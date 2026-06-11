@@ -1,0 +1,8 @@
+Saragossa — a pure-Rust Metal LLM inference engine.
+
+This project's Metal compute kernels (src/kernels.metal) implement quantized
+matmul / attention algorithms that are conceptually derived from Apple's MLX
+(https://github.com/ml-explore/mlx), which is distributed under the MIT License
+(Copyright © 2023 Apple Inc.). The kernels here are an independent Rust/Metal
+reimplementation (distinct naming and structure); no source was copied verbatim.
+We gratefully acknowledge the MLX project.
