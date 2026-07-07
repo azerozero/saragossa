@@ -61,3 +61,29 @@ fn assert_close_eps(left: &[f32], right: &[f32], eps: f32) {
         assert!((a - b).abs() <= eps, "index={idx} left={a} right={b}");
     }
 }
+
+/// Vrai si le GPU local est la référence byte-identité des kernels (famille
+/// M5, machine des campagnes) : la bit-exactitude qmm2/qmv/fused y est
+/// prouvée. Les autres générations (runners CI M1/M2) arrondissent à ±ULP
+/// près — on y vérifie en tolérance ULP serrée, pas à l'égalité de bits.
+pub(crate) fn bitwise_reference_gpu() -> bool {
+    metal::Device::system_default()
+        .map(|device| device.name().contains("M5"))
+        .unwrap_or(false)
+}
+
+/// Écart en ULP entre deux f32 (bits consécutifs), pour les asserts portables.
+pub(crate) fn ulp_diff(a: f32, b: f32) -> u32 {
+    let (x, y) = (a.to_bits() as i64, b.to_bits() as i64);
+    (x - y).unsigned_abs() as u32
+}
+
+/// Assert bit-exact sur la machine de référence, ±4 ULP ailleurs.
+pub(crate) fn assert_bits_portable(a: f32, b: f32, context: &dyn Fn() -> String) {
+    if bitwise_reference_gpu() {
+        assert_eq!(a.to_bits(), b.to_bits(), "{} (bits {a:e} vs {b:e})", context());
+    } else {
+        let d = ulp_diff(a, b);
+        assert!(d <= 4, "{} (ULP {d} > 4 : {a:e} vs {b:e})", context());
+    }
+}

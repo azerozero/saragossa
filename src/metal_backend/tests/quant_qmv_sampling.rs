@@ -2479,10 +2479,8 @@ fn gather_qmv_u8_values(
 fn assert_bits_equal(left: &[f32], right: &[f32], label: &str) {
     assert_eq!(left.len(), right.len(), "{label}: longueurs");
     for (idx, (a, b)) in left.iter().zip(right.iter()).enumerate() {
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "{label}: bits divergents à l'index {idx} (left={a:e} right={b:e})"
-        );
+        assert_bits_portable(*a, *b, &|| {
+            format!("{label}: bits divergents à l'index {idx}")
+        });
     }
 }

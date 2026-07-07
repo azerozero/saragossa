@@ -14,6 +14,7 @@ On Apple Silicon, `mlx_lm` (Apple's MLX-based generation library) is the referen
 |---|---|---|---|
 | [Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit) (MoE, default) | **146.0** (41→48) | 137.8 (48→58) | **+6 %, and cooler** |
 | [Qwen3.6-35B-A3B-oQ8](https://huggingface.co/bearzi/Qwen3.6-35B-A3B-oQ8) (OptiQ 8-bit) @32k ctx, sampled T>0 | **89.8** | 88.1 | ahead at long context (bf16 KV; measured 2026-07-03) |
+| [Qwen3.6-35B-A3B-OptiQ-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit) (MoE, mixed-precision) | **116.3** (43→51) | 114.6 (51→64) | +1.5 % |
 | [Qwen3.6-27B-OptiQ-4bit](https://huggingface.co/mlx-community/Qwen3.6-27B-OptiQ-4bit) (dense) | 27.0 (65→81) | 26.9 (81→72) | parity |
 | [Qwen3-30B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3-30B-A3B-4bit) (MoE) | 112.7 (56→59) | 131.4 (59→68) | **−14 % — under investigation** (measured +11.5 % ahead in June; suspected routing/default drift on our side or `mlx_lm` progress) |
 

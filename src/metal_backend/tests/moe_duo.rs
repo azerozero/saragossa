@@ -521,18 +521,14 @@ fn rms_simd_qmm2_bitwise_matches_fused_qkv_split() -> Result<()> {
         for head in 0..q_heads {
             for col in 0..head_dim {
                 let interleaved = head * 2 * head_dim + col;
-                let q_bits = solo_q[head * head_dim + col].to_bits();
-                let gate_bits = solo_gate[head * head_dim + col].to_bits();
-                assert_eq!(
-                    q_bits,
-                    duo_row[interleaved].to_bits(),
-                    "q divergent (ligne {index}, tête {head}, col {col})"
-                );
-                assert_eq!(
-                    gate_bits,
-                    duo_row[interleaved + head_dim].to_bits(),
-                    "gate divergent (ligne {index}, tête {head}, col {col})"
-                );
+                let q_val = solo_q[head * head_dim + col];
+                let gate_val = solo_gate[head * head_dim + col];
+                assert_bits_portable(q_val, duo_row[interleaved], &|| {
+                    format!("q divergent (ligne {index}, tête {head}, col {col})")
+                });
+                assert_bits_portable(gate_val, duo_row[interleaved + head_dim], &|| {
+                    format!("gate divergent (ligne {index}, tête {head}, col {col})")
+                });
             }
         }
         assert_bits_equal(

@@ -288,6 +288,18 @@ fn na_gemm_src_compiles() -> Result<()> {
     };
     let options = CompileOptions::new();
     options.set_fast_math_enabled(true);
+    // NOTE: metal_tensor (MetalPerformancePrimitives) n'existe que sur les
+    // SDK récents — les runners CI plus vieux n'ont pas le header ; en prod
+    // le chemin NA dégrade proprement (Option → fallback f32), donc on saute.
+    let probe = "#include <metal_tensor>\nkernel void mpp_probe() {}\n";
+    if executor
+        .device
+        .new_library_with_source(probe, &options)
+        .is_err()
+    {
+        eprintln!("metal_tensor indisponible sur ce SDK — test NA sauté");
+        return Ok(());
+    }
     if let Err(e) = executor
         .device
         .new_library_with_source(NA_GEMM_SRC, &options)
