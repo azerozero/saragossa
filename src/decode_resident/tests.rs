@@ -102,6 +102,36 @@ fn read_f32(tensor: &GpuTensor) -> Vec<f32> {
     out
 }
 
+fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let lsb = (bits >> 16) & 1;
+    let rounded = bits.wrapping_add(0x7fff + lsb);
+    (rounded >> 16) as u16
+}
+
+fn bf16_round_to_f32(value: f32) -> f32 {
+    f32::from_bits(u32::from(f32_to_bf16_bits(value)) << 16)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "lecture d'un MTLBuffer partagé après wait_until_completed (test)"
+)]
+fn read_bf16_as_f32(tensor: &GpuTensor) -> Vec<f32> {
+    let ptr = tensor.buffer().contents().cast::<u16>();
+    assert!(!ptr.is_null(), "MTLBuffer partagé sans pointeur CPU");
+    let mut out = Vec::with_capacity(tensor.len());
+    // SAFETY: buffer en StorageModeShared dont les écritures CPU/GPU ont fini
+    // pour les tests ; lecture de `len` u16 dans les bornes du tenseur bf16.
+    unsafe {
+        for index in 0..tensor.len() {
+            let bits = u32::from(ptr.add(index).read()) << 16;
+            out.push(f32::from_bits(bits));
+        }
+    }
+    out
+}
+
 fn dispatch(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
@@ -301,7 +331,7 @@ fn kv_seed_then_append_matches_cpu() -> Result<()> {
     let (q_heads, kv_heads, head_dim) = (16, 2, 256);
     let kv_dim = kv_heads * head_dim; // 512
     let capacity = 6;
-    let mut kv = state.full_attention(capacity, q_heads, kv_heads, head_dim)?;
+    let mut kv = state.full_attention(capacity, q_heads, kv_heads, head_dim, false)?;
     assert_eq!(kv.kv_dim(), kv_dim);
 
     let mut cpu_keys: Vec<f32> = Vec::new();
@@ -345,6 +375,54 @@ fn kv_seed_then_append_matches_cpu() -> Result<()> {
     Ok(())
 }
 
+/// C1B — seed prefill puis append decode en KV bf16 : les lignes valides sont
+/// arrondies bf16 (RNE), la longueur logique reste en lignes et la taille mémoire
+/// est divisée par deux.
+#[test]
+fn kv_bf16_seed_then_append_rounds_to_bf16() -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads, head_dim) = (16, 2, 256);
+    let kv_dim = kv_heads * head_dim;
+    let capacity = 4;
+    let mut kv = state.full_attention_bf16_for_test(capacity, q_heads, kv_heads, head_dim)?;
+    assert_eq!(kv.keys().element(), GpuElement::Bf16);
+    assert_eq!(kv.values().element(), GpuElement::Bf16);
+    assert_eq!(kv.keys().byte_len(), capacity * kv_dim * 2);
+
+    let seed_rows = 2;
+    let seed_k: Vec<f32> = (0..seed_rows * kv_dim)
+        .map(|i| (i as f32 - 333.0) * 0.0017)
+        .collect();
+    let seed_v: Vec<f32> = (0..seed_rows * kv_dim)
+        .map(|i| (i as f32 + 17.0) * -0.0023)
+        .collect();
+    kv.seed(&seed_k, &seed_v, seed_rows)?;
+
+    let row_k: Vec<f32> = (0..kv_dim).map(|i| 1.0 + i as f32 * 0.0009).collect();
+    let row_v: Vec<f32> = (0..kv_dim).map(|i| -1.0 + i as f32 * 0.0011).collect();
+    kv.append_row(&row_k, &row_v)?;
+    assert_eq!(kv.len(), seed_rows + 1);
+
+    let mut cpu_k = seed_k;
+    cpu_k.extend_from_slice(&row_k);
+    let mut cpu_v = seed_v;
+    cpu_v.extend_from_slice(&row_v);
+    let valid = kv.len() * kv_dim;
+    let gpu_k = read_bf16_as_f32(kv.keys());
+    let gpu_v = read_bf16_as_f32(kv.values());
+    for (idx, (&gpu, &cpu)) in gpu_k[..valid].iter().zip(cpu_k.iter()).enumerate() {
+        let expected = bf16_round_to_f32(cpu);
+        assert_eq!(gpu, expected, "K bf16[{idx}] gpu={gpu} expected={expected}");
+    }
+    for (idx, (&gpu, &cpu)) in gpu_v[..valid].iter().zip(cpu_v.iter()).enumerate() {
+        let expected = bf16_round_to_f32(cpu);
+        assert_eq!(gpu, expected, "V bf16[{idx}] gpu={gpu} expected={expected}");
+    }
+    Ok(())
+}
+
 /// 1b.1 / R5 — l'append écrit au BON offset (les helpers 1a.5 n'écrivaient
 /// qu'au début du buffer) : la 2e ligne ne clobbe pas la 1re.
 #[test]
@@ -353,7 +431,7 @@ fn kv_append_writes_at_nonzero_offset() -> Result<()> {
         return Ok(());
     };
     let (q_heads, kv_heads, head_dim) = (4, 2, 2); // jouet, kv_dim = 4
-    let mut kv = state.full_attention(4, q_heads, kv_heads, head_dim)?;
+    let mut kv = state.full_attention(4, q_heads, kv_heads, head_dim, false)?;
     let row0_k = [1.0, 2.0, 3.0, 4.0];
     let row0_v = [5.0, 6.0, 7.0, 8.0];
     kv.append_row(&row0_k, &row0_v)?; // offset 0
@@ -380,7 +458,7 @@ fn kv_overflow_at_capacity_errors() -> Result<()> {
     let (q_heads, kv_heads, head_dim) = (4, 2, 2);
     let kv_dim = kv_heads * head_dim;
     let prefill_len = 3;
-    let mut kv = state.full_attention(prefill_len, q_heads, kv_heads, head_dim)?;
+    let mut kv = state.full_attention(prefill_len, q_heads, kv_heads, head_dim, false)?;
     let seed: Vec<f32> = (0..prefill_len * kv_dim).map(|i| i as f32).collect();
     kv.seed(&seed, &seed, prefill_len)?;
     assert_eq!(kv.len(), kv.capacity());
@@ -399,7 +477,7 @@ fn full_attention_state_rejects_non_multiple_gqa() -> Result<()> {
         return Ok(());
     };
     assert!(
-        state.full_attention(4, 3, 2, 8).is_err(),
+        state.full_attention(4, 3, 2, 8, false).is_err(),
         "q_heads=3 non multiple de kv_heads=2 doit être rejeté"
     );
     Ok(())
@@ -467,12 +545,20 @@ fn cpu_attention(
 /// RÉELLES Qwen3.6-35B-A3B full-attn (q=16, kv=2, hd=256). Tolérance numérique
 /// (le kernel change l'ordre de réduction f32 du produit scalaire — réserve E).
 fn run_attention_case(len: usize) -> Result<()> {
+    run_attention_case_with_dims(len, 16, 2, 256)
+}
+
+fn run_attention_case_with_dims(
+    len: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
     let Some(state) = try_state()? else {
         return Ok(());
     };
-    let (q_heads, kv_heads, head_dim) = (16, 2, 256);
     let kv_dim = kv_heads * head_dim;
-    let mut kv = state.full_attention(len, q_heads, kv_heads, head_dim)?;
+    let mut kv = state.full_attention(len, q_heads, kv_heads, head_dim, false)?;
     let keys: Vec<f32> = (0..len * kv_dim).map(pseudo).collect();
     let values: Vec<f32> = (0..len * kv_dim).map(|i| pseudo(i + 7)).collect();
     kv.seed(&keys, &values, len)?;
@@ -504,6 +590,167 @@ fn run_attention_case(len: usize) -> Result<()> {
     Ok(())
 }
 
+/// Même différentiel que `run_attention_case`, mais avec KV résident bf16. L'oracle
+/// CPU lit des K/V arrondis bf16, donc l'écart toléré couvre seulement l'ordre de
+/// réduction GPU/CPU et le fast-math de l'exponentielle.
+fn run_attention_case_bf16(len: usize) -> Result<()> {
+    run_attention_case_bf16_with_dims(len, 16, 2, 256)
+}
+
+fn run_attention_case_bf16_with_dims(
+    len: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let kv_dim = kv_heads * head_dim;
+    let mut kv = state.full_attention_bf16_for_test(len, q_heads, kv_heads, head_dim)?;
+    let keys: Vec<f32> = (0..len * kv_dim).map(pseudo).collect();
+    let values: Vec<f32> = (0..len * kv_dim).map(|i| pseudo(i + 7)).collect();
+    kv.seed(&keys, &values, len)?;
+
+    let q_dim = q_heads * head_dim;
+    let q_data: Vec<f32> = (0..q_dim).map(|i| pseudo(i + 99)).collect();
+
+    let gpu = kv.attention_decode(&q_data)?;
+    let keys_bf16: Vec<f32> = keys.iter().copied().map(bf16_round_to_f32).collect();
+    let values_bf16: Vec<f32> = values.iter().copied().map(bf16_round_to_f32).collect();
+    let cpu = cpu_attention(
+        &q_data,
+        &keys_bf16,
+        &values_bf16,
+        q_heads,
+        kv_heads,
+        head_dim,
+        len,
+    );
+    assert_eq!(gpu.len(), cpu.len());
+
+    let mut max_abs = 0.0_f32;
+    let mut sum_abs = 0.0_f32;
+    for (g, c) in gpu.iter().zip(cpu.iter()) {
+        let delta = (g - c).abs();
+        max_abs = max_abs.max(delta);
+        sum_abs += delta;
+    }
+    let mean_abs = sum_abs / gpu.len() as f32;
+    assert!(
+        max_abs <= 2.0e-3,
+        "bf16 len={len}: max_abs={max_abs:e} > 2e-3"
+    );
+    assert!(
+        mean_abs <= 2.0e-4,
+        "bf16 len={len}: mean_abs={mean_abs:e} > 2e-4"
+    );
+    Ok(())
+}
+
+/// Microbench AUTONOME du kernel `attention_decode` (SDPA résident decode) aux
+/// dimensions réelles 35B full-attn (q16/kv2/hd256), à plusieurs longueurs de KV,
+/// SANS prefill (KV synthétique seedé) → itération en secondes, pas 34 min.
+/// Mesure ms/appel et **GB/s effectif** (octets K+V UNIQUES lus une fois ;
+/// le déficit GQA gonfle le trafic réel mais on veut la lecture unique).
+/// Activé par `RETI_RUST_BENCH_SDPA` ; `RETI_RUST_FLASH_SDPA=0` = kernel naïf. Run :
+/// `RETI_RUST_BENCH_SDPA=1 cargo test --release -p saragossa attention_decode_bench -- --nocapture`
+#[test]
+fn attention_decode_bench() -> Result<()> {
+    if std::env::var("RETI_RUST_BENCH_SDPA").is_err() {
+        return Ok(());
+    }
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads, head_dim) = (16usize, 2usize, 256usize);
+    let kv_dim = kv_heads * head_dim;
+    let q_dim = q_heads * head_dim;
+    let q_data: Vec<f32> = (0..q_dim)
+        .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
+        .collect();
+    let iters: usize = std::env::var("RETI_RUST_BENCH_SDPA_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    for &len in &[1024usize, 4096, 16384, 32768] {
+        let mut kv = state.full_attention(len, q_heads, kv_heads, head_dim, false)?;
+        let keys: Vec<f32> = (0..len * kv_dim)
+            .map(|i| ((i % 101) as f32 - 50.0) * 0.01)
+            .collect();
+        let values: Vec<f32> = (0..len * kv_dim)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        kv.seed(&keys, &values, len)?;
+        for _ in 0..5 {
+            let _ = kv.attention_decode(&q_data)?;
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = kv.attention_decode(&q_data)?;
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        let bytes = (len * kv_dim * 4 * 2) as f64;
+        let gbps = bytes / (ms / 1000.0) / 1.0e9;
+        eprintln!("bench_sdpa len={len} ms_per_call={ms:.4} gbps_effective={gbps:.1}");
+    }
+    Ok(())
+}
+
+/// SDPA 2-passes split-K (len ≥ seuil 2048) vs CPU — len=4096 (blocks=32).
+#[test]
+fn attention_decode_2pass_matches_cpu_len4096() -> Result<()> {
+    run_attention_case(4096)
+}
+
+/// C1B — SDPA 2-passes split-K avec KV bf16 vs oracle CPU bf16.
+#[test]
+fn attention_decode_2pass_bf16_matches_cpu_len4096() -> Result<()> {
+    run_attention_case_bf16(4096)
+}
+
+/// SDPA 2-passes vs CPU — len=8193 (impair, blocks=64, dernier bloc partiel).
+#[test]
+fn attention_decode_2pass_matches_cpu_len8193() -> Result<()> {
+    run_attention_case(8193)
+}
+
+/// SDPA 2-passes vs CPU — len=33000 (≈32k, blocks=256), cas cible long-contexte.
+#[test]
+fn attention_decode_2pass_matches_cpu_len33000() -> Result<()> {
+    run_attention_case(33000)
+}
+
+/// D-30B — SDPA 2-passes d128 vs CPU — len=4096 (Qwen3-30B : q32/kv4/hd128).
+#[test]
+fn attention_decode_2pass_d128_matches_cpu_len4096() -> Result<()> {
+    run_attention_case_with_dims(4096, 32, 4, 128)
+}
+
+/// D-30B — SDPA 2-passes d128 + KV bf16 vs oracle CPU bf16.
+#[test]
+fn attention_decode_2pass_d128_bf16_matches_cpu_len4096() -> Result<()> {
+    run_attention_case_bf16_with_dims(4096, 32, 4, 128)
+}
+
+/// D-30B — SDPA 2-passes d128 vs CPU — len=8193.
+#[test]
+fn attention_decode_2pass_d128_matches_cpu_len8193() -> Result<()> {
+    run_attention_case_with_dims(8193, 32, 4, 128)
+}
+
+/// D-30B — SDPA 2-passes d128 vs CPU — len=33000.
+#[test]
+fn attention_decode_2pass_d128_matches_cpu_len33000() -> Result<()> {
+    run_attention_case_with_dims(33000, 32, 4, 128)
+}
+
+/// D-30B — SDPA 2-passes d128 + KV bf16 vs oracle CPU bf16 — long contexte.
+#[test]
+fn attention_decode_2pass_d128_bf16_matches_cpu_len33000() -> Result<()> {
+    run_attention_case_bf16_with_dims(33000, 32, 4, 128)
+}
+
 /// 1b.2 / R5 — len=1 (la requête n'attend qu'elle-même : softmax d'un seul
 /// score = 1 → contexte = la valeur du token courant).
 #[test]
@@ -515,6 +762,12 @@ fn attention_decode_matches_cpu_len1() -> Result<()> {
 #[test]
 fn attention_decode_matches_cpu_len64() -> Result<()> {
     run_attention_case(64)
+}
+
+/// C1B — SDPA single-pass flash avec KV bf16 vs oracle CPU bf16.
+#[test]
+fn attention_decode_bf16_matches_cpu_len64() -> Result<()> {
+    run_attention_case_bf16(64)
 }
 
 /// 1b.2 / R5 — len=257 : AU-DELÀ du plafond `seq ≤ 256` du kernel de prefill ;
@@ -776,47 +1029,55 @@ fn rms_norm_rope_decode_matches_cpu() -> Result<()> {
     let Some(state) = try_state()? else {
         return Ok(());
     };
-    let (num_heads, head_dim, rope_dims) = (2, 8, 8);
-    let dim = num_heads * head_dim;
-    let position = 5;
-    let (eps, theta) = (1.0e-6_f32, 10_000.0_f32);
-    let input: Vec<f32> = (0..dim).map(|i| (i as f32 % 11.0 - 5.0) * 0.1).collect();
-    let weight: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 * 0.1).collect();
-    let gpu = state.rms_norm_rope_decode(
-        &input, &weight, num_heads, head_dim, rope_dims, position, eps, theta,
-    )?;
+    let (num_heads, head_dim) = (2, 8);
+    // rope_dims 8 = RoPE plein ; 4 = partiel (cas 35B hybride, rope_dims < head_dim).
+    for rope_dims in [8_usize, 4] {
+        let dim = num_heads * head_dim;
+        let position = 5;
+        let (eps, theta) = (1.0e-6_f32, 10_000.0_f32);
+        let input: Vec<f32> = (0..dim).map(|i| (i as f32 % 11.0 - 5.0) * 0.1).collect();
+        let weight: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 * 0.1).collect();
+        let gpu = state.rms_norm_rope_decode(
+            &input, &weight, num_heads, head_dim, rope_dims, position, eps, theta,
+        )?;
 
-    let mut cpu = vec![0.0_f32; dim];
-    for head in 0..num_heads {
-        let start = head * head_dim;
-        let sumsq: f32 = (0..head_dim)
-            .map(|c| input[start + c] * input[start + c])
-            .sum();
-        let inv_rms = 1.0 / ((sumsq / head_dim as f32) + eps).sqrt();
-        let normed: Vec<f32> = (0..head_dim)
-            .map(|c| input[start + c] * inv_rms * weight[c])
-            .collect();
-        for c in 0..head_dim {
-            cpu[start + c] = if c < rope_dims {
-                let pair = c / 2;
-                let exponent = (2 * pair) as f32 / rope_dims as f32;
-                let angle = position as f32 / theta.powf(exponent);
-                let (even, odd) = (normed[pair * 2], normed[pair * 2 + 1]);
-                if c == pair * 2 {
-                    even * angle.cos() - odd * angle.sin()
+        let mut cpu = vec![0.0_f32; dim];
+        for head in 0..num_heads {
+            let start = head * head_dim;
+            let sumsq: f32 = (0..head_dim)
+                .map(|c| input[start + c] * input[start + c])
+                .sum();
+            let inv_rms = 1.0 / ((sumsq / head_dim as f32) + eps).sqrt();
+            let normed: Vec<f32> = (0..head_dim)
+                .map(|c| input[start + c] * inv_rms * weight[c])
+                .collect();
+            let pairs = rope_dims / 2;
+            for c in 0..head_dim {
+                cpu[start + c] = if c < rope_dims {
+                    // Rotate-half : paire (pair, pair+pairs), exposant 2·pair/rope_dims.
+                    let pair = if c < pairs { c } else { c - pairs };
+                    let exponent = (2 * pair) as f32 / rope_dims as f32;
+                    let angle = position as f32 / theta.powf(exponent);
+                    let (first, second) = (normed[pair], normed[pair + pairs]);
+                    if c < pairs {
+                        first * angle.cos() - second * angle.sin()
+                    } else {
+                        first * angle.sin() + second * angle.cos()
+                    }
                 } else {
-                    even * angle.sin() + odd * angle.cos()
-                }
-            } else {
-                normed[c]
-            };
+                    normed[c]
+                };
+            }
         }
+        let mut max_abs = 0.0_f32;
+        for i in 0..dim {
+            max_abs = max_abs.max((gpu[i] - cpu[i]).abs());
+        }
+        assert!(
+            max_abs <= 1.0e-5,
+            "rope decode vs CPU (rope_dims={rope_dims}): max_abs={max_abs:e}"
+        );
     }
-    let mut max_abs = 0.0_f32;
-    for i in 0..dim {
-        max_abs = max_abs.max((gpu[i] - cpu[i]).abs());
-    }
-    assert!(max_abs <= 1.0e-5, "rope decode vs CPU: max_abs={max_abs:e}");
     Ok(())
 }
 
@@ -830,7 +1091,7 @@ fn encode_append_kv_device_matches_cpu() -> Result<()> {
     };
     let (q_heads, kv_heads, head_dim) = (4, 2, 4);
     let kv_dim = kv_heads * head_dim;
-    let mut kv = state.full_attention(4, q_heads, kv_heads, head_dim)?;
+    let mut kv = state.full_attention(4, q_heads, kv_heads, head_dim, false)?;
     let row0: Vec<f32> = (0..kv_dim).map(|i| i as f32).collect();
     kv.seed(&row0, &row0, 1)?;
     let k_data: Vec<f32> = (0..kv_dim).map(|i| 100.0 + i as f32).collect();
@@ -863,5 +1124,166 @@ fn encode_append_kv_device_matches_cpu() -> Result<()> {
         &v_data[..],
         "V row1 device append"
     );
+    Ok(())
+}
+
+/// C1B — `encode_append_kv` f32→bf16 écrit la ligne device au bon offset et
+/// arrondit exactement comme le seed CPU bf16.
+#[test]
+fn encode_append_kv_device_bf16_roundtrip() -> Result<()> {
+    let Some(mut state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads, head_dim) = (4, 2, 4);
+    let kv_dim = kv_heads * head_dim;
+    let mut kv = state.full_attention_bf16_for_test(4, q_heads, kv_heads, head_dim)?;
+    let row0: Vec<f32> = (0..kv_dim).map(|i| (i as f32 - 4.0) * 0.125).collect();
+    kv.seed(&row0, &row0, 1)?;
+    let k_data: Vec<f32> = (0..kv_dim).map(|i| 100.125 + i as f32 * 0.03125).collect();
+    let v_data: Vec<f32> = (0..kv_dim).map(|i| -200.25 + i as f32 * 0.0625).collect();
+    let k_buf = state.persistent(kv_dim, GpuElement::F32)?;
+    write_f32_at(&k_buf, 0, &k_data)?;
+    let v_buf = state.persistent(kv_dim, GpuElement::F32)?;
+    write_f32_at(&v_buf, 0, &v_data)?;
+
+    let queue = state.device().new_command_queue();
+    let command_buffer = queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    kv.encode_append_kv(encoder, k_buf.buffer(), v_buf.buffer())?;
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    assert_eq!(kv.len(), 2);
+
+    let gpu_keys = read_bf16_as_f32(kv.keys());
+    let gpu_values = read_bf16_as_f32(kv.values());
+    for i in 0..kv_dim {
+        assert_eq!(gpu_keys[i], bf16_round_to_f32(row0[i]), "K row0[{i}]");
+        assert_eq!(
+            gpu_keys[kv_dim + i],
+            bf16_round_to_f32(k_data[i]),
+            "K row1[{i}]"
+        );
+        assert_eq!(gpu_values[i], bf16_round_to_f32(row0[i]), "V row0[{i}]");
+        assert_eq!(
+            gpu_values[kv_dim + i],
+            bf16_round_to_f32(v_data[i]),
+            "V row1[{i}]"
+        );
+    }
+    Ok(())
+}
+
+/// Oracle BIT-EXACT dé-fusion du gate o_proj (gate E2.2 light-batch) :
+/// `attn_gate` (ctx · σ(gate)) suivi du qmv == le kernel FUSIONNÉ
+/// `affine_qmv_gated_input_fast` (chemin solo prod de l'o_proj), en bits —
+/// l'expression sigmoïde est identique dans les deux kernels, compilés avec les
+/// mêmes options fast-math.
+#[test]
+fn attn_gate_then_qmv_bitwise_matches_fused_gated_o_proj() -> Result<()> {
+    let Some(mut state) = try_state()? else {
+        return Ok(());
+    };
+    let executor = MetalExecutor::new()?;
+    // Shape o_proj du 35B prod : out=hidden 2048, in=q_dim 4096.
+    let (out_dim, in_dim) = (2048_usize, 4096_usize);
+    for bits in [4_usize, 8] {
+        let values_per_word = 32 / bits;
+        let packed_cols = in_dim / values_per_word;
+        let groups = in_dim / 64;
+        let mut packed = Vec::with_capacity(out_dim * packed_cols);
+        for row in 0..out_dim {
+            for word in 0..packed_cols {
+                let mut value = 0_u32;
+                for lane in 0..values_per_word {
+                    value |= (((row * 5 + word * 11 + lane) % (1 << bits)) as u32) << (lane * bits);
+                }
+                packed.push(value);
+            }
+        }
+        let scales = crate::Tensor::from_vec(
+            vec![out_dim, groups],
+            (0..out_dim * groups)
+                .map(|i| 0.003 + 0.000_2 * ((i % 5) as f32))
+                .collect(),
+        )?;
+        let biases = crate::Tensor::from_vec(
+            vec![out_dim, groups],
+            (0..out_dim * groups)
+                .map(|i| -0.02 + 0.001 * ((i % 9) as f32))
+                .collect(),
+        )?;
+        let affine = crate::AffineQuantizedTensor::new(
+            &[out_dim, packed_cols],
+            packed,
+            scales,
+            biases,
+            64,
+            bits,
+        )?;
+        let weight = executor.resolve_linear_weight_buffers(
+            &crate::LinearWeight::AffineQuantized(affine),
+            "gate_bits_weight",
+        )?;
+
+        let ctx: Vec<f32> = (0..in_dim)
+            .map(|i| ((((i * 29) % 97) as f32) - 48.0) / 53.0)
+            .collect();
+        let gate: Vec<f32> = (0..in_dim)
+            .map(|i| ((((i * 41 + 3) % 89) as f32) - 44.0) / 17.0)
+            .collect();
+        let ctx_buf = state.persistent(in_dim, GpuElement::F32)?;
+        write_f32_at(&ctx_buf, 0, &ctx)?;
+        let gate_buf = state.persistent(in_dim, GpuElement::F32)?;
+        write_f32_at(&gate_buf, 0, &gate)?;
+        let gated = state.persistent(in_dim, GpuElement::F32)?;
+        let out_fused = state.persistent(out_dim, GpuElement::F32)?;
+        let out_split = state.persistent(out_dim, GpuElement::F32)?;
+
+        let command_buffer = state.queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let fused = executor.encode_full_attn_o_proj_gated_buffers(
+            encoder,
+            ctx_buf.buffer(),
+            gate_buf.buffer(),
+            in_dim,
+            &weight,
+            out_fused.buffer(),
+        )?;
+        assert_eq!(
+            fused,
+            Some(out_dim),
+            "le chemin o_proj fusionné doit s'appliquer en {bits} bits"
+        );
+        state.encode_attn_gate(
+            encoder,
+            ctx_buf.buffer(),
+            gate_buf.buffer(),
+            gated.buffer(),
+            in_dim,
+        )?;
+        let split_out = executor.encode_matmul_weight_buffers(
+            encoder,
+            gated.buffer(),
+            1,
+            in_dim,
+            &weight,
+            out_split.buffer(),
+            false,
+        )?;
+        assert_eq!(split_out, out_dim);
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+
+        let fused_values = read_f32_buffer(out_fused.buffer(), out_dim)?;
+        let split_values = read_f32_buffer(out_split.buffer(), out_dim)?;
+        for (idx, (a, b)) in split_values.iter().zip(fused_values.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "o_proj gated {bits} bits: bits divergents à l'index {idx} (split={a:e} fused={b:e})"
+            );
+        }
+    }
     Ok(())
 }

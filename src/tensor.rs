@@ -5,6 +5,7 @@ use rayon::prelude::*;
 
 const PARALLEL_MATMUL_OUTPUT_THRESHOLD: usize = 1024;
 const PARALLEL_MATMUL_INNER_THRESHOLD: usize = 128;
+const PARALLEL_MAP_THRESHOLD: usize = 8192;
 
 #[derive(Clone, Debug, PartialEq)]
 /// Stocke un tenseur dense CPU avec forme explicite.
@@ -153,6 +154,21 @@ impl Tensor {
         }
     }
 
+    /// Applique une transformation élément par élément, parallélisée au-delà d'un
+    /// seuil (l'ordre élément par élément est indifférent ⇒ byte-identique au
+    /// séquentiel). Pour les grands tenseurs (GELU encodeur `[1500,5120]`).
+    pub fn par_map(&self, f: impl Fn(f32) -> f32 + Send + Sync) -> Self {
+        let data = if self.data.len() >= PARALLEL_MAP_THRESHOLD {
+            self.data.par_iter().copied().map(f).collect()
+        } else {
+            self.data.iter().copied().map(f).collect()
+        };
+        Self {
+            shape: self.shape.clone(),
+            data,
+        }
+    }
+
     /// Additionne deux tenseurs de même forme.
     ///
     /// # Errors
@@ -165,12 +181,19 @@ impl Tensor {
                 self.shape, rhs.shape
             )));
         }
-        let data = self
-            .data
-            .iter()
-            .zip(rhs.data.iter())
-            .map(|(a, b)| a + b)
-            .collect();
+        let data = if self.data.len() >= PARALLEL_MAP_THRESHOLD {
+            self.data
+                .par_iter()
+                .zip(rhs.data.par_iter())
+                .map(|(a, b)| a + b)
+                .collect()
+        } else {
+            self.data
+                .iter()
+                .zip(rhs.data.iter())
+                .map(|(a, b)| a + b)
+                .collect()
+        };
         Ok(Self {
             shape: self.shape.clone(),
             data,
@@ -219,10 +242,18 @@ impl Tensor {
             }
         };
         let mut out = self.data.clone();
-        for row in 0..rows {
-            let start = row * cols;
-            for col in 0..cols {
-                out[start + col] += bias_data[col];
+        if out.len() >= PARALLEL_MAP_THRESHOLD {
+            out.par_chunks_mut(cols).for_each(|row| {
+                for (col, slot) in row.iter_mut().enumerate() {
+                    *slot += bias_data[col];
+                }
+            });
+        } else {
+            for row in 0..rows {
+                let start = row * cols;
+                for col in 0..cols {
+                    out[start + col] += bias_data[col];
+                }
             }
         }
         Ok(Self {

@@ -1,0 +1,11 @@
+{
+  "dtype": "f32",
+  "shape": [
+    80,
+    64
+  ],
+  "tolerance": "input mel prefix (debug_mel_from_samples, 64 frames)",
+  "source": "live_encoder_matches_mlx_on_audio_mel_prefix",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

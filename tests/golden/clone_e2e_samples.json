@@ -1,0 +1,10 @@
+{
+  "dtype": "f32",
+  "shape": [
+    3840
+  ],
+  "tolerance": "max_abs<=0.95, rms<=0.25",
+  "source": "live_clone_e2e_audio_matches_mlx_oracle",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

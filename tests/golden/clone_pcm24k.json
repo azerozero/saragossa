@@ -1,0 +1,10 @@
+{
+  "dtype": "f32",
+  "shape": [
+    208320
+  ],
+  "tolerance": "pcm_max_abs<=1e-7",
+  "source": "live_clone_preprocess_matches_mlxrs",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

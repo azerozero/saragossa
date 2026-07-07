@@ -1,7 +1,11 @@
 //! Attention full-attn GPU-résidente et helpers RoPE/gating.
 
 use super::arena::alloc_tensor;
-use super::utils::{flash_sdpa_enabled, write_f32_at};
+use super::utils::{
+    bf16_round_f32, byte_offset, flash_sdpa_enabled, kv_bf16_for, kv_bf16_sim_konly,
+    kv_bf16_sim_vonly, sdpa_2pass_blocks, sdpa_2pass_enabled, sdpa_2pass_min_len,
+    write_f32_as_bf16_at, write_f32_at,
+};
 use super::*;
 use crate::metal_backend::EncoderEndGuard;
 
@@ -15,12 +19,47 @@ impl DecodeResidentState {
     ///
     /// Renvoie une erreur si une dimension est nulle, si `q_heads` n'est pas un
     /// multiple de `kv_heads` (GQA, réserve R4), ou si la taille déborde.
+    ///
+    /// `sampled` = la génération courante échantillonne (temperature > 0) : pilote
+    /// le dtype KV par défaut (bf16 échantillonné, f32 greedy) sauf override
+    /// explicite `RETI_RUST_KV_BF16` (cf. [`kv_bf16_for`]).
     pub(crate) fn full_attention(
         &self,
         capacity: usize,
         q_heads: usize,
         kv_heads: usize,
         head_dim: usize,
+        sampled: bool,
+    ) -> Result<FullAttentionMetalState> {
+        let kv_element = if kv_bf16_for(sampled) {
+            GpuElement::Bf16
+        } else {
+            GpuElement::F32
+        };
+        if crate::runtime_flags::trace_resident_enabled() {
+            eprintln!("kv résident full-attn dtype={kv_element:?} (sampled={sampled})");
+        }
+        self.full_attention_with_element(capacity, q_heads, kv_heads, head_dim, kv_element)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_attention_bf16_for_test(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<FullAttentionMetalState> {
+        self.full_attention_with_element(capacity, q_heads, kv_heads, head_dim, GpuElement::Bf16)
+    }
+
+    fn full_attention_with_element(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        kv_element: GpuElement,
     ) -> Result<FullAttentionMetalState> {
         if capacity == 0 || q_heads == 0 || kv_heads == 0 || head_dim == 0 {
             return Err(InferError::Config(
@@ -39,8 +78,8 @@ impl DecodeResidentState {
         let cells = capacity
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Config("capacité KV déborde".to_string()))?;
-        let keys = alloc_tensor(&self.device, self.options, cells, GpuElement::F32)?;
-        let values = alloc_tensor(&self.device, self.options, cells, GpuElement::F32)?;
+        let keys = alloc_tensor(&self.device, self.options, cells, kv_element)?;
+        let values = alloc_tensor(&self.device, self.options, cells, kv_element)?;
         Ok(FullAttentionMetalState {
             keys,
             values,
@@ -54,7 +93,17 @@ impl DecodeResidentState {
             attention_naive: self.attention_decode_naive.clone(),
             attention_flash: self.attention_decode_flash.clone(),
             attention_flash_d256: self.attention_decode_flash_d256.clone(),
+            attention_2pass_1: self.attention_decode_2pass_1.clone(),
+            attention_2pass_1_d128: self.attention_decode_2pass_1_d128.clone(),
+            attention_naive_bf16: self.attention_decode_naive_bf16.clone(),
+            attention_flash_bf16: self.attention_decode_flash_bf16.clone(),
+            attention_flash_d256_bf16: self.attention_decode_flash_d256_bf16.clone(),
+            attention_2pass_1_bf16: self.attention_decode_2pass_1_bf16.clone(),
+            attention_2pass_1_d128_bf16: self.attention_decode_2pass_1_d128_bf16.clone(),
+            attention_2pass_2: self.attention_decode_2pass_2.clone(),
+            attention_2pass_2_d128: self.attention_decode_2pass_2_d128.clone(),
             copy_at: self.copy_at_kernel.clone(),
+            copy_at_f32_to_bf16: self.copy_at_f32_to_bf16_kernel.clone(),
         })
     }
 
@@ -400,7 +449,17 @@ pub(crate) struct FullAttentionMetalState {
     attention_naive: ComputePipelineState,
     attention_flash: ComputePipelineState,
     attention_flash_d256: ComputePipelineState,
+    attention_2pass_1: ComputePipelineState,
+    attention_2pass_1_d128: ComputePipelineState,
+    attention_naive_bf16: ComputePipelineState,
+    attention_flash_bf16: ComputePipelineState,
+    attention_flash_d256_bf16: ComputePipelineState,
+    attention_2pass_1_bf16: ComputePipelineState,
+    attention_2pass_1_d128_bf16: ComputePipelineState,
+    attention_2pass_2: ComputePipelineState,
+    attention_2pass_2_d128: ComputePipelineState,
     copy_at: ComputePipelineState,
+    copy_at_f32_to_bf16: ComputePipelineState,
 }
 
 impl FullAttentionMetalState {
@@ -491,8 +550,33 @@ impl FullAttentionMetalState {
                 values_rows.len()
             )));
         }
-        write_f32_at(&self.keys, 0, keys_rows)?;
-        write_f32_at(&self.values, 0, values_rows)?;
+        match self.keys.element() {
+            GpuElement::F32 if kv_bf16_sim_konly() => {
+                // Diagnostic C1B : K bf16 (seed), V f32 exact — buffers/kernels f32.
+                let rounded: Vec<f32> = keys_rows.iter().copied().map(bf16_round_f32).collect();
+                write_f32_at(&self.keys, 0, &rounded)?;
+                write_f32_at(&self.values, 0, values_rows)?;
+            }
+            GpuElement::F32 if kv_bf16_sim_vonly() => {
+                // Diagnostic C1B : V bf16 (seed), K f32 exact.
+                let rounded: Vec<f32> = values_rows.iter().copied().map(bf16_round_f32).collect();
+                write_f32_at(&self.keys, 0, keys_rows)?;
+                write_f32_at(&self.values, 0, &rounded)?;
+            }
+            GpuElement::F32 => {
+                write_f32_at(&self.keys, 0, keys_rows)?;
+                write_f32_at(&self.values, 0, values_rows)?;
+            }
+            GpuElement::Bf16 => {
+                write_f32_as_bf16_at(&self.keys, 0, keys_rows)?;
+                write_f32_as_bf16_at(&self.values, 0, values_rows)?;
+            }
+            GpuElement::U32 => {
+                return Err(InferError::Metal(
+                    "seed KV sur un buffer u32 invalide".to_string(),
+                ));
+            }
+        }
         self.len = n_rows;
         Ok(())
     }
@@ -520,8 +604,21 @@ impl FullAttentionMetalState {
             )));
         }
         let offset = self.len * kv_dim;
-        write_f32_at(&self.keys, offset, key)?;
-        write_f32_at(&self.values, offset, value)?;
+        match self.keys.element() {
+            GpuElement::F32 => {
+                write_f32_at(&self.keys, offset, key)?;
+                write_f32_at(&self.values, offset, value)?;
+            }
+            GpuElement::Bf16 => {
+                write_f32_as_bf16_at(&self.keys, offset, key)?;
+                write_f32_as_bf16_at(&self.values, offset, value)?;
+            }
+            GpuElement::U32 => {
+                return Err(InferError::Metal(
+                    "append KV sur un buffer u32 invalide".to_string(),
+                ));
+            }
+        }
         self.len += 1;
         Ok(())
     }
@@ -605,6 +702,18 @@ impl FullAttentionMetalState {
                 "attention_decode sur KV vide".to_string(),
             ));
         }
+        // Bascule 2-passes split-K pour les longs KV (dédup GQA + tuiles L1) :
+        // head_dim 128/256, GQA réel (>1 q/kv), len ≥ seuil. Cf. encode_attention_decode_2pass.
+        let gqa = self.q_heads / self.kv_heads.max(1);
+        if sdpa_2pass_enabled()
+            && flash_sdpa_enabled()
+            && matches!(self.head_dim, 128 | 256)
+            && gqa > 1
+            && self.q_heads % self.kv_heads == 0
+            && self.len >= sdpa_2pass_min_len()
+        {
+            return self.encode_attention_decode_2pass(encoder, q_buf, out_buf);
+        }
         let dims: [u32; 4] = [
             u32::try_from(self.q_heads)
                 .map_err(|_| InferError::Dimension("q_heads hors u32".to_string()))?,
@@ -616,12 +725,18 @@ impl FullAttentionMetalState {
                 .map_err(|_| InferError::Dimension("len hors u32".to_string()))?,
         ];
         let use_flash = flash_sdpa_enabled() && self.head_dim <= 256 && self.head_dim % 32 == 0;
-        let pipeline = if use_flash && self.head_dim == 256 {
-            &self.attention_flash_d256
-        } else if use_flash {
-            &self.attention_flash
-        } else {
-            &self.attention_naive
+        let pipeline = match (self.keys.element(), use_flash, self.head_dim == 256) {
+            (GpuElement::F32, true, true) => &self.attention_flash_d256,
+            (GpuElement::F32, true, false) => &self.attention_flash,
+            (GpuElement::F32, false, _) => &self.attention_naive,
+            (GpuElement::Bf16, true, true) => &self.attention_flash_d256_bf16,
+            (GpuElement::Bf16, true, false) => &self.attention_flash_bf16,
+            (GpuElement::Bf16, false, _) => &self.attention_naive_bf16,
+            (GpuElement::U32, _, _) => {
+                return Err(InferError::Metal(
+                    "attention_decode sur KV u32 invalide".to_string(),
+                ));
+            }
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_buf), 0);
@@ -648,6 +763,110 @@ impl FullAttentionMetalState {
         encoder.dispatch_thread_groups(
             MTLSize::new(u64::from(dims[0]), 1, 1),
             MTLSize::new(threads, 1, 1),
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// SDPA decode 2-passes split-K (head_dim 128/256) dans l'encoder partagé. Passe 1 :
+    /// un threadgroup par `(kv_head, bloc)`, `gqa` simdgroups (un q_head chacun) → les
+    /// lectures KV redondantes du groupe GQA touchent le L1, pas la DRAM ; la longueur
+    /// est tuilée en `blocks`. Passe 2 : réduit les `blocks` partiels par q_head vers
+    /// `out_buf`. Partials/sums/maxs = scratch loué (vivant jusqu'au wait, hazard-ordonné).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde ou si l'allocation scratch échoue.
+    fn encode_attention_decode_2pass(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &BufferRef,
+        out_buf: &BufferRef,
+    ) -> Result<()> {
+        let blocks = sdpa_2pass_blocks(self.len);
+        let gqa = self.q_heads / self.kv_heads;
+        let reduce_cells = self
+            .q_heads
+            .checked_mul(blocks)
+            .ok_or_else(|| InferError::Dimension("2pass reduce cells déborde".to_string()))?;
+        let partial_cells = reduce_cells
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| InferError::Dimension("2pass partials cells déborde".to_string()))?;
+        let partials = self.scratch.lease(partial_cells, GpuElement::F32)?;
+        let sums = self.scratch.lease(reduce_cells, GpuElement::F32)?;
+        let maxs = self.scratch.lease(reduce_cells, GpuElement::F32)?;
+
+        let dims: [u32; 4] = [
+            u32::try_from(self.q_heads)
+                .map_err(|_| InferError::Dimension("2pass q_heads hors u32".to_string()))?,
+            u32::try_from(self.kv_heads)
+                .map_err(|_| InferError::Dimension("2pass kv_heads hors u32".to_string()))?,
+            u32::try_from(self.len)
+                .map_err(|_| InferError::Dimension("2pass len hors u32".to_string()))?,
+            u32::try_from(blocks)
+                .map_err(|_| InferError::Dimension("2pass blocks hors u32".to_string()))?,
+        ];
+        // Passe 1 : partiels par (kv_head, bloc).
+        let pass1 = match (self.keys.element(), self.head_dim) {
+            (GpuElement::F32, 256) => &self.attention_2pass_1,
+            (GpuElement::F32, 128) => &self.attention_2pass_1_d128,
+            (GpuElement::Bf16, 256) => &self.attention_2pass_1_bf16,
+            (GpuElement::Bf16, 128) => &self.attention_2pass_1_d128_bf16,
+            (GpuElement::F32 | GpuElement::Bf16, other) => {
+                return Err(InferError::Metal(format!(
+                    "attention_decode 2pass head_dim={other} non supporté"
+                )));
+            }
+            (GpuElement::U32, _) => {
+                return Err(InferError::Metal(
+                    "attention_decode 2pass sur KV u32 invalide".to_string(),
+                ));
+            }
+        };
+        encoder.set_compute_pipeline_state(pass1);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(self.keys.buffer()), 0);
+        encoder.set_buffer(2, Some(self.values.buffer()), 0);
+        encoder.set_buffer(3, Some(partials.tensor().buffer()), 0);
+        encoder.set_buffer(4, Some(sums.tensor().buffer()), 0);
+        encoder.set_buffer(5, Some(maxs.tensor().buffer()), 0);
+        encoder.set_bytes(
+            6,
+            std::mem::size_of::<[u32; 4]>() as u64,
+            dims.as_ptr().cast::<c_void>(),
+        );
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(dims[1]), u64::from(dims[3]), 1),
+            MTLSize::new(32, u64::try_from(gqa).unwrap_or(1), 1),
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
+
+        // Passe 2 : réduction des blocs par q_head.
+        let blocks_u32 = dims[3];
+        let pass2 = match self.head_dim {
+            256 => &self.attention_2pass_2,
+            128 => &self.attention_2pass_2_d128,
+            other => {
+                return Err(InferError::Metal(format!(
+                    "attention_decode 2pass pass2 head_dim={other} non supporté"
+                )));
+            }
+        };
+        encoder.set_compute_pipeline_state(pass2);
+        encoder.set_buffer(0, Some(partials.tensor().buffer()), 0);
+        encoder.set_buffer(1, Some(sums.tensor().buffer()), 0);
+        encoder.set_buffer(2, Some(maxs.tensor().buffer()), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            std::ptr::from_ref(&blocks_u32).cast::<c_void>(),
+        );
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(dims[0]), 1, 1),
+            MTLSize::new(32, 32, 1),
         );
         crate::metal_backend::post_dispatch_barrier(encoder);
         Ok(())
@@ -687,12 +906,21 @@ impl FullAttentionMetalState {
         }
         let kv_dim = self.kv_dim();
         let offset = self.len * kv_dim;
-        self.encode_copy_at(encoder, k_buf, k_offset, self.keys.buffer(), offset, kv_dim)?;
+        self.encode_copy_at(
+            encoder,
+            k_buf,
+            k_offset,
+            self.keys.buffer(),
+            self.keys.element(),
+            offset,
+            kv_dim,
+        )?;
         self.encode_copy_at(
             encoder,
             v_buf,
             v_offset,
             self.values.buffer(),
+            self.values.element(),
             offset,
             kv_dim,
         )?;
@@ -708,18 +936,23 @@ impl FullAttentionMetalState {
         input: &BufferRef,
         input_offset: u64,
         output: &BufferRef,
+        output_element: GpuElement,
         output_offset: usize,
         n: usize,
     ) -> Result<()> {
         let len = u32::try_from(n)
             .map_err(|_| InferError::Dimension("copy_at n hors u32".to_string()))?;
-        let offset_bytes = u64::try_from(
-            output_offset
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| InferError::Dimension("copy_at offset déborde".to_string()))?,
-        )
-        .map_err(|_| InferError::Dimension("copy_at offset hors u64".to_string()))?;
-        encoder.set_compute_pipeline_state(&self.copy_at);
+        let offset_bytes = byte_offset(output_offset, output_element, "copy_at offset")?;
+        let pipeline = match output_element {
+            GpuElement::F32 => &self.copy_at,
+            GpuElement::Bf16 => &self.copy_at_f32_to_bf16,
+            GpuElement::U32 => {
+                return Err(InferError::Metal(
+                    "copy_at KV vers un buffer u32 invalide".to_string(),
+                ));
+            }
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(input), input_offset);
         encoder.set_buffer(1, Some(output), offset_bytes);
         encoder.set_bytes(
@@ -727,7 +960,7 @@ impl FullAttentionMetalState {
             std::mem::size_of::<u32>() as u64,
             std::ptr::from_ref(&len).cast::<c_void>(),
         );
-        let width = self.copy_at.thread_execution_width().max(1);
+        let width = pipeline.thread_execution_width().max(1);
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(width, 1, 1));
         crate::metal_backend::post_dispatch_barrier(encoder);

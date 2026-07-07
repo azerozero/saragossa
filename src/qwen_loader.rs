@@ -12,7 +12,13 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-const REQUIRED_DECODER_WEIGHTS: &[&str] = &["embed_tokens.weight", "norm.weight", "lm_head.weight"];
+const REQUIRED_DECODER_WEIGHTS: &[&str] = &["embed_tokens.weight", "norm.weight"];
+
+/// Clé cible de la tête LM, partagée entre chargement et vérification de contrat.
+const LM_HEAD_WEIGHT: &str = "lm_head.weight";
+
+/// Clé cible des embeddings d'entrée, source du tying de la tête LM.
+const EMBED_TOKENS_WEIGHT: &str = "embed_tokens.weight";
 
 const FULL_ATTENTION_LAYER_WEIGHTS: &[&str] = &[
     "input_layernorm.weight",
@@ -55,6 +61,26 @@ const MLP_LAYER_WEIGHTS: &[&str] = &[
     "mlp.down_proj.weight",
 ];
 
+// Double norme feed-forward propre à Gemma (encadre le MLP, en plus de la
+// post_attention_layernorm partagée).
+const GEMMA_FFN_NORM_WEIGHTS: &[&str] = &[
+    "pre_feedforward_layernorm.weight",
+    "post_feedforward_layernorm.weight",
+];
+
+const GEMMA4_PARALLEL_MOE_WEIGHTS: &[&str] = &[
+    "router.proj.weight",
+    "router.scale",
+    "router.per_expert_scale",
+    "experts.switch_glu.gate_proj.weight",
+    "experts.switch_glu.up_proj.weight",
+    "experts.switch_glu.down_proj.weight",
+    "pre_feedforward_layernorm_2.weight",
+    "post_feedforward_layernorm_1.weight",
+    "post_feedforward_layernorm_2.weight",
+    "layer_scalar",
+];
+
 const MOE_LAYER_WEIGHTS: &[&str] = &[
     "post_attention_layernorm.weight",
     "mlp.gate.weight",
@@ -83,9 +109,12 @@ use self::quantized::{
 };
 use self::shape_validation::{validate_decoder_meta_shapes, validate_decoder_shapes};
 
-/// Résumé de validation header-only d'un décodeur Qwen.
+/// Alias rétro-compatible de [`DecoderContract`].
+pub type QwenDecoderContract = DecoderContract;
+
+/// Résumé de validation header-only d'un décodeur causal.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QwenDecoderContract {
+pub struct DecoderContract {
     /// Nombre de shards safetensors inspectés.
     pub shard_count: usize,
     /// Nombre de tenseurs catalogués dans les headers safetensors.
@@ -104,39 +133,62 @@ pub struct QwenDecoderContract {
     pub mtp_tensor_count: usize,
 }
 
-/// Charge un décodeur Qwen minimal depuis les assets locaux.
+/// Charge un décodeur causal depuis les assets locaux.
+///
+/// Générique pour la famille SwiGLU + RMSNorm + RoPE + GQA (Qwen, Llama,
+/// Mistral, Mixtral) : les features (MoE, attention linéaire hybride, q/k-norm,
+/// biais, tying des embeddings) sont détectées depuis la config et la présence
+/// des poids, sans hypothèse `model_type`.
+///
+/// # Errors
+///
+/// Renvoie une erreur si le modèle sort du périmètre minimal supporté.
+pub fn load_causal_decoder(assets: &ModelAssets) -> Result<CausalDecoder> {
+    load_causal_decoder_from_shards(&assets.config, &assets.shards, &assets.catalog)
+}
+
+/// Alias rétro-compatible de [`load_causal_decoder`] (ancien nom Qwen-spécifique).
 ///
 /// # Errors
 ///
 /// Renvoie une erreur si le modèle sort du périmètre minimal supporté.
 pub fn load_qwen_causal_decoder(assets: &ModelAssets) -> Result<CausalDecoder> {
-    load_qwen_causal_decoder_from_shards(&assets.config, &assets.shards, &assets.catalog)
+    load_causal_decoder(assets)
 }
 
-/// Vérifie le contrat Qwen sans charger les payloads de poids.
+/// Vérifie le contrat du décodeur sans charger les payloads de poids.
 ///
 /// # Errors
 ///
 /// Renvoie une erreur si un poids requis, une forme ou un dtype est incompatible.
-pub fn verify_qwen_decoder_contract(assets: &ModelAssets) -> Result<QwenDecoderContract> {
+pub fn verify_decoder_contract(assets: &ModelAssets) -> Result<DecoderContract> {
     let mut contract =
-        verify_qwen_decoder_contract_from_shards(&assets.config, &assets.shards, &assets.catalog)?;
+        verify_decoder_contract_from_shards(&assets.config, &assets.shards, &assets.catalog)?;
     contract.mtp_declared = assets.config.mtp_num_hidden_layers.unwrap_or(0) > 0;
     contract.mtp_weights_present = assets.mtp.is_available();
     contract.mtp_tensor_count = assets.mtp.tensor_count;
     Ok(contract)
 }
 
-/// Vérifie un contrat Qwen depuis des shards safetensors.
+/// Alias rétro-compatible de [`verify_decoder_contract`].
+///
+/// # Errors
+///
+/// Renvoie une erreur si un poids requis, une forme ou un dtype est incompatible.
+pub fn verify_qwen_decoder_contract(assets: &ModelAssets) -> Result<DecoderContract> {
+    verify_decoder_contract(assets)
+}
+
+/// Vérifie un contrat de décodeur depuis des shards safetensors.
 ///
 /// # Errors
 ///
 /// Renvoie une erreur si les headers ne satisfont pas le contrat du décodeur.
-pub fn verify_qwen_decoder_contract_from_shards(
+pub fn verify_decoder_contract_from_shards(
     config: &ModelConfig,
     shards: &[PathBuf],
     catalog: &WeightCatalog,
-) -> Result<QwenDecoderContract> {
+) -> Result<DecoderContract> {
     validate_supported_config(config, catalog)?;
     let prefixes = QwenPrefixes::detect(catalog);
     let specs = decoder_specs(config, &prefixes, catalog);
@@ -145,7 +197,7 @@ pub fn verify_qwen_decoder_contract_from_shards(
     validate_decoder_meta_shapes(config, &metas)?;
     let required_specs = specs.iter().filter(|spec| spec.required).count();
     let present_specs = metas.len();
-    Ok(QwenDecoderContract {
+    Ok(DecoderContract {
         shard_count: shards.len(),
         catalog_tensors: catalog.tensor_count(),
         required_specs,
@@ -157,12 +209,25 @@ pub fn verify_qwen_decoder_contract_from_shards(
     })
 }
 
-/// Charge un décodeur Qwen minimal depuis des shards safetensors.
+/// Alias rétro-compatible de [`verify_decoder_contract_from_shards`].
+///
+/// # Errors
+///
+/// Renvoie une erreur si les headers ne satisfont pas le contrat du décodeur.
+pub fn verify_qwen_decoder_contract_from_shards(
+    config: &ModelConfig,
+    shards: &[PathBuf],
+    catalog: &WeightCatalog,
+) -> Result<DecoderContract> {
+    verify_decoder_contract_from_shards(config, shards, catalog)
+}
+
+/// Charge un décodeur causal depuis des shards safetensors.
 ///
 /// # Errors
 ///
 /// Renvoie une erreur si les poids attendus manquent ou ne sont pas F32/BF16/F16.
-pub fn load_qwen_causal_decoder_from_shards(
+pub fn load_causal_decoder_from_shards(
     config: &ModelConfig,
     shards: &[PathBuf],
     catalog: &WeightCatalog,
@@ -174,7 +239,32 @@ pub fn load_qwen_causal_decoder_from_shards(
     CausalDecoder::from_decoder_tensors(tensors, config.into())
 }
 
+/// Alias rétro-compatible de [`load_causal_decoder_from_shards`].
+///
+/// # Errors
+///
+/// Renvoie une erreur si les poids attendus manquent ou ne sont pas F32/BF16/F16.
+pub fn load_qwen_causal_decoder_from_shards(
+    config: &ModelConfig,
+    shards: &[PathBuf],
+    catalog: &WeightCatalog,
+) -> Result<CausalDecoder> {
+    load_causal_decoder_from_shards(config, shards, catalog)
+}
+
 fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> Result<()> {
+    // Gemma 2 déclare un softcapping (tanh) des scores d'attention et des logits
+    // finaux que le forward n'implémente pas : refuser net plutôt que générer du
+    // charabia. Gemma 3 sérialise ces clés à `null` (qk-norm a remplacé le cap).
+    if config.attn_logit_softcapping.is_some_and(|cap| cap != 0.0)
+        || (!config.is_gemma4() && config.final_logit_softcapping.is_some_and(|cap| cap != 0.0))
+    {
+        return Err(InferError::Config(format!(
+            "logit softcapping non supporté (Gemma 2): attn={:?}, final={:?}",
+            config.attn_logit_softcapping, config.final_logit_softcapping
+        )));
+    }
+    validate_rope_scaling(config)?;
     if let Some(quant) = &config.quantization {
         validate_affine_quantization(quant)?;
     }
@@ -185,6 +275,32 @@ fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> R
         return Err(InferError::Config(format!(
             "poids de couche hors config: layer {layer}, num_hidden_layers={}",
             config.num_hidden_layers
+        )));
+    }
+    Ok(())
+}
+
+/// Valide la section `rope_scaling` déclarée par la config.
+///
+/// Seul le type `linear` est implémenté (Gemma 3 ≥4B : ×8 des positions des
+/// couches globales). Pour Gemma, un autre type produirait du charabia → refus
+/// net, comme le softcapping Gemma 2. Hors Gemma, le statu quo du chargeur
+/// générique est préservé : les types non implémentés (llama3 de Llama 3.2,
+/// yarn…) restent ignorés.
+fn validate_rope_scaling(config: &ModelConfig) -> Result<()> {
+    let Some(scaling) = config.rope_scaling.as_ref() else {
+        return Ok(());
+    };
+    let scaling_type = scaling.scaling_type();
+    if scaling_type == "linear" && config.rope_position_scale().is_none() {
+        return Err(InferError::Config(format!(
+            "rope_scaling linear sans facteur exploitable: {:?}",
+            scaling.factor
+        )));
+    }
+    if config.is_gemma() && !matches!(scaling_type, "linear" | "default") {
+        return Err(InferError::Config(format!(
+            "rope_scaling type {scaling_type} non supporté pour Gemma"
         )));
     }
     Ok(())
@@ -407,7 +523,43 @@ fn load_decoder_tensors(
         out.insert(spec.target.clone(), tensor);
     }
 
+    tie_lm_head_to_embeddings(config, &mut out);
+    bake_gemma_norm_offset(config, &mut out);
     Ok(out)
+}
+
+/// Intègre l'offset `1 + weight` des RMSNorm Gemma 2/3 dans les poids.
+///
+/// Gemma 4 sérialise des poids RMSNorm directs (`x_normé · weight`), donc il
+/// emprunte le même chemin que Qwen/Llama pour éviter de doubler les échelles.
+fn bake_gemma_norm_offset(config: &ModelConfig, tensors: &mut HashMap<String, DecoderTensor>) {
+    if !config.is_gemma() || config.is_gemma4() {
+        return;
+    }
+    for (key, tensor) in tensors.iter_mut() {
+        if !key.ends_with("norm.weight") {
+            continue;
+        }
+        if let DecoderTensor::Dense(weight) = tensor {
+            *weight = weight.map(|value| value + 1.0);
+        }
+    }
+}
+
+/// Substitue les embeddings d'entrée à la tête LM pour les modèles à
+/// embeddings liés (`tie_word_embeddings`) qui ne stockent pas de `lm_head.weight`.
+///
+/// Llama-3.2-1B/3B, Qwen3-0.6B, Gemma… réutilisent `embed_tokens.weight` comme
+/// projection finale ; mlx_lm ne sérialise donc pas de tête séparée. Le clone est
+/// borné aux modèles tied : les Qwen prod (27B/30B/35B) stockent leur `lm_head`
+/// et empruntent ce chemin sans aucune copie (byte-identité préservée).
+fn tie_lm_head_to_embeddings<T: Clone>(config: &ModelConfig, tensors: &mut HashMap<String, T>) {
+    if !config.tie_word_embeddings || tensors.contains_key(LM_HEAD_WEIGHT) {
+        return;
+    }
+    if let Some(embed) = tensors.get(EMBED_TOKENS_WEIGHT).cloned() {
+        tensors.insert(LM_HEAD_WEIGHT.to_string(), embed);
+    }
 }
 
 fn read_shard_headers(shards: &[PathBuf]) -> Result<Vec<ShardHeader>> {
@@ -522,6 +674,7 @@ fn decoder_contract_metas(
         let shape = logical_contract_shape(config, spec, entry_ref, &entries)?;
         out.insert(spec.target.clone(), TensorMeta { shape });
     }
+    tie_lm_head_to_embeddings(config, &mut out);
     Ok(out)
 }
 
@@ -555,6 +708,13 @@ fn decoder_specs(
         true,
     )
     .collect::<Vec<_>>();
+    // La tête LM n'est requise que pour les modèles non liés ; les modèles
+    // `tie_word_embeddings` réutilisent `embed_tokens.weight` (substitué après chargement).
+    specs.extend(specs_for(
+        prefixes,
+        [LM_HEAD_WEIGHT.to_string()],
+        !config.tie_word_embeddings,
+    ));
     for layer in 0..config.num_hidden_layers {
         let required_weights = if config.is_full_attention_layer(layer) {
             FULL_ATTENTION_LAYER_WEIGHTS
@@ -563,6 +723,11 @@ fn decoder_specs(
         };
         let layer_required = required_weights
             .iter()
+            .filter(|suffix| {
+                !(config.attention_k_eq_v
+                    && config.is_gemma4_full_layer(layer)
+                    && **suffix == "self_attn.v_proj.weight")
+            })
             .map(|suffix| layer_target(layer, suffix))
             .collect::<Vec<_>>();
         specs.extend(specs_for(prefixes, layer_required, true));
@@ -579,15 +744,28 @@ fn decoder_specs(
             specs.extend(specs_for(prefixes, layer_mlp, true));
         }
 
+        let layer_gemma4_moe = GEMMA4_PARALLEL_MOE_WEIGHTS
+            .iter()
+            .map(|suffix| layer_target(layer, suffix))
+            .collect::<Vec<_>>();
+        let has_gemma4_moe = config.enable_moe_block
+            || layer_gemma4_moe
+                .iter()
+                .any(|target| catalog.contains(&prefixes.source_for(target)));
+        if has_gemma4_moe {
+            specs.extend(specs_for(prefixes, layer_gemma4_moe, true));
+        }
+
         let layer_moe = MOE_LAYER_WEIGHTS
             .iter()
             .map(|suffix| layer_target(layer, suffix))
             .collect::<Vec<_>>();
-        let has_moe = config.is_moe()
-            || layer_moe
-                .iter()
-                .filter(|target| !target.ends_with("post_attention_layernorm.weight"))
-                .any(|target| catalog.contains(&prefixes.source_for(target)));
+        let has_moe = !config.enable_moe_block
+            && (config.is_moe()
+                || layer_moe
+                    .iter()
+                    .filter(|target| !target.ends_with("post_attention_layernorm.weight"))
+                    .any(|target| catalog.contains(&prefixes.source_for(target))));
         if has_moe {
             specs.extend(specs_for(prefixes, layer_moe, true));
         }
@@ -602,6 +780,13 @@ fn decoder_specs(
         if has_shared_expert {
             specs.extend(specs_for(prefixes, layer_shared_expert, true));
         }
+
+        // Gemma : double norme feed-forward, requise quand l'architecture est Gemma.
+        let gemma_ffn_norms = GEMMA_FFN_NORM_WEIGHTS
+            .iter()
+            .map(|suffix| layer_target(layer, suffix))
+            .collect::<Vec<_>>();
+        specs.extend(specs_for(prefixes, gemma_ffn_norms, config.is_gemma()));
 
         let layer_optional = OPTIONAL_LAYER_WEIGHTS
             .iter()

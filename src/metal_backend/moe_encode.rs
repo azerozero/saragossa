@@ -41,7 +41,27 @@ impl MetalExecutor {
             checked_u32(gate.groups, "gate/up groups")?,
             checked_u32(lhs_rows, "gate/up lhs_rows")?,
         ];
-        encoder.set_compute_pipeline_state(&self.affine_gather_gate_up_swiglu_fast_u4_gs64_f32);
+        let pipeline = if gate.bits == FAST_QMV_BITS {
+            (
+                &self.affine_gather_gate_up_swiglu_fast_u4_gs64_f32,
+                8,
+                "affine_gather_gate_up_swiglu_fast_u4_gs64_f32",
+            )
+        } else if gate.group_size == FAST_QMV_GROUP_SIZE {
+            (
+                &self.affine_gather_gate_up_swiglu_fast_u8_gs64_f32,
+                8,
+                "affine_gather_gate_up_swiglu_fast_u8_gs64_f32",
+            )
+        } else {
+            (
+                &self.affine_gather_gate_up_swiglu_fast_u8_gs128_f32,
+                8,
+                "affine_gather_gate_up_swiglu_fast_u8_gs128_f32",
+            )
+        };
+        let (pipeline, rows_per_threadgroup, kernel_name) = pipeline;
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(&gate.packed), 0);
         encoder.set_buffer(2, Some(&gate.scales), 0);
@@ -53,11 +73,15 @@ impl MetalExecutor {
         encoder.set_buffer(8, Some(output_buffer), 0);
         set_u32_bytes(encoder, 9, &dims, "gate_up_dims")?;
         set_u32_bytes(encoder, 10, &quant, "gate_up_quant")?;
+        trace_dispatch_path(kernel_name, topk, gate.out_dim, gate.in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
                 checked_nsuint(topk, "gate/up topk")?,
-                checked_nsuint(gate.out_dim.div_ceil(8), "gate/up out groups")?,
+                checked_nsuint(
+                    gate.out_dim.div_ceil(rows_per_threadgroup),
+                    "gate/up out groups",
+                )?,
                 1,
             ),
             MTLSize::new(64, 1, 1),
@@ -68,13 +92,14 @@ impl MetalExecutor {
 
     /// Fond les deux QMV (gate_proj, up_proj) + le swiglu du **shared-expert**
     /// (single-row, batch=1) en UN dispatch via
-    /// `affine_gate_up_swiglu_fast_u4_gs64_f32`. Remplace 2 QMV série + 1 swiglu par
-    /// un seul micro-kernel (tranche 3 : le shared-expert est le poste latence-bound
-    /// du MoE). Écrit `silu(gate·x)·(up·x)` dans `output_buffer [out_dim]`.
+    /// `affine_gate_up_swiglu_fast_*`. Remplace 2 QMV série + 1 swiglu par un seul
+    /// micro-kernel (tranche 3 : le shared-expert est le poste latence-bound du
+    /// MoE). Écrit `silu(gate·x)·(up·x)` dans `output_buffer [out_dim]`.
     ///
     /// Renvoie `Ok(false)` (l'appelant garde le chemin 3-dispatch, résultat
-    /// inchangé) si `gate`/`up` ne sont pas tous deux `AffineQuantized` 4-bit gs64
-    /// avec `in_dim % 512 == 0` et des dimensions identiques.
+    /// inchangé) si `gate`/`up` ne sont pas tous deux `AffineQuantized` fast
+    /// (u4/gs64 ou u8/gs64|gs128) avec `in_dim % 512 == 0` et des dimensions
+    /// identiques.
     ///
     /// # Errors
     ///
@@ -101,10 +126,15 @@ impl MetalExecutor {
         else {
             return Ok(false);
         };
-        let eligible = gate_w.bits() == FAST_QMV_BITS
-            && up_w.bits() == FAST_QMV_BITS
-            && gate_w.group_size() == FAST_QMV_GROUP_SIZE
-            && up_w.group_size() == FAST_QMV_GROUP_SIZE
+        let gate_bits = gate_w.bits();
+        let gate_group_size = gate_w.group_size();
+        let eligible_quant = gate_bits == up_w.bits()
+            && gate_group_size == up_w.group_size()
+            && ((gate_bits == FAST_QMV_BITS && gate_group_size == FAST_QMV_GROUP_SIZE)
+                || (gate_bits == 8
+                    && matches!(gate_group_size, FAST_QMV_GROUP_SIZE | 128)
+                    && *gate_out % 8 == 0));
+        let eligible = eligible_quant
             && in_dim % 512 == 0
             && *gate_in == in_dim
             && *up_in == in_dim
@@ -115,7 +145,7 @@ impl MetalExecutor {
         }
         let out_dim = *gate_out;
         let groups = in_dim
-            .checked_div(gate_w.group_size())
+            .checked_div(gate_group_size)
             .ok_or_else(|| InferError::Metal("shared gate/up group_size nul".to_string()))?;
         let dims = [
             checked_u32(out_dim, "shared gate/up out_dim")?,
@@ -134,7 +164,23 @@ impl MetalExecutor {
             self.cached_buffer_from_f32_as_bf16(up_w.scales().data(), "shared_up_scales")?;
         let up_biases =
             self.cached_buffer_from_f32_as_bf16(up_w.biases().data(), "shared_up_biases")?;
-        encoder.set_compute_pipeline_state(&self.affine_gate_up_swiglu_fast_u4_gs64_f32);
+        let (pipeline, kernel_name) = if gate_bits == FAST_QMV_BITS {
+            (
+                &self.affine_gate_up_swiglu_fast_u4_gs64_f32,
+                "affine_gate_up_swiglu_fast_u4_gs64_f32",
+            )
+        } else if gate_group_size == FAST_QMV_GROUP_SIZE {
+            (
+                &self.affine_gate_up_swiglu_fast_u8_gs64_f32,
+                "affine_gate_up_swiglu_fast_u8_gs64_f32",
+            )
+        } else {
+            (
+                &self.affine_gate_up_swiglu_fast_u8_gs128_f32,
+                "affine_gate_up_swiglu_fast_u8_gs128_f32",
+            )
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(&gate_packed), 0);
         encoder.set_buffer(2, Some(&gate_scales), 0);
@@ -144,6 +190,7 @@ impl MetalExecutor {
         encoder.set_buffer(6, Some(&up_biases), 0);
         encoder.set_buffer(7, Some(output_buffer), 0);
         set_u32_bytes(encoder, 8, &dims, "shared_gate_up_dims")?;
+        trace_dispatch_path(kernel_name, 1, out_dim, in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
@@ -193,10 +240,13 @@ impl MetalExecutor {
         else {
             return Ok(false);
         };
-        let eligible = *gate_bits == FAST_QMV_BITS
-            && *up_bits == FAST_QMV_BITS
-            && *gate_group_size == FAST_QMV_GROUP_SIZE
-            && *up_group_size == FAST_QMV_GROUP_SIZE
+        let eligible_quant = *gate_bits == *up_bits
+            && *gate_group_size == *up_group_size
+            && ((*gate_bits == FAST_QMV_BITS && *gate_group_size == FAST_QMV_GROUP_SIZE)
+                || (*gate_bits == 8
+                    && matches!(*gate_group_size, FAST_QMV_GROUP_SIZE | 128)
+                    && *gate_out % 8 == 0));
+        let eligible = eligible_quant
             && in_dim % 512 == 0
             && *gate_in == in_dim
             && *up_in == in_dim
@@ -211,7 +261,23 @@ impl MetalExecutor {
             checked_u32(*gate_packed_cols, "shared gate/up packed_cols")?,
             checked_u32(*groups, "shared gate/up groups")?,
         ];
-        encoder.set_compute_pipeline_state(&self.affine_gate_up_swiglu_fast_u4_gs64_f32);
+        let (pipeline, kernel_name) = if *gate_bits == FAST_QMV_BITS {
+            (
+                &self.affine_gate_up_swiglu_fast_u4_gs64_f32,
+                "affine_gate_up_swiglu_fast_u4_gs64_f32",
+            )
+        } else if *gate_group_size == FAST_QMV_GROUP_SIZE {
+            (
+                &self.affine_gate_up_swiglu_fast_u8_gs64_f32,
+                "affine_gate_up_swiglu_fast_u8_gs64_f32",
+            )
+        } else {
+            (
+                &self.affine_gate_up_swiglu_fast_u8_gs128_f32,
+                "affine_gate_up_swiglu_fast_u8_gs128_f32",
+            )
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(gate_packed), 0);
         encoder.set_buffer(2, Some(gate_scales), 0);
@@ -221,11 +287,226 @@ impl MetalExecutor {
         encoder.set_buffer(6, Some(up_biases), 0);
         encoder.set_buffer(7, Some(output_buffer), 0);
         set_u32_bytes(encoder, 8, &dims, "shared_gate_up_dims")?;
+        trace_dispatch_path(kernel_name, 1, *gate_out, in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
                 1,
                 checked_nsuint(gate_out.div_ceil(8), "shared gate/up out groups")?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(true)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fusion QMV shared gate_proj + gate scalaire"
+    )]
+    pub(crate) fn encode_qmv_plus_shared_gate_fast_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        weight: &MetalLinearWeightBuffers,
+        shared_gate: &MetalLinearWeightBuffers,
+        output_buffer: &BufferRef,
+        shared_gate_buffer: &BufferRef,
+        in_dim: usize,
+    ) -> Result<bool> {
+        let (
+            MetalLinearWeightBuffers::AffineQuantized {
+                packed,
+                scales,
+                biases,
+                out_dim,
+                in_dim: weight_in,
+                packed_cols,
+                group_size,
+                bits,
+                groups,
+            },
+            MetalLinearWeightBuffers::AffineQuantized {
+                packed: shared_gate_packed,
+                scales: shared_gate_scales,
+                biases: shared_gate_biases,
+                out_dim: shared_gate_out,
+                in_dim: shared_gate_in,
+                packed_cols: shared_gate_packed_cols,
+                group_size: shared_gate_group_size,
+                bits: shared_gate_bits,
+                groups: shared_gate_groups,
+            },
+        ) = (weight, shared_gate)
+        else {
+            return Ok(false);
+        };
+        let eligible = *bits == 8
+            && *shared_gate_bits == 8
+            && *group_size == FAST_QMV_GROUP_SIZE
+            && *shared_gate_group_size == FAST_QMV_GROUP_SIZE
+            && in_dim % 512 == 0
+            && *weight_in == in_dim
+            && *shared_gate_in == in_dim
+            && *shared_gate_out == 1
+            && *out_dim % 8 == 0
+            && packed_cols == shared_gate_packed_cols
+            && groups == shared_gate_groups;
+        if !eligible {
+            return Ok(false);
+        }
+        let dims = [
+            checked_u32(*out_dim, "shared gate qmv out_dim")?,
+            checked_u32(in_dim, "shared gate qmv in_dim")?,
+            checked_u32(*packed_cols, "shared gate qmv packed_cols")?,
+            checked_u32(*groups, "shared gate qmv groups")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.affine_qmv_plus_one_fast_aligned_u8_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed), 0);
+        encoder.set_buffer(2, Some(scales), 0);
+        encoder.set_buffer(3, Some(biases), 0);
+        encoder.set_buffer(4, Some(shared_gate_packed), 0);
+        encoder.set_buffer(5, Some(shared_gate_scales), 0);
+        encoder.set_buffer(6, Some(shared_gate_biases), 0);
+        encoder.set_buffer(7, Some(output_buffer), 0);
+        encoder.set_buffer(8, Some(shared_gate_buffer), 0);
+        set_u32_bytes(encoder, 9, &dims, "shared_gate_qmv_dims")?;
+        trace_dispatch_path(
+            "affine_qmv_plus_one_fast_aligned_u8_gs64_f32",
+            1,
+            out_dim.saturating_add(1),
+            in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                1,
+                checked_nsuint(
+                    out_dim.div_ceil(8).saturating_add(1),
+                    "shared gate qmv groups",
+                )?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(true)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fusion shared-expert: deux projections + gate scalaire"
+    )]
+    pub(crate) fn encode_gate_up_swiglu_shared_gate_fast_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        gate: &MetalLinearWeightBuffers,
+        up: &MetalLinearWeightBuffers,
+        shared_gate: &MetalLinearWeightBuffers,
+        output_buffer: &BufferRef,
+        shared_gate_buffer: &BufferRef,
+        in_dim: usize,
+    ) -> Result<bool> {
+        let (
+            MetalLinearWeightBuffers::AffineQuantized {
+                packed: gate_packed,
+                scales: gate_scales,
+                biases: gate_biases,
+                out_dim: gate_out,
+                in_dim: gate_in,
+                packed_cols: gate_packed_cols,
+                group_size: gate_group_size,
+                bits: gate_bits,
+                groups,
+            },
+            MetalLinearWeightBuffers::AffineQuantized {
+                packed: up_packed,
+                scales: up_scales,
+                biases: up_biases,
+                out_dim: up_out,
+                in_dim: up_in,
+                packed_cols: up_packed_cols,
+                group_size: up_group_size,
+                bits: up_bits,
+                ..
+            },
+            MetalLinearWeightBuffers::AffineQuantized {
+                packed: shared_gate_packed,
+                scales: shared_gate_scales,
+                biases: shared_gate_biases,
+                out_dim: shared_gate_out,
+                in_dim: shared_gate_in,
+                packed_cols: shared_gate_packed_cols,
+                group_size: shared_gate_group_size,
+                bits: shared_gate_bits,
+                groups: shared_gate_groups,
+            },
+        ) = (gate, up, shared_gate)
+        else {
+            return Ok(false);
+        };
+        let eligible = *gate_bits == 8
+            && *up_bits == 8
+            && *shared_gate_bits == 8
+            && matches!(*gate_group_size, FAST_QMV_GROUP_SIZE | 128)
+            && *up_group_size == *gate_group_size
+            && *shared_gate_group_size == *gate_group_size
+            && in_dim % 512 == 0
+            && *gate_in == in_dim
+            && *up_in == in_dim
+            && *shared_gate_in == in_dim
+            && gate_out == up_out
+            && *shared_gate_out == 1
+            && *gate_out % 8 == 0
+            && gate_packed_cols == up_packed_cols
+            && gate_packed_cols == shared_gate_packed_cols
+            && groups == shared_gate_groups;
+        if !eligible {
+            return Ok(false);
+        }
+        let dims = [
+            checked_u32(*gate_out, "shared gate/up+scalar out_dim")?,
+            checked_u32(in_dim, "shared gate/up+scalar in_dim")?,
+            checked_u32(*gate_packed_cols, "shared gate/up+scalar packed_cols")?,
+            checked_u32(*groups, "shared gate/up+scalar groups")?,
+        ];
+        let (pipeline, kernel_name) = match (*gate_group_size, *shared_gate_group_size) {
+            (FAST_QMV_GROUP_SIZE, FAST_QMV_GROUP_SIZE) => (
+                &self.affine_gate_up_swiglu_gate_fast_u8_gs64_f32,
+                "affine_gate_up_swiglu_gate_fast_u8_gs64_f32",
+            ),
+            (128, 128) => (
+                &self.affine_gate_up_swiglu_gate_fast_u8_gs128_f32,
+                "affine_gate_up_swiglu_gate_fast_u8_gs128_f32",
+            ),
+            _ => return Ok(false),
+        };
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(gate_packed), 0);
+        encoder.set_buffer(2, Some(gate_scales), 0);
+        encoder.set_buffer(3, Some(gate_biases), 0);
+        encoder.set_buffer(4, Some(up_packed), 0);
+        encoder.set_buffer(5, Some(up_scales), 0);
+        encoder.set_buffer(6, Some(up_biases), 0);
+        encoder.set_buffer(7, Some(shared_gate_packed), 0);
+        encoder.set_buffer(8, Some(shared_gate_scales), 0);
+        encoder.set_buffer(9, Some(shared_gate_biases), 0);
+        encoder.set_buffer(10, Some(output_buffer), 0);
+        encoder.set_buffer(11, Some(shared_gate_buffer), 0);
+        set_u32_bytes(encoder, 12, &dims, "shared_gate_up_scalar_dims")?;
+        trace_dispatch_path(kernel_name, 1, gate_out.saturating_add(1), in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                1,
+                checked_nsuint(
+                    gate_out.div_ceil(8).saturating_add(1),
+                    "shared gate/up+scalar out groups",
+                )?,
                 1,
             ),
             MTLSize::new(64, 1, 1),
@@ -297,6 +578,7 @@ impl MetalExecutor {
         encoder.set_buffer(1, Some(scores_buffer), 0);
         encoder.set_buffer(2, Some(output_buffer), 0);
         set_u32_bytes(encoder, 3, &dims, "weighted_dims")?;
+        trace_dispatch_path("weighted_sum_topk_f32", 1, out_dim, topk);
         self.dispatch_1d(encoder, &self.weighted_sum_topk_f32, out_dim)
     }
 
@@ -323,6 +605,7 @@ impl MetalExecutor {
         encoder.set_buffer(1, Some(scores_buffer), 0);
         encoder.set_buffer(2, Some(output_buffer), 0);
         set_u32_bytes(encoder, 3, &dims, "weighted_grouped_dims")?;
+        trace_dispatch_path("weighted_sum_grouped_topk_f32", rows, out_dim, topk_per_row);
         self.dispatch_1d(encoder, &self.weighted_sum_grouped_topk_f32, len)
     }
 
@@ -351,6 +634,12 @@ impl MetalExecutor {
         encoder.set_buffer(2, Some(residual_buffer), 0);
         encoder.set_buffer(3, Some(output_buffer), 0);
         set_u32_bytes(encoder, 4, &dims, "weighted_grouped_add_dims")?;
+        trace_dispatch_path(
+            "weighted_sum_add_grouped_topk_f32",
+            rows,
+            out_dim,
+            topk_per_row,
+        );
         self.dispatch_1d(encoder, &self.weighted_sum_add_grouped_topk_f32, len)
     }
 
@@ -375,7 +664,117 @@ impl MetalExecutor {
         encoder.set_buffer(2, Some(residual_buffer), 0);
         encoder.set_buffer(3, Some(output_buffer), 0);
         set_u32_bytes(encoder, 4, &dims, "weighted_add_dims")?;
+        trace_dispatch_path("weighted_sum_add_topk_f32", 1, out_dim, topk);
         self.dispatch_1d(encoder, &self.weighted_sum_add_topk_f32, out_dim)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "epilogue MoE shared: topk + residual + shared gate"
+    )]
+    pub(crate) fn encode_weighted_sum_add_shared_topk(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        src_buffer: &BufferRef,
+        scores_buffer: &BufferRef,
+        residual_buffer: &BufferRef,
+        shared_buffer: &BufferRef,
+        shared_gate_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        topk: usize,
+        out_dim: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(topk, "weighted shared topk")?,
+            checked_u32(out_dim, "weighted shared out_dim")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.weighted_sum_add_shared_topk_f32);
+        encoder.set_buffer(0, Some(src_buffer), 0);
+        encoder.set_buffer(1, Some(scores_buffer), 0);
+        encoder.set_buffer(2, Some(residual_buffer), 0);
+        encoder.set_buffer(3, Some(shared_buffer), 0);
+        encoder.set_buffer(4, Some(shared_gate_buffer), 0);
+        encoder.set_buffer(5, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 6, &dims, "weighted_shared_dims")?;
+        trace_dispatch_path("weighted_sum_add_shared_topk_f32", 1, out_dim, topk);
+        self.dispatch_1d(encoder, &self.weighted_sum_add_shared_topk_f32, out_dim)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fusion MoE down_proj + somme top-k + shared expert"
+    )]
+    pub(crate) fn encode_gather_down_weighted_shared_u8_gs64(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        weight: &StackedAffineBuffers,
+        indices_buffer: &BufferRef,
+        scores_buffer: &BufferRef,
+        residual_buffer: &BufferRef,
+        shared_buffer: &BufferRef,
+        shared_gate_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        topk: usize,
+    ) -> Result<bool> {
+        if !fused_moe_down_weighted_u8_enabled() {
+            return Ok(false);
+        }
+        let eligible = weight.bits == 8
+            && weight.group_size == FAST_QMV_GROUP_SIZE
+            && weight.in_dim % 512 == 0
+            && weight.out_dim % 8 == 0
+            && topk > 0;
+        if !eligible {
+            return Ok(false);
+        }
+        let dims = [
+            checked_u32(topk, "down weighted topk")?,
+            checked_u32(weight.out_dim, "down weighted out_dim")?,
+            checked_u32(weight.in_dim, "down weighted in_dim")?,
+            checked_u32(weight.packed_cols, "down weighted packed_cols")?,
+        ];
+        let groups = checked_u32(weight.groups, "down weighted groups")?;
+        encoder
+            .set_compute_pipeline_state(&self.affine_gather_down_weighted_shared_fast_u8_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(&weight.packed), 0);
+        encoder.set_buffer(2, Some(&weight.scales), 0);
+        encoder.set_buffer(3, Some(&weight.biases), 0);
+        encoder.set_buffer(4, Some(indices_buffer), 0);
+        encoder.set_buffer(5, Some(scores_buffer), 0);
+        encoder.set_buffer(6, Some(residual_buffer), 0);
+        encoder.set_buffer(7, Some(shared_buffer), 0);
+        encoder.set_buffer(8, Some(shared_gate_buffer), 0);
+        encoder.set_buffer(9, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 10, &dims, "down_weighted_dims")?;
+        set_u32_bytes(encoder, 11, &[groups], "down_weighted_groups")?;
+        profile_dispatch_shape(DispatchProfileShape::gather(
+            "gather_down_weighted_shared_u8_gs64",
+            topk,
+            topk,
+            weight.in_dim,
+            weight.out_dim,
+            weight.group_size,
+            weight.bits,
+        ));
+        trace_dispatch_path(
+            "affine_gather_down_weighted_shared_fast_u8_gs64_f32",
+            topk,
+            weight.out_dim,
+            weight.in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(weight.out_dim.div_ceil(8), "down weighted out groups")?,
+                1,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(true)
     }
 
     pub(super) fn encode_add_sigmoid_scaled(
@@ -392,7 +791,36 @@ impl MetalExecutor {
         encoder.set_buffer(1, Some(gate_buffer), 0);
         encoder.set_buffer(2, Some(dst_buffer), 0);
         set_u32_bytes(encoder, 3, &[len_u32], "sigmoid_scaled_add_len")?;
+        trace_dispatch_path("add_sigmoid_scaled_f32", 1, len, 0);
         self.dispatch_1d(encoder, &self.add_sigmoid_scaled_f32, len)
+    }
+
+    pub(super) fn encode_add_sigmoid_scaled_rows(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        src_buffer: &BufferRef,
+        gate_buffer: &BufferRef,
+        dst_buffer: &BufferRef,
+        rows: usize,
+        row_dim: usize,
+    ) -> Result<()> {
+        if rows == 0 || row_dim == 0 {
+            return Err(InferError::Dimension(format!(
+                "sigmoid scaled rows invalide rows={rows}, row_dim={row_dim}"
+            )));
+        }
+        let len = checked_len(rows, row_dim, "sigmoid scaled rows len")?;
+        let dims = [
+            checked_u32(rows, "sigmoid scaled rows")?,
+            checked_u32(row_dim, "sigmoid scaled row dim")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.add_sigmoid_scaled_rows_f32);
+        encoder.set_buffer(0, Some(src_buffer), 0);
+        encoder.set_buffer(1, Some(gate_buffer), 0);
+        encoder.set_buffer(2, Some(dst_buffer), 0);
+        set_u32_bytes(encoder, 3, &dims, "sigmoid_scaled_rows_dims")?;
+        trace_dispatch_path("add_sigmoid_scaled_rows_f32", rows, row_dim, 0);
+        self.dispatch_1d(encoder, &self.add_sigmoid_scaled_rows_f32, len)
     }
 
     pub(super) fn encode_topk_softmax(
@@ -411,18 +839,22 @@ impl MetalExecutor {
             checked_u32(topk, "topk")?,
         ];
         let parallel = topk_parallel_enabled();
-        let pipeline = if parallel {
-            &self.topk_softmax_f32
+        let fast_topk8 = topk8_fast_enabled() && count == 256 && topk == 8;
+        let (pipeline, kernel_name) = if fast_topk8 {
+            (&self.topk8_softmax_256_f32, "topk8_softmax_256_f32")
+        } else if parallel {
+            (&self.topk_softmax_f32, "topk_softmax_f32")
         } else {
-            &self.topk_softmax_serial_f32
+            (&self.topk_softmax_serial_f32, "topk_softmax_serial_f32")
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(logits_buffer), 0);
         encoder.set_buffer(1, Some(indices_buffer), 0);
         encoder.set_buffer(2, Some(scores_buffer), 0);
         set_u32_bytes(encoder, 3, &dims, "topk_dims")?;
+        trace_dispatch_path(kernel_name, 1, topk, count);
         profile_dispatch();
-        if parallel {
+        if fast_topk8 || parallel {
             encoder.dispatch_thread_groups(
                 MTLSize::new(1, 1, 1),
                 MTLSize::new(TOPK_SOFTMAX_TG_WIDTH, 1, 1),
@@ -527,6 +959,7 @@ impl MetalExecutor {
         encoder.set_buffer(1, Some(indices_buffer), 0);
         encoder.set_buffer(2, Some(scores_buffer), 0);
         set_u32_bytes(encoder, 3, &dims, "topk_rows_dims")?;
+        trace_dispatch_path("topk_softmax_rows_f32", rows, topk, count);
         self.dispatch_1d(encoder, &self.topk_softmax_rows_f32, rows)
     }
 }

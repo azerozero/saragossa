@@ -4,6 +4,36 @@ use super::attention_checks::TailMoeSharedShape;
 use super::*;
 
 const FULL_ATTN_PREFILL_TG_WIDTH: u64 = 256;
+const FULL_ATTN_PREFILL_BATCH_LONG_TG_WIDTH: u64 = 32;
+const STEEL_ATTN_BQ: usize = 32;
+const STEEL_ATTN_BK: usize = 32;
+const STEEL_ATTN_BD: usize = 64;
+const STEEL_CAUSAL_ATTN_D256_BQ: usize = 32;
+const STEEL_CAUSAL_ATTN_D256_BK: usize = 64;
+const STEEL_CAUSAL_ATTN_D256_BD: usize = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct SteelAttnParams {
+    b: i32,
+    h: i32,
+    d: i32,
+    q_l: i32,
+    k_l: i32,
+    gqa_factor: i32,
+    scale: f32,
+    n_q: i32,
+    n_k: i32,
+    n_q_aligned: i32,
+    n_k_aligned: i32,
+    q_l_rem: i32,
+    k_l_rem: i32,
+    q_l_off: i32,
+    q_strides: [i64; 3],
+    k_strides: [i64; 3],
+    v_strides: [i64; 3],
+    o_strides: [i64; 3],
+}
 
 struct TailMoeSharedScratch {
     residual: Buffer,
@@ -27,11 +57,218 @@ struct TailMoeSharedScratch {
     output: Buffer,
 }
 
+pub(super) fn prefill_attn_batch_long_supported(spec: PrefillAttentionSpec) -> bool {
+    spec.seq > 2048
+        && matches!(
+            (spec.q_heads, spec.kv_heads, spec.head_dim),
+            (24, 4, 256) | (32, 4, 128) | (16, 2, 256)
+        )
+}
+
+pub(super) fn prefill_attn_batch_mid_30b_supported(spec: PrefillAttentionSpec) -> bool {
+    (257..=2048).contains(&spec.seq)
+        && matches!((spec.q_heads, spec.kv_heads, spec.head_dim), (32, 4, 128))
+}
+
+pub(super) fn prefill_attn_batch_mid_35b_supported(spec: PrefillAttentionSpec) -> bool {
+    (257..=2048).contains(&spec.seq)
+        && matches!((spec.q_heads, spec.kv_heads, spec.head_dim), (16, 2, 256))
+}
+
+fn prefill_attn_batch_gqa8_d256_supported(spec: PrefillAttentionSpec) -> bool {
+    matches!((spec.q_heads, spec.kv_heads, spec.head_dim), (16, 2, 256))
+}
+
+pub(super) fn prefill_attn_steel_d256_supported(spec: PrefillAttentionSpec) -> bool {
+    spec.seq > 256
+        && spec.q_heads == 16
+        && spec.kv_heads == 2
+        && spec.head_dim == STEEL_CAUSAL_ATTN_D256_BD
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "wrappers d'encodage Metal: buffers, dimensions et offsets restent explicites"
 )]
 impl MetalExecutor {
+    /// Calcule une attention prefill non causale `softmax(QK^T)V`.
+    ///
+    /// Les tenseurs sont au format aplati par ligne:
+    /// `q=[seq, q_heads*head_dim]`, `k/v=[seq, kv_heads*head_dim]`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les formes sont incompatibles ou si Metal échoue.
+    pub fn noncausal_attention_prefill(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        q_heads: usize,
+        kv_heads: usize,
+    ) -> Result<Tensor> {
+        let (seq, q_dim) = q.as_matrix()?;
+        let (k_seq, k_dim) = k.as_matrix()?;
+        let (v_seq, v_dim) = v.as_matrix()?;
+        if seq == 0 || seq > 2048 {
+            return Err(InferError::Dimension(format!(
+                "attention non causale Metal seq={seq}, attendu 1..=2048"
+            )));
+        }
+        if k_seq != seq || v_seq != seq || k_dim != v_dim {
+            return Err(InferError::Dimension(format!(
+                "attention non causale q={:?}, k={:?}, v={:?}",
+                q.shape(),
+                k.shape(),
+                v.shape()
+            )));
+        }
+        if q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
+            return Err(InferError::Dimension(format!(
+                "attention non causale heads invalides q_heads={q_heads}, kv_heads={kv_heads}"
+            )));
+        }
+        if q_dim % q_heads != 0 || k_dim % kv_heads != 0 {
+            return Err(InferError::Dimension(format!(
+                "attention non causale dims incompatibles q_dim={q_dim}, k_dim={k_dim}, q_heads={q_heads}, kv_heads={kv_heads}"
+            )));
+        }
+        let head_dim = q_dim / q_heads;
+        if k_dim / kv_heads != head_dim {
+            return Err(InferError::Dimension(format!(
+                "attention non causale head_dim q={}, kv={}",
+                head_dim,
+                k_dim / kv_heads
+            )));
+        }
+
+        let q_buffer = self.upload_f32_buffer(q.data(), "noncausal_q")?;
+        let k_buffer = self.upload_f32_buffer(k.data(), "noncausal_k")?;
+        let v_buffer = self.upload_f32_buffer(v.data(), "noncausal_v")?;
+        let output_len = checked_len(seq, q_dim, "sortie attention non causale")?;
+        let output_buffer = self.device.new_buffer(
+            byte_len::<f32>(output_len)?,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let spec = PrefillAttentionSpec {
+            seq,
+            hidden_dim: q_dim,
+            q_heads,
+            kv_heads,
+            head_dim,
+            rope_dims: head_dim,
+            rope_theta: 10_000.0,
+            eps: 0.0,
+        };
+
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        self.encode_noncausal_attention_prefill(
+            encoder,
+            &q_buffer,
+            &k_buffer,
+            &v_buffer,
+            &output_buffer,
+            spec,
+        )?;
+        encoder_guard.end();
+        commit_and_wait(command_buffer)?;
+
+        let output = read_f32_buffer(&output_buffer, output_len)?;
+        Tensor::from_vec(vec![seq, q_dim], output)
+    }
+
+    /// Calcule une attention prefill causale `softmax(QK^T + masque)V` (tests).
+    ///
+    /// Sert à verrouiller la byte-identité des DEUX kernels causaux (court seq <=
+    /// 256, long seq > 256) contre une référence CPU. Format aplati par ligne comme
+    /// [`Self::noncausal_attention_prefill`].
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les formes sont incompatibles ou si Metal échoue.
+    #[cfg(test)]
+    pub(crate) fn causal_attention_prefill(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        q_heads: usize,
+        kv_heads: usize,
+    ) -> Result<Tensor> {
+        let (seq, q_dim) = q.as_matrix()?;
+        let (k_seq, k_dim) = k.as_matrix()?;
+        let (v_seq, v_dim) = v.as_matrix()?;
+        if seq == 0 || seq > 8192 {
+            return Err(InferError::Dimension(format!(
+                "attention causale Metal seq={seq}, attendu 1..=8192"
+            )));
+        }
+        if k_seq != seq || v_seq != seq || k_dim != v_dim {
+            return Err(InferError::Dimension(format!(
+                "attention causale q={:?}, k={:?}, v={:?}",
+                q.shape(),
+                k.shape(),
+                v.shape()
+            )));
+        }
+        if q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
+            return Err(InferError::Dimension(format!(
+                "attention causale heads invalides q_heads={q_heads}, kv_heads={kv_heads}"
+            )));
+        }
+        if q_dim % q_heads != 0 || k_dim % kv_heads != 0 {
+            return Err(InferError::Dimension(format!(
+                "attention causale dims incompatibles q_dim={q_dim}, k_dim={k_dim}, q_heads={q_heads}, kv_heads={kv_heads}"
+            )));
+        }
+        let head_dim = q_dim / q_heads;
+        if k_dim / kv_heads != head_dim {
+            return Err(InferError::Dimension(format!(
+                "attention causale head_dim q={}, kv={}",
+                head_dim,
+                k_dim / kv_heads
+            )));
+        }
+
+        let q_buffer = self.upload_f32_buffer(q.data(), "causal_q")?;
+        let k_buffer = self.upload_f32_buffer(k.data(), "causal_k")?;
+        let v_buffer = self.upload_f32_buffer(v.data(), "causal_v")?;
+        let output_len = checked_len(seq, q_dim, "sortie attention causale")?;
+        let output_buffer = self.device.new_buffer(
+            byte_len::<f32>(output_len)?,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let spec = PrefillAttentionSpec {
+            seq,
+            hidden_dim: q_dim,
+            q_heads,
+            kv_heads,
+            head_dim,
+            rope_dims: head_dim,
+            rope_theta: 10_000.0,
+            eps: 0.0,
+        };
+
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        self.encode_causal_attention_prefill(
+            encoder,
+            &q_buffer,
+            &k_buffer,
+            &v_buffer,
+            &output_buffer,
+            spec,
+        )?;
+        encoder_guard.end();
+        commit_and_wait(command_buffer)?;
+
+        let output = read_f32_buffer(&output_buffer, output_len)?;
+        Tensor::from_vec(vec![seq, q_dim], output)
+    }
+
     fn allocate_tail_moe_shared_scratch(
         &self,
         residual: &Tensor,
@@ -529,11 +766,14 @@ impl MetalExecutor {
                 "full-attn qkv split x=[1,{in_dim}] rhs=[{out_dim},{weight_in_dim}]"
             )));
         }
-        if !fast_affine_qmv_enabled(*out_dim)
-            || *bits != FAST_QMV_BITS
-            || *group_size != FAST_QMV_GROUP_SIZE
-            || in_dim % 512 != 0
-        {
+        let can_use_u4 = fast_affine_qmv_enabled(*out_dim)
+            && *bits == FAST_QMV_BITS
+            && *group_size == FAST_QMV_GROUP_SIZE
+            && in_dim % 512 == 0;
+        let can_use_u8 = full_qkv_split_rms_u8_enabled()
+            && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
+            && *group_size == FAST_QMV_GROUP_SIZE;
+        if !can_use_u4 && !can_use_u8 {
             return Ok(None);
         }
         let q_dim = q_heads
@@ -620,11 +860,14 @@ impl MetalExecutor {
                 "full-attn qkv split rms x=[1,{in_dim}] rhs=[{out_dim},{weight_in_dim}]"
             )));
         }
-        if !fast_affine_qmv_enabled(*out_dim)
-            || *bits != FAST_QMV_BITS
-            || *group_size != FAST_QMV_GROUP_SIZE
-            || in_dim % 512 != 0
-        {
+        let can_use_u4 = fast_affine_qmv_enabled(*out_dim)
+            && *bits == FAST_QMV_BITS
+            && *group_size == FAST_QMV_GROUP_SIZE
+            && in_dim % 512 == 0;
+        let can_use_u8 = full_qkv_split_rms_u8_enabled()
+            && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
+            && *group_size == FAST_QMV_GROUP_SIZE;
+        if !can_use_u4 && !can_use_u8 {
             return Ok(None);
         }
         let q_dim = q_heads
@@ -648,7 +891,12 @@ impl MetalExecutor {
             checked_u32(q_heads, "full qkv split rms q_heads")?,
             checked_u32(head_dim, "full qkv split rms head_dim")?,
         ];
-        encoder.set_compute_pipeline_state(&self.affine_qkv_split_rms_qmv_fast_u4_gs64_f32);
+        let pipeline = if can_use_u4 {
+            &self.affine_qkv_split_rms_qmv_fast_u4_gs64_f32
+        } else {
+            &self.affine_qkv_split_rms_qmv_fast_u8_gs64_f32
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(rms_weight_buffer), 0);
         encoder.set_buffer(2, Some(packed), 0);
@@ -704,11 +952,14 @@ impl MetalExecutor {
                 "full-attn o_proj gated x=[1,{in_dim}] rhs=[{out_dim},{weight_in_dim}]"
             )));
         }
-        if !fast_affine_qmv_enabled(*out_dim)
-            || *bits != FAST_QMV_BITS
-            || *group_size != FAST_QMV_GROUP_SIZE
-            || in_dim % 512 != 0
-        {
+        let can_use_u4 = fast_affine_qmv_enabled(*out_dim)
+            && *bits == FAST_QMV_BITS
+            && *group_size == FAST_QMV_GROUP_SIZE
+            && in_dim % 512 == 0;
+        let can_use_u8 = full_o_proj_gated_u8_enabled()
+            && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
+            && *group_size == FAST_QMV_GROUP_SIZE;
+        if !can_use_u4 && !can_use_u8 {
             return Ok(None);
         }
         let fast_dims = [
@@ -717,7 +968,12 @@ impl MetalExecutor {
             checked_u32(*packed_cols, "full o gated packed_cols")?,
             checked_u32(*groups, "full o gated groups")?,
         ];
-        encoder.set_compute_pipeline_state(&self.affine_qmv_gated_input_fast_u4_gs64_f32);
+        let pipeline = if can_use_u4 {
+            &self.affine_qmv_gated_input_fast_u4_gs64_f32
+        } else {
+            &self.affine_qmv_gated_input_fast_u8_gs64_f32
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(ctx_buffer), 0);
         encoder.set_buffer(1, Some(gate_buffer), 0);
         encoder.set_buffer(2, Some(packed), 0);
@@ -787,12 +1043,201 @@ impl MetalExecutor {
             checked_u32(spec.kv_heads, "attention kv_heads")?,
             checked_u32(spec.head_dim, "attention head_dim")?,
         ];
-        encoder.set_compute_pipeline_state(&self.causal_attention_prefill_f32);
+        if self.encode_steel_causal_attention_prefill(
+            encoder,
+            q_buffer,
+            k_buffer,
+            v_buffer,
+            output_buffer,
+            spec,
+        )? {
+            return Ok(());
+        }
+        // Le kernel court `causal_attention_prefill_f32` reste figé pour seq <=
+        // 256. La variante mid garde les scores en threadgroup jusqu'à 2048 pour
+        // éviter les trois passes de recalcul du long sur les prompts usuels.
+        // Au-delà, le long reste le fallback non borné ; il exige head_dim <= 256
+        // (une colonne de sortie par thread).
+        let (pipeline, tg_width, grid_heads, grid_rows) = if spec.seq <= 256 {
+            (
+                &self.causal_attention_prefill_f32,
+                FULL_ATTN_PREFILL_TG_WIDTH,
+                spec.q_heads,
+                spec.seq,
+            )
+        } else if crate::runtime_flags::prefill_attn_batch_mid_30b_enabled()
+            && prefill_attn_batch_mid_30b_supported(spec)
+        {
+            (
+                &self.causal_attention_prefill_batch_long_d128_f32,
+                FULL_ATTN_PREFILL_BATCH_LONG_TG_WIDTH,
+                spec.q_heads,
+                spec.seq,
+            )
+        } else if crate::runtime_flags::prefill_attn_batch_mid_30b_enabled()
+            && prefill_attn_batch_mid_35b_supported(spec)
+        {
+            (
+                &self.causal_attention_prefill_batch_gqa8x4_d256_f32,
+                FULL_ATTN_PREFILL_TG_WIDTH,
+                spec.kv_heads,
+                spec.seq.div_ceil(4),
+            )
+        } else if spec.seq <= 2048 {
+            (
+                &self.causal_attention_prefill_mid_f32,
+                FULL_ATTN_PREFILL_TG_WIDTH,
+                spec.q_heads,
+                spec.seq,
+            )
+        } else if crate::runtime_flags::prefill_attn_batch_long_enabled()
+            && prefill_attn_batch_long_supported(spec)
+        {
+            match spec.head_dim {
+                128 => (
+                    &self.causal_attention_prefill_batch_long_d128_f32,
+                    FULL_ATTN_PREFILL_BATCH_LONG_TG_WIDTH,
+                    spec.q_heads,
+                    spec.seq,
+                ),
+                256 if prefill_attn_batch_gqa8_d256_supported(spec) => (
+                    &self.causal_attention_prefill_batch_gqa8x4_d256_f32,
+                    FULL_ATTN_PREFILL_TG_WIDTH,
+                    spec.kv_heads,
+                    spec.seq.div_ceil(4),
+                ),
+                256 => (
+                    &self.causal_attention_prefill_batch_long_d256_f32,
+                    FULL_ATTN_PREFILL_BATCH_LONG_TG_WIDTH,
+                    spec.q_heads,
+                    spec.seq,
+                ),
+                _ => {
+                    if spec.head_dim > 256 {
+                        return Err(InferError::Dimension(format!(
+                            "prefill causal résident seq={} head_dim={} non supporté (head_dim > 256)",
+                            spec.seq, spec.head_dim
+                        )));
+                    }
+                    (
+                        &self.causal_attention_prefill_long_f32,
+                        FULL_ATTN_PREFILL_TG_WIDTH,
+                        spec.q_heads,
+                        spec.seq,
+                    )
+                }
+            }
+        } else {
+            if spec.head_dim > 256 {
+                return Err(InferError::Dimension(format!(
+                    "prefill causal résident seq={} head_dim={} non supporté (head_dim > 256)",
+                    spec.seq, spec.head_dim
+                )));
+            }
+            (
+                &self.causal_attention_prefill_long_f32,
+                FULL_ATTN_PREFILL_TG_WIDTH,
+                spec.q_heads,
+                spec.seq,
+            )
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_buffer), 0);
         encoder.set_buffer(1, Some(k_buffer), 0);
         encoder.set_buffer(2, Some(v_buffer), 0);
         encoder.set_buffer(3, Some(output_buffer), 0);
         set_u32_bytes(encoder, 4, &dims, "causal_prefill_dims")?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(grid_heads, "attention grid_heads")?,
+                checked_nsuint(grid_rows, "attention grid_rows")?,
+                1,
+            ),
+            MTLSize::new(tg_width, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    fn encode_steel_causal_attention_prefill(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buffer: &BufferRef,
+        k_buffer: &BufferRef,
+        v_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+    ) -> Result<bool> {
+        if !crate::runtime_flags::prefill_attn_steel_d256_enabled()
+            || !prefill_attn_steel_d256_supported(spec)
+        {
+            return Ok(false);
+        }
+        let Some(pipeline) = self.causal_attention_prefill_steel_d256_f32.as_ref() else {
+            return Ok(false);
+        };
+        let params = steel_attn_params(
+            spec,
+            STEEL_CAUSAL_ATTN_D256_BQ,
+            STEEL_CAUSAL_ATTN_D256_BK,
+            "steel causal d256 attention",
+        )?;
+        let grid_rows = spec.seq.div_ceil(STEEL_CAUSAL_ATTN_D256_BQ);
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(q_buffer), 0);
+        encoder.set_buffer(1, Some(k_buffer), 0);
+        encoder.set_buffer(2, Some(v_buffer), 0);
+        encoder.set_buffer(3, Some(output_buffer), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<SteelAttnParams>() as NSUInteger,
+            (&params as *const SteelAttnParams).cast::<c_void>(),
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(grid_rows, "steel causal d256 NQ")?,
+                checked_nsuint(spec.q_heads, "steel causal d256 heads")?,
+                1,
+            ),
+            MTLSize::new(32, 4, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(true)
+    }
+
+    pub(super) fn encode_noncausal_attention_prefill(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buffer: &BufferRef,
+        k_buffer: &BufferRef,
+        v_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+    ) -> Result<()> {
+        if self.encode_steel_noncausal_attention_prefill(
+            encoder,
+            q_buffer,
+            k_buffer,
+            v_buffer,
+            output_buffer,
+            spec,
+        )? {
+            return Ok(());
+        }
+        let dims = [
+            checked_u32(spec.seq, "attention seq")?,
+            checked_u32(spec.q_heads, "attention q_heads")?,
+            checked_u32(spec.kv_heads, "attention kv_heads")?,
+            checked_u32(spec.head_dim, "attention head_dim")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.noncausal_attention_prefill_f32);
+        encoder.set_buffer(0, Some(q_buffer), 0);
+        encoder.set_buffer(1, Some(k_buffer), 0);
+        encoder.set_buffer(2, Some(v_buffer), 0);
+        encoder.set_buffer(3, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 4, &dims, "noncausal_prefill_dims")?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
@@ -805,4 +1250,126 @@ impl MetalExecutor {
         post_dispatch_barrier(encoder);
         Ok(())
     }
+
+    fn encode_steel_noncausal_attention_prefill(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buffer: &BufferRef,
+        k_buffer: &BufferRef,
+        v_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+    ) -> Result<bool> {
+        let Some(pipeline) = self.steel_attention_f32_bq32_bk32_bd64.as_ref() else {
+            return Ok(false);
+        };
+        if spec.head_dim != STEEL_ATTN_BD {
+            return Ok(false);
+        }
+        let n_q = spec.seq.div_ceil(STEEL_ATTN_BQ);
+        let params = steel_attn_params(spec, STEEL_ATTN_BQ, STEEL_ATTN_BK, "steel attention")?;
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(q_buffer), 0);
+        encoder.set_buffer(1, Some(k_buffer), 0);
+        encoder.set_buffer(2, Some(v_buffer), 0);
+        encoder.set_buffer(3, Some(output_buffer), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<SteelAttnParams>() as NSUInteger,
+            (&params as *const SteelAttnParams).cast::<c_void>(),
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(n_q, "steel attention NQ")?,
+                checked_nsuint(spec.q_heads, "steel attention heads")?,
+                1,
+            ),
+            MTLSize::new(32, 4, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(true)
+    }
+}
+
+fn checked_i32(value: usize, label: &'static str) -> Result<i32> {
+    i32::try_from(value)
+        .map_err(|_| InferError::Dimension(format!("{label}={value} depasse la capacite i32")))
+}
+
+fn checked_i64(value: usize) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| InferError::Dimension(format!("{value} depasse la capacite i64")))
+}
+
+pub(super) fn steel_attn_params(
+    spec: PrefillAttentionSpec,
+    block_q: usize,
+    block_k: usize,
+    label: &'static str,
+) -> Result<SteelAttnParams> {
+    if spec.kv_heads == 0 || spec.q_heads == 0 || spec.q_heads % spec.kv_heads != 0 {
+        return Err(InferError::Dimension(format!(
+            "{label} heads invalides q_heads={} kv_heads={}",
+            spec.q_heads, spec.kv_heads
+        )));
+    }
+    let q_dim = checked_len(spec.q_heads, spec.head_dim, "steel attention q_dim")?;
+    let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "steel attention kv_dim")?;
+    let n_q = spec.seq.div_ceil(block_q);
+    let n_k = spec.seq.div_ceil(block_k);
+    let n_q_aligned = spec.seq / block_q;
+    let n_k_aligned = spec.seq / block_k;
+    Ok(SteelAttnParams {
+        b: 1,
+        h: checked_i32(spec.q_heads, "steel attention heads")?,
+        d: checked_i32(spec.head_dim, "steel attention head_dim")?,
+        q_l: checked_i32(spec.seq, "steel attention qL")?,
+        k_l: checked_i32(spec.seq, "steel attention kL")?,
+        gqa_factor: checked_i32(spec.q_heads / spec.kv_heads, "steel attention gqa")?,
+        scale: (spec.head_dim as f32).sqrt().recip(),
+        n_q: checked_i32(n_q, label)?,
+        n_k: checked_i32(n_k, label)?,
+        n_q_aligned: checked_i32(n_q_aligned, label)?,
+        n_k_aligned: checked_i32(n_k_aligned, label)?,
+        q_l_rem: checked_i32(spec.seq - n_q_aligned * block_q, label)?,
+        k_l_rem: checked_i32(spec.seq - n_k_aligned * block_k, label)?,
+        q_l_off: 0,
+        q_strides: [
+            checked_i64(checked_len(
+                spec.seq,
+                q_dim,
+                "steel attention Q batch stride",
+            )?)?,
+            checked_i64(spec.head_dim)?,
+            checked_i64(q_dim)?,
+        ],
+        k_strides: [
+            checked_i64(checked_len(
+                spec.seq,
+                kv_dim,
+                "steel attention K batch stride",
+            )?)?,
+            checked_i64(spec.head_dim)?,
+            checked_i64(kv_dim)?,
+        ],
+        v_strides: [
+            checked_i64(checked_len(
+                spec.seq,
+                kv_dim,
+                "steel attention V batch stride",
+            )?)?,
+            checked_i64(spec.head_dim)?,
+            checked_i64(kv_dim)?,
+        ],
+        o_strides: [
+            checked_i64(checked_len(
+                spec.seq,
+                q_dim,
+                "steel attention O batch stride",
+            )?)?,
+            checked_i64(spec.head_dim)?,
+            checked_i64(q_dim)?,
+        ],
+    })
 }

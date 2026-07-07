@@ -7,7 +7,10 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(crate) struct FullAttnLayerWeights<'a> {
     pub input_norm: &'a Buffer,
-    pub qkv_proj: &'a MetalLinearWeightBuffers,
+    pub qkv_proj: Option<&'a MetalLinearWeightBuffers>,
+    pub q_proj: &'a MetalLinearWeightBuffers,
+    pub k_proj: &'a MetalLinearWeightBuffers,
+    pub v_proj: &'a MetalLinearWeightBuffers,
     pub o_proj: &'a MetalLinearWeightBuffers,
     pub q_norm: &'a Buffer,
     pub k_norm: &'a Buffer,
@@ -20,6 +23,9 @@ pub(crate) struct FullAttnLayerWeights<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct FullAttnRoutedLayerWeights<'a> {
     pub input_norm: &'a Buffer,
+    /// Le chemin routed-only résident est construit uniquement quand le QKV
+    /// concaténé est disponible. Sinon le setup refuse le decode résident avant
+    /// d'instancier ce type, ce qui rend le fallback 3-matmuls inatteignable ici.
     pub qkv_proj: &'a MetalLinearWeightBuffers,
     pub o_proj: &'a MetalLinearWeightBuffers,
     pub q_norm: &'a Buffer,
@@ -67,7 +73,7 @@ pub(crate) struct FullAttnLayerDims {
 #[derive(Clone, Copy)]
 pub(crate) struct LinearAttnLayerWeights<'a> {
     pub input_norm: &'a Buffer,
-    pub linear: &'a MetalLinearAttnResidentWeights,
+    pub linear: &'a MetalLinearAttnResidentDenseWeights,
     pub post_norm: &'a Buffer,
     pub moe: &'a MetalMoeSharedWeights,
     pub top_k: usize,
@@ -118,7 +124,7 @@ impl GpuSectionTimer {
     /// Construit le timer si `RETI_RUST_GPU_COUNTERS` est défini, sinon `None`
     /// (le decode reste le chemin résident à command buffer unique, inchangé).
     pub(crate) fn try_new() -> Option<Self> {
-        crate::decoder::flags::gpu_counters_enabled().then_some(())?;
+        crate::runtime_flags::gpu_counters_enabled().then_some(())?;
         eprintln!("gpu sections: actif (segmentation CPU par section)");
         Some(Self::default())
     }

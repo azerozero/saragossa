@@ -1,0 +1,10 @@
+{
+  "dtype": "i32",
+  "shape": [
+    1
+  ],
+  "tolerance": "rust_cb0==mlx_sampled_cb0",
+  "source": "live_clone_first_cb0_matches_mlx_oracle",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

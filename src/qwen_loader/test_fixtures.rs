@@ -11,7 +11,9 @@ pub(super) fn test_config() -> ModelConfig {
         num_hidden_layers: 1,
         num_attention_heads: 1,
         num_key_value_heads: 1,
+        num_global_key_value_heads: None,
         head_dim: Some(2),
+        global_head_dim: None,
         intermediate_size: 4,
         rms_norm_eps: 1.0e-6,
         rope_theta: 10_000.0,
@@ -29,9 +31,25 @@ pub(super) fn test_config() -> ModelConfig {
         linear_conv_kernel_dim: None,
         num_experts: None,
         num_experts_per_tok: None,
+        top_k_experts: None,
         moe_intermediate_size: None,
         shared_expert_intermediate_size: None,
         mtp_num_hidden_layers: None,
+        hidden_activation: None,
+        hidden_act: None,
+        rope_local_base_freq: None,
+        rope_full_base_freq: None,
+        rope_full_partial_rotary_factor: None,
+        rope_sliding_partial_rotary_factor: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        layer_types: Vec::new(),
+        attention_k_eq_v: false,
+        enable_moe_block: false,
+        query_pre_attn_scalar: None,
+        attn_logit_softcapping: None,
+        final_logit_softcapping: None,
+        rope_scaling: None,
     }
 }
 
@@ -50,11 +68,80 @@ pub(super) fn write_safetensors(
     std::fs::write(path, buffer).expect("invariant: écriture safetensors");
 }
 
+/// Renvoie une config à embeddings liés (`tie_word_embeddings`, sans `lm_head`).
+pub(super) fn tied_test_config() -> ModelConfig {
+    ModelConfig {
+        tie_word_embeddings: true,
+        ..test_config()
+    }
+}
+
+/// Écrit un modèle à embeddings liés : `embed_tokens` présent, `lm_head` absent.
+pub(super) fn write_tied_safetensors(path: &Path) {
+    let tensors = base_tensors("model.", "lm_head.")
+        .into_iter()
+        .filter(|(name, _)| name != "lm_head.weight")
+        .collect::<Vec<_>>();
+    let buffer = serialize(tensors, None).expect("invariant: safetensors sérialisable");
+    std::fs::write(path, buffer).expect("invariant: écriture safetensors");
+}
+
+/// Écrit l'équivalent non lié : `lm_head.weight` matériellement égal à `embed_tokens`.
+///
+/// Oracle de correction du tying : un décodeur tied doit produire les mêmes
+/// logits qu'un décodeur où la tête LM stocke explicitement les embeddings.
+pub(super) fn write_explicit_tied_equivalent(path: &Path) {
+    let embed = TensorFixture::f32(vec![3, 2], vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    write_safetensors(path, "model.", "lm_head.", Some(("lm_head.weight", embed)));
+}
+
 pub(super) fn write_safetensors_with_mlp(path: &Path) {
     let mut tensors = base_tensors("model.", "lm_head.");
     tensors.extend([
         (
             "model.layers.0.post_attention_layernorm.weight".to_string(),
+            TensorFixture::ones(vec![2]),
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight".to_string(),
+            TensorFixture::f32(vec![4, 2], vec![1.0, 0.0, 0.0, 1.0, 0.5, 0.5, -0.5, 0.5]),
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight".to_string(),
+            TensorFixture::f32(vec![4, 2], vec![1.0, 0.0, 0.0, 1.0, 0.25, 0.75, 0.75, 0.25]),
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight".to_string(),
+            TensorFixture::f32(vec![2, 4], vec![0.5, 0.0, 0.25, 0.0, 0.0, 0.5, 0.0, 0.25]),
+        ),
+    ]);
+    let buffer = serialize(tensors, None).expect("invariant: safetensors sérialisable");
+    std::fs::write(path, buffer).expect("invariant: écriture safetensors");
+}
+
+/// Renvoie une config Gemma 3 minimale (GeGLU, double norme FFN, embed scale).
+pub(super) fn gemma_test_config() -> ModelConfig {
+    ModelConfig {
+        model_type: "gemma3_text".to_string(),
+        hidden_activation: Some("gelu_pytorch_tanh".to_string()),
+        ..test_config()
+    }
+}
+
+/// Écrit un modèle Gemma minimal : base + MLP + double norme feed-forward.
+pub(super) fn write_gemma_safetensors(path: &Path) {
+    let mut tensors = base_tensors("model.", "lm_head.");
+    tensors.extend([
+        (
+            "model.layers.0.post_attention_layernorm.weight".to_string(),
+            TensorFixture::ones(vec![2]),
+        ),
+        (
+            "model.layers.0.pre_feedforward_layernorm.weight".to_string(),
+            TensorFixture::ones(vec![2]),
+        ),
+        (
+            "model.layers.0.post_feedforward_layernorm.weight".to_string(),
             TensorFixture::ones(vec![2]),
         ),
         (

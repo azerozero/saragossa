@@ -1,0 +1,10 @@
+{
+  "dtype": "f32",
+  "shape": [
+    3072
+  ],
+  "tolerance": "argmax== + max_abs<=0.20",
+  "source": "live_voicedesign_talker_logits_match_mlx_oracle",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

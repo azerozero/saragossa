@@ -2,6 +2,64 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+enum MoeProjection {
+    Gate,
+    Up,
+    Down,
+}
+
+impl MoeProjection {
+    fn affine_weight(self, expert: &GatedMlp) -> Result<&AffineQuantizedTensor> {
+        let (gate, up, down) = expert.projections();
+        let linear = match self {
+            Self::Gate => gate,
+            Self::Up => up,
+            Self::Down => down,
+        };
+        ensure_biasless(linear, self.name())?;
+        match linear.weight() {
+            LinearWeight::AffineQuantized(weight) => Ok(weight),
+            LinearWeight::Dense(_) => Err(InferError::Config(format!(
+                "expert MoE {} non affine quantifié",
+                self.name()
+            ))),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gate => "gate",
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+
+    fn packed_label(self) -> &'static str {
+        match self {
+            Self::Gate => "moe_gate_packed",
+            Self::Up => "moe_up_packed",
+            Self::Down => "moe_down_packed",
+        }
+    }
+
+    fn scales_label(self) -> &'static str {
+        match self {
+            Self::Gate => "moe_gate_scales",
+            Self::Up => "moe_up_scales",
+            Self::Down => "moe_down_scales",
+        }
+    }
+
+    fn biases_label(self) -> &'static str {
+        match self {
+            Self::Gate => "moe_gate_biases",
+            Self::Up => "moe_up_biases",
+            Self::Down => "moe_down_biases",
+        }
+    }
+}
+
 impl MetalExecutor {
     /// Exécute les experts MoE sélectionnés en une seule commande Metal.
     ///
@@ -334,6 +392,132 @@ impl MetalExecutor {
         Tensor::from_vec(vec![1, out_dim], output)
     }
 
+    /// Route et exécute deux lignes MoE shared via le chemin duo qmm2.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les poids ne sont pas éligibles au duo ou si Metal échoue.
+    pub(crate) fn moe_gated_router_topk_shared_batch2(
+        &self,
+        input: &Tensor,
+        router: &Linear,
+        experts: &[GatedMlp],
+        top_k: usize,
+        shared_expert: &GatedMlp,
+        shared_gate: &Linear,
+    ) -> Result<Tensor> {
+        if !crate::runtime_flags::lightbatch_moe2_enabled() {
+            return Err(InferError::Metal(
+                "MoE shared batch2 désactivé par RETI_RUST_LIGHTBATCH_MOE2".to_string(),
+            ));
+        }
+        let (batch, in_dim) = input.as_matrix()?;
+        if batch != 2 {
+            return Err(InferError::Dimension(format!(
+                "MoE shared batch2 attend batch=2, reçu {batch}"
+            )));
+        }
+        let weights =
+            self.resolve_moe_shared_weights(router, experts, shared_expert, shared_gate)?;
+        if !self.moe_shared_duo_eligible(&weights) {
+            return Err(InferError::Dimension(
+                "MoE shared batch2 poids non éligibles qmm2".to_string(),
+            ));
+        }
+        let out_dim = weights.stacked.down.out_dim;
+        let input_buffer = self.upload_f32_buffer(input.data(), "moe_shared_batch2_input")?;
+        let output_len = checked_len(2, out_dim, "moe batch2 output")?;
+        let residual_zeros = vec![0.0_f32; output_len];
+        let residual_buffer = self.upload_f32_buffer(&residual_zeros, "moe_shared_batch2_zero")?;
+        let output_buffer = self.new_f32_buffer(output_len, "moe_shared_batch2_output")?;
+        let mut owned_buffers = Vec::new();
+
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        self.encode_moe_shared_duo_buffers(
+            encoder,
+            &mut owned_buffers,
+            &input_buffer,
+            &residual_buffer,
+            &output_buffer,
+            in_dim,
+            &weights,
+            top_k,
+            [0, 1],
+        )?;
+        encoder_guard.end();
+        commit_and_wait(command_buffer)?;
+
+        let output = read_f32_buffer(&output_buffer, output_len)?;
+        Tensor::from_vec(vec![2, out_dim], output)
+    }
+
+    /// Route et exécute `batch` lignes MoE shared via les kernels rows génériques.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le batch est vide, si les poids sont incompatibles,
+    /// ou si Metal échoue.
+    pub(crate) fn moe_gated_router_topk_shared_rows(
+        &self,
+        input: &Tensor,
+        router: &Linear,
+        experts: &[GatedMlp],
+        top_k: usize,
+        shared_expert: &GatedMlp,
+        shared_gate: &Linear,
+    ) -> Result<Tensor> {
+        let (batch, in_dim) = input.as_matrix()?;
+        if batch == 0 {
+            return Err(InferError::Dimension(
+                "MoE shared rows attend un batch non vide".to_string(),
+            ));
+        }
+        let weights =
+            self.resolve_moe_shared_weights(router, experts, shared_expert, shared_gate)?;
+        let out_dim = weights.stacked.down.out_dim;
+        let input_buffer = self.upload_f32_buffer(input.data(), "moe_shared_rows_input")?;
+        let output_len = checked_len(batch, out_dim, "moe shared rows output")?;
+        let output_buffer = self.new_f32_buffer(output_len, "moe_shared_rows_output")?;
+        let mut owned_buffers = Vec::new();
+
+        // Brick #13 : route via le coop tensor-core (gather_qmm porté) quand activé —
+        // le MoE des couches linéaires l'ignorait (encode_moe_shared_buffers_rows non-coop),
+        // alors que le chemin full-attn l'utilise. C'était 66% du prefill (post_linear).
+        if moe_coop_enabled() && weights.coop_compatible() {
+            self.moe_shared_rows_coop(
+                &input_buffer,
+                None,
+                &output_buffer,
+                batch,
+                in_dim,
+                &weights,
+                top_k,
+            )?;
+        } else {
+            let command_buffer = self.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            let encoder_guard = EncoderEndGuard::new(encoder);
+            self.encode_moe_shared_buffers_rows(
+                encoder,
+                &mut owned_buffers,
+                &input_buffer,
+                None,
+                &output_buffer,
+                batch,
+                in_dim,
+                &weights,
+                top_k,
+            )?;
+            encoder_guard.end();
+            commit_and_wait(command_buffer)?;
+        }
+
+        let output = read_f32_buffer(&output_buffer, output_len)?;
+        Tensor::from_vec(vec![batch, out_dim], output)
+    }
+
     pub(super) fn moe_gated_topk_stacked(
         &self,
         input: &Tensor,
@@ -644,7 +828,7 @@ impl MetalExecutor {
         Ok(buffers)
     }
 
-    pub(super) fn build_stacked_affine(
+    fn build_stacked_affine(
         &self,
         experts: &[GatedMlp],
         projection: MoeProjection,

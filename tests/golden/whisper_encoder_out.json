@@ -1,0 +1,11 @@
+{
+  "dtype": "f32",
+  "shape": [
+    32,
+    384
+  ],
+  "tolerance": "cpu mean<1e-2/max<2e-1; metal mean<2e-2/max<3e-1",
+  "source": "live_encoder_matches_mlx_on_audio_mel_prefix",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

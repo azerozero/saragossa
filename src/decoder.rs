@@ -12,9 +12,8 @@ use crate::linear_attention::{
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::metal_backend::{
     LinearAttentionMetalState, LinearAttentionStepSpec, LinearAttnResidentDims,
-    MetalEmbeddingWeightBuffers, MetalLinearAttnResidentDenseWeights,
-    MetalLinearAttnResidentWeights, MetalLinearWeightBuffers, MetalMoeRoutedWeights,
-    MetalMoeSharedWeights,
+    MetalEmbeddingWeightBuffers, MetalLinearAttnResidentDenseWeights, MetalLinearWeightBuffers,
+    MetalMoeRoutedWeights, MetalMoeSharedWeights,
 };
 use crate::{
     embed_weight_tokens, load_f32_tensors, rms_norm, sample_token_top_k_top_p, softmax,
@@ -30,8 +29,10 @@ use std::time::{Duration, Instant};
 mod attention;
 mod attention_cache;
 mod attention_ops;
+mod duo;
 pub(crate) mod flags;
 mod generation;
+mod lightbatch;
 mod loading;
 mod mtp;
 mod resident;
@@ -39,8 +40,30 @@ mod resident;
 use self::flags::*;
 pub(in crate::decoder) use self::loading::*;
 
+/// Force le decode résident complet sur les couches linéaires du processus.
+pub fn force_resident_full_linear_decode() {
+    flags::force_resident_full_linear_decode();
+}
+
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Sélectionne l'appariement des dimensions tournées par le RoPE.
+///
+/// NOTE: La convention du moteur est `Halves` (« rotate-half », le
+/// `traditional=false` de mlx) : c'est celle des checkpoints Qwen, Llama,
+/// Mistral et Gemma — le moteur appliquait historiquement `Interleaved`,
+/// divergeant de mlx_lm sur tous les modèles. `Interleaved` est conservé
+/// comme référence de test et levier de diagnostic ; les kernels Metal
+/// résidents n'implémentent QUE `Halves` (gates en amont).
+pub enum RopeStyle {
+    /// Tourne les moitiés `(i, i+d/2)` (« rotate-half », convention moteur).
+    #[default]
+    Halves,
+    /// Tourne les paires adjacentes `(2i, 2i+1)` (legacy, tests/diagnostic).
+    Interleaved,
+}
 
 #[derive(Clone, Debug)]
 /// Décrit les dimensions et options d'un décodeur causal.
@@ -55,12 +78,22 @@ pub struct CausalDecoderConfig {
     pub num_attention_heads: usize,
     /// Définit le nombre de têtes clé/valeur.
     pub num_key_value_heads: usize,
+    /// Surcharge les têtes K/V des couches globales Gemma 4.
+    pub num_global_key_value_heads: Option<usize>,
     /// Surcharge la dimension de tête.
     pub head_dim: Option<usize>,
+    /// Surcharge la dimension de tête des couches globales Gemma 4.
+    pub global_head_dim: Option<usize>,
     /// Surcharge la dimension RoPE.
     pub rope_dims: Option<usize>,
+    /// Surcharge la dimension RoPE des couches globales Gemma 4.
+    pub rope_full_dims: Option<usize>,
+    /// Surcharge la dimension RoPE des couches locales Gemma 4.
+    pub rope_sliding_dims: Option<usize>,
     /// Active la porte de sortie attention.
     pub attn_output_gate: bool,
+    /// Liste le type d'attention de chaque couche Gemma 4.
+    pub layer_types: Vec<String>,
     /// Définit l'intervalle des couches full-attention.
     pub full_attention_interval: Option<usize>,
     /// Définit le nombre de têtes valeur linéaires.
@@ -81,6 +114,39 @@ pub struct CausalDecoderConfig {
     pub moe_intermediate_size: usize,
     /// Définit la dimension intermédiaire de l'expert partagé.
     pub shared_expert_intermediate_size: usize,
+    /// Met à l'échelle les embeddings d'entrée (`√hidden` Gemma ; `None` ailleurs).
+    pub embed_scale: Option<f32>,
+    /// Définit la base RoPE des couches locales Gemma 3 (sliding-window).
+    pub rope_local_base_freq: Option<f32>,
+    /// Définit la base RoPE des couches globales Gemma 4.
+    pub rope_full_base_freq: Option<f32>,
+    /// Met à l'échelle les positions RoPE (`1/factor` du rope_scaling linear).
+    pub rope_position_scale: Option<f32>,
+    /// Définit la taille de fenêtre des couches locales Gemma 3.
+    pub sliding_window: Option<usize>,
+    /// Définit la période de la couche globale Gemma 3.
+    pub sliding_window_pattern: Option<usize>,
+    /// Indique si les couches globales Gemma 4 partagent K et V.
+    pub attention_k_eq_v: bool,
+    /// Active la RMSNorm sans poids sur V (Gemma 4).
+    pub attention_value_norm: bool,
+    /// Active le bloc MoE parallèle Gemma 4.
+    pub parallel_moe: bool,
+    /// Déclare le softcapping final des logits Gemma.
+    pub final_logit_softcapping: Option<f32>,
+    /// Surcharge le facteur d'échelle des scores d'attention (Gemma).
+    pub query_pre_attn_scalar: Option<f32>,
+    /// Sélectionne l'activation MLP (GeGLU pour Gemma, SwiGLU sinon).
+    pub activation: crate::Activation,
+    /// Sélectionne l'appariement RoPE (rotate-half pour Gemma).
+    pub rope_style: RopeStyle,
+    /// Indique si le modèle est réellement un Gemma 4. Les types de couches
+    /// `full_attention`/`sliding_attention` sont partagés avec d'autres
+    /// architectures hybrides (Qwen3.5/3.6 `qwen3_5_moe` les emploie aussi) :
+    /// sans ce drapeau, les helpers `is_gemma4_*_layer` se déclenchaient à tort
+    /// hors Gemma et baked des `rope_dims = head_dim` (RoPE pleine) au lieu du
+    /// RoPE partiel correct (`partial_rotary_factor`).
+    pub is_gemma4: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +154,8 @@ pub struct CausalDecoderConfig {
 pub struct GenerationOptions {
     /// Liste les tokens qui arrêtent la génération.
     pub stop_token_ids: Vec<usize>,
+    /// Liste les séquences de tokens qui arrêtent la génération après émission.
+    pub stop_sequences: Vec<Vec<usize>>,
     /// Définit la température de sampling.
     pub temperature: f32,
     /// Définit le seuil nucleus sampling.
@@ -102,6 +170,7 @@ impl Default for GenerationOptions {
     fn default() -> Self {
         Self {
             stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
@@ -128,6 +197,76 @@ pub struct GenerationOutput {
     pub tokens: Vec<usize>,
     /// Mesure les timings de génération.
     pub timings: GenerationTimings,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[derive(Clone, Debug, PartialEq)]
+/// Décrit la divergence d'une couche du decode résident.
+pub struct ResidentLinearXrayLayerDiff {
+    /// Indice de la couche comparée.
+    pub layer_index: usize,
+    /// Type d'attention de la couche (`full` ou `linear`).
+    pub attention_kind: String,
+    /// Ecart absolu maximum entre la référence et le résident.
+    pub max_abs: f32,
+    /// Ecart absolu moyen entre la référence et le résident.
+    pub mean_abs: f32,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[derive(Clone, Debug, PartialEq)]
+/// Contient le diagnostic d'un pas résident-linear.
+pub struct ResidentLinearXrayReport {
+    /// Token injecté dans le pas de decode comparé.
+    pub input_token: usize,
+    /// Token greedy produit par la référence per-op.
+    pub reference_token: usize,
+    /// Token greedy produit par le résident full.
+    pub resident_token: usize,
+    /// Ecart absolu maximum sur le final state post-norm.
+    pub final_max_abs: f32,
+    /// Ecart absolu moyen sur le final state post-norm.
+    pub final_mean_abs: f32,
+    /// Indice de la couche linear-attn sondée finement.
+    pub probe_layer_index: Option<usize>,
+    /// Ecart maximum après input RMSNorm de la couche sondée.
+    pub probe_normed_max_abs: Option<f32>,
+    /// Ecart moyen après input RMSNorm de la couche sondée.
+    pub probe_normed_mean_abs: Option<f32>,
+    /// Ecart maximum après linear-attn de la couche sondée.
+    pub probe_attn_max_abs: Option<f32>,
+    /// Ecart moyen après linear-attn de la couche sondée.
+    pub probe_attn_mean_abs: Option<f32>,
+    /// Ecart maximum après linear-attn avec `normed` CPU injecté.
+    pub probe_attn_cpu_normed_max_abs: Option<f32>,
+    /// Ecart moyen après linear-attn avec `normed` CPU injecté.
+    pub probe_attn_cpu_normed_mean_abs: Option<f32>,
+    /// Ecart maximum du cache conv avant le step resident.
+    pub probe_init_state_conv_max_abs: Option<f32>,
+    /// Ecart moyen du cache conv avant le step resident.
+    pub probe_init_state_conv_mean_abs: Option<f32>,
+    /// Ecart maximum du cache SSM avant le step resident.
+    pub probe_init_state_ssm_max_abs: Option<f32>,
+    /// Ecart moyen du cache SSM avant le step resident.
+    pub probe_init_state_ssm_mean_abs: Option<f32>,
+    /// Ecart maximum du cache conv après linear-attn.
+    pub probe_state_conv_max_abs: Option<f32>,
+    /// Ecart moyen du cache conv après linear-attn.
+    pub probe_state_conv_mean_abs: Option<f32>,
+    /// Ecart maximum du cache SSM après linear-attn.
+    pub probe_state_ssm_max_abs: Option<f32>,
+    /// Ecart moyen du cache SSM après linear-attn.
+    pub probe_state_ssm_mean_abs: Option<f32>,
+    /// Ecart maximum du cache conv avec `normed` CPU injecté.
+    pub probe_state_cpu_normed_conv_max_abs: Option<f32>,
+    /// Ecart moyen du cache conv avec `normed` CPU injecté.
+    pub probe_state_cpu_normed_conv_mean_abs: Option<f32>,
+    /// Ecart maximum du cache SSM avec `normed` CPU injecté.
+    pub probe_state_cpu_normed_ssm_max_abs: Option<f32>,
+    /// Ecart moyen du cache SSM avec `normed` CPU injecté.
+    pub probe_state_cpu_normed_ssm_mean_abs: Option<f32>,
+    /// Divergence mesurée après chaque couche.
+    pub layer_diffs: Vec<ResidentLinearXrayLayerDiff>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -168,6 +307,8 @@ pub struct SpeculativeOutput {
     pub tokens: Vec<usize>,
     /// Compteurs de vérification et d'acceptance.
     pub stats: SpeculativeStats,
+    /// Temps decode-only de la boucle spéculative.
+    pub loop_duration: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -242,12 +383,21 @@ struct ResidentMtpArena {
     fc: MetalLinearWeightBuffers,
     layer: ResidentFullDenseBuffers,
     norm: metal::Buffer,
+    draft_lm_head: MetalLinearWeightBuffers,
     kv: FullAttentionMetalState,
+    #[cfg(feature = "devtools")]
+    append_oracle_kv: FullAttentionMetalState,
+    #[cfg(feature = "devtools")]
+    append_oracle_len: usize,
     hidden_a: GpuTensor,
     hidden_b: GpuTensor,
     current_is_a: bool,
     index: GpuTensor,
     draft_indices: GpuTensor,
+    verify_hidden_rows: GpuTensor,
+    pending_append_indices: GpuTensor,
+    pending_append_start: usize,
+    pending_append_count: usize,
     embedding: GpuTensor,
     concat: GpuTensor,
     fc_out: GpuTensor,
@@ -258,6 +408,7 @@ struct ResidentMtpArena {
 struct ResidentVerifyCaptures {
     base_position: usize,
     linear: Vec<Option<Vec<LinearAttentionMetalState>>>,
+    _linear_leases: Vec<ScratchLease>,
 }
 
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -270,6 +421,25 @@ struct ResidentVerifyOutput {
     states: Tensor,
     tokens: Option<Vec<usize>>,
     captures: Option<ResidentVerifyCaptures>,
+    #[cfg_attr(
+        not(feature = "devtools"),
+        expect(dead_code, reason = "lu par le xray résident-linear (devtools)")
+    )]
+    target_hidden: Option<Tensor>,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[derive(Debug)]
+struct ResidentMtpSpecTwoOutput {
+    drafts: [usize; 2],
+    targets: [usize; 3],
+    accepted_for_stats: [bool; 2],
+    checked: usize,
+    accepted_generated: usize,
+    committed_rows: usize,
+    pending: usize,
+    final_state: Tensor,
+    bonus_verified: bool,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -287,7 +457,10 @@ enum ResidentLayerBuffers {
 #[derive(Debug)]
 struct ResidentFullMoeBuffers {
     input_norm: metal::Buffer,
-    qkv_proj: MetalLinearWeightBuffers,
+    qkv_proj: Option<MetalLinearWeightBuffers>,
+    q_proj: MetalLinearWeightBuffers,
+    k_proj: MetalLinearWeightBuffers,
+    v_proj: MetalLinearWeightBuffers,
     o_proj: MetalLinearWeightBuffers,
     q_norm: metal::Buffer,
     k_norm: metal::Buffer,
@@ -313,7 +486,7 @@ struct ResidentFullRoutedBuffers {
 #[derive(Debug)]
 struct ResidentLinearMoeBuffers {
     input_norm: metal::Buffer,
-    linear: MetalLinearAttnResidentWeights,
+    linear: MetalLinearAttnResidentDenseWeights,
     post_norm: metal::Buffer,
     moe: MetalMoeSharedWeights,
     top_k: usize,
@@ -403,9 +576,14 @@ impl Default for CausalDecoderConfig {
             num_hidden_layers: 1,
             num_attention_heads: 1,
             num_key_value_heads: 1,
+            num_global_key_value_heads: None,
             head_dim: None,
+            global_head_dim: None,
             rope_dims: None,
+            rope_full_dims: None,
+            rope_sliding_dims: None,
             attn_output_gate: false,
+            layer_types: Vec::new(),
             full_attention_interval: None,
             linear_num_value_heads: None,
             linear_num_key_heads: None,
@@ -416,6 +594,20 @@ impl Default for CausalDecoderConfig {
             num_experts_per_tok: 1,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            embed_scale: None,
+            rope_local_base_freq: None,
+            rope_full_base_freq: None,
+            rope_position_scale: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            attention_k_eq_v: false,
+            attention_value_norm: false,
+            parallel_moe: false,
+            final_logit_softcapping: None,
+            query_pre_attn_scalar: None,
+            activation: crate::Activation::Silu,
+            rope_style: RopeStyle::Halves,
+            is_gemma4: false,
         }
     }
 }
@@ -428,9 +620,22 @@ impl From<&ModelConfig> for CausalDecoderConfig {
             num_hidden_layers: config.num_hidden_layers,
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads,
+            num_global_key_value_heads: config.num_global_key_value_heads,
             head_dim: Some(config.head_dim()),
+            global_head_dim: config.global_head_dim,
             rope_dims: Some(config.rope_dims()),
+            rope_full_dims: config.is_gemma4().then(|| {
+                (config.global_head_dim.unwrap_or_else(|| config.head_dim()) as f32
+                    * config.rope_full_partial_rotary_factor.unwrap_or(1.0))
+                    as usize
+            }),
+            rope_sliding_dims: config.is_gemma4().then(|| {
+                (config.head_dim() as f32
+                    * config.rope_sliding_partial_rotary_factor.unwrap_or(1.0))
+                    as usize
+            }),
             attn_output_gate: config.attn_output_gate.unwrap_or(false),
+            layer_types: config.layer_types.clone(),
             full_attention_interval: config.full_attention_interval,
             linear_num_value_heads: config.linear_num_value_heads,
             linear_num_key_heads: config.linear_num_key_heads,
@@ -441,16 +646,144 @@ impl From<&ModelConfig> for CausalDecoderConfig {
             num_experts_per_tok: config.num_experts_per_tok.unwrap_or(1),
             moe_intermediate_size: config.moe_intermediate_size.unwrap_or(0),
             shared_expert_intermediate_size: config.shared_expert_intermediate_size.unwrap_or(0),
+            embed_scale: config.embed_scale(),
+            rope_local_base_freq: config.rope_local_base_freq,
+            rope_full_base_freq: config.rope_full_base_freq,
+            rope_position_scale: config.rope_position_scale(),
+            sliding_window: config.sliding_window,
+            sliding_window_pattern: config.sliding_window_pattern,
+            attention_k_eq_v: config.attention_k_eq_v,
+            attention_value_norm: config.is_gemma4(),
+            parallel_moe: config.enable_moe_block,
+            final_logit_softcapping: config.final_logit_softcapping,
+            query_pre_attn_scalar: if config.is_gemma4() {
+                Some(config.query_pre_attn_scalar.unwrap_or(1.0))
+            } else {
+                config.query_pre_attn_scalar
+            },
+            activation: if config.uses_gelu_tanh() {
+                crate::Activation::GeluTanh
+            } else {
+                crate::Activation::Silu
+            },
+            // Rotate-half pour TOUTE la famille supportée (Qwen, Llama, Mistral,
+            // Gemma) : convention d'entraînement des checkpoints, alignée mlx_lm.
+            rope_style: RopeStyle::Halves,
+            is_gemma4: config.is_gemma4(),
         }
     }
 }
 
 impl CausalDecoderConfig {
+    fn layer_kind(&self, layer_index: usize) -> Option<&str> {
+        self.layer_types.get(layer_index).map(String::as_str)
+    }
+
+    fn is_gemma4_full_layer(&self, layer_index: usize) -> bool {
+        // GARDE: `full_attention` est aussi un type de couche de qwen3_5_moe
+        // (Qwen3.5/3.6 hybride). Sans le drapeau `is_gemma4`, on traitait ces
+        // couches comme Gemma → RoPE pleine (`rope_dims = head_dim`) au lieu du
+        // RoPE partiel correct, corrompant Q/K et donc l'attention.
+        self.is_gemma4 && self.layer_kind(layer_index) == Some("full_attention")
+    }
+
+    fn is_gemma4_sliding_layer(&self, layer_index: usize) -> bool {
+        self.is_gemma4 && self.layer_kind(layer_index) == Some("sliding_attention")
+    }
+
     fn is_full_attention_layer(&self, layer_index: usize) -> bool {
         match self.full_attention_interval {
             Some(interval) if interval > 0 => (layer_index + 1) % interval == 0,
             _ => true,
         }
+    }
+
+    /// Indique si une couche est locale (sliding-window) dans le motif Gemma 3.
+    ///
+    /// Gemma 3 alterne couches locales et globales : une couche globale toutes
+    /// les `sliding_window_pattern` couches (la `pattern`-ième), locales sinon.
+    /// Sans motif déclaré, aucune couche n'est locale.
+    fn is_local_sliding_layer(&self, layer_index: usize) -> bool {
+        if !self.layer_types.is_empty() {
+            return self.is_gemma4_sliding_layer(layer_index);
+        }
+        matches!(
+            self.sliding_window_pattern,
+            Some(pattern) if pattern > 0 && (layer_index + 1) % pattern != 0
+        )
+    }
+
+    fn layer_head_dim(&self, layer_index: usize) -> Result<usize> {
+        let head_dim = if self.is_gemma4_full_layer(layer_index) {
+            self.global_head_dim.or(self.head_dim)
+        } else {
+            self.head_dim
+        };
+        head_dim.ok_or_else(|| InferError::Dimension("head_dim manquant".to_string()))
+    }
+
+    fn layer_num_key_value_heads(&self, layer_index: usize) -> usize {
+        if self.is_gemma4_full_layer(layer_index) {
+            self.num_global_key_value_heads
+                .unwrap_or(self.num_key_value_heads)
+        } else {
+            self.num_key_value_heads
+        }
+    }
+
+    fn layer_rope_dims(&self, layer_index: usize, head_dim: usize) -> usize {
+        if self.is_gemma4_full_layer(layer_index) {
+            self.rope_full_dims.unwrap_or(head_dim)
+        } else if self.is_gemma4_sliding_layer(layer_index) {
+            self.rope_sliding_dims.unwrap_or(head_dim)
+        } else {
+            self.rope_dims.unwrap_or(head_dim)
+        }
+    }
+
+    fn layer_rope_frequency_dim(&self, layer_index: usize, head_dim: usize) -> usize {
+        if self.is_gemma4_full_layer(layer_index) {
+            head_dim
+        } else {
+            self.layer_rope_dims(layer_index, head_dim)
+        }
+    }
+
+    /// Renvoie la base RoPE locale d'une couche Gemma 3, ou `None` (base globale).
+    ///
+    /// Les couches locales utilisent `rope_local_base_freq`, les globales
+    /// `rope_theta`. Hors Gemma 3 renvoie `None` → la base unique `rope_theta`
+    /// s'applique (byte-identique).
+    fn layer_rope_theta_override(&self, layer_index: usize) -> Option<f32> {
+        if self.is_gemma4_full_layer(layer_index) {
+            return self.rope_full_base_freq.or(self.rope_theta);
+        }
+        self.rope_local_base_freq
+            .filter(|_| self.is_local_sliding_layer(layer_index))
+    }
+
+    /// Renvoie la fenêtre d'attention d'une couche locale Gemma 3, ou `None`.
+    ///
+    /// Seules les couches locales du motif `sliding_window_pattern` masquent
+    /// leur attention aux `sliding_window` derniers tokens ; les couches
+    /// globales (et tous les modèles non-Gemma) attendent sur tout le contexte.
+    fn layer_sliding_window(&self, layer_index: usize) -> Option<usize> {
+        self.sliding_window
+            .filter(|window| *window > 0 && self.is_local_sliding_layer(layer_index))
+    }
+
+    /// Renvoie l'échelle des positions RoPE d'une couche, ou `None` (positions brutes).
+    ///
+    /// Gemma 3 ≥4B n'étire que les couches globales (linear ×8) : les couches
+    /// locales du motif sliding gardent leurs positions brutes sur
+    /// `rope_local_base_freq`, comme `initialize_rope` de mlx_lm. Sans motif
+    /// sliding (linear historique type Llama 2), l'échelle s'applique partout.
+    fn layer_rope_position_scale(&self, layer_index: usize) -> Option<f32> {
+        if !self.layer_types.is_empty() {
+            return None;
+        }
+        self.rope_position_scale
+            .filter(|_| !self.is_local_sliding_layer(layer_index))
     }
 
     fn linear_attention_config(&self) -> Result<LinearAttentionConfig> {
@@ -484,6 +817,7 @@ pub struct CausalDecoder {
     final_norm: Tensor,
     lm_head: Linear,
     mtp: Option<MtpHead>,
+    mtp_draft_lm_head: Option<Linear>,
     prefix_cache: Arc<Mutex<PrefixCache>>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     runtime: DecoderRuntime,
@@ -499,6 +833,8 @@ struct PrefixCacheEntry {
     tokens: Vec<usize>,
     cache: CausalDecoderCache,
     final_state: Tensor,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    linear_metal: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -539,6 +875,15 @@ struct DecoderLayer {
     attention: AttentionBlock,
     post_attention_norm: Option<Tensor>,
     mlp: Option<FeedForward>,
+    parallel_moe: Option<FeedForward>,
+    // NOTE: Présentes seulement sur Gemma (double norme feed-forward) ; leur
+    // présence bascule le forward sur le câblage Gemma (post-attn + pre/post FFN).
+    pre_feedforward_norm: Option<Tensor>,
+    post_feedforward_norm: Option<Tensor>,
+    pre_feedforward_norm_2: Option<Tensor>,
+    post_feedforward_norm_1: Option<Tensor>,
+    post_feedforward_norm_2: Option<Tensor>,
+    layer_scalar: Option<Tensor>,
 }
 
 #[derive(Clone, Debug)]
@@ -551,10 +896,24 @@ enum AttentionBlock {
 struct FullAttention {
     q_proj: Linear,
     k_proj: Linear,
-    v_proj: Linear,
+    v_proj: Option<Linear>,
     o_proj: Linear,
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
+    num_key_value_heads: Option<usize>,
+    head_dim: Option<usize>,
+    rope_dims: Option<usize>,
+    rope_frequency_dim: Option<usize>,
+    value_norm: bool,
+    // NOTE: Surcharge la base RoPE de la couche (Gemma 3 : locale vs globale) ;
+    // `None` = base unique `config.rope_theta` (Qwen/Llama/Mistral, byte-identique).
+    rope_theta: Option<f32>,
+    // NOTE: Échelle des positions RoPE de la couche (rope_scaling linear des
+    // couches globales Gemma 3 ≥4B) ; `None` = positions brutes (byte-identique).
+    rope_position_scale: Option<f32>,
+    // NOTE: Fenêtre d'attention des couches locales Gemma 3 ; `None` = attention
+    // causale pleine (toutes les autres couches et tous les modèles non-Gemma).
+    sliding_window: Option<usize>,
 }
 
 impl CausalDecoder {
@@ -610,10 +969,24 @@ impl CausalDecoder {
             final_norm,
             lm_head,
             mtp: None,
+            mtp_draft_lm_head: None,
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
             #[cfg(all(target_os = "macos", feature = "metal"))]
             runtime: DecoderRuntime::default(),
         })
+    }
+
+    /// Plonge des tokens et applique l'échelle d'embedding éventuelle (`√hidden` Gemma).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la plongée échoue.
+    pub(in crate::decoder) fn embed_scaled(&self, token_ids: &[usize]) -> Result<Tensor> {
+        let hidden = embed_weight_tokens(&self.embed_tokens, token_ids)?;
+        match self.config.embed_scale {
+            Some(scale) => Ok(hidden.map(|value| value * scale)),
+            None => Ok(hidden),
+        }
     }
 
     /// Calcule les logits du prochain token sans cache.
@@ -623,13 +996,252 @@ impl CausalDecoder {
     /// Renvoie une erreur si le forward échoue.
     pub fn next_logits(&self, token_ids: &[usize]) -> Result<Tensor> {
         let runtime = self.forward_runtime();
-        let mut hidden = embed_weight_tokens(&self.embed_tokens, token_ids)?;
+        let mut hidden = self.embed_scaled(token_ids)?;
         for layer in &self.layers {
             hidden = layer.forward(&self.config, &hidden, runtime)?;
         }
         let final_state = rms_norm(&hidden, &self.final_norm, self.config.rms_eps)?;
         let logits = self.lm_head.forward_with_runtime(&final_state, runtime)?;
-        Tensor::row(logits.last_row()?.to_vec())
+        self.finalize_logits(&logits)
+    }
+
+    /// Pré-remplit le cache depuis des embeddings déjà préparés.
+    ///
+    /// Qwen3-TTS prépare ses entrées comme un overlay texte+codec ; elles ne
+    /// proviennent donc pas directement de `embed_tokens(token_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la forme des embeddings ou le forward échoue.
+    pub fn prefill_cache_from_embeddings(
+        &self,
+        input_embeds: &Tensor,
+    ) -> Result<(CausalDecoderCache, Tensor)> {
+        let (seq, hidden_dim) = input_embeds.as_matrix()?;
+        if seq == 0 {
+            return Err(InferError::Dimension(
+                "embeddings préfixe vides".to_string(),
+            ));
+        }
+        let expected_hidden = self.final_norm.len();
+        if hidden_dim != expected_hidden {
+            return Err(InferError::Dimension(format!(
+                "embeddings préfixe attendus hidden={expected_hidden}, reçu {hidden_dim}"
+            )));
+        }
+        let runtime = self.forward_runtime();
+        let mut cache = self.empty_cache();
+        let mut hidden = input_embeds.clone();
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_prefill(
+                &self.config,
+                &hidden,
+                &mut cache.layers[layer_index],
+                0,
+                runtime,
+            )?;
+        }
+        cache.position = seq;
+        let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
+        let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+        Ok((cache, final_state))
+    }
+
+    /// Avance le décodeur d'une position depuis un embedding déjà préparé.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la forme de l'embedding ou le forward échoue.
+    pub fn next_state_from_embedding(
+        &self,
+        cache: &mut CausalDecoderCache,
+        input_embed: &Tensor,
+    ) -> Result<Tensor> {
+        let (rows, hidden_dim) = input_embed.as_matrix()?;
+        if rows != 1 {
+            return Err(InferError::Dimension(format!(
+                "embedding decode attendu [1, hidden], reçu {:?}",
+                input_embed.shape()
+            )));
+        }
+        let expected_hidden = self.final_norm.len();
+        if hidden_dim != expected_hidden {
+            return Err(InferError::Dimension(format!(
+                "embedding decode attendu hidden={expected_hidden}, reçu {hidden_dim}"
+            )));
+        }
+        if cache.layers.len() != self.layers.len() {
+            return Err(InferError::Dimension(format!(
+                "cache couches={} incompatible avec décodeur couches={}",
+                cache.layers.len(),
+                self.layers.len()
+            )));
+        }
+        let position = cache.position;
+        let runtime = self.forward_runtime();
+        let mut hidden = input_embed.clone();
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_cached(
+                &self.config,
+                &hidden,
+                &mut cache.layers[layer_index],
+                position,
+                runtime,
+            )?;
+        }
+        cache.position += 1;
+        rms_norm(&hidden, &self.final_norm, self.config.rms_eps)
+    }
+
+    /// Prépare l'arène GPU résidente pour décoder depuis des embeddings (TTS).
+    ///
+    /// Renvoie `true` si l'arène est prête (decode résident complet applicable et
+    /// KV seedé depuis le prefill) ; `false` sinon (l'appelant reste sur le
+    /// per-op via [`Self::next_state_from_embedding`]). Sans la feature Metal,
+    /// renvoie toujours `false`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la compilation des kernels, une allocation ou un seed
+    /// résident échoue.
+    pub fn setup_resident_decode_from_prefill(
+        &self,
+        cache: &mut CausalDecoderCache,
+        max_steps: usize,
+    ) -> Result<bool> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if !self.supports_resident_full_decode() {
+                return Ok(false);
+            }
+            // Chemins greedy (TTS talker argmax, spéculatif/DFlash) → KV f32 exact.
+            self.setup_resident_full_decode(cache, max_steps, false)
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, max_steps);
+            Ok(false)
+        }
+    }
+
+    /// Avance le décodeur d'une position depuis un embedding via le decode GPU
+    /// résident (1 token = 1 command buffer) et renvoie le `final_state` post-norm.
+    ///
+    /// Renvoie `Ok(None)` si le résident n'est pas disponible (executor Metal ou
+    /// arène absente, ou build sans Metal) → l'appelant retombe sur
+    /// [`Self::next_state_from_embedding`]. Nécessite un appel préalable réussi à
+    /// [`Self::setup_resident_decode_from_prefill`].
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la forme de l'embedding est invalide ou si un encodage
+    /// Metal échoue.
+    pub fn decode_step_resident_from_embedding(
+        &self,
+        cache: &mut CausalDecoderCache,
+        embedding: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            match self.next_resident_embedding_step(cache, embedding, None)? {
+                Some(crate::decoder::resident::ResidentEmbeddingOut::State(state)) => {
+                    Ok(Some(state))
+                }
+                Some(crate::decoder::resident::ResidentEmbeddingOut::Token(_)) => Err(
+                    InferError::Metal("pas résident embedding: token inattendu".to_string()),
+                ),
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, embedding);
+            Ok(None)
+        }
+    }
+
+    /// Avance le décodeur d'un pas depuis un embedding via le decode GPU résident
+    /// et renvoie directement le token = argmax greedy on-device de `head`
+    /// (lm_head/tête fournie). Matmul + argmax fusionnés dans le command buffer du
+    /// pas → aucun readback du `final_state`, aucun matmul de tête CPU. Réservé aux
+    /// têtes greedy SANS suppression (TTS code_predictor) ; la tête est résolue en
+    /// buffers Metal en interne (cache par pointeur).
+    ///
+    /// Renvoie `Ok(None)` si le résident n'est pas disponible (fallback per-op).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la forme de l'embedding est invalide, si la tête a un
+    /// biais ou si un encodage Metal échoue.
+    pub fn decode_token_resident_from_embedding_head(
+        &self,
+        cache: &mut CausalDecoderCache,
+        embedding: &Tensor,
+        head: &crate::Linear,
+    ) -> Result<Option<usize>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(metal) = self.forward_runtime().metal_executor() else {
+                return Ok(None);
+            };
+            let head_buffers = metal.resolve_linear_weight_buffers(head.weight(), "tts_cp_head")?;
+            match self.next_resident_embedding_step(cache, embedding, Some(&head_buffers))? {
+                Some(crate::decoder::resident::ResidentEmbeddingOut::Token(token)) => {
+                    Ok(Some(token))
+                }
+                Some(crate::decoder::resident::ResidentEmbeddingOut::State(_)) => Err(
+                    InferError::Metal("pas résident tête: état inattendu".to_string()),
+                ),
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, embedding, head);
+            Ok(None)
+        }
+    }
+
+    /// Crée un cache résident « from scratch » (sans préfixe) pour décoder une
+    /// courte séquence entièrement en GPU depuis des embeddings (TTS
+    /// code_predictor). L'arène est allouée une fois ; la remettre à zéro entre
+    /// séquences avec [`Self::reset_resident_decode_cache`].
+    ///
+    /// Renvoie `Ok(None)` si le decode résident n'est pas applicable (build sans
+    /// Metal, ou modèle inéligible).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la compilation des kernels ou une allocation échoue.
+    pub fn new_resident_decode_cache(
+        &self,
+        max_steps: usize,
+    ) -> Result<Option<CausalDecoderCache>> {
+        let mut cache = self.empty_cache();
+        if self.setup_resident_decode_from_prefill(&mut cache, max_steps)? {
+            Ok(Some(cache))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Remet un cache résident à zéro pour un nouveau décodage from-scratch : vide
+    /// le KV résident de chaque couche full-attn (`len = 0`) et remet la position
+    /// à 0. Réservé aux décodeurs full-attn (le code_predictor TTS) ; les états
+    /// linear-attn ne sont pas réinitialisés ici.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la troncature d'un état KV résident échoue.
+    pub fn reset_resident_decode_cache(&self, cache: &mut CausalDecoderCache) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        for layer_cache in cache.layers.iter_mut() {
+            if let Some(full) = layer_cache.full.as_mut() {
+                full.truncate(0)?;
+            }
+        }
+        cache.position = 0;
+        Ok(())
     }
 
     /// Active le runtime Metal pour les kernels de couche disponibles.
@@ -659,6 +1271,26 @@ impl CausalDecoder {
     pub fn with_mtp_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
         self.mtp = Some(MtpHead::from_sidecar(path, &self.config)?);
         Ok(self)
+    }
+
+    /// Charge une projection logits dédiée aux drafts MTP.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
+    pub fn with_mtp_draft_lm_head_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
+        self.mtp_draft_lm_head = Some(mtp::load_mtp_draft_lm_head(
+            path,
+            self.final_norm.data().len(),
+        )?);
+        Ok(self)
+    }
+
+    fn mtp_draft_lm_head(&self) -> &Linear {
+        match self.mtp_draft_lm_head.as_ref() {
+            Some(head) => head,
+            None => &self.lm_head,
+        }
     }
 
     fn forward_runtime(&self) -> ForwardRuntime<'_> {

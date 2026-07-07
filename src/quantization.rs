@@ -171,13 +171,7 @@ impl AffineQuantizedTensor {
     }
 
     fn value(&self, row: usize, col: usize) -> f32 {
-        let packed_cols = self.packed_shape[1];
-        let values_per_word = 32 / self.bits;
-        let mask = (1_u32 << self.bits) - 1;
-        let packed_index = row * packed_cols + col / values_per_word;
-        let lane = col % values_per_word;
-        let shift = lane * self.bits;
-        let quantized = ((self.packed[packed_index] >> shift) & mask) as f32;
+        let quantized = self.bitpacked_value(row, col) as f32;
         let groups = self.shape[1] / self.group_size;
         let group = col / self.group_size;
         let affine_index = row * groups + group;
@@ -190,9 +184,6 @@ impl AffineQuantizedTensor {
             8 if self.group_size % 4 == 0 => return self.dot_row_u8(input_row, row),
             _ => {}
         }
-        let packed_cols = self.packed_shape[1];
-        let values_per_word = 32 / self.bits;
-        let mask = (1_u32 << self.bits) - 1;
         let groups = self.shape[1] / self.group_size;
         let mut acc = 0.0_f32;
 
@@ -200,29 +191,34 @@ impl AffineQuantizedTensor {
             let affine_index = row * groups + group;
             let scale = self.scales.data()[affine_index];
             let bias = self.biases.data()[affine_index];
-            let group_start = group * self.group_size;
-            let group_end = group_start + self.group_size;
-            let first_word = group_start / values_per_word;
-            let last_word = group_end.div_ceil(values_per_word);
-
-            for word_col in first_word..last_word {
-                let packed = self.packed[row * packed_cols + word_col];
-                let base_col = word_col * values_per_word;
-                for lane in 0..values_per_word {
-                    let col = base_col + lane;
-                    if col >= group_end {
-                        break;
-                    }
-                    if col < group_start {
-                        continue;
-                    }
-                    let shift = lane * self.bits;
-                    let quantized = ((packed >> shift) & mask) as f32;
-                    acc += input_row[col] * (quantized * scale + bias);
-                }
+            for col in group * self.group_size..(group + 1) * self.group_size {
+                let quantized = self.bitpacked_value(row, col) as f32;
+                acc += input_row[col] * (quantized * scale + bias);
             }
         }
         acc
+    }
+
+    fn bitpacked_value(&self, row: usize, col: usize) -> u32 {
+        let packed_cols = self.packed_shape[1];
+        let bit_offset = col * self.bits;
+        let word_col = bit_offset / 32;
+        let shift = bit_offset % 32;
+        let row_start = row * packed_cols;
+        let mask = (1_u32 << self.bits) - 1;
+        let low = self.packed[row_start + word_col] >> shift;
+        if shift + self.bits <= 32 {
+            return low & mask;
+        }
+        let high_bits = shift + self.bits - 32;
+        let high_mask = (1_u32 << high_bits) - 1;
+        let high = self
+            .packed
+            .get(row_start + word_col + 1)
+            .copied()
+            .unwrap_or(0)
+            & high_mask;
+        (low | (high << (32 - shift))) & mask
     }
 
     fn dot_row_u4(&self, input_row: &[f32], row: usize) -> f32 {
@@ -324,7 +320,7 @@ fn affine_params(
             packed_len
         )));
     }
-    if group_size == 0 || bits == 0 || 32 % bits != 0 || bits > 16 {
+    if group_size == 0 || bits == 0 || bits > 16 {
         return Err(InferError::Config(format!(
             "quantification affine invalide: group_size={group_size}, bits={bits}"
         )));
@@ -412,6 +408,24 @@ mod tests {
         assert_close(
             dense.data(),
             &[1.0, 0.0, 7.0 / 15.0, 8.0 / 15.0, 1.0, 3.0, 5.0, 7.0],
+        );
+    }
+
+    #[test]
+    fn dequantizes_affine_u6_bitstream_row() {
+        let values = [1, 2, 3, 4, 5, 6, 7, 63, 8, 9, 10, 11, 12, 13, 14, 15];
+        let packed = pack_bitstream(&values, 6);
+        let scales =
+            Tensor::from_vec(vec![1, 2], vec![1.0, 1.0]).expect("invariant: scales valides");
+        let biases =
+            Tensor::from_vec(vec![1, 2], vec![0.0, 0.0]).expect("invariant: biases valides");
+
+        let dense = dequantize_affine_u32(&[1, packed.len()], &packed, &scales, &biases, 8, 6)
+            .expect("invariant: déquantification affine 6-bit valide");
+
+        assert_close(
+            &dense.data()[..values.len()],
+            &values.iter().map(|value| *value as f32).collect::<Vec<_>>(),
         );
     }
 
@@ -521,6 +535,21 @@ mod tests {
             .iter()
             .enumerate()
             .fold(0_u32, |word, (idx, value)| word | (value << (idx * bits)))
+    }
+
+    fn pack_bitstream(values: &[u32], bits: usize) -> Vec<u32> {
+        let total_bits = values.len() * bits;
+        let mut out = vec![0_u32; total_bits.div_ceil(32)];
+        for (idx, value) in values.iter().copied().enumerate() {
+            let bit_offset = idx * bits;
+            let word = bit_offset / 32;
+            let shift = bit_offset % 32;
+            out[word] |= value << shift;
+            if shift + bits > 32 {
+                out[word + 1] |= value >> (32 - shift);
+            }
+        }
+        out
     }
 
     fn assert_close(left: &[f32], right: &[f32]) {

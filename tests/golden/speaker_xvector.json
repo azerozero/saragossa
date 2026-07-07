@@ -1,0 +1,11 @@
+{
+  "dtype": "f32",
+  "shape": [
+    1,
+    2048
+  ],
+  "tolerance": "max_abs<=5e-5, rms<=1e-5",
+  "source": "live_speaker_xvector_matches_mlxrs",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

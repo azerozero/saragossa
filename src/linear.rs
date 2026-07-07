@@ -54,6 +54,36 @@ impl LinearWeight {
             Self::AffineQuantized(weight) => weight.matmul_rhs_t(input),
         }
     }
+
+    /// Comme [`Self::matmul_rhs_t_with_runtime`], mais route les poids **denses**
+    /// avec `batch > 1` (prefill encodeur Whisper) vers le GEMM tuilé. `batch == 1`
+    /// (decode token par token) reste sur le qmv → byte-identique au decode.
+    fn matmul_rhs_t_batched_with_runtime(
+        &self,
+        input: &Tensor,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<Tensor> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = runtime.metal_executor() {
+            return match self {
+                Self::Dense(weight) => {
+                    let (batch, _) = input.as_matrix()?;
+                    if batch > 1 {
+                        metal.matmul_rhs_t_dense_tiled(input, weight)
+                    } else {
+                        metal.matmul_rhs_t_dense(input, weight)
+                    }
+                }
+                Self::AffineQuantized(weight) => metal.matmul_rhs_t_affine(input, weight),
+            };
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = runtime;
+        match self {
+            Self::Dense(weight) => input.matmul_rhs_t(weight),
+            Self::AffineQuantized(weight) => weight.matmul_rhs_t(input),
+        }
+    }
 }
 
 impl Linear {
@@ -123,6 +153,23 @@ impl Linear {
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
         let mut out = self.weight.matmul_rhs_t_with_runtime(input, runtime)?;
+        if let Some(bias) = &self.bias {
+            out = out.add_row_bias(bias)?;
+        }
+        Ok(out)
+    }
+
+    /// Exécute la couche en routant les poids denses `batch > 1` vers le GEMM
+    /// tuilé (prefill encodeur Whisper). Identique à [`Self::forward_with_runtime`]
+    /// pour `batch == 1` et pour les poids quantifiés.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les dimensions ou le runtime échouent.
+    pub fn forward_batched(&self, input: &Tensor, runtime: ForwardRuntime<'_>) -> Result<Tensor> {
+        let mut out = self
+            .weight
+            .matmul_rhs_t_batched_with_runtime(input, runtime)?;
         if let Some(bias) = &self.bias {
             out = out.add_row_bias(bias)?;
         }

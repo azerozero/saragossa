@@ -75,4 +75,27 @@ impl LayerKvCache {
             _ => 0,
         }
     }
+
+    pub(super) fn truncate(&mut self, len: usize) -> Result<()> {
+        let Some(dim) = self.kv_dim else {
+            if len == 0 {
+                return Ok(());
+            }
+            return Err(InferError::Dimension(format!(
+                "truncate KV CPU {len} sans dimension initialisée"
+            )));
+        };
+        let new_len = len
+            .checked_mul(dim)
+            .ok_or_else(|| InferError::Dimension("truncate KV CPU déborde".to_string()))?;
+        if new_len > self.keys.len() || new_len > self.values.len() {
+            return Err(InferError::Dimension(format!(
+                "truncate KV CPU {len} > len {}",
+                self.len()
+            )));
+        }
+        self.keys.truncate(new_len);
+        self.values.truncate(new_len);
+        Ok(())
+    }
 }

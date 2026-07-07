@@ -1,0 +1,10 @@
+{
+  "dtype": "f32",
+  "shape": [
+    2048
+  ],
+  "tolerance": "max_abs<=0.18",
+  "source": "live_clone_icl_inputs_match_mlx_oracle",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

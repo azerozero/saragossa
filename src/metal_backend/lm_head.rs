@@ -79,6 +79,68 @@ impl MetalExecutor {
             .map_err(|_| InferError::Metal(format!("sample Metal index trop grand: {index}")))
     }
 
+    /// Échantillonne une projection biasless par Gumbel-max exact.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si l'entrée ou la projection sont invalides.
+    pub(crate) fn sample_linear_biasless_gumbel(
+        &self,
+        input: &Tensor,
+        linear: &Linear,
+        temperature: f32,
+        rng_state: u64,
+    ) -> Result<usize> {
+        ensure_biasless(linear, "sample_gumbel")?;
+        let (batch, in_dim) = input.as_matrix()?;
+        if batch != 1 {
+            return Err(InferError::Dimension(format!(
+                "sample Gumbel Metal attend batch=1, reçu {batch}"
+            )));
+        }
+        let out_dim = linear_out_dim(linear.weight())?;
+        let input_buffer = self.upload_f32_buffer(input.data(), "sample_gumbel_input")?;
+        let logits_buffer = self.private_f32_buffer(out_dim, "sample_gumbel_logits")?;
+        let index_buffer = self.new_u32_buffer(1, "sample_gumbel_index")?;
+        let mut owned_buffers = Vec::new();
+
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        let projected_dim = self.encode_matmul_weight(
+            encoder,
+            &mut owned_buffers,
+            &input_buffer,
+            batch,
+            in_dim,
+            linear.weight(),
+            &logits_buffer,
+        )?;
+        if projected_dim != out_dim {
+            return Err(InferError::Dimension(format!(
+                "sample Gumbel projection sort {projected_dim}, attendu {out_dim}"
+            )));
+        }
+        self.encode_sample_gumbel(
+            encoder,
+            &logits_buffer,
+            &index_buffer,
+            out_dim,
+            temperature,
+            rng_state,
+        )?;
+        encoder_guard.end();
+        commit_and_wait(command_buffer)?;
+
+        let index = read_u32_buffer(&index_buffer, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| InferError::Metal("sample Gumbel Metal sans index".to_string()))?;
+        usize::try_from(index).map_err(|_| {
+            InferError::Metal(format!("sample Gumbel Metal index trop grand: {index}"))
+        })
+    }
+
     /// Calcule l'argmax d'une projection linéaire biasless sans lire le vocab complet.
     ///
     /// # Errors
@@ -117,6 +179,100 @@ impl MetalExecutor {
             .ok_or_else(|| InferError::Metal("argmax Metal sans index".to_string()))?;
         usize::try_from(index)
             .map_err(|_| InferError::Metal(format!("argmax Metal index trop grand: {index}")))
+    }
+
+    /// Argmax greedy du talker TTS (cb0) sur GPU : matmul `codec_head·input` puis
+    /// `talker_greedy_argmax` (quantification `floor(x*4)/4` + suppression de la
+    /// plage `[suppress_start, vocab)` sauf `eos`, tie-break index le plus bas).
+    /// Renvoie l'id du token (1 `u32` relu), tuant le readback full-vocab + l'argmax
+    /// CPU `greedy_talker_token`. Byte-identique au CPU (mêmes logits GPU, même
+    /// quantification exacte). `linear` doit être biasless.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `batch != 1`, si la projection déborde ou si l'encodage
+    /// Metal échoue.
+    pub(crate) fn talker_greedy_token_biasless(
+        &self,
+        input: &Tensor,
+        linear: &Linear,
+        suppress_start: usize,
+        eos: usize,
+    ) -> Result<usize> {
+        ensure_biasless(linear, "talker_greedy")?;
+        let (batch, in_dim) = input.as_matrix()?;
+        if batch != 1 {
+            return Err(InferError::Dimension(format!(
+                "talker greedy attend batch=1, reçu {batch}"
+            )));
+        }
+        let out_dim = linear_out_dim(linear.weight())?;
+        let input_buffer = self.upload_f32_buffer(input.data(), "talker_argmax_input")?;
+        let logits_buffer = self.private_f32_buffer(out_dim, "talker_argmax_logits")?;
+        let index_buffer = self.new_u32_buffer(1, "talker_argmax_index")?;
+        let mut owned_buffers = Vec::new();
+
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        let projected = self.encode_matmul_weight(
+            encoder,
+            &mut owned_buffers,
+            &input_buffer,
+            batch,
+            in_dim,
+            linear.weight(),
+            &logits_buffer,
+        )?;
+        if projected != out_dim {
+            return Err(InferError::Dimension(format!(
+                "talker greedy projection sort {projected}, attendu {out_dim}"
+            )));
+        }
+        self.encode_talker_greedy_argmax(
+            encoder,
+            &logits_buffer,
+            out_dim,
+            suppress_start,
+            eos,
+            &index_buffer,
+        )?;
+        encoder_guard.end();
+        commit_and_wait(command_buffer)?;
+
+        let index = read_u32_buffer(&index_buffer, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| InferError::Metal("talker greedy sans index".to_string()))?;
+        usize::try_from(index)
+            .map_err(|_| InferError::Metal(format!("talker greedy index trop grand: {index}")))
+    }
+
+    /// Encode l'argmax greedy talker (quantifié + suppression de plage) sur un
+    /// buffer de logits déjà calculé, écrivant 1 `u32` dans `out_index`. Un seul
+    /// threadgroup de 256, grid-stride (vocab talker = 3072).
+    pub(crate) fn encode_talker_greedy_argmax(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buffer: &BufferRef,
+        count: usize,
+        suppress_start: usize,
+        eos: usize,
+        out_index: &BufferRef,
+    ) -> Result<()> {
+        let count = checked_u32(count, "talker argmax count")?;
+        let suppress_start = checked_u32(suppress_start, "talker argmax suppress_start")?;
+        let eos = checked_u32(eos, "talker argmax eos")?;
+        encoder.set_compute_pipeline_state(&self.talker_greedy_argmax_f32);
+        encoder.set_buffer(0, Some(logits_buffer), 0);
+        set_u32_bytes(encoder, 1, &[count], "talker_argmax_count")?;
+        set_u32_bytes(encoder, 2, &[suppress_start], "talker_argmax_suppress")?;
+        set_u32_bytes(encoder, 3, &[eos], "talker_argmax_eos")?;
+        encoder.set_buffer(4, Some(out_index), 0);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(LM_HEAD_TG_WIDTH, 1, 1));
+        post_dispatch_barrier(encoder);
+        Ok(())
     }
 
     /// Encode `lm_head·input` puis l'argmax GPU dans l'encoder PARTAGÉ, écrivant
@@ -190,6 +346,40 @@ impl MetalExecutor {
     ) -> Result<()> {
         let out_dim = self.linear_weight_out_dim(lm_head);
         let batch = 1;
+        if let MetalLinearWeightBuffers::Dense {
+            rhs_bf16: Some(rhs_bf16),
+            in_dim: rhs_in_dim,
+            ..
+        } = lm_head
+        {
+            if super::whisper_decode_bf16_qmv_enabled() && *rhs_in_dim == in_dim {
+                let logits_buffer = self.private_f32_buffer(out_dim, "argmax_logits")?;
+                let partial_count = out_dim.div_ceil(256);
+                let partial_values =
+                    self.private_f32_buffer(partial_count, "argmax_partial_values")?;
+                let partial_indices =
+                    self.private_u32_buffer(partial_count, "argmax_partial_indices")?;
+                self.encode_dense_qmv_rhs_bf16(
+                    encoder,
+                    input_buffer,
+                    rhs_bf16,
+                    &logits_buffer,
+                    batch,
+                    out_dim,
+                    in_dim,
+                )?;
+                self.encode_argmax(
+                    encoder,
+                    owned_buffers,
+                    &logits_buffer,
+                    &partial_values,
+                    &partial_indices,
+                    index_buffer,
+                    out_dim,
+                )?;
+                return Ok(());
+            }
+        }
         if let MetalLinearWeightBuffers::AffineQuantized {
             group_size, bits, ..
         } = lm_head
@@ -288,6 +478,78 @@ impl MetalExecutor {
         )
     }
 
+    /// Encode le `lm_head` puis un sampling Gumbel-max (`top_k=0`, `top_p=1`).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la projection sort une dimension inattendue.
+    pub(crate) fn encode_lm_head_sample_gumbel_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        lm_head: &MetalLinearWeightBuffers,
+        index_buffer: &BufferRef,
+        in_dim: usize,
+        temperature: f32,
+        rng_state: u64,
+    ) -> Result<()> {
+        let out_dim = self.linear_weight_out_dim(lm_head);
+        let logits_buffer = self.private_f32_buffer(out_dim, "sample_gumbel_logits")?;
+        let projected_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            input_buffer,
+            1,
+            in_dim,
+            lm_head,
+            &logits_buffer,
+            false,
+        )?;
+        if projected_dim != out_dim {
+            return Err(InferError::Dimension(format!(
+                "sample Gumbel projection sort {projected_dim}, attendu {out_dim}"
+            )));
+        }
+        self.encode_sample_gumbel(
+            encoder,
+            &logits_buffer,
+            index_buffer,
+            out_dim,
+            temperature,
+            rng_state,
+        )
+    }
+
+    /// Encode le `lm_head` dans un buffer partagé pour sampling CPU exact.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la projection sort une dimension inattendue.
+    pub(crate) fn encode_lm_head_logits_readback_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        lm_head: &MetalLinearWeightBuffers,
+        in_dim: usize,
+    ) -> Result<(metal::Buffer, usize)> {
+        let out_dim = self.linear_weight_out_dim(lm_head);
+        let logits_buffer = self.uncached_f32_buffer(out_dim, "sample_logits_readback")?;
+        let projected_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            input_buffer,
+            1,
+            in_dim,
+            lm_head,
+            &logits_buffer,
+            false,
+        )?;
+        if projected_dim != out_dim {
+            return Err(InferError::Dimension(format!(
+                "sample readback projection sort {projected_dim}, attendu {out_dim}"
+            )));
+        }
+        Ok((logits_buffer, out_dim))
+    }
+
     pub(crate) fn encode_lm_head_argmax_buffers_with_index_offset(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -373,6 +635,132 @@ impl MetalExecutor {
             index_offset,
             partial_count,
         )
+    }
+
+    /// Encode `lm_head` + argmax pour deux lignes contiguës déjà résidentes.
+    ///
+    /// La projection passe par le matmul batché (`rows=2`), qui route vers qmm2
+    /// pour les poids quantifiés éligibles. Les deux argmax restent séparés afin
+    /// de conserver le tie-break existant.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les dimensions divergent ou si Metal échoue.
+    pub(crate) fn encode_lm_head_argmax_two_rows_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        lm_head: &MetalLinearWeightBuffers,
+        index_buffer: &BufferRef,
+        input_offset: u64,
+        index_offset: u64,
+        in_dim: usize,
+    ) -> Result<()> {
+        self.encode_lm_head_argmax_rows_buffers(
+            encoder,
+            input_buffer,
+            lm_head,
+            index_buffer,
+            input_offset,
+            index_offset,
+            2,
+            in_dim,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "lm_head rows: buffers + offsets + dimensions explicites"
+    )]
+    pub(crate) fn encode_lm_head_argmax_rows_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        lm_head: &MetalLinearWeightBuffers,
+        index_buffer: &BufferRef,
+        input_offset: u64,
+        index_offset: u64,
+        rows: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        if rows == 0 {
+            return Err(InferError::Dimension(
+                "argmax rows exige au moins une ligne".to_string(),
+            ));
+        }
+        let out_dim = self.linear_weight_out_dim(lm_head);
+        let logits_len = rows
+            .checked_mul(out_dim)
+            .ok_or_else(|| InferError::Dimension("argmax rows logits déborde".to_string()))?;
+        let logits_buffer = self.private_f32_buffer(logits_len, "argmax_rows_logits")?;
+        let input_rows;
+        let matmul_input = if input_offset == 0 {
+            input_buffer
+        } else {
+            let input_len = rows
+                .checked_mul(in_dim)
+                .ok_or_else(|| InferError::Dimension("argmax rows input déborde".to_string()))?;
+            input_rows = self.private_f32_buffer(input_len, "argmax_rows_input")?;
+            self.encode_copy_with_offsets(
+                encoder,
+                input_buffer,
+                input_offset,
+                &input_rows,
+                0,
+                input_len,
+            )?;
+            &input_rows
+        };
+        let projected_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            matmul_input,
+            rows,
+            in_dim,
+            lm_head,
+            &logits_buffer,
+            true,
+        )?;
+        if projected_dim != out_dim {
+            return Err(InferError::Dimension(format!(
+                "argmax rows projection sort {projected_dim}, attendu {out_dim}"
+            )));
+        }
+        let partial_count = out_dim.div_ceil(256);
+        for row in 0..rows {
+            let partial_values = self.private_f32_buffer(partial_count, "argmax_partial_values")?;
+            let partial_indices =
+                self.private_u32_buffer(partial_count, "argmax_partial_indices")?;
+            let logits_offset = byte_offset_f32(
+                row.checked_mul(out_dim).ok_or_else(|| {
+                    InferError::Dimension("argmax rows logits offset déborde".to_string())
+                })?,
+                "argmax rows logits offset",
+            )?;
+            let row_index_offset = row
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| InferError::Metal("argmax rows index offset déborde".to_string()))?;
+            let out_offset = index_offset
+                .checked_add(row_index_offset)
+                .ok_or_else(|| InferError::Metal("argmax rows index offset déborde".to_string()))?;
+            self.encode_argmax_blocks_with_offset(
+                encoder,
+                &logits_buffer,
+                logits_offset,
+                &partial_values,
+                &partial_indices,
+                out_dim,
+            )?;
+            self.encode_argmax_finalize_with_offset(
+                encoder,
+                &partial_values,
+                &partial_indices,
+                index_buffer,
+                out_offset,
+                partial_count,
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn argmax_linear_biasless_rows_buffers(
@@ -662,12 +1050,31 @@ impl MetalExecutor {
         partial_indices: &BufferRef,
         count: usize,
     ) -> Result<()> {
+        self.encode_argmax_blocks_with_offset(
+            encoder,
+            logits_buffer,
+            0,
+            partial_values,
+            partial_indices,
+            count,
+        )
+    }
+
+    pub(super) fn encode_argmax_blocks_with_offset(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buffer: &BufferRef,
+        logits_offset: u64,
+        partial_values: &BufferRef,
+        partial_indices: &BufferRef,
+        count: usize,
+    ) -> Result<()> {
         let partial_count = count.div_ceil(256);
         let count = checked_u32(count, "argmax count")?;
         let partial_count = checked_u32(partial_count, "argmax partial_count")?;
 
         encoder.set_compute_pipeline_state(&self.argmax_blocks_f32);
-        encoder.set_buffer(0, Some(logits_buffer), 0);
+        encoder.set_buffer(0, Some(logits_buffer), logits_offset);
         encoder.set_buffer(1, Some(partial_values), 0);
         encoder.set_buffer(2, Some(partial_indices), 0);
         set_u32_bytes(encoder, 3, &[count], "argmax_count")?;
@@ -698,7 +1105,7 @@ impl MetalExecutor {
         )
     }
 
-    fn encode_argmax_finalize_with_offset(
+    pub(super) fn encode_argmax_finalize_with_offset(
         &self,
         encoder: &ComputeCommandEncoderRef,
         partial_values: &BufferRef,
@@ -721,6 +1128,71 @@ impl MetalExecutor {
 
     #[expect(
         clippy::too_many_arguments,
+        reason = "encodage Gumbel: buffers, offsets et paramètres sampling explicites"
+    )]
+    pub(super) fn encode_sample_gumbel_with_offsets(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buffer: &BufferRef,
+        logits_offset: u64,
+        output_index: &BufferRef,
+        index_offset: u64,
+        count: usize,
+        temperature: f32,
+        rng_state: u64,
+    ) -> Result<()> {
+        let count_u32 = checked_u32(count, "sample Gumbel count")?;
+        let partial_count = count.div_ceil(256);
+        let partial_values = self.private_f32_buffer(partial_count, "gumbel_partial_values")?;
+        let partial_indices = self.private_u32_buffer(partial_count, "gumbel_partial_indices")?;
+
+        encoder.set_compute_pipeline_state(&self.sample_gumbel_blocks_f32);
+        encoder.set_buffer(0, Some(logits_buffer), logits_offset);
+        encoder.set_buffer(1, Some(&partial_values), 0);
+        encoder.set_buffer(2, Some(&partial_indices), 0);
+        set_u32_bytes(encoder, 3, &[count_u32], "gumbel_count")?;
+        set_f32_bytes(encoder, 4, &[temperature], "gumbel_temperature")?;
+        set_u64_bytes(encoder, 5, &[rng_state], "gumbel_rng")?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(checked_nsuint(partial_count, "gumbel partial_count")?, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+
+        self.encode_argmax_finalize_with_offset(
+            encoder,
+            &partial_values,
+            &partial_indices,
+            output_index,
+            index_offset,
+            partial_count,
+        )
+    }
+
+    fn encode_sample_gumbel(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buffer: &BufferRef,
+        output_index: &BufferRef,
+        count: usize,
+        temperature: f32,
+        rng_state: u64,
+    ) -> Result<()> {
+        self.encode_sample_gumbel_with_offsets(
+            encoder,
+            logits_buffer,
+            0,
+            output_index,
+            0,
+            count,
+            temperature,
+            rng_state,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
         reason = "encodage sampler: paramètres sampling et buffers explicites"
     )]
     fn encode_sample_topk_topp(
@@ -734,6 +1206,52 @@ impl MetalExecutor {
         top_p: f32,
         rng_state: u64,
     ) -> Result<()> {
+        self.encode_sample_topk_topp_with_offsets(
+            encoder,
+            logits_buffer,
+            0,
+            output_index,
+            0,
+            count,
+            top_k,
+            temperature,
+            top_p,
+            rng_state,
+        )
+    }
+
+    /// Variante à offsets du sampler top-k/top-p : `logits_offset` adresse la
+    /// ligne du flux dans des logits `[M, vocab]`, `index_offset` la case u32 du
+    /// flux (duo light-batch, `rng_state` PAR FLUX). Mêmes kernels que le solo.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage sampler: buffers + offsets + paramètres sampling explicites"
+    )]
+    pub(super) fn encode_sample_topk_topp_with_offsets(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buffer: &BufferRef,
+        logits_offset: u64,
+        output_index: &BufferRef,
+        index_offset: u64,
+        count: usize,
+        top_k: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u64,
+    ) -> Result<()> {
+        if top_k == 0 && top_p >= 1.0 {
+            return self.encode_sample_gumbel_with_offsets(
+                encoder,
+                logits_buffer,
+                logits_offset,
+                output_index,
+                index_offset,
+                count,
+                temperature,
+                rng_state,
+            );
+        }
         if top_k == 0 || top_k > MAX_SAMPLER_TOP_K || top_k > count {
             return Err(InferError::Dimension(format!(
                 "sample top_k={top_k} invalide pour count={count}"
@@ -752,7 +1270,7 @@ impl MetalExecutor {
         let partial_indices = self.private_u32_buffer(partial_len, "sample_partial_indices")?;
 
         encoder.set_compute_pipeline_state(&self.sample_topk_blocks_f32);
-        encoder.set_buffer(0, Some(logits_buffer), 0);
+        encoder.set_buffer(0, Some(logits_buffer), logits_offset);
         encoder.set_buffer(1, Some(&partial_values), 0);
         encoder.set_buffer(2, Some(&partial_indices), 0);
         set_u32_bytes(encoder, 3, &dims, "sample_block_dims")?;
@@ -770,12 +1288,12 @@ impl MetalExecutor {
         encoder.set_compute_pipeline_state(&self.sample_topk_finalize_f32);
         encoder.set_buffer(0, Some(&partial_values), 0);
         encoder.set_buffer(1, Some(&partial_indices), 0);
-        encoder.set_buffer(2, Some(output_index), 0);
+        encoder.set_buffer(2, Some(output_index), index_offset);
         set_u32_bytes(encoder, 3, &finalize_dims, "sample_finalize_dims")?;
         set_f32_bytes(encoder, 4, &params, "sample_params")?;
         set_u64_bytes(encoder, 5, &[rng_state], "sample_rng")?;
         profile_dispatch();
-        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 1, 1));
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(128, 1, 1));
         post_dispatch_barrier(encoder);
         Ok(())
     }

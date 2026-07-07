@@ -22,6 +22,256 @@ fn loads_model_prefixed_qwen_weights() {
 }
 
 #[test]
+fn loads_tied_model_substituting_embeddings_for_lm_head() {
+    // Modèle lié (Llama-3.2, Qwen3-0.6B…) : pas de lm_head.weight sur disque.
+    let tied = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_tied_safetensors(tied.path());
+    let tied_catalog = WeightCatalog::from_shards(&[tied.path().to_path_buf()])
+        .expect("invariant: catalog tied chargeable");
+    assert!(!tied_catalog.contains("lm_head.weight"));
+    let tied_model = load_causal_decoder_from_shards(
+        &tied_test_config(),
+        &[tied.path().to_path_buf()],
+        &tied_catalog,
+    )
+    .expect("invariant: modèle lié chargeable via substitution embeddings");
+
+    // Équivalent explicite : lm_head.weight == embed_tokens.weight, non lié.
+    let explicit = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_explicit_tied_equivalent(explicit.path());
+    let explicit_catalog = WeightCatalog::from_shards(&[explicit.path().to_path_buf()])
+        .expect("invariant: catalog explicite chargeable");
+    let explicit_model = load_causal_decoder_from_shards(
+        &test_config(),
+        &[explicit.path().to_path_buf()],
+        &explicit_catalog,
+    )
+    .expect("invariant: modèle explicite chargeable");
+
+    // Oracle byte-identique : la tête liée reproduit la tête explicite.
+    let tied_logits = tied_model
+        .next_logits(&[0])
+        .expect("invariant: forward lié valide");
+    let explicit_logits = explicit_model
+        .next_logits(&[0])
+        .expect("invariant: forward explicite valide");
+    assert_eq!(tied_logits.shape(), &[1, 3]);
+    assert_eq!(tied_logits.data(), explicit_logits.data());
+}
+
+#[test]
+fn tied_contract_reports_lm_head_present() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_tied_safetensors(tmp.path());
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+
+    let contract = verify_decoder_contract_from_shards(
+        &tied_test_config(),
+        &[tmp.path().to_path_buf()],
+        &catalog,
+    )
+    .expect("invariant: contrat lié valide");
+
+    // La tête liée est comptée présente (substituée), sans être requise.
+    assert_eq!(contract.present_specs, 8);
+    assert_eq!(contract.required_specs, 7);
+}
+
+#[test]
+fn untied_model_without_lm_head_is_rejected() {
+    // Sans tie_word_embeddings, l'absence de lm_head reste une erreur dure.
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_tied_safetensors(tmp.path());
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+
+    let err =
+        load_causal_decoder_from_shards(&test_config(), &[tmp.path().to_path_buf()], &catalog)
+            .expect_err("invariant: lm_head manquant rejeté hors tying");
+    assert!(matches!(err, InferError::MissingWeight(_)));
+}
+
+#[test]
+fn loads_gemma_model_with_baked_norms() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_gemma_safetensors(tmp.path());
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    let model = load_causal_decoder_from_shards(
+        &gemma_test_config(),
+        &[tmp.path().to_path_buf()],
+        &catalog,
+    )
+    .expect("invariant: modèle Gemma minimal chargeable");
+
+    let logits = model
+        .next_logits(&[0])
+        .expect("invariant: forward Gemma valide");
+    assert_eq!(logits.shape(), &[1, 3]);
+    assert!(logits.data().iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn gemma_requires_feedforward_norms() {
+    // Sans pre/post_feedforward_layernorm, le contrat Gemma échoue net.
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_safetensors_with_mlp(tmp.path());
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+
+    let err = load_causal_decoder_from_shards(
+        &gemma_test_config(),
+        &[tmp.path().to_path_buf()],
+        &catalog,
+    )
+    .expect_err("invariant: normes FFN manquantes rejetées");
+    assert!(matches!(err, InferError::MissingWeight(_)));
+}
+
+#[test]
+fn rejects_gemma2_softcapping_config() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_safetensors(tmp.path(), "model.", "lm_head.", None);
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    let mut config = gemma_test_config();
+    config.model_type = "gemma2".to_string();
+    config.attn_logit_softcapping = Some(50.0);
+    config.final_logit_softcapping = Some(30.0);
+
+    let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+        .expect_err("invariant: softcapping Gemma 2 rejeté");
+    assert!(matches!(err, InferError::Config(_)));
+    assert!(err.to_string().contains("softcapping"));
+}
+
+#[test]
+fn rejects_unsupported_rope_scaling_type_for_gemma() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_safetensors(tmp.path(), "model.", "lm_head.", None);
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    let mut config = gemma_test_config();
+    config.rope_scaling = Some(crate::RopeScalingConfig {
+        rope_type: Some("yarn".to_string()),
+        legacy_type: None,
+        factor: Some(8.0),
+    });
+
+    let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+        .expect_err("invariant: rope_scaling yarn Gemma rejeté");
+    assert!(matches!(err, InferError::Config(_)));
+    assert!(err.to_string().contains("rope_scaling"));
+}
+
+#[test]
+fn rejects_linear_rope_scaling_without_usable_factor() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_safetensors(tmp.path(), "model.", "lm_head.", None);
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    let mut config = test_config();
+    config.rope_scaling = Some(crate::RopeScalingConfig {
+        rope_type: Some("linear".to_string()),
+        legacy_type: None,
+        factor: Some(0.0),
+    });
+
+    let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+        .expect_err("invariant: linear sans facteur rejeté");
+    assert!(matches!(err, InferError::Config(_)));
+    assert!(err.to_string().contains("facteur"));
+}
+
+#[test]
+fn ignores_non_linear_rope_scaling_outside_gemma() {
+    // Statu quo Llama 3.2 : type `llama3` non implémenté mais le chargement
+    // générique reste accepté (scaling ignoré, comme avant ce chantier).
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_safetensors(tmp.path(), "model.", "lm_head.", None);
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    let mut config = test_config();
+    config.rope_scaling = Some(crate::RopeScalingConfig {
+        rope_type: Some("llama3".to_string()),
+        legacy_type: None,
+        factor: Some(32.0),
+    });
+
+    load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+        .expect("invariant: llama3 hors Gemma toléré");
+}
+
+#[test]
+fn bake_gemma_norm_offset_targets_norm_weights_only() {
+    let dense = |values: &[f32]| {
+        DecoderTensor::Dense(
+            Tensor::from_vec(vec![values.len()], values.to_vec())
+                .expect("invariant: tensor valide"),
+        )
+    };
+    let data = |tensors: &HashMap<String, DecoderTensor>, key: &str| -> Vec<f32> {
+        match tensors.get(key) {
+            Some(DecoderTensor::Dense(tensor)) => tensor.data().to_vec(),
+            other => panic!("invariant: tenseur dense attendu pour {key}, reçu {other:?}"),
+        }
+    };
+    let mut tensors = HashMap::from([
+        ("norm.weight".to_string(), dense(&[0.5, -0.25])),
+        (
+            "layers.0.input_layernorm.weight".to_string(),
+            dense(&[0.0, 0.0]),
+        ),
+        (
+            "layers.0.self_attn.q_norm.weight".to_string(),
+            dense(&[1.0, 1.0]),
+        ),
+        (
+            "layers.0.pre_feedforward_layernorm.weight".to_string(),
+            dense(&[-1.0, 2.0]),
+        ),
+        ("lm_head.weight".to_string(), dense(&[3.0, 4.0])),
+        (
+            "layers.0.mlp.gate_proj.weight".to_string(),
+            dense(&[5.0, 6.0]),
+        ),
+    ]);
+
+    bake_gemma_norm_offset(&gemma_test_config(), &mut tensors);
+    assert_eq!(data(&tensors, "norm.weight"), vec![1.5, 0.75]);
+    assert_eq!(
+        data(&tensors, "layers.0.input_layernorm.weight"),
+        vec![1.0, 1.0]
+    );
+    assert_eq!(
+        data(&tensors, "layers.0.self_attn.q_norm.weight"),
+        vec![2.0, 2.0]
+    );
+    assert_eq!(
+        data(&tensors, "layers.0.pre_feedforward_layernorm.weight"),
+        vec![0.0, 3.0]
+    );
+    assert_eq!(data(&tensors, "lm_head.weight"), vec![3.0, 4.0]);
+    assert_eq!(
+        data(&tensors, "layers.0.mlp.gate_proj.weight"),
+        vec![5.0, 6.0]
+    );
+
+    // Gemma 4 stocke des échelles RMSNorm directes : pas d'offset historique.
+    let mut gemma4 = HashMap::from([("norm.weight".to_string(), dense(&[1.0, 0.5]))]);
+    let mut gemma4_config = gemma_test_config();
+    gemma4_config.model_type = "gemma4".to_string();
+    bake_gemma_norm_offset(&gemma4_config, &mut gemma4);
+    assert_eq!(data(&gemma4, "norm.weight"), vec![1.0, 0.5]);
+
+    // Hors Gemma : aucun offset, byte-identique.
+    let mut untouched = HashMap::from([("norm.weight".to_string(), dense(&[0.5, -0.25]))]);
+    bake_gemma_norm_offset(&test_config(), &mut untouched);
+    assert_eq!(data(&untouched, "norm.weight"), vec![0.5, -0.25]);
+}
+
+#[test]
 fn verifies_qwen_contract_from_headers() {
     let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
     write_safetensors(tmp.path(), "model.", "lm_head.", None);

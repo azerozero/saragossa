@@ -89,7 +89,12 @@ impl MetalExecutor {
     ) -> Result<MetalLinearAttnResidentDenseWeights> {
         let full = match self.resolve_linear_attn_resident_weights(weights) {
             Ok(weights) => Some(weights),
-            Err(InferError::Dimension(_)) => None,
+            Err(InferError::Dimension(error)) => {
+                if crate::runtime_flags::trace_resident_enabled() {
+                    eprintln!("linear-attn resident full concat: fallback ({error})");
+                }
+                None
+            }
             Err(error) => return Err(error),
         };
         Ok(MetalLinearAttnResidentDenseWeights {
@@ -108,6 +113,18 @@ impl MetalExecutor {
                 "resident_la_in_proj_b",
                 "resident_la_in_proj_a",
             )?,
+            z_beta_gate: match self.resolve_concat_linear_weight_buffers(
+                &[
+                    weights.in_proj_z.weight(),
+                    weights.in_proj_b.weight(),
+                    weights.in_proj_a.weight(),
+                ],
+                "resident_la_in_proj_z_beta_gate",
+            ) {
+                Ok(weights) => Some(weights),
+                Err(InferError::Dimension(_)) => None,
+                Err(error) => return Err(error),
+            },
             out_proj: self
                 .resolve_linear_weight_buffers(weights.out_proj.weight(), "resident_la_out")?,
             conv_weight: self
@@ -126,16 +143,20 @@ impl MetalExecutor {
         first_label: &'static str,
         second_label: &'static str,
     ) -> Result<MetalLinearAttnResidentPairWeights> {
-        match self
+        let resolved = match self
             .resolve_concat_linear_weight_buffers(&[first.weight(), second.weight()], concat_label)
         {
-            Ok(weights) => Ok(MetalLinearAttnResidentPairWeights::Concat(weights)),
+            Ok(weights) => MetalLinearAttnResidentPairWeights::Concat(weights),
             Err(InferError::Dimension(_)) => Ok(MetalLinearAttnResidentPairWeights::Split {
                 first: self.resolve_linear_weight_buffers(first.weight(), first_label)?,
                 second: self.resolve_linear_weight_buffers(second.weight(), second_label)?,
-            }),
-            Err(error) => Err(error),
+            })?,
+            Err(error) => return Err(error),
+        };
+        if crate::runtime_flags::trace_resident_enabled() {
+            trace_linear_attn_pair(concat_label, &resolved);
         }
+        Ok(resolved)
     }
 
     pub(crate) fn resolve_moe_shared_weights(
@@ -151,7 +172,7 @@ impl MetalExecutor {
         ensure_biasless(shared_gate_proj, "shared_gate_proj")?;
         ensure_biasless(shared_up_proj, "shared_up_proj")?;
         ensure_biasless(shared_down_proj, "shared_down_proj")?;
-        Ok(MetalMoeSharedWeights {
+        let weights = MetalMoeSharedWeights {
             router: self.resolve_linear_weight_buffers(router.weight(), "resident_moe_router")?,
             stacked: self.stacked_moe_buffers(experts)?,
             shared_gate: self
@@ -168,7 +189,13 @@ impl MetalExecutor {
                 shared_down_proj.weight(),
                 "resident_shared_down_proj",
             )?,
-        })
+        };
+        if crate::runtime_flags::trace_moe_enabled()
+            || crate::runtime_flags::trace_resident_enabled()
+        {
+            trace_moe_shared_weights(&weights);
+        }
+        Ok(weights)
     }
 
     pub(crate) fn resolve_moe_routed_weights(
@@ -346,6 +373,13 @@ impl MetalExecutor {
         self.scratch_buffer(len, MetalBufferElement::U32, label)
     }
 
+    pub(super) fn new_bf16_buffer(&self, len: usize, label: &'static str) -> Result<metal::Buffer> {
+        if len == 0 {
+            return Err(InferError::Metal(format!("buffer {label} vide")));
+        }
+        self.scratch_buffer(len, MetalBufferElement::Bf16, label)
+    }
+
     pub(super) fn uncached_f32_buffer(
         &self,
         len: usize,
@@ -357,6 +391,22 @@ impl MetalExecutor {
         Ok(self
             .device
             .new_buffer(byte_len::<f32>(len)?, MTLResourceOptions::StorageModeShared))
+    }
+
+    /// Buffer u32 frais NON mémoïsé (StorageModeShared, lisible CPU) — pour les
+    /// readbacks diagnostiques où la mémoïsation par label aliaserait les
+    /// occurrences (indices d'experts par couche, stats light-batch).
+    pub(super) fn uncached_u32_buffer(
+        &self,
+        len: usize,
+        label: &'static str,
+    ) -> Result<metal::Buffer> {
+        if len == 0 {
+            return Err(InferError::Metal(format!("buffer {label} vide")));
+        }
+        Ok(self
+            .device
+            .new_buffer(byte_len::<u32>(len)?, MTLResourceOptions::StorageModeShared))
     }
 
     pub(super) fn private_f32_buffer(
@@ -391,6 +441,22 @@ impl MetalExecutor {
         )
     }
 
+    pub(super) fn private_bf16_buffer(
+        &self,
+        len: usize,
+        label: &'static str,
+    ) -> Result<metal::Buffer> {
+        if len == 0 {
+            return Err(InferError::Metal(format!("buffer {label} vide")));
+        }
+        self.scratch_buffer_with_options(
+            len,
+            MetalBufferElement::Bf16,
+            label,
+            scratch_resource_options(),
+        )
+    }
+
     pub(super) fn scratch_buffer(
         &self,
         len: usize,
@@ -411,6 +477,7 @@ impl MetalExecutor {
             label,
             len,
             element,
+            namespace: current_scratch_namespace(),
         };
         let mut buffers = self
             .scratch_buffers
@@ -439,6 +506,85 @@ impl MetalExecutor {
     /// Renvoie le device Metal (pour bâtir l'arène résidente du decode full-attn).
     pub(crate) fn device(&self) -> &Device {
         &self.device
+    }
+}
+
+fn trace_linear_attn_pair(label: &str, pair: &MetalLinearAttnResidentPairWeights) {
+    let message = match pair {
+        MetalLinearAttnResidentPairWeights::Concat(weight) => {
+            format!(
+                "linear-attn resident pair {label}: concat {}",
+                describe_linear_weight_buffers(weight)
+            )
+        }
+        MetalLinearAttnResidentPairWeights::Split { first, second } => {
+            format!(
+                "linear-attn resident pair {label}: split first={} second={}",
+                describe_linear_weight_buffers(first),
+                describe_linear_weight_buffers(second)
+            )
+        }
+    };
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut seen) = seen.lock() {
+        if !seen.insert(message.clone()) {
+            return;
+        }
+    }
+    eprintln!("{message}");
+}
+
+fn trace_moe_shared_weights(weights: &MetalMoeSharedWeights) {
+    let message = format!(
+        "moe shared resident weights: router={} routed_gate={} routed_up={} routed_down={} \
+         shared_gate={} shared_gate_proj={} shared_up_proj={} shared_down_proj={}",
+        describe_linear_weight_buffers(&weights.router),
+        describe_stacked_affine_buffers(&weights.stacked.gate),
+        describe_stacked_affine_buffers(&weights.stacked.up),
+        describe_stacked_affine_buffers(&weights.stacked.down),
+        describe_linear_weight_buffers(&weights.shared_gate),
+        describe_linear_weight_buffers(&weights.shared_gate_proj),
+        describe_linear_weight_buffers(&weights.shared_up_proj),
+        describe_linear_weight_buffers(&weights.shared_down_proj),
+    );
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut seen) = seen.lock() {
+        if !seen.insert(message.clone()) {
+            return;
+        }
+    }
+    eprintln!("{message}");
+}
+
+fn describe_stacked_affine_buffers(weight: &StackedAffineBuffers) -> String {
+    format!(
+        "affine bits={} gs={} groups={} experts={} out={} in={}",
+        weight.bits,
+        weight.group_size,
+        weight.groups,
+        weight.experts,
+        weight.out_dim,
+        weight.in_dim
+    )
+}
+
+fn describe_linear_weight_buffers(weight: &MetalLinearWeightBuffers) -> String {
+    match weight {
+        MetalLinearWeightBuffers::Dense {
+            out_dim, in_dim, ..
+        } => format!("dense out={out_dim} in={in_dim}"),
+        MetalLinearWeightBuffers::AffineQuantized {
+            out_dim,
+            in_dim,
+            group_size,
+            bits,
+            groups,
+            ..
+        } => {
+            format!("affine bits={bits} gs={group_size} groups={groups} out={out_dim} in={in_dim}")
+        }
     }
 }
 

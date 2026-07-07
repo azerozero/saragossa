@@ -31,9 +31,9 @@ pub(in crate::decoder) fn optional_mlp_from(
     let down_proj = linear_from(tensors, &format!("{layer_prefix}.mlp.down_proj"))?;
     Ok((
         Some(post_attention_norm),
-        Some(FeedForward::Dense(Box::new(GatedMlp::new(
-            gate_proj, up_proj, down_proj,
-        )))),
+        Some(FeedForward::Dense(Box::new(
+            GatedMlp::new(gate_proj, up_proj, down_proj).with_activation(config.activation),
+        ))),
     ))
 }
 
@@ -96,6 +96,56 @@ pub(in crate::decoder) fn optional_moe_from(
     ))
 }
 
+pub(in crate::decoder) fn optional_gemma4_parallel_moe_from(
+    config: &CausalDecoderConfig,
+    tensors: &mut HashMap<String, DecoderTensor>,
+    layer_prefix: &str,
+) -> Result<Option<FeedForward>> {
+    let keys = [
+        format!("{layer_prefix}.router.proj.weight"),
+        format!("{layer_prefix}.experts.switch_glu.gate_proj.weight"),
+        format!("{layer_prefix}.experts.switch_glu.up_proj.weight"),
+        format!("{layer_prefix}.experts.switch_glu.down_proj.weight"),
+    ];
+    if !keys.iter().any(|key| tensors.contains_key(key)) {
+        return Ok(None);
+    }
+
+    let expert_count = config.num_experts.ok_or_else(|| {
+        InferError::Config("poids MoE Gemma4 présents sans num_experts".to_string())
+    })?;
+    let router = linear_from(tensors, &format!("{layer_prefix}.router.proj"))?;
+    let gate_weights = take_expert_linear_weights(
+        tensors,
+        &format!("{layer_prefix}.experts.switch_glu.gate_proj.weight"),
+        expert_count,
+    )?;
+    let up_weights = take_expert_linear_weights(
+        tensors,
+        &format!("{layer_prefix}.experts.switch_glu.up_proj.weight"),
+        expert_count,
+    )?;
+    let down_weights = take_expert_linear_weights(
+        tensors,
+        &format!("{layer_prefix}.experts.switch_glu.down_proj.weight"),
+        expert_count,
+    )?;
+    let experts = split_experts_with_activation(
+        gate_weights,
+        up_weights,
+        down_weights,
+        expert_count,
+        config.activation,
+    )?;
+    let router_scale = take_dense(tensors, &format!("{layer_prefix}.router.scale"))?;
+    let router_scale = router_scale.map(|value| value * (router_scale.len() as f32).powf(-0.5));
+    let per_expert_scale = take_dense(tensors, &format!("{layer_prefix}.router.per_expert_scale"))?;
+    let moe = crate::MoeMlp::new(router, experts, None, None, config.num_experts_per_tok)?
+        .with_router_norm(router_scale, config.rms_eps)
+        .with_per_expert_scale(per_expert_scale);
+    Ok(Some(FeedForward::Moe(Box::new(moe))))
+}
+
 fn optional_shared_expert(
     tensors: &mut HashMap<String, DecoderTensor>,
     layer_prefix: &str,
@@ -120,6 +170,22 @@ pub(in crate::decoder) fn split_experts(
     up_weights: Vec<LinearWeight>,
     down_weights: Vec<LinearWeight>,
     expert_count: usize,
+) -> Result<Vec<GatedMlp>> {
+    split_experts_with_activation(
+        gate_weights,
+        up_weights,
+        down_weights,
+        expert_count,
+        crate::Activation::Silu,
+    )
+}
+
+pub(in crate::decoder) fn split_experts_with_activation(
+    gate_weights: Vec<LinearWeight>,
+    up_weights: Vec<LinearWeight>,
+    down_weights: Vec<LinearWeight>,
+    expert_count: usize,
+    activation: crate::Activation,
 ) -> Result<Vec<GatedMlp>> {
     if gate_weights.len() != expert_count
         || up_weights.len() != expert_count
@@ -148,7 +214,7 @@ pub(in crate::decoder) fn split_experts(
         let gate = Linear::from_weight(gate_weight, None)?;
         let up = Linear::from_weight(up_weight, None)?;
         let down = Linear::from_weight(down_weight, None)?;
-        experts.push(GatedMlp::new(gate, up, down));
+        experts.push(GatedMlp::new(gate, up, down).with_activation(activation));
     }
     Ok(experts)
 }

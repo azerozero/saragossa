@@ -33,13 +33,30 @@ impl RustTokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self
-            .inner
-            .encode(text, false)
-            .map_err(|e| InferError::Tokenizer {
-                path: self.path.clone(),
-                message: e.to_string(),
-            })?;
+        self.encode_inner(text, false)
+    }
+
+    /// Encode un texte en activant les tokens spéciaux du tokenizer.
+    ///
+    /// Pour la complétion brute des modèles type Llama qui exigent leur BOS
+    /// (`<|begin_of_text|>`) via le post-processor. Le chemin templaté (ChatML
+    /// Qwen) garde [`Self::encode`] : ses tokens spéciaux sont déjà littéraux.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le tokenizer rejette le texte.
+    pub fn encode_with_special_tokens(&self, text: &str) -> Result<Vec<u32>> {
+        self.encode_inner(text, true)
+    }
+
+    fn encode_inner(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        let encoding =
+            self.inner
+                .encode(text, add_special_tokens)
+                .map_err(|e| InferError::Tokenizer {
+                    path: self.path.clone(),
+                    message: e.to_string(),
+                })?;
         Ok(encoding.get_ids().to_vec())
     }
 

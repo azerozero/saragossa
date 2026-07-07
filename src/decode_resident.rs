@@ -1,7 +1,7 @@
 //! État GPU résident pour le decode « 1 token = 1 command buffer ».
 //!
-//! Fondation de la tranche 1b/1c (cf. `/tmp/rust_infer_plan.md`). Le decode
-//! actuel fait un `commit`+`wait`+readback par opération (~80-120 syncs/token,
+//! Fondation de la tranche 1b/1c du decode résident. Le decode actuel fait un
+//! `commit`+`wait`+readback par opération (~80-120 syncs/token,
 //! `wait_us` ≈ 91 % du temps/token mesuré) : le CPU et le GPU ne se recouvrent
 //! jamais. Le chemin résident vise un seul command buffer par token, les
 //! tenseurs intermédiaires restant **GPU-résidents**, avec une unique lecture
@@ -40,8 +40,7 @@
 use crate::metal_backend::{
     commit_and_wait, read_f32_buffer, LinearAttentionMetalState, LinearAttentionStepSpec,
     LinearAttnResidentDims, MetalExecutor, MetalLinearAttnResidentDenseWeights,
-    MetalLinearAttnResidentWeights, MetalLinearWeightBuffers, MetalMoeRoutedWeights,
-    MetalMoeSharedWeights,
+    MetalLinearWeightBuffers, MetalMoeRoutedWeights, MetalMoeSharedWeights,
 };
 use crate::{InferError, Result};
 use metal::{
@@ -54,6 +53,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod arena;
 mod attention;
+mod duo;
 mod kernels;
 mod layers;
 mod types;
@@ -62,14 +62,12 @@ mod utils;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use self::arena::{GpuElement, GpuTensor, ScratchLease};
+pub(crate) use self::arena::{GpuElement, GpuTensor, ScratchLease, ScratchPool};
 pub(crate) use self::attention::FullAttentionMetalState;
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
     GpuSectionTimer, LinearAttnDenseLayerWeights, LinearAttnLayerWeights,
 };
-
-use self::arena::ScratchPool;
 
 /// État résident d'UN decode (réserves C/D).
 ///
@@ -87,10 +85,23 @@ pub(crate) struct DecodeResidentState {
     attention_decode_naive: ComputePipelineState,
     attention_decode_flash: ComputePipelineState,
     attention_decode_flash_d256: ComputePipelineState,
+    attention_decode_2pass_1: ComputePipelineState,
+    attention_decode_2pass_1_d128: ComputePipelineState,
+    attention_decode_naive_bf16: ComputePipelineState,
+    attention_decode_flash_bf16: ComputePipelineState,
+    attention_decode_flash_d256_bf16: ComputePipelineState,
+    attention_decode_2pass_1_bf16: ComputePipelineState,
+    attention_decode_2pass_1_d128_bf16: ComputePipelineState,
+    attention_decode_2pass_2: ComputePipelineState,
+    attention_decode_2pass_2_d128: ComputePipelineState,
     split_q_gate_kernel: ComputePipelineState,
     attn_gate_kernel: ComputePipelineState,
     rope_decode_kernel: ComputePipelineState,
     copy_at_kernel: ComputePipelineState,
+    copy_at_f32_to_bf16_kernel: ComputePipelineState,
     /// Instrumentation per-section (tranche 3), active si `RETI_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,
+    /// Slot de flux (light-batch) : namespace du scratch label-keyed de
+    /// l'exécuteur partagé. `0` = mono-flux historique.
+    scratch_namespace: u64,
 }

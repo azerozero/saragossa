@@ -2,6 +2,38 @@
 
 use super::*;
 
+/// Active le chemin GEMM bf16 de l'encodeur Whisper (matmul2d Neural Accelerators)
+/// par défaut si disponible. `RETI_STT_F32=1` force l'ancien chemin f32 ;
+/// `RETI_STT_BF16=0` garde aussi un kill-switch compatible avec les anciens benches.
+/// bf16-input / accumulation f32.
+pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        if std::env::var_os("RETI_STT_F32").is_some() {
+            return false;
+        }
+        !matches!(
+            std::env::var("RETI_STT_BF16").as_deref(),
+            Ok("0" | "false" | "off" | "no")
+        )
+    })
+}
+
+/// Active le QMV decode Whisper avec poids bf16 row-major pour les projections
+/// M=1 où le microbench montre un gain. `RETI_STT_F32=1` force le chemin f32.
+pub(crate) fn whisper_decode_bf16_qmv_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        if std::env::var_os("RETI_STT_F32").is_some() {
+            return false;
+        }
+        !matches!(
+            std::env::var("RETI_STT_DECODE_BF16_QMV").as_deref(),
+            Ok("0" | "false" | "off" | "no")
+        )
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "wrappers d'encodage Metal: buffers, dimensions et offsets restent explicites"
@@ -64,6 +96,190 @@ impl MetalExecutor {
 
         let output = read_f32_buffer(&output_buffer, output_len)?;
         Tensor::from_vec(vec![batch, out_dim], output)
+    }
+
+    /// Encode le matmul dense **qmv** `out = lhs · rhs^T` dans un encoder PARTAGÉ
+    /// (buffers résidents, zéro readback) — cœur de [`Self::matmul_rhs_t_dense`]
+    /// réutilisé par le decode résident. MÊME kernel `dense_matmul_rhs_t_f32` ⇒
+    /// byte-identique au decode per-op (qui passe par `matmul_rhs_t_dense` en
+    /// batch=1). `out` peut être lié à un offset (append KV in-place).
+    pub(crate) fn encode_dense_qmv(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        rhs: &BufferRef,
+        out: &BufferRef,
+        out_offset_bytes: u64,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(batch, "qmv batch")?,
+            checked_u32(out_dim, "qmv out_dim")?,
+            checked_u32(in_dim, "qmv in_dim")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.dense_matmul_rhs_t_f32);
+        encoder.set_buffer(0, Some(lhs), 0);
+        encoder.set_buffer(1, Some(rhs), 0);
+        encoder.set_buffer(2, Some(out), out_offset_bytes);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<[u32; 3]>() as u64,
+            dims.as_ptr().cast::<std::ffi::c_void>(),
+        );
+        let threads_per_group = self.qmv_thread_group_size(&self.dense_matmul_rhs_t_f32);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(out_dim, "qmv out_dim")?,
+                checked_nsuint(batch, "qmv batch")?,
+                1,
+            ),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// QMV dense batch=1 avec poids bf16 row-major `[out_dim,in_dim]`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde ou si Metal échoue.
+    pub(crate) fn encode_dense_qmv_rhs_bf16(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        rhs_bf16: &BufferRef,
+        out: &BufferRef,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(batch, "bf16 qmv batch")?,
+            checked_u32(out_dim, "bf16 qmv out_dim")?,
+            checked_u32(in_dim, "bf16 qmv in_dim")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.dense_qmv_rhs_bf16_f32);
+        encoder.set_buffer(0, Some(lhs), 0);
+        encoder.set_buffer(1, Some(rhs_bf16), 0);
+        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<[u32; 3]>() as u64,
+            dims.as_ptr().cast::<std::ffi::c_void>(),
+        );
+        let threads_per_group = self.qmv_thread_group_size(&self.dense_qmv_rhs_bf16_f32);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(out_dim, "bf16 qmv out_dim")?,
+                checked_nsuint(batch, "bf16 qmv batch")?,
+                1,
+            ),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Variante GEMM tuilée de [`Self::matmul_rhs_t_dense`] pour `batch ≫ 1`
+    /// (prefill encodeur Whisper). Le kernel qmv re-lit la ligne de poids par
+    /// ligne de batch (memory-bound) ; ici les tuiles 16×16 sont réutilisées en
+    /// mémoire threadgroup. Accumulation in-order (≈ `dot` CPU), pas l'ordre
+    /// `simd_sum` du qmv → résultats f32 voisins mais non bit-à-bit identiques.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les dimensions sont incompatibles ou si Metal échoue.
+    pub(crate) fn matmul_rhs_t_dense_tiled(
+        &self,
+        input: &Tensor,
+        rhs_out_in: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch, in_dim) = input.as_matrix()?;
+        let (out_dim, rhs_in_dim) = rhs_out_in.as_matrix()?;
+        if batch == 0 || in_dim == 0 || out_dim == 0 {
+            return Err(InferError::Dimension(format!(
+                "gemm Metal dimensions nulles x=[{batch},{in_dim}] rhs=[{out_dim},{rhs_in_dim}]"
+            )));
+        }
+        if in_dim != rhs_in_dim {
+            return Err(InferError::Dimension(format!(
+                "gemm Metal x=[{batch},{in_dim}] rhs_t_source=[{out_dim},{rhs_in_dim}]"
+            )));
+        }
+
+        let lhs_buffer = self.upload_f32_buffer(input.data(), "gemm_input")?;
+        let rhs_buffer = self.cached_buffer_from_f32(rhs_out_in.data(), "gemm_rhs")?;
+        let output_len = checked_len(batch, out_dim, "sortie gemm Metal")?;
+        let output_buffer = self.device.new_buffer(
+            byte_len::<f32>(output_len)?,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        self.encode_dense_gemm(
+            encoder,
+            &lhs_buffer,
+            &rhs_buffer,
+            &output_buffer,
+            batch,
+            out_dim,
+            in_dim,
+        )?;
+        encoder_guard.end();
+        commit_and_wait(command_buffer)?;
+
+        let output = read_f32_buffer(&output_buffer, output_len)?;
+        Tensor::from_vec(vec![batch, out_dim], output)
+    }
+
+    /// Encode le GEMM dense tuilé `out = lhs · rhs^T` dans un encoder PARTAGÉ
+    /// (buffers résidents, zéro readback) — cœur de [`Self::matmul_rhs_t_dense_tiled`]
+    /// réutilisé par l'encodeur résident. MÊME kernel `dense_gemm_rhs_t_f32` ⇒
+    /// résultats byte-identiques au chemin standalone.
+    pub(crate) fn encode_dense_gemm(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        rhs: &BufferRef,
+        out: &BufferRef,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(batch, "batch")?,
+            checked_u32(out_dim, "out_dim")?,
+            checked_u32(in_dim, "in_dim")?,
+        ];
+        // GEMM dense f32 byte-identique. Le chemin bf16 (encodeur) passe par le
+        // matmul2d NA résident (`encode_na_gemm`), pas par ce dispatch.
+        encoder.set_compute_pipeline_state(&self.dense_gemm_rhs_t_f32);
+        encoder.set_buffer(0, Some(lhs), 0);
+        encoder.set_buffer(1, Some(rhs), 0);
+        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<[u32; 3]>() as u64,
+            dims.as_ptr().cast::<std::ffi::c_void>(),
+        );
+        const TILE: NSUInteger = 64; // tuile de sortie 64×64 (micro-bloc 4×4 / thread)
+        const THREADS: NSUInteger = 16; // 16×16 = 256 threads
+        let groups = MTLSize::new(
+            (checked_nsuint(out_dim, "out_dim")? + TILE - 1) / TILE,
+            (checked_nsuint(batch, "batch")? + TILE - 1) / TILE,
+            1,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(groups, MTLSize::new(THREADS, THREADS, 1));
+        post_dispatch_barrier(encoder);
+        Ok(())
     }
 
     /// Multiplie `input` par un poids affine compact MLX `[out,in]`.
@@ -140,7 +356,9 @@ impl MetalExecutor {
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
-        if can_use_fast_affine_qmm2(batch, in_dim, weight) {
+        if can_use_fast_affine_qmm2(batch, in_dim, weight)
+            || can_use_fast_affine_qmm2_u8(batch, in_dim, weight)
+        {
             let fast_dims = [
                 checked_u32(*out_dim, "qmm2 out_dim")?,
                 checked_u32(in_dim, "qmm2 in_dim")?,
@@ -149,7 +367,14 @@ impl MetalExecutor {
             ];
             let fast_dims_buffer = self.buffer_from_u32(&fast_dims, "qmm2_dims")?;
             owned_buffers.push(fast_dims_buffer.clone());
-            encoder.set_compute_pipeline_state(&self.affine_qmm2_fast_aligned_u4_gs64_f32);
+            let pipeline = if weight.bits() == FAST_QMV_BITS {
+                &self.affine_qmm2_fast_aligned_u4_gs64_f32
+            } else if weight.group_size() == FAST_QMV_GROUP_SIZE {
+                &self.affine_qmm2_fast_aligned_u8_gs64_f32
+            } else {
+                &self.affine_qmm2_fast_aligned_u8_gs128_f32
+            };
+            encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&lhs_buffer), 0);
             encoder.set_buffer(1, Some(&packed_buffer), 0);
             encoder.set_buffer(2, Some(&scales_buffer), 0);
@@ -192,6 +417,67 @@ impl MetalExecutor {
                 MTLSize::new(
                     checked_nsuint(batch, "batch")?,
                     checked_nsuint(out_dim.div_ceil(8), "fast out groups")?,
+                    1,
+                ),
+                MTLSize::new(64, 1, 1),
+            );
+            post_dispatch_barrier(encoder);
+        } else if can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
+            let fast_dims = [
+                checked_u32(*out_dim, "fast u6 out_dim")?,
+                checked_u32(in_dim, "fast u6 in_dim")?,
+                checked_u32(*packed_cols, "fast u6 packed_cols")?,
+                checked_u32(groups, "fast u6 groups")?,
+            ];
+            let fast_dims_buffer = self.buffer_from_u32(&fast_dims, "fast_u6_dims")?;
+            owned_buffers.push(fast_dims_buffer.clone());
+            let pipeline = if *out_dim % 2 == 0 {
+                &self.affine_qmv_fast_aligned_u6_gs64_f32
+            } else {
+                &self.affine_qmv_fast_u6_gs64_f32
+            };
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&lhs_buffer), 0);
+            encoder.set_buffer(1, Some(&packed_buffer), 0);
+            encoder.set_buffer(2, Some(&scales_buffer), 0);
+            encoder.set_buffer(3, Some(&biases_buffer), 0);
+            encoder.set_buffer(4, Some(&output_buffer), 0);
+            encoder.set_buffer(5, Some(&fast_dims_buffer), 0);
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    checked_nsuint(batch, "batch")?,
+                    checked_nsuint(out_dim.div_ceil(2), "fast u6 out groups")?,
+                    1,
+                ),
+                MTLSize::new(64, 1, 1),
+            );
+            post_dispatch_barrier(encoder);
+        } else if can_use_fast_affine_qmv_u8(batch, in_dim, weight) {
+            let fast_dims = [
+                checked_u32(*out_dim, "fast u8 out_dim")?,
+                checked_u32(in_dim, "fast u8 in_dim")?,
+                checked_u32(*packed_cols, "fast u8 packed_cols")?,
+                checked_u32(groups, "fast u8 groups")?,
+            ];
+            let fast_dims_buffer = self.buffer_from_u32(&fast_dims, "fast_u8_dims")?;
+            owned_buffers.push(fast_dims_buffer.clone());
+            let pipeline = match weight.group_size() == FAST_QMV_GROUP_SIZE {
+                true => &self.affine_qmv_fast_aligned_u8_gs64_f32,
+                false => &self.affine_qmv_fast_aligned_u8_gs128_f32,
+            };
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&lhs_buffer), 0);
+            encoder.set_buffer(1, Some(&packed_buffer), 0);
+            encoder.set_buffer(2, Some(&scales_buffer), 0);
+            encoder.set_buffer(3, Some(&biases_buffer), 0);
+            encoder.set_buffer(4, Some(&output_buffer), 0);
+            encoder.set_buffer(5, Some(&fast_dims_buffer), 0);
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    checked_nsuint(batch, "batch")?,
+                    checked_nsuint(out_dim.div_ceil(8), "fast u8 out groups")?,
                     1,
                 ),
                 MTLSize::new(64, 1, 1),
@@ -403,7 +689,7 @@ impl MetalExecutor {
     pub(crate) fn encode_matmul_weight(
         &self,
         encoder: &ComputeCommandEncoderRef,
-        _owned_buffers: &mut Vec<metal::Buffer>,
+        owned_buffers: &mut Vec<metal::Buffer>,
         lhs_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -412,6 +698,7 @@ impl MetalExecutor {
     ) -> Result<usize> {
         self.encode_matmul_weight_inner(
             encoder,
+            owned_buffers,
             lhs_buffer,
             batch,
             in_dim,
@@ -437,6 +724,7 @@ impl MetalExecutor {
                 let (out_dim, in_dim) = weight.as_matrix()?;
                 Ok(MetalLinearWeightBuffers::Dense {
                     rhs: self.cached_buffer_from_f32(weight.data(), label)?,
+                    rhs_bf16: None,
                     out_dim,
                     in_dim,
                 })
@@ -511,6 +799,7 @@ impl MetalExecutor {
                 }
                 Ok(MetalLinearWeightBuffers::Dense {
                     rhs: self.buffer_from_slice(&data, label)?,
+                    rhs_bf16: None,
                     out_dim,
                     in_dim,
                 })
@@ -561,7 +850,11 @@ impl MetalExecutor {
                         || weight.bits() != bits
                     {
                         return Err(InferError::Dimension(format!(
-                            "{label}: poids concat incompatibles"
+                            "{label}: poids concat incompatibles cols={cols}/{in_dim} packed_cols={cols_packed}/{packed_cols} group_size={}/{} bits={}/{}",
+                            weight.group_size(),
+                            group_size,
+                            weight.bits(),
+                            bits
                         )));
                     }
                     if packed_rows != rows {

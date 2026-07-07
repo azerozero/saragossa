@@ -2,21 +2,64 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct RopeParams {
+    /// Base angulaire de la couche (locale ou globale Gemma 3, unique ailleurs).
+    pub(super) theta: f32,
+    /// Dimension utilisée au dénominateur des fréquences RoPE.
+    pub(super) frequency_dim: usize,
+    /// Échelle multiplicative des positions (`1/factor` du rope_scaling linear
+    /// des couches globales Gemma 3 ≥4B) ; `1.0` = positions brutes. `pos × 1.0`
+    /// est bit-identique à `pos` → byte-identité des modèles non scalés.
+    pub(super) position_scale: f32,
+}
+
+/// Résout la base et l'échelle RoPE effectives d'une couche full-attention.
+///
+/// `None` si aucune base n'est définie (modèle sans RoPE sur ce chemin).
+pub(super) fn rope_params(
+    config: &CausalDecoderConfig,
+    attention: &FullAttention,
+) -> Option<RopeParams> {
+    let theta = attention.rope_theta.or(config.rope_theta)?;
+    let frequency_dim = attention
+        .rope_frequency_dim
+        .or(attention.head_dim)
+        .or(config.head_dim)
+        .unwrap_or(1);
+    Some(RopeParams {
+        theta,
+        frequency_dim,
+        position_scale: attention.rope_position_scale.unwrap_or(1.0),
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AttentionLayout {
     pub(super) num_attention_heads: usize,
     pub(super) num_key_value_heads: usize,
     pub(super) head_dim: usize,
     pub(super) rope_dims: usize,
+    // NOTE: Base de l'échelle des scores (`scores · 1/√attn_scalar`) ; vaut
+    // `head_dim` partout sauf Gemma (`query_pre_attn_scalar`, ex. 168 sur le 27B).
+    pub(super) attn_scalar: f32,
+    // NOTE: Fenêtre des couches locales Gemma 3 ; `None` = attention pleine.
+    pub(super) sliding_window: Option<usize>,
 }
 
 pub(super) fn full_attention_from_tensors(
+    config: &CausalDecoderConfig,
     tensors: &mut HashMap<String, DecoderTensor>,
     prefix: &str,
+    layer_index: usize,
 ) -> Result<AttentionBlock> {
     let q_proj = linear_from(tensors, &format!("{prefix}.self_attn.q_proj"))?;
     let k_proj = linear_from(tensors, &format!("{prefix}.self_attn.k_proj"))?;
-    let v_proj = linear_from(tensors, &format!("{prefix}.self_attn.v_proj"))?;
+    let v_proj = if config.attention_k_eq_v && config.is_gemma4_full_layer(layer_index) {
+        None
+    } else {
+        Some(linear_from(tensors, &format!("{prefix}.self_attn.v_proj"))?)
+    };
     let o_proj = linear_from(tensors, &format!("{prefix}.self_attn.o_proj"))?;
     let q_norm = take_optional_dense(tensors, &format!("{prefix}.self_attn.q_norm.weight"))?;
     let k_norm = take_optional_dense(tensors, &format!("{prefix}.self_attn.k_norm.weight"))?;
@@ -25,6 +68,10 @@ pub(super) fn full_attention_from_tensors(
             "q_norm/k_norm partiels pour {prefix}.self_attn"
         )));
     }
+    let inferred_head_dim = infer_attention_head_dim(config, &q_proj)?;
+    let head_dim = config
+        .layer_head_dim(layer_index)
+        .unwrap_or(inferred_head_dim);
     Ok(AttentionBlock::Full(Box::new(FullAttention {
         q_proj,
         k_proj,
@@ -32,7 +79,37 @@ pub(super) fn full_attention_from_tensors(
         o_proj,
         q_norm,
         k_norm,
+        num_key_value_heads: Some(config.layer_num_key_value_heads(layer_index)),
+        head_dim: Some(head_dim),
+        rope_dims: Some(config.layer_rope_dims(layer_index, head_dim)),
+        rope_frequency_dim: Some(config.layer_rope_frequency_dim(layer_index, head_dim)),
+        value_norm: config.attention_value_norm,
+        rope_theta: None,
+        rope_position_scale: None,
+        sliding_window: None,
     })))
+}
+
+fn infer_attention_head_dim(config: &CausalDecoderConfig, q_proj: &Linear) -> Result<usize> {
+    if config.num_attention_heads == 0 {
+        return Err(InferError::Dimension(
+            "num_attention_heads nul pour inférer head_dim".to_string(),
+        ));
+    }
+    let [out_dim, _] = q_proj.weight().shape() else {
+        return Err(InferError::Dimension(format!(
+            "q_proj attendu rang 2, reçu {:?}",
+            q_proj.weight().shape()
+        )));
+    };
+    let divisor = config.num_attention_heads * if config.attn_output_gate { 2 } else { 1 };
+    if divisor == 0 || out_dim % divisor != 0 {
+        return Err(InferError::Dimension(format!(
+            "q_proj out_dim {out_dim} incompatible avec q_heads={} gated={}",
+            config.num_attention_heads, config.attn_output_gate
+        )));
+    }
+    Ok(out_dim / divisor)
 }
 
 pub(super) fn linear_attention_from_tensors(
@@ -61,13 +138,23 @@ pub(super) fn full_attention_forward(
     attention: &FullAttention,
     runtime: ForwardRuntime<'_>,
 ) -> Result<Tensor> {
-    let (q_projection, k_projection, v) = project_qkv(normed, attention, runtime)?;
+    let (q_projection, k_projection, mut v) = project_qkv(normed, attention, runtime)?;
     let (mut q, gate) = split_attention_gate(config, &q_projection)?;
     let mut k = k_projection;
-    let layout = attention_layout(config, &q, &k, &v)?;
-    if let (Some(theta), Some(q_norm), Some(k_norm)) =
-        (config.rope_theta, &attention.q_norm, &attention.k_norm)
-    {
+    let layout = attention_layout(config, attention, &q, &k, &v)?;
+    if attention.value_norm {
+        v = rms_norm_heads_no_scale(
+            &v,
+            layout.num_key_value_heads,
+            layout.head_dim,
+            config.rms_eps,
+        )?;
+    }
+    if let (Some(rope), Some(q_norm), Some(k_norm)) = (
+        rope_params(config, attention),
+        &attention.q_norm,
+        &attention.k_norm,
+    ) {
         q = rms_norm_rope_heads_at(
             &q,
             layout.num_attention_heads,
@@ -75,8 +162,9 @@ pub(super) fn full_attention_forward(
             layout.rope_dims,
             q_norm,
             config.rms_eps,
-            theta,
+            rope,
             0,
+            config.rope_style,
         )?;
         k = rms_norm_rope_heads_at(
             &k,
@@ -85,8 +173,9 @@ pub(super) fn full_attention_forward(
             layout.rope_dims,
             k_norm,
             config.rms_eps,
-            theta,
+            rope,
             0,
+            config.rope_style,
         )?;
     } else if let (Some(q_norm), Some(k_norm)) = (&attention.q_norm, &attention.k_norm) {
         q = rms_norm_heads(
@@ -104,8 +193,7 @@ pub(super) fn full_attention_forward(
             config.rms_eps,
         )?;
     }
-    if let Some(theta) = config
-        .rope_theta
+    if let Some(rope) = rope_params(config, attention)
         .filter(|_| attention.q_norm.is_none() || attention.k_norm.is_none())
     {
         q = apply_rope_heads(
@@ -113,14 +201,16 @@ pub(super) fn full_attention_forward(
             layout.num_attention_heads,
             layout.head_dim,
             layout.rope_dims,
-            theta,
+            rope,
+            config.rope_style,
         )?;
         k = apply_rope_heads(
             &k,
             layout.num_key_value_heads,
             layout.head_dim,
             layout.rope_dims,
-            theta,
+            rope,
+            config.rope_style,
         )?;
     }
     let mut context = causal_attention(&q, &k, &v, &layout)?;
@@ -138,13 +228,23 @@ pub(super) fn full_attention_context_cached(
     attention: &FullAttention,
     runtime: ForwardRuntime<'_>,
 ) -> Result<Tensor> {
-    let (q_projection, k_projection, v) = project_qkv(normed, attention, runtime)?;
+    let (q_projection, k_projection, mut v) = project_qkv(normed, attention, runtime)?;
     let (mut q, gate) = split_attention_gate(config, &q_projection)?;
     let mut k = k_projection;
-    let layout = attention_layout(config, &q, &k, &v)?;
-    if let (Some(theta), Some(q_norm), Some(k_norm)) =
-        (config.rope_theta, &attention.q_norm, &attention.k_norm)
-    {
+    let layout = attention_layout(config, attention, &q, &k, &v)?;
+    if attention.value_norm {
+        v = rms_norm_heads_no_scale(
+            &v,
+            layout.num_key_value_heads,
+            layout.head_dim,
+            config.rms_eps,
+        )?;
+    }
+    if let (Some(rope), Some(q_norm), Some(k_norm)) = (
+        rope_params(config, attention),
+        &attention.q_norm,
+        &attention.k_norm,
+    ) {
         q = rms_norm_rope_heads_at(
             &q,
             layout.num_attention_heads,
@@ -152,8 +252,9 @@ pub(super) fn full_attention_context_cached(
             layout.rope_dims,
             q_norm,
             config.rms_eps,
-            theta,
+            rope,
             position,
+            config.rope_style,
         )?;
         k = rms_norm_rope_heads_at(
             &k,
@@ -162,8 +263,9 @@ pub(super) fn full_attention_context_cached(
             layout.rope_dims,
             k_norm,
             config.rms_eps,
-            theta,
+            rope,
             position,
+            config.rope_style,
         )?;
     } else if let (Some(q_norm), Some(k_norm)) = (&attention.q_norm, &attention.k_norm) {
         q = rms_norm_heads(
@@ -181,8 +283,7 @@ pub(super) fn full_attention_context_cached(
             config.rms_eps,
         )?;
     }
-    if let Some(theta) = config
-        .rope_theta
+    if let Some(rope) = rope_params(config, attention)
         .filter(|_| attention.q_norm.is_none() || attention.k_norm.is_none())
     {
         q = apply_rope_heads_at(
@@ -190,16 +291,18 @@ pub(super) fn full_attention_context_cached(
             layout.num_attention_heads,
             layout.head_dim,
             layout.rope_dims,
-            theta,
+            rope,
             position,
+            config.rope_style,
         )?;
         k = apply_rope_heads_at(
             &k,
             layout.num_key_value_heads,
             layout.head_dim,
             layout.rope_dims,
-            theta,
+            rope,
             position,
+            config.rope_style,
         )?;
     }
     // Chemin résident GPU (flag, KV résident présent) OU chemin CPU (oracle).
@@ -256,13 +359,23 @@ pub(super) fn full_attention_context_prefill(
     attention: &FullAttention,
     runtime: ForwardRuntime<'_>,
 ) -> Result<Tensor> {
-    let (q_projection, k_projection, v) = project_qkv(normed, attention, runtime)?;
+    let (q_projection, k_projection, mut v) = project_qkv(normed, attention, runtime)?;
     let (mut q, gate) = split_attention_gate(config, &q_projection)?;
     let mut k = k_projection;
-    let layout = attention_layout(config, &q, &k, &v)?;
-    if let (Some(theta), Some(q_norm), Some(k_norm)) =
-        (config.rope_theta, &attention.q_norm, &attention.k_norm)
-    {
+    let layout = attention_layout(config, attention, &q, &k, &v)?;
+    if attention.value_norm {
+        v = rms_norm_heads_no_scale(
+            &v,
+            layout.num_key_value_heads,
+            layout.head_dim,
+            config.rms_eps,
+        )?;
+    }
+    if let (Some(rope), Some(q_norm), Some(k_norm)) = (
+        rope_params(config, attention),
+        &attention.q_norm,
+        &attention.k_norm,
+    ) {
         q = rms_norm_rope_heads_at(
             &q,
             layout.num_attention_heads,
@@ -270,8 +383,9 @@ pub(super) fn full_attention_context_prefill(
             layout.rope_dims,
             q_norm,
             config.rms_eps,
-            theta,
+            rope,
             position_offset,
+            config.rope_style,
         )?;
         k = rms_norm_rope_heads_at(
             &k,
@@ -280,8 +394,9 @@ pub(super) fn full_attention_context_prefill(
             layout.rope_dims,
             k_norm,
             config.rms_eps,
-            theta,
+            rope,
             position_offset,
+            config.rope_style,
         )?;
     } else if let (Some(q_norm), Some(k_norm)) = (&attention.q_norm, &attention.k_norm) {
         q = rms_norm_heads(
@@ -299,8 +414,7 @@ pub(super) fn full_attention_context_prefill(
             config.rms_eps,
         )?;
     }
-    if let Some(theta) = config
-        .rope_theta
+    if let Some(rope) = rope_params(config, attention)
         .filter(|_| attention.q_norm.is_none() || attention.k_norm.is_none())
     {
         q = apply_rope_heads_at(
@@ -308,16 +422,18 @@ pub(super) fn full_attention_context_prefill(
             layout.num_attention_heads,
             layout.head_dim,
             layout.rope_dims,
-            theta,
+            rope,
             position_offset,
+            config.rope_style,
         )?;
         k = apply_rope_heads_at(
             &k,
             layout.num_key_value_heads,
             layout.head_dim,
             layout.rope_dims,
-            theta,
+            rope,
             position_offset,
+            config.rope_style,
         )?;
     }
     let mut context = if cache.len() == 0 {
@@ -341,21 +457,30 @@ pub(super) fn project_qkv(
     if let Some(metal) = runtime.metal_executor() {
         if attention.q_proj.bias().is_none()
             && attention.k_proj.bias().is_none()
-            && attention.v_proj.bias().is_none()
+            && attention
+                .v_proj
+                .as_ref()
+                .is_some_and(|v_proj| v_proj.bias().is_none())
         {
+            let v_proj = attention
+                .v_proj
+                .as_ref()
+                .expect("invariant: v_proj présent dans le chemin Metal triple");
             return metal.project_three_biasless(
                 normed,
                 &attention.q_proj,
                 &attention.k_proj,
-                &attention.v_proj,
+                v_proj,
             );
         }
     }
-    Ok((
-        attention.q_proj.forward_with_runtime(normed, runtime)?,
-        attention.k_proj.forward_with_runtime(normed, runtime)?,
-        attention.v_proj.forward_with_runtime(normed, runtime)?,
-    ))
+    let q = attention.q_proj.forward_with_runtime(normed, runtime)?;
+    let k = attention.k_proj.forward_with_runtime(normed, runtime)?;
+    let v = match &attention.v_proj {
+        Some(v_proj) => v_proj.forward_with_runtime(normed, runtime)?,
+        None => k.clone(),
+    };
+    Ok((q, k, v))
 }
 
 pub(super) fn split_attention_gate(
@@ -400,6 +525,7 @@ pub(super) fn sigmoid_scalar(value: f32) -> f32 {
 
 pub(super) fn attention_layout(
     config: &CausalDecoderConfig,
+    attention: &FullAttention,
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -408,7 +534,9 @@ pub(super) fn attention_layout(
     let (_, k_dim) = k.as_matrix()?;
     let (_, v_dim) = v.as_matrix()?;
     let num_attention_heads = config.num_attention_heads;
-    let num_key_value_heads = config.num_key_value_heads;
+    let num_key_value_heads = attention
+        .num_key_value_heads
+        .unwrap_or(config.num_key_value_heads);
     if num_attention_heads == 0 || num_key_value_heads == 0 {
         return Err(InferError::Dimension(format!(
             "attention heads invalides: q_heads={num_attention_heads}, kv_heads={num_key_value_heads}"
@@ -419,7 +547,7 @@ pub(super) fn attention_layout(
             "q_heads {num_attention_heads} non divisible par kv_heads {num_key_value_heads}"
         )));
     }
-    let head_dim = match config.head_dim {
+    let head_dim = match attention.head_dim.or(config.head_dim) {
         Some(dim) if dim > 0 => dim,
         Some(_) => return Err(InferError::Dimension("head_dim explicite nul".to_string())),
         None => q_dim.checked_div(num_attention_heads).ok_or_else(|| {
@@ -440,7 +568,7 @@ pub(super) fn attention_layout(
             "kv dims attendues {expected_kv_dim}, reçu k={k_dim}, v={v_dim}"
         )));
     }
-    let rope_dims = config.rope_dims.unwrap_or(head_dim);
+    let rope_dims = attention.rope_dims.or(config.rope_dims).unwrap_or(head_dim);
     if rope_dims == 0 || rope_dims > head_dim || rope_dims % 2 != 0 {
         return Err(InferError::Dimension(format!(
             "rope_dims {rope_dims} invalide pour head_dim {head_dim}"
@@ -451,6 +579,8 @@ pub(super) fn attention_layout(
         num_key_value_heads,
         head_dim,
         rope_dims,
+        attn_scalar: config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
+        sliding_window: attention.sliding_window.filter(|window| *window > 0),
     })
 }
 
@@ -459,9 +589,10 @@ pub(super) fn apply_rope_heads(
     heads: usize,
     head_dim: usize,
     rope_dims: usize,
-    base_theta: f32,
+    rope: RopeParams,
+    style: RopeStyle,
 ) -> Result<Tensor> {
-    apply_rope_heads_at(x, heads, head_dim, rope_dims, base_theta, 0)
+    apply_rope_heads_at(x, heads, head_dim, rope_dims, rope, 0, style)
 }
 
 pub(super) fn rms_norm_heads(
@@ -504,14 +635,44 @@ pub(super) fn rms_norm_heads(
     Tensor::from_vec(vec![seq, dim], out)
 }
 
+pub(super) fn rms_norm_heads_no_scale(
+    x: &Tensor,
+    heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<Tensor> {
+    let (seq, dim) = x.as_matrix()?;
+    if heads == 0 || head_dim == 0 || dim != heads * head_dim {
+        return Err(InferError::Dimension(format!(
+            "RMSNorm heads sans poids invalide: x={:?}, heads={heads}, head_dim={head_dim}",
+            x.shape()
+        )));
+    }
+    let mut out = x.data().to_vec();
+    for pos in 0..seq {
+        let row_start = pos * dim;
+        for head in 0..heads {
+            let head_start = row_start + head * head_dim;
+            let xs = &x.data()[head_start..head_start + head_dim];
+            let mean_square = xs.iter().map(|value| value * value).sum::<f32>() / head_dim as f32;
+            let inv_rms = 1.0 / (mean_square + eps).sqrt();
+            for col in 0..head_dim {
+                out[head_start + col] = xs[col] * inv_rms;
+            }
+        }
+    }
+    Tensor::from_vec(vec![seq, dim], out)
+}
+
 struct RmsHeadSpec<'a> {
     heads: usize,
     head_dim: usize,
     rope_dims: usize,
     weight: &'a Tensor,
     eps: f32,
-    base_theta: f32,
+    rope: RopeParams,
     position_offset: usize,
+    style: RopeStyle,
 }
 
 #[expect(
@@ -525,8 +686,9 @@ pub(super) fn rms_norm_rope_heads_at(
     rope_dims: usize,
     weight: &Tensor,
     eps: f32,
-    base_theta: f32,
+    rope: RopeParams,
     position_offset: usize,
+    style: RopeStyle,
 ) -> Result<Tensor> {
     rms_norm_rope_heads_with(
         x,
@@ -536,8 +698,9 @@ pub(super) fn rms_norm_rope_heads_at(
             rope_dims,
             weight,
             eps,
-            base_theta,
+            rope,
             position_offset,
+            style,
         },
     )
 }
@@ -572,7 +735,7 @@ fn rms_norm_rope_heads_with(x: &Tensor, spec: RmsHeadSpec<'_>) -> Result<Tensor>
     };
     let pairs = spec.rope_dims / 2;
     let rotations = (0..seq)
-        .map(|pos| rope_rotations(spec.position_offset + pos, spec.rope_dims, spec.base_theta))
+        .map(|pos| rope_rotations(spec.position_offset + pos, spec.rope_dims, spec.rope))
         .collect::<Result<Vec<_>>>()?;
     let mut out = vec![0.0_f32; x.len()];
     for (pos, rotation) in rotations.iter().enumerate().take(seq) {
@@ -583,15 +746,30 @@ fn rms_norm_rope_heads_with(x: &Tensor, spec: RmsHeadSpec<'_>) -> Result<Tensor>
             let mean_square =
                 xs.iter().map(|value| value * value).sum::<f32>() / spec.head_dim as f32;
             let inv_rms = 1.0 / (mean_square + spec.eps).sqrt();
-            for pair in 0..pairs {
-                let even = xs[2 * pair] * inv_rms * weight_data[2 * pair];
-                let odd = xs[2 * pair + 1] * inv_rms * weight_data[2 * pair + 1];
-                let (cos, sin) = rotation[pair];
-                out[head_start + 2 * pair] = even * cos - odd * sin;
-                out[head_start + 2 * pair + 1] = even * sin + odd * cos;
-            }
-            for col in spec.rope_dims..spec.head_dim {
+            for col in 0..spec.head_dim {
                 out[head_start + col] = xs[col] * inv_rms * weight_data[col];
+            }
+            match spec.style {
+                RopeStyle::Interleaved => {
+                    for pair in 0..pairs {
+                        let even = out[head_start + 2 * pair];
+                        let odd = out[head_start + 2 * pair + 1];
+                        let (cos, sin) = rotation[pair];
+                        out[head_start + 2 * pair] = even * cos - odd * sin;
+                        out[head_start + 2 * pair + 1] = even * sin + odd * cos;
+                    }
+                }
+                RopeStyle::Halves => {
+                    for pair in 0..pairs {
+                        let first_index = head_start + pair;
+                        let second_index = head_start + pairs + pair;
+                        let first = out[first_index];
+                        let second = out[second_index];
+                        let (cos, sin) = rotation[pair];
+                        out[first_index] = first * cos - second * sin;
+                        out[second_index] = first * sin + second * cos;
+                    }
+                }
             }
         }
     }
@@ -603,8 +781,9 @@ pub(super) fn apply_rope_heads_at(
     heads: usize,
     head_dim: usize,
     rope_dims: usize,
-    base_theta: f32,
+    rope: RopeParams,
     position_offset: usize,
+    style: RopeStyle,
 ) -> Result<Tensor> {
     let (seq, dim) = x.as_matrix()?;
     if dim != heads * head_dim {
@@ -612,27 +791,42 @@ pub(super) fn apply_rope_heads_at(
             "RoPE heads={heads}, head_dim={head_dim}, dim reçu {dim}"
         )));
     }
-    if base_theta <= 0.0 {
+    if rope.theta <= 0.0 {
         return Err(InferError::Dimension(format!(
-            "RoPE base_theta invalide: {base_theta}"
+            "RoPE base_theta invalide: {}",
+            rope.theta
         )));
     }
     let pairs = rope_dims / 2;
     let rotations = (0..seq)
-        .map(|pos| rope_rotations(position_offset + pos, rope_dims, base_theta))
+        .map(|pos| rope_rotations(position_offset + pos, rope_dims, rope))
         .collect::<Result<Vec<_>>>()?;
     let mut out = x.data().to_vec();
     for (pos, rotation) in rotations.iter().enumerate().take(seq) {
         let row_start = pos * dim;
         for head in 0..heads {
             let head_start = row_start + head * head_dim;
-            for (pair, &(cos, sin)) in rotation.iter().enumerate().take(pairs) {
-                let even_index = head_start + 2 * pair;
-                let odd_index = even_index + 1;
-                let even = x.data()[even_index];
-                let odd = x.data()[odd_index];
-                out[even_index] = even * cos - odd * sin;
-                out[odd_index] = even * sin + odd * cos;
+            match style {
+                RopeStyle::Interleaved => {
+                    for (pair, &(cos, sin)) in rotation.iter().enumerate().take(pairs) {
+                        let even_index = head_start + 2 * pair;
+                        let odd_index = even_index + 1;
+                        let even = x.data()[even_index];
+                        let odd = x.data()[odd_index];
+                        out[even_index] = even * cos - odd * sin;
+                        out[odd_index] = even * sin + odd * cos;
+                    }
+                }
+                RopeStyle::Halves => {
+                    for (pair, &(cos, sin)) in rotation.iter().enumerate().take(pairs) {
+                        let first_index = head_start + pair;
+                        let second_index = head_start + pairs + pair;
+                        let first = x.data()[first_index];
+                        let second = x.data()[second_index];
+                        out[first_index] = first * cos - second * sin;
+                        out[second_index] = first * sin + second * cos;
+                    }
+                }
             }
         }
     }
@@ -643,7 +837,9 @@ pub(super) fn apply_rope_heads_at(
 struct RopeRotationKey {
     position: usize,
     rope_dims: usize,
+    frequency_dim: usize,
     base_theta_bits: u32,
+    position_scale_bits: u32,
 }
 
 type RopeRotations = Arc<Vec<(f32, f32)>>;
@@ -652,13 +848,15 @@ type RopeRotationCache = Mutex<HashMap<RopeRotationKey, RopeRotations>>;
 pub(super) fn rope_rotations(
     position: usize,
     rope_dims: usize,
-    base_theta: f32,
+    rope: RopeParams,
 ) -> Result<RopeRotations> {
     static CACHE: OnceLock<RopeRotationCache> = OnceLock::new();
     let key = RopeRotationKey {
         position,
         rope_dims,
-        base_theta_bits: base_theta.to_bits(),
+        frequency_dim: rope.frequency_dim,
+        base_theta_bits: rope.theta.to_bits(),
+        position_scale_bits: rope.position_scale.to_bits(),
     };
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
@@ -671,9 +869,13 @@ pub(super) fn rope_rotations(
     }
     let pairs = rope_dims / 2;
     let mut rotations = Vec::with_capacity(pairs);
+    // Échelle linéaire des positions (rope_scaling Gemma 3) appliquée AVANT la
+    // fréquence, comme `mx.fast.rope(scale=1/factor)` ; `pos × 1.0` reste
+    // bit-identique à `pos` (byte-identité des modèles non scalés).
+    let scaled_position = position as f32 * rope.position_scale;
     for pair in 0..pairs {
-        let exponent = (2 * pair) as f32 / rope_dims as f32;
-        let angle = position as f32 / base_theta.powf(exponent);
+        let exponent = (2 * pair) as f32 / rope.frequency_dim as f32;
+        let angle = scaled_position / rope.theta.powf(exponent);
         rotations.push((angle.cos(), angle.sin()));
     }
     let rotations = Arc::new(rotations);
@@ -709,7 +911,13 @@ pub(super) fn cached_attention_one(
         )));
     }
 
-    let inv_scale = 1.0 / (layout.head_dim as f32).sqrt();
+    let inv_scale = 1.0 / layout.attn_scalar.sqrt();
+    // Fenêtre sliding Gemma 3 : seules les `window` dernières positions du cache
+    // participent ; `None` (tous les autres modèles) → tout le cache, byte-identique.
+    let window_start = layout
+        .sliding_window
+        .map_or(0, |window| cache_len.saturating_sub(window));
+    let window_len = cache_len - window_start;
     let kv_group = layout.num_attention_heads / layout.num_key_value_heads;
     let q_row = q.row_slice(0)?;
     let mut out = vec![0.0_f32; expected_q_dim];
@@ -719,20 +927,20 @@ pub(super) fn cached_attention_one(
         out.par_chunks_mut(layout.head_dim)
             .enumerate()
             .for_each_init(
-                || vec![0.0_f32; cache_len],
+                || vec![0.0_f32; window_len],
                 |scores, (q_head, out_head)| {
                     let kv_head = q_head / kv_group;
                     let q_start = q_head * layout.head_dim;
                     let k_start = kv_head * layout.head_dim;
                     let q_slice = &q_row[q_start..q_start + layout.head_dim];
-                    for (row, score) in scores.iter_mut().enumerate() {
-                        let key_start = row * expected_kv_dim + k_start;
+                    for (offset, score) in scores.iter_mut().enumerate() {
+                        let key_start = (window_start + offset) * expected_kv_dim + k_start;
                         let k_slice = &keys[key_start..key_start + layout.head_dim];
                         *score = dot_product(q_slice, k_slice) * inv_scale;
                     }
                     softmax_in_place(scores, 1.0);
-                    for (row, prob) in scores.iter().copied().enumerate() {
-                        let value_start = row * expected_kv_dim + k_start;
+                    for (offset, prob) in scores.iter().copied().enumerate() {
+                        let value_start = (window_start + offset) * expected_kv_dim + k_start;
                         let v_slice = &values[value_start..value_start + layout.head_dim];
                         for col in 0..layout.head_dim {
                             out_head[col] += prob * v_slice[col];
@@ -742,20 +950,20 @@ pub(super) fn cached_attention_one(
             );
         return Tensor::from_vec(vec![1, expected_q_dim], out);
     }
-    let mut scores = vec![0.0_f32; cache_len];
+    let mut scores = vec![0.0_f32; window_len];
     for q_head in 0..layout.num_attention_heads {
         let kv_head = q_head / kv_group;
         let q_start = q_head * layout.head_dim;
         let k_start = kv_head * layout.head_dim;
         let q_slice = &q_row[q_start..q_start + layout.head_dim];
-        for (row, score) in scores.iter_mut().enumerate() {
-            let key_start = row * expected_kv_dim + k_start;
+        for (offset, score) in scores.iter_mut().enumerate() {
+            let key_start = (window_start + offset) * expected_kv_dim + k_start;
             let k_slice = &keys[key_start..key_start + layout.head_dim];
             *score = dot_product(q_slice, k_slice) * inv_scale;
         }
         softmax_in_place(&mut scores, 1.0);
-        for (row, prob) in scores.iter().copied().enumerate() {
-            let value_start = row * expected_kv_dim + k_start;
+        for (offset, prob) in scores.iter().copied().enumerate() {
+            let value_start = (window_start + offset) * expected_kv_dim + k_start;
             let v_slice = &values[value_start..value_start + layout.head_dim];
             for col in 0..layout.head_dim {
                 out[q_start + col] += prob * v_slice[col];
@@ -866,17 +1074,22 @@ pub(super) fn causal_attention(
         )));
     }
 
-    let scale = (layout.head_dim as f32).sqrt();
+    let scale = layout.attn_scalar.sqrt();
     let kv_group = layout.num_attention_heads / layout.num_key_value_heads;
     let mut out = vec![0.0_f32; seq * expected_q_dim];
     for pos in 0..seq {
         let q_row = q.row_slice(pos)?;
+        // Fenêtre sliding Gemma 3 : la position `pos` ne voit que les `window`
+        // dernières positions causales ; `None` → masque causal plein.
+        let window_start = layout
+            .sliding_window
+            .map_or(0, |window| (pos + 1).saturating_sub(window));
         for q_head in 0..layout.num_attention_heads {
             let kv_head = q_head / kv_group;
             let q_start = q_head * layout.head_dim;
             let q_slice = &q_row[q_start..q_start + layout.head_dim];
-            let mut scores = Vec::with_capacity(pos + 1);
-            for row in 0..=pos {
+            let mut scores = Vec::with_capacity(pos + 1 - window_start);
+            for row in window_start..=pos {
                 let key = k.row_slice(row)?;
                 let k_start = kv_head * layout.head_dim;
                 let k_slice = &key[k_start..k_start + layout.head_dim];
@@ -888,8 +1101,8 @@ pub(super) fn causal_attention(
                 scores.push(dot / scale);
             }
             let probs = softmax(&scores, 1.0);
-            for (row, prob) in probs.iter().enumerate() {
-                let value = v.row_slice(row)?;
+            for (offset, prob) in probs.iter().enumerate() {
+                let value = v.row_slice(window_start + offset)?;
                 let v_start = kv_head * layout.head_dim;
                 let v_slice = &value[v_start..v_start + layout.head_dim];
                 let out_start = pos * expected_q_dim + q_start;

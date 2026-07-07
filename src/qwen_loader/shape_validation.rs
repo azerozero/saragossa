@@ -39,21 +39,37 @@ pub(super) fn validate_decoder_meta_shapes(
 fn validate_decoder_shape_map<T: TensorShapes>(config: &ModelConfig, tensors: &T) -> Result<()> {
     let hidden = config.hidden_size;
     let vocab = config.vocab_size;
-    let q_dim = config.num_attention_heads * config.head_dim();
-    let kv_dim = config.num_key_value_heads * config.head_dim();
     expect_shape(tensors, "embed_tokens.weight", &[vocab, hidden])?;
     for layer in 0..config.num_hidden_layers {
+        let head_dim = config.layer_head_dim(layer);
+        let q_dim = config.num_attention_heads * head_dim;
+        let kv_dim = config.layer_num_key_value_heads(layer) * head_dim;
         expect_shape(
             tensors,
             &layer_target(layer, "input_layernorm.weight"),
             &[hidden],
         )?;
         if config.is_full_attention_layer(layer) {
-            validate_full_attention_shapes(config, tensors, layer, q_dim, kv_dim)?;
+            validate_full_attention_shapes(config, tensors, layer, q_dim, kv_dim, head_dim)?;
         } else {
             validate_linear_attention_shapes(config, tensors, layer)?;
         }
         validate_mlp_shapes(config, tensors, layer)?;
+        if config.is_gemma() {
+            expect_shape(
+                tensors,
+                &layer_target(layer, "pre_feedforward_layernorm.weight"),
+                &[hidden],
+            )?;
+            expect_shape(
+                tensors,
+                &layer_target(layer, "post_feedforward_layernorm.weight"),
+                &[hidden],
+            )?;
+            if config.enable_moe_block {
+                validate_gemma4_parallel_moe_shapes(config, tensors, layer)?;
+            }
+        }
     }
     expect_shape(tensors, "norm.weight", &[hidden])?;
     expect_shape(tensors, "lm_head.weight", &[vocab, hidden])?;
@@ -66,6 +82,7 @@ fn validate_full_attention_shapes(
     layer: usize,
     q_dim: usize,
     kv_dim: usize,
+    head_dim: usize,
 ) -> Result<()> {
     let hidden = config.hidden_size;
     let q_proj_dim = if config.attn_output_gate.unwrap_or(false) {
@@ -85,17 +102,19 @@ fn validate_full_attention_shapes(
         &layer_target(layer, "self_attn.k_proj.weight"),
         &[kv_dim, hidden],
     )?;
-    expect_shape(
-        tensors,
-        &layer_target(layer, "self_attn.v_proj.weight"),
-        &[kv_dim, hidden],
-    )?;
+    if !(config.attention_k_eq_v && config.is_gemma4_full_layer(layer)) {
+        expect_shape(
+            tensors,
+            &layer_target(layer, "self_attn.v_proj.weight"),
+            &[kv_dim, hidden],
+        )?;
+    }
     expect_shape(
         tensors,
         &layer_target(layer, "self_attn.o_proj.weight"),
         &[hidden, q_dim],
     )?;
-    validate_qk_norm_shapes(config, tensors, layer)
+    validate_qk_norm_shapes(tensors, layer, head_dim)
 }
 
 fn validate_linear_attention_shapes(
@@ -180,9 +199,9 @@ fn validate_linear_attention_shapes(
 }
 
 fn validate_qk_norm_shapes(
-    config: &ModelConfig,
     tensors: &impl TensorShapes,
     layer: usize,
+    head_dim: usize,
 ) -> Result<()> {
     let q_norm = layer_target(layer, "self_attn.q_norm.weight");
     let k_norm = layer_target(layer, "self_attn.k_norm.weight");
@@ -191,8 +210,8 @@ fn validate_qk_norm_shapes(
         tensors.contains_tensor(&k_norm),
     ) {
         (true, true) => {
-            expect_shape(tensors, &q_norm, &[config.head_dim()])?;
-            expect_shape(tensors, &k_norm, &[config.head_dim()])?;
+            expect_shape(tensors, &q_norm, &[head_dim])?;
+            expect_shape(tensors, &k_norm, &[head_dim])?;
             Ok(())
         }
         (false, false) => Ok(()),
@@ -344,6 +363,55 @@ fn validate_moe_shapes(
             &[hidden, shared],
         )?;
     }
+    Ok(())
+}
+
+fn validate_gemma4_parallel_moe_shapes(
+    config: &ModelConfig,
+    tensors: &impl TensorShapes,
+    layer: usize,
+) -> Result<()> {
+    let hidden = config.hidden_size;
+    let experts = config
+        .num_experts
+        .ok_or_else(|| InferError::Config("MoE Gemma4 présent sans num_experts".to_string()))?;
+    let intermediate = config.moe_intermediate_size.ok_or_else(|| {
+        InferError::Config("MoE Gemma4 présent sans moe_intermediate_size".to_string())
+    })?;
+    for suffix in [
+        "pre_feedforward_layernorm_2.weight",
+        "post_feedforward_layernorm_1.weight",
+        "post_feedforward_layernorm_2.weight",
+    ] {
+        expect_shape(tensors, &layer_target(layer, suffix), &[hidden])?;
+    }
+    expect_shape(tensors, &layer_target(layer, "layer_scalar"), &[1])?;
+    expect_shape(
+        tensors,
+        &layer_target(layer, "router.proj.weight"),
+        &[experts, hidden],
+    )?;
+    expect_shape(tensors, &layer_target(layer, "router.scale"), &[hidden])?;
+    expect_shape(
+        tensors,
+        &layer_target(layer, "router.per_expert_scale"),
+        &[experts],
+    )?;
+    expect_shape(
+        tensors,
+        &layer_target(layer, "experts.switch_glu.gate_proj.weight"),
+        &[experts, intermediate, hidden],
+    )?;
+    expect_shape(
+        tensors,
+        &layer_target(layer, "experts.switch_glu.up_proj.weight"),
+        &[experts, intermediate, hidden],
+    )?;
+    expect_shape(
+        tensors,
+        &layer_target(layer, "experts.switch_glu.down_proj.weight"),
+        &[experts, hidden, intermediate],
+    )?;
     Ok(())
 }
 

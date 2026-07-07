@@ -1,27 +1,114 @@
-//! Implémentation CPU/Metal de l'attention linéaire récurrente.
+//! Attention linéaire récurrente **Gated DeltaNet** (couches linear-attn des
+//! modèles hybrides `qwen3_5_moe`, ex. 35B-A3B) — chemin CPU de référence et
+//! dispatch vers les kernels Metal (résident / batché-chunké).
+//!
+//! # Règle Gated DeltaNet (forme séquentielle)
+//!
+//! Chaque tête de valeur `h` porte un état récurrent `S ∈ ℝ^{d_v×d_k}` (nul au
+//! départ). Au token `t`, avec `q_t, k_t ∈ ℝ^{d_k}`, `v_t ∈ ℝ^{d_v}` et les
+//! gates scalaires `g_t, β_t ∈ (0,1)` :
+//!
+//! ```text
+//! S_t = g_t·S_{t−1} + β_t·(v_t − g_t·S_{t−1}·k_t)·k_tᵀ     (mise à jour delta gated)
+//! y_t = S_t·q_t                                            (lecture)
+//! ```
+//!
+//! soit, opérateur isolé : `S_t = (I − β_t·k_t·k_tᵀ)·(g_t·S_{t−1}) + β_t·v_t·k_tᵀ`.
+//! `g_t` (gate *a*) efface la mémoire, `β_t` (gate *b*) dose l'écriture ; le
+//! terme `−β_t·(g_t·S_{t−1}·k_t)·k_tᵀ` est la **delta rule** : l'association
+//! portée par `k_t` est *remplacée* (delta vers `v_t`) au lieu d'être accumulée.
+//! C'est exactement la boucle de `gated_delta`, état plat
+//! `[num_value_heads][d_v][d_k]` (une ligne de `S` par colonne de valeur).
+//!
+//! # Gates et normalisations (telles qu'implémentées par `forward_inner`)
+//!
+//! Entrée `x` (hidden, `[seq, d_model]`), projections biasless :
+//!
+//! ```text
+//! [q̃ ‖ k̃ ‖ ṽ] = SiLU(ConvCausale1D_depthwise(W_qkv·x))    (kernel K, mémoire K−1 tokens)
+//! q_t = RMSNormUnit_tête(q̃_t, ε=1e-6) · d_k⁻¹              (scale « squared », cf. key_scale)
+//! k_t = RMSNormUnit_tête(k̃_t, ε=1e-6) · d_k^(−1/2)
+//! β_t = σ(W_b·x_t)                                          (scalaire par tête de valeur)
+//! g_t = exp(−exp(A_log)·softplus(W_a·x_t + dt_bias))        (decay ∈ (0,1), par tête de valeur)
+//! y'_t = RMSNorm_tête(y_t, poids appris, ε=rms_eps)
+//! out_t = W_out·(y'_t ⊙ SiLU(W_z·x_t))                      (gate de sortie z)
+//! ```
+//!
+//! `RMSNormUnit` normalise chaque tête sans poids appris (ε fixe 1e-6) ; le
+//! RMSNorm de sortie applique un poids appris partagé entre têtes (`norm_weight`,
+//! longueur `d_v`). La conv causale depthwise garde `K−1` tokens d'historique par
+//! canal dans `LinearAttentionCache::conv` (décodage token-par-token sans recalcul).
+//!
+//! # GQA (grouped-query)
+//!
+//! `num_value_heads = repeat × num_key_heads` : les `repeat` têtes de valeur
+//! `h ∈ [κ·repeat, (κ+1)·repeat)` **partagent** `q_t`/`k_t` de la tête clé
+//! `κ = ⌊h/repeat⌋`, mais chacune garde son propre état `S`, ses gates
+//! `g_t, β_t` et sa tranche `v_t`.
+//!
+//! # Forme chunkée (kernel Metal `chunk_delta_seq_layout`, chunk C=16)
+//!
+//! Le prefill batché (opt-in `RETI_RUST_LINEAR_CHUNKED`, dispatché par
+//! `MetalExecutor::encode_chunk_delta_seq_layout`) déroule la récurrence par
+//! blocs de C tokens depuis l'état de début de chunk `S₀`. Avec le decay cumulé
+//! intra-chunk `γ_i = ∏_{j≤i} g_j` (indices locaux `i, j ∈ [0, C)`) :
+//!
+//! ```text
+//! u_i  = β_i·(v_i − γ_i·(S₀·k_i))                    (delta mesuré contre S₀ décayé)
+//! A_ij = β_i·(γ_i/γ_j)·(k_i·k_j)         j<i         (couplage intra-chunk)
+//! Δ_i  = u_i − Σ_{j<i} A_ij·Δ_j                      (substitution avant ≡ (I+A)⁻¹·u)
+//! P_ij = (γ_i/γ_j)·(q_i·k_j)             j≤i
+//! y_i  = γ_i·(S₀·q_i) + Σ_{j≤i} P_ij·Δ_j             (lecture : part S₀ + parts intra-chunk)
+//! S_C  = γ_{C−1}·S₀ + Σ_j (γ_{C−1}/γ_j)·Δ_j·k_jᵀ     (état de fin de chunk)
+//! ```
+//!
+//! Équivalence avec la forme séquentielle : en déroulant `S_i = g_i·S_{i−1} +
+//! Δ_i·k_iᵀ` on obtient `S_i = γ_i·S₀ + Σ_{j≤i} (γ_i/γ_j)·Δ_j·k_jᵀ` où
+//! `Δ_j = β_j·(v_j − g_j·S_{j−1}·k_j)` ; substituer cette expansion dans `Δ_i`
+//! donne le système triangulaire ci-dessus. Les sorties coïncident à la
+//! ré-association f32 près — vérifié contre l'oracle CPU naïf token-par-token de
+//! `linear_attention/tests.rs` (mêmes équations, zéro chunking) et par le test GPU direct de
+//! `metal_backend/tests.rs` (`chunk_delta_seq_layout_gqa_matches_naive_oracle`).
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-use crate::decoder::flags::{env_flag, trace_linear_attn_enabled};
+use crate::runtime_flags::{env_flag, trace_linear_attn_enabled};
 use crate::{silu, ForwardRuntime, InferError, Linear, Result, Tensor};
 use rayon::prelude::*;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::sync::OnceLock;
 
+/// Dimensions d'une couche Gated DeltaNet (têtes GQA, conv causale, ε du RMSNorm).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LinearAttentionConfig {
+    /// Nombre de têtes clé/query `H_k` (partagées par `repeat` têtes de valeur).
     pub num_key_heads: usize,
+    /// Nombre de têtes de valeur `H_v = repeat × H_k` (un état `S` chacune).
     pub num_value_heads: usize,
+    /// Dimension `d_k` d'une tête clé/query.
     pub key_head_dim: usize,
+    /// Dimension `d_v` d'une tête de valeur.
     pub value_head_dim: usize,
+    /// Taille `K` du noyau de la conv causale depthwise (mémoire `K−1` tokens).
     pub conv_kernel_dim: usize,
+    /// ε du RMSNorm de sortie (poids appris `norm_weight`).
     pub rms_eps: f32,
 }
 
 impl LinearAttentionConfig {
+    /// Renvoie la largeur totale clé/query `H_k × d_k`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie [`InferError::Shape`] si le produit déborde `usize`.
     pub(crate) fn key_dim(self) -> Result<usize> {
         checked_mul(self.num_key_heads, self.key_head_dim, "linear key_dim")
     }
 
+    /// Renvoie la largeur totale valeur `H_v × d_v`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie [`InferError::Shape`] si le produit déborde `usize`.
     pub(crate) fn value_dim(self) -> Result<usize> {
         checked_mul(
             self.num_value_heads,
@@ -30,6 +117,7 @@ impl LinearAttentionConfig {
         )
     }
 
+    /// Renvoie la largeur de la conv causale : `2×key_dim + value_dim` (q̃‖k̃‖ṽ).
     fn conv_dim(self) -> Result<usize> {
         let key_dim = self.key_dim()?;
         let value_dim = self.value_dim()?;
@@ -39,6 +127,7 @@ impl LinearAttentionConfig {
             .ok_or_else(|| InferError::Shape("linear conv_dim trop grand".to_string()))
     }
 
+    /// Rejette les dimensions nulles et un `H_v` non multiple de `H_k` (GQA).
     fn validate(self) -> Result<()> {
         if self.num_key_heads == 0
             || self.num_value_heads == 0
@@ -65,6 +154,7 @@ impl LinearAttentionConfig {
     }
 }
 
+/// Couche Gated DeltaNet : poids figés + dispatch CPU/Metal (voir doc de module).
 #[derive(Clone, Debug)]
 pub(crate) struct LinearAttention {
     in_proj_qkv: Linear,
@@ -78,19 +168,33 @@ pub(crate) struct LinearAttention {
     norm_weight: Tensor,
 }
 
+/// Poids d'une couche Gated DeltaNet, tels que chargés depuis les safetensors.
 #[derive(Clone, Debug)]
 pub(crate) struct LinearAttentionWeights {
+    /// Projection fusionnée `W_qkv` vers `[q̃‖k̃‖ṽ]` (`conv_dim` sorties).
     pub in_proj_qkv: Linear,
+    /// Projection `W_z` du gate de sortie (`value_dim` sorties).
     pub in_proj_z: Linear,
+    /// Projection `W_b` du gate d'écriture `β_t = σ(·)` (`H_v` sorties).
     pub in_proj_b: Linear,
+    /// Projection `W_a` du decay `g_t` (`H_v` sorties, cf. `compute_decay`).
     pub in_proj_a: Linear,
+    /// Projection de sortie `W_out` appliquée à `y' ⊙ SiLU(z)`.
     pub out_proj: Linear,
+    /// Noyau de la conv causale depthwise, `[conv_dim, K, 1]` ou `[conv_dim, 1, K]`.
     pub conv1d_weight: Tensor,
+    /// `A_log` (`[H_v]`) : amplitude log du decay, `g_t = exp(−exp(A_log)·dt)`.
     pub a_log: Tensor,
+    /// `dt_bias` (`[H_v]`) : biais du pas `dt = softplus(W_a·x + dt_bias)`.
     pub dt_bias: Tensor,
+    /// Poids appris (`[d_v]`) du RMSNorm de sortie par tête.
     pub norm_weight: Tensor,
 }
 
+/// État récurrent d'une couche : historique conv (`K−1` tokens) + état SSM `S`.
+///
+/// `ssm` est l'aplat `[H_v][d_v][d_k]` (une ligne de `S` par colonne de valeur) ;
+/// `metal` est le miroir GPU-résident (non cloné : chaque flux reconstruit le sien).
 #[derive(Debug, Default)]
 pub(crate) struct LinearAttentionCache {
     conv: Vec<f32>,
@@ -102,6 +206,8 @@ pub(crate) struct LinearAttentionCache {
 }
 
 impl Clone for LinearAttentionCache {
+    // NOTE: clone CPU seulement — l'état Metal résident est volontairement
+    // abandonné (buffers GPU non partageables entre flux ; il sera régénéré).
     fn clone(&self) -> Self {
         Self {
             conv: self.conv.clone(),
@@ -115,6 +221,7 @@ impl Clone for LinearAttentionCache {
 }
 
 impl LinearAttention {
+    /// Construit la couche à partir des poids chargés (aucune validation ici).
     pub(crate) fn new(weights: LinearAttentionWeights) -> Self {
         Self {
             in_proj_qkv: weights.in_proj_qkv,
@@ -129,11 +236,21 @@ impl LinearAttention {
         }
     }
 
+    /// Applique la couche sur CPU sans cache persistant (tests uniquement).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les shapes de `x`, des poids ou de `config` divergent.
     #[cfg(test)]
     pub(crate) fn forward(&self, config: LinearAttentionConfig, x: &Tensor) -> Result<Tensor> {
         self.forward_with_runtime(config, x, ForwardRuntime::cpu())
     }
 
+    /// Applique la couche sur `[seq, d_model]` avec un cache jetable (prefill sans état).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les shapes de `x`, des poids ou de `config` divergent.
     pub(crate) fn forward_with_runtime(
         &self,
         config: LinearAttentionConfig,
@@ -144,6 +261,11 @@ impl LinearAttention {
         self.forward_inner(config, x, Some(&mut cache), runtime)
     }
 
+    /// Avance la récurrence d'UN token sur CPU avec cache (tests uniquement).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `x` n'est pas `[1, d_model]` ou si un shape diverge.
     #[cfg(test)]
     pub(crate) fn forward_cached(
         &self,
@@ -161,6 +283,11 @@ impl LinearAttention {
         self.forward_inner(config, x, Some(cache), ForwardRuntime::cpu())
     }
 
+    /// Avance la récurrence d'UN token (chemin decode : conv + delta gated + gates).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `x` n'est pas `[1, d_model]` ou si un shape diverge.
     pub(crate) fn forward_cached_with_runtime(
         &self,
         config: LinearAttentionConfig,
@@ -178,6 +305,14 @@ impl LinearAttention {
         self.forward_inner(config, x, Some(cache), runtime)
     }
 
+    /// Avance la récurrence de `seq` tokens avec cache (chemin prefill batché).
+    ///
+    /// Sur Metal, dispatche le batch résident GPU (forme chunkée ou scan
+    /// séquentiel dk128 selon les flags) ; sinon retombe sur le CPU séquentiel.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `x` est vide ou si un shape diverge.
     pub(crate) fn forward_cached_batch_with_runtime(
         &self,
         config: LinearAttentionConfig,
@@ -198,6 +333,7 @@ impl LinearAttention {
         self.forward_inner(config, x, Some(cache), runtime)
     }
 
+    /// Batch résident GPU si possible, sinon replay token-par-token du batch.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn forward_cached_rows_with_runtime(
         &self,
@@ -251,7 +387,7 @@ impl LinearAttention {
                 Some(expected) if expected != cols => {
                     return Err(InferError::Dimension(format!(
                         "linear-attn batch out_dim={cols}, attendu {expected}"
-                    )))
+                    )));
                 }
                 Some(_) => {}
                 None => {
@@ -266,6 +402,8 @@ impl LinearAttention {
         Tensor::from_vec(vec![seq, cols], data)
     }
 
+    /// Pipeline complet d'une passe (voir les équations de la doc de module) :
+    /// projections → conv causale+SiLU → normalisations/gates → delta gated → sortie.
     fn forward_inner(
         &self,
         config: LinearAttentionConfig,
@@ -300,19 +438,11 @@ impl LinearAttention {
                     }
                 }
             }
-            if seq == 1 && linear_attn_fused_step_enabled() {
-                match self.forward_fused_metal_step(config, x, cache, metal) {
-                    Ok(output) => return Ok(output),
-                    Err(error) => {
-                        if trace_linear_attn_enabled() {
-                            eprintln!("linear-attn fused gpu fallback: {error}");
-                        }
-                    }
-                }
-            }
         }
 
         let (qkv, z, beta_input, gate_input) = self.input_projections(x, runtime)?;
+        // Équation : [q̃‖k̃‖ṽ] = SiLU(ConvCausale1D(W_qkv·x)) — la conv mélange le
+        // token courant aux K−1 précédents (cache.conv), SiLU non-linéarise.
         let conv_out = depthwise_causal_conv(&qkv, &self.conv1d_weight, config, cache)?;
         let conv_out = silu(&conv_out);
 
@@ -321,18 +451,25 @@ impl LinearAttention {
         let q = slice_columns(&conv_out, 0, key_dim)?;
         let k = slice_columns(&conv_out, key_dim, key_dim)?;
         let v = slice_columns(&conv_out, key_dim * 2, value_dim)?;
+        // Équations : q = RMSNormUnit(q̃)·d_k⁻¹ et k = RMSNormUnit(k̃)·d_k^(−1/2).
+        // L'asymétrie (« squared » sur q) reproduit le scaling amont : le produit
+        // lecture q·S·… porte ainsi le 1/√d_k de l'attention ET la contraction sur d_k.
         let q = rms_norm_heads_unit(&q, config.num_key_heads, config.key_head_dim, 1.0e-6)?
             .map(|value| value * key_scale(config.key_head_dim, true));
         let k = rms_norm_heads_unit(&k, config.num_key_heads, config.key_head_dim, 1.0e-6)?
             .map(|value| value * key_scale(config.key_head_dim, false));
+        // Équation : β_t = σ(W_b·x_t) — gate d'écriture de la delta rule.
         let beta = beta_input.map(sigmoid);
+        // Équation : g_t = exp(−exp(A_log)·softplus(W_a·x_t + dt_bias)) — decay ∈ (0,1).
         let g = compute_decay(
             &gate_input,
             &self.a_log,
             &self.dt_bias,
             config.num_value_heads,
         )?;
+        // Cœur : S_t = g_t·S_{t−1} + β_t·(v_t − g_t·S_{t−1}·k_t)·k_tᵀ ; y_t = S_t·q_t.
         let y = gated_delta(&q, &k, &v, &g, &beta, config, cache)?;
+        // Équation : y'_t = RMSNorm_tête(y_t, norm_weight, rms_eps).
         let y = rms_norm_heads(
             &y,
             config.num_value_heads,
@@ -340,10 +477,12 @@ impl LinearAttention {
             &self.norm_weight,
             config.rms_eps,
         )?;
+        // Équation : out_t = W_out·(y'_t ⊙ SiLU(z_t)) — gate de sortie z.
         let gated = y.mul_elementwise(&silu(&z))?;
         self.out_proj.forward_with_runtime(&gated, runtime)
     }
 
+    /// Calcule les quatre projections biasless `(W_qkv·x, W_z·x, W_b·x, W_a·x)`.
     fn input_projections(
         &self,
         x: &Tensor,
@@ -374,46 +513,7 @@ impl LinearAttention {
         ))
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn forward_fused_metal_step(
-        &self,
-        config: LinearAttentionConfig,
-        x: &Tensor,
-        cache: &mut LinearAttentionCache,
-        metal: &crate::MetalExecutor,
-    ) -> Result<Tensor> {
-        let (seq, _) = x.as_matrix()?;
-        if seq != 1 {
-            return Err(InferError::Dimension(format!(
-                "linear-attn fused Metal attend seq=1, reçu {seq}"
-            )));
-        }
-        ensure_conv_cache(config, cache)?;
-        ensure_ssm_cache(config, cache)?;
-        metal.linear_attention_cached_step(
-            x,
-            &self.in_proj_qkv,
-            &self.in_proj_z,
-            &self.in_proj_b,
-            &self.in_proj_a,
-            &self.out_proj,
-            &self.conv1d_weight,
-            &self.a_log,
-            &self.dt_bias,
-            &self.norm_weight,
-            cache.conv.as_mut_slice(),
-            cache.ssm.as_mut_slice(),
-            crate::metal_backend::LinearAttentionStepSpec {
-                num_key_heads: config.num_key_heads,
-                num_value_heads: config.num_value_heads,
-                key_head_dim: config.key_head_dim,
-                value_head_dim: config.value_head_dim,
-                conv_kernel_dim: config.conv_kernel_dim,
-                rms_eps: config.rms_eps,
-            },
-        )
-    }
-
+    /// Pas seq=1 sur le kernel Metal résident (états conv/ssm gardés sur GPU).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn forward_resident_metal_step(
         &self,
@@ -482,6 +582,11 @@ impl LinearAttentionCache {
         self.metal.as_ref()
     }
 
+    /// Copie l'état résident GPU (rollback spéculatif d'une couche isolée).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la copie de buffers Metal échoue.
     #[allow(
         dead_code,
         reason = "fallback single-layer conservé pour debug/tests Metal"
@@ -496,6 +601,11 @@ impl LinearAttentionCache {
             .transpose()
     }
 
+    /// Restaure l'état résident GPU depuis un snapshot (rollback spéculatif).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la recopie de buffers Metal échoue.
     pub(crate) fn restore_metal_state_snapshot(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -516,6 +626,7 @@ impl LinearAttentionCache {
 }
 
 impl LinearAttentionCache {
+    /// Restaure les états conv/ssm CPU depuis un snapshot (rollback spéculatif).
     pub(crate) fn restore_cpu_state_from(&mut self, snapshot: &Self) {
         self.conv = snapshot.conv.clone();
         self.conv_dim = snapshot.conv_dim;
@@ -524,6 +635,7 @@ impl LinearAttentionCache {
     }
 }
 
+/// Vérifie la cohérence des shapes de tous les poids avec `config`.
 fn validate_weights(attn: &LinearAttention, config: LinearAttentionConfig) -> Result<()> {
     let conv_dim = config.conv_dim()?;
     let value_dim = config.value_dim()?;
@@ -546,7 +658,7 @@ fn validate_weights(attn: &LinearAttention, config: LinearAttentionConfig) -> Re
             return Err(InferError::Dimension(format!(
                 "linear_attn.A_log attendu [{}], reçu {shape:?}",
                 config.num_value_heads
-            )))
+            )));
         }
     }
     match attn.dt_bias.shape() {
@@ -555,7 +667,7 @@ fn validate_weights(attn: &LinearAttention, config: LinearAttentionConfig) -> Re
             return Err(InferError::Dimension(format!(
                 "linear_attn.dt_bias attendu [{}], reçu {shape:?}",
                 config.num_value_heads
-            )))
+            )));
         }
     }
     match attn.norm_weight.shape() {
@@ -565,7 +677,7 @@ fn validate_weights(attn: &LinearAttention, config: LinearAttentionConfig) -> Re
             return Err(InferError::Dimension(format!(
                 "linear_attn.norm.weight attendu [{}], reçu {shape:?}",
                 config.value_head_dim
-            )))
+            )));
         }
     }
     let conv_weight = conv_weight_shape(&attn.conv1d_weight, conv_dim, config.conv_kernel_dim)?;
@@ -582,6 +694,7 @@ fn validate_weights(attn: &LinearAttention, config: LinearAttentionConfig) -> Re
     Ok(())
 }
 
+/// Vérifie qu'un poids linéaire est de rang 2 et sort `expected` (0 = libre).
 fn expect_linear_out(linear: &Linear, expected: usize, name: &str) -> Result<()> {
     let shape = linear.weight().shape();
     let [out, _] = shape else {
@@ -597,6 +710,11 @@ fn expect_linear_out(linear: &Linear, expected: usize, name: &str) -> Result<()>
     Ok(())
 }
 
+/// Applique la conv causale depthwise (un filtre K par canal) avec cache glissant.
+///
+/// Terme d'équation : `ConvCausale1D(W_qkv·x)` — chaque canal `c` produit
+/// `Σ_{κ<K} w[c,κ]·in[t−(K−1)+κ, c]`, l'historique `K−1` venant de `cache.conv`
+/// (zéros au premier appel). Le cache est ensuite avancé aux `K−1` derniers tokens.
 fn depthwise_causal_conv(
     qkv: &Tensor,
     weight: &Tensor,
@@ -649,6 +767,7 @@ fn depthwise_causal_conv(
     Tensor::from_vec(vec![seq, conv_dim], out)
 }
 
+/// Initialise (zéros) ou valide l'historique conv `[K−1, conv_dim]` du cache.
 fn ensure_conv_cache(
     config: LinearAttentionConfig,
     cache: &mut LinearAttentionCache,
@@ -663,7 +782,7 @@ fn ensure_conv_cache(
         Some(dim) => {
             return Err(InferError::Dimension(format!(
                 "cache conv linear-attn dim {dim} incompatible avec {conv_dim}"
-            )))
+            )));
         }
         None => {
             cache.conv = vec![0.0; state_len];
@@ -679,6 +798,17 @@ fn ensure_conv_cache(
     Ok(())
 }
 
+/// Déroule la récurrence Gated DeltaNet séquentielle sur `cache.ssm` (référence CPU).
+///
+/// Implémente token par token `S_t = g_t·S_{t−1} + β_t·(v_t − g_t·S_{t−1}·k_t)·k_tᵀ`
+/// puis `y_t = S_t·q_t` (doc de module), GQA inclus : la tête de valeur `h` lit
+/// q/k de la tête clé `⌊h/repeat⌋`. Parallélisé rayon par tête de valeur (états
+/// disjoints) ; l'ordre des flottants par tête reste strictement séquentiel, donc
+/// la sortie est déterministe et invariante au découpage du batch en chunks.
+///
+/// # Errors
+///
+/// Renvoie une erreur si les shapes q/k/v/g/β ou le cache SSM divergent de `config`.
 fn gated_delta(
     q: &Tensor,
     k: &Tensor,
@@ -732,6 +862,7 @@ fn gated_delta(
             .zip(out_row.par_chunks_mut(config.value_head_dim))
             .enumerate()
             .for_each(|(value_head, (state_head, out_head))| {
+                // GQA : q/k viennent de la tête clé κ = ⌊h/repeat⌋, v/gates de h.
                 let key_head = value_head / repeat;
                 let q_head =
                     &q_row[key_head * config.key_head_dim..(key_head + 1) * config.key_head_dim];
@@ -742,16 +873,26 @@ fn gated_delta(
                 let decay = g_row[value_head];
                 let beta_value = beta_row[value_head];
 
+                // Chaque `value_col` traite UNE ligne de S (longueur d_k) : la
+                // récurrence matricielle se décompose ligne à ligne car k_t, q_t
+                // et les gates sont partagés entre lignes.
                 for value_col in 0..config.value_head_dim {
                     let row_start = value_col * config.key_head_dim;
                     let state_row = &mut state_head[row_start..row_start + config.key_head_dim];
                     let mut kv_mem = 0.0_f32;
+                    // Terme g_t·S_{t−1} (decay in place) et, en même temps,
+                    // kv_mem = (g_t·S_{t−1}·k_t)[value_col] — la lecture de
+                    // l'ancienne association AVANT écriture (delta rule).
                     for (state_value, key_value) in state_row.iter_mut().zip(k_head.iter()) {
                         *state_value *= decay;
                         kv_mem += *state_value * *key_value;
                     }
+                    // Terme Δ = β_t·(v_t − g_t·S_{t−1}·k_t) : erreur de prédiction
+                    // dosée par le gate d'écriture.
                     let delta = (v_head[value_col] - kv_mem) * beta_value;
                     let mut y = 0.0_f32;
+                    // Termes S_t = g_t·S_{t−1} + Δ·k_tᵀ (produit extérieur, ligne
+                    // par ligne) et y_t = S_t·q_t, fusionnés en un seul passage.
                     for ((state_value, key_value), query_value) in
                         state_row.iter_mut().zip(k_head.iter()).zip(q_head.iter())
                     {
@@ -765,6 +906,7 @@ fn gated_delta(
     Tensor::from_vec(vec![seq, value_dim], out)
 }
 
+/// Initialise (S=0) ou valide l'état SSM `[H_v][d_v][d_k]` du cache.
 fn ensure_ssm_cache(config: LinearAttentionConfig, cache: &mut LinearAttentionCache) -> Result<()> {
     let state_len = config
         .num_value_heads
@@ -781,7 +923,7 @@ fn ensure_ssm_cache(config: LinearAttentionConfig, cache: &mut LinearAttentionCa
         Some(shape) => {
             return Err(InferError::Dimension(format!(
                 "cache ssm linear-attn shape {shape:?} incompatible"
-            )))
+            )));
         }
         None => {
             cache.ssm = vec![0.0; state_len];
@@ -797,6 +939,10 @@ fn ensure_ssm_cache(config: LinearAttentionConfig, cache: &mut LinearAttentionCa
     Ok(())
 }
 
+/// Normalise chaque tête à RMS unitaire (sans poids appris) : `x/√(E[x²]+ε)`.
+///
+/// Terme d'équation : `RMSNormUnit_tête` appliqué à q̃ et k̃ (ε fixe 1e-6, calqué
+/// sur la référence amont, indépendant du `rms_eps` de sortie).
 fn rms_norm_heads_unit(x: &Tensor, heads: usize, head_dim: usize, eps: f32) -> Result<Tensor> {
     let (seq, dim) = x.as_matrix()?;
     if heads == 0 || head_dim == 0 || dim != heads * head_dim {
@@ -821,6 +967,10 @@ fn rms_norm_heads_unit(x: &Tensor, heads: usize, head_dim: usize, eps: f32) -> R
     Tensor::from_vec(vec![seq, dim], out)
 }
 
+/// Normalise chaque tête par RMS puis applique le poids appris par colonne.
+///
+/// Terme d'équation : `y'_t = RMSNorm_tête(y_t, norm_weight, rms_eps)` — le même
+/// vecteur de poids (`[d_v]`) est partagé par toutes les têtes de valeur.
 fn rms_norm_heads(
     x: &Tensor,
     heads: usize,
@@ -842,7 +992,7 @@ fn rms_norm_heads(
             return Err(InferError::Dimension(format!(
                 "RMSNorm head weight attendu [{head_dim}] ou [1,{head_dim}], reçu {:?}",
                 weight.shape()
-            )))
+            )));
         }
     };
     let mut out = x.data().to_vec();
@@ -861,6 +1011,7 @@ fn rms_norm_heads(
     Tensor::from_vec(vec![seq, dim], out)
 }
 
+/// Extrait `len` colonnes contiguës à partir de `start` (découpe q̃‖k̃‖ṽ).
 fn slice_columns(x: &Tensor, start: usize, len: usize) -> Result<Tensor> {
     let (rows, cols) = x.as_matrix()?;
     let end = start
@@ -880,6 +1031,10 @@ fn slice_columns(x: &Tensor, start: usize, len: usize) -> Result<Tensor> {
     Tensor::from_vec(vec![rows, len], out)
 }
 
+/// Calcule le decay `g_t = exp(−exp(A_log)·softplus(a_t + dt_bias))` par tête.
+///
+/// Paramétrisation SSM (Mamba-like) : `dt = softplus(·) > 0` est le pas de temps
+/// appris, `exp(A_log) > 0` l'amplitude d'oubli — le produit garantit `g_t ∈ (0,1)`.
 fn compute_decay(
     a: &Tensor,
     a_log: &Tensor,
@@ -905,6 +1060,7 @@ fn compute_decay(
     Tensor::from_vec(vec![seq, num_value_heads], out)
 }
 
+/// Renvoie les données d'un vecteur `[len]` (ou `[1, len]`) après contrôle de shape.
 fn vector_data<'a>(tensor: &'a Tensor, len: usize, name: &str) -> Result<&'a [f32]> {
     match tensor.shape() {
         [n] if *n == len => Ok(tensor.data()),
@@ -915,6 +1071,8 @@ fn vector_data<'a>(tensor: &'a Tensor, len: usize, name: &str) -> Result<&'a [f3
     }
 }
 
+/// Valide le noyau conv1d `[conv_dim, K, 1]` ou `[conv_dim, 1, K]` (les deux
+/// layouts safetensors circulent) et renvoie `(canaux, K)`.
 fn conv_weight_shape(weight: &Tensor, conv_dim: usize, kernel: usize) -> Result<(usize, usize)> {
     match weight.shape() {
         [channels, k, one] if *channels == conv_dim && *k == kernel && *one == 1 => {
@@ -929,6 +1087,7 @@ fn conv_weight_shape(weight: &Tensor, conv_dim: usize, kernel: usize) -> Result<
     }
 }
 
+/// Lit `w[channel, kernel_index]` du noyau conv1d, quel que soit son layout.
 fn conv_weight_value(
     weight: &Tensor,
     channel: usize,
@@ -956,6 +1115,7 @@ fn conv_weight_value(
     }
 }
 
+/// Renvoie le scale post-norm : `d_k^(−1/2)` pour k, `d_k⁻¹` (« squared ») pour q.
 fn key_scale(head_dim: usize, squared: bool) -> f32 {
     let inv = (head_dim as f32).powf(-0.5);
     if squared {
@@ -965,10 +1125,12 @@ fn key_scale(head_dim: usize, squared: bool) -> f32 {
     }
 }
 
+/// Calcule `σ(x) = 1/(1+e⁻ˣ)` (gate d'écriture β).
 fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
 
+/// Calcule `softplus(x) = ln(1+eˣ)`, linéarisé au-delà de 20 (évite l'overflow).
 fn softplus(value: f32) -> f32 {
     if value > 20.0 {
         value
@@ -977,6 +1139,7 @@ fn softplus(value: f32) -> f32 {
     }
 }
 
+/// Indique si le pas résident Metal (états conservés GPU) est activé (défaut oui).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn linear_attn_resident_step_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -989,16 +1152,13 @@ fn linear_attn_resident_step_enabled() -> bool {
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
-fn linear_attn_fused_step_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_LINEAR_ATTN_FUSED", false))
-}
-
+/// Multiplie deux `usize` avec détection de débordement (erreur de shape sinon).
 fn checked_mul(left: usize, right: usize, label: &str) -> Result<usize> {
     left.checked_mul(right)
         .ok_or_else(|| InferError::Shape(format!("{label} trop grand")))
 }
 
+// NOTE: pub(crate) pour partager l'oracle GDN naïf avec `metal_backend/tests.rs`
+// (test direct du kernel chunké-GQA) — code compilé uniquement sous cfg(test).
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

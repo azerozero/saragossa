@@ -8,7 +8,7 @@
 //!   (C) M=4  : idem batch=4
 //! V_batch/D = t(B|C) / t(A). Régime DRAM froid (rotation 8 jeux de poids), bf16 scales.
 //!
-//! cargo run --release -p reti-rust-infer --example mtp_qmm_gate --features metal
+//! cargo run --release -p saragossa --example mtp_qmm_gate --features metal
 
 use std::time::Instant;
 

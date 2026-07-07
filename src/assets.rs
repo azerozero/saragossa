@@ -82,6 +82,15 @@ impl ModelAssets {
         self.tokenizer.encode(prompt)
     }
 
+    /// Encode un prompt brut en activant les tokens spéciaux (BOS) du modèle.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le tokenizer rejette le prompt.
+    pub fn encode_prompt_with_special(&self, prompt: &str) -> Result<Vec<u32>> {
+        self.tokenizer.encode_with_special_tokens(prompt)
+    }
+
     pub fn decode_tokens(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         self.tokenizer.decode(ids, skip_special_tokens)
     }
@@ -89,7 +98,16 @@ impl ModelAssets {
     #[must_use]
     pub fn stop_token_ids(&self) -> Vec<usize> {
         let mut ids = self.config.eos_token_ids.clone();
-        for token in ["<|endoftext|>", "<|im_end|>", "<|endofprompt|>"] {
+        // Marqueurs de fin de tour par famille : Qwen (ChatML) et Gemma
+        // (`<end_of_turn>`, absent des eos_token_ids du 1B). Les tokenizers
+        // des autres familles ne connaissent pas ces tokens → liste inchangée.
+        for token in [
+            "<|endoftext|>",
+            "<|im_end|>",
+            "<|endofprompt|>",
+            crate::chat_template::GEMMA_END_OF_TURN,
+            crate::chat_template::GEMMA4_END_OF_TURN,
+        ] {
             if let Some(id) = self
                 .tokenizer
                 .token_to_id(token)
@@ -280,6 +298,57 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(assets.stop_token_ids(), vec![2]);
+    }
+
+    #[test]
+    fn stop_token_ids_include_gemma_end_of_turn() {
+        let tmp = tempfile::tempdir().expect("invariant: tempdir");
+        // Config Gemma 1B-like : eos déclaré = [1] seulement, le tokenizer
+        // porte <end_of_turn> → la liste des stops doit l'ajouter.
+        write_config(
+            tmp.path(),
+            r#"{
+                "model_type":"gemma3_text",
+                "hidden_size":4,
+                "num_hidden_layers":1,
+                "num_attention_heads":2,
+                "num_key_value_heads":2,
+                "intermediate_size":8,
+                "rms_norm_eps":0.000001,
+                "rope_theta":10000.0,
+                "vocab_size":4,
+                "eos_token_id":1
+            }"#,
+        );
+        save_gemma_test_tokenizer(&tmp.path().join("tokenizer.json"));
+        write_safetensors(&tmp.path().join("model.safetensors"), "dummy.weight");
+
+        let assets = ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
+        assert_eq!(assets.stop_token_ids(), vec![1, 3]);
+    }
+
+    fn save_gemma_test_tokenizer(path: &Path) {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+        use tokenizers::Tokenizer;
+
+        let vocab_path = path.with_file_name("gemma-test-vocab.json");
+        std::fs::write(
+            &vocab_path,
+            r#"{"<unk>":0,"<eos>":1,"bonjour":2,"<end_of_turn>":3}"#,
+        )
+        .expect("invariant: écriture vocab tokenizer");
+        let vocab_path = vocab_path
+            .to_str()
+            .expect("invariant: chemin vocab UTF-8")
+            .to_string();
+        let model = WordLevel::from_file(&vocab_path, "<unk>".to_string())
+            .expect("invariant: modèle WordLevel valide");
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .save(path, true)
+            .expect("invariant: sauvegarde tokenizer");
     }
 
     #[test]

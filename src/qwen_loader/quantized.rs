@@ -278,7 +278,8 @@ pub(super) fn quantized_tensor_from_entry(
 }
 
 fn is_moe_expert_weight(target: &str) -> bool {
-    target.contains(".mlp.switch_mlp.") && target.ends_with(".weight")
+    (target.contains(".mlp.switch_mlp.") || target.contains(".experts.switch_glu."))
+        && target.ends_with(".weight")
 }
 
 fn quantized_expert_weights_from_parts(

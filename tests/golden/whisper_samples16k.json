@@ -1,0 +1,10 @@
+{
+  "dtype": "f32",
+  "shape": [
+    138880
+  ],
+  "tolerance": "input PCM16k (decode_wav_to_pcm16k)",
+  "source": "live_log_mel_matches_mlx_on_audio",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

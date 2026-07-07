@@ -1,0 +1,10 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    2
+  ],
+  "tolerance": "égalité exacte",
+  "source": "live_transcribe_matches_mlx_on_audio",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

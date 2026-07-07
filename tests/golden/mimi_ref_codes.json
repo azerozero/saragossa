@@ -1,0 +1,11 @@
+{
+  "dtype": "i32",
+  "shape": [
+    16,
+    109
+  ],
+  "tolerance": "mismatch_ratio<=0.015 (flat q*frames+t)",
+  "source": "live_mimi_ref_codes_match_mlxrs",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

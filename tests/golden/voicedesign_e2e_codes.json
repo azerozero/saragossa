@@ -1,0 +1,11 @@
+{
+  "dtype": "i32",
+  "shape": [
+    2,
+    16
+  ],
+  "tolerance": "codes[0]==, codes[1][..6]==",
+  "source": "live_voicedesign_e2e_audio_matches_mlx_oracle",
+  "mlx_sha": "be456e2",
+  "captured": "2026-06-13"
+}

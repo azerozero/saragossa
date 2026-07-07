@@ -65,6 +65,9 @@ impl DecodeResidentState {
             .and_then(|value| value.checked_add(kv_dim))
             .ok_or_else(|| InferError::Dimension("full-attn qkv concat déborde".to_string()))?;
         let qkv_proj_out = self.scratch().lease(qkv_proj_dim, GpuElement::F32)?;
+        let q_proj_out = self.scratch().lease(q_gate_dim, GpuElement::F32)?;
+        let k_raw = self.scratch().lease(kv_dim, GpuElement::F32)?;
+        let v_raw = self.scratch().lease(kv_dim, GpuElement::F32)?;
         let q_raw = self.scratch().lease(q_dim, GpuElement::F32)?;
         let gate = self.scratch().lease(q_dim, GpuElement::F32)?;
         let q_roped = self.scratch().lease(q_dim, GpuElement::F32)?;
@@ -77,23 +80,25 @@ impl DecodeResidentState {
         let post_normed = self.scratch().lease(hidden, GpuElement::F32)?;
 
         // Projections concaténées Q (gated → 2·q_dim), K, V.
-        let qkv_split_fused = executor
-            .encode_full_attn_qkv_split_rms_buffers(
-                encoder,
-                layer_in,
-                weights.input_norm,
-                dims.eps,
-                hidden,
-                weights.qkv_proj,
-                qkv_proj_out.tensor().buffer(),
-                q_raw.tensor().buffer(),
-                gate.tensor().buffer(),
-                dims.q_heads,
-                dims.head_dim,
-            )?
-            .is_some();
-        if !qkv_split_fused {
-            // input rms_norm
+        let mut qkv_concat_used = false;
+        if let Some(qkv_proj) = weights.qkv_proj {
+            qkv_concat_used = executor
+                .encode_full_attn_qkv_split_rms_buffers(
+                    encoder,
+                    layer_in,
+                    weights.input_norm,
+                    dims.eps,
+                    hidden,
+                    qkv_proj,
+                    qkv_proj_out.tensor().buffer(),
+                    q_raw.tensor().buffer(),
+                    gate.tensor().buffer(),
+                    dims.q_heads,
+                    dims.head_dim,
+                )?
+                .is_some();
+        }
+        if !qkv_concat_used {
             executor.encode_rms_norm_rows(
                 encoder,
                 layer_in,
@@ -103,36 +108,73 @@ impl DecodeResidentState {
                 hidden,
                 dims.eps,
             )?;
-            let qkv_epilogue_fused = executor
-                .encode_full_attn_qkv_split_buffers(
-                    encoder,
-                    normed.tensor().buffer(),
-                    hidden,
-                    weights.qkv_proj,
-                    qkv_proj_out.tensor().buffer(),
-                    q_raw.tensor().buffer(),
-                    gate.tensor().buffer(),
-                    dims.q_heads,
-                    dims.head_dim,
-                )?
-                .is_some();
-            if !qkv_epilogue_fused {
+            if let Some(qkv_proj) = weights.qkv_proj {
+                qkv_concat_used = executor
+                    .encode_full_attn_qkv_split_buffers(
+                        encoder,
+                        normed.tensor().buffer(),
+                        hidden,
+                        qkv_proj,
+                        qkv_proj_out.tensor().buffer(),
+                        q_raw.tensor().buffer(),
+                        gate.tensor().buffer(),
+                        dims.q_heads,
+                        dims.head_dim,
+                    )?
+                    .is_some();
+                if !qkv_concat_used {
+                    executor.encode_matmul_weight_buffers(
+                        encoder,
+                        normed.tensor().buffer(),
+                        1,
+                        hidden,
+                        qkv_proj,
+                        qkv_proj_out.tensor().buffer(),
+                        false,
+                    )?;
+                    self.encode_split_q_gate_with_offset(
+                        encoder,
+                        qkv_proj_out.tensor().buffer(),
+                        0,
+                        q_raw.tensor().buffer(),
+                        gate.tensor().buffer(),
+                        dims.q_heads,
+                        dims.head_dim,
+                    )?;
+                    qkv_concat_used = true;
+                }
+            }
+            if !qkv_concat_used {
                 executor.encode_matmul_weight_buffers(
                     encoder,
                     normed.tensor().buffer(),
                     1,
                     hidden,
-                    weights.qkv_proj,
-                    qkv_proj_out.tensor().buffer(),
+                    weights.q_proj,
+                    q_proj_out.tensor().buffer(),
                     false,
                 )?;
-            }
-            if !qkv_epilogue_fused {
-                // désinterleave le gate AVANT le RoPE (attn_output_gate=true)
-                self.encode_split_q_gate_with_offset(
+                executor.encode_matmul_weight_buffers(
                     encoder,
-                    qkv_proj_out.tensor().buffer(),
-                    0,
+                    normed.tensor().buffer(),
+                    1,
+                    hidden,
+                    weights.k_proj,
+                    k_raw.tensor().buffer(),
+                    false,
+                )?;
+                executor.encode_matmul_weight_buffers(
+                    encoder,
+                    normed.tensor().buffer(),
+                    1,
+                    hidden,
+                    weights.v_proj,
+                    v_raw.tensor().buffer(),
+                    false,
+                )?;
+                self.encode_split_q_gate(
+                    encoder,
+                    q_proj_out.tensor().buffer(),
                     q_raw.tensor().buffer(),
                     gate.tensor().buffer(),
                     dims.q_heads,
@@ -140,13 +182,6 @@ impl DecodeResidentState {
                 )?;
             }
         }
-        let k_offset = byte_offset_f32(q_gate_dim, "full-attn k offset")?;
-        let v_offset = byte_offset_f32(
-            q_gate_dim
-                .checked_add(kv_dim)
-                .ok_or_else(|| InferError::Dimension("full-attn v offset déborde".to_string()))?,
-            "full-attn v offset",
-        )?;
         // norm + RoPE à la POSITION du token (single-query)
         self.encode_rms_norm_rope_decode_with_offset(
             encoder,
@@ -161,27 +196,49 @@ impl DecodeResidentState {
             dims.eps,
             dims.theta,
         )?;
-        self.encode_rms_norm_rope_decode_with_offset(
-            encoder,
-            qkv_proj_out.tensor().buffer(),
-            k_offset,
-            weights.k_norm,
-            k_roped.tensor().buffer(),
-            dims.kv_heads,
-            dims.head_dim,
-            dims.rope_dims,
-            dims.position,
-            dims.eps,
-            dims.theta,
-        )?;
-        // append KV device (K roped, V brut) à `len`, puis attention single-query (R3)
-        kv.encode_append_kv_with_offsets(
-            encoder,
-            k_roped.tensor().buffer(),
-            0,
-            qkv_proj_out.tensor().buffer(),
-            v_offset,
-        )?;
+        if qkv_concat_used {
+            let k_offset = byte_offset_f32(q_gate_dim, "full-attn k offset")?;
+            let v_offset = byte_offset_f32(
+                q_gate_dim.checked_add(kv_dim).ok_or_else(|| {
+                    InferError::Dimension("full-attn v offset déborde".to_string())
+                })?,
+                "full-attn v offset",
+            )?;
+            self.encode_rms_norm_rope_decode_with_offset(
+                encoder,
+                qkv_proj_out.tensor().buffer(),
+                k_offset,
+                weights.k_norm,
+                k_roped.tensor().buffer(),
+                dims.kv_heads,
+                dims.head_dim,
+                dims.rope_dims,
+                dims.position,
+                dims.eps,
+                dims.theta,
+            )?;
+            kv.encode_append_kv_with_offsets(
+                encoder,
+                k_roped.tensor().buffer(),
+                0,
+                qkv_proj_out.tensor().buffer(),
+                v_offset,
+            )?;
+        } else {
+            self.encode_rms_norm_rope_decode(
+                encoder,
+                k_raw.tensor().buffer(),
+                weights.k_norm,
+                k_roped.tensor().buffer(),
+                dims.kv_heads,
+                dims.head_dim,
+                dims.rope_dims,
+                dims.position,
+                dims.eps,
+                dims.theta,
+            )?;
+            kv.encode_append_kv(encoder, k_roped.tensor().buffer(), v_raw.tensor().buffer())?;
+        }
         kv.encode_attention_decode(
             encoder,
             q_roped.tensor().buffer(),
@@ -248,6 +305,11 @@ impl DecodeResidentState {
     ///
     /// Le préfixe attention/KV est identique au chemin shared+routed ; seul le
     /// tail MoE appelle le sous-ensemble routed sans shared-expert.
+    ///
+    /// Contrairement aux variantes shared et dense, ce chemin ne porte pas les
+    /// poids Q/K/V séparés : le setup routed-only échoue avant l'encodage si le
+    /// QKV concaténé n'est pas disponible, puis le decode retombe sur le chemin
+    /// per-op global.
     #[expect(
         clippy::too_many_arguments,
         reason = "data flow d'une couche : exécuteur + KV + poids + dims + ping-pong"
@@ -824,11 +886,6 @@ impl DecodeResidentState {
                 executor, encoder, owned, kv, weights, dims, layer_in, layer_out,
             );
         }
-        let Some(qkv_proj) = weights.qkv_proj else {
-            return Err(InferError::Config(
-                "qkv concat requis pour full-attn dense batché".to_string(),
-            ));
-        };
         let hidden = dims.hidden;
         let q_dim = dims.q_heads.checked_mul(dims.head_dim).ok_or_else(|| {
             InferError::Dimension("full-attn dense rows q_dim déborde".to_string())
@@ -860,6 +917,12 @@ impl DecodeResidentState {
         let batch_qkv = rows
             .checked_mul(qkv_proj_dim)
             .ok_or_else(|| InferError::Dimension("full-attn dense rows qkv déborde".to_string()))?;
+        let batch_q_proj = rows.checked_mul(q_proj_dim).ok_or_else(|| {
+            InferError::Dimension("full-attn dense rows q_proj déborde".to_string())
+        })?;
+        let batch_kv = rows
+            .checked_mul(kv_dim)
+            .ok_or_else(|| InferError::Dimension("full-attn dense rows kv déborde".to_string()))?;
         let batch_q = rows
             .checked_mul(q_dim)
             .ok_or_else(|| InferError::Dimension("full-attn dense rows q déborde".to_string()))?;
@@ -869,13 +932,16 @@ impl DecodeResidentState {
 
         let normed = self.scratch().lease(batch_hidden, GpuElement::F32)?;
         let qkv_proj_out = self.scratch().lease(batch_qkv, GpuElement::F32)?;
-        let q_raw = self.scratch().lease(q_dim, GpuElement::F32)?;
-        let gate_row = self.scratch().lease(q_dim, GpuElement::F32)?;
+        let q_proj_out = self.scratch().lease(batch_q_proj, GpuElement::F32)?;
+        let k_proj_out = self.scratch().lease(batch_kv, GpuElement::F32)?;
+        let v_proj_out = self.scratch().lease(batch_kv, GpuElement::F32)?;
+        let q_raw = self.scratch().lease(batch_q, GpuElement::F32)?;
+        let gate = self.scratch().lease(batch_q, GpuElement::F32)?;
         let q_roped = self.scratch().lease(q_dim, GpuElement::F32)?;
         let k_roped = self.scratch().lease(kv_dim, GpuElement::F32)?;
         let scores = self.scratch().lease(score_cells, GpuElement::F32)?;
-        let ctx = self.scratch().lease(q_dim, GpuElement::F32)?;
-        let gated_ctx_row = self.scratch().lease(q_dim, GpuElement::F32)?;
+        let ctx_row = self.scratch().lease(q_dim, GpuElement::F32)?;
+        let ctx = self.scratch().lease(batch_q, GpuElement::F32)?;
         let gated_ctx = self.scratch().lease(batch_q, GpuElement::F32)?;
         let o_out = self.scratch().lease(batch_hidden, GpuElement::F32)?;
         let summed = self.scratch().lease(batch_hidden, GpuElement::F32)?;
@@ -890,43 +956,98 @@ impl DecodeResidentState {
             hidden,
             dims.eps,
         )?;
-        let out_dim = executor.encode_matmul_weight_buffers(
-            encoder,
-            normed.tensor().buffer(),
-            rows,
-            hidden,
-            qkv_proj,
-            qkv_proj_out.tensor().buffer(),
-            false,
-        )?;
-        if out_dim != qkv_proj_dim {
-            return Err(InferError::Dimension(format!(
-                "full-attn dense rows qkv sort {out_dim}, attendu {qkv_proj_dim}"
-            )));
+        if let Some(qkv_proj) = weights.qkv_proj {
+            let out_dim = executor.encode_matmul_weight_buffers(
+                encoder,
+                normed.tensor().buffer(),
+                rows,
+                hidden,
+                qkv_proj,
+                qkv_proj_out.tensor().buffer(),
+                false,
+            )?;
+            if out_dim != qkv_proj_dim {
+                return Err(InferError::Dimension(format!(
+                    "full-attn dense rows qkv sort {out_dim}, attendu {qkv_proj_dim}"
+                )));
+            }
+        } else {
+            let q_out_dim = executor.encode_matmul_weight_buffers(
+                encoder,
+                normed.tensor().buffer(),
+                rows,
+                hidden,
+                weights.q_proj,
+                q_proj_out.tensor().buffer(),
+                false,
+            )?;
+            if q_out_dim != q_proj_dim {
+                return Err(InferError::Dimension(format!(
+                    "full-attn dense rows q_proj sort {q_out_dim}, attendu {q_proj_dim}"
+                )));
+            }
+            let k_out_dim = executor.encode_matmul_weight_buffers(
+                encoder,
+                normed.tensor().buffer(),
+                rows,
+                hidden,
+                weights.k_proj,
+                k_proj_out.tensor().buffer(),
+                false,
+            )?;
+            if k_out_dim != kv_dim {
+                return Err(InferError::Dimension(format!(
+                    "full-attn dense rows k_proj sort {k_out_dim}, attendu {kv_dim}"
+                )));
+            }
+            let v_out_dim = executor.encode_matmul_weight_buffers(
+                encoder,
+                normed.tensor().buffer(),
+                rows,
+                hidden,
+                weights.v_proj,
+                v_proj_out.tensor().buffer(),
+                false,
+            )?;
+            if v_out_dim != kv_dim {
+                return Err(InferError::Dimension(format!(
+                    "full-attn dense rows v_proj sort {v_out_dim}, attendu {kv_dim}"
+                )));
+            }
         }
+
+        executor.encode_split_q_gate_rows_with_stride(
+            encoder,
+            if weights.qkv_proj.is_some() {
+                qkv_proj_out.tensor().buffer()
+            } else {
+                q_proj_out.tensor().buffer()
+            },
+            q_raw.tensor().buffer(),
+            gate.tensor().buffer(),
+            rows,
+            dims.q_heads,
+            dims.head_dim,
+            if weights.qkv_proj.is_some() {
+                qkv_proj_dim
+            } else {
+                q_proj_dim
+            },
+        )?;
 
         let k_base = q_proj_dim;
         let v_base = q_proj_dim.checked_add(kv_dim).ok_or_else(|| {
             InferError::Dimension("full-attn dense rows v base déborde".to_string())
         })?;
         for row in 0..rows {
-            let qkv_row = row.checked_mul(qkv_proj_dim).ok_or_else(|| {
-                InferError::Dimension("full-attn dense rows offset déborde".to_string())
-            })?;
-            let qkv_offset = byte_offset_f32(qkv_row, "full-attn dense rows q offset")?;
-            self.encode_split_q_gate_with_offset(
-                encoder,
-                qkv_proj_out.tensor().buffer(),
-                qkv_offset,
-                q_raw.tensor().buffer(),
-                gate_row.tensor().buffer(),
-                dims.q_heads,
-                dims.head_dim,
-            )?;
+            let q_row_offset = row
+                .checked_mul(q_dim)
+                .ok_or_else(|| InferError::Dimension("full-attn dense q row déborde".to_string()))
+                .and_then(|offset| byte_offset_f32(offset, "full-attn dense q row offset"))?;
             self.encode_rms_norm_rope_decode_with_offset(
                 encoder,
                 q_raw.tensor().buffer(),
-                0,
+                q_row_offset,
                 weights.q_norm,
                 q_roped.tensor().buffer(),
                 dims.q_heads,
@@ -936,15 +1057,29 @@ impl DecodeResidentState {
                 dims.eps,
                 dims.theta,
             )?;
-            let k_offset = byte_offset_f32(
-                qkv_row.checked_add(k_base).ok_or_else(|| {
-                    InferError::Dimension("full-attn dense rows k offset déborde".to_string())
-                })?,
-                "full-attn dense rows k offset",
-            )?;
+            let k_offset = if weights.qkv_proj.is_some() {
+                let qkv_row = row.checked_mul(qkv_proj_dim).ok_or_else(|| {
+                    InferError::Dimension("full-attn dense rows offset déborde".to_string())
+                })?;
+                byte_offset_f32(
+                    qkv_row.checked_add(k_base).ok_or_else(|| {
+                        InferError::Dimension("full-attn dense rows k offset déborde".to_string())
+                    })?,
+                    "full-attn dense rows k offset",
+                )?
+            } else {
+                let k_row = row.checked_mul(kv_dim).ok_or_else(|| {
+                    InferError::Dimension("full-attn dense rows split k offset déborde".to_string())
+                })?;
+                byte_offset_f32(k_row, "full-attn dense rows split k offset")?
+            };
             self.encode_rms_norm_rope_decode_with_offset(
                 encoder,
-                qkv_proj_out.tensor().buffer(),
+                if weights.qkv_proj.is_some() {
+                    qkv_proj_out.tensor().buffer()
+                } else {
+                    k_proj_out.tensor().buffer()
+                },
                 k_offset,
                 weights.k_norm,
                 k_roped.tensor().buffer(),
@@ -955,43 +1090,63 @@ impl DecodeResidentState {
                 dims.eps,
                 dims.theta,
             )?;
-            let v_offset = byte_offset_f32(
-                qkv_row.checked_add(v_base).ok_or_else(|| {
-                    InferError::Dimension("full-attn dense rows v offset déborde".to_string())
-                })?,
-                "full-attn dense rows v offset",
-            )?;
+            let v_offset = if weights.qkv_proj.is_some() {
+                let qkv_row = row.checked_mul(qkv_proj_dim).ok_or_else(|| {
+                    InferError::Dimension("full-attn dense rows offset déborde".to_string())
+                })?;
+                byte_offset_f32(
+                    qkv_row.checked_add(v_base).ok_or_else(|| {
+                        InferError::Dimension("full-attn dense rows v offset déborde".to_string())
+                    })?,
+                    "full-attn dense rows v offset",
+                )?
+            } else {
+                let v_row = row.checked_mul(kv_dim).ok_or_else(|| {
+                    InferError::Dimension("full-attn dense rows split v offset déborde".to_string())
+                })?;
+                byte_offset_f32(v_row, "full-attn dense rows split v offset")?
+            };
             kv.encode_append_kv_with_offsets(
                 encoder,
                 k_roped.tensor().buffer(),
                 0,
-                qkv_proj_out.tensor().buffer(),
+                if weights.qkv_proj.is_some() {
+                    qkv_proj_out.tensor().buffer()
+                } else {
+                    v_proj_out.tensor().buffer()
+                },
                 v_offset,
             )?;
             kv.encode_attention_decode(
                 encoder,
                 q_roped.tensor().buffer(),
                 scores.tensor().buffer(),
-                ctx.tensor().buffer(),
+                ctx_row.tensor().buffer(),
             )?;
-            self.encode_attn_gate(
-                encoder,
-                ctx.tensor().buffer(),
-                gate_row.tensor().buffer(),
-                gated_ctx_row.tensor().buffer(),
-                q_dim,
-            )?;
-            let gated_offset =
-                byte_offset_f32(row * q_dim, "full-attn dense rows gated ctx offset")?;
+            let gated_offset = row
+                .checked_mul(q_dim)
+                .ok_or_else(|| {
+                    InferError::Dimension("full-attn dense rows gated ctx déborde".to_string())
+                })
+                .and_then(|offset| {
+                    byte_offset_f32(offset, "full-attn dense rows gated ctx offset")
+                })?;
             executor.encode_copy_with_offsets(
                 encoder,
-                gated_ctx_row.tensor().buffer(),
+                ctx_row.tensor().buffer(),
                 0,
-                gated_ctx.tensor().buffer(),
+                ctx.tensor().buffer(),
                 gated_offset,
                 q_dim,
             )?;
         }
+        executor.encode_attn_gate_rows(
+            encoder,
+            ctx.tensor().buffer(),
+            gate.tensor().buffer(),
+            gated_ctx.tensor().buffer(),
+            batch_q,
+        )?;
         let o_dim = executor.encode_matmul_weight_buffers(
             encoder,
             gated_ctx.tensor().buffer(),
@@ -1072,7 +1227,7 @@ impl DecodeResidentState {
         let summed = self.scratch().lease(hidden, GpuElement::F32)?;
         let post_normed = self.scratch().lease(hidden, GpuElement::F32)?;
 
-        executor.encode_linear_attn_resident_buffers(
+        executor.encode_linear_attn_resident_dense_buffers(
             encoder,
             layer_in,
             Some((weights.input_norm, eps)),
@@ -1104,6 +1259,80 @@ impl DecodeResidentState {
             weights.top_k,
         )?;
         Ok(())
+    }
+
+    /// Encode une couche linear-attn MoE sur `rows` positions contiguës.
+    ///
+    /// Les projections linear-attn sont batchées et le scan conv/SSM conserve
+    /// l'ordre temporel. Le tail MoE shared utilise un routeur/top-k par ligne
+    /// puis des gather sur `rows * top_k` slots.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "data flow batché d'une couche linear-attn MoE résidente"
+    )]
+    pub(crate) fn encode_linear_attn_layer_rows(
+        &self,
+        executor: &MetalExecutor,
+        encoder: &ComputeCommandEncoderRef,
+        owned: &mut Vec<Buffer>,
+        state: &LinearAttentionMetalState,
+        weights: LinearAttnLayerWeights<'_>,
+        spec: LinearAttentionStepSpec,
+        res_dims: LinearAttnResidentDims,
+        rows: usize,
+        hidden: usize,
+        eps: f32,
+        layer_in: &BufferRef,
+        layer_out: &BufferRef,
+        captures: Option<&[LinearAttentionMetalState]>,
+    ) -> Result<()> {
+        if rows == 1 && captures.is_none() {
+            return self.encode_linear_attn_layer(
+                executor, encoder, owned, state, weights, spec, res_dims, hidden, eps, layer_in,
+                layer_out,
+            );
+        }
+        let elements = rows.checked_mul(hidden).ok_or_else(|| {
+            InferError::Dimension("linear-attn MoE rows hidden déborde".to_string())
+        })?;
+        let attn_out = self.scratch().lease(elements, GpuElement::F32)?;
+        let summed = self.scratch().lease(elements, GpuElement::F32)?;
+        let post_normed = self.scratch().lease(elements, GpuElement::F32)?;
+
+        executor.encode_linear_attn_resident_dense_buffers_rows(
+            encoder,
+            layer_in,
+            Some((weights.input_norm, eps)),
+            attn_out.tensor().buffer(),
+            rows,
+            weights.linear,
+            state,
+            captures,
+            spec,
+            res_dims,
+        )?;
+        executor.encode_add_rms_norm_rows(
+            encoder,
+            layer_in,
+            attn_out.tensor().buffer(),
+            weights.post_norm,
+            summed.tensor().buffer(),
+            post_normed.tensor().buffer(),
+            rows,
+            hidden,
+            eps,
+        )?;
+        executor.encode_moe_shared_buffers_rows(
+            encoder,
+            owned,
+            post_normed.tensor().buffer(),
+            Some(summed.tensor().buffer()),
+            layer_out,
+            rows,
+            hidden,
+            weights.moe,
+            weights.top_k,
+        )
     }
 
     /// Encode UNE couche linear-attn DENSE (decode résident 1c) dans l'encoder
@@ -1510,10 +1739,10 @@ impl DecodeResidentState {
                 "dense rows down sort {down_dim}, attendu {hidden}"
             )));
         }
-        executor.encode_copy(encoder, summed, layer_out, hidden_elements)?;
-        executor.encode_accumulate_scaled(
+        executor.encode_add_scaled(
             encoder,
             owned,
+            summed,
             down.tensor().buffer(),
             layer_out,
             1.0,

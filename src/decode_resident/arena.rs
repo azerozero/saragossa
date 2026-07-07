@@ -6,17 +6,19 @@ use super::kernels::{
 use super::utils::{write_f32_at, write_u32_at};
 use super::*;
 
-/// Type d'élément d'un buffer résident (4 octets dans les deux cas).
+/// Type d'élément d'un buffer résident.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GpuElement {
+    Bf16,
     F32,
     U32,
 }
 
 impl GpuElement {
     /// Renvoie la taille d'un élément en octets.
-    const fn byte_size(self) -> usize {
+    pub(crate) const fn byte_size(self) -> usize {
         match self {
+            GpuElement::Bf16 => 2,
             GpuElement::F32 | GpuElement::U32 => 4,
         }
     }
@@ -245,6 +247,51 @@ impl DecodeResidentState {
             ATTENTION_DECODE_KERNEL,
             "attention_decode_flash_d256_f32",
         )?;
+        let attention_decode_2pass_1 = compile_kernel(
+            &device,
+            ATTENTION_DECODE_KERNEL,
+            "attention_decode_2pass_1_d256_f32",
+        )?;
+        let attention_decode_2pass_1_d128 = compile_kernel(
+            &device,
+            ATTENTION_DECODE_KERNEL,
+            "attention_decode_2pass_1_d128_f32",
+        )?;
+        let attention_decode_naive_bf16 = compile_kernel(
+            &device,
+            ATTENTION_DECODE_KERNEL,
+            "attention_decode_naive_bf16",
+        )?;
+        let attention_decode_flash_bf16 = compile_kernel(
+            &device,
+            ATTENTION_DECODE_KERNEL,
+            "attention_decode_flash_bf16",
+        )?;
+        let attention_decode_flash_d256_bf16 = compile_kernel(
+            &device,
+            ATTENTION_DECODE_KERNEL,
+            "attention_decode_flash_d256_bf16",
+        )?;
+        let attention_decode_2pass_1_bf16 = compile_kernel(
+            &device,
+            ATTENTION_DECODE_KERNEL,
+            "attention_decode_2pass_1_d256_bf16",
+        )?;
+        let attention_decode_2pass_1_d128_bf16 = compile_kernel(
+            &device,
+            ATTENTION_DECODE_KERNEL,
+            "attention_decode_2pass_1_d128_bf16",
+        )?;
+        let attention_decode_2pass_2 = compile_kernel(
+            &device,
+            ATTENTION_DECODE_KERNEL,
+            "attention_decode_2pass_2_d256_f32",
+        )?;
+        let attention_decode_2pass_2_d128 = compile_kernel(
+            &device,
+            ATTENTION_DECODE_KERNEL,
+            "attention_decode_2pass_2_d128_f32",
+        )?;
         let split_q_gate_kernel = compile_kernel(&device, GATE_KERNELS, "split_q_gate_f32")?;
         let attn_gate_kernel = compile_kernel(&device, GATE_KERNELS, "attn_gate_f32")?;
         let rope_decode_kernel = compile_kernel(
@@ -253,6 +300,8 @@ impl DecodeResidentState {
             "rms_norm_rope_heads_decode_f32",
         )?;
         let copy_at_kernel = compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_f32")?;
+        let copy_at_f32_to_bf16_kernel =
+            compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_f32_to_bf16")?;
         let timer = GpuSectionTimer::try_new();
         Ok(Self {
             device,
@@ -263,17 +312,39 @@ impl DecodeResidentState {
             attention_decode_naive,
             attention_decode_flash,
             attention_decode_flash_d256,
+            attention_decode_2pass_1,
+            attention_decode_2pass_1_d128,
+            attention_decode_naive_bf16,
+            attention_decode_flash_bf16,
+            attention_decode_flash_d256_bf16,
+            attention_decode_2pass_1_bf16,
+            attention_decode_2pass_1_d128_bf16,
+            attention_decode_2pass_2,
+            attention_decode_2pass_2_d128,
             split_q_gate_kernel,
             attn_gate_kernel,
             rope_decode_kernel,
             copy_at_kernel,
+            copy_at_f32_to_bf16_kernel,
             timer,
+            scratch_namespace: 0,
         })
     }
 
     /// Renvoie le timer per-section GPU s'il est actif (`RETI_RUST_GPU_COUNTERS`).
     pub(crate) fn gpu_timer(&self) -> Option<&GpuSectionTimer> {
         self.timer.as_ref()
+    }
+
+    /// Affecte le slot de flux (light-batch) : namespace du scratch label-keyed
+    /// de l'exécuteur partagé. `0` (défaut) = comportement mono-flux historique.
+    pub(crate) fn set_scratch_namespace(&mut self, namespace: u64) {
+        self.scratch_namespace = namespace;
+    }
+
+    /// Renvoie le namespace scratch de ce decode (slot de flux light-batch).
+    pub(crate) fn scratch_namespace(&self) -> u64 {
+        self.scratch_namespace
     }
 
     /// Alloue un buffer **persistant** distinct, gardé vivant jusqu'au drop de
