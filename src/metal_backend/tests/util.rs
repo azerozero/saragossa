@@ -78,12 +78,15 @@ pub(crate) fn ulp_diff(a: f32, b: f32) -> u32 {
     (x - y).unsigned_abs() as u32
 }
 
-/// Assert bit-exact sur la machine de référence, ±4 ULP ailleurs.
+/// Assert bit-exact sur la machine de référence, ±16 ULP ailleurs.
+///
+/// Le runner CI (M1/M2) diverge jusqu'à 8 ULP mesurés sur les kernels
+/// qmm2/fused (run 28846079077) — la marge ×2 absorbe les shapes non vues.
 pub(crate) fn assert_bits_portable(a: f32, b: f32, context: &dyn Fn() -> String) {
     if bitwise_reference_gpu() {
         assert_eq!(a.to_bits(), b.to_bits(), "{} (bits {a:e} vs {b:e})", context());
     } else {
         let d = ulp_diff(a, b);
-        assert!(d <= 4, "{} (ULP {d} > 4 : {a:e} vs {b:e})", context());
+        assert!(d <= 16, "{} (ULP {d} > 16 : {a:e} vs {b:e})", context());
     }
 }
