@@ -78,15 +78,28 @@ pub(crate) fn ulp_diff(a: f32, b: f32) -> u32 {
     (x - y).unsigned_abs() as u32
 }
 
-/// Assert bit-exact sur la machine de référence, ±16 ULP ailleurs.
+/// Assert bit-exact sur la machine de référence, tolérance relative ailleurs.
 ///
-/// Le runner CI (M1/M2) diverge jusqu'à 8 ULP mesurés sur les kernels
-/// qmm2/fused (run 28846079077) — la marge ×2 absorbe les shapes non vues.
+/// Sur M5 (machine des campagnes) les variantes qmm2/qmv/fused sont PROUVÉES
+/// bit-identiques → égalité de bits stricte. Ailleurs (runners CI M1/M2), deux
+/// kernels aux ordres de réduction différents divergent légitimement : jusqu'à
+/// 48 ULP mesurés sur qmm2/rms/shared-expert (run 28847172905), soit ~3,6e-6
+/// en erreur relative — cohérent avec l'accumulation flottante sur des
+/// réductions K jusqu'à ~9216 (≈ √K·ε_f32). L'ULP n'échelonne ni avec la
+/// magnitude ni avec K ; on borne donc en RELATIF (5e-5, ~14× la marge
+/// observée) + un plancher absolu pour les valeurs proches de zéro. Un vrai
+/// bug kernel dévie de plusieurs ordres de grandeur au-dessus.
 pub(crate) fn assert_bits_portable(a: f32, b: f32, context: &dyn Fn() -> String) {
     if bitwise_reference_gpu() {
         assert_eq!(a.to_bits(), b.to_bits(), "{} (bits {a:e} vs {b:e})", context());
     } else {
+        let tol = 5.0e-5 * a.abs().max(b.abs()) + 2.0e-6;
         let d = ulp_diff(a, b);
-        assert!(d <= 16, "{} (ULP {d} > 16 : {a:e} vs {b:e})", context());
+        assert!(
+            (a - b).abs() <= tol,
+            "{} (écart {:e} > tol {tol:e} ; ULP {d} : {a:e} vs {b:e})",
+            context(),
+            (a - b).abs()
+        );
     }
 }
