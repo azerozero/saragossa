@@ -1,0 +1,29 @@
+name: Auto-update PR branches on main push
+
+# Met à jour les PR BEHIND qui ont l'auto-merge activé, pour que la chaîne
+# CI verte → merge reste automatique. Pattern repris de grob.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-prs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Update BEHIND PRs with auto-merge
+        run: |
+          gh pr list --repo "$REPO" --base main --state open --json number,autoMergeRequest,mergeStateStatus \
+            --jq '.[] | select(.autoMergeRequest != null) | select(.mergeStateStatus=="BEHIND") | .number' \
+            | while read -r pr; do
+                echo "Updating PR #${pr}"
+                gh pr update-branch --repo "$REPO" "${pr}" || echo "Skip PR #${pr}"
+              done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}

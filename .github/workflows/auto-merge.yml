@@ -1,0 +1,35 @@
+name: Auto-merge on green CI
+
+# Équivalent des required-checks + auto-merge (indisponibles sur repo privé
+# plan gratuit) : quand le workflow Rust réussit, merge les PR ouvertes
+# étiquetées `automerge` dont la tête correspond au run. Merge commit (pas de
+# squash) : l'historique linéaire des branches de campagne est préservé.
+
+on:
+  workflow_run:
+    workflows: [Rust]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Merge labeled PRs matching the green head
+        run: |
+          gh pr list --repo "$REPO" --state open --label automerge \
+            --json number,headRefOid \
+            --jq --arg sha "$HEAD_SHA" '.[] | select(.headRefOid==$sha) | .number' \
+            | while read -r pr; do
+                echo "Merging PR #${pr} (head $HEAD_SHA, CI verte)"
+                gh pr merge --repo "$REPO" --merge "${pr}" || echo "Skip PR #${pr}"
+              done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
