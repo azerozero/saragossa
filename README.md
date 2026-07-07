@@ -1,21 +1,21 @@
 # Saragossa
 
-**A fast, pure-Rust LLM inference engine for Apple Silicon — and it beats Apple's own `mlx_lm` on Mixture-of-Experts models.**
+**A fast, pure-Rust LLM inference engine for Apple Silicon — ahead of Apple's own `mlx_lm` on the flagship MoE model.**
 
 Saragossa is a from-scratch transformer decoder written in Rust on top of `metal-rs`. No MLX, no PyTorch, no Python — a single self-contained crate that compiles its Metal kernels at runtime. It was extracted from a real-time local voice assistant, where decode latency is everything.
 
 ## Why
 
-On Apple Silicon, `mlx_lm` (Apple's MLX-based generation library) is the reference. Saragossa **matches or beats it** on the models that matter, measured cold (60 s cooldown, decode tok/s):
+On Apple Silicon, `mlx_lm` (Apple's MLX-based generation library) is the reference. Same-night A/B, identical protocol both sides — M5 Max, 1k-token prompt, 512 generated tokens, greedy, GPU-serialized runs, `mlx` 0.31.2 / `mlx_lm` 0.31.3 (decode tok/s, 2026-07-07):
 
 | Model | Saragossa | `mlx_lm` | Verdict |
 |---|---|---|---|
-| **Qwen3.6-35B-A3B** 4-bit (MoE, default) | **145.7 tok/s** | ~110 | **+13–30 %** |
-| **Qwen3.6-35B-A3B** 8-bit (oQ8) @32k ctx | 89.8 tok/s | 88.1 | ahead at long context (bf16 KV) |
-| **Qwen3.6-30B-A3B** (MoE) | ~133 tok/s | ~119 | **+11.5 %** |
-| **Qwen3.6-27B-OptiQ** (dense) | 24.3 tok/s | 24.9 | parity (0.97×) |
+| [Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit) (MoE, default) | **145.7** | 136.1 | **+7 %** |
+| Qwen3.6-35B-A3B OptiQ 8-bit (local quant of [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)) @32k ctx, sampled T>0 | **89.8** | 88.1 | ahead at long context (bf16 KV; measured 2026-07-03) |
+| [Qwen3.6-27B-OptiQ-4bit](https://huggingface.co/mlx-community/Qwen3.6-27B-OptiQ-4bit) (dense) | 27.1 | 26.8 | parity |
+| [Qwen3-30B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3-30B-A3B-4bit) (MoE) | 112.6 | 130.5 | **−14 % — under investigation** (measured +11.5 % ahead in June; suspected routing/default drift on our side or `mlx_lm` progress) |
 
-*(35B figures re-measured 2026-07-06 on M5 Max, greedy @1k context, 512-token window.)*
+Numbers move with every engine and `mlx_lm` release — the protocol above is reproducible with `--prompt-tokens 1024 --max-tokens 512 --temperature 0 --metrics` vs `mlx_lm.benchmark -p 1024 -g 512`.
 
 Output quality holds: on the 35B it produces fluent, literary prose where `mlx_lm` often drifts into meta-planning.
 
