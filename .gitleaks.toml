@@ -1,0 +1,10 @@
+# Allowlist: gitleaks' generic-api-key heuristic flags "key_head_dim=128" and
+# similar Metal-kernel dimension identifiers (value_head_dim/key_head_dim) as
+# high-entropy secrets. They are shader documentation, not credentials.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+[rules.allowlist]
+regexes = ['''(?i)(value_head_dim|key_head_dim|head_dim)\s*=\s*\d+''']
