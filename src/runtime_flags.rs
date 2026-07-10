@@ -464,6 +464,81 @@ pub(super) fn prefix_cache_capacity() -> usize {
     })
 }
 
+/// Active le prefix-cache par blocs de `saragossa serve`.
+pub fn serve_prefix_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_SERVE_PREFIX_CACHE", true))
+}
+
+/// Active le pool LRU de modèles de `saragossa serve`.
+pub fn serve_lru_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_SERVE_LRU", true))
+}
+
+/// Active la garde OOM prédictive de `saragossa serve`.
+pub fn serve_oom_guard_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_SERVE_OOM_GUARD", true))
+}
+
+/// Renvoie la taille des blocs du prefix-cache serveur.
+pub fn serve_prefix_block_tokens() -> usize {
+    static TOKENS: OnceLock<usize> = OnceLock::new();
+    *TOKENS.get_or_init(|| {
+        std::env::var("RETI_SERVE_PREFIX_BLOCK_TOKENS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or(256)
+    })
+}
+
+/// Renvoie la capacité du prefix-cache serveur en blocs.
+pub fn serve_prefix_cache_blocks() -> usize {
+    static BLOCKS: OnceLock<usize> = OnceLock::new();
+    *BLOCKS.get_or_init(|| {
+        std::env::var("RETI_SERVE_PREFIX_CACHE_BLOCKS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(128)
+    })
+}
+
+/// Renvoie le nombre cible de modèles résidents dans `serve`.
+pub fn serve_model_pool_size() -> usize {
+    static MODELS: OnceLock<usize> = OnceLock::new();
+    *MODELS.get_or_init(|| {
+        std::env::var("RETI_SERVE_MODEL_POOL")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|models| *models > 0)
+            .unwrap_or(2)
+    })
+}
+
+/// Renvoie le plafond mémoire statique explicite, en octets.
+pub fn serve_memory_static_cap_bytes() -> Option<u64> {
+    static CAP: OnceLock<Option<u64>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("RETI_SERVE_MEMORY_CAP_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|bytes| *bytes > 0)
+    })
+}
+
+/// Renvoie la marge mémoire conservée hors du process.
+pub fn serve_memory_headroom_bytes() -> u64 {
+    static HEADROOM: OnceLock<u64> = OnceLock::new();
+    *HEADROOM.get_or_init(|| {
+        std::env::var("RETI_SERVE_MEMORY_HEADROOM_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(2 * 1024 * 1024 * 1024)
+    })
+}
+
 pub(super) fn print_layer_profile(
     total_started: Option<Instant>,
     norm: Option<Duration>,

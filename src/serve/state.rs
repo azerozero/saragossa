@@ -4,17 +4,22 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use saragossa::decoder::GenerationTimings;
+use saragossa::runtime_flags::{
+    serve_lru_enabled, serve_model_pool_size, serve_prefix_cache_enabled,
+};
 use saragossa::{
     qwen_assistant_history_content, render_gemma4_chat, render_gemma_chat, render_qwen_chatml,
-    CausalDecoder, ChatTemplateMessage, GenerationOptions, ModelAssets, RuntimePreset,
+    CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage, GenerationOptions, ModelAssets,
+    RuntimePreset,
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
+use super::cache::{
+    estimate_model_bytes, BlockAwarePrefixCache, BlockHash, MemoryProjection, ServeMemoryGuard,
+};
 use super::error::{ServeError, ServeResult};
 use super::protocol::{ChatCompletionRequest, ModelInfo, ModelsResponse, Usage};
 use crate::RuntimeKind;
-
-const PREFIX_CACHE_CAP_ENV: &str = "RETI_RUST_PREFIX_CACHE_CAP";
 
 /// Réponse d'inférence prête à sérialiser en OpenAI.
 #[derive(Debug)]
@@ -25,6 +30,8 @@ pub(super) struct ServedCompletion {
     pub(super) content: String,
     /// Raison de fin OpenAI.
     pub(super) finish_reason: &'static str,
+    /// Stop sequence textuelle qui a arrêté la génération.
+    pub(super) matched_stop: Option<String>,
     /// Usage token OpenAI.
     pub(super) usage: Usage,
     /// Nombre de tokens prompt.
@@ -67,6 +74,8 @@ impl ServedCompletion {
 pub(super) struct ServeState {
     models: Vec<ModelSlot>,
     max_tokens_cap: usize,
+    clock: u64,
+    memory_guard: ServeMemoryGuard,
 }
 
 impl ServeState {
@@ -79,6 +88,8 @@ impl ServeState {
                 .map(|model| ModelSlot::new(model, args.backend))
                 .collect(),
             max_tokens_cap: args.max_tokens_cap,
+            clock: 0,
+            memory_guard: ServeMemoryGuard::new(),
         }
     }
 
@@ -89,8 +100,8 @@ impl ServeState {
 
     /// Charge tous les modèles configurés.
     pub(super) fn preload(&mut self) -> ServeResult<()> {
-        for model in &mut self.models {
-            model.ensure_loaded()?;
+        for index in 0..self.models.len() {
+            self.ensure_loaded_index(index)?;
         }
         Ok(())
     }
@@ -112,13 +123,117 @@ impl ServeState {
     ) -> ServeResult<ServedCompletion> {
         let max_tokens_cap = self.max_tokens_cap;
         let max_tokens = request.max_tokens_capped(max_tokens_cap)?;
-        let model = self
+        let index = self
             .models
-            .iter_mut()
-            .find(|model| model.id == request.model)
+            .iter()
+            .position(|model| model.id == request.model)
             .ok_or_else(|| ServeError::UnknownModel(request.model.clone()))?;
-        model.complete(request, max_tokens)
+        self.ensure_loaded_index(index)?;
+        self.clock = self.clock.saturating_add(1);
+        self.models[index].last_used = self.clock;
+        let model_id = self.models[index].id.clone();
+        let memory_guard = self.memory_guard.clone();
+        let completion = self.models[index]
+            .loaded
+            .as_mut()
+            .ok_or_else(|| ServeError::args(format!("modèle {model_id} absent après chargement")))?
+            .complete(request, max_tokens, &memory_guard)?;
+        self.enforce_memory_budget(0, Some(index))?;
+        Ok(completion)
     }
+
+    fn ensure_loaded_index(&mut self, index: usize) -> ServeResult<()> {
+        if self.models[index].loaded.is_some() {
+            return Ok(());
+        }
+        let additional = self.models[index].estimated_model_bytes();
+        self.enforce_memory_budget(additional, Some(index))?;
+        self.enforce_model_pool_limit(index);
+        self.models[index].ensure_loaded()
+    }
+
+    fn enforce_model_pool_limit(&mut self, protected: usize) {
+        if !serve_lru_enabled() {
+            return;
+        }
+        let limit = serve_model_pool_size();
+        while self.loaded_count() >= limit {
+            if self.evict_lru_model(Some(protected)).is_none() {
+                break;
+            }
+        }
+    }
+
+    fn enforce_memory_budget(
+        &mut self,
+        additional: u64,
+        protected: Option<usize>,
+    ) -> ServeResult<()> {
+        while let Some(projection) = self.memory_guard.projection_over_limit(additional) {
+            if self.evict_one_prefix_block().is_some() {
+                continue;
+            }
+            if self.evict_lru_model(protected).is_some() {
+                continue;
+            }
+            return Err(ServeError::memory(memory_error_message(projection)));
+        }
+        Ok(())
+    }
+
+    fn loaded_count(&self) -> usize {
+        self.models
+            .iter()
+            .filter(|model| model.loaded.is_some())
+            .count()
+    }
+
+    fn evict_one_prefix_block(&mut self) -> Option<usize> {
+        let index = self
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| model.loaded.is_some())
+            .filter(|(_, model)| {
+                model
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|loaded| loaded.prefix_cache_bytes() > 0)
+            })
+            .min_by_key(|(_, model)| model.last_used)
+            .map(|(index, _)| index)?;
+        let loaded = self.models[index].loaded.as_mut()?;
+        let bytes = loaded.evict_prefix_block()?;
+        eprintln!(
+            "saragossa serve evicted prefix block model={} bytes={}",
+            self.models[index].id, bytes
+        );
+        Some(bytes)
+    }
+
+    fn evict_lru_model(&mut self, protected: Option<usize>) -> Option<String> {
+        if !serve_lru_enabled() {
+            return None;
+        }
+        let index = self
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(index, model)| Some(*index) != protected && model.loaded.is_some())
+            .min_by_key(|(_, model)| model.last_used)
+            .map(|(index, _)| index)?;
+        let id = self.models[index].id.clone();
+        self.models[index].loaded = None;
+        eprintln!("saragossa serve evicted model={id} reason=lru-memory");
+        Some(id)
+    }
+}
+
+fn memory_error_message(projection: MemoryProjection) -> String {
+    format!(
+        "mémoire insuffisante: footprint={} projeté={} plafond={}",
+        projection.current, projection.projected, projection.limit
+    )
 }
 
 struct ModelSlot {
@@ -126,6 +241,8 @@ struct ModelSlot {
     path: PathBuf,
     backend: RuntimeKind,
     loaded: Option<LoadedModel>,
+    last_used: u64,
+    estimated_model_bytes: u64,
 }
 
 impl ModelSlot {
@@ -135,10 +252,19 @@ impl ModelSlot {
             path: model.path.clone(),
             backend,
             loaded: None,
+            last_used: 0,
+            estimated_model_bytes: 0,
         }
     }
 
-    fn ensure_loaded(&mut self) -> ServeResult<&mut LoadedModel> {
+    fn estimated_model_bytes(&mut self) -> u64 {
+        if self.estimated_model_bytes == 0 {
+            self.estimated_model_bytes = estimate_model_bytes(&self.path);
+        }
+        self.estimated_model_bytes
+    }
+
+    fn ensure_loaded(&mut self) -> ServeResult<()> {
         if self.loaded.is_none() {
             eprintln!(
                 "saragossa serve loading model={} path={}",
@@ -154,23 +280,16 @@ impl ModelSlot {
                 assets,
                 decoder,
                 preset,
-                prompt_prefixes: Vec::new(),
+                prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),
             });
         }
-        self.loaded.as_mut().ok_or_else(|| {
+        self.loaded.as_ref().ok_or_else(|| {
             ServeError::args(format!(
                 "modèle {} non chargé après initialisation",
                 self.id
             ))
-        })
-    }
-
-    fn complete(
-        &mut self,
-        request: ChatCompletionRequest,
-        max_tokens: usize,
-    ) -> ServeResult<ServedCompletion> {
-        self.ensure_loaded()?.complete(request, max_tokens)
+        })?;
+        Ok(())
     }
 }
 
@@ -179,19 +298,11 @@ struct LoadedModel {
     assets: ModelAssets,
     decoder: CausalDecoder,
     preset: Option<RuntimePreset>,
-    prompt_prefixes: Vec<PromptPrefixEntry>,
-}
-
-#[derive(Clone)]
-struct PromptPrefixEntry {
-    rendered: String,
-    tokens: Vec<usize>,
+    prefix_cache: BlockAwarePrefixCache,
 }
 
 struct PromptEncoding {
-    rendered: String,
     tokens: Vec<usize>,
-    reused_prefix_tokens: usize,
 }
 
 impl LoadedModel {
@@ -199,31 +310,35 @@ impl LoadedModel {
         &mut self,
         request: ChatCompletionRequest,
         max_tokens: usize,
+        memory_guard: &ServeMemoryGuard,
     ) -> ServeResult<ServedCompletion> {
         let stop_texts = request.stop_texts();
         let prompt = self.prompt_encoding(&request)?;
         let prompt_tokens = prompt.tokens.len();
-        let reused_prefix_tokens = prompt.reused_prefix_tokens;
         let options = self.generation_options(&request, &stop_texts)?;
         let started = Instant::now();
-        let output = self.decoder.generate_greedy_timed_with_options(
-            &prompt.tokens,
-            max_tokens,
-            &options,
-        )?;
+        let (prompt_state, reused_prefix_tokens, prefill) =
+            self.prefill_prompt_state(&prompt.tokens, memory_guard)?;
+        let output = self
+            .decoder
+            .generate_greedy_timed_from_prompt_state_with_options(
+                prompt_state,
+                prefill,
+                max_tokens,
+                &options,
+            )?;
         let total = started.elapsed();
-        let finish_reason = if output.tokens.len() >= max_tokens {
+        let generated = tokens_to_u32(&output.tokens)?;
+        let decoded = strip_empty_think(self.assets.decode_tokens(&generated, true)?);
+        let matched_stop = matched_text_stop(&decoded, &stop_texts);
+        let finish_reason = if output.tokens.len() >= max_tokens && matched_stop.is_none() {
             "length"
         } else {
             "stop"
         };
-        let generated = tokens_to_u32(&output.tokens)?;
-        let content = strip_text_stops(
-            strip_empty_think(self.assets.decode_tokens(&generated, true)?),
-            &stop_texts,
-        );
+        let content = strip_text_stops(decoded, &stop_texts);
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache=persistent-decoder",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache=block-snapshots",
             self.id,
             prompt_tokens,
             output.tokens.len(),
@@ -232,11 +347,11 @@ impl LoadedModel {
             total.as_millis(),
             reused_prefix_tokens
         );
-        self.remember_prompt_prefix(prompt.rendered, prompt.tokens);
         Ok(ServedCompletion {
             model: self.id.clone(),
             content,
             finish_reason,
+            matched_stop,
             usage: Usage::new(prompt_tokens, output.tokens.len()),
             prompt_tokens,
             reused_prefix_tokens,
@@ -258,13 +373,92 @@ impl LoadedModel {
             render_qwen_chatml(&messages, true, false)
         };
         let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
-        prompt_encoding_with_verified_prefix(
-            &self.id,
-            &self.prompt_prefixes,
-            rendered,
-            full_tokens,
-            |suffix| self.encode_rendered_suffix(suffix),
-        )
+        Ok(PromptEncoding {
+            tokens: full_tokens,
+        })
+    }
+
+    fn prefill_prompt_state(
+        &mut self,
+        tokens: &[usize],
+        memory_guard: &ServeMemoryGuard,
+    ) -> ServeResult<(CausalDecoderPromptState, usize, Duration)> {
+        let started = Instant::now();
+        if !serve_prefix_cache_enabled() {
+            let state = self.decoder.prefill_prompt_state_uncached(tokens)?;
+            return Ok((state, 0, started.elapsed()));
+        }
+
+        let block_tokens = self.prefix_cache.block_tokens();
+        let full_block_tokens = tokens.len() / block_tokens * block_tokens;
+        let hit = self.prefix_cache.match_prefix(tokens);
+        let reused_prefix_tokens = hit.as_ref().map_or(0, |hit| hit.tokens);
+
+        let (mut state, mut consumed, mut hash) = if let Some(hit) = hit {
+            let mut state = hit.state;
+            let metal = self.decoder.copy_prompt_state_metal_snapshot(&hit.metal)?;
+            self.decoder.restore_prompt_state_metal(&mut state, metal)?;
+            (state, hit.tokens, hit.hash)
+        } else if full_block_tokens >= block_tokens {
+            let first = &tokens[..block_tokens];
+            let state = self.decoder.prefill_prompt_state_uncached(first)?;
+            let hash = BlockHash::root().chain(first);
+            self.remember_prefix_block(hash, block_tokens, &state, memory_guard)?;
+            (state, block_tokens, hash)
+        } else {
+            let state = self.decoder.prefill_prompt_state_uncached(tokens)?;
+            return Ok((state, 0, started.elapsed()));
+        };
+
+        while consumed + block_tokens <= full_block_tokens {
+            let next = consumed + block_tokens;
+            let block = &tokens[consumed..next];
+            self.decoder.extend_prompt_state(&mut state, block)?;
+            hash = hash.chain(block);
+            self.remember_prefix_block(hash, next, &state, memory_guard)?;
+            consumed = next;
+        }
+
+        if consumed < tokens.len() {
+            self.decoder
+                .extend_prompt_state(&mut state, &tokens[consumed..])?;
+        }
+
+        Ok((state, reused_prefix_tokens, started.elapsed()))
+    }
+
+    fn remember_prefix_block(
+        &mut self,
+        hash: BlockHash,
+        tokens: usize,
+        state: &CausalDecoderPromptState,
+        memory_guard: &ServeMemoryGuard,
+    ) -> ServeResult<()> {
+        let metal = self.decoder.snapshot_prompt_state_metal(state)?;
+        let additional = usize_to_u64_saturating(
+            state
+                .estimated_cpu_bytes()
+                .saturating_add(metal.estimated_bytes()),
+        );
+        while memory_guard.projection_over_limit(additional).is_some() {
+            if self.prefix_cache.evict_lru_block().is_none() {
+                eprintln!(
+                    "saragossa serve prefix-cache skip model={} reason=oom-guard tokens={tokens}",
+                    self.id
+                );
+                return Ok(());
+            }
+        }
+        self.prefix_cache.insert(hash, tokens, state.clone(), metal);
+        Ok(())
+    }
+
+    fn prefix_cache_bytes(&self) -> usize {
+        self.prefix_cache.estimated_bytes()
+    }
+
+    fn evict_prefix_block(&mut self) -> Option<usize> {
+        self.prefix_cache.evict_lru_block()
     }
 
     fn generation_options(
@@ -319,91 +513,6 @@ impl LoadedModel {
         };
         tokens_to_usize(&ids)
     }
-
-    fn encode_rendered_suffix(&self, text: &str) -> ServeResult<Vec<usize>> {
-        tokens_to_usize(&self.assets.encode_prompt(text)?)
-    }
-
-    fn remember_prompt_prefix(&mut self, rendered: String, tokens: Vec<usize>) {
-        let capacity = prompt_prefix_capacity();
-        if capacity == 0 {
-            return;
-        }
-        if let Some(index) = self
-            .prompt_prefixes
-            .iter()
-            .position(|entry| entry.rendered == rendered)
-        {
-            self.prompt_prefixes.remove(index);
-        }
-        self.prompt_prefixes
-            .insert(0, PromptPrefixEntry { rendered, tokens });
-        self.prompt_prefixes.truncate(capacity);
-    }
-}
-
-fn longest_prompt_prefix_entry(
-    entries: &[PromptPrefixEntry],
-    rendered: &str,
-) -> Option<(usize, Vec<usize>)> {
-    entries
-        .iter()
-        .filter(|entry| rendered.starts_with(&entry.rendered))
-        .max_by_key(|entry| entry.rendered.len())
-        .map(|entry| (entry.rendered.len(), entry.tokens.clone()))
-}
-
-fn prompt_encoding_with_verified_prefix<F>(
-    model_id: &str,
-    entries: &[PromptPrefixEntry],
-    rendered: String,
-    full_tokens: Vec<usize>,
-    mut encode_suffix: F,
-) -> ServeResult<PromptEncoding>
-where
-    F: FnMut(&str) -> ServeResult<Vec<usize>>,
-{
-    if let Some((prefix_len, prefix_tokens)) = longest_prompt_prefix_entry(entries, &rendered) {
-        let suffix = &rendered[prefix_len..];
-        let suffix_tokens = if suffix.is_empty() {
-            Vec::new()
-        } else {
-            encode_suffix(suffix)?
-        };
-        if joined_tokens_equal(&prefix_tokens, &suffix_tokens, &full_tokens) {
-            return Ok(PromptEncoding {
-                rendered,
-                tokens: full_tokens,
-                reused_prefix_tokens: prefix_tokens.len(),
-            });
-        }
-        eprintln!(
-            "saragossa serve prompt-prefix fallback model={} reason=tokenization-boundary-mismatch prefix_tokens={} suffix_tokens={} full_tokens={}",
-            model_id,
-            prefix_tokens.len(),
-            suffix_tokens.len(),
-            full_tokens.len()
-        );
-    }
-    Ok(PromptEncoding {
-        rendered,
-        tokens: full_tokens,
-        reused_prefix_tokens: 0,
-    })
-}
-
-fn joined_tokens_equal(prefix: &[usize], suffix: &[usize], full: &[usize]) -> bool {
-    if full.len() != prefix.len() + suffix.len() {
-        return false;
-    }
-    full.starts_with(prefix) && full[prefix.len()..] == *suffix
-}
-
-fn prompt_prefix_capacity() -> usize {
-    std::env::var(PREFIX_CACHE_CAP_ENV)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(4)
 }
 
 fn load_decoder_with_runtime(
@@ -456,6 +565,15 @@ fn strip_text_stops(text: String, stop_texts: &[String]) -> String {
     text[..index].to_string()
 }
 
+fn matched_text_stop(text: &str, stop_texts: &[String]) -> Option<String> {
+    stop_texts
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| text.find(stop).map(|index| (index, stop)))
+        .min_by_key(|(index, _)| *index)
+        .map(|(_, stop)| stop.clone())
+}
+
 fn tokens_to_usize(ids: &[u32]) -> ServeResult<Vec<usize>> {
     ids.iter()
         .copied()
@@ -475,6 +593,10 @@ fn tokens_to_u32(ids: &[usize]) -> ServeResult<Vec<u32>> {
                 .map_err(|_| ServeError::args(format!("token généré hors plage: {id}")))
         })
         .collect()
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -507,74 +629,14 @@ mod tests {
     }
 
     #[test]
-    fn longest_prompt_prefix_selects_longest_seen_prompt() {
-        let entries = vec![
-            PromptPrefixEntry {
-                rendered: "abc".to_string(),
-                tokens: vec![1],
-            },
-            PromptPrefixEntry {
-                rendered: "abcdef".to_string(),
-                tokens: vec![1, 2],
-            },
-        ];
-
-        let hit =
-            longest_prompt_prefix_entry(&entries, "abcdefghi").expect("invariant: préfixe trouvé");
-
-        assert_eq!(hit.0, 6);
-        assert_eq!(hit.1, vec![1, 2]);
+    fn usize_to_u64_saturating_keeps_small_values() {
+        assert_eq!(usize_to_u64_saturating(42), 42);
     }
 
     #[test]
-    fn prompt_prefix_mismatch_falls_back_to_full_tokenization() {
-        let turn_one_rendered = "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\n";
-        let turn_two_rendered = format!("{turn_one_rendered}\nOK<|im_end|>\n");
-        let entries = vec![PromptPrefixEntry {
-            rendered: turn_one_rendered.to_string(),
-            tokens: vec![74455, 198, 248068, 271, 248069],
-        }];
-        let full_tokens = vec![74455, 198, 248068, 271, 248069, 1358, 3793];
+    fn matched_text_stop_returns_first_match() {
+        let matched = matched_text_stop("abc STOP def END", &["END".into(), "STOP".into()]);
 
-        let encoding = prompt_encoding_with_verified_prefix(
-            "test-model",
-            &entries,
-            turn_two_rendered,
-            full_tokens.clone(),
-            |suffix| {
-                assert_eq!(suffix, "\nOK<|im_end|>\n");
-                Ok(vec![271, 198, 3793])
-            },
-        )
-        .expect("invariant: encodage suffixe valide");
-
-        assert_eq!(encoding.tokens, full_tokens);
-        assert_eq!(encoding.reused_prefix_tokens, 0);
-    }
-
-    #[test]
-    fn prompt_prefix_reuses_when_joined_tokens_equal_full_tokenization() {
-        let turn_one_rendered = "<turn1>";
-        let turn_two_rendered = "<turn1><turn2>".to_string();
-        let entries = vec![PromptPrefixEntry {
-            rendered: turn_one_rendered.to_string(),
-            tokens: vec![1, 2, 3],
-        }];
-        let full_tokens = vec![1, 2, 3, 4, 5];
-
-        let encoding = prompt_encoding_with_verified_prefix(
-            "test-model",
-            &entries,
-            turn_two_rendered,
-            full_tokens.clone(),
-            |suffix| {
-                assert_eq!(suffix, "<turn2>");
-                Ok(vec![4, 5])
-            },
-        )
-        .expect("invariant: encodage suffixe valide");
-
-        assert_eq!(encoding.tokens, full_tokens);
-        assert_eq!(encoding.reused_prefix_tokens, 3);
+        assert_eq!(matched.as_deref(), Some("STOP"));
     }
 }

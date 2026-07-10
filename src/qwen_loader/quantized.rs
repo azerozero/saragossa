@@ -95,6 +95,11 @@ fn quantized_expert_contract_shape(
 }
 
 fn unpacked_cols(packed_cols: usize, group_size: usize, bits: usize) -> Result<usize> {
+    if bits == 0 || group_size == 0 {
+        return Err(InferError::Shape(format!(
+            "paramètres de quantification invalides : bits={bits}, group_size={group_size}"
+        )));
+    }
     let cols_times_bits = packed_cols
         .checked_mul(32)
         .ok_or_else(|| InferError::Shape("poids quantifié trop large".to_string()))?;
@@ -302,6 +307,11 @@ fn quantized_expert_weights_from_parts(
             biases.shape()
         )));
     }
+    if group_size == 0 {
+        return Err(InferError::Shape(
+            "group_size de quantification expert nul".to_string(),
+        ));
+    }
     let cols = packed_cols
         .checked_mul(32)
         .and_then(|value| value.checked_div(bits))
@@ -449,4 +459,19 @@ fn replace_weight_suffix(source: &str, suffix: &str) -> Result<String> {
         InferError::Config(format!("poids quantifié sans suffixe .weight: {source}"))
     })?;
     Ok(format!("{base}{suffix}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpacked_cols_rejects_zero_bits_or_group_size() {
+        // Régression : un override de quantification malformé (bits=0 ou
+        // group_size=0) doit renvoyer une erreur, jamais paniquer (modulo par zéro).
+        assert!(unpacked_cols(64, 32, 0).is_err());
+        assert!(unpacked_cols(64, 0, 4).is_err());
+        // Cas nominal : 64 packed_cols × 32 / 4 bits = 512 cols, divisible par 32.
+        assert_eq!(unpacked_cols(64, 32, 4).expect("config quant valide"), 512);
+    }
 }

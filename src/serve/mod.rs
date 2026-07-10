@@ -7,7 +7,9 @@
 //! Le parseur HTTP accepte uniquement les corps à `Content-Length`.
 //! `Transfer-Encoding: chunked` n'est pas pris en charge.
 
+mod anthropic;
 mod args;
+mod cache;
 mod error;
 mod http;
 mod protocol;

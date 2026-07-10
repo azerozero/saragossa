@@ -31,6 +31,9 @@ pub(super) enum ServeError {
     /// Modèle demandé absent.
     #[error("modèle inconnu: {0}")]
     UnknownModel(String),
+    /// Ressources mémoire insuffisantes.
+    #[error("ressource mémoire: {0}")]
+    Memory(String),
     /// Erreur d'inférence.
     #[error("inférence: {0}")]
     Inference(#[from] saragossa::InferError),
@@ -56,6 +59,11 @@ impl ServeError {
             context: context.into(),
             source,
         }
+    }
+
+    /// Construit une erreur de pression mémoire.
+    pub(super) fn memory(message: impl Into<String>) -> Self {
+        Self::Memory(message.into())
     }
 }
 

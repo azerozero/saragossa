@@ -685,7 +685,8 @@ impl MetalExecutor {
 
     /// Encode un matmul `[batch,in_dim] · weightᵀ` (dense ou quantifié) vers
     /// `output_buffer` résident, sans commit ni readback. Exposé `pub(crate)` pour
-    /// le chaînage des projections du decode résident (`decode_resident.rs`, 1c).
+    /// le chaînage des projections résidentes (prefill, attention, MoE, lm_head,
+    /// decode résident).
     pub(crate) fn encode_matmul_weight(
         &self,
         encoder: &ComputeCommandEncoderRef,

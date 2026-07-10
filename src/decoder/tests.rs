@@ -203,6 +203,108 @@ fn hybrid_cached_greedy_matches_full_sequence_for_multiple_layer_counts() {
 }
 
 #[test]
+fn snapshot_prompt_state_greedy_matches_cold_prefill() {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())
+        .expect("invariant: poids attention valides");
+    let prompt = [0_usize, 1, 2, 1, 0];
+    let options = GenerationOptions::default();
+    let cold = model
+        .generate_greedy_timed_with_options(&prompt, 4, &options)
+        .expect("invariant: génération froide valide")
+        .tokens;
+
+    let mut state = model
+        .prefill_prompt_state_uncached(&prompt[..2])
+        .expect("invariant: snapshot préfixe valide");
+    model
+        .extend_prompt_state(&mut state, &prompt[2..])
+        .expect("invariant: extension suffixe valide");
+    let warm = model
+        .generate_greedy_timed_from_prompt_state_with_options(state, Duration::ZERO, 4, &options)
+        .expect("invariant: génération depuis snapshot valide")
+        .tokens;
+
+    assert_eq!(warm, cold);
+}
+
+#[test]
+fn hybrid_snapshot_prompt_state_greedy_matches_cold_prefill() {
+    let config = hybrid_config(4);
+    let model =
+        CausalDecoder::from_tensors(hybrid_weights(4, 2), config).expect("invariant: hybride");
+    let prompt = [0_usize, 1, 2, 1, 0, 2];
+    let options = GenerationOptions::default();
+    let cold = model
+        .generate_greedy_timed_with_options(&prompt, 4, &options)
+        .expect("invariant: génération froide hybride valide")
+        .tokens;
+
+    let mut state = model
+        .prefill_prompt_state_uncached(&prompt[..3])
+        .expect("invariant: snapshot préfixe hybride valide");
+    model
+        .extend_prompt_state(&mut state, &prompt[3..])
+        .expect("invariant: extension suffixe hybride valide");
+    let warm = model
+        .generate_greedy_timed_from_prompt_state_with_options(state, Duration::ZERO, 4, &options)
+        .expect("invariant: génération hybride depuis snapshot valide")
+        .tokens;
+
+    assert_eq!(warm, cold);
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn hybrid_cloned_prompt_state_metal_matches_cold_prefill() {
+    let config = CausalDecoderConfig {
+        head_dim: Some(2),
+        ..hybrid_config(4)
+    };
+    let model =
+        CausalDecoder::from_tensors(hybrid_weights(4, 2), config).expect("invariant: hybride");
+    let model = match model.with_metal_runtime() {
+        Ok(model) => model,
+        Err(InferError::Metal(message)) if message.contains("aucun device") => return,
+        Err(error) => panic!("runtime Metal indisponible: {error:?}"),
+    };
+    let prompt = [0_usize, 1, 2, 1, 0, 2];
+    let cold_state = model
+        .prefill_prompt_state_uncached(&prompt)
+        .expect("invariant: prefill froid hybride Metal valide");
+
+    let prefix_state = model
+        .prefill_prompt_state_uncached(&prompt[..3])
+        .expect("invariant: snapshot préfixe hybride Metal valide");
+    assert!(
+        prefix_state
+            .cache
+            .layers
+            .iter()
+            .any(|layer| layer.linear.metal_state().is_some()),
+        "le préfill hybride Metal doit porter un état GDN résident"
+    );
+    let snapshot = model
+        .snapshot_prompt_state_metal(&prefix_state)
+        .expect("invariant: snapshot Metal hybride valide");
+    assert!(
+        snapshot.estimated_bytes() > 0,
+        "le snapshot hybride Metal doit capturer l'état récurrent GDN"
+    );
+    let mut warm_state = prefix_state.clone();
+    let snapshot = model
+        .copy_prompt_state_metal_snapshot(&snapshot)
+        .expect("invariant: copie snapshot Metal hybride valide");
+    model
+        .restore_prompt_state_metal(&mut warm_state, snapshot)
+        .expect("invariant: restore snapshot Metal hybride valide");
+    model
+        .extend_prompt_state(&mut warm_state, &prompt[3..])
+        .expect("invariant: extension suffixe hybride Metal valide");
+
+    assert_eq!(warm_state.final_state.data(), cold_state.final_state.data());
+}
+
+#[test]
 fn hybrid_batched_prefill_matches_tokenwise_prefill_state() {
     let config = hybrid_config(4);
     let model =

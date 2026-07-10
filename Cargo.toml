@@ -2,7 +2,7 @@
 name = "saragossa"
 version = "0.1.0"
 edition = "2021"
-description = "A fast pure-Rust LLM inference engine for Apple Silicon (Metal). Beats Apple's mlx_lm on Mixture-of-Experts models."
+description = "Pure-Rust Metal inference engine for Apple Silicon: Qwen dense/MoE LLMs, Whisper STT, Qwen3 TTS, OpenAI-compatible server — GPU-resident decode, 35B MoE at ~105 tok/s."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/azerozero/saragossa"
 keywords = ["llm", "inference", "metal", "apple-silicon", "transformer"]
@@ -40,6 +40,10 @@ rustfft = "6"
 hound = "3.5"
 metal = "0.29"
 md5 = "0.7"
+sha2 = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach-sys = "0.5"
 
 [dev-dependencies]
 proptest = "1"

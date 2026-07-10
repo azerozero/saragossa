@@ -596,7 +596,10 @@ pub(crate) fn commit_and_wait(command_buffer: &metal::CommandBufferRef) -> Resul
 thread_local! {
     static COMMIT_LABEL: std::cell::Cell<&'static str> = const { std::cell::Cell::new("other") };
 }
-#[allow(clippy::type_complexity)]
+#[allow(
+    clippy::type_complexity,
+    reason = "map de profilage label → (cumul_ms, count) derrière OnceLock<Mutex<…>>"
+)]
 static COMMIT_COMPONENTS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<&'static str, (f64, u64)>>,
 > = std::sync::OnceLock::new();

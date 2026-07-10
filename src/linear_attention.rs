@@ -633,6 +633,14 @@ impl LinearAttentionCache {
         self.ssm = snapshot.ssm.clone();
         self.ssm_shape = snapshot.ssm_shape;
     }
+
+    /// Estime l'empreinte CPU du snapshot récurrent.
+    pub(crate) fn estimated_cpu_bytes(&self) -> usize {
+        self.conv
+            .len()
+            .saturating_add(self.ssm.len())
+            .saturating_mul(std::mem::size_of::<f32>())
+    }
 }
 
 /// Vérifie la cohérence des shapes de tous les poids avec `config`.

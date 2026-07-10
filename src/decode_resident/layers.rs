@@ -8,7 +8,7 @@ impl DecodeResidentState {
     /// `dims.position` dans l'encoder PARTAGÉ : `layer_in [hidden]` → `layer_out
     /// [hidden]`, sans commit ni readback. Reproduit entièrement sur GPU le couple
     /// `full_attention_context_cached` puis `full_attention_tail_moe_shared`
-    /// (decoder.rs / metal_backend.rs).
+    /// (modules `decoder` / `metal_backend`).
     ///
     /// Data flow (gotchas 1c) : (a) `attn_output_gate=true` → q_proj sort `2·q_dim`,
     /// split_q_gate AVANT le RoPE ; (b) norm+RoPE À LA POSITION du token

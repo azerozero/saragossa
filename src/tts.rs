@@ -1,8 +1,8 @@
-//! Contrat local des checkpoints Qwen3-TTS pour le port Rust pur.
+//! Modèle Qwen3-TTS pour le port Rust pur : synthèse audio de bout en bout.
 //!
-//! Ce module ne synthétise pas encore l'audio. Il pose la frontière testable du
-//! port TTS : configs typées, chemins tokenizer BPE, payloads talker/codec
-//! et forward talker mesurable contre l'oracle mlx-rs.
+//! Ce module porte le modèle TTS complet : configs typées, chemins tokenizer
+//! BPE, payloads talker/codec et synthèse PCM (`synthesize_greedy` et variantes
+//! streaming), le tout vérifié octet-près contre l'oracle mlx-rs.
 
 use crate::{
     catalog::read_safetensors_keys,

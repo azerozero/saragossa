@@ -306,9 +306,10 @@ mod tests {
     fn golden_clone_preprocess_matches_fixture() -> Result<()> {
         let wav =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../voices/reti-fr.wav");
-        // NOTE: la fixture voix vit dans le repo reti, pas dans la crate — le
-        // golden reste actif chez reti et se saute proprement en standalone.
-        if !wav.exists() {
+        if !wav.is_file() {
+            // NOTE: le WAV de référence vit dans le workspace reti, pas dans le
+            // dépôt saragossa standalone — skip pour rester CI-portable.
+            eprintln!("skip: WAV de référence clone absent (voices/reti-fr.wav)");
             return Ok(());
         }
         let bytes = std::fs::read(&wav).map_err(|source| InferError::Io {

@@ -12,4 +12,5 @@ référence stable sans mlx-rs.
   pour régénérer les `.bin/.json`.
 
 Chaque fixture est consommée par le test `golden_*` homonyme.
-Voir `/tmp/golden_oracles_plan.md` pour le mapping complet entrée → référence → tolérance.
+Le mapping entrée → référence suit cette homonymie ; la tolérance de chaque
+référence figure dans l'en-tête `.json` (champ `tolerance`).

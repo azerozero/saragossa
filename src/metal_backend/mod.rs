@@ -462,6 +462,18 @@ pub(crate) struct LinearAttentionMetalState {
     ssm_bf16: bool,
 }
 
+impl LinearAttentionMetalState {
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let conv = self.conv_len.saturating_mul(std::mem::size_of::<f32>());
+        let ssm_element = if self.ssm_bf16 {
+            std::mem::size_of::<u16>()
+        } else {
+            std::mem::size_of::<f32>()
+        };
+        conv.saturating_add(self.ssm_len.saturating_mul(ssm_element))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PrefillAttentionLayer<'a> {
     Full {

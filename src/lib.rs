@@ -52,7 +52,8 @@ pub use chat_template::{
 pub use config::{ModelConfig, QuantConfig, RawModelConfig, RopeScalingConfig};
 pub use decoder::{
     force_resident_full_linear_decode, CausalDecoder, CausalDecoderCache, CausalDecoderConfig,
-    GenerationOptions, RopeStyle, SpeculativeOutput, SpeculativeStats,
+    CausalDecoderPromptMetalSnapshot, CausalDecoderPromptState, GenerationOptions, RopeStyle,
+    SpeculativeOutput, SpeculativeStats,
 };
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 pub use decoder::{ResidentLinearXrayLayerDiff, ResidentLinearXrayReport};

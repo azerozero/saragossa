@@ -1,70 +1,138 @@
-# Saragossa
+# saragossa
 
-**A fast, pure-Rust LLM inference engine for Apple Silicon — ahead of Apple's own `mlx_lm` on the flagship MoE model.**
+![licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue)
+![plateforme](https://img.shields.io/badge/plateforme-Apple%20Silicon-black)
+![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
+![python](https://img.shields.io/badge/python-0%20d%C3%A9pendance-success)
 
-Saragossa is a from-scratch transformer decoder written in Rust on top of `metal-rs`. No MLX, no PyTorch, no Python — a single self-contained crate that compiles its Metal kernels at runtime. It was extracted from a real-time local voice assistant, where decode latency is everything.
+Moteur d'inférence **Rust pur** sur Apple Silicon (kernels `metal-rs` bruts,
+zéro Python, zéro MLX). C'est le backend **prod par défaut** de
+[reti](../../README.md) (`--backends rust-metal`) : il fait tourner in-process
+le LLM, le STT et le TTS de la boucle vocale. `saragossa` est **open source**
+(double licence MIT ou Apache-2.0) et s'utilise aussi seul, hors reti, via son
+serveur `saragossa serve`.
 
-## Why
+## Capacités
 
-On Apple Silicon, `mlx_lm` (Apple's MLX-based generation library) is the reference. Same-session A/B, identical protocol both sides (decode tok/s, 2026-07-07):
+| Domaine | Détail |
+|---|---|
+| LLM | Qwen3.x dense et MoE (27B/30B/35B-A3B), loader générique Llama/Mistral/Gemma 3 ; quantifs u4/u6/u8 gs32-128, scales/biases bf16 |
+| STT | Whisper large-v3-turbo (encodeur + décodeur résidents, GEMM Neural-Accelerators bf16) |
+| TTS | Qwen3-TTS : talker résident + codec GPU + streaming intra-phrase |
+| Serveur | `saragossa serve` : HTTP multi-modèle, endpoints **OpenAI** (`/v1/chat/completions`, `/v1/models`) et **Anthropic** (`/v1/messages`, pour Claude Code) ; cache chaud par blocs, garde OOM, pool de modèles LRU |
 
-**Rig**: MacBook Pro, Apple M5 Max (40-core GPU, 18-core CPU), 128 GB unified memory, macOS 26.5.1 · `mlx` 0.31.2 / `mlx_lm` 0.31.3 · 1k-token prompt, 512 generated tokens, greedy · runs GPU-serialized back-to-back (Saragossa then `mlx_lm` per pair) · GPU temperature sampled with [macmon](https://github.com/vladkens/macmon) at each run's start→end.
+## Principes de conception
 
-| Model | Saragossa (GPU °C) | `mlx_lm` (GPU °C) | Verdict |
-|---|---|---|---|
-| [Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit) (MoE, default) | **146.0** (41→48) | 137.8 (48→58) | **+6 %, and cooler** |
-| [Qwen3.6-35B-A3B-oQ8](https://huggingface.co/bearzi/Qwen3.6-35B-A3B-oQ8) (OptiQ 8-bit) @32k ctx, sampled T>0 | **89.8** | 88.1 | ahead at long context (bf16 KV; measured 2026-07-03) |
-| [Qwen3.6-35B-A3B-OptiQ-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit) (MoE, mixed-precision) | **116.3** (43→51) | 114.6 (51→64) | +1.5 % |
-| [Qwen3.6-27B-OptiQ-4bit](https://huggingface.co/mlx-community/Qwen3.6-27B-OptiQ-4bit) (dense) | 27.0 (65→81) | 26.9 (81→72) | parity |
-| [Qwen3-30B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3-30B-A3B-4bit) (MoE) | 112.7 (56→59) | 131.4 (59→68) | **−14 % — under investigation** (measured +11.5 % ahead in June; suspected routing/default drift on our side or `mlx_lm` progress) |
+- **Résidence GPU** : en decode, 1 token = 1 command buffer, zéro readback ni
+  `commit_and_wait` par couche. Le per-op CPU-orchestré n'existe qu'en repli.
+- **Byte-identité comme gate** : toute optimisation prouve qu'elle préserve la
+  sortie (oracles md5 e2e, goldens STT/TTS) ; les dérives near-tie sont
+  qualifiées (ids + top-5 + marge) et actées par dossier — jamais silencieuses.
+- **Tout est débrayable** : chaque chemin optimisé a son kill-switch env ;
+  les flags sont centralisés dans [`src/runtime_flags.rs`](src/runtime_flags.rs).
+- Les dossiers de mesure et de décision vivent dans
+  [`docs/reviews/`](../../docs/reviews/) ; l'architecture cible dans
+  l'[ADR 0011](../../docs/adr/0011-saragossa-moteur-modulaire.md).
 
-Numbers move with every engine and `mlx_lm` release — reproduce with `--prompt-tokens 1024 --max-tokens 512 --temperature 0 --metrics` vs `mlx_lm.benchmark -p 1024 -g 512`.
+## Perfs (mesurées le 2026-07-06, M5 Max)
 
-Output quality holds: on the 35B it produces fluent, literary prose where `mlx_lm` often drifts into meta-planning.
+- Decode 35B-A3B greedy @1k : **145,7 tok/s** (`4bit`, défaut prod) ·
+  **105,9 tok/s** (`oQ8`) ; chemin prod T>0 devant `mlx_lm` jusqu'à 32k
+  (89,8 vs 88,1 tok/s @32k oQ8, KV bf16).
+- Prefill 35B : 1,0 s @2k · 3,5 s @8k · 23,3 s @32k.
+- STT Whisper turbo : rtf 0,107 · TTS : e2e 0,747, TTFA streaming ~1,2 s.
 
-## How it's fast
+## Usage
 
-- **Resident decode** — one Metal command buffer per token (no per-op host round-trips).
-- **GPU sampler** — `top_k`/`top_p`/temperature sampling stays on-device; no full-vocab logits readback (a ~6× win at production temperatures vs. a CPU sampler).
-- **Hand-written quantized kernels** — `affine` 4-bit (group-size 64) `qmv`/`qmm`, aligned fast-path, `bf16` scales/biases — the codegen levers that close the gap with Apple's metallib.
-- **Quantized KV-cache** (optional) — u8 K+V Flash kernel for GQA, growing wins at long context.
-- **MoE-aware** — routed + shared experts, resident.
-- **Prefill kernels** — Neural-Accelerator GEMM paths plus dedicated causal-attention
-  kernels (GQA-tiled and a Steel-derived d256 variant): 35B prefill runs 1.0 s @2k,
-  3.5 s @8k, 23 s @32k.
+```bash
+# Bibliothèque : via reti (chemin nominal).
+cargo run --release -- boss --backends rust-metal
 
-## Format support
-
-- **Quantization**: MLX `affine` 4-bit (incl. OptiQ mixed-precision), `bf16`, and FP8 (`e4m3`/`e5m2`, dequantized).
-- **Models today**: the Qwen3.6 family (MoE + dense), plus a generic loader for the
-  mainstream SwiGLU + RMSNorm + RoPE + GQA family — Llama, Mistral and Gemma 3 load
-  and run at `mlx_lm` parity.
-- **Beyond LLMs**: the same engine runs Whisper large-v3-turbo (STT, resident
-  encoder+decoder) and Qwen3-TTS (talker + GPU codec, intra-sentence streaming).
-- **Serving**: `saragossa serve` exposes an OpenAI-compatible HTTP endpoint
-  (multi-model registry, Unix socket by default, bearer-gated TCP, read timeouts,
-  `max_tokens` cap).
-- Loads MLX-format `safetensors` (not GGUF).
-
-## Build & run
-
-Requires macOS + the Metal toolchain.
-
-```sh
-cargo build --release --features metal,devtools
-./target/release/saragossa \
-  --model-dir /path/to/mlx-model \
-  --prompt "Explain why the sky is blue." \
-  --max-tokens 128 --temperature 0.7 --top-k 20 --backend metal
-
-# OpenAI-compatible server (multi-model).
-./target/release/saragossa serve --model my-model=/path/to/mlx-model
+# CLI de dev (le binaire requiert la feature devtools, activée par défaut) :
+# smoke LLM direct.
+cargo run --release -p saragossa -- \
+  --model-dir models/Qwen3.6-35B-A3B-oQ8 --backend metal \
+  --prompt "Bonjour" --max-tokens 64 --temperature 0 --metrics
 ```
 
-## Status
+## Serveur `saragossa serve`
 
-Experimental, extracted from a production voice agent. The core is reference-grade (zero `unwrap`/`panic` in hot paths, colocated tests, `#![deny(unsafe_code)]` outside the audited Metal FFI). APIs may move.
+Serveur HTTP local **mono-thread** (usage mono-utilisateur assumé), multi-modèle.
+Transport socket Unix par défaut (`/tmp/saragossa-serve.sock`, chmod 0600) ; le
+TCP loopback exige un bearer (`--api-key` ou `SARAGOSSA_API_KEY`). Read-timeout
+par connexion (30 s) et plafond dur `max_tokens` (4096) débrayent les requêtes
+qui dérapent.
 
-## License
+```bash
+# OpenAI-compatible sur socket Unix.
+cargo run --release -p saragossa -- serve \
+  --model qwen35=models/Qwen3.6-35B-A3B-oQ8
 
-Dual-licensed under **MIT OR Apache-2.0**. The Metal kernels are an independent Rust reimplementation of algorithms from Apple's [MLX](https://github.com/ml-explore/mlx) (MIT) — see [`NOTICE`](NOTICE).
+# TCP loopback + bearer, pour brancher Claude Code (shim Anthropic).
+SARAGOSSA_API_KEY=local-dev cargo run --release -p saragossa -- serve \
+  --port 8081 --model qwen35=models/Qwen3.6-35B-A3B-oQ8
+```
+
+```bash
+# Claude Code parle au moteur local via /v1/messages.
+ANTHROPIC_BASE_URL=http://127.0.0.1:8081 ANTHROPIC_API_KEY=local-dev claude
+```
+
+### Cache chaud (prefix-cache par blocs)
+
+Les prompts sont découpés en blocs de 256 tokens (`RETI_SERVE_PREFIX_BLOCK_TOKENS`)
+hachés en chaîne (SHA-256 de `hash_précédent ‖ tokens`) : un préfixe ne réutilise
+un état que si **toute la chaîne amont** est identique. Chaque frontière de bloc
+retient l'état de prompt CPU **et** son **snapshot Metal** (KV + état récurrent
+linéaire GDN résident sur GPU), rechargé tel quel sur hit — donc seul le suffixe
+est prérempli. Le cache est un LRU de 128 blocs (`RETI_SERVE_PREFIX_CACHE_BLOCKS`) ;
+le header `x-saragossa-reused-prefix-tokens` rapporte la reprise.
+
+### Garde OOM + pool de modèles LRU
+
+- **Garde OOM prédictive** : projette l'empreinte process (`phys_footprint` Mach)
+  plus le coût de la prochaine allocation contre le plus bas de trois plafonds —
+  cap statique, mémoire hôte moins marge (2 Gio), working-set Metal recommandé.
+  En cas de dépassement projeté, évince d'abord des blocs de cache, puis des
+  modèles ; sinon refuse la requête (HTTP 503).
+- **Pool de modèles LRU** : jusqu'à 2 modèles résidents simultanés
+  (`RETI_SERVE_MODEL_POOL`) ; charger un modèle de plus évince le moins récemment
+  utilisé.
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `RETI_SERVE_PREFIX_CACHE` | on | Cache chaud de préfixe par blocs |
+| `RETI_SERVE_PREFIX_BLOCK_TOKENS` | 256 | Taille d'un bloc (tokens) |
+| `RETI_SERVE_PREFIX_CACHE_BLOCKS` | 128 | Capacité LRU du cache (blocs) |
+| `RETI_SERVE_LRU` | on | Pool LRU de modèles résidents |
+| `RETI_SERVE_MODEL_POOL` | 2 | Modèles résidents simultanés |
+| `RETI_SERVE_OOM_GUARD` | on | Garde mémoire prédictive |
+| `RETI_SERVE_MEMORY_HEADROOM_BYTES` | 2 Gio | Marge hôte conservée hors process |
+| `RETI_SERVE_MEMORY_CAP_BYTES` | auto | Plafond mémoire statique explicite |
+
+### Shim Anthropic `/v1/messages` (Claude Code)
+
+`POST /v1/messages` accepte le format Anthropic Messages en plus des routes OpenAI,
+pour piloter le moteur local depuis Claude Code :
+
+- Les `tools` déclarés sont rendus en bloc système (signatures `<tools>` + protocole
+  d'appel) ; la sortie `<tool_call>{…}</tool_call>` du modèle est reparsée en blocs
+  `tool_use` (`id`, `name`, `input` JSON). Les `tool_result` entrants deviennent des
+  messages `tool`.
+- Streaming SSE Anthropic (`message_start` → `content_block_*` → `message_delta` →
+  `message_stop`) et non-streaming. `stop_reason` mappé sur
+  `tool_use` / `max_tokens` / `stop_sequence` / `end_turn` ; erreurs au format Anthropic.
+
+## Features
+
+| Feature | Défaut | Rôle |
+|---|---|---|
+| `metal` | oui | Kernels GPU Metal (macOS ; `src/kernels.metal` embarqué au build, compilé au runtime) |
+| `devtools` | oui (lib) / requis (bin) | Harnais bench/diagnostic (DFlash, MTP, doctor) — exclu du binaire reti prod |
+
+Prérequis : Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`).
+
+## Licence
+
+Double licence, au choix : [MIT](https://spdx.org/licenses/MIT.html) ou
+[Apache-2.0](https://spdx.org/licenses/Apache-2.0.html) (SPDX `MIT OR Apache-2.0`).

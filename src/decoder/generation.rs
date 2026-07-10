@@ -651,10 +651,72 @@ impl CausalDecoder {
             });
         }
         let prefill_started = Instant::now();
-        let (mut cache, mut final_state) = self.prefill_cache_state(prompt)?;
+        let (cache, final_state) = self.prefill_cache_state(prompt)?;
         // Decode résident COMPLET (1c) si le flag est ON ET le modèle est supporté
         // (validation en amont, tout-ou-rien). Sinon, decode résident full-attn (1b)
         // si son flag est ON : alloue/seed le KV GPU des couches full-attn.
+        let prefill = prefill_started.elapsed();
+        self.generate_greedy_timed_from_prompt_state_with_options(
+            CausalDecoderPromptState::new(cache, final_state),
+            prefill,
+            max_new_tokens,
+            options,
+        )
+    }
+
+    /// Génère depuis un état de prompt pré-rempli.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si l'état, les options ou le forward échouent.
+    pub fn generate_greedy_timed_from_prompt_state_with_options(
+        &self,
+        state: CausalDecoderPromptState,
+        prefill: Duration,
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+    ) -> Result<GenerationOutput> {
+        if max_new_tokens == 0 {
+            return Ok(GenerationOutput {
+                tokens: Vec::new(),
+                timings: GenerationTimings {
+                    prefill,
+                    decode: Duration::ZERO,
+                    decode_tokens: 0,
+                },
+            });
+        }
+        if state.position() == 0 {
+            return Err(InferError::Dimension("état de prompt vide".to_string()));
+        }
+        let (cache, final_state) = state.into_parts();
+        self.generate_greedy_timed_from_prefilled_state(
+            cache,
+            final_state,
+            prefill,
+            max_new_tokens,
+            options,
+        )
+    }
+
+    fn generate_greedy_timed_from_prefilled_state(
+        &self,
+        mut cache: CausalDecoderCache,
+        mut final_state: Tensor,
+        prefill: Duration,
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+    ) -> Result<GenerationOutput> {
+        if max_new_tokens == 0 {
+            return Ok(GenerationOutput {
+                tokens: Vec::new(),
+                timings: GenerationTimings {
+                    prefill,
+                    decode: Duration::ZERO,
+                    decode_tokens: 0,
+                },
+            });
+        }
         // Decode résident COMPLET (1c) : greedy uniquement (argmax on-device) et
         // modèle supporté. L'arène doit être prête tout-ou-rien : si un état par
         // couche manque, on retombe sur le per-op (et le résident 1b si activé).
@@ -680,7 +742,6 @@ impl CausalDecoder {
                 options.temperature > f32::EPSILON,
             )?;
         }
-        let prefill = prefill_started.elapsed();
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut sampler = DeterministicSampler::new(options.seed);
         let mut decode = Duration::ZERO;
@@ -2567,6 +2628,102 @@ impl CausalDecoder {
         let (cache, final_state) = self.prefill_cache_state_uncached(prompt)?;
         let logits = self.logits_from_final_state(&final_state)?;
         Ok((cache, logits))
+    }
+
+    /// Pré-remplit un prompt sans consulter le cache interne du décodeur.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le prompt est vide ou si le forward échoue.
+    pub fn prefill_prompt_state_uncached(
+        &self,
+        prompt: &[usize],
+    ) -> Result<CausalDecoderPromptState> {
+        let (cache, final_state) = self.prefill_cache_state_uncached(prompt)?;
+        Ok(CausalDecoderPromptState::new(cache, final_state))
+    }
+
+    /// Prolonge un état de prompt avec un suffixe tokenisé.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si l'état ou le forward du suffixe échoue.
+    pub fn extend_prompt_state(
+        &self,
+        state: &mut CausalDecoderPromptState,
+        suffix: &[usize],
+    ) -> Result<()> {
+        if suffix.is_empty() {
+            return Ok(());
+        }
+        let final_states = self.next_final_states_batched(&mut state.cache, suffix)?;
+        state.final_state = Tensor::row(final_states.last_row()?.to_vec())?;
+        Ok(())
+    }
+
+    /// Capture les états Metal attachés à un état de prompt.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la copie GPU du snapshot échoue.
+    pub fn snapshot_prompt_state_metal(
+        &self,
+        state: &CausalDecoderPromptState,
+    ) -> Result<CausalDecoderPromptMetalSnapshot> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            Ok(CausalDecoderPromptMetalSnapshot {
+                linear: self.snapshot_prefix_cache_linear_metal(&state.cache)?,
+            })
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (self, state);
+            Ok(CausalDecoderPromptMetalSnapshot::default())
+        }
+    }
+
+    /// Copie un snapshot Metal pour le restaurer sans aliaser l'entrée cache.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la copie GPU du snapshot échoue.
+    pub fn copy_prompt_state_metal_snapshot(
+        &self,
+        snapshot: &CausalDecoderPromptMetalSnapshot,
+    ) -> Result<CausalDecoderPromptMetalSnapshot> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            Ok(CausalDecoderPromptMetalSnapshot {
+                linear: self.copy_prefix_cache_linear_metal(&snapshot.linear)?,
+            })
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (self, snapshot);
+            Ok(CausalDecoderPromptMetalSnapshot::default())
+        }
+    }
+
+    /// Restaure les états Metal dans un état de prompt cloné.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le nombre de couches diverge ou si le blit échoue.
+    pub fn restore_prompt_state_metal(
+        &self,
+        state: &mut CausalDecoderPromptState,
+        snapshot: CausalDecoderPromptMetalSnapshot,
+    ) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            self.restore_prefix_cache_linear_metal(&mut state.cache, snapshot.linear)
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (self, state, snapshot);
+            Ok(())
+        }
     }
 
     pub(super) fn prefill_cache_state(

@@ -182,6 +182,16 @@ impl Usage {
             total_tokens: prompt_tokens + completion_tokens,
         }
     }
+
+    /// Renvoie les tokens d'entrée.
+    pub(super) fn prompt_tokens(&self) -> usize {
+        self.prompt_tokens
+    }
+
+    /// Renvoie les tokens de sortie.
+    pub(super) fn completion_tokens(&self) -> usize {
+        self.completion_tokens
+    }
 }
 
 /// Réponse non-streaming.

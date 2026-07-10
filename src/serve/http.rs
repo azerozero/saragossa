@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::str;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -14,6 +14,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use serde::Serialize;
 
+use super::anthropic::{handle_anthropic_messages, send_anthropic_error};
 use super::error::{ServeError, ServeResult};
 use super::protocol::{
     json_bytes, sse_done, sse_event, ChatCompletionChunk, ChatCompletionRequest,
@@ -42,7 +43,8 @@ pub(super) fn serve_tcp(
                     eprintln!("saragossa serve request error: {error}");
                     continue;
                 }
-                if let Err(error) = handle_connection(&mut stream, state, Some(api_key)) {
+                let deadline = Instant::now() + read_timeout;
+                if let Err(error) = handle_connection(&mut stream, state, Some(api_key), deadline) {
                     eprintln!("saragossa serve request error: {error}");
                 }
             }
@@ -76,7 +78,8 @@ pub(super) fn serve_unix(
                     eprintln!("saragossa serve request error: {error}");
                     continue;
                 }
-                if let Err(error) = handle_connection(&mut stream, state, None) {
+                let deadline = Instant::now() + read_timeout;
+                if let Err(error) = handle_connection(&mut stream, state, None, deadline) {
                     eprintln!("saragossa serve request error: {error}");
                 }
             }
@@ -132,8 +135,9 @@ fn handle_connection<S: Read + Write>(
     stream: &mut S,
     state: &mut ServeState,
     api_key: Option<&str>,
+    read_deadline: Instant,
 ) -> ServeResult<()> {
-    let request = match read_request(stream) {
+    let request = match read_request(stream, read_deadline) {
         Ok(Some(request)) => request,
         Ok(None) => return Ok(()),
         Err(error) => {
@@ -154,19 +158,26 @@ fn route_request<S: Write>(
     api_key: Option<&str>,
     request: HttpRequest,
 ) -> ServeResult<()> {
-    if let Some(expected) = api_key {
-        if !is_authorized(&request, expected) {
-            return send_error(stream, 401, "authentification bearer requise");
-        }
-    }
     let path = request
         .path
         .split('?')
         .next()
         .unwrap_or(request.path.as_str());
+    if let Some(expected) = api_key {
+        if !is_authorized(&request, expected) {
+            if path == "/v1/messages" {
+                return send_anthropic_error(stream, 401, "authentification bearer requise");
+            }
+            return send_error(stream, 401, "authentification bearer requise");
+        }
+    }
     match (request.method.as_str(), path) {
         ("GET", "/v1/models") => send_json(stream, 200, &state.models_response(), Vec::new()),
         ("POST", "/v1/chat/completions") => handle_chat(stream, state, &request),
+        ("POST", "/v1/messages") => match handle_anthropic_messages(stream, state, &request.body) {
+            Ok(()) => Ok(()),
+            Err(error) => send_anthropic_error(stream, error_status(&error), &error.to_string()),
+        },
         _ => send_error(stream, 404, "endpoint inconnu"),
     }
 }
@@ -228,7 +239,7 @@ fn write_sse_event<S: Write, T: Serialize>(stream: &mut S, value: &T) -> ServeRe
         .map_err(|e| ServeError::io("écriture SSE", e))
 }
 
-fn send_json<S: Write, T: Serialize>(
+pub(super) fn send_json<S: Write, T: Serialize>(
     stream: &mut S,
     status: u16,
     value: &T,
@@ -261,7 +272,7 @@ fn send_error<S: Write>(stream: &mut S, status: u16, message: &str) -> ServeResu
     send_json(stream, status, &body, Vec::new())
 }
 
-fn write_headers<S: Write>(
+pub(super) fn write_headers<S: Write>(
     stream: &mut S,
     status: u16,
     reason: &str,
@@ -295,6 +306,7 @@ fn error_status(error: &ServeError) -> u16 {
     match error {
         ServeError::UnknownModel(_) => 404,
         ServeError::Args(_) | ServeError::Json { .. } | ServeError::Http(_) => 400,
+        ServeError::Memory(_) => 503,
         ServeError::Io { .. } | ServeError::Inference(_) => 500,
     }
 }
@@ -349,7 +361,7 @@ impl HttpRequest {
     }
 }
 
-fn read_request<S: Read>(stream: &mut S) -> ServeResult<Option<HttpRequest>> {
+fn read_request<S: Read>(stream: &mut S, deadline: Instant) -> ServeResult<Option<HttpRequest>> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
     let header_end = loop {
@@ -358,6 +370,13 @@ fn read_request<S: Read>(stream: &mut S) -> ServeResult<Option<HttpRequest>> {
         }
         if buffer.len() > MAX_HEADER_BYTES {
             return Err(ServeError::Http("headers trop grands".to_string()));
+        }
+        // NOTE: le timeout socket ne borne que CHAQUE read ; sans deadline
+        // absolue, un client au goutte-à-goutte épingle le serveur mono-thread.
+        if Instant::now() >= deadline {
+            return Err(ServeError::Http(
+                "délai de lecture de la requête dépassé".to_string(),
+            ));
         }
         let read = stream
             .read(&mut chunk)
@@ -383,6 +402,11 @@ fn read_request<S: Read>(stream: &mut S) -> ServeResult<Option<HttpRequest>> {
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();
     while body.len() < content_length {
+        if Instant::now() >= deadline {
+            return Err(ServeError::Http(
+                "délai de lecture de la requête dépassé".to_string(),
+            ));
+        }
         let read = stream
             .read(&mut chunk)
             .map_err(|e| ServeError::io("lecture body HTTP", e))?;
@@ -461,12 +485,41 @@ mod tests {
     use super::super::state::ServeState;
     use super::*;
 
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    /// Client au goutte-à-goutte : un octet utile toutes les 5 ms, jamais de
+    /// fin de headers.
+    struct SlowLorisStream;
+
+    impl Read for SlowLorisStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(5));
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = b'A';
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn read_request_cuts_slow_loris_at_absolute_deadline() {
+        let mut stream = SlowLorisStream;
+
+        let error = read_request(&mut stream, Instant::now() + Duration::from_millis(20))
+            .expect_err("invariant: client au goutte-à-goutte coupé à la deadline");
+
+        assert!(error.to_string().contains("délai"));
+    }
+
     #[test]
     fn parses_request_with_body() {
         let raw = b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
         let mut cursor = Cursor::new(raw.to_vec());
 
-        let request = read_request(&mut cursor)
+        let request = read_request(&mut cursor, far_deadline())
             .expect("invariant: requête lisible")
             .expect("invariant: requête présente");
 
@@ -522,12 +575,44 @@ mod tests {
         );
         let mut stream = Cursor::new(raw.into_bytes());
 
-        let error = handle_connection(&mut stream, &mut state, None)
+        let error = handle_connection(&mut stream, &mut state, None, far_deadline())
             .expect_err("invariant: max_tokens au-dessus du cap refusé");
 
         assert!(error.to_string().contains("plafond serveur 4"));
         let response = String::from_utf8(stream.into_inner()).expect("invariant: réponse UTF-8");
         assert!(response.contains("HTTP/1.1 400 Bad Request"));
         assert!(response.contains("plafond serveur 4"));
+    }
+
+    #[test]
+    fn anthropic_messages_errors_use_anthropic_shape() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let body = br#"{"model":"reti-35b","messages":[{"role":"user","content":"Bonjour"}]}"#;
+        let raw = format!(
+            "POST /v1/messages HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            str::from_utf8(body).expect("invariant: JSON test UTF-8")
+        );
+        let mut stream = Cursor::new(raw.into_bytes());
+
+        handle_connection(&mut stream, &mut state, None, far_deadline())
+            .expect("invariant: erreur Anthropic sérialisée");
+
+        let response = String::from_utf8(stream.into_inner()).expect("invariant: réponse UTF-8");
+        assert!(response.contains("HTTP/1.1 400 Bad Request"));
+        let response_start = response
+            .rfind("HTTP/1.1 400 Bad Request")
+            .expect("invariant: réponse HTTP présente");
+        let body = response[response_start..]
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("invariant: body HTTP présent");
+        let value: serde_json::Value = serde_json::from_str(body).expect("invariant: JSON erreur");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert!(value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("max_tokens")));
     }
 }

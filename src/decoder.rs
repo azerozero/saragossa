@@ -199,6 +199,67 @@ pub struct GenerationOutput {
     pub timings: GenerationTimings,
 }
 
+#[derive(Clone, Debug)]
+/// Capture un préfill exact à une frontière de prompt.
+pub struct CausalDecoderPromptState {
+    cache: CausalDecoderCache,
+    final_state: Tensor,
+}
+
+impl CausalDecoderPromptState {
+    /// Construit un état de prompt depuis un cache et un état final.
+    #[must_use]
+    pub fn new(cache: CausalDecoderCache, final_state: Tensor) -> Self {
+        Self { cache, final_state }
+    }
+
+    /// Renvoie la position absolue du prochain token.
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.cache.position()
+    }
+
+    /// Estime l'empreinte CPU du snapshot.
+    #[must_use]
+    pub fn estimated_cpu_bytes(&self) -> usize {
+        self.cache.estimated_cpu_bytes().saturating_add(
+            self.final_state
+                .len()
+                .saturating_mul(std::mem::size_of::<f32>()),
+        )
+    }
+
+    fn into_parts(self) -> (CausalDecoderCache, Tensor) {
+        (self.cache, self.final_state)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+/// Capture les états Metal associés à un état de prompt.
+pub struct CausalDecoderPromptMetalSnapshot {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    linear: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
+}
+
+impl CausalDecoderPromptMetalSnapshot {
+    /// Estime l'empreinte GPU du snapshot.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            self.linear
+                .iter()
+                .flatten()
+                .map(crate::metal_backend::LinearAttentionMetalState::estimated_bytes)
+                .sum()
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            0
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 #[derive(Clone, Debug, PartialEq)]
 /// Décrit la divergence d'une couche du decode résident.
@@ -565,6 +626,22 @@ impl CausalDecoderCache {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.position == 0
+    }
+
+    /// Estime l'empreinte CPU du cache.
+    #[must_use]
+    pub fn estimated_cpu_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .keys
+                    .len()
+                    .saturating_add(layer.values.len())
+                    .saturating_mul(std::mem::size_of::<f32>())
+                    .saturating_add(layer.linear.estimated_cpu_bytes())
+            })
+            .sum()
     }
 }
 

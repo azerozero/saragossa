@@ -48,10 +48,21 @@ pub fn render_qwen_chatml(
 ) -> String {
     let mut out = String::new();
     for message in messages {
+        let (role, content) = if message.role == "tool" {
+            (
+                "user",
+                qwen_tool_response(message.content.as_deref().unwrap_or("")),
+            )
+        } else {
+            (
+                message.role.as_str(),
+                message.content.as_deref().unwrap_or("").to_string(),
+            )
+        };
         out.push_str(QWEN_IM_START);
-        out.push_str(&message.role);
+        out.push_str(role);
         out.push('\n');
-        out.push_str(message.content.as_deref().unwrap_or(""));
+        out.push_str(&content);
         out.push_str(QWEN_IM_END);
         out.push('\n');
     }
@@ -63,6 +74,13 @@ pub fn render_qwen_chatml(
         }
     }
     out
+}
+
+fn qwen_tool_response(content: &str) -> String {
+    if content.contains("<tool_response>") {
+        return content.to_string();
+    }
+    format!("<tool_response>\n{}\n</tool_response>", content.trim())
 }
 
 /// Rend des messages au format chat Gemma (`<start_of_turn>…<end_of_turn>`).
@@ -187,6 +205,19 @@ mod tests {
 
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
         assert!(!prompt.contains("<think>"));
+    }
+
+    #[test]
+    fn qwen_renders_tool_result_as_user_tool_response() {
+        let messages = vec![ChatTemplateMessage::new("tool", r#"{"content":"ok"}"#)];
+
+        let prompt = render_qwen_chatml(&messages, true, false);
+
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\n<tool_response>\n{\"content\":\"ok\"}\n</tool_response><|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
     }
 
     #[test]

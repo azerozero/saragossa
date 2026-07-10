@@ -8,10 +8,10 @@
 //! CPU à la fin (l'id du token).
 //!
 //! Ce module isole la **discipline d'ownership/liveness des buffers Metal** hors
-//! du god file `metal_backend.rs` et la verrouille par des tests différentiels.
+//! du module `metal_backend` et la verrouille par des tests différentiels.
 //! Il répond à trois réserves de la revue Codex :
 //!  - **(B) aliasing scratch.** `MetalExecutor::scratch_buffer` renvoie le MÊME
-//!    `MTLBuffer` par label (`metal_backend.rs`) → aliasing silencieux si deux
+//!    `MTLBuffer` par label (`metal_backend`) → aliasing silencieux si deux
 //!    tenseurs vivants partagent un label. Ici le scratch est **à bail**
 //!    ([`ScratchLease`]) : deux bails vivants ne partagent JAMAIS de buffer ;
 //!    seuls des bails à liveness disjointe réutilisent. La poignée scratch est
@@ -19,9 +19,9 @@
 //!    op après la libération du scratch (pas de clobber d'un buffer rendu au
 //!    pool alors que le GPU le référence encore).
 //!  - **(C) concurrence.** Un [`DecodeResidentState`] = UN decode ; jamais
-//!    partagé entre deux decodes simultanés. La sérialisation est déjà garantie
-//!    côté reti par le `MLX_LOCK` global ; ici l'état est volontairement conçu
-//!    pour vivre comme local de la session de génération.
+//!    partagé entre deux decodes simultanés. La sérialisation des decodes est
+//!    garantie côté reti (un seul decode LLM actif à la fois) ; ici l'état est
+//!    volontairement conçu pour vivre comme local de la session de génération.
 //!  - **(D) état résident clonable sans aliasing.** Pas d'impl `Clone` : comme
 //!    `LinearAttentionCache` (qui met son état Metal à `None` au clone), un état
 //!    résident GPU est lié à une session et ne doit jamais être aliasé par copie.
