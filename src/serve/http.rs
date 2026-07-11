@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use super::anthropic::{handle_anthropic_messages, send_anthropic_error};
 use super::audio::{handle_speech, handle_transcription};
+use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
 use super::protocol::{
     json_bytes, sse_done, sse_event, ChatCompletionChunk, ChatCompletionRequest,
@@ -186,6 +187,9 @@ fn route_request<S: Write>(
             &request.body,
         ),
         ("POST", "/v1/audio/speech") => handle_speech(stream, state.audio_mut(), &request.body),
+        ("POST", "/v1/embeddings") => {
+            handle_embeddings(stream, state.embeddings_mut(), &request.body)
+        }
         _ => send_error(stream, 404, "endpoint inconnu"),
     }
 }
@@ -642,6 +646,27 @@ mod tests {
         let response = String::from_utf8_lossy(&stream.into_inner()).to_string();
         assert!(response.contains("HTTP/1.1 400 Bad Request"));
         assert!(error.to_string().contains("WAV") || error.to_string().contains("STT"));
+    }
+
+    #[test]
+    fn embeddings_route_without_model_returns_400() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let body = br#"{"model":"e5","input":"bonjour"}"#;
+        let raw = format!(
+            "POST /v1/embeddings HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            str::from_utf8(body).expect("invariant: JSON test UTF-8")
+        );
+        let mut stream = Cursor::new(raw.into_bytes());
+
+        let error = handle_connection(&mut stream, &mut state, None, far_deadline())
+            .expect_err("invariant: embeddings non configuré refusé");
+
+        assert!(error.to_string().contains("embeddings non configuré"));
+        let response = String::from_utf8(stream.into_inner()).expect("invariant: réponse UTF-8");
+        assert!(response.contains("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("embeddings non configuré"));
     }
 
     #[test]

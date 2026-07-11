@@ -11,6 +11,7 @@ mod anthropic;
 mod args;
 mod audio;
 mod cache;
+mod embeddings;
 mod error;
 mod http;
 mod protocol;

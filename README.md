@@ -5,12 +5,25 @@
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![python](https://img.shields.io/badge/python-0%20d%C3%A9pendance-success)
 
-Moteur d'inférence **Rust pur** sur Apple Silicon (kernels `metal-rs` bruts,
-zéro Python, zéro MLX). C'est le backend **prod par défaut** de
-[reti](../../README.md) (`--backends rust-metal`) : il fait tourner in-process
-le LLM, le STT et le TTS de la boucle vocale. `saragossa` est **open source**
-(double licence MIT ou Apache-2.0) et s'utilise aussi seul, hors reti, via son
-serveur `saragossa serve`.
+Moteur d'inférence **Rust pur** sur Apple Silicon : kernels `metal-rs` bruts,
+zéro Python, zéro dépendance à MLX ou CoreML. LLM, STT et TTS dans un seul
+binaire, utilisables en bibliothèque ou derrière le serveur HTTP
+OpenAI-compatible `saragossa serve`. Né comme le moteur du projet reti (agent
+vocal local), il s'utilise seul.
+
+## Positionnement
+
+Dans le paysage des backends d'inférence (Ollama, llama.cpp, vLLM, SGLang…),
+saragossa occupe le quadrant **latence mono-utilisateur × Apple Silicon** :
+
+- vLLM/SGLang/TGI/LMDeploy exigent un GPU NVIDIA ; ici tout est Metal natif.
+- Ollama et llama.cpp sont multi-plateformes généralistes ; saragossa est
+  optimisé pour UNE cible (GPU Apple Silicon, decode résident) et **dépasse
+  `mlx_lm` sur les MoE** à quantification comparable.
+- Optimisé latence locale (agent, copilote, boucle vocale), pas throughput
+  multi-tenant : le serveur est mono-thread par choix.
+- Cache chaud de préfixe par blocs avec snapshots GPU (même famille d'idées que
+  le RadixAttention de SGLang) : le multi-turn ne repaye pas son historique.
 
 ## Capacités
 
@@ -19,7 +32,19 @@ serveur `saragossa serve`.
 | LLM | Qwen3.x dense et MoE (27B/30B/35B-A3B), loader générique Llama/Mistral/Gemma 3 ; quantifs u4/u6/u8 gs32-128, scales/biases bf16 |
 | STT | Whisper large-v3-turbo (encodeur + décodeur résidents, GEMM Neural-Accelerators bf16) |
 | TTS | Qwen3-TTS : talker résident + codec GPU + streaming intra-phrase |
-| Serveur | `saragossa serve` : HTTP multi-modèle, endpoints **OpenAI** (`/v1/chat/completions`, `/v1/models`) et **Anthropic** (`/v1/messages`, pour Claude Code) ; cache chaud par blocs, garde OOM, pool de modèles LRU |
+| Embeddings | e5-small pur Rust (CPU), pour la mémoire sémantique / le RAG |
+| Serveur | HTTP multi-modèle mono-thread, pool LRU, cache chaud, garde OOM |
+
+### Endpoints `saragossa serve`
+
+| Endpoint | Rôle |
+|---|---|
+| `GET /v1/models` | Modèles servis |
+| `POST /v1/chat/completions` | Chat OpenAI-compatible (SSE ou non) |
+| `POST /v1/messages` | Shim Anthropic Messages + `tool_use` (pilotable par Claude Code) |
+| `POST /v1/audio/transcriptions` | STT Whisper (multipart WAV, opt-in `--stt-model`) |
+| `POST /v1/audio/speech` | TTS Qwen3 (JSON → WAV, opt-in `--tts-model`) |
+| `POST /v1/embeddings` | Embeddings e5-small (opt-in `--embed-model`) |
 
 ## Principes de conception
 
@@ -27,12 +52,9 @@ serveur `saragossa serve`.
   `commit_and_wait` par couche. Le per-op CPU-orchestré n'existe qu'en repli.
 - **Byte-identité comme gate** : toute optimisation prouve qu'elle préserve la
   sortie (oracles md5 e2e, goldens STT/TTS) ; les dérives near-tie sont
-  qualifiées (ids + top-5 + marge) et actées par dossier — jamais silencieuses.
+  qualifiées (ids + top-5 + marge) et actées — jamais silencieuses.
 - **Tout est débrayable** : chaque chemin optimisé a son kill-switch env ;
   les flags sont centralisés dans [`src/runtime_flags.rs`](src/runtime_flags.rs).
-- Les dossiers de mesure et de décision vivent dans
-  [`docs/reviews/`](../../docs/reviews/) ; l'architecture cible dans
-  l'[ADR 0011](../../docs/adr/0011-saragossa-moteur-modulaire.md).
 
 ## Perfs (mesurées le 2026-07-06, M5 Max)
 
@@ -42,26 +64,29 @@ serveur `saragossa serve`.
 - Prefill 35B : 1,0 s @2k · 3,5 s @8k · 23,3 s @32k.
 - STT Whisper turbo : rtf 0,107 · TTS : e2e 0,747, TTFA streaming ~1,2 s.
 
+Ces chiffres valent pour leur contexte (matériel, modèle, longueur) — mesurez
+sur votre machine avant de figer un choix.
+
 ## Usage
 
 ```bash
-# Bibliothèque : via reti (chemin nominal).
-cargo run --release -- boss --backends rust-metal
-
 # CLI de dev (le binaire requiert la feature devtools, activée par défaut) :
-# smoke LLM direct.
+# génération LLM directe.
 cargo run --release -p saragossa -- \
   --model-dir models/Qwen3.6-35B-A3B-oQ8 --backend metal \
   --prompt "Bonjour" --max-tokens 64 --temperature 0 --metrics
 ```
 
+En bibliothèque, les points d'entrée sont `qwen_loader` (LLM), `whisper` (STT),
+`tts` (TTS) et `text_embedder` (embeddings).
+
 ## Serveur `saragossa serve`
 
 Serveur HTTP local **mono-thread** (usage mono-utilisateur assumé), multi-modèle.
 Transport socket Unix par défaut (`/tmp/saragossa-serve.sock`, chmod 0600) ; le
-TCP loopback exige un bearer (`--api-key` ou `SARAGOSSA_API_KEY`). Read-timeout
-par connexion (30 s) et plafond dur `max_tokens` (4096) débrayent les requêtes
-qui dérapent.
+TCP loopback exige un bearer (`--api-key` ou `SARAGOSSA_API_KEY`). Deadline de
+lecture par connexion (30 s) et plafond dur `max_tokens` (4096) débrayent les
+requêtes qui dérapent.
 
 ```bash
 # OpenAI-compatible sur socket Unix.
@@ -110,25 +135,12 @@ le header `x-saragossa-reused-prefix-tokens` rapporte la reprise.
 | `RETI_SERVE_MEMORY_HEADROOM_BYTES` | 2 Gio | Marge hôte conservée hors process |
 | `RETI_SERVE_MEMORY_CAP_BYTES` | auto | Plafond mémoire statique explicite |
 
-### Shim Anthropic `/v1/messages` (Claude Code)
-
-`POST /v1/messages` accepte le format Anthropic Messages en plus des routes OpenAI,
-pour piloter le moteur local depuis Claude Code :
-
-- Les `tools` déclarés sont rendus en bloc système (signatures `<tools>` + protocole
-  d'appel) ; la sortie `<tool_call>{…}</tool_call>` du modèle est reparsée en blocs
-  `tool_use` (`id`, `name`, `input` JSON). Les `tool_result` entrants deviennent des
-  messages `tool`.
-- Streaming SSE Anthropic (`message_start` → `content_block_*` → `message_delta` →
-  `message_stop`) et non-streaming. `stop_reason` mappé sur
-  `tool_use` / `max_tokens` / `stop_sequence` / `end_turn` ; erreurs au format Anthropic.
-
 ## Features
 
 | Feature | Défaut | Rôle |
 |---|---|---|
 | `metal` | oui | Kernels GPU Metal (macOS ; `src/kernels.metal` embarqué au build, compilé au runtime) |
-| `devtools` | oui (lib) / requis (bin) | Harnais bench/diagnostic (DFlash, MTP, doctor) — exclu du binaire reti prod |
+| `devtools` | oui (lib) / requis (bin) | Harnais bench/diagnostic (DFlash, MTP, doctor) — exclu des binaires de prod |
 
 Prérequis : Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`).
 

@@ -269,7 +269,10 @@ fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
 #[derive(Debug)]
 struct MultipartField {
     name: String,
-    #[allow(dead_code, reason = "conservé pour le diagnostic des parties multipart")]
+    #[allow(
+        dead_code,
+        reason = "conservé pour le diagnostic des parties multipart"
+    )]
     filename: Option<String>,
     data: Vec<u8>,
 }
@@ -346,8 +349,7 @@ fn parse_part(part: &[u8]) -> ServeResult<MultipartField> {
             (name, filename) = parse_content_disposition(value);
         }
     }
-    let name =
-        name.ok_or_else(|| ServeError::Http("Content-Disposition sans name".to_string()))?;
+    let name = name.ok_or_else(|| ServeError::Http("Content-Disposition sans name".to_string()))?;
     Ok(MultipartField {
         name,
         filename,
@@ -628,8 +630,8 @@ mod tests {
         let mut stream = Cursor::new(Vec::new());
         let body = br#"{"model":"reti-tts","input":"   "}"#;
 
-        let error = handle_speech(&mut stream, &mut audio, body)
-            .expect_err("invariant: input vide refusé");
+        let error =
+            handle_speech(&mut stream, &mut audio, body).expect_err("invariant: input vide refusé");
 
         assert!(error.to_string().contains("'input' requis"));
     }

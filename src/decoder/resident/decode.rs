@@ -650,11 +650,10 @@ impl CausalDecoder {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-
     /// Dispatch d'un pas de decode per-op (qui prend lui-même le chemin résident
     /// full-attn 1b si `cache.full` est présent). Le chemin résident COMPLET (1c)
     /// est dispatché séparément dans la boucle de génération (renvoie le token).
+    /// Hors metal, le garde interne est faux et on retombe sur le per-op cache.
     ///
     /// # Errors
     ///

@@ -18,6 +18,7 @@ use super::audio::AudioState;
 use super::cache::{
     estimate_model_bytes, BlockAwarePrefixCache, BlockHash, MemoryProjection, ServeMemoryGuard,
 };
+use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
 use super::protocol::{ChatCompletionRequest, ModelInfo, ModelsResponse, Usage};
 use crate::RuntimeKind;
@@ -78,6 +79,7 @@ pub(super) struct ServeState {
     clock: u64,
     memory_guard: ServeMemoryGuard,
     audio: AudioState,
+    embeddings: EmbeddingsState,
 }
 
 impl ServeState {
@@ -93,6 +95,7 @@ impl ServeState {
             clock: 0,
             memory_guard: ServeMemoryGuard::new(),
             audio: AudioState::new(args),
+            embeddings: EmbeddingsState::new(args),
         }
     }
 
@@ -104,6 +107,11 @@ impl ServeState {
     /// Renvoie l'état audio mutable pour les endpoints STT/TTS.
     pub(super) fn audio_mut(&mut self) -> &mut AudioState {
         &mut self.audio
+    }
+
+    /// Renvoie l'état embeddings mutable pour l'endpoint `/v1/embeddings`.
+    pub(super) fn embeddings_mut(&mut self) -> &mut EmbeddingsState {
+        &mut self.embeddings
     }
 
     /// Charge tous les modèles configurés.

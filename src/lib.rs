@@ -31,6 +31,7 @@ pub mod runtime_preset;
 pub mod safetensor;
 pub mod sampling;
 pub mod tensor;
+pub mod text_embedder;
 pub mod tokenizer;
 pub mod tts;
 pub mod tts_clone;
@@ -83,6 +84,7 @@ pub use runtime_preset::{
 pub use safetensor::{load_f32_tensor, load_f32_tensors, load_float_tensor, load_float_tensors};
 pub use sampling::{argmax, sample_token, sample_token_top_k_top_p, softmax, DeterministicSampler};
 pub use tensor::Tensor;
+pub use text_embedder::{TextEmbedError, TextEmbedder, DEFAULT_TEXT_EMBED_REPO, TEXT_EMBED_DIM};
 pub use tokenizer::RustTokenizer;
 pub use tts::{
     TtsAssets, TtsCodecCatalog, TtsForwardOutput, TtsModel, TtsModelConfig, TtsModelKind,
