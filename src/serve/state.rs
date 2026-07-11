@@ -14,6 +14,7 @@ use saragossa::{
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
+use super::audio::AudioState;
 use super::cache::{
     estimate_model_bytes, BlockAwarePrefixCache, BlockHash, MemoryProjection, ServeMemoryGuard,
 };
@@ -76,6 +77,7 @@ pub(super) struct ServeState {
     max_tokens_cap: usize,
     clock: u64,
     memory_guard: ServeMemoryGuard,
+    audio: AudioState,
 }
 
 impl ServeState {
@@ -90,12 +92,18 @@ impl ServeState {
             max_tokens_cap: args.max_tokens_cap,
             clock: 0,
             memory_guard: ServeMemoryGuard::new(),
+            audio: AudioState::new(args),
         }
     }
 
     /// Renvoie le plafond serveur du budget de génération.
     pub(super) fn max_tokens_cap(&self) -> usize {
         self.max_tokens_cap
+    }
+
+    /// Renvoie l'état audio mutable pour les endpoints STT/TTS.
+    pub(super) fn audio_mut(&mut self) -> &mut AudioState {
+        &mut self.audio
     }
 
     /// Charge tous les modèles configurés.

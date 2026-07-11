@@ -29,6 +29,10 @@ pub(super) struct ServeArgs {
     pub(super) api_key: Option<String>,
     /// Registre des modèles exposés.
     pub(super) models: Vec<ServeModelConfig>,
+    /// Répertoire du modèle STT Whisper exposé sur `/v1/audio/transcriptions`.
+    pub(super) stt_model: Option<PathBuf>,
+    /// Répertoire du modèle TTS Qwen3 exposé sur `/v1/audio/speech`.
+    pub(super) tts_model: Option<PathBuf>,
     /// Backend d'inférence.
     pub(super) backend: RuntimeKind,
     /// Charge tous les modèles au démarrage.
@@ -57,6 +61,8 @@ impl ServeArgs {
         let mut api_key = env::var(API_KEY_ENV).ok().filter(|value| !value.is_empty());
         let mut models = Vec::new();
         let mut model_flags_seen = false;
+        let mut stt_model = None;
+        let mut tts_model = None;
         let mut backend = RuntimeKind::default_backend();
         let mut preload = false;
         let mut read_timeout = Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS);
@@ -102,6 +108,12 @@ impl ServeArgs {
                         },
                     )?;
                 }
+                "--stt-model" => {
+                    stt_model = Some(next_value(&mut iter, "--stt-model")?.into());
+                }
+                "--tts-model" => {
+                    tts_model = Some(next_value(&mut iter, "--tts-model")?.into());
+                }
                 "--backend" | "--runtime" => {
                     backend = RuntimeKind::parse(&next_value(&mut iter, "--backend")?)
                         .map_err(|e| ServeError::args(e.to_string()))?;
@@ -133,6 +145,8 @@ impl ServeArgs {
             socket,
             api_key,
             models,
+            stt_model,
+            tts_model,
             backend,
             preload,
             read_timeout,
@@ -151,17 +165,21 @@ pub(super) fn help_text() -> String {
     format!(
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN] [--model ID=DIR]... [--model-27b DIR] [--model-35b DIR] \\
-         [--backend cpu|metal] [--preload]\n\
+         [--stt-model DIR] [--tts-model DIR] [--backend cpu|metal] [--preload]\n\
          Models: repeat --model to expose any supported checkpoint. \\
          Backward-compatible aliases: --model-27b registers reti-27b, \\
          --model-35b registers reti-35b. Without model flags, the old reti-27b \\
          and reti-35b defaults are registered.\n\
+         Audio (opt-in, lazy-loaded): --stt-model enables Whisper STT on \\
+         /v1/audio/transcriptions, --tts-model enables Qwen3 TTS on \\
+         /v1/audio/speech.\n\
          Safety defaults: --read-timeout-secs {DEFAULT_READ_TIMEOUT_SECS}, \\
          --max-tokens-cap {DEFAULT_MAX_TOKENS_CAP}.\n\
          Default transport: Unix socket {DEFAULT_SOCKET} (0600). \\
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\
-         Endpoints: GET /v1/models, POST /v1/chat/completions"
+         Endpoints: GET /v1/models, POST /v1/chat/completions, \\
+         POST /v1/audio/transcriptions, POST /v1/audio/speech"
     )
 }
 

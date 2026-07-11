@@ -15,6 +15,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use serde::Serialize;
 
 use super::anthropic::{handle_anthropic_messages, send_anthropic_error};
+use super::audio::{handle_speech, handle_transcription};
 use super::error::{ServeError, ServeResult};
 use super::protocol::{
     json_bytes, sse_done, sse_event, ChatCompletionChunk, ChatCompletionRequest,
@@ -178,6 +179,13 @@ fn route_request<S: Write>(
             Ok(()) => Ok(()),
             Err(error) => send_anthropic_error(stream, error_status(&error), &error.to_string()),
         },
+        ("POST", "/v1/audio/transcriptions") => handle_transcription(
+            stream,
+            state.audio_mut(),
+            request.header("content-type"),
+            &request.body,
+        ),
+        ("POST", "/v1/audio/speech") => handle_speech(stream, state.audio_mut(), &request.body),
         _ => send_error(stream, 404, "endpoint inconnu"),
     }
 }
@@ -582,6 +590,58 @@ mod tests {
         let response = String::from_utf8(stream.into_inner()).expect("invariant: réponse UTF-8");
         assert!(response.contains("HTTP/1.1 400 Bad Request"));
         assert!(response.contains("plafond serveur 4"));
+    }
+
+    #[test]
+    fn audio_speech_route_without_model_returns_400() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let body = br#"{"model":"reti-tts","input":"Bonjour"}"#;
+        let raw = format!(
+            "POST /v1/audio/speech HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            str::from_utf8(body).expect("invariant: JSON test UTF-8")
+        );
+        let mut stream = Cursor::new(raw.into_bytes());
+
+        let error = handle_connection(&mut stream, &mut state, None, far_deadline())
+            .expect_err("invariant: TTS non configuré refusé");
+
+        assert!(error.to_string().contains("TTS non configuré"));
+        let response = String::from_utf8(stream.into_inner()).expect("invariant: réponse UTF-8");
+        assert!(response.contains("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("TTS non configuré"));
+    }
+
+    #[test]
+    fn audio_transcription_route_without_model_returns_400() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let boundary = "BND";
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\n",
+        );
+        body.extend_from_slice(b"RIFF0000WAVE");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let raw_head = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut raw = raw_head.into_bytes();
+        raw.extend_from_slice(&body);
+        let mut stream = Cursor::new(raw);
+
+        let error = handle_connection(&mut stream, &mut state, None, far_deadline())
+            .expect_err("invariant: STT non configuré ou WAV refusé");
+
+        // Le WAV factice est rejeté avant le chargement modèle : dans les deux cas
+        // la route est bien câblée et renvoie une erreur 400.
+        let response = String::from_utf8_lossy(&stream.into_inner()).to_string();
+        assert!(response.contains("HTTP/1.1 400 Bad Request"));
+        assert!(error.to_string().contains("WAV") || error.to_string().contains("STT"));
     }
 
     #[test]

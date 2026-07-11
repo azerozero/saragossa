@@ -9,6 +9,7 @@
 
 mod anthropic;
 mod args;
+mod audio;
 mod cache;
 mod error;
 mod http;
