@@ -16,6 +16,7 @@ mod error;
 mod http;
 mod protocol;
 mod state;
+mod streaming;
 
 use std::error::Error;
 

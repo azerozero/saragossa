@@ -228,6 +228,32 @@ fn snapshot_prompt_state_greedy_matches_cold_prefill() {
 }
 
 #[test]
+fn callback_greedy_observes_tokens_and_can_stop() {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())
+        .expect("invariant: poids attention valides");
+    let state = model
+        .prefill_prompt_state_uncached(&[0])
+        .expect("invariant: prefill valide");
+    let mut seen = Vec::new();
+
+    let output = model
+        .generate_greedy_timed_from_prompt_state_with_options_and_callback(
+            state,
+            Duration::ZERO,
+            5,
+            &GenerationOptions::default(),
+            |token| {
+                seen.push(token);
+                seen.len() < 2
+            },
+        )
+        .expect("invariant: génération callback valide");
+
+    assert_eq!(output.tokens, seen);
+    assert_eq!(output.tokens.len(), 2);
+}
+
+#[test]
 fn hybrid_snapshot_prompt_state_greedy_matches_cold_prefill() {
     let config = hybrid_config(4);
     let model =

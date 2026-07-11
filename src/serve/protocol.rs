@@ -144,6 +144,22 @@ impl ModelsResponse {
     }
 }
 
+/// Réponse `/health`.
+///
+/// Statut seul, volontairement : la liste des modèles vit derrière le bearer
+/// (`/v1/models`) — l'exemption d'auth du health-check ne doit rien fuiter.
+#[derive(Debug, Serialize)]
+pub(super) struct HealthResponse {
+    status: &'static str,
+}
+
+impl HealthResponse {
+    /// Construit la réponse de santé nominale.
+    pub(super) fn ok() -> Self {
+        Self { status: "ok" }
+    }
+}
+
 /// Entrée de modèle OpenAI.
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct ModelInfo {

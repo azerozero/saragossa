@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::time::Duration;
 
 use saragossa::decoder::GenerationTimings;
@@ -246,6 +247,103 @@ fn sse_events_stream_tool_use_blocks() {
 }
 
 #[test]
+fn live_blocks_stream_text_deltas() {
+    let completion = fake_completion("reti-35b", "salut", "stop", None, 5, 2);
+    let mut blocks = AnthropicLiveBlocks::new();
+    let mut stream = Vec::new();
+
+    blocks
+        .push_text_delta(&mut stream, "sal")
+        .expect("invariant: delta texte sérialisable");
+    blocks
+        .push_text_delta(&mut stream, "ut")
+        .expect("invariant: delta texte sérialisable");
+    let has_tool_use = blocks
+        .finish(&mut stream, &completion)
+        .expect("invariant: fin bloc texte sérialisable");
+
+    assert!(!has_tool_use);
+    let events = sse_events(http_bodyless(&stream));
+    assert_eq!(
+        events
+            .iter()
+            .map(|(event, _)| event.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop"
+        ]
+    );
+    assert_eq!(events[1].1["delta"]["text"], "sal");
+    assert_eq!(events[2].1["delta"]["text"], "ut");
+}
+
+#[test]
+fn live_blocks_keep_tool_use_structured() {
+    let completion = fake_completion(
+        "reti-35b",
+        r#"<tool_call>{"name":"Bash","arguments":{"command":"pwd"}}</tool_call>"#,
+        "stop",
+        None,
+        5,
+        4,
+    );
+    let mut blocks = AnthropicLiveBlocks::new();
+    let mut stream = Vec::new();
+
+    blocks
+        .push_text_delta(&mut stream, "<tool")
+        .expect("invariant: préfixe tool retenu");
+    blocks
+        .push_text_delta(&mut stream, r#"_call>{"name":"Bash"}"#)
+        .expect("invariant: tool call retenu");
+
+    assert!(stream.is_empty());
+    let has_tool_use = blocks
+        .finish(&mut stream, &completion)
+        .expect("invariant: tool use sérialisable");
+
+    assert!(has_tool_use);
+    let events = sse_events(http_bodyless(&stream));
+    assert_eq!(events[0].1["content_block"]["type"], "tool_use");
+    assert_eq!(events[0].1["content_block"]["name"], "Bash");
+    assert_eq!(events[1].1["delta"]["type"], "input_json_delta");
+    assert_eq!(events[1].1["delta"]["partial_json"], r#"{"command":"pwd"}"#);
+    assert_eq!(events[2].0, "content_block_stop");
+}
+
+#[test]
+fn live_blocks_detect_tool_use_after_preamble() {
+    assert_live_tool_stream_matches_non_stream(
+        r#"Je lance l'outil.
+<tool_call>{"name":"Bash","arguments":{"command":"pwd"}}</tool_call>"#,
+        &[
+            "Je lance l'outil.\n",
+            "<tool",
+            r#"_call>{"name":"Bash","arguments":{"command":"pwd"}}"#,
+        ],
+        "Je lance l'outil.",
+    );
+}
+
+#[test]
+fn live_blocks_strip_think_then_detect_tool_use_after_preamble() {
+    assert_live_tool_stream_matches_non_stream(
+        r#"<think>Je vérifie le bon outil.</think>
+
+Je lance l'outil.
+<tool_call>{"name":"Bash","arguments":{"command":"pwd"}}</tool_call>"#,
+        &[
+            "<think>Je vérifie le bon outil.</think>\n\nJe lance l'outil.\n<tool",
+            r#"_call>{"name":"Bash","arguments":{"command":"pwd"}}"#,
+        ],
+        "Je lance l'outil.",
+    );
+}
+
+#[test]
 fn anthropic_error_uses_messages_error_shape() {
     let mut stream = Vec::new();
 
@@ -286,6 +384,87 @@ fn handler_smoke_returns_anthropic_json_with_mock_completion() {
     );
 }
 
+fn assert_live_tool_stream_matches_non_stream(content: &str, deltas: &[&str], expected_text: &str) {
+    let completion = fake_completion("reti-35b", content, "stop", None, 5, 8);
+    let non_stream = serde_json::to_value(AnthropicMessageResponse::from_completion(&completion))
+        .expect("invariant: réponse non-stream sérialisable");
+    let mut blocks = AnthropicLiveBlocks::new();
+    let mut stream = Vec::new();
+
+    for delta in deltas {
+        blocks
+            .push_text_delta(&mut stream, delta)
+            .expect("invariant: delta Anthropic live sérialisable");
+    }
+    let has_tool_use = blocks
+        .finish(&mut stream, &completion)
+        .expect("invariant: fin Anthropic live sérialisable");
+
+    assert!(has_tool_use);
+    assert_eq!(anthropic_stop_reason(&completion, has_tool_use), "tool_use");
+    assert_eq!(non_stream["stop_reason"], "tool_use");
+    assert_eq!(non_stream["content"][0]["text"], expected_text);
+    assert_eq!(non_stream["content"][1]["type"], "tool_use");
+
+    let body = http_bodyless(&stream);
+    assert!(!body.contains("<tool_call"));
+    assert!(!body.contains("</tool_call>"));
+    assert!(!body.contains("<think>"));
+    let events = sse_events(body);
+    assert_eq!(
+        events
+            .iter()
+            .map(|(event, _)| event.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop"
+        ]
+    );
+    let streamed_text = events
+        .iter()
+        .filter_map(|(_, value)| {
+            if value["delta"]["type"] == "text_delta" {
+                value["delta"]["text"].as_str()
+            } else {
+                None
+            }
+        })
+        .collect::<String>();
+    let tool_start = events
+        .iter()
+        .find(|(_, value)| value["content_block"]["type"] == "tool_use")
+        .expect("invariant: bloc tool_use streamé");
+    let partial_json = events
+        .iter()
+        .find_map(|(_, value)| {
+            if value["delta"]["type"] == "input_json_delta" {
+                value["delta"]["partial_json"].as_str()
+            } else {
+                None
+            }
+        })
+        .expect("invariant: delta JSON outil streamé");
+    let streamed_input: Value =
+        serde_json::from_str(partial_json).expect("invariant: delta outil JSON valide");
+    let non_stream_text = non_stream["content"][0]["text"]
+        .as_str()
+        .expect("invariant: texte non-stream");
+
+    assert_eq!(streamed_text, non_stream_text);
+    assert_eq!(streamed_text, expected_text);
+    assert_eq!(tool_start.1["index"], 1);
+    assert_eq!(
+        tool_start.1["content_block"]["name"],
+        non_stream["content"][1]["name"]
+    );
+    assert_eq!(streamed_input, non_stream["content"][1]["input"]);
+}
+
 fn fake_completion(
     model: &str,
     content: &str,
@@ -307,11 +486,69 @@ fn fake_completion(
     }
 }
 
+fn send_anthropic_sse<S: Write>(stream: &mut S, completion: &ServedCompletion) -> ServeResult<()> {
+    let output = AssistantOutput::parse(&completion.content);
+    write_headers(
+        stream,
+        200,
+        "OK",
+        "text/event-stream; charset=utf-8",
+        None,
+        completion.metric_headers(),
+    )?;
+    let message_id = response_id();
+    write_anthropic_sse_event(
+        stream,
+        "message_start",
+        &json!({
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": completion.model.as_str(),
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": completion.usage.prompt_tokens(),
+                    "output_tokens": 0
+                }
+            }
+        }),
+    )?;
+    for (index, block) in output.blocks.iter().enumerate() {
+        write_anthropic_content_block(stream, index, block)?;
+    }
+    write_anthropic_sse_event(
+        stream,
+        "message_delta",
+        &json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": anthropic_stop_reason(completion, output.has_tool_use),
+                "stop_sequence": anthropic_stop_sequence(completion, output.has_tool_use)
+            },
+            "usage": {
+                "output_tokens": completion.usage.completion_tokens()
+            }
+        }),
+    )?;
+    write_anthropic_sse_event(stream, "message_stop", &json!({"type": "message_stop"}))?;
+    stream
+        .flush()
+        .map_err(|e| ServeError::io("flush SSE Anthropic", e))
+}
+
 fn http_body(bytes: &[u8]) -> &str {
     let text = std::str::from_utf8(bytes).expect("invariant: HTTP UTF-8");
     text.split_once("\r\n\r\n")
         .map(|(_, body)| body)
         .expect("invariant: séparation headers/body")
+}
+
+fn http_bodyless(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes).expect("invariant: SSE UTF-8")
 }
 
 fn sse_events(body: &str) -> Vec<(String, Value)> {

@@ -676,6 +676,50 @@ impl CausalDecoder {
         max_new_tokens: usize,
         options: &GenerationOptions,
     ) -> Result<GenerationOutput> {
+        self.generate_greedy_timed_from_prompt_state_inner(
+            state,
+            prefill,
+            max_new_tokens,
+            options,
+            true,
+            |_| true,
+        )
+    }
+
+    /// Génère depuis un état pré-rempli en appelant `on_token` par token.
+    ///
+    /// Arrête la boucle si `on_token` renvoie `false`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si l'état, les options ou le forward échouent.
+    pub fn generate_greedy_timed_from_prompt_state_with_options_and_callback(
+        &self,
+        state: CausalDecoderPromptState,
+        prefill: Duration,
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        on_token: impl FnMut(usize) -> bool,
+    ) -> Result<GenerationOutput> {
+        self.generate_greedy_timed_from_prompt_state_inner(
+            state,
+            prefill,
+            max_new_tokens,
+            options,
+            false,
+            on_token,
+        )
+    }
+
+    fn generate_greedy_timed_from_prompt_state_inner(
+        &self,
+        state: CausalDecoderPromptState,
+        prefill: Duration,
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        allow_pipelined: bool,
+        on_token: impl FnMut(usize) -> bool,
+    ) -> Result<GenerationOutput> {
         if max_new_tokens == 0 {
             return Ok(GenerationOutput {
                 tokens: Vec::new(),
@@ -696,6 +740,8 @@ impl CausalDecoder {
             prefill,
             max_new_tokens,
             options,
+            allow_pipelined,
+            on_token,
         )
     }
 
@@ -706,6 +752,8 @@ impl CausalDecoder {
         prefill: Duration,
         max_new_tokens: usize,
         options: &GenerationOptions,
+        allow_pipelined: bool,
+        mut on_token: impl FnMut(usize) -> bool,
     ) -> Result<GenerationOutput> {
         if max_new_tokens == 0 {
             return Ok(GenerationOutput {
@@ -750,7 +798,8 @@ impl CausalDecoder {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let decode_profiler = DecodeProfiler::start();
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if use_resident_full
+        if allow_pipelined
+            && use_resident_full
             && decode_pipeline_enabled()
             && decode_min_interval().is_none()
             && options.stop_sequences.is_empty()
@@ -788,6 +837,9 @@ impl CausalDecoder {
                 break;
             }
             generated.push(token);
+            if !on_token(token) {
+                break;
+            }
             if generated_matches_stop_sequence(&generated, &options.stop_sequences) {
                 break;
             }

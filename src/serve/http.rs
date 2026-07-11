@@ -20,9 +20,10 @@ use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
 use super::protocol::{
     json_bytes, sse_done, sse_event, ChatCompletionChunk, ChatCompletionRequest,
-    ChatCompletionResponse,
+    ChatCompletionResponse, HealthResponse,
 };
-use super::state::{ServeState, ServedCompletion};
+use super::state::ServeState;
+use super::streaming::CompletionStreamEvent;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -106,14 +107,20 @@ pub(super) fn serve_unix(
 fn configure_tcp_stream(stream: &TcpStream, read_timeout: Duration) -> ServeResult<()> {
     stream
         .set_read_timeout(Some(read_timeout))
-        .map_err(|e| ServeError::io("set read timeout TCP", e))
+        .map_err(|e| ServeError::io("set read timeout TCP", e))?;
+    stream
+        .set_write_timeout(Some(read_timeout))
+        .map_err(|e| ServeError::io("set write timeout TCP", e))
 }
 
 #[cfg(unix)]
 fn configure_unix_stream(stream: &UnixStream, read_timeout: Duration) -> ServeResult<()> {
     stream
         .set_read_timeout(Some(read_timeout))
-        .map_err(|e| ServeError::io("set read timeout socket Unix", e))
+        .map_err(|e| ServeError::io("set read timeout socket Unix", e))?;
+    stream
+        .set_write_timeout(Some(read_timeout))
+        .map_err(|e| ServeError::io("set write timeout socket Unix", e))
 }
 
 #[cfg(unix)]
@@ -165,6 +172,9 @@ fn route_request<S: Write>(
         .split('?')
         .next()
         .unwrap_or(request.path.as_str());
+    if request.method == "GET" && path == "/health" {
+        return send_json(stream, 200, &HealthResponse::ok(), Vec::new());
+    }
     if let Some(expected) = api_key {
         if !is_authorized(&request, expected) {
             if path == "/v1/messages" {
@@ -203,10 +213,10 @@ fn handle_chat<S: Write>(
         .map_err(|e| ServeError::json("désérialisation chat/completions", e))?;
     chat.max_tokens_capped(state.max_tokens_cap())?;
     let stream_enabled = chat.stream;
-    let completion = state.complete(chat)?;
     if stream_enabled {
-        send_sse(stream, completion)
+        send_sse_streaming(stream, state, chat)
     } else {
+        let completion = state.complete(chat)?;
         let headers = completion.metric_headers();
         let response = ChatCompletionResponse::new(
             &completion.model,
@@ -218,23 +228,47 @@ fn handle_chat<S: Write>(
     }
 }
 
-fn send_sse<S: Write>(stream: &mut S, completion: ServedCompletion) -> ServeResult<()> {
-    let headers = completion.metric_headers();
-    write_headers(
-        stream,
-        200,
-        "OK",
-        "text/event-stream; charset=utf-8",
-        None,
-        headers,
-    )?;
-    write_sse_event(stream, &ChatCompletionChunk::role(&completion.model))?;
-    if !completion.content.is_empty() {
-        write_sse_event(
-            stream,
-            &ChatCompletionChunk::content(&completion.model, completion.content),
-        )?;
-    }
+fn send_sse_streaming<S: Write>(
+    stream: &mut S,
+    state: &mut ServeState,
+    chat: ChatCompletionRequest,
+) -> ServeResult<()> {
+    let mut stream_started = false;
+    let mut stream_model = String::new();
+    let result = state.complete_streaming(chat, |event| match event {
+        CompletionStreamEvent::Start(start) => {
+            stream_model = start.model.clone();
+            stream_started = true;
+            write_headers(
+                stream,
+                200,
+                "OK",
+                "text/event-stream; charset=utf-8",
+                None,
+                start.metric_headers(),
+            )?;
+            write_sse_event(stream, &ChatCompletionChunk::role(&start.model))?;
+            stream.flush().map_err(|e| ServeError::io("flush SSE", e))
+        }
+        CompletionStreamEvent::Delta(delta) => {
+            if delta.is_empty() {
+                return Ok(());
+            }
+            write_sse_event(
+                stream,
+                &ChatCompletionChunk::content(&stream_model, delta.to_string()),
+            )?;
+            stream.flush().map_err(|e| ServeError::io("flush SSE", e))
+        }
+    });
+    let completion = match result {
+        Ok(completion) => completion,
+        Err(error) if stream_started => {
+            eprintln!("saragossa serve stream interrompu: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     write_sse_event(
         stream,
         &ChatCompletionChunk::done(&completion.model, completion.finish_reason),
@@ -493,6 +527,9 @@ mod tests {
     use std::net::TcpStream;
     use std::time::Duration;
 
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+
     use super::super::args::ServeArgs;
     use super::super::state::ServeState;
     use super::*;
@@ -554,8 +591,52 @@ mod tests {
     }
 
     #[test]
-    fn accepted_tcp_stream_gets_read_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("invariant: port local disponible");
+    fn health_route_skips_bearer_without_leaking_models() {
+        let args = ServeArgs::parse([
+            "--model".to_string(),
+            "alpha=/m/a".to_string(),
+            "--model".to_string(),
+            "beta=/m/b".to_string(),
+        ])
+        .expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let raw = b"GET /health HTTP/1.1\r\n\r\n";
+        let mut stream = Cursor::new(raw.to_vec());
+
+        handle_connection(&mut stream, &mut state, Some("secret"), far_deadline())
+            .expect("invariant: health non authentifie");
+
+        let response = String::from_utf8(stream.into_inner()).expect("invariant: reponse UTF-8");
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains(r#""status":"ok""#));
+        // La liste des modèles vit derrière le bearer (/v1/models) : l'endpoint
+        // exempté d'auth ne doit pas la répéter.
+        assert!(!response.contains("alpha"));
+        assert!(!response.contains("models"));
+    }
+
+    #[test]
+    fn bearer_still_protects_other_routes() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let raw = b"GET /v1/models HTTP/1.1\r\n\r\n";
+        let mut stream = Cursor::new(raw.to_vec());
+
+        handle_connection(&mut stream, &mut state, Some("secret"), far_deadline())
+            .expect("invariant: erreur auth serialisee");
+
+        let response = String::from_utf8(stream.into_inner()).expect("invariant: reponse UTF-8");
+        assert!(response.contains("HTTP/1.1 401 Unauthorized"));
+        assert!(response.contains("authentification bearer requise"));
+    }
+
+    #[test]
+    fn accepted_tcp_stream_gets_read_and_write_timeout() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("invariant: port local disponible: {error}"),
+        };
         let addr = listener
             .local_addr()
             .expect("invariant: adresse listener disponible");
@@ -571,7 +652,36 @@ mod tests {
                 .expect("invariant: timeout TCP lisible"),
             Some(timeout)
         );
+        assert_eq!(
+            stream
+                .write_timeout()
+                .expect("invariant: timeout écriture TCP lisible"),
+            Some(timeout)
+        );
         drop(client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_unix_stream_gets_read_and_write_timeout() {
+        let (stream, peer) = UnixStream::pair().expect("invariant: paire Unix locale possible");
+        let timeout = Duration::from_secs(7);
+
+        configure_unix_stream(&stream, timeout).expect("invariant: timeout Unix applicable");
+
+        assert_eq!(
+            stream
+                .read_timeout()
+                .expect("invariant: timeout Unix lisible"),
+            Some(timeout)
+        );
+        assert_eq!(
+            stream
+                .write_timeout()
+                .expect("invariant: timeout écriture Unix lisible"),
+            Some(timeout)
+        );
+        drop(peer);
     }
 
     #[test]

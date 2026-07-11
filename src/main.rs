@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod bench_serve;
 mod serve;
 
 use std::env;
@@ -77,6 +78,7 @@ fn run() -> CliResult<()> {
         match command.as_str() {
             "doctor" => return doctor_bench::run_doctor(raw_args.into_iter().skip(1)),
             "bench" => return doctor_bench::run_bench(raw_args.into_iter().skip(1)),
+            "bench-serve" => return bench_serve::run(raw_args.into_iter().skip(1)),
             "serve" => return serve::run(raw_args.into_iter().skip(1)),
             _ => {}
         }
@@ -689,7 +691,7 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error> {
 
 fn print_help() {
     println!(
-        "Usage: saragossa <doctor|bench|serve> [options]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N]\nDefault backend: metal when available, cpu otherwise.\nSet RETI_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set RETI_RUST_DFLASH_ACCEPTANCE=1 with RETI_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
+        "Usage: saragossa <doctor|bench|serve|bench-serve> [options]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N]\nDefault backend: metal when available, cpu otherwise.\nSet RETI_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set RETI_RUST_DFLASH_ACCEPTANCE=1 with RETI_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
     );
 }
 

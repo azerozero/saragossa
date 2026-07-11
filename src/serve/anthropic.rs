@@ -10,6 +10,11 @@ use super::error::{ServeError, ServeResult};
 use super::http::{send_json, write_headers};
 use super::protocol::{json_bytes, ChatCompletionRequest, StopSpec, Usage, WireMessage};
 use super::state::{ServeState, ServedCompletion};
+use super::streaming::CompletionStreamEvent;
+
+mod live;
+
+use self::live::AnthropicLiveBlocks;
 
 /// Sert `POST /v1/messages`.
 pub(super) fn handle_anthropic_messages<S: Write>(
@@ -17,7 +22,16 @@ pub(super) fn handle_anthropic_messages<S: Write>(
     state: &mut ServeState,
     body: &[u8],
 ) -> ServeResult<()> {
-    handle_anthropic_messages_with_completion(stream, body, |request| state.complete(request))
+    let request = parse_anthropic_messages_request(body)?;
+    let stream_enabled = request.stream;
+    let chat = request.to_chat_request()?;
+    if stream_enabled {
+        send_anthropic_sse_streaming(stream, state, chat)
+    } else {
+        let completion = state.complete(chat)?;
+        let response = AnthropicMessageResponse::from_completion(&completion);
+        send_json(stream, 200, &response, completion.metric_headers())
+    }
 }
 
 pub(super) fn send_anthropic_error<S: Write>(
@@ -35,6 +49,7 @@ pub(super) fn send_anthropic_error<S: Write>(
     send_json(stream, status, &body, Vec::new())
 }
 
+#[cfg(test)]
 fn handle_anthropic_messages_with_completion<S, F>(
     stream: &mut S,
     body: &[u8],
@@ -44,17 +59,16 @@ where
     S: Write,
     F: FnOnce(ChatCompletionRequest) -> ServeResult<ServedCompletion>,
 {
-    let request: AnthropicMessagesRequest = serde_json::from_slice(body)
-        .map_err(|e| ServeError::json("désérialisation messages Anthropic", e))?;
-    let stream_enabled = request.stream;
+    let request = parse_anthropic_messages_request(body)?;
     let chat = request.to_chat_request()?;
     let completion = complete(chat)?;
-    if stream_enabled {
-        send_anthropic_sse(stream, &completion)
-    } else {
-        let response = AnthropicMessageResponse::from_completion(&completion);
-        send_json(stream, 200, &response, completion.metric_headers())
-    }
+    let response = AnthropicMessageResponse::from_completion(&completion);
+    send_json(stream, 200, &response, completion.metric_headers())
+}
+
+fn parse_anthropic_messages_request(body: &[u8]) -> ServeResult<AnthropicMessagesRequest> {
+    serde_json::from_slice(body)
+        .map_err(|e| ServeError::json("désérialisation messages Anthropic", e))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -553,48 +567,76 @@ fn strip_think_blocks(raw: &str) -> String {
     out
 }
 
-fn send_anthropic_sse<S: Write>(stream: &mut S, completion: &ServedCompletion) -> ServeResult<()> {
-    let output = AssistantOutput::parse(&completion.content);
-    write_headers(
-        stream,
-        200,
-        "OK",
-        "text/event-stream; charset=utf-8",
-        None,
-        completion.metric_headers(),
-    )?;
+fn send_anthropic_sse_streaming<S: Write>(
+    stream: &mut S,
+    state: &mut ServeState,
+    chat: ChatCompletionRequest,
+) -> ServeResult<()> {
+    let mut stream_started = false;
+    let mut live_blocks = AnthropicLiveBlocks::new();
     let message_id = response_id();
-    write_anthropic_sse_event(
-        stream,
-        "message_start",
-        &json!({
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": completion.model.as_str(),
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {
-                    "input_tokens": completion.usage.prompt_tokens(),
-                    "output_tokens": 0
-                }
+    let result = state.complete_streaming(chat, |event| match event {
+        CompletionStreamEvent::Start(start) => {
+            stream_started = true;
+            write_headers(
+                stream,
+                200,
+                "OK",
+                "text/event-stream; charset=utf-8",
+                None,
+                start.metric_headers(),
+            )?;
+            write_anthropic_sse_event(
+                stream,
+                "message_start",
+                &json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id.as_str(),
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": start.model.as_str(),
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {
+                            "input_tokens": start.prompt_tokens,
+                            "output_tokens": 0
+                        }
+                    }
+                }),
+            )?;
+            stream
+                .flush()
+                .map_err(|e| ServeError::io("flush SSE Anthropic", e))
+        }
+        CompletionStreamEvent::Delta(delta) => {
+            if delta.is_empty() {
+                return Ok(());
             }
-        }),
-    )?;
-    for (index, block) in output.blocks.iter().enumerate() {
-        write_anthropic_content_block(stream, index, block)?;
-    }
+            live_blocks.push_text_delta(stream, delta)?;
+            stream
+                .flush()
+                .map_err(|e| ServeError::io("flush SSE Anthropic", e))
+        }
+    });
+    let completion = match result {
+        Ok(completion) => completion,
+        Err(error) if stream_started => {
+            eprintln!("saragossa serve stream Anthropic interrompu: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let has_tool_use = live_blocks.finish(stream, &completion)?;
     write_anthropic_sse_event(
         stream,
         "message_delta",
         &json!({
             "type": "message_delta",
             "delta": {
-                "stop_reason": anthropic_stop_reason(completion, output.has_tool_use),
-                "stop_sequence": anthropic_stop_sequence(completion, output.has_tool_use)
+                "stop_reason": anthropic_stop_reason(&completion, has_tool_use),
+                "stop_sequence": anthropic_stop_sequence(&completion, has_tool_use)
             },
             "usage": {
                 "output_tokens": completion.usage.completion_tokens()

@@ -21,6 +21,7 @@ use super::cache::{
 use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
 use super::protocol::{ChatCompletionRequest, ModelInfo, ModelsResponse, Usage};
+use super::streaming::{CompletionStreamEvent, StreamingCompletionStart, StreamingTextDetokenizer};
 use crate::RuntimeKind;
 
 /// Réponse d'inférence prête à sérialiser en OpenAI.
@@ -154,6 +155,33 @@ impl ServeState {
             .as_mut()
             .ok_or_else(|| ServeError::args(format!("modèle {model_id} absent après chargement")))?
             .complete(request, max_tokens, &memory_guard)?;
+        self.enforce_memory_budget(0, Some(index))?;
+        Ok(completion)
+    }
+
+    /// Exécute une complétion chat en envoyant les deltas via `on_event`.
+    pub(super) fn complete_streaming(
+        &mut self,
+        request: ChatCompletionRequest,
+        mut on_event: impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
+    ) -> ServeResult<ServedCompletion> {
+        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens = request.max_tokens_capped(max_tokens_cap)?;
+        let index = self
+            .models
+            .iter()
+            .position(|model| model.id == request.model)
+            .ok_or_else(|| ServeError::UnknownModel(request.model.clone()))?;
+        self.ensure_loaded_index(index)?;
+        self.clock = self.clock.saturating_add(1);
+        self.models[index].last_used = self.clock;
+        let model_id = self.models[index].id.clone();
+        let memory_guard = self.memory_guard.clone();
+        let completion = self.models[index]
+            .loaded
+            .as_mut()
+            .ok_or_else(|| ServeError::args(format!("modèle {model_id} absent après chargement")))?
+            .complete_streaming(request, max_tokens, &memory_guard, &mut on_event)?;
         self.enforce_memory_budget(0, Some(index))?;
         Ok(completion)
     }
@@ -355,6 +383,87 @@ impl LoadedModel {
         let content = strip_text_stops(decoded, &stop_texts);
         eprintln!(
             "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache=block-snapshots",
+            self.id,
+            prompt_tokens,
+            output.tokens.len(),
+            output.timings.prefill.as_millis(),
+            output.timings.decode.as_millis(),
+            total.as_millis(),
+            reused_prefix_tokens
+        );
+        Ok(ServedCompletion {
+            model: self.id.clone(),
+            content,
+            finish_reason,
+            matched_stop,
+            usage: Usage::new(prompt_tokens, output.tokens.len()),
+            prompt_tokens,
+            reused_prefix_tokens,
+            timings: output.timings,
+            total,
+        })
+    }
+
+    fn complete_streaming(
+        &mut self,
+        request: ChatCompletionRequest,
+        max_tokens: usize,
+        memory_guard: &ServeMemoryGuard,
+        on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
+    ) -> ServeResult<ServedCompletion> {
+        let stop_texts = request.stop_texts();
+        let prompt = self.prompt_encoding(&request)?;
+        let prompt_tokens = prompt.tokens.len();
+        let options = self.generation_options(&request, &stop_texts)?;
+        let started = Instant::now();
+        let (prompt_state, reused_prefix_tokens, prefill) =
+            self.prefill_prompt_state(&prompt.tokens, memory_guard)?;
+        let start = StreamingCompletionStart {
+            model: self.id.clone(),
+            prompt_tokens,
+            reused_prefix_tokens,
+            prefill,
+        };
+        on_event(CompletionStreamEvent::Start(&start))?;
+
+        let mut detokenizer = StreamingTextDetokenizer::new(&self.assets, &stop_texts, max_tokens);
+        let mut stream_error = None;
+        let output = self
+            .decoder
+            .generate_greedy_timed_from_prompt_state_with_options_and_callback(
+                prompt_state,
+                prefill,
+                max_tokens,
+                &options,
+                |token| {
+                    if stream_error.is_some() {
+                        return false;
+                    }
+                    match detokenizer.push_token(token, on_event) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            stream_error = Some(error);
+                            false
+                        }
+                    }
+                },
+            )?;
+        if let Some(error) = stream_error {
+            return Err(error);
+        }
+        let total = started.elapsed();
+        let generated = tokens_to_u32(&output.tokens)?;
+        let decoded = strip_empty_think(self.assets.decode_tokens(&generated, true)?);
+        let matched_stop = matched_text_stop(&decoded, &stop_texts);
+        let finish_reason = if output.tokens.len() >= max_tokens && matched_stop.is_none() {
+            "length"
+        } else {
+            "stop"
+        };
+        let content = strip_text_stops(decoded, &stop_texts);
+        detokenizer.finish(&content, on_event)?;
+        eprintln!(
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache=block-snapshots streaming=true",
             self.id,
             prompt_tokens,
             output.tokens.len(),
