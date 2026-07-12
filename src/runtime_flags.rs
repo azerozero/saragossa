@@ -2,6 +2,7 @@
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,10 @@ pub(super) fn gpu_sampler_enabled() -> bool {
     false
 }
 
+const DECODE_INTERVAL_UNINITIALIZED_NS: u64 = u64::MAX;
+const DECODE_INTERVAL_MAX_NS: u64 = u64::MAX / 2;
+static DECODE_MIN_INTERVAL_NS: AtomicU64 = AtomicU64::new(DECODE_INTERVAL_UNINITIALIZED_NS);
+
 /// Intervalle minimum entre deux tokens, dérivé de `RETI_RUST_MAX_TOK_S` (cap
 /// tok/s du mode eco/silencieux). `None` = pas de throttle (défaut, pleine
 /// vitesse). Quand actif, le decode est rate-limité pour réduire la charge GPU
@@ -111,14 +116,85 @@ pub(super) fn gpu_sampler_enabled() -> bool {
 /// car la voice loop est TTS-bound. Le pipeline résident est désactivé dans ce
 /// mode (le rate-limit sérialise de toute façon).
 pub(super) fn decode_min_interval() -> Option<Duration> {
-    static INTERVAL: OnceLock<Option<Duration>> = OnceLock::new();
-    *INTERVAL.get_or_init(|| {
-        std::env::var("RETI_RUST_MAX_TOK_S")
+    decode_min_interval_ns().map(Duration::from_nanos)
+}
+
+/// Renvoie le plafond courant de decode, si le pacing est actif.
+pub fn decode_max_tokens_per_s() -> Option<f64> {
+    decode_min_interval_ns().map(|nanos| 1_000_000_000.0 / nanos as f64)
+}
+
+/// Configure à chaud le plafond de decode en tokens par seconde.
+///
+/// `None` désactive le pacing. Les valeurs non finies ou nulles/négatives sont
+/// ignorées pour éviter qu'une configuration invalide désactive un réglage
+/// actif par accident.
+pub fn set_decode_max_tokens_per_s(rate: Option<f64>) {
+    match rate {
+        Some(rate) => {
+            if let Some(nanos) = decode_interval_nanos_for_rate(rate) {
+                DECODE_MIN_INTERVAL_NS.store(nanos, AtomicOrdering::Relaxed);
+            }
+        }
+        None => {
+            DECODE_MIN_INTERVAL_NS.store(0, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+fn decode_min_interval_ns() -> Option<u64> {
+    let loaded = DECODE_MIN_INTERVAL_NS.load(AtomicOrdering::Relaxed);
+    let nanos = if loaded == DECODE_INTERVAL_UNINITIALIZED_NS {
+        let initial = std::env::var("RETI_RUST_MAX_TOK_S")
             .ok()
             .and_then(|value| value.trim().parse::<f64>().ok())
-            .filter(|rate| *rate > 0.0)
-            .map(|rate| Duration::from_secs_f64(1.0 / rate))
-    })
+            .and_then(decode_interval_nanos_for_rate)
+            .unwrap_or(0);
+        match DECODE_MIN_INTERVAL_NS.compare_exchange(
+            DECODE_INTERVAL_UNINITIALIZED_NS,
+            initial,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ) {
+            Ok(_) => initial,
+            Err(current) => current,
+        }
+    } else {
+        loaded
+    };
+    if nanos == 0 || nanos == DECODE_INTERVAL_UNINITIALIZED_NS {
+        None
+    } else {
+        Some(nanos)
+    }
+}
+
+fn decode_interval_nanos_for_rate(rate: f64) -> Option<u64> {
+    if !rate.is_finite() || rate <= 0.0 {
+        return None;
+    }
+    let nanos = 1_000_000_000.0 / rate;
+    if !nanos.is_finite() || nanos <= 0.0 {
+        return None;
+    }
+    Some(nanos.round().clamp(1.0, DECODE_INTERVAL_MAX_NS as f64) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_interval_nanos_for_rate_converts_tok_s_to_interval() {
+        assert_eq!(decode_interval_nanos_for_rate(25.0), Some(40_000_000));
+    }
+
+    #[test]
+    fn decode_interval_nanos_for_rate_rejects_invalid_rates() {
+        assert_eq!(decode_interval_nanos_for_rate(0.0), None);
+        assert_eq!(decode_interval_nanos_for_rate(-1.0), None);
+        assert_eq!(decode_interval_nanos_for_rate(f64::NAN), None);
+    }
 }
 
 /// Active le decode full-attn résident GPU (tranche 1b). **Défaut OFF** : opt-in

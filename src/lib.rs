@@ -78,6 +78,7 @@ pub use qwen_loader::{
     verify_qwen_decoder_contract_from_shards, DecoderContract, QwenDecoderContract,
 };
 pub use runtime::ForwardRuntime;
+pub use runtime_flags::{decode_max_tokens_per_s, set_decode_max_tokens_per_s};
 pub use runtime_preset::{
     apply_runtime_preset_for_model_dir, runtime_preset_for_model_dir, RuntimePreset,
 };
