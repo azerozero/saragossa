@@ -1692,6 +1692,7 @@ fn mtp_verifier_options(stop_token_ids: Vec<usize>) -> GenerationOptions {
         top_p: 1.0,
         top_k: 0,
         seed: 0,
+        token_constraint: None,
     }
 }
 

@@ -36,6 +36,9 @@ pub(super) struct ChatCompletionRequest {
     /// Stop textuel OpenAI.
     #[serde(default)]
     pub(super) stop: Option<StopSpec>,
+    /// Format de réponse OpenAI.
+    #[serde(default)]
+    pub(super) response_format: Option<ResponseFormat>,
 }
 
 impl ChatCompletionRequest {
@@ -76,6 +79,40 @@ impl ChatCompletionRequest {
             None => Vec::new(),
         }
     }
+
+    /// Renvoie le mode de sortie structuré demandé.
+    pub(super) fn response_format_mode(&self) -> ServeResult<ResponseFormatMode> {
+        let Some(format) = &self.response_format else {
+            return Ok(ResponseFormatMode::Text);
+        };
+        match format.kind.as_str() {
+            "text" => Ok(ResponseFormatMode::Text),
+            "json_object" => Ok(ResponseFormatMode::JsonObject),
+            "json_schema" => Err(ServeError::not_implemented(
+                "response_format json_schema n'est pas encore supporté (v1: json_object)",
+            )),
+            other => Err(ServeError::Http(format!(
+                "response_format type inconnu: {other}"
+            ))),
+        }
+    }
+}
+
+/// Mode de sortie structuré supporté par `serve`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResponseFormatMode {
+    /// Comportement texte existant.
+    Text,
+    /// Objet JSON racine contraint par le sampler.
+    JsonObject,
+}
+
+/// Objet `response_format` OpenAI minimal.
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct ResponseFormat {
+    /// Type demandé (`text`, `json_object`, `json_schema`).
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 /// Message OpenAI minimal.

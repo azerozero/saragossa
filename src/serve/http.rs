@@ -212,6 +212,7 @@ fn handle_chat<S: Write>(
     let chat: ChatCompletionRequest = serde_json::from_slice(&request.body)
         .map_err(|e| ServeError::json("désérialisation chat/completions", e))?;
     chat.max_tokens_capped(state.max_tokens_cap())?;
+    chat.response_format_mode()?;
     let stream_enabled = chat.stream;
     if stream_enabled {
         send_sse_streaming(stream, state, chat)
@@ -352,6 +353,7 @@ fn error_status(error: &ServeError) -> u16 {
     match error {
         ServeError::UnknownModel(_) => 404,
         ServeError::Args(_) | ServeError::Json { .. } | ServeError::Http(_) => 400,
+        ServeError::NotImplemented(_) => 501,
         ServeError::Memory(_) => 503,
         ServeError::Io { .. } | ServeError::Inference(_) => 500,
     }
@@ -363,6 +365,7 @@ fn reason_phrase(status: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        501 => "Not Implemented",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -704,6 +707,28 @@ mod tests {
         let response = String::from_utf8(stream.into_inner()).expect("invariant: réponse UTF-8");
         assert!(response.contains("HTTP/1.1 400 Bad Request"));
         assert!(response.contains("plafond serveur 4"));
+    }
+
+    #[test]
+    fn chat_json_schema_response_format_returns_501() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let body =
+            br#"{"model":"reti-35b","messages":[],"response_format":{"type":"json_schema"}}"#;
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            str::from_utf8(body).expect("invariant: JSON test UTF-8")
+        );
+        let mut stream = Cursor::new(raw.into_bytes());
+
+        let error = handle_connection(&mut stream, &mut state, None, far_deadline())
+            .expect_err("invariant: json_schema refusé");
+
+        assert!(error.to_string().contains("json_schema"));
+        let response = String::from_utf8(stream.into_inner()).expect("invariant: réponse UTF-8");
+        assert!(response.contains("HTTP/1.1 501 Not Implemented"));
+        assert!(response.contains("json_schema"));
     }
 
     #[test]

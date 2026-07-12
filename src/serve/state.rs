@@ -1,6 +1,7 @@
 //! Etat d'inférence longue durée du serveur local.
 
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use saragossa::decoder::GenerationTimings;
@@ -12,8 +13,8 @@ use saragossa::runtime_flags::{
 };
 use saragossa::{
     qwen_assistant_history_content, render_gemma4_chat, render_gemma_chat, render_qwen_chatml,
-    CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage, GenerationOptions, ModelAssets,
-    RuntimePreset,
+    CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage, GenerationOptions,
+    JsonTokenCatalog, JsonTokenConstraint, ModelAssets, RuntimePreset, TokenConstraint,
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
@@ -21,7 +22,9 @@ use super::audio::AudioState;
 use super::cache::{BlockAwarePrefixCache, BlockHash};
 use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
-use super::protocol::{ChatCompletionRequest, ModelInfo, ModelsResponse, Usage};
+use super::protocol::{
+    ChatCompletionRequest, ModelInfo, ModelsResponse, ResponseFormatMode, Usage,
+};
 use super::streaming::{CompletionStreamEvent, StreamingCompletionStart, StreamingTextDetokenizer};
 use crate::RuntimeKind;
 
@@ -343,6 +346,7 @@ impl ModelSlot {
                 assets,
                 decoder,
                 preset,
+                json_token_catalog: OnceLock::new(),
                 prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),
             });
         }
@@ -361,6 +365,10 @@ struct LoadedModel {
     assets: ModelAssets,
     decoder: CausalDecoder,
     preset: Option<RuntimePreset>,
+    /// Catalogue des bytes par token, bâti paresseusement à la 1ʳᵉ requête
+    /// `json_object` : un déploiement texte pur ne paie jamais le décodage du
+    /// vocab entier ni son étape faillible au chargement.
+    json_token_catalog: OnceLock<Arc<JsonTokenCatalog>>,
     prefix_cache: BlockAwarePrefixCache,
 }
 
@@ -375,10 +383,12 @@ impl LoadedModel {
         max_tokens: usize,
         memory_guard: &MemoryGuard,
     ) -> ServeResult<ServedCompletion> {
-        let stop_texts = request.stop_texts();
+        let response_format = request.response_format_mode()?;
+        let stop_texts = stop_texts_for_response_format(&request, response_format)?;
         let prompt = self.prompt_encoding(&request)?;
         let prompt_tokens = prompt.tokens.len();
-        let options = self.generation_options(&request, &stop_texts)?;
+        let options = self.generation_options(&request, &stop_texts, response_format)?;
+        let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
         let (prompt_state, reused_prefix_tokens, prefill) =
             self.prefill_prompt_state(&prompt.tokens, memory_guard)?;
@@ -390,6 +400,7 @@ impl LoadedModel {
                 max_tokens,
                 &options,
             )?;
+        ensure_guided_finished(token_constraint.as_deref())?;
         let total = started.elapsed();
         let generated = tokens_to_u32(&output.tokens)?;
         let decoded = strip_empty_think(self.assets.decode_tokens(&generated, true)?);
@@ -430,10 +441,12 @@ impl LoadedModel {
         memory_guard: &MemoryGuard,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
-        let stop_texts = request.stop_texts();
+        let response_format = request.response_format_mode()?;
+        let stop_texts = stop_texts_for_response_format(&request, response_format)?;
         let prompt = self.prompt_encoding(&request)?;
         let prompt_tokens = prompt.tokens.len();
-        let options = self.generation_options(&request, &stop_texts)?;
+        let options = self.generation_options(&request, &stop_texts, response_format)?;
+        let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
         let (prompt_state, reused_prefix_tokens, prefill) =
             self.prefill_prompt_state(&prompt.tokens, memory_guard)?;
@@ -470,6 +483,7 @@ impl LoadedModel {
         if let Some(error) = stream_error {
             return Err(error);
         }
+        ensure_guided_finished(token_constraint.as_deref())?;
         let total = started.elapsed();
         let generated = tokens_to_u32(&output.tokens)?;
         let decoded = strip_empty_think(self.assets.decode_tokens(&generated, true)?);
@@ -605,10 +619,22 @@ impl LoadedModel {
         self.prefix_cache.evict_lru_block()
     }
 
+    fn json_catalog(&self) -> ServeResult<Arc<JsonTokenCatalog>> {
+        if let Some(catalog) = self.json_token_catalog.get() {
+            return Ok(Arc::clone(catalog));
+        }
+        let catalog = Arc::new(JsonTokenCatalog::from_tokenizer(&self.assets.tokenizer)?);
+        // En cas de course, `set` échoue et on réutilise la valeur déjà
+        // installée (le catalogue est immutable, les deux builds sont égaux).
+        let _ = self.json_token_catalog.set(Arc::clone(&catalog));
+        Ok(self.json_token_catalog.get().map_or(catalog, Arc::clone))
+    }
+
     fn generation_options(
         &self,
         request: &ChatCompletionRequest,
         stop_texts: &[String],
+        response_format: ResponseFormatMode,
     ) -> ServeResult<GenerationOptions> {
         let temperature = request.temperature.unwrap_or(0.0);
         let top_p = request.top_p.unwrap_or_else(|| {
@@ -627,13 +653,26 @@ impl LoadedModel {
                 0
             }
         });
+        let stop_token_ids = self.assets.stop_token_ids();
+        let token_constraint = match response_format {
+            ResponseFormatMode::Text => None,
+            ResponseFormatMode::JsonObject => Some(Arc::new(JsonTokenConstraint::new(
+                self.json_catalog()?,
+                &stop_token_ids,
+            )) as Arc<dyn TokenConstraint>),
+        };
         Ok(GenerationOptions {
-            stop_token_ids: self.assets.stop_token_ids(),
-            stop_sequences: self.stop_sequences(stop_texts)?,
+            stop_token_ids,
+            stop_sequences: if response_format == ResponseFormatMode::JsonObject {
+                Vec::new()
+            } else {
+                self.stop_sequences(stop_texts)?
+            },
             temperature,
             top_p,
             top_k,
             seed: 0,
+            token_constraint,
         })
     }
 
@@ -679,6 +718,33 @@ fn load_decoder_metal(assets: &ModelAssets) -> ServeResult<CausalDecoder> {
 fn load_decoder_metal(_assets: &ModelAssets) -> ServeResult<CausalDecoder> {
     Err(ServeError::args(
         "backend metal indisponible dans ce build — recompile avec --features metal",
+    ))
+}
+
+fn stop_texts_for_response_format(
+    request: &ChatCompletionRequest,
+    response_format: ResponseFormatMode,
+) -> ServeResult<Vec<String>> {
+    let stop_texts = request.stop_texts();
+    if response_format == ResponseFormatMode::JsonObject
+        && stop_texts.iter().any(|stop| !stop.is_empty())
+    {
+        return Err(ServeError::Http(
+            "stop n'est pas supporté avec response_format json_object".to_string(),
+        ));
+    }
+    Ok(stop_texts)
+}
+
+fn ensure_guided_finished(constraint: Option<&dyn TokenConstraint>) -> ServeResult<()> {
+    let Some(constraint) = constraint else {
+        return Ok(());
+    };
+    if constraint.is_finished() {
+        return Ok(());
+    }
+    Err(ServeError::args(
+        "structured output JSON incomplet avant la fin du budget max_tokens",
     ))
 }
 
@@ -742,6 +808,9 @@ fn tokens_to_u32(ids: &[usize]) -> ServeResult<Vec<u32>> {
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod json_tests;
 
 #[cfg(test)]
 mod tests {

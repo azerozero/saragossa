@@ -17,6 +17,7 @@ pub mod embedding;
 pub mod error;
 #[cfg(test)]
 mod golden;
+pub mod guided;
 pub mod linear;
 pub mod linear_attention;
 pub mod memory_guard;
@@ -66,6 +67,7 @@ pub use devtools::{
 };
 pub use embedding::{embed_tokens, embed_weight_tokens, EmbeddingWeight};
 pub use error::{InferError, Result};
+pub use guided::{JsonTokenCatalog, JsonTokenConstraint, TokenConstraint};
 pub use linear::{Linear, LinearWeight};
 pub use memory_guard::{
     ensure_process_memory_pressure_watcher, process_memory_guard, process_purge_registry,

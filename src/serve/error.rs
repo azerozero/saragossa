@@ -28,6 +28,9 @@ pub(super) enum ServeError {
     /// Requête HTTP invalide.
     #[error("HTTP invalide: {0}")]
     Http(String),
+    /// Fonctionnalité connue mais non livrée.
+    #[error("non implémenté: {0}")]
+    NotImplemented(String),
     /// Modèle demandé absent.
     #[error("modèle inconnu: {0}")]
     UnknownModel(String),
@@ -64,6 +67,11 @@ impl ServeError {
     /// Construit une erreur de pression mémoire.
     pub(super) fn memory(message: impl Into<String>) -> Self {
         Self::Memory(message.into())
+    }
+
+    /// Construit une erreur 501.
+    pub(super) fn not_implemented(message: impl Into<String>) -> Self {
+        Self::NotImplemented(message.into())
     }
 }
 

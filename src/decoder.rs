@@ -150,7 +150,7 @@ pub struct CausalDecoderConfig {
     pub is_gemma4: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 /// Paramètre une génération autoregressive.
 pub struct GenerationOptions {
     /// Liste les tokens qui arrêtent la génération.
@@ -165,6 +165,8 @@ pub struct GenerationOptions {
     pub top_k: usize,
     /// Définit la graine du sampler déterministe.
     pub seed: u64,
+    /// Applique une contrainte de tokens côté CPU avant le sampling.
+    pub token_constraint: Option<Arc<dyn crate::guided::TokenConstraint>>,
 }
 
 impl Default for GenerationOptions {
@@ -176,7 +178,22 @@ impl Default for GenerationOptions {
             top_p: 1.0,
             top_k: 0,
             seed: 0,
+            token_constraint: None,
         }
+    }
+}
+
+impl std::fmt::Debug for GenerationOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerationOptions")
+            .field("stop_token_ids", &self.stop_token_ids)
+            .field("stop_sequences", &self.stop_sequences)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("seed", &self.seed)
+            .field("token_constraint", &self.token_constraint.is_some())
+            .finish()
     }
 }
 

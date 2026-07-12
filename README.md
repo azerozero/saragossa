@@ -40,7 +40,7 @@ saragossa occupe le quadrant **latence mono-utilisateur × Apple Silicon** :
 | Endpoint | Rôle |
 |---|---|
 | `GET /v1/models` | Modèles servis |
-| `POST /v1/chat/completions` | Chat OpenAI-compatible (SSE ou non) |
+| `POST /v1/chat/completions` | Chat OpenAI-compatible (SSE ou non), `response_format: {"type":"json_object"}` |
 | `POST /v1/messages` | Shim Anthropic Messages + `tool_use` (pilotable par Claude Code) |
 | `POST /v1/audio/transcriptions` | STT Whisper (multipart WAV, opt-in `--stt-model`) |
 | `POST /v1/audio/speech` | TTS Qwen3 (JSON → WAV, opt-in `--tts-model`) |
@@ -102,6 +102,24 @@ SARAGOSSA_API_KEY=local-dev cargo run --release -p saragossa -- serve \
 # Claude Code parle au moteur local via /v1/messages.
 ANTHROPIC_BASE_URL=http://127.0.0.1:8081 ANTHROPIC_API_KEY=local-dev claude
 ```
+
+### Structured output (v1 : `json_object`)
+
+`POST /v1/chat/completions` accepte `response_format: {"type":"json_object"}`.
+La sortie est contrainte par un automate JSON byte-level côté sampler : objet
+racine obligatoire, chaînes/échappements/nombres/booléens/null et structures
+imbriquées. L'EOT n'est admissible qu'après fermeture de l'objet racine.
+
+En v1, seules ces requêtes guidées basculent sur le chemin de sampling CPU
+(logits relus puis masqués avant sample). Les requêtes sans `response_format`,
+ou avec `{"type":"text"}`, gardent le chemin résident/GPU existant. Le mode
+`{"type":"json_schema"}` répond 501 : il est réservé à une version ultérieure.
+
+Limites v1 : l'automate garantit la grammaire JSON (paires de surrogates
+`𐀀` incluses) mais pas la magnitude d'un nombre au-delà de `f64` ;
+en non-stream, un objet non fermé au budget `max_tokens` remonte une erreur
+plutôt que du JSON tronqué ; en SSE, les deltas restent un préfixe JSON valide
+(la garantie « objet complet » ne vaut qu'en fin de flux).
 
 ### Cache chaud (prefix-cache par blocs)
 

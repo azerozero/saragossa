@@ -69,6 +69,23 @@ impl RustTokenizer {
             })
     }
 
+    /// Décode les bytes visibles d'un token isolé.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le tokenizer rejette le token.
+    pub fn decode_token_bytes(&self, id: u32) -> Result<Vec<u8>> {
+        if let Some(byte) = self
+            .inner
+            .id_to_token(id)
+            .as_deref()
+            .and_then(byte_fallback_token)
+        {
+            return Ok(vec![byte]);
+        }
+        self.decode(&[id], true).map(String::into_bytes)
+    }
+
     #[must_use]
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)
@@ -78,6 +95,14 @@ impl RustTokenizer {
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
     }
+}
+
+fn byte_fallback_token(token: &str) -> Option<u8> {
+    let hex = token.strip_prefix("<0x")?.strip_suffix('>')?;
+    if hex.len() != 2 {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
 }
 
 #[cfg(test)]
@@ -122,5 +147,13 @@ mod tests {
             "bonjour reti"
         );
         assert_eq!(tokenizer.token_to_id("bonjour"), Some(1));
+    }
+
+    #[test]
+    fn parses_byte_fallback_token_surface() {
+        assert_eq!(byte_fallback_token("<0xC3>"), Some(0xC3));
+        assert_eq!(byte_fallback_token("<0x0a>"), Some(0x0A));
+        assert_eq!(byte_fallback_token("<0xZZ>"), None);
+        assert_eq!(byte_fallback_token("bonjour"), None);
     }
 }

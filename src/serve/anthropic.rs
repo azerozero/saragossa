@@ -122,6 +122,7 @@ impl AnthropicMessagesRequest {
             top_p: self.top_p,
             top_k: None,
             stop,
+            response_format: None,
         })
     }
 }

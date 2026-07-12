@@ -491,7 +491,10 @@ impl CausalDecoder {
         sampler: &mut DeterministicSampler,
     ) -> Result<usize> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if options.temperature <= f32::EPSILON && gpu_argmax_enabled() {
+        if options.token_constraint.is_none()
+            && options.temperature <= f32::EPSILON
+            && gpu_argmax_enabled()
+        {
             if let Some(metal) = self.forward_runtime().metal_executor() {
                 if head.bias().is_none() {
                     return metal.argmax_linear_biasless(final_state, head);
@@ -499,7 +502,8 @@ impl CausalDecoder {
             }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if options.temperature > f32::EPSILON
+        if options.token_constraint.is_none()
+            && options.temperature > f32::EPSILON
             && options.top_k == 0
             && options.top_p >= 1.0
             && gpu_sampler_enabled()
@@ -519,7 +523,8 @@ impl CausalDecoder {
             }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if options.temperature > f32::EPSILON
+        if options.token_constraint.is_none()
+            && options.temperature > f32::EPSILON
             && options.top_k > 0
             && options.top_k <= crate::metal_backend::MAX_SAMPLER_TOP_K
             && gpu_sampler_enabled()
@@ -541,6 +546,19 @@ impl CausalDecoder {
             }
         }
         let logits = self.logits_from_linear_state(final_state, head)?;
+        if let Some(constraint) = &options.token_constraint {
+            let mut masked = logits.as_row()?.to_vec();
+            constraint.mask_logits(&mut masked)?;
+            let token = sample_token_top_k_top_p(
+                &masked,
+                options.temperature,
+                options.top_p,
+                options.top_k,
+                sampler,
+            )?;
+            constraint.accept_token(token)?;
+            return Ok(token);
+        }
         sample_token_top_k_top_p(
             logits.as_row()?,
             options.temperature,
@@ -768,10 +786,12 @@ impl CausalDecoder {
         // Decode résident COMPLET (1c) : greedy uniquement (argmax on-device) et
         // modèle supporté. L'arène doit être prête tout-ou-rien : si un état par
         // couche manque, on retombe sur le per-op (et le résident 1b si activé).
+        let guided_sampling = options.token_constraint.is_some();
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let resident_sampling = super::resident::resident_sampling_supported(options);
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let mut use_resident_full = decode_resident_full_enabled()
+            && !guided_sampling
             && (options.temperature <= f32::EPSILON || resident_sampling)
             && self.supports_resident_full_decode();
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -783,13 +803,15 @@ impl CausalDecoder {
             )?;
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if decode_resident_enabled() && !use_resident_full {
+        if decode_resident_enabled() && !use_resident_full && !guided_sampling {
             self.setup_resident_decode(
                 &mut cache,
                 max_new_tokens,
                 options.temperature > f32::EPSILON,
             )?;
         }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = guided_sampling;
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut sampler = DeterministicSampler::new(options.seed);
         let mut decode = Duration::ZERO;

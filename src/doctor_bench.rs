@@ -614,6 +614,7 @@ fn run_bench_loaded(
         seed: 0,
         stop_token_ids: Vec::new(),
         stop_sequences: Vec::new(),
+        token_constraint: None,
     };
     let mut tg_samples = Vec::with_capacity(args.repeats);
     let mut ttft_samples = Vec::with_capacity(args.repeats);
