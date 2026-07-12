@@ -4,6 +4,8 @@ use safetensors::{Dtype, SafeTensorError};
 use std::path::PathBuf;
 use thiserror::Error;
 
+use crate::memory_guard::MemoryGuardError;
+
 /// Représente le résultat standard du moteur d'inférence.
 pub type Result<T> = std::result::Result<T, InferError>;
 
@@ -59,6 +61,10 @@ pub enum InferError {
     /// Signale une erreur Metal.
     #[error("metal: {0}")]
     Metal(String),
+
+    /// Signale un refus de la garde mémoire.
+    #[error(transparent)]
+    MemoryGuard(MemoryGuardError),
 
     /// Signale une erreur d'entrée-sortie.
     #[error("I/O {path}: {source}")]

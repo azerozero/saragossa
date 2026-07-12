@@ -551,6 +551,29 @@ impl WhisperModel {
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
         let timing = std::env::var_os("RETI_STT_TIMING").is_some();
+        let t_enc = std::time::Instant::now();
+        let audio_features = self.encoder.encode_samples(samples, runtime)?;
+        if timing {
+            eprintln!("[stt] encode: {} ms", t_enc.elapsed().as_millis());
+        }
+        self.transcribe_with_features(&audio_features, lang, runtime)
+    }
+
+    /// Transcrit depuis des features audio Whisper déjà encodées.
+    ///
+    /// Le chemin ANE de `reti` injecte ici les hidden states de l'encodeur
+    /// CoreML, tandis que `transcribe` conserve l'encodage saragossa existant.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le décodage ou le tokenizer échoue.
+    pub fn transcribe_with_features(
+        &self,
+        audio_features: &Tensor,
+        lang: &str,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<(String, String)> {
+        let timing = std::env::var_os("RETI_STT_TIMING").is_some();
         let mut prompt = Vec::with_capacity(4);
         prompt.push(self.sot_token);
         if let Some(language_token) = self.language_token(lang) {
@@ -559,11 +582,6 @@ impl WhisperModel {
         prompt.push(self.transcribe_token);
         prompt.push(self.no_timestamps_token);
 
-        let t_enc = std::time::Instant::now();
-        let audio_features = self.encoder.encode_samples(samples, runtime)?;
-        if timing {
-            eprintln!("[stt] encode: {} ms", t_enc.elapsed().as_millis());
-        }
         let t_dec = std::time::Instant::now();
 
         let generated = self.decoder.generate_greedy(

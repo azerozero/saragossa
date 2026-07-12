@@ -221,6 +221,22 @@ impl CausalDecoder {
                 return Ok(false);
             }
         }
+        // NOTE: arène hors budget mémoire → on DÉGRADE vers le decode per-op
+        // (empreinte plus basse) au lieu d'échouer la génération — même patron
+        // de repli que les early-returns voisins. C'est l'esprit de la garde :
+        // continuer avec moins de mémoire, jamais geler ni casser le tour.
+        if let Err(error) = self.check_resident_full_decode_allocation(
+            capacity,
+            kv_heads,
+            head_dim,
+            hidden,
+            max_new_tokens,
+        ) {
+            if crate::decoder::flags::trace_resident_enabled() {
+                eprintln!("decode résident full setup désactivé: budget mémoire ({error})");
+            }
+            return Ok(false);
+        }
         let mut layer_buffers = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
             if self.config.is_full_attention_layer(index) {
@@ -646,4 +662,81 @@ impl CausalDecoder {
         });
         Ok(true)
     }
+
+    fn check_resident_full_decode_allocation(
+        &self,
+        capacity: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        hidden: usize,
+        max_new_tokens: usize,
+    ) -> Result<()> {
+        let Some(guard) = self.memory_guard.as_ref() else {
+            return Ok(());
+        };
+        let full_layers = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.config.is_full_attention_layer(*index))
+            .count();
+        let kv_dim = checked_product(&[kv_heads, head_dim], "kv_dim résident")?;
+        let kv_bytes = checked_bytes(
+            &[full_layers, 2, capacity, kv_dim],
+            std::mem::size_of::<f32>(),
+            "KV résident",
+        )?;
+        let base_bytes = checked_bytes(
+            &[2, hidden],
+            std::mem::size_of::<f32>(),
+            "ping-pong résident",
+        )?
+        .saturating_add(checked_bytes(
+            &[1 + RESIDENT_PIPELINE_WINDOW],
+            std::mem::size_of::<u32>(),
+            "index résident",
+        )?);
+        let mtp_bytes = if self.mtp.is_some() {
+            let mtp_kv_states = if cfg!(feature = "devtools") { 2 } else { 1 };
+            checked_bytes(
+                &[mtp_kv_states, 2, capacity, kv_dim],
+                std::mem::size_of::<f32>(),
+                "KV MTP résident",
+            )?
+            .saturating_add(checked_bytes(
+                &[10, hidden],
+                std::mem::size_of::<f32>(),
+                "buffers MTP résidents",
+            )?)
+            .saturating_add(checked_bytes(
+                &[max_new_tokens.max(1) + 3],
+                std::mem::size_of::<u32>(),
+                "indices MTP résidents",
+            )?)
+        } else {
+            0
+        };
+        guard
+            .check_allocation(
+                kv_bytes
+                    .saturating_add(base_bytes)
+                    .saturating_add(mtp_bytes),
+            )
+            .map_err(InferError::MemoryGuard)
+    }
+}
+
+fn checked_product(factors: &[usize], label: &str) -> Result<usize> {
+    factors.iter().try_fold(1_usize, |acc, value| {
+        acc.checked_mul(*value)
+            .ok_or_else(|| InferError::Dimension(format!("{label} déborde")))
+    })
+}
+
+fn checked_bytes(factors: &[usize], element_bytes: usize, label: &str) -> Result<u64> {
+    let elements = checked_product(factors, label)?;
+    let bytes = elements
+        .checked_mul(element_bytes)
+        .ok_or_else(|| InferError::Dimension(format!("{label} bytes déborde")))?;
+    u64::try_from(bytes).map_err(|_| InferError::Dimension(format!("{label} hors u64")))
 }

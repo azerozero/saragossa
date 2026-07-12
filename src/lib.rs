@@ -19,6 +19,7 @@ pub mod error;
 mod golden;
 pub mod linear;
 pub mod linear_attention;
+pub mod memory_guard;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod metal_backend;
 pub mod mlp;
@@ -66,6 +67,11 @@ pub use devtools::{
 pub use embedding::{embed_tokens, embed_weight_tokens, EmbeddingWeight};
 pub use error::{InferError, Result};
 pub use linear::{Linear, LinearWeight};
+pub use memory_guard::{
+    ensure_process_memory_pressure_watcher, process_memory_guard, process_purge_registry,
+    MemoryGuard, MemoryGuardError, MemoryLimits, MemoryPressureLevel, MemoryProjection,
+    MemoryReservation, PurgeOutcome, PurgePressure, PurgeRegistry, PurgeReport,
+};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub use metal_backend::MetalExecutor;
 pub use mlp::{Activation, FeedForward, GatedMlp, MoeMlp};
@@ -73,7 +79,8 @@ pub use norm::{layer_norm, rms_norm};
 pub use quantization::{dequantize_affine_u32, AffineQuantizedTensor};
 pub use qwen_loader::{
     load_causal_decoder, load_causal_decoder_from_shards, load_qwen_causal_decoder,
-    load_qwen_causal_decoder_from_shards, verify_decoder_contract,
+    load_qwen_causal_decoder_from_shards, load_qwen_causal_decoder_from_shards_with_memory_guard,
+    load_qwen_causal_decoder_with_memory_guard, verify_decoder_contract,
     verify_decoder_contract_from_shards, verify_qwen_decoder_contract,
     verify_qwen_decoder_contract_from_shards, DecoderContract, QwenDecoderContract,
 };
@@ -91,4 +98,6 @@ pub use tts::{
     TtsAssets, TtsCodecCatalog, TtsForwardOutput, TtsModel, TtsModelConfig, TtsModelKind,
     TtsPayloadSummary, TtsSynthesisOutput, TtsTalkerCatalog,
 };
-pub use whisper::{WhisperConfig, WhisperDecoder, WhisperEncoder, WhisperModel};
+pub use whisper::{
+    log_mel_spectrogram, WhisperConfig, WhisperDecoder, WhisperEncoder, WhisperModel,
+};

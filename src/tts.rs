@@ -13,7 +13,7 @@ use crate::{
     tts_mimi::TtsMimiEncoder,
     tts_speaker::TtsSpeakerEncoder,
     AffineQuantizedTensor, CausalDecoder, CausalDecoderCache, CausalDecoderConfig, InferError,
-    LinearWeight, Result, Tensor,
+    LinearWeight, MemoryGuard, Result, Tensor,
 };
 use safetensors::Dtype;
 use serde::Deserialize;
@@ -596,6 +596,14 @@ impl TtsModel {
             codec_payload,
             clone_ctx: None,
         })
+    }
+
+    /// Attache une garde mémoire aux décodeurs internes.
+    #[must_use]
+    pub fn with_memory_guard(mut self, guard: MemoryGuard) -> Self {
+        self.talker = self.talker.with_memory_guard(guard.clone());
+        self.code_predictor = self.code_predictor.with_memory_guard(guard);
+        self
     }
 
     /// Charge Qwen3-TTS Base avec une référence clone Base/ICL.

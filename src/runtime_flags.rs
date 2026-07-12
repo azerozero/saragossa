@@ -555,7 +555,35 @@ pub fn serve_lru_enabled() -> bool {
 /// Active la garde OOM prédictive de `saragossa serve`.
 pub fn serve_oom_guard_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_SERVE_OOM_GUARD", true))
+    *ENABLED.get_or_init(|| memory_guard_enabled() && env_flag("RETI_SERVE_OOM_GUARD", true))
+}
+
+/// Active la garde mémoire partagée Saragossa.
+pub fn memory_guard_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_MEMORY_GUARD", true))
+}
+
+/// Renvoie le plafond mémoire statique global, en octets.
+pub fn memory_static_cap_bytes() -> Option<u64> {
+    static CAP: OnceLock<Option<u64>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("RETI_MEMORY_CAP_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|bytes| *bytes > 0)
+    })
+}
+
+/// Renvoie la marge mémoire globale conservée hors du process.
+pub fn memory_headroom_bytes() -> u64 {
+    static HEADROOM: OnceLock<u64> = OnceLock::new();
+    *HEADROOM.get_or_init(|| {
+        std::env::var("RETI_MEMORY_HEADROOM_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(2 * 1024 * 1024 * 1024)
+    })
 }
 
 /// Renvoie la taille des blocs du prefix-cache serveur.

@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use saragossa::decoder::GenerationTimings;
+use saragossa::memory_guard::{
+    estimate_model_bytes, MemoryGuard, MemoryProjection, PurgeOutcome, PurgePressure, PurgeRegistry,
+};
 use saragossa::runtime_flags::{
     serve_lru_enabled, serve_model_pool_size, serve_prefix_cache_enabled,
 };
@@ -15,9 +18,7 @@ use saragossa::{
 
 use super::args::{ServeArgs, ServeModelConfig};
 use super::audio::AudioState;
-use super::cache::{
-    estimate_model_bytes, BlockAwarePrefixCache, BlockHash, MemoryProjection, ServeMemoryGuard,
-};
+use super::cache::{BlockAwarePrefixCache, BlockHash};
 use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
 use super::protocol::{ChatCompletionRequest, ModelInfo, ModelsResponse, Usage};
@@ -78,7 +79,7 @@ pub(super) struct ServeState {
     models: Vec<ModelSlot>,
     max_tokens_cap: usize,
     clock: u64,
-    memory_guard: ServeMemoryGuard,
+    memory_guard: MemoryGuard,
     audio: AudioState,
     embeddings: EmbeddingsState,
 }
@@ -94,7 +95,7 @@ impl ServeState {
                 .collect(),
             max_tokens_cap: args.max_tokens_cap,
             clock: 0,
-            memory_guard: ServeMemoryGuard::new(),
+            memory_guard: MemoryGuard::serve(),
             audio: AudioState::new(args),
             embeddings: EmbeddingsState::new(args),
         }
@@ -214,10 +215,7 @@ impl ServeState {
         protected: Option<usize>,
     ) -> ServeResult<()> {
         while let Some(projection) = self.memory_guard.projection_over_limit(additional) {
-            if self.evict_one_prefix_block().is_some() {
-                continue;
-            }
-            if self.evict_lru_model(protected).is_some() {
+            if self.purge_one_for_memory_budget(protected).is_some() {
                 continue;
             }
             return Err(ServeError::memory(memory_error_message(projection)));
@@ -270,6 +268,27 @@ impl ServeState {
         self.models[index].loaded = None;
         eprintln!("saragossa serve evicted model={id} reason=lru-memory");
         Some(id)
+    }
+
+    fn purge_one_for_memory_budget(&mut self, protected: Option<usize>) -> Option<String> {
+        let mut registry = PurgeRegistry::<ServeState>::new();
+        registry.register(10, "serve-prefix-block", |state, _| {
+            state
+                .evict_one_prefix_block()
+                .map(|bytes| PurgeOutcome::Purged {
+                    bytes: usize_to_u64_saturating(bytes),
+                })
+                .unwrap_or(PurgeOutcome::Empty)
+        });
+        registry.register(20, "serve-model", move |state, _| {
+            state
+                .evict_lru_model(protected)
+                .map(|_| PurgeOutcome::Purged { bytes: 0 })
+                .unwrap_or(PurgeOutcome::Empty)
+        });
+        registry
+            .purge_one(self, PurgePressure::Warn)
+            .map(|report| report.name)
     }
 }
 
@@ -354,7 +373,7 @@ impl LoadedModel {
         &mut self,
         request: ChatCompletionRequest,
         max_tokens: usize,
-        memory_guard: &ServeMemoryGuard,
+        memory_guard: &MemoryGuard,
     ) -> ServeResult<ServedCompletion> {
         let stop_texts = request.stop_texts();
         let prompt = self.prompt_encoding(&request)?;
@@ -408,7 +427,7 @@ impl LoadedModel {
         &mut self,
         request: ChatCompletionRequest,
         max_tokens: usize,
-        memory_guard: &ServeMemoryGuard,
+        memory_guard: &MemoryGuard,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
         let stop_texts = request.stop_texts();
@@ -506,7 +525,7 @@ impl LoadedModel {
     fn prefill_prompt_state(
         &mut self,
         tokens: &[usize],
-        memory_guard: &ServeMemoryGuard,
+        memory_guard: &MemoryGuard,
     ) -> ServeResult<(CausalDecoderPromptState, usize, Duration)> {
         let started = Instant::now();
         if !serve_prefix_cache_enabled() {
@@ -557,7 +576,7 @@ impl LoadedModel {
         hash: BlockHash,
         tokens: usize,
         state: &CausalDecoderPromptState,
-        memory_guard: &ServeMemoryGuard,
+        memory_guard: &MemoryGuard,
     ) -> ServeResult<()> {
         let metal = self.decoder.snapshot_prompt_state_metal(state)?;
         let additional = usize_to_u64_saturating(

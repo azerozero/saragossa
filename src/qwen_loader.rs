@@ -2,6 +2,7 @@
 
 use crate::{
     decoder::DecoderTensor,
+    memory_guard::{estimate_paths_bytes, MemoryGuard},
     quantization::bytes_to_u32,
     safetensor::{bytes_to_dense_f32, tensor_from_safetensor_parts},
     AffineQuantizedTensor, CausalDecoder, InferError, LinearWeight, ModelAssets, ModelConfig,
@@ -147,6 +148,23 @@ pub fn load_causal_decoder(assets: &ModelAssets) -> Result<CausalDecoder> {
     load_causal_decoder_from_shards(&assets.config, &assets.shards, &assets.catalog)
 }
 
+/// Charge un décodeur causal sous garde mémoire.
+///
+/// # Errors
+///
+/// Renvoie une erreur si le modèle sort du périmètre ou si la garde refuse.
+pub fn load_causal_decoder_with_memory_guard(
+    assets: &ModelAssets,
+    guard: &MemoryGuard,
+) -> Result<CausalDecoder> {
+    load_causal_decoder_from_shards_with_memory_guard(
+        &assets.config,
+        &assets.shards,
+        &assets.catalog,
+        guard,
+    )
+}
+
 /// Alias rétro-compatible de [`load_causal_decoder`] (ancien nom Qwen-spécifique).
 ///
 /// # Errors
@@ -154,6 +172,18 @@ pub fn load_causal_decoder(assets: &ModelAssets) -> Result<CausalDecoder> {
 /// Renvoie une erreur si le modèle sort du périmètre minimal supporté.
 pub fn load_qwen_causal_decoder(assets: &ModelAssets) -> Result<CausalDecoder> {
     load_causal_decoder(assets)
+}
+
+/// Alias rétro-compatible de [`load_causal_decoder_with_memory_guard`].
+///
+/// # Errors
+///
+/// Renvoie une erreur si le modèle sort du périmètre ou si la garde refuse.
+pub fn load_qwen_causal_decoder_with_memory_guard(
+    assets: &ModelAssets,
+    guard: &MemoryGuard,
+) -> Result<CausalDecoder> {
+    load_causal_decoder_with_memory_guard(assets, guard)
 }
 
 /// Vérifie le contrat du décodeur sans charger les payloads de poids.
@@ -239,6 +269,23 @@ pub fn load_causal_decoder_from_shards(
     CausalDecoder::from_decoder_tensors(tensors, config.into())
 }
 
+/// Charge un décodeur causal depuis des shards sous garde mémoire.
+///
+/// # Errors
+///
+/// Renvoie une erreur si les poids sont invalides ou si la garde refuse.
+pub fn load_causal_decoder_from_shards_with_memory_guard(
+    config: &ModelConfig,
+    shards: &[PathBuf],
+    catalog: &WeightCatalog,
+    guard: &MemoryGuard,
+) -> Result<CausalDecoder> {
+    let _reservation = guard
+        .reserve_allocation(estimate_paths_bytes(shards))
+        .map_err(InferError::MemoryGuard)?;
+    Ok(load_causal_decoder_from_shards(config, shards, catalog)?.with_memory_guard(guard.clone()))
+}
+
 /// Alias rétro-compatible de [`load_causal_decoder_from_shards`].
 ///
 /// # Errors
@@ -250,6 +297,20 @@ pub fn load_qwen_causal_decoder_from_shards(
     catalog: &WeightCatalog,
 ) -> Result<CausalDecoder> {
     load_causal_decoder_from_shards(config, shards, catalog)
+}
+
+/// Alias rétro-compatible de [`load_causal_decoder_from_shards_with_memory_guard`].
+///
+/// # Errors
+///
+/// Renvoie une erreur si les poids sont invalides ou si la garde refuse.
+pub fn load_qwen_causal_decoder_from_shards_with_memory_guard(
+    config: &ModelConfig,
+    shards: &[PathBuf],
+    catalog: &WeightCatalog,
+    guard: &MemoryGuard,
+) -> Result<CausalDecoder> {
+    load_causal_decoder_from_shards_with_memory_guard(config, shards, catalog, guard)
 }
 
 fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> Result<()> {

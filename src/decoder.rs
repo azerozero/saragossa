@@ -16,9 +16,10 @@ use crate::metal_backend::{
     MetalMoeRoutedWeights, MetalMoeSharedWeights,
 };
 use crate::{
-    embed_weight_tokens, load_f32_tensors, rms_norm, sample_token_top_k_top_p, softmax,
-    DeterministicSampler, EmbeddingWeight, FeedForward, ForwardRuntime, GatedMlp, InferError,
-    Linear, LinearWeight, ModelConfig, Result, Tensor,
+    embed_weight_tokens, load_f32_tensors, process_purge_registry, rms_norm,
+    sample_token_top_k_top_p, softmax, DeterministicSampler, EmbeddingWeight, FeedForward,
+    ForwardRuntime, GatedMlp, InferError, Linear, LinearWeight, MemoryGuard, ModelConfig,
+    PurgeOutcome, Result, Tensor,
 };
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -896,6 +897,7 @@ pub struct CausalDecoder {
     mtp: Option<MtpHead>,
     mtp_draft_lm_head: Option<Linear>,
     prefix_cache: Arc<Mutex<PrefixCache>>,
+    memory_guard: Option<MemoryGuard>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     runtime: DecoderRuntime,
 }
@@ -912,6 +914,67 @@ struct PrefixCacheEntry {
     final_state: Tensor,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     linear_metal: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
+}
+
+impl PrefixCacheEntry {
+    fn estimated_bytes(&self) -> u64 {
+        let mut bytes = self
+            .tokens
+            .len()
+            .saturating_mul(std::mem::size_of::<usize>())
+            .saturating_add(self.cache.estimated_cpu_bytes())
+            .saturating_add(
+                self.final_state
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>()),
+            );
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            bytes = bytes.saturating_add(
+                self.linear_metal
+                    .iter()
+                    .flatten()
+                    .map(crate::metal_backend::LinearAttentionMetalState::estimated_bytes)
+                    .sum::<usize>(),
+            );
+        }
+        usize_to_u64_saturating(bytes)
+    }
+}
+
+impl PrefixCache {
+    fn evict_lru_entry(&mut self) -> Option<u64> {
+        self.entries.pop().map(|entry| entry.estimated_bytes())
+    }
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    match u64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => u64::MAX,
+    }
+}
+
+impl CausalDecoder {
+    fn register_prefix_cache_purgeable(&self) {
+        let cache = Arc::downgrade(&self.prefix_cache);
+        let name = format!("decoder-prefix-cache:{:p}", Arc::as_ptr(&self.prefix_cache));
+        if let Ok(mut registry) = process_purge_registry().lock() {
+            registry.register(100, name, move |_, _| {
+                let Some(cache) = cache.upgrade() else {
+                    return PurgeOutcome::Empty;
+                };
+                let outcome = match cache.lock() {
+                    Ok(mut cache) => cache
+                        .evict_lru_entry()
+                        .map(|bytes| PurgeOutcome::Purged { bytes })
+                        .unwrap_or(PurgeOutcome::Empty),
+                    Err(_) => PurgeOutcome::Empty,
+                };
+                outcome
+            });
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1048,9 +1111,18 @@ impl CausalDecoder {
             mtp: None,
             mtp_draft_lm_head: None,
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
+            memory_guard: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             runtime: DecoderRuntime::default(),
         })
+    }
+
+    /// Attache une garde mémoire aux allocations résidentes de ce décodeur.
+    #[must_use]
+    pub fn with_memory_guard(mut self, guard: MemoryGuard) -> Self {
+        self.register_prefix_cache_purgeable();
+        self.memory_guard = Some(guard);
+        self
     }
 
     /// Plonge des tokens et applique l'échelle d'embedding éventuelle (`√hidden` Gemma).
