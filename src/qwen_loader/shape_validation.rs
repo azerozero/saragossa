@@ -70,6 +70,9 @@ fn validate_decoder_shape_map<T: TensorShapes>(config: &ModelConfig, tensors: &T
                 validate_gemma4_parallel_moe_shapes(config, tensors, layer)?;
             }
         }
+        if config.is_gemma4() {
+            expect_shape(tensors, &layer_target(layer, "layer_scalar"), &[1])?;
+        }
     }
     expect_shape(tensors, "norm.weight", &[hidden])?;
     expect_shape(tensors, "lm_head.weight", &[vocab, hidden])?;
@@ -385,7 +388,6 @@ fn validate_gemma4_parallel_moe_shapes(
     ] {
         expect_shape(tensors, &layer_target(layer, suffix), &[hidden])?;
     }
-    expect_shape(tensors, &layer_target(layer, "layer_scalar"), &[1])?;
     expect_shape(
         tensors,
         &layer_target(layer, "router.proj.weight"),

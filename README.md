@@ -29,7 +29,7 @@ saragossa occupe le quadrant **latence mono-utilisateur × Apple Silicon** :
 
 | Domaine | Détail |
 |---|---|
-| LLM | Qwen3.x dense et MoE (27B/30B/35B-A3B), loader générique Llama/Mistral/Gemma 3 ; quantifs u4/u6/u8 gs32-128, scales/biases bf16 |
+| LLM | Qwen3.x dense et MoE (27B/30B/35B-A3B), Gemma 4 dense (`gemma4_unified`) et MoE (`gemma4`), loader générique Llama/Mistral/Gemma 3 ; quantifs u4/u6/u8 gs32-128, scales/biases bf16 |
 | STT | Whisper large-v3-turbo (encodeur + décodeur résidents, GEMM Neural-Accelerators bf16) |
 | TTS | Qwen3-TTS : talker résident + codec GPU + streaming intra-phrase |
 | Embeddings | e5-small pur Rust (CPU), pour la mémoire sémantique / le RAG |
@@ -67,6 +67,19 @@ saragossa occupe le quadrant **latence mono-utilisateur × Apple Silicon** :
 Ces chiffres valent pour leur contexte (matériel, modèle, longueur) — mesurez
 sur votre machine avant de figer un choix.
 
+## Démarrage rapide
+
+```bash
+# Lance un chat interactif et télécharge le modèle HF s'il manque.
+cargo run --release -p saragossa -- run mlx-community/Qwen3-4B-4bit
+
+# Affiche les modèles déjà présents dans le cache Hugging Face local.
+cargo run --release -p saragossa -- list
+```
+
+Pour les modèles gated (Gemma, par exemple), acceptez d'abord la licence sur la
+page Hugging Face du modèle puis exportez `HF_TOKEN`.
+
 ## Usage
 
 ```bash
@@ -82,11 +95,12 @@ En bibliothèque, les points d'entrée sont `qwen_loader` (LLM), `whisper` (STT)
 
 ## Serveur `saragossa serve`
 
-Serveur HTTP local **mono-thread** (usage mono-utilisateur assumé), multi-modèle.
-Transport socket Unix par défaut (`/tmp/saragossa-serve.sock`, chmod 0600) ; le
-TCP loopback exige un bearer (`--api-key` ou `SARAGOSSA_API_KEY`). Deadline de
-lecture par connexion (30 s) et plafond dur `max_tokens` (4096) débrayent les
-requêtes qui dérapent.
+Serveur HTTP local **mono-thread**, multi-modèle. Le comportement par défaut
+reste mono-utilisateur : l'état chaud est global au modèle tant qu'aucune clé de
+session n'est fournie. Transport socket Unix par défaut
+(`/tmp/saragossa-serve.sock`, chmod 0600) ; le TCP loopback exige un bearer
+(`--api-key` ou `SARAGOSSA_API_KEY`). Deadline de lecture par connexion (30 s)
+et plafond dur `max_tokens` (4096) débrayent les requêtes qui dérapent.
 
 ```bash
 # OpenAI-compatible sur socket Unix.
@@ -119,7 +133,8 @@ Limites v1 : l'automate garantit la grammaire JSON (paires de surrogates
 `𐀀` incluses) mais pas la magnitude d'un nombre au-delà de `f64` ;
 en non-stream, un objet non fermé au budget `max_tokens` remonte une erreur
 plutôt que du JSON tronqué ; en SSE, les deltas restent un préfixe JSON valide
-(la garantie « objet complet » ne vaut qu'en fin de flux).
+et un objet non fermé se termine par un événement `error` de type
+`incomplete_json`, sans `[DONE]` normal.
 
 ### Cache chaud (prefix-cache par blocs)
 
@@ -130,6 +145,22 @@ retient l'état de prompt CPU **et** son **snapshot Metal** (KV + état récurre
 linéaire GDN résident sur GPU), rechargé tel quel sur hit — donc seul le suffixe
 est prérempli. Le cache est un LRU de 128 blocs (`RETI_SERVE_PREFIX_CACHE_BLOCKS`) ;
 le header `x-saragossa-reused-prefix-tokens` rapporte la reprise.
+
+Pour un frontal multi-utilisateur, envoyez `x-saragossa-session: <id>` sur
+`/v1/chat/completions` ; à défaut, le champ OpenAI `user` sert de clé de session.
+Sur `/v1/messages`, le shim Anthropic utilise le même header puis
+`metadata.user_id` en repli. La clé dérive la racine du chaînage : deux sessions
+distinctes ne partagent pas de blocs, et `x-saragossa-reused-prefix-tokens` ne
+rapporte alors que la reprise intra-session. Sans clé, la racine historique
+`[0; 32]` et le namespace global restent inchangés.
+
+Cette isolation est un **cloisonnement de cache**, pas une frontière
+d'authentification. Sur la socket Unix par défaut, sans bearer, tout appelant
+autorisé par les permissions du fichier peut revendiquer n'importe quel
+`session-id`. Pour une vraie frontière multi-tenant, authentifiez en amont
+(gateway frontal `grob`) ou utilisez le bearer TCP de `saragossa serve`.
+Le cap `RETI_SERVE_PREFIX_BLOCKS_PER_SESSION` limite en plus les évictions
+intra-session sans changer le défaut mono-utilisateur.
 
 ### Garde OOM + pool de modèles LRU
 
@@ -147,6 +178,7 @@ le header `x-saragossa-reused-prefix-tokens` rapporte la reprise.
 | `RETI_SERVE_PREFIX_CACHE` | on | Cache chaud de préfixe par blocs |
 | `RETI_SERVE_PREFIX_BLOCK_TOKENS` | 256 | Taille d'un bloc (tokens) |
 | `RETI_SERVE_PREFIX_CACHE_BLOCKS` | 128 | Capacité LRU du cache (blocs) |
+| `RETI_SERVE_PREFIX_BLOCKS_PER_SESSION` | 128 | Capacité LRU par session |
 | `RETI_SERVE_LRU` | on | Pool LRU de modèles résidents |
 | `RETI_SERVE_MODEL_POOL` | 2 | Modèles résidents simultanés |
 | `RETI_SERVE_OOM_GUARD` | on | Garde mémoire prédictive |

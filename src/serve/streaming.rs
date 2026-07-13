@@ -8,7 +8,7 @@ use super::error::{ServeError, ServeResult};
 
 /// Métadonnées connues avant le premier token streamé.
 #[derive(Debug)]
-pub(super) struct StreamingCompletionStart {
+pub(crate) struct StreamingCompletionStart {
     /// Identifiant OpenAI du modèle.
     pub(super) model: String,
     /// Nombre de tokens prompt.
@@ -40,14 +40,34 @@ impl StreamingCompletionStart {
 }
 
 /// Evénement produit par une complétion streamée.
-pub(super) enum CompletionStreamEvent<'a> {
+pub(crate) enum CompletionStreamEvent<'a> {
     /// Signale que le préfill est terminé et que les headers peuvent partir.
     Start(&'a StreamingCompletionStart),
     /// Porte un delta texte prêt à écrire au client.
     Delta(&'a str),
+    /// Signale une erreur terminale après démarrage du flux.
+    TerminalError(&'a StreamTerminalError<'a>),
 }
 
-pub(super) struct StreamingTextDetokenizer<'a> {
+/// Erreur terminale sérialisable par chaque dialecte SSE.
+pub(crate) struct StreamTerminalError<'a> {
+    /// Message lisible par le client.
+    pub(crate) message: &'a str,
+    /// Type stable côté client.
+    pub(crate) error_type: &'static str,
+}
+
+impl<'a> StreamTerminalError<'a> {
+    /// Construit l'erreur terminale d'objet JSON tronqué.
+    pub(crate) fn incomplete_json(message: &'a str) -> Self {
+        Self {
+            message,
+            error_type: "incomplete_json",
+        }
+    }
+}
+
+pub(crate) struct StreamingTextDetokenizer<'a> {
     assets: &'a ModelAssets,
     stop_texts: &'a [String],
     generated: Vec<u32>,
@@ -55,7 +75,7 @@ pub(super) struct StreamingTextDetokenizer<'a> {
 }
 
 impl<'a> StreamingTextDetokenizer<'a> {
-    pub(super) fn new(
+    pub(crate) fn new(
         assets: &'a ModelAssets,
         stop_texts: &'a [String],
         max_tokens: usize,
@@ -68,7 +88,7 @@ impl<'a> StreamingTextDetokenizer<'a> {
         }
     }
 
-    pub(super) fn push_token(
+    pub(crate) fn push_token(
         &mut self,
         token: usize,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
@@ -81,7 +101,7 @@ impl<'a> StreamingTextDetokenizer<'a> {
         self.emitter.emit_streaming(visible, on_event)
     }
 
-    pub(super) fn finish(
+    pub(crate) fn finish(
         &mut self,
         content: &str,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,

@@ -12,11 +12,11 @@ mod args;
 mod audio;
 mod cache;
 mod embeddings;
-mod error;
+pub(crate) mod error;
 mod http;
 mod protocol;
 mod state;
-mod streaming;
+pub(crate) mod streaming;
 
 use std::error::Error;
 

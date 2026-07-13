@@ -1,6 +1,8 @@
 //! Cache de préfixe par blocs de `serve`.
 
-use saragossa::runtime_flags::{serve_prefix_block_tokens, serve_prefix_cache_blocks};
+use saragossa::runtime_flags::{
+    serve_prefix_block_tokens, serve_prefix_blocks_per_session, serve_prefix_cache_blocks,
+};
 use saragossa::{CausalDecoderPromptMetalSnapshot, CausalDecoderPromptState};
 use sha2::{Digest, Sha256};
 
@@ -13,6 +15,20 @@ impl BlockHash {
     #[must_use]
     pub(super) fn root() -> Self {
         Self([0; 32])
+    }
+
+    /// Renvoie la racine isolée pour une session.
+    #[must_use]
+    pub(super) fn for_session(session_key: Option<&str>) -> Self {
+        let Some(key) = session_key.filter(|key| !key.is_empty()) else {
+            return Self::root();
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(key.as_bytes());
+        let digest = hasher.finalize();
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(&digest);
+        Self(hash)
     }
 
     /// Calcule le hash chaîné du bloc suivant.
@@ -45,6 +61,7 @@ pub(super) struct PrefixBlockHit {
 
 #[derive(Clone, Debug)]
 struct PrefixBlockEntry {
+    session: BlockHash,
     hash: BlockHash,
     tokens: usize,
     state: CausalDecoderPromptState,
@@ -57,6 +74,7 @@ struct PrefixBlockEntry {
 pub(super) struct BlockAwarePrefixCache {
     block_tokens: usize,
     capacity: usize,
+    blocks_per_session: usize,
     entries: Vec<PrefixBlockEntry>,
 }
 
@@ -64,15 +82,30 @@ impl BlockAwarePrefixCache {
     /// Construit le cache depuis les flags runtime.
     #[must_use]
     pub(super) fn from_runtime_flags() -> Self {
-        Self::new(serve_prefix_block_tokens(), serve_prefix_cache_blocks())
+        Self::with_blocks_per_session(
+            serve_prefix_block_tokens(),
+            serve_prefix_cache_blocks(),
+            serve_prefix_blocks_per_session(),
+        )
     }
 
     /// Construit un cache de capacité fixe.
     #[must_use]
     pub(super) fn new(block_tokens: usize, capacity: usize) -> Self {
+        Self::with_blocks_per_session(block_tokens, capacity, capacity)
+    }
+
+    /// Construit un cache avec un plafond de blocs par session.
+    #[must_use]
+    pub(super) fn with_blocks_per_session(
+        block_tokens: usize,
+        capacity: usize,
+        blocks_per_session: usize,
+    ) -> Self {
         Self {
             block_tokens: block_tokens.max(1),
             capacity,
+            blocks_per_session,
             entries: Vec::new(),
         }
     }
@@ -84,20 +117,22 @@ impl BlockAwarePrefixCache {
     }
 
     /// Recherche la plus longue chaîne de blocs préfixes.
-    pub(super) fn match_prefix(&mut self, tokens: &[usize]) -> Option<PrefixBlockHit> {
+    pub(super) fn match_prefix(
+        &mut self,
+        root: BlockHash,
+        tokens: &[usize],
+    ) -> Option<PrefixBlockHit> {
         if self.capacity == 0 {
             return None;
         }
-        let mut previous = BlockHash::root();
+        let mut previous = root;
         let mut best = None;
         for (index, block) in tokens.chunks_exact(self.block_tokens).enumerate() {
             let hash = previous.chain(block);
             let expected_tokens = (index + 1).saturating_mul(self.block_tokens);
-            let Some(entry_index) = self
-                .entries
-                .iter()
-                .position(|entry| entry.hash == hash && entry.tokens == expected_tokens)
-            else {
+            let Some(entry_index) = self.entries.iter().position(|entry| {
+                entry.session == root && entry.hash == hash && entry.tokens == expected_tokens
+            }) else {
                 break;
             };
             let entry = self.entries.remove(entry_index);
@@ -117,6 +152,7 @@ impl BlockAwarePrefixCache {
     /// Insère ou rafraîchit un snapshot de frontière de bloc.
     pub(super) fn insert(
         &mut self,
+        session: BlockHash,
         hash: BlockHash,
         tokens: usize,
         state: CausalDecoderPromptState,
@@ -125,11 +161,9 @@ impl BlockAwarePrefixCache {
         if self.capacity == 0 {
             return 0;
         }
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.hash == hash && entry.tokens == tokens)
-        {
+        if let Some(index) = self.entries.iter().position(|entry| {
+            entry.session == session && entry.hash == hash && entry.tokens == tokens
+        }) {
             self.entries.remove(index);
         }
         let bytes = state
@@ -138,6 +172,7 @@ impl BlockAwarePrefixCache {
         self.entries.insert(
             0,
             PrefixBlockEntry {
+                session,
                 hash,
                 tokens,
                 state,
@@ -145,6 +180,11 @@ impl BlockAwarePrefixCache {
                 bytes,
             },
         );
+        while self.session_block_count(session) > self.blocks_per_session {
+            if self.evict_lru_session_block(session).is_none() {
+                break;
+            }
+        }
         while self.entries.len() > self.capacity {
             self.entries.pop();
         }
@@ -160,6 +200,21 @@ impl BlockAwarePrefixCache {
     #[must_use]
     pub(super) fn estimated_bytes(&self) -> usize {
         self.entries.iter().map(|entry| entry.bytes).sum()
+    }
+
+    fn session_block_count(&self, session: BlockHash) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.session == session)
+            .count()
+    }
+
+    fn evict_lru_session_block(&mut self, session: BlockHash) -> Option<usize> {
+        let index = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.session == session)?;
+        Some(self.entries.remove(index).bytes)
     }
 }
 
@@ -232,17 +287,41 @@ mod tests {
     }
 
     #[test]
+    fn session_roots_are_deterministic_and_disjoint() {
+        let alpha = BlockHash::for_session(Some("alpha"));
+        let alpha_again = BlockHash::for_session(Some("alpha"));
+        let beta = BlockHash::for_session(Some("beta"));
+
+        assert_eq!(alpha, alpha_again);
+        assert_ne!(alpha, beta);
+    }
+
+    #[test]
+    fn absent_session_keeps_global_root_byte_identity() {
+        let tokens = [1, 2, 3];
+
+        assert_eq!(BlockHash::for_session(None), BlockHash::root());
+        assert_eq!(
+            BlockHash::for_session(None).chain(&tokens),
+            BlockHash::root().chain(&tokens)
+        );
+    }
+
+    #[test]
     fn prefix_cache_matches_longest_chain() {
         let mut cache = BlockAwarePrefixCache::new(2, 8);
-        let first = BlockHash::root().chain(&[1, 2]);
+        let root = BlockHash::root();
+        let first = root.chain(&[1, 2]);
         let second = first.chain(&[3, 4]);
         cache.insert(
+            root,
             first,
             2,
             test_state(2),
             CausalDecoderPromptMetalSnapshot::default(),
         );
         cache.insert(
+            root,
             second,
             4,
             test_state(4),
@@ -250,7 +329,7 @@ mod tests {
         );
 
         let hit = cache
-            .match_prefix(&[1, 2, 3, 4, 5])
+            .match_prefix(root, &[1, 2, 3, 4, 5])
             .expect("invariant: préfixe présent");
 
         assert_eq!(hit.tokens, 4);
@@ -261,29 +340,154 @@ mod tests {
     #[test]
     fn prefix_cache_evicts_lru_block() {
         let mut cache = BlockAwarePrefixCache::new(1, 2);
-        let first = BlockHash::root().chain(&[1]);
+        let root = BlockHash::root();
+        let first = root.chain(&[1]);
         let second = first.chain(&[2]);
         let third = second.chain(&[3]);
         cache.insert(
+            root,
             first,
             1,
             test_state(1),
             CausalDecoderPromptMetalSnapshot::default(),
         );
         cache.insert(
+            root,
             second,
             2,
             test_state(2),
             CausalDecoderPromptMetalSnapshot::default(),
         );
         cache.insert(
+            root,
             third,
             3,
             test_state(3),
             CausalDecoderPromptMetalSnapshot::default(),
         );
 
-        assert!(cache.match_prefix(&[1]).is_none());
-        assert_eq!(cache.match_prefix(&[1, 2, 3]).map(|hit| hit.tokens), None);
+        assert!(cache.match_prefix(root, &[1]).is_none());
+        assert_eq!(
+            cache.match_prefix(root, &[1, 2, 3]).map(|hit| hit.tokens),
+            None
+        );
+    }
+
+    #[test]
+    fn default_session_cap_keeps_global_lru_eviction_order() {
+        let mut cache = BlockAwarePrefixCache::new(1, 2);
+        let alpha = BlockHash::for_session(Some("agent-a"));
+        let beta = BlockHash::for_session(Some("agent-b"));
+        let beta_first = beta.chain(&[9]);
+        let alpha_first = alpha.chain(&[1]);
+        let alpha_second = alpha_first.chain(&[2]);
+        cache.insert(
+            beta,
+            beta_first,
+            1,
+            test_state(1),
+            CausalDecoderPromptMetalSnapshot::default(),
+        );
+        cache.insert(
+            alpha,
+            alpha_first,
+            1,
+            test_state(1),
+            CausalDecoderPromptMetalSnapshot::default(),
+        );
+        cache.insert(
+            alpha,
+            alpha_second,
+            2,
+            test_state(2),
+            CausalDecoderPromptMetalSnapshot::default(),
+        );
+
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.hash)
+                .collect::<Vec<_>>(),
+            vec![alpha_second, alpha_first]
+        );
+        assert!(cache.match_prefix(beta, &[9]).is_none());
+    }
+
+    #[test]
+    fn reduced_session_cap_evicts_only_that_session_first() {
+        let mut cache = BlockAwarePrefixCache::with_blocks_per_session(1, 2, 1);
+        let alpha = BlockHash::for_session(Some("agent-a"));
+        let beta = BlockHash::for_session(Some("agent-b"));
+        let beta_first = beta.chain(&[9]);
+        let alpha_first = alpha.chain(&[1]);
+        let alpha_second = alpha_first.chain(&[2]);
+        cache.insert(
+            beta,
+            beta_first,
+            1,
+            test_state(1),
+            CausalDecoderPromptMetalSnapshot::default(),
+        );
+        cache.insert(
+            alpha,
+            alpha_first,
+            1,
+            test_state(1),
+            CausalDecoderPromptMetalSnapshot::default(),
+        );
+        cache.insert(
+            alpha,
+            alpha_second,
+            2,
+            test_state(2),
+            CausalDecoderPromptMetalSnapshot::default(),
+        );
+
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.hash)
+                .collect::<Vec<_>>(),
+            vec![alpha_second, beta_first]
+        );
+        assert_eq!(
+            cache.match_prefix(beta, &[9]).map(|hit| hit.hash),
+            Some(beta_first)
+        );
+        assert_eq!(cache.session_block_count(alpha), 1);
+    }
+
+    #[test]
+    fn prefix_cache_does_not_match_across_sessions() {
+        let mut cache = BlockAwarePrefixCache::new(2, 8);
+        let alpha = BlockHash::for_session(Some("agent-a"));
+        let beta = BlockHash::for_session(Some("agent-b"));
+        let first = alpha.chain(&[1, 2]);
+        let second = first.chain(&[3, 4]);
+        cache.insert(
+            alpha,
+            first,
+            2,
+            test_state(2),
+            CausalDecoderPromptMetalSnapshot::default(),
+        );
+        cache.insert(
+            alpha,
+            second,
+            4,
+            test_state(4),
+            CausalDecoderPromptMetalSnapshot::default(),
+        );
+
+        assert_ne!(first, beta.chain(&[1, 2]));
+        assert!(cache.match_prefix(beta, &[1, 2, 3, 4]).is_none());
+        assert_eq!(
+            cache
+                .match_prefix(alpha, &[1, 2, 3, 4])
+                .map(|hit| hit.tokens),
+            Some(4)
+        );
     }
 }

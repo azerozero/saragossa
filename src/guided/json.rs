@@ -57,7 +57,7 @@ struct TokenBytes {
 #[derive(Debug)]
 pub struct JsonTokenConstraint {
     catalog: Arc<JsonTokenCatalog>,
-    eot_tokens: Vec<bool>,
+    eot_tokens: Vec<usize>,
     state: Mutex<JsonAutomaton>,
 }
 
@@ -65,19 +65,9 @@ impl JsonTokenConstraint {
     /// Crée une contrainte JSON pour une requête.
     #[must_use]
     pub fn new(catalog: Arc<JsonTokenCatalog>, eot_token_ids: &[usize]) -> Self {
-        let eot_len = eot_token_ids
-            .iter()
-            .copied()
-            .max()
-            .map_or(catalog.tokens.len(), |max| {
-                catalog.tokens.len().max(max.saturating_add(1))
-            });
-        let mut eot_tokens = vec![false; eot_len];
-        for token in eot_token_ids {
-            if let Some(slot) = eot_tokens.get_mut(*token) {
-                *slot = true;
-            }
-        }
+        let mut eot_tokens = eot_token_ids.to_vec();
+        eot_tokens.sort_unstable();
+        eot_tokens.dedup();
         Self {
             catalog,
             eot_tokens,
@@ -93,7 +83,7 @@ impl JsonTokenConstraint {
     }
 
     fn is_eot(&self, token: usize) -> bool {
-        self.eot_tokens.get(token).copied().unwrap_or(false)
+        self.eot_tokens.binary_search(&token).is_ok()
     }
 }
 
@@ -796,6 +786,17 @@ mod tests {
             .expect("invariant: état final contraignable");
         assert!(logits[EOT].is_finite());
         assert!(constraint.is_finished());
+    }
+
+    #[test]
+    fn eot_lookup_accepts_only_configured_ids() {
+        let catalog = Arc::new(JsonTokenCatalog::from_token_bytes_for_tests(&[b"{}"]));
+        let constraint = JsonTokenConstraint::new(catalog, &[42, 7, 42]);
+
+        assert!(constraint.is_eot(7));
+        assert!(constraint.is_eot(42));
+        assert!(!constraint.is_eot(0));
+        assert!(!constraint.is_eot(41));
     }
 
     #[test]

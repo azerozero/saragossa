@@ -79,7 +79,6 @@ const GEMMA4_PARALLEL_MOE_WEIGHTS: &[&str] = &[
     "pre_feedforward_layernorm_2.weight",
     "post_feedforward_layernorm_1.weight",
     "post_feedforward_layernorm_2.weight",
-    "layer_scalar",
 ];
 
 const MOE_LAYER_WEIGHTS: &[&str] = &[
@@ -849,6 +848,13 @@ fn decoder_specs(
             .collect::<Vec<_>>();
         specs.extend(specs_for(prefixes, gemma_ffn_norms, config.is_gemma()));
 
+        let gemma4_layer_weights = [layer_target(layer, "layer_scalar")];
+        specs.extend(specs_for(
+            prefixes,
+            gemma4_layer_weights,
+            config.is_gemma4(),
+        ));
+
         let layer_optional = OPTIONAL_LAYER_WEIGHTS
             .iter()
             .filter(|suffix| {
@@ -883,6 +889,10 @@ fn layer_target(layer: usize, suffix: &str) -> String {
     format!("layers.{layer}.{suffix}")
 }
 
+#[cfg(test)]
+mod gemma4_test_fixtures;
+#[cfg(test)]
+mod gemma4_tests;
 #[cfg(test)]
 mod test_fixtures;
 #[cfg(test)]

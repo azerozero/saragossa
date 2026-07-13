@@ -3,6 +3,8 @@
 #![deny(unsafe_code)]
 
 mod bench_serve;
+mod hf_resolve;
+mod run_repl;
 mod serve;
 
 use std::env;
@@ -79,8 +81,14 @@ fn run() -> CliResult<()> {
             "doctor" => return doctor_bench::run_doctor(raw_args.into_iter().skip(1)),
             "bench" => return doctor_bench::run_bench(raw_args.into_iter().skip(1)),
             "bench-serve" => return bench_serve::run(raw_args.into_iter().skip(1)),
+            "list" => return hf_resolve::run_list(raw_args.into_iter().skip(1)),
+            "run" => return run_repl::run(raw_args.into_iter().skip(1)),
             "serve" => return serve::run(raw_args.into_iter().skip(1)),
-            _ => {}
+            _ if command.starts_with('-') => {}
+            other => {
+                print_help();
+                return Err(cli_error(format!("commande inconnue: {other}")));
+            }
         }
     }
     if raw_args
@@ -691,7 +699,7 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error> {
 
 fn print_help() {
     println!(
-        "Usage: saragossa <doctor|bench|serve|bench-serve> [options]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N]\nDefault backend: metal when available, cpu otherwise.\nSet RETI_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set RETI_RUST_DFLASH_ACCEPTANCE=1 with RETI_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
+        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve> [options]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N]\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet RETI_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set RETI_RUST_DFLASH_ACCEPTANCE=1 with RETI_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
     );
 }
 

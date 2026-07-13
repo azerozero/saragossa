@@ -5,7 +5,7 @@ use thiserror::Error;
 
 /// Décrit un échec de la sous-commande `serve`.
 #[derive(Debug, Error)]
-pub(super) enum ServeError {
+pub(crate) enum ServeError {
     /// Argument CLI invalide.
     #[error("{0}")]
     Args(String),
@@ -28,6 +28,9 @@ pub(super) enum ServeError {
     /// Requête HTTP invalide.
     #[error("HTTP invalide: {0}")]
     Http(String),
+    /// Génération JSON guidée terminée avant fermeture de l'objet racine.
+    #[error("{0}")]
+    IncompleteJson(String),
     /// Fonctionnalité connue mais non livrée.
     #[error("non implémenté: {0}")]
     NotImplemented(String),
@@ -44,12 +47,25 @@ pub(super) enum ServeError {
 
 impl ServeError {
     /// Construit une erreur d'arguments.
-    pub(super) fn args(message: impl Into<String>) -> Self {
+    pub(crate) fn args(message: impl Into<String>) -> Self {
         Self::Args(message.into())
     }
 
+    /// Construit une erreur de JSON guidé incomplet.
+    pub(crate) fn incomplete_json(message: impl Into<String>) -> Self {
+        Self::IncompleteJson(message.into())
+    }
+
+    /// Renvoie le message si l'erreur signale un JSON guidé incomplet.
+    pub(crate) fn incomplete_json_message(&self) -> Option<&str> {
+        match self {
+            Self::IncompleteJson(message) => Some(message),
+            _ => None,
+        }
+    }
+
     /// Construit une erreur I/O contextualisée.
-    pub(super) fn io(context: impl Into<String>, source: io::Error) -> Self {
+    pub(crate) fn io(context: impl Into<String>, source: io::Error) -> Self {
         Self::Io {
             context: context.into(),
             source,
@@ -76,4 +92,4 @@ impl ServeError {
 }
 
 /// Résultat local du serveur.
-pub(super) type ServeResult<T> = std::result::Result<T, ServeError>;
+pub(crate) type ServeResult<T> = std::result::Result<T, ServeError>;

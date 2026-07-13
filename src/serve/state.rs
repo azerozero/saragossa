@@ -25,7 +25,9 @@ use super::error::{ServeError, ServeResult};
 use super::protocol::{
     ChatCompletionRequest, ModelInfo, ModelsResponse, ResponseFormatMode, Usage,
 };
-use super::streaming::{CompletionStreamEvent, StreamingCompletionStart, StreamingTextDetokenizer};
+use super::streaming::{
+    CompletionStreamEvent, StreamTerminalError, StreamingCompletionStart, StreamingTextDetokenizer,
+};
 use crate::RuntimeKind;
 
 /// Réponse d'inférence prête à sérialiser en OpenAI.
@@ -141,6 +143,7 @@ impl ServeState {
     pub(super) fn complete(
         &mut self,
         request: ChatCompletionRequest,
+        session_key: Option<&str>,
     ) -> ServeResult<ServedCompletion> {
         let max_tokens_cap = self.max_tokens_cap;
         let max_tokens = request.max_tokens_capped(max_tokens_cap)?;
@@ -158,7 +161,7 @@ impl ServeState {
             .loaded
             .as_mut()
             .ok_or_else(|| ServeError::args(format!("modèle {model_id} absent après chargement")))?
-            .complete(request, max_tokens, &memory_guard)?;
+            .complete(request, max_tokens, session_key, &memory_guard)?;
         self.enforce_memory_budget(0, Some(index))?;
         Ok(completion)
     }
@@ -167,6 +170,7 @@ impl ServeState {
     pub(super) fn complete_streaming(
         &mut self,
         request: ChatCompletionRequest,
+        session_key: Option<&str>,
         mut on_event: impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
         let max_tokens_cap = self.max_tokens_cap;
@@ -185,7 +189,13 @@ impl ServeState {
             .loaded
             .as_mut()
             .ok_or_else(|| ServeError::args(format!("modèle {model_id} absent après chargement")))?
-            .complete_streaming(request, max_tokens, &memory_guard, &mut on_event)?;
+            .complete_streaming(
+                request,
+                max_tokens,
+                session_key,
+                &memory_guard,
+                &mut on_event,
+            )?;
         self.enforce_memory_budget(0, Some(index))?;
         Ok(completion)
     }
@@ -381,6 +391,7 @@ impl LoadedModel {
         &mut self,
         request: ChatCompletionRequest,
         max_tokens: usize,
+        session_key: Option<&str>,
         memory_guard: &MemoryGuard,
     ) -> ServeResult<ServedCompletion> {
         let response_format = request.response_format_mode()?;
@@ -391,7 +402,8 @@ impl LoadedModel {
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
         let (prompt_state, reused_prefix_tokens, prefill) =
-            self.prefill_prompt_state(&prompt.tokens, memory_guard)?;
+            self.prefill_prompt_state(&prompt.tokens, session_key, memory_guard)?;
+        // TODO: Câbler une annulation non-stream quand serve aura un signal partagé fiable.
         let output = self
             .decoder
             .generate_greedy_timed_from_prompt_state_with_options(
@@ -438,6 +450,7 @@ impl LoadedModel {
         &mut self,
         request: ChatCompletionRequest,
         max_tokens: usize,
+        session_key: Option<&str>,
         memory_guard: &MemoryGuard,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
@@ -449,7 +462,7 @@ impl LoadedModel {
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
         let (prompt_state, reused_prefix_tokens, prefill) =
-            self.prefill_prompt_state(&prompt.tokens, memory_guard)?;
+            self.prefill_prompt_state(&prompt.tokens, session_key, memory_guard)?;
         let start = StreamingCompletionStart {
             model: self.id.clone(),
             prompt_tokens,
@@ -483,7 +496,13 @@ impl LoadedModel {
         if let Some(error) = stream_error {
             return Err(error);
         }
-        ensure_guided_finished(token_constraint.as_deref())?;
+        if let Err(error) = ensure_guided_finished(token_constraint.as_deref()) {
+            if let Some(message) = error.incomplete_json_message() {
+                let terminal = StreamTerminalError::incomplete_json(message);
+                on_event(CompletionStreamEvent::TerminalError(&terminal))?;
+            }
+            return Err(error);
+        }
         let total = started.elapsed();
         let generated = tokens_to_u32(&output.tokens)?;
         let decoded = strip_empty_think(self.assets.decode_tokens(&generated, true)?);
@@ -539,9 +558,12 @@ impl LoadedModel {
     fn prefill_prompt_state(
         &mut self,
         tokens: &[usize],
+        session_key: Option<&str>,
         memory_guard: &MemoryGuard,
     ) -> ServeResult<(CausalDecoderPromptState, usize, Duration)> {
         let started = Instant::now();
+        // NOTE: serve utilise les APIs uncached/extend ; le cache interne du
+        // décodeur reste hors chemin pour éviter un partage inter-session.
         if !serve_prefix_cache_enabled() {
             let state = self.decoder.prefill_prompt_state_uncached(tokens)?;
             return Ok((state, 0, started.elapsed()));
@@ -549,7 +571,8 @@ impl LoadedModel {
 
         let block_tokens = self.prefix_cache.block_tokens();
         let full_block_tokens = tokens.len() / block_tokens * block_tokens;
-        let hit = self.prefix_cache.match_prefix(tokens);
+        let root = BlockHash::for_session(session_key);
+        let hit = self.prefix_cache.match_prefix(root, tokens);
         let reused_prefix_tokens = hit.as_ref().map_or(0, |hit| hit.tokens);
 
         let (mut state, mut consumed, mut hash) = if let Some(hit) = hit {
@@ -560,8 +583,8 @@ impl LoadedModel {
         } else if full_block_tokens >= block_tokens {
             let first = &tokens[..block_tokens];
             let state = self.decoder.prefill_prompt_state_uncached(first)?;
-            let hash = BlockHash::root().chain(first);
-            self.remember_prefix_block(hash, block_tokens, &state, memory_guard)?;
+            let hash = root.chain(first);
+            self.remember_prefix_block(root, hash, block_tokens, &state, memory_guard)?;
             (state, block_tokens, hash)
         } else {
             let state = self.decoder.prefill_prompt_state_uncached(tokens)?;
@@ -573,7 +596,7 @@ impl LoadedModel {
             let block = &tokens[consumed..next];
             self.decoder.extend_prompt_state(&mut state, block)?;
             hash = hash.chain(block);
-            self.remember_prefix_block(hash, next, &state, memory_guard)?;
+            self.remember_prefix_block(root, hash, next, &state, memory_guard)?;
             consumed = next;
         }
 
@@ -587,6 +610,7 @@ impl LoadedModel {
 
     fn remember_prefix_block(
         &mut self,
+        session: BlockHash,
         hash: BlockHash,
         tokens: usize,
         state: &CausalDecoderPromptState,
@@ -607,7 +631,8 @@ impl LoadedModel {
                 return Ok(());
             }
         }
-        self.prefix_cache.insert(hash, tokens, state.clone(), metal);
+        self.prefix_cache
+            .insert(session, hash, tokens, state.clone(), metal);
         Ok(())
     }
 
@@ -743,7 +768,7 @@ fn ensure_guided_finished(constraint: Option<&dyn TokenConstraint>) -> ServeResu
     if constraint.is_finished() {
         return Ok(());
     }
-    Err(ServeError::args(
+    Err(ServeError::incomplete_json(
         "structured output JSON incomplet avant la fin du budget max_tokens",
     ))
 }

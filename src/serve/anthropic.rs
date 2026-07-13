@@ -8,7 +8,9 @@ use serde_json::{json, Value};
 
 use super::error::{ServeError, ServeResult};
 use super::http::{send_json, write_headers};
-use super::protocol::{json_bytes, ChatCompletionRequest, StopSpec, Usage, WireMessage};
+use super::protocol::{
+    json_bytes, normalize_session_key, ChatCompletionRequest, StopSpec, Usage, WireMessage,
+};
 use super::state::{ServeState, ServedCompletion};
 use super::streaming::CompletionStreamEvent;
 
@@ -20,15 +22,17 @@ use self::live::AnthropicLiveBlocks;
 pub(super) fn handle_anthropic_messages<S: Write>(
     stream: &mut S,
     state: &mut ServeState,
+    session_header: Option<&str>,
     body: &[u8],
 ) -> ServeResult<()> {
     let request = parse_anthropic_messages_request(body)?;
+    let session_key = request.session_key(session_header);
     let stream_enabled = request.stream;
     let chat = request.to_chat_request()?;
     if stream_enabled {
-        send_anthropic_sse_streaming(stream, state, chat)
+        send_anthropic_sse_streaming(stream, state, chat, session_key.as_deref())
     } else {
-        let completion = state.complete(chat)?;
+        let completion = state.complete(chat, session_key.as_deref())?;
         let response = AnthropicMessageResponse::from_completion(&completion);
         send_json(stream, 200, &response, completion.metric_headers())
     }
@@ -88,9 +92,23 @@ struct AnthropicMessagesRequest {
     stop_sequences: Vec<String>,
     #[serde(default)]
     tools: Vec<Value>,
+    #[serde(default)]
+    metadata: AnthropicMetadata,
 }
 
 impl AnthropicMessagesRequest {
+    fn session_key(&self, header: Option<&str>) -> Option<String> {
+        header
+            .and_then(normalize_session_key)
+            .or_else(|| {
+                self.metadata
+                    .user_id
+                    .as_deref()
+                    .and_then(normalize_session_key)
+            })
+            .map(ToString::to_string)
+    }
+
     fn to_chat_request(&self) -> ServeResult<ChatCompletionRequest> {
         let max_tokens = self
             .max_tokens
@@ -123,8 +141,15 @@ impl AnthropicMessagesRequest {
             top_k: None,
             stop,
             response_format: None,
+            user: None,
         })
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AnthropicMetadata {
+    #[serde(default)]
+    user_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -572,11 +597,12 @@ fn send_anthropic_sse_streaming<S: Write>(
     stream: &mut S,
     state: &mut ServeState,
     chat: ChatCompletionRequest,
+    session_key: Option<&str>,
 ) -> ServeResult<()> {
     let mut stream_started = false;
     let mut live_blocks = AnthropicLiveBlocks::new();
     let message_id = response_id();
-    let result = state.complete_streaming(chat, |event| match event {
+    let result = state.complete_streaming(chat, session_key, |event| match event {
         CompletionStreamEvent::Start(start) => {
             stream_started = true;
             write_headers(
@@ -616,6 +642,22 @@ fn send_anthropic_sse_streaming<S: Write>(
                 return Ok(());
             }
             live_blocks.push_text_delta(stream, delta)?;
+            stream
+                .flush()
+                .map_err(|e| ServeError::io("flush SSE Anthropic", e))
+        }
+        CompletionStreamEvent::TerminalError(error) => {
+            write_anthropic_sse_event(
+                stream,
+                "error",
+                &json!({
+                    "type": "error",
+                    "error": {
+                        "type": error.error_type,
+                        "message": error.message
+                    }
+                }),
+            )?;
             stream
                 .flush()
                 .map_err(|e| ServeError::io("flush SSE Anthropic", e))

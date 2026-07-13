@@ -20,13 +20,14 @@ use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
 use super::protocol::{
     json_bytes, sse_done, sse_event, ChatCompletionChunk, ChatCompletionRequest,
-    ChatCompletionResponse, HealthResponse,
+    ChatCompletionResponse, HealthResponse, StreamErrorEvent,
 };
 use super::state::ServeState;
 use super::streaming::CompletionStreamEvent;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const SESSION_HEADER: &str = "x-saragossa-session";
 
 /// Sert en HTTP TCP local.
 pub(super) fn serve_tcp(
@@ -186,7 +187,12 @@ fn route_request<S: Write>(
     match (request.method.as_str(), path) {
         ("GET", "/v1/models") => send_json(stream, 200, &state.models_response(), Vec::new()),
         ("POST", "/v1/chat/completions") => handle_chat(stream, state, &request),
-        ("POST", "/v1/messages") => match handle_anthropic_messages(stream, state, &request.body) {
+        ("POST", "/v1/messages") => match handle_anthropic_messages(
+            stream,
+            state,
+            request.header(SESSION_HEADER),
+            &request.body,
+        ) {
             Ok(()) => Ok(()),
             Err(error) => send_anthropic_error(stream, error_status(&error), &error.to_string()),
         },
@@ -213,11 +219,12 @@ fn handle_chat<S: Write>(
         .map_err(|e| ServeError::json("désérialisation chat/completions", e))?;
     chat.max_tokens_capped(state.max_tokens_cap())?;
     chat.response_format_mode()?;
+    let session_key = chat.session_key(request.header(SESSION_HEADER));
     let stream_enabled = chat.stream;
     if stream_enabled {
-        send_sse_streaming(stream, state, chat)
+        send_sse_streaming(stream, state, chat, session_key)
     } else {
-        let completion = state.complete(chat)?;
+        let completion = state.complete(chat, session_key.as_deref())?;
         let headers = completion.metric_headers();
         let response = ChatCompletionResponse::new(
             &completion.model,
@@ -233,10 +240,11 @@ fn send_sse_streaming<S: Write>(
     stream: &mut S,
     state: &mut ServeState,
     chat: ChatCompletionRequest,
+    session_key: Option<String>,
 ) -> ServeResult<()> {
     let mut stream_started = false;
     let mut stream_model = String::new();
-    let result = state.complete_streaming(chat, |event| match event {
+    let result = state.complete_streaming(chat, session_key.as_deref(), |event| match event {
         CompletionStreamEvent::Start(start) => {
             stream_model = start.model.clone();
             stream_started = true;
@@ -258,6 +266,13 @@ fn send_sse_streaming<S: Write>(
             write_sse_event(
                 stream,
                 &ChatCompletionChunk::content(&stream_model, delta.to_string()),
+            )?;
+            stream.flush().map_err(|e| ServeError::io("flush SSE", e))
+        }
+        CompletionStreamEvent::TerminalError(error) => {
+            write_sse_event(
+                stream,
+                &StreamErrorEvent::new(error.message, error.error_type),
             )?;
             stream.flush().map_err(|e| ServeError::io("flush SSE", e))
         }
@@ -352,7 +367,10 @@ fn sanitize_header_value(value: &str) -> String {
 fn error_status(error: &ServeError) -> u16 {
     match error {
         ServeError::UnknownModel(_) => 404,
-        ServeError::Args(_) | ServeError::Json { .. } | ServeError::Http(_) => 400,
+        ServeError::Args(_)
+        | ServeError::Json { .. }
+        | ServeError::Http(_)
+        | ServeError::IncompleteJson(_) => 400,
         ServeError::NotImplemented(_) => 501,
         ServeError::Memory(_) => 503,
         ServeError::Io { .. } | ServeError::Inference(_) => 500,
@@ -578,6 +596,28 @@ mod tests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/v1/chat/completions");
         assert_eq!(request.body, b"{}");
+    }
+
+    #[test]
+    fn chat_session_header_is_available_for_request_namespace() {
+        let body = br#"{"model":"reti-35b","messages":[],"user":"body-user"}"#;
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nX-Saragossa-Session: header-user\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            str::from_utf8(body).expect("invariant: JSON test UTF-8")
+        );
+        let mut cursor = Cursor::new(raw.into_bytes());
+
+        let request = read_request(&mut cursor, far_deadline())
+            .expect("invariant: requête lisible")
+            .expect("invariant: requête présente");
+        let chat: ChatCompletionRequest =
+            serde_json::from_slice(&request.body).expect("invariant: JSON chat valide");
+
+        assert_eq!(
+            chat.session_key(request.header(SESSION_HEADER)).as_deref(),
+            Some("header-user")
+        );
     }
 
     #[test]

@@ -98,6 +98,40 @@ fn request_injects_tools_and_tool_stop_sequence() {
 }
 
 #[test]
+fn request_uses_metadata_user_id_as_session_fallback() {
+    let request: AnthropicMessagesRequest = serde_json::from_str(
+        r#"{
+            "model":"reti-35b",
+            "max_tokens":64,
+            "metadata":{"user_id":" agent-a "},
+            "messages":[{"role":"user","content":"salut"}]
+        }"#,
+    )
+    .expect("invariant: JSON Anthropic valide");
+
+    assert_eq!(request.session_key(None).as_deref(), Some("agent-a"));
+    assert_eq!(request.session_key(Some("   ")).as_deref(), Some("agent-a"));
+}
+
+#[test]
+fn request_session_header_overrides_metadata_user_id() {
+    let request: AnthropicMessagesRequest = serde_json::from_str(
+        r#"{
+            "model":"reti-35b",
+            "max_tokens":64,
+            "metadata":{"user_id":"agent-a"},
+            "messages":[{"role":"user","content":"salut"}]
+        }"#,
+    )
+    .expect("invariant: JSON Anthropic valide");
+
+    assert_eq!(
+        request.session_key(Some(" agent-b ")).as_deref(),
+        Some("agent-b")
+    );
+}
+
+#[test]
 fn response_serializes_anthropic_message_shape() {
     let completion = fake_completion("reti-35b", "bonjour", "stop", None, 9, 3);
 

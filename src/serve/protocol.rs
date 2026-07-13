@@ -39,6 +39,9 @@ pub(super) struct ChatCompletionRequest {
     /// Format de réponse OpenAI.
     #[serde(default)]
     pub(super) response_format: Option<ResponseFormat>,
+    /// Identifiant utilisateur OpenAI, utilisé comme session de repli.
+    #[serde(default)]
+    pub(super) user: Option<String>,
 }
 
 impl ChatCompletionRequest {
@@ -95,6 +98,23 @@ impl ChatCompletionRequest {
                 "response_format type inconnu: {other}"
             ))),
         }
+    }
+
+    /// Dérive la clé de session effective.
+    pub(super) fn session_key(&self, header: Option<&str>) -> Option<String> {
+        header
+            .and_then(normalize_session_key)
+            .or_else(|| self.user.as_deref().and_then(normalize_session_key))
+            .map(ToString::to_string)
+    }
+}
+
+pub(super) fn normalize_session_key(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
@@ -374,6 +394,31 @@ impl ChatCompletionChunk {
     }
 }
 
+/// Evénement d'erreur terminale pour le streaming OpenAI.
+#[derive(Debug, Serialize)]
+pub(super) struct StreamErrorEvent<'a> {
+    error: StreamErrorPayload<'a>,
+}
+
+impl<'a> StreamErrorEvent<'a> {
+    /// Construit une erreur terminale SSE.
+    pub(super) fn new(message: &'a str, error_type: &'a str) -> Self {
+        Self {
+            error: StreamErrorPayload {
+                message,
+                kind: error_type,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct StreamErrorPayload<'a> {
+    message: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
+}
+
 /// Sérialise en JSON bytes.
 pub(super) fn json_bytes<T: Serialize>(value: &T) -> ServeResult<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| ServeError::json("sérialisation réponse", e))
@@ -447,6 +492,24 @@ mod tests {
     }
 
     #[test]
+    fn request_accepts_user_as_session_fallback() {
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"reti-35b","messages":[],"user":" agent-a "}"#)
+                .expect("invariant: JSON valide");
+
+        assert_eq!(req.session_key(None).as_deref(), Some("agent-a"));
+    }
+
+    #[test]
+    fn request_session_header_overrides_user() {
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"reti-35b","messages":[],"user":"agent-a"}"#)
+                .expect("invariant: JSON valide");
+
+        assert_eq!(req.session_key(Some("agent-b")).as_deref(), Some("agent-b"));
+    }
+
+    #[test]
     fn chunk_serializes_openai_shape() {
         let bytes = json_bytes(&ChatCompletionChunk::content(
             "reti-35b",
@@ -457,5 +520,25 @@ mod tests {
 
         assert_eq!(value["object"], "chat.completion.chunk");
         assert_eq!(value["choices"][0]["delta"]["content"], "salut");
+    }
+
+    #[test]
+    fn stream_error_event_serializes_openai_error_shape() {
+        let bytes = sse_event(&StreamErrorEvent::new(
+            "json incomplet (max_tokens)",
+            "incomplete_json",
+        ))
+        .expect("invariant: erreur SSE sérialisable");
+        let text = String::from_utf8(bytes).expect("invariant: SSE UTF-8");
+        let data = text
+            .strip_prefix("data: ")
+            .and_then(|value| value.strip_suffix("\n\n"))
+            .expect("invariant: frame SSE data");
+        let value: Value = serde_json::from_str(data).expect("invariant: data JSON");
+
+        assert_eq!(value["error"]["type"], "incomplete_json");
+        assert!(value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("max_tokens")));
     }
 }

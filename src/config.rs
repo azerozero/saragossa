@@ -285,7 +285,10 @@ impl ModelConfig {
     #[must_use]
     /// Indique si la configuration suit l'architecture Gemma 4 textuelle.
     pub fn is_gemma4(&self) -> bool {
-        self.model_type == "gemma4" || self.model_type == "gemma4_text"
+        matches!(
+            self.model_type.as_str(),
+            "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text"
+        )
     }
 
     #[must_use]
@@ -504,7 +507,10 @@ fn apply_gemma4_defaults(
     top_vocab_size: Option<serde_json::Value>,
 ) {
     let model_type = map.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
-    if model_type != "gemma4" && model_type != "gemma4_text" {
+    if !matches!(
+        model_type,
+        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text"
+    ) {
         return;
     }
 

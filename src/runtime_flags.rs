@@ -609,6 +609,17 @@ pub fn serve_prefix_cache_blocks() -> usize {
     })
 }
 
+/// Renvoie le plafond de blocs du prefix-cache par session.
+pub fn serve_prefix_blocks_per_session() -> usize {
+    static BLOCKS: OnceLock<usize> = OnceLock::new();
+    *BLOCKS.get_or_init(|| {
+        std::env::var("RETI_SERVE_PREFIX_BLOCKS_PER_SESSION")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_else(serve_prefix_cache_blocks)
+    })
+}
+
 /// Renvoie le nombre cible de modèles résidents dans `serve`.
 pub fn serve_model_pool_size() -> usize {
     static MODELS: OnceLock<usize> = OnceLock::new();
