@@ -1,0 +1,33 @@
+# saragossa
+
+> Moteur d'inférence Rust pur Metal pour Apple Silicon : LLM Qwen/Gemma
+> dense et MoE, Whisper STT, Qwen3-TTS, embeddings et serveur local compatible
+> OpenAI. Decode GPU-résident, sans Python ni MLX.
+
+## Développement
+
+- [Guide de développement](CLAUDE.md): architecture, conventions Rust/Metal et gates
+- [Instructions de contribution](AGENTS.md): règles non négociables et flux fork vers PR
+- [CLA](CLA.md): accord requis pour les contributions externes
+- [README](README.md): capacités, démarrage, serveur et performances
+
+## Points d'entrée
+
+- [Bibliothèque](src/lib.rs): modules publics et API du moteur
+- [CLI](src/main.rs): run, list, serve et outils de diagnostic
+- [Decode](src/decoder.rs): façade de génération LLM
+- [Decode résident](src/decode_resident.rs): état et orchestration GPU-résidents
+- [Backend Metal](src/metal_backend/mod.rs): ressources et pipelines Metal
+- [Kernels](src/kernels.metal): calcul GPU embarqué
+- [Chargement](src/qwen_loader.rs): modèles Qwen, Gemma et quantifications
+- [Whisper](src/whisper.rs): transcription STT
+- [TTS](src/tts.rs): synthèse Qwen3-TTS
+- [Serveur](src/serve/mod.rs): endpoints locaux compatibles OpenAI
+- [Flags runtime](src/runtime_flags.rs): réglages et diagnostics centralisés
+
+## Qualité et publication
+
+- [Hooks locaux](prek.toml): fmt, clippy, gitleaks, deny, audit et machete
+- [Politique de dépendances](deny.toml): advisories, licences et sources
+- [Release](release-plz.toml): versions, changelog, tags et crates.io
+- [Workflows](.github/workflows/): Rust, SAST, docs, nightly, CLA et release
