@@ -3109,6 +3109,9 @@ impl CausalDecoder {
         if !prefill_resident_enabled() {
             return Ok(None);
         }
+        if self.config.is_gemma4 && !prefill_resident_gemma4_enabled() {
+            return Ok(None);
+        }
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };
@@ -3118,23 +3121,26 @@ impl CausalDecoder {
         let Some(head_dim) = self.config.head_dim else {
             return Ok(None);
         };
-        // Le kernel prefill (rms_norm+RoPE fusionné) n'implémente que le
-        // rotate-half : tout autre appariement retombe sur le chemin CPU.
+        // Gemma 4 emploie aussi rotate-half. Tout autre appariement reste hors
+        // du contrat du kernel fusionné et retombe sur le chemin per-op.
         if self.config.rope_style != RopeStyle::Halves {
             return Ok(None);
         }
-        // Le prefill résident applique une base RoPE unique, des positions brutes
-        // et aucun masque fenêtré : exclu dès qu'une couche surcharge sa base, son
-        // échelle de positions ou sa fenêtre (Gemma 3).
-        let has_layer_overrides = self.layers.iter().any(|layer| match &layer.attention {
-            AttentionBlock::Full(attention) => {
+        // Le spine résident porte theta, RoPE partiel et fenêtre par couche.
+        // L'échelle de position RoPE reste le seul override non encodé.
+        let has_unsupported_layer_override = self.layers.iter().any(|layer| {
+            let AttentionBlock::Full(attention) = &layer.attention else {
+                return false;
+            };
+            if self.config.is_gemma4 {
+                attention.rope_position_scale.is_some()
+            } else {
                 attention.rope_theta.is_some()
                     || attention.rope_position_scale.is_some()
                     || attention.sliding_window.is_some()
             }
-            AttentionBlock::Linear(_) => false,
         });
-        if has_layer_overrides {
+        if has_unsupported_layer_override {
             return Ok(None);
         }
         let hidden = self.embed_scaled(prompt)?;
@@ -3146,12 +3152,17 @@ impl CausalDecoder {
             kv_heads: self.config.num_key_value_heads,
             head_dim,
             rope_dims: self.config.rope_dims.unwrap_or(head_dim),
+            rope_frequency_dim: self.config.rope_dims.unwrap_or(head_dim),
             rope_theta,
+            attn_scalar: head_dim as f32,
+            window: None,
+            k_eq_v: false,
+            value_norm: false,
             eps: self.config.rms_eps,
         };
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            let Some(prefill_layer) = layer.prefill_moe_layer(&self.config) else {
+            let Some(prefill_layer) = layer.prefill_moe_layer(&self.config, spec) else {
                 return Ok(None);
             };
             layers.push(prefill_layer);
@@ -3165,20 +3176,21 @@ impl CausalDecoder {
                         self.layers.len()
                     )));
                 }
-                let layout = AttentionLayout {
-                    num_attention_heads: self.config.num_attention_heads,
-                    num_key_value_heads: self.config.num_key_value_heads,
-                    head_dim,
-                    rope_dims: self.config.rope_dims.unwrap_or(head_dim),
-                    attn_scalar: self.config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
-                    sliding_window: None,
-                };
                 let mut cache = self.empty_cache();
-                for (layer_cache, layer_state) in
-                    cache.layers.iter_mut().zip(layer_states.into_iter())
+                for ((layer_cache, prefill_layer), layer_state) in
+                    cache.layers.iter_mut().zip(layers.iter()).zip(layer_states)
                 {
                     match layer_state {
                         crate::metal_backend::PrefillResidentLayerCache::Full { key, value } => {
+                            let layer_spec = prefill_layer.attention_spec;
+                            let layout = AttentionLayout {
+                                num_attention_heads: layer_spec.q_heads,
+                                num_key_value_heads: layer_spec.kv_heads,
+                                head_dim: layer_spec.head_dim,
+                                rope_dims: layer_spec.rope_dims,
+                                attn_scalar: layer_spec.attn_scalar,
+                                sliding_window: layer_spec.window,
+                            };
                             layer_cache.append_batch(&key, &value, &layout)?;
                         }
                         crate::metal_backend::PrefillResidentLayerCache::Linear { state } => {
@@ -3200,6 +3212,15 @@ impl CausalDecoder {
                 Ok(None)
             }
         }
+    }
+
+    /// Exécute le gate résident sans masquer le chemin choisi par l'oracle.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn prefill_cache_state_metal_resident_for_test(
+        &self,
+        prompt: &[usize],
+    ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
+        self.prefill_cache_state_metal_resident(prompt)
     }
 
     fn can_prefill_batched(&self) -> bool {

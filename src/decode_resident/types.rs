@@ -15,6 +15,9 @@ pub(crate) struct FullAttnLayerWeights<'a> {
     pub q_norm: &'a Buffer,
     pub k_norm: &'a Buffer,
     pub post_norm: &'a Buffer,
+    pub pre_feedforward_norm: Option<&'a Buffer>,
+    pub post_feedforward_norm: Option<&'a Buffer>,
+    pub layer_scalar: Option<f32>,
     pub moe: &'a MetalMoeSharedWeights,
     pub top_k: usize,
 }
@@ -31,6 +34,9 @@ pub(crate) struct FullAttnRoutedLayerWeights<'a> {
     pub q_norm: &'a Buffer,
     pub k_norm: &'a Buffer,
     pub post_norm: &'a Buffer,
+    pub pre_feedforward_norm: Option<&'a Buffer>,
+    pub post_feedforward_norm: Option<&'a Buffer>,
+    pub layer_scalar: Option<f32>,
     pub moe: &'a MetalMoeRoutedWeights,
     pub top_k: usize,
 }
@@ -41,6 +47,8 @@ pub(crate) struct FullAttnRoutedLayerWeights<'a> {
 pub(crate) struct FullAttnDenseLayerWeights<'a> {
     pub input_norm: &'a Buffer,
     pub qkv_proj: Option<&'a MetalLinearWeightBuffers>,
+    /// Force le buffer concaténé pour le layout K=V sans `v_proj` séparé.
+    pub qkv_proj_without_gate: bool,
     pub q_proj: &'a MetalLinearWeightBuffers,
     pub k_proj: &'a MetalLinearWeightBuffers,
     pub v_proj: &'a MetalLinearWeightBuffers,
@@ -48,6 +56,9 @@ pub(crate) struct FullAttnDenseLayerWeights<'a> {
     pub q_norm: &'a Buffer,
     pub k_norm: &'a Buffer,
     pub post_norm: &'a Buffer,
+    pub pre_feedforward_norm: Option<&'a Buffer>,
+    pub post_feedforward_norm: Option<&'a Buffer>,
+    pub layer_scalar: Option<f32>,
     pub gate_proj: &'a MetalLinearWeightBuffers,
     pub up_proj: &'a MetalLinearWeightBuffers,
     pub down_proj: &'a MetalLinearWeightBuffers,
@@ -63,6 +74,8 @@ pub(crate) struct FullAttnLayerDims {
     pub head_dim: usize,
     pub rope_dims: usize,
     pub position: usize,
+    /// Première ligne KV incluse dans le softmax (`0` = contexte complet).
+    pub window_start: usize,
     pub eps: f32,
     pub theta: f32,
     pub attn_output_gate: bool,
@@ -90,6 +103,24 @@ pub(crate) struct LinearAttnDenseLayerWeights<'a> {
     pub up_proj: &'a MetalLinearWeightBuffers,
     pub down_proj: &'a MetalLinearWeightBuffers,
     pub tail_score: &'a Buffer,
+}
+
+/// Poids additionnels du tail FFN dense Gemma 4.
+#[derive(Clone, Copy)]
+pub(crate) struct GemmaDenseTailWeights<'a> {
+    pub pre_feedforward_norm: &'a Buffer,
+    pub post_feedforward_norm: &'a Buffer,
+    pub layer_scalar: Option<f32>,
+}
+
+/// Poids additionnels du tail MoE routed Gemma 4.
+#[derive(Clone, Copy)]
+pub(crate) struct GemmaMoeTailWeights<'a> {
+    pub pre_feedforward_norm: &'a Buffer,
+    pub post_feedforward_norm: &'a Buffer,
+    pub layer_scalar: Option<f32>,
+    pub moe: &'a MetalMoeRoutedWeights,
+    pub top_k: usize,
 }
 
 /// Cumul CPU des temps par section du decode résident (ÉTAPE 0 tranche 3,

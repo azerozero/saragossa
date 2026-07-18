@@ -300,6 +300,8 @@ impl MetalExecutor {
     /// `rhs` est transposé en `[K,N]` (= `rhs^T`) pour le matmul standard prouvé.
     /// Renvoie `None` si la NA n'est pas dispo. Réservé au test de correctness
     /// (le chemin prod passe par `cached_rhs_t_bf16` + `encode_na_gemm` résident).
+    /// Conservé comme façade standalone symétrique des encodeurs résidents,
+    /// exercé par `tests/na_gemm_delta.rs`.
     ///
     /// # Errors
     ///
@@ -741,7 +743,12 @@ impl MetalExecutor {
             kv_heads: enc.heads,
             head_dim,
             rope_dims: 0,
+            rope_frequency_dim: 0,
             rope_theta: 0.0,
+            attn_scalar: head_dim as f32,
+            window: None,
+            k_eq_v: false,
+            value_norm: false,
             eps: 0.0,
         };
 

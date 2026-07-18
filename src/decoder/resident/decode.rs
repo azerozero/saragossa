@@ -184,25 +184,14 @@ impl CausalDecoder {
                 "decode résident sans executor Metal".to_string(),
             ));
         };
-        let head_dim = self.config.head_dim.ok_or_else(|| {
-            InferError::Dimension("head_dim manquant (decode résident)".to_string())
-        })?;
         let theta = self.config.rope_theta.ok_or_else(|| {
             InferError::Config("rope_theta manquant (decode résident)".to_string())
         })?;
         let eps = self.config.rms_eps;
-        let rope_dims = self.config.rope_dims.unwrap_or(head_dim);
-        let q_heads = self.config.num_attention_heads;
-        let kv_heads = self.config.num_key_value_heads;
 
         let hidden = self.final_norm.data().len();
         let position = cache.position;
-        let linear_dims = if self
-            .layers
-            .iter()
-            .enumerate()
-            .any(|(index, _)| !self.config.is_full_attention_layer(index))
-        {
+        let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
                 num_key_heads: la_config.num_key_heads,
@@ -277,19 +266,11 @@ impl CausalDecoder {
         let mut other = &arena.hidden_b;
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_cache = &mut layers[index];
-            let is_full = self.config.is_full_attention_layer(index);
+            let is_full = self.config.is_resident_full_attention_layer(index);
             if is_full {
-                let dims = FullAttnLayerDims {
-                    hidden,
-                    q_heads,
-                    kv_heads,
-                    head_dim,
-                    rope_dims,
-                    position,
-                    eps,
-                    theta,
-                    attn_output_gate: self.config.attn_output_gate,
-                };
+                let dims = self
+                    .config
+                    .resident_windowed_full_attn_layer_dims(index, hidden, position, eps, theta)?;
                 self.encode_resident_full_layer(
                     metal,
                     arena,
@@ -483,23 +464,12 @@ impl CausalDecoder {
                 embedding.shape()
             )));
         }
-        let head_dim = self.config.head_dim.ok_or_else(|| {
-            InferError::Dimension("head_dim manquant (decode résident embedding)".to_string())
-        })?;
         let theta = self.config.rope_theta.ok_or_else(|| {
             InferError::Config("rope_theta manquant (decode résident embedding)".to_string())
         })?;
         let eps = self.config.rms_eps;
-        let rope_dims = self.config.rope_dims.unwrap_or(head_dim);
-        let q_heads = self.config.num_attention_heads;
-        let kv_heads = self.config.num_key_value_heads;
         let position = cache.position;
-        let linear_dims = if self
-            .layers
-            .iter()
-            .enumerate()
-            .any(|(index, _)| !self.config.is_full_attention_layer(index))
-        {
+        let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
                 num_key_heads: la_config.num_key_heads,
@@ -546,18 +516,10 @@ impl CausalDecoder {
         let mut other = &arena.hidden_b;
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_cache = &mut layers[index];
-            if self.config.is_full_attention_layer(index) {
-                let dims = FullAttnLayerDims {
-                    hidden,
-                    q_heads,
-                    kv_heads,
-                    head_dim,
-                    rope_dims,
-                    position,
-                    eps,
-                    theta,
-                    attn_output_gate: self.config.attn_output_gate,
-                };
+            if self.config.is_resident_full_attention_layer(index) {
+                let dims = self
+                    .config
+                    .resident_windowed_full_attn_layer_dims(index, hidden, position, eps, theta)?;
                 self.encode_resident_full_layer(
                     metal,
                     arena,

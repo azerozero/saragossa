@@ -113,6 +113,22 @@ fn bf16_round_to_f32(value: f32) -> f32 {
     f32::from_bits(u32::from(f32_to_bf16_bits(value)) << 16)
 }
 
+fn assert_close_eps(actual: &[f32], expected: &[f32], eps: f32) {
+    assert_eq!(actual.len(), expected.len(), "longueurs différentes");
+    let mut max_abs = 0.0_f32;
+    let mut mean_abs = 0.0_f32;
+    for (&actual, &expected) in actual.iter().zip(expected.iter()) {
+        let delta = (actual - expected).abs();
+        max_abs = max_abs.max(delta);
+        mean_abs += delta;
+    }
+    mean_abs /= actual.len().max(1) as f32;
+    assert!(
+        max_abs <= eps,
+        "écart max {max_abs:e} > {eps:e} (mean {mean_abs:e})"
+    );
+}
+
 #[allow(
     unsafe_code,
     reason = "lecture d'un MTLBuffer partagé après wait_until_completed (test)"
@@ -492,6 +508,352 @@ fn pseudo(seed: usize) -> f32 {
     (x as f32 / 1000.0 - 0.5) * 0.2
 }
 
+fn gemma_tail_value(seed: usize, index: usize, scale: f32) -> f32 {
+    let mixed = seed
+        .wrapping_mul(1_103_515_245)
+        .wrapping_add(index.wrapping_mul(12_345))
+        ^ 0xA5A5_9669;
+    (((mixed % 2001) as f32 / 1000.0) - 1.0) * scale
+}
+
+fn gemma_tail_weight(rows: usize, cols: usize, seed: usize, scale: f32) -> Result<crate::Tensor> {
+    crate::Tensor::from_vec(
+        vec![rows, cols],
+        (0..rows * cols)
+            .map(|idx| gemma_tail_value(seed, idx, scale))
+            .collect(),
+    )
+}
+
+fn gemma_tail_norm(hidden: usize, seed: usize) -> Result<crate::Tensor> {
+    crate::Tensor::from_vec(
+        vec![hidden],
+        (0..hidden)
+            .map(|idx| 0.75 + gemma_tail_value(seed, idx, 0.18).abs())
+            .collect(),
+    )
+}
+
+fn gemma_tail_affine_weight(
+    rows: usize,
+    cols: usize,
+    seed: usize,
+    scale: f32,
+) -> Result<crate::AffineQuantizedTensor> {
+    let bits = 8_usize;
+    let values_per_word = 32 / bits;
+    if cols % values_per_word != 0 {
+        return Err(InferError::Dimension(format!(
+            "fixture affine cols={cols} non multiple de {values_per_word}"
+        )));
+    }
+    let packed_cols = cols / values_per_word;
+    let group_size = cols;
+    let groups = cols / group_size;
+    let mut packed = Vec::with_capacity(rows * packed_cols);
+    for row in 0..rows {
+        for word in 0..packed_cols {
+            let mut value = 0_u32;
+            for lane in 0..values_per_word {
+                let col = word * values_per_word + lane;
+                let quant = ((seed + row * 17 + col * 31 + lane * 7) % 23 + 3) as u32;
+                value |= quant << (lane * bits);
+            }
+            packed.push(value);
+        }
+    }
+    let scales = crate::Tensor::from_vec(
+        vec![rows, groups],
+        (0..rows * groups)
+            .map(|idx| bf16_round_to_f32(scale * (0.7 + ((seed + idx) % 5) as f32 * 0.05)))
+            .collect(),
+    )?;
+    let biases = crate::Tensor::from_vec(
+        vec![rows, groups],
+        (0..rows * groups)
+            .map(|idx| bf16_round_to_f32(gemma_tail_value(seed + 97, idx, scale * 3.0)))
+            .collect(),
+    )?;
+    crate::AffineQuantizedTensor::new(
+        &[rows, packed_cols],
+        packed,
+        scales,
+        biases,
+        group_size,
+        bits,
+    )
+}
+
+fn gemma_moe_experts(
+    experts: usize,
+    hidden: usize,
+    inter: usize,
+    seed: usize,
+) -> Result<Vec<crate::GatedMlp>> {
+    let mut out = Vec::with_capacity(experts);
+    for expert in 0..experts {
+        let gate = gemma_tail_affine_weight(inter, hidden, seed + expert * 101 + 1, 0.0035)?;
+        let up = gemma_tail_affine_weight(inter, hidden, seed + expert * 101 + 17, 0.003)?;
+        let down = gemma_tail_affine_weight(hidden, inter, seed + expert * 101 + 41, 0.0025)?;
+        out.push(
+            crate::GatedMlp::new(
+                crate::Linear::new_quantized(gate, None)?,
+                crate::Linear::new_quantized(up, None)?,
+                crate::Linear::new_quantized(down, None)?,
+            )
+            .with_activation(crate::Activation::GeluTanh),
+        );
+    }
+    Ok(out)
+}
+
+fn gemma_moe_router_weight(experts: usize, hidden: usize, seed: usize) -> Result<crate::Tensor> {
+    crate::Tensor::from_vec(
+        vec![experts, hidden],
+        (0..experts * hidden)
+            .map(|idx| {
+                let expert = idx / hidden;
+                let col = idx % hidden;
+                let diagonal = if col == expert % hidden { 0.11 } else { 0.0 };
+                gemma_tail_value(seed + expert * 13, col, 0.18) + diagonal - expert as f32 * 0.007
+            })
+            .collect(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct GemmaTailCase {
+    rows: usize,
+    hidden: usize,
+    inter: usize,
+    seed: usize,
+    embed_scale: f32,
+    layer_scalar: f32,
+}
+
+fn run_gemma_dense_tail_case(case: GemmaTailCase) -> Result<()> {
+    let Some(mut state) = try_state()? else {
+        return Ok(());
+    };
+    let executor = MetalExecutor::new()?;
+    let eps = 1.0e-6_f32;
+    let hidden_data: Vec<f32> = (0..case.rows * case.hidden)
+        .map(|idx| gemma_tail_value(case.seed, idx, 0.7) * case.embed_scale)
+        .collect();
+    let hidden = crate::Tensor::from_vec(vec![case.rows, case.hidden], hidden_data.clone())?;
+    let pre_norm = gemma_tail_norm(case.hidden, case.seed + 11)?;
+    let post_norm = gemma_tail_norm(case.hidden, case.seed + 23)?;
+    let gate_weight = gemma_tail_weight(case.inter, case.hidden, case.seed + 31, 0.09)?;
+    let up_weight = gemma_tail_weight(case.inter, case.hidden, case.seed + 43, 0.08)?;
+    let down_weight = gemma_tail_weight(case.hidden, case.inter, case.seed + 59, 0.07)?;
+    let mlp = crate::GatedMlp::new(
+        crate::Linear::new(gate_weight.clone(), None)?,
+        crate::Linear::new(up_weight.clone(), None)?,
+        crate::Linear::new(down_weight.clone(), None)?,
+    )
+    .with_activation(crate::Activation::GeluTanh);
+
+    let ffn_input = crate::rms_norm(&hidden, &pre_norm, eps)?;
+    let ffn_out = mlp.forward_with_runtime(&ffn_input, crate::ForwardRuntime::metal(&executor))?;
+    let ffn_normed = crate::rms_norm(&ffn_out, &post_norm, eps)?;
+    let oracle = hidden
+        .add(&ffn_normed)?
+        .map(|value| value * case.layer_scalar);
+
+    let hidden_buf = state.persistent(case.rows * case.hidden, GpuElement::F32)?;
+    write_f32_at(&hidden_buf, 0, &hidden_data)?;
+    let out_buf = state.persistent(case.rows * case.hidden, GpuElement::F32)?;
+    let pre_norm_buf = executor.cached_buffer_from_f32(pre_norm.data(), "gemma_tail_pre_norm")?;
+    let post_norm_buf =
+        executor.cached_buffer_from_f32(post_norm.data(), "gemma_tail_post_norm")?;
+    let gate_proj = executor.resolve_linear_weight_buffers(
+        &crate::LinearWeight::Dense(gate_weight),
+        "gemma_tail_gate",
+    )?;
+    let up_proj = executor
+        .resolve_linear_weight_buffers(&crate::LinearWeight::Dense(up_weight), "gemma_tail_up")?;
+    let down_proj = executor.resolve_linear_weight_buffers(
+        &crate::LinearWeight::Dense(down_weight),
+        "gemma_tail_down",
+    )?;
+
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let mut owned = Vec::new();
+    state.encode_gemma_dense_tail(
+        &executor,
+        encoder,
+        &mut owned,
+        hidden_buf.buffer(),
+        out_buf.buffer(),
+        case.rows,
+        case.hidden,
+        eps,
+        &gate_proj,
+        &up_proj,
+        &down_proj,
+        GemmaDenseTailWeights {
+            pre_feedforward_norm: &pre_norm_buf,
+            post_feedforward_norm: &post_norm_buf,
+            layer_scalar: Some(case.layer_scalar),
+        },
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    let gpu = read_f32(&out_buf);
+    // Near-tie documenté : l'oracle per-op garde RMSNorm et gelu_tanh côté CPU,
+    // alors que cette brique résidente les évalue dans Metal (réductions par
+    // threadgroup + fast-math `tanh`). Les écarts attendus restent au niveau ULP.
+    assert_close_eps(&gpu, oracle.data(), 2.0e-5);
+    Ok(())
+}
+
+/// Phase 1 Gemma : le tail dense résident reproduit l'oracle per-op générique.
+#[test]
+fn gemma_dense_tail_resident_matches_per_op_oracle() -> Result<()> {
+    for case in [
+        GemmaTailCase {
+            rows: 1,
+            hidden: 4,
+            inter: 6,
+            seed: 3,
+            embed_scale: 1.75,
+            layer_scalar: 0.95,
+        },
+        GemmaTailCase {
+            rows: 2,
+            hidden: 8,
+            inter: 10,
+            seed: 17,
+            embed_scale: 2.25,
+            layer_scalar: 1.1,
+        },
+        GemmaTailCase {
+            rows: 3,
+            hidden: 16,
+            inter: 12,
+            seed: 29,
+            embed_scale: 0.85,
+            layer_scalar: 0.8,
+        },
+    ] {
+        run_gemma_dense_tail_case(case)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct GemmaMoeTailCase {
+    hidden: usize,
+    inter: usize,
+    experts: usize,
+    top_k: usize,
+    seed: usize,
+    embed_scale: f32,
+    layer_scalar: f32,
+}
+
+fn run_gemma_moe_tail_case(case: GemmaMoeTailCase) -> Result<()> {
+    let Some(mut state) = try_state()? else {
+        return Ok(());
+    };
+    let executor = MetalExecutor::new()?;
+    let eps = 1.0e-6_f32;
+    let hidden_data: Vec<f32> = (0..case.hidden)
+        .map(|idx| gemma_tail_value(case.seed, idx, 0.55) * case.embed_scale)
+        .collect();
+    let hidden = crate::Tensor::from_vec(vec![1, case.hidden], hidden_data.clone())?;
+    let pre_norm = gemma_tail_norm(case.hidden, case.seed + 211)?;
+    let post_norm = gemma_tail_norm(case.hidden, case.seed + 223)?;
+    let router_weight = gemma_moe_router_weight(case.experts, case.hidden, case.seed + 239)?;
+    let router = crate::Linear::new(router_weight, None)?;
+    let experts = gemma_moe_experts(case.experts, case.hidden, case.inter, case.seed + 251)?;
+    let moe = crate::MoeMlp::new(router.clone(), experts.clone(), None, None, case.top_k)?;
+
+    let ffn_input = crate::rms_norm(&hidden, &pre_norm, eps)?;
+    let moe_out = moe.forward_with_runtime(&ffn_input, crate::ForwardRuntime::cpu())?;
+    let ffn_normed = crate::rms_norm(&moe_out, &post_norm, eps)?;
+    let oracle = hidden
+        .add(&ffn_normed)?
+        .map(|value| value * case.layer_scalar);
+
+    let hidden_buf = state.persistent(case.hidden, GpuElement::F32)?;
+    write_f32_at(&hidden_buf, 0, &hidden_data)?;
+    let out_buf = state.persistent(case.hidden, GpuElement::F32)?;
+    let pre_norm_buf =
+        executor.cached_buffer_from_f32(pre_norm.data(), "gemma_moe_tail_pre_norm")?;
+    let post_norm_buf =
+        executor.cached_buffer_from_f32(post_norm.data(), "gemma_moe_tail_post_norm")?;
+    let moe_weights = executor.resolve_moe_routed_weights(&router, &experts)?;
+
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let mut owned = Vec::new();
+    state.encode_gemma_moe_tail(
+        &executor,
+        encoder,
+        &mut owned,
+        hidden_buf.buffer(),
+        out_buf.buffer(),
+        case.hidden,
+        eps,
+        GemmaMoeTailWeights {
+            pre_feedforward_norm: &pre_norm_buf,
+            post_feedforward_norm: &post_norm_buf,
+            layer_scalar: Some(case.layer_scalar),
+            moe: &moe_weights,
+            top_k: case.top_k,
+        },
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    let gpu = read_f32(&out_buf);
+    // Near-tie documenté : l'oracle per-op générique garde le routage MoE et
+    // GeGLU en CPU f32 ; le résident évalue top-k softmax, GeGLU tanh et RMSNorm
+    // dans Metal (fast-math + réductions threadgroup, scales/biases bf16).
+    assert_close_eps(&gpu, oracle.data(), 5.0e-5);
+    Ok(())
+}
+
+/// Phase 1b Gemma : le tail MoE routed résident reproduit l'oracle per-op.
+#[test]
+fn gemma_moe_tail_resident_matches_per_op_oracle() -> Result<()> {
+    for case in [
+        GemmaMoeTailCase {
+            hidden: 4,
+            inter: 4,
+            experts: 3,
+            top_k: 2,
+            seed: 5,
+            embed_scale: 1.6,
+            layer_scalar: 0.92,
+        },
+        GemmaMoeTailCase {
+            hidden: 8,
+            inter: 4,
+            experts: 4,
+            top_k: 2,
+            seed: 23,
+            embed_scale: 2.05,
+            layer_scalar: 1.08,
+        },
+        GemmaMoeTailCase {
+            hidden: 8,
+            inter: 8,
+            experts: 5,
+            top_k: 3,
+            seed: 41,
+            embed_scale: 0.9,
+            layer_scalar: 0.83,
+        },
+    ] {
+        run_gemma_moe_tail_case(case)?;
+    }
+    Ok(())
+}
+
 /// Oracle CPU : réplique EXACTEMENT `cached_attention_one` (decoder.rs:2158) —
 /// GQA `kv_head = q_head / (q_heads/kv_heads)`, scale `1/√head_dim`, softmax
 /// causal sur `0..len`, somme pondérée des valeurs.
@@ -504,6 +866,19 @@ fn cpu_attention(
     head_dim: usize,
     len: usize,
 ) -> Vec<f32> {
+    cpu_attention_windowed(q, keys, values, q_heads, kv_heads, head_dim, len, 0)
+}
+
+fn cpu_attention_windowed(
+    q: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    len: usize,
+    window_start: usize,
+) -> Vec<f32> {
     let kv_dim = kv_heads * head_dim;
     let group = q_heads / kv_heads;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -512,8 +887,9 @@ fn cpu_attention(
         let kvh = qh / group;
         let qs = qh * head_dim;
         let ks = kvh * head_dim;
-        let mut scores = vec![0.0_f32; len];
-        for (r, score) in scores.iter_mut().enumerate() {
+        let mut scores = vec![0.0_f32; len - window_start];
+        for (offset, score) in scores.iter_mut().enumerate() {
+            let r = window_start + offset;
             let kstart = r * kv_dim + ks;
             let mut dot = 0.0_f32;
             for c in 0..head_dim {
@@ -531,7 +907,8 @@ fn cpu_attention(
         for score in scores.iter_mut() {
             *score *= inv;
         }
-        for (r, &prob) in scores.iter().enumerate() {
+        for (offset, &prob) in scores.iter().enumerate() {
+            let r = window_start + offset;
             let vstart = r * kv_dim + ks;
             for c in 0..head_dim {
                 out[qs + c] += prob * values[vstart + c];
@@ -539,6 +916,305 @@ fn cpu_attention(
         }
     }
     out
+}
+
+fn cpu_rms_norm_rope_heads_at(
+    input: &[f32],
+    weight: &[f32],
+    num_heads: usize,
+    head_dim: usize,
+    rope_dims: usize,
+    position: usize,
+    eps: f32,
+    theta: f32,
+) -> Vec<f32> {
+    let mut out = vec![0.0_f32; num_heads * head_dim];
+    let pairs = rope_dims / 2;
+    for head in 0..num_heads {
+        let start = head * head_dim;
+        let sumsq: f32 = (0..head_dim)
+            .map(|c| input[start + c] * input[start + c])
+            .sum();
+        let inv_rms = 1.0 / ((sumsq / head_dim as f32) + eps).sqrt();
+        let normed: Vec<f32> = (0..head_dim)
+            .map(|c| input[start + c] * inv_rms * weight[c])
+            .collect();
+        for c in 0..head_dim {
+            out[start + c] = if c < rope_dims {
+                let pair = if c < pairs { c } else { c - pairs };
+                let exponent = (2 * pair) as f32 / rope_dims as f32;
+                let angle = position as f32 / theta.powf(exponent);
+                let (first, second) = (normed[pair], normed[pair + pairs]);
+                if c < pairs {
+                    first * angle.cos() - second * angle.sin()
+                } else {
+                    first * angle.sin() + second * angle.cos()
+                }
+            } else {
+                normed[c]
+            };
+        }
+    }
+    out
+}
+
+fn run_gemma4_global_attention_decode_case(prefill_len: usize, seed: usize) -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads, head_dim) = (4_usize, 2_usize, 16_usize);
+    let rope_dims = head_dim / 4;
+    let kv_dim = kv_heads * head_dim;
+    let (eps, theta) = (1.0e-6_f32, 1_000_000.0_f32);
+    let q_norm: Vec<f32> = (0..head_dim)
+        .map(|i| 0.7 + pseudo(seed + 11 * i).abs())
+        .collect();
+    let k_norm: Vec<f32> = (0..head_dim)
+        .map(|i| 0.8 + pseudo(seed + 17 * i).abs())
+        .collect();
+
+    let mut prefill_keys = Vec::with_capacity(prefill_len * kv_dim);
+    let mut prefill_values = Vec::with_capacity(prefill_len * kv_dim);
+    for row in 0..prefill_len {
+        let k_raw: Vec<f32> = (0..kv_dim).map(|i| pseudo(seed + row * 131 + i)).collect();
+        let v_raw: Vec<f32> = (0..kv_dim)
+            .map(|i| pseudo(seed + 10_000 + row * 137 + i))
+            .collect();
+        prefill_keys.extend(cpu_rms_norm_rope_heads_at(
+            &k_raw, &k_norm, kv_heads, head_dim, rope_dims, row, eps, theta,
+        ));
+        prefill_values.extend(v_raw);
+    }
+
+    let position = prefill_len;
+    let q_raw: Vec<f32> = (0..q_heads * head_dim)
+        .map(|i| pseudo(seed + 20_000 + i))
+        .collect();
+    let k_raw: Vec<f32> = (0..kv_dim).map(|i| pseudo(seed + 30_000 + i)).collect();
+    let v_raw: Vec<f32> = (0..kv_dim).map(|i| pseudo(seed + 40_000 + i)).collect();
+    let q_cpu = cpu_rms_norm_rope_heads_at(
+        &q_raw, &q_norm, q_heads, head_dim, rope_dims, position, eps, theta,
+    );
+    let k_cpu = cpu_rms_norm_rope_heads_at(
+        &k_raw, &k_norm, kv_heads, head_dim, rope_dims, position, eps, theta,
+    );
+    let q_gpu = state.rms_norm_rope_decode(
+        &q_raw, &q_norm, q_heads, head_dim, rope_dims, position, eps, theta,
+    )?;
+    let k_gpu = state.rms_norm_rope_decode(
+        &k_raw, &k_norm, kv_heads, head_dim, rope_dims, position, eps, theta,
+    )?;
+
+    let mut kv = state.full_attention(prefill_len + 1, q_heads, kv_heads, head_dim, false)?;
+    kv.seed(&prefill_keys, &prefill_values, prefill_len)?;
+    kv.append_row(&k_gpu, &v_raw)?;
+    let gpu = kv.attention_decode(&q_gpu)?;
+
+    let mut keys = prefill_keys;
+    keys.extend(k_cpu);
+    let mut values = prefill_values;
+    values.extend(v_raw);
+    let cpu = cpu_attention(
+        &q_cpu,
+        &keys,
+        &values,
+        q_heads,
+        kv_heads,
+        head_dim,
+        prefill_len + 1,
+    );
+    assert_eq!(gpu.len(), cpu.len());
+
+    let mut max_abs = 0.0_f32;
+    let mut mean_abs = 0.0_f32;
+    for (g, c) in gpu.iter().zip(cpu.iter()) {
+        let delta = (g - c).abs();
+        max_abs = max_abs.max(delta);
+        mean_abs += delta;
+    }
+    mean_abs /= gpu.len() as f32;
+    // Le chemin résident utilise fast-math Metal et une réduction SDPA GPU dont
+    // l'ordre diffère de l'oracle CPU. Les cas ci-dessous restent typiquement
+    // sous 1e-6 ; 1e-4/1e-5 laisse de la marge cross-GPU sans couvrir une erreur
+    // de position RoPE, de GQA ou de rope_dims (observée à >1e-2).
+    assert!(
+        max_abs <= 1.0e-4,
+        "gemma4 global prefill={prefill_len} seed={seed}: max_abs={max_abs:e} > 1e-4"
+    );
+    assert!(
+        mean_abs <= 1.0e-5,
+        "gemma4 global prefill={prefill_len} seed={seed}: mean_abs={mean_abs:e} > 1e-5"
+    );
+    Ok(())
+}
+
+/// Phase 2a Gemma 4 : attention globale decode résidente avec `head_dim` réduit
+/// et RoPE partiel 0.25, KV seedé depuis un préfill court.
+#[test]
+fn gemma4_global_attention_decode_resident_matches_per_op_oracle() -> Result<()> {
+    for (prefill_len, seed) in [(1_usize, 3_usize), (4, 19), (9, 41)] {
+        run_gemma4_global_attention_decode_case(prefill_len, seed)?;
+    }
+    Ok(())
+}
+
+fn run_gemma4_sliding_attention_decode_case(position: usize, seed: usize) -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads, head_dim, window) = (4_usize, 2_usize, 256_usize, 4_usize);
+    let len = position + 1;
+    let window_start = len.saturating_sub(window);
+    let kv_dim = kv_heads * head_dim;
+    let (eps, theta) = (1.0e-6_f32, 10_000.0_f32);
+    let q_norm: Vec<f32> = (0..head_dim)
+        .map(|i| 0.75 + pseudo(seed + 7 * i).abs())
+        .collect();
+    let k_norm: Vec<f32> = (0..head_dim)
+        .map(|i| 0.8 + pseudo(seed + 11 * i).abs())
+        .collect();
+    let q_raw: Vec<f32> = (0..q_heads * head_dim)
+        .map(|i| pseudo(seed + 20_000 + i))
+        .collect();
+    let q = state.rms_norm_rope_decode(
+        &q_raw, &q_norm, q_heads, head_dim, head_dim, position, eps, theta,
+    )?;
+
+    let mut keys = Vec::with_capacity(len * kv_dim);
+    let mut values = Vec::with_capacity(len * kv_dim);
+    for row in 0..len {
+        let k_raw: Vec<f32> = (0..kv_dim).map(|i| pseudo(seed + row * 521 + i)).collect();
+        keys.extend(cpu_rms_norm_rope_heads_at(
+            &k_raw, &k_norm, kv_heads, head_dim, head_dim, row, eps, theta,
+        ));
+        values.extend((0..kv_dim).map(|i| {
+            let base = pseudo(seed + 50_000 + row * 523 + i);
+            if row < window_start {
+                base + 2.0
+            } else {
+                base
+            }
+        }));
+    }
+
+    let mut kv = state.full_attention(len, q_heads, kv_heads, head_dim, false)?;
+    kv.seed(&keys, &values, len)?;
+    let gpu = kv.attention_decode_windowed(&q, window_start)?;
+    let oracle = cpu_attention_windowed(
+        &q,
+        &keys,
+        &values,
+        q_heads,
+        kv_heads,
+        head_dim,
+        len,
+        window_start,
+    );
+    let unwindowed = cpu_attention(&q, &keys, &values, q_heads, kv_heads, head_dim, len);
+    let max_abs = gpu
+        .iter()
+        .zip(&oracle)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    let mean_abs = gpu
+        .iter()
+        .zip(&oracle)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .sum::<f32>()
+        / gpu.len() as f32;
+    // La réduction Metal additionne les 256 composantes en arbre, tandis que
+    // l'oracle les additionne en série. Cette différence f32 atteint ~1e-5 sur
+    // les seeds ci-dessous ; 2e-4 (max) / 2e-5 (moyenne) couvre les near-ties
+    // cross-GPU sans masquer l'inclusion d'une ancienne ligne (écart > 1e-2).
+    assert!(
+        max_abs <= 2.0e-4,
+        "sliding position={position} seed={seed}: max_abs={max_abs:e}"
+    );
+    assert!(
+        mean_abs <= 2.0e-5,
+        "sliding position={position} seed={seed}: mean_abs={mean_abs:e}"
+    );
+    if window_start > 0 {
+        let excluded_delta = oracle
+            .iter()
+            .zip(&unwindowed)
+            .map(|(windowed, full)| (windowed - full).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            excluded_delta > 1.0e-2,
+            "fixture non discriminante: delta={excluded_delta:e}"
+        );
+    }
+    Ok(())
+}
+
+/// Phase 2b Gemma 4 : GQA, q/k norm, RoPE complet et KV plus long que la fenêtre.
+#[test]
+fn gemma4_sliding_attention_decode_resident_matches_windowed_oracle() -> Result<()> {
+    for (position, seed) in [(1_usize, 5_usize), (4, 23), (8, 47)] {
+        run_gemma4_sliding_attention_decode_case(position, seed)?;
+    }
+    Ok(())
+}
+
+/// `window_start=0` emprunte exactement le chemin historique flash/2-pass.
+#[test]
+fn attention_decode_window_start_zero_is_byte_exact() -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    for seed in [13_usize, 37, 71] {
+        let (q_heads, kv_heads, head_dim, len) = (4_usize, 2_usize, 256_usize, 7_usize);
+        let kv_dim = kv_heads * head_dim;
+        let keys: Vec<f32> = (0..len * kv_dim).map(|i| pseudo(seed + i)).collect();
+        let values: Vec<f32> = (0..len * kv_dim)
+            .map(|i| pseudo(seed + 10_000 + i))
+            .collect();
+        let q: Vec<f32> = (0..q_heads * head_dim)
+            .map(|i| pseudo(seed + 20_000 + i))
+            .collect();
+        let mut kv = state.full_attention(len, q_heads, kv_heads, head_dim, false)?;
+        kv.seed(&keys, &values, len)?;
+        assert_eq!(
+            kv.attention_decode(&q)?,
+            kv.attention_decode_windowed(&q, 0)?
+        );
+    }
+    Ok(())
+}
+
+/// Non-régression Qwen : head_dim/RoPE uniformes (`rope_dims=head_dim`) sur le
+/// chemin full-attn résident. Avec une seule ligne KV, softmax vaut exactement 1,
+/// donc le contexte doit être byte-identique à l'oracle.
+#[test]
+fn qwen_uniform_attention_decode_resident_is_byte_exact_single_key() -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads, head_dim) = (4_usize, 2_usize, 16_usize);
+    let rope_dims = head_dim;
+    let kv_dim = kv_heads * head_dim;
+    let (eps, theta, position) = (1.0e-6_f32, 10_000.0_f32, 7_usize);
+    let q_norm = vec![1.0_f32; head_dim];
+    let k_norm = vec![1.0_f32; head_dim];
+    let q_raw: Vec<f32> = (0..q_heads * head_dim)
+        .map(|i| pseudo(50_000 + i))
+        .collect();
+    let k_raw: Vec<f32> = (0..kv_dim).map(|i| pseudo(60_000 + i)).collect();
+    let value: Vec<f32> = (0..kv_dim).map(|i| pseudo(70_000 + i)).collect();
+    let q = state.rms_norm_rope_decode(
+        &q_raw, &q_norm, q_heads, head_dim, rope_dims, position, eps, theta,
+    )?;
+    let k = state.rms_norm_rope_decode(
+        &k_raw, &k_norm, kv_heads, head_dim, rope_dims, position, eps, theta,
+    )?;
+
+    let mut kv = state.full_attention(1, q_heads, kv_heads, head_dim, false)?;
+    kv.append_row(&k, &value)?;
+    let gpu = kv.attention_decode(&q)?;
+    let cpu = cpu_attention(&q, &k, &value, q_heads, kv_heads, head_dim, 1);
+    assert_eq!(gpu, cpu);
+    Ok(())
 }
 
 /// Différentiel GPU vs CPU pour une longueur de KV donnée, sur les dimensions

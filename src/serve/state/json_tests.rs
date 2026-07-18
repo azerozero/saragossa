@@ -94,6 +94,118 @@ fn json_object_streaming_closed_object_finishes_without_terminal_error() {
     assert!(!saw_terminal_error);
 }
 
+#[test]
+fn json_lines_streaming_multiple_objects_finishes_normally() {
+    let mut loaded = tiny_loaded_model_with_vocab(r#"{"{}":0,"\n":1,"<eos>":2}"#, "{}");
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "NDJSON"}],
+        "max_tokens": 5,
+        "stream": true,
+        "response_format": {"type": "json_lines"}
+    }))
+    .expect("invariant: requête test valide");
+    let mut deltas = String::new();
+    let mut saw_terminal_error = false;
+
+    let completion = loaded
+        .complete_streaming(request, 5, None, &MemoryGuard::serve(), &mut |event| {
+            match event {
+                CompletionStreamEvent::Delta(delta) => deltas.push_str(delta),
+                CompletionStreamEvent::TerminalError(_) => saw_terminal_error = true,
+                CompletionStreamEvent::Start(_) => {}
+            }
+            Ok(())
+        })
+        .expect("invariant: NDJSON terminé sur une frontière d'objet");
+
+    assert_eq!(deltas, completion.content);
+    assert!(!saw_terminal_error);
+    assert_eq!(completion.content.matches('\n').count(), 2);
+    for line in completion.content.split('\n') {
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("invariant: ligne NDJSON parseable");
+        assert!(value.is_object());
+    }
+}
+
+#[test]
+fn json_lines_completion_returns_full_ndjson_content() {
+    let mut loaded = tiny_loaded_model_with_vocab(r#"{"{}":0,"\n":1,"<eos>":2}"#, "{}");
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "NDJSON"}],
+        "max_tokens": 5,
+        "response_format": {"type": "json_lines"}
+    }))
+    .expect("invariant: requête test valide");
+
+    let completion = loaded
+        .complete(request, 5, None, &MemoryGuard::serve())
+        .expect("invariant: NDJSON non-stream terminé sur une frontière");
+
+    assert_eq!(completion.content.matches('\n').count(), 2);
+    for line in completion.content.split('\n') {
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("invariant: ligne NDJSON parseable");
+        assert!(value.is_object());
+    }
+}
+
+#[test]
+fn json_lines_streaming_too_short_emits_terminal_error() {
+    let mut loaded = tiny_loaded_model_with_vocab(r#"{"{":0,"}":1,"<eos>":2}"#, "{");
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "NDJSON"}],
+        "max_tokens": 1,
+        "stream": true,
+        "response_format": {"type": "json_lines"}
+    }))
+    .expect("invariant: requête test valide");
+    let mut deltas = String::new();
+    let mut terminal = None;
+
+    let error = loaded
+        .complete_streaming(request, 1, None, &MemoryGuard::serve(), &mut |event| {
+            match event {
+                CompletionStreamEvent::Delta(delta) => deltas.push_str(delta),
+                CompletionStreamEvent::TerminalError(error) => {
+                    terminal = Some((error.error_type, error.message.to_string()));
+                }
+                CompletionStreamEvent::Start(_) => {}
+            }
+            Ok(())
+        })
+        .expect_err("invariant: objet NDJSON non fermé refusé");
+
+    assert!(matches!(error, ServeError::IncompleteJson(_)));
+    assert_eq!(deltas, "{");
+    assert_eq!(
+        terminal,
+        Some((
+            "incomplete_json",
+            "structured output JSON incomplet avant la fin du budget max_tokens".to_string()
+        ))
+    );
+}
+
+#[test]
+fn json_lines_rejects_user_stop_sequences() {
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "NDJSON"}],
+        "stop": "\n",
+        "response_format": {"type": "json_lines"}
+    }))
+    .expect("invariant: requête test valide");
+
+    let error = stop_texts_for_response_format(&request, ResponseFormatMode::JsonLines)
+        .expect_err("invariant: stop utilisateur refusé en json_lines");
+
+    assert!(error.to_string().contains("json_lines"));
+}
+
 fn tiny_loaded_model() -> LoadedModel {
     tiny_loaded_model_with_vocab(r#"{"{}":0,"<pad>":1,"<eos>":2}"#, "{}")
 }
@@ -197,7 +309,7 @@ fn tiny_weights() -> HashMap<String, Tensor> {
     }
     tensors.insert(
         "lm_head.weight".to_string(),
-        Tensor::from_vec(vec![3, 2], vec![1.0, 0.0, -1.0, 0.0, 0.0, 1.0])
+        Tensor::from_vec(vec![3, 2], vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .expect("invariant: lm head tiny"),
     );
     tensors

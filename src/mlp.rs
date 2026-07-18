@@ -84,6 +84,18 @@ impl GatedMlp {
         self
     }
 
+    /// Renvoie l'activation de la porte de l'expert.
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "metal")),
+        expect(
+            dead_code,
+            reason = "consommé par les chemins MoE Metal batchés, absent du build CPU pur"
+        )
+    )]
+    pub(crate) fn activation(&self) -> Activation {
+        self.activation
+    }
+
     /// Exécute le MLP avec le runtime CPU.
     ///
     /// # Errors
@@ -129,6 +141,16 @@ pub struct MoeMlp {
     top_k: usize,
     router_norm: Option<(Tensor, f32)>,
     per_expert_scale: Option<Tensor>,
+}
+
+/// Expose les poids du routeur Gemma 4 au chemin Metal résident.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) struct GemmaMoeMetalParts<'a> {
+    pub(crate) router: &'a Linear,
+    pub(crate) experts: &'a [GatedMlp],
+    pub(crate) top_k: usize,
+    pub(crate) router_norm: Option<(&'a Tensor, f32)>,
+    pub(crate) per_expert_scale: Option<&'a Tensor>,
 }
 
 impl MoeMlp {
@@ -375,6 +397,24 @@ impl MoeMlp {
             return None;
         }
         Some((&self.router, &self.experts, self.top_k))
+    }
+
+    /// Renvoie les poids routés et les modulations propres à Gemma 4.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn gemma4_metal_parts(&self) -> Option<GemmaMoeMetalParts<'_>> {
+        if self.shared_expert.is_some() || self.shared_expert_gate.is_some() {
+            return None;
+        }
+        Some(GemmaMoeMetalParts {
+            router: &self.router,
+            experts: &self.experts,
+            top_k: self.top_k,
+            router_norm: self
+                .router_norm
+                .as_ref()
+                .map(|(weight, eps)| (weight, *eps)),
+            per_expert_scale: self.per_expert_scale.as_ref(),
+        })
     }
 
     #[cfg_attr(

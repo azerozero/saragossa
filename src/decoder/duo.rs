@@ -37,7 +37,7 @@ impl CausalDecoder {
             .enumerate()
             .all(|(index, layer)| match layer {
                 ResidentLayerBuffers::FullMoe(resolved) => {
-                    self.config.is_full_attention_layer(index)
+                    self.config.is_resident_full_attention_layer(index)
                         && resolved
                             .qkv_proj
                             .as_ref()
@@ -45,7 +45,9 @@ impl CausalDecoder {
                         && metal.qmm2_eligible_weight(&resolved.o_proj)
                 }
                 ResidentLayerBuffers::LinearMoe(resolved) => {
-                    !self.config.is_full_attention_layer(index)
+                    self.layers
+                        .get(index)
+                        .is_some_and(|layer| matches!(&layer.attention, AttentionBlock::Linear(_)))
                         && metal.qmm2_eligible_linear_attn(&resolved.linear)
                 }
                 _ => false,
@@ -73,25 +75,13 @@ impl CausalDecoder {
                 "decode duo sans executor Metal".to_string(),
             ));
         };
-        let head_dim = self
-            .config
-            .head_dim
-            .ok_or_else(|| InferError::Dimension("head_dim manquant (decode duo)".to_string()))?;
         let theta = self
             .config
             .rope_theta
             .ok_or_else(|| InferError::Config("rope_theta manquant (decode duo)".to_string()))?;
         let eps = self.config.rms_eps;
-        let rope_dims = self.config.rope_dims.unwrap_or(head_dim);
-        let q_heads = self.config.num_attention_heads;
-        let kv_heads = self.config.num_key_value_heads;
         let hidden = self.final_norm.data().len();
-        let linear_dims = if self
-            .layers
-            .iter()
-            .enumerate()
-            .any(|(index, _)| !self.config.is_full_attention_layer(index))
-        {
+        let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
                 num_key_heads: la_config.num_key_heads,
@@ -167,7 +157,7 @@ impl CausalDecoder {
         for index in 0..self.layers.len() {
             let layer_cache_a = &mut layers_a[index];
             let layer_cache_b = &mut layers_b[index];
-            if self.config.is_full_attention_layer(index) {
+            if self.config.is_resident_full_attention_layer(index) {
                 let ResidentLayerBuffers::FullMoe(resolved) =
                     arena.layers.get(index).ok_or_else(|| {
                         InferError::Config(format!("poids résidents couche {index} absents"))
@@ -195,20 +185,19 @@ impl CausalDecoder {
                     q_norm: &resolved.q_norm,
                     k_norm: &resolved.k_norm,
                     post_norm: &resolved.post_norm,
+                    pre_feedforward_norm: resolved.pre_feedforward_norm.as_ref(),
+                    post_feedforward_norm: resolved.post_feedforward_norm.as_ref(),
+                    layer_scalar: resolved.layer_scalar,
                     moe: &resolved.moe,
                     top_k: resolved.top_k,
                 };
-                let dims = FullAttnLayerDims {
+                let dims = self.config.resident_full_attn_layer_dims(
+                    index,
                     hidden,
-                    q_heads,
-                    kv_heads,
-                    head_dim,
-                    rope_dims,
-                    position: positions[0],
+                    positions[0],
                     eps,
                     theta,
-                    attn_output_gate: self.config.attn_output_gate,
-                };
+                )?;
                 arena.state.encode_full_attn_moe_layer_duo(
                     metal,
                     encoder_guard.encoder(),

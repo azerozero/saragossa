@@ -28,6 +28,7 @@ use super::protocol::{
 use super::streaming::{
     CompletionStreamEvent, StreamTerminalError, StreamingCompletionStart, StreamingTextDetokenizer,
 };
+use super::warmup;
 use crate::RuntimeKind;
 
 /// Réponse d'inférence prête à sérialiser en OpenAI.
@@ -351,6 +352,7 @@ impl ModelSlot {
             let preset = saragossa::runtime_preset_for_model_dir(&self.path);
             let assets = ModelAssets::load_local(&self.path)?;
             let decoder = load_decoder_with_runtime(&assets, self.backend)?;
+            warmup::decoder(&decoder, &assets, self.backend, &self.id)?;
             self.loaded = Some(LoadedModel {
                 id: self.id.clone(),
                 assets,
@@ -376,8 +378,8 @@ struct LoadedModel {
     decoder: CausalDecoder,
     preset: Option<RuntimePreset>,
     /// Catalogue des bytes par token, bâti paresseusement à la 1ʳᵉ requête
-    /// `json_object` : un déploiement texte pur ne paie jamais le décodage du
-    /// vocab entier ni son étape faillible au chargement.
+    /// `json_object`/`json_lines` : un déploiement texte pur ne paie jamais le
+    /// décodage du vocab entier ni son étape faillible au chargement.
     json_token_catalog: OnceLock<Arc<JsonTokenCatalog>>,
     prefix_cache: BlockAwarePrefixCache,
 }
@@ -684,11 +686,20 @@ impl LoadedModel {
             ResponseFormatMode::JsonObject => Some(Arc::new(JsonTokenConstraint::new(
                 self.json_catalog()?,
                 &stop_token_ids,
+                false,
+            )) as Arc<dyn TokenConstraint>),
+            ResponseFormatMode::JsonLines => Some(Arc::new(JsonTokenConstraint::new(
+                self.json_catalog()?,
+                &stop_token_ids,
+                true,
             )) as Arc<dyn TokenConstraint>),
         };
         Ok(GenerationOptions {
             stop_token_ids,
-            stop_sequences: if response_format == ResponseFormatMode::JsonObject {
+            stop_sequences: if matches!(
+                response_format,
+                ResponseFormatMode::JsonObject | ResponseFormatMode::JsonLines
+            ) {
                 Vec::new()
             } else {
                 self.stop_sequences(stop_texts)?
@@ -751,12 +762,19 @@ fn stop_texts_for_response_format(
     response_format: ResponseFormatMode,
 ) -> ServeResult<Vec<String>> {
     let stop_texts = request.stop_texts();
-    if response_format == ResponseFormatMode::JsonObject
-        && stop_texts.iter().any(|stop| !stop.is_empty())
+    if matches!(
+        response_format,
+        ResponseFormatMode::JsonObject | ResponseFormatMode::JsonLines
+    ) && stop_texts.iter().any(|stop| !stop.is_empty())
     {
-        return Err(ServeError::Http(
-            "stop n'est pas supporté avec response_format json_object".to_string(),
-        ));
+        let format = match response_format {
+            ResponseFormatMode::JsonObject => "json_object",
+            ResponseFormatMode::JsonLines => "json_lines",
+            ResponseFormatMode::Text => "text",
+        };
+        return Err(ServeError::Http(format!(
+            "stop n'est pas supporté avec response_format {format}"
+        )));
     }
     Ok(stop_texts)
 }

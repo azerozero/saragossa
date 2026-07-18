@@ -35,15 +35,23 @@ const FAST_QMV_U6_BITS: usize = 6;
 
 mod attention;
 mod attention_checks;
+mod barriers;
 mod buffers;
+mod byte_helpers;
 mod core;
+mod eligibility;
+mod flags;
 mod kernel_timing;
 mod lightbatch_duo;
 mod linear_attention;
 mod linear_attention_encode;
 mod lm_head;
 mod matmul;
+mod matmul_align64;
 mod matmul_encode;
+mod matmul_resident;
+mod matmul_select;
+mod matmul_weight;
 mod moe;
 mod moe_encode;
 mod moe_na;
@@ -51,25 +59,24 @@ mod moe_shared;
 mod na_gemm;
 mod pipelines;
 mod prefill;
+mod profiling;
+mod scratch;
 #[cfg(test)]
 mod tests;
 mod whisper_encode;
 
-#[cfg(any(test, feature = "devtools"))]
-pub(crate) use self::core::read_u16_buffer;
-pub(crate) use self::core::write_f32_buffer;
-use self::core::*;
-pub(crate) use self::core::{
-    commit_and_wait, commit_nonblocking, install_dispatch_barrier_scope, install_scratch_namespace,
-    post_dispatch_barrier, profile_dispatch, profile_dispatch_shape, read_f32_buffer,
-    read_u32_buffer, resident_concurrent_enabled, trace_dispatch_path, wait_for_completion,
-    EncoderEndGuard,
-};
 #[doc(hidden)]
-pub use self::core::{
-    decode_profile_dispatch_shapes_snapshot, decode_profile_dispatch_sites_snapshot,
-    decode_profile_snapshot, dump_commit_components, DispatchProfileShape, DispatchProfileSite,
+pub use self::barriers::dump_commit_components;
+pub(crate) use self::barriers::{
+    commit_and_wait, commit_nonblocking, install_dispatch_barrier_scope, post_dispatch_barrier,
+    wait_for_completion, EncoderEndGuard,
 };
+#[cfg(any(test, feature = "devtools"))]
+pub(crate) use self::byte_helpers::read_u16_buffer;
+pub(crate) use self::byte_helpers::write_f32_buffer;
+pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
+use self::core::*;
+pub(crate) use self::flags::resident_concurrent_enabled;
 pub(crate) use self::lightbatch_duo::{
     begin_expert_indices_collection, take_expert_indices_collection, DuoSampleParams,
 };
@@ -77,6 +84,13 @@ pub(crate) use self::matmul::{whisper_bf16_gemm_enabled, whisper_decode_bf16_qmv
 use self::na_gemm::NA_GEMM_SRC;
 #[cfg(test)]
 use self::pipelines::KernelSources;
+#[doc(hidden)]
+pub use self::profiling::{
+    decode_profile_dispatch_shapes_snapshot, decode_profile_dispatch_sites_snapshot,
+    decode_profile_snapshot, DispatchProfileShape, DispatchProfileSite,
+};
+pub(crate) use self::profiling::{profile_dispatch, profile_dispatch_shape, trace_dispatch_path};
+pub(crate) use self::scratch::install_scratch_namespace;
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
@@ -103,12 +117,14 @@ pub struct MetalExecutor {
     affine_matmul_rhs_t_u32_f32: ComputePipelineState,
     affine_qmv_fast_u4_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u4_gs64_f32: ComputePipelineState,
+    affine_qmv_fast_u4_gs64_align64_f32: ComputePipelineState,
     affine_qmv_fast_u6_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u6_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u4_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs128_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u8_gs64_f32: ComputePipelineState,
+    affine_qmv_fast_u8_gs64_align64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u8_gs128_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u8_gs64_dot4_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u8_gs128_dot4_f32: ComputePipelineState,
@@ -129,6 +145,7 @@ pub struct MetalExecutor {
     embed_gather_dense_from_u32_f32: ComputePipelineState,
     embed_gather_affine_from_u32_f32: ComputePipelineState,
     swiglu_f32: ComputePipelineState,
+    geglu_tanh_f32: ComputePipelineState,
     split_q_gate_rows_f32: ComputePipelineState,
     attn_gate_rows_f32: ComputePipelineState,
     accumulate_scaled_f32: ComputePipelineState,
@@ -169,6 +186,7 @@ pub struct MetalExecutor {
     affine_gate_up_swiglu_fast_u8_gs128_f32: ComputePipelineState,
     affine_argmax_qmv_fast_u4_gs64_f32: ComputePipelineState,
     weighted_sum_topk_f32: ComputePipelineState,
+    scale_topk_scores_f32: ComputePipelineState,
     weighted_sum_grouped_topk_f32: ComputePipelineState,
     weighted_sum_add_grouped_topk_f32: ComputePipelineState,
     weighted_sum_add_topk_f32: ComputePipelineState,
@@ -192,9 +210,13 @@ pub struct MetalExecutor {
     whisper_attn_decode_vec64_f32: ComputePipelineState,
     im2col_f32: ComputePipelineState,
     rms_norm_rope_heads_f32: ComputePipelineState,
+    rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,
     causal_attention_prefill_mid_f32: ComputePipelineState,
     causal_attention_prefill_long_f32: ComputePipelineState,
+    windowed_attention_prefill_f32: ComputePipelineState,
+    windowed_attention_prefill_mid_f32: ComputePipelineState,
+    windowed_attention_prefill_long_f32: ComputePipelineState,
     causal_attention_prefill_batch_long_d128_f32: ComputePipelineState,
     causal_attention_prefill_batch_long_d256_f32: ComputePipelineState,
     causal_attention_prefill_batch_gqa8x4_d256_f32: ComputePipelineState,
@@ -411,7 +433,12 @@ pub(crate) struct PrefillAttentionSpec {
     pub kv_heads: usize,
     pub head_dim: usize,
     pub rope_dims: usize,
+    pub rope_frequency_dim: usize,
     pub rope_theta: f32,
+    pub attn_scalar: f32,
+    pub window: Option<usize>,
+    pub k_eq_v: bool,
+    pub value_norm: bool,
     pub eps: f32,
 }
 
@@ -499,6 +526,46 @@ pub(crate) enum PrefillMoeTail<'a> {
         up_proj: &'a Linear,
         down_proj: &'a Linear,
     },
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "variante construite seulement par l'oracle avant l'ouverture du gate en phase 5"
+        )
+    )]
+    GemmaDense {
+        gate_proj: &'a Linear,
+        up_proj: &'a Linear,
+        down_proj: &'a Linear,
+        pre_feedforward_norm: &'a Tensor,
+        post_feedforward_norm: &'a Tensor,
+        layer_scalar: Option<&'a Tensor>,
+        inter_dim: usize,
+    },
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "variante construite seulement par l'oracle avant l'ouverture du gate en phase 5"
+        )
+    )]
+    GemmaParallel {
+        dense_gate_proj: &'a Linear,
+        dense_up_proj: &'a Linear,
+        dense_down_proj: &'a Linear,
+        pre_feedforward_norm: &'a Tensor,
+        post_feedforward_norm_1: &'a Tensor,
+        router: &'a Linear,
+        experts: &'a [GatedMlp],
+        top_k: usize,
+        router_norm: Option<(&'a Tensor, f32)>,
+        per_expert_scale: Option<&'a Tensor>,
+        pre_feedforward_norm_2: &'a Tensor,
+        post_feedforward_norm_2: &'a Tensor,
+        post_feedforward_norm: &'a Tensor,
+        layer_scalar: Option<&'a Tensor>,
+        dense_inter_dim: usize,
+    },
     Routed {
         router: &'a Linear,
         experts: &'a [GatedMlp],
@@ -516,8 +583,10 @@ pub(crate) enum PrefillMoeTail<'a> {
 impl PrefillMoeTail<'_> {
     pub(crate) fn top_k(self) -> usize {
         match self {
-            Self::Dense { .. } => 1,
-            Self::Routed { top_k, .. } | Self::Shared { top_k, .. } => top_k,
+            Self::Dense { .. } | Self::GemmaDense { .. } => 1,
+            Self::GemmaParallel { top_k, .. }
+            | Self::Routed { top_k, .. }
+            | Self::Shared { top_k, .. } => top_k,
         }
     }
 }
@@ -526,7 +595,9 @@ impl PrefillMoeTail<'_> {
 pub(crate) struct PrefillMoeLayer<'a> {
     pub input_norm: &'a Tensor,
     pub attention: PrefillAttentionLayer<'a>,
+    pub attention_spec: PrefillAttentionSpec,
     pub post_norm: &'a Tensor,
+    pub post_norm_before_residual: bool,
     pub tail: PrefillMoeTail<'a>,
 }
 
