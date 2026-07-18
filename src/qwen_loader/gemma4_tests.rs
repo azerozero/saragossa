@@ -482,20 +482,26 @@ fn assert_all_decoder_keys_mapped(config: &ModelConfig, catalog: &WeightCatalog)
     }
 }
 
+/// Renvoie le hub HF local (`$HOME/.cache/huggingface/hub`) sans chemin en dur.
+fn hf_hub() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache/huggingface/hub"))
+}
+
 fn real_gemma4_snapshot() -> Option<PathBuf> {
-    let path = PathBuf::from(
-        "/Users/ludwig/.cache/huggingface/hub/models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/efbeee6e582ebfd06abc9d65e90839c4b5d2116b",
+    let path = hf_hub()?.join(
+        "models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/efbeee6e582ebfd06abc9d65e90839c4b5d2116b",
     );
     path.is_dir().then_some(path)
 }
 
 fn real_gemma4_unified_snapshot() -> Option<PathBuf> {
+    let hub = hf_hub()?;
     [
-        "/Users/ludwig/.cache/huggingface/hub/models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-8bit/snapshots",
-        "/Users/ludwig/.cache/huggingface/hub/models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-4bit/snapshots",
+        "models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-8bit/snapshots",
+        "models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-4bit/snapshots",
     ]
     .into_iter()
-    .find_map(first_snapshot_dir)
+    .find_map(|rel| first_snapshot_dir(hub.join(rel).to_str()?))
 }
 
 fn first_snapshot_dir(path: &str) -> Option<PathBuf> {
