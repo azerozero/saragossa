@@ -91,8 +91,9 @@ impl ChatCompletionRequest {
         match format.kind.as_str() {
             "text" => Ok(ResponseFormatMode::Text),
             "json_object" => Ok(ResponseFormatMode::JsonObject),
+            "json_lines" => Ok(ResponseFormatMode::JsonLines),
             "json_schema" => Err(ServeError::not_implemented(
-                "response_format json_schema n'est pas encore supporté (v1: json_object)",
+                "response_format json_schema n'est pas encore supporté (v1: json_object, extension saragossa json_lines)",
             )),
             other => Err(ServeError::Http(format!(
                 "response_format type inconnu: {other}"
@@ -125,12 +126,14 @@ pub(super) enum ResponseFormatMode {
     Text,
     /// Objet JSON racine contraint par le sampler.
     JsonObject,
+    /// Suite NDJSON saragossa, un objet JSON racine complet par ligne.
+    JsonLines,
 }
 
 /// Objet `response_format` OpenAI minimal.
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct ResponseFormat {
-    /// Type demandé (`text`, `json_object`, `json_schema`).
+    /// Type demandé (`text`, `json_object`, `json_lines`, `json_schema`).
     #[serde(rename = "type")]
     kind: String,
 }
@@ -489,6 +492,20 @@ mod tests {
 
         let messages = req.template_messages();
         assert_eq!(messages[0].content.as_deref(), Some("bonjour"));
+    }
+
+    #[test]
+    fn request_accepts_json_lines_response_format() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"reti-35b","messages":[],"response_format":{"type":"json_lines"}}"#,
+        )
+        .expect("invariant: JSON valide");
+
+        assert_eq!(
+            req.response_format_mode()
+                .expect("invariant: json_lines supporté"),
+            ResponseFormatMode::JsonLines
+        );
     }
 
     #[test]

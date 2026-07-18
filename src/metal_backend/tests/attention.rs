@@ -447,6 +447,12 @@ fn causal_attention_prefill_with_pipeline_grid_rows(
     encoder.set_buffer(2, Some(&v_buffer), 0);
     encoder.set_buffer(3, Some(&output_buffer), 0);
     set_u32_bytes(encoder, 4, &dims, "test_causal_dims")?;
+    set_f32_bytes(
+        encoder,
+        5,
+        &[(head_dim as f32).sqrt().recip(), 0.0],
+        "test_causal_scale_params",
+    )?;
     encoder.dispatch_thread_groups(
         MTLSize::new(grid_heads as u64, grid_rows as u64, 1),
         MTLSize::new(threadgroup_width, 1, 1),
@@ -509,7 +515,12 @@ fn causal_attention_prefill_with_steel_d256_pipeline(
         kv_heads,
         head_dim,
         rope_dims: head_dim,
+        rope_frequency_dim: head_dim,
         rope_theta: 10_000.0,
+        attn_scalar: head_dim as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
         eps: 0.0,
     };
     let params = attention::steel_attn_params(spec, 32, 64, "test steel causal d256")?;
@@ -604,7 +615,12 @@ fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
         kv_heads: 4,
         head_dim: 256,
         rope_dims: 256,
+        rope_frequency_dim: 256,
         rope_theta: 10_000.0,
+        attn_scalar: 256.0,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
         eps: 0.0,
     };
     assert!(attention::prefill_attn_batch_long_supported(base));

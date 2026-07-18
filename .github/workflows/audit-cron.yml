@@ -1,8 +1,7 @@
 name: Security Audit (daily)
 
 # cargo audit sur cron quotidien : les CVE publiées entre deux modifications
-# du repo sont détectées sous 24 h même sans push (le job supply-chain de
-# rust.yml ne tourne que sur PR/push). Pattern repris de grob.
+# du dépôt sont détectées sous 24 h même sans push.
 
 on:
   schedule:

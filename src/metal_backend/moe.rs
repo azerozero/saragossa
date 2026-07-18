@@ -83,7 +83,10 @@ impl MetalExecutor {
             return Err(InferError::Config("MoE Metal top-k vide".to_string()));
         }
         if let Ok(stacked) = self.stacked_moe_buffers(experts) {
-            return self.moe_gated_topk_stacked(input, weighted_top, &stacked);
+            let activation = experts
+                .first()
+                .map_or(crate::Activation::Silu, GatedMlp::activation);
+            return self.moe_gated_topk_stacked(input, weighted_top, &stacked, activation);
         }
         let Some((first_expert, _)) = weighted_top.first() else {
             return Err(InferError::Config("MoE Metal top-k vide".to_string()));
@@ -145,14 +148,24 @@ impl MetalExecutor {
                     "expert MoE {expert_idx} inter_dim incohérent: gate={gate_dim}, up={up_dim}, attendu={inter_dim}"
                 )));
             }
-            self.encode_swiglu(
-                encoder,
-                &mut owned_buffers,
-                &gate_buffer,
-                &up_buffer,
-                &hidden_buffer,
-                inter_dim,
-            )?;
+            match expert.activation() {
+                crate::Activation::Silu => self.encode_swiglu(
+                    encoder,
+                    &mut owned_buffers,
+                    &gate_buffer,
+                    &up_buffer,
+                    &hidden_buffer,
+                    inter_dim,
+                )?,
+                crate::Activation::GeluTanh => self.encode_geglu_tanh(
+                    encoder,
+                    &mut owned_buffers,
+                    &gate_buffer,
+                    &up_buffer,
+                    &hidden_buffer,
+                    inter_dim,
+                )?,
+            }
             let down_dim = self.encode_matmul_weight(
                 encoder,
                 &mut owned_buffers,
@@ -523,6 +536,7 @@ impl MetalExecutor {
         input: &Tensor,
         weighted_top: &[(usize, f32)],
         stacked: &StackedMoeBuffers,
+        activation: crate::Activation,
     ) -> Result<Tensor> {
         let (batch, in_dim) = input.as_matrix()?;
         if batch != 1 || in_dim != stacked.gate.in_dim || in_dim != stacked.up.in_dim {
@@ -579,45 +593,79 @@ impl MetalExecutor {
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
-        if !self.encode_gather_gate_up_swiglu(
-            encoder,
-            &mut owned_buffers,
-            &input_buffer,
-            1,
-            &stacked.gate,
-            &stacked.up,
-            &indices_buffer,
-            topk,
-            &hidden_buffer,
-        )? {
-            self.encode_gather_matmul(
-                encoder,
-                &mut owned_buffers,
-                &input_buffer,
-                1,
-                &stacked.gate,
-                &indices_buffer,
-                topk,
-                &gate_buffer,
-            )?;
-            self.encode_gather_matmul(
-                encoder,
-                &mut owned_buffers,
-                &input_buffer,
-                1,
-                &stacked.up,
-                &indices_buffer,
-                topk,
-                &up_buffer,
-            )?;
-            self.encode_swiglu(
-                encoder,
-                &mut owned_buffers,
-                &gate_buffer,
-                &up_buffer,
-                &hidden_buffer,
-                checked_len(topk, inter_dim, "moe stack swiglu")?,
-            )?;
+        match activation {
+            crate::Activation::Silu => {
+                if !self.encode_gather_gate_up_swiglu(
+                    encoder,
+                    &mut owned_buffers,
+                    &input_buffer,
+                    1,
+                    &stacked.gate,
+                    &stacked.up,
+                    &indices_buffer,
+                    topk,
+                    &hidden_buffer,
+                )? {
+                    self.encode_gather_matmul(
+                        encoder,
+                        &mut owned_buffers,
+                        &input_buffer,
+                        1,
+                        &stacked.gate,
+                        &indices_buffer,
+                        topk,
+                        &gate_buffer,
+                    )?;
+                    self.encode_gather_matmul(
+                        encoder,
+                        &mut owned_buffers,
+                        &input_buffer,
+                        1,
+                        &stacked.up,
+                        &indices_buffer,
+                        topk,
+                        &up_buffer,
+                    )?;
+                    self.encode_swiglu(
+                        encoder,
+                        &mut owned_buffers,
+                        &gate_buffer,
+                        &up_buffer,
+                        &hidden_buffer,
+                        checked_len(topk, inter_dim, "moe stack swiglu")?,
+                    )?;
+                }
+            }
+            crate::Activation::GeluTanh => {
+                self.encode_gather_matmul(
+                    encoder,
+                    &mut owned_buffers,
+                    &input_buffer,
+                    1,
+                    &stacked.gate,
+                    &indices_buffer,
+                    topk,
+                    &gate_buffer,
+                )?;
+                self.encode_gather_matmul(
+                    encoder,
+                    &mut owned_buffers,
+                    &input_buffer,
+                    1,
+                    &stacked.up,
+                    &indices_buffer,
+                    topk,
+                    &up_buffer,
+                )?;
+                self.encode_geglu_tanh(
+                    encoder,
+                    &mut owned_buffers,
+                    &gate_buffer,
+                    &up_buffer,
+                    &hidden_buffer,
+                    checked_len(topk, inter_dim, "moe stack geglu")?,
+                )?;
+            }
         }
         self.encode_gather_matmul(
             encoder,
@@ -734,45 +782,84 @@ impl MetalExecutor {
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
-        if !self.encode_gather_gate_up_swiglu(
-            encoder,
-            &mut owned_buffers,
-            &input_buffer,
-            batch,
-            &stacked.gate,
-            &stacked.up,
-            &indices_buffer,
-            total_topk,
-            &hidden_buffer,
-        )? {
-            self.encode_gather_matmul(
-                encoder,
-                &mut owned_buffers,
-                &input_buffer,
-                batch,
-                &stacked.gate,
-                &indices_buffer,
-                total_topk,
-                &gate_buffer,
-            )?;
-            self.encode_gather_matmul(
-                encoder,
-                &mut owned_buffers,
-                &input_buffer,
-                batch,
-                &stacked.up,
-                &indices_buffer,
-                total_topk,
-                &up_buffer,
-            )?;
-            self.encode_swiglu(
-                encoder,
-                &mut owned_buffers,
-                &gate_buffer,
-                &up_buffer,
-                &hidden_buffer,
-                checked_len(total_topk, inter_dim, "moe batch swiglu")?,
-            )?;
+        // NOTE: l'activation vient des experts (GeGLU pour Gemma, SwiGLU sinon) ;
+        // l'ignorer calculait le MoE Gemma 4 en SiLU (divergence prefill résident).
+        let activation = experts
+            .first()
+            .map_or(crate::Activation::Silu, GatedMlp::activation);
+        match activation {
+            crate::Activation::Silu => {
+                if !self.encode_gather_gate_up_swiglu(
+                    encoder,
+                    &mut owned_buffers,
+                    &input_buffer,
+                    batch,
+                    &stacked.gate,
+                    &stacked.up,
+                    &indices_buffer,
+                    total_topk,
+                    &hidden_buffer,
+                )? {
+                    self.encode_gather_matmul(
+                        encoder,
+                        &mut owned_buffers,
+                        &input_buffer,
+                        batch,
+                        &stacked.gate,
+                        &indices_buffer,
+                        total_topk,
+                        &gate_buffer,
+                    )?;
+                    self.encode_gather_matmul(
+                        encoder,
+                        &mut owned_buffers,
+                        &input_buffer,
+                        batch,
+                        &stacked.up,
+                        &indices_buffer,
+                        total_topk,
+                        &up_buffer,
+                    )?;
+                    self.encode_swiglu(
+                        encoder,
+                        &mut owned_buffers,
+                        &gate_buffer,
+                        &up_buffer,
+                        &hidden_buffer,
+                        checked_len(total_topk, inter_dim, "moe batch swiglu")?,
+                    )?;
+                }
+            }
+            crate::Activation::GeluTanh => {
+                self.encode_gather_matmul(
+                    encoder,
+                    &mut owned_buffers,
+                    &input_buffer,
+                    batch,
+                    &stacked.gate,
+                    &indices_buffer,
+                    total_topk,
+                    &gate_buffer,
+                )?;
+                self.encode_gather_matmul(
+                    encoder,
+                    &mut owned_buffers,
+                    &input_buffer,
+                    batch,
+                    &stacked.up,
+                    &indices_buffer,
+                    total_topk,
+                    &up_buffer,
+                )?;
+                self.encode_geglu_tanh(
+                    encoder,
+                    &mut owned_buffers,
+                    &gate_buffer,
+                    &up_buffer,
+                    &hidden_buffer,
+                    checked_len(total_topk, inter_dim, "moe batch geglu")?,
+                )?;
+            }
         }
         self.encode_gather_matmul(
             encoder,

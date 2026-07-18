@@ -224,6 +224,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_qmv_fast_u4_gs64_f32")?;
         let affine_qmv_fast_aligned_u4_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_aligned_u4_gs64_f32")?;
+        let affine_qmv_fast_u4_gs64_align64_f32 =
+            pipeline(&library, &device, "affine_qmv_fast_u4_gs64_align64_f32")?;
         let affine_qmv_fast_u6_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_u6_gs64_f32")?;
         let affine_qmv_fast_aligned_u6_gs64_f32 =
@@ -236,6 +238,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_qmm2_fast_aligned_u8_gs128_f32")?;
         let affine_qmv_fast_aligned_u8_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_aligned_u8_gs64_f32")?;
+        let affine_qmv_fast_u8_gs64_align64_f32 =
+            pipeline(&library, &device, "affine_qmv_fast_u8_gs64_align64_f32")?;
         let affine_qmv_fast_aligned_u8_gs128_f32 =
             pipeline(&library, &device, "affine_qmv_fast_aligned_u8_gs128_f32")?;
         let affine_qmv_fast_aligned_u8_gs64_dot4_f32 = pipeline(
@@ -302,6 +306,7 @@ impl MetalExecutor {
         let embed_gather_affine_from_u32_f32 =
             pipeline(&library, &device, "embed_gather_affine_from_u32_f32")?;
         let swiglu_f32 = pipeline(&library, &device, "swiglu_f32")?;
+        let geglu_tanh_f32 = pipeline(&library, &device, "geglu_tanh_f32")?;
         let split_q_gate_rows_f32 = pipeline(&library, &device, "split_q_gate_rows_f32")?;
         let attn_gate_rows_f32 = pipeline(&library, &device, "attn_gate_rows_f32")?;
         let accumulate_scaled_f32 = pipeline(&library, &device, "accumulate_scaled_f32")?;
@@ -419,6 +424,7 @@ impl MetalExecutor {
         let affine_argmax_qmv_fast_u4_gs64_f32 =
             pipeline(&library, &device, "affine_argmax_qmv_fast_u4_gs64_f32")?;
         let weighted_sum_topk_f32 = pipeline(&library, &device, "weighted_sum_topk_f32")?;
+        let scale_topk_scores_f32 = pipeline(&library, &device, "scale_topk_scores_f32")?;
         let weighted_sum_grouped_topk_f32 =
             pipeline(&library, &device, "weighted_sum_grouped_topk_f32")?;
         let weighted_sum_add_grouped_topk_f32 =
@@ -453,12 +459,20 @@ impl MetalExecutor {
             pipeline(&library, &device, "whisper_attn_decode_vec64_f32")?;
         let im2col_f32 = pipeline(&library, &device, "im2col_f32")?;
         let rms_norm_rope_heads_f32 = pipeline(&library, &device, "rms_norm_rope_heads_f32")?;
+        let rms_norm_heads_no_scale_f32 =
+            pipeline(&library, &device, "rms_norm_heads_no_scale_f32")?;
         let causal_attention_prefill_f32 =
             pipeline(&library, &device, "causal_attention_prefill_f32")?;
         let causal_attention_prefill_mid_f32 =
             pipeline(&library, &device, "causal_attention_prefill_mid_f32")?;
         let causal_attention_prefill_long_f32 =
             pipeline(&library, &device, "causal_attention_prefill_long_f32")?;
+        let windowed_attention_prefill_f32 =
+            pipeline(&library, &device, "windowed_attention_prefill_f32")?;
+        let windowed_attention_prefill_mid_f32 =
+            pipeline(&library, &device, "windowed_attention_prefill_mid_f32")?;
+        let windowed_attention_prefill_long_f32 =
+            pipeline(&library, &device, "windowed_attention_prefill_long_f32")?;
         let causal_attention_prefill_batch_long_d128_f32 = pipeline(
             &library,
             &device,
@@ -529,12 +543,14 @@ impl MetalExecutor {
             affine_matmul_rhs_t_u32_f32,
             affine_qmv_fast_u4_gs64_f32,
             affine_qmv_fast_aligned_u4_gs64_f32,
+            affine_qmv_fast_u4_gs64_align64_f32,
             affine_qmv_fast_u6_gs64_f32,
             affine_qmv_fast_aligned_u6_gs64_f32,
             affine_qmm2_fast_aligned_u4_gs64_f32,
             affine_qmm2_fast_aligned_u8_gs64_f32,
             affine_qmm2_fast_aligned_u8_gs128_f32,
             affine_qmv_fast_aligned_u8_gs64_f32,
+            affine_qmv_fast_u8_gs64_align64_f32,
             affine_qmv_fast_aligned_u8_gs128_f32,
             affine_qmv_fast_aligned_u8_gs64_dot4_f32,
             affine_qmv_fast_aligned_u8_gs128_dot4_f32,
@@ -555,6 +571,7 @@ impl MetalExecutor {
             embed_gather_dense_from_u32_f32,
             embed_gather_affine_from_u32_f32,
             swiglu_f32,
+            geglu_tanh_f32,
             split_q_gate_rows_f32,
             attn_gate_rows_f32,
             accumulate_scaled_f32,
@@ -595,6 +612,7 @@ impl MetalExecutor {
             affine_gate_up_swiglu_fast_u8_gs128_f32,
             affine_argmax_qmv_fast_u4_gs64_f32,
             weighted_sum_topk_f32,
+            scale_topk_scores_f32,
             weighted_sum_grouped_topk_f32,
             weighted_sum_add_grouped_topk_f32,
             weighted_sum_add_topk_f32,
@@ -618,9 +636,13 @@ impl MetalExecutor {
             whisper_attn_decode_vec64_f32,
             im2col_f32,
             rms_norm_rope_heads_f32,
+            rms_norm_heads_no_scale_f32,
             causal_attention_prefill_f32,
             causal_attention_prefill_mid_f32,
             causal_attention_prefill_long_f32,
+            windowed_attention_prefill_f32,
+            windowed_attention_prefill_mid_f32,
+            windowed_attention_prefill_long_f32,
             causal_attention_prefill_batch_long_d128_f32,
             causal_attention_prefill_batch_long_d256_f32,
             causal_attention_prefill_batch_gqa8x4_d256_f32,

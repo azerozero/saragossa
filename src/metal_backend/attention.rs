@@ -157,7 +157,12 @@ impl MetalExecutor {
             kv_heads,
             head_dim,
             rope_dims: head_dim,
+            rope_frequency_dim: head_dim,
             rope_theta: 10_000.0,
+            attn_scalar: head_dim as f32,
+            window: None,
+            k_eq_v: false,
+            value_norm: false,
             eps: 0.0,
         };
 
@@ -183,7 +188,8 @@ impl MetalExecutor {
     ///
     /// Sert à verrouiller la byte-identité des DEUX kernels causaux (court seq <=
     /// 256, long seq > 256) contre une référence CPU. Format aplati par ligne comme
-    /// [`Self::noncausal_attention_prefill`].
+    /// [`Self::noncausal_attention_prefill`]. Conservé comme API symétrique,
+    /// exercé par `tests/attention.rs`.
     ///
     /// # Errors
     ///
@@ -247,7 +253,12 @@ impl MetalExecutor {
             kv_heads,
             head_dim,
             rope_dims: head_dim,
+            rope_frequency_dim: head_dim,
             rope_theta: 10_000.0,
+            attn_scalar: head_dim as f32,
+            window: None,
+            k_eq_v: false,
+            value_norm: false,
             eps: 0.0,
         };
 
@@ -1014,7 +1025,17 @@ impl MetalExecutor {
         encoder.set_buffer(1, Some(weight_buffer), 0);
         encoder.set_buffer(2, Some(output_buffer), 0);
         set_u32_bytes(encoder, 3, &dims, "rms_rope_dims")?;
-        set_f32_bytes(encoder, 4, &[spec.eps, spec.rope_theta], "rms_rope_params")?;
+        set_f32_bytes(
+            encoder,
+            4,
+            &[
+                spec.eps,
+                spec.rope_theta,
+                spec.rope_frequency_dim as f32,
+                0.0,
+            ],
+            "rms_rope_params",
+        )?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
@@ -1037,6 +1058,11 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
     ) -> Result<()> {
+        if spec.window.is_some() {
+            return Err(InferError::Config(
+                "prefill résident fenêtré réservé à la phase 4".to_string(),
+            ));
+        }
         let dims = [
             checked_u32(spec.seq, "attention seq")?,
             checked_u32(spec.q_heads, "attention q_heads")?,
@@ -1147,6 +1173,12 @@ impl MetalExecutor {
         encoder.set_buffer(2, Some(v_buffer), 0);
         encoder.set_buffer(3, Some(output_buffer), 0);
         set_u32_bytes(encoder, 4, &dims, "causal_prefill_dims")?;
+        set_f32_bytes(
+            encoder,
+            5,
+            &causal_prefill_scale_params(spec)?,
+            "causal_prefill_scale_params",
+        )?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
@@ -1155,6 +1187,73 @@ impl MetalExecutor {
                 1,
             ),
             MTLSize::new(tg_width, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Encode l'attention prefill causale bornée par une fenêtre glissante.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la fenêtre ou les dimensions dépassent les kernels.
+    pub(super) fn encode_windowed_attention_prefill(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buffer: &BufferRef,
+        k_buffer: &BufferRef,
+        v_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+    ) -> Result<()> {
+        let window = spec.window.ok_or_else(|| {
+            InferError::Config("prefill fenêtré sans taille de fenêtre".to_string())
+        })?;
+        if window == 0 {
+            return Err(InferError::Dimension(
+                "prefill fenêtré avec fenêtre vide".to_string(),
+            ));
+        }
+        let dims = [
+            checked_u32(spec.seq, "attention fenêtrée seq")?,
+            checked_u32(spec.q_heads, "attention fenêtrée q_heads")?,
+            checked_u32(spec.kv_heads, "attention fenêtrée kv_heads")?,
+            checked_u32(spec.head_dim, "attention fenêtrée head_dim")?,
+            checked_u32(window, "attention fenêtrée window")?,
+        ];
+        let pipeline = if spec.seq <= 256 {
+            &self.windowed_attention_prefill_f32
+        } else if spec.seq <= 2048 {
+            &self.windowed_attention_prefill_mid_f32
+        } else {
+            if spec.head_dim > 256 {
+                return Err(InferError::Dimension(format!(
+                    "prefill fenêtré résident seq={} head_dim={} non supporté (head_dim > 256)",
+                    spec.seq, spec.head_dim
+                )));
+            }
+            &self.windowed_attention_prefill_long_f32
+        };
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(q_buffer), 0);
+        encoder.set_buffer(1, Some(k_buffer), 0);
+        encoder.set_buffer(2, Some(v_buffer), 0);
+        encoder.set_buffer(3, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 4, &dims, "windowed_prefill_dims")?;
+        set_f32_bytes(
+            encoder,
+            5,
+            &causal_prefill_scale_params(spec)?,
+            "windowed_prefill_scale_params",
+        )?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(spec.q_heads, "attention fenêtrée grid_heads")?,
+                checked_nsuint(spec.seq, "attention fenêtrée grid_rows")?,
+                1,
+            ),
+            MTLSize::new(FULL_ATTN_PREFILL_TG_WIDTH, 1, 1),
         );
         post_dispatch_barrier(encoder);
         Ok(())
@@ -1320,6 +1419,7 @@ pub(super) fn steel_attn_params(
     let n_k = spec.seq.div_ceil(block_k);
     let n_q_aligned = spec.seq / block_q;
     let n_k_aligned = spec.seq / block_k;
+    let scale = causal_prefill_scale_params(spec)?[0];
     Ok(SteelAttnParams {
         b: 1,
         h: checked_i32(spec.q_heads, "steel attention heads")?,
@@ -1327,7 +1427,7 @@ pub(super) fn steel_attn_params(
         q_l: checked_i32(spec.seq, "steel attention qL")?,
         k_l: checked_i32(spec.seq, "steel attention kL")?,
         gqa_factor: checked_i32(spec.q_heads / spec.kv_heads, "steel attention gqa")?,
-        scale: (spec.head_dim as f32).sqrt().recip(),
+        scale,
         n_q: checked_i32(n_q, label)?,
         n_k: checked_i32(n_k, label)?,
         n_q_aligned: checked_i32(n_q_aligned, label)?,
@@ -1372,4 +1472,15 @@ pub(super) fn steel_attn_params(
             checked_i64(q_dim)?,
         ],
     })
+}
+
+pub(super) fn causal_prefill_scale_params(spec: PrefillAttentionSpec) -> Result<[f32; 2]> {
+    if !spec.attn_scalar.is_finite() || spec.attn_scalar <= 0.0 {
+        return Err(InferError::Dimension(format!(
+            "attention attn_scalar={} invalide",
+            spec.attn_scalar
+        )));
+    }
+    let custom = f32::from(spec.attn_scalar != spec.head_dim as f32);
+    Ok([spec.attn_scalar.sqrt().recip(), custom])
 }

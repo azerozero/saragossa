@@ -17,23 +17,12 @@ impl CausalDecoder {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };
-        let head_dim = self.config.head_dim.ok_or_else(|| {
-            InferError::Dimension("head_dim manquant (verify résident)".to_string())
-        })?;
         let theta = self.config.rope_theta.ok_or_else(|| {
             InferError::Config("rope_theta manquant (verify résident)".to_string())
         })?;
         let eps = self.config.rms_eps;
-        let rope_dims = self.config.rope_dims.unwrap_or(head_dim);
-        let q_heads = self.config.num_attention_heads;
-        let kv_heads = self.config.num_key_value_heads;
         let hidden = self.final_norm.data().len();
-        let linear_dims = if self
-            .layers
-            .iter()
-            .enumerate()
-            .any(|(index, _)| !self.config.is_full_attention_layer(index))
-        {
+        let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
                 num_key_heads: la_config.num_key_heads,
@@ -68,7 +57,7 @@ impl CausalDecoder {
         let layer_batch_supported = token_ids.len() > 1
             && self.layers.iter().enumerate().all(|(index, layer)| {
                 match (
-                    self.config.is_full_attention_layer(index),
+                    self.config.is_resident_full_attention_layer(index),
                     layer.mlp.as_ref(),
                 ) {
                     (true, Some(FeedForward::Dense(_))) => {
@@ -167,7 +156,7 @@ impl CausalDecoder {
 
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_cache = &mut layers[index];
-                if self.config.is_full_attention_layer(index) {
+                if self.config.is_resident_full_attention_layer(index) {
                     for row in 0..batch {
                         let row_offset = row
                             .checked_mul(hidden)
@@ -184,17 +173,13 @@ impl CausalDecoder {
                             0,
                             hidden,
                         )?;
-                        let dims = FullAttnLayerDims {
+                        let dims = self.config.resident_windowed_full_attn_layer_dims(
+                            index,
                             hidden,
-                            q_heads,
-                            kv_heads,
-                            head_dim,
-                            rope_dims,
-                            position: *cache_position + row,
+                            *cache_position + row,
                             eps,
                             theta,
-                            attn_output_gate: self.config.attn_output_gate,
-                        };
+                        )?;
                         self.encode_resident_full_layer(
                             metal,
                             arena,
@@ -448,18 +433,10 @@ impl CausalDecoder {
             let position = *cache_position + token_pos;
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_cache = &mut layers[index];
-                if self.config.is_full_attention_layer(index) {
-                    let dims = FullAttnLayerDims {
-                        hidden,
-                        q_heads,
-                        kv_heads,
-                        head_dim,
-                        rope_dims,
-                        position,
-                        eps,
-                        theta,
-                        attn_output_gate: self.config.attn_output_gate,
-                    };
+                if self.config.is_resident_full_attention_layer(index) {
+                    let dims = self.config.resident_windowed_full_attn_layer_dims(
+                        index, hidden, position, eps, theta,
+                    )?;
                     self.encode_resident_full_layer(
                         metal,
                         arena,

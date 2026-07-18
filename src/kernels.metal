@@ -507,6 +507,127 @@ kernel void affine_qmv_fast_aligned_u4_gs64_f32(
     }
 }
 
+kernel void affine_qmv_fast_u4_gs64_align64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_thread = 16u;
+    const uint values_per_block = values_per_thread * 32u;
+    if (simd_gid >= simdgroups) {
+        return;
+    }
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+    if (row_base >= out_dim) {
+        return;
+    }
+
+    const uint row_bytes = packed_cols * 4u;
+    const uint scale_step_per_thread = 4u;
+    const device uchar* ws = ((const device uchar*)packed) +
+        row_base * row_bytes + simd_lid * 8u;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / scale_step_per_thread;
+    const device float* x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint full_blocks = in_dim / values_per_block;
+    for (uint block = 0u; block < full_blocks; ++block) {
+        float xt[16];
+        float sum = 0.0f;
+        for (uint i = 0u; i < values_per_thread; i += 4u) {
+            const float x0 = x[i];
+            const float x1 = x[i + 1u];
+            const float x2 = x[i + 2u];
+            const float x3 = x[i + 3u];
+            sum += x0 + x1 + x2 + x3;
+            xt[i] = x0;
+            xt[i + 1u] = x1 / 16.0f;
+            xt[i + 2u] = x2 / 256.0f;
+            xt[i + 3u] = x3 / 4096.0f;
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row >= out_dim) {
+                continue;
+            }
+            const device ushort* w16 = (const device ushort*)(ws + row * row_bytes);
+            const float scale = scale_base[row * groups];
+            const float bias = bias_base[row * groups];
+            float accum = 0.0f;
+            for (uint i = 0u; i < 4u; ++i) {
+                const ushort word = w16[i];
+                accum += xt[4u * i] * float(word & 0x000fu);
+                accum += xt[4u * i + 1u] * float(word & 0x00f0u);
+                accum += xt[4u * i + 2u] * float(word & 0x0f00u);
+                accum += xt[4u * i + 3u] * float(word & 0xf000u);
+            }
+            result[row] += scale * accum + sum * bias;
+        }
+
+        ws += 256u;
+        scale_base += 8u;
+        bias_base += 8u;
+        x += values_per_block;
+    }
+
+    const uint tail_values = in_dim - full_blocks * values_per_block;
+    const uint tail_offset = simd_lid * values_per_thread;
+    if (tail_values > 0u && tail_offset < tail_values) {
+        float xt[16];
+        float sum = 0.0f;
+        for (uint i = 0u; i < values_per_thread; i += 4u) {
+            const float x0 = x[i];
+            const float x1 = x[i + 1u];
+            const float x2 = x[i + 2u];
+            const float x3 = x[i + 3u];
+            sum += x0 + x1 + x2 + x3;
+            xt[i] = x0;
+            xt[i + 1u] = x1 / 16.0f;
+            xt[i + 2u] = x2 / 256.0f;
+            xt[i + 3u] = x3 / 4096.0f;
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row >= out_dim) {
+                continue;
+            }
+            const device ushort* w16 = (const device ushort*)(ws + row * row_bytes);
+            const float scale = scale_base[row * groups];
+            const float bias = bias_base[row * groups];
+            float accum = 0.0f;
+            for (uint i = 0u; i < 4u; ++i) {
+                const ushort word = w16[i];
+                accum += xt[4u * i] * float(word & 0x000fu);
+                accum += xt[4u * i + 1u] * float(word & 0x00f0u);
+                accum += xt[4u * i + 2u] * float(word & 0x0f00u);
+                accum += xt[4u * i + 3u] * float(word & 0xf000u);
+            }
+            result[row] += scale * accum + sum * bias;
+        }
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const float reduced = simd_sum(result[row]);
+        if (simd_lid == 0u && row_base + row < out_dim) {
+            out[tile.x * out_dim + row_base + row] = reduced;
+        }
+    }
+}
+
 static inline uint unpack_u6_affine(device const uint* packed, uint packed_cols, uint row_base, uint col) {
     const uint bit_offset = col * 6u;
     const uint word_col = bit_offset / 32u;
@@ -666,6 +787,116 @@ kernel void affine_qmv_fast_aligned_u8_gs64_f32(
     for (uint row = 0u; row < results_per_simdgroup; ++row) {
         const float reduced = simd_sum(result[row]);
         if (simd_lid == 0u) {
+            out[tile.x * out_dim + row_base + row] = reduced;
+        }
+    }
+}
+
+kernel void affine_qmv_fast_u8_gs64_align64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_word = 4u;
+    const uint words_per_thread = 4u;
+    const uint values_per_thread = values_per_word * words_per_thread;
+    const uint values_per_block = values_per_thread * 32u;
+    const uint words_per_block = values_per_block / values_per_word;
+    if (simd_gid >= simdgroups) {
+        return;
+    }
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+    if (row_base >= out_dim) {
+        return;
+    }
+
+    const device uint* ws = packed + row_base * packed_cols + simd_lid;
+    const device bfloat* scale_base = scales + row_base * groups;
+    const device bfloat* bias_base = biases + row_base * groups;
+    const device float* x = lhs + tile.x * in_dim + simd_lid * values_per_word;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint full_blocks = in_dim / values_per_block;
+    for (uint block = 0u; block < full_blocks; ++block) {
+        float xt[16];
+        for (uint word = 0u; word < words_per_thread; ++word) {
+            const uint base = word * values_per_word;
+            const uint x_offset = word * 32u * values_per_word;
+            xt[base] = x[x_offset];
+            xt[base + 1u] = x[x_offset + 1u];
+            xt[base + 2u] = x[x_offset + 2u];
+            xt[base + 3u] = x[x_offset + 3u];
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row >= out_dim) {
+                continue;
+            }
+            const device uint* row_words = ws + row * packed_cols;
+            float accum = 0.0f;
+            for (uint word = 0u; word < words_per_thread; ++word) {
+                const uint packed_word = row_words[word * 32u];
+                const uint group = (simd_lid + word * 32u) / 16u;
+                const float scale = scale_base[row * groups + group];
+                const float bias = bias_base[row * groups + group];
+                const uint base = word * values_per_word;
+                accum += xt[base] * ((float(packed_word & 0x000000ffu) * scale) + bias);
+                accum += xt[base + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
+                accum += xt[base + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
+                accum += xt[base + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+            }
+            result[row] += accum;
+        }
+
+        ws += words_per_block;
+        scale_base += values_per_block / 64u;
+        bias_base += values_per_block / 64u;
+        x += values_per_block;
+    }
+
+    const uint tail_values = in_dim - full_blocks * values_per_block;
+    if (tail_values > 0u) {
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row >= out_dim) {
+                continue;
+            }
+            const device uint* row_words = ws + row * packed_cols;
+            float accum = 0.0f;
+            for (uint word = 0u; word < words_per_thread; ++word) {
+                const uint value_offset = (word * 32u + simd_lid) * values_per_word;
+                if (value_offset >= tail_values) {
+                    continue;
+                }
+                const uint packed_word = row_words[word * 32u];
+                const uint group = value_offset / 64u;
+                const float scale = scale_base[row * groups + group];
+                const float bias = bias_base[row * groups + group];
+                const uint x_offset = word * 32u * values_per_word;
+                accum += x[x_offset] * ((float(packed_word & 0x000000ffu) * scale) + bias);
+                accum += x[x_offset + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
+                accum += x[x_offset + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
+                accum += x[x_offset + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+            }
+            result[row] += accum;
+        }
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const float reduced = simd_sum(result[row]);
+        if (simd_lid == 0u && row_base + row < out_dim) {
             out[tile.x * out_dim + row_base + row] = reduced;
         }
     }
@@ -1696,6 +1927,24 @@ kernel void swiglu_f32(
     }
     const float g = gate[gid];
     out[gid] = (g / (1.0f + exp(-g))) * up[gid];
+}
+
+kernel void geglu_tanh_f32(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& len [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) {
+        return;
+    }
+    const float g = gate[gid];
+    const float inner = 0.7978846f * (g + 0.044715f * g * g * g);
+    // NOTE: le tanh fast-math passe par exp(2x) et déborde en NaN dès inner≈44
+    // (les grosses activations Gemma poussent inner≈4690). On sature l'argument :
+    // tanh(±20)=±1 exactement en f32, comme la référence CPU f32::tanh saturante.
+    out[gid] = (0.5f * g * (1.0f + tanh(clamp(inner, -20.0f, 20.0f)))) * up[gid];
 }
 
 // Désinterleave la projection q_proj batchée `[seq, 2*q_dim]` (layout par tête
@@ -5548,6 +5797,18 @@ kernel void weighted_sum_topk_f32(
     out[gid] = acc;
 }
 
+kernel void scale_topk_scores_f32(
+    device const uint* indices [[buffer(0)]],
+    device float* scores [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < count) {
+        scores[gid] *= scales[indices[gid]];
+    }
+}
+
 kernel void weighted_sum_grouped_topk_f32(
     device const float* src [[buffer(0)]],
     device const float* scores [[buffer(1)]],
@@ -6390,7 +6651,7 @@ kernel void rms_norm_rope_heads_f32(
     device const float* weight [[buffer(1)]],
     device float* out [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
-    constant float2& params [[buffer(4)]],
+    constant float4& params [[buffer(4)]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
@@ -6400,6 +6661,7 @@ kernel void rms_norm_rope_heads_f32(
     const uint rope_dims = dims.w;
     const float eps = params.x;
     const float base_theta = params.y;
+    const float frequency_dim = params.z;
     const uint head = tile.x;
     const uint pos = tile.y;
     if (head >= heads || pos >= seq) {
@@ -6430,9 +6692,9 @@ kernel void rms_norm_rope_heads_f32(
         float value = input[start + col] * inv_rms * weight[col];
         if (col < rope_dims) {
             // Rotate-half : la paire (pair, pair+pairs) tourne a la frequence
-            // d'exposant 2*pair/rope_dims (miroir CPU rms_norm_rope_heads_at).
+            // d'exposant 2*pair/frequency_dim (miroir CPU rms_norm_rope_heads_at).
             const uint pair = (col < pairs) ? col : (col - pairs);
-            const float exponent = float(2u * pair) / float(rope_dims);
+            const float exponent = float(2u * pair) / frequency_dim;
             const float angle = float(pos) / pow(base_theta, exponent);
             const float c = cos(angle);
             const float s = sin(angle);
@@ -6444,12 +6706,54 @@ kernel void rms_norm_rope_heads_f32(
     }
 }
 
+kernel void rms_norm_heads_no_scale_f32(
+    device const float* input [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint3& dims [[buffer(2)]],
+    constant float& eps [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint seq = dims.x;
+    const uint heads = dims.y;
+    const uint head_dim = dims.z;
+    const uint head = tile.x;
+    const uint pos = tile.y;
+    if (head >= heads || pos >= seq) {
+        return;
+    }
+
+    threadgroup float partial[256];
+    const uint dim = heads * head_dim;
+    const uint start = pos * dim + head * head_dim;
+    float sumsq = 0.0f;
+    for (uint col = tid; col < head_dim; col += 256u) {
+        const float value = input[start + col];
+        sumsq += value * value;
+    }
+    partial[tid] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
+    for (uint col = tid; col < head_dim; col += 256u) {
+        out[start + col] = input[start + col] * inv_rms;
+    }
+}
+
 kernel void causal_attention_prefill_f32(
     device const float* q [[buffer(0)]],
     device const float* k [[buffer(1)]],
     device const float* v [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
@@ -6471,7 +6775,7 @@ kernel void causal_attention_prefill_f32(
     const uint kv_dim = kv_heads * head_dim;
     const uint q_start = pos * q_dim + q_head * head_dim;
     const uint kv_head_start = kv_head * head_dim;
-    const float scale = rsqrt(float(head_dim));
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(head_dim));
 
     for (uint row = 0u; row <= pos; ++row) {
         float dot = 0.0f;
@@ -6532,6 +6836,7 @@ kernel void causal_attention_prefill_mid_f32(
     device const float* v [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
@@ -6553,7 +6858,7 @@ kernel void causal_attention_prefill_mid_f32(
     const uint kv_dim = kv_heads * head_dim;
     const uint q_start = pos * q_dim + q_head * head_dim;
     const uint kv_head_start = kv_head * head_dim;
-    const float scale = rsqrt(float(head_dim));
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(head_dim));
 
     for (uint row = 0u; row <= pos; ++row) {
         float dot = 0.0f;
@@ -6618,6 +6923,7 @@ kernel void causal_attention_prefill_long_f32(
     device const float* v [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
@@ -6638,7 +6944,7 @@ kernel void causal_attention_prefill_long_f32(
     const uint kv_dim = kv_heads * head_dim;
     const uint q_start = pos * q_dim + q_head * head_dim;
     const uint kv_head_start = kv_head * head_dim;
-    const float scale = rsqrt(float(head_dim));
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(head_dim));
 
     // Passe 1 : maximum des scores (ordre 0..=pos), score recalculé en arbre.
     float max_score = -INFINITY;
@@ -6711,6 +7017,270 @@ kernel void causal_attention_prefill_long_f32(
     }
 }
 
+// Variantes sliding-window du prefill causal. Elles restent séparées des
+// kernels historiques afin que les chemins Qwen et Gemma globaux conservent
+// strictement leur code et leur ordre arithmétique.
+kernel void windowed_attention_prefill_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint* dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint seq = dims[0];
+    const uint q_heads = dims[1];
+    const uint kv_heads = dims[2];
+    const uint head_dim = dims[3];
+    const uint window = dims[4];
+    const uint q_head = tile.x;
+    const uint pos = tile.y;
+    if (q_head >= q_heads || pos >= seq || seq > 256u) {
+        return;
+    }
+
+    threadgroup float partial[256];
+    threadgroup float scores[256];
+    const uint kv_group = q_heads / kv_heads;
+    const uint kv_head = q_head / kv_group;
+    const uint q_dim = q_heads * head_dim;
+    const uint kv_dim = kv_heads * head_dim;
+    const uint q_start = pos * q_dim + q_head * head_dim;
+    const uint kv_head_start = kv_head * head_dim;
+    const uint row_start = (pos + 1u > window) ? (pos + 1u - window) : 0u;
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(head_dim));
+
+    for (uint row = row_start; row <= pos; ++row) {
+        float dot = 0.0f;
+        const uint k_start = row * kv_dim + kv_head_start;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            dot += q[q_start + col] * k[k_start + col];
+        }
+        partial[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0u) {
+            scores[row] = partial[0] * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        float max_score = scores[row_start];
+        for (uint row = row_start + 1u; row <= pos; ++row) {
+            max_score = max(max_score, scores[row]);
+        }
+        float sum = 0.0f;
+        for (uint row = row_start; row <= pos; ++row) {
+            const float value = exp(scores[row] - max_score);
+            scores[row] = value;
+            sum += value;
+        }
+        const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        for (uint row = row_start; row <= pos; ++row) {
+            scores[row] *= inv_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint out_start = pos * q_dim + q_head * head_dim;
+    for (uint col = tid; col < head_dim; col += 256u) {
+        float acc = 0.0f;
+        for (uint row = row_start; row <= pos; ++row) {
+            const uint v_start = row * kv_dim + kv_head_start;
+            acc += scores[row] * v[v_start + col];
+        }
+        out[out_start + col] = acc;
+    }
+}
+
+kernel void windowed_attention_prefill_mid_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint* dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint seq = dims[0];
+    const uint q_heads = dims[1];
+    const uint kv_heads = dims[2];
+    const uint head_dim = dims[3];
+    const uint window = dims[4];
+    const uint q_head = tile.x;
+    const uint pos = tile.y;
+    if (q_head >= q_heads || pos >= seq || seq > 2048u) {
+        return;
+    }
+
+    threadgroup float partial[256];
+    threadgroup float scores[2048];
+    const uint kv_group = q_heads / kv_heads;
+    const uint kv_head = q_head / kv_group;
+    const uint q_dim = q_heads * head_dim;
+    const uint kv_dim = kv_heads * head_dim;
+    const uint q_start = pos * q_dim + q_head * head_dim;
+    const uint kv_head_start = kv_head * head_dim;
+    const uint row_start = (pos + 1u > window) ? (pos + 1u - window) : 0u;
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(head_dim));
+
+    for (uint row = row_start; row <= pos; ++row) {
+        float dot = 0.0f;
+        const uint k_start = row * kv_dim + kv_head_start;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            dot += q[q_start + col] * k[k_start + col];
+        }
+        partial[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0u) {
+            scores[row] = partial[0] * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        float max_score = scores[row_start];
+        for (uint row = row_start + 1u; row <= pos; ++row) {
+            max_score = max(max_score, scores[row]);
+        }
+        float sum = 0.0f;
+        for (uint row = row_start; row <= pos; ++row) {
+            const float value = exp(scores[row] - max_score);
+            scores[row] = value;
+            sum += value;
+        }
+        const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        for (uint row = row_start; row <= pos; ++row) {
+            scores[row] *= inv_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint out_start = pos * q_dim + q_head * head_dim;
+    for (uint col = tid; col < head_dim; col += 256u) {
+        float acc = 0.0f;
+        for (uint row = row_start; row <= pos; ++row) {
+            const uint v_start = row * kv_dim + kv_head_start;
+            acc += scores[row] * v[v_start + col];
+        }
+        out[out_start + col] = acc;
+    }
+}
+
+kernel void windowed_attention_prefill_long_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint* dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint seq = dims[0];
+    const uint q_heads = dims[1];
+    const uint kv_heads = dims[2];
+    const uint head_dim = dims[3];
+    const uint window = dims[4];
+    const uint q_head = tile.x;
+    const uint pos = tile.y;
+    if (q_head >= q_heads || pos >= seq || head_dim > 256u) {
+        return;
+    }
+
+    threadgroup float partial[256];
+    const uint kv_group = q_heads / kv_heads;
+    const uint kv_head = q_head / kv_group;
+    const uint q_dim = q_heads * head_dim;
+    const uint kv_dim = kv_heads * head_dim;
+    const uint q_start = pos * q_dim + q_head * head_dim;
+    const uint kv_head_start = kv_head * head_dim;
+    const uint row_start = (pos + 1u > window) ? (pos + 1u - window) : 0u;
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(head_dim));
+
+    float max_score = -INFINITY;
+    for (uint row = row_start; row <= pos; ++row) {
+        const uint k_start = row * kv_dim + kv_head_start;
+        float dot = 0.0f;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            dot += q[q_start + col] * k[k_start + col];
+        }
+        partial[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        max_score = max(max_score, partial[0] * scale);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float sum = 0.0f;
+    for (uint row = row_start; row <= pos; ++row) {
+        const uint k_start = row * kv_dim + kv_head_start;
+        float dot = 0.0f;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            dot += q[q_start + col] * k[k_start + col];
+        }
+        partial[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        sum += exp(partial[0] * scale - max_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+
+    const uint out_start = pos * q_dim + q_head * head_dim;
+    const uint my_col = tid;
+    float acc = 0.0f;
+    for (uint row = row_start; row <= pos; ++row) {
+        const uint k_start = row * kv_dim + kv_head_start;
+        float dot = 0.0f;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            dot += q[q_start + col] * k[k_start + col];
+        }
+        partial[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float weight = exp(partial[0] * scale - max_score) * inv_sum;
+        if (my_col < head_dim) {
+            const uint v_start = row * kv_dim + kv_head_start;
+            acc += weight * v[v_start + my_col];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (my_col < head_dim) {
+        out[out_start + my_col] = acc;
+    }
+}
+
 // D-PLONG-B : variante longue opt-in pour les modèles 27B/30B. Une simdgroup
 // calcule une requête causale complète (position, q_head) avec online-softmax :
 // Q/K/V ont déjà reçu RMSNorm+RoPE côté encodeur Rust. L'ordre de réduction
@@ -6722,6 +7292,7 @@ kernel void causal_attention_prefill_batch_long_d128_f32(
     device const float* v [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
@@ -6744,7 +7315,7 @@ kernel void causal_attention_prefill_batch_long_d128_f32(
     const uint q_dim = q_heads * D;
     const uint kv_dim = kv_heads * D;
     const uint lane_base = simd_lid * QK;
-    const float scale = rsqrt(float(D));
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(D));
 
     float ql[QK];
     const device float* q_ptr = q + pos * q_dim + q_head * D + lane_base;
@@ -6790,6 +7361,7 @@ kernel void causal_attention_prefill_batch_long_d256_f32(
     device const float* v [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
@@ -6812,7 +7384,7 @@ kernel void causal_attention_prefill_batch_long_d256_f32(
     const uint q_dim = q_heads * D;
     const uint kv_dim = kv_heads * D;
     const uint lane_base = simd_lid * QK;
-    const float scale = rsqrt(float(D));
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(D));
 
     float ql[QK];
     const device float* q_ptr = q + pos * q_dim + q_head * D + lane_base;
@@ -6862,6 +7434,7 @@ kernel void causal_attention_prefill_batch_gqa8x4_d256_f32(
     device const float* v [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -6888,7 +7461,7 @@ kernel void causal_attention_prefill_batch_gqa8x4_d256_f32(
     const uint q_dim = q_heads * D;
     const uint kv_dim = kv_heads * D;
     const uint lane_base = simd_lid * QK;
-    const float scale = rsqrt(float(D));
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(D));
 
     float q0[QK], q1[QK], q2[QK], q3[QK];
     float o0[QK], o1[QK], o2[QK], o3[QK];

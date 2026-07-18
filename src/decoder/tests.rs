@@ -655,6 +655,125 @@ fn layer_rope_position_scale_targets_global_layers_only() {
 }
 
 #[test]
+fn resident_full_attention_uses_gemma4_layer_types() {
+    let config = CausalDecoderConfig {
+        is_gemma4: true,
+        head_dim: Some(256),
+        global_head_dim: Some(512),
+        rope_dims: Some(256),
+        rope_full_dims: Some(128),
+        rope_sliding_dims: Some(256),
+        num_attention_heads: 16,
+        num_key_value_heads: 8,
+        num_global_key_value_heads: Some(2),
+        layer_types: vec![
+            "sliding_attention".to_string(),
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+        ],
+        ..CausalDecoderConfig::default()
+    };
+
+    assert!(config.is_full_attention_layer(0));
+    assert!(config.is_resident_full_attention_layer(0));
+    assert!(config.is_resident_full_attention_layer(2));
+    let global_head_dim = config
+        .layer_head_dim(2)
+        .expect("invariant: global_head_dim Gemma4 présent");
+    assert_eq!(global_head_dim, 512);
+    assert_eq!(config.layer_num_key_value_heads(2), 2);
+    assert_eq!(config.layer_rope_dims(2, global_head_dim), 128);
+}
+
+#[test]
+fn resident_full_attention_keeps_qwen_interval_and_uniform_dims() {
+    let config = CausalDecoderConfig {
+        is_gemma4: false,
+        head_dim: Some(128),
+        global_head_dim: Some(512),
+        rope_dims: Some(32),
+        rope_full_dims: Some(128),
+        full_attention_interval: Some(5),
+        layer_types: vec![
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+        ],
+        ..CausalDecoderConfig::default()
+    };
+
+    assert!(!config.is_resident_full_attention_layer(0));
+    assert!(config.is_resident_full_attention_layer(4));
+    let head_dim = config
+        .layer_head_dim(4)
+        .expect("invariant: head_dim Qwen présent");
+    assert_eq!(head_dim, 128);
+    assert_eq!(
+        config.layer_num_key_value_heads(4),
+        config.num_key_value_heads
+    );
+    assert_eq!(config.layer_rope_dims(4, head_dim), 32);
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn resident_linear_detection_uses_attention_block_variants() {
+    let mut gemma_weights = HashMap::new();
+    gemma_weights.insert(
+        "embed_tokens.weight".to_string(),
+        Tensor::from_vec(vec![3, 2], vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+            .expect("invariant: embedding valide"),
+    );
+    gemma_weights.insert(
+        "norm.weight".to_string(),
+        Tensor::from_vec(vec![2], vec![1.0, 1.0]).expect("invariant: norm valide"),
+    );
+    gemma_weights.insert(
+        "lm_head.weight".to_string(),
+        Tensor::from_vec(vec![3, 2], vec![1.0, 0.0, -1.0, 0.0, 0.0, 1.0])
+            .expect("invariant: lm_head valide"),
+    );
+    insert_attention_layer(&mut gemma_weights, 0);
+    insert_attention_layer(&mut gemma_weights, 1);
+    let gemma = CausalDecoder::from_tensors(
+        gemma_weights,
+        CausalDecoderConfig {
+            is_gemma4: true,
+            num_hidden_layers: 2,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            num_global_key_value_heads: Some(1),
+            head_dim: Some(2),
+            global_head_dim: Some(2),
+            rope_dims: Some(2),
+            rope_full_dims: Some(2),
+            rope_sliding_dims: Some(2),
+            rope_theta: Some(10_000.0),
+            sliding_window: Some(4),
+            layer_types: vec![
+                "sliding_attention".to_string(),
+                "full_attention".to_string(),
+            ],
+            ..CausalDecoderConfig::default()
+        },
+    )
+    .expect("invariant: Gemma synthétique chargeable");
+
+    assert!(gemma.config.is_resident_full_attention_layer(0));
+    assert!(matches!(
+        &gemma.layers[0].attention,
+        AttentionBlock::Full(attention) if attention.sliding_window == Some(4)
+    ));
+    assert!(!gemma.has_resident_linear_attention_layer());
+
+    let qwen = CausalDecoder::from_tensors(hybrid_weights(2, 2), hybrid_config(2))
+        .expect("invariant: hybride Qwen synthétique chargeable");
+    assert!(qwen.has_resident_linear_attention_layer());
+}
+
+#[test]
 fn gemma_layer_wiring_matches_manual_reference() {
     // Câblage Gemma : norme post-attention AVANT le résiduel, double norme
     // pre/post feed-forward, MLP GeGLU, embeddings mis à l'échelle.
@@ -1090,6 +1209,44 @@ fn attention_layout_wires_scale_and_window() {
         .expect("invariant: layout valide");
     assert_eq!(layout.attn_scalar, 2.0);
     assert_eq!(layout.sliding_window, None);
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn gemma4_global_attention_aliases_k_as_resident_v_projection() -> Result<()> {
+    let mut tensors: HashMap<String, DecoderTensor> = HashMap::new();
+    for name in ["q_proj", "k_proj", "o_proj"] {
+        tensors.insert(
+            format!("layers.0.self_attn.{name}.weight"),
+            DecoderTensor::Dense(identity2().expect("invariant: identité valide")),
+        );
+    }
+    for name in ["q_norm", "k_norm"] {
+        tensors.insert(
+            format!("layers.0.self_attn.{name}.weight"),
+            DecoderTensor::Dense(
+                Tensor::from_vec(vec![2], vec![1.0, 1.0]).expect("invariant: norme valide"),
+            ),
+        );
+    }
+    let config = CausalDecoderConfig {
+        is_gemma4: true,
+        attention_k_eq_v: true,
+        head_dim: Some(2),
+        layer_types: vec!["full_attention".to_string()],
+        ..CausalDecoderConfig::default()
+    };
+    let attention = full_attention_from_tensors(&config, &mut tensors, "layers.0", 0)
+        .expect("invariant: attention Gemma4 valide");
+    let AttentionBlock::Full(attention) = attention else {
+        return Err(InferError::Config(
+            "attention full Gemma4 attendue".to_string(),
+        ));
+    };
+
+    assert!(attention.v_proj.is_none());
+    assert!(std::ptr::eq(attention.resident_v_proj(), &attention.k_proj));
+    Ok(())
 }
 
 fn test_weights() -> HashMap<String, Tensor> {
@@ -1641,10 +1798,6 @@ fn mtp_verifier_model_dir() -> Option<PathBuf> {
             path.display()
         );
         return None;
-    }
-    let default = PathBuf::from("/Users/ludwig/workspace/reti/models/Qwen3.6-27B-OptiQ-4bit");
-    if default.is_dir() {
-        return Some(default);
     }
     eprintln!(
         "skip MTP verifier integration: model missing, set RETI_RUST_MTP_VERIFIER_TEST_MODEL"

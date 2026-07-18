@@ -639,6 +639,20 @@ impl FullAttentionMetalState {
     /// Renvoie une erreur si `q` n'a pas la longueur `q_dim`, si le KV est vide, ou
     /// si une dimension déborde / l'exécution Metal échoue.
     pub(crate) fn attention_decode(&self, q: &[f32]) -> Result<Vec<f32>> {
+        self.attention_decode_windowed(q, 0)
+    }
+
+    /// Calcule l'attention decode sur les lignes KV `window_start..len`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la fenêtre est vide, une dimension déborde ou
+    /// l'exécution Metal échoue.
+    pub(crate) fn attention_decode_windowed(
+        &self,
+        q: &[f32],
+        window_start: usize,
+    ) -> Result<Vec<f32>> {
         if self.len == 0 {
             return Err(InferError::Dimension(
                 "attention_decode sur KV vide".to_string(),
@@ -668,11 +682,12 @@ impl FullAttentionMetalState {
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
-        self.encode_attention_decode(
+        self.encode_attention_decode_windowed(
             encoder,
             q_buf.tensor().buffer(),
             scores.tensor().buffer(),
             out.tensor().buffer(),
+            window_start,
         )?;
         encoder_guard.end();
         commit_and_wait(command_buffer)?;
@@ -697,15 +712,33 @@ impl FullAttentionMetalState {
         scores_buf: &BufferRef,
         out_buf: &BufferRef,
     ) -> Result<()> {
+        self.encode_attention_decode_windowed(encoder, q_buf, scores_buf, out_buf, 0)
+    }
+
+    pub(crate) fn encode_attention_decode_windowed(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &BufferRef,
+        scores_buf: &BufferRef,
+        out_buf: &BufferRef,
+        window_start: usize,
+    ) -> Result<()> {
         if self.len == 0 {
             return Err(InferError::Dimension(
                 "attention_decode sur KV vide".to_string(),
             ));
         }
+        if window_start >= self.len {
+            return Err(InferError::Dimension(format!(
+                "attention_decode fenêtre vide: début={window_start}, len={}",
+                self.len
+            )));
+        }
         // Bascule 2-passes split-K pour les longs KV (dédup GQA + tuiles L1) :
         // head_dim 128/256, GQA réel (>1 q/kv), len ≥ seuil. Cf. encode_attention_decode_2pass.
         let gqa = self.q_heads / self.kv_heads.max(1);
-        if sdpa_2pass_enabled()
+        if window_start == 0
+            && sdpa_2pass_enabled()
             && flash_sdpa_enabled()
             && matches!(self.head_dim, 128 | 256)
             && gqa > 1
@@ -724,7 +757,13 @@ impl FullAttentionMetalState {
             u32::try_from(self.len)
                 .map_err(|_| InferError::Dimension("len hors u32".to_string()))?,
         ];
-        let use_flash = flash_sdpa_enabled() && self.head_dim <= 256 && self.head_dim % 32 == 0;
+        // Le chemin fenêtré privilégie d'abord la correction : le kernel naïf
+        // exclut réellement les lignes antérieures. Les variantes flash/2-pass
+        // historiques restent strictement inchangées pour `window_start == 0`.
+        let use_flash = window_start == 0
+            && flash_sdpa_enabled()
+            && self.head_dim <= 256
+            && self.head_dim % 32 == 0;
         let pipeline = match (self.keys.element(), use_flash, self.head_dim == 256) {
             (GpuElement::F32, true, true) => &self.attention_flash_d256,
             (GpuElement::F32, true, false) => &self.attention_flash,
@@ -756,6 +795,13 @@ impl FullAttentionMetalState {
                 5,
                 std::mem::size_of::<[u32; 4]>() as u64,
                 dims.as_ptr().cast::<c_void>(),
+            );
+            let window_start = u32::try_from(window_start)
+                .map_err(|_| InferError::Dimension("window_start hors u32".to_string()))?;
+            encoder.set_bytes(
+                6,
+                std::mem::size_of::<u32>() as u64,
+                std::ptr::from_ref(&window_start).cast::<c_void>(),
             );
         }
         crate::metal_backend::profile_dispatch();

@@ -123,6 +123,7 @@ impl CausalDecoder {
             head_dim,
             rope_dims: self.config.rope_dims.unwrap_or(head_dim),
             position: 0,
+            window_start: 0,
             eps: self.config.rms_eps,
             theta,
             attn_output_gate: self.config.attn_output_gate,
@@ -436,6 +437,7 @@ impl CausalDecoder {
             let weights = FullAttnDenseLayerWeights {
                 input_norm: &layer.input_norm,
                 qkv_proj: layer.qkv_proj.as_ref(),
+                qkv_proj_without_gate: false,
                 q_proj: &layer.q_proj,
                 k_proj: &layer.k_proj,
                 v_proj: &layer.v_proj,
@@ -443,6 +445,9 @@ impl CausalDecoder {
                 q_norm: &layer.q_norm,
                 k_norm: &layer.k_norm,
                 post_norm: &layer.post_norm,
+                pre_feedforward_norm: layer.pre_feedforward_norm.as_ref(),
+                post_feedforward_norm: layer.post_feedforward_norm.as_ref(),
+                layer_scalar: layer.layer_scalar,
                 gate_proj: &layer.gate_proj,
                 up_proj: &layer.up_proj,
                 down_proj: &layer.down_proj,
@@ -717,6 +722,7 @@ impl CausalDecoder {
             let weights = FullAttnDenseLayerWeights {
                 input_norm: &mtp.layer.input_norm,
                 qkv_proj: mtp.layer.qkv_proj.as_ref(),
+                qkv_proj_without_gate: false,
                 q_proj: &mtp.layer.q_proj,
                 k_proj: &mtp.layer.k_proj,
                 v_proj: &mtp.layer.v_proj,
@@ -724,6 +730,9 @@ impl CausalDecoder {
                 q_norm: &mtp.layer.q_norm,
                 k_norm: &mtp.layer.k_norm,
                 post_norm: &mtp.layer.post_norm,
+                pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
+                post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
+                layer_scalar: mtp.layer.layer_scalar,
                 gate_proj: &mtp.layer.gate_proj,
                 up_proj: &mtp.layer.up_proj,
                 down_proj: &mtp.layer.down_proj,
@@ -736,6 +745,7 @@ impl CausalDecoder {
                 head_dim,
                 rope_dims,
                 position,
+                window_start: 0,
                 eps,
                 theta,
                 attn_output_gate: self.config.attn_output_gate,
@@ -889,6 +899,7 @@ impl CausalDecoder {
         let weights = FullAttnDenseLayerWeights {
             input_norm: &mtp.layer.input_norm,
             qkv_proj: mtp.layer.qkv_proj.as_ref(),
+            qkv_proj_without_gate: false,
             q_proj: &mtp.layer.q_proj,
             k_proj: &mtp.layer.k_proj,
             v_proj: &mtp.layer.v_proj,
@@ -896,6 +907,9 @@ impl CausalDecoder {
             q_norm: &mtp.layer.q_norm,
             k_norm: &mtp.layer.k_norm,
             post_norm: &mtp.layer.post_norm,
+            pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
+            post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
+            layer_scalar: mtp.layer.layer_scalar,
             gate_proj: &mtp.layer.gate_proj,
             up_proj: &mtp.layer.up_proj,
             down_proj: &mtp.layer.down_proj,
@@ -908,6 +922,7 @@ impl CausalDecoder {
             head_dim,
             rope_dims,
             position,
+            window_start: 0,
             eps,
             theta,
             attn_output_gate: self.config.attn_output_gate,
@@ -1100,6 +1115,7 @@ impl CausalDecoder {
             let weights = FullAttnDenseLayerWeights {
                 input_norm: &mtp.layer.input_norm,
                 qkv_proj: mtp.layer.qkv_proj.as_ref(),
+                qkv_proj_without_gate: false,
                 q_proj: &mtp.layer.q_proj,
                 k_proj: &mtp.layer.k_proj,
                 v_proj: &mtp.layer.v_proj,
@@ -1107,6 +1123,9 @@ impl CausalDecoder {
                 q_norm: &mtp.layer.q_norm,
                 k_norm: &mtp.layer.k_norm,
                 post_norm: &mtp.layer.post_norm,
+                pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
+                post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
+                layer_scalar: mtp.layer.layer_scalar,
                 gate_proj: &mtp.layer.gate_proj,
                 up_proj: &mtp.layer.up_proj,
                 down_proj: &mtp.layer.down_proj,
@@ -1121,6 +1140,7 @@ impl CausalDecoder {
                 position: position_offset.checked_add(position).ok_or_else(|| {
                     InferError::Dimension("MTP position résidente déborde".to_string())
                 })?,
+                window_start: 0,
                 eps,
                 theta,
                 attn_output_gate: self.config.attn_output_gate,
@@ -1207,12 +1227,7 @@ impl CausalDecoder {
         let mtp_history = if fresh { 0 } else { history_len };
         let primary_u32 = u32::try_from(primary)
             .map_err(|_| InferError::Dimension(format!("token MTP hors u32: {primary}")))?;
-        let linear_dims = if self
-            .layers
-            .iter()
-            .enumerate()
-            .any(|(index, _)| !self.config.is_full_attention_layer(index))
-        {
+        let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
                 num_key_heads: la_config.num_key_heads,
@@ -1248,7 +1263,7 @@ impl CausalDecoder {
         }
         let trunk_batch_supported = self.layers.iter().enumerate().all(|(index, layer)| {
             match (
-                self.config.is_full_attention_layer(index),
+                self.config.is_resident_full_attention_layer(index),
                 layer.mlp.as_ref(),
             ) {
                 (true, Some(FeedForward::Dense(_))) => {
@@ -1389,6 +1404,7 @@ impl CausalDecoder {
             let weights = FullAttnDenseLayerWeights {
                 input_norm: &mtp.layer.input_norm,
                 qkv_proj: mtp.layer.qkv_proj.as_ref(),
+                qkv_proj_without_gate: false,
                 q_proj: &mtp.layer.q_proj,
                 k_proj: &mtp.layer.k_proj,
                 v_proj: &mtp.layer.v_proj,
@@ -1396,6 +1412,9 @@ impl CausalDecoder {
                 q_norm: &mtp.layer.q_norm,
                 k_norm: &mtp.layer.k_norm,
                 post_norm: &mtp.layer.post_norm,
+                pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
+                post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
+                layer_scalar: mtp.layer.layer_scalar,
                 gate_proj: &mtp.layer.gate_proj,
                 up_proj: &mtp.layer.up_proj,
                 down_proj: &mtp.layer.down_proj,
@@ -1408,6 +1427,7 @@ impl CausalDecoder {
                 head_dim,
                 rope_dims,
                 position: mtp_history,
+                window_start: 0,
                 eps,
                 theta,
                 attn_output_gate: self.config.attn_output_gate,
@@ -1491,18 +1511,14 @@ impl CausalDecoder {
         let target_position = *cache_position;
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_cache = &mut layers[index];
-            if self.config.is_full_attention_layer(index) {
-                let dims = FullAttnLayerDims {
+            if self.config.is_resident_full_attention_layer(index) {
+                let dims = self.config.resident_windowed_full_attn_layer_dims(
+                    index,
                     hidden,
-                    q_heads,
-                    kv_heads,
-                    head_dim,
-                    rope_dims,
-                    position: target_position,
+                    target_position,
                     eps,
                     theta,
-                    attn_output_gate: self.config.attn_output_gate,
-                };
+                )?;
                 self.encode_resident_full_dense_layer_rows(
                     metal,
                     arena,
@@ -1668,6 +1684,7 @@ impl CausalDecoder {
             let weights = FullAttnDenseLayerWeights {
                 input_norm: &mtp.layer.input_norm,
                 qkv_proj: mtp.layer.qkv_proj.as_ref(),
+                qkv_proj_without_gate: false,
                 q_proj: &mtp.layer.q_proj,
                 k_proj: &mtp.layer.k_proj,
                 v_proj: &mtp.layer.v_proj,
@@ -1675,6 +1692,9 @@ impl CausalDecoder {
                 q_norm: &mtp.layer.q_norm,
                 k_norm: &mtp.layer.k_norm,
                 post_norm: &mtp.layer.post_norm,
+                pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
+                post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
+                layer_scalar: mtp.layer.layer_scalar,
                 gate_proj: &mtp.layer.gate_proj,
                 up_proj: &mtp.layer.up_proj,
                 down_proj: &mtp.layer.down_proj,
@@ -1689,6 +1709,7 @@ impl CausalDecoder {
                 position: history_len.checked_add(1).ok_or_else(|| {
                     InferError::Dimension("MTP append position déborde".to_string())
                 })?,
+                window_start: 0,
                 eps,
                 theta,
                 attn_output_gate: self.config.attn_output_gate,
@@ -1834,12 +1855,7 @@ impl CausalDecoder {
         let hidden = self.final_norm.data().len();
         let primary_u32 = u32::try_from(primary)
             .map_err(|_| InferError::Dimension(format!("token MTP hors u32: {primary}")))?;
-        let linear_dims = if self
-            .layers
-            .iter()
-            .enumerate()
-            .any(|(index, _)| !self.config.is_full_attention_layer(index))
-        {
+        let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
                 num_key_heads: la_config.num_key_heads,
@@ -1875,7 +1891,7 @@ impl CausalDecoder {
         }
         let trunk_batch_supported = self.layers.iter().enumerate().all(|(index, layer)| {
             match (
-                self.config.is_full_attention_layer(index),
+                self.config.is_resident_full_attention_layer(index),
                 layer.mlp.as_ref(),
             ) {
                 (true, Some(FeedForward::Dense(_))) => {
@@ -1946,6 +1962,7 @@ impl CausalDecoder {
             head_dim,
             rope_dims,
             position: 0,
+            window_start: 0,
             eps,
             theta,
             attn_output_gate: self.config.attn_output_gate,
@@ -2070,6 +2087,7 @@ impl CausalDecoder {
                 let weights = FullAttnDenseLayerWeights {
                     input_norm: &mtp.layer.input_norm,
                     qkv_proj: mtp.layer.qkv_proj.as_ref(),
+                    qkv_proj_without_gate: false,
                     q_proj: &mtp.layer.q_proj,
                     k_proj: &mtp.layer.k_proj,
                     v_proj: &mtp.layer.v_proj,
@@ -2077,6 +2095,9 @@ impl CausalDecoder {
                     q_norm: &mtp.layer.q_norm,
                     k_norm: &mtp.layer.k_norm,
                     post_norm: &mtp.layer.post_norm,
+                    pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
+                    post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
+                    layer_scalar: mtp.layer.layer_scalar,
                     gate_proj: &mtp.layer.gate_proj,
                     up_proj: &mtp.layer.up_proj,
                     down_proj: &mtp.layer.down_proj,
@@ -2091,6 +2112,7 @@ impl CausalDecoder {
                     position: history_len.checked_add(draft_pos).ok_or_else(|| {
                         InferError::Dimension("MTP position résidente déborde".to_string())
                     })?,
+                    window_start: 0,
                     eps,
                     theta,
                     attn_output_gate: self.config.attn_output_gate,
@@ -2191,18 +2213,14 @@ impl CausalDecoder {
         let target_position = *cache_position;
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_cache = &mut layers[index];
-            if self.config.is_full_attention_layer(index) {
-                let dims = FullAttnLayerDims {
+            if self.config.is_resident_full_attention_layer(index) {
+                let dims = self.config.resident_windowed_full_attn_layer_dims(
+                    index,
                     hidden,
-                    q_heads,
-                    kv_heads,
-                    head_dim,
-                    rope_dims,
-                    position: target_position,
+                    target_position,
                     eps,
                     theta,
-                    attn_output_gate: self.config.attn_output_gate,
-                };
+                )?;
                 self.encode_resident_full_dense_layer_rows(
                     metal,
                     arena,

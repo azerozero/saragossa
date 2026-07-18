@@ -65,3 +65,20 @@ jobs:
         run: command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
       - name: Vulnerabilities
         run: cargo audit
+
+  dependency-policy:
+    name: cargo deny, machete
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: rustup default stable
+      - name: Install policy tools
+        run: |
+          command -v cargo-deny >/dev/null || cargo install cargo-deny --locked
+          command -v cargo-machete >/dev/null || cargo install cargo-machete --locked
+      - name: Dependency policy
+        run: cargo deny check
+      - name: Unused dependencies
+        run: cargo machete

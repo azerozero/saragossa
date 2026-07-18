@@ -1,0 +1,14 @@
+[workspace]
+publish = true
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+changelog_update = true
+semver_check = true
+pr_labels = ["release"]
+release_commits = "^(feat|fix|refactor|perf)(\\([^)]+\\))?:"
+
+[[package]]
+name = "saragossa"
+changelog_path = "CHANGELOG.md"
+git_release_name = "v{{ version }}"

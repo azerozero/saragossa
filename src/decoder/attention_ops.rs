@@ -1114,3 +1114,74 @@ pub(super) fn causal_attention(
     }
     Tensor::from_vec(vec![seq, expected_q_dim], out)
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct GemmaGlobalAttentionOracleSpec {
+    pub(crate) q_heads: usize,
+    pub(crate) kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) rope_dims: usize,
+    pub(crate) rope_theta: f32,
+    pub(crate) attn_scalar: f32,
+    pub(crate) eps: f32,
+    pub(crate) value_norm: bool,
+    pub(crate) window: Option<usize>,
+}
+
+#[cfg(test)]
+pub(crate) fn gemma_global_attention_prefill_oracle(
+    q_raw: &Tensor,
+    k_raw: &Tensor,
+    v_raw: &Tensor,
+    q_norm: &Tensor,
+    k_norm: &Tensor,
+    spec: GemmaGlobalAttentionOracleSpec,
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    let rope = RopeParams {
+        theta: spec.rope_theta,
+        frequency_dim: spec.head_dim,
+        position_scale: 1.0,
+    };
+    let q = rms_norm_rope_heads_at(
+        q_raw,
+        spec.q_heads,
+        spec.head_dim,
+        spec.rope_dims,
+        q_norm,
+        spec.eps,
+        rope,
+        0,
+        RopeStyle::Halves,
+    )?;
+    let k = rms_norm_rope_heads_at(
+        k_raw,
+        spec.kv_heads,
+        spec.head_dim,
+        spec.rope_dims,
+        k_norm,
+        spec.eps,
+        rope,
+        0,
+        RopeStyle::Halves,
+    )?;
+    let v = if spec.value_norm {
+        rms_norm_heads_no_scale(v_raw, spec.kv_heads, spec.head_dim, spec.eps)?
+    } else {
+        v_raw.clone()
+    };
+    let context = causal_attention(
+        &q,
+        &k,
+        &v,
+        &AttentionLayout {
+            num_attention_heads: spec.q_heads,
+            num_key_value_heads: spec.kv_heads,
+            head_dim: spec.head_dim,
+            rope_dims: spec.rope_dims,
+            attn_scalar: spec.attn_scalar,
+            sliding_window: spec.window,
+        },
+    )?;
+    Ok((q, k, v, context))
+}

@@ -17,6 +17,7 @@ mod http;
 mod protocol;
 mod state;
 pub(crate) mod streaming;
+mod warmup;
 
 use std::error::Error;
 

@@ -582,6 +582,33 @@ impl MetalExecutor {
         self.dispatch_1d(encoder, &self.weighted_sum_topk_f32, out_dim)
     }
 
+    /// Applique l'échelle de l'expert sélectionné à chaque score top-k.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le nombre de scores dépasse les dimensions Metal.
+    pub(super) fn encode_scale_topk_scores(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        indices_buffer: &BufferRef,
+        scores_buffer: &BufferRef,
+        scale_buffer: &BufferRef,
+        count: usize,
+    ) -> Result<()> {
+        encoder.set_compute_pipeline_state(&self.scale_topk_scores_f32);
+        encoder.set_buffer(0, Some(indices_buffer), 0);
+        encoder.set_buffer(1, Some(scores_buffer), 0);
+        encoder.set_buffer(2, Some(scale_buffer), 0);
+        set_u32_bytes(
+            encoder,
+            3,
+            &[checked_u32(count, "scale topk count")?],
+            "scale_topk_count",
+        )?;
+        trace_dispatch_path("scale_topk_scores_f32", count, 1, 0);
+        self.dispatch_1d(encoder, &self.scale_topk_scores_f32, count)
+    }
+
     pub(super) fn encode_weighted_sum_grouped_topk(
         &self,
         encoder: &ComputeCommandEncoderRef,

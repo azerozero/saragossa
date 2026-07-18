@@ -1,7 +1,7 @@
 //! Parsing des options de `saragossa serve`.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use super::error::{ServeError, ServeResult};
@@ -271,17 +271,7 @@ fn parse_positive_usize(
 }
 
 fn default_model_path(relative: &str) -> PathBuf {
-    let local = PathBuf::from(relative);
-    if local.is_dir() {
-        return local;
-    }
-    let repo_root = Path::new("/Users/ludwig/workspace/reti");
-    let fallback = repo_root.join(relative);
-    if fallback.is_dir() {
-        fallback
-    } else {
-        local
-    }
+    PathBuf::from(relative)
 }
 
 fn default_models() -> Vec<ServeModelConfig> {

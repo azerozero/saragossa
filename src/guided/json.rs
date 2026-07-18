@@ -1,4 +1,4 @@
-//! Automate JSON byte-level pour `response_format: json_object`.
+//! Automate JSON byte-level pour sorties structurées JSON.
 
 use std::sync::{Arc, Mutex};
 
@@ -53,7 +53,7 @@ struct TokenBytes {
     bytes: Vec<u8>,
 }
 
-/// Contrainte JSON `object` racine avec EOT autorisé seulement en état final.
+/// Contraint un ou plusieurs objets JSON racine complets.
 #[derive(Debug)]
 pub struct JsonTokenConstraint {
     catalog: Arc<JsonTokenCatalog>,
@@ -63,15 +63,18 @@ pub struct JsonTokenConstraint {
 
 impl JsonTokenConstraint {
     /// Crée une contrainte JSON pour une requête.
+    ///
+    /// `repeat=false` impose un seul objet racine (`json_object`). `repeat=true`
+    /// autorise une suite NDJSON saragossa (`json_lines`) séparée par `\n`.
     #[must_use]
-    pub fn new(catalog: Arc<JsonTokenCatalog>, eot_token_ids: &[usize]) -> Self {
+    pub fn new(catalog: Arc<JsonTokenCatalog>, eot_token_ids: &[usize], repeat: bool) -> Self {
         let mut eot_tokens = eot_token_ids.to_vec();
         eot_tokens.sort_unstable();
         eot_tokens.dedup();
         Self {
             catalog,
             eot_tokens,
-            state: Mutex::new(JsonAutomaton::new()),
+            state: Mutex::new(JsonAutomaton::new(repeat)),
         }
     }
 
@@ -158,18 +161,25 @@ impl TokenConstraint for JsonTokenConstraint {
 struct JsonAutomaton {
     mode: Mode,
     stack: Vec<Container>,
+    repeat: bool,
+    completed_root: bool,
 }
 
 impl JsonAutomaton {
-    fn new() -> Self {
+    fn new(repeat: bool) -> Self {
         Self {
             mode: Mode::BeforeRoot,
             stack: Vec::new(),
+            repeat,
+            completed_root: false,
         }
     }
 
     fn is_final(&self) -> bool {
-        self.mode == Mode::AfterRoot && self.stack.is_empty()
+        if self.mode == Mode::AfterRoot && self.stack.is_empty() {
+            return true;
+        }
+        self.repeat && self.completed_root && self.mode == Mode::BeforeRoot && self.stack.is_empty()
     }
 
     fn can_accept_bytes(&self, bytes: &[u8]) -> bool {
@@ -201,6 +211,9 @@ impl JsonAutomaton {
             match self.mode {
                 Mode::BeforeRoot => {
                     if is_ws(byte) {
+                        if self.repeat {
+                            return false;
+                        }
                         continue;
                     }
                     if byte == b'{' {
@@ -210,6 +223,13 @@ impl JsonAutomaton {
                     return false;
                 }
                 Mode::AfterRoot => {
+                    if self.repeat {
+                        if byte == b'\n' {
+                            self.mode = Mode::BeforeRoot;
+                            continue;
+                        }
+                        return false;
+                    }
                     if is_ws(byte) {
                         continue;
                     }
@@ -498,7 +518,10 @@ impl JsonAutomaton {
         self.mode = match self.stack.last().copied() {
             Some(Container::Object) => Mode::ObjectCommaOrEnd,
             Some(Container::Array) => Mode::ArrayCommaOrEnd,
-            None => Mode::AfterRoot,
+            None => {
+                self.completed_root = true;
+                Mode::AfterRoot
+            }
         };
     }
 }
@@ -670,161 +693,5 @@ fn is_low_surrogate(value: u16) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const EOT: usize = 99;
-
-    #[test]
-    fn accepts_valid_root_objects() {
-        for json in [
-            br#"{}"#.as_slice(),
-            br#" { "a": 1, "b": [true, false, null] } "#.as_slice(),
-            br#"{"nested":{"n":1e-5,"x":-0.5}}"#.as_slice(),
-        ] {
-            let mut automaton = JsonAutomaton::new();
-            assert!(automaton.advance_bytes(json), "{json:?}");
-            assert!(automaton.is_final(), "{json:?}");
-            serde_json::from_slice::<serde_json::Value>(json).expect("invariant: cas JSON valide");
-        }
-    }
-
-    #[test]
-    fn rejects_non_object_root() {
-        let mut automaton = JsonAutomaton::new();
-
-        assert!(!automaton.advance_bytes(br#"[]"#));
-        assert!(!automaton.is_final());
-    }
-
-    #[test]
-    fn rejects_bad_numbers() {
-        for json in [
-            br#"{"n":01}"#.as_slice(),
-            br#"{"n":1.}"#.as_slice(),
-            br#"{"n":1e}"#.as_slice(),
-        ] {
-            let mut automaton = JsonAutomaton::new();
-            assert!(!automaton.advance_bytes(json), "{json:?}");
-        }
-    }
-
-    #[test]
-    fn accepts_escapes_and_unicode_sequences() {
-        let json = br#"{"s":"quote:\" slash:\\ newline:\n unicode:\u00e9"}"#;
-        let mut automaton = JsonAutomaton::new();
-
-        assert!(automaton.advance_bytes(json));
-        assert!(automaton.is_final());
-    }
-
-    #[test]
-    fn accepts_paired_surrogates_but_rejects_lone_ones() {
-        let paired = br#"{"s":"\uD83D\uDE00"}"#; // \uD83D\uDE00 en paire de surrogates
-        let mut automaton = JsonAutomaton::new();
-        assert!(automaton.advance_bytes(paired));
-        assert!(automaton.is_final());
-        serde_json::from_slice::<serde_json::Value>(paired)
-            .expect("invariant: paire de surrogates valide");
-
-        for json in [
-            br#"{"s":"\uD800"}"#.as_slice(),  // surrogate haut isolé
-            br#"{"s":"\uDC00"}"#.as_slice(),  // surrogate bas isolé
-            br#"{"s":"\uD83DA"}"#.as_slice(), // haut + \u non-bas
-            br#"{"s":"\uD800A"}"#.as_slice(), // haut non complété par \u
-        ] {
-            let mut automaton = JsonAutomaton::new();
-            assert!(!automaton.advance_bytes(json), "{json:?}");
-            assert!(
-                serde_json::from_slice::<serde_json::Value>(json).is_err(),
-                "oracle serde_json refuse aussi: {json:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_raw_newline_in_string_and_bad_escape() {
-        for json in [b"{\"s\":\"a\nb\"}".as_slice(), br#"{"s":"\x"}"#.as_slice()] {
-            let mut automaton = JsonAutomaton::new();
-            assert!(!automaton.advance_bytes(json), "{json:?}");
-        }
-    }
-
-    #[test]
-    fn accepts_utf8_bytes_split_across_tokens_inside_string() {
-        let mut automaton = JsonAutomaton::new();
-
-        assert!(automaton.advance_bytes(br#"{"s":""#));
-        assert!(automaton.advance_bytes(&[0xC3]));
-        assert!(automaton.advance_bytes(&[0xA9]));
-        assert!(automaton.advance_bytes(br#""}"#));
-
-        assert!(automaton.is_final());
-    }
-
-    #[test]
-    fn eot_is_allowed_only_after_root_object_closed() {
-        let catalog = Arc::new(JsonTokenCatalog::from_token_bytes_for_tests(&[
-            b"{", b"}", b"\"a\"", b":", b"1",
-        ]));
-        let constraint = JsonTokenConstraint::new(catalog, &[EOT]);
-        let mut logits = vec![0.0; 100];
-
-        constraint
-            .mask_logits(&mut logits)
-            .expect("invariant: début contraignable");
-        assert!(logits[EOT].is_infinite() && logits[EOT].is_sign_negative());
-
-        for token in [0, 2, 3, 4, 1] {
-            constraint
-                .accept_token(token)
-                .expect("invariant: token test admissible");
-        }
-        let mut logits = vec![0.0; 100];
-        constraint
-            .mask_logits(&mut logits)
-            .expect("invariant: état final contraignable");
-        assert!(logits[EOT].is_finite());
-        assert!(constraint.is_finished());
-    }
-
-    #[test]
-    fn eot_lookup_accepts_only_configured_ids() {
-        let catalog = Arc::new(JsonTokenCatalog::from_token_bytes_for_tests(&[b"{}"]));
-        let constraint = JsonTokenConstraint::new(catalog, &[42, 7, 42]);
-
-        assert!(constraint.is_eot(7));
-        assert!(constraint.is_eot(42));
-        assert!(!constraint.is_eot(0));
-        assert!(!constraint.is_eot(41));
-    }
-
-    #[test]
-    fn mask_rejects_tokens_that_break_the_prefix() {
-        let catalog = Arc::new(JsonTokenCatalog::from_token_bytes_for_tests(&[
-            b"{", b"[", b"\"a\"", b":", b"true", b"}",
-        ]));
-        let constraint = JsonTokenConstraint::new(catalog, &[EOT]);
-        let mut logits = vec![0.0; 100];
-
-        constraint
-            .mask_logits(&mut logits)
-            .expect("invariant: début contraignable");
-
-        assert!(logits[0].is_finite());
-        assert!(logits[1].is_infinite() && logits[1].is_sign_negative());
-    }
-
-    #[test]
-    fn reports_empty_candidate_set() {
-        let catalog = Arc::new(JsonTokenCatalog::from_token_bytes_for_tests(&[b"[", b"]"]));
-        let constraint = JsonTokenConstraint::new(catalog, &[]);
-        let mut logits = vec![0.0; 2];
-
-        let error = constraint
-            .mask_logits(&mut logits)
-            .expect_err("invariant: aucun token ne peut ouvrir l'objet racine");
-
-        assert!(error.to_string().contains("aucun token admissible"));
-    }
-}
+#[path = "json_tests.rs"]
+mod tests;

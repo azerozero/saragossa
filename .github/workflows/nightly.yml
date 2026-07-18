@@ -1,0 +1,46 @@
+name: Nightly Toolchain Check
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+
+jobs:
+  check:
+    name: ${{ matrix.toolchain }} / macOS Metal
+    runs-on: macos-15
+    continue-on-error: ${{ matrix.toolchain == 'nightly' }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [beta, nightly]
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-${{ matrix.toolchain }}-macos
+          save-if: true
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+      - name: Tests
+        run: cargo test --lib --bins --all-features
+      - name: Documentation tests
+        run: cargo test --doc --all-features

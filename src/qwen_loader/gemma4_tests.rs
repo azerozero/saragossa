@@ -176,24 +176,190 @@ fn gemma4_moe_greedy_tokens_match_cpu_and_gpu() {
     let catalog = catalog_for(tmp.path());
     let cpu = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
         .expect("invariant: modèle CPU chargeable");
-    let gpu = match load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
-        .expect("invariant: modèle GPU chargeable")
-        .with_metal_runtime()
-    {
+    let load_gpu = || {
+        load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+            .expect("invariant: modèle GPU chargeable")
+            .with_metal_runtime()
+    };
+    let gpu_per_op = match load_gpu() {
         Ok(model) => model,
         Err(InferError::Metal(message)) if message.contains("aucun device") => return,
         Err(error) => panic!("runtime Metal indisponible: {error:?}"),
     };
+    let gpu_resident = load_gpu().expect("invariant: second runtime Metal disponible");
+    assert!(gpu_per_op.supports_resident_full_decode());
+    assert!(gpu_resident.supports_resident_full_decode());
 
     let options = GenerationOptions::default();
     let prompt = [0_usize, 1];
     let cpu_tokens = cpu
         .generate_greedy_cached_with_options(&prompt, 4, &options)
         .expect("invariant: greedy CPU valide");
-    let gpu_tokens = gpu
-        .generate_greedy_cached_with_options(&prompt, 4, &options)
-        .expect("invariant: greedy GPU valide");
-    assert_eq!(gpu_tokens, cpu_tokens);
+    let (per_op_cache, per_op_state) = {
+        let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(false);
+        assert!(gpu_per_op
+            .prefill_cache_state_metal_resident_for_test(&prompt)
+            .expect("invariant: gate per-op interrogeable")
+            .is_none());
+        gpu_per_op
+            .prefill_cache_state_batched_for_test(&prompt)
+            .expect("invariant: prefill GPU per-op valide")
+    };
+    let (resident_cache, resident_state) = {
+        let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(true);
+        gpu_resident
+            .prefill_cache_state_metal_resident_for_test(&prompt)
+            .expect("invariant: prefill résident Gemma 4 valide")
+            .expect("invariant: le gate Gemma 4 atteint le prefill résident")
+    };
+    let diagnostics = compare_prefill_paths(
+        &gpu_per_op,
+        &per_op_cache,
+        &per_op_state,
+        &resident_cache,
+        &resident_state,
+    );
+    let per_op_tokens = gpu_per_op
+        .generate_greedy_timed_from_prompt_state_with_options(
+            crate::CausalDecoderPromptState::new(per_op_cache, per_op_state),
+            std::time::Duration::ZERO,
+            4,
+            &options,
+        )
+        .expect("invariant: greedy GPU per-op valide")
+        .tokens;
+    let resident_tokens = gpu_resident
+        .generate_greedy_timed_from_prompt_state_with_options(
+            crate::CausalDecoderPromptState::new(resident_cache, resident_state),
+            std::time::Duration::ZERO,
+            4,
+            &options,
+        )
+        .expect("invariant: greedy GPU résident valide")
+        .tokens;
+    assert_eq!(per_op_tokens, cpu_tokens);
+    assert_eq!(resident_tokens, cpu_tokens, "{diagnostics}");
+    assert_eq!(resident_tokens, per_op_tokens, "{diagnostics}");
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn compare_prefill_paths(
+    decoder: &crate::CausalDecoder,
+    per_op_cache: &crate::CausalDecoderCache,
+    per_op_state: &crate::Tensor,
+    resident_cache: &crate::CausalDecoderCache,
+    resident_state: &crate::Tensor,
+) -> String {
+    let mut first_gross = None;
+    let mut largest = (0_usize, "none", 0.0_f32);
+    for layer in 0..per_op_cache.layer_count() {
+        let Some((per_key, per_value, per_dim)) = per_op_cache.layer_kv_for_test(layer) else {
+            continue;
+        };
+        let Some((resident_key, resident_value, resident_dim)) =
+            resident_cache.layer_kv_for_test(layer)
+        else {
+            continue;
+        };
+        if per_dim != resident_dim
+            || per_key.len() != resident_key.len()
+            || per_value.len() != resident_value.len()
+        {
+            return format!(
+                "prefill A/B forme KV divergente couche {layer}: per-op dim={per_dim:?} K={} V={}, résident dim={resident_dim:?} K={} V={}",
+                per_key.len(),
+                per_value.len(),
+                resident_key.len(),
+                resident_value.len()
+            );
+        }
+        let k_delta = max_abs_delta(per_key, resident_key);
+        let v_delta = max_abs_delta(per_value, resident_value);
+        for (kind, delta) in [("K", k_delta), ("V", v_delta)] {
+            if delta > largest.2 {
+                largest = (layer, kind, delta);
+            }
+            if first_gross.is_none() && delta > 1.0e-2 {
+                first_gross = Some((layer, kind, delta));
+            }
+        }
+    }
+    let state_delta = max_abs_delta(per_op_state.data(), resident_state.data());
+    let logits = decoder
+        .logits_from_final_state(per_op_state)
+        .and_then(|per_op| {
+            decoder
+                .logits_from_final_state(resident_state)
+                .map(|resident| max_abs_delta(per_op.data(), resident.data()))
+        })
+        .map_or_else(|error| format!("erreur={error}"), |delta| delta.to_string());
+    format!(
+        "prefill A/B première divergence grossière={first_gross:?}; max KV=couche {} {} {}; final_state max={state_delta}; logits max={logits}",
+        largest.0, largest.1, largest.2
+    )
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn max_abs_delta(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0_f32, f32::max)
+}
+
+#[test]
+#[ignore = "requiert le snapshot HF local gemma-4-26b-a4b-it-4bit"]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn gemma4_resident_prefill_tokens_match_per_op() {
+    let Some(model_dir) = real_gemma4_snapshot() else {
+        eprintln!("snapshot Gemma 4 réel absent, test ignoré proprement");
+        return;
+    };
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets Gemma 4 lisibles");
+    let decoder = load_causal_decoder(&assets)
+        .expect("invariant: Gemma 4 réel chargeable")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal disponible");
+    let prompt = render_gemma4_chat(
+        &[ChatTemplateMessage::new(
+            "user",
+            "Explique en français, en deux phrases, pourquoi le ciel est bleu.",
+        )],
+        true,
+        false,
+    );
+    let prompt_ids = assets
+        .encode_prompt(&prompt)
+        .expect("invariant: prompt Gemma 4 encodable")
+        .into_iter()
+        .map(|id| usize::try_from(id).expect("invariant: id tokenizer représentable"))
+        .collect::<Vec<_>>();
+    let options = GenerationOptions {
+        stop_token_ids: assets.stop_token_ids(),
+        ..GenerationOptions::default()
+    };
+    let generate = |resident: bool| {
+        let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(resident);
+        decoder
+            .generate_greedy_timed_with_options(&prompt_ids, 32, &options)
+            .expect("invariant: génération Gemma 4 valide")
+            .tokens
+    };
+    let per_op = generate(false);
+    let resident = generate(true);
+    let first_div = per_op
+        .iter()
+        .zip(&resident)
+        .position(|(left, right)| left != right);
+    eprintln!(
+        "TOKENS per_op.len={} resident.len={} first_div={first_div:?}",
+        per_op.len(),
+        resident.len()
+    );
+    assert_eq!(
+        per_op, resident,
+        "les tokens du prefill résident Gemma 4 doivent égaler le chemin per-op"
+    );
 }
 
 #[test]
@@ -298,24 +464,44 @@ fn assert_all_decoder_keys_mapped(config: &ModelConfig, catalog: &WeightCatalog)
         .map(|spec| spec.source.as_str())
         .collect::<HashSet<_>>();
     for key in catalog.keys() {
+        // NOTE: les sidecars affines .scales/.biases sont consommés indirectement par
+        // le loader via leur poids .weight frère (cf. quantized_tensor_from_entry) ; ils
+        // n'apparaissent donc pas comme source de spec mais restent bien mappés.
+        if let Some(base) = key
+            .strip_suffix(".scales")
+            .or_else(|| key.strip_suffix(".biases"))
+        {
+            let weight_key = format!("{base}.weight");
+            assert!(
+                sources.contains(weight_key.as_str()),
+                "sidecar quantifié orphelin: {key}"
+            );
+            continue;
+        }
         assert!(sources.contains(key.as_str()), "clé non mappée: {key}");
     }
 }
 
+/// Renvoie le hub HF local (`$HOME/.cache/huggingface/hub`) sans chemin en dur.
+fn hf_hub() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache/huggingface/hub"))
+}
+
 fn real_gemma4_snapshot() -> Option<PathBuf> {
-    let path = PathBuf::from(
-        "/Users/ludwig/.cache/huggingface/hub/models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/efbeee6e582ebfd06abc9d65e90839c4b5d2116b",
+    let path = hf_hub()?.join(
+        "models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/efbeee6e582ebfd06abc9d65e90839c4b5d2116b",
     );
     path.is_dir().then_some(path)
 }
 
 fn real_gemma4_unified_snapshot() -> Option<PathBuf> {
+    let hub = hf_hub()?;
     [
-        "/Users/ludwig/.cache/huggingface/hub/models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-8bit/snapshots",
-        "/Users/ludwig/.cache/huggingface/hub/models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-4bit/snapshots",
+        "models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-8bit/snapshots",
+        "models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-4bit/snapshots",
     ]
     .into_iter()
-    .find_map(first_snapshot_dir)
+    .find_map(|rel| first_snapshot_dir(hub.join(rel).to_str()?))
 }
 
 fn first_snapshot_dir(path: &str) -> Option<PathBuf> {

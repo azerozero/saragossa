@@ -23,6 +23,16 @@ pub(super) fn gemma4_moe_config() -> ModelConfig {
     config.num_experts_per_tok = Some(1);
     config.top_k_experts = Some(1);
     config.moe_intermediate_size = Some(INTERMEDIATE);
+    // NOTE: le prefill résident MoE n'accepte que des experts affines quantifiés
+    // (StackedAffineBuffers) ; sans quantification le gate retombe sur le per-op et
+    // le test ne couvre jamais le chemin résident. group_size=cols → un groupe/ligne.
+    config.quantization = Some(QuantConfig {
+        group_size: Some(HIDDEN),
+        bits: Some(8),
+        quant_method: Some("mx".to_string()),
+        fmt: None,
+        extra: std::collections::HashMap::new(),
+    });
     config
 }
 
@@ -177,7 +187,7 @@ fn gemma4_dense_mlp_layer(layer: usize) -> Vec<(String, TensorFixture)> {
 }
 
 fn gemma4_parallel_moe_layer(layer: usize) -> Vec<(String, TensorFixture)> {
-    vec![
+    let mut tensors = vec![
         (
             format!("{PREFIX}layers.{layer}.pre_feedforward_layernorm_2.weight"),
             TensorFixture::ones(vec![HIDDEN]),
@@ -205,19 +215,29 @@ fn gemma4_parallel_moe_layer(layer: usize) -> Vec<(String, TensorFixture)> {
             format!("{PREFIX}layers.{layer}.router.per_expert_scale"),
             TensorFixture::ones(vec![EXPERTS]),
         ),
-        (
-            format!("{PREFIX}layers.{layer}.experts.switch_glu.gate_proj.weight"),
-            expert_projection(EXPERTS, INTERMEDIATE, HIDDEN, 0.8),
-        ),
-        (
-            format!("{PREFIX}layers.{layer}.experts.switch_glu.up_proj.weight"),
-            expert_projection(EXPERTS, INTERMEDIATE, HIDDEN, 0.9),
-        ),
-        (
-            format!("{PREFIX}layers.{layer}.experts.switch_glu.down_proj.weight"),
-            expert_projection(EXPERTS, HIDDEN, INTERMEDIATE, 0.6),
-        ),
-    ]
+    ];
+    tensors.extend(quantized_diagonal_experts(
+        &format!("{PREFIX}layers.{layer}.experts.switch_glu.gate_proj"),
+        EXPERTS,
+        INTERMEDIATE,
+        HIDDEN,
+        0.8,
+    ));
+    tensors.extend(quantized_diagonal_experts(
+        &format!("{PREFIX}layers.{layer}.experts.switch_glu.up_proj"),
+        EXPERTS,
+        INTERMEDIATE,
+        HIDDEN,
+        0.9,
+    ));
+    tensors.extend(quantized_diagonal_experts(
+        &format!("{PREFIX}layers.{layer}.experts.switch_glu.down_proj"),
+        EXPERTS,
+        HIDDEN,
+        INTERMEDIATE,
+        0.6,
+    ));
+    tensors
 }
 
 fn projection(rows: usize, cols: usize, scale: f32) -> TensorFixture {
@@ -227,24 +247,50 @@ fn projection(rows: usize, cols: usize, scale: f32) -> TensorFixture {
     TensorFixture::f32(vec![rows, cols], values)
 }
 
-fn expert_projection(experts: usize, rows: usize, cols: usize, scale: f32) -> TensorFixture {
-    let values = (0..experts)
-        .flat_map(|expert| {
-            let expert_scale = scale * (expert as f32 + 1.0);
-            (0..rows).flat_map(move |row| {
-                (0..cols).map(
-                    move |col| {
-                        if row % cols == col {
-                            expert_scale
-                        } else {
-                            0.0
-                        }
-                    },
-                )
-            })
-        })
-        .collect();
-    TensorFixture::f32(vec![experts, rows, cols], values)
+/// Émet les trois tenseurs (poids u32 empaqueté, scales, biases) d'une projection
+/// experte diagonale quantifiée 8 bits sans perte.
+///
+/// Chaque expert est diagonal (`row % cols == col`) de valeur `scale·(expert+1)`.
+/// On encode la diagonale au niveau 1 avec `scale = valeur` et `bias = 0`, si bien
+/// que la déquantification affine `q·scale + bias` reproduit la valeur exacte : le
+/// résident (gather-qmv), le per-op et le CPU partent donc de poids bit-identiques.
+fn quantized_diagonal_experts(
+    prefix: &str,
+    experts: usize,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+) -> Vec<(String, TensorFixture)> {
+    assert!(
+        cols <= 4,
+        "fixture experte: cols>4 déborderait un lane u32 8 bits"
+    );
+    let mut packed = Vec::with_capacity(experts * rows);
+    let mut scales = Vec::with_capacity(experts * rows);
+    for expert in 0..experts {
+        let expert_scale = scale * (expert as f32 + 1.0);
+        for row in 0..rows {
+            let diagonal = row % cols;
+            let lanes: Vec<u32> = (0..cols).map(|col| u32::from(col == diagonal)).collect();
+            packed.push(super::test_fixtures::pack_lanes(&lanes, 8));
+            scales.push(expert_scale);
+        }
+    }
+    let biases = vec![0.0; experts * rows];
+    vec![
+        (
+            format!("{prefix}.weight"),
+            TensorFixture::u32(vec![experts, rows, 1], packed),
+        ),
+        (
+            format!("{prefix}.scales"),
+            TensorFixture::f32(vec![experts, rows, 1], scales),
+        ),
+        (
+            format!("{prefix}.biases"),
+            TensorFixture::f32(vec![experts, rows, 1], biases),
+        ),
+    ]
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +312,14 @@ impl TensorFixture {
     fn ones(shape: Vec<usize>) -> Self {
         let len = shape.iter().product();
         Self::f32(shape, vec![1.0; len])
+    }
+
+    fn u32(shape: Vec<usize>, values: Vec<u32>) -> Self {
+        Self {
+            dtype: Dtype::U32,
+            shape,
+            data: values.into_iter().flat_map(u32::to_le_bytes).collect(),
+        }
     }
 }
 

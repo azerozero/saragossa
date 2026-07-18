@@ -1,0 +1,34 @@
+[advisories]
+version = 2
+# Dépendance transitive de metal/tokenizers, sans correctif amont. L'advisory
+# signale un abandon de maintenance, pas une vulnérabilité exploitable.
+ignore = ["RUSTSEC-2024-0436"]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

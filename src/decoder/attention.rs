@@ -174,9 +174,8 @@ impl DecoderLayer {
     /// shared-expert/router biasless est re-vérifié à l'encodage (`ensure_biasless`).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn supports_resident_full(&self) -> bool {
-        // Gemma (double norme FFN + GeGLU + embed scale) sort du périmètre des
-        // kernels résidents : forcer le chemin générique pour rester correct.
-        if self.pre_feedforward_norm.is_some() {
+        // Le tail Gemma résident exige la paire de normes FFN complète.
+        if self.pre_feedforward_norm.is_some() != self.post_feedforward_norm.is_some() {
             return false;
         }
         let Some(mlp) = self.mlp.as_ref() else {
@@ -186,6 +185,9 @@ impl DecoderLayer {
             return false;
         }
         let mlp_supported = match mlp {
+            FeedForward::Moe(mlp) if self.pre_feedforward_norm.is_some() => {
+                mlp.shared_metal_parts().is_none() && mlp.metal_parts().is_some()
+            }
             FeedForward::Moe(mlp) => {
                 mlp.shared_metal_parts().is_some() || mlp.metal_parts().is_some()
             }
@@ -201,10 +203,7 @@ impl DecoderLayer {
             AttentionBlock::Full(attention) => {
                 attention.q_proj.bias().is_none()
                     && attention.k_proj.bias().is_none()
-                    && attention
-                        .v_proj
-                        .as_ref()
-                        .is_some_and(|v_proj| v_proj.bias().is_none())
+                    && attention.resident_v_proj().bias().is_none()
                     && attention.o_proj.bias().is_none()
                     && attention.q_norm.is_some()
                     && attention.k_norm.is_some()
@@ -218,84 +217,161 @@ impl DecoderLayer {
     pub(super) fn prefill_moe_layer(
         &self,
         config: &CausalDecoderConfig,
+        base_spec: crate::metal_backend::PrefillAttentionSpec,
     ) -> Option<crate::metal_backend::PrefillMoeLayer<'_>> {
         let post_norm = self.post_attention_norm.as_ref()?;
-        let tail = match self.mlp.as_ref()? {
-            FeedForward::Dense(mlp) => {
-                if !prefill_dense_resident_enabled() {
+        let tail = if config.is_gemma4 {
+            let dense = match self.mlp.as_ref()? {
+                FeedForward::Dense(dense) => dense,
+                FeedForward::Moe(_) => return None,
+            };
+            let (dense_gate_proj, dense_up_proj, dense_down_proj) = dense.projections();
+            let dense_inter_dim = dense_gate_proj.weight().shape().first().copied()?;
+            let pre_feedforward_norm = self.pre_feedforward_norm.as_ref()?;
+            let post_feedforward_norm = self.post_feedforward_norm.as_ref()?;
+            if config.parallel_moe {
+                let parallel_moe = self.parallel_moe.as_ref()?;
+                let FeedForward::Moe(parallel_moe) = parallel_moe else {
                     return None;
+                };
+                let parts = parallel_moe.gemma4_metal_parts()?;
+                crate::metal_backend::PrefillMoeTail::GemmaParallel {
+                    dense_gate_proj,
+                    dense_up_proj,
+                    dense_down_proj,
+                    pre_feedforward_norm,
+                    post_feedforward_norm_1: self.post_feedforward_norm_1.as_ref()?,
+                    router: parts.router,
+                    experts: parts.experts,
+                    top_k: parts.top_k,
+                    router_norm: parts.router_norm,
+                    per_expert_scale: parts.per_expert_scale,
+                    pre_feedforward_norm_2: self.pre_feedforward_norm_2.as_ref()?,
+                    post_feedforward_norm_2: self.post_feedforward_norm_2.as_ref()?,
+                    post_feedforward_norm,
+                    layer_scalar: self.layer_scalar.as_ref(),
+                    dense_inter_dim,
                 }
-                let (gate_proj, up_proj, down_proj) = mlp.projections();
-                crate::metal_backend::PrefillMoeTail::Dense {
-                    gate_proj,
-                    up_proj,
-                    down_proj,
+            } else {
+                crate::metal_backend::PrefillMoeTail::GemmaDense {
+                    gate_proj: dense_gate_proj,
+                    up_proj: dense_up_proj,
+                    down_proj: dense_down_proj,
+                    pre_feedforward_norm,
+                    post_feedforward_norm,
+                    layer_scalar: self.layer_scalar.as_ref(),
+                    inter_dim: dense_inter_dim,
                 }
             }
-            FeedForward::Moe(mlp) => {
-                if let Some((router, experts, top_k, shared_expert, shared_gate)) =
-                    mlp.shared_metal_parts()
-                {
-                    crate::metal_backend::PrefillMoeTail::Shared {
-                        router,
-                        experts,
-                        top_k,
-                        shared_expert,
-                        shared_gate,
+        } else {
+            match self.mlp.as_ref()? {
+                FeedForward::Dense(mlp) => {
+                    if !prefill_dense_resident_enabled() {
+                        return None;
                     }
-                } else {
-                    let (router, experts, top_k) = mlp.metal_parts()?;
-                    crate::metal_backend::PrefillMoeTail::Routed {
-                        router,
-                        experts,
-                        top_k,
+                    let (gate_proj, up_proj, down_proj) = mlp.projections();
+                    crate::metal_backend::PrefillMoeTail::Dense {
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                    }
+                }
+                FeedForward::Moe(mlp) => {
+                    if let Some((router, experts, top_k, shared_expert, shared_gate)) =
+                        mlp.shared_metal_parts()
+                    {
+                        crate::metal_backend::PrefillMoeTail::Shared {
+                            router,
+                            experts,
+                            top_k,
+                            shared_expert,
+                            shared_gate,
+                        }
+                    } else {
+                        let (router, experts, top_k) = mlp.metal_parts()?;
+                        crate::metal_backend::PrefillMoeTail::Routed {
+                            router,
+                            experts,
+                            top_k,
+                        }
                     }
                 }
             }
         };
-        let prefill_attention = match &self.attention {
+        let (prefill_attention, attention_spec) = match &self.attention {
             AttentionBlock::Full(attention) => {
                 let q_norm = attention.q_norm.as_ref()?;
                 let k_norm = attention.k_norm.as_ref()?;
-                let v_proj = attention.v_proj.as_ref()?;
-                crate::metal_backend::PrefillAttentionLayer::Full {
-                    q_proj: &attention.q_proj,
-                    k_proj: &attention.k_proj,
-                    v_proj,
-                    o_proj: &attention.o_proj,
-                    q_norm,
-                    k_norm,
-                    gated: config.attn_output_gate,
-                }
+                let head_dim = attention.head_dim.or(config.head_dim)?;
+                let kv_heads = attention
+                    .num_key_value_heads
+                    .unwrap_or(config.num_key_value_heads);
+                let rope_dims = attention.rope_dims.or(config.rope_dims).unwrap_or(head_dim);
+                let rope_frequency_dim = attention.rope_frequency_dim.unwrap_or(rope_dims);
+                let rope_theta = attention.rope_theta.or(config.rope_theta)?;
+                (
+                    crate::metal_backend::PrefillAttentionLayer::Full {
+                        q_proj: &attention.q_proj,
+                        k_proj: &attention.k_proj,
+                        v_proj: attention.resident_v_proj(),
+                        o_proj: &attention.o_proj,
+                        q_norm,
+                        k_norm,
+                        gated: config.attn_output_gate,
+                    },
+                    crate::metal_backend::PrefillAttentionSpec {
+                        kv_heads,
+                        head_dim,
+                        rope_dims,
+                        rope_frequency_dim,
+                        rope_theta,
+                        // Le prefill Qwen historique scale toujours par head_dim ;
+                        // seul Gemma 4 active query_pre_attn_scalar dans ce spine.
+                        attn_scalar: if config.is_gemma4 {
+                            config.query_pre_attn_scalar.unwrap_or(head_dim as f32)
+                        } else {
+                            head_dim as f32
+                        },
+                        window: attention.sliding_window.filter(|window| *window > 0),
+                        k_eq_v: attention.v_proj.is_none(),
+                        value_norm: attention.value_norm,
+                        ..base_spec
+                    },
+                )
             }
             AttentionBlock::Linear(attention) => {
                 let la_config = config.linear_attention_config().ok()?;
                 let key_dim = la_config.key_dim().ok()?;
                 let value_dim = la_config.value_dim().ok()?;
                 let conv_dim = key_dim.checked_mul(2)?.checked_add(value_dim)?;
-                crate::metal_backend::PrefillAttentionLayer::Linear {
-                    weights: attention.resident_weights(),
-                    spec: crate::metal_backend::LinearAttentionStepSpec {
-                        num_key_heads: la_config.num_key_heads,
-                        num_value_heads: la_config.num_value_heads,
-                        key_head_dim: la_config.key_head_dim,
-                        value_head_dim: la_config.value_head_dim,
-                        conv_kernel_dim: la_config.conv_kernel_dim,
-                        rms_eps: la_config.rms_eps,
+                (
+                    crate::metal_backend::PrefillAttentionLayer::Linear {
+                        weights: attention.resident_weights(),
+                        spec: crate::metal_backend::LinearAttentionStepSpec {
+                            num_key_heads: la_config.num_key_heads,
+                            num_value_heads: la_config.num_value_heads,
+                            key_head_dim: la_config.key_head_dim,
+                            value_head_dim: la_config.value_head_dim,
+                            conv_kernel_dim: la_config.conv_kernel_dim,
+                            rms_eps: la_config.rms_eps,
+                        },
+                        dims: crate::metal_backend::LinearAttnResidentDims {
+                            in_dim: self.input_norm.len(),
+                            conv_dim,
+                            value_dim,
+                            key_dim,
+                        },
                     },
-                    dims: crate::metal_backend::LinearAttnResidentDims {
-                        in_dim: self.input_norm.len(),
-                        conv_dim,
-                        value_dim,
-                        key_dim,
-                    },
-                }
+                    base_spec,
+                )
             }
         };
         Some(crate::metal_backend::PrefillMoeLayer {
             input_norm: &self.input_norm,
             attention: prefill_attention,
+            attention_spec,
             post_norm,
+            post_norm_before_residual: self.pre_feedforward_norm.is_some(),
             tail,
         })
     }
@@ -361,7 +437,12 @@ impl DecoderLayer {
                         kv_heads: config.num_key_value_heads,
                         head_dim,
                         rope_dims: config.rope_dims.unwrap_or(head_dim),
+                        rope_frequency_dim: config.rope_dims.unwrap_or(head_dim),
                         rope_theta,
+                        attn_scalar: head_dim as f32,
+                        window: None,
+                        k_eq_v: false,
+                        value_norm: false,
                         eps: config.rms_eps,
                     };
                     match metal.full_attention_prefill_tail_moe(
@@ -452,7 +533,12 @@ impl DecoderLayer {
                             kv_heads: config.num_key_value_heads,
                             head_dim,
                             rope_dims: config.rope_dims.unwrap_or(head_dim),
+                            rope_frequency_dim: config.rope_dims.unwrap_or(head_dim),
                             rope_theta,
+                            attn_scalar: head_dim as f32,
+                            window: None,
+                            k_eq_v: false,
+                            value_norm: false,
                             eps: config.rms_eps,
                         };
                         match metal.full_attention_prefill_tail_moe_shared_gated(
@@ -622,5 +708,17 @@ impl DecoderLayer {
             tail_started.map(|started| started.elapsed()),
         );
         Ok(output)
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl FullAttention {
+    /// Renvoie la projection V effective du layout résident.
+    ///
+    /// Gemma 4 omet `v_proj` sur ses couches globales car K et V partagent les
+    /// mêmes poids. Le forward générique clone déjà K dans ce cas ; le setup
+    /// résident doit concaténer Q/K/K pour conserver exactement ce contrat.
+    pub(super) fn resident_v_proj(&self) -> &Linear {
+        self.v_proj.as_ref().unwrap_or(&self.k_proj)
     }
 }

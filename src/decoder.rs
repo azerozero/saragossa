@@ -30,6 +30,10 @@ use std::time::{Duration, Instant};
 mod attention;
 mod attention_cache;
 mod attention_ops;
+#[cfg(test)]
+pub(crate) use attention_ops::{
+    gemma_global_attention_prefill_oracle, GemmaGlobalAttentionOracleSpec,
+};
 mod duo;
 pub(crate) mod flags;
 mod generation;
@@ -544,6 +548,9 @@ struct ResidentFullMoeBuffers {
     q_norm: metal::Buffer,
     k_norm: metal::Buffer,
     post_norm: metal::Buffer,
+    pre_feedforward_norm: Option<metal::Buffer>,
+    post_feedforward_norm: Option<metal::Buffer>,
+    layer_scalar: Option<f32>,
     moe: MetalMoeSharedWeights,
     top_k: usize,
 }
@@ -557,6 +564,9 @@ struct ResidentFullRoutedBuffers {
     q_norm: metal::Buffer,
     k_norm: metal::Buffer,
     post_norm: metal::Buffer,
+    pre_feedforward_norm: Option<metal::Buffer>,
+    post_feedforward_norm: Option<metal::Buffer>,
+    layer_scalar: Option<f32>,
     moe: MetalMoeRoutedWeights,
     top_k: usize,
 }
@@ -583,6 +593,9 @@ struct ResidentFullDenseBuffers {
     q_norm: metal::Buffer,
     k_norm: metal::Buffer,
     post_norm: metal::Buffer,
+    pre_feedforward_norm: Option<metal::Buffer>,
+    post_feedforward_norm: Option<metal::Buffer>,
+    layer_scalar: Option<f32>,
     gate_proj: MetalLinearWeightBuffers,
     up_proj: MetalLinearWeightBuffers,
     down_proj: MetalLinearWeightBuffers,
@@ -660,6 +673,16 @@ impl CausalDecoderCache {
                     .saturating_add(layer.linear.estimated_cpu_bytes())
             })
             .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layer_kv_for_test(
+        &self,
+        layer_index: usize,
+    ) -> Option<(&[f32], &[f32], Option<usize>)> {
+        self.layers
+            .get(layer_index)
+            .map(|layer| (layer.keys.as_slice(), layer.values.as_slice(), layer.kv_dim))
     }
 }
 
@@ -793,6 +816,14 @@ impl CausalDecoderConfig {
         }
     }
 
+    fn is_resident_full_attention_layer(&self, layer_index: usize) -> bool {
+        if self.is_gemma4 {
+            self.is_gemma4_full_layer(layer_index) || self.is_gemma4_sliding_layer(layer_index)
+        } else {
+            self.is_full_attention_layer(layer_index)
+        }
+    }
+
     /// Indique si une couche est locale (sliding-window) dans le motif Gemma 3.
     ///
     /// Gemma 3 alterne couches locales et globales : une couche globale toutes
@@ -834,6 +865,39 @@ impl CausalDecoderConfig {
         } else {
             self.rope_dims.unwrap_or(head_dim)
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn resident_full_attention_kv_dim(&self, layer_index: usize) -> Result<usize> {
+        let head_dim = self.layer_head_dim(layer_index)?;
+        let kv_heads = self.layer_num_key_value_heads(layer_index);
+        kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| InferError::Dimension("kv_dim résident déborde".to_string()))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn resident_full_attn_layer_dims(
+        &self,
+        layer_index: usize,
+        hidden: usize,
+        position: usize,
+        eps: f32,
+        theta: f32,
+    ) -> Result<FullAttnLayerDims> {
+        let head_dim = self.layer_head_dim(layer_index)?;
+        Ok(FullAttnLayerDims {
+            hidden,
+            q_heads: self.num_attention_heads,
+            kv_heads: self.layer_num_key_value_heads(layer_index),
+            head_dim,
+            rope_dims: self.layer_rope_dims(layer_index, head_dim),
+            position,
+            window_start: 0,
+            eps,
+            theta,
+            attn_output_gate: self.attn_output_gate,
+        })
     }
 
     fn layer_rope_frequency_dim(&self, layer_index: usize, head_dim: usize) -> usize {
@@ -1074,6 +1138,13 @@ struct FullAttention {
 }
 
 impl CausalDecoder {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn has_resident_linear_attention_layer(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| matches!(&layer.attention, AttentionBlock::Linear(_)))
+    }
+
     /// Charge un décodeur depuis un fichier safetensors.
     ///
     /// # Errors

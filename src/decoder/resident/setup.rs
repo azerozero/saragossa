@@ -1,5 +1,42 @@
 use super::super::*;
 use super::types::*;
+use crate::MetalExecutor;
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+type GemmaTailBuffers = (Option<metal::Buffer>, Option<metal::Buffer>, Option<f32>);
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn resolve_gemma_tail_buffers(
+    metal: &MetalExecutor,
+    layer: &DecoderLayer,
+) -> Result<GemmaTailBuffers> {
+    let Some(pre_norm) = layer.pre_feedforward_norm.as_ref() else {
+        return Ok((None, None, None));
+    };
+    let post_norm = layer
+        .post_feedforward_norm
+        .as_ref()
+        .ok_or_else(|| InferError::Config("post_feedforward_norm Gemma absent".to_string()))?;
+    let layer_scalar = layer
+        .layer_scalar
+        .as_ref()
+        .map(|scalar| {
+            scalar
+                .data()
+                .first()
+                .copied()
+                .ok_or_else(|| InferError::Dimension("layer_scalar Gemma4 vide".to_string()))
+        })
+        .transpose()?;
+    Ok((
+        Some(metal.cached_buffer_from_f32(pre_norm.data(), "resident_gemma_pre_feedforward_norm")?),
+        Some(
+            metal
+                .cached_buffer_from_f32(post_norm.data(), "resident_gemma_post_feedforward_norm")?,
+        ),
+        layer_scalar,
+    ))
+}
 
 impl CausalDecoder {
     /// Renvoie `true` si le decode résident COMPLET (1c) est applicable : un
@@ -11,7 +48,7 @@ impl CausalDecoder {
     /// tout-ou-rien — soit le command buffer unique est entièrement GPU, soit on
     /// retombe sur le per-op AVANT de commencer, jamais un readback CPU au milieu.
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub(in crate::decoder) fn supports_resident_full_decode(&self) -> bool {
+    pub(crate) fn supports_resident_full_decode(&self) -> bool {
         let unsupported = self.resident_full_decode_unsupported_reason();
         if let Some(reason) = unsupported.as_ref() {
             if crate::decoder::flags::trace_resident_enabled() {
@@ -30,12 +67,23 @@ impl CausalDecoder {
         if self.config.head_dim.is_none() {
             return Some("head_dim absent".to_string());
         }
-        let q_heads = self.config.num_attention_heads;
-        let kv_heads = self.config.num_key_value_heads;
-        if q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
-            return Some(format!(
-                "GQA invalide q_heads={q_heads} kv_heads={kv_heads}"
-            ));
+        if self.config.num_attention_heads == 0 {
+            return Some("num_attention_heads nul".to_string());
+        }
+        for index in 0..self.layers.len() {
+            if !self.config.is_resident_full_attention_layer(index) {
+                continue;
+            }
+            let Ok(head_dim) = self.config.layer_head_dim(index) else {
+                return Some(format!("couche {index}: head_dim absent"));
+            };
+            let kv_heads = self.config.layer_num_key_value_heads(index);
+            if head_dim == 0 || kv_heads == 0 || self.config.num_attention_heads % kv_heads != 0 {
+                return Some(format!(
+                    "couche {index}: GQA invalide q_heads={} kv_heads={kv_heads} head_dim={head_dim}",
+                    self.config.num_attention_heads
+                ));
+            }
         }
         if self.lm_head.bias().is_some() {
             return Some("lm_head biaisé".to_string());
@@ -60,13 +108,7 @@ impl CausalDecoder {
         if self.config.rope_position_scale.is_some() {
             return Some("rope_position_scale présent".to_string());
         }
-        if !decode_resident_full_linear_enabled()
-            && self
-                .layers
-                .iter()
-                .enumerate()
-                .any(|(index, _)| !self.config.is_full_attention_layer(index))
-        {
+        if !decode_resident_full_linear_enabled() && self.has_resident_linear_attention_layer() {
             return Some(
                 "couches linear-attn en decode résident full désactivées \
                  (RETI_RUST_DECODE_RESIDENT_FULL_LINEAR=0)"
@@ -103,15 +145,10 @@ impl CausalDecoder {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(());
         };
-        let Some(head_dim) = self.config.head_dim else {
-            return Ok(());
-        };
         let q_heads = self.config.num_attention_heads;
-        let kv_heads = self.config.num_key_value_heads;
-        if q_heads == 0 || kv_heads == 0 || head_dim == 0 || q_heads % kv_heads != 0 {
+        if q_heads == 0 {
             return Ok(());
         }
-        let kv_dim = kv_heads * head_dim;
         let prefill_len = cache.position;
         let capacity = prefill_len
             .checked_add(max_new_tokens)
@@ -121,9 +158,17 @@ impl CausalDecoder {
         }
         let arena = DecodeResidentState::new(metal.device().clone())?;
         for (index, layer_cache) in cache.layers.iter_mut().enumerate() {
-            if !self.config.is_full_attention_layer(index) {
+            if !self.config.is_resident_full_attention_layer(index) {
                 continue;
             }
+            let head_dim = self.config.layer_head_dim(index)?;
+            let kv_heads = self.config.layer_num_key_value_heads(index);
+            if head_dim == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
+                continue;
+            }
+            let kv_dim = kv_heads.checked_mul(head_dim).ok_or_else(|| {
+                InferError::Dimension("kv_dim résident full-attn déborde".to_string())
+            })?;
             // Seed depuis le K/V (rope'd) du prefill ; si absent/incohérent, la
             // couche reste sur le chemin CPU (oracle), pas d'erreur.
             if layer_cache.keys.len() != prefill_len * kv_dim
@@ -175,19 +220,18 @@ impl CausalDecoder {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(false);
         };
-        let Some(head_dim) = self.config.head_dim else {
+        let Some(base_head_dim) = self.config.head_dim else {
             return Ok(false);
         };
         let q_heads = self.config.num_attention_heads;
-        let kv_heads = self.config.num_key_value_heads;
-        if q_heads == 0 || kv_heads == 0 || head_dim == 0 || q_heads % kv_heads != 0 {
+        let base_kv_heads = self.config.num_key_value_heads;
+        if q_heads == 0 || base_kv_heads == 0 || base_head_dim == 0 {
             return Ok(false);
         }
         let hidden = self.final_norm.data().len();
         if hidden == 0 {
             return Ok(false);
         }
-        let kv_dim = kv_heads * head_dim;
         let prefill_len = cache.position;
         let capacity = prefill_len
             .checked_add(max_new_tokens)
@@ -198,7 +242,15 @@ impl CausalDecoder {
         // Validation AVANT toute mutation (tout-ou-rien) : KV full-attn seedable et
         // état conv/ssm linear-attn présent (peuplé par le prefill résident per-op).
         for (index, layer_cache) in cache.layers.iter().enumerate() {
-            if self.config.is_full_attention_layer(index) {
+            if self.config.is_resident_full_attention_layer(index) {
+                let head_dim = self.config.layer_head_dim(index)?;
+                let kv_heads = self.config.layer_num_key_value_heads(index);
+                if head_dim == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
+                    return Ok(false);
+                }
+                let kv_dim = kv_heads.checked_mul(head_dim).ok_or_else(|| {
+                    InferError::Dimension("kv_dim résident full-attn déborde".to_string())
+                })?;
                 if layer_cache.keys.len() != prefill_len * kv_dim
                     || layer_cache.values.len() != prefill_len * kv_dim
                 {
@@ -225,13 +277,9 @@ impl CausalDecoder {
         // (empreinte plus basse) au lieu d'échouer la génération — même patron
         // de repli que les early-returns voisins. C'est l'esprit de la garde :
         // continuer avec moins de mémoire, jamais geler ni casser le tour.
-        if let Err(error) = self.check_resident_full_decode_allocation(
-            capacity,
-            kv_heads,
-            head_dim,
-            hidden,
-            max_new_tokens,
-        ) {
+        if let Err(error) =
+            self.check_resident_full_decode_allocation(capacity, hidden, max_new_tokens)
+        {
             if crate::decoder::flags::trace_resident_enabled() {
                 eprintln!("decode résident full setup désactivé: budget mémoire ({error})");
             }
@@ -239,7 +287,7 @@ impl CausalDecoder {
         }
         let mut layer_buffers = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
-            if self.config.is_full_attention_layer(index) {
+            if self.config.is_resident_full_attention_layer(index) {
                 let AttentionBlock::Full(attention) = &layer.attention else {
                     return Ok(false);
                 };
@@ -248,14 +296,14 @@ impl CausalDecoder {
                 else {
                     return Ok(false);
                 };
-                let Some(v_proj) = attention.v_proj.as_ref() else {
-                    return Ok(false);
-                };
+                let v_proj = attention.resident_v_proj();
                 let Some(post_norm) = layer.post_attention_norm.as_ref() else {
                     return Ok(false);
                 };
                 match layer.mlp.as_ref() {
                     Some(FeedForward::Moe(mlp)) => {
+                        let (pre_feedforward_norm, post_feedforward_norm, layer_scalar) =
+                            resolve_gemma_tail_buffers(metal, layer)?;
                         let input_norm = metal.cached_buffer_from_f32(
                             layer.input_norm.data(),
                             "resident_full_input_norm",
@@ -309,6 +357,9 @@ impl CausalDecoder {
                                     q_norm,
                                     k_norm,
                                     post_norm,
+                                    pre_feedforward_norm,
+                                    post_feedforward_norm,
+                                    layer_scalar,
                                     moe: metal.resolve_moe_shared_weights(
                                         router,
                                         experts,
@@ -330,6 +381,9 @@ impl CausalDecoder {
                                     q_norm,
                                     k_norm,
                                     post_norm,
+                                    pre_feedforward_norm,
+                                    post_feedforward_norm,
+                                    layer_scalar,
                                     moe: metal.resolve_moe_routed_weights(router, experts)?,
                                     top_k,
                                 },
@@ -339,6 +393,8 @@ impl CausalDecoder {
                         }
                     }
                     Some(FeedForward::Dense(mlp)) => {
+                        let (pre_feedforward_norm, post_feedforward_norm, layer_scalar) =
+                            resolve_gemma_tail_buffers(metal, layer)?;
                         let (gate_proj, up_proj, down_proj) = mlp.projections();
                         let qkv_proj = if decode_resident_full_qkv_concat_enabled() {
                             match metal.resolve_concat_linear_weight_buffers(
@@ -391,6 +447,9 @@ impl CausalDecoder {
                                     post_norm.data(),
                                     "resident_dense_full_post_norm",
                                 )?,
+                                pre_feedforward_norm,
+                                post_feedforward_norm,
+                                layer_scalar,
                                 gate_proj: metal.resolve_linear_weight_buffers(
                                     gate_proj.weight(),
                                     "resident_dense_gate_proj",
@@ -482,9 +541,11 @@ impl CausalDecoder {
         let mut arena = DecodeResidentState::new(metal.device().clone())?;
         arena.set_scratch_namespace(slot);
         for (index, layer_cache) in cache.layers.iter_mut().enumerate() {
-            if !self.config.is_full_attention_layer(index) {
+            if !self.config.is_resident_full_attention_layer(index) {
                 continue;
             }
+            let head_dim = self.config.layer_head_dim(index)?;
+            let kv_heads = self.config.layer_num_key_value_heads(index);
             let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, sampled)?;
             full.seed(&layer_cache.keys, &layer_cache.values, prefill_len)?;
             layer_cache.full = Some(full);
@@ -553,10 +614,11 @@ impl CausalDecoder {
             };
             // KV de l'arène MTP : même dtype résolu que le KV principal (MTP est
             // greedy-only → `sampled` sera false quand la tête MTP tourne).
-            let kv = arena.full_attention(capacity, q_heads, kv_heads, head_dim, sampled)?;
+            let kv =
+                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, sampled)?;
             #[cfg(feature = "devtools")]
             let append_oracle_kv =
-                arena.full_attention(capacity, q_heads, kv_heads, head_dim, sampled)?;
+                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, sampled)?;
             let hidden_a = arena.persistent(hidden, GpuElement::F32)?;
             let hidden_b = arena.persistent(hidden, GpuElement::F32)?;
             let index = arena.persistent(1, GpuElement::U32)?;
@@ -612,6 +674,9 @@ impl CausalDecoder {
                         head.layer.post_attention_norm.data(),
                         "resident_mtp_post_norm",
                     )?,
+                    pre_feedforward_norm: None,
+                    post_feedforward_norm: None,
+                    layer_scalar: None,
                     gate_proj: metal
                         .resolve_linear_weight_buffers(gate_proj.weight(), "resident_mtp_gate")?,
                     up_proj: metal
@@ -666,26 +731,24 @@ impl CausalDecoder {
     fn check_resident_full_decode_allocation(
         &self,
         capacity: usize,
-        kv_heads: usize,
-        head_dim: usize,
         hidden: usize,
         max_new_tokens: usize,
     ) -> Result<()> {
         let Some(guard) = self.memory_guard.as_ref() else {
             return Ok(());
         };
-        let full_layers = self
-            .layers
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| self.config.is_full_attention_layer(*index))
-            .count();
-        let kv_dim = checked_product(&[kv_heads, head_dim], "kv_dim résident")?;
-        let kv_bytes = checked_bytes(
-            &[full_layers, 2, capacity, kv_dim],
-            std::mem::size_of::<f32>(),
-            "KV résident",
-        )?;
+        let mut kv_bytes = 0_u64;
+        for index in 0..self.layers.len() {
+            if !self.config.is_resident_full_attention_layer(index) {
+                continue;
+            }
+            let kv_dim = self.config.resident_full_attention_kv_dim(index)?;
+            kv_bytes = kv_bytes.saturating_add(checked_bytes(
+                &[2, capacity, kv_dim],
+                std::mem::size_of::<f32>(),
+                "KV résident",
+            )?);
+        }
         let base_bytes = checked_bytes(
             &[2, hidden],
             std::mem::size_of::<f32>(),
@@ -698,8 +761,15 @@ impl CausalDecoder {
         )?);
         let mtp_bytes = if self.mtp.is_some() {
             let mtp_kv_states = if cfg!(feature = "devtools") { 2 } else { 1 };
+            let mtp_head_dim = self.config.head_dim.ok_or_else(|| {
+                InferError::Dimension("head_dim MTP résident manquant".to_string())
+            })?;
+            let mtp_kv_dim = checked_product(
+                &[self.config.num_key_value_heads, mtp_head_dim],
+                "kv_dim MTP résident",
+            )?;
             checked_bytes(
-                &[mtp_kv_states, 2, capacity, kv_dim],
+                &[mtp_kv_states, 2, capacity, mtp_kv_dim],
                 std::mem::size_of::<f32>(),
                 "KV MTP résident",
             )?

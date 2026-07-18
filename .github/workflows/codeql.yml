@@ -1,0 +1,48 @@
+name: CodeQL Security Analysis
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "LICENSE*"
+      - "NOTICE"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "LICENSE*"
+      - "NOTICE"
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: CodeQL Rust
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: codeql
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+      - name: Build with the Metal toolchain
+        run: cargo build --all-features
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:rust

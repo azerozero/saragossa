@@ -1,6 +1,25 @@
 use super::super::*;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
+impl CausalDecoderConfig {
+    pub(super) fn resident_windowed_full_attn_layer_dims(
+        &self,
+        layer_index: usize,
+        hidden: usize,
+        position: usize,
+        eps: f32,
+        theta: f32,
+    ) -> Result<FullAttnLayerDims> {
+        let mut dims =
+            self.resident_full_attn_layer_dims(layer_index, hidden, position, eps, theta)?;
+        dims.window_start = self
+            .layer_sliding_window(layer_index)
+            .map_or(0, |window| (position + 1).saturating_sub(window));
+        Ok(dims)
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) const RESIDENT_PIPELINE_WINDOW: usize = 4;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -64,8 +83,8 @@ pub(in crate::decoder) enum ResidentEmbeddingOut {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Option<&'static str> {
-    if layer.pre_feedforward_norm.is_some() {
-        return Some("pre_feedforward_norm présent");
+    if layer.pre_feedforward_norm.is_some() != layer.post_feedforward_norm.is_some() {
+        return Some("normes feed-forward Gemma partielles");
     }
     let Some(mlp) = layer.mlp.as_ref() else {
         return Some("MLP absent");
@@ -75,6 +94,9 @@ pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Op
     }
     match mlp {
         FeedForward::Moe(mlp) => {
+            if layer.pre_feedforward_norm.is_some() && mlp.shared_metal_parts().is_some() {
+                return Some("MoE Gemma shared non supporté");
+            }
             if mlp.shared_metal_parts().is_none() && mlp.metal_parts().is_none() {
                 return Some("MoE non encodable Metal");
             }
@@ -89,12 +111,9 @@ pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Op
     }
     match &layer.attention {
         AttentionBlock::Full(attention) => {
-            let Some(v_proj) = attention.v_proj.as_ref() else {
-                return Some("full-attn v_proj absent");
-            };
             if attention.q_proj.bias().is_some()
                 || attention.k_proj.bias().is_some()
-                || v_proj.bias().is_some()
+                || attention.resident_v_proj().bias().is_some()
                 || attention.o_proj.bias().is_some()
             {
                 return Some("full-attn projection biaisée");

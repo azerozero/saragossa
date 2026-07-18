@@ -1,5 +1,7 @@
 //! Flags runtime et instrumentation du décodeur.
 
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+use std::sync::atomic::AtomicU8;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -413,6 +415,49 @@ pub(crate) fn prefill_attn_steel_d256_enabled() -> bool {
 pub(super) fn prefill_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_RESIDENT", true))
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+static PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Restaure la bascule Gemma 4 précédente à la fin d'un test.
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) struct PrefillResidentGemma4TestOverride {
+    previous: u8,
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+impl Drop for PrefillResidentGemma4TestOverride {
+    fn drop(&mut self) {
+        PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Force temporairement la bascule Gemma 4 pour un oracle.
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn override_prefill_resident_gemma4_for_test(
+    enabled: bool,
+) -> PrefillResidentGemma4TestOverride {
+    let value = if enabled { 2 } else { 1 };
+    let previous = PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.swap(value, Ordering::Relaxed);
+    PrefillResidentGemma4TestOverride { previous }
+}
+
+/// Active le prefill résident Gemma 4.
+///
+/// Défaut OFF : `RETI_RUST_PREFILL_RESIDENT_GEMMA4=1` ouvre le gate après
+/// qualification des couches fenêtrées, du tail parallèle et de la continuité
+/// KV prefill vers decode.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(super) fn prefill_resident_gemma4_enabled() -> bool {
+    #[cfg(test)]
+    match PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_RESIDENT_GEMMA4", false))
 }
 
 /// Active le tail MLP dense du prefill résident (27B hybride `qwen3_5`).

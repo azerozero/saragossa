@@ -53,9 +53,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod arena;
 mod attention;
+mod dense_tail;
 mod duo;
 mod kernels;
 mod layers;
+mod moe_tail;
 mod types;
 mod utils;
 
@@ -66,7 +68,8 @@ pub(crate) use self::arena::{GpuElement, GpuTensor, ScratchLease, ScratchPool};
 pub(crate) use self::attention::FullAttentionMetalState;
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
-    GpuSectionTimer, LinearAttnDenseLayerWeights, LinearAttnLayerWeights,
+    GemmaDenseTailWeights, GemmaMoeTailWeights, GpuSectionTimer, LinearAttnDenseLayerWeights,
+    LinearAttnLayerWeights,
 };
 
 /// État résident d'UN decode (réserves C/D).

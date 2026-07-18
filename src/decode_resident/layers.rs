@@ -239,11 +239,12 @@ impl DecodeResidentState {
             )?;
             kv.encode_append_kv(encoder, k_roped.tensor().buffer(), v_raw.tensor().buffer())?;
         }
-        kv.encode_attention_decode(
+        kv.encode_attention_decode_windowed(
             encoder,
             q_roped.tensor().buffer(),
             scores.tensor().buffer(),
             ctx.tensor().buffer(),
+            dims.window_start,
         )?;
         let o_proj_fused = executor
             .encode_full_attn_o_proj_gated_buffers(
@@ -275,17 +276,38 @@ impl DecodeResidentState {
                 false,
             )?;
         }
-        executor.encode_add_rms_norm_rows(
-            encoder,
-            layer_in,
-            o_out.tensor().buffer(),
-            weights.post_norm,
-            summed.tensor().buffer(),
-            post_normed.tensor().buffer(),
-            1,
-            hidden,
-            dims.eps,
-        )?;
+        if weights.pre_feedforward_norm.is_some() {
+            executor.encode_rms_norm_rows(
+                encoder,
+                o_out.tensor().buffer(),
+                weights.post_norm,
+                post_normed.tensor().buffer(),
+                1,
+                hidden,
+                dims.eps,
+            )?;
+            executor.encode_add_scaled(
+                encoder,
+                owned,
+                layer_in,
+                post_normed.tensor().buffer(),
+                summed.tensor().buffer(),
+                1.0,
+                hidden,
+            )?;
+        } else {
+            executor.encode_add_rms_norm_rows(
+                encoder,
+                layer_in,
+                o_out.tensor().buffer(),
+                weights.post_norm,
+                summed.tensor().buffer(),
+                post_normed.tensor().buffer(),
+                1,
+                hidden,
+                dims.eps,
+            )?;
+        }
         executor.encode_moe_shared_buffers(
             encoder,
             owned,
@@ -489,11 +511,12 @@ impl DecodeResidentState {
             qkv_proj_out.tensor().buffer(),
             v_offset,
         )?;
-        kv.encode_attention_decode(
+        kv.encode_attention_decode_windowed(
             encoder,
             q_roped.tensor().buffer(),
             scores.tensor().buffer(),
             ctx.tensor().buffer(),
+            dims.window_start,
         )?;
         if dims.attn_output_gate {
             let o_proj_fused = executor
@@ -535,27 +558,70 @@ impl DecodeResidentState {
                 false,
             )?;
         }
-        executor.encode_add_rms_norm_rows(
-            encoder,
-            layer_in,
-            o_out.tensor().buffer(),
-            weights.post_norm,
-            summed.tensor().buffer(),
-            post_normed.tensor().buffer(),
-            1,
-            hidden,
-            dims.eps,
-        )?;
-        executor.encode_moe_routed_buffers(
-            encoder,
-            owned,
-            post_normed.tensor().buffer(),
-            Some(summed.tensor().buffer()),
-            layer_out,
-            hidden,
-            weights.moe,
-            weights.top_k,
-        )
+        if weights.pre_feedforward_norm.is_some() {
+            executor.encode_rms_norm_rows(
+                encoder,
+                o_out.tensor().buffer(),
+                weights.post_norm,
+                post_normed.tensor().buffer(),
+                1,
+                hidden,
+                dims.eps,
+            )?;
+            executor.encode_add_scaled(
+                encoder,
+                owned,
+                layer_in,
+                post_normed.tensor().buffer(),
+                summed.tensor().buffer(),
+                1.0,
+                hidden,
+            )?;
+        } else {
+            executor.encode_add_rms_norm_rows(
+                encoder,
+                layer_in,
+                o_out.tensor().buffer(),
+                weights.post_norm,
+                summed.tensor().buffer(),
+                post_normed.tensor().buffer(),
+                1,
+                hidden,
+                dims.eps,
+            )?;
+        }
+        match (weights.pre_feedforward_norm, weights.post_feedforward_norm) {
+            (Some(pre_feedforward_norm), Some(post_feedforward_norm)) => self
+                .encode_gemma_moe_tail(
+                    executor,
+                    encoder,
+                    owned,
+                    summed.tensor().buffer(),
+                    layer_out,
+                    hidden,
+                    dims.eps,
+                    GemmaMoeTailWeights {
+                        pre_feedforward_norm,
+                        post_feedforward_norm,
+                        layer_scalar: weights.layer_scalar,
+                        moe: weights.moe,
+                        top_k: weights.top_k,
+                    },
+                ),
+            (None, None) => executor.encode_moe_routed_buffers(
+                encoder,
+                owned,
+                post_normed.tensor().buffer(),
+                Some(summed.tensor().buffer()),
+                layer_out,
+                hidden,
+                weights.moe,
+                weights.top_k,
+            ),
+            _ => Err(InferError::Config(
+                "normes feed-forward Gemma résidentes partielles".to_string(),
+            )),
+        }
     }
 
     /// Encode UNE couche full-attn DENSE (decode résident 1c) dans l'encoder
@@ -686,6 +752,24 @@ impl DecodeResidentState {
                         qkv_concat_used = true;
                     }
                 }
+            } else if weights.qkv_proj_without_gate {
+                if let Some(qkv_proj) = weights.qkv_proj {
+                    let projected = executor.encode_matmul_weight_buffers(
+                        encoder,
+                        normed.tensor().buffer(),
+                        1,
+                        hidden,
+                        qkv_proj,
+                        qkv_proj_out.tensor().buffer(),
+                        false,
+                    )?;
+                    if projected != qkv_proj_dim {
+                        return Err(InferError::Dimension(format!(
+                            "full-attn dense qkv sort {projected}, attendu {qkv_proj_dim}"
+                        )));
+                    }
+                    qkv_concat_used = true;
+                }
             }
             if !qkv_concat_used {
                 executor.encode_matmul_weight_buffers(
@@ -729,6 +813,8 @@ impl DecodeResidentState {
         }
         let q_source_buffer = if dims.attn_output_gate {
             q_raw.tensor().buffer()
+        } else if qkv_concat_used {
+            qkv_proj_out.tensor().buffer()
         } else {
             q_proj_out.tensor().buffer()
         };
@@ -788,11 +874,12 @@ impl DecodeResidentState {
             )?;
             kv.encode_append_kv(encoder, k_roped.tensor().buffer(), v_raw.tensor().buffer())?;
         }
-        kv.encode_attention_decode(
+        kv.encode_attention_decode_windowed(
             encoder,
             q_roped.tensor().buffer(),
             scores.tensor().buffer(),
             ctx.tensor().buffer(),
+            dims.window_start,
         )?;
         if dims.attn_output_gate {
             let o_proj_fused = executor
@@ -834,30 +921,75 @@ impl DecodeResidentState {
                 false,
             )?;
         }
-        executor.encode_add_rms_norm_rows(
-            encoder,
-            layer_in,
-            o_out.tensor().buffer(),
-            weights.post_norm,
-            summed.tensor().buffer(),
-            post_normed.tensor().buffer(),
-            1,
-            hidden,
-            dims.eps,
-        )?;
-        self.encode_dense_tail(
-            executor,
-            encoder,
-            owned,
-            post_normed.tensor().buffer(),
-            summed.tensor().buffer(),
-            layer_out,
-            hidden,
-            weights.gate_proj,
-            weights.up_proj,
-            weights.down_proj,
-            weights.tail_score,
-        )
+        if weights.pre_feedforward_norm.is_some() {
+            executor.encode_rms_norm_rows(
+                encoder,
+                o_out.tensor().buffer(),
+                weights.post_norm,
+                post_normed.tensor().buffer(),
+                1,
+                hidden,
+                dims.eps,
+            )?;
+            executor.encode_add_scaled(
+                encoder,
+                owned,
+                layer_in,
+                post_normed.tensor().buffer(),
+                summed.tensor().buffer(),
+                1.0,
+                hidden,
+            )?;
+        } else {
+            executor.encode_add_rms_norm_rows(
+                encoder,
+                layer_in,
+                o_out.tensor().buffer(),
+                weights.post_norm,
+                summed.tensor().buffer(),
+                post_normed.tensor().buffer(),
+                1,
+                hidden,
+                dims.eps,
+            )?;
+        }
+        match (weights.pre_feedforward_norm, weights.post_feedforward_norm) {
+            (Some(pre_feedforward_norm), Some(post_feedforward_norm)) => self
+                .encode_gemma_dense_tail(
+                    executor,
+                    encoder,
+                    owned,
+                    summed.tensor().buffer(),
+                    layer_out,
+                    1,
+                    hidden,
+                    dims.eps,
+                    weights.gate_proj,
+                    weights.up_proj,
+                    weights.down_proj,
+                    GemmaDenseTailWeights {
+                        pre_feedforward_norm,
+                        post_feedforward_norm,
+                        layer_scalar: weights.layer_scalar,
+                    },
+                ),
+            (None, None) => self.encode_dense_tail(
+                executor,
+                encoder,
+                owned,
+                post_normed.tensor().buffer(),
+                summed.tensor().buffer(),
+                layer_out,
+                hidden,
+                weights.gate_proj,
+                weights.up_proj,
+                weights.down_proj,
+                weights.tail_score,
+            ),
+            _ => Err(InferError::Config(
+                "normes feed-forward Gemma résidentes partielles".to_string(),
+            )),
+        }
     }
 
     /// Encode une couche full-attn DENSE sur `rows` positions contiguës.
@@ -1117,11 +1249,12 @@ impl DecodeResidentState {
                 },
                 v_offset,
             )?;
-            kv.encode_attention_decode(
+            kv.encode_attention_decode_windowed(
                 encoder,
                 q_roped.tensor().buffer(),
                 scores.tensor().buffer(),
                 ctx_row.tensor().buffer(),
+                dims.window_start,
             )?;
             let gated_offset = row
                 .checked_mul(q_dim)
@@ -1161,31 +1294,76 @@ impl DecodeResidentState {
                 "full-attn dense rows o_proj sort {o_dim}, attendu {hidden}"
             )));
         }
-        executor.encode_add_rms_norm_rows(
-            encoder,
-            layer_in,
-            o_out.tensor().buffer(),
-            weights.post_norm,
-            summed.tensor().buffer(),
-            post_normed.tensor().buffer(),
-            rows,
-            hidden,
-            dims.eps,
-        )?;
-        self.encode_dense_tail_rows(
-            executor,
-            encoder,
-            owned,
-            post_normed.tensor().buffer(),
-            summed.tensor().buffer(),
-            layer_out,
-            rows,
-            hidden,
-            weights.gate_proj,
-            weights.up_proj,
-            weights.down_proj,
-            weights.tail_score,
-        )
+        if weights.pre_feedforward_norm.is_some() {
+            executor.encode_rms_norm_rows(
+                encoder,
+                o_out.tensor().buffer(),
+                weights.post_norm,
+                post_normed.tensor().buffer(),
+                rows,
+                hidden,
+                dims.eps,
+            )?;
+            executor.encode_add_scaled(
+                encoder,
+                owned,
+                layer_in,
+                post_normed.tensor().buffer(),
+                summed.tensor().buffer(),
+                1.0,
+                batch_hidden,
+            )?;
+        } else {
+            executor.encode_add_rms_norm_rows(
+                encoder,
+                layer_in,
+                o_out.tensor().buffer(),
+                weights.post_norm,
+                summed.tensor().buffer(),
+                post_normed.tensor().buffer(),
+                rows,
+                hidden,
+                dims.eps,
+            )?;
+        }
+        match (weights.pre_feedforward_norm, weights.post_feedforward_norm) {
+            (Some(pre_feedforward_norm), Some(post_feedforward_norm)) => self
+                .encode_gemma_dense_tail(
+                    executor,
+                    encoder,
+                    owned,
+                    summed.tensor().buffer(),
+                    layer_out,
+                    rows,
+                    hidden,
+                    dims.eps,
+                    weights.gate_proj,
+                    weights.up_proj,
+                    weights.down_proj,
+                    GemmaDenseTailWeights {
+                        pre_feedforward_norm,
+                        post_feedforward_norm,
+                        layer_scalar: weights.layer_scalar,
+                    },
+                ),
+            (None, None) => self.encode_dense_tail_rows(
+                executor,
+                encoder,
+                owned,
+                post_normed.tensor().buffer(),
+                summed.tensor().buffer(),
+                layer_out,
+                rows,
+                hidden,
+                weights.gate_proj,
+                weights.up_proj,
+                weights.down_proj,
+                weights.tail_score,
+            ),
+            _ => Err(InferError::Config(
+                "normes feed-forward Gemma résidentes partielles".to_string(),
+            )),
+        }
     }
 
     /// Encode UNE couche linear-attn (decode résident 1c) dans l'encoder PARTAGÉ :
@@ -1514,239 +1692,6 @@ impl DecodeResidentState {
             weights.up_proj,
             weights.down_proj,
             weights.tail_score,
-        )
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "tail dense résident: buffers + poids nécessaires à l'encodage"
-    )]
-    fn encode_dense_tail(
-        &self,
-        executor: &MetalExecutor,
-        encoder: &ComputeCommandEncoderRef,
-        owned: &mut Vec<Buffer>,
-        post_normed: &BufferRef,
-        summed: &BufferRef,
-        layer_out: &BufferRef,
-        hidden: usize,
-        gate_proj: &MetalLinearWeightBuffers,
-        up_proj: &MetalLinearWeightBuffers,
-        down_proj: &MetalLinearWeightBuffers,
-        tail_score: &BufferRef,
-    ) -> Result<()> {
-        let gate_in = executor.linear_weight_in_dim(gate_proj);
-        let inter = executor.linear_weight_out_dim(gate_proj);
-        if gate_in != hidden {
-            return Err(InferError::Dimension(format!(
-                "dense gate_proj attendu [inter,{hidden}], reçu [{inter},{gate_in}]"
-            )));
-        }
-        let up_out = executor.linear_weight_out_dim(up_proj);
-        let up_in = executor.linear_weight_in_dim(up_proj);
-        if up_out != inter || up_in != hidden {
-            return Err(InferError::Dimension(format!(
-                "dense up_proj attendu [{inter},{hidden}], reçu [{up_out},{up_in}]"
-            )));
-        }
-        let down_out = executor.linear_weight_out_dim(down_proj);
-        let down_in = executor.linear_weight_in_dim(down_proj);
-        if down_out != hidden || down_in != inter {
-            return Err(InferError::Dimension(format!(
-                "dense down_proj attendu [{hidden},{inter}], reçu [{down_out},{down_in}]"
-            )));
-        }
-        let swiglu = self.scratch().lease(inter, GpuElement::F32)?;
-        let down = self.scratch().lease(hidden, GpuElement::F32)?;
-
-        if !executor.encode_gate_up_swiglu_fast_buffers(
-            encoder,
-            post_normed,
-            gate_proj,
-            up_proj,
-            swiglu.tensor().buffer(),
-            hidden,
-        )? {
-            let gate = self.scratch().lease(inter, GpuElement::F32)?;
-            let up = self.scratch().lease(inter, GpuElement::F32)?;
-            let gate_dim = executor.encode_matmul_weight_buffers(
-                encoder,
-                post_normed,
-                1,
-                hidden,
-                gate_proj,
-                gate.tensor().buffer(),
-                false,
-            )?;
-            let up_dim = executor.encode_matmul_weight_buffers(
-                encoder,
-                post_normed,
-                1,
-                hidden,
-                up_proj,
-                up.tensor().buffer(),
-                false,
-            )?;
-            if gate_dim != inter || up_dim != inter {
-                return Err(InferError::Dimension(format!(
-                    "dense gate/up sortent gate={gate_dim} up={up_dim}, attendu {inter}"
-                )));
-            }
-            executor.encode_swiglu(
-                encoder,
-                owned,
-                gate.tensor().buffer(),
-                up.tensor().buffer(),
-                swiglu.tensor().buffer(),
-                inter,
-            )?;
-        }
-        let down_dim = executor.encode_matmul_weight_buffers(
-            encoder,
-            swiglu.tensor().buffer(),
-            1,
-            inter,
-            down_proj,
-            down.tensor().buffer(),
-            false,
-        )?;
-        if down_dim != hidden {
-            return Err(InferError::Dimension(format!(
-                "dense down sort {down_dim}, attendu {hidden}"
-            )));
-        }
-        executor.encode_weighted_sum_add_topk(
-            encoder,
-            owned,
-            down.tensor().buffer(),
-            tail_score,
-            summed,
-            layer_out,
-            1,
-            hidden,
-        )
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "tail dense résident batché: buffers + poids nécessaires à l'encodage"
-    )]
-    fn encode_dense_tail_rows(
-        &self,
-        executor: &MetalExecutor,
-        encoder: &ComputeCommandEncoderRef,
-        owned: &mut Vec<Buffer>,
-        post_normed: &BufferRef,
-        summed: &BufferRef,
-        layer_out: &BufferRef,
-        rows: usize,
-        hidden: usize,
-        gate_proj: &MetalLinearWeightBuffers,
-        up_proj: &MetalLinearWeightBuffers,
-        down_proj: &MetalLinearWeightBuffers,
-        tail_score: &BufferRef,
-    ) -> Result<()> {
-        if rows == 1 {
-            return self.encode_dense_tail(
-                executor,
-                encoder,
-                owned,
-                post_normed,
-                summed,
-                layer_out,
-                hidden,
-                gate_proj,
-                up_proj,
-                down_proj,
-                tail_score,
-            );
-        }
-        let gate_in = executor.linear_weight_in_dim(gate_proj);
-        let inter = executor.linear_weight_out_dim(gate_proj);
-        if gate_in != hidden {
-            return Err(InferError::Dimension(format!(
-                "dense gate_proj attendu [inter,{hidden}], reçu [{inter},{gate_in}]"
-            )));
-        }
-        let up_out = executor.linear_weight_out_dim(up_proj);
-        let up_in = executor.linear_weight_in_dim(up_proj);
-        if up_out != inter || up_in != hidden {
-            return Err(InferError::Dimension(format!(
-                "dense up_proj attendu [{inter},{hidden}], reçu [{up_out},{up_in}]"
-            )));
-        }
-        let down_out = executor.linear_weight_out_dim(down_proj);
-        let down_in = executor.linear_weight_in_dim(down_proj);
-        if down_out != hidden || down_in != inter {
-            return Err(InferError::Dimension(format!(
-                "dense down_proj attendu [{hidden},{inter}], reçu [{down_out},{down_in}]"
-            )));
-        }
-
-        let inter_elements = rows
-            .checked_mul(inter)
-            .ok_or_else(|| InferError::Dimension("dense rows inter déborde".to_string()))?;
-        let hidden_elements = rows
-            .checked_mul(hidden)
-            .ok_or_else(|| InferError::Dimension("dense rows hidden déborde".to_string()))?;
-        let gate = self.scratch().lease(inter_elements, GpuElement::F32)?;
-        let up = self.scratch().lease(inter_elements, GpuElement::F32)?;
-        let swiglu = self.scratch().lease(inter_elements, GpuElement::F32)?;
-        let down = self.scratch().lease(hidden_elements, GpuElement::F32)?;
-
-        let gate_dim = executor.encode_matmul_weight_buffers(
-            encoder,
-            post_normed,
-            rows,
-            hidden,
-            gate_proj,
-            gate.tensor().buffer(),
-            false,
-        )?;
-        let up_dim = executor.encode_matmul_weight_buffers(
-            encoder,
-            post_normed,
-            rows,
-            hidden,
-            up_proj,
-            up.tensor().buffer(),
-            false,
-        )?;
-        if gate_dim != inter || up_dim != inter {
-            return Err(InferError::Dimension(format!(
-                "dense rows gate/up sortent gate={gate_dim} up={up_dim}, attendu {inter}"
-            )));
-        }
-        executor.encode_swiglu(
-            encoder,
-            owned,
-            gate.tensor().buffer(),
-            up.tensor().buffer(),
-            swiglu.tensor().buffer(),
-            inter_elements,
-        )?;
-        let down_dim = executor.encode_matmul_weight_buffers(
-            encoder,
-            swiglu.tensor().buffer(),
-            rows,
-            inter,
-            down_proj,
-            down.tensor().buffer(),
-            false,
-        )?;
-        if down_dim != hidden {
-            return Err(InferError::Dimension(format!(
-                "dense rows down sort {down_dim}, attendu {hidden}"
-            )));
-        }
-        executor.encode_add_scaled(
-            encoder,
-            owned,
-            summed,
-            down.tensor().buffer(),
-            layer_out,
-            1.0,
-            hidden_elements,
         )
     }
 }

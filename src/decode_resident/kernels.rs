@@ -15,6 +15,7 @@ kernel void attention_decode_naive_f32(
     device float* scores [[buffer(3)]],
     device float* out [[buffer(4)]],
     constant uint4& dims [[buffer(5)]],
+    constant uint& window_start [[buffer(6)]],
     uint tid [[thread_index_in_threadgroup]],
     uint q_head [[threadgroup_position_in_grid]]
 ) {
@@ -37,7 +38,7 @@ kernel void attention_decode_naive_f32(
     threadgroup float partial[256];
 
     // Phase 1 : scores[r] = dot(q[head], keys[r, kv_head]) * scale
-    for (uint r = 0u; r < len; ++r) {
+    for (uint r = window_start; r < len; ++r) {
         const uint k_start = r * kv_dim + kv_head_start;
         float dot = 0.0f;
         for (uint c = tid; c < head_dim; c += 256u) {
@@ -59,18 +60,18 @@ kernel void attention_decode_naive_f32(
 
     // Phase 2 : softmax causal (thread 0, sériel sur len — acceptable en 1b)
     if (tid == 0u) {
-        float max_score = scores[score_base];
-        for (uint r = 1u; r < len; ++r) {
+        float max_score = scores[score_base + window_start];
+        for (uint r = window_start + 1u; r < len; ++r) {
             max_score = max(max_score, scores[score_base + r]);
         }
         float sum = 0.0f;
-        for (uint r = 0u; r < len; ++r) {
+        for (uint r = window_start; r < len; ++r) {
             const float value = exp(scores[score_base + r] - max_score);
             scores[score_base + r] = value;
             sum += value;
         }
         const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
-        for (uint r = 0u; r < len; ++r) {
+        for (uint r = window_start; r < len; ++r) {
             scores[score_base + r] *= inv_sum;
         }
     }
@@ -79,7 +80,7 @@ kernel void attention_decode_naive_f32(
     // Phase 3 : out[head, c] = Σ_r softmax[r] * values[r, kv_head, c]
     for (uint c = tid; c < head_dim; c += 256u) {
         float acc = 0.0f;
-        for (uint r = 0u; r < len; ++r) {
+        for (uint r = window_start; r < len; ++r) {
             acc += scores[score_base + r] * values[r * kv_dim + kv_head_start + c];
         }
         out[q_start + c] = acc;
@@ -93,6 +94,7 @@ kernel void attention_decode_naive_bf16(
     device float* scores [[buffer(3)]],
     device float* out [[buffer(4)]],
     constant uint4& dims [[buffer(5)]],
+    constant uint& window_start [[buffer(6)]],
     uint tid [[thread_index_in_threadgroup]],
     uint q_head [[threadgroup_position_in_grid]]
 ) {
@@ -114,7 +116,7 @@ kernel void attention_decode_naive_bf16(
 
     threadgroup float partial[256];
 
-    for (uint r = 0u; r < len; ++r) {
+    for (uint r = window_start; r < len; ++r) {
         const uint k_start = r * kv_dim + kv_head_start;
         float dot = 0.0f;
         for (uint c = tid; c < head_dim; c += 256u) {
@@ -135,18 +137,18 @@ kernel void attention_decode_naive_bf16(
     }
 
     if (tid == 0u) {
-        float max_score = scores[score_base];
-        for (uint r = 1u; r < len; ++r) {
+        float max_score = scores[score_base + window_start];
+        for (uint r = window_start + 1u; r < len; ++r) {
             max_score = max(max_score, scores[score_base + r]);
         }
         float sum = 0.0f;
-        for (uint r = 0u; r < len; ++r) {
+        for (uint r = window_start; r < len; ++r) {
             const float value = exp(scores[score_base + r] - max_score);
             scores[score_base + r] = value;
             sum += value;
         }
         const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
-        for (uint r = 0u; r < len; ++r) {
+        for (uint r = window_start; r < len; ++r) {
             scores[score_base + r] *= inv_sum;
         }
     }
@@ -154,7 +156,7 @@ kernel void attention_decode_naive_bf16(
 
     for (uint c = tid; c < head_dim; c += 256u) {
         float acc = 0.0f;
-        for (uint r = 0u; r < len; ++r) {
+        for (uint r = window_start; r < len; ++r) {
             acc += scores[score_base + r] * float(values[r * kv_dim + kv_head_start + c]);
         }
         out[q_start + c] = acc;
