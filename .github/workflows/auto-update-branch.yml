@@ -1,7 +1,7 @@
 name: Auto-update PR branches on main push
 
 # Met à jour les PR BEHIND qui ont l'auto-merge activé, pour que la chaîne
-# CI verte → merge reste automatique. Pattern repris de grob.
+# CI verte → merge reste automatique.
 
 on:
   push:

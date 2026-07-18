@@ -1,0 +1,66 @@
+fail_fast = true
+default_install_hook_types = ["pre-commit", "pre-push"]
+
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "check-toml" },
+  { id = "check-yaml", args = ["--allow-multiple-documents"] },
+  { id = "check-merge-conflict" },
+  { id = "mixed-line-ending", args = ["--fix", "lf"] },
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "gitleaks"
+name = "gitleaks"
+language = "system"
+entry = "gitleaks protect --staged --no-banner"
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt"
+language = "system"
+entry = "cargo fmt --all --"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-clippy"
+name = "cargo clippy"
+language = "system"
+entry = "cargo clippy --all-targets --all-features"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-deny"
+name = "cargo deny"
+language = "system"
+entry = "cargo deny check"
+types_or = ["rust", "toml"]
+pass_filenames = false
+stages = ["pre-push"]
+
+[[repos.hooks]]
+id = "cargo-audit"
+name = "cargo audit"
+language = "system"
+entry = "cargo audit"
+types_or = ["rust", "toml"]
+pass_filenames = false
+stages = ["pre-push"]
+
+[[repos.hooks]]
+id = "cargo-machete"
+name = "cargo machete"
+language = "system"
+entry = "cargo machete"
+types_or = ["rust", "toml"]
+pass_filenames = false
+stages = ["pre-push"]
