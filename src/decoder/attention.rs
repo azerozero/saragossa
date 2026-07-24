@@ -125,7 +125,8 @@ impl DecoderLayer {
                 let dense_out = mlp.forward_with_runtime(&dense_input, runtime)?;
                 let dense_out = rms_norm(&dense_out, post_ffn_1, config.rms_eps)?;
                 let moe_input = rms_norm(&hidden, pre_ffn_2, config.rms_eps)?;
-                let moe_out = parallel_moe.forward_with_runtime(&moe_input, runtime)?;
+                let moe_out =
+                    parallel_moe.forward_with_router_source(&moe_input, &hidden, runtime)?;
                 let moe_out = rms_norm(&moe_out, post_ffn_2, config.rms_eps)?;
                 dense_out.add(&moe_out)?
             } else {

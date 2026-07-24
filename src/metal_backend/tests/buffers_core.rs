@@ -62,6 +62,77 @@ fn scratch_namespace_guard_restores_nested_scopes() {
 }
 
 #[test]
+fn embedding_gather_from_index_applies_gemma_scale() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let table_values = [1.0_f32, -2.0, 3.0, -4.0, 0.5, 1.5, -2.5, 4.5];
+    let table = executor.upload_f32_buffer(&table_values, "scaled_embedding_table")?;
+    let index = executor.upload_u32_buffer(&[1], "scaled_embedding_index")?;
+    let output = executor.uncached_f32_buffer(4, "scaled_embedding_output")?;
+    let embedding = MetalEmbeddingWeightBuffers::Dense {
+        table,
+        vocab: 2,
+        dim: 4,
+    };
+
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_embedding_from_index_buffers_scaled(
+        encoder, &embedding, &index, &output, 4, 3.0, false,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    assert_eq!(read_f32_buffer(&output, 4)?, vec![1.5, 4.5, -7.5, 13.5]);
+    Ok(())
+}
+
+#[test]
+fn embedding_gather_recast_is_opt_in_and_bf16_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let table_values = [1.001_f32, -2.003, 3.007, -4.015];
+    let table = executor.upload_f32_buffer(&table_values, "bf16_embedding_table")?;
+    let index = executor.upload_u32_buffer(&[0], "bf16_embedding_index")?;
+    let output = executor.uncached_f32_buffer(4, "bf16_embedding_output")?;
+    let embedding = MetalEmbeddingWeightBuffers::Dense {
+        table,
+        vocab: 1,
+        dim: 4,
+    };
+
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_embedding_from_index_buffers_scaled(
+        encoder, &embedding, &index, &output, 4, 1.0, false,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    assert_eq!(read_f32_buffer(&output, 4)?, table_values);
+
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_embedding_from_index_buffers_scaled(
+        encoder, &embedding, &index, &output, 4, 1.0, true,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    let expected = table_values
+        .into_iter()
+        .map(|value| {
+            let bits = value.to_bits();
+            let rounding = 0x7fff_u32 + ((bits >> 16) & 1);
+            f32::from_bits(bits.wrapping_add(rounding) & 0xffff_0000)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(read_f32_buffer(&output, 4)?, expected);
+    Ok(())
+}
+
+#[test]
 fn full_attention_tail_moe_rejects_non_single_batch() -> Result<()> {
     let executor = match test_executor()? {
         Some(executor) => executor,

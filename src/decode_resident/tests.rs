@@ -293,6 +293,44 @@ fn scratch_leases_never_alias_while_live() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn pipeline_scratch_slots_are_physically_disjoint() -> Result<()> {
+    let Some(mut state) = try_state()? else {
+        return Ok(());
+    };
+    state.prepare_pipeline_scratch(2);
+
+    let base_address = state
+        .scratch()
+        .lease(16, GpuElement::F32)?
+        .tensor()
+        .buffer()
+        .gpu_address();
+    let slot_0_address = {
+        let _guard = install_pipeline_scratch_slot(0);
+        state
+            .scratch()
+            .lease(16, GpuElement::F32)?
+            .tensor()
+            .buffer()
+            .gpu_address()
+    };
+    let slot_1_address = {
+        let _guard = install_pipeline_scratch_slot(1);
+        state
+            .scratch()
+            .lease(16, GpuElement::F32)?
+            .tensor()
+            .buffer()
+            .gpu_address()
+    };
+
+    assert_ne!(base_address, slot_0_address);
+    assert_ne!(base_address, slot_1_address);
+    assert_ne!(slot_0_address, slot_1_address);
+    Ok(())
+}
+
 /// Une taille (ou un type) différent n'est jamais servi par un slot existant.
 #[test]
 fn scratch_distinct_sizes_use_distinct_slots() -> Result<()> {
@@ -854,6 +892,127 @@ fn gemma_moe_tail_resident_matches_per_op_oracle() -> Result<()> {
     Ok(())
 }
 
+/// Le tail parallèle Gemma 4 du decode résident reproduit la référence CPU.
+#[test]
+fn gemma_parallel_tail_decode_resident_matches_cpu() -> Result<()> {
+    let Some(mut state) = try_state()? else {
+        return Ok(());
+    };
+    const HIDDEN: usize = 4;
+    const DENSE_INTER: usize = 6;
+    const MOE_INTER: usize = 4;
+    const EXPERTS: usize = 2;
+    const TOP_K: usize = 1;
+    const EPS: f32 = 1.0e-6;
+    const LAYER_SCALE: f32 = 0.93;
+
+    let executor = MetalExecutor::new()?;
+    let hidden = crate::Tensor::row(vec![0.8, -0.4, 0.3, -0.2])?;
+    let pre_ffn = gemma_tail_norm(HIDDEN, 311)?;
+    let post_ffn_1 = gemma_tail_norm(HIDDEN, 313)?;
+    let pre_ffn_2 = crate::Tensor::from_vec(vec![HIDDEN], vec![0.05, 4.0, 0.05, 0.05])?;
+    let post_ffn_2 = gemma_tail_norm(HIDDEN, 317)?;
+    let post_ffn = gemma_tail_norm(HIDDEN, 331)?;
+    let router_norm = crate::Tensor::from_vec(vec![HIDDEN], vec![1.0; HIDDEN])?;
+    let per_expert_scale = crate::Tensor::from_vec(vec![EXPERTS], vec![1.0, 1.0])?;
+    let dense_gate_weight = gemma_tail_weight(DENSE_INTER, HIDDEN, 337, 0.09)?;
+    let dense_up_weight = gemma_tail_weight(DENSE_INTER, HIDDEN, 347, 0.08)?;
+    let dense_down_weight = gemma_tail_weight(HIDDEN, DENSE_INTER, 349, 0.07)?;
+    let dense = crate::GatedMlp::new(
+        crate::Linear::new(dense_gate_weight.clone(), None)?,
+        crate::Linear::new(dense_up_weight.clone(), None)?,
+        crate::Linear::new(dense_down_weight.clone(), None)?,
+    )
+    .with_activation(crate::Activation::GeluTanh);
+    let router = crate::Linear::new(
+        crate::Tensor::from_vec(
+            vec![EXPERTS, HIDDEN],
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+        )?,
+        None,
+    )?;
+    let experts = gemma_moe_experts(EXPERTS, HIDDEN, MOE_INTER, 353)?;
+    let moe = crate::MoeMlp::new(router.clone(), experts.clone(), None, None, TOP_K)?
+        .with_router_norm(router_norm.clone(), EPS)
+        .with_per_expert_scale(per_expert_scale.clone());
+
+    let dense_input = crate::rms_norm(&hidden, &pre_ffn, EPS)?;
+    let dense_raw = dense.forward_with_runtime(&dense_input, crate::ForwardRuntime::cpu())?;
+    let dense_out = crate::rms_norm(&dense_raw, &post_ffn_1, EPS)?;
+    let moe_input = crate::rms_norm(&hidden, &pre_ffn_2, EPS)?;
+    let moe_raw =
+        moe.forward_with_router_source(&moe_input, &hidden, crate::ForwardRuntime::cpu())?;
+    let moe_out = crate::rms_norm(&moe_raw, &post_ffn_2, EPS)?;
+    let ffn_out = dense_out.add(&moe_out)?;
+    let ffn_normed = crate::rms_norm(&ffn_out, &post_ffn, EPS)?;
+    let oracle = hidden.add(&ffn_normed)?.map(|value| value * LAYER_SCALE);
+
+    let hidden_buf = state.persistent(HIDDEN, GpuElement::F32)?;
+    write_f32_at(&hidden_buf, 0, hidden.data())?;
+    let out_buf = state.persistent(HIDDEN, GpuElement::F32)?;
+    let pre_ffn_buf = executor.cached_buffer_from_f32(pre_ffn.data(), "decode_parallel_pre_ffn")?;
+    let post_ffn_1_buf =
+        executor.cached_buffer_from_f32(post_ffn_1.data(), "decode_parallel_post_ffn_1")?;
+    let pre_ffn_2_buf =
+        executor.cached_buffer_from_f32(pre_ffn_2.data(), "decode_parallel_pre_ffn_2")?;
+    let post_ffn_2_buf =
+        executor.cached_buffer_from_f32(post_ffn_2.data(), "decode_parallel_post_ffn_2")?;
+    let post_ffn_buf =
+        executor.cached_buffer_from_f32(post_ffn.data(), "decode_parallel_post_ffn")?;
+    let router_norm_buf =
+        executor.cached_buffer_from_f32(router_norm.data(), "decode_parallel_router_norm")?;
+    let per_expert_scale_buf = executor
+        .cached_buffer_from_f32(per_expert_scale.data(), "decode_parallel_per_expert_scale")?;
+    let dense_gate_proj = executor.resolve_linear_weight_buffers(
+        &crate::LinearWeight::Dense(dense_gate_weight),
+        "decode_parallel_dense_gate",
+    )?;
+    let dense_up_proj = executor.resolve_linear_weight_buffers(
+        &crate::LinearWeight::Dense(dense_up_weight),
+        "decode_parallel_dense_up",
+    )?;
+    let dense_down_proj = executor.resolve_linear_weight_buffers(
+        &crate::LinearWeight::Dense(dense_down_weight),
+        "decode_parallel_dense_down",
+    )?;
+    let moe_weights = executor.resolve_moe_routed_weights(&router, &experts)?;
+
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let mut owned = Vec::new();
+    state.encode_gemma_parallel_moe_tail(
+        &executor,
+        encoder,
+        &mut owned,
+        hidden_buf.buffer(),
+        out_buf.buffer(),
+        1,
+        HIDDEN,
+        EPS,
+        GemmaParallelMoeTailWeights {
+            dense_gate_proj: &dense_gate_proj,
+            dense_up_proj: &dense_up_proj,
+            dense_down_proj: &dense_down_proj,
+            pre_feedforward_norm: &pre_ffn_buf,
+            post_feedforward_norm_1: &post_ffn_1_buf,
+            moe: &moe_weights,
+            top_k: TOP_K,
+            router_norm: Some((&router_norm_buf, EPS)),
+            per_expert_scale: Some(&per_expert_scale_buf),
+            pre_feedforward_norm_2: &pre_ffn_2_buf,
+            post_feedforward_norm_2: &post_ffn_2_buf,
+            post_feedforward_norm: &post_ffn_buf,
+            layer_scalar: Some(LAYER_SCALE),
+            dense_inter_dim: DENSE_INTER,
+        },
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    assert_close_eps(&read_f32(&out_buf), oracle.data(), 3.0e-5);
+    Ok(())
+}
+
 /// Oracle CPU : réplique EXACTEMENT `cached_attention_one` (decoder.rs:2158) —
 /// GQA `kv_head = q_head / (q_heads/kv_heads)`, scale `1/√head_dim`, softmax
 /// causal sur `0..len`, somme pondérée des valeurs.
@@ -869,6 +1028,10 @@ fn cpu_attention(
     cpu_attention_windowed(q, keys, values, q_heads, kv_heads, head_dim, len, 0)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "oracle CPU de test: tenseurs, dimensions et fenêtre doivent rester explicites"
+)]
 fn cpu_attention_windowed(
     q: &[f32],
     keys: &[f32],
@@ -918,6 +1081,10 @@ fn cpu_attention_windowed(
     out
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "oracle CPU de test: tenseurs et paramètres RoPE doivent rester explicites"
+)]
 fn cpu_rms_norm_rope_heads_at(
     input: &[f32],
     weight: &[f32],

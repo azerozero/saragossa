@@ -585,7 +585,7 @@ impl WhisperModel {
         let t_dec = std::time::Instant::now();
 
         let generated = self.decoder.generate_greedy(
-            &audio_features,
+            audio_features,
             &prompt,
             self.decoder.config.max_target_positions.min(448),
             self.eot_token,
@@ -782,17 +782,17 @@ mod tests {
                 return Some(path);
             }
         }
-        let home = std::env::var("HOME").ok()?;
-        let snapshots = PathBuf::from(home)
-            .join(".cache/huggingface/hub/models--openai--whisper-tiny/snapshots");
-        let entries = std::fs::read_dir(snapshots).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.join("config.json").is_file() && path.join("model.safetensors").is_file() {
-                return Some(path);
-            }
-        }
-        None
+        let snapshot = crate::hf_resolve::hf_cache_dir_from_env().and_then(|hub| {
+            let snapshots = hub.join("models--openai--whisper-tiny/snapshots");
+            std::fs::read_dir(snapshots)
+                .ok()?
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.join("config.json").is_file() && path.join("model.safetensors").is_file()
+                })
+        });
+        crate::test_support::require_real_model(snapshot, "snapshot openai/whisper-tiny")
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]

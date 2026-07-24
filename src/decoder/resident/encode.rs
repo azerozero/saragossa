@@ -102,6 +102,7 @@ impl CausalDecoder {
                     input_norm: &resolved.input_norm,
                     qkv_proj: resolved.qkv_proj.as_ref(),
                     qkv_proj_without_gate: attention.v_proj.is_none(),
+                    value_norm: resolved.value_norm,
                     q_proj: &resolved.q_proj,
                     k_proj: &resolved.k_proj,
                     v_proj: &resolved.v_proj,
@@ -116,6 +117,7 @@ impl CausalDecoder {
                     up_proj: &resolved.up_proj,
                     down_proj: &resolved.down_proj,
                     tail_score: &arena.dense_tail_score,
+                    parallel_moe: resolved.parallel_moe_weights(),
                 };
                 arena.state.encode_full_attn_dense_layer(
                     metal, encoder, owned, kv, weights, dims, layer_in, layer_out,
@@ -273,6 +275,7 @@ impl CausalDecoder {
             input_norm: &resolved.input_norm,
             qkv_proj: resolved.qkv_proj.as_ref(),
             qkv_proj_without_gate: attention.v_proj.is_none(),
+            value_norm: resolved.value_norm,
             q_proj: &resolved.q_proj,
             k_proj: &resolved.k_proj,
             v_proj: &resolved.v_proj,
@@ -287,6 +290,7 @@ impl CausalDecoder {
             up_proj: &resolved.up_proj,
             down_proj: &resolved.down_proj,
             tail_score: &arena.dense_tail_score,
+            parallel_moe: resolved.parallel_moe_weights(),
         };
         arena.state.encode_full_attn_dense_layer_rows(
             metal, encoder, owned, kv, weights, dims, rows, layer_in, layer_out,

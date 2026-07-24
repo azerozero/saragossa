@@ -11,6 +11,7 @@ use super::attention_ops::full_attention_context_cached;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use super::attention_ops::AttentionLayout;
 use super::mtp::concat_row_pair;
+use super::mtp_adaptive::AdaptiveDepthController;
 use super::*;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -763,6 +764,10 @@ impl CausalDecoder {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "boucle de decode chaude: état, options et callback restent explicites sans emballage par token"
+    )]
     fn generate_greedy_timed_from_prefilled_state(
         &self,
         mut cache: CausalDecoderCache,
@@ -799,6 +804,7 @@ impl CausalDecoder {
             use_resident_full = self.setup_resident_full_decode(
                 &mut cache,
                 max_new_tokens,
+                0,
                 options.temperature > f32::EPSILON,
             )?;
         }
@@ -1004,15 +1010,13 @@ impl CausalDecoder {
                     .collect::<Vec<_>>();
                 metal.restore_linear_attn_states(&pairs)?;
             } else {
-                for (layer, linear_snapshot) in
-                    cache.layers.iter_mut().zip(linear_metal.into_iter())
-                {
+                for (layer, linear_snapshot) in cache.layers.iter_mut().zip(linear_metal) {
                     layer
                         .linear
                         .restore_metal_state_snapshot(metal, linear_snapshot)?;
                 }
             }
-            for (layer, full_len) in cache.layers.iter_mut().zip(full_lens.into_iter()) {
+            for (layer, full_len) in cache.layers.iter_mut().zip(full_lens) {
                 if let (Some(full), Some(len)) = (layer.full.as_mut(), full_len) {
                     full.truncate(len)?;
                 }
@@ -1111,6 +1115,11 @@ impl CausalDecoder {
             });
         }
 
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let trace_setup = mtp_setup_trace_enabled();
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let trace_setup = false;
+        let t_prefill = trace_setup.then(Instant::now);
         let use_committed_mtp_history = mtp_history_policy() == MtpHistoryPolicy::Committed;
         let (mut cache, mut final_state, mut mtp_history_cache) = if use_committed_mtp_history {
             let (cache, final_state, mtp_history) =
@@ -1120,6 +1129,14 @@ impl CausalDecoder {
             let (cache, final_state) = self.prefill_cache_state(prompt)?;
             (cache, final_state, None)
         };
+        if let Some(t) = t_prefill {
+            eprintln!(
+                "mtp_setup prefill_us={} prompt_tokens={} committed_history={}",
+                t.elapsed().as_micros(),
+                prompt.len(),
+                use_committed_mtp_history
+            );
+        }
         let mut resident_mtp_history_len = mtp_history_cache.as_ref().map_or(0, LayerKvCache::len);
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
@@ -1128,11 +1145,19 @@ impl CausalDecoder {
                 && options.temperature <= f32::EPSILON
                 && self.supports_resident_full_decode()
             {
+                let t_setup = trace_setup.then(Instant::now);
                 use_resident_full = self.setup_resident_full_decode(
                     &mut cache,
                     max_new_tokens,
+                    max_draft_tokens,
                     options.temperature > f32::EPSILON,
                 )?;
+                if let Some(t) = t_setup {
+                    eprintln!(
+                        "mtp_setup setup_resident_full_us={} applied={use_resident_full}",
+                        t.elapsed().as_micros()
+                    );
+                }
             }
             if decode_resident_enabled() && !use_resident_full {
                 self.setup_resident_decode(
@@ -1143,7 +1168,15 @@ impl CausalDecoder {
             }
             if use_resident_full {
                 if let Some(mtp_history) = mtp_history_cache.as_ref() {
+                    let t_seed = trace_setup.then(Instant::now);
                     self.seed_mtp_resident_history(&mut cache, mtp_history)?;
+                    if let Some(t) = t_seed {
+                        eprintln!(
+                            "mtp_setup seed_mtp_history_us={} history_len={}",
+                            t.elapsed().as_micros(),
+                            mtp_history.len()
+                        );
+                    }
                 }
             }
         }
@@ -1153,6 +1186,17 @@ impl CausalDecoder {
         let mut stats = SpeculativeStats::default();
         stats.proposed_by_position.resize(max_draft_tokens, 0);
         stats.accepted_by_position.resize(max_draft_tokens, 0);
+        // Profondeur de draft adaptative (défaut OFF). Quand OFF, `step_depth`
+        // vaut toujours `max_draft_tokens` → dispatch et sortie strictement
+        // inchangés. Le contrôleur ne décide QUE de la profondeur ; le vérifieur
+        // trunk exact garantit la byte-identité.
+        let adaptive_depth = mtp_adaptive_depth_enabled();
+        let mut depth_ctl = AdaptiveDepthController::new(
+            max_draft_tokens,
+            mtp_adaptive_alpha(),
+            mtp_adaptive_threshold(),
+            mtp_adaptive_probe_period(),
+        );
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let decode_profiler = DecodeProfiler::start();
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1176,12 +1220,29 @@ impl CausalDecoder {
             } else {
                 0
             };
+            // Profondeur de ce pas : `max_draft_tokens` (fixe) ou choisie par le
+            // contrôleur adaptatif, bornée par les tokens restants.
+            let step_depth = if adaptive_depth {
+                depth_ctl.plan(max_new_tokens.saturating_sub(generated.len()))
+            } else {
+                max_draft_tokens
+            };
             #[cfg(all(target_os = "macos", feature = "metal"))]
             if options.temperature <= f32::EPSILON
                 && use_committed_mtp_history
-                && max_draft_tokens == 1
+                && step_depth == 1
                 && mtp_history_cache.is_some()
             {
+                // POURQUOI : le chemin fused D2 diffère l'append KV MTP (mécanisme
+                // « pending ») au pas suivant, qui le matérialise à son démarrage.
+                // Le chemin fused D1 ne vide PAS ce pending → en adaptatif, une
+                // transition D2→D1 laisserait le KV MTP plus court que l'offset
+                // committed suivi, et `truncate(offset)` échouerait (offset > len).
+                // On matérialise donc le pending avant (no-op sans pending, coût
+                // nul hors transition).
+                if adaptive_depth {
+                    self.flush_mtp_resident_pending_append(&mut cache, cycle_mtp_offset)?;
+                }
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 if let Some((draft, target, target_state, bonus)) = self
                     .next_mtp_spec_one_resident(
@@ -1192,6 +1253,9 @@ impl CausalDecoder {
                         &options.stop_token_ids,
                     )?
                 {
+                    if adaptive_depth {
+                        depth_ctl.observe(1, usize::from(draft == target));
+                    }
                     mtp_profile_record(&mut mtp_step_profile.fused_one, profile_start);
                     stats.verifications += 1;
                     stats.proposed += 1;
@@ -1266,7 +1330,7 @@ impl CausalDecoder {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             if options.temperature <= f32::EPSILON
                 && use_committed_mtp_history
-                && max_draft_tokens == 2
+                && step_depth == 2
                 && mtp_history_cache.is_some()
                 && max_new_tokens.saturating_sub(generated.len()) >= 2
             {
@@ -1278,6 +1342,11 @@ impl CausalDecoder {
                     cycle_mtp_offset,
                     &options.stop_token_ids,
                 )? {
+                    if adaptive_depth {
+                        // `accepted_generated` = nb de tokens de draft acceptés
+                        // (0..=2). deep_paid ⇔ le 2ᵉ draft a été accepté.
+                        depth_ctl.observe(2, output.accepted_generated);
+                    }
                     mtp_profile_record(&mut mtp_step_profile.fused_two, profile_start);
                     for position in 0..output.checked {
                         stats.verifications += 1;
@@ -1338,7 +1407,7 @@ impl CausalDecoder {
                 if let Some(resident_drafts) = self.next_mtp_drafts_resident(
                     &mut cache,
                     draft_token,
-                    max_draft_tokens,
+                    step_depth,
                     cycle_mtp_offset,
                 )? {
                     drafts = resident_drafts;
@@ -1347,7 +1416,7 @@ impl CausalDecoder {
                 mtp_profile_record(&mut mtp_step_profile.draft, profile_start);
             }
             if drafts.is_empty() {
-                for position in 0..max_draft_tokens {
+                for position in 0..step_depth {
                     let absolute_position = cycle_mtp_offset
                         .checked_add(position)
                         .ok_or_else(|| InferError::Dimension("position MTP déborde".to_string()))?;
@@ -1477,6 +1546,12 @@ impl CausalDecoder {
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 mtp_profile_record(&mut mtp_step_profile.bonus_next, profile_start);
             }
+            // Retour d'expérience du chemin général (fallback per-op) : nb de
+            // drafts acceptés à ce pas. Les chemins fused D1/D2 ont déjà `observe`
+            // puis `continue` — ce point n'est atteint que hors fused.
+            if adaptive_depth {
+                depth_ctl.observe(step_depth, accepted_history.len());
+            }
         }
 
         let loop_duration = decode_started.elapsed();
@@ -1485,6 +1560,22 @@ impl CausalDecoder {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if profile_mtp_steps {
             mtp_step_profile.report(generated.len(), stats.verifications);
+        }
+        // Profondeur moyenne effective + état final de l'EMA (diagnostic adaptatif,
+        // hors chemin prod quand le flag est OFF).
+        if adaptive_depth {
+            let summary = depth_ctl.summary();
+            eprintln!(
+                "mtp_adaptive_depth steps={} deep_steps={} avg_depth={:.4} ema_deep={:.4} cap={} threshold={:.3} alpha={:.3} probe={}",
+                summary.steps,
+                summary.deep_steps,
+                summary.avg_depth,
+                summary.ema_deep,
+                max_draft_tokens,
+                mtp_adaptive_threshold(),
+                mtp_adaptive_alpha(),
+                mtp_adaptive_probe_period(),
+            );
         }
         Ok(SpeculativeOutput {
             tokens: generated,
@@ -1718,7 +1809,7 @@ impl CausalDecoder {
         let mut resident_cache = base_cache.clone();
         #[cfg(all(target_os = "macos", feature = "metal"))]
         self.restore_prefix_cache_linear_metal(&mut resident_cache, resident_metal)?;
-        if !self.setup_resident_full_decode(&mut resident_cache, 2, false)? {
+        if !self.setup_resident_full_decode(&mut resident_cache, 2, 0, false)? {
             return Err(InferError::Config(
                 "xray résident-linear: setup résident full indisponible".to_string(),
             ));
@@ -1885,7 +1976,7 @@ impl CausalDecoder {
 
         let mut probe_cache = base_cache.clone();
         self.restore_prefix_cache_linear_metal(&mut probe_cache, linear_metal)?;
-        if !self.setup_resident_full_decode(&mut probe_cache, 2, false)? {
+        if !self.setup_resident_full_decode(&mut probe_cache, 2, 0, false)? {
             return Ok(None);
         }
 
@@ -2837,27 +2928,69 @@ impl CausalDecoder {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
-        let runtime = self.forward_runtime();
-        let mut cache = self.empty_cache();
-        let mut hidden = self.embed_scaled(prompt)?;
-        for (layer_index, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward_prefill(
-                &self.config,
-                &hidden,
-                &mut cache.layers[layer_index],
-                0,
-                runtime,
-            )?;
-        }
-        cache.position = prompt.len();
-        let final_states = rms_norm(&hidden, &self.final_norm, self.config.rms_eps)?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let trace_setup = mtp_setup_trace_enabled();
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let trace_setup = false;
+        let t_main = trace_setup.then(Instant::now);
+        // Chemin rapide : le prefill principal MTP passait par la boucle per-op
+        // `forward_prefill` (≈ 2× l'AR), alors que l'AR emprunte le prefill résident
+        // fusionné. On route le prefill principal MTP par ce MÊME chemin rapide et
+        // on dérive les états normés de TOUTES les positions (nécessaires au seed de
+        // l'historique MTP committed) depuis le hidden final résident. Repli per-op
+        // si le chemin résident décline (préconditions) ou par coupe-circuit.
+        let (cache, final_states) = {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            let resident = if mtp_prefill_resident_enabled() {
+                self.prefill_resident_cache_and_hidden(prompt)?
+            } else {
+                None
+            };
+            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            let resident: Option<(CausalDecoderCache, Tensor)> = None;
+            match resident {
+                Some((cache, final_hidden)) => {
+                    let final_states =
+                        rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+                    (cache, final_states)
+                }
+                None => {
+                    let runtime = self.forward_runtime();
+                    let mut cache = self.empty_cache();
+                    let mut hidden = self.embed_scaled(prompt)?;
+                    for (layer_index, layer) in self.layers.iter().enumerate() {
+                        hidden = layer.forward_prefill(
+                            &self.config,
+                            &hidden,
+                            &mut cache.layers[layer_index],
+                            0,
+                            runtime,
+                        )?;
+                    }
+                    cache.position = prompt.len();
+                    let final_states = rms_norm(&hidden, &self.final_norm, self.config.rms_eps)?;
+                    (cache, final_states)
+                }
+            }
+        };
         let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
+        if let Some(t) = t_main {
+            eprintln!("mtp_setup prefill_main_us={}", t.elapsed().as_micros());
+        }
+        let t_history = trace_setup.then(Instant::now);
         let mut mtp_history = LayerKvCache::default();
         for index in 0..prompt.len().saturating_sub(1) {
             let state = Tensor::row(final_states.row_slice(index)?.to_vec())?;
             let token_id = prompt[index + 1];
             let position = mtp_history.len();
             let _ = self.mtp_forward_post_hidden(&state, token_id, position, &mut mtp_history)?;
+        }
+        if let Some(t) = t_history {
+            eprintln!(
+                "mtp_setup prefill_mtp_history_us={} steps={}",
+                t.elapsed().as_micros(),
+                prompt.len().saturating_sub(1)
+            );
         }
         Ok((cache, final_state, mtp_history))
     }
@@ -2963,7 +3096,7 @@ impl CausalDecoder {
                 "prefix-cache Metal sans executor Metal".to_string(),
             ));
         };
-        for (layer, snapshot) in cache.layers.iter_mut().zip(snapshots.into_iter()) {
+        for (layer, snapshot) in cache.layers.iter_mut().zip(snapshots) {
             layer.linear.restore_metal_state_snapshot(metal, snapshot)?;
         }
         Ok(())
@@ -3106,6 +3239,32 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
+        // Chemin AR : n'a besoin que du dernier état normé (1er token décodé).
+        let Some((cache, final_hidden)) = self.prefill_resident_cache_and_hidden(prompt)? else {
+            return Ok(None);
+        };
+        let final_hidden = Tensor::row(final_hidden.last_row()?.to_vec())?;
+        let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+        Ok(Some((cache, final_state)))
+    }
+
+    /// Exécute le prefill résident fusionné et renvoie `(cache, hidden final de
+    /// TOUTES les positions)` — pré-norme, rang 2 `[seq, hidden]`.
+    ///
+    /// C'est le chemin rapide partagé : le wrapper AR n'en garde que la dernière
+    /// ligne, tandis que le prefill MTP (historique committed) a besoin de toutes
+    /// les lignes pour semer la tête MTP. `None` = préconditions non réunies
+    /// (repli per-op de l'appelant), byte-identique au chemin per-op.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si l'embedding, le forward résident ou la construction
+    /// du cache échoue.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn prefill_resident_cache_and_hidden(
+        &self,
+        prompt: &[usize],
+    ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
         if !prefill_resident_enabled() {
             return Ok(None);
         }
@@ -3201,9 +3360,7 @@ impl CausalDecoder {
                     }
                 }
                 cache.position = prompt.len();
-                let final_hidden = Tensor::row(final_hidden.last_row()?.to_vec())?;
-                let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
-                Ok(Some((cache, final_state)))
+                Ok(Some((cache, final_hidden)))
             }
             Err(error) => {
                 if trace_prefill_enabled() {

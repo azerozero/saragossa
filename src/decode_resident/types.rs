@@ -49,6 +49,7 @@ pub(crate) struct FullAttnDenseLayerWeights<'a> {
     pub qkv_proj: Option<&'a MetalLinearWeightBuffers>,
     /// Force le buffer concaténé pour le layout K=V sans `v_proj` séparé.
     pub qkv_proj_without_gate: bool,
+    pub value_norm: bool,
     pub q_proj: &'a MetalLinearWeightBuffers,
     pub k_proj: &'a MetalLinearWeightBuffers,
     pub v_proj: &'a MetalLinearWeightBuffers,
@@ -63,6 +64,7 @@ pub(crate) struct FullAttnDenseLayerWeights<'a> {
     pub up_proj: &'a MetalLinearWeightBuffers,
     pub down_proj: &'a MetalLinearWeightBuffers,
     pub tail_score: &'a Buffer,
+    pub parallel_moe: Option<GemmaParallelMoeTailWeights<'a>>,
 }
 
 /// Dimensions + paramètres RoPE d'UNE couche full-attn de decode résident.
@@ -72,7 +74,9 @@ pub(crate) struct FullAttnLayerDims {
     pub q_heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
+    pub attn_scalar: f32,
     pub rope_dims: usize,
+    pub rope_frequency_dim: usize,
     pub position: usize,
     /// Première ligne KV incluse dans le softmax (`0` = contexte complet).
     pub window_start: usize,
@@ -121,6 +125,25 @@ pub(crate) struct GemmaMoeTailWeights<'a> {
     pub layer_scalar: Option<f32>,
     pub moe: &'a MetalMoeRoutedWeights,
     pub top_k: usize,
+}
+
+/// Poids du tail dense + MoE parallèle Gemma 4.
+#[derive(Clone, Copy)]
+pub(crate) struct GemmaParallelMoeTailWeights<'a> {
+    pub dense_gate_proj: &'a MetalLinearWeightBuffers,
+    pub dense_up_proj: &'a MetalLinearWeightBuffers,
+    pub dense_down_proj: &'a MetalLinearWeightBuffers,
+    pub pre_feedforward_norm: &'a Buffer,
+    pub post_feedforward_norm_1: &'a Buffer,
+    pub moe: &'a MetalMoeRoutedWeights,
+    pub top_k: usize,
+    pub router_norm: Option<(&'a BufferRef, f32)>,
+    pub per_expert_scale: Option<&'a BufferRef>,
+    pub pre_feedforward_norm_2: &'a Buffer,
+    pub post_feedforward_norm_2: &'a Buffer,
+    pub post_feedforward_norm: &'a Buffer,
+    pub layer_scalar: Option<f32>,
+    pub dense_inter_dim: usize,
 }
 
 /// Cumul CPU des temps par section du decode résident (ÉTAPE 0 tranche 3,

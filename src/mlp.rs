@@ -55,6 +55,18 @@ impl FeedForward {
             Self::Moe(mlp) => mlp.forward_with_runtime(x, runtime),
         }
     }
+
+    pub(crate) fn forward_with_router_source(
+        &self,
+        x: &Tensor,
+        router_source: &Tensor,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward_with_runtime(x, runtime),
+            Self::Moe(mlp) => mlp.forward_with_router_source(x, router_source, runtime),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +155,15 @@ pub struct MoeMlp {
     per_expert_scale: Option<Tensor>,
 }
 
+/// Capture les projections des experts routés d'une ligne MoE.
+#[cfg(test)]
+pub(crate) struct MoePrecisionCapture {
+    pub expert_indices: Vec<usize>,
+    pub gate: Tensor,
+    pub up: Tensor,
+    pub down: Tensor,
+}
+
 /// Expose les poids du routeur Gemma 4 au chemin Metal résident.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) struct GemmaMoeMetalParts<'a> {
@@ -211,82 +232,176 @@ impl MoeMlp {
         self.forward_with_runtime(x, ForwardRuntime::cpu())
     }
 
+    /// Capture gate/up/down des experts sélectionnés, triés par indice.
+    #[cfg(test)]
+    pub(crate) fn precision_capture(&self, x: &Tensor) -> Result<MoePrecisionCapture> {
+        let input = Tensor::row(x.as_row()?.to_vec())?;
+        let router_input = match &self.router_norm {
+            Some((weight, eps)) => rms_norm(&input, weight, *eps)?,
+            None => input.clone(),
+        };
+        let logits = self.router.forward(&router_input)?;
+        let mut selected = self
+            .top_weights(logits.as_row()?)?
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+
+        let mut gate_rows = Vec::new();
+        let mut up_rows = Vec::new();
+        let mut down_rows = Vec::new();
+        let mut intermediate = None;
+        let mut output = None;
+        for index in &selected {
+            let expert = &self.experts[*index];
+            let gate = expert.gate_proj.forward(&input)?;
+            let up = expert.up_proj.forward(&input)?;
+            let hidden = expert.activation.apply(&gate).mul_elementwise(&up)?;
+            let down = expert.down_proj.forward(&hidden)?;
+            intermediate.get_or_insert(gate.len());
+            output.get_or_insert(down.len());
+            gate_rows.extend_from_slice(gate.as_row()?);
+            up_rows.extend_from_slice(up.as_row()?);
+            down_rows.extend_from_slice(down.as_row()?);
+        }
+        let rows = selected.len();
+        Ok(MoePrecisionCapture {
+            expert_indices: selected,
+            gate: Tensor::from_vec(vec![rows, intermediate.unwrap_or(0)], gate_rows)?,
+            up: Tensor::from_vec(vec![rows, intermediate.unwrap_or(0)], up_rows)?,
+            down: Tensor::from_vec(vec![rows, output.unwrap_or(0)], down_rows)?,
+        })
+    }
+
+    /// Renvoie la branche routée et ses poids pour les oracles Metal réels.
+    #[cfg(test)]
+    pub(crate) fn routed_parts_for_test(&self) -> (&Linear, &[GatedMlp], usize) {
+        (&self.router, &self.experts, self.top_k)
+    }
+
+    /// Calcule la contribution routée seule sur CPU.
+    #[cfg(test)]
+    pub(crate) fn routed_only_for_test(&self, x: &Tensor) -> Result<Tensor> {
+        let (rows, hidden) = x.as_matrix()?;
+        let router_logits = self.router.forward(x)?;
+        let mut output = Vec::new();
+        let mut out_dim = None;
+        for row in 0..rows {
+            let input = Tensor::row(x.row_slice(row)?.to_vec())?;
+            let mut acc = None;
+            for (expert, weight) in self.top_weights(router_logits.row_slice(row)?)? {
+                let expert_out = self.experts[expert].forward(&input)?;
+                add_scaled_row(&mut acc, expert_out.as_row()?, weight)?;
+            }
+            let row = acc.ok_or_else(|| InferError::Config("MoE routé sans sortie".to_string()))?;
+            out_dim.get_or_insert(row.len());
+            output.extend(row);
+        }
+        Tensor::from_vec(vec![rows, out_dim.unwrap_or(hidden)], output)
+    }
+
     /// Exécute le MoE avec le runtime demandé.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si le routage, un expert ou le runtime échoue.
     pub fn forward_with_runtime(&self, x: &Tensor, runtime: ForwardRuntime<'_>) -> Result<Tensor> {
+        self.forward_with_router_source(x, x, runtime)
+    }
+
+    /// Exécute le MoE avec des entrées distinctes pour les experts et le
+    /// routeur. Gemma 4 normalise ces deux branches depuis le même résiduel,
+    /// avec des poids de norme différents.
+    pub(crate) fn forward_with_router_source(
+        &self,
+        x: &Tensor,
+        router_source: &Tensor,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<Tensor> {
         let (batch, hidden) = x.as_matrix()?;
+        let (router_batch, router_hidden) = router_source.as_matrix()?;
+        if (router_batch, router_hidden) != (batch, hidden) {
+            return Err(InferError::Dimension(format!(
+                "MoE expert=[{batch},{hidden}] routeur=[{router_batch},{router_hidden}]"
+            )));
+        }
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(metal) = runtime.metal_executor() {
-            if batch == 1 {
-                if let Some((router, experts, top_k, shared_expert, shared_gate)) =
-                    self.shared_metal_parts()
-                {
-                    match metal.moe_gated_router_topk_shared(
-                        x,
-                        router,
-                        experts,
-                        top_k,
-                        shared_expert,
-                        shared_gate,
-                    ) {
-                        Ok(output) => return Ok(output),
-                        Err(error) => {
-                            if trace_moe_enabled() {
-                                eprintln!("moe shared router gpu fallback: {error}");
+        if self.router_norm.is_none() && std::ptr::eq(x, router_source) {
+            if let Some(metal) = runtime.metal_executor() {
+                if batch == 1 {
+                    if let Some((router, experts, top_k, shared_expert, shared_gate)) =
+                        self.shared_metal_parts()
+                    {
+                        match metal.moe_gated_router_topk_shared(
+                            x,
+                            router,
+                            experts,
+                            top_k,
+                            shared_expert,
+                            shared_gate,
+                        ) {
+                            Ok(output) => return Ok(output),
+                            Err(error) => {
+                                if trace_moe_enabled() {
+                                    eprintln!("moe shared router gpu fallback: {error}");
+                                }
                             }
                         }
-                    }
-                } else {
-                    match metal.moe_gated_router_topk(x, &self.router, &self.experts, self.top_k) {
-                        Ok(output) => return Ok(output),
-                        Err(error) => {
-                            if trace_moe_enabled() {
-                                eprintln!("moe router gpu fallback: {error}");
-                            }
-                        }
-                    }
-                }
-            }
-            if batch == 2 {
-                if let Some((router, experts, top_k, shared_expert, shared_gate)) =
-                    self.shared_metal_parts()
-                {
-                    match metal.moe_gated_router_topk_shared_batch2(
-                        x,
-                        router,
-                        experts,
-                        top_k,
-                        shared_expert,
-                        shared_gate,
-                    ) {
-                        Ok(output) => return Ok(output),
-                        Err(error) => {
-                            if trace_moe_enabled() {
-                                eprintln!("moe shared batch2 gpu fallback: {error}");
+                    } else {
+                        match metal.moe_gated_router_topk(
+                            x,
+                            &self.router,
+                            &self.experts,
+                            self.top_k,
+                        ) {
+                            Ok(output) => return Ok(output),
+                            Err(error) => {
+                                if trace_moe_enabled() {
+                                    eprintln!("moe router gpu fallback: {error}");
+                                }
                             }
                         }
                     }
                 }
-            }
-            if batch > 1 && crate::runtime_flags::prefill_moe_rows_enabled() {
-                if let Some((router, experts, top_k, shared_expert, shared_gate)) =
-                    self.shared_metal_parts()
-                {
-                    match metal.moe_gated_router_topk_shared_rows(
-                        x,
-                        router,
-                        experts,
-                        top_k,
-                        shared_expert,
-                        shared_gate,
-                    ) {
-                        Ok(output) => return Ok(output),
-                        Err(error) => {
-                            if trace_moe_enabled() {
-                                eprintln!("moe shared rows gpu fallback: {error}");
+                if batch == 2 {
+                    if let Some((router, experts, top_k, shared_expert, shared_gate)) =
+                        self.shared_metal_parts()
+                    {
+                        match metal.moe_gated_router_topk_shared_batch2(
+                            x,
+                            router,
+                            experts,
+                            top_k,
+                            shared_expert,
+                            shared_gate,
+                        ) {
+                            Ok(output) => return Ok(output),
+                            Err(error) => {
+                                if trace_moe_enabled() {
+                                    eprintln!("moe shared batch2 gpu fallback: {error}");
+                                }
+                            }
+                        }
+                    }
+                }
+                if batch > 1 && crate::runtime_flags::prefill_moe_rows_enabled() {
+                    if let Some((router, experts, top_k, shared_expert, shared_gate)) =
+                        self.shared_metal_parts()
+                    {
+                        match metal.moe_gated_router_topk_shared_rows(
+                            x,
+                            router,
+                            experts,
+                            top_k,
+                            shared_expert,
+                            shared_gate,
+                        ) {
+                            Ok(output) => return Ok(output),
+                            Err(error) => {
+                                if trace_moe_enabled() {
+                                    eprintln!("moe shared rows gpu fallback: {error}");
+                                }
                             }
                         }
                     }
@@ -294,8 +409,8 @@ impl MoeMlp {
             }
         }
         let router_input = match &self.router_norm {
-            Some((weight, eps)) => rms_norm(x, weight, *eps)?,
-            None => x.clone(),
+            Some((weight, eps)) => rms_norm(router_source, weight, *eps)?,
+            None => router_source.clone(),
         };
         let router_logits = self.router.forward_with_runtime(&router_input, runtime)?;
         let (_, expert_count) = router_logits.as_matrix()?;
@@ -541,6 +656,33 @@ mod tests {
         assert_eq!(out.shape(), &[2, 1]);
         assert!((out.data()[0] - silu_scalar(1.0)).abs() < 1.0e-5);
         assert!((out.data()[1] - 2.0 * silu_scalar(2.0)).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn moe_routes_from_distinct_source() {
+        let router = Linear::new(
+            Tensor::from_vec(vec![2, 2], vec![4.0, 0.0, 0.0, 4.0])
+                .expect("invariant: routeur valide"),
+            None,
+        )
+        .expect("invariant: routeur linear valide");
+        let moe = MoeMlp::new(
+            router,
+            vec![constant_expert(1.0), constant_expert(2.0)],
+            None,
+            None,
+            1,
+        )
+        .expect("invariant: MoE valide");
+        let expert_input = Tensor::row(vec![1.0, 0.0]).expect("invariant: entrée expert");
+        let router_source = Tensor::row(vec![0.0, 1.0]).expect("invariant: entrée routeur");
+
+        let out = moe
+            .forward_with_router_source(&expert_input, &router_source, ForwardRuntime::cpu())
+            .expect("invariant: forward distinct valide");
+
+        assert_eq!(out.shape(), &[1, 1]);
+        assert!((out.data()[0] - 2.0 * silu_scalar(2.0)).abs() < 1.0e-5);
     }
 
     fn constant_expert(scale: f32) -> GatedMlp {

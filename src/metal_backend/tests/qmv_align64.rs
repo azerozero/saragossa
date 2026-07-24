@@ -172,6 +172,51 @@ fn routed_affine_outputs(
     ))
 }
 
+fn qmm_na_tiled_u4_align64_reference(
+    executor: &MetalExecutor,
+    weight: &AffineQuantizedTensor,
+    lhs: &[f32],
+    batch: usize,
+    label: &'static str,
+) -> Result<Vec<f32>> {
+    let [out_dim, in_dim] = weight.shape() else {
+        return Err(InferError::Dimension(format!(
+            "{label}: poids attendu rang 2, reçu {:?}",
+            weight.shape()
+        )));
+    };
+    if lhs.len() != batch * *in_dim {
+        return Err(InferError::Dimension(format!(
+            "{label}: lhs len={} incompatible batch={batch} in_dim={in_dim}",
+            lhs.len()
+        )));
+    }
+
+    let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
+    let packed = executor.buffer_from_slice(weight.packed_data(), label)?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), label)?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), label)?;
+    let out_buf = executor.uncached_f32_buffer(batch * *out_dim, label)?;
+
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_affine_qmm_na_fused_tiled_u4_align64_buffers(
+        encoder,
+        &lhs_buf,
+        &packed,
+        &scales,
+        &biases,
+        &out_buf,
+        batch,
+        *in_dim,
+        *out_dim,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    read_f32_buffer(&out_buf, batch * *out_dim)
+}
+
 #[test]
 fn affine_qmv_u8_gs64_align64_matches_generic_and_routes() -> Result<()> {
     let Some(executor) = test_executor()? else {
@@ -303,5 +348,106 @@ fn affine_qmv_u4_gs64_align64_matches_generic_and_routes() -> Result<()> {
         ),
         AffineMatmulKernel::FastQmvU4
     ));
+    Ok(())
+}
+
+#[test]
+fn affine_qmm_na_fused_tiled_u4_align64_matches_generic_and_routes() -> Result<()> {
+    const BATCH: usize = 32;
+    const IN_DIM: usize = 2816;
+    const EPS: f32 = 1.0e-3;
+    assert!(can_use_qmm_na_fused_tiled_u4_align64_buffers(
+        BATCH,
+        IN_DIM,
+        2048,
+        FAST_QMV_GROUP_SIZE,
+        FAST_QMV_BITS,
+    ));
+    assert!(!can_use_qmm_na_fused_tiled_u4_align64_buffers(
+        1,
+        IN_DIM,
+        2048,
+        FAST_QMV_GROUP_SIZE,
+        FAST_QMV_BITS,
+    ));
+    assert!(!can_use_qmm_na_fused_tiled_u4_align64_buffers(
+        BATCH,
+        2048,
+        2048,
+        FAST_QMV_GROUP_SIZE,
+        FAST_QMV_BITS,
+    ));
+
+    let Some(executor) = test_executor()? else {
+        eprintln!("skip: aucun device Metal pour l'oracle GEMM u4 align64");
+        return Ok(());
+    };
+    if executor.na_gemm_coop_qb_tiled_u4.is_none() {
+        eprintln!("skip: Neural Accelerators indisponibles pour l'oracle GEMM u4 align64");
+        return Ok(());
+    }
+    assert!(
+        executor.na_gemm_coop_qb_tiled_u4_align64.is_some(),
+        "la pipeline GEMM u4 align64 doit compiler quand le GEMM u4 nominal compile"
+    );
+
+    for out_dim in [2048_usize, 4096] {
+        let linear = LinearWeight::AffineQuantized(test_affine(
+            out_dim,
+            IN_DIM,
+            1.0 / 256.0,
+        )?);
+        let LinearWeight::AffineQuantized(weight) = &linear else {
+            return Err(InferError::Dimension(
+                "oracle GEMM u4 align64 construit avec un poids non affine".to_string(),
+            ));
+        };
+        let lhs = (0..BATCH * IN_DIM)
+            .map(|i| (((i * 37 + (i / IN_DIM) * 11) % 31) as f32 - 15.0) / 64.0)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            executor.select_owned_affine_matmul_kernel(BATCH, IN_DIM, weight, false),
+            AffineMatmulKernel::QmmNaFusedTiledU4Align64
+        ));
+        assert!(matches!(
+            executor.select_resident_affine_matmul_kernel(
+                BATCH,
+                IN_DIM,
+                out_dim,
+                FAST_QMV_GROUP_SIZE,
+                FAST_QMV_BITS,
+                false,
+            ),
+            AffineMatmulKernel::QmmNaFusedTiledU4Align64
+        ));
+
+        let generic = generic_affine_reference(
+            &executor,
+            weight,
+            &lhs,
+            BATCH,
+            "qmm_u4_align64_generic",
+        )?;
+        let tiled = qmm_na_tiled_u4_align64_reference(
+            &executor,
+            weight,
+            &lhs,
+            BATCH,
+            "qmm_u4_align64_tiled",
+        )?;
+        let (owned, resident) = routed_affine_outputs(
+            &executor,
+            &linear,
+            &lhs,
+            BATCH,
+            "qmm_u4_align64_routes",
+        )?;
+
+        // Activations et poids sont exactement représentables en bf16 : ε ne
+        // couvre que l'association différente des réductions f32 du GEMM tuilé.
+        assert_close_eps(&tiled, &generic, EPS);
+        assert_close_eps(&owned, &generic, EPS);
+        assert_close_eps(&resident, &generic, EPS);
+    }
     Ok(())
 }

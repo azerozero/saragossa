@@ -4,6 +4,34 @@ use super::utils::byte_offset_f32;
 use super::*;
 
 impl DecodeResidentState {
+    fn encode_query_attention_scale(
+        executor: &MetalExecutor,
+        encoder: &ComputeCommandEncoderRef,
+        owned: &mut Vec<Buffer>,
+        query: &BufferRef,
+        query_len: usize,
+        head_dim: usize,
+        attn_scalar: f32,
+    ) -> Result<()> {
+        if !attn_scalar.is_finite() || attn_scalar <= 0.0 {
+            return Err(InferError::Config(format!(
+                "scalaire d'attention résident invalide: {attn_scalar}"
+            )));
+        }
+        let scale = ((head_dim as f32) / attn_scalar).sqrt();
+        if scale.to_bits() != 1.0_f32.to_bits() {
+            executor.encode_accumulate_scaled(
+                encoder,
+                owned,
+                query,
+                query,
+                scale - 1.0,
+                query_len,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Encode UNE couche full-attn (decode résident 1c) à la position
     /// `dims.position` dans l'encoder PARTAGÉ : `layer_in [hidden]` → `layer_out
     /// [hidden]`, sans commit ni readback. Reproduit entièrement sur GPU le couple
@@ -192,9 +220,19 @@ impl DecodeResidentState {
             dims.q_heads,
             dims.head_dim,
             dims.rope_dims,
+            dims.rope_frequency_dim,
             dims.position,
             dims.eps,
             dims.theta,
+        )?;
+        Self::encode_query_attention_scale(
+            executor,
+            encoder,
+            owned,
+            q_roped.tensor().buffer(),
+            q_dim,
+            dims.head_dim,
+            dims.attn_scalar,
         )?;
         if qkv_concat_used {
             let k_offset = byte_offset_f32(q_gate_dim, "full-attn k offset")?;
@@ -213,6 +251,7 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
+                dims.rope_frequency_dim,
                 dims.position,
                 dims.eps,
                 dims.theta,
@@ -233,6 +272,7 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
+                dims.rope_frequency_dim,
                 dims.position,
                 dims.eps,
                 dims.theta,
@@ -487,9 +527,19 @@ impl DecodeResidentState {
             dims.q_heads,
             dims.head_dim,
             dims.rope_dims,
+            dims.rope_frequency_dim,
             dims.position,
             dims.eps,
             dims.theta,
+        )?;
+        Self::encode_query_attention_scale(
+            executor,
+            encoder,
+            owned,
+            q_roped.tensor().buffer(),
+            q_dim,
+            dims.head_dim,
+            dims.attn_scalar,
         )?;
         self.encode_rms_norm_rope_decode_with_offset(
             encoder,
@@ -500,6 +550,7 @@ impl DecodeResidentState {
             dims.kv_heads,
             dims.head_dim,
             dims.rope_dims,
+            dims.rope_frequency_dim,
             dims.position,
             dims.eps,
             dims.theta,
@@ -674,6 +725,7 @@ impl DecodeResidentState {
         let q_proj_out = self.scratch().lease(q_proj_dim, GpuElement::F32)?;
         let k_raw = self.scratch().lease(kv_dim, GpuElement::F32)?;
         let v_raw = self.scratch().lease(kv_dim, GpuElement::F32)?;
+        let v_normed = self.scratch().lease(kv_dim, GpuElement::F32)?;
         let q_raw = self.scratch().lease(q_dim, GpuElement::F32)?;
         let gate = self.scratch().lease(q_dim, GpuElement::F32)?;
         let q_roped = self.scratch().lease(q_dim, GpuElement::F32)?;
@@ -827,9 +879,19 @@ impl DecodeResidentState {
             dims.q_heads,
             dims.head_dim,
             dims.rope_dims,
+            dims.rope_frequency_dim,
             dims.position,
             dims.eps,
             dims.theta,
+        )?;
+        Self::encode_query_attention_scale(
+            executor,
+            encoder,
+            owned,
+            q_roped.tensor().buffer(),
+            q_dim,
+            dims.head_dim,
+            dims.attn_scalar,
         )?;
         if qkv_concat_used {
             let k_offset = byte_offset_f32(q_proj_dim, "full-attn dense k offset")?;
@@ -848,17 +910,43 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
+                dims.rope_frequency_dim,
                 dims.position,
                 dims.eps,
                 dims.theta,
             )?;
-            kv.encode_append_kv_with_offsets(
-                encoder,
-                k_roped.tensor().buffer(),
-                0,
-                qkv_proj_out.tensor().buffer(),
-                v_offset,
-            )?;
+            if weights.value_norm {
+                executor.encode_copy_with_offsets(
+                    encoder,
+                    qkv_proj_out.tensor().buffer(),
+                    v_offset,
+                    v_raw.tensor().buffer(),
+                    0,
+                    kv_dim,
+                )?;
+                executor.encode_rms_norm_heads_no_scale_rows(
+                    encoder,
+                    v_raw.tensor().buffer(),
+                    v_normed.tensor().buffer(),
+                    1,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.eps,
+                )?;
+                kv.encode_append_kv(
+                    encoder,
+                    k_roped.tensor().buffer(),
+                    v_normed.tensor().buffer(),
+                )?;
+            } else {
+                kv.encode_append_kv_with_offsets(
+                    encoder,
+                    k_roped.tensor().buffer(),
+                    0,
+                    qkv_proj_out.tensor().buffer(),
+                    v_offset,
+                )?;
+            }
         } else {
             self.encode_rms_norm_rope_decode(
                 encoder,
@@ -868,11 +956,29 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
+                dims.rope_frequency_dim,
                 dims.position,
                 dims.eps,
                 dims.theta,
             )?;
-            kv.encode_append_kv(encoder, k_roped.tensor().buffer(), v_raw.tensor().buffer())?;
+            if weights.value_norm {
+                executor.encode_rms_norm_heads_no_scale_rows(
+                    encoder,
+                    v_raw.tensor().buffer(),
+                    v_normed.tensor().buffer(),
+                    1,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.eps,
+                )?;
+                kv.encode_append_kv(
+                    encoder,
+                    k_roped.tensor().buffer(),
+                    v_normed.tensor().buffer(),
+                )?;
+            } else {
+                kv.encode_append_kv(encoder, k_roped.tensor().buffer(), v_raw.tensor().buffer())?;
+            }
         }
         kv.encode_attention_decode_windowed(
             encoder,
@@ -952,6 +1058,19 @@ impl DecodeResidentState {
                 hidden,
                 dims.eps,
             )?;
+        }
+        if let Some(parallel_moe) = weights.parallel_moe {
+            return self.encode_gemma_parallel_moe_tail(
+                executor,
+                encoder,
+                owned,
+                summed.tensor().buffer(),
+                layer_out,
+                1,
+                hidden,
+                dims.eps,
+                parallel_moe,
+            );
         }
         match (weights.pre_feedforward_norm, weights.post_feedforward_norm) {
             (Some(pre_feedforward_norm), Some(post_feedforward_norm)) => self
@@ -1067,6 +1186,8 @@ impl DecodeResidentState {
         let q_proj_out = self.scratch().lease(batch_q_proj, GpuElement::F32)?;
         let k_proj_out = self.scratch().lease(batch_kv, GpuElement::F32)?;
         let v_proj_out = self.scratch().lease(batch_kv, GpuElement::F32)?;
+        let v_row = self.scratch().lease(kv_dim, GpuElement::F32)?;
+        let v_normed = self.scratch().lease(kv_dim, GpuElement::F32)?;
         let q_raw = self.scratch().lease(batch_q, GpuElement::F32)?;
         let gate = self.scratch().lease(batch_q, GpuElement::F32)?;
         let q_roped = self.scratch().lease(q_dim, GpuElement::F32)?;
@@ -1185,9 +1306,19 @@ impl DecodeResidentState {
                 dims.q_heads,
                 dims.head_dim,
                 dims.rope_dims,
+                dims.rope_frequency_dim,
                 dims.position + row,
                 dims.eps,
                 dims.theta,
+            )?;
+            Self::encode_query_attention_scale(
+                executor,
+                encoder,
+                owned,
+                q_roped.tensor().buffer(),
+                q_dim,
+                dims.head_dim,
+                dims.attn_scalar,
             )?;
             let k_offset = if weights.qkv_proj.is_some() {
                 let qkv_row = row.checked_mul(qkv_proj_dim).ok_or_else(|| {
@@ -1218,6 +1349,7 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
+                dims.rope_frequency_dim,
                 dims.position + row,
                 dims.eps,
                 dims.theta,
@@ -1238,17 +1370,43 @@ impl DecodeResidentState {
                 })?;
                 byte_offset_f32(v_row, "full-attn dense rows split v offset")?
             };
-            kv.encode_append_kv_with_offsets(
-                encoder,
-                k_roped.tensor().buffer(),
-                0,
-                if weights.qkv_proj.is_some() {
-                    qkv_proj_out.tensor().buffer()
-                } else {
-                    v_proj_out.tensor().buffer()
-                },
-                v_offset,
-            )?;
+            let v_source = if weights.qkv_proj.is_some() {
+                qkv_proj_out.tensor().buffer()
+            } else {
+                v_proj_out.tensor().buffer()
+            };
+            if weights.value_norm {
+                executor.encode_copy_with_offsets(
+                    encoder,
+                    v_source,
+                    v_offset,
+                    v_row.tensor().buffer(),
+                    0,
+                    kv_dim,
+                )?;
+                executor.encode_rms_norm_heads_no_scale_rows(
+                    encoder,
+                    v_row.tensor().buffer(),
+                    v_normed.tensor().buffer(),
+                    1,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.eps,
+                )?;
+                kv.encode_append_kv(
+                    encoder,
+                    k_roped.tensor().buffer(),
+                    v_normed.tensor().buffer(),
+                )?;
+            } else {
+                kv.encode_append_kv_with_offsets(
+                    encoder,
+                    k_roped.tensor().buffer(),
+                    0,
+                    v_source,
+                    v_offset,
+                )?;
+            }
             kv.encode_attention_decode_windowed(
                 encoder,
                 q_roped.tensor().buffer(),
@@ -1325,6 +1483,19 @@ impl DecodeResidentState {
                 hidden,
                 dims.eps,
             )?;
+        }
+        if let Some(parallel_moe) = weights.parallel_moe {
+            return self.encode_gemma_parallel_moe_tail(
+                executor,
+                encoder,
+                owned,
+                summed.tensor().buffer(),
+                layer_out,
+                rows,
+                hidden,
+                dims.eps,
+                parallel_moe,
+            );
         }
         match (weights.pre_feedforward_norm, weights.post_feedforward_norm) {
             (Some(pre_feedforward_norm), Some(post_feedforward_norm)) => self

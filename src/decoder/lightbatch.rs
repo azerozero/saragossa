@@ -386,6 +386,7 @@ impl CausalDecoder {
                 use_resident_full = self.setup_resident_full_decode_with_slot(
                     &mut cache,
                     max_new_tokens,
+                    0,
                     u64::try_from(slot).unwrap_or(u64::MAX),
                     options.temperature > f32::EPSILON,
                 )?;

@@ -191,9 +191,14 @@ impl AffineQuantizedTensor {
             let affine_index = row * groups + group;
             let scale = self.scales.data()[affine_index];
             let bias = self.biases.data()[affine_index];
-            for col in group * self.group_size..(group + 1) * self.group_size {
+            for (col, &input) in input_row
+                .iter()
+                .enumerate()
+                .take((group + 1) * self.group_size)
+                .skip(group * self.group_size)
+            {
                 let quantized = self.bitpacked_value(row, col) as f32;
-                acc += input_row[col] * (quantized * scale + bias);
+                acc += input * (quantized * scale + bias);
             }
         }
         acc

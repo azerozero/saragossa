@@ -59,8 +59,7 @@ saragossa occupe le quadrant **latence mono-utilisateur × Apple Silicon** :
 ## Perfs (mesurées le 2026-07-06, M5 Max)
 
 - Decode 35B-A3B greedy @1k : **145,7 tok/s** (`4bit`, défaut prod) ·
-  **105,9 tok/s** (`oQ8`) ; chemin prod T>0 devant `mlx_lm` jusqu'à 32k
-  (89,8 vs 88,1 tok/s @32k oQ8, KV bf16).
+  **105,9 tok/s** (`oQ8`) · **89,8 tok/s** @32k (`oQ8`, KV bf16).
 - Prefill 35B : 1,0 s @2k · 3,5 s @8k · 23,3 s @32k.
 - STT Whisper turbo : rtf 0,107 · TTS : e2e 0,747, TTFA streaming ~1,2 s.
 

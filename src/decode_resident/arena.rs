@@ -6,6 +6,22 @@ use super::kernels::{
 use super::utils::{write_f32_at, write_u32_at};
 use super::*;
 
+thread_local! {
+    static PIPELINE_SCRATCH_SLOT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub(crate) struct PipelineScratchGuard(Option<usize>);
+
+impl Drop for PipelineScratchGuard {
+    fn drop(&mut self) {
+        PIPELINE_SCRATCH_SLOT.with(|current| current.set(self.0));
+    }
+}
+
+pub(crate) fn install_pipeline_scratch_slot(slot: usize) -> PipelineScratchGuard {
+    PIPELINE_SCRATCH_SLOT.with(|current| PipelineScratchGuard(current.replace(Some(slot))))
+}
+
 /// Type d'élément d'un buffer résident.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GpuElement {
@@ -309,6 +325,7 @@ impl DecodeResidentState {
             options,
             persistent: Vec::new(),
             scratch,
+            pipeline_scratch: Vec::new(),
             attention_decode_naive,
             attention_decode_flash,
             attention_decode_flash_d256,
@@ -362,7 +379,22 @@ impl DecodeResidentState {
 
     /// Renvoie le pool de scratch à bail des intermédiaires transitoires.
     pub(crate) fn scratch(&self) -> &ScratchPool {
-        &self.scratch
+        let slot = PIPELINE_SCRATCH_SLOT.with(Cell::get);
+        slot.and_then(|slot| self.pipeline_scratch.get(slot))
+            .unwrap_or(&self.scratch)
+    }
+
+    /// Prépare un pool scratch indépendant pour chaque command buffer en vol.
+    pub(crate) fn prepare_pipeline_scratch(&mut self, slots: usize) {
+        if self.pipeline_scratch.len() >= slots {
+            return;
+        }
+        self.pipeline_scratch
+            .reserve(slots - self.pipeline_scratch.len());
+        while self.pipeline_scratch.len() < slots {
+            self.pipeline_scratch
+                .push(ScratchPool::new(self.device.clone(), self.options));
+        }
     }
 
     /// Renvoie le device Metal (pour la création du command buffer / des kernels).

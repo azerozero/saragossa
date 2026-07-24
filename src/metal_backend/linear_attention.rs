@@ -2,6 +2,11 @@
 
 use super::*;
 
+type LinearAttentionStateCaptures = (
+    Vec<Option<Vec<LinearAttentionMetalState>>>,
+    Vec<crate::decode_resident::ScratchLease>,
+);
+
 #[expect(
     clippy::too_many_arguments,
     reason = "wrappers d'encodage Metal: buffers, dimensions et offsets restent explicites"
@@ -41,10 +46,7 @@ impl MetalExecutor {
         scratch: &crate::decode_resident::ScratchPool,
         states: &[Option<&LinearAttentionMetalState>],
         rows: usize,
-    ) -> Result<(
-        Vec<Option<Vec<LinearAttentionMetalState>>>,
-        Vec<crate::decode_resident::ScratchLease>,
-    )> {
+    ) -> Result<LinearAttentionStateCaptures> {
         let _ = self;
         if rows == 0 {
             return Err(InferError::Dimension(
@@ -2050,10 +2052,6 @@ impl MetalExecutor {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "microbench linear-attn full: poids, dims et overhead doivent rester explicites"
-    )]
     fn profile_linear_attn_full_segments(
         &self,
         input: &Tensor,
@@ -2294,10 +2292,6 @@ impl MetalExecutor {
     /// buffer pour classer les coûts. Les temps ne doivent pas être additionnés
     /// comme un temps de couche réel, mais ils indiquent les noyaux à fusionner ou
     /// spécialiser.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "microbench linear-attn: poids, dims et overhead restent explicites"
-    )]
     pub(crate) fn profile_linear_attn_dense_segments(
         &self,
         input: &Tensor,

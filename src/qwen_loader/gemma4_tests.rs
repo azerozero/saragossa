@@ -285,6 +285,13 @@ fn compare_prefill_paths(
         }
     }
     let state_delta = max_abs_delta(per_op_state.data(), resident_state.data());
+    assert!(
+        first_gross.is_none(),
+        "prefill A/B: divergence KV grossière {first_gross:?}; max KV=couche {} {} {}",
+        largest.0,
+        largest.1,
+        largest.2
+    );
     let logits = decoder
         .logits_from_final_state(per_op_state)
         .and_then(|per_op| {
@@ -338,15 +345,29 @@ fn gemma4_resident_prefill_tokens_match_per_op() {
         stop_token_ids: assets.stop_token_ids(),
         ..GenerationOptions::default()
     };
-    let generate = |resident: bool| {
-        let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(resident);
+    let per_op = {
+        let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(false);
         decoder
             .generate_greedy_timed_with_options(&prompt_ids, 32, &options)
-            .expect("invariant: génération Gemma 4 valide")
+            .expect("invariant: génération Gemma 4 per-op valide")
             .tokens
     };
-    let per_op = generate(false);
-    let resident = generate(true);
+    let resident = {
+        let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(true);
+        let (cache, state) = decoder
+            .prefill_cache_state_metal_resident_for_test(&prompt_ids)
+            .expect("invariant: gate résident Gemma 4 interrogeable")
+            .expect("invariant: le gate Gemma 4 réel atteint le prefill résident");
+        decoder
+            .generate_greedy_timed_from_prompt_state_with_options(
+                crate::CausalDecoderPromptState::new(cache, state),
+                std::time::Duration::ZERO,
+                32,
+                &options,
+            )
+            .expect("invariant: génération Gemma 4 résidente valide")
+            .tokens
+    };
     let first_div = per_op
         .iter()
         .zip(&resident)
@@ -406,8 +427,15 @@ fn generates_coherent_french_gemma4_moe() {
     let text = assets
         .decode_tokens(&tokens, true)
         .expect("invariant: sortie Gemma 4 décodable");
-    println!("gemma4_smoke_output={}", text.trim());
-    assert!(text.chars().any(char::is_alphabetic));
+    println!("gemma4_output={}", text.trim());
+    let normalized = text.to_lowercase();
+    assert!(
+        normalized.contains("bleu")
+            && ["lumière", "diffus", "rayleigh"]
+                .iter()
+                .any(|keyword| normalized.contains(keyword)),
+        "la réponse doit expliquer le ciel bleu par la lumière ou sa diffusion: {text:?}"
+    );
     assert!(!text.contains('\u{FFFD}'));
 }
 
@@ -482,29 +510,35 @@ fn assert_all_decoder_keys_mapped(config: &ModelConfig, catalog: &WeightCatalog)
     }
 }
 
-/// Renvoie le hub HF local (`$HOME/.cache/huggingface/hub`) sans chemin en dur.
+/// Renvoie le hub HF local configuré comme le résolveur de production.
 fn hf_hub() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache/huggingface/hub"))
+    crate::hf_resolve::hf_cache_dir_from_env()
 }
 
 fn real_gemma4_snapshot() -> Option<PathBuf> {
-    let path = hf_hub()?.join(
-        "models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/efbeee6e582ebfd06abc9d65e90839c4b5d2116b",
-    );
-    path.is_dir().then_some(path)
+    let snapshot = hf_hub()
+        .map(|hub| {
+            hub.join(
+                "models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/efbeee6e582ebfd06abc9d65e90839c4b5d2116b",
+            )
+        })
+        .filter(|path| path.is_dir());
+    crate::test_support::require_real_model(snapshot, "snapshot Gemma 4 MoE")
 }
 
 fn real_gemma4_unified_snapshot() -> Option<PathBuf> {
-    let hub = hf_hub()?;
-    [
-        "models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-8bit/snapshots",
-        "models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-4bit/snapshots",
-    ]
-    .into_iter()
-    .find_map(|rel| first_snapshot_dir(hub.join(rel).to_str()?))
+    let snapshot = hf_hub().and_then(|hub| {
+        [
+            "models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-8bit/snapshots",
+            "models--mlx-community--gemma-4-12b-coder-fable5-composer2.5-4bit/snapshots",
+        ]
+        .into_iter()
+        .find_map(|relative| first_snapshot_dir(&hub.join(relative)))
+    });
+    crate::test_support::require_real_model(snapshot, "snapshot Gemma 4 unified")
 }
 
-fn first_snapshot_dir(path: &str) -> Option<PathBuf> {
+fn first_snapshot_dir(path: &Path) -> Option<PathBuf> {
     let mut dirs = std::fs::read_dir(path)
         .ok()?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))

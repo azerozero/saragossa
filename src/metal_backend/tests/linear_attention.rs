@@ -1,3 +1,13 @@
+type NormGateOutputs = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+type ConvNormOutputs = (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+);
+
 #[test]
 fn linear_attn_state_snapshot_restore_roundtrip() -> Result<()> {
     let Some(executor) = test_executor()? else {
@@ -481,7 +491,7 @@ fn linear_attn_norm_gates_dk128_matches_generic() -> Result<()> {
     let scales = [inv * inv, inv];
 
     let run_kernel =
-        |pipeline: &ComputePipelineState| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        |pipeline: &ComputePipelineState| -> Result<NormGateOutputs> {
             let q_norm_buffer = executor.uncached_f32_buffer(key_dim, "norm_dk128_q")?;
             let k_norm_buffer = executor.uncached_f32_buffer(key_dim, "norm_dk128_k")?;
             let beta_buffer = executor.uncached_f32_buffer(value_heads, "norm_dk128_beta")?;
@@ -573,7 +583,7 @@ fn linear_attn_conv_norm_fused_matches_two_step() -> Result<()> {
     let scales = [inv * inv, inv];
 
     let run_two_step =
-        || -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        || -> Result<ConvNormOutputs> {
             let state_buffer = executor.upload_f32_buffer(&state_seed, "conv_norm_state_a")?;
             let conv_out_buffer = executor.uncached_f32_buffer(conv_dim, "conv_norm_out_a")?;
             let q_norm_buffer = executor.uncached_f32_buffer(key_dim, "conv_norm_q_a")?;
@@ -617,7 +627,7 @@ fn linear_attn_conv_norm_fused_matches_two_step() -> Result<()> {
             ))
         };
 
-    let run_fused = || -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let run_fused = || -> Result<ConvNormOutputs> {
         let state_buffer = executor.upload_f32_buffer(&state_seed, "conv_norm_state_b")?;
         let conv_out_buffer = executor.uncached_f32_buffer(conv_dim, "conv_norm_out_b")?;
         let q_norm_buffer = executor.uncached_f32_buffer(key_dim, "conv_norm_q_b")?;

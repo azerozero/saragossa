@@ -2,6 +2,9 @@ use super::super::*;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::metal_backend::MetalExecutor;
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+type ResidentMtpSpecOneOutput = (usize, usize, Tensor, Option<(usize, Tensor)>);
+
 impl CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     fn reset_mtp_append_oracle(mtp: &mut ResidentMtpArena) {
@@ -121,7 +124,9 @@ impl CausalDecoder {
             q_heads: self.config.num_attention_heads,
             kv_heads: self.config.num_key_value_heads,
             head_dim,
+            attn_scalar: self.config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
             rope_dims: self.config.rope_dims.unwrap_or(head_dim),
+            rope_frequency_dim: self.config.rope_dims.unwrap_or(head_dim),
             position: 0,
             window_start: 0,
             eps: self.config.rms_eps,
@@ -438,6 +443,7 @@ impl CausalDecoder {
                 input_norm: &layer.input_norm,
                 qkv_proj: layer.qkv_proj.as_ref(),
                 qkv_proj_without_gate: false,
+                value_norm: layer.value_norm,
                 q_proj: &layer.q_proj,
                 k_proj: &layer.k_proj,
                 v_proj: &layer.v_proj,
@@ -452,6 +458,7 @@ impl CausalDecoder {
                 up_proj: &layer.up_proj,
                 down_proj: &layer.down_proj,
                 tail_score: dense_tail_score,
+                parallel_moe: layer.parallel_moe_weights(),
             };
             let mut row_dims = dims;
             row_dims.position = start_position.checked_add(row).ok_or_else(|| {
@@ -723,6 +730,7 @@ impl CausalDecoder {
                 input_norm: &mtp.layer.input_norm,
                 qkv_proj: mtp.layer.qkv_proj.as_ref(),
                 qkv_proj_without_gate: false,
+                value_norm: mtp.layer.value_norm,
                 q_proj: &mtp.layer.q_proj,
                 k_proj: &mtp.layer.k_proj,
                 v_proj: &mtp.layer.v_proj,
@@ -737,13 +745,16 @@ impl CausalDecoder {
                 up_proj: &mtp.layer.up_proj,
                 down_proj: &mtp.layer.down_proj,
                 tail_score: &arena.dense_tail_score,
+                parallel_moe: mtp.layer.parallel_moe_weights(),
             };
             let dims = FullAttnLayerDims {
                 hidden,
                 q_heads,
                 kv_heads,
                 head_dim,
+                attn_scalar: self.config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
                 rope_dims,
+                rope_frequency_dim: rope_dims,
                 position,
                 window_start: 0,
                 eps,
@@ -900,6 +911,7 @@ impl CausalDecoder {
             input_norm: &mtp.layer.input_norm,
             qkv_proj: mtp.layer.qkv_proj.as_ref(),
             qkv_proj_without_gate: false,
+            value_norm: mtp.layer.value_norm,
             q_proj: &mtp.layer.q_proj,
             k_proj: &mtp.layer.k_proj,
             v_proj: &mtp.layer.v_proj,
@@ -914,13 +926,16 @@ impl CausalDecoder {
             up_proj: &mtp.layer.up_proj,
             down_proj: &mtp.layer.down_proj,
             tail_score: &arena.dense_tail_score,
+            parallel_moe: mtp.layer.parallel_moe_weights(),
         };
         let dims = FullAttnLayerDims {
             hidden,
             q_heads,
             kv_heads,
             head_dim,
+            attn_scalar: self.config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
             rope_dims,
+            rope_frequency_dim: rope_dims,
             position,
             window_start: 0,
             eps,
@@ -1116,6 +1131,7 @@ impl CausalDecoder {
                 input_norm: &mtp.layer.input_norm,
                 qkv_proj: mtp.layer.qkv_proj.as_ref(),
                 qkv_proj_without_gate: false,
+                value_norm: mtp.layer.value_norm,
                 q_proj: &mtp.layer.q_proj,
                 k_proj: &mtp.layer.k_proj,
                 v_proj: &mtp.layer.v_proj,
@@ -1130,13 +1146,16 @@ impl CausalDecoder {
                 up_proj: &mtp.layer.up_proj,
                 down_proj: &mtp.layer.down_proj,
                 tail_score: &arena.dense_tail_score,
+                parallel_moe: mtp.layer.parallel_moe_weights(),
             };
             let dims = FullAttnLayerDims {
                 hidden,
                 q_heads,
                 kv_heads,
                 head_dim,
+                attn_scalar: self.config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
                 rope_dims,
+                rope_frequency_dim: rope_dims,
                 position: position_offset.checked_add(position).ok_or_else(|| {
                     InferError::Dimension("MTP position résidente déborde".to_string())
                 })?,
@@ -1203,7 +1222,7 @@ impl CausalDecoder {
         primary: usize,
         history_len: usize,
         stop_token_ids: &[usize],
-    ) -> Result<Option<(usize, usize, Tensor, Option<(usize, Tensor)>)>> {
+    ) -> Result<Option<ResidentMtpSpecOneOutput>> {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };
@@ -1405,6 +1424,7 @@ impl CausalDecoder {
                 input_norm: &mtp.layer.input_norm,
                 qkv_proj: mtp.layer.qkv_proj.as_ref(),
                 qkv_proj_without_gate: false,
+                value_norm: mtp.layer.value_norm,
                 q_proj: &mtp.layer.q_proj,
                 k_proj: &mtp.layer.k_proj,
                 v_proj: &mtp.layer.v_proj,
@@ -1419,13 +1439,16 @@ impl CausalDecoder {
                 up_proj: &mtp.layer.up_proj,
                 down_proj: &mtp.layer.down_proj,
                 tail_score: &arena.dense_tail_score,
+                parallel_moe: mtp.layer.parallel_moe_weights(),
             };
             let dims = FullAttnLayerDims {
                 hidden,
                 q_heads,
                 kv_heads,
                 head_dim,
+                attn_scalar: self.config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
                 rope_dims,
+                rope_frequency_dim: rope_dims,
                 position: mtp_history,
                 window_start: 0,
                 eps,
@@ -1685,6 +1708,7 @@ impl CausalDecoder {
                 input_norm: &mtp.layer.input_norm,
                 qkv_proj: mtp.layer.qkv_proj.as_ref(),
                 qkv_proj_without_gate: false,
+                value_norm: mtp.layer.value_norm,
                 q_proj: &mtp.layer.q_proj,
                 k_proj: &mtp.layer.k_proj,
                 v_proj: &mtp.layer.v_proj,
@@ -1699,13 +1723,16 @@ impl CausalDecoder {
                 up_proj: &mtp.layer.up_proj,
                 down_proj: &mtp.layer.down_proj,
                 tail_score: &arena.dense_tail_score,
+                parallel_moe: mtp.layer.parallel_moe_weights(),
             };
             let dims = FullAttnLayerDims {
                 hidden,
                 q_heads,
                 kv_heads,
                 head_dim,
+                attn_scalar: self.config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
                 rope_dims,
+                rope_frequency_dim: rope_dims,
                 position: history_len.checked_add(1).ok_or_else(|| {
                     InferError::Dimension("MTP append position déborde".to_string())
                 })?,
@@ -1960,7 +1987,9 @@ impl CausalDecoder {
             q_heads,
             kv_heads,
             head_dim,
+            attn_scalar: self.config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
             rope_dims,
+            rope_frequency_dim: rope_dims,
             position: 0,
             window_start: 0,
             eps,
@@ -2088,6 +2117,7 @@ impl CausalDecoder {
                     input_norm: &mtp.layer.input_norm,
                     qkv_proj: mtp.layer.qkv_proj.as_ref(),
                     qkv_proj_without_gate: false,
+                    value_norm: mtp.layer.value_norm,
                     q_proj: &mtp.layer.q_proj,
                     k_proj: &mtp.layer.k_proj,
                     v_proj: &mtp.layer.v_proj,
@@ -2102,13 +2132,16 @@ impl CausalDecoder {
                     up_proj: &mtp.layer.up_proj,
                     down_proj: &mtp.layer.down_proj,
                     tail_score: &arena.dense_tail_score,
+                    parallel_moe: mtp.layer.parallel_moe_weights(),
                 };
                 let dims = FullAttnLayerDims {
                     hidden,
                     q_heads,
                     kv_heads,
                     head_dim,
+                    attn_scalar: self.config.query_pre_attn_scalar.unwrap_or(head_dim as f32),
                     rope_dims,
+                    rope_frequency_dim: rope_dims,
                     position: history_len.checked_add(draft_pos).ok_or_else(|| {
                         InferError::Dimension("MTP position résidente déborde".to_string())
                     })?,

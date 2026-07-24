@@ -51,7 +51,7 @@ impl Display for HfResolveError {
                 "modèle invalide: {value} — attendu un chemin local existant ou un id HF org/repo"
             ),
             Self::MissingHome => f.write_str(
-                "cache Hugging Face introuvable: HF_HOME absent et HOME indisponible",
+                "cache Hugging Face introuvable: HF_HUB_CACHE/HF_HOME absents et HOME indisponible",
             ),
             Self::MissingRepoFile { repo, file } => {
                 write!(f, "repo HF {repo}: fichier requis absent: {file}")
@@ -249,22 +249,13 @@ fn is_root_safetensor(name: &str) -> bool {
     !name.contains('/') && name.ends_with(".safetensors")
 }
 
-/// Renvoie le répertoire du cache HF (`HF_HOME`/hub, sinon `~/.cache/huggingface/hub`).
+/// Renvoie le répertoire du cache HF configuré par l'environnement.
 ///
 /// # Errors
 ///
 /// Renvoie une erreur si aucun répertoire personnel n'est résolu.
 pub(super) fn hf_cache_dir_from_env() -> Result<PathBuf, HfResolveError> {
-    if let Ok(home) = env::var("HF_HOME") {
-        if !home.trim().is_empty() {
-            return Ok(PathBuf::from(home).join("hub"));
-        }
-    }
-    let home = env::var_os("HOME").ok_or(HfResolveError::MissingHome)?;
-    Ok(PathBuf::from(home)
-        .join(".cache")
-        .join("huggingface")
-        .join("hub"))
+    crate::hf_cache::hf_cache_dir_from_env().ok_or(HfResolveError::MissingHome)
 }
 
 /// Liste les snapshots HF locaux porteurs d'un `config.json`, avec leur taille.

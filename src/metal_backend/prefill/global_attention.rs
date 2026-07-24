@@ -249,21 +249,46 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
     ) -> Result<()> {
+        self.encode_rms_norm_heads_no_scale_rows(
+            encoder,
+            input_buffer,
+            output_buffer,
+            spec.seq,
+            spec.kv_heads,
+            spec.head_dim,
+            spec.eps,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "normalisation V par tête: encoder, buffers et dimensions explicites"
+    )]
+    pub(crate) fn encode_rms_norm_heads_no_scale_rows(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<()> {
         let dims = [
-            checked_u32(spec.seq, "value norm seq")?,
-            checked_u32(spec.kv_heads, "value norm heads")?,
-            checked_u32(spec.head_dim, "value norm head_dim")?,
+            checked_u32(rows, "value norm rows")?,
+            checked_u32(heads, "value norm heads")?,
+            checked_u32(head_dim, "value norm head_dim")?,
         ];
         encoder.set_compute_pipeline_state(&self.rms_norm_heads_no_scale_f32);
         encoder.set_buffer(0, Some(input_buffer), 0);
         encoder.set_buffer(1, Some(output_buffer), 0);
         set_u32_bytes(encoder, 2, &dims, "value_norm_dims")?;
-        set_f32_bytes(encoder, 3, &[spec.eps], "value_norm_eps")?;
+        set_f32_bytes(encoder, 3, &[eps], "value_norm_eps")?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
-                checked_nsuint(spec.kv_heads, "value norm heads")?,
-                checked_nsuint(spec.seq, "value norm seq")?,
+                checked_nsuint(heads, "value norm heads")?,
+                checked_nsuint(rows, "value norm rows")?,
                 1,
             ),
             MTLSize::new(RMS_HEADS_TG_WIDTH, 1, 1),

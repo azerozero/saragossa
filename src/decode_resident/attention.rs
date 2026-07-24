@@ -303,12 +303,23 @@ impl DecodeResidentState {
         num_heads: usize,
         head_dim: usize,
         rope_dims: usize,
+        rope_frequency_dim: usize,
         position: usize,
         eps: f32,
         base_theta: f32,
     ) -> Result<()> {
         self.encode_rms_norm_rope_decode_with_offset(
-            encoder, input, 0, weight, output, num_heads, head_dim, rope_dims, position, eps,
+            encoder,
+            input,
+            0,
+            weight,
+            output,
+            num_heads,
+            head_dim,
+            rope_dims,
+            rope_frequency_dim,
+            position,
+            eps,
             base_theta,
         )
     }
@@ -327,6 +338,7 @@ impl DecodeResidentState {
         num_heads: usize,
         head_dim: usize,
         rope_dims: usize,
+        rope_frequency_dim: usize,
         position: usize,
         eps: f32,
         base_theta: f32,
@@ -355,6 +367,13 @@ impl DecodeResidentState {
             4,
             std::mem::size_of::<[f32; 2]>() as u64,
             params.as_ptr().cast::<c_void>(),
+        );
+        let rope_frequency_dim = u32::try_from(rope_frequency_dim)
+            .map_err(|_| InferError::Dimension("rope frequency_dim hors u32".to_string()))?;
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            std::ptr::from_ref(&rope_frequency_dim).cast::<c_void>(),
         );
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
@@ -412,6 +431,7 @@ impl DecodeResidentState {
             out_lease.tensor().buffer(),
             num_heads,
             head_dim,
+            rope_dims,
             rope_dims,
             position,
             eps,
@@ -976,6 +996,10 @@ impl FullAttentionMetalState {
 
     /// Copie `input[0..n]` → `output[offset..offset+n]` (device, `output` lié à un
     /// offset en octets). Brique de l'append KV résident.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "primitive Metal chaude: buffers, formats et offsets reflètent les bindings du kernel"
+    )]
     fn encode_copy_at(
         &self,
         encoder: &ComputeCommandEncoderRef,

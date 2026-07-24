@@ -78,17 +78,16 @@ fn local_tts_snapshot(env_var: &str, cache_name: &str) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let home = std::env::var_os("HOME")?;
-    let snapshots = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(cache_name)
-        .join("snapshots");
-    let mut entries = std::fs::read_dir(snapshots)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    entries.sort();
-    entries.pop()
+    let snapshot = crate::hf_resolve::hf_cache_dir_from_env().and_then(|hub| {
+        let snapshots = hub.join(cache_name).join("snapshots");
+        let mut entries = std::fs::read_dir(snapshots)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries.pop()
+    });
+    crate::test_support::require_real_model(snapshot, "snapshot Qwen3-TTS Base")
 }

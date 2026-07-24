@@ -8,7 +8,7 @@ impl MetalExecutor {
         clippy::too_many_arguments,
         reason = "tail Gemma parallèle batché: branches, normes et scratch restent explicites"
     )]
-    pub(super) fn encode_gemma_parallel_tail_rows(
+    pub(crate) fn encode_gemma_parallel_tail_rows(
         &self,
         encoder: &ComputeCommandEncoderRef,
         owned: &mut Vec<Buffer>,
@@ -75,7 +75,7 @@ impl MetalExecutor {
         let router_input = if let Some((router_norm, router_eps)) = router_norm {
             self.encode_rms_norm_rows(
                 encoder,
-                moe_input,
+                hidden_state,
                 router_norm,
                 ffn_normed,
                 rows,
@@ -84,7 +84,7 @@ impl MetalExecutor {
             )?;
             ffn_normed
         } else {
-            moe_input
+            hidden_state
         };
         self.encode_moe_routed_buffers_rows_with_router_input_and_activation(
             encoder,

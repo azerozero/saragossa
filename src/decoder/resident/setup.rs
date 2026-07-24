@@ -38,6 +38,84 @@ fn resolve_gemma_tail_buffers(
     ))
 }
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn resolve_gemma_parallel_moe_buffers(
+    metal: &MetalExecutor,
+    layer: &DecoderLayer,
+    hidden: usize,
+    dense_inter_dim: usize,
+) -> Result<Option<ResidentGemmaParallelMoeBuffers>> {
+    let Some(parallel_moe) = layer.parallel_moe.as_ref() else {
+        return Ok(None);
+    };
+    let FeedForward::Moe(parallel_moe) = parallel_moe else {
+        return Err(InferError::Config(
+            "parallel_moe Gemma4 n'est pas un MoE".to_string(),
+        ));
+    };
+    let parts = parallel_moe
+        .gemma4_metal_parts()
+        .ok_or_else(|| InferError::Config("parallel_moe Gemma4 non encodable Metal".to_string()))?;
+    let required_norm = |value: Option<&Tensor>, label: &'static str| -> Result<metal::Buffer> {
+        let value = value.ok_or_else(|| InferError::Config(format!("{label} Gemma4 absent")))?;
+        if value.len() != hidden {
+            return Err(InferError::Dimension(format!(
+                "{label} Gemma4 len={}, attendu {hidden}",
+                value.len()
+            )));
+        }
+        metal.cached_buffer_from_f32(value.data(), label)
+    };
+    let router_norm = parts
+        .router_norm
+        .map(|(weight, eps)| {
+            if weight.len() != hidden || !eps.is_finite() || eps <= 0.0 {
+                return Err(InferError::Dimension(format!(
+                    "router_norm Gemma4 len={} eps={eps}, attendu {hidden}",
+                    weight.len()
+                )));
+            }
+            Ok((
+                metal.cached_buffer_from_f32(weight.data(), "resident_gemma4_router_norm")?,
+                eps,
+            ))
+        })
+        .transpose()?;
+    let per_expert_scale = parts
+        .per_expert_scale
+        .map(|scale| {
+            if scale.len() != parts.experts.len() {
+                return Err(InferError::Dimension(format!(
+                    "per_expert_scale Gemma4 len={}, attendu {}",
+                    scale.len(),
+                    parts.experts.len()
+                )));
+            }
+            metal.cached_buffer_from_f32(scale.data(), "resident_gemma4_per_expert_scale")
+        })
+        .transpose()?;
+
+    Ok(Some(ResidentGemmaParallelMoeBuffers {
+        post_feedforward_norm_1: required_norm(
+            layer.post_feedforward_norm_1.as_ref(),
+            "resident_gemma4_post_feedforward_norm_1",
+        )?,
+        moe: metal.resolve_moe_routed_weights(parts.router, parts.experts)?,
+        top_k: parts.top_k,
+        router_norm,
+        per_expert_scale,
+        pre_feedforward_norm_2: required_norm(
+            layer.pre_feedforward_norm_2.as_ref(),
+            "resident_gemma4_pre_feedforward_norm_2",
+        )?,
+        post_feedforward_norm_2: required_norm(
+            layer.post_feedforward_norm_2.as_ref(),
+            "resident_gemma4_post_feedforward_norm_2",
+        )?,
+        dense_inter_dim,
+    }))
+}
+
 impl CausalDecoder {
     /// Renvoie `true` si le decode résident COMPLET (1c) est applicable : un
     /// executor Metal, des dimensions GQA valides, un lm_head biasless (argmax
@@ -201,19 +279,28 @@ impl CausalDecoder {
         &self,
         cache: &mut CausalDecoderCache,
         max_new_tokens: usize,
+        draft_headroom: usize,
         sampled: bool,
     ) -> Result<bool> {
-        self.setup_resident_full_decode_with_slot(cache, max_new_tokens, 0, sampled)
+        self.setup_resident_full_decode_with_slot(cache, max_new_tokens, draft_headroom, 0, sampled)
     }
 
     /// Variante light-batch de [`Self::setup_resident_full_decode`] : `slot`
     /// namespace le scratch label-keyed de l'exécuteur partagé pour ce flux
     /// (slot 0 = chemin mono-flux historique, clés inchangées).
+    ///
+    /// `draft_headroom` = profondeur de draft spéculatif (0 hors spéculatif). Le
+    /// decode spéculatif appende les lignes de draft AVANT de tronquer les rejetées :
+    /// la longueur KV dépasse donc transitoirement le nombre de tokens commités, de
+    /// jusqu'à `max_draft`. Sans cette marge, une génération qui va au bout de son
+    /// budget déborde (`append KV résident: capacité N atteinte`) — observé à D3,
+    /// latent à D2 selon l'alignement du dernier pas.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(in crate::decoder) fn setup_resident_full_decode_with_slot(
         &self,
         cache: &mut CausalDecoderCache,
         max_new_tokens: usize,
+        draft_headroom: usize,
         slot: u64,
         sampled: bool,
     ) -> Result<bool> {
@@ -235,6 +322,7 @@ impl CausalDecoder {
         let prefill_len = cache.position;
         let capacity = prefill_len
             .checked_add(max_new_tokens)
+            .and_then(|value| value.checked_add(draft_headroom))
             .ok_or_else(|| InferError::Dimension("capacité KV résidente déborde".to_string()))?;
         if capacity == 0 {
             return Ok(false);
@@ -285,6 +373,20 @@ impl CausalDecoder {
             }
             return Ok(false);
         }
+        // Instrumentation Phase 2 (byte-id, hors chemin prod) : chiffre les
+        // sous-postes du setup pour distinguer l'invariant (poolable) du
+        // prompt-dépendant. Cf. `RETI_RUST_MTP_SETUP_TRACE`.
+        let trace_setup = crate::decoder::flags::mtp_setup_trace_enabled();
+        if trace_setup {
+            // Vide l'accumulateur global avant la boucle pour n'attribuer que
+            // les concats de CE setup.
+            let _ = crate::metal_backend::take_concat_profile();
+        }
+        let t_weights = trace_setup.then(std::time::Instant::now);
+        // Alloc GPU avant la construction des buffers de poids : le delta émis au
+        // trace mesure la VRAM ajoutée par les concats (retenue par le cache concat
+        // quand il est actif, transitoire sinon) — coût mémoire du cache.
+        let alloc_before = trace_setup.then(|| metal.device().current_allocated_size());
         let mut layer_buffers = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
             if self.config.is_resident_full_attention_layer(index) {
@@ -396,6 +498,18 @@ impl CausalDecoder {
                         let (pre_feedforward_norm, post_feedforward_norm, layer_scalar) =
                             resolve_gemma_tail_buffers(metal, layer)?;
                         let (gate_proj, up_proj, down_proj) = mlp.projections();
+                        let dense_inter_dim =
+                            gate_proj.weight().shape().first().copied().ok_or_else(|| {
+                                InferError::Dimension(
+                                    "gate_proj Gemma4 sans dimension de sortie".to_string(),
+                                )
+                            })?;
+                        let parallel_moe = resolve_gemma_parallel_moe_buffers(
+                            metal,
+                            layer,
+                            hidden,
+                            dense_inter_dim,
+                        )?;
                         let qkv_proj = if decode_resident_full_qkv_concat_enabled() {
                             match metal.resolve_concat_linear_weight_buffers(
                                 &[
@@ -419,6 +533,7 @@ impl CausalDecoder {
                                     "resident_dense_full_input_norm",
                                 )?,
                                 qkv_proj,
+                                value_norm: attention.value_norm,
                                 q_proj: metal.resolve_linear_weight_buffers(
                                     attention.q_proj.weight(),
                                     "resident_dense_full_q_proj",
@@ -462,6 +577,7 @@ impl CausalDecoder {
                                     down_proj.weight(),
                                     "resident_dense_down_proj",
                                 )?,
+                                parallel_moe,
                             },
                         ));
                     }
@@ -538,8 +654,33 @@ impl CausalDecoder {
                 }
             }
         }
+        if let Some(t) = t_weights {
+            let (concat_us, concat_count) = crate::metal_backend::take_concat_profile();
+            let gpu_alloc_delta_mb = alloc_before
+                .map(|before| {
+                    metal
+                        .device()
+                        .current_allocated_size()
+                        .saturating_sub(before) as f64
+                        / 1e6
+                })
+                .unwrap_or(0.0);
+            eprintln!(
+                "mtp_setup weight_buffers_us={} concat_us={concat_us} concat_count={concat_count} layers={} gpu_alloc_delta_mb={gpu_alloc_delta_mb:.1}",
+                t.elapsed().as_micros(),
+                self.layers.len()
+            );
+        }
+        let t_arena_new = trace_setup.then(std::time::Instant::now);
         let mut arena = DecodeResidentState::new(metal.device().clone())?;
+        if let Some(t) = t_arena_new {
+            eprintln!("mtp_setup arena_new_kernels_us={}", t.elapsed().as_micros());
+        }
         arena.set_scratch_namespace(slot);
+        if self.config.parallel_moe {
+            arena.prepare_pipeline_scratch(RESIDENT_PIPELINE_WINDOW);
+        }
+        let t_kv_seed = trace_setup.then(std::time::Instant::now);
         for (index, layer_cache) in cache.layers.iter_mut().enumerate() {
             if !self.config.is_resident_full_attention_layer(index) {
                 continue;
@@ -550,8 +691,20 @@ impl CausalDecoder {
             full.seed(&layer_cache.keys, &layer_cache.values, prefill_len)?;
             layer_cache.full = Some(full);
         }
+        if let Some(t) = t_kv_seed {
+            eprintln!("mtp_setup kv_seed_us={}", t.elapsed().as_micros());
+        }
+        let t_mtp_arena = trace_setup.then(std::time::Instant::now);
         let hidden_a = arena.persistent(hidden, GpuElement::F32)?;
         let hidden_b = arena.persistent(hidden, GpuElement::F32)?;
+        let mut pipeline_hidden_ring = Vec::with_capacity(RESIDENT_PIPELINE_WINDOW);
+        pipeline_hidden_ring.push((hidden_a.clone(), hidden_b.clone()));
+        for _ in 1..RESIDENT_PIPELINE_WINDOW {
+            pipeline_hidden_ring.push((
+                arena.persistent(hidden, GpuElement::F32)?,
+                arena.persistent(hidden, GpuElement::F32)?,
+            ));
+        }
         let index = arena.persistent(1, GpuElement::U32)?;
         let mut index_ring = Vec::with_capacity(RESIDENT_PIPELINE_WINDOW);
         for _ in 0..RESIDENT_PIPELINE_WINDOW {
@@ -580,10 +733,17 @@ impl CausalDecoder {
                             .cached_buffer_from_f32(&[1.0], "resident_dense_tail_score")?,
                         hidden_a,
                         hidden_b,
+                        pipeline_hidden_ring,
                         index,
                         index_ring,
                         mtp: None,
                     });
+                    if let Some(t) = t_mtp_arena {
+                        eprintln!(
+                            "mtp_setup mtp_arena_us={} (tête non dense)",
+                            t.elapsed().as_micros()
+                        );
+                    }
                     return Ok(true);
                 }
             };
@@ -654,6 +814,7 @@ impl CausalDecoder {
                         "resident_mtp_input_norm",
                     )?,
                     qkv_proj,
+                    value_norm: false,
                     q_proj: metal.resolve_linear_weight_buffers(
                         head.layer.attention.q_proj.weight(),
                         "resident_mtp_q_proj",
@@ -683,6 +844,7 @@ impl CausalDecoder {
                         .resolve_linear_weight_buffers(up_proj.weight(), "resident_mtp_up")?,
                     down_proj: metal
                         .resolve_linear_weight_buffers(down_proj.weight(), "resident_mtp_down")?,
+                    parallel_moe: None,
                 },
                 norm: metal.cached_buffer_from_f32(head.norm.data(), "resident_mtp_norm")?,
                 draft_lm_head: metal.resolve_linear_weight_buffers(
@@ -714,6 +876,7 @@ impl CausalDecoder {
             state: arena,
             hidden_a,
             hidden_b,
+            pipeline_hidden_ring,
             index,
             index_ring,
             layers: layer_buffers,
@@ -725,6 +888,9 @@ impl CausalDecoder {
                 .resolve_linear_weight_buffers(self.lm_head.weight(), "resident_lm_head")?,
             mtp,
         });
+        if let Some(t) = t_mtp_arena {
+            eprintln!("mtp_setup mtp_arena_us={}", t.elapsed().as_micros());
+        }
         Ok(true)
     }
 

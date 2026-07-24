@@ -91,6 +91,7 @@ impl BlockAwarePrefixCache {
 
     /// Construit un cache de capacité fixe.
     #[must_use]
+    #[cfg(test)]
     pub(super) fn new(block_tokens: usize, capacity: usize) -> Self {
         Self::with_blocks_per_session(block_tokens, capacity, capacity)
     }

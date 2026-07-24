@@ -2,6 +2,52 @@
 
 use super::*;
 
+// Instrumentation Phase 2 (byte-id, hors chemin prod) : cumul du temps passé à
+// re-concaténer les poids linéaires (qkv, linear-attn) — non mémoïsé donc
+// re-payé à chaque génération. Lu et remis à zéro par la trace de setup MTP.
+static CONCAT_PROFILE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONCAT_PROFILE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fraction du working-set Metal recommandé au-delà de laquelle on cesse de retenir
+/// les buffers concat fusionnés (cache adaptatif — voir `concat_cache_within_vram_budget`).
+/// En-deçà : cache plein (setup ~3,5 ms). Au-delà : rebuild par génération, sans OOM.
+const CONCAT_CACHE_VRAM_FRACTION: f64 = 0.85;
+
+/// Renvoie puis remet à zéro `(micros cumulés, nombre de rebuilds)` de concat de
+/// poids non mémoïsés. Un rebuild = un cache-miss ayant re-concaténé/ré-uploadé
+/// (les hits ne sont pas comptés) : la trace de setup MTP le lit pour chiffrer le
+/// coût récurrent restant.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn take_concat_profile() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        CONCAT_PROFILE_US.swap(0, Ordering::Relaxed),
+        CONCAT_PROFILE_COUNT.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Renvoie l'adresse stable du tenseur primaire d'un poids linéaire (données
+/// denses ou données packées quantifiées). Sert de composante de clé de cache :
+/// c'est l'adresse déjà utilisée pour mémoïser les buffers individuels.
+fn linear_weight_addr(weight: &LinearWeight) -> usize {
+    match weight {
+        LinearWeight::Dense(tensor) => tensor.data().as_ptr().addr(),
+        LinearWeight::AffineQuantized(weight) => weight.packed_data().as_ptr().addr(),
+    }
+}
+
+/// Construit la clé de cache d'une concaténation : la suite ordonnée des adresses
+/// sources. `None` si la liste est vide (l'appel échouera de toute façon), pour
+/// ne jamais mémoïser une entrée dégénérée.
+fn concat_weight_key(weights: &[&LinearWeight]) -> Option<ConcatWeightKey> {
+    if weights.is_empty() {
+        return None;
+    }
+    Some(ConcatWeightKey {
+        ptrs: weights.iter().map(|w| linear_weight_addr(w)).collect(),
+    })
+}
+
 /// Active le chemin GEMM bf16 de l'encodeur Whisper (matmul2d Neural Accelerators)
 /// par défaut si disponible. `RETI_STT_F32=1` force l'ancien chemin f32 ;
 /// `RETI_STT_BF16=0` garde aussi un kill-switch compatible avec les anciens benches.
@@ -272,8 +318,8 @@ impl MetalExecutor {
         const TILE: NSUInteger = 64; // tuile de sortie 64×64 (micro-bloc 4×4 / thread)
         const THREADS: NSUInteger = 16; // 16×16 = 256 threads
         let groups = MTLSize::new(
-            (checked_nsuint(out_dim, "out_dim")? + TILE - 1) / TILE,
-            (checked_nsuint(batch, "batch")? + TILE - 1) / TILE,
+            checked_nsuint(out_dim, "out_dim")?.div_ceil(TILE),
+            checked_nsuint(batch, "batch")?.div_ceil(TILE),
             1,
         );
         profile_dispatch();
@@ -766,7 +812,105 @@ impl MetalExecutor {
         }
     }
 
+    /// Résout (et mémoïse) la concaténation de poids linéaires en un buffer Metal.
+    ///
+    /// Le buffer concaténé est une fonction pure des poids sources (invariants
+    /// sur la vie du process) : mémoïsé par la suite des adresses sources, il
+    /// n'est bâti qu'une fois (upload compris) puis partagé entre générations.
+    /// C'était le poste dominant du setup MTP (concat re-payé à chaque
+    /// génération) ; le cache le ramène à un clone de poignée `metal::Buffer`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les poids sont incompatibles ou si l'upload échoue.
     pub(crate) fn resolve_concat_linear_weight_buffers(
+        &self,
+        weights: &[&LinearWeight],
+        label: &'static str,
+    ) -> Result<MetalLinearWeightBuffers> {
+        // Coupe-circuit : le rebuild par génération reste accessible pour l'A/B
+        // et le repli prod. Le comportement est byte-identique (cache ⇒ mêmes
+        // octets ; verdict `Incompatible` ⇒ même repli split).
+        let key = crate::runtime_flags::resident_concat_cache_enabled()
+            .then(|| concat_weight_key(weights))
+            .flatten();
+        // Court-circuit : un hit ne re-concatène ni ne ré-upload rien. Un buffer
+        // clone partage le même `MTLBuffer` (compté par référence) ; un verdict
+        // `Incompatible` renvoie l'erreur de dimension sans recopie partielle.
+        // Byte-identique dans les deux cas (issue invariante des poids).
+        if let Some(key) = key.as_ref() {
+            let cache = self.concat_buffers.lock().map_err(|_| {
+                InferError::Metal(format!("cache concat Metal empoisonné: {label}"))
+            })?;
+            match cache.get(key) {
+                Some(ConcatCacheEntry::Buffers(buffers)) => return Ok(buffers.clone()),
+                Some(ConcatCacheEntry::Incompatible) => {
+                    return Err(InferError::Dimension(format!(
+                        "{label}: poids concat incompatibles (mémoïsé)"
+                    )));
+                }
+                None => {}
+            }
+        }
+        let concat_started = std::time::Instant::now();
+        let result = self.resolve_concat_linear_weight_buffers_inner(weights, label);
+        use std::sync::atomic::Ordering;
+        CONCAT_PROFILE_US.fetch_add(
+            u64::try_from(concat_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        CONCAT_PROFILE_COUNT.fetch_add(1, Ordering::Relaxed);
+        // Ne mémoïse que les issues INVARIANTES : succès (buffer) et incompatibilité
+        // structurelle (`Dimension`). Toute autre erreur (upload Metal, etc.) peut
+        // être transitoire → on la propage sans la cacher.
+        let entry = match &result {
+            Ok(buffers) => Some(ConcatCacheEntry::Buffers(buffers.clone())),
+            Err(InferError::Dimension(_)) => Some(ConcatCacheEntry::Incompatible),
+            Err(_) => None,
+        };
+        // Gate budget VRAM sur la RÉTENTION du buffer fusionné (les ~2,4 Go du 27B) :
+        // ne le retenir que s'il reste de la marge sous le working-set recommandé,
+        // sinon on le rebâtit à la prochaine génération (transitoire, aucun OOM ni
+        // pression sur le KV cache / STT / TTS). Le marqueur d'incompatibilité (sans
+        // donnée GPU) est toujours mémoïsé pour éviter de ré-échouer.
+        let retain = match &entry {
+            Some(ConcatCacheEntry::Buffers(_)) => self.concat_cache_within_vram_budget(),
+            _ => true,
+        };
+        if let (Some(key), Some(entry)) = (key, entry) {
+            if retain {
+                let mut cache = self.concat_buffers.lock().map_err(|_| {
+                    InferError::Metal(format!("cache concat Metal empoisonné: {label}"))
+                })?;
+                cache.insert(key, entry);
+            }
+        }
+        result
+    }
+
+    /// Renvoie `true` s'il reste de la marge VRAM pour retenir un buffer concat.
+    ///
+    /// Réutilise le working-set recommandé du device : au-delà de
+    /// [`CONCAT_CACHE_VRAM_FRACTION`] de l'allocation courante, on cesse de retenir
+    /// les fusions (rebuild par génération) — cache adaptatif, plein sur grosse RAM,
+    /// dégradé sans OOM sur machine tendue.
+    fn concat_cache_within_vram_budget(&self) -> bool {
+        let recommended = self.device.recommended_max_working_set_size();
+        if recommended == 0 {
+            return true;
+        }
+        // Fraction ajustable par machine (`RETI_RUST_CONCAT_CACHE_VRAM_FRACTION`) ;
+        // valeur hors ]0, +∞[ ignorée → défaut `CONCAT_CACHE_VRAM_FRACTION`.
+        let fraction = std::env::var("RETI_RUST_CONCAT_CACHE_VRAM_FRACTION")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(CONCAT_CACHE_VRAM_FRACTION);
+        let budget = (recommended as f64 * fraction) as u64;
+        self.device.current_allocated_size() < budget
+    }
+
+    fn resolve_concat_linear_weight_buffers_inner(
         &self,
         weights: &[&LinearWeight],
         label: &'static str,

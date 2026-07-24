@@ -269,8 +269,7 @@ impl DFlashAttentionWeights {
                 }
                 let weights = softmax_scores(&scores)?;
                 let out_base = query_pos * q_dim + head * info.head_dim;
-                for key_pos in 0..ctx_len {
-                    let weight = weights[key_pos];
+                for (key_pos, &weight) in weights.iter().take(ctx_len).enumerate() {
                     if weight == 0.0 {
                         continue;
                     }

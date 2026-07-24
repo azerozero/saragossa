@@ -511,13 +511,13 @@ impl TtsCodec {
             for head in 0..n_heads {
                 let kv_head = head / kv_repeat;
                 let mut scores = vec![0.0_f32; time + 1];
-                for key_time in 0..=time {
+                for (key_time, score) in scores.iter_mut().enumerate().take(time + 1) {
                     let mut dot = 0.0_f32;
                     for dim in 0..head_dim {
                         dot += q.get(time, head * head_dim + dim)
                             * k.get(key_time, kv_head * head_dim + dim);
                     }
-                    scores[key_time] = dot * scale;
+                    *score = dot * scale;
                 }
                 softmax_in_place(&mut scores);
                 for dim in 0..head_dim {

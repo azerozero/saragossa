@@ -310,6 +310,8 @@ kernel void embed_gather_dense_from_u32_f32(
     device const uint* token_index [[buffer(1)]],
     device float* out [[buffer(2)]],
     constant uint2& dims [[buffer(3)]],
+    constant float& embedding_scale [[buffer(4)]],
+    constant uint& recast_bf16 [[buffer(5)]],
     uint tid [[thread_position_in_grid]]
 ) {
     const uint vocab = dims.x;
@@ -318,7 +320,8 @@ kernel void embed_gather_dense_from_u32_f32(
     if (token >= vocab || tid >= dim) {
         return;
     }
-    out[tid] = table[token * dim + tid];
+    const float value = table[token * dim + tid] * embedding_scale;
+    out[tid] = recast_bf16 != 0u ? float(bfloat(value)) : value;
 }
 
 kernel void embed_gather_affine_from_u32_f32(
@@ -329,6 +332,8 @@ kernel void embed_gather_affine_from_u32_f32(
     device float* out [[buffer(4)]],
     constant uint4& dims [[buffer(5)]],
     constant uint4& quant [[buffer(6)]],
+    constant float& embedding_scale [[buffer(7)]],
+    constant uint& recast_bf16 [[buffer(8)]],
     uint tid [[thread_position_in_grid]]
 ) {
     const uint vocab = dims.x;
@@ -349,7 +354,9 @@ kernel void embed_gather_affine_from_u32_f32(
     const uint q = (word >> (lane * bits)) & mask;
     const uint group = min(tid / group_size, groups - 1u);
     const uint affine_index = token * groups + group;
-    out[tid] = float(q) * scales[affine_index] + biases[affine_index];
+    const float value =
+        (float(q) * scales[affine_index] + biases[affine_index]) * embedding_scale;
+    out[tid] = recast_bf16 != 0u ? float(bfloat(value)) : value;
 }
 
 kernel void affine_qmv_fast_u4_gs64_f32(
@@ -3943,6 +3950,7 @@ kernel void affine_gather_gate_up_swiglu_fast_u4_gs64_f32(
     device float* out [[buffer(8)]],
     constant uint4& dims [[buffer(9)]],
     constant uint4& quant [[buffer(10)]],
+    constant uint& activation [[buffer(11)]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
@@ -4045,7 +4053,15 @@ kernel void affine_gather_gate_up_swiglu_fast_u4_gs64_f32(
         const float gate = simd_sum(gate_result[row]);
         const float up = simd_sum(up_result[row]);
         if (simd_lid == 0u && row_base + row < out_dim) {
-            out[(slot * out_dim) + row_base + row] = (gate / (1.0f + exp(-gate))) * up;
+            float activated;
+            if (activation == 1u) {
+                const float inner = 0.7978846f * (gate + 0.044715f * gate * gate * gate);
+                activated = 0.5f * gate *
+                    (1.0f + tanh(clamp(inner, -20.0f, 20.0f)));
+            } else {
+                activated = gate / (1.0f + exp(-gate));
+            }
+            out[(slot * out_dim) + row_base + row] = activated * up;
         }
     }
 }

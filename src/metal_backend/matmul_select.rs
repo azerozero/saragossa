@@ -6,6 +6,7 @@ use super::*;
 pub(super) enum AffineMatmulKernel {
     Qmm2,
     QmmNaFusedTiledU4,
+    QmmNaFusedTiledU4Align64,
     FastQmvU4,
     FastQmvU4Align64,
     FastQmvU6,
@@ -37,6 +38,12 @@ impl MetalExecutor {
             && can_use_qmm_na_fused_tiled_u4_buffers(batch, in_dim, out_dim, group_size, bits)
         {
             AffineMatmulKernel::QmmNaFusedTiledU4
+        } else if self.qmm_na_fused_tiled_u4_align64_available(group_size)
+            && can_use_qmm_na_fused_tiled_u4_align64_buffers(
+                batch, in_dim, out_dim, group_size, bits,
+            )
+        {
+            AffineMatmulKernel::QmmNaFusedTiledU4Align64
         } else if (fast_affine_qmv_enabled(out_dim) || prefer_fast_affine)
             && batch > 0
             && bits == FAST_QMV_BITS
@@ -87,6 +94,10 @@ impl MetalExecutor {
             && can_use_qmm_na_fused_tiled_u4(batch, in_dim, weight)
         {
             AffineMatmulKernel::QmmNaFusedTiledU4
+        } else if self.qmm_na_fused_tiled_u4_align64_available(weight.group_size())
+            && can_use_qmm_na_fused_tiled_u4_align64(batch, in_dim, weight)
+        {
+            AffineMatmulKernel::QmmNaFusedTiledU4Align64
         } else if can_use_fast_affine_qmv(batch, in_dim, weight)
             || (prefer_fast_affine && can_use_fast_affine_qmv_shape(batch, in_dim, weight))
         {

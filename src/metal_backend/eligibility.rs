@@ -238,6 +238,44 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4(
     ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
+/// Vérifie l'éligibilité du GEMM NA u4 pour K aligné sur 64 hors chemin Qwen.
+pub(super) fn can_use_qmm_na_fused_tiled_u4_align64_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    qmm_na_fused_tiled_enabled()
+        && qmm_na_fused_tiled_u4_enabled()
+        && batch >= 16
+        && out_dim % 64 == 0
+        && out_dim >= 2048
+        && in_dim >= 2048
+        && bits == 4
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 64 == 0
+        && in_dim % 512 != 0
+}
+
+/// Vérifie l'éligibilité owned du GEMM NA u4 aligné sur 64.
+pub(super) fn can_use_qmm_na_fused_tiled_u4_align64(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_qmm_na_fused_tiled_u4_align64_buffers(
+        batch,
+        in_dim,
+        out_dim,
+        weight.group_size(),
+        weight.bits(),
+    ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
 /// Prédicat du GEMM prefill sur Neural Accelerators (matmul2d bf16) : dé-quant
 /// u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
 /// (prefill). Opt-in (`RETI_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est

@@ -71,6 +71,19 @@ struct NaxFrag {
       }
     }
   }
+  static void load_a_masked_mk(thread metal::vec<bfloat,8>& dst, const device bfloat* src,
+                               uint m_base, uint k_base, uint K, uint M) {
+    short2 sc = get_coord();
+    for (short i = 0; i < 2; i++) {
+      uint row = m_base + uint(sc.y) + uint(i) * 8u;
+      for (short j = 0; j < 4; j++) {
+        uint col = k_base + uint(sc.x) + uint(j);
+        dst[i * 4 + j] = (row < M && col < K)
+            ? src[row * K + col]
+            : bfloat(0.0f);
+      }
+    }
+  }
   static void store_c(const thread metal::vec<float,8>& src, device float* dst, int str_x) {
     short2 sc = get_coord();
     dst += sc.y * str_x + sc.x;
@@ -415,6 +428,50 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
       NaxFrag::mma(c1a, c1b, af1, b0, b1);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
+  NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
+  NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
+  NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+}
+// Variante gs64 pour K aligné sur 64 mais non sur 512. La réduction garde des
+// fenêtres de 512 pour préserver le chemin nominal ; la dernière fenêtre est
+// bornée et les chargeurs injectent zéro pour toute lane au-delà de K.
+kernel void gemm_nax_coop_qb_tiled_u4_align64(
+    device const bfloat* A [[buffer(0)]],
+    device const uint* Bp   [[buffer(1)]],
+    device const bfloat* Bs [[buffer(2)]],
+    device const bfloat* Bb [[buffer(3)]],
+    device float* C         [[buffer(4)]],
+    constant uint3& mnk     [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]) {
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
+  constexpr uint BN = 64, BK = 64, REDUCTION_BLOCK = 512, WM = 2, WN = 2;
+  threadgroup bfloat Ws[BN * BK];
+  uint sg_m = sgid / WN;
+  uint sg_n = sgid - sg_m * WN;
+  uint m0 = tgid.x * 64u + sg_m * 32u;
+  uint n0 = tgid.y * BN;
+  uint ns = sg_n * 32u;
+  metal::vec<float,8> c0a = float(0), c0b = float(0), c1a = float(0), c1b = float(0);
+  for (uint kb = 0; kb < K; kb += REDUCTION_BLOCK) {
+    uint kend = min(kb + REDUCTION_BLOCK, K);
+    for (uint k = kb; k < kend; k += BK) {
+      load_b_tile_quant_u4_gs64(Ws, Bp, Bs, Bb, n0, k, N, K, lid, WM * WN * 32u);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint kk = 0; kk < BK; kk += 16u) {
+        metal::vec<bfloat,8> af0, af1, b0, b1;
+        NaxFrag::load_a_masked_mk(af0, A, m0, k + kk, K, M);
+        NaxFrag::load_a_masked_mk(af1, A, m0 + 16u, k + kk, K, M);
+        NaxFrag::load_a_tg(b0, Ws + ns * BK + kk, int(BK));
+        NaxFrag::load_a_tg(b1, Ws + (ns + 16u) * BK + kk, int(BK));
+        NaxFrag::mma(c0a, c0b, af0, b0, b1);
+        NaxFrag::mma(c1a, c1b, af1, b0, b1);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
   NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
   NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);

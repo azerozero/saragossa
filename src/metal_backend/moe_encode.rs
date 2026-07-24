@@ -21,12 +21,67 @@ impl MetalExecutor {
         topk: usize,
         output_buffer: &BufferRef,
     ) -> Result<bool> {
+        self.encode_gather_gate_up_activation(
+            encoder,
+            _owned_buffers,
+            lhs_buffer,
+            lhs_rows,
+            gate,
+            up,
+            indices_buffer,
+            topk,
+            output_buffer,
+            false,
+        )
+    }
+
+    pub(super) fn encode_gather_gate_up_geglu(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        _owned_buffers: &mut Vec<metal::Buffer>,
+        lhs_buffer: &BufferRef,
+        lhs_rows: usize,
+        gate: &StackedAffineBuffers,
+        up: &StackedAffineBuffers,
+        indices_buffer: &BufferRef,
+        topk: usize,
+        output_buffer: &BufferRef,
+    ) -> Result<bool> {
+        self.encode_gather_gate_up_activation(
+            encoder,
+            _owned_buffers,
+            lhs_buffer,
+            lhs_rows,
+            gate,
+            up,
+            indices_buffer,
+            topk,
+            output_buffer,
+            true,
+        )
+    }
+
+    fn encode_gather_gate_up_activation(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        _owned_buffers: &mut Vec<metal::Buffer>,
+        lhs_buffer: &BufferRef,
+        lhs_rows: usize,
+        gate: &StackedAffineBuffers,
+        up: &StackedAffineBuffers,
+        indices_buffer: &BufferRef,
+        topk: usize,
+        output_buffer: &BufferRef,
+        geglu: bool,
+    ) -> Result<bool> {
         if !valid_gather_lhs_rows(lhs_rows, topk) {
             return Err(InferError::Dimension(format!(
                 "gather gate/up lhs_rows={lhs_rows}, topk={topk}"
             )));
         }
-        if !can_use_fast_gather_pair_qmv(lhs_rows, gate, up) {
+        if !can_use_fast_gather_pair_qmv(lhs_rows, gate, up)
+            || (geglu && gate.bits != FAST_QMV_BITS)
+        {
             return Ok(false);
         }
         let dims = [
@@ -45,7 +100,11 @@ impl MetalExecutor {
             (
                 &self.affine_gather_gate_up_swiglu_fast_u4_gs64_f32,
                 8,
-                "affine_gather_gate_up_swiglu_fast_u4_gs64_f32",
+                if geglu {
+                    "affine_gather_gate_up_geglu_fast_u4_gs64_f32"
+                } else {
+                    "affine_gather_gate_up_swiglu_fast_u4_gs64_f32"
+                },
             )
         } else if gate.group_size == FAST_QMV_GROUP_SIZE {
             (
@@ -73,6 +132,9 @@ impl MetalExecutor {
         encoder.set_buffer(8, Some(output_buffer), 0);
         set_u32_bytes(encoder, 9, &dims, "gate_up_dims")?;
         set_u32_bytes(encoder, 10, &quant, "gate_up_quant")?;
+        if gate.bits == FAST_QMV_BITS {
+            set_u32_bytes(encoder, 11, &[u32::from(geglu)], "gate_up_activation")?;
+        }
         trace_dispatch_path(kernel_name, topk, gate.out_dim, gate.in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(

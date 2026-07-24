@@ -36,6 +36,10 @@ pub fn resident_linear_xray_enabled() -> bool {
 /// M=2 ; chaque flux du batch doit produire EXACTEMENT les tokens de son solo.
 /// Les debits sont indicatifs (GPU potentiellement partage) - aucune conclusion
 /// de perf sans GPU idle.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "harnais diagnostic: entrées, options et durées mesurées restent visibles à l'appel"
+)]
 pub fn run_lightbatch_acceptance(
     assets: &ModelAssets,
     decoder: &CausalDecoder,
@@ -132,38 +136,47 @@ pub fn run_mtp_acceptance(
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(2);
+    // AR de référence : variante TIMÉE (mêmes tokens greedy que
+    // `generate_greedy_cached_with_options`, qui délègue à cette même fonction)
+    // afin d'exposer la boucle decode SEULE (`timings.decode`, hors prefill/seed)
+    // et rendre le débit AR comparable apples-to-apples au débit spéculatif
+    // (`spec.loop_duration`). La SÉQUENCE de tokens est inchangée : l'oracle de
+    // byte-identité `tokens_equal` reste identique.
     let ar_started = Instant::now();
-    let ar = decoder.generate_greedy_cached_with_options(prompt_ids, max_tokens, options)?;
+    let ar = decoder.generate_greedy_timed_with_options(prompt_ids, max_tokens, options)?;
     let ar_elapsed = ar_started.elapsed();
     let spec_started = Instant::now();
     let spec = decoder
         .generate_greedy_mtp_batched_with_options(prompt_ids, max_tokens, options, max_draft)?;
     let spec_elapsed = spec_started.elapsed();
-    let tokens_equal = ar == spec.tokens;
+    let tokens_equal = ar.tokens == spec.tokens;
     if !tokens_equal && env::var_os("RETI_RUST_MTP_ORACLE_DUMP").is_some() {
         let first_diff = ar
+            .tokens
             .iter()
             .zip(spec.tokens.iter())
             .position(|(left, right)| left != right);
-        let diff_index = first_diff.unwrap_or_else(|| ar.len().min(spec.tokens.len()));
-        let ar_token = ar.get(diff_index).copied();
+        let diff_index = first_diff.unwrap_or_else(|| ar.tokens.len().min(spec.tokens.len()));
+        let ar_token = ar.tokens.get(diff_index).copied();
         let spec_token = spec.tokens.get(diff_index).copied();
         eprintln!(
             "mtp_oracle_diff index={} ar={:?} spec={:?} ar_len={} spec_len={}",
             diff_index,
             ar_token,
             spec_token,
-            ar.len(),
+            ar.tokens.len(),
             spec.tokens.len()
         );
         let start = diff_index.saturating_sub(6);
         let end = diff_index
             .checked_add(7)
-            .map(|value| value.min(ar.len().max(spec.tokens.len())))
-            .unwrap_or_else(|| ar.len().max(spec.tokens.len()));
+            .map(|value| value.min(ar.tokens.len().max(spec.tokens.len())))
+            .unwrap_or_else(|| ar.tokens.len().max(spec.tokens.len()));
         eprintln!(
             "mtp_oracle_window ar={:?} spec={:?}",
-            ar.get(start..end.min(ar.len())).unwrap_or(&[]),
+            ar.tokens
+                .get(start..end.min(ar.tokens.len()))
+                .unwrap_or(&[]),
             spec.tokens
                 .get(start..end.min(spec.tokens.len()))
                 .unwrap_or(&[])
@@ -201,8 +214,24 @@ pub fn run_mtp_acceptance(
     } else {
         0.0
     };
+    // Débit AR IN-LOOP (boucle decode seule, `timings.decode`), même convention
+    // que `spec_decode_tok_s` (tokens / durée de boucle, hors prefill+seed).
+    let ar_loop_ms = ar.timings.decode.as_millis();
+    let ar_decode_tok_s = if ar.timings.decode.as_secs_f64() > 0.0 {
+        ar.tokens.len() as f64 / ar.timings.decode.as_secs_f64()
+    } else {
+        0.0
+    };
+    // Ratio in-loop apples-to-apples = seul chiffre honnête du gain decode PUR :
+    // `ar_ms`/`spec_ms` incluent prefill et seed (biais fixe), donc inexploitables
+    // pour comparer la vitesse par token.
+    let inloop_speedup = if ar_decode_tok_s > 0.0 {
+        spec_decode_tok_s / ar_decode_tok_s
+    } else {
+        0.0
+    };
     eprintln!(
-        "mtp_acceptance tokens_equal={} generated={} max_draft={} proposed={} accepted={} rejected={} acceptance_rate={:.3} verifications={} avg_accepted_per_verify={:.3} load_ms={} warmup_ms={} ar_ms={} spec_ms={} spec_loop_ms={} spec_decode_tok_s={:.3}",
+        "mtp_acceptance tokens_equal={} generated={} max_draft={} proposed={} accepted={} rejected={} acceptance_rate={:.3} verifications={} avg_accepted_per_verify={:.3} load_ms={} warmup_ms={} ar_ms={} spec_ms={} spec_loop_ms={} spec_decode_tok_s={:.3} ar_loop_ms={} ar_decode_tok_s={:.3} inloop_speedup={:.3}",
         tokens_equal,
         spec.tokens.len(),
         max_draft,
@@ -218,6 +247,9 @@ pub fn run_mtp_acceptance(
         spec_elapsed.as_millis(),
         spec_loop_ms,
         spec_decode_tok_s,
+        ar_loop_ms,
+        ar_decode_tok_s,
+        inloop_speedup,
     );
     for position in 0..max_draft {
         let proposed = spec
@@ -253,6 +285,10 @@ pub fn run_mtp_acceptance(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "harnais diagnostic: modèle, draft, options et durées mesurées restent visibles à l'appel"
+)]
 pub fn run_dflash_acceptance(
     assets: &ModelAssets,
     decoder: &CausalDecoder,

@@ -21,6 +21,10 @@ impl MetalExecutor {
         group_size == FAST_QMV_GROUP_SIZE && self.na_gemm_coop_qb_tiled_u4.is_some()
     }
 
+    pub(super) fn qmm_na_fused_tiled_u4_align64_available(&self, group_size: usize) -> bool {
+        group_size == FAST_QMV_GROUP_SIZE && self.na_gemm_coop_qb_tiled_u4_align64.is_some()
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "kernel NA fused-tiled: buffers, dimensions et group_size explicites"
@@ -99,10 +103,6 @@ impl MetalExecutor {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "kernel NA fused-tiled u4: buffers et dimensions explicites"
-    )]
     pub(super) fn encode_affine_qmm_na_fused_tiled_u4_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -115,16 +115,72 @@ impl MetalExecutor {
         in_dim: usize,
         out_dim: usize,
     ) -> Result<()> {
+        self.encode_affine_qmm_na_fused_tiled_u4_pipeline(
+            encoder,
+            lhs_buffer,
+            packed_buffer,
+            scales_buffer,
+            biases_buffer,
+            output_buffer,
+            batch,
+            in_dim,
+            out_dim,
+            self.na_gemm_coop_qb_tiled_u4.as_ref(),
+            "gemm_nax_coop_qb_tiled_u4",
+            "qmm_na_fused_tiled_u4_gs64",
+        )
+    }
+
+    pub(super) fn encode_affine_qmm_na_fused_tiled_u4_align64_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed_buffer: &BufferRef,
+        scales_buffer: &BufferRef,
+        biases_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<()> {
+        self.encode_affine_qmm_na_fused_tiled_u4_pipeline(
+            encoder,
+            lhs_buffer,
+            packed_buffer,
+            scales_buffer,
+            biases_buffer,
+            output_buffer,
+            batch,
+            in_dim,
+            out_dim,
+            self.na_gemm_coop_qb_tiled_u4_align64.as_ref(),
+            "gemm_nax_coop_qb_tiled_u4_align64",
+            "qmm_na_fused_tiled_u4_align64_gs64",
+        )
+    }
+
+    fn encode_affine_qmm_na_fused_tiled_u4_pipeline(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed_buffer: &BufferRef,
+        scales_buffer: &BufferRef,
+        biases_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        pipeline: Option<&ComputePipelineState>,
+        label: &'static str,
+        profile_label: &'static str,
+    ) -> Result<()> {
         if out_dim % 64 != 0 {
             return Err(InferError::Dimension(format!(
                 "qmm na fused-tiled u4 attend out_dim%64=0, reçu batch={batch} out_dim={out_dim}"
             )));
         }
-        let label = "gemm_nax_coop_qb_tiled_u4";
-        let pso = self
-            .na_gemm_coop_qb_tiled_u4
-            .as_ref()
-            .ok_or_else(|| InferError::Config(format!("{label}: NA indisponible")))?;
+        let pso =
+            pipeline.ok_or_else(|| InferError::Config(format!("{label}: NA indisponible")))?;
         let lhs_len = checked_len(batch, in_dim, "qmm na fused-tiled u4 lhs")?;
         let lhs_bf16 = self.private_bf16_buffer(lhs_len, "qmm_na_fused_tiled_u4_lhs_bf16")?;
         self.encode_f32_to_bf16(encoder, lhs_buffer, &lhs_bf16, lhs_len)?;
@@ -141,7 +197,7 @@ impl MetalExecutor {
         encoder.set_buffer(4, Some(output_buffer), 0);
         encoder.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
-            "qmm_na_fused_tiled_u4_gs64",
+            profile_label,
             batch,
             in_dim,
             out_dim,
@@ -354,13 +410,36 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         expected_dim: usize,
     ) -> Result<()> {
-        self.encode_embedding_from_index_buffers_with_offset(
+        self.encode_embedding_from_index_buffers_scaled(
+            encoder,
+            embedding,
+            index_buffer,
+            output_buffer,
+            expected_dim,
+            1.0,
+            false,
+        )
+    }
+
+    pub(crate) fn encode_embedding_from_index_buffers_scaled(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        embedding: &MetalEmbeddingWeightBuffers,
+        index_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        expected_dim: usize,
+        embedding_scale: f32,
+        recast_bf16: bool,
+    ) -> Result<()> {
+        self.encode_embedding_from_index_buffers_with_offset_scaled(
             encoder,
             embedding,
             index_buffer,
             0,
             output_buffer,
             expected_dim,
+            embedding_scale,
+            recast_bf16,
         )
     }
 
@@ -372,6 +451,33 @@ impl MetalExecutor {
         index_offset: u64,
         output_buffer: &BufferRef,
         expected_dim: usize,
+    ) -> Result<()> {
+        self.encode_embedding_from_index_buffers_with_offset_scaled(
+            encoder,
+            embedding,
+            index_buffer,
+            index_offset,
+            output_buffer,
+            expected_dim,
+            1.0,
+            false,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "gather quantifié: buffers, offset, dimension et échelle explicites"
+    )]
+    pub(crate) fn encode_embedding_from_index_buffers_with_offset_scaled(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        embedding: &MetalEmbeddingWeightBuffers,
+        index_buffer: &BufferRef,
+        index_offset: u64,
+        output_buffer: &BufferRef,
+        expected_dim: usize,
+        embedding_scale: f32,
+        recast_bf16: bool,
     ) -> Result<()> {
         match embedding {
             MetalEmbeddingWeightBuffers::Dense { table, vocab, dim } => {
@@ -389,6 +495,13 @@ impl MetalExecutor {
                 encoder.set_buffer(1, Some(index_buffer), index_offset);
                 encoder.set_buffer(2, Some(output_buffer), 0);
                 set_u32_bytes(encoder, 3, &dims, "embedding_dense_dims")?;
+                set_f32_bytes(encoder, 4, &[embedding_scale], "embedding_dense_scale")?;
+                set_u32_bytes(
+                    encoder,
+                    5,
+                    &[u32::from(recast_bf16)],
+                    "embedding_dense_recast_bf16",
+                )?;
             }
             MetalEmbeddingWeightBuffers::AffineQuantized {
                 packed,
@@ -426,6 +539,13 @@ impl MetalExecutor {
                 encoder.set_buffer(4, Some(output_buffer), 0);
                 set_u32_bytes(encoder, 5, &dims, "embedding_affine_dims")?;
                 set_u32_bytes(encoder, 6, &quant, "embedding_affine_quant")?;
+                set_f32_bytes(encoder, 7, &[embedding_scale], "embedding_affine_scale")?;
+                set_u32_bytes(
+                    encoder,
+                    8,
+                    &[u32::from(recast_bf16)],
+                    "embedding_affine_recast_bf16",
+                )?;
             }
         }
         profile_dispatch();

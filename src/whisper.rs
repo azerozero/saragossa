@@ -608,15 +608,15 @@ pub fn log_mel_spectrogram(samples: &[f32], num_mel_bins: usize) -> Result<Tenso
             buf[index] = Complex::new(sample * hann[index], 0.0);
         }
         fft.process(&mut buf);
-        for freq in 0..N_FREQS {
+        for (freq, power_value) in power.iter_mut().enumerate().take(N_FREQS) {
             let value = buf[freq];
-            power[freq] = value.re * value.re + value.im * value.im;
+            *power_value = value.re * value.re + value.im * value.im;
         }
         if std::env::var_os("RETI_STT_DENSE_MEL").is_some() {
             for mel_bin in 0..num_mel_bins {
                 let mut acc = 0.0_f32;
-                for freq in 0..N_FREQS {
-                    acc += filters.dense_weight(mel_bin, freq) * power[freq];
+                for (freq, &power_value) in power.iter().enumerate().take(N_FREQS) {
+                    acc += filters.dense_weight(mel_bin, freq) * power_value;
                 }
                 mel[mel_bin * N_FRAMES + frame] = acc;
             }
@@ -1023,9 +1023,9 @@ pub(super) fn multi_head_attention(
         let head_base = head * head_dim;
         for row_q in 0..q_seq {
             let mut max_score = f32::NEG_INFINITY;
-            for row_k in 0..kv_seq {
+            for (row_k, score_value) in scores.iter_mut().enumerate().take(kv_seq) {
                 if causal && row_k > row_q {
-                    scores[row_k] = f32::NEG_INFINITY;
+                    *score_value = f32::NEG_INFINITY;
                     continue;
                 }
                 let mut dot = 0.0_f32;
@@ -1034,7 +1034,7 @@ pub(super) fn multi_head_attention(
                         * k.data()[row_k * dim + head_base + col];
                 }
                 let score = dot * scale;
-                scores[row_k] = score;
+                *score_value = score;
                 max_score = max_score.max(score);
             }
             let mut denom = 0.0_f32;

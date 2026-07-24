@@ -95,7 +95,7 @@ struct Shape {
 
 fn f32_to_bf16(v: f32) -> u16 {
     let b = v.to_bits();
-    (((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16) & 0xffff
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }
 
 fn main() {

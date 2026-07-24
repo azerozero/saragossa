@@ -47,7 +47,7 @@ use metal::{
     Buffer, BufferRef, CommandQueue, CompileOptions, ComputeCommandEncoderRef,
     ComputePipelineState, Device, MTLResourceOptions, MTLSize,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -64,12 +64,14 @@ mod utils;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use self::arena::{GpuElement, GpuTensor, ScratchLease, ScratchPool};
+pub(crate) use self::arena::{
+    install_pipeline_scratch_slot, GpuElement, GpuTensor, ScratchLease, ScratchPool,
+};
 pub(crate) use self::attention::FullAttentionMetalState;
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
-    GemmaDenseTailWeights, GemmaMoeTailWeights, GpuSectionTimer, LinearAttnDenseLayerWeights,
-    LinearAttnLayerWeights,
+    GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
+    LinearAttnDenseLayerWeights, LinearAttnLayerWeights,
 };
 
 /// État résident d'UN decode (réserves C/D).
@@ -85,6 +87,7 @@ pub(crate) struct DecodeResidentState {
     options: MTLResourceOptions,
     persistent: Vec<Buffer>,
     scratch: ScratchPool,
+    pipeline_scratch: Vec<ScratchPool>,
     attention_decode_naive: ComputePipelineState,
     attention_decode_flash: ComputePipelineState,
     attention_decode_flash_d256: ComputePipelineState,

@@ -43,6 +43,15 @@ pub(crate) fn env_flag_value(value: &str) -> Option<bool> {
     }
 }
 
+/// Active le recast bf16 de la sortie d'embedding Qwen. **Défaut ON** :
+/// aligne la sortie d'embedding sur oMLX (accord teacher-forced 98,04 → 99,35 %),
+/// l'arrondi se fait dans le gather résident sans dispatch ajouté (coût decode/prefill nul).
+/// `RETI_RUST_QWEN_EMBED_BF16=0` rétablit le contrat f32 historique (coupe-circuit).
+pub(super) fn qwen_embed_bf16_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_QWEN_EMBED_BF16", true))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MtpHistoryPolicy {
     Cycle,
@@ -58,7 +67,18 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
             .and_then(|value| match value.as_str() {
                 "committed" | "full" => Some(MtpHistoryPolicy::Committed),
                 "cycle" | "reset" => Some(MtpHistoryPolicy::Cycle),
-                _ => None,
+                // POURQUOI : une valeur inconnue retombait en silence sur le défaut.
+                // Une simple coquille faisait donc tourner la configuration par
+                // défaut en croyant mesurer l'autre — un A/B vide, sans aucun signal
+                // pour l'opérateur. On prévient, sans paniquer : ce flag est lu au
+                // démarrage d'un binaire de mesure, pas dans une boucle chaude.
+                other => {
+                    eprintln!(
+                        "RETI_RUST_MTP_HISTORY: valeur inconnue {other:?} \
+                         (attendu committed|full|cycle|reset) — repli sur committed"
+                    );
+                    None
+                }
             })
             .unwrap_or(MtpHistoryPolicy::Committed)
     })
@@ -81,6 +101,60 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
 pub(super) fn mtp_fresh_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_MTP_FRESH_CACHE", false))
+}
+
+/// Active la profondeur de draft MTP **adaptative** (GammaTune-style).
+///
+/// **Défaut OFF** (`RETI_RUST_MTP_ADAPTIVE_DEPTH=1` pour l'activer) : le decode
+/// MTP garde alors sa profondeur fixe (`RETI_RUST_MTP_MAX_DRAFT`), comportement
+/// strictement inchangé. Activé, la profondeur est choisie PAR PAS entre 1 et le
+/// plafond `RETI_RUST_MTP_MAX_DRAFT` selon une EMA de la deep-acceptance récente
+/// (cf. [`crate::decoder::mtp_adaptive`]). La séquence générée reste byte-identique
+/// (le vérifieur trunk exact décide *lesquels* des tokens proposés sont acceptés,
+/// pas *combien* on en propose).
+pub(super) fn mtp_adaptive_depth_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_MTP_ADAPTIVE_DEPTH", false))
+}
+
+/// Lissage EMA (`alpha`) de la deep-acceptance MTP adaptative. Défaut 0,3, borné
+/// dans `]0,1]` par le contrôleur. Lu depuis `RETI_RUST_MTP_ADAPTIVE_ALPHA`.
+pub(super) fn mtp_adaptive_alpha() -> f32 {
+    static ALPHA: OnceLock<f32> = OnceLock::new();
+    *ALPHA.get_or_init(|| {
+        std::env::var("RETI_RUST_MTP_ADAPTIVE_ALPHA")
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
+            .unwrap_or(0.3)
+    })
+}
+
+/// Seuil de deep-acceptance au-delà duquel drafter profond « paie ». Défaut 0,5
+/// (la pos-2 globale mesurée ≈ 0,47 pour un D2 ≈ D1 → break-even ~0,5). Lu depuis
+/// `RETI_RUST_MTP_ADAPTIVE_THRESHOLD`.
+pub(super) fn mtp_adaptive_threshold() -> f32 {
+    static THRESHOLD: OnceLock<f32> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("RETI_RUST_MTP_ADAPTIVE_THRESHOLD")
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0 && *value <= 1.0)
+            .unwrap_or(0.5)
+    })
+}
+
+/// Période de sondage forcé d'un pas profond (rafraîchit l'EMA en régime court).
+/// Défaut 8, min 1. Lu depuis `RETI_RUST_MTP_ADAPTIVE_PROBE`.
+pub(super) fn mtp_adaptive_probe_period() -> u32 {
+    static PROBE: OnceLock<u32> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        std::env::var("RETI_RUST_MTP_ADAPTIVE_PROBE")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value >= 1)
+            .unwrap_or(8)
+    })
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -180,23 +254,6 @@ fn decode_interval_nanos_for_rate(rate: f64) -> Option<u64> {
         return None;
     }
     Some(nanos.round().clamp(1.0, DECODE_INTERVAL_MAX_NS as f64) as u64)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decode_interval_nanos_for_rate_converts_tok_s_to_interval() {
-        assert_eq!(decode_interval_nanos_for_rate(25.0), Some(40_000_000));
-    }
-
-    #[test]
-    fn decode_interval_nanos_for_rate_rejects_invalid_rates() {
-        assert_eq!(decode_interval_nanos_for_rate(0.0), None);
-        assert_eq!(decode_interval_nanos_for_rate(-1.0), None);
-        assert_eq!(decode_interval_nanos_for_rate(f64::NAN), None);
-    }
 }
 
 /// Active le decode full-attn résident GPU (tranche 1b). **Défaut OFF** : opt-in
@@ -546,6 +603,41 @@ pub(crate) fn trace_resident_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_TRACE_RESIDENT", false))
 }
 
+/// Active le cache process-global des concaténations de poids linéaires résidents
+/// (qkv, linear-attn). **Défaut ON** : le buffer concaténé est une fonction pure
+/// des poids sources invariants → mémoïsé une fois au lieu d'être re-concaténé et
+/// ré-uploadé à chaque génération (poste dominant du setup MTP, ~1,2 s → ~0). La
+/// sortie est byte-identique (mêmes octets). `RETI_RUST_RESIDENT_CONCAT_CACHE=0`
+/// rétablit le rebuild par génération (coupe-circuit / preuve A/B).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn resident_concat_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_RESIDENT_CONCAT_CACHE", true))
+}
+
+/// Route le prefill principal du decode MTP (historique committed) par le chemin
+/// résident fusionné (celui de l'AR) au lieu de la boucle per-op `forward_prefill`
+/// (≈ 2× plus lente). **Défaut ON**. À valider byte-identique : mêmes tokens ET
+/// acceptance inchangée (le hidden résident sert aussi à semer l'historique MTP).
+/// `RETI_RUST_MTP_PREFILL_RESIDENT=0` rétablit le prefill per-op (coupe-circuit).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn mtp_prefill_resident_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_MTP_PREFILL_RESIDENT", true))
+}
+
+/// Trace chiffrée des sous-postes du setup decode MTP (prefill, résolution des
+/// buffers de poids, compilation des kernels résidents, seed KV, arène MTP).
+///
+/// Diagnostic de la Phase 2 MTP (time-to-first-token) : distingue ce qui est
+/// invariant (poolable entre générations) de ce qui dépend du prompt. Hors
+/// chemin prod, aucun effet quand `RETI_RUST_MTP_SETUP_TRACE=0` (défaut).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn mtp_setup_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_MTP_SETUP_TRACE", false))
+}
+
 pub(crate) fn attention_parallel_threshold() -> usize {
     static THRESHOLD: OnceLock<usize> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
@@ -724,4 +816,21 @@ pub(super) fn print_layer_profile(
         tail.as_micros(),
         total_started.elapsed().as_micros()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_interval_nanos_for_rate_converts_tok_s_to_interval() {
+        assert_eq!(decode_interval_nanos_for_rate(25.0), Some(40_000_000));
+    }
+
+    #[test]
+    fn decode_interval_nanos_for_rate_rejects_invalid_rates() {
+        assert_eq!(decode_interval_nanos_for_rate(0.0), None);
+        assert_eq!(decode_interval_nanos_for_rate(-1.0), None);
+        assert_eq!(decode_interval_nanos_for_rate(f64::NAN), None);
+    }
 }

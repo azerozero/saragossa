@@ -270,13 +270,13 @@ impl TtsMimiEncoder {
         for time in 0..x.time {
             for head in 0..n_heads {
                 let mut scores = vec![0.0_f32; time + 1];
-                for key_time in 0..=time {
+                for (key_time, score) in scores.iter_mut().enumerate().take(time + 1) {
                     let mut acc = 0.0_f32;
                     for dim in 0..head_dim {
                         acc += q.get(time, head * head_dim + dim)
                             * k.get(key_time, head * head_dim + dim);
                     }
-                    scores[key_time] = acc * scale;
+                    *score = acc * scale;
                 }
                 softmax_in_place(&mut scores);
                 for dim in 0..head_dim {
@@ -348,6 +348,10 @@ impl TtsMimiEncoder {
         Ok(codes)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "convolution TTS chaude: stride, dilation, groupes et padding restent explicites dans la boucle"
+    )]
     fn streamable_conv1d(
         &self,
         x: &Nlc,
@@ -400,7 +404,7 @@ impl TtsMimiEncoder {
         out.par_chunks_mut(out_dim)
             .enumerate()
             .try_for_each(|(time, out_row)| -> Result<()> {
-                for out_ch in 0..out_dim {
+                for (out_ch, output) in out_row.iter_mut().enumerate().take(out_dim) {
                     let group = out_ch / out_per_group;
                     let in_start = group * in_per_group;
                     let mut acc = bias.map_or(Ok(0.0), |b| channel_value(b, out_ch))?;
@@ -412,7 +416,7 @@ impl TtsMimiEncoder {
                                 padded.get(src_time, in_start + in_ch) * weight.data()[weight_idx];
                         }
                     }
-                    out_row[out_ch] = acc;
+                    *output = acc;
                 }
                 Ok(())
             })?;
@@ -434,12 +438,12 @@ impl TtsMimiEncoder {
             .enumerate()
             .try_for_each(|(time, out_row)| -> Result<()> {
                 let row = x.row(time);
-                for out_ch in 0..out_dim {
+                for (out_ch, output) in out_row.iter_mut().enumerate().take(out_dim) {
                     let mut acc = dot(row, weight.row_slice(out_ch)?);
                     if let Some(bias) = bias {
                         acc += channel_value(bias, out_ch)?;
                     }
-                    out_row[out_ch] = acc;
+                    *output = acc;
                 }
                 Ok(())
             })?;

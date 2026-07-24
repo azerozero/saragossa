@@ -10,6 +10,21 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 #[test]
+fn qwen_embedding_recast_is_opt_in_and_rounds_to_bf16() {
+    let values = vec![1.003_906_2_f32, -0.333_251_95, 42.125];
+    let hidden = Tensor::from_vec(vec![1, values.len()], values.clone())
+        .expect("invariant: tenseur embedding valide");
+
+    let disabled = recast_qwen_embedding(hidden.clone(), true, false);
+    let unrelated = recast_qwen_embedding(hidden.clone(), false, true);
+    let enabled = recast_qwen_embedding(hidden, true, true);
+
+    assert_eq!(disabled.data(), values.as_slice());
+    assert_eq!(unrelated.data(), values.as_slice());
+    assert_eq!(enabled.data(), &[1.0, -0.333_984_38, 42.0]);
+}
+
+#[test]
 fn causal_decoder_generates_expected_token() {
     let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())
         .expect("invariant: poids cohérents");
@@ -1775,10 +1790,18 @@ fn mtp_verifier_env_ready() -> bool {
             Ok(actual) if actual == expected => {}
             Ok(actual) => {
                 eprintln!("skip MTP verifier integration: {key}={actual}, expected {expected}");
+                let _ = crate::test_support::require_real_model(
+                    None::<()>,
+                    &format!("{key}={expected} pour le test MTP"),
+                );
                 return false;
             }
             Err(_) => {
                 eprintln!("skip MTP verifier integration: {key} is not set to {expected}");
+                let _ = crate::test_support::require_real_model(
+                    None::<()>,
+                    &format!("{key}={expected} pour le test MTP"),
+                );
                 return false;
             }
         }
@@ -1788,21 +1811,27 @@ fn mtp_verifier_env_ready() -> bool {
 
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn mtp_verifier_model_dir() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("RETI_RUST_MTP_VERIFIER_TEST_MODEL") {
+    let model_dir = if let Some(path) = std::env::var_os("RETI_RUST_MTP_VERIFIER_TEST_MODEL") {
         let path = PathBuf::from(path);
         if path.is_dir() {
-            return Some(path);
+            Some(path)
+        } else {
+            eprintln!(
+                "skip MTP verifier integration: RETI_RUST_MTP_VERIFIER_TEST_MODEL is not a directory: {}",
+                path.display()
+            );
+            None
         }
+    } else {
         eprintln!(
-            "skip MTP verifier integration: RETI_RUST_MTP_VERIFIER_TEST_MODEL is not a directory: {}",
-            path.display()
+            "skip MTP verifier integration: model missing, set RETI_RUST_MTP_VERIFIER_TEST_MODEL"
         );
-        return None;
-    }
-    eprintln!(
-        "skip MTP verifier integration: model missing, set RETI_RUST_MTP_VERIFIER_TEST_MODEL"
-    );
-    None
+        None
+    };
+    crate::test_support::require_real_model(
+        model_dir,
+        "RETI_RUST_MTP_VERIFIER_TEST_MODEL pointant vers le modèle MTP",
+    )
 }
 
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]

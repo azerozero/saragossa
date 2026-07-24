@@ -267,7 +267,8 @@ fn gemma_parallel_tail_prefill_resident_matches_cpu() -> Result<()> {
     let moe = crate::MoeMlp::new(router.clone(), experts.clone(), None, None, TOP_K)?
         .with_router_norm(router_norm.clone(), EPS)
         .with_per_expert_scale(per_expert_scale.clone());
-    let moe_raw = moe.forward(&moe_input)?;
+    let moe_raw =
+        moe.forward_with_router_source(&moe_input, &hidden, crate::ForwardRuntime::cpu())?;
     let moe_out = crate::rms_norm(&moe_raw, &post_ffn_2, EPS)?;
     let ffn_out = dense_out.add(&moe_out)?;
     let ffn_normed = crate::rms_norm(&ffn_out, &post_ffn, EPS)?;

@@ -29,6 +29,8 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SESSION_HEADER: &str = "x-saragossa-session";
 
+type ParsedHeaders = (String, String, Vec<(String, String)>);
+
 /// Sert en HTTP TCP local.
 pub(super) fn serve_tcp(
     addr: &str,
@@ -491,7 +493,7 @@ fn read_request<S: Read>(stream: &mut S, deadline: Instant) -> ServeResult<Optio
     }))
 }
 
-fn parse_headers(header_text: &str) -> ServeResult<(String, String, Vec<(String, String)>)> {
+fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
     let mut lines = header_text.split("\r\n");
     let request_line = lines
         .next()

@@ -3,6 +3,7 @@
 #![deny(unsafe_code)]
 
 mod bench_serve;
+mod hf_cache;
 mod hf_resolve;
 mod run_repl;
 mod serve;
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 use saragossa::{
     load_causal_decoder, render_gemma4_chat, render_gemma_chat, render_qwen_chatml,
     verify_decoder_contract, CausalDecoder, ChatTemplateMessage, DecoderContract,
-    GenerationOptions, ModelAssets,
+    GenerationOptions, GenerationOutput, GenerationTimings, ModelAssets,
 };
 
 mod doctor_bench;
@@ -118,10 +119,14 @@ fn run() -> CliResult<()> {
     }
     let load_started = Instant::now();
     let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
-    if saragossa::devtools::mtp_acceptance_enabled() {
-        let path = assets.mtp.path.as_ref().ok_or_else(|| {
-            cli_error("RETI_RUST_MTP_ACCEPTANCE=1 mais aucun sidecar MTP détecté")
-        })?;
+    // La tête MTP doit être chargée pour l'oracle d'acceptance ET pour le decode
+    // opt-in `RETI_RUST_MTP_DECODE` (sinon `generate_greedy_mtp_batched_with_options`
+    // échoue faute de sidecar). Défaut OFF = aucun sidecar chargé, prod inchangée.
+    if saragossa::devtools::mtp_acceptance_enabled() || mtp_decode_enabled() {
+        let path =
+            assets.mtp.path.as_ref().ok_or_else(|| {
+                cli_error("decode/oracle MTP demandé mais aucun sidecar MTP détecté")
+            })?;
         decoder = decoder.with_mtp_sidecar(path)?;
         if let Some(path) = env::var_os("RETI_RUST_MTP_DRAFT_LM_HEAD") {
             decoder = decoder.with_mtp_draft_lm_head_sidecar(PathBuf::from(path))?;
@@ -143,6 +148,27 @@ fn run() -> CliResult<()> {
     };
     let prompt_ids = encode_prompt_ids(&assets, prompt, args.raw)?;
     let warmup_elapsed = warmup_decoder(&decoder, &prompt_ids, args.backend)?;
+    // Chauffe la voie MTP quand le decode MTP est actif : une passe spéculative
+    // peuple le cache de concaténation QKV (`RETI_RUST_RESIDENT_CONCAT_CACHE`) sur
+    // le `MetalExecutor` persistant, si bien que le PREMIER vrai decode saute la
+    // concaténation des poids (mesuré ~1,3 s → ~3,5 ms). Amorti une fois au
+    // démarrage ; en prod résident (voice loop/serve) tous les tours en profitent.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let warmup_elapsed =
+        if mtp_decode_enabled() && args.backend == RuntimeKind::Metal && warmup_enabled() {
+            let started = Instant::now();
+            let warmup_len = prompt_ids.len().min(warmup_prompt_tokens()).max(1);
+            let options = generation_options(&args, &assets, args.top_p);
+            decoder.generate_greedy_mtp_batched_with_options(
+                &prompt_ids[..warmup_len],
+                MTP_DECODE_WARMUP_TOKENS,
+                &options,
+                mtp_decode_max_draft(),
+            )?;
+            warmup_elapsed + started.elapsed()
+        } else {
+            warmup_elapsed
+        };
     if saragossa::devtools::lightbatch_acceptance_enabled() {
         let prompt_b = args
             .prompt_b
@@ -293,12 +319,56 @@ fn run() -> CliResult<()> {
             saragossa::metal_backend::decode_profile_dispatch_shapes_snapshot(),
         )
     });
+    let options = generation_options(&args, &assets, args.top_p);
     let generate_started = Instant::now();
-    let output = decoder.generate_greedy_timed_with_options(
-        &prompt_ids,
-        args.max_tokens,
-        &generation_options(&args, &assets, args.top_p),
-    )?;
+    // Decode opt-in MTP spéculatif (`RETI_RUST_MTP_DECODE=1`, défaut OFF). En T=0
+    // il est byte-identique à l'AR greedy (oracle `run_mtp_acceptance`,
+    // `tokens_equal=true`) et gagne en e2e (D1 ~1,18×). Le résultat spéculatif ne
+    // sépare pas prefill et decode : on mappe `loop_duration` sur `decode` et on
+    // estime le prefill = mur total − boucle decode, pour garder la ligne
+    // `metrics` homogène avec le chemin AR. Défaut OFF = prod inchangé.
+    let output = if mtp_decode_enabled() {
+        let max_draft = mtp_decode_max_draft();
+        // Diagnostic Phase 2 : rejoue le setup à chaud (caches `MetalExecutor`
+        // déjà peuplés) pour distinguer le coût cold-start du coût récurrent par
+        // génération dans une boucle voix. Hors chemin prod (env absent = 1 passe).
+        let warm_passes = std::env::var("RETI_RUST_MTP_DECODE_REPEAT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(1);
+        for pass in 1..warm_passes {
+            let pass_started = Instant::now();
+            let _ = decoder.generate_greedy_mtp_batched_with_options(
+                &prompt_ids,
+                args.max_tokens,
+                &options,
+                max_draft,
+            )?;
+            eprintln!(
+                "mtp_setup_repeat pass={pass} generate_ms={}",
+                pass_started.elapsed().as_millis()
+            );
+        }
+        let spec = decoder.generate_greedy_mtp_batched_with_options(
+            &prompt_ids,
+            args.max_tokens,
+            &options,
+            max_draft,
+        )?;
+        let loop_duration = spec.loop_duration;
+        let prefill = generate_started.elapsed().saturating_sub(loop_duration);
+        let decode_tokens = spec.tokens.len();
+        GenerationOutput {
+            tokens: spec.tokens,
+            timings: GenerationTimings {
+                prefill,
+                decode: loop_duration,
+                decode_tokens,
+            },
+        }
+    } else {
+        decoder.generate_greedy_timed_with_options(&prompt_ids, args.max_tokens, &options)?
+    };
     let generate_elapsed = generate_started.elapsed();
     let timings = output.timings;
     let generated = output.tokens;
@@ -399,9 +469,37 @@ fn compact_source_path(path: &'static str) -> &'static str {
         .unwrap_or(path)
 }
 
+/// Nombre de tokens générés pour chauffer la voie decode MTP au démarrage.
+///
+/// Une courte génération spéculative peuple le cache de concaténation QKV du
+/// `MetalExecutor`, sortant le concat (~1,3 s) du prefill du premier prompt réel.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const MTP_DECODE_WARMUP_TOKENS: usize = 6;
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn prefill_profile_enabled() -> bool {
     saragossa::runtime_flags::env_flag("RETI_RUST_DECODE_PROFILE", false)
+}
+
+/// Indique si le decode normal passe par le chemin spéculatif MTP (défaut OFF).
+///
+/// Opt-in via `RETI_RUST_MTP_DECODE=1`. Défaut OFF = comportement prod inchangé
+/// (decode AR greedy, byte-identique à l'oracle).
+fn mtp_decode_enabled() -> bool {
+    saragossa::runtime_flags::env_flag("RETI_RUST_MTP_DECODE", false)
+}
+
+/// Renvoie la profondeur de draft du decode MTP opt-in (défaut 1).
+///
+/// Lue depuis `RETI_RUST_MTP_MAX_DRAFT` ; une valeur absente, invalide ou nulle
+/// retombe sur 1 (un seul token draft vérifié par cycle), car le decode MTP
+/// exige au moins un draft.
+fn mtp_decode_max_draft() -> usize {
+    env::var("RETI_RUST_MTP_MAX_DRAFT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
 }
 
 /// Encode un prompt en ids. `--raw` : complétion brute (pas de template de

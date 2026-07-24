@@ -205,6 +205,16 @@ pub(crate) struct LinearAttentionCache {
     metal: Option<crate::metal_backend::LinearAttentionMetalState>,
 }
 
+/// Capture les frontières numériques d'une couche Gated DeltaNet.
+#[cfg(test)]
+pub(crate) struct LinearAttentionPrecisionCapture {
+    pub q_proj: Tensor,
+    pub k_proj: Tensor,
+    pub v_proj: Tensor,
+    pub attention: Tensor,
+    pub o_proj: Tensor,
+}
+
 impl Clone for LinearAttentionCache {
     // NOTE: clone CPU seulement — l'état Metal résident est volontairement
     // abandonné (buffers GPU non partageables entre flux ; il sera régénéré).
@@ -281,6 +291,72 @@ impl LinearAttention {
             )));
         }
         self.forward_inner(config, x, Some(cache), ForwardRuntime::cpu())
+    }
+
+    /// Capture les sous-étapes CPU sans modifier le chemin de production.
+    #[cfg(test)]
+    pub(crate) fn precision_capture_cached(
+        &self,
+        config: LinearAttentionConfig,
+        x: &Tensor,
+        cache: &mut LinearAttentionCache,
+    ) -> Result<LinearAttentionPrecisionCapture> {
+        config.validate()?;
+        validate_weights(self, config)?;
+        let (qkv, z, beta_input, gate_input) = self.input_projections(x, ForwardRuntime::cpu())?;
+        let key_dim = config.key_dim()?;
+        let value_dim = config.value_dim()?;
+        let q_proj = slice_columns(&qkv, 0, key_dim)?;
+        let k_proj = slice_columns(&qkv, key_dim, key_dim)?;
+        let v_proj = slice_columns(&qkv, key_dim * 2, value_dim)?;
+
+        let conv_out = silu(&depthwise_causal_conv(
+            &qkv,
+            &self.conv1d_weight,
+            config,
+            cache,
+        )?);
+        let q = rms_norm_heads_unit(
+            &slice_columns(&conv_out, 0, key_dim)?,
+            config.num_key_heads,
+            config.key_head_dim,
+            1.0e-6,
+        )?
+        .map(|value| value * key_scale(config.key_head_dim, true));
+        let k = rms_norm_heads_unit(
+            &slice_columns(&conv_out, key_dim, key_dim)?,
+            config.num_key_heads,
+            config.key_head_dim,
+            1.0e-6,
+        )?
+        .map(|value| value * key_scale(config.key_head_dim, false));
+        let v = slice_columns(&conv_out, key_dim * 2, value_dim)?;
+        let beta = beta_input.map(sigmoid);
+        let g = compute_decay(
+            &gate_input,
+            &self.a_log,
+            &self.dt_bias,
+            config.num_value_heads,
+        )?;
+        let attention = gated_delta(&q, &k, &v, &g, &beta, config, cache)?;
+        let attention = rms_norm_heads(
+            &attention,
+            config.num_value_heads,
+            config.value_head_dim,
+            &self.norm_weight,
+            config.rms_eps,
+        )?
+        .mul_elementwise(&silu(&z))?;
+        let o_proj = self
+            .out_proj
+            .forward_with_runtime(&attention, ForwardRuntime::cpu())?;
+        Ok(LinearAttentionPrecisionCapture {
+            q_proj,
+            k_proj,
+            v_proj,
+            attention,
+            o_proj,
+        })
     }
 
     /// Avance la récurrence d'UN token (chemin decode : conv + delta gated + gates).

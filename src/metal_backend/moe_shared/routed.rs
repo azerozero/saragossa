@@ -184,34 +184,46 @@ impl MetalExecutor {
                 }
             }
             crate::Activation::GeluTanh => {
-                self.encode_gather_matmul(
+                if !self.encode_gather_gate_up_geglu(
                     encoder,
                     owned_buffers,
                     input_buffer,
                     1,
                     &weights.stacked.gate,
-                    &scratch.indices,
-                    top_k,
-                    &scratch.gate,
-                )?;
-                self.encode_gather_matmul(
-                    encoder,
-                    owned_buffers,
-                    input_buffer,
-                    1,
                     &weights.stacked.up,
                     &scratch.indices,
                     top_k,
-                    &scratch.up,
-                )?;
-                self.encode_geglu_tanh(
-                    encoder,
-                    owned_buffers,
-                    &scratch.gate,
-                    &scratch.up,
                     &scratch.hidden,
-                    checked_len(top_k, shape.inter_dim, "moe routed geglu")?,
-                )?;
+                )? {
+                    self.encode_gather_matmul(
+                        encoder,
+                        owned_buffers,
+                        input_buffer,
+                        1,
+                        &weights.stacked.gate,
+                        &scratch.indices,
+                        top_k,
+                        &scratch.gate,
+                    )?;
+                    self.encode_gather_matmul(
+                        encoder,
+                        owned_buffers,
+                        input_buffer,
+                        1,
+                        &weights.stacked.up,
+                        &scratch.indices,
+                        top_k,
+                        &scratch.up,
+                    )?;
+                    self.encode_geglu_tanh(
+                        encoder,
+                        owned_buffers,
+                        &scratch.gate,
+                        &scratch.up,
+                        &scratch.hidden,
+                        checked_len(top_k, shape.inter_dim, "moe routed geglu")?,
+                    )?;
+                }
             }
         }
         self.encode_gather_matmul(

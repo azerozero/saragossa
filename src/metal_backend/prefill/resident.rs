@@ -58,7 +58,7 @@ impl MetalExecutor {
         let command_buffer = self.queue.new_command_buffer();
         let use_shared_encoder = kernel_timing
             .as_ref()
-            .map_or(true, PrefillKernelTiming::uses_dispatch_boundary);
+            .is_none_or(PrefillKernelTiming::uses_dispatch_boundary);
         let encoder = if use_shared_encoder {
             Some(command_buffer.new_compute_command_encoder())
         } else {

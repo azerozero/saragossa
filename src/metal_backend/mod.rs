@@ -80,6 +80,8 @@ pub(crate) use self::flags::resident_concurrent_enabled;
 pub(crate) use self::lightbatch_duo::{
     begin_expert_indices_collection, take_expert_indices_collection, DuoSampleParams,
 };
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) use self::matmul::take_concat_profile;
 pub(crate) use self::matmul::{whisper_bf16_gemm_enabled, whisper_decode_bf16_qmv_enabled};
 use self::na_gemm::NA_GEMM_SRC;
 #[cfg(test)]
@@ -248,6 +250,7 @@ pub struct MetalExecutor {
     na_gemm_coop_qb_tiled: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_gs128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4: Option<ComputePipelineState>,
+    na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_gather: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_gate_up_swiglu: Option<ComputePipelineState>,
@@ -265,6 +268,32 @@ pub struct MetalExecutor {
     bf16_rhs_t_cache: Mutex<HashMap<usize, Buffer>>,
     scratch_buffers: Mutex<HashMap<ScratchBufferKey, Buffer>>,
     moe_stacks: Mutex<HashMap<usize, StackedMoeBuffers>>,
+    /// Cache des concaténations de poids linéaires (qkv, linear-attn) : l'issue
+    /// est une fonction pure des poids sources (invariants) → mémoïsée par process
+    /// au lieu d'être re-payée à chaque génération. Clé = suite des adresses des
+    /// poids sources (cf. [`ConcatWeightKey`]).
+    concat_buffers: Mutex<HashMap<ConcatWeightKey, ConcatCacheEntry>>,
+}
+
+/// Clé du cache de concaténation de poids : la suite ordonnée des adresses des
+/// tenseurs sources. Les poids ont une adresse stable pour toute la vie du
+/// process → deux appels avec les mêmes poids partagent la même issue.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ConcatWeightKey {
+    ptrs: Vec<usize>,
+}
+
+/// Issue mémoïsée d'une concaténation de poids.
+///
+/// `Incompatible` capture le verdict structurel « ces poids ne se concatènent
+/// pas » (mélange dense/quantifié, `in_dim`/quantification hétérogènes) : c'est
+/// une propriété invariante des poids, donc l'appelant re-basculera toujours sur
+/// le chemin `split`. Le mémoïser évite le `extend_from_slice` partiel (recopie
+/// du gros bloc packé qkv) re-payé à chaque génération avant l'échec.
+#[derive(Clone, Debug)]
+pub(crate) enum ConcatCacheEntry {
+    Buffers(MetalLinearWeightBuffers),
+    Incompatible,
 }
 
 #[derive(Clone, Debug)]

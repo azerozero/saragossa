@@ -516,6 +516,84 @@ fn moe_gather_u8_fast_paths_match_cpu() -> Result<()> {
 }
 
 #[test]
+fn moe_gather_u4_geglu_fused_matches_split_at_gemma4_shape() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let hidden = 2816_usize;
+    let inter = 704_usize;
+    let experts = 4_usize;
+    let topk = 2_usize;
+    let indices = [1_u32, 3_u32];
+    let input = varied_row(hidden, 73);
+    let gate = test_stacked_affine_varied_u4_group(&executor, experts, inter, hidden, 5)?;
+    let up = test_stacked_affine_varied_u4_group(&executor, experts, inter, hidden, 17)?;
+    let input_buffer = executor.upload_f32_buffer(&input, "gemma4_geglu_input")?;
+    let indices_buffer = executor.upload_u32_buffer(&indices, "gemma4_geglu_indices")?;
+    let gate_buffer = executor.uncached_f32_buffer(topk * inter, "gemma4_geglu_gate")?;
+    let up_buffer = executor.uncached_f32_buffer(topk * inter, "gemma4_geglu_up")?;
+    let split_buffer = executor.uncached_f32_buffer(topk * inter, "gemma4_geglu_split")?;
+    let fused_buffer = executor.uncached_f32_buffer(topk * inter, "gemma4_geglu_fused")?;
+
+    let split_command = executor.queue.new_command_buffer();
+    let split_encoder = split_command.new_compute_command_encoder();
+    let mut split_owned = Vec::new();
+    executor.encode_gather_matmul(
+        split_encoder,
+        &mut split_owned,
+        &input_buffer,
+        1,
+        &gate,
+        &indices_buffer,
+        topk,
+        &gate_buffer,
+    )?;
+    executor.encode_gather_matmul(
+        split_encoder,
+        &mut split_owned,
+        &input_buffer,
+        1,
+        &up,
+        &indices_buffer,
+        topk,
+        &up_buffer,
+    )?;
+    executor.encode_geglu_tanh(
+        split_encoder,
+        &mut split_owned,
+        &gate_buffer,
+        &up_buffer,
+        &split_buffer,
+        topk * inter,
+    )?;
+    split_encoder.end_encoding();
+    commit_and_wait(split_command)?;
+
+    let fused_command = executor.queue.new_command_buffer();
+    let fused_encoder = fused_command.new_compute_command_encoder();
+    let mut fused_owned = Vec::new();
+    let engaged = executor.encode_gather_gate_up_geglu(
+        fused_encoder,
+        &mut fused_owned,
+        &input_buffer,
+        1,
+        &gate,
+        &up,
+        &indices_buffer,
+        topk,
+        &fused_buffer,
+    )?;
+    assert!(engaged, "le fusé GeGLU u4 doit accepter K=2816");
+    fused_encoder.end_encoding();
+    commit_and_wait(fused_command)?;
+
+    let split = read_f32_buffer(&split_buffer, topk * inter)?;
+    let fused = read_f32_buffer(&fused_buffer, topk * inter)?;
+    assert_close_eps(&fused, &split, 1.0e-6);
+    Ok(())
+}
+
+#[test]
 fn moe_shared_epilogue_fused_matches_two_step() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());

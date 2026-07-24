@@ -518,6 +518,7 @@ impl MetalExecutor {
         let na_gemm_coop_qb_tiled = compile_na("gemm_nax_coop_qb_tiled");
         let na_gemm_coop_qb_tiled_gs128 = compile_na("gemm_nax_coop_qb_tiled_gs128");
         let na_gemm_coop_qb_tiled_u4 = compile_na("gemm_nax_coop_qb_tiled_u4");
+        let na_gemm_coop_qb_tiled_u4_align64 = compile_na("gemm_nax_coop_qb_tiled_u4_align64");
         let na_gemm_coop_qb_grouped = compile_na("gemm_nax_coop_qb_grouped");
         let na_gemm_coop_qb_grouped_gather = compile_na("gemm_nax_coop_qb_grouped_gather");
         let na_gemm_coop_qb_grouped_gate_up_swiglu =
@@ -671,6 +672,7 @@ impl MetalExecutor {
             na_gemm_coop_qb_tiled,
             na_gemm_coop_qb_tiled_gs128,
             na_gemm_coop_qb_tiled_u4,
+            na_gemm_coop_qb_tiled_u4_align64,
             na_gemm_coop_qb_grouped,
             na_gemm_coop_qb_grouped_gather,
             na_gemm_coop_qb_grouped_gate_up_swiglu,
@@ -687,6 +689,7 @@ impl MetalExecutor {
             bf16_rhs_t_cache: Mutex::new(HashMap::new()),
             scratch_buffers: Mutex::new(HashMap::new()),
             moe_stacks: Mutex::new(HashMap::new()),
+            concat_buffers: Mutex::new(HashMap::new()),
         })
     }
 }

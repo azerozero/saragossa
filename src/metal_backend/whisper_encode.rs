@@ -11,6 +11,10 @@ use std::ffi::c_void;
 
 impl MetalExecutor {
     /// Encode une LayerNorm ligne par ligne : `out = (x-µ)/σ · weight + bias`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "encodeur Whisper chaud: buffers et dimensions reflètent les bindings du kernel LayerNorm"
+    )]
     pub(crate) fn encode_layer_norm_rows(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -501,6 +505,10 @@ impl MetalExecutor {
 
     /// Encode l'attention single-query `out = softmax(q·Kᵀ·scale)·V` (decode
     /// Whisper, self ou cross), une tête par threadgroup.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "encodeur Whisper chaud: QKV, sortie et dimensions correspondent au kernel d'attention"
+    )]
     pub(crate) fn encode_whisper_attn_decode(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -763,7 +771,7 @@ impl MetalExecutor {
         if na {
             self.encode_layer_norm_rows_bf16out(
                 encoder,
-                &h,
+                h,
                 &first.self_ln.weight,
                 &first.self_ln.bias,
                 &normed,
@@ -775,7 +783,7 @@ impl MetalExecutor {
         } else {
             self.encode_layer_norm_rows(
                 encoder,
-                &h,
+                h,
                 &first.self_ln.weight,
                 &first.self_ln.bias,
                 &normed,
@@ -833,11 +841,11 @@ impl MetalExecutor {
             if na {
                 self.encode_add_layer_norm_rows_bf16out(
                     encoder,
-                    &h,
+                    h,
                     &proj,
                     &layer.final_ln.weight,
                     &layer.final_ln.bias,
-                    &h,
+                    h,
                     &normed,
                     &normed_bf16,
                     seq,
@@ -847,11 +855,11 @@ impl MetalExecutor {
             } else {
                 self.encode_add_layer_norm_rows(
                     encoder,
-                    &h,
+                    h,
                     &proj,
                     &layer.final_ln.weight,
                     &layer.final_ln.bias,
-                    &h,
+                    h,
                     &normed,
                     seq,
                     dim,
@@ -887,11 +895,11 @@ impl MetalExecutor {
             if na {
                 self.encode_add_layer_norm_rows_bf16out(
                     encoder,
-                    &h,
+                    h,
                     &proj,
                     &next.weight,
                     &next.bias,
-                    &h,
+                    h,
                     &normed,
                     &normed_bf16,
                     seq,
@@ -901,11 +909,11 @@ impl MetalExecutor {
             } else {
                 self.encode_add_layer_norm_rows(
                     encoder,
-                    &h,
+                    h,
                     &proj,
                     &next.weight,
                     &next.bias,
-                    &h,
+                    h,
                     &normed,
                     seq,
                     dim,
@@ -1280,13 +1288,13 @@ impl MetalExecutor {
         let encoder = command_buffer.new_compute_command_encoder();
         let guard = EncoderEndGuard::new(encoder);
         if na {
-            self.encode_f32_to_bf16(encoder, &audio, &audio_bf16, kv_len)?;
+            self.encode_f32_to_bf16(encoder, audio, &audio_bf16, kv_len)?;
         }
         for (index, layer) in dec.layers.iter().enumerate() {
             self.encode_proj_gemm(
                 encoder,
                 na,
-                &audio,
+                audio,
                 &audio_bf16,
                 &layer.cross_k,
                 &cross_keys[index],
@@ -1304,7 +1312,7 @@ impl MetalExecutor {
             self.encode_proj_gemm(
                 encoder,
                 na,
-                &audio,
+                audio,
                 &audio_bf16,
                 &layer.cross_v,
                 &cross_values[index],

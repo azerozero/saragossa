@@ -978,6 +978,7 @@ kernel void rms_norm_rope_heads_decode_f32(
     device float* out [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
     constant float2& params [[buffer(4)]],
+    constant uint& frequency_dim [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {
@@ -1008,9 +1009,9 @@ kernel void rms_norm_rope_heads_decode_f32(
         float value = input[start + col] * inv_rms * weight[col];
         if (col < rope_dims) {
             // Rotate-half : la paire (pair, pair+pairs) tourne a la frequence
-            // d'exposant 2*pair/rope_dims (miroir CPU rms_norm_rope_heads_at).
+            // d'exposant 2*pair/frequency_dim (miroir CPU rms_norm_rope_heads_at).
             const uint pair = (col < pairs) ? col : (col - pairs);
-            const float exponent = float(2u * pair) / float(rope_dims);
+            const float exponent = float(2u * pair) / float(frequency_dim);
             const float angle = float(position) / pow(base_theta, exponent);
             const float c = cos(angle);
             const float s = sin(angle);

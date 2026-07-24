@@ -108,14 +108,14 @@ fn cpu_noncausal_attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> 
         let head_base = head * head_dim;
         for row_q in 0..seq {
             let mut max_score = f32::NEG_INFINITY;
-            for row_k in 0..seq {
+            for (row_k, score_value) in scores.iter_mut().enumerate().take(seq) {
                 let mut dot = 0.0_f32;
                 for col in 0..head_dim {
                     dot += q.data()[row_q * dim + head_base + col]
                         * k.data()[row_k * dim + head_base + col];
                 }
                 let score = dot * scale;
-                scores[row_k] = score;
+                *score_value = score;
                 max_score = max_score.max(score);
             }
             let mut denom = 0.0_f32;
@@ -184,14 +184,14 @@ fn cpu_causal_attention_gqa(
         let kv_head_base = (q_head / kv_group) * head_dim;
         for row_q in 0..seq {
             let mut max_score = f32::NEG_INFINITY;
-            for row_k in 0..=row_q {
+            for (row_k, score_value) in scores.iter_mut().enumerate().take(row_q + 1) {
                 let mut dot = 0.0_f32;
                 for col in 0..head_dim {
                     dot += q.data()[row_q * dim + q_head_base + col]
                         * k.data()[row_k * kv_dim + kv_head_base + col];
                 }
                 let score = dot * scale;
-                scores[row_k] = score;
+                *score_value = score;
                 max_score = max_score.max(score);
             }
             let mut denom = 0.0_f32;
@@ -337,6 +337,10 @@ fn causal_attention_inputs(
     Ok((q, k, v))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "helper Metal de test: tenseurs, têtes et pipeline testé restent explicites"
+)]
 fn causal_attention_prefill_with_pipeline(
     executor: &MetalExecutor,
     q: &Tensor,
@@ -360,6 +364,10 @@ fn causal_attention_prefill_with_pipeline(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "helper Metal de test: grille et paramètres du pipeline restent explicites"
+)]
 fn causal_attention_prefill_with_pipeline_grid(
     executor: &MetalExecutor,
     q: &Tensor,
@@ -385,6 +393,10 @@ fn causal_attention_prefill_with_pipeline_grid(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "helper Metal de test: grille complète et tenseurs restent explicites"
+)]
 fn causal_attention_prefill_with_pipeline_grid_rows(
     executor: &MetalExecutor,
     q: &Tensor,

@@ -29,6 +29,7 @@ impl CausalDecoder {
             ResidentDecodeInput::CpuToken(token_id),
             None,
             None,
+            None,
         )?;
         crate::metal_backend::wait_for_completion(&inflight.command_buffer)?;
         let raw = crate::metal_backend::read_u32_buffer(&inflight.index, 1)?
@@ -51,6 +52,7 @@ impl CausalDecoder {
         let inflight = self.enqueue_decode_token_resident(
             cache,
             ResidentDecodeInput::CpuToken(token_id),
+            None,
             None,
             Some(sample),
         )?;
@@ -115,9 +117,9 @@ impl CausalDecoder {
         let decode_limit = max_new_tokens - 1;
         let mut previous_index: Option<metal::Buffer> = None;
         let mut stopped = false;
-
         while generated.len() < max_new_tokens && !stopped {
             while enqueued < decode_limit && inflight.len() < RESIDENT_PIPELINE_WINDOW {
+                let slot = enqueued % RESIDENT_PIPELINE_WINDOW;
                 let output_index = cache
                     .resident
                     .as_ref()
@@ -136,8 +138,14 @@ impl CausalDecoder {
                 } else {
                     None
                 };
-                let step =
-                    self.enqueue_decode_token_resident(cache, input, Some(&output_index), sample)?;
+                let pipeline_slot = self.config.parallel_moe.then_some(slot);
+                let step = self.enqueue_decode_token_resident(
+                    cache,
+                    input,
+                    Some(&output_index),
+                    pipeline_slot,
+                    sample,
+                )?;
                 previous_index = Some(output_index);
                 inflight.push_back(step);
                 enqueued += 1;
@@ -177,6 +185,7 @@ impl CausalDecoder {
         cache: &mut CausalDecoderCache,
         input: ResidentDecodeInput<'_>,
         output_index: Option<&metal::BufferRef>,
+        pipeline_slot: Option<usize>,
         sample: Option<ResidentSampleSpec>,
     ) -> Result<ResidentDecodeInflight> {
         let Some(metal) = self.forward_runtime().metal_executor() else {
@@ -234,10 +243,25 @@ impl CausalDecoder {
         let mut command_buffer = arena.state.queue().new_command_buffer();
         let _barrier_guard = crate::metal_backend::resident_concurrent_enabled()
             .then(crate::metal_backend::install_dispatch_barrier_scope);
-        let _namespace_guard =
-            crate::metal_backend::install_scratch_namespace(arena.state.scratch_namespace());
+        let scratch_namespace = match pipeline_slot {
+            Some(slot) => pipeline_scratch_namespace(arena.state.scratch_namespace(), slot)?,
+            None => arena.state.scratch_namespace(),
+        };
+        let _namespace_guard = crate::metal_backend::install_scratch_namespace(scratch_namespace);
+        let _resident_scratch_guard = pipeline_slot.map(install_pipeline_scratch_slot);
         let mut encoder = new_resident_compute_encoder(command_buffer);
         let mut owned: Vec<metal::Buffer> = Vec::new();
+
+        let (hidden_a, hidden_b) = match pipeline_slot {
+            Some(slot) => {
+                let (hidden_a, hidden_b) =
+                    arena.pipeline_hidden_ring.get(slot).ok_or_else(|| {
+                        InferError::Metal(format!("ping-pong pipeline absent pour le slot {slot}"))
+                    })?;
+                (hidden_a, hidden_b)
+            }
+            None => (&arena.hidden_a, &arena.hidden_b),
+        };
 
         match input {
             ResidentDecodeInput::CpuToken(token_id) => {
@@ -249,21 +273,23 @@ impl CausalDecoder {
                         "embedding hidden={embed_hidden}, attendu {hidden}"
                     )));
                 }
-                arena.state.upload(&arena.hidden_a, embed.data())?;
+                arena.state.upload(hidden_a, embed.data())?;
             }
             ResidentDecodeInput::GpuIndex(index_buffer) => {
-                metal.encode_embedding_from_index_buffers(
+                metal.encode_embedding_from_index_buffers_scaled(
                     encoder,
                     &arena.embed_tokens,
                     index_buffer,
-                    arena.hidden_a.buffer(),
+                    hidden_a.buffer(),
                     hidden,
+                    self.config.embed_scale.unwrap_or(1.0),
+                    self.config.is_qwen && qwen_embed_bf16_enabled(),
                 )?;
             }
         }
 
-        let mut current = &arena.hidden_a;
-        let mut other = &arena.hidden_b;
+        let mut current = hidden_a;
+        let mut other = hidden_b;
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_cache = &mut layers[index];
             let is_full = self.config.is_resident_full_attention_layer(index);
@@ -633,6 +659,20 @@ impl CausalDecoder {
         }
         self.next_final_state_cached(cache, token_id)
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn pipeline_scratch_namespace(base: u64, slot: usize) -> Result<u64> {
+    const TAG: u64 = 1_u64 << 63;
+    const SLOT_BITS: u32 = 8;
+    let slot = u64::try_from(slot + 1)
+        .map_err(|_| InferError::Metal("slot pipeline hors u64".to_string()))?;
+    if slot >= (1_u64 << SLOT_BITS) || base > ((TAG - 1) >> SLOT_BITS) {
+        return Err(InferError::Metal(
+            "namespace scratch pipeline hors plage".to_string(),
+        ));
+    }
+    Ok(TAG | (base << SLOT_BITS) | slot)
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

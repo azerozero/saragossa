@@ -259,6 +259,10 @@ impl MetalExecutor {
         dead_code,
         reason = "gather non-fusé, superseded par le gather fusé en kernel"
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "encodeur Metal chaud: buffers et dimensions correspondent directement au kernel gather"
+    )]
     fn encode_moe_coop_gather(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -616,6 +620,10 @@ impl MetalExecutor {
     /// # Errors
     ///
     /// Renvoie une erreur si shapes divergent, NA indispo, quant ≠ u8 gs64, ou Metal échoue.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "encodeur MoE chaud: buffers, dimensions et poids restent alignés sur les bindings Metal"
+    )]
     pub(crate) fn encode_moe_shared_rows_coop(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -881,6 +889,10 @@ impl MetalExecutor {
     /// # Errors
     ///
     /// Renvoie une erreur si shapes divergent, NA indispo, quant ≠ u8 gs64, ou Metal échoue.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "wrapper MoE chaud: regrouper buffers et dimensions ajouterait un objet intermédiaire au prefill"
+    )]
     pub(crate) fn moe_shared_rows_coop(
         &self,
         input_buffer: &BufferRef,

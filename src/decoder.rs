@@ -2,8 +2,9 @@
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::decode_resident::{
-    DecodeResidentState, FullAttentionMetalState, FullAttnDenseLayerWeights, FullAttnLayerDims,
-    FullAttnLayerWeights, FullAttnRoutedLayerWeights, GpuElement, GpuSectionTimer, GpuTensor,
+    install_pipeline_scratch_slot, DecodeResidentState, FullAttentionMetalState,
+    FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
+    GemmaParallelMoeTailWeights, GpuElement, GpuSectionTimer, GpuTensor,
     LinearAttnDenseLayerWeights, LinearAttnLayerWeights, ScratchLease,
 };
 use crate::linear_attention::{
@@ -15,6 +16,7 @@ use crate::metal_backend::{
     MetalEmbeddingWeightBuffers, MetalLinearAttnResidentDenseWeights, MetalLinearWeightBuffers,
     MetalMoeRoutedWeights, MetalMoeSharedWeights,
 };
+use crate::runtime_flags::qwen_embed_bf16_enabled;
 use crate::{
     embed_weight_tokens, load_f32_tensors, process_purge_registry, rms_norm,
     sample_token_top_k_top_p, softmax, DeterministicSampler, EmbeddingWeight, FeedForward,
@@ -40,6 +42,7 @@ mod generation;
 mod lightbatch;
 mod loading;
 mod mtp;
+mod mtp_adaptive;
 mod resident;
 
 use self::flags::*;
@@ -50,6 +53,8 @@ pub fn force_resident_full_linear_decode() {
     flags::force_resident_full_linear_decode();
 }
 
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+mod qwen35_oracles;
 #[cfg(test)]
 mod tests;
 
@@ -152,6 +157,8 @@ pub struct CausalDecoderConfig {
     /// hors Gemma et baked des `rope_dims = head_dim` (RoPE pleine) au lieu du
     /// RoPE partiel correct (`partial_rotary_factor`).
     pub is_gemma4: bool,
+    /// Indique que le décodeur appartient à la famille Qwen.
+    pub is_qwen: bool,
 }
 
 #[derive(Clone)]
@@ -448,6 +455,7 @@ struct ResidentArena {
     state: DecodeResidentState,
     hidden_a: GpuTensor,
     hidden_b: GpuTensor,
+    pipeline_hidden_ring: Vec<(GpuTensor, GpuTensor)>,
     index: GpuTensor,
     index_ring: Vec<GpuTensor>,
     layers: Vec<ResidentLayerBuffers>,
@@ -527,6 +535,10 @@ struct ResidentMtpSpecTwoOutput {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "arène résidente allouée une fois: boxer les variantes ajouterait une allocation et une indirection au decode"
+)]
 enum ResidentLayerBuffers {
     FullMoe(ResidentFullMoeBuffers),
     FullRouted(ResidentFullRoutedBuffers),
@@ -586,6 +598,7 @@ struct ResidentLinearMoeBuffers {
 struct ResidentFullDenseBuffers {
     input_norm: metal::Buffer,
     qkv_proj: Option<MetalLinearWeightBuffers>,
+    value_norm: bool,
     q_proj: MetalLinearWeightBuffers,
     k_proj: MetalLinearWeightBuffers,
     v_proj: MetalLinearWeightBuffers,
@@ -599,6 +612,49 @@ struct ResidentFullDenseBuffers {
     gate_proj: MetalLinearWeightBuffers,
     up_proj: MetalLinearWeightBuffers,
     down_proj: MetalLinearWeightBuffers,
+    parallel_moe: Option<ResidentGemmaParallelMoeBuffers>,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[derive(Debug)]
+struct ResidentGemmaParallelMoeBuffers {
+    post_feedforward_norm_1: metal::Buffer,
+    moe: MetalMoeRoutedWeights,
+    top_k: usize,
+    router_norm: Option<(metal::Buffer, f32)>,
+    per_expert_scale: Option<metal::Buffer>,
+    pre_feedforward_norm_2: metal::Buffer,
+    post_feedforward_norm_2: metal::Buffer,
+    dense_inter_dim: usize,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl ResidentFullDenseBuffers {
+    fn parallel_moe_weights(&self) -> Option<GemmaParallelMoeTailWeights<'_>> {
+        let parallel = self.parallel_moe.as_ref()?;
+        Some(GemmaParallelMoeTailWeights {
+            dense_gate_proj: &self.gate_proj,
+            dense_up_proj: &self.up_proj,
+            dense_down_proj: &self.down_proj,
+            pre_feedforward_norm: self.pre_feedforward_norm.as_ref()?,
+            post_feedforward_norm_1: &parallel.post_feedforward_norm_1,
+            moe: &parallel.moe,
+            top_k: parallel.top_k,
+            router_norm: parallel
+                .router_norm
+                .as_ref()
+                .map(|(weight, eps)| (weight.as_ref(), *eps)),
+            per_expert_scale: parallel
+                .per_expert_scale
+                .as_ref()
+                .map(metal::Buffer::as_ref),
+            pre_feedforward_norm_2: &parallel.pre_feedforward_norm_2,
+            post_feedforward_norm_2: &parallel.post_feedforward_norm_2,
+            post_feedforward_norm: self.post_feedforward_norm.as_ref()?,
+            layer_scalar: self.layer_scalar,
+            dense_inter_dim: parallel.dense_inter_dim,
+        })
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -726,6 +782,7 @@ impl Default for CausalDecoderConfig {
             activation: crate::Activation::Silu,
             rope_style: RopeStyle::Halves,
             is_gemma4: false,
+            is_qwen: false,
         }
     }
 }
@@ -788,6 +845,7 @@ impl From<&ModelConfig> for CausalDecoderConfig {
             // Gemma) : convention d'entraînement des checkpoints, alignée mlx_lm.
             rope_style: RopeStyle::Halves,
             is_gemma4: config.is_gemma4(),
+            is_qwen: config.model_type.starts_with("qwen"),
         }
     }
 }
@@ -891,11 +949,13 @@ impl CausalDecoderConfig {
             q_heads: self.num_attention_heads,
             kv_heads: self.layer_num_key_value_heads(layer_index),
             head_dim,
+            attn_scalar: self.query_pre_attn_scalar.unwrap_or(head_dim as f32),
             rope_dims: self.layer_rope_dims(layer_index, head_dim),
+            rope_frequency_dim: self.layer_rope_frequency_dim(layer_index, head_dim),
             position,
             window_start: 0,
             eps,
-            theta,
+            theta: self.layer_rope_theta_override(layer_index).unwrap_or(theta),
             attn_output_gate: self.attn_output_gate,
         })
     }
@@ -1030,10 +1090,7 @@ impl PrefixCache {
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    match u64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 impl CausalDecoder {
@@ -1220,10 +1277,15 @@ impl CausalDecoder {
     /// Renvoie une erreur si la plongée échoue.
     pub(in crate::decoder) fn embed_scaled(&self, token_ids: &[usize]) -> Result<Tensor> {
         let hidden = embed_weight_tokens(&self.embed_tokens, token_ids)?;
-        match self.config.embed_scale {
-            Some(scale) => Ok(hidden.map(|value| value * scale)),
-            None => Ok(hidden),
-        }
+        let hidden = match self.config.embed_scale {
+            Some(scale) => hidden.map(|value| value * scale),
+            None => hidden,
+        };
+        Ok(recast_qwen_embedding(
+            hidden,
+            self.config.is_qwen,
+            qwen_embed_bf16_enabled(),
+        ))
     }
 
     /// Calcule les logits du prochain token sans cache.
@@ -1352,7 +1414,7 @@ impl CausalDecoder {
                 return Ok(false);
             }
             // Chemins greedy (TTS talker argmax, spéculatif/DFlash) → KV f32 exact.
-            self.setup_resident_full_decode(cache, max_steps, false)
+            self.setup_resident_full_decode(cache, max_steps, 0, false)
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
@@ -1561,5 +1623,19 @@ impl CausalDecoder {
     ) -> Result<Tensor> {
         let final_state = self.next_final_state_cached(cache, token_id)?;
         self.logits_from_final_state(&final_state)
+    }
+}
+
+fn bf16_round_f32(value: f32) -> f32 {
+    let bits = value.to_bits();
+    let rounding = 0x7fff_u32 + ((bits >> 16) & 1);
+    f32::from_bits(bits.wrapping_add(rounding) & 0xffff_0000)
+}
+
+fn recast_qwen_embedding(hidden: Tensor, is_qwen: bool, enabled: bool) -> Tensor {
+    if is_qwen && enabled {
+        hidden.map(bf16_round_f32)
+    } else {
+        hidden
     }
 }

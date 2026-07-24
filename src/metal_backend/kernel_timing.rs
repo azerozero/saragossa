@@ -88,7 +88,7 @@ impl PrefillKernelTiming {
             .checked_mul(96)
             .and_then(|count| count.checked_add(128))
             .ok_or_else(|| InferError::Metal("sample_count GPU timing deborde".to_string()))?;
-        let sample_count = sample_count.max(256).min(8192);
+        let sample_count = sample_count.clamp(256, 8192);
         let descriptor = CounterSampleBufferDescriptor::new();
         descriptor.set_counter_set(&counter_set);
         descriptor.set_sample_count(u64::try_from(sample_count).map_err(|_| {
@@ -213,7 +213,7 @@ impl PrefillKernelTiming {
             return Ok(());
         }
         let mut sorted = rows.into_iter().collect::<Vec<_>>();
-        sorted.sort_by(|(_, left), (_, right)| right.total_ns.cmp(&left.total_ns));
+        sorted.sort_by_key(|(_, row)| std::cmp::Reverse(row.total_ns));
         eprintln!(
             "gpu_timestamps summary mode={:?} samples={} used_pairs={} total_ms={:.3}",
             self.mode,

@@ -18,6 +18,9 @@ pub mod error;
 #[cfg(test)]
 mod golden;
 pub mod guided;
+#[cfg(test)]
+#[path = "hf_cache.rs"]
+pub(crate) mod hf_resolve;
 pub mod linear;
 pub mod linear_attention;
 pub mod memory_guard;
@@ -44,6 +47,9 @@ pub mod tts_mimi;
 pub mod tts_speaker;
 pub mod whisper;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use activation::{gelu, gelu_tanh, silu};
 pub use assets::{ModelAssets, MtpWeightsInfo};
 pub use catalog::WeightCatalog;
@@ -55,8 +61,8 @@ pub use chat_template::{
 pub use config::{ModelConfig, QuantConfig, RawModelConfig, RopeScalingConfig};
 pub use decoder::{
     force_resident_full_linear_decode, CausalDecoder, CausalDecoderCache, CausalDecoderConfig,
-    CausalDecoderPromptMetalSnapshot, CausalDecoderPromptState, GenerationOptions, RopeStyle,
-    SpeculativeOutput, SpeculativeStats,
+    CausalDecoderPromptMetalSnapshot, CausalDecoderPromptState, GenerationOptions,
+    GenerationOutput, GenerationTimings, RopeStyle, SpeculativeOutput, SpeculativeStats,
 };
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 pub use decoder::{ResidentLinearXrayLayerDiff, ResidentLinearXrayReport};

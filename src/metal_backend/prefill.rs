@@ -231,7 +231,7 @@ impl PrefillSectionProfile {
                 )
             })
             .collect::<Vec<_>>();
-        rows.sort_by(|left, right| right.3.cmp(&left.3));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.3));
         let total_us = rows.iter().map(|row| row.3).sum::<u128>();
         for (label, encode_us, wait_us, section_total_us, count) in rows {
             let pct = if total_us > 0 {

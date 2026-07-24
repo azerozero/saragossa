@@ -60,11 +60,13 @@ pub struct PurgeRegistry<'a, Ctx = ()> {
     entries: Vec<PurgeableEntry<'a, Ctx>>,
 }
 
+type PurgeCallback<'a, Ctx> = dyn FnMut(&mut Ctx, PurgePressure) -> PurgeOutcome + Send + 'a;
+
 struct PurgeableEntry<'a, Ctx> {
     id: u64,
     order: i32,
     name: String,
-    callback: Box<dyn FnMut(&mut Ctx, PurgePressure) -> PurgeOutcome + Send + 'a>,
+    callback: Box<PurgeCallback<'a, Ctx>>,
 }
 
 impl<'a, Ctx> Default for PurgeRegistry<'a, Ctx> {
@@ -287,7 +289,7 @@ impl MemoryGuard {
                 headroom_bytes,
                 metal_cap: recommended_metal_working_set_bytes(),
             },
-            Arc::new(|| process_footprint_bytes()),
+            Arc::new(process_footprint_bytes),
         )
     }
 

@@ -1,4 +1,71 @@
 // Port qmm_t_nax brique 3 : GEMM naïf + dé-quant B u8 gs64 EN kernel doit calculer juste.
+
+impl MetalExecutor {
+    /// Exécute le coop routé avec des poids et activations de modèle réels.
+    pub(crate) fn moe_routed_rows_coop_real_for_test(
+        &self,
+        input: &Tensor,
+        router: &Linear,
+        experts: &[GatedMlp],
+        top_k: usize,
+    ) -> Result<Tensor> {
+        let (rows, hidden) = input.as_matrix()?;
+        let stacked = self.stacked_moe_buffers(experts)?;
+        if !MetalMoeRoutedWeights::stacked_coop_compatible(&stacked) {
+            return Err(InferError::Config(
+                "poids MoE réels incompatibles avec le coop routé".to_string(),
+            ));
+        }
+        let expert_count = stacked.gate.experts;
+        let out_dim = stacked.down.out_dim;
+        let weights = MetalMoeRoutedWeights {
+            router: self.resolve_linear_weight_buffers(
+                router.weight(),
+                "qwen35_oracle_router",
+            )?,
+            stacked,
+        };
+        let slots = rows
+            .checked_mul(top_k)
+            .ok_or_else(|| InferError::Dimension("oracle coop slots débordent".to_string()))?;
+        let input_buffer = self.upload_f32_buffer(input.data(), "qwen35_oracle_input")?;
+        let router_buffer =
+            self.uncached_f32_buffer(rows * expert_count, "qwen35_oracle_router_out")?;
+        let indices_buffer = self.uncached_u32_buffer(slots, "qwen35_oracle_indices")?;
+        let scores_buffer = self.uncached_f32_buffer(slots, "qwen35_oracle_scores")?;
+        let down_buffer =
+            self.uncached_f32_buffer(slots * out_dim, "qwen35_oracle_down")?;
+        let output_buffer =
+            self.uncached_f32_buffer(rows * out_dim, "qwen35_oracle_output")?;
+
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let guard = EncoderEndGuard::new(encoder);
+        let mut owned = Vec::<metal::Buffer>::new();
+        self.encode_moe_routed_rows_coop(
+            encoder,
+            &mut owned,
+            &input_buffer,
+            None,
+            &output_buffer,
+            &router_buffer,
+            &indices_buffer,
+            &scores_buffer,
+            &down_buffer,
+            rows,
+            hidden,
+            &weights,
+            top_k,
+        )?;
+        guard.end();
+        commit_and_wait(command_buffer)?;
+        Tensor::from_vec(
+            vec![rows, out_dim],
+            read_f32_buffer(&output_buffer, rows * out_dim)?,
+        )
+    }
+}
+
 #[test]
 fn coop_qb_matches_cpu() -> Result<()> {
     let Some(executor) = test_executor()? else {
@@ -143,7 +210,7 @@ fn run_coop_qb_matches_cpu(
     executor.encode_f32_to_bf16(enc, &a_f32, &a_bf16, m * k)?;
     executor.encode_f32_to_bf16(enc, &s_f32, &s_bf16, n * groups)?;
     executor.encode_f32_to_bf16(enc, &bi_f32, &bi_bf16, n * groups)?;
-    enc.set_compute_pipeline_state(&pso);
+    enc.set_compute_pipeline_state(pso);
     enc.set_buffer(0, Some(&a_bf16), 0);
     enc.set_buffer(1, Some(&packed_buf), 0);
     enc.set_buffer(2, Some(&s_bf16), 0);
@@ -870,7 +937,7 @@ fn moe_routed_rows_coop_full_matches_cpu() -> Result<()> {
             let sc = scores[t * top_k + k];
             // hidden2 = silu(gate·x)·(up·x), en bf16.
             let mut h2 = vec![0.0_f32; inter];
-            for col in 0..inter {
+            for (col, h2_value) in h2.iter_mut().enumerate().take(inter) {
                 let mut ga = 0.0_f32;
                 let mut ua = 0.0_f32;
                 for kk in 0..hidden {
@@ -878,12 +945,13 @@ fn moe_routed_rows_coop_full_matches_cpu() -> Result<()> {
                     ga += a * deq(&q_gate, &s_gu, &b_gu, e, col, kk, inter, hidden, groups_gu);
                     ua += a * deq(&q_up, &s_gu, &b_gu, e, col, kk, inter, hidden, groups_gu);
                 }
-                h2[col] = bf16_round((ga / (1.0 + (-ga).exp())) * ua);
+                *h2_value = bf16_round((ga / (1.0 + (-ga).exp())) * ua);
             }
             for o in 0..hidden {
                 let mut acc = 0.0_f32;
-                for kk in 0..inter {
-                    acc += h2[kk] * deq(&q_down, &s_dn, &b_dn, e, o, kk, hidden, inter, groups_dn);
+                for (kk, &h2_value) in h2.iter().enumerate().take(inter) {
+                    acc += h2_value
+                        * deq(&q_down, &s_dn, &b_dn, e, o, kk, hidden, inter, groups_dn);
                 }
                 cpu[t * hidden + o] += sc * acc;
             }

@@ -190,7 +190,12 @@ pub(super) fn flash_sdpa_enabled() -> bool {
 /// la génération échantillonne** (`sampled`, temperature > 0), **f32 en greedy**.
 ///
 /// Motivation : bf16 divise par deux la bande passante KV (decode long-contexte
-/// +12 % @32k → 89,8 tok/s, dépasse la cible mlx locale 88,1) pour une
+/// +12 % @32k → 89,8 tok/s) pour une
+// NOTE : la comparaison « dépasse mlx 88,1 » a été retirée le 2026-07-22. La marge
+// (+1,9 %) est très inférieure au bruit de mesure de la machine (7-16 % d'étendue
+// sur un run unique), et la référence mlx elle-même variait de 12 % entre relevés.
+// Le +12 % de bf16 reste étayé (dose-réponse monotone + réplication indépendante) ;
+// c'est le classement face à mlx qui ne l'était pas.
 /// perturbation **near-tie** (0,03 logit médian ≪ marge 4,5-6,0 du modèle ;
 /// byte-identique à 30k) — noyée par le bruit du sampling T > 0. Le greedy reste
 /// f32 pour garder les **oracles md5 e2e byte-identiques** (non re-baselinés).
@@ -220,37 +225,6 @@ fn kv_bf16_env_override() -> Option<bool> {
 /// `None` sinon (→ défaut piloté par la température).
 fn parse_kv_bf16_override(value: &str) -> Option<bool> {
     env_flag_value(value)
-}
-
-#[cfg(test)]
-mod kv_bf16_resolution_tests {
-    use super::{parse_kv_bf16_override, resolve_kv_bf16};
-
-    #[test]
-    fn parse_reconnait_les_formes_explicites() {
-        for on in ["1", "true", "TRUE", "on", "On", " 1 "] {
-            assert_eq!(parse_kv_bf16_override(on), Some(true), "{on:?} -> true");
-        }
-        for off in ["0", "false", "FALSE", "off", "Off", " 0 "] {
-            assert_eq!(parse_kv_bf16_override(off), Some(false), "{off:?} -> false");
-        }
-        for none in ["", "2", "bf16", "yes", "no"] {
-            assert_eq!(parse_kv_bf16_override(none), None, "{none:?} -> None");
-        }
-    }
-
-    #[test]
-    fn precedence_env_explicite_puis_temperature() {
-        // Override explicite gagne toujours, quelle que soit la température.
-        assert!(resolve_kv_bf16(Some(true), false), "env=1 + greedy -> bf16");
-        assert!(
-            !resolve_kv_bf16(Some(false), true),
-            "env=0 + sampled -> f32"
-        );
-        // Défaut piloté par la température quand l'env est absent.
-        assert!(resolve_kv_bf16(None, true), "défaut sampled -> bf16");
-        assert!(!resolve_kv_bf16(None, false), "défaut greedy -> f32");
-    }
 }
 
 /// Arrondit `value` à la précision bf16 tout en restant représenté en f32.
@@ -309,4 +283,35 @@ pub(super) fn sdpa_2pass_blocks(len: usize) -> usize {
     let raw = (len / 128).max(1);
     let rounded = raw.div_ceil(32) * 32;
     rounded.clamp(32, 1024)
+}
+
+#[cfg(test)]
+mod kv_bf16_resolution_tests {
+    use super::{parse_kv_bf16_override, resolve_kv_bf16};
+
+    #[test]
+    fn parse_reconnait_les_formes_explicites() {
+        for on in ["1", "true", "TRUE", "on", "On", " 1 "] {
+            assert_eq!(parse_kv_bf16_override(on), Some(true), "{on:?} -> true");
+        }
+        for off in ["0", "false", "FALSE", "off", "Off", " 0 "] {
+            assert_eq!(parse_kv_bf16_override(off), Some(false), "{off:?} -> false");
+        }
+        for none in ["", "2", "bf16", "yes", "no"] {
+            assert_eq!(parse_kv_bf16_override(none), None, "{none:?} -> None");
+        }
+    }
+
+    #[test]
+    fn precedence_env_explicite_puis_temperature() {
+        // Override explicite gagne toujours, quelle que soit la température.
+        assert!(resolve_kv_bf16(Some(true), false), "env=1 + greedy -> bf16");
+        assert!(
+            !resolve_kv_bf16(Some(false), true),
+            "env=0 + sampled -> f32"
+        );
+        // Défaut piloté par la température quand l'env est absent.
+        assert!(resolve_kv_bf16(None, true), "défaut sampled -> bf16");
+        assert!(!resolve_kv_bf16(None, false), "défaut greedy -> f32");
+    }
 }

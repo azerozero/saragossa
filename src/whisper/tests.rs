@@ -130,17 +130,17 @@ fn local_whisper_tiny_dir() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let home = std::env::var("HOME").ok()?;
-    let snapshots =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--openai--whisper-tiny/snapshots");
-    let entries = std::fs::read_dir(snapshots).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.join("config.json").is_file() && path.join("model.safetensors").is_file() {
-            return Some(path);
-        }
-    }
-    None
+    let snapshot = crate::hf_resolve::hf_cache_dir_from_env().and_then(|hub| {
+        let snapshots = hub.join("models--openai--whisper-tiny/snapshots");
+        std::fs::read_dir(snapshots)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.join("config.json").is_file() && path.join("model.safetensors").is_file()
+            })
+    });
+    crate::test_support::require_real_model(snapshot, "snapshot openai/whisper-tiny")
 }
 
 fn drift(left: &[f32], right: &[f32]) -> (f32, f32) {

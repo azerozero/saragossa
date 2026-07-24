@@ -469,7 +469,7 @@ impl CodecGpu {
         if data.is_empty() {
             return Err(InferError::Metal("upload codec GPU vide".to_string()));
         }
-        let bytes = u64::try_from(data.len() * std::mem::size_of::<f32>())
+        let bytes = u64::try_from(std::mem::size_of_val(data))
             .map_err(|_| InferError::Metal("upload codec hors u64".to_string()))?;
         Ok(self.device.new_buffer_with_data(
             data.as_ptr().cast::<c_void>(),
@@ -505,7 +505,7 @@ impl CodecGpu {
         // intermédiaires restent résidents, aucune lecture CPU avant la fin.
         let _barrier_scope = install_dispatch_barrier_scope();
 
-        let input_bytes = u64::try_from(hidden.len() * std::mem::size_of::<f32>())
+        let input_bytes = u64::try_from(std::mem::size_of_val(hidden))
             .map_err(|_| InferError::Metal("hidden codec hors u64".to_string()))?;
         let input = GpuNlc {
             buffer: self.device.new_buffer_with_data(
@@ -802,7 +802,7 @@ impl CodecGpu {
         let encoder = command_buffer.new_compute_command_encoder();
         let _barrier_scope = install_dispatch_barrier_scope();
 
-        let input_bytes = u64::try_from(hidden.len() * std::mem::size_of::<f32>())
+        let input_bytes = u64::try_from(std::mem::size_of_val(hidden))
             .map_err(|_| InferError::Metal("hidden codec streaming hors u64".to_string()))?;
         let input = GpuNlc {
             buffer: self.device.new_buffer_with_data(
@@ -817,7 +817,7 @@ impl CodecGpu {
 
         let mut cur = self.conv_stream(
             state,
-            &encoder,
+            encoder,
             &mut pool,
             &input,
             "decoder.decoder.0.conv",
@@ -830,7 +830,7 @@ impl CodecGpu {
         for block in 1..=blocks {
             let stride = self.upsample_rates[block - 1];
             let snaked = self.snake(
-                &encoder,
+                encoder,
                 &mut pool,
                 &cur,
                 &format!("decoder.decoder.{block}.block.0"),
@@ -838,7 +838,7 @@ impl CodecGpu {
             pool.release(cur);
             cur = self.transpose_stream(
                 state,
-                &encoder,
+                encoder,
                 &mut pool,
                 &snaked,
                 &format!("decoder.decoder.{block}.block.1.conv"),
@@ -848,14 +848,14 @@ impl CodecGpu {
             for (slot, dilation) in [(2_usize, 1_usize), (3, 3), (4, 9)] {
                 let prefix = format!("decoder.decoder.{block}.block.{slot}");
                 cur =
-                    self.residual_unit_stream(state, &encoder, &mut pool, cur, &prefix, dilation)?;
+                    self.residual_unit_stream(state, encoder, &mut pool, cur, &prefix, dilation)?;
             }
         }
 
         let tail_snake = blocks + 1;
         let tail_conv = blocks + 2;
         let snaked = self.snake(
-            &encoder,
+            encoder,
             &mut pool,
             &cur,
             &format!("decoder.decoder.{tail_snake}"),
@@ -863,7 +863,7 @@ impl CodecGpu {
         pool.release(cur);
         let wav = self.conv_stream(
             state,
-            &encoder,
+            encoder,
             &mut pool,
             &snaked,
             &format!("decoder.decoder.{tail_conv}.conv"),
@@ -921,6 +921,10 @@ impl CodecGpu {
         Ok(out)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "chemin codec GPU chaud: état, buffers et paramètres de convolution restent explicites"
+    )]
     fn conv_stream(
         &self,
         state: &mut CodecGpuStream,
@@ -966,6 +970,10 @@ impl CodecGpu {
         Ok(out)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "primitive codec GPU chaude: offset et paramètres de convolution suivent le dispatch Metal"
+    )]
     fn conv_with_start(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1065,6 +1073,10 @@ impl CodecGpu {
         Ok(out)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "primitive codec GPU chaude: fenêtre de sortie et stride suivent le dispatch Metal"
+    )]
     fn transpose_with_start(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1216,7 +1228,7 @@ fn compile(device: &Device, name: &str) -> Result<ComputePipelineState> {
 }
 
 fn set_params(encoder: &ComputeCommandEncoderRef, index: u64, params: &[u32]) {
-    let bytes = (params.len() * std::mem::size_of::<u32>()) as u64;
+    let bytes = std::mem::size_of_val(params) as u64;
     encoder.set_bytes(index, bytes, params.as_ptr().cast::<c_void>());
 }
 
