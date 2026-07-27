@@ -6,7 +6,7 @@ et les conventions, puis [`llms.txt`](llms.txt) pour la carte des modules.
 ## Règles non négociables
 
 1. Travailler sur une branche dédiée. Le flux public est fork, branche, pull
-   request, vérifications CI et signature du [`CLA`](CLA.md).
+   request et vérifications CI.
 2. Utiliser des Conventional Commits en français avec un corps utile. Ne pas
    ajouter de trailer de génération ni de `Co-Authored-By`.
 3. Avant de finir, exécuter `cargo fmt --all -- --check`, `cargo clippy

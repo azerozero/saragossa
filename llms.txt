@@ -8,7 +8,6 @@
 
 - [Guide de développement](CLAUDE.md): architecture, conventions Rust/Metal et gates
 - [Instructions de contribution](AGENTS.md): règles non négociables et flux fork vers PR
-- [CLA](CLA.md): accord requis pour les contributions externes
 - [README](README.md): capacités, démarrage, serveur et performances
 
 ## Points d'entrée
@@ -21,7 +20,7 @@
 - [Kernels](src/kernels.metal): calcul GPU embarqué
 - [Chargement](src/qwen_loader.rs): modèles Qwen, Gemma et quantifications
 - [Whisper](src/whisper.rs): transcription STT
-- [TTS](src/tts.rs): synthèse Qwen3-TTS
+- [TTS](src/tts/mod.rs): synthèse Qwen3-TTS
 - [Serveur](src/serve/mod.rs): endpoints locaux compatibles OpenAI
 - [Flags runtime](src/runtime_flags.rs): réglages et diagnostics centralisés
 
@@ -30,4 +29,4 @@
 - [Hooks locaux](prek.toml): fmt, clippy, gitleaks, deny, audit et machete
 - [Politique de dépendances](deny.toml): advisories, licences et sources
 - [Release](release-plz.toml): versions, changelog, tags et crates.io
-- [Workflows](.github/workflows/): Rust, SAST, docs, nightly, CLA et release
+- [Workflows](.github/workflows/): Rust, SAST, docs, nightly et release

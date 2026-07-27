@@ -27,6 +27,10 @@ jobs:
       group: release-plz-pr
       cancel-in-progress: false
     steps:
+      # Passer à block après validation des endpoints release-plz dans les logs d'audit.
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -51,6 +55,10 @@ jobs:
       group: release-plz-publish
       cancel-in-progress: false
     steps:
+      # Passer à block après validation des endpoints release-plz dans les logs d'audit.
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0

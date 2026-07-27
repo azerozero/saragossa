@@ -69,7 +69,7 @@ les contrôles de dépendances au push.
 ## Contributions et releases
 
 Le flux public est : fork du dépôt, branche courte, pull request vers `main`,
-signature du [`CLA`](CLA.md), puis CI verte. Les commits suivent Conventional
+puis CI verte. Les commits suivent Conventional
 Commits en français et n'ajoutent aucun trailer de paternité automatisé.
 
 `release-plz` prépare les changements de version et le changelog. Seul le

@@ -1,7 +1,7 @@
 name: Auto-merge on green CI
 
 # Active l'auto-merge des PR étiquetées `automerge` après le gate Rust. GitHub
-# attend ensuite tous les checks requis, notamment le CLA et les scans SAST.
+# attend ensuite tous les checks requis, notamment les scans SAST.
 
 on:
   workflow_run:

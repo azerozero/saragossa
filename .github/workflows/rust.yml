@@ -30,23 +30,37 @@ jobs:
           rustup component add rustfmt clippy
           rustc --version
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          shared-key: stable-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets --features metal,devtools
       - name: Build
         run: cargo build --features metal,devtools
+      - name: Documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
       - name: Tests
         run: cargo test --features metal,devtools
+
+  msrv:
+    name: MSRV 1.85
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust 1.85 toolchain
+        run: |
+          rustup toolchain install 1.85 --profile minimal
+          rustc +1.85 --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-1.85-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build with MSRV
+        run: cargo +1.85 build
 
   audit:
     name: cargo audit
@@ -75,9 +89,9 @@ jobs:
       - name: Rust toolchain
         run: rustup default stable
       - name: Install policy tools
-        run: |
-          command -v cargo-deny >/dev/null || cargo install cargo-deny --locked
-          command -v cargo-machete >/dev/null || cargo install cargo-machete --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete
       - name: Dependency policy
         run: cargo deny check
       - name: Unused dependencies
