@@ -3,22 +3,19 @@
 # Ce fichier fait du dépôt un *tap* Homebrew. Installation :
 #
 #   brew tap azerozero/saragossa https://github.com/azerozero/saragossa
+#   brew install saragossa             # build depuis le dernier tag (stable)
 #   brew install --HEAD saragossa      # build depuis la branche main
 #
-# La variante `stable` (build depuis une release taguée, sans `--HEAD`) est
-# commentée plus bas : elle s'active dès qu'un tag `vX.Y.Z` + tarball existe.
-# Aujourd'hui la CI release-plz ne pose aucun tag (secret RELEASE_PLZ_TOKEN
-# absent) → seule `--HEAD` fonctionne. Décommenter `url`/`sha256` au premier tag.
+# Deux variantes coexistent : `stable` (dernier tag `vX.Y.Z`, défaut) et `--HEAD`
+# (branche `main`). Bumper `url` + `sha256` à chaque nouveau tag posé par
+# release-plz.
 class Saragossa < Formula
   desc "Pure-Rust Metal inference engine for Apple Silicon LLMs, STT and TTS"
   homepage "https://github.com/azerozero/saragossa"
+  url "https://github.com/azerozero/saragossa/archive/refs/tags/v0.1.0.tar.gz"
+  sha256 "2d018f6ad34ea250fad0b798079574f324b88a9aaf0945bee81ced1b9422f6fc"
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/azerozero/saragossa.git", branch: "main"
-
-  # stable do
-  #   url "https://github.com/azerozero/saragossa/archive/refs/tags/v0.1.0.tar.gz"
-  #   sha256 "<à remplir au 1er tag>"
-  # end
 
   depends_on "rust" => :build
   depends_on arch: :arm64 # kernels Metal GPU → Apple Silicon uniquement
