@@ -21,7 +21,7 @@
 - [Kernels](src/kernels.metal): calcul GPU embarqué
 - [Chargement](src/qwen_loader.rs): modèles Qwen, Gemma et quantifications
 - [Whisper](src/whisper.rs): transcription STT
-- [TTS](src/tts.rs): synthèse Qwen3-TTS
+- [TTS](src/tts/mod.rs): synthèse Qwen3-TTS
 - [Serveur](src/serve/mod.rs): endpoints locaux compatibles OpenAI
 - [Flags runtime](src/runtime_flags.rs): réglages et diagnostics centralisés
 
