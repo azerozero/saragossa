@@ -1,199 +1,218 @@
 # saragossa
 
-![licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue)
-![plateforme](https://img.shields.io/badge/plateforme-Apple%20Silicon-black)
+![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
+![platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
-![python](https://img.shields.io/badge/python-0%20d%C3%A9pendance-success)
+![python](https://img.shields.io/badge/python-zero%20deps-success)
 
-Moteur d'inférence **Rust pur** sur Apple Silicon : kernels `metal-rs` bruts,
-zéro Python, zéro dépendance à MLX ou CoreML. LLM, STT et TTS dans un seul
-binaire, utilisables en bibliothèque ou derrière le serveur HTTP
-OpenAI-compatible `saragossa serve`. Né comme le moteur du projet reti (agent
-vocal local), il s'utilise seul.
+**Pure-Rust Metal inference engine for Apple Silicon.** Raw `metal-rs` kernels,
+no Python, no MLX, no CoreML. LLM, speech-to-text and text-to-speech in a single
+binary — usable as a library or behind the OpenAI-compatible HTTP server
+`saragossa serve`.
 
-## Positionnement
+## Where it fits
 
-Dans le paysage des backends d'inférence (Ollama, llama.cpp, vLLM, SGLang…),
-saragossa occupe le quadrant **latence mono-utilisateur × Apple Silicon** :
+Among inference backends (Ollama, llama.cpp, vLLM, SGLang…), saragossa occupies
+the **single-user latency × Apple Silicon** quadrant:
 
-- vLLM/SGLang/TGI/LMDeploy exigent un GPU NVIDIA ; ici tout est Metal natif.
-- Ollama et llama.cpp sont multi-plateformes généralistes ; saragossa est
-  optimisé pour UNE cible (GPU Apple Silicon, decode résident) et **dépasse
-  `mlx_lm` sur les MoE** à quantification comparable.
-- Optimisé latence locale (agent, copilote, boucle vocale), pas throughput
-  multi-tenant : le serveur est mono-thread par choix.
-- Cache chaud de préfixe par blocs avec snapshots GPU (même famille d'idées que
-  le RadixAttention de SGLang) : le multi-turn ne repaye pas son historique.
+- vLLM / SGLang / TGI / LMDeploy require an NVIDIA GPU; here everything is native
+  Metal.
+- Ollama and llama.cpp are general-purpose and cross-platform; saragossa is tuned
+  for **one** target (the Apple Silicon GPU, resident decode). On MoE **decode**
+  at comparable quantization it is competitive with — and can exceed — `mlx_lm`
+  (measured; benchmark on your own hardware).
+- Optimized for local latency (agents, copilots, voice loops), not multi-tenant
+  throughput: the server is single-threaded by design.
+- A block-wise warm prefix cache with GPU snapshots (same family of ideas as
+  SGLang's RadixAttention): multi-turn sessions don't re-pay for their history.
 
-## Capacités
+## Capabilities
 
-| Domaine | Détail |
+| Domain | Details |
 |---|---|
-| LLM | Qwen3.x dense et MoE (27B/30B/35B-A3B), Gemma 4 dense (`gemma4_unified`) et MoE (`gemma4`), loader générique Llama/Mistral/Gemma 3 ; quantifs u4/u6/u8 gs32-128, scales/biases bf16 |
-| STT | Whisper large-v3-turbo (encodeur + décodeur résidents, GEMM Neural-Accelerators bf16) |
-| TTS | Qwen3-TTS : talker résident + codec GPU + streaming intra-phrase |
-| Embeddings | e5-small pur Rust (CPU), pour la mémoire sémantique / le RAG |
-| Serveur | HTTP multi-modèle mono-thread, pool LRU, cache chaud, garde OOM |
+| LLM | Qwen3.x dense and MoE (27B / 30B / 35B-A3B), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u4 / u6 / u8 quantization at group sizes 32–128, bf16 scales/biases |
+| STT | Whisper large-v3-turbo (resident encoder + decoder, bf16 Neural-Accelerator GEMM) |
+| TTS | Qwen3-TTS: resident talker + GPU codec + intra-sentence streaming |
+| Embeddings | e5-small, pure Rust (CPU) — for semantic memory / RAG |
+| Server | Single-threaded multi-model HTTP, LRU model pool, warm cache, OOM guard |
 
-### Endpoints `saragossa serve`
+### `saragossa serve` endpoints
 
-| Endpoint | Rôle |
+| Endpoint | Purpose |
 |---|---|
-| `GET /v1/models` | Modèles servis |
-| `POST /v1/chat/completions` | Chat OpenAI-compatible (SSE ou non), `response_format: {"type":"json_object"}` |
-| `POST /v1/messages` | Shim Anthropic Messages + `tool_use` (pilotable par Claude Code) |
-| `POST /v1/audio/transcriptions` | STT Whisper (multipart WAV, opt-in `--stt-model`) |
-| `POST /v1/audio/speech` | TTS Qwen3 (JSON → WAV, opt-in `--tts-model`) |
-| `POST /v1/embeddings` | Embeddings e5-small (opt-in `--embed-model`) |
+| `GET /v1/models` | Served models |
+| `POST /v1/chat/completions` | OpenAI-compatible chat (SSE or not), `response_format: {"type":"json_object"}` |
+| `POST /v1/messages` | Anthropic Messages shim + `tool_use` (drivable by Claude Code) |
+| `POST /v1/audio/transcriptions` | Whisper STT (multipart WAV, opt-in `--stt-model`) |
+| `POST /v1/audio/speech` | Qwen3 TTS (JSON → WAV, opt-in `--tts-model`) |
+| `POST /v1/embeddings` | e5-small embeddings (opt-in `--embed-model`) |
 
-## Principes de conception
+## Design principles
 
-- **Résidence GPU** : en decode, 1 token = 1 command buffer, zéro readback ni
-  `commit_and_wait` par couche. Le per-op CPU-orchestré n'existe qu'en repli.
-- **Byte-identité comme gate** : toute optimisation prouve qu'elle préserve la
-  sortie (oracles md5 e2e, goldens STT/TTS) ; les dérives near-tie sont
-  qualifiées (ids + top-5 + marge) et actées — jamais silencieuses.
-- **Tout est débrayable** : chaque chemin optimisé a son kill-switch env ;
-  les flags sont centralisés dans [`src/runtime_flags.rs`](src/runtime_flags.rs).
+- **GPU residency** — in decode, one token is one command buffer, with no
+  readback and no per-layer `commit_and_wait`. The CPU-orchestrated per-op path
+  exists only as a fallback.
+- **Byte-identity as a gate** — every optimization proves it preserves the output
+  (end-to-end md5 oracles, STT/TTS goldens); near-tie drifts are qualified (ids +
+  top-5 + margin) and recorded — never silent.
+- **Everything is switchable** — each optimized path has an environment
+  kill-switch; the flags are centralized in
+  [`src/runtime_flags.rs`](src/runtime_flags.rs).
 
-## Perfs (mesurées le 2026-07-06, M5 Max)
+## Performance
 
-- Decode 35B-A3B greedy @1k : **145,7 tok/s** (`4bit`, défaut prod) ·
-  **105,9 tok/s** (`oQ8`) · **89,8 tok/s** @32k (`oQ8`, KV bf16).
-- Prefill 35B : 1,0 s @2k · 3,5 s @8k · 23,3 s @32k.
-- STT Whisper turbo : rtf 0,107 · TTS : e2e 0,747, TTFA streaming ~1,2 s.
+Measured 2026-07-06 on an M5 Max:
 
-Ces chiffres valent pour leur contexte (matériel, modèle, longueur) — mesurez
-sur votre machine avant de figer un choix.
+- Decode 35B-A3B, greedy @1k: **145.7 tok/s** (`4bit`, production default) ·
+  **105.9 tok/s** (`oQ8`) · **89.8 tok/s** @32k (`oQ8`, KV bf16).
+- Prefill 35B: 1.0 s @2k · 3.5 s @8k · 23.3 s @32k.
+- Whisper turbo STT: rtf 0.107 · TTS: 0.747 end-to-end, streaming TTFA ~1.2 s.
 
-## Démarrage rapide
+These numbers hold for their context (hardware, model, length) — measure on your
+own machine before committing to a choice.
 
-```bash
-# Lance un chat interactif et télécharge le modèle HF s'il manque.
-cargo run --release -p saragossa -- run mlx-community/Qwen3-4B-4bit
+## Install
 
-# Affiche les modèles déjà présents dans le cache Hugging Face local.
-cargo run --release -p saragossa -- list
+### Homebrew (Apple Silicon)
+
+```sh
+brew tap azerozero/saragossa https://github.com/azerozero/saragossa
+brew install --HEAD saragossa   # build from the main branch
+# brew install saragossa        # once a tagged release is wired into the tap
 ```
 
-Pour les modèles gated (Gemma, par exemple), acceptez d'abord la licence sur la
-page Hugging Face du modèle puis exportez `HF_TOKEN`.
+### From source
 
-## Usage
+```sh
+git clone https://github.com/azerozero/saragossa.git
+cd saragossa
+cargo install --path . --locked   # installs the `saragossa` binary
+```
 
-```bash
-# CLI de dev (le binaire requiert la feature devtools, activée par défaut) :
-# génération LLM directe.
-cargo run --release -p saragossa -- \
+Requirements: **Apple Silicon** and the Metal Toolchain, which saragossa uses to
+compile its GPU kernels on first launch:
+
+```sh
+xcodebuild -downloadComponent MetalToolchain
+```
+
+## Quick start
+
+```sh
+# Start an interactive chat, downloading the HF model if it is missing.
+saragossa run mlx-community/Qwen3-4B-4bit
+
+# List the models already present in the local Hugging Face cache.
+saragossa list
+```
+
+For gated models (Gemma, for instance) accept the license on the model's Hugging
+Face page first, then export `HF_TOKEN`.
+
+## CLI usage
+
+```sh
+# Direct LLM generation (the binary requires the `devtools` feature, on by default):
+saragossa \
   --model-dir models/Qwen3.6-35B-A3B-oQ8 --backend metal \
-  --prompt "Bonjour" --max-tokens 64 --temperature 0 --metrics
+  --prompt "Hello" --max-tokens 64 --temperature 0 --metrics
 ```
 
-En bibliothèque, les points d'entrée sont `qwen_loader` (LLM), `whisper` (STT),
-`tts` (TTS) et `text_embedder` (embeddings).
+## Library usage
 
-## Serveur `saragossa serve`
+Add the crate and drive the engine directly. The main entry points are
+`qwen_loader` (LLM), `whisper` (STT), `tts` (TTS) and `text_embedder`
+(embeddings); [`src/lib.rs`](src/lib.rs) lists the public API.
 
-Serveur HTTP local **mono-thread**, multi-modèle. Le comportement par défaut
-reste mono-utilisateur : l'état chaud est global au modèle tant qu'aucune clé de
-session n'est fournie. Transport socket Unix par défaut
-(`/tmp/saragossa-serve.sock`, chmod 0600) ; le TCP loopback exige un bearer
-(`--api-key` ou `SARAGOSSA_API_KEY`). Deadline de lecture par connexion (30 s)
-et plafond dur `max_tokens` (4096) débrayent les requêtes qui dérapent.
+## Server: `saragossa serve`
 
-```bash
-# OpenAI-compatible sur socket Unix.
-cargo run --release -p saragossa -- serve \
-  --model qwen35=models/Qwen3.6-35B-A3B-oQ8
+A **single-threaded**, multi-model local HTTP server. The default behavior is
+single-user: the warm state is global to a model until a session key is supplied.
+The transport is a Unix socket by default (`/tmp/saragossa-serve.sock`, mode
+0600); TCP loopback requires a bearer (`--api-key` or `SARAGOSSA_API_KEY`). A
+per-connection read deadline (30 s) and a hard `max_tokens` ceiling (4096) shed
+runaway requests.
 
-# TCP loopback + bearer, pour brancher Claude Code (shim Anthropic).
-SARAGOSSA_API_KEY=local-dev cargo run --release -p saragossa -- serve \
+```sh
+# OpenAI-compatible, over a Unix socket.
+saragossa serve --model qwen35=models/Qwen3.6-35B-A3B-oQ8
+
+# TCP loopback + bearer, e.g. to wire up Claude Code (Anthropic shim).
+SARAGOSSA_API_KEY=local-dev saragossa serve \
   --port 8081 --model qwen35=models/Qwen3.6-35B-A3B-oQ8
 ```
 
-```bash
-# Claude Code parle au moteur local via /v1/messages.
+```sh
+# Claude Code talks to the local engine via /v1/messages.
 ANTHROPIC_BASE_URL=http://127.0.0.1:8081 ANTHROPIC_API_KEY=local-dev claude
 ```
 
-### Structured output (v1 : `json_object`)
+### Structured output (v1: `json_object`)
 
-`POST /v1/chat/completions` accepte `response_format: {"type":"json_object"}`.
-La sortie est contrainte par un automate JSON byte-level côté sampler : objet
-racine obligatoire, chaînes/échappements/nombres/booléens/null et structures
-imbriquées. L'EOT n'est admissible qu'après fermeture de l'objet racine.
+`POST /v1/chat/completions` accepts `response_format: {"type":"json_object"}`.
+The output is constrained by a byte-level JSON automaton in the sampler:
+mandatory root object, strings/escapes/numbers/booleans/null and nested
+structures. End-of-turn is only admissible after the root object closes.
 
-En v1, seules ces requêtes guidées basculent sur le chemin de sampling CPU
-(logits relus puis masqués avant sample). Les requêtes sans `response_format`,
-ou avec `{"type":"text"}`, gardent le chemin résident/GPU existant. Le mode
-`{"type":"json_schema"}` répond 501 : il est réservé à une version ultérieure.
+In v1, only these guided requests switch to the CPU sampling path (logits read
+back, then masked before sampling). Requests without `response_format`, or with
+`{"type":"text"}`, keep the existing resident/GPU path. The
+`{"type":"json_schema"}` mode returns 501: it is reserved for a later version.
 
-Limites v1 : l'automate garantit la grammaire JSON (paires de surrogates
-`𐀀` incluses) mais pas la magnitude d'un nombre au-delà de `f64` ;
-en non-stream, un objet non fermé au budget `max_tokens` remonte une erreur
-plutôt que du JSON tronqué ; en SSE, les deltas restent un préfixe JSON valide
-et un objet non fermé se termine par un événement `error` de type
-`incomplete_json`, sans `[DONE]` normal.
+v1 limits: the automaton guarantees JSON grammar (surrogate pairs `𐀀`
+included) but not a number's magnitude beyond `f64`; in non-streaming mode, an
+object left unclosed at the `max_tokens` budget raises an error rather than
+returning truncated JSON; in SSE, the deltas stay a valid JSON prefix and an
+unclosed object ends with an `error` event of type `incomplete_json`, without the
+normal `[DONE]`.
 
-### Cache chaud (prefix-cache par blocs)
+### Warm cache (block-wise prefix cache)
 
-Les prompts sont découpés en blocs de 256 tokens (`RETI_SERVE_PREFIX_BLOCK_TOKENS`)
-hachés en chaîne (SHA-256 de `hash_précédent ‖ tokens`) : un préfixe ne réutilise
-un état que si **toute la chaîne amont** est identique. Chaque frontière de bloc
-retient l'état de prompt CPU **et** son **snapshot Metal** (KV + état récurrent
-linéaire GDN résident sur GPU), rechargé tel quel sur hit — donc seul le suffixe
-est prérempli. Le cache est un LRU de 128 blocs (`RETI_SERVE_PREFIX_CACHE_BLOCKS`) ;
-le header `x-saragossa-reused-prefix-tokens` rapporte la reprise.
+Prompts are split into 256-token blocks, hashed as a chain (SHA-256 of
+`previous_hash ‖ tokens`): a prefix only reuses state if the **entire upstream
+chain** is identical. Each block boundary retains both the CPU prompt state
+**and** its **Metal snapshot** (KV plus the resident linear-recurrent GDN state),
+reloaded as-is on a hit — so only the suffix is prefilled. The cache is a
+128-block LRU; the `x-saragossa-reused-prefix-tokens` header reports the reuse.
 
-Pour un frontal multi-utilisateur, envoyez `x-saragossa-session: <id>` sur
-`/v1/chat/completions` ; à défaut, le champ OpenAI `user` sert de clé de session.
-Sur `/v1/messages`, le shim Anthropic utilise le même header puis
-`metadata.user_id` en repli. La clé dérive la racine du chaînage : deux sessions
-distinctes ne partagent pas de blocs, et `x-saragossa-reused-prefix-tokens` ne
-rapporte alors que la reprise intra-session. Sans clé, la racine historique
-`[0; 32]` et le namespace global restent inchangés.
+For a multi-user frontend, send `x-saragossa-session: <id>` on
+`/v1/chat/completions`; otherwise the OpenAI `user` field serves as the session
+key. On `/v1/messages`, the Anthropic shim uses the same header, then falls back
+to `metadata.user_id`. The key derives the root of the hash chain: two distinct
+sessions share no blocks, and `x-saragossa-reused-prefix-tokens` then reports only
+intra-session reuse. Without a key, the historical root and the global namespace
+are unchanged.
 
-Cette isolation est un **cloisonnement de cache**, pas une frontière
-d'authentification. Sur la socket Unix par défaut, sans bearer, tout appelant
-autorisé par les permissions du fichier peut revendiquer n'importe quel
-`session-id`. Pour une vraie frontière multi-tenant, authentifiez en amont
-(gateway frontal `grob`) ou utilisez le bearer TCP de `saragossa serve`.
-Le cap `RETI_SERVE_PREFIX_BLOCKS_PER_SESSION` limite en plus les évictions
-intra-session sans changer le défaut mono-utilisateur.
+This isolation is **cache partitioning, not an authentication boundary**. On the
+default Unix socket, with no bearer, any caller allowed by the file permissions
+can claim any session id. For a real multi-tenant boundary, authenticate upstream
+(a front gateway) or use the TCP bearer of `saragossa serve`.
 
-### Garde OOM + pool de modèles LRU
+### OOM guard + LRU model pool
 
-- **Garde OOM prédictive** : projette l'empreinte process (`phys_footprint` Mach)
-  plus le coût de la prochaine allocation contre le plus bas de trois plafonds —
-  cap statique, mémoire hôte moins marge (2 Gio), working-set Metal recommandé.
-  En cas de dépassement projeté, évince d'abord des blocs de cache, puis des
-  modèles ; sinon refuse la requête (HTTP 503).
-- **Pool de modèles LRU** : jusqu'à 2 modèles résidents simultanés
-  (`RETI_SERVE_MODEL_POOL`) ; charger un modèle de plus évince le moins récemment
-  utilisé.
+- **Predictive OOM guard** — projects the process footprint (`phys_footprint`
+  from Mach) plus the cost of the next allocation against the lowest of three
+  ceilings: a static cap, host memory minus headroom, and the recommended Metal
+  working-set. On a projected overshoot it first evicts cache blocks, then
+  models; otherwise it refuses the request (HTTP 503).
+- **LRU model pool** — up to two resident models at once; loading one more evicts
+  the least recently used.
 
-| Variable | Défaut | Rôle |
-|---|---|---|
-| `RETI_SERVE_PREFIX_CACHE` | on | Cache chaud de préfixe par blocs |
-| `RETI_SERVE_PREFIX_BLOCK_TOKENS` | 256 | Taille d'un bloc (tokens) |
-| `RETI_SERVE_PREFIX_CACHE_BLOCKS` | 128 | Capacité LRU du cache (blocs) |
-| `RETI_SERVE_PREFIX_BLOCKS_PER_SESSION` | 128 | Capacité LRU par session |
-| `RETI_SERVE_LRU` | on | Pool LRU de modèles résidents |
-| `RETI_SERVE_MODEL_POOL` | 2 | Modèles résidents simultanés |
-| `RETI_SERVE_OOM_GUARD` | on | Garde mémoire prédictive |
-| `RETI_SERVE_MEMORY_HEADROOM_BYTES` | 2 Gio | Marge hôte conservée hors process |
-| `RETI_SERVE_MEMORY_CAP_BYTES` | auto | Plafond mémoire statique explicite |
+The warm cache, model pool and OOM guard are all tunable through environment
+variables — see [`src/runtime_flags.rs`](src/runtime_flags.rs) for the exact
+names and defaults (block size, LRU capacity, pool size, host headroom, static
+memory cap, …).
 
 ## Features
 
-| Feature | Défaut | Rôle |
+| Feature | Default | Purpose |
 |---|---|---|
-| `metal` | oui | Kernels GPU Metal (macOS ; `src/kernels.metal` embarqué au build, compilé au runtime) |
-| `devtools` | oui (lib) / requis (bin) | Harnais bench/diagnostic (DFlash, MTP, doctor) — exclu des binaires de prod |
+| `metal` | yes | Metal GPU kernels (macOS; `src/kernels.metal` embedded at build time, compiled at runtime) |
+| `devtools` | yes (lib) / required (bin) | Bench/diagnostic harness (DFlash, MTP, doctor) — excluded from production binaries |
 
-Prérequis : Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`).
+Prerequisite: the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`).
 
-## Licence
+## License
 
-Double licence, au choix : [MIT](https://spdx.org/licenses/MIT.html) ou
+Dual-licensed at your option: [MIT](https://spdx.org/licenses/MIT.html) or
 [Apache-2.0](https://spdx.org/licenses/Apache-2.0.html) (SPDX `MIT OR Apache-2.0`).
