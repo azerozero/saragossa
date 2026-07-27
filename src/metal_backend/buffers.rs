@@ -483,8 +483,16 @@ impl MetalExecutor {
             .scratch_buffers
             .lock()
             .map_err(|_| InferError::Metal(format!("cache scratch Metal empoisonné: {label}")))?;
-        if let Some(buffer) = buffers.get(&key) {
-            return Ok(buffer.clone());
+        let last_used = buffers.next_use();
+        if let Some(entry) = buffers.entries.get_mut(&key) {
+            entry.last_used = last_used;
+            // Un cache miss fournit déjà un buffer au contenu indéfini : tous
+            // les appelants scratch l'écrasent avant lecture. Un état précédent
+            // `Empty` après pression mémoire respecte donc le même contrat.
+            let _ = entry
+                .buffer
+                .set_purgeable_state(MTLPurgeableState::NonVolatile);
+            return Ok(entry.buffer.clone());
         }
         let bytes = match element {
             MetalBufferElement::F32 => byte_len::<f32>(len)?,
@@ -492,8 +500,84 @@ impl MetalExecutor {
             MetalBufferElement::Bf16 => byte_len::<u16>(len)?,
         };
         let buffer = self.device.new_buffer(bytes, options);
-        buffers.insert(key, buffer.clone());
+        buffers.total_bytes = buffers.total_bytes.saturating_add(buffer.length());
+        buffers.entries.insert(
+            key,
+            ScratchBufferEntry {
+                buffer: buffer.clone(),
+                last_used,
+            },
+        );
         Ok(buffer)
+    }
+
+    pub(crate) fn scratch_buffer_stats(&self) -> Result<(usize, u64)> {
+        let buffers = self
+            .scratch_buffers
+            .lock()
+            .map_err(|_| InferError::Metal("cache scratch Metal empoisonné".to_string()))?;
+        Ok((buffers.entries.len(), buffers.total_bytes))
+    }
+
+    pub(crate) fn scratch_buffer_scope(&self) -> impl Drop + '_ {
+        ScratchBufferScope {
+            executor: self,
+            namespace: current_scratch_namespace(),
+        }
+    }
+
+    fn release_scratch_namespace(&self, namespace: u64) -> Result<()> {
+        let cap_bytes = crate::runtime_flags::scratch_cap_bytes();
+        let mut buffers = self
+            .scratch_buffers
+            .lock()
+            .map_err(|_| InferError::Metal("cache scratch Metal empoisonné".to_string()))?;
+        let before_entries = buffers.entries.len();
+        let before_bytes = buffers.total_bytes;
+        let mut volatile_entries = 0_usize;
+        for (key, entry) in &mut buffers.entries {
+            if key.namespace == namespace {
+                // Le scope tombe après le prefill/decode complet. Marquer plus
+                // tôt exposerait au purge un buffer encore référencé par une
+                // command buffer Metal en vol.
+                let _ = entry
+                    .buffer
+                    .set_purgeable_state(MTLPurgeableState::Volatile);
+                volatile_entries = volatile_entries.saturating_add(1);
+            }
+        }
+
+        let mut evicted_entries = 0_usize;
+        let mut evicted_bytes = 0_u64;
+        while buffers.total_bytes > cap_bytes {
+            let Some(lru_key) = buffers
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            let Some(entry) = buffers.entries.remove(&lru_key) else {
+                break;
+            };
+            let bytes = entry.buffer.length();
+            buffers.total_bytes = buffers.total_bytes.saturating_sub(bytes);
+            evicted_entries = evicted_entries.saturating_add(1);
+            evicted_bytes = evicted_bytes.saturating_add(bytes);
+        }
+
+        if crate::runtime_flags::trace_gpu_alloc_enabled() {
+            eprintln!(
+                "scratch_cache_trim namespace={namespace} cap_bytes={cap_bytes} \
+                 before_entries={before_entries} before_bytes={before_bytes} \
+                 volatile_entries={volatile_entries} evicted_entries={evicted_entries} \
+                 evicted_bytes={evicted_bytes} after_entries={} after_bytes={}",
+                buffers.entries.len(),
+                buffers.total_bytes,
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn qmv_thread_group_size(&self, pipeline: &ComputePipelineState) -> NSUInteger {
@@ -506,6 +590,22 @@ impl MetalExecutor {
     /// Renvoie le device Metal (pour bâtir l'arène résidente du decode full-attn).
     pub(crate) fn device(&self) -> &Device {
         &self.device
+    }
+}
+
+struct ScratchBufferScope<'a> {
+    executor: &'a MetalExecutor,
+    namespace: u64,
+}
+
+impl Drop for ScratchBufferScope<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.executor.release_scratch_namespace(self.namespace) {
+            eprintln!(
+                "scratch_cache_trim namespace={} error={error}",
+                self.namespace
+            );
+        }
     }
 }
 

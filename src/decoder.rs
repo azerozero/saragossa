@@ -17,6 +17,8 @@ use crate::metal_backend::{
     MetalMoeRoutedWeights, MetalMoeSharedWeights,
 };
 use crate::runtime_flags::qwen_embed_bf16_enabled;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use crate::runtime_flags::trace_gpu_alloc_enabled;
 use crate::{
     embed_weight_tokens, load_f32_tensors, process_purge_registry, rms_norm,
     sample_token_top_k_top_p, softmax, DeterministicSampler, EmbeddingWeight, FeedForward,
@@ -1121,6 +1123,66 @@ struct DecoderRuntime {
     metal: Option<Arc<crate::MetalExecutor>>,
 }
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[derive(Clone, Copy, Debug)]
+struct GpuAllocSnapshot {
+    allocated_bytes: u64,
+    scratch_entries: usize,
+    scratch_bytes: u64,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+struct GpuAllocTrace<'a> {
+    executor: &'a crate::MetalExecutor,
+    scope: &'static str,
+    id: u64,
+    before: GpuAllocSnapshot,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl GpuAllocTrace<'_> {
+    fn capture(executor: &crate::MetalExecutor) -> Option<GpuAllocSnapshot> {
+        let (scratch_entries, scratch_bytes) = match executor.scratch_buffer_stats() {
+            Ok(stats) => stats,
+            Err(error) => {
+                eprintln!("gpu_alloc_trace event=error error={error}");
+                return None;
+            }
+        };
+        Some(GpuAllocSnapshot {
+            allocated_bytes: executor.device().current_allocated_size(),
+            scratch_entries,
+            scratch_bytes,
+        })
+    }
+
+    fn log(&self, event: &str, snapshot: GpuAllocSnapshot) {
+        const MIB: f64 = 1_048_576.0;
+        let delta_mb = (snapshot.allocated_bytes as f64 - self.before.allocated_bytes as f64) / MIB;
+        eprintln!(
+            "gpu_alloc_trace scope={} id={} event={event} allocated_bytes={} \
+             allocated_mb={:.1} delta_mb={delta_mb:.1} scratch_entries={} \
+             scratch_bytes={} scratch_mb={:.1}",
+            self.scope,
+            self.id,
+            snapshot.allocated_bytes,
+            snapshot.allocated_bytes as f64 / MIB,
+            snapshot.scratch_entries,
+            snapshot.scratch_bytes,
+            snapshot.scratch_bytes as f64 / MIB,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl Drop for GpuAllocTrace<'_> {
+    fn drop(&mut self) {
+        if let Some(after) = Self::capture(self.executor) {
+            self.log("after", after);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum DecoderTensor {
     Dense(Tensor),
@@ -1598,6 +1660,34 @@ impl CausalDecoder {
             return ForwardRuntime::metal(metal);
         }
         ForwardRuntime::cpu()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn trace_gpu_alloc_scope(&self, scope: &'static str) -> Option<GpuAllocTrace<'_>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+        if !trace_gpu_alloc_enabled() {
+            return None;
+        }
+        let executor = self.forward_runtime().metal_executor()?;
+        let before = GpuAllocTrace::capture(executor)?;
+        let trace = GpuAllocTrace {
+            executor,
+            scope,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            before,
+        };
+        trace.log("before", before);
+        Some(trace)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn scratch_buffer_scope(&self) -> Option<impl Drop + '_> {
+        self.forward_runtime()
+            .metal_executor()
+            .map(crate::MetalExecutor::scratch_buffer_scope)
     }
 
     /// Crée un cache K/V vide pour ce décodeur.

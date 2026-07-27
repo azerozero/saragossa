@@ -10,7 +10,7 @@ use metal::objc::runtime::{sel_registerName, Object, Sel};
 use metal::CompileOptions;
 use metal::{
     Buffer, BufferRef, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    MTLCommandBufferStatus, MTLPurgeableState, MTLResourceOptions, MTLSize, NSUInteger,
 };
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -266,7 +266,7 @@ pub struct MetalExecutor {
     weight_buffers: Mutex<HashMap<MetalBufferKey, Buffer>>,
     /// Cache des poids transposés bf16 (rhs^T) pour le GEMM NA, par ptr source.
     bf16_rhs_t_cache: Mutex<HashMap<usize, Buffer>>,
-    scratch_buffers: Mutex<HashMap<ScratchBufferKey, Buffer>>,
+    scratch_buffers: Mutex<ScratchBufferCache>,
     moe_stacks: Mutex<HashMap<usize, StackedMoeBuffers>>,
     /// Cache des concaténations de poids linéaires (qkv, linear-attn) : l'issue
     /// est une fonction pure des poids sources (invariants) → mémoïsée par process
@@ -651,6 +651,26 @@ struct ScratchBufferKey {
     // Slot de flux (light-batch) : deux flux concurrents qui passent par les
     // mêmes labels reçoivent des buffers DISJOINTS au lieu de s'aliaser.
     namespace: u64,
+}
+
+#[derive(Debug)]
+struct ScratchBufferEntry {
+    buffer: Buffer,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct ScratchBufferCache {
+    entries: HashMap<ScratchBufferKey, ScratchBufferEntry>,
+    total_bytes: u64,
+    clock: u64,
+}
+
+impl ScratchBufferCache {
+    fn next_use(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

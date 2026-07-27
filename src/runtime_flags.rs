@@ -43,6 +43,43 @@ pub(crate) fn env_flag_value(value: &str) -> Option<bool> {
     }
 }
 
+/// Active les traces d'allocation GPU autour des prefills et générations.
+///
+/// Défaut OFF (`RETI_RUST_TRACE_GPU_ALLOC=1` pour l'activer). Le flag est gelé
+/// au premier accès afin que le chemin désactivé ne fasse aucune lecture d'env,
+/// aucun appel Metal et aucune prise du mutex du cache scratch après démarrage.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn trace_gpu_alloc_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_TRACE_GPU_ALLOC", false))
+}
+
+// Le working set scratch 8k mesuré tient dans 3,44 Gio ; 4 Gio le conserve,
+// tandis que 12 Gio laissait encore le premier decode 32k à 19,8 tok/s.
+const DEFAULT_SCRATCH_CAP_GB: u64 = 4;
+const GIB_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn scratch_cap_bytes_from_env(value: Option<&str>) -> u64 {
+    value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|gb| *gb > 0)
+        .unwrap_or(DEFAULT_SCRATCH_CAP_GB)
+        .saturating_mul(GIB_BYTES)
+}
+
+/// Renvoie le plafond logique du cache scratch Metal en octets.
+///
+/// `RETI_RUST_SCRATCH_CAP_GB` accepte un nombre entier de Gio. Une valeur
+/// absente, nulle ou invalide retombe sur 4 Gio.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn scratch_cap_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let value = std::env::var("RETI_RUST_SCRATCH_CAP_GB").ok();
+        scratch_cap_bytes_from_env(value.as_deref())
+    })
+}
+
 /// Active le recast bf16 de la sortie d'embedding Qwen. **Défaut ON** :
 /// aligne la sortie d'embedding sur oMLX (accord teacher-forced 98,04 → 99,35 %),
 /// l'arrondi se fait dans le gather résident sans dispatch ajouté (coût decode/prefill nul).
@@ -832,5 +869,18 @@ mod tests {
         assert_eq!(decode_interval_nanos_for_rate(0.0), None);
         assert_eq!(decode_interval_nanos_for_rate(-1.0), None);
         assert_eq!(decode_interval_nanos_for_rate(f64::NAN), None);
+    }
+
+    #[test]
+    fn scratch_cap_uses_gib_and_rejects_invalid_values() {
+        assert_eq!(scratch_cap_bytes_from_env(Some("13")), 13 * GIB_BYTES);
+        assert_eq!(
+            scratch_cap_bytes_from_env(Some("0")),
+            DEFAULT_SCRATCH_CAP_GB * GIB_BYTES
+        );
+        assert_eq!(
+            scratch_cap_bytes_from_env(Some("invalide")),
+            DEFAULT_SCRATCH_CAP_GB * GIB_BYTES
+        );
     }
 }

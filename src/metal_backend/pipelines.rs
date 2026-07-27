@@ -687,7 +687,7 @@ impl MetalExecutor {
             moe_g_perm,
             weight_buffers: Mutex::new(HashMap::new()),
             bf16_rhs_t_cache: Mutex::new(HashMap::new()),
-            scratch_buffers: Mutex::new(HashMap::new()),
+            scratch_buffers: Mutex::new(ScratchBufferCache::default()),
             moe_stacks: Mutex::new(HashMap::new()),
             concat_buffers: Mutex::new(HashMap::new()),
         })

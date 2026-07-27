@@ -660,6 +660,10 @@ impl CausalDecoder {
         max_new_tokens: usize,
         options: &GenerationOptions,
     ) -> Result<GenerationOutput> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _gpu_alloc_trace = self.trace_gpu_alloc_scope("generation");
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _scratch_buffer_scope = self.scratch_buffer_scope();
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
@@ -2895,6 +2899,10 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor)> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _scratch_buffer_scope = self.scratch_buffer_scope();
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
@@ -2903,7 +2911,7 @@ impl CausalDecoder {
                 return Ok(hit);
             }
         }
-        let state = self.prefill_cache_state_uncached(prompt)?;
+        let state = self.prefill_cache_state_uncached_inner(prompt)?;
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state)?;
         }
@@ -2911,6 +2919,17 @@ impl CausalDecoder {
     }
 
     fn prefill_cache_state_uncached(
+        &self,
+        prompt: &[usize],
+    ) -> Result<(CausalDecoderCache, Tensor)> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _scratch_buffer_scope = self.scratch_buffer_scope();
+        self.prefill_cache_state_uncached_inner(prompt)
+    }
+
+    fn prefill_cache_state_uncached_inner(
         &self,
         prompt: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor)> {
