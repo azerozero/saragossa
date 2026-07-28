@@ -1,6 +1,6 @@
 # saragossa
 
-![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
+![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![python](https://img.shields.io/badge/python-zero%20deps-success)
@@ -70,6 +70,34 @@ Measured 2026-07-06 on an M5 Max:
 
 These numbers hold for their context (hardware, model, length) — measure on your
 own machine before committing to a choice.
+
+## Quantization formats: footprint, throughput & quality
+
+saragossa loads **MLX affine** integer weights `u2`/`u3`/`u4`/`u6`/`u8`
+(group-size 64) and **fp8** (`e4m3`). Trade-offs on a **27B dense** model
+(M5 Max, greedy decode T=0; footprint = resident weights; KL = `KL(bf16‖quant)`
+averaged over 5 prompts):
+
+| quant | bpw | weight footprint | decode | quality vs bf16 |
+|-------|-----|------------------|--------|-----------------|
+| `u8` | ~8.5 | ~29 GB | — | near-lossless |
+| `u6` | ~6.5 | ~22 GB | — | near-lossless — **quality sweet-spot** |
+| `u4` | ~4.5 | 18 GB¹ | 27 tok/s | good |
+| `u3` mixed 3/4² | 3.85 | 12 GB | 35 tok/s | ≈ 4-bit (KL 0.07) |
+| `u3` uniform | ~3.5 | 11 GB | 37 tok/s | degraded (KL 0.30) |
+| `u2` mixed 2/3² | 2.9 | 9 GB | — | too degraded (KL 0.58) |
+
+¹ A 27B `u4` fits a **24 GB** Mac: after warmup the decoder frees the 2nd CPU
+copy of the weights (GPU-resident only) → ~23.4 GB footprint (dense).
+² Sensitivity-based mixed quant: the most sensitive layers move up one bit.
+
+**fp8** loads but a 27B (29 GB) saturates a 24-32 GB Mac — prefer `u6`/`u8` for
+high fidelity (smaller, same quality).
+
+**Speculative decode (MTP)**: on a **dense** model carrying a native MTP head,
+in greedy (T=0), saragossa verifies the draft **byte-exactly** → +15 to +40%
+throughput (`u4` 27→~40, `u3` 35→~46 tok/s). NO-GO on MoE (disjoint-expert
+verify cost). See `generate_greedy_mtp_streaming_with_options`.
 
 ## Install
 
@@ -214,5 +242,4 @@ Prerequisite: the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain
 
 ## License
 
-Dual-licensed at your option: [MIT](https://spdx.org/licenses/MIT.html) or
-[Apache-2.0](https://spdx.org/licenses/Apache-2.0.html) (SPDX `MIT OR Apache-2.0`).
+[Apache-2.0](https://spdx.org/licenses/Apache-2.0.html) (SPDX `Apache-2.0`).

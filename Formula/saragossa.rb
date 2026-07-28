@@ -14,7 +14,7 @@ class Saragossa < Formula
   homepage "https://github.com/azerozero/saragossa"
   url "https://github.com/azerozero/saragossa/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "2d018f6ad34ea250fad0b798079574f324b88a9aaf0945bee81ced1b9422f6fc"
-  license any_of: ["MIT", "Apache-2.0"]
+  license "Apache-2.0"
   head "https://github.com/azerozero/saragossa.git", branch: "main"
 
   depends_on "rust" => :build
