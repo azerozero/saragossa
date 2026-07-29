@@ -180,11 +180,9 @@ impl MetalExecutor {
         let groups = in_dim
             .checked_div(weight.group_size())
             .ok_or_else(|| InferError::Metal("group_size quantifié nul".to_string()))?;
-        let packed_buffer = self.cached_buffer_from_u32(weight.packed_data(), "packed")?;
-        let scales_buffer =
-            self.cached_buffer_from_f32_as_bf16(weight.scales().data(), "scales")?;
-        let biases_buffer =
-            self.cached_buffer_from_f32_as_bf16(weight.biases().data(), "biases")?;
+        let packed_buffer = self.cached_affine_packed(weight, "packed")?;
+        let scales_buffer = self.cached_affine_scales(weight, "scales")?;
+        let biases_buffer = self.cached_affine_biases(weight, "biases")?;
         let dims = [
             checked_u32(batch, "batch")?,
             checked_u32(*out_dim, "out_dim")?,
@@ -265,6 +263,32 @@ impl MetalExecutor {
                 *packed_cols,
                 groups,
                 FAST_QMV_BITS,
+            )?,
+            AffineMatmulKernel::FastQmvU2 => self.encode_affine_qmv_u2_buffers(
+                encoder,
+                lhs_buffer,
+                &packed_buffer,
+                &scales_buffer,
+                &biases_buffer,
+                output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                groups,
+            )?,
+            AffineMatmulKernel::FastQmvU3 => self.encode_affine_qmv_u3_buffers(
+                encoder,
+                lhs_buffer,
+                &packed_buffer,
+                &scales_buffer,
+                &biases_buffer,
+                output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                groups,
             )?,
             AffineMatmulKernel::FastQmvU6 => self.encode_affine_qmv_u6_buffers(
                 encoder,
@@ -402,6 +426,11 @@ impl MetalExecutor {
             (
                 &self.affine_qmm2_fast_aligned_u4_gs64_f32,
                 "affine_qmm2_fast_aligned_u4_gs64_f32",
+            )
+        } else if bits == FAST_QMV_U3_BITS {
+            (
+                &self.affine_qmm2_fast_aligned_u3_gs64_f32,
+                "affine_qmm2_fast_aligned_u3_gs64_f32",
             )
         } else if group_size == FAST_QMV_GROUP_SIZE {
             (

@@ -31,7 +31,7 @@ struct WarmupReport {
 ///
 /// Renvoie une erreur si l'encodage ou un prefill de warmup échoue.
 pub(super) fn decoder(
-    decoder: &CausalDecoder,
+    decoder: &mut CausalDecoder,
     assets: &ModelAssets,
     backend: RuntimeKind,
     model_id: &str,
@@ -51,6 +51,10 @@ pub(super) fn decoder(
         })
         .collect::<ServeResult<Vec<_>>>()?;
 
+    let warmup_prompt = &prompt[..prompt.len().min(config.prompt_tokens)];
+    // Construit et libère les poids couche par couche avant le premier prefill,
+    // qui matérialiserait sinon tous les buffers Metal avec la copie CPU intacte.
+    let _ = decoder.warmup_and_release_cpu_weights(warmup_prompt)?;
     let report = run(config, &prompt, |tokens| {
         let _ = decoder.prefill_cache_uncached(tokens)?;
         Ok(())

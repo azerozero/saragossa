@@ -3,6 +3,18 @@
 use super::attention_ops::*;
 use super::*;
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const RESIDENT_SUPPORTED_BITS: &[usize] = &[3, 4, 8];
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn resident_projection_unsupported_bits(projection: &Linear) -> Option<usize> {
+    let LinearWeight::AffineQuantized(weight) = projection.weight() else {
+        return None;
+    };
+    // Les formats u2/u6 ont un qmv per-op, mais aucun kernel résident.
+    (!RESIDENT_SUPPORTED_BITS.contains(&weight.bits())).then_some(weight.bits())
+}
+
 impl DecoderLayer {
     pub(super) fn from_tensors(
         tensors: &mut HashMap<String, DecoderTensor>,
@@ -200,6 +212,9 @@ impl DecoderLayer {
         if !mlp_supported {
             return false;
         }
+        if self.resident_quantization_unsupported_bits().is_some() {
+            return false;
+        }
         match &self.attention {
             AttentionBlock::Full(attention) => {
                 attention.q_proj.bias().is_none()
@@ -212,6 +227,31 @@ impl DecoderLayer {
             // Linear-attn : chemin résident conv/ssm déjà éprouvé (phases 1a/1b).
             AttentionBlock::Linear(_) => true,
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn resident_quantization_unsupported_bits(&self) -> Option<usize> {
+        if let AttentionBlock::Full(attention) = &self.attention {
+            for projection in [
+                &attention.q_proj,
+                &attention.k_proj,
+                attention.resident_v_proj(),
+                &attention.o_proj,
+            ] {
+                if let Some(bits) = resident_projection_unsupported_bits(projection) {
+                    return Some(bits);
+                }
+            }
+        }
+        if let Some(FeedForward::Dense(mlp)) = self.mlp.as_ref() {
+            let (gate_proj, up_proj, down_proj) = mlp.projections();
+            for projection in [gate_proj, up_proj, down_proj] {
+                if let Some(bits) = resident_projection_unsupported_bits(projection) {
+                    return Some(bits);
+                }
+            }
+        }
+        None
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -721,5 +761,49 @@ impl FullAttention {
     /// résident doit concaténer Q/K/K pour conserver exactement ce contrat.
     pub(super) fn resident_v_proj(&self) -> &Linear {
         self.v_proj.as_ref().unwrap_or(&self.k_proj)
+    }
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod tests {
+    use super::*;
+
+    fn quantized_projection(bits: usize, packed_cols: usize) -> Linear {
+        let cols = packed_cols * 32 / bits;
+        let scales = Tensor::from_vec(vec![1, 1], vec![1.0]).expect("invariant: scales valides");
+        let biases = Tensor::from_vec(vec![1, 1], vec![0.0]).expect("invariant: biases valides");
+        let weight = crate::AffineQuantizedTensor::new(
+            &[1, packed_cols],
+            vec![0; packed_cols],
+            scales,
+            biases,
+            cols,
+            bits,
+        )
+        .expect("invariant: poids quantifié valide");
+        Linear::new_quantized(weight, None).expect("invariant: projection quantifiée valide")
+    }
+
+    #[test]
+    fn resident_projection_accepts_dense_and_u3_u4_u8_only() {
+        let dense = Linear::new(
+            Tensor::from_vec(vec![1, 1], vec![0.0]).expect("invariant: poids dense valide"),
+            None,
+        )
+        .expect("invariant: projection dense valide");
+        assert_eq!(resident_projection_unsupported_bits(&dense), None);
+
+        for (bits, packed_cols) in [(3, 3), (4, 1), (8, 1)] {
+            let projection = quantized_projection(bits, packed_cols);
+            assert_eq!(resident_projection_unsupported_bits(&projection), None);
+        }
+
+        for (bits, packed_cols) in [(2, 1), (6, 3)] {
+            let projection = quantized_projection(bits, packed_cols);
+            assert_eq!(
+                resident_projection_unsupported_bits(&projection),
+                Some(bits)
+            );
+        }
     }
 }

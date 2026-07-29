@@ -1,4 +1,5 @@
 
+#include <metal_simdgroup>
 #include <metal_stdlib>
 using namespace metal;
 
@@ -10,6 +11,72 @@ static inline float dot4_u8_affine(uint packed_word, float4 x, float scale, floa
         float((packed_word >> 24u) & 0x000000ffu)
     );
     return dot(x, lanes * scale + float4(bias));
+}
+
+// Reciproques 8^-i = 2^-3i (i=0..7), toutes exactes en f32 (puissances de 2).
+// Pre-scaler l'activation par 8^-i permet d'extraire le code u3 par simple masque
+// `pack & (0x07<<3i)` (= 8^i·code) sans le shift `>>3i` par valeur/ligne : le
+// produit a une mantisse identique a `xt*float((pack>>3i)&7)` (memes bits), comme
+// le pre-scale /16 du kernel u4. Amorti sur les 4 lignes du simdgroup.
+constant float u3_inv_scale[8] = {
+    1.0f, 0.125f, 0.015625f, 1.953125e-3f,
+    2.44140625e-4f, 3.0517578125e-5f, 3.814697265625e-6f, 4.76837158203125e-7f
+};
+
+// Un quad couvre 4 packs u3, soit exactement 3 mots u32 alignés. Chaque lane
+// active charge un mot, puis le partage de registre recompose ses 24 bits.
+static inline uint load_u3x8_pack24(const device uint* words, uint simd_lid) {
+    const uint quad_lid = simd_lid & 3u;
+    const uint quad_word = (simd_lid >> 2u) * 3u + quad_lid;
+    const uint word = quad_lid < 3u ? words[quad_word] : 0u;
+    const uint previous = quad_shuffle_up(word, 1u);
+    uint pack24 = 0u;
+    switch (quad_lid) {
+        case 0u:
+            pack24 = word;
+            break;
+        case 1u:
+            pack24 = (previous >> 24u) | (word << 8u);
+            break;
+        case 2u:
+            pack24 = (previous >> 16u) | (word << 16u);
+            break;
+        default:
+            pack24 = previous >> 8u;
+            break;
+    }
+    return pack24 & 0x00ffffffu;
+}
+
+// Les deux demi-blocs gardent la distribution historique de 8 valeurs par lane.
+// Le uint2 mutualise leur shuffle sans modifier l'ordre flottant des produits.
+static inline uint2 load_u3x16_pack24(
+    const device uint* words0,
+    const device uint* words1,
+    uint simd_lid
+) {
+    const uint quad_lid = simd_lid & 3u;
+    const uint quad_word = (simd_lid >> 2u) * 3u + quad_lid;
+    const uint2 words = quad_lid < 3u
+        ? uint2(words0[quad_word], words1[quad_word])
+        : uint2(0u);
+    const uint2 previous = quad_shuffle_up(words, 1u);
+    uint2 packs = uint2(0u);
+    switch (quad_lid) {
+        case 0u:
+            packs = words;
+            break;
+        case 1u:
+            packs = (previous >> 24u) | (words << 8u);
+            break;
+        case 2u:
+            packs = (previous >> 16u) | (words << 16u);
+            break;
+        default:
+            packs = previous >> 8u;
+            break;
+    }
+    return packs & uint2(0x00ffffffu);
 }
 
 kernel void dense_matmul_rhs_t_f32(
@@ -312,16 +379,17 @@ kernel void embed_gather_dense_from_u32_f32(
     constant uint2& dims [[buffer(3)]],
     constant float& embedding_scale [[buffer(4)]],
     constant uint& recast_bf16 [[buffer(5)]],
-    uint tid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
     const uint vocab = dims.x;
     const uint dim = dims.y;
-    const uint token = token_index[0];
-    if (token >= vocab || tid >= dim) {
+    const uint token = token_index[gid.y];
+    if (token >= vocab || gid.x >= dim) {
         return;
     }
-    const float value = table[token * dim + tid] * embedding_scale;
-    out[tid] = recast_bf16 != 0u ? float(bfloat(value)) : value;
+    const float value = table[token * dim + gid.x] * embedding_scale;
+    out[gid.y * dim + gid.x] =
+        recast_bf16 != 0u ? float(bfloat(value)) : value;
 }
 
 kernel void embed_gather_affine_from_u32_f32(
@@ -334,7 +402,7 @@ kernel void embed_gather_affine_from_u32_f32(
     constant uint4& quant [[buffer(6)]],
     constant float& embedding_scale [[buffer(7)]],
     constant uint& recast_bf16 [[buffer(8)]],
-    uint tid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
     const uint vocab = dims.x;
     const uint dim = dims.y;
@@ -342,21 +410,35 @@ kernel void embed_gather_affine_from_u32_f32(
     const uint groups = dims.w;
     const uint group_size = quant.x;
     const uint bits = quant.y;
-    const uint token = token_index[0];
-    if (token >= vocab || tid >= dim || bits == 0u) {
+    const uint token = token_index[gid.y];
+    if (token >= vocab || gid.x >= dim || bits == 0u) {
         return;
     }
-    const uint values_per_word = 32u / bits;
     const uint mask = (1u << bits) - 1u;
-    const uint word_col = tid / values_per_word;
-    const uint lane = tid % values_per_word;
-    const uint word = packed[token * packed_cols + word_col];
-    const uint q = (word >> (lane * bits)) & mask;
-    const uint group = min(tid / group_size, groups - 1u);
+    uint q = 0u;
+    if (bits == 3u) {
+        const uint bit_offset = gid.x * bits;
+        const uint word_col = bit_offset / 32u;
+        const uint shift = bit_offset - word_col * 32u;
+        const uint row_base = token * packed_cols;
+        q = packed[row_base + word_col] >> shift;
+        if ((shift + bits) > 32u && (word_col + 1u) < packed_cols) {
+            q |= packed[row_base + word_col + 1u] << (32u - shift);
+        }
+        q &= mask;
+    } else {
+        const uint values_per_word = 32u / bits;
+        const uint word_col = gid.x / values_per_word;
+        const uint lane = gid.x % values_per_word;
+        const uint word = packed[token * packed_cols + word_col];
+        q = (word >> (lane * bits)) & mask;
+    }
+    const uint group = min(gid.x / group_size, groups - 1u);
     const uint affine_index = token * groups + group;
     const float value =
         (float(q) * scales[affine_index] + biases[affine_index]) * embedding_scale;
-    out[tid] = recast_bf16 != 0u ? float(bfloat(value)) : value;
+    out[gid.y * dim + gid.x] =
+        recast_bf16 != 0u ? float(bfloat(value)) : value;
 }
 
 kernel void affine_qmv_fast_u4_gs64_f32(
@@ -439,6 +521,71 @@ kernel void affine_qmv_fast_u4_gs64_f32(
     }
 }
 
+kernel void affine_qmv_fast_aligned_u2_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_thread = 16u;
+    const uint block_size = values_per_thread * 32u;
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+
+    const device uint* ws = packed + row_base * packed_cols + simd_lid;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / 4u;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / 4u;
+    const device float* x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint k = 0u; k < in_dim; k += block_size) {
+        const bool lane_active = k + simd_lid * values_per_thread < in_dim;
+        if (lane_active) {
+            float xt[16];
+            float sum = 0.0f;
+            for (uint i = 0u; i < values_per_thread; ++i) {
+                const float value = x[i];
+                xt[i] = value;
+                sum += value;
+            }
+
+            for (uint row = 0u; row < results_per_simdgroup; ++row) {
+                const uint word = ws[row * packed_cols];
+                const float scale = scale_base[row * groups];
+                const float bias = bias_base[row * groups];
+                float accum = 0.0f;
+                for (uint i = 0u; i < values_per_thread; ++i) {
+                    accum += xt[i] * float((word >> (2u * i)) & 0x03u);
+                }
+                result[row] += scale * accum + sum * bias;
+            }
+        }
+
+        ws += 32u;
+        scale_base += 8u;
+        bias_base += 8u;
+        x += block_size;
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const float reduced = simd_sum(result[row]);
+        if (simd_lid == 0u) {
+            out[tile.x * out_dim + row_base + row] = reduced;
+        }
+    }
+}
+
 kernel void affine_qmv_fast_aligned_u4_gs64_f32(
     device const float* lhs [[buffer(0)]],
     device const uint* packed [[buffer(1)]],
@@ -504,6 +651,126 @@ kernel void affine_qmv_fast_aligned_u4_gs64_f32(
         scale_base += 8u;
         bias_base += 8u;
         x += block_size;
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const float reduced = simd_sum(result[row]);
+        if (simd_lid == 0u) {
+            out[tile.x * out_dim + row_base + row] = reduced;
+        }
+    }
+}
+
+kernel void affine_qmv_fast_aligned_u3_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_pack = 8u;
+    const uint values_per_thread = 16u;
+    const uint block_size = values_per_thread * 32u;
+    const uint half_block_size = values_per_pack * 32u;
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+
+    const uint scale_step_per_thread = 8u;
+    const device uint* ws = packed + row_base * packed_cols;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / scale_step_per_thread;
+    // Conserver ce stride de 8 maintient exactement le même arbre simd_sum.
+    const device float* x = lhs + tile.x * in_dim + simd_lid * values_per_pack;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint full_blocks = in_dim / block_size;
+    for (uint block = 0u; block < full_blocks; ++block) {
+        float xt[16];
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        for (uint i = 0u; i < values_per_pack; ++i) {
+            const float a0 = x[i];
+            const float a1 = x[half_block_size + i];
+            sum0 += a0;
+            sum1 += a1;
+            const float inv = u3_inv_scale[i];
+            xt[i] = a0 * inv;
+            xt[values_per_pack + i] = a1 * inv;
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            const device uint* row_words = ws + row * packed_cols;
+            const uint2 packs = load_u3x16_pack24(row_words, row_words + 24u, simd_lid);
+            const uint pack0 = packs.x;
+            const uint pack1 = packs.y;
+            const float scale0 = scale_base[row * groups];
+            const float bias0 = bias_base[row * groups];
+            const float scale1 = scale_base[row * groups + 4u];
+            const float bias1 = bias_base[row * groups + 4u];
+            float accum0 = 0.0f;
+            accum0 += xt[0] * float(pack0 & 0x000007u);
+            accum0 += xt[1] * float(pack0 & 0x000038u);
+            accum0 += xt[2] * float(pack0 & 0x0001C0u);
+            accum0 += xt[3] * float(pack0 & 0x000E00u);
+            accum0 += xt[4] * float(pack0 & 0x007000u);
+            accum0 += xt[5] * float(pack0 & 0x038000u);
+            accum0 += xt[6] * float(pack0 & 0x1C0000u);
+            accum0 += xt[7] * float(pack0 & 0xE00000u);
+            result[row] += scale0 * accum0 + sum0 * bias0;
+
+            float accum1 = 0.0f;
+            accum1 += xt[8] * float(pack1 & 0x000007u);
+            accum1 += xt[9] * float(pack1 & 0x000038u);
+            accum1 += xt[10] * float(pack1 & 0x0001C0u);
+            accum1 += xt[11] * float(pack1 & 0x000E00u);
+            accum1 += xt[12] * float(pack1 & 0x007000u);
+            accum1 += xt[13] * float(pack1 & 0x038000u);
+            accum1 += xt[14] * float(pack1 & 0x1C0000u);
+            accum1 += xt[15] * float(pack1 & 0xE00000u);
+            result[row] += scale1 * accum1 + sum1 * bias1;
+        }
+
+        ws += 48u;
+        scale_base += 8u;
+        bias_base += 8u;
+        x += block_size;
+    }
+
+    if (full_blocks * block_size < in_dim) {
+        float xt[8];
+        float sum = 0.0f;
+        for (uint i = 0u; i < values_per_pack; ++i) {
+            const float a = x[i];
+            sum += a;
+            xt[i] = a * u3_inv_scale[i];
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            const device uint* row_words = ws + row * packed_cols;
+            const uint pack24 = load_u3x8_pack24(row_words, simd_lid);
+            const float scale = scale_base[row * groups];
+            const float bias = bias_base[row * groups];
+            float accum = 0.0f;
+            accum += xt[0] * float(pack24 & 0x000007u);
+            accum += xt[1] * float(pack24 & 0x000038u);
+            accum += xt[2] * float(pack24 & 0x0001C0u);
+            accum += xt[3] * float(pack24 & 0x000E00u);
+            accum += xt[4] * float(pack24 & 0x007000u);
+            accum += xt[5] * float(pack24 & 0x038000u);
+            accum += xt[6] * float(pack24 & 0x1C0000u);
+            accum += xt[7] * float(pack24 & 0xE00000u);
+            result[row] += scale * accum + sum * bias;
+        }
     }
 
     for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -1922,6 +2189,92 @@ kernel void affine_qmm2_fast_aligned_u4_gs64_f32(
     }
 }
 
+kernel void affine_qmm2_fast_aligned_u3_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_thread = 8u;
+    const uint block_size = values_per_thread * 32u;
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+
+    const uint scale_step_per_thread = 8u;
+    const device uint* ws = packed + row_base * packed_cols;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / scale_step_per_thread;
+    const device float* x0 = lhs + simd_lid * values_per_thread;
+    const device float* x1 = lhs + in_dim + simd_lid * values_per_thread;
+
+    float r0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float r1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint k = 0u; k < in_dim; k += block_size) {
+        float xt0[8];
+        float xt1[8];
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        for (uint i = 0u; i < values_per_thread; ++i) {
+            xt0[i] = x0[i];
+            xt1[i] = x1[i];
+            s0 += x0[i];
+            s1 += x1[i];
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            const device uint* row_words = ws + row * packed_cols;
+            const uint pack24 = load_u3x8_pack24(row_words, simd_lid);
+            const float scale = scale_base[row * groups];
+            const float bias = bias_base[row * groups];
+            float ac0 = 0.0f;
+            float ac1 = 0.0f;
+            const uint q0 = (pack24 >> 0u) & 0x07u;
+            const uint q1 = (pack24 >> 3u) & 0x07u;
+            const uint q2 = (pack24 >> 6u) & 0x07u;
+            const uint q3 = (pack24 >> 9u) & 0x07u;
+            const uint q4 = (pack24 >> 12u) & 0x07u;
+            const uint q5 = (pack24 >> 15u) & 0x07u;
+            const uint q6 = (pack24 >> 18u) & 0x07u;
+            const uint q7 = (pack24 >> 21u) & 0x07u;
+            ac0 += xt0[0] * float(q0); ac1 += xt1[0] * float(q0);
+            ac0 += xt0[1] * float(q1); ac1 += xt1[1] * float(q1);
+            ac0 += xt0[2] * float(q2); ac1 += xt1[2] * float(q2);
+            ac0 += xt0[3] * float(q3); ac1 += xt1[3] * float(q3);
+            ac0 += xt0[4] * float(q4); ac1 += xt1[4] * float(q4);
+            ac0 += xt0[5] * float(q5); ac1 += xt1[5] * float(q5);
+            ac0 += xt0[6] * float(q6); ac1 += xt1[6] * float(q6);
+            ac0 += xt0[7] * float(q7); ac1 += xt1[7] * float(q7);
+            r0[row] += scale * ac0 + s0 * bias;
+            r1[row] += scale * ac1 + s1 * bias;
+        }
+        ws += 24u;
+        scale_base += 4u;
+        bias_base += 4u;
+        x0 += block_size;
+        x1 += block_size;
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const float v0 = simd_sum(r0[row]);
+        const float v1 = simd_sum(r1[row]);
+        if (simd_lid == 0u) {
+            out[row_base + row] = v0;
+            out[out_dim + row_base + row] = v1;
+        }
+    }
+}
+
 kernel void swiglu_f32(
     device const float* gate [[buffer(0)]],
     device const float* up [[buffer(1)]],
@@ -3159,10 +3512,34 @@ kernel void affine_gather_matmul_rhs_t_u32_f32(
         const uint slots_per_row = (topk > lhs_rows) ? (topk / lhs_rows) : 1u;
         lhs_row = min(slot / slots_per_row, lhs_rows - 1u);
     }
-    const uint values_per_word = 32 / bits;
     const uint mask = (1u << bits) - 1u;
     float acc = 0.0f;
 
+    if (bits == 3u) {
+        const uint packed_row = (expert * out_dim + row) * packed_cols;
+        for (uint col = lane; col < in_dim; col += 32u) {
+            const uint bit_offset = col * bits;
+            const uint word_col = bit_offset / 32u;
+            const uint shift = bit_offset - word_col * 32u;
+            uint q = packed[packed_row + word_col] >> shift;
+            if ((shift + bits) > 32u && (word_col + 1u) < packed_cols) {
+                q |= packed[packed_row + word_col + 1u] << (32u - shift);
+            }
+            q &= mask;
+            const uint group = min(col / group_size, groups - 1u);
+            const uint affine_index = ((expert * out_dim + row) * groups) + group;
+            const float scale = scales[affine_index];
+            const float bias = biases[affine_index];
+            acc += lhs[(lhs_row * in_dim) + col] * ((float(q) * scale) + bias);
+        }
+        acc = simd_sum(acc);
+        if (lane == 0u) {
+            out[(slot * out_dim) + row] = acc;
+        }
+        return;
+    }
+
+    const uint values_per_word = 32 / bits;
     for (uint word_col = lane; word_col < packed_cols; word_col += 32) {
         const uint col_base = word_col * values_per_word;
         const uint packed_index = ((expert * out_dim + row) * packed_cols) + word_col;
@@ -5008,6 +5385,95 @@ kernel void affine_qkv_split_qmv_fast_u4_gs64_f32(
     }
 }
 
+kernel void affine_qkv_split_qmv_fast_u3_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    device float* q_out [[buffer(5)]],
+    device float* gate_out [[buffer(6)]],
+    constant uint4& dims [[buffer(7)]],
+    constant uint2& q_dims [[buffer(8)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint q_heads = q_dims.x;
+    const uint head_dim = q_dims.y;
+    const uint q_gate_dim = q_heads * head_dim * 2u;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_thread = 8u;
+    const uint block_size = values_per_thread * 32u;
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+    if (row_base >= out_dim) {
+        return;
+    }
+
+    const uint scale_step_per_thread = 8u;
+    const device uint* ws = packed + row_base * packed_cols;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / scale_step_per_thread;
+    const device float* x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint k = 0u; k < in_dim; k += block_size) {
+        float xt[8];
+        float sum = 0.0f;
+        for (uint i = 0u; i < values_per_thread; ++i) {
+            xt[i] = x[i];
+            sum += x[i];
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row < out_dim) {
+                const device uint* row_words = ws + row * packed_cols;
+                const uint pack24 = load_u3x8_pack24(row_words, simd_lid);
+                const float scale = scale_base[row * groups];
+                const float bias = bias_base[row * groups];
+                float accum = 0.0f;
+                accum += xt[0] * float((pack24 >> 0u) & 0x07u);
+                accum += xt[1] * float((pack24 >> 3u) & 0x07u);
+                accum += xt[2] * float((pack24 >> 6u) & 0x07u);
+                accum += xt[3] * float((pack24 >> 9u) & 0x07u);
+                accum += xt[4] * float((pack24 >> 12u) & 0x07u);
+                accum += xt[5] * float((pack24 >> 15u) & 0x07u);
+                accum += xt[6] * float((pack24 >> 18u) & 0x07u);
+                accum += xt[7] * float((pack24 >> 21u) & 0x07u);
+                result[row] += scale * accum + sum * bias;
+            }
+        }
+        ws += 24u;
+        scale_base += 4u;
+        bias_base += 4u;
+        x += block_size;
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const uint out_row = row_base + row;
+        const float reduced = simd_sum(result[row]);
+        if (simd_lid == 0u && out_row < out_dim) {
+            if (out_row < q_gate_dim) {
+                const uint pair = out_row / (2u * head_dim);
+                const uint col = out_row - pair * 2u * head_dim;
+                if (col < head_dim) {
+                    q_out[pair * head_dim + col] = reduced;
+                } else {
+                    gate_out[pair * head_dim + (col - head_dim)] = reduced;
+                }
+            } else {
+                out[tile.x * out_dim + out_row] = reduced;
+            }
+        }
+    }
+}
+
 kernel void affine_qmv_rms_fast_u4_gs64_f32(
     device const float* lhs [[buffer(0)]],
     device const float* rms_weight [[buffer(1)]],
@@ -5398,6 +5864,119 @@ kernel void affine_qkv_split_rms_qmv_fast_u4_gs64_f32(
         ws += block_size / 2u;
         scale_base += 32u / scale_step_per_thread;
         bias_base += 32u / scale_step_per_thread;
+        x += block_size;
+        gamma += block_size;
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const uint out_row = row_base + row;
+        const float reduced = simd_sum(result[row]);
+        if (simd_lid == 0u && out_row < out_dim) {
+            if (out_row < q_gate_dim) {
+                const uint pair = out_row / (2u * head_dim);
+                const uint col = out_row - pair * 2u * head_dim;
+                if (col < head_dim) {
+                    q_out[pair * head_dim + col] = reduced;
+                } else {
+                    gate_out[pair * head_dim + (col - head_dim)] = reduced;
+                }
+            } else {
+                out[tile.x * out_dim + out_row] = reduced;
+            }
+        }
+    }
+}
+
+kernel void affine_qkv_split_rms_qmv_fast_u3_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const float* rms_weight [[buffer(1)]],
+    device const uint* packed [[buffer(2)]],
+    device const bfloat* scales [[buffer(3)]],
+    device const bfloat* biases [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    device float* q_out [[buffer(6)]],
+    device float* gate_out [[buffer(7)]],
+    constant uint4& dims [[buffer(8)]],
+    constant uint2& q_dims [[buffer(9)]],
+    constant float& eps [[buffer(10)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint q_heads = q_dims.x;
+    const uint head_dim = q_dims.y;
+    const uint q_gate_dim = q_heads * head_dim * 2u;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_thread = 8u;
+    const uint block_size = values_per_thread * 32u;
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+    if (row_base >= out_dim) {
+        return;
+    }
+
+    threadgroup float inv_rms_shared;
+    float sumsq = 0.0f;
+    if (simd_gid == 0u) {
+        const device float* norm_x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
+        for (uint k = 0u; k < in_dim; k += block_size) {
+            for (uint i = 0u; i < values_per_thread; ++i) {
+                const float value = norm_x[i];
+                sumsq += value * value;
+            }
+            norm_x += block_size;
+        }
+        const float reduced_sumsq = simd_sum(sumsq);
+        if (simd_lid == 0u) {
+            inv_rms_shared = rsqrt((reduced_sumsq / float(in_dim)) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_rms = inv_rms_shared;
+
+    const uint scale_step_per_thread = 8u;
+    const device uint* ws = packed + row_base * packed_cols;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / scale_step_per_thread;
+    const device float* x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
+    const device float* gamma = rms_weight + simd_lid * values_per_thread;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint k = 0u; k < in_dim; k += block_size) {
+        float xt[8];
+        float sum = 0.0f;
+        for (uint i = 0u; i < values_per_thread; ++i) {
+            const float value = x[i] * inv_rms * gamma[i];
+            xt[i] = value;
+            sum += value;
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row < out_dim) {
+                const device uint* row_words = ws + row * packed_cols;
+                const uint pack24 = load_u3x8_pack24(row_words, simd_lid);
+                const float scale = scale_base[row * groups];
+                const float bias = bias_base[row * groups];
+                float accum = 0.0f;
+                accum += xt[0] * float((pack24 >> 0u) & 0x07u);
+                accum += xt[1] * float((pack24 >> 3u) & 0x07u);
+                accum += xt[2] * float((pack24 >> 6u) & 0x07u);
+                accum += xt[3] * float((pack24 >> 9u) & 0x07u);
+                accum += xt[4] * float((pack24 >> 12u) & 0x07u);
+                accum += xt[5] * float((pack24 >> 15u) & 0x07u);
+                accum += xt[6] * float((pack24 >> 18u) & 0x07u);
+                accum += xt[7] * float((pack24 >> 21u) & 0x07u);
+                result[row] += scale * accum + sum * bias;
+            }
+        }
+        ws += 24u;
+        scale_base += 4u;
+        bias_base += 4u;
         x += block_size;
         gamma += block_size;
     }
@@ -6099,6 +6678,44 @@ kernel void rms_norm_simd_rows_f32(
     uint row [[threadgroup_position_in_grid]]
 ) {
     const uint values_per_thread = 16u;
+    const uint block_size = values_per_thread * 32u;
+    const uint offset = row * dim;
+
+    const device float* norm_x = input + offset + simd_lid * values_per_thread;
+    float sumsq = 0.0f;
+    for (uint k = 0u; k < dim; k += block_size) {
+        for (uint i = 0u; i < values_per_thread; ++i) {
+            const float value = norm_x[i];
+            sumsq += value * value;
+        }
+        norm_x += block_size;
+    }
+    const float reduced_sumsq = simd_sum(sumsq);
+    const float inv_rms = rsqrt((reduced_sumsq / float(dim)) + eps);
+
+    const device float* x = input + offset + simd_lid * values_per_thread;
+    const device float* gamma = weight + simd_lid * values_per_thread;
+    device float* o = out + offset + simd_lid * values_per_thread;
+    for (uint k = 0u; k < dim; k += block_size) {
+        for (uint i = 0u; i < values_per_thread; ++i) {
+            o[i] = x[i] * inv_rms * gamma[i];
+        }
+        x += block_size;
+        gamma += block_size;
+        o += block_size;
+    }
+}
+
+kernel void rms_norm_simd_u3_rows_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& dim [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    const uint values_per_thread = 8u;
     const uint block_size = values_per_thread * 32u;
     const uint offset = row * dim;
 

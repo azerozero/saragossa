@@ -1,7 +1,7 @@
 # Fixtures golden de parité metal-rs ↔ référence figée
 
-Sorties de référence figées pour les oracles de parité STT/TTS/clone de
-`crates/saragossa`. Elles permettent aux tests `golden_*` de comparer metal-rs à une
+Sorties de référence figées pour les oracles de parité STT/TTS/clone du moteur
+saragossa. Elles permettent aux tests `golden_*` de comparer metal-rs à une
 référence stable sans mlx-rs.
 
 - **Provenance** : reti HEAD `be456e2`, fork mlx-rs vendoré (`vendor/mlx-rs`, MLX 0.31.2).

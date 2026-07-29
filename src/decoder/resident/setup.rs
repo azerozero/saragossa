@@ -197,8 +197,8 @@ impl CausalDecoder {
             if layer.supports_resident_full() {
                 None
             } else {
-                let reason =
-                    resident_full_layer_unsupported_reason(layer).unwrap_or("raison inconnue");
+                let reason = resident_full_layer_unsupported_reason(layer)
+                    .unwrap_or_else(|| "raison inconnue".to_string());
                 Some(format!("couche {index}: {reason}"))
             }
         })

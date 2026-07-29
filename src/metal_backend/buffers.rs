@@ -3,6 +3,17 @@
 use super::*;
 
 impl MetalExecutor {
+    /// Force la conservation des buffers dérivés nécessaires après libération CPU.
+    pub(crate) fn prepare_cpu_weight_release(&self) {
+        self.preserve_weight_caches
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn preserving_weight_caches(&self) -> bool {
+        self.preserve_weight_caches
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn resolve_embedding_weight_buffers(
         &self,
         embedding: &EmbeddingWeight,
@@ -38,16 +49,9 @@ impl MetalExecutor {
                     InferError::Metal("group_size embedding quantifié nul".to_string())
                 })?;
                 Ok(MetalEmbeddingWeightBuffers::AffineQuantized {
-                    packed: self
-                        .cached_buffer_from_u32(weight.packed_data(), "resident_embed_packed")?,
-                    scales: self.cached_buffer_from_f32_as_bf16(
-                        weight.scales().data(),
-                        "resident_embed_scales",
-                    )?,
-                    biases: self.cached_buffer_from_f32_as_bf16(
-                        weight.biases().data(),
-                        "resident_embed_biases",
-                    )?,
+                    packed: self.cached_affine_packed(weight, "resident_embed_packed")?,
+                    scales: self.cached_affine_scales(weight, "resident_embed_scales")?,
+                    biases: self.cached_affine_biases(weight, "resident_embed_biases")?,
                     vocab: *vocab,
                     dim: *dim,
                     packed_cols: *packed_cols,
@@ -57,6 +61,65 @@ impl MetalExecutor {
                 })
             }
         }
+    }
+
+    pub(crate) fn embed_weight_tokens(
+        &self,
+        embedding: &EmbeddingWeight,
+        token_ids: &[usize],
+        embedding_scale: f32,
+        recast_bf16: bool,
+    ) -> Result<Tensor> {
+        let Some(&dim) = embedding.shape().get(1) else {
+            return Err(InferError::Dimension(format!(
+                "embedding attendu rang 2, reçu {:?}",
+                embedding.shape()
+            )));
+        };
+        if embedding.shape().len() != 2 || token_ids.is_empty() {
+            return Err(InferError::Dimension(format!(
+                "embedding ou tokens invalides: shape={:?}, tokens={}",
+                embedding.shape(),
+                token_ids.len()
+            )));
+        }
+        let vocab = embedding.shape()[0];
+        let indices = token_ids
+            .iter()
+            .map(|token| {
+                if *token >= vocab {
+                    return Err(InferError::Dimension(format!(
+                        "token id {token} hors vocab {vocab}"
+                    )));
+                }
+                u32::try_from(*token).map_err(|_| {
+                    InferError::Dimension(format!("token embedding hors plage u32: {token}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let weights = self.resolve_embedding_weight_buffers(embedding)?;
+        let indices = self.upload_u32_buffer(&indices, "embedding_indices")?;
+        let output_len = checked_len(token_ids.len(), dim, "embedding Metal")?;
+        let output = self.uncached_f32_buffer(output_len, "embedding_output")?;
+
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_embeddings_from_indices_scaled(
+            encoder,
+            &weights,
+            &indices,
+            &output,
+            dim,
+            token_ids.len(),
+            embedding_scale,
+            recast_bf16,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        Tensor::from_vec(
+            vec![token_ids.len(), dim],
+            read_f32_buffer(&output, output_len)?,
+        )
     }
 
     pub(crate) fn resolve_linear_attn_resident_weights(
@@ -270,7 +333,7 @@ impl MetalExecutor {
         label: &'static str,
     ) -> Result<metal::Buffer> {
         self.cached_buffer(
-            data.as_ptr().addr(),
+            MetalBufferSource::Pointer(data.as_ptr().addr()),
             data.len(),
             MetalBufferElement::F32,
             label,
@@ -278,13 +341,14 @@ impl MetalExecutor {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn cached_buffer_from_u32(
         &self,
         data: &[u32],
         label: &'static str,
     ) -> Result<metal::Buffer> {
         self.cached_buffer(
-            data.as_ptr().addr(),
+            MetalBufferSource::Pointer(data.as_ptr().addr()),
             data.len(),
             MetalBufferElement::U32,
             label,
@@ -304,7 +368,7 @@ impl MetalExecutor {
         label: &'static str,
     ) -> Result<metal::Buffer> {
         self.cached_buffer(
-            data.as_ptr().addr(),
+            MetalBufferSource::Pointer(data.as_ptr().addr()),
             data.len(),
             MetalBufferElement::Bf16,
             label,
@@ -322,15 +386,70 @@ impl MetalExecutor {
         self.buffer_from_slice(&f32_slice_to_bf16(data), label)
     }
 
+    pub(super) fn cached_affine_packed(
+        &self,
+        weight: &AffineQuantizedTensor,
+        label: &'static str,
+    ) -> Result<metal::Buffer> {
+        self.cached_buffer(
+            MetalBufferSource::Affine {
+                weight_id: weight.weight_id(),
+                part: AffineWeightPart::Packed,
+            },
+            weight.packed_len(),
+            MetalBufferElement::U32,
+            label,
+            || self.buffer_from_u32(weight.packed_data(), label),
+        )
+    }
+
+    pub(super) fn cached_affine_scales(
+        &self,
+        weight: &AffineQuantizedTensor,
+        label: &'static str,
+    ) -> Result<metal::Buffer> {
+        self.cached_buffer(
+            MetalBufferSource::Affine {
+                weight_id: weight.weight_id(),
+                part: AffineWeightPart::Scales,
+            },
+            weight.scales_len(),
+            MetalBufferElement::Bf16,
+            label,
+            || self.buffer_from_f32_as_bf16(weight.scales().data(), label),
+        )
+    }
+
+    pub(super) fn cached_affine_biases(
+        &self,
+        weight: &AffineQuantizedTensor,
+        label: &'static str,
+    ) -> Result<metal::Buffer> {
+        self.cached_buffer(
+            MetalBufferSource::Affine {
+                weight_id: weight.weight_id(),
+                part: AffineWeightPart::Biases,
+            },
+            weight.biases_len(),
+            MetalBufferElement::Bf16,
+            label,
+            || self.buffer_from_f32_as_bf16(weight.biases().data(), label),
+        )
+    }
+
     pub(super) fn cached_buffer(
         &self,
-        ptr: usize,
+        source: MetalBufferSource,
         len: usize,
         element: MetalBufferElement,
         label: &'static str,
         create: impl FnOnce() -> Result<metal::Buffer>,
     ) -> Result<metal::Buffer> {
-        let key = MetalBufferKey { ptr, len, element };
+        let key = MetalBufferKey {
+            source,
+            len,
+            element,
+        };
         let mut buffers = self
             .weight_buffers
             .lock()

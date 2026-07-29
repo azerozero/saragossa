@@ -351,8 +351,8 @@ impl ModelSlot {
             let _ = saragossa::apply_runtime_preset_for_model_dir(&self.path);
             let preset = saragossa::runtime_preset_for_model_dir(&self.path);
             let assets = ModelAssets::load_local(&self.path)?;
-            let decoder = load_decoder_with_runtime(&assets, self.backend)?;
-            warmup::decoder(&decoder, &assets, self.backend, &self.id)?;
+            let mut decoder = load_decoder_with_runtime(&assets, self.backend)?;
+            warmup::decoder(&mut decoder, &assets, self.backend, &self.id)?;
             self.loaded = Some(LoadedModel {
                 id: self.id.clone(),
                 assets,

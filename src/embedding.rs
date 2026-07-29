@@ -20,6 +20,31 @@ impl EmbeddingWeight {
             Self::AffineQuantized(tensor) => tensor.shape(),
         }
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn cpu_data_available(&self) -> bool {
+        match self {
+            Self::Dense(_) => true,
+            Self::AffineQuantized(weight) => weight.cpu_data_available(),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn metal_release_byte_exact(&self) -> bool {
+        match self {
+            Self::Dense(_) => true,
+            Self::AffineQuantized(weight) => weight.metal_embedding_byte_exact(),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+        if let Self::AffineQuantized(weight) = self {
+            let weight_id = weight.weight_id();
+            let bytes = weight.release_cpu_data();
+            released.push((weight_id, bytes));
+        }
+    }
 }
 
 /// Extrait les lignes d'embedding d'une table dense.

@@ -6,6 +6,34 @@ use safetensors::serialize;
 use std::collections::HashMap;
 
 #[test]
+fn accepts_affine_u2_quantization_config() {
+    let quant = QuantConfig {
+        group_size: Some(64),
+        bits: Some(2),
+        quant_method: Some("mx".to_string()),
+        fmt: None,
+        extra: HashMap::new(),
+    };
+
+    validate_affine_quantization(&quant)
+        .expect("invariant: quantification affine u2 gs64 supportée");
+}
+
+#[test]
+fn accepts_affine_u3_quantization_config() {
+    let quant = QuantConfig {
+        group_size: Some(64),
+        bits: Some(3),
+        quant_method: Some("mx".to_string()),
+        fmt: None,
+        extra: HashMap::new(),
+    };
+
+    validate_affine_quantization(&quant)
+        .expect("invariant: quantification affine u3 gs64 supportée");
+}
+
+#[test]
 fn loads_model_prefixed_qwen_weights() {
     let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
     write_safetensors(tmp.path(), "model.", "lm_head.", None);

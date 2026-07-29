@@ -82,30 +82,35 @@ pub(in crate::decoder) enum ResidentEmbeddingOut {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Option<&'static str> {
+pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Option<String> {
     if layer.pre_feedforward_norm.is_some() != layer.post_feedforward_norm.is_some() {
-        return Some("normes feed-forward Gemma partielles");
+        return Some("normes feed-forward Gemma partielles".to_string());
     }
     let Some(mlp) = layer.mlp.as_ref() else {
-        return Some("MLP absent");
+        return Some("MLP absent".to_string());
     };
     if layer.post_attention_norm.is_none() {
-        return Some("post_attention_norm absent");
+        return Some("post_attention_norm absent".to_string());
+    }
+    if let Some(bits) = layer.resident_quantization_unsupported_bits() {
+        return Some(format!(
+            "quant u{bits} non supportée en résident (fallback per-op)"
+        ));
     }
     match mlp {
         FeedForward::Moe(mlp) => {
             if layer.pre_feedforward_norm.is_some() && mlp.shared_metal_parts().is_some() {
-                return Some("MoE Gemma shared non supporté");
+                return Some("MoE Gemma shared non supporté".to_string());
             }
             if mlp.shared_metal_parts().is_none() && mlp.metal_parts().is_none() {
-                return Some("MoE non encodable Metal");
+                return Some("MoE non encodable Metal".to_string());
             }
         }
         FeedForward::Dense(mlp) => {
             let (gate_proj, up_proj, down_proj) = mlp.projections();
             if gate_proj.bias().is_some() || up_proj.bias().is_some() || down_proj.bias().is_some()
             {
-                return Some("MLP dense biaisé");
+                return Some("MLP dense biaisé".to_string());
             }
         }
     }
@@ -116,13 +121,13 @@ pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Op
                 || attention.resident_v_proj().bias().is_some()
                 || attention.o_proj.bias().is_some()
             {
-                return Some("full-attn projection biaisée");
+                return Some("full-attn projection biaisée".to_string());
             }
             if attention.q_norm.is_none() {
-                return Some("full-attn q_norm absent");
+                return Some("full-attn q_norm absent".to_string());
             }
             if attention.k_norm.is_none() {
-                return Some("full-attn k_norm absent");
+                return Some("full-attn k_norm absent".to_string());
             }
         }
         AttentionBlock::Linear(_) => {}

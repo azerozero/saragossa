@@ -781,10 +781,12 @@ impl MetalExecutor {
             && *bits == FAST_QMV_BITS
             && *group_size == FAST_QMV_GROUP_SIZE
             && in_dim % 512 == 0;
+        let can_use_u3 =
+            can_use_fast_affine_qmv_u3_buffers(1, in_dim, *out_dim, *group_size, *bits);
         let can_use_u8 = full_qkv_split_rms_u8_enabled()
             && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
             && *group_size == FAST_QMV_GROUP_SIZE;
-        if !can_use_u4 && !can_use_u8 {
+        if !can_use_u4 && !can_use_u3 && !can_use_u8 {
             return Ok(None);
         }
         let q_dim = q_heads
@@ -808,7 +810,12 @@ impl MetalExecutor {
             checked_u32(q_heads, "full qkv split q_heads")?,
             checked_u32(head_dim, "full qkv split head_dim")?,
         ];
-        encoder.set_compute_pipeline_state(&self.affine_qkv_split_qmv_fast_u4_gs64_f32);
+        let pipeline = if can_use_u3 {
+            &self.affine_qkv_split_qmv_fast_u3_gs64_f32
+        } else {
+            &self.affine_qkv_split_qmv_fast_u4_gs64_f32
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(packed), 0);
         encoder.set_buffer(2, Some(scales), 0);
@@ -875,10 +882,12 @@ impl MetalExecutor {
             && *bits == FAST_QMV_BITS
             && *group_size == FAST_QMV_GROUP_SIZE
             && in_dim % 512 == 0;
+        let can_use_u3 =
+            can_use_fast_affine_qmv_u3_buffers(1, in_dim, *out_dim, *group_size, *bits);
         let can_use_u8 = full_qkv_split_rms_u8_enabled()
             && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
             && *group_size == FAST_QMV_GROUP_SIZE;
-        if !can_use_u4 && !can_use_u8 {
+        if !can_use_u4 && !can_use_u3 && !can_use_u8 {
             return Ok(None);
         }
         let q_dim = q_heads
@@ -904,6 +913,8 @@ impl MetalExecutor {
         ];
         let pipeline = if can_use_u4 {
             &self.affine_qkv_split_rms_qmv_fast_u4_gs64_f32
+        } else if can_use_u3 {
+            &self.affine_qkv_split_rms_qmv_fast_u3_gs64_f32
         } else {
             &self.affine_qkv_split_rms_qmv_fast_u8_gs64_f32
         };

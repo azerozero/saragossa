@@ -105,6 +105,30 @@ pub(super) fn can_use_fast_affine_qmv_u6(
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
+pub(super) fn can_use_fast_affine_qmv_u2(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_fast_affine_qmv_u2_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
+        && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
+pub(super) fn can_use_fast_affine_qmv_u3(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
+        && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
 pub(super) fn can_use_fast_affine_qmm2(
     batch: usize,
     in_dim: usize,
@@ -114,6 +138,18 @@ pub(super) fn can_use_fast_affine_qmm2(
         return false;
     };
     can_use_fast_affine_qmm2_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
+        && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
+pub(super) fn can_use_fast_affine_qmm2_u3(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_fast_affine_qmm2_u3_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
@@ -366,6 +402,17 @@ pub(super) fn can_use_fast_affine_qmm2_buffers(
         && out_dim % 8 == 0
 }
 
+/// Prédicat du qmm2 u3 gs64 : même layout MLX LSB-first que le qmv u3.
+pub(super) fn can_use_fast_affine_qmm2_u3_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    batch == 2 && can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, group_size, bits)
+}
+
 /// Prédicat du qmv 6-bit gs64 pour le talker TTS : même contrat de buffers que
 /// les qmv rapides u4/u8, mais dépaquetage 6-bit identique au kernel générique.
 pub(super) fn can_use_fast_affine_qmv_u6_buffers(
@@ -381,6 +428,38 @@ pub(super) fn can_use_fast_affine_qmv_u6_buffers(
         && bits == FAST_QMV_U6_BITS
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % FAST_QMV_GROUP_SIZE == 0
+}
+
+/// Vérifie l'éligibilité du qmv u2 gs64 au packing MLX de 16 valeurs par `u32`.
+pub(super) fn can_use_fast_affine_qmv_u2_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    fast_affine_qmv_enabled(out_dim)
+        && batch > 0
+        && bits == FAST_QMV_U2_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 256 == 0
+        && out_dim % 8 == 0
+}
+
+/// Vérifie l'éligibilité du qmv u3 gs64 au layout MLX de 8 valeurs sur 3 octets.
+pub(super) fn can_use_fast_affine_qmv_u3_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    fast_affine_qmv_enabled(out_dim)
+        && batch > 0
+        && bits == FAST_QMV_U3_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 256 == 0
+        && out_dim % 8 == 0
 }
 
 /// Prédicat du qmv 8-bit aligné : même géométrie que le qmv 4-bit rapide,

@@ -222,8 +222,12 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_matmul_rhs_t_u32_f32")?;
         let affine_qmv_fast_u4_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_u4_gs64_f32")?;
+        let affine_qmv_fast_aligned_u2_gs64_f32 =
+            pipeline(&library, &device, "affine_qmv_fast_aligned_u2_gs64_f32")?;
         let affine_qmv_fast_aligned_u4_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_aligned_u4_gs64_f32")?;
+        let affine_qmv_fast_aligned_u3_gs64_f32 =
+            pipeline(&library, &device, "affine_qmv_fast_aligned_u3_gs64_f32")?;
         let affine_qmv_fast_u4_gs64_align64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_u4_gs64_align64_f32")?;
         let affine_qmv_fast_u6_gs64_f32 =
@@ -232,6 +236,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_qmv_fast_aligned_u6_gs64_f32")?;
         let affine_qmm2_fast_aligned_u4_gs64_f32 =
             pipeline(&library, &device, "affine_qmm2_fast_aligned_u4_gs64_f32")?;
+        let affine_qmm2_fast_aligned_u3_gs64_f32 =
+            pipeline(&library, &device, "affine_qmm2_fast_aligned_u3_gs64_f32")?;
         let affine_qmm2_fast_aligned_u8_gs64_f32 =
             pipeline(&library, &device, "affine_qmm2_fast_aligned_u8_gs64_f32")?;
         let affine_qmm2_fast_aligned_u8_gs128_f32 =
@@ -281,6 +287,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_qmv_one_fast_u8_gs64_f32")?;
         let affine_qkv_split_qmv_fast_u4_gs64_f32 =
             pipeline(&library, &device, "affine_qkv_split_qmv_fast_u4_gs64_f32")?;
+        let affine_qkv_split_qmv_fast_u3_gs64_f32 =
+            pipeline(&library, &device, "affine_qkv_split_qmv_fast_u3_gs64_f32")?;
         let affine_qmv_rms_fast_u4_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_rms_fast_u4_gs64_f32")?;
         let affine_qmv_rms_fast_u8_gs64_f32 =
@@ -291,6 +299,11 @@ impl MetalExecutor {
             &library,
             &device,
             "affine_qkv_split_rms_qmv_fast_u4_gs64_f32",
+        )?;
+        let affine_qkv_split_rms_qmv_fast_u3_gs64_f32 = pipeline(
+            &library,
+            &device,
+            "affine_qkv_split_rms_qmv_fast_u3_gs64_f32",
         )?;
         let affine_qkv_split_rms_qmv_fast_u8_gs64_f32 = pipeline(
             &library,
@@ -444,6 +457,7 @@ impl MetalExecutor {
         let copy_u16 = pipeline(&library, &device, "copy_u16")?;
         let rms_norm_rows_f32 = pipeline(&library, &device, "rms_norm_rows_f32")?;
         let rms_norm_simd_rows_f32 = pipeline(&library, &device, "rms_norm_simd_rows_f32")?;
+        let rms_norm_simd_u3_rows_f32 = pipeline(&library, &device, "rms_norm_simd_u3_rows_f32")?;
         let add_rms_norm_rows_f32 = pipeline(&library, &device, "add_rms_norm_rows_f32")?;
         let layer_norm_rows_f32 = pipeline(&library, &device, "layer_norm_rows_f32")?;
         let add_layer_norm_rows_f32 = pipeline(&library, &device, "add_layer_norm_rows_f32")?;
@@ -543,11 +557,14 @@ impl MetalExecutor {
             dense_gemm_rhs_t_f32,
             affine_matmul_rhs_t_u32_f32,
             affine_qmv_fast_u4_gs64_f32,
+            affine_qmv_fast_aligned_u2_gs64_f32,
             affine_qmv_fast_aligned_u4_gs64_f32,
+            affine_qmv_fast_aligned_u3_gs64_f32,
             affine_qmv_fast_u4_gs64_align64_f32,
             affine_qmv_fast_u6_gs64_f32,
             affine_qmv_fast_aligned_u6_gs64_f32,
             affine_qmm2_fast_aligned_u4_gs64_f32,
+            affine_qmm2_fast_aligned_u3_gs64_f32,
             affine_qmm2_fast_aligned_u8_gs64_f32,
             affine_qmm2_fast_aligned_u8_gs128_f32,
             affine_qmv_fast_aligned_u8_gs64_f32,
@@ -562,10 +579,12 @@ impl MetalExecutor {
             affine_qmv_plus_one_fast_aligned_u8_gs64_f32,
             affine_qmv_one_fast_u8_gs64_f32,
             affine_qkv_split_qmv_fast_u4_gs64_f32,
+            affine_qkv_split_qmv_fast_u3_gs64_f32,
             affine_qmv_rms_fast_u4_gs64_f32,
             affine_qmv_rms_fast_u8_gs64_f32,
             affine_qmv_rms_fast_u8_gs128_f32,
             affine_qkv_split_rms_qmv_fast_u4_gs64_f32,
+            affine_qkv_split_rms_qmv_fast_u3_gs64_f32,
             affine_qkv_split_rms_qmv_fast_u8_gs64_f32,
             affine_qmv_gated_input_fast_u4_gs64_f32,
             affine_qmv_gated_input_fast_u8_gs64_f32,
@@ -625,6 +644,7 @@ impl MetalExecutor {
             copy_u16,
             rms_norm_rows_f32,
             rms_norm_simd_rows_f32,
+            rms_norm_simd_u3_rows_f32,
             add_rms_norm_rows_f32,
             layer_norm_rows_f32,
             add_layer_norm_rows_f32,
@@ -690,6 +710,7 @@ impl MetalExecutor {
             scratch_buffers: Mutex::new(ScratchBufferCache::default()),
             moe_stacks: Mutex::new(HashMap::new()),
             concat_buffers: Mutex::new(HashMap::new()),
+            preserve_weight_caches: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }

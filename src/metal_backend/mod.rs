@@ -31,6 +31,8 @@ pub(crate) const MAX_SAMPLER_TOP_K: usize = 32;
 const FAST_QMV_GROUP_SIZE: usize = 64;
 const QMM_NA_GS128_GROUP_SIZE: usize = 128;
 const FAST_QMV_BITS: usize = 4;
+const FAST_QMV_U2_BITS: usize = 2;
+const FAST_QMV_U3_BITS: usize = 3;
 const FAST_QMV_U6_BITS: usize = 6;
 
 mod attention;
@@ -118,11 +120,14 @@ pub struct MetalExecutor {
     dense_gemm_rhs_t_f32: ComputePipelineState,
     affine_matmul_rhs_t_u32_f32: ComputePipelineState,
     affine_qmv_fast_u4_gs64_f32: ComputePipelineState,
+    affine_qmv_fast_aligned_u2_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u4_gs64_f32: ComputePipelineState,
+    affine_qmv_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmv_fast_u4_gs64_align64_f32: ComputePipelineState,
     affine_qmv_fast_u6_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u6_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u4_gs64_f32: ComputePipelineState,
+    affine_qmm2_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs128_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u8_gs64_f32: ComputePipelineState,
@@ -137,10 +142,12 @@ pub struct MetalExecutor {
     affine_qmv_plus_one_fast_aligned_u8_gs64_f32: ComputePipelineState,
     affine_qmv_one_fast_u8_gs64_f32: ComputePipelineState,
     affine_qkv_split_qmv_fast_u4_gs64_f32: ComputePipelineState,
+    affine_qkv_split_qmv_fast_u3_gs64_f32: ComputePipelineState,
     affine_qmv_rms_fast_u4_gs64_f32: ComputePipelineState,
     affine_qmv_rms_fast_u8_gs64_f32: ComputePipelineState,
     affine_qmv_rms_fast_u8_gs128_f32: ComputePipelineState,
     affine_qkv_split_rms_qmv_fast_u4_gs64_f32: ComputePipelineState,
+    affine_qkv_split_rms_qmv_fast_u3_gs64_f32: ComputePipelineState,
     affine_qkv_split_rms_qmv_fast_u8_gs64_f32: ComputePipelineState,
     affine_qmv_gated_input_fast_u4_gs64_f32: ComputePipelineState,
     affine_qmv_gated_input_fast_u8_gs64_f32: ComputePipelineState,
@@ -200,6 +207,7 @@ pub struct MetalExecutor {
     copy_u16: ComputePipelineState,
     rms_norm_rows_f32: ComputePipelineState,
     rms_norm_simd_rows_f32: ComputePipelineState,
+    rms_norm_simd_u3_rows_f32: ComputePipelineState,
     add_rms_norm_rows_f32: ComputePipelineState,
     layer_norm_rows_f32: ComputePipelineState,
     add_layer_norm_rows_f32: ComputePipelineState,
@@ -267,20 +275,33 @@ pub struct MetalExecutor {
     /// Cache des poids transposés bf16 (rhs^T) pour le GEMM NA, par ptr source.
     bf16_rhs_t_cache: Mutex<HashMap<usize, Buffer>>,
     scratch_buffers: Mutex<ScratchBufferCache>,
-    moe_stacks: Mutex<HashMap<usize, StackedMoeBuffers>>,
+    moe_stacks: Mutex<HashMap<MoeWeightKey, StackedMoeBuffers>>,
     /// Cache des concaténations de poids linéaires (qkv, linear-attn) : l'issue
     /// est une fonction pure des poids sources (invariants) → mémoïsée par process
-    /// au lieu d'être re-payée à chaque génération. Clé = suite des adresses des
-    /// poids sources (cf. [`ConcatWeightKey`]).
+    /// au lieu d'être re-payée à chaque génération. Clé = suite des identités
+    /// stables des poids sources (cf. [`ConcatWeightKey`]).
     concat_buffers: Mutex<HashMap<ConcatWeightKey, ConcatCacheEntry>>,
+    /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
+    preserve_weight_caches: std::sync::atomic::AtomicBool,
 }
 
-/// Clé du cache de concaténation de poids : la suite ordonnée des adresses des
-/// tenseurs sources. Les poids ont une adresse stable pour toute la vie du
-/// process → deux appels avec les mêmes poids partagent la même issue.
+/// Identifie un poids dense par adresse ou un poids quantifié par ID stable.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum LinearWeightId {
+    Dense(usize),
+    Affine(u64),
+}
+
+/// Clé du cache de concaténation : suite ordonnée des identités sources.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ConcatWeightKey {
-    ptrs: Vec<usize>,
+    weights: Vec<LinearWeightId>,
+}
+
+/// Clé stable des trois projections de tous les experts d'un bloc MoE.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MoeWeightKey {
+    weights: Vec<[u64; 3]>,
 }
 
 /// Issue mémoïsée d'une concaténation de poids.
@@ -638,9 +659,25 @@ pub(crate) enum PrefillResidentLayerCache {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct MetalBufferKey {
-    ptr: usize,
+    source: MetalBufferSource,
     len: usize,
     element: MetalBufferElement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MetalBufferSource {
+    Pointer(usize),
+    Affine {
+        weight_id: u64,
+        part: AffineWeightPart,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AffineWeightPart {
+    Packed,
+    Scales,
+    Biases,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -133,6 +133,34 @@ fn embedding_gather_recast_is_opt_in_and_bf16_exact() -> Result<()> {
 }
 
 #[test]
+fn quantized_embedding_batch_survives_cpu_payload_release() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let scales = Tensor::from_vec(vec![2, 1], vec![0.5, 0.25])?;
+    let biases = Tensor::from_vec(vec![2, 1], vec![-1.0, 2.0])?;
+    let weight = AffineQuantizedTensor::new(
+        &[2, 1],
+        vec![0x7654_3210, 0x0123_4567],
+        scales,
+        biases,
+        8,
+        4,
+    )?;
+    let mut embedding = EmbeddingWeight::AffineQuantized(weight);
+    let token_ids = [1, 0];
+    let expected = crate::embed_weight_tokens(&embedding, &token_ids)?;
+
+    let before = executor.embed_weight_tokens(&embedding, &token_ids, 1.0, false)?;
+    embedding.release_affine_cpu_data(&mut Vec::new());
+    let after = executor.embed_weight_tokens(&embedding, &token_ids, 1.0, false)?;
+
+    assert_eq!(before, expected);
+    assert_eq!(after, expected);
+    Ok(())
+}
+
+#[test]
 fn full_attention_tail_moe_rejects_non_single_batch() -> Result<()> {
     let executor = match test_executor()? {
         Some(executor) => executor,

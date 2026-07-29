@@ -1,4 +1,4 @@
-//! Bench ADDITIF du décodeur Whisper STT (chemin `src/stt_rust.rs`, metal-rs).
+//! Bench ADDITIF du décodeur Whisper STT (chemin `src/whisper.rs`, metal-rs).
 //!
 //! Charge le modèle + l'exécuteur Metal UNE fois, jette un warm-up, puis mesure
 //! la **médiane** de N transcriptions sur un WAV. `rtf = compute / durée_audio`.

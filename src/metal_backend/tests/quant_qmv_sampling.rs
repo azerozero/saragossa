@@ -1452,6 +1452,358 @@ fn encode_matmul_weight_buffers_u8_gs128_matches_fast_qmv_route() -> Result<()> 
 }
 
 #[test]
+fn affine_qmv_u2_gs64_dequantizes_like_cpu_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    for in_dim in [256_usize, 512_usize] {
+        let out_dim = 8_usize;
+        let weight = test_affine_mlx_u2(out_dim, in_dim)?;
+        assert!(matches!(
+            executor.select_owned_affine_matmul_kernel(1, in_dim, &weight, false),
+            AffineMatmulKernel::FastQmvU2
+        ));
+
+        let mut identity = vec![0.0_f32; in_dim * in_dim];
+        for index in 0..in_dim {
+            identity[index * in_dim + index] = 1.0;
+        }
+        let input = Tensor::from_vec(vec![in_dim, in_dim], identity)?;
+        let gpu = executor.matmul_rhs_t_affine(&input, &weight)?;
+        let cpu = weight.dequantize()?;
+
+        for col in 0..in_dim {
+            for row in 0..out_dim {
+                let gpu_value = gpu.data()[col * out_dim + row];
+                let cpu_value = cpu.data()[row * in_dim + col];
+                assert_eq!(
+                    gpu_value.to_bits(),
+                    cpu_value.to_bits(),
+                    "déquant u2 CPU/GPU différente in_dim={in_dim} row={row} col={col}: \
+                     {gpu_value} vs {cpu_value}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn affine_qmv_u3_gs64_dequantizes_like_cpu_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    for in_dim in [256_usize, 512_usize] {
+        let out_dim = 8_usize;
+        let weight = test_affine_mlx_u3(out_dim, in_dim)?;
+        assert!(matches!(
+            executor.select_owned_affine_matmul_kernel(1, in_dim, &weight, false),
+            AffineMatmulKernel::FastQmvU3
+        ));
+
+        let mut identity = vec![0.0_f32; in_dim * in_dim];
+        for index in 0..in_dim {
+            identity[index * in_dim + index] = 1.0;
+        }
+        let input = Tensor::from_vec(vec![in_dim, in_dim], identity)?;
+        let gpu = executor.matmul_rhs_t_affine(&input, &weight)?;
+        let cpu = weight.dequantize()?;
+
+        for col in 0..in_dim {
+            for row in 0..out_dim {
+                let gpu_value = gpu.data()[col * out_dim + row];
+                let cpu_value = cpu.data()[row * in_dim + col];
+                assert_eq!(
+                    gpu_value.to_bits(),
+                    cpu_value.to_bits(),
+                    "déquant u3 CPU/GPU différente in_dim={in_dim} row={row} col={col}: \
+                     {gpu_value} vs {cpu_value}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn affine_qmm2_u3_gs64_matches_two_qmv_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let in_dim = 256_usize;
+    let out_dim = 40_usize;
+    let weight = test_affine_mlx_u3(out_dim, in_dim)?;
+    assert!(matches!(
+        executor.select_owned_affine_matmul_kernel(2, in_dim, &weight, false),
+        AffineMatmulKernel::Qmm2
+    ));
+    let row0 = varied_row(in_dim, 71);
+    let row1 = varied_row(in_dim, 73);
+    let reference0 =
+        executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row0.clone())?, &weight)?;
+    let reference1 =
+        executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row1.clone())?, &weight)?;
+    let mut lhs = row0;
+    lhs.extend_from_slice(&row1);
+    let actual = executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![2, in_dim], lhs)?, &weight)?;
+
+    assert_bits_equal(
+        &actual.data()[..out_dim],
+        reference0.data(),
+        "qmm2 u3 ligne 0",
+    );
+    assert_bits_equal(
+        &actual.data()[out_dim..],
+        reference1.data(),
+        "qmm2 u3 ligne 1",
+    );
+    Ok(())
+}
+
+#[test]
+fn affine_qkv_split_u3_matches_qmv_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (q_heads, head_dim) = (2_usize, 8_usize);
+    let q_dim = q_heads * head_dim;
+    let q_gate_dim = q_dim * 2;
+    let (out_dim, in_dim) = (40_usize, 256_usize);
+    let affine = test_affine_mlx_u3(out_dim, in_dim)?;
+    let reference =
+        executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], varied_row(in_dim, 79))?, &affine)?;
+    let weight = executor.resolve_linear_weight_buffers(
+        &LinearWeight::AffineQuantized(affine),
+        "qkv_split_u3_weight",
+    )?;
+    let lhs = varied_row(in_dim, 79);
+    let lhs_buffer = executor.upload_f32_buffer(&lhs, "qkv_split_u3_lhs")?;
+    let qkv_output = executor.uncached_f32_buffer(out_dim, "qkv_split_u3_qkv")?;
+    let q_output = executor.uncached_f32_buffer(q_dim, "qkv_split_u3_q")?;
+    let gate_output = executor.uncached_f32_buffer(q_dim, "qkv_split_u3_gate")?;
+
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let fused = executor.encode_full_attn_qkv_split_buffers(
+        encoder,
+        &lhs_buffer,
+        in_dim,
+        &weight,
+        &qkv_output,
+        &q_output,
+        &gate_output,
+        q_heads,
+        head_dim,
+    )?;
+    assert_eq!(fused, Some(out_dim));
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    let q = read_f32_buffer(&q_output, q_dim)?;
+    let gate = read_f32_buffer(&gate_output, q_dim)?;
+    let qkv = read_f32_buffer(&qkv_output, out_dim)?;
+    for head in 0..q_heads {
+        for col in 0..head_dim {
+            let interleaved = head * 2 * head_dim + col;
+            assert_eq!(
+                q[head * head_dim + col].to_bits(),
+                reference.data()[interleaved].to_bits()
+            );
+            assert_eq!(
+                gate[head * head_dim + col].to_bits(),
+                reference.data()[interleaved + head_dim].to_bits()
+            );
+        }
+    }
+    assert_bits_equal(
+        &qkv[q_gate_dim..],
+        &reference.data()[q_gate_dim..],
+        "qkv split u3 k/v",
+    );
+    Ok(())
+}
+
+#[test]
+fn affine_qkv_split_rms_u3_matches_split_route_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (q_heads, head_dim) = (2_usize, 8_usize);
+    let q_dim = q_heads * head_dim;
+    let q_gate_dim = q_dim * 2;
+    let (out_dim, in_dim) = (40_usize, 256_usize);
+    let eps = 1.0e-6_f32;
+    let affine = test_affine_mlx_u3(out_dim, in_dim)?;
+    let weight = executor.resolve_linear_weight_buffers(
+        &LinearWeight::AffineQuantized(affine),
+        "qkv_split_rms_u3_weight",
+    )?;
+    let lhs = varied_row(in_dim, 83);
+    let gamma = (0..in_dim)
+        .map(|index| 0.9 + 0.002 * (index % 31) as f32)
+        .collect::<Vec<_>>();
+    let lhs_buffer = executor.upload_f32_buffer(&lhs, "qkv_split_rms_u3_lhs")?;
+    let gamma_buffer = executor.upload_f32_buffer(&gamma, "qkv_split_rms_u3_gamma")?;
+    let normed = executor.uncached_f32_buffer(in_dim, "qkv_split_rms_u3_normed")?;
+    let reference = executor.uncached_f32_buffer(out_dim, "qkv_split_rms_u3_ref")?;
+    let qkv_output = executor.uncached_f32_buffer(out_dim, "qkv_split_rms_u3_qkv")?;
+    let q_output = executor.uncached_f32_buffer(q_dim, "qkv_split_rms_u3_q")?;
+    let gate_output = executor.uncached_f32_buffer(q_dim, "qkv_split_rms_u3_gate")?;
+
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_rms_norm_simd_u3_rows(
+        encoder,
+        &lhs_buffer,
+        &gamma_buffer,
+        &normed,
+        1,
+        in_dim,
+        eps,
+    )?;
+    executor.encode_matmul_weight_buffers(
+        encoder, &normed, 1, in_dim, &weight, &reference, false,
+    )?;
+    let fused = executor.encode_full_attn_qkv_split_rms_buffers(
+        encoder,
+        &lhs_buffer,
+        &gamma_buffer,
+        eps,
+        in_dim,
+        &weight,
+        &qkv_output,
+        &q_output,
+        &gate_output,
+        q_heads,
+        head_dim,
+    )?;
+    assert_eq!(fused, Some(out_dim));
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    let reference = read_f32_buffer(&reference, out_dim)?;
+    let q = read_f32_buffer(&q_output, q_dim)?;
+    let gate = read_f32_buffer(&gate_output, q_dim)?;
+    let qkv = read_f32_buffer(&qkv_output, out_dim)?;
+    for head in 0..q_heads {
+        for col in 0..head_dim {
+            let interleaved = head * 2 * head_dim + col;
+            assert_eq!(
+                q[head * head_dim + col].to_bits(),
+                reference[interleaved].to_bits()
+            );
+            assert_eq!(
+                gate[head * head_dim + col].to_bits(),
+                reference[interleaved + head_dim].to_bits()
+            );
+        }
+    }
+    assert_bits_equal(
+        &qkv[q_gate_dim..],
+        &reference[q_gate_dim..],
+        "qkv split rms u3 k/v",
+    );
+    Ok(())
+}
+
+#[test]
+fn affine_gather_u3_prefill_fallback_dequantizes_like_cpu_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (out_dim, in_dim) = (8_usize, 256_usize);
+    let weight = test_affine_mlx_u3(out_dim, in_dim)?;
+    let dense = weight.dequantize()?;
+    let [_, packed_cols] = weight.packed_shape() else {
+        return Err(InferError::Dimension(
+            "poids gather u3 attendu rang 2".to_string(),
+        ));
+    };
+    let groups = in_dim / weight.group_size();
+    let stacked = StackedAffineBuffers {
+        packed: executor.buffer_from_slice(weight.packed_data(), "gather_u3_packed")?,
+        scales: executor
+            .buffer_from_f32_as_bf16(weight.scales().data(), "gather_u3_scales")?,
+        biases: executor
+            .buffer_from_f32_as_bf16(weight.biases().data(), "gather_u3_biases")?,
+        experts: 1,
+        out_dim,
+        in_dim,
+        packed_cols: *packed_cols,
+        group_size: weight.group_size(),
+        bits: weight.bits(),
+        groups,
+    };
+    assert!(!can_use_fast_gather_qmv(in_dim, &stacked));
+
+    let mut identity = vec![0.0_f32; in_dim * in_dim];
+    for index in 0..in_dim {
+        identity[index * in_dim + index] = 1.0;
+    }
+    let indices = vec![0_u32; in_dim];
+    let lhs = executor.upload_f32_buffer(&identity, "gather_u3_lhs")?;
+    let indices = executor.upload_u32_buffer(&indices, "gather_u3_indices")?;
+    let output = executor.uncached_f32_buffer(in_dim * out_dim, "gather_u3_output")?;
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let mut owned = Vec::new();
+    executor.encode_gather_matmul(
+        encoder,
+        &mut owned,
+        &lhs,
+        in_dim,
+        &stacked,
+        &indices,
+        in_dim,
+        &output,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    let actual = read_f32_buffer(&output, in_dim * out_dim)?;
+    for col in 0..in_dim {
+        for row in 0..out_dim {
+            assert_eq!(
+                actual[col * out_dim + row].to_bits(),
+                dense.data()[row * in_dim + col].to_bits(),
+                "gather u3 row={row} col={col}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn affine_embedding_u3_fallback_dequantizes_like_cpu_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (vocab, dim) = (8_usize, 256_usize);
+    let token = 5_usize;
+    let weight = test_affine_mlx_u3(vocab, dim)?;
+    let dense = weight.dequantize()?;
+    let embedding =
+        executor.resolve_embedding_weight_buffers(&EmbeddingWeight::AffineQuantized(weight))?;
+    let index = executor.upload_u32_buffer(&[token as u32], "embedding_u3_index")?;
+    let output = executor.uncached_f32_buffer(dim, "embedding_u3_output")?;
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_embedding_from_index_buffers(
+        encoder, &embedding, &index, &output, dim,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    let actual = read_f32_buffer(&output, dim)?;
+    assert_bits_equal(
+        &actual,
+        &dense.data()[token * dim..(token + 1) * dim],
+        "embedding u3",
+    );
+    Ok(())
+}
+
+#[test]
 fn affine_qmv_u6_gs64_matches_generic_and_routes() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
@@ -1811,6 +2163,51 @@ fn test_affine_varied_u8_group(
         group_size,
         bits,
     )
+}
+
+fn test_affine_mlx_u2(out_dim: usize, in_dim: usize) -> Result<AffineQuantizedTensor> {
+    let bits = 2;
+    let values_per_word = 32 / bits;
+    let packed_cols = in_dim / values_per_word;
+    let groups = in_dim / 64;
+    let mut packed = Vec::with_capacity(out_dim * packed_cols);
+    for row in 0..out_dim {
+        for word in 0..packed_cols {
+            let mut value = 0_u32;
+            for lane in 0..values_per_word {
+                let col = word * values_per_word + lane;
+                let q = ((row * 5 + col * 3 + col / 64) % 4) as u32;
+                value |= q << (lane * bits);
+            }
+            packed.push(value);
+        }
+    }
+    let scales = Tensor::from_vec(vec![out_dim, groups], vec![1.0; out_dim * groups])?;
+    let biases = Tensor::from_vec(vec![out_dim, groups], vec![0.0; out_dim * groups])?;
+    AffineQuantizedTensor::new(&[out_dim, packed_cols], packed, scales, biases, 64, bits)
+}
+
+fn test_affine_mlx_u3(out_dim: usize, in_dim: usize) -> Result<AffineQuantizedTensor> {
+    let bits = 3;
+    let packed_cols = in_dim * bits / 32;
+    let groups = in_dim / 64;
+    let mut packed = vec![0_u32; out_dim * packed_cols];
+    for row in 0..out_dim {
+        for col in 0..in_dim {
+            let q = ((row * 5 + col * 3 + col / 64) % 8) as u32;
+            let bit_offset = col * bits;
+            let word_col = bit_offset / 32;
+            let shift = bit_offset % 32;
+            let row_word = row * packed_cols + word_col;
+            packed[row_word] |= q << shift;
+            if shift + bits > 32 {
+                packed[row_word + 1] |= q >> (32 - shift);
+            }
+        }
+    }
+    let scales = Tensor::from_vec(vec![out_dim, groups], vec![1.0; out_dim * groups])?;
+    let biases = Tensor::from_vec(vec![out_dim, groups], vec![0.0; out_dim * groups])?;
+    AffineQuantizedTensor::new(&[out_dim, packed_cols], packed, scales, biases, 64, bits)
 }
 
 fn test_affine_varied_u6(out_dim: usize, in_dim: usize) -> Result<AffineQuantizedTensor> {
