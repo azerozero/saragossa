@@ -215,17 +215,12 @@ impl MetalExecutor {
             checked_u32(*gate_packed_cols, "shared gate/up packed_cols")?,
             checked_u32(groups, "shared gate/up groups")?,
         ];
-        let gate_packed =
-            self.cached_buffer_from_u32(gate_w.packed_data(), "shared_gate_packed")?;
-        let gate_scales =
-            self.cached_buffer_from_f32_as_bf16(gate_w.scales().data(), "shared_gate_scales")?;
-        let gate_biases =
-            self.cached_buffer_from_f32_as_bf16(gate_w.biases().data(), "shared_gate_biases")?;
-        let up_packed = self.cached_buffer_from_u32(up_w.packed_data(), "shared_up_packed")?;
-        let up_scales =
-            self.cached_buffer_from_f32_as_bf16(up_w.scales().data(), "shared_up_scales")?;
-        let up_biases =
-            self.cached_buffer_from_f32_as_bf16(up_w.biases().data(), "shared_up_biases")?;
+        let gate_packed = self.cached_affine_packed(gate_w, "shared_gate_packed")?;
+        let gate_scales = self.cached_affine_scales(gate_w, "shared_gate_scales")?;
+        let gate_biases = self.cached_affine_biases(gate_w, "shared_gate_biases")?;
+        let up_packed = self.cached_affine_packed(up_w, "shared_up_packed")?;
+        let up_scales = self.cached_affine_scales(up_w, "shared_up_scales")?;
+        let up_biases = self.cached_affine_biases(up_w, "shared_up_biases")?;
         let (pipeline, kernel_name) = if gate_bits == FAST_QMV_BITS {
             (
                 &self.affine_gate_up_swiglu_fast_u4_gs64_f32,

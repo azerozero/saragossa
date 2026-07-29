@@ -339,6 +339,114 @@ impl MetalExecutor {
         Ok(())
     }
 
+    pub(super) fn encode_affine_qmv_u2_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed_buffer: &BufferRef,
+        scales_buffer: &BufferRef,
+        biases_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        packed_cols: usize,
+        groups: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(out_dim, "qmv u2 out_dim")?,
+            checked_u32(in_dim, "qmv u2 in_dim")?,
+            checked_u32(packed_cols, "qmv u2 packed_cols")?,
+            checked_u32(groups, "qmv u2 groups")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.affine_qmv_fast_aligned_u2_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), 0);
+        encoder.set_buffer(2, Some(scales_buffer), 0);
+        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, &dims, "qmv_u2_dims")?;
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            "affine_qmv_u2_aligned_gs64",
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_U2_BITS,
+        ));
+        trace_dispatch_path(
+            "affine_qmv_fast_aligned_u2_gs64_f32",
+            batch,
+            out_dim,
+            in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch, "qmv u2 batch")?,
+                checked_nsuint(out_dim / 8, "qmv u2 out groups")?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
+    }
+
+    pub(super) fn encode_affine_qmv_u3_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed_buffer: &BufferRef,
+        scales_buffer: &BufferRef,
+        biases_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        packed_cols: usize,
+        groups: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(out_dim, "qmv u3 out_dim")?,
+            checked_u32(in_dim, "qmv u3 in_dim")?,
+            checked_u32(packed_cols, "qmv u3 packed_cols")?,
+            checked_u32(groups, "qmv u3 groups")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.affine_qmv_fast_aligned_u3_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), 0);
+        encoder.set_buffer(2, Some(scales_buffer), 0);
+        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, &dims, "qmv_u3_dims")?;
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            "affine_qmv_u3_aligned_gs64",
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_U3_BITS,
+        ));
+        trace_dispatch_path(
+            "affine_qmv_fast_aligned_u3_gs64_f32",
+            batch,
+            out_dim,
+            in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch, "qmv u3 batch")?,
+                checked_nsuint(out_dim / 8, "qmv u3 out groups")?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
+    }
+
     pub(super) fn encode_affine_qmv_u6_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -438,6 +546,7 @@ impl MetalExecutor {
             0,
             output_buffer,
             expected_dim,
+            1,
             embedding_scale,
             recast_bf16,
         )
@@ -459,8 +568,33 @@ impl MetalExecutor {
             index_offset,
             output_buffer,
             expected_dim,
+            1,
             1.0,
             false,
+        )
+    }
+
+    pub(crate) fn encode_embeddings_from_indices_scaled(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        embedding: &MetalEmbeddingWeightBuffers,
+        indices: &BufferRef,
+        output: &BufferRef,
+        expected_dim: usize,
+        token_count: usize,
+        embedding_scale: f32,
+        recast_bf16: bool,
+    ) -> Result<()> {
+        self.encode_embedding_from_index_buffers_with_offset_scaled(
+            encoder,
+            embedding,
+            indices,
+            0,
+            output,
+            expected_dim,
+            token_count,
+            embedding_scale,
+            recast_bf16,
         )
     }
 
@@ -476,9 +610,15 @@ impl MetalExecutor {
         index_offset: u64,
         output_buffer: &BufferRef,
         expected_dim: usize,
+        token_count: usize,
         embedding_scale: f32,
         recast_bf16: bool,
     ) -> Result<()> {
+        if token_count == 0 {
+            return Err(InferError::Dimension(
+                "gather embedding sans token".to_string(),
+            ));
+        }
         match embedding {
             MetalEmbeddingWeightBuffers::Dense { table, vocab, dim } => {
                 if *dim != expected_dim {
@@ -550,7 +690,11 @@ impl MetalExecutor {
         }
         profile_dispatch();
         encoder.dispatch_threads(
-            MTLSize::new(checked_nsuint(expected_dim, "embedding dim")?, 1, 1),
+            MTLSize::new(
+                checked_nsuint(expected_dim, "embedding dim")?,
+                checked_nsuint(token_count, "embedding tokens")?,
+                1,
+            ),
             MTLSize::new(256, 1, 1),
         );
         post_dispatch_barrier_buffer(encoder, output_buffer);
@@ -807,6 +951,47 @@ impl MetalExecutor {
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(checked_nsuint(rows, "rms simd rows")?, 1, 1),
+            MTLSize::new(32, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
+    }
+
+    /// Encode le `rms_norm` avec la partition 8 valeurs/thread du qmv u3.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `dim % 256 != 0`.
+    pub(crate) fn encode_rms_norm_simd_u3_rows(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        weight_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        if dim % 256 != 0 {
+            return Err(InferError::Dimension(format!(
+                "rms_norm_simd_u3 exige dim % 256 == 0, reçu {dim}"
+            )));
+        }
+        encoder.set_compute_pipeline_state(&self.rms_norm_simd_u3_rows_f32);
+        encoder.set_buffer(0, Some(input_buffer), 0);
+        encoder.set_buffer(1, Some(weight_buffer), 0);
+        encoder.set_buffer(2, Some(output_buffer), 0);
+        set_u32_bytes(
+            encoder,
+            3,
+            &[checked_u32(dim, "rms simd u3 rows dim")?],
+            "rms_simd_u3_rows_dim",
+        )?;
+        set_f32_bytes(encoder, 4, &[eps], "rms_simd_u3_rows_eps")?;
+        trace_dispatch_path("rms_norm_simd_u3_rows_f32", rows, dim, 0);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(checked_nsuint(rows, "rms simd u3 rows")?, 1, 1),
             MTLSize::new(32, 1, 1),
         );
         post_dispatch_barrier_buffer(encoder, output_buffer);

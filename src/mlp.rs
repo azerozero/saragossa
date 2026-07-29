@@ -67,6 +67,14 @@ impl FeedForward {
             Self::Moe(mlp) => mlp.forward_with_router_source(x, router_source, runtime),
         }
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+        match self {
+            Self::Dense(mlp) => mlp.release_affine_cpu_data(released),
+            Self::Moe(mlp) => mlp.release_affine_cpu_data(released),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +148,13 @@ impl GatedMlp {
     )]
     pub(crate) fn projections(&self) -> (&Linear, &Linear, &Linear) {
         (&self.gate_proj, &self.up_proj, &self.down_proj)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+        self.gate_proj.release_affine_cpu_data(released);
+        self.up_proj.release_affine_cpu_data(released);
+        self.down_proj.release_affine_cpu_data(released);
     }
 }
 
@@ -575,6 +590,20 @@ impl MoeMlp {
         }
         Ok(out)
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+        self.router.release_affine_cpu_data(released);
+        // NOTE: Les stacks gate/up/down du préfill MoE résident peuvent être
+        // résolues tardivement avec une clé distincte du decode. Conserver les
+        // experts routés rend tout cache-miss reconstructible après le warmup.
+        if let Some(shared_expert) = &mut self.shared_expert {
+            shared_expert.release_affine_cpu_data(released);
+        }
+        if let Some(shared_expert_gate) = &mut self.shared_expert_gate {
+            shared_expert_gate.release_affine_cpu_data(released);
+        }
+    }
 }
 
 fn top_k_indices(values: &[f32], k: usize) -> Vec<usize> {
@@ -685,6 +714,47 @@ mod tests {
         assert!((out.data()[0] - 2.0 * silu_scalar(2.0)).abs() < 1.0e-5);
     }
 
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn cpu_release_preserves_routed_expert_payloads() {
+        let router = quantized_linear();
+        let routed_expert = quantized_expert();
+        let shared_expert = quantized_expert();
+        let shared_gate = quantized_linear();
+        let mut moe = MoeMlp::new(
+            router,
+            vec![routed_expert],
+            Some(shared_expert),
+            Some(shared_gate),
+            1,
+        )
+        .expect("invariant: MoE quantifié valide");
+        let mut released = Vec::new();
+
+        moe.release_affine_cpu_data(&mut released);
+
+        assert!(
+            moe.experts
+                .iter()
+                .flat_map(|expert| [&expert.gate_proj, &expert.up_proj, &expert.down_proj,])
+                .all(quantized_cpu_data_available),
+            "les experts routés doivent rester reconstructibles après le warmup"
+        );
+        assert!(!quantized_cpu_data_available(&moe.router));
+        assert!(moe
+            .shared_expert
+            .as_ref()
+            .into_iter()
+            .flat_map(|expert| [&expert.gate_proj, &expert.up_proj, &expert.down_proj,])
+            .all(|linear| !quantized_cpu_data_available(linear)));
+        assert!(!quantized_cpu_data_available(
+            moe.shared_expert_gate
+                .as_ref()
+                .expect("invariant: gate partagé présent")
+        ));
+        assert_eq!(released.len(), 5);
+    }
+
     fn constant_expert(scale: f32) -> GatedMlp {
         let gate = Linear::new(
             Tensor::from_vec(vec![1, 2], vec![scale, scale]).expect("invariant: gate"),
@@ -702,6 +772,31 @@ mod tests {
         )
         .expect("invariant: down linear");
         GatedMlp::new(gate, up, down)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn quantized_expert() -> GatedMlp {
+        GatedMlp::new(quantized_linear(), quantized_linear(), quantized_linear())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn quantized_linear() -> Linear {
+        let scales = Tensor::from_vec(vec![1, 1], vec![0.5])
+            .expect("invariant: échelles quantifiées valides");
+        let biases =
+            Tensor::from_vec(vec![1, 1], vec![0.0]).expect("invariant: biais quantifiés valides");
+        let weight =
+            crate::AffineQuantizedTensor::new(&[1, 1], vec![0x7654_3210], scales, biases, 8, 4)
+                .expect("invariant: poids quantifié valide");
+        Linear::new_quantized(weight, None).expect("invariant: projection quantifiée valide")
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn quantized_cpu_data_available(linear: &Linear) -> bool {
+        match linear.weight() {
+            crate::LinearWeight::AffineQuantized(weight) => weight.cpu_data_available(),
+            crate::LinearWeight::Dense(_) => false,
+        }
     }
 
     fn silu_scalar(value: f32) -> f32 {

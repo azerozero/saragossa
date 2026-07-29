@@ -246,6 +246,15 @@ impl LinearAttention {
         }
     }
 
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+        self.in_proj_qkv.release_affine_cpu_data(released);
+        self.in_proj_z.release_affine_cpu_data(released);
+        self.in_proj_b.release_affine_cpu_data(released);
+        self.in_proj_a.release_affine_cpu_data(released);
+        self.out_proj.release_affine_cpu_data(released);
+    }
+
     /// Applique la couche sur CPU sans cache persistant (tests uniquement).
     ///
     /// # Errors

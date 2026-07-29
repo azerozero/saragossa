@@ -956,11 +956,9 @@ impl MetalExecutor {
         let groups = in_dim
             .checked_div(weight.group_size())
             .ok_or_else(|| InferError::Metal("group_size argmax nul".to_string()))?;
-        let packed_buffer = self.cached_buffer_from_u32(weight.packed_data(), "argmax_packed")?;
-        let scales_buffer =
-            self.cached_buffer_from_f32_as_bf16(weight.scales().data(), "argmax_scales")?;
-        let biases_buffer =
-            self.cached_buffer_from_f32_as_bf16(weight.biases().data(), "argmax_biases")?;
+        let packed_buffer = self.cached_affine_packed(weight, "argmax_packed")?;
+        let scales_buffer = self.cached_affine_scales(weight, "argmax_scales")?;
+        let biases_buffer = self.cached_affine_biases(weight, "argmax_biases")?;
         let dims = [
             checked_u32(out_dim, "argmax fast out_dim")?,
             checked_u32(in_dim, "argmax fast in_dim")?,

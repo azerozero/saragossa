@@ -147,7 +147,7 @@ fn run() -> CliResult<()> {
         })?
     };
     let prompt_ids = encode_prompt_ids(&assets, prompt, args.raw)?;
-    let warmup_elapsed = warmup_decoder(&decoder, &prompt_ids, args.backend)?;
+    let warmup_elapsed = warmup_decoder(&mut decoder, &prompt_ids, args.backend)?;
     // Chauffe la voie MTP quand le decode MTP est actif : une passe spéculative
     // peuple le cache de concaténation QKV (`RETI_RUST_RESIDENT_CONCAT_CACHE`) sur
     // le `MetalExecutor` persistant, si bien que le PREMIER vrai decode saute la
@@ -579,7 +579,7 @@ fn encode_benchmark_text(assets: &ModelAssets, text: &str, raw: bool) -> CliResu
 }
 
 fn warmup_decoder(
-    decoder: &CausalDecoder,
+    decoder: &mut CausalDecoder,
     prompt_ids: &[usize],
     backend: RuntimeKind,
 ) -> CliResult<Duration> {
@@ -593,6 +593,9 @@ fn warmup_decoder(
     let passes = warmup_passes();
     let warmup_len = prompt_ids.len().min(warmup_prompt_tokens());
     let warmup_prompt = &prompt_ids[..warmup_len];
+    // Le drop doit précéder tout prefill : la première passe construirait sinon
+    // les buffers Metal du modèle entier pendant que les payloads CPU résident.
+    let _ = decoder.warmup_and_release_cpu_weights(warmup_prompt)?;
     for _ in 0..passes {
         let _ = decoder.prefill_cache_uncached(warmup_prompt)?;
     }

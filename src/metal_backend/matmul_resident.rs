@@ -289,6 +289,32 @@ impl MetalExecutor {
                 groups,
                 FAST_QMV_BITS,
             )?,
+            AffineMatmulKernel::FastQmvU2 => self.encode_affine_qmv_u2_buffers(
+                encoder,
+                lhs_buffer,
+                packed,
+                scales,
+                biases,
+                output_buffer,
+                batch,
+                in_dim,
+                out_dim,
+                packed_cols,
+                groups,
+            )?,
+            AffineMatmulKernel::FastQmvU3 => self.encode_affine_qmv_u3_buffers(
+                encoder,
+                lhs_buffer,
+                packed,
+                scales,
+                biases,
+                output_buffer,
+                batch,
+                in_dim,
+                out_dim,
+                packed_cols,
+                groups,
+            )?,
             AffineMatmulKernel::FastQmvU6 => self.encode_affine_qmv_u6_buffers(
                 encoder,
                 lhs_buffer,
@@ -415,6 +441,11 @@ impl MetalExecutor {
                 &self.affine_qmm2_fast_aligned_u4_gs64_f32,
                 "affine_qmm2_fast_aligned_u4_gs64_f32",
             )
+        } else if bits == FAST_QMV_U3_BITS {
+            (
+                &self.affine_qmm2_fast_aligned_u3_gs64_f32,
+                "affine_qmm2_fast_aligned_u3_gs64_f32",
+            )
         } else if group_size == FAST_QMV_GROUP_SIZE {
             (
                 &self.affine_qmm2_fast_aligned_u8_gs64_f32,
@@ -436,6 +467,8 @@ impl MetalExecutor {
         profile_dispatch_shape(DispatchProfileShape::matmul(
             if bits == FAST_QMV_BITS {
                 "affine_qmm2_u4_gs64"
+            } else if bits == FAST_QMV_U3_BITS {
+                "affine_qmm2_u3_gs64"
             } else if group_size == FAST_QMV_GROUP_SIZE {
                 "affine_qmm2_u8_gs64"
             } else {

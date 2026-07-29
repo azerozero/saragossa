@@ -687,6 +687,44 @@ impl CausalDecoder {
         )
     }
 
+    /// Génère en greedy/sampled depuis un prompt en émettant chaque token via
+    /// `on_token` (renvoie `false` pour arrêter, ex. barge-in).
+    ///
+    /// Fait le prefill puis décode par le chemin RÉSIDENT (comme
+    /// `generate_greedy_timed_with_options`), contrairement au streaming pull
+    /// per-op côté hôte. Byte-identique au decode résident non-streamé.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le prompt est vide ou si prefill/forward échoue.
+    pub fn generate_greedy_streaming_with_options(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        on_token: impl FnMut(usize) -> bool,
+    ) -> Result<GenerationOutput> {
+        if prompt.is_empty() {
+            return Err(InferError::Dimension("prompt token vide".to_string()));
+        }
+        if max_new_tokens == 0 {
+            return Ok(GenerationOutput {
+                tokens: Vec::new(),
+                timings: GenerationTimings::default(),
+            });
+        }
+        let prefill_started = Instant::now();
+        let (cache, final_state) = self.prefill_cache_state(prompt)?;
+        let prefill = prefill_started.elapsed();
+        self.generate_greedy_timed_from_prompt_state_with_options_and_callback(
+            CausalDecoderPromptState::new(cache, final_state),
+            prefill,
+            max_new_tokens,
+            options,
+            on_token,
+        )
+    }
+
     /// Génère depuis un état de prompt pré-rempli.
     ///
     /// # Errors
@@ -1097,6 +1135,37 @@ impl CausalDecoder {
         options: &GenerationOptions,
         max_draft_tokens: usize,
     ) -> Result<SpeculativeOutput> {
+        self.generate_greedy_mtp_inner(prompt, max_new_tokens, options, max_draft_tokens, |_| true)
+    }
+
+    /// Comme `generate_greedy_mtp_batched_with_options` mais émet chaque token
+    /// committé via `on_token` (qui renvoie `false` pour arrêter, ex. barge-in
+    /// voix). La séquence produite est byte-identique à la variante batchée : le
+    /// vérifieur trunk exact la garantit, le callback ne fait qu'observer/arrêter.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si aucun sidecar MTP n'est chargé, si `max_draft_tokens`
+    /// vaut 0, si le prompt est vide, ou si une étape de prefill/verify échoue.
+    pub fn generate_greedy_mtp_streaming_with_options(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        max_draft_tokens: usize,
+        on_token: impl FnMut(usize) -> bool,
+    ) -> Result<SpeculativeOutput> {
+        self.generate_greedy_mtp_inner(prompt, max_new_tokens, options, max_draft_tokens, on_token)
+    }
+
+    fn generate_greedy_mtp_inner(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        max_draft_tokens: usize,
+        mut on_token: impl FnMut(usize) -> bool,
+    ) -> Result<SpeculativeOutput> {
         if self.mtp.is_none() {
             return Err(InferError::Config(
                 "decode MTP demandé sans sidecar MTP chargé".to_string(),
@@ -1187,6 +1256,10 @@ impl CausalDecoder {
         let mut sampler = DeterministicSampler::new(options.seed);
         let mut pending = self.sample_token_from_state(&final_state, options, &mut sampler)?;
         let mut generated = Vec::with_capacity(max_new_tokens);
+        // Streaming : `emitted` = nb de tokens déjà passés à `on_token` ; émis en
+        // tête d'itération pour capturer tous les chemins de commit (dont `continue`).
+        let mut emitted = 0usize;
+        let mut stop_streaming = false;
         let mut stats = SpeculativeStats::default();
         stats.proposed_by_position.resize(max_draft_tokens, 0);
         stats.accepted_by_position.resize(max_draft_tokens, 0);
@@ -1210,6 +1283,19 @@ impl CausalDecoder {
         let decode_started = Instant::now();
 
         while generated.len() < max_new_tokens {
+            // Émet les tokens committés aux itérations précédentes (byte-identiques
+            // à l'AR). `on_token` renvoie `false` → arrêt (barge-in voix).
+            while emitted < generated.len() {
+                let committed = generated[emitted];
+                emitted += 1;
+                if !on_token(committed) {
+                    stop_streaming = true;
+                    break;
+                }
+            }
+            if stop_streaming {
+                break;
+            }
             let primary = pending;
             if options.stop_token_ids.contains(&primary) {
                 break;
@@ -1559,6 +1645,16 @@ impl CausalDecoder {
         }
 
         let loop_duration = decode_started.elapsed();
+        // Flush final : émet les derniers tokens committés non encore streamés.
+        if !stop_streaming {
+            while emitted < generated.len() {
+                let committed = generated[emitted];
+                emitted += 1;
+                if !on_token(committed) {
+                    break;
+                }
+            }
+        }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         decode_profiler.report_decode_loop(loop_duration, generated.len());
         #[cfg(all(target_os = "macos", feature = "metal"))]

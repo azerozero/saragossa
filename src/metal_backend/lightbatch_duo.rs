@@ -73,6 +73,7 @@ impl MetalExecutor {
                 ..
             } => {
                 can_use_fast_affine_qmm2_buffers(2, *in_dim, *out_dim, *group_size, *bits)
+                    || can_use_fast_affine_qmm2_u3_buffers(2, *in_dim, *out_dim, *group_size, *bits)
                     || can_use_fast_affine_qmm2_u8_buffers(2, *in_dim, *out_dim, *group_size, *bits)
             }
         }
@@ -136,6 +137,14 @@ impl MetalExecutor {
                         && *bits == FAST_QMV_BITS
                         && *group_size == FAST_QMV_GROUP_SIZE
                         && in_dim % 512 == 0)
+                        || (epilogue
+                            && can_use_fast_affine_qmv_u3_buffers(
+                                1,
+                                in_dim,
+                                *out_dim,
+                                *group_size,
+                                *bits,
+                            ))
                         || can_use_fast_affine_qmv_u8_buffers(
                             1,
                             in_dim,
@@ -165,6 +174,35 @@ impl MetalExecutor {
         proj_weight: &MetalLinearWeightBuffers,
         epilogue: bool,
     ) -> Result<()> {
+        let u3_fused = epilogue
+            && matches!(
+                proj_weight,
+                MetalLinearWeightBuffers::AffineQuantized {
+                    out_dim,
+                    in_dim: weight_in_dim,
+                    group_size,
+                    bits,
+                    ..
+                } if *weight_in_dim == dim
+                    && can_use_fast_affine_qmv_u3_buffers(
+                        1,
+                        dim,
+                        *out_dim,
+                        *group_size,
+                        *bits,
+                    )
+            );
+        if u3_fused {
+            return self.encode_rms_norm_simd_u3_rows(
+                encoder,
+                input_buffer,
+                weight_buffer,
+                output_buffer,
+                2,
+                dim,
+                eps,
+            );
+        }
         if self.solo_rms_fusion_applies(proj_weight, dim, epilogue) {
             self.encode_rms_norm_simd_rows(
                 encoder,

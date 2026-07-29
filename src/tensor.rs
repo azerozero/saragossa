@@ -67,6 +67,13 @@ impl Tensor {
         &self.data
     }
 
+    /// Libère les données CPU tout en conservant la forme du tenseur.
+    ///
+    /// Réservé aux poids déjà copiés dans des buffers Metal résidents.
+    pub(crate) fn release_data(&mut self) -> usize {
+        std::mem::take(&mut self.data).len()
+    }
+
     #[must_use]
     /// Renvoie le nombre d'éléments.
     pub fn len(&self) -> usize {

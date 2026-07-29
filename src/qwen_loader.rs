@@ -406,7 +406,7 @@ fn validate_affine_quantization(quant: &QuantConfig) -> Result<()> {
         return Ok(());
     }
     let (group_size, bits) = quant_params(quant)?;
-    if !matches!(bits, 4 | 8) {
+    if !matches!(bits, 2 | 3 | 4 | 8) {
         return Err(InferError::Config(format!(
             "quantification affine bits={bits} non supportée"
         )));

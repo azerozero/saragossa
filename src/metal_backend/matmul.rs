@@ -26,17 +26,15 @@ pub(crate) fn take_concat_profile() -> (u64, u64) {
     )
 }
 
-/// Renvoie l'adresse stable du tenseur primaire d'un poids linéaire (données
-/// denses ou données packées quantifiées). Sert de composante de clé de cache :
-/// c'est l'adresse déjà utilisée pour mémoïser les buffers individuels.
-fn linear_weight_addr(weight: &LinearWeight) -> usize {
+/// Renvoie l'identité stable d'un poids linéaire pour les caches Metal.
+fn linear_weight_id(weight: &LinearWeight) -> LinearWeightId {
     match weight {
-        LinearWeight::Dense(tensor) => tensor.data().as_ptr().addr(),
-        LinearWeight::AffineQuantized(weight) => weight.packed_data().as_ptr().addr(),
+        LinearWeight::Dense(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
+        LinearWeight::AffineQuantized(weight) => LinearWeightId::Affine(weight.weight_id()),
     }
 }
 
-/// Construit la clé de cache d'une concaténation : la suite ordonnée des adresses
+/// Construit la clé de cache d'une concaténation : la suite ordonnée des identités
 /// sources. `None` si la liste est vide (l'appel échouera de toute façon), pour
 /// ne jamais mémoïser une entrée dégénérée.
 fn concat_weight_key(weights: &[&LinearWeight]) -> Option<ConcatWeightKey> {
@@ -44,7 +42,10 @@ fn concat_weight_key(weights: &[&LinearWeight]) -> Option<ConcatWeightKey> {
         return None;
     }
     Some(ConcatWeightKey {
-        ptrs: weights.iter().map(|w| linear_weight_addr(w)).collect(),
+        weights: weights
+            .iter()
+            .map(|weight| linear_weight_id(weight))
+            .collect(),
     })
 }
 
@@ -373,11 +374,9 @@ impl MetalExecutor {
         }
 
         let lhs_buffer = self.upload_f32_buffer(input.data(), "input")?;
-        let packed_buffer = self.cached_buffer_from_u32(weight.packed_data(), "packed")?;
-        let scales_buffer =
-            self.cached_buffer_from_f32_as_bf16(weight.scales().data(), "scales")?;
-        let biases_buffer =
-            self.cached_buffer_from_f32_as_bf16(weight.biases().data(), "biases")?;
+        let packed_buffer = self.cached_affine_packed(weight, "packed")?;
+        let scales_buffer = self.cached_affine_scales(weight, "scales")?;
+        let biases_buffer = self.cached_affine_biases(weight, "biases")?;
         let output_len = checked_len(batch, *out_dim, "sortie matmul Metal quantifiée")?;
         let output_buffer = self.device.new_buffer(
             byte_len::<f32>(output_len)?,
@@ -403,6 +402,7 @@ impl MetalExecutor {
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
         if can_use_fast_affine_qmm2(batch, in_dim, weight)
+            || can_use_fast_affine_qmm2_u3(batch, in_dim, weight)
             || can_use_fast_affine_qmm2_u8(batch, in_dim, weight)
         {
             let fast_dims = [
@@ -415,6 +415,8 @@ impl MetalExecutor {
             owned_buffers.push(fast_dims_buffer.clone());
             let pipeline = if weight.bits() == FAST_QMV_BITS {
                 &self.affine_qmm2_fast_aligned_u4_gs64_f32
+            } else if weight.bits() == FAST_QMV_U3_BITS {
+                &self.affine_qmm2_fast_aligned_u3_gs64_f32
             } else if weight.group_size() == FAST_QMV_GROUP_SIZE {
                 &self.affine_qmm2_fast_aligned_u8_gs64_f32
             } else {
@@ -468,6 +470,34 @@ impl MetalExecutor {
                 MTLSize::new(64, 1, 1),
             );
             post_dispatch_barrier(encoder);
+        } else if can_use_fast_affine_qmv_u2(batch, in_dim, weight) {
+            self.encode_affine_qmv_u2_buffers(
+                encoder,
+                &lhs_buffer,
+                &packed_buffer,
+                &scales_buffer,
+                &biases_buffer,
+                &output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                groups,
+            )?;
+        } else if can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
+            self.encode_affine_qmv_u3_buffers(
+                encoder,
+                &lhs_buffer,
+                &packed_buffer,
+                &scales_buffer,
+                &biases_buffer,
+                &output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                groups,
+            )?;
         } else if can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
             let fast_dims = [
                 checked_u32(*out_dim, "fast u6 out_dim")?,
@@ -798,9 +828,9 @@ impl MetalExecutor {
                     .checked_div(weight.group_size())
                     .ok_or_else(|| InferError::Metal("group_size quantifié nul".to_string()))?;
                 Ok(MetalLinearWeightBuffers::AffineQuantized {
-                    packed: self.cached_buffer_from_u32(weight.packed_data(), label)?,
-                    scales: self.cached_buffer_from_f32_as_bf16(weight.scales().data(), label)?,
-                    biases: self.cached_buffer_from_f32_as_bf16(weight.biases().data(), label)?,
+                    packed: self.cached_affine_packed(weight, label)?,
+                    scales: self.cached_affine_scales(weight, label)?,
+                    biases: self.cached_affine_biases(weight, label)?,
                     out_dim: *out_dim,
                     in_dim: *in_dim,
                     packed_cols: *packed_cols,
@@ -815,7 +845,7 @@ impl MetalExecutor {
     /// Résout (et mémoïse) la concaténation de poids linéaires en un buffer Metal.
     ///
     /// Le buffer concaténé est une fonction pure des poids sources (invariants
-    /// sur la vie du process) : mémoïsé par la suite des adresses sources, il
+    /// sur la vie du process) : mémoïsé par la suite des identités sources, il
     /// n'est bâti qu'une fois (upload compris) puis partagé entre générations.
     /// C'était le poste dominant du setup MTP (concat re-payé à chaque
     /// génération) ; le cache le ramène à un clone de poignée `metal::Buffer`.
@@ -831,9 +861,9 @@ impl MetalExecutor {
         // Coupe-circuit : le rebuild par génération reste accessible pour l'A/B
         // et le repli prod. Le comportement est byte-identique (cache ⇒ mêmes
         // octets ; verdict `Incompatible` ⇒ même repli split).
-        let key = crate::runtime_flags::resident_concat_cache_enabled()
-            .then(|| concat_weight_key(weights))
-            .flatten();
+        let cache_enabled = crate::runtime_flags::resident_concat_cache_enabled()
+            || self.preserving_weight_caches();
+        let key = cache_enabled.then(|| concat_weight_key(weights)).flatten();
         // Court-circuit : un hit ne re-concatène ni ne ré-upload rien. Un buffer
         // clone partage le même `MTLBuffer` (compté par référence) ; un verdict
         // `Incompatible` renvoie l'erreur de dimension sans recopie partielle.
@@ -874,7 +904,9 @@ impl MetalExecutor {
         // pression sur le KV cache / STT / TTS). Le marqueur d'incompatibilité (sans
         // donnée GPU) est toujours mémoïsé pour éviter de ré-échouer.
         let retain = match &entry {
-            Some(ConcatCacheEntry::Buffers(_)) => self.concat_cache_within_vram_budget(),
+            Some(ConcatCacheEntry::Buffers(_)) => {
+                self.preserving_weight_caches() || self.concat_cache_within_vram_budget()
+            }
             _ => true,
         };
         if let (Some(key), Some(entry)) = (key, entry) {
@@ -1027,5 +1059,27 @@ impl MetalExecutor {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::*;
+
+    #[test]
+    fn affine_concat_key_survives_cpu_payload_release() {
+        let scales = Tensor::from_vec(vec![1, 1], vec![0.5]).expect("invariant: scales valides");
+        let biases = Tensor::from_vec(vec![1, 1], vec![0.0]).expect("invariant: biases valides");
+        let affine = AffineQuantizedTensor::new(&[1, 1], vec![0x7654_3210], scales, biases, 8, 4)
+            .expect("invariant: poids affine valide");
+        let mut weight = LinearWeight::AffineQuantized(affine);
+        let before = concat_weight_key(&[&weight]).expect("invariant: clé non vide");
+
+        let mut released = Vec::new();
+        weight.release_affine_cpu_data(&mut released);
+        let after = concat_weight_key(&[&weight]).expect("invariant: clé non vide");
+
+        assert_eq!(before, after);
+        assert_eq!(released.len(), 1);
     }
 }

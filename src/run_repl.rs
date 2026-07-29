@@ -181,7 +181,21 @@ impl ReplModel {
         let _ = saragossa::apply_runtime_preset_for_model_dir(model_dir);
         let preset = saragossa::runtime_preset_for_model_dir(model_dir);
         let assets = ModelAssets::load_local(model_dir)?;
-        let decoder = load_decoder_with_runtime(&assets, args.backend)?;
+        let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if args.backend == RuntimeKind::Metal {
+            let prompt = assets.encode_prompt_with_special("warmup")?;
+            let prompt = prompt
+                .into_iter()
+                .map(|id| {
+                    usize::try_from(id)
+                        .map_err(|_| cli_error(format!("token warmup hors plage: {id}")))
+                })
+                .collect::<CliResult<Vec<_>>>()?;
+            if !prompt.is_empty() {
+                let _ = decoder.warmup_and_release_cpu_weights(&prompt)?;
+            }
+        }
         let top_p = args.top_p.unwrap_or_else(|| {
             if args.temperature > f32::EPSILON {
                 preset.map(|preset| preset.sampling_top_p).unwrap_or(1.0)

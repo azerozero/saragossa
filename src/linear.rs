@@ -84,6 +84,15 @@ impl LinearWeight {
             Self::AffineQuantized(weight) => weight.matmul_rhs_t(input),
         }
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+        if let Self::AffineQuantized(weight) = self {
+            let weight_id = weight.weight_id();
+            let bytes = weight.release_cpu_data();
+            released.push((weight_id, bytes));
+        }
+    }
 }
 
 impl Linear {
@@ -180,6 +189,11 @@ impl Linear {
     /// Renvoie le stockage des poids.
     pub fn weight(&self) -> &LinearWeight {
         &self.weight
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+        self.weight.release_affine_cpu_data(released);
     }
 
     #[must_use]

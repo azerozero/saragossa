@@ -16,72 +16,6 @@ use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 
 const KERNELS: &str = include_str!("../src/kernels.metal");
 
-/// qmm petit-M (M=2) : aligned fast-qmv étendu à 2 lignes d'activation, **poids lu
-/// une seule fois** par mot (réutilisé pour les 2 lignes) → V_batch ≈ D.
-const QMM2_SRC: &str = r#"
-kernel void affine_qmm2_fast_aligned_u4_gs64_f32(
-    device const float* lhs [[buffer(0)]],
-    device const uint* packed [[buffer(1)]],
-    device const bfloat* scales [[buffer(2)]],
-    device const bfloat* biases [[buffer(3)]],
-    device float* out [[buffer(4)]],
-    constant uint4& dims [[buffer(5)]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]],
-    uint2 tile [[threadgroup_position_in_grid]]
-) {
-    const uint out_dim = dims.x;
-    const uint in_dim = dims.y;
-    const uint packed_cols = dims.z;
-    const uint groups = dims.w;
-    const uint rps = 4u;
-    const uint simdgroups = 2u;
-    const uint vpt = 16u;
-    const uint block_size = vpt * 32u;
-    const uint row_base = tile.y * (simdgroups * rps) + simd_gid * rps;
-    const uint row_bytes = packed_cols * 4u;
-    const device uchar* ws = ((const device uchar*)packed) + row_base * row_bytes + simd_lid * 8u;
-    const device bfloat* scale_base = scales + row_base * groups + simd_lid / 4u;
-    const device bfloat* bias_base = biases + row_base * groups + simd_lid / 4u;
-    const device float* x0 = lhs + simd_lid * vpt;
-    const device float* x1 = lhs + in_dim + simd_lid * vpt;
-    float r0[4] = {0,0,0,0};
-    float r1[4] = {0,0,0,0};
-    for (uint k = 0u; k < in_dim; k += block_size) {
-        float xt0[16]; float s0 = 0.0f;
-        float xt1[16]; float s1 = 0.0f;
-        for (uint i = 0u; i < vpt; i += 4u) {
-            float a0=x0[i],a1=x0[i+1u],a2=x0[i+2u],a3=x0[i+3u];
-            s0 += a0+a1+a2+a3; xt0[i]=a0; xt0[i+1u]=a1/16.0f; xt0[i+2u]=a2/256.0f; xt0[i+3u]=a3/4096.0f;
-            float c0=x1[i],c1=x1[i+1u],c2=x1[i+2u],c3=x1[i+3u];
-            s1 += c0+c1+c2+c3; xt1[i]=c0; xt1[i+1u]=c1/16.0f; xt1[i+2u]=c2/256.0f; xt1[i+3u]=c3/4096.0f;
-        }
-        for (uint row = 0u; row < rps; ++row) {
-            const device ushort* w16 = (const device ushort*)(ws + row * row_bytes);
-            const float scale = scale_base[row * groups];
-            const float bias = bias_base[row * groups];
-            float ac0=0.0f, ac1=0.0f;
-            for (uint i = 0u; i < 4u; ++i) {
-                const ushort w = w16[i];
-                ac0 += xt0[4u*i]*float(w&0x000fu); ac0 += xt0[4u*i+1u]*float(w&0x00f0u); ac0 += xt0[4u*i+2u]*float(w&0x0f00u); ac0 += xt0[4u*i+3u]*float(w&0xf000u);
-                ac1 += xt1[4u*i]*float(w&0x000fu); ac1 += xt1[4u*i+1u]*float(w&0x00f0u); ac1 += xt1[4u*i+2u]*float(w&0x0f00u); ac1 += xt1[4u*i+3u]*float(w&0xf000u);
-            }
-            r0[row] += scale*ac0 + s0*bias;
-            r1[row] += scale*ac1 + s1*bias;
-        }
-        ws += 256u; scale_base += 8u; bias_base += 8u; x0 += block_size; x1 += block_size;
-    }
-    for (uint row = 0u; row < rps; ++row) {
-        const float v0 = simd_sum(r0[row]);
-        const float v1 = simd_sum(r1[row]);
-        if (simd_lid == 0u) {
-            out[row_base + row] = v0;
-            out[out_dim + row_base + row] = v1;
-        }
-    }
-}
-"#;
-
 const WARMUP: usize = 8;
 const CBS: usize = 60;
 const REPS: usize = 48;
@@ -103,10 +37,9 @@ fn main() {
     let queue = device.new_command_queue();
     let opts = CompileOptions::new();
     opts.set_fast_math_enabled(true);
-    let src = format!("{KERNELS}\n{QMM2_SRC}");
     let lib = device
-        .new_library_with_source(&src, &opts)
-        .expect("compile kernels.metal + qmm2");
+        .new_library_with_source(KERNELS, &opts)
+        .expect("compile kernels.metal");
     let pso = |n: &str| {
         let f = lib.get_function(n, None).expect("get_function");
         device

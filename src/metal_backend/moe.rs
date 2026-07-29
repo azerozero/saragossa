@@ -892,7 +892,7 @@ impl MetalExecutor {
         if experts.is_empty() {
             return Err(InferError::Config("MoE sans expert".to_string()));
         }
-        let key = experts.as_ptr().addr();
+        let key = moe_weight_key(experts)?;
         {
             let stacks = self
                 .moe_stacks
@@ -976,4 +976,16 @@ impl MetalExecutor {
             groups,
         })
     }
+}
+
+fn moe_weight_key(experts: &[GatedMlp]) -> Result<MoeWeightKey> {
+    let mut weights = Vec::with_capacity(experts.len());
+    for expert in experts {
+        weights.push([
+            MoeProjection::Gate.affine_weight(expert)?.weight_id(),
+            MoeProjection::Up.affine_weight(expert)?.weight_id(),
+            MoeProjection::Down.affine_weight(expert)?.weight_id(),
+        ]);
+    }
+    Ok(MoeWeightKey { weights })
 }

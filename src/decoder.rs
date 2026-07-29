@@ -1121,6 +1121,7 @@ impl CausalDecoder {
 #[derive(Clone, Debug, Default)]
 struct DecoderRuntime {
     metal: Option<Arc<crate::MetalExecutor>>,
+    cpu_weights_released: bool,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1256,6 +1257,119 @@ struct FullAttention {
     sliding_window: Option<usize>,
 }
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl FullAttention {
+    fn materialize_metal_weight_buffers(&self, metal: &crate::MetalExecutor) -> Result<()> {
+        let v_proj = self.resident_v_proj();
+        let _ =
+            metal.resolve_linear_weight_buffers(self.q_proj.weight(), "cpu_release_full_q_proj")?;
+        let _ =
+            metal.resolve_linear_weight_buffers(self.k_proj.weight(), "cpu_release_full_k_proj")?;
+        let _ = metal.resolve_linear_weight_buffers(v_proj.weight(), "cpu_release_full_v_proj")?;
+        let _ =
+            metal.resolve_linear_weight_buffers(self.o_proj.weight(), "cpu_release_full_o_proj")?;
+        match metal.resolve_concat_linear_weight_buffers(
+            &[self.q_proj.weight(), self.k_proj.weight(), v_proj.weight()],
+            "cpu_release_full_qkv_proj",
+        ) {
+            Ok(_) | Err(InferError::Dimension(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+        self.q_proj.release_affine_cpu_data(released);
+        self.k_proj.release_affine_cpu_data(released);
+        if let Some(v_proj) = &mut self.v_proj {
+            v_proj.release_affine_cpu_data(released);
+        }
+        self.o_proj.release_affine_cpu_data(released);
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl DecoderLayer {
+    fn materialize_metal_weight_buffers(&self, metal: &crate::MetalExecutor) -> Result<()> {
+        match &self.attention {
+            AttentionBlock::Full(attention) => {
+                attention.materialize_metal_weight_buffers(metal)?;
+            }
+            AttentionBlock::Linear(attention) => {
+                let weights = attention.resident_weights();
+                for (weight, label) in [
+                    (weights.in_proj_qkv.weight(), "cpu_release_linear_qkv"),
+                    (weights.in_proj_z.weight(), "cpu_release_linear_z"),
+                    (weights.in_proj_b.weight(), "cpu_release_linear_b"),
+                    (weights.in_proj_a.weight(), "cpu_release_linear_a"),
+                    (weights.out_proj.weight(), "cpu_release_linear_out"),
+                ] {
+                    let _ = metal.resolve_linear_weight_buffers(weight, label)?;
+                }
+                let _ = metal.resolve_linear_attn_resident_dense_weights(weights)?;
+            }
+        }
+        if let Some(mlp) = &self.mlp {
+            materialize_feed_forward_weight_buffers(metal, mlp)?;
+        }
+        if let Some(parallel_moe) = &self.parallel_moe {
+            materialize_feed_forward_weight_buffers(metal, parallel_moe)?;
+        }
+        Ok(())
+    }
+
+    fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+        match &mut self.attention {
+            AttentionBlock::Full(attention) => attention.release_affine_cpu_data(released),
+            AttentionBlock::Linear(attention) => attention.release_affine_cpu_data(released),
+        }
+        if let Some(mlp) = &mut self.mlp {
+            mlp.release_affine_cpu_data(released);
+        }
+        if let Some(parallel_moe) = &mut self.parallel_moe {
+            parallel_moe.release_affine_cpu_data(released);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn materialize_feed_forward_weight_buffers(
+    metal: &crate::MetalExecutor,
+    feed_forward: &FeedForward,
+) -> Result<()> {
+    match feed_forward {
+        FeedForward::Dense(mlp) => {
+            let (gate_proj, up_proj, down_proj) = mlp.projections();
+            for (weight, label) in [
+                (gate_proj.weight(), "cpu_release_dense_gate"),
+                (up_proj.weight(), "cpu_release_dense_up"),
+                (down_proj.weight(), "cpu_release_dense_down"),
+            ] {
+                let _ = metal.resolve_linear_weight_buffers(weight, label)?;
+            }
+        }
+        FeedForward::Moe(mlp) => {
+            if let Some((router, experts, _, shared_expert, shared_gate)) = mlp.shared_metal_parts()
+            {
+                let _ = metal.resolve_moe_shared_weights(
+                    router,
+                    experts,
+                    shared_expert,
+                    shared_gate,
+                )?;
+            } else if let Some(parts) = mlp.gemma4_metal_parts() {
+                let _ = metal.resolve_moe_routed_weights(parts.router, parts.experts)?;
+            } else if let Some((router, experts, _)) = mlp.metal_parts() {
+                let _ = metal.resolve_moe_routed_weights(router, experts)?;
+            } else {
+                return Err(InferError::Config(
+                    "MoE impossible à matérialiser avant libération CPU".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn has_resident_linear_attention_layer(&self) -> bool {
@@ -1338,6 +1452,20 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si la plongée échoue.
     pub(in crate::decoder) fn embed_scaled(&self, token_ids: &[usize]) -> Result<Tensor> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if !self.embed_tokens.cpu_data_available() {
+            let metal = self.forward_runtime().metal_executor().ok_or_else(|| {
+                InferError::Config(
+                    "embedding CPU libéré sans executor Metal disponible".to_string(),
+                )
+            })?;
+            return metal.embed_weight_tokens(
+                &self.embed_tokens,
+                token_ids,
+                self.config.embed_scale.unwrap_or(1.0),
+                self.config.is_qwen && qwen_embed_bf16_enabled(),
+            );
+        }
         let hidden = embed_weight_tokens(&self.embed_tokens, token_ids)?;
         let hidden = match self.config.embed_scale {
             Some(scale) => hidden.map(|value| value * scale),
@@ -1622,6 +1750,112 @@ impl CausalDecoder {
     pub fn with_metal_executor(mut self, executor: crate::MetalExecutor) -> Self {
         self.runtime.metal = Some(Arc::new(executor));
         self
+    }
+
+    /// Libère les payloads CPU par couche puis chauffe le chemin résident Metal.
+    ///
+    /// La passe structurelle matérialise tous les buffers individuels et dérivés
+    /// d'une couche avant de libérer ses poids. Le warmup s'exécute ensuite depuis
+    /// les buffers résidents, sans faire coexister les deux copies du modèle.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si Metal est absent ou si le warmup échoue.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn warmup_and_release_cpu_weights(&mut self, prompt: &[usize]) -> Result<usize> {
+        if self.runtime.cpu_weights_released {
+            return Ok(0);
+        }
+        // La libération CPU n'est prouvée byte-identique que sur les modèles
+        // DENSES (27B : gates court + long verts). Sur MoE, le préfill batché
+        // résout des stacks experts/shared que le warmup court ne couvre pas ;
+        // droper leurs payloads casse le byte-id sur prompt long (mesuré). On
+        // restreint donc au dense ; l'extension MoE (couverture exacte du
+        // préfill batché avant le drop) est un follow-up documenté.
+        if self.config.num_experts.unwrap_or(0) > 0 {
+            return Ok(0);
+        }
+        if prompt.is_empty() {
+            return Err(InferError::Dimension(
+                "prompt vide pour libération des poids CPU".to_string(),
+            ));
+        }
+        let metal = self.runtime.metal.clone().ok_or_else(|| {
+            InferError::Config("libération des poids CPU sans runtime Metal".to_string())
+        })?;
+        metal.prepare_cpu_weight_release();
+        let cpu_embedding = self.embed_scaled(prompt)?;
+        let metal_embedding = metal.embed_weight_tokens(
+            &self.embed_tokens,
+            prompt,
+            self.config.embed_scale.unwrap_or(1.0),
+            self.config.is_qwen && qwen_embed_bf16_enabled(),
+        )?;
+        let release_embedding =
+            self.embed_tokens.metal_release_byte_exact() && cpu_embedding == metal_embedding;
+        if !release_embedding {
+            eprintln!(
+                "cpu_weights_release embedding conservé: gather Metal non byte-identique au CPU"
+            );
+        }
+
+        let mut released = Vec::new();
+        if release_embedding {
+            self.embed_tokens.release_affine_cpu_data(&mut released);
+        }
+        self.materialize_and_release_cpu_weight_buffers(&metal, &mut released)?;
+        self.runtime.cpu_weights_released = true;
+        let _ = self.generate_greedy(prompt, 2)?;
+
+        let bytes = released
+            .iter()
+            .map(|(_, bytes)| *bytes)
+            .fold(0usize, usize::saturating_add);
+        let unique_weights = released
+            .iter()
+            .map(|(weight_id, _)| *weight_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        eprintln!(
+            "cpu_weights_released mode=incremental bytes={bytes} payloads={} unique_weights={unique_weights}",
+            released.len()
+        );
+        Ok(bytes)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn materialize_and_release_cpu_weight_buffers(
+        &mut self,
+        metal: &crate::MetalExecutor,
+        released: &mut Vec<(u64, usize)>,
+    ) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.materialize_metal_weight_buffers(metal)?;
+            // Une couche dense n'est plus résolue depuis le CPU après cette passe :
+            // les buffers unitaires et les concats requis sont désormais retenus.
+            layer.release_affine_cpu_data(released);
+        }
+        let _ =
+            metal.resolve_linear_weight_buffers(self.lm_head.weight(), "cpu_release_lm_head")?;
+        self.lm_head.release_affine_cpu_data(released);
+        if let Some(mtp) = &mut self.mtp {
+            let _ = metal.resolve_linear_weight_buffers(mtp.fc.weight(), "cpu_release_mtp_fc")?;
+            mtp.layer
+                .attention
+                .materialize_metal_weight_buffers(metal)?;
+            materialize_feed_forward_weight_buffers(metal, &mtp.layer.mlp)?;
+            mtp.fc.release_affine_cpu_data(released);
+            mtp.layer.attention.release_affine_cpu_data(released);
+            mtp.layer.mlp.release_affine_cpu_data(released);
+        }
+        if let Some(draft_lm_head) = &mut self.mtp_draft_lm_head {
+            let _ = metal.resolve_linear_weight_buffers(
+                draft_lm_head.weight(),
+                "cpu_release_mtp_draft_lm_head",
+            )?;
+            draft_lm_head.release_affine_cpu_data(released);
+        }
+        Ok(())
     }
 
     /// Charge une tête MTP depuis un sidecar safetensors.

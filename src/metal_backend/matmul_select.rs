@@ -9,6 +9,8 @@ pub(super) enum AffineMatmulKernel {
     QmmNaFusedTiledU4Align64,
     FastQmvU4,
     FastQmvU4Align64,
+    FastQmvU2,
+    FastQmvU3,
     FastQmvU6,
     FastQmvOneU8,
     QmmNaFusedTiledU8,
@@ -31,6 +33,7 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> AffineMatmulKernel {
         if can_use_fast_affine_qmm2_buffers(batch, in_dim, out_dim, group_size, bits)
+            || can_use_fast_affine_qmm2_u3_buffers(batch, in_dim, out_dim, group_size, bits)
             || can_use_fast_affine_qmm2_u8_buffers(batch, in_dim, out_dim, group_size, bits)
         {
             AffineMatmulKernel::Qmm2
@@ -51,6 +54,10 @@ impl MetalExecutor {
             && in_dim % 512 == 0
         {
             AffineMatmulKernel::FastQmvU4
+        } else if can_use_fast_affine_qmv_u2_buffers(batch, in_dim, out_dim, group_size, bits) {
+            AffineMatmulKernel::FastQmvU2
+        } else if can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, group_size, bits) {
+            AffineMatmulKernel::FastQmvU3
         } else if can_use_fast_affine_qmv_u6_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::FastQmvU6
         } else if can_use_fast_affine_qmv_one_u8_buffers(batch, in_dim, out_dim, group_size, bits) {
@@ -87,6 +94,7 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> AffineMatmulKernel {
         if can_use_fast_affine_qmm2(batch, in_dim, weight)
+            || can_use_fast_affine_qmm2_u3(batch, in_dim, weight)
             || can_use_fast_affine_qmm2_u8(batch, in_dim, weight)
         {
             AffineMatmulKernel::Qmm2
@@ -102,6 +110,10 @@ impl MetalExecutor {
             || (prefer_fast_affine && can_use_fast_affine_qmv_shape(batch, in_dim, weight))
         {
             AffineMatmulKernel::FastQmvU4
+        } else if can_use_fast_affine_qmv_u2(batch, in_dim, weight) {
+            AffineMatmulKernel::FastQmvU2
+        } else if can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
+            AffineMatmulKernel::FastQmvU3
         } else if can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvU6
         } else if can_use_fast_affine_qmv_one_u8(batch, in_dim, weight) {

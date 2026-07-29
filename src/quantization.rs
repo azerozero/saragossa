@@ -2,13 +2,16 @@
 
 use crate::{InferError, Result, Tensor};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PARALLEL_QUANT_MATMUL_OUTPUT_THRESHOLD: usize = 1024;
 const PARALLEL_QUANT_MATMUL_INNER_THRESHOLD: usize = 128;
+static NEXT_WEIGHT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Poids affine packé en `u32`, conservé compact en mémoire.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AffineQuantizedTensor {
+    weight_id: u64,
     shape: Vec<usize>,
     packed_shape: Vec<usize>,
     packed: Vec<u32>,
@@ -41,6 +44,7 @@ impl AffineQuantizedTensor {
             bits,
         )?;
         Ok(Self {
+            weight_id: next_weight_id()?,
             shape: vec![params.rows, params.cols],
             packed_shape: packed_shape.to_vec(),
             packed,
@@ -49,6 +53,12 @@ impl AffineQuantizedTensor {
             group_size,
             bits,
         })
+    }
+
+    /// Renvoie l'identité stable du poids pour les caches Metal.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn weight_id(&self) -> u64 {
+        self.weight_id
     }
 
     /// Renvoie la forme dense logique `[rows, cols]`.
@@ -87,12 +97,64 @@ impl AffineQuantizedTensor {
         self.bits
     }
 
+    /// Libère les payloads CPU après leur copie dans les buffers Metal résidents.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn release_cpu_data(&mut self) -> usize {
+        let packed = std::mem::take(&mut self.packed)
+            .len()
+            .saturating_mul(std::mem::size_of::<u32>());
+        let scales = self
+            .scales
+            .release_data()
+            .saturating_mul(std::mem::size_of::<f32>());
+        let biases = self
+            .biases
+            .release_data()
+            .saturating_mul(std::mem::size_of::<f32>());
+        packed.saturating_add(scales).saturating_add(biases)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn cpu_data_available(&self) -> bool {
+        self.packed.len() == self.packed_len()
+            && self.scales.len() == self.scales_len()
+            && self.biases.len() == self.biases_len()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn metal_embedding_byte_exact(&self) -> bool {
+        self.bits > 0
+            && 32 % self.bits == 0
+            && self
+                .scales
+                .data()
+                .iter()
+                .chain(self.biases.data())
+                .all(|value| bf16_round(*value) == *value)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn packed_len(&self) -> usize {
+        self.packed_shape.iter().product()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn scales_len(&self) -> usize {
+        self.scales.shape().iter().product()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn biases_len(&self) -> usize {
+        self.biases.shape().iter().product()
+    }
+
     /// Multiplie `input` par la transposée du poids logique dense.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si les dimensions de `input` sont incompatibles.
     pub fn matmul_rhs_t(&self, input: &Tensor) -> Result<Tensor> {
+        self.ensure_cpu_data()?;
         let (batch, in_dim) = input.as_matrix()?;
         let [out_dim, weight_in_dim] = self.shape.as_slice() else {
             return Err(InferError::Dimension(format!(
@@ -131,6 +193,7 @@ impl AffineQuantizedTensor {
     ///
     /// Renvoie une erreur si la représentation compacte est incohérente.
     pub fn dequantize(&self) -> Result<Tensor> {
+        self.ensure_cpu_data()?;
         let [rows, cols] = self.shape.as_slice() else {
             return Err(InferError::Dimension(format!(
                 "poids quantifié attendu rang 2, reçu {:?}",
@@ -152,6 +215,7 @@ impl AffineQuantizedTensor {
     ///
     /// Renvoie une erreur si `row` est hors bornes.
     pub fn row(&self, row: usize) -> Result<Vec<f32>> {
+        self.ensure_cpu_data()?;
         let [rows, cols] = self.shape.as_slice() else {
             return Err(InferError::Dimension(format!(
                 "poids quantifié attendu rang 2, reçu {:?}",
@@ -168,6 +232,26 @@ impl AffineQuantizedTensor {
             out.push(self.value(row, col));
         }
         Ok(out)
+    }
+
+    fn ensure_cpu_data(&self) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if !self.cpu_data_available() {
+            return Err(InferError::Config(format!(
+                "payload CPU du poids quantifié {} déjà libéré",
+                self.weight_id
+            )));
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        if self.packed.len() != self.packed_shape.iter().product::<usize>()
+            || self.scales.len() != self.scales.shape().iter().product::<usize>()
+            || self.biases.len() != self.biases.shape().iter().product::<usize>()
+        {
+            return Err(InferError::Config(
+                "payload CPU du poids quantifié incomplet".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn value(&self, row: usize, col: usize) -> f32 {
@@ -277,6 +361,31 @@ impl AffineQuantizedTensor {
     }
 }
 
+impl PartialEq for AffineQuantizedTensor {
+    fn eq(&self, other: &Self) -> bool {
+        self.shape == other.shape
+            && self.packed_shape == other.packed_shape
+            && self.packed == other.packed
+            && self.scales == other.scales
+            && self.biases == other.biases
+            && self.group_size == other.group_size
+            && self.bits == other.bits
+    }
+}
+
+fn next_weight_id() -> Result<u64> {
+    NEXT_WEIGHT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| InferError::Config("espace des identités de poids épuisé".to_string()))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn bf16_round(value: f32) -> f32 {
+    let bits = value.to_bits();
+    let rounding = 0x7fff_u32 + ((bits >> 16) & 1);
+    f32::from_bits(bits.wrapping_add(rounding) & 0xffff_0000)
+}
+
 struct AffineParams {
     rows: usize,
     cols: usize,
@@ -383,6 +492,24 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn stable_id_survives_clone_and_cpu_payload_release() {
+        let scales = Tensor::from_vec(vec![1, 1], vec![0.5]).expect("invariant: scales valides");
+        let biases = Tensor::from_vec(vec![1, 1], vec![0.0]).expect("invariant: biases valides");
+        let mut weight =
+            AffineQuantizedTensor::new(&[1, 1], vec![0x7654_3210], scales, biases, 8, 4)
+                .expect("invariant: poids affine valide");
+        let clone = weight.clone();
+
+        assert_eq!(weight.weight_id(), clone.weight_id());
+        assert_eq!(weight.release_cpu_data(), 12);
+        assert_eq!(weight.packed_len(), 1);
+        assert_eq!(weight.scales_len(), 1);
+        assert_eq!(weight.biases_len(), 1);
+        assert!(weight.row(0).is_err());
+    }
+
     #[test]
     fn dequantizes_affine_u8_packed_rows() {
         let packed = [
@@ -417,6 +544,25 @@ mod tests {
     }
 
     #[test]
+    fn dequantizes_mlx_affine_u2_byte_exact_row() {
+        // MLX écrit seize codes u2 LSB-first dans un u32 :
+        // [0,1,2,3] répété quatre fois devient 0xe4e4_e4e4.
+        let packed = [0xe4e4_e4e4; 4];
+        let scales =
+            Tensor::from_vec(vec![1, 1], vec![0.5]).expect("invariant: scale u2 MLX valide");
+        let biases =
+            Tensor::from_vec(vec![1, 1], vec![-1.0]).expect("invariant: bias u2 MLX valide");
+
+        let dense = dequantize_affine_u32(&[1, 4], &packed, &scales, &biases, 64, 2)
+            .expect("invariant: déquantification affine u2 MLX valide");
+        let expected = (0..64)
+            .map(|index| ((index % 4) as f32) * 0.5 - 1.0)
+            .collect::<Vec<_>>();
+
+        assert_eq!(dense.data(), expected);
+    }
+
+    #[test]
     fn dequantizes_affine_u6_bitstream_row() {
         let values = [1, 2, 3, 4, 5, 6, 7, 63, 8, 9, 10, 11, 12, 13, 14, 15];
         let packed = pack_bitstream(&values, 6);
@@ -432,6 +578,32 @@ mod tests {
             &dense.data()[..values.len()],
             &values.iter().map(|value| *value as f32).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn dequantizes_mlx_affine_u3_byte_exact_row() {
+        // MLX écrit huit codes u3 LSB-first dans trois octets consécutifs :
+        // [0,1,2,3,4,5,6,7] devient [0x88, 0xc6, 0xfa].
+        let packed = [
+            0x88fa_c688,
+            0xc688_fac6,
+            0xfac6_88fa,
+            0x88fa_c688,
+            0xc688_fac6,
+            0xfac6_88fa,
+        ];
+        let scales =
+            Tensor::from_vec(vec![1, 1], vec![0.5]).expect("invariant: scale u3 MLX valide");
+        let biases =
+            Tensor::from_vec(vec![1, 1], vec![-1.0]).expect("invariant: bias u3 MLX valide");
+
+        let dense = dequantize_affine_u32(&[1, 6], &packed, &scales, &biases, 64, 3)
+            .expect("invariant: déquantification affine u3 MLX valide");
+        let expected = (0..64)
+            .map(|index| ((index % 8) as f32) * 0.5 - 1.0)
+            .collect::<Vec<_>>();
+
+        assert_eq!(dense.data(), expected);
     }
 
     #[test]
