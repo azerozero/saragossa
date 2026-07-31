@@ -375,6 +375,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "linear_attn_rms_gate_batch_dv128_f32")?;
         let affine_gather_matmul_rhs_t_u32_f32 =
             pipeline(&library, &device, "affine_gather_matmul_rhs_t_u32_f32")?;
+        let affine_gather_qmv_fast_u3_gs64_f32 =
+            pipeline(&library, &device, "affine_gather_qmv_fast_u3_gs64_f32")?;
         let affine_gather_qmv_fast_u4_gs64_f32 =
             pipeline(&library, &device, "affine_gather_qmv_fast_u4_gs64_f32")?;
         let affine_gather_qmv_fast_u8_gs64_f32 =
@@ -401,8 +403,15 @@ impl MetalExecutor {
             &device,
             "affine_gather_qmv_fast_u8_gs128_tg256_f32",
         )?;
+        let affine_gather_qmv_tail_u3_gs64_f32 =
+            pipeline(&library, &device, "affine_gather_qmv_tail_u3_gs64_f32")?;
         let affine_gather_qmv_tail_u4_gs64_f32 =
             pipeline(&library, &device, "affine_gather_qmv_tail_u4_gs64_f32")?;
+        let affine_gather_gate_up_swiglu_fast_u3_gs64_f32 = pipeline(
+            &library,
+            &device,
+            "affine_gather_gate_up_swiglu_fast_u3_gs64_f32",
+        )?;
         let affine_gather_gate_up_swiglu_fast_u4_gs64_f32 = pipeline(
             &library,
             &device,
@@ -614,6 +623,7 @@ impl MetalExecutor {
             linear_attn_rms_gate_dv128_f32,
             linear_attn_rms_gate_batch_dv128_f32,
             affine_gather_matmul_rhs_t_u32_f32,
+            affine_gather_qmv_fast_u3_gs64_f32,
             affine_gather_qmv_fast_u4_gs64_f32,
             affine_gather_qmv_fast_u8_gs64_f32,
             affine_gather_qmv_fast_u8_gs128_f32,
@@ -621,7 +631,9 @@ impl MetalExecutor {
             affine_gather_qmv_fast_u8_gs128_tg128_f32,
             affine_gather_qmv_fast_u8_gs64_tg256_f32,
             affine_gather_qmv_fast_u8_gs128_tg256_f32,
+            affine_gather_qmv_tail_u3_gs64_f32,
             affine_gather_qmv_tail_u4_gs64_f32,
+            affine_gather_gate_up_swiglu_fast_u3_gs64_f32,
             affine_gather_gate_up_swiglu_fast_u4_gs64_f32,
             affine_gather_gate_up_swiglu_fast_u8_gs64_f32,
             affine_gather_gate_up_swiglu_fast_u8_gs128_f32,

@@ -228,13 +228,14 @@ pub(super) fn tensor_from_entry(
     entry_ref: &TensorEntryRef,
     headers: &[ShardHeader],
     entries: &HashMap<String, TensorEntryRef>,
+    context: &DecoderLoadContext<'_>,
 ) -> Result<DecoderTensor> {
     let entry = &entry_ref.entry;
     let shard = headers
         .get(entry_ref.shard_index)
         .ok_or_else(|| InferError::Shape("index shard invalide".to_string()))?;
     if entry.dtype == Dtype::U32 && spec.source.ends_with(".weight") {
-        return quantized_tensor_from_entry(config, spec, entry, shard, headers, entries);
+        return quantized_tensor_from_entry(config, spec, entry, shard, headers, entries, context);
     }
     let bytes = read_entry_bytes(shard, entry)?;
     let mut tensor = tensor_from_safetensor_parts(&spec.source, entry.dtype, &entry.shape, &bytes)?;
@@ -251,6 +252,7 @@ pub(super) fn quantized_tensor_from_entry(
     shard: &ShardHeader,
     headers: &[ShardHeader],
     entries: &HashMap<String, TensorEntryRef>,
+    context: &DecoderLoadContext<'_>,
 ) -> Result<DecoderTensor> {
     let quant = config.quantization.as_ref().ok_or_else(|| {
         InferError::Config(format!(
@@ -261,6 +263,51 @@ pub(super) fn quantized_tensor_from_entry(
     let (group_size, bits) = quant_params_for(quant, &spec.source)?;
     let scales_key = replace_weight_suffix(&spec.source, ".scales")?;
     let biases_key = replace_weight_suffix(&spec.source, ".biases")?;
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if crate::runtime_flags::single_copy_weights_enabled() {
+        if let Some(metal) = context.metal {
+            let scales_entry = named_entry(headers, entries, &scales_key)?;
+            let biases_entry = named_entry(headers, entries, &biases_key)?;
+            if scales_entry.entry.dtype == Dtype::BF16 && biases_entry.entry.dtype == Dtype::BF16 {
+                let scales = bf16_entry_to_metal(headers, scales_entry, &scales_key, metal)?;
+                let biases = bf16_entry_to_metal(headers, biases_entry, &biases_key, metal)?;
+                let bytes = read_entry_bytes(shard, entry)?;
+                let packed = bytes_to_u32(&bytes, &spec.source)?;
+                let packed_len = packed.len();
+                let packed_buffer = metal.weight_buffer_from_u32(&packed)?;
+                if is_moe_expert_weight(&spec.target) && entry.shape.len() == 3 {
+                    return quantized_expert_weights_from_metal_views(
+                        &entry.shape,
+                        packed_buffer,
+                        packed_len,
+                        scales,
+                        biases,
+                        group_size,
+                        bits,
+                    );
+                }
+                let weight = AffineQuantizedTensor::new_metal_shared_bf16(
+                    &entry.shape,
+                    packed_buffer,
+                    0,
+                    packed_len,
+                    &scales.shape,
+                    scales.buffer,
+                    0,
+                    scales.len,
+                    &biases.shape,
+                    biases.buffer,
+                    0,
+                    biases.len,
+                    group_size,
+                    bits,
+                )?;
+                return Ok(DecoderTensor::LinearWeight(LinearWeight::AffineQuantized(
+                    weight,
+                )));
+            }
+        }
+    }
     let scales = tensor_from_named_entry(headers, entries, &scales_key)?;
     let biases = tensor_from_named_entry(headers, entries, &biases_key)?;
     let bytes = read_entry_bytes(shard, entry)?;
@@ -273,7 +320,28 @@ pub(super) fn quantized_tensor_from_entry(
             biases,
             group_size,
             bits,
+            context,
         );
+    }
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if crate::runtime_flags::single_copy_weights_enabled() {
+        if let Some(metal) = context.metal {
+            let len_u32 = packed.len();
+            let buffer = metal.weight_buffer_from_u32(&packed)?;
+            let weight = AffineQuantizedTensor::new_metal_shared(
+                &entry.shape,
+                buffer,
+                0,
+                len_u32,
+                scales,
+                biases,
+                group_size,
+                bits,
+            )?;
+            return Ok(DecoderTensor::LinearWeight(LinearWeight::AffineQuantized(
+                weight,
+            )));
+        }
     }
     let weight =
         AffineQuantizedTensor::new(&entry.shape, packed, scales, biases, group_size, bits)?;
@@ -282,9 +350,156 @@ pub(super) fn quantized_tensor_from_entry(
     )))
 }
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+struct MetalBf16Entry {
+    buffer: metal::Buffer,
+    shape: Vec<usize>,
+    len: usize,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn named_entry<'a>(
+    headers: &[ShardHeader],
+    entries: &'a HashMap<String, TensorEntryRef>,
+    name: &str,
+) -> Result<&'a TensorEntryRef> {
+    let entry_ref = entries
+        .get(name)
+        .ok_or_else(|| InferError::MissingWeight(name.to_string()))?;
+    if headers.get(entry_ref.shard_index).is_none() {
+        return Err(InferError::Shape("index shard invalide".to_string()));
+    }
+    Ok(entry_ref)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn bf16_entry_to_metal(
+    headers: &[ShardHeader],
+    entry_ref: &TensorEntryRef,
+    name: &str,
+    metal: &crate::MetalExecutor,
+) -> Result<MetalBf16Entry> {
+    let shard = headers
+        .get(entry_ref.shard_index)
+        .ok_or_else(|| InferError::Shape("index shard invalide".to_string()))?;
+    let entry = &entry_ref.entry;
+    if entry.dtype != Dtype::BF16 {
+        return Err(InferError::UnsupportedDtype {
+            name: name.to_string(),
+            dtype: entry.dtype,
+        });
+    }
+    let len = element_count(&entry.shape, name)?;
+    let expected_bytes = len
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| InferError::Shape(format!("payload bf16 trop grand pour {name}")))?;
+    let payload_bytes = entry.data_offsets[1]
+        .checked_sub(entry.data_offsets[0])
+        .ok_or_else(|| InferError::Shape(format!("offsets bf16 inversés pour {name}")))?;
+    if payload_bytes != expected_bytes {
+        return Err(InferError::Shape(format!(
+            "tensor {name} BF16 shape={:?} attend {expected_bytes} octets, reçu {}",
+            entry.shape, payload_bytes
+        )));
+    }
+    let file_offset = shard
+        .data_start
+        .checked_add(entry.data_offsets[0] as u64)
+        .ok_or_else(|| InferError::Shape(format!("offset bf16 trop grand pour {name}")))?;
+    Ok(MetalBf16Entry {
+        buffer: metal.weight_buffer_from_bf16_file(&shard.path, file_offset, expected_bytes)?,
+        shape: entry.shape.clone(),
+        len,
+    })
+}
+
 fn is_moe_expert_weight(target: &str) -> bool {
     (target.contains(".mlp.switch_mlp.") || target.contains(".experts.switch_glu."))
         && target.ends_with(".weight")
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn quantized_expert_weights_from_metal_views(
+    packed_shape: &[usize],
+    packed_buffer: metal::Buffer,
+    packed_len: usize,
+    scales: MetalBf16Entry,
+    biases: MetalBf16Entry,
+    group_size: usize,
+    bits: usize,
+) -> Result<DecoderTensor> {
+    let [experts, rows, packed_cols] = packed_shape else {
+        return Err(InferError::Dimension(format!(
+            "poids expert quantifié attendu rang 3, reçu {packed_shape:?}"
+        )));
+    };
+    if group_size == 0 || bits == 0 {
+        return Err(InferError::Config(format!(
+            "quantification expert invalide: group_size={group_size}, bits={bits}"
+        )));
+    }
+    let cols = packed_cols
+        .checked_mul(32)
+        .and_then(|value| value.checked_div(bits))
+        .ok_or_else(|| InferError::Shape("poids expert quantifié trop large".to_string()))?;
+    if cols % group_size != 0 {
+        return Err(InferError::Shape(format!(
+            "expert cols={cols} non divisible par group_size={group_size}"
+        )));
+    }
+    let groups = cols / group_size;
+    let expected_affine_shape = [*experts, *rows, groups];
+    if scales.shape != expected_affine_shape || biases.shape != expected_affine_shape {
+        return Err(InferError::Dimension(format!(
+            "scales/biases experts attendus {expected_affine_shape:?}, reçu scales={:?}, biases={:?}",
+            scales.shape, biases.shape
+        )));
+    }
+    let packed_stride = rows
+        .checked_mul(*packed_cols)
+        .ok_or_else(|| InferError::Shape("stride expert packed trop grand".to_string()))?;
+    let affine_stride = rows
+        .checked_mul(groups)
+        .ok_or_else(|| InferError::Shape("stride expert affine trop grand".to_string()))?;
+    let expected_packed_len = experts
+        .checked_mul(packed_stride)
+        .ok_or_else(|| InferError::Shape("stack packed expert trop grand".to_string()))?;
+    if packed_len != expected_packed_len {
+        return Err(InferError::Shape(format!(
+            "stack packed expert attend {expected_packed_len} u32, reçu {packed_len}"
+        )));
+    }
+    let affine_shape = [*rows, groups];
+    let mut weights = Vec::with_capacity(*experts);
+    for expert in 0..*experts {
+        let packed_offset = expert
+            .checked_mul(packed_stride)
+            .ok_or_else(|| InferError::Shape("offset expert packed trop grand".to_string()))?;
+        let affine_offset = expert
+            .checked_mul(affine_stride)
+            .ok_or_else(|| InferError::Shape("offset expert affine trop grand".to_string()))?;
+        let weight = AffineQuantizedTensor::new_metal_shared_bf16(
+            &[*rows, *packed_cols],
+            packed_buffer.clone(),
+            packed_offset,
+            packed_stride,
+            &affine_shape,
+            scales.buffer.clone(),
+            affine_offset,
+            affine_stride,
+            &affine_shape,
+            biases.buffer.clone(),
+            affine_offset,
+            affine_stride,
+            group_size,
+            bits,
+        )?;
+        weights.push(LinearWeight::AffineQuantized(weight));
+    }
+    Ok(DecoderTensor::ExpertLinearWeights {
+        shape: vec![*experts, *rows, cols],
+        weights,
+    })
 }
 
 fn quantized_expert_weights_from_parts(
@@ -294,6 +509,7 @@ fn quantized_expert_weights_from_parts(
     biases: Tensor,
     group_size: usize,
     bits: usize,
+    context: &DecoderLoadContext<'_>,
 ) -> Result<DecoderTensor> {
     let [experts, rows, packed_cols] = packed_shape else {
         return Err(InferError::Dimension(format!(
@@ -335,6 +551,15 @@ fn quantized_expert_weights_from_parts(
     let affine_stride = rows
         .checked_mul(groups)
         .ok_or_else(|| InferError::Shape("stride expert affine trop grand".to_string()))?;
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let shared_buffer = if crate::runtime_flags::single_copy_weights_enabled() {
+        context
+            .metal
+            .map(|metal| metal.weight_buffer_from_u32(&packed))
+            .transpose()?
+    } else {
+        None
+    };
     let mut weights = Vec::with_capacity(*experts);
     for expert in 0..*experts {
         let packed_start = expert
@@ -343,10 +568,10 @@ fn quantized_expert_weights_from_parts(
         let affine_start = expert
             .checked_mul(affine_stride)
             .ok_or_else(|| InferError::Shape("offset expert affine trop grand".to_string()))?;
+        let packed_range = packed_start..packed_start + packed_stride;
         let packed_slice = packed
-            .get(packed_start..packed_start + packed_stride)
-            .ok_or_else(|| InferError::Shape(format!("slice packed expert {expert} invalide")))?
-            .to_vec();
+            .get(packed_range.clone())
+            .ok_or_else(|| InferError::Shape(format!("slice packed expert {expert} invalide")))?;
         let scales_slice = scales
             .data()
             .get(affine_start..affine_start + affine_stride)
@@ -361,9 +586,31 @@ fn quantized_expert_weights_from_parts(
             .map_err(|err| InferError::Shape(format!("scales expert {expert} invalides: {err}")))?;
         let biases = Tensor::from_vec(vec![*rows, groups], biases_slice)
             .map_err(|err| InferError::Shape(format!("biases expert {expert} invalides: {err}")))?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let weight = match &shared_buffer {
+            Some(buffer) => AffineQuantizedTensor::new_metal_shared(
+                &[*rows, *packed_cols],
+                buffer.clone(),
+                packed_start,
+                packed_stride,
+                scales,
+                biases,
+                group_size,
+                bits,
+            )?,
+            None => AffineQuantizedTensor::new(
+                &[*rows, *packed_cols],
+                packed_slice.to_vec(),
+                scales,
+                biases,
+                group_size,
+                bits,
+            )?,
+        };
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let weight = AffineQuantizedTensor::new(
             &[*rows, *packed_cols],
-            packed_slice,
+            packed_slice.to_vec(),
             scales,
             biases,
             group_size,

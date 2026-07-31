@@ -60,6 +60,35 @@ impl MoeProjection {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MoeStackTraceContext {
+    phase: &'static str,
+    layer_index: Option<usize>,
+}
+
+impl MoeStackTraceContext {
+    pub(super) const fn runtime() -> Self {
+        Self {
+            phase: "runtime",
+            layer_index: None,
+        }
+    }
+
+    pub(super) const fn cpu_release(layer_index: Option<usize>) -> Self {
+        Self {
+            phase: "cpu_release",
+            layer_index,
+        }
+    }
+
+    pub(super) const fn prefill(layer_index: usize) -> Self {
+        Self {
+            phase: "prefill",
+            layer_index: Some(layer_index),
+        }
+    }
+}
+
 impl MetalExecutor {
     /// Exécute les experts MoE sélectionnés en une seule commande Metal.
     ///
@@ -889,6 +918,14 @@ impl MetalExecutor {
     }
 
     pub(super) fn stacked_moe_buffers(&self, experts: &[GatedMlp]) -> Result<StackedMoeBuffers> {
+        self.stacked_moe_buffers_with_context(experts, MoeStackTraceContext::runtime())
+    }
+
+    pub(super) fn stacked_moe_buffers_with_context(
+        &self,
+        experts: &[GatedMlp],
+        trace_context: MoeStackTraceContext,
+    ) -> Result<StackedMoeBuffers> {
         if experts.is_empty() {
             return Err(InferError::Config("MoE sans expert".to_string()));
         }
@@ -899,6 +936,7 @@ impl MetalExecutor {
                 .lock()
                 .map_err(|_| InferError::Metal("cache MoE Metal empoisonné".to_string()))?;
             if let Some(buffers) = stacks.get(&key) {
+                trace_moe_stack_resolution(trace_context, true, &key, buffers);
                 return Ok(buffers.clone());
             }
         }
@@ -911,7 +949,8 @@ impl MetalExecutor {
             .moe_stacks
             .lock()
             .map_err(|_| InferError::Metal("cache MoE Metal empoisonné".to_string()))?;
-        stacks.insert(key, buffers.clone());
+        stacks.insert(key.clone(), buffers.clone());
+        trace_moe_stack_resolution(trace_context, false, &key, &buffers);
         Ok(buffers)
     }
 
@@ -942,31 +981,52 @@ impl MetalExecutor {
             .checked_div(first.group_size())
             .ok_or_else(|| InferError::Metal("group_size quantifié nul".to_string()))?;
         let expected_affine_shape = [*out_dim, groups];
-        let mut packed = Vec::with_capacity(experts.len() * first.packed_data().len());
-        let mut scales = Vec::with_capacity(experts.len() * first.scales().len());
-        let mut biases = Vec::with_capacity(experts.len() * first.biases().len());
+        let mut weights = Vec::with_capacity(experts.len());
         for (idx, expert) in experts.iter().enumerate() {
             let weight = projection.affine_weight(expert)?;
             if weight.shape() != [*out_dim, *in_dim]
                 || weight.packed_shape() != [*packed_rows, *packed_cols]
                 || weight.group_size() != first.group_size()
                 || weight.bits() != first.bits()
-                || weight.scales().shape() != expected_affine_shape
-                || weight.biases().shape() != expected_affine_shape
+                || weight.scales_shape() != expected_affine_shape
+                || weight.biases_shape() != expected_affine_shape
             {
                 return Err(InferError::Dimension(format!(
                     "expert MoE {idx} {:?} incompatible avec le premier expert",
                     projection
                 )));
             }
-            packed.extend_from_slice(weight.packed_data());
-            scales.extend_from_slice(weight.scales().data());
-            biases.extend_from_slice(weight.biases().data());
+            weights.push(weight);
         }
+        let direct = contiguous_metal_expert_stacks(&weights)?;
+        let (packed, packed_offset, scales, scales_offset, biases, biases_offset) = match direct {
+            Some(direct) => direct,
+            None => {
+                let mut packed = Vec::with_capacity(experts.len() * first.packed_data().len());
+                let mut scales = Vec::with_capacity(experts.len() * first.scales_len());
+                let mut biases = Vec::with_capacity(experts.len() * first.biases_len());
+                for weight in &weights {
+                    packed.extend_from_slice(weight.packed_data());
+                    scales.extend_from_slice(weight.scales_f32().as_ref());
+                    biases.extend_from_slice(weight.biases_f32().as_ref());
+                }
+                (
+                    self.buffer_from_u32(&packed, projection.packed_label())?,
+                    0,
+                    self.buffer_from_f32_as_bf16(&scales, projection.scales_label())?,
+                    0,
+                    self.buffer_from_f32_as_bf16(&biases, projection.biases_label())?,
+                    0,
+                )
+            }
+        };
         Ok(StackedAffineBuffers {
-            packed: self.buffer_from_u32(&packed, projection.packed_label())?,
-            scales: self.buffer_from_f32_as_bf16(&scales, projection.scales_label())?,
-            biases: self.buffer_from_f32_as_bf16(&biases, projection.biases_label())?,
+            packed,
+            packed_offset,
+            scales,
+            scales_offset,
+            biases,
+            biases_offset,
             experts: experts.len(),
             out_dim: *out_dim,
             in_dim: *in_dim,
@@ -976,6 +1036,85 @@ impl MetalExecutor {
             groups,
         })
     }
+}
+
+type DirectExpertStacks = (
+    metal::Buffer,
+    NSUInteger,
+    metal::Buffer,
+    NSUInteger,
+    metal::Buffer,
+    NSUInteger,
+);
+
+fn contiguous_metal_expert_stacks(
+    weights: &[&AffineQuantizedTensor],
+) -> Result<Option<DirectExpertStacks>> {
+    let Some(first) = weights.first() else {
+        return Ok(None);
+    };
+    let Some((first_buffer, first_offset)) = first.packed_metal_view() else {
+        return Ok(None);
+    };
+    let Some((first_scales_buffer, first_scales_offset)) = first.scales_metal_view() else {
+        return Ok(None);
+    };
+    let Some((first_biases_buffer, first_biases_offset)) = first.biases_metal_view() else {
+        return Ok(None);
+    };
+    let packed_stride_bytes = first
+        .packed_data()
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| InferError::Shape("stride stack MoE trop grand".to_string()))?;
+    let scales_stride_bytes = first
+        .scales_len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| InferError::Shape("stride scales MoE trop grand".to_string()))?;
+    let biases_stride_bytes = first
+        .biases_len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| InferError::Shape("stride biases MoE trop grand".to_string()))?;
+    for (index, weight) in weights.iter().enumerate() {
+        let Some((buffer, offset)) = weight.packed_metal_view() else {
+            return Ok(None);
+        };
+        let Some((scales_buffer, scales_offset)) = weight.scales_metal_view() else {
+            return Ok(None);
+        };
+        let Some((biases_buffer, biases_offset)) = weight.biases_metal_view() else {
+            return Ok(None);
+        };
+        let expected_packed_offset = index
+            .checked_mul(packed_stride_bytes)
+            .and_then(|value| first_offset.checked_add(value))
+            .ok_or_else(|| InferError::Shape("offset stack MoE trop grand".to_string()))?;
+        let expected_scales_offset = index
+            .checked_mul(scales_stride_bytes)
+            .and_then(|value| first_scales_offset.checked_add(value))
+            .ok_or_else(|| InferError::Shape("offset scales MoE trop grand".to_string()))?;
+        let expected_biases_offset = index
+            .checked_mul(biases_stride_bytes)
+            .and_then(|value| first_biases_offset.checked_add(value))
+            .ok_or_else(|| InferError::Shape("offset biases MoE trop grand".to_string()))?;
+        if buffer.contents() != first_buffer.contents()
+            || offset != expected_packed_offset
+            || scales_buffer.contents() != first_scales_buffer.contents()
+            || scales_offset != expected_scales_offset
+            || biases_buffer.contents() != first_biases_buffer.contents()
+            || biases_offset != expected_biases_offset
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some((
+        first_buffer.clone(),
+        checked_nsuint(first_offset, "offset stack MoE")?,
+        first_scales_buffer.clone(),
+        checked_nsuint(first_scales_offset, "offset scales stack MoE")?,
+        first_biases_buffer.clone(),
+        checked_nsuint(first_biases_offset, "offset biases stack MoE")?,
+    )))
 }
 
 fn moe_weight_key(experts: &[GatedMlp]) -> Result<MoeWeightKey> {
@@ -988,4 +1127,98 @@ fn moe_weight_key(experts: &[GatedMlp]) -> Result<MoeWeightKey> {
         ]);
     }
     Ok(MoeWeightKey { weights })
+}
+
+fn trace_moe_stack_resolution(
+    context: MoeStackTraceContext,
+    cache_hit: bool,
+    key: &MoeWeightKey,
+    buffers: &StackedMoeBuffers,
+) {
+    if !crate::runtime_flags::moe_drop_trace_enabled() {
+        return;
+    }
+    let layer = context
+        .layer_index
+        .map_or_else(|| "na".to_string(), |index| index.to_string());
+    let cache = if cache_hit { "hit" } else { "miss" };
+    eprintln!(
+        "moe_drop_trace phase={} layer={layer} cache={cache} expert_ids=0..{} \
+         weight_ids={:?} \
+         gate_packed_ptr={:p} gate_packed_bytes={} \
+         gate_scales_ptr={:p} gate_scales_bytes={} \
+         gate_biases_ptr={:p} gate_biases_bytes={} \
+         up_packed_ptr={:p} up_packed_bytes={} \
+         up_scales_ptr={:p} up_scales_bytes={} \
+         up_biases_ptr={:p} up_biases_bytes={} \
+         down_packed_ptr={:p} down_packed_bytes={} \
+         down_scales_ptr={:p} down_scales_bytes={} \
+         down_biases_ptr={:p} down_biases_bytes={}",
+        context.phase,
+        key.weights.len(),
+        key.weights,
+        buffers.gate.packed.as_ptr(),
+        buffers.gate.packed.length(),
+        buffers.gate.scales.as_ptr(),
+        buffers.gate.scales.length(),
+        buffers.gate.biases.as_ptr(),
+        buffers.gate.biases.length(),
+        buffers.up.packed.as_ptr(),
+        buffers.up.packed.length(),
+        buffers.up.scales.as_ptr(),
+        buffers.up.scales.length(),
+        buffers.up.biases.as_ptr(),
+        buffers.up.biases.length(),
+        buffers.down.packed.as_ptr(),
+        buffers.down.packed.length(),
+        buffers.down.scales.as_ptr(),
+        buffers.down.scales.length(),
+        buffers.down.biases.as_ptr(),
+        buffers.down.biases.length(),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_affine(marker: u32) -> Result<AffineQuantizedTensor> {
+        AffineQuantizedTensor::new(
+            &[1, 1],
+            vec![marker],
+            Tensor::from_vec(vec![1, 1], vec![0.5])?,
+            Tensor::from_vec(vec![1, 1], vec![0.0])?,
+            8,
+            4,
+        )
+    }
+
+    fn test_expert(marker: u32) -> Result<GatedMlp> {
+        let linear = |offset| {
+            Linear::from_weight(
+                LinearWeight::AffineQuantized(test_affine(marker + offset)?),
+                None,
+            )
+        };
+        Ok(GatedMlp::new(linear(0)?, linear(1)?, linear(2)?))
+    }
+
+    #[test]
+    fn moe_weight_key_survives_cpu_drop_and_preserves_expert_order() -> Result<()> {
+        let mut experts = vec![test_expert(10)?, test_expert(20)?];
+        let key_before_drop = moe_weight_key(&experts)?;
+        let mut reversed = experts.clone();
+        reversed.reverse();
+        let reversed_key = moe_weight_key(&reversed)?;
+        assert_ne!(key_before_drop, reversed_key);
+
+        let mut released = Vec::new();
+        for expert in &mut experts {
+            expert.release_affine_cpu_data(&mut released);
+        }
+
+        assert_eq!(key_before_drop, moe_weight_key(&experts)?);
+        assert_eq!(released.len(), 6);
+        Ok(())
+    }
 }

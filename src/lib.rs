@@ -92,6 +92,10 @@ pub use qwen_loader::{
     verify_decoder_contract_from_shards, verify_qwen_decoder_contract,
     verify_qwen_decoder_contract_from_shards, DecoderContract, QwenDecoderContract,
 };
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub use qwen_loader::{
+    load_causal_decoder_for_metal, load_causal_decoder_for_metal_with_memory_guard,
+};
 pub use runtime::ForwardRuntime;
 pub use runtime_flags::{decode_max_tokens_per_s, set_decode_max_tokens_per_s};
 pub use runtime_preset::{

@@ -14,6 +14,8 @@ mod cache;
 mod embeddings;
 pub(crate) mod error;
 mod http;
+mod model_selection;
+mod mtp;
 mod protocol;
 mod state;
 pub(crate) mod streaming;
@@ -35,7 +37,9 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         println!("{}", args::help_text());
         return Ok(());
     }
-    let args = ServeArgs::parse(raw_args).map_err(boxed_error)?;
+    let mut args = ServeArgs::parse(raw_args).map_err(boxed_error)?;
+    model_selection::select_if_missing(&mut args).map_err(boxed_error)?;
+    model_selection::resolve_models(&mut args).map_err(boxed_error)?;
     saragossa::force_resident_full_linear_decode();
     let mut state = state::ServeState::new(&args);
     if args.preload {

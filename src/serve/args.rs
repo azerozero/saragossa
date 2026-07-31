@@ -1,17 +1,15 @@
 //! Parsing des options de `saragossa serve`.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::error::{ServeError, ServeResult};
-use crate::RuntimeKind;
+use crate::{hf_resolve, RuntimeKind};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8081;
 const DEFAULT_SOCKET: &str = "/tmp/saragossa-serve.sock";
-const DEFAULT_27B_REL: &str = "models/Qwen3.6-27B-8bit";
-const DEFAULT_35B_REL: &str = "models/Qwen3.6-35B-A3B-oQ8";
 const API_KEY_ENV: &str = "SARAGOSSA_API_KEY";
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_TOKENS_CAP: usize = 4096;
@@ -52,6 +50,8 @@ pub(super) struct ServeModelConfig {
     pub(super) id: String,
     /// Répertoire local du modèle.
     pub(super) path: PathBuf,
+    /// Identifiant HF nu à résoudre avant de lancer le serveur.
+    pub(super) hf_repo: Option<String>,
 }
 
 impl ServeArgs {
@@ -62,7 +62,6 @@ impl ServeArgs {
         let mut socket = PathBuf::from(DEFAULT_SOCKET);
         let mut api_key = env::var(API_KEY_ENV).ok().filter(|value| !value.is_empty());
         let mut models = Vec::new();
-        let mut model_flags_seen = false;
         let mut stt_model = None;
         let mut tts_model = None;
         let mut embed_model = None;
@@ -87,27 +86,26 @@ impl ServeArgs {
                     api_key = Some(next_value(&mut iter, "--api-key")?)
                 }
                 "--model" => {
-                    model_flags_seen = true;
                     let model = parse_model_registration(&next_value(&mut iter, "--model")?)?;
                     upsert_model(&mut models, model)?;
                 }
                 "--model-27b" => {
-                    model_flags_seen = true;
                     upsert_model(
                         &mut models,
                         ServeModelConfig {
                             id: "reti-27b".to_string(),
                             path: next_value(&mut iter, "--model-27b")?.into(),
+                            hf_repo: None,
                         },
                     )?;
                 }
                 "--model-35b" => {
-                    model_flags_seen = true;
                     upsert_model(
                         &mut models,
                         ServeModelConfig {
                             id: "reti-35b".to_string(),
                             path: next_value(&mut iter, "--model-35b")?.into(),
+                            hf_repo: None,
                         },
                     )?;
                 }
@@ -137,14 +135,6 @@ impl ServeArgs {
             }
         }
         validate_tcp_args(&host, port, api_key.as_deref())?;
-        if !model_flags_seen {
-            models = default_models();
-        }
-        if models.is_empty() {
-            return Err(ServeError::args(
-                "aucun modèle enregistré: utilisez --model id=/chemin",
-            ));
-        }
         Ok(Self {
             host,
             port,
@@ -165,19 +155,27 @@ impl ServeArgs {
     pub(super) fn tcp_addr(&self) -> Option<String> {
         self.port.map(|port| format!("{}:{port}", self.host))
     }
+
+    /// Ajoute un modèle choisi après le parsing, notamment par le picker.
+    pub(super) fn add_model(&mut self, model: ServeModelConfig) -> ServeResult<()> {
+        upsert_model(&mut self.models, model)
+    }
 }
 
 /// Renvoie l'aide concise de `serve`.
 pub(super) fn help_text() -> String {
     format!(
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
-         [--api-key TOKEN] [--model ID=DIR]... [--model-27b DIR] [--model-35b DIR] \\
+         [--api-key TOKEN] [--model ID=DIR|DIR|ORG/REPO]... \\
+         [--model-27b DIR] [--model-35b DIR] \\
          [--stt-model DIR] [--tts-model DIR] [--embed-model DIR] \\
          [--backend cpu|metal] [--preload]\n\
-         Models: repeat --model to expose any supported checkpoint. \\
+         Models: repeat --model to expose any supported checkpoint. A bare path \\
+         gets its directory name as alias; ORG/REPO is resolved through the local \\
+         Hugging Face cache and downloaded when incomplete. Without --model, a TTY \\
+         opens a local-model picker. \\
          Backward-compatible aliases: --model-27b registers reti-27b, \\
-         --model-35b registers reti-35b. Without model flags, the old reti-27b \\
-         and reti-35b defaults are registered.\n\
+         --model-35b registers reti-35b.\n\
          Audio/embeddings (opt-in, lazy-loaded): --stt-model enables Whisper STT \\
          on /v1/audio/transcriptions, --tts-model enables Qwen3 TTS on \\
          /v1/audio/speech, --embed-model enables e5-small on /v1/embeddings.\n\
@@ -208,26 +206,48 @@ fn validate_tcp_args(host: &str, port: Option<u16>, api_key: Option<&str>) -> Se
     Ok(())
 }
 
-fn parse_model_registration(value: &str) -> ServeResult<ServeModelConfig> {
-    let Some((id, path)) = value.split_once('=') else {
-        return Err(ServeError::args(
-            "--model attend le format id=/chemin/du/modèle",
-        ));
-    };
-    let id = id.trim();
-    let path = path.trim();
-    if id.is_empty() {
-        return Err(ServeError::args("--model: id vide"));
+pub(super) fn parse_model_registration(value: &str) -> ServeResult<ServeModelConfig> {
+    let value = value.trim();
+    if let Some((id, path)) = value.split_once('=') {
+        let id = id.trim();
+        let path = path.trim();
+        if id.is_empty() {
+            return Err(ServeError::args("--model: id vide"));
+        }
+        if path.is_empty() {
+            return Err(ServeError::args(format!("--model {id}: chemin vide")));
+        }
+        return Ok(ServeModelConfig {
+            id: id.to_string(),
+            path: PathBuf::from(path),
+            hf_repo: None,
+        });
     }
-    if path.is_empty() {
-        return Err(ServeError::args(format!("--model {id}: chemin vide")));
+    if value.is_empty() {
+        return Err(ServeError::args("--model: référence vide"));
     }
+    let id = model_alias(value)?;
+    let hf_repo = (!Path::new(value).exists() && hf_resolve::is_hf_model_id(value))
+        .then(|| value.to_string());
     Ok(ServeModelConfig {
-        id: id.to_string(),
-        path: PathBuf::from(path),
+        id,
+        path: PathBuf::from(value),
+        hf_repo,
     })
 }
 
+fn model_alias(value: &str) -> ServeResult<String> {
+    Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            ServeError::args(format!(
+                "--model {value}: impossible de déduire un alias depuis le dernier segment"
+            ))
+        })
+}
 fn upsert_model(models: &mut Vec<ServeModelConfig>, model: ServeModelConfig) -> ServeResult<()> {
     if let Some(index) = models.iter().position(|entry| entry.id == model.id) {
         models[index] = model;
@@ -270,42 +290,19 @@ fn parse_positive_usize(
     Ok(parsed)
 }
 
-fn default_model_path(relative: &str) -> PathBuf {
-    PathBuf::from(relative)
-}
-
-fn default_models() -> Vec<ServeModelConfig> {
-    vec![
-        ServeModelConfig {
-            id: "reti-27b".to_string(),
-            path: default_model_path(DEFAULT_27B_REL),
-        },
-        ServeModelConfig {
-            id: "reti-35b".to_string(),
-            path: default_model_path(DEFAULT_35B_REL),
-        },
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_defaults_to_unix_socket() {
+    fn parse_defaults_to_unix_socket_without_implicit_models() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: defaults valides");
 
         assert_eq!(args.host, "127.0.0.1");
         assert_eq!(args.port, None);
         assert_eq!(args.socket, PathBuf::from(DEFAULT_SOCKET));
         assert_eq!(args.api_key, None);
-        assert_eq!(
-            args.models
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["reti-27b", "reti-35b"]
-        );
+        assert!(args.models.is_empty());
         assert_eq!(args.backend, RuntimeKind::default_backend());
         assert!(!args.preload);
         assert_eq!(
@@ -349,10 +346,12 @@ mod tests {
                 ServeModelConfig {
                     id: "reti-35b".to_string(),
                     path: PathBuf::from("/m/35"),
+                    hf_repo: None,
                 },
                 ServeModelConfig {
                     id: "qwen-7b".to_string(),
                     path: PathBuf::from("/m/7"),
+                    hf_repo: None,
                 },
             ]
         );
@@ -377,10 +376,12 @@ mod tests {
                 ServeModelConfig {
                     id: "reti-27b".to_string(),
                     path: PathBuf::from("/m/27"),
+                    hf_repo: None,
                 },
                 ServeModelConfig {
                     id: "reti-35b".to_string(),
                     path: PathBuf::from("/m/35"),
+                    hf_repo: None,
                 },
             ]
         );
@@ -402,11 +403,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_invalid_model_registration() {
-        let error = ServeArgs::parse(["--model".to_string(), "missing_equals".to_string()])
-            .expect_err("invariant: format id=dir requis");
+    fn parse_accepts_bare_path_with_automatic_alias() {
+        let temp = tempfile::tempdir().expect("invariant: tempdir disponible");
+        let model = temp.path().join("Qwen-local");
+        std::fs::create_dir(&model).expect("invariant: dossier modèle créé");
 
-        assert!(error.to_string().contains("id=/chemin"));
+        let args = ServeArgs::parse(["--model".to_string(), model.to_string_lossy().into_owned()])
+            .expect("invariant: chemin nu accepté");
+
+        assert_eq!(args.models[0].id, "Qwen-local");
+        assert_eq!(args.models[0].path, model);
+        assert_eq!(args.models[0].hf_repo, None);
+    }
+
+    #[test]
+    fn parse_accepts_hf_id_with_repo_alias() {
+        let args = ServeArgs::parse(["--model".to_string(), "mlx-community/Qwen3-4B".to_string()])
+            .expect("invariant: id HF accepté");
+
+        assert_eq!(args.models[0].id, "Qwen3-4B");
+        assert_eq!(
+            args.models[0].hf_repo.as_deref(),
+            Some("mlx-community/Qwen3-4B")
+        );
+    }
+
+    #[test]
+    fn parse_keeps_explicit_alias_path_lazy() {
+        let args = ServeArgs::parse(["--model".to_string(), "custom=missing/local".to_string()])
+            .expect("invariant: alias historique accepté");
+
+        assert_eq!(args.models[0].id, "custom");
+        assert_eq!(args.models[0].path, PathBuf::from("missing/local"));
+        assert_eq!(args.models[0].hf_repo, None);
     }
 
     #[test]

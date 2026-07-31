@@ -8,8 +8,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use saragossa::{
-    apply_runtime_preset_for_model_dir, load_causal_decoder, GenerationOptions, MetalExecutor,
-    ModelAssets,
+    apply_runtime_preset_for_model_dir, load_causal_decoder_for_metal, GenerationOptions,
+    MetalExecutor, ModelAssets,
 };
 
 fn synth_ids(len: usize) -> Vec<usize> {
@@ -60,7 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let assets = ModelAssets::load_local(&model_dir)?;
     let executor = MetalExecutor::new()?;
-    let decoder = load_causal_decoder(&assets)?.with_metal_executor(executor);
+    let decoder =
+        load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
     let options = GenerationOptions {
         temperature: 0.0,
         top_p: 1.0,

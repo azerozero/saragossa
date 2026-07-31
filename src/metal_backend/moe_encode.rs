@@ -96,7 +96,13 @@ impl MetalExecutor {
             checked_u32(gate.groups, "gate/up groups")?,
             checked_u32(lhs_rows, "gate/up lhs_rows")?,
         ];
-        let pipeline = if gate.bits == FAST_QMV_BITS {
+        let pipeline = if gate.bits == FAST_QMV_U3_BITS {
+            (
+                &self.affine_gather_gate_up_swiglu_fast_u3_gs64_f32,
+                8,
+                "affine_gather_gate_up_swiglu_fast_u3_gs64_f32",
+            )
+        } else if gate.bits == FAST_QMV_BITS {
             (
                 &self.affine_gather_gate_up_swiglu_fast_u4_gs64_f32,
                 8,
@@ -122,12 +128,12 @@ impl MetalExecutor {
         let (pipeline, rows_per_threadgroup, kernel_name) = pipeline;
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(&gate.packed), 0);
-        encoder.set_buffer(2, Some(&gate.scales), 0);
-        encoder.set_buffer(3, Some(&gate.biases), 0);
-        encoder.set_buffer(4, Some(&up.packed), 0);
-        encoder.set_buffer(5, Some(&up.scales), 0);
-        encoder.set_buffer(6, Some(&up.biases), 0);
+        encoder.set_buffer(1, Some(&gate.packed), gate.packed_offset);
+        encoder.set_buffer(2, Some(&gate.scales), gate.scales_offset);
+        encoder.set_buffer(3, Some(&gate.biases), gate.biases_offset);
+        encoder.set_buffer(4, Some(&up.packed), up.packed_offset);
+        encoder.set_buffer(5, Some(&up.scales), up.scales_offset);
+        encoder.set_buffer(6, Some(&up.biases), up.biases_offset);
         encoder.set_buffer(7, Some(indices_buffer), 0);
         encoder.set_buffer(8, Some(output_buffer), 0);
         set_u32_bytes(encoder, 9, &dims, "gate_up_dims")?;
@@ -216,9 +222,11 @@ impl MetalExecutor {
             checked_u32(groups, "shared gate/up groups")?,
         ];
         let gate_packed = self.cached_affine_packed(gate_w, "shared_gate_packed")?;
+        let gate_packed_offset = affine_packed_offset(gate_w)?;
         let gate_scales = self.cached_affine_scales(gate_w, "shared_gate_scales")?;
         let gate_biases = self.cached_affine_biases(gate_w, "shared_gate_biases")?;
         let up_packed = self.cached_affine_packed(up_w, "shared_up_packed")?;
+        let up_packed_offset = affine_packed_offset(up_w)?;
         let up_scales = self.cached_affine_scales(up_w, "shared_up_scales")?;
         let up_biases = self.cached_affine_biases(up_w, "shared_up_biases")?;
         let (pipeline, kernel_name) = if gate_bits == FAST_QMV_BITS {
@@ -239,10 +247,10 @@ impl MetalExecutor {
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(&gate_packed), 0);
+        encoder.set_buffer(1, Some(&gate_packed), gate_packed_offset);
         encoder.set_buffer(2, Some(&gate_scales), 0);
         encoder.set_buffer(3, Some(&gate_biases), 0);
-        encoder.set_buffer(4, Some(&up_packed), 0);
+        encoder.set_buffer(4, Some(&up_packed), up_packed_offset);
         encoder.set_buffer(5, Some(&up_scales), 0);
         encoder.set_buffer(6, Some(&up_biases), 0);
         encoder.set_buffer(7, Some(output_buffer), 0);
@@ -273,8 +281,11 @@ impl MetalExecutor {
         let (
             MetalLinearWeightBuffers::AffineQuantized {
                 packed: gate_packed,
+                packed_offset: gate_packed_offset,
                 scales: gate_scales,
+                scales_offset: gate_scales_offset,
                 biases: gate_biases,
+                biases_offset: gate_biases_offset,
                 out_dim: gate_out,
                 in_dim: gate_in,
                 packed_cols: gate_packed_cols,
@@ -284,8 +295,11 @@ impl MetalExecutor {
             },
             MetalLinearWeightBuffers::AffineQuantized {
                 packed: up_packed,
+                packed_offset: up_packed_offset,
                 scales: up_scales,
+                scales_offset: up_scales_offset,
                 biases: up_biases,
+                biases_offset: up_biases_offset,
                 out_dim: up_out,
                 in_dim: up_in,
                 packed_cols: up_packed_cols,
@@ -336,12 +350,12 @@ impl MetalExecutor {
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(gate_packed), 0);
-        encoder.set_buffer(2, Some(gate_scales), 0);
-        encoder.set_buffer(3, Some(gate_biases), 0);
-        encoder.set_buffer(4, Some(up_packed), 0);
-        encoder.set_buffer(5, Some(up_scales), 0);
-        encoder.set_buffer(6, Some(up_biases), 0);
+        encoder.set_buffer(1, Some(gate_packed), *gate_packed_offset);
+        encoder.set_buffer(2, Some(gate_scales), *gate_scales_offset);
+        encoder.set_buffer(3, Some(gate_biases), *gate_biases_offset);
+        encoder.set_buffer(4, Some(up_packed), *up_packed_offset);
+        encoder.set_buffer(5, Some(up_scales), *up_scales_offset);
+        encoder.set_buffer(6, Some(up_biases), *up_biases_offset);
         encoder.set_buffer(7, Some(output_buffer), 0);
         set_u32_bytes(encoder, 8, &dims, "shared_gate_up_dims")?;
         trace_dispatch_path(kernel_name, 1, *gate_out, in_dim);
@@ -375,8 +389,11 @@ impl MetalExecutor {
         let (
             MetalLinearWeightBuffers::AffineQuantized {
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 out_dim,
                 in_dim: weight_in,
                 packed_cols,
@@ -386,8 +403,11 @@ impl MetalExecutor {
             },
             MetalLinearWeightBuffers::AffineQuantized {
                 packed: shared_gate_packed,
+                packed_offset: shared_gate_packed_offset,
                 scales: shared_gate_scales,
+                scales_offset: shared_gate_scales_offset,
                 biases: shared_gate_biases,
+                biases_offset: shared_gate_biases_offset,
                 out_dim: shared_gate_out,
                 in_dim: shared_gate_in,
                 packed_cols: shared_gate_packed_cols,
@@ -421,12 +441,12 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(&self.affine_qmv_plus_one_fast_aligned_u8_gs64_f32);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed), 0);
-        encoder.set_buffer(2, Some(scales), 0);
-        encoder.set_buffer(3, Some(biases), 0);
-        encoder.set_buffer(4, Some(shared_gate_packed), 0);
-        encoder.set_buffer(5, Some(shared_gate_scales), 0);
-        encoder.set_buffer(6, Some(shared_gate_biases), 0);
+        encoder.set_buffer(1, Some(packed), *packed_offset);
+        encoder.set_buffer(2, Some(scales), *scales_offset);
+        encoder.set_buffer(3, Some(biases), *biases_offset);
+        encoder.set_buffer(4, Some(shared_gate_packed), *shared_gate_packed_offset);
+        encoder.set_buffer(5, Some(shared_gate_scales), *shared_gate_scales_offset);
+        encoder.set_buffer(6, Some(shared_gate_biases), *shared_gate_biases_offset);
         encoder.set_buffer(7, Some(output_buffer), 0);
         encoder.set_buffer(8, Some(shared_gate_buffer), 0);
         set_u32_bytes(encoder, 9, &dims, "shared_gate_qmv_dims")?;
@@ -470,8 +490,11 @@ impl MetalExecutor {
         let (
             MetalLinearWeightBuffers::AffineQuantized {
                 packed: gate_packed,
+                packed_offset: gate_packed_offset,
                 scales: gate_scales,
+                scales_offset: gate_scales_offset,
                 biases: gate_biases,
+                biases_offset: gate_biases_offset,
                 out_dim: gate_out,
                 in_dim: gate_in,
                 packed_cols: gate_packed_cols,
@@ -481,8 +504,11 @@ impl MetalExecutor {
             },
             MetalLinearWeightBuffers::AffineQuantized {
                 packed: up_packed,
+                packed_offset: up_packed_offset,
                 scales: up_scales,
+                scales_offset: up_scales_offset,
                 biases: up_biases,
+                biases_offset: up_biases_offset,
                 out_dim: up_out,
                 in_dim: up_in,
                 packed_cols: up_packed_cols,
@@ -492,8 +518,11 @@ impl MetalExecutor {
             },
             MetalLinearWeightBuffers::AffineQuantized {
                 packed: shared_gate_packed,
+                packed_offset: shared_gate_packed_offset,
                 scales: shared_gate_scales,
+                scales_offset: shared_gate_scales_offset,
                 biases: shared_gate_biases,
+                biases_offset: shared_gate_biases_offset,
                 out_dim: shared_gate_out,
                 in_dim: shared_gate_in,
                 packed_cols: shared_gate_packed_cols,
@@ -543,15 +572,15 @@ impl MetalExecutor {
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(gate_packed), 0);
-        encoder.set_buffer(2, Some(gate_scales), 0);
-        encoder.set_buffer(3, Some(gate_biases), 0);
-        encoder.set_buffer(4, Some(up_packed), 0);
-        encoder.set_buffer(5, Some(up_scales), 0);
-        encoder.set_buffer(6, Some(up_biases), 0);
-        encoder.set_buffer(7, Some(shared_gate_packed), 0);
-        encoder.set_buffer(8, Some(shared_gate_scales), 0);
-        encoder.set_buffer(9, Some(shared_gate_biases), 0);
+        encoder.set_buffer(1, Some(gate_packed), *gate_packed_offset);
+        encoder.set_buffer(2, Some(gate_scales), *gate_scales_offset);
+        encoder.set_buffer(3, Some(gate_biases), *gate_biases_offset);
+        encoder.set_buffer(4, Some(up_packed), *up_packed_offset);
+        encoder.set_buffer(5, Some(up_scales), *up_scales_offset);
+        encoder.set_buffer(6, Some(up_biases), *up_biases_offset);
+        encoder.set_buffer(7, Some(shared_gate_packed), *shared_gate_packed_offset);
+        encoder.set_buffer(8, Some(shared_gate_scales), *shared_gate_scales_offset);
+        encoder.set_buffer(9, Some(shared_gate_biases), *shared_gate_biases_offset);
         encoder.set_buffer(10, Some(output_buffer), 0);
         encoder.set_buffer(11, Some(shared_gate_buffer), 0);
         set_u32_bytes(encoder, 12, &dims, "shared_gate_up_scalar_dims")?;
@@ -822,9 +851,9 @@ impl MetalExecutor {
         encoder
             .set_compute_pipeline_state(&self.affine_gather_down_weighted_shared_fast_u8_gs64_f32);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(&weight.packed), 0);
-        encoder.set_buffer(2, Some(&weight.scales), 0);
-        encoder.set_buffer(3, Some(&weight.biases), 0);
+        encoder.set_buffer(1, Some(&weight.packed), weight.packed_offset);
+        encoder.set_buffer(2, Some(&weight.scales), weight.scales_offset);
+        encoder.set_buffer(3, Some(&weight.biases), weight.biases_offset);
         encoder.set_buffer(4, Some(indices_buffer), 0);
         encoder.set_buffer(5, Some(scores_buffer), 0);
         encoder.set_buffer(6, Some(residual_buffer), 0);

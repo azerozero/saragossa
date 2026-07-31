@@ -19,9 +19,9 @@ fn qmm2_bitwise_matches_qmv_aligned_on_prod_shapes() -> Result<()> {
         let weight = test_affine_varied(out_dim, in_dim)?;
         let packed = executor.buffer_from_slice(weight.packed_data(), "qmm2_bits_packed")?;
         let scales =
-            executor.buffer_from_f32_as_bf16(weight.scales().data(), "qmm2_bits_scales")?;
+            executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), "qmm2_bits_scales")?;
         let biases =
-            executor.buffer_from_f32_as_bf16(weight.biases().data(), "qmm2_bits_biases")?;
+            executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), "qmm2_bits_biases")?;
         let mut lhs = varied_row(in_dim, 1);
         lhs.extend_from_slice(&varied_row(in_dim, 2));
         let lhs_buf = executor.upload_f32_buffer(&lhs, "qmm2_bits_lhs")?;
@@ -299,12 +299,15 @@ fn shared_expert_duo_bitwise_matches_fused_gate_up_swiglu() -> Result<()> {
     let up_affine = {
         let mut affine = test_affine_varied(out_dim, in_dim)?;
         // Décale les scales pour différencier up de gate (déterministe).
-        let scales = affine.scales().data().iter().map(|s| s * 1.5).collect();
+        let scales = affine.scales_f32().as_ref().iter().map(|s| s * 1.5).collect();
         affine = AffineQuantizedTensor::new(
             &[out_dim, in_dim / 8],
             affine.packed_data().to_vec(),
             Tensor::from_vec(vec![out_dim, in_dim / 64], scales)?,
-            affine.biases().clone(),
+            Tensor::from_vec(
+                affine.biases_shape().to_vec(),
+                affine.biases_f32().into_owned(),
+            )?,
             64,
             4,
         )?;

@@ -43,6 +43,34 @@ pub(crate) fn env_flag_value(value: &str) -> Option<bool> {
     }
 }
 
+/// Active expérimentalement la libération CPU des poids MoE.
+///
+/// Défaut OFF : le chemin dense qualifié reste inchangé. L'activation demande
+/// `RETI_RUST_FREE_CPU_WEIGHTS_MOE=1` et reste soumise aux gates byte-id GPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn free_cpu_weights_moe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_FREE_CPU_WEIGHTS_MOE", false))
+}
+
+/// Active le stockage single-copy des poids quantifiés en mémoire unifiée.
+///
+/// **Défaut ON** : les MTLBuffer partagés stockent les codes `u32` et les
+/// paramètres affines bf16 natifs. `RETI_RUST_SINGLE_COPY_WEIGHTS=0` restaure
+/// strictement le chemin historique f32 CPU puis copies Metal (kill-switch).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn single_copy_weights_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_SINGLE_COPY_WEIGHTS", true))
+}
+
+/// Active la trace des résolutions de stacks MoE autour du drop CPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn moe_drop_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("RETI_RUST_MOE_DROP_TRACE", false))
+}
+
 /// Active les traces d'allocation GPU autour des prefills et générations.
 ///
 /// Défaut OFF (`RETI_RUST_TRACE_GPU_ALLOC=1` pour l'activer). Le flag est gelé

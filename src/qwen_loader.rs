@@ -98,6 +98,30 @@ const SHARED_EXPERT_LAYER_WEIGHTS: &[&str] = &[
 
 const FP8_SCALE_BLOCK: usize = 128;
 
+struct DecoderLoadContext<'a> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    metal: Option<&'a crate::MetalExecutor>,
+    marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl DecoderLoadContext<'_> {
+    fn cpu() -> Self {
+        Self {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            metal: None,
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn metal(executor: &crate::MetalExecutor) -> DecoderLoadContext<'_> {
+        DecoderLoadContext {
+            metal: Some(executor),
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
 mod quantized;
 mod shape_validation;
 
@@ -147,6 +171,24 @@ pub fn load_causal_decoder(assets: &ModelAssets) -> Result<CausalDecoder> {
     load_causal_decoder_from_shards(&assets.config, &assets.shards, &assets.catalog)
 }
 
+/// Charge un décodeur en créant directement les payloads quantifiés partagés.
+///
+/// # Errors
+///
+/// Renvoie une erreur si les poids sont invalides ou si l'allocation Metal échoue.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn load_causal_decoder_for_metal(
+    assets: &ModelAssets,
+    executor: &crate::MetalExecutor,
+) -> Result<CausalDecoder> {
+    load_causal_decoder_from_shards_for_metal(
+        &assets.config,
+        &assets.shards,
+        &assets.catalog,
+        executor,
+    )
+}
+
 /// Charge un décodeur causal sous garde mémoire.
 ///
 /// # Errors
@@ -162,6 +204,23 @@ pub fn load_causal_decoder_with_memory_guard(
         &assets.catalog,
         guard,
     )
+}
+
+/// Charge un décodeur Metal single-copy sous garde mémoire.
+///
+/// # Errors
+///
+/// Renvoie une erreur si les poids sont invalides ou si la garde refuse.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn load_causal_decoder_for_metal_with_memory_guard(
+    assets: &ModelAssets,
+    executor: &crate::MetalExecutor,
+    guard: &MemoryGuard,
+) -> Result<CausalDecoder> {
+    let _reservation = guard
+        .reserve_allocation(estimate_paths_bytes(&assets.shards))
+        .map_err(InferError::MemoryGuard)?;
+    Ok(load_causal_decoder_for_metal(assets, executor)?.with_memory_guard(guard.clone()))
 }
 
 /// Alias rétro-compatible de [`load_causal_decoder`] (ancien nom Qwen-spécifique).
@@ -264,6 +323,21 @@ pub fn load_causal_decoder_from_shards(
     validate_supported_config(config, catalog)?;
     let prefixes = QwenPrefixes::detect(catalog);
     let tensors = load_decoder_tensors(config, shards, catalog, &prefixes)?;
+    validate_decoder_shapes(config, &tensors)?;
+    CausalDecoder::from_decoder_tensors(tensors, config.into())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn load_causal_decoder_from_shards_for_metal(
+    config: &ModelConfig,
+    shards: &[PathBuf],
+    catalog: &WeightCatalog,
+    executor: &crate::MetalExecutor,
+) -> Result<CausalDecoder> {
+    validate_supported_config(config, catalog)?;
+    let prefixes = QwenPrefixes::detect(catalog);
+    let context = DecoderLoadContext::metal(executor);
+    let tensors = load_decoder_tensors_with_context(config, shards, catalog, &prefixes, &context)?;
     validate_decoder_shapes(config, &tensors)?;
     CausalDecoder::from_decoder_tensors(tensors, config.into())
 }
@@ -556,6 +630,22 @@ fn load_decoder_tensors(
     catalog: &WeightCatalog,
     prefixes: &QwenPrefixes,
 ) -> Result<HashMap<String, DecoderTensor>> {
+    load_decoder_tensors_with_context(
+        config,
+        shards,
+        catalog,
+        prefixes,
+        &DecoderLoadContext::cpu(),
+    )
+}
+
+fn load_decoder_tensors_with_context(
+    config: &ModelConfig,
+    shards: &[PathBuf],
+    catalog: &WeightCatalog,
+    prefixes: &QwenPrefixes,
+    context: &DecoderLoadContext<'_>,
+) -> Result<HashMap<String, DecoderTensor>> {
     let specs = decoder_specs(config, prefixes, catalog);
     let headers = read_shard_headers(shards)?;
     let entries = index_shard_entries(&headers)?;
@@ -579,7 +669,7 @@ fn load_decoder_tensors(
                 spec.target, spec.source
             )));
         }
-        let tensor = tensor_from_entry(config, spec, entry_ref, &headers, &entries)?;
+        let tensor = tensor_from_entry(config, spec, entry_ref, &headers, &entries, context)?;
         out.insert(spec.target.clone(), tensor);
     }
 

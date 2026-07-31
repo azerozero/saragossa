@@ -1268,10 +1268,12 @@ impl FullAttention {
         let _ = metal.resolve_linear_weight_buffers(v_proj.weight(), "cpu_release_full_v_proj")?;
         let _ =
             metal.resolve_linear_weight_buffers(self.o_proj.weight(), "cpu_release_full_o_proj")?;
-        match metal.resolve_concat_linear_weight_buffers(
-            &[self.q_proj.weight(), self.k_proj.weight(), v_proj.weight()],
-            "cpu_release_full_qkv_proj",
-        ) {
+        let qkv_sources = [self.q_proj.weight(), self.k_proj.weight(), v_proj.weight()];
+        if metal.concat_would_duplicate_affine_storage(&qkv_sources) {
+            return Ok(());
+        }
+        match metal.resolve_concat_linear_weight_buffers(&qkv_sources, "cpu_release_full_qkv_proj")
+        {
             Ok(_) | Err(InferError::Dimension(_)) => Ok(()),
             Err(error) => Err(error),
         }
@@ -1285,11 +1287,24 @@ impl FullAttention {
         }
         self.o_proj.release_affine_cpu_data(released);
     }
+
+    fn move_packed_to_metal_shared(&mut self, metal: &crate::MetalExecutor) -> Result<()> {
+        self.q_proj.move_packed_to_metal_shared(metal)?;
+        self.k_proj.move_packed_to_metal_shared(metal)?;
+        if let Some(v_proj) = &mut self.v_proj {
+            v_proj.move_packed_to_metal_shared(metal)?;
+        }
+        self.o_proj.move_packed_to_metal_shared(metal)
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 impl DecoderLayer {
-    fn materialize_metal_weight_buffers(&self, metal: &crate::MetalExecutor) -> Result<()> {
+    fn materialize_metal_weight_buffers(
+        &self,
+        metal: &crate::MetalExecutor,
+        layer_index: Option<usize>,
+    ) -> Result<()> {
         match &self.attention {
             AttentionBlock::Full(attention) => {
                 attention.materialize_metal_weight_buffers(metal)?;
@@ -1309,10 +1324,10 @@ impl DecoderLayer {
             }
         }
         if let Some(mlp) = &self.mlp {
-            materialize_feed_forward_weight_buffers(metal, mlp)?;
+            materialize_feed_forward_weight_buffers(metal, mlp, layer_index)?;
         }
         if let Some(parallel_moe) = &self.parallel_moe {
-            materialize_feed_forward_weight_buffers(metal, parallel_moe)?;
+            materialize_feed_forward_weight_buffers(metal, parallel_moe, layer_index)?;
         }
         Ok(())
     }
@@ -1329,12 +1344,31 @@ impl DecoderLayer {
             parallel_moe.release_affine_cpu_data(released);
         }
     }
+
+    fn move_packed_to_metal_shared(&mut self, metal: &crate::MetalExecutor) -> Result<()> {
+        match &mut self.attention {
+            AttentionBlock::Full(attention) => {
+                attention.move_packed_to_metal_shared(metal)?;
+            }
+            AttentionBlock::Linear(attention) => {
+                attention.move_packed_to_metal_shared(metal)?;
+            }
+        }
+        if let Some(mlp) = &mut self.mlp {
+            mlp.move_packed_to_metal_shared(metal)?;
+        }
+        if let Some(parallel_moe) = &mut self.parallel_moe {
+            parallel_moe.move_packed_to_metal_shared(metal)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn materialize_feed_forward_weight_buffers(
     metal: &crate::MetalExecutor,
     feed_forward: &FeedForward,
+    layer_index: Option<usize>,
 ) -> Result<()> {
     match feed_forward {
         FeedForward::Dense(mlp) => {
@@ -1350,16 +1384,25 @@ fn materialize_feed_forward_weight_buffers(
         FeedForward::Moe(mlp) => {
             if let Some((router, experts, _, shared_expert, shared_gate)) = mlp.shared_metal_parts()
             {
-                let _ = metal.resolve_moe_shared_weights(
+                let _ = metal.resolve_moe_shared_weights_for_cpu_release(
                     router,
                     experts,
                     shared_expert,
                     shared_gate,
+                    layer_index,
                 )?;
             } else if let Some(parts) = mlp.gemma4_metal_parts() {
-                let _ = metal.resolve_moe_routed_weights(parts.router, parts.experts)?;
+                let _ = metal.resolve_moe_routed_weights_for_cpu_release(
+                    parts.router,
+                    parts.experts,
+                    layer_index,
+                )?;
             } else if let Some((router, experts, _)) = mlp.metal_parts() {
-                let _ = metal.resolve_moe_routed_weights(router, experts)?;
+                let _ = metal.resolve_moe_routed_weights_for_cpu_release(
+                    router,
+                    experts,
+                    layer_index,
+                )?;
             } else {
                 return Err(InferError::Config(
                     "MoE impossible à matérialiser avant libération CPU".to_string(),
@@ -1740,16 +1783,43 @@ impl CausalDecoder {
     /// Renvoie une erreur si Metal est indisponible ou si un kernel ne compile pas.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn with_metal_runtime(mut self) -> Result<Self> {
-        self.runtime.metal = Some(Arc::new(crate::MetalExecutor::new()?));
+        let executor = crate::MetalExecutor::new()?;
+        self.enable_single_copy_weights(&executor)?;
+        self.runtime.metal = Some(Arc::new(executor));
         Ok(self)
     }
 
     /// Active le runtime Metal avec un executor déjà initialisé.
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    #[must_use]
-    pub fn with_metal_executor(mut self, executor: crate::MetalExecutor) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la conversion single-copy d'un poids est invalide.
+    pub fn with_metal_executor(mut self, executor: crate::MetalExecutor) -> Result<Self> {
+        self.enable_single_copy_weights(&executor)?;
         self.runtime.metal = Some(Arc::new(executor));
-        self
+        Ok(self)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn enable_single_copy_weights(&mut self, metal: &crate::MetalExecutor) -> Result<()> {
+        if !crate::runtime_flags::single_copy_weights_enabled() {
+            return Ok(());
+        }
+        self.embed_tokens.move_packed_to_metal_shared(metal)?;
+        for layer in &mut self.layers {
+            layer.move_packed_to_metal_shared(metal)?;
+        }
+        self.lm_head.move_packed_to_metal_shared(metal)?;
+        if let Some(mtp) = &mut self.mtp {
+            mtp.fc.move_packed_to_metal_shared(metal)?;
+            mtp.layer.attention.move_packed_to_metal_shared(metal)?;
+            mtp.layer.mlp.move_packed_to_metal_shared(metal)?;
+        }
+        if let Some(draft_lm_head) = &mut self.mtp_draft_lm_head {
+            draft_lm_head.move_packed_to_metal_shared(metal)?;
+        }
+        Ok(())
     }
 
     /// Libère les payloads CPU par couche puis chauffe le chemin résident Metal.
@@ -1767,12 +1837,11 @@ impl CausalDecoder {
             return Ok(0);
         }
         // La libération CPU n'est prouvée byte-identique que sur les modèles
-        // DENSES (27B : gates court + long verts). Sur MoE, le préfill batché
-        // résout des stacks experts/shared que le warmup court ne couvre pas ;
-        // droper leurs payloads casse le byte-id sur prompt long (mesuré). On
-        // restreint donc au dense ; l'extension MoE (couverture exacte du
-        // préfill batché avant le drop) est un follow-up documenté.
-        if self.config.num_experts.unwrap_or(0) > 0 {
+        // denses. Le défaut reste donc dense-only ; le MoE ne s'ouvre que par
+        // un flag d'acceptance explicite, le temps de qualifier ses gates GPU.
+        if self.config.num_experts.unwrap_or(0) > 0
+            && !crate::runtime_flags::free_cpu_weights_moe_enabled()
+        {
             return Ok(0);
         }
         if prompt.is_empty() {
@@ -1806,6 +1875,15 @@ impl CausalDecoder {
         self.materialize_and_release_cpu_weight_buffers(&metal, &mut released)?;
         self.runtime.cpu_weights_released = true;
         let _ = self.generate_greedy(prompt, 2)?;
+        // Le generate_greedy de chauffe vient de mettre `prompt` dans le
+        // prefix-cache : un vrai run sur le MÊME prompt ferait un hit exact et
+        // restaurerait le snapshot linear-attn au lieu d'un prefill frais —
+        // near-tie non byte-identique sur prompt long (c'était le « md5
+        // divergent d62b5537 » attribué à tort au drop MoE pendant 6 rounds).
+        // On purge : le cache se repeuple proprement dès le premier vrai tour.
+        if let Ok(mut cache) = self.prefix_cache.lock() {
+            cache.entries.clear();
+        }
 
         let bytes = released
             .iter()
@@ -1829,8 +1907,8 @@ impl CausalDecoder {
         metal: &crate::MetalExecutor,
         released: &mut Vec<(u64, usize)>,
     ) -> Result<()> {
-        for layer in &mut self.layers {
-            layer.materialize_metal_weight_buffers(metal)?;
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
+            layer.materialize_metal_weight_buffers(metal, Some(layer_index))?;
             // Une couche dense n'est plus résolue depuis le CPU après cette passe :
             // les buffers unitaires et les concats requis sont désormais retenus.
             layer.release_affine_cpu_data(released);
@@ -1843,7 +1921,7 @@ impl CausalDecoder {
             mtp.layer
                 .attention
                 .materialize_metal_weight_buffers(metal)?;
-            materialize_feed_forward_weight_buffers(metal, &mtp.layer.mlp)?;
+            materialize_feed_forward_weight_buffers(metal, &mtp.layer.mlp, None)?;
             mtp.fc.release_affine_cpu_data(released);
             mtp.layer.attention.release_affine_cpu_data(released);
             mtp.layer.mlp.release_affine_cpu_data(released);
@@ -1864,7 +1942,15 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
     pub fn with_mtp_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
-        self.mtp = Some(MtpHead::from_sidecar(path, &self.config)?);
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let context = self
+            .runtime
+            .metal
+            .as_deref()
+            .map_or_else(mtp::MtpLoadContext::cpu, mtp::MtpLoadContext::metal);
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let context = mtp::MtpLoadContext::cpu();
+        self.mtp = Some(MtpHead::from_sidecar(path, &self.config, &context)?);
         Ok(self)
     }
 
@@ -1874,9 +1960,18 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
     pub fn with_mtp_draft_lm_head_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let context = self
+            .runtime
+            .metal
+            .as_deref()
+            .map_or_else(mtp::MtpLoadContext::cpu, mtp::MtpLoadContext::metal);
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let context = mtp::MtpLoadContext::cpu();
         self.mtp_draft_lm_head = Some(mtp::load_mtp_draft_lm_head(
             path,
             self.final_norm.data().len(),
+            &context,
         )?);
         Ok(self)
     }

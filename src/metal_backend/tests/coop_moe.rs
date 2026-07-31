@@ -128,8 +128,8 @@ fn run_coop_qb_tiled_matches_cpu(
     }
     let a_f32 = executor.upload_f32_buffer(&lhs, "qb_tiled_a")?;
     let packed = executor.buffer_from_slice(weight.packed_data(), "qb_tiled_packed")?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), "qb_tiled_scales")?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), "qb_tiled_biases")?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), "qb_tiled_scales")?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), "qb_tiled_biases")?;
     let a_bf16 = executor
         .device
         .new_buffer((m * k * 2) as u64, MTLResourceOptions::StorageModeShared);
@@ -855,8 +855,11 @@ fn moe_routed_rows_coop_full_matches_cpu() -> Result<()> {
      -> Result<StackedAffineBuffers> {
         Ok(StackedAffineBuffers {
             packed: executor.buffer_from_slice(&pack_u4(q, experts, out_dim, in_dim), "st_p")?,
+            packed_offset: 0,
             scales: executor.buffer_from_f32_as_bf16(s, "st_s")?,
+            scales_offset: 0,
             biases: executor.buffer_from_f32_as_bf16(b, "st_b")?,
+            biases_offset: 0,
             experts,
             out_dim,
             in_dim,

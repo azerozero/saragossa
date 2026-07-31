@@ -312,3 +312,150 @@ fn dense_qmv_fast_matches_dense_kernel_on_router_shape() -> Result<()> {
     assert_bits_equal(&fast, &dense, "dense qmv fast");
     Ok(())
 }
+
+#[test]
+fn native_bf16_expert_view_keeps_all_three_offsets() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let packed = executor.weight_buffer_from_u32(&[0x1111_1111, 0x2222_2222])?;
+    let mut scales_bytes = Vec::with_capacity(4);
+    scales_bytes.extend_from_slice(&0x3f00_u16.to_le_bytes());
+    scales_bytes.extend_from_slice(&0x3f80_u16.to_le_bytes());
+    let scales = executor.weight_buffer_from_bf16_bytes(&scales_bytes)?;
+    let mut biases_bytes = Vec::with_capacity(4);
+    biases_bytes.extend_from_slice(&0_u16.to_le_bytes());
+    biases_bytes.extend_from_slice(&0x4000_u16.to_le_bytes());
+    let biases = executor.weight_buffer_from_bf16_bytes(&biases_bytes)?;
+    let weight = AffineQuantizedTensor::new_metal_shared_bf16(
+        &[1, 1],
+        packed.clone(),
+        1,
+        1,
+        &[1, 1],
+        scales.clone(),
+        1,
+        1,
+        &[1, 1],
+        biases.clone(),
+        1,
+        1,
+        8,
+        4,
+    )?;
+
+    assert_eq!(weight.row(0)?, vec![4.0; 8]);
+    let resolved = executor.resolve_linear_weight_buffers(
+        &LinearWeight::AffineQuantized(weight),
+        "native_bf16_offset_test",
+    )?;
+    let MetalLinearWeightBuffers::AffineQuantized {
+        packed: resolved_packed,
+        packed_offset,
+        scales: resolved_scales,
+        scales_offset,
+        biases: resolved_biases,
+        biases_offset,
+        ..
+    } = resolved
+    else {
+        return Err(InferError::Config(
+            "résolution affine attendue dans le test bf16".to_string(),
+        ));
+    };
+    assert_eq!(resolved_packed.as_ptr(), packed.as_ptr());
+    assert_eq!(resolved_scales.as_ptr(), scales.as_ptr());
+    assert_eq!(resolved_biases.as_ptr(), biases.as_ptr());
+    assert_eq!(packed_offset, std::mem::size_of::<u32>() as u64);
+    assert_eq!(scales_offset, std::mem::size_of::<u16>() as u64);
+    assert_eq!(biases_offset, std::mem::size_of::<u16>() as u64);
+    Ok(())
+}
+
+#[test]
+fn native_bf16_pair_resolves_as_storage_backed_split() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let make_linear = |word: u32, scale: u16| -> Result<(Linear, metal::Buffer)> {
+        let packed = executor.weight_buffer_from_u32(&[word])?;
+        let scales = executor.weight_buffer_from_bf16_bytes(&scale.to_le_bytes())?;
+        let biases = executor.weight_buffer_from_bf16_bytes(&0_u16.to_le_bytes())?;
+        let expected_scales = scales.clone();
+        let weight = AffineQuantizedTensor::new_metal_shared_bf16(
+            &[1, 1],
+            packed,
+            0,
+            1,
+            &[1, 1],
+            scales,
+            0,
+            1,
+            &[1, 1],
+            biases,
+            0,
+            1,
+            8,
+            4,
+        )?;
+        Ok((Linear::new_quantized(weight, None)?, expected_scales))
+    };
+    let (first, first_scales) = make_linear(0x1111_1111, 0x3f00)?;
+    let (second, second_scales) = make_linear(0x2222_2222, 0x3f80)?;
+
+    let resolved = executor.resolve_linear_attn_pair_weights(
+        &first,
+        &second,
+        "native_bf16_pair_concat",
+        "native_bf16_pair_first",
+        "native_bf16_pair_second",
+    )?;
+    let MetalLinearAttnResidentPairWeights::Split { first, second } = resolved else {
+        return Err(InferError::Config(
+            "une paire bf16 native ne doit pas créer de concat affine".to_string(),
+        ));
+    };
+    let MetalLinearWeightBuffers::AffineQuantized {
+        scales: resolved_first,
+        ..
+    } = first
+    else {
+        return Err(InferError::Config(
+            "premier poids affine attendu".to_string(),
+        ));
+    };
+    let MetalLinearWeightBuffers::AffineQuantized {
+        scales: resolved_second,
+        ..
+    } = second
+    else {
+        return Err(InferError::Config(
+            "second poids affine attendu".to_string(),
+        ));
+    };
+    assert_eq!(resolved_first.as_ptr(), first_scales.as_ptr());
+    assert_eq!(resolved_second.as_ptr(), second_scales.as_ptr());
+    Ok(())
+}
+
+#[test]
+fn native_bf16_file_load_writes_directly_into_storage() -> Result<()> {
+    use std::io::Write;
+
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let mut file = tempfile::NamedTempFile::new().map_err(|source| InferError::Io {
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    file.write_all(&[0xaa, 0xbb, 0x00, 0x3f, 0x80, 0x3f])
+        .map_err(|source| InferError::Io {
+            path: file.path().to_path_buf(),
+            source,
+        })?;
+    let buffer = executor.weight_buffer_from_bf16_file(file.path(), 2, 4)?;
+
+    assert_eq!(read_u16_buffer(&buffer, 2)?, vec![0x3f00, 0x3f80]);
+    Ok(())
+}

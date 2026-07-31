@@ -569,9 +569,15 @@ pub(super) fn can_use_dense_qmv_fast(batch: usize, in_dim: usize, out_dim: usize
 pub(super) fn can_use_fast_gather_qmv(lhs_rows: usize, weight: &StackedAffineBuffers) -> bool {
     fast_gather_qmv_enabled(weight)
         && lhs_rows > 0
-        && ((weight.bits == FAST_QMV_BITS
+        // u3 : 256 = un demi-bloc (8 valeurs × 32 lanes). Le kernel plein exige
+        // in_dim % 512 (dispatch), le tail absorbe un reliquat de 256 exactement
+        // → %256 garantit reliquat ∈ {0, 256}, aucune géométrie orpheline.
+        && ((weight.bits == FAST_QMV_U3_BITS
             && weight.group_size == FAST_QMV_GROUP_SIZE
-            && weight.in_dim % weight.group_size == 0)
+            && weight.in_dim % 256 == 0)
+            || (weight.bits == FAST_QMV_BITS
+                && weight.group_size == FAST_QMV_GROUP_SIZE
+                && weight.in_dim % weight.group_size == 0)
             || (weight.bits == 8
                 && matches!(weight.group_size, FAST_QMV_GROUP_SIZE | 128)
                 && weight.in_dim % 512 == 0

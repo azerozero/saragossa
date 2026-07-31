@@ -1,6 +1,7 @@
 //! Validation et allocation du scratch des prefills résidents.
 
 use super::*;
+use crate::metal_backend::moe::MoeStackTraceContext;
 
 #[expect(
     clippy::too_many_arguments,
@@ -646,7 +647,10 @@ impl MetalExecutor {
                         experts.len()
                     )));
                 }
-                let stacked = self.stacked_moe_buffers(experts)?;
+                let stacked = self.stacked_moe_buffers_with_context(
+                    experts,
+                    MoeStackTraceContext::prefill(layer_index),
+                )?;
                 if hidden_dim != stacked.gate.in_dim || hidden_dim != stacked.up.in_dim {
                     return Err(InferError::Dimension(format!(
                         "prefill résident hidden={hidden_dim}, gate_in={}, up_in={} couche {layer_index}",
@@ -673,8 +677,13 @@ impl MetalExecutor {
                 shared_expert,
                 shared_gate,
             } => {
-                let weights =
-                    self.resolve_moe_shared_weights(router, experts, shared_expert, shared_gate)?;
+                let weights = self.resolve_moe_shared_weights_for_prefill(
+                    router,
+                    experts,
+                    shared_expert,
+                    shared_gate,
+                    layer_index,
+                )?;
                 let shape = self.check_moe_shared_buffer_shapes(hidden_dim, &weights, top_k)?;
                 if shape.out_dim != hidden_dim {
                     return Err(InferError::Dimension(format!(

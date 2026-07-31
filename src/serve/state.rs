@@ -22,6 +22,7 @@ use super::audio::AudioState;
 use super::cache::{BlockAwarePrefixCache, BlockHash};
 use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
+use super::mtp;
 use super::protocol::{
     ChatCompletionRequest, ModelInfo, ModelsResponse, ResponseFormatMode, Usage,
 };
@@ -352,12 +353,32 @@ impl ModelSlot {
             let preset = saragossa::runtime_preset_for_model_dir(&self.path);
             let assets = ModelAssets::load_local(&self.path)?;
             let mut decoder = load_decoder_with_runtime(&assets, self.backend)?;
+            let mtp_active = mtp::active_for(&assets);
+            if mtp_active {
+                let path = assets.mtp.path.as_ref().ok_or_else(|| {
+                    ServeError::args(format!(
+                        "modèle {} qualifié MTP sans chemin de sidecar",
+                        self.id
+                    ))
+                })?;
+                decoder = decoder.with_mtp_sidecar(path)?;
+                eprintln!(
+                    "saragossa serve MTP actif model={} sidecar={} max_draft={}",
+                    self.id,
+                    path.display(),
+                    mtp::max_draft_tokens()
+                );
+            }
             warmup::decoder(&mut decoder, &assets, self.backend, &self.id)?;
+            if mtp_active {
+                warmup::mtp_decoder(&decoder, &assets, self.backend, &self.id)?;
+            }
             self.loaded = Some(LoadedModel {
                 id: self.id.clone(),
                 assets,
                 decoder,
                 preset,
+                mtp_active,
                 json_token_catalog: OnceLock::new(),
                 prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),
             });
@@ -377,6 +398,7 @@ struct LoadedModel {
     assets: ModelAssets,
     decoder: CausalDecoder,
     preset: Option<RuntimePreset>,
+    mtp_active: bool,
     /// Catalogue des bytes par token, bâti paresseusement à la 1ʳᵉ requête
     /// `json_object`/`json_lines` : un déploiement texte pur ne paie jamais le
     /// décodage du vocab entier ni son étape faillible au chargement.
@@ -403,17 +425,37 @@ impl LoadedModel {
         let options = self.generation_options(&request, &stop_texts, response_format)?;
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
-        let (prompt_state, reused_prefix_tokens, prefill) =
-            self.prefill_prompt_state(&prompt.tokens, session_key, memory_guard)?;
-        // TODO: Câbler une annulation non-stream quand serve aura un signal partagé fiable.
-        let output = self
-            .decoder
-            .generate_greedy_timed_from_prompt_state_with_options(
-                prompt_state,
-                prefill,
+        let use_mtp = self.mtp_active && mtp::routes_request(&request, response_format);
+        let (output, reused_prefix_tokens, prefix_cache) = if use_mtp {
+            // NOTE: v1 MTP assume son propre prefill via le prefix-cache du
+            // décodeur (longest-prefix + extension). Il by-passe donc les
+            // snapshots par blocs de serve pour ces seules requêtes greedy
+            // non guidées ; le chemin AR reste strictement inchangé.
+            let output = self.decoder.generate_greedy_mtp_batched_with_options(
+                &prompt.tokens,
                 max_tokens,
                 &options,
+                mtp::max_draft_tokens(),
             )?;
+            (
+                mtp::into_generation_output(output, started.elapsed()),
+                0,
+                "decoder-longest-prefix",
+            )
+        } else {
+            let (prompt_state, reused_prefix_tokens, prefill) =
+                self.prefill_prompt_state(&prompt.tokens, session_key, memory_guard)?;
+            // TODO: Câbler une annulation non-stream quand serve aura un signal partagé fiable.
+            let output = self
+                .decoder
+                .generate_greedy_timed_from_prompt_state_with_options(
+                    prompt_state,
+                    prefill,
+                    max_tokens,
+                    &options,
+                )?;
+            (output, reused_prefix_tokens, "block-snapshots")
+        };
         ensure_guided_finished(token_constraint.as_deref())?;
         let total = started.elapsed();
         let generated = tokens_to_u32(&output.tokens)?;
@@ -426,14 +468,16 @@ impl LoadedModel {
         };
         let content = strip_text_stops(decoded, &stop_texts);
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache=block-snapshots",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}",
             self.id,
             prompt_tokens,
             output.tokens.len(),
             output.timings.prefill.as_millis(),
             output.timings.decode.as_millis(),
             total.as_millis(),
-            reused_prefix_tokens
+            reused_prefix_tokens,
+            prefix_cache,
+            if use_mtp { "mtp" } else { "ar" }
         );
         Ok(ServedCompletion {
             model: self.id.clone(),
@@ -463,28 +507,55 @@ impl LoadedModel {
         let options = self.generation_options(&request, &stop_texts, response_format)?;
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
-        let (prompt_state, reused_prefix_tokens, prefill) =
-            self.prefill_prompt_state(&prompt.tokens, session_key, memory_guard)?;
-        let start = StreamingCompletionStart {
-            model: self.id.clone(),
-            prompt_tokens,
-            reused_prefix_tokens,
-            prefill,
+        let use_mtp = self.mtp_active && mtp::routes_request(&request, response_format);
+        let (prompt_state, reused_prefix_tokens, prefill) = if use_mtp {
+            (None, 0, Duration::ZERO)
+        } else {
+            let (state, reused, elapsed) =
+                self.prefill_prompt_state(&prompt.tokens, session_key, memory_guard)?;
+            (Some(state), reused, elapsed)
         };
-        on_event(CompletionStreamEvent::Start(&start))?;
+        if !use_mtp {
+            let start = StreamingCompletionStart {
+                model: self.id.clone(),
+                prompt_tokens,
+                reused_prefix_tokens,
+                prefill,
+            };
+            on_event(CompletionStreamEvent::Start(&start))?;
+        }
 
         let mut detokenizer = StreamingTextDetokenizer::new(&self.assets, &stop_texts, max_tokens);
         let mut stream_error = None;
-        let output = self
-            .decoder
-            .generate_greedy_timed_from_prompt_state_with_options_and_callback(
-                prompt_state,
-                prefill,
+        let mut stream_started = !use_mtp;
+        let output = if use_mtp {
+            // NOTE: comme le non-stream, MTP préremplit via le cache longest-prefix
+            // du décodeur et by-passe les snapshots serve v1. Le callback observe
+            // uniquement les tokens committés, puis le detokenizer existant garde
+            // l'exacte même politique de stops et de texte visible.
+            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
+                &prompt.tokens,
                 max_tokens,
                 &options,
+                mtp::max_draft_tokens(),
                 |token| {
                     if stream_error.is_some() {
                         return false;
+                    }
+                    if !stream_started {
+                        let start = StreamingCompletionStart {
+                            model: self.id.clone(),
+                            prompt_tokens,
+                            reused_prefix_tokens: 0,
+                            // Le callback MTP commence après son prefill interne.
+                            // Cette mesure inclut au plus le premier pas verify.
+                            prefill: started.elapsed(),
+                        };
+                        if let Err(error) = on_event(CompletionStreamEvent::Start(&start)) {
+                            stream_error = Some(error);
+                            return false;
+                        }
+                        stream_started = true;
                     }
                     match detokenizer.push_token(token, on_event) {
                         Ok(()) => true,
@@ -495,6 +566,38 @@ impl LoadedModel {
                     }
                 },
             )?;
+            mtp::into_generation_output(output, started.elapsed())
+        } else {
+            self.decoder
+                .generate_greedy_timed_from_prompt_state_with_options_and_callback(
+                    prompt_state
+                        .ok_or_else(|| ServeError::args("état de prompt AR absent avant decode"))?,
+                    prefill,
+                    max_tokens,
+                    &options,
+                    |token| {
+                        if stream_error.is_some() {
+                            return false;
+                        }
+                        match detokenizer.push_token(token, on_event) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                stream_error = Some(error);
+                                false
+                            }
+                        }
+                    },
+                )?
+        };
+        if !stream_started {
+            let start = StreamingCompletionStart {
+                model: self.id.clone(),
+                prompt_tokens,
+                reused_prefix_tokens: 0,
+                prefill: output.timings.prefill,
+            };
+            on_event(CompletionStreamEvent::Start(&start))?;
+        }
         if let Some(error) = stream_error {
             return Err(error);
         }
@@ -517,14 +620,20 @@ impl LoadedModel {
         let content = strip_text_stops(decoded, &stop_texts);
         detokenizer.finish(&content, on_event)?;
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache=block-snapshots streaming=true",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={} streaming=true",
             self.id,
             prompt_tokens,
             output.tokens.len(),
             output.timings.prefill.as_millis(),
             output.timings.decode.as_millis(),
             total.as_millis(),
-            reused_prefix_tokens
+            reused_prefix_tokens,
+            if use_mtp {
+                "decoder-longest-prefix"
+            } else {
+                "block-snapshots"
+            },
+            if use_mtp { "mtp" } else { "ar" }
         );
         Ok(ServedCompletion {
             model: self.id.clone(),
@@ -747,7 +856,8 @@ fn load_decoder_with_runtime(
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn load_decoder_metal(assets: &ModelAssets) -> ServeResult<CausalDecoder> {
     let executor = saragossa::MetalExecutor::new()?;
-    Ok(saragossa::load_causal_decoder(assets)?.with_metal_executor(executor))
+    Ok(saragossa::load_causal_decoder_for_metal(assets, &executor)?
+        .with_metal_executor(executor)?)
 }
 
 #[cfg(not(all(target_os = "macos", feature = "metal")))]

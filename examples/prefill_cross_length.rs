@@ -23,7 +23,7 @@
 
 use std::time::Instant;
 
-use saragossa::{load_causal_decoder, MetalExecutor, ModelAssets};
+use saragossa::{load_causal_decoder_for_metal, MetalExecutor, ModelAssets};
 
 fn synth_ids(len: usize) -> Vec<usize> {
     // Ids valides et variés (routing MoE non dégénéré), déterministes.
@@ -45,7 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // chemin per-op dégénéré (mesuré : warmup 333 s, 1ʳᵉ passe >10 min) au lieu du
     // résident (~1-2 s). Tout harnais de bench prefill DOIT le rattacher.
     let executor = MetalExecutor::new()?;
-    let decoder = load_causal_decoder(&assets)?.with_metal_executor(executor);
+    let decoder =
+        load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
 
     // Warmup : paie le coût unique de compilation JIT/shaders (~27 s), hors mesure,
     // exactement comme un serveur au boot. On warm à une 3ᵉ longueur (256) pour ne

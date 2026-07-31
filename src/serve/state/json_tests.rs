@@ -248,6 +248,7 @@ fn tiny_loaded_model_with_vocab(vocab_json: &str, unk_token: &str) -> LoadedMode
         decoder: CausalDecoder::from_tensors(tiny_weights(), CausalDecoderConfig::default())
             .expect("invariant: modèle tiny valide"),
         preset: None,
+        mtp_active: false,
         json_token_catalog: OnceLock::new(),
         prefix_cache: BlockAwarePrefixCache::new(1, 0),
     }

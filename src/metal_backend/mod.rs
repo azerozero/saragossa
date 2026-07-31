@@ -109,6 +109,27 @@ fn ensure_valid_top_k(top_k: usize, expert_count: usize) -> Result<()> {
     Ok(())
 }
 
+fn affine_packed_offset(weight: &AffineQuantizedTensor) -> Result<NSUInteger> {
+    let offset = weight
+        .packed_metal_view()
+        .map_or(0, |(_, offset_bytes)| offset_bytes);
+    checked_nsuint(offset, "offset poids packed")
+}
+
+fn affine_scales_offset(weight: &AffineQuantizedTensor) -> Result<NSUInteger> {
+    let offset = weight
+        .scales_metal_view()
+        .map_or(0, |(_, offset_bytes)| offset_bytes);
+    checked_nsuint(offset, "offset scales affines")
+}
+
+fn affine_biases_offset(weight: &AffineQuantizedTensor) -> Result<NSUInteger> {
+    let offset = weight
+        .biases_metal_view()
+        .map_or(0, |(_, offset_bytes)| offset_bytes);
+    checked_nsuint(offset, "offset biases affines")
+}
+
 /// Exécute les premiers kernels Metal du backend Rust expérimental.
 #[derive(Debug)]
 pub struct MetalExecutor {
@@ -177,6 +198,7 @@ pub struct MetalExecutor {
     linear_attn_rms_gate_dv128_f32: ComputePipelineState,
     linear_attn_rms_gate_batch_dv128_f32: ComputePipelineState,
     affine_gather_matmul_rhs_t_u32_f32: ComputePipelineState,
+    affine_gather_qmv_fast_u3_gs64_f32: ComputePipelineState,
     affine_gather_qmv_fast_u4_gs64_f32: ComputePipelineState,
     affine_gather_qmv_fast_u8_gs64_f32: ComputePipelineState,
     affine_gather_qmv_fast_u8_gs128_f32: ComputePipelineState,
@@ -184,7 +206,9 @@ pub struct MetalExecutor {
     affine_gather_qmv_fast_u8_gs128_tg128_f32: ComputePipelineState,
     affine_gather_qmv_fast_u8_gs64_tg256_f32: ComputePipelineState,
     affine_gather_qmv_fast_u8_gs128_tg256_f32: ComputePipelineState,
+    affine_gather_qmv_tail_u3_gs64_f32: ComputePipelineState,
     affine_gather_qmv_tail_u4_gs64_f32: ComputePipelineState,
+    affine_gather_gate_up_swiglu_fast_u3_gs64_f32: ComputePipelineState,
     affine_gather_gate_up_swiglu_fast_u4_gs64_f32: ComputePipelineState,
     affine_gather_gate_up_swiglu_fast_u8_gs64_f32: ComputePipelineState,
     affine_gather_gate_up_swiglu_fast_u8_gs128_f32: ComputePipelineState,
@@ -327,8 +351,11 @@ pub(crate) struct StackedMoeBuffers {
 #[derive(Clone, Debug)]
 pub(crate) struct StackedAffineBuffers {
     packed: Buffer,
+    packed_offset: NSUInteger,
     scales: Buffer,
+    scales_offset: NSUInteger,
     biases: Buffer,
+    biases_offset: NSUInteger,
     experts: usize,
     out_dim: usize,
     in_dim: usize,
@@ -348,8 +375,11 @@ pub(crate) enum MetalLinearWeightBuffers {
     },
     AffineQuantized {
         packed: Buffer,
+        packed_offset: NSUInteger,
         scales: Buffer,
+        scales_offset: NSUInteger,
         biases: Buffer,
+        biases_offset: NSUInteger,
         out_dim: usize,
         in_dim: usize,
         packed_cols: usize,
@@ -368,8 +398,11 @@ pub(crate) enum MetalEmbeddingWeightBuffers {
     },
     AffineQuantized {
         packed: Buffer,
+        packed_offset: NSUInteger,
         scales: Buffer,
+        scales_offset: NSUInteger,
         biases: Buffer,
+        biases_offset: NSUInteger,
         vocab: usize,
         dim: usize,
         packed_cols: usize,

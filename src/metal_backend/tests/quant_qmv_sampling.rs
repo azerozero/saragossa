@@ -308,12 +308,15 @@ fn shared_gate_up_swiglu_fast_u8_matches_cpu() -> Result<()> {
         let gate_affine = test_affine_varied_u8_group(out_dim, in_dim, group_size)?;
         let up_affine = {
             let affine = test_affine_varied_u8_group(out_dim, in_dim, group_size)?;
-            let scales = affine.scales().data().iter().map(|s| s * 1.25).collect();
+            let scales = affine.scales_f32().as_ref().iter().map(|s| s * 1.25).collect();
             AffineQuantizedTensor::new(
                 &[out_dim, in_dim / 4],
                 affine.packed_data().to_vec(),
                 Tensor::from_vec(vec![out_dim, in_dim / group_size], scales)?,
-                affine.biases().clone(),
+                Tensor::from_vec(
+                    affine.biases_shape().to_vec(),
+                    affine.biases_f32().into_owned(),
+                )?,
                 group_size,
                 8,
             )?
@@ -733,8 +736,8 @@ fn moe_down_weighted_shared_fused_matches_two_step() -> Result<()> {
         .set_compute_pipeline_state(&executor.affine_gather_down_weighted_shared_fast_u8_gs64_f32);
     encoder.set_buffer(0, Some(&lhs_buffer), 0);
     encoder.set_buffer(1, Some(&stacked.down.packed), 0);
-    encoder.set_buffer(2, Some(&stacked.down.scales), 0);
-    encoder.set_buffer(3, Some(&stacked.down.biases), 0);
+    encoder.set_buffer(2, Some(&stacked.down.scales), stacked.down.scales_offset);
+    encoder.set_buffer(3, Some(&stacked.down.biases), stacked.down.biases_offset);
     encoder.set_buffer(4, Some(&indices_buffer), 0);
     encoder.set_buffer(5, Some(&scores_buffer), 0);
     encoder.set_buffer(6, Some(&residual_buffer), 0);
@@ -1058,8 +1061,8 @@ fn qmm2_aligned_matches_cpu_both_rows() -> Result<()> {
     lhs2.extend_from_slice(&x1);
     let lhs_buf = executor.upload_f32_buffer(&lhs2, "qmm2_lhs")?;
     let packed = executor.cached_buffer_from_u32(gpu_w.packed_data(), "qmm2_packed")?;
-    let scales = executor.cached_buffer_from_f32_as_bf16(gpu_w.scales().data(), "qmm2_scales")?;
-    let biases = executor.cached_buffer_from_f32_as_bf16(gpu_w.biases().data(), "qmm2_biases")?;
+    let scales = executor.cached_buffer_from_f32_as_bf16(gpu_w.scales_f32().as_ref(), "qmm2_scales")?;
+    let biases = executor.cached_buffer_from_f32_as_bf16(gpu_w.biases_f32().as_ref(), "qmm2_biases")?;
     let out_buf = executor.uncached_f32_buffer(2 * out_dim, "qmm2_out")?;
     let packed_cols = in_dim / 8;
     let groups = in_dim / 64;
@@ -1711,7 +1714,7 @@ fn affine_gather_u3_prefill_fallback_dequantizes_like_cpu_bit_exact() -> Result<
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    let (out_dim, in_dim) = (8_usize, 256_usize);
+    let (out_dim, in_dim) = (8_usize, 64_usize);
     let weight = test_affine_mlx_u3(out_dim, in_dim)?;
     let dense = weight.dequantize()?;
     let [_, packed_cols] = weight.packed_shape() else {
@@ -1722,10 +1725,13 @@ fn affine_gather_u3_prefill_fallback_dequantizes_like_cpu_bit_exact() -> Result<
     let groups = in_dim / weight.group_size();
     let stacked = StackedAffineBuffers {
         packed: executor.buffer_from_slice(weight.packed_data(), "gather_u3_packed")?,
+        packed_offset: 0,
         scales: executor
-            .buffer_from_f32_as_bf16(weight.scales().data(), "gather_u3_scales")?,
+            .buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), "gather_u3_scales")?,
+        scales_offset: 0,
         biases: executor
-            .buffer_from_f32_as_bf16(weight.biases().data(), "gather_u3_biases")?,
+            .buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), "gather_u3_biases")?,
+        biases_offset: 0,
         experts: 1,
         out_dim,
         in_dim,
@@ -1767,6 +1773,288 @@ fn affine_gather_u3_prefill_fallback_dequantizes_like_cpu_bit_exact() -> Result<
                 actual[col * out_dim + row].to_bits(),
                 dense.data()[row * in_dim + col].to_bits(),
                 "gather u3 row={row} col={col}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn affine_gather_qmv_fast_u3_gs64_matches_cpu_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (experts, out_dim, in_dim) = (3_usize, 9_usize, 512_usize);
+    let (stacked, affine_experts) =
+        test_stacked_affine_varied_u3_group(&executor, experts, out_dim, in_dim, 5)?;
+    assert!(can_use_fast_gather_qmv(in_dim, &stacked));
+
+    let mut identity = vec![0.0_f32; in_dim * in_dim];
+    for index in 0..in_dim {
+        identity[index * in_dim + index] = 1.0;
+    }
+    let indices = (0..in_dim)
+        .map(|slot| (slot % experts) as u32)
+        .collect::<Vec<_>>();
+    let actual = gather_qmv_u3_values(
+        &executor,
+        &stacked,
+        &identity,
+        in_dim,
+        &indices,
+        GatherQmvU3Route::Full,
+        "gather_qmv_u3_full",
+    )?;
+    let dense = affine_experts
+        .iter()
+        .map(AffineQuantizedTensor::dequantize)
+        .collect::<Result<Vec<_>>>()?;
+
+    for (slot, expert) in indices.iter().copied().enumerate() {
+        for row in 0..out_dim {
+            let gpu = actual[slot * out_dim + row];
+            let cpu = dense[expert as usize].data()[row * in_dim + slot];
+            assert_eq!(
+                gpu.to_bits(),
+                cpu.to_bits(),
+                "gather qmv u3 plein CPU/GPU différent slot={slot} row={row}: \
+                 {gpu} vs {cpu}"
+            );
+        }
+    }
+
+    let mut lhs = varied_row(in_dim, 41);
+    lhs.extend_from_slice(&varied_row(in_dim, 43));
+    let indices = [2_u32, 0_u32];
+    let actual = gather_qmv_u3_values(
+        &executor,
+        &stacked,
+        &lhs,
+        indices.len(),
+        &indices,
+        GatherQmvU3Route::Full,
+        "gather_qmv_u3_full_varied",
+    )?;
+    let generic = generic_gather_qmv_u3_values(
+        &executor,
+        &stacked,
+        &lhs,
+        indices.len(),
+        &indices,
+        "gather_qmv_u3_generic_full",
+    )?;
+    assert_all_close_scaled(&actual, &generic, "gather qmv u3 plein/générique");
+    Ok(())
+}
+
+#[test]
+fn affine_gather_qmv_tail_u3_gs64_matches_cpu_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (experts, out_dim, in_dim) = (3_usize, 9_usize, 768_usize);
+    let (stacked, affine_experts) =
+        test_stacked_affine_varied_u3_group(&executor, experts, out_dim, in_dim, 11)?;
+    assert!(can_use_fast_gather_qmv(in_dim, &stacked));
+
+    let mut identity = vec![0.0_f32; in_dim * in_dim];
+    for index in 0..in_dim {
+        identity[index * in_dim + index] = 1.0;
+    }
+    let indices = (0..in_dim)
+        .map(|slot| ((slot + 1) % experts) as u32)
+        .collect::<Vec<_>>();
+    let actual = gather_qmv_u3_values(
+        &executor,
+        &stacked,
+        &identity,
+        in_dim,
+        &indices,
+        GatherQmvU3Route::Tail,
+        "gather_qmv_u3_tail",
+    )?;
+    let dense = affine_experts
+        .iter()
+        .map(AffineQuantizedTensor::dequantize)
+        .collect::<Result<Vec<_>>>()?;
+
+    for (slot, expert) in indices.iter().copied().enumerate() {
+        for row in 0..out_dim {
+            let gpu = actual[slot * out_dim + row];
+            let cpu = dense[expert as usize].data()[row * in_dim + slot];
+            assert_eq!(
+                gpu.to_bits(),
+                cpu.to_bits(),
+                "gather qmv u3 tail CPU/GPU différent slot={slot} row={row}: \
+                 {gpu} vs {cpu}"
+            );
+        }
+    }
+
+    let mut lhs = varied_row(in_dim, 47);
+    lhs.extend_from_slice(&varied_row(in_dim, 53));
+    let indices = [1_u32, 2_u32];
+    let actual = gather_qmv_u3_values(
+        &executor,
+        &stacked,
+        &lhs,
+        indices.len(),
+        &indices,
+        GatherQmvU3Route::Tail,
+        "gather_qmv_u3_tail_varied",
+    )?;
+    let generic = generic_gather_qmv_u3_values(
+        &executor,
+        &stacked,
+        &lhs,
+        indices.len(),
+        &indices,
+        "gather_qmv_u3_generic_tail",
+    )?;
+    assert_all_close_scaled(&actual, &generic, "gather qmv u3 tail/générique");
+    Ok(())
+}
+
+#[test]
+fn affine_gather_gate_up_swiglu_fast_u3_gs64_matches_split_bit_exact() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (experts, out_dim, topk) = (3_usize, 9_usize, 2_usize);
+    let indices = [2_u32, 0_u32];
+
+    for in_dim in [512_usize, 768_usize] {
+        let (gate, _) =
+            test_stacked_affine_varied_u3_group(&executor, experts, out_dim, in_dim, 17)?;
+        let (up, _) =
+            test_stacked_affine_varied_u3_group(&executor, experts, out_dim, in_dim, 29)?;
+        assert!(can_use_fast_gather_pair_qmv(topk, &gate, &up));
+        let mut lhs = varied_row(in_dim, 31);
+        lhs.extend_from_slice(&varied_row(in_dim, 37));
+        let lhs_buffer = executor.upload_f32_buffer(&lhs, "gather_gate_up_u3_lhs")?;
+        let indices_buffer =
+            executor.upload_u32_buffer(&indices, "gather_gate_up_u3_indices")?;
+        let gate_generic = generic_gather_qmv_u3_values(
+            &executor,
+            &gate,
+            &lhs,
+            topk,
+            &indices,
+            "gather_gate_u3_generic",
+        )?;
+        let up_generic = generic_gather_qmv_u3_values(
+            &executor,
+            &up,
+            &lhs,
+            topk,
+            &indices,
+            "gather_up_u3_generic",
+        )?;
+        let gate_buffer =
+            executor.upload_f32_buffer(&gate_generic, "gather_gate_u3_generic_output")?;
+        let up_buffer = executor.upload_f32_buffer(&up_generic, "gather_up_u3_generic_output")?;
+        let split_buffer =
+            executor.uncached_f32_buffer(topk * out_dim, "gather_swiglu_u3_split")?;
+        let fused_buffer =
+            executor.uncached_f32_buffer(topk * out_dim, "gather_swiglu_u3_fused")?;
+
+        let split_command = executor.queue.new_command_buffer();
+        let split_encoder = split_command.new_compute_command_encoder();
+        let mut split_owned = Vec::new();
+        executor.encode_swiglu(
+            split_encoder,
+            &mut split_owned,
+            &gate_buffer,
+            &up_buffer,
+            &split_buffer,
+            topk * out_dim,
+        )?;
+        split_encoder.end_encoding();
+        commit_and_wait(split_command)?;
+
+        let fused_command = executor.queue.new_command_buffer();
+        let fused_encoder = fused_command.new_compute_command_encoder();
+        let mut fused_owned = Vec::new();
+        let engaged = executor.encode_gather_gate_up_swiglu(
+            fused_encoder,
+            &mut fused_owned,
+            &lhs_buffer,
+            topk,
+            &gate,
+            &up,
+            &indices_buffer,
+            topk,
+            &fused_buffer,
+        )?;
+        assert!(engaged, "le fusé gather u3 doit accepter in_dim={in_dim}");
+        fused_encoder.end_encoding();
+        commit_and_wait(fused_command)?;
+
+        let split = read_f32_buffer(&split_buffer, topk * out_dim)?;
+        let fused = read_f32_buffer(&fused_buffer, topk * out_dim)?;
+        assert_all_close_scaled(
+            &fused,
+            &split,
+            &format!("gather gate/up u3 fusion/split in_dim={in_dim}"),
+        );
+    }
+    Ok(())
+}
+
+/// Routage PROD : `encode_gather_matmul` doit sélectionner les kernels u3
+/// rapides (plein à in_dim%512==0, tail au reliquat 256) et produire les mêmes
+/// valeurs que le chemin générique — y compris la forme chaude du decode MoE
+/// (`lhs_rows == 1`, broadcast sur topk). Ferme les deux angles morts de
+/// l'audit : une régression de l'échelle else-if du dispatcher (u3 tombant
+/// dans une branche u4/u8) ou du bloc `lhs_row` recopié serait attrapée ici.
+#[test]
+fn encode_gather_matmul_routes_u3_full_and_tail_shapes() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let out_dim = 9_usize;
+    let experts = 3_usize;
+    let indices = [2_u32, 0_u32];
+    let topk = indices.len();
+    for in_dim in [512_usize, 768_usize] {
+        let (stacked, _tensors) =
+            test_stacked_affine_varied_u3_group(&executor, experts, out_dim, in_dim, 29)?;
+        for lhs_rows in [1_usize, topk] {
+            let mut lhs = Vec::with_capacity(lhs_rows * in_dim);
+            for row in 0..lhs_rows {
+                lhs.extend_from_slice(&varied_row(in_dim, 59 + row * 11));
+            }
+            let input_buffer = executor.upload_f32_buffer(&lhs, "route_u3_input")?;
+            let indices_buffer = executor.upload_u32_buffer(&indices, "route_u3_indices")?;
+            let out_buffer = executor.uncached_f32_buffer(topk * out_dim, "route_u3_out")?;
+            let command = executor.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            let mut owned = Vec::new();
+            executor.encode_gather_matmul(
+                encoder,
+                &mut owned,
+                &input_buffer,
+                lhs_rows,
+                &stacked,
+                &indices_buffer,
+                topk,
+                &out_buffer,
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command)?;
+            let routed = read_f32_buffer(&out_buffer, topk * out_dim)?;
+            let generic = generic_gather_qmv_u3_values(
+                &executor,
+                &stacked,
+                &lhs,
+                lhs_rows,
+                &indices,
+                "route_u3_generic",
+            )?;
+            assert_all_close_scaled(
+                &routed,
+                &generic,
+                &format!("routage gather u3 in_dim={in_dim} lhs_rows={lhs_rows}"),
             );
         }
     }
@@ -2051,8 +2339,8 @@ fn affine_qmv_one_u8_gs64_matches_cpu_on_shared_gate_shape() -> Result<()> {
     let cpu = weight.matmul_rhs_t(&input)?;
     let lhs_buf = executor.upload_f32_buffer(&lhs, "qmv_one_u8_lhs")?;
     let packed = executor.buffer_from_slice(weight.packed_data(), "qmv_one_u8_packed")?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), "qmv_one_u8_scales")?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), "qmv_one_u8_biases")?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), "qmv_one_u8_scales")?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), "qmv_one_u8_biases")?;
     let out_buf = executor.uncached_f32_buffer(batch * out_dim, "qmv_one_u8_out")?;
     let [_, packed_cols] = weight.packed_shape() else {
         return Err(InferError::Dimension(format!(
@@ -2244,6 +2532,31 @@ fn test_affine_varied_u6(out_dim: usize, in_dim: usize) -> Result<AffineQuantize
 }
 
 /// Ligne d'activation déterministe variée (valeurs signées non triviales).
+/// Égalité numérique à tolérance SERRÉE, relative à l'ÉCHELLE DU VECTEUR, pour
+/// comparer le chemin fast au chemin générique/split : leurs ordres
+/// d'accumulation flottante diffèrent (`scale·Σ(x·c)` par groupe gs64 vs
+/// `Σ(scale·x·c)` séquentiel) → l'égalité bit-à-bit est structurellement
+/// inatteignable, comme pour les gathers u4 prod. La tolérance par élément
+/// serait piégée par l'annulation catastrophique (un dot-product proche de 0 a
+/// une erreur RELATIVE non bornée alors que l'erreur absolue reste ~1 ulp de
+/// l'échelle des sommes partielles). Le déballage/indexation u3, lui, reste
+/// testé bit-exact (`…dequantizes_like_cpu_bit_exact`) : une erreur de code u3
+/// décalerait d'un facteur ≥ 1/7 ≈ 0,14 — invisible à 1e-5 d'échelle, criante
+/// au bit-exact du déballage.
+fn assert_all_close_scaled(actual: &[f32], expected: &[f32], context: &str) {
+    let scale = expected
+        .iter()
+        .fold(0.0f32, |acc, value| acc.max(value.abs()))
+        .max(1e-6);
+    for (index, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        let diff = (a - e).abs();
+        assert!(
+            diff <= 1e-5 * scale,
+            "{context} index={index}: {a} vs {e} (diff {diff:e}, échelle {scale:e})"
+        );
+    }
+}
+
 fn varied_row(in_dim: usize, salt: usize) -> Vec<f32> {
     (0..in_dim)
         .map(|i| ((((i * 37 + salt * 101) % 113) as f32) - 56.0) / 71.0)
@@ -2278,8 +2591,8 @@ fn generic_affine_reference(
     }
     let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
     let packed = executor.buffer_from_slice(weight.packed_data(), label)?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), label)?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), label)?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), label)?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), label)?;
     let out_buf = executor.uncached_f32_buffer(batch * *out_dim, label)?;
     let groups = *weight_in_dim / weight.group_size();
     let dims: [u32; 4] = [
@@ -2347,8 +2660,8 @@ fn fast_qmv_u6_reference(
     }
     let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
     let packed = executor.buffer_from_slice(weight.packed_data(), label)?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), label)?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), label)?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), label)?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), label)?;
     let out_buf = executor.uncached_f32_buffer(batch * *out_dim, label)?;
     let groups = *weight_in_dim / weight.group_size();
     let dims: [u32; 4] = [
@@ -2410,8 +2723,8 @@ fn fast_qmv_u8_reference(
     }
     let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
     let packed = executor.buffer_from_slice(weight.packed_data(), label)?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), label)?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), label)?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), label)?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), label)?;
     let out_buf = executor.uncached_f32_buffer(batch * *out_dim, label)?;
     let groups = *weight_in_dim / weight.group_size();
     let dims: [u32; 4] = [
@@ -2490,8 +2803,8 @@ fn qmm_na_qb_reference(
                 let word = weight.packed_data()[nn * *packed_cols + kk / values_per_word];
                 let q = (word >> ((kk % values_per_word) * bits)) & mask;
                 let group = kk / weight.group_size();
-                let scale = bf16_round(weight.scales().data()[nn * groups + group]);
-                let bias = bf16_round(weight.biases().data()[nn * groups + group]);
+                let scale = bf16_round(weight.scales_f32().as_ref()[nn * groups + group]);
+                let bias = bf16_round(weight.biases_f32().as_ref()[nn * groups + group]);
                 let deq = bf16_round(q as f32 * scale + bias);
                 acc += bf16_round(lhs[bb * *in_dim + kk]) * deq;
             }
@@ -2592,8 +2905,8 @@ fn fast_qmv_u8_tg128(
     }
     let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
     let packed = executor.buffer_from_slice(weight.packed_data(), label)?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), label)?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), label)?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), label)?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), label)?;
     let out_buf = executor.uncached_f32_buffer(batch * *out_dim, label)?;
     let groups = *weight_in_dim / weight.group_size();
     let dims: [u32; 4] = [
@@ -2659,8 +2972,8 @@ fn fast_qmv_u8_tg256(
     }
     let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
     let packed = executor.buffer_from_slice(weight.packed_data(), label)?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), label)?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), label)?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), label)?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), label)?;
     let out_buf = executor.uncached_f32_buffer(batch * *out_dim, label)?;
     let groups = *weight_in_dim / weight.group_size();
     let dims: [u32; 4] = [
@@ -2726,8 +3039,8 @@ fn fast_qmv_u8_dot4(
     }
     let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
     let packed = executor.buffer_from_slice(weight.packed_data(), label)?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), label)?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), label)?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), label)?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), label)?;
     let out_buf = executor.uncached_f32_buffer(batch * *out_dim, label)?;
     let groups = *weight_in_dim / weight.group_size();
     let dims: [u32; 4] = [
@@ -2790,15 +3103,13 @@ fn test_stacked_affine_varied_u8_group(
         packed.extend_from_slice(affine.packed_data());
         scales.extend(
             affine
-                .scales()
-                .data()
+                .scales_f32()
                 .iter()
                 .map(|value| bf16_round(*value * (1.0 + 0.03 * expert as f32))),
         );
         biases.extend(
             affine
-                .biases()
-                .data()
+                .biases_f32()
                 .iter()
                 .map(|value| bf16_round(*value + 0.002 * expert as f32)),
         );
@@ -2806,8 +3117,11 @@ fn test_stacked_affine_varied_u8_group(
 
     Ok(StackedAffineBuffers {
         packed: executor.buffer_from_slice(&packed, "stacked_u8_packed")?,
+        packed_offset: 0,
         scales: executor.buffer_from_f32_as_bf16(&scales, "stacked_u8_scales")?,
+        scales_offset: 0,
         biases: executor.buffer_from_f32_as_bf16(&biases, "stacked_u8_biases")?,
+        biases_offset: 0,
         experts,
         out_dim,
         in_dim,
@@ -2816,6 +3130,82 @@ fn test_stacked_affine_varied_u8_group(
         bits: 8,
         groups,
     })
+}
+
+fn test_stacked_affine_varied_u3_group(
+    executor: &MetalExecutor,
+    experts: usize,
+    out_dim: usize,
+    in_dim: usize,
+    salt: usize,
+) -> Result<(StackedAffineBuffers, Vec<AffineQuantizedTensor>)> {
+    let bits = FAST_QMV_U3_BITS;
+    let group_size = FAST_QMV_GROUP_SIZE;
+    let packed_cols = in_dim * bits / 32;
+    let groups = in_dim / group_size;
+    let mut stacked_packed = Vec::with_capacity(experts * out_dim * packed_cols);
+    let mut stacked_scales = Vec::with_capacity(experts * out_dim * groups);
+    let mut stacked_biases = Vec::with_capacity(experts * out_dim * groups);
+    let mut affine_experts = Vec::with_capacity(experts);
+
+    for expert in 0..experts {
+        let mut packed = vec![0_u32; out_dim * packed_cols];
+        for row in 0..out_dim {
+            for col in 0..in_dim {
+                let q = ((expert * 11 + row * 7 + col * 3 + col / 64 + salt) % 8) as u32;
+                let bit_offset = col * bits;
+                let word_col = bit_offset / 32;
+                let shift = bit_offset % 32;
+                let row_word = row * packed_cols + word_col;
+                packed[row_word] |= q << shift;
+                if shift + bits > 32 {
+                    packed[row_word + 1] |= q >> (32 - shift);
+                }
+            }
+        }
+        let scales = (0..out_dim * groups)
+            .map(|index| {
+                bf16_round(
+                    0.0018 + 0.000_04 * ((expert + index + salt) % 17) as f32,
+                )
+            })
+            .collect::<Vec<_>>();
+        let biases = (0..out_dim * groups)
+            .map(|index| {
+                bf16_round(
+                    -0.018 + 0.000_5 * ((expert * 3 + index + salt) % 23) as f32,
+                )
+            })
+            .collect::<Vec<_>>();
+        stacked_packed.extend_from_slice(&packed);
+        stacked_scales.extend_from_slice(&scales);
+        stacked_biases.extend_from_slice(&biases);
+        affine_experts.push(AffineQuantizedTensor::new(
+            &[out_dim, packed_cols],
+            packed,
+            Tensor::from_vec(vec![out_dim, groups], scales)?,
+            Tensor::from_vec(vec![out_dim, groups], biases)?,
+            group_size,
+            bits,
+        )?);
+    }
+
+    let stacked = StackedAffineBuffers {
+        packed: executor.buffer_from_slice(&stacked_packed, "stacked_u3_packed")?,
+        packed_offset: 0,
+        scales: executor.buffer_from_f32_as_bf16(&stacked_scales, "stacked_u3_scales")?,
+        scales_offset: 0,
+        biases: executor.buffer_from_f32_as_bf16(&stacked_biases, "stacked_u3_biases")?,
+        biases_offset: 0,
+        experts,
+        out_dim,
+        in_dim,
+        packed_cols,
+        group_size,
+        bits,
+        groups,
+    };
+    Ok((stacked, affine_experts))
 }
 
 fn test_stacked_affine_varied_u4_group(
@@ -2856,8 +3246,11 @@ fn test_stacked_affine_varied_u4_group(
 
     Ok(StackedAffineBuffers {
         packed: executor.buffer_from_slice(&packed, "stacked_u4_packed")?,
+        packed_offset: 0,
         scales: executor.buffer_from_f32_as_bf16(&scales, "stacked_u4_scales")?,
+        scales_offset: 0,
         biases: executor.buffer_from_f32_as_bf16(&biases, "stacked_u4_biases")?,
+        biases_offset: 0,
         experts,
         out_dim,
         in_dim,
@@ -2873,6 +3266,130 @@ enum GatherQmvU8Route {
     Tg64,
     Tg128,
     Tg256,
+}
+
+#[derive(Clone, Copy)]
+enum GatherQmvU3Route {
+    Full,
+    Tail,
+}
+
+fn gather_qmv_u3_values(
+    executor: &MetalExecutor,
+    weight: &StackedAffineBuffers,
+    lhs: &[f32],
+    lhs_rows: usize,
+    indices: &[u32],
+    route: GatherQmvU3Route,
+    label: &'static str,
+) -> Result<Vec<f32>> {
+    let topk = indices.len();
+    if lhs.len() != lhs_rows * weight.in_dim {
+        return Err(InferError::Dimension(format!(
+            "{label}: lhs len={} incompatible lhs_rows={lhs_rows} in_dim={}",
+            lhs.len(),
+            weight.in_dim
+        )));
+    }
+    let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
+    let indices_buf = executor.upload_u32_buffer(indices, label)?;
+    let out_buf = executor.uncached_f32_buffer(topk * weight.out_dim, label)?;
+    let dims = [
+        topk as u32,
+        weight.out_dim as u32,
+        weight.in_dim as u32,
+        weight.packed_cols as u32,
+    ];
+    let quant = [
+        weight.group_size as u32,
+        weight.bits as u32,
+        weight.groups as u32,
+        lhs_rows as u32,
+    ];
+    let pipeline = match route {
+        GatherQmvU3Route::Full => &executor.affine_gather_qmv_fast_u3_gs64_f32,
+        GatherQmvU3Route::Tail => &executor.affine_gather_qmv_tail_u3_gs64_f32,
+    };
+
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(&lhs_buf), 0);
+    encoder.set_buffer(1, Some(&weight.packed), weight.packed_offset);
+    encoder.set_buffer(2, Some(&weight.scales), weight.scales_offset);
+    encoder.set_buffer(3, Some(&weight.biases), weight.biases_offset);
+    encoder.set_buffer(4, Some(&indices_buf), 0);
+    encoder.set_buffer(5, Some(&out_buf), 0);
+    encoder.set_bytes(6, 16, dims.as_ptr().cast());
+    encoder.set_bytes(7, 16, quant.as_ptr().cast());
+    encoder.dispatch_thread_groups(
+        MTLSize::new(topk as u64, (weight.out_dim as u64).div_ceil(8), 1),
+        MTLSize::new(64, 1, 1),
+    );
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    read_f32_buffer(&out_buf, topk * weight.out_dim)
+}
+
+fn generic_gather_qmv_u3_values(
+    executor: &MetalExecutor,
+    weight: &StackedAffineBuffers,
+    lhs: &[f32],
+    lhs_rows: usize,
+    indices: &[u32],
+    label: &'static str,
+) -> Result<Vec<f32>> {
+    let topk = indices.len();
+    if lhs.len() != lhs_rows * weight.in_dim {
+        return Err(InferError::Dimension(format!(
+            "{label}: lhs len={} incompatible lhs_rows={lhs_rows} in_dim={}",
+            lhs.len(),
+            weight.in_dim
+        )));
+    }
+    let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
+    let indices_buf = executor.upload_u32_buffer(indices, label)?;
+    let out_buf = executor.uncached_f32_buffer(topk * weight.out_dim, label)?;
+    let dims = [
+        topk as u32,
+        weight.out_dim as u32,
+        weight.in_dim as u32,
+        weight.packed_cols as u32,
+    ];
+    let quant = [
+        weight.group_size as u32,
+        weight.bits as u32,
+        weight.groups as u32,
+        lhs_rows as u32,
+    ];
+
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&executor.affine_gather_matmul_rhs_t_u32_f32);
+    encoder.set_buffer(0, Some(&lhs_buf), 0);
+    encoder.set_buffer(1, Some(&weight.packed), weight.packed_offset);
+    encoder.set_buffer(2, Some(&weight.scales), weight.scales_offset);
+    encoder.set_buffer(3, Some(&weight.biases), weight.biases_offset);
+    encoder.set_buffer(4, Some(&indices_buf), 0);
+    encoder.set_buffer(5, Some(&out_buf), 0);
+    encoder.set_bytes(6, 16, dims.as_ptr().cast());
+    encoder.set_bytes(7, 16, quant.as_ptr().cast());
+    encoder.dispatch_thread_groups(
+        MTLSize::new(weight.out_dim as u64, topk as u64, 1),
+        MTLSize::new(
+            executor
+                .affine_gather_matmul_rhs_t_u32_f32
+                .thread_execution_width()
+                .max(1),
+            1,
+            1,
+        ),
+    );
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    read_f32_buffer(&out_buf, topk * weight.out_dim)
 }
 
 fn gather_qmv_u8_values(
@@ -2931,8 +3448,8 @@ fn gather_qmv_u8_values(
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(&lhs_buf), 0);
     encoder.set_buffer(1, Some(&weight.packed), 0);
-    encoder.set_buffer(2, Some(&weight.scales), 0);
-    encoder.set_buffer(3, Some(&weight.biases), 0);
+    encoder.set_buffer(2, Some(&weight.scales), weight.scales_offset);
+    encoder.set_buffer(3, Some(&weight.biases), weight.biases_offset);
     encoder.set_buffer(4, Some(&indices_buf), 0);
     encoder.set_buffer(5, Some(&out_buf), 0);
     encoder.set_bytes(6, 16, dims.as_ptr().cast());

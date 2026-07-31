@@ -11,6 +11,7 @@ use crate::RuntimeKind;
 const WARMUP_PROMPT: &str = "warmup";
 const DEFAULT_WARMUP_PASSES: usize = 2;
 const DEFAULT_WARMUP_PROMPT_TOKENS: usize = 32;
+const MTP_WARMUP_TOKENS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WarmupConfig {
@@ -64,6 +65,52 @@ pub(super) fn decoder(
         report.passes,
         report.prompt_tokens,
         report.elapsed.as_millis()
+    );
+    Ok(())
+}
+
+/// Réchauffe la voie MTP Metal avec quatre tokens.
+///
+/// # Errors
+///
+/// Renvoie une erreur si l'encodage ou la génération MTP échoue.
+pub(super) fn mtp_decoder(
+    decoder: &CausalDecoder,
+    assets: &ModelAssets,
+    backend: RuntimeKind,
+    model_id: &str,
+) -> ServeResult<()> {
+    if backend != RuntimeKind::Metal {
+        return Ok(());
+    }
+    let prompt = assets
+        .encode_prompt_with_special(WARMUP_PROMPT)?
+        .into_iter()
+        .map(|id| {
+            usize::try_from(id).map_err(|_| {
+                ServeError::args(format!(
+                    "token warmup MTP hors plage pour cette plateforme: {id}"
+                ))
+            })
+        })
+        .collect::<ServeResult<Vec<_>>>()?;
+    if prompt.is_empty() {
+        return Err(ServeError::args("prompt token vide pour le warmup MTP"));
+    }
+    let options = saragossa::GenerationOptions {
+        stop_token_ids: assets.stop_token_ids(),
+        ..saragossa::GenerationOptions::default()
+    };
+    let started = Instant::now();
+    let _ = decoder.generate_greedy_mtp_batched_with_options(
+        &prompt,
+        MTP_WARMUP_TOKENS,
+        &options,
+        super::mtp::max_draft_tokens(),
+    )?;
+    eprintln!(
+        "saragossa serve warmup MTP model={model_id} tokens={MTP_WARMUP_TOKENS} elapsed_ms={}",
+        started.elapsed().as_millis()
     );
     Ok(())
 }

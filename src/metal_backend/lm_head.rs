@@ -831,8 +831,11 @@ impl MetalExecutor {
     ) -> Result<()> {
         let MetalLinearWeightBuffers::AffineQuantized {
             packed,
+            packed_offset,
             scales,
+            scales_offset,
             biases,
+            biases_offset,
             packed_cols,
             group_size,
             bits,
@@ -865,9 +868,9 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(&self.affine_argmax_qmv_fast_u4_gs64_f32);
         encoder.set_buffer(0, Some(input_buffer), input_offset);
-        encoder.set_buffer(1, Some(packed), 0);
-        encoder.set_buffer(2, Some(scales), 0);
-        encoder.set_buffer(3, Some(biases), 0);
+        encoder.set_buffer(1, Some(packed), *packed_offset);
+        encoder.set_buffer(2, Some(scales), *scales_offset);
+        encoder.set_buffer(3, Some(biases), *biases_offset);
         encoder.set_buffer(4, Some(&partial_values), 0);
         encoder.set_buffer(5, Some(&partial_indices), 0);
         set_u32_bytes(encoder, 6, &dims, "argmax_fast_dims")?;
@@ -957,8 +960,11 @@ impl MetalExecutor {
             .checked_div(weight.group_size())
             .ok_or_else(|| InferError::Metal("group_size argmax nul".to_string()))?;
         let packed_buffer = self.cached_affine_packed(weight, "argmax_packed")?;
+        let packed_offset = affine_packed_offset(weight)?;
         let scales_buffer = self.cached_affine_scales(weight, "argmax_scales")?;
+        let scales_offset = affine_scales_offset(weight)?;
         let biases_buffer = self.cached_affine_biases(weight, "argmax_biases")?;
+        let biases_offset = affine_biases_offset(weight)?;
         let dims = [
             checked_u32(out_dim, "argmax fast out_dim")?,
             checked_u32(in_dim, "argmax fast in_dim")?,
@@ -967,9 +973,9 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(&self.affine_argmax_qmv_fast_u4_gs64_f32);
         encoder.set_buffer(0, Some(input_buffer), 0);
-        encoder.set_buffer(1, Some(&packed_buffer), 0);
-        encoder.set_buffer(2, Some(&scales_buffer), 0);
-        encoder.set_buffer(3, Some(&biases_buffer), 0);
+        encoder.set_buffer(1, Some(&packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(&scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(&biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(partial_values), 0);
         encoder.set_buffer(5, Some(partial_indices), 0);
         set_u32_bytes(encoder, 6, &dims, "argmax_fast_dims")?;

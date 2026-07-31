@@ -760,8 +760,11 @@ impl MetalExecutor {
         }
         let MetalLinearWeightBuffers::AffineQuantized {
             packed,
+            packed_offset,
             scales,
+            scales_offset,
             biases,
+            biases_offset,
             out_dim,
             in_dim: weight_in_dim,
             packed_cols,
@@ -817,9 +820,9 @@ impl MetalExecutor {
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed), 0);
-        encoder.set_buffer(2, Some(scales), 0);
-        encoder.set_buffer(3, Some(biases), 0);
+        encoder.set_buffer(1, Some(packed), *packed_offset);
+        encoder.set_buffer(2, Some(scales), *scales_offset);
+        encoder.set_buffer(3, Some(biases), *biases_offset);
         encoder.set_buffer(4, Some(qkv_output_buffer), 0);
         encoder.set_buffer(5, Some(q_output_buffer), 0);
         encoder.set_buffer(6, Some(gate_output_buffer), 0);
@@ -861,8 +864,11 @@ impl MetalExecutor {
         }
         let MetalLinearWeightBuffers::AffineQuantized {
             packed,
+            packed_offset,
             scales,
+            scales_offset,
             biases,
+            biases_offset,
             out_dim,
             in_dim: weight_in_dim,
             packed_cols,
@@ -921,9 +927,9 @@ impl MetalExecutor {
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(rms_weight_buffer), 0);
-        encoder.set_buffer(2, Some(packed), 0);
-        encoder.set_buffer(3, Some(scales), 0);
-        encoder.set_buffer(4, Some(biases), 0);
+        encoder.set_buffer(2, Some(packed), *packed_offset);
+        encoder.set_buffer(3, Some(scales), *scales_offset);
+        encoder.set_buffer(4, Some(biases), *biases_offset);
         encoder.set_buffer(5, Some(qkv_output_buffer), 0);
         encoder.set_buffer(6, Some(q_output_buffer), 0);
         encoder.set_buffer(7, Some(gate_output_buffer), 0);
@@ -957,8 +963,11 @@ impl MetalExecutor {
         }
         let MetalLinearWeightBuffers::AffineQuantized {
             packed,
+            packed_offset,
             scales,
+            scales_offset,
             biases,
+            biases_offset,
             out_dim,
             in_dim: weight_in_dim,
             packed_cols,
@@ -998,9 +1007,9 @@ impl MetalExecutor {
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(ctx_buffer), 0);
         encoder.set_buffer(1, Some(gate_buffer), 0);
-        encoder.set_buffer(2, Some(packed), 0);
-        encoder.set_buffer(3, Some(scales), 0);
-        encoder.set_buffer(4, Some(biases), 0);
+        encoder.set_buffer(2, Some(packed), *packed_offset);
+        encoder.set_buffer(3, Some(scales), *scales_offset);
+        encoder.set_buffer(4, Some(biases), *biases_offset);
         encoder.set_buffer(5, Some(output_buffer), 0);
         set_u32_bytes(encoder, 6, &fast_dims, "full_o_gated_dims")?;
         profile_dispatch();
