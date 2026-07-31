@@ -30,7 +30,7 @@ the **single-user latency × Apple Silicon** quadrant:
 
 | Domain | Details |
 |---|---|
-| LLM | Qwen3.x dense and MoE (27B / 30B / 35B-A3B), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u4 / u6 / u8 quantization at group sizes 32–128, bf16 scales/biases |
+| LLM | Qwen3.x dense and MoE (27B / 30B / 35B-A3B), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u2–u8 (incl. mixed 3/4-bit) quantization at group sizes 32–128, bf16 scales/biases |
 | STT | Whisper large-v3-turbo (resident encoder + decoder, bf16 Neural-Accelerator GEMM) |
 | TTS | Qwen3-TTS: resident talker + GPU codec + intra-sentence streaming |
 | Embeddings | e5-small, pure Rust (CPU) — for semantic memory / RAG |
@@ -87,8 +87,9 @@ averaged over 5 prompts):
 | `u3` uniform | ~3.5 | 11 GB | 37 tok/s | degraded (KL 0.30) |
 | `u2` mixed 2/3² | 2.9 | 9 GB | — | too degraded (KL 0.58) |
 
-¹ A 27B `u4` fits a **24 GB** Mac: after warmup the decoder frees the 2nd CPU
-copy of the weights (GPU-resident only) → ~23.4 GB footprint (dense).
+¹ A 27B `u4` fits a **24 GB** Mac: the single-copy unified-memory loader (v0.3)
+stores weights once, in the shared Metal buffer → ~22 GB footprint (dense);
+the 35B-A3B MoE drops from 40.5 to 19.4 GB.
 ² Sensitivity-based mixed quant: the most sensitive layers move up one bit.
 
 **fp8** loads but a 27B (29 GB) saturates a 24-32 GB Mac — prefer `u6`/`u8` for
