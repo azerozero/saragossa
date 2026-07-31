@@ -1,5 +1,6 @@
 //! Allocation, cache et résolution des buffers Metal.
 
+use super::moe::MoeStackTraceContext;
 use super::*;
 
 impl MetalExecutor {
@@ -50,8 +51,11 @@ impl MetalExecutor {
                 })?;
                 Ok(MetalEmbeddingWeightBuffers::AffineQuantized {
                     packed: self.cached_affine_packed(weight, "resident_embed_packed")?,
+                    packed_offset: affine_packed_offset(weight)?,
                     scales: self.cached_affine_scales(weight, "resident_embed_scales")?,
+                    scales_offset: affine_scales_offset(weight)?,
                     biases: self.cached_affine_biases(weight, "resident_embed_biases")?,
+                    biases_offset: affine_biases_offset(weight)?,
                     vocab: *vocab,
                     dim: *dim,
                     packed_cols: *packed_cols,
@@ -150,15 +154,25 @@ impl MetalExecutor {
         &self,
         weights: LinearAttnResidentWeights<'_>,
     ) -> Result<MetalLinearAttnResidentDenseWeights> {
-        let full = match self.resolve_linear_attn_resident_weights(weights) {
-            Ok(weights) => Some(weights),
-            Err(InferError::Dimension(error)) => {
-                if crate::runtime_flags::trace_resident_enabled() {
-                    eprintln!("linear-attn resident full concat: fallback ({error})");
+        let full_sources = [
+            weights.in_proj_qkv.weight(),
+            weights.in_proj_z.weight(),
+            weights.in_proj_b.weight(),
+            weights.in_proj_a.weight(),
+        ];
+        let full = if self.concat_duplication_worth_avoiding(&full_sources) {
+            None
+        } else {
+            match self.resolve_linear_attn_resident_weights(weights) {
+                Ok(weights) => Some(weights),
+                Err(InferError::Dimension(error)) => {
+                    if crate::runtime_flags::trace_resident_enabled() {
+                        eprintln!("linear-attn resident full concat: fallback ({error})");
+                    }
+                    None
                 }
-                None
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
         Ok(MetalLinearAttnResidentDenseWeights {
             full,
@@ -176,17 +190,24 @@ impl MetalExecutor {
                 "resident_la_in_proj_b",
                 "resident_la_in_proj_a",
             )?,
-            z_beta_gate: match self.resolve_concat_linear_weight_buffers(
-                &[
+            z_beta_gate: {
+                let sources = [
                     weights.in_proj_z.weight(),
                     weights.in_proj_b.weight(),
                     weights.in_proj_a.weight(),
-                ],
-                "resident_la_in_proj_z_beta_gate",
-            ) {
-                Ok(weights) => Some(weights),
-                Err(InferError::Dimension(_)) => None,
-                Err(error) => return Err(error),
+                ];
+                if self.concat_duplication_worth_avoiding(&sources) {
+                    None
+                } else {
+                    match self.resolve_concat_linear_weight_buffers(
+                        &sources,
+                        "resident_la_in_proj_z_beta_gate",
+                    ) {
+                        Ok(weights) => Some(weights),
+                        Err(InferError::Dimension(_)) => None,
+                        Err(error) => return Err(error),
+                    }
+                }
             },
             out_proj: self
                 .resolve_linear_weight_buffers(weights.out_proj.weight(), "resident_la_out")?,
@@ -198,7 +219,7 @@ impl MetalExecutor {
         })
     }
 
-    fn resolve_linear_attn_pair_weights(
+    pub(super) fn resolve_linear_attn_pair_weights(
         &self,
         first: &Linear,
         second: &Linear,
@@ -206,15 +227,21 @@ impl MetalExecutor {
         first_label: &'static str,
         second_label: &'static str,
     ) -> Result<MetalLinearAttnResidentPairWeights> {
-        let resolved = match self
-            .resolve_concat_linear_weight_buffers(&[first.weight(), second.weight()], concat_label)
-        {
-            Ok(weights) => MetalLinearAttnResidentPairWeights::Concat(weights),
-            Err(InferError::Dimension(_)) => Ok(MetalLinearAttnResidentPairWeights::Split {
+        let sources = [first.weight(), second.weight()];
+        let resolved = if self.concat_would_duplicate_affine_storage(&sources) {
+            MetalLinearAttnResidentPairWeights::Split {
                 first: self.resolve_linear_weight_buffers(first.weight(), first_label)?,
                 second: self.resolve_linear_weight_buffers(second.weight(), second_label)?,
-            })?,
-            Err(error) => return Err(error),
+            }
+        } else {
+            match self.resolve_concat_linear_weight_buffers(&sources, concat_label) {
+                Ok(weights) => MetalLinearAttnResidentPairWeights::Concat(weights),
+                Err(InferError::Dimension(_)) => MetalLinearAttnResidentPairWeights::Split {
+                    first: self.resolve_linear_weight_buffers(first.weight(), first_label)?,
+                    second: self.resolve_linear_weight_buffers(second.weight(), second_label)?,
+                },
+                Err(error) => return Err(error),
+            }
         };
         if crate::runtime_flags::trace_resident_enabled() {
             trace_linear_attn_pair(concat_label, &resolved);
@@ -229,6 +256,57 @@ impl MetalExecutor {
         shared_expert: &GatedMlp,
         shared_gate: &Linear,
     ) -> Result<MetalMoeSharedWeights> {
+        self.resolve_moe_shared_weights_with_context(
+            router,
+            experts,
+            shared_expert,
+            shared_gate,
+            MoeStackTraceContext::runtime(),
+        )
+    }
+
+    pub(crate) fn resolve_moe_shared_weights_for_cpu_release(
+        &self,
+        router: &Linear,
+        experts: &[GatedMlp],
+        shared_expert: &GatedMlp,
+        shared_gate: &Linear,
+        layer_index: Option<usize>,
+    ) -> Result<MetalMoeSharedWeights> {
+        self.resolve_moe_shared_weights_with_context(
+            router,
+            experts,
+            shared_expert,
+            shared_gate,
+            MoeStackTraceContext::cpu_release(layer_index),
+        )
+    }
+
+    pub(crate) fn resolve_moe_shared_weights_for_prefill(
+        &self,
+        router: &Linear,
+        experts: &[GatedMlp],
+        shared_expert: &GatedMlp,
+        shared_gate: &Linear,
+        layer_index: usize,
+    ) -> Result<MetalMoeSharedWeights> {
+        self.resolve_moe_shared_weights_with_context(
+            router,
+            experts,
+            shared_expert,
+            shared_gate,
+            MoeStackTraceContext::prefill(layer_index),
+        )
+    }
+
+    fn resolve_moe_shared_weights_with_context(
+        &self,
+        router: &Linear,
+        experts: &[GatedMlp],
+        shared_expert: &GatedMlp,
+        shared_gate: &Linear,
+        trace_context: MoeStackTraceContext,
+    ) -> Result<MetalMoeSharedWeights> {
         ensure_biasless(router, "router")?;
         ensure_biasless(shared_gate, "shared_gate")?;
         let (shared_gate_proj, shared_up_proj, shared_down_proj) = shared_expert.projections();
@@ -237,7 +315,7 @@ impl MetalExecutor {
         ensure_biasless(shared_down_proj, "shared_down_proj")?;
         let weights = MetalMoeSharedWeights {
             router: self.resolve_linear_weight_buffers(router.weight(), "resident_moe_router")?,
-            stacked: self.stacked_moe_buffers(experts)?,
+            stacked: self.stacked_moe_buffers_with_context(experts, trace_context)?,
             shared_gate: self
                 .resolve_linear_weight_buffers(shared_gate.weight(), "resident_shared_gate")?,
             shared_gate_proj: self.resolve_linear_weight_buffers(
@@ -266,10 +344,36 @@ impl MetalExecutor {
         router: &Linear,
         experts: &[GatedMlp],
     ) -> Result<MetalMoeRoutedWeights> {
+        self.resolve_moe_routed_weights_with_context(
+            router,
+            experts,
+            MoeStackTraceContext::runtime(),
+        )
+    }
+
+    pub(crate) fn resolve_moe_routed_weights_for_cpu_release(
+        &self,
+        router: &Linear,
+        experts: &[GatedMlp],
+        layer_index: Option<usize>,
+    ) -> Result<MetalMoeRoutedWeights> {
+        self.resolve_moe_routed_weights_with_context(
+            router,
+            experts,
+            MoeStackTraceContext::cpu_release(layer_index),
+        )
+    }
+
+    fn resolve_moe_routed_weights_with_context(
+        &self,
+        router: &Linear,
+        experts: &[GatedMlp],
+        trace_context: MoeStackTraceContext,
+    ) -> Result<MetalMoeRoutedWeights> {
         ensure_biasless(router, "router")?;
         Ok(MetalMoeRoutedWeights {
             router: self.resolve_linear_weight_buffers(router.weight(), "resident_moe_router")?,
-            stacked: self.stacked_moe_buffers(experts)?,
+            stacked: self.stacked_moe_buffers_with_context(experts, trace_context)?,
         })
     }
 
@@ -301,6 +405,76 @@ impl MetalExecutor {
         label: &'static str,
     ) -> Result<metal::Buffer> {
         self.buffer_from_slice(data, label)
+    }
+
+    /// Alloue le stockage partagé définitif d'un payload de poids quantifié.
+    pub(crate) fn weight_buffer_from_u32(&self, data: &[u32]) -> Result<metal::Buffer> {
+        self.buffer_from_u32(data, "single_copy_weight_packed")
+    }
+
+    /// Alloue le stockage partagé définitif d'un payload bf16 natif.
+    pub(crate) fn weight_buffer_from_bf16_bytes(&self, data: &[u8]) -> Result<metal::Buffer> {
+        if data.len() % std::mem::size_of::<u16>() != 0 {
+            return Err(InferError::Shape(format!(
+                "payload bf16 single-copy de {} octets",
+                data.len()
+            )));
+        }
+        self.buffer_from_slice(data, "single_copy_weight_affine")
+    }
+
+    /// Lit un payload bf16 directement dans son stockage partagé définitif.
+    #[expect(
+        unsafe_code,
+        reason = "écriture initiale d'un MTLBuffer StorageModeShared depuis le fichier de poids"
+    )]
+    pub(crate) fn weight_buffer_from_bf16_file(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len_bytes: usize,
+    ) -> Result<metal::Buffer> {
+        use std::io::{Read, Seek};
+
+        if len_bytes == 0 || len_bytes % std::mem::size_of::<u16>() != 0 {
+            return Err(InferError::Shape(format!(
+                "payload bf16 single-copy de {len_bytes} octets"
+            )));
+        }
+        let buffer = self.device.new_buffer(
+            checked_nsuint(len_bytes, "single_copy_weight_affine_file")?,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let destination = buffer.contents().cast::<u8>();
+        if destination.is_null() {
+            return Err(InferError::Metal(
+                "MTLBuffer affine StorageModeShared sans pointeur CPU".to_string(),
+            ));
+        }
+        // SAFETY: `buffer` vient d'être alloué en StorageModeShared avec exactement
+        // `len_bytes`; son pointeur CPU est non nul et reste valide pendant la
+        // lecture. Aucun command buffer GPU ne référence ce poids avant le retour.
+        let destination = unsafe { std::slice::from_raw_parts_mut(destination, len_bytes) };
+        let mut file = std::fs::File::open(path).map_err(|source| InferError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|source| InferError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        file.read_exact(destination)
+            .map_err(|source| InferError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok(buffer)
+    }
+
+    /// Alloue le stockage bf16 partagé définitif depuis une source f32 générique.
+    pub(crate) fn weight_buffer_from_f32_as_bf16(&self, data: &[f32]) -> Result<metal::Buffer> {
+        self.buffer_from_f32_as_bf16(data, "single_copy_weight_affine")
     }
 
     pub(super) fn upload_f32_buffer(
@@ -391,6 +565,9 @@ impl MetalExecutor {
         weight: &AffineQuantizedTensor,
         label: &'static str,
     ) -> Result<metal::Buffer> {
+        if let Some((buffer, _)) = weight.packed_metal_view() {
+            return Ok(buffer.clone());
+        }
         self.cached_buffer(
             MetalBufferSource::Affine {
                 weight_id: weight.weight_id(),
@@ -408,6 +585,9 @@ impl MetalExecutor {
         weight: &AffineQuantizedTensor,
         label: &'static str,
     ) -> Result<metal::Buffer> {
+        if let Some((buffer, _)) = weight.scales_metal_view() {
+            return Ok(buffer.clone());
+        }
         self.cached_buffer(
             MetalBufferSource::Affine {
                 weight_id: weight.weight_id(),
@@ -416,7 +596,10 @@ impl MetalExecutor {
             weight.scales_len(),
             MetalBufferElement::Bf16,
             label,
-            || self.buffer_from_f32_as_bf16(weight.scales().data(), label),
+            || {
+                let scales = weight.scales_f32();
+                self.buffer_from_f32_as_bf16(scales.as_ref(), label)
+            },
         )
     }
 
@@ -425,6 +608,9 @@ impl MetalExecutor {
         weight: &AffineQuantizedTensor,
         label: &'static str,
     ) -> Result<metal::Buffer> {
+        if let Some((buffer, _)) = weight.biases_metal_view() {
+            return Ok(buffer.clone());
+        }
         self.cached_buffer(
             MetalBufferSource::Affine {
                 weight_id: weight.weight_id(),
@@ -433,7 +619,10 @@ impl MetalExecutor {
             weight.biases_len(),
             MetalBufferElement::Bf16,
             label,
-            || self.buffer_from_f32_as_bf16(weight.biases().data(), label),
+            || {
+                let biases = weight.biases_f32();
+                self.buffer_from_f32_as_bf16(biases.as_ref(), label)
+            },
         )
     }
 

@@ -255,6 +255,18 @@ impl LinearAttention {
         self.out_proj.release_affine_cpu_data(released);
     }
 
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn move_packed_to_metal_shared(
+        &mut self,
+        metal: &crate::MetalExecutor,
+    ) -> Result<()> {
+        self.in_proj_qkv.move_packed_to_metal_shared(metal)?;
+        self.in_proj_z.move_packed_to_metal_shared(metal)?;
+        self.in_proj_b.move_packed_to_metal_shared(metal)?;
+        self.in_proj_a.move_packed_to_metal_shared(metal)?;
+        self.out_proj.move_packed_to_metal_shared(metal)
+    }
+
     /// Applique la couche sur CPU sans cache persistant (tests uniquement).
     ///
     /// # Errors

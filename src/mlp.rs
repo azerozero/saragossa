@@ -75,6 +75,17 @@ impl FeedForward {
             Self::Moe(mlp) => mlp.release_affine_cpu_data(released),
         }
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn move_packed_to_metal_shared(
+        &mut self,
+        metal: &crate::MetalExecutor,
+    ) -> Result<()> {
+        match self {
+            Self::Dense(mlp) => mlp.move_packed_to_metal_shared(metal),
+            Self::Moe(mlp) => mlp.move_packed_to_metal_shared(metal),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -151,10 +162,38 @@ impl GatedMlp {
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
+    pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         self.gate_proj.release_affine_cpu_data(released);
         self.up_proj.release_affine_cpu_data(released);
         self.down_proj.release_affine_cpu_data(released);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn move_packed_to_metal_shared(
+        &mut self,
+        metal: &crate::MetalExecutor,
+    ) -> Result<()> {
+        self.gate_proj.move_packed_to_metal_shared(metal)?;
+        self.up_proj.move_packed_to_metal_shared(metal)?;
+        self.down_proj.move_packed_to_metal_shared(metal)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn projection(&self, index: usize) -> &Linear {
+        match index {
+            0 => &self.gate_proj,
+            1 => &self.up_proj,
+            _ => &self.down_proj,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn projection_mut(&mut self, index: usize) -> &mut Linear {
+        match index {
+            0 => &mut self.gate_proj,
+            1 => &mut self.up_proj,
+            _ => &mut self.down_proj,
+        }
     }
 }
 
@@ -594,9 +633,13 @@ impl MoeMlp {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         self.router.release_affine_cpu_data(released);
-        // NOTE: Les stacks gate/up/down du préfill MoE résident peuvent être
-        // résolues tardivement avec une clé distincte du decode. Conserver les
-        // experts routés rend tout cache-miss reconstructible après le warmup.
+        // Le seul appelant est le drop du décodeur, qui garde les modèles MoE
+        // derrière RETI_RUST_FREE_CPU_WEIGHTS_MOE=1. Les stacks ont été
+        // matérialisées juste avant ; l'opt-in doit libérer aussi leur source,
+        // sinon l'essentiel de la copie CPU MoE resterait résident.
+        for expert in &mut self.experts {
+            expert.release_affine_cpu_data(released);
+        }
         if let Some(shared_expert) = &mut self.shared_expert {
             shared_expert.release_affine_cpu_data(released);
         }
@@ -604,6 +647,86 @@ impl MoeMlp {
             shared_expert_gate.release_affine_cpu_data(released);
         }
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn move_packed_to_metal_shared(&mut self, metal: &crate::MetalExecutor) -> Result<()> {
+        self.router.move_packed_to_metal_shared(metal)?;
+        for projection in 0..3 {
+            move_expert_projection_to_metal_shared(&mut self.experts, projection, metal)?;
+        }
+        if let Some(shared_expert) = &mut self.shared_expert {
+            shared_expert.move_packed_to_metal_shared(metal)?;
+        }
+        if let Some(shared_expert_gate) = &mut self.shared_expert_gate {
+            shared_expert_gate.move_packed_to_metal_shared(metal)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn move_expert_projection_to_metal_shared(
+    experts: &mut [GatedMlp],
+    projection: usize,
+    metal: &crate::MetalExecutor,
+) -> Result<()> {
+    let already_shared = experts.iter().all(|expert| {
+        expert
+            .projection(projection)
+            .affine_quantized()
+            .is_some_and(|weight| {
+                weight.packed_metal_view().is_some()
+                    && weight.scales_metal_view().is_some()
+                    && weight.biases_metal_view().is_some()
+            })
+    });
+    if already_shared {
+        return Ok(());
+    }
+
+    let mut packed = Vec::new();
+    let mut scales = Vec::new();
+    let mut biases = Vec::new();
+    let mut strides = Vec::with_capacity(experts.len());
+    for expert in experts.iter() {
+        let weight = expert
+            .projection(projection)
+            .affine_quantized()
+            .ok_or_else(|| {
+                InferError::Config("expert MoE non affine pour stockage single-copy".to_string())
+            })?;
+        strides.push((weight.packed_data().len(), weight.scales_len()));
+        packed.extend_from_slice(weight.packed_data());
+        scales.extend_from_slice(weight.scales_f32().as_ref());
+        biases.extend_from_slice(weight.biases_f32().as_ref());
+    }
+    let packed_buffer = metal.weight_buffer_from_u32(&packed)?;
+    let scales_buffer = metal.weight_buffer_from_f32_as_bf16(&scales)?;
+    let biases_buffer = metal.weight_buffer_from_f32_as_bf16(&biases)?;
+    let mut offset_u32 = 0_usize;
+    let mut offset_bf16 = 0_usize;
+    for (expert, (len_u32, len_bf16)) in experts.iter_mut().zip(strides) {
+        let weight = expert
+            .projection_mut(projection)
+            .affine_quantized_mut()
+            .ok_or_else(|| {
+                InferError::Config("expert MoE non affine pour stockage single-copy".to_string())
+            })?;
+        weight.set_packed_metal_view(packed_buffer.clone(), offset_u32)?;
+        weight.set_affine_metal_views(
+            scales_buffer.clone(),
+            offset_bf16,
+            biases_buffer.clone(),
+            offset_bf16,
+        )?;
+        offset_u32 = offset_u32
+            .checked_add(len_u32)
+            .ok_or_else(|| InferError::Shape("stack packed MoE trop grand".to_string()))?;
+        offset_bf16 = offset_bf16
+            .checked_add(len_bf16)
+            .ok_or_else(|| InferError::Shape("stack affine MoE trop grand".to_string()))?;
+    }
+    Ok(())
 }
 
 fn top_k_indices(values: &[f32], k: usize) -> Vec<usize> {
@@ -715,8 +838,15 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
+    /// CONTRAT (depuis le drop MoE opt-in) : `release_affine_cpu_data` libère
+    /// TOUT le MoE, experts routés compris — c'est ce qui rend le drop
+    /// `RETI_RUST_FREE_CPU_WEIGHTS_MOE=1` effectif (avant : les experts
+    /// conservés rendaient le gate MoE presque sans effet). La protection des
+    /// modèles MoE en défaut vit UN NIVEAU AU-DESSUS : le gate de
+    /// `warmup_and_release_cpu_weights` (decoder.rs) ne déclenche la release
+    /// MoE que sous le flag opt-in.
     #[test]
-    fn cpu_release_preserves_routed_expert_payloads() {
+    fn cpu_release_releases_routed_expert_payloads_too() {
         let router = quantized_linear();
         let routed_expert = quantized_expert();
         let shared_expert = quantized_expert();
@@ -737,8 +867,8 @@ mod tests {
             moe.experts
                 .iter()
                 .flat_map(|expert| [&expert.gate_proj, &expert.up_proj, &expert.down_proj,])
-                .all(quantized_cpu_data_available),
-            "les experts routés doivent rester reconstructibles après le warmup"
+                .all(|linear| !quantized_cpu_data_available(linear)),
+            "les experts routés doivent être libérés (le drop MoE opt-in les couvre)"
         );
         assert!(!quantized_cpu_data_available(&moe.router));
         assert!(moe
@@ -752,7 +882,7 @@ mod tests {
                 .as_ref()
                 .expect("invariant: gate partagé présent")
         ));
-        assert_eq!(released.len(), 5);
+        assert_eq!(released.len(), 8, "5 unités + les 3 projections routées");
     }
 
     fn constant_expert(scale: f32) -> GatedMlp {

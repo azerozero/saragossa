@@ -45,6 +45,17 @@ impl EmbeddingWeight {
             released.push((weight_id, bytes));
         }
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn move_packed_to_metal_shared(
+        &mut self,
+        metal: &crate::MetalExecutor,
+    ) -> Result<()> {
+        if let Self::AffineQuantized(weight) = self {
+            weight.move_packed_to_metal_shared(metal)?;
+        }
+        Ok(())
+    }
 }
 
 /// Extrait les lignes d'embedding d'une table dense.

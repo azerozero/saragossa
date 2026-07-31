@@ -645,8 +645,11 @@ impl MetalExecutor {
             }
             MetalEmbeddingWeightBuffers::AffineQuantized {
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 vocab,
                 dim,
                 packed_cols,
@@ -672,9 +675,9 @@ impl MetalExecutor {
                     0,
                 ];
                 encoder.set_compute_pipeline_state(&self.embed_gather_affine_from_u32_f32);
-                encoder.set_buffer(0, Some(packed), 0);
-                encoder.set_buffer(1, Some(scales), 0);
-                encoder.set_buffer(2, Some(biases), 0);
+                encoder.set_buffer(0, Some(packed), *packed_offset);
+                encoder.set_buffer(1, Some(scales), *scales_offset);
+                encoder.set_buffer(2, Some(biases), *biases_offset);
                 encoder.set_buffer(3, Some(index_buffer), index_offset);
                 encoder.set_buffer(4, Some(output_buffer), 0);
                 set_u32_bytes(encoder, 5, &dims, "embedding_affine_dims")?;
@@ -720,8 +723,11 @@ impl MetalExecutor {
         }
         let MetalLinearWeightBuffers::AffineQuantized {
             packed,
+            packed_offset,
             scales,
+            scales_offset,
             biases,
+            biases_offset,
             out_dim,
             in_dim: weight_in_dim,
             packed_cols,
@@ -771,9 +777,9 @@ impl MetalExecutor {
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(rms_weight_buffer), 0);
-        encoder.set_buffer(2, Some(packed), 0);
-        encoder.set_buffer(3, Some(scales), 0);
-        encoder.set_buffer(4, Some(biases), 0);
+        encoder.set_buffer(2, Some(packed), *packed_offset);
+        encoder.set_buffer(3, Some(scales), *scales_offset);
+        encoder.set_buffer(4, Some(biases), *biases_offset);
         encoder.set_buffer(5, Some(output_buffer), 0);
         set_u32_bytes(encoder, 6, &fast_dims, "rms_qmv_dims")?;
         set_f32_bytes(encoder, 7, &[rms_eps], "rms_qmv_eps")?;

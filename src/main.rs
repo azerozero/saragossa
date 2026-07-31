@@ -817,7 +817,8 @@ fn load_decoder_with_runtime(
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn load_decoder_metal(assets: &ModelAssets) -> CliResult<CausalDecoder> {
     let executor = saragossa::MetalExecutor::new()?;
-    Ok(load_causal_decoder(assets)?.with_metal_executor(executor))
+    Ok(saragossa::load_causal_decoder_for_metal(assets, &executor)?
+        .with_metal_executor(executor)?)
 }
 
 #[cfg(not(all(target_os = "macos", feature = "metal")))]

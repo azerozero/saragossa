@@ -510,13 +510,16 @@ impl CausalDecoder {
                             hidden,
                             dense_inter_dim,
                         )?;
-                        let qkv_proj = if decode_resident_full_qkv_concat_enabled() {
+                        let qkv_sources = [
+                            attention.q_proj.weight(),
+                            attention.k_proj.weight(),
+                            v_proj.weight(),
+                        ];
+                        let qkv_proj = if decode_resident_full_qkv_concat_enabled()
+                            && !metal.concat_would_duplicate_affine_storage(&qkv_sources)
+                        {
                             match metal.resolve_concat_linear_weight_buffers(
-                                &[
-                                    attention.q_proj.weight(),
-                                    attention.k_proj.weight(),
-                                    v_proj.weight(),
-                                ],
+                                &qkv_sources,
                                 "resident_dense_full_qkv_proj",
                             ) {
                                 Ok(weights) => Some(weights),
@@ -760,17 +763,21 @@ impl CausalDecoder {
                 head.layer.attention.v_proj.as_ref().ok_or_else(|| {
                     InferError::Config("v_proj MTP manquant (résident)".to_string())
                 })?;
-            let qkv_proj = match metal.resolve_concat_linear_weight_buffers(
-                &[
-                    head.layer.attention.q_proj.weight(),
-                    head.layer.attention.k_proj.weight(),
-                    v_proj.weight(),
-                ],
-                "resident_mtp_qkv_proj",
-            ) {
-                Ok(weights) => Some(weights),
-                Err(InferError::Dimension(_)) => None,
-                Err(error) => return Err(error),
+            let qkv_sources = [
+                head.layer.attention.q_proj.weight(),
+                head.layer.attention.k_proj.weight(),
+                v_proj.weight(),
+            ];
+            let qkv_proj = if metal.concat_would_duplicate_affine_storage(&qkv_sources) {
+                None
+            } else {
+                match metal
+                    .resolve_concat_linear_weight_buffers(&qkv_sources, "resident_mtp_qkv_proj")
+                {
+                    Ok(weights) => Some(weights),
+                    Err(InferError::Dimension(_)) => None,
+                    Err(error) => return Err(error),
+                }
             };
             // KV de l'arène MTP : même dtype résolu que le KV principal (MTP est
             // greedy-only → `sampled` sera false quand la tête MTP tourne).

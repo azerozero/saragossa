@@ -9,13 +9,40 @@ use super::*;
 use crate::quantization::bytes_to_u32;
 use crate::safetensor::bytes_to_dense_f32;
 use crate::AffineQuantizedTensor;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use safetensors::Dtype;
 use safetensors::{tensor::TensorView, SafeTensors};
 use std::collections::HashMap;
+
+pub(super) struct MtpLoadContext<'a> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    metal: Option<&'a crate::MetalExecutor>,
+    marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl MtpLoadContext<'_> {
+    pub(super) fn cpu() -> Self {
+        Self {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            metal: None,
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn metal(executor: &crate::MetalExecutor) -> MtpLoadContext<'_> {
+        MtpLoadContext {
+            metal: Some(executor),
+            marker: std::marker::PhantomData,
+        }
+    }
+}
 
 impl MtpHead {
     pub(super) fn from_sidecar(
         path: impl AsRef<Path>,
         _config: &CausalDecoderConfig,
+        context: &MtpLoadContext<'_>,
     ) -> Result<Self> {
         let bytes = std::fs::read(path.as_ref())
             .map_err(|source| InferError::Config(format!("lecture sidecar MTP: {source}")))?;
@@ -37,17 +64,18 @@ impl MtpHead {
         let pre_fc_norm_embedding =
             load_mtp_norm(&st, &resolve, "mtp.pre_fc_norm_embedding.weight")?;
         let pre_fc_norm_hidden = load_mtp_norm(&st, &resolve, "mtp.pre_fc_norm_hidden.weight")?;
-        let fc = load_mtp_linear(&st, &resolve, "mtp.fc")?;
+        let fc = load_mtp_linear(&st, &resolve, "mtp.fc", context)?;
         let input_norm = load_mtp_norm(&st, &resolve, "mtp.layers.0.input_layernorm.weight")?;
         let attention = FullAttention {
-            q_proj: load_mtp_linear(&st, &resolve, "mtp.layers.0.self_attn.q_proj")?,
-            k_proj: load_mtp_linear(&st, &resolve, "mtp.layers.0.self_attn.k_proj")?,
+            q_proj: load_mtp_linear(&st, &resolve, "mtp.layers.0.self_attn.q_proj", context)?,
+            k_proj: load_mtp_linear(&st, &resolve, "mtp.layers.0.self_attn.k_proj", context)?,
             v_proj: Some(load_mtp_linear(
                 &st,
                 &resolve,
                 "mtp.layers.0.self_attn.v_proj",
+                context,
             )?),
-            o_proj: load_mtp_linear(&st, &resolve, "mtp.layers.0.self_attn.o_proj")?,
+            o_proj: load_mtp_linear(&st, &resolve, "mtp.layers.0.self_attn.o_proj", context)?,
             q_norm: Some(load_mtp_norm(
                 &st,
                 &resolve,
@@ -75,9 +103,9 @@ impl MtpHead {
             "mtp.layers.0.post_attention_layernorm.weight",
         )?;
         let mlp = FeedForward::Dense(Box::new(GatedMlp::new(
-            load_mtp_linear(&st, &resolve, "mtp.layers.0.mlp.gate_proj")?,
-            load_mtp_linear(&st, &resolve, "mtp.layers.0.mlp.up_proj")?,
-            load_mtp_linear(&st, &resolve, "mtp.layers.0.mlp.down_proj")?,
+            load_mtp_linear(&st, &resolve, "mtp.layers.0.mlp.gate_proj", context)?,
+            load_mtp_linear(&st, &resolve, "mtp.layers.0.mlp.up_proj", context)?,
+            load_mtp_linear(&st, &resolve, "mtp.layers.0.mlp.down_proj", context)?,
         )));
         let norm = load_mtp_norm(&st, &resolve, "mtp.norm.weight")?;
         Ok(Self {
@@ -155,29 +183,44 @@ fn load_mtp_linear(
     st: &SafeTensors,
     resolve: &HashMap<String, String>,
     prefix: &str,
+    _context: &MtpLoadContext<'_>,
 ) -> Result<Linear> {
     let weight = st_view(st, resolve, &format!("{prefix}.weight"))?;
     let scales_key = format!("{prefix}.scales");
     if resolve.contains_key(&scales_key) {
         // Quantifié affine 4-bit (.weight u32 packé, .scales/.biases bf16).
         let packed_shape = weight.shape().to_vec();
-        let packed = bytes_to_u32(weight.data(), &format!("{prefix}.weight"))?;
         let scales_view = st_view(st, resolve, &scales_key)?;
+        let biases_key = format!("{prefix}.biases");
+        let biases_view = st_view(st, resolve, &biases_key)?;
+        let (_, group_size) = infer_mtp_affine_layout(
+            &packed_shape,
+            scales_view.shape(),
+            Some(4),
+            None,
+            &scales_key,
+        )?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(quant) = mtp_affine_from_native_bf16(
+            &weight,
+            &scales_view,
+            &biases_view,
+            group_size,
+            4,
+            _context,
+            prefix,
+        )? {
+            return Linear::from_weight(LinearWeight::AffineQuantized(quant), None);
+        }
+        let packed = bytes_to_u32(weight.data(), &format!("{prefix}.weight"))?;
         let scales = Tensor::from_vec(
             scales_view.shape().to_vec(),
             bytes_to_dense_f32(scales_view.data(), scales_view.dtype(), &scales_key)?,
         )?;
-        let biases_view = st_view(st, resolve, &format!("{prefix}.biases"))?;
         let biases = Tensor::from_vec(
             biases_view.shape().to_vec(),
-            bytes_to_dense_f32(
-                biases_view.data(),
-                biases_view.dtype(),
-                &format!("{prefix}.biases"),
-            )?,
+            bytes_to_dense_f32(biases_view.data(), biases_view.dtype(), &biases_key)?,
         )?;
-        let (_, group_size) =
-            infer_mtp_affine_layout(&packed_shape, scales.shape(), Some(4), None, &scales_key)?;
         let quant =
             AffineQuantizedTensor::new(&packed_shape, packed, scales, biases, group_size, 4)?;
         Linear::from_weight(LinearWeight::AffineQuantized(quant), None)
@@ -192,6 +235,7 @@ fn load_mtp_linear(
 pub(super) fn load_mtp_draft_lm_head(
     path: impl AsRef<Path>,
     expected_in_dim: usize,
+    _context: &MtpLoadContext<'_>,
 ) -> Result<Linear> {
     let bytes = std::fs::read(path.as_ref())
         .map_err(|source| InferError::Config(format!("lecture draft lm_head MTP: {source}")))?;
@@ -202,7 +246,7 @@ pub(super) fn load_mtp_draft_lm_head(
         .into_iter()
         .map(|name| (normalize_mtp_draft_lm_head_key(name), name.to_string()))
         .collect();
-    let head = load_mtp_draft_linear(&st, &resolve, "lm_head", expected_in_dim)?;
+    let head = load_mtp_draft_linear(&st, &resolve, "lm_head", expected_in_dim, _context)?;
     let shape = head.weight().shape();
     if shape.len() != 2 || shape[1] != expected_in_dim {
         return Err(InferError::Dimension(format!(
@@ -238,29 +282,42 @@ fn load_mtp_draft_linear(
     resolve: &HashMap<String, String>,
     prefix: &str,
     expected_in_dim: usize,
+    _context: &MtpLoadContext<'_>,
 ) -> Result<Linear> {
     let weight = st_view(st, resolve, &format!("{prefix}.weight"))?;
     let scales_key = format!("{prefix}.scales");
     if resolve.contains_key(&scales_key) {
         let packed_shape = weight.shape().to_vec();
-        let packed = bytes_to_u32(weight.data(), &format!("{prefix}.weight"))?;
         let scales_view = st_view(st, resolve, &scales_key)?;
+        let biases_key = format!("{prefix}.biases");
+        let biases_view = st_view(st, resolve, &biases_key)?;
+        let (bits, group_size) = infer_mtp_affine_layout(
+            &packed_shape,
+            scales_view.shape(),
+            None,
+            Some(expected_in_dim),
+            &scales_key,
+        )?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(quant) = mtp_affine_from_native_bf16(
+            &weight,
+            &scales_view,
+            &biases_view,
+            group_size,
+            bits,
+            _context,
+            prefix,
+        )? {
+            return Linear::from_weight(LinearWeight::AffineQuantized(quant), None);
+        }
+        let packed = bytes_to_u32(weight.data(), &format!("{prefix}.weight"))?;
         let scales = Tensor::from_vec(
             scales_view.shape().to_vec(),
             bytes_to_dense_f32(scales_view.data(), scales_view.dtype(), &scales_key)?,
         )?;
-        let biases_key = format!("{prefix}.biases");
-        let biases_view = st_view(st, resolve, &biases_key)?;
         let biases = Tensor::from_vec(
             biases_view.shape().to_vec(),
             bytes_to_dense_f32(biases_view.data(), biases_view.dtype(), &biases_key)?,
-        )?;
-        let (bits, group_size) = infer_mtp_affine_layout(
-            &packed_shape,
-            scales.shape(),
-            None,
-            Some(expected_in_dim),
-            &scales_key,
         )?;
         let quant =
             AffineQuantizedTensor::new(&packed_shape, packed, scales, biases, group_size, bits)?;
@@ -270,6 +327,47 @@ fn load_mtp_draft_linear(
         let dense = Tensor::from_vec(weight.shape().to_vec(), data)?;
         Linear::new(dense, None)
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn mtp_affine_from_native_bf16(
+    weight: &TensorView<'_>,
+    scales: &TensorView<'_>,
+    biases: &TensorView<'_>,
+    group_size: usize,
+    bits: usize,
+    context: &MtpLoadContext<'_>,
+    prefix: &str,
+) -> Result<Option<AffineQuantizedTensor>> {
+    if !crate::runtime_flags::single_copy_weights_enabled()
+        || scales.dtype() != Dtype::BF16
+        || biases.dtype() != Dtype::BF16
+    {
+        return Ok(None);
+    }
+    let Some(metal) = context.metal else {
+        return Ok(None);
+    };
+    let packed = bytes_to_u32(weight.data(), &format!("{prefix}.weight"))?;
+    let packed_len = packed.len();
+    let scales_len = scales.data().len() / std::mem::size_of::<u16>();
+    let biases_len = biases.data().len() / std::mem::size_of::<u16>();
+    Ok(Some(AffineQuantizedTensor::new_metal_shared_bf16(
+        weight.shape(),
+        metal.weight_buffer_from_u32(&packed)?,
+        0,
+        packed_len,
+        scales.shape(),
+        metal.weight_buffer_from_bf16_bytes(scales.data())?,
+        0,
+        scales_len,
+        biases.shape(),
+        metal.weight_buffer_from_bf16_bytes(biases.data())?,
+        0,
+        biases_len,
+        group_size,
+        bits,
+    )?))
 }
 
 fn infer_mtp_affine_layout(

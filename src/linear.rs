@@ -93,6 +93,33 @@ impl LinearWeight {
             released.push((weight_id, bytes));
         }
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn move_packed_to_metal_shared(
+        &mut self,
+        metal: &crate::MetalExecutor,
+    ) -> Result<()> {
+        if let Self::AffineQuantized(weight) = self {
+            weight.move_packed_to_metal_shared(metal)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn affine_quantized(&self) -> Option<&AffineQuantizedTensor> {
+        match self {
+            Self::Dense(_) => None,
+            Self::AffineQuantized(weight) => Some(weight),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn affine_quantized_mut(&mut self) -> Option<&mut AffineQuantizedTensor> {
+        match self {
+            Self::Dense(_) => None,
+            Self::AffineQuantized(weight) => Some(weight),
+        }
+    }
 }
 
 impl Linear {
@@ -140,6 +167,24 @@ impl Linear {
             ));
         }
         Ok(Self { weight, bias })
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn move_packed_to_metal_shared(
+        &mut self,
+        metal: &crate::MetalExecutor,
+    ) -> Result<()> {
+        self.weight.move_packed_to_metal_shared(metal)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn affine_quantized(&self) -> Option<&AffineQuantizedTensor> {
+        self.weight.affine_quantized()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn affine_quantized_mut(&mut self) -> Option<&mut AffineQuantizedTensor> {
+        self.weight.affine_quantized_mut()
     }
 
     /// Exécute la couche avec le runtime CPU.

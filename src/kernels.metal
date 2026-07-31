@@ -3576,6 +3576,118 @@ kernel void affine_gather_matmul_rhs_t_u32_f32(
     }
 }
 
+kernel void affine_gather_qmv_fast_u3_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device const uint* expert_indices [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant uint4& dims [[buffer(6)]],
+    constant uint4& quant [[buffer(7)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint topk = dims.x;
+    const uint out_dim = dims.y;
+    const uint in_dim = dims.z;
+    const uint packed_cols = dims.w;
+    const uint groups = quant.z;
+    const uint lhs_rows = quant.w;
+    const uint slot = tile.x;
+    const uint results_per_simdgroup = 4u;
+    const uint row_base = tile.y * 8u + simd_gid * results_per_simdgroup;
+    if (slot >= topk || row_base >= out_dim) {
+        return;
+    }
+
+    const uint expert = expert_indices[slot];
+    uint lhs_row = 0u;
+    if (lhs_rows == 1u) {
+        lhs_row = 0u;
+    } else if (lhs_rows == topk) {
+        lhs_row = slot;
+    } else {
+        const uint slots_per_row = (topk > lhs_rows) ? (topk / lhs_rows) : 1u;
+        lhs_row = min(slot / slots_per_row, lhs_rows - 1u);
+    }
+    const uint values_per_pack = 8u;
+    const uint values_per_thread = 16u;
+    const uint block_size = values_per_thread * 32u;
+    const uint half_block_size = values_per_pack * 32u;
+    const uint scale_step_per_thread = 8u;
+    const device uint* ws = packed + (expert * out_dim + row_base) * packed_cols;
+    const device bfloat* scale_base = scales +
+        ((expert * out_dim + row_base) * groups) + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases +
+        ((expert * out_dim + row_base) * groups) + simd_lid / scale_step_per_thread;
+    const device float* x = lhs + lhs_row * in_dim + simd_lid * values_per_pack;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint k = 0u; k < in_dim; k += block_size) {
+        float xt[16];
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        for (uint i = 0u; i < values_per_pack; ++i) {
+            const float a0 = x[i];
+            const float a1 = x[half_block_size + i];
+            sum0 += a0;
+            sum1 += a1;
+            const float inv = u3_inv_scale[i];
+            xt[i] = a0 * inv;
+            xt[values_per_pack + i] = a1 * inv;
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row < out_dim) {
+                const device uint* row_words = ws + row * packed_cols;
+                const uint2 packs =
+                    load_u3x16_pack24(row_words, row_words + 24u, simd_lid);
+                const uint pack0 = packs.x;
+                const uint pack1 = packs.y;
+                const float scale0 = scale_base[row * groups];
+                const float bias0 = bias_base[row * groups];
+                const float scale1 = scale_base[row * groups + 4u];
+                const float bias1 = bias_base[row * groups + 4u];
+                float accum0 = 0.0f;
+                accum0 += xt[0] * float(pack0 & 0x000007u);
+                accum0 += xt[1] * float(pack0 & 0x000038u);
+                accum0 += xt[2] * float(pack0 & 0x0001C0u);
+                accum0 += xt[3] * float(pack0 & 0x000E00u);
+                accum0 += xt[4] * float(pack0 & 0x007000u);
+                accum0 += xt[5] * float(pack0 & 0x038000u);
+                accum0 += xt[6] * float(pack0 & 0x1C0000u);
+                accum0 += xt[7] * float(pack0 & 0xE00000u);
+                result[row] += scale0 * accum0 + sum0 * bias0;
+
+                float accum1 = 0.0f;
+                accum1 += xt[8] * float(pack1 & 0x000007u);
+                accum1 += xt[9] * float(pack1 & 0x000038u);
+                accum1 += xt[10] * float(pack1 & 0x0001C0u);
+                accum1 += xt[11] * float(pack1 & 0x000E00u);
+                accum1 += xt[12] * float(pack1 & 0x007000u);
+                accum1 += xt[13] * float(pack1 & 0x038000u);
+                accum1 += xt[14] * float(pack1 & 0x1C0000u);
+                accum1 += xt[15] * float(pack1 & 0xE00000u);
+                result[row] += scale1 * accum1 + sum1 * bias1;
+            }
+        }
+
+        ws += 48u;
+        scale_base += 8u;
+        bias_base += 8u;
+        x += block_size;
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const float reduced = simd_sum(result[row]);
+        if (simd_lid == 0u && row_base + row < out_dim) {
+            out[(slot * out_dim) + row_base + row] = reduced;
+        }
+    }
+}
+
 kernel void affine_gather_qmv_fast_u4_gs64_f32(
     device const float* lhs [[buffer(0)]],
     device const uint* packed [[buffer(1)]],
@@ -4220,6 +4332,148 @@ kernel void affine_gather_qmv_fast_u8_gs128_tg256_f32(
     }
 }
 
+kernel void affine_gather_qmv_tail_u3_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device const uint* expert_indices [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant uint4& dims [[buffer(6)]],
+    constant uint4& quant [[buffer(7)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint topk = dims.x;
+    const uint out_dim = dims.y;
+    const uint in_dim = dims.z;
+    const uint packed_cols = dims.w;
+    const uint groups = quant.z;
+    const uint lhs_rows = quant.w;
+    const uint slot = tile.x;
+    const uint results_per_simdgroup = 4u;
+    const uint row_base = tile.y * 8u + simd_gid * results_per_simdgroup;
+    if (slot >= topk || row_base >= out_dim) {
+        return;
+    }
+
+    const uint expert = expert_indices[slot];
+    uint lhs_row = 0u;
+    if (lhs_rows == 1u) {
+        lhs_row = 0u;
+    } else if (lhs_rows == topk) {
+        lhs_row = slot;
+    } else {
+        const uint slots_per_row = (topk > lhs_rows) ? (topk / lhs_rows) : 1u;
+        lhs_row = min(slot / slots_per_row, lhs_rows - 1u);
+    }
+    const uint values_per_pack = 8u;
+    const uint values_per_thread = 16u;
+    const uint block_size = values_per_thread * 32u;
+    const uint half_block_size = values_per_pack * 32u;
+    const uint scale_step_per_thread = 8u;
+    const device uint* ws = packed + (expert * out_dim + row_base) * packed_cols;
+    const device bfloat* scale_base = scales +
+        ((expert * out_dim + row_base) * groups) + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases +
+        ((expert * out_dim + row_base) * groups) + simd_lid / scale_step_per_thread;
+    const device float* x = lhs + lhs_row * in_dim + simd_lid * values_per_pack;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint full_blocks = in_dim / block_size;
+    for (uint block = 0u; block < full_blocks; ++block) {
+        float xt[16];
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        for (uint i = 0u; i < values_per_pack; ++i) {
+            const float a0 = x[i];
+            const float a1 = x[half_block_size + i];
+            sum0 += a0;
+            sum1 += a1;
+            const float inv = u3_inv_scale[i];
+            xt[i] = a0 * inv;
+            xt[values_per_pack + i] = a1 * inv;
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row < out_dim) {
+                const device uint* row_words = ws + row * packed_cols;
+                const uint2 packs =
+                    load_u3x16_pack24(row_words, row_words + 24u, simd_lid);
+                const uint pack0 = packs.x;
+                const uint pack1 = packs.y;
+                const float scale0 = scale_base[row * groups];
+                const float bias0 = bias_base[row * groups];
+                const float scale1 = scale_base[row * groups + 4u];
+                const float bias1 = bias_base[row * groups + 4u];
+                float accum0 = 0.0f;
+                accum0 += xt[0] * float(pack0 & 0x000007u);
+                accum0 += xt[1] * float(pack0 & 0x000038u);
+                accum0 += xt[2] * float(pack0 & 0x0001C0u);
+                accum0 += xt[3] * float(pack0 & 0x000E00u);
+                accum0 += xt[4] * float(pack0 & 0x007000u);
+                accum0 += xt[5] * float(pack0 & 0x038000u);
+                accum0 += xt[6] * float(pack0 & 0x1C0000u);
+                accum0 += xt[7] * float(pack0 & 0xE00000u);
+                result[row] += scale0 * accum0 + sum0 * bias0;
+
+                float accum1 = 0.0f;
+                accum1 += xt[8] * float(pack1 & 0x000007u);
+                accum1 += xt[9] * float(pack1 & 0x000038u);
+                accum1 += xt[10] * float(pack1 & 0x0001C0u);
+                accum1 += xt[11] * float(pack1 & 0x000E00u);
+                accum1 += xt[12] * float(pack1 & 0x007000u);
+                accum1 += xt[13] * float(pack1 & 0x038000u);
+                accum1 += xt[14] * float(pack1 & 0x1C0000u);
+                accum1 += xt[15] * float(pack1 & 0xE00000u);
+                result[row] += scale1 * accum1 + sum1 * bias1;
+            }
+        }
+
+        ws += 48u;
+        scale_base += 8u;
+        bias_base += 8u;
+        x += block_size;
+    }
+
+    if (full_blocks * block_size < in_dim) {
+        float xt[8];
+        float sum = 0.0f;
+        for (uint i = 0u; i < values_per_pack; ++i) {
+            const float a = x[i];
+            sum += a;
+            xt[i] = a * u3_inv_scale[i];
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row < out_dim) {
+                const device uint* row_words = ws + row * packed_cols;
+                const uint pack24 = load_u3x8_pack24(row_words, simd_lid);
+                const float scale = scale_base[row * groups];
+                const float bias = bias_base[row * groups];
+                float accum = 0.0f;
+                accum += xt[0] * float(pack24 & 0x000007u);
+                accum += xt[1] * float(pack24 & 0x000038u);
+                accum += xt[2] * float(pack24 & 0x0001C0u);
+                accum += xt[3] * float(pack24 & 0x000E00u);
+                accum += xt[4] * float(pack24 & 0x007000u);
+                accum += xt[5] * float(pack24 & 0x038000u);
+                accum += xt[6] * float(pack24 & 0x1C0000u);
+                accum += xt[7] * float(pack24 & 0xE00000u);
+                result[row] += scale * accum + sum * bias;
+            }
+        }
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const float reduced = simd_sum(result[row]);
+        if (simd_lid == 0u && row_base + row < out_dim) {
+            out[(slot * out_dim) + row_base + row] = reduced;
+        }
+    }
+}
+
 kernel void affine_gather_qmv_tail_u4_gs64_f32(
     device const float* lhs [[buffer(0)]],
     device const uint* packed [[buffer(1)]],
@@ -4311,6 +4565,208 @@ kernel void affine_gather_qmv_tail_u4_gs64_f32(
         const float reduced = simd_sum(result[row]);
         if (simd_lid == 0u && row_base + row < out_dim) {
             out[(slot * out_dim) + row_base + row] = reduced;
+        }
+    }
+}
+
+kernel void affine_gather_gate_up_swiglu_fast_u3_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* gate_packed [[buffer(1)]],
+    device const bfloat* gate_scales [[buffer(2)]],
+    device const bfloat* gate_biases [[buffer(3)]],
+    device const uint* up_packed [[buffer(4)]],
+    device const bfloat* up_scales [[buffer(5)]],
+    device const bfloat* up_biases [[buffer(6)]],
+    device const uint* expert_indices [[buffer(7)]],
+    device float* out [[buffer(8)]],
+    constant uint4& dims [[buffer(9)]],
+    constant uint4& quant [[buffer(10)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint topk = dims.x;
+    const uint out_dim = dims.y;
+    const uint in_dim = dims.z;
+    const uint packed_cols = dims.w;
+    const uint groups = quant.z;
+    const uint lhs_rows = quant.w;
+    const uint slot = tile.x;
+    const uint results_per_simdgroup = 4u;
+    const uint row_base = tile.y * 8u + simd_gid * results_per_simdgroup;
+    if (slot >= topk || row_base >= out_dim) {
+        return;
+    }
+
+    const uint expert = expert_indices[slot];
+    uint lhs_row = 0u;
+    if (lhs_rows == 1u) {
+        lhs_row = 0u;
+    } else if (lhs_rows == topk) {
+        lhs_row = slot;
+    } else {
+        const uint slots_per_row = (topk > lhs_rows) ? (topk / lhs_rows) : 1u;
+        lhs_row = min(slot / slots_per_row, lhs_rows - 1u);
+    }
+    const uint values_per_pack = 8u;
+    const uint values_per_thread = 16u;
+    const uint block_size = values_per_thread * 32u;
+    const uint half_block_size = values_per_pack * 32u;
+    const uint scale_step_per_thread = 8u;
+    const device uint* gate_ws =
+        gate_packed + (expert * out_dim + row_base) * packed_cols;
+    const device uint* up_ws =
+        up_packed + (expert * out_dim + row_base) * packed_cols;
+    const device bfloat* gate_scale_base = gate_scales +
+        ((expert * out_dim + row_base) * groups) + simd_lid / scale_step_per_thread;
+    const device bfloat* gate_bias_base = gate_biases +
+        ((expert * out_dim + row_base) * groups) + simd_lid / scale_step_per_thread;
+    const device bfloat* up_scale_base = up_scales +
+        ((expert * out_dim + row_base) * groups) + simd_lid / scale_step_per_thread;
+    const device bfloat* up_bias_base = up_biases +
+        ((expert * out_dim + row_base) * groups) + simd_lid / scale_step_per_thread;
+    const device float* x = lhs + lhs_row * in_dim + simd_lid * values_per_pack;
+
+    float gate_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float up_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint full_blocks = in_dim / block_size;
+    for (uint block = 0u; block < full_blocks; ++block) {
+        float xt[16];
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        for (uint i = 0u; i < values_per_pack; ++i) {
+            const float a0 = x[i];
+            const float a1 = x[half_block_size + i];
+            sum0 += a0;
+            sum1 += a1;
+            const float inv = u3_inv_scale[i];
+            xt[i] = a0 * inv;
+            xt[values_per_pack + i] = a1 * inv;
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row < out_dim) {
+                const device uint* gate_row_words = gate_ws + row * packed_cols;
+                const device uint* up_row_words = up_ws + row * packed_cols;
+                const uint2 gate_packs =
+                    load_u3x16_pack24(gate_row_words, gate_row_words + 24u, simd_lid);
+                const uint2 up_packs =
+                    load_u3x16_pack24(up_row_words, up_row_words + 24u, simd_lid);
+                const float gate_scale0 = gate_scale_base[row * groups];
+                const float gate_bias0 = gate_bias_base[row * groups];
+                const float gate_scale1 = gate_scale_base[row * groups + 4u];
+                const float gate_bias1 = gate_bias_base[row * groups + 4u];
+                const float up_scale0 = up_scale_base[row * groups];
+                const float up_bias0 = up_bias_base[row * groups];
+                const float up_scale1 = up_scale_base[row * groups + 4u];
+                const float up_bias1 = up_bias_base[row * groups + 4u];
+
+                float gate_accum0 = 0.0f;
+                gate_accum0 += xt[0] * float(gate_packs.x & 0x000007u);
+                gate_accum0 += xt[1] * float(gate_packs.x & 0x000038u);
+                gate_accum0 += xt[2] * float(gate_packs.x & 0x0001C0u);
+                gate_accum0 += xt[3] * float(gate_packs.x & 0x000E00u);
+                gate_accum0 += xt[4] * float(gate_packs.x & 0x007000u);
+                gate_accum0 += xt[5] * float(gate_packs.x & 0x038000u);
+                gate_accum0 += xt[6] * float(gate_packs.x & 0x1C0000u);
+                gate_accum0 += xt[7] * float(gate_packs.x & 0xE00000u);
+                gate_result[row] += gate_scale0 * gate_accum0 + sum0 * gate_bias0;
+
+                float up_accum0 = 0.0f;
+                up_accum0 += xt[0] * float(up_packs.x & 0x000007u);
+                up_accum0 += xt[1] * float(up_packs.x & 0x000038u);
+                up_accum0 += xt[2] * float(up_packs.x & 0x0001C0u);
+                up_accum0 += xt[3] * float(up_packs.x & 0x000E00u);
+                up_accum0 += xt[4] * float(up_packs.x & 0x007000u);
+                up_accum0 += xt[5] * float(up_packs.x & 0x038000u);
+                up_accum0 += xt[6] * float(up_packs.x & 0x1C0000u);
+                up_accum0 += xt[7] * float(up_packs.x & 0xE00000u);
+                up_result[row] += up_scale0 * up_accum0 + sum0 * up_bias0;
+
+                float gate_accum1 = 0.0f;
+                gate_accum1 += xt[8] * float(gate_packs.y & 0x000007u);
+                gate_accum1 += xt[9] * float(gate_packs.y & 0x000038u);
+                gate_accum1 += xt[10] * float(gate_packs.y & 0x0001C0u);
+                gate_accum1 += xt[11] * float(gate_packs.y & 0x000E00u);
+                gate_accum1 += xt[12] * float(gate_packs.y & 0x007000u);
+                gate_accum1 += xt[13] * float(gate_packs.y & 0x038000u);
+                gate_accum1 += xt[14] * float(gate_packs.y & 0x1C0000u);
+                gate_accum1 += xt[15] * float(gate_packs.y & 0xE00000u);
+                gate_result[row] += gate_scale1 * gate_accum1 + sum1 * gate_bias1;
+
+                float up_accum1 = 0.0f;
+                up_accum1 += xt[8] * float(up_packs.y & 0x000007u);
+                up_accum1 += xt[9] * float(up_packs.y & 0x000038u);
+                up_accum1 += xt[10] * float(up_packs.y & 0x0001C0u);
+                up_accum1 += xt[11] * float(up_packs.y & 0x000E00u);
+                up_accum1 += xt[12] * float(up_packs.y & 0x007000u);
+                up_accum1 += xt[13] * float(up_packs.y & 0x038000u);
+                up_accum1 += xt[14] * float(up_packs.y & 0x1C0000u);
+                up_accum1 += xt[15] * float(up_packs.y & 0xE00000u);
+                up_result[row] += up_scale1 * up_accum1 + sum1 * up_bias1;
+            }
+        }
+
+        gate_ws += 48u;
+        up_ws += 48u;
+        gate_scale_base += 8u;
+        gate_bias_base += 8u;
+        up_scale_base += 8u;
+        up_bias_base += 8u;
+        x += block_size;
+    }
+
+    if (full_blocks * block_size < in_dim) {
+        float xt[8];
+        float sum = 0.0f;
+        for (uint i = 0u; i < values_per_pack; ++i) {
+            const float a = x[i];
+            sum += a;
+            xt[i] = a * u3_inv_scale[i];
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            if (row_base + row < out_dim) {
+                const device uint* gate_row_words = gate_ws + row * packed_cols;
+                const device uint* up_row_words = up_ws + row * packed_cols;
+                const uint gate_pack = load_u3x8_pack24(gate_row_words, simd_lid);
+                const uint up_pack = load_u3x8_pack24(up_row_words, simd_lid);
+                const float gate_scale = gate_scale_base[row * groups];
+                const float gate_bias = gate_bias_base[row * groups];
+                const float up_scale = up_scale_base[row * groups];
+                const float up_bias = up_bias_base[row * groups];
+
+                float gate_accum = 0.0f;
+                gate_accum += xt[0] * float(gate_pack & 0x000007u);
+                gate_accum += xt[1] * float(gate_pack & 0x000038u);
+                gate_accum += xt[2] * float(gate_pack & 0x0001C0u);
+                gate_accum += xt[3] * float(gate_pack & 0x000E00u);
+                gate_accum += xt[4] * float(gate_pack & 0x007000u);
+                gate_accum += xt[5] * float(gate_pack & 0x038000u);
+                gate_accum += xt[6] * float(gate_pack & 0x1C0000u);
+                gate_accum += xt[7] * float(gate_pack & 0xE00000u);
+                gate_result[row] += gate_scale * gate_accum + sum * gate_bias;
+
+                float up_accum = 0.0f;
+                up_accum += xt[0] * float(up_pack & 0x000007u);
+                up_accum += xt[1] * float(up_pack & 0x000038u);
+                up_accum += xt[2] * float(up_pack & 0x0001C0u);
+                up_accum += xt[3] * float(up_pack & 0x000E00u);
+                up_accum += xt[4] * float(up_pack & 0x007000u);
+                up_accum += xt[5] * float(up_pack & 0x038000u);
+                up_accum += xt[6] * float(up_pack & 0x1C0000u);
+                up_accum += xt[7] * float(up_pack & 0xE00000u);
+                up_result[row] += up_scale * up_accum + sum * up_bias;
+            }
+        }
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const float gate = simd_sum(gate_result[row]);
+        const float up = simd_sum(up_result[row]);
+        if (simd_lid == 0u && row_base + row < out_dim) {
+            out[(slot * out_dim) + row_base + row] =
+                (gate / (1.0f + exp(-gate))) * up;
         }
     }
 }

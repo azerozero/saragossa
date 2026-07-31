@@ -26,8 +26,8 @@ fn fast_qmv_align64_reference(
 
     let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
     let packed = executor.buffer_from_slice(weight.packed_data(), label)?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), label)?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), label)?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), label)?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), label)?;
     let out_buf = executor.uncached_f32_buffer(batch * *out_dim, label)?;
     let dims = [
         *out_dim as u32,
@@ -100,8 +100,8 @@ fn cpu_qmv_align64_reference(
     let group_size = weight.group_size();
     let groups = *in_dim / group_size;
     let packed = weight.packed_data();
-    let scales = weight.scales().data();
-    let biases = weight.biases().data();
+    let scales = weight.scales_f32();
+    let biases = weight.biases_f32();
     let mut out = vec![0.0_f32; batch * *out_dim];
     for bb in 0..batch {
         for row in 0..*out_dim {
@@ -194,8 +194,8 @@ fn qmm_na_tiled_u4_align64_reference(
 
     let lhs_buf = executor.upload_f32_buffer(lhs, label)?;
     let packed = executor.buffer_from_slice(weight.packed_data(), label)?;
-    let scales = executor.buffer_from_f32_as_bf16(weight.scales().data(), label)?;
-    let biases = executor.buffer_from_f32_as_bf16(weight.biases().data(), label)?;
+    let scales = executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), label)?;
+    let biases = executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), label)?;
     let out_buf = executor.uncached_f32_buffer(batch * *out_dim, label)?;
 
     let command_buffer = executor.queue.new_command_buffer();

@@ -1,4 +1,4 @@
-//! Résolution locale et cache Hugging Face pour `saragossa run`.
+//! Résolution locale et cache Hugging Face pour les commandes Saragossa.
 
 use std::collections::HashSet;
 use std::env;
@@ -94,6 +94,7 @@ pub(super) fn resolve_model(value: &str) -> Result<PathBuf, HfResolveError> {
 /// Sous-commande `saragossa list`.
 pub(super) fn run_list(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     let mut cache_dir = None;
+    let mut models_dir = PathBuf::from("models");
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -102,6 +103,7 @@ pub(super) fn run_list(args: impl IntoIterator<Item = String>) -> CliResult<()> 
                 return Ok(());
             }
             "--cache-dir" => cache_dir = Some(PathBuf::from(next_value(&mut iter, "--cache-dir")?)),
+            "--models-dir" => models_dir = PathBuf::from(next_value(&mut iter, "--models-dir")?),
             other => return Err(cli_error(format!("argument list inconnu: {other}"))),
         }
     }
@@ -109,21 +111,31 @@ pub(super) fn run_list(args: impl IntoIterator<Item = String>) -> CliResult<()> 
         Some(path) => path,
         None => hf_cache_dir_from_env()?,
     };
-    let models = list_cached_models(&cache_dir)?;
+    let models = discover_local_models(&cache_dir, &models_dir)?;
     if models.is_empty() {
-        println!("aucun modèle prêt dans {}", cache_dir.display());
+        println!(
+            "aucun modèle prêt dans {} ni {}",
+            cache_dir.display(),
+            models_dir.display()
+        );
         return Ok(());
     }
-    println!("{:<48} {:>12}", "MODEL", "SIZE");
+    println!("{:<48} {:<56} {:>12}", "MODEL", "PATH", "SIZE");
     for model in models {
-        println!("{:<48} {:>12}", model.id, human_size(model.size_bytes));
+        println!(
+            "{:<48} {:<56} {:>12}",
+            model.id,
+            model.snapshot.display(),
+            human_size(model.size_bytes)
+        );
     }
     Ok(())
 }
 
 fn print_list_help() {
     println!(
-        "Usage: saragossa list [--cache-dir DIR]\n\nListe les snapshots modèles du cache Hugging Face local contenant config.json."
+        "Usage: saragossa list [--cache-dir DIR] [--models-dir DIR]\n\n\
+         Liste les snapshots du cache Hugging Face et les modèles locaux contenant config.json."
     );
 }
 
@@ -309,6 +321,56 @@ pub(super) fn list_cached_models(cache_dir: &Path) -> Result<Vec<CachedModel>, H
     Ok(models)
 }
 
+/// Liste les modèles prêts du cache HF et d'un répertoire local.
+///
+/// # Errors
+///
+/// Renvoie une erreur si un des répertoires présents est illisible.
+pub(super) fn discover_local_models(
+    cache_dir: &Path,
+    models_dir: &Path,
+) -> Result<Vec<CachedModel>, HfResolveError> {
+    let mut models = list_cached_models(cache_dir)?;
+    models.extend(list_models_directory(models_dir)?);
+    models.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.snapshot.cmp(&right.snapshot))
+    });
+    models.dedup_by(|left, right| left.snapshot == right.snapshot);
+    Ok(models)
+}
+
+fn list_models_directory(models_dir: &Path) -> Result<Vec<CachedModel>, HfResolveError> {
+    if !models_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut models = Vec::new();
+    for entry in read_dir(models_dir, "lecture répertoire models")? {
+        let entry = entry.map_err(|source| HfResolveError::Io {
+            context: format!("lecture entrée {}", models_dir.display()),
+            source,
+        })?;
+        let path = entry.path();
+        if !path.join("config.json").is_file() {
+            continue;
+        }
+        let Some(id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+        models.push(CachedModel {
+            id,
+            size_bytes: dir_size_following_links(&path)?,
+            snapshot: path,
+        });
+    }
+    Ok(models)
+}
+
 fn read_dir(path: &Path, context: &'static str) -> Result<fs::ReadDir, HfResolveError> {
     fs::read_dir(path).map_err(|source| HfResolveError::Io {
         context: format!("{context}: {}", path.display()),
@@ -432,6 +494,36 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "org/repo");
         assert_eq!(models[0].size_bytes, 12);
+    }
+
+    #[test]
+    fn discovers_cache_and_models_directory() {
+        let temp = tempfile::tempdir().expect("invariant: tempdir disponible");
+        let cache = temp.path().join("hub");
+        let snapshot = cache
+            .join("models--org--cached")
+            .join("snapshots")
+            .join("abc123");
+        fs::create_dir_all(&snapshot).expect("invariant: snapshot créé");
+        fs::write(snapshot.join("config.json"), b"{}").expect("invariant: config cache écrite");
+
+        let models_dir = temp.path().join("models");
+        let local = models_dir.join("local-model");
+        fs::create_dir_all(&local).expect("invariant: modèle local créé");
+        fs::write(local.join("config.json"), b"{}").expect("invariant: config locale écrite");
+
+        let models =
+            discover_local_models(&cache, &models_dir).expect("invariant: sources lisibles");
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-model", "org/cached"]
+        );
+        assert!(models.iter().any(|model| model.snapshot == local));
+        assert!(models.iter().any(|model| model.snapshot == snapshot));
     }
 
     #[test]
