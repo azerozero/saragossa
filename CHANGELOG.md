@@ -7,11 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0](https://github.com/azerozero/saragossa/releases/tag/v0.2.0) - 2026-07-31
+## [0.3.0](https://github.com/azerozero/saragossa/releases/tag/v0.3.0) - 2026-07-31
 
 ### Added
 
-- single-copy unified-memory, gathers u3, serve prêt-à-l'emploi (v0.3.0) ([#7](https://github.com/azerozero/saragossa/pull/7))
+- Stockage single-copy des poids quantifiés en mémoire unifiée (défaut ON) : une seule résidence dès le chargement (35B-A3B : 40,5 → 19,4 Go ; 27B : ~22 Go), pic de load ≈ steady ([#7](https://github.com/azerozero/saragossa/pull/7))
+- Gathers MoE rapides u3 : un 35B mixed 3/4-bit décode à ~150 tok/s (+60 %, dépasse le 4-bit avec 18 % de mémoire en moins) ([#7](https://github.com/azerozero/saragossa/pull/7))
+- `saragossa serve` prêt-à-l'emploi : `--model` par chemin nu ou id Hugging Face (auto-téléchargement), picker interactif sans argument, decode spéculatif MTP automatique (modèle dense + tête + requête greedy) ([#7](https://github.com/azerozero/saragossa/pull/7))
+
+### Fixed
+
+- Guard de bit-width du decode résident : les quants u6/u2 retombent sur le per-op correct au lieu de produire du texte corrompu ([#7](https://github.com/azerozero/saragossa/pull/7))
+- Purge du prefix-cache après la chauffe de libération des poids (restaure le byte-id MoE sur prompt long) ([#7](https://github.com/azerozero/saragossa/pull/7))
+
+## [0.2.0](https://github.com/azerozero/saragossa/releases/tag/v0.2.0) - 2026-07-30
+
+### Added
+
 - kernels affine u2/u3 + decode MTP spéculatif streaming (v0.2.0) ([#6](https://github.com/azerozero/saragossa/pull/6))
 - gemma4 loader, saragossa run/list CLI, per-session cache isolation, guided-JSON polish
 - *(serve)* structured output json_object (v1)
