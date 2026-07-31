@@ -104,9 +104,8 @@ verify cost). See `generate_greedy_mtp_streaming_with_options`.
 ### Homebrew (Apple Silicon)
 
 ```sh
-brew tap azerozero/saragossa https://github.com/azerozero/saragossa
-brew install --HEAD saragossa   # build from the main branch
-# brew install saragossa        # once a tagged release is wired into the tap
+brew install azerozero/tap/saragossa          # latest tagged release (stable)
+# brew install --HEAD azerozero/tap/saragossa # build from the main branch
 ```
 
 ### From source
