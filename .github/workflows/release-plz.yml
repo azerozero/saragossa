@@ -9,6 +9,8 @@ on:
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "release-plz.toml"
+      - ".github/workflows/release-plz.yml"
   pull_request:
     types: [closed]
     branches: [main]

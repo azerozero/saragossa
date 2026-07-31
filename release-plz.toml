@@ -1,10 +1,10 @@
 [workspace]
-publish = true
+publish = false
 git_release_enable = true
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
 changelog_update = true
-semver_check = true
+semver_check = false
 pr_labels = ["release"]
 release_commits = "^(feat|fix|refactor|perf)(\\([^)]+\\))?:"
 
@@ -12,3 +12,10 @@ release_commits = "^(feat|fix|refactor|perf)(\\([^)]+\\))?:"
 name = "saragossa"
 changelog_path = "CHANGELOG.md"
 git_release_name = "v{{ version }}"
+
+# POURQUOI publish=false + semver_check=false : saragossa est distribué par
+# GitHub releases + Homebrew, PAS crates.io (crate Metal/Apple-Silicon only —
+# docs.rs et cargo install multi-plateforme n'ont pas de sens ici). release-plz
+# gère version/changelog/tag/GitHub release en mode git pur ; la comparaison
+# registre (et le semver-check qui s'y adosse) est désactivée, sinon il refuse
+# de tourner (« tag v0.2.0 exists but package not found in the registry »).
