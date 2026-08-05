@@ -151,7 +151,7 @@ impl CausalDecoder {
         encoder_guard.end();
         crate::metal_backend::commit_and_wait(command_buffer)?;
         #[cfg(feature = "devtools")]
-        if crate::decoder::flags::env_flag("RETI_RUST_MTP_APPEND_KV_ORACLE", false) {
+        if crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false) {
             if let Some(mtp) = arena.mtp.as_mut() {
                 self.check_mtp_append_kv_oracle(mtp, expected_history_len)?;
             }
@@ -195,7 +195,7 @@ impl CausalDecoder {
         {
             mtp.kv.truncate(pending_start)?;
             #[cfg(feature = "devtools")]
-            if crate::decoder::flags::env_flag("RETI_RUST_MTP_APPEND_KV_ORACLE", false) {
+            if crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false) {
                 Self::encode_copy_mtp_kv_prefix(
                     metal,
                     encoder,
@@ -226,7 +226,7 @@ impl CausalDecoder {
                 mtp.append_oracle_len = pending_end;
             }
             #[cfg(feature = "devtools")]
-            if !crate::decoder::flags::env_flag("RETI_RUST_MTP_APPEND_KV_ORACLE", false) {
+            if !crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false) {
                 mtp.append_oracle_len = 0;
             }
             Self::encode_mtp_append_rows_serial_to_kv(
@@ -2387,7 +2387,7 @@ impl CausalDecoder {
         drop(target_indices);
 
         #[cfg(feature = "devtools")]
-        if crate::decoder::flags::env_flag("RETI_RUST_MTP_APPEND_KV_ORACLE", false) {
+        if crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false) {
             if let Some(arena) = resident.as_mut() {
                 if let Some(mtp) = arena.mtp.as_mut() {
                     self.check_mtp_append_kv_oracle(mtp, history_len)?;

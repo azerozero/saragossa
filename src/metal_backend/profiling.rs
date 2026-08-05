@@ -5,7 +5,7 @@ use crate::runtime_flags::env_flag;
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Instrumentation decode (RETI_RUST_DECODE_PROFILE) — phase 1a
+// Instrumentation decode (SARAGOSSA_RUST_DECODE_PROFILE) — phase 1a
 //
 // Split par token : `encode_us` (CPU, dérivé = total − wait − read) / `wait_us`
 // (CPU bloqué sur le GPU dans `wait_until_completed`) / `read_us` (readback
@@ -101,7 +101,7 @@ pub(super) fn decode_profile_enabled() -> bool {
 
 fn decode_profile_sites_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_DECODE_PROFILE_SITES", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_PROFILE_SITES", false))
 }
 
 /// `(command_buffers, wait_ns, read_ns)` cumulés — bornés par l'appelant

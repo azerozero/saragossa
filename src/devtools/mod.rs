@@ -2,7 +2,6 @@
 
 pub mod dflash;
 
-use std::env;
 use std::time::{Duration, Instant};
 
 pub use dflash::{
@@ -14,20 +13,20 @@ use crate::runtime_flags::env_flag;
 use crate::{CausalDecoder, GenerationOptions, InferError, ModelAssets, Result};
 
 pub fn mtp_acceptance_enabled() -> bool {
-    env_flag("RETI_RUST_MTP_ACCEPTANCE", false)
+    env_flag("SARAGOSSA_RUST_MTP_ACCEPTANCE", false)
 }
 
 pub fn dflash_acceptance_enabled() -> bool {
-    env_flag("RETI_RUST_DFLASH_ACCEPTANCE", false)
+    env_flag("SARAGOSSA_RUST_DFLASH_ACCEPTANCE", false)
 }
 
 pub fn lightbatch_acceptance_enabled() -> bool {
-    env_flag("RETI_RUST_LIGHTBATCH_ACCEPTANCE", false)
+    env_flag("SARAGOSSA_RUST_LIGHTBATCH_ACCEPTANCE", false)
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub fn resident_linear_xray_enabled() -> bool {
-    env_flag("RETI_RUST_RESIDENT_LINEAR_XRAY", false)
+    env_flag("SARAGOSSA_RUST_RESIDENT_LINEAR_XRAY", false)
 }
 
 /// Harnais d'acceptance light-batch (E2.1) : oracle de byte-identite par flux.
@@ -132,8 +131,7 @@ pub fn run_mtp_acceptance(
     load_elapsed: Duration,
     warmup_elapsed: Duration,
 ) -> Result<()> {
-    let max_draft = env::var("RETI_RUST_MTP_MAX_DRAFT")
-        .ok()
+    let max_draft = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_MAX_DRAFT")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(2);
     // AR de référence : variante TIMÉE (mêmes tokens greedy que
@@ -150,7 +148,8 @@ pub fn run_mtp_acceptance(
         .generate_greedy_mtp_batched_with_options(prompt_ids, max_tokens, options, max_draft)?;
     let spec_elapsed = spec_started.elapsed();
     let tokens_equal = ar.tokens == spec.tokens;
-    if !tokens_equal && env::var_os("RETI_RUST_MTP_ORACLE_DUMP").is_some() {
+    if !tokens_equal && crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_ORACLE_DUMP").is_some()
+    {
         let first_diff = ar
             .tokens
             .iter()
@@ -299,8 +298,7 @@ pub fn run_dflash_acceptance(
     load_elapsed: Duration,
     warmup_elapsed: Duration,
 ) -> Result<()> {
-    let max_draft = env::var("RETI_RUST_DFLASH_MAX_DRAFT")
-        .ok()
+    let max_draft = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_MAX_DRAFT")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(draft.info.block_size);

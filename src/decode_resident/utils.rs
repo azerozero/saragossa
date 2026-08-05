@@ -181,12 +181,12 @@ pub(super) fn byte_offset(
 
 pub(super) fn flash_sdpa_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_FLASH_SDPA", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLASH_SDPA", true))
 }
 
 /// Résout le dtype du KV résident full-attn selon la politique produit C1B.
 ///
-/// `RETI_RUST_KV_BF16` explicite (0/1) gagne toujours ; sinon défaut = **bf16 si
+/// `SARAGOSSA_RUST_KV_BF16` explicite (0/1) gagne toujours ; sinon défaut = **bf16 si
 /// la génération échantillonne** (`sampled`, temperature > 0), **f32 en greedy**.
 ///
 /// Motivation : bf16 divise par deux la bande passante KV (decode long-contexte
@@ -209,12 +209,11 @@ fn resolve_kv_bf16(env_override: Option<bool>, sampled: bool) -> bool {
     env_override.unwrap_or(sampled)
 }
 
-/// Override explicite de `RETI_RUST_KV_BF16` (lu une fois), cf. [`kv_bf16_for`].
+/// Override explicite de `SARAGOSSA_RUST_KV_BF16` (lu une fois), cf. [`kv_bf16_for`].
 fn kv_bf16_env_override() -> Option<bool> {
     static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
     *OVERRIDE.get_or_init(|| {
-        std::env::var("RETI_RUST_KV_BF16")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_KV_BF16")
             .as_deref()
             .and_then(parse_kv_bf16_override)
     })
@@ -239,39 +238,38 @@ pub(super) fn bf16_round_f32(value: f32) -> f32 {
 
 /// Diagnostic C1B (hors prod) : arrondit **seulement K** au seed prefill (V reste
 /// f32 exact), pour isoler l'effet de la précision des clés (→ scores) sur la
-/// divergence. `RETI_RUST_KV_BF16_SIM_KONLY=1`, défaut OFF. À utiliser avec
-/// `RETI_RUST_KV_BF16=0` (buffers f32). N'arrondit que le seed, pas les lignes
+/// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_KONLY=1`, défaut OFF. À utiliser avec
+/// `SARAGOSSA_RUST_KV_BF16=0` (buffers f32). N'arrondit que le seed, pas les lignes
 /// appendées en decode (négligeables devant le prompt).
 pub(super) fn kv_bf16_sim_konly() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_KV_BF16_SIM_KONLY", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_BF16_SIM_KONLY", false))
 }
 
 /// Diagnostic C1B (hors prod) : arrondit **seulement V** au seed prefill (K reste
 /// f32 exact), pour isoler l'effet de la précision des valeurs (→ sortie) sur la
-/// divergence. `RETI_RUST_KV_BF16_SIM_VONLY=1`, défaut OFF.
+/// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_VONLY=1`, défaut OFF.
 pub(super) fn kv_bf16_sim_vonly() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_KV_BF16_SIM_VONLY", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_BF16_SIM_VONLY", false))
 }
 
 /// Active la SDPA decode **2-passes split-K** (dédup GQA + tuiles L1) au-delà de
-/// `sdpa_2pass_min_len()` rows de KV. Défaut ON ; kill-switch `RETI_RUST_SDPA_2PASS=0`.
+/// `sdpa_2pass_min_len()` rows de KV. Défaut ON ; kill-switch `SARAGOSSA_RUST_SDPA_2PASS=0`.
 pub(super) fn sdpa_2pass_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_SDPA_2PASS", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_SDPA_2PASS", true))
 }
 
 /// Longueur de KV minimale pour basculer en 2-passes.
 ///
 /// Défaut 2048 (décision tuning 2026-07-03, D-30B) : sous ce seuil le
 /// single-pass flash est plus rapide, avec moins de dispatches et pas de
-/// scratch partials. Override : `RETI_RUST_SDPA_2PASS_MIN_LEN`.
+/// scratch partials. Override : `SARAGOSSA_RUST_SDPA_2PASS_MIN_LEN`.
 pub(super) fn sdpa_2pass_min_len() -> usize {
     static LEN: OnceLock<usize> = OnceLock::new();
     *LEN.get_or_init(|| {
-        std::env::var("RETI_RUST_SDPA_2PASS_MIN_LEN")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_SDPA_2PASS_MIN_LEN")
             .and_then(|value| value.parse().ok())
             .unwrap_or(2048)
     })

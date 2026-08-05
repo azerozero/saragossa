@@ -873,7 +873,7 @@ fn causal_attention_prefill_steel_d256_matches_cpu_selected_rows() -> Result<()>
 }
 
 /// Oracle CPU direct du kernel chunké-GQA `chunk_delta_seq_layout` (celui que
-/// dispatche `encode_chunk_delta_seq_layout`, opt-in `RETI_RUST_LINEAR_CHUNKED`) :
+/// dispatche `encode_chunk_delta_seq_layout`, opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`) :
 /// compare y ET l'état SSM final contre `naive_gdn_reference` (récurrence GDN
 /// séquentielle token-par-token, zéro chunking — voir la doc de module de
 /// `linear_attention`). Longueurs aux frontières du chunk C=16 (1, 15, 16, 17,

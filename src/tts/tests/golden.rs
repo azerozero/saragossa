@@ -4,7 +4,7 @@ use super::*;
 #[ignore = "live: charge les payloads Qwen3-TTS VoiceDesign et exécute le talker"]
 fn live_loads_voicedesign_payloads_and_forwards_talker() -> Result<()> {
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_VOICEDESIGN_DIR",
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS VoiceDesign absent du cache HF");
@@ -56,7 +56,7 @@ fn golden_voicedesign_talker_logits_matches_fixture() -> Result<()> {
     const MAX_ABS_TOLERANCE: f32 = 0.20;
 
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_VOICEDESIGN_DIR",
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS VoiceDesign absent du cache HF");
@@ -99,7 +99,7 @@ fn golden_voicedesign_e2e_audio_matches_fixture() -> Result<()> {
     const RMS_TOLERANCE: f32 = 0.10;
 
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_VOICEDESIGN_DIR",
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS VoiceDesign absent du cache HF");
@@ -167,7 +167,7 @@ fn golden_clone_icl_inputs_matches_fixture() -> Result<()> {
     const MAX_ABS_TOLERANCE: f32 = 0.18;
 
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_BASE_DIR",
+        "SARAGOSSA_QWEN3_TTS_BASE_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS Base absent du cache HF");
@@ -211,7 +211,7 @@ fn golden_clone_first_cb0_matches_fixture() -> Result<()> {
     const MAX_ABS_TOLERANCE: f32 = 0.56;
 
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_BASE_DIR",
+        "SARAGOSSA_QWEN3_TTS_BASE_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS Base absent du cache HF");
@@ -254,7 +254,7 @@ fn golden_clone_e2e_audio_matches_fixture() -> Result<()> {
     const RMS_TOLERANCE: f32 = 0.25;
 
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_BASE_DIR",
+        "SARAGOSSA_QWEN3_TTS_BASE_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS Base absent du cache HF");
@@ -306,14 +306,19 @@ fn live_clone_generation_diagnoses_frame_cap() -> Result<()> {
     const MAX_FRAMES: usize = 2;
 
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_BASE_DIR",
+        "SARAGOSSA_QWEN3_TTS_BASE_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS Base absent du cache HF");
         return Ok(());
     };
-    let wav = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../voices/reti-fr.wav");
-    let txt = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../voices/reti-fr.txt");
+    let (Some(wav), Some(txt)) = (
+        crate::test_support::voice_fixture("reti-fr.wav"),
+        crate::test_support::voice_fixture("reti-fr.txt"),
+    ) else {
+        eprintln!("skip: fixtures voix de référence absentes");
+        return Ok(());
+    };
     let wav_bytes = std::fs::read(&wav).map_err(|source| InferError::Io {
         path: wav.clone(),
         source,
@@ -353,7 +358,7 @@ fn live_clone_generation_diagnoses_frame_cap() -> Result<()> {
 #[ignore = "live: charge le contrat header-only d'un snapshot Qwen3-TTS Base"]
 fn live_loads_base_snapshot_contract() -> Result<()> {
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_BASE_DIR",
+        "SARAGOSSA_QWEN3_TTS_BASE_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS Base absent du cache HF");

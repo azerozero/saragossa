@@ -10,6 +10,10 @@ publish = true
 edition = "2021"
 rust-version = "1.85"
 build = "build.rs"
+# `tools/` regroupe des utilitaires Python annexes (quantification, mesure de
+# qualité) : utiles dans le dépôt, inutiles à qui compile le crate. Les exclure
+# garde le paquet crates.io strictement Rust.
+exclude = ["tools/"]
 
 [lib]
 name = "saragossa"
@@ -31,7 +35,7 @@ devtools = []
 
 [dependencies]
 thiserror = "2"
-safetensors = "0.7"
+safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }

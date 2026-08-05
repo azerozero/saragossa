@@ -1779,11 +1779,11 @@ fn resident_full_precondition_rejects_model_without_moe() {
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn mtp_verifier_env_ready() -> bool {
     let required = [
-        ("RETI_RUST_MTP_HISTORY", "committed"),
-        ("RETI_RUST_PREFIX_CACHE", "0"),
-        ("RETI_RUST_DECODE_RESIDENT_FULL", "1"),
-        ("RETI_RUST_DECODE_RESIDENT_FULL_LINEAR", "1"),
-        ("RETI_RUST_GPU_ARGMAX", "1"),
+        ("SARAGOSSA_RUST_MTP_HISTORY", "committed"),
+        ("SARAGOSSA_RUST_PREFIX_CACHE", "0"),
+        ("SARAGOSSA_RUST_DECODE_RESIDENT_FULL", "1"),
+        ("SARAGOSSA_RUST_DECODE_RESIDENT_FULL_LINEAR", "1"),
+        ("SARAGOSSA_RUST_GPU_ARGMAX", "1"),
     ];
     for (key, expected) in required {
         match std::env::var(key) {
@@ -1811,26 +1811,28 @@ fn mtp_verifier_env_ready() -> bool {
 
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn mtp_verifier_model_dir() -> Option<PathBuf> {
-    let model_dir = if let Some(path) = std::env::var_os("RETI_RUST_MTP_VERIFIER_TEST_MODEL") {
+    let model_dir = if let Some(path) =
+        crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL")
+    {
         let path = PathBuf::from(path);
         if path.is_dir() {
             Some(path)
         } else {
             eprintln!(
-                "skip MTP verifier integration: RETI_RUST_MTP_VERIFIER_TEST_MODEL is not a directory: {}",
+                "skip MTP verifier integration: SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL is not a directory: {}",
                 path.display()
             );
             None
         }
     } else {
         eprintln!(
-            "skip MTP verifier integration: model missing, set RETI_RUST_MTP_VERIFIER_TEST_MODEL"
+            "skip MTP verifier integration: model missing, set SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL"
         );
         None
     };
     crate::test_support::require_real_model(
         model_dir,
-        "RETI_RUST_MTP_VERIFIER_TEST_MODEL pointant vers le modèle MTP",
+        "SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL pointant vers le modèle MTP",
     )
 }
 
@@ -1911,7 +1913,7 @@ fn mtp_verifier_case(
 /// il se lance explicitement avec les flags résident/MTP ci-dessous.
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 #[test]
-#[ignore = "requires Metal + 27B MTP model; set RETI_RUST_MTP_HISTORY=committed and resident decode flags"]
+#[ignore = "requires Metal + 27B MTP model; set SARAGOSSA_RUST_MTP_HISTORY=committed and resident decode flags"]
 fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
     if !mtp_verifier_env_ready() {
         return Ok(());

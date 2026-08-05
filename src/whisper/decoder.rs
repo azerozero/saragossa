@@ -148,10 +148,12 @@ impl WhisperDecoder {
             return Err(InferError::Config("préfixe Whisper vide".to_string()));
         }
         // Backend decode : RÉSIDENT (GPU, un command buffer/token, zéro readback)
-        // par défaut sur Metal ; `RETI_STT_DECODER_PEROP=1` rebascule per-op.
+        // par défaut sur Metal ; `SARAGOSSA_STT_DECODER_PEROP=1` rebascule per-op.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let mut resident: Option<ResidentDecode<'_>> = match runtime.metal_executor() {
-            Some(metal) if std::env::var_os("RETI_STT_DECODER_PEROP").is_none() => {
+            Some(metal)
+                if crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none() =>
+            {
                 let dec = self.build_resident_decoder(metal)?;
                 let kv = metal.build_whisper_decode_kv_resident(
                     audio_features,
@@ -550,7 +552,7 @@ impl WhisperModel {
         lang: &str,
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
-        let timing = std::env::var_os("RETI_STT_TIMING").is_some();
+        let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
         let t_enc = std::time::Instant::now();
         let audio_features = self.encoder.encode_samples(samples, runtime)?;
         if timing {
@@ -573,7 +575,7 @@ impl WhisperModel {
         lang: &str,
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
-        let timing = std::env::var_os("RETI_STT_TIMING").is_some();
+        let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
         let mut prompt = Vec::with_capacity(4);
         prompt.push(self.sot_token);
         if let Some(language_token) = self.language_token(lang) {
@@ -776,7 +778,7 @@ mod tests {
     }
 
     fn local_whisper_tiny_dir() -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("RETI_WHISPER_TINY_DIR") {
+        if let Some(path) = crate::runtime_flags::env_var("SARAGOSSA_WHISPER_TINY_DIR") {
             let path = PathBuf::from(path);
             if path.join("config.json").is_file() && path.join("model.safetensors").is_file() {
                 return Some(path);

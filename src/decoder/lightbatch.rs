@@ -14,7 +14,7 @@
 use super::*;
 
 /// Accumulateur de la disjonction d'experts à M=2
-/// (`RETI_RUST_LIGHTBATCH_EXPERT_STATS=1`) : pour chaque (couche MoE, pas duo),
+/// (`SARAGOSSA_RUST_LIGHTBATCH_EXPERT_STATS=1`) : pour chaque (couche MoE, pas duo),
 /// n(2) = nombre d'experts DISTINCTS dans l'union des top-k des 2 flux
 /// (top_k ≤ n(2) ≤ 2·top_k). C'est LA donnée du plafond du gain MoE batché :
 /// trafic routé dédupliqué idéal = n(2)/(2·top_k) du trafic par-flux actuel.
@@ -93,7 +93,7 @@ fn report_expert_stats() {
     if stats.samples == 0 {
         eprintln!(
             "lightbatch expert_stats: aucun échantillon (pas duo MoE non exercé — \
-             vérifier RETI_RUST_LIGHTBATCH_MOE2 et le mode duo)"
+             vérifier SARAGOSSA_RUST_LIGHTBATCH_MOE2 et le mode duo)"
         );
         return;
     }
@@ -199,7 +199,7 @@ impl CausalDecoder {
     /// le flux 0 (principal, prioritaire) peut être consommé incrémentalement
     /// pendant que le flux de fond avance. `max_new_tokens` est PAR FLUX
     /// (chaque flux suit la sémantique solo avec SON budget). La priorité du
-    /// principal se règle via `RETI_RUST_LIGHTBATCH_BG_STRIDE` (flux de fond
+    /// principal se règle via `SARAGOSSA_RUST_LIGHTBATCH_BG_STRIDE` (flux de fond
     /// décodé 1 pas sur N, défaut 1).
     ///
     /// # Errors

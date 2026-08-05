@@ -233,7 +233,7 @@ impl CausalDecoder {
             InferError::Metal("arène résidente absente (decode résident)".to_string())
         })?;
 
-        // Instrumentation per-section (tranche 3, `RETI_RUST_GPU_COUNTERS`) :
+        // Instrumentation per-section (tranche 3, `SARAGOSSA_RUST_GPU_COUNTERS`) :
         // `Some` → forward segmenté en 1 command buffer par couche + 1 pour lm_head
         // (chronométrés CPU) ; `None` → command buffer unique 1c.4, inchangé. La
         // segmentation ne change ni les kernels ni l'ordre ni l'état GPU persistant
@@ -418,7 +418,7 @@ impl CausalDecoder {
         if let (Some(timer), Some(started)) = (timer, lmhead_started) {
             timer.record_lmhead(started.elapsed().as_nanos());
         }
-        // Diagnostic C1B (hors prod, gaté `RETI_RUST_ORACLE_DUMP_LOGITS`) : relit
+        // Diagnostic C1B (hors prod, gaté `SARAGOSSA_RUST_ORACLE_DUMP_LOGITS`) : relit
         // l'état post-`final_norm` du token courant et recalcule les logits pleins
         // (lm_head), pour dumper les top-k et mesurer la marge top1-top2 (near-tie
         // bf16 vs dégradation). Sans effet sur la trajectoire : le token émis reste

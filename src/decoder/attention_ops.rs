@@ -322,7 +322,7 @@ pub(super) fn full_attention_context_cached(
 }
 
 /// Chemin résident GPU de l'attention decode full-attn (flag
-/// `RETI_RUST_DECODE_RESIDENT`). Renvoie `Some(contexte brut [1, q_dim])` si la
+/// `SARAGOSSA_RUST_DECODE_RESIDENT`). Renvoie `Some(contexte brut [1, q_dim])` si la
 /// couche a un KV résident (`LayerKvCache::full`), sinon `None` → chemin CPU
 /// `cached_attention_one`. Append du K/V (rope'd) du token courant par écriture
 /// résidente (réserve R3), puis attention single-query sur le KV résident.

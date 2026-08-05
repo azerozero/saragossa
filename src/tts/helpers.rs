@@ -5,7 +5,7 @@ use super::{
 use crate::{InferError, Result, Tensor};
 
 pub(super) fn tts_generation_trace_enabled() -> bool {
-    std::env::var("RETI_TTS_TRACE_FRAMES")
+    crate::runtime_flags::env_var("SARAGOSSA_TTS_TRACE_FRAMES")
         .map(|value| {
             let value = value.trim();
             !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
@@ -14,7 +14,7 @@ pub(super) fn tts_generation_trace_enabled() -> bool {
 }
 
 pub(super) fn tts_internal_profile_enabled() -> bool {
-    std::env::var("RETI_TTS_INTERNAL_PROFILE")
+    crate::runtime_flags::env_var("SARAGOSSA_TTS_INTERNAL_PROFILE")
         .map(|value| {
             let value = value.trim();
             !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
@@ -24,10 +24,9 @@ pub(super) fn tts_internal_profile_enabled() -> bool {
 
 /// Taille (en frames) du PREMIER lot de décodage streaming : petit = TTFA basse.
 /// Les lots suivants croissent (×2) → coût total O(N). Réglable via
-/// `RETI_TTS_STREAM_LOT` (défaut 4 frames ≈ 320 ms d'audio). Borné ≥ 1.
+/// `SARAGOSSA_TTS_STREAM_LOT` (défaut 4 frames ≈ 320 ms d'audio). Borné ≥ 1.
 pub(super) fn tts_stream_first_lot() -> usize {
-    std::env::var("RETI_TTS_STREAM_LOT")
-        .ok()
+    crate::runtime_flags::env_var("SARAGOSSA_TTS_STREAM_LOT")
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(4)
@@ -37,7 +36,9 @@ pub(super) fn tts_stream_first_lot() -> usize {
 /// plusieurs fois indique une dérive de décodage greedy, pas une prosodie utile.
 /// `0` désactive le garde-fou pour les diagnostics.
 pub(super) fn tts_repeat_frame_stop() -> usize {
-    tts_repeat_frame_stop_from_env(std::env::var("RETI_TTS_REPEAT_FRAME_STOP").ok().as_deref())
+    tts_repeat_frame_stop_from_env(
+        crate::runtime_flags::env_var("SARAGOSSA_TTS_REPEAT_FRAME_STOP").as_deref(),
+    )
 }
 
 pub(super) fn tts_repeat_frame_stop_from_env(value: Option<&str>) -> usize {
@@ -95,8 +96,7 @@ pub(super) fn clone_effective_frame_cap(max_frames: usize, target_tokens: usize)
 }
 
 pub(super) fn clone_sample_seed() -> u64 {
-    std::env::var("RETI_TTS_CLONE_SAMPLE_SEED")
-        .ok()
+    crate::runtime_flags::env_var("SARAGOSSA_TTS_CLONE_SAMPLE_SEED")
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(0)
 }

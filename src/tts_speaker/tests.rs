@@ -17,7 +17,7 @@ fn golden_speaker_xvector_matches_fixture() -> Result<()> {
     const RMS_TOLERANCE: f32 = 0.000_01;
 
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_BASE_DIR",
+        "SARAGOSSA_QWEN3_TTS_BASE_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS Base absent du cache HF");
@@ -26,7 +26,10 @@ fn golden_speaker_xvector_matches_fixture() -> Result<()> {
     let assets = crate::tts::TtsAssets::load_local(&model_dir)?;
     let speaker = TtsSpeakerEncoder::load(&model_dir, &assets.model_config)?;
 
-    let wav = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../voices/reti-fr.wav");
+    let Some(wav) = crate::test_support::voice_fixture("reti-fr.wav") else {
+        eprintln!("skip: fixture voix reti-fr.wav absente");
+        return Ok(());
+    };
     let bytes = std::fs::read(&wav).map_err(|source| InferError::Io {
         path: wav.clone(),
         source,

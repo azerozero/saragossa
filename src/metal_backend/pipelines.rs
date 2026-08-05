@@ -26,7 +26,9 @@ pub(super) struct KernelSources {
 
 impl KernelSources {
     fn load() -> Result<Self> {
-        Self::from_runtime_path(std::env::var_os("RETI_RUST_KERNELS_PATH").map(PathBuf::from))
+        Self::from_runtime_path(
+            crate::runtime_flags::env_var_os("SARAGOSSA_RUST_KERNELS_PATH").map(PathBuf::from),
+        )
     }
 
     pub(super) fn from_runtime_path(path: Option<PathBuf>) -> Result<Self> {
@@ -70,7 +72,7 @@ fn read_runtime_kernel(root: &Path, names: &[&str]) -> Result<String> {
         }
     }
     Err(InferError::Config(format!(
-        "RETI_RUST_KERNELS_PATH={} ne contient aucun de: {}",
+        "SARAGOSSA_RUST_KERNELS_PATH={} ne contient aucun de: {}",
         root.display(),
         names.join(", ")
     )))
@@ -105,8 +107,8 @@ fn compile_na_gemm_named(
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compile_steel_attention(device: &Device, source: &str) -> Option<ComputePipelineState> {
     if matches!(
-        std::env::var("RETI_STT_STEEL_ATTN").as_deref(),
-        Ok("0" | "false" | "off" | "no")
+        crate::runtime_flags::env_var("SARAGOSSA_STT_STEEL_ATTN").as_deref(),
+        Some("0" | "false" | "off" | "no")
     ) {
         return None;
     }

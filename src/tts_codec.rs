@@ -11,7 +11,7 @@ pub(crate) struct TtsCodec {
     sample_rate: u32,
     weights: HashMap<String, Tensor>,
     /// Forward GPU résident de la section chaude (`decoder.decoder.*`), construit
-    /// au chargement quand Metal est dispo et `RETI_TTS_CODEC_GPU` actif (défaut).
+    /// au chargement quand Metal est dispo et `SARAGOSSA_TTS_CODEC_GPU` actif (défaut).
     /// Repli CPU (octet-identique) si absent.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     gpu: Option<crate::tts_codec_gpu::CodecGpu>,
@@ -114,7 +114,7 @@ impl TtsCodec {
         // Forward GPU résident de la section chaude : best-effort au chargement.
         // Échec (pas de Metal, kernel KO, poids absent) ⇒ repli CPU silencieux.
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        let gpu = if crate::runtime_flags::env_flag("RETI_TTS_CODEC_GPU", true) {
+        let gpu = if crate::runtime_flags::env_flag("SARAGOSSA_TTS_CODEC_GPU", true) {
             match crate::tts_codec_gpu::CodecGpu::new(&weights, &cfg) {
                 Ok(gpu) => Some(gpu),
                 Err(error) => {

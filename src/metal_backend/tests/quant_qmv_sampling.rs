@@ -1513,10 +1513,10 @@ fn affine_qmv_u6_gs64_matches_generic_and_routes() -> Result<()> {
 #[test]
 fn encode_matmul_weight_buffers_na_gs128_matches_cpu_when_enabled() -> Result<()> {
     if !matches!(
-        std::env::var("RETI_RUST_QMM_NA_GS128").as_deref(),
-        Ok("1" | "true" | "on" | "yes")
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_NA_GS128").as_deref(),
+        Some("1" | "true" | "on" | "yes")
     ) {
-        eprintln!("skip: RETI_RUST_QMM_NA_GS128 désactivé");
+        eprintln!("skip: SARAGOSSA_RUST_QMM_NA_GS128 désactivé");
         return Ok(());
     }
     let Some(executor) = test_executor()? else {
@@ -1559,10 +1559,10 @@ fn encode_matmul_weight_buffers_na_gs128_matches_cpu_when_enabled() -> Result<()
 #[test]
 fn encode_matmul_weight_buffers_na_fused_tiled_matches_cpu_when_enabled() -> Result<()> {
     if !matches!(
-        std::env::var("RETI_RUST_QMM_NA_FUSED_TILED").as_deref(),
-        Ok("1" | "true" | "on" | "yes")
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_NA_FUSED_TILED").as_deref(),
+        Some("1" | "true" | "on" | "yes")
     ) {
-        eprintln!("skip: RETI_RUST_QMM_NA_FUSED_TILED désactivé");
+        eprintln!("skip: SARAGOSSA_RUST_QMM_NA_FUSED_TILED désactivé");
         return Ok(());
     }
     let Some(executor) = test_executor()? else {
@@ -1640,11 +1640,11 @@ fn encode_matmul_weight_buffers_na_fused_tiled_matches_cpu_when_enabled() -> Res
         let eps = if bits == 4 { 3.0e-1 } else { 5.0e-2 };
         assert_close_eps(&actual, &reference, eps);
         if matches!(
-            std::env::var("RETI_RUST_DECODE_PROFILE").as_deref(),
-            Ok("1" | "true" | "on" | "yes")
+            crate::runtime_flags::env_var("SARAGOSSA_RUST_DECODE_PROFILE").as_deref(),
+            Some("1" | "true" | "on" | "yes")
         ) && matches!(
-            std::env::var("RETI_RUST_DECODE_PROFILE_SITES").as_deref(),
-            Ok("1" | "true" | "on" | "yes")
+            crate::runtime_flags::env_var("SARAGOSSA_RUST_DECODE_PROFILE_SITES").as_deref(),
+            Some("1" | "true" | "on" | "yes")
         ) {
             let after_profile = decode_profile_dispatch_shapes_snapshot()
                 .get(&profile_key)

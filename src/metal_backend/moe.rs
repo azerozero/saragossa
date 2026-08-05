@@ -421,7 +421,7 @@ impl MetalExecutor {
     ) -> Result<Tensor> {
         if !crate::runtime_flags::lightbatch_moe2_enabled() {
             return Err(InferError::Metal(
-                "MoE shared batch2 désactivé par RETI_RUST_LIGHTBATCH_MOE2".to_string(),
+                "MoE shared batch2 désactivé par SARAGOSSA_RUST_LIGHTBATCH_MOE2".to_string(),
             ));
         }
         let (batch, in_dim) = input.as_matrix()?;

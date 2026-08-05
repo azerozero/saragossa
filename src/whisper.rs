@@ -261,15 +261,17 @@ impl WhisperEncoder {
             )));
         }
 
-        let timing = std::env::var_os("RETI_STT_TIMING").is_some();
+        let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
         let tc = std::time::Instant::now();
 
         // Frontend conv : RÉSIDENT (GPU, im2col + GEMM tuilé, un command buffer) par
-        // défaut sur Metal ; `RETI_STT_CONV_PEROP=1` rebascule CPU rayon. Conv en
+        // défaut sur Metal ; `SARAGOSSA_STT_CONV_PEROP=1` rebascule CPU rayon. Conv en
         // GEMM ⇒ drift ~1e-6 vs CPU (vérifié au golden).
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let h_resident: Option<Tensor> = match runtime.metal_executor() {
-            Some(metal) if std::env::var_os("RETI_STT_CONV_PEROP").is_none() => {
+            Some(metal)
+                if crate::runtime_flags::env_var_os("SARAGOSSA_STT_CONV_PEROP").is_none() =>
+            {
                 let nlc = transpose_mel_to_nlc(mel)?;
                 let conv = self.build_conv_weights(metal)?;
                 Some(metal.encode_whisper_conv(&nlc, &conv)?)
@@ -296,10 +298,10 @@ impl WhisperEncoder {
         // Chemin RÉSIDENT (défaut sur Metal) : les couches dans un command buffer,
         // zéro readback (vs ~7 syncs/couche). Mêmes GEMM/attention f32 ⇒
         // byte-identique ; seuls LayerNorm/GELU/add migrent GPU (drift ~1e-7,
-        // vérifié au golden). `RETI_STT_ENCODER_PEROP=1` rebascule sur le per-op.
+        // vérifié au golden). `SARAGOSSA_STT_ENCODER_PEROP=1` rebascule sur le per-op.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some(metal) = runtime.metal_executor() {
-            if std::env::var_os("RETI_STT_ENCODER_PEROP").is_none() {
+            if crate::runtime_flags::env_var_os("SARAGOSSA_STT_ENCODER_PEROP").is_none() {
                 let enc = self.build_resident(metal)?;
                 let tr = std::time::Instant::now();
                 let out = metal.encode_whisper_encoder(&h, &enc)?;
@@ -503,7 +505,7 @@ impl WhisperEncoder {
     ///
     /// Renvoie une erreur si le frontend mel ou l'encodeur échoue.
     pub fn encode_samples(&self, samples: &[f32], runtime: ForwardRuntime<'_>) -> Result<Tensor> {
-        let timing = std::env::var_os("RETI_STT_TIMING").is_some();
+        let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
         let t_mel = std::time::Instant::now();
         let mel = self.log_mel_spectrogram(samples)?;
         if timing {
@@ -612,7 +614,7 @@ pub fn log_mel_spectrogram(samples: &[f32], num_mel_bins: usize) -> Result<Tenso
             let value = buf[freq];
             *power_value = value.re * value.re + value.im * value.im;
         }
-        if std::env::var_os("RETI_STT_DENSE_MEL").is_some() {
+        if crate::runtime_flags::env_var_os("SARAGOSSA_STT_DENSE_MEL").is_some() {
             for mel_bin in 0..num_mel_bins {
                 let mut acc = 0.0_f32;
                 for (freq, &power_value) in power.iter().enumerate().take(N_FREQS) {

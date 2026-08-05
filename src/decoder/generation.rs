@@ -89,8 +89,9 @@ fn mtp_step_profile_enabled() -> bool {
     #[cfg(feature = "devtools")]
     {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED
-            .get_or_init(|| crate::decoder::flags::env_flag("RETI_RUST_MTP_STEP_PROFILE", false))
+        *ENABLED.get_or_init(|| {
+            crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_STEP_PROFILE", false)
+        })
     }
     #[cfg(not(feature = "devtools"))]
     {
@@ -223,7 +224,7 @@ struct DecodeProfiler {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 impl DecodeProfiler {
     fn start() -> Self {
-        // Profil decode (RETI_RUST_DECODE_PROFILE) : borne le cumul Metal autour
+        // Profil decode (SARAGOSSA_RUST_DECODE_PROFILE) : borne le cumul Metal autour
         // de la boucle de decode steady-state pour un split encode/wait/read par
         // token (phase 1a du decode résident).
         Self {
@@ -300,7 +301,7 @@ impl DecodeProfiler {
     }
 
     fn report_gpu_sections(decoder: &CausalDecoder, cache: &CausalDecoderCache) {
-        // Classement per-section GPU (tranche 3, `RETI_RUST_GPU_COUNTERS`).
+        // Classement per-section GPU (tranche 3, `SARAGOSSA_RUST_GPU_COUNTERS`).
         let Some(arena) = cache.resident.as_ref() else {
             return;
         };
@@ -2637,11 +2638,10 @@ impl CausalDecoder {
         input_token: usize,
         position: usize,
     ) -> Result<()> {
-        let Some(path) = std::env::var_os("RETI_RUST_MTP_TRACE") else {
+        let Some(path) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_TRACE") else {
             return Ok(());
         };
-        let limit = std::env::var("RETI_RUST_MTP_TRACE_LIMIT")
-            .ok()
+        let limit = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_TRACE_LIMIT")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(4);
         if position >= limit {
@@ -2697,7 +2697,7 @@ impl CausalDecoder {
         accepted: bool,
         generated_len_before: usize,
     ) -> Result<()> {
-        let Some(path) = std::env::var_os("RETI_RUST_MTP_VERIFY_TRACE") else {
+        let Some(path) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_VERIFY_TRACE") else {
             return Ok(());
         };
         let line = format!(

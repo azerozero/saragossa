@@ -2,7 +2,7 @@
 //! groupé `gemm_nax_coop_qb_grouped`, ~7,6× le qmv-gather). Tri+pad des tokens par
 //! expert (16-aligné, CPU à partir d'un readback des indices), UN dispatch par
 //! projection lisant le poids EMPILÉ packed/scales/biases DIRECTEMENT (zéro
-//! matérialisation bf16). Opt-in `RETI_RUST_MOE_COOP`.
+//! matérialisation bf16). Opt-in `SARAGOSSA_RUST_MOE_COOP`.
 
 use super::*;
 
@@ -713,9 +713,10 @@ impl MetalExecutor {
         self.encode_moe_g_perm(encoder, &scratch.indices, &cursor, &perm, total)?;
         // gate/up : GEMM + GATHER fusé (lit input via perm). swiglu padé.
         // down : GEMM + SCATTER fusé (écrit scratch.down[slot] via perm).
-        // DIAGNOSTIC perf : RETI_RUST_MOE_COOP_SKIP_GEMM saute les 3 grouped GEMMs
+        // DIAGNOSTIC perf : SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM saute les 3 grouped GEMMs
         // (sortie FAUSSE) → le delta vs la version complète = le coût du GEMM routé.
-        let skip_gemm = std::env::var("RETI_RUST_MOE_COOP_SKIP_GEMM").is_ok();
+        let skip_gemm =
+            crate::runtime_flags::env_var("SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM").is_some();
         let fused_swiglu = !skip_gemm && moe_coop_fused_swiglu_enabled();
         if skip_gemm {
             // Zéro gate/up (0.0f32 = 0u32) pour éviter les dénormaux qui faussent le timing.
@@ -787,7 +788,8 @@ impl MetalExecutor {
         }
         // Expert partagé + combine (même encodeur). DIAGNOSTIC : SKIP_SHARED saute
         // les 3 projections shared (par-token, qmv) → le delta = leur coût.
-        let skip_shared = std::env::var("RETI_RUST_MOE_COOP_SKIP_SHARED").is_ok();
+        let skip_shared =
+            crate::runtime_flags::env_var("SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED").is_some();
         let gate_dim = self.encode_matmul_weight_buffers(
             encoder,
             input_buffer,

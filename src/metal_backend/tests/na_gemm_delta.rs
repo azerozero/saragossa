@@ -473,7 +473,7 @@ fn conv_norm_gates_batch_real_perf() -> Result<()> {
 
 // Brick #2 campagne : débit RÉEL du GEMM dense quantifié au shape in_proj du 35B
 // (M=16384, K=2048, N=8192, u8 gs64), via le chemin prod encode_matmul_weight (qmv
-// si RETI_RUST_QMM_NA off, NA-matmul2d si on). Décisif : TFLOP/s vs le pic ~26.
+// si SARAGOSSA_RUST_QMM_NA off, NA-matmul2d si on). Décisif : TFLOP/s vs le pic ~26.
 #[ignore = "perf manuel"]
 #[test]
 fn dense_gemm_inproj_throughput() -> Result<()> {
@@ -508,7 +508,7 @@ fn dense_gemm_inproj_throughput() -> Result<()> {
     commit_and_wait(cb)?;
     let dt = t0.elapsed().as_secs_f64() / f64::from(iters);
     let tflops = 2.0 * m as f64 * k as f64 * n as f64 / dt / 1.0e12;
-    let na = std::env::var("RETI_RUST_QMM_NA").is_ok();
+    let na = crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_NA").is_some();
     let line = format!(
         "[dense_inproj] qmm_na={na} M={m} K={k} N={n} : {:.2} ms/GEMM, {tflops:.1} TFLOP/s",
         dt * 1.0e3

@@ -1496,11 +1496,11 @@ fn run_attention_case_bf16_with_dims(
 /// SANS prefill (KV synthétique seedé) → itération en secondes, pas 34 min.
 /// Mesure ms/appel et **GB/s effectif** (octets K+V UNIQUES lus une fois ;
 /// le déficit GQA gonfle le trafic réel mais on veut la lecture unique).
-/// Activé par `RETI_RUST_BENCH_SDPA` ; `RETI_RUST_FLASH_SDPA=0` = kernel naïf. Run :
-/// `RETI_RUST_BENCH_SDPA=1 cargo test --release -p saragossa attention_decode_bench -- --nocapture`
+/// Activé par `SARAGOSSA_RUST_BENCH_SDPA` ; `SARAGOSSA_RUST_FLASH_SDPA=0` = kernel naïf. Run :
+/// `SARAGOSSA_RUST_BENCH_SDPA=1 cargo test --release -p saragossa attention_decode_bench -- --nocapture`
 #[test]
 fn attention_decode_bench() -> Result<()> {
-    if std::env::var("RETI_RUST_BENCH_SDPA").is_err() {
+    if crate::runtime_flags::env_var("SARAGOSSA_RUST_BENCH_SDPA").is_none() {
         return Ok(());
     }
     let Some(state) = try_state()? else {
@@ -1512,8 +1512,7 @@ fn attention_decode_bench() -> Result<()> {
     let q_data: Vec<f32> = (0..q_dim)
         .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
         .collect();
-    let iters: usize = std::env::var("RETI_RUST_BENCH_SDPA_ITERS")
-        .ok()
+    let iters: usize = crate::runtime_flags::env_var("SARAGOSSA_RUST_BENCH_SDPA_ITERS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
     for &len in &[1024usize, 4096, 16384, 32768] {

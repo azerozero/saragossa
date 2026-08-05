@@ -17,7 +17,7 @@ type ExpertIndicesPair = ([Buffer; 2], usize);
 
 thread_local! {
     // Collecte diagnostique des indices d'experts du pas duo
-    // (RETI_RUST_LIGHTBATCH_EXPERT_STATS) : une paire de buffers u32 [top_k]
+    // (SARAGOSSA_RUST_LIGHTBATCH_EXPERT_STATS) : une paire de buffers u32 [top_k]
     // par couche MoE duo, dans l'ordre des couches. None = collecte inactive.
     static EXPERT_INDICES_COLLECTOR: RefCell<Option<Vec<ExpertIndicesPair>>> =
         const { RefCell::new(None) };
@@ -517,7 +517,7 @@ impl MetalExecutor {
             && self.qmm2_eligible_weight(&weights.shared_gate_proj)
             && self.qmm2_eligible_weight(&weights.shared_up_proj)
             && self.qmm2_eligible_weight(&weights.shared_down_proj);
-        if !eligible && crate::runtime_flags::env_flag("RETI_RUST_TRACE_MOE", false) {
+        if !eligible && crate::runtime_flags::env_flag("SARAGOSSA_RUST_TRACE_MOE", false) {
             eprintln!(
                 "MoE shared duo qmm2 eligibility: {}; {}; {}; {}",
                 self.qmm2_eligible_weight_report("router", &weights.router),

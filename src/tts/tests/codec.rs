@@ -15,11 +15,11 @@ fn codec_gpu_cpu_parity_synthetic() -> Result<()> {
     };
     if crate::test_support::require_real_model(
         codec.gpu_active().then_some(()),
-        "codec GPU actif (Metal et RETI_TTS_CODEC_GPU)",
+        "codec GPU actif (Metal et SARAGOSSA_TTS_CODEC_GPU)",
     )
     .is_none()
     {
-        eprintln!("skip: forward GPU codec inactif (Metal absent ou RETI_TTS_CODEC_GPU=0)");
+        eprintln!("skip: forward GPU codec inactif (Metal absent ou SARAGOSSA_TTS_CODEC_GPU=0)");
         return Ok(());
     }
     let mut report = String::from("# Parité codec GPU vs CPU — codes synthétiques\n\n");
@@ -58,7 +58,7 @@ fn codec_gpu_cpu_parity_synthetic() -> Result<()> {
 #[ignore = "parité: codec GPU vs CPU sur codes réels VoiceDesign (cache HF + Metal requis)"]
 fn codec_gpu_cpu_parity_e2e() -> Result<()> {
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_VOICEDESIGN_DIR",
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS VoiceDesign absent du cache HF");
@@ -67,7 +67,7 @@ fn codec_gpu_cpu_parity_e2e() -> Result<()> {
     let rust = TtsModel::load_local(model_dir)?;
     if crate::test_support::require_real_model(
         rust.codec.gpu_active().then_some(()),
-        "codec GPU actif (Metal et RETI_TTS_CODEC_GPU)",
+        "codec GPU actif (Metal et SARAGOSSA_TTS_CODEC_GPU)",
     )
     .is_none()
     {
@@ -95,7 +95,7 @@ fn codec_gpu_cpu_parity_e2e() -> Result<()> {
 #[ignore = "parité: codec streaming incrémental vs batch (cache HF + Metal requis)"]
 fn codec_streaming_incremental_matches_full_prefix_on_representative_reply() -> Result<()> {
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_VOICEDESIGN_DIR",
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS VoiceDesign absent du cache HF");
@@ -104,7 +104,7 @@ fn codec_streaming_incremental_matches_full_prefix_on_representative_reply() -> 
     let rust = TtsModel::load_local(model_dir)?;
     if crate::test_support::require_real_model(
         rust.codec.gpu_active().then_some(()),
-        "codec GPU actif (Metal et RETI_TTS_CODEC_GPU)",
+        "codec GPU actif (Metal et SARAGOSSA_TTS_CODEC_GPU)",
     )
     .is_none()
     {
@@ -160,7 +160,7 @@ mean_abs_diff={mean_abs:.3e}\n",
 #[ignore = "parité+TTFA: streaming TTS ~= batch (cache HF + Metal requis)"]
 fn tts_streaming_matches_batch() -> Result<()> {
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_VOICEDESIGN_DIR",
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS VoiceDesign absent du cache HF");
@@ -321,7 +321,7 @@ d'obtenir un nombre de frames représentatif et une mesure stable.";
         .unwrap_or(400);
 
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_VOICEDESIGN_DIR",
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS VoiceDesign absent du cache HF");
