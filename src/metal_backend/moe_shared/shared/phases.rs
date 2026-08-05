@@ -38,7 +38,7 @@ impl MetalExecutor {
             )));
         }
         // Shared-expert : gate_proj + up_proj + swiglu fondus en 1 dispatch (tranche
-        // 3, kill-switch `RETI_RUST_FUSED_SHARED_GATE_UP=0`) — attaque le poste dispatch-bound
+        // 3, kill-switch `SARAGOSSA_RUST_FUSED_SHARED_GATE_UP=0`) — attaque le poste dispatch-bound
         // du MoE (6 micro-QMV série du shared-expert). Sinon le chemin 2 QMV + swiglu
         // (résultat identique ; le fusé est ==CPU/tolérance, cf. test colocalisé).
         let fused_shared =

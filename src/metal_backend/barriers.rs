@@ -133,7 +133,7 @@ pub(crate) fn post_dispatch_barrier_buffers(
 
 pub(super) fn resource_barriers_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| profile_env_flag("RETI_RUST_RESOURCE_BARRIERS", false))
+    *ENABLED.get_or_init(|| profile_env_flag("SARAGOSSA_RUST_RESOURCE_BARRIERS", false))
 }
 
 pub(crate) struct EncoderEndGuard<'a> {
@@ -169,7 +169,7 @@ impl Drop for EncoderEndGuard<'_> {
 
 /// `commit()` + `wait_until_completed()` + `ensure_completed`, centralisant le
 /// **point de synchronisation CPU↔GPU bloquant** (cf. plan : ~80-120/token).
-/// Sous `RETI_RUST_DECODE_PROFILE`, compte le command buffer et chronomètre le
+/// Sous `SARAGOSSA_RUST_DECODE_PROFILE`, compte le command buffer et chronomètre le
 /// wait. Hors profil : strictement l'ancien comportement (commit+wait+ensure).
 pub(crate) fn commit_and_wait(command_buffer: &metal::CommandBufferRef) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -195,7 +195,7 @@ pub(crate) fn commit_and_wait(command_buffer: &metal::CommandBufferRef) -> Resul
 }
 
 // Brick #5 campagne : ventilation du temps GPU (commit_and_wait synchrone) par
-// composant du prefill, via un label thread-local. Gaté RETI_RUST_TRACE_COMPONENTS.
+// composant du prefill, via un label thread-local. Gaté SARAGOSSA_RUST_TRACE_COMPONENTS.
 thread_local! {
     static COMMIT_LABEL: std::cell::Cell<&'static str> = const { std::cell::Cell::new("other") };
 }
@@ -209,7 +209,7 @@ static COMMIT_COMPONENTS: std::sync::OnceLock<
 
 pub(crate) fn commit_components_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| profile_env_flag("RETI_RUST_TRACE_COMPONENTS", false))
+    *ENABLED.get_or_init(|| profile_env_flag("SARAGOSSA_RUST_TRACE_COMPONENTS", false))
 }
 
 /// Fixe le label du prochain `commit_and_wait` (no-op si le traçage est désactivé).

@@ -22,9 +22,81 @@ pub(crate) fn force_resident_full_linear_decode() {
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
 pub(crate) fn force_resident_full_linear_decode() {}
 
+/// Préfixe canonique des variables d'environnement du moteur.
+const ENV_PREFIX: &str = "SARAGOSSA_";
+
+/// Préfixe historique, hérité de l'époque où le moteur vivait dans le binaire
+/// `reti`. Conservé en repli pour ne casser ni les scripts de bench, ni les
+/// presets machine, ni les canaries déjà déployés.
+const LEGACY_ENV_PREFIX: &str = "RETI_";
+
+/// Traduit un nom canonique `SARAGOSSA_*` vers son alias historique `RETI_*`.
+///
+/// Renvoie `None` pour les noms qui ne portent pas le préfixe canonique : ils
+/// n'ont pas d'alias et sont lus tels quels.
+fn legacy_alias(name: &str) -> Option<String> {
+    name.strip_prefix(ENV_PREFIX)
+        .map(|suffix| format!("{LEGACY_ENV_PREFIX}{suffix}"))
+}
+
+/// Avertit une seule fois par variable qu'un nom hérité a servi.
+///
+/// Le repli est silencieux par conception (il ne doit rien casser), mais sans
+/// ce signal une configuration reposant sur l'ancien préfixe casserait sans
+/// prévenir le jour de son retrait. L'avertissement part sur `stderr` une fois
+/// par nom, pour ne pas polluer une boucle de decode.
+fn warn_legacy_env_once(legacy: &str, canonical: &str) {
+    if claim_legacy_warning(legacy) {
+        eprintln!("saragossa: {legacy} est déprécié, utiliser {canonical} (le repli sera retiré)");
+    }
+}
+
+/// Réserve l'avertissement pour `legacy` ; vrai la première fois seulement.
+fn claim_legacy_warning(legacy: &str) -> bool {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return false;
+    };
+    seen.insert(legacy.to_string())
+}
+
+/// Lit une variable d'environnement du moteur, nom canonique d'abord.
+///
+/// `SARAGOSSA_FOO` gagne toujours ; à défaut on retombe sur `SARAGOSSA_FOO`. C'est
+/// le point de passage unique pour que le contrat public du crate cesse de
+/// dépendre du nom de son consommateur (cf. ADR 0011, dette « namespace »).
+pub fn env_var(name: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(name) {
+        return Some(value);
+    }
+    let legacy = legacy_alias(name)?;
+    let value = std::env::var(&legacy).ok()?;
+    warn_legacy_env_once(&legacy, name);
+    Some(value)
+}
+
+/// Variante `OsString` de [`env_var`], pour les flags qui portent un chemin.
+pub fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
+    if let Some(value) = std::env::var_os(name) {
+        return Some(value);
+    }
+    let legacy = legacy_alias(name)?;
+    let value = std::env::var_os(&legacy)?;
+    warn_legacy_env_once(&legacy, name);
+    Some(value)
+}
+
+/// Vrai si la variable est définie sous l'un ou l'autre des deux préfixes.
+pub fn env_present(name: &str) -> bool {
+    env_var_os(name).is_some()
+}
+
 pub fn env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
+    env_var(name)
         .and_then(|value| env_flag_value(&value))
         .unwrap_or(default)
 }
@@ -73,13 +145,13 @@ pub(crate) fn moe_drop_trace_enabled() -> bool {
 
 /// Active les traces d'allocation GPU autour des prefills et générations.
 ///
-/// Défaut OFF (`RETI_RUST_TRACE_GPU_ALLOC=1` pour l'activer). Le flag est gelé
+/// Défaut OFF (`SARAGOSSA_RUST_TRACE_GPU_ALLOC=1` pour l'activer). Le flag est gelé
 /// au premier accès afin que le chemin désactivé ne fasse aucune lecture d'env,
 /// aucun appel Metal et aucune prise du mutex du cache scratch après démarrage.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn trace_gpu_alloc_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_TRACE_GPU_ALLOC", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_GPU_ALLOC", false))
 }
 
 // Le working set scratch 8k mesuré tient dans 3,44 Gio ; 4 Gio le conserve,
@@ -97,13 +169,13 @@ fn scratch_cap_bytes_from_env(value: Option<&str>) -> u64 {
 
 /// Renvoie le plafond logique du cache scratch Metal en octets.
 ///
-/// `RETI_RUST_SCRATCH_CAP_GB` accepte un nombre entier de Gio. Une valeur
+/// `SARAGOSSA_RUST_SCRATCH_CAP_GB` accepte un nombre entier de Gio. Une valeur
 /// absente, nulle ou invalide retombe sur 4 Gio.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn scratch_cap_bytes() -> u64 {
     static CAP: OnceLock<u64> = OnceLock::new();
     *CAP.get_or_init(|| {
-        let value = std::env::var("RETI_RUST_SCRATCH_CAP_GB").ok();
+        let value = crate::runtime_flags::env_var("SARAGOSSA_RUST_SCRATCH_CAP_GB");
         scratch_cap_bytes_from_env(value.as_deref())
     })
 }
@@ -111,10 +183,10 @@ pub(crate) fn scratch_cap_bytes() -> u64 {
 /// Active le recast bf16 de la sortie d'embedding Qwen. **Défaut ON** :
 /// aligne la sortie d'embedding sur oMLX (accord teacher-forced 98,04 → 99,35 %),
 /// l'arrondi se fait dans le gather résident sans dispatch ajouté (coût decode/prefill nul).
-/// `RETI_RUST_QWEN_EMBED_BF16=0` rétablit le contrat f32 historique (coupe-circuit).
+/// `SARAGOSSA_RUST_QWEN_EMBED_BF16=0` rétablit le contrat f32 historique (coupe-circuit).
 pub(super) fn qwen_embed_bf16_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_QWEN_EMBED_BF16", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QWEN_EMBED_BF16", true))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,8 +198,7 @@ pub(super) enum MtpHistoryPolicy {
 pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
     static POLICY: OnceLock<MtpHistoryPolicy> = OnceLock::new();
     *POLICY.get_or_init(|| {
-        std::env::var("RETI_RUST_MTP_HISTORY")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_HISTORY")
             .map(|value| value.trim().to_ascii_lowercase())
             .and_then(|value| match value.as_str() {
                 "committed" | "full" => Some(MtpHistoryPolicy::Committed),
@@ -139,7 +210,7 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
                 // démarrage d'un binaire de mesure, pas dans une boucle chaude.
                 other => {
                     eprintln!(
-                        "RETI_RUST_MTP_HISTORY: valeur inconnue {other:?} \
+                        "SARAGOSSA_RUST_MTP_HISTORY: valeur inconnue {other:?} \
                          (attendu committed|full|cycle|reset) — repli sur committed"
                     );
                     None
@@ -150,7 +221,7 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
 }
 
 /// Chemin MTP fused depth-1 SANS historique committed ni pré-draft spéculatif
-/// (draft#2). **Défaut OFF** (`RETI_RUST_MTP_FRESH_CACHE=1` pour l'activer) :
+/// (draft#2). **Défaut OFF** (`SARAGOSSA_RUST_MTP_FRESH_CACHE=1` pour l'activer) :
 /// diagnostic, pas un gain prod.
 ///
 /// En mode fresh : cache MTP vidé par pas (attention self-only, position 0,
@@ -165,30 +236,29 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn mtp_fresh_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_MTP_FRESH_CACHE", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_FRESH_CACHE", false))
 }
 
 /// Active la profondeur de draft MTP **adaptative** (GammaTune-style).
 ///
-/// **Défaut OFF** (`RETI_RUST_MTP_ADAPTIVE_DEPTH=1` pour l'activer) : le decode
-/// MTP garde alors sa profondeur fixe (`RETI_RUST_MTP_MAX_DRAFT`), comportement
+/// **Défaut OFF** (`SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=1` pour l'activer) : le decode
+/// MTP garde alors sa profondeur fixe (`SARAGOSSA_RUST_MTP_MAX_DRAFT`), comportement
 /// strictement inchangé. Activé, la profondeur est choisie PAR PAS entre 1 et le
-/// plafond `RETI_RUST_MTP_MAX_DRAFT` selon une EMA de la deep-acceptance récente
+/// plafond `SARAGOSSA_RUST_MTP_MAX_DRAFT` selon une EMA de la deep-acceptance récente
 /// (cf. [`crate::decoder::mtp_adaptive`]). La séquence générée reste byte-identique
 /// (le vérifieur trunk exact décide *lesquels* des tokens proposés sont acceptés,
 /// pas *combien* on en propose).
 pub(super) fn mtp_adaptive_depth_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_MTP_ADAPTIVE_DEPTH", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH", false))
 }
 
 /// Lissage EMA (`alpha`) de la deep-acceptance MTP adaptative. Défaut 0,3, borné
-/// dans `]0,1]` par le contrôleur. Lu depuis `RETI_RUST_MTP_ADAPTIVE_ALPHA`.
+/// dans `]0,1]` par le contrôleur. Lu depuis `SARAGOSSA_RUST_MTP_ADAPTIVE_ALPHA`.
 pub(super) fn mtp_adaptive_alpha() -> f32 {
     static ALPHA: OnceLock<f32> = OnceLock::new();
     *ALPHA.get_or_init(|| {
-        std::env::var("RETI_RUST_MTP_ADAPTIVE_ALPHA")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_ADAPTIVE_ALPHA")
             .and_then(|value| value.trim().parse::<f32>().ok())
             .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
             .unwrap_or(0.3)
@@ -197,12 +267,11 @@ pub(super) fn mtp_adaptive_alpha() -> f32 {
 
 /// Seuil de deep-acceptance au-delà duquel drafter profond « paie ». Défaut 0,5
 /// (la pos-2 globale mesurée ≈ 0,47 pour un D2 ≈ D1 → break-even ~0,5). Lu depuis
-/// `RETI_RUST_MTP_ADAPTIVE_THRESHOLD`.
+/// `SARAGOSSA_RUST_MTP_ADAPTIVE_THRESHOLD`.
 pub(super) fn mtp_adaptive_threshold() -> f32 {
     static THRESHOLD: OnceLock<f32> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
-        std::env::var("RETI_RUST_MTP_ADAPTIVE_THRESHOLD")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_ADAPTIVE_THRESHOLD")
             .and_then(|value| value.trim().parse::<f32>().ok())
             .filter(|value| value.is_finite() && *value >= 0.0 && *value <= 1.0)
             .unwrap_or(0.5)
@@ -210,12 +279,11 @@ pub(super) fn mtp_adaptive_threshold() -> f32 {
 }
 
 /// Période de sondage forcé d'un pas profond (rafraîchit l'EMA en régime court).
-/// Défaut 8, min 1. Lu depuis `RETI_RUST_MTP_ADAPTIVE_PROBE`.
+/// Défaut 8, min 1. Lu depuis `SARAGOSSA_RUST_MTP_ADAPTIVE_PROBE`.
 pub(super) fn mtp_adaptive_probe_period() -> u32 {
     static PROBE: OnceLock<u32> = OnceLock::new();
     *PROBE.get_or_init(|| {
-        std::env::var("RETI_RUST_MTP_ADAPTIVE_PROBE")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_ADAPTIVE_PROBE")
             .and_then(|value| value.trim().parse::<u32>().ok())
             .filter(|value| *value >= 1)
             .unwrap_or(8)
@@ -225,13 +293,13 @@ pub(super) fn mtp_adaptive_probe_period() -> u32 {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn gpu_argmax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_GPU_ARGMAX", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_ARGMAX", true))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn gpu_sampler_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_GPU_SAMPLER", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_SAMPLER", true))
 }
 
 // NOTE: Sans Metal, aucun chemin GPU n'existe : les flags retombent sur false
@@ -250,7 +318,7 @@ const DECODE_INTERVAL_UNINITIALIZED_NS: u64 = u64::MAX;
 const DECODE_INTERVAL_MAX_NS: u64 = u64::MAX / 2;
 static DECODE_MIN_INTERVAL_NS: AtomicU64 = AtomicU64::new(DECODE_INTERVAL_UNINITIALIZED_NS);
 
-/// Intervalle minimum entre deux tokens, dérivé de `RETI_RUST_MAX_TOK_S` (cap
+/// Intervalle minimum entre deux tokens, dérivé de `SARAGOSSA_RUST_MAX_TOK_S` (cap
 /// tok/s du mode eco/silencieux). `None` = pas de throttle (défaut, pleine
 /// vitesse). Quand actif, le decode est rate-limité pour réduire la charge GPU
 /// soutenue (moins de ventilo, moins de conso) — sans coût en latence ressentie
@@ -286,8 +354,7 @@ pub fn set_decode_max_tokens_per_s(rate: Option<f64>) {
 fn decode_min_interval_ns() -> Option<u64> {
     let loaded = DECODE_MIN_INTERVAL_NS.load(AtomicOrdering::Relaxed);
     let nanos = if loaded == DECODE_INTERVAL_UNINITIALIZED_NS {
-        let initial = std::env::var("RETI_RUST_MAX_TOK_S")
-            .ok()
+        let initial = crate::runtime_flags::env_var("SARAGOSSA_RUST_MAX_TOK_S")
             .and_then(|value| value.trim().parse::<f64>().ok())
             .and_then(decode_interval_nanos_for_rate)
             .unwrap_or(0);
@@ -322,7 +389,7 @@ fn decode_interval_nanos_for_rate(rate: f64) -> Option<u64> {
 }
 
 /// Active le decode full-attn résident GPU (tranche 1b). **Défaut OFF** : opt-in
-/// `RETI_RUST_DECODE_RESIDENT=1` tant que non prouvé plus rapide ET correct.
+/// `SARAGOSSA_RUST_DECODE_RESIDENT=1` tant que non prouvé plus rapide ET correct.
 /// Le flag n'est lu qu'au setup post-prefill ;
 /// le chemin résident s'active ensuite via la présence de `LayerKvCache::full`.
 /// Ce repli 1b reste vivant pour diagnostic et sera retiré avec le split de
@@ -330,12 +397,12 @@ fn decode_interval_nanos_for_rate(rate: f64) -> Option<u64> {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn decode_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_DECODE_RESIDENT", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_RESIDENT", false))
 }
 
 /// Active le decode résident COMPLET (tranche 1c) : tout le forward d'un token
-/// en UN command buffer. **Défaut ON**, kill-switch `RETI_RUST_DECODE_RESIDENT_FULL=0`.
-/// Distinct du flag 1b (`RETI_RUST_DECODE_RESIDENT`, qui n'active que l'attention
+/// en UN command buffer. **Défaut ON**, kill-switch `SARAGOSSA_RUST_DECODE_RESIDENT_FULL=0`.
+/// Distinct du flag 1b (`SARAGOSSA_RUST_DECODE_RESIDENT`, qui n'active que l'attention
 /// full-attn) pour tester 1c indépendamment ; ils fusionneront à la fin de 1c.
 ///
 /// Bascule justifiée par l'oracle 1c.4 sur le 27B `qwen3_5` (256 tokens greedy) :
@@ -347,19 +414,19 @@ pub(super) fn decode_resident_enabled() -> bool {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn decode_resident_full_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_DECODE_RESIDENT_FULL", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_RESIDENT_FULL", true))
 }
 
 /// Autorise les couches linear-attn dans le decode résident complet. **Défaut
 /// ON** après oracle greedy 35B-oQ8 byte-identique vs per-op ; kill-switch
-/// `RETI_RUST_DECODE_RESIDENT_FULL_LINEAR=0` pour replier sur le per-op.
+/// `SARAGOSSA_RUST_DECODE_RESIDENT_FULL_LINEAR=0` pour replier sur le per-op.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn decode_resident_full_linear_enabled() -> bool {
     if FORCE_RESIDENT_FULL_LINEAR.load(Ordering::Relaxed) {
         return true;
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_DECODE_RESIDENT_FULL_LINEAR", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_RESIDENT_FULL_LINEAR", true))
 }
 
 /// Autorise la projection QKV concaténée dans les couches full-attn résidentes.
@@ -368,16 +435,16 @@ pub(super) fn decode_resident_full_linear_enabled() -> bool {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn decode_resident_full_qkv_concat_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_DECODE_RESIDENT_FULL_QKV_CONCAT", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_RESIDENT_FULL_QKV_CONCAT", true))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn decode_pipeline_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_DECODE_PIPELINE", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_PIPELINE", true))
 }
 
-/// Diagnostic C1B (hors chemin prod) : `RETI_RUST_ORACLE_DUMP_LOGITS=k` dump sur
+/// Diagnostic C1B (hors chemin prod) : `SARAGOSSA_RUST_ORACLE_DUMP_LOGITS=k` dump sur
 /// stderr les `k` plus grands logits (`id:valeur_f32`) à chaque pas de decode
 /// résident, pour classer les near-ties bf16 vs une vraie dégradation. Renvoie
 /// `None` si l'env est absent, non entier ou nul. Quand actif, le decode résident
@@ -386,8 +453,7 @@ pub(super) fn decode_pipeline_enabled() -> bool {
 pub(super) fn oracle_dump_logits_topk() -> Option<usize> {
     static TOPK: OnceLock<Option<usize>> = OnceLock::new();
     *TOPK.get_or_init(|| {
-        std::env::var("RETI_RUST_ORACLE_DUMP_LOGITS")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_ORACLE_DUMP_LOGITS")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|k| *k > 0)
     })
@@ -397,41 +463,40 @@ pub(super) fn oracle_dump_logits_topk() -> Option<usize> {
 /// buffer, projections denses batchées. **Défaut ON** quand le modèle le
 /// supporte (gate [`crate::decoder::CausalDecoder::supports_resident_duo`]),
 /// kill-switch
-/// `RETI_RUST_LIGHTBATCH_QMM2=0` → retombe sur le time-slicing E2.1.
+/// `SARAGOSSA_RUST_LIGHTBATCH_QMM2=0` → retombe sur le time-slicing E2.1.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn lightbatch_qmm2_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_LIGHTBATCH_QMM2", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LIGHTBATCH_QMM2", true))
 }
 
 /// Active le tail MoE duo du light-batch (E2.3) : router + shared expert
 /// batchés qmm2, topk/gathers routés par flux. **Défaut ON** quand les poids
-/// MoE sont qmm2-éligibles, kill-switch `RETI_RUST_LIGHTBATCH_MOE2=0` →
+/// MoE sont qmm2-éligibles, kill-switch `SARAGOSSA_RUST_LIGHTBATCH_MOE2=0` →
 /// retombe sur le tail MoE par flux (composition solo).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn lightbatch_moe2_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_LIGHTBATCH_MOE2", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LIGHTBATCH_MOE2", true))
 }
 
 /// Trace le mode effectif du light-batch (duo qmm2 vs time-slicing, MoE duo)
-/// sur stderr — diagnostic du repli silencieux (`RETI_RUST_TRACE_LIGHTBATCH=1`).
+/// sur stderr — diagnostic du repli silencieux (`SARAGOSSA_RUST_TRACE_LIGHTBATCH=1`).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn trace_lightbatch_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_TRACE_LIGHTBATCH", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_LIGHTBATCH", false))
 }
 
 /// Priorité du flux principal (light-batch E2.5) : le flux de fond (index > 0)
-/// n'est décodé qu'un pas sur N (`RETI_RUST_LIGHTBATCH_BG_STRIDE`, défaut 1 =
+/// n'est décodé qu'un pas sur N (`SARAGOSSA_RUST_LIGHTBATCH_BG_STRIDE`, défaut 1 =
 /// même cadence). N'altère pas la byte-identité par flux (la séquence d'un
 /// flux ne dépend que de son propre état, pas de QUAND ses pas s'exécutent).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn lightbatch_background_stride() -> u64 {
     static STRIDE: OnceLock<u64> = OnceLock::new();
     *STRIDE.get_or_init(|| {
-        std::env::var("RETI_RUST_LIGHTBATCH_BG_STRIDE")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_LIGHTBATCH_BG_STRIDE")
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|stride| *stride >= 1)
             .unwrap_or(1)
@@ -439,24 +504,24 @@ pub(super) fn lightbatch_background_stride() -> u64 {
 }
 
 /// Mesure la disjonction d'experts réelle à M=2
-/// (`RETI_RUST_LIGHTBATCH_EXPERT_STATS=1`, **défaut OFF**) : readback des
+/// (`SARAGOSSA_RUST_LIGHTBATCH_EXPERT_STATS=1`, **défaut OFF**) : readback des
 /// indices top-k des 2 flux par couche MoE duo, synthèse n(2) en fin de run.
 /// Diagnostic pur (readback après wait) — ne change AUCUN résultat ; coût
 /// readback non nul → jamais actif en prod ni pendant un bench.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn lightbatch_expert_stats_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_LIGHTBATCH_EXPERT_STATS", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LIGHTBATCH_EXPERT_STATS", false))
 }
 
 pub(super) fn profile_layer_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PROFILE_LAYER", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PROFILE_LAYER", false))
 }
 
 pub(super) fn prefill_batched_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_BATCH", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_BATCH", true))
 }
 
 // Défaut ON : routent le prefill des hybrides linéaire+full (qwen3_5_moe) vers le
@@ -468,20 +533,19 @@ pub(super) fn prefill_batched_enabled() -> bool {
 // batchés via les couches full ; le MoE rows n'affecte que les couches linear/le verify).
 pub(super) fn prefill_linear_batched_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_LINEAR_BATCH", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_LINEAR_BATCH", true))
 }
 
 pub(crate) fn prefill_moe_rows_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_MOE_ROWS", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_MOE_ROWS", true))
 }
 
 pub(super) fn prefill_chunk_size() -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();
     *CHUNK.get_or_init(|| {
-        std::env::var("RETI_RUST_PREFILL_CHUNK")
-            .ok()
-            .or_else(|| std::env::var("RETI_RUST_PREFILL_STEP_SIZE").ok())
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_PREFILL_CHUNK")
+            .or_else(|| crate::runtime_flags::env_var("SARAGOSSA_RUST_PREFILL_STEP_SIZE"))
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(0)
     })
@@ -496,12 +560,12 @@ pub(super) fn prefill_chunk_size() -> usize {
 /// à 6,3k/8,8k tokens ; 30B un near-tie à ~4k — marge 0,0084 vs 0,46, texte
 /// équivalent — ids identiques à 9,2k). Gain mesuré : 27B @8k 48→268 tok/s
 /// (×5,6), 30B @9k réel 13→306 (×23) ; le régime 32k devient exploitable.
-/// Kill-switch : `RETI_RUST_PREFILL_ATTN_BATCH_LONG=0` (fallback long
+/// Kill-switch : `SARAGOSSA_RUST_PREFILL_ATTN_BATCH_LONG=0` (fallback long
 /// byte-identique).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_attn_batch_long_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_ATTN_BATCH_LONG", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_BATCH_LONG", true))
 }
 
 /// Active l'attention causale batchée du prefill résident 30B et 35B sur la
@@ -514,11 +578,11 @@ pub(crate) fn prefill_attn_batch_long_enabled() -> bool {
 /// qualifiées pour le long (d128 pour le 30B, d256 pour le 35B) ; l'ordre de
 /// réduction n'est pas byte-identique au `mid`, donc le flag reste un
 /// kill-switch explicite.
-/// Kill-switch : `RETI_RUST_PREFILL_ATTN_BATCH_MID_30B=0`.
+/// Kill-switch : `SARAGOSSA_RUST_PREFILL_ATTN_BATCH_MID_30B=0`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_attn_batch_mid_30b_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_ATTN_BATCH_MID_30B", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_BATCH_MID_30B", true))
 }
 
 /// Active la variante Steel causale d256 du prefill 35B.
@@ -526,17 +590,17 @@ pub(crate) fn prefill_attn_batch_mid_30b_enabled() -> bool {
 /// Défaut ON : cette voie reprend le kernel Steel tuilé (Q/K/V en blocs,
 /// softmax online par tuile KV, causalité par tuile diagonale) pour remplacer le
 /// repli GQA8x4 quand la spécialisation d256 compile sur le GPU courant.
-/// Kill-switch dédié : `RETI_RUST_PREFILL_ATTN_STEEL_D256=0`.
+/// Kill-switch dédié : `SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256=0`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_attn_steel_d256_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_ATTN_STEEL_D256", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256", true))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_RESIDENT", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT", true))
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
@@ -567,7 +631,7 @@ pub(crate) fn override_prefill_resident_gemma4_for_test(
 
 /// Active le prefill résident Gemma 4.
 ///
-/// Défaut OFF : `RETI_RUST_PREFILL_RESIDENT_GEMMA4=1` ouvre le gate après
+/// Défaut OFF : `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` ouvre le gate après
 /// qualification des couches fenêtrées, du tail parallèle et de la continuité
 /// KV prefill vers decode.
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -579,7 +643,7 @@ pub(super) fn prefill_resident_gemma4_enabled() -> bool {
         _ => {}
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_RESIDENT_GEMMA4", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", false))
 }
 
 /// Active le tail MLP dense du prefill résident (27B hybride `qwen3_5`).
@@ -589,106 +653,106 @@ pub(super) fn prefill_resident_gemma4_enabled() -> bool {
 /// 256 de `causal_attention_prefill` — la divergence initiale venait de ce
 /// kernel (sortie non écrite au-delà de seq 256), pas du tail dense. Gain
 /// mesuré 27B : prefill @1k 29,7 → 192,4 tok/s (×6,5), @8k timeout 900 s →
-/// 48,5 tok/s. Kill-switch : `RETI_RUST_PREFILL_DENSE_RESIDENT=0`.
+/// 48,5 tok/s. Kill-switch : `SARAGOSSA_RUST_PREFILL_DENSE_RESIDENT=0`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_dense_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_DENSE_RESIDENT", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_DENSE_RESIDENT", true))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn gpu_counters_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_GPU_COUNTERS", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_COUNTERS", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn gpu_timestamps_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_GPU_TIMESTAMPS", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_TIMESTAMPS", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn moe_micro_split_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_MOE_MICRO_SPLIT", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_MICRO_SPLIT", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn linear_micro_split_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_LINEAR_MICRO_SPLIT", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_MICRO_SPLIT", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn trace_linear_attn_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_TRACE_LINEAR_ATTN", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_LINEAR_ATTN", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn trace_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_TRACE_PREFILL", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_PREFILL", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_profile_sections_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFILL_PROFILE_SECTIONS", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_PROFILE_SECTIONS", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn trace_dispatch_path_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_TRACE_DISPATCH_PATH", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_DISPATCH_PATH", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn decode_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_DECODE_PROFILE", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_PROFILE", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn topk_bench_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_TOPK_BENCH", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TOPK_BENCH", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn trace_moe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_TRACE_MOE", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_MOE", false))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn trace_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_TRACE_RESIDENT", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_RESIDENT", false))
 }
 
 /// Active le cache process-global des concaténations de poids linéaires résidents
 /// (qkv, linear-attn). **Défaut ON** : le buffer concaténé est une fonction pure
 /// des poids sources invariants → mémoïsé une fois au lieu d'être re-concaténé et
 /// ré-uploadé à chaque génération (poste dominant du setup MTP, ~1,2 s → ~0). La
-/// sortie est byte-identique (mêmes octets). `RETI_RUST_RESIDENT_CONCAT_CACHE=0`
+/// sortie est byte-identique (mêmes octets). `SARAGOSSA_RUST_RESIDENT_CONCAT_CACHE=0`
 /// rétablit le rebuild par génération (coupe-circuit / preuve A/B).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn resident_concat_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_RESIDENT_CONCAT_CACHE", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_RESIDENT_CONCAT_CACHE", true))
 }
 
 /// Route le prefill principal du decode MTP (historique committed) par le chemin
 /// résident fusionné (celui de l'AR) au lieu de la boucle per-op `forward_prefill`
 /// (≈ 2× plus lente). **Défaut ON**. À valider byte-identique : mêmes tokens ET
 /// acceptance inchangée (le hidden résident sert aussi à semer l'historique MTP).
-/// `RETI_RUST_MTP_PREFILL_RESIDENT=0` rétablit le prefill per-op (coupe-circuit).
+/// `SARAGOSSA_RUST_MTP_PREFILL_RESIDENT=0` rétablit le prefill per-op (coupe-circuit).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn mtp_prefill_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_MTP_PREFILL_RESIDENT", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_PREFILL_RESIDENT", true))
 }
 
 /// Trace chiffrée des sous-postes du setup decode MTP (prefill, résolution des
@@ -696,18 +760,17 @@ pub(crate) fn mtp_prefill_resident_enabled() -> bool {
 ///
 /// Diagnostic de la Phase 2 MTP (time-to-first-token) : distingue ce qui est
 /// invariant (poolable entre générations) de ce qui dépend du prompt. Hors
-/// chemin prod, aucun effet quand `RETI_RUST_MTP_SETUP_TRACE=0` (défaut).
+/// chemin prod, aucun effet quand `SARAGOSSA_RUST_MTP_SETUP_TRACE=0` (défaut).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn mtp_setup_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_MTP_SETUP_TRACE", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SETUP_TRACE", false))
 }
 
 pub(crate) fn attention_parallel_threshold() -> usize {
     static THRESHOLD: OnceLock<usize> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
-        std::env::var("RETI_RUST_ATTENTION_PAR_THRESHOLD")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_ATTENTION_PAR_THRESHOLD")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(128)
     })
@@ -716,27 +779,26 @@ pub(crate) fn attention_parallel_threshold() -> usize {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn qmv_fast_mode() -> Option<&'static str> {
     static MODE: OnceLock<Option<String>> = OnceLock::new();
-    MODE.get_or_init(|| std::env::var("RETI_RUST_QMV_FAST").ok())
+    MODE.get_or_init(|| crate::runtime_flags::env_var("SARAGOSSA_RUST_QMV_FAST"))
         .as_deref()
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn gather_fast_mode() -> Option<&'static str> {
     static MODE: OnceLock<Option<String>> = OnceLock::new();
-    MODE.get_or_init(|| std::env::var("RETI_RUST_GATHER_FAST").ok())
+    MODE.get_or_init(|| crate::runtime_flags::env_var("SARAGOSSA_RUST_GATHER_FAST"))
         .as_deref()
 }
 
 pub(super) fn prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_RUST_PREFIX_CACHE", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
 }
 
 pub(super) fn prefix_cache_capacity() -> usize {
     static CAPACITY: OnceLock<usize> = OnceLock::new();
     *CAPACITY.get_or_init(|| {
-        std::env::var("RETI_RUST_PREFIX_CACHE_CAP")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_PREFIX_CACHE_CAP")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(4)
     })
@@ -745,33 +807,32 @@ pub(super) fn prefix_cache_capacity() -> usize {
 /// Active le prefix-cache par blocs de `saragossa serve`.
 pub fn serve_prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_SERVE_PREFIX_CACHE", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SERVE_PREFIX_CACHE", true))
 }
 
 /// Active le pool LRU de modèles de `saragossa serve`.
 pub fn serve_lru_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_SERVE_LRU", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SERVE_LRU", true))
 }
 
 /// Active la garde OOM prédictive de `saragossa serve`.
 pub fn serve_oom_guard_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| memory_guard_enabled() && env_flag("RETI_SERVE_OOM_GUARD", true))
+    *ENABLED.get_or_init(|| memory_guard_enabled() && env_flag("SARAGOSSA_SERVE_OOM_GUARD", true))
 }
 
 /// Active la garde mémoire partagée Saragossa.
 pub fn memory_guard_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("RETI_MEMORY_GUARD", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_MEMORY_GUARD", true))
 }
 
 /// Renvoie le plafond mémoire statique global, en octets.
 pub fn memory_static_cap_bytes() -> Option<u64> {
     static CAP: OnceLock<Option<u64>> = OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("RETI_MEMORY_CAP_BYTES")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_MEMORY_CAP_BYTES")
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|bytes| *bytes > 0)
     })
@@ -781,8 +842,7 @@ pub fn memory_static_cap_bytes() -> Option<u64> {
 pub fn memory_headroom_bytes() -> u64 {
     static HEADROOM: OnceLock<u64> = OnceLock::new();
     *HEADROOM.get_or_init(|| {
-        std::env::var("RETI_MEMORY_HEADROOM_BYTES")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_MEMORY_HEADROOM_BYTES")
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(2 * 1024 * 1024 * 1024)
     })
@@ -792,8 +852,7 @@ pub fn memory_headroom_bytes() -> u64 {
 pub fn serve_prefix_block_tokens() -> usize {
     static TOKENS: OnceLock<usize> = OnceLock::new();
     *TOKENS.get_or_init(|| {
-        std::env::var("RETI_SERVE_PREFIX_BLOCK_TOKENS")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_SERVE_PREFIX_BLOCK_TOKENS")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|tokens| *tokens > 0)
             .unwrap_or(256)
@@ -804,8 +863,7 @@ pub fn serve_prefix_block_tokens() -> usize {
 pub fn serve_prefix_cache_blocks() -> usize {
     static BLOCKS: OnceLock<usize> = OnceLock::new();
     *BLOCKS.get_or_init(|| {
-        std::env::var("RETI_SERVE_PREFIX_CACHE_BLOCKS")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_SERVE_PREFIX_CACHE_BLOCKS")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(128)
     })
@@ -815,8 +873,7 @@ pub fn serve_prefix_cache_blocks() -> usize {
 pub fn serve_prefix_blocks_per_session() -> usize {
     static BLOCKS: OnceLock<usize> = OnceLock::new();
     *BLOCKS.get_or_init(|| {
-        std::env::var("RETI_SERVE_PREFIX_BLOCKS_PER_SESSION")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_SERVE_PREFIX_BLOCKS_PER_SESSION")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or_else(serve_prefix_cache_blocks)
     })
@@ -826,8 +883,7 @@ pub fn serve_prefix_blocks_per_session() -> usize {
 pub fn serve_model_pool_size() -> usize {
     static MODELS: OnceLock<usize> = OnceLock::new();
     *MODELS.get_or_init(|| {
-        std::env::var("RETI_SERVE_MODEL_POOL")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_SERVE_MODEL_POOL")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|models| *models > 0)
             .unwrap_or(2)
@@ -838,8 +894,7 @@ pub fn serve_model_pool_size() -> usize {
 pub fn serve_memory_static_cap_bytes() -> Option<u64> {
     static CAP: OnceLock<Option<u64>> = OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("RETI_SERVE_MEMORY_CAP_BYTES")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_SERVE_MEMORY_CAP_BYTES")
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|bytes| *bytes > 0)
     })
@@ -849,8 +904,7 @@ pub fn serve_memory_static_cap_bytes() -> Option<u64> {
 pub fn serve_memory_headroom_bytes() -> u64 {
     static HEADROOM: OnceLock<u64> = OnceLock::new();
     *HEADROOM.get_or_init(|| {
-        std::env::var("RETI_SERVE_MEMORY_HEADROOM_BYTES")
-            .ok()
+        crate::runtime_flags::env_var("SARAGOSSA_SERVE_MEMORY_HEADROOM_BYTES")
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(2 * 1024 * 1024 * 1024)
     })
@@ -910,5 +964,63 @@ mod tests {
             scratch_cap_bytes_from_env(Some("invalide")),
             DEFAULT_SCRATCH_CAP_GB * GIB_BYTES
         );
+    }
+
+    #[test]
+    fn legacy_alias_maps_canonical_prefix_only() {
+        assert_eq!(
+            legacy_alias("SARAGOSSA_RUST_TRUC").as_deref(),
+            Some("RETI_RUST_TRUC")
+        );
+        // Un nom hors préfixe canonique n'a pas d'alias : il est lu tel quel.
+        assert_eq!(legacy_alias("HF_HOME"), None);
+        assert_eq!(legacy_alias("RETI_RUST_TRUC"), None);
+    }
+
+    // Les trois tests d'env ci-dessous partagent le même processus : un mutex
+    // les sérialise, sans quoi les `set_var`/`remove_var` fuient d'un test à
+    // l'autre sous le harness multi-thread de Cargo.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_var_prefers_canonical_over_legacy() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        std::env::set_var("SARAGOSSA_TEST_PRIORITE", "canonique");
+        std::env::set_var("RETI_TEST_PRIORITE", "herite");
+        assert_eq!(
+            env_var("SARAGOSSA_TEST_PRIORITE").as_deref(),
+            Some("canonique")
+        );
+        std::env::remove_var("SARAGOSSA_TEST_PRIORITE");
+        std::env::remove_var("RETI_TEST_PRIORITE");
+    }
+
+    #[test]
+    fn env_var_falls_back_to_legacy_prefix() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        std::env::remove_var("SARAGOSSA_TEST_REPLI");
+        std::env::set_var("RETI_TEST_REPLI", "herite");
+        assert_eq!(env_var("SARAGOSSA_TEST_REPLI").as_deref(), Some("herite"));
+        assert!(env_present("SARAGOSSA_TEST_REPLI"));
+        std::env::remove_var("RETI_TEST_REPLI");
+    }
+
+    #[test]
+    fn env_flag_honours_legacy_prefix() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        std::env::remove_var("SARAGOSSA_TEST_DRAPEAU");
+        std::env::set_var("RETI_TEST_DRAPEAU", "1");
+        assert!(env_flag("SARAGOSSA_TEST_DRAPEAU", false));
+        std::env::remove_var("RETI_TEST_DRAPEAU");
+        assert!(!env_flag("SARAGOSSA_TEST_DRAPEAU", false));
+    }
+
+    #[test]
+    fn legacy_warning_fires_once_per_variable() {
+        // L'avertissement doit rester un signal de dépréciation, pas un bruit
+        // répété à chaque lecture : une boucle de decode lit ces flags souvent.
+        assert!(claim_legacy_warning("RETI_TEST_UNIQUE"));
+        assert!(!claim_legacy_warning("RETI_TEST_UNIQUE"));
+        assert!(claim_legacy_warning("RETI_TEST_AUTRE"));
     }
 }

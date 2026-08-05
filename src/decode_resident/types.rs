@@ -147,7 +147,7 @@ pub(crate) struct GemmaParallelMoeTailWeights<'a> {
 }
 
 /// Cumul CPU des temps par section du decode résident (ÉTAPE 0 tranche 3,
-/// fallback `RETI_RUST_GPU_COUNTERS`). Sur Apple Silicon (AGX) l'échantillonnage
+/// fallback `SARAGOSSA_RUST_GPU_COUNTERS`). Sur Apple Silicon (AGX) l'échantillonnage
 /// programmatique de compteurs GPU (`sampleCountersInBuffer`) est **refusé par le
 /// device** → on segmente le forward en command buffers par section, chronométrés
 /// CPU (`commit_and_wait` borné). Chaque couche = 1 CB (full-attn ou linear-attn,
@@ -175,7 +175,7 @@ pub(crate) struct GpuSectionTimer {
 }
 
 impl GpuSectionTimer {
-    /// Construit le timer si `RETI_RUST_GPU_COUNTERS` est défini, sinon `None`
+    /// Construit le timer si `SARAGOSSA_RUST_GPU_COUNTERS` est défini, sinon `None`
     /// (le decode reste le chemin résident à command buffer unique, inchangé).
     pub(crate) fn try_new() -> Option<Self> {
         crate::runtime_flags::gpu_counters_enabled().then_some(())?;

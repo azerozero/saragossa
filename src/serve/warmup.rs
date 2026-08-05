@@ -1,6 +1,5 @@
 //! Warmup du décodeur lors du chargement d'un modèle servi.
 
-use std::env;
 use std::time::{Duration, Instant};
 
 use saragossa::{CausalDecoder, ModelAssets};
@@ -118,10 +117,10 @@ pub(super) fn mtp_decoder(
 fn config_from_env(backend: RuntimeKind) -> Option<WarmupConfig> {
     warmup_config(
         backend,
-        env::var("RETI_RUST_WARMUP").ok().as_deref(),
-        positive_env_usize("RETI_RUST_WARMUP_PASSES", DEFAULT_WARMUP_PASSES),
+        saragossa::runtime_flags::env_var("SARAGOSSA_RUST_WARMUP").as_deref(),
+        positive_env_usize("SARAGOSSA_RUST_WARMUP_PASSES", DEFAULT_WARMUP_PASSES),
         positive_env_usize(
-            "RETI_RUST_WARMUP_PROMPT_TOKENS",
+            "SARAGOSSA_RUST_WARMUP_PROMPT_TOKENS",
             DEFAULT_WARMUP_PROMPT_TOKENS,
         ),
     )
@@ -149,8 +148,7 @@ fn warmup_disabled(value: Option<&str>) -> bool {
 }
 
 fn positive_env_usize(name: &str, default: usize) -> usize {
-    env::var(name)
-        .ok()
+    saragossa::runtime_flags::env_var(name)
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)

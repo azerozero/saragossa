@@ -425,7 +425,7 @@ impl CausalDecoder {
         )
     }
 
-    /// Microbench (tranche 3, `RETI_RUST_GPU_COUNTERS`) isolant le **MoE** et le
+    /// Microbench (tranche 3, `SARAGOSSA_RUST_GPU_COUNTERS`) isolant le **MoE** et le
     /// **surcoût commit/wait par command buffer** — les deux inconnues que la
     /// segmentation per-couche ne sépare pas (chaque couche = attn + MoE + 1 CB).
     ///

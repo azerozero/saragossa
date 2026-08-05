@@ -50,33 +50,33 @@ fn concat_weight_key(weights: &[&LinearWeight]) -> Option<ConcatWeightKey> {
 }
 
 /// Active le chemin GEMM bf16 de l'encodeur Whisper (matmul2d Neural Accelerators)
-/// par défaut si disponible. `RETI_STT_F32=1` force l'ancien chemin f32 ;
-/// `RETI_STT_BF16=0` garde aussi un kill-switch compatible avec les anciens benches.
+/// par défaut si disponible. `SARAGOSSA_STT_F32=1` force l'ancien chemin f32 ;
+/// `SARAGOSSA_STT_BF16=0` garde aussi un kill-switch compatible avec les anciens benches.
 /// bf16-input / accumulation f32.
 pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        if std::env::var_os("RETI_STT_F32").is_some() {
+        if crate::runtime_flags::env_var_os("SARAGOSSA_STT_F32").is_some() {
             return false;
         }
         !matches!(
-            std::env::var("RETI_STT_BF16").as_deref(),
-            Ok("0" | "false" | "off" | "no")
+            crate::runtime_flags::env_var("SARAGOSSA_STT_BF16").as_deref(),
+            Some("0" | "false" | "off" | "no")
         )
     })
 }
 
 /// Active le QMV decode Whisper avec poids bf16 row-major pour les projections
-/// M=1 où le microbench montre un gain. `RETI_STT_F32=1` force le chemin f32.
+/// M=1 où le microbench montre un gain. `SARAGOSSA_STT_F32=1` force le chemin f32.
 pub(crate) fn whisper_decode_bf16_qmv_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        if std::env::var_os("RETI_STT_F32").is_some() {
+        if crate::runtime_flags::env_var_os("SARAGOSSA_STT_F32").is_some() {
             return false;
         }
         !matches!(
-            std::env::var("RETI_STT_DECODE_BF16_QMV").as_deref(),
-            Ok("0" | "false" | "off" | "no")
+            crate::runtime_flags::env_var("SARAGOSSA_STT_DECODE_BF16_QMV").as_deref(),
+            Some("0" | "false" | "off" | "no")
         )
     })
 }
@@ -963,10 +963,9 @@ impl MetalExecutor {
         if recommended == 0 {
             return true;
         }
-        // Fraction ajustable par machine (`RETI_RUST_CONCAT_CACHE_VRAM_FRACTION`) ;
+        // Fraction ajustable par machine (`SARAGOSSA_RUST_CONCAT_CACHE_VRAM_FRACTION`) ;
         // valeur hors ]0, +∞[ ignorée → défaut `CONCAT_CACHE_VRAM_FRACTION`.
-        let fraction = std::env::var("RETI_RUST_CONCAT_CACHE_VRAM_FRACTION")
-            .ok()
+        let fraction = crate::runtime_flags::env_var("SARAGOSSA_RUST_CONCAT_CACHE_VRAM_FRACTION")
             .and_then(|value| value.trim().parse::<f64>().ok())
             .filter(|value| value.is_finite() && *value > 0.0)
             .unwrap_or(CONCAT_CACHE_VRAM_FRACTION);

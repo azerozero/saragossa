@@ -105,7 +105,7 @@ pub(crate) struct DecodeResidentState {
     rope_decode_kernel: ComputePipelineState,
     copy_at_kernel: ComputePipelineState,
     copy_at_f32_to_bf16_kernel: ComputePipelineState,
-    /// Instrumentation per-section (tranche 3), active si `RETI_RUST_GPU_COUNTERS`.
+    /// Instrumentation per-section (tranche 3), active si `SARAGOSSA_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,
     /// Slot de flux (light-batch) : namespace du scratch label-keyed de
     /// l'exécuteur partagé. `0` = mono-flux historique.

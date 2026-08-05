@@ -456,8 +456,8 @@ impl MetalExecutor {
         k: usize,
     ) -> Result<()> {
         let use_bn128 = !matches!(
-            std::env::var("RETI_STT_NAX_BN128").as_deref(),
-            Ok("0" | "false" | "off" | "no")
+            crate::runtime_flags::env_var("SARAGOSSA_STT_NAX_BN128").as_deref(),
+            Some("0" | "false" | "off" | "no")
         ) && n % 128 == 0;
         let pso = if use_bn128 {
             self.na_gemm_bf16_bn128
@@ -617,8 +617,8 @@ impl MetalExecutor {
         let mut owned: Vec<Buffer> = Vec::new();
         let use_na = super::whisper_bf16_gemm_enabled()
             && !matches!(
-                std::env::var("RETI_STT_CONV_NAX").as_deref(),
-                Ok("0" | "false" | "off" | "no")
+                crate::runtime_flags::env_var("SARAGOSSA_STT_CONV_NAX").as_deref(),
+                Some("0" | "false" | "off" | "no")
             )
             && w.conv1_weight_na.is_some()
             && w.conv2_weight_na.is_some()
@@ -727,7 +727,7 @@ impl MetalExecutor {
         let f1 = self.new_f32_buffer(nf, "we_f1")?;
         let g = self.new_f32_buffer(nf, "we_g")?;
 
-        // Chemin bf16 matmul2d NA (`RETI_STT_BF16`) : opérandes lhs convertis bf16,
+        // Chemin bf16 matmul2d NA (`SARAGOSSA_STT_BF16`) : opérandes lhs convertis bf16,
         // poids déjà cachés en bf16 (`weight_na`). Accumulation f32 → transcription
         // préservée (vérifié golden). Sinon : GEMM dense f32 byte-identique.
         let na = self.na_gemm_bf16.is_some()
@@ -1388,7 +1388,7 @@ pub(crate) struct WhisperResidentNorm {
 pub(crate) struct WhisperResidentProj {
     pub weight: Buffer,
     pub bias: Option<Buffer>,
-    /// Poids transposé bf16 `rhs^T [K,N]` pour le GEMM NA (Some si `RETI_STT_BF16`).
+    /// Poids transposé bf16 `rhs^T [K,N]` pour le GEMM NA (Some si `SARAGOSSA_STT_BF16`).
     pub weight_na: Option<Buffer>,
     /// Poids bf16 row-major `[N,K]` pour le QMV decode M=1.
     pub weight_bf16: Option<Buffer>,

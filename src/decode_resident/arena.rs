@@ -348,7 +348,7 @@ impl DecodeResidentState {
         })
     }
 
-    /// Renvoie le timer per-section GPU s'il est actif (`RETI_RUST_GPU_COUNTERS`).
+    /// Renvoie le timer per-section GPU s'il est actif (`SARAGOSSA_RUST_GPU_COUNTERS`).
     pub(crate) fn gpu_timer(&self) -> Option<&GpuSectionTimer> {
         self.timer.as_ref()
     }

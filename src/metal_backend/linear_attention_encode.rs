@@ -304,7 +304,7 @@ impl MetalExecutor {
 
     /// Linear-attn gated-delta en forme CHUNKÉE (port chunked-DeltaNet brique 4).
     /// 1 threadgroup/value_head, boucle sur T/C chunks (16× moins d'étapes séquentielles).
-    /// Exige `value_head_dim == 128` et `key_head_dim == 128`. Opt-in `RETI_RUST_LINEAR_CHUNKED`.
+    /// Exige `value_head_dim == 128` et `key_head_dim == 128`. Opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`.
     ///
     /// Correspondance étapes du kernel ↔ équations (section « Forme chunkée » de la
     /// doc de module `crate::linear_attention`, chunk C=16, `S₀` = état d'entrée) :

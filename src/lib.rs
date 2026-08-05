@@ -2,6 +2,11 @@
 //! TTS Qwen3 — backend prod `--backends rust-metal`, repli CPU `--backends rust`.
 
 #![deny(unsafe_code)]
+// R2 (docs/rust-guidelines.md) : aucun `unwrap()` sur le chemin de prod du
+// moteur (mesuré 0 le 2026-08-04). Un panic ici tue la boucle vocale entière,
+// donc la règle est verrouillée par le compilateur plutôt que par la revue.
+// Les tests conservent `unwrap()`, exemptés par `cfg_attr(test, …)`.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod activation;
 pub mod assets;

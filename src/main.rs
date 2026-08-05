@@ -108,7 +108,9 @@ fn run() -> CliResult<()> {
     if args.check_only {
         let contract = verify_decoder_contract(&assets)?;
         print_contract(&contract);
-        if let Some(draft_dir) = env::var_os("RETI_RUST_DFLASH_DRAFT_DIR") {
+        if let Some(draft_dir) =
+            saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")
+        {
             let draft = saragossa::devtools::load_dflash_draft_weights_for_target(
                 &assets.config,
                 PathBuf::from(draft_dir),
@@ -120,7 +122,7 @@ fn run() -> CliResult<()> {
     let load_started = Instant::now();
     let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
     // La tête MTP doit être chargée pour l'oracle d'acceptance ET pour le decode
-    // opt-in `RETI_RUST_MTP_DECODE` (sinon `generate_greedy_mtp_batched_with_options`
+    // opt-in `SARAGOSSA_RUST_MTP_DECODE` (sinon `generate_greedy_mtp_batched_with_options`
     // échoue faute de sidecar). Défaut OFF = aucun sidecar chargé, prod inchangée.
     if saragossa::devtools::mtp_acceptance_enabled() || mtp_decode_enabled() {
         let path =
@@ -128,7 +130,8 @@ fn run() -> CliResult<()> {
                 cli_error("decode/oracle MTP demandé mais aucun sidecar MTP détecté")
             })?;
         decoder = decoder.with_mtp_sidecar(path)?;
-        if let Some(path) = env::var_os("RETI_RUST_MTP_DRAFT_LM_HEAD") {
+        if let Some(path) = saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD")
+        {
             decoder = decoder.with_mtp_draft_lm_head_sidecar(PathBuf::from(path))?;
         }
     }
@@ -149,7 +152,7 @@ fn run() -> CliResult<()> {
     let prompt_ids = encode_prompt_ids(&assets, prompt, args.raw)?;
     let warmup_elapsed = warmup_decoder(&mut decoder, &prompt_ids, args.backend)?;
     // Chauffe la voie MTP quand le decode MTP est actif : une passe spéculative
-    // peuple le cache de concaténation QKV (`RETI_RUST_RESIDENT_CONCAT_CACHE`) sur
+    // peuple le cache de concaténation QKV (`SARAGOSSA_RUST_RESIDENT_CONCAT_CACHE`) sur
     // le `MetalExecutor` persistant, si bien que le PREMIER vrai decode saute la
     // concaténation des poids (mesuré ~1,3 s → ~3,5 ms). Amorti une fois au
     // démarrage ; en prod résident (voice loop/serve) tous les tours en profitent.
@@ -170,10 +173,9 @@ fn run() -> CliResult<()> {
             warmup_elapsed
         };
     if saragossa::devtools::lightbatch_acceptance_enabled() {
-        let prompt_b = args
-            .prompt_b
-            .as_ref()
-            .ok_or_else(|| cli_error("RETI_RUST_LIGHTBATCH_ACCEPTANCE=1 requiert --prompt-b"))?;
+        let prompt_b = args.prompt_b.as_ref().ok_or_else(|| {
+            cli_error("SARAGOSSA_RUST_LIGHTBATCH_ACCEPTANCE=1 requiert --prompt-b")
+        })?;
         let prompt_b_ids = encode_prompt_ids(&assets, prompt_b, args.raw)?;
         let options = generation_options(&args, &assets, args.top_p);
         return Ok(saragossa::devtools::run_lightbatch_acceptance(
@@ -189,7 +191,7 @@ fn run() -> CliResult<()> {
     }
     if args.prefill_only {
         // Bench serveur-chaud : N prefills réels, sans prefix-cache, dans le
-        // même process après un seul load/warmup. `RETI_RUST_PREFILL_ITERS`
+        // même process après un seul load/warmup. `SARAGOSSA_RUST_PREFILL_ITERS`
         // reste accepté pour rejouer les anciens protocoles.
         let prefill_repeat = args.prefill_repeat.or_else(env_prefill_repeat);
         if let Some(repeat) = prefill_repeat {
@@ -283,9 +285,12 @@ fn run() -> CliResult<()> {
         )?);
     }
     if saragossa::devtools::dflash_acceptance_enabled() {
-        let draft_dir = env::var_os("RETI_RUST_DFLASH_DRAFT_DIR").ok_or_else(|| {
-            cli_error("RETI_RUST_DFLASH_ACCEPTANCE=1 requiert RETI_RUST_DFLASH_DRAFT_DIR")
-        })?;
+        let draft_dir = saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")
+            .ok_or_else(|| {
+                cli_error(
+                    "SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 requiert SARAGOSSA_RUST_DFLASH_DRAFT_DIR",
+                )
+            })?;
         let draft = saragossa::devtools::load_dflash_draft_weights_for_target(
             &assets.config,
             PathBuf::from(draft_dir),
@@ -321,7 +326,7 @@ fn run() -> CliResult<()> {
     });
     let options = generation_options(&args, &assets, args.top_p);
     let generate_started = Instant::now();
-    // Decode opt-in MTP spéculatif (`RETI_RUST_MTP_DECODE=1`, défaut OFF). En T=0
+    // Decode opt-in MTP spéculatif (`SARAGOSSA_RUST_MTP_DECODE=1`, défaut OFF). En T=0
     // il est byte-identique à l'AR greedy (oracle `run_mtp_acceptance`,
     // `tokens_equal=true`) et gagne en e2e (D1 ~1,18×). Le résultat spéculatif ne
     // sépare pas prefill et decode : on mappe `loop_duration` sur `decode` et on
@@ -332,8 +337,7 @@ fn run() -> CliResult<()> {
         // Diagnostic Phase 2 : rejoue le setup à chaud (caches `MetalExecutor`
         // déjà peuplés) pour distinguer le coût cold-start du coût récurrent par
         // génération dans une boucle voix. Hors chemin prod (env absent = 1 passe).
-        let warm_passes = std::env::var("RETI_RUST_MTP_DECODE_REPEAT")
-            .ok()
+        let warm_passes = saragossa::runtime_flags::env_var("SARAGOSSA_RUST_MTP_DECODE_REPEAT")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(1);
         for pass in 1..warm_passes {
@@ -383,7 +387,7 @@ fn run() -> CliResult<()> {
     println!("{}", text.trim());
     // Diagnostic oracle : dump des IDs générés pour un diff token-à-token exact
     // entre deux configurations (ex. chemin NA ON vs OFF). Env-gated, hors chemin prod.
-    if env::var_os("RETI_RUST_ORACLE_DUMP_IDS").is_some() {
+    if saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_ORACLE_DUMP_IDS").is_some() {
         let ids = generated
             .iter()
             .map(ToString::to_string)
@@ -478,25 +482,24 @@ const MTP_DECODE_WARMUP_TOKENS: usize = 6;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn prefill_profile_enabled() -> bool {
-    saragossa::runtime_flags::env_flag("RETI_RUST_DECODE_PROFILE", false)
+    saragossa::runtime_flags::env_flag("SARAGOSSA_RUST_DECODE_PROFILE", false)
 }
 
 /// Indique si le decode normal passe par le chemin spéculatif MTP (défaut OFF).
 ///
-/// Opt-in via `RETI_RUST_MTP_DECODE=1`. Défaut OFF = comportement prod inchangé
+/// Opt-in via `SARAGOSSA_RUST_MTP_DECODE=1`. Défaut OFF = comportement prod inchangé
 /// (decode AR greedy, byte-identique à l'oracle).
 fn mtp_decode_enabled() -> bool {
-    saragossa::runtime_flags::env_flag("RETI_RUST_MTP_DECODE", false)
+    saragossa::runtime_flags::env_flag("SARAGOSSA_RUST_MTP_DECODE", false)
 }
 
 /// Renvoie la profondeur de draft du decode MTP opt-in (défaut 1).
 ///
-/// Lue depuis `RETI_RUST_MTP_MAX_DRAFT` ; une valeur absente, invalide ou nulle
+/// Lue depuis `SARAGOSSA_RUST_MTP_MAX_DRAFT` ; une valeur absente, invalide ou nulle
 /// retombe sur 1 (un seul token draft vérifié par cycle), car le decode MTP
 /// exige au moins un draft.
 fn mtp_decode_max_draft() -> usize {
-    env::var("RETI_RUST_MTP_MAX_DRAFT")
-        .ok()
+    saragossa::runtime_flags::env_var("SARAGOSSA_RUST_MTP_MAX_DRAFT")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(1)
@@ -603,30 +606,27 @@ fn warmup_decoder(
 }
 
 fn warmup_enabled() -> bool {
-    !env::var("RETI_RUST_WARMUP").is_ok_and(|value| {
+    !saragossa::runtime_flags::env_var("SARAGOSSA_RUST_WARMUP").is_some_and(|value| {
         value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
     })
 }
 
 fn warmup_passes() -> usize {
-    env::var("RETI_RUST_WARMUP_PASSES")
-        .ok()
+    saragossa::runtime_flags::env_var("SARAGOSSA_RUST_WARMUP_PASSES")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|passes| *passes > 0)
         .unwrap_or(2)
 }
 
 fn warmup_prompt_tokens() -> usize {
-    env::var("RETI_RUST_WARMUP_PROMPT_TOKENS")
-        .ok()
+    saragossa::runtime_flags::env_var("SARAGOSSA_RUST_WARMUP_PROMPT_TOKENS")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|tokens| *tokens > 0)
         .unwrap_or(32)
 }
 
 fn env_prefill_repeat() -> Option<usize> {
-    env::var("RETI_RUST_PREFILL_ITERS")
-        .ok()
+    saragossa::runtime_flags::env_var("SARAGOSSA_RUST_PREFILL_ITERS")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|repeat| *repeat > 1)
 }
@@ -800,7 +800,7 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error> {
 
 fn print_help() {
     println!(
-        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve> [options]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N]\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet RETI_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set RETI_RUST_DFLASH_ACCEPTANCE=1 with RETI_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
+        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve> [options]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N]\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
     );
 }
 

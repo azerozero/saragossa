@@ -26,10 +26,10 @@ pub const MLX_SHA: &str = "be456e2";
 /// Date de capture des goldens (ISO).
 pub const CAPTURED: &str = "2026-06-13";
 
-/// Indique si l'on est en mode capture (`RETI_GOLDEN_CAPTURE=1`) — écrit les
+/// Indique si l'on est en mode capture (`SARAGOSSA_GOLDEN_CAPTURE=1`) — écrit les
 /// fixtures depuis la référence mlx-rs au lieu de les comparer.
 pub fn capturing() -> bool {
-    env_flag("RETI_GOLDEN_CAPTURE", false)
+    env_flag("SARAGOSSA_GOLDEN_CAPTURE", false)
 }
 
 /// Racine versionnée des fixtures (`crates/saragossa/tests/golden`).

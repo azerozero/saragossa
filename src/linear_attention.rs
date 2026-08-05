@@ -48,7 +48,7 @@
 //!
 //! # Forme chunkée (kernel Metal `chunk_delta_seq_layout`, chunk C=16)
 //!
-//! Le prefill batché (opt-in `RETI_RUST_LINEAR_CHUNKED`, dispatché par
+//! Le prefill batché (opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`, dispatché par
 //! `MetalExecutor::encode_chunk_delta_seq_layout`) déroule la récurrence par
 //! blocs de C tokens depuis l'état de début de chunk `S₀`. Avec le decay cumulé
 //! intra-chunk `γ_i = ∏_{j≤i} g_j` (indices locaux `i, j ∈ [0, C)`) :
@@ -1250,10 +1250,10 @@ fn linear_attn_resident_step_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         // Défaut **ON** (phase 1a full-rust : +43 % decode mesuré, sortie greedy
-        // bit-identique). Kill-switch : `RETI_RUST_LINEAR_ATTN_RESIDENT=0`
+        // bit-identique). Kill-switch : `SARAGOSSA_RUST_LINEAR_ATTN_RESIDENT=0`
         // (ou `false`/`off`) pour revenir au chemin par-op (ex. régression /
         // diagnostic). Toute autre valeur, ou variable absente → résident.
-        env_flag("RETI_RUST_LINEAR_ATTN_RESIDENT", true)
+        env_flag("SARAGOSSA_RUST_LINEAR_ATTN_RESIDENT", true)
     })
 }
 

@@ -16,7 +16,7 @@ mod guards;
 fn load_voicedesign_codec() -> Option<TtsCodec> {
     let codec = (|| {
         let model_dir = local_tts_snapshot(
-            "RETI_QWEN3_TTS_VOICEDESIGN_DIR",
+            "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
             "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
         )?;
         let codec_weights = model_dir.join("speech_tokenizer/model.safetensors");
@@ -79,8 +79,10 @@ fn drift_stats(reference: &[f32], candidate: &[f32]) -> (f32, f32, f32, f32) {
 }
 
 fn clone_reference_assets() -> Result<(Vec<u8>, String)> {
-    let wav = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../voices/reti-fr.wav");
-    let txt = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../voices/reti-fr.txt");
+    let wav = crate::test_support::voice_fixture("reti-fr.wav")
+        .ok_or_else(|| InferError::Config("fixture voix reti-fr.wav absente".to_string()))?;
+    let txt = crate::test_support::voice_fixture("reti-fr.txt")
+        .ok_or_else(|| InferError::Config("fixture voix reti-fr.txt absente".to_string()))?;
     let wav_bytes = std::fs::read(&wav).map_err(|source| InferError::Io {
         path: wav.clone(),
         source,

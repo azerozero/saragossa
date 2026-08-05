@@ -314,7 +314,7 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_align64(
 
 /// Prédicat du GEMM prefill sur Neural Accelerators (matmul2d bf16) : dé-quant
 /// u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
-/// (prefill). Opt-in (`RETI_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
+/// (prefill). Opt-in (`SARAGOSSA_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
 /// dispo (`na_gemm_bf16.is_some()`, macOS≥26). bf16 ⇒ non bit-à-bit identique.
 pub(super) fn can_use_qmm_na_u8(
     batch: usize,

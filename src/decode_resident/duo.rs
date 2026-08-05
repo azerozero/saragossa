@@ -310,9 +310,9 @@ impl DecodeResidentState {
     }
 
     /// Tail MoE duo : router + shared expert batchés qmm2 quand les poids sont
-    /// éligibles (E2.3, kill-switch `RETI_RUST_LIGHTBATCH_MOE2=0`), sinon repli
+    /// éligibles (E2.3, kill-switch `SARAGOSSA_RUST_LIGHTBATCH_MOE2=0`), sinon repli
     /// sur la composition solo par flux. Les deux variantes sont byte-identiques
-    /// par flux ; la trace `RETI_RUST_TRACE_LIGHTBATCH=1` annonce le mode UNE fois.
+    /// par flux ; la trace `SARAGOSSA_RUST_TRACE_LIGHTBATCH=1` annonce le mode UNE fois.
     #[expect(
         clippy::too_many_arguments,
         reason = "tail MoE duo : exécuteur + duo buffers + poids + slots"

@@ -304,14 +304,12 @@ mod tests {
     /// décode/mel pur sur reti-fr.wav). Mêmes tolérances que `live_clone_preprocess_*`.
     #[test]
     fn golden_clone_preprocess_matches_fixture() -> Result<()> {
-        let wav =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../voices/reti-fr.wav");
-        if !wav.is_file() {
-            // NOTE: le WAV de référence vit dans le workspace reti, pas dans le
-            // dépôt saragossa standalone — skip pour rester CI-portable.
-            eprintln!("skip: WAV de référence clone absent (voices/reti-fr.wav)");
+        // La fixture est embarquée dans `assets/voices/`, donc présente aussi
+        // dans le miroir public. Le skip ne couvre plus qu'un arbre tronqué.
+        let Some(wav) = crate::test_support::voice_fixture("reti-fr.wav") else {
+            eprintln!("skip: fixture voix reti-fr.wav absente");
             return Ok(());
-        }
+        };
         let bytes = std::fs::read(&wav).map_err(|source| InferError::Io {
             path: wav.clone(),
             source,

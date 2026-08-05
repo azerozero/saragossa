@@ -8374,7 +8374,7 @@ kernel void windowed_attention_prefill_long_f32(
 // calcule une requête causale complète (position, q_head) avec online-softmax :
 // Q/K/V ont déjà reçu RMSNorm+RoPE côté encodeur Rust. L'ordre de réduction
 // change par rapport au fallback long byte-identique, donc le dispatch reste
-// strictement gaté par RETI_RUST_PREFILL_ATTN_BATCH_LONG.
+// strictement gaté par SARAGOSSA_RUST_PREFILL_ATTN_BATCH_LONG.
 kernel void causal_attention_prefill_batch_long_d128_f32(
     device const float* q [[buffer(0)]],
     device const float* k [[buffer(1)]],

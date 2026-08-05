@@ -180,6 +180,7 @@ impl SttSlot {
 }
 
 fn tts_max_frames() -> usize {
+    // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
     std::env::var(TTS_MAX_FRAMES_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())

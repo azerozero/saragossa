@@ -1310,7 +1310,7 @@ fn coop_qb_grouped_u4_bit_identical_to_u8_same_weights() -> Result<()> {
 
 /// Parité BIT-À-BIT u4 vs u8 du GEMM NA tuilé dense (`gemm_nax_coop_qb_tiled*`),
 /// à poids logiques identiques (q ∈ [0,15], scales/biases identiques). Le chemin u4
-/// dense est DÉFAUT ON (RETI_RUST_QMM_NA_FUSED_TILED_U4) ; ce test prouve que le
+/// dense est DÉFAUT ON (SARAGOSSA_RUST_QMM_NA_FUSED_TILED_U4) ; ce test prouve que le
 /// dé-paquetage nibble/stride u4 est correct (aucun bug), donc sa sensibilité aux
 /// near-ties de l'oracle greedy est PUREMENT la précision bf16 tensor-core, la même
 /// que le chemin u8 promu en prod (6156f29).

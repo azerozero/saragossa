@@ -751,7 +751,7 @@ fn print_doctor_markdown(models: &[ModelSummary], memory: Option<u64>) {
                 .map(format_bytes)
                 .unwrap_or_else(|| "n/a".to_string()),
             resident_status(model),
-            flag_text(runtime_flag("RETI_RUST_PREFIX_CACHE", true)),
+            flag_text(runtime_flag("SARAGOSSA_RUST_PREFIX_CACHE", true)),
         );
     }
     println!();
@@ -838,25 +838,28 @@ fn health_checks() -> Vec<(&'static str, &'static str, String)> {
             check(metal && macos_major_at_least(26)),
             "NA matmul2d",
             format!(
-                "macOS {macos}, RETI_RUST_QMM_NA={}",
-                flag_text(runtime_flag("RETI_RUST_QMM_NA", true))
+                "macOS {macos}, SARAGOSSA_RUST_QMM_NA={}",
+                flag_text(runtime_flag("SARAGOSSA_RUST_QMM_NA", true))
             ),
         ),
         (
-            check(runtime_flag("RETI_RUST_DECODE_RESIDENT_FULL", true)),
+            check(runtime_flag("SARAGOSSA_RUST_DECODE_RESIDENT_FULL", true)),
             "decode resident full",
             format!(
                 "full={}, linear={}",
-                flag_text(runtime_flag("RETI_RUST_DECODE_RESIDENT_FULL", true)),
-                flag_text(runtime_flag("RETI_RUST_DECODE_RESIDENT_FULL_LINEAR", false))
+                flag_text(runtime_flag("SARAGOSSA_RUST_DECODE_RESIDENT_FULL", true)),
+                flag_text(runtime_flag(
+                    "SARAGOSSA_RUST_DECODE_RESIDENT_FULL_LINEAR",
+                    false
+                ))
             ),
         ),
         (
-            check(runtime_flag("RETI_RUST_PREFILL_RESIDENT", true)),
+            check(runtime_flag("SARAGOSSA_RUST_PREFILL_RESIDENT", true)),
             "prefill resident",
             format!(
-                "RETI_RUST_PREFILL_RESIDENT={}",
-                flag_text(runtime_flag("RETI_RUST_PREFILL_RESIDENT", true))
+                "SARAGOSSA_RUST_PREFILL_RESIDENT={}",
+                flag_text(runtime_flag("SARAGOSSA_RUST_PREFILL_RESIDENT", true))
             ),
         ),
         (
@@ -865,29 +868,30 @@ fn health_checks() -> Vec<(&'static str, &'static str, String)> {
             "chemins bf16/NA disponibles quand Metal est actif".to_string(),
         ),
         (
-            check(runtime_flag("RETI_RUST_GPU_SAMPLER", true)),
+            check(runtime_flag("SARAGOSSA_RUST_GPU_SAMPLER", true)),
             "sampler GPU",
             format!(
-                "RETI_RUST_GPU_SAMPLER={}",
-                flag_text(runtime_flag("RETI_RUST_GPU_SAMPLER", true))
+                "SARAGOSSA_RUST_GPU_SAMPLER={}",
+                flag_text(runtime_flag("SARAGOSSA_RUST_GPU_SAMPLER", true))
             ),
         ),
         (
-            check(runtime_flag("RETI_RUST_LIGHTBATCH_QMM2", true)),
+            check(runtime_flag("SARAGOSSA_RUST_LIGHTBATCH_QMM2", true)),
             "light-batch",
             format!(
                 "qmm2={}, moe2={}",
-                flag_text(runtime_flag("RETI_RUST_LIGHTBATCH_QMM2", true)),
-                flag_text(runtime_flag("RETI_RUST_LIGHTBATCH_MOE2", true))
+                flag_text(runtime_flag("SARAGOSSA_RUST_LIGHTBATCH_QMM2", true)),
+                flag_text(runtime_flag("SARAGOSSA_RUST_LIGHTBATCH_MOE2", true))
             ),
         ),
         (
-            check(runtime_flag("RETI_RUST_PREFIX_CACHE", true)),
+            check(runtime_flag("SARAGOSSA_RUST_PREFIX_CACHE", true)),
             "prefix-cache",
             format!(
                 "enabled={}, cap={}",
-                flag_text(runtime_flag("RETI_RUST_PREFIX_CACHE", true)),
-                std::env::var("RETI_RUST_PREFIX_CACHE_CAP").unwrap_or_else(|_| "32".to_string())
+                flag_text(runtime_flag("SARAGOSSA_RUST_PREFIX_CACHE", true)),
+                saragossa::runtime_flags::env_var("SARAGOSSA_RUST_PREFIX_CACHE_CAP")
+                    .unwrap_or_else(|| "32".to_string())
             ),
         ),
         (
@@ -913,8 +917,8 @@ fn macos_major_at_least(major: u64) -> bool {
 }
 
 fn resident_status(model: &ModelSummary) -> String {
-    let full = runtime_flag("RETI_RUST_DECODE_RESIDENT_FULL", true);
-    let linear = runtime_flag("RETI_RUST_DECODE_RESIDENT_FULL_LINEAR", false);
+    let full = runtime_flag("SARAGOSSA_RUST_DECODE_RESIDENT_FULL", true);
+    let linear = runtime_flag("SARAGOSSA_RUST_DECODE_RESIDENT_FULL_LINEAR", false);
     if model.linear_layers.unwrap_or(0) > 0 && !linear {
         format!("partiel: full={}, linear=off", flag_text(full))
     } else {

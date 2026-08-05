@@ -111,7 +111,7 @@ fn rejects_missing_talker_weights() -> Result<()> {
 #[ignore = "live: charge le contrat header-only d'un snapshot Qwen3-TTS VoiceDesign"]
 fn live_loads_voicedesign_snapshot_contract() -> Result<()> {
     let Some(model_dir) = local_tts_snapshot(
-        "RETI_QWEN3_TTS_VOICEDESIGN_DIR",
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
         "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
     ) else {
         eprintln!("skip: snapshot Qwen3-TTS VoiceDesign absent du cache HF");

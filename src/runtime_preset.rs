@@ -7,7 +7,7 @@ use std::path::Path;
 pub struct RuntimePreset {
     /// Nom stable du preset.
     pub name: &'static str,
-    /// Valeur recommandee de `RETI_RUST_OPT_PROFILE`.
+    /// Valeur recommandee de `SARAGOSSA_RUST_OPT_PROFILE`.
     pub opt_profile: &'static str,
     /// Top-p de sampling recommande pour les chemins chat.
     pub sampling_top_p: f32,
@@ -35,15 +35,15 @@ pub fn runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
 /// Applique le preset kernel modele si aucun override explicite n'existe.
 ///
 /// PROMOTED infra (decision tangle 2026-07-05) : le modele oQ8 pose
-/// `RETI_RUST_OPT_PROFILE=qwen36-oq8`, mais l'env explicite reste prioritaire.
+/// `SARAGOSSA_RUST_OPT_PROFILE=qwen36-oq8`, mais l'env explicite reste prioritaire.
 ///
 /// Renvoie le preset applique, ou `None` si le modele est inconnu ou si
-/// l'utilisateur a deja pose `RETI_RUST_OPT_PROFILE`.
+/// l'utilisateur a deja pose `SARAGOSSA_RUST_OPT_PROFILE`.
 #[must_use]
 pub fn apply_runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
     let preset = runtime_preset_for_model_dir(model_dir)?;
-    if std::env::var_os("RETI_RUST_OPT_PROFILE").is_none() {
-        std::env::set_var("RETI_RUST_OPT_PROFILE", preset.opt_profile);
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_OPT_PROFILE").is_none() {
+        std::env::set_var("SARAGOSSA_RUST_OPT_PROFILE", preset.opt_profile);
         return Some(preset);
     }
     None

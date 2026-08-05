@@ -124,7 +124,7 @@ fn golden_encoder_matches_fixture() -> Result<()> {
 }
 
 fn local_whisper_tiny_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("RETI_WHISPER_TINY_DIR") {
+    if let Some(path) = crate::runtime_flags::env_var("SARAGOSSA_WHISPER_TINY_DIR") {
         let path = PathBuf::from(path);
         if path.join("config.json").is_file() && path.join("model.safetensors").is_file() {
             return Some(path);

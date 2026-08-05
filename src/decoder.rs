@@ -676,7 +676,7 @@ struct LayerKvCache {
     values: Vec<f32>,
     kv_dim: Option<usize>,
     linear: LinearAttentionCache,
-    // KV full-attn résident GPU (decode résident, flag RETI_RUST_DECODE_RESIDENT).
+    // KV full-attn résident GPU (decode résident, flag SARAGOSSA_RUST_DECODE_RESIDENT).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     full: Option<FullAttentionMetalState>,
 }

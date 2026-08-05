@@ -539,7 +539,7 @@ impl MetalExecutor {
             if spec.conv_kernel_dim == 4 && spec.value_head_dim == 128 && spec.key_head_dim == 128 {
                 // Brick #8/#9 : conv+norm+gates BATCHÉ (1 dispatch + finalize conv_state) au
                 // lieu de la boucle per-token (~16384 dispatches/couche → 2). Fait le calcul
-                // fusé conv+norm+gates → correct quel que soit RETI_RUST_LINEAR_CONV_NORM_FUSED.
+                // fusé conv+norm+gates → correct quel que soit SARAGOSSA_RUST_LINEAR_CONV_NORM_FUSED.
                 self.encode_linear_attn_conv_norm_gates_k4_dk128_batch(
                     encoder,
                     &qkv_buffer,

@@ -22,7 +22,7 @@ impl DecodeResidentState {
     ///
     /// `sampled` = la génération courante échantillonne (temperature > 0) : pilote
     /// le dtype KV par défaut (bf16 échantillonné, f32 greedy) sauf override
-    /// explicite `RETI_RUST_KV_BF16` (cf. [`kv_bf16_for`]).
+    /// explicite `SARAGOSSA_RUST_KV_BF16` (cf. [`kv_bf16_for`]).
     pub(crate) fn full_attention(
         &self,
         capacity: usize,

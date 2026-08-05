@@ -1,5 +1,6 @@
 use super::super::*;
 use super::types::*;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::MetalExecutor;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -189,7 +190,7 @@ impl CausalDecoder {
         if !decode_resident_full_linear_enabled() && self.has_resident_linear_attention_layer() {
             return Some(
                 "couches linear-attn en decode résident full désactivées \
-                 (RETI_RUST_DECODE_RESIDENT_FULL_LINEAR=0)"
+                 (SARAGOSSA_RUST_DECODE_RESIDENT_FULL_LINEAR=0)"
                     .to_string(),
             );
         }
@@ -375,7 +376,7 @@ impl CausalDecoder {
         }
         // Instrumentation Phase 2 (byte-id, hors chemin prod) : chiffre les
         // sous-postes du setup pour distinguer l'invariant (poolable) du
-        // prompt-dépendant. Cf. `RETI_RUST_MTP_SETUP_TRACE`.
+        // prompt-dépendant. Cf. `SARAGOSSA_RUST_MTP_SETUP_TRACE`.
         let trace_setup = crate::decoder::flags::mtp_setup_trace_enabled();
         if trace_setup {
             // Vide l'accumulateur global avant la boucle pour n'attribuer que
@@ -901,6 +902,10 @@ impl CausalDecoder {
         Ok(true)
     }
 
+    // Ne sert qu'au chemin résident Metal (`setup_resident_full_decode_with_slot`)
+    // et référence `RESIDENT_PIPELINE_WINDOW`, lui-même gaté : sans ce `cfg`, la
+    // compilation sans la feature `metal` échoue.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     fn check_resident_full_decode_allocation(
         &self,
         capacity: usize,
