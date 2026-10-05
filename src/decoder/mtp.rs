@@ -145,7 +145,7 @@ fn normalize_mtp_sidecar_key(key: &str) -> String {
 }
 
 fn is_bare_mtp_sidecar_key(key: &str) -> bool {
-    key == "fc.weight"
+    key.starts_with("fc.")
         || key.starts_with("layers.")
         || key.starts_with("pre_fc_norm_")
         || key.starts_with("norm.")
@@ -436,7 +436,20 @@ fn infer_mtp_affine_layout(
 
 #[cfg(test)]
 mod tests {
-    use super::infer_mtp_affine_layout;
+    use super::{infer_mtp_affine_layout, normalize_mtp_sidecar_key};
+
+    #[test]
+    fn normalizes_bare_quantized_fc_sidecar_keys() {
+        // Sidecar mlx-community/*-MTP-4bit : `fc` quantifié (weight + scales + biases).
+        for key in ["fc.weight", "fc.scales", "fc.biases"] {
+            assert_eq!(normalize_mtp_sidecar_key(key), format!("mtp.{key}"));
+        }
+        assert_eq!(normalize_mtp_sidecar_key("mtp.fc.weight"), "mtp.fc.weight");
+        assert_eq!(
+            normalize_mtp_sidecar_key("lm_head.weight"),
+            "lm_head.weight"
+        );
+    }
 
     #[test]
     fn infer_mtp_affine_group_size_accepts_gs32_and_gs64() {

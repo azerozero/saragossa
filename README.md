@@ -30,7 +30,7 @@ the **single-user latency × Apple Silicon** quadrant:
 
 | Domain | Details |
 |---|---|
-| LLM | Qwen3.x dense and MoE (27B / 30B / 35B-A3B), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u2–u8 (incl. mixed 3/4-bit) quantization at group sizes 32–128, bf16 scales/biases |
+| LLM | Qwen3.5 / 3.6 / 3.8 dense and MoE (27B / 30B / 35B-A3B; MLX `affine` quants only, not `mxfp4`/`nvfp4`), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u2–u8 (incl. mixed 3/4-bit) quantization at group sizes 32–128, bf16 scales/biases |
 | STT | Whisper large-v3-turbo (resident encoder + decoder, bf16 Neural-Accelerator GEMM) |
 | TTS | Qwen3-TTS: resident talker + GPU codec + intra-sentence streaming |
 | Embeddings | e5-small, pure Rust (CPU) — for semantic memory / RAG |

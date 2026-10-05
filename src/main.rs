@@ -121,10 +121,10 @@ fn run() -> CliResult<()> {
     }
     let load_started = Instant::now();
     let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
-    // La tête MTP doit être chargée pour l'oracle d'acceptance ET pour le decode
-    // opt-in `SARAGOSSA_RUST_MTP_DECODE` (sinon `generate_greedy_mtp_batched_with_options`
-    // échoue faute de sidecar). Défaut OFF = aucun sidecar chargé, prod inchangée.
-    if saragossa::devtools::mtp_acceptance_enabled() || mtp_decode_enabled() {
+    let mtp_active = serve::mtp::active_for(&assets, args.backend)
+        && serve::mtp::supports_options(&generation_options(&args, &assets, args.top_p));
+    // Charger avant la chauffe ; l'oracle explicite conserve son erreur sans tête.
+    if saragossa::devtools::mtp_acceptance_enabled() || mtp_active {
         let path =
             assets.mtp.path.as_ref().ok_or_else(|| {
                 cli_error("decode/oracle MTP demandé mais aucun sidecar MTP détecté")
@@ -157,21 +157,20 @@ fn run() -> CliResult<()> {
     // concaténation des poids (mesuré ~1,3 s → ~3,5 ms). Amorti une fois au
     // démarrage ; en prod résident (voice loop/serve) tous les tours en profitent.
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    let warmup_elapsed =
-        if mtp_decode_enabled() && args.backend == RuntimeKind::Metal && warmup_enabled() {
-            let started = Instant::now();
-            let warmup_len = prompt_ids.len().min(warmup_prompt_tokens()).max(1);
-            let options = generation_options(&args, &assets, args.top_p);
-            decoder.generate_greedy_mtp_batched_with_options(
-                &prompt_ids[..warmup_len],
-                MTP_DECODE_WARMUP_TOKENS,
-                &options,
-                mtp_decode_max_draft(),
-            )?;
-            warmup_elapsed + started.elapsed()
-        } else {
-            warmup_elapsed
-        };
+    let warmup_elapsed = if mtp_active && warmup_enabled() {
+        let started = Instant::now();
+        let warmup_len = prompt_ids.len().min(warmup_prompt_tokens()).max(1);
+        let options = generation_options(&args, &assets, args.top_p);
+        decoder.generate_greedy_mtp_batched_with_options(
+            &prompt_ids[..warmup_len],
+            MTP_DECODE_WARMUP_TOKENS,
+            &options,
+            mtp_decode_max_draft(),
+        )?;
+        warmup_elapsed + started.elapsed()
+    } else {
+        warmup_elapsed
+    };
     if saragossa::devtools::lightbatch_acceptance_enabled() {
         let prompt_b = args.prompt_b.as_ref().ok_or_else(|| {
             cli_error("SARAGOSSA_RUST_LIGHTBATCH_ACCEPTANCE=1 requiert --prompt-b")
@@ -326,13 +325,12 @@ fn run() -> CliResult<()> {
     });
     let options = generation_options(&args, &assets, args.top_p);
     let generate_started = Instant::now();
-    // Decode opt-in MTP spéculatif (`SARAGOSSA_RUST_MTP_DECODE=1`, défaut OFF). En T=0
-    // il est byte-identique à l'AR greedy (oracle `run_mtp_acceptance`,
-    // `tokens_equal=true`) et gagne en e2e (D1 ~1,18×). Le résultat spéculatif ne
+    // Decode MTP automatique si la tête et les options sont compatibles.
+    // `SARAGOSSA_RUST_MTP_DECODE=0` force l'AR. Le résultat spéculatif ne
     // sépare pas prefill et decode : on mappe `loop_duration` sur `decode` et on
     // estime le prefill = mur total − boucle decode, pour garder la ligne
-    // `metrics` homogène avec le chemin AR. Défaut OFF = prod inchangé.
-    let output = if mtp_decode_enabled() {
+    // `metrics` homogène avec le chemin AR.
+    let output = if mtp_active {
         let max_draft = mtp_decode_max_draft();
         // Diagnostic Phase 2 : rejoue le setup à chaud (caches `MetalExecutor`
         // déjà peuplés) pour distinguer le coût cold-start du coût récurrent par
@@ -485,24 +483,13 @@ fn prefill_profile_enabled() -> bool {
     saragossa::runtime_flags::env_flag("SARAGOSSA_RUST_DECODE_PROFILE", false)
 }
 
-/// Indique si le decode normal passe par le chemin spéculatif MTP (défaut OFF).
-///
-/// Opt-in via `SARAGOSSA_RUST_MTP_DECODE=1`. Défaut OFF = comportement prod inchangé
-/// (decode AR greedy, byte-identique à l'oracle).
-fn mtp_decode_enabled() -> bool {
-    saragossa::runtime_flags::env_flag("SARAGOSSA_RUST_MTP_DECODE", false)
-}
-
-/// Renvoie la profondeur de draft du decode MTP opt-in (défaut 1).
+/// Renvoie la profondeur de draft du decode MTP automatique (défaut 1).
 ///
 /// Lue depuis `SARAGOSSA_RUST_MTP_MAX_DRAFT` ; une valeur absente, invalide ou nulle
 /// retombe sur 1 (un seul token draft vérifié par cycle), car le decode MTP
 /// exige au moins un draft.
 fn mtp_decode_max_draft() -> usize {
-    saragossa::runtime_flags::env_var("SARAGOSSA_RUST_MTP_MAX_DRAFT")
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
+    serve::mtp::max_draft_tokens()
 }
 
 /// Encode un prompt en ids. `--raw` : complétion brute (pas de template de

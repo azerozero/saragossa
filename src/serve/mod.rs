@@ -15,7 +15,7 @@ mod embeddings;
 pub(crate) mod error;
 mod http;
 mod model_selection;
-mod mtp;
+pub(crate) mod mtp;
 mod protocol;
 mod state;
 pub(crate) mod streaming;

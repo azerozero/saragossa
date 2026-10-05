@@ -823,6 +823,7 @@ mod tests {
             quantization: Option::<QuantConfig>::None,
             full_attention_interval: None,
             attn_output_gate: None,
+            output_gate_type: None,
             partial_rotary_factor: None,
             linear_num_value_heads: None,
             linear_num_key_heads: None,

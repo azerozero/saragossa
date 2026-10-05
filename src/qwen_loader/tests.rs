@@ -34,6 +34,56 @@ fn accepts_affine_u3_quantization_config() {
 }
 
 #[test]
+fn accepts_affine_u6_quantization_config() {
+    // mlx-community/*-oQ6 : base bits=6, kernels fast_affine_qmv_u6 existants.
+    let quant = QuantConfig {
+        group_size: Some(64),
+        bits: Some(6),
+        quant_method: None,
+        fmt: None,
+        extra: HashMap::from([("mode".to_string(), serde_json::json!("affine"))]),
+    };
+
+    validate_affine_quantization(&quant)
+        .expect("invariant: quantification affine u6 gs64 supportée");
+}
+
+#[test]
+fn rejects_non_affine_quantization_mode() {
+    let quant = QuantConfig {
+        group_size: Some(32),
+        bits: Some(4),
+        quant_method: None,
+        fmt: None,
+        extra: HashMap::from([("mode".to_string(), serde_json::json!("mxfp4"))]),
+    };
+
+    let err = validate_affine_quantization(&quant).expect_err("mxfp4 doit être refusé");
+    assert!(err.to_string().contains("mode=mxfp4"), "{err}");
+}
+
+#[test]
+fn rejects_unknown_output_gate_type() {
+    let mut config = test_config();
+    config.full_attention_interval = Some(4);
+    config.linear_num_key_heads = Some(1);
+    config.linear_num_value_heads = Some(1);
+    config.linear_key_head_dim = Some(4);
+    config.linear_value_head_dim = Some(4);
+    config.linear_conv_kernel_dim = Some(4);
+
+    config.output_gate_type = Some("swish".to_string());
+    validate_hybrid_config(&config).expect("invariant: swish = SiLU implémenté");
+
+    config.output_gate_type = Some("sigmoid".to_string());
+    let err = validate_hybrid_config(&config).expect_err("sigmoid doit être refusé");
+    assert!(
+        err.to_string().contains("output_gate_type sigmoid"),
+        "{err}"
+    );
+}
+
+#[test]
 fn loads_model_prefixed_qwen_weights() {
     let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
     write_safetensors(tmp.path(), "model.", "lm_head.", None);
