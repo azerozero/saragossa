@@ -174,6 +174,7 @@ struct ReplModel {
     decoder: saragossa::CausalDecoder,
     max_tokens: usize,
     options: GenerationOptions,
+    mtp_active: bool,
 }
 
 impl ReplModel {
@@ -182,6 +183,13 @@ impl ReplModel {
         let preset = saragossa::runtime_preset_for_model_dir(model_dir);
         let assets = ModelAssets::load_local(model_dir)?;
         let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
+        let mtp_active = args.temperature.abs() <= f32::EPSILON
+            && crate::serve::mtp::active_for(&assets, args.backend);
+        if mtp_active {
+            if let Some(path) = assets.mtp.path.as_ref() {
+                decoder = decoder.with_mtp_sidecar(path)?;
+            }
+        }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if args.backend == RuntimeKind::Metal {
             let prompt = assets.encode_prompt_with_special("warmup")?;
@@ -224,6 +232,7 @@ impl ReplModel {
             decoder,
             max_tokens: args.max_tokens,
             options,
+            mtp_active,
         })
     }
 }
@@ -238,49 +247,60 @@ impl ChatTurnGenerator for ReplModel {
         if prompt_ids.is_empty() {
             return Err(cli_error("prompt token vide"));
         }
-        let prefill_started = Instant::now();
-        let prompt_state = self.decoder.prefill_prompt_state_uncached(&prompt_ids)?;
-        let prefill = prefill_started.elapsed();
         let stop_texts = Vec::new();
         let mut detokenizer =
             StreamingTextDetokenizer::new(&self.assets, &stop_texts, self.max_tokens);
         let mut stream_error = None;
-        let output = self
-            .decoder
-            .generate_greedy_timed_from_prompt_state_with_options_and_callback(
-                prompt_state,
-                prefill,
-                self.max_tokens,
-                &self.options,
-                |token| {
-                    if stream_error.is_some() {
-                        return false;
-                    }
-                    let result = detokenizer.push_token(token, &mut |event| {
-                        if let CompletionStreamEvent::Delta(delta) = event {
-                            writer
-                                .write_all(delta.as_bytes())
-                                .map_err(|source| ServeError::io("écriture stdout", source))?;
-                            writer
-                                .flush()
-                                .map_err(|source| ServeError::io("flush stdout", source))?;
-                        }
-                        Ok(())
-                    });
-                    match result {
-                        Ok(()) => true,
-                        Err(error) => {
-                            stream_error = Some(error);
-                            false
-                        }
-                    }
-                },
-            )?;
+        let on_token = |token| {
+            if stream_error.is_some() {
+                return false;
+            }
+            let result = detokenizer.push_token(token, &mut |event| {
+                if let CompletionStreamEvent::Delta(delta) = event {
+                    writer
+                        .write_all(delta.as_bytes())
+                        .map_err(|source| ServeError::io("écriture stdout", source))?;
+                    writer
+                        .flush()
+                        .map_err(|source| ServeError::io("flush stdout", source))?;
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    stream_error = Some(error);
+                    false
+                }
+            }
+        };
+        let tokens = if self.mtp_active && crate::serve::mtp::supports_options(&self.options) {
+            self.decoder
+                .generate_greedy_mtp_streaming_with_options(
+                    &prompt_ids,
+                    self.max_tokens,
+                    &self.options,
+                    crate::serve::mtp::max_draft_tokens(),
+                    on_token,
+                )?
+                .tokens
+        } else {
+            let started = Instant::now();
+            let state = self.decoder.prefill_prompt_state_uncached(&prompt_ids)?;
+            self.decoder
+                .generate_greedy_timed_from_prompt_state_with_options_and_callback(
+                    state,
+                    started.elapsed(),
+                    self.max_tokens,
+                    &self.options,
+                    on_token,
+                )?
+                .tokens
+        };
         if let Some(error) = stream_error {
             return Err(Box::new(error));
         }
-        let generated = output
-            .tokens
+        let generated = tokens
             .iter()
             .copied()
             .map(|id| {

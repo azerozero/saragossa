@@ -1,4 +1,5 @@
 /target
+/models
 .DS_Store
 
 # Recette d'environnement du sandbox agent (chemins machine locaux).

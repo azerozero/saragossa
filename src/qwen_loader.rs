@@ -449,6 +449,17 @@ fn validate_hybrid_config(config: &ModelConfig) -> Result<()> {
             "full_attention_interval nul".to_string(),
         ));
     }
+    // Qwen3.8 nomme l'activation du gate de sortie DeltaNet ; seul `swish`
+    // (SiLU, implicite avant Qwen3.8) est implémenté par `linear_attention`.
+    if let Some(gate) = config
+        .output_gate_type
+        .as_deref()
+        .filter(|gate| !matches!(*gate, "swish" | "silu"))
+    {
+        return Err(InferError::Config(format!(
+            "output_gate_type {gate} non supporté (attendu swish)"
+        )));
+    }
     for (name, value) in [
         ("linear_num_key_heads", config.linear_num_key_heads),
         ("linear_num_value_heads", config.linear_num_value_heads),
@@ -479,8 +490,19 @@ fn validate_affine_quantization(quant: &QuantConfig) -> Result<()> {
         }
         return Ok(());
     }
+    // MLX sérialise `mode` (affine, mxfp4, nvfp4...) ; seul affine a scales+biases.
+    if let Some(mode) = quant
+        .extra
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .filter(|mode| !mode.eq_ignore_ascii_case("affine"))
+    {
+        return Err(InferError::Config(format!(
+            "quantification mode={mode} non supportée (attendu affine)"
+        )));
+    }
     let (group_size, bits) = quant_params(quant)?;
-    if !matches!(bits, 2 | 3 | 4 | 8) {
+    if !matches!(bits, 2 | 3 | 4 | 6 | 8) {
         return Err(InferError::Config(format!(
             "quantification affine bits={bits} non supportée"
         )));

@@ -11,6 +11,35 @@ use saragossa::{
 use super::*;
 
 #[test]
+fn custom_stop_falls_back_to_ar_even_when_mtp_is_active() {
+    for streaming in [false, true] {
+        let mut loaded = tiny_loaded_model();
+        // Pas de tête chargée : un mauvais routage MTP échouerait immédiatement.
+        loaded.mtp_active = true;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "tiny", "messages": [{"role": "user", "content": "JSON"}],
+            "temperature": 0, "stop": "{}", "stream": streaming
+        }))
+        .expect("invariant: requête test valide");
+        let mut deltas = String::new();
+        let completion = if streaming {
+            loaded.complete_streaming(request, 4, None, &MemoryGuard::serve(), &mut |event| {
+                if let CompletionStreamEvent::Delta(delta) = event {
+                    deltas.push_str(delta);
+                }
+                Ok(())
+            })
+        } else {
+            loaded.complete(request, 4, None, &MemoryGuard::serve())
+        }
+        .expect("invariant: arrêt personnalisé routé vers AR");
+        assert!(completion.content.is_empty());
+        assert!(deltas.is_empty());
+        assert_eq!(completion.finish_reason, "stop");
+    }
+}
+
+#[test]
 fn json_object_completion_is_parseable_with_tiny_model() {
     let mut loaded = tiny_loaded_model();
     let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({

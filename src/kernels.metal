@@ -416,7 +416,8 @@ kernel void embed_gather_affine_from_u32_f32(
     }
     const uint mask = (1u << bits) - 1u;
     uint q = 0u;
-    if (bits == 3u) {
+    // Bitstream MLX dès que 32 % bits != 0 (u3, u6) ; sinon lanes alignées.
+    if ((32u % bits) != 0u) {
         const uint bit_offset = gid.x * bits;
         const uint word_col = bit_offset / 32u;
         const uint shift = bit_offset - word_col * 32u;
@@ -3515,7 +3516,8 @@ kernel void affine_gather_matmul_rhs_t_u32_f32(
     const uint mask = (1u << bits) - 1u;
     float acc = 0.0f;
 
-    if (bits == 3u) {
+    // Bitstream MLX dès que 32 % bits != 0 (u3, u6) ; sinon lanes alignées.
+    if ((32u % bits) != 0u) {
         const uint packed_row = (expert * out_dim + row) * packed_cols;
         for (uint col = lane; col < in_dim; col += 32u) {
             const uint bit_offset = col * bits;

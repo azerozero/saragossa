@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Chargeur : les quants MLX `u6` (ex. `mlx-community/*-oQ6`) étaient refusés à la validation de config alors que les kernels existent ; les modes `mxfp4`/`nvfp4` et un `output_gate_type` autre que `swish`/`silu` (Qwen3.8) sont désormais refusés avec un message clair au lieu d'une erreur de poids manquant ou d'une sortie corrompue.
+- Decode résident : la liste blanche `RESIDENT_SUPPORTED_BITS` ignorait u2/u6 alors que leurs kernels résidents (`FastQmvU2`/`FastQmvU6`) existent ; un 27B oQ6 tombait en per-op.
+- Kernels Metal `affine_gather_*` (experts MoE, embeddings) : le décodage bitstream n'était appliqué qu'à u3 ; u6 passait en lanes alignées (5 x 6 bits != 32) et aurait produit des experts corrompus. La condition devient `32 % bits != 0`, identique pour u3.
+- MTP : un sidecar quantifié (`mlx-community/*-MTP-4bit`, `fc.scales`/`fc.biases` sans préfixe) échouait en `dtype non supporté pour mtp.fc: U32` ; la normalisation des clés du chargeur s'aligne sur celle de la détection (`assets.rs`). Le gain dépend du prompt et reste à mesurer sur des runs comparables.
+- CLI et `run` : détection automatique de la tête MTP locale pour les modèles denses sous Metal en greedy non contraint. `SARAGOSSA_RUST_MTP_DECODE=0` désactive MTP ; les alias `RETI_*` restent acceptés, avec priorité aux variables `SARAGOSSA_*`. La profondeur reste à 1 par défaut, sans activation automatique du contrôleur adaptatif.
+
 ## [0.3.0](https://github.com/azerozero/saragossa/releases/tag/v0.3.0) - 2026-07-31
 
 ### Added

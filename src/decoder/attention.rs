@@ -4,14 +4,15 @@ use super::attention_ops::*;
 use super::*;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-const RESIDENT_SUPPORTED_BITS: &[usize] = &[3, 4, 8];
+const RESIDENT_SUPPORTED_BITS: &[usize] = &[2, 3, 4, 6, 8];
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn resident_projection_unsupported_bits(projection: &Linear) -> Option<usize> {
     let LinearWeight::AffineQuantized(weight) = projection.weight() else {
         return None;
     };
-    // Les formats u2/u6 ont un qmv per-op, mais aucun kernel résident.
+    // Chaque largeur listée a un kernel résident (`AffineMatmulKernel::FastQmvU{2,3,4,6,8}`) ;
+    // les autres retombent sur le per-op avant d'encoder, jamais au milieu.
     (!RESIDENT_SUPPORTED_BITS.contains(&weight.bits())).then_some(weight.bits())
 }
 
@@ -785,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_projection_accepts_dense_and_u3_u4_u8_only() {
+    fn resident_projection_accepts_dense_and_kernel_backed_bits_only() {
         let dense = Linear::new(
             Tensor::from_vec(vec![1, 1], vec![0.0]).expect("invariant: poids dense valide"),
             None,
@@ -793,17 +794,13 @@ mod tests {
         .expect("invariant: projection dense valide");
         assert_eq!(resident_projection_unsupported_bits(&dense), None);
 
-        for (bits, packed_cols) in [(3, 3), (4, 1), (8, 1)] {
+        for (bits, packed_cols) in [(2, 1), (3, 3), (4, 1), (6, 3), (8, 1)] {
             let projection = quantized_projection(bits, packed_cols);
             assert_eq!(resident_projection_unsupported_bits(&projection), None);
         }
 
-        for (bits, packed_cols) in [(2, 1), (6, 3)] {
-            let projection = quantized_projection(bits, packed_cols);
-            assert_eq!(
-                resident_projection_unsupported_bits(&projection),
-                Some(bits)
-            );
-        }
+        // u5 (overrides oQ4 sur linear_attn.in_proj_a/b) : aucun kernel résident.
+        let projection = quantized_projection(5, 5);
+        assert_eq!(resident_projection_unsupported_bits(&projection), Some(5));
     }
 }

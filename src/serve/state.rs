@@ -353,7 +353,7 @@ impl ModelSlot {
             let preset = saragossa::runtime_preset_for_model_dir(&self.path);
             let assets = ModelAssets::load_local(&self.path)?;
             let mut decoder = load_decoder_with_runtime(&assets, self.backend)?;
-            let mtp_active = mtp::active_for(&assets);
+            let mtp_active = mtp::active_for(&assets, self.backend);
             if mtp_active {
                 let path = assets.mtp.path.as_ref().ok_or_else(|| {
                     ServeError::args(format!(
@@ -425,7 +425,9 @@ impl LoadedModel {
         let options = self.generation_options(&request, &stop_texts, response_format)?;
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
-        let use_mtp = self.mtp_active && mtp::routes_request(&request, response_format);
+        let use_mtp = self.mtp_active
+            && mtp::routes_request(&request, response_format)
+            && mtp::supports_options(&options);
         let (output, reused_prefix_tokens, prefix_cache) = if use_mtp {
             // NOTE: v1 MTP assume son propre prefill via le prefix-cache du
             // décodeur (longest-prefix + extension). Il by-passe donc les
@@ -507,7 +509,9 @@ impl LoadedModel {
         let options = self.generation_options(&request, &stop_texts, response_format)?;
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
-        let use_mtp = self.mtp_active && mtp::routes_request(&request, response_format);
+        let use_mtp = self.mtp_active
+            && mtp::routes_request(&request, response_format)
+            && mtp::supports_options(&options);
         let (prompt_state, reused_prefix_tokens, prefill) = if use_mtp {
             (None, 0, Duration::ZERO)
         } else {

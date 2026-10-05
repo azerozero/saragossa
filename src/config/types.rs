@@ -52,6 +52,9 @@ pub struct ModelConfig {
     /// Active la porte de sortie attention.
     #[serde(default)]
     pub attn_output_gate: Option<bool>,
+    /// Nomme l'activation du gate de sortie DeltaNet (`swish` = SiLU, seul implémenté).
+    #[serde(default)]
+    pub output_gate_type: Option<String>,
     /// Définit la fraction RoPE appliquée.
     #[serde(default)]
     pub partial_rotary_factor: Option<f32>,

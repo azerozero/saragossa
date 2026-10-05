@@ -2557,9 +2557,9 @@ fn assert_all_close_scaled(actual: &[f32], expected: &[f32], context: &str) {
     }
 }
 
-fn varied_row(in_dim: usize, salt: usize) -> Vec<f32> {
+fn varied_row(in_dim: usize, variant: usize) -> Vec<f32> {
     (0..in_dim)
-        .map(|i| ((((i * 37 + salt * 101) % 113) as f32) - 56.0) / 71.0)
+        .map(|i| ((((i * 37 + variant * 101) % 113) as f32) - 56.0) / 71.0)
         .collect()
 }
 
@@ -3137,7 +3137,7 @@ fn test_stacked_affine_varied_u3_group(
     experts: usize,
     out_dim: usize,
     in_dim: usize,
-    salt: usize,
+    variant: usize,
 ) -> Result<(StackedAffineBuffers, Vec<AffineQuantizedTensor>)> {
     let bits = FAST_QMV_U3_BITS;
     let group_size = FAST_QMV_GROUP_SIZE;
@@ -3152,7 +3152,7 @@ fn test_stacked_affine_varied_u3_group(
         let mut packed = vec![0_u32; out_dim * packed_cols];
         for row in 0..out_dim {
             for col in 0..in_dim {
-                let q = ((expert * 11 + row * 7 + col * 3 + col / 64 + salt) % 8) as u32;
+                let q = ((expert * 11 + row * 7 + col * 3 + col / 64 + variant) % 8) as u32;
                 let bit_offset = col * bits;
                 let word_col = bit_offset / 32;
                 let shift = bit_offset % 32;
@@ -3166,14 +3166,14 @@ fn test_stacked_affine_varied_u3_group(
         let scales = (0..out_dim * groups)
             .map(|index| {
                 bf16_round(
-                    0.0018 + 0.000_04 * ((expert + index + salt) % 17) as f32,
+                    0.0018 + 0.000_04 * ((expert + index + variant) % 17) as f32,
                 )
             })
             .collect::<Vec<_>>();
         let biases = (0..out_dim * groups)
             .map(|index| {
                 bf16_round(
-                    -0.018 + 0.000_5 * ((expert * 3 + index + salt) % 23) as f32,
+                    -0.018 + 0.000_5 * ((expert * 3 + index + variant) % 23) as f32,
                 )
             })
             .collect::<Vec<_>>();
@@ -3213,7 +3213,7 @@ fn test_stacked_affine_varied_u4_group(
     experts: usize,
     out_dim: usize,
     in_dim: usize,
-    salt: usize,
+    variant: usize,
 ) -> Result<StackedAffineBuffers> {
     let bits = FAST_QMV_BITS;
     let group_size = FAST_QMV_GROUP_SIZE;
@@ -3229,16 +3229,16 @@ fn test_stacked_affine_varied_u4_group(
             for word in 0..packed_cols {
                 let mut lanes = [0_u32; 8];
                 for (lane, value) in lanes.iter_mut().enumerate() {
-                    *value = ((expert * 11 + row * 7 + word * 3 + lane * 5 + salt) % 16) as u32;
+                    *value = ((expert * 11 + row * 7 + word * 3 + lane * 5 + variant) % 16) as u32;
                 }
                 packed.push(pack_lanes(&lanes, bits));
             }
             for group in 0..groups {
                 scales.push(bf16_round(
-                    0.0018 + 0.000_04 * ((expert + row + group + salt) % 17) as f32,
+                    0.0018 + 0.000_04 * ((expert + row + group + variant) % 17) as f32,
                 ));
                 biases.push(bf16_round(
-                    -0.018 + 0.000_5 * ((expert * 3 + row + group + salt) % 23) as f32,
+                    -0.018 + 0.000_5 * ((expert * 3 + row + group + variant) % 23) as f32,
                 ));
             }
         }
