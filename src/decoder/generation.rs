@@ -1646,6 +1646,8 @@ impl CausalDecoder {
         }
 
         let loop_duration = decode_started.elapsed();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        DecodeProfiler::report_gpu_sections(self, &cache);
         // Flush final : émet les derniers tokens committés non encore streamés.
         if !stop_streaming {
             while emitted < generated.len() {

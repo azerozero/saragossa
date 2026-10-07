@@ -172,6 +172,8 @@ struct SectionAccum {
 #[derive(Debug, Default)]
 pub(crate) struct GpuSectionTimer {
     accum: RefCell<SectionAccum>,
+    mtp_cycles: RefCell<[(u128, u64); 2]>,
+    mtp_flush: RefCell<(u128, u64)>,
 }
 
 impl GpuSectionTimer {
@@ -179,7 +181,7 @@ impl GpuSectionTimer {
     /// (le decode reste le chemin résident à command buffer unique, inchangé).
     pub(crate) fn try_new() -> Option<Self> {
         crate::runtime_flags::gpu_counters_enabled().then_some(())?;
-        eprintln!("gpu sections: actif (segmentation CPU par section)");
+        eprintln!("gpu sections: actif (AR segmenté CPU ; MTP fusionné non segmenté)");
         Some(Self::default())
     }
 
@@ -203,12 +205,56 @@ impl GpuSectionTimer {
         accum.tokens += 1;
     }
 
+    /// Mesure CPU submit/wait du cycle fusionné, sans segmenter ses kernels.
+    pub(crate) fn record_mtp_cycle(&self, depth: usize, elapsed_ns: u128) {
+        if let Some((total, count)) = self.mtp_cycles.borrow_mut().get_mut(match depth {
+            1 => 0,
+            2 => 1,
+            _ => return,
+        }) {
+            *total += elapsed_ns;
+            *count += 1;
+        }
+    }
+
+    /// Coût supplémentaire du flush d'historique avant un changement de chemin.
+    pub(crate) fn record_mtp_flush(&self, elapsed_ns: u128) {
+        let mut accum = self.mtp_flush.borrow_mut();
+        accum.0 += elapsed_ns;
+        accum.1 += 1;
+    }
+
     /// Formate le classement per-section (ms/token + %), ou `None` si rien
     /// d'accumulé. Donne les moyennes par couche full vs linear et le total lm_head.
     pub(crate) fn report(&self) -> Option<String> {
         let accum = *self.accum.borrow();
+        let mut mtp = self
+            .mtp_cycles
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, count))| *count > 0)
+            .map(|(index, (total, count))| {
+                format!(
+                    "MTP fused D{} (n={count}, CPU submit/wait, non segmenté): {:.3} ms/cycle",
+                    index + 1,
+                    *total as f64 / 1.0e6 / *count as f64
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let (total, count) = *self.mtp_flush.borrow();
+        if count > 0 {
+            if !mtp.is_empty() {
+                mtp.push_str(" | ");
+            }
+            mtp.push_str(&format!(
+                "MTP history flush (n={count}, CPU submit/wait, supplément aux cycles): {:.3} ms/flush",
+                total as f64 / 1.0e6 / count as f64
+            ));
+        }
         if accum.tokens == 0 {
-            return None;
+            return (!mtp.is_empty()).then_some(mtp);
         }
         let tokens = accum.tokens as f64;
         let ms = |ns: u128| ns as f64 / 1.0e6 / tokens;
@@ -231,7 +277,12 @@ impl GpuSectionTimer {
             "gpu sections/token (n={tok}, segmenté CPU) : \
              couches full-attn {full_total:.3} ms ({full_p:.1}%, {full_per:.3} ms/couche ×{nf}) | \
              couches linear-attn {linear_total:.3} ms ({linear_p:.1}%, {linear_per:.3} ms/couche ×{nl}) | \
-             lm_head {lmhead:.3} ms ({lmhead_p:.1}%) | Σ {sum:.3} ms/token",
+             lm_head {lmhead:.3} ms ({lmhead_p:.1}%) | Σ {sum:.3} ms/token{mtp_suffix}",
+            mtp_suffix = if mtp.is_empty() {
+                String::new()
+            } else {
+                format!(" | {mtp}")
+            },
             tok = accum.tokens,
             nf = accum.full_layer_count / accum.tokens,
             nl = accum.linear_layer_count / accum.tokens,
@@ -239,5 +290,35 @@ impl GpuSectionTimer {
             linear_p = pct(linear_total),
             lmhead_p = pct(lmhead),
         ))
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::GpuSectionTimer;
+
+    #[test]
+    fn fused_cycles_are_reported_without_segmented_tokens() {
+        let timer = GpuSectionTimer::default();
+        assert!(timer.report().is_none());
+        timer.record_mtp_cycle(0, 99);
+        assert!(timer.report().is_none());
+        timer.record_mtp_cycle(1, 2_000_000);
+        timer.record_mtp_cycle(1, 4_000_000);
+        timer.record_mtp_cycle(2, 5_000_000);
+        let report = timer.report().expect("invariant: cycles enregistrés");
+        assert!(report.contains("D1 (n=2"));
+        assert!(report.contains("3.000 ms/cycle"));
+        assert!(report.contains("D2 (n=1"));
+        assert!(!report.contains("ms/token"));
+        timer.record_layer(true, 1_000_000);
+        timer.record_lmhead(1_000_000);
+        let mixed = timer.report().expect("invariant: token enregistré");
+        assert!(mixed.contains("sections/token (n=1"));
+        assert!(mixed.contains(&report));
+        timer.record_mtp_flush(7_000_000);
+        let flushed = timer.report().expect("invariant: flush enregistré");
+        assert!(flushed.contains("7.000 ms/flush"));
+        assert!(flushed.contains(&mixed));
     }
 }

@@ -149,7 +149,12 @@ impl CausalDecoder {
             &mut scratch,
         )?;
         encoder_guard.end();
+        let timer = arena.state.gpu_timer();
+        let started = timer.map(|_| std::time::Instant::now());
         crate::metal_backend::commit_and_wait(command_buffer)?;
+        if let (Some(timer), Some(started)) = (timer, started) {
+            timer.record_mtp_flush(started.elapsed().as_nanos());
+        }
         #[cfg(feature = "devtools")]
         if crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false) {
             if let Some(mtp) = arena.mtp.as_mut() {
@@ -1277,9 +1282,6 @@ impl CausalDecoder {
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
         };
-        if arena.state.gpu_timer().is_some() {
-            return Ok(None);
-        }
         let trunk_batch_supported = self.layers.iter().enumerate().all(|(index, layer)| {
             match (
                 self.config.is_resident_full_attention_layer(index),
@@ -1772,7 +1774,12 @@ impl CausalDecoder {
         scratch.push(verify_final);
 
         encoder_guard.end();
+        let timer = arena.state.gpu_timer();
+        let started = timer.map(|_| std::time::Instant::now());
         crate::metal_backend::commit_and_wait(command_buffer)?;
+        if let (Some(timer), Some(started)) = (timer, started) {
+            timer.record_mtp_cycle(1, started.elapsed().as_nanos());
+        }
         let draft_raw = {
             let arena = resident.as_ref().ok_or_else(|| {
                 InferError::Metal("arène résidente absente après MTP fused".to_string())
@@ -1913,9 +1920,6 @@ impl CausalDecoder {
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
         };
-        if arena.state.gpu_timer().is_some() {
-            return Ok(None);
-        }
         let trunk_batch_supported = self.layers.iter().enumerate().all(|(index, layer)| {
             match (
                 self.config.is_resident_full_attention_layer(index),
@@ -2363,7 +2367,12 @@ impl CausalDecoder {
         scratch.push(verify_b);
 
         encoder_guard.end();
+        let timer = arena.state.gpu_timer();
+        let started = timer.map(|_| std::time::Instant::now());
         crate::metal_backend::commit_and_wait(command_buffer)?;
+        if let (Some(timer), Some(started)) = (timer, started) {
+            timer.record_mtp_cycle(2, started.elapsed().as_nanos());
+        }
 
         let (draft_values, target_values) = {
             let arena = resident.as_ref().ok_or_else(|| {
