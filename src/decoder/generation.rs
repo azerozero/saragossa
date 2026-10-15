@@ -1232,6 +1232,10 @@ impl CausalDecoder {
                 loop_duration: Duration::default(),
             });
         }
+        // Historique MTP selon la longueur du prompt (fresh court, committed long),
+        // lu par `mtp_fresh_cache_enabled` jusqu'à la fin de cette génération.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _mtp_history = crate::runtime_flags::MtpHistoryForPrompt::enter(prompt.len());
 
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let trace_setup = mtp_setup_trace_enabled();

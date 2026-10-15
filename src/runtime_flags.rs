@@ -3,6 +3,8 @@
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(crate) mod pairwise;
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use std::cell::Cell;
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 use std::sync::atomic::AtomicU8;
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -245,8 +247,79 @@ pub(super) fn mtp_fresh_cache_enabled() -> bool {
     if let Some(case) = pairwise::current() {
         return case.fresh();
     }
+    if let Some(fresh) = MTP_FRESH_FOR_PROMPT.get() {
+        return fresh;
+    }
+    mtp_fresh_cache_env()
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn mtp_fresh_cache_env() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_FRESH_CACHE", true))
+}
+
+/// Longueur de prompt (tokens) au-delà de laquelle le decode MTP garde
+/// l'historique committed même avec le cache fresh activé. Défaut 128.
+///
+/// MESURE (phase 5 pairwise du 2026-10-15, `models/pairwise/length-plan.md`,
+/// PW03 contre PW04 apparié, n48 par longueur, Holm6) : le cache fresh gagne sur
+/// prompt court et l'historique committed sur prompt long, la bascule se situe
+/// entre 33 et 204 tokens. Mécanisme : en fresh la tête MTP n'attend que sur
+/// elle-même ; sur un long prompt, l'historique lui rend du contexte et relève
+/// l'acceptance en position 2. `SARAGOSSA_RUST_MTP_FRESH_MAX_PROMPT=0` :
+/// committed partout ; `SARAGOSSA_RUST_MTP_FRESH_CACHE=0` reste prioritaire.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(super) fn mtp_fresh_max_prompt_tokens() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MTP_FRESH_MAX_PROMPT")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(128)
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+thread_local! {
+    static MTP_FRESH_FOR_PROMPT: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Choix fresh/committed d'une génération : fresh seulement si activé par l'env
+/// et si le prompt ne dépasse pas [`mtp_fresh_max_prompt_tokens`].
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn fresh_for_prompt(env_fresh: bool, max_prompt_tokens: usize, prompt_tokens: usize) -> bool {
+    env_fresh && prompt_tokens <= max_prompt_tokens
+}
+
+/// Fixe, pour la durée d'une génération MTP sur ce thread, le choix
+/// fresh/committed selon la longueur du prompt. Le Drop restaure l'état précédent ;
+/// un cas pairwise actif garde la priorité (le harnais mesure une configuration fixe).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) struct MtpHistoryForPrompt {
+    previous: Option<bool>,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl MtpHistoryForPrompt {
+    pub(crate) fn enter(prompt_tokens: usize) -> Self {
+        let fresh = fresh_for_prompt(
+            mtp_fresh_cache_env(),
+            mtp_fresh_max_prompt_tokens(),
+            prompt_tokens,
+        );
+        Self {
+            previous: MTP_FRESH_FOR_PROMPT.replace(Some(fresh)),
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl Drop for MtpHistoryForPrompt {
+    fn drop(&mut self) {
+        MTP_FRESH_FOR_PROMPT.set(self.previous);
+    }
 }
 
 pub(crate) fn mtp_resident_hidden_enabled() -> bool {
@@ -1067,6 +1140,28 @@ mod tests {
         assert!(env_flag("SARAGOSSA_TEST_DRAPEAU", false));
         std::env::remove_var("RETI_TEST_DRAPEAU");
         assert!(!env_flag("SARAGOSSA_TEST_DRAPEAU", false));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn fresh_history_follows_prompt_length() {
+        assert!(fresh_for_prompt(true, 128, 26));
+        assert!(fresh_for_prompt(true, 128, 128));
+        assert!(!fresh_for_prompt(true, 128, 128 + 1));
+        assert!(!fresh_for_prompt(true, 128, 732));
+        assert!(!fresh_for_prompt(false, 128, 26));
+        assert!(!fresh_for_prompt(true, 0, 1));
+        assert_eq!(MTP_FRESH_FOR_PROMPT.get(), None);
+        {
+            let _long = MtpHistoryForPrompt::enter(usize::MAX);
+            assert_eq!(MTP_FRESH_FOR_PROMPT.get(), Some(false));
+            {
+                let _nested = MtpHistoryForPrompt::enter(0);
+                assert_eq!(MTP_FRESH_FOR_PROMPT.get(), Some(mtp_fresh_cache_env()));
+            }
+            assert_eq!(MTP_FRESH_FOR_PROMPT.get(), Some(false));
+        }
+        assert_eq!(MTP_FRESH_FOR_PROMPT.get(), None);
     }
 
     #[test]

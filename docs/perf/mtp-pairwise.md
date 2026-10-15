@@ -13,6 +13,16 @@ chemins restent dans le code, désactivés hors harnais. Retour au D1 :
 `SARAGOSSA_RUST_MTP_MAX_DRAFT=1 SARAGOSSA_RUST_MTP_FRESH_CACHE=0
 SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0`.
 
+Depuis le 2026-10-16, l'historique MTP suit la longueur du prompt : cache fresh
+jusqu'à `SARAGOSSA_RUST_MTP_FRESH_MAX_PROMPT` tokens (défaut 128), historique
+committed au-delà, à profondeur adaptative égale. Mesure appariée PW03 contre
+PW04 (n48 par longueur, Holm6 à +2 %, A/A +0,3 %) : le committed perd -5,5 % à
+26 tokens, est neutre à 33 et 556 tokens, et gagne +3,3 % à 204, +6,7 % à 380 et
++6,8 % à 732 tokens. Mécanisme : en fresh la tête MTP n'attend que sur
+elle-même ; sur un long prompt l'historique lui rend du contexte et relève
+l'acceptance en position 2. `SARAGOSSA_RUST_MTP_FRESH_MAX_PROMPT=0` force le
+committed partout ; `SARAGOSSA_RUST_MTP_FRESH_CACHE=0` reste prioritaire.
+
 ## Protocole
 
 - 19 configurations effectives, chacune sur trois entrées : T0 (26 tokens),
