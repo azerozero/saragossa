@@ -1,6 +1,8 @@
 //! Harnais et chargeurs de diagnostic hors moteur nominal.
 
 pub mod dflash;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+mod pairwise;
 
 use std::time::{Duration, Instant};
 
@@ -131,6 +133,10 @@ pub fn run_mtp_acceptance(
     load_elapsed: Duration,
     warmup_elapsed: Duration,
 ) -> Result<()> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if env_flag("SARAGOSSA_RUST_PAIRWISE", false) {
+        return pairwise::run(decoder, prompt_ids, max_tokens, options);
+    }
     let max_draft = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_MAX_DRAFT")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(2);

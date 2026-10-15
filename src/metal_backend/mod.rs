@@ -58,6 +58,7 @@ mod moe;
 mod moe_encode;
 mod moe_na;
 mod moe_shared;
+pub(crate) mod mtp_control;
 mod na_gemm;
 mod pipelines;
 mod prefill;
@@ -70,8 +71,8 @@ mod whisper_encode;
 #[doc(hidden)]
 pub use self::barriers::dump_commit_components;
 pub(crate) use self::barriers::{
-    commit_and_wait, commit_nonblocking, install_dispatch_barrier_scope, post_dispatch_barrier,
-    wait_for_completion, EncoderEndGuard,
+    commit_and_wait, commit_and_wait_with, commit_nonblocking, install_dispatch_barrier_scope,
+    post_dispatch_barrier, wait_for_completion, EncoderEndGuard,
 };
 #[cfg(any(test, feature = "devtools"))]
 pub(crate) use self::byte_helpers::read_u16_buffer;
@@ -143,6 +144,7 @@ pub struct MetalExecutor {
     affine_qmv_fast_u4_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u2_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u4_gs64_f32: ComputePipelineState,
+    affine_qmv_fast_aligned_u4_gs64_residual_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmv_fast_u4_gs64_align64_f32: ComputePipelineState,
     affine_qmv_fast_u6_gs64_f32: ComputePipelineState,

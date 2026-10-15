@@ -239,6 +239,83 @@ impl CausalDecoder {
         layer_in: &metal::BufferRef,
         layer_out: &metal::BufferRef,
     ) -> Result<()> {
+        self.encode_resident_full_dense_layer_rows_impl(
+            metal,
+            arena,
+            layer_cache,
+            layer,
+            index,
+            encoder,
+            owned,
+            dims,
+            rows,
+            None,
+            layer_in,
+            layer_out,
+        )
+    }
+
+    /// Adapter position GPU de [`Self::encode_resident_full_dense_layer_rows`] :
+    /// ligne `row` à `ctrl[slot] + row`, attention sur `ctrl[slot] + row + 1`.
+    /// `dims.position` et `kv.len()` ignorés ; `kv.len()` inchangé (resync
+    /// `truncate` par l'appelant après le bloc). Préconditions : cf.
+    /// `DecodeResidentState::encode_full_attn_dense_layer_rows_gpu_position`.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "routage full-attn résident batché: état couche + arena + position GPU + encoder"
+    )]
+    pub(super) fn encode_resident_full_dense_layer_rows_gpu_position(
+        &self,
+        metal: &MetalExecutor,
+        arena: &ResidentArena,
+        layer_cache: &mut LayerKvCache,
+        layer: &DecoderLayer,
+        index: usize,
+        encoder: &metal::ComputeCommandEncoderRef,
+        owned: &mut Vec<metal::Buffer>,
+        dims: FullAttnLayerDims,
+        position: crate::decode_resident::GpuPosition<'_>,
+        rows: usize,
+        layer_in: &metal::BufferRef,
+        layer_out: &metal::BufferRef,
+    ) -> Result<()> {
+        self.encode_resident_full_dense_layer_rows_impl(
+            metal,
+            arena,
+            layer_cache,
+            layer,
+            index,
+            encoder,
+            owned,
+            dims,
+            rows,
+            Some(position),
+            layer_in,
+            layer_out,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "routage full-attn résident batché: état couche + arena + ping-pong + encoder"
+    )]
+    fn encode_resident_full_dense_layer_rows_impl(
+        &self,
+        metal: &MetalExecutor,
+        arena: &ResidentArena,
+        layer_cache: &mut LayerKvCache,
+        layer: &DecoderLayer,
+        index: usize,
+        encoder: &metal::ComputeCommandEncoderRef,
+        owned: &mut Vec<metal::Buffer>,
+        dims: FullAttnLayerDims,
+        rows: usize,
+        position: Option<crate::decode_resident::GpuPosition<'_>>,
+        layer_in: &metal::BufferRef,
+        layer_out: &metal::BufferRef,
+    ) -> Result<()> {
         let AttentionBlock::Full(attention) = &layer.attention else {
             return Err(InferError::Config(
                 "couche full-attn attendue (verify résident batché)".to_string(),
@@ -292,9 +369,14 @@ impl CausalDecoder {
             tail_score: &arena.dense_tail_score,
             parallel_moe: resolved.parallel_moe_weights(),
         };
-        arena.state.encode_full_attn_dense_layer_rows(
-            metal, encoder, owned, kv, weights, dims, rows, layer_in, layer_out,
-        )
+        match position {
+            Some(position) => arena.state.encode_full_attn_dense_layer_rows_gpu_position(
+                metal, encoder, owned, kv, weights, dims, position, rows, layer_in, layer_out,
+            ),
+            None => arena.state.encode_full_attn_dense_layer_rows(
+                metal, encoder, owned, kv, weights, dims, rows, layer_in, layer_out,
+            ),
+        }
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]

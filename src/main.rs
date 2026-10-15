@@ -483,11 +483,11 @@ fn prefill_profile_enabled() -> bool {
     saragossa::runtime_flags::env_flag("SARAGOSSA_RUST_DECODE_PROFILE", false)
 }
 
-/// Renvoie la profondeur de draft du decode MTP automatique (défaut 1).
+/// Renvoie la profondeur de draft du decode MTP automatique (défaut 2, plafond
+/// de la profondeur adaptative).
 ///
 /// Lue depuis `SARAGOSSA_RUST_MTP_MAX_DRAFT` ; une valeur absente, invalide ou nulle
-/// retombe sur 1 (un seul token draft vérifié par cycle), car le decode MTP
-/// exige au moins un draft.
+/// retombe sur le défaut, car le decode MTP exige au moins un draft.
 fn mtp_decode_max_draft() -> usize {
     serve::mtp::max_draft_tokens()
 }

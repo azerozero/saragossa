@@ -194,6 +194,61 @@ pub(crate) fn commit_and_wait(command_buffer: &metal::CommandBufferRef) -> Resul
     ensure_completed(command_buffer.status())
 }
 
+// Le callback peut paniquer : drainer le GPU avant que l'appelant rende ses baux.
+struct DrainOnDrop<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for DrainOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(drain) = self.0.take() {
+            drain();
+        }
+    }
+}
+
+pub(crate) fn commit_and_wait_with(
+    command_buffer: &metal::CommandBufferRef,
+    work: &mut dyn FnMut() -> bool,
+) -> Result<bool> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let components = commit_components_enabled();
+    let started = std::time::Instant::now();
+    if components {
+        command_buffer.commit();
+    } else {
+        commit_nonblocking(command_buffer);
+    }
+    let drain = DrainOnDrop(Some(|| command_buffer.wait_until_completed()));
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::Overlap);
+    let keep_going = work();
+    let wait_started = std::time::Instant::now();
+    drop(drain);
+    if components {
+        record_commit_component(
+            COMMIT_LABEL.with(std::cell::Cell::get),
+            started.elapsed().as_secs_f64(),
+        );
+    } else if decode_profile_enabled() {
+        DECODE_PROFILE_WAIT_NS.fetch_add(wait_started.elapsed().as_nanos() as u64, Relaxed);
+    }
+    ensure_completed(command_buffer.status())?;
+    Ok(keep_going)
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::DrainOnDrop;
+    #[test]
+    fn submitted_work_is_drained_on_callback_unwind() {
+        let drains = std::cell::Cell::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _drain = DrainOnDrop(Some(|| drains.set(drains.get() + 1)));
+            panic!("test callback unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(drains.get(), 1);
+    }
+}
+
 // Brick #5 campagne : ventilation du temps GPU (commit_and_wait synchrone) par
 // composant du prefill, via un label thread-local. Gaté SARAGOSSA_RUST_TRACE_COMPONENTS.
 thread_local! {

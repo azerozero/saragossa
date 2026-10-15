@@ -2129,3 +2129,343 @@ fn attn_gate_then_qmv_bitwise_matches_fused_gated_o_proj() -> Result<()> {
     }
     Ok(())
 }
+
+// --- Positions GPU (RoPE / append KV / SDPA lus dans `ctrl[slot]`) ---
+
+#[test]
+fn gpu_position_templates_follow_ctrl_and_clamp_to_host_bound() -> Result<()> {
+    use super::gpu_position::{gpu_position_params_cpu, gpu_position_templates};
+    let templates = gpu_position_templates(4, 2, 128, 64, 6, 2)?;
+    assert_eq!(templates.len(), 8);
+    let blocks = |len| super::utils::sdpa_2pass_blocks(len) as u32;
+    // ctrl = 5 : ligne r rotée à 5+r, SDPA sur 5+r+1 lignes.
+    assert_eq!(
+        gpu_position_params_cpu(&templates, 5),
+        vec![
+            [4, 128, 64, 5],
+            [2, 128, 64, 5],
+            [4, 2, 128, 6],
+            [4, 2, 6, blocks(7)],
+            [4, 128, 64, 6],
+            [2, 128, 64, 6],
+            [4, 2, 128, 7],
+            [4, 2, 7, blocks(8)],
+        ]
+    );
+    // ctrl hors contrat : borné à max_position (jamais au-delà de la capacité).
+    let clamped = gpu_position_params_cpu(&templates, u32::MAX);
+    assert_eq!(clamped[0][3], 6);
+    assert_eq!(clamped[2][3], 7);
+    assert_eq!(clamped[4][3], 7);
+    assert_eq!(clamped[7][2], 8);
+    Ok(())
+}
+
+#[test]
+fn gpu_position_preconditions_reject_unsupported_and_capacity() {
+    use super::gpu_position::{check_gpu_position_rows, GPU_POSITION_MAX_ROWS};
+    let f32 = GpuElement::F32;
+    assert!(check_gpu_position_rows(16, 256, f32, 0, 14, 2).is_ok());
+    assert!(matches!(
+        check_gpu_position_rows(16, 256, f32, 0, 15, 2),
+        Err(InferError::Dimension(_))
+    ));
+    assert!(matches!(
+        check_gpu_position_rows(16, 256, f32, 0, usize::MAX, 2),
+        Err(InferError::Dimension(_))
+    ));
+    assert!(matches!(
+        check_gpu_position_rows(usize::MAX, 256, f32, 0, 0, 2),
+        Err(InferError::Dimension(_))
+    ));
+    for (element, window, rows) in [
+        (GpuElement::Bf16, 0, 2),
+        (f32, 3, 2),
+        (f32, 0, 0),
+        (f32, 0, GPU_POSITION_MAX_ROWS + 1),
+    ] {
+        assert!(
+            matches!(
+                check_gpu_position_rows(64, 256, element, window, 4, rows),
+                Err(InferError::Config(_))
+            ),
+            "{element:?} window={window} rows={rows} doit être refusé (repli)"
+        );
+    }
+}
+
+const POS_Q: usize = 4;
+const POS_KV: usize = 2;
+const POS_HD: usize = 128;
+const POS_ROPE: usize = 64;
+const POS_ROWS: usize = 2;
+
+struct PositionCycleBuffers<'a> {
+    q_raw: &'a ScratchLease,
+    k_raw: &'a ScratchLease,
+    v_raw: &'a ScratchLease,
+    q_norm: &'a ScratchLease,
+    k_norm: &'a ScratchLease,
+    q_roped: &'a ScratchLease,
+    k_roped: &'a ScratchLease,
+    scores: &'a ScratchLease,
+    ctx: &'a [ScratchLease],
+}
+
+/// Une couche réduite à RoPE q/k + append + SDPA sur `POS_ROWS` lignes, en
+/// position hôte (`gpu == None`, base `base`) ou GPU (`ctrl`).
+fn encode_position_cycle(
+    state: &DecodeResidentState,
+    encoder: &metal::ComputeCommandEncoderRef,
+    kv: &mut FullAttentionMetalState,
+    gpu: Option<&super::gpu_position::GpuPositionRows<'_>>,
+    base: usize,
+    b: &PositionCycleBuffers<'_>,
+) -> Result<()> {
+    use super::gpu_position::rope_dims_param;
+    let (eps, theta) = (1.0e-6_f32, 1.0e7_f32);
+    for row in 0..POS_ROWS {
+        let q_off = (row * POS_Q * POS_HD * 4) as u64;
+        let kv_off = (row * POS_KV * POS_HD * 4) as u64;
+        let (rope_q, rope_k) = match gpu {
+            Some(g) => (g.rope_q(row), g.rope_k(row)),
+            None => (
+                rope_dims_param(POS_Q, POS_HD, POS_ROPE, base + row)?,
+                rope_dims_param(POS_KV, POS_HD, POS_ROPE, base + row)?,
+            ),
+        };
+        state.encode_rms_norm_rope_decode_param(
+            encoder,
+            b.q_raw.tensor().buffer(),
+            q_off,
+            b.q_norm.tensor().buffer(),
+            b.q_roped.tensor().buffer(),
+            POS_Q,
+            rope_q,
+            POS_ROPE,
+            eps,
+            theta,
+        )?;
+        state.encode_rms_norm_rope_decode_param(
+            encoder,
+            b.k_raw.tensor().buffer(),
+            kv_off,
+            b.k_norm.tensor().buffer(),
+            b.k_roped.tensor().buffer(),
+            POS_KV,
+            rope_k,
+            POS_ROPE,
+            eps,
+            theta,
+        )?;
+        let (k, v) = (b.k_roped.tensor().buffer(), b.v_raw.tensor().buffer());
+        let (q, scores, ctx) = (
+            b.q_roped.tensor().buffer(),
+            b.scores.tensor().buffer(),
+            b.ctx[row].tensor().buffer(),
+        );
+        match gpu {
+            Some(g) => {
+                kv.encode_append_kv_gpu_position(encoder, k, 0, v, kv_off, g, row)?;
+                kv.encode_attention_decode_gpu_position(encoder, q, scores, ctx, g, row)?;
+            }
+            None => {
+                kv.encode_append_kv_with_offsets(encoder, k, 0, v, kv_off)?;
+                kv.encode_attention_decode_windowed(encoder, q, scores, ctx, 0)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lease_with(state: &DecodeResidentState, data: &[f32]) -> Result<ScratchLease> {
+    let lease = state.scratch().lease(data.len(), GpuElement::F32)?;
+    seed_f32(lease.tensor(), data);
+    Ok(lease)
+}
+
+/// Deux cycles de 2 lignes : cycle 1 à `P`, rejet simulé (position `P+1`,
+/// réécriture de la ligne `P+1`), cycle 2 à `P+1`. Chemin hôte = 2 command
+/// buffers avec `truncate` ; chemin GPU = 1 command buffer, `ctrl` modifié par
+/// un blit entre les cycles, `len` hôte volontairement faux (0).
+fn run_gpu_position_case(
+    state: &DecodeResidentState,
+    prefix: usize,
+    capacity: usize,
+) -> Result<()> {
+    use super::gpu_position::{gpu_position_params_cpu, gpu_position_templates, GpuPosition};
+    use super::utils::write_u32_at;
+    let q_dim = POS_Q * POS_HD;
+    let kv_dim = POS_KV * POS_HD;
+    let keys: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 3)).collect();
+    let values: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 11)).collect();
+    let mut kv_host = state.full_attention_f32_for_test(capacity, POS_Q, POS_KV, POS_HD)?;
+    kv_host.seed(&keys, &values, prefix)?;
+    let mut kv_gpu = state.full_attention_f32_for_test(capacity, POS_Q, POS_KV, POS_HD)?;
+    kv_gpu.seed(&keys, &values, prefix)?;
+    kv_gpu.truncate(0)?;
+
+    let q_norm = lease_with(
+        state,
+        &(0..POS_HD)
+            .map(|i| 1.0 + 0.1 * pseudo(i + 5))
+            .collect::<Vec<_>>(),
+    )?;
+    let k_norm = lease_with(
+        state,
+        &(0..POS_HD)
+            .map(|i| 1.0 + 0.1 * pseudo(i + 9))
+            .collect::<Vec<_>>(),
+    )?;
+    let mut inputs = Vec::new();
+    for cycle in 0..2 {
+        let seed = 1000 * (cycle + 1);
+        inputs.push((
+            lease_with(
+                state,
+                &(0..POS_ROWS * q_dim)
+                    .map(|i| pseudo(seed + i))
+                    .collect::<Vec<_>>(),
+            )?,
+            lease_with(
+                state,
+                &(0..POS_ROWS * kv_dim)
+                    .map(|i| pseudo(seed + 7 + i))
+                    .collect::<Vec<_>>(),
+            )?,
+            lease_with(
+                state,
+                &(0..POS_ROWS * kv_dim)
+                    .map(|i| pseudo(seed + 13 + i))
+                    .collect::<Vec<_>>(),
+            )?,
+        ));
+    }
+    let q_roped = state.scratch().lease(q_dim, GpuElement::F32)?;
+    let k_roped = state.scratch().lease(kv_dim, GpuElement::F32)?;
+    let scores = state.scratch().lease(POS_Q * capacity, GpuElement::F32)?;
+    let mut ctx = Vec::new();
+    for _ in 0..2 * 2 * POS_ROWS {
+        ctx.push(state.scratch().lease(q_dim, GpuElement::F32)?);
+    }
+    let (ctx_host, ctx_gpu) = ctx.split_at(2 * POS_ROWS);
+    let make = |cycle: usize, path: usize| PositionCycleBuffers {
+        q_raw: &inputs[cycle].0,
+        k_raw: &inputs[cycle].1,
+        v_raw: &inputs[cycle].2,
+        q_norm: &q_norm,
+        k_norm: &k_norm,
+        q_roped: &q_roped,
+        k_roped: &k_roped,
+        scores: &scores,
+        ctx: &ctx[(path * 2 + cycle) * POS_ROWS..(path * 2 + cycle + 1) * POS_ROWS],
+    };
+
+    // Référence : positions hôte, rejet = truncate(P+1) entre les cycles.
+    for (cycle, base) in [(0, prefix), (1, prefix + 1)] {
+        kv_host.truncate(base)?;
+        let command_buffer = state.queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_position_cycle(state, encoder, &mut kv_host, None, base, &make(cycle, 0))?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+    }
+
+    // Position GPU : un seul command buffer, aucun readback intermédiaire.
+    let ctrl = state.scratch().lease(2, GpuElement::U32)?;
+    write_u32_at(
+        ctrl.tensor(),
+        0,
+        &[
+            999,
+            u32::try_from(prefix).map_err(|_| InferError::Dimension("P".into()))?,
+        ],
+    )?;
+    let next = state.scratch().lease(1, GpuElement::U32)?;
+    write_u32_at(
+        next.tensor(),
+        0,
+        &[u32::try_from(prefix + 1).map_err(|_| InferError::Dimension("P".into()))?],
+    )?;
+    let position = GpuPosition {
+        ctrl: ctrl.tensor().buffer(),
+        slot: 1,
+        max_position: prefix + 1,
+    };
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let rows0 = state.encode_gpu_position_rows(
+        encoder, &kv_gpu, position, POS_Q, POS_KV, POS_ROPE, 0, POS_ROWS,
+    )?;
+    encode_position_cycle(
+        state,
+        encoder,
+        &mut kv_gpu,
+        Some(&rows0),
+        usize::MAX,
+        &make(0, 1),
+    )?;
+    encoder.end_encoding();
+    let blit = command_buffer.new_blit_command_encoder();
+    blit.copy_from_buffer(next.tensor().buffer(), 0, ctrl.tensor().buffer(), 4, 4);
+    blit.end_encoding();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let rows1 = state.encode_gpu_position_rows(
+        encoder, &kv_gpu, position, POS_Q, POS_KV, POS_ROPE, 0, POS_ROWS,
+    )?;
+    encode_position_cycle(
+        state,
+        encoder,
+        &mut kv_gpu,
+        Some(&rows1),
+        usize::MAX,
+        &make(1, 1),
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    assert_eq!(kv_gpu.len(), 0, "len hôte inchangé en position GPU");
+    for (host, gpu) in ctx_host.iter().zip(ctx_gpu) {
+        assert_close_eps(&read_f32(gpu.tensor()), &read_f32(host.tensor()), 0.0);
+    }
+    let rows = (prefix + 3) * kv_dim;
+    assert_close_eps(
+        &read_f32(kv_gpu.keys())[..rows],
+        &read_f32(kv_host.keys())[..rows],
+        0.0,
+    );
+    assert_close_eps(
+        &read_f32(kv_gpu.values())[..rows],
+        &read_f32(kv_host.values())[..rows],
+        0.0,
+    );
+
+    let templates = gpu_position_templates(POS_Q, POS_KV, POS_HD, POS_ROPE, prefix + 1, POS_ROWS)?;
+    let expected = gpu_position_params_cpu(
+        &templates,
+        u32::try_from(prefix + 1).map_err(|_| InferError::Dimension("P".into()))?,
+    );
+    let params: Vec<u32> = read_f32(rows1.params())
+        .into_iter()
+        .map(f32::to_bits)
+        .collect();
+    for (index, entry) in expected.iter().enumerate() {
+        assert_eq!(
+            &params[index * 64..index * 64 + 4],
+            entry,
+            "params entrée {index}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn gpu_position_two_cycles_one_command_buffer_matches_host_positions() -> Result<()> {
+    let state = try_state()?.ok_or_else(|| {
+        InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
+    })?;
+    // Flash single-pass (len courte), puis 2-passes split-K (len ≥ 2048 par défaut).
+    run_gpu_position_case(&state, 5, 16)?;
+    run_gpu_position_case(&state, 2050, 2060)
+}

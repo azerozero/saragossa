@@ -49,6 +49,8 @@ pub(super) fn write_f32_at(tensor: &GpuTensor, offset: usize, data: &[f32]) -> R
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
     }
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(true, std::mem::size_of_val(data));
     Ok(())
 }
 
@@ -105,6 +107,8 @@ pub(super) fn write_f32_as_bf16_at(tensor: &GpuTensor, offset: usize, data: &[f3
             ptr.add(offset + index).write(f32_to_bf16_bits(value));
         }
     }
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(true, data.len() * 2);
     Ok(())
 }
 
@@ -148,6 +152,8 @@ pub(super) fn write_u32_at(tensor: &GpuTensor, offset: usize, data: &[u32]) -> R
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
     }
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(true, std::mem::size_of_val(data));
     Ok(())
 }
 

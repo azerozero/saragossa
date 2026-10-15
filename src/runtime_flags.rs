@@ -1,5 +1,8 @@
 //! Flags runtime et instrumentation du décodeur.
 
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+pub(crate) mod pairwise;
+
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 use std::sync::atomic::AtomicU8;
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -220,9 +223,12 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
     })
 }
 
-/// Chemin MTP fused depth-1 SANS historique committed ni pré-draft spéculatif
-/// (draft#2). **Défaut OFF** (`SARAGOSSA_RUST_MTP_FRESH_CACHE=1` pour l'activer) :
-/// diagnostic, pas un gain prod.
+/// Chemin MTP fused SANS historique committed ni pré-draft spéculatif (draft#2).
+/// **Défaut ON depuis le 2026-10-15** (`SARAGOSSA_RUST_MTP_FRESH_CACHE=0` pour
+/// revenir au D1 committed) : la campagne pairwise `models/pairwise` (PW04,
+/// `docs/perf/mtp-pairwise.md`) a confirmé, avec l'adaptatif en profondeur 2,
+/// +5,8 % T0 et +17,0 % T1 après Holm15, et la non-infériorité à -2 % sur T2
+/// (n96, médiane +0,2 %). La mesure ci-dessous est antérieure (depth-1 seul).
 ///
 /// En mode fresh : cache MTP vidé par pas (attention self-only, position 0,
 /// comme `generate_mtp1` de MTPLX) et draft#2 supprimé → un forward de tête MTP
@@ -235,22 +241,66 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
 /// 0,920× vs 0,953×). draft#2 « se paie » : garder l'historique (défaut OFF).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn mtp_fresh_cache_enabled() -> bool {
+    #[cfg(feature = "devtools")]
+    if let Some(case) = pairwise::current() {
+        return case.fresh();
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_FRESH_CACHE", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_FRESH_CACHE", true))
+}
+
+pub(crate) fn mtp_resident_hidden_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.hidden;
+    }
+    false
+}
+
+pub(crate) fn mtp_gpu_embedding_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.embedding;
+    }
+    false
+}
+
+pub(crate) fn mtp_overlap_stream_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.overlap;
+    }
+    false
+}
+
+pub(crate) fn mtp_gpu_block_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.mode == pairwise::Mode::Block2;
+    }
+    false
 }
 
 /// Active la profondeur de draft MTP **adaptative** (GammaTune-style).
 ///
-/// **Défaut OFF** (`SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=1` pour l'activer) : le decode
-/// MTP garde alors sa profondeur fixe (`SARAGOSSA_RUST_MTP_MAX_DRAFT`), comportement
-/// strictement inchangé. Activé, la profondeur est choisie PAR PAS entre 1 et le
+/// **Défaut ON depuis le 2026-10-15** (`SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0` pour
+/// revenir à la profondeur fixe `SARAGOSSA_RUST_MTP_MAX_DRAFT`) ; avec le cache
+/// fresh c'est la configuration PW04 de la campagne pairwise, cf.
+/// [`mtp_fresh_cache_enabled`]. Activé, la profondeur est choisie PAR PAS entre 1 et le
 /// plafond `SARAGOSSA_RUST_MTP_MAX_DRAFT` selon une EMA de la deep-acceptance récente
 /// (cf. [`crate::decoder::mtp_adaptive`]). La séquence générée reste byte-identique
 /// (le vérifieur trunk exact décide *lesquels* des tokens proposés sont acceptés,
 /// pas *combien* on en propose).
 pub(super) fn mtp_adaptive_depth_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return matches!(
+            case.mode,
+            pairwise::Mode::Adaptive | pairwise::Mode::AdaptiveFresh
+        );
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH", true))
 }
 
 /// Lissage EMA (`alpha`) de la deep-acceptance MTP adaptative. Défaut 0,3, borné
@@ -710,6 +760,10 @@ pub(crate) fn trace_dispatch_path_enabled() -> bool {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn decode_profile_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(trace) = pairwise::traced() {
+        return trace;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_PROFILE", false))
 }

@@ -662,6 +662,85 @@ kernel void affine_qmv_fast_aligned_u4_gs64_f32(
     }
 }
 
+// Variante résiduelle du qmv u4 aligné : `out = residual + W·x`, égale à qmv +
+// `weighted_sum_add_topk` (topk=1, score=1.0) : même ordre d'addition f32.
+kernel void affine_qmv_fast_aligned_u4_gs64_residual_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    device const float* residual [[buffer(6)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_thread = 16u;
+    const uint block_size = values_per_thread * 32u;
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+
+    const uint row_bytes = packed_cols * 4u;
+    const uint scale_step_per_thread = 4u;
+    const device uchar* ws = ((const device uchar*)packed) +
+        row_base * row_bytes + simd_lid * 8u;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / scale_step_per_thread;
+    const device float* x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint k = 0u; k < in_dim; k += block_size) {
+        float xt[16];
+        float sum = 0.0f;
+        for (uint i = 0u; i < values_per_thread; i += 4u) {
+            const float x0 = x[i];
+            const float x1 = x[i + 1u];
+            const float x2 = x[i + 2u];
+            const float x3 = x[i + 3u];
+            sum += x0 + x1 + x2 + x3;
+            xt[i] = x0;
+            xt[i + 1u] = x1 / 16.0f;
+            xt[i + 2u] = x2 / 256.0f;
+            xt[i + 3u] = x3 / 4096.0f;
+        }
+
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            const device ushort* w16 = (const device ushort*)(ws + row * row_bytes);
+            const float scale = scale_base[row * groups];
+            const float bias = bias_base[row * groups];
+            float accum = 0.0f;
+            for (uint i = 0u; i < 4u; ++i) {
+                const ushort word = w16[i];
+                accum += xt[4u * i] * float(word & 0x000fu);
+                accum += xt[4u * i + 1u] * float(word & 0x00f0u);
+                accum += xt[4u * i + 2u] * float(word & 0x0f00u);
+                accum += xt[4u * i + 3u] * float(word & 0xf000u);
+            }
+            result[row] += scale * accum + sum * bias;
+        }
+
+        ws += 256u;
+        scale_base += 8u;
+        bias_base += 8u;
+        x += block_size;
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        const float reduced = simd_sum(result[row]);
+        if (simd_lid == 0u) {
+            const uint idx = tile.x * out_dim + row_base + row;
+            out[idx] = residual[idx] + reduced;
+        }
+    }
+}
+
 kernel void affine_qmv_fast_aligned_u3_gs64_f32(
     device const float* lhs [[buffer(0)]],
     device const uint* packed [[buffer(1)]],

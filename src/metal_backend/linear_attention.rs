@@ -103,6 +103,19 @@ impl MetalExecutor {
         self.encode_copy_with_offsets(encoder, &state.ssm, 0, &capture.ssm, 0, state.ssm_len)
     }
 
+    /// Encode (sans commit) la capture de chaque `(état, capture)` : capture
+    /// pré-cycle du bloc MTP GPU, restaurée conditionnellement sur GPU.
+    pub(crate) fn encode_capture_linear_attn_states(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pairs: &[(&LinearAttentionMetalState, &LinearAttentionMetalState)],
+    ) -> Result<()> {
+        for (state, capture) in pairs {
+            self.encode_capture_linear_attn_state(encoder, state, capture)?;
+        }
+        Ok(())
+    }
+
     fn encode_capture_linear_attn_conv_state(
         &self,
         encoder: &ComputeCommandEncoderRef,

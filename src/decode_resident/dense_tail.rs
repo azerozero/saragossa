@@ -103,6 +103,19 @@ impl DecodeResidentState {
                 inter,
             )?;
         }
+        // Pairwise p2 (OFF par défaut) : `tail_score` vaut 1.0 (`dense_tail_score`),
+        // down + résiduel fusionnés ; sinon qmv puis `weighted_sum_add_topk`.
+        if executor.encode_qmv_u4_residual_buffers(
+            encoder,
+            swiglu.tensor().buffer(),
+            down_proj,
+            summed,
+            layer_out,
+            inter,
+            hidden,
+        )? {
+            return Ok(());
+        }
         let down_dim = executor.encode_matmul_weight_buffers(
             encoder,
             swiglu.tensor().buffer(),

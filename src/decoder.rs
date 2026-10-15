@@ -521,6 +521,123 @@ struct ResidentVerifyOutput {
     target_hidden: Option<Tensor>,
 }
 
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+thread_local! {
+    // Lectures hidden et uploads hidden du seul chemin D1, pas du prefill.
+    static MTP_D1_HIDDEN_TRANSFERS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Le bail garde le scratch hors du pool jusqu'à la fin du prochain cycle.
+/// Le repli CPU consomme l'état : aucun tenseur CPU périmé n'est conservé.
+#[derive(Debug)]
+enum MtpFinalState {
+    Cpu(Tensor),
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    Resident(ScratchLease),
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    ResidentRow {
+        lease: ScratchLease,
+        row: usize,
+        hidden: usize,
+    },
+}
+
+impl MtpFinalState {
+    fn into_cpu(self) -> Result<Tensor> {
+        match self {
+            Self::Cpu(state) => Ok(state),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::Resident(lease) => {
+                #[cfg(test)]
+                MTP_D1_HIDDEN_TRANSFERS.with(|counts| {
+                    let (reads, uploads) = counts.get();
+                    counts.set((reads + 1, uploads));
+                });
+                Tensor::row(crate::metal_backend::read_f32_buffer(
+                    lease.tensor().buffer(),
+                    lease.tensor().len(),
+                )?)
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::ResidentRow { lease, row, hidden } => {
+                let values = crate::metal_backend::read_f32_buffer(
+                    lease.tensor().buffer(),
+                    lease.tensor().len(),
+                )?;
+                let range = Self::row_range(row, hidden)?;
+                let values = values
+                    .get(range)
+                    .ok_or_else(|| InferError::Dimension("ligne hidden hors bail".into()))?;
+                Tensor::row(values.to_vec())
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn row_range(row: usize, hidden: usize) -> Result<std::ops::Range<usize>> {
+        let start = row
+            .checked_mul(hidden)
+            .ok_or_else(|| InferError::Dimension("offset hidden déborde".into()))?;
+        let end = start
+            .checked_add(hidden)
+            .ok_or_else(|| InferError::Dimension("fin hidden déborde".into()))?;
+        Ok(start..end)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn validate_resident(&self, hidden: usize) -> Result<()> {
+        let (lease, end) = match self {
+            Self::Cpu(_) => return Ok(()),
+            Self::Resident(lease) => (lease, hidden),
+            Self::ResidentRow {
+                lease,
+                row,
+                hidden: width,
+            } if *width == hidden => (lease, Self::row_range(*row, hidden)?.end),
+            _ => return Err(InferError::Dimension("largeur hidden incompatible".into())),
+        };
+        if lease.tensor().element() != GpuElement::F32 || lease.tensor().len() < end {
+            return Err(InferError::Dimension("bail hidden incompatible".into()));
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn encode_resident_copy(
+        &self,
+        metal: &crate::metal_backend::MetalExecutor,
+        encoder: &metal::ComputeCommandEncoderRef,
+        dst: &metal::BufferRef,
+        hidden: usize,
+    ) -> Result<()> {
+        self.validate_resident(hidden)?;
+        let (lease, row) = match self {
+            Self::Cpu(_) => return Ok(()),
+            Self::Resident(lease) => (lease, 0),
+            Self::ResidentRow { lease, row, .. } => (lease, *row),
+        };
+        let offset = Self::row_range(row, hidden)?
+            .start
+            .checked_mul(4)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| InferError::Dimension("offset hidden octets déborde".into()))?;
+        metal.encode_copy_with_offsets(encoder, lease.tensor().buffer(), offset, dst, 0, hidden)?;
+        #[cfg(feature = "devtools")]
+        crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::Hidden);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn from_lease(lease: ScratchLease, retain_hidden: bool) -> Result<Self> {
+        let state = Self::Resident(lease);
+        if retain_hidden {
+            Ok(state)
+        } else {
+            Ok(Self::Cpu(state.into_cpu()?))
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Debug)]
 struct ResidentMtpSpecTwoOutput {
@@ -531,7 +648,7 @@ struct ResidentMtpSpecTwoOutput {
     accepted_generated: usize,
     committed_rows: usize,
     pending: usize,
-    final_state: Tensor,
+    final_state: MtpFinalState,
     bonus_verified: bool,
 }
 

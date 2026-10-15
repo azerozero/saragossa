@@ -14,6 +14,50 @@ use super::mtp::concat_row_pair;
 use super::mtp_adaptive::AdaptiveDepthController;
 use super::*;
 
+fn emit_mtp_committed(
+    tokens: &[usize],
+    emitted: &mut usize,
+    on_token: &mut impl FnMut(usize) -> bool,
+) -> bool {
+    while *emitted < tokens.len() {
+        let token = tokens[*emitted];
+        *emitted += 1;
+        if !on_token(token) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod emission_tests {
+    use super::emit_mtp_committed;
+
+    #[test]
+    fn committed_prefix_stops_once_and_is_not_duplicated() {
+        let tokens = [10, 20, 30];
+        for cancel_at in 1..=tokens.len() {
+            let mut emitted = 0;
+            let mut seen = Vec::new();
+            assert!(!emit_mtp_committed(&tokens, &mut emitted, &mut |token| {
+                seen.push(token);
+                seen.len() < cancel_at
+            }));
+            assert_eq!(seen, tokens[..cancel_at]);
+            assert_eq!(emitted, cancel_at);
+        }
+        let mut emitted = 0;
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            assert!(emit_mtp_committed(&tokens, &mut emitted, &mut |token| {
+                seen.push(token);
+                true
+            }));
+        }
+        assert_eq!(seen, tokens);
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Clone, Copy, Debug)]
 struct MtpProfilePoint {
@@ -1195,7 +1239,7 @@ impl CausalDecoder {
         let trace_setup = false;
         let t_prefill = trace_setup.then(Instant::now);
         let use_committed_mtp_history = mtp_history_policy() == MtpHistoryPolicy::Committed;
-        let (mut cache, mut final_state, mut mtp_history_cache) = if use_committed_mtp_history {
+        let (mut cache, final_state, mut mtp_history_cache) = if use_committed_mtp_history {
             let (cache, final_state, mtp_history) =
                 self.prefill_cache_state_with_mtp_history(prompt)?;
             (cache, final_state, Some(mtp_history))
@@ -1269,6 +1313,11 @@ impl CausalDecoder {
         // inchangés. Le contrôleur ne décide QUE de la profondeur ; le vérifieur
         // trunk exact garantit la byte-identité.
         let adaptive_depth = mtp_adaptive_depth_enabled();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        // Les baux D1 et les lignes D2 restent vivants jusqu'au cycle suivant.
+        // Seul un repli CPU consomme et matérialise l'état.
+        let retain_hidden = crate::runtime_flags::mtp_resident_hidden_enabled();
+        let mut final_state = MtpFinalState::Cpu(final_state);
         let mut depth_ctl = AdaptiveDepthController::new(
             max_draft_tokens,
             mtp_adaptive_alpha(),
@@ -1281,18 +1330,40 @@ impl CausalDecoder {
         let profile_mtp_steps = mtp_step_profile_enabled();
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let mut mtp_step_profile = MtpStepProfile::default();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let gpu_block_kernels = if crate::runtime_flags::mtp_gpu_block_enabled()
+            && max_draft_tokens == 1
+            && !adaptive_depth
+            && use_committed_mtp_history
+            && mtp_fresh_cache_enabled()
+            && options.temperature.abs() <= f32::EPSILON
+            && options.token_constraint.is_none()
+            && options.stop_sequences.is_empty()
+        {
+            cache
+                .resident
+                .as_ref()
+                .map(|arena| {
+                    crate::metal_backend::mtp_control::MtpD1Kernels::new(arena.state.device())
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let overlap_stream = crate::runtime_flags::mtp_overlap_stream_enabled();
         let decode_started = Instant::now();
 
         while generated.len() < max_new_tokens {
-            // Émet les tokens committés aux itérations précédentes (byte-identiques
-            // à l'AR). `on_token` renvoie `false` → arrêt (barge-in voix).
-            while emitted < generated.len() {
-                let committed = generated[emitted];
-                emitted += 1;
-                if !on_token(committed) {
-                    stop_streaming = true;
-                    break;
-                }
+            let committed_prefix = generated.len();
+            let defer_emit = overlap_stream
+                && emitted < committed_prefix
+                && committed_prefix + 1 < max_new_tokens
+                && !options.stop_token_ids.contains(&pending)
+                && options.temperature <= f32::EPSILON
+                && use_committed_mtp_history
+                && mtp_history_cache.is_some();
+            if !defer_emit {
+                stop_streaming = !emit_mtp_committed(&generated, &mut emitted, &mut on_token);
             }
             if stop_streaming {
                 break;
@@ -1300,6 +1371,43 @@ impl CausalDecoder {
             let primary = pending;
             if options.stop_token_ids.contains(&primary) {
                 break;
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            if let Some(kernels) = gpu_block_kernels.as_ref() {
+                let MtpFinalState::Cpu(state) = &final_state else {
+                    return Err(InferError::Config("bloc2 sans état CPU matérialisé".into()));
+                };
+                if let Some(output) = self.next_mtp_gpu_block(
+                    &mut cache,
+                    state,
+                    primary,
+                    max_new_tokens - generated.len(),
+                    &options.stop_token_ids,
+                    kernels,
+                )? {
+                    #[cfg(feature = "devtools")]
+                    {
+                        crate::runtime_flags::pairwise::mark(
+                            crate::runtime_flags::pairwise::Hit::Block,
+                        );
+                        crate::runtime_flags::pairwise::mark(
+                            crate::runtime_flags::pairwise::Hit::Embedding,
+                        );
+                    }
+                    stats.accepted += output.accepted;
+                    stats.accepted_by_position[0] += output.accepted;
+                    stats.rejected += output.rejected;
+                    stats.proposed += output.accepted + output.rejected;
+                    stats.proposed_by_position[0] += output.accepted + output.rejected;
+                    stats.verifications += output.verifications;
+                    generated.extend(output.tokens);
+                    pending = output.pending;
+                    final_state = MtpFinalState::Cpu(output.final_state);
+                    if output.eos {
+                        break;
+                    }
+                    continue;
+                }
             }
             generated.push(primary);
             if generated.len() >= max_new_tokens {
@@ -1335,15 +1443,30 @@ impl CausalDecoder {
                     self.flush_mtp_resident_pending_append(&mut cache, cycle_mtp_offset)?;
                 }
                 let profile_start = mtp_profile_start(profile_mtp_steps);
-                if let Some((draft, target, target_state, bonus)) = self
-                    .next_mtp_spec_one_resident(
+                let output = {
+                    let mut emit = || {
+                        stop_streaming = !emit_mtp_committed(
+                            &generated[..committed_prefix],
+                            &mut emitted,
+                            &mut on_token,
+                        );
+                        !stop_streaming
+                    };
+                    self.next_mtp_spec_one_resident(
                         &mut cache,
                         &final_state,
                         primary,
                         cycle_mtp_offset,
                         &options.stop_token_ids,
+                        retain_hidden,
+                        if defer_emit { Some(&mut emit) } else { None },
                     )?
-                {
+                };
+                if stop_streaming {
+                    generated.truncate(committed_prefix);
+                    break;
+                }
+                if let Some((draft, target, target_state, bonus)) = output {
                     if adaptive_depth {
                         depth_ctl.observe(1, usize::from(draft == target));
                     }
@@ -1351,8 +1474,8 @@ impl CausalDecoder {
                     stats.verifications += 1;
                     stats.proposed += 1;
                     stats.proposed_by_position[0] += 1;
-                    // En mode fresh, le chemin résident ignore l'historique MTP
-                    // committed (self-only, prouvé inerte) : on ne le fait pas
+                    // En mode fresh, les drafts utilisent un historique self-only
+                    // (prédictions différentes, oracle AR conservé) : on ne le fait pas
                     // croître ni ne le tronque (évite un truncate au-delà de la
                     // longueur réelle, qui exposerait des lignes KV périmées).
                     let fresh = mtp_fresh_cache_enabled();
@@ -1395,12 +1518,10 @@ impl CausalDecoder {
                         } else {
                             final_state = target_state;
                             if generated.len() < max_new_tokens {
-                                final_state = self.next_decode_state(&mut cache, draft)?;
-                                pending = self.sample_token_from_state(
-                                    &final_state,
-                                    options,
-                                    &mut sampler,
-                                )?;
+                                let state = self.next_decode_state(&mut cache, draft)?;
+                                pending =
+                                    self.sample_token_from_state(&state, options, &mut sampler)?;
+                                final_state = MtpFinalState::Cpu(state);
                                 stats.verifications += 1;
                             }
                         }
@@ -1426,13 +1547,30 @@ impl CausalDecoder {
                 && max_new_tokens.saturating_sub(generated.len()) >= 2
             {
                 let profile_start = mtp_profile_start(profile_mtp_steps);
-                if let Some(output) = self.next_mtp_spec_two_resident(
-                    &mut cache,
-                    &final_state,
-                    primary,
-                    cycle_mtp_offset,
-                    &options.stop_token_ids,
-                )? {
+                let output = {
+                    let mut emit = || {
+                        stop_streaming = !emit_mtp_committed(
+                            &generated[..committed_prefix],
+                            &mut emitted,
+                            &mut on_token,
+                        );
+                        !stop_streaming
+                    };
+                    self.next_mtp_spec_two_resident(
+                        &mut cache,
+                        &final_state,
+                        primary,
+                        cycle_mtp_offset,
+                        &options.stop_token_ids,
+                        retain_hidden,
+                        if defer_emit { Some(&mut emit) } else { None },
+                    )?
+                };
+                if stop_streaming {
+                    generated.truncate(committed_prefix);
+                    break;
+                }
+                if let Some(output) = output {
                     if adaptive_depth {
                         // `accepted_generated` = nb de tokens de draft acceptés
                         // (0..=2). deep_paid ⇔ le 2ᵉ draft a été accepté.
@@ -1472,8 +1610,17 @@ impl CausalDecoder {
                     mtp_profile_record(&mut mtp_step_profile.fused_two, profile_start);
                 }
             }
+            if defer_emit
+                && !emit_mtp_committed(&generated[..committed_prefix], &mut emitted, &mut on_token)
+            {
+                stop_streaming = true;
+                generated.truncate(committed_prefix);
+                break;
+            }
+            // Un repli ne peut jamais consommer une ancienne copie CPU de l'état.
+            let mut cpu_state = final_state.into_cpu()?;
             let mut local_mtp_cache = LayerKvCache::default();
-            let mut draft_hidden = final_state.clone();
+            let mut draft_hidden = cpu_state.clone();
             let mut draft_token = primary;
             let mut drafts = Vec::with_capacity(max_draft_tokens);
             let mut draft_distributions = Vec::with_capacity(max_draft_tokens);
@@ -1482,7 +1629,7 @@ impl CausalDecoder {
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 let resident = self.start_mtp_resident_draft(
                     &mut cache,
-                    &final_state,
+                    &cpu_state,
                     mtp_history_cache.as_ref().map(|_| resident_mtp_history_len),
                 )?;
                 mtp_profile_record(&mut mtp_step_profile.draft_setup, profile_start);
@@ -1567,7 +1714,7 @@ impl CausalDecoder {
             let profile_start = mtp_profile_start(profile_mtp_steps);
             let verified = self.verify_mtp_drafts_batched(MtpVerify {
                 cache: &mut cache,
-                final_state: &mut final_state,
+                final_state: &mut cpu_state,
                 pending: &mut pending,
                 generated: &mut generated,
                 drafts,
@@ -1631,8 +1778,8 @@ impl CausalDecoder {
             if accepted_all {
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 let profile_start = mtp_profile_start(profile_mtp_steps);
-                final_state = self.next_decode_state(&mut cache, verify_token)?;
-                pending = self.sample_token_from_state(&final_state, options, &mut sampler)?;
+                cpu_state = self.next_decode_state(&mut cache, verify_token)?;
+                pending = self.sample_token_from_state(&cpu_state, options, &mut sampler)?;
                 stats.verifications += 1;
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 mtp_profile_record(&mut mtp_step_profile.bonus_next, profile_start);
@@ -1643,6 +1790,7 @@ impl CausalDecoder {
             if adaptive_depth {
                 depth_ctl.observe(step_depth, accepted_history.len());
             }
+            final_state = MtpFinalState::Cpu(cpu_state);
         }
 
         let loop_duration = decode_started.elapsed();

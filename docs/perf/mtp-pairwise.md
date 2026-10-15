@@ -1,8 +1,17 @@
 # Criblage pairwise des optimisations MTP
 
 Modèle Qwen3.8-27B 4 bits, Apple M5 Max, décodage greedy de 64 tokens.
-Référence de production : MTP D1 committed, `SARAGOSSA_RUST_MTP_FRESH_CACHE=0`.
-Ce document publie le criblage. La confirmation statistique est en cours.
+Référence de production au moment du criblage : MTP D1 committed,
+`SARAGOSSA_RUST_MTP_FRESH_CACHE=0`. Ce document publie le criblage.
+
+Depuis le 2026-10-15, le défaut est PW04 (`adaptive_fresh`, profondeur 2,
+fusions p1 déjà actives) : confirmation n24 Holm15 +5,8 % sur T0 et +17,0 % sur T1,
+non-infériorité à -2 % sur T2 (n96, médiane +0,2 %). L'isolation factorielle
+(n48, harnais V5) n'a trouvé aucun gain ≥2 % des états cachés GPU, de l'embedding
+GPU, du recouvrement ni de la fusion QMV-u4+résiduel au-dessus du mode seul ; ces
+chemins restent dans le code, désactivés hors harnais. Retour au D1 :
+`SARAGOSSA_RUST_MTP_MAX_DRAFT=1 SARAGOSSA_RUST_MTP_FRESH_CACHE=0
+SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0`.
 
 ## Protocole
 

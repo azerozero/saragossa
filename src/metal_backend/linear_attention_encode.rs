@@ -495,6 +495,8 @@ impl MetalExecutor {
         encoder.set_buffer(11, Some(decay_buffer), decay_offset);
         set_u32_bytes(encoder, 12, &dims, "linear_attn_fused_conv_norm_dims")?;
         set_f32_bytes(encoder, 13, &scales, "linear_attn_fused_conv_norm_scales")?;
+        #[cfg(feature = "devtools")]
+        crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::P3);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(

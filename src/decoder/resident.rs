@@ -3,6 +3,8 @@
 mod decode;
 mod encode;
 mod mtp;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+mod mtp_block;
 mod setup;
 mod types;
 mod verify;

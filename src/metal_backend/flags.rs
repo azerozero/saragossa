@@ -288,13 +288,31 @@ pub(super) fn fast_affine_qmv_enabled(out_dim: usize) -> bool {
 }
 
 pub(super) fn fused_attn_epilogue_enabled() -> bool {
+    #[cfg(feature = "devtools")]
+    if let Some(case) = crate::runtime_flags::pairwise::current() {
+        return case.p1;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FUSED_ATTN_EPILOGUE", true))
 }
 
 pub(super) fn fused_rms_prologue_enabled() -> bool {
+    #[cfg(feature = "devtools")]
+    if let Some(case) = crate::runtime_flags::pairwise::current() {
+        return case.p1;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FUSED_RMS_PROLOGUE", true))
+}
+
+/// Fusion `down_proj` u4 + résiduel du tail dense résident (pairwise p2).
+/// OFF hors harnais pairwise : aucun env, défaut de production inchangé.
+pub(super) fn qmv_u4_residual_enabled() -> bool {
+    #[cfg(feature = "devtools")]
+    if let Some(case) = crate::runtime_flags::pairwise::current() {
+        return case.p2;
+    }
+    false
 }
 
 pub(super) fn dense_qmv_fast_enabled() -> bool {
@@ -353,6 +371,10 @@ pub(super) fn linear_norm_dk128_enabled() -> bool {
 }
 
 pub(super) fn linear_conv_norm_fused_enabled() -> bool {
+    #[cfg(feature = "devtools")]
+    if let Some(case) = crate::runtime_flags::pairwise::current() {
+        return case.p3;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| profile_env_flag("SARAGOSSA_RUST_LINEAR_CONV_NORM_FUSED", false))
 }
