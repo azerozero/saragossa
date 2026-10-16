@@ -10,6 +10,7 @@ use crate::DFlashDraft;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use super::attention_ops::AttentionLayout;
 use super::attention_ops::{full_attention_context_cached, full_attention_context_prefill};
+use super::lookup::NgramLookup;
 use super::mtp::{concat_row_pair, concat_rows};
 use super::mtp_adaptive::AdaptiveDepthController;
 use super::*;
@@ -1239,6 +1240,11 @@ impl CausalDecoder {
         // Un draft plus long que la génération restante est inutile et dépasserait
         // la capacité résidente (`draft_indices`, dimensionnée sur `max_new_tokens`).
         let max_draft_tokens = max_draft_tokens.min(max_new_tokens);
+        // Lookup n-grammes : drafts sans tête MTP quand le suffixe courant s'est
+        // déjà vu. OFF par défaut (`SARAGOSSA_RUST_MTP_LOOKUP_DRAFT`), à mesurer.
+        let lookup_draft = crate::runtime_flags::mtp_lookup_draft_tokens().min(max_new_tokens);
+        let mut lookup = (lookup_draft > 0).then(|| NgramLookup::new(prompt));
+        let draft_headroom = max_draft_tokens.max(lookup_draft);
 
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let trace_setup = mtp_setup_trace_enabled();
@@ -1274,7 +1280,7 @@ impl CausalDecoder {
                 use_resident_full = self.setup_resident_full_decode(
                     &mut cache,
                     max_new_tokens,
-                    max_draft_tokens,
+                    draft_headroom,
                     options.temperature > f32::EPSILON,
                 )?;
                 if let Some(t) = t_setup {
@@ -1313,8 +1319,8 @@ impl CausalDecoder {
         let mut emitted = 0usize;
         let mut stop_streaming = false;
         let mut stats = SpeculativeStats::default();
-        stats.proposed_by_position.resize(max_draft_tokens, 0);
-        stats.accepted_by_position.resize(max_draft_tokens, 0);
+        stats.proposed_by_position.resize(draft_headroom, 0);
+        stats.accepted_by_position.resize(draft_headroom, 0);
         // Profondeur de draft adaptative (défaut OFF). Quand OFF, `step_depth`
         // vaut toujours `max_draft_tokens` → dispatch et sortie strictement
         // inchangés. Le contrôleur ne décide QUE de la profondeur ; le vérifieur
@@ -1433,11 +1439,16 @@ impl CausalDecoder {
             } else {
                 max_draft_tokens
             };
+            let lookup_drafts = lookup.as_mut().and_then(|lookup| {
+                lookup.sync(&generated);
+                lookup.propose(lookup_draft.min(max_new_tokens.saturating_sub(generated.len())))
+            });
             #[cfg(all(target_os = "macos", feature = "metal"))]
             if options.temperature <= f32::EPSILON
                 && use_committed_mtp_history
                 && step_depth == 1
                 && mtp_history_cache.is_some()
+                && lookup_drafts.is_none()
             {
                 // POURQUOI : le chemin fused D2 diffère l'append KV MTP (mécanisme
                 // « pending ») au pas suivant, qui le matérialise à son démarrage.
@@ -1552,6 +1563,7 @@ impl CausalDecoder {
                 && step_depth == 2
                 && mtp_history_cache.is_some()
                 && max_new_tokens.saturating_sub(generated.len()) >= 2
+                && lookup_drafts.is_none()
             {
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 let output = {
@@ -1646,8 +1658,13 @@ impl CausalDecoder {
             };
             #[cfg(not(all(target_os = "macos", feature = "metal")))]
             let mtp_resident = false;
+            if let Some(found) = lookup_drafts.as_ref() {
+                // La préparation résidente ci-dessus reste nécessaire : l'historique
+                // MTP est prolongé après vérification avec les tokens acceptés.
+                drafts = found.clone();
+            }
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            if mtp_resident {
+            if mtp_resident && drafts.is_empty() {
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 if let Some(resident_drafts) = self.next_mtp_drafts_resident(
                     &mut cache,
@@ -1794,8 +1811,10 @@ impl CausalDecoder {
             // Retour d'expérience du chemin général (fallback per-op) : nb de
             // drafts acceptés à ce pas. Les chemins fused D1/D2 ont déjà `observe`
             // puis `continue` — ce point n'est atteint que hors fused.
-            if adaptive_depth {
-                depth_ctl.observe(step_depth, accepted_history.len());
+            match (lookup.as_mut(), lookup_drafts.as_ref()) {
+                (Some(lookup), Some(found)) => lookup.observe(found.len(), accepted_history.len()),
+                _ if adaptive_depth => depth_ctl.observe(step_depth, accepted_history.len()),
+                _ => {}
             }
             final_state = MtpFinalState::Cpu(cpu_state);
         }

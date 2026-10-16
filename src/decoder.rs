@@ -43,6 +43,7 @@ pub(crate) mod flags;
 mod generation;
 mod lightbatch;
 mod loading;
+mod lookup;
 mod mtp;
 mod mtp_adaptive;
 mod resident;

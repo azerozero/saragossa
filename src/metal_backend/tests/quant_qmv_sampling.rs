@@ -2301,22 +2301,30 @@ fn encode_matmul_weight_buffers_na_fused_tiled_matches_cpu_when_enabled() -> Res
 
 #[test]
 fn qmm_na_fused_tiled_u4_accepts_dense_and_rejects_shared_shapes() {
+    // Seuil de largeur mesuré (qmm_na_min_batch, défaut 32) : 33 lignes passent, 31 non.
     assert!(can_use_qmm_na_fused_tiled_u4_buffers(
-        17,
+        33,
         2048,
         2048,
         FAST_QMV_GROUP_SIZE,
         FAST_QMV_BITS
     ));
     assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        17,
+        31,
+        2048,
+        2048,
+        FAST_QMV_GROUP_SIZE,
+        FAST_QMV_BITS
+    ));
+    assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
+        33,
         2048,
         512,
         FAST_QMV_GROUP_SIZE,
         FAST_QMV_BITS
     ));
     assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        17,
+        33,
         512,
         2048,
         FAST_QMV_GROUP_SIZE,

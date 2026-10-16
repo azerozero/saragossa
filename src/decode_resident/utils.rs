@@ -281,10 +281,21 @@ pub(super) fn sdpa_2pass_min_len() -> usize {
     })
 }
 
+/// Clés de KV par bloc split-K (passe 1). Override : `SARAGOSSA_RUST_SDPA_2PASS_KEYS_PER_BLOCK`.
+fn sdpa_2pass_keys_per_block() -> usize {
+    static KEYS: OnceLock<usize> = OnceLock::new();
+    *KEYS.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_SDPA_2PASS_KEYS_PER_BLOCK")
+            .and_then(|value| value.parse().ok())
+            .filter(|keys| *keys > 0)
+            .unwrap_or(128)
+    })
+}
+
 /// Nombre de blocs split-K pour la SDPA 2-passes : multiple de 32 (requis par la
 /// réduction passe-2 `blocks/32`), ≈ `len/128`, borné `[32, 1024]`.
 pub(super) fn sdpa_2pass_blocks(len: usize) -> usize {
-    let raw = (len / 128).max(1);
+    let raw = (len / sdpa_2pass_keys_per_block()).max(1);
     let rounded = raw.div_ceil(32) * 32;
     rounded.clamp(32, 1024)
 }

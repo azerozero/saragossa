@@ -364,6 +364,18 @@ pub(crate) fn mtp_gpu_block_enabled() -> bool {
 /// (cf. [`crate::decoder::mtp_adaptive`]). La séquence générée reste byte-identique
 /// (le vérifieur trunk exact décide *lesquels* des tokens proposés sont acceptés,
 /// pas *combien* on en propose).
+/// Drafts par pas du lookup n-grammes (`decoder::lookup`), 0 = désactivé (défaut).
+/// `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=8` propose jusqu'à 8 tokens quand le suffixe
+/// courant s'est déjà vu ; borné à 15 (16 lignes de vérification au plus).
+pub(super) fn mtp_lookup_draft_tokens() -> usize {
+    static DRAFT: OnceLock<usize> = OnceLock::new();
+    *DRAFT.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MTP_LOOKUP_DRAFT")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map_or(0, |value| value.min(15))
+    })
+}
+
 pub(super) fn mtp_adaptive_depth_enabled() -> bool {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     if let Some(case) = pairwise::current() {

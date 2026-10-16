@@ -16,7 +16,7 @@ fn small_m_qmm_microbench() -> Result<()> {
         ("o_proj 6144->5120", 5120, 6144),
         ("lm_head 5120->248320", 248_320, 5120),
     ];
-    let widths = [1_usize, 2, 3, 4, 6, 8, 12, 16];
+    let widths = [1_usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
     let time_dispatch = |encode: &dyn Fn(&ComputeCommandEncoderRef) -> Result<()>| -> Result<f64> {
         let mut ms = Vec::new();
         for _ in 0..7 {
@@ -39,10 +39,10 @@ fn small_m_qmm_microbench() -> Result<()> {
             "small_m_weight",
         )?;
         let bytes = (out_dim * in_dim / 2) as f64;
-        let lhs16: Vec<f32> = (0..16 * in_dim)
+        let lhs_all: Vec<f32> = (0..64 * in_dim)
             .map(|i| ((i % 23) as f32 - 11.0) * 0.01)
             .collect();
-        let lhs16_buf = executor.upload_f32_buffer(&lhs16, "small_m_lhs16")?;
+        let lhs16_buf = executor.upload_f32_buffer(&lhs_all[..16 * in_dim], "small_m_lhs16")?;
         let out16 = executor.uncached_f32_buffer(16 * out_dim, "small_m_out16")?;
         let m16 = time_dispatch(&|enc| {
             executor
@@ -52,7 +52,7 @@ fn small_m_qmm_microbench() -> Result<()> {
         eprintln!("{label} ({:.0} MB u4)", bytes / 1e6);
         for m in widths {
             let kernel = executor.select_owned_affine_matmul_kernel(m, in_dim, &affine, false);
-            let lhs_buf = executor.upload_f32_buffer(&lhs16[..m * in_dim], "small_m_lhs")?;
+            let lhs_buf = executor.upload_f32_buffer(&lhs_all[..m * in_dim], "small_m_lhs")?;
             let out = executor.uncached_f32_buffer(m * out_dim, "small_m_out")?;
             let ms = time_dispatch(&|enc| {
                 executor

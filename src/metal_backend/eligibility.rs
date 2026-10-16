@@ -212,7 +212,7 @@ pub(super) fn can_use_qmm_na_fused_tiled_u8_buffers(
     bits: usize,
 ) -> bool {
     qmm_na_fused_tiled_enabled()
-        && batch >= 16
+        && batch >= qmm_na_min_batch()
         && out_dim % 64 == 0
         && bits == 8
         && matches!(group_size, FAST_QMV_GROUP_SIZE | QMM_NA_GS128_GROUP_SIZE)
@@ -248,7 +248,7 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_buffers(
 ) -> bool {
     qmm_na_fused_tiled_enabled()
         && qmm_na_fused_tiled_u4_enabled()
-        && batch >= 16
+        && batch >= qmm_na_min_batch()
         && out_dim % 64 == 0
         && out_dim >= 2048
         && in_dim >= 2048
@@ -284,7 +284,7 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_align64_buffers(
 ) -> bool {
     qmm_na_fused_tiled_enabled()
         && qmm_na_fused_tiled_u4_enabled()
-        && batch >= 16
+        && batch >= qmm_na_min_batch()
         && out_dim % 64 == 0
         && out_dim >= 2048
         && in_dim >= 2048
@@ -322,7 +322,7 @@ pub(super) fn can_use_qmm_na_u8(
     weight: &AffineQuantizedTensor,
 ) -> bool {
     qmm_na_enabled()
-        && batch >= 16
+        && batch >= qmm_na_min_batch()
         && weight.bits() == 8
         && weight.group_size() == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
@@ -339,7 +339,7 @@ pub(super) fn can_use_qmm_na_u8_gs128_buffers(
     bits: usize,
 ) -> bool {
     qmm_na_gs128_enabled()
-        && batch >= 16
+        && batch >= qmm_na_min_batch()
         && out_dim % 32 == 0
         && bits == 8
         && group_size == QMM_NA_GS128_GROUP_SIZE
@@ -636,4 +636,22 @@ pub(super) fn can_fuse_shared_gate_up_buffers(
         ) if *gate_bits == 8 || *up_bits == 8 => fused_shared_gate_up_u8_enabled(),
         _ => true,
     }
+}
+
+/// Largeur minimale (lignes) pour router un matmul quantifié vers le GEMM NA
+/// tensor-core plutôt que le qmv répliqué. Override : `SARAGOSSA_RUST_QMM_NA_MIN_BATCH`.
+///
+/// MESURE (`small_m_qmm_microbench`, M5 Max, formes du 27B u4 gs64, 2026-10-16) : le
+/// GEMM NA coûte un temps constant (gate/up 1,25 ms, down 2,0, qkv 0,77, o_proj 0,74)
+/// que le qmv répliqué ne dépasse qu'à partir de 32 lignes sur gate/up et qkv, 48 sur
+/// down et o_proj ; seul le lm_head (636 Mo) préfère le NA dès 16. À 16 lignes, l'ancien
+/// seuil coûtait 2,6 ms de plus par couche sur le MLP (vérification M=16 : 366 ms).
+pub(super) fn qmm_na_min_batch() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_NA_MIN_BATCH")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|min| *min >= 2)
+            .unwrap_or(32)
+    })
 }
