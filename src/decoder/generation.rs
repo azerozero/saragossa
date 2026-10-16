@@ -1236,6 +1236,9 @@ impl CausalDecoder {
         // lu par `mtp_fresh_cache_enabled` jusqu'à la fin de cette génération.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _mtp_history = crate::runtime_flags::MtpHistoryForPrompt::enter(prompt.len());
+        // Un draft plus long que la génération restante est inutile et dépasserait
+        // la capacité résidente (`draft_indices`, dimensionnée sur `max_new_tokens`).
+        let max_draft_tokens = max_draft_tokens.min(max_new_tokens);
 
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let trace_setup = mtp_setup_trace_enabled();
@@ -3281,6 +3284,25 @@ impl CausalDecoder {
     /// qui la suit. Même calcul que [`Self::mtp_forward_post_hidden`] répété, sans
     /// le MLP final dont seul le cache K/V d'attention importe ici.
     fn seed_mtp_history_batched(
+        &self,
+        states: &[f32],
+        tokens: &[usize],
+        history: &mut LayerKvCache,
+    ) -> Result<()> {
+        // Par blocs : l'attention CPU du bloc matérialise ses scores (lignes du
+        // bloc × positions vues), un bloc unique de 8k tokens coûtait 130 s.
+        const SEED_CHUNK: usize = 64;
+        let hidden = self.final_norm.data().len();
+        for (states, tokens) in states
+            .chunks(SEED_CHUNK.saturating_mul(hidden).max(1))
+            .zip(tokens.chunks(SEED_CHUNK))
+        {
+            self.seed_mtp_history_chunk(states, tokens, history)?;
+        }
+        Ok(())
+    }
+
+    fn seed_mtp_history_chunk(
         &self,
         states: &[f32],
         tokens: &[usize],

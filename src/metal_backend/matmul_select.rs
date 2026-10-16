@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum AffineMatmulKernel {
     Qmm2,
     QmmNaFusedTiledU4,
