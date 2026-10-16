@@ -1529,6 +1529,40 @@ fn affine_qmv_u3_gs64_dequantizes_like_cpu_bit_exact() -> Result<()> {
 }
 
 #[test]
+#[ignore = "kernel opt-in : SARAGOSSA_RUST_QMM8=1 cargo test --all-features qmm8 -- --ignored"]
+fn affine_qmm8_u4_gs64_matches_qmv_bit_exact_for_3_to_31_rows() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let in_dim = 1024_usize;
+    let out_dim = 40_usize;
+    let weight = test_affine_varied(out_dim, in_dim)?;
+    assert!(matches!(
+        executor.select_owned_affine_matmul_kernel(8, in_dim, &weight, false),
+        AffineMatmulKernel::Qmm8
+    ));
+    assert!(!matches!(
+        executor.select_owned_affine_matmul_kernel(2, in_dim, &weight, false),
+        AffineMatmulKernel::Qmm8
+    ));
+    for batch in [3_usize, 5, 8, 9, 16, 31] {
+        let mut lhs = Vec::with_capacity(batch * in_dim);
+        let mut expected = Vec::with_capacity(batch * out_dim);
+        for row in 0..batch {
+            let values = varied_row(in_dim, 101 + row);
+            let reference = executor
+                .matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], values.clone())?, &weight)?;
+            expected.extend_from_slice(reference.data());
+            lhs.extend_from_slice(&values);
+        }
+        let actual =
+            executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![batch, in_dim], lhs)?, &weight)?;
+        assert_bits_equal(actual.data(), &expected, &format!("qmm8 u4 batch={batch}"));
+    }
+    Ok(())
+}
+
+#[test]
 fn affine_qmm2_u3_gs64_matches_two_qmv_bit_exact() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());

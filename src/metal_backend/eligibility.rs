@@ -129,6 +129,49 @@ pub(super) fn can_use_fast_affine_qmv_u3(
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
+/// Kernel u4 gs64 à huit lignes (`affine_qmm8_fast_aligned_u4_gs64_f32`) pour les
+/// largeurs 3 à `qmm_na_min_batch() - 1` : les poids d'un bloc sont lus une fois
+/// pour huit lignes au lieu d'une fois par ligne (qmv répliqué). **Opt-in**
+/// (`SARAGOSSA_RUST_QMM8=1`), résultat négatif mesuré le 2026-10-16
+/// (`small_m_qmm_microbench`, M5 Max) : bit à bit identique au qmv mais environ
+/// trois fois le coût d'un qmv M=1 quelle que soit la largeur (chaque thread
+/// sérialise huit lignes de calcul), alors que le qmv répliqué est servi par le
+/// cache système ; en défaut il ramenait le decode D2 (3 lignes) de 50 à 30 tok/s.
+/// Un kernel « skinny » rentable passera par les unités matricielles.
+pub(super) fn can_use_fast_affine_qmm8_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    qmm8_enabled()
+        && fast_affine_qmv_enabled(out_dim)
+        && batch >= 3
+        && batch < qmm_na_min_batch()
+        && bits == FAST_QMV_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 512 == 0
+        && out_dim % 8 == 0
+}
+
+pub(super) fn can_use_fast_affine_qmm8(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_fast_affine_qmm8_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
+        && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
+fn qmm8_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMM8", false))
+}
+
 pub(super) fn can_use_fast_affine_qmm2(
     batch: usize,
     in_dim: usize,

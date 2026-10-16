@@ -2269,6 +2269,110 @@ kernel void affine_qmm2_fast_aligned_u4_gs64_f32(
     }
 }
 
+// Variante à ROWS=8 lignes de `affine_qmm2_fast_aligned_u4_gs64_f32` : un
+// threadgroup traite 8 lignes de lhs (tile.x) pour 8 lignes de poids (tile.y),
+// les poids d'un bloc sont décodés une fois puis appliqués aux 8 lignes. Même
+// ordre d'accumulation que le qmv : résultats identiques bit à bit. Les
+// lignes au-delà de `batch` (dernier bloc partiel) sont ignorées.
+kernel void affine_qmm8_fast_aligned_u4_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    constant uint& batch [[buffer(6)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    constexpr uint ROWS = 8u;
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_thread = 16u;
+    const uint block_size = values_per_thread * 32u;
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+    const uint m_base = tile.x * ROWS;
+    if (m_base >= batch) { return; }
+    const uint rows_here = min(ROWS, batch - m_base);
+
+    const uint row_bytes = packed_cols * 4u;
+    const uint scale_step_per_thread = 4u;
+    const device uchar* ws = ((const device uchar*)packed) +
+        row_base * row_bytes + simd_lid * 8u;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / scale_step_per_thread;
+    const device float* x = lhs + m_base * in_dim + simd_lid * values_per_thread;
+
+    float acc[4][ROWS];
+    for (uint row = 0u; row < 4u; ++row) {
+        for (uint m = 0u; m < ROWS; ++m) { acc[row][m] = 0.0f; }
+    }
+    // Les lignes de lhs au-delà de `batch` recalculent la dernière ligne valide
+    // (coût du seul bloc partiel), leurs résultats ne sont pas écrits.
+    const uint last_row = rows_here - 1u;
+    for (uint k = 0u; k < in_dim; k += block_size) {
+        // 4 lignes de poids × 4 mots de 16 bits : lus une fois, gardés en registres.
+        ushort words[4][4];
+        float scale[4];
+        float bias[4];
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            const device ushort* w16 = (const device ushort*)(ws + row * row_bytes);
+            words[row][0] = w16[0];
+            words[row][1] = w16[1];
+            words[row][2] = w16[2];
+            words[row][3] = w16[3];
+            scale[row] = scale_base[row * groups];
+            bias[row] = bias_base[row * groups];
+        }
+        for (uint m = 0u; m < ROWS; ++m) {
+            const device float* xm = x + min(m, last_row) * in_dim;
+            float xt[16];
+            float sum = 0.0f;
+            for (uint i = 0u; i < values_per_thread; i += 4u) {
+                const float x0 = xm[i];
+                const float x1 = xm[i + 1u];
+                const float x2 = xm[i + 2u];
+                const float x3 = xm[i + 3u];
+                sum += x0 + x1 + x2 + x3;
+                xt[i] = x0;
+                xt[i + 1u] = x1 / 16.0f;
+                xt[i + 2u] = x2 / 256.0f;
+                xt[i + 3u] = x3 / 4096.0f;
+            }
+            for (uint row = 0u; row < results_per_simdgroup; ++row) {
+                float accum = 0.0f;
+                for (uint i = 0u; i < 4u; ++i) {
+                    const ushort word = words[row][i];
+                    accum += xt[4u * i] * float(word & 0x000fu);
+                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
+                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
+                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                }
+                acc[row][m] += scale[row] * accum + sum * bias[row];
+            }
+        }
+        ws += 256u;
+        scale_base += 8u;
+        bias_base += 8u;
+        x += block_size;
+    }
+
+    for (uint row = 0u; row < results_per_simdgroup; ++row) {
+        for (uint m = 0u; m < ROWS; ++m) {
+            const float reduced = simd_sum(acc[row][m]);
+            if (simd_lid == 0u && m < rows_here) {
+                out[(m_base + m) * out_dim + row_base + row] = reduced;
+            }
+        }
+    }
+}
+
 kernel void affine_qmm2_fast_aligned_u3_gs64_f32(
     device const float* lhs [[buffer(0)]],
     device const uint* packed [[buffer(1)]],
