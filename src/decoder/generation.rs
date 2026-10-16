@@ -7,10 +7,10 @@ use crate::sampling::{
 #[cfg(feature = "devtools")]
 use crate::DFlashDraft;
 
-use super::attention_ops::full_attention_context_cached;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use super::attention_ops::AttentionLayout;
-use super::mtp::concat_row_pair;
+use super::attention_ops::{full_attention_context_cached, full_attention_context_prefill};
+use super::mtp::{concat_row_pair, concat_rows};
 use super::mtp_adaptive::AdaptiveDepthController;
 use super::*;
 
@@ -2509,6 +2509,7 @@ impl CausalDecoder {
                 *final_state = target_state;
                 accepted_all = false;
                 if position + 1 < verify_tokens.len() {
+                    stats.rollbacks += 1;
                     let replay_len = position + 1;
                     #[cfg(all(target_os = "macos", feature = "metal"))]
                     if let Some(captures) = resident_captures.as_ref() {
@@ -2545,6 +2546,7 @@ impl CausalDecoder {
                 if generated.len() >= max_new_tokens {
                     accepted_all = false;
                     if position + 1 < verify_tokens.len() {
+                        stats.rollbacks += 1;
                         let replay_len = position + 1;
                         #[cfg(all(target_os = "macos", feature = "metal"))]
                         if let Some(captures) = resident_captures.as_ref() {
@@ -2577,6 +2579,7 @@ impl CausalDecoder {
                 *final_state = target_state;
                 accepted_all = false;
                 if position + 1 < verify_tokens.len() {
+                    stats.rollbacks += 1;
                     let replay_len = position + 1;
                     #[cfg(all(target_os = "macos", feature = "metal"))]
                     if let Some(captures) = resident_captures.as_ref() {
@@ -3163,7 +3166,7 @@ impl CausalDecoder {
         }
         let state = self.prefill_cache_state_uncached_inner(prompt)?;
         if prefix_cache_enabled() {
-            self.prefix_cache_put(prompt, &state)?;
+            self.prefix_cache_put(prompt, &state, None)?;
         }
         Ok(state)
     }
@@ -3196,6 +3199,11 @@ impl CausalDecoder {
     ) -> Result<(CausalDecoderCache, Tensor, LayerKvCache)> {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
+        }
+        if prefix_cache_enabled() {
+            if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt)? {
+                return Ok(hit);
+            }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let trace_setup = mtp_setup_trace_enabled();
@@ -3248,23 +3256,123 @@ impl CausalDecoder {
         }
         let t_history = trace_setup.then(Instant::now);
         let mut mtp_history = LayerKvCache::default();
-        for index in 0..prompt.len().saturating_sub(1) {
-            let state = Tensor::row(final_states.row_slice(index)?.to_vec())?;
-            let token_id = prompt[index + 1];
-            let position = mtp_history.len();
-            let _ = self.mtp_forward_post_hidden(&state, token_id, position, &mut mtp_history)?;
-        }
+        let seeded = prompt.len().saturating_sub(1);
+        let hidden = self.final_norm.data().len();
+        self.seed_mtp_history_batched(
+            &final_states.data()[..seeded * hidden],
+            &prompt[1..],
+            &mut mtp_history,
+        )?;
         if let Some(t) = t_history {
             eprintln!(
-                "mtp_setup prefill_mtp_history_us={} steps={}",
-                t.elapsed().as_micros(),
-                prompt.len().saturating_sub(1)
+                "mtp_setup prefill_mtp_history_us={} steps={seeded}",
+                t.elapsed().as_micros()
             );
         }
-        Ok((cache, final_state, mtp_history))
+        let state = (cache, final_state);
+        if prefix_cache_enabled() {
+            self.prefix_cache_put(prompt, &state, Some(&mtp_history))?;
+        }
+        Ok((state.0, state.1, mtp_history))
+    }
+
+    /// Sème l'historique MTP committed en un forward batché de la tête : la ligne
+    /// `i` de `states` (état final normé d'une position) est appariée au token `i`
+    /// qui la suit. Même calcul que [`Self::mtp_forward_post_hidden`] répété, sans
+    /// le MLP final dont seul le cache K/V d'attention importe ici.
+    fn seed_mtp_history_batched(
+        &self,
+        states: &[f32],
+        tokens: &[usize],
+        history: &mut LayerKvCache,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let head = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| InferError::Config("forward MTP sans tête chargée".to_string()))?;
+        let hidden = self.final_norm.data().len();
+        if states.len() != tokens.len() * hidden {
+            return Err(InferError::Dimension(format!(
+                "semis MTP : {} états pour {} tokens",
+                states.len() / hidden.max(1),
+                tokens.len()
+            )));
+        }
+        let runtime = self.forward_runtime();
+        let eps = self.config.rms_eps;
+        let states = Tensor::from_vec(vec![tokens.len(), hidden], states.to_vec())?;
+        let embedding = rms_norm(
+            &self.embed_scaled(tokens)?,
+            &head.pre_fc_norm_embedding,
+            eps,
+        )?;
+        let hidden = rms_norm(&states, &head.pre_fc_norm_hidden, eps)?;
+        let x = head
+            .fc
+            .forward_with_runtime(&concat_rows(&embedding, &hidden)?, runtime)?;
+        let normed = rms_norm(&x, &head.layer.input_norm, eps)?;
+        let position = history.len();
+        let _ = full_attention_context_prefill(
+            &self.config,
+            &normed,
+            history,
+            position,
+            &head.layer.attention,
+            runtime,
+        )?;
+        Ok(())
     }
 
     fn prefix_cache_get(&self, prompt: &[usize]) -> Result<Option<(CausalDecoderCache, Tensor)>> {
+        let Some((mut output, cached_len, _)) = self.prefix_cache_hit(prompt, false)? else {
+            return Ok(None);
+        };
+        if cached_len < prompt.len() {
+            self.extend_prefix_cache_suffix(&mut output, &prompt[cached_len..])?;
+            self.prefix_cache_put(prompt, &output, None)?;
+        }
+        Ok(Some(output))
+    }
+
+    /// Variante committed de [`Self::prefix_cache_get`] : exige une entrée avec
+    /// historique MTP et prolonge cet historique sur le suffixe avec les états
+    /// finaux du forward d'extension (l'état de la dernière position couverte est
+    /// l'état final de l'entrée).
+    fn prefix_cache_get_with_mtp_history(
+        &self,
+        prompt: &[usize],
+    ) -> Result<Option<(CausalDecoderCache, Tensor, LayerKvCache)>> {
+        let Some((mut output, cached_len, Some(mut history))) =
+            self.prefix_cache_hit(prompt, true)?
+        else {
+            return Ok(None);
+        };
+        if cached_len < prompt.len() {
+            let suffix = &prompt[cached_len..];
+            let final_states = self.next_final_states_batched(&mut output.0, suffix)?;
+            let hidden = self.final_norm.data().len();
+            let mut states = output.1.data().to_vec();
+            states.extend_from_slice(&final_states.data()[..(suffix.len() - 1) * hidden]);
+            self.seed_mtp_history_batched(&states, suffix, &mut history)?;
+            output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
+            self.prefix_cache_put(prompt, &output, Some(&history))?;
+        }
+        Ok(Some((output.0, output.1, history)))
+    }
+
+    /// Plus longue entrée du prefix cache couvrant un préfixe de `prompt`, état
+    /// linear-attn Metal restauré. Renvoie l'état, la longueur couverte et
+    /// l'historique MTP s'il a été enregistré ; `with_mtp_history` rend une entrée
+    /// sans historique invisible.
+    #[allow(clippy::type_complexity)]
+    fn prefix_cache_hit(
+        &self,
+        prompt: &[usize],
+        with_mtp_history: bool,
+    ) -> Result<Option<((CausalDecoderCache, Tensor), usize, Option<LayerKvCache>)>> {
         let mut cache = self
             .prefix_cache
             .lock()
@@ -3272,9 +3380,23 @@ impl CausalDecoder {
         let Some(index) = longest_prefix_entry_index(&cache.entries, prompt) else {
             return Ok(None);
         };
+        if with_mtp_history && cache.entries[index].mtp_history.is_none() {
+            return Ok(None);
+        }
+        // ponytail: l'extension d'un préfixe passe par le forward per-op (~19 ms par
+        // token sur 27B 4 bits) contre ~6 ms par token pour le prefill résident
+        // complet : au-delà d'un tiers du prompt à recalculer, repartir de zéro est
+        // plus rapide. À remplacer par un prefill résident à offset de position.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if prefill_resident_enabled()
+            && (prompt.len() - cache.entries[index].tokens.len()) * 3 > prompt.len()
+        {
+            return Ok(None);
+        }
         let entry = cache.entries.remove(index);
         let cached_len = entry.tokens.len();
         let mut output = (entry.cache.clone(), entry.final_state.clone());
+        let history = entry.mtp_history.clone();
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let linear_metal_entry = entry.linear_metal.clone();
         cache.entries.insert(0, entry);
@@ -3285,12 +3407,7 @@ impl CausalDecoder {
             let linear_metal = self.copy_prefix_cache_linear_metal(&linear_metal_entry)?;
             self.restore_prefix_cache_linear_metal(&mut output.0, linear_metal)?;
         }
-
-        if cached_len < prompt.len() {
-            self.extend_prefix_cache_suffix(&mut output, &prompt[cached_len..])?;
-            self.prefix_cache_put(prompt, &output)?;
-        }
-        Ok(Some(output))
+        Ok(Some((output, cached_len, history)))
     }
 
     fn extend_prefix_cache_suffix(
@@ -3375,6 +3492,7 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
         state: &(CausalDecoderCache, Tensor),
+        mtp_history: Option<&LayerKvCache>,
     ) -> Result<()> {
         let capacity = prefix_cache_capacity();
         if capacity == 0 {
@@ -3386,12 +3504,16 @@ impl CausalDecoder {
             .prefix_cache
             .lock()
             .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+        // Une entrée identique déjà semée garde son historique si le nouvel état
+        // vient du chemin AR ou fresh.
+        let mut mtp_history = mtp_history.cloned();
         if let Some(index) = cache
             .entries
             .iter()
             .position(|entry| entry.tokens == prompt)
         {
-            cache.entries.remove(index);
+            let previous = cache.entries.remove(index);
+            mtp_history = mtp_history.or(previous.mtp_history);
         }
         cache.entries.insert(
             0,
@@ -3399,6 +3521,7 @@ impl CausalDecoder {
                 tokens: prompt.to_vec(),
                 cache: state.0.clone(),
                 final_state: state.1.clone(),
+                mtp_history,
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 linear_metal,
             },

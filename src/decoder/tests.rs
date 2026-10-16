@@ -435,6 +435,7 @@ fn prefix_cache_selects_longest_append_prefix() {
             tokens: vec![1, 2],
             cache: model.empty_cache(),
             final_state: final_state.clone(),
+            mtp_history: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             linear_metal: Vec::new(),
         },
@@ -442,6 +443,7 @@ fn prefix_cache_selects_longest_append_prefix() {
             tokens: vec![1, 2, 3],
             cache: model.empty_cache(),
             final_state: final_state.clone(),
+            mtp_history: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             linear_metal: Vec::new(),
         },
@@ -449,6 +451,7 @@ fn prefix_cache_selects_longest_append_prefix() {
             tokens: vec![1],
             cache: model.empty_cache(),
             final_state,
+            mtp_history: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             linear_metal: Vec::new(),
         },

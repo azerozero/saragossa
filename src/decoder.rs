@@ -1172,6 +1172,9 @@ struct PrefixCacheEntry {
     tokens: Vec<usize>,
     cache: CausalDecoderCache,
     final_state: Tensor,
+    // Historique MTP committed semé sur `tokens` ; absent si l'entrée vient du
+    // chemin AR ou fresh. Le chemin committed l'exige pour un hit.
+    mtp_history: Option<LayerKvCache>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     linear_metal: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
 }
@@ -1187,7 +1190,14 @@ impl PrefixCacheEntry {
                 self.final_state
                     .len()
                     .saturating_mul(std::mem::size_of::<f32>()),
-            );
+            )
+            .saturating_add(self.mtp_history.as_ref().map_or(0, |history| {
+                history
+                    .keys
+                    .len()
+                    .saturating_add(history.values.len())
+                    .saturating_mul(std::mem::size_of::<f32>())
+            }));
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             bytes = bytes.saturating_add(

@@ -123,6 +123,23 @@ impl MtpHead {
     }
 }
 
+/// Concatène ligne à ligne deux matrices de même hauteur : `[n, a] ++ [n, b] -> [n, a+b]`.
+pub(super) fn concat_rows(left: &Tensor, right: &Tensor) -> Result<Tensor> {
+    let (rows, a) = left.as_matrix()?;
+    let (rows_right, b) = right.as_matrix()?;
+    if rows != rows_right {
+        return Err(InferError::Dimension(format!(
+            "concat_rows: {rows} lignes contre {rows_right}"
+        )));
+    }
+    let mut out = Vec::with_capacity(rows * (a + b));
+    for row in 0..rows {
+        out.extend_from_slice(left.row_slice(row)?);
+        out.extend_from_slice(right.row_slice(row)?);
+    }
+    Tensor::from_vec(vec![rows, a + b], out)
+}
+
 pub(super) fn concat_row_pair(left: &Tensor, right: &Tensor) -> Result<Tensor> {
     let left = left.as_row()?;
     let right = right.as_row()?;
@@ -436,7 +453,20 @@ fn infer_mtp_affine_layout(
 
 #[cfg(test)]
 mod tests {
-    use super::{infer_mtp_affine_layout, normalize_mtp_sidecar_key};
+    use super::{concat_rows, infer_mtp_affine_layout, normalize_mtp_sidecar_key};
+    use crate::tensor::Tensor;
+
+    #[test]
+    fn concat_rows_interleaves_each_row() {
+        let left = Tensor::from_vec(vec![2, 2], vec![1.0, 2.0, 5.0, 6.0])
+            .expect("invariant: forme valide");
+        let right = Tensor::from_vec(vec![2, 1], vec![3.0, 7.0]).expect("invariant: forme valide");
+        let out = concat_rows(&left, &right).expect("invariant: hauteurs égales");
+        assert_eq!(out.shape(), &[2, 3]);
+        assert_eq!(out.data(), &[1.0, 2.0, 3.0, 5.0, 6.0, 7.0]);
+        let short = Tensor::from_vec(vec![1, 1], vec![0.0]).expect("invariant: forme valide");
+        assert!(concat_rows(&left, &short).is_err());
+    }
 
     #[test]
     fn normalizes_bare_quantized_fc_sidecar_keys() {
