@@ -23,11 +23,15 @@ fn small_m_qmm_microbench() -> Result<()> {
             let cb = executor.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             let g = EncoderEndGuard::new(enc);
-            encode(enc)?;
+            // Dix dispatches par command buffer : la latence de soumission
+            // (~0,2 ms) ne compte qu'une fois.
+            for _ in 0..10 {
+                encode(enc)?;
+            }
             g.end();
             let t = std::time::Instant::now();
             commit_and_wait(cb)?;
-            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            ms.push(t.elapsed().as_secs_f64() * 100.0);
         }
         ms.sort_by(|a, b| a.partial_cmp(b).expect("invariant: temps fini"));
         Ok(ms[3])

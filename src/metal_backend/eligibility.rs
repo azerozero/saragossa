@@ -133,7 +133,7 @@ pub(super) fn can_use_fast_affine_qmv_u3(
 /// largeurs 3 à `qmm_na_min_batch() - 1` : les poids d'un bloc sont lus une fois
 /// pour huit lignes au lieu d'une fois par ligne (qmv répliqué). **Opt-in**
 /// (`SARAGOSSA_RUST_QMM8=1`), résultat négatif mesuré le 2026-10-16
-/// (`small_m_qmm_microbench`, M5 Max) : bit à bit identique au qmv mais environ
+/// (`small_m_qmm_microbench`, M5 Max) : égal au qmv à quelques ULP mais environ
 /// trois fois le coût d'un qmv M=1 quelle que soit la largeur (chaque thread
 /// sérialise huit lignes de calcul), alors que le qmv répliqué est servi par le
 /// cache système ; en défaut il ramenait le decode D2 (3 lignes) de 50 à 30 tok/s.
@@ -165,6 +165,70 @@ pub(super) fn can_use_fast_affine_qmm8(
     };
     can_use_fast_affine_qmm8_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
+/// GEMM « skinny » u4 gs64 sur unités matricielles (`gemm_nax_skinny_u4_x3`,
+/// `na_gemm.metal`) pour les largeurs de `qmm_skinny_min_batch()` à
+/// `qmm_na_min_batch() - 1` (vérification spéculative large) : les poids d'une
+/// tuile sont dé-quantifiés une fois pour seize lignes au lieu d'un qmv par ligne.
+/// Mesuré le 2026-10-16 (M5 Max, `small_m_qmm_microbench`) : gate/up M=8 0,19 ms
+/// contre 0,30 en qmv répliqué, lm_head 2,4 contre 4,4 ; rentable dès 5 lignes,
+/// d'où le défaut de `SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH`. Le défaut D2 fusionné
+/// (3 lignes) n'est pas concerné. Précision : A et B scindés en bf16 hi+lo, trois
+/// MMA, écart 1e-5 de l'échelle (classe f32, sorties greedy identiques sur les
+/// prompts de campagne). `SARAGOSSA_RUST_QMM_SKINNY_KERNEL=bf16` prend la variante
+/// à un seul MMA (gate/up 0,14 ms, lm_head 1,8) au prix d'un écart 5e-3.
+/// `SARAGOSSA_RUST_QMM_SKINNY=0` rétablit le qmv répliqué.
+pub(super) fn can_use_qmm_skinny_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    qmm_skinny_enabled()
+        && fast_affine_qmv_enabled(out_dim)
+        && batch >= qmm_skinny_min_batch()
+        && batch < qmm_na_min_batch()
+        && bits == FAST_QMV_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 512 == 0
+        && out_dim % 32 == 0
+}
+
+pub(super) fn can_use_qmm_skinny(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_qmm_skinny_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
+        && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
+fn qmm_skinny_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMM_SKINNY", true))
+}
+
+pub(super) fn qmm_skinny_bf16() -> bool {
+    static BF16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BF16.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_SKINNY_KERNEL")
+            .is_some_and(|value| value.trim() == "bf16")
+    })
+}
+
+pub(super) fn qmm_skinny_min_batch() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|min| *min >= 2)
+            .unwrap_or(5)
+    })
 }
 
 fn qmm8_enabled() -> bool {

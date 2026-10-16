@@ -330,6 +330,14 @@ pub(super) fn linear_delta_dk128_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_DELTA_DK128", true))
 }
 
+/// Vérification MTP : conv/normes/gates et rms-gate batchés sur les lignes du
+/// draft (kernels du prefill) au lieu d'une boucle de dispatches par ligne.
+/// `SARAGOSSA_RUST_LINEAR_ROWS_BATCHED=0` rétablit la boucle (repli A/B).
+pub(super) fn linear_rows_batched_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_ROWS_BATCHED", true))
+}
+
 pub(super) fn linear_delta_tg_rows() -> u64 {
     static ROWS: OnceLock<u64> = OnceLock::new();
     *ROWS.get_or_init(|| linear_delta_tg_rows_override().unwrap_or(4))

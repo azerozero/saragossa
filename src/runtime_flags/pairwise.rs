@@ -26,6 +26,10 @@ pub(crate) struct Case {
     pub p1: bool,
     pub p2: bool,
     pub p3: bool,
+    /// Drafts par lookup n-grammes (0 = tête MTP seule), cf.
+    /// `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT`.
+    #[serde(default)]
+    pub lookup: usize,
 }
 
 impl Default for Case {
@@ -38,6 +42,7 @@ impl Default for Case {
             p1: true,
             p2: false,
             p3: false,
+            lookup: 0,
         }
     }
 }

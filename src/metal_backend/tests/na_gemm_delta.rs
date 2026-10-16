@@ -454,7 +454,23 @@ fn conv_norm_gates_batch_real_perf() -> Result<()> {
     let g = EncoderEndGuard::new(enc);
     for _ in 0..iters {
         executor.encode_linear_attn_conv_norm_gates_k4_dk128_batch(
-            enc, &qkv, &bin, &gin, &cw, &cs, &al, &dtb, &co, &qn, &kn, &bo, &de, batch, spec,
+            enc,
+            &qkv,
+            &bin,
+            &gin,
+            &cw,
+            &cs,
+            &al,
+            &dtb,
+            &co,
+            &qn,
+            &kn,
+            &bo,
+            &de,
+            batch,
+            spec,
+            LinearAttnBatchLayout::contiguous(spec),
+            true,
         )?;
     }
     g.end();

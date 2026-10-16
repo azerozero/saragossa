@@ -120,6 +120,22 @@ Plan validé avant mesure : PW02, PW04, EX14, EX15 et EX16 sur T0, T1 et T2,
   au moins nulle sur les trois entrées.
 - Aucun verdict avant les 360 paires. Les paires du criblage n'y entrent pas.
 
+## Vérification large
+
+Mesures CLI du 16 octobre (M5 Max, Qwen3.8-27B-4bit, sorties identiques) hors
+protocole pairwise : elles ne touchent pas le défaut D2 fusionné (3 lignes).
+
+- Kernel « skinny » u4 sur unités matricielles (`gemm_nax_skinny_u4_x3`) pour
+  les vérifications de 5 à 31 lignes : T0 à draft fixe 8 passe de 28,5 à
+  37,8 tok/s, un appel de vérification à 9 lignes de 140 à 75 ms. Variante
+  `SARAGOSSA_RUST_QMM_SKINNY_KERNEL=bf16` (42,6 tok/s, écart 5e-3) et retrait
+  `SARAGOSSA_RUST_QMM_SKINNY=0`.
+- Couches linear-attention batchées sur les lignes du draft
+  (`SARAGOSSA_RUST_LINEAR_ROWS_BATCHED=0` pour la boucle par ligne) : environ
+  5 ms de moins par vérification à 9 lignes.
+- Lookup n-grammes (`SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=n`, défaut 0) et champ
+  `lookup` des cas pairwise : à rejouer en phase PW05 avec ces kernels.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

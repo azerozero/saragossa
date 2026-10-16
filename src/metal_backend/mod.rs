@@ -47,6 +47,7 @@ mod kernel_timing;
 mod lightbatch_duo;
 mod linear_attention;
 mod linear_attention_encode;
+pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
 mod matmul;
 mod matmul_align64;
@@ -151,6 +152,8 @@ pub struct MetalExecutor {
     affine_qmv_fast_aligned_u6_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u4_gs64_f32: ComputePipelineState,
     affine_qmm8_fast_aligned_u4_gs64_f32: ComputePipelineState,
+    na_gemm_skinny_u4: Option<ComputePipelineState>,
+    na_gemm_skinny_u4_x3: Option<ComputePipelineState>,
     affine_qmm2_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs128_f32: ComputePipelineState,
@@ -190,7 +193,7 @@ pub struct MetalExecutor {
     linear_attn_norm_gates_inv_dk128_f32: ComputePipelineState,
     linear_attn_conv_norm_gates_k4_dk128_f32: ComputePipelineState,
     linear_attn_conv_norm_gates_k4_dk128_batch_f32: ComputePipelineState,
-    linear_attn_conv_state_finalize_f32: ComputePipelineState,
+    linear_attn_conv_state_shift_f32: ComputePipelineState,
     linear_attn_gated_delta_f32: ComputePipelineState,
     linear_attn_gated_delta_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_seq_dk128_tg4_f32: ComputePipelineState,

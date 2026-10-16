@@ -2272,7 +2272,7 @@ kernel void affine_qmm2_fast_aligned_u4_gs64_f32(
 // Variante à ROWS=8 lignes de `affine_qmm2_fast_aligned_u4_gs64_f32` : un
 // threadgroup traite 8 lignes de lhs (tile.x) pour 8 lignes de poids (tile.y),
 // les poids d'un bloc sont décodés une fois puis appliqués aux 8 lignes. Même
-// ordre d'accumulation que le qmv : résultats identiques bit à bit. Les
+// ordre d'accumulation que le qmv, résultats à quelques ULP près. Les
 // lignes au-delà de `batch` (dernier bloc partiel) sont ignorées.
 kernel void affine_qmm8_fast_aligned_u4_gs64_f32(
     device const float* lhs [[buffer(0)]],
@@ -2932,6 +2932,7 @@ static inline float linear_attn_conv_k4_batch_channel(
     device const float* conv_weight,
     device const float* conv_state0,
     uint conv_dim,
+    uint qkv_stride,
     uint channel,
     uint token,
     uint batch
@@ -2942,7 +2943,7 @@ static inline float linear_attn_conv_k4_batch_channel(
         int p = int(token) - 3 + k;
         float x;
         if (p >= 0) {
-            x = qkv[uint(p) * conv_dim + channel];
+            x = qkv[uint(p) * qkv_stride + channel];
         } else {
             x = conv_state0[uint(p + 3) * conv_dim + channel];
         }
@@ -2967,6 +2968,9 @@ kernel void linear_attn_conv_norm_gates_k4_dk128_batch_f32(
     constant uint4& dims [[buffer(12)]],
     constant float2& scales [[buffer(13)]],
     constant uint& batch [[buffer(14)]],
+    // (foulée des lignes qkv, foulée des lignes beta/gate) : conv_dim et
+    // value_heads en prefill, lignes concaténées qkv+z et beta+gate en vérification.
+    constant uint2& strides [[buffer(15)]],
     uint lane [[thread_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]]
 ) {
@@ -2987,19 +2991,21 @@ kernel void linear_attn_conv_norm_gates_k4_dk128_batch_f32(
     const uint qrow = token * key_dim;
     const uint crow = token * conv_dim;
     const uint grow = token * value_heads;
+    const uint qkv_stride = strides.x;
+    const uint gin = token * strides.y;
 
     if (item < key_heads) {
         const uint base = item * 128u;
         const uint l0 = base + lane, l1 = l0 + 32u, l2 = l0 + 64u, l3 = l0 + 96u;
         const uint k0c = key_dim + l0, k1c = key_dim + l1, k2c = key_dim + l2, k3c = key_dim + l3;
-        const float q0 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, l0, token, batch);
-        const float q1 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, l1, token, batch);
-        const float q2 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, l2, token, batch);
-        const float q3 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, l3, token, batch);
-        const float kk0 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, k0c, token, batch);
-        const float kk1 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, k1c, token, batch);
-        const float kk2 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, k2c, token, batch);
-        const float kk3 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, k3c, token, batch);
+        const float q0 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l0, token, batch);
+        const float q1 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l1, token, batch);
+        const float q2 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l2, token, batch);
+        const float q3 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l3, token, batch);
+        const float kk0 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, k0c, token, batch);
+        const float kk1 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, k1c, token, batch);
+        const float kk2 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, k2c, token, batch);
+        const float kk3 = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, k3c, token, batch);
         float q_ss = q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3;
         float k_ss = kk0 * kk0 + kk1 * kk1 + kk2 * kk2 + kk3 * kk3;
         const float q_inv = rsqrt(simd_sum(q_ss) / float(key_head_dim) + 1.0e-6f) * scales.x;
@@ -3017,36 +3023,46 @@ kernel void linear_attn_conv_norm_gates_k4_dk128_batch_f32(
     if (item < value_heads) {
         const uint vbase = (2u * key_dim) + (item * 128u);
         const uint l0 = vbase + lane, l1 = l0 + 32u, l2 = l0 + 64u, l3 = l0 + 96u;
-        conv_out[crow + l0] = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, l0, token, batch);
-        conv_out[crow + l1] = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, l1, token, batch);
-        conv_out[crow + l2] = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, l2, token, batch);
-        conv_out[crow + l3] = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, l3, token, batch);
+        conv_out[crow + l0] = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l0, token, batch);
+        conv_out[crow + l1] = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l1, token, batch);
+        conv_out[crow + l2] = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l2, token, batch);
+        conv_out[crow + l3] = linear_attn_conv_k4_batch_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l3, token, batch);
         if (lane == 0u) {
-            const float b = beta_input[grow + item];
+            const float b = beta_input[gin + item];
             beta[grow + item] = 1.0f / (1.0f + exp(-b));
-            const float dt_arg = gate_input[grow + item] + dt_bias[item];
+            const float dt_arg = gate_input[gin + item] + dt_bias[item];
             const float dt = (dt_arg > 20.0f) ? dt_arg : log(1.0f + exp(dt_arg));
             decay[grow + item] = exp(-exp(a_log[item]) * dt);
         }
     }
 }
 
-// Met conv_state aux 3 derniers tokens de la séquence (état pour le décode suivant).
-// 1 thread/canal. Suppose batch >= 3 (prefill). conv_state[k*cd+c] = qkv[(batch-3+k)*cd+c].
-kernel void linear_attn_conv_state_finalize_f32(
+// Fait glisser conv_state de `batch` tokens : fenêtre des 3 derniers tokens de la
+// séquence, les tokens négatifs venant de l'état d'entrée. `in_place` (dims.w) lit
+// l'état dans state_out même (chaque thread lit ses trois valeurs avant d'écrire) ;
+// sinon state_in est l'état initial et state_out une capture (vérification MTP).
+kernel void linear_attn_conv_state_shift_f32(
     device const float* qkv [[buffer(0)]],
-    device float* conv_state [[buffer(1)]],
-    constant uint2& dims [[buffer(2)]], // (conv_dim, batch)
+    device const float* state_in [[buffer(1)]],
+    device float* state_out [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]], // (conv_dim, batch, qkv_stride, in_place)
     uint gid [[thread_position_in_grid]]
 ) {
     const uint conv_dim = dims.x;
-    const uint batch = dims.y;
-    if (gid >= conv_dim || batch < 3u) {
+    const int batch = int(dims.y);
+    const uint qkv_stride = dims.z;
+    if (gid >= conv_dim) {
         return;
     }
-    conv_state[gid] = qkv[(batch - 3u) * conv_dim + gid];
-    conv_state[conv_dim + gid] = qkv[(batch - 2u) * conv_dim + gid];
-    conv_state[(2u * conv_dim) + gid] = qkv[(batch - 1u) * conv_dim + gid];
+    device const float* src = (dims.w != 0u) ? (device const float*)state_out : state_in;
+    float w[3];
+    for (int k = 0; k < 3; k++) {
+        const int p = batch - 3 + k;
+        w[k] = (p >= 0) ? qkv[uint(p) * qkv_stride + gid] : src[uint(p + 3) * conv_dim + gid];
+    }
+    for (uint k = 0u; k < 3u; k++) {
+        state_out[k * conv_dim + gid] = w[k];
+    }
 }
 
 kernel void linear_attn_gated_delta_f32(
@@ -3622,6 +3638,7 @@ kernel void linear_attn_rms_gate_batch_dv128_f32(
     device float* gated [[buffer(3)]],
     constant uint3& dims [[buffer(4)]],
     constant float& eps [[buffer(5)]],
+    constant uint& z_stride [[buffer(6)]],
     uint lane [[thread_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]]
 ) {
@@ -3649,10 +3666,11 @@ kernel void linear_attn_rms_gate_batch_dv128_f32(
     ss += y3 * y3;
     const float mean = simd_sum(ss) / float(value_head_dim);
     const float inv = rsqrt(mean + eps);
-    const float z0 = z[idx0];
-    const float z1 = z[idx1];
-    const float z2 = z[idx2];
-    const float z3 = z[idx3];
+    const uint zbase = token * z_stride + value_head * 128u + lane;
+    const float z0 = z[zbase];
+    const float z1 = z[zbase + 32u];
+    const float z2 = z[zbase + 64u];
+    const float z3 = z[zbase + 96u];
     gated[idx0] = y0 * inv * norm_weight[lane] * (z0 / (1.0f + exp(-z0)));
     gated[idx1] = y1 * inv * norm_weight[lane + 32u] * (z1 / (1.0f + exp(-z1)));
     gated[idx2] = y2 * inv * norm_weight[lane + 64u] * (z2 / (1.0f + exp(-z2)));

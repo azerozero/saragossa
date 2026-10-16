@@ -368,6 +368,10 @@ pub(crate) fn mtp_gpu_block_enabled() -> bool {
 /// `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=8` propose jusqu'à 8 tokens quand le suffixe
 /// courant s'est déjà vu ; borné à 15 (16 lignes de vérification au plus).
 pub(super) fn mtp_lookup_draft_tokens() -> usize {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.lookup.min(15);
+    }
     static DRAFT: OnceLock<usize> = OnceLock::new();
     *DRAFT.get_or_init(|| {
         env_var("SARAGOSSA_RUST_MTP_LOOKUP_DRAFT")

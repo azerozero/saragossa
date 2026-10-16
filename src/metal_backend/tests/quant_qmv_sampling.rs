@@ -1528,9 +1528,36 @@ fn affine_qmv_u3_gs64_dequantizes_like_cpu_bit_exact() -> Result<()> {
     Ok(())
 }
 
+/// Produit `lhs[batch, in_dim] · Wᵀ` par le vrai sélecteur de kernel
+/// (`encode_matmul_weight_buffers`), contrairement à `matmul_rhs_t_affine` qui a
+/// sa propre chaîne qmv.
+fn matmul_via_selected_kernel(
+    executor: &MetalExecutor,
+    weight: &AffineQuantizedTensor,
+    lhs: &[f32],
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>> {
+    let buffers = executor.resolve_linear_weight_buffers(
+        &LinearWeight::AffineQuantized(weight.clone()),
+        "selected_kernel_weight",
+    )?;
+    let lhs_buf = executor.upload_f32_buffer(lhs, "selected_kernel_lhs")?;
+    let out_buf = executor.uncached_f32_buffer(batch * out_dim, "selected_kernel_out")?;
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let actual_out = executor
+        .encode_matmul_weight_buffers(encoder, &lhs_buf, batch, in_dim, &buffers, &out_buf, false)?;
+    assert_eq!(actual_out, out_dim);
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    read_f32_buffer(&out_buf, batch * out_dim)
+}
+
 #[test]
 #[ignore = "kernel opt-in : SARAGOSSA_RUST_QMM8=1 cargo test --all-features qmm8 -- --ignored"]
-fn affine_qmm8_u4_gs64_matches_qmv_bit_exact_for_3_to_31_rows() -> Result<()> {
+fn affine_qmm8_u4_gs64_matches_qmv_for_3_to_31_rows() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
@@ -1555,9 +1582,56 @@ fn affine_qmm8_u4_gs64_matches_qmv_bit_exact_for_3_to_31_rows() -> Result<()> {
             expected.extend_from_slice(reference.data());
             lhs.extend_from_slice(&values);
         }
-        let actual =
-            executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![batch, in_dim], lhs)?, &weight)?;
-        assert_bits_equal(actual.data(), &expected, &format!("qmm8 u4 batch={batch}"));
+        let actual = matmul_via_selected_kernel(&executor, &weight, &lhs, batch, in_dim, out_dim)?;
+        // Même ordre d'accumulation que le qmv mais fusion FMA différente : à
+        // quelques ULP, pas bit à bit (constaté une fois le test routé par le
+        // sélecteur réel ; `matmul_rhs_t_affine` ne dispatche jamais qmm8).
+        assert_all_close_scaled(&actual, &expected, &format!("qmm8 u4 batch={batch}"));
+    }
+    Ok(())
+}
+
+#[test]
+fn qmm_skinny_u4_gs64_matches_qmv_for_5_to_31_rows() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let in_dim = 1024_usize;
+    let out_dim = 64_usize;
+    let weight = test_affine_varied(out_dim, in_dim)?;
+    if !executor.qmm_skinny_available() {
+        eprintln!("skip: GEMM NA skinny indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    assert!(matches!(
+        executor.select_owned_affine_matmul_kernel(8, in_dim, &weight, false),
+        AffineMatmulKernel::Skinny
+    ));
+    assert!(!matches!(
+        executor.select_owned_affine_matmul_kernel(4, in_dim, &weight, false),
+        AffineMatmulKernel::Skinny
+    ));
+    for batch in [5_usize, 8, 9, 16, 17, 31] {
+        let mut lhs = Vec::with_capacity(batch * in_dim);
+        let mut expected = Vec::with_capacity(batch * out_dim);
+        for row in 0..batch {
+            let values = varied_row(in_dim, 101 + row);
+            let reference = executor
+                .matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], values.clone())?, &weight)?;
+            expected.extend_from_slice(reference.data());
+            lhs.extend_from_slice(&values);
+        }
+        let actual = matmul_via_selected_kernel(&executor, &weight, &lhs, batch, in_dim, out_dim)?;
+        let scale = expected.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let worst = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, e)| (a - e).abs() / scale)
+            .fold(0.0f32, f32::max);
+        // bf16 hi+lo sur A et B, trois MMA : ~1e-5 de l'échelle (le qmv f32
+        // réordonné est à 8e-7) ; 5e-5 laisse la marge d'une autre génération de GPU.
+        eprintln!("qmm skinny batch={batch}: écart max {worst:.2e} de l'échelle");
+        assert!(worst <= 5.0e-5, "qmm skinny u4 batch={batch}: écart {worst:e}");
     }
     Ok(())
 }
