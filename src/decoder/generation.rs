@@ -1243,7 +1243,13 @@ impl CausalDecoder {
         // Lookup n-grammes : drafts sans tête MTP quand le suffixe courant s'est
         // déjà vu. Défaut selon l'historique choisi ci-dessus (committed : 8,
         // fresh : 0), cf. `mtp_lookup_draft_tokens`.
-        let lookup_draft = crate::runtime_flags::mtp_lookup_draft_tokens().min(max_new_tokens);
+        // Greedy seulement : une proposition du lookup n'a pas de distribution de
+        // draft, et la vérification avec température l'exige.
+        let lookup_draft = if options.temperature > f32::EPSILON {
+            0
+        } else {
+            crate::runtime_flags::mtp_lookup_draft_tokens().min(max_new_tokens)
+        };
         let mut lookup = (lookup_draft > 0).then(|| NgramLookup::new(prompt));
         let draft_headroom = max_draft_tokens.max(lookup_draft);
 
@@ -1659,18 +1665,21 @@ impl CausalDecoder {
             };
             #[cfg(not(all(target_os = "macos", feature = "metal")))]
             let mtp_resident = false;
-            if let Some(found) = lookup_drafts.as_ref() {
-                // La préparation résidente ci-dessus reste nécessaire : l'historique
-                // MTP est prolongé après vérification avec les tokens acceptés.
-                drafts = found.clone();
-            }
+            // Avec une proposition du lookup, la tête MTP ne sert qu'à écrire la
+            // ligne KV du token primaire dans l'historique committed : la mise à
+            // jour après vérification tronque à `cycle_mtp_offset + 1` et suppose
+            // cette ligne présente. En fresh il n'y a rien à écrire.
+            let head_depth = match lookup_drafts.as_ref() {
+                Some(_) => usize::from(mtp_history_cache.is_some()),
+                None => step_depth,
+            };
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            if mtp_resident && drafts.is_empty() {
+            if mtp_resident {
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 if let Some(resident_drafts) = self.next_mtp_drafts_resident(
                     &mut cache,
                     draft_token,
-                    step_depth,
+                    head_depth,
                     cycle_mtp_offset,
                 )? {
                     drafts = resident_drafts;
@@ -1679,7 +1688,7 @@ impl CausalDecoder {
                 mtp_profile_record(&mut mtp_step_profile.draft, profile_start);
             }
             if drafts.is_empty() {
-                for position in 0..step_depth {
+                for position in 0..head_depth {
                     let absolute_position = cycle_mtp_offset
                         .checked_add(position)
                         .ok_or_else(|| InferError::Dimension("position MTP déborde".to_string()))?;
@@ -1732,9 +1741,12 @@ impl CausalDecoder {
                     drafts.push(draft);
                     draft_token = draft;
                 }
-            } else {
-                draft_distributions.resize(drafts.len(), None);
             }
+            if let Some(found) = lookup_drafts.as_ref() {
+                drafts = found.clone();
+                draft_distributions.clear();
+            }
+            draft_distributions.resize(drafts.len(), None);
             #[cfg(all(target_os = "macos", feature = "metal"))]
             let profile_start = mtp_profile_start(profile_mtp_steps);
             let verified = self.verify_mtp_drafts_batched(MtpVerify {
