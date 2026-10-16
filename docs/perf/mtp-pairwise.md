@@ -133,8 +133,30 @@ protocole pairwise : elles ne touchent pas le défaut D2 fusionné (3 lignes).
 - Couches linear-attention batchées sur les lignes du draft
   (`SARAGOSSA_RUST_LINEAR_ROWS_BATCHED=0` pour la boucle par ligne) : environ
   5 ms de moins par vérification à 9 lignes.
-- Lookup n-grammes (`SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=n`, défaut 0) et champ
-  `lookup` des cas pairwise : à rejouer en phase PW05 avec ces kernels.
+- Lookup n-grammes (`SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=n`) et champ `lookup` des
+  cas pairwise : mesuré en phase 6, ci-dessous.
+
+## Phase 6 : lookup n-grammes et plafond adaptatif 4
+
+Protocole V5 (contrôle = ligne de matrice, harnais dans l'arbre), 16 octobre,
+`models/pairwise/lookup-plan.md`. Deux facteurs isolés contre le défaut par
+longueur (PW04 fresh sur T0 et T1, PW03 committed sur T6 et T2), 48 paires par
+cellule, 12 A/A, test des signes contre +2 %, Holm8.
+
+| Facteur | T0 (26) | T1 (33) | T6 (424, code) | T2 (732, prose) |
+|---|---:|---:|---:|---:|
+| lookup 8 | −0,1 % | −4,2 % | **+21,2 %** [19,9 ; 23,0] | −0,2 % |
+| plafond 4 | −9,9 % | −23,0 % | −16,2 % | −16,4 % |
+
+- Lookup 8 : sur T6 la sortie recopie le prompt, 9 pas au lieu de 21, tout
+  accepté. Sur T2 et T0 il ne propose jamais, coût nul. Sur T1 une proposition
+  de deux tokens au dernier pas vaut moins que la tête MTP et coûte une
+  vérification. Décision : actif par défaut quand l'historique MTP est committed
+  (prompt au-delà de `SARAGOSSA_RUST_MTP_FRESH_MAX_PROMPT`, 128 tokens), inactif
+  en fresh ; la variable force la valeur dans les deux cas.
+- Plafond 4 : perte partout, même adaptatif. Reste à 2.
+- Kernel skinny bf16 contre x3 (huit prompts, 200 tokens, draft fixe 8, hors
+  protocole) : trois sorties sur huit divergent (T0, T1, T5). bf16 reste opt-in.
 
 ## Limites
 

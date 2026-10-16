@@ -1241,7 +1241,8 @@ impl CausalDecoder {
         // la capacité résidente (`draft_indices`, dimensionnée sur `max_new_tokens`).
         let max_draft_tokens = max_draft_tokens.min(max_new_tokens);
         // Lookup n-grammes : drafts sans tête MTP quand le suffixe courant s'est
-        // déjà vu. OFF par défaut (`SARAGOSSA_RUST_MTP_LOOKUP_DRAFT`), à mesurer.
+        // déjà vu. Défaut selon l'historique choisi ci-dessus (committed : 8,
+        // fresh : 0), cf. `mtp_lookup_draft_tokens`.
         let lookup_draft = crate::runtime_flags::mtp_lookup_draft_tokens().min(max_new_tokens);
         let mut lookup = (lookup_draft > 0).then(|| NgramLookup::new(prompt));
         let draft_headroom = max_draft_tokens.max(lookup_draft);

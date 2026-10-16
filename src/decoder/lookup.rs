@@ -3,6 +3,7 @@
 //! récente est proposée à la place des drafts de la tête MTP. Sans perte : le
 //! tronc vérifie chaque token. Rentable sur les sorties qui recopient (édition
 //! de code, citations), nul sur du texte libre, d'où la porte d'acceptation.
+//! Actif par défaut sur prompt long seulement (`runtime_flags::mtp_lookup_draft_tokens`).
 
 use std::collections::HashMap;
 

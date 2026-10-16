@@ -364,20 +364,34 @@ pub(crate) fn mtp_gpu_block_enabled() -> bool {
 /// (cf. [`crate::decoder::mtp_adaptive`]). La séquence générée reste byte-identique
 /// (le vérifieur trunk exact décide *lesquels* des tokens proposés sont acceptés,
 /// pas *combien* on en propose).
-/// Drafts par pas du lookup n-grammes (`decoder::lookup`), 0 = désactivé (défaut).
-/// `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=8` propose jusqu'à 8 tokens quand le suffixe
-/// courant s'est déjà vu ; borné à 15 (16 lignes de vérification au plus).
+/// Drafts par pas du lookup n-grammes (`decoder::lookup`), 0 = désactivé.
+/// `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=n` force la valeur, bornée à 15 (16 lignes de
+/// vérification au plus). Sans variable : 8 quand l'historique MTP reste committed
+/// (prompt long, cf. [`mtp_fresh_cache_enabled`]), 0 avec le cache fresh.
+///
+/// MESURE (phase 6 pairwise du 2026-10-16, `models/pairwise/lookup-plan.md`,
+/// lookup 8 contre le défaut par longueur, n48 par cellule, Holm8) : T6 (424
+/// tokens, code qui recopie) +21 %, T2 (732, prose) −0,2 % sans proposition ;
+/// T0 (26) −0,1 %, T1 (33) −4,2 % : une proposition de deux tokens moins bonne
+/// que la tête MTP au dernier pas coûte une vérification. D'où la coupure sur la
+/// même longueur que le choix fresh/committed.
 pub(super) fn mtp_lookup_draft_tokens() -> usize {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     if let Some(case) = pairwise::current() {
         return case.lookup.min(15);
     }
-    static DRAFT: OnceLock<usize> = OnceLock::new();
-    *DRAFT.get_or_init(|| {
+    static DRAFT: OnceLock<Option<usize>> = OnceLock::new();
+    if let Some(forced) = *DRAFT.get_or_init(|| {
         env_var("SARAGOSSA_RUST_MTP_LOOKUP_DRAFT")
             .and_then(|value| value.trim().parse::<usize>().ok())
-            .map_or(0, |value| value.min(15))
-    })
+    }) {
+        return forced.min(15);
+    }
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if !mtp_fresh_cache_enabled() {
+        return 8;
+    }
+    0
 }
 
 pub(super) fn mtp_adaptive_depth_enabled() -> bool {
