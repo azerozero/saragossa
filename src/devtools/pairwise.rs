@@ -128,15 +128,25 @@ fn routes(run: &Run, case: Case, id: &str) -> Result<()> {
     }
     Ok(())
 }
-fn benchmark_control(name: &str, rows: &[&Row]) -> Result<Case> {
+fn benchmark_control(name: &str, rows: &[&Row], matrix: &[Row]) -> Result<Case> {
     match name {
         "d1" => Ok(Case::default()),
         "ar" if !rows.is_empty() && rows.iter().all(|r| r.case.mode == Mode::Ar) => Ok(Case {
             mode: Mode::Ar,
             ..Case::default()
         }),
+        // V5 : une ligne de matrice comme contrôle, pour isoler un facteur entre deux
+        // configurations complètes (EX14 contre PW02) au lieu de tout référencer à D1.
+        _ if name.starts_with("row:") => {
+            let row = matrix
+                .iter()
+                .find(|r| r.id == name["row:".len()..])
+                .ok_or_else(|| InferError::Config(format!("contrôle inconnu {name}")))?;
+            row.case.validate()?;
+            Ok(row.case)
+        }
         _ => Err(InferError::Config(
-            "contrôle pairwise : d1 obligatoire, ou ar pour un A/B secondaire exclusivement AR"
+            "contrôle pairwise : d1 obligatoire, ar pour un A/B secondaire exclusivement AR, ou row:ID"
                 .into(),
         )),
     }
@@ -218,7 +228,7 @@ pub(super) fn run(
     }
     let control_mode =
         flags::env_var("SARAGOSSA_RUST_PAIRWISE_CONTROL").unwrap_or_else(|| "d1".into());
-    let control = benchmark_control(&control_mode, &selected)?;
+    let control = benchmark_control(&control_mode, &selected, &matrix.rows)?;
     // Les longs prefills imposent parfois un lot d'une paire ; inverser le lot suivant.
     let reverse_order = flags::env_flag("SARAGOSSA_RUST_PAIRWISE_REVERSE_ORDER", false);
     if control.mode == Mode::Ar && action != "bench" {
@@ -235,7 +245,7 @@ pub(super) fn run(
         .collect();
     eprintln!(
         "pairwise {}",
-        json!({"phase":"start","ids":ids,"action":action,"budget":budget,"prompt_tokens":prompt.len(),"control_mode":control_mode,"reverse_order":reverse_order,"harness_version":4,"counter_sets":counter_sets,"device":device.name()})
+        json!({"phase":"start","ids":ids,"action":action,"budget":budget,"prompt_tokens":prompt.len(),"control_mode":control_mode,"reverse_order":reverse_order,"harness_version":5,"counter_sets":counter_sets,"device":device.name()})
     );
     let base = Case::default();
     let oracle = one(
@@ -442,19 +452,38 @@ mod tests {
                 ..Case::default()
             },
         };
+        let matrix = [
+            Row {
+                id: "D1".into(),
+                case: Case::default(),
+            },
+            Row {
+                id: "AR".into(),
+                case: ar.case,
+            },
+        ];
         assert_eq!(
-            benchmark_control("d1", &[&mtp, &ar]).expect("invariant: D1 control"),
+            benchmark_control("d1", &[&mtp, &ar], &matrix).expect("invariant: D1 control"),
             Case::default()
         );
         assert_eq!(
-            benchmark_control("ar", &[&ar])
+            benchmark_control("ar", &[&ar], &matrix)
                 .expect("invariant: secondary AR control")
                 .mode,
             Mode::Ar
         );
-        assert!(benchmark_control("ar", &[&mtp]).is_err());
-        assert!(benchmark_control("ar", &[]).is_err());
-        assert!(benchmark_control("fresh", &[&mtp]).is_err());
+        assert!(benchmark_control("ar", &[&mtp], &matrix).is_err());
+        assert!(benchmark_control("ar", &[], &matrix).is_err());
+        assert!(benchmark_control("fresh", &[&mtp], &matrix).is_err());
+        // V5 : un contrôle ligne de matrice reprend exactement la configuration nommée.
+        assert_eq!(
+            benchmark_control("row:AR", &[&mtp], &matrix)
+                .expect("invariant: row control")
+                .mode,
+            Mode::Ar
+        );
+        assert!(benchmark_control("row:PW99", &[&mtp], &matrix).is_err());
+        assert!(benchmark_control("row:", &[&mtp], &matrix).is_err());
     }
 
     #[test]

@@ -30,6 +30,9 @@ pub(crate) struct Case {
     /// `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT`.
     #[serde(default)]
     pub lookup: usize,
+    /// Plafond de profondeur de draft (0 = celui du mode : 2 en adaptatif, 1 sinon).
+    #[serde(default)]
+    pub cap: usize,
 }
 
 impl Default for Case {
@@ -43,13 +46,16 @@ impl Default for Case {
             p2: false,
             p3: false,
             lookup: 0,
+            cap: 0,
         }
     }
 }
 
 impl Case {
     pub fn depth(self) -> usize {
-        if matches!(self.mode, Mode::D2 | Mode::Adaptive | Mode::AdaptiveFresh) {
+        if self.cap > 0 {
+            self.cap
+        } else if matches!(self.mode, Mode::D2 | Mode::Adaptive | Mode::AdaptiveFresh) {
             2
         } else {
             1
