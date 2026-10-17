@@ -221,9 +221,11 @@ d256). Les kernels existent en d128 et d256 (le modèle a 24 têtes q, 4 têtes 
 lignes à 8k, 2,4 ms par couche contre 1,4 pour la boucle, d'où les variantes d256.
 Kill-switch `SARAGOSSA_RUST_FULL_ROWS_FUSED=0`, diagnostic `SARAGOSSA_RUST_FULL_ROWS_GROUP=n`
 (lignes par threadgroup du 2-passes). Les kernels reprennent l'arithmétique des kernels
-mono-ligne dans le même ordre : `full_attn_rows_fused_matches_row_loop` vérifie l'égalité
-bit à bit (contextes et KV) en flash et en 2-passes, d128 et d256, f32 et bf16, chunks
-d'une ligne compris.
+mono-ligne dans le même ordre ; quand les lignes chevauchent une frontière de partition
+(seuil flash/2-passes à 2048, nombre de blocs split-K tous les 4096 tokens), le chemin
+passe en chunks d'une ligne avec le choix et les blocs de chaque ligne.
+`full_attn_rows_fused_matches_row_loop` vérifie l'égalité bit à bit (contextes et KV) en
+flash et en 2-passes, d128 et d256, f32 et bf16, chunks d'une ligne et frontières compris.
 
 Mesures du 17 octobre (64 tokens, draft fixe 2, profil D2 segmenté, runs alternés OFF/ON,
 sorties byte-identiques par hachage sur T0, T6, T7 et T6 avec lookup) :

@@ -2680,6 +2680,29 @@ fn full_attn_rows_fused_matches_row_loop() -> Result<()> {
         run_rows_fused_case(&state, 2050, 2060, head_dim, bf16, None)?;
         run_rows_fused_case(&state, 2050, 2060, head_dim, bf16, Some(1))?;
     }
+    // Frontières de partition chevauchées par les 3 lignes : seuil flash/2-passes
+    // (lignes 2047, 2048, 2049) et nombre de blocs split-K (4222 → 32, 4224 → 64).
+    run_rows_fused_case(&state, 2046, 2052, 128, false, None)?;
+    run_rows_fused_case(&state, 4221, 4226, 256, false, None)?;
+    // Capacité insuffisante : erreur AVANT tout encodage, `len` inchangé.
+    let kernels = state.rows_kernels()?;
+    let mut kv = state.full_attention_f32_for_test(4, POS_Q, POS_KV, 128)?;
+    kv.seed(
+        &vec![0.0; 2 * POS_KV * 128],
+        &vec![0.0; 2 * POS_KV * 128],
+        2,
+    )?;
+    let rows = state.scratch().lease(3 * POS_KV * 128, GpuElement::F32)?;
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let buffer = rows.tensor().buffer();
+    let kv_dim = POS_KV * 128;
+    assert!(matches!(
+        kv.encode_append_kv_rows(encoder, kernels, buffer, 0, kv_dim, buffer, 0, kv_dim, 3),
+        Err(InferError::Dimension(_))
+    ));
+    encoder.end_encoding();
+    assert_eq!(kv.len(), 2);
     Ok(())
 }
 

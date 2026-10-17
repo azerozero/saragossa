@@ -534,6 +534,19 @@ impl FullAttentionMetalState {
         rows: usize,
     ) -> Result<()> {
         let kv_dim = self.kv_dim();
+        // Capacité vérifiée AVANT tout encodage : rien n'est lié ni dispatché hors
+        // du KV (le `advance_len` final ne fait que consommer les lignes).
+        let fits = self
+            .len()
+            .checked_add(rows)
+            .is_some_and(|next| next <= self.capacity());
+        if rows == 0 || !fits {
+            return Err(InferError::Dimension(format!(
+                "append KV rows: {} + {rows} lignes hors capacité {}",
+                self.len(),
+                self.capacity()
+            )));
+        }
         let cells = rows
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Dimension("append KV rows déborde".to_string()))?;
@@ -619,45 +632,28 @@ impl FullAttentionMetalState {
         let gqa = q_heads / kv_heads.max(1);
         let len0 = len - rows + 1;
         let element = self.keys().element();
-        let two_pass = sdpa_2pass_enabled()
-            && flash_sdpa_enabled()
-            && matches!(head_dim, 128 | 256)
-            && gqa > 1
-            && q_heads % kv_heads == 0
-            && len >= sdpa_2pass_min_len();
-        if !two_pass {
-            let pipeline = match (element, head_dim == 256) {
-                (GpuElement::F32, true) => &kernels.flash_rows_d256,
-                (GpuElement::F32, false) => &kernels.flash_rows,
-                (GpuElement::Bf16, true) => &kernels.flash_rows_d256_bf16,
-                (GpuElement::Bf16, false) => &kernels.flash_rows_bf16,
-                (GpuElement::U32, _) => {
-                    return Err(InferError::Metal(
-                        "attention rows sur KV u32 invalide".to_string(),
-                    ));
-                }
-            };
-            let dims = [
-                to_u32(q_heads, "attention rows q_heads")?,
-                to_u32(kv_heads, "attention rows kv_heads")?,
-                to_u32(head_dim, "attention rows head_dim")?,
-                to_u32(len0, "attention rows len")?,
-            ];
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(q_rows), 0);
-            encoder.set_buffer(1, Some(self.keys().buffer()), 0);
-            encoder.set_buffer(2, Some(self.values().buffer()), 0);
-            encoder.set_buffer(3, Some(out_rows), 0);
-            set_bytes(encoder, 4, &dims);
-            crate::metal_backend::profile_dispatch();
-            encoder.dispatch_thread_groups(
-                MTLSize::new(u64::from(dims[0]), to_u64(rows, "attention rows")?, 1),
-                MTLSize::new(1024, 1, 1),
-            );
-            crate::metal_backend::post_dispatch_barrier(encoder);
-            return Ok(());
-        }
-
+        let q_dim = q_heads * head_dim;
+        // Même choix flash/2-passes que `encode_attention_decode_dims`, évalué sur la
+        // longueur de la DERNIÈRE ligne du chunk.
+        let two_pass_for = |length: usize| {
+            sdpa_2pass_enabled()
+                && flash_sdpa_enabled()
+                && matches!(head_dim, 128 | 256)
+                && gqa > 1
+                && q_heads % kv_heads == 0
+                && length >= sdpa_2pass_min_len()
+        };
+        let flash = match (element, head_dim == 256) {
+            (GpuElement::F32, true) => &kernels.flash_rows_d256,
+            (GpuElement::F32, false) => &kernels.flash_rows,
+            (GpuElement::Bf16, true) => &kernels.flash_rows_d256_bf16,
+            (GpuElement::Bf16, false) => &kernels.flash_rows_bf16,
+            (GpuElement::U32, _) => {
+                return Err(InferError::Metal(
+                    "attention rows sur KV u32 invalide".to_string(),
+                ));
+            }
+        };
         let pass1 = match (element, head_dim) {
             (GpuElement::F32, 128) => &kernels.two_pass_rows_d128,
             (GpuElement::F32, _) => &kernels.two_pass_rows_d256,
@@ -674,21 +670,54 @@ impl FullAttentionMetalState {
         } else {
             self.attention_2pass_2()
         };
-        let blocks = sdpa_2pass_blocks(len);
+        // Frontière de partition entre la première et la dernière ligne (seuil
+        // flash/2-passes ou nombre de blocs split-K) : chunks d'une ligne, chacun
+        // avec le choix et les blocs de SA longueur, pour rester bit-identique à la
+        // boucle par ligne.
+        let boundary = two_pass_for(len0) != two_pass_for(len)
+            || (two_pass_for(len) && sdpa_2pass_blocks(len0) != sdpa_2pass_blocks(len));
         let threads_per_row = 32 * gqa;
         let group_limit = usize::try_from(pass1.max_total_threads_per_threadgroup())
             .unwrap_or(threads_per_row)
             / threads_per_row;
-        let rows_per_group = max_rows_per_group
-            .unwrap_or(usize::MAX)
-            .min(group_limit)
-            .clamp(1, rows);
-        let q_dim = q_heads * head_dim;
+        let rows_per_group = if boundary {
+            1
+        } else {
+            max_rows_per_group
+                .unwrap_or(usize::MAX)
+                .min(group_limit)
+                .clamp(1, rows)
+        };
         let kv_heads_u32 = to_u32(kv_heads, "attention rows kv_heads")?;
-        let blocks_u32 = to_u32(blocks, "attention rows blocks")?;
         let mut start = 0;
         while start < rows {
             let chunk = rows_per_group.min(rows - start);
+            let chunk_len0 = len0 + start;
+            let row_offset = byte_offset(start * q_dim, GpuElement::F32, "attention rows offset")?;
+            if !two_pass_for(chunk_len0 + chunk - 1) {
+                let dims = [
+                    to_u32(q_heads, "attention rows q_heads")?,
+                    kv_heads_u32,
+                    to_u32(head_dim, "attention rows head_dim")?,
+                    to_u32(chunk_len0, "attention rows len")?,
+                ];
+                encoder.set_compute_pipeline_state(flash);
+                encoder.set_buffer(0, Some(q_rows), row_offset);
+                encoder.set_buffer(1, Some(self.keys().buffer()), 0);
+                encoder.set_buffer(2, Some(self.values().buffer()), 0);
+                encoder.set_buffer(3, Some(out_rows), row_offset);
+                set_bytes(encoder, 4, &dims);
+                crate::metal_backend::profile_dispatch();
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(u64::from(dims[0]), to_u64(chunk, "attention rows")?, 1),
+                    MTLSize::new(1024, 1, 1),
+                );
+                crate::metal_backend::post_dispatch_barrier(encoder);
+                start += chunk;
+                continue;
+            }
+            let blocks = sdpa_2pass_blocks(chunk_len0 + chunk - 1);
+            let blocks_u32 = to_u32(blocks, "attention rows blocks")?;
             let reduce_cells = q_heads
                 .checked_mul(chunk)
                 .and_then(|slots| slots.checked_mul(blocks))
@@ -701,11 +730,10 @@ impl FullAttentionMetalState {
             let partials = self.scratch().lease(partial_cells, GpuElement::F32)?;
             let sums = self.scratch().lease(reduce_cells, GpuElement::F32)?;
             let maxs = self.scratch().lease(reduce_cells, GpuElement::F32)?;
-            let row_offset = byte_offset(start * q_dim, GpuElement::F32, "attention rows offset")?;
             let dims = [
                 to_u32(q_heads, "attention rows q_heads")?,
                 kv_heads_u32,
-                to_u32(len0 + start, "attention rows len")?,
+                to_u32(chunk_len0, "attention rows len")?,
                 blocks_u32,
             ];
             encoder.set_compute_pipeline_state(pass1);
