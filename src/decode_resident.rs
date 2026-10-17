@@ -59,6 +59,7 @@ mod gpu_position;
 mod kernels;
 mod layers;
 mod moe_tail;
+mod rows;
 mod types;
 mod utils;
 
@@ -109,6 +110,8 @@ pub(crate) struct DecodeResidentState {
     copy_at_f32_to_bf16_kernel: ComputePipelineState,
     /// Kernels position GPU (bloc MTP), compilés au premier usage seulement.
     gpu_position_kernels: OnceLock<gpu_position::GpuPositionKernels>,
+    /// Kernels du chemin full-attn en lignes fusionné, compilés au premier usage.
+    rows_kernels: OnceLock<rows::RowsKernels>,
     /// Instrumentation per-section (tranche 3), active si `SARAGOSSA_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,
     /// Slot de flux (light-batch) : namespace du scratch label-keyed de

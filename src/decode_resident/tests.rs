@@ -2459,6 +2459,230 @@ fn run_gpu_position_case(
     Ok(())
 }
 
+/// Chemin en lignes fusionné (`rows.rs`) contre la boucle par ligne sur `ROWS`
+/// lignes : RoPE q/k, append KV et attention. Mêmes kernels mono-ligne repris
+/// dans le même ordre → égalité bit à bit des contextes et du KV.
+fn run_rows_fused_case(
+    state: &DecodeResidentState,
+    prefix: usize,
+    capacity: usize,
+    head_dim: usize,
+    bf16: bool,
+    max_rows_per_group: Option<usize>,
+) -> Result<()> {
+    use super::gpu_position::rope_dims_param;
+    const ROWS: usize = 3;
+    let (eps, theta) = (1.0e-6_f32, 1.0e7_f32);
+    let q_dim = POS_Q * head_dim;
+    let kv_dim = POS_KV * head_dim;
+    let keys: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 3)).collect();
+    let values: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 11)).collect();
+    let make_kv = || -> Result<FullAttentionMetalState> {
+        let mut kv = if bf16 {
+            state.full_attention_bf16_for_test(capacity, POS_Q, POS_KV, head_dim)?
+        } else {
+            state.full_attention_f32_for_test(capacity, POS_Q, POS_KV, head_dim)?
+        };
+        kv.seed(&keys, &values, prefix)?;
+        Ok(kv)
+    };
+    let mut kv_loop = make_kv()?;
+    let mut kv_fused = make_kv()?;
+    assert!(
+        kv_fused.rows_fused_supported(),
+        "préconditions du chemin en lignes"
+    );
+
+    let q_norm = lease_with(
+        state,
+        &(0..head_dim)
+            .map(|i| 1.0 + 0.1 * pseudo(i + 5))
+            .collect::<Vec<_>>(),
+    )?;
+    let k_norm = lease_with(
+        state,
+        &(0..head_dim)
+            .map(|i| 1.0 + 0.1 * pseudo(i + 9))
+            .collect::<Vec<_>>(),
+    )?;
+    let q_raw = lease_with(
+        state,
+        &(0..ROWS * q_dim)
+            .map(|i| pseudo(2000 + i))
+            .collect::<Vec<_>>(),
+    )?;
+    let k_raw = lease_with(
+        state,
+        &(0..ROWS * kv_dim)
+            .map(|i| pseudo(2007 + i))
+            .collect::<Vec<_>>(),
+    )?;
+    let v_raw = lease_with(
+        state,
+        &(0..ROWS * kv_dim)
+            .map(|i| pseudo(2013 + i))
+            .collect::<Vec<_>>(),
+    )?;
+
+    // Référence : boucle par ligne (kernels mono-ligne).
+    let q_roped = state.scratch().lease(q_dim, GpuElement::F32)?;
+    let k_roped = state.scratch().lease(kv_dim, GpuElement::F32)?;
+    let scores = state.scratch().lease(POS_Q * capacity, GpuElement::F32)?;
+    let mut ctx_loop = Vec::new();
+    for _ in 0..ROWS {
+        ctx_loop.push(state.scratch().lease(q_dim, GpuElement::F32)?);
+    }
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    for (row, ctx_row) in ctx_loop.iter().enumerate() {
+        state.encode_rms_norm_rope_decode_param(
+            encoder,
+            q_raw.tensor().buffer(),
+            (row * q_dim * 4) as u64,
+            q_norm.tensor().buffer(),
+            q_roped.tensor().buffer(),
+            POS_Q,
+            rope_dims_param(POS_Q, head_dim, POS_ROPE, prefix + row)?,
+            POS_ROPE,
+            eps,
+            theta,
+        )?;
+        state.encode_rms_norm_rope_decode_param(
+            encoder,
+            k_raw.tensor().buffer(),
+            (row * kv_dim * 4) as u64,
+            k_norm.tensor().buffer(),
+            k_roped.tensor().buffer(),
+            POS_KV,
+            rope_dims_param(POS_KV, head_dim, POS_ROPE, prefix + row)?,
+            POS_ROPE,
+            eps,
+            theta,
+        )?;
+        kv_loop.encode_append_kv_with_offsets(
+            encoder,
+            k_roped.tensor().buffer(),
+            0,
+            v_raw.tensor().buffer(),
+            (row * kv_dim * 4) as u64,
+        )?;
+        kv_loop.encode_attention_decode_windowed(
+            encoder,
+            q_roped.tensor().buffer(),
+            scores.tensor().buffer(),
+            ctx_row.tensor().buffer(),
+            0,
+        )?;
+    }
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    // Chemin en lignes : un dispatch par étape.
+    let kernels = state.rows_kernels()?;
+    let q_rows = state.scratch().lease(ROWS * q_dim, GpuElement::F32)?;
+    let k_rows = state.scratch().lease(ROWS * kv_dim, GpuElement::F32)?;
+    let ctx_rows = state.scratch().lease(ROWS * q_dim, GpuElement::F32)?;
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    state.encode_rms_norm_rope_decode_rows(
+        encoder,
+        kernels,
+        q_raw.tensor().buffer(),
+        0,
+        q_dim,
+        q_norm.tensor().buffer(),
+        q_rows.tensor().buffer(),
+        q_dim,
+        POS_Q,
+        head_dim,
+        POS_ROPE,
+        POS_ROPE,
+        prefix,
+        ROWS,
+        eps,
+        theta,
+    )?;
+    state.encode_rms_norm_rope_decode_rows(
+        encoder,
+        kernels,
+        k_raw.tensor().buffer(),
+        0,
+        kv_dim,
+        k_norm.tensor().buffer(),
+        k_rows.tensor().buffer(),
+        kv_dim,
+        POS_KV,
+        head_dim,
+        POS_ROPE,
+        POS_ROPE,
+        prefix,
+        ROWS,
+        eps,
+        theta,
+    )?;
+    kv_fused.encode_append_kv_rows(
+        encoder,
+        kernels,
+        k_rows.tensor().buffer(),
+        0,
+        kv_dim,
+        v_raw.tensor().buffer(),
+        0,
+        kv_dim,
+        ROWS,
+    )?;
+    kv_fused.encode_attention_decode_rows_chunked(
+        encoder,
+        kernels,
+        q_rows.tensor().buffer(),
+        ctx_rows.tensor().buffer(),
+        ROWS,
+        max_rows_per_group,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    assert_eq!(kv_fused.len(), prefix + ROWS, "len après append en lignes");
+    assert_eq!(kv_loop.len(), prefix + ROWS);
+    let fused_ctx = read_f32(ctx_rows.tensor());
+    for (row, expected) in ctx_loop.iter().enumerate() {
+        assert_close_eps(
+            &fused_ctx[row * q_dim..(row + 1) * q_dim],
+            &read_f32(expected.tensor()),
+            0.0,
+        );
+    }
+    let cells = (prefix + ROWS) * kv_dim;
+    let read_kv = |tensor: &GpuTensor| {
+        if bf16 {
+            read_bf16_as_f32(tensor)
+        } else {
+            read_f32(tensor)
+        }
+    };
+    let (keys_fused, keys_loop) = (read_kv(kv_fused.keys()), read_kv(kv_loop.keys()));
+    let (values_fused, values_loop) = (read_kv(kv_fused.values()), read_kv(kv_loop.values()));
+    assert_close_eps(&keys_fused[..cells], &keys_loop[..cells], 0.0);
+    assert_close_eps(&values_fused[..cells], &values_loop[..cells], 0.0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn full_attn_rows_fused_matches_row_loop() -> Result<()> {
+    let state = try_state()?.ok_or_else(|| {
+        InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
+    })?;
+    for (head_dim, bf16) in [(128, false), (128, true), (256, false), (256, true)] {
+        // Flash en lignes (len courte), puis 2-passes en lignes (len ≥ 2048) en un
+        // chunk et en chunks d'une ligne.
+        run_rows_fused_case(&state, 5, 16, head_dim, bf16, None)?;
+        run_rows_fused_case(&state, 2050, 2060, head_dim, bf16, None)?;
+        run_rows_fused_case(&state, 2050, 2060, head_dim, bf16, Some(1))?;
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn gpu_position_two_cycles_one_command_buffer_matches_host_positions() -> Result<()> {

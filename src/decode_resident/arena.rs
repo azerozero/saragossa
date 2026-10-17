@@ -344,6 +344,7 @@ impl DecodeResidentState {
             copy_at_kernel,
             copy_at_f32_to_bf16_kernel,
             gpu_position_kernels: OnceLock::new(),
+            rows_kernels: OnceLock::new(),
             timer,
             scratch_namespace: 0,
         })

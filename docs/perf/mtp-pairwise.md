@@ -180,11 +180,13 @@ restent lisibles. Profils du 17 octobre, 64 tokens, draft fixe 2 (25 cycles) :
 | queue (norme, lm_head, copies) | 2,1 ms | 2,1 ms |
 | cycle | 63,4 ms | 81,8 ms |
 
-- Surcoût à 8k : +9 ms d'attention du tronc sur 3 lignes (33 Mo de KV par
-  couche en 0,58 ms, soit ~60 Go/s, loin de la bande passante : le kernel
-  d'attention en lignes est le levier), +4,6 ms de tête MTP (attention sur son
-  historique committed de 8k), +4,5 ms sur les couches linear-attn (à confirmer,
-  indépendant du contexte en théorie).
+- Surcoût à 8k : +9 ms d'attention du tronc sur 3 lignes. Chaque ligne relit K et
+  V f32 en entier (8297 × 1024 × 4 o × 2 = 68 Mo par ligne, 204 Mo par couche) en
+  0,58 ms, soit ~350 Go/s : le kernel 2-passes est proche de la bande passante, le
+  levier est la relecture par ligne (cf. « Chemin full-attn en lignes fusionné »
+  ci-dessous). +4,6 ms de tête MTP (attention sur son historique committed de 8k),
+  +4,5 ms sur les couches linear-attn (à confirmer, indépendant du contexte en
+  théorie).
 - Indépendamment du contexte, les 48 couches linear-attn font 43 des 63 ms du
   cycle pour 3 lignes seulement. Compteurs par site (`SARAGOSSA_RUST_DECODE_PROFILE_SITES`) :
   par couche linéaire, 3 dispatches delta par ligne et 3 glissements d'état conv ;
@@ -200,6 +202,48 @@ restent lisibles. Profils du 17 octobre, 64 tokens, draft fixe 2 (25 cycles) :
   `SARAGOSSA_RUST_LINEAR_ROWS_SEQ_DELTA=0` pour la boucle) : un dispatch au lieu de
   3 delta + 2 copies d'état par couche à M=3 ; couche linéaire 0,806 contre 0,850 ms
   (−2 ms par cycle D2), sorties T0 et T6 byte-identiques.
+
+### Chemin full-attn en lignes fusionné (`src/decode_resident/rows.rs`)
+
+Pour les `rows` lignes d'une vérification (position hôte, fenêtre pleine, sans
+norme de V, KV f32 ou bf16), la boucle par ligne (RoPE q, RoPE k, copie K, copie V,
+attention, copie du contexte : 6 dispatches par ligne, KV relu par ligne) est
+remplacée par cinq dispatches pour toutes les lignes : `rms_norm_rope_heads_decode_rows_f32`
+(grille têtes × lignes, position `base + ligne`) pour Q puis K, `copy_rows_at_{f32,bf16}`
+pour K puis V (lignes KV contiguës, stride source de la projection qkv concaténée),
+puis `attention_decode_flash_rows_*` (grille q_heads × lignes, longueur `base + ligne + 1`)
+ou, dès le seuil 2-passes, `attention_decode_2pass_1_rows_d128_*` : threadgroup
+(32, gqa, lignes) par (kv_head, bloc), chaque bloc KV lu une fois pour `gqa × lignes`
+simdgroups, passe 2 inchangée sur `q_heads × lignes`, écriture directe dans `ctx[ligne]`.
+Les lignes sont découpées en chunks bornés par le threadgroup (5 lignes à gqa 6 en
+d256). Les kernels existent en d128 et d256 (le modèle a 24 têtes q, 4 têtes kv,
+`head_dim` 256) : un premier essai limité à d128 retombait sur le flash générique en
+lignes à 8k, 2,4 ms par couche contre 1,4 pour la boucle, d'où les variantes d256.
+Kill-switch `SARAGOSSA_RUST_FULL_ROWS_FUSED=0`, diagnostic `SARAGOSSA_RUST_FULL_ROWS_GROUP=n`
+(lignes par threadgroup du 2-passes). Les kernels reprennent l'arithmétique des kernels
+mono-ligne dans le même ordre : `full_attn_rows_fused_matches_row_loop` vérifie l'égalité
+bit à bit (contextes et KV) en flash et en 2-passes, d128 et d256, f32 et bf16, chunks
+d'une ligne compris.
+
+Mesures du 17 octobre (64 tokens, draft fixe 2, profil D2 segmenté, runs alternés OFF/ON,
+sorties byte-identiques par hachage sur T0, T6, T7 et T6 avec lookup) :
+
+| | boucle par ligne | en lignes fusionné |
+|---|---:|---:|
+| T0 (26 tokens), full-attn par couche | 0,77-0,79 ms | 0,74 ms |
+| T0, cycle D2 | 57,4-59,2 ms | 56,4-56,7 ms |
+| T0, dispatches par run | 36 311 | 31 207 |
+| T7 (8297 tokens), full-attn par couche | 1,56 ms | 1,34-1,36 ms |
+| T7, cycle D2 | 87,7 ms | 84,1-85,4 ms |
+| T6 avec lookup, 200 tokens | 72,2 tok/s | 72,9-73,1 tok/s |
+
+À 8k le gain par couche (−0,2 ms) reste sous l'estimation (−0,4 ms) : le KV n'est plus
+relu par ligne, mais les 18 simdgroups par bloc (gqa 6 × 3 lignes) progressent moins
+bien que 3 dispatches de 6. Sur T6 avec lookup, la vérification à 9 lignes (chemin
+générique) coûte 68 ms par appel contre 58-60 ms pour le cycle D2 à 3 lignes : six
+lignes de plus ne coûtent que 10 ms, ce qui fixe la condition du drafter externe.
+Les runs où tous les segments ralentissent ensemble (couches linéaires comprises) sont
+des contentions GPU externes, pas un effet du chemin : ils ont été rejoués.
 
 ## Drafter DFlash 2 (prototype CPU, devtools)
 

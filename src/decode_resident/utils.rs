@@ -262,6 +262,14 @@ pub(super) fn kv_bf16_sim_vonly() -> bool {
 
 /// Active la SDPA decode **2-passes split-K** (dédup GQA + tuiles L1) au-delà de
 /// `sdpa_2pass_min_len()` rows de KV. Défaut ON ; kill-switch `SARAGOSSA_RUST_SDPA_2PASS=0`.
+/// Chemin full-attn en lignes fusionné (RoPE, append KV et attention des `rows`
+/// lignes d'une vérification en un dispatch chacun, cf. `rows.rs`). Défaut ON ;
+/// `SARAGOSSA_RUST_FULL_ROWS_FUSED=0` rejoue la boucle par ligne.
+pub(super) fn full_rows_fused_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FULL_ROWS_FUSED", true))
+}
+
 pub(super) fn sdpa_2pass_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_SDPA_2PASS", true))

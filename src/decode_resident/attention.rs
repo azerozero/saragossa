@@ -544,6 +544,40 @@ impl FullAttentionMetalState {
     }
 
     /// Renvoie la capacité en lignes.
+    pub(super) fn scratch(&self) -> &ScratchPool {
+        &self.scratch
+    }
+
+    pub(super) fn attention_2pass_2_d128(&self) -> &ComputePipelineState {
+        &self.attention_2pass_2_d128
+    }
+
+    pub(super) fn attention_2pass_2(&self) -> &ComputePipelineState {
+        &self.attention_2pass_2
+    }
+
+    /// Avance `len` de `rows` lignes appendues par un kernel en lignes.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la capacité serait dépassée.
+    pub(super) fn advance_len(&mut self, rows: usize) -> Result<()> {
+        let next = self
+            .len
+            .checked_add(rows)
+            .filter(|next| *next <= self.capacity);
+        match next {
+            Some(next) => {
+                self.len = next;
+                Ok(())
+            }
+            None => Err(InferError::Dimension(format!(
+                "append KV résident: {} + {rows} lignes dépasse la capacité {}",
+                self.len, self.capacity
+            ))),
+        }
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }

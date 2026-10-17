@@ -1,7 +1,7 @@
 //! Encodage des couches full-attn, linear-attn et MoE résidentes.
 
 use super::gpu_position::{rope_dims_param, GpuPosition, GpuPositionRows};
-use super::utils::byte_offset_f32;
+use super::utils::{byte_offset_f32, full_rows_fused_enabled};
 use super::*;
 
 impl DecodeResidentState {
@@ -1389,7 +1389,99 @@ impl DecodeResidentState {
         let v_base = q_proj_dim.checked_add(kv_dim).ok_or_else(|| {
             InferError::Dimension("full-attn dense rows v base déborde".to_string())
         })?;
-        for row in 0..rows {
+        // Chemin en lignes fusionné (position hôte, fenêtre pleine, sans norme V) :
+        // RoPE Q, RoPE K, append K, append V, attention → un dispatch chacun, écriture
+        // directe de `ctx[row]`. Sinon, boucle historique par ligne.
+        let fused_rows = gpu_rows.is_none()
+            && dims.window_start == 0
+            && !weights.value_norm
+            && full_rows_fused_enabled()
+            && kv.rows_fused_supported();
+        if fused_rows {
+            let kernels = self.rows_kernels()?;
+            let q_roped_rows = self.scratch().lease(batch_q, GpuElement::F32)?;
+            let k_roped_rows = self.scratch().lease(batch_kv, GpuElement::F32)?;
+            self.encode_rms_norm_rope_decode_rows(
+                encoder,
+                kernels,
+                q_raw.tensor().buffer(),
+                0,
+                q_dim,
+                weights.q_norm,
+                q_roped_rows.tensor().buffer(),
+                q_dim,
+                dims.q_heads,
+                dims.head_dim,
+                dims.rope_dims,
+                dims.rope_frequency_dim,
+                dims.position,
+                rows,
+                dims.eps,
+                dims.theta,
+            )?;
+            Self::encode_query_attention_scale(
+                executor,
+                encoder,
+                owned,
+                q_roped_rows.tensor().buffer(),
+                batch_q,
+                dims.head_dim,
+                dims.attn_scalar,
+            )?;
+            let (kv_source, k_offset, v_offset, kv_stride) = if weights.qkv_proj.is_some() {
+                (
+                    qkv_proj_out.tensor().buffer(),
+                    byte_offset_f32(k_base, "full-attn dense rows k base")?,
+                    byte_offset_f32(v_base, "full-attn dense rows v base")?,
+                    qkv_proj_dim,
+                )
+            } else {
+                (k_proj_out.tensor().buffer(), 0, 0, kv_dim)
+            };
+            self.encode_rms_norm_rope_decode_rows(
+                encoder,
+                kernels,
+                kv_source,
+                k_offset,
+                kv_stride,
+                weights.k_norm,
+                k_roped_rows.tensor().buffer(),
+                kv_dim,
+                dims.kv_heads,
+                dims.head_dim,
+                dims.rope_dims,
+                dims.rope_frequency_dim,
+                dims.position,
+                rows,
+                dims.eps,
+                dims.theta,
+            )?;
+            let v_source = if weights.qkv_proj.is_some() {
+                kv_source
+            } else {
+                v_proj_out.tensor().buffer()
+            };
+            kv.encode_append_kv_rows(
+                encoder,
+                kernels,
+                k_roped_rows.tensor().buffer(),
+                0,
+                kv_dim,
+                v_source,
+                v_offset,
+                kv_stride,
+                rows,
+            )?;
+            kv.encode_attention_decode_rows(
+                encoder,
+                kernels,
+                q_roped_rows.tensor().buffer(),
+                ctx.tensor().buffer(),
+                rows,
+            )?;
+        }
+        let loop_rows = if fused_rows { 0 } else { rows };
+        for row in 0..loop_rows {
             let q_row_offset = row
                 .checked_mul(q_dim)
                 .ok_or_else(|| InferError::Dimension("full-attn dense q row déborde".to_string()))
