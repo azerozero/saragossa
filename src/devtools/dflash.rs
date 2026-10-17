@@ -43,6 +43,16 @@ pub struct DFlashDraftInfo {
     pub layer_types: Vec<String>,
     /// Fenetre des couches `sliding_attention`.
     pub sliding_window: Option<usize>,
+    /// Taille du vocabulaire déclarée par le draft (codebooks du sélecteur).
+    pub vocab_size: usize,
+    /// DFlash 2 : taps de la convolution causale autour de chaque sous-couche (0 = DFlash 1).
+    pub conv_kernel_size: usize,
+    /// DFlash 2 : canaux partageant un noyau dynamique.
+    pub conv_group_size: usize,
+    /// DFlash 2 : rang de la transition du sélecteur de candidats.
+    pub selector_rank: usize,
+    /// DFlash 2 : candidats unaires reclassés par position.
+    pub selector_top_k: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +62,36 @@ pub struct DFlashDraft {
     pub fc: Linear,
     pub layers: Vec<DFlashDraftLayer>,
     pub norm: Tensor,
+    /// DFlash 2 : sélecteur de candidats (absent en DFlash 1 : argmax par position).
+    pub selector: Option<DFlashSelector>,
+}
+
+/// DFlash 2 : convolution causale groupée à noyau dynamique autour d'une sous-couche.
+/// `prepare` convole l'entrée (noyau 0), `finish` la sortie (noyau 1) avec le noyau
+/// dynamique produit à l'entrée. Zéro-remplie au début du bloc : ne traverse jamais
+/// la frontière ancre/bloc.
+#[derive(Debug, Clone)]
+pub struct DFlashConv {
+    /// `[2, kernel_size, hidden]` : noyaux statiques d'entrée (0) et de sortie (1).
+    pub base_kernel: Tensor,
+    /// `[2 * kernel_size * groups, hidden]` : noyaux dynamiques par token.
+    pub kernel_projection: Linear,
+    pub kernel_size: usize,
+    pub group_size: usize,
+}
+
+/// DFlash 2 : reclassement des `top_k` candidats unaires par un score de transition
+/// de rang `rank` : `unaire + <pred[précédent] ⊙ proj(h), succ[candidat]>`.
+#[derive(Debug, Clone)]
+pub struct DFlashSelector {
+    /// `[rank, hidden]`.
+    pub hidden_projection: Linear,
+    /// `[vocab, rank]`.
+    pub predecessor_codebook: Tensor,
+    /// `[vocab, rank]`.
+    pub successor_codebook: Tensor,
+    pub rank: usize,
+    pub top_k: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +100,8 @@ pub struct DFlashDraftLayer {
     pub attention: DFlashAttentionWeights,
     pub post_attention_norm: Tensor,
     pub mlp: GatedMlp,
+    pub attention_conv: Option<DFlashConv>,
+    pub mlp_conv: Option<DFlashConv>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,16 +185,172 @@ impl DFlashDraftLayer {
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
         let normed = rms_norm(hidden_states, &self.input_norm, info.rms_norm_eps)?;
-        let attn_out = self
-            .attention
-            .forward(info, layer_idx, &normed, draft_context, runtime)?;
+        let (attn_in, attn_dynamic) = match &self.attention_conv {
+            Some(conv) => conv.prepare(&normed, runtime)?,
+            None => (normed, Vec::new()),
+        };
+        let mut attn_out =
+            self.attention
+                .forward(info, layer_idx, &attn_in, draft_context, runtime)?;
+        if let Some(conv) = &self.attention_conv {
+            attn_out = conv.finish(&attn_out, &attn_dynamic)?;
+        }
         let attention_state = hidden_states.add(&attn_out)?;
-        let mlp_input = rms_norm(
+        let mlp_normed = rms_norm(
             &attention_state,
             &self.post_attention_norm,
             info.rms_norm_eps,
         )?;
-        attention_state.add(&self.mlp.forward_with_runtime(&mlp_input, runtime)?)
+        let (mlp_input, mlp_dynamic) = match &self.mlp_conv {
+            Some(conv) => conv.prepare(&mlp_normed, runtime)?,
+            None => (mlp_normed, Vec::new()),
+        };
+        let mut mlp_out = self.mlp.forward_with_runtime(&mlp_input, runtime)?;
+        if let Some(conv) = &self.mlp_conv {
+            mlp_out = conv.finish(&mlp_out, &mlp_dynamic)?;
+        }
+        attention_state.add(&mlp_out)
+    }
+}
+
+impl DFlashConv {
+    fn groups(&self, hidden: usize) -> Result<usize> {
+        if self.group_size == 0 || hidden % self.group_size != 0 {
+            return Err(InferError::Dimension(format!(
+                "draft DFlash conv group_size={} ne divise pas hidden={hidden}",
+                self.group_size
+            )));
+        }
+        Ok(hidden / self.group_size)
+    }
+
+    /// Noyau dynamique par token `[len, 2 * kernel_size * groups]` et entrée convolée.
+    pub fn prepare(
+        &self,
+        hidden: &Tensor,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<(Tensor, Vec<f32>)> {
+        let dynamic = self
+            .kernel_projection
+            .forward_with_runtime(hidden, runtime)?
+            .into_data();
+        let output = self.convolve(hidden, &dynamic, 0)?;
+        Ok((output, dynamic))
+    }
+
+    /// Sortie de la sous-couche convolée avec le noyau dynamique de `prepare`.
+    pub fn finish(&self, hidden: &Tensor, dynamic: &[f32]) -> Result<Tensor> {
+        self.convolve(hidden, dynamic, 1)
+    }
+
+    /// `out[t, c] = Σ_off (base[which, off, c] + dyn[t, which, off, g(c)]) · x[t - off, c]`,
+    /// termes `t - off < 0` ignorés (zéro-remplissage causal).
+    fn convolve(&self, hidden: &Tensor, dynamic: &[f32], which: usize) -> Result<Tensor> {
+        let (len, width) = hidden.as_matrix()?;
+        let groups = self.groups(width)?;
+        let per_token = 2 * self.kernel_size * groups;
+        if dynamic.len() != len * per_token {
+            return Err(InferError::Dimension(format!(
+                "draft DFlash conv dynamique {} valeurs, attendu {}",
+                dynamic.len(),
+                len * per_token
+            )));
+        }
+        expect_shape(
+            self.base_kernel.shape(),
+            &[2, self.kernel_size, width],
+            "draft DFlash conv base_kernel",
+        )?;
+        let base = self.base_kernel.data();
+        let x = hidden.data();
+        let mut out = vec![0.0f32; len * width];
+        for t in 0..len {
+            for off in 0..self.kernel_size.min(t + 1) {
+                let source = &x[(t - off) * width..(t - off + 1) * width];
+                let base_row = &base[(which * self.kernel_size + off) * width..][..width];
+                let dyn_row =
+                    &dynamic[t * per_token + (which * self.kernel_size + off) * groups..][..groups];
+                let target = &mut out[t * width..(t + 1) * width];
+                for (c, value) in target.iter_mut().enumerate() {
+                    *value += (base_row[c] + dyn_row[c / self.group_size]) * source[c];
+                }
+            }
+        }
+        Tensor::from_vec(vec![len, width], out)
+    }
+}
+
+impl DFlashSelector {
+    /// Candidats `(token, logit)` des `top_k` logits d'une position, ordre quelconque.
+    pub fn top_candidates(&self, logits: &[f32]) -> Vec<(usize, f32)> {
+        let k = self.top_k.min(logits.len());
+        let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        if k < indexed.len() {
+            indexed.select_nth_unstable_by(k, |a, b| b.1.total_cmp(&a.1));
+            indexed.truncate(k);
+        }
+        indexed
+    }
+
+    /// Parcourt le bloc depuis `anchor` : à chaque position le candidat de score
+    /// maximal `unaire + <pred[précédent] ⊙ proj(h), succ[candidat]>` devient le
+    /// précédent de la suivante. `hidden` : `[positions, hidden]`, `candidates[p]` :
+    /// les candidats de la position `p`.
+    pub fn select(
+        &self,
+        hidden: &Tensor,
+        candidates: &[Vec<(usize, f32)>],
+        anchor: usize,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<Vec<usize>> {
+        let (positions, _) = hidden.as_matrix()?;
+        if candidates.len() != positions {
+            return Err(InferError::Dimension(format!(
+                "draft DFlash sélecteur : {} positions, {} listes de candidats",
+                positions,
+                candidates.len()
+            )));
+        }
+        let projected = self
+            .hidden_projection
+            .forward_with_runtime(hidden, runtime)?;
+        let (_, rank) = projected.as_matrix()?;
+        if rank != self.rank {
+            return Err(InferError::Dimension(format!(
+                "draft DFlash sélecteur rang {rank}, attendu {}",
+                self.rank
+            )));
+        }
+        let vocab = self.predecessor_codebook.shape()[0];
+        fn codebook_row(codebook: &Tensor, token: usize, vocab: usize) -> Result<&[f32]> {
+            if token >= vocab {
+                return Err(InferError::Dimension(format!(
+                    "draft DFlash sélecteur token {token} hors vocabulaire {vocab}"
+                )));
+            }
+            codebook.row_slice(token)
+        }
+        let mut previous = anchor;
+        let mut path = Vec::with_capacity(positions);
+        for (position, row_candidates) in candidates.iter().enumerate() {
+            let proj = projected.row_slice(position)?;
+            let pred = codebook_row(&self.predecessor_codebook, previous, vocab)?;
+            let gate: Vec<f32> = pred.iter().zip(proj).map(|(p, h)| p * h).collect();
+            let mut best: Option<(usize, f32)> = None;
+            for &(token, unary) in row_candidates {
+                let score =
+                    unary + dot(&gate, codebook_row(&self.successor_codebook, token, vocab)?);
+                if best.is_none_or(|(_, b)| score > b) {
+                    best = Some((token, score));
+                }
+            }
+            let (token, _) = best.ok_or_else(|| {
+                InferError::Config("draft DFlash sélecteur sans candidat".to_string())
+            })?;
+            path.push(token);
+            previous = token;
+        }
+        Ok(path)
     }
 }
 
@@ -329,6 +527,8 @@ struct RawDFlashDraftConfig {
     sliding_window: Option<usize>,
     rms_norm_eps: f32,
     #[serde(default)]
+    vocab_size: Option<usize>,
+    #[serde(default)]
     rope_theta: Option<f32>,
     #[serde(default)]
     rope_parameters: Option<RawRopeParameters>,
@@ -340,6 +540,14 @@ struct RawDFlashConfig {
     block_size: usize,
     mask_token_id: usize,
     target_layer_ids: Vec<usize>,
+    #[serde(default)]
+    conv_kernel_size: Option<usize>,
+    #[serde(default)]
+    conv_group_size: Option<usize>,
+    #[serde(default)]
+    selector_rank: Option<usize>,
+    #[serde(default)]
+    selector_top_k: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,16 +589,49 @@ pub fn load_dflash_draft_for_target(
             source,
         })?;
 
-    if !raw
+    let is_v2 = raw
         .architectures
         .iter()
-        .any(|name| name == "DFlashDraftModel")
+        .any(|name| name == "DFlash2DraftModel");
+    if !is_v2
+        && !raw
+            .architectures
+            .iter()
+            .any(|name| name == "DFlashDraftModel")
     {
         return Err(InferError::Config(format!(
             "draft DFlash architecture absente: {:?}",
             raw.architectures
         )));
     }
+    let v2 = |value: Option<usize>, name: &str| -> Result<usize> {
+        match (is_v2, value) {
+            (false, _) => Ok(0),
+            (true, Some(value)) if value > 0 => Ok(value),
+            (true, _) => Err(InferError::Config(format!(
+                "draft DFlash 2 requiert dflash_config.{name} > 0"
+            ))),
+        }
+    };
+    let conv_kernel_size = v2(raw.dflash_config.conv_kernel_size, "conv_kernel_size")?;
+    let conv_group_size = v2(raw.dflash_config.conv_group_size, "conv_group_size")?;
+    let selector_rank = v2(raw.dflash_config.selector_rank, "selector_rank")?;
+    let selector_top_k = v2(raw.dflash_config.selector_top_k, "selector_top_k")?;
+    if is_v2 && raw.hidden_size % conv_group_size != 0 {
+        return Err(InferError::Config(format!(
+            "draft DFlash 2 conv_group_size={conv_group_size} ne divise pas hidden_size={}",
+            raw.hidden_size
+        )));
+    }
+    let vocab_size = match (is_v2, raw.vocab_size) {
+        (true, Some(vocab)) if vocab > 0 => vocab,
+        (true, _) => {
+            return Err(InferError::Config(
+                "draft DFlash 2 requiert vocab_size > 0".to_string(),
+            ))
+        }
+        (false, vocab) => vocab.unwrap_or(0),
+    };
     if raw.hidden_size != target.hidden_size {
         return Err(InferError::Dimension(format!(
             "draft DFlash hidden_size={} incompatible avec trunk hidden_size={}",
@@ -522,6 +763,11 @@ pub fn load_dflash_draft_for_target(
         rope_theta,
         layer_types: raw.layer_types,
         sliding_window: raw.sliding_window,
+        vocab_size,
+        conv_kernel_size,
+        conv_group_size,
+        selector_rank,
+        selector_top_k,
     })
 }
 
@@ -602,6 +848,31 @@ pub fn load_dflash_draft_weights_for_target(
                 info.intermediate_size,
             )?,
         );
+        let conv = |name: &str| -> Result<Option<DFlashConv>> {
+            if info.conv_kernel_size == 0 {
+                return Ok(None);
+            }
+            let groups = hidden / info.conv_group_size;
+            let base_kernel = load_dflash_tensor(&st, &format!("{prefix}.{name}.base_kernel"))?;
+            expect_shape(
+                base_kernel.shape(),
+                &[2, info.conv_kernel_size, hidden],
+                &format!("{prefix}.{name}.base_kernel"),
+            )?;
+            Ok(Some(DFlashConv {
+                base_kernel,
+                kernel_projection: load_dflash_linear(
+                    &st,
+                    &format!("{prefix}.{name}.kernel_projection"),
+                    2 * info.conv_kernel_size * groups,
+                    hidden,
+                )?,
+                kernel_size: info.conv_kernel_size,
+                group_size: info.conv_group_size,
+            }))
+        };
+        let attention_conv = conv("attention_conv")?;
+        let mlp_conv = conv("mlp_conv")?;
         layers.push(DFlashDraftLayer {
             input_norm: load_dflash_norm(&st, &format!("{prefix}.input_layernorm.weight"), hidden)?,
             attention,
@@ -611,15 +882,39 @@ pub fn load_dflash_draft_weights_for_target(
                 hidden,
             )?,
             mlp,
+            attention_conv,
+            mlp_conv,
         });
     }
     let norm = load_dflash_norm(&st, "norm.weight", hidden)?;
+    let selector = if info.selector_rank > 0 {
+        let codebook = |key: &str| -> Result<Tensor> {
+            let tensor = load_dflash_tensor(&st, key)?;
+            expect_shape(tensor.shape(), &[info.vocab_size, info.selector_rank], key)?;
+            Ok(tensor)
+        };
+        Some(DFlashSelector {
+            hidden_projection: load_dflash_linear(
+                &st,
+                "candidate_selector.hidden_projection",
+                info.selector_rank,
+                hidden,
+            )?,
+            predecessor_codebook: codebook("candidate_selector.predecessor_codebook")?,
+            successor_codebook: codebook("candidate_selector.successor_codebook")?,
+            rank: info.selector_rank,
+            top_k: info.selector_top_k,
+        })
+    } else {
+        None
+    };
     Ok(DFlashDraft {
         info,
         hidden_norm,
         fc,
         layers,
         norm,
+        selector,
     })
 }
 
@@ -1025,5 +1320,83 @@ mod tests {
         fn data_len(&self) -> usize {
             self.data.len()
         }
+    }
+}
+
+#[cfg(test)]
+mod dflash2_tests {
+    use super::{DFlashConv, DFlashSelector};
+    use crate::{ForwardRuntime, Linear, Tensor};
+
+    #[test]
+    fn conv_is_causal_grouped_and_dynamic() {
+        // hidden 4, groupes de 2, 2 taps. Projection nulle sauf pour (noyau 0, tap 1, groupe 1)
+        // qui vaut la somme des entrées du token : noyau dynamique = Σx.
+        let hidden =
+            Tensor::from_vec(vec![2, 4], vec![1.0, 2.0, 3.0, 4.0, 1.0, 1.0, 1.0, 1.0]).unwrap();
+        // base[0] : tap 0 = identité, tap 1 = 0 ; base[1] : tap 0 = 2, tap 1 = 0.
+        let base = Tensor::from_vec(
+            vec![2, 2, 4],
+            vec![
+                1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+        )
+        .unwrap();
+        // Lignes de la projection : [noyau, tap, groupe] = (0,0,0) (0,0,1) (0,1,0) (0,1,1) (1,0,0) (1,0,1) (1,1,0) (1,1,1).
+        let mut proj = vec![0.0; 8 * 4];
+        proj[3 * 4..4 * 4].copy_from_slice(&[1.0, 1.0, 1.0, 1.0]);
+        let conv = DFlashConv {
+            base_kernel: base,
+            kernel_projection: Linear::new(Tensor::from_vec(vec![8, 4], proj).unwrap(), None)
+                .unwrap(),
+            kernel_size: 2,
+            group_size: 2,
+        };
+        let (out, dynamic) = conv.prepare(&hidden, ForwardRuntime::cpu()).unwrap();
+        // Token 0 : identité (pas de tap 1). Token 1 : identité + tap 1 dynamique (Σx = 4) sur le groupe 1
+        // appliqué à x[0] = [.., 3, 4].
+        assert_eq!(
+            out.data(),
+            &[
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+                1.0,
+                1.0,
+                1.0 + 4.0 * 3.0,
+                1.0 + 4.0 * 4.0
+            ]
+        );
+        let finished = conv.finish(&hidden, &dynamic).unwrap();
+        assert_eq!(finished.data(), &[2.0, 4.0, 6.0, 8.0, 2.0, 2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn selector_walks_from_anchor_with_transition_scores() {
+        // vocab 3, rang 1. pred = [1, 2, 3], succ = [1, 0, -1], projection = identité sur hidden 1.
+        let selector = DFlashSelector {
+            hidden_projection: Linear::new(Tensor::from_vec(vec![1, 1], vec![1.0]).unwrap(), None)
+                .unwrap(),
+            predecessor_codebook: Tensor::from_vec(vec![3, 1], vec![1.0, 2.0, 3.0]).unwrap(),
+            successor_codebook: Tensor::from_vec(vec![3, 1], vec![1.0, 0.0, -1.0]).unwrap(),
+            rank: 1,
+            top_k: 2,
+        };
+        let candidates = selector.top_candidates(&[0.5, 0.1, 0.4]);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().any(|&(t, _)| t == 0) && candidates.iter().any(|&(t, _)| t == 2));
+        // Position 0 (h = 1, précédent = ancre 1, pred 2) : token 0 → 0.5 + 2·1 = 2.5 ; token 2 → 0.4 − 2 = −1.6.
+        // Position 1 (h = −1, précédent 0, pred 1) : token 0 → 0.5 − 1 = −0.5 ; token 2 → 0.4 + 1 = 1.4.
+        let hidden = Tensor::from_vec(vec![2, 1], vec![1.0, -1.0]).unwrap();
+        let path = selector
+            .select(
+                &hidden,
+                &[candidates.clone(), candidates],
+                1,
+                ForwardRuntime::cpu(),
+            )
+            .unwrap();
+        assert_eq!(path, vec![0, 2]);
     }
 }

@@ -1321,6 +1321,11 @@ fn tiny_dflash_draft() -> crate::DFlashDraft {
             rope_theta: 10_000.0,
             layer_types: Vec::new(),
             sliding_window: None,
+            vocab_size: 0,
+            conv_kernel_size: 0,
+            conv_group_size: 0,
+            selector_rank: 0,
+            selector_top_k: 0,
         },
         hidden_norm: Tensor::from_vec(vec![2], vec![1.0, 1.0]).expect("invariant: norm valide"),
         fc: Linear::new(identity2().expect("invariant: fc valide"), None)
@@ -1351,8 +1356,11 @@ fn tiny_dflash_draft() -> crate::DFlashDraft {
                 Linear::new(identity2().expect("invariant: down valide"), None)
                     .expect("invariant: linear valide"),
             ),
+            attention_conv: None,
+            mlp_conv: None,
         }],
         norm: Tensor::from_vec(vec![2], vec![1.0, 1.0]).expect("invariant: norm valide"),
+        selector: None,
     }
 }
 

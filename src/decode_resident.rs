@@ -73,7 +73,7 @@ pub(crate) use self::gpu_position::{check_gpu_position_rows, GpuPosition};
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
-    LinearAttnDenseLayerWeights, LinearAttnLayerWeights,
+    LinearAttnDenseLayerWeights, LinearAttnLayerWeights, MtpD2Segments,
 };
 
 /// État résident d'UN decode (réserves C/D).

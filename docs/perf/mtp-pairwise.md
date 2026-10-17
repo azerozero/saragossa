@@ -157,6 +157,61 @@ cellule, 12 A/A, test des signes contre +2 %, Holm8.
 - Plafond 4 : perte partout, même adaptatif. Reste à 2.
 - Kernel skinny bf16 contre x3 (huit prompts, 200 tokens, draft fixe 8, hors
   protocole) : trois sorties sur huit divergent (T0, T1, T5). bf16 reste opt-in.
+- Phase 6b (17 octobre, après le correctif de la ligne KV du primaire, HEAD
+  `133e47d`, `models/pairwise/lookup-b/`) : lookup 8 contre PW03, 48 paires par
+  cellule, 6 A/A : T6 **+21,4 %** [20,6 ; 22,6], 48/48 victoires ; T2 −0,1 %
+  [−0,5 ; 0,4] ; A/A +0,2 %. Le défaut sur prompt long est confirmé.
+
+## Cycle D2 fusionné segmenté et contexte long
+
+`SARAGOSSA_RUST_GPU_COUNTERS=1` coupe désormais le cycle D2 fusionné en command
+buffers chronométrés CPU (append différé, tête MTP, chaque couche de
+vérification, queue) ; mêmes kernels, même état GPU, sortie identique. La coupe
+ajoute ~0,2 ms de soumission par segment, soit ~13 ms par cycle : les totaux
+segmentés dépassent le cycle non segmenté (63 contre 49 ms sur T0), les parts
+restent lisibles. Profils du 17 octobre, 64 tokens, draft fixe 2 (25 cycles) :
+
+| Segment | T0 (26 tokens) | T7 (8297 tokens) |
+|---|---:|---:|
+| append différé | 1,0 ms | 1,0 ms |
+| tête MTP (2 drafts) | 3,9 ms | 8,5 ms |
+| vérification, 16 couches full-attn | 13,3 ms (0,83 ms/couche) | 22,6 ms (1,41 ms/couche) |
+| vérification, 48 couches linear-attn | 43,1 ms (0,90 ms/couche) | 47,6 ms (0,99 ms/couche) |
+| queue (norme, lm_head, copies) | 2,1 ms | 2,1 ms |
+| cycle | 63,4 ms | 81,8 ms |
+
+- Surcoût à 8k : +9 ms d'attention du tronc sur 3 lignes (33 Mo de KV par
+  couche en 0,58 ms, soit ~60 Go/s, loin de la bande passante : le kernel
+  d'attention en lignes est le levier), +4,6 ms de tête MTP (attention sur son
+  historique committed de 8k), +4,5 ms sur les couches linear-attn (à confirmer,
+  indépendant du contexte en théorie).
+- Indépendamment du contexte, les 48 couches linear-attn font 43 des 63 ms du
+  cycle pour 3 lignes seulement : ~0,9 ms par couche pour une trentaine de
+  dispatches, borné par le nombre de dispatches et non par le calcul. Fusionner
+  le chemin en lignes des couches linear-attn est le levier commun au D2 et aux
+  vérifications larges.
+
+## Drafter DFlash 2 (prototype CPU, devtools)
+
+Drafter publié `z-lab/Qwen3.8-27B-DFlash2` (bf16, 3,8 Go, 5 couches, bloc 8,
+cibles 5/19/33/47/61, convolution causale dynamique 2 taps par groupes de 16
+autour de chaque sous-couche, sélecteur de candidats rang 256 sur le top 16 des
+logits). Chargé par `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`, harnais
+`SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1`, sémantique d'après `z-lab/dflash`
+(`model.py`, MIT). Greedy sans perte : sorties identiques à l'AR sur les quatre
+entrées, 64 tokens, 8 drafts par tour.
+
+| Entrée | tours | tokens acceptés | tokens par tour (bonus inclus) | MTP D2 aujourd'hui |
+|---|---:|---:|---:|---:|
+| T0 (prose courte) | 17 | 46 | 3,8 | ~2,8 |
+| T1 (code court) | 11 | 53 | 5,8 | ~2,8 |
+| T2 (prose longue) | 20 | 44 | 3,2 | ~2,2 |
+| T6 (code qui recopie) | 7 | 56 | 9,1 | 9 (lookup) |
+
+Décision : un drafter GPU ne paie qu'avec une vérification à 9 lignes bien
+moins chère que les 75 ms actuels (un pas AR coûte ~35 ms) : à 95 ms par tour,
+T1 et T6 gagnent, T0 et T2 perdent. Prérequis : fusion du chemin en lignes des
+couches linear-attn, puis mesure. Le prototype CPU (~11 tok/s) sert d'oracle.
 
 ## Limites
 

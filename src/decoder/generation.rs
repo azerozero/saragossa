@@ -2779,6 +2779,20 @@ impl CausalDecoder {
         let mut tokens = Vec::with_capacity(max_draft_tokens);
         // DFlash-MLX lit `draft_hidden[:, 1:, :]`: le premier rang porte le
         // `staged_first`, les propositions commencent sur les rangs masque.
+        if let Some(selector) = draft.selector.as_ref() {
+            // DFlash 2 : top-k des logits par position, puis parcours depuis l'ancre.
+            let mut candidates = Vec::with_capacity(rows - 1);
+            for row in 1..rows {
+                let state = Tensor::row(draft_states.row_slice(row)?.to_vec())?;
+                let logits = self.logits_from_linear_state(&state, &self.lm_head)?;
+                candidates.push(selector.top_candidates(logits.as_row()?));
+            }
+            let block = Tensor::from_vec(
+                vec![rows - 1, hidden],
+                draft_states.data()[hidden..].to_vec(),
+            )?;
+            return selector.select(&block, &candidates, primary, self.forward_runtime());
+        }
         for row in 1..rows {
             let state = Tensor::row(draft_states.row_slice(row)?.to_vec())?;
             tokens.push(self.sample_token_from_state(&state, options, sampler)?);

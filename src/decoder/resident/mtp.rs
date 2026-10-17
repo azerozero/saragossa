@@ -2054,13 +2054,18 @@ impl CausalDecoder {
         } else {
             None
         };
-        let command_buffer = arena.state.queue().new_command_buffer();
+        let queue = arena.state.queue();
+        let mut command_buffer = queue.new_command_buffer();
         let _barrier_guard = crate::metal_backend::resident_concurrent_enabled()
             .then(crate::metal_backend::install_dispatch_barrier_scope);
         let _namespace_guard =
             crate::metal_backend::install_scratch_namespace(arena.state.scratch_namespace());
         let encoder = new_resident_compute_encoder(command_buffer);
-        let encoder_guard = crate::metal_backend::EncoderEndGuard::new(encoder);
+        let mut encoder_guard = crate::metal_backend::EncoderEndGuard::new(encoder);
+        // Compteurs GPU : le cycle est coupé en command buffers chronométrés CPU
+        // (append, tête, chaque couche de vérification, queue), état GPU inchangé.
+        let timer = arena.state.gpu_timer();
+        let mut segments = crate::decode_resident::MtpD2Segments::default();
         let mut owned: Vec<metal::Buffer> = Vec::new();
         let mut scratch: Vec<ScratchLease> = Vec::new();
 
@@ -2095,6 +2100,10 @@ impl CausalDecoder {
                 history_len,
                 &mut scratch,
             )?;
+        }
+        if timer.is_some() {
+            segments.append_ns +=
+                cut_fused_segment(queue, &mut command_buffer, &mut encoder_guard)?;
         }
 
         {
@@ -2276,6 +2285,9 @@ impl CausalDecoder {
             }
             mtp.current_is_a = current_is_a;
         }
+        if timer.is_some() {
+            segments.head_ns += cut_fused_segment(queue, &mut command_buffer, &mut encoder_guard)?;
+        }
 
         let verify_a = arena
             .state
@@ -2356,7 +2368,8 @@ impl CausalDecoder {
         let target_position = *cache_position;
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_cache = &mut layers[index];
-            if self.config.is_resident_full_attention_layer(index) {
+            let is_full = self.config.is_resident_full_attention_layer(index);
+            if is_full {
                 let dims = self.config.resident_windowed_full_attn_layer_dims(
                     index,
                     hidden,
@@ -2413,6 +2426,16 @@ impl CausalDecoder {
                 )?;
             }
             std::mem::swap(&mut current, &mut other);
+            if timer.is_some() {
+                let elapsed = cut_fused_segment(queue, &mut command_buffer, &mut encoder_guard)?;
+                if is_full {
+                    segments.verify_full_ns += elapsed;
+                    segments.verify_full_layers += 1;
+                } else {
+                    segments.verify_linear_ns += elapsed;
+                    segments.verify_linear_layers += 1;
+                }
+            }
         }
 
         let verify_final = arena
@@ -2473,7 +2496,6 @@ impl CausalDecoder {
         scratch.push(verify_b);
 
         encoder_guard.end();
-        let timer = arena.state.gpu_timer();
         let started = timer.map(|_| std::time::Instant::now());
         let keep_going = if let Some(work) = after_submit {
             crate::metal_backend::commit_and_wait_with(command_buffer, work)?
@@ -2482,7 +2504,9 @@ impl CausalDecoder {
             true
         };
         if let (Some(timer), Some(started)) = (timer, started) {
-            timer.record_mtp_cycle(2, started.elapsed().as_nanos());
+            segments.tail_ns = started.elapsed().as_nanos();
+            segments.cycles = 1;
+            timer.record_mtp_d2_segments(segments);
         }
         if !keep_going {
             return Ok(None);
@@ -2656,4 +2680,25 @@ impl CausalDecoder {
             bonus_verified,
         }))
     }
+}
+
+/// Compteurs GPU (`SARAGOSSA_RUST_GPU_COUNTERS`) : clôt le command buffer courant du
+/// cycle fusionné, attend sa fin (chronométrée CPU) et repart sur un neuf. Mêmes
+/// kernels, même ordre, état GPU persistant : résultat numérique identique.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn cut_fused_segment<'q>(
+    queue: &'q metal::CommandQueue,
+    command_buffer: &mut &'q metal::CommandBufferRef,
+    encoder_guard: &mut crate::metal_backend::EncoderEndGuard<'q>,
+) -> Result<u128> {
+    let next = queue.new_command_buffer();
+    let previous = std::mem::replace(
+        encoder_guard,
+        crate::metal_backend::EncoderEndGuard::new(new_resident_compute_encoder(next)),
+    );
+    previous.end();
+    let started = std::time::Instant::now();
+    crate::metal_backend::commit_and_wait(command_buffer)?;
+    *command_buffer = next;
+    Ok(started.elapsed().as_nanos())
 }

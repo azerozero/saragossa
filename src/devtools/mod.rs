@@ -490,7 +490,7 @@ pub fn run_resident_linear_xray(
 pub fn print_dflash_draft(draft: &DFlashDraft) {
     let info = &draft.info;
     println!(
-        "dflash_draft loaded tensors={} layers={} loaded_layers={} hidden={} block_size={} mask_token={} target_layers={}",
+        "dflash_draft loaded tensors={} layers={} loaded_layers={} hidden={} block_size={} mask_token={} target_layers={} variant={}",
         info.tensor_count,
         info.num_hidden_layers,
         draft.layers.len(),
@@ -501,7 +501,15 @@ pub fn print_dflash_draft(draft: &DFlashDraft) {
             .iter()
             .map(usize::to_string)
             .collect::<Vec<_>>()
-            .join(",")
+            .join(","),
+        if draft.selector.is_some() {
+            format!(
+                "dflash2(conv {}x{}, sélecteur rang {} top {})",
+                info.conv_kernel_size, info.conv_group_size, info.selector_rank, info.selector_top_k
+            )
+        } else {
+            "dflash1".to_string()
+        }
     );
 }
 
