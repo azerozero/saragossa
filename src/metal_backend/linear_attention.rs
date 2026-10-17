@@ -2908,8 +2908,22 @@ impl MetalExecutor {
                 layout,
                 false,
             )?;
-            for row in 0..rows {
-                self.encode_linear_attn_gated_delta_row(
+            // Delta : un dispatch par séquence qui écrit aussi les captures SSM
+            // (f32, au plus 8 captures), sinon la boucle par ligne avec copies.
+            let capture_rows = captures.map_or(0, |c| c.len().min(rows.saturating_sub(1)));
+            let fused_seq = !state.ssm_bf16
+                && capture_rows <= Self::LINEAR_ATTN_SEQ_MAX_CAPTURES
+                && linear_rows_seq_delta_enabled();
+            if fused_seq {
+                let ssm_captures: Vec<&BufferRef> = captures
+                    .map(|c| {
+                        c[..capture_rows]
+                            .iter()
+                            .map(|cap| cap.ssm.as_ref())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.encode_linear_attn_gated_delta_seq_captures_dk128(
                     encoder,
                     &conv_out_rows,
                     &q_norm_rows,
@@ -2917,11 +2931,28 @@ impl MetalExecutor {
                     &beta_rows,
                     &decay_rows,
                     &state.ssm,
-                    state.ssm_bf16,
                     &y_rows,
+                    rows,
+                    &ssm_captures,
                     spec,
-                    row,
                 )?;
+            }
+            for row in 0..rows {
+                if !fused_seq {
+                    self.encode_linear_attn_gated_delta_row(
+                        encoder,
+                        &conv_out_rows,
+                        &q_norm_rows,
+                        &k_norm_rows,
+                        &beta_rows,
+                        &decay_rows,
+                        &state.ssm,
+                        state.ssm_bf16,
+                        &y_rows,
+                        spec,
+                        row,
+                    )?;
+                }
                 if let Some(capture) = captures.filter(|_| row + 1 < rows).map(|c| &c[row]) {
                     self.encode_linear_attn_conv_state_shift(
                         encoder,
@@ -2932,7 +2963,9 @@ impl MetalExecutor {
                         conv_dim,
                         row + 1,
                     )?;
-                    self.encode_capture_linear_attn_ssm_state(encoder, state, capture)?;
+                    if !fused_seq {
+                        self.encode_capture_linear_attn_ssm_state(encoder, state, capture)?;
+                    }
                 }
             }
             self.encode_linear_attn_conv_state_shift(

@@ -3293,6 +3293,135 @@ kernel void linear_attn_gated_delta_seq_dk128_tg4_f32(
     ssm_state[idx3] = state3;
 }
 
+// Variante du kernel précédent qui écrit aussi l'état SSM après chaque pas `t <
+// capture_count` dans `capture_t` (vérification en lignes : états intermédiaires
+// pour le rollback), au lieu d'un dispatch delta par ligne suivi d'une copie
+// d'état par capture. Même arithmétique, même ordre : y et état finaux identiques.
+kernel void linear_attn_gated_delta_seq_capture_dk128_tg4_f32(
+    device const float* conv_out [[buffer(0)]],
+    device const float* q_norm [[buffer(1)]],
+    device const float* k_norm [[buffer(2)]],
+    device const float* beta [[buffer(3)]],
+    device const float* decay [[buffer(4)]],
+    device float* ssm_state [[buffer(5)]],
+    device float* y [[buffer(6)]],
+    constant uint4& dims [[buffer(7)]],
+    constant uint& steps [[buffer(8)]],
+    constant uint& capture_count [[buffer(9)]],
+    device float* capture_0 [[buffer(10)]],
+    device float* capture_1 [[buffer(11)]],
+    device float* capture_2 [[buffer(12)]],
+    device float* capture_3 [[buffer(13)]],
+    device float* capture_4 [[buffer(14)]],
+    device float* capture_5 [[buffer(15)]],
+    device float* capture_6 [[buffer(16)]],
+    device float* capture_7 [[buffer(17)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]
+) {
+    const uint value_heads = dims.x;
+    const uint value_head_dim = dims.y;
+    const uint key_head_dim = dims.z;
+    const uint repeat = dims.w;
+    const uint lane = tid.x;
+    const uint value_col = gid.y;
+    const uint value_head = gid.z;
+    if (value_head >= value_heads || value_col >= value_head_dim || repeat == 0u || lane >= 32u || key_head_dim != 128u) {
+        return;
+    }
+
+    const uint key_heads = value_heads / repeat;
+    const uint key_dim = key_heads * 128u;
+    const uint value_dim = value_heads * value_head_dim;
+    const uint conv_dim = (2u * key_dim) + value_dim;
+    const uint key_head = value_head / repeat;
+    const uint key_base = key_head * 128u;
+    const uint value_index = value_head * value_head_dim + value_col;
+    const uint state_base = value_index * 128u;
+
+    const uint idx0 = state_base + lane;
+    const uint idx1 = idx0 + 32u;
+    const uint idx2 = idx0 + 64u;
+    const uint idx3 = idx0 + 96u;
+    const uint key0 = key_base + lane;
+    const uint key1 = key0 + 32u;
+    const uint key2 = key0 + 64u;
+    const uint key3 = key0 + 96u;
+
+    float state0 = ssm_state[idx0];
+    float state1 = ssm_state[idx1];
+    float state2 = ssm_state[idx2];
+    float state3 = ssm_state[idx3];
+
+    for (uint t = 0u; t < steps; ++t) {
+        const uint key_offset = t * key_dim;
+        const uint value_offset = t * value_dim;
+        const uint conv_offset = t * conv_dim;
+        const uint gate_offset = t * value_heads;
+        const float d = decay[gate_offset + value_head];
+        const float beta_v = beta[gate_offset + value_head];
+
+        state0 *= d;
+        state1 *= d;
+        state2 *= d;
+        state3 *= d;
+
+        const float k0 = k_norm[key_offset + key0];
+        const float k1 = k_norm[key_offset + key1];
+        const float k2 = k_norm[key_offset + key2];
+        const float k3 = k_norm[key_offset + key3];
+        float kv_part = 0.0f;
+        kv_part += state0 * k0;
+        kv_part += state1 * k1;
+        kv_part += state2 * k2;
+        kv_part += state3 * k3;
+        const float kv_mem = simd_sum(kv_part);
+        const float v = conv_out[conv_offset + (2u * key_dim) + value_index];
+        const float delta = (v - kv_mem) * beta_v;
+
+        state0 += delta * k0;
+        state1 += delta * k1;
+        state2 += delta * k2;
+        state3 += delta * k3;
+
+        const float q0 = q_norm[key_offset + key0];
+        const float q1 = q_norm[key_offset + key1];
+        const float q2 = q_norm[key_offset + key2];
+        const float q3 = q_norm[key_offset + key3];
+        float y_part = 0.0f;
+        y_part += state0 * q0;
+        y_part += state1 * q1;
+        y_part += state2 * q2;
+        y_part += state3 * q3;
+        const float out = simd_sum(y_part);
+        if (lane == 0u) {
+            y[value_offset + value_index] = out;
+        }
+        if (t < capture_count) {
+            device float* capture = capture_0;
+            switch (t) {
+                case 1u: capture = capture_1; break;
+                case 2u: capture = capture_2; break;
+                case 3u: capture = capture_3; break;
+                case 4u: capture = capture_4; break;
+                case 5u: capture = capture_5; break;
+                case 6u: capture = capture_6; break;
+                case 7u: capture = capture_7; break;
+                default: break;
+            }
+            capture[idx0] = state0;
+            capture[idx1] = state1;
+            capture[idx2] = state2;
+            capture[idx3] = state3;
+        }
+    }
+
+    ssm_state[idx0] = state0;
+    ssm_state[idx1] = state1;
+    ssm_state[idx2] = state2;
+    ssm_state[idx3] = state3;
+}
+
 kernel void linear_attn_gated_delta_seq_dk128_bf16_tg4_f32(
     device const float* conv_out [[buffer(0)]],
     device const float* q_norm [[buffer(1)]],

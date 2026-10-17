@@ -186,10 +186,20 @@ restent lisibles. Profils du 17 octobre, 64 tokens, draft fixe 2 (25 cycles) :
   historique committed de 8k), +4,5 ms sur les couches linear-attn (à confirmer,
   indépendant du contexte en théorie).
 - Indépendamment du contexte, les 48 couches linear-attn font 43 des 63 ms du
-  cycle pour 3 lignes seulement : ~0,9 ms par couche pour une trentaine de
-  dispatches, borné par le nombre de dispatches et non par le calcul. Fusionner
-  le chemin en lignes des couches linear-attn est le levier commun au D2 et aux
-  vérifications larges.
+  cycle pour 3 lignes seulement. Compteurs par site (`SARAGOSSA_RUST_DECODE_PROFILE_SITES`) :
+  par couche linéaire, 3 dispatches delta par ligne et 3 glissements d'état conv ;
+  par couche full, 6 copies KV et 6 norm/rope par ligne ; ~1000 dispatches par cycle.
+- Matmuls à M=3 (microbench `small_m_qmm_microbench`, poids chauds) : le qmv
+  répliqué coûte 1,6 à 1,9 fois le M=1 (gate/up 0,175 contre 0,091 ms, down 0,139
+  contre 0,078), soit ~18 ms par cycle D2 sur 64 couches. Trois kernels « R lignes
+  par thread » (une lecture des poids pour R lignes, ordre d'addition conservé) ont
+  été mesurés plus lents en decode réel (0,96 à 1,05 ms par couche linéaire contre
+  0,85) et supprimés : à petit M le qmv est borné par la latence par thread, et les
+  3× threadgroups du qmv répliqué la masquent mieux.
+- Delta linear-attn par séquence avec captures (`linear_attn_gated_delta_seq_capture_dk128_tg4_f32`,
+  `SARAGOSSA_RUST_LINEAR_ROWS_SEQ_DELTA=0` pour la boucle) : un dispatch au lieu de
+  3 delta + 2 copies d'état par couche à M=3 ; couche linéaire 0,806 contre 0,850 ms
+  (−2 ms par cycle D2), sorties T0 et T6 byte-identiques.
 
 ## Drafter DFlash 2 (prototype CPU, devtools)
 

@@ -405,6 +405,135 @@ fn linear_attn_gated_delta_seq_dk128_matches_step_loop() -> Result<()> {
 }
 
 #[test]
+fn linear_attn_gated_delta_seq_capture_dk128_matches_step_loop_states() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let spec = LinearAttentionStepSpec {
+        num_key_heads: 2,
+        num_value_heads: 4,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel_dim: 4,
+        rms_eps: 1.0e-6,
+    };
+    // Neuf lignes (vérification à 8 drafts) : huit captures, le maximum du kernel.
+    let steps = 9_usize;
+    let captures = steps - 1;
+    let repeat = spec.num_value_heads / spec.num_key_heads;
+    let key_dim = spec.num_key_heads * spec.key_head_dim;
+    let value_dim = spec.num_value_heads * spec.value_head_dim;
+    let conv_dim = key_dim * 2 + value_dim;
+    let state_len = spec.num_value_heads * spec.value_head_dim * spec.key_head_dim;
+    let conv_out: Vec<f32> = (0..steps * conv_dim)
+        .map(|idx| ((idx as f32) * 0.013).sin() * 0.5)
+        .collect();
+    let q_norm: Vec<f32> = (0..steps * key_dim)
+        .map(|idx| ((idx as f32) * 0.021).cos() * 0.25)
+        .collect();
+    let k_norm: Vec<f32> = (0..steps * key_dim)
+        .map(|idx| ((idx as f32) * 0.023).sin() * 0.25)
+        .collect();
+    let beta: Vec<f32> = (0..steps * spec.num_value_heads)
+        .map(|idx| 0.3 + (idx % spec.num_value_heads) as f32 * 0.05)
+        .collect();
+    let decay: Vec<f32> = (0..steps * spec.num_value_heads)
+        .map(|idx| 0.9 - (idx % spec.num_value_heads) as f32 * 0.02)
+        .collect();
+    let state_seed: Vec<f32> = (0..state_len)
+        .map(|idx| ((idx as f32) * 0.009).cos() * 0.1)
+        .collect();
+    let dims = [
+        spec.num_value_heads as u32,
+        spec.value_head_dim as u32,
+        spec.key_head_dim as u32,
+        repeat as u32,
+    ];
+    let conv_out_buffer = executor.upload_f32_buffer(&conv_out, "delta_cap_conv_out")?;
+    let q_norm_buffer = executor.upload_f32_buffer(&q_norm, "delta_cap_q_norm")?;
+    let k_norm_buffer = executor.upload_f32_buffer(&k_norm, "delta_cap_k_norm")?;
+    let beta_buffer = executor.upload_f32_buffer(&beta, "delta_cap_beta")?;
+    let decay_buffer = executor.upload_f32_buffer(&decay, "delta_cap_decay")?;
+    // Référence : boucle par pas, état relu après chaque pas.
+    let loop_ssm = executor.upload_f32_buffer(&state_seed, "delta_cap_loop_ssm")?;
+    let loop_y = executor.uncached_f32_buffer(steps * value_dim, "delta_cap_loop_y")?;
+    let mut loop_states = Vec::with_capacity(captures);
+    for step in 0..steps {
+        let command_buffer = executor.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&executor.linear_attn_gated_delta_dk128_tg4_f32);
+        encoder.set_buffer(0, Some(&conv_out_buffer), byte_offset_f32(step * conv_dim, "cap conv")?);
+        encoder.set_buffer(1, Some(&q_norm_buffer), byte_offset_f32(step * key_dim, "cap q")?);
+        encoder.set_buffer(2, Some(&k_norm_buffer), byte_offset_f32(step * key_dim, "cap k")?);
+        encoder.set_buffer(
+            3,
+            Some(&beta_buffer),
+            byte_offset_f32(step * spec.num_value_heads, "cap beta")?,
+        );
+        encoder.set_buffer(
+            4,
+            Some(&decay_buffer),
+            byte_offset_f32(step * spec.num_value_heads, "cap decay")?,
+        );
+        encoder.set_buffer(5, Some(&loop_ssm), 0);
+        encoder.set_buffer(6, Some(&loop_y), byte_offset_f32(step * value_dim, "cap y")?);
+        set_u32_bytes(encoder, 7, &dims, "delta_cap_loop_dims")?;
+        encoder.dispatch_threads(
+            MTLSize::new(32, spec.value_head_dim as u64, spec.num_value_heads as u64),
+            MTLSize::new(32, 4, 1),
+        );
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        if step + 1 < steps {
+            loop_states.push(read_f32_buffer(&loop_ssm, state_len)?);
+        }
+    }
+    // Candidat : un dispatch, captures écrites par le kernel.
+    let seq_ssm = executor.upload_f32_buffer(&state_seed, "delta_cap_ssm")?;
+    let seq_y = executor.uncached_f32_buffer(steps * value_dim, "delta_cap_y")?;
+    let capture_buffers = (0..captures)
+        .map(|index| executor.uncached_f32_buffer(state_len, if index % 2 == 0 { "delta_cap_a" } else { "delta_cap_b" }))
+        .collect::<Result<Vec<_>>>()?;
+    let capture_refs: Vec<&BufferRef> = capture_buffers.iter().map(|b| b.as_ref()).collect();
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_linear_attn_gated_delta_seq_captures_dk128(
+        encoder,
+        &conv_out_buffer,
+        &q_norm_buffer,
+        &k_norm_buffer,
+        &beta_buffer,
+        &decay_buffer,
+        &seq_ssm,
+        &seq_y,
+        steps,
+        &capture_refs,
+        spec,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    assert_close_eps(
+        &read_f32_buffer(&seq_y, steps * value_dim)?,
+        &read_f32_buffer(&loop_y, steps * value_dim)?,
+        1.0e-5,
+    );
+    assert_close_eps(
+        &read_f32_buffer(&seq_ssm, state_len)?,
+        &read_f32_buffer(&loop_ssm, state_len)?,
+        1.0e-5,
+    );
+    for (index, (capture, expected)) in capture_buffers.iter().zip(&loop_states).enumerate() {
+        let actual = read_f32_buffer(capture, state_len)?;
+        assert_close_eps(&actual, expected, 1.0e-5);
+        assert!(
+            actual.iter().zip(expected).any(|(a, e)| a == e) && actual != state_seed,
+            "capture {index} non écrite"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn linear_attn_conv_k4_matches_generic() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());

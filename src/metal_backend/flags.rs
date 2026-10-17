@@ -333,6 +333,15 @@ pub(super) fn linear_delta_dk128_enabled() -> bool {
 /// Vérification MTP : conv/normes/gates et rms-gate batchés sur les lignes du
 /// draft (kernels du prefill) au lieu d'une boucle de dispatches par ligne.
 /// `SARAGOSSA_RUST_LINEAR_ROWS_BATCHED=0` rétablit la boucle (repli A/B).
+/// Delta par séquence avec captures SSM dans le chemin en lignes (un dispatch au
+/// lieu de `rows` delta + copies). `SARAGOSSA_RUST_LINEAR_ROWS_SEQ_DELTA=0` : boucle.
+pub(super) fn linear_rows_seq_delta_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::runtime_flags::env_flag("SARAGOSSA_RUST_LINEAR_ROWS_SEQ_DELTA", true)
+    })
+}
+
 pub(super) fn linear_rows_batched_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_ROWS_BATCHED", true))

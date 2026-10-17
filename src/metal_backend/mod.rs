@@ -197,6 +197,7 @@ pub struct MetalExecutor {
     linear_attn_gated_delta_f32: ComputePipelineState,
     linear_attn_gated_delta_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_seq_dk128_tg4_f32: ComputePipelineState,
+    linear_attn_gated_delta_seq_capture_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_seq_dk128_bf16_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_dk128_bf16_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_inv_dk128_tg4_f32: ComputePipelineState,

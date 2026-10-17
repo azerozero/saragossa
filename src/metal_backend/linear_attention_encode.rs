@@ -252,6 +252,9 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Captures d'état SSM par pas que le kernel `seq_capture` peut écrire (8 slots).
+    pub(super) const LINEAR_ATTN_SEQ_MAX_CAPTURES: usize = 8;
+
     #[expect(
         clippy::too_many_arguments,
         reason = "signature d'encodage Metal: scan sequence + buffers explicites"
@@ -311,6 +314,95 @@ impl MetalExecutor {
             &[checked_u32(steps, "linear-attn seq steps")?],
             "linear_attn_seq_delta_steps",
         )?;
+        profile_dispatch();
+        let value_head_dim = checked_nsuint(spec.value_head_dim, "linear-attn seq value dim")?;
+        let tg_rows = linear_delta_tg_rows().min(value_head_dim);
+        encoder.dispatch_threads(
+            MTLSize::new(
+                LINEAR_ATTN_TG_WIDTH,
+                value_head_dim,
+                checked_nsuint(spec.num_value_heads, "linear-attn seq value heads")?,
+            ),
+            MTLSize::new(LINEAR_ATTN_TG_WIDTH, tg_rows, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Delta par séquence sur `steps` lignes (f32, dk128) avec capture de l'état SSM
+    /// après chaque ligne `t < captures.len()` (au plus 8), en un dispatch : remplace
+    /// `steps` dispatches `delta_row` et `captures.len()` copies d'état.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "buffers d'un pas linear-attn + captures : interface des encodeurs delta"
+    )]
+    pub(super) fn encode_linear_attn_gated_delta_seq_captures_dk128(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        conv_out_buffer: &BufferRef,
+        q_norm_buffer: &BufferRef,
+        k_norm_buffer: &BufferRef,
+        beta_buffer: &BufferRef,
+        decay_buffer: &BufferRef,
+        ssm_state_buffer: &BufferRef,
+        y_buffer: &BufferRef,
+        steps: usize,
+        captures: &[&BufferRef],
+        spec: LinearAttentionStepSpec,
+    ) -> Result<()> {
+        if steps == 0
+            || captures.len() > Self::LINEAR_ATTN_SEQ_MAX_CAPTURES
+            || captures.len() >= steps
+        {
+            return Err(InferError::Dimension(format!(
+                "linear-attn seq captures : {} captures pour {steps} pas (max {})",
+                captures.len(),
+                Self::LINEAR_ATTN_SEQ_MAX_CAPTURES
+            )));
+        }
+        if spec.key_head_dim != 128 {
+            return Err(InferError::Dimension(format!(
+                "linear-attn seq attend key_head_dim=128, reçu {}",
+                spec.key_head_dim
+            )));
+        }
+        let repeat = spec
+            .num_value_heads
+            .checked_div(spec.num_key_heads)
+            .ok_or_else(|| InferError::Metal("linear-attn seq repeat nul".to_string()))?;
+        let dims = [
+            checked_u32(spec.num_value_heads, "linear-attn seq value heads")?,
+            checked_u32(spec.value_head_dim, "linear-attn seq value dim")?,
+            checked_u32(spec.key_head_dim, "linear-attn seq key dim")?,
+            checked_u32(repeat, "linear-attn seq repeat")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.linear_attn_gated_delta_seq_capture_dk128_tg4_f32);
+        encoder.set_buffer(0, Some(conv_out_buffer), 0);
+        encoder.set_buffer(1, Some(q_norm_buffer), 0);
+        encoder.set_buffer(2, Some(k_norm_buffer), 0);
+        encoder.set_buffer(3, Some(beta_buffer), 0);
+        encoder.set_buffer(4, Some(decay_buffer), 0);
+        encoder.set_buffer(5, Some(ssm_state_buffer), 0);
+        encoder.set_buffer(6, Some(y_buffer), 0);
+        set_u32_bytes(encoder, 7, &dims, "linear_attn_seq_delta_dims")?;
+        set_u32_bytes(
+            encoder,
+            8,
+            &[checked_u32(steps, "linear-attn seq steps")?],
+            "linear_attn_seq_delta_steps",
+        )?;
+        set_u32_bytes(
+            encoder,
+            9,
+            &[checked_u32(captures.len(), "linear-attn seq captures")?],
+            "linear_attn_seq_delta_captures",
+        )?;
+        // Les emplacements non utilisés pointent sur la première capture (jamais lus
+        // au-delà de `capture_count`) : tous les buffers du kernel restent liés.
+        for slot in 0..Self::LINEAR_ATTN_SEQ_MAX_CAPTURES {
+            let buffer = captures.get(slot).or(captures.first()).copied();
+            encoder.set_buffer(10 + slot as u64, buffer.or(Some(ssm_state_buffer)), 0);
+        }
         profile_dispatch();
         let value_head_dim = checked_nsuint(spec.value_head_dim, "linear-attn seq value dim")?;
         let tg_rows = linear_delta_tg_rows().min(value_head_dim);
