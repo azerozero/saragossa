@@ -298,6 +298,34 @@ impl DFlashResident {
         self.context_len
     }
 
+    /// Déclare `rows` positions de contexte jamais projetées (début du prompt hors
+    /// fenêtre) : le KV avance sans écriture, les positions restent absolues.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une couche n'est pas fenêtrée (elle lirait ces
+    /// positions) ou si le KV déborde.
+    pub(crate) fn skip_context(&mut self, rows: usize) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if self
+            .layers
+            .iter()
+            .any(|layer| layer.sliding_window.is_none())
+        {
+            return Err(InferError::Config(
+                "drafter résident: skip_context exige des couches fenêtrées".to_string(),
+            ));
+        }
+        let next = self.context_len + rows;
+        for layer in &mut self.layers {
+            layer.kv.truncate(next)?;
+        }
+        self.context_len = next;
+        Ok(())
+    }
+
     /// Ramène le contexte à `len` positions (rejet d'un bloc déjà projeté).
     ///
     /// # Errors

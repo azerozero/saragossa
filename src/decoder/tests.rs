@@ -2513,3 +2513,65 @@ fn resident_sampling_predicates_route_default_and_readback() {
 // (`decode_token_resident`), non instanciable par le modèle synthétique de test
 // (sans MoE → `supports_resident_full_decode()=false`). La validation 1c est
 // l'oracle 35B réel (texte greedy ==CPU + A/B).
+
+// --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
+
+/// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
+/// l'AR, même acceptance. Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` et
+/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` (quantification via
+/// `SARAGOSSA_RUST_DFLASH_QUANT_BITS`, appliquée aux deux boucles).
+#[test]
+#[ignore = "modèle réel + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let Some(draft_dir) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")
+    else {
+        eprintln!("skip DFlash résident: SARAGOSSA_RUST_DFLASH_DRAFT_DIR absent");
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let draft = crate::load_dflash_draft_weights_quantized(
+        &assets.config,
+        PathBuf::from(draft_dir),
+        crate::DFlashQuant::from_env()?,
+    )?;
+    let prompt = mtp_verifier_prompt_ids(
+        &assets,
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+    )?;
+    let options = mtp_verifier_options(Vec::new());
+    let max_new_tokens = 32;
+    let ar = model.generate_greedy_cached_with_options(&prompt, max_new_tokens, &options)?;
+    let cpu = model.generate_greedy_dflash_batched_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        &draft,
+        draft.info.block_size,
+    )?;
+    let resident = model.generate_greedy_dflash_resident_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        &draft,
+        draft.info.block_size,
+    )?;
+    eprintln!(
+        "DFlash résident: cpu {} ms ({} acceptés / {} proposés), résident {} ms ({} / {})",
+        cpu.loop_duration.as_millis(),
+        cpu.stats.accepted,
+        cpu.stats.proposed,
+        resident.loop_duration.as_millis(),
+        resident.stats.accepted,
+        resident.stats.proposed
+    );
+    assert_eq!(resident.tokens, ar, "boucle résidente divergente de l'AR");
+    assert_eq!(cpu.tokens, ar, "boucle CPU divergente de l'AR");
+    assert_eq!(resident.stats.accepted, cpu.stats.accepted);
+    assert_eq!(resident.stats.proposed, cpu.stats.proposed);
+    Ok(())
+}

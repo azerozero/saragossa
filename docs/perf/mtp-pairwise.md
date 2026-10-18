@@ -269,6 +269,37 @@ moins chère que les 75 ms actuels (un pas AR coûte ~35 ms) : à 95 ms par tour
 T1 et T6 gagnent, T0 et T2 perdent. Prérequis : fusion du chemin en lignes des
 couches linear-attn, puis mesure. Le prototype CPU (~11 tok/s) sert d'oracle.
 
+### Drafter résident (18 octobre, non mesuré)
+
+Chantier préparé, à mesurer machine libre (`dflash_resident.sh` dans le scratchpad :
+`oracle`, `quant`, `bench`). Ce qui existe :
+
+- `AffineQuantizedTensor::quantize` : quantification affine Rust (layout MLX, u4/u8
+  gs64). `SARAGOSSA_RUST_DFLASH_QUANT_BITS=4|8` quantifie les projections du draft
+  au chargement (fc, q/k/v/o, gate/up/down, noyaux dynamiques) : 3,8 Go bf16 →
+  ~0,8 Go lus par tour. Normes, sélecteur et codebooks restent en f32. L'acceptance
+  avec draft quantifié n'est pas encore mesurée (`quant`).
+- `decode_resident/dflash.rs` : mini-décodeur sur `block` lignes dans l'encoder
+  partagé (matmuls du tronc, convolution dynamique en un kernel, RoPE/append/
+  attention en lignes sur un KV de contexte par couche, repli ligne par ligne
+  fenêtré au-delà de la fenêtre glissante de 2048, top-k des logits sur GPU,
+  projection du sélecteur). Parcours des codebooks sur CPU. Oracle synthétique
+  `dflash_resident_block_matches_cpu` (états, top-k et parcours identiques).
+- `decoder/resident/dflash.rs` : boucle `generate_greedy_dflash_resident_with_options`
+  (`SARAGOSSA_RUST_DFLASH_RESIDENT=1` dans le harnais d'acceptance) : proposition
+  GPU, vérification résidente en lignes avec captures (rollback par troncature,
+  sans rejeu, contrairement à la boucle CPU qui rejoue les tokens commités), contexte
+  du drafter nourri des hidden states commités. Prefill du contexte limité aux 2048
+  dernières positions du prompt (toutes les couches sont fenêtrées). Oracle modèle
+  réel ignoré `dflash_resident_matches_cpu_loop_real_model` (résident == CPU == AR).
+
+Coût attendu par tour : vérification à 9 lignes 68 ms + drafter ~5 ms (u4) + 3
+synchronisations (draft, vérification, append du contexte). Estimation : T0 ~52,
+T1 ~79, T2 ~44, T6 ~125 tok/s contre 50 / 50 / 39 / 73 aujourd'hui, seuil de
+rentabilité à 77 ms par tour sur T0 et T2. À faire après mesure : fusionner
+l'append du contexte dans le command buffer de vérification (captures GPU sans
+readback), prefill du contexte depuis les captures du prefill résident.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

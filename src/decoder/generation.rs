@@ -1114,7 +1114,7 @@ impl CausalDecoder {
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn restore_mtp_resident_progress(
+    pub(in crate::decoder) fn restore_mtp_resident_progress(
         &self,
         cache: &mut CausalDecoderCache,
         captures: &ResidentVerifyCaptures,
@@ -2813,7 +2813,7 @@ impl CausalDecoder {
     }
 
     #[cfg(feature = "devtools")]
-    fn validate_dflash_draft(&self, draft: &DFlashDraft) -> Result<()> {
+    pub(in crate::decoder) fn validate_dflash_draft(&self, draft: &DFlashDraft) -> Result<()> {
         let hidden = self.final_norm.len();
         if draft.info.hidden_size != hidden {
             return Err(InferError::Dimension(format!(
@@ -2825,7 +2825,7 @@ impl CausalDecoder {
     }
 
     #[cfg(feature = "devtools")]
-    fn prefill_cache_state_with_layer_capture(
+    pub(in crate::decoder) fn prefill_cache_state_with_layer_capture(
         &self,
         prompt: &[usize],
         layer_ids: &[usize],

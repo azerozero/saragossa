@@ -313,10 +313,17 @@ pub fn run_dflash_acceptance(
     let reference = decoder
         .generate_greedy_dflash_reference_with_options(prompt_ids, max_tokens, options, draft)?;
     let reference_elapsed = reference_started.elapsed();
+    let resident = env_flag("SARAGOSSA_RUST_DFLASH_RESIDENT", false);
     let spec_started = Instant::now();
-    let spec = decoder.generate_greedy_dflash_batched_with_options(
-        prompt_ids, max_tokens, options, draft, max_draft,
-    )?;
+    let spec = if resident {
+        decoder.generate_greedy_dflash_resident_with_options(
+            prompt_ids, max_tokens, options, draft, max_draft,
+        )?
+    } else {
+        decoder.generate_greedy_dflash_batched_with_options(
+            prompt_ids, max_tokens, options, draft, max_draft,
+        )?
+    };
     let spec_elapsed = spec_started.elapsed();
     let tokens_equal = reference == spec.tokens;
     let generated = spec
@@ -334,7 +341,8 @@ pub fn run_dflash_acceptance(
         0.0
     };
     eprintln!(
-        "dflash_acceptance tokens_equal={} generated={} max_draft={} block_size={} proposed={} accepted={} rejected={} verifications={} avg_accepted_per_verify={:.3} load_ms={} warmup_ms={} ref_ms={} spec_ms={}",
+        "dflash_acceptance mode={} tokens_equal={} generated={} max_draft={} block_size={} proposed={} accepted={} rejected={} verifications={} avg_accepted_per_verify={:.3} load_ms={} warmup_ms={} ref_ms={} spec_ms={} spec_tok_s={:.1}",
+        if resident { "resident" } else { "cpu" },
         tokens_equal,
         spec.tokens.len(),
         max_draft,
@@ -348,6 +356,7 @@ pub fn run_dflash_acceptance(
         warmup_elapsed.as_millis(),
         reference_elapsed.as_millis(),
         spec_elapsed.as_millis(),
+        spec.tokens.len() as f64 / spec.loop_duration.as_secs_f64().max(1.0e-9),
     );
     for position in 0..max_draft.min(draft.info.block_size) {
         let proposed = spec
