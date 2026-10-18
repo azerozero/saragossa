@@ -111,9 +111,10 @@ fn run() -> CliResult<()> {
         if let Some(draft_dir) =
             saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")
         {
-            let draft = saragossa::devtools::load_dflash_draft_weights_for_target(
+            let draft = saragossa::devtools::load_dflash_draft_weights_quantized(
                 &assets.config,
                 PathBuf::from(draft_dir),
+                saragossa::devtools::DFlashQuant::from_env()?,
             )?;
             saragossa::devtools::print_dflash_draft(&draft);
         }
@@ -290,9 +291,10 @@ fn run() -> CliResult<()> {
                     "SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 requiert SARAGOSSA_RUST_DFLASH_DRAFT_DIR",
                 )
             })?;
-        let draft = saragossa::devtools::load_dflash_draft_weights_for_target(
+        let draft = saragossa::devtools::load_dflash_draft_weights_quantized(
             &assets.config,
             PathBuf::from(draft_dir),
+            saragossa::devtools::DFlashQuant::from_env()?,
         )?;
         let options = generation_options(&args, &assets, 1.0);
         return Ok(saragossa::devtools::run_dflash_acceptance(

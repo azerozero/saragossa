@@ -1327,6 +1327,7 @@ fn tiny_dflash_draft() -> crate::DFlashDraft {
             selector_rank: 0,
             selector_top_k: 0,
         },
+        quant: None,
         hidden_norm: Tensor::from_vec(vec![2], vec![1.0, 1.0]).expect("invariant: norm valide"),
         fc: Linear::new(identity2().expect("invariant: fc valide"), None)
             .expect("invariant: linear valide"),

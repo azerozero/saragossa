@@ -1,8 +1,9 @@
 //! Validation et chargement des checkpoints draft DFlash.
 
 use crate::{
-    catalog::read_safetensors_keys, rms_norm, safetensor::bytes_to_dense_f32, ForwardRuntime,
-    GatedMlp, InferError, Linear, ModelConfig, Result, Tensor,
+    catalog::read_safetensors_keys, rms_norm, safetensor::bytes_to_dense_f32,
+    AffineQuantizedTensor, ForwardRuntime, GatedMlp, InferError, Linear, ModelConfig, Result,
+    Tensor,
 };
 use safetensors::{tensor::TensorView, SafeTensors};
 use serde::Deserialize;
@@ -55,9 +56,48 @@ pub struct DFlashDraftInfo {
     pub selector_top_k: usize,
 }
 
+/// Quantification affine appliquée aux projections du draft au chargement
+/// (fc, q/k/v/o, gate/up/down, noyaux dynamiques). Normes, noyaux statiques,
+/// sélecteur et codebooks restent en f32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DFlashQuant {
+    pub group_size: usize,
+    pub bits: usize,
+}
+
+impl DFlashQuant {
+    /// `SARAGOSSA_RUST_DFLASH_QUANT_BITS` : absent ou `0` → dense f32 ; `4` ou `8` →
+    /// affine par groupes de 64 (format des kernels u4/u8 gs64 du tronc).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la variable n'est ni vide, ni `0`, `4` ou `8`.
+    pub fn from_env() -> Result<Option<Self>> {
+        match crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_QUANT_BITS") {
+            None => Ok(None),
+            Some(value) => match value.trim() {
+                "" | "0" => Ok(None),
+                "4" => Ok(Some(Self {
+                    group_size: 64,
+                    bits: 4,
+                })),
+                "8" => Ok(Some(Self {
+                    group_size: 64,
+                    bits: 8,
+                })),
+                other => Err(InferError::Config(format!(
+                    "SARAGOSSA_RUST_DFLASH_QUANT_BITS={other} : attendu 0, 4 ou 8"
+                ))),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DFlashDraft {
     pub info: DFlashDraftInfo,
+    /// Quantification appliquée aux projections (None : dense f32).
+    pub quant: Option<DFlashQuant>,
     pub hidden_norm: Tensor,
     pub fc: Linear,
     pub layers: Vec<DFlashDraftLayer>,
@@ -314,10 +354,27 @@ impl DFlashSelector {
         let projected = self
             .hidden_projection
             .forward_with_runtime(hidden, runtime)?;
-        let (_, rank) = projected.as_matrix()?;
-        if rank != self.rank {
+        self.select_projected(projected.data(), candidates, anchor)
+    }
+
+    /// Comme [`Self::select`], avec la projection `[positions, rank]` déjà calculée
+    /// (chemin résident : projection sur GPU, parcours des codebooks sur CPU).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les tailles divergent ou si un candidat sort du
+    /// vocabulaire.
+    pub fn select_projected(
+        &self,
+        projected: &[f32],
+        candidates: &[Vec<(usize, f32)>],
+        anchor: usize,
+    ) -> Result<Vec<usize>> {
+        let positions = candidates.len();
+        if projected.len() != positions * self.rank {
             return Err(InferError::Dimension(format!(
-                "draft DFlash sélecteur rang {rank}, attendu {}",
+                "draft DFlash sélecteur : projection de {} valeurs, attendu {positions}×{}",
+                projected.len(),
                 self.rank
             )));
         }
@@ -333,7 +390,7 @@ impl DFlashSelector {
         let mut previous = anchor;
         let mut path = Vec::with_capacity(positions);
         for (position, row_candidates) in candidates.iter().enumerate() {
-            let proj = projected.row_slice(position)?;
+            let proj = &projected[position * self.rank..(position + 1) * self.rank];
             let pred = codebook_row(&self.predecessor_codebook, previous, vocab)?;
             let gate: Vec<f32> = pred.iter().zip(proj).map(|(p, h)| p * h).collect();
             let mut best: Option<(usize, f32)> = None;
@@ -781,6 +838,21 @@ pub fn load_dflash_draft_weights_for_target(
     target: &ModelConfig,
     draft_dir: impl AsRef<Path>,
 ) -> Result<DFlashDraft> {
+    load_dflash_draft_weights_quantized(target, draft_dir, None)
+}
+
+/// Comme [`load_dflash_draft_weights_for_target`], avec les projections
+/// quantifiées en affine au chargement si `quant` est fourni.
+///
+/// # Errors
+///
+/// Renvoie une erreur si un poids requis est absent, si une forme diverge de la
+/// config draft ou si une dimension d'entrée n'est pas un multiple du groupe.
+pub fn load_dflash_draft_weights_quantized(
+    target: &ModelConfig,
+    draft_dir: impl AsRef<Path>,
+    quant: Option<DFlashQuant>,
+) -> Result<DFlashDraft> {
     let info = load_dflash_draft_for_target(target, draft_dir)?;
     let bytes = std::fs::read(&info.weight_path).map_err(|source| InferError::Io {
         path: info.weight_path.clone(),
@@ -806,17 +878,41 @@ pub fn load_dflash_draft_weights_for_target(
         .ok_or_else(|| InferError::Shape("draft DFlash kv_dim deborde".to_string()))?;
 
     let hidden_norm = load_dflash_norm(&st, "hidden_norm.weight", hidden)?;
-    let fc = load_dflash_linear(&st, "fc", hidden, fc_in)?;
+    let fc = load_dflash_linear(&st, "fc", hidden, fc_in, quant)?;
     let mut layers = Vec::with_capacity(info.num_hidden_layers);
     for layer_idx in 0..info.num_hidden_layers {
         let prefix = format!("layers.{layer_idx}");
         let attention_prefix = format!("{prefix}.self_attn");
         let mlp_prefix = format!("{prefix}.mlp");
         let attention = DFlashAttentionWeights {
-            q_proj: load_dflash_linear(&st, &format!("{attention_prefix}.q_proj"), q_dim, hidden)?,
-            k_proj: load_dflash_linear(&st, &format!("{attention_prefix}.k_proj"), kv_dim, hidden)?,
-            v_proj: load_dflash_linear(&st, &format!("{attention_prefix}.v_proj"), kv_dim, hidden)?,
-            o_proj: load_dflash_linear(&st, &format!("{attention_prefix}.o_proj"), hidden, q_dim)?,
+            q_proj: load_dflash_linear(
+                &st,
+                &format!("{attention_prefix}.q_proj"),
+                q_dim,
+                hidden,
+                quant,
+            )?,
+            k_proj: load_dflash_linear(
+                &st,
+                &format!("{attention_prefix}.k_proj"),
+                kv_dim,
+                hidden,
+                quant,
+            )?,
+            v_proj: load_dflash_linear(
+                &st,
+                &format!("{attention_prefix}.v_proj"),
+                kv_dim,
+                hidden,
+                quant,
+            )?,
+            o_proj: load_dflash_linear(
+                &st,
+                &format!("{attention_prefix}.o_proj"),
+                hidden,
+                q_dim,
+                quant,
+            )?,
             q_norm: load_dflash_norm(
                 &st,
                 &format!("{attention_prefix}.q_norm.weight"),
@@ -834,18 +930,21 @@ pub fn load_dflash_draft_weights_for_target(
                 &format!("{mlp_prefix}.gate_proj"),
                 info.intermediate_size,
                 hidden,
+                quant,
             )?,
             load_dflash_linear(
                 &st,
                 &format!("{mlp_prefix}.up_proj"),
                 info.intermediate_size,
                 hidden,
+                quant,
             )?,
             load_dflash_linear(
                 &st,
                 &format!("{mlp_prefix}.down_proj"),
                 hidden,
                 info.intermediate_size,
+                quant,
             )?,
         );
         let conv = |name: &str| -> Result<Option<DFlashConv>> {
@@ -866,6 +965,7 @@ pub fn load_dflash_draft_weights_for_target(
                     &format!("{prefix}.{name}.kernel_projection"),
                     2 * info.conv_kernel_size * groups,
                     hidden,
+                    quant,
                 )?,
                 kernel_size: info.conv_kernel_size,
                 group_size: info.conv_group_size,
@@ -899,6 +999,7 @@ pub fn load_dflash_draft_weights_for_target(
                 "candidate_selector.hidden_projection",
                 info.selector_rank,
                 hidden,
+                None,
             )?,
             predecessor_codebook: codebook("candidate_selector.predecessor_codebook")?,
             successor_codebook: codebook("candidate_selector.successor_codebook")?,
@@ -910,6 +1011,7 @@ pub fn load_dflash_draft_weights_for_target(
     };
     Ok(DFlashDraft {
         info,
+        quant,
         hidden_norm,
         fc,
         layers,
@@ -923,11 +1025,18 @@ fn load_dflash_linear(
     prefix: &str,
     expected_rows: usize,
     expected_cols: usize,
+    quant: Option<DFlashQuant>,
 ) -> Result<Linear> {
     let key = format!("{prefix}.weight");
     let tensor = load_dflash_tensor(st, &key)?;
     expect_shape(tensor.shape(), &[expected_rows, expected_cols], &key)?;
-    Linear::new(tensor, None)
+    match quant {
+        Some(DFlashQuant { group_size, bits }) => Linear::new_quantized(
+            AffineQuantizedTensor::quantize(&tensor, group_size, bits)?,
+            None,
+        ),
+        None => Linear::new(tensor, None),
+    }
 }
 
 fn load_dflash_norm(st: &SafeTensors, key: &str, expected_dim: usize) -> Result<Tensor> {

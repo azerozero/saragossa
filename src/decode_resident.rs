@@ -54,6 +54,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 mod arena;
 mod attention;
 mod dense_tail;
+#[cfg(feature = "devtools")]
+pub(crate) mod dflash;
 mod duo;
 mod gpu_position;
 mod kernels;

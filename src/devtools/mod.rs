@@ -7,8 +7,9 @@ mod pairwise;
 use std::time::{Duration, Instant};
 
 pub use dflash::{
-    load_dflash_draft_for_target, load_dflash_draft_weights_for_target, DFlashAttentionWeights,
-    DFlashDraft, DFlashDraftInfo, DFlashDraftLayer,
+    load_dflash_draft_for_target, load_dflash_draft_weights_for_target,
+    load_dflash_draft_weights_quantized, DFlashAttentionWeights, DFlashConv, DFlashDraft,
+    DFlashDraftInfo, DFlashDraftLayer, DFlashQuant, DFlashSelector,
 };
 
 use crate::runtime_flags::env_flag;
@@ -490,7 +491,7 @@ pub fn run_resident_linear_xray(
 pub fn print_dflash_draft(draft: &DFlashDraft) {
     let info = &draft.info;
     println!(
-        "dflash_draft loaded tensors={} layers={} loaded_layers={} hidden={} block_size={} mask_token={} target_layers={} variant={}",
+        "dflash_draft loaded tensors={} layers={} loaded_layers={} hidden={} block_size={} mask_token={} target_layers={} variant={} quant={}",
         info.tensor_count,
         info.num_hidden_layers,
         draft.layers.len(),
@@ -509,7 +510,10 @@ pub fn print_dflash_draft(draft: &DFlashDraft) {
             )
         } else {
             "dflash1".to_string()
-        }
+        },
+        draft
+            .quant
+            .map_or("dense".to_string(), |q| format!("u{}g{}", q.bits, q.group_size))
     );
 }
 

@@ -2716,3 +2716,264 @@ fn gpu_position_two_cycles_one_command_buffer_matches_host_positions() -> Result
     run_gpu_position_case(&state, 5, 16)?;
     run_gpu_position_case(&state, 2050, 2060)
 }
+
+// ---------------------------------------------------------------------------
+// Drafter DFlash 2 résident : oracle CPU `DFlashDraft` sur des poids synthétiques.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "devtools")]
+mod dflash_resident {
+    use super::super::dflash::DFlashResident;
+    use super::*;
+    use crate::devtools::{
+        DFlashAttentionWeights, DFlashConv, DFlashDraft, DFlashDraftInfo, DFlashDraftLayer,
+        DFlashSelector,
+    };
+    use crate::{ForwardRuntime, GatedMlp, Linear, LinearWeight, Tensor};
+
+    const HIDDEN: usize = 64;
+    const INTER: usize = 96;
+    const Q_HEADS: usize = 2;
+    const KV_HEADS: usize = 1;
+    const HEAD_DIM: usize = 128;
+    const TARGET_LAYERS: usize = 2;
+    const CONV_K: usize = 2;
+    const CONV_GROUP: usize = 16;
+    const VOCAB: usize = 40;
+    const RANK: usize = 8;
+    const TOP_K: usize = 3;
+    const BLOCK: usize = 4;
+    const CONTEXT: usize = 5;
+    const CAPACITY: usize = 16;
+    const LAYERS: usize = 2;
+
+    fn tensor(shape: &[usize], seed: usize, scale: f32) -> Tensor {
+        let len: usize = shape.iter().product();
+        Tensor::from_vec(
+            shape.to_vec(),
+            (0..len).map(|i| pseudo(seed + i) * scale).collect(),
+        )
+        .expect("invariant: tenseur synthétique")
+    }
+
+    fn norm(dim: usize, seed: usize) -> Tensor {
+        Tensor::from_vec(
+            vec![dim],
+            (0..dim).map(|i| 1.0 + 0.5 * pseudo(seed + i)).collect(),
+        )
+        .expect("invariant: norme synthétique")
+    }
+
+    fn linear(rows: usize, cols: usize, seed: usize) -> Linear {
+        Linear::new(tensor(&[rows, cols], seed, 1.0), None).expect("invariant: linéaire")
+    }
+
+    fn conv(seed: usize) -> DFlashConv {
+        DFlashConv {
+            base_kernel: tensor(&[2, CONV_K, HIDDEN], seed, 3.0),
+            kernel_projection: linear(2 * CONV_K * (HIDDEN / CONV_GROUP), HIDDEN, seed + 1000),
+            kernel_size: CONV_K,
+            group_size: CONV_GROUP,
+        }
+    }
+
+    fn draft(window: Option<usize>) -> DFlashDraft {
+        let layers = (0..LAYERS)
+            .map(|layer| {
+                let seed = 10_000 * (layer + 1);
+                DFlashDraftLayer {
+                    input_norm: norm(HIDDEN, seed + 1),
+                    attention: DFlashAttentionWeights {
+                        q_proj: linear(Q_HEADS * HEAD_DIM, HIDDEN, seed + 2),
+                        k_proj: linear(KV_HEADS * HEAD_DIM, HIDDEN, seed + 3),
+                        v_proj: linear(KV_HEADS * HEAD_DIM, HIDDEN, seed + 4),
+                        o_proj: linear(HIDDEN, Q_HEADS * HEAD_DIM, seed + 5),
+                        q_norm: norm(HEAD_DIM, seed + 6),
+                        k_norm: norm(HEAD_DIM, seed + 7),
+                    },
+                    post_attention_norm: norm(HIDDEN, seed + 8),
+                    mlp: GatedMlp::new(
+                        linear(INTER, HIDDEN, seed + 9),
+                        linear(INTER, HIDDEN, seed + 10),
+                        linear(HIDDEN, INTER, seed + 11),
+                    ),
+                    attention_conv: Some(conv(seed + 12)),
+                    mlp_conv: Some(conv(seed + 13)),
+                }
+            })
+            .collect();
+        DFlashDraft {
+            info: DFlashDraftInfo {
+                draft_dir: std::path::PathBuf::new(),
+                weight_path: std::path::PathBuf::new(),
+                tensor_count: 0,
+                block_size: BLOCK,
+                mask_token_id: 1,
+                target_layer_ids: (0..TARGET_LAYERS).collect(),
+                num_hidden_layers: LAYERS,
+                hidden_size: HIDDEN,
+                intermediate_size: INTER,
+                num_attention_heads: Q_HEADS,
+                num_key_value_heads: KV_HEADS,
+                head_dim: HEAD_DIM,
+                rms_norm_eps: 1.0e-6,
+                rope_theta: 10_000.0,
+                layer_types: vec![
+                    if window.is_some() {
+                        "sliding_attention"
+                    } else {
+                        "full_attention"
+                    }
+                    .to_string();
+                    LAYERS
+                ],
+                sliding_window: window,
+                vocab_size: VOCAB,
+                conv_kernel_size: CONV_K,
+                conv_group_size: CONV_GROUP,
+                selector_rank: RANK,
+                selector_top_k: TOP_K,
+            },
+            quant: None,
+            hidden_norm: norm(HIDDEN, 3),
+            fc: linear(HIDDEN, TARGET_LAYERS * HIDDEN, 5),
+            layers,
+            norm: norm(HIDDEN, 7),
+            selector: Some(DFlashSelector {
+                hidden_projection: linear(RANK, HIDDEN, 11),
+                predecessor_codebook: tensor(&[VOCAB, RANK], 13, 1.0),
+                successor_codebook: tensor(&[VOCAB, RANK], 17, 1.0),
+                rank: RANK,
+                top_k: TOP_K,
+            }),
+        }
+    }
+
+    fn assert_close(label: &str, gpu: &[f32], cpu: &[f32], tolerance: f32) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: longueurs");
+        for (i, (g, c)) in gpu.iter().zip(cpu).enumerate() {
+            assert!(
+                (g - c).abs() <= tolerance * (1.0 + c.abs()),
+                "{label}[{i}] gpu={g} cpu={c}"
+            );
+        }
+    }
+
+    fn run_case(window: Option<usize>) -> Result<()> {
+        let Some(mut state) = try_state()? else {
+            return Ok(());
+        };
+        let executor = MetalExecutor::new()?;
+        let draft = draft(window);
+        let selector = draft.selector.as_ref().expect("invariant: sélecteur");
+        let lm_head = tensor(&[VOCAB, HIDDEN], 19, 4.0);
+        let target_hidden = tensor(&[CONTEXT, TARGET_LAYERS * HIDDEN], 23, 8.0);
+        let noise = tensor(&[BLOCK, HIDDEN], 29, 8.0);
+        let anchor = 7usize;
+
+        // Oracle CPU.
+        let projected = draft.project_target_hidden(&target_hidden, ForwardRuntime::cpu())?;
+        let states = draft.forward_projected_context(&noise, &projected, ForwardRuntime::cpu())?;
+        let logits = states.matmul_rhs_t(&lm_head)?;
+        let mut candidates_cpu = Vec::new();
+        for row in 1..BLOCK {
+            let mut row_candidates = selector.top_candidates(logits.row_slice(row)?);
+            row_candidates.sort_by_key(|(token, _)| *token);
+            candidates_cpu.push(row_candidates);
+        }
+        let block_states =
+            Tensor::from_vec(vec![BLOCK - 1, HIDDEN], states.data()[HIDDEN..].to_vec())?;
+        let path_cpu = selector.select(
+            &block_states,
+            &candidates_cpu,
+            anchor,
+            ForwardRuntime::cpu(),
+        )?;
+
+        // Chemin résident.
+        let mut resident = DFlashResident::new(&state, &executor, &draft, CAPACITY)?;
+        let hidden_buf = state.persistent(CONTEXT * TARGET_LAYERS * HIDDEN, GpuElement::F32)?;
+        write_f32_at(&hidden_buf, 0, target_hidden.data())?;
+        let noise_buf = state.persistent(BLOCK * HIDDEN, GpuElement::F32)?;
+        write_f32_at(&noise_buf, 0, noise.data())?;
+        let out_states = state.persistent(BLOCK * HIDDEN, GpuElement::F32)?;
+        let out_index = state.persistent((BLOCK - 1) * TOP_K, GpuElement::U32)?;
+        let out_value = state.persistent((BLOCK - 1) * TOP_K, GpuElement::F32)?;
+        let out_projected = state.persistent(BLOCK * RANK, GpuElement::F32)?;
+        let lm_head_buf = executor
+            .resolve_linear_weight_buffers(&LinearWeight::Dense(lm_head.clone()), "test_lm_head")?;
+
+        let command_buffer = state.queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let mut owned = Vec::new();
+        resident.encode_context_append(
+            &state,
+            &executor,
+            encoder,
+            &mut owned,
+            hidden_buf.buffer(),
+            CONTEXT,
+        )?;
+        assert_eq!(resident.context_len(), CONTEXT);
+        resident.encode_block(
+            &state,
+            &executor,
+            encoder,
+            &mut owned,
+            noise_buf.buffer(),
+            BLOCK,
+            out_states.buffer(),
+        )?;
+        resident.encode_block_candidates(
+            &state,
+            &executor,
+            encoder,
+            &mut owned,
+            out_states.buffer(),
+            BLOCK,
+            &lm_head_buf,
+            TOP_K,
+            out_index.buffer(),
+            out_value.buffer(),
+            Some(out_projected.buffer()),
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+
+        assert_close(
+            "états du bloc",
+            &read_f32(&out_states),
+            states.data(),
+            2.0e-3,
+        );
+        let indices =
+            crate::metal_backend::read_u32_buffer(out_index.buffer(), (BLOCK - 1) * TOP_K)?;
+        let values = read_f32(&out_value);
+        let mut candidates_gpu = Vec::new();
+        for row in 0..BLOCK - 1 {
+            let mut row_candidates: Vec<(usize, f32)> = (0..TOP_K)
+                .map(|k| (indices[row * TOP_K + k] as usize, values[row * TOP_K + k]))
+                .collect();
+            row_candidates.sort_by_key(|(token, _)| *token);
+            let tokens_gpu: Vec<usize> = row_candidates.iter().map(|(t, _)| *t).collect();
+            let tokens_cpu: Vec<usize> = candidates_cpu[row].iter().map(|(t, _)| *t).collect();
+            assert_eq!(tokens_gpu, tokens_cpu, "top-k ligne {}", row + 1);
+            candidates_gpu.push(row_candidates);
+        }
+        let projected_gpu = read_f32(&out_projected);
+        let path_gpu =
+            selector.select_projected(&projected_gpu[RANK..], &candidates_gpu, anchor)?;
+        assert_eq!(
+            path_gpu, path_cpu,
+            "parcours du sélecteur (fenêtre {window:?})"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dflash_resident_block_matches_cpu() -> Result<()> {
+        run_case(None)?;
+        // Fenêtre plus courte que contexte + bloc : chemin ligne par ligne fenêtré.
+        run_case(Some(3))
+    }
+}

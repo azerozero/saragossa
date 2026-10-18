@@ -335,6 +335,73 @@ impl AffineQuantizedTensor {
         })
     }
 
+    /// Quantifie un poids dense `[rows, cols]` en affine `bits` par groupes de
+    /// `group_size` colonnes, au layout MLX consommé par les kernels : `q =
+    /// round((w − min) / scale)`, `w ≈ q·scale + min`, codes packés poids faible en
+    /// premier dans chaque `u32`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le poids n'est pas une matrice, si `cols` n'est pas un
+    /// multiple de `group_size`, si `bits` ne divise pas 32 ou si une valeur n'est
+    /// pas finie.
+    pub fn quantize(weight: &Tensor, group_size: usize, bits: usize) -> Result<Self> {
+        let (rows, cols) = weight.as_matrix()?;
+        if group_size == 0 || cols % group_size != 0 || bits == 0 || 32 % bits != 0 {
+            return Err(InferError::Config(format!(
+                "quantification affine impossible: shape={:?}, group_size={group_size}, bits={bits}",
+                weight.shape()
+            )));
+        }
+        let lanes = 32 / bits;
+        if group_size % lanes != 0 {
+            return Err(InferError::Config(format!(
+                "quantification affine: group_size={group_size} non multiple de {lanes} codes par u32"
+            )));
+        }
+        let groups = cols / group_size;
+        let packed_cols = cols / lanes;
+        let levels = ((1_u32 << bits) - 1) as f32;
+        let data = weight.data();
+        let mut packed = vec![0_u32; rows * packed_cols];
+        let mut scales = vec![0.0_f32; rows * groups];
+        let mut biases = vec![0.0_f32; rows * groups];
+        for row in 0..rows {
+            for group in 0..groups {
+                let start = row * cols + group * group_size;
+                let slice = &data[start..start + group_size];
+                let (min, max) = slice
+                    .iter()
+                    .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &value| {
+                        (lo.min(value), hi.max(value))
+                    });
+                if !min.is_finite() || !max.is_finite() {
+                    return Err(InferError::Config(format!(
+                        "quantification affine: valeur non finie (ligne {row}, groupe {group})"
+                    )));
+                }
+                let scale = ((max - min) / levels).max(1.0e-7);
+                let inv = scale.recip();
+                scales[row * groups + group] = scale;
+                biases[row * groups + group] = min;
+                for (lane, &value) in slice.iter().enumerate() {
+                    // Code borné dans [0, levels] : la conversion ne tronque rien.
+                    let code = ((value - min) * inv).round().clamp(0.0, levels) as u32;
+                    let col = group * group_size + lane;
+                    packed[row * packed_cols + col / lanes] |= code << ((col % lanes) * bits);
+                }
+            }
+        }
+        Self::new(
+            &[rows, packed_cols],
+            packed,
+            Tensor::from_vec(vec![rows, groups], scales)?,
+            Tensor::from_vec(vec![rows, groups], biases)?,
+            group_size,
+            bits,
+        )
+    }
+
     #[cfg(all(target_os = "macos", feature = "metal"))]
     #[expect(
         clippy::too_many_arguments,
@@ -1144,6 +1211,39 @@ mod tests {
 
             prop_assert_eq!(lane_count, rows * cols);
         }
+    }
+
+    #[test]
+    fn quantize_roundtrip_within_half_step() {
+        let rows = 3;
+        let cols = 128;
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * (1.0 + (i % 5) as f32))
+            .collect();
+        let dense = Tensor::from_vec(vec![rows, cols], data.clone()).expect("invariant: dense");
+        for bits in [4_usize, 8] {
+            let compact = AffineQuantizedTensor::quantize(&dense, 64, bits)
+                .expect("invariant: quantification");
+            assert_eq!(compact.shape(), &[rows, cols]);
+            assert_eq!(compact.packed_shape(), &[rows, cols * bits / 32]);
+            let scales = compact.scales_f32();
+            let biases = compact.biases_f32();
+            for row in 0..rows {
+                for col in 0..cols {
+                    let affine = row * 2 + col / 64;
+                    let value =
+                        compact.bitpacked_value(row, col) as f32 * scales[affine] + biases[affine];
+                    let tolerance = scales[affine] * 0.5 + 1.0e-5;
+                    assert!(
+                        (value - data[row * cols + col]).abs() <= tolerance,
+                        "bits={bits} ({row},{col}) {value} vs {}",
+                        data[row * cols + col]
+                    );
+                }
+            }
+        }
+        assert!(AffineQuantizedTensor::quantize(&dense, 48, 4).is_err());
+        assert!(AffineQuantizedTensor::quantize(&dense, 64, 3).is_err());
     }
 
     fn pack_lanes(values: &[u32], bits: usize) -> u32 {
