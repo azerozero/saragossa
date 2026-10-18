@@ -1,7 +1,7 @@
 //! Decode résident Metal complet et préparation des arènes.
 
 mod decode;
-#[cfg(feature = "devtools")]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 mod dflash;
 mod encode;
 mod mtp;

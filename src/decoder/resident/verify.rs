@@ -2,6 +2,38 @@ use super::super::*;
 use super::types::*;
 
 impl CausalDecoder {
+    /// Vrai si toutes les couches ont leurs buffers résidents en lignes : la
+    /// vérification batchée (captures, rollback par troncature) est possible.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(in crate::decoder) fn resident_layer_batch_supported(&self, arena: &ResidentArena) -> bool {
+        self.layers.iter().enumerate().all(|(index, layer)| {
+            match (
+                self.config.is_resident_full_attention_layer(index),
+                layer.mlp.as_ref(),
+            ) {
+                (true, Some(FeedForward::Dense(_))) => {
+                    matches!(
+                        arena.layers.get(index),
+                        Some(ResidentLayerBuffers::FullDense(_))
+                    )
+                }
+                (false, Some(FeedForward::Moe(_))) if prefill_moe_rows_enabled() => {
+                    matches!(
+                        arena.layers.get(index),
+                        Some(ResidentLayerBuffers::LinearMoe(_))
+                    )
+                }
+                (false, Some(FeedForward::Dense(_))) => {
+                    matches!(
+                        arena.layers.get(index),
+                        Some(ResidentLayerBuffers::LinearDense(_))
+                    )
+                }
+                _ => false,
+            }
+        })
+    }
+
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(in crate::decoder) fn next_final_states_resident_verify(
         &self,
@@ -54,33 +86,8 @@ impl CausalDecoder {
             return Ok(None);
         };
 
-        let layer_batch_supported = token_ids.len() > 1
-            && self.layers.iter().enumerate().all(|(index, layer)| {
-                match (
-                    self.config.is_resident_full_attention_layer(index),
-                    layer.mlp.as_ref(),
-                ) {
-                    (true, Some(FeedForward::Dense(_))) => {
-                        matches!(
-                            arena.layers.get(index),
-                            Some(ResidentLayerBuffers::FullDense(_))
-                        )
-                    }
-                    (false, Some(FeedForward::Moe(_))) if prefill_moe_rows_enabled() => {
-                        matches!(
-                            arena.layers.get(index),
-                            Some(ResidentLayerBuffers::LinearMoe(_))
-                        )
-                    }
-                    (false, Some(FeedForward::Dense(_))) => {
-                        matches!(
-                            arena.layers.get(index),
-                            Some(ResidentLayerBuffers::LinearDense(_))
-                        )
-                    }
-                    _ => false,
-                }
-            });
+        let layer_batch_supported =
+            token_ids.len() > 1 && self.resident_layer_batch_supported(arena);
         if layer_batch_supported {
             let base_position = *cache_position;
             let embed = self.embed_scaled(token_ids)?;

@@ -313,8 +313,11 @@ pub fn run_dflash_acceptance(
     let reference = decoder
         .generate_greedy_dflash_reference_with_options(prompt_ids, max_tokens, options, draft)?;
     let reference_elapsed = reference_started.elapsed();
-    let resident = env_flag("SARAGOSSA_RUST_DFLASH_RESIDENT", false);
+    // Drafter résident : Metal seulement ; sans Metal le harnais garde la boucle CPU.
+    let resident = cfg!(all(target_os = "macos", feature = "metal"))
+        && env_flag("SARAGOSSA_RUST_DFLASH_RESIDENT", false);
     let spec_started = Instant::now();
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let spec = if resident {
         decoder.generate_greedy_dflash_resident_with_options(
             prompt_ids, max_tokens, options, draft, max_draft,
@@ -324,6 +327,10 @@ pub fn run_dflash_acceptance(
             prompt_ids, max_tokens, options, draft, max_draft,
         )?
     };
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let spec = decoder.generate_greedy_dflash_batched_with_options(
+        prompt_ids, max_tokens, options, draft, max_draft,
+    )?;
     let spec_elapsed = spec_started.elapsed();
     let tokens_equal = reference == spec.tokens;
     let generated = spec

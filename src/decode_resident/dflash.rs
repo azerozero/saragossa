@@ -633,6 +633,7 @@ impl DFlashResident {
             MTLSize::new((block - 1) as u64, 1, 1),
             MTLSize::new(TOPK_THREADS as u64, 1, 1),
         );
+        crate::metal_backend::post_dispatch_barrier(encoder);
         if let (Some(projection), Some(out)) = (self.selector_projection.as_ref(), out_projected) {
             let rank = executor.linear_weight_out_dim(projection);
             expect_out_dim(
@@ -1125,6 +1126,8 @@ fn encode_conv(
         MTLSize::new(width as u64, rows as u64, 1),
         MTLSize::new(threads as u64, 1, 1),
     );
+    // Sortie consommée par le matmul suivant : barrière en mode concurrent.
+    crate::metal_backend::post_dispatch_barrier(encoder);
     Ok(())
 }
 

@@ -347,7 +347,7 @@ impl AffineQuantizedTensor {
     /// pas finie.
     pub fn quantize(weight: &Tensor, group_size: usize, bits: usize) -> Result<Self> {
         let (rows, cols) = weight.as_matrix()?;
-        if group_size == 0 || cols % group_size != 0 || bits == 0 || 32 % bits != 0 {
+        if group_size == 0 || cols % group_size != 0 || bits == 0 || bits > 16 || 32 % bits != 0 {
             return Err(InferError::Config(format!(
                 "quantification affine impossible: shape={:?}, group_size={group_size}, bits={bits}",
                 weight.shape()
@@ -370,16 +370,17 @@ impl AffineQuantizedTensor {
             for group in 0..groups {
                 let start = row * cols + group * group_size;
                 let slice = &data[start..start + group_size];
+                // `min`/`max` ignorent NaN : chaque valeur est contrôlée.
+                if slice.iter().any(|value| !value.is_finite()) {
+                    return Err(InferError::Config(format!(
+                        "quantification affine: valeur non finie (ligne {row}, groupe {group})"
+                    )));
+                }
                 let (min, max) = slice
                     .iter()
                     .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &value| {
                         (lo.min(value), hi.max(value))
                     });
-                if !min.is_finite() || !max.is_finite() {
-                    return Err(InferError::Config(format!(
-                        "quantification affine: valeur non finie (ligne {row}, groupe {group})"
-                    )));
-                }
                 let scale = ((max - min) / levels).max(1.0e-7);
                 let inv = scale.recip();
                 scales[row * groups + group] = scale;
@@ -1244,6 +1245,11 @@ mod tests {
         }
         assert!(AffineQuantizedTensor::quantize(&dense, 48, 4).is_err());
         assert!(AffineQuantizedTensor::quantize(&dense, 64, 3).is_err());
+        assert!(AffineQuantizedTensor::quantize(&dense, 64, 32).is_err());
+        let mut with_nan = data;
+        with_nan[70] = f32::NAN;
+        let with_nan = Tensor::from_vec(vec![rows, cols], with_nan).expect("invariant: nan");
+        assert!(AffineQuantizedTensor::quantize(&with_nan, 64, 4).is_err());
     }
 
     fn pack_lanes(values: &[u32], bits: usize) -> u32 {

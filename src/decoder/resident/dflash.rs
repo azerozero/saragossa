@@ -58,6 +58,12 @@ impl CausalDecoder {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
+        if options.token_constraint.is_some() {
+            // Les cibles viennent de l'argmax GPU, hors `mask_logits`/`accept_token`.
+            return Err(InferError::Config(
+                "decode DFlash résident sans contrainte de tokens (sélecteur greedy)".to_string(),
+            ));
+        }
         self.validate_dflash_draft(draft)?;
         if max_new_tokens == 0 {
             return Ok(SpeculativeOutput {
@@ -87,6 +93,18 @@ impl CausalDecoder {
         if !self.setup_resident_decode_from_prefill(&mut cache, max_new_tokens + draft_limit + 1)? {
             return Err(InferError::Config(
                 "decode DFlash résident: decode résident complet indisponible".to_string(),
+            ));
+        }
+        // Le rollback par troncature exige la vérification batchée (captures) ; le
+        // repli séquentiel (`SARAGOSSA_RUST_PREFILL_MOE_ROWS=0`) n'en fournit pas.
+        if !cache
+            .resident
+            .as_ref()
+            .is_some_and(|arena| self.resident_layer_batch_supported(arena))
+        {
+            return Err(InferError::Config(
+                "decode DFlash résident: vérification résidente batchée indisponible (couches en lignes requises)"
+                    .to_string(),
             ));
         }
         let top_k = draft.selector.as_ref().map_or(1, |selector| selector.top_k);
