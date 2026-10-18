@@ -168,6 +168,11 @@ impl CausalDecoder {
         stats.proposed_by_position.resize(draft_limit, 0);
         stats.accepted_by_position.resize(draft_limit, 0);
         let loop_started = Instant::now();
+        // Profil par segment du tour (devtools) : draft, vérification, rollback,
+        // append du contexte.
+        let profile = crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_PROFILE", false);
+        let mut segments = [std::time::Duration::ZERO; 4];
+        let mut tours = 0usize;
 
         while generated.len() < max_new_tokens {
             let primary = pending;
@@ -179,6 +184,8 @@ impl CausalDecoder {
                 break;
             }
 
+            tours += 1;
+            let mut segment_started = Instant::now();
             let drafts = self.dflash_resident_drafts(
                 &mut cache,
                 metal,
@@ -188,9 +195,14 @@ impl CausalDecoder {
                 primary,
                 draft_limit,
             )?;
-            let mut verify_tokens = Vec::with_capacity(drafts.len());
+            segments[0] += segment_started.elapsed();
+            segment_started = Instant::now();
+            // Bloc de vérification = ancre + tous les drafts : la dernière ligne
+            // fournit le token suivant quand tout est accepté, sans pas bonus
+            // séquentiel (un forward complet, ~33 ms, par tour entièrement accepté).
+            let mut verify_tokens = Vec::with_capacity(drafts.len() + 1);
             verify_tokens.push(primary);
-            verify_tokens.extend(drafts.iter().take(drafts.len().saturating_sub(1)).copied());
+            verify_tokens.extend(drafts.iter().copied());
             let output = self
                 .next_final_states_resident_verify(
                     &mut cache,
@@ -204,6 +216,7 @@ impl CausalDecoder {
                         "decode DFlash résident: vérification résidente indisponible".to_string(),
                     )
                 })?;
+            segments[1] += segment_started.elapsed();
             let targets = output.tokens.ok_or_else(|| {
                 InferError::Config("decode DFlash résident: argmax résident absent".to_string())
             })?;
@@ -211,7 +224,6 @@ impl CausalDecoder {
                 InferError::Config("decode DFlash résident: capture cible absente".to_string())
             })?;
             let mut accepted_all = true;
-            let mut verify_token = primary;
             let mut committed_len = 0usize;
             for (position, draft_token) in drafts.iter().copied().enumerate() {
                 let target = *targets.get(position).ok_or_else(|| {
@@ -232,7 +244,6 @@ impl CausalDecoder {
                         *slot += 1;
                     }
                     generated.push(draft_token);
-                    verify_token = draft_token;
                     if generated.len() >= max_new_tokens
                         || options.stop_token_ids.contains(&draft_token)
                     {
@@ -246,7 +257,16 @@ impl CausalDecoder {
                     break;
                 }
             }
-            if !accepted_all && committed_len < verify_tokens.len() {
+            if accepted_all {
+                pending = *targets.get(drafts.len()).ok_or_else(|| {
+                    InferError::Dimension(format!(
+                        "decode DFlash résident: {} cibles pour le token suivant",
+                        targets.len()
+                    ))
+                })?;
+                committed_len = verify_tokens.len();
+            }
+            if committed_len < verify_tokens.len() {
                 stats.rollbacks += 1;
                 let captures = output.captures.as_ref().ok_or_else(|| {
                     InferError::Config(
@@ -254,8 +274,11 @@ impl CausalDecoder {
                             .to_string(),
                     )
                 })?;
+                segment_started = Instant::now();
                 self.restore_mtp_resident_progress(&mut cache, captures, committed_len)?;
+                segments[2] += segment_started.elapsed();
             }
+            segment_started = Instant::now();
             self.dflash_resident_append_context(
                 &mut cache,
                 metal,
@@ -265,6 +288,7 @@ impl CausalDecoder {
                 0,
                 committed_len,
             )?;
+            segments[3] += segment_started.elapsed();
             if generated.len() >= max_new_tokens
                 || generated
                     .last()
@@ -272,44 +296,17 @@ impl CausalDecoder {
             {
                 break;
             }
-            if accepted_all {
-                // Tout accepté : le dernier draft devient l'entrée du pas bonus.
-                let bonus = self
-                    .next_final_states_resident_verify(
-                        &mut cache,
-                        &[verify_token],
-                        true,
-                        false,
-                        Some(layer_ids),
-                    )?
-                    .ok_or_else(|| {
-                        InferError::Config(
-                            "decode DFlash résident: pas bonus résident indisponible".to_string(),
-                        )
-                    })?;
-                pending = bonus
-                    .tokens
-                    .as_ref()
-                    .and_then(|tokens| tokens.first().copied())
-                    .ok_or_else(|| {
-                        InferError::Config(
-                            "decode DFlash résident: argmax bonus absent".to_string(),
-                        )
-                    })?;
-                let bonus_hidden = bonus.target_hidden.ok_or_else(|| {
-                    InferError::Config("decode DFlash résident: capture bonus absente".to_string())
-                })?;
-                self.dflash_resident_append_context(
-                    &mut cache,
-                    metal,
-                    &mut drafter,
-                    &buffers,
-                    &bonus_hidden,
-                    0,
-                    1,
-                )?;
-                stats.verifications += 1;
-            }
+        }
+        if profile && tours > 0 {
+            let per_tour = |d: std::time::Duration| d.as_secs_f64() * 1e3 / tours as f64;
+            eprintln!(
+                "dflash_profile tours={tours} ms/tour draft={:.1} verify={:.1} rollback={:.1} append={:.1} total={:.1}",
+                per_tour(segments[0]),
+                per_tour(segments[1]),
+                per_tour(segments[2]),
+                per_tour(segments[3]),
+                loop_started.elapsed().as_secs_f64() * 1e3 / tours as f64,
+            );
         }
 
         Ok(SpeculativeOutput {
