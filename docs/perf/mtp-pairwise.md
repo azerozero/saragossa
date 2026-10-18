@@ -327,10 +327,14 @@ perte de 5 à 7 % sur la prose courte et le contexte long. Un premier bench, lan
 juste après la quantification, donnait 25 à 32 tok/s sur T0 des deux côtés :
 contention externe, seule la mesure appariée répétée fait foi.
 
-Suite : ramener le drafter sous 5 ms (fusionner draft, vérification et append du
-contexte dans un seul command buffer, captures GPU sans readback, sélecteur sur
-GPU), puis prefill du contexte depuis les captures du prefill résident. Le seuil
-de rentabilité sur T0 et T2 reste 77 ms par tour.
+Sous-profil du drafter sur T0 : 0,6 ms d'embeddings et d'encodage, 8,1 ms
+d'attente GPU, 0,1 ms de readback et de sélecteur. Le coût est le travail GPU du
+bloc (cinq couches à 9 lignes, logits du lm_head sur 8 lignes, top-k), pas les
+synchronisations ni le CPU. Suite : réduire ce travail (nombre de dispatches par
+couche, logits sur moins de lignes ou lm_head restreint, top-k mieux parallélisé),
+puis prefill du contexte depuis les captures du prefill résident. Le seuil de
+rentabilité sur T0 et T2 reste 77 ms par tour, et la vérification à 9 lignes
+varie de 66 à 77 ms d'un run à l'autre : T0 est dans le bruit.
 
 ## Limites
 
