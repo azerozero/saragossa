@@ -16,12 +16,30 @@ pub(super) struct ResidentPrefillEncodeContext<'a> {
     reason = "orchestration prefill: couches, dimensions et caches restent explicites"
 )]
 impl MetalExecutor {
+    #[cfg(test)]
     pub(crate) fn qwen_moe_prefill_resident(
         &self,
         input: &Tensor,
         layers: &[PrefillMoeLayer<'_>],
         spec: PrefillAttentionSpec,
     ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>)> {
+        let (output, caches, _) =
+            self.qwen_moe_prefill_resident_with_captures(input, layers, spec, &[])?;
+        Ok((output, caches))
+    }
+
+    /// Prefill résident avec capture du flux résiduel en sortie des couches
+    /// `capture_layer_ids` (toutes les positions). Les captures sont copiées sur
+    /// le GPU pendant l'encodage, relues une fois à la fin et rendues en
+    /// `[seq, n * hidden]`, la disposition attendue par le drafter DFlash.
+    /// `None` quand aucune couche n'est demandée.
+    pub(crate) fn qwen_moe_prefill_resident_with_captures(
+        &self,
+        input: &Tensor,
+        layers: &[PrefillMoeLayer<'_>],
+        spec: PrefillAttentionSpec,
+        capture_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>, Option<Tensor>)> {
         let profile_sections = prefill_profile_sections_enabled();
         if profile_sections {
             reset_prefill_f32_to_bf16_shapes();
@@ -51,6 +69,22 @@ impl MetalExecutor {
         let input_buffer = self.upload_f32_buffer(input.data(), "resident_input")?;
         let hidden_a = self.private_f32_buffer(hidden_len, "resident_hidden_a")?;
         let hidden_b = self.private_f32_buffer(hidden_len, "resident_hidden_b")?;
+        if let Some(bad) = capture_layer_ids.iter().find(|&&id| id >= layers.len()) {
+            return Err(InferError::Config(format!(
+                "prefill résident capture couche {bad} hors des {} couches",
+                layers.len()
+            )));
+        }
+        let capture_buffer = if capture_layer_ids.is_empty() {
+            None
+        } else {
+            let len = checked_len(
+                capture_layer_ids.len(),
+                hidden_len,
+                "prefill résident captures",
+            )?;
+            Some(self.uncached_f32_buffer(len, "resident_captures")?)
+        };
         let mut current_buffer = input_buffer;
         let mut layer_cache_buffers = Vec::with_capacity(layers.len());
         let mut owned_buffers = Vec::new();
@@ -184,6 +218,37 @@ impl MetalExecutor {
                 )?;
                 layer_cache_buffers.push(layer_cache_buffer);
                 current_buffer = output_buffer;
+                if let Some(capture_buffer) = capture_buffer.as_ref() {
+                    for slot in capture_layer_ids
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, &id)| (id == layer_index).then_some(slot))
+                    {
+                        let offset =
+                            checked_len(slot, hidden_len, "prefill résident capture offset")?
+                                .checked_mul(std::mem::size_of::<f32>())
+                                .and_then(|bytes| u64::try_from(bytes).ok())
+                                .ok_or_else(|| {
+                                    InferError::Shape(
+                                        "prefill résident capture offset déborde".to_string(),
+                                    )
+                                })?;
+                        self.run_resident_prefill_section(
+                            &mut encode_context,
+                            "capture_copy",
+                            |encoder, _owned| {
+                                self.encode_copy_with_offsets(
+                                    encoder,
+                                    &current_buffer,
+                                    0,
+                                    capture_buffer,
+                                    offset,
+                                    hidden_len,
+                                )
+                            },
+                        )?;
+                    }
+                }
             }
             if private_scratch_enabled() {
                 let shared = self.uncached_f32_buffer(hidden_len, "resident_final_output")?;
@@ -224,6 +289,22 @@ impl MetalExecutor {
         let read_started = trace.then(std::time::Instant::now);
         let profile_read_started = profile_sections.then(std::time::Instant::now);
         let output = read_f32_buffer(&final_read_buffer, hidden_len)?;
+        let captures = capture_buffer
+            .map(|buffer| -> Result<Tensor> {
+                let count = capture_layer_ids.len();
+                let raw = read_f32_buffer(&buffer, count * hidden_len)?;
+                // [n, seq, hidden] sur le GPU -> [seq, n * hidden] attendu par le drafter.
+                let mut out = vec![0.0_f32; count * hidden_len];
+                for slot in 0..count {
+                    for row in 0..spec.seq {
+                        let src = slot * hidden_len + row * hidden_dim;
+                        let dst = (row * count + slot) * hidden_dim;
+                        out[dst..dst + hidden_dim].copy_from_slice(&raw[src..src + hidden_dim]);
+                    }
+                }
+                Tensor::from_vec(vec![spec.seq, count * hidden_dim], out)
+            })
+            .transpose()?;
         let mut layer_caches = Vec::with_capacity(layer_cache_buffers.len());
         for cache_buffer in layer_cache_buffers {
             match cache_buffer {
@@ -268,6 +349,7 @@ impl MetalExecutor {
         Ok((
             Tensor::from_vec(vec![spec.seq, hidden_dim], output)?,
             layer_caches,
+            captures,
         ))
     }
 

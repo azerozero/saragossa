@@ -2834,6 +2834,20 @@ impl CausalDecoder {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
         validate_capture_layer_ids(layer_ids, self.layers.len())?;
+        // Chemin rapide : le prefill résident fusionné copie les sorties des couches
+        // cibles pendant l'encodage (3 s contre ~21 s per-op sur 732 tokens). Même
+        // prefill que l'AR et le MTP du CLI, donc même trajectoire greedy.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some((cache, final_hidden, captures)) =
+            self.prefill_resident_cache_hidden_and_captures(prompt, layer_ids)?
+        {
+            let target_hidden = captures.ok_or_else(|| {
+                InferError::Config("prefill résident sans captures de couches".to_string())
+            })?;
+            let final_hidden = Tensor::row(final_hidden.last_row()?.to_vec())?;
+            let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+            return Ok((cache, final_state, target_hidden));
+        }
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
         let mut hidden = self.embed_scaled(prompt)?;
@@ -3730,6 +3744,19 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
+        Ok(self
+            .prefill_resident_cache_hidden_and_captures(prompt, &[])?
+            .map(|(cache, hidden, _)| (cache, hidden)))
+    }
+
+    /// Même prefill résident, avec capture du flux résiduel en sortie des
+    /// couches `capture_layer_ids` (`[seq, n * hidden]`, cf. le drafter DFlash).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn prefill_resident_cache_hidden_and_captures(
+        &self,
+        prompt: &[usize],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<(CausalDecoderCache, Tensor, Option<Tensor>)>> {
         if !prefill_resident_enabled() {
             return Ok(None);
         }
@@ -3791,8 +3818,13 @@ impl CausalDecoder {
             };
             layers.push(prefill_layer);
         }
-        match metal.qwen_moe_prefill_resident(&hidden, &layers, spec) {
-            Ok((final_hidden, layer_states)) => {
+        match metal.qwen_moe_prefill_resident_with_captures(
+            &hidden,
+            &layers,
+            spec,
+            capture_layer_ids,
+        ) {
+            Ok((final_hidden, layer_states, captures)) => {
                 if layer_states.len() != self.layers.len() {
                     return Err(InferError::Dimension(format!(
                         "prefill résident états couches={} attendu={}",
@@ -3825,7 +3857,7 @@ impl CausalDecoder {
                     }
                 }
                 cache.position = prompt.len();
-                Ok(Some((cache, final_hidden)))
+                Ok(Some((cache, final_hidden, captures)))
             }
             Err(error) => {
                 if trace_prefill_enabled() {

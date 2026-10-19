@@ -416,11 +416,26 @@ politique du 4 juillet, pas une régression. Les kill-switches
 `PREFILL_ATTN_BATCH_MID_30B=0` et `PREFILL_ATTN_STEEL_D256=0` ne changent rien
 (le 27B, 24/4/256 hybride, n'est éligible à aucun des deux à 732 tokens).
 
-Conséquence pratique pour la solution A : le prefill per-op avec capture coûte
-~21 s sur T2 contre 3 s en résident (`prefill_ms=2979`). Le drafter résident
-n'est utilisable en production sur prompt long que si le prefill résident
-expose les captures des couches cibles. C'est le prochain chantier DFlash,
-avant toute intégration au chemin greedy.
+Conséquence pratique pour la solution A : le prefill per-op avec capture coûtait
+~21 s sur T2 contre 3 s en résident. Corrigé le 19 octobre : le prefill résident
+fusionné copie sur GPU la sortie des couches cibles pendant l'encodage
+(`qwen_moe_prefill_resident_with_captures`, une copie par couche capturée vers
+un buffer `[n, seq, hidden]`, relu une fois et transposé en `[seq, n * hidden]`)
+et `prefill_cache_state_with_layer_capture` l'emprunte avant le repli per-op.
+Kill-switch inchangé : `SARAGOSSA_RUST_PREFILL_RESIDENT=0` ramène au per-op.
+Mesure T2, 200 tokens, `dflash-acceptance` résident u4 (machine chargée) :
+
+| | per-op avec capture | résident avec captures |
+|---|---|---|
+| `spec_ms` (prefill + boucle) | 27 474 | 8 318 |
+| `ref_ms` (prefill + AR) | 30 186 | 11 194 |
+| texte | ≠ AR du CLI (near-tie) | = AR du CLI |
+
+Le drafter résident, sa référence AR et sa boucle CPU partagent désormais le
+prefill de l'AR et du MTP du CLI : la divergence T2 disparaît par construction.
+Oracle modèle réel toujours vert (résident == CPU == AR, 26/30, dense et u4) ;
+test synthétique `prefill_resident_uses_layer_specific_attention_dimensions` :
+captures byte-identiques à la sortie de chaque couche.
 
 ## Limites
 
