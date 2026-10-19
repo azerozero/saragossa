@@ -3714,7 +3714,12 @@ impl CausalDecoder {
     /// C'est le chemin rapide partagé : le wrapper AR n'en garde que la dernière
     /// ligne, tandis que le prefill MTP (historique committed) a besoin de toutes
     /// les lignes pour semer la tête MTP. `None` = préconditions non réunies
-    /// (repli per-op de l'appelant), byte-identique au chemin per-op.
+    /// (repli per-op de l'appelant).
+    ///
+    /// NOTE : pas byte-identique au chemin per-op sur le 27B hybride (24/4/256) :
+    /// logits décalés de 0,002 à 0,08 dès un prompt de 32 tokens, near-tie
+    /// observé au 17e token de T2 (732 tokens, marge 0,016 contre 0,006 dans
+    /// l'autre sens). Classe near-tie, cf. `docs/perf/mtp-pairwise.md`.
     ///
     /// # Errors
     ///

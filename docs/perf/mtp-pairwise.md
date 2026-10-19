@@ -399,12 +399,28 @@ Lecture :
   justifié. Verdict : A, décision par requête ; la bascule reste un outil de
   mesure opt-in du harnais, désactivée par défaut.
 
-Observation hors périmètre : sur T2, la sortie MTP du CLI (`--metrics`, défaut
-adaptatif) diverge de l'AR vers le 15e token alors que T0, T1 et T6 sont
-byte-identiques ; le résident DFlash est égal à l'AR sur les quatre. Après
-bascule sur T2 le harnais rapporte donc `tokens_equal=false` (dérive de la
-boucle MTP, pas de la jonction : préfixe commun bien au-delà du point de
-bascule) et sort en erreur d'oracle. À examiner séparément.
+Divergence T2 examinée (19 octobre) : après bascule sur T2 le harnais rapporte
+`tokens_equal=false` et sort en erreur d'oracle. Ce n'est ni la jonction ni la
+boucle MTP : sur T2, toutes les variantes MTP du CLI (défaut adaptatif, lookup
+0, profondeur 1, historique fresh) et l'AR du CLI (`SARAGOSSA_RUST_MTP_DECODE=0`)
+donnent le même texte, hachage identique sur 64 tokens, et le devtool
+`SARAGOSSA_RUST_MTP_ACCEPTANCE=1` confirme MTP == AR. Ce qui diffère, c'est le
+prefill : la référence AR du harnais DFlash et le drafter résident passent par
+le prefill per-op avec capture de couches (`prefill_cache_state_with_layer_capture`),
+le CLI et MTP par le prefill résident fusionné. `SARAGOSSA_RUST_ORACLE_DUMP_LOGITS=3`
+sur l'AR du CLI avec chaque prefill : logits décalés de 0,002 à 0,08 à toutes
+les positions (déjà 0,002 sur le prompt de warmup de 32 tokens), et au 17e
+token généré un near-tie, 9462 contre 218318 : marge 0,016 avec le prefill
+résident, 0,006 dans l'autre sens avec le per-op. Classe near-tie de la
+politique du 4 juillet, pas une régression. Les kill-switches
+`PREFILL_ATTN_BATCH_MID_30B=0` et `PREFILL_ATTN_STEEL_D256=0` ne changent rien
+(le 27B, 24/4/256 hybride, n'est éligible à aucun des deux à 732 tokens).
+
+Conséquence pratique pour la solution A : le prefill per-op avec capture coûte
+~21 s sur T2 contre 3 s en résident (`prefill_ms=2979`). Le drafter résident
+n'est utilisable en production sur prompt long que si le prefill résident
+expose les captures des couches cibles. C'est le prochain chantier DFlash,
+avant toute intégration au chemin greedy.
 
 ## Limites
 
