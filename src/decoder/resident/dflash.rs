@@ -16,6 +16,8 @@ use crate::DFlashDraft;
 const CONTEXT_UPLOAD_ROWS: usize = 64;
 
 struct DFlashResidentBuffers {
+    /// Kernel skinny bf16 pour les matmuls du drafter (−20 % sur le bloc).
+    skinny_bf16: bool,
     context_upload: GpuTensor,
     noise: GpuTensor,
     states: GpuTensor,
@@ -121,6 +123,10 @@ impl CausalDecoder {
             let drafter = DFlashResident::new(&arena.state, metal, draft, capacity)?;
             let state = &mut arena.state;
             let buffers = DFlashResidentBuffers {
+                skinny_bf16: crate::runtime_flags::env_flag(
+                    "SARAGOSSA_RUST_DFLASH_SKINNY_BF16",
+                    true,
+                ),
                 context_upload: state
                     .persistent(CONTEXT_UPLOAD_ROWS * context_cols, GpuElement::F32)?,
                 noise: state.persistent(block * hidden, GpuElement::F32)?,
@@ -346,6 +352,8 @@ impl CausalDecoder {
             .then(crate::metal_backend::install_dispatch_barrier_scope);
         let _namespace_guard =
             crate::metal_backend::install_scratch_namespace(arena.state.scratch_namespace());
+        let _skinny_guard =
+            crate::metal_backend::install_qmm_skinny_bf16_scope(buffers.skinny_bf16);
         let encoder = new_resident_compute_encoder(command_buffer);
         let mut owned = Vec::new();
         drafter.encode_block(
@@ -446,6 +454,8 @@ impl CausalDecoder {
                 .then(crate::metal_backend::install_dispatch_barrier_scope);
             let _namespace_guard =
                 crate::metal_backend::install_scratch_namespace(arena.state.scratch_namespace());
+            let _skinny_guard =
+                crate::metal_backend::install_qmm_skinny_bf16_scope(buffers.skinny_bf16);
             let encoder = new_resident_compute_encoder(command_buffer);
             let mut owned = Vec::new();
             drafter.encode_context_append(

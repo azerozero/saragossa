@@ -213,7 +213,33 @@ fn qmm_skinny_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMM_SKINNY", true))
 }
 
+thread_local! {
+    // Forçage local du kernel skinny bf16 (drafter DFlash : ses sorties ne sont
+    // que des propositions, la vérification garantit la parité ; le tronc garde
+    // le x3 car bf16 fait diverger le greedy).
+    static SKINNY_BF16_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Garde RAII restaurant le choix précédent du kernel skinny à sa sortie de portée.
+pub(crate) struct SkinnyBf16ScopeGuard(Option<bool>);
+
+impl Drop for SkinnyBf16ScopeGuard {
+    fn drop(&mut self) {
+        SKINNY_BF16_OVERRIDE.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Force le kernel skinny bf16 (`enabled`) ou x3 (`!enabled`) pour les matmuls
+/// encodés sur ce thread tant que la garde vit, indépendamment de
+/// `SARAGOSSA_RUST_QMM_SKINNY_KERNEL`.
+pub(crate) fn install_qmm_skinny_bf16_scope(enabled: bool) -> SkinnyBf16ScopeGuard {
+    SKINNY_BF16_OVERRIDE.with(|slot| SkinnyBf16ScopeGuard(slot.replace(Some(enabled))))
+}
+
 pub(super) fn qmm_skinny_bf16() -> bool {
+    if let Some(forced) = SKINNY_BF16_OVERRIDE.with(Cell::get) {
+        return forced;
+    }
     static BF16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *BF16.get_or_init(|| {
         crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_SKINNY_KERNEL")

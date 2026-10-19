@@ -80,6 +80,7 @@ pub(crate) use self::byte_helpers::read_u16_buffer;
 pub(crate) use self::byte_helpers::write_f32_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
 use self::core::*;
+pub(crate) use self::eligibility::install_qmm_skinny_bf16_scope;
 pub(crate) use self::flags::resident_concurrent_enabled;
 pub(crate) use self::lightbatch_duo::{
     begin_expert_indices_collection, take_expert_indices_collection, DuoSampleParams,
