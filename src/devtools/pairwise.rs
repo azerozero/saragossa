@@ -1,4 +1,5 @@
 //! Campagne locale : mêmes poids/processus, contrôle D1 committed, aucun env muté.
+use crate::devtools::DFlashDraft;
 use crate::runtime_flags::{
     self as flags,
     pairwise::{self, Case, Guard, Mode},
@@ -45,6 +46,7 @@ fn one(
     trace: bool,
     cancel: Option<usize>,
     device: &metal::DeviceRef,
+    draft: Option<&DFlashDraft>,
 ) -> Result<Run> {
     let _guard = Guard::set(case, trace)?;
     let (cb, wait, read, dispatch) = crate::metal_backend::decode_profile_snapshot();
@@ -76,6 +78,26 @@ fn one(
             stats: SpeculativeStats::default(),
             loop_duration: ar.timings.decode,
         }
+    } else if case.mode == Mode::Dflash {
+        // Phase 7 : la boucle DFlash résidente n'a ni callback ni annulation ; seule
+        // l'action bench (byte-identité avec l'oracle AR incluse) la mesure.
+        if trace || cancel.is_some() {
+            return Err(InferError::Config(
+                "mode dflash : action bench seulement (pas de streaming ni d'annulation)".into(),
+            ));
+        }
+        let draft = draft.ok_or_else(|| {
+            InferError::Config(
+                "mode dflash : drafter non chargé (SARAGOSSA_RUST_DFLASH_DRAFT_DIR)".into(),
+            )
+        })?;
+        decoder.generate_greedy_dflash_resident_with_options(
+            prompt,
+            budget,
+            options,
+            draft,
+            draft.info.block_size,
+        )?
     } else if trace || cancel.is_some() {
         decoder.generate_greedy_mtp_streaming_with_options(
             prompt,
@@ -178,6 +200,7 @@ pub(super) fn run(
     prompt: &[usize],
     budget: usize,
     options: &GenerationOptions,
+    draft: Option<&DFlashDraft>,
 ) -> Result<()> {
     if options.temperature.abs() > f32::EPSILON
         || options.token_constraint.is_some()
@@ -236,6 +259,13 @@ pub(super) fn run(
             "contrôle AR réservé au benchmark secondaire AR".into(),
         ));
     }
+    if (control.mode == Mode::Dflash || selected.iter().any(|r| r.case.mode == Mode::Dflash))
+        && (action != "bench" || draft.is_none())
+    {
+        return Err(InferError::Config(
+            "mode dflash : action bench et SARAGOSSA_RUST_DFLASH_DRAFT_DIR requis".into(),
+        ));
+    }
     let device = metal::Device::system_default()
         .ok_or_else(|| InferError::Metal("aucun device pour le harnais".into()))?;
     let counter_sets: Vec<String> = device
@@ -260,6 +290,7 @@ pub(super) fn run(
         false,
         None,
         &device,
+        draft,
     )?;
     if oracle.output.tokens.len() != budget {
         return Err(InferError::Config(
@@ -271,7 +302,9 @@ pub(super) fn run(
     let mut inactive = Vec::new();
     for row in &selected {
         for case in [control, row.case] {
-            let warm = one(decoder, prompt, options, case, 4, false, None, &device)?;
+            let warm = one(
+                decoder, prompt, options, case, 4, false, None, &device, draft,
+            )?;
             exact(&warm, &oracle.output.tokens[..4], "warmup")?;
         }
         if action == "bench" {
@@ -279,7 +312,9 @@ pub(super) fn run(
             for pair in 0..pairs {
                 for candidate in benchmark_order(pair, reverse_order) {
                     let case = if candidate { row.case } else { control };
-                    let run = one(decoder, prompt, options, case, budget, false, None, &device)?;
+                    let run = one(
+                        decoder, prompt, options, case, budget, false, None, &device, draft,
+                    )?;
                     exact(&run, &oracle.output.tokens, &row.id)?;
                     let stats = if candidate {
                         &mut candidate_stats
@@ -304,7 +339,7 @@ pub(super) fn run(
         } else if action == "edges" {
             for limit in [0, 1, 2, 3, 4, 9] {
                 let run = one(
-                    decoder, prompt, options, row.case, limit, false, None, &device,
+                    decoder, prompt, options, row.case, limit, false, None, &device, draft,
                 )?;
                 exact(&run, &oracle.output.tokens[..limit], &row.id)?;
                 report(&run, &row.id, "budget", limit, "candidate");
@@ -319,7 +354,9 @@ pub(super) fn run(
                     .iter()
                     .position(|t| *t == eos)
                     .ok_or_else(|| InferError::Config("EOS oracle absent".into()))?;
-                let run = one(decoder, prompt, &stopped, row.case, 9, false, None, &device)?;
+                let run = one(
+                    decoder, prompt, &stopped, row.case, 9, false, None, &device, draft,
+                )?;
                 exact(&run, &oracle.output.tokens[..end], &row.id)?;
                 report(&run, &row.id, "eos", at, "candidate");
             }
@@ -333,6 +370,7 @@ pub(super) fn run(
                     true,
                     Some(at),
                     &device,
+                    draft,
                 )?;
                 if run.seen != oracle.output.tokens[..at]
                     || !oracle.output.tokens.starts_with(&run.output.tokens)
@@ -346,7 +384,7 @@ pub(super) fn run(
             }
         } else {
             let run = one(
-                decoder, prompt, options, row.case, budget, true, None, &device,
+                decoder, prompt, options, row.case, budget, true, None, &device, draft,
             )?;
             exact(&run, &oracle.output.tokens, &row.id)?;
             if run.seen != run.output.tokens {
@@ -512,5 +550,16 @@ mod tests {
         .validate()
         .is_ok());
         assert!(serde_json::from_str::<Row>(r#"{"id":"PW00","mode":"inconnu"}"#).is_err());
+        // Phase 7 : le drafter DFlash est un mode sans variante MTP, comme le contrôle AR.
+        let dflash: Row = serde_json::from_str(r#"{"id":"PW23","mode":"dflash","hidden":false,"embedding":false,"overlap":false,"p1":true,"p2":false,"p3":false}"#)
+            .expect("invariant: fixture JSON");
+        assert_eq!(dflash.case.mode, Mode::Dflash);
+        assert!(dflash.case.validate().is_ok());
+        assert!(Case {
+            hidden: true,
+            ..dflash.case
+        }
+        .validate()
+        .is_err());
     }
 }

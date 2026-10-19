@@ -15,6 +15,9 @@ pub(crate) enum Mode {
     AdaptiveFresh,
     Block2,
     Ar,
+    /// Drafter DFlash 2 résident (phase 7) : boucle `generate_greedy_dflash_resident`,
+    /// aucune variante MTP applicable.
+    Dflash,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
@@ -65,9 +68,12 @@ impl Case {
         matches!(self.mode, Mode::Fresh | Mode::AdaptiveFresh | Mode::Block2)
     }
     pub fn validate(self) -> crate::Result<()> {
-        if self.mode == Mode::Ar && (self.hidden || self.embedding || self.overlap) {
+        if matches!(self.mode, Mode::Ar | Mode::Dflash)
+            && (self.hidden || self.embedding || self.overlap)
+        {
             return Err(crate::InferError::Config(
-                "les variantes MTP ne sont pas applicables au contrôle AR".into(),
+                "les variantes MTP ne sont pas applicables au contrôle AR ni au drafter DFlash"
+                    .into(),
             ));
         }
         if self.mode == Mode::Block2 && (self.hidden || !self.embedding || self.overlap) {
@@ -201,6 +207,17 @@ mod tests {
         assert!(Case {
             mode: Mode::Block2,
             ..Case::default()
+        }
+        .validate()
+        .is_err());
+        let dflash = Case {
+            mode: Mode::Dflash,
+            ..Case::default()
+        };
+        assert!(dflash.validate().is_ok() && dflash.depth() == 1 && !dflash.fresh());
+        assert!(Case {
+            overlap: true,
+            ..dflash
         }
         .validate()
         .is_err());

@@ -136,7 +136,17 @@ pub fn run_mtp_acceptance(
 ) -> Result<()> {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     if env_flag("SARAGOSSA_RUST_PAIRWISE", false) {
-        return pairwise::run(decoder, prompt_ids, max_tokens, options);
+        // Phase 7 : le drafter DFlash n'est chargé que si le répertoire est posé ; les
+        // campagnes MTP seules restent inchangées.
+        let draft = match crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR") {
+            Some(dir) => Some(load_dflash_draft_weights_quantized(
+                &assets.config,
+                std::path::PathBuf::from(dir),
+                DFlashQuant::from_env()?,
+            )?),
+            None => None,
+        };
+        return pairwise::run(decoder, prompt_ids, max_tokens, options, draft.as_ref());
     }
     let max_draft = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_MAX_DRAFT")
         .and_then(|value| value.parse::<usize>().ok())
