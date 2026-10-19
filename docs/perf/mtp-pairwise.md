@@ -359,6 +359,53 @@ absolus sans valeur. À rejouer machine calme. Le seuil de rentabilité sur T0 e
 T2 reste 77 ms par tour, et la vérification à 9 lignes varie de 66 à 77 ms d'un
 run à l'autre : T0 est dans le bruit.
 
+### Bascule par acceptance observée (19 octobre, mesurée, écartée)
+
+Deux politiques comparées sur 200 tokens (×3) et 500 tokens (×2), alternées
+A/B/MTP par entrée, via `dflash-acceptance` :
+
+- A : décision par requête, drafter résident seul (`SWITCH_MIN=0`).
+- B : résident, puis bascule vers la boucle MTP si l'acceptance observée tombe
+  sous 4 tokens par tour après 8 tours (`SARAGOSSA_RUST_DFLASH_SWITCH_MIN=4.0`,
+  `SARAGOSSA_RUST_DFLASH_SWITCH_WARMUP=8`). Faute de reprise du cache DFlash
+  par la boucle MTP (arène et historique MTP dimensionnés au setup), la bascule
+  du harnais re-prefill prompt + généré, re-prefill compris dans le temps.
+
+Machine chargée pendant tout le run (VM 107-267 % CPU, attente de 90 min sans
+calme) : absolus bruités (vérification 87 ms par tour contre 73-77 calme),
+seules les comparaisons par ligne comptent. tok/s de la boucle, 200 tokens :
+
+| Entrée | A (résident) | B (bascule) | MTP | bascule à | re-prefill + reste |
+|---|---|---|---|---|---|
+| T0 | 48,1 / 34,7 / 36,5 | 42,4 / 33,9 / 35,7 | 47,1 / 46,0 / 46,7 | 35 | 4,0-4,9 s |
+| T1 | 68,1 / 52,7 / 55,8 | 49,7 / 55,2 / 59,4 | 46,4 / 49,7 / 44,3 | jamais | — |
+| T2 | 35,1 / 42,2 / 36,2 | 22,5 / 23,6 / 23,0 | 40,6 / 43,0 / 40,7 | 21 | 7,7-8,1 s |
+| T6 | 71,9 / 86,3 / 101,2 | 77,6 / 88,9 / 101,3 | 79,3 / 79,7 / 70,9 | jamais | — |
+
+500 tokens : T0 A 52,7 / 52,9, B 39,1 / 42,1, MTP 47,9 / 44,4 (bascule à 35,
+re-prefill + reste 11-12 s) ; T1 A 64,8 / 67,3, B 66,1 / 68,1, MTP 45,8 / 47,5.
+
+Lecture :
+
+- Le seuil ne se déclenche jamais sur le code (T1, T6, 10 runs sur 10) et se
+  déclenche au premier tour éligible sur la prose (T0 à 35 tokens, T2 à 21).
+- B perd partout : son plafond est le débit MTP moins le re-prefill, et il ne
+  bascule que sur les entrées où A est déjà à ±7 % de MTP. Sur T2 (prompt 732
+  tokens, re-prefill ~3 s) B tombe à 23 tok/s, moitié de A.
+- Une bascule intégrée (reprise du cache sans re-prefill) rapporterait au mieux
+  l'écart A/MTP sur la prose, +5-7 % à 200 tokens, et rien à 500 tokens où A
+  rejoint ou dépasse MTP sur T0 (52,8 contre 46,2, machine chargée). Le coût
+  (refonte de `generate_greedy_mtp_inner`, arène à redimensionner) n'est pas
+  justifié. Verdict : A, décision par requête ; la bascule reste un outil de
+  mesure opt-in du harnais, désactivée par défaut.
+
+Observation hors périmètre : sur T2, la sortie MTP du CLI (`--metrics`, défaut
+adaptatif) diverge de l'AR vers le 15e token alors que T0, T1 et T6 sont
+byte-identiques ; le résident DFlash est égal à l'AR sur les quatre. Après
+bascule sur T2 le harnais rapporte donc `tokens_equal=false` (dérive de la
+boucle MTP, pas de la jonction : préfixe commun bien au-delà du point de
+bascule) et sort en erreur d'oracle. À examiner séparément.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.
