@@ -329,12 +329,35 @@ contention externe, seule la mesure appariée répétée fait foi.
 
 Sous-profil du drafter sur T0 : 0,6 ms d'embeddings et d'encodage, 8,1 ms
 d'attente GPU, 0,1 ms de readback et de sélecteur. Le coût est le travail GPU du
-bloc (cinq couches à 9 lignes, logits du lm_head sur 8 lignes, top-k), pas les
-synchronisations ni le CPU. Suite : réduire ce travail (nombre de dispatches par
-couche, logits sur moins de lignes ou lm_head restreint, top-k mieux parallélisé),
-puis prefill du contexte depuis les captures du prefill résident. Le seuil de
-rentabilité sur T0 et T2 reste 77 ms par tour, et la vérification à 9 lignes
-varie de 66 à 77 ms d'un run à l'autre : T0 est dans le bruit.
+bloc, pas les synchronisations ni le CPU. Microbench du command buffer du
+drafter (médiane de 20 runs, machine calme) :
+
+| Segment | skinny x3 (défaut tronc) | skinny bf16 | sans skinny (NA tiled) | qmm8 |
+|---|---|---|---|---|
+| bloc 5 couches, 9 lignes | 4,57 | 3,74 | 7,58 | 13,2 |
+| bloc à 2 lignes (qmm2) | 2,80 | | | |
+| lm_head 9 lignes | 2,59 | 2,14 | 5,86 | 9,36 |
+| lm_head 1 ligne (qmv) | 1,50 | 1,50 | 1,51 | 1,53 |
+| candidats (lm_head + top-k + projection) | 3,12 | 2,63 | 6,46 | 9,62 |
+| bloc + candidats | 7,37 | 6,10 | 13,6 | 23,2 |
+
+Le kernel skinny lit les 800 Mo du bloc et les 636 Mo du lm_head à ~2,4× le
+plancher de bande passante (le qmv à 1 ligne est au plancher). Le drafter ne
+produit que des propositions, la vérification garantit la parité : il prend le
+kernel skinny bf16 (portée thread-local `install_qmm_skinny_bf16_scope`, kill-switch
+`SARAGOSSA_RUST_DFLASH_SKINNY_BF16=0`) alors que le tronc garde le x3, qui seul
+préserve le greedy. Drafter 9,6 → 7,9 ms par tour sur T0, 9,1 → 8,2 sur T6,
+acceptations identiques (145 et 177 sur 200), oracle modèle réel vert. Le top-k
+restant vaut ~0,45 ms par tour (0,5 %), laissé tel quel. Le reste du drafter est
+la lecture des poids par le kernel skinny, même levier que la vérification du
+tronc à 9 lignes (73-77 ms, 85 % du tour).
+
+Le bench apparié relancé après ce changement a tourné machine chargée (VM,
+navigateur) : tous les segments ralentissent ensemble, MTP compris (T0 41-47,
+T6 62-65 tok/s), ratios conservés (T1 +40 %, T6 +40 %, T0 -15 %, T2 -10 %),
+absolus sans valeur. À rejouer machine calme. Le seuil de rentabilité sur T0 et
+T2 reste 77 ms par tour, et la vérification à 9 lignes varie de 66 à 77 ms d'un
+run à l'autre : T0 est dans le bruit.
 
 ## Limites
 
