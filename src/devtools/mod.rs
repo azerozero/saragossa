@@ -309,6 +309,16 @@ pub fn run_dflash_acceptance(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(draft.info.block_size);
+    // La bascule termine par la boucle MTP : sidecar exigé avant de commencer,
+    // plutôt qu'une erreur en cours de génération.
+    let switch_requested = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_MIN")
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .is_some_and(|value| value > 0.0);
+    if switch_requested && !decoder.has_mtp_head() {
+        return Err(InferError::Config(
+            "bascule DFlash (SARAGOSSA_RUST_DFLASH_SWITCH_MIN) sans sidecar MTP chargé".to_string(),
+        ));
+    }
     let reference_started = Instant::now();
     let reference = decoder
         .generate_greedy_dflash_reference_with_options(prompt_ids, max_tokens, options, draft)?;
@@ -336,8 +346,10 @@ pub fn run_dflash_acceptance(
     // termine depuis prompt + généré (re-prefill compris dans le temps mesuré).
     let mut fallback_ms = 0u128;
     if let Some(switched_at) = spec.stats.dflash_switched_at {
+        // Même lecture que `serve::mtp::max_draft_tokens` : minimum strict de un.
         let mtp_draft = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_MAX_DRAFT")
             .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
             .unwrap_or(2);
         let fallback_started = Instant::now();
         let mut fallback_prompt = prompt_ids.to_vec();

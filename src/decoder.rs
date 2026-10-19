@@ -1227,6 +1227,13 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 }
 
 impl CausalDecoder {
+    /// Vrai si un sidecar MTP est chargé (repli de la bascule DFlash).
+    pub fn has_mtp_head(&self) -> bool {
+        self.mtp.is_some()
+    }
+}
+
+impl CausalDecoder {
     fn register_prefix_cache_purgeable(&self) {
         let cache = Arc::downgrade(&self.prefix_cache);
         let name = format!("decoder-prefix-cache:{:p}", Arc::as_ptr(&self.prefix_cache));
