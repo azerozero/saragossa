@@ -391,6 +391,9 @@ pub struct SpeculativeStats {
     pub proposed_by_position: Vec<usize>,
     /// Nombre de propositions acceptées par position draft.
     pub accepted_by_position: Vec<usize>,
+    /// Boucle DFlash interrompue par la bascule sur acceptance observée, après
+    /// ce nombre de tokens générés (le reste revient à la boucle MTP).
+    pub dflash_switched_at: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

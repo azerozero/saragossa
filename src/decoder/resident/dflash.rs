@@ -177,12 +177,29 @@ impl CausalDecoder {
         // Profil par segment du tour (devtools) : draft, vérification, rollback,
         // append du contexte.
         let profile = crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_PROFILE", false);
+        // Bascule par acceptance observée : sous `switch_min` tokens par tour en
+        // moyenne après `switch_warmup` tours, la boucle rend la main (le reste de
+        // la génération revient à la boucle MTP, cf. harnais d'acceptance).
+        let switch_min = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_MIN")
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let switch_warmup = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_WARMUP")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(6)
+            .max(1);
         let mut segments = [std::time::Duration::ZERO; 4];
         let mut tours = 0usize;
 
         while generated.len() < max_new_tokens {
             let primary = pending;
             if options.stop_token_ids.contains(&primary) {
+                break;
+            }
+            if switch_min > 0.0
+                && tours >= switch_warmup
+                && (generated.len() as f64) < switch_min * tours as f64
+            {
+                stats.dflash_switched_at = Some(generated.len());
                 break;
             }
             generated.push(primary);

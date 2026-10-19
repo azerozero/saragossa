@@ -318,7 +318,7 @@ pub fn run_dflash_acceptance(
         && env_flag("SARAGOSSA_RUST_DFLASH_RESIDENT", false);
     let spec_started = Instant::now();
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    let spec = if resident {
+    let mut spec = if resident {
         decoder.generate_greedy_dflash_resident_with_options(
             prompt_ids, max_tokens, options, draft, max_draft,
         )?
@@ -328,10 +328,37 @@ pub fn run_dflash_acceptance(
         )?
     };
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
-    let spec = decoder.generate_greedy_dflash_batched_with_options(
+    let mut spec = decoder.generate_greedy_dflash_batched_with_options(
         prompt_ids, max_tokens, options, draft, max_draft,
     )?;
-    let spec_elapsed = spec_started.elapsed();
+    let mut spec_elapsed = spec_started.elapsed();
+    // Bascule : la boucle DFlash a rendu la main, la boucle MTP par défaut
+    // termine depuis prompt + généré (re-prefill compris dans le temps mesuré).
+    let mut fallback_ms = 0u128;
+    if let Some(switched_at) = spec.stats.dflash_switched_at {
+        let mtp_draft = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_MAX_DRAFT")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2);
+        let fallback_started = Instant::now();
+        let mut fallback_prompt = prompt_ids.to_vec();
+        fallback_prompt.extend_from_slice(&spec.tokens);
+        let fallback = decoder.generate_greedy_mtp_batched_with_options(
+            &fallback_prompt,
+            max_tokens.saturating_sub(spec.tokens.len()),
+            options,
+            mtp_draft,
+        )?;
+        let fallback_elapsed = fallback_started.elapsed();
+        fallback_ms = fallback_elapsed.as_millis();
+        spec_elapsed += fallback_elapsed;
+        spec.loop_duration += fallback_elapsed;
+        spec.tokens.extend(fallback.tokens);
+        spec.stats.proposed += fallback.stats.proposed;
+        spec.stats.accepted += fallback.stats.accepted;
+        spec.stats.rejected += fallback.stats.rejected;
+        spec.stats.verifications += fallback.stats.verifications;
+        spec.stats.dflash_switched_at = Some(switched_at);
+    }
     let tokens_equal = reference == spec.tokens;
     let generated = spec
         .tokens
@@ -348,8 +375,10 @@ pub fn run_dflash_acceptance(
         0.0
     };
     eprintln!(
-        "dflash_acceptance mode={} tokens_equal={} generated={} max_draft={} block_size={} proposed={} accepted={} rejected={} verifications={} avg_accepted_per_verify={:.3} load_ms={} warmup_ms={} ref_ms={} spec_ms={} spec_tok_s={:.1}",
+        "dflash_acceptance mode={} switched_at={} fallback_ms={} tokens_equal={} generated={} max_draft={} block_size={} proposed={} accepted={} rejected={} verifications={} avg_accepted_per_verify={:.3} load_ms={} warmup_ms={} ref_ms={} spec_ms={} spec_tok_s={:.1}",
         if resident { "resident" } else { "cpu" },
+        spec.stats.dflash_switched_at.unwrap_or(0),
+        fallback_ms,
         tokens_equal,
         spec.tokens.len(),
         max_draft,
