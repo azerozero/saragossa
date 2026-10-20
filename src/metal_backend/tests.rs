@@ -4,6 +4,7 @@ use super::*;
 include!("tests/util.rs");
 include!("tests/buffers_core.rs");
 include!("tests/na_gemm_delta.rs");
+include!("tests/small_m_qmm.rs");
 include!("tests/coop_moe.rs");
 include!("tests/quant_qmv_sampling.rs");
 include!("tests/qmv_align64.rs");

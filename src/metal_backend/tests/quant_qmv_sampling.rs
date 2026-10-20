@@ -1528,6 +1528,114 @@ fn affine_qmv_u3_gs64_dequantizes_like_cpu_bit_exact() -> Result<()> {
     Ok(())
 }
 
+/// Produit `lhs[batch, in_dim] · Wᵀ` par le vrai sélecteur de kernel
+/// (`encode_matmul_weight_buffers`), contrairement à `matmul_rhs_t_affine` qui a
+/// sa propre chaîne qmv.
+fn matmul_via_selected_kernel(
+    executor: &MetalExecutor,
+    weight: &AffineQuantizedTensor,
+    lhs: &[f32],
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>> {
+    let buffers = executor.resolve_linear_weight_buffers(
+        &LinearWeight::AffineQuantized(weight.clone()),
+        "selected_kernel_weight",
+    )?;
+    let lhs_buf = executor.upload_f32_buffer(lhs, "selected_kernel_lhs")?;
+    let out_buf = executor.uncached_f32_buffer(batch * out_dim, "selected_kernel_out")?;
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let actual_out = executor
+        .encode_matmul_weight_buffers(encoder, &lhs_buf, batch, in_dim, &buffers, &out_buf, false)?;
+    assert_eq!(actual_out, out_dim);
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    read_f32_buffer(&out_buf, batch * out_dim)
+}
+
+#[test]
+#[ignore = "kernel opt-in : SARAGOSSA_RUST_QMM8=1 cargo test --all-features qmm8 -- --ignored"]
+fn affine_qmm8_u4_gs64_matches_qmv_for_3_to_31_rows() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let in_dim = 1024_usize;
+    let out_dim = 40_usize;
+    let weight = test_affine_varied(out_dim, in_dim)?;
+    assert!(matches!(
+        executor.select_owned_affine_matmul_kernel(8, in_dim, &weight, false),
+        AffineMatmulKernel::Qmm8
+    ));
+    assert!(!matches!(
+        executor.select_owned_affine_matmul_kernel(2, in_dim, &weight, false),
+        AffineMatmulKernel::Qmm8
+    ));
+    for batch in [3_usize, 5, 8, 9, 16, 31] {
+        let mut lhs = Vec::with_capacity(batch * in_dim);
+        let mut expected = Vec::with_capacity(batch * out_dim);
+        for row in 0..batch {
+            let values = varied_row(in_dim, 101 + row);
+            let reference = executor
+                .matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], values.clone())?, &weight)?;
+            expected.extend_from_slice(reference.data());
+            lhs.extend_from_slice(&values);
+        }
+        let actual = matmul_via_selected_kernel(&executor, &weight, &lhs, batch, in_dim, out_dim)?;
+        // Même ordre d'accumulation que le qmv mais fusion FMA différente : à
+        // quelques ULP, pas bit à bit (constaté une fois le test routé par le
+        // sélecteur réel ; `matmul_rhs_t_affine` ne dispatche jamais qmm8).
+        assert_all_close_scaled(&actual, &expected, &format!("qmm8 u4 batch={batch}"));
+    }
+    Ok(())
+}
+
+#[test]
+fn qmm_skinny_u4_gs64_matches_qmv_for_5_to_31_rows() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let in_dim = 1024_usize;
+    let out_dim = 64_usize;
+    let weight = test_affine_varied(out_dim, in_dim)?;
+    if !executor.qmm_skinny_available() {
+        eprintln!("skip: GEMM NA skinny indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    assert!(matches!(
+        executor.select_owned_affine_matmul_kernel(8, in_dim, &weight, false),
+        AffineMatmulKernel::Skinny
+    ));
+    assert!(!matches!(
+        executor.select_owned_affine_matmul_kernel(4, in_dim, &weight, false),
+        AffineMatmulKernel::Skinny
+    ));
+    for batch in [5_usize, 8, 9, 16, 17, 31] {
+        let mut lhs = Vec::with_capacity(batch * in_dim);
+        let mut expected = Vec::with_capacity(batch * out_dim);
+        for row in 0..batch {
+            let values = varied_row(in_dim, 101 + row);
+            let reference = executor
+                .matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], values.clone())?, &weight)?;
+            expected.extend_from_slice(reference.data());
+            lhs.extend_from_slice(&values);
+        }
+        let actual = matmul_via_selected_kernel(&executor, &weight, &lhs, batch, in_dim, out_dim)?;
+        let scale = expected.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let worst = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, e)| (a - e).abs() / scale)
+            .fold(0.0f32, f32::max);
+        // bf16 hi+lo sur A et B, trois MMA : ~1e-5 de l'échelle (le qmv f32
+        // réordonné est à 8e-7) ; 5e-5 laisse la marge d'une autre génération de GPU.
+        eprintln!("qmm skinny batch={batch}: écart max {worst:.2e} de l'échelle");
+        assert!(worst <= 5.0e-5, "qmm skinny u4 batch={batch}: écart {worst:e}");
+    }
+    Ok(())
+}
+
 #[test]
 fn affine_qmm2_u3_gs64_matches_two_qmv_bit_exact() -> Result<()> {
     let Some(executor) = test_executor()? else {
@@ -2301,22 +2409,30 @@ fn encode_matmul_weight_buffers_na_fused_tiled_matches_cpu_when_enabled() -> Res
 
 #[test]
 fn qmm_na_fused_tiled_u4_accepts_dense_and_rejects_shared_shapes() {
+    // Seuil de largeur mesuré (qmm_na_min_batch, défaut 32) : 33 lignes passent, 31 non.
     assert!(can_use_qmm_na_fused_tiled_u4_buffers(
-        17,
+        33,
         2048,
         2048,
         FAST_QMV_GROUP_SIZE,
         FAST_QMV_BITS
     ));
     assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        17,
+        31,
+        2048,
+        2048,
+        FAST_QMV_GROUP_SIZE,
+        FAST_QMV_BITS
+    ));
+    assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
+        33,
         2048,
         512,
         FAST_QMV_GROUP_SIZE,
         FAST_QMV_BITS
     ));
     assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        17,
+        33,
         512,
         2048,
         FAST_QMV_GROUP_SIZE,
@@ -3475,4 +3591,126 @@ fn assert_bits_equal(left: &[f32], right: &[f32], label: &str) {
             format!("{label}: bits divergents à l'index {idx}")
         });
     }
+}
+
+/// Pairwise p2 : `out = residual + W·x` doit égaler bit à bit qmv u4 aligné +
+/// `weighted_sum_add_topk(score=1.0)`, et rester proche de la référence CPU.
+#[cfg(feature = "devtools")]
+#[test]
+#[ignore = "GPU Metal strict : lancer explicitement avec --ignored"]
+fn qmv_u4_residual_matches_two_step_and_cpu() -> Result<()> {
+    use crate::runtime_flags::pairwise::{Case, Guard};
+    let Some(executor) = test_executor()? else {
+        return Err(InferError::Metal("aucun device Metal pour test strict p2".into()));
+    };
+    let _p2 = Guard::set(
+        Case {
+            p2: true,
+            ..Case::default()
+        },
+        false,
+    )?;
+    let (in_dim, out_dim) = (1024_usize, 72_usize);
+    let affine = test_affine_varied(out_dim, in_dim)?;
+    let cpu = Linear::from_weight(LinearWeight::AffineQuantized(affine.clone()), None)?;
+    let weight = executor.resolve_linear_weight_buffers(
+        &LinearWeight::AffineQuantized(affine),
+        "qmv_u4_residual_weight",
+    )?;
+    let x: Vec<f32> = (0..in_dim)
+        .map(|i| ((i % 37) as f32 - 18.0) / 32.0)
+        .collect();
+    let residual: Vec<f32> = (0..out_dim)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.375)
+        .collect();
+    let projected = cpu.forward(&Tensor::from_vec(vec![1, in_dim], x.clone())?)?;
+    let reference: Vec<f32> = residual
+        .iter()
+        .zip(projected.data())
+        .map(|(r, p)| r + p)
+        .collect();
+
+    let lhs = executor.upload_f32_buffer(&x, "qmv_u4_residual_lhs")?;
+    let res = executor.upload_f32_buffer(&residual, "qmv_u4_residual_res")?;
+    let score = executor.upload_f32_buffer(&[1.0], "qmv_u4_residual_score")?;
+    let fused = executor.uncached_f32_buffer(out_dim, "qmv_u4_residual_fused")?;
+    let down = executor.uncached_f32_buffer(out_dim, "qmv_u4_residual_down")?;
+    let split = executor.uncached_f32_buffer(out_dim, "qmv_u4_residual_split")?;
+    let mut owned = Vec::new();
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    assert!(executor
+        .encode_qmv_u4_residual_buffers(encoder, &lhs, &weight, &res, &fused, in_dim, out_dim)?);
+    assert_eq!(
+        executor.encode_matmul_weight_buffers(encoder, &lhs, 1, in_dim, &weight, &down, false)?,
+        out_dim
+    );
+    executor.encode_weighted_sum_add_topk(
+        encoder, &mut owned, &down, &score, &res, &split, 1, out_dim,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    let fused = read_f32_buffer(&fused, out_dim)?;
+    let split = read_f32_buffer(&split, out_dim)?;
+    let fused_bits: Vec<u32> = fused.iter().map(|v| v.to_bits()).collect();
+    let split_bits: Vec<u32> = split.iter().map(|v| v.to_bits()).collect();
+    assert_eq!(fused_bits, split_bits);
+    assert_close_eps(&fused, &reference, 1.0e-3);
+    Ok(())
+}
+
+/// Pairwise p2 : dimensions/buffers non éligibles → `Ok(false)` sans encoder
+/// (sortie intacte), et p2 OFF hors harnais même sur une forme éligible.
+#[cfg(feature = "devtools")]
+#[test]
+#[ignore = "GPU Metal strict : lancer explicitement avec --ignored"]
+fn qmv_u4_residual_falls_back_without_mutation() -> Result<()> {
+    use crate::runtime_flags::pairwise::{Case, Guard};
+    let Some(executor) = test_executor()? else {
+        return Err(InferError::Metal("aucun device Metal pour test strict p2".into()));
+    };
+    let resolve = |out_dim: usize, in_dim: usize| {
+        executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(test_affine_varied(out_dim, in_dim)?),
+            "qmv_u4_residual_fallback_weight",
+        )
+    };
+    let eligible = resolve(64, 512)?;
+    let short_k = resolve(64, 64)?;
+    let ragged_out = resolve(60, 512)?;
+    let lhs = executor.upload_f32_buffer(&[0.5; 512], "qmv_u4_residual_fb_lhs")?;
+    let res = executor.upload_f32_buffer(&[1.0; 64], "qmv_u4_residual_fb_res")?;
+    let tiny_res = executor.upload_f32_buffer(&[1.0; 8], "qmv_u4_residual_fb_tiny")?;
+    let sentinel = [-7.25_f32; 64];
+    let out = executor.upload_f32_buffer(&sentinel, "qmv_u4_residual_fb_out")?;
+
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    assert!(!executor
+        .encode_qmv_u4_residual_buffers(encoder, &lhs, &eligible, &res, &out, 512, 64)?);
+    {
+        let _p2 = Guard::set(
+            Case {
+                p2: true,
+                ..Case::default()
+            },
+            false,
+        )?;
+        for (weight, in_dim, out_dim, residual) in [
+            (&short_k, 64, 64, &res),
+            (&ragged_out, 512, 60, &res),
+            (&eligible, 512, 128, &res),
+            (&eligible, 1024, 64, &res),
+            (&eligible, 512, 64, &tiny_res),
+        ] {
+            assert!(!executor.encode_qmv_u4_residual_buffers(
+                encoder, &lhs, weight, residual, &out, in_dim, out_dim,
+            )?);
+        }
+    }
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    assert_eq!(read_f32_buffer(&out, 64)?, sentinel);
+    Ok(())
 }

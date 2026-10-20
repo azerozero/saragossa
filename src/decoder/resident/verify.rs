@@ -2,6 +2,38 @@ use super::super::*;
 use super::types::*;
 
 impl CausalDecoder {
+    /// Vrai si toutes les couches ont leurs buffers résidents en lignes : la
+    /// vérification batchée (captures, rollback par troncature) est possible.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(in crate::decoder) fn resident_layer_batch_supported(&self, arena: &ResidentArena) -> bool {
+        self.layers.iter().enumerate().all(|(index, layer)| {
+            match (
+                self.config.is_resident_full_attention_layer(index),
+                layer.mlp.as_ref(),
+            ) {
+                (true, Some(FeedForward::Dense(_))) => {
+                    matches!(
+                        arena.layers.get(index),
+                        Some(ResidentLayerBuffers::FullDense(_))
+                    )
+                }
+                (false, Some(FeedForward::Moe(_))) if prefill_moe_rows_enabled() => {
+                    matches!(
+                        arena.layers.get(index),
+                        Some(ResidentLayerBuffers::LinearMoe(_))
+                    )
+                }
+                (false, Some(FeedForward::Dense(_))) => {
+                    matches!(
+                        arena.layers.get(index),
+                        Some(ResidentLayerBuffers::LinearDense(_))
+                    )
+                }
+                _ => false,
+            }
+        })
+    }
+
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(in crate::decoder) fn next_final_states_resident_verify(
         &self,
@@ -54,33 +86,8 @@ impl CausalDecoder {
             return Ok(None);
         };
 
-        let layer_batch_supported = token_ids.len() > 1
-            && self.layers.iter().enumerate().all(|(index, layer)| {
-                match (
-                    self.config.is_resident_full_attention_layer(index),
-                    layer.mlp.as_ref(),
-                ) {
-                    (true, Some(FeedForward::Dense(_))) => {
-                        matches!(
-                            arena.layers.get(index),
-                            Some(ResidentLayerBuffers::FullDense(_))
-                        )
-                    }
-                    (false, Some(FeedForward::Moe(_))) if prefill_moe_rows_enabled() => {
-                        matches!(
-                            arena.layers.get(index),
-                            Some(ResidentLayerBuffers::LinearMoe(_))
-                        )
-                    }
-                    (false, Some(FeedForward::Dense(_))) => {
-                        matches!(
-                            arena.layers.get(index),
-                            Some(ResidentLayerBuffers::LinearDense(_))
-                        )
-                    }
-                    _ => false,
-                }
-            });
+        let layer_batch_supported =
+            token_ids.len() > 1 && self.resident_layer_batch_supported(arena);
         if layer_batch_supported {
             let base_position = *cache_position;
             let embed = self.embed_scaled(token_ids)?;
@@ -104,8 +111,6 @@ impl CausalDecoder {
                 .lease(batch_elements, GpuElement::F32)?;
             arena.state.upload(batch_a.tensor(), embed.data())?;
 
-            let row_in = arena.state.scratch().lease(hidden, GpuElement::F32)?;
-            let row_out = arena.state.scratch().lease(hidden, GpuElement::F32)?;
             let final_states = arena
                 .state
                 .scratch()
@@ -157,50 +162,28 @@ impl CausalDecoder {
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_cache = &mut layers[index];
                 if self.config.is_resident_full_attention_layer(index) {
-                    for row in 0..batch {
-                        let row_offset = row
-                            .checked_mul(hidden)
-                            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
-                            .and_then(|value| u64::try_from(value).ok())
-                            .ok_or_else(|| {
-                                InferError::Metal("verify row offset déborde".to_string())
-                            })?;
-                        metal.encode_copy_with_offsets(
-                            encoder,
-                            current,
-                            row_offset,
-                            row_in.tensor().buffer(),
-                            0,
-                            hidden,
-                        )?;
-                        let dims = self.config.resident_windowed_full_attn_layer_dims(
-                            index,
-                            hidden,
-                            *cache_position + row,
-                            eps,
-                            theta,
-                        )?;
-                        self.encode_resident_full_layer(
-                            metal,
-                            arena,
-                            layer_cache,
-                            layer,
-                            index,
-                            encoder,
-                            &mut owned,
-                            dims,
-                            row_in.tensor().buffer(),
-                            row_out.tensor().buffer(),
-                        )?;
-                        metal.encode_copy_with_offsets(
-                            encoder,
-                            row_out.tensor().buffer(),
-                            0,
-                            other,
-                            row_offset,
-                            hidden,
-                        )?;
-                    }
+                    // Toutes les lignes en un passage, comme le pas D2 fusionné :
+                    // ligne par ligne, chaque ligne relisait les poids de la couche.
+                    let dims = self.config.resident_windowed_full_attn_layer_dims(
+                        index,
+                        hidden,
+                        *cache_position,
+                        eps,
+                        theta,
+                    )?;
+                    self.encode_resident_full_dense_layer_rows(
+                        metal,
+                        arena,
+                        layer_cache,
+                        layer,
+                        index,
+                        encoder,
+                        &mut owned,
+                        dims,
+                        batch,
+                        current,
+                        other,
+                    )?;
                 } else {
                     let Some((la_spec, key_dim, value_dim, conv_dim)) = linear_dims else {
                         return Err(InferError::Config(
@@ -308,31 +291,17 @@ impl CausalDecoder {
             )?;
             let final_indices = if emit_argmax {
                 let indices = arena.state.scratch().lease(batch, GpuElement::U32)?;
-                for row in 0..batch {
-                    let input_offset = row
-                        .checked_mul(hidden)
-                        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
-                        .and_then(|value| u64::try_from(value).ok())
-                        .ok_or_else(|| {
-                            InferError::Metal("verify argmax input offset déborde".to_string())
-                        })?;
-                    let index_offset = row
-                        .checked_mul(std::mem::size_of::<u32>())
-                        .and_then(|value| u64::try_from(value).ok())
-                        .ok_or_else(|| {
-                            InferError::Metal("verify argmax index offset déborde".to_string())
-                        })?;
-                    metal.encode_lm_head_argmax_buffers_with_index_offset(
-                        encoder,
-                        &mut owned,
-                        final_states.tensor().buffer(),
-                        &arena.lm_head,
-                        indices.tensor().buffer(),
-                        input_offset,
-                        index_offset,
-                        hidden,
-                    )?;
-                }
+                // lm_head projeté une fois pour toutes les lignes, argmax par ligne.
+                metal.encode_lm_head_argmax_rows_buffers(
+                    encoder,
+                    final_states.tensor().buffer(),
+                    &arena.lm_head,
+                    indices.tensor().buffer(),
+                    0,
+                    0,
+                    batch,
+                    hidden,
+                )?;
                 Some(indices)
             } else {
                 None

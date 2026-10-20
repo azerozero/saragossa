@@ -3,7 +3,7 @@ use super::super::*;
 use crate::metal_backend::MetalExecutor;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-type ResidentMtpSpecOneOutput = (usize, usize, Tensor, Option<(usize, Tensor)>);
+type ResidentMtpSpecOneOutput = (usize, usize, MtpFinalState, Option<(usize, MtpFinalState)>);
 
 impl CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
@@ -149,7 +149,12 @@ impl CausalDecoder {
             &mut scratch,
         )?;
         encoder_guard.end();
+        let timer = arena.state.gpu_timer();
+        let started = timer.map(|_| std::time::Instant::now());
         crate::metal_backend::commit_and_wait(command_buffer)?;
+        if let (Some(timer), Some(started)) = (timer, started) {
+            timer.record_mtp_flush(started.elapsed().as_nanos());
+        }
         #[cfg(feature = "devtools")]
         if crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false) {
             if let Some(mtp) = arena.mtp.as_mut() {
@@ -1215,13 +1220,19 @@ impl CausalDecoder {
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cycle MTP : cache, état, historique, arrêt et callback après soumission explicites"
+    )]
     pub(in crate::decoder) fn next_mtp_spec_one_resident(
         &self,
         cache: &mut CausalDecoderCache,
-        final_state: &Tensor,
+        final_state: &MtpFinalState,
         primary: usize,
         history_len: usize,
         stop_token_ids: &[usize],
+        retain_hidden: bool,
+        after_submit: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<Option<ResidentMtpSpecOneOutput>> {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
@@ -1239,9 +1250,9 @@ impl CausalDecoder {
         let q_heads = self.config.num_attention_heads;
         let kv_heads = self.config.num_key_value_heads;
         let hidden = self.final_norm.data().len();
-        // Mode fresh (défaut) : cache MTP self-only (position 0, vidé par
-        // pas), ni draft#2 ni historique committed (prouvé inerte : committed
-        // ≡ cycle byte-identique). `mtp_history` = position/troncature du cache.
+        // Fresh est opt-in : cache MTP self-only (position 0, vidé par pas),
+        // sans draft#2 préparatoire. Il change les propositions, pas l'oracle AR.
+        // Le défaut reste l'historique committed.
         let fresh = crate::decoder::flags::mtp_fresh_cache_enabled();
         let mtp_history = if fresh { 0 } else { history_len };
         let primary_u32 = u32::try_from(primary)
@@ -1277,9 +1288,6 @@ impl CausalDecoder {
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
         };
-        if arena.state.gpu_timer().is_some() {
-            return Ok(None);
-        }
         let trunk_batch_supported = self.layers.iter().enumerate().all(|(index, layer)| {
             match (
                 self.config.is_resident_full_attention_layer(index),
@@ -1306,26 +1314,55 @@ impl CausalDecoder {
         let Some(mtp) = arena.mtp.as_mut() else {
             return Ok(None);
         };
-        let (rows, state_hidden) = final_state.as_matrix()?;
-        if rows != 1 || state_hidden != hidden {
-            return Err(InferError::Dimension(format!(
-                "MTP fused final_state=[{rows},{state_hidden}], attendu [1,{hidden}]"
-            )));
+        match final_state {
+            MtpFinalState::Cpu(state) => {
+                let (rows, state_hidden) = state.as_matrix()?;
+                if rows != 1 || state_hidden != hidden {
+                    return Err(InferError::Dimension(format!(
+                        "MTP fused final_state=[{rows},{state_hidden}], attendu [1,{hidden}]"
+                    )));
+                }
+                arena.state.upload(&mtp.hidden_a, state.as_row()?)?;
+                #[cfg(test)]
+                MTP_D1_HIDDEN_TRANSFERS.with(|counts| {
+                    let (reads, uploads) = counts.get();
+                    counts.set((reads, uploads + 1));
+                });
+            }
+            MtpFinalState::ResidentRow { .. } => final_state.validate_resident(hidden)?,
+            MtpFinalState::Resident(lease) => {
+                #[cfg(feature = "devtools")]
+                crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::Hidden);
+                if lease.tensor().len() != hidden || lease.tensor().element() != GpuElement::F32 {
+                    return Err(InferError::Dimension(
+                        "état MTP résident incompatible".into(),
+                    ));
+                }
+            }
         }
-
-        arena.state.upload(&mtp.hidden_a, final_state.as_row()?)?;
         arena.state.upload_u32(&mtp.index, &[primary_u32])?;
         mtp.kv.truncate(mtp_history)?;
         mtp.current_is_a = true;
 
-        let embed = self.embed_scaled(&[primary])?;
-        let (_, embed_hidden) = embed.as_matrix()?;
-        if embed_hidden != hidden {
-            return Err(InferError::Dimension(format!(
-                "embedding hidden={embed_hidden}, attendu {hidden}"
-            )));
-        }
-        arena.state.upload(&arena.hidden_a, embed.data())?;
+        // Embedding GPU : ligne 0 du verify gathered depuis `mtp.index` dans le CB.
+        // `arena.hidden_a` n'est lu par aucun consommateur sans réécriture
+        // préalable : ON ne le remplit pas. OFF : chemin CPU historique inchangé.
+        let gpu_embedding = crate::runtime_flags::mtp_gpu_embedding_enabled();
+        let embed = if gpu_embedding {
+            None
+        } else {
+            let embed = self.embed_scaled(&[primary])?;
+            let (_, embed_hidden) = embed.as_matrix()?;
+            if embed_hidden != hidden {
+                return Err(InferError::Dimension(format!(
+                    "embedding hidden={embed_hidden}, attendu {hidden}"
+                )));
+            }
+            arena.state.upload(&arena.hidden_a, embed.data())?;
+            Some(embed)
+        };
+        let embed_scale = self.config.embed_scale.unwrap_or(1.0);
+        let embed_bf16 = self.config.is_qwen && qwen_embed_bf16_enabled();
 
         let linear_captures = if linear_dims.is_some() {
             let capture_rows = 1usize;
@@ -1359,6 +1396,14 @@ impl CausalDecoder {
             let embedding_norm = arena.state.scratch().lease(hidden, GpuElement::F32)?;
             let hidden_norm = arena.state.scratch().lease(hidden, GpuElement::F32)?;
             let layer_out = arena.state.scratch().lease(hidden, GpuElement::F32)?;
+            if matches!(final_state, MtpFinalState::ResidentRow { .. }) {
+                final_state.encode_resident_copy(
+                    metal,
+                    encoder_guard.encoder(),
+                    mtp.hidden_a.buffer(),
+                    hidden,
+                )?;
+            }
             metal.encode_embedding_from_index_buffers(
                 encoder_guard.encoder(),
                 &arena.embed_tokens,
@@ -1377,7 +1422,12 @@ impl CausalDecoder {
             )?;
             metal.encode_rms_norm_rows(
                 encoder_guard.encoder(),
-                mtp.hidden_a.buffer(),
+                match final_state {
+                    MtpFinalState::Cpu(_) | MtpFinalState::ResidentRow { .. } => {
+                        mtp.hidden_a.buffer()
+                    }
+                    MtpFinalState::Resident(lease) => lease.tensor().buffer(),
+                },
                 &mtp.pre_fc_norm_hidden,
                 hidden_norm.tensor().buffer(),
                 1,
@@ -1502,12 +1552,30 @@ impl CausalDecoder {
             .scratch()
             .lease(verify_elements, GpuElement::F32)?;
         let draft_embed = arena.state.scratch().lease(hidden, GpuElement::F32)?;
-        arena.state.upload(verify_a.tensor(), embed.data())?;
+        if let Some(embed) = &embed {
+            arena.state.upload(verify_a.tensor(), embed.data())?;
+        }
         {
             let mtp = arena
                 .mtp
                 .as_ref()
                 .ok_or_else(|| InferError::Metal("arène MTP résidente absente".to_string()))?;
+            if gpu_embedding {
+                // Ligne 0 du verify = embedding mis à l'échelle du token primaire.
+                metal.encode_embedding_from_index_buffers_scaled(
+                    encoder_guard.encoder(),
+                    &arena.embed_tokens,
+                    mtp.index.buffer(),
+                    verify_a.tensor().buffer(),
+                    hidden,
+                    embed_scale,
+                    embed_bf16,
+                )?;
+                #[cfg(feature = "devtools")]
+                crate::runtime_flags::pairwise::mark(
+                    crate::runtime_flags::pairwise::Hit::Embedding,
+                );
+            }
             metal.encode_embedding_from_index_buffers(
                 encoder_guard.encoder(),
                 &arena.embed_tokens,
@@ -1772,7 +1840,20 @@ impl CausalDecoder {
         scratch.push(verify_final);
 
         encoder_guard.end();
-        crate::metal_backend::commit_and_wait(command_buffer)?;
+        let timer = arena.state.gpu_timer();
+        let started = timer.map(|_| std::time::Instant::now());
+        let keep_going = if let Some(work) = after_submit {
+            crate::metal_backend::commit_and_wait_with(command_buffer, work)?
+        } else {
+            crate::metal_backend::commit_and_wait(command_buffer)?;
+            true
+        };
+        if let (Some(timer), Some(started)) = (timer, started) {
+            timer.record_mtp_cycle(1, started.elapsed().as_nanos());
+        }
+        if !keep_going {
+            return Ok(None);
+        }
         let draft_raw = {
             let arena = resident.as_ref().ok_or_else(|| {
                 InferError::Metal("arène résidente absente après MTP fused".to_string())
@@ -1799,13 +1880,12 @@ impl CausalDecoder {
         let bonus_raw = target_rows
             .next()
             .ok_or_else(|| InferError::Metal("MTP fused sans bonus".to_string()))?;
-        let state = crate::metal_backend::read_f32_buffer(target_final.tensor().buffer(), hidden)?;
-        let bonus_state =
-            crate::metal_backend::read_f32_buffer(bonus_final.tensor().buffer(), hidden)?;
+        // Le wait ci-dessus couvre les écritures des deux états. En mode résident,
+        // leurs baux survivent au retour et empêchent toute réutilisation du scratch.
+        let state = MtpFinalState::from_lease(target_final, retain_hidden)?;
+        let bonus_state = MtpFinalState::from_lease(bonus_final, retain_hidden)?;
         drop(scratch);
         drop(target_indices);
-        drop(bonus_final);
-        drop(target_final);
         let draft = usize::try_from(draft_raw)
             .map_err(|_| InferError::Metal(format!("draft MTP trop grand: {draft_raw}")))?;
         let target = usize::try_from(target_raw)
@@ -1847,22 +1927,24 @@ impl CausalDecoder {
                 }
             }
         }
-        let bonus = if keep_bonus {
-            Some((bonus, Tensor::row(bonus_state)?))
-        } else {
-            None
-        };
-        Ok(Some((draft, target, Tensor::row(state)?, bonus)))
+        let bonus = keep_bonus.then_some((bonus, bonus_state));
+        Ok(Some((draft, target, state, bonus)))
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cycle MTP : cache, état, historique, arrêt et callback après soumission explicites"
+    )]
     pub(in crate::decoder) fn next_mtp_spec_two_resident(
         &self,
         cache: &mut CausalDecoderCache,
-        final_state: &Tensor,
+        final_state: &MtpFinalState,
         primary: usize,
         history_len: usize,
         stop_token_ids: &[usize],
+        retain_hidden: bool,
+        after_submit: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<Option<ResidentMtpSpecTwoOutput>> {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
@@ -1913,9 +1995,6 @@ impl CausalDecoder {
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
         };
-        if arena.state.gpu_timer().is_some() {
-            return Ok(None);
-        }
         let trunk_batch_supported = self.layers.iter().enumerate().all(|(index, layer)| {
             match (
                 self.config.is_resident_full_attention_layer(index),
@@ -1945,14 +2024,17 @@ impl CausalDecoder {
         if mtp.draft_indices.len() < 2 {
             return Ok(None);
         }
-        let (rows, state_hidden) = final_state.as_matrix()?;
-        if rows != 1 || state_hidden != hidden {
-            return Err(InferError::Dimension(format!(
-                "MTP fused D2 final_state=[{rows},{state_hidden}], attendu [1,{hidden}]"
-            )));
+        if let MtpFinalState::Cpu(state) = final_state {
+            let (rows, state_hidden) = state.as_matrix()?;
+            if rows != 1 || state_hidden != hidden {
+                return Err(InferError::Dimension(format!(
+                    "MTP fused D2 final_state=[{rows},{state_hidden}], attendu [1,{hidden}]"
+                )));
+            }
+            arena.state.upload(&mtp.hidden_a, state.as_row()?)?;
+        } else {
+            final_state.validate_resident(hidden)?;
         }
-
-        arena.state.upload(&mtp.hidden_a, final_state.as_row()?)?;
         arena.state.upload_u32(&mtp.index, &[primary_u32])?;
         let verify_rows = 3usize;
         let verify_elements = verify_rows
@@ -1972,13 +2054,18 @@ impl CausalDecoder {
         } else {
             None
         };
-        let command_buffer = arena.state.queue().new_command_buffer();
+        let queue = arena.state.queue();
+        let mut command_buffer = queue.new_command_buffer();
         let _barrier_guard = crate::metal_backend::resident_concurrent_enabled()
             .then(crate::metal_backend::install_dispatch_barrier_scope);
         let _namespace_guard =
             crate::metal_backend::install_scratch_namespace(arena.state.scratch_namespace());
         let encoder = new_resident_compute_encoder(command_buffer);
-        let encoder_guard = crate::metal_backend::EncoderEndGuard::new(encoder);
+        let mut encoder_guard = crate::metal_backend::EncoderEndGuard::new(encoder);
+        // Compteurs GPU : le cycle est coupé en command buffers chronométrés CPU
+        // (append, tête, chaque couche de vérification, queue), état GPU inchangé.
+        let timer = arena.state.gpu_timer();
+        let mut segments = crate::decode_resident::MtpD2Segments::default();
         let mut owned: Vec<metal::Buffer> = Vec::new();
         let mut scratch: Vec<ScratchLease> = Vec::new();
 
@@ -2014,6 +2101,10 @@ impl CausalDecoder {
                 &mut scratch,
             )?;
         }
+        if timer.is_some() {
+            segments.append_ns +=
+                cut_fused_segment(queue, &mut command_buffer, &mut encoder_guard)?;
+        }
 
         {
             let mtp = arena
@@ -2028,6 +2119,14 @@ impl CausalDecoder {
                 .mtp
                 .as_mut()
                 .ok_or_else(|| InferError::Metal("arène MTP résidente absente".to_string()))?;
+            // L'append différé précède la copie : il peut réutiliser les buffers MTP.
+            // Le bail du verify précédent garde la ligne choisie intacte.
+            final_state.encode_resident_copy(
+                metal,
+                encoder_guard.encoder(),
+                mtp.hidden_a.buffer(),
+                hidden,
+            )?;
             let mut current_is_a = true;
             for draft_pos in 0..2usize {
                 let (input_hidden, output_hidden) = if current_is_a {
@@ -2186,6 +2285,9 @@ impl CausalDecoder {
             }
             mtp.current_is_a = current_is_a;
         }
+        if timer.is_some() {
+            segments.head_ns += cut_fused_segment(queue, &mut command_buffer, &mut encoder_guard)?;
+        }
 
         let verify_a = arena
             .state
@@ -2195,14 +2297,34 @@ impl CausalDecoder {
             .state
             .scratch()
             .lease(verify_elements, GpuElement::F32)?;
-        let embed = self.embed_scaled(&[primary])?;
-        let embed_hidden = embed.data().len();
-        if embed_hidden != hidden {
-            return Err(InferError::Dimension(format!(
-                "embedding hidden={embed_hidden}, attendu {hidden}"
-            )));
+        if crate::runtime_flags::mtp_gpu_embedding_enabled() {
+            // D2 : ligne 0 du verify gathered depuis `mtp.index` (token primaire).
+            metal.encode_embedding_from_index_buffers_scaled(
+                encoder_guard.encoder(),
+                &arena.embed_tokens,
+                arena
+                    .mtp
+                    .as_ref()
+                    .ok_or_else(|| InferError::Metal("arène MTP résidente absente".to_string()))?
+                    .index
+                    .buffer(),
+                verify_a.tensor().buffer(),
+                hidden,
+                self.config.embed_scale.unwrap_or(1.0),
+                self.config.is_qwen && qwen_embed_bf16_enabled(),
+            )?;
+            #[cfg(feature = "devtools")]
+            crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::Embedding);
+        } else {
+            let embed = self.embed_scaled(&[primary])?;
+            let embed_hidden = embed.data().len();
+            if embed_hidden != hidden {
+                return Err(InferError::Dimension(format!(
+                    "embedding hidden={embed_hidden}, attendu {hidden}"
+                )));
+            }
+            arena.state.upload(verify_a.tensor(), embed.data())?;
         }
-        arena.state.upload(verify_a.tensor(), embed.data())?;
         for row in 1..verify_rows {
             let draft_embed = arena.state.scratch().lease(hidden, GpuElement::F32)?;
             let source_index_offset = row
@@ -2246,7 +2368,8 @@ impl CausalDecoder {
         let target_position = *cache_position;
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_cache = &mut layers[index];
-            if self.config.is_resident_full_attention_layer(index) {
+            let is_full = self.config.is_resident_full_attention_layer(index);
+            if is_full {
                 let dims = self.config.resident_windowed_full_attn_layer_dims(
                     index,
                     hidden,
@@ -2303,6 +2426,16 @@ impl CausalDecoder {
                 )?;
             }
             std::mem::swap(&mut current, &mut other);
+            if timer.is_some() {
+                let elapsed = cut_fused_segment(queue, &mut command_buffer, &mut encoder_guard)?;
+                if is_full {
+                    segments.verify_full_ns += elapsed;
+                    segments.verify_full_layers += 1;
+                } else {
+                    segments.verify_linear_ns += elapsed;
+                    segments.verify_linear_layers += 1;
+                }
+            }
         }
 
         let verify_final = arena
@@ -2363,7 +2496,21 @@ impl CausalDecoder {
         scratch.push(verify_b);
 
         encoder_guard.end();
-        crate::metal_backend::commit_and_wait(command_buffer)?;
+        let started = timer.map(|_| std::time::Instant::now());
+        let keep_going = if let Some(work) = after_submit {
+            crate::metal_backend::commit_and_wait_with(command_buffer, work)?
+        } else {
+            crate::metal_backend::commit_and_wait(command_buffer)?;
+            true
+        };
+        if let (Some(timer), Some(started)) = (timer, started) {
+            segments.tail_ns = started.elapsed().as_nanos();
+            segments.cycles = 1;
+            timer.record_mtp_d2_segments(segments);
+        }
+        if !keep_going {
+            return Ok(None);
+        }
 
         let (draft_values, target_values) = {
             let arena = resident.as_ref().ok_or_else(|| {
@@ -2381,8 +2528,14 @@ impl CausalDecoder {
                 )?,
             )
         };
-        let state_values =
-            crate::metal_backend::read_f32_buffer(verify_final.tensor().buffer(), verify_elements)?;
+        let state_values = if retain_hidden {
+            None
+        } else {
+            Some(crate::metal_backend::read_f32_buffer(
+                verify_final.tensor().buffer(),
+                verify_elements,
+            )?)
+        };
         drop(scratch);
         drop(target_indices);
 
@@ -2503,9 +2656,18 @@ impl CausalDecoder {
         let final_end = final_offset
             .checked_add(hidden)
             .ok_or_else(|| InferError::Dimension("fin final_state MTP déborde".to_string()))?;
-        let final_slice = state_values.get(final_offset..final_end).ok_or_else(|| {
-            InferError::Dimension("final_state MTP fused D2 incomplet".to_string())
-        })?;
+        let final_state = if let Some(values) = state_values {
+            let final_slice = values.get(final_offset..final_end).ok_or_else(|| {
+                InferError::Dimension("final_state MTP fused D2 incomplet".to_string())
+            })?;
+            MtpFinalState::Cpu(Tensor::row(final_slice.to_vec())?)
+        } else {
+            MtpFinalState::ResidentRow {
+                lease: verify_final,
+                row: final_row,
+                hidden,
+            }
+        };
         Ok(Some(ResidentMtpSpecTwoOutput {
             drafts,
             targets,
@@ -2514,8 +2676,29 @@ impl CausalDecoder {
             accepted_generated,
             committed_rows,
             pending,
-            final_state: Tensor::row(final_slice.to_vec())?,
+            final_state,
             bonus_verified,
         }))
     }
+}
+
+/// Compteurs GPU (`SARAGOSSA_RUST_GPU_COUNTERS`) : clôt le command buffer courant du
+/// cycle fusionné, attend sa fin (chronométrée CPU) et repart sur un neuf. Mêmes
+/// kernels, même ordre, état GPU persistant : résultat numérique identique.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn cut_fused_segment<'q>(
+    queue: &'q metal::CommandQueue,
+    command_buffer: &mut &'q metal::CommandBufferRef,
+    encoder_guard: &mut crate::metal_backend::EncoderEndGuard<'q>,
+) -> Result<u128> {
+    let next = queue.new_command_buffer();
+    let previous = std::mem::replace(
+        encoder_guard,
+        crate::metal_backend::EncoderEndGuard::new(new_resident_compute_encoder(next)),
+    );
+    previous.end();
+    let started = std::time::Instant::now();
+    crate::metal_backend::commit_and_wait(command_buffer)?;
+    *command_buffer = next;
+    Ok(started.elapsed().as_nanos())
 }

@@ -265,6 +265,40 @@ impl MetalExecutor {
                 bits,
                 groups,
             )?,
+            AffineMatmulKernel::Skinny => self.encode_affine_qmm_skinny_buffers(
+                encoder,
+                lhs_buffer,
+                packed,
+                packed_offset,
+                scales,
+                scales_offset,
+                biases,
+                biases_offset,
+                output_buffer,
+                batch,
+                in_dim,
+                out_dim,
+                packed_cols,
+                groups,
+            )?,
+            AffineMatmulKernel::Qmm8 => self.encode_resident_affine_qmm8(
+                encoder,
+                lhs_buffer,
+                packed,
+                packed_offset,
+                scales,
+                scales_offset,
+                biases,
+                biases_offset,
+                output_buffer,
+                batch,
+                in_dim,
+                out_dim,
+                packed_cols,
+                group_size,
+                bits,
+                groups,
+            )?,
             AffineMatmulKernel::QmmNaFusedTiledU4 => {
                 self.encode_affine_qmm_na_fused_tiled_u4_buffers(
                     encoder,
@@ -448,6 +482,68 @@ impl MetalExecutor {
     }
 
     #[inline]
+    fn encode_resident_affine_qmm8(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed: &BufferRef,
+        packed_offset: NSUInteger,
+        scales: &BufferRef,
+        scales_offset: NSUInteger,
+        biases: &BufferRef,
+        biases_offset: NSUInteger,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        packed_cols: usize,
+        group_size: usize,
+        bits: usize,
+        groups: usize,
+    ) -> Result<()> {
+        let fast_dims = [
+            checked_u32(out_dim, "qmm8 out_dim")?,
+            checked_u32(in_dim, "qmm8 in_dim")?,
+            checked_u32(packed_cols, "qmm8 packed_cols")?,
+            checked_u32(groups, "qmm8 groups")?,
+        ];
+        let batch_u32 = [checked_u32(batch, "qmm8 batch")?];
+        encoder.set_compute_pipeline_state(&self.affine_qmm8_fast_aligned_u4_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed), packed_offset);
+        encoder.set_buffer(2, Some(scales), scales_offset);
+        encoder.set_buffer(3, Some(biases), biases_offset);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, &fast_dims, "qmm8_dims")?;
+        set_u32_bytes(encoder, 6, &batch_u32, "qmm8_batch")?;
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            "affine_qmm8_u4_gs64",
+            batch,
+            in_dim,
+            out_dim,
+            group_size,
+            bits,
+        ));
+        trace_dispatch_path(
+            "affine_qmm8_fast_aligned_u4_gs64_f32",
+            batch,
+            out_dim,
+            in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch.div_ceil(8), "qmm8 row groups")?,
+                checked_nsuint(out_dim.div_ceil(8), "qmm8 out groups")?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
+    }
+
+    #[inline]
     fn encode_resident_affine_qmm2(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -529,6 +625,97 @@ impl MetalExecutor {
         );
         post_dispatch_barrier_buffer(encoder, output_buffer);
         Ok(())
+    }
+
+    /// Encode `out = residual + W·x` (batch 1, u4/gs64, `in_dim % 512 == 0`,
+    /// `out_dim % 8 == 0`, offsets nuls) via le qmv u4 aligné résiduel (pairwise p2).
+    /// `Ok(false)` sans rien encoder si désactivé ou non éligible : l'appelant garde
+    /// qmv + `weighted_sum_add_topk`. Égalité exacte seulement avec un score 1.0.
+    pub(crate) fn encode_qmv_u4_residual_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        weight: &MetalLinearWeightBuffers,
+        residual_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<bool> {
+        let MetalLinearWeightBuffers::AffineQuantized {
+            packed,
+            packed_offset,
+            scales,
+            scales_offset,
+            biases,
+            biases_offset,
+            out_dim: weight_out,
+            in_dim: weight_in,
+            packed_cols,
+            group_size,
+            bits,
+            groups,
+        } = weight
+        else {
+            return Ok(false);
+        };
+        let f32_bytes = |n: usize| (n as u64).checked_mul(4);
+        let fits = |buffer: &BufferRef, n: usize| {
+            f32_bytes(n).is_some_and(|bytes| buffer.length() >= bytes)
+        };
+        let eligible = super::flags::qmv_u4_residual_enabled()
+            && fast_affine_qmv_enabled(out_dim)
+            && *bits == FAST_QMV_BITS
+            && *group_size == FAST_QMV_GROUP_SIZE
+            && *weight_in == in_dim
+            && *weight_out == out_dim
+            && in_dim > 0
+            && in_dim % 512 == 0
+            && out_dim > 0
+            && out_dim % 8 == 0
+            && *packed_offset == 0
+            && *scales_offset == 0
+            && *biases_offset == 0
+            && fits(lhs_buffer, in_dim)
+            && fits(residual_buffer, out_dim)
+            && fits(output_buffer, out_dim);
+        if !eligible {
+            return Ok(false);
+        }
+        let dims = [
+            checked_u32(out_dim, "residual out_dim")?,
+            checked_u32(in_dim, "residual in_dim")?,
+            checked_u32(*packed_cols, "residual packed_cols")?,
+            checked_u32(*groups, "residual groups")?,
+        ];
+        let out_groups = checked_nsuint(out_dim.div_ceil(8), "residual out groups")?;
+        encoder.set_compute_pipeline_state(&self.affine_qmv_fast_aligned_u4_gs64_residual_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed), 0);
+        encoder.set_buffer(2, Some(scales), 0);
+        encoder.set_buffer(3, Some(biases), 0);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, &dims, "residual_dims")?;
+        encoder.set_buffer(6, Some(residual_buffer), 0);
+        #[cfg(feature = "devtools")]
+        crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::P2);
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            "affine_qmv_u4_aligned_residual_gs64",
+            1,
+            in_dim,
+            out_dim,
+            *group_size,
+            *bits,
+        ));
+        trace_dispatch_path(
+            "affine_qmv_fast_aligned_u4_gs64_residual_f32",
+            1,
+            out_dim,
+            in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(MTLSize::new(1, out_groups, 1), MTLSize::new(64, 1, 1));
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(true)
     }
 
     #[inline]

@@ -25,6 +25,74 @@ impl MetalExecutor {
         group_size == FAST_QMV_GROUP_SIZE && self.na_gemm_coop_qb_tiled_u4_align64.is_some()
     }
 
+    pub(super) fn qmm_skinny_available(&self) -> bool {
+        if qmm_skinny_bf16() {
+            self.na_gemm_skinny_u4.is_some()
+        } else {
+            self.na_gemm_skinny_u4_x3.is_some()
+        }
+    }
+
+    pub(super) fn encode_affine_qmm_skinny_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed: &BufferRef,
+        packed_offset: NSUInteger,
+        scales: &BufferRef,
+        scales_offset: NSUInteger,
+        biases: &BufferRef,
+        biases_offset: NSUInteger,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        packed_cols: usize,
+        groups: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(out_dim, "qmm skinny out_dim")?,
+            checked_u32(in_dim, "qmm skinny in_dim")?,
+            checked_u32(packed_cols, "qmm skinny packed_cols")?,
+            checked_u32(groups, "qmm skinny groups")?,
+        ];
+        let batch_u32 = [checked_u32(batch, "qmm skinny batch")?];
+        let pso = if qmm_skinny_bf16() {
+            self.na_gemm_skinny_u4.as_ref()
+        } else {
+            self.na_gemm_skinny_u4_x3.as_ref()
+        }
+        .ok_or_else(|| InferError::Config("qmm skinny NA indisponible".into()))?;
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed), packed_offset);
+        encoder.set_buffer(2, Some(scales), scales_offset);
+        encoder.set_buffer(3, Some(biases), biases_offset);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, &dims, "qmm_skinny_dims")?;
+        set_u32_bytes(encoder, 6, &batch_u32, "qmm_skinny_batch")?;
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            "qmm_skinny_u4_gs64",
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            4,
+        ));
+        trace_dispatch_path("qmm_skinny_u4_gs64_f32", batch, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(out_dim / 32, "qmm skinny out tiles")?,
+                checked_nsuint(batch.div_ceil(16), "qmm skinny row tiles")?,
+                1,
+            ),
+            MTLSize::new(128, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "kernel NA fused-tiled: buffers, dimensions et group_size explicites"

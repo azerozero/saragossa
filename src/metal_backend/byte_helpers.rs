@@ -24,6 +24,8 @@ fn read_pod_buffer<T: bytemuck::Pod + Default>(buffer: &BufferRef, len: usize) -
     unsafe {
         std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len);
     }
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(false, std::mem::size_of_val(out.as_slice()));
     if let Some(started) = read_started {
         DECODE_PROFILE_READ_NS.fetch_add(
             started.elapsed().as_nanos() as u64,
@@ -62,6 +64,8 @@ fn write_pod_buffer<T: bytemuck::Pod>(buffer: &BufferRef, data: &[T]) -> Result<
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
     }
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(true, std::mem::size_of_val(data));
     Ok(())
 }
 

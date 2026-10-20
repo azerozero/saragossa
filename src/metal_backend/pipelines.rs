@@ -228,6 +228,11 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_qmv_fast_aligned_u2_gs64_f32")?;
         let affine_qmv_fast_aligned_u4_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_aligned_u4_gs64_f32")?;
+        let affine_qmv_fast_aligned_u4_gs64_residual_f32 = pipeline(
+            &library,
+            &device,
+            "affine_qmv_fast_aligned_u4_gs64_residual_f32",
+        )?;
         let affine_qmv_fast_aligned_u3_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_aligned_u3_gs64_f32")?;
         let affine_qmv_fast_u4_gs64_align64_f32 =
@@ -238,6 +243,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_qmv_fast_aligned_u6_gs64_f32")?;
         let affine_qmm2_fast_aligned_u4_gs64_f32 =
             pipeline(&library, &device, "affine_qmm2_fast_aligned_u4_gs64_f32")?;
+        let affine_qmm8_fast_aligned_u4_gs64_f32 =
+            pipeline(&library, &device, "affine_qmm8_fast_aligned_u4_gs64_f32")?;
         let affine_qmm2_fast_aligned_u3_gs64_f32 =
             pipeline(&library, &device, "affine_qmm2_fast_aligned_u3_gs64_f32")?;
         let affine_qmm2_fast_aligned_u8_gs64_f32 =
@@ -344,8 +351,8 @@ impl MetalExecutor {
             &device,
             "linear_attn_conv_norm_gates_k4_dk128_batch_f32",
         )?;
-        let linear_attn_conv_state_finalize_f32 =
-            pipeline(&library, &device, "linear_attn_conv_state_finalize_f32")?;
+        let linear_attn_conv_state_shift_f32 =
+            pipeline(&library, &device, "linear_attn_conv_state_shift_f32")?;
         let linear_attn_gated_delta_f32 =
             pipeline(&library, &device, "linear_attn_gated_delta_f32")?;
         let linear_attn_gated_delta_dk128_tg4_f32 =
@@ -354,6 +361,11 @@ impl MetalExecutor {
             &library,
             &device,
             "linear_attn_gated_delta_seq_dk128_tg4_f32",
+        )?;
+        let linear_attn_gated_delta_seq_capture_dk128_tg4_f32 = pipeline(
+            &library,
+            &device,
+            "linear_attn_gated_delta_seq_capture_dk128_tg4_f32",
         )?;
         let linear_attn_gated_delta_seq_dk128_bf16_tg4_f32 = pipeline(
             &library,
@@ -544,6 +556,8 @@ impl MetalExecutor {
         let na_gemm_coop_qb_tiled_gs128 = compile_na("gemm_nax_coop_qb_tiled_gs128");
         let na_gemm_coop_qb_tiled_u4 = compile_na("gemm_nax_coop_qb_tiled_u4");
         let na_gemm_coop_qb_tiled_u4_align64 = compile_na("gemm_nax_coop_qb_tiled_u4_align64");
+        let na_gemm_skinny_u4 = compile_na("gemm_nax_skinny_u4");
+        let na_gemm_skinny_u4_x3 = compile_na("gemm_nax_skinny_u4_x3");
         let na_gemm_coop_qb_grouped = compile_na("gemm_nax_coop_qb_grouped");
         let na_gemm_coop_qb_grouped_gather = compile_na("gemm_nax_coop_qb_grouped_gather");
         let na_gemm_coop_qb_grouped_gate_up_swiglu =
@@ -570,11 +584,13 @@ impl MetalExecutor {
             affine_qmv_fast_u4_gs64_f32,
             affine_qmv_fast_aligned_u2_gs64_f32,
             affine_qmv_fast_aligned_u4_gs64_f32,
+            affine_qmv_fast_aligned_u4_gs64_residual_f32,
             affine_qmv_fast_aligned_u3_gs64_f32,
             affine_qmv_fast_u4_gs64_align64_f32,
             affine_qmv_fast_u6_gs64_f32,
             affine_qmv_fast_aligned_u6_gs64_f32,
             affine_qmm2_fast_aligned_u4_gs64_f32,
+            affine_qmm8_fast_aligned_u4_gs64_f32,
             affine_qmm2_fast_aligned_u3_gs64_f32,
             affine_qmm2_fast_aligned_u8_gs64_f32,
             affine_qmm2_fast_aligned_u8_gs128_f32,
@@ -614,10 +630,11 @@ impl MetalExecutor {
             linear_attn_norm_gates_inv_dk128_f32,
             linear_attn_conv_norm_gates_k4_dk128_f32,
             linear_attn_conv_norm_gates_k4_dk128_batch_f32,
-            linear_attn_conv_state_finalize_f32,
+            linear_attn_conv_state_shift_f32,
             linear_attn_gated_delta_f32,
             linear_attn_gated_delta_dk128_tg4_f32,
             linear_attn_gated_delta_seq_dk128_tg4_f32,
+            linear_attn_gated_delta_seq_capture_dk128_tg4_f32,
             linear_attn_gated_delta_seq_dk128_bf16_tg4_f32,
             linear_attn_gated_delta_dk128_bf16_tg4_f32,
             linear_attn_gated_delta_inv_dk128_tg4_f32,
@@ -706,6 +723,8 @@ impl MetalExecutor {
             na_gemm_coop_qb_tiled,
             na_gemm_coop_qb_tiled_gs128,
             na_gemm_coop_qb_tiled_u4,
+            na_gemm_skinny_u4,
+            na_gemm_skinny_u4_x3,
             na_gemm_coop_qb_tiled_u4_align64,
             na_gemm_coop_qb_grouped,
             na_gemm_coop_qb_grouped_gather,

@@ -49,6 +49,8 @@ pub(super) fn write_f32_at(tensor: &GpuTensor, offset: usize, data: &[f32]) -> R
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
     }
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(true, std::mem::size_of_val(data));
     Ok(())
 }
 
@@ -105,6 +107,8 @@ pub(super) fn write_f32_as_bf16_at(tensor: &GpuTensor, offset: usize, data: &[f3
             ptr.add(offset + index).write(f32_to_bf16_bits(value));
         }
     }
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(true, data.len() * 2);
     Ok(())
 }
 
@@ -148,6 +152,8 @@ pub(super) fn write_u32_at(tensor: &GpuTensor, offset: usize, data: &[u32]) -> R
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
     }
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(true, std::mem::size_of_val(data));
     Ok(())
 }
 
@@ -256,6 +262,14 @@ pub(super) fn kv_bf16_sim_vonly() -> bool {
 
 /// Active la SDPA decode **2-passes split-K** (dédup GQA + tuiles L1) au-delà de
 /// `sdpa_2pass_min_len()` rows de KV. Défaut ON ; kill-switch `SARAGOSSA_RUST_SDPA_2PASS=0`.
+/// Chemin full-attn en lignes fusionné (RoPE, append KV et attention des `rows`
+/// lignes d'une vérification en un dispatch chacun, cf. `rows.rs`). Défaut ON ;
+/// `SARAGOSSA_RUST_FULL_ROWS_FUSED=0` rejoue la boucle par ligne.
+pub(super) fn full_rows_fused_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FULL_ROWS_FUSED", true))
+}
+
 pub(super) fn sdpa_2pass_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_SDPA_2PASS", true))
@@ -275,10 +289,21 @@ pub(super) fn sdpa_2pass_min_len() -> usize {
     })
 }
 
+/// Clés de KV par bloc split-K (passe 1). Override : `SARAGOSSA_RUST_SDPA_2PASS_KEYS_PER_BLOCK`.
+fn sdpa_2pass_keys_per_block() -> usize {
+    static KEYS: OnceLock<usize> = OnceLock::new();
+    *KEYS.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_SDPA_2PASS_KEYS_PER_BLOCK")
+            .and_then(|value| value.parse().ok())
+            .filter(|keys| *keys > 0)
+            .unwrap_or(128)
+    })
+}
+
 /// Nombre de blocs split-K pour la SDPA 2-passes : multiple de 32 (requis par la
 /// réduction passe-2 `blocks/32`), ≈ `len/128`, borné `[32, 1024]`.
 pub(super) fn sdpa_2pass_blocks(len: usize) -> usize {
-    let raw = (len / 128).max(1);
+    let raw = (len / sdpa_2pass_keys_per_block()).max(1);
     let rounded = raw.div_ceil(32) * 32;
     rounded.clamp(32, 1024)
 }

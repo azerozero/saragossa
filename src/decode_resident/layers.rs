@@ -1,6 +1,7 @@
 //! Encodage des couches full-attn, linear-attn et MoE résidentes.
 
-use super::utils::byte_offset_f32;
+use super::gpu_position::{rope_dims_param, GpuPosition, GpuPositionRows};
+use super::utils::{byte_offset_f32, full_rows_fused_enabled};
 use super::*;
 
 impl DecodeResidentState {
@@ -1137,6 +1138,88 @@ impl DecodeResidentState {
                 executor, encoder, owned, kv, weights, dims, layer_in, layer_out,
             );
         }
+        self.encode_full_attn_dense_layer_rows_impl(
+            executor, encoder, owned, kv, weights, dims, rows, None, layer_in, layer_out,
+        )
+    }
+
+    /// Variante de [`Self::encode_full_attn_dense_layer_rows`] dont la position est
+    /// lue sur GPU : ligne `row` rotée et écrite à `ctrl[slot] + row`, attention sur
+    /// `ctrl[slot] + row + 1` lignes. `dims.position` et `kv.len()` sont ignorés ;
+    /// `kv.len()` n'est pas modifié (resync `kv.truncate(...)` après le bloc).
+    /// Préconditions (sinon `Err` avant tout dispatch, repli appelant) : KV f32,
+    /// `dims.window_start == 0`, `max_position + rows <= kv.capacity()`,
+    /// `rows <= GPU_POSITION_MAX_ROWS`, `attn_output_gate`. Ni commit ni wait.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une précondition échoue ou si l'encodage échoue.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "data flow batché d'une couche full-attn dense + position GPU"
+    )]
+    pub(crate) fn encode_full_attn_dense_layer_rows_gpu_position(
+        &self,
+        executor: &MetalExecutor,
+        encoder: &ComputeCommandEncoderRef,
+        owned: &mut Vec<Buffer>,
+        kv: &mut FullAttentionMetalState,
+        weights: FullAttnDenseLayerWeights<'_>,
+        dims: FullAttnLayerDims,
+        position: GpuPosition<'_>,
+        rows: usize,
+        layer_in: &BufferRef,
+        layer_out: &BufferRef,
+    ) -> Result<()> {
+        self.encode_full_attn_dense_layer_rows_impl(
+            executor,
+            encoder,
+            owned,
+            kv,
+            weights,
+            dims,
+            rows,
+            Some(position),
+            layer_in,
+            layer_out,
+        )
+    }
+
+    /// Append K/V d'une ligne : position GPU si `gpu_rows`, sinon `len` hôte.
+    fn encode_append_kv_row(
+        encoder: &ComputeCommandEncoderRef,
+        kv: &mut FullAttentionMetalState,
+        gpu_rows: Option<&GpuPositionRows<'_>>,
+        row: usize,
+        k_buf: &BufferRef,
+        v_buf: &BufferRef,
+        v_offset: u64,
+    ) -> Result<()> {
+        match gpu_rows {
+            Some(gpu_rows) => {
+                kv.encode_append_kv_gpu_position(encoder, k_buf, 0, v_buf, v_offset, gpu_rows, row)
+            }
+            None => kv.encode_append_kv_with_offsets(encoder, k_buf, 0, v_buf, v_offset),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "data flow batché d'une couche full-attn dense"
+    )]
+    fn encode_full_attn_dense_layer_rows_impl(
+        &self,
+        executor: &MetalExecutor,
+        encoder: &ComputeCommandEncoderRef,
+        owned: &mut Vec<Buffer>,
+        kv: &mut FullAttentionMetalState,
+        weights: FullAttnDenseLayerWeights<'_>,
+        dims: FullAttnLayerDims,
+        rows: usize,
+        gpu_position: Option<GpuPosition<'_>>,
+        layer_in: &BufferRef,
+        layer_out: &BufferRef,
+    ) -> Result<()> {
         let hidden = dims.hidden;
         let q_dim = dims.q_heads.checked_mul(dims.head_dim).ok_or_else(|| {
             InferError::Dimension("full-attn dense rows q_dim déborde".to_string())
@@ -1180,6 +1263,20 @@ impl DecodeResidentState {
         let score_cells = dims.q_heads.checked_mul(kv.capacity()).ok_or_else(|| {
             InferError::Dimension("full-attn dense rows scores débordent".to_string())
         })?;
+        // Préconditions position GPU vérifiées ici, avant tout dispatch.
+        let gpu_rows = match gpu_position {
+            Some(position) => Some(self.encode_gpu_position_rows(
+                encoder,
+                &*kv,
+                position,
+                dims.q_heads,
+                dims.kv_heads,
+                dims.rope_dims,
+                dims.window_start,
+                rows,
+            )?),
+            None => None,
+        };
 
         let normed = self.scratch().lease(batch_hidden, GpuElement::F32)?;
         let qkv_proj_out = self.scratch().lease(batch_qkv, GpuElement::F32)?;
@@ -1292,22 +1389,121 @@ impl DecodeResidentState {
         let v_base = q_proj_dim.checked_add(kv_dim).ok_or_else(|| {
             InferError::Dimension("full-attn dense rows v base déborde".to_string())
         })?;
-        for row in 0..rows {
+        // Chemin en lignes fusionné (position hôte, fenêtre pleine, sans norme V) :
+        // RoPE Q, RoPE K, append K, append V, attention → un dispatch chacun, écriture
+        // directe de `ctx[row]`. Sinon, boucle historique par ligne.
+        let fused_rows = gpu_rows.is_none()
+            && dims.window_start == 0
+            && !weights.value_norm
+            && full_rows_fused_enabled()
+            && kv.rows_fused_supported();
+        if fused_rows {
+            let kernels = self.rows_kernels()?;
+            let q_roped_rows = self.scratch().lease(batch_q, GpuElement::F32)?;
+            let k_roped_rows = self.scratch().lease(batch_kv, GpuElement::F32)?;
+            self.encode_rms_norm_rope_decode_rows(
+                encoder,
+                kernels,
+                q_raw.tensor().buffer(),
+                0,
+                q_dim,
+                weights.q_norm,
+                q_roped_rows.tensor().buffer(),
+                q_dim,
+                dims.q_heads,
+                dims.head_dim,
+                dims.rope_dims,
+                dims.rope_frequency_dim,
+                dims.position,
+                rows,
+                dims.eps,
+                dims.theta,
+            )?;
+            Self::encode_query_attention_scale(
+                executor,
+                encoder,
+                owned,
+                q_roped_rows.tensor().buffer(),
+                batch_q,
+                dims.head_dim,
+                dims.attn_scalar,
+            )?;
+            let (kv_source, k_offset, v_offset, kv_stride) = if weights.qkv_proj.is_some() {
+                (
+                    qkv_proj_out.tensor().buffer(),
+                    byte_offset_f32(k_base, "full-attn dense rows k base")?,
+                    byte_offset_f32(v_base, "full-attn dense rows v base")?,
+                    qkv_proj_dim,
+                )
+            } else {
+                (k_proj_out.tensor().buffer(), 0, 0, kv_dim)
+            };
+            self.encode_rms_norm_rope_decode_rows(
+                encoder,
+                kernels,
+                kv_source,
+                k_offset,
+                kv_stride,
+                weights.k_norm,
+                k_roped_rows.tensor().buffer(),
+                kv_dim,
+                dims.kv_heads,
+                dims.head_dim,
+                dims.rope_dims,
+                dims.rope_frequency_dim,
+                dims.position,
+                rows,
+                dims.eps,
+                dims.theta,
+            )?;
+            let v_source = if weights.qkv_proj.is_some() {
+                kv_source
+            } else {
+                v_proj_out.tensor().buffer()
+            };
+            kv.encode_append_kv_rows(
+                encoder,
+                kernels,
+                k_roped_rows.tensor().buffer(),
+                0,
+                kv_dim,
+                v_source,
+                v_offset,
+                kv_stride,
+                rows,
+            )?;
+            kv.encode_attention_decode_rows(
+                encoder,
+                kernels,
+                q_roped_rows.tensor().buffer(),
+                ctx.tensor().buffer(),
+                rows,
+            )?;
+        }
+        let loop_rows = if fused_rows { 0 } else { rows };
+        for row in 0..loop_rows {
             let q_row_offset = row
                 .checked_mul(q_dim)
                 .ok_or_else(|| InferError::Dimension("full-attn dense q row déborde".to_string()))
                 .and_then(|offset| byte_offset_f32(offset, "full-attn dense q row offset"))?;
-            self.encode_rms_norm_rope_decode_with_offset(
+            let rope_q = match &gpu_rows {
+                Some(gpu_rows) => gpu_rows.rope_q(row),
+                None => rope_dims_param(
+                    dims.q_heads,
+                    dims.head_dim,
+                    dims.rope_dims,
+                    dims.position + row,
+                )?,
+            };
+            self.encode_rms_norm_rope_decode_param(
                 encoder,
                 q_raw.tensor().buffer(),
                 q_row_offset,
                 weights.q_norm,
                 q_roped.tensor().buffer(),
                 dims.q_heads,
-                dims.head_dim,
-                dims.rope_dims,
+                rope_q,
                 dims.rope_frequency_dim,
-                dims.position + row,
                 dims.eps,
                 dims.theta,
             )?;
@@ -1336,7 +1532,16 @@ impl DecodeResidentState {
                 })?;
                 byte_offset_f32(k_row, "full-attn dense rows split k offset")?
             };
-            self.encode_rms_norm_rope_decode_with_offset(
+            let rope_k = match &gpu_rows {
+                Some(gpu_rows) => gpu_rows.rope_k(row),
+                None => rope_dims_param(
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.rope_dims,
+                    dims.position + row,
+                )?,
+            };
+            self.encode_rms_norm_rope_decode_param(
                 encoder,
                 if weights.qkv_proj.is_some() {
                     qkv_proj_out.tensor().buffer()
@@ -1347,10 +1552,8 @@ impl DecodeResidentState {
                 weights.k_norm,
                 k_roped.tensor().buffer(),
                 dims.kv_heads,
-                dims.head_dim,
-                dims.rope_dims,
+                rope_k,
                 dims.rope_frequency_dim,
-                dims.position + row,
                 dims.eps,
                 dims.theta,
             )?;
@@ -1393,27 +1596,43 @@ impl DecodeResidentState {
                     dims.head_dim,
                     dims.eps,
                 )?;
-                kv.encode_append_kv(
+                Self::encode_append_kv_row(
                     encoder,
+                    kv,
+                    gpu_rows.as_ref(),
+                    row,
                     k_roped.tensor().buffer(),
                     v_normed.tensor().buffer(),
+                    0,
                 )?;
             } else {
-                kv.encode_append_kv_with_offsets(
+                Self::encode_append_kv_row(
                     encoder,
+                    kv,
+                    gpu_rows.as_ref(),
+                    row,
                     k_roped.tensor().buffer(),
-                    0,
                     v_source,
                     v_offset,
                 )?;
             }
-            kv.encode_attention_decode_windowed(
-                encoder,
-                q_roped.tensor().buffer(),
-                scores.tensor().buffer(),
-                ctx_row.tensor().buffer(),
-                dims.window_start,
-            )?;
+            match &gpu_rows {
+                Some(gpu_rows) => kv.encode_attention_decode_gpu_position(
+                    encoder,
+                    q_roped.tensor().buffer(),
+                    scores.tensor().buffer(),
+                    ctx_row.tensor().buffer(),
+                    gpu_rows,
+                    row,
+                )?,
+                None => kv.encode_attention_decode_windowed(
+                    encoder,
+                    q_roped.tensor().buffer(),
+                    scores.tensor().buffer(),
+                    ctx_row.tensor().buffer(),
+                    dims.window_start,
+                )?,
+            }
             let gated_offset = row
                 .checked_mul(q_dim)
                 .ok_or_else(|| {

@@ -828,6 +828,8 @@ impl MetalExecutor {
         encoder.set_buffer(6, Some(gate_output_buffer), 0);
         set_u32_bytes(encoder, 7, &fast_dims, "full_qkv_split_dims")?;
         set_u32_bytes(encoder, 8, &q_dims, "full_qkv_split_q_dims")?;
+        #[cfg(feature = "devtools")]
+        crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::P1);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
@@ -936,6 +938,8 @@ impl MetalExecutor {
         set_u32_bytes(encoder, 8, &fast_dims, "full_qkv_split_rms_dims")?;
         set_u32_bytes(encoder, 9, &q_dims, "full_qkv_split_rms_q_dims")?;
         set_f32_bytes(encoder, 10, &[rms_eps], "full_qkv_split_rms_eps")?;
+        #[cfg(feature = "devtools")]
+        crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::P1);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
@@ -1012,6 +1016,8 @@ impl MetalExecutor {
         encoder.set_buffer(4, Some(biases), *biases_offset);
         encoder.set_buffer(5, Some(output_buffer), 0);
         set_u32_bytes(encoder, 6, &fast_dims, "full_o_gated_dims")?;
+        #[cfg(feature = "devtools")]
+        crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::P1);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(

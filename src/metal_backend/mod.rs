@@ -47,6 +47,7 @@ mod kernel_timing;
 mod lightbatch_duo;
 mod linear_attention;
 mod linear_attention_encode;
+pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
 mod matmul;
 mod matmul_align64;
@@ -58,6 +59,7 @@ mod moe;
 mod moe_encode;
 mod moe_na;
 mod moe_shared;
+pub(crate) mod mtp_control;
 mod na_gemm;
 mod pipelines;
 mod prefill;
@@ -70,14 +72,15 @@ mod whisper_encode;
 #[doc(hidden)]
 pub use self::barriers::dump_commit_components;
 pub(crate) use self::barriers::{
-    commit_and_wait, commit_nonblocking, install_dispatch_barrier_scope, post_dispatch_barrier,
-    wait_for_completion, EncoderEndGuard,
+    commit_and_wait, commit_and_wait_with, commit_nonblocking, install_dispatch_barrier_scope,
+    post_dispatch_barrier, wait_for_completion, EncoderEndGuard,
 };
 #[cfg(any(test, feature = "devtools"))]
 pub(crate) use self::byte_helpers::read_u16_buffer;
 pub(crate) use self::byte_helpers::write_f32_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
 use self::core::*;
+pub(crate) use self::eligibility::install_qmm_skinny_bf16_scope;
 pub(crate) use self::flags::resident_concurrent_enabled;
 pub(crate) use self::lightbatch_duo::{
     begin_expert_indices_collection, take_expert_indices_collection, DuoSampleParams,
@@ -143,11 +146,15 @@ pub struct MetalExecutor {
     affine_qmv_fast_u4_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u2_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u4_gs64_f32: ComputePipelineState,
+    affine_qmv_fast_aligned_u4_gs64_residual_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmv_fast_u4_gs64_align64_f32: ComputePipelineState,
     affine_qmv_fast_u6_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u6_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u4_gs64_f32: ComputePipelineState,
+    affine_qmm8_fast_aligned_u4_gs64_f32: ComputePipelineState,
+    na_gemm_skinny_u4: Option<ComputePipelineState>,
+    na_gemm_skinny_u4_x3: Option<ComputePipelineState>,
     affine_qmm2_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs128_f32: ComputePipelineState,
@@ -187,10 +194,11 @@ pub struct MetalExecutor {
     linear_attn_norm_gates_inv_dk128_f32: ComputePipelineState,
     linear_attn_conv_norm_gates_k4_dk128_f32: ComputePipelineState,
     linear_attn_conv_norm_gates_k4_dk128_batch_f32: ComputePipelineState,
-    linear_attn_conv_state_finalize_f32: ComputePipelineState,
+    linear_attn_conv_state_shift_f32: ComputePipelineState,
     linear_attn_gated_delta_f32: ComputePipelineState,
     linear_attn_gated_delta_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_seq_dk128_tg4_f32: ComputePipelineState,
+    linear_attn_gated_delta_seq_capture_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_seq_dk128_bf16_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_dk128_bf16_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_inv_dk128_tg4_f32: ComputePipelineState,

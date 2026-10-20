@@ -1,5 +1,10 @@
 //! Flags runtime et instrumentation du décodeur.
 
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+pub(crate) mod pairwise;
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use std::cell::Cell;
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 use std::sync::atomic::AtomicU8;
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -220,9 +225,12 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
     })
 }
 
-/// Chemin MTP fused depth-1 SANS historique committed ni pré-draft spéculatif
-/// (draft#2). **Défaut OFF** (`SARAGOSSA_RUST_MTP_FRESH_CACHE=1` pour l'activer) :
-/// diagnostic, pas un gain prod.
+/// Chemin MTP fused SANS historique committed ni pré-draft spéculatif (draft#2).
+/// **Défaut ON depuis le 2026-10-15** (`SARAGOSSA_RUST_MTP_FRESH_CACHE=0` pour
+/// revenir au D1 committed) : la campagne pairwise `models/pairwise` (PW04,
+/// `docs/perf/mtp-pairwise.md`) a confirmé, avec l'adaptatif en profondeur 2,
+/// +5,8 % T0 et +17,0 % T1 après Holm15, et la non-infériorité à -2 % sur T2
+/// (n96, médiane +0,2 %). La mesure ci-dessous est antérieure (depth-1 seul).
 ///
 /// En mode fresh : cache MTP vidé par pas (attention self-only, position 0,
 /// comme `generate_mtp1` de MTPLX) et draft#2 supprimé → un forward de tête MTP
@@ -235,22 +243,167 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
 /// 0,920× vs 0,953×). draft#2 « se paie » : garder l'historique (défaut OFF).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn mtp_fresh_cache_enabled() -> bool {
+    #[cfg(feature = "devtools")]
+    if let Some(case) = pairwise::current() {
+        return case.fresh();
+    }
+    if let Some(fresh) = MTP_FRESH_FOR_PROMPT.get() {
+        return fresh;
+    }
+    mtp_fresh_cache_env()
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn mtp_fresh_cache_env() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_FRESH_CACHE", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_FRESH_CACHE", true))
+}
+
+/// Longueur de prompt (tokens) au-delà de laquelle le decode MTP garde
+/// l'historique committed même avec le cache fresh activé. Défaut 128.
+///
+/// MESURE (phase 5 pairwise du 2026-10-15, `models/pairwise/length-plan.md`,
+/// PW03 contre PW04 apparié, n48 par longueur, Holm6) : le cache fresh gagne sur
+/// prompt court et l'historique committed sur prompt long, la bascule se situe
+/// entre 33 et 204 tokens. Mécanisme : en fresh la tête MTP n'attend que sur
+/// elle-même ; sur un long prompt, l'historique lui rend du contexte et relève
+/// l'acceptance en position 2. `SARAGOSSA_RUST_MTP_FRESH_MAX_PROMPT=0` :
+/// committed partout ; `SARAGOSSA_RUST_MTP_FRESH_CACHE=0` reste prioritaire.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(super) fn mtp_fresh_max_prompt_tokens() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MTP_FRESH_MAX_PROMPT")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(128)
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+thread_local! {
+    static MTP_FRESH_FOR_PROMPT: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Choix fresh/committed d'une génération : fresh seulement si activé par l'env
+/// et si le prompt ne dépasse pas [`mtp_fresh_max_prompt_tokens`].
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn fresh_for_prompt(env_fresh: bool, max_prompt_tokens: usize, prompt_tokens: usize) -> bool {
+    env_fresh && prompt_tokens <= max_prompt_tokens
+}
+
+/// Fixe, pour la durée d'une génération MTP sur ce thread, le choix
+/// fresh/committed selon la longueur du prompt. Le Drop restaure l'état précédent ;
+/// un cas pairwise actif garde la priorité (le harnais mesure une configuration fixe).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) struct MtpHistoryForPrompt {
+    previous: Option<bool>,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl MtpHistoryForPrompt {
+    pub(crate) fn enter(prompt_tokens: usize) -> Self {
+        let fresh = fresh_for_prompt(
+            mtp_fresh_cache_env(),
+            mtp_fresh_max_prompt_tokens(),
+            prompt_tokens,
+        );
+        Self {
+            previous: MTP_FRESH_FOR_PROMPT.replace(Some(fresh)),
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl Drop for MtpHistoryForPrompt {
+    fn drop(&mut self) {
+        MTP_FRESH_FOR_PROMPT.set(self.previous);
+    }
+}
+
+pub(crate) fn mtp_resident_hidden_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.hidden;
+    }
+    false
+}
+
+pub(crate) fn mtp_gpu_embedding_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.embedding;
+    }
+    false
+}
+
+pub(crate) fn mtp_overlap_stream_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.overlap;
+    }
+    false
+}
+
+pub(crate) fn mtp_gpu_block_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.mode == pairwise::Mode::Block2;
+    }
+    false
 }
 
 /// Active la profondeur de draft MTP **adaptative** (GammaTune-style).
 ///
-/// **Défaut OFF** (`SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=1` pour l'activer) : le decode
-/// MTP garde alors sa profondeur fixe (`SARAGOSSA_RUST_MTP_MAX_DRAFT`), comportement
-/// strictement inchangé. Activé, la profondeur est choisie PAR PAS entre 1 et le
+/// **Défaut ON depuis le 2026-10-15** (`SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0` pour
+/// revenir à la profondeur fixe `SARAGOSSA_RUST_MTP_MAX_DRAFT`) ; avec le cache
+/// fresh c'est la configuration PW04 de la campagne pairwise, cf.
+/// [`mtp_fresh_cache_enabled`]. Activé, la profondeur est choisie PAR PAS entre 1 et le
 /// plafond `SARAGOSSA_RUST_MTP_MAX_DRAFT` selon une EMA de la deep-acceptance récente
 /// (cf. [`crate::decoder::mtp_adaptive`]). La séquence générée reste byte-identique
 /// (le vérifieur trunk exact décide *lesquels* des tokens proposés sont acceptés,
 /// pas *combien* on en propose).
+/// Drafts par pas du lookup n-grammes (`decoder::lookup`), 0 = désactivé.
+/// `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=n` force la valeur, bornée à 15 (16 lignes de
+/// vérification au plus). Sans variable : 8 quand l'historique MTP reste committed
+/// (prompt long, cf. [`mtp_fresh_cache_enabled`]), 0 avec le cache fresh.
+///
+/// MESURE (phase 6 pairwise du 2026-10-16, `models/pairwise/lookup-plan.md`,
+/// lookup 8 contre le défaut par longueur, n48 par cellule, Holm8) : T6 (424
+/// tokens, code qui recopie) +21 %, T2 (732, prose) −0,2 % sans proposition ;
+/// T0 (26) −0,1 %, T1 (33) −4,2 % : une proposition de deux tokens moins bonne
+/// que la tête MTP au dernier pas coûte une vérification. D'où la coupure sur la
+/// même longueur que le choix fresh/committed.
+pub(super) fn mtp_lookup_draft_tokens() -> usize {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return case.lookup.min(15);
+    }
+    static DRAFT: OnceLock<Option<usize>> = OnceLock::new();
+    if let Some(forced) = *DRAFT.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MTP_LOOKUP_DRAFT")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    }) {
+        return forced.min(15);
+    }
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if !mtp_fresh_cache_enabled() {
+        return 8;
+    }
+    0
+}
+
 pub(super) fn mtp_adaptive_depth_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(case) = pairwise::current() {
+        return matches!(
+            case.mode,
+            pairwise::Mode::Adaptive | pairwise::Mode::AdaptiveFresh
+        );
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH", true))
 }
 
 /// Lissage EMA (`alpha`) de la deep-acceptance MTP adaptative. Défaut 0,3, borné
@@ -710,6 +863,10 @@ pub(crate) fn trace_dispatch_path_enabled() -> bool {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn decode_profile_enabled() -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if let Some(trace) = pairwise::traced() {
+        return trace;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_PROFILE", false))
 }
@@ -1013,6 +1170,28 @@ mod tests {
         assert!(env_flag("SARAGOSSA_TEST_DRAPEAU", false));
         std::env::remove_var("RETI_TEST_DRAPEAU");
         assert!(!env_flag("SARAGOSSA_TEST_DRAPEAU", false));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn fresh_history_follows_prompt_length() {
+        assert!(fresh_for_prompt(true, 128, 26));
+        assert!(fresh_for_prompt(true, 128, 128));
+        assert!(!fresh_for_prompt(true, 128, 128 + 1));
+        assert!(!fresh_for_prompt(true, 128, 732));
+        assert!(!fresh_for_prompt(false, 128, 26));
+        assert!(!fresh_for_prompt(true, 0, 1));
+        assert_eq!(MTP_FRESH_FOR_PROMPT.get(), None);
+        {
+            let _long = MtpHistoryForPrompt::enter(usize::MAX);
+            assert_eq!(MTP_FRESH_FOR_PROMPT.get(), Some(false));
+            {
+                let _nested = MtpHistoryForPrompt::enter(0);
+                assert_eq!(MTP_FRESH_FOR_PROMPT.get(), Some(mtp_fresh_cache_env()));
+            }
+            assert_eq!(MTP_FRESH_FOR_PROMPT.get(), Some(false));
+        }
+        assert_eq!(MTP_FRESH_FOR_PROMPT.get(), None);
     }
 
     #[test]

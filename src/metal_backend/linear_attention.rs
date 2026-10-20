@@ -97,10 +97,32 @@ impl MetalExecutor {
         capture: &LinearAttentionMetalState,
     ) -> Result<()> {
         self.encode_capture_linear_attn_conv_state(encoder, state, capture)?;
+        self.encode_capture_linear_attn_ssm_state(encoder, state, capture)
+    }
+
+    fn encode_capture_linear_attn_ssm_state(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        state: &LinearAttentionMetalState,
+        capture: &LinearAttentionMetalState,
+    ) -> Result<()> {
         if state.ssm_bf16 {
             return self.encode_copy_u16(encoder, &state.ssm, &capture.ssm, state.ssm_len);
         }
         self.encode_copy_with_offsets(encoder, &state.ssm, 0, &capture.ssm, 0, state.ssm_len)
+    }
+
+    /// Encode (sans commit) la capture de chaque `(état, capture)` : capture
+    /// pré-cycle du bloc MTP GPU, restaurée conditionnellement sur GPU.
+    pub(crate) fn encode_capture_linear_attn_states(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pairs: &[(&LinearAttentionMetalState, &LinearAttentionMetalState)],
+    ) -> Result<()> {
+        for (state, capture) in pairs {
+            self.encode_capture_linear_attn_state(encoder, state, capture)?;
+        }
+        Ok(())
     }
 
     fn encode_capture_linear_attn_conv_state(
@@ -556,6 +578,8 @@ impl MetalExecutor {
                     &decay_buffer,
                     batch,
                     spec,
+                    LinearAttnBatchLayout::contiguous(spec),
+                    true,
                 )?;
             } else {
                 for pos in 0..batch {
@@ -683,6 +707,8 @@ impl MetalExecutor {
                     encoder,
                     &y_buffer,
                     &z_buffer,
+                    0,
+                    value_dim,
                     &norm_weight_buffer,
                     &gated_batch_buffer,
                     batch,
@@ -1041,6 +1067,8 @@ impl MetalExecutor {
                     &decay_buffer,
                     rows,
                     spec,
+                    LinearAttnBatchLayout::contiguous(spec),
+                    true,
                 )?;
             } else {
                 for pos in 0..rows {
@@ -1166,6 +1194,8 @@ impl MetalExecutor {
                     encoder,
                     &y_buffer,
                     &z_buffer,
+                    0,
+                    value_dim,
                     &norm_weight_buffer,
                     &gated_batch_buffer,
                     rows,
@@ -2781,6 +2811,195 @@ impl MetalExecutor {
             }
         };
 
+        // Chantier 3' : conv/normes/gates et rms-gate batchés sur les lignes (kernels
+        // du prefill), delta et captures par ligne. La conv lit l'état initial et les
+        // captures le glissent elles-mêmes ; l'état n'avance qu'après les captures.
+        let batched = spec.conv_kernel_dim == 4
+            && spec.key_head_dim == 128
+            && spec.value_head_dim == 128
+            && linear_delta_dk128_enabled()
+            && linear_rows_batched_enabled();
+        if batched {
+            let (qkv_buffer, layout_qkv_stride, z_buffer, z_offset, z_stride) = match &qkv_z {
+                PairOutput::Concat { buffer, stride } => (
+                    buffer,
+                    *stride,
+                    buffer,
+                    byte_offset_f32(conv_dim, "linear-attn rows z offset")?,
+                    *stride,
+                ),
+                PairOutput::Split {
+                    first,
+                    first_stride,
+                    second,
+                    second_stride,
+                } => (first, *first_stride, second, 0, *second_stride),
+            };
+            let (beta_input, gate_input, layout) = match &beta_gate {
+                PairOutput::Concat { buffer, stride } => (
+                    buffer,
+                    buffer,
+                    LinearAttnBatchLayout {
+                        qkv_stride: layout_qkv_stride,
+                        beta_offset: 0,
+                        gate_offset: byte_offset_f32(
+                            spec.num_value_heads,
+                            "linear-attn rows gate offset",
+                        )?,
+                        gate_stride: *stride,
+                    },
+                ),
+                PairOutput::Split {
+                    first,
+                    first_stride,
+                    second,
+                    ..
+                } => (
+                    first,
+                    second,
+                    LinearAttnBatchLayout {
+                        qkv_stride: layout_qkv_stride,
+                        beta_offset: 0,
+                        gate_offset: 0,
+                        gate_stride: *first_stride,
+                    },
+                ),
+            };
+            let conv_out_rows = self.private_f32_buffer(
+                checked_len(rows, conv_dim, "linear-attn rows conv_out")?,
+                "linear_attn_rows_conv_out_batch",
+            )?;
+            let q_norm_rows = self.private_f32_buffer(
+                checked_len(rows, key_dim, "linear-attn rows q_norm")?,
+                "linear_attn_rows_q_norm_batch",
+            )?;
+            let k_norm_rows = self.private_f32_buffer(
+                checked_len(rows, key_dim, "linear-attn rows k_norm")?,
+                "linear_attn_rows_k_norm_batch",
+            )?;
+            let beta_rows = self.private_f32_buffer(
+                checked_len(rows, spec.num_value_heads, "linear-attn rows beta")?,
+                "linear_attn_rows_beta_batch",
+            )?;
+            let decay_rows = self.private_f32_buffer(
+                checked_len(rows, spec.num_value_heads, "linear-attn rows decay")?,
+                "linear_attn_rows_decay_batch",
+            )?;
+            let y_rows = self.private_f32_buffer(
+                checked_len(rows, value_dim, "linear-attn rows y")?,
+                "linear_attn_rows_y_batch",
+            )?;
+            self.encode_linear_attn_conv_norm_gates_k4_dk128_batch(
+                encoder,
+                qkv_buffer,
+                beta_input,
+                gate_input,
+                &weights.conv_weight,
+                &state.conv,
+                &weights.a_log,
+                &weights.dt_bias,
+                &conv_out_rows,
+                &q_norm_rows,
+                &k_norm_rows,
+                &beta_rows,
+                &decay_rows,
+                rows,
+                spec,
+                layout,
+                false,
+            )?;
+            // Delta : un dispatch par séquence qui écrit aussi les captures SSM
+            // (f32, au plus 8 captures), sinon la boucle par ligne avec copies.
+            let capture_rows = captures.map_or(0, |c| c.len().min(rows.saturating_sub(1)));
+            let fused_seq = !state.ssm_bf16
+                && capture_rows <= Self::LINEAR_ATTN_SEQ_MAX_CAPTURES
+                && linear_rows_seq_delta_enabled();
+            if fused_seq {
+                let ssm_captures: Vec<&BufferRef> = captures
+                    .map(|c| {
+                        c[..capture_rows]
+                            .iter()
+                            .map(|cap| cap.ssm.as_ref())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.encode_linear_attn_gated_delta_seq_captures_dk128(
+                    encoder,
+                    &conv_out_rows,
+                    &q_norm_rows,
+                    &k_norm_rows,
+                    &beta_rows,
+                    &decay_rows,
+                    &state.ssm,
+                    &y_rows,
+                    rows,
+                    &ssm_captures,
+                    spec,
+                )?;
+            }
+            for row in 0..rows {
+                if !fused_seq {
+                    self.encode_linear_attn_gated_delta_row(
+                        encoder,
+                        &conv_out_rows,
+                        &q_norm_rows,
+                        &k_norm_rows,
+                        &beta_rows,
+                        &decay_rows,
+                        &state.ssm,
+                        state.ssm_bf16,
+                        &y_rows,
+                        spec,
+                        row,
+                    )?;
+                }
+                if let Some(capture) = captures.filter(|_| row + 1 < rows).map(|c| &c[row]) {
+                    self.encode_linear_attn_conv_state_shift(
+                        encoder,
+                        qkv_buffer,
+                        layout.qkv_stride,
+                        &state.conv,
+                        &capture.conv,
+                        conv_dim,
+                        row + 1,
+                    )?;
+                    if !fused_seq {
+                        self.encode_capture_linear_attn_ssm_state(encoder, state, capture)?;
+                    }
+                }
+            }
+            self.encode_linear_attn_conv_state_shift(
+                encoder,
+                qkv_buffer,
+                layout.qkv_stride,
+                &state.conv,
+                &state.conv,
+                conv_dim,
+                rows,
+            )?;
+            self.encode_linear_attn_rms_gate_batch(
+                encoder,
+                &y_rows,
+                z_buffer,
+                z_offset,
+                z_stride,
+                &weights.norm_weight,
+                &gated_batch_buffer,
+                rows,
+                spec,
+            )?;
+            return self
+                .encode_matmul_weight_buffers(
+                    encoder,
+                    &gated_batch_buffer,
+                    rows,
+                    value_dim,
+                    &weights.out_proj,
+                    output_buffer,
+                    false,
+                )
+                .map(|_| ());
+        }
         for row in 0..rows {
             match &qkv_z {
                 PairOutput::Concat { buffer, stride } => {

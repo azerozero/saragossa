@@ -170,6 +170,53 @@ struct NaxFrag {
       }
     }
   }
+  // Fragment A 16×16 depuis un lhs f32 (vérification spéculative), lignes ≥ M à zéro.
+  // SPLIT : hi = bf16(x), lo = bf16(x - hi) pour un produit « bf16×3 » proche du f32.
+  template <bool SPLIT>
+  static void load_a_f32_masked(thread metal::vec<bfloat,8>& hi, thread metal::vec<bfloat,8>& lo,
+                                const device float* src, uint m_base, uint k_base, uint K, uint M) {
+    short2 sc = get_coord();
+    for (short i = 0; i < 2; i++) {
+      uint row = m_base + uint(sc.y) + uint(i) * 8u;
+      const device float* p = src + row * K + k_base + uint(sc.x);
+      for (short j = 0; j < 4; j++) {
+        float x = (row < M) ? p[j] : 0.0f;
+        bfloat h = bfloat(x);
+        hi[i * 4 + j] = h;
+        if (SPLIT) { lo[i * 4 + j] = bfloat(x - float(h)); }
+      }
+    }
+  }
+  // Fragment B 16×16 u4 gs64 : un mot u32 (8 poids) et un scale/bias par ligne.
+  template <bool SPLIT>
+  static void load_b_u4_split(thread metal::vec<bfloat,8>& hi, thread metal::vec<bfloat,8>& lo,
+                              const device uint* packed, const device bfloat* scales,
+                              const device bfloat* biases, uint n_base, uint k_base, uint K) {
+    short2 sc = get_coord();
+    uint groups = K / 64u;
+    uint packed_cols = K / 8u;
+    uint kk = k_base + uint(sc.x);
+    uint shift = (kk & 7u) * 4u;
+    for (short i = 0; i < 2; i++) {
+      uint nn = n_base + uint(sc.y) + uint(i) * 8u;
+      uint word = packed[nn * packed_cols + (kk >> 3)] >> shift;
+      float s = float(scales[nn * groups + (kk >> 6)]);
+      float b = float(biases[nn * groups + (kk >> 6)]);
+      for (short j = 0; j < 4; j++) {
+        float w = float((word >> (4u * uint(j))) & 0x0fu) * s + b;
+        bfloat h = bfloat(w);
+        hi[i * 4 + j] = h;
+        if (SPLIT) { lo[i * 4 + j] = bfloat(w - float(h)); }
+      }
+    }
+  }
+  static void store_c_tg(const thread metal::vec<float,8>& src, threadgroup float* dst, int str_x) {
+    short2 sc = get_coord();
+    dst += sc.y * str_x + sc.x;
+    for (short i = 0; i < 2; i++)
+      for (short j = 0; j < 4; j++)
+        dst[(i * 8) * str_x + j] = src[i * 4 + j];
+  }
   // Charge un fragment A 16×16 en GATHERANT depuis input[token] (token=perm[row]/top_k),
   // f32→bf16. Padding (perm sentinel) → 0. Fusionne le gather DANS le GEMM (zéro buffer).
   static void load_a_gathered(thread metal::vec<bfloat,8>& dst, const device float* input,
@@ -477,6 +524,72 @@ kernel void gemm_nax_coop_qb_tiled_u4_align64(
   NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
   NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
   NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+}
+// GEMM « skinny » u4 gs64 pour la vérification spéculative (M ≤ 16 par tuile) :
+// C[M,N] = A[M,K]·deq(B[N,K])ᵀ avec A f32 lu directement. Grille (N/32, ceil(M/16)),
+// threadgroup = 4 simdgroups qui se partagent K (split-K, K % 512 == 0), chacun
+// accumulant un fragment 16×32 ; réduction en mémoire threadgroup, écriture des
+// seules lignes < M. X3 : A et B scindés en bf16 hi + lo et trois MMA
+// (hi·hi + hi·lo + lo·hi), précision proche du f32 pour le tri greedy.
+template <bool X3>
+static inline void gemm_nax_skinny_u4_body(device const float* A, device const uint* Bp,
+                                           device const bfloat* Bs, device const bfloat* Bb,
+                                           device float* C, uint M, uint N, uint K,
+                                           uint2 tgid, uint sgid, uint lid,
+                                           threadgroup float* red) {
+  constexpr uint SG = 4u;
+  uint m0 = tgid.y * 16u, n0 = tgid.x * 32u;
+  uint span = K / SG;
+  uint kb = sgid * span, ke = kb + span;
+  metal::vec<float,8> Cn0 = float(0), Cn1 = float(0);
+  for (uint k = kb; k < ke; k += 16u) {
+    metal::vec<bfloat,8> Ah, Al, Bh0, Bl0, Bh1, Bl1;
+    NaxFrag::load_a_f32_masked<X3>(Ah, Al, A, m0, k, K, M);
+    NaxFrag::load_b_u4_split<X3>(Bh0, Bl0, Bp, Bs, Bb, n0, k, K);
+    NaxFrag::load_b_u4_split<X3>(Bh1, Bl1, Bp, Bs, Bb, n0 + 16u, k, K);
+    NaxFrag::mma(Cn0, Cn1, Ah, Bh0, Bh1);
+    if (X3) {
+      NaxFrag::mma(Cn0, Cn1, Ah, Bl0, Bl1);
+      NaxFrag::mma(Cn0, Cn1, Al, Bh0, Bh1);
+    }
+  }
+  threadgroup float* mine = red + sgid * 512u;
+  NaxFrag::store_c_tg(Cn0, mine, 32);
+  NaxFrag::store_c_tg(Cn1, mine + 16u, 32);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint tid = sgid * 32u + lid;
+  for (uint idx = tid; idx < 512u; idx += SG * 32u) {
+    uint m = idx >> 5u, nn = idx & 31u;
+    if (m0 + m < M) {
+      C[(m0 + m) * N + n0 + nn] = red[idx] + red[512u + idx] + red[1024u + idx] + red[1536u + idx];
+    }
+  }
+}
+kernel void gemm_nax_skinny_u4(device const float* A [[buffer(0)]],
+                               device const uint* Bp   [[buffer(1)]],
+                               device const bfloat* Bs [[buffer(2)]],
+                               device const bfloat* Bb [[buffer(3)]],
+                               device float* C         [[buffer(4)]],
+                               constant uint4& dims    [[buffer(5)]],
+                               constant uint& batch    [[buffer(6)]],
+                               uint2 tgid [[threadgroup_position_in_grid]],
+                               uint sgid [[simdgroup_index_in_threadgroup]],
+                               uint lid [[thread_index_in_simdgroup]]) {
+  threadgroup float red[4u * 512u];
+  gemm_nax_skinny_u4_body<false>(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red);
+}
+kernel void gemm_nax_skinny_u4_x3(device const float* A [[buffer(0)]],
+                                  device const uint* Bp   [[buffer(1)]],
+                                  device const bfloat* Bs [[buffer(2)]],
+                                  device const bfloat* Bb [[buffer(3)]],
+                                  device float* C         [[buffer(4)]],
+                                  constant uint4& dims    [[buffer(5)]],
+                                  constant uint& batch    [[buffer(6)]],
+                                  uint2 tgid [[threadgroup_position_in_grid]],
+                                  uint sgid [[simdgroup_index_in_threadgroup]],
+                                  uint lid [[thread_index_in_simdgroup]]) {
+  threadgroup float red[4u * 512u];
+  gemm_nax_skinny_u4_body<true>(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red);
 }
 kernel void gemm_nax_coop_qb_tiled_gs128(device const bfloat* A [[buffer(0)]],
                                          device const uint* Bp   [[buffer(1)]],

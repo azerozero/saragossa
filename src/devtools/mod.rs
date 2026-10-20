@@ -1,12 +1,15 @@
 //! Harnais et chargeurs de diagnostic hors moteur nominal.
 
 pub mod dflash;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+mod pairwise;
 
 use std::time::{Duration, Instant};
 
 pub use dflash::{
-    load_dflash_draft_for_target, load_dflash_draft_weights_for_target, DFlashAttentionWeights,
-    DFlashDraft, DFlashDraftInfo, DFlashDraftLayer,
+    load_dflash_draft_for_target, load_dflash_draft_weights_for_target,
+    load_dflash_draft_weights_quantized, DFlashAttentionWeights, DFlashConv, DFlashDraft,
+    DFlashDraftInfo, DFlashDraftLayer, DFlashQuant, DFlashSelector,
 };
 
 use crate::runtime_flags::env_flag;
@@ -131,6 +134,20 @@ pub fn run_mtp_acceptance(
     load_elapsed: Duration,
     warmup_elapsed: Duration,
 ) -> Result<()> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if env_flag("SARAGOSSA_RUST_PAIRWISE", false) {
+        // Phase 7 : le drafter DFlash n'est chargé que si le répertoire est posé ; les
+        // campagnes MTP seules restent inchangées.
+        let draft = match crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR") {
+            Some(dir) => Some(load_dflash_draft_weights_quantized(
+                &assets.config,
+                std::path::PathBuf::from(dir),
+                DFlashQuant::from_env()?,
+            )?),
+            None => None,
+        };
+        return pairwise::run(decoder, prompt_ids, max_tokens, options, draft.as_ref());
+    }
     let max_draft = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_MAX_DRAFT")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(2);
@@ -302,15 +319,68 @@ pub fn run_dflash_acceptance(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(draft.info.block_size);
+    // La bascule termine par la boucle MTP : sidecar exigé avant de commencer,
+    // plutôt qu'une erreur en cours de génération.
+    let switch_requested = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_MIN")
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .is_some_and(|value| value > 0.0);
+    if switch_requested && !decoder.has_mtp_head() {
+        return Err(InferError::Config(
+            "bascule DFlash (SARAGOSSA_RUST_DFLASH_SWITCH_MIN) sans sidecar MTP chargé".to_string(),
+        ));
+    }
     let reference_started = Instant::now();
     let reference = decoder
         .generate_greedy_dflash_reference_with_options(prompt_ids, max_tokens, options, draft)?;
     let reference_elapsed = reference_started.elapsed();
+    // Drafter résident : Metal seulement ; sans Metal le harnais garde la boucle CPU.
+    let resident = cfg!(all(target_os = "macos", feature = "metal"))
+        && env_flag("SARAGOSSA_RUST_DFLASH_RESIDENT", false);
     let spec_started = Instant::now();
-    let spec = decoder.generate_greedy_dflash_batched_with_options(
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let mut spec = if resident {
+        decoder.generate_greedy_dflash_resident_with_options(
+            prompt_ids, max_tokens, options, draft, max_draft,
+        )?
+    } else {
+        decoder.generate_greedy_dflash_batched_with_options(
+            prompt_ids, max_tokens, options, draft, max_draft,
+        )?
+    };
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let mut spec = decoder.generate_greedy_dflash_batched_with_options(
         prompt_ids, max_tokens, options, draft, max_draft,
     )?;
-    let spec_elapsed = spec_started.elapsed();
+    let mut spec_elapsed = spec_started.elapsed();
+    // Bascule : la boucle DFlash a rendu la main, la boucle MTP par défaut
+    // termine depuis prompt + généré (re-prefill compris dans le temps mesuré).
+    let mut fallback_ms = 0u128;
+    if let Some(switched_at) = spec.stats.dflash_switched_at {
+        // Même lecture que `serve::mtp::max_draft_tokens` : minimum strict de un.
+        let mtp_draft = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_MAX_DRAFT")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2);
+        let fallback_started = Instant::now();
+        let mut fallback_prompt = prompt_ids.to_vec();
+        fallback_prompt.extend_from_slice(&spec.tokens);
+        let fallback = decoder.generate_greedy_mtp_batched_with_options(
+            &fallback_prompt,
+            max_tokens.saturating_sub(spec.tokens.len()),
+            options,
+            mtp_draft,
+        )?;
+        let fallback_elapsed = fallback_started.elapsed();
+        fallback_ms = fallback_elapsed.as_millis();
+        spec_elapsed += fallback_elapsed;
+        spec.loop_duration += fallback_elapsed;
+        spec.tokens.extend(fallback.tokens);
+        spec.stats.proposed += fallback.stats.proposed;
+        spec.stats.accepted += fallback.stats.accepted;
+        spec.stats.rejected += fallback.stats.rejected;
+        spec.stats.verifications += fallback.stats.verifications;
+        spec.stats.dflash_switched_at = Some(switched_at);
+    }
     let tokens_equal = reference == spec.tokens;
     let generated = spec
         .tokens
@@ -327,7 +397,10 @@ pub fn run_dflash_acceptance(
         0.0
     };
     eprintln!(
-        "dflash_acceptance tokens_equal={} generated={} max_draft={} block_size={} proposed={} accepted={} rejected={} verifications={} avg_accepted_per_verify={:.3} load_ms={} warmup_ms={} ref_ms={} spec_ms={}",
+        "dflash_acceptance mode={} switched_at={} fallback_ms={} tokens_equal={} generated={} max_draft={} block_size={} proposed={} accepted={} rejected={} verifications={} avg_accepted_per_verify={:.3} load_ms={} warmup_ms={} ref_ms={} spec_ms={} spec_tok_s={:.1}",
+        if resident { "resident" } else { "cpu" },
+        spec.stats.dflash_switched_at.unwrap_or(0),
+        fallback_ms,
         tokens_equal,
         spec.tokens.len(),
         max_draft,
@@ -341,6 +414,7 @@ pub fn run_dflash_acceptance(
         warmup_elapsed.as_millis(),
         reference_elapsed.as_millis(),
         spec_elapsed.as_millis(),
+        spec.tokens.len() as f64 / spec.loop_duration.as_secs_f64().max(1.0e-9),
     );
     for position in 0..max_draft.min(draft.info.block_size) {
         let proposed = spec
@@ -484,7 +558,7 @@ pub fn run_resident_linear_xray(
 pub fn print_dflash_draft(draft: &DFlashDraft) {
     let info = &draft.info;
     println!(
-        "dflash_draft loaded tensors={} layers={} loaded_layers={} hidden={} block_size={} mask_token={} target_layers={}",
+        "dflash_draft loaded tensors={} layers={} loaded_layers={} hidden={} block_size={} mask_token={} target_layers={} variant={} quant={}",
         info.tensor_count,
         info.num_hidden_layers,
         draft.layers.len(),
@@ -495,7 +569,18 @@ pub fn print_dflash_draft(draft: &DFlashDraft) {
             .iter()
             .map(usize::to_string)
             .collect::<Vec<_>>()
-            .join(",")
+            .join(","),
+        if draft.selector.is_some() {
+            format!(
+                "dflash2(conv {}x{}, sélecteur rang {} top {})",
+                info.conv_kernel_size, info.conv_group_size, info.selector_rank, info.selector_top_k
+            )
+        } else {
+            "dflash1".to_string()
+        },
+        draft
+            .quant
+            .map_or("dense".to_string(), |q| format!("u{}g{}", q.bits, q.group_size))
     );
 }
 

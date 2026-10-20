@@ -435,6 +435,8 @@ fn prefix_cache_selects_longest_append_prefix() {
             tokens: vec![1, 2],
             cache: model.empty_cache(),
             final_state: final_state.clone(),
+            mtp_history: None,
+            captures: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             linear_metal: Vec::new(),
         },
@@ -442,6 +444,8 @@ fn prefix_cache_selects_longest_append_prefix() {
             tokens: vec![1, 2, 3],
             cache: model.empty_cache(),
             final_state: final_state.clone(),
+            mtp_history: None,
+            captures: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             linear_metal: Vec::new(),
         },
@@ -449,6 +453,8 @@ fn prefix_cache_selects_longest_append_prefix() {
             tokens: vec![1],
             cache: model.empty_cache(),
             final_state,
+            mtp_history: None,
+            captures: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             linear_metal: Vec::new(),
         },
@@ -463,6 +469,36 @@ fn prefix_cache_selects_longest_append_prefix() {
         Some(2)
     );
     assert_eq!(generation::longest_prefix_entry_index(&entries, &[9]), None);
+}
+
+/// Un hit DFlash exige les mêmes couches et des captures couvrant la fenêtre
+/// demandée ; une entrée à fenêtre plus courte est ignorée (prefill complet).
+#[test]
+#[cfg(feature = "devtools")]
+fn prefix_cache_dflash_hit_requires_capture_coverage() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let prompt = [1usize, 2, 3, 4];
+    let state = (model.empty_cache(), Tensor::row(vec![0.0])?);
+    let captures = PrefixCaptures::tail(
+        &[0],
+        0,
+        Tensor::from_vec(vec![4, 1], vec![1.0, 2.0, 3.0, 4.0])?,
+        2,
+    )?;
+    assert_eq!(captures.from, 2);
+    model.prefix_cache_put(&prompt, &state, None, Some(&captures))?;
+    let hit = model
+        .prefix_cache_get_with_captures(&prompt, &[0], 2)?
+        .ok_or_else(|| InferError::Config("hit attendu".to_string()))?;
+    assert_eq!(hit.3, 2);
+    assert_eq!(hit.2.data(), &[3.0, 4.0]);
+    assert!(model
+        .prefix_cache_get_with_captures(&prompt, &[0], 4)?
+        .is_none());
+    assert!(model
+        .prefix_cache_get_with_captures(&prompt, &[1], 2)?
+        .is_none());
+    Ok(())
 }
 
 #[test]
@@ -1318,7 +1354,13 @@ fn tiny_dflash_draft() -> crate::DFlashDraft {
             rope_theta: 10_000.0,
             layer_types: Vec::new(),
             sliding_window: None,
+            vocab_size: 0,
+            conv_kernel_size: 0,
+            conv_group_size: 0,
+            selector_rank: 0,
+            selector_top_k: 0,
         },
+        quant: None,
         hidden_norm: Tensor::from_vec(vec![2], vec![1.0, 1.0]).expect("invariant: norm valide"),
         fc: Linear::new(identity2().expect("invariant: fc valide"), None)
             .expect("invariant: linear valide"),
@@ -1348,8 +1390,11 @@ fn tiny_dflash_draft() -> crate::DFlashDraft {
                 Linear::new(identity2().expect("invariant: down valide"), None)
                     .expect("invariant: linear valide"),
             ),
+            attention_conv: None,
+            mlp_conv: None,
         }],
         norm: Tensor::from_vec(vec![2], vec![1.0, 1.0]).expect("invariant: norm valide"),
+        selector: None,
     }
 }
 
@@ -1774,6 +1819,22 @@ fn resident_full_precondition_rejects_model_without_moe() {
     );
 }
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn mtp_final_state_row_range_is_checked() -> Result<()> {
+    assert_eq!(MtpFinalState::row_range(2, 8)?, 16..24);
+    assert!(MtpFinalState::row_range(usize::MAX, 8).is_err());
+    assert!(MtpFinalState::row_range(1, usize::MAX).is_err());
+    Ok(())
+}
+
+#[test]
+fn mtp_final_state_cpu_roundtrip() -> Result<()> {
+    let state = MtpFinalState::Cpu(Tensor::row(vec![1.0, -2.0, 3.0])?);
+    assert_eq!(state.into_cpu()?.data(), &[1.0, -2.0, 3.0]);
+    Ok(())
+}
+
 // --- MTP : oracle résident two-row committed-history (GPU + modèle réel) ---
 
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
@@ -2029,6 +2090,425 @@ fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
     Ok(())
 }
 
+// --- MTP D1 : états hidden résidents (harnais pairwise `Case::hidden`) ---
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn mtp_hidden_and_embedding_off_outside_harness() {
+    #[cfg(feature = "devtools")]
+    if crate::runtime_flags::pairwise::current().is_some() {
+        return;
+    }
+    assert!(!crate::runtime_flags::mtp_resident_hidden_enabled());
+    assert!(!crate::runtime_flags::mtp_gpu_embedding_enabled());
+}
+
+/// Garde pairwise D1/Fresh selon l'environnement courant, hidden forcé.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn d1_hidden_guard(resident: bool) -> Result<crate::runtime_flags::pairwise::Guard> {
+    use crate::runtime_flags::pairwise::{Case, Guard, Mode};
+    let mode = if super::flags::mtp_fresh_cache_enabled() {
+        Mode::Fresh
+    } else {
+        Mode::D1
+    };
+    Guard::set(
+        Case {
+            mode,
+            hidden: resident,
+            ..Case::default()
+        },
+        true,
+    )
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[test]
+fn mtp_hidden_pairwise_guard_is_scoped() -> Result<()> {
+    {
+        let _on = d1_hidden_guard(true)?;
+        assert!(crate::runtime_flags::mtp_resident_hidden_enabled());
+        {
+            let _off = d1_hidden_guard(false)?;
+            assert!(!crate::runtime_flags::mtp_resident_hidden_enabled());
+        }
+        assert!(crate::runtime_flags::mtp_resident_hidden_enabled());
+    }
+    assert!(!crate::runtime_flags::mtp_resident_hidden_enabled());
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn d1_transfers_reset() {
+    MTP_D1_HIDDEN_TRANSFERS.with(|counts| counts.set((0, 0)));
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn d1_transfers() -> (usize, usize) {
+    MTP_D1_HIDDEN_TRANSFERS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn d1_strict_arena() -> Result<DecodeResidentState> {
+    let device = metal::Device::system_default()
+        .ok_or_else(|| InferError::Metal("test D1 strict : aucun device Metal".to_string()))?;
+    DecodeResidentState::new(device)
+}
+
+/// Bail résident : survit à la réallocation du pool et au drop de l'arène, sans
+/// alias ; `into_cpu` relit exactement les valeurs (1 lecture, 0 upload).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "requires Metal device"]
+fn mtp_d1_resident_state_lease_survives_pool_reuse() -> Result<()> {
+    let arena = d1_strict_arena()?;
+    let values: Vec<f32> = (0..64u16).map(|i| f32::from(i) * 0.5 - 3.0).collect();
+    let lease = arena.scratch().lease(values.len(), GpuElement::F32)?;
+    arena.upload(lease.tensor(), &values)?;
+    let kept = lease.tensor().buffer().gpu_address();
+    let state = MtpFinalState::Resident(lease);
+
+    let other = arena.scratch().lease(values.len(), GpuElement::F32)?;
+    assert_ne!(
+        other.tensor().buffer().gpu_address(),
+        kept,
+        "bail vivant aliasé"
+    );
+    arena.upload(other.tensor(), &[9.0; 64])?;
+    let freed = other.tensor().buffer().gpu_address();
+    drop(other);
+    let reused = arena.scratch().lease(values.len(), GpuElement::F32)?;
+    assert_ne!(
+        reused.tensor().buffer().gpu_address(),
+        kept,
+        "slot réattribué au bail vivant"
+    );
+    arena.upload(reused.tensor(), &[7.0; 64])?;
+    assert_eq!(
+        reused.tensor().buffer().gpu_address(),
+        freed,
+        "le slot libéré doit être réemployé"
+    );
+
+    // Repli : `from_lease(.., false)` matérialise immédiatement.
+    let cpu_lease = arena.scratch().lease(values.len(), GpuElement::F32)?;
+    arena.upload(cpu_lease.tensor(), &values)?;
+    d1_transfers_reset();
+    let materialized = MtpFinalState::from_lease(cpu_lease, false)?;
+    assert!(matches!(materialized, MtpFinalState::Cpu(_)));
+    assert_eq!(d1_transfers(), (1, 0));
+    assert_eq!(materialized.into_cpu()?.data(), values.as_slice());
+
+    drop(reused);
+    drop(arena);
+    d1_transfers_reset();
+    let cpu = state.into_cpu()?;
+    assert_eq!(
+        cpu.data(),
+        values.as_slice(),
+        "bail relu après drop de l'arène"
+    );
+    assert_eq!(d1_transfers(), (1, 0));
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
+    if !mtp_verifier_env_ready() {
+        return Err(InferError::Config(
+            "test D1 strict : flags MTP/résident absents".to_string(),
+        ));
+    }
+    if super::flags::mtp_adaptive_depth_enabled() {
+        return Err(InferError::Config(
+            "test D1 strict : ADAPTIVE_DEPTH off requis".to_string(),
+        ));
+    }
+    let model_dir = mtp_verifier_model_dir().ok_or_else(|| {
+        InferError::Config("test D1 strict : SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL".to_string())
+    })?;
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let mtp_path = assets
+        .mtp
+        .path
+        .clone()
+        .ok_or_else(|| InferError::MissingArtifact {
+            path: model_dir.clone(),
+            what: "MTP sidecar",
+        })?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(&mtp_path)?;
+    if model.mtp.is_none() || !model.supports_resident_full_decode() {
+        return Err(InferError::Config(
+            "test D1 strict : MTP résident non supporté".to_string(),
+        ));
+    }
+    Ok((assets, model))
+}
+
+/// (sortie, (lectures, uploads) hidden D1, delta (CB, dispatchs) profilé).
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+type D1Run = (SpeculativeOutput, (usize, usize), Option<(u64, u64)>);
+
+/// Une génération MTP sous flag D1 forcé : sortie, compteurs D1 hors prefill, et
+/// delta (CB, dispatchs) si `SARAGOSSA_RUST_DECODE_PROFILE=1`.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn d1_run(
+    model: &CausalDecoder,
+    prompt: &[usize],
+    budget: usize,
+    options: &GenerationOptions,
+    depth: usize,
+    resident: bool,
+) -> Result<D1Run> {
+    let _flag = d1_hidden_guard(resident)?;
+    let profile = crate::runtime_flags::decode_profile_enabled();
+    let before = crate::metal_backend::decode_profile_snapshot();
+    d1_transfers_reset();
+    let output = model.generate_greedy_mtp_batched_with_options(prompt, budget, options, depth)?;
+    let transfers = d1_transfers();
+    let after = crate::metal_backend::decode_profile_snapshot();
+    let delta = profile.then(|| (after.0 - before.0, after.3 - before.3));
+    Ok((output, transfers, delta))
+}
+
+/// Vérifie OFF/ON == AR, stats identiques et compteurs D1 attendus.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn d1_check_off_on(
+    model: &CausalDecoder,
+    name: &str,
+    prompt: &[usize],
+    budget: usize,
+    options: &GenerationOptions,
+) -> Result<SpeculativeOutput> {
+    let ar = model.generate_greedy_cached_with_options(prompt, budget, options)?;
+    let (off, off_io, off_profile) = d1_run(model, prompt, budget, options, 1, false)?;
+    let (on, on_io, on_profile) = d1_run(model, prompt, budget, options, 1, true)?;
+    assert_eq!(off.tokens, ar, "{name}: D1 OFF diverge de l'AR");
+    assert_eq!(on.tokens, ar, "{name}: D1 ON diverge de l'AR");
+    assert_eq!(on.stats, off.stats, "{name}: stats OFF/ON différentes");
+    let cycles = off.stats.proposed;
+    assert_eq!(off_io, (2 * cycles, cycles), "{name}: transferts D1 OFF");
+    assert_eq!(
+        on_io,
+        (0, usize::from(cycles > 0)),
+        "{name}: transferts D1 ON"
+    );
+    assert_eq!(
+        on_profile, off_profile,
+        "{name}: (CB, dispatchs) OFF/ON différents"
+    );
+    eprintln!(
+        "D1 hidden {name}: n={} proposed={cycles} accepted={} rejected={} off={off_io:?} on={on_io:?} profile={on_profile:?}",
+        ar.len(),
+        off.stats.accepted,
+        off.stats.rejected
+    );
+    Ok(off)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+const D1_MERGE_SORT_PROMPT: &str = "Écris une fonction Python de tri fusion avec une explication.";
+
+/// Oracle 64 tokens : OFF == ON == AR, acceptations et rejets présents,
+/// OFF=(2n,n) et ON=(0,1) transferts hidden D1, CB/dispatchs égaux si profilés.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[test]
+#[ignore = "requires Metal + 27B MTP model; committed history, resident flags; FRESH_CACHE=0 (D1) ou 1 (Fresh)"]
+fn mtp_d1_resident_hidden_oracle_matches_ar() -> Result<()> {
+    let (assets, model) = d1_strict_model()?;
+    let prompt = mtp_verifier_prompt_ids(&assets, D1_MERGE_SORT_PROMPT)?;
+    let plain = mtp_verifier_options(Vec::new());
+    // Exclure l'initialisation paresseuse du contrôle de cardinalité CB/dispatchs.
+    for resident in [false, true] {
+        let _ = d1_run(&model, &prompt, 4, &plain, 1, resident)?;
+    }
+    let out = d1_check_off_on(&model, "tri-fusion-64", &prompt, 64, &plain)?;
+    assert_eq!(out.tokens.len(), 64);
+    assert!(out.stats.accepted > 0, "aucune acceptation D1");
+    assert!(out.stats.rejected > 0, "aucun rejet D1");
+    Ok(())
+}
+
+/// Budgets : séparés des arrêts pour borner chaque exécution Metal.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[test]
+#[ignore = "requires Metal + 27B MTP model; committed history, resident flags; FRESH_CACHE=0 (D1) ou 1 (Fresh)"]
+fn mtp_d1_resident_hidden_edges_match_ar() -> Result<()> {
+    let (assets, model) = d1_strict_model()?;
+    let prompt = mtp_verifier_prompt_ids(&assets, D1_MERGE_SORT_PROMPT)?;
+    let plain = mtp_verifier_options(Vec::new());
+    for resident in [false, true] {
+        let _ = d1_run(&model, &prompt, 4, &plain, 1, resident)?;
+    }
+
+    for budget in [0, 1, 2, 3, 4, 9] {
+        let out = d1_check_off_on(&model, &format!("budget-{budget}"), &prompt, budget, &plain)?;
+        assert_eq!(out.tokens.len(), budget, "budget {budget} non respecté");
+    }
+    Ok(())
+}
+
+/// EOS, arrêt streaming, D2 hors compteurs D1 et repli direct, sans refaire les budgets.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[test]
+#[ignore = "requires Metal + 27B MTP model; committed history, resident flags; FRESH_CACHE=0 (D1) ou 1 (Fresh)"]
+fn mtp_d1_resident_hidden_stop_and_fallback_match_ar() -> Result<()> {
+    let (assets, model) = d1_strict_model()?;
+    let prompt = mtp_verifier_prompt_ids(&assets, D1_MERGE_SORT_PROMPT)?;
+    let plain = mtp_verifier_options(Vec::new());
+    for resident in [false, true] {
+        let _ = d1_run(&model, &prompt, 4, &plain, 1, resident)?;
+    }
+    let probe = model.generate_greedy_cached_with_options(&prompt, 4, &plain)?;
+    for position in 0..4 {
+        let stop = *probe
+            .get(position)
+            .ok_or_else(|| InferError::Dimension("sonde AR D1 trop courte".to_string()))?;
+        let options = mtp_verifier_options(vec![stop]);
+        let out = d1_check_off_on(&model, &format!("eos-{position}"), &prompt, 16, &options)?;
+        assert!(
+            out.tokens.len() <= position,
+            "EOS en position {position} ignoré"
+        );
+    }
+
+    for stop_after in 1..=4 {
+        let mut outputs = Vec::new();
+        for resident in [false, true] {
+            let _flag = d1_hidden_guard(resident)?;
+            let mut seen = Vec::new();
+            let out = model.generate_greedy_mtp_streaming_with_options(
+                &prompt,
+                16,
+                &plain,
+                1,
+                |token| {
+                    seen.push(token);
+                    seen.len() < stop_after
+                },
+            )?;
+            assert_eq!(
+                seen.len(),
+                stop_after,
+                "callback supplémentaire après arrêt"
+            );
+            assert_eq!(seen.as_slice(), &probe[..stop_after], "tokens émis != AR");
+            outputs.push((out.tokens, out.stats));
+        }
+        assert_eq!(
+            outputs[0], outputs[1],
+            "arrêt streaming {stop_after}: OFF/ON différents"
+        );
+    }
+
+    let (d2_off, d2_off_io, _) = d1_run(&model, &prompt, 9, &plain, 2, false)?;
+    let (d2_on, d2_on_io, _) = d1_run(&model, &prompt, 9, &plain, 2, true)?;
+    assert_eq!(d2_on.tokens, d2_off.tokens, "D2 flag ON diverge");
+    assert_eq!(d2_on.stats, d2_off.stats);
+    assert_eq!(d2_off_io, (0, 0), "D2 ne doit pas passer par le D1 fused");
+    assert_eq!(
+        d2_on_io,
+        (0, 0),
+        "D2 ne doit pas utiliser les transferts du chemin D1"
+    );
+
+    // Repli : sans arène résidente, le D1 rend None sans lire ni uploader l'état,
+    // et `into_cpu` matérialise le bail une seule fois.
+    let arena = d1_strict_arena()?;
+    let hidden = model.final_norm.data().len();
+    let values: Vec<f32> = (0..hidden).map(|i| (i % 17) as f32 - 8.0).collect();
+    let lease = arena.scratch().lease(hidden, GpuElement::F32)?;
+    arena.upload(lease.tensor(), &values)?;
+    let state = MtpFinalState::Resident(lease);
+    let mut cache = model.empty_cache();
+    d1_transfers_reset();
+    assert!(model
+        .next_mtp_spec_one_resident(&mut cache, &state, probe[0], 0, &[], true, None)?
+        .is_none());
+    assert_eq!(d1_transfers(), (0, 0));
+    assert_eq!(state.into_cpu()?.data(), values.as_slice());
+    assert_eq!(d1_transfers(), (1, 0));
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[test]
+#[ignore = "requires Metal + 27B MTP model; committed history and resident flags"]
+fn mtp_gpu_block_d2_and_capacity_fallback_without_mutation() -> Result<()> {
+    use crate::runtime_flags::pairwise::{self, Case, Guard, Hit, Mode};
+    let (assets, model) = d1_strict_model()?;
+    let prompt = mtp_verifier_prompt_ids(&assets, D1_MERGE_SORT_PROMPT)?;
+    let options = mtp_verifier_options(Vec::new());
+    let oracle = model.generate_greedy_cached_with_options(&prompt, 9, &options)?;
+    assert_eq!(oracle.len(), 9);
+    let _guard = Guard::set(
+        Case {
+            mode: Mode::Block2,
+            embedding: true,
+            ..Case::default()
+        },
+        true,
+    )?;
+    let fallback = model.generate_greedy_mtp_batched_with_options(&prompt, 9, &options, 2)?;
+    assert_eq!(fallback.tokens, oracle);
+    assert_eq!(
+        pairwise::hits()[Hit::Block as usize],
+        0,
+        "D2 doit contourner bloc2"
+    );
+    let (mut cache, state) = model.prefill_cache_state(&prompt)?;
+    assert!(model.setup_resident_full_decode(&mut cache, 2, 1, false)?);
+    let arena = cache
+        .resident
+        .as_ref()
+        .expect("invariant: setup résident réussi");
+    let kernels = crate::metal_backend::mtp_control::MtpD1Kernels::new(arena.state.device())?;
+    let position = cache.position;
+    let lengths: Vec<_> = cache
+        .layers
+        .iter()
+        .filter_map(|l| l.full.as_ref())
+        .map(|kv| {
+            assert_eq!(
+                kv.capacity(),
+                position + 3,
+                "capacité volontairement insuffisante pour quatre écritures"
+            );
+            kv.len()
+        })
+        .collect();
+    assert!(!lengths.is_empty());
+    let before = crate::metal_backend::decode_profile_snapshot();
+    let before_io = pairwise::io();
+    assert!(model
+        .next_mtp_gpu_block(&mut cache, &state, oracle[0], 2, &[], &kernels)?
+        .is_none());
+    assert_eq!(cache.position, position);
+    assert_eq!(
+        cache
+            .layers
+            .iter()
+            .filter_map(|l| l.full.as_ref())
+            .map(|kv| kv.len())
+            .collect::<Vec<_>>(),
+        lengths
+    );
+    assert_eq!(
+        pairwise::io(),
+        before_io,
+        "aucun transfert partagé avant repli"
+    );
+    let after = crate::metal_backend::decode_profile_snapshot();
+    assert_eq!(
+        (after.0, after.3),
+        (before.0, before.3),
+        "aucune soumission ni dispatch avant repli"
+    );
+    Ok(())
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn resident_sampling_predicates_route_default_and_readback() {
@@ -2066,3 +2546,178 @@ fn resident_sampling_predicates_route_default_and_readback() {
 // (`decode_token_resident`), non instanciable par le modèle synthétique de test
 // (sans MoE → `supports_resident_full_decode()=false`). La validation 1c est
 // l'oracle 35B réel (texte greedy ==CPU + A/B).
+
+// --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
+
+/// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
+/// l'AR, même acceptance ; la variante streamée émet exactement ces tokens et
+/// s'arrête sur le callback ; le greedy MTP route vers DFlash quand le drafter
+/// est chargé. Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` et
+/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` (quantification via
+/// `SARAGOSSA_RUST_DFLASH_QUANT_BITS`, u4 si absente, appliquée aux deux boucles).
+#[test]
+#[ignore = "modèle réel + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let Some(draft_dir) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")
+    else {
+        eprintln!("skip DFlash résident: SARAGOSSA_RUST_DFLASH_DRAFT_DIR absent");
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config(format!("drafter non chargé depuis {draft_dir:?}")))?
+        .clone();
+    let prompt = mtp_verifier_prompt_ids(
+        &assets,
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+    )?;
+    let options = mtp_verifier_options(Vec::new());
+    let max_new_tokens = 32;
+    let ar = model.generate_greedy_cached_with_options(&prompt, max_new_tokens, &options)?;
+    let cpu = model.generate_greedy_dflash_batched_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        &draft,
+        draft.info.block_size,
+    )?;
+    let resident = model.generate_greedy_dflash_resident_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        &draft,
+        draft.info.block_size,
+    )?;
+    eprintln!(
+        "DFlash résident: cpu {} ms ({} acceptés / {} proposés), résident {} ms ({} / {})",
+        cpu.loop_duration.as_millis(),
+        cpu.stats.accepted,
+        cpu.stats.proposed,
+        resident.loop_duration.as_millis(),
+        resident.stats.accepted,
+        resident.stats.proposed
+    );
+    assert_eq!(resident.tokens, ar, "boucle résidente divergente de l'AR");
+    assert_eq!(cpu.tokens, ar, "boucle CPU divergente de l'AR");
+    // Le drafter résident tourne sur le kernel skinny bf16 : ses propositions
+    // peuvent différer de la boucle CPU f32, pas les tokens. Tolérance de deux
+    // acceptations sur 32 tokens.
+    assert!(
+        resident.stats.accepted + 2 >= cpu.stats.accepted,
+        "drafter résident moins accepté : {} contre {}",
+        resident.stats.accepted,
+        cpu.stats.accepted
+    );
+    let mut streamed = Vec::new();
+    let streaming = model.generate_greedy_dflash_resident_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        &draft,
+        draft.info.block_size,
+        |token| {
+            streamed.push(token);
+            true
+        },
+    )?;
+    assert_eq!(streaming.tokens, ar, "boucle streamée divergente de l'AR");
+    assert_eq!(streamed, ar, "callback DFlash divergent de la sortie");
+    let mut seen = 0usize;
+    let early = model.generate_greedy_dflash_resident_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        &draft,
+        draft.info.block_size,
+        |_| {
+            seen += 1;
+            seen < 5
+        },
+    )?;
+    assert_eq!(early.tokens, ar[..5], "arrêt par callback DFlash");
+    // Stop token au milieu de la sortie AR : exclu de la sortie, que DFlash le
+    // rencontre en primaire ou en draft accepté (CPU, résident, streamé).
+    let stop = ar[10];
+    let options_stop = mtp_verifier_options(vec![stop]);
+    let ar_stop =
+        model.generate_greedy_cached_with_options(&prompt, max_new_tokens, &options_stop)?;
+    let cut = ar
+        .iter()
+        .position(|token| *token == stop)
+        .unwrap_or(ar.len());
+    assert_eq!(ar_stop, ar[..cut], "AR avec stop token");
+    let cpu_stop = model.generate_greedy_dflash_batched_with_options(
+        &prompt,
+        max_new_tokens,
+        &options_stop,
+        &draft,
+        draft.info.block_size,
+    )?;
+    assert_eq!(cpu_stop.tokens, ar_stop, "boucle CPU avec stop token");
+    let mut streamed_stop = Vec::new();
+    let resident_stop = model.generate_greedy_dflash_resident_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &options_stop,
+        &draft,
+        draft.info.block_size,
+        |token| {
+            streamed_stop.push(token);
+            true
+        },
+    )?;
+    assert_eq!(
+        resident_stop.tokens, ar_stop,
+        "boucle résidente avec stop token"
+    );
+    assert_eq!(streamed_stop, ar_stop, "callback avec stop token");
+    // Extension du cache de préfixe : prompt + 3 tokens déjà générés, suffixe
+    // et captures calculés per-op sur l'entrée précédente, même sortie que l'AR.
+    let mut extended = prompt.clone();
+    extended.extend_from_slice(&ar[..3]);
+    let resident_ext = model.generate_greedy_dflash_resident_with_options(
+        &extended,
+        max_new_tokens - 3,
+        &options,
+        &draft,
+        draft.info.block_size,
+    )?;
+    // Référence AR sans cache de préfixe : l'oracle ne partage pas l'état étendu.
+    let ar_ext = model
+        .generate_greedy_timed_from_prompt_state_with_options(
+            model.prefill_prompt_state_uncached(&extended)?,
+            Duration::ZERO,
+            max_new_tokens - 3,
+            &options,
+        )?
+        .tokens;
+    assert_eq!(
+        resident_ext.tokens, ar_ext,
+        "extension du cache de préfixe avec captures"
+    );
+    // Routage : le greedy MTP passe par DFlash (8 positions de draft, pas 2).
+    let routed = model.generate_greedy_mtp_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        2,
+        |_| true,
+    )?;
+    assert_eq!(
+        routed.tokens, ar,
+        "greedy MTP routé vers DFlash divergent de l'AR"
+    );
+    assert_eq!(
+        routed.stats.proposed_by_position.len(),
+        draft.info.block_size
+    );
+    Ok(())
+}

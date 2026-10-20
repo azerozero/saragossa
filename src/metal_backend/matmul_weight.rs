@@ -236,6 +236,40 @@ impl MetalExecutor {
                 weight.bits(),
                 groups,
             )?,
+            AffineMatmulKernel::Skinny => self.encode_affine_qmm_skinny_buffers(
+                encoder,
+                lhs_buffer,
+                &packed_buffer,
+                packed_offset,
+                &scales_buffer,
+                scales_offset,
+                &biases_buffer,
+                biases_offset,
+                output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                groups,
+            )?,
+            AffineMatmulKernel::Qmm8 => self.encode_owned_affine_qmm8(
+                encoder,
+                lhs_buffer,
+                &packed_buffer,
+                packed_offset,
+                &scales_buffer,
+                scales_offset,
+                &biases_buffer,
+                biases_offset,
+                output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                weight.group_size(),
+                weight.bits(),
+                groups,
+            )?,
             AffineMatmulKernel::QmmNaFusedTiledU4 => {
                 self.encode_affine_qmm_na_fused_tiled_u4_buffers(
                     encoder,
@@ -425,6 +459,68 @@ impl MetalExecutor {
             )?,
         }
         Ok(*out_dim)
+    }
+
+    #[inline]
+    fn encode_owned_affine_qmm8(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed: &BufferRef,
+        packed_offset: NSUInteger,
+        scales: &BufferRef,
+        scales_offset: NSUInteger,
+        biases: &BufferRef,
+        biases_offset: NSUInteger,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        packed_cols: usize,
+        group_size: usize,
+        bits: usize,
+        groups: usize,
+    ) -> Result<()> {
+        let fast_dims = [
+            checked_u32(out_dim, "qmm8 out_dim")?,
+            checked_u32(in_dim, "qmm8 in_dim")?,
+            checked_u32(packed_cols, "qmm8 packed_cols")?,
+            checked_u32(groups, "qmm8 groups")?,
+        ];
+        let batch_u32 = [checked_u32(batch, "qmm8 batch")?];
+        encoder.set_compute_pipeline_state(&self.affine_qmm8_fast_aligned_u4_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed), packed_offset);
+        encoder.set_buffer(2, Some(scales), scales_offset);
+        encoder.set_buffer(3, Some(biases), biases_offset);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, &fast_dims, "qmm8_dims")?;
+        set_u32_bytes(encoder, 6, &batch_u32, "qmm8_batch")?;
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            "affine_qmm8_u4_gs64",
+            batch,
+            in_dim,
+            out_dim,
+            group_size,
+            bits,
+        ));
+        trace_dispatch_path(
+            "affine_qmm8_fast_aligned_u4_gs64_f32",
+            batch,
+            out_dim,
+            in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch.div_ceil(8), "qmm8 row groups")?,
+                checked_nsuint(out_dim.div_ceil(8), "qmm8 out groups")?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
     }
 
     #[inline]

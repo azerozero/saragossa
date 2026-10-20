@@ -43,6 +43,7 @@ pub(crate) mod flags;
 mod generation;
 mod lightbatch;
 mod loading;
+mod lookup;
 mod mtp;
 mod mtp_adaptive;
 mod resident;
@@ -390,6 +391,9 @@ pub struct SpeculativeStats {
     pub proposed_by_position: Vec<usize>,
     /// Nombre de propositions acceptées par position draft.
     pub accepted_by_position: Vec<usize>,
+    /// Boucle DFlash interrompue par la bascule sur acceptance observée, après
+    /// ce nombre de tokens générés (le reste revient à la boucle MTP).
+    pub dflash_switched_at: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -521,6 +525,123 @@ struct ResidentVerifyOutput {
     target_hidden: Option<Tensor>,
 }
 
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+thread_local! {
+    // Lectures hidden et uploads hidden du seul chemin D1, pas du prefill.
+    static MTP_D1_HIDDEN_TRANSFERS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Le bail garde le scratch hors du pool jusqu'à la fin du prochain cycle.
+/// Le repli CPU consomme l'état : aucun tenseur CPU périmé n'est conservé.
+#[derive(Debug)]
+enum MtpFinalState {
+    Cpu(Tensor),
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    Resident(ScratchLease),
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    ResidentRow {
+        lease: ScratchLease,
+        row: usize,
+        hidden: usize,
+    },
+}
+
+impl MtpFinalState {
+    fn into_cpu(self) -> Result<Tensor> {
+        match self {
+            Self::Cpu(state) => Ok(state),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::Resident(lease) => {
+                #[cfg(test)]
+                MTP_D1_HIDDEN_TRANSFERS.with(|counts| {
+                    let (reads, uploads) = counts.get();
+                    counts.set((reads + 1, uploads));
+                });
+                Tensor::row(crate::metal_backend::read_f32_buffer(
+                    lease.tensor().buffer(),
+                    lease.tensor().len(),
+                )?)
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::ResidentRow { lease, row, hidden } => {
+                let values = crate::metal_backend::read_f32_buffer(
+                    lease.tensor().buffer(),
+                    lease.tensor().len(),
+                )?;
+                let range = Self::row_range(row, hidden)?;
+                let values = values
+                    .get(range)
+                    .ok_or_else(|| InferError::Dimension("ligne hidden hors bail".into()))?;
+                Tensor::row(values.to_vec())
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn row_range(row: usize, hidden: usize) -> Result<std::ops::Range<usize>> {
+        let start = row
+            .checked_mul(hidden)
+            .ok_or_else(|| InferError::Dimension("offset hidden déborde".into()))?;
+        let end = start
+            .checked_add(hidden)
+            .ok_or_else(|| InferError::Dimension("fin hidden déborde".into()))?;
+        Ok(start..end)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn validate_resident(&self, hidden: usize) -> Result<()> {
+        let (lease, end) = match self {
+            Self::Cpu(_) => return Ok(()),
+            Self::Resident(lease) => (lease, hidden),
+            Self::ResidentRow {
+                lease,
+                row,
+                hidden: width,
+            } if *width == hidden => (lease, Self::row_range(*row, hidden)?.end),
+            _ => return Err(InferError::Dimension("largeur hidden incompatible".into())),
+        };
+        if lease.tensor().element() != GpuElement::F32 || lease.tensor().len() < end {
+            return Err(InferError::Dimension("bail hidden incompatible".into()));
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn encode_resident_copy(
+        &self,
+        metal: &crate::metal_backend::MetalExecutor,
+        encoder: &metal::ComputeCommandEncoderRef,
+        dst: &metal::BufferRef,
+        hidden: usize,
+    ) -> Result<()> {
+        self.validate_resident(hidden)?;
+        let (lease, row) = match self {
+            Self::Cpu(_) => return Ok(()),
+            Self::Resident(lease) => (lease, 0),
+            Self::ResidentRow { lease, row, .. } => (lease, *row),
+        };
+        let offset = Self::row_range(row, hidden)?
+            .start
+            .checked_mul(4)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| InferError::Dimension("offset hidden octets déborde".into()))?;
+        metal.encode_copy_with_offsets(encoder, lease.tensor().buffer(), offset, dst, 0, hidden)?;
+        #[cfg(feature = "devtools")]
+        crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::Hidden);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn from_lease(lease: ScratchLease, retain_hidden: bool) -> Result<Self> {
+        let state = Self::Resident(lease);
+        if retain_hidden {
+            Ok(state)
+        } else {
+            Ok(Self::Cpu(state.into_cpu()?))
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Debug)]
 struct ResidentMtpSpecTwoOutput {
@@ -531,7 +652,7 @@ struct ResidentMtpSpecTwoOutput {
     accepted_generated: usize,
     committed_rows: usize,
     pending: usize,
-    final_state: Tensor,
+    final_state: MtpFinalState,
     bonus_verified: bool,
 }
 
@@ -1039,6 +1160,10 @@ pub struct CausalDecoder {
     lm_head: Linear,
     mtp: Option<MtpHead>,
     mtp_draft_lm_head: Option<Linear>,
+    /// Drafter DFlash 2 résident, opt-in : quand il est chargé, le greedy MTP
+    /// passe par la boucle DFlash (`generate_greedy_mtp_inner`).
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    dflash: Option<crate::DFlashDraft>,
     prefix_cache: Arc<Mutex<PrefixCache>>,
     memory_guard: Option<MemoryGuard>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1055,8 +1180,51 @@ struct PrefixCacheEntry {
     tokens: Vec<usize>,
     cache: CausalDecoderCache,
     final_state: Tensor,
+    // Historique MTP committed semé sur `tokens` ; absent si l'entrée vient du
+    // chemin AR ou fresh. Le chemin committed l'exige pour un hit.
+    mtp_history: Option<LayerKvCache>,
+    /// Captures des couches cibles du drafter DFlash sur `tokens` ; absentes si
+    /// l'entrée vient du chemin AR ou MTP. Le chemin DFlash les exige pour un hit.
+    captures: Option<PrefixCaptures>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     linear_metal: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
+}
+
+/// Hidden states des couches `layer_ids` pour les positions `from..` d'un prompt,
+/// bornés à la fenêtre du drafter (les positions antérieures ne sont jamais lues).
+#[derive(Clone, Debug)]
+pub(crate) struct PrefixCaptures {
+    pub(crate) layer_ids: Vec<usize>,
+    pub(crate) from: usize,
+    /// `[positions, layer_ids.len() * hidden]`.
+    pub(crate) hidden: Tensor,
+}
+
+impl PrefixCaptures {
+    /// Garde au plus les `keep_rows` dernières lignes de `hidden` (positions
+    /// `from..`), en avançant `from` d'autant.
+    pub(crate) fn tail(
+        layer_ids: &[usize],
+        from: usize,
+        hidden: Tensor,
+        keep_rows: usize,
+    ) -> Result<Self> {
+        let (rows, cols) = hidden.as_matrix()?;
+        let drop = rows.saturating_sub(keep_rows.max(1));
+        let hidden = if drop == 0 {
+            hidden
+        } else {
+            Tensor::from_vec(
+                vec![rows - drop, cols],
+                hidden.data()[drop * cols..].to_vec(),
+            )?
+        };
+        Ok(Self {
+            layer_ids: layer_ids.to_vec(),
+            from: from + drop,
+            hidden,
+        })
+    }
 }
 
 impl PrefixCacheEntry {
@@ -1070,7 +1238,20 @@ impl PrefixCacheEntry {
                 self.final_state
                     .len()
                     .saturating_mul(std::mem::size_of::<f32>()),
-            );
+            )
+            .saturating_add(self.mtp_history.as_ref().map_or(0, |history| {
+                history
+                    .keys
+                    .len()
+                    .saturating_add(history.values.len())
+                    .saturating_mul(std::mem::size_of::<f32>())
+            }))
+            .saturating_add(self.captures.as_ref().map_or(0, |captures| {
+                captures
+                    .hidden
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>())
+            }));
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             bytes = bytes.saturating_add(
@@ -1093,6 +1274,13 @@ impl PrefixCache {
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+impl CausalDecoder {
+    /// Vrai si un sidecar MTP est chargé (repli de la bascule DFlash).
+    pub fn has_mtp_head(&self) -> bool {
+        self.mtp.is_some()
+    }
 }
 
 impl CausalDecoder {
@@ -1474,6 +1662,8 @@ impl CausalDecoder {
             lm_head,
             mtp: None,
             mtp_draft_lm_head: None,
+            #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+            dflash: None,
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
             memory_guard: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1952,6 +2142,47 @@ impl CausalDecoder {
         let context = mtp::MtpLoadContext::cpu();
         self.mtp = Some(MtpHead::from_sidecar(path, &self.config, &context)?);
         Ok(self)
+    }
+
+    /// Charge le drafter DFlash 2 désigné par `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`
+    /// (quantification `SARAGOSSA_RUST_DFLASH_QUANT_BITS`, u4 gs64 si absente :
+    /// la configuration mesurée en phase 7). Sans la variable, le décodeur est
+    /// rendu inchangé : c'est le kill-switch.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le runtime Metal est absent, si le checkpoint est
+    /// incompatible avec `target` ou si la quantification demandée est invalide.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    pub fn with_dflash_draft_from_env(mut self, target: &crate::ModelConfig) -> Result<Self> {
+        let Some(dir) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR") else {
+            return Ok(self);
+        };
+        if self.runtime.metal.is_none() {
+            return Err(InferError::Config(
+                "drafter DFlash : runtime Metal requis".to_string(),
+            ));
+        }
+        let quant = if crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_QUANT_BITS").is_none() {
+            Some(crate::DFlashQuant {
+                group_size: 64,
+                bits: 4,
+            })
+        } else {
+            crate::DFlashQuant::from_env()?
+        };
+        self.dflash = Some(crate::load_dflash_draft_weights_quantized(
+            target,
+            std::path::PathBuf::from(dir),
+            quant,
+        )?);
+        Ok(self)
+    }
+
+    /// Drafter DFlash chargé par `with_dflash_draft_from_env`, s'il y en a un.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    pub fn dflash_draft(&self) -> Option<&crate::DFlashDraft> {
+        self.dflash.as_ref()
     }
 
     /// Charge une projection logits dédiée aux drafts MTP.

@@ -1,6 +1,9 @@
 //! Attention full-attn GPU-résidente et helpers RoPE/gating.
 
 use super::arena::alloc_tensor;
+use super::gpu_position::{
+    check_gpu_position_rows, rope_dims_param, to_u32, GpuPositionRows, U32x4Param,
+};
 use super::utils::{
     bf16_round_f32, byte_offset, flash_sdpa_enabled, kv_bf16_for, kv_bf16_sim_konly,
     kv_bf16_sim_vonly, sdpa_2pass_blocks, sdpa_2pass_enabled, sdpa_2pass_min_len,
@@ -51,6 +54,17 @@ impl DecodeResidentState {
         head_dim: usize,
     ) -> Result<FullAttentionMetalState> {
         self.full_attention_with_element(capacity, q_heads, kv_heads, head_dim, GpuElement::Bf16)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_attention_f32_for_test(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<FullAttentionMetalState> {
+        self.full_attention_with_element(capacity, q_heads, kv_heads, head_dim, GpuElement::F32)
     }
 
     fn full_attention_with_element(
@@ -343,26 +357,46 @@ impl DecodeResidentState {
         eps: f32,
         base_theta: f32,
     ) -> Result<()> {
-        let dims: [u32; 4] = [
-            u32::try_from(num_heads)
-                .map_err(|_| InferError::Dimension("rope num_heads hors u32".to_string()))?,
-            u32::try_from(head_dim)
-                .map_err(|_| InferError::Dimension("rope head_dim hors u32".to_string()))?,
-            u32::try_from(rope_dims)
-                .map_err(|_| InferError::Dimension("rope rope_dims hors u32".to_string()))?,
-            u32::try_from(position)
-                .map_err(|_| InferError::Dimension("rope position hors u32".to_string()))?,
-        ];
+        let dims = rope_dims_param(num_heads, head_dim, rope_dims, position)?;
+        self.encode_rms_norm_rope_decode_param(
+            encoder,
+            input,
+            input_offset,
+            weight,
+            output,
+            num_heads,
+            dims,
+            rope_frequency_dim,
+            eps,
+            base_theta,
+        )
+    }
+
+    /// Cœur RoPE decode : `dims = [heads, head_dim, rope_dims, position]` lié par
+    /// octets hôte (chemin historique) ou par buffer GPU (position GPU).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirror des paramètres rms_norm+RoPE (dims liés + theta)"
+    )]
+    pub(super) fn encode_rms_norm_rope_decode_param(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input: &BufferRef,
+        input_offset: u64,
+        weight: &BufferRef,
+        output: &BufferRef,
+        num_heads: usize,
+        dims: U32x4Param<'_>,
+        rope_frequency_dim: usize,
+        eps: f32,
+        base_theta: f32,
+    ) -> Result<()> {
         let params: [f32; 2] = [eps, base_theta];
         encoder.set_compute_pipeline_state(&self.rope_decode_kernel);
         encoder.set_buffer(0, Some(input), input_offset);
         encoder.set_buffer(1, Some(weight), 0);
         encoder.set_buffer(2, Some(output), 0);
-        encoder.set_bytes(
-            3,
-            std::mem::size_of::<[u32; 4]>() as u64,
-            dims.as_ptr().cast::<c_void>(),
-        );
+        dims.bind(encoder, 3);
         encoder.set_bytes(
             4,
             std::mem::size_of::<[f32; 2]>() as u64,
@@ -377,7 +411,7 @@ impl DecodeResidentState {
         );
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
-            MTLSize::new(u64::from(dims[0]), 1, 1),
+            MTLSize::new(u64::from(to_u32(num_heads, "rope num_heads")?), 1, 1),
             MTLSize::new(256, 1, 1),
         );
         crate::metal_backend::post_dispatch_barrier(encoder);
@@ -510,6 +544,40 @@ impl FullAttentionMetalState {
     }
 
     /// Renvoie la capacité en lignes.
+    pub(super) fn scratch(&self) -> &ScratchPool {
+        &self.scratch
+    }
+
+    pub(super) fn attention_2pass_2_d128(&self) -> &ComputePipelineState {
+        &self.attention_2pass_2_d128
+    }
+
+    pub(super) fn attention_2pass_2(&self) -> &ComputePipelineState {
+        &self.attention_2pass_2
+    }
+
+    /// Avance `len` de `rows` lignes appendues par un kernel en lignes.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la capacité serait dépassée.
+    pub(super) fn advance_len(&mut self, rows: usize) -> Result<()> {
+        let next = self
+            .len
+            .checked_add(rows)
+            .filter(|next| *next <= self.capacity);
+        match next {
+            Some(next) => {
+                self.len = next;
+                Ok(())
+            }
+            None => Err(InferError::Dimension(format!(
+                "append KV résident: {} + {rows} lignes dépasse la capacité {}",
+                self.len, self.capacity
+            ))),
+        }
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -754,6 +822,82 @@ impl FullAttentionMetalState {
                 self.len
             )));
         }
+        let len = to_u32(self.len, "len")?;
+        let sdpa_dims = U32x4Param::Bytes([
+            to_u32(self.q_heads, "q_heads")?,
+            to_u32(self.kv_heads, "kv_heads")?,
+            to_u32(self.head_dim, "head_dim")?,
+            len,
+        ]);
+        let two_pass_dims = U32x4Param::Bytes([
+            to_u32(self.q_heads, "2pass q_heads")?,
+            to_u32(self.kv_heads, "2pass kv_heads")?,
+            len,
+            to_u32(sdpa_2pass_blocks(self.len), "2pass blocks")?,
+        ]);
+        self.encode_attention_decode_dims(
+            encoder,
+            q_buf,
+            scores_buf,
+            out_buf,
+            window_start,
+            self.len,
+            sdpa_dims,
+            two_pass_dims,
+        )
+    }
+
+    /// Attention decode dont la longueur est lue par le GPU dans `ctrl` :
+    /// ligne `row` sur `ctrl[slot] + row + 1` lignes. Mêmes kernels et même choix
+    /// flash/2-passes, fixé par la borne hôte `max_position + row + 1`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde ou si l'allocation 2-passes échoue.
+    pub(crate) fn encode_attention_decode_gpu_position(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &BufferRef,
+        scores_buf: &BufferRef,
+        out_buf: &BufferRef,
+        rows: &GpuPositionRows<'_>,
+        row: usize,
+    ) -> Result<()> {
+        let len_bound = rows
+            .position()
+            .max_position
+            .checked_add(row + 1)
+            .ok_or_else(|| InferError::Dimension("position GPU len déborde".to_string()))?;
+        self.encode_attention_decode_dims(
+            encoder,
+            q_buf,
+            scores_buf,
+            out_buf,
+            0,
+            len_bound,
+            rows.sdpa(row),
+            rows.sdpa_2pass(row),
+        )
+    }
+
+    /// Cœur SDPA decode. `len_bound` (= len hôte, ou borne en position GPU) choisit
+    /// le kernel et la grille 2-passes ; `sdpa_dims`/`two_pass_dims` portent la
+    /// longueur effective lue par le kernel.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: buffers + fenêtre + borne + deux jeux de dims"
+    )]
+    fn encode_attention_decode_dims(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &BufferRef,
+        scores_buf: &BufferRef,
+        out_buf: &BufferRef,
+        window_start: usize,
+        len_bound: usize,
+        sdpa_dims: U32x4Param<'_>,
+        two_pass_dims: U32x4Param<'_>,
+    ) -> Result<()> {
         // Bascule 2-passes split-K pour les longs KV (dédup GQA + tuiles L1) :
         // head_dim 128/256, GQA réel (>1 q/kv), len ≥ seuil. Cf. encode_attention_decode_2pass.
         let gqa = self.q_heads / self.kv_heads.max(1);
@@ -763,20 +907,16 @@ impl FullAttentionMetalState {
             && matches!(self.head_dim, 128 | 256)
             && gqa > 1
             && self.q_heads % self.kv_heads == 0
-            && self.len >= sdpa_2pass_min_len()
+            && len_bound >= sdpa_2pass_min_len()
         {
-            return self.encode_attention_decode_2pass(encoder, q_buf, out_buf);
+            return self.encode_attention_decode_2pass(
+                encoder,
+                q_buf,
+                out_buf,
+                len_bound,
+                two_pass_dims,
+            );
         }
-        let dims: [u32; 4] = [
-            u32::try_from(self.q_heads)
-                .map_err(|_| InferError::Dimension("q_heads hors u32".to_string()))?,
-            u32::try_from(self.kv_heads)
-                .map_err(|_| InferError::Dimension("kv_heads hors u32".to_string()))?,
-            u32::try_from(self.head_dim)
-                .map_err(|_| InferError::Dimension("head_dim hors u32".to_string()))?,
-            u32::try_from(self.len)
-                .map_err(|_| InferError::Dimension("len hors u32".to_string()))?,
-        ];
         // Le chemin fenêtré privilégie d'abord la correction : le kernel naïf
         // exclut réellement les lignes antérieures. Les variantes flash/2-pass
         // historiques restent strictement inchangées pour `window_start == 0`.
@@ -803,19 +943,11 @@ impl FullAttentionMetalState {
         encoder.set_buffer(2, Some(self.values.buffer()), 0);
         if use_flash {
             encoder.set_buffer(3, Some(out_buf), 0);
-            encoder.set_bytes(
-                4,
-                std::mem::size_of::<[u32; 4]>() as u64,
-                dims.as_ptr().cast::<c_void>(),
-            );
+            sdpa_dims.bind(encoder, 4);
         } else {
             encoder.set_buffer(3, Some(scores_buf), 0);
             encoder.set_buffer(4, Some(out_buf), 0);
-            encoder.set_bytes(
-                5,
-                std::mem::size_of::<[u32; 4]>() as u64,
-                dims.as_ptr().cast::<c_void>(),
-            );
+            sdpa_dims.bind(encoder, 5);
             let window_start = u32::try_from(window_start)
                 .map_err(|_| InferError::Dimension("window_start hors u32".to_string()))?;
             encoder.set_bytes(
@@ -827,7 +959,7 @@ impl FullAttentionMetalState {
         crate::metal_backend::profile_dispatch();
         let threads = if use_flash { 1024 } else { 256 };
         encoder.dispatch_thread_groups(
-            MTLSize::new(u64::from(dims[0]), 1, 1),
+            MTLSize::new(u64::from(to_u32(self.q_heads, "q_heads")?), 1, 1),
             MTLSize::new(threads, 1, 1),
         );
         crate::metal_backend::post_dispatch_barrier(encoder);
@@ -848,8 +980,13 @@ impl FullAttentionMetalState {
         encoder: &ComputeCommandEncoderRef,
         q_buf: &BufferRef,
         out_buf: &BufferRef,
+        len_bound: usize,
+        dims: U32x4Param<'_>,
     ) -> Result<()> {
-        let blocks = sdpa_2pass_blocks(self.len);
+        // Grille dimensionnée par la borne : en position GPU, les blocs au-delà de
+        // la longueur effective restent vides (max=-inf, somme 0) et la passe 2
+        // les neutralise (facteur exp(-inf)=0), comme les simdgroups vides du flash.
+        let blocks = sdpa_2pass_blocks(len_bound);
         let gqa = self.q_heads / self.kv_heads;
         let reduce_cells = self
             .q_heads
@@ -862,16 +999,8 @@ impl FullAttentionMetalState {
         let sums = self.scratch.lease(reduce_cells, GpuElement::F32)?;
         let maxs = self.scratch.lease(reduce_cells, GpuElement::F32)?;
 
-        let dims: [u32; 4] = [
-            u32::try_from(self.q_heads)
-                .map_err(|_| InferError::Dimension("2pass q_heads hors u32".to_string()))?,
-            u32::try_from(self.kv_heads)
-                .map_err(|_| InferError::Dimension("2pass kv_heads hors u32".to_string()))?,
-            u32::try_from(self.len)
-                .map_err(|_| InferError::Dimension("2pass len hors u32".to_string()))?,
-            u32::try_from(blocks)
-                .map_err(|_| InferError::Dimension("2pass blocks hors u32".to_string()))?,
-        ];
+        let kv_heads = to_u32(self.kv_heads, "2pass kv_heads")?;
+        let blocks_u32 = to_u32(blocks, "2pass blocks")?;
         // Passe 1 : partiels par (kv_head, bloc).
         let pass1 = match (self.keys.element(), self.head_dim) {
             (GpuElement::F32, 256) => &self.attention_2pass_1,
@@ -896,20 +1025,15 @@ impl FullAttentionMetalState {
         encoder.set_buffer(3, Some(partials.tensor().buffer()), 0);
         encoder.set_buffer(4, Some(sums.tensor().buffer()), 0);
         encoder.set_buffer(5, Some(maxs.tensor().buffer()), 0);
-        encoder.set_bytes(
-            6,
-            std::mem::size_of::<[u32; 4]>() as u64,
-            dims.as_ptr().cast::<c_void>(),
-        );
+        dims.bind(encoder, 6);
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
-            MTLSize::new(u64::from(dims[1]), u64::from(dims[3]), 1),
+            MTLSize::new(u64::from(kv_heads), u64::from(blocks_u32), 1),
             MTLSize::new(32, u64::try_from(gqa).unwrap_or(1), 1),
         );
         crate::metal_backend::post_dispatch_barrier(encoder);
 
         // Passe 2 : réduction des blocs par q_head.
-        let blocks_u32 = dims[3];
         let pass2 = match self.head_dim {
             256 => &self.attention_2pass_2,
             128 => &self.attention_2pass_2_d128,
@@ -931,7 +1055,7 @@ impl FullAttentionMetalState {
         );
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
-            MTLSize::new(u64::from(dims[0]), 1, 1),
+            MTLSize::new(u64::from(to_u32(self.q_heads, "2pass q_heads")?), 1, 1),
             MTLSize::new(32, 32, 1),
         );
         crate::metal_backend::post_dispatch_barrier(encoder);
@@ -991,6 +1115,67 @@ impl FullAttentionMetalState {
             kv_dim,
         )?;
         self.len += 1;
+        Ok(())
+    }
+
+    /// Append K/V à la position GPU `min(ctrl[slot], max_position) + row`, sans
+    /// lire ni modifier `len` hôte (resync par l'appelant après le bloc).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le KV n'est pas f32 ou si `max_position + row`
+    /// dépasse la capacité (vérifié avant dispatch).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: buffers K/V + offsets + position GPU + ligne"
+    )]
+    pub(crate) fn encode_append_kv_gpu_position(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        k_buf: &BufferRef,
+        k_offset: u64,
+        v_buf: &BufferRef,
+        v_offset: u64,
+        rows: &GpuPositionRows<'_>,
+        row: usize,
+    ) -> Result<()> {
+        let position = rows.position();
+        let pipeline = rows.copy_at_position();
+        check_gpu_position_rows(
+            self.capacity,
+            self.kv_dim(),
+            self.keys.element(),
+            0,
+            position.max_position,
+            row + 1,
+        )?;
+        let p = [
+            to_u32(self.kv_dim(), "append position kv_dim")?,
+            to_u32(position.slot, "append position slot")?,
+            to_u32(row, "append position row")?,
+            to_u32(position.max_position, "append position max")?,
+        ];
+        for (input, offset, output) in [
+            (k_buf, k_offset, self.keys.buffer()),
+            (v_buf, v_offset, self.values.buffer()),
+        ] {
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(input), offset);
+            encoder.set_buffer(1, Some(output), 0);
+            encoder.set_bytes(
+                2,
+                std::mem::size_of::<[u32; 4]>() as u64,
+                p.as_ptr().cast::<c_void>(),
+            );
+            encoder.set_buffer(3, Some(position.ctrl), 0);
+            let width = pipeline.thread_execution_width().max(1);
+            crate::metal_backend::profile_dispatch();
+            encoder.dispatch_threads(
+                MTLSize::new(u64::from(p[0]), 1, 1),
+                MTLSize::new(width, 1, 1),
+            );
+            crate::metal_backend::post_dispatch_barrier(encoder);
+        }
         Ok(())
     }
 

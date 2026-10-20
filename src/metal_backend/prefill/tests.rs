@@ -816,6 +816,25 @@ fn prefill_resident_uses_layer_specific_attention_dimensions() -> Result<()> {
         &sequential_output,
         "prefill multi-layout final output",
     );
+    // Captures : la sortie de la couche 0 est l'entrée de la couche 1 (= sortie
+    // du run à une couche), celle de la couche 1 est la sortie finale.
+    let (_, _, captures) =
+        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, base, &[0, 1])?;
+    let captures = captures.ok_or_else(|| InferError::Config("captures absentes".to_string()))?;
+    assert_eq!(captures.shape(), &[SEQ, 2 * HIDDEN]);
+    for row in 0..SEQ {
+        let line = captures.row_slice(row)?;
+        assert_eq!(
+            &line[..HIDDEN],
+            first_output.row_slice(row)?,
+            "capture couche 0 ligne {row}"
+        );
+        assert_eq!(
+            &line[HIDDEN..],
+            resident_output.row_slice(row)?,
+            "capture couche 1 ligne {row}"
+        );
+    }
     match caches.as_slice() {
         [PrefillResidentLayerCache::Full {
             key: first,

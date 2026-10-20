@@ -111,9 +111,10 @@ fn run() -> CliResult<()> {
         if let Some(draft_dir) =
             saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")
         {
-            let draft = saragossa::devtools::load_dflash_draft_weights_for_target(
+            let draft = saragossa::devtools::load_dflash_draft_weights_quantized(
                 &assets.config,
                 PathBuf::from(draft_dir),
+                saragossa::devtools::DFlashQuant::from_env()?,
             )?;
             saragossa::devtools::print_dflash_draft(&draft);
         }
@@ -134,6 +135,15 @@ fn run() -> CliResult<()> {
         {
             decoder = decoder.with_mtp_draft_lm_head_sidecar(PathBuf::from(path))?;
         }
+    }
+    // Les harnais d'acceptance et pairwise chargent le drafter eux-mêmes et
+    // comparent la tête MTP nue : ne pas la détourner vers DFlash.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if mtp_active
+        && !saragossa::devtools::mtp_acceptance_enabled()
+        && !saragossa::devtools::dflash_acceptance_enabled()
+    {
+        decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
     }
     let load_elapsed = load_started.elapsed();
     if args.load_only {
@@ -290,9 +300,10 @@ fn run() -> CliResult<()> {
                     "SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 requiert SARAGOSSA_RUST_DFLASH_DRAFT_DIR",
                 )
             })?;
-        let draft = saragossa::devtools::load_dflash_draft_weights_for_target(
+        let draft = saragossa::devtools::load_dflash_draft_weights_quantized(
             &assets.config,
             PathBuf::from(draft_dir),
+            saragossa::devtools::DFlashQuant::from_env()?,
         )?;
         let options = generation_options(&args, &assets, 1.0);
         return Ok(saragossa::devtools::run_dflash_acceptance(
@@ -483,11 +494,11 @@ fn prefill_profile_enabled() -> bool {
     saragossa::runtime_flags::env_flag("SARAGOSSA_RUST_DECODE_PROFILE", false)
 }
 
-/// Renvoie la profondeur de draft du decode MTP automatique (défaut 1).
+/// Renvoie la profondeur de draft du decode MTP automatique (défaut 2, plafond
+/// de la profondeur adaptative).
 ///
 /// Lue depuis `SARAGOSSA_RUST_MTP_MAX_DRAFT` ; une valeur absente, invalide ou nulle
-/// retombe sur 1 (un seul token draft vérifié par cycle), car le decode MTP
-/// exige au moins un draft.
+/// retombe sur le défaut, car le decode MTP exige au moins un draft.
 fn mtp_decode_max_draft() -> usize {
     serve::mtp::max_draft_tokens()
 }

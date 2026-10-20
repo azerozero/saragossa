@@ -54,10 +54,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 mod arena;
 mod attention;
 mod dense_tail;
+#[cfg(feature = "devtools")]
+pub(crate) mod dflash;
 mod duo;
+mod gpu_position;
 mod kernels;
 mod layers;
 mod moe_tail;
+mod rows;
 mod types;
 mod utils;
 
@@ -68,10 +72,11 @@ pub(crate) use self::arena::{
     install_pipeline_scratch_slot, GpuElement, GpuTensor, ScratchLease, ScratchPool,
 };
 pub(crate) use self::attention::FullAttentionMetalState;
+pub(crate) use self::gpu_position::{check_gpu_position_rows, GpuPosition};
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
-    LinearAttnDenseLayerWeights, LinearAttnLayerWeights,
+    LinearAttnDenseLayerWeights, LinearAttnLayerWeights, MtpD2Segments,
 };
 
 /// État résident d'UN decode (réserves C/D).
@@ -105,6 +110,10 @@ pub(crate) struct DecodeResidentState {
     rope_decode_kernel: ComputePipelineState,
     copy_at_kernel: ComputePipelineState,
     copy_at_f32_to_bf16_kernel: ComputePipelineState,
+    /// Kernels position GPU (bloc MTP), compilés au premier usage seulement.
+    gpu_position_kernels: OnceLock<gpu_position::GpuPositionKernels>,
+    /// Kernels du chemin full-attn en lignes fusionné, compilés au premier usage.
+    rows_kernels: OnceLock<rows::RowsKernels>,
     /// Instrumentation per-section (tranche 3), active si `SARAGOSSA_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,
     /// Slot de flux (light-batch) : namespace du scratch label-keyed de

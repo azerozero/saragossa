@@ -45,11 +45,14 @@ pub(super) fn routes_request(
 }
 
 /// Renvoie la profondeur draft MTP, avec un minimum strict de un.
+///
+/// Défaut 2 depuis le 2026-10-15 : plafond de la profondeur adaptative (PW04,
+/// campagne pairwise). `SARAGOSSA_RUST_MTP_MAX_DRAFT=1` rétablit le D1.
 pub(crate) fn max_draft_tokens() -> usize {
     saragossa::runtime_flags::env_var(MTP_MAX_DRAFT_ENV)
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(1)
+        .unwrap_or(2)
 }
 
 /// Convertit les métriques spéculatives vers le contrat de métriques serveur.

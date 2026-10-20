@@ -4,6 +4,30 @@ use super::*;
 
 const LINEAR_ATTN_TG_WIDTH: u64 = 32;
 
+/// Disposition des entrées du kernel conv/normes/gates batché : foulée (en
+/// éléments) des lignes qkv et des lignes beta/gate, offsets en octets des
+/// colonnes beta et gate. Contiguë en prefill ; en vérification MTP les lignes
+/// sont les sorties concaténées qkv+z et beta+gate.
+#[derive(Clone, Copy)]
+pub(crate) struct LinearAttnBatchLayout {
+    pub qkv_stride: usize,
+    pub beta_offset: u64,
+    pub gate_offset: u64,
+    pub gate_stride: usize,
+}
+
+impl LinearAttnBatchLayout {
+    pub(crate) fn contiguous(spec: LinearAttentionStepSpec) -> Self {
+        Self {
+            qkv_stride: 2 * spec.num_key_heads * spec.key_head_dim
+                + spec.num_value_heads * spec.value_head_dim,
+            beta_offset: 0,
+            gate_offset: 0,
+            gate_stride: spec.num_value_heads,
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "wrappers d'encodage Metal: buffers, dimensions et offsets restent explicites"
@@ -228,6 +252,9 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Captures d'état SSM par pas que le kernel `seq_capture` peut écrire (8 slots).
+    pub(super) const LINEAR_ATTN_SEQ_MAX_CAPTURES: usize = 8;
+
     #[expect(
         clippy::too_many_arguments,
         reason = "signature d'encodage Metal: scan sequence + buffers explicites"
@@ -287,6 +314,95 @@ impl MetalExecutor {
             &[checked_u32(steps, "linear-attn seq steps")?],
             "linear_attn_seq_delta_steps",
         )?;
+        profile_dispatch();
+        let value_head_dim = checked_nsuint(spec.value_head_dim, "linear-attn seq value dim")?;
+        let tg_rows = linear_delta_tg_rows().min(value_head_dim);
+        encoder.dispatch_threads(
+            MTLSize::new(
+                LINEAR_ATTN_TG_WIDTH,
+                value_head_dim,
+                checked_nsuint(spec.num_value_heads, "linear-attn seq value heads")?,
+            ),
+            MTLSize::new(LINEAR_ATTN_TG_WIDTH, tg_rows, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Delta par séquence sur `steps` lignes (f32, dk128) avec capture de l'état SSM
+    /// après chaque ligne `t < captures.len()` (au plus 8), en un dispatch : remplace
+    /// `steps` dispatches `delta_row` et `captures.len()` copies d'état.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "buffers d'un pas linear-attn + captures : interface des encodeurs delta"
+    )]
+    pub(super) fn encode_linear_attn_gated_delta_seq_captures_dk128(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        conv_out_buffer: &BufferRef,
+        q_norm_buffer: &BufferRef,
+        k_norm_buffer: &BufferRef,
+        beta_buffer: &BufferRef,
+        decay_buffer: &BufferRef,
+        ssm_state_buffer: &BufferRef,
+        y_buffer: &BufferRef,
+        steps: usize,
+        captures: &[&BufferRef],
+        spec: LinearAttentionStepSpec,
+    ) -> Result<()> {
+        if steps == 0
+            || captures.len() > Self::LINEAR_ATTN_SEQ_MAX_CAPTURES
+            || captures.len() >= steps
+        {
+            return Err(InferError::Dimension(format!(
+                "linear-attn seq captures : {} captures pour {steps} pas (max {})",
+                captures.len(),
+                Self::LINEAR_ATTN_SEQ_MAX_CAPTURES
+            )));
+        }
+        if spec.key_head_dim != 128 {
+            return Err(InferError::Dimension(format!(
+                "linear-attn seq attend key_head_dim=128, reçu {}",
+                spec.key_head_dim
+            )));
+        }
+        let repeat = spec
+            .num_value_heads
+            .checked_div(spec.num_key_heads)
+            .ok_or_else(|| InferError::Metal("linear-attn seq repeat nul".to_string()))?;
+        let dims = [
+            checked_u32(spec.num_value_heads, "linear-attn seq value heads")?,
+            checked_u32(spec.value_head_dim, "linear-attn seq value dim")?,
+            checked_u32(spec.key_head_dim, "linear-attn seq key dim")?,
+            checked_u32(repeat, "linear-attn seq repeat")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.linear_attn_gated_delta_seq_capture_dk128_tg4_f32);
+        encoder.set_buffer(0, Some(conv_out_buffer), 0);
+        encoder.set_buffer(1, Some(q_norm_buffer), 0);
+        encoder.set_buffer(2, Some(k_norm_buffer), 0);
+        encoder.set_buffer(3, Some(beta_buffer), 0);
+        encoder.set_buffer(4, Some(decay_buffer), 0);
+        encoder.set_buffer(5, Some(ssm_state_buffer), 0);
+        encoder.set_buffer(6, Some(y_buffer), 0);
+        set_u32_bytes(encoder, 7, &dims, "linear_attn_seq_delta_dims")?;
+        set_u32_bytes(
+            encoder,
+            8,
+            &[checked_u32(steps, "linear-attn seq steps")?],
+            "linear_attn_seq_delta_steps",
+        )?;
+        set_u32_bytes(
+            encoder,
+            9,
+            &[checked_u32(captures.len(), "linear-attn seq captures")?],
+            "linear_attn_seq_delta_captures",
+        )?;
+        // Les emplacements non utilisés pointent sur la première capture (jamais lus
+        // au-delà de `capture_count`) : tous les buffers du kernel restent liés.
+        for slot in 0..Self::LINEAR_ATTN_SEQ_MAX_CAPTURES {
+            let buffer = captures.get(slot).or(captures.first()).copied();
+            encoder.set_buffer(10 + slot as u64, buffer.or(Some(ssm_state_buffer)), 0);
+        }
         profile_dispatch();
         let value_head_dim = checked_nsuint(spec.value_head_dim, "linear-attn seq value dim")?;
         let tg_rows = linear_delta_tg_rows().min(value_head_dim);
@@ -495,6 +611,8 @@ impl MetalExecutor {
         encoder.set_buffer(11, Some(decay_buffer), decay_offset);
         set_u32_bytes(encoder, 12, &dims, "linear_attn_fused_conv_norm_dims")?;
         set_f32_bytes(encoder, 13, &scales, "linear_attn_fused_conv_norm_scales")?;
+        #[cfg(feature = "devtools")]
+        crate::runtime_flags::pairwise::mark(crate::runtime_flags::pairwise::Hit::P3);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
@@ -533,6 +651,8 @@ impl MetalExecutor {
         decay_buffer: &BufferRef,
         batch: usize,
         spec: LinearAttentionStepSpec,
+        layout: LinearAttnBatchLayout,
+        finalize_state: bool,
     ) -> Result<()> {
         let dims = [
             checked_u32(spec.num_key_heads, "linear-attn batch key heads")?,
@@ -553,8 +673,8 @@ impl MetalExecutor {
         let batch_u32 = checked_u32(batch, "linear-attn batch")?;
         encoder.set_compute_pipeline_state(&self.linear_attn_conv_norm_gates_k4_dk128_batch_f32);
         encoder.set_buffer(0, Some(qkv_buffer), 0);
-        encoder.set_buffer(1, Some(beta_input_buffer), 0);
-        encoder.set_buffer(2, Some(gate_input_buffer), 0);
+        encoder.set_buffer(1, Some(beta_input_buffer), layout.beta_offset);
+        encoder.set_buffer(2, Some(gate_input_buffer), layout.gate_offset);
         encoder.set_buffer(3, Some(conv_weight_buffer), 0);
         encoder.set_buffer(4, Some(conv_state_buffer), 0);
         encoder.set_buffer(5, Some(a_log_buffer), 0);
@@ -572,6 +692,11 @@ impl MetalExecutor {
             &[batch_u32],
             "linear_attn_batch_conv_norm_batch",
         )?;
+        let strides = [
+            checked_u32(layout.qkv_stride, "linear-attn batch qkv stride")?,
+            checked_u32(layout.gate_stride, "linear-attn batch gate stride")?,
+        ];
+        set_u32_bytes(encoder, 15, &strides, "linear_attn_batch_conv_norm_strides")?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
@@ -581,20 +706,56 @@ impl MetalExecutor {
             ),
             MTLSize::new(LINEAR_ATTN_TG_WIDTH, 1, 1),
         );
-        // Barrière : la conv a lu conv_state initial ; finalize le met aux 3 derniers tokens.
-        memory_barrier_buffers(encoder);
-        let fin_dims = [
-            checked_u32(conv_dim, "linear-attn finalize conv_dim")?,
-            batch_u32,
+        // La conv a lu l'état initial ; le glissement le met aux 3 derniers tokens.
+        // La vérification MTP le diffère : ses captures lisent encore l'état initial.
+        if finalize_state {
+            memory_barrier_buffers(encoder);
+            self.encode_linear_attn_conv_state_shift(
+                encoder,
+                qkv_buffer,
+                layout.qkv_stride,
+                conv_state_buffer,
+                conv_state_buffer,
+                conv_dim,
+                batch,
+            )?;
+        }
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Fenêtre conv après `batch` lignes de `qkv` : dans `state_out` (en place si
+    /// c'est `state_in`, sinon une capture, l'état d'entrée restant intact).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "signature d'encodage Metal: buffers + dimensions"
+    )]
+    pub(super) fn encode_linear_attn_conv_state_shift(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        qkv_buffer: &BufferRef,
+        qkv_stride: usize,
+        state_in: &BufferRef,
+        state_out: &BufferRef,
+        conv_dim: usize,
+        batch: usize,
+    ) -> Result<()> {
+        let in_place = std::ptr::eq(state_in.as_ptr(), state_out.as_ptr());
+        let dims = [
+            checked_u32(conv_dim, "linear-attn shift conv_dim")?,
+            checked_u32(batch, "linear-attn shift batch")?,
+            checked_u32(qkv_stride, "linear-attn shift qkv stride")?,
+            u32::from(in_place),
         ];
-        encoder.set_compute_pipeline_state(&self.linear_attn_conv_state_finalize_f32);
+        encoder.set_compute_pipeline_state(&self.linear_attn_conv_state_shift_f32);
         encoder.set_buffer(0, Some(qkv_buffer), 0);
-        encoder.set_buffer(1, Some(conv_state_buffer), 0);
-        set_u32_bytes(encoder, 2, &fin_dims, "linear_attn_finalize_dims")?;
+        encoder.set_buffer(1, Some(state_in), 0);
+        encoder.set_buffer(2, Some(state_out), 0);
+        set_u32_bytes(encoder, 3, &dims, "linear_attn_shift_dims")?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
-                checked_nsuint(conv_dim.div_ceil(64), "lin finalize groups")?,
+                checked_nsuint(conv_dim.div_ceil(64), "linear-attn shift groups")?,
                 1,
                 1,
             ),
@@ -667,6 +828,51 @@ impl MetalExecutor {
         y_buffer: &BufferRef,
         spec: LinearAttentionStepSpec,
     ) -> Result<()> {
+        self.encode_linear_attn_gated_delta_row(
+            encoder,
+            conv_out_buffer,
+            q_norm_buffer,
+            k_norm_buffer,
+            beta_buffer,
+            decay_buffer,
+            ssm_state_buffer,
+            ssm_bf16,
+            y_buffer,
+            spec,
+            0,
+        )
+    }
+
+    /// Un pas de delta sur la ligne `row` de buffers à plusieurs lignes
+    /// (foulées conv_dim, key_dim, value_heads, value_dim).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "signature d'encodage Metal: buffers + dimensions"
+    )]
+    pub(super) fn encode_linear_attn_gated_delta_row(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        conv_out_buffer: &BufferRef,
+        q_norm_buffer: &BufferRef,
+        k_norm_buffer: &BufferRef,
+        beta_buffer: &BufferRef,
+        decay_buffer: &BufferRef,
+        ssm_state_buffer: &BufferRef,
+        ssm_bf16: bool,
+        y_buffer: &BufferRef,
+        spec: LinearAttentionStepSpec,
+        row: usize,
+    ) -> Result<()> {
+        let key_dim = checked_len(spec.num_key_heads, spec.key_head_dim, "delta row key_dim")?;
+        let value_dim = checked_len(
+            spec.num_value_heads,
+            spec.value_head_dim,
+            "delta row value_dim",
+        )?;
+        let conv_offset = byte_offset_f32(row * (2 * key_dim + value_dim), "delta row conv")?;
+        let qk_offset = byte_offset_f32(row * key_dim, "delta row q/k")?;
+        let head_offset = byte_offset_f32(row * spec.num_value_heads, "delta row beta/decay")?;
+        let y_offset = byte_offset_f32(row * value_dim, "delta row y")?;
         let repeat = spec
             .num_value_heads
             .checked_div(spec.num_key_heads)
@@ -693,13 +899,13 @@ impl MetalExecutor {
             &self.linear_attn_gated_delta_f32
         };
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(conv_out_buffer), 0);
-        encoder.set_buffer(1, Some(q_norm_buffer), 0);
-        encoder.set_buffer(2, Some(k_norm_buffer), 0);
-        encoder.set_buffer(3, Some(beta_buffer), 0);
-        encoder.set_buffer(4, Some(decay_buffer), 0);
+        encoder.set_buffer(0, Some(conv_out_buffer), conv_offset);
+        encoder.set_buffer(1, Some(q_norm_buffer), qk_offset);
+        encoder.set_buffer(2, Some(k_norm_buffer), qk_offset);
+        encoder.set_buffer(3, Some(beta_buffer), head_offset);
+        encoder.set_buffer(4, Some(decay_buffer), head_offset);
         encoder.set_buffer(5, Some(ssm_state_buffer), 0);
-        encoder.set_buffer(6, Some(y_buffer), 0);
+        encoder.set_buffer(6, Some(y_buffer), y_offset);
         set_u32_bytes(encoder, 7, &dims, "linear_attn_delta_dims")?;
         profile_dispatch();
         if use_dk128 {
@@ -878,6 +1084,8 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         y_buffer: &BufferRef,
         z_buffer: &BufferRef,
+        z_offset: u64,
+        z_stride: usize,
         norm_weight_buffer: &BufferRef,
         gated_buffer: &BufferRef,
         batch: usize,
@@ -890,11 +1098,17 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(&self.linear_attn_rms_gate_batch_dv128_f32);
         encoder.set_buffer(0, Some(y_buffer), 0);
-        encoder.set_buffer(1, Some(z_buffer), 0);
+        encoder.set_buffer(1, Some(z_buffer), z_offset);
         encoder.set_buffer(2, Some(norm_weight_buffer), 0);
         encoder.set_buffer(3, Some(gated_buffer), 0);
         set_u32_bytes(encoder, 4, &dims, "linear_attn_rms_batch_dims")?;
         set_f32_bytes(encoder, 5, &[spec.rms_eps], "linear_attn_rms_eps")?;
+        set_u32_bytes(
+            encoder,
+            6,
+            &[checked_u32(z_stride, "linear-attn rms z stride")?],
+            "linear_attn_rms_z_stride",
+        )?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(

@@ -369,6 +369,19 @@ impl ModelSlot {
                     mtp::max_draft_tokens()
                 );
             }
+            // Le drafter n'est joignable que par le chemin MTP : inutile sans lui.
+            #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+            if mtp_active {
+                decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
+                if let Some(draft) = decoder.dflash_draft() {
+                    eprintln!(
+                        "saragossa serve drafter DFlash actif model={} block_size={} quant_bits={:?}",
+                        self.id,
+                        draft.info.block_size,
+                        draft.quant.map(|quant| quant.bits)
+                    );
+                }
+            }
             warmup::decoder(&mut decoder, &assets, self.backend, &self.id)?;
             if mtp_active {
                 warmup::mtp_decoder(&decoder, &assets, self.backend, &self.id)?;
