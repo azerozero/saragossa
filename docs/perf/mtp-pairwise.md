@@ -437,6 +437,57 @@ Oracle modèle réel toujours vert (résident == CPU == AR, 26/30, dense et u4) 
 test synthétique `prefill_resident_uses_layer_specific_attention_dimensions` :
 captures byte-identiques à la sortie de chaque couche.
 
+### Phase 7 : drafter résident contre le défaut MTP, pairwise (nuit du 19 au 20 octobre)
+
+Question : à mode égal (greedy, committed, résident), le drafter DFlash 2 u4
+(`mode: dflash`, PW23, 8 drafts par tour, skinny bf16) paie-t-il contre le défaut
+de production par entrée, à 64 tokens comme les phases 5-6 et en génération
+longue (500 tokens ; 350 sur T6 dont l'AR s'arrête sur EOS avant 400) ?
+Harnais V5 (`Mode::Dflash`, commit `70cc013`, action bench seulement), contrôle
+`row:ID` : PW04 (`adaptive_fresh`) sur T0/T1, PW03 (`adaptive`) sur T6/T2.
+Huit cellules, 48 paires d'un lot alterné chacune, A/A PW04 contre PW04 sur T0
+(12 paires). H0 médiane du gain ≤ +2 %, test des signes exact, Holm8 à 0,025.
+Byte-identité avec l'oracle AR exigée et obtenue sur les 396 paires. Gel sur
+HEAD `70cc013`, binaire archivé, poids du modèle et du drafter épinglés.
+Machine sous contention toute la nuit (VM à 600 % CPU sur les 396 attentes de
+machine calme) : mesure appariée et alternée, valide pour le signe, bruitée
+pour l'amplitude. A/A : −0,17 %, IC [−2,1, +1,8].
+
+| Entrée | Budget | Contrôle | Médianes contrôle / PW23 tok/s | Gain médian | IC simultané | p Holm | Acceptés/proposés | Tokens par tour DFlash / MTP |
+|---|---:|---|---|---:|---|---|---|---|
+| T0 (26, prose) | 64 | PW04 | 51,96 / 45,38 | −12,8 % | [−13,1, −12,4] | 1 | 44/62 (71 %) | 3,4 / 2,3 |
+| T1 (33, code) | 64 | PW04 | 58,80 / 76,85 | +30,7 % | [+29,9, +32,0] | 3e-14 | 53/60 (88 %) | 5,8 / 2,8 |
+| T6 (424, code) | 64 | PW03 | 63,14 / 113,60 | +81,3 % | [+78,3, +82,7] | 3e-14 | 56/56 (100 %) | 9,1 / 3,0 |
+| T2 (732, prose) | 64 | PW03 | 48,75 / 35,58 | −27,0 % | [−28,8, −24,8] | 1 | 42/63 (67 %) | 2,9 / 2,2 |
+| T0 (26, prose) | 500 | PW04 | 48,39 / 59,08 | +22,3 % | [+21,6, +22,8] | 3e-14 | 394/476 (83 %) | 4,7 / 2,2 |
+| T1 (33, code) | 500 | PW04 | 51,24 / 74,77 | +46,6 % | [+45,1, +47,9] | 3e-14 | 416/469 (89 %) | 6,0 / 2,4 |
+| T6 (424, code) | 350 | PW03 | 59,00 / 110,82 | +88,1 % | [+84,8, +90,3] | 3e-14 | 311/311 (100 %) | 9,0 / 3,0 |
+| T2 (732, prose) | 500 | PW03 | 47,78 / 50,33 | +7,0 % | [+3,3, +9,0] | 2e-5 | 380/485 (78 %) | 4,2 / 2,3 |
+
+Tokens par tour = budget divisé par le nombre de forwards du tronc
+(`by_position[0]` des stats ; `verifications` compte une position de draft
+examinée, pas un forward). Un tour DFlash coûte ~75-80 ms (vérification à
+9 lignes et drafter), un tour MTP ~45 ms : le drafter gagne dès qu'il commet
+plus de ~1,7 fois plus de tokens par tour que la tête MTP.
+
+Lecture :
+
+- Sur le code, gain massif et stable à toute longueur (+31 à +88 %) : 100 %
+  d'acceptation sur l'édition de fichier T6, 88 % sur T1.
+- Sur la prose, perte aux 64 premiers tokens (−13 % T0, −27 % T2) puis gain en
+  génération longue (+22 % T0, +7 % T2 à 500). Ce n'est pas un coût fixe :
+  aucun surcoût sur T1/T6 entre 64 et 500. C'est l'acceptation du début de
+  réponse (phrases d'introduction : 2,9-3,4 tokens par tour) qui ne couvre pas
+  le tour plus cher, alors que le corps de la réponse monte à 4,2-4,7.
+- Le signe dépend donc de la longueur générée, inconnue a priori (EOS), pas
+  seulement de l'entrée. Décision automatique du statut : gain sur le code et
+  perte sur la prose courte, le drafter reste opt-in, défaut greedy inchangé.
+  La bascule intégrée mesurée le 19 octobre (bornée à +5-7 %) reste la seule
+  issue pour couvrir le début de réponse en prose.
+
+Bruts : `models/pairwise/dflash/` (hors dépôt) : `results-live.json`,
+`results.json`, `status.md`, manifeste et journal.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.
