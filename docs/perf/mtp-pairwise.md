@@ -498,8 +498,14 @@ stop sequences gardent la tête MTP, et les harnais d'acceptance et pairwise
 ne sont pas détournés. Sans la variable, rien ne change. Le prefill DFlash
 passe par le cache de préfixe comme MTP : l'entrée porte en plus les captures
 des couches cibles sur les 2048 dernières positions (fenêtre du drafter), un
-hit est prolongé per-op sur le suffixe avec ses captures, même règle du tiers
-qu'en MTP au-delà de laquelle le prefill résident complet repart de zéro.
+hit est prolongé per-op sur le suffixe avec ses captures. Le seuil partagé
+avec MTP au-delà duquel le prefill résident complet repart de zéro passe d'un
+tiers à un huitième du prompt (mesure du 20 octobre : 31 ms par token en
+extension per-op contre 3,6 ms en prefill résident). Serve multi-tour, tour 2 :
+T2 (732 + 86 tokens) 2,7 s contre 3,1 s sans cache ; T7 (8297 + 54) 6,9 s
+contre 49 s. Réserve : sur T7 le decode DFlash tombe à 13 tok/s contre 27 en
+MTP sur les 32 premiers tokens (vérification à 9 lignes sur 8k de contexte,
+début de réponse structuré), cas hors phase 7 qui confirme l'opt-in.
 
 ## Limites
 
