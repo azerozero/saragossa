@@ -81,8 +81,7 @@ fn prefill_attn_batch_gqa8_d256_supported(spec: PrefillAttentionSpec) -> bool {
 
 pub(super) fn prefill_attn_steel_d256_supported(spec: PrefillAttentionSpec) -> bool {
     spec.seq > 256
-        && spec.q_heads == 16
-        && spec.kv_heads == 2
+        && matches!((spec.q_heads, spec.kv_heads), (16, 2) | (24, 4))
         && spec.head_dim == STEEL_CAUSAL_ATTN_D256_BD
 }
 

@@ -738,11 +738,15 @@ pub(crate) fn prefill_attn_batch_mid_30b_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_BATCH_MID_30B", true))
 }
 
-/// Active la variante Steel causale d256 du prefill 35B.
+/// Active la variante Steel causale d256 du prefill 35B (16/2 têtes) et 27B
+/// (24/4 têtes, depuis le 2026-10-21).
 ///
 /// Défaut ON : cette voie reprend le kernel Steel tuilé (Q/K/V en blocs,
 /// softmax online par tuile KV, causalité par tuile diagonale) pour remplacer le
-/// repli GQA8x4 quand la spécialisation d256 compile sur le GPU courant.
+/// repli GQA8x4 quand la spécialisation d256 compile sur le GPU courant. Sur le
+/// 27B elle remplace le `mid` per-query (257..=2048) et le `batch_long_d256` :
+/// attention causale 491 → 20 ms à 732 tokens, 9,2 → 1,6 s à 8,3k (M5 Max),
+/// prefill −16 % et −25 %, suites greedy identiques (oracle CPU à 2e-3).
 /// Kill-switch dédié : `SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256=0`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_attn_steel_d256_enabled() -> bool {
