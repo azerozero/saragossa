@@ -26,11 +26,14 @@ fn supports_model(
         && !config.is_moe()
 }
 
-/// Le MTP actuel ne vérifie que le greedy non contraint.
+/// Le MTP vérifie le greedy non contraint ; l'échantillonnage (accept/reject
+/// lossless) est opt-in via `SARAGOSSA_RUST_MTP_SAMPLED=1`.
 pub(crate) fn supports_options(options: &saragossa::GenerationOptions) -> bool {
-    options.temperature.abs() <= f32::EPSILON
-        && options.token_constraint.is_none()
-        && options.stop_sequences.is_empty()
+    let temperature_ok = options.temperature.abs() <= f32::EPSILON
+        || (saragossa::runtime_flags::mtp_sampled_enabled()
+            && options.temperature.is_finite()
+            && options.temperature > 0.0);
+    temperature_ok && options.token_constraint.is_none() && options.stop_sequences.is_empty()
 }
 
 /// Indique si une requête doit emprunter le chemin MTP.
