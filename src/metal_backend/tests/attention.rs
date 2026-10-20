@@ -715,8 +715,12 @@ fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
             ..base
         }
     ));
-    assert!(!attention::prefill_attn_steel_d256_supported(
+    // 27B (24/4/256) : Steel depuis le 2026-10-21, au-delà de 256 tokens seulement.
+    assert!(attention::prefill_attn_steel_d256_supported(
         PrefillAttentionSpec { ..base }
+    ));
+    assert!(!attention::prefill_attn_steel_d256_supported(
+        PrefillAttentionSpec { seq: 256, ..base }
     ));
     assert!(!attention::prefill_attn_steel_d256_supported(
         PrefillAttentionSpec {
@@ -857,17 +861,22 @@ fn causal_attention_prefill_steel_d256_matches_cpu_selected_rows() -> Result<()>
             "pipeline steel causal d256 indisponible".to_string(),
         ));
     };
-    for seq in [257_usize, 1025, 2049] {
-        let (q, k, v) = causal_attention_inputs(seq, 8, 1, 256)?;
-        let got =
-            causal_attention_prefill_with_steel_d256_pipeline(&executor, &q, &k, &v, 8, 1, pipeline)?;
-        let rows = if seq > 2048 {
-            vec![0, 1, 2047, 2048]
-        } else {
-            vec![0, 1, seq / 2, seq - 1]
-        };
-        let expected = cpu_causal_attention_selected_rows_gqa(&q, &k, &v, 8, 1, &rows)?;
-        assert_causal_rows_close(&got, &expected, 2.0e-3)?;
+    // (8, 1) couvre le 35B (facteur GQA 8), (24, 4) le 27B (facteur 6, head_dim 256).
+    for (q_heads, kv_heads) in [(8_usize, 1_usize), (24, 4)] {
+        for seq in [257_usize, 1025, 2049] {
+            let (q, k, v) = causal_attention_inputs(seq, q_heads, kv_heads, 256)?;
+            let got = causal_attention_prefill_with_steel_d256_pipeline(
+                &executor, &q, &k, &v, q_heads, kv_heads, pipeline,
+            )?;
+            let rows = if seq > 2048 {
+                vec![0, 1, 2047, 2048]
+            } else {
+                vec![0, 1, seq / 2, seq - 1]
+            };
+            let expected =
+                cpu_causal_attention_selected_rows_gqa(&q, &k, &v, q_heads, kv_heads, &rows)?;
+            assert_causal_rows_close(&got, &expected, 2.0e-3)?;
+        }
     }
     Ok(())
 }

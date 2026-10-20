@@ -586,6 +586,28 @@ T0/T1 de mlx (131-257 tok/s) incluent sa compilation sur un prompt court et
 ne comptent pas. Le prefill est le prochain levier pour le contexte long
 (T7 : 40 s DFlash, 62 s MTP dont 22 s de semis CPU de l'historique MTP).
 
+Prefill (21 octobre, profil par sections `SARAGOSSA_RUST_PREFILL_PROFILE_SECTIONS=1`,
+AR greedy, VM en fond) : T2 (732 tokens, 3,44 s) MLP dense 54 %, attention
+linéaire 20 %, attention causale 15 % (32 ms par couche, kernel `mid`
+per-query), projections q/k/v et o 7 % ; T7 (8297 tokens, 39,2 s) MLP dense
+47 %, attention causale 24 % (595 ms par couche, `batch_long_d256`), attention
+linéaire 20 %, q/k/v 5 %. Le GEMM u4 tourne à 13-15 TFLOPS effectifs sur les
+deux tailles, loin des ~44 que mlx_lm tire des accélérateurs neuronaux du M5
+(825 tok/s sur T2, 679 sur T7) : c'est l'écart principal. Premier levier pris :
+le kernel Steel causal d256 (déjà qualifié sur le 35B, facteur GQA en
+paramètre) étendu au 27B (24/4 têtes) :
+
+| Prompt | Attention causale avant | après | Prefill avant | après |
+|---|---|---|---|---|
+| T2 (732) | 491 ms | 20 ms | 3481 ms (210 tok/s) | 2935 ms (249 tok/s) |
+| T7 (8297) | 9,18 s | 1,56 s | 43,3 s (192 tok/s) | 32,5 s (256 tok/s) |
+
+Suites greedy identiques au binaire précédent (64 tokens sur T2, 8 sur T7),
+oracle CPU à 2e-3 sur (24/4) à 257, 1025 et 2049 tokens. Kill-switch
+`SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256=0`. Leviers restants dans l'ordre :
+GEMM u4 sur accélérateur neuronal (54 %), attention linéaire (20 %), semis CPU
+de l'historique MTP sur contexte long (22 s sur T7 en MTP committed).
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.
