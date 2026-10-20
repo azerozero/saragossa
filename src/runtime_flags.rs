@@ -990,6 +990,15 @@ pub(super) fn prefix_cache_capacity() -> usize {
     })
 }
 
+/// Route les requêtes échantillonnées (température > 0) vers le decode MTP
+/// (drafts avec distribution, accept/reject lossless) sur `serve`, `run` et la
+/// CLI. Opt-in `SARAGOSSA_RUST_MTP_SAMPLED=1` : les drafts de la tête MTP
+/// restent per-op avec température, mesure en cours.
+pub fn mtp_sampled_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SAMPLED", false))
+}
+
 /// Active le prefix-cache par blocs de `saragossa serve`.
 pub fn serve_prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

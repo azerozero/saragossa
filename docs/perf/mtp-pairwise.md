@@ -527,6 +527,18 @@ bascule retrouve l'entrée du cache au lieu de re-préremplir prompt + généré
 multi-tour T2 et T7 avec et sans extension résidente (MTP et DFlash), puis
 A/B/M de la bascule sur T0/T2 (prose) et T1/T6 (code) à 64 et 500 tokens.
 
+Spéculatif échantillonné (20 octobre, préparé) : le cœur MTP vérifie déjà les
+drafts avec température par accept/reject lossless (`lossless_speculative_sample`,
+distribution du draft fournie par la tête MTP), mais seules les requêtes greedy
+y étaient routées. `SARAGOSSA_RUST_MTP_SAMPLED=1` (opt-in) étend le routage de
+`serve`, `run` et la CLI aux requêtes à température > 0 sans contrainte ni stop
+sequence. Oracle réel : à T = 0,05 la sortie est celle de l'AR greedy sur 32
+tokens, une même graine rejoue la même sortie, 18 drafts acceptés sur 21 à
+T = 0,7. Réserve : les drafts de la tête MTP et les distributions cibles restent
+per-op avec température (4,3 s pour 32 tokens sous charge), le bench de nuit
+compare à l'AR échantillonné résident ; si MTP perd, le chantier suivant est le
+draft résident avec distribution.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

@@ -2547,6 +2547,73 @@ fn resident_sampling_predicates_route_default_and_readback() {
 // (sans MoE → `supports_resident_full_decode()=false`). La validation 1c est
 // l'oracle 35B réel (texte greedy ==CPU + A/B).
 
+// --- MTP échantillonné : accept/reject lossless sur le modèle réel ---
+
+/// À température quasi nulle la trajectoire est celle de l'AR greedy, une même
+/// graine rejoue la même sortie ; à 0,7 le decode accepte des drafts et va au
+/// budget. Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
+#[test]
+#[ignore = "modèle réel avec sidecar MTP requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+        eprintln!("skip MTP échantillonné : sidecar MTP absent");
+        return Ok(());
+    };
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(mtp_path)?;
+    let prompt = mtp_verifier_prompt_ids(
+        &assets,
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+    )?;
+    let max_new_tokens = 32;
+    let greedy = model.generate_greedy_cached_with_options(
+        &prompt,
+        max_new_tokens,
+        &mtp_verifier_options(Vec::new()),
+    )?;
+    let cold = GenerationOptions {
+        temperature: 0.05,
+        seed: 7,
+        ..mtp_verifier_options(Vec::new())
+    };
+    let first = model.generate_greedy_mtp_core(&prompt, max_new_tokens, &cold, 2, |_| true)?;
+    let second = model.generate_greedy_mtp_core(&prompt, max_new_tokens, &cold, 2, |_| true)?;
+    eprintln!(
+        "MTP échantillonné T=0,05 : {} ms, {} acceptés / {} proposés",
+        first.loop_duration.as_millis(),
+        first.stats.accepted,
+        first.stats.proposed
+    );
+    assert_eq!(
+        first.tokens, greedy,
+        "MTP échantillonné à T=0,05 divergent de l'AR greedy"
+    );
+    assert_eq!(
+        first.tokens, second.tokens,
+        "MTP échantillonné non déterministe à seed fixe"
+    );
+    let warm = GenerationOptions {
+        temperature: 0.7,
+        ..cold
+    };
+    let sampled = model.generate_greedy_mtp_core(&prompt, max_new_tokens, &warm, 2, |_| true)?;
+    eprintln!(
+        "MTP échantillonné T=0,7 : {} ms, {} acceptés / {} proposés",
+        sampled.loop_duration.as_millis(),
+        sampled.stats.accepted,
+        sampled.stats.proposed
+    );
+    assert_eq!(sampled.tokens.len(), max_new_tokens);
+    assert!(sampled.stats.accepted > 0, "aucun draft accepté à T=0,7");
+    Ok(())
+}
+
 // --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
 
 /// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
