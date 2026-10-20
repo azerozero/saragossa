@@ -2780,12 +2780,17 @@ impl CausalDecoder {
                 if let Some(slot) = stats.accepted_by_position.get_mut(position) {
                     *slot += 1;
                 }
-                generated.push(draft_token);
                 *final_state = target_state;
+                if options.stop_token_ids.contains(&draft_token) {
+                    // Stop token accepté : exclu de la sortie comme en AR et MTP ;
+                    // le tour suivant s'arrête sur ce `pending`.
+                    *pending = draft_token;
+                    accepted_all = false;
+                    break;
+                }
+                generated.push(draft_token);
                 verify_token = draft_token;
-                if generated.len() >= max_new_tokens
-                    || options.stop_token_ids.contains(&draft_token)
-                {
+                if generated.len() >= max_new_tokens {
                     accepted_all = false;
                     break;
                 }

@@ -2610,6 +2610,42 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         },
     )?;
     assert_eq!(early.tokens, ar[..5], "arrêt par callback DFlash");
+    // Stop token au milieu de la sortie AR : exclu de la sortie, que DFlash le
+    // rencontre en primaire ou en draft accepté (CPU, résident, streamé).
+    let stop = ar[10];
+    let options_stop = mtp_verifier_options(vec![stop]);
+    let ar_stop =
+        model.generate_greedy_cached_with_options(&prompt, max_new_tokens, &options_stop)?;
+    let cut = ar
+        .iter()
+        .position(|token| *token == stop)
+        .unwrap_or(ar.len());
+    assert_eq!(ar_stop, ar[..cut], "AR avec stop token");
+    let cpu_stop = model.generate_greedy_dflash_batched_with_options(
+        &prompt,
+        max_new_tokens,
+        &options_stop,
+        &draft,
+        draft.info.block_size,
+    )?;
+    assert_eq!(cpu_stop.tokens, ar_stop, "boucle CPU avec stop token");
+    let mut streamed_stop = Vec::new();
+    let resident_stop = model.generate_greedy_dflash_resident_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &options_stop,
+        &draft,
+        draft.info.block_size,
+        |token| {
+            streamed_stop.push(token);
+            true
+        },
+    )?;
+    assert_eq!(
+        resident_stop.tokens, ar_stop,
+        "boucle résidente avec stop token"
+    );
+    assert_eq!(streamed_stop, ar_stop, "callback avec stop token");
     // Routage : le greedy MTP passe par DFlash (8 positions de draft, pas 2).
     let routed = model.generate_greedy_mtp_streaming_with_options(
         &prompt,

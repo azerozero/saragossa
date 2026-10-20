@@ -295,15 +295,20 @@ impl CausalDecoder {
                     if let Some(slot) = stats.accepted_by_position.get_mut(position) {
                         *slot += 1;
                     }
+                    if options.stop_token_ids.contains(&draft_token) {
+                        // Stop token accepté : exclu de la sortie comme en AR et
+                        // MTP ; le tour suivant s'arrête sur ce `pending`.
+                        pending = draft_token;
+                        accepted_all = false;
+                        break;
+                    }
                     generated.push(draft_token);
                     if !on_token(draft_token) {
                         stopped = true;
                         accepted_all = false;
                         break;
                     }
-                    if generated.len() >= max_new_tokens
-                        || options.stop_token_ids.contains(&draft_token)
-                    {
+                    if generated.len() >= max_new_tokens {
                         accepted_all = false;
                         break;
                     }
@@ -349,11 +354,7 @@ impl CausalDecoder {
                 committed_len,
             )?;
             segments[3] += segment_started.elapsed();
-            if generated.len() >= max_new_tokens
-                || generated
-                    .last()
-                    .is_some_and(|token| options.stop_token_ids.contains(token))
-            {
+            if generated.len() >= max_new_tokens {
                 break;
             }
         }
