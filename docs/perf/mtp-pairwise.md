@@ -507,6 +507,26 @@ contre 49 s. Réserve : sur T7 le decode DFlash tombe à 13 tok/s contre 27 en
 MTP sur les 32 premiers tokens (vérification à 9 lignes sur 8k de contexte,
 début de réponse structuré), cas hors phase 7 qui confirme l'opt-in.
 
+Extension résidente du cache de préfixe (20 octobre, préparée ; bench de nuit
+en attente) : le suffixe d'un hit ne passe plus par le forward per-op mais par
+la vérification en lignes du decode résident. Une arène temporaire est seedée
+depuis le KV CPU de l'entrée, le suffixe est traité par blocs de 256 lignes
+(`SARAGOSSA_RUST_PREFIX_EXTEND_ROWS`), les lignes K/V ajoutées sont relues
+vers le cache CPU et l'arène rendue : le decode qui suit seed son arène comme
+avant (double upload du KV, levier suivant si la mesure le justifie).
+Kill-switch `SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT=0` (retour au per-op et au
+seuil d'un huitième). Chemin partagé par l'AR, l'extension MTP committed,
+DFlash (captures des couches cibles rendues par le même passage) et
+`extend_prompt_state` de serve. Oracle réel (prompt de 28 tokens, machine
+chargée) : 3 lignes en 46 ms, 29 lignes en 129 ms (4,4 ms par token contre
+31 per-op), suites identiques à l'AR non caché. Bascule intégrée : quand
+`SARAGOSSA_RUST_DFLASH_SWITCH_MIN` est posé, le prefill DFlash sème aussi
+l'historique MTP committed et l'extension le prolonge, donc le repli MTP après
+bascule retrouve l'entrée du cache au lieu de re-préremplir prompt + généré :
+8 ms de prefill contre 150 ms sur l'oracle. À mesurer machine calme : serve
+multi-tour T2 et T7 avec et sans extension résidente (MTP et DFlash), puis
+A/B/M de la bascule sur T0/T2 (prose) et T1/T6 (code) à 64 et 500 tokens.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.
