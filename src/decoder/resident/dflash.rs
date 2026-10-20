@@ -212,9 +212,7 @@ impl CausalDecoder {
         // Bascule par acceptance observée : sous `switch_min` tokens par tour en
         // moyenne après `switch_warmup` tours, la boucle rend la main (le reste de
         // la génération revient à la boucle MTP, cf. harnais d'acceptance).
-        let switch_min = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_MIN")
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .unwrap_or(0.0);
+        let switch_min = crate::runtime_flags::dflash_switch_min();
         let switch_warmup = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_WARMUP")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(6)
