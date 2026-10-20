@@ -136,6 +136,15 @@ fn run() -> CliResult<()> {
             decoder = decoder.with_mtp_draft_lm_head_sidecar(PathBuf::from(path))?;
         }
     }
+    // Les harnais d'acceptance et pairwise chargent le drafter eux-mêmes et
+    // comparent la tête MTP nue : ne pas la détourner vers DFlash.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if mtp_active
+        && !saragossa::devtools::mtp_acceptance_enabled()
+        && !saragossa::devtools::dflash_acceptance_enabled()
+    {
+        decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
+    }
     let load_elapsed = load_started.elapsed();
     if args.load_only {
         println!("ok loaded");

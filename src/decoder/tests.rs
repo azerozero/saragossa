@@ -2517,9 +2517,11 @@ fn resident_sampling_predicates_route_default_and_readback() {
 // --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
 
 /// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
-/// l'AR, même acceptance. Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` et
+/// l'AR, même acceptance ; la variante streamée émet exactement ces tokens et
+/// s'arrête sur le callback ; le greedy MTP route vers DFlash quand le drafter
+/// est chargé. Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` et
 /// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` (quantification via
-/// `SARAGOSSA_RUST_DFLASH_QUANT_BITS`, appliquée aux deux boucles).
+/// `SARAGOSSA_RUST_DFLASH_QUANT_BITS`, u4 si absente, appliquée aux deux boucles).
 #[test]
 #[ignore = "modèle réel + draft DFlash requis"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
@@ -2533,12 +2535,13 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
-    let draft = crate::load_dflash_draft_weights_quantized(
-        &assets.config,
-        PathBuf::from(draft_dir),
-        crate::DFlashQuant::from_env()?,
-    )?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config(format!("drafter non chargé depuis {draft_dir:?}")))?
+        .clone();
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Write a Rust function that parses a semantic version string and returns its three components.",
@@ -2579,6 +2582,49 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         "drafter résident moins accepté : {} contre {}",
         resident.stats.accepted,
         cpu.stats.accepted
+    );
+    let mut streamed = Vec::new();
+    let streaming = model.generate_greedy_dflash_resident_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        &draft,
+        draft.info.block_size,
+        |token| {
+            streamed.push(token);
+            true
+        },
+    )?;
+    assert_eq!(streaming.tokens, ar, "boucle streamée divergente de l'AR");
+    assert_eq!(streamed, ar, "callback DFlash divergent de la sortie");
+    let mut seen = 0usize;
+    let early = model.generate_greedy_dflash_resident_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        &draft,
+        draft.info.block_size,
+        |_| {
+            seen += 1;
+            seen < 5
+        },
+    )?;
+    assert_eq!(early.tokens, ar[..5], "arrêt par callback DFlash");
+    // Routage : le greedy MTP passe par DFlash (8 positions de draft, pas 2).
+    let routed = model.generate_greedy_mtp_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        2,
+        |_| true,
+    )?;
+    assert_eq!(
+        routed.tokens, ar,
+        "greedy MTP routé vers DFlash divergent de l'AR"
+    );
+    assert_eq!(
+        routed.stats.proposed_by_position.len(),
+        draft.info.block_size
     );
     Ok(())
 }

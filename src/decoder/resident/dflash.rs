@@ -47,6 +47,34 @@ impl CausalDecoder {
         draft: &DFlashDraft,
         max_draft_tokens: usize,
     ) -> Result<SpeculativeOutput> {
+        self.generate_greedy_dflash_resident_streaming_with_options(
+            prompt,
+            max_new_tokens,
+            options,
+            draft,
+            max_draft_tokens,
+            |_| true,
+        )
+    }
+
+    /// Comme `generate_greedy_dflash_resident_with_options` mais émet chaque
+    /// token via `on_token` (qui renvoie `false` pour arrêter). Tout token poussé
+    /// est définitif (vérifieur exact), donc émis aussitôt : la séquence reste
+    /// byte-identique à la variante non streamée, le callback ne fait
+    /// qu'observer ou arrêter.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que `generate_greedy_dflash_resident_with_options`.
+    pub fn generate_greedy_dflash_resident_streaming_with_options(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        draft: &DFlashDraft,
+        max_draft_tokens: usize,
+        mut on_token: impl FnMut(usize) -> bool,
+    ) -> Result<SpeculativeOutput> {
         if options.temperature > f32::EPSILON {
             return Err(InferError::Config(
                 "decode DFlash résident supporte uniquement greedy temperature=0".to_string(),
@@ -203,7 +231,7 @@ impl CausalDecoder {
                 break;
             }
             generated.push(primary);
-            if generated.len() >= max_new_tokens {
+            if !on_token(primary) || generated.len() >= max_new_tokens {
                 break;
             }
 
@@ -247,6 +275,7 @@ impl CausalDecoder {
                 InferError::Config("decode DFlash résident: capture cible absente".to_string())
             })?;
             let mut accepted_all = true;
+            let mut stopped = false;
             let mut committed_len = 0usize;
             for (position, draft_token) in drafts.iter().copied().enumerate() {
                 let target = *targets.get(position).ok_or_else(|| {
@@ -267,6 +296,11 @@ impl CausalDecoder {
                         *slot += 1;
                     }
                     generated.push(draft_token);
+                    if !on_token(draft_token) {
+                        stopped = true;
+                        accepted_all = false;
+                        break;
+                    }
                     if generated.len() >= max_new_tokens
                         || options.stop_token_ids.contains(&draft_token)
                     {
@@ -279,6 +313,9 @@ impl CausalDecoder {
                     accepted_all = false;
                     break;
                 }
+            }
+            if stopped {
+                break;
             }
             if accepted_all {
                 pending = *targets.get(drafts.len()).ok_or_else(|| {

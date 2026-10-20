@@ -1160,6 +1160,10 @@ pub struct CausalDecoder {
     lm_head: Linear,
     mtp: Option<MtpHead>,
     mtp_draft_lm_head: Option<Linear>,
+    /// Drafter DFlash 2 résident, opt-in : quand il est chargé, le greedy MTP
+    /// passe par la boucle DFlash (`generate_greedy_mtp_inner`).
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    dflash: Option<crate::DFlashDraft>,
     prefix_cache: Arc<Mutex<PrefixCache>>,
     memory_guard: Option<MemoryGuard>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1612,6 +1616,8 @@ impl CausalDecoder {
             lm_head,
             mtp: None,
             mtp_draft_lm_head: None,
+            #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+            dflash: None,
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
             memory_guard: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2090,6 +2096,47 @@ impl CausalDecoder {
         let context = mtp::MtpLoadContext::cpu();
         self.mtp = Some(MtpHead::from_sidecar(path, &self.config, &context)?);
         Ok(self)
+    }
+
+    /// Charge le drafter DFlash 2 désigné par `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`
+    /// (quantification `SARAGOSSA_RUST_DFLASH_QUANT_BITS`, u4 gs64 si absente :
+    /// la configuration mesurée en phase 7). Sans la variable, le décodeur est
+    /// rendu inchangé : c'est le kill-switch.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le runtime Metal est absent, si le checkpoint est
+    /// incompatible avec `target` ou si la quantification demandée est invalide.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    pub fn with_dflash_draft_from_env(mut self, target: &crate::ModelConfig) -> Result<Self> {
+        let Some(dir) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR") else {
+            return Ok(self);
+        };
+        if self.runtime.metal.is_none() {
+            return Err(InferError::Config(
+                "drafter DFlash : runtime Metal requis".to_string(),
+            ));
+        }
+        let quant = if crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_QUANT_BITS").is_none() {
+            Some(crate::DFlashQuant {
+                group_size: 64,
+                bits: 4,
+            })
+        } else {
+            crate::DFlashQuant::from_env()?
+        };
+        self.dflash = Some(crate::load_dflash_draft_weights_quantized(
+            target,
+            std::path::PathBuf::from(dir),
+            quant,
+        )?);
+        Ok(self)
+    }
+
+    /// Drafter DFlash chargé par `with_dflash_draft_from_env`, s'il y en a un.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    pub fn dflash_draft(&self) -> Option<&crate::DFlashDraft> {
+        self.dflash.as_ref()
     }
 
     /// Charge une projection logits dédiée aux drafts MTP.

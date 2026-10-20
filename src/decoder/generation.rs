@@ -1210,6 +1210,85 @@ impl CausalDecoder {
         max_new_tokens: usize,
         options: &GenerationOptions,
         max_draft_tokens: usize,
+        on_token: impl FnMut(usize) -> bool,
+    ) -> Result<SpeculativeOutput> {
+        // Drafter DFlash opt-in (`with_dflash_draft_from_env`) : le greedy non
+        // contraint passe par la boucle résidente ; échantillonnage et contraintes
+        // gardent la tête MTP. Phase 7 pairwise : code +31 à +88 %, prose longue
+        // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
+        // ponytail: le prefill DFlash (captures de couches) ignore le cache de
+        // préfixe du décodeur, chaque requête re-préremplit tout ; brancher
+        // `longest_prefix_entry_index` si le multi-tour long paie trop.
+        #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+        if let Some(draft) = self.dflash.as_ref() {
+            if options.temperature <= f32::EPSILON && options.token_constraint.is_none() {
+                return self.generate_greedy_dflash_then_mtp(
+                    prompt,
+                    max_new_tokens,
+                    options,
+                    draft,
+                    max_draft_tokens,
+                    on_token,
+                );
+            }
+        }
+        self.generate_greedy_mtp_core(prompt, max_new_tokens, options, max_draft_tokens, on_token)
+    }
+
+    /// Boucle DFlash résidente, puis la tête MTP si la bascule par acceptance
+    /// (`SARAGOSSA_RUST_DFLASH_SWITCH_MIN`, opt-in) a rendu la main : même
+    /// enchaînement que le harnais d'acceptance, re-prefill compris.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    fn generate_greedy_dflash_then_mtp(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        draft: &DFlashDraft,
+        mtp_draft_tokens: usize,
+        mut on_token: impl FnMut(usize) -> bool,
+    ) -> Result<SpeculativeOutput> {
+        let mut spec = self.generate_greedy_dflash_resident_streaming_with_options(
+            prompt,
+            max_new_tokens,
+            options,
+            draft,
+            draft.info.block_size,
+            &mut on_token,
+        )?;
+        let Some(switched_at) = spec.stats.dflash_switched_at else {
+            return Ok(spec);
+        };
+        let remaining = max_new_tokens.saturating_sub(spec.tokens.len());
+        if remaining == 0 {
+            return Ok(spec);
+        }
+        let fallback_started = Instant::now();
+        let mut fallback_prompt = prompt.to_vec();
+        fallback_prompt.extend_from_slice(&spec.tokens);
+        let fallback = self.generate_greedy_mtp_core(
+            &fallback_prompt,
+            remaining,
+            options,
+            mtp_draft_tokens,
+            on_token,
+        )?;
+        spec.loop_duration += fallback_started.elapsed();
+        spec.tokens.extend(fallback.tokens);
+        spec.stats.proposed += fallback.stats.proposed;
+        spec.stats.accepted += fallback.stats.accepted;
+        spec.stats.rejected += fallback.stats.rejected;
+        spec.stats.verifications += fallback.stats.verifications;
+        spec.stats.dflash_switched_at = Some(switched_at);
+        Ok(spec)
+    }
+
+    fn generate_greedy_mtp_core(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        max_draft_tokens: usize,
         mut on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
         if self.mtp.is_none() {

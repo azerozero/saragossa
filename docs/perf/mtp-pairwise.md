@@ -488,6 +488,17 @@ Lecture :
 Bruts : `models/pairwise/dflash/` (hors dépôt) : `results-live.json`,
 `results.json`, `status.md`, manifeste et journal.
 
+Mise en service (20 octobre, suite de la phase 7) : le drafter est opt-in dans
+le chemin greedy de production. `SARAGOSSA_RUST_DFLASH_DRAFT_DIR=<dossier>`
+sur `serve`, `run` ou la CLI le charge à côté du sidecar MTP (u4 gs64 par
+défaut, `SARAGOSSA_RUST_DFLASH_QUANT_BITS=0|8` pour dense ou u8) et
+`generate_greedy_mtp_inner` aiguille le greedy non contraint vers la boucle
+résidente, désormais streamée et annulable ; échantillonnage, contraintes et
+stop sequences gardent la tête MTP, et les harnais d'acceptance et pairwise
+ne sont pas détournés. Sans la variable, rien ne change. Limite connue : le
+prefill DFlash ne réutilise pas le cache de préfixe du décodeur, chaque
+requête re-préremplit tout le prompt.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

@@ -189,6 +189,10 @@ impl ReplModel {
             if let Some(path) = assets.mtp.path.as_ref() {
                 decoder = decoder.with_mtp_sidecar(path)?;
             }
+            #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+            {
+                decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
+            }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if args.backend == RuntimeKind::Metal {
