@@ -604,9 +604,27 @@ paramètre) étendu au 27B (24/4 têtes) :
 
 Suites greedy identiques au binaire précédent (64 tokens sur T2, 8 sur T7),
 oracle CPU à 2e-3 sur (24/4) à 257, 1025 et 2049 tokens. Kill-switch
-`SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256=0`. Leviers restants dans l'ordre :
-GEMM u4 sur accélérateur neuronal (54 %), attention linéaire (20 %), semis CPU
-de l'historique MTP sur contexte long (22 s sur T7 en MTP committed).
+`SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256=0`.
+
+Deuxième levier pris : le chargeur de tuile B du GEMM u4 gs64 sur accélérateur
+neuronal (`gemm_nax_coop_qb_tiled_u4` et sa variante align64, mêmes tuiles
+64×64×64 et 2×2 simdgroups que le `qmm_t_nax` de MLX) dé-quantifiait poids par
+poids en relisant le mot u32, le scale et le bias à chaque fois (96 lectures
+device par thread et par pas de K). Il dé-quantifie maintenant une demi-ligne
+par thread (4 mots, 32 poids, un scale et un bias), et la tuile threadgroup est
+paddée à 72 colonnes pour étaler les fragments sur les banques. Bit-identique
+au chemin u8 et au GEMM générique (oracles existants). Cumul des deux leviers,
+même protocole :
+
+| Prompt | MLP dense | Attention linéaire | Prefill avant la nuit | après |
+|---|---|---|---|---|
+| T2 (732) | 1761 → 820 ms | 702 → 363 ms | 3481 ms (210 tok/s) | 1754 ms (417 tok/s) |
+| T7 (8297) | 19,3 → 12,8 s | 7,3 → 5,3 s | 43,3 s (192 tok/s) | 23,2 s (358 tok/s) |
+
+Suites greedy identiques. Reste un facteur 2 contre mlx_lm (825 / 679 tok/s) :
+le GEMM tourne à 25-30 TFLOPS effectifs, sans double tampon ni chargement
+vectorisé de A ; puis attention linéaire (20 %), et semis CPU de l'historique
+MTP sur contexte long (22 s sur T7 en MTP committed).
 
 ## Limites
 
