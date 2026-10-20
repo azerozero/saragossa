@@ -1280,7 +1280,7 @@ impl CausalDecoder {
         Ok(spec)
     }
 
-    fn generate_greedy_mtp_core(
+    pub(super) fn generate_greedy_mtp_core(
         &self,
         prompt: &[usize],
         max_new_tokens: usize,
@@ -2911,6 +2911,21 @@ impl CausalDecoder {
         prompt: &[usize],
         layer_ids: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor, Tensor)> {
+        let (cache, final_states, target_hidden) =
+            self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids)?;
+        let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
+        Ok((cache, final_state, target_hidden))
+    }
+
+    /// Comme [`Self::prefill_cache_state_with_layer_capture`], mais rend les
+    /// états finaux normés de TOUTES les positions (`[seq, hidden]`), nécessaires
+    /// pour semer l'historique MTP committed à côté des captures DFlash.
+    #[cfg(feature = "devtools")]
+    fn prefill_cache_state_with_layer_capture_all(
+        &self,
+        prompt: &[usize],
+        layer_ids: &[usize],
+    ) -> Result<(CausalDecoderCache, Tensor, Tensor)> {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
@@ -2925,9 +2940,8 @@ impl CausalDecoder {
             let target_hidden = captures.ok_or_else(|| {
                 InferError::Config("prefill résident sans captures de couches".to_string())
             })?;
-            let final_hidden = Tensor::row(final_hidden.last_row()?.to_vec())?;
-            let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
-            return Ok((cache, final_state, target_hidden));
+            let final_states = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+            return Ok((cache, final_states, target_hidden));
         }
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
@@ -2945,10 +2959,9 @@ impl CausalDecoder {
             capture_layer_output(layer_ids, layer_index, &hidden, &mut captures);
         }
         cache.position = prompt.len();
-        let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
-        let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+        let final_states = rms_norm(&hidden, &self.final_norm, self.config.rms_eps)?;
         let target_hidden = concat_layer_captures(captures, seq, hidden_dim)?;
-        Ok((cache, final_state, target_hidden))
+        Ok((cache, final_states, target_hidden))
     }
 
     #[cfg(feature = "devtools")]
@@ -3222,7 +3235,7 @@ impl CausalDecoder {
         if suffix.is_empty() {
             return Ok(());
         }
-        let final_states = self.next_final_states_batched(&mut state.cache, suffix)?;
+        let (final_states, _) = self.forward_suffix_batched(&mut state.cache, suffix, None)?;
         state.final_state = Tensor::row(final_states.last_row()?.to_vec())?;
         Ok(())
     }
@@ -3511,7 +3524,7 @@ impl CausalDecoder {
         layer_ids: &[usize],
         keep_rows: usize,
     ) -> Result<Option<(CausalDecoderCache, Tensor, Tensor, usize)>> {
-        let Some((mut output, cached_len, _, Some(captures))) =
+        let Some((mut output, cached_len, history, Some(captures))) =
             self.prefix_cache_hit(prompt, false)?
         else {
             return Ok(None);
@@ -3533,11 +3546,20 @@ impl CausalDecoder {
         if cached_len == prompt.len() {
             return Ok(Some((output.0, output.1, captures.hidden, captures.from)));
         }
-        let (final_states, suffix_hidden) = self.next_final_states_batched_with_layer_capture(
-            &mut output.0,
-            &prompt[cached_len..],
-            layer_ids,
-        )?;
+        let suffix = &prompt[cached_len..];
+        let (final_states, suffix_hidden) =
+            self.forward_suffix_batched(&mut output.0, suffix, Some(layer_ids))?;
+        let suffix_hidden = suffix_hidden.ok_or_else(|| {
+            InferError::Config("extension DFlash sans captures de couches".to_string())
+        })?;
+        // Entrée semée par un prefill DFlash avec bascule : l'historique MTP suit
+        // le suffixe, pour que le repli MTP après bascule retrouve l'entrée.
+        let history = history
+            .map(|mut history| {
+                self.extend_mtp_history_suffix(&output.1, &final_states, suffix, &mut history)?;
+                Ok::<_, InferError>(history)
+            })
+            .transpose()?;
         output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
         let captures = PrefixCaptures::tail(
             layer_ids,
@@ -3545,7 +3567,7 @@ impl CausalDecoder {
             stack_rows(&captures.hidden, &suffix_hidden)?,
             keep_rows,
         )?;
-        self.prefix_cache_put(prompt, &output, None, Some(&captures))?;
+        self.prefix_cache_put(prompt, &output, history.as_ref(), Some(&captures))?;
         Ok(Some((output.0, output.1, captures.hidden, captures.from)))
     }
 
@@ -3575,12 +3597,13 @@ impl CausalDecoder {
                 return Ok(hit);
             }
         }
-        let (cache, final_state, hidden) =
-            self.prefill_cache_state_with_layer_capture(prompt, layer_ids)?;
+        let (cache, final_states, hidden) =
+            self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids)?;
         let captures = PrefixCaptures::tail(layer_ids, 0, hidden, keep_rows)?;
-        let state = (cache, final_state);
+        let mtp_history = self.dflash_switch_mtp_history(prompt, &final_states)?;
+        let state = (cache, Tensor::row(final_states.last_row()?.to_vec())?);
         if prefix_cache_enabled() {
-            self.prefix_cache_put(prompt, &state, None, Some(&captures))?;
+            self.prefix_cache_put(prompt, &state, mtp_history.as_ref(), Some(&captures))?;
         }
         if profile {
             eprintln!(
@@ -3608,15 +3631,57 @@ impl CausalDecoder {
         };
         if cached_len < prompt.len() {
             let suffix = &prompt[cached_len..];
-            let final_states = self.next_final_states_batched(&mut output.0, suffix)?;
-            let hidden = self.final_norm.data().len();
-            let mut states = output.1.data().to_vec();
-            states.extend_from_slice(&final_states.data()[..(suffix.len() - 1) * hidden]);
-            self.seed_mtp_history_batched(&states, suffix, &mut history)?;
+            let (final_states, _) = self.forward_suffix_batched(&mut output.0, suffix, None)?;
+            self.extend_mtp_history_suffix(&output.1, &final_states, suffix, &mut history)?;
             output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
             self.prefix_cache_put(prompt, &output, Some(&history), None)?;
         }
         Ok(Some((output.0, output.1, history)))
+    }
+
+    /// Prolonge l'historique MTP committed d'une entrée sur `suffix` : l'état de
+    /// la dernière position couverte (`previous_final_state`) est apparié au
+    /// premier token du suffixe, puis les états du forward d'extension aux
+    /// suivants (la dernière position n'a pas encore de token suivant).
+    fn extend_mtp_history_suffix(
+        &self,
+        previous_final_state: &Tensor,
+        final_states: &Tensor,
+        suffix: &[usize],
+        history: &mut LayerKvCache,
+    ) -> Result<()> {
+        let hidden = self.final_norm.data().len();
+        let mut states = previous_final_state.data().to_vec();
+        states.extend_from_slice(&final_states.data()[..suffix.len().saturating_sub(1) * hidden]);
+        self.seed_mtp_history_batched(&states, suffix, history)
+    }
+
+    /// Historique MTP committed semé par le prefill DFlash quand la bascule
+    /// (`SARAGOSSA_RUST_DFLASH_SWITCH_MIN`) est active : le repli MTP après
+    /// bascule retrouve alors l'entrée du cache de préfixe au lieu de re-préremplir
+    /// prompt + généré. `None` sans bascule, sans sidecar MTP ou hors politique
+    /// committed.
+    #[cfg(feature = "devtools")]
+    fn dflash_switch_mtp_history(
+        &self,
+        prompt: &[usize],
+        final_states: &Tensor,
+    ) -> Result<Option<LayerKvCache>> {
+        if self.mtp.is_none()
+            || dflash_switch_min() <= 0.0
+            || mtp_history_policy() != MtpHistoryPolicy::Committed
+        {
+            return Ok(None);
+        }
+        let hidden = self.final_norm.data().len();
+        let seeded = prompt.len().saturating_sub(1);
+        let mut history = LayerKvCache::default();
+        self.seed_mtp_history_batched(
+            &final_states.data()[..seeded * hidden],
+            &prompt[1..],
+            &mut history,
+        )?;
+        Ok(Some(history))
     }
 
     /// Plus longue entrée du prefix cache couvrant un préfixe de `prompt`, état
@@ -3646,13 +3711,13 @@ impl CausalDecoder {
         if with_mtp_history && cache.entries[index].mtp_history.is_none() {
             return Ok(None);
         }
-        // ponytail: l'extension d'un préfixe passe par le forward per-op (31 ms par
-        // token mesurés le 20 octobre sur 27B 4 bits, captures comprises) contre
-        // 3,6 ms par token pour le prefill résident complet : au-delà d'un huitième
-        // du prompt à recalculer, repartir de zéro est plus rapide. À remplacer par
-        // un prefill résident à offset de position.
+        // ponytail: sans extension résidente, le suffixe passe par le forward per-op
+        // (31 ms par token mesurés le 20 octobre sur 27B 4 bits, captures comprises)
+        // contre 3,6 ms par token pour le prefill résident complet : au-delà d'un
+        // huitième du prompt à recalculer, repartir de zéro est plus rapide.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if prefill_resident_enabled()
+            && !prefix_extend_resident_enabled()
             && (prompt.len() - cache.entries[index].tokens.len()) * 8 > prompt.len()
         {
             return Ok(None);
@@ -3683,8 +3748,127 @@ impl CausalDecoder {
         if suffix.is_empty() {
             return Ok(());
         }
-        let final_states = self.next_final_states_batched(&mut state.0, suffix)?;
+        let (final_states, _) = self.forward_suffix_batched(&mut state.0, suffix, None)?;
         state.1 = Tensor::row(final_states.last_row()?.to_vec())?;
+        Ok(())
+    }
+
+    /// Forward batché d'un suffixe sur un cache CPU (hit du cache de préfixe,
+    /// état de prompt de serve). Sur Metal, une arène résidente temporaire est
+    /// seedée depuis le KV CPU pour que `next_final_states_batched*` prenne le
+    /// chemin de vérification en lignes (kernels de decode fusionnés) au lieu du
+    /// forward per-op (31 ms par token) ; les lignes K/V ajoutées sont relues vers
+    /// le cache CPU et l'arène libérée : le cache rendu reste seedable par le
+    /// decode qui suit. Rend les états finaux normés de toutes les positions du
+    /// suffixe (`[suffix, hidden]`) et, si `layer_ids` est donné, les captures des
+    /// couches cibles (`[suffix, n * hidden]`).
+    fn forward_suffix_batched(
+        &self,
+        cache: &mut CausalDecoderCache,
+        suffix: &[usize],
+        layer_ids: Option<&[usize]>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        if suffix.is_empty() {
+            return Err(InferError::Dimension(
+                "extension de préfixe vide".to_string(),
+            ));
+        }
+        let trace = trace_prefill_enabled();
+        let started = Instant::now();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let base_len = cache.position;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let resident = prefix_extend_resident_enabled()
+            && self.setup_resident_decode_from_prefill(cache, suffix.len())?;
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let resident = false;
+        let setup_elapsed = started.elapsed();
+        // Sans arène le forward per-op traite tout le suffixe d'un coup, comme avant.
+        let chunk = if resident {
+            prefix_extend_rows()
+        } else {
+            suffix.len()
+        };
+        let hidden = self.final_norm.data().len();
+        let mut states = Vec::with_capacity(suffix.len() * hidden);
+        let mut captures =
+            layer_ids.map(|ids| Vec::with_capacity(suffix.len() * ids.len() * hidden));
+        for part in suffix.chunks(chunk) {
+            match layer_ids {
+                #[cfg(feature = "devtools")]
+                Some(ids) => {
+                    let (part_states, part_hidden) =
+                        self.next_final_states_batched_with_layer_capture(cache, part, ids)?;
+                    states.extend_from_slice(part_states.data());
+                    if let Some(captures) = captures.as_mut() {
+                        captures.extend_from_slice(part_hidden.data());
+                    }
+                }
+                #[cfg(not(feature = "devtools"))]
+                Some(_) => {
+                    return Err(InferError::Config(
+                        "captures de couches hors devtools".to_string(),
+                    ));
+                }
+                None => {
+                    let part_states = self.next_final_states_batched(cache, part)?;
+                    states.extend_from_slice(part_states.data());
+                }
+            }
+        }
+        let forward_elapsed = started.elapsed() - setup_elapsed;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if resident {
+            self.release_suffix_arena(cache, base_len)?;
+        }
+        if trace {
+            eprintln!(
+                "prefix_extend rows={} resident={resident} setup_ms={} forward_ms={} readback_ms={}",
+                suffix.len(),
+                setup_elapsed.as_millis(),
+                forward_elapsed.as_millis(),
+                (started.elapsed() - setup_elapsed - forward_elapsed).as_millis()
+            );
+        }
+        let states = Tensor::from_vec(vec![suffix.len(), hidden], states)?;
+        let captures = captures
+            .zip(layer_ids)
+            .map(|(data, ids)| Tensor::from_vec(vec![suffix.len(), ids.len() * hidden], data))
+            .transpose()?;
+        Ok((states, captures))
+    }
+
+    /// Libère l'arène temporaire d'une extension : les lignes K/V ajoutées depuis
+    /// `base_len` sont relues vers le cache CPU, l'état GPU est rendu. Le cache
+    /// redevient un cache CPU ordinaire, à `position` lignes par couche full-attn.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn release_suffix_arena(&self, cache: &mut CausalDecoderCache, base_len: usize) -> Result<()> {
+        for (index, layer_cache) in cache.layers.iter_mut().enumerate() {
+            let Some(full) = layer_cache.full.take() else {
+                continue;
+            };
+            let kv_dim = full.kv_dim();
+            if layer_cache.keys.len() != base_len * kv_dim {
+                return Err(InferError::Dimension(format!(
+                    "extension résidente couche {index}: KV CPU {} lignes, attendu {base_len}",
+                    layer_cache.keys.len() / kv_dim.max(1)
+                )));
+            }
+            let rows = full.len().saturating_sub(base_len);
+            if rows > 0 {
+                let (keys, values) = full.read_rows(base_len, rows)?;
+                layer_cache.keys.extend_from_slice(&keys);
+                layer_cache.values.extend_from_slice(&values);
+            }
+            if layer_cache.keys.len() != cache.position * kv_dim {
+                return Err(InferError::Dimension(format!(
+                    "extension résidente couche {index}: {} lignes relues, position {}",
+                    layer_cache.keys.len() / kv_dim.max(1),
+                    cache.position
+                )));
+            }
+        }
+        cache.resident = None;
         Ok(())
     }
 

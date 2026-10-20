@@ -54,6 +54,71 @@ pub(super) fn write_f32_at(tensor: &GpuTensor, offset: usize, data: &[f32]) -> R
     Ok(())
 }
 
+/// Relit `count` éléments du buffer `tensor` à partir de l'élément `offset`,
+/// en f32 (bf16 élargi sans arrondi), après la fin du command buffer qui l'a
+/// écrit. Sert à rapatrier vers le cache CPU les lignes K/V ajoutées par un
+/// kernel en lignes.
+///
+/// # Errors
+///
+/// Renvoie une erreur si `tensor` est u32 ou si `offset + count` dépasse sa
+/// longueur logique.
+#[allow(
+    unsafe_code,
+    reason = "lecture d'un MTLBuffer StorageModeShared à un offset après wait_until_completed"
+)]
+pub(super) fn read_f32_at(tensor: &GpuTensor, offset: usize, count: usize) -> Result<Vec<f32>> {
+    let end = offset
+        .checked_add(count)
+        .ok_or_else(|| InferError::Metal("read_f32_at: offset déborde".to_string()))?;
+    if end > tensor.len() {
+        return Err(InferError::Metal(format!(
+            "read_f32_at hors capacité: offset({offset})+count({count}) > {}",
+            tensor.len()
+        )));
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let contents = tensor.buffer().contents();
+    if contents.is_null() {
+        return Err(InferError::Metal(
+            "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
+        ));
+    }
+    let mut out = vec![0.0_f32; count];
+    match tensor.element() {
+        GpuElement::F32 => {
+            // SAFETY: buffer en StorageModeShared dont le command buffer a terminé ;
+            // `offset + count <= tensor.len()` vérifié → `ptr.add(offset)` est dans
+            // les bornes, copie de `count` f32 sans chevauchement vers `out`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    contents.cast::<f32>().add(offset),
+                    out.as_mut_ptr(),
+                    count,
+                );
+            }
+        }
+        GpuElement::Bf16 => {
+            let ptr = contents.cast::<u16>();
+            for (index, value) in out.iter_mut().enumerate() {
+                // SAFETY: mêmes bornes que ci-dessus, lecture d'un u16 par élément.
+                let bits = unsafe { ptr.add(offset + index).read() };
+                *value = f32::from_bits(u32::from(bits) << 16);
+            }
+        }
+        GpuElement::U32 => {
+            return Err(InferError::Metal(
+                "read_f32_at sur un buffer u32 invalide".to_string(),
+            ));
+        }
+    }
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(false, std::mem::size_of_val(out.as_slice()));
+    Ok(out)
+}
+
 fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let lsb = (bits >> 16) & 1;

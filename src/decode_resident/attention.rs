@@ -6,7 +6,7 @@ use super::gpu_position::{
 };
 use super::utils::{
     bf16_round_f32, byte_offset, flash_sdpa_enabled, kv_bf16_for, kv_bf16_sim_konly,
-    kv_bf16_sim_vonly, sdpa_2pass_blocks, sdpa_2pass_enabled, sdpa_2pass_min_len,
+    kv_bf16_sim_vonly, read_f32_at, sdpa_2pass_blocks, sdpa_2pass_enabled, sdpa_2pass_min_len,
     write_f32_as_bf16_at, write_f32_at,
 };
 use super::*;
@@ -580,6 +580,35 @@ impl FullAttentionMetalState {
 
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Relit `rows` lignes K/V (rope'd, f32) à partir de la ligne `from`, pour
+    /// rapatrier vers le cache CPU les lignes ajoutées par un kernel en lignes.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `from + rows` dépasse les lignes valides.
+    pub(crate) fn read_rows(&self, from: usize, rows: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let end = from
+            .checked_add(rows)
+            .filter(|end| *end <= self.len)
+            .ok_or_else(|| {
+                InferError::Dimension(format!(
+                    "read KV rows: {from} + {rows} hors des {} lignes valides",
+                    self.len
+                ))
+            })?;
+        let kv_dim = self.kv_dim();
+        let offset = from
+            .checked_mul(kv_dim)
+            .ok_or_else(|| InferError::Dimension("read KV rows: offset déborde".to_string()))?;
+        let count = (end - from)
+            .checked_mul(kv_dim)
+            .ok_or_else(|| InferError::Dimension("read KV rows: longueur déborde".to_string()))?;
+        Ok((
+            read_f32_at(&self.keys, offset, count)?,
+            read_f32_at(&self.values, offset, count)?,
+        ))
     }
 
     /// Renvoie le buffer résident des clés (`capacity * kv_dim`).

@@ -952,6 +952,35 @@ pub(super) fn prefix_cache_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
 }
 
+/// Extension d'un préfixe caché par le chemin résident en lignes (arène
+/// temporaire seedée depuis le KV CPU) au lieu du forward per-op. Kill-switch
+/// `SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT=0`.
+pub(super) fn prefix_extend_resident_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT", true))
+}
+
+/// Lignes par passage du forward résident d'extension (`SARAGOSSA_RUST_PREFIX_EXTEND_ROWS`,
+/// défaut 256) : borne le scratch par couche, chaque passage relit les poids.
+pub(super) fn prefix_extend_rows() -> usize {
+    static ROWS: OnceLock<usize> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_PREFIX_EXTEND_ROWS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|rows| *rows > 0)
+            .unwrap_or(256)
+    })
+}
+
+/// Seuil de bascule DFlash → MTP (`SARAGOSSA_RUST_DFLASH_SWITCH_MIN`, tokens
+/// acceptés par tour en moyenne) ; 0 = pas de bascule. Lu à chaque appel : le
+/// harnais d'acceptance le fait varier entre deux runs d'un même processus.
+pub(super) fn dflash_switch_min() -> f64 {
+    crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_MIN")
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
 pub(super) fn prefix_cache_capacity() -> usize {
     static CAPACITY: OnceLock<usize> = OnceLock::new();
     *CAPACITY.get_or_init(|| {

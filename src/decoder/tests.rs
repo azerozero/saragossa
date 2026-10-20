@@ -2568,9 +2568,13 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let model = crate::load_causal_decoder(&assets)?
+    let mut model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
         .with_dflash_draft_from_env(&assets.config)?;
+    // Sidecar MTP pour le repli après bascule (section ignorée sans sidecar).
+    if let Some(mtp_path) = assets.mtp.path.as_ref() {
+        model = model.with_mtp_sidecar(mtp_path)?;
+    }
     let draft = model
         .dflash_draft()
         .ok_or_else(|| InferError::Config(format!("drafter non chargé depuis {draft_dir:?}")))?
@@ -2702,6 +2706,39 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
     assert_eq!(
         resident_ext.tokens, ar_ext,
         "extension du cache de préfixe avec captures"
+    );
+    // Repli MTP après bascule : le cœur MTP sur prompt + généré retrouve
+    // l'entrée DFlash (avec historique si `SARAGOSSA_RUST_DFLASH_SWITCH_MIN` est
+    // posé, sinon prefill complet) et produit la même suite que l'AR.
+    if model.mtp.is_some() {
+        let mtp_ext =
+            model.generate_greedy_mtp_core(&extended, max_new_tokens - 3, &options, 2, |_| true)?;
+        assert_eq!(mtp_ext.tokens, ar_ext, "repli MTP après extension DFlash");
+    } else {
+        eprintln!("skip repli MTP : sidecar MTP absent");
+    }
+    // Extension longue (32 lignes : matmuls GEMM, attention en lignes par
+    // groupes) : prompt + toute la génération, suite comparée à l'AR non caché.
+    let mut extended_long = prompt.clone();
+    extended_long.extend_from_slice(&ar);
+    let resident_long = model.generate_greedy_dflash_resident_with_options(
+        &extended_long,
+        16,
+        &options,
+        &draft,
+        draft.info.block_size,
+    )?;
+    let ar_long = model
+        .generate_greedy_timed_from_prompt_state_with_options(
+            model.prefill_prompt_state_uncached(&extended_long)?,
+            Duration::ZERO,
+            16,
+            &options,
+        )?
+        .tokens;
+    assert_eq!(
+        resident_long.tokens, ar_long,
+        "extension longue du cache de préfixe"
     );
     // Routage : le greedy MTP passe par DFlash (8 positions de draft, pas 2).
     let routed = model.generate_greedy_mtp_streaming_with_options(
