@@ -1216,9 +1216,6 @@ impl CausalDecoder {
         // contraint passe par la boucle résidente ; échantillonnage et contraintes
         // gardent la tête MTP. Phase 7 pairwise : code +31 à +88 %, prose longue
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
-        // ponytail: le prefill DFlash (captures de couches) ignore le cache de
-        // préfixe du décodeur, chaque requête re-préremplit tout ; brancher
-        // `longest_prefix_entry_index` si le multi-tour long paie trop.
         #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
         if let Some(draft) = self.dflash.as_ref() {
             if options.temperature <= f32::EPSILON && options.token_constraint.is_none() {
@@ -3313,7 +3310,7 @@ impl CausalDecoder {
         }
         let state = self.prefill_cache_state_uncached_inner(prompt)?;
         if prefix_cache_enabled() {
-            self.prefix_cache_put(prompt, &state, None)?;
+            self.prefix_cache_put(prompt, &state, None, None)?;
         }
         Ok(state)
     }
@@ -3418,7 +3415,7 @@ impl CausalDecoder {
         }
         let state = (cache, final_state);
         if prefix_cache_enabled() {
-            self.prefix_cache_put(prompt, &state, Some(&mtp_history))?;
+            self.prefix_cache_put(prompt, &state, Some(&mtp_history), None)?;
         }
         Ok((state.0, state.1, mtp_history))
     }
@@ -3493,14 +3490,103 @@ impl CausalDecoder {
     }
 
     fn prefix_cache_get(&self, prompt: &[usize]) -> Result<Option<(CausalDecoderCache, Tensor)>> {
-        let Some((mut output, cached_len, _)) = self.prefix_cache_hit(prompt, false)? else {
+        let Some((mut output, cached_len, _, _)) = self.prefix_cache_hit(prompt, false)? else {
             return Ok(None);
         };
         if cached_len < prompt.len() {
             self.extend_prefix_cache_suffix(&mut output, &prompt[cached_len..])?;
-            self.prefix_cache_put(prompt, &output, None)?;
+            self.prefix_cache_put(prompt, &output, None, None)?;
         }
         Ok(Some(output))
+    }
+
+    /// Variante DFlash de [`Self::prefix_cache_get`] : exige une entrée portant
+    /// les captures de `layer_ids` et prolonge état et captures sur le suffixe
+    /// (forward per-op avec captures). Rend `(cache, état final, captures, from)`
+    /// avec les captures bornées aux `keep_rows` dernières positions.
+    #[cfg(feature = "devtools")]
+    fn prefix_cache_get_with_captures(
+        &self,
+        prompt: &[usize],
+        layer_ids: &[usize],
+        keep_rows: usize,
+    ) -> Result<Option<(CausalDecoderCache, Tensor, Tensor, usize)>> {
+        let Some((mut output, cached_len, _, Some(captures))) =
+            self.prefix_cache_hit(prompt, false)?
+        else {
+            return Ok(None);
+        };
+        if captures.layer_ids != layer_ids {
+            return Ok(None);
+        }
+        if crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_PROFILE", false) {
+            eprintln!(
+                "dflash_prefill hit cached_len={cached_len} prompt={} captures_from={}",
+                prompt.len(),
+                captures.from
+            );
+        }
+        if cached_len == prompt.len() {
+            return Ok(Some((output.0, output.1, captures.hidden, captures.from)));
+        }
+        let (final_states, suffix_hidden) = self.next_final_states_batched_with_layer_capture(
+            &mut output.0,
+            &prompt[cached_len..],
+            layer_ids,
+        )?;
+        output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
+        let captures = PrefixCaptures::tail(
+            layer_ids,
+            captures.from,
+            stack_rows(&captures.hidden, &suffix_hidden)?,
+            keep_rows,
+        )?;
+        self.prefix_cache_put(prompt, &output, None, Some(&captures))?;
+        Ok(Some((output.0, output.1, captures.hidden, captures.from)))
+    }
+
+    /// Comme [`Self::prefill_cache_state_with_layer_capture`], via le cache de
+    /// préfixe (hit exact, extension per-op du suffixe, sinon prefill complet
+    /// puis insertion). Les captures rendues couvrent `from..prompt.len()`, au
+    /// plus `keep_rows` positions ; `from` est la quatrième valeur.
+    #[cfg(feature = "devtools")]
+    pub(in crate::decoder) fn prefill_cache_state_with_layer_capture_cached(
+        &self,
+        prompt: &[usize],
+        layer_ids: &[usize],
+        keep_rows: usize,
+    ) -> Result<(CausalDecoderCache, Tensor, Tensor, usize)> {
+        let profile = crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_PROFILE", false);
+        let started = Instant::now();
+        if prefix_cache_enabled() {
+            if let Some(hit) = self.prefix_cache_get_with_captures(prompt, layer_ids, keep_rows)? {
+                if profile {
+                    eprintln!(
+                        "dflash_prefill source=prefix_cache prompt={} from={} ms={}",
+                        prompt.len(),
+                        hit.3,
+                        started.elapsed().as_millis()
+                    );
+                }
+                return Ok(hit);
+            }
+        }
+        let (cache, final_state, hidden) =
+            self.prefill_cache_state_with_layer_capture(prompt, layer_ids)?;
+        let captures = PrefixCaptures::tail(layer_ids, 0, hidden, keep_rows)?;
+        let state = (cache, final_state);
+        if prefix_cache_enabled() {
+            self.prefix_cache_put(prompt, &state, None, Some(&captures))?;
+        }
+        if profile {
+            eprintln!(
+                "dflash_prefill source=full prompt={} from={} ms={}",
+                prompt.len(),
+                captures.from,
+                started.elapsed().as_millis()
+            );
+        }
+        Ok((state.0, state.1, captures.hidden, captures.from))
     }
 
     /// Variante committed de [`Self::prefix_cache_get`] : exige une entrée avec
@@ -3511,7 +3597,7 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, Tensor, LayerKvCache)>> {
-        let Some((mut output, cached_len, Some(mut history))) =
+        let Some((mut output, cached_len, Some(mut history), _)) =
             self.prefix_cache_hit(prompt, true)?
         else {
             return Ok(None);
@@ -3524,7 +3610,7 @@ impl CausalDecoder {
             states.extend_from_slice(&final_states.data()[..(suffix.len() - 1) * hidden]);
             self.seed_mtp_history_batched(&states, suffix, &mut history)?;
             output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
-            self.prefix_cache_put(prompt, &output, Some(&history))?;
+            self.prefix_cache_put(prompt, &output, Some(&history), None)?;
         }
         Ok(Some((output.0, output.1, history)))
     }
@@ -3538,7 +3624,14 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
         with_mtp_history: bool,
-    ) -> Result<Option<((CausalDecoderCache, Tensor), usize, Option<LayerKvCache>)>> {
+    ) -> Result<
+        Option<(
+            (CausalDecoderCache, Tensor),
+            usize,
+            Option<LayerKvCache>,
+            Option<PrefixCaptures>,
+        )>,
+    > {
         let mut cache = self
             .prefix_cache
             .lock()
@@ -3549,13 +3642,14 @@ impl CausalDecoder {
         if with_mtp_history && cache.entries[index].mtp_history.is_none() {
             return Ok(None);
         }
-        // ponytail: l'extension d'un préfixe passe par le forward per-op (~19 ms par
-        // token sur 27B 4 bits) contre ~6 ms par token pour le prefill résident
-        // complet : au-delà d'un tiers du prompt à recalculer, repartir de zéro est
-        // plus rapide. À remplacer par un prefill résident à offset de position.
+        // ponytail: l'extension d'un préfixe passe par le forward per-op (31 ms par
+        // token mesurés le 20 octobre sur 27B 4 bits, captures comprises) contre
+        // 3,6 ms par token pour le prefill résident complet : au-delà d'un huitième
+        // du prompt à recalculer, repartir de zéro est plus rapide. À remplacer par
+        // un prefill résident à offset de position.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if prefill_resident_enabled()
-            && (prompt.len() - cache.entries[index].tokens.len()) * 3 > prompt.len()
+            && (prompt.len() - cache.entries[index].tokens.len()) * 8 > prompt.len()
         {
             return Ok(None);
         }
@@ -3563,6 +3657,7 @@ impl CausalDecoder {
         let cached_len = entry.tokens.len();
         let mut output = (entry.cache.clone(), entry.final_state.clone());
         let history = entry.mtp_history.clone();
+        let captures = entry.captures.clone();
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let linear_metal_entry = entry.linear_metal.clone();
         cache.entries.insert(0, entry);
@@ -3573,7 +3668,7 @@ impl CausalDecoder {
             let linear_metal = self.copy_prefix_cache_linear_metal(&linear_metal_entry)?;
             self.restore_prefix_cache_linear_metal(&mut output.0, linear_metal)?;
         }
-        Ok(Some((output, cached_len, history)))
+        Ok(Some((output, cached_len, history, captures)))
     }
 
     fn extend_prefix_cache_suffix(
@@ -3659,6 +3754,7 @@ impl CausalDecoder {
         prompt: &[usize],
         state: &(CausalDecoderCache, Tensor),
         mtp_history: Option<&LayerKvCache>,
+        captures: Option<&PrefixCaptures>,
     ) -> Result<()> {
         let capacity = prefix_cache_capacity();
         if capacity == 0 {
@@ -3670,9 +3766,10 @@ impl CausalDecoder {
             .prefix_cache
             .lock()
             .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
-        // Une entrée identique déjà semée garde son historique si le nouvel état
-        // vient du chemin AR ou fresh.
+        // Une entrée identique déjà semée garde son historique (et ses captures
+        // DFlash) si le nouvel état vient d'un autre chemin.
         let mut mtp_history = mtp_history.cloned();
+        let mut captures = captures.cloned();
         if let Some(index) = cache
             .entries
             .iter()
@@ -3680,6 +3777,7 @@ impl CausalDecoder {
         {
             let previous = cache.entries.remove(index);
             mtp_history = mtp_history.or(previous.mtp_history);
+            captures = captures.or(previous.captures);
         }
         cache.entries.insert(
             0,
@@ -3688,6 +3786,7 @@ impl CausalDecoder {
                 cache: state.0.clone(),
                 final_state: state.1.clone(),
                 mtp_history,
+                captures,
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 linear_metal,
             },
@@ -4153,6 +4252,22 @@ fn concat_layer_captures(
 }
 
 #[cfg(feature = "devtools")]
+/// Empile `bottom` sous `top` (mêmes colonnes).
+#[cfg(feature = "devtools")]
+fn stack_rows(top: &Tensor, bottom: &Tensor) -> Result<Tensor> {
+    let (rows_top, cols) = top.as_matrix()?;
+    let (rows_bottom, cols_bottom) = bottom.as_matrix()?;
+    if cols != cols_bottom {
+        return Err(InferError::Dimension(format!(
+            "stack rows: colonnes {cols} contre {cols_bottom}"
+        )));
+    }
+    let mut data = Vec::with_capacity((rows_top + rows_bottom) * cols);
+    data.extend_from_slice(top.data());
+    data.extend_from_slice(bottom.data());
+    Tensor::from_vec(vec![rows_top + rows_bottom, cols], data)
+}
+
 fn take_tensor_rows(tensor: &Tensor, rows: usize) -> Result<Tensor> {
     let (total_rows, cols) = tensor.as_matrix()?;
     if rows == 0 || rows > total_rows {

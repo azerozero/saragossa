@@ -495,9 +495,11 @@ défaut, `SARAGOSSA_RUST_DFLASH_QUANT_BITS=0|8` pour dense ou u8) et
 `generate_greedy_mtp_inner` aiguille le greedy non contraint vers la boucle
 résidente, désormais streamée et annulable ; échantillonnage, contraintes et
 stop sequences gardent la tête MTP, et les harnais d'acceptance et pairwise
-ne sont pas détournés. Sans la variable, rien ne change. Limite connue : le
-prefill DFlash ne réutilise pas le cache de préfixe du décodeur, chaque
-requête re-préremplit tout le prompt.
+ne sont pas détournés. Sans la variable, rien ne change. Le prefill DFlash
+passe par le cache de préfixe comme MTP : l'entrée porte en plus les captures
+des couches cibles sur les 2048 dernières positions (fenêtre du drafter), un
+hit est prolongé per-op sur le suffixe avec ses captures, même règle du tiers
+qu'en MTP au-delà de laquelle le prefill résident complet repart de zéro.
 
 ## Limites
 

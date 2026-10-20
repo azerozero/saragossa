@@ -118,8 +118,22 @@ impl CausalDecoder {
             .checked_mul(hidden)
             .ok_or_else(|| InferError::Shape("DFlash contexte déborde".to_string()))?;
 
-        let (mut cache, final_state, target_hidden) =
-            self.prefill_cache_state_with_layer_capture(prompt, layer_ids)?;
+        // Toutes les couches fenêtrées : seules les `window` dernières positions du
+        // prompt sont attendues, les précédentes ne sont jamais lues (ni gardées
+        // dans le cache de préfixe).
+        let all_sliding = !draft.info.layer_types.is_empty()
+            && draft
+                .info
+                .layer_types
+                .iter()
+                .all(|kind| kind == "sliding_attention");
+        let keep_rows = draft
+            .info
+            .sliding_window
+            .filter(|_| all_sliding)
+            .unwrap_or(usize::MAX);
+        let (mut cache, final_state, target_hidden, captured_from) =
+            self.prefill_cache_state_with_layer_capture_cached(prompt, layer_ids, keep_rows)?;
         if !self.setup_resident_decode_from_prefill(&mut cache, max_new_tokens + draft_limit + 1)? {
             return Err(InferError::Config(
                 "decode DFlash résident: decode résident complet indisponible".to_string(),
@@ -171,19 +185,9 @@ impl CausalDecoder {
             };
             (drafter, buffers)
         };
-        // Toutes les couches fenêtrées : seules les `window` dernières positions du
-        // prompt sont attendues, les précédentes ne sont jamais lues.
-        let all_sliding = !draft.info.layer_types.is_empty()
-            && draft
-                .info
-                .layer_types
-                .iter()
-                .all(|kind| kind == "sliding_attention");
-        let skip = draft
-            .info
-            .sliding_window
-            .filter(|_| all_sliding)
-            .map_or(0, |window| prompt.len().saturating_sub(window));
+        // Les captures ne couvrent que `captured_from..prompt.len()` : le contexte
+        // du drafter commence au plus tôt là.
+        let skip = prompt.len().saturating_sub(keep_rows).max(captured_from);
         drafter.skip_context(skip)?;
         self.dflash_resident_append_context(
             &mut cache,
@@ -191,8 +195,8 @@ impl CausalDecoder {
             &mut drafter,
             &buffers,
             &target_hidden,
-            skip,
-            prompt.len(),
+            skip - captured_from,
+            prompt.len() - captured_from,
         )?;
 
         let mut sampler = DeterministicSampler::new(options.seed);

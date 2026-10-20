@@ -436,6 +436,7 @@ fn prefix_cache_selects_longest_append_prefix() {
             cache: model.empty_cache(),
             final_state: final_state.clone(),
             mtp_history: None,
+            captures: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             linear_metal: Vec::new(),
         },
@@ -444,6 +445,7 @@ fn prefix_cache_selects_longest_append_prefix() {
             cache: model.empty_cache(),
             final_state: final_state.clone(),
             mtp_history: None,
+            captures: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             linear_metal: Vec::new(),
         },
@@ -452,6 +454,7 @@ fn prefix_cache_selects_longest_append_prefix() {
             cache: model.empty_cache(),
             final_state,
             mtp_history: None,
+            captures: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             linear_metal: Vec::new(),
         },
@@ -2646,6 +2649,23 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         "boucle résidente avec stop token"
     );
     assert_eq!(streamed_stop, ar_stop, "callback avec stop token");
+    // Extension du cache de préfixe : prompt + 3 tokens déjà générés, suffixe
+    // et captures calculés per-op sur l'entrée précédente, même sortie que l'AR.
+    let mut extended = prompt.clone();
+    extended.extend_from_slice(&ar[..3]);
+    let resident_ext = model.generate_greedy_dflash_resident_with_options(
+        &extended,
+        max_new_tokens - 3,
+        &options,
+        &draft,
+        draft.info.block_size,
+    )?;
+    let ar_ext =
+        model.generate_greedy_cached_with_options(&extended, max_new_tokens - 3, &options)?;
+    assert_eq!(
+        resident_ext.tokens, ar_ext,
+        "extension du cache de préfixe avec captures"
+    );
     // Routage : le greedy MTP passe par DFlash (8 positions de draft, pas 2).
     let routed = model.generate_greedy_mtp_streaming_with_options(
         &prompt,

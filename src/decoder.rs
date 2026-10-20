@@ -1183,8 +1183,48 @@ struct PrefixCacheEntry {
     // Historique MTP committed semé sur `tokens` ; absent si l'entrée vient du
     // chemin AR ou fresh. Le chemin committed l'exige pour un hit.
     mtp_history: Option<LayerKvCache>,
+    /// Captures des couches cibles du drafter DFlash sur `tokens` ; absentes si
+    /// l'entrée vient du chemin AR ou MTP. Le chemin DFlash les exige pour un hit.
+    captures: Option<PrefixCaptures>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     linear_metal: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
+}
+
+/// Hidden states des couches `layer_ids` pour les positions `from..` d'un prompt,
+/// bornés à la fenêtre du drafter (les positions antérieures ne sont jamais lues).
+#[derive(Clone, Debug)]
+pub(crate) struct PrefixCaptures {
+    pub(crate) layer_ids: Vec<usize>,
+    pub(crate) from: usize,
+    /// `[positions, layer_ids.len() * hidden]`.
+    pub(crate) hidden: Tensor,
+}
+
+impl PrefixCaptures {
+    /// Garde au plus les `keep_rows` dernières lignes de `hidden` (positions
+    /// `from..`), en avançant `from` d'autant.
+    pub(crate) fn tail(
+        layer_ids: &[usize],
+        from: usize,
+        hidden: Tensor,
+        keep_rows: usize,
+    ) -> Result<Self> {
+        let (rows, cols) = hidden.as_matrix()?;
+        let drop = rows.saturating_sub(keep_rows.max(1));
+        let hidden = if drop == 0 {
+            hidden
+        } else {
+            Tensor::from_vec(
+                vec![rows - drop, cols],
+                hidden.data()[drop * cols..].to_vec(),
+            )?
+        };
+        Ok(Self {
+            layer_ids: layer_ids.to_vec(),
+            from: from + drop,
+            hidden,
+        })
+    }
 }
 
 impl PrefixCacheEntry {
@@ -1204,6 +1244,12 @@ impl PrefixCacheEntry {
                     .keys
                     .len()
                     .saturating_add(history.values.len())
+                    .saturating_mul(std::mem::size_of::<f32>())
+            }))
+            .saturating_add(self.captures.as_ref().map_or(0, |captures| {
+                captures
+                    .hidden
+                    .len()
                     .saturating_mul(std::mem::size_of::<f32>())
             }));
         #[cfg(all(target_os = "macos", feature = "metal"))]
