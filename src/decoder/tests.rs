@@ -471,6 +471,36 @@ fn prefix_cache_selects_longest_append_prefix() {
     assert_eq!(generation::longest_prefix_entry_index(&entries, &[9]), None);
 }
 
+/// Un hit DFlash exige les mêmes couches et des captures couvrant la fenêtre
+/// demandée ; une entrée à fenêtre plus courte est ignorée (prefill complet).
+#[test]
+#[cfg(feature = "devtools")]
+fn prefix_cache_dflash_hit_requires_capture_coverage() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let prompt = [1usize, 2, 3, 4];
+    let state = (model.empty_cache(), Tensor::row(vec![0.0])?);
+    let captures = PrefixCaptures::tail(
+        &[0],
+        0,
+        Tensor::from_vec(vec![4, 1], vec![1.0, 2.0, 3.0, 4.0])?,
+        2,
+    )?;
+    assert_eq!(captures.from, 2);
+    model.prefix_cache_put(&prompt, &state, None, Some(&captures))?;
+    let hit = model
+        .prefix_cache_get_with_captures(&prompt, &[0], 2)?
+        .ok_or_else(|| InferError::Config("hit attendu".to_string()))?;
+    assert_eq!(hit.3, 2);
+    assert_eq!(hit.2.data(), &[3.0, 4.0]);
+    assert!(model
+        .prefix_cache_get_with_captures(&prompt, &[0], 4)?
+        .is_none());
+    assert!(model
+        .prefix_cache_get_with_captures(&prompt, &[1], 2)?
+        .is_none());
+    Ok(())
+}
+
 #[test]
 fn prefix_cache_extends_append_suffix_with_batched_prefill() {
     let config = hybrid_config(4);
@@ -2660,8 +2690,15 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         &draft,
         draft.info.block_size,
     )?;
-    let ar_ext =
-        model.generate_greedy_cached_with_options(&extended, max_new_tokens - 3, &options)?;
+    // Référence AR sans cache de préfixe : l'oracle ne partage pas l'état étendu.
+    let ar_ext = model
+        .generate_greedy_timed_from_prompt_state_with_options(
+            model.prefill_prompt_state_uncached(&extended)?,
+            Duration::ZERO,
+            max_new_tokens - 3,
+            &options,
+        )?
+        .tokens;
     assert_eq!(
         resident_ext.tokens, ar_ext,
         "extension du cache de préfixe avec captures"

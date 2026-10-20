@@ -3505,7 +3505,7 @@ impl CausalDecoder {
     /// (forward per-op avec captures). Rend `(cache, état final, captures, from)`
     /// avec les captures bornées aux `keep_rows` dernières positions.
     #[cfg(feature = "devtools")]
-    fn prefix_cache_get_with_captures(
+    pub(super) fn prefix_cache_get_with_captures(
         &self,
         prompt: &[usize],
         layer_ids: &[usize],
@@ -3516,7 +3516,11 @@ impl CausalDecoder {
         else {
             return Ok(None);
         };
-        if captures.layer_ids != layer_ids {
+        // Même couches et captures couvrant toute la fenêtre demandée
+        // (`prompt.len() - keep_rows ..`) ; sinon l'entrée vient d'un drafter à
+        // fenêtre plus courte et le prefill complet la remplace.
+        if captures.layer_ids != layer_ids || captures.from > prompt.len().saturating_sub(keep_rows)
+        {
             return Ok(None);
         }
         if crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_PROFILE", false) {
@@ -3749,7 +3753,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    fn prefix_cache_put(
+    pub(super) fn prefix_cache_put(
         &self,
         prompt: &[usize],
         state: &(CausalDecoderCache, Tensor),
