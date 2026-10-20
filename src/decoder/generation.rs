@@ -3717,7 +3717,7 @@ impl CausalDecoder {
         // huitième du prompt à recalculer, repartir de zéro est plus rapide.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if prefill_resident_enabled()
-            && !prefix_extend_resident_enabled()
+            && !self.prefix_extend_resident_available()
             && (prompt.len() - cache.entries[index].tokens.len()) * 8 > prompt.len()
         {
             return Ok(None);
@@ -3773,12 +3773,15 @@ impl CausalDecoder {
                 "extension de préfixe vide".to_string(),
             ));
         }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         let trace = trace_prefill_enabled();
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let trace = false;
         let started = Instant::now();
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let base_len = cache.position;
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        let resident = prefix_extend_resident_enabled()
+        let resident = self.prefix_extend_resident_available()
             && self.setup_resident_decode_from_prefill(cache, suffix.len())?;
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let resident = false;
@@ -3836,6 +3839,18 @@ impl CausalDecoder {
             .map(|(data, ids)| Tensor::from_vec(vec![suffix.len(), ids.len() * hidden], data))
             .transpose()?;
         Ok((states, captures))
+    }
+
+    /// Vrai si l'extension d'un préfixe peut passer par le chemin résident en
+    /// lignes : flag posé, decode résident complet supporté (flags, Metal,
+    /// couches) et porte d'attention en sortie, exigée par la vérification
+    /// batchée des couches full-attn denses. Reste la garde mémoire du setup,
+    /// évaluée à l'allocation de l'arène.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn prefix_extend_resident_available(&self) -> bool {
+        prefix_extend_resident_enabled()
+            && self.config.attn_output_gate
+            && self.supports_resident_full_decode()
     }
 
     /// Libère l'arène temporaire d'une extension : les lignes K/V ajoutées depuis
