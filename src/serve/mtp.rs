@@ -26,14 +26,23 @@ fn supports_model(
         && !config.is_moe()
 }
 
+/// Température admise par le decode MTP : greedy, ou toute température finie
+/// strictement positive quand l'échantillonnage lossless est activé
+/// (`SARAGOSSA_RUST_MTP_SAMPLED=1`, lu par l'appelant).
+fn temperature_supported(temperature: f32, sampled: bool) -> bool {
+    temperature.abs() <= f32::EPSILON || (sampled && temperature.is_finite() && temperature > 0.0)
+}
+
 /// Le MTP vérifie le greedy non contraint ; l'échantillonnage (accept/reject
 /// lossless) est opt-in via `SARAGOSSA_RUST_MTP_SAMPLED=1`.
 pub(crate) fn supports_options(options: &saragossa::GenerationOptions) -> bool {
-    let temperature_ok = options.temperature.abs() <= f32::EPSILON
-        || (saragossa::runtime_flags::mtp_sampled_enabled()
-            && options.temperature.is_finite()
-            && options.temperature > 0.0);
-    temperature_ok && options.token_constraint.is_none() && options.stop_sequences.is_empty()
+    supports_options_with(options, saragossa::runtime_flags::mtp_sampled_enabled())
+}
+
+fn supports_options_with(options: &saragossa::GenerationOptions, sampled: bool) -> bool {
+    temperature_supported(options.temperature, sampled)
+        && options.token_constraint.is_none()
+        && options.stop_sequences.is_empty()
 }
 
 /// Indique si une requête doit emprunter le chemin MTP.
@@ -41,10 +50,22 @@ pub(super) fn routes_request(
     request: &ChatCompletionRequest,
     response_format: ResponseFormatMode,
 ) -> bool {
+    routes_request_with(
+        request,
+        response_format,
+        saragossa::runtime_flags::mtp_sampled_enabled(),
+    )
+}
+
+fn routes_request_with(
+    request: &ChatCompletionRequest,
+    response_format: ResponseFormatMode,
+    sampled: bool,
+) -> bool {
     matches!(response_format, ResponseFormatMode::Text)
         && request
             .temperature
-            .is_none_or(|temperature| temperature.abs() <= f32::EPSILON)
+            .is_none_or(|temperature| temperature_supported(temperature, sampled))
 }
 
 /// Renvoie la profondeur draft MTP, avec un minimum strict de un.
@@ -123,11 +144,45 @@ mod tests {
             temperature: 0.0,
             ..Default::default()
         };
-        assert!(supports_options(&options));
+        assert!(supports_options_with(&options, false));
+        assert!(supports_options_with(&options, true));
         for temperature in [0.7, -0.7, f32::NAN, f32::INFINITY] {
             options.temperature = temperature;
-            assert!(!supports_options(&options));
+            assert!(!supports_options_with(&options, false));
         }
+        options.temperature = 0.7;
+        assert!(supports_options_with(&options, true));
+        for temperature in [-0.7, f32::NAN, f32::INFINITY] {
+            options.temperature = temperature;
+            assert!(!supports_options_with(&options, true));
+        }
+    }
+
+    #[test]
+    fn request_routing_follows_sampled_opt_in() {
+        let sampled = request(r#"{"model":"m","messages":[],"temperature":0.7}"#);
+        assert!(!routes_request_with(
+            &sampled,
+            ResponseFormatMode::Text,
+            false
+        ));
+        assert!(routes_request_with(
+            &sampled,
+            ResponseFormatMode::Text,
+            true
+        ));
+        let negative = request(r#"{"model":"m","messages":[],"temperature":-0.7}"#);
+        assert!(!routes_request_with(
+            &negative,
+            ResponseFormatMode::Text,
+            true
+        ));
+        let greedy = request(r#"{"model":"m","messages":[],"temperature":0}"#);
+        assert!(routes_request_with(
+            &greedy,
+            ResponseFormatMode::Text,
+            false
+        ));
     }
 
     #[test]
