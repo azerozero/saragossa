@@ -3711,17 +3711,20 @@ impl CausalDecoder {
         if with_mtp_history && cache.entries[index].mtp_history.is_none() {
             return Ok(None);
         }
-        // ponytail: sans extension résidente, le suffixe passe par le forward per-op
-        // (31 ms par token mesurés le 20 octobre sur 27B 4 bits, captures comprises)
-        // contre 3,6 ms par token pour le prefill résident complet : au-delà d'un
-        // huitième du prompt à recalculer, repartir de zéro est plus rapide.
+        // ponytail: le suffixe coûte 31 ms par token en per-op et 5 à 9 ms en
+        // lignes résidentes (nuit du 20 au 21 octobre, 27B 4 bits) contre 4 à 5 ms
+        // pour le prefill résident complet : au-delà d'un huitième (per-op) ou de
+        // la moitié (lignes) du prompt à recalculer, repartir de zéro est plus rapide.
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if prefill_resident_enabled()
-            && self.forward_runtime().metal_executor().is_some()
-            && !self.prefix_extend_resident_available()
-            && (prompt.len() - cache.entries[index].tokens.len()) * 8 > prompt.len()
-        {
-            return Ok(None);
+        if prefill_resident_enabled() && self.forward_runtime().metal_executor().is_some() {
+            let divisor = if self.prefix_extend_resident_available() {
+                2
+            } else {
+                8
+            };
+            if (prompt.len() - cache.entries[index].tokens.len()) * divisor > prompt.len() {
+                return Ok(None);
+            }
         }
         let entry = cache.entries.remove(index);
         let cached_len = entry.tokens.len();

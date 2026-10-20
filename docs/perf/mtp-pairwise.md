@@ -507,37 +507,84 @@ contre 49 s. Réserve : sur T7 le decode DFlash tombe à 13 tok/s contre 27 en
 MTP sur les 32 premiers tokens (vérification à 9 lignes sur 8k de contexte,
 début de réponse structuré), cas hors phase 7 qui confirme l'opt-in.
 
-Extension résidente du cache de préfixe (20 octobre, préparée ; bench de nuit
-en attente) : le suffixe d'un hit ne passe plus par le forward per-op mais par
-la vérification en lignes du decode résident. Une arène temporaire est seedée
+Extension résidente du cache de préfixe (20 octobre, mesurée la nuit du 20 au
+21) : le suffixe d'un hit ne passe plus par le forward per-op mais par la
+vérification en lignes du decode résident. Une arène temporaire est seedée
 depuis le KV CPU de l'entrée, le suffixe est traité par blocs de 256 lignes
 (`SARAGOSSA_RUST_PREFIX_EXTEND_ROWS`), les lignes K/V ajoutées sont relues
-vers le cache CPU et l'arène rendue : le decode qui suit seed son arène comme
-avant (double upload du KV, levier suivant si la mesure le justifie).
-Kill-switch `SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT=0` (retour au per-op et au
-seuil d'un huitième). Chemin partagé par l'AR, l'extension MTP committed,
-DFlash (captures des couches cibles rendues par le même passage) et
-`extend_prompt_state` de serve. Oracle réel (prompt de 28 tokens, machine
-chargée) : 3 lignes en 46 ms, 29 lignes en 129 ms (4,4 ms par token contre
-31 per-op), suites identiques à l'AR non caché. Bascule intégrée : quand
-`SARAGOSSA_RUST_DFLASH_SWITCH_MIN` est posé, le prefill DFlash sème aussi
-l'historique MTP committed et l'extension le prolonge, donc le repli MTP après
-bascule retrouve l'entrée du cache au lieu de re-préremplir prompt + généré :
-8 ms de prefill contre 150 ms sur l'oracle. À mesurer machine calme : serve
-multi-tour T2 et T7 avec et sans extension résidente (MTP et DFlash), puis
-A/B/M de la bascule sur T0/T2 (prose) et T1/T6 (code) à 64 et 500 tokens.
+vers le cache CPU et l'arène rendue. Kill-switch
+`SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT=0` (retour au per-op et au seuil d'un
+huitième). Chemin partagé par l'AR, l'extension MTP committed, DFlash
+(captures des couches cibles rendues par le même passage) et
+`extend_prompt_state` de serve. Serve multi-tour, VM en fond (110-630 % CPU),
+prefill du tour 2 (`prefill_ms`, extension en lignes contre per-op) :
 
-Spéculatif échantillonné (20 octobre, préparé) : le cœur MTP vérifie déjà les
-drafts avec température par accept/reject lossless (`lossless_speculative_sample`,
-distribution du draft fournie par la tête MTP), mais seules les requêtes greedy
-y étaient routées. `SARAGOSSA_RUST_MTP_SAMPLED=1` (opt-in) étend le routage de
-`serve`, `run` et la CLI aux requêtes à température > 0 sans contrainte ni stop
-sequence. Oracle réel : à T = 0,05 la sortie est celle de l'AR greedy sur 32
-tokens, une même graine rejoue la même sortie, 18 drafts acceptés sur 21 à
-T = 0,7. Réserve : les drafts de la tête MTP et les distributions cibles restent
-per-op avec température (4,3 s pour 32 tokens sous charge), le bench de nuit
-compare à l'AR échantillonné résident ; si MTP perd, le chantier suivant est le
-draft résident avec distribution.
+| Prompt | Suffixe | MTP résident | MTP per-op | DFlash résident | DFlash per-op |
+|---|---|---|---|---|---|
+| T2 (732) | 86 | 664-708 ms | 2489 ms | 638-787 ms | 2270 ms |
+| T7 (8297) | 54 | 1244-1303 ms | 5865 ms | 1209-1386 ms | 7222 ms |
+
+Trace `prefix_extend` : T2 86 lignes en 467-667 ms (5,4-7,8 ms par token,
+seed de l'arène 9-16 ms, relecture 2-3 ms) ; T7 54 lignes en 445-531 ms
+(9 ms par token sur 8k de contexte, seed 68-121 ms, relecture 5-8 ms). Le
+seed de l'arène pèse moins de 10 % du tour même sur 8k : la réutilisation de
+l'arène pour le decode (v2) n'est pas justifiée. En revanche 550-670 ms du tour
+T7 sont hors extension (clone de l'entrée du cache de préfixe de 8k à la
+lecture puis à l'écriture) : levier suivant sur contexte long. Par token,
+l'extension en lignes reste 1,5 à 2 fois plus chère que le prefill résident
+complet (4,1 ms par token sur T2, 4,9 sur T7 sans semis MTP) : au-delà de la
+moitié du prompt à recalculer, le prefill complet reprend la main (seuil dans
+`prefix_cache_hit`, un huitième sans extension résidente).
+
+Bascule intégrée (A DFlash, B DFlash puis repli MTP par acceptance 4,0 après 8
+tours, M MTP, harnais d'acceptance, médianes, VM en fond) :
+
+| Prompt | A 64 | B 64 | M 64 | A 500 | B 500 | M 500 |
+|---|---|---|---|---|---|---|
+| T0 prose | 32,7 | 29,3 | 51,4 | 56,3 | 43,5 | 46,5 |
+| T2 prose | 32,2 | 32,2 | 46,7 | 50,1 | 45,2 | 46,9 |
+| T1 code | 60,2 | 56,3 | 54,1 | 70,5 | 71,0 | 49,1 |
+| T6 code | 110,8 | 111,9 | 75,7 | 110,4 | 111,4 | 74,5 |
+
+Le repli retrouve bien l'entrée du cache (bascule au tour 19-35, suite
+identique à l'AR partout) mais B ne rejoint M nulle part en prose : il paie
+le départ DFlash lent, et à 500 tokens le DFlash seul dépasse déjà M sur T0 et
+T2 (phase 7 confirmée). La bascule reste opt-in. Les cellules M à 64 tokens
+(51,4 / 54,1 / 46,7) confirment que les 47-51 tok/s du contrôle d1 tiennent
+toujours : les 41-46 relevés le 20 étaient des runs à 200 tokens sous charge.
+
+Spéculatif échantillonné (20 octobre, mesuré la nuit du 20 au 21) : le cœur
+MTP vérifie déjà les drafts avec température par accept/reject lossless
+(`lossless_speculative_sample`, distribution du draft fournie par la tête MTP),
+mais seules les requêtes greedy y étaient routées. `SARAGOSSA_RUST_MTP_SAMPLED=1`
+(opt-in) étend le routage de `serve`, `run` et la CLI aux requêtes à
+température > 0 sans contrainte ni stop sequence. Oracle réel : à T = 0,05 la
+sortie est celle de l'AR greedy sur 32 tokens, une même graine rejoue la même
+sortie, 18 drafts acceptés sur 21 à T = 0,7. Mesure CLI, 200 tokens, T = 0,7,
+graine 1 : AR échantillonné 32,6 / 32,0 / 32,4 tok/s (T0 / T2 / T6) contre MTP
+échantillonné 6,9 / 2,0 / 10,4. Avec température, drafts de la tête MTP,
+lm_head et distributions cibles sont per-op sur CPU (493 ms par cycle sur T2,
+profondeur moyenne 1,18) : le flag reste à 0 et le chantier suivant est le
+draft résident avec distribution (lm_head GPU, relecture des logits, sampling
+CPU).
+
+Comparatif mlx_lm 0.32.2 (même checkpoint MLX u4 gs64, 200 tokens, 2 reps,
+VM en fond) :
+
+| Prompt | mlx_lm greedy | MTP défaut | DFlash | mlx_lm T0,7 | AR T0,7 |
+|---|---|---|---|---|---|
+| T0 | 32,4 | 47,6 | 49,7 | 32,3 | 32,7 |
+| T1 | 32,4 | 49,6 | 73,9 | | |
+| T2 | 32,2 | 45,5 | 45,8 | 32,0 | 31,8 |
+| T6 | 32,3 | 75,0 | 115,1 | | |
+
+Decode : l'AR saragossa est à parité avec mlx_lm (32 tok/s, limite mémoire du
+27B 4 bits), le MTP ajoute +41 à +132 % et DFlash +42 à +256 %. Prefill : mlx
+annonce 825 tok/s sur T2 (772 tokens avec template) et 727 sur T6 contre
+251-304 et 262-282 pour saragossa, soit 2,6 à 3,1 fois plus vite ; les cellules
+T0/T1 de mlx (131-257 tok/s) incluent sa compilation sur un prompt court et
+ne comptent pas. Le prefill est le prochain levier pour le contexte long
+(T7 : 40 s DFlash, 62 s MTP dont 22 s de semis CPU de l'historique MTP).
 
 ## Limites
 
