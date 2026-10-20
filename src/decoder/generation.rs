@@ -3717,6 +3717,7 @@ impl CausalDecoder {
         // huitième du prompt à recalculer, repartir de zéro est plus rapide.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if prefill_resident_enabled()
+            && self.forward_runtime().metal_executor().is_some()
             && !self.prefix_extend_resident_available()
             && (prompt.len() - cache.entries[index].tokens.len()) * 8 > prompt.len()
         {
