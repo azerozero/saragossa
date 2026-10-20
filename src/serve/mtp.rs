@@ -233,11 +233,31 @@ mod tests {
         let sampled = request(r#"{"model":"m","messages":[],"temperature":0.7}"#);
         let negative = request(r#"{"model":"m","messages":[],"temperature":-0.7}"#);
 
-        assert!(routes_request(&absent, ResponseFormatMode::Text));
-        assert!(routes_request(&zero, ResponseFormatMode::Text));
-        assert!(!routes_request(&sampled, ResponseFormatMode::Text));
-        assert!(!routes_request(&negative, ResponseFormatMode::Text));
-        assert!(!routes_request(&zero, ResponseFormatMode::JsonObject));
-        assert!(!routes_request(&zero, ResponseFormatMode::JsonLines));
+        assert!(routes_request_with(
+            &absent,
+            ResponseFormatMode::Text,
+            false
+        ));
+        assert!(routes_request_with(&zero, ResponseFormatMode::Text, false));
+        assert!(!routes_request_with(
+            &sampled,
+            ResponseFormatMode::Text,
+            false
+        ));
+        assert!(!routes_request_with(
+            &negative,
+            ResponseFormatMode::Text,
+            false
+        ));
+        assert!(!routes_request_with(
+            &zero,
+            ResponseFormatMode::JsonObject,
+            false
+        ));
+        assert!(!routes_request_with(
+            &zero,
+            ResponseFormatMode::JsonLines,
+            true
+        ));
     }
 }
