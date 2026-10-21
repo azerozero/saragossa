@@ -28,13 +28,13 @@ fn supports_model(
 
 /// Température admise par le decode MTP : greedy, ou toute température finie
 /// strictement positive quand l'échantillonnage lossless est activé
-/// (`SARAGOSSA_RUST_MTP_SAMPLED=1`, lu par l'appelant).
+/// (défaut, kill-switch `SARAGOSSA_RUST_MTP_SAMPLED=0`, lu par l'appelant).
 fn temperature_supported(temperature: f32, sampled: bool) -> bool {
     temperature.abs() <= f32::EPSILON || (sampled && temperature.is_finite() && temperature > 0.0)
 }
 
-/// Le MTP vérifie le greedy non contraint ; l'échantillonnage (accept/reject
-/// lossless) est opt-in via `SARAGOSSA_RUST_MTP_SAMPLED=1`.
+/// Le MTP vérifie le greedy non contraint et, par défaut, l'échantillonnage
+/// (accept/reject lossless) ; `SARAGOSSA_RUST_MTP_SAMPLED=0` le coupe.
 pub(crate) fn supports_options(options: &saragossa::GenerationOptions) -> bool {
     supports_options_with(options, saragossa::runtime_flags::mtp_sampled_enabled())
 }
