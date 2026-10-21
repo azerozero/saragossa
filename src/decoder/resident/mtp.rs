@@ -5,6 +5,13 @@ use crate::metal_backend::MetalExecutor;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 type ResidentMtpSpecOneOutput = (usize, usize, MtpFinalState, Option<(usize, MtpFinalState)>);
 
+/// Sortie d'un pas de draft MTP résident : l'argmax GPU ou la ligne de logits.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+enum MtpDraftResident {
+    Token(usize),
+    Logits(Vec<f32>),
+}
+
 impl CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     fn reset_mtp_append_oracle(mtp: &mut ResidentMtpArena) {
@@ -804,6 +811,40 @@ impl CausalDecoder {
         token_id: usize,
         position: usize,
     ) -> Result<usize> {
+        match self.next_mtp_draft_resident_with(cache, token_id, position, false)? {
+            MtpDraftResident::Token(token) => Ok(token),
+            MtpDraftResident::Logits(_) => Err(InferError::Metal(
+                "draft MTP résident : logits reçus, token attendu".to_string(),
+            )),
+        }
+    }
+
+    /// Draft MTP résident dont la tête rend la ligne de logits complète (lue
+    /// sur le CPU) au lieu de l'argmax GPU : l'échantillonnage lossless à T>0
+    /// a besoin de la distribution du draft.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(in crate::decoder) fn next_mtp_draft_resident_logits(
+        &self,
+        cache: &mut CausalDecoderCache,
+        token_id: usize,
+        position: usize,
+    ) -> Result<Vec<f32>> {
+        match self.next_mtp_draft_resident_with(cache, token_id, position, true)? {
+            MtpDraftResident::Logits(logits) => Ok(logits),
+            MtpDraftResident::Token(_) => Err(InferError::Metal(
+                "draft MTP résident : token reçu, logits attendus".to_string(),
+            )),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn next_mtp_draft_resident_with(
+        &self,
+        cache: &mut CausalDecoderCache,
+        token_id: usize,
+        position: usize,
+        readback_logits: bool,
+    ) -> Result<MtpDraftResident> {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Err(InferError::Metal(
                 "executor Metal absent pour MTP résident".to_string(),
@@ -966,23 +1007,40 @@ impl CausalDecoder {
             hidden,
             eps,
         )?;
-        metal.encode_lm_head_argmax_buffers(
-            encoder,
-            &mut owned,
-            output_hidden,
-            &mtp.draft_lm_head,
-            mtp.index.buffer(),
-            hidden,
-        )?;
+        let logits_readback = if readback_logits {
+            Some(metal.encode_lm_head_logits_readback_buffers(
+                encoder,
+                output_hidden,
+                &mtp.draft_lm_head,
+                hidden,
+            )?)
+        } else {
+            metal.encode_lm_head_argmax_buffers(
+                encoder,
+                &mut owned,
+                output_hidden,
+                &mtp.draft_lm_head,
+                mtp.index.buffer(),
+                hidden,
+            )?;
+            None
+        };
         encoder.end_encoding();
         crate::metal_backend::commit_and_wait(command_buffer)?;
+        mtp.current_is_a = !mtp.current_is_a;
 
+        if let Some((buffer, len)) = logits_readback {
+            return Ok(MtpDraftResident::Logits(
+                crate::metal_backend::read_f32_buffer(&buffer, len)?,
+            ));
+        }
         let raw = crate::metal_backend::read_u32_buffer(mtp.index.buffer(), 1)?
             .into_iter()
             .next()
             .ok_or_else(|| InferError::Metal("MTP résident sans index".to_string()))?;
-        mtp.current_is_a = !mtp.current_is_a;
-        usize::try_from(raw).map_err(|_| InferError::Metal(format!("index MTP trop grand: {raw}")))
+        usize::try_from(raw)
+            .map(MtpDraftResident::Token)
+            .map_err(|_| InferError::Metal(format!("index MTP trop grand: {raw}")))
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
