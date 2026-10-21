@@ -9,7 +9,7 @@ use crate::DFlashDraft;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use super::attention_ops::AttentionLayout;
-use super::attention_ops::{full_attention_context_cached, full_attention_context_prefill};
+use super::attention_ops::{full_attention_append_kv_rows, full_attention_context_cached};
 use super::lookup::NgramLookup;
 use super::mtp::{concat_row_pair, concat_rows};
 use super::mtp_adaptive::AdaptiveDepthController;
@@ -3443,9 +3443,9 @@ impl CausalDecoder {
         tokens: &[usize],
         history: &mut LayerKvCache,
     ) -> Result<()> {
-        // Par blocs : l'attention CPU du bloc matérialise ses scores (lignes du
-        // bloc × positions vues), un bloc unique de 8k tokens coûtait 130 s.
-        const SEED_CHUNK: usize = 64;
+        // Par blocs pour borner la mémoire des activations (fc, q/k/v) : sans
+        // attention, le coût par bloc ne dépend plus de l'historique.
+        const SEED_CHUNK: usize = 1024;
         let hidden = self.final_norm.data().len();
         for (states, tokens) in states
             .chunks(SEED_CHUNK.saturating_mul(hidden).max(1))
@@ -3491,15 +3491,14 @@ impl CausalDecoder {
             .forward_with_runtime(&concat_rows(&embedding, &hidden)?, runtime)?;
         let normed = rms_norm(&x, &head.layer.input_norm, eps)?;
         let position = history.len();
-        let _ = full_attention_context_prefill(
+        full_attention_append_kv_rows(
             &self.config,
             &normed,
             history,
             position,
             &head.layer.attention,
             runtime,
-        )?;
-        Ok(())
+        )
     }
 
     fn prefix_cache_get(&self, prompt: &[usize]) -> Result<Option<(CausalDecoderCache, Tensor)>> {
