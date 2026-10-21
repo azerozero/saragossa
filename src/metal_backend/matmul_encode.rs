@@ -320,7 +320,17 @@ impl MetalExecutor {
         };
         let (gp, gpo, gs, gso, gb, gbo) = quant(gate, "gate_proj")?;
         let (up_p, upo, us, uso, ub, ubo) = quant(up, "up_proj")?;
-        let (dp, dpo, ds, dso, db, dbo) = quant(down, "down_proj")?;
+        let (dp, _, ds, _, db, _) = quant(down, "down_proj")?;
+        // Le prédicat de décision est réévalué par l'encodeur lui-même, avant tout
+        // dispatch : une grille tronquée (dimension non multiple de 64), un poids
+        // poolé (offset non nul) ou un u8/gs32 lu comme du u4 gs64 donnerait un
+        // résultat faux sans erreur. Mêmes arguments qu'à l'allocation du scratch.
+        if !self.fused_dense_mlp_supported(batch, in_dim, gate, up, down, inter_dim) {
+            return Err(InferError::Config(
+                "MLP fusionné : poids ou dimensions hors du prédicat fused_dense_mlp_supported"
+                    .into(),
+            ));
+        }
         let pso = self
             .na_gemm_coop_qb_tiled_u4_gate_up_swiglu
             .as_ref()
@@ -374,11 +384,6 @@ impl MetalExecutor {
             MTLSize::new(width * 4, 1, 1),
         );
         post_dispatch_barrier_buffer(encoder, &hidden_bf16);
-        if dpo != 0 || dso != 0 || dbo != 0 {
-            return Err(InferError::Config(
-                "MLP fusionné : down_proj avec offsets non nuls".into(),
-            ));
-        }
         self.dispatch_affine_qmm_na_fused_tiled_u4(
             encoder,
             down_pso,

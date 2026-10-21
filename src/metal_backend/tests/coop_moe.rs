@@ -1495,3 +1495,69 @@ fn coop_qb_tiled_u4_bit_identical_to_u8_same_weights() -> Result<()> {
     }
     Ok(())
 }
+
+/// Prédicat du MLP fusionné : accepte seulement trois poids u4 gs64 sans offset
+/// aux bonnes dimensions ; un offset non nul (poids poolé, régression de
+/// 9f23853), un poids dense ou une forme inattendue renvoient au chemin séparé.
+#[test]
+fn fused_dense_mlp_supported_rejects_offsets_dense_and_shape() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    if executor.na_gemm_coop_qb_tiled_u4_gate_up_swiglu.is_none()
+        || !executor.qmm_na_fused_tiled_u4_available(FAST_QMV_GROUP_SIZE)
+    {
+        eprintln!("skip: coop qb tiled u4 fusionné indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    // NOTE: l'assertion positive suppose les flags par défaut
+    // (SARAGOSSA_RUST_PREFILL_FUSED_MLP, QMM_NA_FUSED_TILED, QMM_NA_MIN_BATCH ≤ 64).
+    let (batch, in_dim, inter_dim) = (64_usize, 2048_usize, 2048_usize);
+    // Le prédicat ne lit que les métadonnées : des buffers d'un mot suffisent.
+    let word = executor.buffer_from_slice(&[0_u32], "fused_pred_word")?;
+    let u4 = |out_dim: usize, in_dim: usize, offset: u64| MetalLinearWeightBuffers::AffineQuantized {
+        packed: word.clone(),
+        packed_offset: offset,
+        scales: word.clone(),
+        scales_offset: 0,
+        biases: word.clone(),
+        biases_offset: 0,
+        out_dim,
+        in_dim,
+        packed_cols: in_dim / 8,
+        group_size: FAST_QMV_GROUP_SIZE,
+        bits: FAST_QMV_BITS,
+        groups: in_dim / FAST_QMV_GROUP_SIZE,
+    };
+    let gate = u4(inter_dim, in_dim, 0);
+    let up = u4(inter_dim, in_dim, 0);
+    let down = u4(in_dim, inter_dim, 0);
+    let supported = |g: &MetalLinearWeightBuffers, u: &MetalLinearWeightBuffers, d: &MetalLinearWeightBuffers| {
+        executor.fused_dense_mlp_supported(batch, in_dim, g, u, d, inter_dim)
+    };
+    assert!(supported(&gate, &up, &down), "trois poids u4 gs64 sans offset doivent être acceptés");
+    assert!(
+        !supported(&u4(inter_dim, in_dim, 64), &up, &down),
+        "un offset non nul sur gate doit renvoyer au chemin séparé"
+    );
+    assert!(
+        !supported(&gate, &up, &u4(in_dim, inter_dim, 64)),
+        "un offset non nul sur down doit renvoyer au chemin séparé"
+    );
+    assert!(
+        !supported(&gate, &up, &u4(in_dim + 64, inter_dim, 0)),
+        "un down de mauvaise sortie doit renvoyer au chemin séparé"
+    );
+    let dense = MetalLinearWeightBuffers::Dense {
+        rhs: word.clone(),
+        rhs_bf16: None,
+        out_dim: inter_dim,
+        in_dim,
+    };
+    assert!(!supported(&dense, &up, &down), "un poids dense doit renvoyer au chemin séparé");
+    assert!(
+        !executor.fused_dense_mlp_supported(1, in_dim, &gate, &up, &down, inter_dim),
+        "batch 1 reste sur le chemin séparé (kernel NA réservé aux batches ≥ 32)"
+    );
+    Ok(())
+}
