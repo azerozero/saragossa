@@ -283,7 +283,8 @@ impl MetalExecutor {
 
     /// MLP dense fusionné : `out = down(swiglu(gate(x), up(x)))` en deux
     /// dispatchs NA, H en bf16 privé sans sortie f32 intermédiaire. L'appelant
-    /// vérifie [`Self::fused_dense_mlp_supported`] avant.
+    /// décide via [`Self::fused_dense_mlp_supported`] ; le prefill résident le
+    /// fait à l'allocation du scratch, qui n'a alors pas de buffers gate/up/hidden.
     pub(crate) fn encode_fused_dense_mlp(
         &self,
         encoder: &ComputeCommandEncoderRef,

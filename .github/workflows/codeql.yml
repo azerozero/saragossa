@@ -8,13 +8,10 @@ on:
       - "**.txt"
       - "LICENSE*"
       - "NOTICE"
+  # Pas de filtre de chemins ici : « CodeQL Rust » est un check requis par la
+  # ruleset de main, une PR purement documentaire resterait sinon bloquée.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "**.txt"
-      - "LICENSE*"
-      - "NOTICE"
   schedule:
     - cron: "0 6 * * 1"
 
