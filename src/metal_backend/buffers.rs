@@ -696,9 +696,16 @@ impl MetalExecutor {
         if len == 0 {
             return Err(InferError::Metal(format!("buffer {label} vide")));
         }
-        Ok(self
+        let buffer = self
             .device
-            .new_buffer(byte_len::<f32>(len)?, MTLResourceOptions::StorageModeShared))
+            .new_buffer(byte_len::<f32>(len)?, MTLResourceOptions::StorageModeShared);
+        if crate::runtime_flags::trace_gpu_alloc_enabled() {
+            eprintln!(
+                "uncached_alloc label={label} len={len} element=f32 bytes={}",
+                buffer.length()
+            );
+        }
+        Ok(buffer)
     }
 
     /// Buffer u32 frais NON mémoïsé (StorageModeShared, lisible CPU) — pour les
@@ -712,9 +719,16 @@ impl MetalExecutor {
         if len == 0 {
             return Err(InferError::Metal(format!("buffer {label} vide")));
         }
-        Ok(self
+        let buffer = self
             .device
-            .new_buffer(byte_len::<u32>(len)?, MTLResourceOptions::StorageModeShared))
+            .new_buffer(byte_len::<u32>(len)?, MTLResourceOptions::StorageModeShared);
+        if crate::runtime_flags::trace_gpu_alloc_enabled() {
+            eprintln!(
+                "uncached_alloc label={label} len={len} element=u32 bytes={}",
+                buffer.length()
+            );
+        }
+        Ok(buffer)
     }
 
     pub(super) fn private_f32_buffer(
@@ -809,6 +823,16 @@ impl MetalExecutor {
         };
         let buffer = self.device.new_buffer(bytes, options);
         buffers.total_bytes = buffers.total_bytes.saturating_add(buffer.length());
+        if crate::runtime_flags::trace_gpu_alloc_enabled() {
+            // Une ligne par allocation neuve (jamais par hit) : c'est ce qui
+            // permet de ventiler l'empreinte d'un prefill long par buffer.
+            eprintln!(
+                "scratch_alloc label={label} len={len} element={element:?} bytes={} total_bytes={} entries={}",
+                buffer.length(),
+                buffers.total_bytes,
+                buffers.entries.len() + 1
+            );
+        }
         buffers.entries.insert(
             key,
             ScratchBufferEntry {

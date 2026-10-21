@@ -297,27 +297,30 @@ impl MetalExecutor {
         inter_dim: usize,
         output_buffer: &BufferRef,
     ) -> Result<()> {
-        let quant = |weight: &MetalLinearWeightBuffers, name: &str| match weight {
-            MetalLinearWeightBuffers::AffineQuantized {
-                packed,
-                packed_offset,
-                scales,
-                scales_offset,
-                biases,
-                biases_offset,
-                ..
-            } => Ok((
-                packed.clone(),
-                *packed_offset,
-                scales.clone(),
-                *scales_offset,
-                biases.clone(),
-                *biases_offset,
-            )),
-            MetalLinearWeightBuffers::Dense { .. } => Err(InferError::Config(format!(
-                "MLP fusionné : {name} n'est pas quantifié"
-            ))),
-        };
+        type Quant<'a> = (&'a Buffer, u64, &'a Buffer, u64, &'a Buffer, u64);
+        fn quant<'a>(weight: &'a MetalLinearWeightBuffers, name: &str) -> Result<Quant<'a>> {
+            match weight {
+                MetalLinearWeightBuffers::AffineQuantized {
+                    packed,
+                    packed_offset,
+                    scales,
+                    scales_offset,
+                    biases,
+                    biases_offset,
+                    ..
+                } => Ok((
+                    packed,
+                    *packed_offset,
+                    scales,
+                    *scales_offset,
+                    biases,
+                    *biases_offset,
+                )),
+                MetalLinearWeightBuffers::Dense { .. } => Err(InferError::Config(format!(
+                    "MLP fusionné : {name} n'est pas quantifié"
+                ))),
+            }
+        }
         let (gp, gpo, gs, gso, gb, gbo) = quant(gate, "gate_proj")?;
         let (up_p, upo, us, uso, ub, ubo) = quant(up, "up_proj")?;
         let (dp, _, ds, _, db, _) = quant(down, "down_proj")?;
@@ -351,12 +354,12 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(&lhs_bf16), 0);
-        encoder.set_buffer(1, Some(&gp), gpo);
-        encoder.set_buffer(2, Some(&gs), gso);
-        encoder.set_buffer(3, Some(&gb), gbo);
-        encoder.set_buffer(4, Some(&up_p), upo);
-        encoder.set_buffer(5, Some(&us), uso);
-        encoder.set_buffer(6, Some(&ub), ubo);
+        encoder.set_buffer(1, Some(gp), gpo);
+        encoder.set_buffer(2, Some(gs), gso);
+        encoder.set_buffer(3, Some(gb), gbo);
+        encoder.set_buffer(4, Some(up_p), upo);
+        encoder.set_buffer(5, Some(us), uso);
+        encoder.set_buffer(6, Some(ub), ubo);
         encoder.set_buffer(7, Some(&hidden_bf16), 0);
         encoder.set_bytes(8, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
@@ -388,9 +391,9 @@ impl MetalExecutor {
             encoder,
             down_pso,
             &hidden_bf16,
-            &dp,
-            &ds,
-            &db,
+            dp,
+            ds,
+            db,
             output_buffer,
             batch,
             inter_dim,
