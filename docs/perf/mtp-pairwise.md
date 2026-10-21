@@ -568,6 +568,26 @@ profondeur moyenne 1,18) : le flag reste à 0 et le chantier suivant est le
 draft résident avec distribution (lm_head GPU, relecture des logits, sampling
 CPU).
 
+Suite (21 octobre) : la distribution résiduelle du rejet passe en O(V) (scan
+du draft par token du target = 248k² par rejet) : MTP échantillonné T2 2,0 →
+8,2 tok/s. Puis chemin résident à T>0 sous le même flag : arène résidente
+construite comme en greedy, draft de la tête MTP résident avec relecture de la
+ligne de logits (`next_mtp_draft_resident_logits`, softmax et tirage CPU),
+vérification en lignes avec rollback par captures résidentes (plus de snapshot
+CPU ni de rejeu), et distribution complète sans tri du vocabulaire quand
+top_p = 1. Mesure CLI, 200 tokens, T = 0,7, graine 1 :
+
+| Prompt | AR T0,7 | MTP échantillonné nuit | MTP échantillonné résident |
+|---|---|---|---|
+| T0 | 32,2 | 6,9 | 31,2 |
+| T2 | 32,5 | 2,0 | 29,1 |
+| T6 | 31,5 | 10,4 | 33,7 |
+
+Parité avec l'AR, pas encore de gain : le flag reste opt-in. Reste par cycle
+le lm_head des lignes cibles via l'API Tensor (envoi, matmul, relecture par
+ligne) et deux softmax de 248k par draft ; levier suivant = logits des lignes
+cibles calculés dans le command buffer de vérification et relus en bloc.
+
 Comparatif mlx_lm 0.32.2 (même checkpoint MLX u4 gs64, 200 tokens, 2 reps,
 VM en fond) :
 

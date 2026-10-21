@@ -188,6 +188,13 @@ pub fn token_distribution_top_k_top_p(
         .collect();
 
     if top_k == 0 || top_k >= logits.len() {
+        if top_p >= 1.0 {
+            // Distribution complète : le tri de tout le vocabulaire (248k sur
+            // Qwen3.5) ne sert qu'à la troncature nucleus. Ordre naturel des
+            // tokens, sans les probabilités nulles (exp sous-dépassé).
+            indexed_probs.retain(|(_, prob)| *prob > 0.0);
+            return normalize_distribution(indexed_probs, logits);
+        }
         indexed_probs.sort_by(|(_, left), (_, right)| right.total_cmp(left));
         let mut nucleus = Vec::new();
         let mut cumulative = 0.0_f32;
@@ -247,6 +254,9 @@ pub fn sample_from_token_distribution(
     let roll = sampler.next_unit_f32() * sum;
     let mut acc = 0.0_f32;
     for (token, prob) in distribution {
+        if *prob <= 0.0 {
+            continue;
+        }
         acc += *prob;
         if roll <= acc {
             return Ok(*token);
@@ -383,6 +393,21 @@ fn residual_distribution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_skips_zero_probability_entries() {
+        let distribution = vec![(0, 0.0), (1, 0.0), (2, 1.0)];
+        let mut sampler = DeterministicSampler::new(7);
+        for _ in 0..64 {
+            let token = sample_from_token_distribution(&distribution, &mut sampler)
+                .expect("invariant: distribution valide");
+            assert_eq!(token, 2);
+        }
+        let full = token_distribution_top_k_top_p(&[0.0, -200.0, 1.0], 1.0, 1.0, 0)
+            .expect("invariant: logits valides");
+        assert!(full.iter().all(|(_, prob)| *prob > 0.0));
+        assert_eq!(full.len(), 2);
+    }
 
     #[test]
     fn residual_distribution_matches_linear_scan() {

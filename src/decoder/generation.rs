@@ -1,5 +1,6 @@
 //! Génération, préfill et tête MTP du décodeur causal.
 
+use crate::runtime_flags::mtp_sampled_enabled;
 use crate::sampling::{
     lossless_speculative_sample, sample_from_token_distribution, token_distribution_top_k_top_p,
     TokenDistribution,
@@ -448,12 +449,17 @@ impl CausalDecoder {
         &self,
         cache: &mut CausalDecoderCache,
         token_ids: &[usize],
+        emit_argmax: bool,
         capture_linear: bool,
     ) -> Result<(Tensor, Option<Vec<usize>>, Option<ResidentVerifyCaptures>)> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(output) =
-            self.next_final_states_resident_verify(cache, token_ids, true, capture_linear, None)?
-        {
+        if let Some(output) = self.next_final_states_resident_verify(
+            cache,
+            token_ids,
+            emit_argmax,
+            capture_linear,
+            None,
+        )? {
             return Ok((output.states, output.tokens, output.captures));
         }
         self.next_final_states_batched(cache, token_ids)
@@ -1355,8 +1361,11 @@ impl CausalDecoder {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let mut use_resident_full = false;
+            // À T>0 (échantillonné opt-in), l'arène sert au draft résident avec
+            // relecture des logits et à la vérification en lignes ; le KV passe en
+            // bf16 comme pour l'AR échantillonné (`kv_bf16_for`).
             if decode_resident_full_enabled()
-                && options.temperature <= f32::EPSILON
+                && (options.temperature <= f32::EPSILON || mtp_sampled_enabled())
                 && self.supports_resident_full_decode()
             {
                 let t_setup = trace_setup.then(Instant::now);
@@ -1727,7 +1736,7 @@ impl CausalDecoder {
             let mut drafts = Vec::with_capacity(max_draft_tokens);
             let mut draft_distributions = Vec::with_capacity(max_draft_tokens);
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            let mtp_resident = if options.temperature <= f32::EPSILON {
+            let mtp_resident = if options.temperature <= f32::EPSILON || mtp_sampled_enabled() {
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 let resident = self.start_mtp_resident_draft(
                     &mut cache,
@@ -1749,8 +1758,10 @@ impl CausalDecoder {
                 Some(_) => usize::from(mtp_history_cache.is_some()),
                 None => step_depth,
             };
+            // Les drafts chaînés sur le GPU imposent l'argmax : à T>0 chaque pas
+            // relit ses logits pour échantillonner sur le CPU.
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            if mtp_resident {
+            if mtp_resident && options.temperature <= f32::EPSILON {
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 if let Some(resident_drafts) = self.next_mtp_drafts_resident(
                     &mut cache,
@@ -1771,11 +1782,33 @@ impl CausalDecoder {
                     let draft = if mtp_resident {
                         #[cfg(all(target_os = "macos", feature = "metal"))]
                         {
-                            self.next_mtp_draft_resident(
-                                &mut cache,
-                                draft_token,
-                                absolute_position,
-                            )?
+                            if options.temperature > f32::EPSILON {
+                                let logits = self.next_mtp_draft_resident_logits(
+                                    &mut cache,
+                                    draft_token,
+                                    absolute_position,
+                                )?;
+                                let logits = self.finalize_logits(&Tensor::from_vec(
+                                    vec![1, logits.len()],
+                                    logits,
+                                )?)?;
+                                let distribution = token_distribution_top_k_top_p(
+                                    logits.as_row()?,
+                                    options.temperature,
+                                    options.top_p,
+                                    options.top_k,
+                                )?;
+                                let draft =
+                                    sample_from_token_distribution(&distribution, &mut sampler)?;
+                                draft_distributions.push(Some(distribution));
+                                draft
+                            } else {
+                                self.next_mtp_draft_resident(
+                                    &mut cache,
+                                    draft_token,
+                                    absolute_position,
+                                )?
+                            }
                         }
                         #[cfg(not(all(target_os = "macos", feature = "metal")))]
                         unreachable!("invariant: mtp_resident=false hors Metal")
@@ -2525,11 +2558,17 @@ impl CausalDecoder {
             });
         }
 
+        // À T>0 l'arène n'existe qu'en échantillonné opt-in : le rollback par
+        // captures résidentes remplace alors le snapshot CPU et son rejeu. Le
+        // chemin séquentiel du verify résident (arènes sans vérification batchée)
+        // ne capture rien : le snapshot reste nécessaire dès qu'un rollback est
+        // possible (plus d'un token à vérifier).
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        let capture_rollback = options.temperature <= f32::EPSILON
-            && gpu_argmax_enabled()
-            && cache.resident.is_some()
-            && self.supports_resident_full_decode();
+        let capture_rollback = gpu_argmax_enabled()
+            && self.supports_resident_full_decode()
+            && cache.resident.as_ref().is_some_and(|arena| {
+                drafts.len() <= 1 || self.resident_layer_batch_supported(arena)
+            });
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let capture_rollback = false;
         let mut snapshot = if capture_rollback {
@@ -2542,7 +2581,19 @@ impl CausalDecoder {
         verify_tokens.extend(drafts.iter().take(drafts.len().saturating_sub(1)).copied());
         let (target_states, target_tokens, resident_captures) =
             if options.temperature <= f32::EPSILON && gpu_argmax_enabled() {
-                self.next_final_states_batched_with_tokens(cache, &verify_tokens, capture_rollback)?
+                self.next_final_states_batched_with_tokens(
+                    cache,
+                    &verify_tokens,
+                    true,
+                    capture_rollback,
+                )?
+            } else if capture_rollback {
+                self.next_final_states_batched_with_tokens(
+                    cache,
+                    &verify_tokens,
+                    false,
+                    capture_rollback,
+                )?
             } else {
                 (
                     self.next_final_states_batched(cache, &verify_tokens)?,
