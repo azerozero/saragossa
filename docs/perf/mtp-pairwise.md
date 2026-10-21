@@ -603,8 +603,14 @@ de sa distribution. Même protocole :
 | T2 | 32,5 | 29,1 | 39,4 |
 | T6 | 31,5 | 33,7 | 52,4 |
 
-Le flag reste opt-in (pas de golden sur le texte échantillonné) ; reste par
-cycle ~44 ms de verify sur T2 dont les softmax CPU de 248k par ligne.
+Reste par cycle ~44 ms de verify sur T2 dont les softmax CPU de 248k par
+ligne.
+
+Oracle réel (T2, T = 0,05, graine 1, 32 tokens) : AR échantillonné et MTP
+échantillonné (nuit, #32, #34) donnent le même texte, rejeu de graine
+identique ; le greedy diffère d'une bascule near-tie propre au chemin T>0 (KV
+bf16). `SARAGOSSA_RUST_MTP_SAMPLED` passe à 1 par défaut le 21 octobre sur
+`serve`, `run` et la CLI (kill-switch `=0`).
 
 Comparatif mlx_lm 0.32.2 (même checkpoint MLX u4 gs64, 200 tokens, 2 reps,
 VM en fond) :

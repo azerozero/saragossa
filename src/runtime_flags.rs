@@ -995,12 +995,14 @@ pub(super) fn prefix_cache_capacity() -> usize {
 }
 
 /// Route les requêtes échantillonnées (température > 0) vers le decode MTP
-/// (drafts avec distribution, accept/reject lossless) sur `serve`, `run` et la
-/// CLI. Opt-in `SARAGOSSA_RUST_MTP_SAMPLED=1` : les drafts de la tête MTP
-/// restent per-op avec température, mesure en cours.
+/// (drafts résidents avec distribution, accept/reject lossless) sur `serve`,
+/// `run` et la CLI. Actif par défaut depuis le 2026-10-21 : 43,8 / 39,4 / 52,4
+/// tok/s contre 32,2 / 32,5 / 31,5 en AR (T0 / T2 / T6, T = 0,7, 27B 4 bits),
+/// oracle réel à T = 0,05 identique à l'AR échantillonné. Kill-switch
+/// `SARAGOSSA_RUST_MTP_SAMPLED=0`.
 pub fn mtp_sampled_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SAMPLED", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SAMPLED", true))
 }
 
 /// Active le prefix-cache par blocs de `saragossa serve`.
