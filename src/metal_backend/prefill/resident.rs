@@ -471,17 +471,43 @@ impl MetalExecutor {
                     down_proj,
                     inter_dim,
                 },
-                PrefillResidentTailScratch::Dense {
-                    gate,
-                    up,
-                    hidden,
-                    down,
-                },
+                PrefillResidentTailScratch::Dense { unfused, down },
             ) => self.run_resident_prefill_section(context, "tail_dense", |encoder, owned| {
-                let inter_len = checked_len(spec.seq, inter_dim, "resident dense inter")?;
-                if self.fused_dense_mlp_supported(
-                    spec.seq, hidden_dim, &gate_proj, &up_proj, &down_proj, inter_dim,
-                ) {
+                if let Some((gate, up, hidden)) = &unfused {
+                    let gate_dim = self.encode_matmul_weight_buffers(
+                        encoder,
+                        post_normed_buffer,
+                        spec.seq,
+                        hidden_dim,
+                        &gate_proj,
+                        gate,
+                        false,
+                    )?;
+                    let up_dim = self.encode_matmul_weight_buffers(
+                        encoder,
+                        post_normed_buffer,
+                        spec.seq,
+                        hidden_dim,
+                        &up_proj,
+                        up,
+                        false,
+                    )?;
+                    if gate_dim != inter_dim || up_dim != inter_dim {
+                        return Err(InferError::Dimension(format!(
+                            "prefill résident dense gate/up sortent gate={gate_dim} up={up_dim}, attendu {inter_dim}"
+                        )));
+                    }
+                    let inter_len = checked_len(spec.seq, inter_dim, "resident dense inter")?;
+                    self.encode_swiglu(encoder, owned, gate, up, hidden, inter_len)?;
+                    let down_dim = self.encode_matmul_weight_buffers(
+                        encoder, hidden, spec.seq, inter_dim, &down_proj, &down, false,
+                    )?;
+                    if down_dim != hidden_dim {
+                        return Err(InferError::Dimension(format!(
+                            "prefill résident dense down sort {down_dim}, attendu {hidden_dim}"
+                        )));
+                    }
+                } else {
                     self.encode_fused_dense_mlp(
                         encoder,
                         post_normed_buffer,
@@ -493,39 +519,6 @@ impl MetalExecutor {
                         inter_dim,
                         &down,
                     )?;
-                } else {
-                    let gate_dim = self.encode_matmul_weight_buffers(
-                        encoder,
-                        post_normed_buffer,
-                        spec.seq,
-                        hidden_dim,
-                        &gate_proj,
-                        &gate,
-                        false,
-                    )?;
-                    let up_dim = self.encode_matmul_weight_buffers(
-                        encoder,
-                        post_normed_buffer,
-                        spec.seq,
-                        hidden_dim,
-                        &up_proj,
-                        &up,
-                        false,
-                    )?;
-                    if gate_dim != inter_dim || up_dim != inter_dim {
-                        return Err(InferError::Dimension(format!(
-                            "prefill résident dense gate/up sortent gate={gate_dim} up={up_dim}, attendu {inter_dim}"
-                        )));
-                    }
-                    self.encode_swiglu(encoder, owned, &gate, &up, &hidden, inter_len)?;
-                    let down_dim = self.encode_matmul_weight_buffers(
-                        encoder, &hidden, spec.seq, inter_dim, &down_proj, &down, false,
-                    )?;
-                    if down_dim != hidden_dim {
-                        return Err(InferError::Dimension(format!(
-                            "prefill résident dense down sort {down_dim}, attendu {hidden_dim}"
-                        )));
-                    }
                 }
                 self.encode_copy(
                     encoder,

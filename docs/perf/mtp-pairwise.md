@@ -699,6 +699,13 @@ passes séparées (oracle sur M=77, fragments masqués), textes identiques sur T
 et T7. Section `tail_dense`, meilleure de trois (VM en fond) : T2 697 → 582 ms,
 T7 (deux runs) 9,4 → 6,5 s ; conversions f32→bf16 agrégées 48 → 21 ms sur T2.
 
+Nettoyage du 21 octobre au soir : le scratch résident dense n'alloue plus ses
+trois buffers f32 `[seq, inter]` (gate, up, hidden) quand le MLP fusionné prend
+la couche, soit 3 × 0,58 Go de mémoire privée évités à 8k tokens. La décision
+est prise une seule fois, à l'allocation, et l'encodage suit le scratch. Textes
+greedy identiques sur T2 et T7, chemin fusionné et repli ; les temps de prefill
+ne bougent pas au bruit près.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

@@ -159,12 +159,28 @@ impl MetalExecutor {
             }
         };
         let tail = match &shape.tail {
-            PrefillResidentTailShape::Dense { inter_dim, .. } => {
-                let inter_len = checked_len(spec.seq, *inter_dim, "resident dense inter")?;
+            PrefillResidentTailShape::Dense {
+                gate_proj,
+                up_proj,
+                down_proj,
+                inter_dim,
+            } => {
+                // Décision prise ici une seule fois : l'encodage suit le scratch.
+                let fused = self.fused_dense_mlp_supported(
+                    spec.seq, hidden_dim, gate_proj, up_proj, down_proj, *inter_dim,
+                );
+                let unfused = if fused {
+                    None
+                } else {
+                    let inter_len = checked_len(spec.seq, *inter_dim, "resident dense inter")?;
+                    Some((
+                        self.private_f32_buffer(inter_len, "resident_dense_gate")?,
+                        self.private_f32_buffer(inter_len, "resident_dense_up")?,
+                        self.private_f32_buffer(inter_len, "resident_dense_hidden")?,
+                    ))
+                };
                 PrefillResidentTailScratch::Dense {
-                    gate: self.private_f32_buffer(inter_len, "resident_dense_gate")?,
-                    up: self.private_f32_buffer(inter_len, "resident_dense_up")?,
-                    hidden: self.private_f32_buffer(inter_len, "resident_dense_hidden")?,
+                    unfused,
                     down: self.private_f32_buffer(hidden_len, "resident_dense_down")?,
                 }
             }

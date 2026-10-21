@@ -149,9 +149,9 @@ enum PrefillResidentTailShape {
 
 enum PrefillResidentTailScratch {
     Dense {
-        gate: Buffer,
-        up: Buffer,
-        hidden: Buffer,
+        /// `(gate, up, hidden)` f32 `[seq, inter]`, absents quand le MLP fusionné
+        /// prend la couche : il n'écrit que `down`, via un scratch bf16 interne.
+        unfused: Option<(Buffer, Buffer, Buffer)>,
         down: Buffer,
     },
     GemmaDense {
