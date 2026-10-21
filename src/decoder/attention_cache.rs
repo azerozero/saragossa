@@ -1,5 +1,7 @@
 //! Mise à jour du cache K/V attention.
 
+use std::sync::Arc;
+
 use super::attention_ops::AttentionLayout;
 use super::*;
 
@@ -30,8 +32,8 @@ impl LayerKvCache {
             Some(_) => {}
             None => self.kv_dim = Some(expected_dim),
         }
-        self.keys.extend_from_slice(key.data());
-        self.values.extend_from_slice(value.data());
+        Arc::make_mut(&mut self.keys).extend_from_slice(key.data());
+        Arc::make_mut(&mut self.values).extend_from_slice(value.data());
         Ok(())
     }
 
@@ -64,8 +66,8 @@ impl LayerKvCache {
             Some(_) => {}
             None => self.kv_dim = Some(expected_dim),
         }
-        self.keys.extend_from_slice(key.data());
-        self.values.extend_from_slice(value.data());
+        Arc::make_mut(&mut self.keys).extend_from_slice(key.data());
+        Arc::make_mut(&mut self.values).extend_from_slice(value.data());
         Ok(())
     }
 
@@ -94,8 +96,12 @@ impl LayerKvCache {
                 self.len()
             )));
         }
-        self.keys.truncate(new_len);
-        self.values.truncate(new_len);
+        if new_len != self.keys.len() {
+            Arc::make_mut(&mut self.keys).truncate(new_len);
+        }
+        if new_len != self.values.len() {
+            Arc::make_mut(&mut self.values).truncate(new_len);
+        }
         Ok(())
     }
 }

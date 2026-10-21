@@ -793,8 +793,11 @@ struct ResidentLinearDenseBuffers {
 
 #[derive(Debug, Default)]
 struct LayerKvCache {
-    keys: Vec<f32>,
-    values: Vec<f32>,
+    // NOTE: `Arc` partagé avec le cache de préfixe : son clone (1,1 Go à 8k
+    // tokens, 550-670 ms par tour) devient O(1) ; une écriture copie à la
+    // demande via `Arc::make_mut` si une autre poignée existe encore.
+    keys: std::sync::Arc<Vec<f32>>,
+    values: std::sync::Arc<Vec<f32>>,
     kv_dim: Option<usize>,
     linear: LinearAttentionCache,
     // KV full-attn résident GPU (decode résident, flag SARAGOSSA_RUST_DECODE_RESIDENT).

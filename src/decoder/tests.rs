@@ -1263,6 +1263,38 @@ fn attention_layout_wires_scale_and_window() {
 }
 
 #[test]
+fn layer_kv_cache_clone_shares_rows_until_written() -> Result<()> {
+    let layout = AttentionLayout {
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: 2,
+        rope_dims: 2,
+        attn_scalar: 1.0,
+        sliding_window: None,
+    };
+    let row = |a: f32, b: f32| Tensor::from_vec(vec![1, 2], vec![a, b]);
+    let mut cache = LayerKvCache::default();
+    cache.append(&row(1.0, 2.0)?, &row(3.0, 4.0)?, &layout)?;
+    let snapshot = cache.clone();
+    assert!(std::sync::Arc::ptr_eq(&cache.keys, &snapshot.keys));
+    assert!(std::sync::Arc::ptr_eq(&cache.values, &snapshot.values));
+
+    cache.append(&row(5.0, 6.0)?, &row(7.0, 8.0)?, &layout)?;
+    assert_eq!(cache.len(), 2);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(*snapshot.keys, vec![1.0, 2.0]);
+    assert_eq!(*cache.keys, vec![1.0, 2.0, 5.0, 6.0]);
+
+    let shared = cache.clone();
+    cache.truncate(2)?;
+    assert!(std::sync::Arc::ptr_eq(&cache.keys, &shared.keys));
+    cache.truncate(1)?;
+    assert_eq!(shared.len(), 2);
+    assert_eq!(cache.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn full_attention_append_kv_rows_matches_prefill_cache_bytes() -> Result<()> {
     // Hidden 4, deux têtes q de dim 2, une tête kv, qk norm et RoPE : le semis
     // MTP sans attention doit laisser exactement les mêmes K/V dans le cache.
