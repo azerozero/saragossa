@@ -367,9 +367,12 @@ static void load_b_tile_quant_u4_gs64_vec(threadgroup bfloat* Ws,
   uint nl = lid >> 1u;
   uint kl0 = (lid & 1u) * 32u;
   uint nn = n0 + nl;
-  threadgroup bfloat* dst = Ws + nl * BKP + kl0;
+  // Ws est déclaré en vec<bfloat,8> par les appelants : les stores de 8 poids
+  // sont alignés sur 16 octets (stride de ligne 144 octets, offsets multiples de 16).
+  threadgroup metal::vec<bfloat,8>* dst =
+      (threadgroup metal::vec<bfloat,8>*)(Ws + nl * BKP + kl0);
   if (nn >= N) {
-    for (uint j = 0; j < 32u; j++) { dst[j] = bfloat(0.0f); }
+    for (uint w = 0; w < 4u; w++) { dst[w] = metal::vec<bfloat,8>(bfloat(0.0f)); }
     return;
   }
   uint packed_cols = K / 8u;
@@ -377,12 +380,16 @@ static void load_b_tile_quant_u4_gs64_vec(threadgroup bfloat* Ws,
   uint g = k0 / 64u;
   float s = float(Bs[nn * groups + g]);
   float b = float(Bb[nn * groups + g]);
-  const device uint* src = Bp + nn * packed_cols + ((k0 + kl0) >> 3u);
+  const device metal::vec<uint,4>* src =
+      (const device metal::vec<uint,4>*)(Bp + nn * packed_cols + ((k0 + kl0) >> 3u));
+  metal::vec<uint,4> words = *src;
   for (uint w = 0; w < 4u; w++) {
-    uint word = src[w];
+    uint word = words[w];
+    metal::vec<bfloat,8> out;
     for (uint j = 0; j < 8u; j++) {
-      dst[w * 8u + j] = bfloat(float((word >> (4u * j)) & 0x0fu) * s + b);
+      out[j] = bfloat(float((word >> (4u * j)) & 0x0fu) * s + b);
     }
+    dst[w] = out;
   }
 }
 static void load_b_tile_quant_gs128(threadgroup bfloat* Ws,
@@ -464,7 +471,8 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
                                       uint sgid [[simdgroup_index_in_threadgroup]]) {
   uint M = mnk.x, N = mnk.y, K = mnk.z;
   constexpr uint BN = 64, BK = 64, BKP = BK + 8, WM = 2, WN = 2;
-  threadgroup bfloat Ws[BN * BKP];
+  threadgroup metal::vec<bfloat,8> Ws8[BN * BKP / 8];
+  threadgroup bfloat* Ws = (threadgroup bfloat*)Ws8;
   uint sg_m = sgid / WN;
   uint sg_n = sgid - sg_m * WN;
   uint m0 = tgid.x * 64u + sg_m * 32u;
@@ -476,8 +484,13 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint kk = 0; kk < BK; kk += 16u) {
       metal::vec<bfloat,8> af0, af1, b0, b1;
-      NaxFrag::load_a_masked(af0, A, m0, k + kk, K, M);
-      NaxFrag::load_a_masked(af1, A, m0 + 16u, k + kk, K, M);
+      if (m0 + 32u <= M) {
+        NaxFrag::load_a(af0, A + m0 * K + k + kk, int(K));
+        NaxFrag::load_a(af1, A + (m0 + 16u) * K + k + kk, int(K));
+      } else {
+        NaxFrag::load_a_masked(af0, A, m0, k + kk, K, M);
+        NaxFrag::load_a_masked(af1, A, m0 + 16u, k + kk, K, M);
+      }
       NaxFrag::load_a_tg(b0, Ws + ns * BKP + kk, int(BKP));
       NaxFrag::load_a_tg(b1, Ws + (ns + 16u) * BKP + kk, int(BKP));
       NaxFrag::mma(c0a, c0b, af0, b0, b1);
@@ -505,7 +518,8 @@ kernel void gemm_nax_coop_qb_tiled_u4_align64(
     uint sgid [[simdgroup_index_in_threadgroup]]) {
   uint M = mnk.x, N = mnk.y, K = mnk.z;
   constexpr uint BN = 64, BK = 64, BKP = BK + 8, REDUCTION_BLOCK = 512, WM = 2, WN = 2;
-  threadgroup bfloat Ws[BN * BKP];
+  threadgroup metal::vec<bfloat,8> Ws8[BN * BKP / 8];
+  threadgroup bfloat* Ws = (threadgroup bfloat*)Ws8;
   uint sg_m = sgid / WN;
   uint sg_n = sgid - sg_m * WN;
   uint m0 = tgid.x * 64u + sg_m * 32u;
