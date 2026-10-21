@@ -321,6 +321,115 @@ pub fn lossless_speculative_sample(
     })
 }
 
+/// Échantillonne une distribution dense `probs[token]` (non nécessairement
+/// normalisée) : chemin complet (top_k = 0, top_p = 1) du spéculatif résident,
+/// sans matérialiser 248k paires (token, probabilité).
+///
+/// # Errors
+///
+/// Renvoie une erreur si la distribution est vide ou dégénérée.
+pub fn sample_from_dense_distribution(
+    probs: &[f32],
+    sampler: &mut DeterministicSampler,
+) -> Result<usize> {
+    if probs.is_empty() {
+        return Err(InferError::Dimension(
+            "sampling sur distribution dense vide".to_string(),
+        ));
+    }
+    let sum = probs.iter().sum::<f32>();
+    if !sum.is_finite() || sum <= f32::EPSILON {
+        return Err(InferError::Config(
+            "distribution dense dégénérée".to_string(),
+        ));
+    }
+    let roll = sampler.next_unit_f32() * sum;
+    let mut acc = 0.0_f32;
+    let mut last = None;
+    for (token, prob) in probs.iter().enumerate() {
+        if *prob <= 0.0 {
+            continue;
+        }
+        acc += *prob;
+        last = Some(token);
+        if roll <= acc {
+            return Ok(token);
+        }
+    }
+    last.ok_or_else(|| InferError::Config("distribution dense sans masse".to_string()))
+}
+
+/// Accept/reject lossless sur distributions denses complètes (`p[token]`,
+/// `q[token]`) : même décision que [`lossless_speculative_sample`], résiduel
+/// `max(p - q, 0)` construit en un passage.
+///
+/// # Errors
+///
+/// Renvoie une erreur si les distributions sont vides, de tailles différentes
+/// ou si `draft_token` est hors vocabulaire.
+pub fn lossless_speculative_sample_dense(
+    target: &[f32],
+    draft: &[f32],
+    draft_token: usize,
+    sampler: &mut DeterministicSampler,
+) -> Result<LosslessSpeculativeSample> {
+    if target.is_empty() || target.len() != draft.len() {
+        return Err(InferError::Dimension(format!(
+            "distributions denses target={} draft={}",
+            target.len(),
+            draft.len()
+        )));
+    }
+    let (Some(p), Some(q)) = (target.get(draft_token), draft.get(draft_token)) else {
+        return Err(InferError::Dimension(format!(
+            "draft token {draft_token} hors vocabulaire {}",
+            target.len()
+        )));
+    };
+    let accept_probability = if *q <= f32::EPSILON {
+        if *p > 0.0 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        (*p / *q).min(1.0)
+    };
+    let accepted = sampler.next_unit_f32() <= accept_probability;
+    if accepted {
+        return Ok(LosslessSpeculativeSample {
+            accepted: true,
+            token: draft_token,
+            accept_probability,
+        });
+    }
+    // Même seuil que `residual_distribution` (paires) : un résidu <= EPSILON
+    // ne porte aucune masse.
+    let mut residual_sum = 0.0_f32;
+    let residual: Vec<f32> = target
+        .iter()
+        .zip(draft)
+        .map(|(p, q)| {
+            let value = (*p - *q).max(0.0);
+            if value <= f32::EPSILON {
+                return 0.0;
+            }
+            residual_sum += value;
+            value
+        })
+        .collect();
+    let token = if residual_sum <= f32::EPSILON {
+        sample_from_dense_distribution(target, sampler)?
+    } else {
+        sample_from_dense_distribution(&residual, sampler)?
+    };
+    Ok(LosslessSpeculativeSample {
+        accepted: false,
+        token,
+        accept_probability,
+    })
+}
+
 fn normalize_distribution(
     mut distribution: TokenDistribution,
     fallback_logits: &[f32],
@@ -407,6 +516,55 @@ mod tests {
             .expect("invariant: logits valides");
         assert!(full.iter().all(|(_, prob)| *prob > 0.0));
         assert_eq!(full.len(), 2);
+    }
+
+    #[test]
+    fn dense_speculative_sample_matches_sparse() {
+        let target = [0.5_f32, 0.0, 0.25, 0.25];
+        let draft = [0.25_f32, 0.25, 0.5, 0.0];
+        let sparse = |probs: &[f32]| -> Vec<(usize, f32)> {
+            probs
+                .iter()
+                .enumerate()
+                .filter(|(_, prob)| **prob > 0.0)
+                .map(|(token, prob)| (token, *prob))
+                .collect()
+        };
+        for draft_token in 0..4 {
+            for seed in 0..32_u64 {
+                let mut left = DeterministicSampler::new(seed);
+                let mut right = DeterministicSampler::new(seed);
+                let a = lossless_speculative_sample(
+                    &sparse(&target),
+                    &sparse(&draft),
+                    draft_token,
+                    &mut left,
+                )
+                .expect("invariant: distributions valides");
+                let b = lossless_speculative_sample_dense(&target, &draft, draft_token, &mut right)
+                    .expect("invariant: distributions valides");
+                assert_eq!((a.accepted, a.token), (b.accepted, b.token));
+                assert!((a.accept_probability - b.accept_probability).abs() < 1e-6);
+            }
+        }
+        let mut sampler = DeterministicSampler::new(3);
+        for _ in 0..16 {
+            let token = sample_from_dense_distribution(&[0.0, 0.0, 1.0, 0.0], &mut sampler)
+                .expect("invariant: distribution valide");
+            assert_eq!(token, 2);
+        }
+        // Résiduel vide (draft == target) : repli sur la cible, même tirage.
+        for seed in 0..8_u64 {
+            let mut left = DeterministicSampler::new(seed);
+            let mut right = DeterministicSampler::new(seed);
+            let a = lossless_speculative_sample(&sparse(&target), &sparse(&target), 1, &mut left)
+                .expect("invariant: distributions valides");
+            let b = lossless_speculative_sample_dense(&target, &target, 1, &mut right)
+                .expect("invariant: distributions valides");
+            assert_eq!((a.accepted, a.token), (b.accepted, b.token));
+        }
+        assert!(lossless_speculative_sample_dense(&target, &draft[..3], 0, &mut sampler).is_err());
+        assert!(lossless_speculative_sample_dense(&target, &draft, 9, &mut sampler).is_err());
     }
 
     #[test]

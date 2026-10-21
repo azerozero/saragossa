@@ -2,8 +2,8 @@
 
 use crate::runtime_flags::mtp_sampled_enabled;
 use crate::sampling::{
-    lossless_speculative_sample, sample_from_token_distribution, token_distribution_top_k_top_p,
-    TokenDistribution,
+    lossless_speculative_sample, lossless_speculative_sample_dense, sample_from_dense_distribution,
+    sample_from_token_distribution, softmax, token_distribution_top_k_top_p, TokenDistribution,
 };
 #[cfg(feature = "devtools")]
 use crate::DFlashDraft;
@@ -192,13 +192,26 @@ type BatchedFinalStates = (
     Option<Tensor>,
 );
 
+/// Distribution d'un draft MTP à T>0 : paires (token, probabilité) filtrées
+/// top-k/top-p, ou softmax dense complet quand `top_k = 0` et `top_p = 1`
+/// (chemin résident : évite 248k paires par ligne sur Qwen3.5).
+enum MtpDraftDistribution {
+    Sparse(TokenDistribution),
+    Dense(Vec<f32>),
+}
+
+/// Vrai quand la distribution n'est ni tronquée ni filtrée : chemin dense.
+fn full_distribution(options: &GenerationOptions) -> bool {
+    options.top_k == 0 && options.top_p >= 1.0
+}
+
 struct MtpVerify<'a> {
     cache: &'a mut CausalDecoderCache,
     final_state: &'a mut Tensor,
     pending: &'a mut usize,
     generated: &'a mut Vec<usize>,
     drafts: Vec<usize>,
-    draft_distributions: Vec<Option<TokenDistribution>>,
+    draft_distributions: Vec<Option<MtpDraftDistribution>>,
     primary: usize,
     max_new_tokens: usize,
     options: &'a GenerationOptions,
@@ -647,20 +660,6 @@ impl CausalDecoder {
             options.top_p,
             options.top_k,
             sampler,
-        )
-    }
-
-    fn token_distribution_from_state(
-        &self,
-        final_state: &Tensor,
-        options: &GenerationOptions,
-    ) -> Result<TokenDistribution> {
-        let logits = self.logits_from_final_state(final_state)?;
-        token_distribution_top_k_top_p(
-            logits.as_row()?,
-            options.temperature,
-            options.top_p,
-            options.top_k,
         )
     }
 
@@ -1821,16 +1820,28 @@ impl CausalDecoder {
                                     vec![1, logits.len()],
                                     logits,
                                 )?)?;
-                                let distribution = token_distribution_top_k_top_p(
-                                    logits.as_row()?,
-                                    options.temperature,
-                                    options.top_p,
-                                    options.top_k,
-                                )?;
-                                let draft =
-                                    sample_from_token_distribution(&distribution, &mut sampler)?;
-                                draft_distributions.push(Some(distribution));
-                                draft
+                                if full_distribution(options) {
+                                    let probs = softmax(logits.as_row()?, options.temperature);
+                                    let draft =
+                                        sample_from_dense_distribution(&probs, &mut sampler)?;
+                                    draft_distributions
+                                        .push(Some(MtpDraftDistribution::Dense(probs)));
+                                    draft
+                                } else {
+                                    let distribution = token_distribution_top_k_top_p(
+                                        logits.as_row()?,
+                                        options.temperature,
+                                        options.top_p,
+                                        options.top_k,
+                                    )?;
+                                    let draft = sample_from_token_distribution(
+                                        &distribution,
+                                        &mut sampler,
+                                    )?;
+                                    draft_distributions
+                                        .push(Some(MtpDraftDistribution::Sparse(distribution)));
+                                    draft
+                                }
                             } else {
                                 self.next_mtp_draft_resident(
                                     &mut cache,
@@ -1860,7 +1871,8 @@ impl CausalDecoder {
                                     options,
                                     &mut sampler,
                                 )?;
-                            draft_distributions.push(Some(distribution));
+                            draft_distributions
+                                .push(Some(MtpDraftDistribution::Sparse(distribution)));
                             draft_hidden = next_hidden;
                             draft
                         } else {
@@ -1884,7 +1896,7 @@ impl CausalDecoder {
                 drafts = found.clone();
                 draft_distributions.clear();
             }
-            draft_distributions.resize(drafts.len(), None);
+            draft_distributions.resize_with(drafts.len(), || None);
             #[cfg(all(target_os = "macos", feature = "metal"))]
             let profile_start = mtp_profile_start(profile_mtp_steps);
             let verified = self.verify_mtp_drafts_batched(MtpVerify {
@@ -2656,22 +2668,27 @@ impl CausalDecoder {
                     None,
                 )
             };
+        // Logits finalisés d'une ligne cible : relus du verify résident, sinon
+        // lm_head CPU sur l'état.
+        let target_logits_row = |position: usize, state: &Tensor| -> Result<Tensor> {
+            match target_logits.as_ref() {
+                Some(logits) => {
+                    self.finalize_logits(&Tensor::row(logits.row_slice(position)?.to_vec())?)
+                }
+                None => self.logits_from_final_state(state),
+            }
+        };
         let target_distribution_at =
             |position: usize, state: &Tensor| -> Result<TokenDistribution> {
-                match target_logits.as_ref() {
-                    Some(logits) => {
-                        let row = self
-                            .finalize_logits(&Tensor::row(logits.row_slice(position)?.to_vec())?)?;
-                        token_distribution_top_k_top_p(
-                            row.as_row()?,
-                            options.temperature,
-                            options.top_p,
-                            options.top_k,
-                        )
-                    }
-                    None => self.token_distribution_from_state(state, options),
-                }
+                let row = target_logits_row(position, state)?;
+                token_distribution_top_k_top_p(
+                    row.as_row()?,
+                    options.temperature,
+                    options.top_p,
+                    options.top_k,
+                )
             };
+        let dense = full_distribution(options);
         let target_tokens = if target_tokens.is_some() {
             target_tokens
         } else if options.temperature <= f32::EPSILON && gpu_argmax_enabled() {
@@ -2700,7 +2717,6 @@ impl CausalDecoder {
         for (position, draft) in drafts.into_iter().enumerate() {
             let target_state = Tensor::row(target_states.row_slice(position)?.to_vec())?;
             let (target, accepted_now) = if options.temperature > f32::EPSILON {
-                let target_distribution = target_distribution_at(position, &target_state)?;
                 let draft_distribution = draft_distributions
                     .get(position)
                     .and_then(Option::as_ref)
@@ -2709,12 +2725,27 @@ impl CausalDecoder {
                             "sampling MTP temp>0 sans distribution draft".to_string(),
                         )
                     })?;
-                let sample = lossless_speculative_sample(
-                    &target_distribution,
-                    draft_distribution,
-                    draft,
-                    sampler,
-                )?;
+                let sample = match draft_distribution {
+                    MtpDraftDistribution::Dense(draft_probs) => {
+                        let row = target_logits_row(position, &target_state)?;
+                        let target_probs = softmax(row.as_row()?, options.temperature);
+                        lossless_speculative_sample_dense(
+                            &target_probs,
+                            draft_probs,
+                            draft,
+                            sampler,
+                        )?
+                    }
+                    MtpDraftDistribution::Sparse(draft_distribution) => {
+                        let target_distribution = target_distribution_at(position, &target_state)?;
+                        lossless_speculative_sample(
+                            &target_distribution,
+                            draft_distribution,
+                            draft,
+                            sampler,
+                        )?
+                    }
+                };
                 (sample.token, sample.accepted)
             } else {
                 let target = match target_tokens
@@ -2843,8 +2874,16 @@ impl CausalDecoder {
         let bonus = if accepted_all && bonus_row {
             let position = verify_tokens.len().saturating_sub(1);
             let state = Tensor::row(target_states.row_slice(position)?.to_vec())?;
-            let distribution = target_distribution_at(position, &state)?;
-            let token = sample_from_token_distribution(&distribution, sampler)?;
+            let token = if dense {
+                let row = target_logits_row(position, &state)?;
+                sample_from_dense_distribution(
+                    &softmax(row.as_row()?, options.temperature),
+                    sampler,
+                )?
+            } else {
+                let distribution = target_distribution_at(position, &state)?;
+                sample_from_token_distribution(&distribution, sampler)?
+            };
             Some((token, state))
         } else {
             None

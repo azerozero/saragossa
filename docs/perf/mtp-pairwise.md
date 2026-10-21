@@ -604,7 +604,12 @@ de sa distribution. Même protocole :
 | T6 | 31,5 | 33,7 | 52,4 |
 
 Reste par cycle ~44 ms de verify sur T2 dont les softmax CPU de 248k par
-ligne.
+ligne. Pris ensuite : quand la distribution est complète (top_k = 0,
+top_p = 1), drafts et cibles restent des softmax denses (`Vec<f32>`) et
+l'accept/reject travaille dessus (`lossless_speculative_sample_dense`), sans
+matérialiser 248k paires (token, probabilité) par ligne : 47,3 / 43,3 / 55,1
+tok/s (T0 / T2 / T6), verify 41 ms par cycle sur T2, oracle T = 0,05
+bit-identique au chemin par paires.
 
 Oracle réel (T2, T = 0,05, graine 1, 32 tokens) : AR échantillonné et MTP
 échantillonné (nuit, #32, #34) donnent le même texte, rejeu de graine
