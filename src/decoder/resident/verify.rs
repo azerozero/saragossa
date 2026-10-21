@@ -1,5 +1,7 @@
 use super::super::*;
 use super::types::*;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use crate::decoder::ResidentVerifyHead;
 
 impl CausalDecoder {
     /// Vrai si toutes les couches ont leurs buffers résidents en lignes : la
@@ -39,7 +41,7 @@ impl CausalDecoder {
         &self,
         cache: &mut CausalDecoderCache,
         token_ids: &[usize],
-        emit_argmax: bool,
+        head: ResidentVerifyHead,
         capture_linear: bool,
         capture_layer_ids: Option<&[usize]>,
     ) -> Result<Option<ResidentVerifyOutput>> {
@@ -289,7 +291,7 @@ impl CausalDecoder {
                 hidden,
                 eps,
             )?;
-            let final_indices = if emit_argmax {
+            let final_indices = if head == ResidentVerifyHead::Argmax {
                 let indices = arena.state.scratch().lease(batch, GpuElement::U32)?;
                 // lm_head projeté une fois pour toutes les lignes, argmax par ligne.
                 metal.encode_lm_head_argmax_rows_buffers(
@@ -303,6 +305,17 @@ impl CausalDecoder {
                     hidden,
                 )?;
                 Some(indices)
+            } else {
+                None
+            };
+            let logits_readback = if head == ResidentVerifyHead::Logits {
+                Some(metal.encode_lm_head_logits_rows_readback_buffers(
+                    encoder,
+                    final_states.tensor().buffer(),
+                    &arena.lm_head,
+                    batch,
+                    hidden,
+                )?)
             } else {
                 None
             };
@@ -328,6 +341,12 @@ impl CausalDecoder {
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?;
+            let logits = logits_readback
+                .map(|(buffer, len)| {
+                    let values = crate::metal_backend::read_f32_buffer(&buffer, len)?;
+                    Tensor::from_vec(vec![batch, len / batch.max(1)], values)
+                })
+                .transpose()?;
             let target_hidden = target_captures
                 .as_ref()
                 .map(|captures| {
@@ -341,6 +360,7 @@ impl CausalDecoder {
             return Ok(Some(ResidentVerifyOutput {
                 states: Tensor::from_vec(vec![batch, hidden], output)?,
                 tokens,
+                logits,
                 captures: linear_captures.map(|linear| ResidentVerifyCaptures {
                     base_position,
                     linear: linear.0,
@@ -495,7 +515,7 @@ impl CausalDecoder {
                 hidden,
             )?;
         }
-        let final_indices = if emit_argmax {
+        let final_indices = if head == ResidentVerifyHead::Argmax {
             let indices = arena
                 .state
                 .scratch()
@@ -562,6 +582,9 @@ impl CausalDecoder {
         Ok(Some(ResidentVerifyOutput {
             states: Tensor::from_vec(vec![token_ids.len(), hidden], output)?,
             tokens,
+            // NOTE: le chemin séquentiel ne rend pas les logits ; l'appelant
+            // retombe sur le lm_head CPU par ligne.
+            logits: None,
             captures: None,
             target_hidden,
         }))

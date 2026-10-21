@@ -260,7 +260,7 @@ impl CausalDecoder {
                 .next_final_states_resident_verify(
                     &mut cache,
                     &verify_tokens,
-                    true,
+                    crate::decoder::ResidentVerifyHead::Argmax,
                     true,
                     Some(layer_ids),
                 )?

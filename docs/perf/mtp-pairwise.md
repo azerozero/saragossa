@@ -588,6 +588,24 @@ le lm_head des lignes cibles via l'API Tensor (envoi, matmul, relecture par
 ligne) et deux softmax de 248k par draft ; levier suivant = logits des lignes
 cibles calculés dans le command buffer de vérification et relus en bloc.
 
+Profil du cycle (`SARAGOSSA_RUST_MTP_STEP_PROFILE=1`, T2, 103 cycles pour
+200 tokens) : verify 38 ms par cycle, et `bonus_next` 32 ms × 76 cycles : le
+chemin général paie un pas de decode complet pour le token bonus après un cycle
+entièrement accepté, parce que la ligne du dernier draft n'est pas vérifiée.
+Deux leviers pris : les logits des lignes cibles sortent du command buffer de
+vérification (`ResidentVerifyHead::Logits`, relecture en bloc), et à T>0 avec
+rollback résident la ligne du dernier draft est vérifiée aussi, le bonus se tire
+de sa distribution. Même protocole :
+
+| Prompt | AR T0,7 | MTP échantillonné résident | + logits en lignes et bonus |
+|---|---|---|---|
+| T0 | 32,2 | 31,2 | 43,8 |
+| T2 | 32,5 | 29,1 | 39,4 |
+| T6 | 31,5 | 33,7 | 52,4 |
+
+Le flag reste opt-in (pas de golden sur le texte échantillonné) ; reste par
+cycle ~44 ms de verify sur T2 dont les softmax CPU de 248k par ligne.
+
 Comparatif mlx_lm 0.32.2 (même checkpoint MLX u4 gs64, 200 tokens, 2 reps,
 VM en fond) :
 

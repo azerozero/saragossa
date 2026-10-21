@@ -179,7 +179,18 @@ struct MtpVerifyResult {
     accepted_all: bool,
     verify_token: usize,
     accepted_history: Vec<(Tensor, usize)>,
+    /// Token et état suivant le dernier draft quand sa ligne a été vérifiée
+    /// (tout accepté) : évite un pas de decode pour le token bonus.
+    bonus: Option<(usize, Tensor)>,
 }
+
+/// `(états, argmax par ligne, captures résidentes, logits par ligne)`.
+type BatchedFinalStates = (
+    Tensor,
+    Option<Vec<usize>>,
+    Option<ResidentVerifyCaptures>,
+    Option<Tensor>,
+);
 
 struct MtpVerify<'a> {
     cache: &'a mut CausalDecoderCache,
@@ -424,9 +435,13 @@ impl CausalDecoder {
             )));
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(output) =
-            self.next_final_states_resident_verify(cache, token_ids, false, false, None)?
-        {
+        if let Some(output) = self.next_final_states_resident_verify(
+            cache,
+            token_ids,
+            ResidentVerifyHead::Skip,
+            false,
+            None,
+        )? {
             return Ok(output.states);
         }
         let position_offset = cache.position;
@@ -445,25 +460,39 @@ impl CausalDecoder {
         rms_norm(&hidden, &self.final_norm, self.config.rms_eps)
     }
 
+    /// États finaux d'un lot de tokens avec, sur l'arène résidente, l'argmax
+    /// (`emit_argmax`) ou les logits complets (`emit_logits`) de chaque ligne.
     fn next_final_states_batched_with_tokens(
         &self,
         cache: &mut CausalDecoderCache,
         token_ids: &[usize],
         emit_argmax: bool,
+        emit_logits: bool,
         capture_linear: bool,
-    ) -> Result<(Tensor, Option<Vec<usize>>, Option<ResidentVerifyCaptures>)> {
+    ) -> Result<BatchedFinalStates> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(output) = self.next_final_states_resident_verify(
-            cache,
-            token_ids,
-            emit_argmax,
-            capture_linear,
-            None,
-        )? {
-            return Ok((output.states, output.tokens, output.captures));
+        {
+            let head = if emit_logits {
+                ResidentVerifyHead::Logits
+            } else if emit_argmax {
+                ResidentVerifyHead::Argmax
+            } else {
+                ResidentVerifyHead::Skip
+            };
+            if let Some(output) = self.next_final_states_resident_verify(
+                cache,
+                token_ids,
+                head,
+                capture_linear,
+                None,
+            )? {
+                return Ok((output.states, output.tokens, output.captures, output.logits));
+            }
         }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = (emit_argmax, emit_logits, capture_linear);
         self.next_final_states_batched(cache, token_ids)
-            .map(|states| (states, None, None))
+            .map(|states| (states, None, None, None))
     }
 
     pub fn logits_from_final_state(&self, final_state: &Tensor) -> Result<Tensor> {
@@ -1877,6 +1906,7 @@ impl CausalDecoder {
                 accepted_all,
                 verify_token,
                 accepted_history,
+                bonus,
             } = verified;
 
             if let Some(history_cache) = mtp_history_cache.as_mut() {
@@ -1924,8 +1954,13 @@ impl CausalDecoder {
             if accepted_all {
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 let profile_start = mtp_profile_start(profile_mtp_steps);
-                cpu_state = self.next_decode_state(&mut cache, verify_token)?;
-                pending = self.sample_token_from_state(&cpu_state, options, &mut sampler)?;
+                if let Some((bonus_token, bonus_state)) = bonus {
+                    cpu_state = bonus_state;
+                    pending = bonus_token;
+                } else {
+                    cpu_state = self.next_decode_state(&mut cache, verify_token)?;
+                    pending = self.sample_token_from_state(&cpu_state, options, &mut sampler)?;
+                }
                 stats.verifications += 1;
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 mtp_profile_record(&mut mtp_step_profile.bonus_next, profile_start);
@@ -2217,7 +2252,7 @@ impl CausalDecoder {
             .next_final_states_resident_verify(
                 &mut resident_cache,
                 &[input_token],
-                false,
+                ResidentVerifyHead::Skip,
                 false,
                 Some(&layer_ids),
             )?
@@ -2555,6 +2590,7 @@ impl CausalDecoder {
                 accepted_all: true,
                 verify_token: primary,
                 accepted_history: Vec::new(),
+                bonus: None,
             });
         }
 
@@ -2564,27 +2600,44 @@ impl CausalDecoder {
         // ne capture rien : le snapshot reste nécessaire dès qu'un rollback est
         // possible (plus d'un token à vérifier).
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        let capture_rollback = gpu_argmax_enabled()
+        let batched_rollback = gpu_argmax_enabled()
             && self.supports_resident_full_decode()
-            && cache.resident.as_ref().is_some_and(|arena| {
-                drafts.len() <= 1 || self.resident_layer_batch_supported(arena)
-            });
+            && cache
+                .resident
+                .as_ref()
+                .is_some_and(|arena| self.resident_layer_batch_supported(arena));
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let capture_rollback = batched_rollback
+            || (drafts.len() <= 1
+                && gpu_argmax_enabled()
+                && cache.resident.is_some()
+                && self.supports_resident_full_decode());
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        let capture_rollback = false;
+        let (batched_rollback, capture_rollback) = (false, false);
         let mut snapshot = if capture_rollback {
             None
         } else {
             Some(self.snapshot_speculative_cache(cache)?)
         };
-        let mut verify_tokens = Vec::with_capacity(drafts.len());
+        // À T>0 avec rollback résident, la ligne du dernier draft est vérifiée
+        // aussi : si tout est accepté, le token bonus se tire de cette ligne au
+        // lieu d'un pas de decode complet (32 ms sur le 27B).
+        let bonus_row = options.temperature > f32::EPSILON && batched_rollback;
+        let verified_drafts = if bonus_row {
+            drafts.len()
+        } else {
+            drafts.len().saturating_sub(1)
+        };
+        let mut verify_tokens = Vec::with_capacity(verified_drafts + 1);
         verify_tokens.push(primary);
-        verify_tokens.extend(drafts.iter().take(drafts.len().saturating_sub(1)).copied());
-        let (target_states, target_tokens, resident_captures) =
+        verify_tokens.extend(drafts.iter().take(verified_drafts).copied());
+        let (target_states, target_tokens, resident_captures, target_logits) =
             if options.temperature <= f32::EPSILON && gpu_argmax_enabled() {
                 self.next_final_states_batched_with_tokens(
                     cache,
                     &verify_tokens,
                     true,
+                    false,
                     capture_rollback,
                 )?
             } else if capture_rollback {
@@ -2592,6 +2645,7 @@ impl CausalDecoder {
                     cache,
                     &verify_tokens,
                     false,
+                    true,
                     capture_rollback,
                 )?
             } else {
@@ -2599,7 +2653,24 @@ impl CausalDecoder {
                     self.next_final_states_batched(cache, &verify_tokens)?,
                     None,
                     None,
+                    None,
                 )
+            };
+        let target_distribution_at =
+            |position: usize, state: &Tensor| -> Result<TokenDistribution> {
+                match target_logits.as_ref() {
+                    Some(logits) => {
+                        let row = self
+                            .finalize_logits(&Tensor::row(logits.row_slice(position)?.to_vec())?)?;
+                        token_distribution_top_k_top_p(
+                            row.as_row()?,
+                            options.temperature,
+                            options.top_p,
+                            options.top_k,
+                        )
+                    }
+                    None => self.token_distribution_from_state(state, options),
+                }
             };
         let target_tokens = if target_tokens.is_some() {
             target_tokens
@@ -2629,8 +2700,7 @@ impl CausalDecoder {
         for (position, draft) in drafts.into_iter().enumerate() {
             let target_state = Tensor::row(target_states.row_slice(position)?.to_vec())?;
             let (target, accepted_now) = if options.temperature > f32::EPSILON {
-                let target_distribution =
-                    self.token_distribution_from_state(&target_state, options)?;
+                let target_distribution = target_distribution_at(position, &target_state)?;
                 let draft_distribution = draft_distributions
                     .get(position)
                     .and_then(Option::as_ref)
@@ -2770,10 +2840,20 @@ impl CausalDecoder {
             }
         }
 
+        let bonus = if accepted_all && bonus_row {
+            let position = verify_tokens.len().saturating_sub(1);
+            let state = Tensor::row(target_states.row_slice(position)?.to_vec())?;
+            let distribution = target_distribution_at(position, &state)?;
+            let token = sample_from_token_distribution(&distribution, sampler)?;
+            Some((token, state))
+        } else {
+            None
+        };
         Ok(MtpVerifyResult {
             accepted_all,
             verify_token,
             accepted_history,
+            bonus,
         })
     }
 
@@ -2798,6 +2878,7 @@ impl CausalDecoder {
                 accepted_all: true,
                 verify_token: primary,
                 accepted_history: Vec::new(),
+                bonus: None,
             });
         }
 
@@ -2875,6 +2956,7 @@ impl CausalDecoder {
             accepted_all,
             verify_token,
             accepted_history: Vec::new(),
+            bonus: None,
         })
     }
 
@@ -3048,9 +3130,13 @@ impl CausalDecoder {
             )));
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(output) =
-            self.next_final_states_resident_verify(cache, token_ids, false, false, Some(layer_ids))?
-        {
+        if let Some(output) = self.next_final_states_resident_verify(
+            cache,
+            token_ids,
+            ResidentVerifyHead::Skip,
+            false,
+            Some(layer_ids),
+        )? {
             if let Some(target_hidden) = output.target_hidden {
                 return Ok((output.states, target_hidden));
             }

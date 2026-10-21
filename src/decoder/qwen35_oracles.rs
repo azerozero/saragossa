@@ -1,5 +1,7 @@
 //! Oracles ignorés Qwen3.6-35B : précision couche 0 et CPU↔GPU réel.
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use super::ResidentVerifyHead;
 use super::*;
 use crate::MoeMlp;
 use serde::Deserialize;
@@ -522,7 +524,13 @@ fn qwen35_cpu_gpu_teacher_forced_oracle_matrix() -> Result<()> {
             ));
         }
         let output = gpu
-            .next_final_states_resident_verify(&mut cache, &case.forced, true, false, None)?
+            .next_final_states_resident_verify(
+                &mut cache,
+                &case.forced,
+                ResidentVerifyHead::Argmax,
+                false,
+                None,
+            )?
             .ok_or_else(|| InferError::Config("verify résident-full non exercé".to_string()))?;
         let predictions = output
             .tokens
