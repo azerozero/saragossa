@@ -1,5 +1,7 @@
 //! Échantillonnage déterministe et filtrage des logits.
 
+use std::collections::HashMap;
+
 use crate::{InferError, Result};
 
 /// Distribution discrète filtrée sous forme `(token, probabilité normalisée)`.
@@ -353,9 +355,16 @@ fn residual_distribution(
     target: &[(usize, f32)],
     draft: &[(usize, f32)],
 ) -> Result<TokenDistribution> {
+    // Table indexée par token : un scan linéaire du draft par token du target
+    // coûtait vocab² (248k² sur Qwen3.5) à chaque rejet. Premier match conservé,
+    // comme `distribution_probability`.
+    let mut draft_probs: HashMap<usize, f32> = HashMap::with_capacity(draft.len());
+    for (token, q) in draft {
+        draft_probs.entry(*token).or_insert(*q);
+    }
     let mut residual = Vec::new();
     for (token, p) in target {
-        let q = distribution_probability(draft, *token);
+        let q = draft_probs.get(token).copied().unwrap_or(0.0);
         let prob = (*p - q).max(0.0);
         if prob > f32::EPSILON {
             residual.push((*token, prob));
@@ -374,6 +383,38 @@ fn residual_distribution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn residual_distribution_matches_linear_scan() {
+        let target = vec![(0, 0.5), (3, 0.3), (7, 0.2)];
+        let draft = vec![(7, 0.6), (0, 0.1), (5, 0.3)];
+        let residual =
+            residual_distribution(&target, &draft).expect("invariant: distributions valides");
+        let expected: Vec<(usize, f32)> = target
+            .iter()
+            .map(|(token, p)| {
+                (
+                    *token,
+                    (p - distribution_probability(&draft, *token)).max(0.0),
+                )
+            })
+            .filter(|(_, prob)| *prob > f32::EPSILON)
+            .collect();
+        let sum: f32 = expected.iter().map(|(_, prob)| prob).sum();
+        let expected: Vec<(usize, f32)> = expected
+            .into_iter()
+            .map(|(token, prob)| (token, prob / sum))
+            .collect();
+        assert_eq!(residual, expected);
+        assert_eq!(residual.len(), 2);
+        assert!(residual.iter().all(|(token, _)| *token != 7));
+
+        // Identifiants arbitraires (API publique) : ni débordement ni allocation.
+        let huge = vec![(usize::MAX, 0.5), (1, 0.5)];
+        let residual = residual_distribution(&huge, &[(usize::MAX, 1.0)])
+            .expect("invariant: distributions valides");
+        assert_eq!(residual, vec![(1, 1.0)]);
+    }
 
     #[test]
     fn argmax_returns_first_max() {
