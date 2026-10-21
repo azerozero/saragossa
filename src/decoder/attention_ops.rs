@@ -359,6 +359,49 @@ pub(super) fn full_attention_context_prefill(
     attention: &FullAttention,
     runtime: ForwardRuntime<'_>,
 ) -> Result<Tensor> {
+    let (q, gate, k, v, layout) =
+        full_attention_prepare_rows(config, normed, position_offset, attention, runtime)?;
+    let mut context = if cache.len() == 0 {
+        cache.append_batch(&k, &v, &layout)?;
+        causal_attention(&q, &k, &v, &layout)?
+    } else {
+        cached_attention_prefill_rows(&q, &k, &v, cache, &layout)?
+    };
+    if let Some(gate) = gate {
+        context = context.mul_elementwise(&gate.map(sigmoid_scalar))?;
+    }
+    Ok(context)
+}
+
+/// Ajoute au cache les lignes K/V de `normed` sans calculer l'attention : même
+/// projection, normes et RoPE que [`full_attention_context_prefill`], donc
+/// mêmes octets dans le cache. Sert au semis de l'historique MTP, dont seul
+/// le cache K/V importe ; la sortie d'attention y était jetée et son coût
+/// CPU croissait avec l'historique (22 s sur un prompt de 8k tokens).
+pub(super) fn full_attention_append_kv_rows(
+    config: &CausalDecoderConfig,
+    normed: &Tensor,
+    cache: &mut LayerKvCache,
+    position_offset: usize,
+    attention: &FullAttention,
+    runtime: ForwardRuntime<'_>,
+) -> Result<()> {
+    let (_, _, k, v, layout) =
+        full_attention_prepare_rows(config, normed, position_offset, attention, runtime)?;
+    cache.append_batch(&k, &v, &layout)
+}
+
+type PreparedAttentionRows = (Tensor, Option<Tensor>, Tensor, Tensor, AttentionLayout);
+
+/// Projette q/k/v, applique les normes de tête et le RoPE à partir de
+/// `position_offset`, et renvoie `(q, gate, k, v, layout)`.
+fn full_attention_prepare_rows(
+    config: &CausalDecoderConfig,
+    normed: &Tensor,
+    position_offset: usize,
+    attention: &FullAttention,
+    runtime: ForwardRuntime<'_>,
+) -> Result<PreparedAttentionRows> {
     let (q_projection, k_projection, mut v) = project_qkv(normed, attention, runtime)?;
     let (mut q, gate) = split_attention_gate(config, &q_projection)?;
     let mut k = k_projection;
@@ -436,16 +479,7 @@ pub(super) fn full_attention_context_prefill(
             config.rope_style,
         )?;
     }
-    let mut context = if cache.len() == 0 {
-        cache.append_batch(&k, &v, &layout)?;
-        causal_attention(&q, &k, &v, &layout)?
-    } else {
-        cached_attention_prefill_rows(&q, &k, &v, cache, &layout)?
-    };
-    if let Some(gate) = gate {
-        context = context.mul_elementwise(&gate.map(sigmoid_scalar))?;
-    }
-    Ok(context)
+    Ok((q, gate, k, v, layout))
 }
 
 pub(super) fn project_qkv(

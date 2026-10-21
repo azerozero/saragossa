@@ -1,7 +1,7 @@
 use super::attention_ops::{
     apply_rope_heads_at, attention_layout, cached_attention_one, causal_attention,
-    full_attention_from_tensors, rms_norm_heads, rms_norm_rope_heads_at, AttentionLayout,
-    RopeParams,
+    full_attention_append_kv_rows, full_attention_context_prefill, full_attention_from_tensors,
+    rms_norm_heads, rms_norm_rope_heads_at, AttentionLayout, RopeParams,
 };
 use super::*;
 use safetensors::{serialize, Dtype, View};
@@ -1260,6 +1260,74 @@ fn attention_layout_wires_scale_and_window() {
         .expect("invariant: layout valide");
     assert_eq!(layout.attn_scalar, 2.0);
     assert_eq!(layout.sliding_window, None);
+}
+
+#[test]
+fn full_attention_append_kv_rows_matches_prefill_cache_bytes() -> Result<()> {
+    // Hidden 4, deux têtes q de dim 2, une tête kv, qk norm et RoPE : le semis
+    // MTP sans attention doit laisser exactement les mêmes K/V dans le cache.
+    let mut tensors: HashMap<String, DecoderTensor> = HashMap::new();
+    let dense = |rows: usize, cols: usize, seed: f32| -> Result<DecoderTensor> {
+        let data = (0..rows * cols)
+            .map(|i| ((i as f32 * 0.37 + seed).sin()) * 0.8)
+            .collect();
+        Ok(DecoderTensor::Dense(Tensor::from_vec(
+            vec![rows, cols],
+            data,
+        )?))
+    };
+    tensors.insert("layers.0.self_attn.q_proj.weight".into(), dense(4, 4, 0.1)?);
+    tensors.insert("layers.0.self_attn.k_proj.weight".into(), dense(2, 4, 0.2)?);
+    tensors.insert("layers.0.self_attn.v_proj.weight".into(), dense(2, 4, 0.3)?);
+    tensors.insert("layers.0.self_attn.o_proj.weight".into(), dense(4, 4, 0.4)?);
+    tensors.insert(
+        "layers.0.self_attn.q_norm.weight".into(),
+        DecoderTensor::Dense(Tensor::from_vec(vec![2], vec![1.5, 0.5])?),
+    );
+    tensors.insert(
+        "layers.0.self_attn.k_norm.weight".into(),
+        DecoderTensor::Dense(Tensor::from_vec(vec![2], vec![0.75, 1.25])?),
+    );
+    let config = CausalDecoderConfig {
+        rope_theta: Some(10_000.0),
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: Some(2),
+        ..CausalDecoderConfig::default()
+    };
+    let AttentionBlock::Full(attention) =
+        full_attention_from_tensors(&config, &mut tensors, "layers.0", 0)?
+    else {
+        return Err(InferError::Config("attention full attendue".to_string()));
+    };
+    let rows = |n: usize, seed: f32| -> Result<Tensor> {
+        Tensor::from_vec(
+            vec![n, 4],
+            (0..n * 4).map(|i| (i as f32 * 0.61 + seed).cos()).collect(),
+        )
+    };
+    let (first, second) = (rows(3, 0.0)?, rows(2, 1.0)?);
+    let runtime = ForwardRuntime::cpu();
+
+    let mut with_attention = LayerKvCache::default();
+    let mut kv_only = LayerKvCache::default();
+    for (normed, offset) in [(&first, 0), (&second, 3)] {
+        let _ = full_attention_context_prefill(
+            &config,
+            normed,
+            &mut with_attention,
+            offset,
+            &attention,
+            runtime,
+        )?;
+        full_attention_append_kv_rows(&config, normed, &mut kv_only, offset, &attention, runtime)?;
+    }
+    assert_eq!(kv_only.len(), 5);
+    assert_eq!(kv_only.len(), with_attention.len());
+    assert_eq!(kv_only.keys, with_attention.keys);
+    assert_eq!(kv_only.values, with_attention.values);
+    assert_eq!(kv_only.kv_dim, with_attention.kv_dim);
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
