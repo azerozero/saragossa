@@ -291,6 +291,7 @@ pub struct MetalExecutor {
     na_gemm_coop_qb_tiled_gs128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,
+    na_gemm_coop_qb_tiled_u4_gate_up_swiglu: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_gather: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_gate_up_swiglu: Option<ComputePipelineState>,

@@ -132,6 +132,15 @@ pub(crate) fn resident_concurrent_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_RESIDENT_CONCURRENT", false))
 }
 
+/// MLP dense fusionné gate+up+SwiGLU au prefill (kernel
+/// `gemm_nax_coop_qb_tiled_u4_gate_up_swiglu`, sortie bf16 vers le down_proj).
+/// Actif par défaut depuis le 2026-10-21, kill-switch
+/// `SARAGOSSA_RUST_PREFILL_FUSED_MLP=0`.
+pub(crate) fn prefill_fused_mlp_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_FUSED_MLP", true))
+}
+
 /// Active la linear-attn gated-delta en forme CHUNKÉE (port chunked-DeltaNet) au lieu
 /// du séquentiel token-par-token. Opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`. Exige head_dim=128.
 pub(crate) fn linear_chunked_enabled() -> bool {
