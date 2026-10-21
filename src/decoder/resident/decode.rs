@@ -652,9 +652,13 @@ impl CausalDecoder {
         token_id: usize,
     ) -> Result<Tensor> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(output) =
-            self.next_final_states_resident_verify(cache, &[token_id], false, false, None)?
-        {
+        if let Some(output) = self.next_final_states_resident_verify(
+            cache,
+            &[token_id],
+            crate::decoder::ResidentVerifyHead::Skip,
+            false,
+            None,
+        )? {
             return Tensor::row(output.states.row_slice(0)?.to_vec());
         }
         self.next_final_state_cached(cache, token_id)

@@ -512,11 +512,22 @@ struct ResidentVerifyCaptures {
 #[derive(Debug)]
 struct ResidentVerifyCaptures;
 
+/// Tête appliquée aux états finaux du verify résident.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResidentVerifyHead {
+    Skip,
+    Argmax,
+    /// Ligne de logits complète par état, relue sur le CPU (échantillonné).
+    Logits,
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Debug)]
 struct ResidentVerifyOutput {
     states: Tensor,
     tokens: Option<Vec<usize>>,
+    logits: Option<Tensor>,
     captures: Option<ResidentVerifyCaptures>,
     #[cfg_attr(
         not(feature = "devtools"),

@@ -550,6 +550,38 @@ impl MetalExecutor {
         Ok((logits_buffer, out_dim))
     }
 
+    /// Variante en lignes de [`Self::encode_lm_head_logits_readback_buffers`] :
+    /// `rows` états contigus, logits `[rows, vocab]` dans un buffer partagé.
+    pub(crate) fn encode_lm_head_logits_rows_readback_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        lm_head: &MetalLinearWeightBuffers,
+        rows: usize,
+        in_dim: usize,
+    ) -> Result<(metal::Buffer, usize)> {
+        let out_dim = self.linear_weight_out_dim(lm_head);
+        let len = rows
+            .checked_mul(out_dim)
+            .ok_or_else(|| InferError::Dimension("logits rows readback déborde".to_string()))?;
+        let logits_buffer = self.uncached_f32_buffer(len, "sample_logits_rows_readback")?;
+        let projected_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            input_buffer,
+            rows,
+            in_dim,
+            lm_head,
+            &logits_buffer,
+            false,
+        )?;
+        if projected_dim != out_dim {
+            return Err(InferError::Dimension(format!(
+                "logits rows readback projection sort {projected_dim}, attendu {out_dim}"
+            )));
+        }
+        Ok((logits_buffer, len))
+    }
+
     pub(crate) fn encode_lm_head_argmax_buffers_with_index_offset(
         &self,
         encoder: &ComputeCommandEncoderRef,
