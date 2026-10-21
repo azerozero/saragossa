@@ -621,10 +621,20 @@ même protocole :
 | T2 (732) | 1761 → 820 ms | 702 → 363 ms | 3481 ms (210 tok/s) | 1754 ms (417 tok/s) |
 | T7 (8297) | 19,3 → 12,8 s | 7,3 → 5,3 s | 43,3 s (192 tok/s) | 23,2 s (358 tok/s) |
 
-Suites greedy identiques. Reste un facteur 2 contre mlx_lm (825 / 679 tok/s) :
-le GEMM tourne à 25-30 TFLOPS effectifs, sans double tampon ni chargement
-vectorisé de A ; puis attention linéaire (20 %), et semis CPU de l'historique
-MTP sur contexte long (22 s sur T7 en MTP committed).
+Troisième levier (PR #28) : stores vectorisés de la tuile u4 (`vec<bfloat,8>`
+au lieu de huit écritures scalaires) et fragments A chargés sans masque quand
+M est aligné sur 32. Bit-identique aux mêmes oracles. Cumul des trois leviers :
+
+| Prompt | MLP dense | Attention linéaire | Prefill avant la nuit | après |
+|---|---|---|---|---|
+| T2 (732) | 1761 → 663 ms | 702 → 309 ms | 3481 ms (210 tok/s) | 1324 ms (552 tok/s) |
+| T7 (8297) | 19,3 → 6,8 s | 7,3 → 3,7 s | 43,3 s (192 tok/s) | 15,3 s (544 tok/s) |
+
+Suites greedy identiques. Reste un facteur 1,5 contre mlx_lm (825 / 679
+tok/s) : le GEMM tourne à 38-41 TFLOPS effectifs (BK=32 comme MLX essayé, sans
+gain) ; puis attention linéaire (23 %, dont ~100 ms de kernels delta sur T2),
+conversions f32→bf16 avant chaque GEMM (3 %), et semis CPU de l'historique MTP
+sur contexte long (22 s sur T7 en MTP committed).
 
 ## Limites
 
