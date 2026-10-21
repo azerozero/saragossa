@@ -403,12 +403,17 @@ pub fn lossless_speculative_sample_dense(
             accept_probability,
         });
     }
+    // Même seuil que `residual_distribution` (paires) : un résidu <= EPSILON
+    // ne porte aucune masse.
     let mut residual_sum = 0.0_f32;
     let residual: Vec<f32> = target
         .iter()
         .zip(draft)
         .map(|(p, q)| {
             let value = (*p - *q).max(0.0);
+            if value <= f32::EPSILON {
+                return 0.0;
+            }
             residual_sum += value;
             value
         })
@@ -547,6 +552,16 @@ mod tests {
             let token = sample_from_dense_distribution(&[0.0, 0.0, 1.0, 0.0], &mut sampler)
                 .expect("invariant: distribution valide");
             assert_eq!(token, 2);
+        }
+        // Résiduel vide (draft == target) : repli sur la cible, même tirage.
+        for seed in 0..8_u64 {
+            let mut left = DeterministicSampler::new(seed);
+            let mut right = DeterministicSampler::new(seed);
+            let a = lossless_speculative_sample(&sparse(&target), &sparse(&target), 1, &mut left)
+                .expect("invariant: distributions valides");
+            let b = lossless_speculative_sample_dense(&target, &target, 1, &mut right)
+                .expect("invariant: distributions valides");
+            assert_eq!((a.accepted, a.token), (b.accepted, b.token));
         }
         assert!(lossless_speculative_sample_dense(&target, &draft[..3], 0, &mut sampler).is_err());
         assert!(lossless_speculative_sample_dense(&target, &draft, 9, &mut sampler).is_err());
