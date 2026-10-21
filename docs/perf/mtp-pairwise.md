@@ -685,6 +685,20 @@ gain) ; puis attention linéaire (23 %, dont ~100 ms de kernels delta sur T2),
 conversions f32→bf16 avant chaque GEMM (3 %), et semis CPU de l'historique MTP
 sur contexte long (22 s sur T7 en MTP committed).
 
+Plafond mesuré sur MLX (`mx.quantized_matmul`, mêmes formes, `mx.eval` par
+itération) : 48 TFLOPS à M=732, 57 à M=8297, contre 38 / 41 ici : le GEMM
+n'explique plus que ~130 des ~440 ms d'écart sur T2. Écartés après mesure :
+delta chunké (`SARAGOSSA_RUST_LINEAR_CHUNKED=1`, section linéaire 385-417 ms
+contre 319-333, texte différent) et plancher de sortie 1024 du GEMM u4 pour
+les k/v_proj (qkv T7 1367 → 691 ms, T2 −20 ms, mais texte greedy T2 différent).
+Pris (21 octobre) : MLP dense fusionné gate+up+SwiGLU
+(`gemm_nax_coop_qb_tiled_u4_gate_up_swiglu`, deux tuiles B par pas de K,
+SwiGLU f32 sur les accumulateurs, H bf16 directement en entrée du down_proj ;
+kill-switch `SARAGOSSA_RUST_PREFILL_FUSED_MLP=0`) : bit-identique aux trois
+passes séparées (oracle sur M=77, fragments masqués), textes identiques sur T2
+et T7. Section `tail_dense`, meilleure de trois (VM en fond) : T2 697 → 582 ms,
+T7 (deux runs) 9,4 → 6,5 s ; conversions f32→bf16 agrégées 48 → 21 ms sur T2.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

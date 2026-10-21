@@ -227,6 +227,173 @@ impl MetalExecutor {
         )
     }
 
+    /// Vrai quand gate, up et down sont des poids u4 gs64 éligibles au GEMM
+    /// tuilé NA (même prédicat que la sélection résidente) et que le kernel
+    /// fusionné gate+up+SwiGLU est disponible et activé.
+    pub(crate) fn fused_dense_mlp_supported(
+        &self,
+        batch: usize,
+        in_dim: usize,
+        gate: &MetalLinearWeightBuffers,
+        up: &MetalLinearWeightBuffers,
+        down: &MetalLinearWeightBuffers,
+        inter_dim: usize,
+    ) -> bool {
+        // Offsets nuls exigés, comme le chemin résident qui renvoie tout offset
+        // non nul vers le repli : des poids poolés liraient sinon un autre tenseur.
+        let u4_gs64 = |weight: &MetalLinearWeightBuffers, expect_in: usize, expect_out: usize| {
+            matches!(
+                weight,
+                MetalLinearWeightBuffers::AffineQuantized {
+                    out_dim,
+                    in_dim: weight_in,
+                    group_size,
+                    bits,
+                    packed_offset: 0,
+                    scales_offset: 0,
+                    biases_offset: 0,
+                    ..
+                } if *out_dim == expect_out
+                    && *weight_in == expect_in
+                    && *group_size == FAST_QMV_GROUP_SIZE
+                    && *bits == FAST_QMV_BITS
+            )
+        };
+        super::flags::prefill_fused_mlp_enabled()
+            && self.na_gemm_coop_qb_tiled_u4_gate_up_swiglu.is_some()
+            && self.qmm_na_fused_tiled_u4_available(FAST_QMV_GROUP_SIZE)
+            && u4_gs64(gate, in_dim, inter_dim)
+            && u4_gs64(up, in_dim, inter_dim)
+            && u4_gs64(down, inter_dim, in_dim)
+            && can_use_qmm_na_fused_tiled_u4_buffers(
+                batch,
+                in_dim,
+                inter_dim,
+                FAST_QMV_GROUP_SIZE,
+                FAST_QMV_BITS,
+            )
+            && can_use_qmm_na_fused_tiled_u4_buffers(
+                batch,
+                inter_dim,
+                in_dim,
+                FAST_QMV_GROUP_SIZE,
+                FAST_QMV_BITS,
+            )
+    }
+
+    /// MLP dense fusionné : `out = down(swiglu(gate(x), up(x)))` en deux
+    /// dispatchs NA, H en bf16 privé sans sortie f32 intermédiaire. L'appelant
+    /// vérifie [`Self::fused_dense_mlp_supported`] avant.
+    pub(crate) fn encode_fused_dense_mlp(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        gate: &MetalLinearWeightBuffers,
+        up: &MetalLinearWeightBuffers,
+        down: &MetalLinearWeightBuffers,
+        inter_dim: usize,
+        output_buffer: &BufferRef,
+    ) -> Result<()> {
+        let quant = |weight: &MetalLinearWeightBuffers, name: &str| match weight {
+            MetalLinearWeightBuffers::AffineQuantized {
+                packed,
+                packed_offset,
+                scales,
+                scales_offset,
+                biases,
+                biases_offset,
+                ..
+            } => Ok((
+                packed.clone(),
+                *packed_offset,
+                scales.clone(),
+                *scales_offset,
+                biases.clone(),
+                *biases_offset,
+            )),
+            MetalLinearWeightBuffers::Dense { .. } => Err(InferError::Config(format!(
+                "MLP fusionné : {name} n'est pas quantifié"
+            ))),
+        };
+        let (gp, gpo, gs, gso, gb, gbo) = quant(gate, "gate_proj")?;
+        let (up_p, upo, us, uso, ub, ubo) = quant(up, "up_proj")?;
+        let (dp, dpo, ds, dso, db, dbo) = quant(down, "down_proj")?;
+        let pso = self
+            .na_gemm_coop_qb_tiled_u4_gate_up_swiglu
+            .as_ref()
+            .ok_or_else(|| InferError::Config("MLP fusionné : kernel NA indisponible".into()))?;
+        let down_pso = self
+            .na_gemm_coop_qb_tiled_u4
+            .as_ref()
+            .ok_or_else(|| InferError::Config("MLP fusionné : GEMM NA indisponible".into()))?;
+        let lhs_len = checked_len(batch, in_dim, "MLP fusionné lhs")?;
+        let hidden_len = checked_len(batch, inter_dim, "MLP fusionné hidden")?;
+        let lhs_bf16 = self.private_bf16_buffer(lhs_len, "fused_mlp_lhs_bf16")?;
+        let hidden_bf16 = self.private_bf16_buffer(hidden_len, "fused_mlp_hidden_bf16")?;
+        self.encode_f32_to_bf16(encoder, lhs_buffer, &lhs_bf16, lhs_len)?;
+        let mnk = [
+            checked_u32(batch, "MLP fusionné batch")?,
+            checked_u32(inter_dim, "MLP fusionné inter_dim")?,
+            checked_u32(in_dim, "MLP fusionné in_dim")?,
+        ];
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(&lhs_bf16), 0);
+        encoder.set_buffer(1, Some(&gp), gpo);
+        encoder.set_buffer(2, Some(&gs), gso);
+        encoder.set_buffer(3, Some(&gb), gbo);
+        encoder.set_buffer(4, Some(&up_p), upo);
+        encoder.set_buffer(5, Some(&us), uso);
+        encoder.set_buffer(6, Some(&ub), ubo);
+        encoder.set_buffer(7, Some(&hidden_bf16), 0);
+        encoder.set_bytes(8, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            "qmm_na_fused_tiled_u4_gate_up_swiglu_gs64",
+            batch,
+            in_dim,
+            inter_dim,
+            FAST_QMV_GROUP_SIZE,
+            4,
+        ));
+        trace_dispatch_path(
+            "gemm_nax_coop_qb_tiled_u4_gate_up_swiglu",
+            batch,
+            inter_dim,
+            in_dim,
+        );
+        profile_dispatch();
+        let width = pso.thread_execution_width().max(1);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch.div_ceil(64), "MLP fusionné batch tiles")?,
+                checked_nsuint(inter_dim / 64, "MLP fusionné inter tiles")?,
+                1,
+            ),
+            MTLSize::new(width * 4, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, &hidden_bf16);
+        if dpo != 0 || dso != 0 || dbo != 0 {
+            return Err(InferError::Config(
+                "MLP fusionné : down_proj avec offsets non nuls".into(),
+            ));
+        }
+        self.dispatch_affine_qmm_na_fused_tiled_u4(
+            encoder,
+            down_pso,
+            &hidden_bf16,
+            &dp,
+            &ds,
+            &db,
+            output_buffer,
+            batch,
+            inter_dim,
+            in_dim,
+            "gemm_nax_coop_qb_tiled_u4",
+            "qmm_na_fused_tiled_u4_gs64",
+        )
+    }
+
     fn encode_affine_qmm_na_fused_tiled_u4_pipeline(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -252,13 +419,45 @@ impl MetalExecutor {
         let lhs_len = checked_len(batch, in_dim, "qmm na fused-tiled u4 lhs")?;
         let lhs_bf16 = self.private_bf16_buffer(lhs_len, "qmm_na_fused_tiled_u4_lhs_bf16")?;
         self.encode_f32_to_bf16(encoder, lhs_buffer, &lhs_bf16, lhs_len)?;
+        self.dispatch_affine_qmm_na_fused_tiled_u4(
+            encoder,
+            pso,
+            &lhs_bf16,
+            packed_buffer,
+            scales_buffer,
+            biases_buffer,
+            output_buffer,
+            batch,
+            in_dim,
+            out_dim,
+            label,
+            profile_label,
+        )
+    }
+
+    /// Dispatch du GEMM tuilé u4 sur un lhs déjà converti en bf16.
+    fn dispatch_affine_qmm_na_fused_tiled_u4(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pso: &ComputePipelineState,
+        lhs_bf16: &BufferRef,
+        packed_buffer: &BufferRef,
+        scales_buffer: &BufferRef,
+        biases_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        label: &'static str,
+        profile_label: &'static str,
+    ) -> Result<()> {
         let mnk = [
             checked_u32(batch, "qmm na fused-tiled u4 batch")?,
             checked_u32(out_dim, "qmm na fused-tiled u4 out_dim")?,
             checked_u32(in_dim, "qmm na fused-tiled u4 in_dim")?,
         ];
         encoder.set_compute_pipeline_state(pso);
-        encoder.set_buffer(0, Some(&lhs_bf16), 0);
+        encoder.set_buffer(0, Some(lhs_bf16), 0);
         encoder.set_buffer(1, Some(packed_buffer), 0);
         encoder.set_buffer(2, Some(scales_buffer), 0);
         encoder.set_buffer(3, Some(biases_buffer), 0);

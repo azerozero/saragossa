@@ -1315,6 +1315,110 @@ fn coop_qb_grouped_u4_bit_identical_to_u8_same_weights() -> Result<()> {
 /// near-ties de l'oracle greedy est PUREMENT la précision bf16 tensor-core, la même
 /// que le chemin u8 promu en prod (6156f29).
 #[test]
+fn coop_qb_tiled_u4_gate_up_swiglu_bit_identical_to_separate_passes() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (Some(pso_fused), Some(pso_tiled)) = (
+        executor.na_gemm_coop_qb_tiled_u4_gate_up_swiglu.clone(),
+        executor.na_gemm_coop_qb_tiled_u4.clone(),
+    ) else {
+        eprintln!("skip: coop qb tiled u4 fusionné indisponible (macOS < 26 ?)");
+        return Ok(());
+    };
+    // M non multiple de 32 : exerce les fragments A masqués et le store masqué.
+    let (m, n, k) = (77_usize, 128_usize, 512_usize);
+    let groups = k / FAST_QMV_GROUP_SIZE;
+    let lhs = (0..m * k)
+        .map(|idx| ((idx % 29) as f32 - 14.0) * 0.013)
+        .collect::<Vec<_>>();
+    let weight = |seed: usize| -> Result<(metal::Buffer, metal::Buffer, metal::Buffer)> {
+        let mut packed = vec![0_u32; n * (k / 8)];
+        for nn in 0..n {
+            for kk in 0..k {
+                let q = ((nn * k + kk) * 7 + seed) % 16;
+                packed[nn * (k / 8) + kk / 8] |= (q as u32) << ((kk % 8) * 4);
+            }
+        }
+        let scales = (0..n * groups)
+            .map(|idx| bf16_round(0.002 + ((idx + seed) % 5) as f32 * 0.0002))
+            .collect::<Vec<_>>();
+        let biases = (0..n * groups)
+            .map(|idx| bf16_round(-0.03 + ((idx + seed) % 7) as f32 * 0.004))
+            .collect::<Vec<_>>();
+        Ok((
+            executor.buffer_from_slice(&packed, "fused_bid_packed")?,
+            executor.buffer_from_f32_as_bf16(&scales, "fused_bid_s")?,
+            executor.buffer_from_f32_as_bf16(&biases, "fused_bid_b")?,
+        ))
+    };
+    let (gp, gs, gb) = weight(3)?;
+    let (up, us, ub) = weight(11)?;
+    let a_f32 = executor.upload_f32_buffer(&lhs, "fused_bid_a")?;
+    let a_bf16 = executor.private_bf16_buffer(m * k, "fused_bid_a_bf16")?;
+    let mnk = [m as u32, n as u32, k as u32];
+    let width = pso_tiled.thread_execution_width().max(1);
+    let grid = MTLSize::new(m.div_ceil(64) as u64, (n / 64) as u64, 1);
+    let tg = MTLSize::new(width * 4, 1, 1);
+
+    // Référence : deux GEMM tuilés f32, swiglu_f32, f32_to_bf16.
+    let gate_out = executor.uncached_f32_buffer(m * n, "fused_bid_gate")?;
+    let up_out = executor.uncached_f32_buffer(m * n, "fused_bid_up")?;
+    let swiglu_out = executor.uncached_f32_buffer(m * n, "fused_bid_swiglu")?;
+    // Sorties bf16 partagées, comparées mot à mot (u32 = deux bf16).
+    let reference_bf16 =
+        executor.scratch_buffer(m * n, MetalBufferElement::Bf16, "fused_bid_ref_bf16")?;
+    let fused_bf16 =
+        executor.scratch_buffer(m * n, MetalBufferElement::Bf16, "fused_bid_fused_bf16")?;
+    let cb = executor.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    let guard = EncoderEndGuard::new(enc);
+    executor.encode_f32_to_bf16(enc, &a_f32, &a_bf16, m * k)?;
+    for (packed, scales, biases, out) in [(&gp, &gs, &gb, &gate_out), (&up, &us, &ub, &up_out)] {
+        enc.set_compute_pipeline_state(&pso_tiled);
+        enc.set_buffer(0, Some(&a_bf16), 0);
+        enc.set_buffer(1, Some(packed), 0);
+        enc.set_buffer(2, Some(scales), 0);
+        enc.set_buffer(3, Some(biases), 0);
+        enc.set_buffer(4, Some(out), 0);
+        enc.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        enc.dispatch_thread_groups(grid, tg);
+        post_dispatch_barrier_buffer(enc, out);
+    }
+    let mut owned = Vec::new();
+    executor.encode_swiglu(enc, &mut owned, &gate_out, &up_out, &swiglu_out, m * n)?;
+    executor.encode_f32_to_bf16(enc, &swiglu_out, &reference_bf16, m * n)?;
+    // Fusionné.
+    enc.set_compute_pipeline_state(&pso_fused);
+    enc.set_buffer(0, Some(&a_bf16), 0);
+    enc.set_buffer(1, Some(&gp), 0);
+    enc.set_buffer(2, Some(&gs), 0);
+    enc.set_buffer(3, Some(&gb), 0);
+    enc.set_buffer(4, Some(&up), 0);
+    enc.set_buffer(5, Some(&us), 0);
+    enc.set_buffer(6, Some(&ub), 0);
+    enc.set_buffer(7, Some(&fused_bf16), 0);
+    enc.set_bytes(8, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+    enc.dispatch_thread_groups(grid, tg);
+    post_dispatch_barrier_buffer(enc, &fused_bf16);
+    guard.end();
+    commit_and_wait(cb)?;
+    let reference = read_u32_buffer(&reference_bf16, m * n / 2)?;
+    let fused = read_u32_buffer(&fused_bf16, m * n / 2)?;
+    let mismatches = reference
+        .iter()
+        .zip(&fused)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        mismatches, 0,
+        "MLP fusionné : {mismatches} mots bf16 diffèrent des passes séparées"
+    );
+    assert!(reference.iter().any(|word| *word != 0));
+    Ok(())
+}
+
+#[test]
 fn coop_qb_tiled_u4_bit_identical_to_u8_same_weights() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());

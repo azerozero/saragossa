@@ -102,6 +102,24 @@ struct NaxFrag {
       }
     }
   }
+  // SwiGLU f32 sur les accumulateurs gate/up puis sortie bf16, lignes >= M ignorées.
+  // Même expression que `swiglu_f32` puis `f32_to_bf16` (arrondi bfloat()) :
+  // la fusion dense gate+up+SwiGLU reste bit-identique aux trois passes séparées.
+  static void store_swiglu_bf16_masked(const thread metal::vec<float,8>& gate,
+                                       const thread metal::vec<float,8>& up,
+                                       device bfloat* dst, uint m_base, uint n_base, uint N, uint M) {
+    short2 sc = get_coord();
+    for (short i = 0; i < 2; i++) {
+      uint row = m_base + uint(sc.y) + uint(i) * 8u;
+      if (row < M) {
+        device bfloat* row_dst = dst + row * N + n_base + uint(sc.x);
+        for (short j = 0; j < 4; j++) {
+          float g = gate[i * 4 + j];
+          row_dst[j] = bfloat((g / (1.0f + exp(-g))) * up[i * 4 + j]);
+        }
+      }
+    }
+  }
   static void load_a_tg(thread metal::vec<bfloat,8>& dst, const threadgroup bfloat* src, int str_x) {
     short2 sc = get_coord();
     src += sc.y * str_x + sc.x;
@@ -502,6 +520,66 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
   NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
   NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
   NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+}
+// MLP dense fusionné gate+up+SwiGLU (prefill) : mêmes tuiles 64×64×64 et
+// fragments que `gemm_nax_coop_qb_tiled_u4`, deux tuiles B (gate, up) par pas
+// de K, SwiGLU en f32 sur les accumulateurs et sortie H bf16 [M, N] prête pour
+// le down_proj. Évite deux sorties f32 [M, N], la passe swiglu et la conversion
+// bf16 de H ; bit-identique aux passes séparées (oracle dans les tests).
+kernel void gemm_nax_coop_qb_tiled_u4_gate_up_swiglu(
+    device const bfloat* A [[buffer(0)]],
+    device const uint* Gp   [[buffer(1)]],
+    device const bfloat* Gs [[buffer(2)]],
+    device const bfloat* Gb [[buffer(3)]],
+    device const uint* Up   [[buffer(4)]],
+    device const bfloat* Us [[buffer(5)]],
+    device const bfloat* Ub [[buffer(6)]],
+    device bfloat* H        [[buffer(7)]],
+    constant uint3& mnk     [[buffer(8)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]) {
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
+  constexpr uint BN = 64, BK = 64, BKP = BK + 8, WN = 2;
+  threadgroup metal::vec<bfloat,8> Wg8[BN * BKP / 8];
+  threadgroup metal::vec<bfloat,8> Wu8[BN * BKP / 8];
+  threadgroup bfloat* Wg = (threadgroup bfloat*)Wg8;
+  threadgroup bfloat* Wu = (threadgroup bfloat*)Wu8;
+  uint sg_m = sgid / WN;
+  uint sg_n = sgid - sg_m * WN;
+  uint m0 = tgid.x * 64u + sg_m * 32u;
+  uint n0 = tgid.y * BN;
+  uint ns = sg_n * 32u;
+  metal::vec<float,8> g0a = float(0), g0b = float(0), g1a = float(0), g1b = float(0);
+  metal::vec<float,8> u0a = float(0), u0b = float(0), u1a = float(0), u1b = float(0);
+  for (uint k = 0; k < K; k += BK) {
+    load_b_tile_quant_u4_gs64_vec(Wg, Gp, Gs, Gb, n0, k, N, K, lid);
+    load_b_tile_quant_u4_gs64_vec(Wu, Up, Us, Ub, n0, k, N, K, lid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 0; kk < BK; kk += 16u) {
+      metal::vec<bfloat,8> af0, af1, b0, b1;
+      if (m0 + 32u <= M) {
+        NaxFrag::load_a(af0, A + m0 * K + k + kk, int(K));
+        NaxFrag::load_a(af1, A + (m0 + 16u) * K + k + kk, int(K));
+      } else {
+        NaxFrag::load_a_masked(af0, A, m0, k + kk, K, M);
+        NaxFrag::load_a_masked(af1, A, m0 + 16u, k + kk, K, M);
+      }
+      NaxFrag::load_a_tg(b0, Wg + ns * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b1, Wg + (ns + 16u) * BKP + kk, int(BKP));
+      NaxFrag::mma(g0a, g0b, af0, b0, b1);
+      NaxFrag::mma(g1a, g1b, af1, b0, b1);
+      NaxFrag::load_a_tg(b0, Wu + ns * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b1, Wu + (ns + 16u) * BKP + kk, int(BKP));
+      NaxFrag::mma(u0a, u0b, af0, b0, b1);
+      NaxFrag::mma(u1a, u1b, af1, b0, b1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  NaxFrag::store_swiglu_bf16_masked(g0a, u0a, H, m0, n0 + ns, N, M);
+  NaxFrag::store_swiglu_bf16_masked(g0b, u0b, H, m0, n0 + ns + 16u, N, M);
+  NaxFrag::store_swiglu_bf16_masked(g1a, u1a, H, m0 + 16u, n0 + ns, N, M);
+  NaxFrag::store_swiglu_bf16_masked(g1b, u1b, H, m0 + 16u, n0 + ns + 16u, N, M);
 }
 // Variante gs64 pour K aligné sur 64 mais non sur 512. La réduction garde des
 // fenêtres de 512 pour préserver le chemin nominal ; la dernière fenêtre est
