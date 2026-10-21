@@ -239,11 +239,20 @@ impl MetalExecutor {
         down: &MetalLinearWeightBuffers,
         inter_dim: usize,
     ) -> bool {
+        // Offsets nuls exigés, comme le chemin résident qui renvoie tout offset
+        // non nul vers le repli : des poids poolés liraient sinon un autre tenseur.
         let u4_gs64 = |weight: &MetalLinearWeightBuffers, expect_in: usize, expect_out: usize| {
             matches!(
                 weight,
                 MetalLinearWeightBuffers::AffineQuantized {
-                    out_dim, in_dim: weight_in, group_size, bits, ..
+                    out_dim,
+                    in_dim: weight_in,
+                    group_size,
+                    bits,
+                    packed_offset: 0,
+                    scales_offset: 0,
+                    biases_offset: 0,
+                    ..
                 } if *out_dim == expect_out
                     && *weight_in == expect_in
                     && *group_size == FAST_QMV_GROUP_SIZE
@@ -364,7 +373,11 @@ impl MetalExecutor {
             MTLSize::new(width * 4, 1, 1),
         );
         post_dispatch_barrier_buffer(encoder, &hidden_bf16);
-        let _ = (dpo, dso, dbo);
+        if dpo != 0 || dso != 0 || dbo != 0 {
+            return Err(InferError::Config(
+                "MLP fusionné : down_proj avec offsets non nuls".into(),
+            ));
+        }
         self.dispatch_affine_qmm_na_fused_tiled_u4(
             encoder,
             down_pso,
