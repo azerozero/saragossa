@@ -3416,6 +3416,8 @@ impl CausalDecoder {
         if suffix.is_empty() {
             return Ok(());
         }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _scratch_buffer_scope = self.scratch_buffer_scope();
         let (final_states, _) = self.forward_suffix_batched(&mut state.cache, suffix, None)?;
         state.final_state = Tensor::row(final_states.last_row()?.to_vec())?;
         Ok(())

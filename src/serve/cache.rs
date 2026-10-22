@@ -2,6 +2,7 @@
 
 use saragossa::runtime_flags::{
     serve_prefix_block_tokens, serve_prefix_blocks_per_session, serve_prefix_cache_blocks,
+    serve_prefix_cache_bytes,
 };
 use saragossa::{CausalDecoderPromptMetalSnapshot, CausalDecoderPromptState};
 use sha2::{Digest, Sha256};
@@ -51,8 +52,6 @@ impl BlockHash {
 pub(super) struct PrefixBlockHit {
     /// Nombre de tokens réutilisables.
     pub(super) tokens: usize,
-    /// Hash chaîné du dernier bloc réutilisé.
-    pub(super) hash: BlockHash,
     /// Snapshot exact à la frontière du dernier bloc.
     pub(super) state: CausalDecoderPromptState,
     /// Snapshot Metal associé à cette frontière.
@@ -70,11 +69,16 @@ struct PrefixBlockEntry {
 }
 
 /// Cache LRU de snapshots aux frontières de blocs.
+///
+/// Les frontières mémorisées sont clairsemées (une par prompt servi) : la
+/// recherche suit la chaîne de hash jusqu'à la frontière présente la plus
+/// profonde, sans exiger les blocs intermédiaires.
 #[derive(Clone, Debug)]
 pub(super) struct BlockAwarePrefixCache {
     block_tokens: usize,
     capacity: usize,
     blocks_per_session: usize,
+    max_bytes: usize,
     entries: Vec<PrefixBlockEntry>,
 }
 
@@ -82,11 +86,13 @@ impl BlockAwarePrefixCache {
     /// Construit le cache depuis les flags runtime.
     #[must_use]
     pub(super) fn from_runtime_flags() -> Self {
-        Self::with_blocks_per_session(
+        let mut cache = Self::with_blocks_per_session(
             serve_prefix_block_tokens(),
             serve_prefix_cache_blocks(),
             serve_prefix_blocks_per_session(),
-        )
+        );
+        cache.max_bytes = serve_prefix_cache_bytes();
+        cache
     }
 
     /// Construit un cache de capacité fixe.
@@ -107,6 +113,7 @@ impl BlockAwarePrefixCache {
             block_tokens: block_tokens.max(1),
             capacity,
             blocks_per_session,
+            max_bytes: usize::MAX,
             entries: Vec::new(),
         }
     }
@@ -117,7 +124,7 @@ impl BlockAwarePrefixCache {
         self.block_tokens
     }
 
-    /// Recherche la plus longue chaîne de blocs préfixes.
+    /// Recherche la frontière mémorisée la plus profonde du préfixe.
     pub(super) fn match_prefix(
         &mut self,
         root: BlockHash,
@@ -130,24 +137,22 @@ impl BlockAwarePrefixCache {
         let mut best = None;
         for (index, block) in tokens.chunks_exact(self.block_tokens).enumerate() {
             let hash = previous.chain(block);
-            let expected_tokens = (index + 1).saturating_mul(self.block_tokens);
-            let Some(entry_index) = self.entries.iter().position(|entry| {
-                entry.session == root && entry.hash == hash && entry.tokens == expected_tokens
-            }) else {
-                break;
-            };
-            let entry = self.entries.remove(entry_index);
-            let hit = PrefixBlockHit {
-                tokens: entry.tokens,
-                hash: entry.hash,
-                state: entry.state.clone(),
-                metal: entry.metal.clone(),
-            };
-            self.entries.insert(0, entry);
             previous = hash;
-            best = Some(hit);
+            let expected_tokens = (index + 1).saturating_mul(self.block_tokens);
+            if let Some(entry_index) = self.entries.iter().position(|entry| {
+                entry.session == root && entry.hash == hash && entry.tokens == expected_tokens
+            }) {
+                best = Some(entry_index);
+            }
         }
-        best
+        let entry = self.entries.remove(best?);
+        let hit = PrefixBlockHit {
+            tokens: entry.tokens,
+            state: entry.state.clone(),
+            metal: entry.metal.clone(),
+        };
+        self.entries.insert(0, entry);
+        Some(hit)
     }
 
     /// Insère ou rafraîchit un snapshot de frontière de bloc.
@@ -170,6 +175,9 @@ impl BlockAwarePrefixCache {
         let bytes = state
             .estimated_cpu_bytes()
             .saturating_add(metal.estimated_bytes());
+        if bytes > self.max_bytes {
+            return 0;
+        }
         self.entries.insert(
             0,
             PrefixBlockEntry {
@@ -186,7 +194,7 @@ impl BlockAwarePrefixCache {
                 break;
             }
         }
-        while self.entries.len() > self.capacity {
+        while self.entries.len() > self.capacity || self.estimated_bytes() > self.max_bytes {
             self.entries.pop();
         }
         bytes
@@ -334,7 +342,6 @@ mod tests {
             .expect("invariant: préfixe présent");
 
         assert_eq!(hit.tokens, 4);
-        assert_eq!(hit.hash, second);
         assert_eq!(hit.state.position(), 4);
     }
 
@@ -368,9 +375,10 @@ mod tests {
         );
 
         assert!(cache.match_prefix(root, &[1]).is_none());
+        // Le bloc 1 évincé n'orpheline plus les frontières plus profondes.
         assert_eq!(
             cache.match_prefix(root, &[1, 2, 3]).map(|hit| hit.tokens),
-            None
+            Some(3)
         );
     }
 
@@ -454,8 +462,8 @@ mod tests {
             vec![alpha_second, beta_first]
         );
         assert_eq!(
-            cache.match_prefix(beta, &[9]).map(|hit| hit.hash),
-            Some(beta_first)
+            cache.match_prefix(beta, &[9]).map(|hit| hit.tokens),
+            Some(1)
         );
         assert_eq!(cache.session_block_count(alpha), 1);
     }
@@ -490,5 +498,48 @@ mod tests {
                 .map(|hit| hit.tokens),
             Some(4)
         );
+    }
+
+    #[test]
+    fn prefix_cache_matches_deepest_sparse_boundary() {
+        let mut cache = BlockAwarePrefixCache::new(2, 8);
+        let root = BlockHash::root();
+        let second = root.chain(&[1, 2]).chain(&[3, 4]);
+        cache.insert(
+            root,
+            second,
+            4,
+            test_state(4),
+            CausalDecoderPromptMetalSnapshot::default(),
+        );
+
+        assert_eq!(
+            cache
+                .match_prefix(root, &[1, 2, 3, 4, 5, 6, 7])
+                .map(|hit| hit.tokens),
+            Some(4)
+        );
+        assert!(cache.match_prefix(root, &[1, 2, 3, 9]).is_none());
+    }
+
+    #[test]
+    fn prefix_cache_respects_byte_cap() {
+        let mut cache = BlockAwarePrefixCache::new(1, 8);
+        let one = test_state(1).estimated_cpu_bytes();
+        cache.max_bytes = one * 2;
+        let root = BlockHash::root();
+        let mut hash = root;
+        for tokens in 1..=4 {
+            hash = hash.chain(&[tokens]);
+            cache.insert(
+                root,
+                hash,
+                tokens,
+                test_state(tokens),
+                CausalDecoderPromptMetalSnapshot::default(),
+            );
+            assert!(cache.estimated_bytes() <= cache.max_bytes);
+        }
+        assert!(!cache.entries.is_empty());
     }
 }

@@ -858,10 +858,12 @@ impl CausalDecoderCache {
         self.layers
             .iter()
             .map(|layer| {
+                // `capacity` : après `make_mut` + `extend`, un Vec peut détenir
+                // jusqu'à 2× sa longueur.
                 layer
                     .keys
-                    .len()
-                    .saturating_add(layer.values.len())
+                    .capacity()
+                    .saturating_add(layer.values.capacity())
                     .saturating_mul(std::mem::size_of::<f32>())
                     .saturating_add(layer.linear.estimated_cpu_bytes())
             })
