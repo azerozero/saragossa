@@ -1246,6 +1246,11 @@ impl CausalDecoder {
         max_draft_tokens: usize,
         on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
+        // NOTE: sans ce scope, le scratch du prefill MTP (clé label × longueur)
+        // n'était jamais élagué : chaque longueur de prompt distincte laissait
+        // ~10 Go en 16k dans `serve` (ctxbench du 22 oct., 125 Go à 32k).
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _scratch_buffer_scope = self.scratch_buffer_scope();
         // Drafter DFlash opt-in (`with_dflash_draft_from_env`) : le greedy non
         // contraint passe par la boucle résidente ; échantillonnage et contraintes
         // gardent la tête MTP. Phase 7 pairwise : code +31 à +88 %, prose longue

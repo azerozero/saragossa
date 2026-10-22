@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use saragossa::decoder::GenerationTimings;
 use saragossa::memory_guard::{
-    estimate_model_bytes, MemoryGuard, MemoryProjection, PurgeOutcome, PurgePressure, PurgeRegistry,
+    estimate_model_bytes, process_footprint_bytes, MemoryGuard, MemoryProjection, PurgeOutcome,
+    PurgePressure, PurgeRegistry,
 };
 use saragossa::runtime_flags::{
     serve_lru_enabled, serve_model_pool_size, serve_prefix_cache_enabled,
@@ -483,7 +484,7 @@ impl LoadedModel {
         };
         let content = strip_text_stops(decoded, &stop_texts);
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={} footprint_bytes={} prefix_cache_bytes={}",
             self.id,
             prompt_tokens,
             output.tokens.len(),
@@ -492,7 +493,9 @@ impl LoadedModel {
             total.as_millis(),
             reused_prefix_tokens,
             prefix_cache,
-            if use_mtp { "mtp" } else { "ar" }
+            if use_mtp { "mtp" } else { "ar" },
+            process_footprint_bytes().unwrap_or(0),
+            self.prefix_cache_bytes()
         );
         Ok(ServedCompletion {
             model: self.id.clone(),
@@ -637,7 +640,7 @@ impl LoadedModel {
         let content = strip_text_stops(decoded, &stop_texts);
         detokenizer.finish(&content, on_event)?;
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={} streaming=true",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={} streaming=true footprint_bytes={} prefix_cache_bytes={}",
             self.id,
             prompt_tokens,
             output.tokens.len(),
@@ -650,7 +653,9 @@ impl LoadedModel {
             } else {
                 "block-snapshots"
             },
-            if use_mtp { "mtp" } else { "ar" }
+            if use_mtp { "mtp" } else { "ar" },
+            process_footprint_bytes().unwrap_or(0),
+            self.prefix_cache_bytes()
         );
         Ok(ServedCompletion {
             model: self.id.clone(),
