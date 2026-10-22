@@ -4,6 +4,8 @@ default_install_hook_types = ["pre-commit", "pre-push"]
 [[repos]]
 repo = "builtin"
 hooks = [
+  # main n'avance que par pull request ; refuse un commit local dessus.
+  { id = "no-commit-to-branch", args = ["--branch", "main"] },
   { id = "trailing-whitespace" },
   { id = "end-of-file-fixer" },
   { id = "check-toml" },
@@ -34,7 +36,7 @@ pass_filenames = false
 id = "cargo-clippy"
 name = "cargo clippy"
 language = "system"
-entry = "cargo clippy --all-targets --all-features"
+entry = "cargo clippy --all-targets --all-features -- -D warnings"
 types = ["rust"]
 pass_filenames = false
 
@@ -62,5 +64,27 @@ name = "cargo machete"
 language = "system"
 entry = "cargo machete"
 types_or = ["rust", "toml"]
+pass_filenames = false
+stages = ["pre-push"]
+
+# Liens intra-doc cassés : ils pourrissent sans bruit tant que rustdoc ne
+# fait qu'avertir.
+[[repos.hooks]]
+id = "cargo-doc"
+name = "cargo doc"
+language = "system"
+entry = "sh"
+args = ["-c", "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features --document-private-items"]
+types = ["rust"]
+pass_filenames = false
+stages = ["pre-push"]
+
+# target/ dépasse vite plusieurs dizaines de Go entre builds Metal et release.
+[[repos.hooks]]
+id = "cargo-sweep"
+name = "cargo sweep"
+language = "system"
+entry = "cargo sweep --time 7"
+always_run = true
 pass_filenames = false
 stages = ["pre-push"]

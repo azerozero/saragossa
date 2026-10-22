@@ -39,7 +39,7 @@ jobs:
           shared-key: nightly-${{ matrix.toolchain }}-macos
           save-if: true
       - name: Clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --lib --bins --all-features
       - name: Documentation tests

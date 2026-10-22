@@ -181,7 +181,7 @@ fn st_view<'a>(
         .map_err(|source| InferError::Config(format!("MTP tensor {norm_key}: {source}")))
 }
 
-/// Charge une norme bf16 [dim] + correction unit-offset (mean<0.5 → +1.0).
+/// Charge une norme bf16 `[dim]` + correction unit-offset (mean<0.5 → +1.0).
 fn load_mtp_norm(st: &SafeTensors, resolve: &HashMap<String, String>, key: &str) -> Result<Tensor> {
     let view = st_view(st, resolve, key)?;
     let data = bytes_to_dense_f32(view.data(), view.dtype(), key)?;

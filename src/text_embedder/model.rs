@@ -3,11 +3,11 @@
 //!
 //! ## Pipeline forward
 //!
-//!   ids [L] + mask [L]
-//!     └─ embeddings : word[ids] + position[0..L] + token_type[0] → LayerNorm
+//!   ids `[L]` + mask `[L]`
+//!     └─ embeddings : `word[ids] + position[0..L] + token_type[0]` → LayerNorm
 //!     └─ N=12 BertLayer : (self-attn non causale + add&LN) ; (FFN gelu + add&LN)
 //!     └─ mean-pooling MASQUÉ : Σ(h · mask) / Σmask  (E5 = mean tokens, PAS CLS)
-//!     └─ L2-normalize → vecteur unitaire [384]
+//!     └─ L2-normalize → vecteur unitaire `[384]`
 //!
 //! ## Parité
 //!

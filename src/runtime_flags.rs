@@ -361,7 +361,7 @@ pub(crate) fn mtp_gpu_block_enabled() -> bool {
 /// fresh c'est la configuration PW04 de la campagne pairwise, cf.
 /// [`mtp_fresh_cache_enabled`]. Activé, la profondeur est choisie PAR PAS entre 1 et le
 /// plafond `SARAGOSSA_RUST_MTP_MAX_DRAFT` selon une EMA de la deep-acceptance récente
-/// (cf. [`crate::decoder::mtp_adaptive`]). La séquence générée reste byte-identique
+/// (cf. `decoder::mtp_adaptive`). La séquence générée reste byte-identique
 /// (le vérifieur trunk exact décide *lesquels* des tokens proposés sont acceptés,
 /// pas *combien* on en propose).
 /// Drafts par pas du lookup n-grammes (`decoder::lookup`), 0 = désactivé.
