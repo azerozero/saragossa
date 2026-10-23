@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use saragossa::decoder::GenerationTimings;
 use saragossa::memory_guard::{
-    estimate_model_bytes, process_footprint_bytes, MemoryGuard, MemoryProjection, PurgeOutcome,
-    PurgePressure, PurgeRegistry,
+    estimate_model_bytes, process_footprint_bytes, process_purge_registry, MemoryGuard,
+    MemoryProjection, PurgeOutcome, PurgePressure, PurgeRegistry,
 };
 use saragossa::runtime_flags::{
     serve_lru_enabled, serve_model_pool_size, serve_prefix_cache_enabled,
@@ -293,6 +293,19 @@ impl ServeState {
                 .evict_one_prefix_block()
                 .map(|bytes| PurgeOutcome::Purged {
                     bytes: usize_to_u64_saturating(bytes),
+                })
+                .unwrap_or(PurgeOutcome::Empty)
+        });
+        // Cache de préfixe du décodeur (chemin MTP) et autres purgeables du
+        // process : sans eux, une requête MTP échouait alors qu'ils étaient
+        // libérables.
+        registry.register(15, "process-purgeables", |_, pressure| {
+            process_purge_registry()
+                .lock()
+                .ok()
+                .and_then(|mut registry| registry.purge_one(&mut (), pressure))
+                .map(|report| PurgeOutcome::Purged {
+                    bytes: report.bytes,
                 })
                 .unwrap_or(PurgeOutcome::Empty)
         });
@@ -708,35 +721,35 @@ impl LoadedModel {
         let hit = self.prefix_cache.match_prefix(root, tokens);
         let reused_prefix_tokens = hit.as_ref().map_or(0, |hit| hit.tokens);
 
-        let (mut state, mut consumed, mut hash) = if let Some(hit) = hit {
+        // NOTE: une seule frontière mémorisée par prompt, la dernière complète.
+        // Un snapshot par bloc partageait l'Arc du KV avec l'état vivant : chaque
+        // extension recopiait tout le préfixe, soit O(n²) retenu (~65 Gio en 16k).
+        // ponytail: un préfixe commun plus court que le prompt servi (prompt
+        // système partagé) n'est réutilisé que s'il a été servi seul ; ajouter
+        // une frontière déclarée (fin du message système) si ce cas compte.
+        let mut state = if let Some(hit) = hit {
             let mut state = hit.state;
             let metal = self.decoder.copy_prompt_state_metal_snapshot(&hit.metal)?;
             self.decoder.restore_prompt_state_metal(&mut state, metal)?;
-            (state, hit.tokens, hit.hash)
-        } else if full_block_tokens >= block_tokens {
-            let first = &tokens[..block_tokens];
-            let state = self.decoder.prefill_prompt_state_uncached(first)?;
-            let hash = root.chain(first);
-            self.remember_prefix_block(root, hash, block_tokens, &state, memory_guard)?;
-            (state, block_tokens, hash)
+            self.decoder
+                .extend_prompt_state(&mut state, &tokens[hit.tokens..full_block_tokens])?;
+            state
+        } else if full_block_tokens > 0 {
+            self.decoder
+                .prefill_prompt_state_uncached(&tokens[..full_block_tokens])?
         } else {
             let state = self.decoder.prefill_prompt_state_uncached(tokens)?;
             return Ok((state, 0, started.elapsed()));
         };
 
-        while consumed + block_tokens <= full_block_tokens {
-            let next = consumed + block_tokens;
-            let block = &tokens[consumed..next];
-            self.decoder.extend_prompt_state(&mut state, block)?;
-            hash = hash.chain(block);
-            self.remember_prefix_block(root, hash, next, &state, memory_guard)?;
-            consumed = next;
+        if reused_prefix_tokens < full_block_tokens {
+            let hash = tokens[..full_block_tokens]
+                .chunks_exact(block_tokens)
+                .fold(root, BlockHash::chain);
+            self.remember_prefix_block(root, hash, full_block_tokens, &state, memory_guard)?;
         }
-
-        if consumed < tokens.len() {
-            self.decoder
-                .extend_prompt_state(&mut state, &tokens[consumed..])?;
-        }
+        self.decoder
+            .extend_prompt_state(&mut state, &tokens[full_block_tokens..])?;
 
         Ok((state, reused_prefix_tokens, started.elapsed()))
     }

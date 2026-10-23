@@ -1060,6 +1060,19 @@ pub fn serve_prefix_block_tokens() -> usize {
     })
 }
 
+/// Renvoie le plafond en octets des snapshots du prefix-cache serveur
+/// (`SARAGOSSA_SERVE_PREFIX_CACHE_BYTES`, 16 Gio par défaut). Une entrée porte
+/// tout le KV f32 de son préfixe, ~4 Gio en 32k sur le 27B : le plafond en
+/// blocs seul laissait le cache monter jusqu'à la garde OOM du process.
+pub fn serve_prefix_cache_bytes() -> usize {
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_SERVE_PREFIX_CACHE_BYTES")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(16 << 30)
+    })
+}
+
 /// Renvoie la capacité du prefix-cache serveur en blocs.
 pub fn serve_prefix_cache_blocks() -> usize {
     static BLOCKS: OnceLock<usize> = OnceLock::new();
