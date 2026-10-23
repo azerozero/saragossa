@@ -718,7 +718,13 @@ impl LoadedModel {
         let block_tokens = self.prefix_cache.block_tokens();
         let full_block_tokens = tokens.len() / block_tokens * block_tokens;
         let root = BlockHash::for_session(session_key);
-        let hit = self.prefix_cache.match_prefix(root, tokens);
+        // NOTE: l'extension résidente coûte ~2,3× un prefill à froid par token
+        // (29k étendus en 127 s contre 32k à froid en 63 s, 27B) : un hit qui
+        // couvre moins de la moitié des blocs du prompt est ignoré.
+        let hit = self
+            .prefix_cache
+            .match_prefix(root, tokens)
+            .filter(|hit| hit.tokens.saturating_mul(2) >= full_block_tokens);
         let reused_prefix_tokens = hit.as_ref().map_or(0, |hit| hit.tokens);
 
         // NOTE: une seule frontière mémorisée par prompt, la dernière complète.
