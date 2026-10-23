@@ -51,7 +51,8 @@ de référence et de repli mesurable.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features --document-private-items
 cargo build
 cargo test --all-features
 cargo deny check

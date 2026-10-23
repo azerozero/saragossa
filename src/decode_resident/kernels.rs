@@ -966,7 +966,7 @@ kernel void attn_gate_f32(
 /// `dims.w` (PAS l'index de ligne comme le kernel de prefill, qui roterait à 0).
 /// Reproduit `rms_norm_rope_heads_at` (decoder.rs) pour le token courant.
 /// `copy_at_f32` : `out[i] = in[i]` ; en liant `out` à un offset, écrit la ligne
-/// KV[position] device-side (append, hazard read-after-write prouvé en R3).
+/// `KV[position]` device-side (append, hazard read-after-write prouvé en R3).
 /// `copy_at_f32_to_bf16` applique le même append vers un KV compact bf16.
 pub(super) const ROPE_DECODE_COPY_KERNELS: &str = r#"
 #include <metal_stdlib>
