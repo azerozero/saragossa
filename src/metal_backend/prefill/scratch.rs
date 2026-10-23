@@ -117,7 +117,10 @@ impl MetalExecutor {
                         None
                     },
                     q: self.private_f32_buffer(q_len, "resident_q")?,
-                    k: self.uncached_f32_buffer(kv_len, "resident_k")?,
+                    // NOTE: k avant RoPE n'est qu'un intermédiaire (seuls k_rope et
+                    // v partent au cache) : scratch partagé entre couches, pas un
+                    // buffer par couche (2,1 Go de footprint en moins à 32k).
+                    k: self.private_f32_buffer(kv_len, "resident_k")?,
                     v: self.uncached_f32_buffer(kv_len, "resident_v")?,
                     q_rope: self.private_f32_buffer(q_len, "resident_q_rope")?,
                     k_rope: self.uncached_f32_buffer(kv_len, "resident_k_rope")?,
