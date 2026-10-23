@@ -635,7 +635,9 @@ fn recommended_metal_working_set_bytes() -> Option<u64> {
     unsafe_code,
     reason = "FFI Mach task_info : lit phys_footprint du process pour la garde mémoire"
 )]
-fn process_footprint_bytes() -> Option<u64> {
+/// Lit le `phys_footprint` du process (ce que macOS compte pour la pression
+/// mémoire, buffers Metal compris) ; `None` hors macOS ou si Mach échoue.
+pub fn process_footprint_bytes() -> Option<u64> {
     use mach_sys::kern_return::KERN_SUCCESS;
     use mach_sys::message::mach_msg_type_number_t;
     use mach_sys::task::task_info;
@@ -659,7 +661,9 @@ fn process_footprint_bytes() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn process_footprint_bytes() -> Option<u64> {
+/// Lit le `phys_footprint` du process (ce que macOS compte pour la pression
+/// mémoire, buffers Metal compris) ; `None` hors macOS ou si Mach échoue.
+pub fn process_footprint_bytes() -> Option<u64> {
     None
 }
 
