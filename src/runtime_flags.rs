@@ -754,6 +754,19 @@ pub(crate) fn prefill_attn_steel_d256_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256", true))
 }
 
+/// Attention causale d256 du prefill (même périmètre que le Steel d256) sur les
+/// accélérateurs neuronaux : kernel NAX dsplit de MLX, Q/K/V bf16, accumulation
+/// f32. Défaut ON depuis le 2026-10-23 (M5 Max, 27B) : attention 26,6 → 6,7 s
+/// à 32k, TTFT 83 → 63 s ; oracle CPU 2,05e-3. Textes greedy identiques sur 4
+/// contextes sur 7 (4k-32k), les 3 autres divergent sur un near-tie (marges
+/// 0,0001-0,011 contre 2,3 en médiane), même politique que le `batch_long`.
+/// Kill-switch `SARAGOSSA_RUST_PREFILL_ATTN_NAX=0` (retour au Steel f32).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_attn_nax_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX", true))
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

@@ -11,6 +11,10 @@ const STEEL_ATTN_BD: usize = 64;
 const STEEL_CAUSAL_ATTN_D256_BQ: usize = 32;
 const STEEL_CAUSAL_ATTN_D256_BK: usize = 64;
 const STEEL_CAUSAL_ATTN_D256_BD: usize = 256;
+const STEEL_CAUSAL_ATTN_NAX_BQ: usize = 64;
+const STEEL_CAUSAL_ATTN_NAX_BK: usize = 32;
+/// WM × WN simdgroups de la variante dsplit (4 lignes × 2 tranches de D).
+const STEEL_CAUSAL_ATTN_NAX_SIMDGROUPS: NSUInteger = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1298,20 +1302,54 @@ impl MetalExecutor {
         {
             return Ok(false);
         }
-        let Some(pipeline) = self.causal_attention_prefill_steel_d256_f32.as_ref() else {
-            return Ok(false);
-        };
-        let params = steel_attn_params(
-            spec,
-            STEEL_CAUSAL_ATTN_D256_BQ,
-            STEEL_CAUSAL_ATTN_D256_BK,
-            "steel causal d256 attention",
-        )?;
-        let grid_rows = spec.seq.div_ceil(STEEL_CAUSAL_ATTN_D256_BQ);
+        // NAX (accélérateurs neuronaux) d'abord : Q/K/V convertis en bf16 comme
+        // chez MLX ; lire du f32 (TF32) est plus lent que le Steel f32.
+        let nax_inputs;
+        let (pipeline, block_q, block_k, threads_y, q_in, k_in, v_in) =
+            match self.causal_attention_prefill_steel_nax_d256.as_ref() {
+                Some(pipeline) => {
+                    let q_len = checked_len(spec.seq, spec.q_heads * spec.head_dim, "nax q")?;
+                    let kv_len = checked_len(spec.seq, spec.kv_heads * spec.head_dim, "nax kv")?;
+                    nax_inputs = [
+                        self.private_bf16_buffer(q_len, "prefill_attn_nax_q_bf16")?,
+                        self.private_bf16_buffer(kv_len, "prefill_attn_nax_k_bf16")?,
+                        self.private_bf16_buffer(kv_len, "prefill_attn_nax_v_bf16")?,
+                    ];
+                    self.encode_f32_to_bf16(encoder, q_buffer, &nax_inputs[0], q_len)?;
+                    self.encode_f32_to_bf16(encoder, k_buffer, &nax_inputs[1], kv_len)?;
+                    self.encode_f32_to_bf16(encoder, v_buffer, &nax_inputs[2], kv_len)?;
+                    (
+                        pipeline,
+                        STEEL_CAUSAL_ATTN_NAX_BQ,
+                        STEEL_CAUSAL_ATTN_NAX_BK,
+                        STEEL_CAUSAL_ATTN_NAX_SIMDGROUPS,
+                        nax_inputs[0].as_ref(),
+                        nax_inputs[1].as_ref(),
+                        nax_inputs[2].as_ref(),
+                    )
+                }
+                None => {
+                    let Some(pipeline) = self.causal_attention_prefill_steel_d256_f32.as_ref()
+                    else {
+                        return Ok(false);
+                    };
+                    (
+                        pipeline,
+                        STEEL_CAUSAL_ATTN_D256_BQ,
+                        STEEL_CAUSAL_ATTN_D256_BK,
+                        4,
+                        q_buffer,
+                        k_buffer,
+                        v_buffer,
+                    )
+                }
+            };
+        let params = steel_attn_params(spec, block_q, block_k, "steel causal d256 attention")?;
+        let grid_rows = spec.seq.div_ceil(block_q);
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(q_buffer), 0);
-        encoder.set_buffer(1, Some(k_buffer), 0);
-        encoder.set_buffer(2, Some(v_buffer), 0);
+        encoder.set_buffer(0, Some(q_in), 0);
+        encoder.set_buffer(1, Some(k_in), 0);
+        encoder.set_buffer(2, Some(v_in), 0);
         encoder.set_buffer(3, Some(output_buffer), 0);
         encoder.set_bytes(
             4,
@@ -1325,7 +1363,7 @@ impl MetalExecutor {
                 checked_nsuint(spec.q_heads, "steel causal d256 heads")?,
                 1,
             ),
-            MTLSize::new(32, 4, 1),
+            MTLSize::new(32, threads_y, 1),
         );
         post_dispatch_barrier(encoder);
         Ok(true)
