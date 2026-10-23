@@ -22,6 +22,7 @@ pub(super) struct KernelSources {
     pub(super) matmul: Cow<'static, str>,
     pub(super) na_gemm: Cow<'static, str>,
     pub(super) steel_attention: Cow<'static, str>,
+    pub(super) steel_attention_nax: Cow<'static, str>,
 }
 
 impl KernelSources {
@@ -37,6 +38,7 @@ impl KernelSources {
                 matmul: Cow::Borrowed(MATMUL_KERNELS),
                 na_gemm: Cow::Borrowed(NA_GEMM_SRC),
                 steel_attention: Cow::Borrowed(STEEL_ATTENTION_KERNELS),
+                steel_attention_nax: Cow::Borrowed(STEEL_ATTENTION_NAX_KERNELS),
             });
         };
         Ok(Self {
@@ -46,6 +48,14 @@ impl KernelSources {
                 &root,
                 &["steel_attention", "steel_attention.metal"],
             )?),
+            // Optionnelle : un répertoire préparé avant le NAX reste valide.
+            steel_attention_nax: match read_runtime_kernel(
+                &root,
+                &["steel_attention_nax", "steel_attention_nax.metal"],
+            ) {
+                Ok(source) => Cow::Owned(source),
+                Err(_) => Cow::Borrowed(STEEL_ATTENTION_NAX_KERNELS),
+            },
         })
     }
 }
@@ -161,6 +171,49 @@ fn compile_steel_causal_d256_attention(
         Ok(pipeline) => Some(pipeline),
         Err(message) => {
             trace_steel_causal_d256_compile_error("pipeline", &message);
+            None
+        }
+    }
+}
+
+/// Compile l'attention causale NAX d256 (bibliothèque séparée, MPP). `None`
+/// si MetalPerformancePrimitives manque (macOS < 26) ou sans accélérateur.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(super) fn compile_steel_causal_nax_d256_attention(
+    device: &Device,
+    source: &str,
+) -> Option<ComputePipelineState> {
+    let options = CompileOptions::new();
+    options.set_fast_math_enabled(true);
+    let library = match device.new_library_with_source(source, &options) {
+        Ok(library) => library,
+        Err(message) => {
+            trace_steel_causal_d256_compile_error("nax compile", &message);
+            return None;
+        }
+    };
+    let constants = FunctionConstantValues::new();
+    for (index, value) in [
+        (200, false),
+        (201, false),
+        (300, false),
+        (301, true),
+        (302, false),
+        (303, false),
+    ] {
+        set_metal_bool_constant(&constants, index, value);
+    }
+    let function = match library.get_function(STEEL_CAUSAL_ATTN_NAX_D256, Some(constants)) {
+        Ok(function) => function,
+        Err(message) => {
+            trace_steel_causal_d256_compile_error("nax function", &message);
+            return None;
+        }
+    };
+    match device.new_compute_pipeline_state_with_function(&function) {
+        Ok(pipeline) => Some(pipeline),
+        Err(message) => {
+            trace_steel_causal_d256_compile_error("nax pipeline", &message);
             None
         }
     }
@@ -527,6 +580,19 @@ impl MetalExecutor {
         )?;
         let causal_attention_prefill_steel_d256_f32 =
             compile_steel_causal_d256_attention(&device, sources.steel_attention.as_ref());
+        let causal_attention_prefill_steel_nax_d256 =
+            if crate::runtime_flags::prefill_attn_nax_enabled() {
+                let pipeline = compile_steel_causal_nax_d256_attention(
+                    &device,
+                    sources.steel_attention_nax.as_ref(),
+                );
+                if pipeline.is_none() {
+                    eprintln!("attention prefill NAX indisponible : repli Steel f32");
+                }
+                pipeline
+            } else {
+                None
+            };
         let noncausal_attention_prefill_f32 =
             pipeline(&library, &device, "noncausal_attention_prefill_f32")?;
         let steel_attention_f32_bq32_bk32_bd64 =
@@ -701,6 +767,7 @@ impl MetalExecutor {
             causal_attention_prefill_batch_long_d256_f32,
             causal_attention_prefill_batch_gqa8x4_d256_f32,
             causal_attention_prefill_steel_d256_f32,
+            causal_attention_prefill_steel_nax_d256,
             noncausal_attention_prefill_f32,
             steel_attention_f32_bq32_bk32_bd64,
             add_rms_norm_row_f32,

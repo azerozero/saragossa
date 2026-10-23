@@ -706,6 +706,27 @@ est prise une seule fois, à l'allocation, et l'encodage suit le scratch. Textes
 greedy identiques sur T2 et T7, chemin fusionné et repli ; les temps de prefill
 ne bougent pas au bruit près.
 
+Attention causale du prefill sur les accélérateurs neuronaux (23 octobre) : à
+32k, le profil par sections montrait l'attention causale à 26,6 s sur 78,9
+(34 %), soit ~8 TFLOPS pour le Steel f32, contre 5,3 s (40 TFLOPS) pour
+`mx.fast.scaled_dot_product_attention` aux mêmes formes. Le kernel NAX « dsplit »
+de MLX 0.32.4 (`bq64_bk32_bd256_wm4_wn2`, celui que MLX choisit pour d256) est
+figé dans `assets/steel_attention_nax.metal`, Q/K/V convertis en bf16, sortie
+f32. Lire Q/K/V en f32 (TF32) a été mesuré plus lent que le Steel (35,4 s).
+
+| Prompt | Attention causale Steel | NAX | Prefill Steel | NAX |
+|---|---|---|---|---|
+| 8k | 1,38 s | 0,43 s | 635 tok/s | 676 tok/s |
+| 32k | 26,6 s | 6,7 s | 405 tok/s | 578 tok/s |
+
+Oracle CPU (entrées arrondies en bf16) à 2,5e-4 sur (16, 2) et (24, 4), lignes
+de chaque groupe et tuiles partielles. Sur `serve` (ctxbench, 7 contextes 4k à
+32k, greedy) : TTFT 32k 83 → 63 s, 16k 35 → 29 s, intégrité 4/4 partout, textes
+identiques sur 4 contextes. Les 3 autres divergent sur un near-tie (marges
+top1-top2 au premier écart 0,0001 à 0,011 contre 2,3 en médiane, mêmes deux
+tokens inversés, logit top1 décalé d'au plus 0,16 avant l'écart). Défaut ON,
+kill-switch `SARAGOSSA_RUST_PREFILL_ATTN_NAX=0`.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

@@ -26,6 +26,10 @@ const STEEL_ATTN_F32_BQ32_BK32_BD64: &str =
     "steel_attention_float32_bq32_bk32_bd64_wm4_wn1_maskfloat32";
 const STEEL_CAUSAL_ATTN_D256_F32_BQ32_BK64_BD64X4: &str =
     "steel_attention_float32_bq32_bk64_bd64x4_wm4_wn1_causal_d256";
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const STEEL_ATTENTION_NAX_KERNELS: &str = include_str!("../../assets/steel_attention_nax.metal");
+const STEEL_CAUSAL_ATTN_NAX_D256: &str =
+    "steel_attention_nax_dsplit_bf16_f32out_bq64_bk32_bd256_wm4_wn2";
 const MAX_MOE_TOP_K: usize = 16;
 pub(crate) const MAX_SAMPLER_TOP_K: usize = 32;
 const FAST_QMV_GROUP_SIZE: usize = 64;
@@ -263,6 +267,7 @@ pub struct MetalExecutor {
     causal_attention_prefill_batch_long_d256_f32: ComputePipelineState,
     causal_attention_prefill_batch_gqa8x4_d256_f32: ComputePipelineState,
     causal_attention_prefill_steel_d256_f32: Option<ComputePipelineState>,
+    causal_attention_prefill_steel_nax_d256: Option<ComputePipelineState>,
     noncausal_attention_prefill_f32: ComputePipelineState,
     steel_attention_f32_bq32_bk32_bd64: Option<ComputePipelineState>,
     add_rms_norm_row_f32: ComputePipelineState,
