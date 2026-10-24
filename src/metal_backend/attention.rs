@@ -1292,9 +1292,11 @@ impl MetalExecutor {
     }
 
     /// Attention causale d'un morceau de prefill : les `spec.seq` requêtes sont
-    /// les dernières des `kv_rows` clés déjà écrites dans `k_buffer`/`v_buffer`
-    /// (capacité `kv_capacity` lignes, stable d'un morceau à l'autre pour que le
-    /// scratch bf16 du NAX reste le même buffer).
+    /// les dernières des `kv_rows` clés déjà écrites dans `k_buffer`/`v_buffer`.
+    /// Le scratch bf16 du NAX est dimensionné sur `kv_capacity` pour rester une
+    /// seule entrée du cache de scratch d'un morceau à l'autre.
+    // ponytail: le NAX reconvertit tout le préfixe en bf16 à chaque morceau
+    // (O(morceaux²), ~0,3 s à 64k) ; garder des K/V bf16 par couche si ça pèse.
     ///
     /// # Errors
     ///

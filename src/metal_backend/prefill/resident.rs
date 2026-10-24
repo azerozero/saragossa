@@ -68,9 +68,9 @@ impl MetalExecutor {
                 spec.seq, spec.hidden_dim
             )));
         }
-        if layers.is_empty() {
+        if layers.is_empty() || spec.seq == 0 {
             return Err(InferError::Config(
-                "prefill résident sans couche".to_string(),
+                "prefill résident sans couche ou sans token".to_string(),
             ));
         }
         let chunk_rows = self.resident_prefill_chunk_rows(layers, spec, chunk_tokens);
@@ -419,17 +419,20 @@ impl MetalExecutor {
         spec: PrefillAttentionSpec,
         target: usize,
     ) -> usize {
-        if target == 0 || spec.seq <= target {
+        // NOTE: les timestamps GPU plafonnent à 8192 échantillons ; un seul
+        // morceau garde le profil par couche lisible.
+        if target == 0 || spec.seq <= target || crate::runtime_flags::gpu_timestamps_enabled() {
             return spec.seq;
         }
         let rows = spec.seq.div_ceil(spec.seq.div_ceil(target));
+        let last_rows = spec.seq - (spec.seq.div_ceil(rows) - 1) * rows;
         let chunkable = layers.iter().all(|layer| match layer.attention {
-            PrefillAttentionLayer::Full { .. } => {
+            PrefillAttentionLayer::Full { .. } => [rows, last_rows].into_iter().all(|seq| {
                 self.causal_attention_prefill_chunk_supported(PrefillAttentionSpec {
-                    seq: rows,
+                    seq,
                     ..layer.attention_spec
                 })
-            }
+            }),
             PrefillAttentionLayer::Linear { .. } => true,
         });
         if chunkable {

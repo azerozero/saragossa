@@ -773,6 +773,8 @@ pub(crate) fn prefill_attn_nax_enabled() -> bool {
 /// découpé en morceaux égaux (au plus cette taille, au moins 512). Les modèles
 /// hors périmètre Steel/NAX d256 (fenêtre glissante, autres têtes) restent en
 /// un seul morceau. `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0` désactive.
+/// Avec l'état SSM bf16 (opt-in), l'état est arrondi à chaque frontière de
+/// morceau au lieu d'une fois : dérive non mesurée.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_resident_chunk_tokens() -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();
