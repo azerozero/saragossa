@@ -117,13 +117,13 @@ impl MetalExecutor {
                         None
                     },
                     q: self.private_f32_buffer(q_len, "resident_q")?,
-                    // NOTE: k avant RoPE n'est qu'un intermédiaire (seuls k_rope et
-                    // v partent au cache) : scratch partagé entre couches, pas un
-                    // buffer par couche (2,1 Go de footprint en moins à 32k).
+                    // NOTE: k, v et k_rope sont dimensionnés sur le morceau et partagés
+                    // entre couches ; le KV de chaque couche est recopié dans son
+                    // cache pleine longueur (`allocate_prefill_resident_layer_cache`).
                     k: self.private_f32_buffer(kv_len, "resident_k")?,
-                    v: self.uncached_f32_buffer(kv_len, "resident_v")?,
+                    v: self.private_f32_buffer(kv_len, "resident_v_chunk")?,
                     q_rope: self.private_f32_buffer(q_len, "resident_q_rope")?,
-                    k_rope: self.uncached_f32_buffer(kv_len, "resident_k_rope")?,
+                    k_rope: self.private_f32_buffer(kv_len, "resident_k_rope_chunk")?,
                     context: self.private_f32_buffer(q_len, "resident_context")?,
                     gated_context: if *gated {
                         Some(self.private_f32_buffer(q_len, "resident_gated_context")?)
@@ -133,31 +133,9 @@ impl MetalExecutor {
                     o: self.private_f32_buffer(hidden_len, "resident_o")?,
                 })
             }
-            PrefillResidentAttentionShape::Linear {
-                spec: linear_spec,
-                dims,
-                conv_len,
-                ssm_len,
-                ..
-            } => {
-                let conv_seed = vec![0.0; *conv_len];
-                let ssm_seed = vec![0.0; *ssm_len];
-                let mut state = None;
-                self.ensure_linear_attention_metal_state(
-                    &mut state,
-                    &conv_seed,
-                    &ssm_seed,
-                    dims.conv_dim,
-                    *conv_len,
-                    *ssm_len,
-                    *linear_spec,
-                )?;
-                let state = state.ok_or_else(|| {
-                    InferError::Metal("état prefill linear-attn absent".to_string())
-                })?;
+            PrefillResidentAttentionShape::Linear { .. } => {
                 PrefillResidentAttentionScratch::Linear(PrefillResidentLinearAttentionScratch {
                     output: self.private_f32_buffer(hidden_len, "resident_linear_o")?,
-                    state,
                 })
             }
         };
@@ -239,6 +217,48 @@ impl MetalExecutor {
             post_normed: self.private_f32_buffer(hidden_len, "resident_post_normed")?,
             tail,
         })
+    }
+
+    /// Alloue ce qui survit aux morceaux d'une couche : le KV pleine longueur
+    /// (`kv_rows` lignes) d'une attention complète, ou l'état conv/SSM d'une
+    /// attention linéaire, initialisé à zéro.
+    pub(super) fn allocate_prefill_resident_layer_cache(
+        &self,
+        shape: &PrefillResidentLayerShape<'_>,
+        kv_rows: usize,
+        kv_dim: usize,
+    ) -> Result<PrefillResidentLayerCacheBuffer> {
+        match &shape.attention {
+            PrefillResidentAttentionShape::Full { .. } => {
+                let kv_len = checked_len(kv_rows, kv_dim, "prefill résident kv")?;
+                Ok(PrefillResidentLayerCacheBuffer::Full {
+                    key: self.uncached_f32_buffer(kv_len, "resident_k_rope")?,
+                    value: self.uncached_f32_buffer(kv_len, "resident_v")?,
+                    kv_dim,
+                })
+            }
+            PrefillResidentAttentionShape::Linear {
+                spec,
+                dims,
+                conv_len,
+                ssm_len,
+            } => {
+                let mut state = None;
+                self.ensure_linear_attention_metal_state(
+                    &mut state,
+                    &vec![0.0; *conv_len],
+                    &vec![0.0; *ssm_len],
+                    dims.conv_dim,
+                    *conv_len,
+                    *ssm_len,
+                    *spec,
+                )?;
+                let state = state.ok_or_else(|| {
+                    InferError::Metal("état prefill linear-attn absent".to_string())
+                })?;
+                Ok(PrefillResidentLayerCacheBuffer::Linear { state })
+            }
+        }
     }
 
     pub(super) fn allocate_prefill_gemma_dense_tail_scratch(

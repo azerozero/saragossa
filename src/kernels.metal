@@ -8116,7 +8116,8 @@ kernel void rms_norm_rope_heads_f32(
             // d'exposant 2*pair/frequency_dim (miroir CPU rms_norm_rope_heads_at).
             const uint pair = (col < pairs) ? col : (col - pairs);
             const float exponent = float(2u * pair) / frequency_dim;
-            const float angle = float(pos) / pow(base_theta, exponent);
+            // params.w : position absolue de la première ligne (prefill par morceaux).
+            const float angle = (float(pos) + params.w) / pow(base_theta, exponent);
             const float c = cos(angle);
             const float s = sin(angle);
             const float first = input[start + pair] * inv_rms * weight[pair];

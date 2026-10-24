@@ -819,7 +819,7 @@ fn prefill_resident_uses_layer_specific_attention_dimensions() -> Result<()> {
     // Captures : la sortie de la couche 0 est l'entrée de la couche 1 (= sortie
     // du run à une couche), celle de la couche 1 est la sortie finale.
     let (_, _, captures) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, base, &[0, 1])?;
+        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, base, &[0, 1], 0)?;
     let captures = captures.ok_or_else(|| InferError::Config("captures absentes".to_string()))?;
     assert_eq!(captures.shape(), &[SEQ, 2 * HIDDEN]);
     for row in 0..SEQ {
@@ -953,5 +953,197 @@ fn qwen3_moe_prefill_resident_matches_legacy_bit_exact() -> Result<()> {
     assert_bit_exact(&resident, &legacy, "qwen prefill output");
     assert_bit_exact(resident_key, &legacy_key, "qwen prefill key");
     assert_bit_exact(resident_value, &legacy_value, "qwen prefill value");
+    Ok(())
+}
+
+/// Le prefill par morceaux (KV recopié, état linéaire reporté, RoPE et
+/// attention décalées) reproduit le prefill en un seul morceau.
+#[test]
+fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    const SEQ: usize = 1100;
+    const HIDDEN: usize = 64;
+    const Q_HEADS: usize = 16;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 256;
+    const INTER: usize = 32;
+    // Chemin de production 27B : dk128/dv128, noyau conv 4.
+    let linear_spec = LinearAttentionStepSpec {
+        num_key_heads: 1,
+        num_value_heads: 2,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel_dim: 4,
+        rms_eps: 1.0e-6,
+    };
+    let dims = LinearAttnResidentDims {
+        in_dim: HIDDEN,
+        conv_dim: 512,
+        value_dim: 256,
+        key_dim: 128,
+    };
+
+    let input = deterministic_tensor(SEQ, HIDDEN, 601, 0.5)?;
+    let input_norm = deterministic_norm(HIDDEN, 607)?;
+    let post_norm = deterministic_norm(HIDDEN, 613)?;
+    let gate = Linear::new(deterministic_tensor(INTER, HIDDEN, 617, 0.1)?, None)?;
+    let up = Linear::new(deterministic_tensor(INTER, HIDDEN, 619, 0.1)?, None)?;
+    let down = Linear::new(deterministic_tensor(HIDDEN, INTER, 631, 0.1)?, None)?;
+    let in_proj_qkv = Linear::new(deterministic_tensor(512, HIDDEN, 641, 0.08)?, None)?;
+    let in_proj_z = Linear::new(deterministic_tensor(256, HIDDEN, 643, 0.08)?, None)?;
+    let in_proj_b = Linear::new(deterministic_tensor(2, HIDDEN, 647, 0.08)?, None)?;
+    let in_proj_a = Linear::new(deterministic_tensor(2, HIDDEN, 653, 0.08)?, None)?;
+    let out_proj = Linear::new(deterministic_tensor(HIDDEN, 256, 659, 0.05)?, None)?;
+    let conv_weight = Tensor::from_vec(
+        vec![512, 4, 1],
+        deterministic_tensor(512, 4, 661, 0.3)?.data().to_vec(),
+    )?;
+    let a_log = [0.1_f32, -0.2];
+    let dt_bias = [0.05_f32, 0.15];
+    let norm_weight = deterministic_norm(128, 673)?;
+    let q_norm = deterministic_norm(HEAD_DIM, 677)?;
+    let k_norm = deterministic_norm(HEAD_DIM, 683)?;
+    let q_proj = Linear::new(
+        deterministic_tensor(2 * Q_HEADS * HEAD_DIM, HIDDEN, 691, 0.06)?,
+        None,
+    )?;
+    let k_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 701, 0.06)?,
+        None,
+    )?;
+    let v_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 709, 0.06)?,
+        None,
+    )?;
+    let o_proj = Linear::new(
+        deterministic_tensor(HIDDEN, Q_HEADS * HEAD_DIM, 719, 0.02)?,
+        None,
+    )?;
+    let spec = PrefillAttentionSpec {
+        seq: SEQ,
+        hidden_dim: HIDDEN,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        rope_theta: 10_000_000.0,
+        attn_scalar: HEAD_DIM as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let tail = PrefillMoeTail::Dense {
+        gate_proj: &gate,
+        up_proj: &up,
+        down_proj: &down,
+    };
+    let layers = [
+        PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Linear {
+                weights: LinearAttnResidentWeights {
+                    in_proj_qkv: &in_proj_qkv,
+                    in_proj_z: &in_proj_z,
+                    in_proj_b: &in_proj_b,
+                    in_proj_a: &in_proj_a,
+                    out_proj: &out_proj,
+                    conv_weight: &conv_weight,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    norm_weight: norm_weight.data(),
+                },
+                spec: linear_spec,
+                dims,
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail,
+        },
+        PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Full {
+                q_proj: &q_proj,
+                k_proj: &k_proj,
+                v_proj: &v_proj,
+                o_proj: &o_proj,
+                q_norm: &q_norm,
+                k_norm: &k_norm,
+                gated: true,
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail,
+        },
+    ];
+
+    let (single, single_caches, single_captures) =
+        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 0)?;
+    // 512 → trois morceaux de 367/367/366 lignes.
+    let (chunked, chunked_caches, chunked_captures) =
+        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512)?;
+    let max_diff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    };
+    let output_diff = max_diff(chunked.data(), single.data());
+    eprintln!("prefill par morceaux: écart sortie {output_diff:e}");
+    assert_close(&chunked, &single, 1.0e-4, "prefill par morceaux sortie");
+    let (Some(single_captures), Some(chunked_captures)) = (single_captures, chunked_captures)
+    else {
+        return Err(InferError::Config("captures absentes".to_string()));
+    };
+    assert_close(
+        &chunked_captures,
+        &single_captures,
+        1.0e-4,
+        "prefill par morceaux capture",
+    );
+    match (single_caches.as_slice(), chunked_caches.as_slice()) {
+        (
+            [PrefillResidentLayerCache::Linear {
+                state: single_state,
+            }, PrefillResidentLayerCache::Full {
+                key: single_key,
+                value: single_value,
+            }],
+            [PrefillResidentLayerCache::Linear {
+                state: chunked_state,
+            }, PrefillResidentLayerCache::Full {
+                key: chunked_key,
+                value: chunked_value,
+            }],
+        ) => {
+            assert_close(chunked_key, single_key, 1.0e-4, "prefill par morceaux K");
+            assert_close(
+                chunked_value,
+                single_value,
+                1.0e-4,
+                "prefill par morceaux V",
+            );
+            let conv_single = read_f32_buffer(&single_state.conv, single_state.conv_len)?;
+            let conv_chunked = read_f32_buffer(&chunked_state.conv, chunked_state.conv_len)?;
+            assert!(max_diff(&conv_chunked, &conv_single) <= 1.0e-4, "état conv");
+            if !single_state.ssm_bf16 {
+                let ssm_single = read_f32_buffer(&single_state.ssm, single_state.ssm_len)?;
+                let ssm_chunked = read_f32_buffer(&chunked_state.ssm, chunked_state.ssm_len)?;
+                let ssm_diff = max_diff(&ssm_chunked, &ssm_single);
+                eprintln!("prefill par morceaux: écart SSM {ssm_diff:e}");
+                assert!(ssm_diff <= 1.0e-4, "état SSM écart {ssm_diff}");
+            }
+        }
+        _ => {
+            return Err(InferError::Dimension(
+                "caches linéaire + full attendus".to_string(),
+            ))
+        }
+    }
     Ok(())
 }

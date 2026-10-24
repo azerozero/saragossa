@@ -1042,6 +1042,7 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
         heads: usize,
+        position_offset: usize,
     ) -> Result<()> {
         let dims = [
             checked_u32(spec.seq, "rope seq")?,
@@ -1061,7 +1062,7 @@ impl MetalExecutor {
                 spec.eps,
                 spec.rope_theta,
                 spec.rope_frequency_dim as f32,
-                0.0,
+                position_offset as f32,
             ],
             "rms_rope_params",
         )?;
@@ -1105,6 +1106,8 @@ impl MetalExecutor {
             v_buffer,
             output_buffer,
             spec,
+            spec.seq,
+            spec.seq,
         )? {
             return Ok(());
         }
@@ -1288,6 +1291,57 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Attention causale d'un morceau de prefill : les `spec.seq` requêtes sont
+    /// les dernières des `kv_rows` clés déjà écrites dans `k_buffer`/`v_buffer`
+    /// (capacité `kv_capacity` lignes, stable d'un morceau à l'autre pour que le
+    /// scratch bf16 du NAX reste le même buffer).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la forme sort du périmètre Steel/NAX d256.
+    pub(super) fn encode_causal_attention_prefill_chunk(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buffer: &BufferRef,
+        k_buffer: &BufferRef,
+        v_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+        kv_rows: usize,
+        kv_capacity: usize,
+    ) -> Result<()> {
+        if kv_rows > kv_capacity
+            || !self.encode_steel_causal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+                kv_rows,
+                kv_capacity,
+            )?
+        {
+            return Err(InferError::Config(format!(
+                "prefill par morceaux hors périmètre Steel d256 (q={} kv={kv_rows}/{kv_capacity})",
+                spec.seq
+            )));
+        }
+        Ok(())
+    }
+
+    /// Indique si l'attention par morceaux est disponible pour cette forme.
+    pub(super) fn causal_attention_prefill_chunk_supported(
+        &self,
+        spec: PrefillAttentionSpec,
+    ) -> bool {
+        crate::runtime_flags::prefill_attn_steel_d256_enabled()
+            && spec.window.is_none()
+            && prefill_attn_steel_d256_supported(spec)
+            && (self.causal_attention_prefill_steel_nax_d256.is_some()
+                || self.causal_attention_prefill_steel_d256_f32.is_some())
+    }
+
     fn encode_steel_causal_attention_prefill(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1296,6 +1350,8 @@ impl MetalExecutor {
         v_buffer: &BufferRef,
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
+        kv_rows: usize,
+        kv_capacity: usize,
     ) -> Result<bool> {
         if !crate::runtime_flags::prefill_attn_steel_d256_enabled()
             || !prefill_attn_steel_d256_supported(spec)
@@ -1309,11 +1365,13 @@ impl MetalExecutor {
             match self.causal_attention_prefill_steel_nax_d256.as_ref() {
                 Some(pipeline) => {
                     let q_len = checked_len(spec.seq, spec.q_heads * spec.head_dim, "nax q")?;
-                    let kv_len = checked_len(spec.seq, spec.kv_heads * spec.head_dim, "nax kv")?;
+                    let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "nax kv_dim")?;
+                    let kv_len = checked_len(kv_rows, kv_dim, "nax kv")?;
+                    let kv_capacity_len = checked_len(kv_capacity, kv_dim, "nax kv capacité")?;
                     nax_inputs = [
                         self.private_bf16_buffer(q_len, "prefill_attn_nax_q_bf16")?,
-                        self.private_bf16_buffer(kv_len, "prefill_attn_nax_k_bf16")?,
-                        self.private_bf16_buffer(kv_len, "prefill_attn_nax_v_bf16")?,
+                        self.private_bf16_buffer(kv_capacity_len, "prefill_attn_nax_k_bf16")?,
+                        self.private_bf16_buffer(kv_capacity_len, "prefill_attn_nax_v_bf16")?,
                     ];
                     self.encode_f32_to_bf16(encoder, q_buffer, &nax_inputs[0], q_len)?;
                     self.encode_f32_to_bf16(encoder, k_buffer, &nax_inputs[1], kv_len)?;
@@ -1344,7 +1402,13 @@ impl MetalExecutor {
                     )
                 }
             };
-        let params = steel_attn_params(spec, block_q, block_k, "steel causal d256 attention")?;
+        let params = steel_attn_params(
+            spec,
+            block_q,
+            block_k,
+            kv_rows,
+            "steel causal d256 attention",
+        )?;
         let grid_rows = spec.seq.div_ceil(block_q);
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_in), 0);
@@ -1429,7 +1493,13 @@ impl MetalExecutor {
             return Ok(false);
         }
         let n_q = spec.seq.div_ceil(STEEL_ATTN_BQ);
-        let params = steel_attn_params(spec, STEEL_ATTN_BQ, STEEL_ATTN_BK, "steel attention")?;
+        let params = steel_attn_params(
+            spec,
+            STEEL_ATTN_BQ,
+            STEEL_ATTN_BK,
+            spec.seq,
+            "steel attention",
+        )?;
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_buffer), 0);
         encoder.set_buffer(1, Some(k_buffer), 0);
@@ -1468,8 +1538,15 @@ pub(super) fn steel_attn_params(
     spec: PrefillAttentionSpec,
     block_q: usize,
     block_k: usize,
+    kv_rows: usize,
     label: &'static str,
 ) -> Result<SteelAttnParams> {
+    if kv_rows < spec.seq {
+        return Err(InferError::Dimension(format!(
+            "{label} kv_rows={kv_rows} < q_rows={}",
+            spec.seq
+        )));
+    }
     if spec.kv_heads == 0 || spec.q_heads == 0 || spec.q_heads % spec.kv_heads != 0 {
         return Err(InferError::Dimension(format!(
             "{label} heads invalides q_heads={} kv_heads={}",
@@ -1479,16 +1556,16 @@ pub(super) fn steel_attn_params(
     let q_dim = checked_len(spec.q_heads, spec.head_dim, "steel attention q_dim")?;
     let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "steel attention kv_dim")?;
     let n_q = spec.seq.div_ceil(block_q);
-    let n_k = spec.seq.div_ceil(block_k);
+    let n_k = kv_rows.div_ceil(block_k);
     let n_q_aligned = spec.seq / block_q;
-    let n_k_aligned = spec.seq / block_k;
+    let n_k_aligned = kv_rows / block_k;
     let scale = causal_prefill_scale_params(spec)?[0];
     Ok(SteelAttnParams {
         b: 1,
         h: checked_i32(spec.q_heads, "steel attention heads")?,
         d: checked_i32(spec.head_dim, "steel attention head_dim")?,
         q_l: checked_i32(spec.seq, "steel attention qL")?,
-        k_l: checked_i32(spec.seq, "steel attention kL")?,
+        k_l: checked_i32(kv_rows, "steel attention kL")?,
         gqa_factor: checked_i32(spec.q_heads / spec.kv_heads, "steel attention gqa")?,
         scale,
         n_q: checked_i32(n_q, label)?,
@@ -1496,8 +1573,9 @@ pub(super) fn steel_attn_params(
         n_q_aligned: checked_i32(n_q_aligned, label)?,
         n_k_aligned: checked_i32(n_k_aligned, label)?,
         q_l_rem: checked_i32(spec.seq - n_q_aligned * block_q, label)?,
-        k_l_rem: checked_i32(spec.seq - n_k_aligned * block_k, label)?,
-        q_l_off: 0,
+        k_l_rem: checked_i32(kv_rows - n_k_aligned * block_k, label)?,
+        // Convention MLX : les requêtes sont alignées sur la fin des clés.
+        q_l_off: checked_i32(kv_rows - spec.seq, label)?,
         q_strides: [
             checked_i64(checked_len(
                 spec.seq,
@@ -1509,7 +1587,7 @@ pub(super) fn steel_attn_params(
         ],
         k_strides: [
             checked_i64(checked_len(
-                spec.seq,
+                kv_rows,
                 kv_dim,
                 "steel attention K batch stride",
             )?)?,
@@ -1518,7 +1596,7 @@ pub(super) fn steel_attn_params(
         ],
         v_strides: [
             checked_i64(checked_len(
-                spec.seq,
+                kv_rows,
                 kv_dim,
                 "steel attention V batch stride",
             )?)?,

@@ -767,6 +767,22 @@ pub(crate) fn prefill_attn_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX", true))
 }
 
+/// Taille cible, en tokens, d'un morceau du prefill résident. Les buffers
+/// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
+/// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est
+/// découpé en morceaux égaux (au plus cette taille, au moins 512). Les modèles
+/// hors périmètre Steel/NAX d256 (fenêtre glissante, autres têtes) restent en
+/// un seul morceau. `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0` désactive.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_resident_chunk_tokens() -> usize {
+    static CHUNK: OnceLock<usize> = OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map_or(4096, |chunk| if chunk == 0 { 0 } else { chunk.max(512) })
+    })
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

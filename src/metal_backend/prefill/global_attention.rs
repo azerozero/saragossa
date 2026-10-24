@@ -1,6 +1,6 @@
 //! Primitives propres à l'attention globale Gemma 4.
 
-use super::resident::ResidentPrefillEncodeContext;
+use super::resident::{ResidentPrefillChunk, ResidentPrefillEncodeContext};
 use super::*;
 
 const RMS_HEADS_TG_WIDTH: u64 = 256;
@@ -17,12 +17,14 @@ impl MetalExecutor {
         attention: PrefillAttentionLayer<'_>,
         attention_scratch: PrefillResidentAttentionScratch,
         normed_buffer: &BufferRef,
+        layer_cache: &PrefillResidentLayerCacheBuffer,
+        chunk: ResidentPrefillChunk,
         spec: PrefillAttentionSpec,
         hidden_dim: usize,
         q_dim: usize,
         layer_index: usize,
-    ) -> Result<(Buffer, PrefillResidentLayerCacheBuffer)> {
-        match (attention, attention_scratch) {
+    ) -> Result<Buffer> {
+        match (attention, attention_scratch, layer_cache) {
             (
                 PrefillAttentionLayer::Full {
                     q_proj,
@@ -33,7 +35,17 @@ impl MetalExecutor {
                     ..
                 },
                 PrefillResidentAttentionScratch::Full(full_scratch),
+                PrefillResidentLayerCacheBuffer::Full {
+                    key: key_cache,
+                    value: value_cache,
+                    kv_dim,
+                },
             ) => {
+                let kv_chunk_len = checked_len(spec.seq, *kv_dim, "resident kv morceau")?;
+                let kv_cache_offset = checked_len(chunk.start, *kv_dim, "resident kv offset")?
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .ok_or_else(|| InferError::Shape("resident kv offset déborde".to_string()))?;
                 let PrefillResidentFullAttentionScratch {
                     q_norm: q_norm_buffer,
                     k_norm: k_norm_buffer,
@@ -127,6 +139,7 @@ impl MetalExecutor {
                         &q_rope_buffer,
                         spec,
                         spec.q_heads,
+                        chunk.start,
                     )?;
                     self.encode_rms_norm_rope_heads(
                         encoder,
@@ -135,6 +148,23 @@ impl MetalExecutor {
                         &k_rope_buffer,
                         spec,
                         spec.kv_heads,
+                        chunk.start,
+                    )?;
+                    self.encode_copy_with_offsets(
+                        encoder,
+                        &k_rope_buffer,
+                        0,
+                        key_cache,
+                        kv_cache_offset,
+                        kv_chunk_len,
+                    )?;
+                    self.encode_copy_with_offsets(
+                        encoder,
+                        &v_buffer,
+                        0,
+                        value_cache,
+                        kv_cache_offset,
+                        kv_chunk_len,
                     )
                 })?;
                 self.run_resident_prefill_section(
@@ -145,12 +175,23 @@ impl MetalExecutor {
                         "causal_attention"
                     },
                     |encoder, _owned| {
-                        if spec.window.is_some() {
+                        if chunk.rows < chunk.total {
+                            self.encode_causal_attention_prefill_chunk(
+                                encoder,
+                                &q_rope_buffer,
+                                key_cache,
+                                value_cache,
+                                &context_buffer,
+                                spec,
+                                chunk.start + chunk.rows,
+                                chunk.total,
+                            )
+                        } else if spec.window.is_some() {
                             self.encode_windowed_attention_prefill(
                                 encoder,
                                 &q_rope_buffer,
-                                &k_rope_buffer,
-                                &v_buffer,
+                                key_cache,
+                                value_cache,
                                 &context_buffer,
                                 spec,
                             )
@@ -158,8 +199,8 @@ impl MetalExecutor {
                             self.encode_causal_attention_prefill(
                                 encoder,
                                 &q_rope_buffer,
-                                &k_rope_buffer,
-                                &v_buffer,
+                                key_cache,
+                                value_cache,
                                 &context_buffer,
                                 spec,
                             )
@@ -199,14 +240,7 @@ impl MetalExecutor {
                     )?;
                     Ok(())
                 })?;
-                Ok((
-                    o_buffer,
-                    PrefillResidentLayerCacheBuffer::Full {
-                        key: k_rope_buffer,
-                        value: v_buffer,
-                        kv_dim: checked_len(spec.kv_heads, spec.head_dim, "resident cache kv_dim")?,
-                    },
-                ))
+                Ok(o_buffer)
             }
             (
                 PrefillAttentionLayer::Linear {
@@ -214,9 +248,11 @@ impl MetalExecutor {
                     spec: linear_spec,
                     dims,
                 },
-                PrefillResidentAttentionScratch::Linear(linear_scratch),
+                PrefillResidentAttentionScratch::Linear(PrefillResidentLinearAttentionScratch {
+                    output,
+                }),
+                PrefillResidentLayerCacheBuffer::Linear { state },
             ) => {
-                let PrefillResidentLinearAttentionScratch { output, state } = linear_scratch;
                 self.run_resident_prefill_section(
                     context,
                     "linear_attention",
@@ -228,13 +264,13 @@ impl MetalExecutor {
                             &output,
                             spec.seq,
                             weights,
-                            &state,
+                            state,
                             linear_spec,
                             dims,
                         )
                     },
                 )?;
-                Ok((output, PrefillResidentLayerCacheBuffer::Linear { state }))
+                Ok(output)
             }
             _ => Err(InferError::Dimension(format!(
                 "prefill résident scratch attention incohérent couche {layer_index}"

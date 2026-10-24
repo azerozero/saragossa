@@ -11,6 +11,20 @@ pub(super) struct ResidentPrefillEncodeContext<'a> {
     owned_buffers: &'a mut Vec<Buffer>,
 }
 
+/// Morceau de lignes `[start, start + rows)` d'un prefill de `total` lignes.
+#[derive(Clone, Copy)]
+pub(super) struct ResidentPrefillChunk {
+    pub(super) start: usize,
+    pub(super) rows: usize,
+    pub(super) total: usize,
+}
+
+fn f32_byte_offset(len: usize) -> Result<u64> {
+    len.checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| InferError::Shape(format!("offset f32 {len} déborde")))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "orchestration prefill: couches, dimensions et caches restent explicites"
@@ -24,7 +38,7 @@ impl MetalExecutor {
         spec: PrefillAttentionSpec,
     ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>)> {
         let (output, caches, _) =
-            self.qwen_moe_prefill_resident_with_captures(input, layers, spec, &[])?;
+            self.qwen_moe_prefill_resident_with_captures(input, layers, spec, &[], 0)?;
         Ok((output, caches))
     }
 
@@ -32,27 +46,21 @@ impl MetalExecutor {
     /// `capture_layer_ids` (toutes les positions). Les captures sont copiées sur
     /// le GPU pendant l'encodage, relues une fois à la fin et rendues en
     /// `[seq, n * hidden]`, la disposition attendue par le drafter DFlash.
-    /// `None` quand aucune couche n'est demandée.
+    /// `None` quand aucune couche n'est demandée. `chunk_tokens` borne la
+    /// taille d'un morceau (0 : un seul morceau), cf.
+    /// `prefill_resident_chunk_tokens`.
     pub(crate) fn qwen_moe_prefill_resident_with_captures(
         &self,
         input: &Tensor,
         layers: &[PrefillMoeLayer<'_>],
         spec: PrefillAttentionSpec,
         capture_layer_ids: &[usize],
+        chunk_tokens: usize,
     ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>, Option<Tensor>)> {
         let profile_sections = prefill_profile_sections_enabled();
         if profile_sections {
             reset_prefill_f32_to_bf16_shapes();
         }
-        let mut kernel_timing = if profile_sections {
-            None
-        } else {
-            PrefillKernelTiming::try_new(&self.device, layers.len())
-        };
-        let profile_total_started = profile_sections.then(std::time::Instant::now);
-        let mut section_profile = PrefillSectionProfile::default();
-        let trace = !profile_sections && trace_prefill_enabled();
-        let total_started = trace.then(std::time::Instant::now);
         let (seq, hidden_dim) = input.as_matrix()?;
         if seq != spec.seq || hidden_dim != spec.hidden_dim {
             return Err(InferError::Dimension(format!(
@@ -65,10 +73,28 @@ impl MetalExecutor {
                 "prefill résident sans couche".to_string(),
             ));
         }
+        let chunk_rows = self.resident_prefill_chunk_rows(layers, spec, chunk_tokens);
+        let chunk_count = spec.seq.div_ceil(chunk_rows);
+        let mut kernel_timing = if profile_sections {
+            None
+        } else {
+            PrefillKernelTiming::try_new(&self.device, layers.len() * chunk_count)
+        };
+        let profile_total_started = profile_sections.then(std::time::Instant::now);
+        let mut section_profile = PrefillSectionProfile::default();
+        let trace = !profile_sections && trace_prefill_enabled();
+        let total_started = trace.then(std::time::Instant::now);
         let hidden_len = checked_len(spec.seq, hidden_dim, "prefill résident hidden")?;
+        let chunk_hidden_capacity =
+            checked_len(chunk_rows, hidden_dim, "prefill résident hidden morceau")?;
         let input_buffer = self.upload_f32_buffer(input.data(), "resident_input")?;
-        let hidden_a = self.private_f32_buffer(hidden_len, "resident_hidden_a")?;
-        let hidden_b = self.private_f32_buffer(hidden_len, "resident_hidden_b")?;
+        let hidden_a = self.private_f32_buffer(chunk_hidden_capacity, "resident_hidden_a")?;
+        let hidden_b = self.private_f32_buffer(chunk_hidden_capacity, "resident_hidden_b")?;
+        let chunk_input = if chunk_count > 1 {
+            Some(self.private_f32_buffer(chunk_hidden_capacity, "resident_chunk_input")?)
+        } else {
+            None
+        };
         if let Some(bad) = capture_layer_ids.iter().find(|&&id| id >= layers.len()) {
             return Err(InferError::Config(format!(
                 "prefill résident capture couche {bad} hors des {} couches",
@@ -85,8 +111,23 @@ impl MetalExecutor {
             )?;
             Some(self.uncached_f32_buffer(len, "resident_captures")?)
         };
-        let mut current_buffer = input_buffer;
+        let final_output = if chunk_count > 1 || private_scratch_enabled() {
+            Some(self.uncached_f32_buffer(hidden_len, "resident_final_output")?)
+        } else {
+            None
+        };
+        // NOTE: seuls le KV pleine longueur et l'état linéaire survivent aux
+        // morceaux ; tout le reste est un scratch dimensionné sur un morceau.
         let mut layer_cache_buffers = Vec::with_capacity(layers.len());
+        for (layer_index, layer) in layers.iter().enumerate() {
+            let (_, kv_dim, layer_shape) =
+                self.resident_prefill_layer_shape(layer, layer_index, spec, hidden_dim)?;
+            layer_cache_buffers.push(self.allocate_prefill_resident_layer_cache(
+                &layer_shape,
+                spec.seq,
+                kv_dim,
+            )?);
+        }
         let mut owned_buffers = Vec::new();
 
         let command_buffer = self.queue.new_command_buffer();
@@ -110,7 +151,8 @@ impl MetalExecutor {
             ensure_completed(command_buffer.status())?;
         }
         let encode_started = trace.then(std::time::Instant::now);
-        let final_read_buffer = {
+        let mut current_buffer = input_buffer.clone();
+        {
             let mut encode_context = ResidentPrefillEncodeContext {
                 profile_sections,
                 section_profile: &mut section_profile,
@@ -119,151 +161,165 @@ impl MetalExecutor {
                 fallback_encoder,
                 owned_buffers: &mut owned_buffers,
             };
-            for (layer_index, layer) in layers.iter().enumerate() {
-                let layer_spec = layer.attention_spec;
-                if layer_spec.seq != spec.seq
-                    || layer_spec.hidden_dim != hidden_dim
-                    || layer_spec.q_heads != spec.q_heads
-                    || layer_spec.eps != spec.eps
-                {
-                    return Err(InferError::Dimension(format!(
-                        "prefill résident spec incohérent couche {layer_index}: {layer_spec:?}"
-                    )));
-                }
-                let q_dim = checked_len(
-                    layer_spec.q_heads,
-                    layer_spec.head_dim,
-                    "prefill résident q_dim couche",
-                )?;
-                let kv_dim = checked_len(
-                    layer_spec.kv_heads,
-                    layer_spec.head_dim,
-                    "prefill résident kv_dim couche",
-                )?;
-                let layer_shape = self.check_prefill_resident_layer_shapes(
-                    *layer,
-                    layer_index,
-                    hidden_dim,
-                    q_dim,
-                    kv_dim,
-                    layer_spec,
-                )?;
-                let top_k = layer.tail.top_k();
-                let scratch = self.allocate_prefill_resident_layer_scratch(
-                    &layer_shape,
-                    layer_spec,
-                    hidden_dim,
-                    q_dim,
-                    kv_dim,
-                    top_k,
-                )?;
-                let tail_shape = layer_shape.tail;
-                let PrefillResidentLayerScratch {
-                    input_norm: input_norm_buffer,
-                    post_norm: post_norm_buffer,
-                    normed: normed_buffer,
-                    attention: attention_scratch,
-                    attention_state: attention_state_buffer,
-                    post_normed: post_normed_buffer,
-                    tail: tail_scratch,
-                } = scratch;
-                let output_buffer = if layer_index % 2 == 0 {
-                    hidden_a.clone()
-                } else {
-                    hidden_b.clone()
+            for chunk_start in (0..spec.seq).step_by(chunk_rows) {
+                let chunk = ResidentPrefillChunk {
+                    start: chunk_start,
+                    rows: chunk_rows.min(spec.seq - chunk_start),
+                    total: spec.seq,
                 };
+                let chunk_hidden_len =
+                    checked_len(chunk.rows, hidden_dim, "prefill résident hidden morceau")?;
+                let chunk_offset_bytes =
+                    f32_byte_offset(checked_len(chunk.start, hidden_dim, "morceau offset")?)?;
+                if let Some(chunk_input) = chunk_input.as_ref() {
+                    self.run_resident_prefill_section(
+                        &mut encode_context,
+                        "chunk_input",
+                        |encoder, _owned| {
+                            self.encode_copy_with_offsets(
+                                encoder,
+                                &input_buffer,
+                                chunk_offset_bytes,
+                                chunk_input,
+                                0,
+                                chunk_hidden_len,
+                            )
+                        },
+                    )?;
+                    current_buffer = chunk_input.clone();
+                }
+                for (layer_index, layer) in layers.iter().enumerate() {
+                    let layer_spec = PrefillAttentionSpec {
+                        seq: chunk.rows,
+                        ..layer.attention_spec
+                    };
+                    let (q_dim, kv_dim, layer_shape) =
+                        self.resident_prefill_layer_shape(layer, layer_index, spec, hidden_dim)?;
+                    // Scratch dimensionné sur `chunk_rows` : le dernier morceau, plus
+                    // court, réutilise les mêmes buffers du cache de scratch.
+                    let scratch = self.allocate_prefill_resident_layer_scratch(
+                        &layer_shape,
+                        PrefillAttentionSpec {
+                            seq: chunk_rows,
+                            ..layer_spec
+                        },
+                        hidden_dim,
+                        q_dim,
+                        kv_dim,
+                        layer.tail.top_k(),
+                    )?;
+                    let tail_shape = layer_shape.tail;
+                    let PrefillResidentLayerScratch {
+                        input_norm: input_norm_buffer,
+                        post_norm: post_norm_buffer,
+                        normed: normed_buffer,
+                        attention: attention_scratch,
+                        attention_state: attention_state_buffer,
+                        post_normed: post_normed_buffer,
+                        tail: tail_scratch,
+                    } = scratch;
+                    let output_buffer = if layer_index % 2 == 0 {
+                        hidden_a.clone()
+                    } else {
+                        hidden_b.clone()
+                    };
 
-                self.encode_resident_input_norm_phase(
-                    &mut encode_context,
-                    &current_buffer,
-                    &input_norm_buffer,
-                    &normed_buffer,
-                    layer_spec,
-                    hidden_dim,
-                )?;
-                let (attention_output_buffer, layer_cache_buffer) = self
-                    .encode_resident_attention_phase(
+                    self.encode_resident_input_norm_phase(
+                        &mut encode_context,
+                        &current_buffer,
+                        &input_norm_buffer,
+                        &normed_buffer,
+                        layer_spec,
+                        hidden_dim,
+                    )?;
+                    let attention_output_buffer = self.encode_resident_attention_phase(
                         &mut encode_context,
                         layer.attention,
                         attention_scratch,
                         &normed_buffer,
+                        &layer_cache_buffers[layer_index],
+                        chunk,
                         layer_spec,
                         hidden_dim,
                         q_dim,
                         layer_index,
                     )?;
-                self.encode_resident_residual_phase(
-                    &mut encode_context,
-                    &current_buffer,
-                    &attention_output_buffer,
-                    &post_norm_buffer,
-                    &attention_state_buffer,
-                    &post_normed_buffer,
-                    layer.post_norm_before_residual,
-                    layer_spec,
-                    hidden_dim,
-                )?;
-                self.encode_resident_moe_tail_phase(
-                    &mut encode_context,
-                    layer.tail,
-                    tail_shape,
-                    tail_scratch,
-                    &post_normed_buffer,
-                    &attention_state_buffer,
-                    &output_buffer,
-                    layer_spec,
-                    hidden_dim,
-                    hidden_len,
-                    layer_index,
-                )?;
-                layer_cache_buffers.push(layer_cache_buffer);
-                current_buffer = output_buffer;
-                if let Some(capture_buffer) = capture_buffer.as_ref() {
-                    for slot in capture_layer_ids
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(slot, &id)| (id == layer_index).then_some(slot))
-                    {
-                        let offset =
-                            checked_len(slot, hidden_len, "prefill résident capture offset")?
-                                .checked_mul(std::mem::size_of::<f32>())
-                                .and_then(|bytes| u64::try_from(bytes).ok())
-                                .ok_or_else(|| {
-                                    InferError::Shape(
-                                        "prefill résident capture offset déborde".to_string(),
+                    self.encode_resident_residual_phase(
+                        &mut encode_context,
+                        &current_buffer,
+                        &attention_output_buffer,
+                        &post_norm_buffer,
+                        &attention_state_buffer,
+                        &post_normed_buffer,
+                        layer.post_norm_before_residual,
+                        layer_spec,
+                        hidden_dim,
+                    )?;
+                    self.encode_resident_moe_tail_phase(
+                        &mut encode_context,
+                        layer.tail,
+                        tail_shape,
+                        tail_scratch,
+                        &post_normed_buffer,
+                        &attention_state_buffer,
+                        &output_buffer,
+                        layer_spec,
+                        hidden_dim,
+                        chunk_hidden_len,
+                        layer_index,
+                    )?;
+                    current_buffer = output_buffer;
+                    if let Some(capture_buffer) = capture_buffer.as_ref() {
+                        for slot in capture_layer_ids
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(slot, &id)| (id == layer_index).then_some(slot))
+                        {
+                            let offset = f32_byte_offset(
+                                checked_len(slot, hidden_len, "prefill résident capture offset")?
+                                    .checked_add(chunk.start * hidden_dim)
+                                    .ok_or_else(|| {
+                                        InferError::Shape(
+                                            "prefill résident capture offset déborde".to_string(),
+                                        )
+                                    })?,
+                            )?;
+                            self.run_resident_prefill_section(
+                                &mut encode_context,
+                                "capture_copy",
+                                |encoder, _owned| {
+                                    self.encode_copy_with_offsets(
+                                        encoder,
+                                        &current_buffer,
+                                        0,
+                                        capture_buffer,
+                                        offset,
+                                        chunk_hidden_len,
                                     )
-                                })?;
-                        self.run_resident_prefill_section(
-                            &mut encode_context,
-                            "capture_copy",
-                            |encoder, _owned| {
-                                self.encode_copy_with_offsets(
-                                    encoder,
-                                    &current_buffer,
-                                    0,
-                                    capture_buffer,
-                                    offset,
-                                    hidden_len,
-                                )
-                            },
-                        )?;
+                                },
+                            )?;
+                        }
                     }
                 }
+                if let Some(final_output) = final_output.as_ref() {
+                    self.run_resident_prefill_section(
+                        &mut encode_context,
+                        "final_copy",
+                        |encoder, _owned| {
+                            self.encode_copy_with_offsets(
+                                encoder,
+                                &current_buffer,
+                                0,
+                                final_output,
+                                chunk_offset_bytes,
+                                chunk_hidden_len,
+                            )
+                        },
+                    )?;
+                }
             }
-            if private_scratch_enabled() {
-                let shared = self.uncached_f32_buffer(hidden_len, "resident_final_output")?;
-                self.run_resident_prefill_section(
-                    &mut encode_context,
-                    "final_copy",
-                    |encoder, _owned| {
-                        self.encode_copy(encoder, &current_buffer, &shared, hidden_len)
-                    },
-                )?;
-                shared
-            } else {
-                current_buffer.clone()
-            }
-        };
+        }
+        let final_read_buffer = final_output.unwrap_or(current_buffer);
         let encode_elapsed = encode_started.map(|started| started.elapsed());
         let wait_elapsed = if profile_sections {
             None
@@ -351,6 +407,74 @@ impl MetalExecutor {
             layer_caches,
             captures,
         ))
+    }
+
+    /// Lignes par morceau : le prompt est coupé en morceaux égaux d'au plus
+    /// `target` lignes, si toutes les attentions
+    /// complètes passent par le chemin Steel/NAX à décalage ; sinon un seul
+    /// morceau.
+    fn resident_prefill_chunk_rows(
+        &self,
+        layers: &[PrefillMoeLayer<'_>],
+        spec: PrefillAttentionSpec,
+        target: usize,
+    ) -> usize {
+        if target == 0 || spec.seq <= target {
+            return spec.seq;
+        }
+        let rows = spec.seq.div_ceil(spec.seq.div_ceil(target));
+        let chunkable = layers.iter().all(|layer| match layer.attention {
+            PrefillAttentionLayer::Full { .. } => {
+                self.causal_attention_prefill_chunk_supported(PrefillAttentionSpec {
+                    seq: rows,
+                    ..layer.attention_spec
+                })
+            }
+            PrefillAttentionLayer::Linear { .. } => true,
+        });
+        if chunkable {
+            rows
+        } else {
+            spec.seq
+        }
+    }
+
+    fn resident_prefill_layer_shape<'a>(
+        &self,
+        layer: &PrefillMoeLayer<'a>,
+        layer_index: usize,
+        spec: PrefillAttentionSpec,
+        hidden_dim: usize,
+    ) -> Result<(usize, usize, PrefillResidentLayerShape<'a>)> {
+        let layer_spec = layer.attention_spec;
+        if layer_spec.seq != spec.seq
+            || layer_spec.hidden_dim != hidden_dim
+            || layer_spec.q_heads != spec.q_heads
+            || layer_spec.eps != spec.eps
+        {
+            return Err(InferError::Dimension(format!(
+                "prefill résident spec incohérent couche {layer_index}: {layer_spec:?}"
+            )));
+        }
+        let q_dim = checked_len(
+            layer_spec.q_heads,
+            layer_spec.head_dim,
+            "prefill résident q_dim couche",
+        )?;
+        let kv_dim = checked_len(
+            layer_spec.kv_heads,
+            layer_spec.head_dim,
+            "prefill résident kv_dim couche",
+        )?;
+        let shape = self.check_prefill_resident_layer_shapes(
+            *layer,
+            layer_index,
+            hidden_dim,
+            q_dim,
+            kv_dim,
+            layer_spec,
+        )?;
+        Ok((q_dim, kv_dim, shape))
     }
 
     #[inline]
