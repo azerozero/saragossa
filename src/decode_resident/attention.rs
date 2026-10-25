@@ -23,9 +23,10 @@ impl DecodeResidentState {
     /// Renvoie une erreur si une dimension est nulle, si `q_heads` n'est pas un
     /// multiple de `kv_heads` (GQA, réserve R4), ou si la taille déborde.
     ///
-    /// `sampled` = la génération courante échantillonne (temperature > 0) : pilote
-    /// le dtype KV par défaut (bf16 échantillonné, f32 greedy) sauf override
-    /// explicite `SARAGOSSA_RUST_KV_BF16` (cf. [`kv_bf16_for`]).
+    /// `sampled` = la génération courante échantillonne (temperature > 0) : avec
+    /// `capacity`, pilote le dtype KV par défaut (bf16 échantillonné ou long, f32
+    /// en greedy court) sauf override explicite `SARAGOSSA_RUST_KV_BF16` (cf.
+    /// [`kv_bf16_for`]).
     pub(crate) fn full_attention(
         &self,
         capacity: usize,
@@ -34,7 +35,7 @@ impl DecodeResidentState {
         head_dim: usize,
         sampled: bool,
     ) -> Result<FullAttentionMetalState> {
-        let kv_element = if kv_bf16_for(sampled) {
+        let kv_element = if kv_bf16_for(sampled, capacity) {
             GpuElement::Bf16
         } else {
             GpuElement::F32

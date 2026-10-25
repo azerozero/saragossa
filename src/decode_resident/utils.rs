@@ -258,7 +258,9 @@ pub(super) fn flash_sdpa_enabled() -> bool {
 /// Résout le dtype du KV résident full-attn selon la politique produit C1B.
 ///
 /// `SARAGOSSA_RUST_KV_BF16` explicite (0/1) gagne toujours ; sinon défaut = **bf16 si
-/// la génération échantillonne** (`sampled`, temperature > 0), **f32 en greedy**.
+/// la génération échantillonne** (`sampled`, temperature > 0) **ou si l'arène porte
+/// au moins `SARAGOSSA_RUST_KV_BF16_MIN_TOKENS` positions** (16k par défaut), f32
+/// en greedy court.
 ///
 /// Motivation : bf16 divise par deux la bande passante KV (decode long-contexte
 /// +12 % @32k → 89,8 tok/s) pour une
@@ -269,15 +271,32 @@ pub(super) fn flash_sdpa_enabled() -> bool {
 // c'est le classement face à mlx qui ne l'était pas.
 /// perturbation **near-tie** (0,03 logit médian ≪ marge 4,5-6,0 du modèle ;
 /// byte-identique à 30k) — noyée par le bruit du sampling T > 0. Le greedy reste
-/// f32 pour garder les **oracles md5 e2e byte-identiques** (non re-baselinés).
-pub(super) fn kv_bf16_for(sampled: bool) -> bool {
-    resolve_kv_bf16(kv_bf16_env_override(), sampled)
+/// f32 en dessous du seuil pour garder les **oracles md5 e2e courts
+/// byte-identiques**. Au-delà, la bande passante KV domine le decode : greedy
+/// 32k 24,6 → 26,9 tok/s, 64k 20,0 → 23,9 tok/s, RSS −2 à −4 Go (25 oct. 2026,
+/// 27B 4 bits) ; seule divergence de texte à 64k, un near-tie (marge 0,0015
+/// contre 3,09 médiane).
+// TODO: Re-baseliner les oracles md5 longs (≥ 16k) du harnais pairwise.
+pub(super) fn kv_bf16_for(sampled: bool, capacity: usize) -> bool {
+    resolve_kv_bf16(
+        kv_bf16_env_override(),
+        sampled || capacity >= kv_bf16_greedy_min_tokens(),
+    )
 }
 
-/// Combine l'override explicite et l'indice `sampled` : l'override gagne toujours,
-/// sinon le défaut suit la température (bf16 échantillonné, f32 greedy).
-fn resolve_kv_bf16(env_override: Option<bool>, sampled: bool) -> bool {
-    env_override.unwrap_or(sampled)
+/// Combine l'override explicite et le défaut : l'override gagne toujours.
+fn resolve_kv_bf16(env_override: Option<bool>, default_bf16: bool) -> bool {
+    env_override.unwrap_or(default_bf16)
+}
+
+/// Capacité d'arène à partir de laquelle le greedy passe en KV bf16.
+fn kv_bf16_greedy_min_tokens() -> usize {
+    static TOKENS: OnceLock<usize> = OnceLock::new();
+    *TOKENS.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_KV_BF16_MIN_TOKENS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(16 * 1024)
+    })
 }
 
 /// Override explicite de `SARAGOSSA_RUST_KV_BF16` (lu une fois), cf. [`kv_bf16_for`].
@@ -391,15 +410,17 @@ mod kv_bf16_resolution_tests {
     }
 
     #[test]
-    fn precedence_env_explicite_puis_temperature() {
-        // Override explicite gagne toujours, quelle que soit la température.
-        assert!(resolve_kv_bf16(Some(true), false), "env=1 + greedy -> bf16");
+    fn precedence_env_explicite_puis_defaut() {
+        // Override explicite gagne toujours, quel que soit le défaut.
+        assert!(
+            resolve_kv_bf16(Some(true), false),
+            "env=1 + défaut f32 -> bf16"
+        );
         assert!(
             !resolve_kv_bf16(Some(false), true),
-            "env=0 + sampled -> f32"
+            "env=0 + défaut bf16 -> f32"
         );
-        // Défaut piloté par la température quand l'env est absent.
-        assert!(resolve_kv_bf16(None, true), "défaut sampled -> bf16");
-        assert!(!resolve_kv_bf16(None, false), "défaut greedy -> f32");
+        assert!(resolve_kv_bf16(None, true), "défaut bf16");
+        assert!(!resolve_kv_bf16(None, false), "défaut f32");
     }
 }
