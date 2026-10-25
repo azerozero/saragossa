@@ -1256,12 +1256,8 @@ impl PrefixCaptures {
 }
 
 impl PrefixCacheEntry {
-    fn estimated_bytes(&self) -> u64 {
-        self.estimated_bytes_unseen(&mut std::collections::HashSet::new())
-    }
-
-    /// Comme [`Self::estimated_bytes`], sans les segments KV déjà dans `seen`
-    /// (partagés avec une entrée plus récente) ; ajoute les siens.
+    /// Octets de l'entrée, sans les segments KV déjà dans `seen` (partagés avec
+    /// une autre entrée) ; ajoute les siens.
     fn estimated_bytes_unseen(&self, seen: &mut std::collections::HashSet<usize>) -> u64 {
         let mut bytes = self
             .tokens
@@ -1300,8 +1296,15 @@ impl PrefixCacheEntry {
 }
 
 impl PrefixCache {
+    /// Évince l'entrée la moins récente ; rend les octets réellement libérés,
+    /// sans les segments KV qu'elle partage avec les entrées restantes.
     fn evict_lru_entry(&mut self) -> Option<u64> {
-        self.entries.pop().map(|entry| entry.estimated_bytes())
+        let entry = self.entries.pop()?;
+        let mut seen = std::collections::HashSet::new();
+        for kept in &self.entries {
+            kept.estimated_bytes_unseen(&mut seen);
+        }
+        Some(entry.estimated_bytes_unseen(&mut seen))
     }
 
     /// Évince les entrées les moins récentes au-delà de `max_bytes`, segments

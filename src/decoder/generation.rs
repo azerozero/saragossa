@@ -922,21 +922,15 @@ impl CausalDecoder {
             && (options.temperature <= f32::EPSILON || resident_sampling)
             && self.supports_resident_full_decode();
         #[cfg(all(target_os = "macos", feature = "metal"))]
+        let kv_bf16 = Self::resident_kv_bf16(options.temperature > f32::EPSILON, cache.position);
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         if use_resident_full {
-            use_resident_full = self.setup_resident_full_decode(
-                &mut cache,
-                max_new_tokens,
-                0,
-                options.temperature > f32::EPSILON,
-            )?;
+            use_resident_full =
+                self.setup_resident_full_decode(&mut cache, max_new_tokens, 0, kv_bf16)?;
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if decode_resident_enabled() && !use_resident_full && !guided_sampling {
-            self.setup_resident_decode(
-                &mut cache,
-                max_new_tokens,
-                options.temperature > f32::EPSILON,
-            )?;
+            self.setup_resident_decode(&mut cache, max_new_tokens, kv_bf16)?;
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let _ = guided_sampling;
@@ -1397,7 +1391,9 @@ impl CausalDecoder {
             let mut use_resident_full = false;
             // À T>0 (échantillonné opt-in), l'arène sert au draft résident avec
             // relecture des logits et à la vérification en lignes ; le KV passe en
-            // bf16 comme pour l'AR échantillonné (`kv_bf16_for`).
+            // bf16 comme pour l'AR échantillonné (`resident_kv_bf16`).
+            let kv_bf16 =
+                Self::resident_kv_bf16(options.temperature > f32::EPSILON, cache.position);
             if decode_resident_full_enabled()
                 && (options.temperature <= f32::EPSILON || mtp_sampled_enabled())
                 && self.supports_resident_full_decode()
@@ -1407,7 +1403,7 @@ impl CausalDecoder {
                     &mut cache,
                     max_new_tokens,
                     draft_headroom,
-                    options.temperature > f32::EPSILON,
+                    kv_bf16,
                 )?;
                 if let Some(t) = t_setup {
                     eprintln!(
@@ -1417,11 +1413,7 @@ impl CausalDecoder {
                 }
             }
             if decode_resident_enabled() && !use_resident_full {
-                self.setup_resident_decode(
-                    &mut cache,
-                    max_new_tokens,
-                    options.temperature > f32::EPSILON,
-                )?;
+                self.setup_resident_decode(&mut cache, max_new_tokens, kv_bf16)?;
             }
             if use_resident_full {
                 if let Some(mtp_history) = mtp_history_cache.as_ref() {
@@ -3839,7 +3831,9 @@ impl CausalDecoder {
             return Ok(None);
         };
         if cached_len < prompt.len() {
-            self.extend_prefix_cache_suffix(&mut output, &prompt[cached_len..])?;
+            let (final_states, _) =
+                self.forward_suffix_batched(&mut output.0, &prompt[cached_len..], None, false)?;
+            output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
             self.prefix_cache_put(prompt, &output, None, None)?;
         }
         Ok(Some((output, cached_len)))
@@ -4034,6 +4028,8 @@ impl CausalDecoder {
             Option<PrefixCaptures>,
         )>,
     > {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let cheap_extend = self.prefix_extend_as_cheap_as_cold(prompt.len());
         let mut cache = self
             .prefix_cache
             .lock()
@@ -4049,20 +4045,27 @@ impl CausalDecoder {
         // pour le prefill résident complet : au-delà d'un huitième (per-op) ou de
         // la moitié (lignes) du prompt à recalculer, repartir de zéro est plus rapide.
         // Quand l'extension passe par le prefill résident (coût par token d'un
-        // prefill à froid), tout hit est rentable : un tour de conversation qui
-        // double le prompt reprend quand même son préfixe.
+        // prefill à froid, mêmes conditions que `extend_cache_metal_resident` :
+        // une entrée clonée n'a ni arène ni KV monté, son état linéaire est
+        // restauré), tout hit est rentable : un tour de conversation qui double
+        // le prompt reprend quand même son préfixe.
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if prefill_resident_enabled()
-            && self.forward_runtime().metal_executor().is_some()
-            && !self.prefix_extend_as_cheap_as_cold(prompt.len())
         {
-            let divisor = if self.prefix_extend_resident_available() {
-                2
-            } else {
-                8
-            };
-            if (prompt.len() - cache.entries[index].tokens.len()) * divisor > prompt.len() {
-                return Ok(None);
+            let suffix = prompt.len() - cache.entries[index].tokens.len();
+            let resident_extend =
+                cheap_extend && suffix >= crate::runtime_flags::prefix_extend_resident_min_tokens();
+            if prefill_resident_enabled()
+                && self.forward_runtime().metal_executor().is_some()
+                && !resident_extend
+            {
+                let divisor = if self.prefix_extend_resident_available() {
+                    2
+                } else {
+                    8
+                };
+                if suffix * divisor > prompt.len() {
+                    return Ok(None);
+                }
             }
         }
         let entry = cache.entries.remove(index);
@@ -4083,19 +4086,6 @@ impl CausalDecoder {
         Ok(Some((output, cached_len, history, captures)))
     }
 
-    fn extend_prefix_cache_suffix(
-        &self,
-        state: &mut (CausalDecoderCache, Tensor),
-        suffix: &[usize],
-    ) -> Result<()> {
-        if suffix.is_empty() {
-            return Ok(());
-        }
-        let (final_states, _) = self.forward_suffix_batched(&mut state.0, suffix, None, false)?;
-        state.1 = Tensor::row(final_states.last_row()?.to_vec())?;
-        Ok(())
-    }
-
     /// Forward batché d'un suffixe sur un cache CPU (hit du cache de préfixe,
     /// état de prompt de serve). Sur Metal, une arène résidente temporaire est
     /// seedée depuis le KV CPU pour que `next_final_states_batched*` prenne le
@@ -4106,8 +4096,8 @@ impl CausalDecoder {
     /// suffixe (`[suffix, hidden]`) et, si `layer_ids` est donné, les captures des
     /// couches cibles (`[suffix, n * hidden]`). Au-delà de
     /// `prefix_extend_resident_min_tokens`, le prefill résident par morceaux
-    /// remplace les lignes ; sans `all_states`, il ne rend alors que l'état de
-    /// la dernière position (`[1, hidden]`).
+    /// remplace les lignes. Sans `all_states`, seul l'état de la dernière
+    /// position est rendu (`[1, hidden]`), quel que soit le chemin.
     fn forward_suffix_batched(
         &self,
         cache: &mut CausalDecoderCache,
@@ -4121,16 +4111,26 @@ impl CausalDecoder {
             ));
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some((final_hidden, captures)) =
-            self.extend_cache_metal_resident(cache, suffix, layer_ids.unwrap_or_default())?
         {
-            let final_hidden = if all_states {
-                final_hidden
-            } else {
-                Tensor::row(final_hidden.last_row()?.to_vec())?
-            };
-            let states = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
-            return Ok((states, captures));
+            let started = Instant::now();
+            if let Some((final_hidden, captures)) =
+                self.extend_cache_metal_resident(cache, suffix, layer_ids.unwrap_or_default())?
+            {
+                let final_hidden = if all_states {
+                    final_hidden
+                } else {
+                    Tensor::row(final_hidden.last_row()?.to_vec())?
+                };
+                let states = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+                if trace_prefill_enabled() {
+                    eprintln!(
+                        "prefix_extend rows={} path=prefill_resident ms={}",
+                        suffix.len(),
+                        started.elapsed().as_millis()
+                    );
+                }
+                return Ok((states, captures));
+            }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let trace = trace_prefill_enabled();
@@ -4192,7 +4192,11 @@ impl CausalDecoder {
                 (started.elapsed() - setup_elapsed - forward_elapsed).as_millis()
             );
         }
-        let states = Tensor::from_vec(vec![suffix.len(), hidden], states)?;
+        let states = if all_states {
+            Tensor::from_vec(vec![suffix.len(), hidden], states)?
+        } else {
+            Tensor::row(states[states.len() - hidden..].to_vec())?
+        };
         let captures = captures
             .zip(layer_ids)
             .map(|(data, ids)| Tensor::from_vec(vec![suffix.len(), ids.len() * hidden], data))

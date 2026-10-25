@@ -205,6 +205,19 @@ impl CausalDecoder {
         })
     }
 
+    /// KV résident bf16 par défaut pour une génération : échantillonnée, ou
+    /// greedy sur un prompt d'au moins `kv_bf16_greedy_min_tokens` positions, où
+    /// la bande passante KV domine le decode (greedy 32k 24,6 → 26,9 tok/s, 64k
+    /// 20,0 → 23,9 tok/s, RSS −2 à −4 Go, 25 oct. 2026, 27B 4 bits ; seule
+    /// divergence de texte à 64k, un near-tie de marge 0,0015 contre 3,09 en
+    /// médiane). Le greedy court reste f32 pour ses oracles md5 ; les arènes
+    /// d'extension, DFlash, TTS et oracles passent `false` : leurs lignes relues
+    /// vers le cache CPU restent f32 exactes.
+    // TODO: Re-baseliner les oracles md5 longs (≥ 16k) du harnais pairwise.
+    pub(in crate::decoder) fn resident_kv_bf16(sampled: bool, prompt_len: usize) -> bool {
+        sampled || prompt_len >= crate::runtime_flags::kv_bf16_greedy_min_tokens()
+    }
+
     /// Prépare le decode full-attn résident : alloue les buffers KV GPU des
     /// couches full-attn et les seed depuis le K/V (rope'd) du prefill (CPU,
     /// `keys`/`values`). Une couche sans KV prefill cohérent reste sur le chemin
@@ -219,7 +232,7 @@ impl CausalDecoder {
         &self,
         cache: &mut CausalDecoderCache,
         max_new_tokens: usize,
-        sampled: bool,
+        kv_bf16: bool,
     ) -> Result<()> {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(());
@@ -255,7 +268,7 @@ impl CausalDecoder {
             {
                 continue;
             }
-            let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, sampled)?;
+            let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?;
             full.seed_segments(
                 &layer_cache.keys.segments().collect::<Vec<_>>(),
                 &layer_cache.values.segments().collect::<Vec<_>>(),
@@ -285,9 +298,9 @@ impl CausalDecoder {
         cache: &mut CausalDecoderCache,
         max_new_tokens: usize,
         draft_headroom: usize,
-        sampled: bool,
+        kv_bf16: bool,
     ) -> Result<bool> {
-        self.setup_resident_full_decode_with_slot(cache, max_new_tokens, draft_headroom, 0, sampled)
+        self.setup_resident_full_decode_with_slot(cache, max_new_tokens, draft_headroom, 0, kv_bf16)
     }
 
     /// Variante light-batch de [`Self::setup_resident_full_decode`] : `slot`
@@ -307,7 +320,7 @@ impl CausalDecoder {
         max_new_tokens: usize,
         draft_headroom: usize,
         slot: u64,
-        sampled: bool,
+        kv_bf16: bool,
     ) -> Result<bool> {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(false);
@@ -695,7 +708,7 @@ impl CausalDecoder {
             }
             let head_dim = self.config.layer_head_dim(index)?;
             let kv_heads = self.config.layer_num_key_value_heads(index);
-            let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, sampled)?;
+            let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?;
             full.seed_segments(
                 &layer_cache.keys.segments().collect::<Vec<_>>(),
                 &layer_cache.values.segments().collect::<Vec<_>>(),
@@ -788,13 +801,12 @@ impl CausalDecoder {
                     Err(error) => return Err(error),
                 }
             };
-            // KV de l'arène MTP : même dtype résolu que le KV principal (MTP est
-            // greedy-only → `sampled` sera false quand la tête MTP tourne).
+            // KV de l'arène MTP : même dtype résolu que le KV principal.
             let kv =
-                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, sampled)?;
+                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, kv_bf16)?;
             #[cfg(feature = "devtools")]
             let append_oracle_kv =
-                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, sampled)?;
+                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, kv_bf16)?;
             let hidden_a = arena.persistent(hidden, GpuElement::F32)?;
             let hidden_b = arena.persistent(hidden, GpuElement::F32)?;
             let index = arena.persistent(1, GpuElement::U32)?;

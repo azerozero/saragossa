@@ -1055,10 +1055,24 @@ pub(super) fn prefix_cache_capacity() -> usize {
     })
 }
 
+/// Taille de prompt à partir de laquelle le decode greedy passe en KV résident
+/// bf16 (`SARAGOSSA_RUST_KV_BF16_MIN_TOKENS`, 16k par défaut), cf.
+/// `CausalDecoder::resident_kv_bf16`.
+pub(crate) fn kv_bf16_greedy_min_tokens() -> usize {
+    static TOKENS: OnceLock<usize> = OnceLock::new();
+    *TOKENS.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_KV_BF16_MIN_TOKENS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(16 * 1024)
+    })
+}
+
 /// Plafond en octets du prefix-cache du décodeur
-/// (`SARAGOSSA_RUST_PREFIX_CACHE_BYTES`, 16 Gio par défaut, comme celui de
-/// serve). Les segments KV partagés entre entrées comptent une fois ; sans ce
-/// plafond, 4 conversations distinctes de 64k gardaient ~35 Gio de KV f32.
+/// (`SARAGOSSA_RUST_PREFIX_CACHE_BYTES`, 16 Gio par défaut). Les segments KV
+/// partagés entre entrées comptent une fois ; sans ce plafond, 4 conversations
+/// distinctes de 64k gardaient ~35 Gio de KV f32. Il s'ajoute à celui de serve
+/// (`SARAGOSSA_SERVE_PREFIX_CACHE_BYTES`) : MTP remplit ce cache, l'AR celui de
+/// serve, soit jusqu'à 32 Gio de KV CPU sur un serveur qui sert les deux.
 pub(super) fn prefix_cache_max_bytes() -> u64 {
     static BYTES: OnceLock<u64> = OnceLock::new();
     *BYTES.get_or_init(|| {

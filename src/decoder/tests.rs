@@ -501,7 +501,7 @@ fn prefix_cache_byte_cap_counts_shared_segments_once() {
             entry(vec![7], history()),
         ],
     };
-    let newest = cache.entries[0].estimated_bytes();
+    let newest = cache.entries[0].estimated_bytes_unseen(&mut Default::default());
     cache.enforce_byte_cap(newest + 1000);
     assert_eq!(cache.entries.len(), 2, "segments partagés comptés une fois");
     cache.enforce_byte_cap(0);

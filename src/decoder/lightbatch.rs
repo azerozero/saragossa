@@ -379,6 +379,8 @@ impl CausalDecoder {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let use_resident_full = {
             let resident_sampling = super::resident::resident_sampling_supported(options);
+            let kv_bf16 =
+                Self::resident_kv_bf16(options.temperature > f32::EPSILON, cache.position);
             let mut use_resident_full = decode_resident_full_enabled()
                 && (options.temperature <= f32::EPSILON || resident_sampling)
                 && self.supports_resident_full_decode();
@@ -388,15 +390,11 @@ impl CausalDecoder {
                     max_new_tokens,
                     0,
                     u64::try_from(slot).unwrap_or(u64::MAX),
-                    options.temperature > f32::EPSILON,
+                    kv_bf16,
                 )?;
             }
             if decode_resident_enabled() && !use_resident_full {
-                self.setup_resident_decode(
-                    &mut cache,
-                    max_new_tokens,
-                    options.temperature > f32::EPSILON,
-                )?;
+                self.setup_resident_decode(&mut cache, max_new_tokens, kv_bf16)?;
             }
             use_resident_full
         };
