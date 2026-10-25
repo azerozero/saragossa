@@ -958,13 +958,11 @@ pub(super) fn cached_attention_one(
     // Lignes du cache segmenté, sans copie des données.
     let keys: Vec<&[f32]> = cache
         .keys
-        .rows(expected_kv_dim)
-        .skip(window_start)
+        .rows_from(expected_kv_dim, window_start)
         .collect();
     let values: Vec<&[f32]> = cache
         .values
-        .rows(expected_kv_dim)
-        .skip(window_start)
+        .rows_from(expected_kv_dim, window_start)
         .collect();
     if cache_len >= attention_parallel_threshold() {
         out.par_chunks_mut(layout.head_dim)

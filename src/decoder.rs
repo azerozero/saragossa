@@ -255,7 +255,13 @@ impl CausalDecoderPromptState {
     /// Estime l'empreinte CPU du snapshot.
     #[must_use]
     pub fn estimated_cpu_bytes(&self) -> usize {
-        self.cache.estimated_cpu_bytes().saturating_add(
+        self.estimated_cpu_bytes_unseen(&mut std::collections::HashSet::new())
+    }
+
+    /// Comme [`Self::estimated_cpu_bytes`], sans les segments KV déjà présents
+    /// dans `seen`, auquel les siens sont ajoutés.
+    pub fn estimated_cpu_bytes_unseen(&self, seen: &mut std::collections::HashSet<usize>) -> usize {
+        self.cache.estimated_cpu_bytes_unseen(seen).saturating_add(
             self.final_state
                 .len()
                 .saturating_mul(std::mem::size_of::<f32>()),
@@ -856,15 +862,19 @@ impl CausalDecoderCache {
     /// Estime l'empreinte CPU du cache.
     #[must_use]
     pub fn estimated_cpu_bytes(&self) -> usize {
+        self.estimated_cpu_bytes_unseen(&mut std::collections::HashSet::new())
+    }
+
+    /// Comme [`Self::estimated_cpu_bytes`], sans les segments KV déjà présents
+    /// dans `seen` (partagés avec un autre snapshot) ; ajoute les siens.
+    pub fn estimated_cpu_bytes_unseen(&self, seen: &mut std::collections::HashSet<usize>) -> usize {
         self.layers
             .iter()
             .map(|layer| {
-                // `capacity` : après `make_mut` + `extend`, un Vec peut détenir
-                // jusqu'à 2× sa longueur.
                 layer
                     .keys
-                    .capacity_bytes()
-                    .saturating_add(layer.values.capacity_bytes())
+                    .capacity_bytes_unseen(seen)
+                    .saturating_add(layer.values.capacity_bytes_unseen(seen))
                     .saturating_add(layer.linear.estimated_cpu_bytes())
             })
             .sum()

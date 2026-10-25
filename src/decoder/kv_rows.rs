@@ -5,10 +5,13 @@
 //! dernier segment s'il n'est pas partagé, sinon ils en ouvrent un nouveau :
 //! prolonger un préfixe en cache ne recopie plus jamais le préfixe.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Taille minimale (en f32) d'un nouveau segment : les ajouts d'une ligne en
 /// decode CPU remplissent ce segment au lieu d'en ouvrir un par token.
+// NOTE: après un snapshot, le premier ajout réserve 1 Mio par K/V et par
+// couche full-attn (~32 Mio sur le 27B), compté par `capacity_bytes_unseen`.
 const MIN_SEGMENT_FLOATS: usize = 1 << 18;
 
 #[derive(Clone, Debug, Default)]
@@ -28,16 +31,26 @@ impl KvRows {
         self.segments.iter().map(|segment| segment.as_slice())
     }
 
-    /// Lignes de `dim` f32 dans l'ordre, sans copie.
-    pub(super) fn rows(&self, dim: usize) -> impl Iterator<Item = &[f32]> {
+    /// Lignes de `dim` f32 à partir de la ligne `first`, sans copie ; les
+    /// segments entièrement avant `first` sont sautés sans être parcourus.
+    pub(super) fn rows_from(&self, dim: usize, first: usize) -> impl Iterator<Item = &[f32]> {
+        let mut skip = first.saturating_mul(dim);
         self.segments()
+            .filter_map(move |segment| {
+                let start = skip.min(segment.len());
+                skip -= start;
+                (start < segment.len()).then(|| &segment[start..])
+            })
             .flat_map(move |segment| segment.chunks_exact(dim))
     }
 
-    /// Octets réservés, capacité comprise.
-    pub(super) fn capacity_bytes(&self) -> usize {
+    /// Octets réservés, capacité comprise, des segments absents de `seen` ;
+    /// les segments comptés y sont ajoutés (un segment partagé ne compte
+    /// qu'une fois sur plusieurs snapshots).
+    pub(super) fn capacity_bytes_unseen(&self, seen: &mut HashSet<usize>) -> usize {
         self.segments
             .iter()
+            .filter(|segment| seen.insert(Arc::as_ptr(segment) as usize))
             .map(|segment| segment.capacity())
             .sum::<usize>()
             .saturating_mul(std::mem::size_of::<f32>())
@@ -121,9 +134,17 @@ mod tests {
         assert_eq!(rows.to_vec(), vec![1.0, 2.0, 3.0]);
         assert_eq!(snapshot.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(
-            rows.rows(1).map(|row| row[0]).collect::<Vec<_>>(),
+            rows.rows_from(1, 0).map(|row| row[0]).collect::<Vec<_>>(),
             vec![1.0, 2.0, 3.0]
         );
+        let mut split = KvRows::default();
+        split.push_owned(vec![1.0, 2.0]);
+        split.push_owned(vec![3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            split.rows_from(2, 2).map(|row| row[0]).collect::<Vec<_>>(),
+            vec![5.0]
+        );
+        assert_eq!(split.rows_from(2, 3).count(), 0);
         rows.truncate(10);
         assert_eq!(rows.len(), 3);
     }

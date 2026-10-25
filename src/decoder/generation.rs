@@ -4191,8 +4191,8 @@ impl CausalDecoder {
             let rows = full.len().saturating_sub(base_len);
             if rows > 0 {
                 let (keys, values) = full.read_rows(base_len, rows)?;
-                layer_cache.keys.extend_from_slice(&keys);
-                layer_cache.values.extend_from_slice(&values);
+                layer_cache.keys.push_owned(keys);
+                layer_cache.values.push_owned(values);
             }
             if layer_cache.keys.len() != cache.position * kv_dim {
                 return Err(InferError::Dimension(format!(

@@ -770,9 +770,13 @@ impl LoadedModel {
         memory_guard: &MemoryGuard,
     ) -> ServeResult<()> {
         let metal = self.decoder.snapshot_prompt_state_metal(state)?;
+        // Le snapshot partage les segments KV de l'état vivant, déjà en mémoire :
+        // un second passage sur le même `seen` ne compte que le reste.
+        let mut seen = std::collections::HashSet::new();
+        state.estimated_cpu_bytes_unseen(&mut seen);
         let additional = usize_to_u64_saturating(
             state
-                .estimated_cpu_bytes()
+                .estimated_cpu_bytes_unseen(&mut seen)
                 .saturating_add(metal.estimated_bytes()),
         );
         while memory_guard.projection_over_limit(additional).is_some() {
