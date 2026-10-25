@@ -207,13 +207,15 @@ impl CausalDecoder {
 
     /// KV résident bf16 par défaut pour une génération : échantillonnée, ou
     /// greedy sur un prompt d'au moins `kv_bf16_greedy_min_tokens` positions, où
-    /// la bande passante KV domine le decode (greedy 32k 24,6 → 26,9 tok/s, 64k
-    /// 20,0 → 23,9 tok/s, RSS −2 à −4 Go, 25 oct. 2026, 27B 4 bits ; seule
-    /// divergence de texte à 64k, un near-tie de marge 0,0015 contre 3,09 en
-    /// médiane). Le greedy court reste f32 pour ses oracles md5 ; les arènes
-    /// d'extension, DFlash, TTS et oracles passent `false` : leurs lignes relues
-    /// vers le cache CPU restent f32 exactes.
-    // TODO: Re-baseliner les oracles md5 longs (≥ 16k) du harnais pairwise.
+    /// la bande passante KV domine le decode (greedy MTP 32k 35,6 → 40,9 tok/s,
+    /// 64k 25,7 → 31,4 tok/s, empreinte −2,3 / −4,6 Go, 25 oct. 2026, 27B 4 bits ;
+    /// seule divergence de texte vue à 64k, un near-tie de marge 0,0015 contre
+    /// 3,09 en médiane). Le greedy court reste f32 pour ses oracles md5 ; les
+    /// arènes d'extension, DFlash, TTS et oracles passent `false` : leurs lignes
+    /// relues vers le cache CPU restent f32 exactes.
+    // NOTE: Les oracles md5 du harnais pairwise portent sur des prompts courts
+    // (≤ 3,5k tokens) et ne franchissent pas ce seuil ; ctxbench vérifie des
+    // marqueurs, pas des md5.
     pub(in crate::decoder) fn resident_kv_bf16(sampled: bool, prompt_len: usize) -> bool {
         sampled || prompt_len >= crate::runtime_flags::kv_bf16_greedy_min_tokens()
     }
