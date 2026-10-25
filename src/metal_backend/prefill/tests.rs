@@ -1232,6 +1232,13 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     max_diff(&conv_extended, &conv_single) <= 1.0e-4,
                     "prolongement conv"
                 );
+                // L'état SSM après la dernière ligne est celui que reprend le decode.
+                let ssm_single = read_f32_buffer(&single_state.ssm, single_state.ssm_len)?;
+                let ssm_extended = read_f32_buffer(&extended_state.ssm, extended_state.ssm_len)?;
+                assert!(
+                    max_diff(&ssm_extended, &ssm_single) <= 1.0e-4,
+                    "prolongement ssm"
+                );
             }
             _ => {
                 return Err(InferError::Dimension(

@@ -19,18 +19,17 @@ fn read_pod_buffer<T: bytemuck::Pod + Default>(
             "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
         ));
     }
-    if offset > 0
-        && offset
-            .checked_add(len)
-            .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
-            .is_none_or(|end| end as u64 > buffer.length())
+    if offset
+        .checked_add(len)
+        .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
+        .is_none_or(|end| end as u64 > buffer.length())
     {
         return Err(InferError::Metal(format!(
             "lecture MTLBuffer [{offset}, +{len}) hors des {} octets",
             buffer.length()
         )));
     }
-    // SAFETY: `offset` est dans le buffer (vérifié ci-dessus quand non nul).
+    // SAFETY: `[offset, offset + len)` est dans le buffer (vérifié ci-dessus).
     let ptr = unsafe { ptr.add(offset) };
     // `out` est zéro-initialisé (aucune fenêtre non-initialisée → lint
     // `uninit_vec` évité) ; ses `len` éléments sont ensuite ÉCRASÉS par la copie.

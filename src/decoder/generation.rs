@@ -3427,6 +3427,48 @@ impl CausalDecoder {
         Ok(())
     }
 
+    /// Couches du prefill résident pour prolonger un préfixe jusqu'à `seq`
+    /// tokens, si le modèle et le backend le permettent.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[allow(clippy::type_complexity)]
+    fn resident_extend_layers(
+        &self,
+        seq: usize,
+    ) -> Option<(
+        &crate::MetalExecutor,
+        crate::metal_backend::PrefillAttentionSpec,
+        Vec<crate::metal_backend::PrefillMoeLayer<'_>>,
+    )> {
+        if !prefill_resident_enabled() || self.config.is_gemma4 {
+            return None;
+        }
+        let metal = self.forward_runtime().metal_executor()?;
+        let spec = self.resident_prefill_spec(seq, self.final_norm.data().len())?;
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| layer.prefill_moe_layer(&self.config, spec))
+            .collect::<Option<Vec<_>>>()?;
+        metal
+            .prefill_resident_extend_supported(&layers)
+            .then_some((metal, spec, layers))
+    }
+
+    /// Vrai si prolonger un préfixe jusqu'à `seq` tokens passe par le prefill
+    /// résident, dont le coût par token est celui d'un prefill à froid : tout
+    /// hit de cache est alors rentable.
+    pub fn prefix_extend_as_cheap_as_cold(&self, seq: usize) -> bool {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            self.resident_extend_layers(seq).is_some()
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = seq;
+            false
+        }
+    }
+
     /// Prolonge un état de prompt par le prefill résident par morceaux : le KV
     /// CPU du préfixe est recopié sur le GPU, l'état linéaire GPU avance en
     /// place. `false` : préconditions non réunies, état intact (repli sur
@@ -3443,37 +3485,18 @@ impl CausalDecoder {
         suffix: &[usize],
     ) -> Result<bool> {
         let start = state.cache.position;
-        if !prefill_resident_enabled()
-            || self.config.is_gemma4
-            || start == 0
-            || suffix.len() < crate::runtime_flags::prefix_extend_resident_min_tokens()
-        {
+        if start == 0 || suffix.len() < crate::runtime_flags::prefix_extend_resident_min_tokens() {
             return Ok(false);
         }
-        let Some(metal) = self.forward_runtime().metal_executor() else {
-            return Ok(false);
-        };
         // Un KV déjà monté sur le GPU (decode résident) deviendrait périmé.
         if state.cache.resident.is_some()
             || state.cache.layers.iter().any(|layer| layer.full.is_some())
         {
             return Ok(false);
         }
-        let Some(spec) =
-            self.resident_prefill_spec(start + suffix.len(), self.final_norm.data().len())
-        else {
+        let Some((metal, spec, layers)) = self.resident_extend_layers(start + suffix.len()) else {
             return Ok(false);
         };
-        let mut layers = Vec::with_capacity(self.layers.len());
-        for layer in &self.layers {
-            let Some(prefill_layer) = layer.prefill_moe_layer(&self.config, spec) else {
-                return Ok(false);
-            };
-            layers.push(prefill_layer);
-        }
-        if !metal.prefill_resident_extend_supported(&layers) {
-            return Ok(false);
-        }
         let mut prefix_layers = Vec::with_capacity(layers.len());
         for (layer_cache, layer) in state.cache.layers.iter().zip(&layers) {
             prefix_layers.push(match layer.attention {
