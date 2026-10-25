@@ -767,6 +767,36 @@ pub(crate) fn prefill_attn_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX", true))
 }
 
+/// Suffixe minimal (tokens) pour prolonger un préfixe en cache par le prefill
+/// résident par morceaux plutôt que par l'extension en lignes. Mesuré le
+/// 2026-10-25 (serve AR, 27B 4 bits, préfixe ~10k) : égalité jusqu'à 16 tokens
+/// (recopie du KV du préfixe vers le GPU), puis 342 contre 372 ms à 32, 450
+/// contre 591 ms à 128 et 5,7 contre 12,4 s à 3,5k.
+/// `SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT_MIN`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefix_extend_resident_min_tokens() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT_MIN")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// Récurrence gated delta du prefill linéaire (27B : 16/48 têtes, dk = dv =
+/// 128, état f32) sur les accélérateurs neuronaux : noyau
+/// `gated_delta_fused_nax` de MLX figé. Défaut ON depuis le 2026-10-25 (M5 Max,
+/// 27B 4 bits) : prefill 32k 588-598 → 630-651 tok/s, TTFT serve 32k 55,8 →
+/// 52,2 s ; oracle naïf 3,8e-4. Textes greedy AR identiques à 16k et 32k, celui
+/// de 8k diverge au 1 775e caractère sur 1 783 (fin de phrase, near-tie
+/// présumé). Kill-switch `SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0` (retour au
+/// chunk-delta).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_linear_nax_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_LINEAR_NAX", true))
+}
+
 /// Taille cible, en tokens, d'un morceau du prefill résident. Les buffers
 /// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
 /// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est

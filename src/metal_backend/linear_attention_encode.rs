@@ -446,6 +446,71 @@ impl MetalExecutor {
         clippy::too_many_arguments,
         reason = "wrapper d'encodage : buffers explicites"
     )]
+    /// Récurrence gated delta d'une couche linéaire par le noyau NAX de MLX :
+    /// q/k `[T, key_dim]`, v lu dans `conv_out` à `2 * key_dim`, état SSM
+    /// `[Hv, Dv, Dk]` mis à jour en place. `false` hors périmètre du noyau.
+    pub(super) fn encode_gated_delta_nax(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        conv_out_buffer: &BufferRef,
+        q_norm_buffer: &BufferRef,
+        k_norm_buffer: &BufferRef,
+        beta_buffer: &BufferRef,
+        decay_buffer: &BufferRef,
+        ssm_state_buffer: &BufferRef,
+        y_buffer: &BufferRef,
+        steps: usize,
+        spec: LinearAttentionStepSpec,
+    ) -> Result<bool> {
+        let Some(pso) = self.gated_delta_nax_hk16_hv48.as_ref() else {
+            return Ok(false);
+        };
+        if (
+            spec.num_key_heads,
+            spec.num_value_heads,
+            spec.key_head_dim,
+            spec.value_head_dim,
+        ) != (16, 48, 128, 128)
+        {
+            return Ok(false);
+        }
+        let key_dim = spec.num_key_heads * spec.key_head_dim;
+        let conv_dim = 2 * key_dim + spec.num_value_heads * spec.value_head_dim;
+        let steps = checked_i32_bytes(steps, "gated delta NAX T")?;
+        let v_ld = checked_i32_bytes(conv_dim, "gated delta NAX v_ld")?;
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(q_norm_buffer), 0);
+        encoder.set_buffer(1, Some(k_norm_buffer), 0);
+        encoder.set_buffer(
+            2,
+            Some(conv_out_buffer),
+            byte_offset_f32(2 * key_dim, "gated delta NAX v offset")?,
+        );
+        encoder.set_buffer(3, Some(ssm_state_buffer), 0);
+        encoder.set_buffer(4, Some(decay_buffer), 0);
+        encoder.set_buffer(5, Some(beta_buffer), 0);
+        encoder.set_buffer(6, Some(y_buffer), 0);
+        encoder.set_buffer(7, Some(ssm_state_buffer), 0);
+        encoder.set_bytes(8, 4, (&steps as *const i32).cast());
+        // Sans cache d'état (constante 200 fausse) : 9-11 ne sont jamais lus.
+        for index in 9..12 {
+            encoder.set_buffer(index, Some(ssm_state_buffer), 0);
+        }
+        encoder.set_bytes(12, 4, (&v_ld as *const i32).cast());
+        profile_dispatch();
+        // Une colonne de 16 valeurs par simdgroup, 4 simdgroups par groupe.
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                1,
+                checked_nsuint(spec.value_head_dim / 64, "gated delta NAX dv")?,
+                48,
+            ),
+            MTLSize::new(32, 4, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(true)
+    }
+
     pub(super) fn encode_chunk_delta_seq_layout(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1121,4 +1186,8 @@ impl MetalExecutor {
         post_dispatch_barrier(encoder);
         Ok(())
     }
+}
+
+fn checked_i32_bytes(value: usize, label: &'static str) -> Result<i32> {
+    i32::try_from(value).map_err(|_| InferError::Dimension(format!("{label}={value} dépasse i32")))
 }

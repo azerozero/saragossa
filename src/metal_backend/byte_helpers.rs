@@ -7,7 +7,11 @@ use super::*;
     unsafe_code,
     reason = "lecture d'un MTLBuffer partagé après wait_until_completed"
 )]
-fn read_pod_buffer<T: bytemuck::Pod + Default>(buffer: &BufferRef, len: usize) -> Result<Vec<T>> {
+fn read_pod_buffer<T: bytemuck::Pod + Default>(
+    buffer: &BufferRef,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<T>> {
     let read_started = decode_profile_enabled().then(std::time::Instant::now);
     let ptr = buffer.contents().cast::<T>();
     if ptr.is_null() {
@@ -15,6 +19,19 @@ fn read_pod_buffer<T: bytemuck::Pod + Default>(buffer: &BufferRef, len: usize) -
             "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
         ));
     }
+    if offset > 0
+        && offset
+            .checked_add(len)
+            .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
+            .is_none_or(|end| end as u64 > buffer.length())
+    {
+        return Err(InferError::Metal(format!(
+            "lecture MTLBuffer [{offset}, +{len}) hors des {} octets",
+            buffer.length()
+        )));
+    }
+    // SAFETY: `offset` est dans le buffer (vérifié ci-dessus quand non nul).
+    let ptr = unsafe { ptr.add(offset) };
     // `out` est zéro-initialisé (aucune fenêtre non-initialisée → lint
     // `uninit_vec` évité) ; ses `len` éléments sont ensuite ÉCRASÉS par la copie.
     let mut out = vec![T::default(); len];
@@ -36,16 +53,25 @@ fn read_pod_buffer<T: bytemuck::Pod + Default>(buffer: &BufferRef, len: usize) -
 }
 
 pub(crate) fn read_f32_buffer(buffer: &BufferRef, len: usize) -> Result<Vec<f32>> {
-    read_pod_buffer(buffer, len)
+    read_pod_buffer(buffer, 0, len)
+}
+
+/// Lit `len` f32 à partir de l'élément `offset`.
+pub(crate) fn read_f32_buffer_at(
+    buffer: &BufferRef,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<f32>> {
+    read_pod_buffer(buffer, offset, len)
 }
 
 pub(crate) fn read_u32_buffer(buffer: &BufferRef, len: usize) -> Result<Vec<u32>> {
-    read_pod_buffer(buffer, len)
+    read_pod_buffer(buffer, 0, len)
 }
 
 #[cfg(any(test, feature = "devtools"))]
 pub(crate) fn read_u16_buffer(buffer: &BufferRef, len: usize) -> Result<Vec<u16>> {
-    read_pod_buffer(buffer, len)
+    read_pod_buffer(buffer, 0, len)
 }
 
 #[allow(

@@ -183,6 +183,35 @@ pub(super) fn compile_steel_causal_nax_d256_attention(
     device: &Device,
     source: &str,
 ) -> Option<ComputePipelineState> {
+    compile_nax_function(
+        device,
+        source,
+        STEEL_CAUSAL_ATTN_NAX_D256,
+        &[
+            (200, false),
+            (201, false),
+            (300, false),
+            (301, true),
+            (302, false),
+            (303, false),
+        ],
+    )
+}
+
+/// Compile le gated delta NAX figé, sans cache d'état (constante 200).
+pub(super) fn compile_gated_delta_nax(
+    device: &Device,
+    source: &str,
+) -> Option<ComputePipelineState> {
+    compile_nax_function(device, source, GATED_DELTA_NAX_HK16_HV48, &[(200, false)])
+}
+
+fn compile_nax_function(
+    device: &Device,
+    source: &str,
+    name: &str,
+    bool_constants: &[(u64, bool)],
+) -> Option<ComputePipelineState> {
     let options = CompileOptions::new();
     options.set_fast_math_enabled(true);
     let library = match device.new_library_with_source(source, &options) {
@@ -193,17 +222,10 @@ pub(super) fn compile_steel_causal_nax_d256_attention(
         }
     };
     let constants = FunctionConstantValues::new();
-    for (index, value) in [
-        (200, false),
-        (201, false),
-        (300, false),
-        (301, true),
-        (302, false),
-        (303, false),
-    ] {
+    for &(index, value) in bool_constants {
         set_metal_bool_constant(&constants, index, value);
     }
-    let function = match library.get_function(STEEL_CAUSAL_ATTN_NAX_D256, Some(constants)) {
+    let function = match library.get_function(name, Some(constants)) {
         Ok(function) => function,
         Err(message) => {
             trace_steel_causal_d256_compile_error("nax function", &message);
@@ -616,6 +638,15 @@ impl MetalExecutor {
         let na_gemm_bf16_bn128 = compile_na("gemm_nax_bf16_bn128");
         let chunk_delta_seq_layout = compile_na("chunk_delta_seq_layout");
         let chunk_delta_seq_layout_tc = compile_na("chunk_delta_seq_layout_tc");
+        let gated_delta_nax_hk16_hv48 = if crate::runtime_flags::prefill_linear_nax_enabled() {
+            let pipeline = compile_gated_delta_nax(&device, GATED_DELTA_NAX_KERNELS);
+            if pipeline.is_none() {
+                eprintln!("gated delta NAX indisponible : repli chunk-delta");
+            }
+            pipeline
+        } else {
+            None
+        };
         let na_gemm_coop_qb = compile_na("gemm_nax_coop_qb");
         let na_gemm_coop_qb_gs128 = compile_na("gemm_nax_coop_qb_gs128");
         let na_gemm_coop_qb_tiled = compile_na("gemm_nax_coop_qb_tiled");
@@ -787,6 +818,7 @@ impl MetalExecutor {
             na_gemm_bf16_bn128,
             chunk_delta_seq_layout,
             chunk_delta_seq_layout_tc,
+            gated_delta_nax_hk16_hv48,
             na_gemm_coop_qb,
             na_gemm_coop_qb_gs128,
             na_gemm_coop_qb_tiled,

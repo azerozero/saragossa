@@ -42,13 +42,6 @@ impl MetalExecutor {
         Ok((output, caches))
     }
 
-    /// Prefill résident avec capture du flux résiduel en sortie des couches
-    /// `capture_layer_ids` (toutes les positions). Les captures sont copiées sur
-    /// le GPU pendant l'encodage, relues une fois à la fin et rendues en
-    /// `[seq, n * hidden]`, la disposition attendue par le drafter DFlash.
-    /// `None` quand aucune couche n'est demandée. `chunk_tokens` borne la
-    /// taille d'un morceau (0 : un seul morceau), cf.
-    /// `prefill_resident_chunk_tokens`.
     pub(crate) fn qwen_moe_prefill_resident_with_captures(
         &self,
         input: &Tensor,
@@ -57,24 +50,72 @@ impl MetalExecutor {
         capture_layer_ids: &[usize],
         chunk_tokens: usize,
     ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>, Option<Tensor>)> {
+        self.qwen_moe_prefill_resident_from(
+            input,
+            layers,
+            spec,
+            capture_layer_ids,
+            chunk_tokens,
+            None,
+        )
+    }
+
+    /// Indique si un prefill peut prolonger un préfixe : toutes les attentions
+    /// complètes doivent passer par l'attention Steel/NAX à décalage.
+    pub(crate) fn prefill_resident_extend_supported(&self, layers: &[PrefillMoeLayer<'_>]) -> bool {
+        layers.iter().all(|layer| match layer.attention {
+            PrefillAttentionLayer::Full { .. } => {
+                self.causal_attention_prefill_chunk_supported(layer.attention_spec)
+            }
+            PrefillAttentionLayer::Linear { .. } => true,
+        })
+    }
+
+    /// Prefill résident avec capture du flux résiduel en sortie des couches
+    /// `capture_layer_ids` (toutes les positions). Les captures sont copiées sur
+    /// le GPU pendant l'encodage, relues une fois à la fin et rendues en
+    /// `[seq, n * hidden]`, la disposition attendue par le drafter DFlash.
+    /// `None` quand aucune couche n'est demandée. `chunk_tokens` borne la
+    /// taille d'un morceau (0 : un seul morceau), cf.
+    /// `prefill_resident_chunk_tokens`. Avec `prefix`, `input` ne porte que les
+    /// `spec.seq - prefix.rows` positions nouvelles ; sorties, captures et KV
+    /// rendus ne couvrent que celles-ci, l'état linéaire du préfixe avance en
+    /// place.
+    pub(crate) fn qwen_moe_prefill_resident_from(
+        &self,
+        input: &Tensor,
+        layers: &[PrefillMoeLayer<'_>],
+        spec: PrefillAttentionSpec,
+        capture_layer_ids: &[usize],
+        chunk_tokens: usize,
+        prefix: Option<&PrefillResidentPrefix<'_>>,
+    ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>, Option<Tensor>)> {
         let profile_sections = prefill_profile_sections_enabled();
         if profile_sections {
             reset_prefill_f32_to_bf16_shapes();
         }
-        let (seq, hidden_dim) = input.as_matrix()?;
-        if seq != spec.seq || hidden_dim != spec.hidden_dim {
+        let start = prefix.map_or(0, |prefix| prefix.rows);
+        let (rows, hidden_dim) = input.as_matrix()?;
+        if rows.checked_add(start) != Some(spec.seq) || hidden_dim != spec.hidden_dim {
             return Err(InferError::Dimension(format!(
-                "prefill résident input=[{seq},{hidden_dim}], spec seq={} hidden={}",
+                "prefill résident input=[{rows},{hidden_dim}] après {start}, spec seq={} hidden={}",
                 spec.seq, spec.hidden_dim
             )));
         }
-        if layers.is_empty() || spec.seq == 0 {
+        if layers.is_empty() || rows == 0 {
             return Err(InferError::Config(
                 "prefill résident sans couche ou sans token".to_string(),
             ));
         }
-        let chunk_rows = self.resident_prefill_chunk_rows(layers, spec, chunk_tokens);
-        let chunk_count = spec.seq.div_ceil(chunk_rows);
+        if prefix.is_some_and(|prefix| prefix.layers.len() != layers.len())
+            || (start > 0 && !self.prefill_resident_extend_supported(layers))
+        {
+            return Err(InferError::Config(
+                "prefill résident prolongé hors périmètre".to_string(),
+            ));
+        }
+        let chunk_rows = self.resident_prefill_chunk_rows(layers, rows, chunk_tokens);
+        let chunk_count = rows.div_ceil(chunk_rows);
         let mut kernel_timing = if profile_sections {
             None
         } else {
@@ -84,7 +125,7 @@ impl MetalExecutor {
         let mut section_profile = PrefillSectionProfile::default();
         let trace = !profile_sections && trace_prefill_enabled();
         let total_started = trace.then(std::time::Instant::now);
-        let hidden_len = checked_len(spec.seq, hidden_dim, "prefill résident hidden")?;
+        let hidden_len = checked_len(rows, hidden_dim, "prefill résident hidden")?;
         let chunk_hidden_capacity =
             checked_len(chunk_rows, hidden_dim, "prefill résident hidden morceau")?;
         let input_buffer = self.upload_f32_buffer(input.data(), "resident_input")?;
@@ -122,11 +163,46 @@ impl MetalExecutor {
         for (layer_index, layer) in layers.iter().enumerate() {
             let (_, kv_dim, layer_shape) =
                 self.resident_prefill_layer_shape(layer, layer_index, spec, hidden_dim)?;
-            layer_cache_buffers.push(self.allocate_prefill_resident_layer_cache(
-                &layer_shape,
-                spec.seq,
-                kv_dim,
-            )?);
+            let prefix_layer = prefix.map(|prefix| &prefix.layers[layer_index]);
+            let cache = match (prefix_layer, &layer_shape.attention) {
+                (
+                    Some(PrefillResidentPrefixLayer::Linear { state }),
+                    PrefillResidentAttentionShape::Linear { .. },
+                ) => PrefillResidentLayerCacheBuffer::Linear {
+                    state: (*state).clone(),
+                },
+                (None, _)
+                | (
+                    Some(PrefillResidentPrefixLayer::Full { .. }),
+                    PrefillResidentAttentionShape::Full { .. },
+                ) => self.allocate_prefill_resident_layer_cache(&layer_shape, spec.seq, kv_dim)?,
+                _ => {
+                    return Err(InferError::Config(format!(
+                        "préfixe résident incohérent couche {layer_index}"
+                    )))
+                }
+            };
+            if let (
+                Some(PrefillResidentPrefixLayer::Full { key, value }),
+                PrefillResidentLayerCacheBuffer::Full {
+                    key: key_cache,
+                    value: value_cache,
+                    ..
+                },
+            ) = (prefix_layer, &cache)
+            {
+                let prefix_len = checked_len(start, kv_dim, "préfixe résident kv")?;
+                if key.len() != prefix_len || value.len() != prefix_len {
+                    return Err(InferError::Dimension(format!(
+                        "préfixe résident KV couche {layer_index}: {}/{} attendu {prefix_len}",
+                        key.len(),
+                        value.len()
+                    )));
+                }
+                write_f32_buffer(key_cache, key)?;
+                write_f32_buffer(value_cache, value)?;
+            }
+            layer_cache_buffers.push(cache);
         }
         let mut owned_buffers = Vec::new();
 
@@ -161,7 +237,7 @@ impl MetalExecutor {
                 fallback_encoder,
                 owned_buffers: &mut owned_buffers,
             };
-            for chunk_start in (0..spec.seq).step_by(chunk_rows) {
+            for chunk_start in (start..spec.seq).step_by(chunk_rows) {
                 let chunk = ResidentPrefillChunk {
                     start: chunk_start,
                     rows: chunk_rows.min(spec.seq - chunk_start),
@@ -169,8 +245,11 @@ impl MetalExecutor {
                 };
                 let chunk_hidden_len =
                     checked_len(chunk.rows, hidden_dim, "prefill résident hidden morceau")?;
-                let chunk_offset_bytes =
-                    f32_byte_offset(checked_len(chunk.start, hidden_dim, "morceau offset")?)?;
+                let chunk_offset_bytes = f32_byte_offset(checked_len(
+                    chunk.start - start,
+                    hidden_dim,
+                    "morceau offset",
+                )?)?;
                 if let Some(chunk_input) = chunk_input.as_ref() {
                     self.run_resident_prefill_section(
                         &mut encode_context,
@@ -277,7 +356,7 @@ impl MetalExecutor {
                         {
                             let offset = f32_byte_offset(
                                 checked_len(slot, hidden_len, "prefill résident capture offset")?
-                                    .checked_add(chunk.start * hidden_dim)
+                                    .checked_add((chunk.start - start) * hidden_dim)
                                     .ok_or_else(|| {
                                         InferError::Shape(
                                             "prefill résident capture offset déborde".to_string(),
@@ -352,25 +431,28 @@ impl MetalExecutor {
                 // [n, seq, hidden] sur le GPU -> [seq, n * hidden] attendu par le drafter.
                 let mut out = vec![0.0_f32; count * hidden_len];
                 for slot in 0..count {
-                    for row in 0..spec.seq {
+                    for row in 0..rows {
                         let src = slot * hidden_len + row * hidden_dim;
                         let dst = (row * count + slot) * hidden_dim;
                         out[dst..dst + hidden_dim].copy_from_slice(&raw[src..src + hidden_dim]);
                     }
                 }
-                Tensor::from_vec(vec![spec.seq, count * hidden_dim], out)
+                Tensor::from_vec(vec![rows, count * hidden_dim], out)
             })
             .transpose()?;
         let mut layer_caches = Vec::with_capacity(layer_cache_buffers.len());
         for cache_buffer in layer_cache_buffers {
             match cache_buffer {
                 PrefillResidentLayerCacheBuffer::Full { key, value, kv_dim } => {
-                    let kv_len = checked_len(spec.seq, kv_dim, "prefill résident readback kv")?;
-                    let key = read_f32_buffer(&key, kv_len)?;
-                    let value = read_f32_buffer(&value, kv_len)?;
+                    // Seules les positions nouvelles repartent au CPU : le préfixe
+                    // y est déjà.
+                    let kv_len = checked_len(rows, kv_dim, "prefill résident readback kv")?;
+                    let kv_offset = checked_len(start, kv_dim, "prefill résident readback kv")?;
+                    let key = read_f32_buffer_at(&key, kv_offset, kv_len)?;
+                    let value = read_f32_buffer_at(&value, kv_offset, kv_len)?;
                     layer_caches.push(PrefillResidentLayerCache::Full {
-                        key: Tensor::from_vec(vec![spec.seq, kv_dim], key)?,
-                        value: Tensor::from_vec(vec![spec.seq, kv_dim], value)?,
+                        key: Tensor::from_vec(vec![rows, kv_dim], key)?,
+                        value: Tensor::from_vec(vec![rows, kv_dim], value)?,
                     });
                 }
                 PrefillResidentLayerCacheBuffer::Linear { state } => {
@@ -403,43 +485,32 @@ impl MetalExecutor {
             section_profile.dump();
         }
         Ok((
-            Tensor::from_vec(vec![spec.seq, hidden_dim], output)?,
+            Tensor::from_vec(vec![rows, hidden_dim], output)?,
             layer_caches,
             captures,
         ))
     }
 
-    /// Lignes par morceau : le prompt est coupé en morceaux égaux d'au plus
-    /// `target` lignes, si toutes les attentions
+    /// Lignes par morceau : les `rows` positions à calculer sont coupées en
+    /// morceaux égaux d'au plus `target` lignes, si toutes les attentions
     /// complètes passent par le chemin Steel/NAX à décalage ; sinon un seul
     /// morceau.
     fn resident_prefill_chunk_rows(
         &self,
         layers: &[PrefillMoeLayer<'_>],
-        spec: PrefillAttentionSpec,
+        rows: usize,
         target: usize,
     ) -> usize {
         // NOTE: les timestamps GPU plafonnent à 8192 échantillons ; un seul
         // morceau garde le profil par couche lisible.
-        if target == 0 || spec.seq <= target || crate::runtime_flags::gpu_timestamps_enabled() {
-            return spec.seq;
+        if target == 0
+            || rows <= target
+            || crate::runtime_flags::gpu_timestamps_enabled()
+            || !self.prefill_resident_extend_supported(layers)
+        {
+            return rows;
         }
-        let rows = spec.seq.div_ceil(spec.seq.div_ceil(target));
-        let last_rows = spec.seq - (spec.seq.div_ceil(rows) - 1) * rows;
-        let chunkable = layers.iter().all(|layer| match layer.attention {
-            PrefillAttentionLayer::Full { .. } => [rows, last_rows].into_iter().all(|seq| {
-                self.causal_attention_prefill_chunk_supported(PrefillAttentionSpec {
-                    seq,
-                    ..layer.attention_spec
-                })
-            }),
-            PrefillAttentionLayer::Linear { .. } => true,
-        });
-        if chunkable {
-            rows
-        } else {
-            spec.seq
-        }
+        rows.div_ceil(rows.div_ceil(target))
     }
 
     fn resident_prefill_layer_shape<'a>(

@@ -1041,46 +1041,49 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
         up_proj: &up,
         down_proj: &down,
     };
-    let layers = [
-        PrefillMoeLayer {
-            input_norm: &input_norm,
-            attention: PrefillAttentionLayer::Linear {
-                weights: LinearAttnResidentWeights {
-                    in_proj_qkv: &in_proj_qkv,
-                    in_proj_z: &in_proj_z,
-                    in_proj_b: &in_proj_b,
-                    in_proj_a: &in_proj_a,
-                    out_proj: &out_proj,
-                    conv_weight: &conv_weight,
-                    a_log: &a_log,
-                    dt_bias: &dt_bias,
-                    norm_weight: norm_weight.data(),
+    let make_layers = |spec: PrefillAttentionSpec| {
+        [
+            PrefillMoeLayer {
+                input_norm: &input_norm,
+                attention: PrefillAttentionLayer::Linear {
+                    weights: LinearAttnResidentWeights {
+                        in_proj_qkv: &in_proj_qkv,
+                        in_proj_z: &in_proj_z,
+                        in_proj_b: &in_proj_b,
+                        in_proj_a: &in_proj_a,
+                        out_proj: &out_proj,
+                        conv_weight: &conv_weight,
+                        a_log: &a_log,
+                        dt_bias: &dt_bias,
+                        norm_weight: norm_weight.data(),
+                    },
+                    spec: linear_spec,
+                    dims,
                 },
-                spec: linear_spec,
-                dims,
+                attention_spec: spec,
+                post_norm: &post_norm,
+                post_norm_before_residual: false,
+                tail,
             },
-            attention_spec: spec,
-            post_norm: &post_norm,
-            post_norm_before_residual: false,
-            tail,
-        },
-        PrefillMoeLayer {
-            input_norm: &input_norm,
-            attention: PrefillAttentionLayer::Full {
-                q_proj: &q_proj,
-                k_proj: &k_proj,
-                v_proj: &v_proj,
-                o_proj: &o_proj,
-                q_norm: &q_norm,
-                k_norm: &k_norm,
-                gated: true,
+            PrefillMoeLayer {
+                input_norm: &input_norm,
+                attention: PrefillAttentionLayer::Full {
+                    q_proj: &q_proj,
+                    k_proj: &k_proj,
+                    v_proj: &v_proj,
+                    o_proj: &o_proj,
+                    q_norm: &q_norm,
+                    k_norm: &k_norm,
+                    gated: true,
+                },
+                attention_spec: spec,
+                post_norm: &post_norm,
+                post_norm_before_residual: false,
+                tail,
             },
-            attention_spec: spec,
-            post_norm: &post_norm,
-            post_norm_before_residual: false,
-            tail,
-        },
-    ];
+        ]
+    };
+    let layers = make_layers(spec);
 
     let (single, single_caches, single_captures) =
         executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 0)?;
@@ -1143,6 +1146,98 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             return Err(InferError::Dimension(
                 "caches linéaire + full attendus".to_string(),
             ))
+        }
+    }
+
+    // Prolongement d'un préfixe calculé à froid (KV recopié, état linéaire avancé
+    // en place) : suffixe de 400 lignes, puis de 5 lignes, plus court qu'un bloc Steel.
+    for prefix_rows in [700, SEQ - 5] {
+        let rows_of = |tensor: &Tensor, from: usize, to: usize, dim: usize| {
+            Tensor::from_vec(
+                vec![to - from, dim],
+                tensor.data()[from * dim..to * dim].to_vec(),
+            )
+        };
+        let prefix_spec = PrefillAttentionSpec {
+            seq: prefix_rows,
+            ..spec
+        };
+        let (_, prefix_caches) = executor.qwen_moe_prefill_resident(
+            &rows_of(&input, 0, prefix_rows, HIDDEN)?,
+            &make_layers(prefix_spec),
+            prefix_spec,
+        )?;
+        let prefix = PrefillResidentPrefix {
+            rows: prefix_rows,
+            layers: prefix_caches
+                .iter()
+                .map(|cache| match cache {
+                    PrefillResidentLayerCache::Full { key, value } => {
+                        PrefillResidentPrefixLayer::Full {
+                            key: key.data(),
+                            value: value.data(),
+                        }
+                    }
+                    PrefillResidentLayerCache::Linear { state } => {
+                        PrefillResidentPrefixLayer::Linear { state }
+                    }
+                })
+                .collect(),
+        };
+        let (extended, extended_caches, _) = executor.qwen_moe_prefill_resident_from(
+            &rows_of(&input, prefix_rows, SEQ, HIDDEN)?,
+            &layers,
+            spec,
+            &[],
+            512,
+            Some(&prefix),
+        )?;
+        assert_close(
+            &extended,
+            &rows_of(&single, prefix_rows, SEQ, HIDDEN)?,
+            1.0e-4,
+            "prolongement sortie",
+        );
+        match (single_caches.as_slice(), extended_caches.as_slice()) {
+            (
+                [PrefillResidentLayerCache::Linear {
+                    state: single_state,
+                }, PrefillResidentLayerCache::Full {
+                    key: single_key,
+                    value: single_value,
+                }],
+                [PrefillResidentLayerCache::Linear {
+                    state: extended_state,
+                }, PrefillResidentLayerCache::Full {
+                    key: extended_key,
+                    value: extended_value,
+                }],
+            ) => {
+                let kv_dim = KV_HEADS * HEAD_DIM;
+                assert_close(
+                    extended_key,
+                    &rows_of(single_key, prefix_rows, SEQ, kv_dim)?,
+                    1.0e-4,
+                    "prolongement K",
+                );
+                assert_close(
+                    extended_value,
+                    &rows_of(single_value, prefix_rows, SEQ, kv_dim)?,
+                    1.0e-4,
+                    "prolongement V",
+                );
+                let conv_single = read_f32_buffer(&single_state.conv, single_state.conv_len)?;
+                let conv_extended = read_f32_buffer(&extended_state.conv, extended_state.conv_len)?;
+                assert!(
+                    max_diff(&conv_extended, &conv_single) <= 1.0e-4,
+                    "prolongement conv"
+                );
+            }
+            _ => {
+                return Err(InferError::Dimension(
+                    "caches prolongés linéaire + full attendus".to_string(),
+                ))
+            }
         }
     }
     Ok(())

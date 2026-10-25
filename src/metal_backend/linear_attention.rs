@@ -1156,7 +1156,22 @@ impl MetalExecutor {
                     }
                 }
             }
-            if linear_chunked_enabled()
+            if !state.ssm_bf16
+                && self.encode_gated_delta_nax(
+                    encoder,
+                    &conv_out_buffer,
+                    &q_norm_buffer,
+                    &k_norm_buffer,
+                    &beta_buffer,
+                    &decay_buffer,
+                    &state.ssm,
+                    &y_buffer,
+                    rows,
+                    spec,
+                )?
+            {
+                // Récurrence faite par le noyau NAX.
+            } else if linear_chunked_enabled()
                 && spec.key_head_dim == 128
                 && spec.value_head_dim == 128
                 && !state.ssm_bf16

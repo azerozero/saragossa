@@ -3418,9 +3418,119 @@ impl CausalDecoder {
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if self.extend_prompt_state_metal_resident(state, suffix)? {
+            return Ok(());
+        }
         let (final_states, _) = self.forward_suffix_batched(&mut state.cache, suffix, None)?;
         state.final_state = Tensor::row(final_states.last_row()?.to_vec())?;
         Ok(())
+    }
+
+    /// Prolonge un état de prompt par le prefill résident par morceaux : le KV
+    /// CPU du préfixe est recopié sur le GPU, l'état linéaire GPU avance en
+    /// place. `false` : préconditions non réunies, état intact (repli sur
+    /// l'extension en lignes).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le forward résident échoue ; l'état linéaire a pu
+    /// avancer, il n'y a donc pas de repli.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn extend_prompt_state_metal_resident(
+        &self,
+        state: &mut CausalDecoderPromptState,
+        suffix: &[usize],
+    ) -> Result<bool> {
+        let start = state.cache.position;
+        if !prefill_resident_enabled()
+            || self.config.is_gemma4
+            || start == 0
+            || suffix.len() < crate::runtime_flags::prefix_extend_resident_min_tokens()
+        {
+            return Ok(false);
+        }
+        let Some(metal) = self.forward_runtime().metal_executor() else {
+            return Ok(false);
+        };
+        // Un KV déjà monté sur le GPU (decode résident) deviendrait périmé.
+        if state.cache.resident.is_some()
+            || state.cache.layers.iter().any(|layer| layer.full.is_some())
+        {
+            return Ok(false);
+        }
+        let Some(spec) =
+            self.resident_prefill_spec(start + suffix.len(), self.final_norm.data().len())
+        else {
+            return Ok(false);
+        };
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let Some(prefill_layer) = layer.prefill_moe_layer(&self.config, spec) else {
+                return Ok(false);
+            };
+            layers.push(prefill_layer);
+        }
+        if !metal.prefill_resident_extend_supported(&layers) {
+            return Ok(false);
+        }
+        let mut prefix_layers = Vec::with_capacity(layers.len());
+        for (layer_cache, layer) in state.cache.layers.iter().zip(&layers) {
+            prefix_layers.push(match layer.attention {
+                crate::metal_backend::PrefillAttentionLayer::Full { .. } => {
+                    if layer_cache.len() != start {
+                        return Ok(false);
+                    }
+                    crate::metal_backend::PrefillResidentPrefixLayer::Full {
+                        key: layer_cache.keys.as_slice(),
+                        value: layer_cache.values.as_slice(),
+                    }
+                }
+                crate::metal_backend::PrefillAttentionLayer::Linear { .. } => {
+                    let Some(linear) = layer_cache.linear.metal_state() else {
+                        return Ok(false);
+                    };
+                    crate::metal_backend::PrefillResidentPrefixLayer::Linear { state: linear }
+                }
+            });
+        }
+        let hidden = self.embed_scaled(suffix)?;
+        let prefix = crate::metal_backend::PrefillResidentPrefix {
+            rows: start,
+            layers: prefix_layers,
+        };
+        let (final_hidden, layer_states, _) = metal.qwen_moe_prefill_resident_from(
+            &hidden,
+            &layers,
+            spec,
+            &[],
+            crate::runtime_flags::prefill_resident_chunk_tokens(),
+            Some(&prefix),
+        )?;
+        drop(prefix);
+        for ((layer_cache, layer), layer_state) in
+            state.cache.layers.iter_mut().zip(&layers).zip(layer_states)
+        {
+            // L'état linéaire a avancé en place dans le buffer du cache.
+            if let crate::metal_backend::PrefillResidentLayerCache::Full { key, value } =
+                layer_state
+            {
+                let layer_spec = layer.attention_spec;
+                let layout = AttentionLayout {
+                    num_attention_heads: layer_spec.q_heads,
+                    num_key_value_heads: layer_spec.kv_heads,
+                    head_dim: layer_spec.head_dim,
+                    rope_dims: layer_spec.rope_dims,
+                    attn_scalar: layer_spec.attn_scalar,
+                    sliding_window: layer_spec.window,
+                };
+                layer_cache.append_batch(&key, &value, &layout)?;
+            }
+        }
+        state.cache.position = start + suffix.len();
+        let last = Tensor::row(final_hidden.last_row()?.to_vec())?;
+        state.final_state = rms_norm(&last, &self.final_norm, self.config.rms_eps)?;
+        Ok(true)
     }
 
     /// Capture les états Metal attachés à un état de prompt.
@@ -4321,6 +4431,55 @@ impl CausalDecoder {
             .map(|(cache, hidden, _)| (cache, hidden)))
     }
 
+    /// Spec d'attention du prefill résident pour `seq` positions, `None` hors
+    /// contrat du spine résident (RoPE, overrides par couche).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn resident_prefill_spec(
+        &self,
+        seq: usize,
+        hidden_dim: usize,
+    ) -> Option<crate::metal_backend::PrefillAttentionSpec> {
+        let rope_theta = self.config.rope_theta?;
+        let head_dim = self.config.head_dim?;
+        // Gemma 4 emploie aussi rotate-half. Tout autre appariement reste hors
+        // du contrat du kernel fusionné et retombe sur le chemin per-op.
+        if self.config.rope_style != RopeStyle::Halves {
+            return None;
+        }
+        // Le spine résident porte theta, RoPE partiel et fenêtre par couche.
+        // L'échelle de position RoPE reste le seul override non encodé.
+        let has_unsupported_layer_override = self.layers.iter().any(|layer| {
+            let AttentionBlock::Full(attention) = &layer.attention else {
+                return false;
+            };
+            if self.config.is_gemma4 {
+                attention.rope_position_scale.is_some()
+            } else {
+                attention.rope_theta.is_some()
+                    || attention.rope_position_scale.is_some()
+                    || attention.sliding_window.is_some()
+            }
+        });
+        if has_unsupported_layer_override {
+            return None;
+        }
+        Some(crate::metal_backend::PrefillAttentionSpec {
+            seq,
+            hidden_dim,
+            q_heads: self.config.num_attention_heads,
+            kv_heads: self.config.num_key_value_heads,
+            head_dim,
+            rope_dims: self.config.rope_dims.unwrap_or(head_dim),
+            rope_frequency_dim: self.config.rope_dims.unwrap_or(head_dim),
+            rope_theta,
+            attn_scalar: head_dim as f32,
+            window: None,
+            k_eq_v: false,
+            value_norm: false,
+            eps: self.config.rms_eps,
+        })
+    }
+
     /// Même prefill résident, avec capture du flux résiduel en sortie des
     /// couches `capture_layer_ids` (`[seq, n * hidden]`, cf. le drafter DFlash).
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -4338,51 +4497,11 @@ impl CausalDecoder {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };
-        let Some(rope_theta) = self.config.rope_theta else {
+        let Some(spec) = self.resident_prefill_spec(prompt.len(), self.final_norm.data().len())
+        else {
             return Ok(None);
         };
-        let Some(head_dim) = self.config.head_dim else {
-            return Ok(None);
-        };
-        // Gemma 4 emploie aussi rotate-half. Tout autre appariement reste hors
-        // du contrat du kernel fusionné et retombe sur le chemin per-op.
-        if self.config.rope_style != RopeStyle::Halves {
-            return Ok(None);
-        }
-        // Le spine résident porte theta, RoPE partiel et fenêtre par couche.
-        // L'échelle de position RoPE reste le seul override non encodé.
-        let has_unsupported_layer_override = self.layers.iter().any(|layer| {
-            let AttentionBlock::Full(attention) = &layer.attention else {
-                return false;
-            };
-            if self.config.is_gemma4 {
-                attention.rope_position_scale.is_some()
-            } else {
-                attention.rope_theta.is_some()
-                    || attention.rope_position_scale.is_some()
-                    || attention.sliding_window.is_some()
-            }
-        });
-        if has_unsupported_layer_override {
-            return Ok(None);
-        }
         let hidden = self.embed_scaled(prompt)?;
-        let (seq, hidden_dim) = hidden.as_matrix()?;
-        let spec = crate::metal_backend::PrefillAttentionSpec {
-            seq,
-            hidden_dim,
-            q_heads: self.config.num_attention_heads,
-            kv_heads: self.config.num_key_value_heads,
-            head_dim,
-            rope_dims: self.config.rope_dims.unwrap_or(head_dim),
-            rope_frequency_dim: self.config.rope_dims.unwrap_or(head_dim),
-            rope_theta,
-            attn_scalar: head_dim as f32,
-            window: None,
-            k_eq_v: false,
-            value_norm: false,
-            eps: self.config.rms_eps,
-        };
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let Some(prefill_layer) = layer.prefill_moe_layer(&self.config, spec) else {
