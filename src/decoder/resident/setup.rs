@@ -256,7 +256,11 @@ impl CausalDecoder {
                 continue;
             }
             let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, sampled)?;
-            full.seed(&layer_cache.keys, &layer_cache.values, prefill_len)?;
+            full.seed_segments(
+                &layer_cache.keys.segments().collect::<Vec<_>>(),
+                &layer_cache.values.segments().collect::<Vec<_>>(),
+                prefill_len,
+            )?;
             layer_cache.full = Some(full);
         }
         Ok(())
@@ -692,7 +696,11 @@ impl CausalDecoder {
             let head_dim = self.config.layer_head_dim(index)?;
             let kv_heads = self.config.layer_num_key_value_heads(index);
             let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, sampled)?;
-            full.seed(&layer_cache.keys, &layer_cache.values, prefill_len)?;
+            full.seed_segments(
+                &layer_cache.keys.segments().collect::<Vec<_>>(),
+                &layer_cache.values.segments().collect::<Vec<_>>(),
+                prefill_len,
+            )?;
             layer_cache.full = Some(full);
         }
         if let Some(t) = t_kv_seed {

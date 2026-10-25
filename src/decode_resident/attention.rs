@@ -650,6 +650,22 @@ impl FullAttentionMetalState {
         values_rows: &[f32],
         n_rows: usize,
     ) -> Result<()> {
+        self.seed_segments(&[keys_rows], &[values_rows], n_rows)
+    }
+
+    /// Comme [`Self::seed`], depuis des segments de lignes contiguës mis bout à
+    /// bout (KV CPU segmenté) : aucun tampon intermédiaire de la taille du KV.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `n_rows > capacity` ou si les segments ne totalisent
+    /// pas `n_rows * kv_dim`.
+    pub(crate) fn seed_segments(
+        &mut self,
+        keys_segments: &[&[f32]],
+        values_segments: &[&[f32]],
+        n_rows: usize,
+    ) -> Result<()> {
         if n_rows > self.capacity {
             return Err(InferError::Dimension(format!(
                 "seed KV {n_rows} > capacité {}",
@@ -660,38 +676,39 @@ impl FullAttentionMetalState {
         let expected = n_rows
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Dimension("seed KV déborde".to_string()))?;
-        if keys_rows.len() != expected || values_rows.len() != expected {
+        let keys_len: usize = keys_segments.iter().map(|segment| segment.len()).sum();
+        let values_len: usize = values_segments.iter().map(|segment| segment.len()).sum();
+        if keys_len != expected || values_len != expected {
             return Err(InferError::Dimension(format!(
-                "seed KV: attendu {expected} (={n_rows}×{kv_dim}), reçu keys={} values={}",
-                keys_rows.len(),
-                values_rows.len()
+                "seed KV: attendu {expected} (={n_rows}×{kv_dim}), reçu keys={keys_len} values={values_len}"
             )));
         }
-        match self.keys.element() {
-            GpuElement::F32 if kv_bf16_sim_konly() => {
-                // Diagnostic C1B : K bf16 (seed), V f32 exact — buffers/kernels f32.
-                let rounded: Vec<f32> = keys_rows.iter().copied().map(bf16_round_f32).collect();
-                write_f32_at(&self.keys, 0, &rounded)?;
-                write_f32_at(&self.values, 0, values_rows)?;
-            }
-            GpuElement::F32 if kv_bf16_sim_vonly() => {
-                // Diagnostic C1B : V bf16 (seed), K f32 exact.
-                let rounded: Vec<f32> = values_rows.iter().copied().map(bf16_round_f32).collect();
-                write_f32_at(&self.keys, 0, keys_rows)?;
-                write_f32_at(&self.values, 0, &rounded)?;
-            }
-            GpuElement::F32 => {
-                write_f32_at(&self.keys, 0, keys_rows)?;
-                write_f32_at(&self.values, 0, values_rows)?;
-            }
-            GpuElement::Bf16 => {
-                write_f32_as_bf16_at(&self.keys, 0, keys_rows)?;
-                write_f32_as_bf16_at(&self.values, 0, values_rows)?;
-            }
-            GpuElement::U32 => {
-                return Err(InferError::Metal(
-                    "seed KV sur un buffer u32 invalide".to_string(),
-                ));
+        // Diagnostic C1B : arrondi bf16 du seed sur K seul ou V seul, buffers f32.
+        let (round_keys, round_values) = match self.keys.element() {
+            GpuElement::F32 => (kv_bf16_sim_konly(), kv_bf16_sim_vonly()),
+            _ => (false, false),
+        };
+        for (tensor, segments, round) in [
+            (&self.keys, keys_segments, round_keys),
+            (&self.values, values_segments, round_values && !round_keys),
+        ] {
+            let mut offset = 0;
+            for segment in segments {
+                match tensor.element() {
+                    GpuElement::F32 if round => {
+                        let rounded: Vec<f32> =
+                            segment.iter().copied().map(bf16_round_f32).collect();
+                        write_f32_at(tensor, offset, &rounded)?;
+                    }
+                    GpuElement::F32 => write_f32_at(tensor, offset, segment)?,
+                    GpuElement::Bf16 => write_f32_as_bf16_at(tensor, offset, segment)?,
+                    GpuElement::U32 => {
+                        return Err(InferError::Metal(
+                            "seed KV sur un buffer u32 invalide".to_string(),
+                        ));
+                    }
+                }
+                offset += segment.len();
             }
         }
         self.len = n_rows;

@@ -77,17 +77,28 @@ pub(crate) fn read_u16_buffer(buffer: &BufferRef, len: usize) -> Result<Vec<u16>
     unsafe_code,
     reason = "écriture d'un MTLBuffer partagé avant commit du command buffer"
 )]
-fn write_pod_buffer<T: bytemuck::Pod>(buffer: &BufferRef, data: &[T]) -> Result<()> {
+fn write_pod_buffer<T: bytemuck::Pod>(buffer: &BufferRef, offset: usize, data: &[T]) -> Result<()> {
     let ptr = buffer.contents().cast::<T>();
     if ptr.is_null() {
         return Err(InferError::Metal(
             "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
         ));
     }
-    // SAFETY: `buffer` est en StorageModeShared, et l'appelant fournit un
-    // scratch dimensionné pour exactement `data.len()` éléments POD.
+    if offset
+        .checked_add(data.len())
+        .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
+        .is_none_or(|end| end as u64 > buffer.length())
+    {
+        return Err(InferError::Metal(format!(
+            "écriture MTLBuffer [{offset}, +{}) hors des {} octets",
+            data.len(),
+            buffer.length()
+        )));
+    }
+    // SAFETY: `buffer` est en StorageModeShared et `[offset, offset + len)` y
+    // tient (vérifié ci-dessus) ; `data` est une tranche CPU distincte.
     unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
     }
     #[cfg(feature = "devtools")]
     crate::runtime_flags::pairwise::record_io(true, std::mem::size_of_val(data));
@@ -95,11 +106,16 @@ fn write_pod_buffer<T: bytemuck::Pod>(buffer: &BufferRef, data: &[T]) -> Result<
 }
 
 pub(crate) fn write_f32_buffer(buffer: &BufferRef, data: &[f32]) -> Result<()> {
-    write_pod_buffer(buffer, data)
+    write_pod_buffer(buffer, 0, data)
+}
+
+/// Écrit `data` à partir de l'élément `offset`.
+pub(crate) fn write_f32_buffer_at(buffer: &BufferRef, offset: usize, data: &[f32]) -> Result<()> {
+    write_pod_buffer(buffer, offset, data)
 }
 
 pub(super) fn write_u32_buffer(buffer: &BufferRef, data: &[u32]) -> Result<()> {
-    write_pod_buffer(buffer, data)
+    write_pod_buffer(buffer, 0, data)
 }
 
 pub(super) fn set_u32_bytes(

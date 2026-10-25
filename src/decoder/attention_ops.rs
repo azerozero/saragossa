@@ -955,8 +955,17 @@ pub(super) fn cached_attention_one(
     let kv_group = layout.num_attention_heads / layout.num_key_value_heads;
     let q_row = q.row_slice(0)?;
     let mut out = vec![0.0_f32; expected_q_dim];
-    let keys = &cache.keys;
-    let values = &cache.values;
+    // Lignes du cache segmenté, sans copie des données.
+    let keys: Vec<&[f32]> = cache
+        .keys
+        .rows(expected_kv_dim)
+        .skip(window_start)
+        .collect();
+    let values: Vec<&[f32]> = cache
+        .values
+        .rows(expected_kv_dim)
+        .skip(window_start)
+        .collect();
     if cache_len >= attention_parallel_threshold() {
         out.par_chunks_mut(layout.head_dim)
             .enumerate()
@@ -968,14 +977,12 @@ pub(super) fn cached_attention_one(
                     let k_start = kv_head * layout.head_dim;
                     let q_slice = &q_row[q_start..q_start + layout.head_dim];
                     for (offset, score) in scores.iter_mut().enumerate() {
-                        let key_start = (window_start + offset) * expected_kv_dim + k_start;
-                        let k_slice = &keys[key_start..key_start + layout.head_dim];
+                        let k_slice = &keys[offset][k_start..k_start + layout.head_dim];
                         *score = dot_product(q_slice, k_slice) * inv_scale;
                     }
                     softmax_in_place(scores, 1.0);
                     for (offset, prob) in scores.iter().copied().enumerate() {
-                        let value_start = (window_start + offset) * expected_kv_dim + k_start;
-                        let v_slice = &values[value_start..value_start + layout.head_dim];
+                        let v_slice = &values[offset][k_start..k_start + layout.head_dim];
                         for col in 0..layout.head_dim {
                             out_head[col] += prob * v_slice[col];
                         }
@@ -991,14 +998,12 @@ pub(super) fn cached_attention_one(
         let k_start = kv_head * layout.head_dim;
         let q_slice = &q_row[q_start..q_start + layout.head_dim];
         for (offset, score) in scores.iter_mut().enumerate() {
-            let key_start = (window_start + offset) * expected_kv_dim + k_start;
-            let k_slice = &keys[key_start..key_start + layout.head_dim];
+            let k_slice = &keys[offset][k_start..k_start + layout.head_dim];
             *score = dot_product(q_slice, k_slice) * inv_scale;
         }
         softmax_in_place(&mut scores, 1.0);
         for (offset, prob) in scores.iter().copied().enumerate() {
-            let value_start = (window_start + offset) * expected_kv_dim + k_start;
-            let v_slice = &values[value_start..value_start + layout.head_dim];
+            let v_slice = &values[offset][k_start..k_start + layout.head_dim];
             for col in 0..layout.head_dim {
                 out[q_start + col] += prob * v_slice[col];
             }

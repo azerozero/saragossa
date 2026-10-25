@@ -710,9 +710,10 @@ pub(crate) struct PrefillResidentPrefix<'a> {
 }
 
 pub(crate) enum PrefillResidentPrefixLayer<'a> {
+    /// Lignes K et V du préfixe, en segments contigus mis bout à bout.
     Full {
-        key: &'a [f32],
-        value: &'a [f32],
+        key: Vec<&'a [f32]>,
+        value: Vec<&'a [f32]>,
     },
     Linear {
         state: &'a LinearAttentionMetalState,

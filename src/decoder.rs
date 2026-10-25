@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 mod attention;
 mod attention_cache;
 mod attention_ops;
+mod kv_rows;
 #[cfg(test)]
 pub(crate) use attention_ops::{
     gemma_global_attention_prefill_oracle, GemmaGlobalAttentionOracleSpec,
@@ -804,11 +805,11 @@ struct ResidentLinearDenseBuffers {
 
 #[derive(Debug, Default)]
 struct LayerKvCache {
-    // NOTE: `Arc` partagé avec le cache de préfixe : son clone (1,1 Go à 8k
-    // tokens, 550-670 ms par tour) devient O(1) ; une écriture copie à la
-    // demande via `Arc::make_mut` si une autre poignée existe encore.
-    keys: std::sync::Arc<Vec<f32>>,
-    values: std::sync::Arc<Vec<f32>>,
+    // NOTE: segments partagés avec le cache de préfixe et les snapshots : un
+    // clone (1,1 Go à 8k tokens) est O(segments) et un ajout ne recopie jamais
+    // le préfixe (cf. `kv_rows`).
+    keys: kv_rows::KvRows,
+    values: kv_rows::KvRows,
     kv_dim: Option<usize>,
     linear: LinearAttentionCache,
     // KV full-attn résident GPU (decode résident, flag SARAGOSSA_RUST_DECODE_RESIDENT).
@@ -862,9 +863,8 @@ impl CausalDecoderCache {
                 // jusqu'à 2× sa longueur.
                 layer
                     .keys
-                    .capacity()
-                    .saturating_add(layer.values.capacity())
-                    .saturating_mul(std::mem::size_of::<f32>())
+                    .capacity_bytes()
+                    .saturating_add(layer.values.capacity_bytes())
                     .saturating_add(layer.linear.estimated_cpu_bytes())
             })
             .sum()
@@ -874,10 +874,10 @@ impl CausalDecoderCache {
     pub(crate) fn layer_kv_for_test(
         &self,
         layer_index: usize,
-    ) -> Option<(&[f32], &[f32], Option<usize>)> {
+    ) -> Option<(Vec<f32>, Vec<f32>, Option<usize>)> {
         self.layers
             .get(layer_index)
-            .map(|layer| (layer.keys.as_slice(), layer.values.as_slice(), layer.kv_dim))
+            .map(|layer| (layer.keys.to_vec(), layer.values.to_vec(), layer.kv_dim))
     }
 }
 

@@ -1174,8 +1174,8 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 .map(|cache| match cache {
                     PrefillResidentLayerCache::Full { key, value } => {
                         PrefillResidentPrefixLayer::Full {
-                            key: key.data(),
-                            value: value.data(),
+                            key: vec![key.data()],
+                            value: vec![value.data()],
                         }
                     }
                     PrefillResidentLayerCache::Linear { state } => {
