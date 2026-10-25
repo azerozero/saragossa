@@ -471,6 +471,43 @@ fn prefix_cache_selects_longest_append_prefix() {
     assert_eq!(generation::longest_prefix_entry_index(&entries, &[9]), None);
 }
 
+/// Le plafond en octets compte une fois les segments partagés et garde
+/// toujours l'entrée la plus récente.
+#[test]
+fn prefix_cache_byte_cap_counts_shared_segments_once() {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())
+        .expect("invariant: poids cohérents");
+    let final_state = Tensor::row(vec![0.0]).expect("invariant: tenseur test valide");
+    let history = || {
+        let mut history = LayerKvCache::default();
+        history.keys.push_owned(vec![0.0; 1000]);
+        history.values.push_owned(vec![0.0; 1000]);
+        history
+    };
+    let shared = history();
+    let entry = |tokens: Vec<usize>, mtp_history: LayerKvCache| PrefixCacheEntry {
+        tokens,
+        cache: model.empty_cache(),
+        final_state: final_state.clone(),
+        mtp_history: Some(mtp_history),
+        captures: None,
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        linear_metal: Vec::new(),
+    };
+    let mut cache = PrefixCache {
+        entries: vec![
+            entry(vec![1, 2, 3], shared.clone()),
+            entry(vec![1, 2], shared),
+            entry(vec![7], history()),
+        ],
+    };
+    let newest = cache.entries[0].estimated_bytes();
+    cache.enforce_byte_cap(newest + 1000);
+    assert_eq!(cache.entries.len(), 2, "segments partagés comptés une fois");
+    cache.enforce_byte_cap(0);
+    assert_eq!(cache.entries.len(), 1, "entrée la plus récente gardée");
+}
+
 /// Un hit DFlash exige les mêmes couches et des captures couvrant la fenêtre
 /// demandée ; une entrée à fenêtre plus courte est ignorée (prefill complet).
 #[test]

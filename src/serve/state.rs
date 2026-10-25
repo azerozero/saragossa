@@ -466,9 +466,10 @@ impl LoadedModel {
                 &options,
                 mtp::max_draft_tokens(),
             )?;
+            let reused = output.stats.reused_prefix_tokens;
             (
                 mtp::into_generation_output(output, started.elapsed()),
-                0,
+                reused,
                 "decoder-longest-prefix",
             )
         } else {
@@ -541,7 +542,7 @@ impl LoadedModel {
         let use_mtp = self.mtp_active
             && mtp::routes_request(&request, response_format)
             && mtp::supports_options(&options);
-        let (prompt_state, reused_prefix_tokens, prefill) = if use_mtp {
+        let (prompt_state, mut reused_prefix_tokens, prefill) = if use_mtp {
             (None, 0, Duration::ZERO)
         } else {
             let (state, reused, elapsed) =
@@ -579,6 +580,8 @@ impl LoadedModel {
                         let start = StreamingCompletionStart {
                             model: self.id.clone(),
                             prompt_tokens,
+                            // NOTE: le hit MTP n'est connu qu'en fin de génération ;
+                            // l'en-tête reste à 0, le journal de fin le porte.
                             reused_prefix_tokens: 0,
                             // Le callback MTP commence après son prefill interne.
                             // Cette mesure inclut au plus le premier pas verify.
@@ -599,6 +602,7 @@ impl LoadedModel {
                     }
                 },
             )?;
+            reused_prefix_tokens = output.stats.reused_prefix_tokens;
             mtp::into_generation_output(output, started.elapsed())
         } else {
             self.decoder
@@ -626,7 +630,7 @@ impl LoadedModel {
             let start = StreamingCompletionStart {
                 model: self.id.clone(),
                 prompt_tokens,
-                reused_prefix_tokens: 0,
+                reused_prefix_tokens,
                 prefill: output.timings.prefill,
             };
             on_event(CompletionStreamEvent::Start(&start))?;

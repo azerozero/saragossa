@@ -1055,6 +1055,19 @@ pub(super) fn prefix_cache_capacity() -> usize {
     })
 }
 
+/// Plafond en octets du prefix-cache du décodeur
+/// (`SARAGOSSA_RUST_PREFIX_CACHE_BYTES`, 16 Gio par défaut, comme celui de
+/// serve). Les segments KV partagés entre entrées comptent une fois ; sans ce
+/// plafond, 4 conversations distinctes de 64k gardaient ~35 Gio de KV f32.
+pub(super) fn prefix_cache_max_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_PREFIX_CACHE_BYTES")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(16 << 30)
+    })
+}
+
 /// Route les requêtes échantillonnées (température > 0) vers le decode MTP
 /// (drafts résidents avec distribution, accept/reject lossless) sur `serve`,
 /// `run` et la CLI. Actif par défaut depuis le 2026-10-21 : 43,8 / 39,4 / 52,4

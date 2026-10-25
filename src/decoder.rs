@@ -401,6 +401,8 @@ pub struct SpeculativeStats {
     /// Boucle DFlash interrompue par la bascule sur acceptance observée, après
     /// ce nombre de tokens générés (le reste revient à la boucle MTP).
     pub dflash_switched_at: Option<usize>,
+    /// Tokens du prompt repris du cache de préfixe au lieu d'être préremplis.
+    pub reused_prefix_tokens: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1255,11 +1257,17 @@ impl PrefixCaptures {
 
 impl PrefixCacheEntry {
     fn estimated_bytes(&self) -> u64 {
+        self.estimated_bytes_unseen(&mut std::collections::HashSet::new())
+    }
+
+    /// Comme [`Self::estimated_bytes`], sans les segments KV déjà dans `seen`
+    /// (partagés avec une entrée plus récente) ; ajoute les siens.
+    fn estimated_bytes_unseen(&self, seen: &mut std::collections::HashSet<usize>) -> u64 {
         let mut bytes = self
             .tokens
             .len()
             .saturating_mul(std::mem::size_of::<usize>())
-            .saturating_add(self.cache.estimated_cpu_bytes())
+            .saturating_add(self.cache.estimated_cpu_bytes_unseen(seen))
             .saturating_add(
                 self.final_state
                     .len()
@@ -1268,9 +1276,8 @@ impl PrefixCacheEntry {
             .saturating_add(self.mtp_history.as_ref().map_or(0, |history| {
                 history
                     .keys
-                    .len()
-                    .saturating_add(history.values.len())
-                    .saturating_mul(std::mem::size_of::<f32>())
+                    .capacity_bytes_unseen(seen)
+                    .saturating_add(history.values.capacity_bytes_unseen(seen))
             }))
             .saturating_add(self.captures.as_ref().map_or(0, |captures| {
                 captures
@@ -1295,6 +1302,22 @@ impl PrefixCacheEntry {
 impl PrefixCache {
     fn evict_lru_entry(&mut self) -> Option<u64> {
         self.entries.pop().map(|entry| entry.estimated_bytes())
+    }
+
+    /// Évince les entrées les moins récentes au-delà de `max_bytes`, segments
+    /// partagés comptés une fois ; l'entrée la plus récente reste toujours.
+    fn enforce_byte_cap(&mut self, max_bytes: u64) {
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0u64;
+        let keep = self
+            .entries
+            .iter()
+            .position(|entry| {
+                total = total.saturating_add(entry.estimated_bytes_unseen(&mut seen));
+                total > max_bytes
+            })
+            .map_or(self.entries.len(), |index| index.max(1));
+        self.entries.truncate(keep);
     }
 }
 
