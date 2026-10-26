@@ -192,15 +192,20 @@ impl MetalExecutor {
             ) = (prefix_layer, &cache)
             {
                 let prefix_len = checked_len(start, kv_dim, "préfixe résident kv")?;
-                if key.len() != prefix_len || value.len() != prefix_len {
+                let key_len: usize = key.iter().map(|segment| segment.len()).sum();
+                let value_len: usize = value.iter().map(|segment| segment.len()).sum();
+                if key_len != prefix_len || value_len != prefix_len {
                     return Err(InferError::Dimension(format!(
-                        "préfixe résident KV couche {layer_index}: {}/{} attendu {prefix_len}",
-                        key.len(),
-                        value.len()
+                        "préfixe résident KV couche {layer_index}: {key_len}/{value_len} attendu {prefix_len}"
                     )));
                 }
-                write_f32_buffer(key_cache, key)?;
-                write_f32_buffer(value_cache, value)?;
+                for (buffer, segments) in [(key_cache, key), (value_cache, value)] {
+                    let mut offset = 0;
+                    for segment in segments {
+                        write_f32_buffer_at(buffer, offset, segment)?;
+                        offset += segment.len();
+                    }
+                }
             }
             layer_cache_buffers.push(cache);
         }

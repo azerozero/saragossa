@@ -273,8 +273,8 @@ fn compare_prefill_paths(
                 resident_value.len()
             );
         }
-        let k_delta = max_abs_delta(per_key, resident_key);
-        let v_delta = max_abs_delta(per_value, resident_value);
+        let k_delta = max_abs_delta(&per_key, &resident_key);
+        let v_delta = max_abs_delta(&per_value, &resident_value);
         for (kind, delta) in [("K", k_delta), ("V", v_delta)] {
             if delta > largest.2 {
                 largest = (layer, kind, delta);

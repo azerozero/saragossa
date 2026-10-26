@@ -208,7 +208,18 @@ impl BlockAwarePrefixCache {
     /// Renvoie l'empreinte estimée des snapshots.
     #[must_use]
     pub(super) fn estimated_bytes(&self) -> usize {
-        self.entries.iter().map(|entry| entry.bytes).sum()
+        // Les blocs d'une même conversation partagent les segments KV de leur
+        // préfixe : chaque segment ne compte qu'une fois.
+        let mut seen = std::collections::HashSet::new();
+        self.entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .state
+                    .estimated_cpu_bytes_unseen(&mut seen)
+                    .saturating_add(entry.metal.estimated_bytes())
+            })
+            .sum()
     }
 
     fn session_block_count(&self, session: BlockHash) -> usize {

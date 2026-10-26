@@ -64,7 +64,11 @@ impl CausalDecoder {
         };
         mtp.pending_append_count = 0;
         Self::reset_mtp_append_oracle(mtp);
-        mtp.kv.seed(&history.keys, &history.values, history.len())
+        mtp.kv.seed_segments(
+            &history.keys.segments().collect::<Vec<_>>(),
+            &history.values.segments().collect::<Vec<_>>(),
+            history.len(),
+        )
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]

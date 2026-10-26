@@ -1276,18 +1276,20 @@ fn layer_kv_cache_clone_shares_rows_until_written() -> Result<()> {
     let mut cache = LayerKvCache::default();
     cache.append(&row(1.0, 2.0)?, &row(3.0, 4.0)?, &layout)?;
     let snapshot = cache.clone();
-    assert!(std::sync::Arc::ptr_eq(&cache.keys, &snapshot.keys));
-    assert!(std::sync::Arc::ptr_eq(&cache.values, &snapshot.values));
+    assert!(cache.keys.shares_segments_with(&snapshot.keys));
+    assert!(cache.values.shares_segments_with(&snapshot.values));
 
     cache.append(&row(5.0, 6.0)?, &row(7.0, 8.0)?, &layout)?;
     assert_eq!(cache.len(), 2);
     assert_eq!(snapshot.len(), 1);
-    assert_eq!(*snapshot.keys, vec![1.0, 2.0]);
-    assert_eq!(*cache.keys, vec![1.0, 2.0, 5.0, 6.0]);
+    assert_eq!(snapshot.keys.to_vec(), vec![1.0, 2.0]);
+    assert_eq!(cache.keys.to_vec(), vec![1.0, 2.0, 5.0, 6.0]);
+    // Le préfixe reste partagé après l'ajout : aucune recopie.
+    assert!(cache.keys.shares_segments_with(&snapshot.keys));
 
     let shared = cache.clone();
     cache.truncate(2)?;
-    assert!(std::sync::Arc::ptr_eq(&cache.keys, &shared.keys));
+    assert!(cache.keys.shares_segments_with(&shared.keys));
     cache.truncate(1)?;
     assert_eq!(shared.len(), 2);
     assert_eq!(cache.len(), 1);
@@ -1356,8 +1358,8 @@ fn full_attention_append_kv_rows_matches_prefill_cache_bytes() -> Result<()> {
     }
     assert_eq!(kv_only.len(), 5);
     assert_eq!(kv_only.len(), with_attention.len());
-    assert_eq!(kv_only.keys, with_attention.keys);
-    assert_eq!(kv_only.values, with_attention.values);
+    assert_eq!(kv_only.keys.to_vec(), with_attention.keys.to_vec());
+    assert_eq!(kv_only.values.to_vec(), with_attention.values.to_vec());
     assert_eq!(kv_only.kv_dim, with_attention.kv_dim);
     Ok(())
 }

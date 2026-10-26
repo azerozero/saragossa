@@ -1,7 +1,5 @@
 //! Mise à jour du cache K/V attention.
 
-use std::sync::Arc;
-
 use super::attention_ops::AttentionLayout;
 use super::*;
 
@@ -32,12 +30,38 @@ impl LayerKvCache {
             Some(_) => {}
             None => self.kv_dim = Some(expected_dim),
         }
-        Arc::make_mut(&mut self.keys).extend_from_slice(key.data());
-        Arc::make_mut(&mut self.values).extend_from_slice(value.data());
+        self.keys.extend_from_slice(key.data());
+        self.values.extend_from_slice(value.data());
         Ok(())
     }
 
     pub(super) fn append_batch(
+        &mut self,
+        key: &Tensor,
+        value: &Tensor,
+        layout: &AttentionLayout,
+    ) -> Result<()> {
+        self.check_batch(key, value, layout)?;
+        self.keys.extend_from_slice(key.data());
+        self.values.extend_from_slice(value.data());
+        Ok(())
+    }
+
+    /// Comme [`Self::append_batch`], en reprenant les données sans copie : le
+    /// KV relu du prefill devient un segment du cache.
+    pub(super) fn append_batch_owned(
+        &mut self,
+        key: Tensor,
+        value: Tensor,
+        layout: &AttentionLayout,
+    ) -> Result<()> {
+        self.check_batch(&key, &value, layout)?;
+        self.keys.push_owned(key.into_data());
+        self.values.push_owned(value.into_data());
+        Ok(())
+    }
+
+    fn check_batch(
         &mut self,
         key: &Tensor,
         value: &Tensor,
@@ -66,8 +90,6 @@ impl LayerKvCache {
             Some(_) => {}
             None => self.kv_dim = Some(expected_dim),
         }
-        Arc::make_mut(&mut self.keys).extend_from_slice(key.data());
-        Arc::make_mut(&mut self.values).extend_from_slice(value.data());
         Ok(())
     }
 
@@ -96,12 +118,8 @@ impl LayerKvCache {
                 self.len()
             )));
         }
-        if new_len != self.keys.len() {
-            Arc::make_mut(&mut self.keys).truncate(new_len);
-        }
-        if new_len != self.values.len() {
-            Arc::make_mut(&mut self.values).truncate(new_len);
-        }
+        self.keys.truncate(new_len);
+        self.values.truncate(new_len);
         Ok(())
     }
 }
