@@ -1368,10 +1368,30 @@ impl CausalDecoder {
         let trace_setup = false;
         let t_prefill = trace_setup.then(Instant::now);
         let use_committed_mtp_history = mtp_history_policy() == MtpHistoryPolicy::Committed;
+        let mut sampler = DeterministicSampler::new(options.seed);
+        // Premier token tiré et émis dès le dernier état du prefill, avant le
+        // semis de l'historique MTP et la mise en place des arènes : ceux-ci ne
+        // conditionnent que les drafts suivants (~1,4 s de TTFT à 32k). Le bloc
+        // GPU (devtools) gère sa propre émission.
+        let mut first_token = None;
+        let mut early_emitted = false;
+        let mut early_stop = false;
         let (mut cache, final_state, mut mtp_history_cache, reused_prefix_tokens) =
             if use_committed_mtp_history {
+                let mut on_final_state = |state: &Tensor| -> Result<()> {
+                    let token = self.sample_token_from_state(state, options, &mut sampler)?;
+                    first_token = Some(token);
+                    if !options.stop_token_ids.contains(&token)
+                        && crate::runtime_flags::mtp_early_first_token_enabled()
+                        && !crate::runtime_flags::mtp_gpu_block_enabled()
+                    {
+                        early_emitted = true;
+                        early_stop = !on_token(token);
+                    }
+                    Ok(())
+                };
                 let (cache, final_state, mtp_history, reused) =
-                    self.prefill_cache_state_with_mtp_history(prompt)?;
+                    self.prefill_cache_state_with_mtp_history(prompt, &mut on_final_state)?;
                 (cache, final_state, Some(mtp_history), reused)
             } else {
                 let (cache, final_state, reused) = self.prefill_cache_state_reused(prompt)?;
@@ -1429,13 +1449,20 @@ impl CausalDecoder {
                 }
             }
         }
-        let mut sampler = DeterministicSampler::new(options.seed);
-        let mut pending = self.sample_token_from_state(&final_state, options, &mut sampler)?;
+        let mut pending = match first_token {
+            Some(token) => token,
+            None => self.sample_token_from_state(&final_state, options, &mut sampler)?,
+        };
         let mut generated = Vec::with_capacity(max_new_tokens);
         // Streaming : `emitted` = nb de tokens déjà passés à `on_token` ; émis en
         // tête d'itération pour capturer tous les chemins de commit (dont `continue`).
         let mut emitted = 0usize;
         let mut stop_streaming = false;
+        if early_stop {
+            // L'appelant a refusé la suite dès le premier token, déjà émis.
+            generated.push(pending);
+            emitted = 1;
+        }
         let mut stats = SpeculativeStats {
             reused_prefix_tokens,
             ..SpeculativeStats::default()
@@ -1487,7 +1514,7 @@ impl CausalDecoder {
         let overlap_stream = crate::runtime_flags::mtp_overlap_stream_enabled();
         let decode_started = Instant::now();
 
-        while generated.len() < max_new_tokens {
+        while !early_stop && generated.len() < max_new_tokens {
             let committed_prefix = generated.len();
             let defer_emit = overlap_stream
                 && emitted < committed_prefix
@@ -1544,6 +1571,9 @@ impl CausalDecoder {
                 }
             }
             generated.push(primary);
+            if early_emitted && generated.len() == 1 {
+                emitted = 1;
+            }
             if generated.len() >= max_new_tokens {
                 break;
             }
@@ -3672,15 +3702,18 @@ impl CausalDecoder {
 
     /// Prefill avec historique MTP committed ; la quatrième valeur compte les
     /// tokens du prompt repris du cache de préfixe.
+    /// `on_final_state` reçoit l'état normé de la dernière position dès qu'il
+    /// est connu, avant le semis de l'historique MTP.
     fn prefill_cache_state_with_mtp_history(
         &self,
         prompt: &[usize],
+        on_final_state: &mut dyn FnMut(&Tensor) -> Result<()>,
     ) -> Result<(CausalDecoderCache, Tensor, LayerKvCache, usize)> {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
         if prefix_cache_enabled() {
-            if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt)? {
+            if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt, on_final_state)? {
                 return Ok(hit);
             }
         }
@@ -3733,6 +3766,7 @@ impl CausalDecoder {
         if let Some(t) = t_main {
             eprintln!("mtp_setup prefill_main_us={}", t.elapsed().as_micros());
         }
+        on_final_state(&final_state)?;
         let t_history = trace_setup.then(Instant::now);
         let mut mtp_history = LayerKvCache::default();
         let seeded = prompt.len().saturating_sub(1);
@@ -3952,6 +3986,7 @@ impl CausalDecoder {
     fn prefix_cache_get_with_mtp_history(
         &self,
         prompt: &[usize],
+        on_final_state: &mut dyn FnMut(&Tensor) -> Result<()>,
     ) -> Result<Option<(CausalDecoderCache, Tensor, LayerKvCache, usize)>> {
         let Some((mut output, cached_len, Some(mut history), _)) =
             self.prefix_cache_hit(prompt, true)?
@@ -3962,9 +3997,13 @@ impl CausalDecoder {
             let suffix = &prompt[cached_len..];
             let (final_states, _) =
                 self.forward_suffix_batched(&mut output.0, suffix, None, true)?;
+            let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
+            on_final_state(&final_state)?;
             self.extend_mtp_history_suffix(&output.1, &final_states, suffix, &mut history)?;
-            output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
+            output.1 = final_state;
             self.prefix_cache_put(prompt, &output, Some(&history), None)?;
+        } else {
+            on_final_state(&output.1)?;
         }
         Ok(Some((output.0, output.1, history, cached_len)))
     }
