@@ -4395,6 +4395,7 @@ impl CausalDecoder {
             &layers,
             spec,
             capture_layer_ids,
+            crate::runtime_flags::prefill_resident_chunk_tokens(),
         ) {
             Ok((final_hidden, layer_states, captures)) => {
                 if layer_states.len() != self.layers.len() {

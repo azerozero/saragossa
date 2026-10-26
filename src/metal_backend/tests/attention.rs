@@ -535,7 +535,7 @@ fn causal_attention_prefill_with_steel_d256_pipeline(
         value_norm: false,
         eps: 0.0,
     };
-    let params = attention::steel_attn_params(spec, 32, 64, "test steel causal d256")?;
+    let params = attention::steel_attn_params(spec, 32, 64, spec.seq, "test steel causal d256")?;
 
     let command_buffer = executor.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();

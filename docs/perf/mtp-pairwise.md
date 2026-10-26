@@ -727,6 +727,26 @@ top1-top2 au premier écart 0,0001 à 0,011 contre 2,3 en médiane, mêmes deux
 tokens inversés, logit top1 décalé d'au plus 0,16 avant l'écart). Défaut ON,
 kill-switch `SARAGOSSA_RUST_PREFILL_ATTN_NAX=0`.
 
+### Prefill résident par morceaux (24 oct. 2026)
+
+Le prefill résident traite le prompt par morceaux égaux d'au plus 4096 tokens
+(`SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK`, 0 pour désactiver). Les buffers
+intermédiaires sont dimensionnés sur un morceau ; seuls le KV pleine longueur
+des couches d'attention complète et l'état conv/SSM des couches linéaires
+survivent d'un morceau au suivant. La RoPE reçoit la position absolue de la
+première ligne, l'attention Steel/NAX lit les clés `[0, fin du morceau)` avec
+`qL_off`. Les modèles hors périmètre Steel/NAX d256 restent en un morceau.
+
+| 27B, `saragossa bench` | un morceau | morceaux 4096 |
+|---|---|---|
+| pic de footprint 32k | 46,0 Go | 30,4 Go |
+| prefill 32k | 594 tok/s | 617 tok/s |
+| pic de footprint 64k | 73 Go | 38,1 Go |
+
+L'oracle synthétique (couche linéaire dk128 + attention gated 16/2 d256,
+1100 tokens en 3 morceaux) est bit-exact ; les textes greedy AR serve sont
+identiques sur 8k, 16k et 32k.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

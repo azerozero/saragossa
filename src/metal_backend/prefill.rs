@@ -99,7 +99,6 @@ struct PrefillResidentFullAttentionScratch {
 
 struct PrefillResidentLinearAttentionScratch {
     output: Buffer,
-    state: LinearAttentionMetalState,
 }
 
 enum PrefillResidentAttentionScratch {
@@ -353,6 +352,7 @@ impl MetalExecutor {
             &q_rope_buffer,
             spec,
             spec.q_heads,
+            0,
         )?;
         self.encode_rms_norm_rope_heads(
             encoder,
@@ -361,6 +361,7 @@ impl MetalExecutor {
             &k_rope_buffer,
             spec,
             spec.kv_heads,
+            0,
         )?;
         self.encode_causal_attention_prefill(
             encoder,
@@ -682,8 +683,24 @@ impl MetalExecutor {
             spec.q_heads,
             spec.head_dim,
         )?;
-        self.encode_rms_norm_rope_heads(encoder, &q, &q_norm_buffer, &q_rope, spec, spec.q_heads)?;
-        self.encode_rms_norm_rope_heads(encoder, &k, &k_norm_buffer, &k_rope, spec, spec.kv_heads)?;
+        self.encode_rms_norm_rope_heads(
+            encoder,
+            &q,
+            &q_norm_buffer,
+            &q_rope,
+            spec,
+            spec.q_heads,
+            0,
+        )?;
+        self.encode_rms_norm_rope_heads(
+            encoder,
+            &k,
+            &k_norm_buffer,
+            &k_rope,
+            spec,
+            spec.kv_heads,
+            0,
+        )?;
         self.encode_causal_attention_prefill(encoder, &q_rope, &k_rope, &v, &context, spec)?;
         self.encode_attn_gate_rows(encoder, &context, &gate, &gated, q_len)?;
         self.encode_matmul_weight(
