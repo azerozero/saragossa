@@ -1245,3 +1245,64 @@ fn cpu_topk_softmax_reference(logits: &[f32], top_k: usize) -> (Vec<usize>, Vec<
     let scores = exps.iter().map(|&value| value / denom).collect();
     (indices, scores)
 }
+
+/// Oracle CPU du kernel NAX (Q/K/V arrondis en bf16 côté oracle aussi : reste
+/// l'accumulation f32 et P converti pour le MMA). (16, 2) couvre le 35B, (24, 4)
+/// le 27B ; les longueurs ≡ 17 et 45 mod 64 et les lignes 64k+16/32/48/63
+/// exercent les quatre groupes de lignes, la tuile Q partielle et le dernier bloc
+/// K partiel (`kL_rem`). Écart mesuré 2,5e-4 (M5 Max) : tolérance 1e-3, sous
+/// le poids d'une colonne fantôme au dernier bloc K (≈ 1/seq, 3,7e-3 à 273).
+/// Sans accélérateur neuronal, pipeline absent : ignoré.
+#[test]
+fn causal_attention_prefill_nax_d256_matches_cpu_selected_rows() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    executor.causal_attention_prefill_steel_nax_d256 =
+        pipelines::compile_steel_causal_nax_d256_attention(
+            &executor.device,
+            STEEL_ATTENTION_NAX_KERNELS,
+        );
+    if executor.causal_attention_prefill_steel_nax_d256.is_none() {
+        return Ok(());
+    }
+    let round = |tensor: &Tensor| -> Result<Tensor> {
+        let (rows, cols) = tensor.as_matrix()?;
+        Tensor::from_vec(
+            vec![rows, cols],
+            tensor.data().iter().copied().map(bf16_round).collect(),
+        )
+    };
+    let mut worst = 0.0_f32;
+    for (q_heads, kv_heads) in [(16_usize, 2_usize), (24, 4)] {
+        for seq in [273_usize, 1069, 2049] {
+            let (q, k, v) = causal_attention_inputs(seq, q_heads, kv_heads, 256)?;
+            let got = executor.causal_attention_prefill(&q, &k, &v, q_heads, kv_heads)?;
+            let tile = seq / 64 * 64;
+            let mut rows = vec![0, 1, 16, 33, 48, 63, tile - 1, seq - 2, seq - 1];
+            if seq % 64 > 16 {
+                rows.push(tile + 16);
+            }
+            let expected = cpu_causal_attention_selected_rows_gqa(
+                &round(&q)?,
+                &round(&k)?,
+                &round(&v)?,
+                q_heads,
+                kv_heads,
+                &rows,
+            )?;
+            let (_, dim) = got.as_matrix()?;
+            for (row, want) in &expected {
+                let start = row * dim;
+                for (a, b) in got.data()[start..start + dim].iter().zip(want) {
+                    worst = worst.max((a - b).abs());
+                }
+            }
+        }
+    }
+    eprintln!("nax d256 écart max contre CPU (entrées bf16) : {worst:e}");
+    assert!(worst <= NAX_D256_TOLERANCE, "écart {worst:e}");
+    Ok(())
+}
+
+const NAX_D256_TOLERANCE: f32 = 1.0e-3;
