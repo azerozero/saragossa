@@ -1,6 +1,7 @@
 //! Couches d'embedding et extraction de lignes de tokens.
 
 use crate::{AffineQuantizedTensor, InferError, Result, Tensor};
+use rayon::prelude::*;
 
 #[derive(Clone, Debug, PartialEq)]
 /// Décrit le stockage des poids d'embedding.
@@ -102,15 +103,21 @@ fn embed_quantized_tokens(table: &AffineQuantizedTensor, token_ids: &[usize]) ->
     if token_ids.is_empty() {
         return Err(InferError::Dimension("séquence de tokens vide".to_string()));
     }
-    let mut out = Vec::with_capacity(token_ids.len() * dim);
-    for token_id in token_ids {
-        if *token_id >= *vocab {
-            return Err(InferError::Dimension(format!(
-                "token id {token_id} hors vocab {vocab}"
-            )));
-        }
-        out.extend(table.row(*token_id)?);
+    if let Some(token_id) = token_ids.iter().find(|&&id| id >= *vocab) {
+        return Err(InferError::Dimension(format!(
+            "token id {token_id} hors vocab {vocab}"
+        )));
     }
+    // Déquantification parallèle par ligne (chaque ligne est indépendante,
+    // byte-identique) : en série elle coûtait ~55 µs par token, soit ~1,8 s
+    // sur le chemin du prefill d'un prompt de 32k.
+    let mut out = vec![0.0_f32; token_ids.len() * dim];
+    out.par_chunks_mut((*dim).max(1))
+        .zip(token_ids.par_iter())
+        .try_for_each(|(out_row, &token_id)| -> Result<()> {
+            out_row.copy_from_slice(&table.row(token_id)?);
+            Ok(())
+        })?;
     Tensor::from_vec(vec![token_ids.len(), *dim], out)
 }
 
