@@ -28,6 +28,8 @@ const STEEL_CAUSAL_ATTN_D256_F32_BQ32_BK64_BD64X4: &str =
     "steel_attention_float32_bq32_bk64_bd64x4_wm4_wn1_causal_d256";
 #[cfg(all(target_os = "macos", feature = "metal"))]
 const STEEL_ATTENTION_NAX_KERNELS: &str = include_str!("../../assets/steel_attention_nax.metal");
+const GATED_DELTA_NAX_KERNELS: &str = include_str!("../../assets/gated_delta_nax.metal");
+const GATED_DELTA_NAX_HK16_HV48: &str = "gated_delta_fused_nax_f32_dk128_dv128_hk16_hv48_c16";
 const STEEL_CAUSAL_ATTN_NAX_D256: &str =
     "steel_attention_nax_dsplit_bf16_f32out_bq64_bk32_bd256_wm4_wn2";
 const MAX_MOE_TOP_K: usize = 16;
@@ -290,6 +292,8 @@ pub struct MetalExecutor {
     na_gemm_bf16_bn128: Option<ComputePipelineState>,
     pub(super) chunk_delta_seq_layout: Option<ComputePipelineState>,
     pub(super) chunk_delta_seq_layout_tc: Option<ComputePipelineState>,
+    /// Gated delta NAX de MLX (27B : 16/48 têtes, dk = dv = 128).
+    pub(super) gated_delta_nax_hk16_hv48: Option<ComputePipelineState>,
     na_gemm_coop_qb: Option<ComputePipelineState>,
     na_gemm_coop_qb_gs128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled: Option<ComputePipelineState>,
@@ -696,6 +700,23 @@ pub(crate) struct PrefillMoeLayer<'a> {
     pub post_norm: &'a Tensor,
     pub post_norm_before_residual: bool,
     pub tail: PrefillMoeTail<'a>,
+}
+
+/// Préfixe déjà calculé d'un prefill prolongé : `rows` positions, puis par
+/// couche le KV CPU `[rows, kv_dim]` ou l'état linéaire GPU, mis à jour en place.
+pub(crate) struct PrefillResidentPrefix<'a> {
+    pub rows: usize,
+    pub layers: Vec<PrefillResidentPrefixLayer<'a>>,
+}
+
+pub(crate) enum PrefillResidentPrefixLayer<'a> {
+    Full {
+        key: &'a [f32],
+        value: &'a [f32],
+    },
+    Linear {
+        state: &'a LinearAttentionMetalState,
+    },
 }
 
 #[derive(Debug)]

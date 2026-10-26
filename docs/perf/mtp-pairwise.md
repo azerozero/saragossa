@@ -747,6 +747,33 @@ L'oracle synthétique (couche linéaire dk128 + attention gated 16/2 d256,
 1100 tokens en 3 morceaux) est bit-exact ; les textes greedy AR serve sont
 identiques sur 8k, 16k et 32k.
 
+### Extension de préfixe et gated delta NAX (25 oct. 2026)
+
+L'extension d'un préfixe en cache passe par le même prefill résident : le KV
+du préfixe est recopié vers le GPU, l'état linéaire avance en place, et seules
+les lignes du suffixe sont relues. Serve AR, préfixe d'environ 10k tokens,
+`x-saragossa-prefill-ms` :
+
+| suffixe | extension en lignes | prefill résident |
+|---|---|---|
+| 4-16 | 271-309 ms | 280-306 ms |
+| 32 | 372 ms | 342 ms |
+| 128 | 591 ms | 450 ms |
+| 550 | 2 200 ms | 1 444 ms |
+| 3 537 | 12 447 ms | 5 667 ms |
+
+Seuil par défaut à 32 tokens (`SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT_MIN`).
+Textes greedy identiques au prefill à froid sur 2 prompts prolongés sur 3 ; le
+troisième s'inverse sur un near-tie (marge 0,0045 logit, écart des logits
+~0,007 entre chemins). Le chemin MTP serve n'est pas concerné : son cache
+`decoder-longest-prefix` n'accepte qu'une entrée entière préfixe du prompt.
+
+La récurrence gated delta du prefill linéaire utilise le noyau
+`gated_delta_fused_nax` de MLX (assets/gated_delta_nax.metal) : prefill 32k
+588-598 → 630-651 tok/s, TTFT serve 32k 55,8 → 52,2 s, oracle naïf 3,8e-4.
+Textes greedy AR identiques à 16k et 32k ; à 8k, divergence au 1 775e
+caractère sur 1 783.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

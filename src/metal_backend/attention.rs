@@ -84,8 +84,12 @@ fn prefill_attn_batch_gqa8_d256_supported(spec: PrefillAttentionSpec) -> bool {
 }
 
 pub(super) fn prefill_attn_steel_d256_supported(spec: PrefillAttentionSpec) -> bool {
-    spec.seq > 256
-        && matches!((spec.q_heads, spec.kv_heads), (16, 2) | (24, 4))
+    spec.seq > 256 && prefill_attn_steel_d256_shape_supported(spec)
+}
+
+/// Têtes et dimension couvertes par le Steel/NAX d256, quel que soit `seq`.
+fn prefill_attn_steel_d256_shape_supported(spec: PrefillAttentionSpec) -> bool {
+    matches!((spec.q_heads, spec.kv_heads), (16, 2) | (24, 4))
         && spec.head_dim == STEEL_CAUSAL_ATTN_D256_BD
 }
 
@@ -1339,7 +1343,7 @@ impl MetalExecutor {
     ) -> bool {
         crate::runtime_flags::prefill_attn_steel_d256_enabled()
             && spec.window.is_none()
-            && prefill_attn_steel_d256_supported(spec)
+            && prefill_attn_steel_d256_shape_supported(spec)
             && (self.causal_attention_prefill_steel_nax_d256.is_some()
                 || self.causal_attention_prefill_steel_d256_f32.is_some())
     }
@@ -1355,9 +1359,14 @@ impl MetalExecutor {
         kv_rows: usize,
         kv_capacity: usize,
     ) -> Result<bool> {
-        if !crate::runtime_flags::prefill_attn_steel_d256_enabled()
-            || !prefill_attn_steel_d256_supported(spec)
-        {
+        // NOTE: le seuil seq > 256 est un choix de perf du prefill en un bloc ;
+        // un morceau (kv_rows > seq) passe toujours par le Steel/NAX.
+        let in_scope = if kv_rows > spec.seq {
+            prefill_attn_steel_d256_shape_supported(spec)
+        } else {
+            prefill_attn_steel_d256_supported(spec)
+        };
+        if !crate::runtime_flags::prefill_attn_steel_d256_enabled() || !in_scope {
             return Ok(false);
         }
         // NAX (accélérateurs neuronaux) d'abord : Q/K/V convertis en bf16 comme
