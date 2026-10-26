@@ -360,7 +360,7 @@ pub(super) fn full_attention_context_prefill(
     runtime: ForwardRuntime<'_>,
 ) -> Result<Tensor> {
     let (q, gate, k, v, layout) =
-        full_attention_prepare_rows(config, normed, position_offset, attention, runtime)?;
+        full_attention_prepare_rows(config, normed, position_offset, attention, runtime, true)?;
     let mut context = if cache.len() == 0 {
         cache.append_batch(&k, &v, &layout)?;
         causal_attention(&q, &k, &v, &layout)?
@@ -387,22 +387,28 @@ pub(super) fn full_attention_append_kv_rows(
     runtime: ForwardRuntime<'_>,
 ) -> Result<()> {
     let (_, _, k, v, layout) =
-        full_attention_prepare_rows(config, normed, position_offset, attention, runtime)?;
+        full_attention_prepare_rows(config, normed, position_offset, attention, runtime, false)?;
     cache.append_batch(&k, &v, &layout)
 }
 
 type PreparedAttentionRows = (Tensor, Option<Tensor>, Tensor, Tensor, AttentionLayout);
 
 /// Projette q/k/v, applique les normes de tête et le RoPE à partir de
-/// `position_offset`, et renvoie `(q, gate, k, v, layout)`.
+/// `position_offset`, et renvoie `(q, gate, k, v, layout)`. Sans `with_q`, Q
+/// n'est pas projeté et reste vide (`[0, q]`) : seuls K et V sont calculés.
 fn full_attention_prepare_rows(
     config: &CausalDecoderConfig,
     normed: &Tensor,
     position_offset: usize,
     attention: &FullAttention,
     runtime: ForwardRuntime<'_>,
+    with_q: bool,
 ) -> Result<PreparedAttentionRows> {
-    let (q_projection, k_projection, mut v) = project_qkv(normed, attention, runtime)?;
+    let (q_projection, k_projection, mut v) = if with_q {
+        project_qkv(normed, attention, runtime)?
+    } else {
+        project_kv(normed, attention, runtime)?
+    };
     let (mut q, gate) = split_attention_gate(config, &q_projection)?;
     let mut k = k_projection;
     let layout = attention_layout(config, attention, &q, &k, &v)?;
@@ -500,12 +506,9 @@ pub(super) fn project_qkv(
                 .v_proj
                 .as_ref()
                 .expect("invariant: v_proj présent dans le chemin Metal triple");
-            return metal.project_three_biasless(
-                normed,
-                &attention.q_proj,
-                &attention.k_proj,
-                v_proj,
-            );
+            let [q, k, v] =
+                metal.project_biasless(normed, [&attention.q_proj, &attention.k_proj, v_proj])?;
+            return Ok((q, k, v));
         }
     }
     let q = attention.q_proj.forward_with_runtime(normed, runtime)?;
@@ -515,6 +518,41 @@ pub(super) fn project_qkv(
         None => k.clone(),
     };
     Ok((q, k, v))
+}
+
+/// K et V comme [`project_qkv`] (chaque projection est indépendante, mêmes
+/// octets), Q rendu vide `[0, q]` : le semis de l'historique MTP ne garde que
+/// le cache K/V, et Q pesait 12× K ou V en projection, relecture et RoPE CPU.
+fn project_kv(
+    normed: &Tensor,
+    attention: &FullAttention,
+    runtime: ForwardRuntime<'_>,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let q_out = attention
+        .q_proj
+        .weight()
+        .shape()
+        .first()
+        .copied()
+        .ok_or_else(|| InferError::Dimension("q_proj sans dimension de sortie".to_string()))?;
+    let empty_q = Tensor::from_vec(vec![0, q_out], Vec::new())?;
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if let Some(metal) = runtime.metal_executor() {
+        if let Some(v_proj) = attention
+            .v_proj
+            .as_ref()
+            .filter(|v_proj| attention.k_proj.bias().is_none() && v_proj.bias().is_none())
+        {
+            let [k, v] = metal.project_biasless(normed, [&attention.k_proj, v_proj])?;
+            return Ok((empty_q, k, v));
+        }
+    }
+    let k = attention.k_proj.forward_with_runtime(normed, runtime)?;
+    let v = match &attention.v_proj {
+        Some(v_proj) => v_proj.forward_with_runtime(normed, runtime)?,
+        None => k.clone(),
+    };
+    Ok((empty_q, k, v))
 }
 
 pub(super) fn split_attention_gate(

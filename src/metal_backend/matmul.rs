@@ -592,176 +592,70 @@ impl MetalExecutor {
         Tensor::from_vec(vec![batch, *out_dim], output)
     }
 
-    /// Projette trois couches linéaires indépendantes dans une seule commande.
+    /// Projette `N` couches linéaires indépendantes sur la même entrée dans une
+    /// seule commande ; chaque projection garde son propre noyau, donc les
+    /// mêmes octets qu'une projection seule.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si une projection porte un biais ou si les dimensions
     /// sont incompatibles avec l'entrée.
-    pub(crate) fn project_three_biasless(
+    pub(crate) fn project_biasless<const N: usize>(
         &self,
         input: &Tensor,
-        first: &Linear,
-        second: &Linear,
-        third: &Linear,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        ensure_biasless(first, "first")?;
-        ensure_biasless(second, "second")?;
-        ensure_biasless(third, "third")?;
+        linears: [&Linear; N],
+    ) -> Result<[Tensor; N]> {
+        for linear in linears {
+            ensure_biasless(linear, "projection")?;
+        }
         let (batch, in_dim) = input.as_matrix()?;
-        let first_dim = linear_out_dim(first.weight())?;
-        let second_dim = linear_out_dim(second.weight())?;
-        let third_dim = linear_out_dim(third.weight())?;
-        let input_buffer = self.upload_f32_buffer(input.data(), "project3_input")?;
-        let first_buffer = self.new_f32_buffer(
-            checked_len(batch, first_dim, "project3 first")?,
-            "project3_first",
-        )?;
-        let second_buffer = self.new_f32_buffer(
-            checked_len(batch, second_dim, "project3 second")?,
-            "project3_second",
-        )?;
-        let third_buffer = self.new_f32_buffer(
-            checked_len(batch, third_dim, "project3 third")?,
-            "project3_third",
-        )?;
+        let input_buffer = self.upload_f32_buffer(input.data(), "project_input")?;
+        // Un label par sortie : le scratch est indexé par label et taille, deux
+        // sorties de même forme partageraient sinon le même buffer.
+        const LABELS: [&str; 4] = [
+            "project_out0",
+            "project_out1",
+            "project_out2",
+            "project_out3",
+        ];
+        if N > LABELS.len() {
+            return Err(InferError::Config(format!("{N} projections, au plus 4")));
+        }
+        let mut outputs = Vec::with_capacity(N);
+        for (linear, label) in linears.iter().zip(LABELS) {
+            let out_dim = linear_out_dim(linear.weight())?;
+            let buffer = self.new_f32_buffer(checked_len(batch, out_dim, "project out")?, label)?;
+            outputs.push((out_dim, buffer));
+        }
         let mut owned_buffers = Vec::new();
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
-        self.encode_matmul_weight(
-            encoder,
-            &mut owned_buffers,
-            &input_buffer,
-            batch,
-            in_dim,
-            first.weight(),
-            &first_buffer,
-        )?;
-        self.encode_matmul_weight(
-            encoder,
-            &mut owned_buffers,
-            &input_buffer,
-            batch,
-            in_dim,
-            second.weight(),
-            &second_buffer,
-        )?;
-        self.encode_matmul_weight(
-            encoder,
-            &mut owned_buffers,
-            &input_buffer,
-            batch,
-            in_dim,
-            third.weight(),
-            &third_buffer,
-        )?;
+        for (linear, (_, buffer)) in linears.iter().zip(&outputs) {
+            self.encode_matmul_weight(
+                encoder,
+                &mut owned_buffers,
+                &input_buffer,
+                batch,
+                in_dim,
+                linear.weight(),
+                buffer,
+            )?;
+        }
         encoder_guard.end();
         commit_and_wait(command_buffer)?;
-
-        let first = read_f32_buffer(&first_buffer, batch * first_dim)?;
-        let second = read_f32_buffer(&second_buffer, batch * second_dim)?;
-        let third = read_f32_buffer(&third_buffer, batch * third_dim)?;
-        Ok((
-            Tensor::from_vec(vec![batch, first_dim], first)?,
-            Tensor::from_vec(vec![batch, second_dim], second)?,
-            Tensor::from_vec(vec![batch, third_dim], third)?,
-        ))
-    }
-
-    /// Projette quatre couches linéaires indépendantes dans une seule commande.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si une projection porte un biais ou si les dimensions
-    /// sont incompatibles avec l'entrée.
-    pub(crate) fn project_four_biasless(
-        &self,
-        input: &Tensor,
-        first: &Linear,
-        second: &Linear,
-        third: &Linear,
-        fourth: &Linear,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-        ensure_biasless(first, "first")?;
-        ensure_biasless(second, "second")?;
-        ensure_biasless(third, "third")?;
-        ensure_biasless(fourth, "fourth")?;
-        let (batch, in_dim) = input.as_matrix()?;
-        let first_dim = linear_out_dim(first.weight())?;
-        let second_dim = linear_out_dim(second.weight())?;
-        let third_dim = linear_out_dim(third.weight())?;
-        let fourth_dim = linear_out_dim(fourth.weight())?;
-        let input_buffer = self.upload_f32_buffer(input.data(), "project4_input")?;
-        let first_buffer = self.new_f32_buffer(
-            checked_len(batch, first_dim, "project4 first")?,
-            "project4_first",
-        )?;
-        let second_buffer = self.new_f32_buffer(
-            checked_len(batch, second_dim, "project4 second")?,
-            "project4_second",
-        )?;
-        let third_buffer = self.new_f32_buffer(
-            checked_len(batch, third_dim, "project4 third")?,
-            "project4_third",
-        )?;
-        let fourth_buffer = self.new_f32_buffer(
-            checked_len(batch, fourth_dim, "project4 fourth")?,
-            "project4_fourth",
-        )?;
-        let mut owned_buffers = Vec::new();
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        let encoder_guard = EncoderEndGuard::new(encoder);
-        self.encode_matmul_weight(
-            encoder,
-            &mut owned_buffers,
-            &input_buffer,
-            batch,
-            in_dim,
-            first.weight(),
-            &first_buffer,
-        )?;
-        self.encode_matmul_weight(
-            encoder,
-            &mut owned_buffers,
-            &input_buffer,
-            batch,
-            in_dim,
-            second.weight(),
-            &second_buffer,
-        )?;
-        self.encode_matmul_weight(
-            encoder,
-            &mut owned_buffers,
-            &input_buffer,
-            batch,
-            in_dim,
-            third.weight(),
-            &third_buffer,
-        )?;
-        self.encode_matmul_weight(
-            encoder,
-            &mut owned_buffers,
-            &input_buffer,
-            batch,
-            in_dim,
-            fourth.weight(),
-            &fourth_buffer,
-        )?;
-        encoder_guard.end();
-        commit_and_wait(command_buffer)?;
-
-        let first = read_f32_buffer(&first_buffer, batch * first_dim)?;
-        let second = read_f32_buffer(&second_buffer, batch * second_dim)?;
-        let third = read_f32_buffer(&third_buffer, batch * third_dim)?;
-        let fourth = read_f32_buffer(&fourth_buffer, batch * fourth_dim)?;
-        Ok((
-            Tensor::from_vec(vec![batch, first_dim], first)?,
-            Tensor::from_vec(vec![batch, second_dim], second)?,
-            Tensor::from_vec(vec![batch, third_dim], third)?,
-            Tensor::from_vec(vec![batch, fourth_dim], fourth)?,
-        ))
+        let tensors = outputs
+            .iter()
+            .map(|(out_dim, buffer)| {
+                Tensor::from_vec(
+                    vec![batch, *out_dim],
+                    read_f32_buffer(buffer, batch * out_dim)?,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        tensors
+            .try_into()
+            .map_err(|_| InferError::Dimension("projections: nombre de sorties".to_string()))
     }
 
     /// Encode un matmul `[batch,in_dim] · weightᵀ` (dense ou quantifié) vers
