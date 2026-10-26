@@ -818,8 +818,14 @@ fn prefill_resident_uses_layer_specific_attention_dimensions() -> Result<()> {
     );
     // Captures : la sortie de la couche 0 est l'entrée de la couche 1 (= sortie
     // du run à une couche), celle de la couche 1 est la sortie finale.
-    let (_, _, captures) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, base, &[0, 1], 0)?;
+    let (_, _, captures) = executor.qwen_moe_prefill_resident_with_captures(
+        &input,
+        &layers,
+        base,
+        &[0, 1],
+        0,
+        false,
+    )?;
     let captures = captures.ok_or_else(|| InferError::Config("captures absentes".to_string()))?;
     assert_eq!(captures.shape(), &[SEQ, 2 * HIDDEN]);
     for row in 0..SEQ {
@@ -1086,10 +1092,33 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
     let layers = make_layers(spec);
 
     let (single, single_caches, single_captures) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 0)?;
+        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 0, false)?;
     // 512 → trois morceaux de 367/367/366 lignes.
-    let (chunked, chunked_caches, chunked_captures) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512)?;
+    let (chunked, chunked_caches, chunked_captures) = executor
+        .qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, false)?;
+    // Dernière ligne seule : la couche finale (attention complète) ne calcule
+    // que son K/V sur les morceaux non finaux ; ligne et KV restent identiques.
+    let (last, last_caches, _) =
+        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, true)?;
+    let hidden = last.data().len();
+    assert_eq!(last.shape(), &[1, hidden]);
+    assert_eq!(
+        last.data(),
+        &chunked.data()[chunked.data().len() - hidden..]
+    );
+    for (a, b) in last_caches.iter().zip(&chunked_caches) {
+        if let (
+            PrefillResidentLayerCache::Full { key, value },
+            PrefillResidentLayerCache::Full {
+                key: key_ref,
+                value: value_ref,
+            },
+        ) = (a, b)
+        {
+            assert_eq!(key.data(), key_ref.data());
+            assert_eq!(value.data(), value_ref.data());
+        }
+    }
     let max_diff = |a: &[f32], b: &[f32]| {
         a.iter()
             .zip(b)
@@ -1191,6 +1220,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             &[],
             512,
             Some(&prefix),
+            false,
         )?;
         assert_close(
             &extended,

@@ -23,6 +23,7 @@ impl MetalExecutor {
         hidden_dim: usize,
         q_dim: usize,
         layer_index: usize,
+        kv_only: bool,
     ) -> Result<Buffer> {
         match (attention, attention_scratch, layer_cache) {
             (
@@ -61,7 +62,9 @@ impl MetalExecutor {
                     o: o_buffer,
                 } = full_scratch;
                 self.run_resident_prefill_section(context, "qkv", |encoder, owned| {
-                    if gated {
+                    if kv_only {
+                        // Seul le K/V de ces positions sert : Q et la suite sont sautés.
+                    } else if gated {
                         let (Some(q2_buffer), Some(attn_gate_buffer)) =
                             (q2_buffer.as_ref(), attn_gate_buffer.as_ref())
                         else {
@@ -132,15 +135,17 @@ impl MetalExecutor {
                     if spec.value_norm {
                         self.encode_rms_norm_heads_no_scale(encoder, &v_buffer, &v_buffer, spec)?;
                     }
-                    self.encode_rms_norm_rope_heads(
-                        encoder,
-                        &q_buffer,
-                        &q_norm_buffer,
-                        &q_rope_buffer,
-                        spec,
-                        spec.q_heads,
-                        chunk.start,
-                    )?;
+                    if !kv_only {
+                        self.encode_rms_norm_rope_heads(
+                            encoder,
+                            &q_buffer,
+                            &q_norm_buffer,
+                            &q_rope_buffer,
+                            spec,
+                            spec.q_heads,
+                            chunk.start,
+                        )?;
+                    }
                     self.encode_rms_norm_rope_heads(
                         encoder,
                         &k_buffer,
@@ -167,6 +172,9 @@ impl MetalExecutor {
                         kv_chunk_len,
                     )
                 })?;
+                if kv_only {
+                    return Ok(o_buffer);
+                }
                 self.run_resident_prefill_section(
                     context,
                     if spec.window.is_some() {

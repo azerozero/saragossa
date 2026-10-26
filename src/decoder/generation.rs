@@ -3108,7 +3108,7 @@ impl CausalDecoder {
         // prefill que l'AR et le MTP du CLI, donc même trajectoire greedy.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some((cache, final_hidden, captures)) =
-            self.prefill_resident_cache_hidden_and_captures(prompt, layer_ids)?
+            self.prefill_resident_cache_hidden_and_captures(prompt, layer_ids, false)?
         {
             let target_hidden = captures.ok_or_else(|| {
                 InferError::Config("prefill résident sans captures de couches".to_string())
@@ -3464,8 +3464,9 @@ impl CausalDecoder {
 
     /// Prolonge `cache` de `suffix` par le prefill résident par morceaux : le KV
     /// CPU du préfixe est recopié sur le GPU, l'état linéaire GPU avance en
-    /// place. Rend le hidden final non normé de chaque position du suffixe et
-    /// les captures de `capture_layer_ids` (`[suffix, n * hidden]`). `None` :
+    /// place. Rend le hidden final non normé de chaque position du suffixe (de
+    /// la seule dernière avec `last_row_only`) et les captures de
+    /// `capture_layer_ids` (`[suffix, n * hidden]`). `None` :
     /// préconditions non réunies, cache intact (repli sur l'extension en lignes).
     ///
     /// # Errors
@@ -3478,6 +3479,7 @@ impl CausalDecoder {
         cache: &mut CausalDecoderCache,
         suffix: &[usize],
         capture_layer_ids: &[usize],
+        last_row_only: bool,
     ) -> Result<Option<(Tensor, Option<Tensor>)>> {
         let start = cache.position;
         if start == 0 || suffix.len() < crate::runtime_flags::prefix_extend_resident_min_tokens() {
@@ -3522,6 +3524,7 @@ impl CausalDecoder {
             capture_layer_ids,
             crate::runtime_flags::prefill_resident_chunk_tokens(),
             Some(&prefix),
+            last_row_only,
         )?;
         drop(prefix);
         for ((layer_cache, layer), layer_state) in
@@ -4113,14 +4116,12 @@ impl CausalDecoder {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let started = Instant::now();
-            if let Some((final_hidden, captures)) =
-                self.extend_cache_metal_resident(cache, suffix, layer_ids.unwrap_or_default())?
-            {
-                let final_hidden = if all_states {
-                    final_hidden
-                } else {
-                    Tensor::row(final_hidden.last_row()?.to_vec())?
-                };
+            if let Some((final_hidden, captures)) = self.extend_cache_metal_resident(
+                cache,
+                suffix,
+                layer_ids.unwrap_or_default(),
+                !all_states,
+            )? {
                 let states = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
                 if trace_prefill_enabled() {
                     eprintln!(
@@ -4464,10 +4465,11 @@ impl CausalDecoder {
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
         // Chemin AR : n'a besoin que du dernier état normé (1er token décodé).
-        let Some((cache, final_hidden)) = self.prefill_resident_cache_and_hidden(prompt)? else {
+        let Some((cache, final_hidden, _)) =
+            self.prefill_resident_cache_hidden_and_captures(prompt, &[], true)?
+        else {
             return Ok(None);
         };
-        let final_hidden = Tensor::row(final_hidden.last_row()?.to_vec())?;
         let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
         Ok(Some((cache, final_state)))
     }
@@ -4495,7 +4497,7 @@ impl CausalDecoder {
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
         Ok(self
-            .prefill_resident_cache_hidden_and_captures(prompt, &[])?
+            .prefill_resident_cache_hidden_and_captures(prompt, &[], false)?
             .map(|(cache, hidden, _)| (cache, hidden)))
     }
 
@@ -4555,6 +4557,7 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
         capture_layer_ids: &[usize],
+        last_row_only: bool,
     ) -> Result<Option<(CausalDecoderCache, Tensor, Option<Tensor>)>> {
         if !prefill_resident_enabled() {
             return Ok(None);
@@ -4583,6 +4586,7 @@ impl CausalDecoder {
             spec,
             capture_layer_ids,
             crate::runtime_flags::prefill_resident_chunk_tokens(),
+            last_row_only,
         ) {
             Ok((final_hidden, layer_states, captures)) => {
                 if layer_states.len() != self.layers.len() {
