@@ -797,14 +797,6 @@ pub(crate) fn prefill_linear_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_LINEAR_NAX", true))
 }
 
-/// Taille cible, en tokens, d'un morceau du prefill résident. Les buffers
-/// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
-/// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est
-/// découpé en morceaux égaux (au plus cette taille, au moins 512). Les modèles
-/// hors périmètre Steel/NAX d256 (fenêtre glissante, autres têtes) restent en
-/// un seul morceau. `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0` désactive.
-/// Avec l'état SSM bf16 (opt-in), l'état est arrondi à chaque frontière de
-/// morceau au lieu d'une fois : dérive non mesurée.
 /// Émet le premier token MTP avant le semis de l'historique et la mise en place
 /// des arènes (`SARAGOSSA_RUST_MTP_EARLY_FIRST_TOKEN=0` pour l'émettre après le
 /// premier cycle). Le TTFT baisse d'autant (−2,1 s en serve à 32k), le temps
@@ -814,6 +806,14 @@ pub(crate) fn mtp_early_first_token_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_EARLY_FIRST_TOKEN", true))
 }
 
+/// Taille cible, en tokens, d'un morceau du prefill résident. Les buffers
+/// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
+/// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est
+/// découpé en morceaux égaux (au plus cette taille, au moins 512). Les modèles
+/// hors périmètre Steel/NAX d256 (fenêtre glissante, autres têtes) restent en
+/// un seul morceau. `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0` désactive.
+/// Avec l'état SSM bf16 (opt-in), l'état est arrondi à chaque frontière de
+/// morceau au lieu d'une fois : dérive non mesurée.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_resident_chunk_tokens() -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();

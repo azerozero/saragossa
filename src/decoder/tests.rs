@@ -2753,6 +2753,58 @@ fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
     Ok(())
 }
 
+/// Premier token MTP émis avant le semis de l'historique : le flux émet chaque
+/// token une seule fois, et un refus dès le premier rend ce seul token, à froid
+/// comme en extension du cache de préfixe. Requiert
+/// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
+#[test]
+#[ignore = "modèle réel avec sidecar MTP requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn mtp_early_first_token_streams_once_and_stops_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+        eprintln!("skip premier token MTP : sidecar MTP absent");
+        return Ok(());
+    };
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(mtp_path)?;
+    let prompt = mtp_verifier_prompt_ids(
+        &assets,
+        "Explain in two sentences why the borrow checker rejects aliasing mutable references.",
+    )?;
+    let options = mtp_verifier_options(Vec::new());
+    let max_new_tokens = 24;
+    let mut streamed = Vec::new();
+    let full = model.generate_greedy_mtp_core(&prompt, max_new_tokens, &options, 2, |token| {
+        streamed.push(token);
+        true
+    })?;
+    assert_eq!(streamed, full.tokens, "flux MTP différent de la sortie");
+
+    for prompt in [prompt.clone(), [prompt.as_slice(), &full.tokens].concat()] {
+        let mut seen = Vec::new();
+        let cut =
+            model.generate_greedy_mtp_core(&prompt, max_new_tokens, &options, 2, |token| {
+                seen.push(token);
+                false
+            })?;
+        assert_eq!(seen.len(), 1, "un seul token émis avant l'arrêt");
+        assert_eq!(cut.tokens, seen, "sortie après refus au premier token");
+    }
+    assert_eq!(
+        full.tokens,
+        model
+            .generate_greedy_mtp_core(&prompt, max_new_tokens, &options, 2, |_| true)?
+            .tokens,
+        "un refus précoce ne doit pas polluer le cache de préfixe"
+    );
+    Ok(())
+}
+
 // --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
 
 /// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
