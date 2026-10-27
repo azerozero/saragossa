@@ -42,11 +42,13 @@ impl Segment {
         self.as_slice().len()
     }
 
-    fn capacity(&self) -> usize {
+    /// Allocation tenue (identité, f32 réservés) : une vue partagée, même
+    /// tronquée ou clonée, garde tout son buffer en vie.
+    fn allocation(&self) -> (usize, usize) {
         match self {
-            Self::Owned(data) => data.capacity(),
+            Self::Owned(data) => (data.as_ptr().addr(), data.capacity()),
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            Self::Shared(rows) => rows.len(),
+            Self::Shared(rows) => (rows.allocation_id(), rows.allocation_len()),
         }
     }
 
@@ -83,14 +85,15 @@ impl KvRows {
             .flat_map(move |segment| segment.chunks_exact(dim))
     }
 
-    /// Octets réservés, capacité comprise, des segments absents de `seen` ;
-    /// les segments comptés y sont ajoutés (un segment partagé ne compte
-    /// qu'une fois sur plusieurs snapshots).
+    /// Octets réservés, capacité comprise, des allocations absentes de `seen` ;
+    /// les allocations comptées y sont ajoutées (un segment partagé entre
+    /// snapshots, ou plusieurs vues d'un même buffer, ne compte qu'une fois).
     pub(super) fn capacity_bytes_unseen(&self, seen: &mut HashSet<usize>) -> usize {
         self.segments
             .iter()
-            .filter(|segment| seen.insert(Arc::as_ptr(segment) as usize))
-            .map(|segment| segment.capacity())
+            .map(|segment| segment.allocation())
+            .filter(|(id, _)| seen.insert(*id))
+            .map(|(_, floats)| floats)
             .sum::<usize>()
             .saturating_mul(std::mem::size_of::<f32>())
     }

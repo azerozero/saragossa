@@ -3006,11 +3006,28 @@ fn kv_seed_from_shared_view_matches_cpu_bytes() -> Result<()> {
         MTLResourceOptions::StorageModeShared,
     );
     // La vue saute la première ligne : offset non nul dans le buffer source.
-    let view = crate::metal_backend::SharedF32Rows::new(buffer, kv_dim, (rows - 1) * kv_dim)?;
+    // SAFETY: buffer propre au test, plus écrit après sa création.
+    #[expect(unsafe_code, reason = "vue partagée sur un buffer de test figé")]
+    let view =
+        unsafe { crate::metal_backend::SharedF32Rows::new(buffer, kv_dim, (rows - 1) * kv_dim)? };
     let head = &values[..kv_dim];
     for bf16 in [false, true] {
-        let mut gpu = state.full_attention(rows + 2, q_heads, kv_heads, head_dim, bf16)?;
-        let mut cpu = state.full_attention(rows + 2, q_heads, kv_heads, head_dim, bf16)?;
+        // Variantes de test : dtype forcé, indépendant de SARAGOSSA_RUST_KV_BF16.
+        let arena = |state: &DecodeResidentState| {
+            if bf16 {
+                state.full_attention_bf16_for_test(rows + 2, q_heads, kv_heads, head_dim)
+            } else {
+                state.full_attention_f32_for_test(rows + 2, q_heads, kv_heads, head_dim)
+            }
+        };
+        let mut gpu = arena(&state)?;
+        let mut cpu = arena(&state)?;
+        let element = if bf16 {
+            GpuElement::Bf16
+        } else {
+            GpuElement::F32
+        };
+        assert_eq!(gpu.keys().element(), element);
         let shared = [KvSeedSegment::Cpu(head), KvSeedSegment::Shared(&view)];
         let copied = [
             KvSeedSegment::Cpu(head),

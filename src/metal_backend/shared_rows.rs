@@ -13,15 +13,22 @@ pub(crate) struct SharedF32Rows {
 }
 
 impl SharedF32Rows {
-    /// Fige `buffer[offset..offset + len]`. L'appelant garantit que plus
-    /// aucune commande GPU n'écrira ce buffer : la vue n'est relue que par le
-    /// CPU et par des copies GPU en lecture.
+    /// Fige `buffer[offset..offset + len]`.
+    ///
+    /// # Safety
+    ///
+    /// Plus aucune commande GPU ni écriture CPU ne doit viser `buffer` : la vue
+    /// en expose le contenu en `&[f32]` à durée de vie libre côté lecteur.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si la plage dépasse le buffer ou si le buffer n'a
     /// pas de pointeur CPU (stockage privé).
-    pub(crate) fn new(buffer: metal::Buffer, offset: usize, len: usize) -> Result<Self> {
+    #[expect(
+        unsafe_code,
+        reason = "contrat d'immuabilité du buffer reporté sur l'appelant"
+    )]
+    pub(crate) unsafe fn new(buffer: metal::Buffer, offset: usize, len: usize) -> Result<Self> {
         let end = offset
             .checked_add(len)
             .and_then(|end| end.checked_mul(std::mem::size_of::<f32>()))
@@ -51,8 +58,8 @@ impl SharedF32Rows {
     pub(crate) fn as_slice(&self) -> &[f32] {
         // SAFETY: `new` a vérifié que `offset + len` f32 tiennent dans le buffer
         // partagé et que son pointeur CPU existe (aligné page, donc f32). Plus
-        // aucune commande GPU ne l'écrit (contrat de `new`) et les vues ne
-        // donnent qu'un accès en lecture : aucune écriture concurrente.
+        // rien ne l'écrit (contrat `# Safety` de `new`) et les vues ne donnent
+        // qu'un accès en lecture : aucune écriture concurrente.
         unsafe {
             std::slice::from_raw_parts(
                 self.buffer.contents().cast::<f32>().add(self.offset),
@@ -61,8 +68,20 @@ impl SharedF32Rows {
         }
     }
 
+    /// Buffer source, à ne lier qu'en lecture (copie GPU vers l'arène).
     pub(crate) fn buffer(&self) -> &BufferRef {
         &self.buffer
+    }
+
+    /// Identité de l'allocation, partagée par toutes ses vues (troncatures et
+    /// clones compris) : le comptage mémoire n'en retient qu'une.
+    pub(crate) fn allocation_id(&self) -> usize {
+        self.buffer.contents().addr()
+    }
+
+    /// Taille entière de l'allocation en f32, qu'une vue tronquée garde en vie.
+    pub(crate) fn allocation_len(&self) -> usize {
+        usize::try_from(self.buffer.length()).unwrap_or(usize::MAX) / std::mem::size_of::<f32>()
     }
 
     pub(crate) fn byte_offset(&self) -> u64 {

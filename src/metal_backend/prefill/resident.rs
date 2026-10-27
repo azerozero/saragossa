@@ -496,10 +496,7 @@ impl MetalExecutor {
                     let (key, value) = if start == 0
                         && crate::runtime_flags::prefill_kv_shared_enabled()
                     {
-                        (
-                            PrefillKvRows::Shared(SharedF32Rows::new(key, 0, kv_len)?),
-                            PrefillKvRows::Shared(SharedF32Rows::new(value, 0, kv_len)?),
-                        )
+                        shared_kv_rows(key, value, kv_len)?
                     } else {
                         (
                             PrefillKvRows::Owned(read_f32_buffer_at(&key, kv_offset, kv_len)?),
@@ -1107,5 +1104,26 @@ impl MetalExecutor {
                 "prefill résident tail MoE incohérent couche {layer_index}"
             ))),
         }
+    }
+}
+
+/// Remet les buffers K/V d'un prefill terminé comme vues partagées.
+#[expect(
+    unsafe_code,
+    reason = "les buffers K/V du prefill passent au cache CPU en lecture seule"
+)]
+fn shared_kv_rows(
+    key: metal::Buffer,
+    value: metal::Buffer,
+    kv_len: usize,
+) -> Result<(PrefillKvRows, PrefillKvRows)> {
+    // SAFETY: buffers `uncached_f32_buffer` propres à ce prefill, hors scratch :
+    // son command buffer est terminé et l'appelant les cède ici, plus rien ne
+    // les écrit ensuite.
+    unsafe {
+        Ok((
+            PrefillKvRows::Shared(SharedF32Rows::new(key, 0, kv_len)?),
+            PrefillKvRows::Shared(SharedF32Rows::new(value, 0, kv_len)?),
+        ))
     }
 }
