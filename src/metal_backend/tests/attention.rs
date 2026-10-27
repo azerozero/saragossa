@@ -1426,6 +1426,10 @@ fn nax_d256_variants_match_cpu_oracle() -> Result<()> {
             kv_heads,
             &absolute,
         )?;
+        assert!(
+            expected.iter().all(|(_, row)| row.iter().all(|value| value.is_finite())),
+            "oracle CPU non fini"
+        );
         let mut reference: Option<Vec<f32>> = None;
         for (index, (name, shape)) in variants.iter().enumerate() {
             let mut grids = Vec::new();
@@ -1440,9 +1444,13 @@ fn nax_d256_variants_match_cpu_oracle() -> Result<()> {
                         },
                     );
                 let Some(nax) = executor.causal_attention_prefill_steel_nax_d256.as_ref() else {
-                    // Sans accélérateur, bq64 manque aussi ; sinon la variante
-                    // dépasse les ressources du GPU.
-                    assert_eq!(index, 0, "{name}: pipeline NAX non compilé");
+                    // Seule la référence bq64 en grille normale peut manquer
+                    // (GPU sans accélérateur) ; une fois compilée, toute
+                    // spécialisation absente est une régression.
+                    assert!(
+                        index == 0 && !head_major,
+                        "{name} head_major={head_major}: pipeline NAX non compilé"
+                    );
                     return Ok(());
                 };
                 let threads = shape.simdgroups * 32;
@@ -1460,6 +1468,12 @@ fn nax_d256_variants_match_cpu_oracle() -> Result<()> {
                     &executor, &q, &k, &v, q_heads, kv_heads,
                 )?);
             }
+            // `f32::max` ignore NaN : sans ce contrôle, une sortie NaN
+            // passerait les écarts à zéro.
+            assert!(
+                grids.iter().flatten().all(|value| value.is_finite()),
+                "{name}: sortie non finie (seq={seq} kv={kv_rows})"
+            );
             assert!(
                 grids[0]
                     .iter()
@@ -1522,12 +1536,18 @@ fn nax_d256_head_major_grid_is_bit_identical() -> Result<()> {
                 },
             );
         if executor.causal_attention_prefill_steel_nax_d256.is_none() {
+            // Seule la grille normale peut manquer (GPU sans accélérateur).
+            assert!(!head_major, "spécialisation head-major non compilée");
             return Ok(());
         }
         outputs.push(nax_chunk_attention(
             &executor, &q, &k, &v, q_heads, kv_heads,
         )?);
     }
+    assert!(
+        outputs.iter().flatten().all(|value| value.is_finite()),
+        "sortie NAX non finie"
+    );
     let differing = outputs[0]
         .iter()
         .zip(&outputs[1])

@@ -1028,6 +1028,22 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
         return Ok(());
     };
     executor.prefill_kv_bf16_mirror = false;
+    // Le miroir n'est alloué qu'avec le NAX : on l'impose dès le départ,
+    // quel que soit `SARAGOSSA_RUST_PREFILL_ATTN_NAX`, pour que les
+    // assertions miroir comparent bien le chemin incrémental au chemin
+    // courant, tous deux en NAX. Sans accélérateur, elles sont sautées.
+    if executor.causal_attention_prefill_steel_nax_d256.is_none() {
+        executor.causal_attention_prefill_steel_nax_d256 =
+            super::super::pipelines::compile_steel_causal_nax_d256_attention(
+                &executor.device,
+                STEEL_ATTENTION_NAX_KERNELS,
+                super::super::attention::NAX_CAUSAL_ATTN_BQ64,
+            );
+    }
+    let nax = executor.causal_attention_prefill_steel_nax_d256.is_some();
+    if !nax {
+        eprintln!("assertions miroir bf16 sautées : NAX indisponible sur ce GPU");
+    }
     const SEQ: usize = 1100;
     const HIDDEN: usize = 64;
     const Q_HEADS: usize = 16;
@@ -1159,36 +1175,38 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
     // que son K/V sur les morceaux non finaux ; ligne et KV restent identiques.
     let (last, last_caches, _) =
         executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, true)?;
-    executor.prefill_kv_bf16_mirror = true;
-    let (mirrored, mirrored_caches, mirrored_captures) = executor
-        .qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, false)?;
-    let (mirrored_last, mirrored_last_caches, _) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, true)?;
-    executor.prefill_kv_bf16_mirror = false;
     let (single, chunked, last) = (
         single.into_tensor(spec.hidden_dim)?,
         chunked.into_tensor(spec.hidden_dim)?,
         last.into_tensor(spec.hidden_dim)?,
     );
-    assert_bit_exact(
-        &mirrored.into_tensor(spec.hidden_dim)?,
-        &chunked,
-        "miroir bf16 sortie",
-    );
-    assert_bit_exact(
-        &mirrored_last.into_tensor(spec.hidden_dim)?,
-        &last,
-        "miroir bf16 dernière ligne",
-    );
-    if let (Some(a), Some(b)) = (mirrored_captures.as_ref(), chunked_captures.as_ref()) {
-        assert_bit_exact(a, b, "miroir bf16 capture");
+    if nax {
+        executor.prefill_kv_bf16_mirror = true;
+        let (mirrored, mirrored_caches, mirrored_captures) = executor
+            .qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, false)?;
+        let (mirrored_last, mirrored_last_caches, _) = executor
+            .qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, true)?;
+        executor.prefill_kv_bf16_mirror = false;
+        assert_bit_exact(
+            &mirrored.into_tensor(spec.hidden_dim)?,
+            &chunked,
+            "miroir bf16 sortie",
+        );
+        assert_bit_exact(
+            &mirrored_last.into_tensor(spec.hidden_dim)?,
+            &last,
+            "miroir bf16 dernière ligne",
+        );
+        if let (Some(a), Some(b)) = (mirrored_captures.as_ref(), chunked_captures.as_ref()) {
+            assert_bit_exact(a, b, "miroir bf16 capture");
+        }
+        assert_full_kv_bit_exact(&mirrored_caches, &chunked_caches, "miroir bf16 K/V")?;
+        assert_full_kv_bit_exact(
+            &mirrored_last_caches,
+            &last_caches,
+            "miroir bf16 K/V dernière ligne",
+        )?;
     }
-    assert_full_kv_bit_exact(&mirrored_caches, &chunked_caches, "miroir bf16 K/V")?;
-    assert_full_kv_bit_exact(
-        &mirrored_last_caches,
-        &last_caches,
-        "miroir bf16 K/V dernière ligne",
-    )?;
     let hidden = last.data().len();
     assert_eq!(last.shape(), &[1, hidden]);
     assert_eq!(
