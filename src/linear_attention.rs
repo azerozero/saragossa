@@ -587,14 +587,16 @@ impl LinearAttention {
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some(metal) = runtime.metal_executor() {
-            match metal.project_four_biasless(
+            match metal.project_biasless(
                 x,
-                &self.in_proj_qkv,
-                &self.in_proj_z,
-                &self.in_proj_b,
-                &self.in_proj_a,
+                [
+                    &self.in_proj_qkv,
+                    &self.in_proj_z,
+                    &self.in_proj_b,
+                    &self.in_proj_a,
+                ],
             ) {
-                Ok(projections) => return Ok(projections),
+                Ok([qkv, z, b, a]) => return Ok((qkv, z, b, a)),
                 Err(error) => {
                     if trace_linear_attn_enabled() {
                         eprintln!("linear-attn project4 gpu fallback: {error}");

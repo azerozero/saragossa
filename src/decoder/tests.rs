@@ -2753,6 +2753,58 @@ fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
     Ok(())
 }
 
+/// Premier token MTP émis avant le semis de l'historique : le flux émet chaque
+/// token une seule fois, et un refus dès le premier rend ce seul token, à froid
+/// comme en extension du cache de préfixe. Requiert
+/// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
+#[test]
+#[ignore = "modèle réel avec sidecar MTP requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn mtp_early_first_token_streams_once_and_stops_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+        eprintln!("skip premier token MTP : sidecar MTP absent");
+        return Ok(());
+    };
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(mtp_path)?;
+    let prompt = mtp_verifier_prompt_ids(
+        &assets,
+        "Explain in two sentences why the borrow checker rejects aliasing mutable references.",
+    )?;
+    let options = mtp_verifier_options(Vec::new());
+    let max_new_tokens = 24;
+    let mut streamed = Vec::new();
+    let full = model.generate_greedy_mtp_core(&prompt, max_new_tokens, &options, 2, |token| {
+        streamed.push(token);
+        true
+    })?;
+    assert_eq!(streamed, full.tokens, "flux MTP différent de la sortie");
+
+    for prompt in [prompt.clone(), [prompt.as_slice(), &full.tokens].concat()] {
+        let mut seen = Vec::new();
+        let cut =
+            model.generate_greedy_mtp_core(&prompt, max_new_tokens, &options, 2, |token| {
+                seen.push(token);
+                false
+            })?;
+        assert_eq!(seen.len(), 1, "un seul token émis avant l'arrêt");
+        assert_eq!(cut.tokens, seen, "sortie après refus au premier token");
+    }
+    assert_eq!(
+        full.tokens,
+        model
+            .generate_greedy_mtp_core(&prompt, max_new_tokens, &options, 2, |_| true)?
+            .tokens,
+        "un refus précoce ne doit pas polluer le cache de préfixe"
+    );
+    Ok(())
+}
+
 // --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
 
 /// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
@@ -2962,5 +3014,67 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         routed.stats.proposed_by_position.len(),
         draft.info.block_size
     );
+    Ok(())
+}
+
+/// Semis MTP Metal contre l'oracle CPU sur la vraie tête : deux blocs pour
+/// couvrir le décalage de position RoPE, dérive bornée. Le GEMM tuilé du FC et
+/// de K|V accumule en bf16 (2e-3 relatif mesuré sur K) ; statistiques de draft
+/// et texte restent identiques sur quatre prompts de 8k à 32k. Requiert
+/// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
+#[test]
+#[ignore = "modèle réel avec sidecar MTP requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+        eprintln!("skip semis MTP : sidecar MTP absent");
+        return Ok(());
+    };
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(mtp_path)?;
+    let head = model
+        .mtp
+        .as_ref()
+        .ok_or_else(|| InferError::Config("tête MTP absente".to_string()))?;
+    let metal = model
+        .forward_runtime()
+        .metal_executor()
+        .ok_or_else(|| InferError::Config("runtime Metal absent".to_string()))?;
+    let hidden = model.final_norm.data().len();
+    let tokens: Vec<usize> = (0..1500).map(|i| (i * 7919 + 13) % 50_000).collect();
+    // Embeddings normés en guise d'états finaux : même échelle, sans prefill.
+    let states = rms_norm(&model.embed_scaled(&tokens)?, &model.final_norm, 1e-6)?;
+    let mut cpu = LayerKvCache::default();
+    let mut gpu = LayerKvCache::default();
+    for (states, tokens) in states.data().chunks(1024 * hidden).zip(tokens.chunks(1024)) {
+        model.seed_mtp_history_chunk_cpu(head, states, tokens, &mut cpu)?;
+        assert!(model.seed_mtp_history_chunk_metal(metal, head, states, tokens, &mut gpu)?);
+    }
+    assert_eq!(cpu.len(), gpu.len());
+    for (label, cpu, gpu) in [
+        ("K", cpu.keys.to_vec(), gpu.keys.to_vec()),
+        ("V", cpu.values.to_vec(), gpu.values.to_vec()),
+    ] {
+        assert_eq!(cpu.len(), gpu.len(), "longueur {label}");
+        assert!(
+            cpu.iter().chain(&gpu).all(|value| value.is_finite()),
+            "{label} non fini"
+        );
+        let scale = cpu.iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
+        let max_err = cpu
+            .iter()
+            .zip(&gpu)
+            .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+        eprintln!("semis MTP {label} : max_abs={scale:e} max_err={max_err:e}");
+        assert!(
+            max_err <= 5e-3 * scale,
+            "dérive {label} {max_err:e} / {scale:e}"
+        );
+    }
     Ok(())
 }

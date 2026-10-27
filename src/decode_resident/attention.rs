@@ -476,6 +476,27 @@ impl DecodeResidentState {
     }
 }
 
+/// Bloc de lignes K ou V à semer dans l'arène : tranche CPU, ou vue d'un
+/// buffer GPU partagé copiée sur le GPU.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum KvSeedSegment<'a> {
+    Cpu(&'a [f32]),
+    Shared(&'a crate::metal_backend::SharedF32Rows),
+}
+
+impl KvSeedSegment<'_> {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Cpu(data) => data,
+            Self::Shared(rows) => rows.as_slice(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
 /// KV-cache full-attn **résident GPU** d'UNE couche (10 couches sur Qwen3.6).
 ///
 /// Remplace, derrière le flag du decode résident, le `Vec<f32>` CPU append-only
@@ -649,7 +670,11 @@ impl FullAttentionMetalState {
         values_rows: &[f32],
         n_rows: usize,
     ) -> Result<()> {
-        self.seed_segments(&[keys_rows], &[values_rows], n_rows)
+        self.seed_segments(
+            &[KvSeedSegment::Cpu(keys_rows)],
+            &[KvSeedSegment::Cpu(values_rows)],
+            n_rows,
+        )
     }
 
     /// Comme [`Self::seed`], depuis des segments de lignes contiguës mis bout à
@@ -661,8 +686,8 @@ impl FullAttentionMetalState {
     /// pas `n_rows * kv_dim`.
     pub(crate) fn seed_segments(
         &mut self,
-        keys_segments: &[&[f32]],
-        values_segments: &[&[f32]],
+        keys_segments: &[KvSeedSegment<'_>],
+        values_segments: &[KvSeedSegment<'_>],
         n_rows: usize,
     ) -> Result<()> {
         if n_rows > self.capacity {
@@ -675,8 +700,8 @@ impl FullAttentionMetalState {
         let expected = n_rows
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Dimension("seed KV déborde".to_string()))?;
-        let keys_len: usize = keys_segments.iter().map(|segment| segment.len()).sum();
-        let values_len: usize = values_segments.iter().map(|segment| segment.len()).sum();
+        let keys_len: usize = keys_segments.iter().map(KvSeedSegment::len).sum();
+        let values_len: usize = values_segments.iter().map(KvSeedSegment::len).sum();
         if keys_len != expected || values_len != expected {
             return Err(InferError::Dimension(format!(
                 "seed KV: attendu {expected} (={n_rows}×{kv_dim}), reçu keys={keys_len} values={values_len}"
@@ -687,21 +712,45 @@ impl FullAttentionMetalState {
             GpuElement::F32 => (kv_bf16_sim_konly(), kv_bf16_sim_vonly()),
             _ => (false, false),
         };
+        // Les vues GPU se copient sur le GPU : une écriture CPU dans l'arène
+        // neuve payait une faute de page par 16 Kio (2,2 s à 256k).
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        let mut gpu_copies = false;
         for (tensor, segments, round) in [
             (&self.keys, keys_segments, round_keys),
             (&self.values, values_segments, round_values && !round_keys),
         ] {
             let mut offset = 0;
             for segment in segments {
-                match tensor.element() {
-                    GpuElement::F32 if round => {
-                        let rounded: Vec<f32> =
-                            segment.iter().copied().map(bf16_round_f32).collect();
+                match (segment, tensor.element()) {
+                    (KvSeedSegment::Shared(rows), GpuElement::F32 | GpuElement::Bf16) if !round => {
+                        self.encode_copy_at(
+                            encoder,
+                            rows.buffer(),
+                            rows.byte_offset(),
+                            tensor.buffer(),
+                            tensor.element(),
+                            offset,
+                            rows.len(),
+                        )?;
+                        gpu_copies = true;
+                    }
+                    (_, GpuElement::F32) if round => {
+                        let rounded: Vec<f32> = segment
+                            .as_slice()
+                            .iter()
+                            .copied()
+                            .map(bf16_round_f32)
+                            .collect();
                         write_f32_at(tensor, offset, &rounded)?;
                     }
-                    GpuElement::F32 => write_f32_at(tensor, offset, segment)?,
-                    GpuElement::Bf16 => write_f32_as_bf16_at(tensor, offset, segment)?,
-                    GpuElement::U32 => {
+                    (_, GpuElement::F32) => write_f32_at(tensor, offset, segment.as_slice())?,
+                    (_, GpuElement::Bf16) => {
+                        write_f32_as_bf16_at(tensor, offset, segment.as_slice())?;
+                    }
+                    (_, GpuElement::U32) => {
                         return Err(InferError::Metal(
                             "seed KV sur un buffer u32 invalide".to_string(),
                         ));
@@ -709,6 +758,11 @@ impl FullAttentionMetalState {
                 }
                 offset += segment.len();
             }
+        }
+        encoder_guard.end();
+        // Segments tous CPU (repli, diagnostic d'arrondi) : rien à attendre.
+        if gpu_copies {
+            commit_and_wait(command_buffer)?;
         }
         self.len = n_rows;
         Ok(())

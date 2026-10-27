@@ -1368,10 +1368,30 @@ impl CausalDecoder {
         let trace_setup = false;
         let t_prefill = trace_setup.then(Instant::now);
         let use_committed_mtp_history = mtp_history_policy() == MtpHistoryPolicy::Committed;
+        let mut sampler = DeterministicSampler::new(options.seed);
+        // Premier token tiré et émis dès le dernier état du prefill, avant le
+        // semis de l'historique MTP et la mise en place des arènes : ceux-ci ne
+        // conditionnent que les drafts suivants (~1,4 s de TTFT à 32k). Le bloc
+        // GPU (devtools) gère sa propre émission.
+        let mut first_token = None;
+        let mut early_emitted = false;
+        let mut early_stop = false;
         let (mut cache, final_state, mut mtp_history_cache, reused_prefix_tokens) =
             if use_committed_mtp_history {
+                let mut on_final_state = |state: &Tensor| -> Result<bool> {
+                    let token = self.sample_token_from_state(state, options, &mut sampler)?;
+                    first_token = Some(token);
+                    if !options.stop_token_ids.contains(&token)
+                        && crate::runtime_flags::mtp_early_first_token_enabled()
+                        && !crate::runtime_flags::mtp_gpu_block_enabled()
+                    {
+                        early_emitted = true;
+                        early_stop = !on_token(token);
+                    }
+                    Ok(!early_stop)
+                };
                 let (cache, final_state, mtp_history, reused) =
-                    self.prefill_cache_state_with_mtp_history(prompt)?;
+                    self.prefill_cache_state_with_mtp_history(prompt, &mut on_final_state)?;
                 (cache, final_state, Some(mtp_history), reused)
             } else {
                 let (cache, final_state, reused) = self.prefill_cache_state_reused(prompt)?;
@@ -1429,8 +1449,22 @@ impl CausalDecoder {
                 }
             }
         }
-        let mut sampler = DeterministicSampler::new(options.seed);
-        let mut pending = self.sample_token_from_state(&final_state, options, &mut sampler)?;
+        if early_stop {
+            // L'appelant a refusé la suite dès le premier token, déjà émis : ni
+            // semis (abandonné en route) ni arène à préparer.
+            return Ok(SpeculativeOutput {
+                tokens: first_token.into_iter().collect(),
+                stats: SpeculativeStats {
+                    reused_prefix_tokens,
+                    ..SpeculativeStats::default()
+                },
+                loop_duration: Duration::default(),
+            });
+        }
+        let mut pending = match first_token {
+            Some(token) => token,
+            None => self.sample_token_from_state(&final_state, options, &mut sampler)?,
+        };
         let mut generated = Vec::with_capacity(max_new_tokens);
         // Streaming : `emitted` = nb de tokens déjà passés à `on_token` ; émis en
         // tête d'itération pour capturer tous les chemins de commit (dont `continue`).
@@ -1544,6 +1578,9 @@ impl CausalDecoder {
                 }
             }
             generated.push(primary);
+            if early_emitted && generated.len() == 1 {
+                emitted = 1;
+            }
             if generated.len() >= max_new_tokens {
                 break;
             }
@@ -3108,7 +3145,7 @@ impl CausalDecoder {
         // prefill que l'AR et le MTP du CLI, donc même trajectoire greedy.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some((cache, final_hidden, captures)) =
-            self.prefill_resident_cache_hidden_and_captures(prompt, layer_ids)?
+            self.prefill_resident_cache_hidden_and_captures(prompt, layer_ids, false)?
         {
             let target_hidden = captures.ok_or_else(|| {
                 InferError::Config("prefill résident sans captures de couches".to_string())
@@ -3464,8 +3501,9 @@ impl CausalDecoder {
 
     /// Prolonge `cache` de `suffix` par le prefill résident par morceaux : le KV
     /// CPU du préfixe est recopié sur le GPU, l'état linéaire GPU avance en
-    /// place. Rend le hidden final non normé de chaque position du suffixe et
-    /// les captures de `capture_layer_ids` (`[suffix, n * hidden]`). `None` :
+    /// place. Rend le hidden final non normé de chaque position du suffixe (de
+    /// la seule dernière avec `last_row_only`) et les captures de
+    /// `capture_layer_ids` (`[suffix, n * hidden]`). `None` :
     /// préconditions non réunies, cache intact (repli sur l'extension en lignes).
     ///
     /// # Errors
@@ -3478,6 +3516,7 @@ impl CausalDecoder {
         cache: &mut CausalDecoderCache,
         suffix: &[usize],
         capture_layer_ids: &[usize],
+        last_row_only: bool,
     ) -> Result<Option<(Tensor, Option<Tensor>)>> {
         let start = cache.position;
         if start == 0 || suffix.len() < crate::runtime_flags::prefix_extend_resident_min_tokens() {
@@ -3522,13 +3561,14 @@ impl CausalDecoder {
             capture_layer_ids,
             crate::runtime_flags::prefill_resident_chunk_tokens(),
             Some(&prefix),
+            last_row_only,
         )?;
         drop(prefix);
         for ((layer_cache, layer), layer_state) in
             cache.layers.iter_mut().zip(&layers).zip(layer_states)
         {
             // L'état linéaire a avancé en place dans le buffer du cache.
-            if let crate::metal_backend::PrefillResidentLayerCache::Full { key, value } =
+            if let crate::metal_backend::PrefillResidentLayerCache::Full { key, value, kv_dim } =
                 layer_state
             {
                 let layer_spec = layer.attention_spec;
@@ -3540,7 +3580,7 @@ impl CausalDecoder {
                     attn_scalar: layer_spec.attn_scalar,
                     sliding_window: layer_spec.window,
                 };
-                layer_cache.append_batch_owned(key, value, &layout)?;
+                layer_cache.append_prefill(key, value, kv_dim, &layout)?;
             }
         }
         cache.position = start + suffix.len();
@@ -3669,15 +3709,19 @@ impl CausalDecoder {
 
     /// Prefill avec historique MTP committed ; la quatrième valeur compte les
     /// tokens du prompt repris du cache de préfixe.
+    /// `on_final_state` reçoit l'état normé de la dernière position dès qu'il
+    /// est connu, avant le semis de l'historique MTP ; s'il rend `false`, le
+    /// semis est abandonné (historique vide, rien n'entre au cache de préfixe).
     fn prefill_cache_state_with_mtp_history(
         &self,
         prompt: &[usize],
+        on_final_state: &mut dyn FnMut(&Tensor) -> Result<bool>,
     ) -> Result<(CausalDecoderCache, Tensor, LayerKvCache, usize)> {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
         if prefix_cache_enabled() {
-            if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt)? {
+            if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt, on_final_state)? {
                 return Ok(hit);
             }
         }
@@ -3729,6 +3773,9 @@ impl CausalDecoder {
         let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
         if let Some(t) = t_main {
             eprintln!("mtp_setup prefill_main_us={}", t.elapsed().as_micros());
+        }
+        if !on_final_state(&final_state)? {
+            return Ok((cache, final_state, LayerKvCache::default(), 0));
         }
         let t_history = trace_setup.then(Instant::now);
         let mut mtp_history = LayerKvCache::default();
@@ -3797,6 +3844,30 @@ impl CausalDecoder {
             )));
         }
         let runtime = self.forward_runtime();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if crate::runtime_flags::mtp_seed_gpu_enabled() {
+            if let Some(metal) = runtime.metal_executor() {
+                if self.seed_mtp_history_chunk_metal(metal, head, states, tokens, history)? {
+                    return Ok(());
+                }
+            }
+        }
+        self.seed_mtp_history_chunk_cpu(head, states, tokens, history)
+    }
+
+    /// Chemin de référence du semis par opérations séparées (repli et oracle de
+    /// [`Self::seed_mtp_history_chunk_metal`]) ; le FC et K/V passent par
+    /// les projections Metal quand elles existent : la dérive mesurée par le
+    /// test d'oracle porte sur les normes, RoPE et le GEMM tuilé.
+    pub(super) fn seed_mtp_history_chunk_cpu(
+        &self,
+        head: &MtpHead,
+        states: &[f32],
+        tokens: &[usize],
+        history: &mut LayerKvCache,
+    ) -> Result<()> {
+        let runtime = self.forward_runtime();
+        let hidden = self.final_norm.data().len();
         let eps = self.config.rms_eps;
         let states = Tensor::from_vec(vec![tokens.len(), hidden], states.to_vec())?;
         let embedding = rms_norm(
@@ -3805,9 +3876,7 @@ impl CausalDecoder {
             eps,
         )?;
         let hidden = rms_norm(&states, &head.pre_fc_norm_hidden, eps)?;
-        let x = head
-            .fc
-            .forward_with_runtime(&concat_rows(&embedding, &hidden)?, runtime)?;
+        let x = self.seed_mtp_fc(&head.fc, &concat_rows(&embedding, &hidden)?, runtime)?;
         let normed = rms_norm(&x, &head.layer.input_norm, eps)?;
         let position = history.len();
         full_attention_append_kv_rows(
@@ -3818,6 +3887,108 @@ impl CausalDecoder {
             &head.layer.attention,
             runtime,
         )
+    }
+
+    /// Variante Metal de [`Self::seed_mtp_history_chunk`] : un command buffer par
+    /// bloc au lieu de normes CPU et de trois allers-retours GPU. Rend `false`,
+    /// sans rien écrire, quand la tête sort du contrat des kernels (RoPE non
+    /// rotate-half, échelle de position, fenêtre, K=V, biais) ; le CPU sème alors.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn seed_mtp_history_chunk_metal(
+        &self,
+        metal: &crate::MetalExecutor,
+        head: &MtpHead,
+        states: &[f32],
+        tokens: &[usize],
+        history: &mut LayerKvCache,
+    ) -> Result<bool> {
+        let attention = &head.layer.attention;
+        let (Some(v_proj), Some(k_norm), Some(rope)) = (
+            attention.v_proj.as_ref(),
+            attention.k_norm.as_ref(),
+            super::attention_ops::rope_params(&self.config, attention),
+        ) else {
+            return Ok(false);
+        };
+        if self.config.rope_style != RopeStyle::Halves
+            || rope.position_scale != 1.0
+            || attention.sliding_window.is_some_and(|window| window > 0)
+            || [&head.fc, &attention.k_proj, v_proj]
+                .iter()
+                .any(|linear| linear.bias().is_some())
+        {
+            return Ok(false);
+        }
+        let hidden = self.final_norm.data().len();
+        let (empty_q, _) = super::attention_ops::split_attention_gate(
+            &self.config,
+            &super::attention_ops::empty_q(attention)?,
+        )?;
+        let kv_heads = attention
+            .num_key_value_heads
+            .unwrap_or(self.config.num_key_value_heads);
+        let head_dim = attention
+            .head_dim
+            .or(self.config.head_dim)
+            .ok_or_else(|| InferError::Dimension("head_dim manquant (semis MTP)".to_string()))?;
+        let rope_dims = attention
+            .rope_dims
+            .or(self.config.rope_dims)
+            .unwrap_or(head_dim);
+        let spec = crate::metal_backend::PrefillAttentionSpec {
+            seq: tokens.len(),
+            hidden_dim: hidden,
+            q_heads: self.config.num_attention_heads,
+            kv_heads,
+            head_dim,
+            rope_dims,
+            rope_frequency_dim: rope.frequency_dim,
+            rope_theta: rope.theta,
+            attn_scalar: head_dim as f32,
+            window: None,
+            k_eq_v: false,
+            value_norm: attention.value_norm,
+            eps: self.config.rms_eps,
+        };
+        let (k, v) = metal.mtp_seed_kv_rows(
+            tokens,
+            states,
+            crate::metal_backend::MtpSeedWeights {
+                embed_tokens: &self.embed_tokens,
+                embed_scale: self.config.embed_scale.unwrap_or(1.0),
+                embed_recast_bf16: self.config.is_qwen && qwen_embed_bf16_enabled(),
+                pre_fc_norm_embedding: &head.pre_fc_norm_embedding,
+                pre_fc_norm_hidden: &head.pre_fc_norm_hidden,
+                fc: &head.fc,
+                input_norm: &head.layer.input_norm,
+                k_proj: &attention.k_proj,
+                v_proj,
+                k_norm,
+            },
+            spec,
+            history.len(),
+        )?;
+        let layout =
+            super::attention_ops::attention_layout(&self.config, attention, &empty_q, &k, &v)?;
+        history.append_batch_owned(k, v, &layout)?;
+        Ok(true)
+    }
+
+    /// FC de la tête sur un bloc du semis. Côté Metal, la projection batchée
+    /// passe par le GEMM tuilé au lieu du qmv ligne à ligne de `forward`, qui
+    /// redéquantifiait le poids pour chaque ligne du bloc.
+    fn seed_mtp_fc(
+        &self,
+        fc: &crate::linear::Linear,
+        input: &Tensor,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<Tensor> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = runtime.metal_executor().filter(|_| fc.bias().is_none()) {
+            let [x] = metal.project_biasless(input, [fc])?;
+            return Ok(x);
+        }
+        fc.forward_with_runtime(input, runtime)
     }
 
     /// Hit du cache de préfixe prolongé jusqu'à `prompt`, avec le nombre de
@@ -3949,6 +4120,7 @@ impl CausalDecoder {
     fn prefix_cache_get_with_mtp_history(
         &self,
         prompt: &[usize],
+        on_final_state: &mut dyn FnMut(&Tensor) -> Result<bool>,
     ) -> Result<Option<(CausalDecoderCache, Tensor, LayerKvCache, usize)>> {
         let Some((mut output, cached_len, Some(mut history), _)) =
             self.prefix_cache_hit(prompt, true)?
@@ -3959,9 +4131,20 @@ impl CausalDecoder {
             let suffix = &prompt[cached_len..];
             let (final_states, _) =
                 self.forward_suffix_batched(&mut output.0, suffix, None, true)?;
+            let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
+            if !on_final_state(&final_state)? {
+                return Ok(Some((
+                    output.0,
+                    final_state,
+                    LayerKvCache::default(),
+                    cached_len,
+                )));
+            }
             self.extend_mtp_history_suffix(&output.1, &final_states, suffix, &mut history)?;
-            output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
+            output.1 = final_state;
             self.prefix_cache_put(prompt, &output, Some(&history), None)?;
+        } else if !on_final_state(&output.1)? {
+            history = LayerKvCache::default();
         }
         Ok(Some((output.0, output.1, history, cached_len)))
     }
@@ -4113,14 +4296,12 @@ impl CausalDecoder {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let started = Instant::now();
-            if let Some((final_hidden, captures)) =
-                self.extend_cache_metal_resident(cache, suffix, layer_ids.unwrap_or_default())?
-            {
-                let final_hidden = if all_states {
-                    final_hidden
-                } else {
-                    Tensor::row(final_hidden.last_row()?.to_vec())?
-                };
+            if let Some((final_hidden, captures)) = self.extend_cache_metal_resident(
+                cache,
+                suffix,
+                layer_ids.unwrap_or_default(),
+                !all_states,
+            )? {
                 let states = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
                 if trace_prefill_enabled() {
                     eprintln!(
@@ -4464,10 +4645,11 @@ impl CausalDecoder {
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
         // Chemin AR : n'a besoin que du dernier état normé (1er token décodé).
-        let Some((cache, final_hidden)) = self.prefill_resident_cache_and_hidden(prompt)? else {
+        let Some((cache, final_hidden, _)) =
+            self.prefill_resident_cache_hidden_and_captures(prompt, &[], true)?
+        else {
             return Ok(None);
         };
-        let final_hidden = Tensor::row(final_hidden.last_row()?.to_vec())?;
         let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
         Ok(Some((cache, final_state)))
     }
@@ -4495,7 +4677,7 @@ impl CausalDecoder {
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
         Ok(self
-            .prefill_resident_cache_hidden_and_captures(prompt, &[])?
+            .prefill_resident_cache_hidden_and_captures(prompt, &[], false)?
             .map(|(cache, hidden, _)| (cache, hidden)))
     }
 
@@ -4555,6 +4737,7 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
         capture_layer_ids: &[usize],
+        last_row_only: bool,
     ) -> Result<Option<(CausalDecoderCache, Tensor, Option<Tensor>)>> {
         if !prefill_resident_enabled() {
             return Ok(None);
@@ -4583,6 +4766,7 @@ impl CausalDecoder {
             spec,
             capture_layer_ids,
             crate::runtime_flags::prefill_resident_chunk_tokens(),
+            last_row_only,
         ) {
             Ok((final_hidden, layer_states, captures)) => {
                 if layer_states.len() != self.layers.len() {
@@ -4597,7 +4781,11 @@ impl CausalDecoder {
                     cache.layers.iter_mut().zip(layers.iter()).zip(layer_states)
                 {
                     match layer_state {
-                        crate::metal_backend::PrefillResidentLayerCache::Full { key, value } => {
+                        crate::metal_backend::PrefillResidentLayerCache::Full {
+                            key,
+                            value,
+                            kv_dim,
+                        } => {
                             let layer_spec = prefill_layer.attention_spec;
                             let layout = AttentionLayout {
                                 num_attention_heads: layer_spec.q_heads,
@@ -4607,7 +4795,7 @@ impl CausalDecoder {
                                 attn_scalar: layer_spec.attn_scalar,
                                 sliding_window: layer_spec.window,
                             };
-                            layer_cache.append_batch_owned(key, value, &layout)?;
+                            layer_cache.append_prefill(key, value, kv_dim, &layout)?;
                         }
                         crate::metal_backend::PrefillResidentLayerCache::Linear { state } => {
                             layer_cache

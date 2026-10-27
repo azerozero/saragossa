@@ -3,6 +3,9 @@
 use crate::{InferError, Result, Tensor};
 use rayon::prelude::*;
 
+/// Lignes à partir desquelles une norme se parallélise.
+const PARALLEL_MIN_ROWS: usize = 64;
+
 /// Applique une LayerNorm standard ligne par ligne.
 ///
 /// Contrairement a RMSNorm, Whisper soustrait la moyenne avant de normaliser par
@@ -49,14 +52,26 @@ pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Resul
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let (rows, dim) = x.as_matrix()?;
     let weight_data = norm_vector(weight, dim, "RMSNorm weight")?;
-    let mut out = Vec::with_capacity(x.len());
-    for row in 0..rows {
-        let xs = x.row_slice(row)?;
+    let input = x.data();
+    let mut out = vec![0.0_f32; rows * dim];
+    let norm_row = |(row, out_row): (usize, &mut [f32])| {
+        let xs = &input[row * dim..(row + 1) * dim];
         let mean_square = xs.iter().map(|v| v * v).sum::<f32>() / dim as f32;
         let inv_rms = 1.0 / (mean_square + eps).sqrt();
-        for col in 0..dim {
-            out.push(xs[col] * inv_rms * weight_data[col]);
+        for (col, slot) in out_row.iter_mut().enumerate() {
+            *slot = xs[col] * inv_rms * weight_data[col];
         }
+    };
+    // Parallélisé par ligne au-delà d'un lot (même ordre intra-ligne ⇒
+    // byte-identique) : le semis MTP et la norme finale du prefill normalisent
+    // tout le prompt, ~0,1 ms par millier de lignes en série. Le decode (une
+    // ligne) reste séquentiel, sans aller-retour rayon.
+    if rows >= PARALLEL_MIN_ROWS {
+        out.par_chunks_mut(dim.max(1))
+            .enumerate()
+            .for_each(norm_row);
+    } else {
+        out.chunks_mut(dim.max(1)).enumerate().for_each(norm_row);
     }
     Tensor::from_vec(vec![rows, dim], out)
 }

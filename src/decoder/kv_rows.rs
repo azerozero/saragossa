@@ -16,8 +16,49 @@ const MIN_SEGMENT_FLOATS: usize = 1 << 18;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct KvRows {
-    segments: Vec<Arc<Vec<f32>>>,
+    segments: Vec<Arc<Segment>>,
     len: usize,
+}
+
+/// Bloc de lignes : possédé, ou vue figée du buffer GPU d'un prefill (relu en
+/// place, sans copie ni faute de page sur une mémoire neuve).
+#[derive(Clone, Debug)]
+enum Segment {
+    Owned(Vec<f32>),
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    Shared(crate::metal_backend::SharedF32Rows),
+}
+
+impl Segment {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Owned(data) => data,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::Shared(rows) => rows.as_slice(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// Allocation tenue (identité, f32 réservés) : une vue partagée, même
+    /// tronquée ou clonée, garde tout son buffer en vie.
+    fn allocation(&self) -> (usize, usize) {
+        match self {
+            Self::Owned(data) => (data.as_ptr().addr(), data.capacity()),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::Shared(rows) => (rows.allocation_id(), rows.allocation_len()),
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Owned(data) => data.truncate(len),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::Shared(rows) => rows.truncate(len),
+        }
+    }
 }
 
 impl KvRows {
@@ -44,14 +85,15 @@ impl KvRows {
             .flat_map(move |segment| segment.chunks_exact(dim))
     }
 
-    /// Octets réservés, capacité comprise, des segments absents de `seen` ;
-    /// les segments comptés y sont ajoutés (un segment partagé ne compte
-    /// qu'une fois sur plusieurs snapshots).
+    /// Octets réservés, capacité comprise, des allocations absentes de `seen` ;
+    /// les allocations comptées y sont ajoutées (un segment partagé entre
+    /// snapshots, ou plusieurs vues d'un même buffer, ne compte qu'une fois).
     pub(super) fn capacity_bytes_unseen(&self, seen: &mut HashSet<usize>) -> usize {
         self.segments
             .iter()
-            .filter(|segment| seen.insert(Arc::as_ptr(segment) as usize))
-            .map(|segment| segment.capacity())
+            .map(|segment| segment.allocation())
+            .filter(|(id, _)| seen.insert(*id))
+            .map(|(_, floats)| floats)
             .sum::<usize>()
             .saturating_mul(std::mem::size_of::<f32>())
     }
@@ -60,7 +102,7 @@ impl KvRows {
         if data.is_empty() {
             return;
         }
-        if let Some(last) = self.segments.last_mut().and_then(Arc::get_mut) {
+        if let Some(Segment::Owned(last)) = self.segments.last_mut().and_then(Arc::get_mut) {
             if last.capacity() - last.len() >= data.len() {
                 last.extend_from_slice(data);
                 self.len += data.len();
@@ -69,7 +111,7 @@ impl KvRows {
         }
         let mut segment = Vec::with_capacity(data.len().max(MIN_SEGMENT_FLOATS));
         segment.extend_from_slice(data);
-        self.segments.push(Arc::new(segment));
+        self.segments.push(Arc::new(Segment::Owned(segment)));
         self.len += data.len();
     }
 
@@ -79,7 +121,35 @@ impl KvRows {
             return;
         }
         self.len += data.len();
-        self.segments.push(Arc::new(data));
+        self.segments.push(Arc::new(Segment::Owned(data)));
+    }
+
+    /// Ajoute le K ou V d'un prefill résident, vue GPU comprise, sans copie.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn push_prefill(&mut self, rows: crate::metal_backend::PrefillKvRows) {
+        match rows {
+            crate::metal_backend::PrefillKvRows::Owned(data) => self.push_owned(data),
+            crate::metal_backend::PrefillKvRows::Shared(rows) => {
+                if rows.len() == 0 {
+                    return;
+                }
+                self.len += rows.len();
+                self.segments.push(Arc::new(Segment::Shared(rows)));
+            }
+        }
+    }
+
+    /// Segments dans l'ordre, avec leur provenance pour le semis de l'arène.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn seed_segments(&self) -> Vec<crate::decode_resident::KvSeedSegment<'_>> {
+        use crate::decode_resident::KvSeedSegment;
+        self.segments
+            .iter()
+            .map(|segment| match segment.as_ref() {
+                Segment::Owned(data) => KvSeedSegment::Cpu(data),
+                Segment::Shared(rows) => KvSeedSegment::Shared(rows),
+            })
+            .collect()
     }
 
     /// Ramène à `len` f32 ; seul le segment coupé en deux est recopié s'il

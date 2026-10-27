@@ -2163,6 +2163,17 @@ impl CausalDecoder {
             mtp.layer
                 .attention
                 .materialize_metal_weight_buffers(metal)?;
+            // Concat K|V du semis MTP (`mtp_seed_kv_rows`), à bâtir tant que les
+            // payloads CPU existent.
+            if let Some(v_proj) = &mtp.layer.attention.v_proj {
+                match metal.resolve_concat_linear_weight_buffers(
+                    &[mtp.layer.attention.k_proj.weight(), v_proj.weight()],
+                    "mtp_seed_kv_proj",
+                ) {
+                    Ok(_) | Err(InferError::Dimension(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
             materialize_feed_forward_weight_buffers(metal, &mtp.layer.mlp, None)?;
             mtp.fc.release_affine_cpu_data(released);
             mtp.layer.attention.release_affine_cpu_data(released);

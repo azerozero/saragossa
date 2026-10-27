@@ -66,6 +66,10 @@ mod moe_encode;
 mod moe_na;
 mod moe_shared;
 pub(crate) mod mtp_control;
+mod mtp_seed;
+mod shared_rows;
+pub(crate) use self::mtp_seed::MtpSeedWeights;
+pub(crate) use self::shared_rows::{PrefillKvRows, SharedF32Rows};
 mod na_gemm;
 mod pipelines;
 mod prefill;
@@ -242,6 +246,7 @@ pub struct MetalExecutor {
     add_sigmoid_scaled_f32: ComputePipelineState,
     add_sigmoid_scaled_rows_f32: ComputePipelineState,
     copy_f32: ComputePipelineState,
+    copy_cols_f32: ComputePipelineState,
     copy_u16: ComputePipelineState,
     rms_norm_rows_f32: ComputePipelineState,
     rms_norm_simd_rows_f32: ComputePipelineState,
@@ -722,8 +727,14 @@ pub(crate) enum PrefillResidentPrefixLayer<'a> {
 
 #[derive(Debug)]
 pub(crate) enum PrefillResidentLayerCache {
-    Full { key: Tensor, value: Tensor },
-    Linear { state: LinearAttentionMetalState },
+    Full {
+        key: PrefillKvRows,
+        value: PrefillKvRows,
+        kv_dim: usize,
+    },
+    Linear {
+        state: LinearAttentionMetalState,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

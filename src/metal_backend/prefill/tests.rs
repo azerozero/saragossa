@@ -129,9 +129,42 @@ fn zero_linear(rows: usize, cols: usize) -> Result<Linear> {
     Linear::new(Tensor::zeros(vec![rows, cols])?, None)
 }
 
-fn full_cache(caches: &[PrefillResidentLayerCache]) -> Result<(&Tensor, &Tensor)> {
+/// K ou V d'un cache de prefill en tenseur `[rows, kv_dim]`, vue partagée ou
+/// copie relue.
+fn kv_tensor(rows: &PrefillKvRows, kv_dim: usize) -> Result<Tensor> {
+    let data = rows.data().to_vec();
+    Tensor::from_vec(vec![data.len() / kv_dim.max(1), kv_dim], data)
+}
+
+/// Caches de prefill avec K/V en tenseurs, pour les comparaisons d'oracle.
+enum TestCache<'a> {
+    Full {
+        key: Tensor,
+        value: Tensor,
+    },
+    Linear {
+        state: &'a LinearAttentionMetalState,
+    },
+}
+
+fn test_caches(caches: &[PrefillResidentLayerCache]) -> Result<Vec<TestCache<'_>>> {
+    caches
+        .iter()
+        .map(|cache| match cache {
+            PrefillResidentLayerCache::Full { key, value, kv_dim } => Ok(TestCache::Full {
+                key: kv_tensor(key, *kv_dim)?,
+                value: kv_tensor(value, *kv_dim)?,
+            }),
+            PrefillResidentLayerCache::Linear { state } => Ok(TestCache::Linear { state }),
+        })
+        .collect()
+}
+
+fn full_cache(caches: &[PrefillResidentLayerCache]) -> Result<(Tensor, Tensor)> {
     match caches {
-        [PrefillResidentLayerCache::Full { key, value }] => Ok((key, value)),
+        [PrefillResidentLayerCache::Full { key, value, kv_dim }] => {
+            Ok((kv_tensor(key, *kv_dim)?, kv_tensor(value, *kv_dim)?))
+        }
         _ => Err(InferError::Dimension(format!(
             "oracle prefill attend un cache full unique, reçu {}",
             caches.len()
@@ -395,7 +428,7 @@ fn gemma_global_attention_prefill_matches_cpu() -> Result<()> {
     let expected = input.add(&crate::rms_norm(&attention_output, &post_norm, EPS)?)?;
 
     let (actual, caches) = executor.qwen_moe_prefill_resident(&input, &[layer], spec)?;
-    let (actual_key, actual_value) = full_cache(&caches)?;
+    let (ref actual_key, ref actual_value) = full_cache(&caches)?;
     // Near-tie RoPE f32 : la réduction Metal peut décaler K de quelques ULP
     // (écart mesuré 1,035e-4), sans modifier V ni la sortie d'attention.
     let key_tolerance = 2.0e-4;
@@ -535,7 +568,7 @@ fn gemma_windowed_attention_prefill_matches_cpu() -> Result<()> {
     );
 
     let (actual, caches) = executor.qwen_moe_prefill_resident(&input, &[layer], spec)?;
-    let (actual_key, actual_value) = full_cache(&caches)?;
+    let (ref actual_key, ref actual_value) = full_cache(&caches)?;
     let tolerance = 1.0e-4;
     // NOTE: near-tie sur la clé — le RoPE des couches sliding applique une base
     // locale (theta=1e4) dont la rotation accumule un peu plus d'erreur f32 que
@@ -628,8 +661,8 @@ fn gemma_windowed_attention_prefill_full_window_is_causal_bit_exact() -> Result<
         window: Some(WINDOW),
         ..causal_spec
     })?;
-    let (causal_key, causal_value) = full_cache(&causal_caches)?;
-    let (windowed_key, windowed_value) = full_cache(&windowed_caches)?;
+    let (ref causal_key, ref causal_value) = full_cache(&causal_caches)?;
+    let (ref windowed_key, ref windowed_value) = full_cache(&windowed_caches)?;
     assert_bit_exact(&windowed, &causal, "gemma full-window output");
     assert_bit_exact(windowed_key, causal_key, "gemma full-window key");
     assert_bit_exact(windowed_value, causal_value, "gemma full-window value");
@@ -708,8 +741,8 @@ fn gemma_global_attention_aliases_raw_k_as_v() -> Result<()> {
         },
         &k_proj,
     )?;
-    let (_, alias_value) = full_cache(&alias_caches)?;
-    let (_, projected_k_value) = full_cache(&projected_k_caches)?;
+    let (_, ref alias_value) = full_cache(&alias_caches)?;
+    let (_, ref projected_k_value) = full_cache(&projected_k_caches)?;
     assert_bit_exact(alias_value, projected_k_value, "gemma raw K alias V");
     Ok(())
 }
@@ -818,8 +851,14 @@ fn prefill_resident_uses_layer_specific_attention_dimensions() -> Result<()> {
     );
     // Captures : la sortie de la couche 0 est l'entrée de la couche 1 (= sortie
     // du run à une couche), celle de la couche 1 est la sortie finale.
-    let (_, _, captures) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, base, &[0, 1], 0)?;
+    let (_, _, captures) = executor.qwen_moe_prefill_resident_with_captures(
+        &input,
+        &layers,
+        base,
+        &[0, 1],
+        0,
+        false,
+    )?;
     let captures = captures.ok_or_else(|| InferError::Config("captures absentes".to_string()))?;
     assert_eq!(captures.shape(), &[SEQ, 2 * HIDDEN]);
     for row in 0..SEQ {
@@ -835,18 +874,18 @@ fn prefill_resident_uses_layer_specific_attention_dimensions() -> Result<()> {
             "capture couche 1 ligne {row}"
         );
     }
-    match caches.as_slice() {
-        [PrefillResidentLayerCache::Full {
+    match test_caches(&caches)?.as_slice() {
+        [TestCache::Full {
             key: first,
             value: first_value,
-        }, PrefillResidentLayerCache::Full {
+        }, TestCache::Full {
             key: second,
             value: second_value,
         }] => {
             assert_eq!(first.shape(), &[SEQ, 4]);
             assert_eq!(second.shape(), &[SEQ, 2]);
-            let (expected_first, expected_first_value) = full_cache(&first_cache)?;
-            let (expected_second, expected_second_value) = full_cache(&second_cache)?;
+            let (ref expected_first, ref expected_first_value) = full_cache(&first_cache)?;
+            let (ref expected_second, ref expected_second_value) = full_cache(&second_cache)?;
             assert_bit_exact(first, expected_first, "prefill multi-layout K couche 0");
             assert_bit_exact(
                 first_value,
@@ -949,7 +988,7 @@ fn qwen3_moe_prefill_resident_matches_legacy_bit_exact() -> Result<()> {
         }],
         spec,
     )?;
-    let (resident_key, resident_value) = full_cache(&caches)?;
+    let (ref resident_key, ref resident_value) = full_cache(&caches)?;
     assert_bit_exact(&resident, &legacy, "qwen prefill output");
     assert_bit_exact(resident_key, &legacy_key, "qwen prefill key");
     assert_bit_exact(resident_value, &legacy_value, "qwen prefill value");
@@ -1086,10 +1125,36 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
     let layers = make_layers(spec);
 
     let (single, single_caches, single_captures) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 0)?;
+        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 0, false)?;
     // 512 → trois morceaux de 367/367/366 lignes.
-    let (chunked, chunked_caches, chunked_captures) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512)?;
+    let (chunked, chunked_caches, chunked_captures) = executor
+        .qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, false)?;
+    // Dernière ligne seule : la couche finale (attention complète) ne calcule
+    // que son K/V sur les morceaux non finaux ; ligne et KV restent identiques.
+    let (last, last_caches, _) =
+        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, true)?;
+    let hidden = last.data().len();
+    assert_eq!(last.shape(), &[1, hidden]);
+    assert_eq!(
+        last.data(),
+        &chunked.data()[chunked.data().len() - hidden..]
+    );
+    for (a, b) in test_caches(&last_caches)?
+        .iter()
+        .zip(&test_caches(&chunked_caches)?)
+    {
+        if let (
+            TestCache::Full { key, value },
+            TestCache::Full {
+                key: key_ref,
+                value: value_ref,
+            },
+        ) = (a, b)
+        {
+            assert_eq!(key.data(), key_ref.data());
+            assert_eq!(value.data(), value_ref.data());
+        }
+    }
     let max_diff = |a: &[f32], b: &[f32]| {
         a.iter()
             .zip(b)
@@ -1109,17 +1174,20 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
         1.0e-4,
         "prefill par morceaux capture",
     );
-    match (single_caches.as_slice(), chunked_caches.as_slice()) {
+    match (
+        test_caches(&single_caches)?.as_slice(),
+        test_caches(&chunked_caches)?.as_slice(),
+    ) {
         (
-            [PrefillResidentLayerCache::Linear {
+            [TestCache::Linear {
                 state: single_state,
-            }, PrefillResidentLayerCache::Full {
+            }, TestCache::Full {
                 key: single_key,
                 value: single_value,
             }],
-            [PrefillResidentLayerCache::Linear {
+            [TestCache::Linear {
                 state: chunked_state,
-            }, PrefillResidentLayerCache::Full {
+            }, TestCache::Full {
                 key: chunked_key,
                 value: chunked_value,
             }],
@@ -1172,7 +1240,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             layers: prefix_caches
                 .iter()
                 .map(|cache| match cache {
-                    PrefillResidentLayerCache::Full { key, value } => {
+                    PrefillResidentLayerCache::Full { key, value, .. } => {
                         PrefillResidentPrefixLayer::Full {
                             key: vec![key.data()],
                             value: vec![value.data()],
@@ -1191,6 +1259,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             &[],
             512,
             Some(&prefix),
+            false,
         )?;
         assert_close(
             &extended,
@@ -1198,17 +1267,20 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             1.0e-4,
             "prolongement sortie",
         );
-        match (single_caches.as_slice(), extended_caches.as_slice()) {
+        match (
+            test_caches(&single_caches)?.as_slice(),
+            test_caches(&extended_caches)?.as_slice(),
+        ) {
             (
-                [PrefillResidentLayerCache::Linear {
+                [TestCache::Linear {
                     state: single_state,
-                }, PrefillResidentLayerCache::Full {
+                }, TestCache::Full {
                     key: single_key,
                     value: single_value,
                 }],
-                [PrefillResidentLayerCache::Linear {
+                [TestCache::Linear {
                     state: extended_state,
-                }, PrefillResidentLayerCache::Full {
+                }, TestCache::Full {
                     key: extended_key,
                     value: extended_value,
                 }],

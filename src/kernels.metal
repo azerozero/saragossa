@@ -7436,6 +7436,23 @@ kernel void copy_f32(
     out[gid] = src[gid];
 }
 
+// Copie `cols` colonnes de chaque ligne d'une matrice au pas `src_stride`
+// vers une matrice contiguë : sépare les blocs d'une sortie de projections
+// concaténées (K|V du semis MTP).
+kernel void copy_cols_f32(
+    device const float* src [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    constant uint& src_stride [[buffer(3)]],
+    constant uint& len [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) {
+        return;
+    }
+    out[gid] = src[(gid / cols) * src_stride + gid % cols];
+}
+
 kernel void copy_u16(
     device const ushort* src [[buffer(0)]],
     device ushort* out [[buffer(1)]],
@@ -7532,12 +7549,15 @@ kernel void rms_norm_simd_u3_rows_f32(
     }
 }
 
+// `out_stride` (= `dim` en général) laisse deux appels remplir les deux
+// moitiés d'une concaténation par lignes (semis MTP) sans copie.
 kernel void rms_norm_rows_f32(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
     device float* out [[buffer(2)]],
     constant uint& dim [[buffer(3)]],
     constant float& eps [[buffer(4)]],
+    constant uint& out_stride [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint row [[threadgroup_position_in_grid]]
 ) {
@@ -7559,8 +7579,9 @@ kernel void rms_norm_rows_f32(
     }
 
     const float inv_rms = rsqrt((partial[0] / float(dim)) + eps);
+    const uint out_offset = row * out_stride;
     for (uint col = tid; col < dim; col += 256u) {
-        out[offset + col] = input[offset + col] * inv_rms * weight[col];
+        out[out_offset + col] = input[offset + col] * inv_rms * weight[col];
     }
 }
 

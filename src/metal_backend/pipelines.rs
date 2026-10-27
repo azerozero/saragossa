@@ -552,6 +552,7 @@ impl MetalExecutor {
         let add_sigmoid_scaled_rows_f32 =
             pipeline(&library, &device, "add_sigmoid_scaled_rows_f32")?;
         let copy_f32 = pipeline(&library, &device, "copy_f32")?;
+        let copy_cols_f32 = pipeline(&library, &device, "copy_cols_f32")?;
         let copy_u16 = pipeline(&library, &device, "copy_u16")?;
         let rms_norm_rows_f32 = pipeline(&library, &device, "rms_norm_rows_f32")?;
         let rms_norm_simd_rows_f32 = pipeline(&library, &device, "rms_norm_simd_rows_f32")?;
@@ -771,6 +772,7 @@ impl MetalExecutor {
             add_sigmoid_scaled_f32,
             add_sigmoid_scaled_rows_f32,
             copy_f32,
+            copy_cols_f32,
             copy_u16,
             rms_norm_rows_f32,
             rms_norm_simd_rows_f32,

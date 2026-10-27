@@ -38,7 +38,7 @@ impl MetalExecutor {
         spec: PrefillAttentionSpec,
     ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>)> {
         let (output, caches, _) =
-            self.qwen_moe_prefill_resident_with_captures(input, layers, spec, &[], 0)?;
+            self.qwen_moe_prefill_resident_with_captures(input, layers, spec, &[], 0, false)?;
         Ok((output, caches))
     }
 
@@ -49,6 +49,7 @@ impl MetalExecutor {
         spec: PrefillAttentionSpec,
         capture_layer_ids: &[usize],
         chunk_tokens: usize,
+        last_row_only: bool,
     ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>, Option<Tensor>)> {
         self.qwen_moe_prefill_resident_from(
             input,
@@ -57,6 +58,7 @@ impl MetalExecutor {
             capture_layer_ids,
             chunk_tokens,
             None,
+            last_row_only,
         )
     }
 
@@ -80,7 +82,10 @@ impl MetalExecutor {
     /// `prefill_resident_chunk_tokens`. Avec `prefix`, `input` ne porte que les
     /// `spec.seq - prefix.rows` positions nouvelles ; sorties, captures et KV
     /// rendus ne couvrent que celles-ci, l'état linéaire du préfixe avance en
-    /// place.
+    /// place. `last_row_only` rend la seule dernière ligne `[1, hidden]` : la
+    /// dernière couche, si elle est en attention complète et non capturée, ne
+    /// calcule alors que son K/V sur les morceaux non finaux (ses autres sorties
+    /// n'alimentent rien), et seule cette ligne est relue.
     pub(crate) fn qwen_moe_prefill_resident_from(
         &self,
         input: &Tensor,
@@ -89,6 +94,7 @@ impl MetalExecutor {
         capture_layer_ids: &[usize],
         chunk_tokens: usize,
         prefix: Option<&PrefillResidentPrefix<'_>>,
+        last_row_only: bool,
     ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>, Option<Tensor>)> {
         let profile_sections = prefill_profile_sections_enabled();
         if profile_sections {
@@ -152,7 +158,7 @@ impl MetalExecutor {
             )?;
             Some(self.uncached_f32_buffer(len, "resident_captures")?)
         };
-        let final_output = if chunk_count > 1 || private_scratch_enabled() {
+        let final_output = if (chunk_count > 1 && !last_row_only) || private_scratch_enabled() {
             Some(self.uncached_f32_buffer(hidden_len, "resident_final_output")?)
         } else {
             None
@@ -279,6 +285,11 @@ impl MetalExecutor {
                     };
                     let (q_dim, kv_dim, layer_shape) =
                         self.resident_prefill_layer_shape(layer, layer_index, spec, hidden_dim)?;
+                    let kv_only = last_row_only
+                        && layer_index + 1 == layers.len()
+                        && chunk.start + chunk.rows < spec.seq
+                        && matches!(layer.attention, PrefillAttentionLayer::Full { .. })
+                        && !capture_layer_ids.contains(&layer_index);
                     // Scratch dimensionné sur `chunk_rows` : le dernier morceau, plus
                     // court, réutilise les mêmes buffers du cache de scratch.
                     let scratch = self.allocate_prefill_resident_layer_scratch(
@@ -327,7 +338,11 @@ impl MetalExecutor {
                         hidden_dim,
                         q_dim,
                         layer_index,
+                        kv_only,
                     )?;
+                    if kv_only {
+                        continue;
+                    }
                     self.encode_resident_residual_phase(
                         &mut encode_context,
                         &current_buffer,
@@ -403,6 +418,7 @@ impl MetalExecutor {
                 }
             }
         }
+        let final_output_used = final_output.is_some();
         let final_read_buffer = final_output.unwrap_or(current_buffer);
         let encode_elapsed = encode_started.map(|started| started.elapsed());
         let wait_elapsed = if profile_sections {
@@ -428,7 +444,28 @@ impl MetalExecutor {
 
         let read_started = trace.then(std::time::Instant::now);
         let profile_read_started = profile_sections.then(std::time::Instant::now);
-        let output = read_f32_buffer(&final_read_buffer, hidden_len)?;
+        let output = if last_row_only {
+            // Dernière ligne du morceau final, ou de la sortie pleine longueur
+            // quand le scratch privé l'impose.
+            let last_row = if final_output_used {
+                rows - 1
+            } else {
+                (rows - 1) % chunk_rows
+            };
+            Tensor::from_vec(
+                vec![1, hidden_dim],
+                read_f32_buffer_at(
+                    &final_read_buffer,
+                    checked_len(last_row, hidden_dim, "prefill résident dernière ligne")?,
+                    hidden_dim,
+                )?,
+            )?
+        } else {
+            Tensor::from_vec(
+                vec![rows, hidden_dim],
+                read_f32_buffer(&final_read_buffer, hidden_len)?,
+            )?
+        };
         let captures = capture_buffer
             .map(|buffer| -> Result<Tensor> {
                 let count = capture_layer_ids.len();
@@ -453,12 +490,20 @@ impl MetalExecutor {
                     // y est déjà.
                     let kv_len = checked_len(rows, kv_dim, "prefill résident readback kv")?;
                     let kv_offset = checked_len(start, kv_dim, "prefill résident readback kv")?;
-                    let key = read_f32_buffer_at(&key, kv_offset, kv_len)?;
-                    let value = read_f32_buffer_at(&value, kv_offset, kv_len)?;
-                    layer_caches.push(PrefillResidentLayerCache::Full {
-                        key: Tensor::from_vec(vec![rows, kv_dim], key)?,
-                        value: Tensor::from_vec(vec![rows, kv_dim], value)?,
-                    });
+                    // Prefill complet : le buffer, que plus rien n'écrit, devient
+                    // le stockage CPU du K/V. Extension : il porte aussi le
+                    // préfixe, seules les lignes nouvelles sont relues.
+                    let (key, value) = if start == 0
+                        && crate::runtime_flags::prefill_kv_shared_enabled()
+                    {
+                        shared_kv_rows(key, value, kv_len)?
+                    } else {
+                        (
+                            PrefillKvRows::Owned(read_f32_buffer_at(&key, kv_offset, kv_len)?),
+                            PrefillKvRows::Owned(read_f32_buffer_at(&value, kv_offset, kv_len)?),
+                        )
+                    };
+                    layer_caches.push(PrefillResidentLayerCache::Full { key, value, kv_dim });
                 }
                 PrefillResidentLayerCacheBuffer::Linear { state } => {
                     layer_caches.push(PrefillResidentLayerCache::Linear { state });
@@ -489,11 +534,7 @@ impl MetalExecutor {
             );
             section_profile.dump();
         }
-        Ok((
-            Tensor::from_vec(vec![rows, hidden_dim], output)?,
-            layer_caches,
-            captures,
-        ))
+        Ok((output, layer_caches, captures))
     }
 
     /// Lignes par morceau : les `rows` positions à calculer sont coupées en
@@ -1063,5 +1104,26 @@ impl MetalExecutor {
                 "prefill résident tail MoE incohérent couche {layer_index}"
             ))),
         }
+    }
+}
+
+/// Remet les buffers K/V d'un prefill terminé comme vues partagées.
+#[expect(
+    unsafe_code,
+    reason = "les buffers K/V du prefill passent au cache CPU en lecture seule"
+)]
+fn shared_kv_rows(
+    key: metal::Buffer,
+    value: metal::Buffer,
+    kv_len: usize,
+) -> Result<(PrefillKvRows, PrefillKvRows)> {
+    // SAFETY: buffers `uncached_f32_buffer` propres à ce prefill, hors scratch :
+    // son command buffer est terminé et l'appelant les cède ici, plus rien ne
+    // les écrit ensuite.
+    unsafe {
+        Ok((
+            PrefillKvRows::Shared(SharedF32Rows::new(key, 0, kv_len)?),
+            PrefillKvRows::Shared(SharedF32Rows::new(value, 0, kv_len)?),
+        ))
     }
 }
