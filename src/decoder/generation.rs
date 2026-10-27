@@ -3150,6 +3150,7 @@ impl CausalDecoder {
             let target_hidden = captures.ok_or_else(|| {
                 InferError::Config("prefill résident sans captures de couches".to_string())
             })?;
+            let final_hidden = final_hidden.into_tensor(self.final_norm.data().len())?;
             let final_states = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
             return Ok((cache, final_states, target_hidden));
         }
@@ -3584,7 +3585,10 @@ impl CausalDecoder {
             }
         }
         cache.position = start + suffix.len();
-        Ok(Some((final_hidden, captures)))
+        Ok(Some((
+            final_hidden.into_tensor(self.final_norm.data().len())?,
+            captures,
+        )))
     }
 
     /// Capture les états Metal attachés à un état de prompt.
@@ -3746,10 +3750,20 @@ impl CausalDecoder {
             #[cfg(not(all(target_os = "macos", feature = "metal")))]
             let resident: Option<(CausalDecoderCache, Tensor)> = None;
             match resident {
+                // Hidden lu en place : la norme finale de tout le prompt passe
+                // au semis GPU, seule la dernière ligne est normée ici.
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                Some((cache, crate::metal_backend::PrefillKvRows::Shared(raw)))
+                    if crate::runtime_flags::mtp_seed_gpu_enabled() =>
+                {
+                    (cache, PromptStates::Raw(raw))
+                }
                 Some((cache, final_hidden)) => {
+                    #[cfg(all(target_os = "macos", feature = "metal"))]
+                    let final_hidden = final_hidden.into_tensor(self.final_norm.data().len())?;
                     let final_states =
                         rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
-                    (cache, final_states)
+                    (cache, PromptStates::Normed(final_states))
                 }
                 None => {
                     let runtime = self.forward_runtime();
@@ -3766,11 +3780,22 @@ impl CausalDecoder {
                     }
                     cache.position = prompt.len();
                     let final_states = rms_norm(&hidden, &self.final_norm, self.config.rms_eps)?;
-                    (cache, final_states)
+                    (cache, PromptStates::Normed(final_states))
                 }
             }
         };
-        let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
+        let hidden = self.final_norm.data().len();
+        let final_state = match &final_states {
+            PromptStates::Normed(states) => Tensor::row(states.last_row()?.to_vec())?,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            PromptStates::Raw(raw) => {
+                let last = raw.as_slice().len().checked_sub(hidden).ok_or_else(|| {
+                    InferError::Dimension("prefill MTP sans ligne finale".to_string())
+                })?;
+                let row = Tensor::row(raw.as_slice()[last..].to_vec())?;
+                rms_norm(&row, &self.final_norm, self.config.rms_eps)?
+            }
+        };
         if let Some(t) = t_main {
             eprintln!("mtp_setup prefill_main_us={}", t.elapsed().as_micros());
         }
@@ -3780,12 +3805,32 @@ impl CausalDecoder {
         let t_history = trace_setup.then(Instant::now);
         let mut mtp_history = LayerKvCache::default();
         let seeded = prompt.len().saturating_sub(1);
-        let hidden = self.final_norm.data().len();
-        self.seed_mtp_history_batched(
-            &final_states.data()[..seeded * hidden],
-            &prompt[1..],
-            &mut mtp_history,
-        )?;
+        let normed = match final_states {
+            PromptStates::Normed(states) => Some(states),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            PromptStates::Raw(raw) => {
+                if self.seed_mtp_history_raw(&raw, &prompt[1..], &mut mtp_history)? {
+                    None
+                } else {
+                    let hidden_rows = Tensor::from_vec(
+                        vec![raw.len() / hidden.max(1), hidden],
+                        raw.as_slice().to_vec(),
+                    )?;
+                    Some(rms_norm(
+                        &hidden_rows,
+                        &self.final_norm,
+                        self.config.rms_eps,
+                    )?)
+                }
+            }
+        };
+        if let Some(normed) = normed {
+            self.seed_mtp_history_batched(
+                &normed.data()[..seeded * hidden],
+                &prompt[1..],
+                &mut mtp_history,
+            )?;
+        }
         if let Some(t) = t_history {
             eprintln!(
                 "mtp_setup prefill_mtp_history_us={} steps={seeded}",
@@ -3809,9 +3854,6 @@ impl CausalDecoder {
         tokens: &[usize],
         history: &mut LayerKvCache,
     ) -> Result<()> {
-        // Par blocs pour borner la mémoire des activations (fc, q/k/v) : sans
-        // attention, le coût par bloc ne dépend plus de l'historique.
-        const SEED_CHUNK: usize = 1024;
         let hidden = self.final_norm.data().len();
         for (states, tokens) in states
             .chunks(SEED_CHUNK.saturating_mul(hidden).max(1))
@@ -3820,6 +3862,36 @@ impl CausalDecoder {
             self.seed_mtp_history_chunk(states, tokens, history)?;
         }
         Ok(())
+    }
+
+    /// Sème l'historique depuis le hidden final non normé `raw` (vue du buffer
+    /// du prefill), norme finale comprise, sur le GPU. `false` : semis GPU
+    /// indisponible pour cette tête, historique intact.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn seed_mtp_history_raw(
+        &self,
+        raw: &crate::metal_backend::SharedF32Rows,
+        tokens: &[usize],
+        history: &mut LayerKvCache,
+    ) -> Result<bool> {
+        let (Some(head), Some(metal)) =
+            (self.mtp.as_ref(), self.forward_runtime().metal_executor())
+        else {
+            return Ok(false);
+        };
+        for (index, chunk) in tokens.chunks(SEED_CHUNK).enumerate() {
+            let states = crate::metal_backend::MtpSeedStates::Raw {
+                rows: raw,
+                first_row: index * SEED_CHUNK,
+                final_norm: &self.final_norm,
+            };
+            if !self.seed_mtp_history_chunk_metal(metal, head, states, chunk, history)? {
+                // L'éligibilité ne dépend que de la tête : seul le premier bloc
+                // peut refuser, avant toute écriture.
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn seed_mtp_history_chunk(
@@ -3847,6 +3919,7 @@ impl CausalDecoder {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if crate::runtime_flags::mtp_seed_gpu_enabled() {
             if let Some(metal) = runtime.metal_executor() {
+                let states = crate::metal_backend::MtpSeedStates::Normed(states);
                 if self.seed_mtp_history_chunk_metal(metal, head, states, tokens, history)? {
                     return Ok(());
                 }
@@ -3898,7 +3971,7 @@ impl CausalDecoder {
         &self,
         metal: &crate::MetalExecutor,
         head: &MtpHead,
-        states: &[f32],
+        states: crate::metal_backend::MtpSeedStates<'_>,
         tokens: &[usize],
         history: &mut LayerKvCache,
     ) -> Result<bool> {
@@ -4650,6 +4723,7 @@ impl CausalDecoder {
         else {
             return Ok(None);
         };
+        let final_hidden = final_hidden.into_tensor(self.final_norm.data().len())?;
         let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
         Ok(Some((cache, final_state)))
     }
@@ -4675,7 +4749,7 @@ impl CausalDecoder {
     fn prefill_resident_cache_and_hidden(
         &self,
         prompt: &[usize],
-    ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
+    ) -> Result<Option<(CausalDecoderCache, crate::metal_backend::PrefillKvRows)>> {
         Ok(self
             .prefill_resident_cache_hidden_and_captures(prompt, &[], false)?
             .map(|(cache, hidden, _)| (cache, hidden)))
@@ -4738,7 +4812,13 @@ impl CausalDecoder {
         prompt: &[usize],
         capture_layer_ids: &[usize],
         last_row_only: bool,
-    ) -> Result<Option<(CausalDecoderCache, Tensor, Option<Tensor>)>> {
+    ) -> Result<
+        Option<(
+            CausalDecoderCache,
+            crate::metal_backend::PrefillKvRows,
+            Option<Tensor>,
+        )>,
+    > {
         if !prefill_resident_enabled() {
             return Ok(None);
         }
@@ -5065,4 +5145,17 @@ fn append_tensor_rows(left: &Tensor, right: &Tensor) -> Result<Tensor> {
     data.extend_from_slice(left.data());
     data.extend_from_slice(right.data());
     Tensor::from_vec(vec![rows, left_cols], data)
+}
+
+/// Blocs du semis MTP : bornent la mémoire des activations (fc, k/v) ; sans
+/// attention, le coût par bloc ne dépend pas de l'historique.
+const SEED_CHUNK: usize = 1024;
+
+/// États de toutes les positions du prompt pour le semis MTP.
+enum PromptStates {
+    /// Normés, en mémoire CPU.
+    Normed(Tensor),
+    /// Hidden final non normé lu en place dans le buffer du prefill résident.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    Raw(crate::metal_backend::SharedF32Rows),
 }

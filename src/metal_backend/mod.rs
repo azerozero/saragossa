@@ -68,7 +68,7 @@ mod moe_shared;
 pub(crate) mod mtp_control;
 mod mtp_seed;
 mod shared_rows;
-pub(crate) use self::mtp_seed::MtpSeedWeights;
+pub(crate) use self::mtp_seed::{MtpSeedStates, MtpSeedWeights};
 pub(crate) use self::shared_rows::{PrefillKvRows, SharedF32Rows};
 mod na_gemm;
 mod pipelines;

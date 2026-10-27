@@ -19,6 +19,21 @@ pub(crate) struct MtpSeedWeights<'a> {
     pub k_norm: &'a Tensor,
 }
 
+/// États finaux d'un bloc du semis.
+#[derive(Clone, Copy)]
+pub(crate) enum MtpSeedStates<'a> {
+    /// `[seq, hidden]` déjà normés, téléversés.
+    Normed(&'a [f32]),
+    /// Lignes `first_row..first_row + seq` du hidden final non normé, lues en
+    /// place dans le buffer du prefill ; la norme finale passe sur le GPU au
+    /// lieu d'une relecture et d'une norme CPU de tout le prompt.
+    Raw {
+        rows: &'a SharedF32Rows,
+        first_row: usize,
+        final_norm: &'a Tensor,
+    },
+}
+
 impl MetalExecutor {
     /// K (normé, tourné à partir de `position_offset`) et V de la tête MTP pour
     /// `spec.seq` paires (embedding du token suivant, état final normé),
@@ -31,7 +46,7 @@ impl MetalExecutor {
     pub(crate) fn mtp_seed_kv_rows(
         &self,
         tokens: &[usize],
-        states: &[f32],
+        states: MtpSeedStates<'_>,
         weights: MtpSeedWeights<'_>,
         spec: PrefillAttentionSpec,
         position_offset: usize,
@@ -39,11 +54,21 @@ impl MetalExecutor {
         let rows = spec.seq;
         let hidden = spec.hidden_dim;
         let rows_hidden = checked_len(rows, hidden, "semis MTP états")?;
-        if rows == 0 || tokens.len() != rows || states.len() != rows_hidden {
+        let states_len = match states {
+            MtpSeedStates::Normed(states) => states.len(),
+            MtpSeedStates::Raw {
+                rows: raw,
+                first_row,
+                ..
+            } => raw
+                .len()
+                .saturating_sub(checked_len(first_row, hidden, "semis MTP états")?)
+                .min(rows_hidden),
+        };
+        if rows == 0 || tokens.len() != rows || states_len != rows_hidden {
             return Err(InferError::Dimension(format!(
-                "semis MTP : {} tokens et {} états pour {rows}×{hidden}",
+                "semis MTP : {} tokens et {states_len} états pour {rows}×{hidden}",
                 tokens.len(),
-                states.len()
             )));
         }
         let concat_dim = checked_len(hidden, 2, "semis MTP concat")?;
@@ -51,16 +76,24 @@ impl MetalExecutor {
         // Les kernels lisent `dim` coefficients par norme et découpent K|V à
         // `kv_dim` : une forme divergente lirait hors du buffer ou mélangerait
         // K et V, là où l'oracle CPU refuse le sidecar.
-        for (norm, dim, label) in [
-            (
-                weights.pre_fc_norm_embedding,
-                hidden,
-                "pre_fc_norm_embedding",
-            ),
-            (weights.pre_fc_norm_hidden, hidden, "pre_fc_norm_hidden"),
-            (weights.input_norm, hidden, "input_norm"),
-            (weights.k_norm, spec.head_dim, "k_norm"),
-        ] {
+        let final_norm = match states {
+            MtpSeedStates::Raw { final_norm, .. } => Some(final_norm),
+            MtpSeedStates::Normed(_) => None,
+        };
+        for (norm, dim, label) in final_norm
+            .map(|norm| (norm, hidden, "final_norm"))
+            .into_iter()
+            .chain([
+                (
+                    weights.pre_fc_norm_embedding,
+                    hidden,
+                    "pre_fc_norm_embedding",
+                ),
+                (weights.pre_fc_norm_hidden, hidden, "pre_fc_norm_hidden"),
+                (weights.input_norm, hidden, "input_norm"),
+                (weights.k_norm, spec.head_dim, "k_norm"),
+            ])
+        {
             if !matches!(norm.shape(), [n] | [1, n] if *n == dim) {
                 return Err(InferError::Dimension(format!(
                     "semis MTP : {label} {:?}, attendu [{dim}]",
@@ -89,7 +122,30 @@ impl MetalExecutor {
             )));
         }
         let kv_len = checked_len(rows, kv_dim, "semis MTP kv")?;
-        let state_buffer = self.upload_f32_buffer(states, "mtp_seed_states")?;
+        let state_input = match states {
+            MtpSeedStates::Normed(states) => {
+                (self.upload_f32_buffer(states, "mtp_seed_states")?, 0, None)
+            }
+            MtpSeedStates::Raw {
+                rows: raw,
+                first_row,
+                final_norm,
+            } => {
+                let offset = checked_len(first_row, hidden, "semis MTP états")?
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .and_then(|bytes| bytes.checked_add(raw.byte_offset()))
+                    .ok_or_else(|| {
+                        InferError::Dimension("semis MTP : offset états déborde".to_string())
+                    })?;
+                let norm = self.cached_buffer_from_f32(final_norm.data(), "mtp_seed_final_norm")?;
+                (raw.buffer().to_owned(), offset, Some(norm))
+            }
+        };
+        let state_buffer = match &state_input {
+            (_, _, Some(_)) => self.new_f32_buffer(rows_hidden, "mtp_seed_states_normed")?,
+            (buffer, _, None) => buffer.clone(),
+        };
         let concat = self.new_f32_buffer(
             checked_len(rows, concat_dim, "semis MTP concat")?,
             "mtp_seed_concat",
@@ -127,6 +183,20 @@ impl MetalExecutor {
                 "semis MTP : embedding {embed_dim}, attendu {hidden}"
             )));
         }
+        if let (raw, offset, Some(final_norm)) = &state_input {
+            self.encode_rms_norm_rows_strided(
+                encoder,
+                raw,
+                *offset,
+                final_norm,
+                &state_buffer,
+                0,
+                rows,
+                hidden,
+                hidden,
+                spec.eps,
+            )?;
+        }
         // Ligne de concat = [norme(embedding) | norme(état)], comme `concat_rows`.
         for (input, weight, half) in [
             (&embed_buffer, &embedding_norm, 0),
@@ -135,6 +205,7 @@ impl MetalExecutor {
             self.encode_rms_norm_rows_strided(
                 encoder,
                 input,
+                0,
                 weight,
                 &concat,
                 u64::try_from(half * hidden * std::mem::size_of::<f32>()).map_err(|_| {
