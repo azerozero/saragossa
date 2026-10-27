@@ -273,6 +273,8 @@ pub struct MetalExecutor {
     causal_attention_prefill_batch_gqa8x4_d256_f32: ComputePipelineState,
     causal_attention_prefill_steel_d256_f32: Option<ComputePipelineState>,
     causal_attention_prefill_steel_nax_d256: Option<attention::NaxCausalAttention>,
+    /// Miroir bf16 du K/V pour le NAX par morceaux (lu du flag, forcé en test).
+    prefill_kv_bf16_mirror: bool,
     noncausal_attention_prefill_f32: ComputePipelineState,
     steel_attention_f32_bq32_bk32_bd64: Option<ComputePipelineState>,
     add_rms_norm_row_f32: ComputePipelineState,

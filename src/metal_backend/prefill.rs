@@ -190,10 +190,23 @@ enum PrefillResidentLayerCacheBuffer {
         key: Buffer,
         value: Buffer,
         kv_dim: usize,
+        bf16_mirror: Option<PrefillKvBf16Mirror>,
     },
     Linear {
         state: LinearAttentionMetalState,
     },
+}
+
+/// Copie bf16 persistante du K/V (après RoPE) d'une couche full-attention,
+/// lue par le NAX des morceaux : seules les lignes pas encore converties le
+/// sont, au lieu de tout le préfixe à chaque morceau (O(n²/morceau) octets).
+/// Coût : `kv_rows × kv_dim × 2 octets × 2`, soit 1 Gio par couche à 256k sur
+/// le 27B (kv_dim 1 024), 16 Gio pour ses 16 couches full-attention.
+struct PrefillKvBf16Mirror {
+    key: Buffer,
+    value: Buffer,
+    /// Lignes déjà converties, dans l'ordre d'encodage du command buffer.
+    rows: Cell<usize>,
 }
 
 #[derive(Default)]

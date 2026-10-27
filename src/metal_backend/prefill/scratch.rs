@@ -220,21 +220,38 @@ impl MetalExecutor {
     }
 
     /// Alloue ce qui survit aux morceaux d'une couche : le KV pleine longueur
-    /// (`kv_rows` lignes) d'une attention complète, ou l'état conv/SSM d'une
-    /// attention linéaire, initialisé à zéro.
+    /// (`kv_rows` lignes) d'une attention complète, avec son miroir bf16 si
+    /// `bf16_mirror`, ou l'état conv/SSM d'une attention linéaire, initialisé
+    /// à zéro.
     pub(super) fn allocate_prefill_resident_layer_cache(
         &self,
         shape: &PrefillResidentLayerShape<'_>,
         kv_rows: usize,
         kv_dim: usize,
+        bf16_mirror: bool,
     ) -> Result<PrefillResidentLayerCacheBuffer> {
         match &shape.attention {
             PrefillResidentAttentionShape::Full { .. } => {
                 let kv_len = checked_len(kv_rows, kv_dim, "prefill résident kv")?;
+                let bf16_mirror = if bf16_mirror {
+                    let bytes = byte_len::<u16>(kv_len)?;
+                    Some(PrefillKvBf16Mirror {
+                        key: self
+                            .device
+                            .new_buffer(bytes, MTLResourceOptions::StorageModePrivate),
+                        value: self
+                            .device
+                            .new_buffer(bytes, MTLResourceOptions::StorageModePrivate),
+                        rows: Cell::new(0),
+                    })
+                } else {
+                    None
+                };
                 Ok(PrefillResidentLayerCacheBuffer::Full {
                     key: self.uncached_f32_buffer(kv_len, "resident_k_rope")?,
                     value: self.uncached_f32_buffer(kv_len, "resident_v")?,
                     kv_dim,
+                    bf16_mirror,
                 })
             }
             PrefillResidentAttentionShape::Linear {

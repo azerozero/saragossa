@@ -805,6 +805,7 @@ impl MetalExecutor {
             causal_attention_prefill_batch_gqa8x4_d256_f32,
             causal_attention_prefill_steel_d256_f32,
             causal_attention_prefill_steel_nax_d256,
+            prefill_kv_bf16_mirror: crate::runtime_flags::prefill_kv_bf16_mirror_enabled(),
             noncausal_attention_prefill_f32,
             steel_attention_f32_bq32_bk32_bd64,
             add_rms_norm_row_f32,

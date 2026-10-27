@@ -781,6 +781,19 @@ pub(crate) fn prefill_attn_nax_head_major() -> bool {
     })
 }
 
+/// Miroir bf16 persistant du K/V full-attention pendant le prefill résident
+/// par morceaux : `SARAGOSSA_RUST_PREFILL_KV_BF16_MIRROR=1` ne convertit que
+/// les lignes nouvelles au lieu de tout le préfixe à chaque morceau (~1,7 To
+/// de trafic à 256k). Même conversion après RoPE : sorties et K/V
+/// bit-identiques (`prefill_resident_chunked_matches_single_chunk`). Coûte
+/// 1 Gio par couche full-attention à 256k sur le 27B. Opt-in tant que non
+/// benché.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_BF16_MIRROR", false))
+}
+
 /// Suffixe minimal (tokens) pour prolonger un préfixe en cache par le prefill
 /// résident par morceaux plutôt que par l'extension en lignes. Mesuré le
 /// 2026-10-25 (serve AR, 27B 4 bits, préfixe ~10k) : égalité jusqu'à 16 tokens

@@ -40,6 +40,7 @@ impl MetalExecutor {
                     key: key_cache,
                     value: value_cache,
                     kv_dim,
+                    bf16_mirror,
                 },
             ) => {
                 let kv_chunk_len = checked_len(spec.seq, *kv_dim, "resident kv morceau")?;
@@ -184,6 +185,30 @@ impl MetalExecutor {
                     },
                     |encoder, _owned| {
                         if chunk.rows < chunk.total {
+                            let kv_rows = chunk.start + chunk.rows;
+                            let bf16_kv = match bf16_mirror {
+                                Some(mirror) => {
+                                    // Préfixe et lignes des morceaux `kv_only`
+                                    // compris : tout ce qui n'est pas encore converti.
+                                    let from =
+                                        checked_len(mirror.rows.get(), *kv_dim, "miroir kv")?;
+                                    let to = checked_len(kv_rows, *kv_dim, "miroir kv")?;
+                                    for (f32_cache, bf16_cache) in
+                                        [(key_cache, &mirror.key), (value_cache, &mirror.value)]
+                                    {
+                                        self.encode_f32_to_bf16_at(
+                                            encoder,
+                                            f32_cache,
+                                            bf16_cache,
+                                            from,
+                                            to - from,
+                                        )?;
+                                    }
+                                    mirror.rows.set(kv_rows);
+                                    Some([mirror.key.as_ref(), mirror.value.as_ref()])
+                                }
+                                None => None,
+                            };
                             self.encode_causal_attention_prefill_chunk(
                                 encoder,
                                 &q_rope_buffer,
@@ -191,8 +216,9 @@ impl MetalExecutor {
                                 value_cache,
                                 &context_buffer,
                                 spec,
-                                chunk.start + chunk.rows,
+                                kv_rows,
                                 chunk.total,
+                                bf16_kv,
                             )
                         } else if spec.window.is_some() {
                             self.encode_windowed_attention_prefill(

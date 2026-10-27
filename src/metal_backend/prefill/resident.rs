@@ -173,6 +173,11 @@ impl MetalExecutor {
         };
         // NOTE: seuls le KV pleine longueur et l'état linéaire survivent aux
         // morceaux ; tout le reste est un scratch dimensionné sur un morceau.
+        // Le miroir ne sert qu'à l'attention par morceaux (plusieurs morceaux
+        // ou préfixe), et seulement si elle passe par le NAX bf16.
+        let bf16_mirror = self.prefill_kv_bf16_mirror
+            && (chunk_count > 1 || start > 0)
+            && self.causal_attention_prefill_steel_nax_d256.is_some();
         let mut layer_cache_buffers = Vec::with_capacity(layers.len());
         for (layer_index, layer) in layers.iter().enumerate() {
             let (_, kv_dim, layer_shape) =
@@ -189,7 +194,12 @@ impl MetalExecutor {
                 | (
                     Some(PrefillResidentPrefixLayer::Full { .. }),
                     PrefillResidentAttentionShape::Full { .. },
-                ) => self.allocate_prefill_resident_layer_cache(&layer_shape, spec.seq, kv_dim)?,
+                ) => self.allocate_prefill_resident_layer_cache(
+                    &layer_shape,
+                    spec.seq,
+                    kv_dim,
+                    bf16_mirror,
+                )?,
                 _ => {
                     return Err(InferError::Config(format!(
                         "préfixe résident incohérent couche {layer_index}"
@@ -497,7 +507,9 @@ impl MetalExecutor {
         let mut layer_caches = Vec::with_capacity(layer_cache_buffers.len());
         for cache_buffer in layer_cache_buffers {
             match cache_buffer {
-                PrefillResidentLayerCacheBuffer::Full { key, value, kv_dim } => {
+                PrefillResidentLayerCacheBuffer::Full {
+                    key, value, kv_dim, ..
+                } => {
                     // Seules les positions nouvelles repartent au CPU : le préfixe
                     // y est déjà.
                     let kv_len = checked_len(rows, kv_dim, "prefill résident readback kv")?;

@@ -1146,6 +1146,7 @@ impl MetalExecutor {
             spec,
             spec.seq,
             spec.seq,
+            None,
         )? {
             return Ok(());
         }
@@ -1332,9 +1333,10 @@ impl MetalExecutor {
     /// Attention causale d'un morceau de prefill : les `spec.seq` requêtes sont
     /// les dernières des `kv_rows` clés déjà écrites dans `k_buffer`/`v_buffer`.
     /// Le scratch bf16 du NAX est dimensionné sur `kv_capacity` pour rester une
-    /// seule entrée du cache de scratch d'un morceau à l'autre.
-    // ponytail: le NAX reconvertit tout le préfixe en bf16 à chaque morceau
-    // (O(morceaux²), ~0,3 s à 64k) ; garder des K/V bf16 par couche si ça pèse.
+    /// seule entrée du cache de scratch d'un morceau à l'autre. Sans `bf16_kv`,
+    /// tout le préfixe y est reconverti à chaque morceau (O(morceaux²) octets) ;
+    /// avec, le NAX lit ce miroir bf16 que l'appelant tient à jour sur
+    /// `kv_rows` lignes (`SARAGOSSA_RUST_PREFILL_KV_BF16_MIRROR`).
     ///
     /// # Errors
     ///
@@ -1349,6 +1351,7 @@ impl MetalExecutor {
         spec: PrefillAttentionSpec,
         kv_rows: usize,
         kv_capacity: usize,
+        bf16_kv: Option<[&BufferRef; 2]>,
     ) -> Result<()> {
         if kv_rows > kv_capacity
             || !self.encode_steel_causal_attention_prefill(
@@ -1360,6 +1363,7 @@ impl MetalExecutor {
                 spec,
                 kv_rows,
                 kv_capacity,
+                bf16_kv,
             )?
         {
             return Err(InferError::Config(format!(
@@ -1392,6 +1396,7 @@ impl MetalExecutor {
         spec: PrefillAttentionSpec,
         kv_rows: usize,
         kv_capacity: usize,
+        bf16_kv: Option<[&BufferRef; 2]>,
     ) -> Result<bool> {
         // NOTE: le seuil seq > 256 est un choix de perf du prefill en un bloc ;
         // un morceau (kv_rows > seq) passe toujours par le Steel/NAX.
@@ -1405,50 +1410,60 @@ impl MetalExecutor {
         }
         // NAX (accélérateurs neuronaux) d'abord : Q/K/V convertis en bf16 comme
         // chez MLX ; lire du f32 (TF32) est plus lent que le Steel f32.
-        let nax_inputs;
-        let (pipeline, block_q, block_k, threads_y, q_in, k_in, v_in, head_major) =
-            match self.causal_attention_prefill_steel_nax_d256.as_ref() {
-                Some(nax) => {
-                    let q_len = checked_len(spec.seq, spec.q_heads * spec.head_dim, "nax q")?;
-                    let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "nax kv_dim")?;
-                    let kv_len = checked_len(kv_rows, kv_dim, "nax kv")?;
-                    let kv_capacity_len = checked_len(kv_capacity, kv_dim, "nax kv capacité")?;
-                    nax_inputs = [
-                        self.private_bf16_buffer(q_len, "prefill_attn_nax_q_bf16")?,
-                        self.private_bf16_buffer(kv_capacity_len, "prefill_attn_nax_k_bf16")?,
-                        self.private_bf16_buffer(kv_capacity_len, "prefill_attn_nax_v_bf16")?,
-                    ];
-                    self.encode_f32_to_bf16(encoder, q_buffer, &nax_inputs[0], q_len)?;
-                    self.encode_f32_to_bf16(encoder, k_buffer, &nax_inputs[1], kv_len)?;
-                    self.encode_f32_to_bf16(encoder, v_buffer, &nax_inputs[2], kv_len)?;
-                    (
-                        &nax.pipeline,
-                        nax.shape.block_q,
-                        nax.shape.block_k,
-                        nax.shape.simdgroups,
-                        nax_inputs[0].as_ref(),
-                        nax_inputs[1].as_ref(),
-                        nax_inputs[2].as_ref(),
-                        nax.shape.head_major,
-                    )
-                }
-                None => {
-                    let Some(pipeline) = self.causal_attention_prefill_steel_d256_f32.as_ref()
-                    else {
-                        return Ok(false);
-                    };
-                    (
-                        pipeline,
-                        STEEL_CAUSAL_ATTN_D256_BQ,
-                        STEEL_CAUSAL_ATTN_D256_BK,
-                        4,
-                        q_buffer,
-                        k_buffer,
-                        v_buffer,
-                        false,
-                    )
-                }
-            };
+        let nax_q;
+        let nax_kv;
+        let (pipeline, block_q, block_k, threads_y, q_in, k_in, v_in, head_major) = match self
+            .causal_attention_prefill_steel_nax_d256
+            .as_ref()
+        {
+            Some(nax) => {
+                let q_len = checked_len(spec.seq, spec.q_heads * spec.head_dim, "nax q")?;
+                let q_bf16 = self.private_bf16_buffer(q_len, "prefill_attn_nax_q_bf16")?;
+                self.encode_f32_to_bf16(encoder, q_buffer, &q_bf16, q_len)?;
+                // Miroir bf16 tenu à jour par l'appelant : seul Q est converti.
+                let [k_bf16, v_bf16] = match bf16_kv {
+                    Some(mirror) => mirror,
+                    None => {
+                        let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "nax kv_dim")?;
+                        let kv_len = checked_len(kv_rows, kv_dim, "nax kv")?;
+                        let kv_capacity_len = checked_len(kv_capacity, kv_dim, "nax kv capacité")?;
+                        nax_kv = [
+                            self.private_bf16_buffer(kv_capacity_len, "prefill_attn_nax_k_bf16")?,
+                            self.private_bf16_buffer(kv_capacity_len, "prefill_attn_nax_v_bf16")?,
+                        ];
+                        self.encode_f32_to_bf16(encoder, k_buffer, &nax_kv[0], kv_len)?;
+                        self.encode_f32_to_bf16(encoder, v_buffer, &nax_kv[1], kv_len)?;
+                        [nax_kv[0].as_ref(), nax_kv[1].as_ref()]
+                    }
+                };
+                nax_q = q_bf16;
+                (
+                    &nax.pipeline,
+                    nax.shape.block_q,
+                    nax.shape.block_k,
+                    nax.shape.simdgroups,
+                    nax_q.as_ref(),
+                    k_bf16,
+                    v_bf16,
+                    nax.shape.head_major,
+                )
+            }
+            None => {
+                let Some(pipeline) = self.causal_attention_prefill_steel_d256_f32.as_ref() else {
+                    return Ok(false);
+                };
+                (
+                    pipeline,
+                    STEEL_CAUSAL_ATTN_D256_BQ,
+                    STEEL_CAUSAL_ATTN_D256_BK,
+                    4,
+                    q_buffer,
+                    k_buffer,
+                    v_buffer,
+                    false,
+                )
+            }
+        };
         let params = steel_attn_params(
             spec,
             block_q,

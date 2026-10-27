@@ -1360,6 +1360,7 @@ fn nax_chunk_attention(
         spec,
         kv_rows,
         kv_rows,
+        None,
     );
     encoder.end_encoding();
     encoded?;
