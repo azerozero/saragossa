@@ -781,6 +781,21 @@ pub(crate) fn prefill_attn_nax_head_major() -> bool {
     })
 }
 
+/// Tuilage du NAX d256 : `SARAGOSSA_RUST_PREFILL_ATTN_NAX_VARIANT` = `bq64`
+/// (défaut, BQ=64 BK=32), `bk64` (BK=64) ou `bq128` (BQ=128, WM=8) ; toute
+/// autre valeur garde `bq64`. Écarts à l'oracle CPU et à `bq64` mesurés par
+/// `nax_d256_variants_match_cpu_oracle`. Opt-in tant que non benché.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_attn_nax_variant() -> Option<&'static str> {
+    static VARIANT: OnceLock<Option<String>> = OnceLock::new();
+    VARIANT
+        .get_or_init(|| {
+            env_var("SARAGOSSA_RUST_PREFILL_ATTN_NAX_VARIANT")
+                .map(|value| value.trim().to_ascii_lowercase())
+        })
+        .as_deref()
+}
+
 /// Miroir bf16 persistant du K/V full-attention pendant le prefill résident
 /// par morceaux : `SARAGOSSA_RUST_PREFILL_KV_BF16_MIRROR=1` ne convertit que
 /// les lignes nouvelles au lieu de tout le préfixe à chaque morceau (~1,7 To

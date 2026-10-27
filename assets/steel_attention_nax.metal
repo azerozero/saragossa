@@ -3523,3 +3523,14 @@ template [[host_name("steel_attention_nax_dsplit_bf16_f32out_bq64_bk32_bd256_wm4
 [[kernel]] decltype(attention_nax_dsplit<bfloat, 64, 32, 256, 4, 2, float, float, float>)
 attention_nax_dsplit<bfloat, 64, 32, 256, 4, 2, float, float, float>;
 
+// Variantes opt-in (`SARAGOSSA_RUST_PREFILL_ATTN_NAX_VARIANT`) : BK=64 divise
+// par deux les tours de boucle KV et leurs barrières, BQ=128 (WM=8) relit
+// chaque tuile K/V pour deux fois plus de requêtes. Chacune remplit les 32 Kio
+// de mémoire threadgroup de l'échange des scores (WM × WN × TK × 8 × 32 f32).
+template [[host_name("steel_attention_nax_dsplit_bf16_f32out_bq64_bk64_bd256_wm4_wn2")]]
+[[kernel]] decltype(attention_nax_dsplit<bfloat, 64, 64, 256, 4, 2, float, float, float>)
+attention_nax_dsplit<bfloat, 64, 64, 256, 4, 2, float, float, float>;
+
+template [[host_name("steel_attention_nax_dsplit_bf16_f32out_bq128_bk32_bd256_wm8_wn2")]]
+[[kernel]] decltype(attention_nax_dsplit<bfloat, 128, 32, 256, 8, 2, float, float, float>)
+attention_nax_dsplit<bfloat, 128, 32, 256, 8, 2, float, float, float>;

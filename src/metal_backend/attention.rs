@@ -33,12 +33,35 @@ pub(super) const NAX_CAUSAL_ATTN_BQ64: NaxCausalAttnShape = NaxCausalAttnShape {
     head_major: false,
 };
 
+/// Variante BK=64 : deux fois moins de tours KV et de barrières.
+pub(super) const NAX_CAUSAL_ATTN_BK64: NaxCausalAttnShape = NaxCausalAttnShape {
+    host_name: "steel_attention_nax_dsplit_bf16_f32out_bq64_bk64_bd256_wm4_wn2",
+    block_q: 64,
+    block_k: 64,
+    simdgroups: 8,
+    head_major: false,
+};
+
+/// Variante BQ=128 (WM=8) : chaque tuile K/V sert deux fois plus de requêtes.
+pub(super) const NAX_CAUSAL_ATTN_BQ128: NaxCausalAttnShape = NaxCausalAttnShape {
+    host_name: "steel_attention_nax_dsplit_bf16_f32out_bq128_bk32_bd256_wm8_wn2",
+    block_q: 128,
+    block_k: 32,
+    simdgroups: 16,
+    head_major: false,
+};
+
 impl NaxCausalAttnShape {
     /// Instanciation retenue par les flags `SARAGOSSA_RUST_PREFILL_ATTN_NAX_*`.
     pub(super) fn from_flags() -> Self {
+        let base = match crate::runtime_flags::prefill_attn_nax_variant() {
+            Some("bk64") => NAX_CAUSAL_ATTN_BK64,
+            Some("bq128") => NAX_CAUSAL_ATTN_BQ128,
+            _ => NAX_CAUSAL_ATTN_BQ64,
+        };
         Self {
             head_major: crate::runtime_flags::prefill_attn_nax_head_major(),
-            ..NAX_CAUSAL_ATTN_BQ64
+            ..base
         }
     }
 }
