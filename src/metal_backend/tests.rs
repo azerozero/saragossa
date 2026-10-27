@@ -11,3 +11,4 @@ include!("tests/qmv_align64.rs");
 include!("tests/moe_duo.rs");
 include!("tests/linear_attention.rs");
 include!("tests/attention.rs");
+include!("tests/mtp_seed.rs");

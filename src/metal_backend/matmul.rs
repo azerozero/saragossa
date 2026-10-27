@@ -618,9 +618,7 @@ impl MetalExecutor {
             "project_out2",
             "project_out3",
         ];
-        if N > LABELS.len() {
-            return Err(InferError::Config(format!("{N} projections, au plus 4")));
-        }
+        const { assert!(N <= 4, "au plus 4 projections") };
         let mut outputs = Vec::with_capacity(N);
         for (linear, label) in linears.iter().zip(LABELS) {
             let out_dim = linear_out_dim(linear.weight())?;

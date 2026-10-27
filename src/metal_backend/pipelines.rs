@@ -555,7 +555,6 @@ impl MetalExecutor {
         let copy_cols_f32 = pipeline(&library, &device, "copy_cols_f32")?;
         let copy_u16 = pipeline(&library, &device, "copy_u16")?;
         let rms_norm_rows_f32 = pipeline(&library, &device, "rms_norm_rows_f32")?;
-        let rms_norm_rows_strided_f32 = pipeline(&library, &device, "rms_norm_rows_strided_f32")?;
         let rms_norm_simd_rows_f32 = pipeline(&library, &device, "rms_norm_simd_rows_f32")?;
         let rms_norm_simd_u3_rows_f32 = pipeline(&library, &device, "rms_norm_simd_u3_rows_f32")?;
         let add_rms_norm_rows_f32 = pipeline(&library, &device, "add_rms_norm_rows_f32")?;
@@ -776,7 +775,6 @@ impl MetalExecutor {
             copy_cols_f32,
             copy_u16,
             rms_norm_rows_f32,
-            rms_norm_rows_strided_f32,
             rms_norm_simd_rows_f32,
             rms_norm_simd_u3_rows_f32,
             add_rms_norm_rows_f32,

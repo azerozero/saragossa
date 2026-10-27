@@ -520,6 +520,18 @@ pub(super) fn project_qkv(
     Ok((q, k, v))
 }
 
+/// Q vide `[0, q_out]` des semis qui ne projettent que K et V.
+pub(super) fn empty_q(attention: &FullAttention) -> Result<Tensor> {
+    let q_out = attention
+        .q_proj
+        .weight()
+        .shape()
+        .first()
+        .copied()
+        .ok_or_else(|| InferError::Dimension("q_proj sans dimension de sortie".to_string()))?;
+    Tensor::from_vec(vec![0, q_out], Vec::new())
+}
+
 /// K et V comme [`project_qkv`] (chaque projection est indépendante, mêmes
 /// octets), Q rendu vide `[0, q]` : le semis de l'historique MTP ne garde que
 /// le cache K/V, et Q pesait 12× K ou V en projection, relecture et RoPE CPU.
@@ -528,14 +540,7 @@ fn project_kv(
     attention: &FullAttention,
     runtime: ForwardRuntime<'_>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
-    let q_out = attention
-        .q_proj
-        .weight()
-        .shape()
-        .first()
-        .copied()
-        .ok_or_else(|| InferError::Dimension("q_proj sans dimension de sortie".to_string()))?;
-    let empty_q = Tensor::from_vec(vec![0, q_out], Vec::new())?;
+    let empty_q = empty_q(attention)?;
     #[cfg(all(target_os = "macos", feature = "metal"))]
     if let Some(metal) = runtime.metal_executor() {
         if let Some(v_proj) = attention

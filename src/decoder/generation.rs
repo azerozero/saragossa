@@ -3855,7 +3855,10 @@ impl CausalDecoder {
         self.seed_mtp_history_chunk_cpu(head, states, tokens, history)
     }
 
-    /// Chemin CPU du semis, oracle de [`Self::seed_mtp_history_chunk_metal`].
+    /// Chemin de référence du semis par opérations séparées (repli et oracle de
+    /// [`Self::seed_mtp_history_chunk_metal`]) ; le FC et K/V passent par
+    /// les projections Metal quand elles existent : la dérive mesurée par le
+    /// test d'oracle porte sur les normes, RoPE et le GEMM tuilé.
     pub(super) fn seed_mtp_history_chunk_cpu(
         &self,
         head: &MtpHead,
@@ -3900,9 +3903,8 @@ impl CausalDecoder {
         history: &mut LayerKvCache,
     ) -> Result<bool> {
         let attention = &head.layer.attention;
-        let (Some(v_proj), Some(_), Some(k_norm), Some(rope)) = (
+        let (Some(v_proj), Some(k_norm), Some(rope)) = (
             attention.v_proj.as_ref(),
-            attention.q_norm.as_ref(),
             attention.k_norm.as_ref(),
             super::attention_ops::rope_params(&self.config, attention),
         ) else {
@@ -3918,16 +3920,9 @@ impl CausalDecoder {
             return Ok(false);
         }
         let hidden = self.final_norm.data().len();
-        let q_out = attention
-            .q_proj
-            .weight()
-            .shape()
-            .first()
-            .copied()
-            .ok_or_else(|| InferError::Dimension("q_proj sans dimension de sortie".to_string()))?;
         let (empty_q, _) = super::attention_ops::split_attention_gate(
             &self.config,
-            &Tensor::from_vec(vec![0, q_out], Vec::new())?,
+            &super::attention_ops::empty_q(attention)?,
         )?;
         let kv_heads = attention
             .num_key_value_heads

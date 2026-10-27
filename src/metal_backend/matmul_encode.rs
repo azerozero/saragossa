@@ -2,7 +2,7 @@
 
 use super::*;
 
-pub(super) const MATMUL_ROW_TG_WIDTH: u64 = 256;
+const MATMUL_ROW_TG_WIDTH: u64 = 256;
 
 #[expect(
     clippy::too_many_arguments,
@@ -1174,21 +1174,56 @@ impl MetalExecutor {
         dim: usize,
         eps: f32,
     ) -> Result<()> {
+        self.encode_rms_norm_rows_strided(
+            encoder,
+            input_buffer,
+            weight_buffer,
+            output_buffer,
+            0,
+            rows,
+            dim,
+            dim,
+            eps,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "norme par ligne à pas de sortie: buffers, offset et dimensions explicites"
+    )]
+    pub(super) fn encode_rms_norm_rows_strided(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        weight_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        output_offset: u64,
+        rows: usize,
+        dim: usize,
+        out_stride: usize,
+        eps: f32,
+    ) -> Result<()> {
         encoder.set_compute_pipeline_state(&self.rms_norm_rows_f32);
         encoder.set_buffer(0, Some(input_buffer), 0);
         encoder.set_buffer(1, Some(weight_buffer), 0);
-        encoder.set_buffer(2, Some(output_buffer), 0);
+        encoder.set_buffer(2, Some(output_buffer), output_offset);
         set_u32_bytes(
             encoder,
             3,
-            &[checked_u32(dim, "rms rows dim")?],
-            "rms_rows_dim",
+            &[checked_u32(dim, "rms strided dim")?],
+            "rms_strided_dim",
         )?;
-        set_f32_bytes(encoder, 4, &[eps], "rms_rows_eps")?;
+        set_f32_bytes(encoder, 4, &[eps], "rms_strided_eps")?;
+        set_u32_bytes(
+            encoder,
+            5,
+            &[checked_u32(out_stride, "rms strided stride")?],
+            "rms_strided_stride",
+        )?;
         trace_dispatch_path("rms_norm_rows_f32", rows, dim, 0);
         profile_dispatch();
         encoder.dispatch_thread_groups(
-            MTLSize::new(checked_nsuint(rows, "rms rows")?, 1, 1),
+            MTLSize::new(checked_nsuint(rows, "rms strided rows")?, 1, 1),
             MTLSize::new(MATMUL_ROW_TG_WIDTH, 1, 1),
         );
         post_dispatch_barrier_buffer(encoder, output_buffer);

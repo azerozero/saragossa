@@ -249,7 +249,6 @@ pub struct MetalExecutor {
     copy_cols_f32: ComputePipelineState,
     copy_u16: ComputePipelineState,
     rms_norm_rows_f32: ComputePipelineState,
-    rms_norm_rows_strided_f32: ComputePipelineState,
     rms_norm_simd_rows_f32: ComputePipelineState,
     rms_norm_simd_u3_rows_f32: ComputePipelineState,
     add_rms_norm_rows_f32: ComputePipelineState,

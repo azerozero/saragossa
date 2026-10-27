@@ -2,7 +2,6 @@
 //! RoPE de K de la tête en un command buffer par bloc, sans relecture
 //! intermédiaire. Le chemin CPU de `seed_mtp_history_chunk` reste l'oracle.
 
-use super::matmul_encode::MATMUL_ROW_TG_WIDTH;
 use super::*;
 
 /// Poids de la tête MTP lus par le semis.
@@ -267,7 +266,7 @@ impl MetalExecutor {
         clippy::too_many_arguments,
         reason = "copie de colonnes: buffers, offset et dimensions explicites"
     )]
-    fn encode_copy_cols(
+    pub(super) fn encode_copy_cols(
         &self,
         encoder: &ComputeCommandEncoderRef,
         input_buffer: &BufferRef,
@@ -294,47 +293,5 @@ impl MetalExecutor {
             "copy_cols_len",
         )?;
         self.dispatch_1d(encoder, &self.copy_cols_f32, len)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "norme par ligne à pas de sortie: buffers, offset et dimensions explicites"
-    )]
-    fn encode_rms_norm_rows_strided(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        input_buffer: &BufferRef,
-        weight_buffer: &BufferRef,
-        output_buffer: &BufferRef,
-        output_offset: u64,
-        rows: usize,
-        dim: usize,
-        out_stride: usize,
-        eps: f32,
-    ) -> Result<()> {
-        encoder.set_compute_pipeline_state(&self.rms_norm_rows_strided_f32);
-        encoder.set_buffer(0, Some(input_buffer), 0);
-        encoder.set_buffer(1, Some(weight_buffer), 0);
-        encoder.set_buffer(2, Some(output_buffer), output_offset);
-        set_u32_bytes(
-            encoder,
-            3,
-            &[checked_u32(dim, "rms strided dim")?],
-            "rms_strided_dim",
-        )?;
-        set_f32_bytes(encoder, 4, &[eps], "rms_strided_eps")?;
-        set_u32_bytes(
-            encoder,
-            5,
-            &[checked_u32(out_stride, "rms strided stride")?],
-            "rms_strided_stride",
-        )?;
-        profile_dispatch();
-        encoder.dispatch_thread_groups(
-            MTLSize::new(checked_nsuint(rows, "rms strided rows")?, 1, 1),
-            MTLSize::new(MATMUL_ROW_TG_WIDTH, 1, 1),
-        );
-        post_dispatch_barrier_buffer(encoder, output_buffer);
-        Ok(())
     }
 }

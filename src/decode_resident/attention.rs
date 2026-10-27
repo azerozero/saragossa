@@ -493,10 +493,7 @@ impl KvSeedSegment<'_> {
     }
 
     fn len(&self) -> usize {
-        match self {
-            Self::Cpu(data) => data.len(),
-            Self::Shared(rows) => rows.len(),
-        }
+        self.as_slice().len()
     }
 }
 
@@ -720,6 +717,7 @@ impl FullAttentionMetalState {
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
+        let mut gpu_copies = false;
         for (tensor, segments, round) in [
             (&self.keys, keys_segments, round_keys),
             (&self.values, values_segments, round_values && !round_keys),
@@ -737,6 +735,7 @@ impl FullAttentionMetalState {
                             offset,
                             rows.len(),
                         )?;
+                        gpu_copies = true;
                     }
                     (_, GpuElement::F32) if round => {
                         let rounded: Vec<f32> = segment
@@ -761,7 +760,10 @@ impl FullAttentionMetalState {
             }
         }
         encoder_guard.end();
-        commit_and_wait(command_buffer)?;
+        // Segments tous CPU (repli, diagnostic d'arrondi) : rien à attendre.
+        if gpu_copies {
+            commit_and_wait(command_buffer)?;
+        }
         self.len = n_rows;
         Ok(())
     }

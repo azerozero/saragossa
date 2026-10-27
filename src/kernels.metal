@@ -7549,41 +7549,9 @@ kernel void rms_norm_simd_u3_rows_f32(
     }
 }
 
+// `out_stride` (= `dim` en général) laisse deux appels remplir les deux
+// moitiés d'une concaténation par lignes (semis MTP) sans copie.
 kernel void rms_norm_rows_f32(
-    device const float* input [[buffer(0)]],
-    device const float* weight [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant uint& dim [[buffer(3)]],
-    constant float& eps [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint row [[threadgroup_position_in_grid]]
-) {
-    threadgroup float partial[256];
-    float sumsq = 0.0f;
-    const uint offset = row * dim;
-    for (uint col = tid; col < dim; col += 256u) {
-        const float value = input[offset + col];
-        sumsq += value * value;
-    }
-    partial[tid] = sumsq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float inv_rms = rsqrt((partial[0] / float(dim)) + eps);
-    for (uint col = tid; col < dim; col += 256u) {
-        out[offset + col] = input[offset + col] * inv_rms * weight[col];
-    }
-}
-
-// rms_norm_rows_f32 à pas de sortie `out_stride` : deux appels remplissent les
-// deux moitiés d'une concaténation par lignes (semis MTP) sans copie.
-kernel void rms_norm_rows_strided_f32(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
     device float* out [[buffer(2)]],
