@@ -47,11 +47,48 @@ impl MetalExecutor {
                 states.len()
             )));
         }
-        for linear in [weights.fc, weights.k_proj, weights.v_proj] {
-            ensure_biasless(linear, "semis MTP")?;
-        }
         let concat_dim = checked_len(hidden, 2, "semis MTP concat")?;
         let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "semis MTP kv_dim")?;
+        // Les kernels lisent `dim` coefficients par norme et découpent K|V à
+        // `kv_dim` : une forme divergente lirait hors du buffer ou mélangerait
+        // K et V, là où l'oracle CPU refuse le sidecar.
+        for (norm, dim, label) in [
+            (
+                weights.pre_fc_norm_embedding,
+                hidden,
+                "pre_fc_norm_embedding",
+            ),
+            (weights.pre_fc_norm_hidden, hidden, "pre_fc_norm_hidden"),
+            (weights.input_norm, hidden, "input_norm"),
+            (weights.k_norm, spec.head_dim, "k_norm"),
+        ] {
+            if !matches!(norm.shape(), [n] | [1, n] if *n == dim) {
+                return Err(InferError::Dimension(format!(
+                    "semis MTP : {label} {:?}, attendu [{dim}]",
+                    norm.shape()
+                )));
+            }
+        }
+        for (linear, out_dim, in_dim, label) in [
+            (weights.fc, hidden, concat_dim, "fc"),
+            (weights.k_proj, kv_dim, hidden, "k_proj"),
+            (weights.v_proj, kv_dim, hidden, "v_proj"),
+        ] {
+            if !matches!(linear.weight().shape(), [out, input] if *out == out_dim && *input == in_dim)
+            {
+                return Err(InferError::Dimension(format!(
+                    "semis MTP : {label} {:?}, attendu [{out_dim}, {in_dim}]",
+                    linear.weight().shape()
+                )));
+            }
+            ensure_biasless(linear, "semis MTP")?;
+        }
+        if spec.rope_dims == 0 || spec.rope_dims > spec.head_dim || spec.rope_dims % 2 != 0 {
+            return Err(InferError::Dimension(format!(
+                "semis MTP : rope_dims {} pour head_dim {}",
+                spec.rope_dims, spec.head_dim
+            )));
+        }
         let kv_len = checked_len(rows, kv_dim, "semis MTP kv")?;
         let state_buffer = self.upload_f32_buffer(states, "mtp_seed_states")?;
         let concat = self.new_f32_buffer(
@@ -136,11 +173,18 @@ impl MetalExecutor {
         // K|V concaténés : la sortie de 2·kv_dim passe le seuil du GEMM tuilé,
         // que chaque projection seule manque. Deux matmuls si les poids ne se
         // concatènent pas.
-        match self.resolve_concat_linear_weight_buffers(
-            &[weights.k_proj.weight(), weights.v_proj.weight()],
-            "mtp_seed_kv_proj",
-        ) {
-            Ok(kv_weights) => {
+        let kv_sources = [weights.k_proj.weight(), weights.v_proj.weight()];
+        let kv_concat = if self.concat_reusable(&kv_sources) {
+            match self.resolve_concat_linear_weight_buffers(&kv_sources, "mtp_seed_kv_proj") {
+                Ok(buffers) => Some(buffers),
+                Err(InferError::Dimension(_)) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        match kv_concat {
+            Some(kv_weights) => {
                 let kv_concat_dim = checked_len(kv_dim, 2, "semis MTP kv concat")?;
                 let kv =
                     self.new_f32_buffer(checked_len(kv_len, 2, "semis MTP kv")?, "mtp_seed_kv")?;
@@ -172,7 +216,7 @@ impl MetalExecutor {
                     )?;
                 }
             }
-            Err(InferError::Dimension(_)) => {
+            None => {
                 for (linear, output) in [(weights.k_proj, &k), (weights.v_proj, &v)] {
                     let out_dim = self.encode_matmul_weight(
                         encoder,
@@ -190,7 +234,6 @@ impl MetalExecutor {
                     }
                 }
             }
-            Err(error) => return Err(error),
         }
         if spec.value_norm {
             self.encode_rms_norm_heads_no_scale_rows(

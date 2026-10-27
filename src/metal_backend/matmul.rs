@@ -846,6 +846,29 @@ impl MetalExecutor {
         result
     }
 
+    /// Vrai si le concat de `weights` sert sans reconstruction à chaque appel :
+    /// déjà mémoïsé, ou bâtissable depuis des données CPU encore présentes et
+    /// retenu ensuite. Après libération des poids CPU, un concat absent du cache
+    /// ne peut plus être bâti.
+    pub(super) fn concat_reusable(&self, weights: &[&LinearWeight]) -> bool {
+        let cache_enabled = crate::runtime_flags::resident_concat_cache_enabled()
+            || self.preserving_weight_caches();
+        let Some(key) = cache_enabled.then(|| concat_weight_key(weights)).flatten() else {
+            return false;
+        };
+        let cached = self
+            .concat_buffers
+            .lock()
+            .is_ok_and(|cache| matches!(cache.get(&key), Some(ConcatCacheEntry::Buffers(_))));
+        cached
+            || ((self.preserving_weight_caches() || self.concat_cache_within_vram_budget())
+                && weights.iter().all(|weight| {
+                    weight
+                        .affine_quantized()
+                        .is_none_or(AffineQuantizedTensor::cpu_data_available)
+                }))
+    }
+
     /// Renvoie `true` s'il reste de la marge VRAM pour retenir un buffer concat.
     ///
     /// Réutilise le working-set recommandé du device : au-delà de

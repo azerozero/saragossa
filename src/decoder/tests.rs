@@ -3060,6 +3060,11 @@ fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
         ("K", cpu.keys.to_vec(), gpu.keys.to_vec()),
         ("V", cpu.values.to_vec(), gpu.values.to_vec()),
     ] {
+        assert_eq!(cpu.len(), gpu.len(), "longueur {label}");
+        assert!(
+            cpu.iter().chain(&gpu).all(|value| value.is_finite()),
+            "{label} non fini"
+        );
         let scale = cpu.iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
         let max_err = cpu
             .iter()
