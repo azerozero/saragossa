@@ -767,6 +767,20 @@ pub(crate) fn prefill_attn_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX", true))
 }
 
+/// Ordre de la grille du NAX d256 : `SARAGOSSA_RUST_PREFILL_ATTN_NAX_GRID` =
+/// `seq` (défaut, `(NQ, H)`) ou `head` (`(H, NQ)`, la tête la plus rapide :
+/// les têtes Q d'un groupe KV partent côte à côte et partagent les tuiles K/V
+/// en cache). Calcul par threadgroup identique, sortie bit-identique
+/// (`nax_d256_head_major_grid_is_bit_identical`). Opt-in tant que non benché.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_attn_nax_head_major() -> bool {
+    static HEAD: OnceLock<bool> = OnceLock::new();
+    *HEAD.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_PREFILL_ATTN_NAX_GRID")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("head"))
+    })
+}
+
 /// Suffixe minimal (tokens) pour prolonger un préfixe en cache par le prefill
 /// résident par morceaux plutôt que par l'extension en lignes. Mesuré le
 /// 2026-10-25 (serve AR, 27B 4 bits, préfixe ~10k) : égalité jusqu'à 16 tokens

@@ -182,11 +182,12 @@ fn compile_steel_causal_d256_attention(
 pub(super) fn compile_steel_causal_nax_d256_attention(
     device: &Device,
     source: &str,
-) -> Option<ComputePipelineState> {
-    compile_nax_function(
+    shape: attention::NaxCausalAttnShape,
+) -> Option<attention::NaxCausalAttention> {
+    let pipeline = compile_nax_function(
         device,
         source,
-        STEEL_CAUSAL_ATTN_NAX_D256,
+        shape.host_name,
         &[
             (200, false),
             (201, false),
@@ -194,8 +195,10 @@ pub(super) fn compile_steel_causal_nax_d256_attention(
             (301, true),
             (302, false),
             (303, false),
+            (304, shape.head_major),
         ],
-    )
+    )?;
+    Some(attention::NaxCausalAttention { pipeline, shape })
 }
 
 /// Compile le gated delta NAX figé, sans cache d'état (constante 200).
@@ -608,6 +611,7 @@ impl MetalExecutor {
                 let pipeline = compile_steel_causal_nax_d256_attention(
                     &device,
                     sources.steel_attention_nax.as_ref(),
+                    attention::NaxCausalAttnShape::from_flags(),
                 );
                 if pipeline.is_none() {
                     eprintln!("attention prefill NAX indisponible : repli Steel f32");

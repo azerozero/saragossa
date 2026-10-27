@@ -1262,6 +1262,7 @@ fn causal_attention_prefill_nax_d256_matches_cpu_selected_rows() -> Result<()> {
         pipelines::compile_steel_causal_nax_d256_attention(
             &executor.device,
             STEEL_ATTENTION_NAX_KERNELS,
+            attention::NAX_CAUSAL_ATTN_BQ64,
         );
     if executor.causal_attention_prefill_steel_nax_d256.is_none() {
         return Ok(());
@@ -1306,6 +1307,103 @@ fn causal_attention_prefill_nax_d256_matches_cpu_selected_rows() -> Result<()> {
 }
 
 const NAX_D256_TOLERANCE: f32 = 1.0e-3;
+
+/// Dernières `rows` lignes de `tensor` : les requêtes d'un morceau final.
+fn tail_rows(tensor: &Tensor, rows: usize) -> Result<Tensor> {
+    let (total, dim) = tensor.as_matrix()?;
+    let start = checked_len(total - rows, dim, "test tail rows")?;
+    Tensor::from_vec(vec![rows, dim], tensor.data()[start..].to_vec())
+}
+
+/// Attention NAX d256 d'un morceau : `q` porte les dernières lignes, `k`/`v`
+/// tout le préfixe (`q_l_off = kv_rows - seq`), via le pipeline courant de
+/// l'exécuteur.
+fn nax_chunk_attention(
+    executor: &MetalExecutor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    q_heads: usize,
+    kv_heads: usize,
+) -> Result<Vec<f32>> {
+    let (seq, q_dim) = q.as_matrix()?;
+    let (kv_rows, _) = k.as_matrix()?;
+    let head_dim = q_dim / q_heads;
+    let spec = PrefillAttentionSpec {
+        seq,
+        hidden_dim: q_dim,
+        q_heads,
+        kv_heads,
+        head_dim,
+        rope_dims: head_dim,
+        rope_frequency_dim: head_dim,
+        rope_theta: 10_000.0,
+        attn_scalar: head_dim as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 0.0,
+    };
+    let q_buffer = executor.upload_f32_buffer(q.data(), "test_nax_chunk_q")?;
+    let k_buffer = executor.upload_f32_buffer(k.data(), "test_nax_chunk_k")?;
+    let v_buffer = executor.upload_f32_buffer(v.data(), "test_nax_chunk_v")?;
+    let output_len = checked_len(seq, q_dim, "test nax chunk out")?;
+    let output_buffer = executor.uncached_f32_buffer(output_len, "test_nax_chunk_out")?;
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let encoded = executor.encode_causal_attention_prefill_chunk(
+        encoder,
+        &q_buffer,
+        &k_buffer,
+        &v_buffer,
+        &output_buffer,
+        spec,
+        kv_rows,
+        kv_rows,
+    );
+    encoder.end_encoding();
+    encoded?;
+    commit_and_wait(command_buffer)?;
+    read_f32_buffer(&output_buffer, output_len)
+}
+
+/// La grille `(H, NQ)` ne change que l'ordre de lancement des threadgroups :
+/// sortie bit-identique à `(NQ, H)` sur un morceau 27B (24/4 têtes) de 1 100
+/// requêtes après 948 positions (tuile Q partielle, `q_l_off` non aligné).
+#[test]
+fn nax_d256_head_major_grid_is_bit_identical() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (seq, kv_rows, q_heads, kv_heads) = (1100, 2048, 24, 4);
+    let (q_full, k, v) = causal_attention_inputs(kv_rows, q_heads, kv_heads, 256)?;
+    let q = tail_rows(&q_full, seq)?;
+    let mut outputs = Vec::new();
+    for head_major in [false, true] {
+        executor.causal_attention_prefill_steel_nax_d256 =
+            pipelines::compile_steel_causal_nax_d256_attention(
+                &executor.device,
+                STEEL_ATTENTION_NAX_KERNELS,
+                attention::NaxCausalAttnShape {
+                    head_major,
+                    ..attention::NAX_CAUSAL_ATTN_BQ64
+                },
+            );
+        if executor.causal_attention_prefill_steel_nax_d256.is_none() {
+            return Ok(());
+        }
+        outputs.push(nax_chunk_attention(
+            &executor, &q, &k, &v, q_heads, kv_heads,
+        )?);
+    }
+    let differing = outputs[0]
+        .iter()
+        .zip(&outputs[1])
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(differing, 0, "grille head-major non bit-identique");
+    Ok(())
+}
 
 /// Le gated delta NAX de MLX (forme 27B, 16/48 têtes) suit la récurrence
 /// séquentielle `naive_gdn_reference`, y et état final, aux frontières de

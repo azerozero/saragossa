@@ -2574,6 +2574,10 @@ constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
 constant bool save_lse [[function_constant(303)]];
+// saragossa : grille (H, NQ) du dsplit, la tête la plus rapide. Les têtes Q
+// d'un même groupe KV partent côte à côte et relisent les mêmes tuiles K/V
+// pendant qu'elles sont en cache ; le calcul d'un threadgroup est inchangé.
+constant bool head_major [[function_constant(304)]];
 
 template <typename T>
 struct TransformScale {
@@ -3096,11 +3100,15 @@ template <
     device float* LSE [[buffer(8), function_constant(save_lse)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tid_grid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]]) { // clang-format on
 
   // Pacifying compiler
   (void)lid;
+
+  // tid.x = bloc Q, tid.y = tête, quel que soit l'ordre de la grille.
+  const uint3 tid =
+      head_major ? uint3(tid_grid.y, tid_grid.x, tid_grid.z) : tid_grid;
 
   // Move to correct block
   ulong3 tidl{tid.x, tid.y, tid.z};
