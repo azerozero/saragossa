@@ -3844,6 +3844,27 @@ impl CausalDecoder {
             )));
         }
         let runtime = self.forward_runtime();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if crate::runtime_flags::mtp_seed_gpu_enabled() {
+            if let Some(metal) = runtime.metal_executor() {
+                if self.seed_mtp_history_chunk_metal(metal, head, states, tokens, history)? {
+                    return Ok(());
+                }
+            }
+        }
+        self.seed_mtp_history_chunk_cpu(head, states, tokens, history)
+    }
+
+    /// Chemin CPU du semis, oracle de [`Self::seed_mtp_history_chunk_metal`].
+    pub(super) fn seed_mtp_history_chunk_cpu(
+        &self,
+        head: &MtpHead,
+        states: &[f32],
+        tokens: &[usize],
+        history: &mut LayerKvCache,
+    ) -> Result<()> {
+        let runtime = self.forward_runtime();
+        let hidden = self.final_norm.data().len();
         let eps = self.config.rms_eps;
         let states = Tensor::from_vec(vec![tokens.len(), hidden], states.to_vec())?;
         let embedding = rms_norm(
@@ -3852,9 +3873,7 @@ impl CausalDecoder {
             eps,
         )?;
         let hidden = rms_norm(&states, &head.pre_fc_norm_hidden, eps)?;
-        let x = head
-            .fc
-            .forward_with_runtime(&concat_rows(&embedding, &hidden)?, runtime)?;
+        let x = self.seed_mtp_fc(&head.fc, &concat_rows(&embedding, &hidden)?, runtime)?;
         let normed = rms_norm(&x, &head.layer.input_norm, eps)?;
         let position = history.len();
         full_attention_append_kv_rows(
@@ -3865,6 +3884,116 @@ impl CausalDecoder {
             &head.layer.attention,
             runtime,
         )
+    }
+
+    /// Variante Metal de [`Self::seed_mtp_history_chunk`] : un command buffer par
+    /// bloc au lieu de normes CPU et de trois allers-retours GPU. Rend `false`,
+    /// sans rien écrire, quand la tête sort du contrat des kernels (RoPE non
+    /// rotate-half, échelle de position, fenêtre, K=V, biais) ; le CPU sème alors.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn seed_mtp_history_chunk_metal(
+        &self,
+        metal: &crate::MetalExecutor,
+        head: &MtpHead,
+        states: &[f32],
+        tokens: &[usize],
+        history: &mut LayerKvCache,
+    ) -> Result<bool> {
+        let attention = &head.layer.attention;
+        let (Some(v_proj), Some(_), Some(k_norm), Some(rope)) = (
+            attention.v_proj.as_ref(),
+            attention.q_norm.as_ref(),
+            attention.k_norm.as_ref(),
+            super::attention_ops::rope_params(&self.config, attention),
+        ) else {
+            return Ok(false);
+        };
+        if self.config.rope_style != RopeStyle::Halves
+            || rope.position_scale != 1.0
+            || attention.sliding_window.is_some_and(|window| window > 0)
+            || [&head.fc, &attention.k_proj, v_proj]
+                .iter()
+                .any(|linear| linear.bias().is_some())
+        {
+            return Ok(false);
+        }
+        let hidden = self.final_norm.data().len();
+        let q_out = attention
+            .q_proj
+            .weight()
+            .shape()
+            .first()
+            .copied()
+            .ok_or_else(|| InferError::Dimension("q_proj sans dimension de sortie".to_string()))?;
+        let (empty_q, _) = super::attention_ops::split_attention_gate(
+            &self.config,
+            &Tensor::from_vec(vec![0, q_out], Vec::new())?,
+        )?;
+        let kv_heads = attention
+            .num_key_value_heads
+            .unwrap_or(self.config.num_key_value_heads);
+        let head_dim = attention
+            .head_dim
+            .or(self.config.head_dim)
+            .ok_or_else(|| InferError::Dimension("head_dim manquant (semis MTP)".to_string()))?;
+        let rope_dims = attention
+            .rope_dims
+            .or(self.config.rope_dims)
+            .unwrap_or(head_dim);
+        let spec = crate::metal_backend::PrefillAttentionSpec {
+            seq: tokens.len(),
+            hidden_dim: hidden,
+            q_heads: self.config.num_attention_heads,
+            kv_heads,
+            head_dim,
+            rope_dims,
+            rope_frequency_dim: rope.frequency_dim,
+            rope_theta: rope.theta,
+            attn_scalar: head_dim as f32,
+            window: None,
+            k_eq_v: false,
+            value_norm: attention.value_norm,
+            eps: self.config.rms_eps,
+        };
+        let (k, v) = metal.mtp_seed_kv_rows(
+            tokens,
+            states,
+            crate::metal_backend::MtpSeedWeights {
+                embed_tokens: &self.embed_tokens,
+                embed_scale: self.config.embed_scale.unwrap_or(1.0),
+                embed_recast_bf16: self.config.is_qwen && qwen_embed_bf16_enabled(),
+                pre_fc_norm_embedding: &head.pre_fc_norm_embedding,
+                pre_fc_norm_hidden: &head.pre_fc_norm_hidden,
+                fc: &head.fc,
+                input_norm: &head.layer.input_norm,
+                k_proj: &attention.k_proj,
+                v_proj,
+                k_norm,
+            },
+            spec,
+            history.len(),
+        )?;
+        let layout =
+            super::attention_ops::attention_layout(&self.config, attention, &empty_q, &k, &v)?;
+        history.append_batch_owned(k, v, &layout)?;
+        Ok(true)
+    }
+
+    /// FC de la tête sur un bloc du semis. Côté Metal, la projection batchée
+    /// passe par le GEMM tuilé au lieu du qmv ligne à ligne de `forward`, qui
+    /// redéquantifiait le poids pour chaque ligne du bloc.
+    fn seed_mtp_fc(
+        &self,
+        fc: &crate::linear::Linear,
+        input: &Tensor,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<Tensor> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = runtime.metal_executor().filter(|_| fc.bias().is_none()) {
+            let [x] = metal.project_biasless(input, [fc])?;
+            return Ok(x);
+        }
+        fc.forward_with_runtime(input, runtime)
     }
 
     /// Hit du cache de préfixe prolongé jusqu'à `prompt`, avec le nombre de

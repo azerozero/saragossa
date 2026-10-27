@@ -3016,3 +3016,59 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
     );
     Ok(())
 }
+
+/// Semis MTP Metal contre l'oracle CPU sur la vraie tête : deux blocs pour
+/// couvrir le décalage de position RoPE, dérive bornée (normes, GEMM tuilé et
+/// RoPE GPU n'accumulent pas dans le même ordre que le CPU). Requiert
+/// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
+#[test]
+#[ignore = "modèle réel avec sidecar MTP requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+        eprintln!("skip semis MTP : sidecar MTP absent");
+        return Ok(());
+    };
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(mtp_path)?;
+    let head = model
+        .mtp
+        .as_ref()
+        .ok_or_else(|| InferError::Config("tête MTP absente".to_string()))?;
+    let metal = model
+        .forward_runtime()
+        .metal_executor()
+        .ok_or_else(|| InferError::Config("runtime Metal absent".to_string()))?;
+    let hidden = model.final_norm.data().len();
+    let tokens: Vec<usize> = (0..1500).map(|i| (i * 7919 + 13) % 50_000).collect();
+    // Embeddings normés en guise d'états finaux : même échelle, sans prefill.
+    let states = rms_norm(&model.embed_scaled(&tokens)?, &model.final_norm, 1e-6)?;
+    let mut cpu = LayerKvCache::default();
+    let mut gpu = LayerKvCache::default();
+    for (states, tokens) in states.data().chunks(1024 * hidden).zip(tokens.chunks(1024)) {
+        model.seed_mtp_history_chunk_cpu(head, states, tokens, &mut cpu)?;
+        assert!(model.seed_mtp_history_chunk_metal(metal, head, states, tokens, &mut gpu)?);
+    }
+    assert_eq!(cpu.len(), gpu.len());
+    for (label, cpu, gpu) in [
+        ("K", cpu.keys.to_vec(), gpu.keys.to_vec()),
+        ("V", cpu.values.to_vec(), gpu.values.to_vec()),
+    ] {
+        let scale = cpu.iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
+        let max_err = cpu
+            .iter()
+            .zip(&gpu)
+            .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+        eprintln!("semis MTP {label} : max_abs={scale:e} max_err={max_err:e}");
+        assert!(
+            max_err <= 1e-3 * scale,
+            "dérive {label} {max_err:e} / {scale:e}"
+        );
+    }
+    Ok(())
+}

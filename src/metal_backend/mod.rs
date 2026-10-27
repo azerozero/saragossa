@@ -66,6 +66,8 @@ mod moe_encode;
 mod moe_na;
 mod moe_shared;
 pub(crate) mod mtp_control;
+mod mtp_seed;
+pub(crate) use self::mtp_seed::MtpSeedWeights;
 mod na_gemm;
 mod pipelines;
 mod prefill;
@@ -244,6 +246,7 @@ pub struct MetalExecutor {
     copy_f32: ComputePipelineState,
     copy_u16: ComputePipelineState,
     rms_norm_rows_f32: ComputePipelineState,
+    rms_norm_rows_strided_f32: ComputePipelineState,
     rms_norm_simd_rows_f32: ComputePipelineState,
     rms_norm_simd_u3_rows_f32: ComputePipelineState,
     add_rms_norm_rows_f32: ComputePipelineState,

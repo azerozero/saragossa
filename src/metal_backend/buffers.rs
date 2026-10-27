@@ -74,6 +74,36 @@ impl MetalExecutor {
         embedding_scale: f32,
         recast_bf16: bool,
     ) -> Result<Tensor> {
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let (output, dim) = self.encode_embed_weight_tokens(
+            encoder,
+            embedding,
+            token_ids,
+            embedding_scale,
+            recast_bf16,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        Tensor::from_vec(
+            vec![token_ids.len(), dim],
+            read_f32_buffer(
+                &output,
+                checked_len(token_ids.len(), dim, "embedding Metal")?,
+            )?,
+        )
+    }
+
+    /// Encode le gather `[tokens, dim]` de `embedding` (mis à l'échelle, recast
+    /// bf16 éventuel) et rend le buffer de sortie avec `dim`, sans commit.
+    pub(crate) fn encode_embed_weight_tokens(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        embedding: &EmbeddingWeight,
+        token_ids: &[usize],
+        embedding_scale: f32,
+        recast_bf16: bool,
+    ) -> Result<(metal::Buffer, usize)> {
         let Some(&dim) = embedding.shape().get(1) else {
             return Err(InferError::Dimension(format!(
                 "embedding attendu rang 2, reçu {:?}",
@@ -105,9 +135,6 @@ impl MetalExecutor {
         let indices = self.upload_u32_buffer(&indices, "embedding_indices")?;
         let output_len = checked_len(token_ids.len(), dim, "embedding Metal")?;
         let output = self.uncached_f32_buffer(output_len, "embedding_output")?;
-
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
         self.encode_embeddings_from_indices_scaled(
             encoder,
             &weights,
@@ -118,12 +145,7 @@ impl MetalExecutor {
             embedding_scale,
             recast_bf16,
         )?;
-        encoder.end_encoding();
-        commit_and_wait(command_buffer)?;
-        Tensor::from_vec(
-            vec![token_ids.len(), dim],
-            read_f32_buffer(&output, output_len)?,
-        )
+        Ok((output, dim))
     }
 
     pub(crate) fn resolve_linear_attn_resident_weights(

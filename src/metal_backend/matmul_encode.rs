@@ -2,7 +2,7 @@
 
 use super::*;
 
-const MATMUL_ROW_TG_WIDTH: u64 = 256;
+pub(super) const MATMUL_ROW_TG_WIDTH: u64 = 256;
 
 #[expect(
     clippy::too_many_arguments,
