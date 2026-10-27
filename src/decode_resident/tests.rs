@@ -2977,3 +2977,64 @@ mod dflash_resident {
         run_case(Some(3))
     }
 }
+
+/// Semis de l'arène depuis une vue GPU partagée (K/V d'un prefill complet) :
+/// mêmes octets que l'écriture CPU, en f32 comme en bf16 (arrondi au plus
+/// proche pair des deux côtés, égalités comprises), sur un segment CPU suivi
+/// d'une vue décalée.
+#[test]
+fn kv_seed_from_shared_view_matches_cpu_bytes() -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads, head_dim) = (8, 2, 128);
+    let kv_dim = kv_heads * head_dim;
+    let rows = 5;
+    // Valeurs quelconques et égalités bf16 exactes (bit 15 seul sous la coupe).
+    let values: Vec<f32> = (0..(rows + 1) * kv_dim)
+        .map(|i| {
+            if i % 7 == 0 {
+                f32::from_bits(0x3f80_8000 + ((i as u32 & 1) << 16))
+            } else {
+                (i as f32 * 0.3711).sin() * 13.0
+            }
+        })
+        .collect();
+    let buffer = state.device().new_buffer_with_data(
+        values.as_ptr().cast(),
+        (values.len() * std::mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    // La vue saute la première ligne : offset non nul dans le buffer source.
+    let view = crate::metal_backend::SharedF32Rows::new(buffer, kv_dim, (rows - 1) * kv_dim)?;
+    let head = &values[..kv_dim];
+    for bf16 in [false, true] {
+        let mut gpu = state.full_attention(rows + 2, q_heads, kv_heads, head_dim, bf16)?;
+        let mut cpu = state.full_attention(rows + 2, q_heads, kv_heads, head_dim, bf16)?;
+        let shared = [KvSeedSegment::Cpu(head), KvSeedSegment::Shared(&view)];
+        let copied = [
+            KvSeedSegment::Cpu(head),
+            KvSeedSegment::Cpu(view.as_slice()),
+        ];
+        gpu.seed_segments(&shared, &shared, rows)?;
+        cpu.seed_segments(&copied, &copied, rows)?;
+        let cells = rows * kv_dim;
+        for (gpu, cpu) in [(gpu.keys(), cpu.keys()), (gpu.values(), cpu.values())] {
+            if bf16 {
+                assert_eq!(
+                    crate::metal_backend::read_u16_buffer(gpu.buffer(), cells)?,
+                    crate::metal_backend::read_u16_buffer(cpu.buffer(), cells)?,
+                    "semis bf16"
+                );
+            } else {
+                let gpu = read_f32_buffer(gpu.buffer(), cells)?;
+                let cpu = read_f32_buffer(cpu.buffer(), cells)?;
+                assert!(gpu
+                    .iter()
+                    .zip(&cpu)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()));
+            }
+        }
+    }
+    Ok(())
+}

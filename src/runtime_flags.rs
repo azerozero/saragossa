@@ -814,6 +814,15 @@ pub(crate) fn mtp_seed_gpu_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SEED_GPU", true))
 }
 
+/// Garde le K/V d'un prefill résident complet dans ses buffers GPU partagés,
+/// relus en place par le cache CPU et copiés sur GPU vers l'arène de decode
+/// (`SARAGOSSA_RUST_PREFILL_KV_SHARED=0` pour la relecture vers des `Vec`).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_kv_shared_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_SHARED", true))
+}
+
 /// Taille cible, en tokens, d'un morceau du prefill résident. Les buffers
 /// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
 /// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est

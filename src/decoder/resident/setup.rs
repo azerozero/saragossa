@@ -272,8 +272,8 @@ impl CausalDecoder {
             }
             let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?;
             full.seed_segments(
-                &layer_cache.keys.segments().collect::<Vec<_>>(),
-                &layer_cache.values.segments().collect::<Vec<_>>(),
+                &layer_cache.keys.seed_segments(),
+                &layer_cache.values.seed_segments(),
                 prefill_len,
             )?;
             layer_cache.full = Some(full);
@@ -712,14 +712,17 @@ impl CausalDecoder {
             let kv_heads = self.config.layer_num_key_value_heads(index);
             let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?;
             full.seed_segments(
-                &layer_cache.keys.segments().collect::<Vec<_>>(),
-                &layer_cache.values.segments().collect::<Vec<_>>(),
+                &layer_cache.keys.seed_segments(),
+                &layer_cache.values.seed_segments(),
                 prefill_len,
             )?;
             layer_cache.full = Some(full);
         }
         if let Some(t) = t_kv_seed {
-            eprintln!("mtp_setup kv_seed_us={}", t.elapsed().as_micros());
+            eprintln!(
+                "mtp_setup kv_seed_us={} kv_bf16={kv_bf16}",
+                t.elapsed().as_micros()
+            );
         }
         let t_mtp_arena = trace_setup.then(std::time::Instant::now);
         let hidden_a = arena.persistent(hidden, GpuElement::F32)?;

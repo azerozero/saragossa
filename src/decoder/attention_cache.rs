@@ -61,6 +61,36 @@ impl LayerKvCache {
         Ok(())
     }
 
+    /// Ajoute le K/V `[rows, kv_dim]` d'un prefill résident, vues GPU
+    /// partagées comprises, sans recopie.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn append_prefill(
+        &mut self,
+        key: crate::metal_backend::PrefillKvRows,
+        value: crate::metal_backend::PrefillKvRows,
+        kv_dim: usize,
+        layout: &AttentionLayout,
+    ) -> Result<()> {
+        let expected_dim = layout.num_key_value_heads * layout.head_dim;
+        let (key_len, value_len) = (key.data().len(), value.data().len());
+        if expected_dim == 0
+            || kv_dim != expected_dim
+            || key_len == 0
+            || key_len != value_len
+            || key_len % expected_dim != 0
+            || self.kv_dim.is_some_and(|dim| dim != expected_dim)
+        {
+            return Err(InferError::Dimension(format!(
+                "cache KV prefill attend [seq,{expected_dim}], reçu key={key_len} value={value_len} (dim courante {:?})",
+                self.kv_dim
+            )));
+        }
+        self.kv_dim = Some(expected_dim);
+        self.keys.push_prefill(key);
+        self.values.push_prefill(value);
+        Ok(())
+    }
+
     fn check_batch(
         &mut self,
         key: &Tensor,

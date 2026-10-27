@@ -3568,7 +3568,7 @@ impl CausalDecoder {
             cache.layers.iter_mut().zip(&layers).zip(layer_states)
         {
             // L'état linéaire a avancé en place dans le buffer du cache.
-            if let crate::metal_backend::PrefillResidentLayerCache::Full { key, value } =
+            if let crate::metal_backend::PrefillResidentLayerCache::Full { key, value, kv_dim } =
                 layer_state
             {
                 let layer_spec = layer.attention_spec;
@@ -3580,7 +3580,7 @@ impl CausalDecoder {
                     attn_scalar: layer_spec.attn_scalar,
                     sliding_window: layer_spec.window,
                 };
-                layer_cache.append_batch_owned(key, value, &layout)?;
+                layer_cache.append_prefill(key, value, kv_dim, &layout)?;
             }
         }
         cache.position = start + suffix.len();
@@ -4786,7 +4786,11 @@ impl CausalDecoder {
                     cache.layers.iter_mut().zip(layers.iter()).zip(layer_states)
                 {
                     match layer_state {
-                        crate::metal_backend::PrefillResidentLayerCache::Full { key, value } => {
+                        crate::metal_backend::PrefillResidentLayerCache::Full {
+                            key,
+                            value,
+                            kv_dim,
+                        } => {
                             let layer_spec = prefill_layer.attention_spec;
                             let layout = AttentionLayout {
                                 num_attention_heads: layer_spec.q_heads,
@@ -4796,7 +4800,7 @@ impl CausalDecoder {
                                 attn_scalar: layer_spec.attn_scalar,
                                 sliding_window: layer_spec.window,
                             };
-                            layer_cache.append_batch_owned(key, value, &layout)?;
+                            layer_cache.append_prefill(key, value, kv_dim, &layout)?;
                         }
                         crate::metal_backend::PrefillResidentLayerCache::Linear { state } => {
                             layer_cache

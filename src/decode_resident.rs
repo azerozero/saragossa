@@ -71,7 +71,7 @@ mod tests;
 pub(crate) use self::arena::{
     install_pipeline_scratch_slot, GpuElement, GpuTensor, ScratchLease, ScratchPool,
 };
-pub(crate) use self::attention::FullAttentionMetalState;
+pub(crate) use self::attention::{FullAttentionMetalState, KvSeedSegment};
 pub(crate) use self::gpu_position::{check_gpu_position_rows, GpuPosition};
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,

@@ -490,12 +490,23 @@ impl MetalExecutor {
                     // y est déjà.
                     let kv_len = checked_len(rows, kv_dim, "prefill résident readback kv")?;
                     let kv_offset = checked_len(start, kv_dim, "prefill résident readback kv")?;
-                    let key = read_f32_buffer_at(&key, kv_offset, kv_len)?;
-                    let value = read_f32_buffer_at(&value, kv_offset, kv_len)?;
-                    layer_caches.push(PrefillResidentLayerCache::Full {
-                        key: Tensor::from_vec(vec![rows, kv_dim], key)?,
-                        value: Tensor::from_vec(vec![rows, kv_dim], value)?,
-                    });
+                    // Prefill complet : le buffer, que plus rien n'écrit, devient
+                    // le stockage CPU du K/V. Extension : il porte aussi le
+                    // préfixe, seules les lignes nouvelles sont relues.
+                    let (key, value) = if start == 0
+                        && crate::runtime_flags::prefill_kv_shared_enabled()
+                    {
+                        (
+                            PrefillKvRows::Shared(SharedF32Rows::new(key, 0, kv_len)?),
+                            PrefillKvRows::Shared(SharedF32Rows::new(value, 0, kv_len)?),
+                        )
+                    } else {
+                        (
+                            PrefillKvRows::Owned(read_f32_buffer_at(&key, kv_offset, kv_len)?),
+                            PrefillKvRows::Owned(read_f32_buffer_at(&value, kv_offset, kv_len)?),
+                        )
+                    };
+                    layer_caches.push(PrefillResidentLayerCache::Full { key, value, kv_dim });
                 }
                 PrefillResidentLayerCacheBuffer::Linear { state } => {
                     layer_caches.push(PrefillResidentLayerCache::Linear { state });
