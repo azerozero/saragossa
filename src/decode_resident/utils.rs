@@ -2,6 +2,10 @@
 
 use super::*;
 use crate::runtime_flags::{env_flag, env_flag_value};
+use rayon::prelude::*;
+
+/// Taille des blocs convertis en parallèle vers un buffer bf16 partagé.
+const PARALLEL_COPY_CHUNK: usize = 1 << 16;
 
 /// Écrit `data` dans le buffer f32 `tensor` à partir de l'élément `offset`.
 ///
@@ -164,14 +168,20 @@ pub(super) fn write_f32_as_bf16_at(tensor: &GpuTensor, offset: usize, data: &[f3
             "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
         ));
     }
-    // SAFETY: buffer en StorageModeShared, écriture de `data.len()` u16 à partir
-    // de l'élément `offset` ; les bornes sont vérifiées plus haut et l'écriture
-    // précède le command buffer qui lira le KV résident.
-    unsafe {
-        for (index, value) in data.iter().copied().enumerate() {
-            ptr.add(offset + index).write(f32_to_bf16_bits(value));
-        }
-    }
+    // SAFETY: buffer en StorageModeShared, tranche de `data.len()` u16 à partir
+    // de l'élément `offset` ; les bornes sont vérifiées plus haut, aucun autre
+    // accès CPU ne vise ce buffer pendant l'écriture, qui précède le command
+    // buffer lisant le KV résident.
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr.add(offset), data.len()) };
+    // Conversion indépendante par élément : parallèle par blocs (semis du KV
+    // bf16 d'un prompt de 32k : 210 -> 162 ms).
+    out.par_chunks_mut(PARALLEL_COPY_CHUNK)
+        .zip(data.par_chunks(PARALLEL_COPY_CHUNK))
+        .for_each(|(out, data)| {
+            for (out, value) in out.iter_mut().zip(data) {
+                *out = f32_to_bf16_bits(*value);
+            }
+        });
     #[cfg(feature = "devtools")]
     crate::runtime_flags::pairwise::record_io(true, data.len() * 2);
     Ok(())
