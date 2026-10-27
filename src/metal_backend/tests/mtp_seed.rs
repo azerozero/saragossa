@@ -40,6 +40,7 @@ fn mtp_seed_strided_norm_and_copy_cols_match_cpu() -> Result<()> {
         executor.encode_rms_norm_rows_strided(
             encoder,
             input,
+            0,
             weight,
             &concat,
             (half * dim * std::mem::size_of::<f32>()) as u64,

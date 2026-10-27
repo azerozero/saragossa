@@ -99,9 +99,9 @@ impl SharedF32Rows {
     }
 }
 
-/// K ou V `[rows, kv_dim]` rendu par le prefill résident : vue du buffer GPU
-/// pour un prefill complet, copie relue pour une extension (son buffer porte
-/// aussi le préfixe, déjà dans le cache CPU).
+/// K, V `[rows, kv_dim]` ou hidden final `[rows, hidden]` rendu par le prefill
+/// résident : vue du buffer GPU qu'il a seul écrit, ou copie relue (extension
+/// de K/V dont le buffer porte aussi le préfixe, dernière ligne seule).
 #[derive(Clone, Debug)]
 pub(crate) enum PrefillKvRows {
     Owned(Vec<f32>),
@@ -114,5 +114,26 @@ impl PrefillKvRows {
             Self::Owned(data) => data,
             Self::Shared(rows) => rows.as_slice(),
         }
+    }
+
+    /// Tenseur `[len / cols, cols]` ; une vue partagée est copiée.
+    pub(crate) fn into_tensor(self, cols: usize) -> Result<Tensor> {
+        let data = match self {
+            Self::Owned(data) => data,
+            Self::Shared(rows) => rows.as_slice().to_vec(),
+        };
+        Tensor::from_vec(vec![data.len() / cols.max(1), cols], data)
+    }
+}
+
+#[cfg(test)]
+impl MetalExecutor {
+    /// Vue partagée d'une copie de `data`, comme le hidden d'un prefill.
+    #[expect(unsafe_code, reason = "buffer neuf propre au test")]
+    pub(crate) fn shared_f32_rows_for_test(&self, data: &[f32]) -> Result<SharedF32Rows> {
+        let buffer = self.uncached_f32_buffer(data.len(), "test_shared_rows")?;
+        write_f32_buffer(&buffer, data)?;
+        // SAFETY: buffer neuf, hors scratch, que plus rien n'écrit ensuite.
+        unsafe { SharedF32Rows::new(buffer, 0, data.len()) }
     }
 }

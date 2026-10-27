@@ -1133,6 +1133,11 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
     // que son K/V sur les morceaux non finaux ; ligne et KV restent identiques.
     let (last, last_caches, _) =
         executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, true)?;
+    let (single, chunked, last) = (
+        single.into_tensor(spec.hidden_dim)?,
+        chunked.into_tensor(spec.hidden_dim)?,
+        last.into_tensor(spec.hidden_dim)?,
+    );
     let hidden = last.data().len();
     assert_eq!(last.shape(), &[1, hidden]);
     assert_eq!(
@@ -1261,6 +1266,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             Some(&prefix),
             false,
         )?;
+        let extended = extended.into_tensor(HIDDEN)?;
         assert_close(
             &extended,
             &rows_of(&single, prefix_rows, SEQ, HIDDEN)?,

@@ -3047,18 +3047,27 @@ fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
         .ok_or_else(|| InferError::Config("runtime Metal absent".to_string()))?;
     let hidden = model.final_norm.data().len();
     let tokens: Vec<usize> = (0..1500).map(|i| (i * 7919 + 13) % 50_000).collect();
-    // Embeddings normés en guise d'états finaux : même échelle, sans prefill.
-    let states = rms_norm(&model.embed_scaled(&tokens)?, &model.final_norm, 1e-6)?;
+    // Embeddings en guise de hidden final : même échelle, sans prefill.
+    let raw = model.embed_scaled(&tokens)?;
+    let states = rms_norm(&raw, &model.final_norm, model.config.rms_eps)?;
     let mut cpu = LayerKvCache::default();
     let mut gpu = LayerKvCache::default();
     for (states, tokens) in states.data().chunks(1024 * hidden).zip(tokens.chunks(1024)) {
         model.seed_mtp_history_chunk_cpu(head, states, tokens, &mut cpu)?;
+        let states = crate::metal_backend::MtpSeedStates::Normed(states);
         assert!(model.seed_mtp_history_chunk_metal(metal, head, states, tokens, &mut gpu)?);
     }
+    // Hidden non normé lu en place, norme finale sur le GPU.
+    let mut gpu_raw = LayerKvCache::default();
+    let raw = metal.shared_f32_rows_for_test(raw.data())?;
+    assert!(model.seed_mtp_history_raw(&raw, &tokens, &mut gpu_raw)?);
     assert_eq!(cpu.len(), gpu.len());
+    assert_eq!(cpu.len(), gpu_raw.len());
     for (label, cpu, gpu) in [
         ("K", cpu.keys.to_vec(), gpu.keys.to_vec()),
         ("V", cpu.values.to_vec(), gpu.values.to_vec()),
+        ("K brut", cpu.keys.to_vec(), gpu_raw.keys.to_vec()),
+        ("V brut", cpu.values.to_vec(), gpu_raw.values.to_vec()),
     ] {
         assert_eq!(cpu.len(), gpu.len(), "longueur {label}");
         assert!(

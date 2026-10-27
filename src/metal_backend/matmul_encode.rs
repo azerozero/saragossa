@@ -1177,6 +1177,7 @@ impl MetalExecutor {
         self.encode_rms_norm_rows_strided(
             encoder,
             input_buffer,
+            0,
             weight_buffer,
             output_buffer,
             0,
@@ -1195,6 +1196,7 @@ impl MetalExecutor {
         &self,
         encoder: &ComputeCommandEncoderRef,
         input_buffer: &BufferRef,
+        input_offset: u64,
         weight_buffer: &BufferRef,
         output_buffer: &BufferRef,
         output_offset: u64,
@@ -1204,7 +1206,7 @@ impl MetalExecutor {
         eps: f32,
     ) -> Result<()> {
         encoder.set_compute_pipeline_state(&self.rms_norm_rows_f32);
-        encoder.set_buffer(0, Some(input_buffer), 0);
+        encoder.set_buffer(0, Some(input_buffer), input_offset);
         encoder.set_buffer(1, Some(weight_buffer), 0);
         encoder.set_buffer(2, Some(output_buffer), output_offset);
         set_u32_bytes(
