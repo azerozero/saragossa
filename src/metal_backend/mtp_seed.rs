@@ -133,21 +133,64 @@ impl MetalExecutor {
             hidden,
             spec.eps,
         )?;
-        for (linear, output) in [(weights.k_proj, &k), (weights.v_proj, &v)] {
-            let out_dim = self.encode_matmul_weight(
-                encoder,
-                &mut owned_buffers,
-                &normed,
-                rows,
-                hidden,
-                linear.weight(),
-                output,
-            )?;
-            if out_dim != kv_dim {
-                return Err(InferError::Dimension(format!(
-                    "semis MTP : projection K/V sort {out_dim}, attendu {kv_dim}"
-                )));
+        // K|V concaténés : la sortie de 2·kv_dim passe le seuil du GEMM tuilé,
+        // que chaque projection seule manque. Deux matmuls si les poids ne se
+        // concatènent pas.
+        match self.resolve_concat_linear_weight_buffers(
+            &[weights.k_proj.weight(), weights.v_proj.weight()],
+            "mtp_seed_kv_proj",
+        ) {
+            Ok(kv_weights) => {
+                let kv_concat_dim = checked_len(kv_dim, 2, "semis MTP kv concat")?;
+                let kv =
+                    self.new_f32_buffer(checked_len(kv_len, 2, "semis MTP kv")?, "mtp_seed_kv")?;
+                let out_dim = self.encode_matmul_weight_buffers(
+                    encoder,
+                    &normed,
+                    rows,
+                    hidden,
+                    &kv_weights,
+                    &kv,
+                    false,
+                )?;
+                if out_dim != kv_concat_dim {
+                    return Err(InferError::Dimension(format!(
+                        "semis MTP : projection K|V sort {out_dim}, attendu {kv_concat_dim}"
+                    )));
+                }
+                for (column, output) in [(0, &k), (kv_dim, &v)] {
+                    self.encode_copy_cols(
+                        encoder,
+                        &kv,
+                        u64::try_from(column * std::mem::size_of::<f32>()).map_err(|_| {
+                            InferError::Dimension("semis MTP : offset K|V déborde".to_string())
+                        })?,
+                        output,
+                        kv_dim,
+                        kv_concat_dim,
+                        kv_len,
+                    )?;
+                }
             }
+            Err(InferError::Dimension(_)) => {
+                for (linear, output) in [(weights.k_proj, &k), (weights.v_proj, &v)] {
+                    let out_dim = self.encode_matmul_weight(
+                        encoder,
+                        &mut owned_buffers,
+                        &normed,
+                        rows,
+                        hidden,
+                        linear.weight(),
+                        output,
+                    )?;
+                    if out_dim != kv_dim {
+                        return Err(InferError::Dimension(format!(
+                            "semis MTP : projection K/V sort {out_dim}, attendu {kv_dim}"
+                        )));
+                    }
+                }
+            }
+            Err(error) => return Err(error),
         }
         if spec.value_norm {
             self.encode_rms_norm_heads_no_scale_rows(
@@ -175,6 +218,39 @@ impl MetalExecutor {
             Tensor::from_vec(vec![rows, kv_dim], read_f32_buffer(&k_rope, kv_len)?)?,
             Tensor::from_vec(vec![rows, kv_dim], read_f32_buffer(&v, kv_len)?)?,
         ))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "copie de colonnes: buffers, offset et dimensions explicites"
+    )]
+    fn encode_copy_cols(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        input_offset: u64,
+        output_buffer: &BufferRef,
+        cols: usize,
+        src_stride: usize,
+        len: usize,
+    ) -> Result<()> {
+        encoder.set_compute_pipeline_state(&self.copy_cols_f32);
+        encoder.set_buffer(0, Some(input_buffer), input_offset);
+        encoder.set_buffer(1, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 2, &[checked_u32(cols, "copy cols")?], "copy_cols")?;
+        set_u32_bytes(
+            encoder,
+            3,
+            &[checked_u32(src_stride, "copy cols stride")?],
+            "copy_cols_stride",
+        )?;
+        set_u32_bytes(
+            encoder,
+            4,
+            &[checked_u32(len, "copy cols len")?],
+            "copy_cols_len",
+        )?;
+        self.dispatch_1d(encoder, &self.copy_cols_f32, len)
     }
 
     #[expect(

@@ -244,6 +244,7 @@ pub struct MetalExecutor {
     add_sigmoid_scaled_f32: ComputePipelineState,
     add_sigmoid_scaled_rows_f32: ComputePipelineState,
     copy_f32: ComputePipelineState,
+    copy_cols_f32: ComputePipelineState,
     copy_u16: ComputePipelineState,
     rms_norm_rows_f32: ComputePipelineState,
     rms_norm_rows_strided_f32: ComputePipelineState,

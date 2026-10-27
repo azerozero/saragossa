@@ -7436,6 +7436,23 @@ kernel void copy_f32(
     out[gid] = src[gid];
 }
 
+// Copie `cols` colonnes de chaque ligne d'une matrice au pas `src_stride`
+// vers une matrice contiguë : sépare les blocs d'une sortie de projections
+// concaténées (K|V du semis MTP).
+kernel void copy_cols_f32(
+    device const float* src [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    constant uint& src_stride [[buffer(3)]],
+    constant uint& len [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) {
+        return;
+    }
+    out[gid] = src[(gid / cols) * src_stride + gid % cols];
+}
+
 kernel void copy_u16(
     device const ushort* src [[buffer(0)]],
     device ushort* out [[buffer(1)]],
