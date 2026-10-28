@@ -290,10 +290,31 @@ fn kv_bf16_for(default_bf16: bool) -> bool {
 /// si bf16, le format de `SARAGOSSA_RUST_KV_QUANT` (bf16 par défaut). Les
 /// capacités de la couche sont vérifiées ensuite ([`kv_quant_refusal`]).
 pub(super) fn kv_format_for(default_bf16: bool) -> KvFormat {
+    #[cfg(test)]
+    if let Some(format) = KV_FORMAT_OVERRIDE.with(Cell::get) {
+        return format;
+    }
     resolve_kv_format(
         kv_bf16_for(default_bf16),
         crate::runtime_flags::kv_quant_format(),
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    static KV_FORMAT_OVERRIDE: Cell<Option<KvFormat>> = const { Cell::new(None) };
+}
+
+/// Test : force le format rendu par [`kv_format_for`] pendant `run`, sur ce
+/// thread. Les flags sont gelés par `OnceLock` : sans ce levier, un même
+/// processus ne peut pas comparer deux formats. Les replis de capacité
+/// (`kv_quant_refusal`, fenêtres glissantes) s'appliquent toujours.
+#[cfg(test)]
+pub(crate) fn with_kv_format_override<R>(format: KvFormat, run: impl FnOnce() -> R) -> R {
+    let previous = KV_FORMAT_OVERRIDE.with(|cell| cell.replace(Some(format)));
+    let result = run();
+    KV_FORMAT_OVERRIDE.with(|cell| cell.set(previous));
+    result
 }
 
 /// Combine le dtype résolu et le format quantifié demandé : seul un KV bf16

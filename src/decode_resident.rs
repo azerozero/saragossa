@@ -80,6 +80,8 @@ pub(crate) use self::types::{
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
     LinearAttnDenseLayerWeights, LinearAttnLayerWeights, MtpD2Segments,
 };
+#[cfg(all(test, feature = "devtools"))]
+pub(crate) use self::utils::with_kv_format_override;
 
 /// État résident d'UN decode (réserves C/D).
 ///

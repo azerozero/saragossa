@@ -3087,3 +3087,136 @@ fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
     }
     Ok(())
 }
+
+/// Logits des tokens `forced` après le prompt, sur un KV résident forcé au
+/// format `format` : vérification résidente alternant une ligne (boucle
+/// mono-ligne) et trois lignes (chemin en lignes fusionné), comme le decode
+/// AR et la vérification MTP.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn kv_quant_forced_logits(
+    model: &CausalDecoder,
+    prompt: &[usize],
+    forced: &[usize],
+    format: crate::decode_resident::KvFormat,
+) -> Result<Vec<Vec<f32>>> {
+    let (mut cache, _) = model.prefill_prompt_state_uncached(prompt)?.into_parts();
+    let ready = crate::decode_resident::with_kv_format_override(format, || {
+        model.setup_resident_full_decode(&mut cache, forced.len() + 1, 0, true)
+    })?;
+    if !ready {
+        return Err(InferError::Config(format!(
+            "setup résident refusé pour {format:?}"
+        )));
+    }
+    let hidden = model.final_norm.data().len();
+    let mut logits = Vec::with_capacity(forced.len());
+    let (mut start, mut call) = (0, 0);
+    while start < forced.len() {
+        let rows = if call % 2 == 0 { 1 } else { 3 };
+        call += 1;
+        let chunk = &forced[start..(start + rows).min(forced.len())];
+        let output = model
+            .next_final_states_resident_verify(
+                &mut cache,
+                chunk,
+                ResidentVerifyHead::Skip,
+                false,
+                None,
+            )?
+            .ok_or_else(|| InferError::Config("vérification résidente non exercée".into()))?;
+        for row in output.states.data().chunks(hidden) {
+            let state = Tensor::from_vec(vec![1, hidden], row.to_vec())?;
+            logits.push(model.logits_from_final_state(&state)?.as_row()?.to_vec());
+        }
+        start += chunk.len();
+    }
+    Ok(logits)
+}
+
+/// Rang 1 et 2 d'une ligne de logits : `(argmax, marge top1 − top2)`.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn top2(logits: &[f32]) -> (usize, f32) {
+    let mut best = (0, f32::NEG_INFINITY);
+    let mut second = f32::NEG_INFINITY;
+    for (index, &value) in logits.iter().enumerate() {
+        if value > best.1 {
+            second = best.1;
+            best = (index, value);
+        } else if value > second {
+            second = value;
+        }
+    }
+    (best.0, best.1 - second)
+}
+
+/// Dérive du KV résident quantifié contre bf16 sur le vrai modèle : prompt de
+/// ~6k tokens (source de ce dépôt) puis 64 tokens imposés (la suite du texte),
+/// identiques pour tous les formats ; f32 donne l'échelle de la dérive bf16.
+/// Affiche par format la dérive max et médiane des logits, l'accord top-1 et
+/// la marge bf16 aux désaccords. Seul garde-fou : logits finis et accord
+/// top-1 Q8 ≥ 90 %. Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`.
+#[test]
+#[ignore = "modèle réel requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn kv_quant_logit_drift_vs_bf16_real_model() -> Result<()> {
+    use crate::decode_resident::KvFormat;
+    const PROMPT_TOKENS: usize = 6000;
+    const FORCED: usize = 64;
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let text = concat!(
+        include_str!("../decode_resident/attention.rs"),
+        include_str!("../decode_resident/rows.rs"),
+    );
+    let ids = mtp_verifier_prompt_ids(&assets, text)?;
+    let prompt_len = PROMPT_TOKENS.min(ids.len().saturating_sub(FORCED));
+    let (prompt, forced) = (&ids[..prompt_len], &ids[prompt_len..prompt_len + FORCED]);
+    let reference = kv_quant_forced_logits(&model, prompt, forced, KvFormat::Bf16)?;
+    let mut q8_agree = 0;
+    for format in [KvFormat::F32, KvFormat::Q8, KvFormat::K8V4, KvFormat::Q4] {
+        let logits = kv_quant_forced_logits(&model, prompt, forced, format)?;
+        assert_eq!(logits.len(), reference.len());
+        let mut step_max = Vec::with_capacity(logits.len());
+        let mut agree = 0;
+        let mut flips = Vec::new();
+        for (step, (row, base)) in logits.iter().zip(&reference).enumerate() {
+            assert!(
+                row.iter().all(|value| value.is_finite()),
+                "{format:?} pas {step}: logit non fini"
+            );
+            step_max.push(
+                row.iter()
+                    .zip(base)
+                    .fold(0.0_f32, |acc, (a, b)| acc.max((a - b).abs())),
+            );
+            let ((top, _), (base_top, base_margin)) = (top2(row), top2(base));
+            if top == base_top {
+                agree += 1;
+            } else {
+                flips.push(format!("pas {step} marge bf16 {base_margin:.4}"));
+            }
+        }
+        let max = step_max.iter().copied().fold(0.0_f32, f32::max);
+        step_max.sort_by(f32::total_cmp);
+        let median = step_max[step_max.len() / 2];
+        eprintln!(
+            "kv_quant {format:?} vs bf16 (prompt {prompt_len}, {FORCED} pas) : dérive logits \
+             max={max:.4} médiane={median:.4} top-1={agree}/{FORCED} désaccords=[{}]",
+            flips.join(", ")
+        );
+        if format == KvFormat::Q8 {
+            q8_agree = agree;
+        }
+    }
+    let margins: Vec<f32> = reference.iter().map(|row| top2(row).1).collect();
+    let min_margin = margins.iter().copied().fold(f32::INFINITY, f32::min);
+    eprintln!("kv_quant marge top1-top2 bf16 : min={min_margin:.4}");
+    assert!(
+        q8_agree * 10 >= FORCED * 9,
+        "Q8 : accord top-1 {q8_agree}/{FORCED} < 90 %"
+    );
+    Ok(())
+}
