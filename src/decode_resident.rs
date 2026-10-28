@@ -59,6 +59,7 @@ pub(crate) mod dflash;
 mod duo;
 mod gpu_position;
 mod kernels;
+mod kv_quant;
 mod layers;
 mod moe_tail;
 mod rows;
@@ -73,6 +74,7 @@ pub(crate) use self::arena::{
 };
 pub(crate) use self::attention::{FullAttentionMetalState, KvSeedSegment};
 pub(crate) use self::gpu_position::{check_gpu_position_rows, GpuPosition};
+pub(crate) use self::kv_quant::KvFormat;
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,

@@ -257,7 +257,7 @@ impl DFlashResident {
                     .transpose()?,
                 mlp_conv: layer.mlp_conv.as_ref().map(resolve_conv).transpose()?,
                 sliding_window,
-                kv: state.full_attention(
+                kv: state.full_attention_dense(
                     capacity,
                     dims.q_heads,
                     dims.kv_heads,

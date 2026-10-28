@@ -28,12 +28,15 @@ pub(crate) enum GpuElement {
     Bf16,
     F32,
     U32,
+    /// Octet brut : charge utile du KV quantifié (Q8, ou deux codes Q4 par octet).
+    U8,
 }
 
 impl GpuElement {
     /// Renvoie la taille d'un élément en octets.
     pub(crate) const fn byte_size(self) -> usize {
         match self {
+            GpuElement::U8 => 1,
             GpuElement::Bf16 => 2,
             GpuElement::F32 | GpuElement::U32 => 4,
         }

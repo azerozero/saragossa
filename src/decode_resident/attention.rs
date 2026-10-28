@@ -5,8 +5,8 @@ use super::gpu_position::{
     check_gpu_position_rows, rope_dims_param, to_u32, GpuPositionRows, U32x4Param,
 };
 use super::utils::{
-    bf16_round_f32, byte_offset, flash_sdpa_enabled, kv_bf16_for, kv_bf16_sim_konly,
-    kv_bf16_sim_vonly, read_f32_at, sdpa_2pass_blocks, sdpa_2pass_enabled, sdpa_2pass_min_len,
+    bf16_round_f32, byte_offset, flash_sdpa_enabled, kv_bf16_sim_konly, kv_bf16_sim_vonly,
+    kv_format_for, read_f32_at, sdpa_2pass_blocks, sdpa_2pass_enabled, sdpa_2pass_min_len,
     write_f32_as_bf16_at, write_f32_at,
 };
 use super::*;
@@ -24,7 +24,7 @@ impl DecodeResidentState {
     /// multiple de `kv_heads` (GQA, réserve R4), ou si la taille déborde.
     ///
     /// `kv_bf16` = dtype KV par défaut choisi par l'appelant (bf16 si vrai),
-    /// sauf override explicite `SARAGOSSA_RUST_KV_BF16` (cf. [`kv_bf16_for`]).
+    /// sauf override explicite `SARAGOSSA_RUST_KV_BF16` (cf. [`kv_format_for`]).
     pub(crate) fn full_attention(
         &self,
         capacity: usize,
@@ -33,15 +33,34 @@ impl DecodeResidentState {
         head_dim: usize,
         kv_bf16: bool,
     ) -> Result<FullAttentionMetalState> {
-        let kv_element = if kv_bf16_for(kv_bf16) {
-            GpuElement::Bf16
-        } else {
-            GpuElement::F32
-        };
+        let format = kv_format_for(kv_bf16);
         if crate::runtime_flags::trace_resident_enabled() {
-            eprintln!("kv résident full-attn dtype={kv_element:?} (kv_bf16={kv_bf16})");
+            eprintln!("kv résident full-attn format={format:?} (kv_bf16={kv_bf16})");
         }
-        self.full_attention_with_element(capacity, q_heads, kv_heads, head_dim, kv_element)
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format)
+    }
+
+    /// Comme [`Self::full_attention`], mais jamais quantifié : f32 ou bf16
+    /// seulement. Sert aux arènes dont l'attention n'a pas de variante
+    /// quantifiée (fenêtre glissante, tête MTP, DFlash) ou dont les octets sont
+    /// comparés tels quels (oracles).
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que [`Self::full_attention`].
+    pub(crate) fn full_attention_dense(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        kv_bf16: bool,
+    ) -> Result<FullAttentionMetalState> {
+        let format = match kv_format_for(kv_bf16) {
+            KvFormat::F32 => KvFormat::F32,
+            KvFormat::Bf16 | KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4 => KvFormat::Bf16,
+        };
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format)
     }
 
     #[cfg(test)]
@@ -52,7 +71,7 @@ impl DecodeResidentState {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<FullAttentionMetalState> {
-        self.full_attention_with_element(capacity, q_heads, kv_heads, head_dim, GpuElement::Bf16)
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, KvFormat::Bf16)
     }
 
     #[cfg(test)]
@@ -63,16 +82,16 @@ impl DecodeResidentState {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<FullAttentionMetalState> {
-        self.full_attention_with_element(capacity, q_heads, kv_heads, head_dim, GpuElement::F32)
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, KvFormat::F32)
     }
 
-    fn full_attention_with_element(
+    fn full_attention_with_format(
         &self,
         capacity: usize,
         q_heads: usize,
         kv_heads: usize,
         head_dim: usize,
-        kv_element: GpuElement,
+        format: KvFormat,
     ) -> Result<FullAttentionMetalState> {
         if capacity == 0 || q_heads == 0 || kv_heads == 0 || head_dim == 0 {
             return Err(InferError::Config(
@@ -91,11 +110,17 @@ impl DecodeResidentState {
         let cells = capacity
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Config("capacité KV déborde".to_string()))?;
-        let keys = alloc_tensor(&self.device, self.options, cells, kv_element)?;
-        let values = alloc_tensor(&self.device, self.options, cells, kv_element)?;
+        if format.is_quantized() {
+            return Err(InferError::Config(format!(
+                "KV résident {format:?} non implémenté"
+            )));
+        }
+        let keys = alloc_tensor(&self.device, self.options, cells, format.keys().element())?;
+        let values = alloc_tensor(&self.device, self.options, cells, format.values().element())?;
         Ok(FullAttentionMetalState {
             keys,
             values,
+            format,
             capacity,
             len: 0,
             q_heads,
@@ -512,6 +537,7 @@ impl KvSeedSegment<'_> {
 pub(crate) struct FullAttentionMetalState {
     keys: GpuTensor,
     values: GpuTensor,
+    format: KvFormat,
     capacity: usize,
     len: usize,
     q_heads: usize,
@@ -629,6 +655,13 @@ impl FullAttentionMetalState {
             read_f32_at(&self.keys, offset, count)?,
             read_f32_at(&self.values, offset, count)?,
         ))
+    }
+
+    /// Renvoie le format du KV (dense ou quantifié) : seule source pour
+    /// choisir un chemin selon le stockage, `keys().element()` ne distinguant
+    /// pas Q8 de Q4.
+    pub(crate) fn format(&self) -> KvFormat {
+        self.format
     }
 
     /// Renvoie le buffer résident des clés (`capacity * kv_dim`).
@@ -750,10 +783,10 @@ impl FullAttentionMetalState {
                     (_, GpuElement::Bf16) => {
                         write_f32_as_bf16_at(tensor, offset, segment.as_slice())?;
                     }
-                    (_, GpuElement::U32) => {
-                        return Err(InferError::Metal(
-                            "seed KV sur un buffer u32 invalide".to_string(),
-                        ));
+                    (_, element @ (GpuElement::U32 | GpuElement::U8)) => {
+                        return Err(InferError::Metal(format!(
+                            "seed KV sur un buffer {element:?} invalide"
+                        )));
                     }
                 }
                 offset += segment.len();
@@ -800,10 +833,10 @@ impl FullAttentionMetalState {
                 write_f32_as_bf16_at(&self.keys, offset, key)?;
                 write_f32_as_bf16_at(&self.values, offset, value)?;
             }
-            GpuElement::U32 => {
-                return Err(InferError::Metal(
-                    "append KV sur un buffer u32 invalide".to_string(),
-                ));
+            element @ (GpuElement::U32 | GpuElement::U8) => {
+                return Err(InferError::Metal(format!(
+                    "append KV sur un buffer {element:?} invalide"
+                )));
             }
         }
         self.len += 1;
@@ -1030,10 +1063,10 @@ impl FullAttentionMetalState {
             (GpuElement::Bf16, true, true) => &self.attention_flash_d256_bf16,
             (GpuElement::Bf16, true, false) => &self.attention_flash_bf16,
             (GpuElement::Bf16, false, _) => &self.attention_naive_bf16,
-            (GpuElement::U32, _, _) => {
-                return Err(InferError::Metal(
-                    "attention_decode sur KV u32 invalide".to_string(),
-                ));
+            (element @ (GpuElement::U32 | GpuElement::U8), _, _) => {
+                return Err(InferError::Metal(format!(
+                    "attention_decode sur KV {element:?} invalide"
+                )));
             }
         };
         encoder.set_compute_pipeline_state(pipeline);
@@ -1111,10 +1144,10 @@ impl FullAttentionMetalState {
                     "attention_decode 2pass head_dim={other} non supporté"
                 )));
             }
-            (GpuElement::U32, _) => {
-                return Err(InferError::Metal(
-                    "attention_decode 2pass sur KV u32 invalide".to_string(),
-                ));
+            (element @ (GpuElement::U32 | GpuElement::U8), _) => {
+                return Err(InferError::Metal(format!(
+                    "attention_decode 2pass sur KV {element:?} invalide"
+                )));
             }
         };
         encoder.set_compute_pipeline_state(pass1);
@@ -1243,7 +1276,7 @@ impl FullAttentionMetalState {
         check_gpu_position_rows(
             self.capacity,
             self.kv_dim(),
-            self.keys.element(),
+            self.format,
             0,
             position.max_position,
             row + 1,
@@ -1300,10 +1333,10 @@ impl FullAttentionMetalState {
         let pipeline = match output_element {
             GpuElement::F32 => &self.copy_at,
             GpuElement::Bf16 => &self.copy_at_f32_to_bf16,
-            GpuElement::U32 => {
-                return Err(InferError::Metal(
-                    "copy_at KV vers un buffer u32 invalide".to_string(),
-                ));
+            GpuElement::U32 | GpuElement::U8 => {
+                return Err(InferError::Metal(format!(
+                    "copy_at KV vers un buffer {output_element:?} invalide"
+                )));
             }
         };
         encoder.set_compute_pipeline_state(pipeline);

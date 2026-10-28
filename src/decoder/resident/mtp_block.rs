@@ -210,7 +210,7 @@ impl CausalDecoder {
                 ) || check_gpu_position_rows(
                     kv.capacity(),
                     kv.kv_dim(),
-                    kv.keys().element(),
+                    kv.format(),
                     0,
                     max_position,
                     2,

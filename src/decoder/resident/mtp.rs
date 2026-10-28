@@ -278,22 +278,20 @@ impl CausalDecoder {
         target: &FullAttentionMetalState,
         rows: usize,
     ) -> Result<()> {
+        use crate::decode_resident::KvFormat;
         let cells = rows
             .checked_mul(source.kv_dim())
             .ok_or_else(|| InferError::Dimension("MTP oracle KV prefix déborde".to_string()))?;
         if cells == 0 {
             return Ok(());
         }
-        if source.kv_dim() != target.kv_dim()
-            || source.keys().element() != target.keys().element()
-            || source.values().element() != target.values().element()
-        {
+        if source.kv_dim() != target.kv_dim() || source.format() != target.format() {
             return Err(InferError::Dimension(
                 "MTP oracle KV dtype/dim incompatible".to_string(),
             ));
         }
-        match source.keys().element() {
-            GpuElement::F32 => {
+        match source.format() {
+            KvFormat::F32 => {
                 metal.encode_copy_with_offsets(
                     encoder,
                     source.keys().buffer(),
@@ -311,7 +309,7 @@ impl CausalDecoder {
                     cells,
                 )?;
             }
-            GpuElement::Bf16 => {
+            KvFormat::Bf16 => {
                 metal.encode_copy_u16_with_offsets(
                     encoder,
                     source.keys().buffer(),
@@ -329,10 +327,12 @@ impl CausalDecoder {
                     cells,
                 )?;
             }
-            GpuElement::U32 => {
-                return Err(InferError::Metal(
-                    "MTP oracle KV ne supporte pas u32".to_string(),
-                ));
+            // L'arène de tête MTP est construite dense (`full_attention_dense`) :
+            // une copie brute d'un KV quantifié omettrait ses échelles.
+            format @ (KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4) => {
+                return Err(InferError::Config(format!(
+                    "MTP oracle KV: format {format:?} non supporté (dense seulement)"
+                )));
             }
         }
         Ok(())
@@ -576,8 +576,10 @@ impl CausalDecoder {
                     }
                 }
             }
-            GpuElement::U32 => {
-                return Err(InferError::Metal("MTP oracle KV u32 inattendu".to_string()));
+            element @ (GpuElement::U32 | GpuElement::U8) => {
+                return Err(InferError::Metal(format!(
+                    "MTP oracle KV {element:?} inattendu (dense seulement)"
+                )));
             }
         }
         Ok(())

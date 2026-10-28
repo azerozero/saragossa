@@ -2164,7 +2164,7 @@ fn gpu_position_templates_follow_ctrl_and_clamp_to_host_bound() -> Result<()> {
 #[test]
 fn gpu_position_preconditions_reject_unsupported_and_capacity() {
     use super::gpu_position::{check_gpu_position_rows, GPU_POSITION_MAX_ROWS};
-    let f32 = GpuElement::F32;
+    let f32 = KvFormat::F32;
     assert!(check_gpu_position_rows(16, 256, f32, 0, 14, 2).is_ok());
     assert!(matches!(
         check_gpu_position_rows(16, 256, f32, 0, 15, 2),
@@ -2179,7 +2179,8 @@ fn gpu_position_preconditions_reject_unsupported_and_capacity() {
         Err(InferError::Dimension(_))
     ));
     for (element, window, rows) in [
-        (GpuElement::Bf16, 0, 2),
+        (KvFormat::Bf16, 0, 2),
+        (KvFormat::Q8, 0, 2),
         (f32, 3, 2),
         (f32, 0, 0),
         (f32, 0, GPU_POSITION_MAX_ROWS + 1),

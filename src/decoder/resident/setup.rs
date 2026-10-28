@@ -806,12 +806,23 @@ impl CausalDecoder {
                     Err(error) => return Err(error),
                 }
             };
-            // KV de l'arène MTP : même dtype résolu que le KV principal.
-            let kv =
-                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, kv_bf16)?;
+            // KV de l'arène MTP : même dtype f32/bf16 résolu que le KV principal,
+            // jamais quantifié (son oracle compare les octets bruts).
+            let kv = arena.full_attention_dense(
+                capacity,
+                q_heads,
+                base_kv_heads,
+                base_head_dim,
+                kv_bf16,
+            )?;
             #[cfg(feature = "devtools")]
-            let append_oracle_kv =
-                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, kv_bf16)?;
+            let append_oracle_kv = arena.full_attention_dense(
+                capacity,
+                q_heads,
+                base_kv_heads,
+                base_head_dim,
+                kv_bf16,
+            )?;
             let hidden_a = arena.persistent(hidden, GpuElement::F32)?;
             let hidden_b = arena.persistent(hidden, GpuElement::F32)?;
             let index = arena.persistent(1, GpuElement::U32)?;

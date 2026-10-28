@@ -112,10 +112,11 @@ pub(super) fn read_f32_at(tensor: &GpuTensor, offset: usize, count: usize) -> Re
                 *value = f32::from_bits(u32::from(bits) << 16);
             }
         }
-        GpuElement::U32 => {
-            return Err(InferError::Metal(
-                "read_f32_at sur un buffer u32 invalide".to_string(),
-            ));
+        GpuElement::U32 | GpuElement::U8 => {
+            return Err(InferError::Metal(format!(
+                "read_f32_at sur un buffer {:?} invalide",
+                tensor.element()
+            )));
         }
     }
     #[cfg(feature = "devtools")]
@@ -280,8 +281,18 @@ pub(super) fn flash_sdpa_enabled() -> bool {
 // c'est le classement face à mlx qui ne l'était pas.
 /// perturbation **near-tie** (0,03 logit médian ≪ marge 4,5-6,0 du modèle ;
 /// byte-identique à 30k) — noyée par le bruit du sampling T > 0.
-pub(super) fn kv_bf16_for(default_bf16: bool) -> bool {
+fn kv_bf16_for(default_bf16: bool) -> bool {
     resolve_kv_bf16(kv_bf16_env_override(), default_bf16)
+}
+
+/// Résout le format du KV résident full-attn : point unique de décision du
+/// dtype (f32/bf16 selon [`kv_bf16_for`]).
+pub(super) fn kv_format_for(default_bf16: bool) -> KvFormat {
+    if kv_bf16_for(default_bf16) {
+        KvFormat::Bf16
+    } else {
+        KvFormat::F32
+    }
 }
 
 /// Combine l'override explicite et le défaut : l'override gagne toujours.

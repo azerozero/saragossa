@@ -508,7 +508,7 @@ impl FullAttentionMetalState {
         flash_sdpa_enabled()
             && self.head_dim() <= 256
             && self.head_dim() % 32 == 0
-            && matches!(self.keys().element(), GpuElement::F32 | GpuElement::Bf16)
+            && matches!(self.format(), KvFormat::F32 | KvFormat::Bf16)
     }
 
     /// Append des `rows` K puis V (lignes contiguës à partir de `len`) en deux
@@ -554,10 +554,10 @@ impl FullAttentionMetalState {
         let pipeline = match element {
             GpuElement::F32 => &kernels.copy_rows,
             GpuElement::Bf16 => &kernels.copy_rows_bf16,
-            GpuElement::U32 => {
-                return Err(InferError::Metal(
-                    "append KV rows vers un buffer u32 invalide".to_string(),
-                ));
+            GpuElement::U32 | GpuElement::U8 => {
+                return Err(InferError::Metal(format!(
+                    "append KV rows vers un buffer {element:?} invalide"
+                )));
             }
         };
         let base = self
@@ -648,10 +648,10 @@ impl FullAttentionMetalState {
             (GpuElement::F32, false) => &kernels.flash_rows,
             (GpuElement::Bf16, true) => &kernels.flash_rows_d256_bf16,
             (GpuElement::Bf16, false) => &kernels.flash_rows_bf16,
-            (GpuElement::U32, _) => {
-                return Err(InferError::Metal(
-                    "attention rows sur KV u32 invalide".to_string(),
-                ));
+            (GpuElement::U32 | GpuElement::U8, _) => {
+                return Err(InferError::Metal(format!(
+                    "attention rows sur KV {element:?} invalide"
+                )));
             }
         };
         let pass1 = match (element, head_dim) {
@@ -659,10 +659,10 @@ impl FullAttentionMetalState {
             (GpuElement::F32, _) => &kernels.two_pass_rows_d256,
             (GpuElement::Bf16, 128) => &kernels.two_pass_rows_d128_bf16,
             (GpuElement::Bf16, _) => &kernels.two_pass_rows_d256_bf16,
-            (GpuElement::U32, _) => {
-                return Err(InferError::Metal(
-                    "attention rows 2pass sur KV u32 invalide".to_string(),
-                ));
+            (GpuElement::U32 | GpuElement::U8, _) => {
+                return Err(InferError::Metal(format!(
+                    "attention rows 2pass sur KV {element:?} invalide"
+                )));
             }
         };
         let pass2 = if head_dim == 128 {
