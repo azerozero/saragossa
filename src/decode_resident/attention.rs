@@ -7,8 +7,8 @@ use super::gpu_position::{
 use super::kv_quant::{KvEncoding, KvQuant};
 use super::utils::{
     bf16_round_f32, byte_offset, flash_sdpa_enabled, kv_bf16_sim_konly, kv_bf16_sim_vonly,
-    kv_format_for, read_f32_at, sdpa_2pass_blocks, sdpa_2pass_enabled, sdpa_2pass_min_len,
-    write_f32_as_bf16_at, write_f32_at,
+    kv_format_for, kv_quant_refusal, read_f32_at, sdpa_2pass_blocks, sdpa_2pass_enabled,
+    sdpa_2pass_min_len, write_f32_as_bf16_at, write_f32_at,
 };
 use super::*;
 use crate::metal_backend::EncoderEndGuard;
@@ -34,9 +34,31 @@ impl DecodeResidentState {
         head_dim: usize,
         kv_bf16: bool,
     ) -> Result<FullAttentionMetalState> {
-        let format = kv_format_for(kv_bf16);
+        let requested = kv_format_for(kv_bf16);
+        // Repli bf16 décidé AVANT allocation pour une couche sans attention
+        // quantifiée (les fenêtres glissantes passent par `full_attention_dense`).
+        let refusal = requested
+            .is_quantized()
+            .then(|| {
+                kv_quant_refusal(
+                    q_heads,
+                    kv_heads,
+                    head_dim,
+                    flash_sdpa_enabled(),
+                    sdpa_2pass_enabled(),
+                )
+            })
+            .flatten();
+        let format = if refusal.is_some() {
+            KvFormat::Bf16
+        } else {
+            requested
+        };
         if crate::runtime_flags::trace_resident_enabled() {
-            eprintln!("kv résident full-attn format={format:?} (kv_bf16={kv_bf16})");
+            eprintln!(
+                "kv résident full-attn format={format:?} (kv_bf16={kv_bf16}, demandé {requested:?}{})",
+                refusal.map_or(String::new(), |reason| format!(", repli: {reason}"))
+            );
         }
         self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format)
     }

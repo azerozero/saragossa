@@ -285,13 +285,48 @@ fn kv_bf16_for(default_bf16: bool) -> bool {
     resolve_kv_bf16(kv_bf16_env_override(), default_bf16)
 }
 
-/// Résout le format du KV résident full-attn : point unique de décision du
-/// dtype (f32/bf16 selon [`kv_bf16_for`]).
+/// Résout le format du KV résident full-attn : point unique de décision.
+/// f32/bf16 selon [`kv_bf16_for`] (`SARAGOSSA_RUST_KV_BF16=0` garde f32), puis,
+/// si bf16, le format de `SARAGOSSA_RUST_KV_QUANT` (bf16 par défaut). Les
+/// capacités de la couche sont vérifiées ensuite ([`kv_quant_refusal`]).
 pub(super) fn kv_format_for(default_bf16: bool) -> KvFormat {
-    if kv_bf16_for(default_bf16) {
-        KvFormat::Bf16
+    resolve_kv_format(
+        kv_bf16_for(default_bf16),
+        crate::runtime_flags::kv_quant_format(),
+    )
+}
+
+/// Combine le dtype résolu et le format quantifié demandé : seul un KV bf16
+/// est quantifié, pour que les arènes f32 exactes le restent.
+fn resolve_kv_format(bf16: bool, quant: KvFormat) -> KvFormat {
+    match (bf16, quant) {
+        (false, _) => KvFormat::F32,
+        (true, KvFormat::F32 | KvFormat::Bf16) => KvFormat::Bf16,
+        (true, quant @ (KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4)) => quant,
+    }
+}
+
+/// Raison pour laquelle une couche ne peut pas porter un KV quantifié, `None`
+/// si elle le peut. Seul le 2-passes split-K d128/d256 lit le KV quantifié ; il
+/// suppose une GQA réelle (comme son déclenchement dense) et les kill-switches
+/// flash/2-passes demandent les kernels denses de référence.
+pub(super) fn kv_quant_refusal(
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    flash: bool,
+    two_pass: bool,
+) -> Option<&'static str> {
+    if !matches!(head_dim, 128 | 256) {
+        Some("head_dim hors 128/256")
+    } else if kv_heads == 0 || q_heads % kv_heads != 0 || q_heads / kv_heads < 2 {
+        Some("GQA 1 ou invalide")
+    } else if !flash {
+        Some("SARAGOSSA_RUST_FLASH_SDPA=0")
+    } else if !two_pass {
+        Some("SARAGOSSA_RUST_SDPA_2PASS=0")
     } else {
-        KvFormat::F32
+        None
     }
 }
 
@@ -395,7 +430,9 @@ pub(super) fn sdpa_2pass_blocks(len: usize) -> usize {
 
 #[cfg(test)]
 mod kv_bf16_resolution_tests {
-    use super::{parse_kv_bf16_override, resolve_kv_bf16};
+    use super::{kv_quant_refusal, parse_kv_bf16_override, resolve_kv_bf16, resolve_kv_format};
+    use crate::decode_resident::KvFormat;
+    use crate::runtime_flags::parse_kv_quant;
 
     #[test]
     fn parse_reconnait_les_formes_explicites() {
@@ -423,5 +460,53 @@ mod kv_bf16_resolution_tests {
         );
         assert!(resolve_kv_bf16(None, true), "défaut bf16");
         assert!(!resolve_kv_bf16(None, false), "défaut f32");
+    }
+
+    #[test]
+    fn table_de_verite_du_format_kv() {
+        // (SARAGOSSA_RUST_KV_BF16, défaut de l'appelant, SARAGOSSA_RUST_KV_QUANT) → format.
+        let cases = [
+            // Arènes f32 exactes (greedy court, extension, TTS, DFlash) : jamais quantifiées.
+            (None, false, KvFormat::Q8, KvFormat::F32),
+            (None, false, KvFormat::Bf16, KvFormat::F32),
+            // Défaut de KV_QUANT : bf16 inchangé.
+            (None, true, KvFormat::Bf16, KvFormat::Bf16),
+            (None, true, KvFormat::Q8, KvFormat::Q8),
+            (None, true, KvFormat::K8V4, KvFormat::K8V4),
+            (None, true, KvFormat::Q4, KvFormat::Q4),
+            // KV_BF16=0 garde f32 en priorité ; KV_BF16=1 étend la quantification.
+            (Some(false), true, KvFormat::Q4, KvFormat::F32),
+            (Some(true), false, KvFormat::Q8, KvFormat::Q8),
+            (Some(true), false, KvFormat::Bf16, KvFormat::Bf16),
+        ];
+        for (bf16_override, default_bf16, quant, expected) in cases {
+            assert_eq!(
+                resolve_kv_format(resolve_kv_bf16(bf16_override, default_bf16), quant),
+                expected,
+                "KV_BF16={bf16_override:?} défaut={default_bf16} KV_QUANT={quant:?}"
+            );
+        }
+        for (value, expected) in [
+            ("bf16", Some(KvFormat::Bf16)),
+            ("8", Some(KvFormat::Q8)),
+            (" Q8 ", Some(KvFormat::Q8)),
+            ("k8v4", Some(KvFormat::K8V4)),
+            ("K8V4", Some(KvFormat::K8V4)),
+            ("4", Some(KvFormat::Q4)),
+            ("q4", Some(KvFormat::Q4)),
+            ("", None),
+            ("f32", None),
+            ("16", None),
+        ] {
+            assert_eq!(parse_kv_quant(value), expected, "{value:?}");
+        }
+        // Capacités de la couche : repli bf16 hors 2-passes d128/d256 à GQA réelle.
+        assert_eq!(kv_quant_refusal(16, 2, 256, true, true), None);
+        assert_eq!(kv_quant_refusal(16, 4, 128, true, true), None);
+        assert!(kv_quant_refusal(16, 2, 512, true, true).is_some());
+        assert!(kv_quant_refusal(16, 16, 128, true, true).is_some());
+        assert!(kv_quant_refusal(16, 0, 128, true, true).is_some());
+        assert!(kv_quant_refusal(16, 2, 256, false, true).is_some());
+        assert!(kv_quant_refusal(16, 2, 256, true, false).is_some());
     }
 }
