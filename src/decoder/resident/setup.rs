@@ -270,7 +270,13 @@ impl CausalDecoder {
             {
                 continue;
             }
-            let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?;
+            // Fenêtre glissante : attention naïve fenêtrée, sans variante
+            // quantifiée → KV dense même si `SARAGOSSA_RUST_KV_QUANT` est posé.
+            let mut full = if self.config.layer_sliding_window(index).is_some() {
+                arena.full_attention_dense(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
+            } else {
+                arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
+            };
             full.seed_segments(
                 &layer_cache.keys.seed_segments(),
                 &layer_cache.values.seed_segments(),
@@ -710,7 +716,13 @@ impl CausalDecoder {
             }
             let head_dim = self.config.layer_head_dim(index)?;
             let kv_heads = self.config.layer_num_key_value_heads(index);
-            let mut full = arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?;
+            // Fenêtre glissante : attention naïve fenêtrée, sans variante
+            // quantifiée → KV dense même si `SARAGOSSA_RUST_KV_QUANT` est posé.
+            let mut full = if self.config.layer_sliding_window(index).is_some() {
+                arena.full_attention_dense(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
+            } else {
+                arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
+            };
             full.seed_segments(
                 &layer_cache.keys.seed_segments(),
                 &layer_cache.values.seed_segments(),
@@ -806,12 +818,23 @@ impl CausalDecoder {
                     Err(error) => return Err(error),
                 }
             };
-            // KV de l'arène MTP : même dtype résolu que le KV principal.
-            let kv =
-                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, kv_bf16)?;
+            // KV de l'arène MTP : même dtype f32/bf16 résolu que le KV principal,
+            // jamais quantifié (son oracle compare les octets bruts).
+            let kv = arena.full_attention_dense(
+                capacity,
+                q_heads,
+                base_kv_heads,
+                base_head_dim,
+                kv_bf16,
+            )?;
             #[cfg(feature = "devtools")]
-            let append_oracle_kv =
-                arena.full_attention(capacity, q_heads, base_kv_heads, base_head_dim, kv_bf16)?;
+            let append_oracle_kv = arena.full_attention_dense(
+                capacity,
+                q_heads,
+                base_kv_heads,
+                base_head_dim,
+                kv_bf16,
+            )?;
             let hidden_a = arena.persistent(hidden, GpuElement::F32)?;
             let hidden_b = arena.persistent(hidden, GpuElement::F32)?;
             let index = arena.persistent(1, GpuElement::U32)?;

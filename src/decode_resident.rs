@@ -59,6 +59,7 @@ pub(crate) mod dflash;
 mod duo;
 mod gpu_position;
 mod kernels;
+mod kv_quant;
 mod layers;
 mod moe_tail;
 mod rows;
@@ -73,11 +74,14 @@ pub(crate) use self::arena::{
 };
 pub(crate) use self::attention::{FullAttentionMetalState, KvSeedSegment};
 pub(crate) use self::gpu_position::{check_gpu_position_rows, GpuPosition};
+pub(crate) use self::kv_quant::KvFormat;
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
     LinearAttnDenseLayerWeights, LinearAttnLayerWeights, MtpD2Segments,
 };
+#[cfg(all(test, feature = "devtools"))]
+pub(crate) use self::utils::with_kv_format_override;
 
 /// État résident d'UN decode (réserves C/D).
 ///
@@ -114,6 +118,8 @@ pub(crate) struct DecodeResidentState {
     gpu_position_kernels: OnceLock<gpu_position::GpuPositionKernels>,
     /// Kernels du chemin full-attn en lignes fusionné, compilés au premier usage.
     rows_kernels: OnceLock<rows::RowsKernels>,
+    /// Kernels du KV quantifié, compilés au premier KV quantifié construit.
+    kv_quant_kernels: OnceLock<kv_quant::KvQuantKernels>,
     /// Instrumentation per-section (tranche 3), active si `SARAGOSSA_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,
     /// Slot de flux (light-batch) : namespace du scratch label-keyed de

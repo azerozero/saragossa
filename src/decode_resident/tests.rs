@@ -1492,7 +1492,8 @@ fn run_attention_case_bf16_with_dims(
 }
 
 /// Microbench AUTONOME du kernel `attention_decode` (SDPA résident decode) aux
-/// dimensions réelles 35B full-attn (q16/kv2/hd256), à plusieurs longueurs de KV,
+/// dimensions réelles 35B full-attn (q16/kv2/hd256) puis 27B (q24/kv4/hd256),
+/// pour chaque format de KV, à plusieurs longueurs de KV,
 /// SANS prefill (KV synthétique seedé) → itération en secondes, pas 34 min.
 /// Mesure ms/appel et **GB/s effectif** (octets K+V UNIQUES lus une fois ;
 /// le déficit GQA gonfle le trafic réel mais on veut la lecture unique).
@@ -1506,35 +1507,58 @@ fn attention_decode_bench() -> Result<()> {
     let Some(state) = try_state()? else {
         return Ok(());
     };
-    let (q_heads, kv_heads, head_dim) = (16usize, 2usize, 256usize);
-    let kv_dim = kv_heads * head_dim;
-    let q_dim = q_heads * head_dim;
-    let q_data: Vec<f32> = (0..q_dim)
-        .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
-        .collect();
     let iters: usize = crate::runtime_flags::env_var("SARAGOSSA_RUST_BENCH_SDPA_ITERS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
-    for &len in &[1024usize, 4096, 16384, 32768] {
-        let mut kv = state.full_attention(len, q_heads, kv_heads, head_dim, false)?;
-        let keys: Vec<f32> = (0..len * kv_dim)
-            .map(|i| ((i % 101) as f32 - 50.0) * 0.01)
+    let shapes = [
+        (16usize, 2usize, 256usize, [1024usize, 4096, 16384, 32768]),
+        (24, 4, 256, [32768, 65536, 131_072, 262_144]),
+    ];
+    for (q_heads, kv_heads, head_dim, lens) in shapes {
+        let kv_dim = kv_heads * head_dim;
+        let q_data: Vec<f32> = (0..q_heads * head_dim)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
             .collect();
-        let values: Vec<f32> = (0..len * kv_dim)
-            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
-            .collect();
-        kv.seed(&keys, &values, len)?;
-        for _ in 0..5 {
-            let _ = kv.attention_decode(&q_data)?;
+        for len in lens {
+            let keys: Vec<f32> = (0..len * kv_dim)
+                .map(|i| ((i % 101) as f32 - 50.0) * 0.01)
+                .collect();
+            let values: Vec<f32> = (0..len * kv_dim)
+                .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+                .collect();
+            for format in [
+                KvFormat::F32,
+                KvFormat::Bf16,
+                KvFormat::Q8,
+                KvFormat::K8V4,
+                KvFormat::Q4,
+            ] {
+                let mut kv = state
+                    .full_attention_format_for_test(len, q_heads, kv_heads, head_dim, format)?;
+                kv.seed(&keys, &values, len)?;
+                for _ in 0..5 {
+                    let _ = kv.attention_decode(&q_data)?;
+                }
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    let _ = kv.attention_decode(&q_data)?;
+                }
+                let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+                // Bits K+V stockés par valeur, échelles (64 bits pour 64 valeurs) comprises.
+                let bits = |encoding: super::kv_quant::KvEncoding| match encoding.bits() {
+                    Some(bits) => bits + 1,
+                    None if format == KvFormat::F32 => 32,
+                    None => 16,
+                };
+                let bytes =
+                    ((bits(format.keys()) + bits(format.values())) * len * kv_dim) as f64 / 8.0;
+                let gbps = bytes / (ms / 1000.0) / 1.0e9;
+                eprintln!(
+                    "bench_sdpa q{q_heads}/kv{kv_heads} {format:?} len={len} \
+                     ms_per_call={ms:.4} gbps_effective={gbps:.1}"
+                );
+            }
         }
-        let start = std::time::Instant::now();
-        for _ in 0..iters {
-            let _ = kv.attention_decode(&q_data)?;
-        }
-        let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-        let bytes = (len * kv_dim * 4 * 2) as f64;
-        let gbps = bytes / (ms / 1000.0) / 1.0e9;
-        eprintln!("bench_sdpa len={len} ms_per_call={ms:.4} gbps_effective={gbps:.1}");
     }
     Ok(())
 }
@@ -2164,7 +2188,7 @@ fn gpu_position_templates_follow_ctrl_and_clamp_to_host_bound() -> Result<()> {
 #[test]
 fn gpu_position_preconditions_reject_unsupported_and_capacity() {
     use super::gpu_position::{check_gpu_position_rows, GPU_POSITION_MAX_ROWS};
-    let f32 = GpuElement::F32;
+    let f32 = KvFormat::F32;
     assert!(check_gpu_position_rows(16, 256, f32, 0, 14, 2).is_ok());
     assert!(matches!(
         check_gpu_position_rows(16, 256, f32, 0, 15, 2),
@@ -2179,7 +2203,8 @@ fn gpu_position_preconditions_reject_unsupported_and_capacity() {
         Err(InferError::Dimension(_))
     ));
     for (element, window, rows) in [
-        (GpuElement::Bf16, 0, 2),
+        (KvFormat::Bf16, 0, 2),
+        (KvFormat::Q8, 0, 2),
         (f32, 3, 2),
         (f32, 0, 0),
         (f32, 0, GPU_POSITION_MAX_ROWS + 1),
@@ -2467,7 +2492,7 @@ fn run_rows_fused_case(
     prefix: usize,
     capacity: usize,
     head_dim: usize,
-    bf16: bool,
+    format: KvFormat,
     max_rows_per_group: Option<usize>,
 ) -> Result<()> {
     use super::gpu_position::rope_dims_param;
@@ -2478,11 +2503,8 @@ fn run_rows_fused_case(
     let keys: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 3)).collect();
     let values: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 11)).collect();
     let make_kv = || -> Result<FullAttentionMetalState> {
-        let mut kv = if bf16 {
-            state.full_attention_bf16_for_test(capacity, POS_Q, POS_KV, head_dim)?
-        } else {
-            state.full_attention_f32_for_test(capacity, POS_Q, POS_KV, head_dim)?
-        };
+        let mut kv =
+            state.full_attention_format_for_test(capacity, POS_Q, POS_KV, head_dim, format)?;
         kv.seed(&keys, &values, prefix)?;
         Ok(kv)
     };
@@ -2652,9 +2674,16 @@ fn run_rows_fused_case(
             0.0,
         );
     }
+    if format.is_quantized() {
+        assert!(
+            kv_quant_bytes(&kv_fused)? == kv_quant_bytes(&kv_loop)?,
+            "{format:?}: KV en lignes ≠ boucle"
+        );
+        return Ok(());
+    }
     let cells = (prefix + ROWS) * kv_dim;
     let read_kv = |tensor: &GpuTensor| {
-        if bf16 {
+        if format == KvFormat::Bf16 {
             read_bf16_as_f32(tensor)
         } else {
             read_f32(tensor)
@@ -2673,17 +2702,28 @@ fn full_attn_rows_fused_matches_row_loop() -> Result<()> {
     let state = try_state()?.ok_or_else(|| {
         InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
     })?;
-    for (head_dim, bf16) in [(128, false), (128, true), (256, false), (256, true)] {
-        // Flash en lignes (len courte), puis 2-passes en lignes (len ≥ 2048) en un
-        // chunk et en chunks d'une ligne.
-        run_rows_fused_case(&state, 5, 16, head_dim, bf16, None)?;
-        run_rows_fused_case(&state, 2050, 2060, head_dim, bf16, None)?;
-        run_rows_fused_case(&state, 2050, 2060, head_dim, bf16, Some(1))?;
+    let formats = [
+        KvFormat::F32,
+        KvFormat::Bf16,
+        KvFormat::Q8,
+        KvFormat::K8V4,
+        KvFormat::Q4,
+    ];
+    for head_dim in [128, 256] {
+        for format in formats {
+            // Flash en lignes (len courte, 2-passes si quantifié), puis 2-passes en
+            // lignes (len ≥ 2048) en un chunk et en chunks d'une ligne.
+            run_rows_fused_case(&state, 5, 16, head_dim, format, None)?;
+            run_rows_fused_case(&state, 2050, 2060, head_dim, format, None)?;
+            run_rows_fused_case(&state, 2050, 2060, head_dim, format, Some(1))?;
+        }
     }
     // Frontières de partition chevauchées par les 3 lignes : seuil flash/2-passes
     // (lignes 2047, 2048, 2049) et nombre de blocs split-K (4222 → 32, 4224 → 64).
-    run_rows_fused_case(&state, 2046, 2052, 128, false, None)?;
-    run_rows_fused_case(&state, 4221, 4226, 256, false, None)?;
+    run_rows_fused_case(&state, 2046, 2052, 128, KvFormat::F32, None)?;
+    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::F32, None)?;
+    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::Q4, None)?;
+    run_rows_fused_case(&state, 4221, 4226, 128, KvFormat::K8V4, None)?;
     // Capacité insuffisante : erreur AVANT tout encodage, `len` inchangé.
     let kernels = state.rows_kernels()?;
     let mut kv = state.full_attention_f32_for_test(4, POS_Q, POS_KV, 128)?;
@@ -3050,6 +3090,318 @@ fn kv_seed_from_shared_view_matches_cpu_bytes() -> Result<()> {
                     .iter()
                     .zip(&cpu)
                     .all(|(a, b)| a.to_bits() == b.to_bits()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Valeur synthétique d'un KV quantifié : amplitude et centre variables par
+/// groupe de 64, un groupe sur sept constant (échelle nulle).
+fn kv_quant_value(i: usize) -> f32 {
+    let group = i / 64;
+    if group % 7 == 3 {
+        return 2.5 - (group % 11) as f32 * 0.3;
+    }
+    // Hachage (splitmix) plutôt qu'un sinus : des lignes périodiques
+    // produiraient des quasi-égalités de scores qui faussent la perte mesurée.
+    let mut x = (i as u64) ^ 0x9e37_79b9_7f4a_7c15;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 31;
+    let unit = (x % 65_536) as f32 / 65_536.0 - 0.5;
+    unit * (1.0 + (group % 5) as f32 * 3.0) + (group % 3) as f32 * 0.7
+}
+
+#[allow(
+    unsafe_code,
+    reason = "lecture d'un MTLBuffer partagé après wait_until_completed (test)"
+)]
+fn read_bytes(tensor: &GpuTensor, count: usize) -> Vec<u8> {
+    assert!(count <= tensor.byte_len(), "lecture hors buffer");
+    let ptr = tensor.buffer().contents().cast::<u8>();
+    assert!(!ptr.is_null(), "MTLBuffer partagé sans pointeur CPU");
+    // SAFETY: buffer en StorageModeShared dont le command buffer a terminé ;
+    // `count` octets dans la taille logique vérifiée ci-dessus.
+    unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
+}
+
+/// Octets valides (codes K, codes V, échelles K, échelles V en bits) des
+/// `len` premières lignes d'un KV quantifié.
+fn kv_quant_bytes(kv: &FullAttentionMetalState) -> Result<[Vec<u8>; 4]> {
+    let quant = kv
+        .quant()
+        .ok_or_else(|| InferError::Config("KV non quantifié".into()))?;
+    let cells = kv.len() * kv.kv_dim();
+    let scales = |tensor: &GpuTensor| -> Result<Vec<u8>> {
+        Ok(read_f32_buffer(tensor.buffer(), cells / 64 * 2)?
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect())
+    };
+    let codes = |tensor: &GpuTensor, encoding: super::kv_quant::KvEncoding| {
+        read_bytes(tensor, encoding.payload_len(cells).unwrap_or(0))
+    };
+    Ok([
+        codes(kv.keys(), kv.format().keys()),
+        codes(kv.values(), kv.format().values()),
+        scales(quant.keys.scales())?,
+        scales(quant.values.scales())?,
+    ])
+}
+
+/// Écritures du KV quantifié sur GPU contre l'oracle CPU : semis (segment CPU
+/// puis vue GPU à offset non nul), append mono-ligne, append en lignes (stride
+/// source > kv_dim), troncature puis ré-append. Codes et échelles identiques
+/// bit à bit ; `read_rows` déquantifie à l'identique.
+fn run_kv_quant_writes_case(
+    state: &DecodeResidentState,
+    format: KvFormat,
+    head_dim: usize,
+) -> Result<()> {
+    let (q_heads, kv_heads, rows) = (8, 2, 5);
+    let kv_dim = kv_heads * head_dim;
+    let data: Vec<f32> = (0..(rows + 1) * kv_dim).map(kv_quant_value).collect();
+    let buffer = state.device().new_buffer_with_data(
+        data.as_ptr().cast(),
+        (data.len() * std::mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    // SAFETY: buffer propre au test, plus écrit après sa création.
+    #[expect(unsafe_code, reason = "vue partagée sur un buffer de test figé")]
+    let view =
+        unsafe { crate::metal_backend::SharedF32Rows::new(buffer, kv_dim, (rows - 1) * kv_dim)? };
+    let head = &data[..kv_dim];
+    let make =
+        || state.full_attention_format_for_test(rows + 6, q_heads, kv_heads, head_dim, format);
+    let mut gpu = make()?;
+    let mut cpu = make()?;
+    assert_eq!(gpu.format(), format);
+    let shared = [KvSeedSegment::Cpu(head), KvSeedSegment::Shared(&view)];
+    let copied = [
+        KvSeedSegment::Cpu(head),
+        KvSeedSegment::Cpu(view.as_slice()),
+    ];
+    gpu.seed_segments(&shared, &shared, rows)?;
+    cpu.seed_segments(&copied, &copied, rows)?;
+    assert!(
+        kv_quant_bytes(&gpu)? == kv_quant_bytes(&cpu)?,
+        "{format:?} d{head_dim}: semis GPU ≠ CPU"
+    );
+
+    // Lignes source entrelacées K, V (stride 2·kv_dim) : append mono puis 2 lignes.
+    let extra: Vec<f32> = (0..8 * kv_dim)
+        .map(|i| kv_quant_value(i + 7777) * 1.7)
+        .collect();
+    let src = lease_with(state, &extra)?;
+    let row_bytes = (kv_dim * 4) as u64;
+    let kernels = state.rows_kernels()?;
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let buf = src.tensor().buffer();
+    gpu.encode_append_kv_with_offsets(encoder, buf, 0, buf, row_bytes)?;
+    gpu.encode_append_kv_rows(
+        encoder,
+        kernels,
+        buf,
+        2 * row_bytes,
+        2 * kv_dim,
+        buf,
+        3 * row_bytes,
+        2 * kv_dim,
+        2,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    for row in 0..3 {
+        let k = &extra[2 * row * kv_dim..(2 * row + 1) * kv_dim];
+        let v = &extra[(2 * row + 1) * kv_dim..(2 * row + 2) * kv_dim];
+        cpu.append_row(k, v)?;
+    }
+    assert_eq!(gpu.len(), rows + 3);
+    assert!(
+        kv_quant_bytes(&gpu)? == kv_quant_bytes(&cpu)?,
+        "{format:?} d{head_dim}: append GPU ≠ CPU"
+    );
+
+    // Rejet simulé : troncature puis ré-append d'une autre ligne au même rang.
+    gpu.truncate(rows + 1)?;
+    cpu.truncate(rows + 1)?;
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    gpu.encode_append_kv_with_offsets(encoder, buf, 6 * row_bytes, buf, 7 * row_bytes)?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    cpu.append_row(&extra[6 * kv_dim..7 * kv_dim], &extra[7 * kv_dim..])?;
+    assert!(
+        kv_quant_bytes(&gpu)? == kv_quant_bytes(&cpu)?,
+        "{format:?} d{head_dim}: ré-append GPU ≠ CPU"
+    );
+    let (gpu_k, gpu_v) = gpu.read_rows(0, rows + 2)?;
+    let (cpu_k, cpu_v) = cpu.read_rows(0, rows + 2)?;
+    assert!(gpu_k
+        .iter()
+        .zip(&cpu_k)
+        .all(|(a, b)| a.to_bits() == b.to_bits()));
+    assert!(gpu_v
+        .iter()
+        .zip(&cpu_v)
+        .all(|(a, b)| a.to_bits() == b.to_bits()));
+    // Dernière ligne relue ≈ source (au demi-pas Q4 près, large ici).
+    let last = &gpu_k[(rows + 1) * kv_dim..];
+    let source = &extra[6 * kv_dim..7 * kv_dim];
+    let max_err = last
+        .iter()
+        .zip(source)
+        .fold(0.0_f32, |acc, (a, b)| acc.max((a - b).abs()));
+    assert!(
+        max_err < 2.0,
+        "{format:?}: ligne relue trop loin ({max_err})"
+    );
+    Ok(())
+}
+
+#[test]
+fn kv_quant_gpu_writes_match_cpu_bytes() -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    for format in [KvFormat::Q8, KvFormat::K8V4, KvFormat::Q4] {
+        for head_dim in [128, 256] {
+            run_kv_quant_writes_case(&state, format, head_dim)?;
+        }
+    }
+    // Volume : 4096 lignes quantifiées sur GPU contre CPU, mantisses quelconques
+    // et grille de 1000 pas (égalités d'arrondi fréquentes) en alternance.
+    let (rows, kv_dim) = (4096, 256);
+    let data: Vec<f32> = (0..rows * kv_dim)
+        .map(|i| {
+            if (i / 64) % 2 == 0 {
+                pseudo(i) * (1.0 + ((i / 64) % 9) as f32)
+            } else {
+                let bits = (i.wrapping_mul(2_654_435_761) >> 5) as u32 & 0x007f_ffff;
+                f32::from_bits(0x3f80_0000 | bits) - 1.5
+            }
+        })
+        .collect();
+    let buffer = state.device().new_buffer_with_data(
+        data.as_ptr().cast(),
+        (data.len() * std::mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    // SAFETY: buffer propre au test, plus écrit après sa création.
+    #[expect(unsafe_code, reason = "vue partagée sur un buffer de test figé")]
+    let view = unsafe { crate::metal_backend::SharedF32Rows::new(buffer, 0, data.len())? };
+    for format in [KvFormat::Q8, KvFormat::Q4] {
+        let mut gpu = state.full_attention_format_for_test(rows, 8, 2, 128, format)?;
+        let mut cpu = state.full_attention_format_for_test(rows, 8, 2, 128, format)?;
+        let shared = [KvSeedSegment::Shared(&view)];
+        let copied = [KvSeedSegment::Cpu(&data)];
+        gpu.seed_segments(&shared, &shared, rows)?;
+        cpu.seed_segments(&copied, &copied, rows)?;
+        assert!(
+            kv_quant_bytes(&gpu)? == kv_quant_bytes(&cpu)?,
+            "{format:?}: semis volumineux GPU ≠ CPU"
+        );
+    }
+    // Une ligne (kv_dim 256) coupée en segments de 64 et 192 : total juste,
+    // segments hors lignes entières, refusés avant toute écriture.
+    let mut kv = state.full_attention_format_for_test(4, 8, 2, 128, KvFormat::Q8)?;
+    let row = vec![0.0_f32; 256];
+    let split = [
+        KvSeedSegment::Cpu(&row[..64]),
+        KvSeedSegment::Cpu(&row[64..]),
+    ];
+    assert!(kv.seed_segments(&split, &split, 1).is_err());
+    // head_dim sans attention quantifiée : refusé à la construction.
+    assert!(state
+        .full_attention_format_for_test(4, 8, 2, 64, KvFormat::Q8)
+        .is_err());
+    Ok(())
+}
+
+/// Déquantifie sur le CPU (oracle `kv_quant`) des lignes f32 encodées `encoding`.
+fn kv_quant_oracle(
+    encoding: super::kv_quant::KvEncoding,
+    kv_dim: usize,
+    values: &[f32],
+) -> Result<Vec<f32>> {
+    let mut payload = vec![0_u8; encoding.payload_len(values.len()).unwrap_or(0)];
+    let mut scales = vec![0.0_f32; values.len() / 64 * 2];
+    super::kv_quant::quantize_rows(encoding, kv_dim, values, &mut payload, &mut scales)?;
+    let mut out = vec![0.0_f32; values.len()];
+    super::kv_quant::dequantize_rows(encoding, kv_dim, &payload, &scales, &mut out)?;
+    Ok(out)
+}
+
+fn max_mean_abs(actual: &[f32], expected: &[f32]) -> (f32, f32) {
+    let max = actual
+        .iter()
+        .zip(expected)
+        .fold(0.0_f32, |acc, (a, b)| acc.max((a - b).abs()));
+    let sum: f32 = actual
+        .iter()
+        .zip(expected)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    (max, sum / actual.len().max(1) as f32)
+}
+
+/// Attention 2-passes sur KV quantifié (q16/kv2) contre `cpu_attention` sur le
+/// KV déquantifié par l'oracle CPU (mêmes valeurs que lit le GPU) : seul
+/// l'ordre de réduction et l'exponentielle fast-math diffèrent. L'écart à
+/// l'attention exacte sur le KV f32 d'origine mesure la perte de
+/// quantification ; il est affiché (`--nocapture`) et borné large.
+fn run_attention_case_quant(len: usize, head_dim: usize, format: KvFormat) -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads) = (16, 2);
+    let kv_dim = kv_heads * head_dim;
+    let mut kv = state.full_attention_format_for_test(len, q_heads, kv_heads, head_dim, format)?;
+    let keys: Vec<f32> = (0..len * kv_dim).map(kv_quant_value).collect();
+    let values: Vec<f32> = (0..len * kv_dim).map(|i| kv_quant_value(i + 7)).collect();
+    kv.seed(&keys, &values, len)?;
+    let q: Vec<f32> = (0..q_heads * head_dim)
+        .map(|i| 2.0 * pseudo(i + 99))
+        .collect();
+    let gpu = kv.attention_decode(&q)?;
+    let keys_deq = kv_quant_oracle(format.keys(), kv_dim, &keys)?;
+    let values_deq = kv_quant_oracle(format.values(), kv_dim, &values)?;
+    let cpu_deq = cpu_attention(&q, &keys_deq, &values_deq, q_heads, kv_heads, head_dim, len);
+    let cpu_f32 = cpu_attention(&q, &keys, &values, q_heads, kv_heads, head_dim, len);
+    let (max_deq, mean_deq) = max_mean_abs(&gpu, &cpu_deq);
+    let (max_f32, mean_f32) = max_mean_abs(&gpu, &cpu_f32);
+    eprintln!(
+        "attention {format:?} d{head_dim} len={len}: vs oracle déquantifié max={max_deq:e} \
+         moy={mean_deq:e} ; vs f32 exact max={max_f32:e} moy={mean_f32:e}"
+    );
+    // Mesuré (Apple GPU) : max 1,3e-5, moyenne 2,7e-6 à len=33000, 0 à len=1.
+    // Bornes ×8 au-dessus, quatre ordres sous un défaut de lecture des codes ou
+    // des échelles (valeurs jusqu'à ±7).
+    assert!(
+        max_deq <= 1.0e-4 && mean_deq <= 2.0e-5,
+        "{format:?} d{head_dim} len={len}: GPU vs oracle déquantifié max={max_deq:e} moy={mean_deq:e}"
+    );
+    // Perte de quantification mesurée : Q8 ≤ 2,5e-2, V en Q4 ≤ 0,43 (len=1,
+    // où la sortie est une ligne de V sans moyenne ; demi-pas Q4 ≈ 0,43 ici).
+    let bound = if format.values() == super::kv_quant::KvEncoding::Q4 {
+        0.6
+    } else {
+        0.05
+    };
+    assert!(
+        max_f32 <= bound,
+        "{format:?} d{head_dim} len={len}: perte de quantification max={max_f32:e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn attention_decode_quant_matches_dequantized_oracle() -> Result<()> {
+    for format in [KvFormat::Q8, KvFormat::K8V4, KvFormat::Q4] {
+        for head_dim in [128, 256] {
+            for len in [1, 64, 4096, 33000] {
+                run_attention_case_quant(len, head_dim, format)?;
             }
         }
     }

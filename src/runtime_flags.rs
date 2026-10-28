@@ -1137,6 +1137,47 @@ pub(crate) fn kv_bf16_greedy_min_tokens() -> usize {
     })
 }
 
+/// Format du KV résident full-attn là où le dtype résolu est bf16
+/// (`SARAGOSSA_RUST_KV_QUANT`) : `bf16` (défaut), `8`, `k8v4` ou `4`. Les
+/// arènes f32 (greedy court, extension, TTS, DFlash, `SARAGOSSA_RUST_KV_BF16=0`)
+/// ne sont jamais quantifiées ; une couche sans attention quantifiée (fenêtre
+/// glissante, head_dim ≠ 128/256, GQA 1, flash ou 2-passes coupés) reste bf16.
+/// Une valeur inconnue garde bf16, avec un avertissement.
+///
+/// NOTE: bf16 reste le défaut. Mesuré sur M5 Max avec Qwen3.8 27B en AR, le
+/// decode ne gagne que 2 à 3 % à 115k/256k et perd 1 % à 32k : le 2-passes
+/// est borné par la latence de sa boucle ligne à ligne, pas par les octets
+/// lus. Q8 change le texte à 32k (intégrité intacte) et ne réduit pas le pic
+/// RSS à 256k.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn kv_quant_format() -> crate::decode_resident::KvFormat {
+    static FORMAT: OnceLock<crate::decode_resident::KvFormat> = OnceLock::new();
+    *FORMAT.get_or_init(|| {
+        let Some(value) = env_var("SARAGOSSA_RUST_KV_QUANT") else {
+            return crate::decode_resident::KvFormat::Bf16;
+        };
+        parse_kv_quant(&value).unwrap_or_else(|| {
+            eprintln!(
+                "saragossa: SARAGOSSA_RUST_KV_QUANT={value:?} inconnu (bf16|8|k8v4|4), KV bf16"
+            );
+            crate::decode_resident::KvFormat::Bf16
+        })
+    })
+}
+
+/// Parse `SARAGOSSA_RUST_KV_QUANT` (insensible à la casse, espaces ignorés).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn parse_kv_quant(value: &str) -> Option<crate::decode_resident::KvFormat> {
+    use crate::decode_resident::KvFormat;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "bf16" => Some(KvFormat::Bf16),
+        "8" | "q8" => Some(KvFormat::Q8),
+        "k8v4" => Some(KvFormat::K8V4),
+        "4" | "q4" => Some(KvFormat::Q4),
+        _ => None,
+    }
+}
+
 /// Plafond en octets du prefix-cache du décodeur
 /// (`SARAGOSSA_RUST_PREFIX_CACHE_BYTES`, 16 Gio par défaut). Les segments KV
 /// partagés entre entrées comptent une fois ; sans ce plafond, 4 conversations

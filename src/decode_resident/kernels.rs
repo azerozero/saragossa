@@ -1055,15 +1055,40 @@ pub(super) fn compile_kernel(
     source: &str,
     name: &str,
 ) -> Result<ComputePipelineState> {
+    let mut pipelines = compile_kernels(device, source, &[name], true)?;
+    pipelines
+        .pop()
+        .ok_or_else(|| InferError::Metal(format!("pipeline kernel {name} absent")))
+}
+
+/// Compile une source Metal UNE fois et renvoie les pipelines de `names`, dans
+/// l'ordre. `fast_math = false` sert aux kernels dont la division et l'arrondi
+/// doivent reproduire un oracle CPU bit à bit (quantification du KV).
+///
+/// # Errors
+///
+/// Renvoie une erreur si la source ne compile pas, si une fonction est absente,
+/// ou si un pipeline est invalide.
+pub(super) fn compile_kernels(
+    device: &Device,
+    source: &str,
+    names: &[&str],
+    fast_math: bool,
+) -> Result<Vec<ComputePipelineState>> {
     let options = CompileOptions::new();
-    options.set_fast_math_enabled(true);
+    options.set_fast_math_enabled(fast_math);
     let library = device
         .new_library_with_source(source, &options)
-        .map_err(|error| InferError::Metal(format!("compilation kernel {name}: {error}")))?;
-    let function = library
-        .get_function(name, None)
-        .map_err(|error| InferError::Metal(format!("fonction kernel {name}: {error}")))?;
-    device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(|error| InferError::Metal(format!("pipeline kernel {name}: {error}")))
+        .map_err(|error| InferError::Metal(format!("compilation kernels {names:?}: {error}")))?;
+    names
+        .iter()
+        .map(|name| {
+            let function = library
+                .get_function(name, None)
+                .map_err(|error| InferError::Metal(format!("fonction kernel {name}: {error}")))?;
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|error| InferError::Metal(format!("pipeline kernel {name}: {error}")))
+        })
+        .collect()
 }

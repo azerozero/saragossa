@@ -132,7 +132,7 @@ pub(super) fn rope_dims_param(
 pub(crate) fn check_gpu_position_rows(
     capacity: usize,
     kv_dim: usize,
-    kv_element: GpuElement,
+    kv_format: KvFormat,
     window_start: usize,
     max_position: usize,
     rows: usize,
@@ -142,9 +142,11 @@ pub(crate) fn check_gpu_position_rows(
             "position GPU: rows={rows} hors [1, {GPU_POSITION_MAX_ROWS}]"
         )));
     }
-    if kv_element != GpuElement::F32 {
+    // Les kernels position GPU copient et lisent du f32 brut : bf16 et formats
+    // quantifiés reviennent au chemin parent (position hôte).
+    if kv_format != KvFormat::F32 {
         return Err(InferError::Config(format!(
-            "position GPU: KV {kv_element:?} non supporté (f32 seulement)"
+            "position GPU: KV {kv_format:?} non supporté (f32 seulement)"
         )));
     }
     if window_start != 0 {
@@ -310,7 +312,7 @@ impl DecodeResidentState {
         check_gpu_position_rows(
             kv.capacity(),
             kv.kv_dim(),
-            kv.keys().element(),
+            kv.format(),
             window_start,
             position.max_position,
             rows,
