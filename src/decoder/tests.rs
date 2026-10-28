@@ -3108,6 +3108,18 @@ fn kv_quant_forced_logits(
             "setup résident refusé pour {format:?}"
         )));
     }
+    // Un repli silencieux (kill-switch, forme refusée) comparerait bf16 à
+    // lui-même : au moins une couche doit porter le format demandé.
+    let exercised = cache
+        .layers
+        .iter()
+        .filter_map(|layer| layer.full.as_ref())
+        .any(|full| full.format() == format);
+    if !exercised {
+        return Err(InferError::Config(format!(
+            "aucune couche n'exerce le format KV {format:?}"
+        )));
+    }
     let hidden = model.final_norm.data().len();
     let mut logits = Vec::with_capacity(forced.len());
     let (mut start, mut call) = (0, 0);

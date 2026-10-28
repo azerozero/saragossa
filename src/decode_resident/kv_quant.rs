@@ -105,6 +105,9 @@ pub(crate) const KV_QUANT_GROUP: usize = 64;
 /// Code affine d'une valeur, miroir exact de `kv_code` du kernel : échelle
 /// nulle ou NaN, valeur NaN ou sous le biais → 0 ; saturation à `levels`. Les
 /// comparaisons explicites rendent ces cas définis à l'identique sur CPU et GPU.
+/// NOTE: une valeur ±inf rend l'échelle infinie et toute la relecture du groupe
+/// NaN (`fma(0, inf, b)`), là où bf16 ne perd qu'une valeur ; un K/V infini
+/// signale déjà un modèle divergé.
 fn quant_code(x: f32, scale: f32, bias: f32, levels: u8) -> u8 {
     let t = (x - bias) / scale;
     if scale > 0.0 && t > 0.0 {
@@ -272,7 +275,8 @@ inline void kv_quantize_rows(
     if (gid >= groups * p.z) { return; }
     const uint row = gid / groups;
     const uint g = gid - row * groups;
-    const device float* x = input + row * p.y + g * G;
+    // Index 64 bits : `row * stride` déborde un uint au-delà de ~1M lignes de 4096.
+    const device float* x = input + ulong(row) * p.y + g * G;
     float lo = x[0];
     float hi = x[0];
     for (uint j = 1u; j < G; ++j) {
@@ -281,8 +285,8 @@ inline void kv_quantize_rows(
         if (v > hi) { hi = v; }
     }
     const float s = (hi - lo) / LEVELS;
-    scales[row * groups + g] = float2(s, lo);
-    device uchar* out = payload + (row * p.x + g * G) / PER_BYTE;
+    scales[ulong(row) * groups + g] = float2(s, lo);
+    device uchar* out = payload + (ulong(row) * p.x + g * G) / PER_BYTE;
     for (uint j = 0u; j < G; j += PER_BYTE) {
         uint byte = 0u;
         for (uint c = 0u; c < PER_BYTE; ++c) {

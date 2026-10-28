@@ -3279,12 +3279,15 @@ fn kv_quant_gpu_writes_match_cpu_bytes() -> Result<()> {
             "{format:?}: semis volumineux GPU ≠ CPU"
         );
     }
-    // Segment hors lignes entières : refusé avant toute écriture.
+    // Une ligne (kv_dim 256) coupée en segments de 64 et 192 : total juste,
+    // segments hors lignes entières, refusés avant toute écriture.
     let mut kv = state.full_attention_format_for_test(4, 8, 2, 128, KvFormat::Q8)?;
-    let odd = vec![0.0_f32; 64];
-    assert!(kv
-        .seed_segments(&[KvSeedSegment::Cpu(&odd)], &[KvSeedSegment::Cpu(&odd)], 0)
-        .is_err());
+    let row = vec![0.0_f32; 256];
+    let split = [
+        KvSeedSegment::Cpu(&row[..64]),
+        KvSeedSegment::Cpu(&row[64..]),
+    ];
+    assert!(kv.seed_segments(&split, &split, 1).is_err());
     // head_dim sans attention quantifiée : refusé à la construction.
     assert!(state
         .full_attention_format_for_test(4, 8, 2, 64, KvFormat::Q8)

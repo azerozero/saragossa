@@ -54,6 +54,14 @@ impl DecodeResidentState {
         } else {
             requested
         };
+        if let Some(reason) = refusal {
+            // Signalé une fois : un KV_QUANT demandé mais ignoré passerait
+            // sinon inaperçu hors trace.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!("SARAGOSSA_RUST_KV_QUANT ignoré ({reason}) : KV résident en bf16");
+            });
+        }
         if crate::runtime_flags::trace_resident_enabled() {
             eprintln!(
                 "kv résident full-attn format={format:?} (kv_bf16={kv_bf16}, demandé {requested:?}{})",
@@ -677,6 +685,8 @@ impl FullAttentionMetalState {
 
     /// Relit `rows` lignes K/V (rope'd, f32) à partir de la ligne `from`, pour
     /// rapatrier vers le cache CPU les lignes ajoutées par un kernel en lignes.
+    /// Un KV quantifié rend ses valeurs déquantifiées ; un ré-semis les
+    /// requantifie avec les mêmes codes, l'échelle pouvant varier d'un ulp.
     ///
     /// # Errors
     ///

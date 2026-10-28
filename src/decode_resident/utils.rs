@@ -342,6 +342,10 @@ pub(super) fn kv_quant_refusal(
         Some("head_dim hors 128/256")
     } else if kv_heads == 0 || q_heads % kv_heads != 0 || q_heads / kv_heads < 2 {
         Some("GQA 1 ou invalide")
+    } else if q_heads / kv_heads > 32 {
+        // Le 2-passes lance 32 threads par tête Q du groupe : au-delà de 32
+        // têtes par tête KV, le threadgroup dépasserait 1024 threads.
+        Some("GQA > 32")
     } else if !flash {
         Some("SARAGOSSA_RUST_FLASH_SDPA=0")
     } else if !two_pass {
@@ -526,6 +530,11 @@ mod kv_bf16_resolution_tests {
         assert_eq!(kv_quant_refusal(16, 4, 128, true, true), None);
         assert!(kv_quant_refusal(16, 2, 512, true, true).is_some());
         assert!(kv_quant_refusal(16, 16, 128, true, true).is_some());
+        assert!(
+            kv_quant_refusal(64, 1, 128, true, true).is_some(),
+            "GQA > 32"
+        );
+        assert_eq!(kv_quant_refusal(32, 1, 128, true, true), None);
         assert!(kv_quant_refusal(16, 0, 128, true, true).is_some());
         assert!(kv_quant_refusal(16, 2, 256, false, true).is_some());
         assert!(kv_quant_refusal(16, 2, 256, true, false).is_some());
