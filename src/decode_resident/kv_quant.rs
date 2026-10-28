@@ -324,6 +324,15 @@ kernel void kv_quantize_rows_q4(
 /// l'arrondi diffère donc de `dequantize_rows` à l'ulp près. Le mono-ligne
 /// est le cas `rows = 1` (`tidtg.z = 0`). Une lane lit un groupe entier
 /// d'échelle (64 ≥ QK) : une seule paire par lane et par ligne.
+///
+/// NOTE: mesuré (q24/kv4, Q8, 256k, une couche) : 2,09 ms, dont 0,24 de passe 2
+/// et d'appel, contre 1,28 ms au plafond de bande passante. Avec des données
+/// toujours en cache, la passe 1 coûte encore 1,12 ms : le calcul par ligne et
+/// par tête ne se cache pas derrière la mémoire. Essayés sans gain suffisant :
+/// préchargement de la ligne suivante (0 %), une simdgroup pour les six têtes
+/// (×2 plus lent), une tête par threadgroup (×3), tuiles chargées en commun avec
+/// codes dépaquetés une fois en mémoire threadgroup (−6 % à 8 lignes, pire
+/// au-delà). Le seuil fixé pour un nouveau kernel (≤ 1,6 ms) n'est pas atteint.
 const KV_QUANT_ATTENTION_TEMPLATE: &str = r#"
 kernel void attention_decode_2pass_1_q_dDHEAD_FMT(
     device const float* q [[buffer(0)]],
