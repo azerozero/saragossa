@@ -1659,3 +1659,82 @@ fn gated_delta_nax_matches_naive_oracle() -> Result<()> {
     eprintln!("gated delta NAX: écart max {max_err:e}");
     Ok(())
 }
+
+#[test]
+#[ignore = "microbench NAX d256 du dernier morceau de prefill (GPU idle)"]
+fn nax_d256_chunk_microbench() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    // Forme du 27B : 24 têtes Q, 4 KV, d256, morceaux de 4096.
+    const SEQ: usize = 4096;
+    const Q_HEADS: usize = 24;
+    const KV_HEADS: usize = 4;
+    const HEAD_DIM: usize = 256;
+    let spec = PrefillAttentionSpec {
+        seq: SEQ,
+        hidden_dim: 5120,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+        rope_dims: 64,
+        rope_frequency_dim: HEAD_DIM,
+        rope_theta: 1.0e7,
+        attn_scalar: HEAD_DIM as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let kv_dim = KV_HEADS * HEAD_DIM;
+    for kv_rows in [16 * 1024, 64 * 1024, 256 * 1024] {
+        let q: Vec<f32> = (0..SEQ * Q_HEADS * HEAD_DIM)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.01)
+            .collect();
+        let kv: Vec<f32> = (0..kv_rows * kv_dim)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.01)
+            .collect();
+        let q_buf = executor.upload_f32_buffer(&q, "mb_nax_q")?;
+        let k_buf = executor.upload_f32_buffer(&kv, "mb_nax_k")?;
+        let v_buf = executor.upload_f32_buffer(&kv, "mb_nax_v")?;
+        let out = executor.uncached_f32_buffer(SEQ * Q_HEADS * HEAD_DIM, "mb_nax_out")?;
+        let mirror = [
+            executor.private_bf16_buffer(kv_rows * kv_dim, "mb_nax_k_bf16")?,
+            executor.private_bf16_buffer(kv_rows * kv_dim, "mb_nax_v_bf16")?,
+        ];
+        {
+            let cb = executor.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            executor.encode_f32_to_bf16(enc, &k_buf, &mirror[0], kv_rows * kv_dim)?;
+            executor.encode_f32_to_bf16(enc, &v_buf, &mirror[1], kv_rows * kv_dim)?;
+            enc.end_encoding();
+            commit_and_wait(cb)?;
+        }
+        // Requêtes aux positions [kv_rows - SEQ, kv_rows) : clés vues en moyenne.
+        let attended = (kv_rows - SEQ / 2) as f64;
+        let flops = 4.0 * (Q_HEADS * HEAD_DIM * SEQ) as f64 * attended;
+        for (label, bf16_kv) in [
+            ("conversion + noyau", None),
+            ("noyau seul (miroir)", Some([mirror[0].as_ref(), mirror[1].as_ref()])),
+        ] {
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let cb = executor.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                executor.encode_causal_attention_prefill_chunk(
+                    enc, &q_buf, &k_buf, &v_buf, &out, spec, kv_rows, kv_rows, bf16_kv,
+                )?;
+                enc.end_encoding();
+                let t = std::time::Instant::now();
+                commit_and_wait(cb)?;
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "[nax d256] kv={kv_rows} q={SEQ} {label} : {:.1} ms, {:.1} TFLOP/s",
+                best * 1.0e3,
+                flops / best / 1.0e12
+            );
+        }
+    }
+    Ok(())
+}
