@@ -787,7 +787,10 @@ pub(crate) fn prefill_attn_nax_head_major() -> bool {
 /// (BQ=128, WM=4, deux fragments Q par simdgroup) ; toute autre valeur, ou une
 /// variante dont le pipeline ne compile pas, garde `bq64`. Écarts à l'oracle CPU et à `bq64` mesurés par
 /// `nax_d256_variants_match_cpu_oracle`. Écartés au bench 64k du 27B : `bk64`
-/// +27 % de TTFT et texte différent, `bq128` +1 %.
+/// +27 % de TTFT et texte différent, `bq128` +1 %. `tq2` écarté au microbench
+/// (dernier morceau de 4096, 24/4 têtes) : 3,4 à 3,9 fois plus lent que `bq64`
+/// de 16k à 256k, l'accumulateur O de deux fragments par simdgroup ne tenant
+/// vraisemblablement pas dans les registres à 256 threads.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_attn_nax_variant() -> Option<&'static str> {
     static VARIANT: OnceLock<Option<String>> = OnceLock::new();

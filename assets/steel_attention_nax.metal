@@ -3559,6 +3559,11 @@ attention_nax_dsplit<bfloat, 128, 32, 256, 8, 2, float, float, float>;
 
 // Variante opt-in `tq2` : BQ=128 sur WM=4 (TQ=2), 256 threads comme bq64 ;
 // chaque fragment K/V chargé sert deux fragments Q du même simdgroup.
+// NOTE: 3,4 à 3,9 fois plus lente que bq64 au microbench (M5 Max) : O (128
+// f32), Q (16 fragments bf16) et S par thread débordent vraisemblablement des
+// registres. Doubler le tampon d'échange des scores de bq64 pour supprimer la
+// seconde barrière par tour coûte aussi +18 à +25 % : 32 Kio de mémoire
+// threadgroup au lieu de 16 divisent par deux les threadgroups résidents.
 template [[host_name("steel_attention_nax_dsplit_bf16_f32out_bq128_bk32_bd256_wm4_wn2")]]
 [[kernel]] decltype(attention_nax_dsplit<bfloat, 128, 32, 256, 4, 2, float, float, float>)
 attention_nax_dsplit<bfloat, 128, 32, 256, 4, 2, float, float, float>;
