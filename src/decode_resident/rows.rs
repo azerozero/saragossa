@@ -547,6 +547,24 @@ impl FullAttentionMetalState {
                 self.capacity()
             )));
         }
+        if let Some(quant) = self.quant() {
+            for (tensor, payload, input, offset, stride) in [
+                (&quant.keys, self.keys(), k_buf, k_offset, k_stride),
+                (&quant.values, self.values(), v_buf, v_offset, v_stride),
+            ] {
+                tensor.encode_rows(
+                    encoder,
+                    payload,
+                    input,
+                    offset,
+                    stride,
+                    self.len(),
+                    rows,
+                    kv_dim,
+                )?;
+            }
+            return self.advance_len(rows);
+        }
         let cells = rows
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Dimension("append KV rows déborde".to_string()))?;

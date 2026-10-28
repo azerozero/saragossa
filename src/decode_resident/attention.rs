@@ -4,6 +4,7 @@ use super::arena::alloc_tensor;
 use super::gpu_position::{
     check_gpu_position_rows, rope_dims_param, to_u32, GpuPositionRows, U32x4Param,
 };
+use super::kv_quant::{KvEncoding, KvQuant};
 use super::utils::{
     bf16_round_f32, byte_offset, flash_sdpa_enabled, kv_bf16_sim_konly, kv_bf16_sim_vonly,
     kv_format_for, read_f32_at, sdpa_2pass_blocks, sdpa_2pass_enabled, sdpa_2pass_min_len,
@@ -75,6 +76,18 @@ impl DecodeResidentState {
     }
 
     #[cfg(test)]
+    pub(crate) fn full_attention_format_for_test(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        format: KvFormat,
+    ) -> Result<FullAttentionMetalState> {
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format)
+    }
+
+    #[cfg(test)]
     pub(crate) fn full_attention_f32_for_test(
         &self,
         capacity: usize,
@@ -110,17 +123,33 @@ impl DecodeResidentState {
         let cells = capacity
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Config("capacité KV déborde".to_string()))?;
-        if format.is_quantized() {
-            return Err(InferError::Config(format!(
-                "KV résident {format:?} non implémenté"
-            )));
-        }
-        let keys = alloc_tensor(&self.device, self.options, cells, format.keys().element())?;
-        let values = alloc_tensor(&self.device, self.options, cells, format.values().element())?;
+        let quant = if format.is_quantized() {
+            // Seule l'attention 2-passes d128/d256 lit le KV quantifié.
+            if !matches!(head_dim, 128 | 256) {
+                return Err(InferError::Config(format!(
+                    "KV {format:?}: head_dim={head_dim} non supporté (128 ou 256)"
+                )));
+            }
+            Some(KvQuant {
+                keys: self.quant_tensor(format.keys(), cells)?,
+                values: self.quant_tensor(format.values(), cells)?,
+            })
+        } else {
+            None
+        };
+        let payload = |encoding: KvEncoding| {
+            let len = encoding.payload_len(cells).ok_or_else(|| {
+                InferError::Config(format!("KV {format:?}: {cells} cellules non groupées"))
+            })?;
+            alloc_tensor(&self.device, self.options, len, encoding.element())
+        };
+        let keys = payload(format.keys())?;
+        let values = payload(format.values())?;
         Ok(FullAttentionMetalState {
             keys,
             values,
             format,
+            quant,
             capacity,
             len: 0,
             q_heads,
@@ -535,9 +564,13 @@ impl KvSeedSegment<'_> {
 /// buffers), jamais le partager — câblé en 1b.3.
 #[derive(Debug)]
 pub(crate) struct FullAttentionMetalState {
+    /// Charge utile : f32, bf16, ou codes u8 d'un format quantifié.
     keys: GpuTensor,
     values: GpuTensor,
     format: KvFormat,
+    /// Échelles et kernels d'écriture, présents si et seulement si `format`
+    /// est quantifié.
+    quant: Option<KvQuant>,
     capacity: usize,
     len: usize,
     q_heads: usize,
@@ -651,6 +684,14 @@ impl FullAttentionMetalState {
         let count = (end - from)
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Dimension("read KV rows: longueur déborde".to_string()))?;
+        if let Some(quant) = &self.quant {
+            return Ok((
+                quant.keys.read_rows(&self.keys, from, end - from, kv_dim)?,
+                quant
+                    .values
+                    .read_rows(&self.values, from, end - from, kv_dim)?,
+            ));
+        }
         Ok((
             read_f32_at(&self.keys, offset, count)?,
             read_f32_at(&self.values, offset, count)?,
@@ -662,6 +703,11 @@ impl FullAttentionMetalState {
     /// pas Q8 de Q4.
     pub(crate) fn format(&self) -> KvFormat {
         self.format
+    }
+
+    /// Métadonnées du KV quantifié, `None` pour un KV dense.
+    pub(super) fn quant(&self) -> Option<&KvQuant> {
+        self.quant.as_ref()
     }
 
     /// Renvoie le buffer résident des clés (`capacity * kv_dim`).
@@ -740,6 +786,11 @@ impl FullAttentionMetalState {
                 "seed KV: attendu {expected} (={n_rows}×{kv_dim}), reçu keys={keys_len} values={values_len}"
             )));
         }
+        if let Some(quant) = &self.quant {
+            self.seed_quantized(quant, keys_segments, values_segments)?;
+            self.len = n_rows;
+            return Ok(());
+        }
         // Diagnostic C1B : arrondi bf16 du seed sur K seul ou V seul, buffers f32.
         let (round_keys, round_values) = match self.keys.element() {
             GpuElement::F32 => (kv_bf16_sim_konly(), kv_bf16_sim_vonly()),
@@ -801,6 +852,61 @@ impl FullAttentionMetalState {
         Ok(())
     }
 
+    /// Semis d'un KV quantifié : segments GPU quantifiés par le kernel,
+    /// segments CPU par l'oracle CPU (mêmes octets). Chaque segment doit couvrir
+    /// des lignes entières, la quantification groupant le long d'une ligne.
+    fn seed_quantized(
+        &self,
+        quant: &KvQuant,
+        keys_segments: &[KvSeedSegment<'_>],
+        values_segments: &[KvSeedSegment<'_>],
+    ) -> Result<()> {
+        let kv_dim = self.kv_dim();
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        let mut gpu_writes = false;
+        for (payload, tensor, segments) in [
+            (&self.keys, &quant.keys, keys_segments),
+            (&self.values, &quant.values, values_segments),
+        ] {
+            let mut row = 0;
+            for segment in segments {
+                if segment.len() % kv_dim != 0 {
+                    return Err(InferError::Dimension(format!(
+                        "seed KV quantifié: segment de {} valeurs hors lignes de {kv_dim}",
+                        segment.len()
+                    )));
+                }
+                let rows = segment.len() / kv_dim;
+                match segment {
+                    KvSeedSegment::Shared(shared) => {
+                        if rows > 0 {
+                            tensor.encode_rows(
+                                encoder,
+                                payload,
+                                shared.buffer(),
+                                shared.byte_offset(),
+                                kv_dim,
+                                row,
+                                rows,
+                                kv_dim,
+                            )?;
+                            gpu_writes = true;
+                        }
+                    }
+                    KvSeedSegment::Cpu(data) => tensor.write_rows(payload, row, kv_dim, data)?,
+                }
+                row += rows;
+            }
+        }
+        encoder_guard.end();
+        if gpu_writes {
+            commit_and_wait(command_buffer)?;
+        }
+        Ok(())
+    }
+
     /// Append la K/V (rope'd) du token courant à la ligne `len`, sans readback
     /// (écriture résidente). Incrémente `len`.
     ///
@@ -822,6 +928,14 @@ impl FullAttentionMetalState {
                 "append KV: capacité {} atteinte (overflow)",
                 self.capacity
             )));
+        }
+        if let Some(quant) = &self.quant {
+            quant.keys.write_rows(&self.keys, self.len, kv_dim, key)?;
+            quant
+                .values
+                .write_rows(&self.values, self.len, kv_dim, value)?;
+            self.len += 1;
+            return Ok(());
         }
         let offset = self.len * kv_dim;
         match self.keys.element() {
@@ -1227,6 +1341,16 @@ impl FullAttentionMetalState {
             )));
         }
         let kv_dim = self.kv_dim();
+        if let Some(quant) = &self.quant {
+            for (tensor, payload, input, offset) in [
+                (&quant.keys, &self.keys, k_buf, k_offset),
+                (&quant.values, &self.values, v_buf, v_offset),
+            ] {
+                tensor.encode_rows(encoder, payload, input, offset, kv_dim, self.len, 1, kv_dim)?;
+            }
+            self.len += 1;
+            return Ok(());
+        }
         let offset = self.len * kv_dim;
         self.encode_copy_at(
             encoder,

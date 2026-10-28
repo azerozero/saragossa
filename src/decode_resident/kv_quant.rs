@@ -1,7 +1,10 @@
 //! Format du KV résident full-attn : dense (f32, bf16) ou quantifié affine.
 
-use super::GpuElement;
-use crate::{InferError, Result};
+use super::arena::alloc_tensor;
+use super::gpu_position::to_u32;
+use super::kernels::compile_kernels;
+use super::utils::byte_offset;
+use super::*;
 use rayon::prelude::*;
 
 /// Encodage d'UN tenseur résident K ou V.
@@ -231,6 +234,356 @@ pub(super) fn dequantize_rows(
             }
         });
     Ok(())
+}
+
+/// Kernels de quantification du KV, compilés SANS fast-math : division et
+/// arrondi reproduisent [`quantize_rows`] bit à bit (codes et échelles).
+///
+/// Un thread par (ligne, groupe de 64) écrit les codes ET l'échelle de son
+/// groupe : aucune écriture partagée entre threads (quartets Q4 compris), et
+/// une ligne réécrite après troncature (rejet MTP) ne garde rien de l'ancienne.
+const KV_QUANTIZE_KERNELS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Miroir de `quant_code` (kv_quant.rs).
+inline uint kv_code(float x, float s, float b, float levels) {
+    const float t = (x - b) / s;
+    if (s > 0.0f && t > 0.0f) {
+        return (t >= levels) ? uint(levels) : uint(rint(t));
+    }
+    return 0u;
+}
+
+// p = [cols, in_stride, rows, 0] ; `payload` et `scales` sont liés à la
+// première ligne cible, `input` à la première ligne source (stride en floats).
+template <uint BITS>
+inline void kv_quantize_rows(
+    device const float* input,
+    device uchar* payload,
+    device float2* scales,
+    constant uint4& p,
+    uint gid
+) {
+    constexpr uint G = 64u;
+    constexpr uint PER_BYTE = 8u / BITS;
+    constexpr float LEVELS = float((1u << BITS) - 1u);
+    const uint groups = p.x / G;
+    if (gid >= groups * p.z) { return; }
+    const uint row = gid / groups;
+    const uint g = gid - row * groups;
+    const device float* x = input + row * p.y + g * G;
+    float lo = x[0];
+    float hi = x[0];
+    for (uint j = 1u; j < G; ++j) {
+        const float v = x[j];
+        if (v < lo) { lo = v; }
+        if (v > hi) { hi = v; }
+    }
+    const float s = (hi - lo) / LEVELS;
+    scales[row * groups + g] = float2(s, lo);
+    device uchar* out = payload + (row * p.x + g * G) / PER_BYTE;
+    for (uint j = 0u; j < G; j += PER_BYTE) {
+        uint byte = 0u;
+        for (uint c = 0u; c < PER_BYTE; ++c) {
+            byte |= kv_code(x[j + c], s, lo, LEVELS) << (c * BITS);
+        }
+        out[j / PER_BYTE] = uchar(byte);
+    }
+}
+
+kernel void kv_quantize_rows_q8(
+    device const float* input [[buffer(0)]],
+    device uchar* payload [[buffer(1)]],
+    device float2* scales [[buffer(2)]],
+    constant uint4& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    kv_quantize_rows<8u>(input, payload, scales, p, gid);
+}
+
+kernel void kv_quantize_rows_q4(
+    device const float* input [[buffer(0)]],
+    device uchar* payload [[buffer(1)]],
+    device float2* scales [[buffer(2)]],
+    constant uint4& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    kv_quantize_rows<4u>(input, payload, scales, p, gid);
+}
+"#;
+
+/// Pipelines du KV quantifié, compilés au premier KV quantifié construit.
+#[derive(Debug)]
+pub(super) struct KvQuantKernels {
+    quantize_q8: ComputePipelineState,
+    quantize_q4: ComputePipelineState,
+}
+
+impl DecodeResidentState {
+    pub(super) fn kv_quant_kernels(&self) -> Result<&KvQuantKernels> {
+        if let Some(kernels) = self.kv_quant_kernels.get() {
+            return Ok(kernels);
+        }
+        let mut quantize = compile_kernels(
+            &self.device,
+            KV_QUANTIZE_KERNELS,
+            &["kv_quantize_rows_q8", "kv_quantize_rows_q4"],
+            false,
+        )?
+        .into_iter();
+        let (Some(quantize_q8), Some(quantize_q4)) = (quantize.next(), quantize.next()) else {
+            return Err(InferError::Metal(
+                "kernels de quantification KV incomplets".to_string(),
+            ));
+        };
+        let kernels = KvQuantKernels {
+            quantize_q8,
+            quantize_q4,
+        };
+        Ok(self.kv_quant_kernels.get_or_init(|| kernels))
+    }
+
+    /// Alloue les échelles d'un tenseur quantifié de `cells` valeurs.
+    pub(super) fn quant_tensor(&self, encoding: KvEncoding, cells: usize) -> Result<QuantTensor> {
+        let kernels = self.kv_quant_kernels()?;
+        let quantize = match encoding {
+            KvEncoding::Q8 => kernels.quantize_q8.clone(),
+            KvEncoding::Q4 => kernels.quantize_q4.clone(),
+            KvEncoding::F32 | KvEncoding::Bf16 => {
+                return Err(InferError::Config(format!(
+                    "KV quantifié: encodage {encoding:?} dense"
+                )));
+            }
+        };
+        let scale_cells = (cells / KV_QUANT_GROUP)
+            .checked_mul(2)
+            .ok_or_else(|| InferError::Dimension("échelles KV débordent".to_string()))?;
+        Ok(QuantTensor {
+            encoding,
+            scales: alloc_tensor(&self.device, self.options, scale_cells, GpuElement::F32)?,
+            quantize,
+        })
+    }
+}
+
+/// Métadonnées des tenseurs K et V d'un KV quantifié.
+#[derive(Debug)]
+pub(super) struct KvQuant {
+    pub(super) keys: QuantTensor,
+    pub(super) values: QuantTensor,
+}
+
+/// Métadonnées d'UN tenseur K ou V quantifié : échelles `[capacity, kv_dim/64]`
+/// en paires `float2` (échelle, biais) et kernel d'écriture. La charge utile
+/// (codes) reste le `GpuTensor` u8 de l'état.
+#[derive(Debug)]
+pub(super) struct QuantTensor {
+    encoding: KvEncoding,
+    scales: GpuTensor,
+    quantize: ComputePipelineState,
+}
+
+impl QuantTensor {
+    pub(super) fn scales(&self) -> &GpuTensor {
+        &self.scales
+    }
+
+    /// Offsets (octets de charge utile, octets d'échelles) de la ligne `row`.
+    fn row_offsets(&self, row: usize, kv_dim: usize) -> Result<(u64, u64)> {
+        let cells = row
+            .checked_mul(kv_dim)
+            .ok_or_else(|| InferError::Dimension("ligne KV quantifiée déborde".to_string()))?;
+        let payload = self
+            .encoding
+            .payload_len(cells)
+            .ok_or_else(|| InferError::Dimension("offset KV quantifié invalide".to_string()))?;
+        Ok((
+            byte_offset(payload, GpuElement::U8, "offset KV quantifié")?,
+            byte_offset(
+                cells / KV_QUANT_GROUP * 2,
+                GpuElement::F32,
+                "offset échelles KV",
+            )?,
+        ))
+    }
+
+    /// Encode la quantification de `rows` lignes : la ligne `r` lit
+    /// `input[input_offset + r·in_stride ..]` (stride en floats) et écrit la
+    /// ligne `first_row + r` de `payload` et des échelles. Bornes vérifiées par
+    /// l'appelant (capacité).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: source + offset + stride, cible + lignes"
+    )]
+    pub(super) fn encode_rows(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        payload: &GpuTensor,
+        input: &BufferRef,
+        input_offset: u64,
+        in_stride: usize,
+        first_row: usize,
+        rows: usize,
+        kv_dim: usize,
+    ) -> Result<()> {
+        let (payload_offset, scales_offset) = self.row_offsets(first_row, kv_dim)?;
+        let threads = rows
+            .checked_mul(kv_dim / KV_QUANT_GROUP)
+            .ok_or_else(|| InferError::Dimension("quantification KV déborde".to_string()))?;
+        let p = [
+            to_u32(kv_dim, "quantification KV kv_dim")?,
+            to_u32(in_stride, "quantification KV stride")?,
+            to_u32(rows, "quantification KV lignes")?,
+            0,
+        ];
+        to_u32(threads, "quantification KV threads")?;
+        encoder.set_compute_pipeline_state(&self.quantize);
+        encoder.set_buffer(0, Some(input), input_offset);
+        encoder.set_buffer(1, Some(payload.buffer()), payload_offset);
+        encoder.set_buffer(2, Some(self.scales.buffer()), scales_offset);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<[u32; 4]>() as u64,
+            p.as_ptr().cast::<c_void>(),
+        );
+        let width = self.quantize.thread_execution_width().max(1);
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_threads(
+            MTLSize::new(threads as u64, 1, 1),
+            MTLSize::new(width, 1, 1),
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Quantifie sur le CPU (oracle [`quantize_rows`]) les lignes `values` vers
+    /// les lignes `first_row..` de `payload` et des échelles, avant tout commit
+    /// qui les lirait (même discipline que `write_f32_at`).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les lignes sortent du buffer ou si les longueurs
+    /// ne forment pas des lignes entières.
+    #[expect(
+        unsafe_code,
+        reason = "écriture CPU d'un MTLBuffer StorageModeShared avant commit"
+    )]
+    pub(super) fn write_rows(
+        &self,
+        payload: &GpuTensor,
+        first_row: usize,
+        kv_dim: usize,
+        values: &[f32],
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let (payload_range, scales_range) =
+            self.ranges(payload, first_row, kv_dim, values.len())?;
+        let payload_ptr = payload.buffer().contents().cast::<u8>();
+        let scales_ptr = self.scales.buffer().contents().cast::<f32>();
+        if payload_ptr.is_null() || scales_ptr.is_null() {
+            return Err(InferError::Metal(
+                "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
+            ));
+        }
+        // SAFETY: buffers StorageModeShared distincts, plages vérifiées par
+        // `ranges` dans leurs longueurs logiques ; écriture avant le commit du
+        // command buffer qui lira ces lignes, aucun autre accès CPU concurrent.
+        let (codes, scales) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(
+                    payload_ptr.add(payload_range.start),
+                    payload_range.len(),
+                ),
+                std::slice::from_raw_parts_mut(
+                    scales_ptr.add(scales_range.start),
+                    scales_range.len(),
+                ),
+            )
+        };
+        quantize_rows(self.encoding, kv_dim, values, codes, scales)
+    }
+
+    /// Relit et déquantifie `rows` lignes à partir de `first_row`, après la fin
+    /// du command buffer qui les a écrites.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les lignes sortent du buffer.
+    #[expect(
+        unsafe_code,
+        reason = "lecture CPU d'un MTLBuffer StorageModeShared après wait_until_completed"
+    )]
+    pub(super) fn read_rows(
+        &self,
+        payload: &GpuTensor,
+        first_row: usize,
+        rows: usize,
+        kv_dim: usize,
+    ) -> Result<Vec<f32>> {
+        let cells = rows
+            .checked_mul(kv_dim)
+            .ok_or_else(|| InferError::Dimension("lecture KV quantifié déborde".to_string()))?;
+        if cells == 0 {
+            return Ok(Vec::new());
+        }
+        let (payload_range, scales_range) = self.ranges(payload, first_row, kv_dim, cells)?;
+        let payload_ptr = payload.buffer().contents().cast::<u8>();
+        let scales_ptr = self.scales.buffer().contents().cast::<f32>();
+        if payload_ptr.is_null() || scales_ptr.is_null() {
+            return Err(InferError::Metal(
+                "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
+            ));
+        }
+        // SAFETY: plages vérifiées par `ranges`, command buffer écrivain terminé ;
+        // lecture seule sans écriture concurrente.
+        let (codes, scales) = unsafe {
+            (
+                std::slice::from_raw_parts(
+                    payload_ptr.add(payload_range.start),
+                    payload_range.len(),
+                ),
+                std::slice::from_raw_parts(scales_ptr.add(scales_range.start), scales_range.len()),
+            )
+        };
+        let mut out = vec![0.0_f32; cells];
+        dequantize_rows(self.encoding, kv_dim, codes, scales, &mut out)?;
+        Ok(out)
+    }
+
+    /// Plages (octets de codes, floats d'échelles) de `cells` valeurs à partir
+    /// de la ligne `first_row`, vérifiées dans les longueurs logiques.
+    fn ranges(
+        &self,
+        payload: &GpuTensor,
+        first_row: usize,
+        kv_dim: usize,
+        cells: usize,
+    ) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+        let invalid = || {
+            InferError::Dimension(format!(
+                "KV quantifié: {cells} valeurs depuis la ligne {first_row} hors buffer"
+            ))
+        };
+        if kv_dim == 0 || kv_dim % KV_QUANT_GROUP != 0 || cells % kv_dim != 0 {
+            return Err(invalid());
+        }
+        let start = first_row.checked_mul(kv_dim).ok_or_else(invalid)?;
+        let end = start.checked_add(cells).ok_or_else(invalid)?;
+        let code = |cells| self.encoding.payload_len(cells).ok_or_else(invalid);
+        let payload_range = code(start)?..code(end)?;
+        let scales_range = start / KV_QUANT_GROUP * 2..end / KV_QUANT_GROUP * 2;
+        if payload_range.end > payload.len() || scales_range.end > self.scales.len() {
+            return Err(invalid());
+        }
+        Ok((payload_range, scales_range))
+    }
 }
 
 #[cfg(test)]

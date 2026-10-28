@@ -3056,3 +3056,217 @@ fn kv_seed_from_shared_view_matches_cpu_bytes() -> Result<()> {
     }
     Ok(())
 }
+
+/// Valeur synthétique d'un KV quantifié : amplitude et centre variables par
+/// groupe de 64, un groupe sur sept constant (échelle nulle).
+fn kv_quant_value(i: usize) -> f32 {
+    let group = i / 64;
+    if group % 7 == 3 {
+        return 2.5 - group as f32 * 0.01;
+    }
+    (i as f32 * 0.3711).sin() * (1.0 + (group % 5) as f32 * 3.0) + (group % 3) as f32 * 0.7
+}
+
+#[allow(
+    unsafe_code,
+    reason = "lecture d'un MTLBuffer partagé après wait_until_completed (test)"
+)]
+fn read_bytes(tensor: &GpuTensor, count: usize) -> Vec<u8> {
+    assert!(count <= tensor.byte_len(), "lecture hors buffer");
+    let ptr = tensor.buffer().contents().cast::<u8>();
+    assert!(!ptr.is_null(), "MTLBuffer partagé sans pointeur CPU");
+    // SAFETY: buffer en StorageModeShared dont le command buffer a terminé ;
+    // `count` octets dans la taille logique vérifiée ci-dessus.
+    unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
+}
+
+/// Octets valides (codes K, codes V, échelles K, échelles V en bits) des
+/// `len` premières lignes d'un KV quantifié.
+fn kv_quant_bytes(kv: &FullAttentionMetalState) -> Result<[Vec<u8>; 4]> {
+    let quant = kv
+        .quant()
+        .ok_or_else(|| InferError::Config("KV non quantifié".into()))?;
+    let cells = kv.len() * kv.kv_dim();
+    let scales = |tensor: &GpuTensor| -> Result<Vec<u8>> {
+        Ok(read_f32_buffer(tensor.buffer(), cells / 64 * 2)?
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect())
+    };
+    let codes = |tensor: &GpuTensor, encoding: super::kv_quant::KvEncoding| {
+        read_bytes(tensor, encoding.payload_len(cells).unwrap_or(0))
+    };
+    Ok([
+        codes(kv.keys(), kv.format().keys()),
+        codes(kv.values(), kv.format().values()),
+        scales(quant.keys.scales())?,
+        scales(quant.values.scales())?,
+    ])
+}
+
+/// Écritures du KV quantifié sur GPU contre l'oracle CPU : semis (segment CPU
+/// puis vue GPU à offset non nul), append mono-ligne, append en lignes (stride
+/// source > kv_dim), troncature puis ré-append. Codes et échelles identiques
+/// bit à bit ; `read_rows` déquantifie à l'identique.
+fn run_kv_quant_writes_case(
+    state: &DecodeResidentState,
+    format: KvFormat,
+    head_dim: usize,
+) -> Result<()> {
+    let (q_heads, kv_heads, rows) = (8, 2, 5);
+    let kv_dim = kv_heads * head_dim;
+    let data: Vec<f32> = (0..(rows + 1) * kv_dim).map(kv_quant_value).collect();
+    let buffer = state.device().new_buffer_with_data(
+        data.as_ptr().cast(),
+        (data.len() * std::mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    // SAFETY: buffer propre au test, plus écrit après sa création.
+    #[expect(unsafe_code, reason = "vue partagée sur un buffer de test figé")]
+    let view =
+        unsafe { crate::metal_backend::SharedF32Rows::new(buffer, kv_dim, (rows - 1) * kv_dim)? };
+    let head = &data[..kv_dim];
+    let make =
+        || state.full_attention_format_for_test(rows + 6, q_heads, kv_heads, head_dim, format);
+    let mut gpu = make()?;
+    let mut cpu = make()?;
+    assert_eq!(gpu.format(), format);
+    let shared = [KvSeedSegment::Cpu(head), KvSeedSegment::Shared(&view)];
+    let copied = [
+        KvSeedSegment::Cpu(head),
+        KvSeedSegment::Cpu(view.as_slice()),
+    ];
+    gpu.seed_segments(&shared, &shared, rows)?;
+    cpu.seed_segments(&copied, &copied, rows)?;
+    assert!(
+        kv_quant_bytes(&gpu)? == kv_quant_bytes(&cpu)?,
+        "{format:?} d{head_dim}: semis GPU ≠ CPU"
+    );
+
+    // Lignes source entrelacées K, V (stride 2·kv_dim) : append mono puis 2 lignes.
+    let extra: Vec<f32> = (0..8 * kv_dim)
+        .map(|i| kv_quant_value(i + 7777) * 1.7)
+        .collect();
+    let src = lease_with(state, &extra)?;
+    let row_bytes = (kv_dim * 4) as u64;
+    let kernels = state.rows_kernels()?;
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let buf = src.tensor().buffer();
+    gpu.encode_append_kv_with_offsets(encoder, buf, 0, buf, row_bytes)?;
+    gpu.encode_append_kv_rows(
+        encoder,
+        kernels,
+        buf,
+        2 * row_bytes,
+        2 * kv_dim,
+        buf,
+        3 * row_bytes,
+        2 * kv_dim,
+        2,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    for row in 0..3 {
+        let k = &extra[2 * row * kv_dim..(2 * row + 1) * kv_dim];
+        let v = &extra[(2 * row + 1) * kv_dim..(2 * row + 2) * kv_dim];
+        cpu.append_row(k, v)?;
+    }
+    assert_eq!(gpu.len(), rows + 3);
+    assert!(
+        kv_quant_bytes(&gpu)? == kv_quant_bytes(&cpu)?,
+        "{format:?} d{head_dim}: append GPU ≠ CPU"
+    );
+
+    // Rejet simulé : troncature puis ré-append d'une autre ligne au même rang.
+    gpu.truncate(rows + 1)?;
+    cpu.truncate(rows + 1)?;
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    gpu.encode_append_kv_with_offsets(encoder, buf, 6 * row_bytes, buf, 7 * row_bytes)?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    cpu.append_row(&extra[6 * kv_dim..7 * kv_dim], &extra[7 * kv_dim..])?;
+    assert!(
+        kv_quant_bytes(&gpu)? == kv_quant_bytes(&cpu)?,
+        "{format:?} d{head_dim}: ré-append GPU ≠ CPU"
+    );
+    let (gpu_k, gpu_v) = gpu.read_rows(0, rows + 2)?;
+    let (cpu_k, cpu_v) = cpu.read_rows(0, rows + 2)?;
+    assert!(gpu_k
+        .iter()
+        .zip(&cpu_k)
+        .all(|(a, b)| a.to_bits() == b.to_bits()));
+    assert!(gpu_v
+        .iter()
+        .zip(&cpu_v)
+        .all(|(a, b)| a.to_bits() == b.to_bits()));
+    // Dernière ligne relue ≈ source (au demi-pas Q4 près, large ici).
+    let last = &gpu_k[(rows + 1) * kv_dim..];
+    let source = &extra[6 * kv_dim..7 * kv_dim];
+    let max_err = last
+        .iter()
+        .zip(source)
+        .fold(0.0_f32, |acc, (a, b)| acc.max((a - b).abs()));
+    assert!(
+        max_err < 2.0,
+        "{format:?}: ligne relue trop loin ({max_err})"
+    );
+    Ok(())
+}
+
+#[test]
+fn kv_quant_gpu_writes_match_cpu_bytes() -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    for format in [KvFormat::Q8, KvFormat::K8V4, KvFormat::Q4] {
+        for head_dim in [128, 256] {
+            run_kv_quant_writes_case(&state, format, head_dim)?;
+        }
+    }
+    // Volume : 4096 lignes quantifiées sur GPU contre CPU, mantisses quelconques
+    // et grille de 1000 pas (égalités d'arrondi fréquentes) en alternance.
+    let (rows, kv_dim) = (4096, 256);
+    let data: Vec<f32> = (0..rows * kv_dim)
+        .map(|i| {
+            if (i / 64) % 2 == 0 {
+                pseudo(i) * (1.0 + ((i / 64) % 9) as f32)
+            } else {
+                let bits = (i.wrapping_mul(2_654_435_761) >> 5) as u32 & 0x007f_ffff;
+                f32::from_bits(0x3f80_0000 | bits) - 1.5
+            }
+        })
+        .collect();
+    let buffer = state.device().new_buffer_with_data(
+        data.as_ptr().cast(),
+        (data.len() * std::mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    // SAFETY: buffer propre au test, plus écrit après sa création.
+    #[expect(unsafe_code, reason = "vue partagée sur un buffer de test figé")]
+    let view = unsafe { crate::metal_backend::SharedF32Rows::new(buffer, 0, data.len())? };
+    for format in [KvFormat::Q8, KvFormat::Q4] {
+        let mut gpu = state.full_attention_format_for_test(rows, 8, 2, 128, format)?;
+        let mut cpu = state.full_attention_format_for_test(rows, 8, 2, 128, format)?;
+        let shared = [KvSeedSegment::Shared(&view)];
+        let copied = [KvSeedSegment::Cpu(&data)];
+        gpu.seed_segments(&shared, &shared, rows)?;
+        cpu.seed_segments(&copied, &copied, rows)?;
+        assert!(
+            kv_quant_bytes(&gpu)? == kv_quant_bytes(&cpu)?,
+            "{format:?}: semis volumineux GPU ≠ CPU"
+        );
+    }
+    // Segment hors lignes entières : refusé avant toute écriture.
+    let mut kv = state.full_attention_format_for_test(4, 8, 2, 128, KvFormat::Q8)?;
+    let odd = vec![0.0_f32; 64];
+    assert!(kv
+        .seed_segments(&[KvSeedSegment::Cpu(&odd)], &[KvSeedSegment::Cpu(&odd)], 0)
+        .is_err());
+    // head_dim sans attention quantifiée : refusé à la construction.
+    assert!(state
+        .full_attention_format_for_test(4, 8, 2, 64, KvFormat::Q8)
+        .is_err());
+    Ok(())
+}

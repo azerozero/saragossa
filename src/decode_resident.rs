@@ -116,6 +116,8 @@ pub(crate) struct DecodeResidentState {
     gpu_position_kernels: OnceLock<gpu_position::GpuPositionKernels>,
     /// Kernels du chemin full-attn en lignes fusionné, compilés au premier usage.
     rows_kernels: OnceLock<rows::RowsKernels>,
+    /// Kernels du KV quantifié, compilés au premier KV quantifié construit.
+    kv_quant_kernels: OnceLock<kv_quant::KvQuantKernels>,
     /// Instrumentation per-section (tranche 3), active si `SARAGOSSA_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,
     /// Slot de flux (light-batch) : namespace du scratch label-keyed de
