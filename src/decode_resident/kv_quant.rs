@@ -319,11 +319,11 @@ kernel void kv_quantize_rows_q4(
 
 /// Passe 1 de l'attention 2-passes split-K sur KV quantifié, dérivée de
 /// `attention_decode_2pass_1_rows_dDHEAD_SUFFIX` (rows.rs) : mêmes grille,
-/// partiels et passe 2. Chaque lane déquantifie ses `QK` codes en registres
-/// (`fma(code, échelle, biais)`, miroir de `dequantize_rows`) puis accumule
-/// dans l'ordre du kernel dense (`score += ql[j] * k[j]`) : seule la lecture
-/// change. Le mono-ligne est le cas `rows = 1` (`tidtg.z = 0`). Une lane lit
-/// un groupe entier d'échelle (64 ≥ QK) : une seule paire par lane et par ligne.
+/// partiels et passe 2. Chaque lane lit ses `QK` codes bruts et applique
+/// l'échelle et le biais de son groupe hors des produits (cf. le kernel) :
+/// l'arrondi diffère donc de `dequantize_rows` à l'ulp près. Le mono-ligne
+/// est le cas `rows = 1` (`tidtg.z = 0`). Une lane lit un groupe entier
+/// d'échelle (64 ≥ QK) : une seule paire par lane et par ligne.
 const KV_QUANT_ATTENTION_TEMPLATE: &str = r#"
 kernel void attention_decode_2pass_1_q_dDHEAD_FMT(
     device const float* q [[buffer(0)]],
@@ -373,30 +373,43 @@ kernel void attention_decode_2pass_1_q_dDHEAD_FMT(
     const uint v_step = blocks * kv_dim * V_BITSu / 8u;
     const uint s_step = blocks * groups;
 
+    // Échelle et biais sortent des produits : `q·(s·c + b) = s·(q·c) + b·Σq`
+    // pour K, et `p·(s·c + b)` s'accumule en `(p·s)·c` plus un terme de biais
+    // commun aux QK valeurs de la lane (un seul groupe de 64 par lane). La
+    // boucle est bornée par les instructions de déquantification, pas par les
+    // octets lus : ce repliement en retire une sur deux.
+    float q_sum = 0.0f;
+    for (uint j = 0u; j < QK; ++j) { q_sum += ql[j]; }
     float o[QK];
     for (uint j = 0u; j < QK; ++j) { o[j] = 0.0f; }
+    float o_bias = 0.0f;
     float max_score = -INFINITY;
     float sum_exp = 0.0f;
 
     for (uint i = block_idx; i < len; i += blocks) {
         float k[QK];
-        kv_dequant_K_BITS(k_, *ks_, k);
-        float score = 0.0f;
-        for (uint j = 0u; j < QK; ++j) { score += ql[j] * k[j]; }
-        score = simd_sum(score);
+        kv_codes_K_BITS(k_, k);
+        const float2 ks = *ks_;
+        float dot = 0.0f;
+        for (uint j = 0u; j < QK; ++j) { dot += ql[j] * k[j]; }
+        const float score = simd_sum(fma(ks.x, dot, ks.y * q_sum));
         const float new_max = max(max_score, score);
         const float factor = fast::exp(max_score - new_max);
         const float exp_score = fast::exp(score - new_max);
         max_score = new_max;
         sum_exp = sum_exp * factor + exp_score;
         float v[QK];
-        kv_dequant_V_BITS(v_, *vs_, v);
-        for (uint j = 0u; j < QK; ++j) { o[j] = o[j] * factor + exp_score * v[j]; }
+        kv_codes_V_BITS(v_, v);
+        const float2 vs = *vs_;
+        const float weight = exp_score * vs.x;
+        for (uint j = 0u; j < QK; ++j) { o[j] = fma(weight, v[j], o[j] * factor); }
+        o_bias = fma(exp_score, vs.y, o_bias * factor);
         k_ += k_step;
         v_ += v_step;
         ks_ += s_step;
         vs_ += s_step;
     }
+    for (uint j = 0u; j < QK; ++j) { o[j] += o_bias; }
 
     if (simd_lid == 0u) {
         sums[slot * blocks + block_idx] = sum_exp;
@@ -414,30 +427,43 @@ const KV_QUANT_FORMATS: [(KvFormat, &str); 3] = [
     (KvFormat::Q4, "q4"),
 ];
 
-/// Déquantification des `qk` codes de `bits` bits d'une lane : lecture en mots
-/// alignés (`uint`, ou `ushort` pour 4 codes Q4), code `c` d'un mot au
-/// décalage `c·bits` (petit-boutiste : quartet bas = indice pair).
-fn dequant_lane_source(bits: usize, qk: usize) -> String {
-    let lane_bits = bits * qk;
-    let (word, word_bits) = if lane_bits % 32 == 0 {
-        ("uint", 32)
-    } else {
-        ("ushort", 16)
+/// Codes bruts (en flottants) des `qk` valeurs de `bits` bits d'une lane, lus
+/// en un chargement aligné ; code `c` d'un mot au décalage `c·bits`
+/// (petit-boutiste : quartet bas = indice pair).
+fn lane_codes_source(bits: usize, qk: usize) -> String {
+    // Un seul chargement vectoriel par lane : le coût de la boucle suit le
+    // nombre de lectures, pas leur taille (mesuré : Q4 aussi lent que Q8).
+    let (load, words) = match bits * qk {
+        16 => ("ushort", 1),
+        32 => ("uint", 1),
+        64 => ("uint2", 2),
+        _ => ("uint4", 4),
     };
-    let words = lane_bits / word_bits;
-    let per_word = word_bits / bits;
+    let per_word = qk / words;
     let mask = (1_u32 << bits) - 1;
+    let word = |i: usize| {
+        if words == 1 {
+            String::new()
+        } else {
+            format!("[{i}]")
+        }
+    };
+    let mut body = String::new();
+    for i in 0..words {
+        for c in 0..per_word {
+            body.push_str(&format!(
+                "    x[{}] = float((uint(w{}) >> {}u) & {mask}u);\n",
+                i * per_word + c,
+                word(i),
+                c * bits
+            ));
+        }
+    }
     format!(
-        r"
-inline void kv_dequant_{bits}(const device uchar* p, const float2 sb, thread float* x) {{
-    const device {word}* w = (const device {word}*)p;
-    for (uint i = 0u; i < {words}u; ++i) {{
-        const uint bits_ = uint(w[i]);
-        for (uint c = 0u; c < {per_word}u; ++c) {{
-            x[i * {per_word}u + c] = fma(float((bits_ >> (c * {bits}u)) & {mask}u), sb.x, sb.y);
-        }}
-    }}
-}}
+        "
+inline void kv_codes_{bits}(const device uchar* p, thread float* x) {{
+    const {load} w = *(const device {load}*)p;
+{body}}}
 "
     )
 }
@@ -448,8 +474,8 @@ fn attention_source(head_dim: usize) -> String {
     let mut source = String::from(
         "#include <metal_stdlib>\n#include <metal_simdgroup>\nusing namespace metal;\n",
     );
-    source.push_str(&dequant_lane_source(8, qk));
-    source.push_str(&dequant_lane_source(4, qk));
+    source.push_str(&lane_codes_source(8, qk));
+    source.push_str(&lane_codes_source(4, qk));
     for (format, suffix) in KV_QUANT_FORMATS {
         let bits = |encoding: KvEncoding| encoding.bits().unwrap_or(8).to_string();
         source.push_str(
