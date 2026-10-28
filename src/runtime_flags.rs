@@ -783,8 +783,9 @@ pub(crate) fn prefill_attn_nax_head_major() -> bool {
 }
 
 /// Tuilage du NAX d256 : `SARAGOSSA_RUST_PREFILL_ATTN_NAX_VARIANT` = `bq64`
-/// (défaut, BQ=64 BK=32), `bk64` (BK=64) ou `bq128` (BQ=128, WM=8) ; toute
-/// autre valeur garde `bq64`. Écarts à l'oracle CPU et à `bq64` mesurés par
+/// (défaut, BQ=64 BK=32), `bk64` (BK=64), `bq128` (BQ=128, WM=8) ou `tq2`
+/// (BQ=128, WM=4, deux fragments Q par simdgroup) ; toute autre valeur, ou une
+/// variante dont le pipeline ne compile pas, garde `bq64`. Écarts à l'oracle CPU et à `bq64` mesurés par
 /// `nax_d256_variants_match_cpu_oracle`. Écartés au bench 64k du 27B : `bk64`
 /// +27 % de TTFT et texte différent, `bq128` +1 %.
 #[cfg(all(target_os = "macos", feature = "metal"))]

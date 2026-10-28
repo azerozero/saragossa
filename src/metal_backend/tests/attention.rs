@@ -1370,12 +1370,13 @@ fn nax_chunk_attention(
 
 /// Variantes de tuilage du NAX d256 contre l'oracle CPU (entrées bf16, même
 /// tolérance que `bq64`) sur des morceaux 27B : requêtes et clés aux frontières
-/// 31/32/33 et 63/64/65 des tuiles, décalages non alignés et un bloc sans
-/// décalage. Chaque variante doit tenir dans 32 Kio de mémoire threadgroup et
-/// accepter ses `simdgroups × 32` threads ; sa grille head-major reste
-/// bit-identique. Écarts max mesurés (M5 Max) : contre le CPU 2,5e-4 pour les
-/// trois ; contre bq64, bk64 6,8e-5 (ordre du softmax online changé) et bq128
-/// 0 (mêmes tuiles K par ligne, blocs causaux en plus entièrement masqués).
+/// 15/16/17 (fragment), 31/32/33, 63/64/65 et 127/128/129 des tuiles,
+/// décalages non alignés et un bloc sans décalage. Chaque variante doit tenir
+/// dans 32 Kio de mémoire threadgroup et accepter ses `simdgroups × 32`
+/// threads ; sa grille head-major reste bit-identique. Écarts max mesurés
+/// (M5 Max) : contre le CPU 2,5e-4 pour les quatre ; contre bq64, bk64 6,8e-5
+/// (ordre du softmax online changé), bq128 et tq2 0 (mêmes tuiles K par ligne,
+/// blocs causaux en plus entièrement masqués).
 #[test]
 fn nax_d256_variants_match_cpu_oracle() -> Result<()> {
     let Some(mut executor) = test_executor()? else {
@@ -1383,12 +1384,18 @@ fn nax_d256_variants_match_cpu_oracle() -> Result<()> {
     };
     let (q_heads, kv_heads) = (24, 4);
     let cases = [
+        (15, 79),
+        (16, 80),
+        (17, 81),
         (31, 95),
         (32, 96),
         (33, 97),
         (63, 1087),
         (64, 1088),
         (65, 1089),
+        (127, 1151),
+        (128, 1152),
+        (129, 1153),
         (300, 1061),
         (1069, 1069),
     ];
@@ -1403,14 +1410,15 @@ fn nax_d256_variants_match_cpu_oracle() -> Result<()> {
         ("bq64", attention::NAX_CAUSAL_ATTN_BQ64),
         ("bk64", attention::NAX_CAUSAL_ATTN_BK64),
         ("bq128", attention::NAX_CAUSAL_ATTN_BQ128),
+        ("tq2", attention::NAX_CAUSAL_ATTN_TQ2),
     ];
-    let mut worst_cpu = [0.0_f32; 3];
-    let mut worst_bq64 = [0.0_f32; 3];
+    let mut worst_cpu = [0.0_f32; 4];
+    let mut worst_bq64 = [0.0_f32; 4];
     for (seq, kv_rows) in cases {
         let (q_full, k, v) = causal_attention_inputs(kv_rows, q_heads, kv_heads, 256)?;
         let q = tail_rows(&q_full, seq)?;
         let offset = kv_rows - seq;
-        let mut rows: Vec<usize> = [0, 1, 16, 31, 32, 33, 48, 63, 64, 65]
+        let mut rows: Vec<usize> = [0, 1, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65, 127, 128, 129]
             .into_iter()
             .filter(|&row| row < seq)
             .collect();
@@ -1690,6 +1698,13 @@ fn nax_d256_chunk_microbench() -> Result<()> {
         value_norm: false,
         eps: 1.0e-6,
     };
+    // Variante lue par l'exécuteur (`SARAGOSSA_RUST_PREFILL_ATTN_NAX_VARIANT`,
+    // figée par OnceLock : un processus par variante).
+    let variant = executor
+        .causal_attention_prefill_steel_nax_d256
+        .as_ref()
+        .map_or("absent", |nax| nax.shape.host_name);
+    const ITERATIONS: usize = 7;
     let kv_dim = kv_heads * HEAD_DIM;
     for kv_rows in [16 * 1024, 64 * 1024, 256 * 1024] {
         let q: Vec<f32> = (0..SEQ * Q_HEADS * HEAD_DIM)
@@ -1721,8 +1736,8 @@ fn nax_d256_chunk_microbench() -> Result<()> {
             ("conversion + noyau", None),
             ("noyau seul (miroir)", Some([mirror[0].as_ref(), mirror[1].as_ref()])),
         ] {
-            let mut best = f64::MAX;
-            for _ in 0..4 {
+            let mut times = Vec::with_capacity(ITERATIONS);
+            for _ in 0..ITERATIONS {
                 let cb = executor.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 executor.encode_causal_attention_prefill_chunk(
@@ -1731,12 +1746,16 @@ fn nax_d256_chunk_microbench() -> Result<()> {
                 enc.end_encoding();
                 let t = std::time::Instant::now();
                 commit_and_wait(cb)?;
-                best = best.min(t.elapsed().as_secs_f64());
+                times.push(t.elapsed().as_secs_f64());
             }
+            times.sort_by(f64::total_cmp);
+            let (best, median) = (times[0], times[ITERATIONS / 2]);
             eprintln!(
-                "[nax d256] kv_heads={kv_heads} kv={kv_rows} q={SEQ} {label} : {:.1} ms, {:.1} TFLOP/s",
+                "[nax d256 {variant}] kv_heads={kv_heads} kv={kv_rows} q={SEQ} {label} : \
+                 médiane {:.1} ms (min {:.1}), {:.1} TFLOP/s",
+                median * 1.0e3,
                 best * 1.0e3,
-                flops / best / 1.0e12
+                flops / median / 1.0e12
             );
         }
     }

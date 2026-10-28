@@ -608,11 +608,19 @@ impl MetalExecutor {
             compile_steel_causal_d256_attention(&device, sources.steel_attention.as_ref());
         let causal_attention_prefill_steel_nax_d256 =
             if crate::runtime_flags::prefill_attn_nax_enabled() {
-                let pipeline = compile_steel_causal_nax_d256_attention(
-                    &device,
-                    sources.steel_attention_nax.as_ref(),
-                    attention::NaxCausalAttnShape::from_flags(),
-                );
+                let shape = attention::NaxCausalAttnShape::from_flags();
+                let source = sources.steel_attention_nax.as_ref();
+                // Une variante opt-in qui ne compile pas retombe sur bq64.
+                let pipeline = compile_steel_causal_nax_d256_attention(&device, source, shape)
+                    .or_else(|| {
+                        let base = attention::NaxCausalAttnShape {
+                            head_major: shape.head_major,
+                            ..attention::NAX_CAUSAL_ATTN_BQ64
+                        };
+                        (base != shape)
+                            .then(|| compile_steel_causal_nax_d256_attention(&device, source, base))
+                            .flatten()
+                    });
                 if pipeline.is_none() {
                     eprintln!("attention prefill NAX indisponible : repli Steel f32");
                 }

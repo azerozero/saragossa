@@ -51,12 +51,23 @@ pub(super) const NAX_CAUSAL_ATTN_BQ128: NaxCausalAttnShape = NaxCausalAttnShape 
     head_major: false,
 };
 
+/// Variante TQ2 : BQ=128 sur WM=4, chaque simdgroup porte deux fragments de 16
+/// lignes Q et réutilise chaque fragment K/V chargé pour les deux.
+pub(super) const NAX_CAUSAL_ATTN_TQ2: NaxCausalAttnShape = NaxCausalAttnShape {
+    host_name: "steel_attention_nax_dsplit_bf16_f32out_bq128_bk32_bd256_wm4_wn2",
+    block_q: 128,
+    block_k: 32,
+    simdgroups: 8,
+    head_major: false,
+};
+
 impl NaxCausalAttnShape {
     /// Instanciation retenue par les flags `SARAGOSSA_RUST_PREFILL_ATTN_NAX_*`.
     pub(super) fn from_flags() -> Self {
         let base = match crate::runtime_flags::prefill_attn_nax_variant() {
             Some("bk64") => NAX_CAUSAL_ATTN_BK64,
             Some("bq128") => NAX_CAUSAL_ATTN_BQ128,
+            Some("tq2") => NAX_CAUSAL_ATTN_TQ2,
             _ => NAX_CAUSAL_ATTN_BQ64,
         };
         Self {

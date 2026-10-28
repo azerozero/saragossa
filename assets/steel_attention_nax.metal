@@ -3155,7 +3155,10 @@ template <
   // KV seq frags per warp
   constexpr short TK = BK / kU;
 
-  static_assert(TQ == 1, "Check TQ");
+  // TQ = 2 : chaque simdgroup porte deux fragments de 16 lignes Q et réutilise
+  // chaque fragment K/V chargé pour les deux (deux fois moins de chargements
+  // K/V par MMA qu'avec WM = 8 pour le même BQ).
+  static_assert(TQ == 1 || TQ == 2, "Check TQ");
   static_assert(TD % WN == 0, "The head dim must split evenly across WN");
 
   // HeadDim frags / columns owned by each of the WN simdgroups of a row group
@@ -3218,11 +3221,11 @@ template <
 
   // One slot per (row group, D group) in per-lane-linear layout. All groups
   // share the fragment-to-lane mapping.
-  threadgroup AccumType s_xchg[WM][WN][TK * kEPF * 32];
+  threadgroup AccumType s_xchg[WM][WN][TQ * TK * kEPF * 32];
 
   // Keep the simdgroup's Q slice resident in registers for the whole KV
   // loop: TDh fragments of T are cheap next to the accumulators.
-  NAXTile<T, 1, 1> Qtiles[TDh];
+  NAXTile<T, TQ, 1> Qtiles[TDh];
   STEEL_PRAGMA_UNROLL
   for (short id = 0; id < TDh; id++) {
     const int Q_load_off = id * kU;
@@ -3260,23 +3263,27 @@ template <
           Ktile.load(K + K_load_off, int(params->K_strides[2]));
         }
 
-        stile_t::NAXFrag_t::mma(
-            Stile.frag_at(0, ik),
-            Stile.frag_at(0, ik + 1),
-            Qtiles[id].frag_at(0, 0),
-            metal::false_type{},
-            Ktile.frag_at(0, 0),
-            Ktile.frag_at(1, 0),
-            metal::true_type{});
+        STEEL_PRAGMA_UNROLL
+        for (short iq = 0; iq < TQ; iq++) {
+          stile_t::NAXFrag_t::mma(
+              Stile.frag_at(iq, ik),
+              Stile.frag_at(iq, ik + 1),
+              Qtiles[id].frag_at(iq, 0),
+              metal::false_type{},
+              Ktile.frag_at(0, 0),
+              Ktile.frag_at(1, 0),
+              metal::true_type{});
+        }
       }
     }
 
     // Exchange all partial scores and reduce them in a fixed order.
     threadgroup AccumType* slot = s_xchg[row_group][d_group];
-    const short base = short(simd_lane_id) * (TK * kEPF);
+    constexpr short kSlotElems = stile_t::kNumFrags * kEPF;
+    const short base = short(simd_lane_id) * kSlotElems;
     STEEL_PRAGMA_UNROLL
-    for (short ik = 0; ik < TK; ik++) {
-      thread auto& s = Stile.frag_at(0, ik);
+    for (short ik = 0; ik < stile_t::kNumFrags; ik++) {
+      thread auto& s = Stile.val_frags[ik];
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < kEPF; i++) {
         slot[base + ik * kEPF + i] = s[i];
@@ -3284,8 +3291,8 @@ template <
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     STEEL_PRAGMA_UNROLL
-    for (short ik = 0; ik < TK; ik++) {
-      thread auto& s = Stile.frag_at(0, ik);
+    for (short ik = 0; ik < stile_t::kNumFrags; ik++) {
+      thread auto& s = Stile.val_frags[ik];
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < kEPF; i++) {
         s[i] = s_xchg[row_group][0][base + ik * kEPF + i];
@@ -3312,16 +3319,19 @@ template <
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
       STEEL_PRAGMA_UNROLL
-      for (short ik = 0; ik < TK; ik++) {
-        const short col_pos = ik * kU + sn;
-        thread auto& fg = Stile.frag_at(0, ik);
-
+      for (short iq = 0; iq < TQ; iq++) {
         STEEL_PRAGMA_UNROLL
-        for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+        for (short ik = 0; ik < TK; ik++) {
+          const short col_pos = ik * kU + sn;
+          thread auto& fg = Stile.frag_at(iq, ik);
+
           STEEL_PRAGMA_UNROLL
-          for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
-            const auto loc = ii * stile_t::kFragThrCols + jj;
-            fg[loc] = ((col_pos + jj) < params->kL_rem) ? fg[loc] : neg_inf;
+          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+              const auto loc = ii * stile_t::kFragThrCols + jj;
+              fg[loc] = ((col_pos + jj) < params->kL_rem) ? fg[loc] : neg_inf;
+            }
           }
         }
       }
@@ -3335,17 +3345,21 @@ template <
       const int base_col = kb * BK;
 
       STEEL_PRAGMA_UNROLL
-      for (short ik = 0; ik < TK; ik++) {
-        thread auto& fg = Stile.frag_at(0, ik);
-
+      for (short iq = 0; iq < TQ; iq++) {
         STEEL_PRAGMA_UNROLL
-        for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+        for (short ik = 0; ik < TK; ik++) {
+          thread auto& fg = Stile.frag_at(iq, ik);
+
           STEEL_PRAGMA_UNROLL
-          for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
-            const auto r = base_row + ii * stile_t::kFragRowsJump + sm;
-            const auto c = base_col + ik * kU + jj + sn;
-            const auto loc = ii * stile_t::kFragThrCols + jj;
-            fg[loc] = (r < c) ? neg_inf : fg[loc];
+          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+              const auto r =
+                  base_row + iq * kU + ii * stile_t::kFragRowsJump + sm;
+              const auto c = base_col + ik * kU + jj + sn;
+              const auto loc = ii * stile_t::kFragThrCols + jj;
+              fg[loc] = (r < c) ? neg_inf : fg[loc];
+            }
           }
         }
       }
@@ -3355,7 +3369,7 @@ template <
     if (has_mask) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
-      const int base_row = tid.x * BQ + tm;
+      const int base_row_q = tid.x * BQ + tm;
       const int base_col = kb * BK;
 
       constexpr bool is_bool = is_same_v<MaskType, bool>;
@@ -3363,57 +3377,61 @@ template <
       using mtile_t = NAXTile<melem_t, TQ, TK>;
       using mfrag_t = typename mtile_t::frag_type;
 
-      if (base_row + kU <= params->qL && base_col + BK <= params->kL) {
-        STEEL_PRAGMA_UNROLL
-        for (short ik = 0; ik < TK; ik++) {
-          const int row_pos = base_row;
-          const int col_pos = base_col + ik * kU;
-
-          mfrag_t mfrag;
-          mtile_t::NAXFrag_t::load(
-              mfrag,
-              mask,
-              int64_t(mask_params->M_strides[2]),
-              Int<1>{},
-              row_pos,
-              col_pos);
-
-          thread auto& fg = Stile.frag_at(0, ik);
-
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
+        const int base_row = base_row_q + iq * kU;
+        if (base_row + kU <= params->qL && base_col + BK <= params->kL) {
           STEEL_PRAGMA_UNROLL
-          for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
-            if constexpr (is_bool) {
-              fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
-            } else {
-              fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
+          for (short ik = 0; ik < TK; ik++) {
+            const int row_pos = base_row;
+            const int col_pos = base_col + ik * kU;
+
+            mfrag_t mfrag;
+            mtile_t::NAXFrag_t::load(
+                mfrag,
+                mask,
+                int64_t(mask_params->M_strides[2]),
+                Int<1>{},
+                row_pos,
+                col_pos);
+
+            thread auto& fg = Stile.frag_at(iq, ik);
+
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
+              if constexpr (is_bool) {
+                fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
+              } else {
+                fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
+              }
             }
           }
-        }
-      } else {
-        STEEL_PRAGMA_UNROLL
-        for (short ik = 0; ik < TK; ik++) {
-          const int row_pos = base_row;
-          const int col_pos = base_col + ik * kU;
-
-          mfrag_t mfrag;
-          mtile_t::NAXFrag_t::load_safe(
-              mfrag,
-              mask,
-              int64_t(mask_params->M_strides[2]),
-              Int<1>{},
-              params->qL,
-              params->kL,
-              row_pos,
-              col_pos);
-
-          thread auto& fg = Stile.frag_at(0, ik);
-
+        } else {
           STEEL_PRAGMA_UNROLL
-          for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
-            if constexpr (is_bool) {
-              fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
-            } else {
-              fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
+          for (short ik = 0; ik < TK; ik++) {
+            const int row_pos = base_row;
+            const int col_pos = base_col + ik * kU;
+
+            mfrag_t mfrag;
+            mtile_t::NAXFrag_t::load_safe(
+                mfrag,
+                mask,
+                int64_t(mask_params->M_strides[2]),
+                Int<1>{},
+                params->qL,
+                params->kL,
+                row_pos,
+                col_pos);
+
+            thread auto& fg = Stile.frag_at(iq, ik);
+
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
+              if constexpr (is_bool) {
+                fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
+              } else {
+                fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
+              }
             }
           }
         }
@@ -3464,14 +3482,17 @@ template <
           Vtile.load(V + V_load_off, int(params->V_strides[2]));
         }
 
-        otile_t::NAXFrag_t::mma(
-            Otile.frag_at(0, id),
-            Otile.frag_at(0, id + 1),
-            Stile.frag_at(0, ik),
-            metal::false_type{},
-            Vtile.frag_at(0, 0),
-            Vtile.frag_at(0, 1),
-            metal::false_type{});
+        STEEL_PRAGMA_UNROLL
+        for (short iq = 0; iq < TQ; iq++) {
+          otile_t::NAXFrag_t::mma(
+              Otile.frag_at(iq, id),
+              Otile.frag_at(iq, id + 1),
+              Stile.frag_at(iq, ik),
+              metal::false_type{},
+              Vtile.frag_at(0, 0),
+              Vtile.frag_at(0, 1),
+              metal::false_type{});
+        }
       }
     }
 
@@ -3495,7 +3516,8 @@ template <
 
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kRowsPT; ++i) {
-      const int row = lse_row_base + i * stile_t::kFragRowsJump + sm;
+      const int row = lse_row_base + (i / stile_t::kFragThrRows) * kU +
+          (i % stile_t::kFragThrRows) * stile_t::kFragRowsJump + sm;
       if (row < params->qL) {
         LSE[lse_head_off + row] = (sum_score[i] == 0)
             ? -INFINITY
@@ -3534,3 +3556,9 @@ attention_nax_dsplit<bfloat, 64, 64, 256, 4, 2, float, float, float>;
 template [[host_name("steel_attention_nax_dsplit_bf16_f32out_bq128_bk32_bd256_wm8_wn2")]]
 [[kernel]] decltype(attention_nax_dsplit<bfloat, 128, 32, 256, 8, 2, float, float, float>)
 attention_nax_dsplit<bfloat, 128, 32, 256, 8, 2, float, float, float>;
+
+// Variante opt-in `tq2` : BQ=128 sur WM=4 (TQ=2), 256 threads comme bq64 ;
+// chaque fragment K/V chargé sert deux fragments Q du même simdgroup.
+template [[host_name("steel_attention_nax_dsplit_bf16_f32out_bq128_bk32_bd256_wm4_wn2")]]
+[[kernel]] decltype(attention_nax_dsplit<bfloat, 128, 32, 256, 4, 2, float, float, float>)
+attention_nax_dsplit<bfloat, 128, 32, 256, 4, 2, float, float, float>;
