@@ -1262,6 +1262,7 @@ fn causal_attention_prefill_nax_d256_matches_cpu_selected_rows() -> Result<()> {
         pipelines::compile_steel_causal_nax_d256_attention(
             &executor.device,
             STEEL_ATTENTION_NAX_KERNELS,
+            attention::NAX_CAUSAL_ATTN_BQ64,
         );
     if executor.causal_attention_prefill_steel_nax_d256.is_none() {
         return Ok(());
@@ -1306,6 +1307,255 @@ fn causal_attention_prefill_nax_d256_matches_cpu_selected_rows() -> Result<()> {
 }
 
 const NAX_D256_TOLERANCE: f32 = 1.0e-3;
+
+/// Dernières `rows` lignes de `tensor` : les requêtes d'un morceau final.
+fn tail_rows(tensor: &Tensor, rows: usize) -> Result<Tensor> {
+    let (total, dim) = tensor.as_matrix()?;
+    let start = checked_len(total - rows, dim, "test tail rows")?;
+    Tensor::from_vec(vec![rows, dim], tensor.data()[start..].to_vec())
+}
+
+/// Attention NAX d256 d'un morceau : `q` porte les dernières lignes, `k`/`v`
+/// tout le préfixe (`q_l_off = kv_rows - seq`), via le pipeline courant de
+/// l'exécuteur.
+fn nax_chunk_attention(
+    executor: &MetalExecutor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    q_heads: usize,
+    kv_heads: usize,
+) -> Result<Vec<f32>> {
+    let (seq, q_dim) = q.as_matrix()?;
+    let (kv_rows, _) = k.as_matrix()?;
+    let head_dim = q_dim / q_heads;
+    let spec = PrefillAttentionSpec {
+        seq,
+        hidden_dim: q_dim,
+        q_heads,
+        kv_heads,
+        head_dim,
+        rope_dims: head_dim,
+        rope_frequency_dim: head_dim,
+        rope_theta: 10_000.0,
+        attn_scalar: head_dim as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 0.0,
+    };
+    let q_buffer = executor.upload_f32_buffer(q.data(), "test_nax_chunk_q")?;
+    let k_buffer = executor.upload_f32_buffer(k.data(), "test_nax_chunk_k")?;
+    let v_buffer = executor.upload_f32_buffer(v.data(), "test_nax_chunk_v")?;
+    let output_len = checked_len(seq, q_dim, "test nax chunk out")?;
+    let output_buffer = executor.uncached_f32_buffer(output_len, "test_nax_chunk_out")?;
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let encoded = executor.encode_causal_attention_prefill_chunk(
+        encoder,
+        &q_buffer,
+        &k_buffer,
+        &v_buffer,
+        &output_buffer,
+        spec,
+        kv_rows,
+        kv_rows,
+        None,
+    );
+    encoder.end_encoding();
+    encoded?;
+    commit_and_wait(command_buffer)?;
+    read_f32_buffer(&output_buffer, output_len)
+}
+
+/// Variantes de tuilage du NAX d256 contre l'oracle CPU (entrées bf16, même
+/// tolérance que `bq64`) sur des morceaux 27B : requêtes et clés aux frontières
+/// 31/32/33 et 63/64/65 des tuiles, décalages non alignés et un bloc sans
+/// décalage. Chaque variante doit tenir dans 32 Kio de mémoire threadgroup et
+/// accepter ses `simdgroups × 32` threads ; sa grille head-major reste
+/// bit-identique. Écarts max mesurés (M5 Max) : contre le CPU 2,5e-4 pour les
+/// trois ; contre bq64, bk64 6,8e-5 (ordre du softmax online changé) et bq128
+/// 0 (mêmes tuiles K par ligne, blocs causaux en plus entièrement masqués).
+#[test]
+fn nax_d256_variants_match_cpu_oracle() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads) = (24, 4);
+    let cases = [
+        (31, 95),
+        (32, 96),
+        (33, 97),
+        (63, 1087),
+        (64, 1088),
+        (65, 1089),
+        (300, 1061),
+        (1069, 1069),
+    ];
+    let round = |tensor: &Tensor| -> Result<Tensor> {
+        let (rows, cols) = tensor.as_matrix()?;
+        Tensor::from_vec(
+            vec![rows, cols],
+            tensor.data().iter().copied().map(bf16_round).collect(),
+        )
+    };
+    let variants = [
+        ("bq64", attention::NAX_CAUSAL_ATTN_BQ64),
+        ("bk64", attention::NAX_CAUSAL_ATTN_BK64),
+        ("bq128", attention::NAX_CAUSAL_ATTN_BQ128),
+    ];
+    let mut worst_cpu = [0.0_f32; 3];
+    let mut worst_bq64 = [0.0_f32; 3];
+    for (seq, kv_rows) in cases {
+        let (q_full, k, v) = causal_attention_inputs(kv_rows, q_heads, kv_heads, 256)?;
+        let q = tail_rows(&q_full, seq)?;
+        let offset = kv_rows - seq;
+        let mut rows: Vec<usize> = [0, 1, 16, 31, 32, 33, 48, 63, 64, 65]
+            .into_iter()
+            .filter(|&row| row < seq)
+            .collect();
+        rows.extend([seq / 2, seq - 1]);
+        rows.sort_unstable();
+        rows.dedup();
+        let absolute: Vec<usize> = rows.iter().map(|row| offset + row).collect();
+        let expected = cpu_causal_attention_selected_rows_gqa(
+            &round(&q_full)?,
+            &round(&k)?,
+            &round(&v)?,
+            q_heads,
+            kv_heads,
+            &absolute,
+        )?;
+        assert!(
+            expected.iter().all(|(_, row)| row.iter().all(|value| value.is_finite())),
+            "oracle CPU non fini"
+        );
+        let mut reference: Option<Vec<f32>> = None;
+        for (index, (name, shape)) in variants.iter().enumerate() {
+            let mut grids = Vec::new();
+            for head_major in [false, true] {
+                executor.causal_attention_prefill_steel_nax_d256 =
+                    pipelines::compile_steel_causal_nax_d256_attention(
+                        &executor.device,
+                        STEEL_ATTENTION_NAX_KERNELS,
+                        attention::NaxCausalAttnShape {
+                            head_major,
+                            ..*shape
+                        },
+                    );
+                let Some(nax) = executor.causal_attention_prefill_steel_nax_d256.as_ref() else {
+                    // Seule la référence bq64 en grille normale peut manquer
+                    // (GPU sans accélérateur) ; une fois compilée, toute
+                    // spécialisation absente est une régression.
+                    assert!(
+                        index == 0 && !head_major,
+                        "{name} head_major={head_major}: pipeline NAX non compilé"
+                    );
+                    return Ok(());
+                };
+                let threads = shape.simdgroups * 32;
+                assert!(
+                    nax.pipeline.static_threadgroup_memory_length() <= 32 * 1024,
+                    "{name}: mémoire threadgroup {}",
+                    nax.pipeline.static_threadgroup_memory_length()
+                );
+                assert!(
+                    nax.pipeline.max_total_threads_per_threadgroup() >= threads,
+                    "{name}: {} threads max < {threads}",
+                    nax.pipeline.max_total_threads_per_threadgroup()
+                );
+                grids.push(nax_chunk_attention(
+                    &executor, &q, &k, &v, q_heads, kv_heads,
+                )?);
+            }
+            // `f32::max` ignore NaN : sans ce contrôle, une sortie NaN
+            // passerait les écarts à zéro.
+            assert!(
+                grids.iter().flatten().all(|value| value.is_finite()),
+                "{name}: sortie non finie (seq={seq} kv={kv_rows})"
+            );
+            assert!(
+                grids[0]
+                    .iter()
+                    .zip(&grids[1])
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{name}: grille head-major non bit-identique (seq={seq} kv={kv_rows})"
+            );
+            let got = grids.swap_remove(0);
+            let dim = q_heads * 256;
+            for (row, (_, want)) in rows.iter().zip(&expected) {
+                let start = row * dim;
+                for (a, b) in got[start..start + dim].iter().zip(want) {
+                    worst_cpu[index] = worst_cpu[index].max((a - b).abs());
+                }
+            }
+            match reference.as_ref() {
+                None => reference = Some(got),
+                Some(reference) => {
+                    for (a, b) in got.iter().zip(reference) {
+                        worst_bq64[index] = worst_bq64[index].max((a - b).abs());
+                    }
+                }
+            }
+        }
+    }
+    for (index, (name, _)) in variants.iter().enumerate() {
+        eprintln!(
+            "nax d256 {name}: écart max CPU {:e}, contre bq64 {:e}",
+            worst_cpu[index], worst_bq64[index]
+        );
+        assert!(
+            worst_cpu[index] <= NAX_D256_TOLERANCE,
+            "{name}: écart CPU {:e}",
+            worst_cpu[index]
+        );
+    }
+    Ok(())
+}
+
+/// La grille `(H, NQ)` ne change que l'ordre de lancement des threadgroups :
+/// sortie bit-identique à `(NQ, H)` sur un morceau 27B (24/4 têtes) de 1 100
+/// requêtes après 948 positions (tuile Q partielle, `q_l_off` non aligné).
+#[test]
+fn nax_d256_head_major_grid_is_bit_identical() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (seq, kv_rows, q_heads, kv_heads) = (1100, 2048, 24, 4);
+    let (q_full, k, v) = causal_attention_inputs(kv_rows, q_heads, kv_heads, 256)?;
+    let q = tail_rows(&q_full, seq)?;
+    let mut outputs = Vec::new();
+    for head_major in [false, true] {
+        executor.causal_attention_prefill_steel_nax_d256 =
+            pipelines::compile_steel_causal_nax_d256_attention(
+                &executor.device,
+                STEEL_ATTENTION_NAX_KERNELS,
+                attention::NaxCausalAttnShape {
+                    head_major,
+                    ..attention::NAX_CAUSAL_ATTN_BQ64
+                },
+            );
+        if executor.causal_attention_prefill_steel_nax_d256.is_none() {
+            // Seule la grille normale peut manquer (GPU sans accélérateur).
+            assert!(!head_major, "spécialisation head-major non compilée");
+            return Ok(());
+        }
+        outputs.push(nax_chunk_attention(
+            &executor, &q, &k, &v, q_heads, kv_heads,
+        )?);
+    }
+    assert!(
+        outputs.iter().flatten().all(|value| value.is_finite()),
+        "sortie NAX non finie"
+    );
+    let differing = outputs[0]
+        .iter()
+        .zip(&outputs[1])
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(differing, 0, "grille head-major non bit-identique");
+    Ok(())
+}
 
 /// Le gated delta NAX de MLX (forme 27B, 16/48 têtes) suit la récurrence
 /// séquentielle `naive_gdn_reference`, y et état final, aux frontières de

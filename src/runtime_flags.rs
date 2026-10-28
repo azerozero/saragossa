@@ -767,6 +767,50 @@ pub(crate) fn prefill_attn_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX", true))
 }
 
+/// Ordre de la grille du NAX d256 : `SARAGOSSA_RUST_PREFILL_ATTN_NAX_GRID` =
+/// `head` (défaut, `(H, NQ)`, la tête la plus rapide : les têtes Q d'un groupe
+/// KV partent côte à côte et partagent les tuiles K/V en cache) ou `seq`
+/// (`(NQ, H)`, ancien ordre). Calcul par threadgroup identique, sortie
+/// bit-identique (`nax_d256_head_major_grid_is_bit_identical`). Mesuré sur le
+/// 27B : TTFT 256k 756,4 → 750,0 s, neutre à 64k, textes identiques.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_attn_nax_head_major() -> bool {
+    static HEAD: OnceLock<bool> = OnceLock::new();
+    *HEAD.get_or_init(|| {
+        !env_var("SARAGOSSA_RUST_PREFILL_ATTN_NAX_GRID")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("seq"))
+    })
+}
+
+/// Tuilage du NAX d256 : `SARAGOSSA_RUST_PREFILL_ATTN_NAX_VARIANT` = `bq64`
+/// (défaut, BQ=64 BK=32), `bk64` (BK=64) ou `bq128` (BQ=128, WM=8) ; toute
+/// autre valeur garde `bq64`. Écarts à l'oracle CPU et à `bq64` mesurés par
+/// `nax_d256_variants_match_cpu_oracle`. Écartés au bench 64k du 27B : `bk64`
+/// +27 % de TTFT et texte différent, `bq128` +1 %.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_attn_nax_variant() -> Option<&'static str> {
+    static VARIANT: OnceLock<Option<String>> = OnceLock::new();
+    VARIANT
+        .get_or_init(|| {
+            env_var("SARAGOSSA_RUST_PREFILL_ATTN_NAX_VARIANT")
+                .map(|value| value.trim().to_ascii_lowercase())
+        })
+        .as_deref()
+}
+
+/// Miroir bf16 persistant du K/V full-attention pendant le prefill résident
+/// par morceaux : `SARAGOSSA_RUST_PREFILL_KV_BF16_MIRROR=1` ne convertit que
+/// les lignes nouvelles au lieu de tout le préfixe à chaque morceau (~1,7 To
+/// de trafic à 256k). Même conversion après RoPE : sorties et K/V
+/// bit-identiques (`prefill_resident_chunked_matches_single_chunk`). Coûte
+/// 1 Gio par couche full-attention à 256k sur le 27B (16 Gio) pour un gain
+/// mesuré de 3,4 s sur 750 s à 256k, neutre à 64k : reste opt-in.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_BF16_MIRROR", false))
+}
+
 /// Suffixe minimal (tokens) pour prolonger un préfixe en cache par le prefill
 /// résident par morceaux plutôt que par l'extension en lignes. Mesuré le
 /// 2026-10-25 (serve AR, 27B 4 bits, préfixe ~10k) : égalité jusqu'à 16 tokens
