@@ -1143,6 +1143,12 @@ pub(crate) fn kv_bf16_greedy_min_tokens() -> usize {
 /// ne sont jamais quantifiées ; une couche sans attention quantifiée (fenêtre
 /// glissante, head_dim ≠ 128/256, GQA 1, flash ou 2-passes coupés) reste bf16.
 /// Une valeur inconnue garde bf16, avec un avertissement.
+///
+/// NOTE: bf16 reste le défaut. Mesuré sur M5 Max avec Qwen3.8 27B en AR, le
+/// decode ne gagne que 2 à 3 % à 115k/256k et perd 1 % à 32k : le 2-passes
+/// est borné par la latence de sa boucle ligne à ligne, pas par les octets
+/// lus. Q8 change le texte à 32k (intégrité intacte) et ne réduit pas le pic
+/// RSS à 256k.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn kv_quant_format() -> crate::decode_resident::KvFormat {
     static FORMAT: OnceLock<crate::decode_resident::KvFormat> = OnceLock::new();
