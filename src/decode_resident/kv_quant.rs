@@ -313,11 +313,159 @@ kernel void kv_quantize_rows_q4(
 }
 "#;
 
+/// Passe 1 de l'attention 2-passes split-K sur KV quantifié, dérivée de
+/// `attention_decode_2pass_1_rows_dDHEAD_SUFFIX` (rows.rs) : mêmes grille,
+/// partiels et passe 2. Chaque lane déquantifie ses `QK` codes en registres
+/// (`fma(code, échelle, biais)`, miroir de `dequantize_rows`) puis accumule
+/// dans l'ordre du kernel dense (`score += ql[j] * k[j]`) : seule la lecture
+/// change. Le mono-ligne est le cas `rows = 1` (`tidtg.z = 0`). Une lane lit
+/// un groupe entier d'échelle (64 ≥ QK) : une seule paire par lane et par ligne.
+const KV_QUANT_ATTENTION_TEMPLATE: &str = r#"
+kernel void attention_decode_2pass_1_q_dDHEAD_FMT(
+    device const float* q [[buffer(0)]],
+    device const uchar* keys [[buffer(1)]],
+    device const uchar* values [[buffer(2)]],
+    device float* partials [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    constant uint4& dims [[buffer(6)]],
+    device const float2* key_scales [[buffer(7)]],
+    device const float2* value_scales [[buffer(8)]],
+    uint3 tidtg [[thread_position_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]
+) {
+    constexpr uint BD = 32u;
+    constexpr uint D = DHEADu;
+    constexpr uint QK = D / BD;
+    constexpr uint G = 64u;
+    const uint q_heads = dims.x;
+    const uint kv_heads = dims.y;
+    const uint blocks = dims.w;
+    const uint gqa = q_heads / kv_heads;
+    const uint kv_head = tid.x;
+    const uint block_idx = tid.y;
+    const uint q_in_group = tidtg.y;
+    const uint row = tidtg.z;
+    const uint len = dims.z + row;
+    const uint q_head = kv_head * gqa + q_in_group;
+    if (q_head >= q_heads || block_idx >= blocks) { return; }
+    const uint slot = row * q_heads + q_head;
+    const uint kv_dim = kv_heads * D;
+    const uint groups = kv_dim / G;
+    const float scale = rsqrt(float(D));
+
+    float ql[QK];
+    {
+        const device float* q_ = q + slot * D + simd_lid * QK;
+        for (uint j = 0u; j < QK; ++j) { ql[j] = scale * q_[j]; }
+    }
+    const uint lane = kv_head * D + simd_lid * QK;
+    const device uchar* k_ = keys + (block_idx * kv_dim + lane) * K_BITSu / 8u;
+    const device uchar* v_ = values + (block_idx * kv_dim + lane) * V_BITSu / 8u;
+    const device float2* ks_ = key_scales + block_idx * groups + lane / G;
+    const device float2* vs_ = value_scales + block_idx * groups + lane / G;
+    const uint k_step = blocks * kv_dim * K_BITSu / 8u;
+    const uint v_step = blocks * kv_dim * V_BITSu / 8u;
+    const uint s_step = blocks * groups;
+
+    float o[QK];
+    for (uint j = 0u; j < QK; ++j) { o[j] = 0.0f; }
+    float max_score = -INFINITY;
+    float sum_exp = 0.0f;
+
+    for (uint i = block_idx; i < len; i += blocks) {
+        float k[QK];
+        kv_dequant_K_BITS(k_, *ks_, k);
+        float score = 0.0f;
+        for (uint j = 0u; j < QK; ++j) { score += ql[j] * k[j]; }
+        score = simd_sum(score);
+        const float new_max = max(max_score, score);
+        const float factor = fast::exp(max_score - new_max);
+        const float exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp = sum_exp * factor + exp_score;
+        float v[QK];
+        kv_dequant_V_BITS(v_, *vs_, v);
+        for (uint j = 0u; j < QK; ++j) { o[j] = o[j] * factor + exp_score * v[j]; }
+        k_ += k_step;
+        v_ += v_step;
+        ks_ += s_step;
+        vs_ += s_step;
+    }
+
+    if (simd_lid == 0u) {
+        sums[slot * blocks + block_idx] = sum_exp;
+        maxs[slot * blocks + block_idx] = max_score;
+    }
+    device float* out_ = partials + (slot * blocks + block_idx) * D + simd_lid * QK;
+    for (uint j = 0u; j < QK; ++j) { out_[j] = o[j]; }
+}
+"#;
+
+/// Formats quantifiés et suffixe de leur kernel d'attention.
+const KV_QUANT_FORMATS: [(KvFormat, &str); 3] = [
+    (KvFormat::Q8, "q8"),
+    (KvFormat::K8V4, "k8v4"),
+    (KvFormat::Q4, "q4"),
+];
+
+/// Déquantification des `qk` codes de `bits` bits d'une lane : lecture en mots
+/// alignés (`uint`, ou `ushort` pour 4 codes Q4), code `c` d'un mot au
+/// décalage `c·bits` (petit-boutiste : quartet bas = indice pair).
+fn dequant_lane_source(bits: usize, qk: usize) -> String {
+    let lane_bits = bits * qk;
+    let (word, word_bits) = if lane_bits % 32 == 0 {
+        ("uint", 32)
+    } else {
+        ("ushort", 16)
+    };
+    let words = lane_bits / word_bits;
+    let per_word = word_bits / bits;
+    let mask = (1_u32 << bits) - 1;
+    format!(
+        r"
+inline void kv_dequant_{bits}(const device uchar* p, const float2 sb, thread float* x) {{
+    const device {word}* w = (const device {word}*)p;
+    for (uint i = 0u; i < {words}u; ++i) {{
+        const uint bits_ = uint(w[i]);
+        for (uint c = 0u; c < {per_word}u; ++c) {{
+            x[i * {per_word}u + c] = fma(float((bits_ >> (c * {bits}u)) & {mask}u), sb.x, sb.y);
+        }}
+    }}
+}}
+"
+    )
+}
+
+/// Source des trois kernels d'attention quantifiée pour `head_dim`.
+fn attention_source(head_dim: usize) -> String {
+    let qk = head_dim / 32;
+    let mut source = String::from(
+        "#include <metal_stdlib>\n#include <metal_simdgroup>\nusing namespace metal;\n",
+    );
+    source.push_str(&dequant_lane_source(8, qk));
+    source.push_str(&dequant_lane_source(4, qk));
+    for (format, suffix) in KV_QUANT_FORMATS {
+        let bits = |encoding: KvEncoding| encoding.bits().unwrap_or(8).to_string();
+        source.push_str(
+            &KV_QUANT_ATTENTION_TEMPLATE
+                .replace("DHEAD", &head_dim.to_string())
+                .replace("FMT", suffix)
+                .replace("K_BITS", &bits(format.keys()))
+                .replace("V_BITS", &bits(format.values())),
+        );
+    }
+    source
+}
+
 /// Pipelines du KV quantifié, compilés au premier KV quantifié construit.
 #[derive(Debug)]
 pub(super) struct KvQuantKernels {
     quantize_q8: ComputePipelineState,
     quantize_q4: ComputePipelineState,
+    /// Passe 1 de l'attention par `(head_dim, format)`.
+    attention: Vec<((usize, KvFormat), ComputePipelineState)>,
 }
 
 impl DecodeResidentState {
@@ -337,15 +485,60 @@ impl DecodeResidentState {
                 "kernels de quantification KV incomplets".to_string(),
             ));
         };
+        let mut attention = Vec::new();
+        for head_dim in [128, 256] {
+            let names: Vec<String> = KV_QUANT_FORMATS
+                .iter()
+                .map(|(_, suffix)| format!("attention_decode_2pass_1_q_d{head_dim}_{suffix}"))
+                .collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            // Fast-math comme les kernels d'attention denses (`fast::exp` explicite).
+            let pipelines =
+                compile_kernels(&self.device, &attention_source(head_dim), &names, true)?;
+            for ((format, _), pipeline) in KV_QUANT_FORMATS.iter().zip(pipelines) {
+                attention.push(((head_dim, *format), pipeline));
+            }
+        }
         let kernels = KvQuantKernels {
             quantize_q8,
             quantize_q4,
+            attention,
         };
         Ok(self.kv_quant_kernels.get_or_init(|| kernels))
     }
 
+    /// Alloue les métadonnées d'un KV `format` de `cells` valeurs par tenseur.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le format est dense, si `head_dim` n'a pas de
+    /// kernel d'attention quantifiée, ou si la compilation échoue.
+    pub(super) fn kv_quant(
+        &self,
+        format: KvFormat,
+        head_dim: usize,
+        cells: usize,
+    ) -> Result<KvQuant> {
+        let attention = self
+            .kv_quant_kernels()?
+            .attention
+            .iter()
+            .find(|(key, _)| *key == (head_dim, format))
+            .map(|(_, pipeline)| pipeline.clone())
+            .ok_or_else(|| {
+                InferError::Config(format!(
+                    "KV {format:?}: head_dim={head_dim} non supporté (128 ou 256)"
+                ))
+            })?;
+        Ok(KvQuant {
+            keys: self.quant_tensor(format.keys(), cells)?,
+            values: self.quant_tensor(format.values(), cells)?,
+            attention,
+        })
+    }
+
     /// Alloue les échelles d'un tenseur quantifié de `cells` valeurs.
-    pub(super) fn quant_tensor(&self, encoding: KvEncoding, cells: usize) -> Result<QuantTensor> {
+    fn quant_tensor(&self, encoding: KvEncoding, cells: usize) -> Result<QuantTensor> {
         let kernels = self.kv_quant_kernels()?;
         let quantize = match encoding {
             KvEncoding::Q8 => kernels.quantize_q8.clone(),
@@ -372,6 +565,8 @@ impl DecodeResidentState {
 pub(super) struct KvQuant {
     pub(super) keys: QuantTensor,
     pub(super) values: QuantTensor,
+    /// Passe 1 de l'attention 2-passes pour ce format et ce `head_dim`.
+    pub(super) attention: ComputePipelineState,
 }
 
 /// Métadonnées d'UN tenseur K ou V quantifié : échelles `[capacity, kv_dim/64]`

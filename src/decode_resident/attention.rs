@@ -123,17 +123,9 @@ impl DecodeResidentState {
         let cells = capacity
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Config("capacité KV déborde".to_string()))?;
+        // Seule l'attention 2-passes d128/d256 lit le KV quantifié.
         let quant = if format.is_quantized() {
-            // Seule l'attention 2-passes d128/d256 lit le KV quantifié.
-            if !matches!(head_dim, 128 | 256) {
-                return Err(InferError::Config(format!(
-                    "KV {format:?}: head_dim={head_dim} non supporté (128 ou 256)"
-                )));
-            }
-            Some(KvQuant {
-                keys: self.quant_tensor(format.keys(), cells)?,
-                values: self.quant_tensor(format.values(), cells)?,
-            })
+            Some(self.kv_quant(format, head_dim, cells)?)
         } else {
             None
         };
@@ -862,10 +854,7 @@ impl FullAttentionMetalState {
         values_segments: &[KvSeedSegment<'_>],
     ) -> Result<()> {
         let kv_dim = self.kv_dim();
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        let encoder_guard = EncoderEndGuard::new(encoder);
-        let mut gpu_writes = false;
+        let mut gpu_segments = Vec::new();
         for (payload, tensor, segments) in [
             (&self.keys, &quant.keys, keys_segments),
             (&self.values, &quant.values, values_segments),
@@ -880,30 +869,39 @@ impl FullAttentionMetalState {
                 }
                 let rows = segment.len() / kv_dim;
                 match segment {
-                    KvSeedSegment::Shared(shared) => {
-                        if rows > 0 {
-                            tensor.encode_rows(
-                                encoder,
-                                payload,
-                                shared.buffer(),
-                                shared.byte_offset(),
-                                kv_dim,
-                                row,
-                                rows,
-                                kv_dim,
-                            )?;
-                            gpu_writes = true;
-                        }
+                    KvSeedSegment::Shared(shared) if rows > 0 => {
+                        gpu_segments.push((payload, tensor, *shared, row, rows));
                     }
+                    KvSeedSegment::Shared(_) => {}
                     KvSeedSegment::Cpu(data) => tensor.write_rows(payload, row, kv_dim, data)?,
                 }
                 row += rows;
             }
         }
-        encoder_guard.end();
-        if gpu_writes {
-            commit_and_wait(command_buffer)?;
+        // Command buffer créé seulement s'il sera commité : un buffer jamais
+        // commité reste compté par la file (64 au plus) faute de pool
+        // d'autorelease, et bloque `new_command_buffer` après quelques dizaines
+        // de semis.
+        if gpu_segments.is_empty() {
+            return Ok(());
         }
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        for (payload, tensor, shared, row, rows) in gpu_segments {
+            tensor.encode_rows(
+                encoder,
+                payload,
+                shared.buffer(),
+                shared.byte_offset(),
+                kv_dim,
+                row,
+                rows,
+                kv_dim,
+            )?;
+        }
+        encoder_guard.end();
+        commit_and_wait(command_buffer)?;
         Ok(())
     }
 
@@ -1144,6 +1142,24 @@ impl FullAttentionMetalState {
         sdpa_dims: U32x4Param<'_>,
         two_pass_dims: U32x4Param<'_>,
     ) -> Result<()> {
+        // KV quantifié : 2-passes quelle que soit la longueur, seul kernel qui
+        // le lit (aucune variante flash ni naïve). Les fenêtres glissantes sont
+        // exclues dès la construction (`full_attention_dense`).
+        if self.quant.is_some() {
+            if window_start != 0 {
+                return Err(InferError::Config(format!(
+                    "attention_decode KV {:?}: fenêtre glissante non supportée",
+                    self.format
+                )));
+            }
+            return self.encode_attention_decode_2pass(
+                encoder,
+                q_buf,
+                out_buf,
+                len_bound,
+                two_pass_dims,
+            );
+        }
         // Bascule 2-passes split-K pour les longs KV (dédup GQA + tuiles L1) :
         // head_dim 128/256, GQA réel (>1 q/kv), len ≥ seuil. Cf. encode_attention_decode_2pass.
         let gqa = self.q_heads / self.kv_heads.max(1);
@@ -1248,21 +1264,24 @@ impl FullAttentionMetalState {
         let kv_heads = to_u32(self.kv_heads, "2pass kv_heads")?;
         let blocks_u32 = to_u32(blocks, "2pass blocks")?;
         // Passe 1 : partiels par (kv_head, bloc).
-        let pass1 = match (self.keys.element(), self.head_dim) {
-            (GpuElement::F32, 256) => &self.attention_2pass_1,
-            (GpuElement::F32, 128) => &self.attention_2pass_1_d128,
-            (GpuElement::Bf16, 256) => &self.attention_2pass_1_bf16,
-            (GpuElement::Bf16, 128) => &self.attention_2pass_1_d128_bf16,
-            (GpuElement::F32 | GpuElement::Bf16, other) => {
-                return Err(InferError::Metal(format!(
-                    "attention_decode 2pass head_dim={other} non supporté"
-                )));
-            }
-            (element @ (GpuElement::U32 | GpuElement::U8), _) => {
-                return Err(InferError::Metal(format!(
-                    "attention_decode 2pass sur KV {element:?} invalide"
-                )));
-            }
+        let pass1 = match &self.quant {
+            Some(quant) => &quant.attention,
+            None => match (self.keys.element(), self.head_dim) {
+                (GpuElement::F32, 256) => &self.attention_2pass_1,
+                (GpuElement::F32, 128) => &self.attention_2pass_1_d128,
+                (GpuElement::Bf16, 256) => &self.attention_2pass_1_bf16,
+                (GpuElement::Bf16, 128) => &self.attention_2pass_1_d128_bf16,
+                (GpuElement::F32 | GpuElement::Bf16, other) => {
+                    return Err(InferError::Metal(format!(
+                        "attention_decode 2pass head_dim={other} non supporté"
+                    )));
+                }
+                (element @ (GpuElement::U32 | GpuElement::U8), _) => {
+                    return Err(InferError::Metal(format!(
+                        "attention_decode 2pass sur KV {element:?} invalide"
+                    )));
+                }
+            },
         };
         encoder.set_compute_pipeline_state(pass1);
         encoder.set_buffer(0, Some(q_buf), 0);
@@ -1272,6 +1291,10 @@ impl FullAttentionMetalState {
         encoder.set_buffer(4, Some(sums.tensor().buffer()), 0);
         encoder.set_buffer(5, Some(maxs.tensor().buffer()), 0);
         dims.bind(encoder, 6);
+        if let Some(quant) = &self.quant {
+            encoder.set_buffer(7, Some(quant.keys.scales().buffer()), 0);
+            encoder.set_buffer(8, Some(quant.values.scales().buffer()), 0);
+        }
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(u64::from(kv_heads), u64::from(blocks_u32), 1),

@@ -501,14 +501,13 @@ impl DecodeResidentState {
 }
 
 impl FullAttentionMetalState {
-    /// Le chemin en lignes couvre les KV f32/bf16 sous flash SDPA, `head_dim ≤ 256`
-    /// multiple de 32 (le 2-passes exige en plus `head_dim == 128` et une GQA réelle,
-    /// sinon le flash en lignes prend le relais quelle que soit la longueur).
+    /// Le chemin en lignes couvre les KV denses sous flash SDPA, `head_dim ≤ 256`
+    /// multiple de 32 (le 2-passes exige en plus `head_dim` 128/256 et une GQA
+    /// réelle, sinon le flash en lignes prend le relais quelle que soit la
+    /// longueur). Un KV quantifié (d128/d256 par construction) passe toujours
+    /// par le 2-passes en lignes, comme son chemin mono-ligne.
     pub(super) fn rows_fused_supported(&self) -> bool {
-        flash_sdpa_enabled()
-            && self.head_dim() <= 256
-            && self.head_dim() % 32 == 0
-            && matches!(self.format(), KvFormat::F32 | KvFormat::Bf16)
+        flash_sdpa_enabled() && self.head_dim() <= 256 && self.head_dim() % 32 == 0
     }
 
     /// Append des `rows` K puis V (lignes contiguës à partir de `len`) en deux
@@ -652,32 +651,37 @@ impl FullAttentionMetalState {
         let element = self.keys().element();
         let q_dim = q_heads * head_dim;
         // Même choix flash/2-passes que `encode_attention_decode_dims`, évalué sur la
-        // longueur de la DERNIÈRE ligne du chunk.
+        // longueur de la DERNIÈRE ligne du chunk (toujours 2-passes si quantifié).
+        let quant = self.quant();
         let two_pass_for = |length: usize| {
-            sdpa_2pass_enabled()
-                && flash_sdpa_enabled()
-                && matches!(head_dim, 128 | 256)
-                && gqa > 1
-                && q_heads % kv_heads == 0
-                && length >= sdpa_2pass_min_len()
+            quant.is_some()
+                || sdpa_2pass_enabled()
+                    && flash_sdpa_enabled()
+                    && matches!(head_dim, 128 | 256)
+                    && gqa > 1
+                    && q_heads % kv_heads == 0
+                    && length >= sdpa_2pass_min_len()
         };
+        // `None` pour un KV quantifié : `two_pass_for` exclut alors le flash.
         let flash = match (element, head_dim == 256) {
-            (GpuElement::F32, true) => &kernels.flash_rows_d256,
-            (GpuElement::F32, false) => &kernels.flash_rows,
-            (GpuElement::Bf16, true) => &kernels.flash_rows_d256_bf16,
-            (GpuElement::Bf16, false) => &kernels.flash_rows_bf16,
+            (GpuElement::F32, true) => Some(&kernels.flash_rows_d256),
+            (GpuElement::F32, false) => Some(&kernels.flash_rows),
+            (GpuElement::Bf16, true) => Some(&kernels.flash_rows_d256_bf16),
+            (GpuElement::Bf16, false) => Some(&kernels.flash_rows_bf16),
+            (GpuElement::U8, _) if quant.is_some() => None,
             (GpuElement::U32 | GpuElement::U8, _) => {
                 return Err(InferError::Metal(format!(
                     "attention rows sur KV {element:?} invalide"
                 )));
             }
         };
-        let pass1 = match (element, head_dim) {
-            (GpuElement::F32, 128) => &kernels.two_pass_rows_d128,
-            (GpuElement::F32, _) => &kernels.two_pass_rows_d256,
-            (GpuElement::Bf16, 128) => &kernels.two_pass_rows_d128_bf16,
-            (GpuElement::Bf16, _) => &kernels.two_pass_rows_d256_bf16,
-            (GpuElement::U32 | GpuElement::U8, _) => {
+        let pass1 = match (quant, element, head_dim) {
+            (Some(quant), _, _) => &quant.attention,
+            (None, GpuElement::F32, 128) => &kernels.two_pass_rows_d128,
+            (None, GpuElement::F32, _) => &kernels.two_pass_rows_d256,
+            (None, GpuElement::Bf16, 128) => &kernels.two_pass_rows_d128_bf16,
+            (None, GpuElement::Bf16, _) => &kernels.two_pass_rows_d256_bf16,
+            (None, GpuElement::U32 | GpuElement::U8, _) => {
                 return Err(InferError::Metal(format!(
                     "attention rows 2pass sur KV {element:?} invalide"
                 )));
@@ -713,6 +717,9 @@ impl FullAttentionMetalState {
             let chunk_len0 = len0 + start;
             let row_offset = byte_offset(start * q_dim, GpuElement::F32, "attention rows offset")?;
             if !two_pass_for(chunk_len0 + chunk - 1) {
+                let flash = flash.ok_or_else(|| {
+                    InferError::Metal("attention rows: flash sur KV quantifié".to_string())
+                })?;
                 let dims = [
                     to_u32(q_heads, "attention rows q_heads")?,
                     kv_heads_u32,
@@ -762,6 +769,10 @@ impl FullAttentionMetalState {
             encoder.set_buffer(4, Some(sums.tensor().buffer()), 0);
             encoder.set_buffer(5, Some(maxs.tensor().buffer()), 0);
             set_bytes(encoder, 6, &dims);
+            if let Some(quant) = quant {
+                encoder.set_buffer(7, Some(quant.keys.scales().buffer()), 0);
+                encoder.set_buffer(8, Some(quant.values.scales().buffer()), 0);
+            }
             crate::metal_backend::profile_dispatch();
             encoder.dispatch_thread_groups(
                 MTLSize::new(u64::from(kv_heads_u32), u64::from(blocks_u32), 1),

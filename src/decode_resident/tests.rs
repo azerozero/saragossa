@@ -2468,7 +2468,7 @@ fn run_rows_fused_case(
     prefix: usize,
     capacity: usize,
     head_dim: usize,
-    bf16: bool,
+    format: KvFormat,
     max_rows_per_group: Option<usize>,
 ) -> Result<()> {
     use super::gpu_position::rope_dims_param;
@@ -2479,11 +2479,8 @@ fn run_rows_fused_case(
     let keys: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 3)).collect();
     let values: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 11)).collect();
     let make_kv = || -> Result<FullAttentionMetalState> {
-        let mut kv = if bf16 {
-            state.full_attention_bf16_for_test(capacity, POS_Q, POS_KV, head_dim)?
-        } else {
-            state.full_attention_f32_for_test(capacity, POS_Q, POS_KV, head_dim)?
-        };
+        let mut kv =
+            state.full_attention_format_for_test(capacity, POS_Q, POS_KV, head_dim, format)?;
         kv.seed(&keys, &values, prefix)?;
         Ok(kv)
     };
@@ -2653,9 +2650,16 @@ fn run_rows_fused_case(
             0.0,
         );
     }
+    if format.is_quantized() {
+        assert!(
+            kv_quant_bytes(&kv_fused)? == kv_quant_bytes(&kv_loop)?,
+            "{format:?}: KV en lignes ≠ boucle"
+        );
+        return Ok(());
+    }
     let cells = (prefix + ROWS) * kv_dim;
     let read_kv = |tensor: &GpuTensor| {
-        if bf16 {
+        if format == KvFormat::Bf16 {
             read_bf16_as_f32(tensor)
         } else {
             read_f32(tensor)
@@ -2674,17 +2678,28 @@ fn full_attn_rows_fused_matches_row_loop() -> Result<()> {
     let state = try_state()?.ok_or_else(|| {
         InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
     })?;
-    for (head_dim, bf16) in [(128, false), (128, true), (256, false), (256, true)] {
-        // Flash en lignes (len courte), puis 2-passes en lignes (len ≥ 2048) en un
-        // chunk et en chunks d'une ligne.
-        run_rows_fused_case(&state, 5, 16, head_dim, bf16, None)?;
-        run_rows_fused_case(&state, 2050, 2060, head_dim, bf16, None)?;
-        run_rows_fused_case(&state, 2050, 2060, head_dim, bf16, Some(1))?;
+    let formats = [
+        KvFormat::F32,
+        KvFormat::Bf16,
+        KvFormat::Q8,
+        KvFormat::K8V4,
+        KvFormat::Q4,
+    ];
+    for head_dim in [128, 256] {
+        for format in formats {
+            // Flash en lignes (len courte, 2-passes si quantifié), puis 2-passes en
+            // lignes (len ≥ 2048) en un chunk et en chunks d'une ligne.
+            run_rows_fused_case(&state, 5, 16, head_dim, format, None)?;
+            run_rows_fused_case(&state, 2050, 2060, head_dim, format, None)?;
+            run_rows_fused_case(&state, 2050, 2060, head_dim, format, Some(1))?;
+        }
     }
     // Frontières de partition chevauchées par les 3 lignes : seuil flash/2-passes
     // (lignes 2047, 2048, 2049) et nombre de blocs split-K (4222 → 32, 4224 → 64).
-    run_rows_fused_case(&state, 2046, 2052, 128, false, None)?;
-    run_rows_fused_case(&state, 4221, 4226, 256, false, None)?;
+    run_rows_fused_case(&state, 2046, 2052, 128, KvFormat::F32, None)?;
+    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::F32, None)?;
+    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::Q4, None)?;
+    run_rows_fused_case(&state, 4221, 4226, 128, KvFormat::K8V4, None)?;
     // Capacité insuffisante : erreur AVANT tout encodage, `len` inchangé.
     let kernels = state.rows_kernels()?;
     let mut kv = state.full_attention_f32_for_test(4, POS_Q, POS_KV, 128)?;
@@ -3062,9 +3077,15 @@ fn kv_seed_from_shared_view_matches_cpu_bytes() -> Result<()> {
 fn kv_quant_value(i: usize) -> f32 {
     let group = i / 64;
     if group % 7 == 3 {
-        return 2.5 - group as f32 * 0.01;
+        return 2.5 - (group % 11) as f32 * 0.3;
     }
-    (i as f32 * 0.3711).sin() * (1.0 + (group % 5) as f32 * 3.0) + (group % 3) as f32 * 0.7
+    // Hachage (splitmix) plutôt qu'un sinus : des lignes périodiques
+    // produiraient des quasi-égalités de scores qui faussent la perte mesurée.
+    let mut x = (i as u64) ^ 0x9e37_79b9_7f4a_7c15;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 31;
+    let unit = (x % 65_536) as f32 / 65_536.0 - 0.5;
+    unit * (1.0 + (group % 5) as f32 * 3.0) + (group % 3) as f32 * 0.7
 }
 
 #[allow(
@@ -3268,5 +3289,94 @@ fn kv_quant_gpu_writes_match_cpu_bytes() -> Result<()> {
     assert!(state
         .full_attention_format_for_test(4, 8, 2, 64, KvFormat::Q8)
         .is_err());
+    Ok(())
+}
+
+/// Déquantifie sur le CPU (oracle `kv_quant`) des lignes f32 encodées `encoding`.
+fn kv_quant_oracle(
+    encoding: super::kv_quant::KvEncoding,
+    kv_dim: usize,
+    values: &[f32],
+) -> Result<Vec<f32>> {
+    let mut payload = vec![0_u8; encoding.payload_len(values.len()).unwrap_or(0)];
+    let mut scales = vec![0.0_f32; values.len() / 64 * 2];
+    super::kv_quant::quantize_rows(encoding, kv_dim, values, &mut payload, &mut scales)?;
+    let mut out = vec![0.0_f32; values.len()];
+    super::kv_quant::dequantize_rows(encoding, kv_dim, &payload, &scales, &mut out)?;
+    Ok(out)
+}
+
+fn max_mean_abs(actual: &[f32], expected: &[f32]) -> (f32, f32) {
+    let max = actual
+        .iter()
+        .zip(expected)
+        .fold(0.0_f32, |acc, (a, b)| acc.max((a - b).abs()));
+    let sum: f32 = actual
+        .iter()
+        .zip(expected)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    (max, sum / actual.len().max(1) as f32)
+}
+
+/// Attention 2-passes sur KV quantifié (q16/kv2) contre `cpu_attention` sur le
+/// KV déquantifié par l'oracle CPU (mêmes valeurs que lit le GPU) : seul
+/// l'ordre de réduction et l'exponentielle fast-math diffèrent. L'écart à
+/// l'attention exacte sur le KV f32 d'origine mesure la perte de
+/// quantification ; il est affiché (`--nocapture`) et borné large.
+fn run_attention_case_quant(len: usize, head_dim: usize, format: KvFormat) -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads) = (16, 2);
+    let kv_dim = kv_heads * head_dim;
+    let mut kv = state.full_attention_format_for_test(len, q_heads, kv_heads, head_dim, format)?;
+    let keys: Vec<f32> = (0..len * kv_dim).map(kv_quant_value).collect();
+    let values: Vec<f32> = (0..len * kv_dim).map(|i| kv_quant_value(i + 7)).collect();
+    kv.seed(&keys, &values, len)?;
+    let q: Vec<f32> = (0..q_heads * head_dim)
+        .map(|i| 2.0 * pseudo(i + 99))
+        .collect();
+    let gpu = kv.attention_decode(&q)?;
+    let keys_deq = kv_quant_oracle(format.keys(), kv_dim, &keys)?;
+    let values_deq = kv_quant_oracle(format.values(), kv_dim, &values)?;
+    let cpu_deq = cpu_attention(&q, &keys_deq, &values_deq, q_heads, kv_heads, head_dim, len);
+    let cpu_f32 = cpu_attention(&q, &keys, &values, q_heads, kv_heads, head_dim, len);
+    let (max_deq, mean_deq) = max_mean_abs(&gpu, &cpu_deq);
+    let (max_f32, mean_f32) = max_mean_abs(&gpu, &cpu_f32);
+    eprintln!(
+        "attention {format:?} d{head_dim} len={len}: vs oracle déquantifié max={max_deq:e} \
+         moy={mean_deq:e} ; vs f32 exact max={max_f32:e} moy={mean_f32:e}"
+    );
+    // Mesuré (Apple GPU) : max 1,3e-5, moyenne 2,7e-6 à len=33000, 0 à len=1.
+    // Bornes ×8 au-dessus, quatre ordres sous un défaut de lecture des codes ou
+    // des échelles (valeurs jusqu'à ±7).
+    assert!(
+        max_deq <= 1.0e-4 && mean_deq <= 2.0e-5,
+        "{format:?} d{head_dim} len={len}: GPU vs oracle déquantifié max={max_deq:e} moy={mean_deq:e}"
+    );
+    // Perte de quantification mesurée : Q8 ≤ 2,5e-2, V en Q4 ≤ 0,43 (len=1,
+    // où la sortie est une ligne de V sans moyenne ; demi-pas Q4 ≈ 0,43 ici).
+    let bound = if format.values() == super::kv_quant::KvEncoding::Q4 {
+        0.6
+    } else {
+        0.05
+    };
+    assert!(
+        max_f32 <= bound,
+        "{format:?} d{head_dim} len={len}: perte de quantification max={max_f32:e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn attention_decode_quant_matches_dequantized_oracle() -> Result<()> {
+    for format in [KvFormat::Q8, KvFormat::K8V4, KvFormat::Q4] {
+        for head_dim in [128, 256] {
+            for len in [1, 64, 4096, 33000] {
+                run_attention_case_quant(len, head_dim, format)?;
+            }
+        }
+    }
     Ok(())
 }
