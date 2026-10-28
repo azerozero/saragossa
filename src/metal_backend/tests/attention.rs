@@ -1669,13 +1669,17 @@ fn nax_d256_chunk_microbench() -> Result<()> {
     // Forme du 27B : 24 têtes Q, 4 KV, d256, morceaux de 4096.
     const SEQ: usize = 4096;
     const Q_HEADS: usize = 24;
-    const KV_HEADS: usize = 4;
     const HEAD_DIM: usize = 256;
+    // `SARAGOSSA_TEST_NAX_KV_HEADS=24` : une tête KV par tête Q (six fois plus
+    // de K/V distinct, même calcul) pour départager mémoire et calcul.
+    let kv_heads: usize = crate::runtime_flags::env_var("SARAGOSSA_TEST_NAX_KV_HEADS")
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(4);
     let spec = PrefillAttentionSpec {
         seq: SEQ,
         hidden_dim: 5120,
         q_heads: Q_HEADS,
-        kv_heads: KV_HEADS,
+        kv_heads,
         head_dim: HEAD_DIM,
         rope_dims: 64,
         rope_frequency_dim: HEAD_DIM,
@@ -1686,7 +1690,7 @@ fn nax_d256_chunk_microbench() -> Result<()> {
         value_norm: false,
         eps: 1.0e-6,
     };
-    let kv_dim = KV_HEADS * HEAD_DIM;
+    let kv_dim = kv_heads * HEAD_DIM;
     for kv_rows in [16 * 1024, 64 * 1024, 256 * 1024] {
         let q: Vec<f32> = (0..SEQ * Q_HEADS * HEAD_DIM)
             .map(|i| ((i % 23) as f32 - 11.0) * 0.01)
@@ -1730,7 +1734,7 @@ fn nax_d256_chunk_microbench() -> Result<()> {
                 best = best.min(t.elapsed().as_secs_f64());
             }
             eprintln!(
-                "[nax d256] kv={kv_rows} q={SEQ} {label} : {:.1} ms, {:.1} TFLOP/s",
+                "[nax d256] kv_heads={kv_heads} kv={kv_rows} q={SEQ} {label} : {:.1} ms, {:.1} TFLOP/s",
                 best * 1.0e3,
                 flops / best / 1.0e12
             );

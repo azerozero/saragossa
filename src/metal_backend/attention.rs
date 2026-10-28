@@ -146,7 +146,10 @@ pub(super) fn prefill_attn_steel_d256_supported(spec: PrefillAttentionSpec) -> b
 
 /// Têtes et dimension couvertes par le Steel/NAX d256, quel que soit `seq`.
 fn prefill_attn_steel_d256_shape_supported(spec: PrefillAttentionSpec) -> bool {
-    matches!((spec.q_heads, spec.kv_heads), (16, 2) | (24, 4))
+    // NOTE: (24, 24) seulement sous test : le microbench y compare K/V partagé
+    // par six têtes Q et six copies distinctes, à calcul égal.
+    (matches!((spec.q_heads, spec.kv_heads), (16, 2) | (24, 4))
+        || (cfg!(test) && (spec.q_heads, spec.kv_heads) == (24, 24)))
         && spec.head_dim == STEEL_CAUSAL_ATTN_D256_BD
 }
 
