@@ -1492,7 +1492,8 @@ fn run_attention_case_bf16_with_dims(
 }
 
 /// Microbench AUTONOME du kernel `attention_decode` (SDPA résident decode) aux
-/// dimensions réelles 35B full-attn (q16/kv2/hd256), à plusieurs longueurs de KV,
+/// dimensions réelles 35B full-attn (q16/kv2/hd256) puis 27B (q24/kv4/hd256),
+/// pour chaque format de KV, à plusieurs longueurs de KV,
 /// SANS prefill (KV synthétique seedé) → itération en secondes, pas 34 min.
 /// Mesure ms/appel et **GB/s effectif** (octets K+V UNIQUES lus une fois ;
 /// le déficit GQA gonfle le trafic réel mais on veut la lecture unique).
@@ -1506,35 +1507,58 @@ fn attention_decode_bench() -> Result<()> {
     let Some(state) = try_state()? else {
         return Ok(());
     };
-    let (q_heads, kv_heads, head_dim) = (16usize, 2usize, 256usize);
-    let kv_dim = kv_heads * head_dim;
-    let q_dim = q_heads * head_dim;
-    let q_data: Vec<f32> = (0..q_dim)
-        .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
-        .collect();
     let iters: usize = crate::runtime_flags::env_var("SARAGOSSA_RUST_BENCH_SDPA_ITERS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
-    for &len in &[1024usize, 4096, 16384, 32768] {
-        let mut kv = state.full_attention(len, q_heads, kv_heads, head_dim, false)?;
-        let keys: Vec<f32> = (0..len * kv_dim)
-            .map(|i| ((i % 101) as f32 - 50.0) * 0.01)
+    let shapes = [
+        (16usize, 2usize, 256usize, [1024usize, 4096, 16384, 32768]),
+        (24, 4, 256, [32768, 65536, 131_072, 262_144]),
+    ];
+    for (q_heads, kv_heads, head_dim, lens) in shapes {
+        let kv_dim = kv_heads * head_dim;
+        let q_data: Vec<f32> = (0..q_heads * head_dim)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
             .collect();
-        let values: Vec<f32> = (0..len * kv_dim)
-            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
-            .collect();
-        kv.seed(&keys, &values, len)?;
-        for _ in 0..5 {
-            let _ = kv.attention_decode(&q_data)?;
+        for len in lens {
+            let keys: Vec<f32> = (0..len * kv_dim)
+                .map(|i| ((i % 101) as f32 - 50.0) * 0.01)
+                .collect();
+            let values: Vec<f32> = (0..len * kv_dim)
+                .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+                .collect();
+            for format in [
+                KvFormat::F32,
+                KvFormat::Bf16,
+                KvFormat::Q8,
+                KvFormat::K8V4,
+                KvFormat::Q4,
+            ] {
+                let mut kv = state
+                    .full_attention_format_for_test(len, q_heads, kv_heads, head_dim, format)?;
+                kv.seed(&keys, &values, len)?;
+                for _ in 0..5 {
+                    let _ = kv.attention_decode(&q_data)?;
+                }
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    let _ = kv.attention_decode(&q_data)?;
+                }
+                let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+                // Bits K+V stockés par valeur, échelles (64 bits pour 64 valeurs) comprises.
+                let bits = |encoding: super::kv_quant::KvEncoding| match encoding.bits() {
+                    Some(bits) => bits + 1,
+                    None if format == KvFormat::F32 => 32,
+                    None => 16,
+                };
+                let bytes =
+                    ((bits(format.keys()) + bits(format.values())) * len * kv_dim) as f64 / 8.0;
+                let gbps = bytes / (ms / 1000.0) / 1.0e9;
+                eprintln!(
+                    "bench_sdpa q{q_heads}/kv{kv_heads} {format:?} len={len} \
+                     ms_per_call={ms:.4} gbps_effective={gbps:.1}"
+                );
+            }
         }
-        let start = std::time::Instant::now();
-        for _ in 0..iters {
-            let _ = kv.attention_decode(&q_data)?;
-        }
-        let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-        let bytes = (len * kv_dim * 4 * 2) as f64;
-        let gbps = bytes / (ms / 1000.0) / 1.0e9;
-        eprintln!("bench_sdpa len={len} ms_per_call={ms:.4} gbps_effective={gbps:.1}");
     }
     Ok(())
 }
