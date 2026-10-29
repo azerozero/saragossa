@@ -732,9 +732,14 @@ pub(crate) struct PrefillResidentPrefix<'a> {
 
 pub(crate) enum PrefillResidentPrefixLayer<'a> {
     /// Lignes K et V du préfixe, en segments contigus mis bout à bout.
+    /// `in_place` : buffers K et V qui portent déjà tout le préfixe depuis
+    /// leur début (vue partagée d'un prefill à froid) ; s'ils ont la place
+    /// des lignes nouvelles, le prolongement y écrit à la suite au lieu de
+    /// recopier le préfixe dans un buffer neuf.
     Full {
         key: Vec<&'a [f32]>,
         value: Vec<&'a [f32]>,
+        in_place: Option<[metal::Buffer; 2]>,
     },
     Linear {
         state: &'a LinearAttentionMetalState,

@@ -124,6 +124,20 @@ impl KvRows {
         self.segments.push(Arc::new(Segment::Owned(data)));
     }
 
+    /// Buffer GPU dont une seule vue porte toutes les lignes depuis son début
+    /// (K ou V d'un prefill à froid) : un prolongement peut y écrire à la
+    /// suite, cf. `PrefillResidentPrefixLayer::Full::in_place`.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn sole_shared_buffer(&self) -> Option<metal::Buffer> {
+        match self.segments.as_slice() {
+            [segment] => match segment.as_ref() {
+                Segment::Shared(rows) if rows.byte_offset() == 0 => Some(rows.buffer().to_owned()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Ajoute le K ou V d'un prefill résident, vue GPU comprise, sans copie.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn push_prefill(&mut self, rows: crate::metal_backend::PrefillKvRows) {

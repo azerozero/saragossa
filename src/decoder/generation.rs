@@ -3540,6 +3540,11 @@ impl CausalDecoder {
                     crate::metal_backend::PrefillResidentPrefixLayer::Full {
                         key: layer_cache.keys.segments().collect(),
                         value: layer_cache.values.segments().collect(),
+                        in_place: layer_cache
+                            .keys
+                            .sole_shared_buffer()
+                            .zip(layer_cache.values.sole_shared_buffer())
+                            .map(|(key, value)| [key, value]),
                     }
                 }
                 crate::metal_backend::PrefillAttentionLayer::Linear { .. } => {

@@ -20,6 +20,89 @@ pub(super) struct ResidentPrefillChunk {
     pub(super) total: usize,
 }
 
+/// Lignes K/V réservées au-delà d'un prefill à froid : la queue d'un prompt
+/// servi (moins d'un bloc du cache de préfixe serve, 256 par défaut) s'y
+/// prolonge en place. Sans elle, le prolongement recopiait tout le KV f32 du
+/// préfixe dans un buffer neuf : +30 Go transitoires à 256k sur le 27B.
+// ponytail: réserve fixe, ~34 Mo sur le 27B ; une queue plus longue (bloc
+// serve agrandi, prolongement sur plusieurs blocs) retombe sur la copie.
+const PREFILL_KV_RESERVE_ROWS: usize = 256;
+
+/// `segments` est-il exactement une vue de `buffer` depuis son début ?
+fn is_sole_view_of(segments: &[&[f32]], buffer: &BufferRef) -> bool {
+    matches!(segments, [segment] if segment.as_ptr() == buffer.contents().cast::<f32>().cast_const())
+}
+
+/// Buffers K/V d'un préfixe de `start` lignes réutilisables pour un
+/// prolongement jusqu'à `seq` lignes : ils portent le préfixe depuis leur
+/// début (vérifié sur les pointeurs), ont la place des lignes nouvelles et
+/// sont ceux d'un prefill à froid d'exactement `start` lignes. Aucune vue ne
+/// couvre alors les lignes réservées (un prolongement les relit dans un `Vec`)
+/// : un état tronqué sous une vue encore vivante ne passe pas par ici. Deux
+/// clones d'un même état prolongés en même temps se disputeraient la réserve
+/// (l'un l'écraserait pendant la relecture de l'autre) : le premier la
+/// réserve dans `claims` jusqu'à la fin du prefill, le second recopie.
+fn prefix_kv_in_place(
+    in_place: Option<&[Buffer; 2]>,
+    key: &[&[f32]],
+    value: &[&[f32]],
+    (start, seq): (usize, usize),
+    kv_dim: usize,
+    claims: &mut Vec<InPlaceClaim>,
+) -> Result<Option<[Buffer; 2]>> {
+    let Some([key_buffer, value_buffer]) = in_place else {
+        return Ok(None);
+    };
+    if seq > start.saturating_add(PREFILL_KV_RESERVE_ROWS) {
+        return Ok(None);
+    }
+    let reserved = byte_len::<f32>(checked_len(
+        start + PREFILL_KV_RESERVE_ROWS,
+        kv_dim,
+        "prolongement en place",
+    )?)?;
+    let fits = |buffer: &Buffer| buffer.length() == reserved;
+    if !(fits(key_buffer)
+        && fits(value_buffer)
+        && is_sole_view_of(key, key_buffer)
+        && is_sole_view_of(value, value_buffer))
+    {
+        return Ok(None);
+    }
+    let Some(claim) = InPlaceClaim::try_new([key_buffer, value_buffer]) else {
+        return Ok(None);
+    };
+    claims.push(claim);
+    Ok(Some([key_buffer.clone(), value_buffer.clone()]))
+}
+
+/// Allocations K/V dont la réserve est en cours d'écriture par un
+/// prolongement en place, tous executors confondus.
+static IN_PLACE_ALLOCATIONS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Droit exclusif d'écrire la réserve de K et V, rendu au drop.
+struct InPlaceClaim([usize; 2]);
+
+impl InPlaceClaim {
+    fn try_new(buffers: [&Buffer; 2]) -> Option<Self> {
+        let ids = buffers.map(|buffer| buffer.contents().addr());
+        let mut claimed = IN_PLACE_ALLOCATIONS.lock().ok()?;
+        if ids.iter().any(|id| claimed.contains(id)) {
+            return None;
+        }
+        claimed.extend(ids);
+        Some(Self(ids))
+    }
+}
+
+impl Drop for InPlaceClaim {
+    fn drop(&mut self) {
+        if let Ok(mut claimed) = IN_PLACE_ALLOCATIONS.lock() {
+            claimed.retain(|id| !self.0.contains(id));
+        }
+    }
+}
+
 /// Entrée du prefill une fois sur le GPU : flux plongé complet, ou ids et
 /// table pour plonger chaque morceau.
 enum ResidentPrefillSource {
@@ -220,6 +303,8 @@ impl MetalExecutor {
             && (chunk_count > 1 || start > 0)
             && self.causal_attention_prefill_steel_nax_d256.is_some();
         let mut layer_cache_buffers = Vec::with_capacity(layers.len());
+        // Tenus jusqu'à la relecture des lignes nouvelles, en fin de fonction.
+        let mut in_place_claims = Vec::new();
         for (layer_index, layer) in layers.iter().enumerate() {
             let (_, kv_dim, layer_shape) =
                 self.resident_prefill_layer_shape(layer, layer_index, spec, hidden_dim)?;
@@ -231,15 +316,35 @@ impl MetalExecutor {
                 ) => PrefillResidentLayerCacheBuffer::Linear {
                     state: (*state).clone(),
                 },
-                (None, _)
-                | (
-                    Some(PrefillResidentPrefixLayer::Full { .. }),
+                (None, _) => self.allocate_prefill_resident_layer_cache(
+                    &layer_shape,
+                    // Réserve pour la queue d'un prompt servi, prolongée en
+                    // place (cf. `prefix_kv_in_place`).
+                    spec.seq.saturating_add(PREFILL_KV_RESERVE_ROWS),
+                    kv_dim,
+                    bf16_mirror,
+                    None,
+                )?,
+                (
+                    Some(PrefillResidentPrefixLayer::Full {
+                        key,
+                        value,
+                        in_place,
+                    }),
                     PrefillResidentAttentionShape::Full { .. },
                 ) => self.allocate_prefill_resident_layer_cache(
                     &layer_shape,
                     spec.seq,
                     kv_dim,
                     bf16_mirror,
+                    prefix_kv_in_place(
+                        in_place.as_ref(),
+                        key,
+                        value,
+                        (start, spec.seq),
+                        kv_dim,
+                        &mut in_place_claims,
+                    )?,
                 )?,
                 _ => {
                     return Err(InferError::Config(format!(
@@ -248,7 +353,7 @@ impl MetalExecutor {
                 }
             };
             if let (
-                Some(PrefillResidentPrefixLayer::Full { key, value }),
+                Some(PrefillResidentPrefixLayer::Full { key, value, .. }),
                 PrefillResidentLayerCacheBuffer::Full {
                     key: key_cache,
                     value: value_cache,
@@ -265,6 +370,10 @@ impl MetalExecutor {
                     )));
                 }
                 for (buffer, segments) in [(key_cache, key), (value_cache, value)] {
+                    // Prolongement en place : le préfixe est déjà au début.
+                    if is_sole_view_of(segments, buffer) {
+                        continue;
+                    }
                     let mut offset = 0;
                     for segment in segments {
                         write_f32_buffer_at(buffer, offset, segment)?;
@@ -1205,12 +1314,34 @@ fn shared_kv_rows(
     kv_len: usize,
 ) -> Result<(PrefillKvRows, PrefillKvRows)> {
     // SAFETY: buffers `uncached_f32_buffer` propres à ce prefill, hors scratch :
-    // son command buffer est terminé et l'appelant les cède ici, plus rien ne
-    // les écrit ensuite.
+    // son command buffer est terminé et l'appelant les cède ici. Seules les
+    // lignes réservées au-delà de `kv_len` seront encore écrites (prolongement
+    // en place, `prefix_kv_in_place`), hors de la vue.
     unsafe {
         Ok((
             PrefillKvRows::Shared(SharedF32Rows::new(key, 0, kv_len)?),
             PrefillKvRows::Shared(SharedF32Rows::new(value, 0, kv_len)?),
         ))
+    }
+}
+
+#[cfg(test)]
+mod in_place_claim_tests {
+    use super::*;
+
+    #[test]
+    fn in_place_claim_is_exclusive_until_dropped() -> Result<()> {
+        let Some(device) = metal::Device::system_default() else {
+            return Ok(());
+        };
+        let new = || device.new_buffer(64, MTLResourceOptions::StorageModeShared);
+        let (key, value, other) = (new(), new(), new());
+        let first = InPlaceClaim::try_new([&key, &value]);
+        assert!(first.is_some());
+        // Un autre détenteur de la même allocation recopie.
+        assert!(InPlaceClaim::try_new([&key, &other]).is_none());
+        drop(first);
+        assert!(InPlaceClaim::try_new([&key, &value]).is_some());
+        Ok(())
     }
 }

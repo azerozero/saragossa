@@ -1242,6 +1242,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                             PrefillResidentPrefixLayer::Full {
                                 key: vec![key.data()],
                                 value: vec![value.data()],
+                                in_place: None,
                             }
                         }
                         PrefillResidentLayerCache::Linear { state } => {
@@ -1445,8 +1446,11 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             ..spec
         };
         // L'état linéaire du préfixe avance en place : un préfixe frais par run.
-        let mut runs = Vec::with_capacity(2);
-        for mirror in [false, true] {
+        // Troisième run : prolongement dans les buffers du préfixe (réserve de
+        // 256 lignes), suffixe de 5 lignes seulement ; 400 lignes retombent
+        // sur la copie.
+        let mut runs = Vec::with_capacity(3);
+        for (mirror, in_place) in [(false, false), (true, false), (false, true)] {
             executor.prefill_kv_bf16_mirror = mirror;
             let (_, prefix_caches) = executor.qwen_moe_prefill_resident(
                 &rows_of(&input, 0, prefix_rows, HIDDEN)?,
@@ -1462,6 +1466,14 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                             PrefillResidentPrefixLayer::Full {
                                 key: vec![key.data()],
                                 value: vec![value.data()],
+                                in_place: match (in_place, key, value) {
+                                    (
+                                        true,
+                                        PrefillKvRows::Shared(key),
+                                        PrefillKvRows::Shared(value),
+                                    ) => Some([key.buffer().to_owned(), value.buffer().to_owned()]),
+                                    _ => None,
+                                },
                             }
                         }
                         PrefillResidentLayerCache::Linear { state } => {
@@ -1470,6 +1482,13 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     })
                     .collect(),
             };
+            let prefix_key_before = prefix_caches
+                .iter()
+                .find_map(|cache| match cache {
+                    PrefillResidentLayerCache::Full { key, .. } => Some(key.data().to_vec()),
+                    PrefillResidentLayerCache::Linear { .. } => None,
+                })
+                .unwrap_or_default();
             let (extended, extended_caches, _) = executor.qwen_moe_prefill_resident_from(
                 PrefillInput::Hidden(&rows_of(&input, prefix_rows, SEQ, HIDDEN)?),
                 &layers,
@@ -1479,11 +1498,53 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 Some(&prefix),
                 false,
             )?;
+            if in_place
+                && prefix_rows + 256 >= SEQ
+                && crate::runtime_flags::prefill_kv_shared_enabled()
+            {
+                // Les lignes nouvelles sont bien écrites à la suite du préfixe.
+                let mut checked = 0;
+                for (prefix_cache, extended_cache) in prefix_caches.iter().zip(&extended_caches) {
+                    if let (
+                        PrefillResidentLayerCache::Full {
+                            key: PrefillKvRows::Shared(key),
+                            kv_dim,
+                            ..
+                        },
+                        PrefillResidentLayerCache::Full {
+                            key: extended_key, ..
+                        },
+                    ) = (prefix_cache, extended_cache)
+                    {
+                        let written =
+                            crate::metal_backend::read_f32_buffer(key.buffer(), SEQ * kv_dim)?;
+                        assert_eq!(
+                            &written[prefix_rows * kv_dim..],
+                            extended_key.data(),
+                            "prolongement en place"
+                        );
+                        assert_eq!(
+                            &written[..prefix_rows * kv_dim],
+                            prefix_key_before.as_slice(),
+                            "préfixe intact après prolongement en place"
+                        );
+                        checked += 1;
+                    }
+                }
+                assert_eq!(checked, 1, "prolongement en place non emprunté");
+            }
             runs.push((extended.into_tensor(HIDDEN)?, extended_caches));
         }
         executor.prefill_kv_bf16_mirror = false;
-        let (mirrored, mirrored_caches) = runs.pop().expect("invariant: deux runs");
-        let (extended, extended_caches) = runs.pop().expect("invariant: deux runs");
+        let (in_place, in_place_caches) = runs.pop().expect("invariant: trois runs");
+        let (mirrored, mirrored_caches) = runs.pop().expect("invariant: trois runs");
+        let (extended, extended_caches) = runs.pop().expect("invariant: trois runs");
+        assert_bit_exact(&in_place, &extended, "prolongement en place");
+        assert_full_kv_bit_exact(
+            &in_place_caches,
+            &extended_caches,
+            "prolongement en place K/V",
+        )?;
         assert_bit_exact(&mirrored, &extended, "miroir bf16 prolongement");
         assert_full_kv_bit_exact(
             &mirrored_caches,

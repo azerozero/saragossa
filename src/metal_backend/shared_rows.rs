@@ -17,8 +17,12 @@ impl SharedF32Rows {
     ///
     /// # Safety
     ///
-    /// Plus aucune commande GPU ni écriture CPU ne doit viser `buffer` : la vue
-    /// en expose le contenu en `&[f32]` à durée de vie libre côté lecteur.
+    /// Plus aucune commande GPU ni écriture CPU ne doit viser
+    /// `buffer[offset..offset + len]` : la vue en expose le contenu en `&[f32]`
+    /// à durée de vie libre côté lecteur. Seules les lignes qu'aucune vue
+    /// vivante du buffer (clones et troncatures compris) ne couvre peuvent
+    /// encore être écrites (prolongement en place d'un prefill dans ses lignes
+    /// réservées).
     ///
     /// # Errors
     ///
@@ -58,8 +62,8 @@ impl SharedF32Rows {
     pub(crate) fn as_slice(&self) -> &[f32] {
         // SAFETY: `new` a vérifié que `offset + len` f32 tiennent dans le buffer
         // partagé et que son pointeur CPU existe (aligné page, donc f32). Plus
-        // rien ne l'écrit (contrat `# Safety` de `new`) et les vues ne donnent
-        // qu'un accès en lecture : aucune écriture concurrente.
+        // rien n'écrit cette plage (contrat `# Safety` de `new`) et les vues ne
+        // donnent qu'un accès en lecture : aucune écriture concurrente.
         unsafe {
             std::slice::from_raw_parts(
                 self.buffer.contents().cast::<f32>().add(self.offset),

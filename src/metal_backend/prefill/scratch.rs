@@ -229,6 +229,7 @@ impl MetalExecutor {
         kv_rows: usize,
         kv_dim: usize,
         bf16_mirror: bool,
+        kv_buffers: Option<[Buffer; 2]>,
     ) -> Result<PrefillResidentLayerCacheBuffer> {
         match &shape.attention {
             PrefillResidentAttentionShape::Full { .. } => {
@@ -247,9 +248,16 @@ impl MetalExecutor {
                 } else {
                     None
                 };
+                let [key, value] = match kv_buffers {
+                    Some(buffers) => buffers,
+                    None => [
+                        self.uncached_f32_buffer(kv_len, "resident_k_rope")?,
+                        self.uncached_f32_buffer(kv_len, "resident_v")?,
+                    ],
+                };
                 Ok(PrefillResidentLayerCacheBuffer::Full {
-                    key: self.uncached_f32_buffer(kv_len, "resident_k_rope")?,
-                    value: self.uncached_f32_buffer(kv_len, "resident_v")?,
+                    key,
+                    value,
                     kv_dim,
                     bf16_mirror,
                 })
