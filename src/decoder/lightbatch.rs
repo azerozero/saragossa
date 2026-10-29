@@ -373,7 +373,8 @@ impl CausalDecoder {
         slot: usize,
     ) -> Result<LightBatchStream> {
         let prefill_started = Instant::now();
-        let (mut cache, final_state) = self.prefill_cache_state(prompt)?;
+        let (mut cache, final_state) =
+            with_prefill_kv_reserve(max_new_tokens, || self.prefill_cache_state(prompt))?;
         // Mêmes prédicats que la boucle solo : résident complet (1c) si supporté
         // (greedy ou sampler GPU), sinon résident 1b puis per-op.
         #[cfg(all(target_os = "macos", feature = "metal"))]

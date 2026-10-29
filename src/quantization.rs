@@ -875,9 +875,18 @@ impl PartialEq for AffineQuantizedTensor {
 }
 
 fn next_weight_id() -> Result<u64> {
-    NEXT_WEIGHT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .map_err(|_| InferError::Config("espace des identités de poids épuisé".to_string()))
+    // NOTE: boucle compare-exchange plutôt que `fetch_update`, déprécié au
+    // profit de `try_update` absent de la MSRV 1.85.
+    let mut id = NEXT_WEIGHT_ID.load(Ordering::Relaxed);
+    loop {
+        let next = id.checked_add(1).ok_or_else(|| {
+            InferError::Config("espace des identités de poids épuisé".to_string())
+        })?;
+        match NEXT_WEIGHT_ID.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return Ok(previous),
+            Err(current) => id = current,
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

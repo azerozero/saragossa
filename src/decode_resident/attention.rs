@@ -68,7 +68,7 @@ impl DecodeResidentState {
                 refusal.map_or(String::new(), |reason| format!(", repli: {reason}"))
             );
         }
-        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format)
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format, None)
     }
 
     /// Comme [`Self::full_attention`], mais jamais quantifié : f32 ou bf16
@@ -91,7 +91,7 @@ impl DecodeResidentState {
             KvFormat::F32 => KvFormat::F32,
             KvFormat::Bf16 | KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4 => KvFormat::Bf16,
         };
-        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format)
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format, None)
     }
 
     #[cfg(test)]
@@ -102,7 +102,7 @@ impl DecodeResidentState {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<FullAttentionMetalState> {
-        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, KvFormat::Bf16)
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, KvFormat::Bf16, None)
     }
 
     #[cfg(test)]
@@ -114,7 +114,7 @@ impl DecodeResidentState {
         head_dim: usize,
         format: KvFormat,
     ) -> Result<FullAttentionMetalState> {
-        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format)
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, format, None)
     }
 
     #[cfg(test)]
@@ -125,7 +125,67 @@ impl DecodeResidentState {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<FullAttentionMetalState> {
-        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, KvFormat::F32)
+        self.full_attention_with_format(capacity, q_heads, kv_heads, head_dim, KvFormat::F32, None)
+    }
+
+    /// Comme [`Self::full_attention`], sur les buffers K/V bf16 d'un prefill
+    /// au lieu d'une allocation neuve : leurs `floor` premières lignes sont
+    /// celles du préfixe, déjà en place, et l'arène écrit à la suite. Renvoie
+    /// `None` (l'appelant alloue et sème) si le format résolu n'est pas bf16
+    /// dense, si les buffers n'ont pas la place de `capacity` lignes ou si un
+    /// autre écrivain tient déjà leur réserve.
+    ///
+    /// L'appelant garantit qu'aucune vue de ces buffers ne couvre de ligne au
+    /// delà de `floor` (vue entière du prefill, `SharedRows::is_whole`).
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que [`Self::full_attention`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "dimensions de la couche, buffers adoptés et lignes du préfixe"
+    )]
+    pub(crate) fn full_attention_adopting(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        kv_bf16: bool,
+        buffers: [Buffer; 2],
+        floor: usize,
+    ) -> Result<Option<FullAttentionMetalState>> {
+        if !kv_bf16_dense(kv_bf16) || floor > capacity {
+            return Ok(None);
+        }
+        let bytes = kv_heads
+            .checked_mul(head_dim)
+            .and_then(|kv_dim| kv_dim.checked_mul(capacity))
+            .and_then(|cells| cells.checked_mul(GpuElement::Bf16.byte_size()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| InferError::Config("capacité KV adoptée déborde".to_string()))?;
+        if buffers.iter().any(|buffer| buffer.length() < bytes) {
+            return Ok(None);
+        }
+        let Some(claim) = crate::metal_backend::InPlaceClaim::try_new([&buffers[0], &buffers[1]])
+        else {
+            return Ok(None);
+        };
+        let mut state = self.full_attention_with_format(
+            capacity,
+            q_heads,
+            kv_heads,
+            head_dim,
+            KvFormat::Bf16,
+            Some(buffers),
+        )?;
+        state.len = floor;
+        state.floor = floor;
+        state.adopted = Some(AdoptedKv {
+            queue: self.queue.clone(),
+            _claim: claim,
+        });
+        Ok(Some(state))
     }
 
     fn full_attention_with_format(
@@ -135,6 +195,7 @@ impl DecodeResidentState {
         kv_heads: usize,
         head_dim: usize,
         format: KvFormat,
+        existing: Option<[Buffer; 2]>,
     ) -> Result<FullAttentionMetalState> {
         if capacity == 0 || q_heads == 0 || kv_heads == 0 || head_dim == 0 {
             return Err(InferError::Config(
@@ -165,13 +226,25 @@ impl DecodeResidentState {
             })?;
             alloc_tensor(&self.device, self.options, len, encoding.element())
         };
-        let keys = payload(format.keys())?;
-        let values = payload(format.values())?;
+        let (keys, values) = match existing {
+            Some([keys, values]) if format == KvFormat::Bf16 => (
+                GpuTensor::adopt(keys, cells, GpuElement::Bf16)?,
+                GpuTensor::adopt(values, cells, GpuElement::Bf16)?,
+            ),
+            Some(_) => {
+                return Err(InferError::Config(format!(
+                    "KV adopté en {format:?} : seul le bf16 dense l'est"
+                )))
+            }
+            None => (payload(format.keys())?, payload(format.values())?),
+        };
         Ok(FullAttentionMetalState {
             keys,
             values,
             format,
             quant,
+            adopted: None,
+            floor: 0,
             capacity,
             len: 0,
             q_heads,
@@ -601,6 +674,24 @@ impl<'a> KvSegment<'a> {
     }
 }
 
+/// Réserve d'un buffer de prefill adopté par une arène. Le drop attend la
+/// fin des commandes déjà soumises sur la file du decode (exécutées dans
+/// l'ordre de soumission) avant de rendre le droit d'écrire : une sortie sur
+/// erreur peut laisser des pas de decode en vol.
+#[derive(Debug)]
+struct AdoptedKv {
+    queue: CommandQueue,
+    _claim: crate::metal_backend::InPlaceClaim,
+}
+
+impl Drop for AdoptedKv {
+    fn drop(&mut self) {
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+}
+
 /// KV-cache full-attn **résident GPU** d'UNE couche (10 couches sur Qwen3.6).
 ///
 /// Remplace, derrière le flag du decode résident, le `Vec<f32>` CPU append-only
@@ -621,6 +712,12 @@ pub(crate) struct FullAttentionMetalState {
     /// Échelles et kernels d'écriture, présents si et seulement si `format`
     /// est quantifié.
     quant: Option<KvQuant>,
+    /// Buffers K/V d'un prefill adoptés : droit exclusif sur leur réserve,
+    /// rendu après la fin des commandes de la file.
+    adopted: Option<AdoptedKv>,
+    /// Lignes du préfixe adopté, vues par le cache CPU : jamais réécrites,
+    /// `len` ne descend pas en dessous.
+    floor: usize,
     capacity: usize,
     len: usize,
     q_heads: usize,
@@ -664,10 +761,10 @@ impl FullAttentionMetalState {
     ///
     /// Renvoie une erreur si `len` dépasse la capacité allouée.
     pub(crate) fn truncate(&mut self, len: usize) -> Result<()> {
-        if len > self.capacity {
+        if len > self.capacity || len < self.floor {
             return Err(InferError::Dimension(format!(
-                "truncate KV {len} > capacité {}",
-                self.capacity
+                "truncate KV {len} hors [{}, {}] (préfixe adopté, capacité)",
+                self.floor, self.capacity
             )));
         }
         self.len = len;
@@ -823,14 +920,17 @@ impl FullAttentionMetalState {
         values_segments: &[KvSegment<'_>],
         n_rows: usize,
     ) -> Result<()> {
-        if n_rows > self.capacity {
+        // Arène adoptée : les segments suivent le préfixe déjà en place, à
+        // partir du plancher, jamais réécrit.
+        let first = self.floor;
+        if n_rows > self.capacity || first > n_rows {
             return Err(InferError::Dimension(format!(
-                "seed KV {n_rows} > capacité {}",
-                self.capacity
+                "seed KV {first}..{n_rows} hors [{}, {}]",
+                self.floor, self.capacity
             )));
         }
         let kv_dim = self.kv_dim();
-        let expected = n_rows
+        let expected = (n_rows - first)
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Dimension("seed KV déborde".to_string()))?;
         let keys_len: usize = keys_segments.iter().map(KvSegment::len).sum();
@@ -841,6 +941,11 @@ impl FullAttentionMetalState {
             )));
         }
         if let Some(quant) = &self.quant {
+            if first > 0 {
+                return Err(InferError::Dimension(
+                    "seed KV quantifié après un préfixe adopté".to_string(),
+                ));
+            }
             self.seed_quantized(quant, keys_segments, values_segments)?;
             self.len = n_rows;
             return Ok(());
@@ -852,15 +957,12 @@ impl FullAttentionMetalState {
         };
         // Les vues GPU se copient sur le GPU : une écriture CPU dans l'arène
         // neuve payait une faute de page par 16 Kio (2,2 s à 256k).
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        let encoder_guard = EncoderEndGuard::new(encoder);
-        let mut gpu_copies = false;
+        let mut gpu_copies = Vec::new();
         for (tensor, segments, round) in [
             (&self.keys, keys_segments, round_keys),
             (&self.values, values_segments, round_values && !round_keys),
         ] {
-            let mut offset = 0;
+            let mut offset = first * kv_dim;
             for segment in segments {
                 // Un segment bf16 sème une arène bf16 à l'identique ; une arène
                 // f32 (queue courte, DFlash) le reçoit élargi : valeurs arrondies.
@@ -868,17 +970,14 @@ impl FullAttentionMetalState {
                     (Some((buffer, byte_offset, input)), GpuElement::F32 | GpuElement::Bf16)
                         if !round =>
                     {
-                        self.encode_copy_at(
-                            encoder,
+                        gpu_copies.push((
                             buffer,
                             byte_offset,
                             input,
-                            tensor.buffer(),
-                            tensor.element(),
+                            tensor,
                             offset,
                             segment.len(),
-                        )?;
-                        gpu_copies = true;
+                        ));
                     }
                     (_, GpuElement::F32) if round => {
                         let rounded: Vec<f32> = segment
@@ -911,9 +1010,26 @@ impl FullAttentionMetalState {
                 offset += segment.len();
             }
         }
-        encoder_guard.end();
-        // Segments tous CPU (repli, diagnostic d'arrondi) : rien à attendre.
-        if gpu_copies {
+        // Command buffer créé seulement s'il sera commité (cf. `seed_quantized`) :
+        // segments tous CPU (queue d'une arène adoptée, repli, diagnostic
+        // d'arrondi), rien à soumettre.
+        if !gpu_copies.is_empty() {
+            let command_buffer = self.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            let encoder_guard = EncoderEndGuard::new(encoder);
+            for (buffer, byte_offset, input, tensor, offset, len) in gpu_copies {
+                self.encode_copy_at(
+                    encoder,
+                    buffer,
+                    byte_offset,
+                    input,
+                    tensor.buffer(),
+                    tensor.element(),
+                    offset,
+                    len,
+                )?;
+            }
+            encoder_guard.end();
             commit_and_wait(command_buffer)?;
         }
         self.len = n_rows;

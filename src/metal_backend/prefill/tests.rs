@@ -1424,6 +1424,40 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             }
             assert_full_kv_bf16_of(&stored_caches, expected_caches, "K/V bf16 stocké")?;
         }
+        // Réserve demandée (decode à venir) : seul un K/V bf16 la prend, un
+        // scope imbriqué plus petit ne la réduit pas.
+        let reserve_len = |caches: &[PrefillResidentLayerCache]| {
+            caches.iter().find_map(|cache| match cache {
+                PrefillResidentLayerCache::Full {
+                    key: PrefillKvRows::SharedBf16(rows),
+                    ..
+                } => Some((rows.buffer().length() / 2) as usize),
+                PrefillResidentLayerCache::Full {
+                    key: PrefillKvRows::Shared(rows),
+                    ..
+                } => Some((rows.buffer().length() / 4) as usize),
+                _ => None,
+            })
+        };
+        let kv_dim = KV_HEADS * HEAD_DIM;
+        let prefill = |executor: &MetalExecutor| {
+            super::super::with_prefill_kv_reserve(1000, || {
+                super::super::with_prefill_kv_reserve(10, || {
+                    executor.qwen_moe_prefill_resident_with_captures(
+                        PrefillInput::Hidden(&input),
+                        &layers,
+                        spec,
+                        &[],
+                        512,
+                        false,
+                    )
+                })
+            })
+        };
+        let (_, reserved, _) = prefill(&executor)?;
+        if crate::runtime_flags::prefill_kv_shared_enabled() {
+            assert_eq!(reserve_len(&reserved), Some((SEQ + 1000) * kv_dim));
+        }
         // Prompt sous le seuil : K/V f32 inchangé.
         executor.prefill_kv_bf16_store_min_rows = Some(SEQ + 1);
         let (_, short_caches, _) = executor.qwen_moe_prefill_resident_with_captures(
@@ -1435,6 +1469,10 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             false,
         )?;
         assert_full_kv_bit_exact(&short_caches, &chunked_caches, "K/V f32 sous le seuil")?;
+        let (_, reserved, _) = prefill(&executor)?;
+        if crate::runtime_flags::prefill_kv_shared_enabled() {
+            assert_eq!(reserve_len(&reserved), Some((SEQ + 256) * kv_dim));
+        }
         executor.prefill_kv_bf16_store_min_rows = None;
     }
     let hidden = last.data().len();

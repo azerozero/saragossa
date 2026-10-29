@@ -7,7 +7,6 @@ use crate::{
 };
 use safetensors::{tensor::TensorView, SafeTensors};
 use serde::Deserialize;
-use std::f32;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]

@@ -473,8 +473,13 @@ impl LoadedModel {
                 "decoder-longest-prefix",
             )
         } else {
-            let (prompt_state, reused_prefix_tokens, prefill) =
-                self.prefill_prompt_state(&prompt.tokens, session_key, memory_guard)?;
+            let (prompt_state, reused_prefix_tokens, prefill) = self
+                .prefill_prompt_state_reserving(
+                    &prompt.tokens,
+                    max_tokens,
+                    session_key,
+                    memory_guard,
+                )?;
             // TODO: Câbler une annulation non-stream quand serve aura un signal partagé fiable.
             let output = self
                 .decoder
@@ -545,8 +550,12 @@ impl LoadedModel {
         let (prompt_state, mut reused_prefix_tokens, prefill) = if use_mtp {
             (None, 0, Duration::ZERO)
         } else {
-            let (state, reused, elapsed) =
-                self.prefill_prompt_state(&prompt.tokens, session_key, memory_guard)?;
+            let (state, reused, elapsed) = self.prefill_prompt_state_reserving(
+                &prompt.tokens,
+                max_tokens,
+                session_key,
+                memory_guard,
+            )?;
             (Some(state), reused, elapsed)
         };
         if !use_mtp {
@@ -702,6 +711,22 @@ impl LoadedModel {
         let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
         Ok(PromptEncoding {
             tokens: full_tokens,
+        })
+    }
+
+    /// [`Self::prefill_prompt_state`] avec une réserve K/V pour la queue du
+    /// prompt (moins d'un bloc) et `max_tokens` : l'arène de decode adopte
+    /// alors le K/V du prefill au lieu de le recopier.
+    fn prefill_prompt_state_reserving(
+        &mut self,
+        tokens: &[usize],
+        max_tokens: usize,
+        session_key: Option<&str>,
+        memory_guard: &MemoryGuard,
+    ) -> ServeResult<(CausalDecoderPromptState, usize, Duration)> {
+        let rows = self.prefix_cache.block_tokens().saturating_add(max_tokens);
+        saragossa::decoder::with_prefill_kv_reserve(rows, || {
+            self.prefill_prompt_state(tokens, session_key, memory_guard)
         })
     }
 

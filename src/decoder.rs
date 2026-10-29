@@ -893,6 +893,22 @@ impl CausalDecoderCache {
     }
 }
 
+/// Exécute `run` avec une réserve d'au moins `rows` lignes derrière le K/V
+/// stocké en bf16 de tout prefill à froid lancé sur ce thread : le decode qui
+/// suit (`max_tokens` + marge spéculative, queue de prompt servie) y écrit au
+/// lieu de recopier tout le K/V dans une arène neuve. Sans effet hors Metal.
+pub fn with_prefill_kv_reserve<R>(rows: usize, run: impl FnOnce() -> R) -> R {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        crate::metal_backend::with_prefill_kv_reserve(rows, run)
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = rows;
+        run()
+    }
+}
+
 impl Default for CausalDecoderConfig {
     fn default() -> Self {
         Self {

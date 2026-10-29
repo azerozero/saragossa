@@ -67,10 +67,11 @@ pub(crate) mod mtp_control;
 mod mtp_seed;
 mod shared_rows;
 pub(crate) use self::mtp_seed::{MtpSeedStates, MtpSeedWeights};
-pub(crate) use self::shared_rows::{PrefillKvRows, SharedBf16Rows, SharedF32Rows};
+pub(crate) use self::shared_rows::{InPlaceClaim, PrefillKvRows, SharedBf16Rows, SharedF32Rows};
 mod na_gemm;
 mod pipelines;
 mod prefill;
+pub(crate) use self::prefill::with_prefill_kv_reserve;
 mod profiling;
 mod scratch;
 #[cfg(test)]

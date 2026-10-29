@@ -3130,6 +3130,95 @@ fn kv_seed_from_shared_view_matches_cpu_bytes() -> Result<()> {
     Ok(())
 }
 
+/// L'arène adopte les buffers bf16 d'un prefill : préfixe laissé en place,
+/// queue semée à la suite, mêmes octets que le semis par copie. Droit
+/// d'écriture exclusif tant qu'elle vit, préfixe jamais réécrit ni tronqué,
+/// refus si la réserve est trop courte.
+#[test]
+fn kv_arena_adopts_prefill_bf16_buffers() -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    if !super::kv_bf16_dense_by_default() {
+        return Ok(());
+    }
+    let (q_heads, kv_heads, head_dim) = (8, 2, 128);
+    let kv_dim = kv_heads * head_dim;
+    let (prefix, tail, capacity) = (5, 2, 10);
+    let bits: Vec<u16> = (0..(prefix + tail) * kv_dim)
+        .map(|i| f32_to_bf16_bits((i as f32 * 0.3711).sin() * 7.0))
+        .collect();
+    // Réserve remplie d'octets étrangers (prolongement abandonné) : la queue
+    // semée doit les remplacer.
+    let mut stored = bits[..prefix * kv_dim].to_vec();
+    stored.resize(capacity * kv_dim, 0x7fc0);
+    let buffer = || {
+        state.device().new_buffer_with_data(
+            stored.as_ptr().cast(),
+            (stored.len() * std::mem::size_of::<u16>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let (keys, values) = (buffer(), buffer());
+    // SAFETY: buffers propres au test ; seule la réserve, hors vue, est écrite.
+    #[expect(unsafe_code, reason = "vues partagées sur des buffers de test")]
+    let (key_view, value_view) = unsafe {
+        (
+            crate::metal_backend::SharedBf16Rows::new(keys.clone(), 0, prefix * kv_dim)?,
+            crate::metal_backend::SharedBf16Rows::new(values.clone(), 0, prefix * kv_dim)?,
+        )
+    };
+    let adopt = |capacity| {
+        state.full_attention_adopting(
+            capacity,
+            q_heads,
+            kv_heads,
+            head_dim,
+            true,
+            [keys.clone(), values.clone()],
+            prefix,
+        )
+    };
+    let tail_segments = [KvSegment::CpuBf16(&bits[prefix * kv_dim..])];
+    let all_keys = [KvSegment::SharedBf16(&key_view), tail_segments[0]];
+    let all_values = [KvSegment::SharedBf16(&value_view), tail_segments[0]];
+
+    let mut adopted = adopt(capacity)?.expect("adoption de buffers qui ont la place");
+    assert_eq!(adopted.keys().buffer().contents(), keys.contents());
+    assert!(adopt(capacity)?.is_none(), "réserve déjà tenue");
+    assert!(
+        adopted
+            .seed_segments(&all_keys, &all_values, prefix + tail)
+            .is_err(),
+        "le préfixe adopté n'est jamais resemé"
+    );
+    adopted.seed_segments(&tail_segments, &tail_segments, prefix + tail)?;
+    assert!(
+        adopted.truncate(prefix - 1).is_err(),
+        "sous le préfixe adopté"
+    );
+    adopted.truncate(prefix + 1)?;
+
+    let mut copied = state.full_attention_bf16_for_test(capacity, q_heads, kv_heads, head_dim)?;
+    copied.seed_segments(&all_keys, &all_values, prefix + tail)?;
+    let cells = (prefix + tail) * kv_dim;
+    for (adopted, copied) in [
+        (adopted.keys(), copied.keys()),
+        (adopted.values(), copied.values()),
+    ] {
+        assert_eq!(
+            crate::metal_backend::read_u16_buffer(adopted.buffer(), cells)?,
+            crate::metal_backend::read_u16_buffer(copied.buffer(), cells)?,
+            "arène adoptée"
+        );
+    }
+    assert_eq!(key_view.as_slice(), &bits[..prefix * kv_dim]);
+    drop(adopted);
+    assert!(adopt(capacity + 1)?.is_none(), "réserve trop courte");
+    assert!(adopt(capacity)?.is_some(), "réserve rendue au drop");
+    Ok(())
+}
+
 /// Valeur synthétique d'un KV quantifié : amplitude et centre variables par
 /// groupe de 64, un groupe sur sept constant (échelle nulle).
 fn kv_quant_value(i: usize) -> f32 {

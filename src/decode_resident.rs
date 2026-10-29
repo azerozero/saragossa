@@ -80,9 +80,9 @@ pub(crate) use self::types::{
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
     LinearAttnDenseLayerWeights, LinearAttnLayerWeights, MtpD2Segments,
 };
-pub(crate) use self::utils::kv_bf16_dense_by_default;
 #[cfg(all(test, feature = "devtools"))]
 pub(crate) use self::utils::with_kv_format_override;
+pub(crate) use self::utils::{kv_bf16_dense, kv_bf16_dense_by_default, kv_element_bytes};
 
 /// État résident d'UN decode (réserves C/D).
 ///
