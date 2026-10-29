@@ -50,7 +50,7 @@ fn request_translates_blocks_system_and_stop_sequences() {
     assert_eq!(messages[2].role, "tool");
     assert_eq!(
         messages[2].content.as_deref(),
-        Some(r#"{"tool_use_id":"toolu_1","content":"ok"}"#)
+        Some(r#"{"content":"ok","tool_use_id":"toolu_1"}"#)
     );
     assert_eq!(messages[3].role, "assistant");
     let assistant = messages[3]

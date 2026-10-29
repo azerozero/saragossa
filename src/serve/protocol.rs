@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use saragossa::ChatTemplateMessage;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 use super::error::{ServeError, ServeResult};
@@ -45,7 +46,8 @@ pub(super) struct ChatCompletionRequest {
     /// Outils OpenAI (`{"type":"function","function":{...}}`), rendus et
     /// parsés pour flint seulement.
     #[serde(default)]
-    pub(super) tools: Option<Vec<Value>>,
+    /// Texte brut conservé : `Value` trierait les clés que le template rend.
+    pub(super) tools: Option<Vec<Box<RawValue>>>,
 }
 
 impl ChatCompletionRequest {
@@ -75,14 +77,23 @@ impl ChatCompletionRequest {
                 role: message.role.clone(),
                 content: Some(message.content_text()),
                 reasoning_content: message.reasoning_content.clone(),
-                tool_calls: message.tool_calls.clone().unwrap_or_default(),
+                tool_calls: raw_texts(message.tool_calls.as_deref()),
             })
             .collect()
     }
 
-    /// Renvoie les outils déclarés par la requête.
-    pub(super) fn tools(&self) -> &[Value] {
-        self.tools.as_deref().unwrap_or_default()
+    /// Renvoie le texte JSON brut de chaque outil déclaré.
+    pub(super) fn tools_json(&self) -> Vec<String> {
+        raw_texts(self.tools.as_deref())
+    }
+
+    /// Renvoie les outils déclarés, lus en JSON (ordre des clés perdu).
+    pub(super) fn tool_values(&self) -> Vec<Value> {
+        self.tools
+            .iter()
+            .flatten()
+            .filter_map(|tool| serde_json::from_str(tool.get()).ok())
+            .collect()
     }
 
     /// Renvoie les chaînes stop demandées.
@@ -119,6 +130,14 @@ impl ChatCompletionRequest {
             .or_else(|| self.user.as_deref().and_then(normalize_session_key))
             .map(ToString::to_string)
     }
+}
+
+fn raw_texts(values: Option<&[Box<RawValue>]>) -> Vec<String> {
+    values
+        .unwrap_or_default()
+        .iter()
+        .map(|value| value.get().to_string())
+        .collect()
 }
 
 pub(super) fn normalize_session_key(value: &str) -> Option<&str> {
@@ -162,7 +181,7 @@ pub(super) struct WireMessage {
     pub(super) reasoning_content: Option<String>,
     /// Appels d'outils d'un tour assistant passé.
     #[serde(default)]
-    pub(super) tool_calls: Option<Vec<Value>>,
+    pub(super) tool_calls: Option<Vec<Box<RawValue>>>,
 }
 
 impl WireMessage {
@@ -632,9 +651,10 @@ mod tests {
         .expect("invariant: JSON valide");
 
         let messages = req.template_messages();
-        assert_eq!(req.tools().len(), 1);
+        assert_eq!(req.tools_json().len(), 1);
+        assert_eq!(req.tool_values()[0]["function"]["name"], "heure");
         assert_eq!(messages[0].reasoning_content.as_deref(), Some("r"));
-        assert_eq!(messages[0].tool_calls[0]["function"]["name"], "heure");
+        assert!(messages[0].tool_calls[0].starts_with(r#"{"id":"c0""#));
     }
 
     #[test]

@@ -227,7 +227,7 @@ fn handle_chat<S: Write>(
     if stream_enabled {
         send_sse_streaming(stream, state, chat, session_key)
     } else {
-        let tools = chat.tools().to_vec();
+        let tools = chat.tool_values();
         let completion = state.complete(chat, session_key.as_deref())?;
         let headers = completion.metric_headers();
         let mut finish_reason = completion.finish_reason;
@@ -286,7 +286,7 @@ fn send_sse_streaming<S: Write>(
 ) -> ServeResult<()> {
     let mut stream_started = false;
     let mut stream_model = String::new();
-    let mut tools = chat.tools().to_vec();
+    let mut tools = chat.tool_values();
     let mut flint: Option<FlintOutputParser> = None;
     let result = state.complete_streaming(chat, session_key.as_deref(), |event| match event {
         CompletionStreamEvent::Start(start) => {

@@ -15,7 +15,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use super::protocol::{ToolCall, ToolCallFunction};
 
@@ -145,7 +145,7 @@ impl FlintOutputParser {
                 kind: "function",
                 function: ToolCallFunction {
                     name,
-                    arguments: Value::Object(arguments).to_string(),
+                    arguments: arguments_json(&arguments),
                 },
             }));
             self.calls_sent += 1;
@@ -234,14 +234,24 @@ fn closed_tool_blocks(region: &str) -> Vec<&str> {
     blocks
 }
 
-/// `name<arg_key>k</arg_key><arg_value>v</arg_value>…` vers nom et arguments.
-fn parse_tool_block(block: &str, tools: &[Value]) -> Option<(String, Map<String, Value>)> {
+/// Objet JSON des arguments, dans l'ordre où le modèle les a écrits.
+fn arguments_json(arguments: &[(String, Value)]) -> String {
+    let members: Vec<String> = arguments
+        .iter()
+        .map(|(key, value)| format!("{}:{value}", Value::String(key.clone())))
+        .collect();
+    format!("{{{}}}", members.join(","))
+}
+
+/// `name<arg_key>k</arg_key><arg_value>v</arg_value>…` vers nom et arguments
+/// ordonnés ; une clé répétée garde sa place et sa dernière valeur.
+fn parse_tool_block(block: &str, tools: &[Value]) -> Option<(String, Vec<(String, Value)>)> {
     let name_end = block.find(ARG_KEY_OPEN).unwrap_or(block.len());
     let name = block[..name_end].trim();
     if name.is_empty() {
         return None;
     }
-    let mut arguments = Map::new();
+    let mut arguments: Vec<(String, Value)> = Vec::new();
     let mut rest = &block[name_end..];
     while let Some(open) = rest.find(ARG_KEY_OPEN) {
         rest = &rest[open + ARG_KEY_OPEN.len()..];
@@ -266,7 +276,10 @@ fn parse_tool_block(block: &str, tools: &[Value]) -> Option<(String, Map<String,
             // une valeur non JSON reste une chaîne.
             serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
         };
-        arguments.insert(key.to_string(), typed);
+        match arguments.iter_mut().find(|(name, _)| name == key) {
+            Some(slot) => slot.1 = typed,
+            None => arguments.push((key.to_string(), typed)),
+        }
         rest = &value[value_end + ARG_VALUE_CLOSE.len()..];
     }
     Some((name.to_string(), arguments))
@@ -341,6 +354,10 @@ mod tests {
             ("heure".to_string(), serde_json::json!({}))
         );
         assert_ne!(output.tool_calls[0].id, output.tool_calls[1].id);
+        assert!(output.tool_calls[0]
+            .function
+            .arguments
+            .starts_with(r#"{"ville":"Lyon","jours":2,"code":"69","#));
         assert_eq!(output.tool_calls[0].index, None);
     }
 

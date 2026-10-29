@@ -711,7 +711,7 @@ impl LoadedModel {
             normalize_qwen_assistant_history(&mut messages);
         }
         let rendered = if self.assets.config.is_flint() {
-            render_flint_chat(&messages, request.tools(), true)
+            render_flint_chat(&messages, &request.tools_json(), true)
         } else if self.assets.config.is_gemma4() {
             render_gemma4_chat(&messages, true, false)
         } else if self.assets.config.is_gemma() {
