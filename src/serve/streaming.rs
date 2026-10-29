@@ -11,8 +11,6 @@ use super::error::{ServeError, ServeResult};
 pub(crate) struct StreamingCompletionStart {
     /// Identifiant OpenAI du modèle.
     pub(super) model: String,
-    /// Sortie au format flint (`<think>`, `<tool_call>` XML) à parser.
-    pub(super) flint: bool,
     /// Nombre de tokens prompt.
     pub(super) prompt_tokens: usize,
     /// Nombre de tokens repris d'un prompt déjà vu.

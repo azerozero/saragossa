@@ -509,7 +509,6 @@ fn fake_completion(
 ) -> ServedCompletion {
     ServedCompletion {
         model: model.to_string(),
-        flint: false,
         content: content.to_string(),
         finish_reason,
         matched_stop,

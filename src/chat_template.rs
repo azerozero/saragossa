@@ -2,7 +2,7 @@
 
 mod python_json;
 
-use self::python_json::{json_string, python_json, OrderedObject};
+use self::python_json::{JsonObject, JsonValue};
 
 /// Marqueur d'ouverture de message ChatML Qwen.
 pub const QWEN_IM_START: &str = "<|im_start|>";
@@ -252,11 +252,18 @@ fn flint_tool_preamble(tools: &[String]) -> String {
          You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
     );
     for tool in tools {
-        let function = OrderedObject::parse(tool).and_then(|tool| {
-            tool.get("function")
-                .map(|function| function.get().to_string())
-        });
-        out.push_str(&python_json(function.as_deref().unwrap_or(tool)));
+        match serde_json::from_str::<JsonValue>(tool) {
+            Ok(JsonValue::Object(object)) => {
+                let function = match object.get("function") {
+                    Some(function @ JsonValue::Object(_)) => function.to_python_json(),
+                    _ => JsonValue::Object(object).to_python_json(),
+                };
+                out.push_str(&function);
+            }
+            Ok(other) => out.push_str(&other.to_python_json()),
+            // Texte déjà validé comme JSON par la requête ; recopié tel quel sinon.
+            Err(_) => out.push_str(tool),
+        }
     }
     out.push_str(
         "</tools>\n\n\
@@ -270,35 +277,34 @@ fn flint_tool_preamble(tools: &[String]) -> String {
 /// `arguments` peut être l'objet ou sa chaîne JSON (forme OpenAI) ; des
 /// arguments illisibles sont rendus sans paires, là où le Jinja échouerait.
 fn push_flint_tool_call(out: &mut String, call: &str) {
-    let call = OrderedObject::parse(call);
-    let nested = call
-        .as_ref()
-        .and_then(|call| call.get("function"))
-        .and_then(|function| OrderedObject::parse(function.get()));
-    let function = nested.or(call);
     out.push_str("<tool_call>");
-    let Some(function) = function else {
-        out.push_str("</tool_call>");
-        return;
-    };
-    if let Some(name) = function.get("name").and_then(json_string) {
-        out.push_str(&name);
-    }
-    let arguments = function
-        .get("arguments")
-        .and_then(|raw| match json_string(raw) {
-            Some(text) => OrderedObject::parse(&text),
-            None => OrderedObject::parse(raw.get()),
-        });
-    for (key, value) in arguments.iter().flat_map(|arguments| &arguments.0) {
-        out.push_str("<arg_key>");
-        out.push_str(key);
-        out.push_str("</arg_key><arg_value>");
-        match json_string(value) {
-            Some(text) => out.push_str(&text),
-            None => out.push_str(&python_json(value.get())),
+    if let Some(call) = JsonObject::parse(call) {
+        let function = match call.get("function") {
+            Some(JsonValue::Object(function)) => function,
+            _ => &call,
+        };
+        if let Some(name) = function.get("name").and_then(JsonValue::as_str) {
+            out.push_str(name);
         }
-        out.push_str("</arg_value>");
+        let parsed;
+        let arguments = match function.get("arguments") {
+            Some(JsonValue::String(text)) => {
+                parsed = JsonObject::parse(text);
+                parsed.as_ref()
+            }
+            Some(JsonValue::Object(object)) => Some(object),
+            _ => None,
+        };
+        for (key, value) in arguments.iter().flat_map(|arguments| arguments.iter()) {
+            out.push_str("<arg_key>");
+            out.push_str(key);
+            out.push_str("</arg_key><arg_value>");
+            match value.as_str() {
+                Some(text) => out.push_str(text),
+                None => out.push_str(&value.to_python_json()),
+            }
+            out.push_str("</arg_value>");
+        }
     }
     out.push_str("</tool_call>");
 }

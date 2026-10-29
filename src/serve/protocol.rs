@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use saragossa::ChatTemplateMessage;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
 
@@ -44,10 +44,36 @@ pub(super) struct ChatCompletionRequest {
     #[serde(default)]
     pub(super) user: Option<String>,
     /// Outils OpenAI (`{"type":"function","function":{...}}`), rendus et
-    /// parsés pour flint seulement.
+    /// parsés pour flint seulement ; les autres familles les ignorent.
     #[serde(default)]
-    /// Texte brut conservé : `Value` trierait les clés que le template rend.
-    pub(super) tools: Option<Vec<Box<RawValue>>>,
+    pub(super) tools: Option<Vec<DeclaredTool>>,
+    /// Choix d'outil OpenAI (`none`, `auto`, `required`, outil nommé).
+    #[serde(default)]
+    pub(super) tool_choice: Option<Value>,
+    /// Appels d'outils multiples autorisés (défaut vrai).
+    #[serde(default)]
+    pub(super) parallel_tool_calls: Option<bool>,
+}
+
+/// Outil déclaré par la requête, lu une seule fois.
+#[derive(Clone, Debug)]
+pub(super) struct DeclaredTool {
+    /// Texte JSON brut, que le template flint rend dans l'ordre du client
+    /// (`Value` trierait les clés).
+    pub(super) json: String,
+    /// Même outil en `Value`, pour lire son schéma.
+    pub(super) value: Value,
+}
+
+impl<'de> Deserialize<'de> for DeclaredTool {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        let value = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            json: raw.get().to_string(),
+            value,
+        })
+    }
 }
 
 impl ChatCompletionRequest {
@@ -82,18 +108,30 @@ impl ChatCompletionRequest {
             .collect()
     }
 
-    /// Renvoie le texte JSON brut de chaque outil déclaré.
-    pub(super) fn tools_json(&self) -> Vec<String> {
-        raw_texts(self.tools.as_deref())
+    /// Outils à rendre et à parser selon `tool_choice` : aucun pour `none`,
+    /// tous pour `auto` ou en l'absence de choix. `required` et un outil nommé
+    /// demandent une génération contrainte que serve n'a pas : refusés.
+    pub(super) fn active_tools(&self) -> ServeResult<&[DeclaredTool]> {
+        let tools = self.tools.as_deref().unwrap_or_default();
+        match &self.tool_choice {
+            None | Some(Value::Null) => Ok(tools),
+            Some(Value::String(choice)) if choice == "auto" => Ok(tools),
+            Some(Value::String(choice)) if choice == "none" => Ok(&[]),
+            Some(Value::String(choice)) if choice == "required" => Err(ServeError::Http(
+                "tool_choice \"required\" n'est pas supporté (génération non contrainte) ; utiliser \"auto\""
+                    .to_string(),
+            )),
+            Some(Value::Object(_)) => Err(ServeError::Http(
+                "tool_choice nommé n'est pas supporté (génération non contrainte) ; utiliser \"auto\""
+                    .to_string(),
+            )),
+            Some(other) => Err(ServeError::Http(format!("tool_choice invalide: {other}"))),
+        }
     }
 
-    /// Renvoie les outils déclarés, lus en JSON (ordre des clés perdu).
-    pub(super) fn tool_values(&self) -> Vec<Value> {
-        self.tools
-            .iter()
-            .flatten()
-            .filter_map(|tool| serde_json::from_str(tool.get()).ok())
-            .collect()
+    /// Appels d'outils multiples autorisés ?
+    pub(super) fn parallel_tool_calls(&self) -> bool {
+        self.parallel_tool_calls.unwrap_or(true)
     }
 
     /// Renvoie les chaînes stop demandées.
@@ -651,10 +689,40 @@ mod tests {
         .expect("invariant: JSON valide");
 
         let messages = req.template_messages();
-        assert_eq!(req.tools_json().len(), 1);
-        assert_eq!(req.tool_values()[0]["function"]["name"], "heure");
+        let tools = req.active_tools().expect("invariant: tool_choice absent");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].value["function"]["name"], "heure");
+        assert!(tools[0].json.starts_with(r#"{"type":"function""#));
         assert_eq!(messages[0].reasoning_content.as_deref(), Some("r"));
         assert!(messages[0].tool_calls[0].starts_with(r#"{"id":"c0""#));
+    }
+
+    #[test]
+    fn tool_choice_selects_or_refuses_tools() {
+        let request = |choice: &str| -> ChatCompletionRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model":"flint","messages":[],"tools":[{{"name":"heure"}}],"tool_choice":{choice}}}"#
+            ))
+            .expect("invariant: JSON valide")
+        };
+
+        assert_eq!(
+            request(r#""auto""#).active_tools().map(<[_]>::len).ok(),
+            Some(1)
+        );
+        assert_eq!(request("null").active_tools().map(<[_]>::len).ok(), Some(1));
+        assert_eq!(
+            request(r#""none""#).active_tools().map(<[_]>::len).ok(),
+            Some(0)
+        );
+        for refused in [
+            r#""required""#,
+            r#"{"type":"function","function":{"name":"heure"}}"#,
+            r#""autre""#,
+        ] {
+            assert!(request(refused).active_tools().is_err(), "{refused}");
+        }
+        assert!(request(r#""auto""#).parallel_tool_calls());
     }
 
     #[test]

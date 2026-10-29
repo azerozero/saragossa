@@ -223,16 +223,27 @@ fn handle_chat<S: Write>(
     chat.max_tokens_capped(state.max_tokens_cap())?;
     chat.response_format_mode()?;
     let session_key = chat.session_key(request.header(SESSION_HEADER));
+    // NOTE: `tools` et `tool_choice` ne servent qu'à flint ; les autres
+    // familles les ignorent, comme avant.
+    let flint = if state.model_is_flint(&chat.model)? {
+        let tools = chat
+            .active_tools()?
+            .iter()
+            .map(|tool| tool.value.clone())
+            .collect();
+        Some(FlintOutputParser::new(tools, chat.parallel_tool_calls()))
+    } else {
+        None
+    };
     let stream_enabled = chat.stream;
     if stream_enabled {
-        send_sse_streaming(stream, state, chat, session_key)
+        send_sse_streaming(stream, state, chat, session_key, flint)
     } else {
-        let tools = chat.tool_values();
         let completion = state.complete(chat, session_key.as_deref())?;
         let headers = completion.metric_headers();
         let mut finish_reason = completion.finish_reason;
-        let message = if completion.flint {
-            let output = FlintOutputParser::parse(&completion.content, tools);
+        let message = if let Some(parser) = flint {
+            let output = parser.parse(&completion.content);
             finish_reason = flint_finish_reason(finish_reason, !output.tool_calls.is_empty());
             let content = if output.content.is_empty() && !output.tool_calls.is_empty() {
                 None
@@ -283,18 +294,14 @@ fn send_sse_streaming<S: Write>(
     state: &mut ServeState,
     chat: ChatCompletionRequest,
     session_key: Option<String>,
+    mut flint: Option<FlintOutputParser>,
 ) -> ServeResult<()> {
     let mut stream_started = false;
     let mut stream_model = String::new();
-    let mut tools = chat.tool_values();
-    let mut flint: Option<FlintOutputParser> = None;
     let result = state.complete_streaming(chat, session_key.as_deref(), |event| match event {
         CompletionStreamEvent::Start(start) => {
             stream_model = start.model.clone();
             stream_started = true;
-            if start.flint {
-                flint = Some(FlintOutputParser::new(std::mem::take(&mut tools)));
-            }
             write_headers(
                 stream,
                 200,
