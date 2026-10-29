@@ -63,6 +63,7 @@ impl MetalExecutor {
                     context: context_buffer,
                     gated_context: gated_context_buffer,
                     o: o_buffer,
+                    sinks: sinks_buffer,
                 } = full_scratch;
                 self.run_resident_prefill_section(context, "qkv", |encoder, owned| {
                     if kv_only {
@@ -204,6 +205,25 @@ impl MetalExecutor {
                         "causal_attention"
                     },
                     |encoder, _owned| {
+                        if let Some(sinks_buffer) = sinks_buffer.as_ref() {
+                            // Sinks (flint) : un seul morceau, K/V f32. Le
+                            // découpage et le K/V bf16 n'existent que pour le
+                            // Steel/NAX d256, que l'éligibilité exclut ici.
+                            if chunk.rows < chunk.total || *bf16_store {
+                                return Err(InferError::Config(format!(
+                                    "prefill avec sinks par morceaux ou K/V bf16 non supporté couche {layer_index}"
+                                )));
+                            }
+                            return self.encode_attention_prefill_sink(
+                                encoder,
+                                &q_rope_buffer,
+                                key_cache,
+                                value_cache,
+                                &context_buffer,
+                                sinks_buffer,
+                                spec,
+                            );
+                        }
                         if chunk.rows < chunk.total {
                             let kv_rows = chunk.start + chunk.rows;
                             let bf16_kv = match bf16_mirror {

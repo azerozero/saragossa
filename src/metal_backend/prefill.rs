@@ -12,6 +12,8 @@ mod resident;
 pub(crate) use self::resident::with_prefill_kv_reserve;
 mod scratch;
 #[cfg(test)]
+mod sink_tests;
+#[cfg(test)]
 mod tests;
 
 struct PrefillTailMoeShape<'a> {
@@ -38,6 +40,7 @@ enum PrefillResidentAttentionShape<'a> {
         q_norm_weight: &'a [f32],
         k_norm_weight: &'a [f32],
         gated: bool,
+        sinks: Option<&'a [f32]>,
     },
     Linear {
         spec: LinearAttentionStepSpec,
@@ -96,6 +99,8 @@ struct PrefillResidentFullAttentionScratch {
     context: Buffer,
     gated_context: Option<Buffer>,
     o: Buffer,
+    /// Sinks `[q_heads]` f32 de la couche (flint).
+    sinks: Option<Buffer>,
 }
 
 struct PrefillResidentLinearAttentionScratch {
@@ -108,12 +113,7 @@ enum PrefillResidentAttentionScratch {
 }
 
 enum PrefillResidentTailShape {
-    Dense {
-        gate_proj: MetalLinearWeightBuffers,
-        up_proj: MetalLinearWeightBuffers,
-        down_proj: MetalLinearWeightBuffers,
-        inter_dim: usize,
-    },
+    Dense(PrefillResidentDenseMlp),
     GemmaDense {
         gate_proj: MetalLinearWeightBuffers,
         up_proj: MetalLinearWeightBuffers,
@@ -141,19 +141,32 @@ enum PrefillResidentTailShape {
     Routed {
         expert_count: usize,
         stacked: StackedMoeBuffers,
+        /// Expert partagé sans gate du MoE sigmoïde flint.
+        sigmoid_shared: Option<PrefillResidentDenseMlp>,
     },
     Shared {
         weights: MetalMoeSharedWeights,
     },
 }
 
+/// Poids résolus d'un MLP SwiGLU dense `[hidden] -> [inter] -> [hidden]`.
+struct PrefillResidentDenseMlp {
+    gate_proj: MetalLinearWeightBuffers,
+    up_proj: MetalLinearWeightBuffers,
+    down_proj: MetalLinearWeightBuffers,
+    inter_dim: usize,
+}
+
+/// Scratch d'un MLP dense : `(gate, up, hidden)` f32 `[seq, inter]`, absents
+/// quand le MLP fusionné prend la couche (il n'écrit que `down`, via un scratch
+/// bf16 interne), et `down` `[seq, hidden]`.
+struct PrefillResidentDenseScratch {
+    unfused: Option<(Buffer, Buffer, Buffer)>,
+    down: Buffer,
+}
+
 enum PrefillResidentTailScratch {
-    Dense {
-        /// `(gate, up, hidden)` f32 `[seq, inter]`, absents quand le MLP fusionné
-        /// prend la couche : il n'écrit que `down`, via un scratch bf16 interne.
-        unfused: Option<(Buffer, Buffer, Buffer)>,
-        down: Buffer,
-    },
+    Dense(PrefillResidentDenseScratch),
     GemmaDense {
         ffn_input: Buffer,
         gate: Buffer,
@@ -182,6 +195,7 @@ enum PrefillResidentTailScratch {
         up: Buffer,
         hidden: Buffer,
         down: Buffer,
+        sigmoid_shared: Option<PrefillResidentDenseScratch>,
     },
     Shared,
 }

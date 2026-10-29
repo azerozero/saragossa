@@ -1111,4 +1111,41 @@ impl MetalExecutor {
         trace_dispatch_path("topk_softmax_rows_f32", rows, topk, count);
         self.dispatch_1d(encoder, &self.topk_softmax_rows_f32, rows)
     }
+
+    /// Top-k du routeur sigmoïde flint sur `rows` lignes (prefill), jumeau de
+    /// [`Self::encode_topk_softmax_rows`].
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `rows` est nul, si `topk` est invalide ou si une
+    /// dimension déborde.
+    pub(super) fn encode_topk_sigmoid_rows(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buffer: &BufferRef,
+        indices_buffer: &BufferRef,
+        scores_buffer: &BufferRef,
+        rows: usize,
+        count: usize,
+        topk: usize,
+    ) -> Result<()> {
+        if rows == 0 {
+            return Err(InferError::Dimension(
+                "topk sigmoïde sans ligne".to_string(),
+            ));
+        }
+        ensure_valid_top_k(topk, count)?;
+        let dims = [
+            checked_u32(rows, "topk sigmoid rows")?,
+            checked_u32(count, "topk sigmoid rows count")?,
+            checked_u32(topk, "topk sigmoid rows topk")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.topk_sigmoid_rows_f32);
+        encoder.set_buffer(0, Some(logits_buffer), 0);
+        encoder.set_buffer(1, Some(indices_buffer), 0);
+        encoder.set_buffer(2, Some(scores_buffer), 0);
+        set_u32_bytes(encoder, 3, &dims, "topk_sigmoid_rows_dims")?;
+        trace_dispatch_path("topk_sigmoid_rows_f32", rows, topk, count);
+        self.dispatch_1d(encoder, &self.topk_sigmoid_rows_f32, rows)
+    }
 }

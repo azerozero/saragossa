@@ -204,6 +204,9 @@ impl MetalExecutor {
     /// complètes doivent passer par l'attention Steel/NAX à décalage.
     pub(crate) fn prefill_resident_extend_supported(&self, layers: &[PrefillMoeLayer<'_>]) -> bool {
         layers.iter().all(|layer| match layer.attention {
+            // Les sinks (flint) n'ont pas d'attention par morceaux : prefill
+            // en un seul morceau, prolongement de préfixe refusé.
+            PrefillAttentionLayer::Full { sinks: Some(_), .. } => false,
             PrefillAttentionLayer::Full { .. } => {
                 self.causal_attention_prefill_chunk_supported(layer.attention_spec)
             }
@@ -1109,71 +1112,23 @@ impl MetalExecutor {
         match (tail, tail_shape, tail_scratch) {
             (
                 PrefillMoeTail::Dense { .. },
-                PrefillResidentTailShape::Dense {
-                    gate_proj,
-                    up_proj,
-                    down_proj,
-                    inter_dim,
-                },
-                PrefillResidentTailScratch::Dense { unfused, down },
+                PrefillResidentTailShape::Dense(mlp),
+                PrefillResidentTailScratch::Dense(scratch),
             ) => self.run_resident_prefill_section(context, "tail_dense", |encoder, owned| {
-                if let Some((gate, up, hidden)) = &unfused {
-                    let gate_dim = self.encode_matmul_weight_buffers(
-                        encoder,
-                        post_normed_buffer,
-                        spec.seq,
-                        hidden_dim,
-                        &gate_proj,
-                        gate,
-                        false,
-                    )?;
-                    let up_dim = self.encode_matmul_weight_buffers(
-                        encoder,
-                        post_normed_buffer,
-                        spec.seq,
-                        hidden_dim,
-                        &up_proj,
-                        up,
-                        false,
-                    )?;
-                    if gate_dim != inter_dim || up_dim != inter_dim {
-                        return Err(InferError::Dimension(format!(
-                            "prefill résident dense gate/up sortent gate={gate_dim} up={up_dim}, attendu {inter_dim}"
-                        )));
-                    }
-                    let inter_len = checked_len(spec.seq, inter_dim, "resident dense inter")?;
-                    self.encode_swiglu(encoder, owned, gate, up, hidden, inter_len)?;
-                    let down_dim = self.encode_matmul_weight_buffers(
-                        encoder, hidden, spec.seq, inter_dim, &down_proj, &down, false,
-                    )?;
-                    if down_dim != hidden_dim {
-                        return Err(InferError::Dimension(format!(
-                            "prefill résident dense down sort {down_dim}, attendu {hidden_dim}"
-                        )));
-                    }
-                } else {
-                    self.encode_fused_dense_mlp(
-                        encoder,
-                        post_normed_buffer,
-                        spec.seq,
-                        hidden_dim,
-                        &gate_proj,
-                        &up_proj,
-                        &down_proj,
-                        inter_dim,
-                        &down,
-                    )?;
-                }
-                self.encode_copy(
+                self.encode_resident_dense_mlp(
                     encoder,
-                    attention_state_buffer,
-                    output_buffer,
-                    hidden_len,
+                    owned,
+                    post_normed_buffer,
+                    &mlp,
+                    &scratch,
+                    spec.seq,
+                    hidden_dim,
                 )?;
+                self.encode_copy(encoder, attention_state_buffer, output_buffer, hidden_len)?;
                 self.encode_accumulate_scaled(
                     encoder,
                     owned,
-                    &down,
+                    &scratch.down,
                     output_buffer,
                     1.0,
                     hidden_len,
@@ -1198,10 +1153,8 @@ impl MetalExecutor {
                     down,
                     ffn_normed,
                 },
-            ) => self.run_resident_prefill_section(
-                context,
-                "tail_gemma_dense",
-                |encoder, owned| {
+            ) => {
+                self.run_resident_prefill_section(context, "tail_gemma_dense", |encoder, owned| {
                     self.encode_gemma_dense_tail_rows(
                         encoder,
                         owned,
@@ -1224,8 +1177,8 @@ impl MetalExecutor {
                         &down,
                         &ffn_normed,
                     )
-                },
-            ),
+                })
+            }
             (
                 PrefillMoeTail::GemmaParallel { top_k, .. },
                 PrefillResidentTailShape::GemmaParallel {
@@ -1301,6 +1254,7 @@ impl MetalExecutor {
                 PrefillResidentTailShape::Routed {
                     expert_count,
                     stacked,
+                    sigmoid_shared,
                 },
                 PrefillResidentTailScratch::Routed {
                     router: router_buffer,
@@ -1310,6 +1264,7 @@ impl MetalExecutor {
                     up: up_buffer,
                     hidden: hidden_buffer,
                     down: down_buffer,
+                    sigmoid_shared: sigmoid_shared_scratch,
                 },
             ) => {
                 let total_topk = checked_len(spec.seq, top_k, "resident topk total")?;
@@ -1319,7 +1274,10 @@ impl MetalExecutor {
                 // `moe_routed_coop_prefill_enabled`). Le défaut garde le chemin
                 // gather-qmv par lignes, byte-identique à la base. Le routeur n'est
                 // résolu que dans la branche coop.
-                if moe_routed_coop_prefill_enabled()
+                // Le coop route en softmax : le MoE sigmoïde flint garde le
+                // chemin gather par lignes.
+                if sigmoid_shared.is_none()
+                    && moe_routed_coop_prefill_enabled()
                     && MetalMoeRoutedWeights::stacked_coop_compatible(&stacked)
                 {
                     let weights = MetalMoeRoutedWeights {
@@ -1351,19 +1309,27 @@ impl MetalExecutor {
                         },
                     )
                 } else {
-                    self.run_resident_prefill_section(
-                        context,
-                        "router_topk",
-                        |encoder, owned| {
-                            self.encode_matmul_weight(
+                    self.run_resident_prefill_section(context, "router_topk", |encoder, owned| {
+                        self.encode_matmul_weight(
+                            encoder,
+                            owned,
+                            post_normed_buffer,
+                            spec.seq,
+                            hidden_dim,
+                            router.weight(),
+                            &router_buffer,
+                        )?;
+                        if sigmoid_shared.is_some() {
+                            self.encode_topk_sigmoid_rows(
                                 encoder,
-                                owned,
-                                post_normed_buffer,
-                                spec.seq,
-                                hidden_dim,
-                                router.weight(),
                                 &router_buffer,
-                            )?;
+                                &indices_buffer,
+                                &scores_buffer,
+                                spec.seq,
+                                expert_count,
+                                top_k,
+                            )
+                        } else {
                             self.encode_topk_softmax_rows(
                                 encoder,
                                 &router_buffer,
@@ -1373,71 +1339,63 @@ impl MetalExecutor {
                                 expert_count,
                                 top_k,
                             )
-                        },
-                    )?;
-                    self.run_resident_prefill_section(
-                        context,
-                        "moe_gate_up",
-                        |encoder, owned| {
-                            if !self.encode_gather_gate_up_swiglu(
+                        }
+                    })?;
+                    self.run_resident_prefill_section(context, "moe_gate_up", |encoder, owned| {
+                        if !self.encode_gather_gate_up_swiglu(
+                            encoder,
+                            owned,
+                            post_normed_buffer,
+                            spec.seq,
+                            &stacked.gate,
+                            &stacked.up,
+                            &indices_buffer,
+                            total_topk,
+                            &hidden_buffer,
+                        )? {
+                            self.encode_gather_matmul(
                                 encoder,
                                 owned,
                                 post_normed_buffer,
                                 spec.seq,
                                 &stacked.gate,
-                                &stacked.up,
                                 &indices_buffer,
                                 total_topk,
-                                &hidden_buffer,
-                            )? {
-                                self.encode_gather_matmul(
-                                    encoder,
-                                    owned,
-                                    post_normed_buffer,
-                                    spec.seq,
-                                    &stacked.gate,
-                                    &indices_buffer,
-                                    total_topk,
-                                    &gate_buffer,
-                                )?;
-                                self.encode_gather_matmul(
-                                    encoder,
-                                    owned,
-                                    post_normed_buffer,
-                                    spec.seq,
-                                    &stacked.up,
-                                    &indices_buffer,
-                                    total_topk,
-                                    &up_buffer,
-                                )?;
-                                self.encode_swiglu(
-                                    encoder,
-                                    owned,
-                                    &gate_buffer,
-                                    &up_buffer,
-                                    &hidden_buffer,
-                                    checked_len(total_topk, inter_dim, "resident swiglu")?,
-                                )?;
-                            }
-                            Ok(())
-                        },
-                    )?;
-                    self.run_resident_prefill_section(
-                        context,
-                        "moe_down",
-                        |encoder, owned| {
+                                &gate_buffer,
+                            )?;
                             self.encode_gather_matmul(
                                 encoder,
                                 owned,
-                                &hidden_buffer,
-                                total_topk,
-                                &stacked.down,
+                                post_normed_buffer,
+                                spec.seq,
+                                &stacked.up,
                                 &indices_buffer,
                                 total_topk,
-                                &down_buffer,
-                            )
-                        },
-                    )?;
+                                &up_buffer,
+                            )?;
+                            self.encode_swiglu(
+                                encoder,
+                                owned,
+                                &gate_buffer,
+                                &up_buffer,
+                                &hidden_buffer,
+                                checked_len(total_topk, inter_dim, "resident swiglu")?,
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                    self.run_resident_prefill_section(context, "moe_down", |encoder, owned| {
+                        self.encode_gather_matmul(
+                            encoder,
+                            owned,
+                            &hidden_buffer,
+                            total_topk,
+                            &stacked.down,
+                            &indices_buffer,
+                            total_topk,
+                            &down_buffer,
+                        )
+                    })?;
                     self.run_resident_prefill_section(
                         context,
                         "moe_weighted_sum",
@@ -1454,7 +1412,38 @@ impl MetalExecutor {
                                 hidden_dim,
                             )
                         },
-                    )
+                    )?;
+                    match (sigmoid_shared, sigmoid_shared_scratch) {
+                        (None, None) => Ok(()),
+                        // Expert partagé flint, sans gate : ajouté tel quel au
+                        // flux qui porte déjà résiduel et experts routés.
+                        (Some(mlp), Some(scratch)) => self.run_resident_prefill_section(
+                            context,
+                            "moe_shared_ungated",
+                            |encoder, owned| {
+                                self.encode_resident_dense_mlp(
+                                    encoder,
+                                    owned,
+                                    post_normed_buffer,
+                                    &mlp,
+                                    &scratch,
+                                    spec.seq,
+                                    hidden_dim,
+                                )?;
+                                self.encode_accumulate_scaled(
+                                    encoder,
+                                    owned,
+                                    &scratch.down,
+                                    output_buffer,
+                                    1.0,
+                                    hidden_len,
+                                )
+                            },
+                        ),
+                        _ => Err(InferError::Dimension(format!(
+                            "prefill résident expert partagé sigmoïde incohérent couche {layer_index}"
+                        ))),
+                    }
                 }
             }
             (
@@ -1504,6 +1493,80 @@ impl MetalExecutor {
                 "prefill résident tail MoE incohérent couche {layer_index}"
             ))),
         }
+    }
+}
+
+impl MetalExecutor {
+    /// MLP SwiGLU dense de `seq` lignes `input` vers `scratch.down`, fusionné
+    /// ou non selon le scratch alloué.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "MLP dense résident: buffers, poids et dimensions restent explicites"
+    )]
+    fn encode_resident_dense_mlp(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        owned: &mut Vec<Buffer>,
+        input: &BufferRef,
+        mlp: &PrefillResidentDenseMlp,
+        scratch: &PrefillResidentDenseScratch,
+        seq: usize,
+        hidden_dim: usize,
+    ) -> Result<()> {
+        let inter_dim = mlp.inter_dim;
+        let Some((gate, up, hidden)) = &scratch.unfused else {
+            return self.encode_fused_dense_mlp(
+                encoder,
+                input,
+                seq,
+                hidden_dim,
+                &mlp.gate_proj,
+                &mlp.up_proj,
+                &mlp.down_proj,
+                inter_dim,
+                &scratch.down,
+            );
+        };
+        let gate_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            input,
+            seq,
+            hidden_dim,
+            &mlp.gate_proj,
+            gate,
+            false,
+        )?;
+        let up_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            input,
+            seq,
+            hidden_dim,
+            &mlp.up_proj,
+            up,
+            false,
+        )?;
+        if gate_dim != inter_dim || up_dim != inter_dim {
+            return Err(InferError::Dimension(format!(
+                "prefill résident dense gate/up sortent gate={gate_dim} up={up_dim}, attendu {inter_dim}"
+            )));
+        }
+        let inter_len = checked_len(seq, inter_dim, "resident dense inter")?;
+        self.encode_swiglu(encoder, owned, gate, up, hidden, inter_len)?;
+        let down_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            hidden,
+            seq,
+            inter_dim,
+            &mlp.down_proj,
+            &scratch.down,
+            false,
+        )?;
+        if down_dim != hidden_dim {
+            return Err(InferError::Dimension(format!(
+                "prefill résident dense down sort {down_dim}, attendu {hidden_dim}"
+            )));
+        }
+        Ok(())
     }
 }
 
