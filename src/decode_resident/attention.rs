@@ -1277,6 +1277,48 @@ impl FullAttentionMetalState {
         q: &[f32],
         window_start: usize,
     ) -> Result<Vec<f32>> {
+        self.attention_decode_with(q, |encoder, q_buf, scores_buf, out_buf| {
+            self.encode_attention_decode_windowed(encoder, q_buf, scores_buf, out_buf, window_start)
+        })
+    }
+
+    /// Oracle GPU du 2-passes fenêtré avec sink : force le naïf avec sink sur
+    /// les lignes `window_start..len`, quel que soit le choix de production.
+    #[cfg(test)]
+    pub(crate) fn attention_decode_sink_naive(
+        &self,
+        q: &[f32],
+        window_start: usize,
+    ) -> Result<Vec<f32>> {
+        let sinks = self
+            .sinks
+            .as_ref()
+            .ok_or_else(|| InferError::Config("naïf avec sink sans sinks".to_string()))?;
+        let dims = U32x4Param::Bytes([
+            to_u32(self.q_heads, "q_heads")?,
+            to_u32(self.kv_heads, "kv_heads")?,
+            to_u32(self.head_dim, "head_dim")?,
+            to_u32(self.len, "len")?,
+        ]);
+        self.attention_decode_with(q, |encoder, q_buf, scores_buf, out_buf| {
+            self.encode_attention_decode_sink_naive(
+                encoder,
+                q_buf,
+                scores_buf,
+                out_buf,
+                window_start,
+                dims,
+                sinks,
+            )
+        })
+    }
+
+    /// Exécute un encodage d'attention decode sur `q` uploadé et relit la sortie.
+    fn attention_decode_with(
+        &self,
+        q: &[f32],
+        encode: impl FnOnce(&ComputeCommandEncoderRef, &BufferRef, &BufferRef, &BufferRef) -> Result<()>,
+    ) -> Result<Vec<f32>> {
         if self.len == 0 {
             return Err(InferError::Dimension(
                 "attention_decode sur KV vide".to_string(),
@@ -1306,12 +1348,11 @@ impl FullAttentionMetalState {
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
-        self.encode_attention_decode_windowed(
+        encode(
             encoder,
             q_buf.tensor().buffer(),
             scores.tensor().buffer(),
             out.tensor().buffer(),
-            window_start,
         )?;
         encoder_guard.end();
         commit_and_wait(command_buffer)?;
@@ -1469,7 +1510,7 @@ impl FullAttentionMetalState {
                 out_buf,
                 len_bound,
                 two_pass_dims,
-                None,
+                (None, 0),
             );
         }
         // Bascule 2-passes split-K pour les longs KV (dédup GQA + tuiles L1) :
@@ -1489,7 +1530,7 @@ impl FullAttentionMetalState {
                 out_buf,
                 len_bound,
                 two_pass_dims,
-                None,
+                (None, 0),
             );
         }
         // Le chemin fenêtré privilégie d'abord la correction : le kernel naïf
@@ -1541,9 +1582,10 @@ impl FullAttentionMetalState {
         Ok(())
     }
 
-    /// Attention decode d'une couche à sinks. Fenêtre nulle, d128 et GQA réelle :
-    /// 2-passes avec le sink en passe 2 (quelle que soit la longueur, les blocs
-    /// vides étant neutralisés par la passe 2). Sinon naïf fenêtré avec sink.
+    /// Attention decode d'une couche à sinks. d128 et GQA réelle : 2-passes avec
+    /// le sink en passe 2 (quelle que soit la longueur, les blocs vides étant
+    /// neutralisés par la passe 2). Une fenêtre glissante devient une vue du KV
+    /// décalée de `window_start` lignes. Sinon naïf fenêtré avec sink.
     #[expect(
         clippy::too_many_arguments,
         reason = "encodage Metal: buffers + fenêtre + borne + dims + sinks"
@@ -1567,24 +1609,75 @@ impl FullAttentionMetalState {
             _ => &self.attention_2pass_1_d128,
         }
         .max_total_threads_per_threadgroup();
-        let two_pass = window_start == 0
-            && sdpa_2pass_enabled()
+        let two_pass = sdpa_2pass_enabled()
             && self.head_dim == 128
             && gqa > 1
             && self.q_heads % self.kv_heads == 0
             && u64::try_from(32 * gqa).is_ok_and(|threads| threads <= pass1_threads);
-        if two_pass {
+        if two_pass && window_start == 0 {
             return self.encode_attention_decode_2pass(
                 encoder,
                 q_buf,
                 out_buf,
                 len_bound,
                 two_pass_dims,
-                Some(sinks),
+                (Some(sinks), 0),
             );
         }
-        // ponytail: naïf sériel sur la fenêtre (513 lignes flint) ; un 2-passes
-        // fenêtré avec sink viendra si le decode des couches glissantes domine.
+        // Fenêtre glissante : la passe 1 lit une vue du KV commençant à
+        // `window_start`, sur la seule longueur de la fenêtre. Les blocs sont
+        // dimensionnés sur cette longueur (32 pour 513 lignes) : les dimensionner
+        // sur le contexte complet gaspillerait des partitions vides. Une fenêtre
+        // non nulle ne vient que de `encode_attention_decode_windowed`, dont la
+        // borne est la longueur hôte : les dims peuvent être reconstruites ici.
+        if two_pass {
+            let window_len = len_bound.checked_sub(window_start).ok_or_else(|| {
+                InferError::Dimension(format!(
+                    "attention_decode fenêtre vide: début={window_start}, borne={len_bound}"
+                ))
+            })?;
+            let window_dims = U32x4Param::Bytes([
+                to_u32(self.q_heads, "2pass q_heads")?,
+                to_u32(self.kv_heads, "2pass kv_heads")?,
+                to_u32(window_len, "2pass fenêtre")?,
+                to_u32(sdpa_2pass_blocks(window_len), "2pass blocks")?,
+            ]);
+            return self.encode_attention_decode_2pass(
+                encoder,
+                q_buf,
+                out_buf,
+                window_len,
+                window_dims,
+                (Some(sinks), window_start),
+            );
+        }
+        self.encode_attention_decode_sink_naive(
+            encoder,
+            q_buf,
+            scores_buf,
+            out_buf,
+            window_start,
+            sdpa_dims,
+            sinks,
+        )
+    }
+
+    /// Naïf avec sink sur les lignes `window_start..len` : un threadgroup par
+    /// tête Q, softmax sériel. Repli hors d128/GQA et oracle du 2-passes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: buffers + fenêtre + dims + sinks"
+    )]
+    fn encode_attention_decode_sink_naive(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &BufferRef,
+        scores_buf: &BufferRef,
+        out_buf: &BufferRef,
+        window_start: usize,
+        sdpa_dims: U32x4Param<'_>,
+        sinks: &AttentionSinks,
+    ) -> Result<()> {
         let pipeline = match self.keys.element() {
             GpuElement::F32 => &sinks.kernels.naive_f32,
             GpuElement::Bf16 => &sinks.kernels.naive_bf16,
@@ -1629,7 +1722,8 @@ impl FullAttentionMetalState {
     /// Renvoie une erreur si une dimension déborde ou si l'allocation scratch échoue.
     ///
     /// `sinks = Some` remplace la passe 2 d128 par sa variante avec sink (passe 1
-    /// inchangée : le sink ne touche aucune partition).
+    /// inchangée : le sink ne touche aucune partition). `first_row` décale la vue
+    /// K/V lue par la passe 1 (début de fenêtre glissante, 0 sinon).
     fn encode_attention_decode_2pass(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1637,7 +1731,7 @@ impl FullAttentionMetalState {
         out_buf: &BufferRef,
         len_bound: usize,
         dims: U32x4Param<'_>,
-        sinks: Option<&AttentionSinks>,
+        (sinks, first_row): (Option<&AttentionSinks>, usize),
     ) -> Result<()> {
         // Grille dimensionnée par la borne : en position GPU, les blocs au-delà de
         // la longueur effective restent vides (max=-inf, somme 0) et la passe 2
@@ -1677,10 +1771,22 @@ impl FullAttentionMetalState {
                 }
             },
         };
+        // Le KV quantifié porte des échelles indexées par ligne absolue : seule
+        // la vue dense peut être décalée.
+        if first_row != 0 && self.quant.is_some() {
+            return Err(InferError::Config(
+                "attention_decode 2pass fenêtré sur KV quantifié".to_string(),
+            ));
+        }
+        let kv_offset = first_row
+            .checked_mul(self.kv_dim())
+            .and_then(|cells| cells.checked_mul(self.keys.element().byte_size()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| InferError::Dimension("2pass offset fenêtre déborde".to_string()))?;
         encoder.set_compute_pipeline_state(pass1);
         encoder.set_buffer(0, Some(q_buf), 0);
-        encoder.set_buffer(1, Some(self.keys.buffer()), 0);
-        encoder.set_buffer(2, Some(self.values.buffer()), 0);
+        encoder.set_buffer(1, Some(self.keys.buffer()), kv_offset);
+        encoder.set_buffer(2, Some(self.values.buffer()), kv_offset);
         encoder.set_buffer(3, Some(partials.tensor().buffer()), 0);
         encoder.set_buffer(4, Some(sums.tensor().buffer()), 0);
         encoder.set_buffer(5, Some(maxs.tensor().buffer()), 0);
