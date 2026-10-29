@@ -75,7 +75,10 @@ kernel void attention_decode_naive_f32(
             scores[score_base + r] *= inv_sum;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Les probabilités écrites par le thread 0 dans `scores` (mémoire device)
+    // sont relues par tous les threads : `mem_threadgroup` seul n'en garantit
+    // pas la visibilité.
+    threadgroup_barrier(mem_flags::mem_device);
 
     // Phase 3 : out[head, c] = Σ_r softmax[r] * values[r, kv_head, c]
     for (uint c = tid; c < head_dim; c += 256u) {
@@ -152,7 +155,8 @@ kernel void attention_decode_naive_bf16(
             scores[score_base + r] *= inv_sum;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Même relecture des probabilités device que la variante f32.
+    threadgroup_barrier(mem_flags::mem_device);
 
     for (uint c = tid; c < head_dim; c += 256u) {
         float acc = 0.0f;
