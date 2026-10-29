@@ -321,7 +321,11 @@ kernel void kv_quantize_rows_q4(
 /// `attention_decode_2pass_1_rows_dDHEAD_SUFFIX` (rows.rs) : mêmes grille,
 /// partiels et passe 2. Chaque lane lit ses `QK` codes bruts et applique
 /// l'échelle et le biais de son groupe hors des produits (cf. le kernel) :
-/// l'arrondi diffère donc de `dequantize_rows` à l'ulp près. Le mono-ligne
+/// l'arrondi diffère donc de `dequantize_rows`. Côté V, `o` et `o_bias`
+/// s'accumulent séparément puis s'additionnent : quand ils se compensent,
+/// l'écart grandit (simulation Q8 fp32, 256k lignes identiques, extrema ±100 :
+/// 2,7e-4 contre un pas de quantification de 0,78), sans commune mesure avec
+/// l'erreur de quantification elle-même. Le mono-ligne
 /// est le cas `rows = 1` (`tidtg.z = 0`). Une lane lit un groupe entier
 /// d'échelle (64 ≥ QK) : une seule paire par lane et par ligne.
 ///
