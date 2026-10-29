@@ -980,6 +980,42 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Encode le top-k du routeur sigmoïde flint (kernel jumeau de
+    /// `topk_softmax_f32`) : sélection sur `sigmoid(logit)`, poids renormalisés
+    /// par la somme des scores retenus. Le softmax n'est pas touché.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `topk` est invalide ou si une dimension déborde.
+    pub(crate) fn encode_topk_sigmoid(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buffer: &BufferRef,
+        indices_buffer: &BufferRef,
+        scores_buffer: &BufferRef,
+        count: usize,
+        topk: usize,
+    ) -> Result<()> {
+        ensure_valid_top_k(topk, count)?;
+        let dims = [
+            checked_u32(count, "topk sigmoid count")?,
+            checked_u32(topk, "topk sigmoid")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.topk_sigmoid_f32);
+        encoder.set_buffer(0, Some(logits_buffer), 0);
+        encoder.set_buffer(1, Some(indices_buffer), 0);
+        encoder.set_buffer(2, Some(scores_buffer), 0);
+        set_u32_bytes(encoder, 3, &dims, "topk_sigmoid_dims")?;
+        trace_dispatch_path("topk_sigmoid_f32", 1, topk, count);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(1, 1, 1),
+            MTLSize::new(TOPK_SOFTMAX_TG_WIDTH, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
     /// Microbench isolé du kernel top-k decode (router 256 -> top-8).
     ///
     /// Encode plusieurs dispatchs dans un seul command buffer : le temps mesuré

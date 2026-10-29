@@ -9301,6 +9301,99 @@ kernel void topk_softmax_f32(
     }
 }
 
+// Routage sigmoïde flint : jumeau de `topk_softmax_f32`. La sélection porte
+// sur `sigmoid(logit)` et non sur le logit, pour départager comme l'oracle CPU
+// (`sigmoid_top_weights`) les scores saturés à 1,0 en f32 ; le poids est le
+// score divisé par la somme des scores retenus (+1e-20, référence SGLang).
+kernel void topk_sigmoid_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* indices [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint2& dims [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    const uint count = dims.x;
+    const uint topk = dims.y;
+    const uint width = 32u;
+    const uint max_topk = 16u;
+    threadgroup float partial_values[32u * 16u];
+    threadgroup uint partial_indices[32u * 16u];
+
+    float best_values[16];
+    uint best_indices[16];
+    for (uint slot = 0u; slot < max_topk; ++slot) {
+        best_values[slot] = -3.402823466e38f;
+        best_indices[slot] = 0xffffffffu;
+    }
+
+    for (uint idx = tid; idx < count; idx += width) {
+        const float value = 1.0f / (1.0f + exp(-logits[idx]));
+        for (uint slot = 0u; slot < topk; ++slot) {
+            if (topk_better(value, idx, best_values[slot], best_indices[slot])) {
+                for (uint shift = topk - 1u; shift > slot; --shift) {
+                    best_values[shift] = best_values[shift - 1u];
+                    best_indices[shift] = best_indices[shift - 1u];
+                }
+                best_values[slot] = value;
+                best_indices[slot] = idx;
+                break;
+            }
+        }
+    }
+
+    const uint local_base = tid * max_topk;
+    for (uint slot = 0u; slot < max_topk; ++slot) {
+        partial_values[local_base + slot] = best_values[slot];
+        partial_indices[local_base + slot] = best_indices[slot];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const uint left_base = tid * max_topk;
+            const uint right_base = (tid + stride) * max_topk;
+            float merged_values[16];
+            uint merged_indices[16];
+            for (uint slot = 0u; slot < max_topk; ++slot) {
+                merged_values[slot] = partial_values[left_base + slot];
+                merged_indices[slot] = partial_indices[left_base + slot];
+            }
+            for (uint src = 0u; src < topk; ++src) {
+                const float value = partial_values[right_base + src];
+                const uint index = partial_indices[right_base + src];
+                for (uint slot = 0u; slot < topk; ++slot) {
+                    if (topk_better(value, index, merged_values[slot], merged_indices[slot])) {
+                        for (uint shift = topk - 1u; shift > slot; --shift) {
+                            merged_values[shift] = merged_values[shift - 1u];
+                            merged_indices[shift] = merged_indices[shift - 1u];
+                        }
+                        merged_values[slot] = value;
+                        merged_indices[slot] = index;
+                        break;
+                    }
+                }
+            }
+            for (uint slot = 0u; slot < topk; ++slot) {
+                partial_values[left_base + slot] = merged_values[slot];
+                partial_indices[left_base + slot] = merged_indices[slot];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        float denom = 0.0f;
+        for (uint slot = 0u; slot < topk; ++slot) {
+            denom += partial_values[slot];
+        }
+        denom += 1.0e-20f;
+        for (uint slot = 0u; slot < topk; ++slot) {
+            indices[slot] = partial_indices[slot];
+            scores[slot] = partial_values[slot] / denom;
+        }
+    }
+}
+
 kernel void topk8_softmax_256_f32(
     device const float* logits [[buffer(0)]],
     device uint* indices [[buffer(1)]],

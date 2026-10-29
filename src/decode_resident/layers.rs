@@ -1093,19 +1093,44 @@ impl DecodeResidentState {
                         layer_scalar: weights.layer_scalar,
                     },
                 ),
-            (None, None) => self.encode_dense_tail(
-                executor,
-                encoder,
-                owned,
-                post_normed.tensor().buffer(),
-                summed.tensor().buffer(),
-                layer_out,
-                hidden,
-                weights.gate_proj,
-                weights.up_proj,
-                weights.down_proj,
-                weights.tail_score,
-            ),
+            (None, None) => {
+                // flint : résiduel + routé sigmoïde, puis l'expert partagé sans
+                // gate ajouté par le tail dense (score 1,0) — même somme que
+                // l'oracle CPU, à l'ordre d'accumulation f32 près.
+                let routed = match weights.sigmoid_moe {
+                    Some((moe, top_k)) => {
+                        let routed = self.scratch().lease(hidden, GpuElement::F32)?;
+                        executor.encode_moe_routed_sigmoid_buffers(
+                            encoder,
+                            owned,
+                            post_normed.tensor().buffer(),
+                            Some(summed.tensor().buffer()),
+                            routed.tensor().buffer(),
+                            hidden,
+                            moe,
+                            top_k,
+                        )?;
+                        Some(routed)
+                    }
+                    None => None,
+                };
+                let residual = routed
+                    .as_ref()
+                    .map_or(summed.tensor().buffer(), |routed| routed.tensor().buffer());
+                self.encode_dense_tail(
+                    executor,
+                    encoder,
+                    owned,
+                    post_normed.tensor().buffer(),
+                    residual,
+                    layer_out,
+                    hidden,
+                    weights.gate_proj,
+                    weights.up_proj,
+                    weights.down_proj,
+                    weights.tail_score,
+                )
+            }
             _ => Err(InferError::Config(
                 "normes feed-forward Gemma résidentes partielles".to_string(),
             )),
@@ -1237,6 +1262,11 @@ impl DecodeResidentState {
         if !dims.attn_output_gate {
             return Err(InferError::Config(
                 "full-attn dense batché attend attn_output_gate=true".to_string(),
+            ));
+        }
+        if weights.sigmoid_moe.is_some() {
+            return Err(InferError::Config(
+                "full-attn dense batché sans MoE sigmoïde (flint)".to_string(),
             ));
         }
         let qkv_proj_dim = q_proj_dim

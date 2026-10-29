@@ -77,6 +77,46 @@ impl MetalExecutor {
             weights,
             top_k,
             activation,
+            crate::RouterScore::Softmax,
+        )
+    }
+
+    /// Encode le MoE routé du routeur sigmoïde flint dans un encoder partagé.
+    ///
+    /// Même chemin que [`Self::encode_moe_routed_buffers`] (gather SwiGLU,
+    /// somme pondérée, résiduel fusionné) ; seul le top-k diffère.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension est incompatible ou si un dispatch échoue.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirror des poids MoE routed résolus (routeur + experts)"
+    )]
+    pub(crate) fn encode_moe_routed_sigmoid_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        owned_buffers: &mut Vec<Buffer>,
+        input_buffer: &BufferRef,
+        residual: Option<&BufferRef>,
+        output_buffer: &BufferRef,
+        in_dim: usize,
+        weights: &MetalMoeRoutedWeights,
+        top_k: usize,
+    ) -> Result<()> {
+        self.encode_moe_routed_buffers_with_router_input_and_activation(
+            encoder,
+            owned_buffers,
+            input_buffer,
+            input_buffer,
+            None,
+            residual,
+            output_buffer,
+            in_dim,
+            weights,
+            top_k,
+            crate::Activation::Silu,
+            crate::RouterScore::Sigmoid,
         )
     }
 
@@ -98,6 +138,7 @@ impl MetalExecutor {
         weights: &MetalMoeRoutedWeights,
         top_k: usize,
         activation: crate::Activation,
+        router_score: crate::RouterScore,
     ) -> Result<()> {
         let shape = self.check_moe_routed_buffer_shapes(in_dim, weights, top_k)?;
         let scratch = self.allocate_moe_routed_scratch(
@@ -122,15 +163,25 @@ impl MetalExecutor {
                 shape.expert_count
             )));
         }
-        self.encode_topk_softmax(
-            encoder,
-            owned_buffers,
-            &scratch.router,
-            &scratch.indices,
-            &scratch.scores,
-            shape.expert_count,
-            top_k,
-        )?;
+        match router_score {
+            crate::RouterScore::Softmax => self.encode_topk_softmax(
+                encoder,
+                owned_buffers,
+                &scratch.router,
+                &scratch.indices,
+                &scratch.scores,
+                shape.expert_count,
+                top_k,
+            )?,
+            crate::RouterScore::Sigmoid => self.encode_topk_sigmoid(
+                encoder,
+                &scratch.router,
+                &scratch.indices,
+                &scratch.scores,
+                shape.expert_count,
+                top_k,
+            )?,
+        }
         if let Some(scale) = per_expert_scale {
             self.encode_scale_topk_scores(
                 encoder,
@@ -308,6 +359,7 @@ impl MetalExecutor {
                 weights,
                 top_k,
                 activation,
+                crate::RouterScore::Softmax,
             );
         }
 

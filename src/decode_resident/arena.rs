@@ -370,6 +370,7 @@ impl DecodeResidentState {
             gpu_position_kernels: OnceLock::new(),
             rows_kernels: OnceLock::new(),
             kv_quant_kernels: OnceLock::new(),
+            sink_kernels: OnceLock::new(),
             timer,
             scratch_namespace: 0,
         })

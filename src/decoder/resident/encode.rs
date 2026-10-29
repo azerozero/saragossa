@@ -39,8 +39,14 @@ impl CausalDecoder {
         let kv = layer_cache.full.as_mut().ok_or_else(|| {
             InferError::Metal("KV full-attn résident absent (decode résident)".to_string())
         })?;
+        // Une couche MoE flint est résolue en `FullDense` (expert partagé sans
+        // gate + MoE sigmoïde) : elle prend le chemin dense.
+        let dense_buffers = matches!(
+            arena.layers.get(index),
+            Some(ResidentLayerBuffers::FullDense(_))
+        );
         match layer.mlp.as_ref() {
-            Some(FeedForward::Moe(_)) => {
+            Some(FeedForward::Moe(_)) if !dense_buffers => {
                 match arena.layers.get(index).ok_or_else(|| {
                     InferError::Config(format!("poids résidents couche {index} absents"))
                 })? {
@@ -88,7 +94,7 @@ impl CausalDecoder {
                     ))),
                 }
             }
-            Some(FeedForward::Dense(_)) => {
+            Some(_) => {
                 let ResidentLayerBuffers::FullDense(resolved) =
                     arena.layers.get(index).ok_or_else(|| {
                         InferError::Config(format!("poids résidents couche {index} absents"))
@@ -118,6 +124,7 @@ impl CausalDecoder {
                     down_proj: &resolved.down_proj,
                     tail_score: &arena.dense_tail_score,
                     parallel_moe: resolved.parallel_moe_weights(),
+                    sigmoid_moe: resolved.sigmoid_moe_weights(),
                 };
                 arena.state.encode_full_attn_dense_layer(
                     metal, encoder, owned, kv, weights, dims, layer_in, layer_out,
@@ -368,6 +375,7 @@ impl CausalDecoder {
             down_proj: &resolved.down_proj,
             tail_score: &arena.dense_tail_score,
             parallel_moe: resolved.parallel_moe_weights(),
+            sigmoid_moe: resolved.sigmoid_moe_weights(),
         };
         match position {
             Some(position) => arena.state.encode_full_attn_dense_layer_rows_gpu_position(

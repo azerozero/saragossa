@@ -237,9 +237,9 @@ impl DecoderLayer {
     /// shared-expert/router biasless est re-vérifié à l'encodage (`ensure_biasless`).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn supports_resident_full(&self) -> bool {
-        if self.metal_unsupported() {
-            return false;
-        }
+        // NOTE: Sinks, NoPE et MoE flint (sigmoïde + expert partagé sans gate)
+        // ont leurs kernels résidents ; `metal_unsupported` ne garde ici que
+        // les chemins per-op, qui eux les ignorent.
         // Le tail Gemma résident exige la paire de normes FFN complète.
         if self.pre_feedforward_norm.is_some() != self.post_feedforward_norm.is_some() {
             return false;
@@ -255,7 +255,9 @@ impl DecoderLayer {
                 mlp.shared_metal_parts().is_none() && mlp.metal_parts().is_some()
             }
             FeedForward::Moe(mlp) => {
-                mlp.shared_metal_parts().is_some() || mlp.metal_parts().is_some()
+                mlp.shared_metal_parts().is_some()
+                    || mlp.metal_parts().is_some()
+                    || mlp.sigmoid_metal_parts().is_some()
             }
             FeedForward::Dense(mlp) => {
                 let (gate_proj, up_proj, down_proj) = mlp.projections();

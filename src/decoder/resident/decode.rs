@@ -77,6 +77,57 @@ impl CausalDecoder {
             .map_err(|_| InferError::Metal(format!("token résident hors usize: {raw}")))
     }
 
+    /// Oracle de test : prefill (CPU pour flint) de `prompt`, puis decode résident
+    /// complet des tokens `forced` ; renvoie les logits GPU bruts de chaque pas,
+    /// relus depuis le lm_head résident. Erreur si l'arène ne s'établit pas,
+    /// pour qu'un repli per-op silencieux ne passe pas pour un succès.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le decode résident est indisponible ou échoue.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn resident_forced_logits_for_test(
+        &self,
+        prompt: &[usize],
+        forced: &[usize],
+        kv_bf16: bool,
+    ) -> Result<Vec<Vec<f32>>> {
+        let (mut cache, _) = self.prefill_cache_state(prompt)?;
+        if !self.supports_resident_full_decode()
+            || !self.setup_resident_full_decode(&mut cache, forced.len(), 0, kv_bf16)?
+        {
+            return Err(InferError::Config(
+                "decode résident complet indisponible".to_string(),
+            ));
+        }
+        let mut rows = Vec::with_capacity(forced.len());
+        for &token in forced {
+            let spec = ResidentSampleSpec {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 0,
+                rng_state: 0,
+                mode: ResidentSampleMode::Readback,
+            };
+            let inflight = self.enqueue_decode_token_resident(
+                &mut cache,
+                ResidentDecodeInput::CpuToken(token),
+                None,
+                None,
+                Some(spec),
+            )?;
+            crate::metal_backend::wait_for_completion(&inflight.command_buffer)?;
+            let readback = inflight
+                .logits_readback
+                .ok_or_else(|| InferError::Metal("logits résidents absents".to_string()))?;
+            rows.push(crate::metal_backend::read_f32_buffer(
+                &readback.buffer,
+                readback.len,
+            )?);
+        }
+        Ok(rows)
+    }
+
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(in crate::decoder) fn decode_tokens_resident_pipelined(
         &self,
@@ -188,7 +239,7 @@ impl CausalDecoder {
         pipeline_slot: Option<usize>,
         sample: Option<ResidentSampleSpec>,
     ) -> Result<ResidentDecodeInflight> {
-        let Some(metal) = self.forward_runtime().metal_executor() else {
+        let Some(metal) = self.resident_metal() else {
             return Err(InferError::Metal(
                 "decode résident sans executor Metal".to_string(),
             ));

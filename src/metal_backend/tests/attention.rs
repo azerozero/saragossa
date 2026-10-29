@@ -1197,6 +1197,50 @@ fn topk_softmax_gpu_matches_cpu_routing() -> Result<()> {
     Ok(())
 }
 
+/// Routage sigmoïde flint GPU (`topk_sigmoid_f32`) contre l'oracle CPU
+/// `sigmoid_top_weights` : 256 experts top-6 comme flint, logits distincts puis
+/// scores saturés à 1,0 (égalités départagées par indice des deux côtés).
+#[test]
+fn topk_sigmoid_gpu_matches_cpu_routing() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let distinct = (0..256)
+        .map(|i| ((i * 37) % 256) as f32 * 0.05 - 6.0)
+        .collect::<Vec<_>>();
+    let mut saturated = distinct.clone();
+    for index in [200, 17, 90, 4] {
+        saturated[index] = 30.0 + index as f32;
+    }
+    for (logits, top_k) in [(distinct.clone(), 6), (saturated, 6), (distinct, 1)] {
+        let logits_buffer = executor.upload_f32_buffer(&logits, "topk_sigmoid_logits")?;
+        let indices_buffer = executor.uncached_u32_buffer(top_k, "topk_sigmoid_indices")?;
+        let scores_buffer = executor.uncached_f32_buffer(top_k, "topk_sigmoid_scores")?;
+        let command_buffer = executor.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoded = executor.encode_topk_sigmoid(
+            encoder,
+            &logits_buffer,
+            &indices_buffer,
+            &scores_buffer,
+            logits.len(),
+            top_k,
+        );
+        encoder.end_encoding();
+        encoded?;
+        commit_and_wait(command_buffer)?;
+        let gpu_indices = read_u32_buffer(&indices_buffer, top_k)?
+            .into_iter()
+            .map(|index| index as usize)
+            .collect::<Vec<_>>();
+        let gpu_scores = read_f32_buffer(&scores_buffer, top_k)?;
+        let (cpu_indices, cpu_scores) = crate::mlp::sigmoid_top_weights(&logits, top_k);
+        assert_eq!(gpu_indices, cpu_indices, "sélection sigmoïde GPU != CPU");
+        assert_close_eps(&gpu_scores, &cpu_scores, 1.0e-6);
+    }
+    Ok(())
+}
+
 /// Encode le kernel top-k réel sur `logits` et relit indices + scores.
 fn gpu_topk_softmax(
     executor: &MetalExecutor,

@@ -996,7 +996,7 @@ pub(super) fn rope_rotations(
 /// Sans sink, softmax standard (octets inchangés). Avec un sink `s`, le max
 /// inclut `s` et `e^(s-m)` entre UNE fois au dénominateur, sans valeur
 /// associée : `p_i = e^(a_i-m) / (e^(s-m) + Σ_j e^(a_j-m))`.
-pub(super) fn attention_probs_in_place(scores: &mut [f32], sink: Option<f32>) {
+pub(crate) fn attention_probs_in_place(scores: &mut [f32], sink: Option<f32>) {
     let Some(sink) = sink else {
         softmax_in_place(scores, 1.0);
         return;

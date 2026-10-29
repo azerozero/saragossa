@@ -119,6 +119,7 @@ impl CausalDecoder {
             down_proj: &mtp.layer.down_proj,
             tail_score: &arena.dense_tail_score,
             parallel_moe: mtp.layer.parallel_moe_weights(),
+            sigmoid_moe: mtp.layer.sigmoid_moe_weights(),
         };
         let dims = FullAttnLayerDims {
             hidden,
