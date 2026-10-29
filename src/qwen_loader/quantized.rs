@@ -14,9 +14,9 @@ pub(super) fn quantized_contract_shape(
             spec.source
         ))
     })?;
-    let (group_size, bits) = quant_params_for(quant, &spec.source)?;
     let scales_key = replace_weight_suffix(&spec.source, ".scales")?;
     let biases_key = replace_weight_suffix(&spec.source, ".biases")?;
+    let (group_size, bits) = resolve_quant_params(quant, &spec.source, entry, entries)?;
     let scales = entries
         .get(&scales_key)
         .ok_or_else(|| InferError::MissingWeight(scales_key.clone()))?
@@ -50,6 +50,85 @@ pub(super) fn quantized_contract_shape(
         &scales_key,
         &biases_key,
     )
+}
+
+/// Vue U32 d'un poids affine empaqueté, ou `None` pour un tenseur dense.
+///
+/// MLX sérialise parfois l'empaquetage en `U8` (flint) : mêmes octets
+/// little-endian que l'`U32`, seule la dernière dimension change
+/// (`packed_cols / 4`). La relecture passe ensuite par le chemin U32 commun,
+/// sans copie supplémentaire.
+pub(in crate::qwen_loader) fn packed_u32_entry(
+    entry: &ShardTensorEntry,
+    source: &str,
+) -> Result<Option<ShardTensorEntry>> {
+    if !source.ends_with(".weight") {
+        return Ok(None);
+    }
+    match entry.dtype {
+        Dtype::U32 => Ok(Some(entry.clone())),
+        Dtype::U8 => {
+            let mut shape = entry.shape.clone();
+            let last = shape.last_mut().ok_or_else(|| {
+                InferError::Dimension(format!("poids U8 empaqueté {source} sans dimension"))
+            })?;
+            if *last % 4 != 0 {
+                return Err(InferError::Shape(format!(
+                    "poids U8 empaqueté {source}: {} octets par ligne, non multiple de 4",
+                    *last
+                )));
+            }
+            *last /= 4;
+            Ok(Some(ShardTensorEntry {
+                dtype: Dtype::U32,
+                shape,
+                data_offsets: entry.data_offsets,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Résout `(group_size, bits)` d'un poids affine.
+///
+/// Un override par tenseur de la config prime. Sinon les bits sont déduits
+/// des formes : la config ne décrit qu'une largeur globale, alors que flint
+/// mélange un embedding 8 bits et un corps 4 bits (`mlx_export`). À
+/// `group_size` fixé, `bits = packed_cols·32 / (groups·group_size)` est
+/// unique ; une déduction hors des largeurs connues garde la valeur globale,
+/// que la validation des formes refusera ensuite.
+fn resolve_quant_params(
+    quant: &QuantConfig,
+    source: &str,
+    packed: &ShardTensorEntry,
+    entries: &HashMap<String, TensorEntryRef>,
+) -> Result<(usize, usize)> {
+    let (group_size, bits) = quant_params_for(quant, source)?;
+    let base = source.strip_suffix(".weight").unwrap_or(source);
+    if quant_override_usize(quant, base, "bits")?.is_some() {
+        return Ok((group_size, bits));
+    }
+    let scales_key = replace_weight_suffix(source, ".scales")?;
+    let groups = entries
+        .get(&scales_key)
+        .and_then(|scales| scales.entry.shape.last().copied());
+    let packed_cols = packed.shape.last().copied();
+    Ok((
+        group_size,
+        deduce_affine_bits(packed_cols, groups, group_size).unwrap_or(bits),
+    ))
+}
+
+fn deduce_affine_bits(
+    packed_cols: Option<usize>,
+    groups: Option<usize>,
+    group_size: usize,
+) -> Option<usize> {
+    let packed_bits = packed_cols?.checked_mul(32)?;
+    let cols = groups?.checked_mul(group_size).filter(|cols| *cols > 0)?;
+    (packed_bits % cols == 0)
+        .then_some(packed_bits / cols)
+        .filter(|bits| matches!(bits, 2 | 3 | 4 | 5 | 6 | 8))
 }
 
 fn quantized_linear_contract_shape(
@@ -234,8 +313,10 @@ pub(super) fn tensor_from_entry(
     let shard = headers
         .get(entry_ref.shard_index)
         .ok_or_else(|| InferError::Shape("index shard invalide".to_string()))?;
-    if entry.dtype == Dtype::U32 && spec.source.ends_with(".weight") {
-        return quantized_tensor_from_entry(config, spec, entry, shard, headers, entries, context);
+    if let Some(packed) = packed_u32_entry(entry, &spec.source)? {
+        return quantized_tensor_from_entry(
+            config, spec, &packed, shard, headers, entries, context,
+        );
     }
     let bytes = read_entry_bytes(shard, entry)?;
     let mut tensor = tensor_from_safetensor_parts(&spec.source, entry.dtype, &entry.shape, &bytes)?;
@@ -260,7 +341,7 @@ pub(super) fn quantized_tensor_from_entry(
             spec.source
         ))
     })?;
-    let (group_size, bits) = quant_params_for(quant, &spec.source)?;
+    let (group_size, bits) = resolve_quant_params(quant, &spec.source, entry, entries)?;
     let scales_key = replace_weight_suffix(&spec.source, ".scales")?;
     let biases_key = replace_weight_suffix(&spec.source, ".biases")?;
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -720,5 +801,47 @@ mod tests {
         assert!(unpacked_cols(64, 0, 4).is_err());
         // Cas nominal : 64 packed_cols × 32 / 4 bits = 512 cols, divisible par 32.
         assert_eq!(unpacked_cols(64, 32, 4).expect("config quant valide"), 512);
+    }
+
+    #[test]
+    fn affine_bits_follow_scales_shape() {
+        // flint : embedding [V, 2048] en 8 bits (512 u32, 32 groupes de 64),
+        // lm_head [V, 2048] en 4 bits (256 u32, 32 groupes).
+        assert_eq!(deduce_affine_bits(Some(512), Some(32), 64), Some(8));
+        assert_eq!(deduce_affine_bits(Some(256), Some(32), 64), Some(4));
+        assert_eq!(deduce_affine_bits(Some(96), Some(16), 64), Some(3));
+        // Largeur inconnue ou formes absentes : pas de déduction.
+        assert_eq!(deduce_affine_bits(Some(7), Some(1), 32), None);
+        assert_eq!(deduce_affine_bits(Some(256), None, 64), None);
+        assert_eq!(deduce_affine_bits(Some(256), Some(0), 64), None);
+    }
+
+    #[test]
+    fn u8_packed_entry_reads_as_u32_view() {
+        let entry = ShardTensorEntry {
+            dtype: Dtype::U8,
+            shape: vec![3, 256, 1024],
+            data_offsets: [10, 10 + 3 * 256 * 1024],
+        };
+        let packed = packed_u32_entry(&entry, "x.weight")
+            .expect("invariant: U8 valide")
+            .expect("invariant: poids empaqueté");
+        assert_eq!(packed.dtype, Dtype::U32);
+        assert_eq!(packed.shape, vec![3, 256, 256]);
+        assert_eq!(packed.data_offsets, entry.data_offsets);
+        // Les mêmes octets décodés en U32 donnent les mots little-endian.
+        let bytes = [0x21_u8, 0x43, 0x65, 0x87, 0xa9, 0xcb, 0xed, 0x0f];
+        assert_eq!(
+            bytes_to_u32(&bytes, "x.weight").expect("invariant: 8 octets"),
+            vec![0x8765_4321, 0x0fed_cba9]
+        );
+        let ragged = ShardTensorEntry {
+            shape: vec![2, 6],
+            ..entry.clone()
+        };
+        assert!(packed_u32_entry(&ragged, "x.weight").is_err());
+        assert!(packed_u32_entry(&entry, "x.scales")
+            .expect("invariant: non poids")
+            .is_none());
     }
 }

@@ -96,6 +96,8 @@ impl MtpHead {
             rope_theta: None,
             rope_position_scale: None,
             sliding_window: None,
+            sinks: None,
+            no_rope: false,
         };
         let post_attention_norm = load_mtp_norm(
             &st,

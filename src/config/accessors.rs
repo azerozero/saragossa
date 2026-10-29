@@ -100,6 +100,49 @@ impl ModelConfig {
     }
 
     #[must_use]
+    /// Indique si la configuration suit l'architecture flint (RecursiveSI).
+    pub fn is_flint(&self) -> bool {
+        self.model_type == "flint"
+    }
+
+    #[must_use]
+    /// Indique si la couche porte un MLP dense dans un modèle MoE.
+    pub fn is_mlp_only_layer(&self, layer_index: usize) -> bool {
+        self.mlp_only_layers.contains(&layer_index)
+    }
+
+    #[must_use]
+    /// Indique si les couches d'attention portent un sink appris par tête
+    /// (`self_attn.softmax_offset`). Seul flint en déclare.
+    pub fn has_attention_sinks(&self) -> bool {
+        self.is_flint()
+    }
+
+    /// Renvoie la fonction de score du routeur MoE déclarée.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la fonction déclarée n'est pas implémentée.
+    pub fn router_score(&self) -> Result<crate::RouterScore> {
+        match self.router_score_function.as_deref() {
+            None | Some("softmax") => Ok(crate::RouterScore::Softmax),
+            Some("sigmoid") => Ok(crate::RouterScore::Sigmoid),
+            Some(other) => Err(InferError::Config(format!(
+                "router_score_function {other} non supportée (attendu softmax ou sigmoid)"
+            ))),
+        }
+    }
+
+    #[must_use]
+    /// Indique si l'expert partagé est pondéré par `shared_expert_gate`.
+    ///
+    /// flint ajoute son expert partagé tel quel : une gate nulle simulée
+    /// donnerait `sigmoid(0) = 0,5`, d'où une variante explicite.
+    pub fn shared_expert_gated(&self) -> bool {
+        !self.is_flint()
+    }
+
+    #[must_use]
     /// Indique si la couche déclarée est une couche Gemma 4 globale.
     pub fn is_gemma4_full_layer(&self, layer_index: usize) -> bool {
         self.layer_types

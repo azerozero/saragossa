@@ -25,6 +25,16 @@ impl Activation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Sélectionne la fonction de score du routeur MoE.
+pub enum RouterScore {
+    /// Softmax sur les logits du top-k (Qwen, Mixtral, Gemma 4).
+    #[default]
+    Softmax,
+    /// Sigmoïde par expert, top-k sur les scores puis renormalisation (flint).
+    Sigmoid,
+}
+
 #[derive(Clone, Debug)]
 /// Sélectionne le type de bloc feed-forward d'une couche.
 pub enum FeedForward {
@@ -207,6 +217,10 @@ pub struct MoeMlp {
     top_k: usize,
     router_norm: Option<(Tensor, f32)>,
     per_expert_scale: Option<Tensor>,
+    router_score: RouterScore,
+    // NOTE: Variante explicite « ajouté tel quel » (flint), distincte de la
+    // paire `shared_expert` + `shared_expert_gate` pondérée par sigmoïde.
+    ungated_shared_expert: Option<GatedMlp>,
 }
 
 /// Capture les projections des experts routés d'une ligne MoE.
@@ -260,7 +274,40 @@ impl MoeMlp {
             top_k,
             router_norm: None,
             per_expert_scale: None,
+            router_score: RouterScore::Softmax,
+            ungated_shared_expert: None,
         })
+    }
+
+    /// Sélectionne la fonction de score du routeur.
+    #[must_use]
+    pub fn with_router_score(mut self, score: RouterScore) -> Self {
+        self.router_score = score;
+        self
+    }
+
+    /// Ajoute un expert partagé sommé sans gate à la sortie routée (flint).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si un expert partagé gated est déjà présent.
+    pub fn with_ungated_shared_expert(mut self, shared_expert: GatedMlp) -> Result<Self> {
+        if self.shared_expert.is_some() {
+            return Err(InferError::Config(
+                "MoE avec expert partagé gated et non gated".to_string(),
+            ));
+        }
+        self.ungated_shared_expert = Some(shared_expert);
+        Ok(self)
+    }
+
+    /// Indique si les chemins Metal connaissent ce contrat MoE.
+    ///
+    /// Les kernels Metal appliquent un softmax top-k et une gate sigmoïde à
+    /// l'expert partagé : un routeur sigmoïde ou un expert partagé sans gate
+    /// produiraient un résultat faux sans erreur, donc ils restent CPU.
+    pub(crate) fn metal_compatible(&self) -> bool {
+        self.router_score == RouterScore::Softmax && self.ungated_shared_expert.is_none()
     }
 
     /// Ajoute une normalisation avant le routeur.
@@ -373,6 +420,11 @@ impl MoeMlp {
         router_source: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
+        let runtime = if self.metal_compatible() {
+            runtime
+        } else {
+            ForwardRuntime::cpu()
+        };
         let (batch, hidden) = x.as_matrix()?;
         let (router_batch, router_hidden) = router_source.as_matrix()?;
         if (router_batch, router_hidden) != (batch, hidden) {
@@ -533,6 +585,10 @@ impl MoeMlp {
                 let shared_out = shared.forward_with_runtime(&input, runtime)?;
                 add_scaled_row(&mut acc, shared_out.as_row()?, gate)?;
             }
+            if let Some(shared) = &self.ungated_shared_expert {
+                let shared_out = shared.forward_with_runtime(&input, runtime)?;
+                add_scaled_row(&mut acc, shared_out.as_row()?, 1.0)?;
+            }
 
             let row_out = acc.ok_or_else(|| InferError::Config("MoE sans sortie".to_string()))?;
             match out_dim {
@@ -559,7 +615,8 @@ impl MoeMlp {
         )
     )]
     pub(crate) fn metal_parts(&self) -> Option<(&Linear, &[GatedMlp], usize)> {
-        if self.router_norm.is_some() || self.per_expert_scale.is_some() {
+        if !self.metal_compatible() || self.router_norm.is_some() || self.per_expert_scale.is_some()
+        {
             return None;
         }
         if self.shared_expert.is_some() {
@@ -571,7 +628,10 @@ impl MoeMlp {
     /// Renvoie les poids routés et les modulations propres à Gemma 4.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn gemma4_metal_parts(&self) -> Option<GemmaMoeMetalParts<'_>> {
-        if self.shared_expert.is_some() || self.shared_expert_gate.is_some() {
+        if !self.metal_compatible()
+            || self.shared_expert.is_some()
+            || self.shared_expert_gate.is_some()
+        {
             return None;
         }
         Some(GemmaMoeMetalParts {
@@ -599,7 +659,11 @@ impl MoeMlp {
         self.shared_expert
             .as_ref()
             .zip(self.shared_expert_gate.as_ref())
-            .filter(|_| self.router_norm.is_none() && self.per_expert_scale.is_none())
+            .filter(|_| {
+                self.metal_compatible()
+                    && self.router_norm.is_none()
+                    && self.per_expert_scale.is_none()
+            })
             .map(|(shared_expert, shared_gate)| {
                 (
                     &self.router,
@@ -612,9 +676,15 @@ impl MoeMlp {
     }
 
     fn top_weights(&self, logits: &[f32]) -> Result<Vec<(usize, f32)>> {
-        let top = top_k_indices(logits, self.top_k);
-        let top_logits = top.iter().map(|idx| logits[*idx]).collect::<Vec<_>>();
-        let weights = softmax(&top_logits, 1.0);
+        let (top, weights) = match self.router_score {
+            RouterScore::Softmax => {
+                let top = top_k_indices(logits, self.top_k);
+                let top_logits = top.iter().map(|idx| logits[*idx]).collect::<Vec<_>>();
+                let weights = softmax(&top_logits, 1.0);
+                (top, weights)
+            }
+            RouterScore::Sigmoid => sigmoid_top_weights(logits, self.top_k),
+        };
         let mut out = Vec::with_capacity(top.len());
         for (rank, expert_idx) in top.into_iter().enumerate() {
             let scale = match &self.per_expert_scale {
@@ -646,6 +716,9 @@ impl MoeMlp {
         if let Some(shared_expert_gate) = &mut self.shared_expert_gate {
             shared_expert_gate.release_affine_cpu_data(released);
         }
+        if let Some(shared_expert) = &mut self.ungated_shared_expert {
+            shared_expert.release_affine_cpu_data(released);
+        }
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -659,6 +732,9 @@ impl MoeMlp {
         }
         if let Some(shared_expert_gate) = &mut self.shared_expert_gate {
             shared_expert_gate.move_packed_to_metal_shared(metal)?;
+        }
+        if let Some(shared_expert) = &mut self.ungated_shared_expert {
+            shared_expert.move_packed_to_metal_shared(metal)?;
         }
         Ok(())
     }
@@ -756,6 +832,19 @@ fn add_scaled_row(acc: &mut Option<Vec<f32>>, row: &[f32], scale: f32) -> Result
 
 fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
+}
+
+/// Routage sigmoïde flint : top-k sur les scores `sigmoid(logit)` (pas sur les
+/// logits, pour départager comme la référence les scores saturés à 1,0 en
+/// f32), puis poids = score / somme des scores retenus.
+fn sigmoid_top_weights(logits: &[f32], top_k: usize) -> (Vec<usize>, Vec<f32>) {
+    let scores = logits.iter().copied().map(sigmoid).collect::<Vec<_>>();
+    let top = top_k_indices(&scores, top_k);
+    let selected = top.iter().map(|idx| scores[*idx]).collect::<Vec<_>>();
+    // NOTE: Le `1e-20` de la référence SGLang évite la division par zéro si
+    // tous les scores retenus sous-débordent.
+    let sum = selected.iter().sum::<f32>() + 1e-20;
+    (top, selected.into_iter().map(|score| score / sum).collect())
 }
 
 #[cfg(test)]
@@ -883,6 +972,50 @@ mod tests {
                 .expect("invariant: gate partagé présent")
         ));
         assert_eq!(released.len(), 8, "5 unités + les 3 projections routées");
+    }
+
+    #[test]
+    fn sigmoid_routing_selects_on_scores_and_renormalizes() {
+        let ln3 = 3.0_f32.ln();
+        let (top, weights) = sigmoid_top_weights(&[0.0, ln3, -ln3, 2.0], 2);
+        assert_eq!(top, vec![3, 1]);
+        let s3 = 1.0 / (1.0 + (-2.0_f32).exp());
+        let sum = s3 + 0.75;
+        assert!((weights[0] - s3 / sum).abs() < 1.0e-6);
+        assert!((weights[1] - 0.75 / sum).abs() < 1.0e-6);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn sigmoid_moe_adds_ungated_shared_expert_as_is() {
+        // Logits routeur pour l'entrée [1, 0] : [0, ln3, -ln3].
+        let ln3 = 3.0_f32.ln();
+        let router = Linear::new(
+            Tensor::from_vec(vec![3, 2], vec![0.0, 0.0, ln3, 0.0, -ln3, 0.0])
+                .expect("invariant: routeur valide"),
+            None,
+        )
+        .expect("invariant: routeur linear valide");
+        let experts = vec![
+            constant_expert(1.0),
+            constant_expert(2.0),
+            constant_expert(0.5),
+        ];
+        let moe = MoeMlp::new(router, experts, None, None, 2)
+            .expect("invariant: MoE valide")
+            .with_router_score(RouterScore::Sigmoid)
+            .with_ungated_shared_expert(constant_expert(3.0))
+            .expect("invariant: shared non gated valide");
+        assert!(!moe.metal_compatible());
+        let input = Tensor::from_vec(vec![1, 2], vec![1.0, 0.0]).expect("invariant: input");
+
+        let out = moe.forward(&input).expect("invariant: MoE forward valide");
+
+        // Experts 1 (score 0,75) et 0 (score 0,5), renormalisés ; expert
+        // partagé ajouté avec un poids 1 exact (une gate nulle donnerait 0,5).
+        let expert = |scale: f32| silu_scalar(scale) * scale;
+        let expected = (0.75 * expert(2.0) + 0.5 * expert(1.0)) / 1.25 + expert(3.0);
+        assert!((out.data()[0] - expected).abs() < 1.0e-5);
     }
 
     fn constant_expert(scale: f32) -> GatedMlp {

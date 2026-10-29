@@ -35,8 +35,25 @@ impl DecoderLayer {
             full.rope_theta = config.layer_rope_theta_override(layer_index);
             full.rope_position_scale = config.layer_rope_position_scale(layer_index);
             full.sliding_window = config.layer_sliding_window(layer_index);
+            full.no_rope = config.is_no_rope_layer(layer_index);
         }
         let (post_attention_norm, mlp) = optional_mlp_from(config, tensors, &prefix)?;
+        // `mlp_only_layers` décide la nature du MLP couche par couche : un
+        // checkpoint qui le contredit est refusé plutôt qu'assemblé de travers.
+        if !config.mlp_only_layers.is_empty() {
+            let dense_expected = config.mlp_only_layers.contains(&layer_index);
+            let mismatch = match &mlp {
+                Some(FeedForward::Dense(_)) => !dense_expected,
+                Some(FeedForward::Moe(_)) => dense_expected,
+                None => true,
+            };
+            if mismatch {
+                return Err(InferError::Config(format!(
+                    "couche {layer_index}: MLP {} attendu par mlp_only_layers",
+                    if dense_expected { "dense" } else { "MoE" }
+                )));
+            }
+        }
         let parallel_moe = if config.parallel_moe {
             optional_gemma4_parallel_moe_from(config, tensors, &prefix)?
         } else {
@@ -79,12 +96,36 @@ impl DecoderLayer {
         })
     }
 
+    /// Indique si la couche porte un contrat inconnu des kernels Metal
+    /// (sinks, NoPE, routeur sigmoïde, expert partagé sans gate).
+    pub(super) fn metal_unsupported(&self) -> bool {
+        let attention = match &self.attention {
+            AttentionBlock::Full(attention) => attention.sinks.is_some() || attention.no_rope,
+            AttentionBlock::Linear(_) => false,
+        };
+        let moe = [self.mlp.as_ref(), self.parallel_moe.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|mlp| matches!(mlp, FeedForward::Moe(moe) if !moe.metal_compatible()));
+        attention || moe
+    }
+
+    /// Ramène le runtime au CPU pour une couche inconnue des kernels Metal.
+    fn layer_runtime<'a>(&self, runtime: ForwardRuntime<'a>) -> ForwardRuntime<'a> {
+        if self.metal_unsupported() {
+            ForwardRuntime::cpu()
+        } else {
+            runtime
+        }
+    }
+
     pub(super) fn forward(
         &self,
         config: &CausalDecoderConfig,
         x: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
+        let runtime = self.layer_runtime(runtime);
         let normed = rms_norm(x, &self.input_norm, config.rms_eps)?;
         let attn_out = match &self.attention {
             AttentionBlock::Full(attention) => {
@@ -188,6 +229,9 @@ impl DecoderLayer {
     /// shared-expert/router biasless est re-vérifié à l'encodage (`ensure_biasless`).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn supports_resident_full(&self) -> bool {
+        if self.metal_unsupported() {
+            return false;
+        }
         // Le tail Gemma résident exige la paire de normes FFN complète.
         if self.pre_feedforward_norm.is_some() != self.post_feedforward_norm.is_some() {
             return false;
@@ -261,6 +305,9 @@ impl DecoderLayer {
         config: &CausalDecoderConfig,
         base_spec: crate::metal_backend::PrefillAttentionSpec,
     ) -> Option<crate::metal_backend::PrefillMoeLayer<'_>> {
+        if self.metal_unsupported() {
+            return None;
+        }
         let post_norm = self.post_attention_norm.as_ref()?;
         let tail = if config.is_gemma4 {
             let dense = match self.mlp.as_ref()? {
@@ -426,6 +473,7 @@ impl DecoderLayer {
         position_offset: usize,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
+        let runtime = self.layer_runtime(runtime);
         let profile = profile_layer_enabled();
         let total_started = profile.then(Instant::now);
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -667,6 +715,7 @@ impl DecoderLayer {
         position: usize,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
+        let runtime = self.layer_runtime(runtime);
         let profile = profile_layer_enabled();
         let total_started = profile.then(Instant::now);
         let norm_started = profile.then(Instant::now);

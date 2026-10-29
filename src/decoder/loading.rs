@@ -74,7 +74,11 @@ pub(in crate::decoder) fn optional_moe_from(
         expert_count,
     )?;
     let experts = split_experts(gate_weights, up_weights, down_weights, expert_count)?;
-    let shared_expert = optional_shared_expert(tensors, layer_prefix)?;
+    let (shared_expert, ungated_shared_expert) = if config.ungated_shared_expert {
+        (None, optional_shared_expert(tensors, layer_prefix)?)
+    } else {
+        (optional_shared_expert(tensors, layer_prefix)?, None)
+    };
     let shared_expert_gate = if shared_expert.is_some() {
         Some(linear_from(
             tensors,
@@ -83,13 +87,17 @@ pub(in crate::decoder) fn optional_moe_from(
     } else {
         None
     };
-    let moe = crate::MoeMlp::new(
+    let mut moe = crate::MoeMlp::new(
         router,
         experts,
         shared_expert,
         shared_expert_gate,
         config.num_experts_per_tok,
-    )?;
+    )?
+    .with_router_score(config.router_score);
+    if let Some(shared) = ungated_shared_expert {
+        moe = moe.with_ungated_shared_expert(shared)?;
+    }
     Ok((
         Some(post_attention_norm),
         Some(FeedForward::Moe(Box::new(moe))),

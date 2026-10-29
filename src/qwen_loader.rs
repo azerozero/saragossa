@@ -89,11 +89,20 @@ const MOE_LAYER_WEIGHTS: &[&str] = &[
     "mlp.switch_mlp.down_proj.weight",
 ];
 
+const SHARED_EXPERT_GATE_WEIGHT: &str = "mlp.shared_expert_gate.weight";
+
 const SHARED_EXPERT_LAYER_WEIGHTS: &[&str] = &[
-    "mlp.shared_expert_gate.weight",
+    SHARED_EXPERT_GATE_WEIGHT,
     "mlp.shared_expert.gate_proj.weight",
     "mlp.shared_expert.up_proj.weight",
     "mlp.shared_expert.down_proj.weight",
+];
+
+// Tenseurs d'attention obligatoires des modèles à sinks (flint).
+const FLINT_ATTENTION_LAYER_WEIGHTS: &[&str] = &[
+    "self_attn.softmax_offset",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
 ];
 
 const FP8_SCALE_BLOCK: usize = 128;
@@ -128,8 +137,8 @@ mod shape_validation;
 #[cfg(test)]
 use self::quantized::apply_fp8_scales;
 use self::quantized::{
-    is_fp8_weight, quantized_contract_shape, tensor_from_entry, validate_dense_contract_dtype,
-    validate_optional_fp8_scale_inv,
+    is_fp8_weight, packed_u32_entry, quantized_contract_shape, tensor_from_entry,
+    validate_dense_contract_dtype, validate_optional_fp8_scale_inv,
 };
 use self::shape_validation::{validate_decoder_meta_shapes, validate_decoder_shapes};
 
@@ -335,6 +344,14 @@ fn load_causal_decoder_from_shards_for_metal(
     executor: &crate::MetalExecutor,
 ) -> Result<CausalDecoder> {
     validate_supported_config(config, catalog)?;
+    // Refus avant de lire 20 Go de poids : aucun chemin Metal ne connaît ce
+    // contrat (cf. `CausalDecoderConfig::metal_unsupported_reason`).
+    if let Some(reason) = crate::CausalDecoderConfig::from(config).metal_unsupported_reason() {
+        return Err(InferError::Config(format!(
+            "backend Metal non supporté pour {} ({reason}) : utiliser le backend CPU",
+            config.model_type
+        )));
+    }
     let prefixes = QwenPrefixes::detect(catalog);
     let context = DecoderLoadContext::metal(executor);
     let tensors = load_decoder_tensors_with_context(config, shards, catalog, &prefixes, &context)?;
@@ -399,6 +416,15 @@ fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> R
         )));
     }
     validate_rope_scaling(config)?;
+    config.router_score()?;
+    if config.router_expert_bias == Some(true) {
+        return Err(InferError::Config(
+            "router_expert_bias non supporté (biais de sélection des experts)".to_string(),
+        ));
+    }
+    if config.is_flint() {
+        validate_flint_config(config)?;
+    }
     if let Some(quant) = &config.quantization {
         validate_affine_quantization(quant)?;
     }
@@ -412,6 +438,83 @@ fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> R
         )));
     }
     Ok(())
+}
+
+/// Valide la description par couche de flint : types d'attention, fenêtre et
+/// indices NoPE / MLP dense dans les bornes.
+fn validate_flint_config(config: &ModelConfig) -> Result<()> {
+    let layers = config.num_hidden_layers;
+    if config.layer_types.len() != layers {
+        return Err(InferError::Config(format!(
+            "flint: layer_types a {} entrées pour {layers} couches",
+            config.layer_types.len()
+        )));
+    }
+    if let Some(kind) = config
+        .layer_types
+        .iter()
+        .find(|kind| !matches!(kind.as_str(), "full_attention" | "sliding_attention"))
+    {
+        return Err(InferError::Config(format!(
+            "flint: type de couche {kind} non supporté"
+        )));
+    }
+    let has_sliding = config
+        .layer_types
+        .iter()
+        .any(|kind| kind == "sliding_attention");
+    if has_sliding && config.sliding_window.unwrap_or(0) == 0 {
+        return Err(InferError::Config(
+            "flint: couches sliding_attention sans sliding_window".to_string(),
+        ));
+    }
+    for (name, indices) in [
+        ("no_rope_layer_indices", &config.no_rope_layer_indices),
+        ("mlp_only_layers", &config.mlp_only_layers),
+    ] {
+        if let Some(layer) = indices.iter().find(|layer| **layer >= layers) {
+            return Err(InferError::Config(format!(
+                "flint: {name} contient la couche {layer} hors des {layers} couches"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse les tenseurs que le chargeur ne consommerait pas (flint).
+///
+/// Un `softmax_offset` ou un `expert_bias` ignoré donnerait du charabia sans
+/// erreur : tout tenseur hors specs (et hors scales/biases affines d'un
+/// poids des specs) est une erreur explicite.
+fn validate_no_orphan_tensors(
+    config: &ModelConfig,
+    specs: &[TensorSpec],
+    entries: &HashMap<String, TensorEntryRef>,
+) -> Result<()> {
+    if !config.is_flint() {
+        return Ok(());
+    }
+    let mut known = std::collections::HashSet::with_capacity(specs.len() * 3);
+    for spec in specs {
+        known.insert(spec.source.clone());
+        if let Some(base) = spec.source.strip_suffix(".weight") {
+            known.insert(format!("{base}.scales"));
+            known.insert(format!("{base}.biases"));
+        }
+    }
+    let mut orphans = entries
+        .keys()
+        .filter(|name| !known.contains(*name))
+        .collect::<Vec<_>>();
+    if orphans.is_empty() {
+        return Ok(());
+    }
+    orphans.sort();
+    Err(InferError::Config(format!(
+        "{} tenseurs non consommés par le chargeur flint, ex. {:?}",
+        orphans.len(),
+        orphans.iter().take(5).collect::<Vec<_>>()
+    )))
 }
 
 /// Valide la section `rope_scaling` déclarée par la config.
@@ -671,6 +774,7 @@ fn load_decoder_tensors_with_context(
     let specs = decoder_specs(config, prefixes, catalog);
     let headers = read_shard_headers(shards)?;
     let entries = index_shard_entries(&headers)?;
+    validate_no_orphan_tensors(config, &specs, &entries)?;
     let mut out = HashMap::new();
 
     for spec in &specs {
@@ -830,6 +934,7 @@ fn decoder_contract_metas(
     catalog: &WeightCatalog,
 ) -> Result<HashMap<String, TensorMeta>> {
     let entries = index_shard_entries(headers)?;
+    validate_no_orphan_tensors(config, specs, &entries)?;
     let mut out = HashMap::new();
     for spec in specs {
         let Some(entry_ref) = entries.get(&spec.source) else {
@@ -857,8 +962,8 @@ fn logical_contract_shape(
     entries: &HashMap<String, TensorEntryRef>,
 ) -> Result<Vec<usize>> {
     let entry = &entry_ref.entry;
-    if entry.dtype == Dtype::U32 && spec.source.ends_with(".weight") {
-        return quantized_contract_shape(config, spec, entry, entries);
+    if let Some(packed) = packed_u32_entry(entry, &spec.source)? {
+        return quantized_contract_shape(config, spec, &packed, entries);
     }
     validate_dense_contract_dtype(&spec.source, entry.dtype)?;
     if is_fp8_weight(entry.dtype, &spec.source) {
@@ -908,10 +1013,12 @@ fn decoder_specs(
             .iter()
             .map(|suffix| layer_target(layer, suffix))
             .collect::<Vec<_>>();
-        let has_mlp = layer_mlp
-            .iter()
-            .filter(|target| !target.ends_with("post_attention_layernorm.weight"))
-            .any(|target| catalog.contains(&prefixes.source_for(target)));
+        let mlp_only = config.is_mlp_only_layer(layer);
+        let has_mlp = mlp_only
+            || layer_mlp
+                .iter()
+                .filter(|target| !target.ends_with("post_attention_layernorm.weight"))
+                .any(|target| catalog.contains(&prefixes.source_for(target)));
         if has_mlp {
             specs.extend(specs_for(prefixes, layer_mlp, true));
         }
@@ -933,6 +1040,7 @@ fn decoder_specs(
             .map(|suffix| layer_target(layer, suffix))
             .collect::<Vec<_>>();
         let has_moe = !config.enable_moe_block
+            && !mlp_only
             && (config.is_moe()
                 || layer_moe
                     .iter()
@@ -943,12 +1051,14 @@ fn decoder_specs(
         }
         let layer_shared_expert = SHARED_EXPERT_LAYER_WEIGHTS
             .iter()
+            .filter(|suffix| config.shared_expert_gated() || **suffix != SHARED_EXPERT_GATE_WEIGHT)
             .map(|suffix| layer_target(layer, suffix))
             .collect::<Vec<_>>();
-        let has_shared_expert = config.shared_expert_intermediate_size.is_some()
-            || layer_shared_expert
-                .iter()
-                .any(|target| catalog.contains(&prefixes.source_for(target)));
+        let has_shared_expert = !mlp_only
+            && (config.shared_expert_intermediate_size.is_some()
+                || layer_shared_expert
+                    .iter()
+                    .any(|target| catalog.contains(&prefixes.source_for(target))));
         if has_shared_expert {
             specs.extend(specs_for(prefixes, layer_shared_expert, true));
         }
@@ -967,10 +1077,23 @@ fn decoder_specs(
             config.is_gemma4(),
         ));
 
+        // flint : sinks et QK-norms obligatoires (la QK-norm porte seule la
+        // normalisation des couches NoPE) ; ils sortent donc des optionnels.
+        if config.has_attention_sinks() {
+            let flint_attention = FLINT_ATTENTION_LAYER_WEIGHTS
+                .iter()
+                .map(|suffix| layer_target(layer, suffix))
+                .collect::<Vec<_>>();
+            specs.extend(specs_for(prefixes, flint_attention, true));
+        }
+
         let layer_optional = OPTIONAL_LAYER_WEIGHTS
             .iter()
             .filter(|suffix| {
                 config.is_full_attention_layer(layer) || !suffix.starts_with("self_attn.")
+            })
+            .filter(|suffix| {
+                !(config.has_attention_sinks() && FLINT_ATTENTION_LAYER_WEIGHTS.contains(suffix))
             })
             .filter(|suffix| !suffix.starts_with("lm_head."))
             .map(|suffix| layer_target(layer, suffix))
@@ -1001,6 +1124,8 @@ fn layer_target(layer: usize, suffix: &str) -> String {
     format!("layers.{layer}.{suffix}")
 }
 
+#[cfg(test)]
+mod flint_tests;
 #[cfg(test)]
 mod gemma4_test_fixtures;
 #[cfg(test)]
