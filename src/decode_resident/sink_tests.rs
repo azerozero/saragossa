@@ -116,8 +116,14 @@ fn kv_state(
     Ok(kv)
 }
 
+/// Écart max entre deux sorties finies : `f32::max` ignore les NaN, une sortie
+/// entièrement NaN passerait sinon pour un écart nul.
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
+    assert!(
+        a.iter().chain(b).all(|value| value.is_finite()),
+        "sortie non finie"
+    );
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
@@ -125,7 +131,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Couvre le 2-passes d128 (fenêtre nulle, court et au-delà du seuil 2048) et
-/// le naïf fenêtré (fenêtre flint de 513 lignes), en f32 et bf16.
+/// fenêtré (fenêtre flint de 513 lignes), en f32 et bf16.
 #[test]
 fn sink_attention_matches_cpu_oracle() -> Result<()> {
     let Some(state) = try_state()? else {
@@ -152,6 +158,47 @@ fn sink_attention_matches_cpu_oracle() -> Result<()> {
     Ok(())
 }
 
+/// Fenêtre flint de 513 lignes : le 2-passes sur la vue décalée du KV (choisi
+/// en production pour d128/GQA 8) contre le naïf avec sink et l'oracle CPU.
+/// L'ordre de réduction diffère (partitions entrelacées) : tolérance, pas bits.
+// NOTE: Mesuré le 30 oct. 2026 (M5 Max, trois exécutions identiques) : pire
+// écart 1,72e-8 contre le naïf et 1,68e-8 contre le CPU, en f32 comme en bf16.
+// 1e-6 laisse ~60× de marge tout en restant assez serré pour qu'un décalage de
+// vue K/V faux (lignes hors fenêtre) se voie ; les 2e-5 du test en fenêtre
+// nulle couvrent 3 000 lignes et le sink dominant, pas ce cas.
+#[test]
+fn windowed_two_pass_sink_matches_naive_and_cpu_oracle() -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let sinks = sinks();
+    for len in [513_usize, 514, 600, 1100, 4000] {
+        let window_start = len.saturating_sub(513);
+        let case = case(len);
+        for format in [KvFormat::F32, KvFormat::Bf16] {
+            let (keys, values) = match format {
+                KvFormat::Bf16 => (bf16_round(&case.keys), bf16_round(&case.values)),
+                _ => (case.keys.clone(), case.values.clone()),
+            };
+            let expected = cpu_sink_attention(&case.q, &keys, &values, len, window_start, &sinks);
+            let kv = kv_state(&state, &case, len, format, Some(&sinks))?;
+            let got = kv.attention_decode_sink_two_pass(&case.q, window_start)?;
+            let naive = kv.attention_decode_sink_naive(&case.q, window_start)?;
+            let production = kv.attention_decode_windowed(&case.q, window_start)?;
+            // La production prend le 2-passes (bits identiques), sauf si un flag
+            // runtime la ramène au naïf : comparée alors à tolérance.
+            assert!(max_abs_diff(&production, &got) <= 1.0e-6);
+            let to_naive = max_abs_diff(&got, &naive);
+            let to_cpu = max_abs_diff(&got, &expected);
+            assert!(
+                to_naive <= 1.0e-6 && to_cpu <= 1.0e-6,
+                "len={len} fenêtre={window_start} {format:?}: écart naïf {to_naive}, CPU {to_cpu}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Un sink neutre réduit les kernels avec sink à l'arithmétique historique :
 /// `max(m, s) = m` et `+ exp(s - m) = + 0`. Les deux sorties sont égales bit à
 /// bit, et les kernels sans sink (source distincte, inchangée) le restent par
@@ -162,14 +209,20 @@ fn neutral_sink_is_bit_identical_to_historical_kernels() -> Result<()> {
         return Ok(());
     };
     let neutral = vec![NEUTRAL_SINK; Q_HEADS];
-    // 3000 ≥ seuil 2-passes (fenêtre nulle) ; fenêtre > 0 : naïf des deux côtés.
+    // 3000 ≥ seuil 2-passes (fenêtre nulle) ; fenêtre > 0 : l'historique est
+    // le naïf, comparé au naïf avec sink (le 2-passes fenêtré n'existe qu'avec
+    // sink et se compare à tolérance ci-dessus).
     for (len, window_start) in [(3000, 0), (600, 600 - 513)] {
         let case = case(len);
         for format in [KvFormat::F32, KvFormat::Bf16] {
             let historical = kv_state(&state, &case, len, format, None)?
                 .attention_decode_windowed(&case.q, window_start)?;
-            let with_sink = kv_state(&state, &case, len, format, Some(&neutral))?
-                .attention_decode_windowed(&case.q, window_start)?;
+            let sink_kv = kv_state(&state, &case, len, format, Some(&neutral))?;
+            let with_sink = if window_start == 0 {
+                sink_kv.attention_decode_windowed(&case.q, window_start)?
+            } else {
+                sink_kv.attention_decode_sink_naive(&case.q, window_start)?
+            };
             assert!(
                 historical
                     .iter()
