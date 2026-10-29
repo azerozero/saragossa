@@ -3540,6 +3540,11 @@ impl CausalDecoder {
                     crate::metal_backend::PrefillResidentPrefixLayer::Full {
                         key: layer_cache.keys.segments().collect(),
                         value: layer_cache.values.segments().collect(),
+                        in_place: layer_cache
+                            .keys
+                            .sole_shared_buffer()
+                            .zip(layer_cache.values.sole_shared_buffer())
+                            .map(|(key, value)| [key, value]),
                     }
                 }
                 crate::metal_backend::PrefillAttentionLayer::Linear { .. } => {
@@ -3550,13 +3555,13 @@ impl CausalDecoder {
                 }
             });
         }
-        let hidden = self.embed_scaled(suffix)?;
+        let hidden = self.prefill_hidden(suffix)?;
         let prefix = crate::metal_backend::PrefillResidentPrefix {
             rows: start,
             layers: prefix_layers,
         };
         let (final_hidden, layer_states, captures) = metal.qwen_moe_prefill_resident_from(
-            &hidden,
+            self.prefill_input(suffix, hidden.as_ref()),
             &layers,
             spec,
             capture_layer_ids,
@@ -4804,6 +4809,39 @@ impl CausalDecoder {
         })
     }
 
+    /// Plongée CPU des jetons d'un prefill résident, `None` quand le gather
+    /// Metal a été vérifié octet près le CPU au warmup
+    /// (`warmup_and_release_cpu_weights`) : le prefill plonge alors chaque
+    /// morceau sur le GPU, sans `[seq, hidden]` CPU ni sa copie (cf.
+    /// [`Self::prefill_input`]).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn prefill_hidden(&self, tokens: &[usize]) -> Result<Option<Tensor>> {
+        if self.runtime.embed_gather_byte_exact {
+            Ok(None)
+        } else {
+            self.embed_scaled(tokens).map(Some)
+        }
+    }
+
+    /// Entrée du prefill résident : le flux plongé sur CPU s'il existe, sinon
+    /// les jetons, plongés par le gather Metal déjà vérifié.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn prefill_input<'a>(
+        &'a self,
+        tokens: &'a [usize],
+        hidden: Option<&'a Tensor>,
+    ) -> crate::metal_backend::PrefillInput<'a> {
+        hidden.map_or(
+            crate::metal_backend::PrefillInput::Tokens {
+                ids: tokens,
+                embedding: &self.embed_tokens,
+                scale: self.config.embed_scale.unwrap_or(1.0),
+                recast_bf16: self.config.is_qwen && qwen_embed_bf16_enabled(),
+            },
+            crate::metal_backend::PrefillInput::Hidden,
+        )
+    }
+
     /// Même prefill résident, avec capture du flux résiduel en sortie des
     /// couches `capture_layer_ids` (`[seq, n * hidden]`, cf. le drafter DFlash).
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -4832,7 +4870,7 @@ impl CausalDecoder {
         else {
             return Ok(None);
         };
-        let hidden = self.embed_scaled(prompt)?;
+        let hidden = self.prefill_hidden(prompt)?;
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let Some(prefill_layer) = layer.prefill_moe_layer(&self.config, spec) else {
@@ -4841,7 +4879,7 @@ impl CausalDecoder {
             layers.push(prefill_layer);
         }
         match metal.qwen_moe_prefill_resident_with_captures(
-            &hidden,
+            self.prefill_input(prompt, hidden.as_ref()),
             &layers,
             spec,
             capture_layer_ids,

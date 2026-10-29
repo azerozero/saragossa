@@ -117,20 +117,7 @@ impl MetalExecutor {
                 token_ids.len()
             )));
         }
-        let vocab = embedding.shape()[0];
-        let indices = token_ids
-            .iter()
-            .map(|token| {
-                if *token >= vocab {
-                    return Err(InferError::Dimension(format!(
-                        "token id {token} hors vocab {vocab}"
-                    )));
-                }
-                u32::try_from(*token).map_err(|_| {
-                    InferError::Dimension(format!("token embedding hors plage u32: {token}"))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let indices = embedding_indices(embedding, token_ids)?;
         let weights = self.resolve_embedding_weight_buffers(embedding)?;
         let indices = self.upload_u32_buffer(&indices, "embedding_indices")?;
         let output_len = checked_len(token_ids.len(), dim, "embedding Metal")?;
@@ -1051,6 +1038,27 @@ fn f32_slice_to_bf16(data: &[f32]) -> Vec<u16> {
             // RNE : ajoute 0x7fff + bit de poids faible conservé avant de tronquer.
             let rounding = 0x7fff + ((bits >> 16) & 1);
             ((bits + rounding) >> 16) as u16
+        })
+        .collect()
+}
+
+/// Indices `u32` du gather d'embedding, chacun vérifié contre le vocabulaire.
+pub(crate) fn embedding_indices(
+    embedding: &EmbeddingWeight,
+    token_ids: &[usize],
+) -> Result<Vec<u32>> {
+    let vocab = embedding.shape().first().copied().unwrap_or(0);
+    token_ids
+        .iter()
+        .map(|token| {
+            if *token >= vocab {
+                return Err(InferError::Dimension(format!(
+                    "token id {token} hors vocab {vocab}"
+                )));
+            }
+            u32::try_from(*token).map_err(|_| {
+                InferError::Dimension(format!("token embedding hors plage u32: {token}"))
+            })
         })
         .collect()
 }

@@ -852,7 +852,7 @@ fn prefill_resident_uses_layer_specific_attention_dimensions() -> Result<()> {
     // Captures : la sortie de la couche 0 est l'entrée de la couche 1 (= sortie
     // du run à une couche), celle de la couche 1 est la sortie finale.
     let (_, _, captures) = executor.qwen_moe_prefill_resident_with_captures(
-        &input,
+        PrefillInput::Hidden(&input),
         &layers,
         base,
         &[0, 1],
@@ -1166,15 +1166,142 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
     };
     let layers = make_layers(spec);
 
-    let (single, single_caches, single_captures) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 0, false)?;
+    // Entrée par jetons (gather GPU morceau par morceau, décalé après un
+    // préfixe) : octet près l'entrée plongée d'avance par le même gather sur
+    // toute la séquence, table dense ou quantifiée. L'égalité de ce gather
+    // avec le CPU est vérifiée au warmup avant de libérer la table
+    // (`warmup_and_release_cpu_weights`).
+    let ids: Vec<usize> = (0..SEQ).map(|index| (index * 31 + 7) % 97).collect();
+    for table in [
+        EmbeddingWeight::Dense(deterministic_tensor(97, HIDDEN, 727, 0.5)?),
+        EmbeddingWeight::AffineQuantized(deterministic_affine_weight(97, HIDDEN, 733, 0.05)?),
+    ] {
+        let embedded = executor.embed_weight_tokens(&table, &ids, 1.5, true)?;
+        let tokens = |ids| PrefillInput::Tokens {
+            ids,
+            embedding: &table,
+            scale: 1.5,
+            recast_bf16: true,
+        };
+        for (chunk_tokens, last_row_only) in [(0, false), (512, false), (512, true)] {
+            let (expected, expected_caches, expected_captures) = executor
+                .qwen_moe_prefill_resident_with_captures(
+                    PrefillInput::Hidden(&embedded),
+                    &layers,
+                    spec,
+                    &[0],
+                    chunk_tokens,
+                    last_row_only,
+                )?;
+            let (actual, actual_caches, actual_captures) = executor
+                .qwen_moe_prefill_resident_with_captures(
+                    tokens(&ids),
+                    &layers,
+                    spec,
+                    &[0],
+                    chunk_tokens,
+                    last_row_only,
+                )?;
+            assert_bit_exact(
+                &actual.into_tensor(HIDDEN)?,
+                &expected.into_tensor(HIDDEN)?,
+                "entrée par jetons",
+            );
+            assert_full_kv_bit_exact(&actual_caches, &expected_caches, "entrée par jetons K/V")?;
+            let (Some(actual), Some(expected)) = (actual_captures, expected_captures) else {
+                panic!("captures manquantes en entrée par jetons");
+            };
+            assert_bit_exact(&actual, &expected, "entrée par jetons captures");
+        }
+        const PREFIX_ROWS: usize = 700;
+        let prefix_spec = PrefillAttentionSpec {
+            seq: PREFIX_ROWS,
+            ..spec
+        };
+        let suffix = Tensor::from_vec(
+            vec![SEQ - PREFIX_ROWS, HIDDEN],
+            embedded.data()[PREFIX_ROWS * HIDDEN..].to_vec(),
+        )?;
+        let mut extended = Vec::with_capacity(2);
+        for input in [PrefillInput::Hidden(&suffix), tokens(&ids[PREFIX_ROWS..])] {
+            // L'état linéaire du préfixe avance en place : un préfixe frais par run.
+            let (_, prefix_caches) = executor.qwen_moe_prefill_resident(
+                &Tensor::from_vec(
+                    vec![PREFIX_ROWS, HIDDEN],
+                    embedded.data()[..PREFIX_ROWS * HIDDEN].to_vec(),
+                )?,
+                &make_layers(prefix_spec),
+                prefix_spec,
+            )?;
+            let prefix = PrefillResidentPrefix {
+                rows: PREFIX_ROWS,
+                layers: prefix_caches
+                    .iter()
+                    .map(|cache| match cache {
+                        PrefillResidentLayerCache::Full { key, value, .. } => {
+                            PrefillResidentPrefixLayer::Full {
+                                key: vec![key.data()],
+                                value: vec![value.data()],
+                                in_place: None,
+                            }
+                        }
+                        PrefillResidentLayerCache::Linear { state } => {
+                            PrefillResidentPrefixLayer::Linear { state }
+                        }
+                    })
+                    .collect(),
+            };
+            let (output, caches, _) = executor.qwen_moe_prefill_resident_from(
+                input,
+                &layers,
+                spec,
+                &[],
+                // Suffixe de 400 lignes en quatre morceaux décalés.
+                128,
+                Some(&prefix),
+                false,
+            )?;
+            extended.push((output.into_tensor(HIDDEN)?, caches));
+        }
+        let (actual, actual_caches) = extended.pop().expect("invariant: deux runs");
+        let (expected, expected_caches) = extended.pop().expect("invariant: deux runs");
+        assert_bit_exact(&actual, &expected, "entrée par jetons prolongée");
+        assert_full_kv_bit_exact(
+            &actual_caches,
+            &expected_caches,
+            "entrée par jetons K/V prolongée",
+        )?;
+    }
+
+    let (single, single_caches, single_captures) = executor
+        .qwen_moe_prefill_resident_with_captures(
+            PrefillInput::Hidden(&input),
+            &layers,
+            spec,
+            &[0],
+            0,
+            false,
+        )?;
     // 512 → trois morceaux de 367/367/366 lignes.
     let (chunked, chunked_caches, chunked_captures) = executor
-        .qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, false)?;
+        .qwen_moe_prefill_resident_with_captures(
+            PrefillInput::Hidden(&input),
+            &layers,
+            spec,
+            &[0],
+            512,
+            false,
+        )?;
     // Dernière ligne seule : la couche finale (attention complète) ne calcule
     // que son K/V sur les morceaux non finaux ; ligne et KV restent identiques.
-    let (last, last_caches, _) =
-        executor.qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, true)?;
+    let (last, last_caches, _) = executor.qwen_moe_prefill_resident_with_captures(
+        PrefillInput::Hidden(&input),
+        &layers,
+        spec,
+        &[0],
+        512,
+        true,
+    )?;
     let (single, chunked, last) = (
         single.into_tensor(spec.hidden_dim)?,
         chunked.into_tensor(spec.hidden_dim)?,
@@ -1183,9 +1310,23 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
     if nax {
         executor.prefill_kv_bf16_mirror = true;
         let (mirrored, mirrored_caches, mirrored_captures) = executor
-            .qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, false)?;
+            .qwen_moe_prefill_resident_with_captures(
+                PrefillInput::Hidden(&input),
+                &layers,
+                spec,
+                &[0],
+                512,
+                false,
+            )?;
         let (mirrored_last, mirrored_last_caches, _) = executor
-            .qwen_moe_prefill_resident_with_captures(&input, &layers, spec, &[0], 512, true)?;
+            .qwen_moe_prefill_resident_with_captures(
+                PrefillInput::Hidden(&input),
+                &layers,
+                spec,
+                &[0],
+                512,
+                true,
+            )?;
         executor.prefill_kv_bf16_mirror = false;
         assert_bit_exact(
             &mirrored.into_tensor(spec.hidden_dim)?,
@@ -1305,8 +1446,11 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             ..spec
         };
         // L'état linéaire du préfixe avance en place : un préfixe frais par run.
-        let mut runs = Vec::with_capacity(2);
-        for mirror in [false, true] {
+        // Troisième run : prolongement dans les buffers du préfixe (réserve de
+        // 256 lignes), suffixe de 5 lignes seulement ; 400 lignes retombent
+        // sur la copie.
+        let mut runs = Vec::with_capacity(3);
+        for (mirror, in_place) in [(false, false), (true, false), (false, true)] {
             executor.prefill_kv_bf16_mirror = mirror;
             let (_, prefix_caches) = executor.qwen_moe_prefill_resident(
                 &rows_of(&input, 0, prefix_rows, HIDDEN)?,
@@ -1322,6 +1466,14 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                             PrefillResidentPrefixLayer::Full {
                                 key: vec![key.data()],
                                 value: vec![value.data()],
+                                in_place: match (in_place, key, value) {
+                                    (
+                                        true,
+                                        PrefillKvRows::Shared(key),
+                                        PrefillKvRows::Shared(value),
+                                    ) => Some([key.buffer().to_owned(), value.buffer().to_owned()]),
+                                    _ => None,
+                                },
                             }
                         }
                         PrefillResidentLayerCache::Linear { state } => {
@@ -1330,8 +1482,15 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     })
                     .collect(),
             };
+            let prefix_key_before = prefix_caches
+                .iter()
+                .find_map(|cache| match cache {
+                    PrefillResidentLayerCache::Full { key, .. } => Some(key.data().to_vec()),
+                    PrefillResidentLayerCache::Linear { .. } => None,
+                })
+                .unwrap_or_default();
             let (extended, extended_caches, _) = executor.qwen_moe_prefill_resident_from(
-                &rows_of(&input, prefix_rows, SEQ, HIDDEN)?,
+                PrefillInput::Hidden(&rows_of(&input, prefix_rows, SEQ, HIDDEN)?),
                 &layers,
                 spec,
                 &[],
@@ -1339,11 +1498,53 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 Some(&prefix),
                 false,
             )?;
+            if in_place
+                && prefix_rows + 256 >= SEQ
+                && crate::runtime_flags::prefill_kv_shared_enabled()
+            {
+                // Les lignes nouvelles sont bien écrites à la suite du préfixe.
+                let mut checked = 0;
+                for (prefix_cache, extended_cache) in prefix_caches.iter().zip(&extended_caches) {
+                    if let (
+                        PrefillResidentLayerCache::Full {
+                            key: PrefillKvRows::Shared(key),
+                            kv_dim,
+                            ..
+                        },
+                        PrefillResidentLayerCache::Full {
+                            key: extended_key, ..
+                        },
+                    ) = (prefix_cache, extended_cache)
+                    {
+                        let written =
+                            crate::metal_backend::read_f32_buffer(key.buffer(), SEQ * kv_dim)?;
+                        assert_eq!(
+                            &written[prefix_rows * kv_dim..],
+                            extended_key.data(),
+                            "prolongement en place"
+                        );
+                        assert_eq!(
+                            &written[..prefix_rows * kv_dim],
+                            prefix_key_before.as_slice(),
+                            "préfixe intact après prolongement en place"
+                        );
+                        checked += 1;
+                    }
+                }
+                assert_eq!(checked, 1, "prolongement en place non emprunté");
+            }
             runs.push((extended.into_tensor(HIDDEN)?, extended_caches));
         }
         executor.prefill_kv_bf16_mirror = false;
-        let (mirrored, mirrored_caches) = runs.pop().expect("invariant: deux runs");
-        let (extended, extended_caches) = runs.pop().expect("invariant: deux runs");
+        let (in_place, in_place_caches) = runs.pop().expect("invariant: trois runs");
+        let (mirrored, mirrored_caches) = runs.pop().expect("invariant: trois runs");
+        let (extended, extended_caches) = runs.pop().expect("invariant: trois runs");
+        assert_bit_exact(&in_place, &extended, "prolongement en place");
+        assert_full_kv_bit_exact(
+            &in_place_caches,
+            &extended_caches,
+            "prolongement en place K/V",
+        )?;
         assert_bit_exact(&mirrored, &extended, "miroir bf16 prolongement");
         assert_full_kv_bit_exact(
             &mirrored_caches,
