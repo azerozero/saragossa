@@ -295,11 +295,25 @@ impl MetalExecutor {
         start: usize,
         n: usize,
     ) -> Result<()> {
+        self.encode_f32_to_bf16_offsets(encoder, input, start, out_bf16, start, n)
+    }
+
+    /// Comme [`Self::encode_f32_to_bf16_at`], avec des éléments de départ
+    /// distincts en entrée (f32) et en sortie (bf16).
+    pub(crate) fn encode_f32_to_bf16_offsets(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input: &BufferRef,
+        input_start: usize,
+        out_bf16: &BufferRef,
+        out_start: usize,
+        n: usize,
+    ) -> Result<()> {
         let n_u32 = checked_u32(n, "f32_to_bf16 n")?;
         record_prefill_f32_to_bf16_shape(n);
         encoder.set_compute_pipeline_state(&self.f32_to_bf16);
-        encoder.set_buffer(0, Some(input), byte_len::<f32>(start)?);
-        encoder.set_buffer(1, Some(out_bf16), byte_len::<u16>(start)?);
+        encoder.set_buffer(0, Some(input), byte_len::<f32>(input_start)?);
+        encoder.set_buffer(1, Some(out_bf16), byte_len::<u16>(out_start)?);
         encoder.set_bytes(2, 4, std::ptr::from_ref(&n_u32).cast::<c_void>());
         let width = self.f32_to_bf16.thread_execution_width().max(1);
         trace_dispatch_path("f32_to_bf16", n, 1, 0);

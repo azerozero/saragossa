@@ -360,6 +360,12 @@ fn resolve_kv_bf16(env_override: Option<bool>, default_bf16: bool) -> bool {
     env_override.unwrap_or(default_bf16)
 }
 
+/// Une arène dont le défaut est bf16 (prompt long) reste-t-elle en bf16 dense,
+/// ni forcée en f32 ni quantifiée ? Condition du K/V de prefill stocké en bf16.
+pub(crate) fn kv_bf16_dense_by_default() -> bool {
+    kv_format_for(true) == KvFormat::Bf16
+}
+
 /// Override explicite de `SARAGOSSA_RUST_KV_BF16` (lu une fois), cf. [`kv_bf16_for`].
 fn kv_bf16_env_override() -> Option<bool> {
     static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();

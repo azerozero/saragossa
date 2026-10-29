@@ -717,6 +717,28 @@ impl MetalExecutor {
         Ok(buffer)
     }
 
+    /// Buffer bf16 frais NON mémoïsé (StorageModeShared, lisible CPU) : K/V
+    /// d'un prefill stocké en bf16, cédé ensuite au cache CPU.
+    pub(super) fn uncached_bf16_buffer(
+        &self,
+        len: usize,
+        label: &'static str,
+    ) -> Result<metal::Buffer> {
+        if len == 0 {
+            return Err(InferError::Metal(format!("buffer {label} vide")));
+        }
+        let buffer = self
+            .device
+            .new_buffer(byte_len::<u16>(len)?, MTLResourceOptions::StorageModeShared);
+        if crate::runtime_flags::trace_gpu_alloc_enabled() {
+            eprintln!(
+                "uncached_alloc label={label} len={len} element=bf16 bytes={}",
+                buffer.length()
+            );
+        }
+        Ok(buffer)
+    }
+
     /// Buffer u32 frais NON mémoïsé (StorageModeShared, lisible CPU) — pour les
     /// readbacks diagnostiques où la mémoïsation par label aliaserait les
     /// occurrences (indices d'experts par couche, stats light-batch).
@@ -1031,13 +1053,13 @@ fn describe_linear_weight_buffers(weight: &MetalLinearWeightBuffers) -> String {
 
 /// Convertit un slice f32 en bf16 (`u16`) par arrondi au plus proche pair (RNE),
 /// identique à la troncature-haute de mantisse de mlx pour les scales/biases.
-fn f32_slice_to_bf16(data: &[f32]) -> Vec<u16> {
+pub(super) fn f32_slice_to_bf16(data: &[f32]) -> Vec<u16> {
     data.iter()
         .map(|&v| {
             let bits = v.to_bits();
             // RNE : ajoute 0x7fff + bit de poids faible conservé avant de tronquer.
             let rounding = 0x7fff + ((bits >> 16) & 1);
-            ((bits + rounding) >> 16) as u16
+            (bits.wrapping_add(rounding) >> 16) as u16
         })
         .collect()
 }

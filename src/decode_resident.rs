@@ -72,7 +72,7 @@ mod tests;
 pub(crate) use self::arena::{
     install_pipeline_scratch_slot, GpuElement, GpuTensor, ScratchLease, ScratchPool,
 };
-pub(crate) use self::attention::{FullAttentionMetalState, KvSeedSegment};
+pub(crate) use self::attention::{FullAttentionMetalState, KvSegment};
 pub(crate) use self::gpu_position::{check_gpu_position_rows, GpuPosition};
 pub(crate) use self::kv_quant::KvFormat;
 pub(crate) use self::types::{
@@ -80,6 +80,7 @@ pub(crate) use self::types::{
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
     LinearAttnDenseLayerWeights, LinearAttnLayerWeights, MtpD2Segments,
 };
+pub(crate) use self::utils::kv_bf16_dense_by_default;
 #[cfg(all(test, feature = "devtools"))]
 pub(crate) use self::utils::with_kv_format_override;
 
@@ -114,6 +115,8 @@ pub(crate) struct DecodeResidentState {
     rope_decode_kernel: ComputePipelineState,
     copy_at_kernel: ComputePipelineState,
     copy_at_f32_to_bf16_kernel: ComputePipelineState,
+    copy_at_bf16_kernel: ComputePipelineState,
+    copy_at_bf16_to_f32_kernel: ComputePipelineState,
     /// Kernels position GPU (bloc MTP), compilés au premier usage seulement.
     gpu_position_kernels: OnceLock<gpu_position::GpuPositionKernels>,
     /// Kernels du chemin full-attn en lignes fusionné, compilés au premier usage.

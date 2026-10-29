@@ -967,7 +967,9 @@ kernel void attn_gate_f32(
 /// Reproduit `rms_norm_rope_heads_at` (decoder.rs) pour le token courant.
 /// `copy_at_f32` : `out[i] = in[i]` ; en liant `out` à un offset, écrit la ligne
 /// `KV[position]` device-side (append, hazard read-after-write prouvé en R3).
-/// `copy_at_f32_to_bf16` applique le même append vers un KV compact bf16.
+/// `copy_at_f32_to_bf16` applique le même append vers un KV compact bf16 ;
+/// `copy_at_bf16` et `copy_at_bf16_to_f32` sèment l'arène depuis un K/V de
+/// prefill stocké en bf16 (copie exacte, élargissement exact).
 pub(super) const ROPE_DECODE_COPY_KERNELS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1041,6 +1043,26 @@ kernel void copy_at_f32_to_bf16(
 ) {
     if (i >= n) { return; }
     output[i] = bfloat(input[i]);
+}
+
+kernel void copy_at_bf16(
+    device const bfloat* input [[buffer(0)]],
+    device bfloat* output [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) { return; }
+    output[i] = input[i];
+}
+
+kernel void copy_at_bf16_to_f32(
+    device const bfloat* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) { return; }
+    output[i] = float(input[i]);
 }
 "#;
 

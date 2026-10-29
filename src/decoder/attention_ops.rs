@@ -998,15 +998,14 @@ pub(super) fn cached_attention_one(
     let kv_group = layout.num_attention_heads / layout.num_key_value_heads;
     let q_row = q.row_slice(0)?;
     let mut out = vec![0.0_f32; expected_q_dim];
-    // Lignes du cache segmenté, sans copie des données.
-    let keys: Vec<&[f32]> = cache
-        .keys
-        .rows_from(expected_kv_dim, window_start)
-        .collect();
-    let values: Vec<&[f32]> = cache
-        .values
-        .rows_from(expected_kv_dim, window_start)
-        .collect();
+    // Lignes du cache segmenté, sans copie des segments f32 ; un segment bf16
+    // est élargi à chaque appel (repli CPU d'un KV stocké en bf16).
+    let key_segments = cache.keys.f32_segments();
+    let value_segments = cache.values.f32_segments();
+    let keys: Vec<&[f32]> =
+        super::kv_rows::rows_from(&key_segments, expected_kv_dim, window_start).collect();
+    let values: Vec<&[f32]> =
+        super::kv_rows::rows_from(&value_segments, expected_kv_dim, window_start).collect();
     if cache_len >= attention_parallel_threshold() {
         out.par_chunks_mut(layout.head_dim)
             .enumerate()

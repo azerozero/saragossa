@@ -3051,6 +3051,21 @@ fn kv_seed_from_shared_view_matches_cpu_bytes() -> Result<()> {
     let view =
         unsafe { crate::metal_backend::SharedF32Rows::new(buffer, kv_dim, (rows - 1) * kv_dim)? };
     let head = &values[..kv_dim];
+    let bits: Vec<u16> = values.iter().copied().map(f32_to_bf16_bits).collect();
+    let rounded: Vec<f32> = bits
+        .iter()
+        .map(|&bits| f32::from_bits(u32::from(bits) << 16))
+        .collect();
+    let bf16_buffer = state.device().new_buffer_with_data(
+        bits.as_ptr().cast(),
+        (bits.len() * std::mem::size_of::<u16>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    // SAFETY: buffer propre au test, plus écrit après sa création.
+    #[expect(unsafe_code, reason = "vue partagée sur un buffer de test figé")]
+    let bf16_view = unsafe {
+        crate::metal_backend::SharedBf16Rows::new(bf16_buffer, kv_dim, (rows - 1) * kv_dim)?
+    };
     for bf16 in [false, true] {
         // Variantes de test : dtype forcé, indépendant de SARAGOSSA_RUST_KV_BF16.
         let arena = |state: &DecodeResidentState| {
@@ -3068,14 +3083,33 @@ fn kv_seed_from_shared_view_matches_cpu_bytes() -> Result<()> {
             GpuElement::F32
         };
         assert_eq!(gpu.keys().element(), element);
-        let shared = [KvSeedSegment::Cpu(head), KvSeedSegment::Shared(&view)];
-        let copied = [
-            KvSeedSegment::Cpu(head),
-            KvSeedSegment::Cpu(view.as_slice()),
-        ];
+        let shared = [KvSegment::Cpu(head), KvSegment::Shared(&view)];
+        let copied = [KvSegment::Cpu(head), KvSegment::Cpu(view.as_slice())];
         gpu.seed_segments(&shared, &shared, rows)?;
         cpu.seed_segments(&copied, &copied, rows)?;
+        // Même KV stocké en bf16 (CPU puis vue GPU) : arène bf16 identique au
+        // semis f32, arène f32 aux valeurs arrondies élargies.
+        let mut stored = arena(&state)?;
+        let bf16_head = [KvSegment::CpuBf16(&bits[..kv_dim])];
+        let bf16_shared = [bf16_head[0], KvSegment::SharedBf16(&bf16_view)];
+        stored.seed_segments(&bf16_shared, &bf16_shared, rows)?;
+        let mut rounded_arena = arena(&state)?;
+        let rounded_copied = [KvSegment::Cpu(&rounded[..rows * kv_dim])];
+        rounded_arena.seed_segments(&rounded_copied, &rounded_copied, rows)?;
         let cells = rows * kv_dim;
+        let reference = if bf16 { &cpu } else { &rounded_arena };
+        // Octets comparés en u16 : deux par f32.
+        let words = if bf16 { cells } else { 2 * cells };
+        for (stored, reference) in [
+            (stored.keys(), reference.keys()),
+            (stored.values(), reference.values()),
+        ] {
+            assert_eq!(
+                crate::metal_backend::read_u16_buffer(stored.buffer(), words)?,
+                crate::metal_backend::read_u16_buffer(reference.buffer(), words)?,
+                "semis depuis bf16 (arène bf16 = {bf16})"
+            );
+        }
         for (gpu, cpu) in [(gpu.keys(), cpu.keys()), (gpu.values(), cpu.values())] {
             if bf16 {
                 assert_eq!(
@@ -3176,11 +3210,8 @@ fn run_kv_quant_writes_case(
     let mut gpu = make()?;
     let mut cpu = make()?;
     assert_eq!(gpu.format(), format);
-    let shared = [KvSeedSegment::Cpu(head), KvSeedSegment::Shared(&view)];
-    let copied = [
-        KvSeedSegment::Cpu(head),
-        KvSeedSegment::Cpu(view.as_slice()),
-    ];
+    let shared = [KvSegment::Cpu(head), KvSegment::Shared(&view)];
+    let copied = [KvSegment::Cpu(head), KvSegment::Cpu(view.as_slice())];
     gpu.seed_segments(&shared, &shared, rows)?;
     cpu.seed_segments(&copied, &copied, rows)?;
     assert!(
@@ -3294,8 +3325,8 @@ fn kv_quant_gpu_writes_match_cpu_bytes() -> Result<()> {
     for format in [KvFormat::Q8, KvFormat::Q4] {
         let mut gpu = state.full_attention_format_for_test(rows, 8, 2, 128, format)?;
         let mut cpu = state.full_attention_format_for_test(rows, 8, 2, 128, format)?;
-        let shared = [KvSeedSegment::Shared(&view)];
-        let copied = [KvSeedSegment::Cpu(&data)];
+        let shared = [KvSegment::Shared(&view)];
+        let copied = [KvSegment::Cpu(&data)];
         gpu.seed_segments(&shared, &shared, rows)?;
         cpu.seed_segments(&copied, &copied, rows)?;
         assert!(
@@ -3307,10 +3338,7 @@ fn kv_quant_gpu_writes_match_cpu_bytes() -> Result<()> {
     // segments hors lignes entières, refusés avant toute écriture.
     let mut kv = state.full_attention_format_for_test(4, 8, 2, 128, KvFormat::Q8)?;
     let row = vec![0.0_f32; 256];
-    let split = [
-        KvSeedSegment::Cpu(&row[..64]),
-        KvSeedSegment::Cpu(&row[64..]),
-    ];
+    let split = [KvSegment::Cpu(&row[..64]), KvSegment::Cpu(&row[64..])];
     assert!(kv.seed_segments(&split, &split, 1).is_err());
     // head_dim sans attention quantifiée : refusé à la construction.
     assert!(state

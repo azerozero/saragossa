@@ -132,7 +132,8 @@ fn zero_linear(rows: usize, cols: usize) -> Result<Linear> {
 /// K ou V d'un cache de prefill en tenseur `[rows, kv_dim]`, vue partagée ou
 /// copie relue.
 fn kv_tensor(rows: &PrefillKvRows, kv_dim: usize) -> Result<Tensor> {
-    let data = rows.data().to_vec();
+    // K/V stocké en bf16 : élargi, valeurs exactes de l'arrondi.
+    let data = rows.segment().as_f32().into_owned();
     Tensor::from_vec(vec![data.len() / kv_dim.max(1), kv_dim], data)
 }
 
@@ -1017,11 +1018,63 @@ fn assert_full_kv_bit_exact(
     Ok(())
 }
 
+/// Le K/V stocké en bf16 de `stored` vaut, bit à bit, l'arrondi au plus
+/// proche pair du K/V f32 de `expected`, et arrive bien en bits bf16.
+fn assert_full_kv_bf16_of(
+    stored: &[PrefillResidentLayerCache],
+    expected: &[PrefillResidentLayerCache],
+    label: &str,
+) -> Result<()> {
+    let round = |tensor: &Tensor| -> Result<Tensor> {
+        Tensor::from_vec(
+            tensor.shape().to_vec(),
+            tensor
+                .data()
+                .iter()
+                .map(|&value| {
+                    let bits = value.to_bits();
+                    f32::from_bits((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) & 0xffff_0000)
+                })
+                .collect(),
+        )
+    };
+    let mut checked = 0;
+    for (cache, (a, b)) in stored
+        .iter()
+        .zip(test_caches(stored)?.iter().zip(&test_caches(expected)?))
+    {
+        if let (
+            PrefillResidentLayerCache::Full { key: rows, .. },
+            TestCache::Full { key, value },
+            TestCache::Full {
+                key: key_ref,
+                value: value_ref,
+            },
+        ) = (cache, a, b)
+        {
+            assert!(
+                matches!(
+                    rows,
+                    PrefillKvRows::SharedBf16(_) | PrefillKvRows::OwnedBf16(_)
+                ),
+                "{label}: K/V non stocké en bf16"
+            );
+            assert_bit_exact(key, &round(key_ref)?, label);
+            assert_bit_exact(value, &round(value_ref)?, label);
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "{label}: aucune couche full-attention");
+    Ok(())
+}
+
 /// Le prefill par morceaux (KV recopié, état linéaire reporté, RoPE et
 /// attention décalées) reproduit le prefill en un seul morceau. Le miroir bf16
 /// du K/V (`SARAGOSSA_RUST_PREFILL_KV_BF16_MIRROR`) est bit-identique à la
 /// reconversion complète : morceaux de 367 lignes (non alignés), dernière
-/// ligne seule (K/V des morceaux `kv_only` rattrapé) et prolongements.
+/// ligne seule (K/V des morceaux `kv_only` rattrapé) et prolongements. Le K/V
+/// stocké en bf16 (`SARAGOSSA_RUST_PREFILL_KV_BF16_STORE`) laisse les sorties
+/// bit-identiques et vaut l'arrondi du K/V f32.
 #[test]
 fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
     let Some(mut executor) = test_executor()? else {
@@ -1240,8 +1293,8 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     .map(|cache| match cache {
                         PrefillResidentLayerCache::Full { key, value, .. } => {
                             PrefillResidentPrefixLayer::Full {
-                                key: vec![key.data()],
-                                value: vec![value.data()],
+                                key: vec![key.segment()],
+                                value: vec![value.segment()],
                                 in_place: None,
                             }
                         }
@@ -1347,6 +1400,42 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             &last_caches,
             "miroir bf16 K/V dernière ligne",
         )?;
+        executor.prefill_kv_bf16_store_min_rows = Some(0);
+        for (last_row_only, expected, expected_caches) in [
+            (false, &chunked, &chunked_caches),
+            (true, &last, &last_caches),
+        ] {
+            let (stored, stored_caches, stored_captures) = executor
+                .qwen_moe_prefill_resident_with_captures(
+                    PrefillInput::Hidden(&input),
+                    &layers,
+                    spec,
+                    &[0],
+                    512,
+                    last_row_only,
+                )?;
+            assert_bit_exact(
+                &stored.into_tensor(spec.hidden_dim)?,
+                expected,
+                "K/V bf16 stocké sortie",
+            );
+            if let (Some(a), Some(b)) = (stored_captures.as_ref(), chunked_captures.as_ref()) {
+                assert_bit_exact(a, b, "K/V bf16 stocké capture");
+            }
+            assert_full_kv_bf16_of(&stored_caches, expected_caches, "K/V bf16 stocké")?;
+        }
+        // Prompt sous le seuil : K/V f32 inchangé.
+        executor.prefill_kv_bf16_store_min_rows = Some(SEQ + 1);
+        let (_, short_caches, _) = executor.qwen_moe_prefill_resident_with_captures(
+            PrefillInput::Hidden(&input),
+            &layers,
+            spec,
+            &[0],
+            512,
+            false,
+        )?;
+        assert_full_kv_bit_exact(&short_caches, &chunked_caches, "K/V f32 sous le seuil")?;
+        executor.prefill_kv_bf16_store_min_rows = None;
     }
     let hidden = last.data().len();
     assert_eq!(last.shape(), &[1, hidden]);
@@ -1448,14 +1537,33 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
         // L'état linéaire du préfixe avance en place : un préfixe frais par run.
         // Troisième run : prolongement dans les buffers du préfixe (réserve de
         // 256 lignes), suffixe de 5 lignes seulement ; 400 lignes retombent
-        // sur la copie.
-        let mut runs = Vec::with_capacity(3);
-        for (mirror, in_place) in [(false, false), (true, false), (false, true)] {
+        // sur la copie. Trois derniers : K/V stocké en bf16, préfixe f32
+        // (seuil franchi au prolongement, recopie arrondie sur le CPU), puis
+        // préfixe bf16 compris (morceaux de 512), recopié et prolongé en place.
+        let mut runs = Vec::with_capacity(6);
+        for (mirror, in_place, store_prefix, store) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, false, true),
+            (false, false, true, true),
+            (false, true, true, true),
+        ] {
+            if store && !nax {
+                continue;
+            }
             executor.prefill_kv_bf16_mirror = mirror;
-            let (_, prefix_caches) = executor.qwen_moe_prefill_resident(
-                &rows_of(&input, 0, prefix_rows, HIDDEN)?,
+            executor.prefill_kv_bf16_store_min_rows = store_prefix.then_some(0);
+            // Morceaux de 512 : le préfixe de 700 lignes passe par le chemin
+            // par morceaux, seul à stocker en bf16.
+            let (_, prefix_caches, _) = executor.qwen_moe_prefill_resident_from(
+                PrefillInput::Hidden(&rows_of(&input, 0, prefix_rows, HIDDEN)?),
                 &make_layers(prefix_spec),
                 prefix_spec,
+                &[],
+                512,
+                None,
+                false,
             )?;
             let prefix = PrefillResidentPrefix {
                 rows: prefix_rows,
@@ -1464,13 +1572,18 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     .map(|cache| match cache {
                         PrefillResidentLayerCache::Full { key, value, .. } => {
                             PrefillResidentPrefixLayer::Full {
-                                key: vec![key.data()],
-                                value: vec![value.data()],
+                                key: vec![key.segment()],
+                                value: vec![value.segment()],
                                 in_place: match (in_place, key, value) {
                                     (
                                         true,
                                         PrefillKvRows::Shared(key),
                                         PrefillKvRows::Shared(value),
+                                    ) => Some([key.buffer().to_owned(), value.buffer().to_owned()]),
+                                    (
+                                        true,
+                                        PrefillKvRows::SharedBf16(key),
+                                        PrefillKvRows::SharedBf16(value),
                                     ) => Some([key.buffer().to_owned(), value.buffer().to_owned()]),
                                     _ => None,
                                 },
@@ -1482,10 +1595,13 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     })
                     .collect(),
             };
+            executor.prefill_kv_bf16_store_min_rows = store.then_some(0);
             let prefix_key_before = prefix_caches
                 .iter()
                 .find_map(|cache| match cache {
-                    PrefillResidentLayerCache::Full { key, .. } => Some(key.data().to_vec()),
+                    PrefillResidentLayerCache::Full { key, .. } => {
+                        Some(key.segment().as_f32().into_owned())
+                    }
                     PrefillResidentLayerCache::Linear { .. } => None,
                 })
                 .unwrap_or_default();
@@ -1507,7 +1623,8 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 for (prefix_cache, extended_cache) in prefix_caches.iter().zip(&extended_caches) {
                     if let (
                         PrefillResidentLayerCache::Full {
-                            key: PrefillKvRows::Shared(key),
+                            key:
+                                prefix_key @ (PrefillKvRows::Shared(_) | PrefillKvRows::SharedBf16(_)),
                             kv_dim,
                             ..
                         },
@@ -1516,11 +1633,26 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                         },
                     ) = (prefix_cache, extended_cache)
                     {
-                        let written =
-                            crate::metal_backend::read_f32_buffer(key.buffer(), SEQ * kv_dim)?;
+                        // Lignes nouvelles possédées, hors de la vue du préfixe.
+                        assert!(matches!(
+                            extended_key,
+                            PrefillKvRows::Owned(_) | PrefillKvRows::OwnedBf16(_)
+                        ));
+                        let written: Vec<f32> = match prefix_key {
+                            PrefillKvRows::SharedBf16(key) => {
+                                crate::metal_backend::read_u16_buffer(key.buffer(), SEQ * kv_dim)?
+                                    .into_iter()
+                                    .map(|bits| f32::from_bits(u32::from(bits) << 16))
+                                    .collect()
+                            }
+                            PrefillKvRows::Shared(key) => {
+                                crate::metal_backend::read_f32_buffer(key.buffer(), SEQ * kv_dim)?
+                            }
+                            _ => unreachable!("vue partagée filtrée par le motif"),
+                        };
                         assert_eq!(
                             &written[prefix_rows * kv_dim..],
-                            extended_key.data(),
+                            &*extended_key.segment().as_f32(),
                             "prolongement en place"
                         );
                         assert_eq!(
@@ -1536,6 +1668,30 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             runs.push((extended.into_tensor(HIDDEN)?, extended_caches));
         }
         executor.prefill_kv_bf16_mirror = false;
+        executor.prefill_kv_bf16_store_min_rows = None;
+        if nax {
+            let (stored_in_place, stored_in_place_caches) =
+                runs.pop().expect("invariant: six runs");
+            let (stored, stored_caches) = runs.pop().expect("invariant: six runs");
+            let (crossed, crossed_caches) = runs.pop().expect("invariant: six runs");
+            let reference = &runs[0];
+            for (output, caches, label) in [
+                (
+                    &crossed,
+                    &crossed_caches,
+                    "K/V bf16 prolongement d'un préfixe f32",
+                ),
+                (&stored, &stored_caches, "K/V bf16 prolongement"),
+                (
+                    &stored_in_place,
+                    &stored_in_place_caches,
+                    "K/V bf16 prolongement en place",
+                ),
+            ] {
+                assert_bit_exact(output, &reference.0, label);
+                assert_full_kv_bf16_of(caches, &reference.1, label)?;
+            }
+        }
         let (in_place, in_place_caches) = runs.pop().expect("invariant: trois runs");
         let (mirrored, mirrored_caches) = runs.pop().expect("invariant: trois runs");
         let (extended, extended_caches) = runs.pop().expect("invariant: trois runs");
