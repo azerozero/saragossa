@@ -764,11 +764,20 @@ impl LoadedModel {
         // système partagé) n'est réutilisé que s'il a été servi seul ; ajouter
         // une frontière déclarée (fin du message système) si ce cas compte.
         let mut state = if let Some(hit) = hit {
+            let hit_kv = kv_allocations(&hit.state);
             let mut state = hit.state;
             let metal = self.decoder.copy_prompt_state_metal_snapshot(&hit.metal)?;
             self.decoder.restore_prompt_state_metal(&mut state, metal)?;
             self.decoder
                 .extend_prompt_state(&mut state, &tokens[hit.tokens..full_block_tokens])?;
+            // Prolongement qui a recopié tout le K/V dans un buffer neuf : les
+            // blocs de la session qui tiennent l'ancien buffer retiendraient une
+            // seconde copie complète de la conversation à chaque tour. Retirés
+            // avant la garde mémoire, pour ne pas évincer d'autres sessions.
+            let live_kv = kv_allocations(&state);
+            if !hit_kv.is_empty() && hit_kv.is_disjoint(&live_kv) {
+                self.prefix_cache.remove_superseded(root, &hit_kv, &live_kv);
+            }
             state
         } else if full_block_tokens > 0 {
             self.decoder
@@ -1039,6 +1048,14 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 
 #[cfg(test)]
 mod json_tests;
+
+/// Identités des allocations K/V (et autres segments comptés) d'un état de
+/// prompt : deux états qui n'en partagent aucune ne se partagent pas le K/V.
+fn kv_allocations(state: &CausalDecoderPromptState) -> std::collections::HashSet<usize> {
+    let mut seen = std::collections::HashSet::new();
+    state.estimated_cpu_bytes_unseen(&mut seen);
+    seen
+}
 
 #[cfg(test)]
 mod tests {

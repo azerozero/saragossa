@@ -91,6 +91,36 @@ impl LayerKvCache {
         Ok(())
     }
 
+    /// Remplace tout le K/V par celui d'un prolongement résident recopié
+    /// dans un buffer neuf (`rows` lignes, préfixe compris), validé avant
+    /// toute mutation.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn replace_prefill(
+        &mut self,
+        key: crate::metal_backend::PrefillKvRows,
+        value: crate::metal_backend::PrefillKvRows,
+        kv_dim: usize,
+        rows: usize,
+        layout: &AttentionLayout,
+    ) -> Result<()> {
+        let expected = rows.checked_mul(kv_dim);
+        if expected != Some(key.len())
+            || expected != Some(value.len())
+            || kv_dim != layout.num_key_value_heads * layout.head_dim
+            || self.kv_dim.is_some_and(|dim| dim != kv_dim)
+        {
+            return Err(InferError::Dimension(format!(
+                "K/V prolongé recopié: {}/{} au lieu de {rows}×{kv_dim}",
+                key.len(),
+                value.len()
+            )));
+        }
+        // Tout ce qu'`append_prefill` vérifie l'a été ci-dessus : vider est sûr.
+        self.keys = Default::default();
+        self.values = Default::default();
+        self.append_prefill(key, value, kv_dim, layout)
+    }
+
     fn check_batch(
         &mut self,
         key: &Tensor,

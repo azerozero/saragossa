@@ -195,6 +195,9 @@ enum PrefillResidentLayerCacheBuffer {
         /// `key`/`value` stockent le K/V en bf16 (buffers partagés) : le NAX
         /// les lit directement, sans miroir ni conversion.
         bf16_store: bool,
+        /// Buffer neuf où le préfixe bf16 est recopié : rendu en vue entière
+        /// qui remplace le préfixe du cache (cf. `PrefillResidentLayerCache`).
+        replaces_prefix: bool,
     },
     Linear {
         state: LinearAttentionMetalState,

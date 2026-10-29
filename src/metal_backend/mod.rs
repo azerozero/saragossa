@@ -753,10 +753,14 @@ pub(crate) enum PrefillResidentPrefixLayer<'a> {
 
 #[derive(Debug)]
 pub(crate) enum PrefillResidentLayerCache {
+    /// `replaces_prefix` : `key`/`value` portent tout le K/V (préfixe recopié
+    /// compris, vue entière d'un buffer neuf) et remplacent les segments du
+    /// cache au lieu de s'y ajouter.
     Full {
         key: PrefillKvRows,
         value: PrefillKvRows,
         kv_dim: usize,
+        replaces_prefix: bool,
     },
     Linear {
         state: LinearAttentionMetalState,

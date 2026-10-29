@@ -42,6 +42,7 @@ impl MetalExecutor {
                     kv_dim,
                     bf16_mirror,
                     bf16_store,
+                    ..
                 },
             ) => {
                 let kv_chunk_len = checked_len(spec.seq, *kv_dim, "resident kv morceau")?;
