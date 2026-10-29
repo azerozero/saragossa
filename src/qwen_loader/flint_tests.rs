@@ -255,6 +255,23 @@ fn flint_config_decodes_per_layer_contract() {
 }
 
 #[test]
+fn router_defaults_to_sigmoid_for_flint_only() {
+    let mut config = flint_config();
+    config.router_score_function = None;
+    assert_eq!(
+        config.router_score().ok(),
+        Some(crate::RouterScore::Sigmoid)
+    );
+    config.model_type = "qwen3_moe".to_string();
+    assert_eq!(
+        config.router_score().ok(),
+        Some(crate::RouterScore::Softmax)
+    );
+    config.router_score_function = Some("softplus".to_string());
+    assert!(config.router_score().is_err());
+}
+
+#[test]
 fn synthetic_flint_loads_and_generates_on_cpu() {
     let model = load(flint_tensors(true)).expect("invariant: flint synthétique chargeable");
     let logits = model.next_logits(&[1, 2, 3]).expect("invariant: forward");
@@ -317,6 +334,25 @@ fn flint_rejects_missing_sink_and_orphan_tensors() {
     let mut dense_moe = flint_tensors(true);
     dense_moe.retain(|(name, _)| !name.starts_with("model.layers.0.mlp."));
     assert!(load(dense_moe).is_err(), "couche mlp_only sans MLP dense");
+
+    // Biais dense chargé (spec optionnelle) mais jamais assemblé sur une
+    // couche MoE : refusé après assemblage, pas ignoré.
+    let mut stray_bias = flint_tensors(true);
+    stray_bias.push((
+        "model.layers.1.mlp.gate_proj.bias".to_string(),
+        bf16(vec![INTER], vec![0.0; INTER]),
+    ));
+    let err = load(stray_bias).expect_err("biais non assemblé refusé");
+    assert!(err.to_string().contains("non assemblés"), "{err}");
+
+    // Scales/biases affines d'un poids dense : orphelins.
+    let mut dense_scales = flint_tensors(true);
+    dense_scales.push((
+        "model.layers.1.mlp.gate.scales".to_string(),
+        bf16(vec![EXPERTS, 1], vec![1.0; EXPERTS]),
+    ));
+    let err = load(dense_scales).expect_err("scales d'un poids dense refusées");
+    assert!(err.to_string().contains("non consommés"), "{err}");
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -356,134 +392,153 @@ fn read_npy_f32(path: &Path) -> (Vec<usize>, Vec<f32>) {
     (shape, data)
 }
 
-fn compare_rows(label: &str, ours: &[f32], reference: &[f32]) -> (f32, f32, bool) {
+/// Écarts d'une ligne de logits : max et moyenne absolus, après retrait du
+/// décalage constant (sans effet sur le softmax), et argmax identique.
+struct RowGap {
+    max: f32,
+    mean: f32,
+    same_argmax: bool,
+}
+
+fn argmax(row: &[f32]) -> Option<usize> {
+    row.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(index, _)| index)
+}
+
+fn compare_rows(label: &str, ours: &[f32], reference: &[f32]) -> RowGap {
     assert_eq!(ours.len(), reference.len());
     assert!(
         ours.iter().all(|value| value.is_finite()),
         "{label}: logits non finis"
     );
-    let diffs = ours.iter().zip(reference).map(|(a, b)| (a - b).abs());
-    let max = diffs.clone().fold(0.0_f32, f32::max);
-    let mean = diffs.sum::<f32>() / ours.len() as f32;
-    let argmax = |row: &[f32]| {
-        row.iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(index, _)| index)
-    };
-    let same = argmax(ours) == argmax(reference);
-    // Décalage moyen signé : un décalage constant ne change pas le softmax.
-    let shift = ours.iter().zip(reference).map(|(a, b)| a - b).sum::<f32>() / ours.len() as f32;
+    let len = ours.len() as f32;
+    let shift = ours.iter().zip(reference).map(|(a, b)| a - b).sum::<f32>() / len;
+    let centered = ours
+        .iter()
+        .zip(reference)
+        .map(|(a, b)| (a - b - shift).abs());
+    let max = centered.clone().fold(0.0_f32, f32::max);
+    let mean = centered.sum::<f32>() / len;
+    let same_argmax = argmax(ours) == argmax(reference);
     println!(
-        "{label}: max_abs={max:.4} mean_abs={mean:.5} shift={shift:.4} argmax ours={:?} ref={:?}",
+        "{label}: max={max:.4} mean={mean:.5} shift={shift:.4} argmax ours={:?} ref={:?}",
         argmax(ours),
         argmax(reference)
     );
-    (max, mean, same)
+    RowGap {
+        max,
+        mean,
+        same_argmax,
+    }
+}
+
+fn oracle_ids(oracle: &serde_json::Value, key: &str) -> Vec<usize> {
+    oracle[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("invariant: oracle sans {key}"))
+        .iter()
+        .map(|id| id.as_u64().expect("invariant: id entier") as usize)
+        .collect()
+}
+
+/// Compare chaque ligne de `ours` (positions du prompt puis pas greedy) aux
+/// logits d'un oracle ; renvoie le pire écart `(max, mean)` et l'accord des argmax.
+fn compare_oracle(
+    name: &str,
+    dir: &Path,
+    ours: &[Vec<f32>],
+    prompt_len: usize,
+) -> (f32, f32, bool) {
+    let (_, prompt) = read_npy_f32(&dir.join("oracle_prompt_logits.npy"));
+    let (_, greedy) = read_npy_f32(&dir.join("oracle_greedy_logits.npy"));
+    let vocab = ours[0].len();
+    let (mut max, mut mean, mut argmax_ok) = (0.0_f32, 0.0_f32, true);
+    for (index, row) in ours.iter().enumerate() {
+        let (label, reference) = if index < prompt_len {
+            (
+                format!("{name} prompt[{index}]"),
+                &prompt[index * vocab..(index + 1) * vocab],
+            )
+        } else {
+            let step = index + 1 - prompt_len;
+            (
+                format!("{name} greedy[{step}]"),
+                &greedy[step * vocab..(step + 1) * vocab],
+            )
+        };
+        let gap = compare_rows(&label, row, reference);
+        max = max.max(gap.max);
+        mean = mean.max(gap.mean);
+        argmax_ok &= gap.same_argmax;
+    }
+    println!("{name}: pire max={max:.4}, pire moyenne={mean:.5}");
+    (max, mean, argmax_ok)
 }
 
 /// Poids réels flint-int4 contre les logits de mlx-lm épinglé (4cfc6478).
 ///
-/// `SARAGOSSA_FLINT_DIR` et `SARAGOSSA_FLINT_ORACLE_DIR` surchargent les chemins.
+/// Exige `SARAGOSSA_FLINT_MODEL_DIR` (poids MLX int4) et
+/// `SARAGOSSA_FLINT_ORACLE_DIR` (oracle mlx en float32 : `oracle.json`,
+/// `oracle_prompt_logits.npy`, `oracle_greedy_logits.npy`) ;
+/// `SARAGOSSA_FLINT_ORACLE_BF16_DIR`, optionnel, ajoute l'oracle bf16 pour
+/// information. Sans les deux premières, le test s'arrête avec un message.
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) et oracle mlx-lm requis"]
 fn flint_int4_real_weights_match_mlx_oracle() {
-    let model_dir = std::env::var_os("SARAGOSSA_FLINT_DIR").map_or_else(
-        || PathBuf::from("/Users/ludwig/workspace/saragossa-oss/models/flint-int4"),
-        PathBuf::from,
-    );
-    let oracle_dir = std::env::var_os("SARAGOSSA_FLINT_ORACLE_DIR").map_or_else(
-        || {
-            PathBuf::from(
-                "/private/tmp/claude-501/-Users-ludwig-workspace-saragossa-oss/\
-                 47d98124-b7be-4a39-ab25-3be149b935b4/scratchpad/flint",
-            )
-        },
-        PathBuf::from,
-    );
+    let (Some(model_dir), Some(oracle_dir)) = (
+        std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from),
+        std::env::var_os("SARAGOSSA_FLINT_ORACLE_DIR").map(PathBuf::from),
+    ) else {
+        eprintln!(
+            "test flint réel sauté : définir SARAGOSSA_FLINT_MODEL_DIR et \
+             SARAGOSSA_FLINT_ORACLE_DIR"
+        );
+        return;
+    };
     let oracle: serde_json::Value = serde_json::from_slice(
         &std::fs::read(oracle_dir.join("oracle.json")).expect("invariant: oracle.json"),
     )
     .expect("invariant: oracle JSON");
-    let ids = |key: &str| {
-        oracle[key]
-            .as_array()
-            .unwrap_or_else(|| panic!("oracle sans {key}"))
-            .iter()
-            .map(|id| id.as_u64().expect("invariant: id entier") as usize)
-            .collect::<Vec<_>>()
-    };
-    let prompt_ids = ids("ids");
-    let greedy_ids = ids("greedy");
+    let prompt_ids = oracle_ids(&oracle, "ids");
+    let greedy_ids = oracle_ids(&oracle, "greedy");
     let prompt = oracle["prompt"].as_str().expect("invariant: prompt texte");
 
     let started = std::time::Instant::now();
     let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
-    let ours = assets
+    let ours_ids = assets
         .tokenizer
         .encode(prompt)
         .expect("invariant: tokenisation")
         .into_iter()
         .map(|id| id as usize)
         .collect::<Vec<_>>();
-    println!("tokens ours={ours:?} mlx={prompt_ids:?}");
+    println!("tokens ours={ours_ids:?} mlx={prompt_ids:?}");
+    assert_eq!(ours_ids, prompt_ids, "tokenizer divergent de mlx");
     let model = load_causal_decoder(&assets).expect("invariant: flint-int4 chargeable");
     println!("chargement: {:.1?}", started.elapsed());
 
-    // Logits du prompt position par position via le chemin avec cache.
-    let (shape, prompt_logits) = read_npy_f32(&oracle_dir.join("oracle_prompt_logits.npy"));
-    assert_eq!(shape, vec![prompt_ids.len(), assets.config.vocab_size]);
-    let vocab = assets.config.vocab_size;
+    // Prompt position par position puis toute la continuation de référence,
+    // en forçant ses tokens pour mesurer la dérive sans divergence. La ligne
+    // `prompt_len - 1` porte aussi le premier pas greedy.
     let started = std::time::Instant::now();
     let mut cache = model.empty_cache();
-    let mut worst = 0.0_f32;
-    let mut argmax_ok = true;
-    let mut last_row = Vec::new();
-    for (position, token) in prompt_ids.iter().enumerate() {
-        let logits = model
-            .next_logits_cached(&mut cache, *token)
-            .expect("invariant: pas avec cache");
-        let reference = &prompt_logits[position * vocab..(position + 1) * vocab];
-        let (max, _, same) = compare_rows(&format!("prompt[{position}]"), logits.data(), reference);
-        worst = worst.max(max);
-        argmax_ok &= same;
-        last_row = logits.data().to_vec();
-    }
-    println!("prompt: {:.1?}", started.elapsed());
-
-    // Greedy avec cache, en forçant les tokens de la référence pour mesurer la
-    // dérive sans divergence de trajectoire.
-    let (_, greedy_logits) = read_npy_f32(&oracle_dir.join("oracle_greedy_logits.npy"));
-    let steps = std::env::var("SARAGOSSA_FLINT_STEPS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(4)
-        .min(greedy_ids.len());
-    let started = std::time::Instant::now();
-    let mut ours_greedy = Vec::new();
-    // Le premier token greedy sort des logits de la dernière position du prompt.
-    let mut row = last_row;
-    for step in 0..steps {
-        if step > 0 {
-            row = model
-                .next_logits_cached(&mut cache, greedy_ids[step - 1])
-                .expect("invariant: pas greedy")
+    let mut rows = Vec::new();
+    for token in prompt_ids.iter().chain(&greedy_ids[..greedy_ids.len() - 1]) {
+        rows.push(
+            model
+                .next_logits_cached(&mut cache, *token)
+                .expect("invariant: pas avec cache")
                 .data()
-                .to_vec();
-        }
-        let reference = &greedy_logits[step * vocab..(step + 1) * vocab];
-        let (max, _, same) = compare_rows(&format!("greedy[{step}]"), &row, reference);
-        worst = worst.max(max);
-        argmax_ok &= same;
-        let token = row
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(index, _)| index)
-            .expect("invariant: vocab non vide");
-        ours_greedy.push(token);
+                .to_vec(),
+        );
     }
-    println!("greedy: {:.1?}", started.elapsed());
+    println!("prompt + greedy: {:.1?}", started.elapsed());
+    let ours_greedy = rows[prompt_ids.len() - 1..]
+        .iter()
+        .map(|row| argmax(row).expect("invariant: vocab non vide"))
+        .collect::<Vec<_>>();
     let text = assets
         .tokenizer
         .decode(
@@ -491,10 +546,25 @@ fn flint_int4_real_weights_match_mlx_oracle() {
             false,
         )
         .expect("invariant: décodage");
-    println!("greedy ours={ours_greedy:?} ref={:?}", &greedy_ids[..steps]);
     println!("texte: {prompt}{text:?}");
-    println!("écart max global: {worst:.4}");
-    assert_eq!(ours, prompt_ids, "tokenizer divergent de mlx");
-    assert_eq!(ours_greedy, greedy_ids[..steps], "tokens greedy divergents");
+
+    if let Some(bf16_dir) = std::env::var_os("SARAGOSSA_FLINT_ORACLE_BF16_DIR") {
+        compare_oracle("mlx-bf16", Path::new(&bf16_dir), &rows, prompt_ids.len());
+    }
+    let (max, mean, argmax_ok) = compare_oracle("mlx-f32", &oracle_dir, &rows, prompt_ids.len());
+    assert_eq!(ours_greedy, greedy_ids, "tokens greedy divergents");
     assert!(argmax_ok, "argmax divergent sur au moins une position");
+    assert!(max < MAX_GAP_F32, "écart max {max} ≥ {MAX_GAP_F32}");
+    assert!(mean < MEAN_GAP_F32, "écart moyen {mean} ≥ {MEAN_GAP_F32}");
 }
+
+// Seuils contre mlx float32, écarts centrés (décalage constant retiré), sur
+// les 5 positions du prompt et les 16 pas greedy.
+// NOTE: Mesuré le 29 oct. 2026 (CPU f32, mlx-lm 4cfc6478 en float32) : pire
+// max 4,16 et pire moyenne 0,70 (greedy[15]) ; la position 0 est à 0,004 près.
+// L'écart croît par sauts non monotones, signe probable d'experts départagés
+// différemment sur des quasi-égalités de scores (ordre d'accumulation f32),
+// pas d'une erreur de formule. Les seuils laissent ~1,5× de marge et restent
+// 3 à 4× sous l'écart propre de mlx bf16 contre mlx f32 (17,0 et 2,6).
+const MAX_GAP_F32: f32 = 6.0;
+const MEAN_GAP_F32: f32 = 1.0;

@@ -420,11 +420,13 @@ impl MoeMlp {
         router_source: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
-        let runtime = if self.metal_compatible() {
-            runtime
-        } else {
-            ForwardRuntime::cpu()
-        };
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if runtime.metal_executor().is_some() && !self.metal_compatible() {
+            return Err(InferError::Config(
+                "MoE à routeur sigmoïde ou expert partagé sans gate refusé par le runtime Metal"
+                    .to_string(),
+            ));
+        }
         let (batch, hidden) = x.as_matrix()?;
         let (router_batch, router_hidden) = router_source.as_matrix()?;
         if (router_batch, router_hidden) != (batch, hidden) {

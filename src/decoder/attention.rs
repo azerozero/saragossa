@@ -110,13 +110,21 @@ impl DecoderLayer {
         attention || moe
     }
 
-    /// Ramène le runtime au CPU pour une couche inconnue des kernels Metal.
-    fn layer_runtime<'a>(&self, runtime: ForwardRuntime<'a>) -> ForwardRuntime<'a> {
-        if self.metal_unsupported() {
-            ForwardRuntime::cpu()
-        } else {
-            runtime
+    /// Refuse un runtime Metal sur une couche inconnue des kernels Metal.
+    ///
+    /// `CausalDecoder` refuse déjà d'attacher Metal à un tel modèle ; cette
+    /// garde rend l'erreur explicite si un autre appelant passait outre.
+    fn ensure_runtime_supported(&self, runtime: ForwardRuntime<'_>) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if runtime.metal_executor().is_some() && self.metal_unsupported() {
+            return Err(InferError::Config(
+                "couche flint (sinks, NoPE ou MoE sigmoïde) refusée par le runtime Metal"
+                    .to_string(),
+            ));
         }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = runtime;
+        Ok(())
     }
 
     pub(super) fn forward(
@@ -125,7 +133,7 @@ impl DecoderLayer {
         x: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
-        let runtime = self.layer_runtime(runtime);
+        self.ensure_runtime_supported(runtime)?;
         let normed = rms_norm(x, &self.input_norm, config.rms_eps)?;
         let attn_out = match &self.attention {
             AttentionBlock::Full(attention) => {
@@ -473,7 +481,7 @@ impl DecoderLayer {
         position_offset: usize,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
-        let runtime = self.layer_runtime(runtime);
+        self.ensure_runtime_supported(runtime)?;
         let profile = profile_layer_enabled();
         let total_started = profile.then(Instant::now);
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -715,7 +723,7 @@ impl DecoderLayer {
         position: usize,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
-        let runtime = self.layer_runtime(runtime);
+        self.ensure_runtime_supported(runtime)?;
         let profile = profile_layer_enabled();
         let total_started = profile.then(Instant::now);
         let norm_started = profile.then(Instant::now);

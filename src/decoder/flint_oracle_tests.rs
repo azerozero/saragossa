@@ -1,7 +1,7 @@
 //! Cas analytiques de l'oracle CPU flint : sinks, fenêtre 513 et NoPE.
 
 use super::attention_ops::{
-    cached_attention_one_with_sinks, causal_attention_with_sinks, full_attention_context_prefill,
+    cached_attention_one, causal_attention, full_attention_context_prefill,
     full_attention_from_tensors, AttentionLayout,
 };
 use super::*;
@@ -48,14 +48,14 @@ fn sink_enters_max_and_denominator_once_per_head() {
             .append(&rows(1, |_| *k), &rows(1, |_| *v), &layout)
             .expect("invariant: append");
     }
-    let cached = cached_attention_one_with_sinks(&q, &mut cache, &layout, Some(&sinks))
+    let cached = cached_attention_one(&q, &mut cache, &layout, Some(&sinks))
         .expect("invariant: attention cache");
     close(cached.data(), &expected, 1.0e-6);
 
     // Même formule sur le chemin prefill (dernière ligne causale).
     let q_rows = Tensor::from_vec(vec![2, 4], vec![0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0])
         .expect("invariant: q prefill");
-    let prefill = causal_attention_with_sinks(
+    let prefill = causal_attention(
         &q_rows,
         &rows(2, |i| keys[i]),
         &rows(2, |i| values[i]),
@@ -82,7 +82,7 @@ fn sliding_window_513_includes_current_token() {
     let q = rows(seq, |_| [0.0, 0.0]);
     let k = rows(seq, |i| [i as f32 * 1e-3, 1.0]);
     let v = rows(seq, |i| [i as f32, 1.0]);
-    let out = causal_attention_with_sinks(&q, &k, &v, &layout, None).expect("invariant: prefill");
+    let out = causal_attention(&q, &k, &v, &layout, None).expect("invariant: prefill");
     let probe = |pos: usize| out.row_slice(pos).expect("invariant: ligne")[0];
     // 512 tokens visibles (0..=511), 513 (0..=512), puis 513 (1..=513).
     assert!((probe(511) - mean(0, 511)).abs() < 1e-3);
@@ -107,7 +107,7 @@ fn sliding_window_513_includes_current_token() {
                 )
                 .expect("invariant: append");
         }
-        let out = cached_attention_one_with_sinks(&zero_q, &mut cache, &layout, None)
+        let out = cached_attention_one(&zero_q, &mut cache, &layout, None)
             .expect("invariant: decode fenêtré");
         assert!((out.data()[0] - expected).abs() < 1e-3, "len={len}");
     }

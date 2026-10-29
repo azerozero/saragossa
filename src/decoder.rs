@@ -1790,6 +1790,16 @@ impl CausalDecoder {
         }
         let final_norm = take_dense(&mut tensors, "norm.weight")?;
         let lm_head = linear_from(&mut tensors, "lm_head")?;
+        // Contrat strict des modèles à sinks (flint) : un tenseur chargé mais
+        // jamais assemblé (ex. `mlp.gate_proj.bias` sur une couche MoE) serait
+        // ignoré en silence. Les autres familles gardent leur tolérance.
+        if config.attention_sinks && !tensors.is_empty() {
+            let mut leftovers = tensors.keys().cloned().collect::<Vec<_>>();
+            leftovers.sort();
+            return Err(InferError::Config(format!(
+                "tenseurs chargés mais non assemblés: {leftovers:?}"
+            )));
+        }
         Ok(Self {
             config,
             embed_tokens,

@@ -125,6 +125,9 @@ impl ModelConfig {
     /// Renvoie une erreur si la fonction déclarée n'est pas implémentée.
     pub fn router_score(&self) -> Result<crate::RouterScore> {
         match self.router_score_function.as_deref() {
+            // Défaut de `FlintConfig` dans la référence : sigmoïde ; softmax
+            // pour toutes les autres familles.
+            None if self.is_flint() => Ok(crate::RouterScore::Sigmoid),
             None | Some("softmax") => Ok(crate::RouterScore::Softmax),
             Some("sigmoid") => Ok(crate::RouterScore::Sigmoid),
             Some(other) => Err(InferError::Config(format!(

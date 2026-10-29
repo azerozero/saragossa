@@ -232,7 +232,7 @@ pub(super) fn full_attention_forward(
         )?;
     }
     let sinks = attention.sinks.as_ref().map(Tensor::data);
-    let mut context = causal_attention_with_sinks(&q, &k, &v, &layout, sinks)?;
+    let mut context = causal_attention(&q, &k, &v, &layout, sinks)?;
     if let Some(gate) = gate {
         context = context.mul_elementwise(&gate.map(sigmoid_scalar))?;
     }
@@ -337,7 +337,7 @@ pub(super) fn full_attention_context_cached(
         Some(context) => context,
         None => {
             cache.append(&k, &v, &layout)?;
-            cached_attention_one_with_sinks(&q, cache, &layout, sinks)?
+            cached_attention_one(&q, cache, &layout, sinks)?
         }
     };
     // Gate de sortie full-attn : appliqué APRÈS le contexte (hors kernel), à
@@ -391,7 +391,7 @@ pub(super) fn full_attention_context_prefill(
     let sinks = attention.sinks.as_ref().map(Tensor::data);
     let mut context = if cache.len() == 0 {
         cache.append_batch(&k, &v, &layout)?;
-        causal_attention_with_sinks(&q, &k, &v, &layout, sinks)?
+        causal_attention(&q, &k, &v, &layout, sinks)?
     } else {
         cached_attention_prefill_rows(&q, &k, &v, cache, &layout, sinks)?
     };
@@ -991,15 +991,6 @@ pub(super) fn rope_rotations(
     Ok(rotations)
 }
 
-#[cfg(test)]
-pub(super) fn cached_attention_one(
-    q: &Tensor,
-    cache: &mut LayerKvCache,
-    layout: &AttentionLayout,
-) -> Result<Tensor> {
-    cached_attention_one_with_sinks(q, cache, layout, None)
-}
-
 /// Normalise des scores d'attention en tenant compte d'un sink appris.
 ///
 /// Sans sink, softmax standard (octets inchangés). Avec un sink `s`, le max
@@ -1022,32 +1013,32 @@ pub(super) fn attention_probs_in_place(scores: &mut [f32], sink: Option<f32>) {
     }
 }
 
-fn head_sink(sinks: Option<&[f32]>, q_head: usize) -> Result<Option<f32>> {
-    sinks
-        .map(|sinks| {
-            sinks
-                .get(q_head)
-                .copied()
-                .ok_or_else(|| InferError::Dimension(format!("sink absent pour la tête {q_head}")))
-        })
-        .transpose()
+/// Vérifie qu'il y a un sink par tête requête ; ensuite, l'accès par tête
+/// (`sinks.get(q_head)`) est toujours dans les bornes.
+fn validate_sinks(sinks: Option<&[f32]>, layout: &AttentionLayout) -> Result<()> {
+    match sinks {
+        Some(sinks) if sinks.len() != layout.num_attention_heads => {
+            Err(InferError::Dimension(format!(
+                "sinks attendus {}, reçu {}",
+                layout.num_attention_heads,
+                sinks.len()
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
-pub(super) fn cached_attention_one_with_sinks(
+fn head_sink(sinks: Option<&[f32]>, q_head: usize) -> Option<f32> {
+    sinks.and_then(|sinks| sinks.get(q_head).copied())
+}
+
+pub(super) fn cached_attention_one(
     q: &Tensor,
     cache: &mut LayerKvCache,
     layout: &AttentionLayout,
     sinks: Option<&[f32]>,
 ) -> Result<Tensor> {
-    if let Some(sinks) = sinks {
-        if sinks.len() != layout.num_attention_heads {
-            return Err(InferError::Dimension(format!(
-                "sinks attendus {}, reçu {}",
-                layout.num_attention_heads,
-                sinks.len()
-            )));
-        }
-    }
+    validate_sinks(sinks, layout)?;
     let (seq, dim) = q.as_matrix()?;
     let expected_q_dim = layout.num_attention_heads * layout.head_dim;
     let expected_kv_dim = layout.num_key_value_heads * layout.head_dim;
@@ -1100,8 +1091,7 @@ pub(super) fn cached_attention_one_with_sinks(
                         let k_slice = &keys[offset][k_start..k_start + layout.head_dim];
                         *score = dot_product(q_slice, k_slice) * inv_scale;
                     }
-                    let sink = sinks.and_then(|sinks| sinks.get(q_head).copied());
-                    attention_probs_in_place(scores, sink);
+                    attention_probs_in_place(scores, head_sink(sinks, q_head));
                     for (offset, prob) in scores.iter().copied().enumerate() {
                         let v_slice = &values[offset][k_start..k_start + layout.head_dim];
                         for col in 0..layout.head_dim {
@@ -1122,7 +1112,7 @@ pub(super) fn cached_attention_one_with_sinks(
             let k_slice = &keys[offset][k_start..k_start + layout.head_dim];
             *score = dot_product(q_slice, k_slice) * inv_scale;
         }
-        attention_probs_in_place(&mut scores, head_sink(sinks, q_head)?);
+        attention_probs_in_place(&mut scores, head_sink(sinks, q_head));
         for (offset, prob) in scores.iter().copied().enumerate() {
             let v_slice = &values[offset][k_start..k_start + layout.head_dim];
             for col in 0..layout.head_dim {
@@ -1174,7 +1164,7 @@ fn cached_attention_prefill_rows(
             Some(context) => context,
             None => {
                 cache.append(&k_row, &v_row, layout)?;
-                cached_attention_one_with_sinks(&q_row, cache, layout, sinks)?
+                cached_attention_one(&q_row, cache, layout, sinks)?
             }
         };
         data.extend_from_slice(context.as_row()?);
@@ -1215,23 +1205,14 @@ pub(super) fn attention_parallel_threshold() -> usize {
     crate::decoder::flags::attention_parallel_threshold()
 }
 
-#[cfg(test)]
 pub(super) fn causal_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    layout: &AttentionLayout,
-) -> Result<Tensor> {
-    causal_attention_with_sinks(q, k, v, layout, None)
-}
-
-pub(super) fn causal_attention_with_sinks(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     layout: &AttentionLayout,
     sinks: Option<&[f32]>,
 ) -> Result<Tensor> {
+    validate_sinks(sinks, layout)?;
     let (seq, dim) = q.as_matrix()?;
     let (k_seq, k_dim) = k.as_matrix()?;
     let (v_seq, v_dim) = v.as_matrix()?;
@@ -1277,7 +1258,7 @@ pub(super) fn causal_attention_with_sinks(
                     .sum::<f32>();
                 scores.push(dot / scale);
             }
-            let probs = match head_sink(sinks, q_head)? {
+            let probs = match head_sink(sinks, q_head) {
                 None => softmax(&scores, 1.0),
                 sink => {
                     attention_probs_in_place(&mut scores, sink);
@@ -1365,6 +1346,7 @@ pub(crate) fn gemma_global_attention_prefill_oracle(
             attn_scalar: spec.attn_scalar,
             sliding_window: spec.window,
         },
+        None,
     )?;
     Ok((q, k, v, context))
 }

@@ -497,7 +497,12 @@ fn validate_no_orphan_tensors(
     let mut known = std::collections::HashSet::with_capacity(specs.len() * 3);
     for spec in specs {
         known.insert(spec.source.clone());
-        if let Some(base) = spec.source.strip_suffix(".weight") {
+        // Scales et biases affines seulement pour un poids réellement empaqueté.
+        let packed = match entries.get(&spec.source) {
+            Some(entry_ref) => packed_u32_entry(&entry_ref.entry, &spec.source)?.is_some(),
+            None => false,
+        };
+        if let Some(base) = spec.source.strip_suffix(".weight").filter(|_| packed) {
             known.insert(format!("{base}.scales"));
             known.insert(format!("{base}.biases"));
         }
