@@ -461,6 +461,61 @@ fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
     );
 }
 
+/// Le scratch du prefill résident flint passe par le scope de purge (marquage
+/// volatil, éviction LRU au-delà de `SARAGOSSA_RUST_SCRATCH_CAP_GB`) après
+/// chaque prefill, quelle que soit sa taille, et reste sous ce plafond.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_resident_prefill_scratch_is_released() {
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let mut releases = gpu
+        .scratch_stats_for_test()
+        .expect("invariant: stats scratch")
+        .2;
+    for len in [3, 9, 17, 40] {
+        let prompt = (0..len).map(|i| i % VOCAB).collect::<Vec<_>>();
+        gpu.generate_greedy(&prompt, 1)
+            .expect("invariant: prefill Metal flint");
+        let releases_before = releases;
+        let (entries, bytes, after) = gpu
+            .scratch_stats_for_test()
+            .expect("invariant: stats scratch");
+        releases = after;
+        assert!(entries > 0, "prefill résident sans scratch (len={len})");
+        assert!(
+            releases > releases_before,
+            "scratch jamais purgé (len={len})"
+        );
+        assert!(
+            bytes <= crate::runtime_flags::scratch_cap_bytes(),
+            "scratch au-delà du plafond (len={len}): {bytes}"
+        );
+    }
+}
+
+/// Au-delà du plafond de prefill flint, refus explicite avant tout calcul
+/// plutôt qu'un échec mémoire suivi d'un repli CPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_refuses_prompt_beyond_prefill_cap() {
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let prompt = vec![1; crate::runtime_flags::flint_prefill_max_tokens() + 1];
+    let err = gpu
+        .generate_greedy(&prompt, 1)
+        .expect_err("prompt flint au-delà du plafond refusé");
+    assert!(
+        err.to_string()
+            .contains("SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS"),
+        "{err}"
+    );
+}
+
 /// Lit un `.npy` v1 f32 little-endian (en-tête puis données brutes).
 fn read_npy_f32(path: &Path) -> (Vec<usize>, Vec<f32>) {
     let bytes = std::fs::read(path).expect("invariant: .npy lisible");

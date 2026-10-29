@@ -2447,7 +2447,7 @@ impl CausalDecoder {
         if !trace_gpu_alloc_enabled() {
             return None;
         }
-        let executor = self.forward_runtime().metal_executor()?;
+        let executor = self.resident_metal()?;
         let before = GpuAllocTrace::capture(executor)?;
         let trace = GpuAllocTrace {
             executor,
@@ -2459,11 +2459,28 @@ impl CausalDecoder {
         Some(trace)
     }
 
+    /// Scope de purge du scratch Metal. `resident_metal` et non
+    /// `forward_runtime` : le prefill résident de flint alloue son scratch sur
+    /// cet executor alors que son runtime per-op est le CPU ; sans scope, ce
+    /// scratch n'était jamais rendu volatil ni plafonné.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn scratch_buffer_scope(&self) -> Option<impl Drop + '_> {
-        self.forward_runtime()
-            .metal_executor()
+        self.resident_metal()
             .map(crate::MetalExecutor::scratch_buffer_scope)
+    }
+
+    /// Scratch Metal de test : `(entrées, octets, passages du scope de purge)`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sans executor Metal ou si le cache est empoisonné.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn scratch_stats_for_test(&self) -> Result<(usize, u64, usize)> {
+        let metal = self
+            .resident_metal()
+            .ok_or_else(|| InferError::Metal("executor Metal absent".to_string()))?;
+        let (entries, bytes) = metal.scratch_buffer_stats()?;
+        Ok((entries, bytes, metal.scratch_releases_for_test()))
     }
 
     /// Crée un cache K/V vide pour ce décodeur.

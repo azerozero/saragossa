@@ -338,6 +338,9 @@ pub struct MetalExecutor {
     concat_buffers: Mutex<HashMap<ConcatWeightKey, ConcatCacheEntry>>,
     /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
     preserve_weight_caches: std::sync::atomic::AtomicBool,
+    /// Passages du scope de purge du scratch, vérifiés par les tests.
+    #[cfg(test)]
+    scratch_releases: std::sync::atomic::AtomicUsize,
 }
 
 /// Identifie un poids dense par adresse ou un poids quantifié par ID stable.

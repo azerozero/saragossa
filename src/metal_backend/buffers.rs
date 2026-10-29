@@ -882,6 +882,13 @@ impl MetalExecutor {
         Ok((buffers.entries.len(), buffers.total_bytes))
     }
 
+    /// Nombre de passages du scope de purge du scratch (tests).
+    #[cfg(test)]
+    pub(crate) fn scratch_releases_for_test(&self) -> usize {
+        self.scratch_releases
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn scratch_buffer_scope(&self) -> impl Drop + '_ {
         ScratchBufferScope {
             executor: self,
@@ -895,6 +902,9 @@ impl MetalExecutor {
             .scratch_buffers
             .lock()
             .map_err(|_| InferError::Metal("cache scratch Metal empoisonné".to_string()))?;
+        #[cfg(test)]
+        self.scratch_releases
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let before_entries = buffers.entries.len();
         let before_bytes = buffers.total_bytes;
         let mut volatile_entries = 0_usize;

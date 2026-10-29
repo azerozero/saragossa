@@ -9656,6 +9656,9 @@ kernel void topk_softmax_rows_f32(
 // Sélection sur `sigmoid(logit)`, égalités départagées par l'indice le plus
 // petit comme le tri stable de l'oracle CPU (`sigmoid_top_weights`) ; poids =
 // score / (somme des scores retenus + 1e-20).
+// NOTE: la bibliothèque est compilée en fast-math : `exp` y diffère de
+// quelques ulp de `f32::exp`, donc deux experts quasi à égalité peuvent
+// s'inverser par rapport au CPU (dérive acceptée, cf. le test réel flint).
 kernel void topk_sigmoid_rows_f32(
     device const float* logits [[buffer(0)]],
     device uint* indices [[buffer(1)]],
