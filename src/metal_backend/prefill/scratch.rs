@@ -99,6 +99,7 @@ impl MetalExecutor {
                 q_norm_weight,
                 k_norm_weight,
                 gated,
+                sinks,
             } => {
                 let q_len = checked_len(spec.seq, q_dim, "prefill résident q")?;
                 let kv_len = checked_len(spec.seq, kv_dim, "prefill résident kv")?;
@@ -131,6 +132,9 @@ impl MetalExecutor {
                         None
                     },
                     o: self.private_f32_buffer(hidden_len, "resident_o")?,
+                    sinks: sinks
+                        .map(|sinks| self.cached_buffer_from_f32(sinks, "resident_attention_sinks"))
+                        .transpose()?,
                 })
             }
             PrefillResidentAttentionShape::Linear { .. } => {
@@ -140,31 +144,9 @@ impl MetalExecutor {
             }
         };
         let tail = match &shape.tail {
-            PrefillResidentTailShape::Dense {
-                gate_proj,
-                up_proj,
-                down_proj,
-                inter_dim,
-            } => {
-                // Décision prise ici une seule fois : l'encodage suit le scratch.
-                let fused = self.fused_dense_mlp_supported(
-                    spec.seq, hidden_dim, gate_proj, up_proj, down_proj, *inter_dim,
-                );
-                let unfused = if fused {
-                    None
-                } else {
-                    let inter_len = checked_len(spec.seq, *inter_dim, "resident dense inter")?;
-                    Some((
-                        self.private_f32_buffer(inter_len, "resident_dense_gate")?,
-                        self.private_f32_buffer(inter_len, "resident_dense_up")?,
-                        self.private_f32_buffer(inter_len, "resident_dense_hidden")?,
-                    ))
-                };
-                PrefillResidentTailScratch::Dense {
-                    unfused,
-                    down: self.private_f32_buffer(hidden_len, "resident_dense_down")?,
-                }
-            }
+            PrefillResidentTailShape::Dense(mlp) => PrefillResidentTailScratch::Dense(
+                self.allocate_prefill_dense_mlp_scratch(mlp, spec.seq, hidden_dim)?,
+            ),
             PrefillResidentTailShape::GemmaDense { inter_dim, .. } => {
                 self.allocate_prefill_gemma_dense_tail_scratch(spec.seq, hidden_dim, *inter_dim)?
             }
@@ -178,6 +160,7 @@ impl MetalExecutor {
             PrefillResidentTailShape::Routed {
                 expert_count,
                 stacked,
+                sigmoid_shared,
             } => {
                 let total_topk = checked_len(spec.seq, top_k, "resident topk total")?;
                 let inter_dim = stacked.gate.out_dim;
@@ -204,6 +187,12 @@ impl MetalExecutor {
                         checked_len(total_topk, hidden_dim, "resident down")?,
                         "resident_down",
                     )?,
+                    sigmoid_shared: sigmoid_shared
+                        .as_ref()
+                        .map(|mlp| {
+                            self.allocate_prefill_dense_mlp_scratch(mlp, spec.seq, hidden_dim)
+                        })
+                        .transpose()?,
                 }
             }
             PrefillResidentTailShape::Shared { .. } => PrefillResidentTailScratch::Shared,
@@ -216,6 +205,66 @@ impl MetalExecutor {
             attention_state: self.private_f32_buffer(hidden_len, "resident_attention_state")?,
             post_normed: self.private_f32_buffer(hidden_len, "resident_post_normed")?,
             tail,
+        })
+    }
+
+    /// Alloue le scratch d'un MLP dense sur `seq` lignes. Le choix fusionné
+    /// ou non est pris ici une seule fois : l'encodage suit le scratch.
+    fn allocate_prefill_dense_mlp_scratch(
+        &self,
+        mlp: &PrefillResidentDenseMlp,
+        seq: usize,
+        hidden_dim: usize,
+    ) -> Result<PrefillResidentDenseScratch> {
+        let fused = self.fused_dense_mlp_supported(
+            seq,
+            hidden_dim,
+            &mlp.gate_proj,
+            &mlp.up_proj,
+            &mlp.down_proj,
+            mlp.inter_dim,
+        );
+        let unfused = if fused {
+            None
+        } else {
+            let inter_len = checked_len(seq, mlp.inter_dim, "resident dense inter")?;
+            Some((
+                self.private_f32_buffer(inter_len, "resident_dense_gate")?,
+                self.private_f32_buffer(inter_len, "resident_dense_up")?,
+                self.private_f32_buffer(inter_len, "resident_dense_hidden")?,
+            ))
+        };
+        Ok(PrefillResidentDenseScratch {
+            unfused,
+            down: self.private_f32_buffer(
+                checked_len(seq, hidden_dim, "resident dense down")?,
+                "resident_dense_down",
+            )?,
+        })
+    }
+
+    /// Résout et valide les poids d'un MLP SwiGLU dense sans biais.
+    fn resolve_prefill_dense_mlp(
+        &self,
+        hidden_dim: usize,
+        gate_proj: &Linear,
+        up_proj: &Linear,
+        down_proj: &Linear,
+    ) -> Result<PrefillResidentDenseMlp> {
+        ensure_biasless(gate_proj, "dense.gate_proj")?;
+        ensure_biasless(up_proj, "dense.up_proj")?;
+        ensure_biasless(down_proj, "dense.down_proj")?;
+        let inter_dim = linear_out_dim(gate_proj.weight())?;
+        expect_linear_shape(gate_proj.weight(), inter_dim, hidden_dim, "dense.gate_proj")?;
+        expect_linear_shape(up_proj.weight(), inter_dim, hidden_dim, "dense.up_proj")?;
+        expect_linear_shape(down_proj.weight(), hidden_dim, inter_dim, "dense.down_proj")?;
+        Ok(PrefillResidentDenseMlp {
+            gate_proj: self
+                .resolve_linear_weight_buffers(gate_proj.weight(), "resident_dense_gate")?,
+            up_proj: self.resolve_linear_weight_buffers(up_proj.weight(), "resident_dense_up")?,
+            down_proj: self
+                .resolve_linear_weight_buffers(down_proj.weight(), "resident_dense_down")?,
+            inter_dim,
         })
     }
 
@@ -448,12 +497,16 @@ impl MetalExecutor {
                 q_norm,
                 k_norm,
                 gated,
+                sinks,
             } => {
+                // NOTE: `rope_dims = 0` (NoPE flint) n'est admis qu'avec des
+                // sinks : le kernel fusionné garde alors la QK-RMSNorm et saute
+                // la rotation ; ailleurs ce serait une config RoPE cassée.
                 if spec.q_heads == 0
                     || spec.kv_heads == 0
                     || spec.head_dim == 0
                     || spec.q_heads % spec.kv_heads != 0
-                    || spec.rope_dims == 0
+                    || (spec.rope_dims == 0 && sinks.is_none())
                     || spec.rope_dims > spec.head_dim
                     || spec.rope_dims % 2 != 0
                     || spec.rope_frequency_dim < spec.rope_dims
@@ -481,10 +534,18 @@ impl MetalExecutor {
                         "prefill résident projections incompatibles couche {layer_index}"
                     )));
                 }
+                if sinks.is_some() && gated {
+                    return Err(InferError::Config(format!(
+                        "prefill résident: sinks et porte de sortie couche {layer_index}"
+                    )));
+                }
                 PrefillResidentAttentionShape::Full {
                     q_norm_weight: dense_vector(q_norm, spec.head_dim, "resident q_norm")?,
                     k_norm_weight: dense_vector(k_norm, spec.head_dim, "resident k_norm")?,
                     gated,
+                    sinks: sinks
+                        .map(|sinks| dense_vector(sinks, spec.q_heads, "resident sinks"))
+                        .transpose()?,
                 }
             }
             PrefillAttentionLayer::Linear {
@@ -635,24 +696,9 @@ impl MetalExecutor {
                 gate_proj,
                 up_proj,
                 down_proj,
-            } => {
-                ensure_biasless(gate_proj, "dense.gate_proj")?;
-                ensure_biasless(up_proj, "dense.up_proj")?;
-                ensure_biasless(down_proj, "dense.down_proj")?;
-                let inter_dim = linear_out_dim(gate_proj.weight())?;
-                expect_linear_shape(gate_proj.weight(), inter_dim, hidden_dim, "dense.gate_proj")?;
-                expect_linear_shape(up_proj.weight(), inter_dim, hidden_dim, "dense.up_proj")?;
-                expect_linear_shape(down_proj.weight(), hidden_dim, inter_dim, "dense.down_proj")?;
-                PrefillResidentTailShape::Dense {
-                    gate_proj: self
-                        .resolve_linear_weight_buffers(gate_proj.weight(), "resident_dense_gate")?,
-                    up_proj: self
-                        .resolve_linear_weight_buffers(up_proj.weight(), "resident_dense_up")?,
-                    down_proj: self
-                        .resolve_linear_weight_buffers(down_proj.weight(), "resident_dense_down")?,
-                    inter_dim,
-                }
-            }
+            } => PrefillResidentTailShape::Dense(
+                self.resolve_prefill_dense_mlp(hidden_dim, gate_proj, up_proj, down_proj)?,
+            ),
             PrefillMoeTail::GemmaDense {
                 gate_proj,
                 up_proj,
@@ -709,6 +755,7 @@ impl MetalExecutor {
                 router,
                 experts,
                 top_k,
+                sigmoid_shared,
             } => {
                 ensure_biasless(router, "router")?;
                 let expert_count = linear_out_dim(router.weight())?;
@@ -737,9 +784,16 @@ impl MetalExecutor {
                         stacked.gate.out_dim, stacked.up.out_dim, stacked.down.in_dim
                     )));
                 }
+                let sigmoid_shared = sigmoid_shared
+                    .map(|shared| {
+                        let (gate_proj, up_proj, down_proj) = shared.projections();
+                        self.resolve_prefill_dense_mlp(hidden_dim, gate_proj, up_proj, down_proj)
+                    })
+                    .transpose()?;
                 PrefillResidentTailShape::Routed {
                     expert_count,
                     stacked,
+                    sigmoid_shared,
                 }
             }
             PrefillMoeTail::Shared {

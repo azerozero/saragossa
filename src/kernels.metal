@@ -8798,6 +8798,123 @@ kernel void causal_attention_prefill_batch_long_d128_f32(
     }
 }
 
+// Attention prefill avec sinks appris (flint, `softmax_offset`). Kernel
+// distinct : les attentions prefill sans sink (Qwen, Gemma) restent inchangées.
+// Une simdgroup calcule une requête (position, tête Q) en softmax en ligne,
+// amorcé par le sink (max = sink, somme = e^0 = 1) : le sink compte dans le
+// max et UNE fois au dénominateur, sans valeur, comme `attention_probs_in_place`.
+// `dims[4]` = fenêtre : 0 pour le masque causal plein, sinon les `window`
+// dernières positions, courante comprise. Le corps reprend l'arithmétique de
+// `causal_attention_prefill_batch_long_d128_f32` (QK constant, fast::exp,
+// inverse multiplié) : un sink neutre sans fenêtre rend ses octets en d128, ce
+// que vérifie un test.
+template <uint QK>
+inline void attention_prefill_sink_body(
+    device const float* q,
+    device const float* k,
+    device const float* v,
+    device float* out,
+    const uint q_heads,
+    const uint kv_heads,
+    const uint window,
+    const float scale,
+    const float sink,
+    const uint simd_lid,
+    const uint q_head,
+    const uint pos
+) {
+    constexpr uint D = QK * 32u;
+    const uint kv_group = q_heads / kv_heads;
+    const uint kv_head = q_head / kv_group;
+    const uint q_dim = q_heads * D;
+    const uint kv_dim = kv_heads * D;
+    const uint lane_base = simd_lid * QK;
+
+    float ql[QK];
+    const device float* q_ptr = q + pos * q_dim + q_head * D + lane_base;
+    for (uint j = 0u; j < QK; ++j) {
+        ql[j] = q_ptr[j] * scale;
+    }
+
+    float o[QK];
+    for (uint j = 0u; j < QK; ++j) {
+        o[j] = 0.0f;
+    }
+    float max_score = sink;
+    float sum_exp = 1.0f;
+    const uint row_start = (window > 0u && pos + 1u > window) ? (pos + 1u - window) : 0u;
+
+    for (uint row = row_start; row <= pos; ++row) {
+        const device float* k_ptr = k + row * kv_dim + kv_head * D + lane_base;
+        const device float* v_ptr = v + row * kv_dim + kv_head * D + lane_base;
+        float score = 0.0f;
+        for (uint j = 0u; j < QK; ++j) {
+            score += ql[j] * k_ptr[j];
+        }
+        score = simd_sum(score);
+        const float new_max = max(max_score, score);
+        const float factor = fast::exp(max_score - new_max);
+        const float exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp = sum_exp * factor + exp_score;
+        for (uint j = 0u; j < QK; ++j) {
+            o[j] = o[j] * factor + exp_score * v_ptr[j];
+        }
+    }
+
+    const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    device float* out_ptr = out + pos * q_dim + q_head * D + lane_base;
+    for (uint j = 0u; j < QK; ++j) {
+        out_ptr[j] = o[j] * inv_sum;
+    }
+}
+
+kernel void attention_prefill_sink_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint* dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
+    device const float* sinks [[buffer(6)]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint seq = dims[0];
+    const uint q_heads = dims[1];
+    const uint kv_heads = dims[2];
+    const uint head_dim = dims[3];
+    const uint window = dims[4];
+    const uint q_head = tile.x;
+    const uint pos = tile.y;
+    if (q_heads == 0u || kv_heads == 0u || (q_heads % kv_heads) != 0u || q_head >= q_heads ||
+        pos >= seq) {
+        return;
+    }
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(head_dim));
+    const float sink = sinks[q_head];
+    switch (head_dim) {
+        case 32u:
+            attention_prefill_sink_body<1u>(
+                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos);
+            break;
+        case 64u:
+            attention_prefill_sink_body<2u>(
+                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos);
+            break;
+        case 128u:
+            attention_prefill_sink_body<4u>(
+                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos);
+            break;
+        case 256u:
+            attention_prefill_sink_body<8u>(
+                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos);
+            break;
+        default:
+            break;
+    }
+}
+
 kernel void causal_attention_prefill_batch_long_d256_f32(
     device const float* q [[buffer(0)]],
     device const float* k [[buffer(1)]],
@@ -9532,6 +9649,62 @@ kernel void topk_softmax_rows_f32(
     for (uint slot = 0u; slot < topk; ++slot) {
         indices[row_topk + slot] = best_indices[slot];
         scores[row_topk + slot] = exp(best_values[slot] - max_value) / denom;
+    }
+}
+
+// Routage sigmoïde flint en lignes (prefill) : jumeau de `topk_softmax_rows_f32`.
+// Sélection sur `sigmoid(logit)`, égalités départagées par l'indice le plus
+// petit comme le tri stable de l'oracle CPU (`sigmoid_top_weights`) ; poids =
+// score / (somme des scores retenus + 1e-20).
+// NOTE: la bibliothèque est compilée en fast-math : `exp` y diffère de
+// quelques ulp de `f32::exp`, donc deux experts quasi à égalité peuvent
+// s'inverser par rapport au CPU (dérive acceptée, cf. le test réel flint).
+kernel void topk_sigmoid_rows_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* indices [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint3& dims [[buffer(3)]],
+    uint row [[thread_position_in_grid]]
+) {
+    const uint rows = dims.x;
+    const uint count = dims.y;
+    const uint topk = dims.z;
+    if (row >= rows) {
+        return;
+    }
+    const uint row_logits = row * count;
+    const uint row_topk = row * topk;
+
+    float best_values[16];
+    uint best_indices[16];
+    for (uint slot = 0u; slot < topk; ++slot) {
+        best_values[slot] = -3.402823466e38f;
+        best_indices[slot] = 0u;
+    }
+
+    for (uint idx = 0u; idx < count; ++idx) {
+        const float value = 1.0f / (1.0f + exp(-logits[row_logits + idx]));
+        for (uint slot = 0u; slot < topk; ++slot) {
+            if (value > best_values[slot]) {
+                for (uint shift = topk - 1u; shift > slot; --shift) {
+                    best_values[shift] = best_values[shift - 1u];
+                    best_indices[shift] = best_indices[shift - 1u];
+                }
+                best_values[slot] = value;
+                best_indices[slot] = idx;
+                break;
+            }
+        }
+    }
+
+    float denom = 0.0f;
+    for (uint slot = 0u; slot < topk; ++slot) {
+        denom += best_values[slot];
+    }
+    denom += 1.0e-20f;
+    for (uint slot = 0u; slot < topk; ++slot) {
+        indices[row_topk + slot] = best_indices[slot];
+        scores[row_topk + slot] = best_values[slot] / denom;
     }
 }
 

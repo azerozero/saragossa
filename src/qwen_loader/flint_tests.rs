@@ -422,6 +422,100 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
     assert!(err.to_string().contains("light-batch"), "{err}");
 }
 
+/// Prefill résident Metal (sinks, NoPE, fenêtre 2 dépassée, MLP dense puis MoE
+/// sigmoïde avec expert partagé sans gate) contre le prefill per-op CPU sur
+/// toutes les positions, puis greedy (prefill Metal + decode résident) contre
+/// le CPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
+    let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3];
+    let per_op = gpu
+        .prefill_hidden_for_test(&prompt, false)
+        .expect("invariant: prefill per-op flint")
+        .expect("invariant: hidden per-op");
+    let resident = gpu
+        .prefill_hidden_for_test(&prompt, true)
+        .expect("invariant: prefill résident flint")
+        .expect("prefill résident flint attendu");
+    assert_eq!(per_op.shape(), resident.shape());
+    let gap = per_op
+        .data()
+        .iter()
+        .zip(resident.data())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    // Hidden d'ordre 1 : seul l'ordre d'accumulation f32 sépare GPU et CPU.
+    assert!(gap <= 1.0e-4, "hidden résident vs per-op: écart {gap}");
+    assert_eq!(
+        gpu.generate_greedy(&prompt, 6)
+            .expect("invariant: greedy GPU"),
+        cpu.generate_greedy(&prompt, 6)
+            .expect("invariant: greedy CPU"),
+        "tokens greedy (prefill Metal) != CPU"
+    );
+}
+
+/// Le scratch du prefill résident flint passe par le scope de purge (marquage
+/// volatil, éviction LRU au-delà de `SARAGOSSA_RUST_SCRATCH_CAP_GB`) après
+/// chaque prefill, quelle que soit sa taille, et reste sous ce plafond.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_resident_prefill_scratch_is_released() {
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let mut releases = gpu
+        .scratch_stats_for_test()
+        .expect("invariant: stats scratch")
+        .2;
+    for len in [3, 9, 17, 40] {
+        let prompt = (0..len).map(|i| i % VOCAB).collect::<Vec<_>>();
+        gpu.generate_greedy(&prompt, 1)
+            .expect("invariant: prefill Metal flint");
+        let releases_before = releases;
+        let (entries, bytes, after) = gpu
+            .scratch_stats_for_test()
+            .expect("invariant: stats scratch");
+        releases = after;
+        assert!(entries > 0, "prefill résident sans scratch (len={len})");
+        assert!(
+            releases > releases_before,
+            "scratch jamais purgé (len={len})"
+        );
+        assert!(
+            bytes <= crate::runtime_flags::scratch_cap_bytes(),
+            "scratch au-delà du plafond (len={len}): {bytes}"
+        );
+    }
+}
+
+/// Au-delà du plafond de prefill flint, refus explicite avant tout calcul
+/// plutôt qu'un échec mémoire suivi d'un repli CPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_refuses_prompt_beyond_prefill_cap() {
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let prompt = vec![1; crate::runtime_flags::flint_prefill_max_tokens() + 1];
+    let err = gpu
+        .generate_greedy(&prompt, 1)
+        .expect_err("prompt flint au-delà du plafond refusé");
+    assert!(
+        err.to_string()
+            .contains("SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS"),
+        "{err}"
+    );
+}
+
 /// Lit un `.npy` v1 f32 little-endian (en-tête puis données brutes).
 fn read_npy_f32(path: &Path) -> (Vec<usize>, Vec<f32>) {
     let bytes = std::fs::read(path).expect("invariant: .npy lisible");
@@ -626,15 +720,20 @@ fn flint_int4_real_weights_match_mlx_oracle() {
 const MAX_GAP_F32: f32 = 6.0;
 const MEAN_GAP_F32: f32 = 1.0;
 
-/// Decode résident Metal de flint-int4 (chargement Metal du CLI, prefill CPU)
-/// contre l'oracle mlx-lm float32 : 16 tokens greedy identiques par le chemin
-/// de production, puis logits GPU sur la continuation de référence forcée.
+/// Chemin Metal de flint-int4 (chargement Metal du CLI) contre l'oracle mlx-lm
+/// float32 et contre l'oracle CPU F1 :
+/// - prefill résident : logits des 5 positions du prompt contre mlx ;
+/// - 16 tokens greedy identiques par le chemin de production (prefill Metal,
+///   decode résident), avec temps de prefill CPU et Metal et débit du decode ;
+/// - logits GPU sur la continuation de référence forcée ;
+/// - prompt synthétique de 1 000 tokens (fenêtre de 513 dépassée) : logits du
+///   prefill résident contre le prefill per-op CPU à cinq positions.
 ///
 /// Mêmes variables d'environnement que [`flint_int4_real_weights_match_mlx_oracle`].
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) et oracle mlx-lm requis"]
-fn flint_int4_resident_decode_matches_mlx_oracle() {
+fn flint_int4_metal_matches_mlx_oracle() {
     let (Some(model_dir), Some(oracle_dir)) = (
         std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from),
         std::env::var_os("SARAGOSSA_FLINT_ORACLE_DIR").map(PathBuf::from),
@@ -666,6 +765,43 @@ fn flint_int4_resident_decode_matches_mlx_oracle() {
         "decode résident complet attendu pour flint"
     );
 
+    // 1. Logits du prompt : prefill résident (et per-op CPU, pour le temps
+    //    « avant ») contre mlx f32. Le premier prefill Metal paie aussi la
+    //    résolution des poids GPU ; le temps retenu est celui du greedy.
+    let (cpu_hidden, metal_hidden, cpu_time, metal_time) = timed_prefills(&model, &prompt_ids);
+    println!(
+        "prompt {} tokens : prefill CPU per-op {cpu_time:.1?}, prefill Metal à froid {metal_time:.1?}",
+        prompt_ids.len()
+    );
+    let all_rows = (0..prompt_ids.len()).collect::<Vec<_>>();
+    let metal_rows = model
+        .logits_of_hidden_rows_for_test(&metal_hidden, &all_rows)
+        .expect("invariant: logits du prefill Metal");
+    let cpu_rows = model
+        .logits_of_hidden_rows_for_test(&cpu_hidden, &all_rows)
+        .expect("invariant: logits du prefill CPU");
+    for (index, (metal, cpu)) in metal_rows.iter().zip(&cpu_rows).enumerate() {
+        compare_rows(&format!("Metal vs CPU prompt[{index}]"), metal, cpu);
+    }
+    let (max, mean, argmax_ok) = compare_oracle(
+        "prefill Metal mlx-f32",
+        &oracle_dir,
+        &metal_rows,
+        prompt_ids.len(),
+    );
+    // Le prefill résident calcule en f32 la formule de l'oracle CPU ; seuls
+    // l'ordre d'accumulation et les kernels diffèrent : seuils CPU contre mlx.
+    assert!(argmax_ok, "argmax du prefill Metal divergent");
+    assert!(
+        max < MAX_GAP_F32,
+        "prefill: écart max {max} ≥ {MAX_GAP_F32}"
+    );
+    assert!(
+        mean < MEAN_GAP_F32,
+        "prefill: écart moyen {mean} ≥ {MEAN_GAP_F32}"
+    );
+
+    // 2. Greedy de production : prefill Metal (à chaud) puis decode résident.
     let steps_before = resident_decode_steps();
     let output = model
         .generate_greedy_timed_with_options(
@@ -682,7 +818,7 @@ fn flint_int4_resident_decode_matches_mlx_oracle() {
     let timings = &output.timings;
     let decode_secs = timings.decode.as_secs_f64();
     println!(
-        "prefill (CPU) {} tokens: {:.1?} ; decode résident {} tokens: {:.1?} → {:.1} tok/s",
+        "prefill Metal {} tokens: {:.1?} ; decode résident {} tokens: {:.1?} → {:.1} tok/s",
         prompt_ids.len(),
         timings.prefill,
         timings.decode_tokens,
@@ -695,8 +831,8 @@ fn flint_int4_resident_decode_matches_mlx_oracle() {
         "tokens greedy résidents divergents"
     );
 
-    // Logits GPU des pas 1..16 : continuation de référence forcée, comparée
-    // ligne à ligne aux logits mlx (la ligne 0 vient du prefill CPU).
+    // 3. Logits GPU des pas 1..16 : continuation de référence forcée, comparée
+    //    ligne à ligne aux logits mlx (la ligne 0 vient du prefill).
     let rows = model
         .resident_forced_logits_for_test(&prompt_ids, &greedy_ids[..greedy_ids.len() - 1], false)
         .expect("invariant: logits résidents");
@@ -715,12 +851,112 @@ fn flint_int4_resident_decode_matches_mlx_oracle() {
         argmax_ok &= gap.same_argmax;
     }
     println!("résident contre mlx-f32: pire max={max:.4}, pire moyenne={mean:.5}");
-    // Le decode résident calcule en f32 (KV f32 en greedy court) la même
-    // formule que l'oracle CPU ; seuls l'ordre d'accumulation et les kernels
-    // diffèrent. Les seuils CPU contre mlx f32 s'appliquent donc tels quels.
     assert!(argmax_ok, "argmax résident divergent sur au moins un pas");
     assert!(max < MAX_GAP_F32, "écart max {max} ≥ {MAX_GAP_F32}");
     assert!(mean < MEAN_GAP_F32, "écart moyen {mean} ≥ {MEAN_GAP_F32}");
+
+    // 4. Prompt long synthétique contre le prefill per-op CPU (oracle F1) :
+    //    positions de part et d'autre de la fenêtre de 513 tokens.
+    let long_ids = synthetic_long_prompt(&assets, 1000);
+    let (cpu_hidden, metal_hidden, cpu_time, metal_time) = timed_prefills(&model, &long_ids);
+    println!(
+        "prompt long {} tokens : prefill CPU per-op {cpu_time:.1?}, prefill Metal {metal_time:.1?} → {:.0} tok/s",
+        long_ids.len(),
+        long_ids.len() as f64 / metal_time.as_secs_f64().max(f64::EPSILON)
+    );
+    let positions = [0, 511, 512, 513, long_ids.len() - 1];
+    let metal_rows = model
+        .logits_of_hidden_rows_for_test(&metal_hidden, &positions)
+        .expect("invariant: logits du prefill Metal long");
+    let cpu_rows = model
+        .logits_of_hidden_rows_for_test(&cpu_hidden, &positions)
+        .expect("invariant: logits du prefill CPU long");
+    let (mut max, mut mean, mut same_argmax) = (0.0_f32, 0.0_f32, 0);
+    for ((position, metal), cpu) in positions.iter().zip(&metal_rows).zip(&cpu_rows) {
+        let gap = compare_rows(&format!("long Metal vs CPU [{position}]"), metal, cpu);
+        max = max.max(gap.max);
+        mean = mean.max(gap.mean);
+        same_argmax += usize::from(gap.same_argmax);
+    }
+    println!(
+        "long Metal vs CPU : pire max={max:.4}, pire moyenne={mean:.5}, argmax identiques {same_argmax}/{}",
+        positions.len()
+    );
+    // NOTE: Même formule f32 des deux côtés ; seuls l'ordre d'accumulation et
+    // d'éventuels experts départagés autrement sur des quasi-égalités les
+    // séparent, comme CPU contre mlx f32 : mêmes seuils, argmax seulement
+    // affichés (une quasi-égalité peut les intervertir sans erreur).
+    assert!(max < MAX_GAP_F32, "long: écart max {max} ≥ {MAX_GAP_F32}");
+    assert!(
+        mean < MEAN_GAP_F32,
+        "long: écart moyen {mean} ≥ {MEAN_GAP_F32}"
+    );
+}
+
+/// Hidden non normés du prefill per-op CPU puis du prefill résident Metal, et
+/// leurs durées.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn timed_prefills(
+    model: &CausalDecoder,
+    prompt: &[usize],
+) -> (Tensor, Tensor, std::time::Duration, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let cpu = model
+        .prefill_hidden_for_test(prompt, false)
+        .expect("invariant: prefill per-op");
+    let cpu_time = started.elapsed();
+    let started = std::time::Instant::now();
+    let metal = model
+        .prefill_hidden_for_test(prompt, true)
+        .expect("invariant: prefill résident");
+    let metal_time = started.elapsed();
+    let metal = metal.expect("prefill résident Metal attendu pour flint");
+    (
+        cpu.expect("invariant: hidden per-op"),
+        metal,
+        cpu_time,
+        metal_time,
+    )
+}
+
+/// Texte synthétique déterministe tokenisé, tronqué à `len` tokens.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn synthetic_long_prompt(assets: &ModelAssets, len: usize) -> Vec<usize> {
+    const SUBJECTS: [&str; 5] = [
+        "The engineer",
+        "A small robot",
+        "The archive",
+        "Our team",
+        "The river",
+    ];
+    const VERBS: [&str; 5] = ["records", "inspects", "rewrites", "measures", "follows"];
+    const OBJECTS: [&str; 5] = [
+        "the cache layout",
+        "a sliding window",
+        "every expert route",
+        "the attention sink",
+        "an old ledger",
+    ];
+    let mut text = String::new();
+    let mut index = 0_usize;
+    loop {
+        text.push_str(&format!(
+            "{} {} {} on day {}, then writes note {} about it.\n",
+            SUBJECTS[index % 5],
+            VERBS[(index / 5) % 5],
+            OBJECTS[(index / 25) % 5],
+            index % 31,
+            index * 7 % 101
+        ));
+        index += 1;
+        let ids = assets
+            .tokenizer
+            .encode(&text)
+            .expect("invariant: tokenisation");
+        if ids.len() >= len {
+            return ids[..len].iter().map(|&id| id as usize).collect();
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

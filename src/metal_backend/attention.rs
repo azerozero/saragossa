@@ -1356,6 +1356,66 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Encode l'attention prefill causale avec sinks appris `[q_heads]` (flint),
+    /// fenêtrée si `spec.window` : `attention_prefill_sink_f32`, toutes
+    /// longueurs, une simdgroup par (tête Q, position).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `head_dim` sort du kernel (32, 64, 128 ou 256),
+    /// si la GQA est invalide ou si une dimension déborde.
+    pub(super) fn encode_attention_prefill_sink(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buffer: &BufferRef,
+        k_buffer: &BufferRef,
+        v_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        sinks_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+    ) -> Result<()> {
+        if !matches!(spec.head_dim, 32 | 64 | 128 | 256)
+            || spec.kv_heads == 0
+            || spec.q_heads % spec.kv_heads != 0
+        {
+            return Err(InferError::Dimension(format!(
+                "prefill avec sinks: head_dim={} q_heads={} kv_heads={} hors kernel",
+                spec.head_dim, spec.q_heads, spec.kv_heads
+            )));
+        }
+        let dims = [
+            checked_u32(spec.seq, "attention sinks seq")?,
+            checked_u32(spec.q_heads, "attention sinks q_heads")?,
+            checked_u32(spec.kv_heads, "attention sinks kv_heads")?,
+            checked_u32(spec.head_dim, "attention sinks head_dim")?,
+            checked_u32(spec.window.unwrap_or(0), "attention sinks window")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.attention_prefill_sink_f32);
+        encoder.set_buffer(0, Some(q_buffer), 0);
+        encoder.set_buffer(1, Some(k_buffer), 0);
+        encoder.set_buffer(2, Some(v_buffer), 0);
+        encoder.set_buffer(3, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 4, &dims, "sink_prefill_dims")?;
+        set_f32_bytes(
+            encoder,
+            5,
+            &causal_prefill_scale_params(spec)?,
+            "sink_prefill_scale_params",
+        )?;
+        encoder.set_buffer(6, Some(sinks_buffer), 0);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(spec.q_heads, "attention sinks grid_heads")?,
+                checked_nsuint(spec.seq, "attention sinks grid_rows")?,
+                1,
+            ),
+            MTLSize::new(FULL_ATTN_PREFILL_BATCH_LONG_TG_WIDTH, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
     /// Attention causale d'un morceau de prefill : les `spec.seq` requêtes sont
     /// les dernières des `kv_rows` clés déjà écrites dans `k_buffer`/`v_buffer`.
     /// Le scratch bf16 du NAX est dimensionné sur `kv_capacity` pour rester une

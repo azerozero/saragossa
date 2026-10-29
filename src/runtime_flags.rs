@@ -903,6 +903,26 @@ pub(crate) fn prefill_resident_chunk_tokens() -> usize {
     })
 }
 
+/// Plafond de longueur du prefill flint (défaut 32 768 tokens), au-delà
+/// duquel le prompt est refusé explicitement.
+///
+/// Le prefill résident flint tient en un seul morceau (pas d'attention par
+/// morceaux avec sinks) : son scratch croît avec le prompt, ≈ 0,25 Mo par
+/// token (activations, Q/K/V, MoE top-6 en f32), plus ≈ 0,2 Mo de K/V f32 sur
+/// 49 couches, soit ≈ 15 Go à 32k, et l'attention à sinks est en O(n²) sans
+/// tuilage. Au-delà, un échec mémoire retomberait sur le prefill CPU, environ
+/// 500 fois plus lent. `SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS` le règle.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn flint_prefill_max_tokens() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|max| *max > 0)
+            .unwrap_or(32_768)
+    })
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

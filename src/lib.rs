@@ -59,9 +59,9 @@ pub use activation::{gelu, gelu_tanh, silu};
 pub use assets::{ModelAssets, MtpWeightsInfo};
 pub use catalog::WeightCatalog;
 pub use chat_template::{
-    qwen_assistant_history_content, render_gemma4_chat, render_gemma_chat, render_qwen_chatml,
-    ChatTemplateMessage, GEMMA4_END_OF_TURN, GEMMA4_START_OF_TURN, GEMMA_END_OF_TURN,
-    GEMMA_START_OF_TURN, QWEN_EMPTY_THINK_BLOCK, QWEN_IM_END, QWEN_IM_START,
+    qwen_assistant_history_content, render_flint_chat, render_gemma4_chat, render_gemma_chat,
+    render_qwen_chatml, ChatTemplateMessage, GEMMA4_END_OF_TURN, GEMMA4_START_OF_TURN,
+    GEMMA_END_OF_TURN, GEMMA_START_OF_TURN, QWEN_EMPTY_THINK_BLOCK, QWEN_IM_END, QWEN_IM_START,
 };
 pub use config::{ModelConfig, QuantConfig, RawModelConfig, RopeScalingConfig};
 pub use decoder::{

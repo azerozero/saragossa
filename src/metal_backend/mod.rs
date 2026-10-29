@@ -269,6 +269,7 @@ pub struct MetalExecutor {
     windowed_attention_prefill_f32: ComputePipelineState,
     windowed_attention_prefill_mid_f32: ComputePipelineState,
     windowed_attention_prefill_long_f32: ComputePipelineState,
+    attention_prefill_sink_f32: ComputePipelineState,
     causal_attention_prefill_batch_long_d128_f32: ComputePipelineState,
     causal_attention_prefill_batch_long_d256_f32: ComputePipelineState,
     causal_attention_prefill_batch_gqa8x4_d256_f32: ComputePipelineState,
@@ -285,6 +286,7 @@ pub struct MetalExecutor {
     add_rms_norm_row_f32: ComputePipelineState,
     topk_softmax_f32: ComputePipelineState,
     topk_sigmoid_f32: ComputePipelineState,
+    topk_sigmoid_rows_f32: ComputePipelineState,
     topk_softmax_serial_f32: ComputePipelineState,
     topk8_softmax_256_f32: ComputePipelineState,
     topk_softmax_rows_f32: ComputePipelineState,
@@ -336,6 +338,9 @@ pub struct MetalExecutor {
     concat_buffers: Mutex<HashMap<ConcatWeightKey, ConcatCacheEntry>>,
     /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
     preserve_weight_caches: std::sync::atomic::AtomicBool,
+    /// Passages du scope de purge du scratch, vérifiés par les tests.
+    #[cfg(test)]
+    scratch_releases: std::sync::atomic::AtomicUsize,
 }
 
 /// Identifie un poids dense par adresse ou un poids quantifié par ID stable.
@@ -623,6 +628,9 @@ pub(crate) enum PrefillAttentionLayer<'a> {
         q_norm: &'a Tensor,
         k_norm: &'a Tensor,
         gated: bool,
+        /// Sinks appris `[q_heads]` (flint) : attention par
+        /// `attention_prefill_sink_f32`, sinon kernels sans sink inchangés.
+        sinks: Option<&'a Tensor>,
     },
     Linear {
         weights: LinearAttnResidentWeights<'a>,
@@ -682,6 +690,9 @@ pub(crate) enum PrefillMoeTail<'a> {
         router: &'a Linear,
         experts: &'a [GatedMlp],
         top_k: usize,
+        /// MoE flint : routeur sigmoïde et expert partagé sans gate, ajouté
+        /// tel quel ; `None` garde le routage softmax historique.
+        sigmoid_shared: Option<&'a GatedMlp>,
     },
     Shared {
         router: &'a Linear,

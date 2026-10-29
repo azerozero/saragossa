@@ -315,9 +315,10 @@ impl DecoderLayer {
         config: &CausalDecoderConfig,
         base_spec: crate::metal_backend::PrefillAttentionSpec,
     ) -> Option<crate::metal_backend::PrefillMoeLayer<'_>> {
-        if self.metal_unsupported() {
-            return None;
-        }
+        // NOTE: Sinks, NoPE et MoE flint (sigmoïde + expert partagé sans gate)
+        // ont leurs kernels de prefill résident ; tout autre MoE hors contrat
+        // softmax (sigmoïde sans expert partagé, Gemma 4 sigmoïde) est refusé
+        // plus bas, faute de parts Metal.
         let post_norm = self.post_attention_norm.as_ref()?;
         let tail = if config.is_gemma4 {
             let dense = match self.mlp.as_ref()? {
@@ -376,7 +377,14 @@ impl DecoderLayer {
                     }
                 }
                 FeedForward::Moe(mlp) => {
-                    if let Some((router, experts, top_k, shared_expert, shared_gate)) =
+                    if let Some((router, experts, top_k, shared)) = mlp.sigmoid_metal_parts() {
+                        crate::metal_backend::PrefillMoeTail::Routed {
+                            router,
+                            experts,
+                            top_k,
+                            sigmoid_shared: Some(shared),
+                        }
+                    } else if let Some((router, experts, top_k, shared_expert, shared_gate)) =
                         mlp.shared_metal_parts()
                     {
                         crate::metal_backend::PrefillMoeTail::Shared {
@@ -392,6 +400,7 @@ impl DecoderLayer {
                             router,
                             experts,
                             top_k,
+                            sigmoid_shared: None,
                         }
                     }
                 }
@@ -405,7 +414,13 @@ impl DecoderLayer {
                 let kv_heads = attention
                     .num_key_value_heads
                     .unwrap_or(config.num_key_value_heads);
-                let rope_dims = attention.rope_dims.or(config.rope_dims).unwrap_or(head_dim);
+                // NoPE (flint) : `rope_dims = 0`, le kernel fusionné ne garde
+                // que la QK-RMSNorm.
+                let rope_dims = if attention.no_rope {
+                    0
+                } else {
+                    attention.rope_dims.or(config.rope_dims).unwrap_or(head_dim)
+                };
                 let rope_frequency_dim = attention.rope_frequency_dim.unwrap_or(rope_dims);
                 let rope_theta = attention.rope_theta.or(config.rope_theta)?;
                 (
@@ -417,6 +432,7 @@ impl DecoderLayer {
                         q_norm,
                         k_norm,
                         gated: config.attn_output_gate,
+                        sinks: attention.sinks.as_ref(),
                     },
                     crate::metal_backend::PrefillAttentionSpec {
                         kv_heads,

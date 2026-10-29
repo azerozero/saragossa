@@ -1184,14 +1184,15 @@ impl CausalDecoderConfig {
         self.no_rope_layers.contains(&layer_index)
     }
 
-    /// Renvoie la raison pour laquelle les chemins Metal per-op, spéculatifs
-    /// et de prefill ne connaissent pas ce modèle, ou `None` s'ils le couvrent.
+    /// Renvoie la raison pour laquelle les chemins Metal per-op et spéculatifs
+    /// ne connaissent pas ce modèle, ou `None` s'ils le couvrent.
     ///
-    /// Ces kernels (per-op, prefill résident, MTP, DFlash, light-batch)
-    /// ignorent les sinks, le NoPE, le routeur sigmoïde et l'expert partagé
-    /// sans gate : les laisser tourner produirait un résultat faux sans
-    /// erreur. Seul le decode résident complet couvre flint ; pour un tel
-    /// modèle, le runtime Metal ne sert qu'à lui (prefill CPU).
+    /// Ces kernels (per-op, MTP, DFlash, light-batch, prefill par morceaux et
+    /// prolongement de préfixe) ignorent les sinks, le NoPE, le routeur
+    /// sigmoïde et l'expert partagé sans gate : les laisser tourner produirait
+    /// un résultat faux sans erreur. Seuls le prefill résident en un morceau et
+    /// le decode résident complet couvrent flint ; pour un tel modèle, le
+    /// runtime Metal ne sert qu'à eux (repli CPU sinon).
     pub fn metal_unsupported_reason(&self) -> Option<&'static str> {
         if self.attention_sinks {
             Some("sinks d'attention appris (softmax_offset)")
@@ -2415,9 +2416,9 @@ impl CausalDecoder {
         }
     }
 
-    /// Runtime des chemins per-op, de prefill et spéculatifs : CPU pour un
-    /// modèle que leurs kernels ne connaissent pas (flint), qui n'emploie Metal
-    /// que via [`Self::resident_metal`].
+    /// Runtime des chemins per-op et spéculatifs : CPU pour un modèle que leurs
+    /// kernels ne connaissent pas (flint), qui n'emploie Metal que via
+    /// [`Self::resident_metal`].
     fn forward_runtime(&self) -> ForwardRuntime<'_> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some(metal) = self
@@ -2429,8 +2430,9 @@ impl CausalDecoder {
         ForwardRuntime::cpu()
     }
 
-    /// Executor du decode résident complet, seul chemin Metal couvrant flint.
-    /// Identique à `forward_runtime().metal_executor()` pour les autres modèles.
+    /// Executor du prefill résident et du decode résident complet, seuls
+    /// chemins Metal couvrant flint. Identique à
+    /// `forward_runtime().metal_executor()` pour les autres modèles.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn resident_metal(&self) -> Option<&crate::MetalExecutor> {
         self.runtime.metal.as_deref()
@@ -2445,7 +2447,7 @@ impl CausalDecoder {
         if !trace_gpu_alloc_enabled() {
             return None;
         }
-        let executor = self.forward_runtime().metal_executor()?;
+        let executor = self.resident_metal()?;
         let before = GpuAllocTrace::capture(executor)?;
         let trace = GpuAllocTrace {
             executor,
@@ -2457,11 +2459,28 @@ impl CausalDecoder {
         Some(trace)
     }
 
+    /// Scope de purge du scratch Metal. `resident_metal` et non
+    /// `forward_runtime` : le prefill résident de flint alloue son scratch sur
+    /// cet executor alors que son runtime per-op est le CPU ; sans scope, ce
+    /// scratch n'était jamais rendu volatil ni plafonné.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn scratch_buffer_scope(&self) -> Option<impl Drop + '_> {
-        self.forward_runtime()
-            .metal_executor()
+        self.resident_metal()
             .map(crate::MetalExecutor::scratch_buffer_scope)
+    }
+
+    /// Scratch Metal de test : `(entrées, octets, passages du scope de purge)`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sans executor Metal ou si le cache est empoisonné.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn scratch_stats_for_test(&self) -> Result<(usize, u64, usize)> {
+        let metal = self
+            .resident_metal()
+            .ok_or_else(|| InferError::Metal("executor Metal absent".to_string()))?;
+        let (entries, bytes) = metal.scratch_buffer_stats()?;
+        Ok((entries, bytes, metal.scratch_releases_for_test()))
     }
 
     /// Crée un cache K/V vide pour ce décodeur.

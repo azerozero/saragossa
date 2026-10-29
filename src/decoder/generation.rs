@@ -4666,6 +4666,18 @@ impl CausalDecoder {
         if let Some(state) = self.prefill_cache_state_metal_resident(prompt)? {
             return Ok(state);
         }
+        // NOTE: le hidden `[seq, hidden]` rendu pour les tests est déplacé, pas
+        // copié : il tombe ici comme il tombait en fin de fonction.
+        self.prefill_cache_state_batched_per_op(prompt)
+            .map(|(cache, _, final_state)| (cache, final_state))
+    }
+
+    /// Prefill batché per-op, sans le chemin résident ; rend aussi le hidden
+    /// non normé `[seq, hidden]` du dernier morceau (oracle des tests).
+    fn prefill_cache_state_batched_per_op(
+        &self,
+        prompt: &[usize],
+    ) -> Result<(CausalDecoderCache, Tensor, Tensor)> {
         let chunk_size = prefill_chunk_size();
         if chunk_size > 0 && chunk_size < prompt.len() {
             return self.prefill_cache_state_batched_chunked(prompt, chunk_size);
@@ -4685,14 +4697,14 @@ impl CausalDecoder {
         cache.position = prompt.len();
         let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
         let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
-        Ok((cache, final_state))
+        Ok((cache, hidden, final_state))
     }
 
     fn prefill_cache_state_batched_chunked(
         &self,
         prompt: &[usize],
         chunk_size: usize,
-    ) -> Result<(CausalDecoderCache, Tensor)> {
+    ) -> Result<(CausalDecoderCache, Tensor, Tensor)> {
         if chunk_size == 0 {
             return Err(InferError::Dimension(
                 "taille de chunk prefill nulle".to_string(),
@@ -4720,7 +4732,7 @@ impl CausalDecoder {
             last_hidden.ok_or_else(|| InferError::Dimension("prompt token vide".to_string()))?;
         let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
         let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
-        Ok((cache, final_state))
+        Ok((cache, hidden, final_state))
     }
 
     #[cfg(test)]
@@ -4738,6 +4750,52 @@ impl CausalDecoder {
         chunk_size: usize,
     ) -> Result<(CausalDecoderCache, Tensor)> {
         self.prefill_cache_state_batched_chunked(prompt, chunk_size)
+            .map(|(cache, _, final_state)| (cache, final_state))
+    }
+
+    /// Oracle de test : hidden non normé `[seq, hidden]` de toutes les
+    /// positions, par le prefill résident Metal si `resident` (`None` s'il se
+    /// dérobe), sinon par le prefill per-op (CPU pour flint).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le prefill échoue.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn prefill_hidden_for_test(
+        &self,
+        prompt: &[usize],
+        resident: bool,
+    ) -> Result<Option<Tensor>> {
+        if !resident {
+            return Ok(Some(self.prefill_cache_state_batched_per_op(prompt)?.1));
+        }
+        self.prefill_resident_cache_and_hidden(prompt)?
+            .map(|(_, hidden)| hidden.into_tensor(self.final_norm.data().len()))
+            .transpose()
+    }
+
+    /// Oracle de test : logits des lignes `rows` d'un hidden non normé
+    /// `[seq, hidden]` (norme finale puis lm_head).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une ligne manque ou si la projection échoue.
+    #[cfg(test)]
+    pub(crate) fn logits_of_hidden_rows_for_test(
+        &self,
+        hidden: &Tensor,
+        rows: &[usize],
+    ) -> Result<Vec<Vec<f32>>> {
+        rows.iter()
+            .map(|&row| {
+                let state = rms_norm(
+                    &Tensor::row(hidden.row_slice(row)?.to_vec())?,
+                    &self.final_norm,
+                    self.config.rms_eps,
+                )?;
+                Ok(self.logits_from_final_state(&state)?.data().to_vec())
+            })
+            .collect()
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -4807,9 +4865,11 @@ impl CausalDecoder {
             if self.config.is_gemma4 {
                 attention.rope_position_scale.is_some()
             } else {
+                // La fenêtre flint passe par le kernel à sinks, qui la porte ;
+                // les autres fenêtres non-Gemma 4 restent hors contrat.
                 attention.rope_theta.is_some()
                     || attention.rope_position_scale.is_some()
-                    || attention.sliding_window.is_some()
+                    || (attention.sliding_window.is_some() && attention.sinks.is_none())
             }
         });
         if has_unsupported_layer_override {
@@ -4880,24 +4940,38 @@ impl CausalDecoder {
             Option<Tensor>,
         )>,
     > {
-        if !prefill_resident_enabled() {
+        // `resident_metal` et non `forward_runtime` : flint (sinks, NoPE, MoE
+        // sigmoïde) a ses kernels de prefill résident, pas de per-op Metal.
+        // `prefill_moe_layer` refuse chaque couche hors de ce contrat.
+        let Some(metal) = self.resident_metal() else {
             return Ok(None);
+        };
+        // Modèle que seuls les chemins résidents couvrent (flint) : son repli
+        // CPU est ~500× plus lent, il n'est donc jamais silencieux.
+        let resident_only = self.config.metal_unsupported_reason().is_some();
+        if !prefill_resident_enabled() {
+            return self.resident_prefill_ineligible("SARAGOSSA_RUST_PREFILL_RESIDENT=0");
         }
         if self.config.is_gemma4 && !prefill_resident_gemma4_enabled() {
             return Ok(None);
         }
-        let Some(metal) = self.forward_runtime().metal_executor() else {
-            return Ok(None);
-        };
+        let max_tokens = crate::runtime_flags::flint_prefill_max_tokens();
+        if resident_only && prompt.len() > max_tokens {
+            return Err(InferError::Config(format!(
+                "prompt flint de {} tokens au-delà du plafond de prefill de {max_tokens} \
+                 (SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS) : prefill en un seul morceau",
+                prompt.len()
+            )));
+        }
         let Some(spec) = self.resident_prefill_spec(prompt.len(), self.final_norm.data().len())
         else {
-            return Ok(None);
+            return self.resident_prefill_ineligible("spec d'attention hors contrat");
         };
         let hidden = self.prefill_hidden(prompt)?;
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let Some(prefill_layer) = layer.prefill_moe_layer(&self.config, spec) else {
-                return Ok(None);
+                return self.resident_prefill_ineligible("couche hors contrat résident");
             };
             layers.push(prefill_layer);
         }
@@ -4949,6 +5023,9 @@ impl CausalDecoder {
                 cache.position = prompt.len();
                 Ok(Some((cache, final_hidden, captures)))
             }
+            // Erreur d'exécution flint : la propager plutôt que masquer un
+            // kernel cassé derrière un prefill CPU ~500× plus lent.
+            Err(error) if resident_only => Err(error),
             Err(error) => {
                 if trace_prefill_enabled() {
                     eprintln!("prefill résident fallback: {error}");
@@ -4956,6 +5033,24 @@ impl CausalDecoder {
                 Ok(None)
             }
         }
+    }
+
+    /// Prefill résident inéligible : repli per-op silencieux (Qwen, Gemma),
+    /// sauf pour un modèle que seuls les chemins résidents couvrent (flint),
+    /// dont le prefill CPU est ~500× plus lent : avertissement une fois par
+    /// processus.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn resident_prefill_ineligible<T>(&self, reason: &str) -> Result<Option<T>> {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.config.metal_unsupported_reason().is_some()
+            && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "saragossa: prefill Metal flint indisponible ({reason}) : repli sur le \
+                 prefill CPU, environ 500 fois plus lent"
+            );
+        }
+        Ok(None)
     }
 
     /// Exécute le gate résident sans masquer le chemin choisi par l'oracle.

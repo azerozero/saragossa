@@ -589,6 +589,7 @@ impl MetalExecutor {
             pipeline(&library, &device, "windowed_attention_prefill_mid_f32")?;
         let windowed_attention_prefill_long_f32 =
             pipeline(&library, &device, "windowed_attention_prefill_long_f32")?;
+        let attention_prefill_sink_f32 = pipeline(&library, &device, "attention_prefill_sink_f32")?;
         let causal_attention_prefill_batch_long_d128_f32 = pipeline(
             &library,
             &device,
@@ -627,6 +628,7 @@ impl MetalExecutor {
         let add_rms_norm_row_f32 = pipeline(&library, &device, "add_rms_norm_row_f32")?;
         let topk_softmax_f32 = pipeline(&library, &device, "topk_softmax_f32")?;
         let topk_sigmoid_f32 = pipeline(&library, &device, "topk_sigmoid_f32")?;
+        let topk_sigmoid_rows_f32 = pipeline(&library, &device, "topk_sigmoid_rows_f32")?;
         let topk_softmax_serial_f32 = pipeline(&library, &device, "topk_softmax_serial_f32")?;
         let topk8_softmax_256_f32 = pipeline(&library, &device, "topk8_softmax_256_f32")?;
         let topk_softmax_rows_f32 = pipeline(&library, &device, "topk_softmax_rows_f32")?;
@@ -801,6 +803,7 @@ impl MetalExecutor {
             windowed_attention_prefill_f32,
             windowed_attention_prefill_mid_f32,
             windowed_attention_prefill_long_f32,
+            attention_prefill_sink_f32,
             causal_attention_prefill_batch_long_d128_f32,
             causal_attention_prefill_batch_long_d256_f32,
             causal_attention_prefill_batch_gqa8x4_d256_f32,
@@ -815,6 +818,7 @@ impl MetalExecutor {
             add_rms_norm_row_f32,
             topk_softmax_f32,
             topk_sigmoid_f32,
+            topk_sigmoid_rows_f32,
             topk_softmax_serial_f32,
             topk8_softmax_256_f32,
             topk_softmax_rows_f32,
@@ -858,6 +862,8 @@ impl MetalExecutor {
             moe_stacks: Mutex::new(HashMap::new()),
             concat_buffers: Mutex::new(HashMap::new()),
             preserve_weight_caches: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            scratch_releases: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 }

@@ -13,9 +13,10 @@ use saragossa::runtime_flags::{
     serve_lru_enabled, serve_model_pool_size, serve_prefix_cache_enabled,
 };
 use saragossa::{
-    qwen_assistant_history_content, render_gemma4_chat, render_gemma_chat, render_qwen_chatml,
-    CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage, GenerationOptions,
-    JsonTokenCatalog, JsonTokenConstraint, ModelAssets, RuntimePreset, TokenConstraint,
+    qwen_assistant_history_content, render_flint_chat, render_gemma4_chat, render_gemma_chat,
+    render_qwen_chatml, CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage,
+    GenerationOptions, JsonTokenCatalog, JsonTokenConstraint, ModelAssets, RuntimePreset,
+    TokenConstraint,
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
@@ -698,10 +699,13 @@ impl LoadedModel {
 
     fn prompt_encoding(&self, request: &ChatCompletionRequest) -> ServeResult<PromptEncoding> {
         let mut messages = request.template_messages();
-        if !self.assets.config.is_gemma() {
+        // flint garde l'historique assistant tel quel : pas de bloc think vide.
+        if !self.assets.config.is_gemma() && !self.assets.config.is_flint() {
             normalize_qwen_assistant_history(&mut messages);
         }
-        let rendered = if self.assets.config.is_gemma4() {
+        let rendered = if self.assets.config.is_flint() {
+            render_flint_chat(&messages, true)
+        } else if self.assets.config.is_gemma4() {
             render_gemma4_chat(&messages, true, false)
         } else if self.assets.config.is_gemma() {
             render_gemma_chat(&messages, true)
@@ -739,7 +743,7 @@ impl LoadedModel {
         let started = Instant::now();
         // NOTE: serve utilise les APIs uncached/extend ; le cache interne du
         // décodeur reste hors chemin pour éviter un partage inter-session.
-        if !serve_prefix_cache_enabled() {
+        if !prefix_blocks_usable(&self.assets.config) {
             let state = self.decoder.prefill_prompt_state_uncached(tokens)?;
             return Ok((state, 0, started.elapsed()));
         }
@@ -985,6 +989,17 @@ fn ensure_guided_finished(constraint: Option<&dyn TokenConstraint>) -> ServeResu
     ))
 }
 
+/// Le cache de préfixe par blocs de serve est-il utilisable pour ce modèle ?
+///
+/// NOTE: flint n'a pas d'extension GPU (`extend_prompt_state` passe en CPU
+/// per-op, ~0,6 s par token) : préremplir les blocs complets puis étendre le
+/// reliquat (jusqu'à un bloc) ou le suffixe d'un hit coûterait des minutes.
+/// Son prompt entier passe donc par le prefill Metal à froid, sans blocs. À
+/// lever quand le prolongement résident couvrira les sinks.
+fn prefix_blocks_usable(config: &saragossa::ModelConfig) -> bool {
+    serve_prefix_cache_enabled() && !config.is_flint()
+}
+
 fn normalize_qwen_assistant_history(messages: &mut [ChatTemplateMessage]) {
     for message in messages {
         if message.role != "assistant" {
@@ -1060,6 +1075,29 @@ fn kv_allocations(state: &CausalDecoderPromptState) -> std::collections::HashSet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flint_skips_prefix_blocks() {
+        let raw = r#"{
+            "model_type":"qwen3",
+            "hidden_size":64,
+            "num_hidden_layers":1,
+            "num_attention_heads":2,
+            "num_key_value_heads":1,
+            "head_dim":32,
+            "intermediate_size":64,
+            "rms_norm_eps":0.000001,
+            "rope_theta":10000.0,
+            "vocab_size":8
+        }"#;
+        let mut config = serde_json::from_str::<saragossa::RawModelConfig>(raw)
+            .expect("invariant: JSON valide")
+            .resolve()
+            .expect("invariant: config valide");
+        assert_eq!(prefix_blocks_usable(&config), serve_prefix_cache_enabled());
+        config.model_type = "flint".to_string();
+        assert!(!prefix_blocks_usable(&config));
+    }
 
     #[test]
     fn qwen_assistant_history_gets_empty_think_prefix() {
