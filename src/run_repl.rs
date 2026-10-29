@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use saragossa::{
-    qwen_assistant_history_content, render_gemma4_chat, render_gemma_chat, render_qwen_chatml,
-    ChatTemplateMessage, GenerationOptions, ModelAssets,
+    qwen_assistant_history_content, render_flint_chat, render_gemma4_chat, render_gemma_chat,
+    render_qwen_chatml, ChatTemplateMessage, GenerationOptions, ModelAssets,
 };
 
 use crate::hf_resolve;
@@ -330,10 +330,13 @@ fn encode_chat_prompt(
     history: &[ChatTemplateMessage],
 ) -> CliResult<Vec<usize>> {
     let mut messages = history.to_vec();
-    if !assets.config.is_gemma() {
+    // flint garde l'historique assistant tel quel : pas de bloc think vide.
+    if !assets.config.is_gemma() && !assets.config.is_flint() {
         normalize_qwen_assistant_history(&mut messages);
     }
-    let rendered = if assets.config.is_gemma4() {
+    let rendered = if assets.config.is_flint() {
+        render_flint_chat(&messages, true)
+    } else if assets.config.is_gemma4() {
         render_gemma4_chat(&messages, true, false)
     } else if assets.config.is_gemma() {
         render_gemma_chat(&messages, true)

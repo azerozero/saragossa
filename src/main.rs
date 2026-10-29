@@ -16,9 +16,9 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use saragossa::{
-    load_causal_decoder, render_gemma4_chat, render_gemma_chat, render_qwen_chatml,
-    verify_decoder_contract, CausalDecoder, ChatTemplateMessage, DecoderContract,
-    GenerationOptions, GenerationOutput, GenerationTimings, ModelAssets,
+    load_causal_decoder, render_flint_chat, render_gemma4_chat, render_gemma_chat,
+    render_qwen_chatml, verify_decoder_contract, CausalDecoder, ChatTemplateMessage,
+    DecoderContract, GenerationOptions, GenerationOutput, GenerationTimings, ModelAssets,
 };
 
 mod doctor_bench;
@@ -506,11 +506,16 @@ fn mtp_decode_max_draft() -> usize {
 /// Encode un prompt en ids. `--raw` : complétion brute (pas de template de
 /// chat), utile pour tester un modèle hors familles connues (Llama/Mistral) —
 /// tokens spéciaux du tokenizer activés (BOS Llama). Gemma 3 : tours
-/// `<start_of_turn>` ; Gemma 4 : tours `<|turn>` avec `<bos>` littéral.
-/// Sinon : ChatML Qwen, byte-identique.
+/// `<start_of_turn>` ; Gemma 4 : tours `<|turn>` avec `<bos>` littéral ;
+/// flint : tours `<|user|>…<|assistant|>`. Sinon : ChatML Qwen, byte-identique.
 fn encode_prompt_ids(assets: &ModelAssets, prompt: &str, raw: bool) -> CliResult<Vec<usize>> {
     if raw {
         assets.encode_prompt_with_special(prompt)?
+    } else if assets.config.is_flint() {
+        assets.encode_prompt(&render_flint_chat(
+            &[ChatTemplateMessage::new("user", prompt)],
+            true,
+        ))?
     } else if assets.config.is_gemma4() {
         let templated =
             render_gemma4_chat(&[ChatTemplateMessage::new("user", prompt)], true, false);

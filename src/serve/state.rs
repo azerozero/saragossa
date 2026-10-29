@@ -13,9 +13,10 @@ use saragossa::runtime_flags::{
     serve_lru_enabled, serve_model_pool_size, serve_prefix_cache_enabled,
 };
 use saragossa::{
-    qwen_assistant_history_content, render_gemma4_chat, render_gemma_chat, render_qwen_chatml,
-    CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage, GenerationOptions,
-    JsonTokenCatalog, JsonTokenConstraint, ModelAssets, RuntimePreset, TokenConstraint,
+    qwen_assistant_history_content, render_flint_chat, render_gemma4_chat, render_gemma_chat,
+    render_qwen_chatml, CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage,
+    GenerationOptions, JsonTokenCatalog, JsonTokenConstraint, ModelAssets, RuntimePreset,
+    TokenConstraint,
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
@@ -698,10 +699,13 @@ impl LoadedModel {
 
     fn prompt_encoding(&self, request: &ChatCompletionRequest) -> ServeResult<PromptEncoding> {
         let mut messages = request.template_messages();
-        if !self.assets.config.is_gemma() {
+        // flint garde l'historique assistant tel quel : pas de bloc think vide.
+        if !self.assets.config.is_gemma() && !self.assets.config.is_flint() {
             normalize_qwen_assistant_history(&mut messages);
         }
-        let rendered = if self.assets.config.is_gemma4() {
+        let rendered = if self.assets.config.is_flint() {
+            render_flint_chat(&messages, true)
+        } else if self.assets.config.is_gemma4() {
             render_gemma4_chat(&messages, true, false)
         } else if self.assets.config.is_gemma() {
             render_gemma_chat(&messages, true)
