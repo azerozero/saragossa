@@ -67,7 +67,7 @@ pub(crate) mod mtp_control;
 mod mtp_seed;
 mod shared_rows;
 pub(crate) use self::mtp_seed::{MtpSeedStates, MtpSeedWeights};
-pub(crate) use self::shared_rows::{PrefillKvRows, SharedF32Rows};
+pub(crate) use self::shared_rows::{PrefillKvRows, SharedBf16Rows, SharedF32Rows};
 mod na_gemm;
 mod pipelines;
 mod prefill;
@@ -85,8 +85,8 @@ pub(crate) use self::barriers::{
 };
 #[cfg(any(test, feature = "devtools"))]
 pub(crate) use self::byte_helpers::read_u16_buffer;
-pub(crate) use self::byte_helpers::write_f32_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
+pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at};
 use self::core::*;
 pub(crate) use self::eligibility::install_qmm_skinny_bf16_scope;
 pub(crate) use self::flags::resident_concurrent_enabled;
@@ -275,6 +275,10 @@ pub struct MetalExecutor {
     causal_attention_prefill_steel_nax_d256: Option<attention::NaxCausalAttention>,
     /// Miroir bf16 du K/V pour le NAX par morceaux (lu du flag, forcé en test).
     prefill_kv_bf16_mirror: bool,
+    /// Longueur minimale (lignes totales) d'un prefill par morceaux dont le
+    /// K/V est stocké en bf16 ; `None` hors flag ou arène non bf16 (forcé en
+    /// test).
+    prefill_kv_bf16_store_min_rows: Option<usize>,
     noncausal_attention_prefill_f32: ComputePipelineState,
     steel_attention_f32_bq32_bk32_bd64: Option<ComputePipelineState>,
     add_rms_norm_row_f32: ComputePipelineState,
@@ -737,8 +741,8 @@ pub(crate) enum PrefillResidentPrefixLayer<'a> {
     /// des lignes nouvelles, le prolongement y écrit à la suite au lieu de
     /// recopier le préfixe dans un buffer neuf.
     Full {
-        key: Vec<&'a [f32]>,
-        value: Vec<&'a [f32]>,
+        key: Vec<crate::decode_resident::KvSegment<'a>>,
+        value: Vec<crate::decode_resident::KvSegment<'a>>,
         in_place: Option<[metal::Buffer; 2]>,
     },
     Linear {

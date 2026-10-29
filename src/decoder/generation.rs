@@ -3538,8 +3538,8 @@ impl CausalDecoder {
                         return Ok(None);
                     }
                     crate::metal_backend::PrefillResidentPrefixLayer::Full {
-                        key: layer_cache.keys.segments().collect(),
-                        value: layer_cache.values.segments().collect(),
+                        key: layer_cache.keys.segments(),
+                        value: layer_cache.values.segments(),
                         in_place: layer_cache
                             .keys
                             .sole_shared_buffer()

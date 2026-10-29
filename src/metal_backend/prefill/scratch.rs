@@ -220,21 +220,23 @@ impl MetalExecutor {
     }
 
     /// Alloue ce qui survit aux morceaux d'une couche : le KV pleine longueur
-    /// (`kv_rows` lignes) d'une attention complète, avec son miroir bf16 si
-    /// `bf16_mirror`, ou l'état conv/SSM d'une attention linéaire, initialisé
-    /// à zéro.
+    /// (`kv_rows` lignes) d'une attention complète, en bf16 si `bf16_store`,
+    /// sinon f32 avec son miroir bf16 si `bf16_mirror`, ou l'état conv/SSM
+    /// d'une attention linéaire, initialisé à zéro. `kv_buffers` remplace le
+    /// KV neuf (prolongement en place), du même élément.
     pub(super) fn allocate_prefill_resident_layer_cache(
         &self,
         shape: &PrefillResidentLayerShape<'_>,
         kv_rows: usize,
         kv_dim: usize,
         bf16_mirror: bool,
+        bf16_store: bool,
         kv_buffers: Option<[Buffer; 2]>,
     ) -> Result<PrefillResidentLayerCacheBuffer> {
         match &shape.attention {
             PrefillResidentAttentionShape::Full { .. } => {
                 let kv_len = checked_len(kv_rows, kv_dim, "prefill résident kv")?;
-                let bf16_mirror = if bf16_mirror {
+                let bf16_mirror = if bf16_mirror && !bf16_store {
                     let bytes = byte_len::<u16>(kv_len)?;
                     Some(PrefillKvBf16Mirror {
                         key: self
@@ -250,6 +252,10 @@ impl MetalExecutor {
                 };
                 let [key, value] = match kv_buffers {
                     Some(buffers) => buffers,
+                    None if bf16_store => [
+                        self.uncached_bf16_buffer(kv_len, "resident_k_rope_bf16")?,
+                        self.uncached_bf16_buffer(kv_len, "resident_v_bf16")?,
+                    ],
                     None => [
                         self.uncached_f32_buffer(kv_len, "resident_k_rope")?,
                         self.uncached_f32_buffer(kv_len, "resident_v")?,
@@ -260,6 +266,7 @@ impl MetalExecutor {
                     value,
                     kv_dim,
                     bf16_mirror,
+                    bf16_store,
                 })
             }
             PrefillResidentAttentionShape::Linear {

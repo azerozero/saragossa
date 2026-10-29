@@ -321,6 +321,10 @@ impl DecodeResidentState {
         let copy_at_kernel = compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_f32")?;
         let copy_at_f32_to_bf16_kernel =
             compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_f32_to_bf16")?;
+        let copy_at_bf16_kernel =
+            compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_bf16")?;
+        let copy_at_bf16_to_f32_kernel =
+            compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_bf16_to_f32")?;
         let timer = GpuSectionTimer::try_new();
         Ok(Self {
             device,
@@ -346,6 +350,8 @@ impl DecodeResidentState {
             rope_decode_kernel,
             copy_at_kernel,
             copy_at_f32_to_bf16_kernel,
+            copy_at_bf16_kernel,
+            copy_at_bf16_to_f32_kernel,
             gpu_position_kernels: OnceLock::new(),
             rows_kernels: OnceLock::new(),
             kv_quant_kernels: OnceLock::new(),

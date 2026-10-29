@@ -806,6 +806,9 @@ impl MetalExecutor {
             causal_attention_prefill_steel_d256_f32,
             causal_attention_prefill_steel_nax_d256,
             prefill_kv_bf16_mirror: crate::runtime_flags::prefill_kv_bf16_mirror_enabled(),
+            prefill_kv_bf16_store_min_rows: (crate::runtime_flags::prefill_kv_bf16_store_enabled()
+                && crate::decode_resident::kv_bf16_dense_by_default())
+            .then(crate::runtime_flags::kv_bf16_greedy_min_tokens),
             noncausal_attention_prefill_f32,
             steel_attention_f32_bq32_bk32_bd64,
             add_rms_norm_row_f32,

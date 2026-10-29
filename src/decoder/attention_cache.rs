@@ -72,7 +72,7 @@ impl LayerKvCache {
         layout: &AttentionLayout,
     ) -> Result<()> {
         let expected_dim = layout.num_key_value_heads * layout.head_dim;
-        let (key_len, value_len) = (key.data().len(), value.data().len());
+        let (key_len, value_len) = (key.len(), value.len());
         if expected_dim == 0
             || kv_dim != expected_dim
             || key_len == 0

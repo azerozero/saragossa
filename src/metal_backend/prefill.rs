@@ -191,6 +191,9 @@ enum PrefillResidentLayerCacheBuffer {
         value: Buffer,
         kv_dim: usize,
         bf16_mirror: Option<PrefillKvBf16Mirror>,
+        /// `key`/`value` stockent le K/V en bf16 (buffers partagés) : le NAX
+        /// les lit directement, sans miroir ni conversion.
+        bf16_store: bool,
     },
     Linear {
         state: LinearAttentionMetalState,

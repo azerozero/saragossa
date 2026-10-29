@@ -278,8 +278,8 @@ impl CausalDecoder {
                 arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
             };
             full.seed_segments(
-                &layer_cache.keys.seed_segments(),
-                &layer_cache.values.seed_segments(),
+                &layer_cache.keys.segments(),
+                &layer_cache.values.segments(),
                 prefill_len,
             )?;
             layer_cache.full = Some(full);
@@ -724,8 +724,8 @@ impl CausalDecoder {
                 arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
             };
             full.seed_segments(
-                &layer_cache.keys.seed_segments(),
-                &layer_cache.values.seed_segments(),
+                &layer_cache.keys.segments(),
+                &layer_cache.values.segments(),
                 prefill_len,
             )?;
             layer_cache.full = Some(full);

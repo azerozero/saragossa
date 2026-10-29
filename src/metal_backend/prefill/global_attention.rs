@@ -41,6 +41,7 @@ impl MetalExecutor {
                     value: value_cache,
                     kv_dim,
                     bf16_mirror,
+                    bf16_store,
                 },
             ) => {
                 let kv_chunk_len = checked_len(spec.seq, *kv_dim, "resident kv morceau")?;
@@ -156,6 +157,24 @@ impl MetalExecutor {
                         spec.kv_heads,
                         chunk.start,
                     )?;
+                    if *bf16_store {
+                        // Même `bfloat(x)` que la conversion du NAX ou du
+                        // miroir : K/V lus à l'identique.
+                        let kv_start = checked_len(chunk.start, *kv_dim, "resident kv bf16")?;
+                        for (chunk_kv, cache) in
+                            [(&k_rope_buffer, key_cache), (&v_buffer, value_cache)]
+                        {
+                            self.encode_f32_to_bf16_offsets(
+                                encoder,
+                                chunk_kv,
+                                0,
+                                cache,
+                                kv_start,
+                                kv_chunk_len,
+                            )?;
+                        }
+                        return Ok(());
+                    }
                     self.encode_copy_with_offsets(
                         encoder,
                         &k_rope_buffer,
@@ -187,6 +206,9 @@ impl MetalExecutor {
                         if chunk.rows < chunk.total {
                             let kv_rows = chunk.start + chunk.rows;
                             let bf16_kv = match bf16_mirror {
+                                _ if *bf16_store => {
+                                    Some([key_cache.as_ref(), value_cache.as_ref()])
+                                }
                                 Some(mirror) => {
                                     // Préfixe et lignes des morceaux `kv_only`
                                     // compris : tout ce qui n'est pas encore converti.
@@ -220,6 +242,12 @@ impl MetalExecutor {
                                 chunk.total,
                                 bf16_kv,
                             )
+                        } else if *bf16_store {
+                            // Exclu par l'éligibilité : seul le NAX par
+                            // morceaux lit un K/V bf16.
+                            Err(InferError::Config(
+                                "K/V bf16 hors attention par morceaux".to_string(),
+                            ))
                         } else if spec.window.is_some() {
                             self.encode_windowed_attention_prefill(
                                 encoder,

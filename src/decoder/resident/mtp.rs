@@ -65,8 +65,8 @@ impl CausalDecoder {
         mtp.pending_append_count = 0;
         Self::reset_mtp_append_oracle(mtp);
         mtp.kv.seed_segments(
-            &history.keys.seed_segments(),
-            &history.values.seed_segments(),
+            &history.keys.segments(),
+            &history.values.segments(),
             history.len(),
         )
     }

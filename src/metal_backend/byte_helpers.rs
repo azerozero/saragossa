@@ -114,6 +114,20 @@ pub(crate) fn write_f32_buffer_at(buffer: &BufferRef, offset: usize, data: &[f32
     write_pod_buffer(buffer, offset, data)
 }
 
+/// Écrit des bits bf16 à partir de l'élément `offset`.
+pub(crate) fn write_u16_buffer_at(buffer: &BufferRef, offset: usize, data: &[u16]) -> Result<()> {
+    write_pod_buffer(buffer, offset, data)
+}
+
+/// Relit `len` bits bf16 à partir de l'élément `offset`.
+pub(crate) fn read_u16_buffer_at(
+    buffer: &BufferRef,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u16>> {
+    read_pod_buffer(buffer, offset, len)
+}
+
 pub(super) fn write_u32_buffer(buffer: &BufferRef, data: &[u32]) -> Result<()> {
     write_pod_buffer(buffer, 0, data)
 }

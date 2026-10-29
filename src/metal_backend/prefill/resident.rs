@@ -2,6 +2,7 @@
 
 use super::buffers::embedding_indices;
 use super::*;
+use crate::decode_resident::KvSegment;
 
 pub(super) struct ResidentPrefillEncodeContext<'a> {
     profile_sections: bool,
@@ -28,9 +29,15 @@ pub(super) struct ResidentPrefillChunk {
 // serve agrandi, prolongement sur plusieurs blocs) retombe sur la copie.
 const PREFILL_KV_RESERVE_ROWS: usize = 256;
 
-/// `segments` est-il exactement une vue de `buffer` depuis son début ?
-fn is_sole_view_of(segments: &[&[f32]], buffer: &BufferRef) -> bool {
-    matches!(segments, [segment] if segment.as_ptr() == buffer.contents().cast::<f32>().cast_const())
+/// `segments` est-il exactement une vue de `buffer` depuis son début, en bf16
+/// si `bf16`, sinon en f32 ?
+fn is_sole_view_of(segments: &[KvSegment<'_>], buffer: &BufferRef, bf16: bool) -> bool {
+    let view = match (segments, bf16) {
+        ([KvSegment::Shared(rows)], false) => (rows.buffer(), rows.byte_offset()),
+        ([KvSegment::SharedBf16(rows)], true) => (rows.buffer(), rows.byte_offset()),
+        _ => return false,
+    };
+    view.1 == 0 && view.0.contents() == buffer.contents()
 }
 
 /// Buffers K/V d'un préfixe de `start` lignes réutilisables pour un
@@ -44,10 +51,10 @@ fn is_sole_view_of(segments: &[&[f32]], buffer: &BufferRef) -> bool {
 /// réserve dans `claims` jusqu'à la fin du prefill, le second recopie.
 fn prefix_kv_in_place(
     in_place: Option<&[Buffer; 2]>,
-    key: &[&[f32]],
-    value: &[&[f32]],
+    key: &[KvSegment<'_>],
+    value: &[KvSegment<'_>],
     (start, seq): (usize, usize),
-    kv_dim: usize,
+    (kv_dim, bf16): (usize, bool),
     claims: &mut Vec<InPlaceClaim>,
 ) -> Result<Option<[Buffer; 2]>> {
     let Some([key_buffer, value_buffer]) = in_place else {
@@ -56,16 +63,21 @@ fn prefix_kv_in_place(
     if seq > start.saturating_add(PREFILL_KV_RESERVE_ROWS) {
         return Ok(None);
     }
-    let reserved = byte_len::<f32>(checked_len(
+    let reserved_len = checked_len(
         start + PREFILL_KV_RESERVE_ROWS,
         kv_dim,
         "prolongement en place",
-    )?)?;
+    )?;
+    let reserved = if bf16 {
+        byte_len::<u16>(reserved_len)?
+    } else {
+        byte_len::<f32>(reserved_len)?
+    };
     let fits = |buffer: &Buffer| buffer.length() == reserved;
     if !(fits(key_buffer)
         && fits(value_buffer)
-        && is_sole_view_of(key, key_buffer)
-        && is_sole_view_of(value, value_buffer))
+        && is_sole_view_of(key, key_buffer, bf16)
+        && is_sole_view_of(value, value_buffer, bf16))
     {
         return Ok(None);
     }
@@ -299,9 +311,15 @@ impl MetalExecutor {
         // morceaux ; tout le reste est un scratch dimensionné sur un morceau.
         // Le miroir ne sert qu'à l'attention par morceaux (plusieurs morceaux
         // ou préfixe), et seulement si elle passe par le NAX bf16.
-        let bf16_mirror = self.prefill_kv_bf16_mirror
-            && (chunk_count > 1 || start > 0)
+        let chunked_nax = (chunk_count > 1 || start > 0)
             && self.causal_attention_prefill_steel_nax_d256.is_some();
+        let bf16_mirror = self.prefill_kv_bf16_mirror && chunked_nax;
+        // Le NAX lit déjà ce K/V en bf16 et l'arène d'un prompt de cette
+        // longueur sera bf16 : le stocker arrondi ne change aucun octet lu.
+        let bf16_store = chunked_nax
+            && self
+                .prefill_kv_bf16_store_min_rows
+                .is_some_and(|min_rows| spec.seq >= min_rows);
         let mut layer_cache_buffers = Vec::with_capacity(layers.len());
         // Tenus jusqu'à la relecture des lignes nouvelles, en fin de fonction.
         let mut in_place_claims = Vec::new();
@@ -323,6 +341,7 @@ impl MetalExecutor {
                     spec.seq.saturating_add(PREFILL_KV_RESERVE_ROWS),
                     kv_dim,
                     bf16_mirror,
+                    bf16_store,
                     None,
                 )?,
                 (
@@ -337,12 +356,13 @@ impl MetalExecutor {
                     spec.seq,
                     kv_dim,
                     bf16_mirror,
+                    bf16_store,
                     prefix_kv_in_place(
                         in_place.as_ref(),
                         key,
                         value,
                         (start, spec.seq),
-                        kv_dim,
+                        (kv_dim, bf16_store),
                         &mut in_place_claims,
                     )?,
                 )?,
@@ -357,6 +377,7 @@ impl MetalExecutor {
                 PrefillResidentLayerCacheBuffer::Full {
                     key: key_cache,
                     value: value_cache,
+                    bf16_store,
                     ..
                 },
             ) = (prefix_layer, &cache)
@@ -371,12 +392,26 @@ impl MetalExecutor {
                 }
                 for (buffer, segments) in [(key_cache, key), (value_cache, value)] {
                     // Prolongement en place : le préfixe est déjà au début.
-                    if is_sole_view_of(segments, buffer) {
+                    if is_sole_view_of(segments, buffer, *bf16_store) {
                         continue;
                     }
                     let mut offset = 0;
                     for segment in segments {
-                        write_f32_buffer_at(buffer, offset, segment)?;
+                        match (*bf16_store, segment) {
+                            (true, KvSegment::CpuBf16(data)) => {
+                                write_u16_buffer_at(buffer, offset, data)?;
+                            }
+                            (true, KvSegment::SharedBf16(rows)) => {
+                                write_u16_buffer_at(buffer, offset, rows.as_slice())?;
+                            }
+                            // Arrondi RNE, comme `bfloat(x)` sur le GPU.
+                            (true, _) => write_u16_buffer_at(
+                                buffer,
+                                offset,
+                                &super::buffers::f32_slice_to_bf16(&segment.as_f32()),
+                            )?,
+                            (false, _) => write_f32_buffer_at(buffer, offset, &segment.as_f32())?,
+                        }
                         offset += segment.len();
                     }
                 }
@@ -680,7 +715,11 @@ impl MetalExecutor {
         for cache_buffer in layer_cache_buffers {
             match cache_buffer {
                 PrefillResidentLayerCacheBuffer::Full {
-                    key, value, kv_dim, ..
+                    key,
+                    value,
+                    kv_dim,
+                    bf16_store,
+                    ..
                 } => {
                     // Seules les positions nouvelles repartent au CPU : le préfixe
                     // y est déjà.
@@ -692,7 +731,17 @@ impl MetalExecutor {
                     let (key, value) = if start == 0
                         && crate::runtime_flags::prefill_kv_shared_enabled()
                     {
-                        shared_kv_rows(key, value, kv_len)?
+                        shared_kv_rows(key, value, kv_len, bf16_store)?
+                    } else if bf16_store {
+                        // Lignes possédées, hors de toute vue : un prolongement
+                        // en place ultérieur du même préfixe peut réécrire la
+                        // réserve.
+                        (
+                            PrefillKvRows::OwnedBf16(read_u16_buffer_at(&key, kv_offset, kv_len)?),
+                            PrefillKvRows::OwnedBf16(read_u16_buffer_at(
+                                &value, kv_offset, kv_len,
+                            )?),
+                        )
                     } else {
                         (
                             PrefillKvRows::Owned(read_f32_buffer_at(&key, kv_offset, kv_len)?),
@@ -1312,16 +1361,25 @@ fn shared_kv_rows(
     key: metal::Buffer,
     value: metal::Buffer,
     kv_len: usize,
+    bf16: bool,
 ) -> Result<(PrefillKvRows, PrefillKvRows)> {
-    // SAFETY: buffers `uncached_f32_buffer` propres à ce prefill, hors scratch :
-    // son command buffer est terminé et l'appelant les cède ici. Seules les
-    // lignes réservées au-delà de `kv_len` seront encore écrites (prolongement
-    // en place, `prefix_kv_in_place`), hors de la vue.
+    // SAFETY: buffers `uncached_f32_buffer` ou `uncached_bf16_buffer` propres à
+    // ce prefill, hors scratch : son command buffer est terminé et l'appelant
+    // les cède ici. Seules les lignes réservées au-delà de `kv_len` seront
+    // encore écrites (prolongement en place, `prefix_kv_in_place`), hors de
+    // la vue.
     unsafe {
-        Ok((
-            PrefillKvRows::Shared(SharedF32Rows::new(key, 0, kv_len)?),
-            PrefillKvRows::Shared(SharedF32Rows::new(value, 0, kv_len)?),
-        ))
+        Ok(if bf16 {
+            (
+                PrefillKvRows::SharedBf16(SharedBf16Rows::new(key, 0, kv_len)?),
+                PrefillKvRows::SharedBf16(SharedBf16Rows::new(value, 0, kv_len)?),
+            )
+        } else {
+            (
+                PrefillKvRows::Shared(SharedF32Rows::new(key, 0, kv_len)?),
+                PrefillKvRows::Shared(SharedF32Rows::new(value, 0, kv_len)?),
+            )
+        })
     }
 }
 
