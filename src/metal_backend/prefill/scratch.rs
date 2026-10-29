@@ -267,6 +267,7 @@ impl MetalExecutor {
                     kv_dim,
                     bf16_mirror,
                     bf16_store,
+                    replaces_prefix: false,
                 })
             }
             PrefillResidentAttentionShape::Linear {

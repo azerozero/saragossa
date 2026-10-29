@@ -200,6 +200,29 @@ impl BlockAwarePrefixCache {
         bytes
     }
 
+    /// Retire les blocs de `session` qui tiennent une allocation K/V de
+    /// `superseded` sans en partager aucune avec `live` : un prolongement a
+    /// recopié tout leur K/V dans l'état vivant, les garder retiendrait une
+    /// seconde copie complète de la conversation (tous les blocs qui
+    /// partageaient l'ancien buffer, pas seulement le plus profond).
+    pub(super) fn remove_superseded(
+        &mut self,
+        session: BlockHash,
+        superseded: &std::collections::HashSet<usize>,
+        live: &std::collections::HashSet<usize>,
+    ) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            if entry.session != session {
+                return true;
+            }
+            let mut allocations = std::collections::HashSet::new();
+            entry.state.estimated_cpu_bytes_unseen(&mut allocations);
+            allocations.is_disjoint(superseded) || !allocations.is_disjoint(live)
+        });
+        before - self.entries.len()
+    }
+
     /// Evince le bloc le moins récemment utilisé.
     pub(super) fn evict_lru_block(&mut self) -> Option<usize> {
         self.entries.pop().map(|entry| entry.bytes)
@@ -354,6 +377,48 @@ mod tests {
 
         assert_eq!(hit.tokens, 4);
         assert_eq!(hit.state.position(), 4);
+    }
+
+    #[test]
+    fn prefix_cache_removes_superseded_block() {
+        let root = BlockHash::root();
+        let first = root.chain(&[1, 2]);
+        let second = first.chain(&[3, 4]);
+        // Retrait des blocs supplantés : seuls ceux de la session qui tiennent
+        // l'ancien K/V sans rien partager avec l'état vivant partent.
+        let mut other = BlockAwarePrefixCache::new(2, 8);
+        let other_root = BlockHash::for_session(Some("autre"));
+        let (old, live) = (test_state(2), test_state(4));
+        for (session, hash, tokens, state) in [
+            (root, first, 2, old.clone()),
+            (other_root, other_root.chain(&[1, 2]), 2, old.clone()),
+            (root, second, 4, live.clone()),
+        ] {
+            other.insert(
+                session,
+                hash,
+                tokens,
+                state,
+                CausalDecoderPromptMetalSnapshot::default(),
+            );
+        }
+        let allocations = |state: &CausalDecoderPromptState| {
+            let mut seen = std::collections::HashSet::new();
+            state.estimated_cpu_bytes_unseen(&mut seen);
+            seen
+        };
+        let (old_kv, live_kv) = (allocations(&old), allocations(&live));
+        // Un ensemble vide ne supplante rien ; avec un vrai K/V recopié, seul le
+        // bloc de la session qui le tient part.
+        assert_eq!(
+            other.remove_superseded(root, &std::collections::HashSet::new(), &live_kv),
+            0
+        );
+        if !old_kv.is_empty() && old_kv.is_disjoint(&live_kv) {
+            assert_eq!(other.remove_superseded(root, &old_kv, &live_kv), 1);
+        }
+        assert!(other.match_prefix(other_root, &[1, 2]).is_some());
+        assert!(other.match_prefix(root, &[1, 2, 3, 4]).is_some());
     }
 
     #[test]

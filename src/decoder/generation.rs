@@ -3581,8 +3581,12 @@ impl CausalDecoder {
             cache.layers.iter_mut().zip(&layers).zip(layer_states)
         {
             // L'état linéaire a avancé en place dans le buffer du cache.
-            if let crate::metal_backend::PrefillResidentLayerCache::Full { key, value, kv_dim } =
-                layer_state
+            if let crate::metal_backend::PrefillResidentLayerCache::Full {
+                key,
+                value,
+                kv_dim,
+                replaces_prefix,
+            } = layer_state
             {
                 let layer_spec = layer.attention_spec;
                 let layout = AttentionLayout {
@@ -3593,7 +3597,19 @@ impl CausalDecoder {
                     attn_scalar: layer_spec.attn_scalar,
                     sliding_window: layer_spec.window,
                 };
-                layer_cache.append_prefill(key, value, kv_dim, &layout)?;
+                if replaces_prefix {
+                    // Préfixe recopié dans un buffer neuf : la vue entière
+                    // remplace les segments (les snapshots gardent les leurs).
+                    layer_cache.replace_prefill(
+                        key,
+                        value,
+                        kv_dim,
+                        start + suffix.len(),
+                        &layout,
+                    )?;
+                } else {
+                    layer_cache.append_prefill(key, value, kv_dim, &layout)?;
+                }
             }
         }
         cache.position = start + suffix.len();
@@ -4910,6 +4926,7 @@ impl CausalDecoder {
                             key,
                             value,
                             kv_dim,
+                            ..
                         } => {
                             let layer_spec = prefill_layer.attention_spec;
                             let layout = AttentionLayout {

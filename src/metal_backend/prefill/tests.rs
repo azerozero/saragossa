@@ -152,7 +152,9 @@ fn test_caches(caches: &[PrefillResidentLayerCache]) -> Result<Vec<TestCache<'_>
     caches
         .iter()
         .map(|cache| match cache {
-            PrefillResidentLayerCache::Full { key, value, kv_dim } => Ok(TestCache::Full {
+            PrefillResidentLayerCache::Full {
+                key, value, kv_dim, ..
+            } => Ok(TestCache::Full {
                 key: kv_tensor(key, *kv_dim)?,
                 value: kv_tensor(value, *kv_dim)?,
             }),
@@ -163,9 +165,9 @@ fn test_caches(caches: &[PrefillResidentLayerCache]) -> Result<Vec<TestCache<'_>
 
 fn full_cache(caches: &[PrefillResidentLayerCache]) -> Result<(Tensor, Tensor)> {
     match caches {
-        [PrefillResidentLayerCache::Full { key, value, kv_dim }] => {
-            Ok((kv_tensor(key, *kv_dim)?, kv_tensor(value, *kv_dim)?))
-        }
+        [PrefillResidentLayerCache::Full {
+            key, value, kv_dim, ..
+        }] => Ok((kv_tensor(key, *kv_dim)?, kv_tensor(value, *kv_dim)?)),
         _ => Err(InferError::Dimension(format!(
             "oracle prefill attend un cache full unique, reçu {}",
             caches.len()
@@ -1059,8 +1061,15 @@ fn assert_full_kv_bf16_of(
                 ),
                 "{label}: K/V non stocké en bf16"
             );
-            assert_bit_exact(key, &round(key_ref)?, label);
-            assert_bit_exact(value, &round(value_ref)?, label);
+            // Préfixe recopié rendu en entier : on compare les lignes nouvelles.
+            let tail = |tensor: &Tensor, rows: usize| -> Result<Tensor> {
+                let cols = tensor.shape()[1];
+                let data = tensor.data();
+                Tensor::from_vec(vec![rows, cols], data[data.len() - rows * cols..].to_vec())
+            };
+            let rows_ref = key_ref.shape()[0];
+            assert_bit_exact(&tail(key, rows_ref)?, &round(key_ref)?, label);
+            assert_bit_exact(&tail(value, rows_ref)?, &round(value_ref)?, label);
             checked += 1;
         }
     }
@@ -1652,6 +1661,38 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 Some(&prefix),
                 false,
             )?;
+            // Préfixe recopié rendu en entier : longueur exacte, préfixe K et V
+            // identiques au snapshot d'origine.
+            for (prefix_cache, extended_cache) in prefix_caches.iter().zip(&extended_caches) {
+                if let (
+                    PrefillResidentLayerCache::Full {
+                        key: prefix_key,
+                        value: prefix_value,
+                        kv_dim,
+                        ..
+                    },
+                    PrefillResidentLayerCache::Full {
+                        key,
+                        value,
+                        replaces_prefix: true,
+                        ..
+                    },
+                ) = (prefix_cache, extended_cache)
+                {
+                    for (rows, prefix) in [(key, prefix_key), (value, prefix_value)] {
+                        let rows = rows.segment().as_f32().into_owned();
+                        let prefix = prefix.segment().as_f32().into_owned();
+                        assert_eq!(rows.len(), SEQ * kv_dim, "préfixe recopié : longueur");
+                        assert!(
+                            rows[..prefix.len()]
+                                .iter()
+                                .zip(&prefix)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "préfixe recopié : contenu"
+                        );
+                    }
+                }
+            }
             if in_place
                 && prefix_rows + 256 >= SEQ
                 && crate::runtime_flags::prefill_kv_shared_enabled()
@@ -1711,6 +1752,18 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             let (stored_in_place, stored_in_place_caches) =
                 runs.pop().expect("invariant: six runs");
             let (stored, stored_caches) = runs.pop().expect("invariant: six runs");
+            // Préfixe bf16 recopié : vue entière d'un buffer neuf qui remplace le
+            // préfixe, avec la réserve d'un prefill à froid.
+            if crate::runtime_flags::prefill_kv_shared_enabled() {
+                assert!(stored_caches.iter().any(|cache| matches!(
+                    cache,
+                    PrefillResidentLayerCache::Full {
+                        key: PrefillKvRows::SharedBf16(_),
+                        replaces_prefix: true,
+                        ..
+                    }
+                )));
+            }
             let (crossed, crossed_caches) = runs.pop().expect("invariant: six runs");
             let reference = &runs[0];
             for (output, caches, label) in [
