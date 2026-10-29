@@ -139,6 +139,18 @@ pub struct ModelConfig {
     /// Décrit le scaling RoPE déclaré (`null`/absent → aucun scaling).
     #[serde(default)]
     pub rope_scaling: Option<RopeScalingConfig>,
+    /// Liste les couches à MLP dense d'un modèle MoE (flint : couches 0-1).
+    #[serde(default)]
+    pub mlp_only_layers: Vec<usize>,
+    /// Liste les couches sans encodage positionnel (NoPE, flint).
+    #[serde(default)]
+    pub no_rope_layer_indices: Vec<usize>,
+    /// Nomme la fonction de score du routeur MoE (`softmax` si absente).
+    #[serde(default)]
+    pub router_score_function: Option<String>,
+    /// Déclare un biais de sélection des experts (flint ; non supporté).
+    #[serde(default)]
+    pub router_expert_bias: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]

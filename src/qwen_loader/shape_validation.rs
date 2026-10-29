@@ -117,6 +117,13 @@ fn validate_full_attention_shapes(
         &layer_target(layer, "self_attn.o_proj.weight"),
         &[hidden, q_dim],
     )?;
+    if config.has_attention_sinks() {
+        expect_shape(
+            tensors,
+            &layer_target(layer, "self_attn.softmax_offset"),
+            &[config.num_attention_heads],
+        )?;
+    }
     validate_qk_norm_shapes(tensors, layer, head_dim)
 }
 
@@ -345,11 +352,13 @@ fn validate_moe_shapes(
         &[experts, hidden, intermediate],
     )?;
     if let Some(shared) = config.shared_expert_intermediate_size {
-        expect_shape(
-            tensors,
-            &layer_target(layer, "mlp.shared_expert_gate.weight"),
-            &[1, hidden],
-        )?;
+        if config.shared_expert_gated() {
+            expect_shape(
+                tensors,
+                &layer_target(layer, "mlp.shared_expert_gate.weight"),
+                &[1, hidden],
+            )?;
+        }
         expect_shape(
             tensors,
             &layer_target(layer, "mlp.shared_expert.gate_proj.weight"),

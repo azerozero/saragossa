@@ -1254,6 +1254,10 @@ mod tests {
             attn_logit_softcapping: None,
             final_logit_softcapping: None,
             rope_scaling: None,
+            mlp_only_layers: Vec::new(),
+            no_rope_layer_indices: Vec::new(),
+            router_score_function: None,
+            router_expert_bias: None,
         }
     }
 

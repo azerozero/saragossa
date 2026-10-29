@@ -57,6 +57,8 @@ pub fn force_resident_full_linear_decode() {
     flags::force_resident_full_linear_decode();
 }
 
+#[cfg(test)]
+mod flint_oracle_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
 #[cfg(test)]
@@ -163,6 +165,19 @@ pub struct CausalDecoderConfig {
     pub is_gemma4: bool,
     /// Indique que le décodeur appartient à la famille Qwen.
     pub is_qwen: bool,
+    /// Honore les étiquettes `sliding_attention` de `layer_types` hors Gemma 4
+    /// (flint). Faux pour Gemma 2/3, dont la fenêtre suit `sliding_window_pattern`.
+    pub sliding_from_layer_types: bool,
+    /// Liste les couches sans RoPE : QK-RMSNorm seule (NoPE, flint).
+    pub no_rope_layers: Vec<usize>,
+    /// Exige un sink appris par tête (`self_attn.softmax_offset`, flint).
+    pub attention_sinks: bool,
+    /// Sélectionne la fonction de score du routeur MoE.
+    pub router_score: crate::RouterScore,
+    /// Somme l'expert partagé sans gate (flint) au lieu de le pondérer.
+    pub ungated_shared_expert: bool,
+    /// Liste les couches à MLP dense d'un modèle MoE.
+    pub mlp_only_layers: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -950,6 +965,12 @@ impl Default for CausalDecoderConfig {
             rope_style: RopeStyle::Halves,
             is_gemma4: false,
             is_qwen: false,
+            sliding_from_layer_types: false,
+            no_rope_layers: Vec::new(),
+            attention_sinks: false,
+            router_score: crate::RouterScore::Softmax,
+            ungated_shared_expert: false,
+            mlp_only_layers: Vec::new(),
         }
     }
 }
@@ -1013,6 +1034,15 @@ impl From<&ModelConfig> for CausalDecoderConfig {
             rope_style: RopeStyle::Halves,
             is_gemma4: config.is_gemma4(),
             is_qwen: config.model_type.starts_with("qwen"),
+            sliding_from_layer_types: config.is_gemma4() || !config.is_gemma(),
+            no_rope_layers: config.no_rope_layer_indices.clone(),
+            attention_sinks: config.has_attention_sinks(),
+            // NOTE: Une fonction inconnue est refusée par le chargeur avant
+            // cette conversion ; le repli softmax ne sert qu'aux appelants
+            // qui construisent la config sans passer par lui.
+            router_score: config.router_score().unwrap_or_default(),
+            ungated_shared_expert: !config.shared_expert_gated(),
+            mlp_only_layers: config.mlp_only_layers.clone(),
         }
     }
 }
@@ -1056,7 +1086,10 @@ impl CausalDecoderConfig {
     /// Sans motif déclaré, aucune couche n'est locale.
     fn is_local_sliding_layer(&self, layer_index: usize) -> bool {
         if !self.layer_types.is_empty() {
-            return self.is_gemma4_sliding_layer(layer_index);
+            // NOTE: Hors Gemma 2/3, l'étiquette suffit (flint) ; Gemma 4 passe
+            // par la même étiquette. Seul Gemma 3 garde son motif historique.
+            return (self.is_gemma4 || self.sliding_from_layer_types)
+                && self.layer_kind(layer_index) == Some("sliding_attention");
         }
         matches!(
             self.sliding_window_pattern,
@@ -1125,6 +1158,32 @@ impl CausalDecoderConfig {
             theta: self.layer_rope_theta_override(layer_index).unwrap_or(theta),
             attn_output_gate: self.attn_output_gate,
         })
+    }
+
+    /// Indique si la couche saute le RoPE (NoPE) en gardant la QK-RMSNorm.
+    fn is_no_rope_layer(&self, layer_index: usize) -> bool {
+        self.no_rope_layers.contains(&layer_index)
+    }
+
+    /// Renvoie la raison pour laquelle les chemins Metal ne connaissent pas
+    /// ce modèle, ou `None` s'ils le couvrent.
+    ///
+    /// Les kernels Metal (per-op, decode et prefill résidents, MTP, DFlash)
+    /// ignorent les sinks, le NoPE, le routeur sigmoïde et l'expert partagé
+    /// sans gate : les laisser tourner produirait un résultat faux sans
+    /// erreur. Le support Metal de flint viendra avec ses kernels dédiés.
+    pub fn metal_unsupported_reason(&self) -> Option<&'static str> {
+        if self.attention_sinks {
+            Some("sinks d'attention appris (softmax_offset)")
+        } else if !self.no_rope_layers.is_empty() {
+            Some("couches sans RoPE (no_rope_layer_indices)")
+        } else if self.router_score != crate::RouterScore::Softmax {
+            Some("routeur MoE sigmoïde")
+        } else if self.ungated_shared_expert {
+            Some("expert partagé sans gate")
+        } else {
+            None
+        }
     }
 
     fn layer_rope_frequency_dim(&self, layer_index: usize, head_dim: usize) -> usize {
@@ -1511,9 +1570,15 @@ struct FullAttention {
     // NOTE: Échelle des positions RoPE de la couche (rope_scaling linear des
     // couches globales Gemma 3 ≥4B) ; `None` = positions brutes (byte-identique).
     rope_position_scale: Option<f32>,
-    // NOTE: Fenêtre d'attention des couches locales Gemma 3 ; `None` = attention
-    // causale pleine (toutes les autres couches et tous les modèles non-Gemma).
+    // NOTE: Fenêtre d'attention des couches locales (Gemma 3, flint) ; `None` =
+    // attention causale pleine.
     sliding_window: Option<usize>,
+    // NOTE: Logit appris par tête ajouté une seule fois au dénominateur du
+    // softmax, sans valeur associée (flint) ; `None` = softmax standard.
+    sinks: Option<Tensor>,
+    // NOTE: Couche NoPE (flint) : QK-RMSNorm sans rotation. Distinct de
+    // `rope_theta = None`, qui retombe sur la base globale.
+    no_rope: bool,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1725,6 +1790,16 @@ impl CausalDecoder {
         }
         let final_norm = take_dense(&mut tensors, "norm.weight")?;
         let lm_head = linear_from(&mut tensors, "lm_head")?;
+        // Contrat strict des modèles à sinks (flint) : un tenseur chargé mais
+        // jamais assemblé (ex. `mlp.gate_proj.bias` sur une couche MoE) serait
+        // ignoré en silence. Les autres familles gardent leur tolérance.
+        if config.attention_sinks && !tensors.is_empty() {
+            let mut leftovers = tensors.keys().cloned().collect::<Vec<_>>();
+            leftovers.sort();
+            return Err(InferError::Config(format!(
+                "tenseurs chargés mais non assemblés: {leftovers:?}"
+            )));
+        }
         Ok(Self {
             config,
             embed_tokens,
@@ -2044,6 +2119,7 @@ impl CausalDecoder {
     /// Renvoie une erreur si Metal est indisponible ou si un kernel ne compile pas.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn with_metal_runtime(mut self) -> Result<Self> {
+        self.ensure_metal_supported()?;
         let executor = crate::MetalExecutor::new()?;
         self.enable_single_copy_weights(&executor)?;
         self.runtime.metal = Some(Arc::new(executor));
@@ -2057,9 +2133,22 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si la conversion single-copy d'un poids est invalide.
     pub fn with_metal_executor(mut self, executor: crate::MetalExecutor) -> Result<Self> {
+        self.ensure_metal_supported()?;
         self.enable_single_copy_weights(&executor)?;
         self.runtime.metal = Some(Arc::new(executor));
         Ok(self)
+    }
+
+    /// Refuse les chemins Metal et spéculatifs pour un modèle qu'ils ne
+    /// connaissent pas (flint) : erreur explicite plutôt qu'un résultat faux.
+    fn ensure_metal_supported(&self) -> Result<()> {
+        match self.config.metal_unsupported_reason() {
+            Some(reason) => Err(InferError::Config(format!(
+                "chemins Metal et spéculatifs non supportés pour ce modèle ({reason}) : \
+                 utiliser le backend CPU"
+            ))),
+            None => Ok(()),
+        }
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2215,6 +2304,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
     pub fn with_mtp_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
+        self.ensure_metal_supported()?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let context = self
             .runtime
@@ -2241,6 +2331,7 @@ impl CausalDecoder {
         let Some(dir) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR") else {
             return Ok(self);
         };
+        self.ensure_metal_supported()?;
         if self.runtime.metal.is_none() {
             return Err(InferError::Config(
                 "drafter DFlash : runtime Metal requis".to_string(),
@@ -2274,6 +2365,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
     pub fn with_mtp_draft_lm_head_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
+        self.ensure_metal_supported()?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let context = self
             .runtime

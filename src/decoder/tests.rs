@@ -953,7 +953,7 @@ fn causal_attention_sliding_window_matches_truncated_context() {
     let v = Tensor::from_vec(vec![4, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
         .expect("invariant: v valide");
     let windowed =
-        causal_attention(&q, &k, &v, &windowed_layout).expect("invariant: attention valide");
+        causal_attention(&q, &k, &v, &windowed_layout, None).expect("invariant: attention valide");
 
     let truncate = |tensor: &Tensor, start: usize, end: usize| -> Tensor {
         let mut data = Vec::new();
@@ -969,6 +969,7 @@ fn causal_attention_sliding_window_matches_truncated_context() {
             &truncate(&k, start, pos + 1),
             &truncate(&v, start, pos + 1),
             &full_layout,
+            None,
         )
         .expect("invariant: référence valide");
         assert_close(
@@ -1025,9 +1026,9 @@ fn cached_attention_sliding_window_matches_truncated_cache() {
             .expect("invariant: append valide");
     }
     let q = row([1.0, 0.25]);
-    let windowed = cached_attention_one(&q, &mut windowed_cache, &windowed_layout)
+    let windowed = cached_attention_one(&q, &mut windowed_cache, &windowed_layout, None)
         .expect("invariant: attention fenêtrée valide");
-    let reference = cached_attention_one(&q, &mut truncated_cache, &full_layout)
+    let reference = cached_attention_one(&q, &mut truncated_cache, &full_layout, None)
         .expect("invariant: attention référence valide");
     assert_close(
         windowed.as_row().expect("invariant: ligne valide"),
@@ -1057,7 +1058,7 @@ fn attention_scale_uses_query_pre_attn_scalar() {
     cache
         .append(&row([0.0, 0.0]), &row([0.0, 1.0]), &layout)
         .expect("invariant: append valide");
-    let out = cached_attention_one(&row([1.0, 0.0]), &mut cache, &layout)
+    let out = cached_attention_one(&row([1.0, 0.0]), &mut cache, &layout, None)
         .expect("invariant: attention valide");
     // scores = [1/√8, 0] → p0 = 1/(1 + e^{-1/√8}), sortie = p0·v0 + (1−p0)·v1.
     let p0 = 1.0 / (1.0 + (-1.0_f32 / 8.0_f32.sqrt()).exp());

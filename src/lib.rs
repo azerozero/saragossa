@@ -88,7 +88,7 @@ pub use memory_guard::{
 };
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub use metal_backend::MetalExecutor;
-pub use mlp::{Activation, FeedForward, GatedMlp, MoeMlp};
+pub use mlp::{Activation, FeedForward, GatedMlp, MoeMlp, RouterScore};
 pub use norm::{layer_norm, rms_norm};
 pub use quantization::{dequantize_affine_u32, AffineQuantizedTensor};
 pub use qwen_loader::{

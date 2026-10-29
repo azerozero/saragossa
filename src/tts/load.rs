@@ -259,6 +259,7 @@ impl TtsModel {
             rope_style: crate::RopeStyle::Halves,
             is_gemma4: false,
             is_qwen: false,
+            ..CausalDecoderConfig::default()
         };
         let mut talker = CausalDecoder::from_decoder_tensors(tensors, decoder_config)?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -315,6 +316,7 @@ impl TtsModel {
                 rope_style: crate::RopeStyle::Halves,
                 is_gemma4: false,
                 is_qwen: false,
+                ..CausalDecoderConfig::default()
             };
         let mut code_predictor = CausalDecoder::from_decoder_tensors(cp_tensors, cp_config)?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
