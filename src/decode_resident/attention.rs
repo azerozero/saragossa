@@ -1313,6 +1313,30 @@ impl FullAttentionMetalState {
         })
     }
 
+    /// Force le 2-passes fenêtré avec sink, indépendamment des flags runtime
+    /// (`SARAGOSSA_RUST_SDPA_2PASS=0` ferait retomber la production sur le naïf).
+    #[cfg(test)]
+    pub(crate) fn attention_decode_sink_two_pass(
+        &self,
+        q: &[f32],
+        window_start: usize,
+    ) -> Result<Vec<f32>> {
+        let sinks = self
+            .sinks
+            .as_ref()
+            .ok_or_else(|| InferError::Config("2-passes avec sink sans sinks".to_string()))?;
+        self.attention_decode_with(q, |encoder, q_buf, _scores, out_buf| {
+            self.encode_attention_decode_sink_windowed_2pass(
+                encoder,
+                q_buf,
+                out_buf,
+                window_start,
+                self.len,
+                sinks,
+            )
+        })
+    }
+
     /// Exécute un encodage d'attention decode sur `q` uploadé et relit la sortie.
     fn attention_decode_with(
         &self,
@@ -1510,7 +1534,8 @@ impl FullAttentionMetalState {
                 out_buf,
                 len_bound,
                 two_pass_dims,
-                (None, 0),
+                None,
+                0,
             );
         }
         // Bascule 2-passes split-K pour les longs KV (dédup GQA + tuiles L1) :
@@ -1530,7 +1555,8 @@ impl FullAttentionMetalState {
                 out_buf,
                 len_bound,
                 two_pass_dims,
-                (None, 0),
+                None,
+                0,
             );
         }
         // Le chemin fenêtré privilégie d'abord la correction : le kernel naïf
@@ -1621,34 +1647,18 @@ impl FullAttentionMetalState {
                 out_buf,
                 len_bound,
                 two_pass_dims,
-                (Some(sinks), 0),
+                Some(sinks),
+                0,
             );
         }
-        // Fenêtre glissante : la passe 1 lit une vue du KV commençant à
-        // `window_start`, sur la seule longueur de la fenêtre. Les blocs sont
-        // dimensionnés sur cette longueur (32 pour 513 lignes) : les dimensionner
-        // sur le contexte complet gaspillerait des partitions vides. Une fenêtre
-        // non nulle ne vient que de `encode_attention_decode_windowed`, dont la
-        // borne est la longueur hôte : les dims peuvent être reconstruites ici.
         if two_pass {
-            let window_len = len_bound.checked_sub(window_start).ok_or_else(|| {
-                InferError::Dimension(format!(
-                    "attention_decode fenêtre vide: début={window_start}, borne={len_bound}"
-                ))
-            })?;
-            let window_dims = U32x4Param::Bytes([
-                to_u32(self.q_heads, "2pass q_heads")?,
-                to_u32(self.kv_heads, "2pass kv_heads")?,
-                to_u32(window_len, "2pass fenêtre")?,
-                to_u32(sdpa_2pass_blocks(window_len), "2pass blocks")?,
-            ]);
-            return self.encode_attention_decode_2pass(
+            return self.encode_attention_decode_sink_windowed_2pass(
                 encoder,
                 q_buf,
                 out_buf,
-                window_len,
-                window_dims,
-                (Some(sinks), window_start),
+                window_start,
+                len_bound,
+                sinks,
             );
         }
         self.encode_attention_decode_sink_naive(
@@ -1659,6 +1669,49 @@ impl FullAttentionMetalState {
             window_start,
             sdpa_dims,
             sinks,
+        )
+    }
+
+    /// 2-passes avec sink sur la vue du KV commençant à `window_start`, sur la
+    /// seule longueur de la fenêtre. Les blocs sont dimensionnés sur cette
+    /// longueur (32 pour 513 lignes) : les dimensionner sur le contexte complet
+    /// gaspillerait des partitions vides. Une fenêtre non nulle ne vient que de
+    /// `encode_attention_decode_windowed`, dont la borne est la longueur hôte :
+    /// les dims peuvent être reconstruites ici.
+    fn encode_attention_decode_sink_windowed_2pass(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &BufferRef,
+        out_buf: &BufferRef,
+        window_start: usize,
+        len_bound: usize,
+        sinks: &AttentionSinks,
+    ) -> Result<()> {
+        if len_bound != self.len {
+            return Err(InferError::Config(format!(
+                "attention_decode 2pass fenêtré: borne {len_bound} ≠ len hôte {}",
+                self.len
+            )));
+        }
+        let window_len = len_bound.checked_sub(window_start).ok_or_else(|| {
+            InferError::Dimension(format!(
+                "attention_decode fenêtre vide: début={window_start}, borne={len_bound}"
+            ))
+        })?;
+        let window_dims = U32x4Param::Bytes([
+            to_u32(self.q_heads, "2pass q_heads")?,
+            to_u32(self.kv_heads, "2pass kv_heads")?,
+            to_u32(window_len, "2pass fenêtre")?,
+            to_u32(sdpa_2pass_blocks(window_len), "2pass blocks")?,
+        ]);
+        self.encode_attention_decode_2pass(
+            encoder,
+            q_buf,
+            out_buf,
+            window_len,
+            window_dims,
+            Some(sinks),
+            window_start,
         )
     }
 
@@ -1724,6 +1777,10 @@ impl FullAttentionMetalState {
     /// `sinks = Some` remplace la passe 2 d128 par sa variante avec sink (passe 1
     /// inchangée : le sink ne touche aucune partition). `first_row` décale la vue
     /// K/V lue par la passe 1 (début de fenêtre glissante, 0 sinon).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: buffers + borne + dims + sinks + début de vue KV"
+    )]
     fn encode_attention_decode_2pass(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1731,7 +1788,8 @@ impl FullAttentionMetalState {
         out_buf: &BufferRef,
         len_bound: usize,
         dims: U32x4Param<'_>,
-        (sinks, first_row): (Option<&AttentionSinks>, usize),
+        sinks: Option<&AttentionSinks>,
+        first_row: usize,
     ) -> Result<()> {
         // Grille dimensionnée par la borne : en position GPU, les blocs au-delà de
         // la longueur effective restent vides (max=-inf, somme 0) et la passe 2
@@ -1771,13 +1829,9 @@ impl FullAttentionMetalState {
                 }
             },
         };
-        // Le KV quantifié porte des échelles indexées par ligne absolue : seule
-        // la vue dense peut être décalée.
-        if first_row != 0 && self.quant.is_some() {
-            return Err(InferError::Config(
-                "attention_decode 2pass fenêtré sur KV quantifié".to_string(),
-            ));
-        }
+        // NOTE: Le KV quantifié porte des échelles indexées par ligne absolue et
+        // ne peut pas être décalé. `first_row != 0` ne vient que d'une couche à
+        // sinks, que `set_sinks` refuse dès la construction sur KV quantifié.
         let kv_offset = first_row
             .checked_mul(self.kv_dim())
             .and_then(|cells| cells.checked_mul(self.keys.element().byte_size()))

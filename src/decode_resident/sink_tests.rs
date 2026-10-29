@@ -116,8 +116,14 @@ fn kv_state(
     Ok(kv)
 }
 
+/// Écart max entre deux sorties finies : `f32::max` ignore les NaN, une sortie
+/// entièrement NaN passerait sinon pour un écart nul.
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
+    assert!(
+        a.iter().chain(b).all(|value| value.is_finite()),
+        "sortie non finie"
+    );
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
@@ -155,6 +161,11 @@ fn sink_attention_matches_cpu_oracle() -> Result<()> {
 /// Fenêtre flint de 513 lignes : le 2-passes sur la vue décalée du KV (choisi
 /// en production pour d128/GQA 8) contre le naïf avec sink et l'oracle CPU.
 /// L'ordre de réduction diffère (partitions entrelacées) : tolérance, pas bits.
+// NOTE: Mesuré le 30 oct. 2026 (M5 Max, trois exécutions identiques) : pire
+// écart 1,72e-8 contre le naïf et 1,68e-8 contre le CPU, en f32 comme en bf16.
+// 1e-6 laisse ~60× de marge tout en restant assez serré pour qu'un décalage de
+// vue K/V faux (lignes hors fenêtre) se voie ; les 2e-5 du test en fenêtre
+// nulle couvrent 3 000 lignes et le sink dominant, pas ce cas.
 #[test]
 fn windowed_two_pass_sink_matches_naive_and_cpu_oracle() -> Result<()> {
     let Some(state) = try_state()? else {
@@ -171,8 +182,12 @@ fn windowed_two_pass_sink_matches_naive_and_cpu_oracle() -> Result<()> {
             };
             let expected = cpu_sink_attention(&case.q, &keys, &values, len, window_start, &sinks);
             let kv = kv_state(&state, &case, len, format, Some(&sinks))?;
-            let got = kv.attention_decode_windowed(&case.q, window_start)?;
+            let got = kv.attention_decode_sink_two_pass(&case.q, window_start)?;
             let naive = kv.attention_decode_sink_naive(&case.q, window_start)?;
+            let production = kv.attention_decode_windowed(&case.q, window_start)?;
+            // La production prend le 2-passes (bits identiques), sauf si un flag
+            // runtime la ramène au naïf : comparée alors à tolérance.
+            assert!(max_abs_diff(&production, &got) <= 1.0e-6);
             let to_naive = max_abs_diff(&got, &naive);
             let to_cpu = max_abs_diff(&got, &expected);
             assert!(
