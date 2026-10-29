@@ -1,6 +1,12 @@
 use super::super::*;
 use super::types::*;
 
+/// Pas encodés par le decode résident complet : prouve en test qu'une
+/// génération est passée par ce chemin, pas par un repli per-op.
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) static RESIDENT_DECODE_STEPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl CausalDecoder {
     /// Forward d'UN token de decode par le chemin résident COMPLET (1c) : embed
     /// gather (CPU, input upload) → boucle des 40 couches en **UN** command buffer →
@@ -244,6 +250,8 @@ impl CausalDecoder {
                 "decode résident sans executor Metal".to_string(),
             ));
         };
+        #[cfg(test)]
+        RESIDENT_DECODE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let theta = self.config.rope_theta.ok_or_else(|| {
             InferError::Config("rope_theta manquant (decode résident)".to_string())
         })?;

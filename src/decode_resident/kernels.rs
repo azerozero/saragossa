@@ -998,7 +998,9 @@ inline void attention_decode_naive_sink(
             scores[score_base + r] *= inv_sum;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Les probabilités écrites par le thread 0 vivent en mémoire `device` :
+    // seule une barrière `mem_device` les rend visibles aux autres threads.
+    threadgroup_barrier(mem_flags::mem_device);
 
     for (uint c = tid; c < head_dim; c += 256u) {
         float acc = 0.0f;

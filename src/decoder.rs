@@ -59,6 +59,12 @@ pub fn force_resident_full_linear_decode() {
 
 #[cfg(test)]
 mod flint_oracle_tests;
+
+/// Compte les pas encodés par le decode résident complet (tests flint).
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn resident_decode_steps_for_test() -> usize {
+    resident::RESIDENT_DECODE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+}
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
 #[cfg(test)]
@@ -1993,7 +1999,11 @@ impl CausalDecoder {
     ) -> Result<bool> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
-            if !self.supports_resident_full_decode() {
+            // Le pas depuis embedding (`next_resident_embedding_step`) n'emploie
+            // que le runtime per-op : hors périmètre pour flint, pas d'arène.
+            if self.config.metal_unsupported_reason().is_some()
+                || !self.supports_resident_full_decode()
+            {
                 return Ok(false);
             }
             // Chemins greedy (TTS talker argmax, spéculatif/DFlash) → KV f32 exact.
@@ -2410,10 +2420,11 @@ impl CausalDecoder {
     /// que via [`Self::resident_metal`].
     fn forward_runtime(&self) -> ForwardRuntime<'_> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(metal) = self.runtime.metal.as_deref() {
-            if self.config.metal_unsupported_reason().is_none() {
-                return ForwardRuntime::metal(metal);
-            }
+        if let Some(metal) = self
+            .resident_metal()
+            .filter(|_| self.config.metal_unsupported_reason().is_none())
+        {
+            return ForwardRuntime::metal(metal);
         }
         ForwardRuntime::cpu()
     }

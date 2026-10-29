@@ -475,7 +475,7 @@ impl CausalDecoder {
                 down_proj: &layer.down_proj,
                 tail_score: dense_tail_score,
                 parallel_moe: layer.parallel_moe_weights(),
-                sigmoid_moe: layer.sigmoid_moe_weights(),
+                sigmoid_moe: None,
             };
             let mut row_dims = dims;
             row_dims.position = start_position.checked_add(row).ok_or_else(|| {
@@ -765,7 +765,7 @@ impl CausalDecoder {
                 down_proj: &mtp.layer.down_proj,
                 tail_score: &arena.dense_tail_score,
                 parallel_moe: mtp.layer.parallel_moe_weights(),
-                sigmoid_moe: mtp.layer.sigmoid_moe_weights(),
+                sigmoid_moe: None,
             };
             let dims = FullAttnLayerDims {
                 hidden,
@@ -981,7 +981,7 @@ impl CausalDecoder {
             down_proj: &mtp.layer.down_proj,
             tail_score: &arena.dense_tail_score,
             parallel_moe: mtp.layer.parallel_moe_weights(),
-            sigmoid_moe: mtp.layer.sigmoid_moe_weights(),
+            sigmoid_moe: None,
         };
         let dims = FullAttnLayerDims {
             hidden,
@@ -1219,7 +1219,7 @@ impl CausalDecoder {
                 down_proj: &mtp.layer.down_proj,
                 tail_score: &arena.dense_tail_score,
                 parallel_moe: mtp.layer.parallel_moe_weights(),
-                sigmoid_moe: mtp.layer.sigmoid_moe_weights(),
+                sigmoid_moe: None,
             };
             let dims = FullAttnLayerDims {
                 hidden,
@@ -1558,7 +1558,7 @@ impl CausalDecoder {
                 down_proj: &mtp.layer.down_proj,
                 tail_score: &arena.dense_tail_score,
                 parallel_moe: mtp.layer.parallel_moe_weights(),
-                sigmoid_moe: mtp.layer.sigmoid_moe_weights(),
+                sigmoid_moe: None,
             };
             let dims = FullAttnLayerDims {
                 hidden,
@@ -1861,7 +1861,7 @@ impl CausalDecoder {
                 down_proj: &mtp.layer.down_proj,
                 tail_score: &arena.dense_tail_score,
                 parallel_moe: mtp.layer.parallel_moe_weights(),
-                sigmoid_moe: mtp.layer.sigmoid_moe_weights(),
+                sigmoid_moe: None,
             };
             let dims = FullAttnLayerDims {
                 hidden,
@@ -2302,7 +2302,7 @@ impl CausalDecoder {
                     down_proj: &mtp.layer.down_proj,
                     tail_score: &arena.dense_tail_score,
                     parallel_moe: mtp.layer.parallel_moe_weights(),
-                    sigmoid_moe: mtp.layer.sigmoid_moe_weights(),
+                    sigmoid_moe: None,
                 };
                 let dims = FullAttnLayerDims {
                     hidden,

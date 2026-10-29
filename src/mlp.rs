@@ -679,19 +679,25 @@ impl MoeMlp {
 
     /// Renvoie les poids du MoE flint pour le decode résident : routeur
     /// sigmoïde, experts routés et expert partagé sans gate. `None` pour tout
-    /// autre contrat (softmax, gate partagée, normes ou échelles Gemma).
+    /// autre contrat (softmax, gate partagée, normes ou échelles Gemma), ou
+    /// si un poids porte un biais : les buffers résidents n'en transmettent
+    /// aucun, l'ignorer donnerait un résultat faux.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn sigmoid_metal_parts(&self) -> Option<(&Linear, &[GatedMlp], usize, &GatedMlp)> {
         let shared = self.ungated_shared_expert.as_ref()?;
+        let plain_swiglu = |mlp: &GatedMlp| {
+            mlp.activation == Activation::Silu
+                && [&mlp.gate_proj, &mlp.up_proj, &mlp.down_proj]
+                    .iter()
+                    .all(|projection| projection.bias().is_none())
+        };
         (self.router_score == RouterScore::Sigmoid
             && self.shared_expert.is_none()
             && self.router_norm.is_none()
             && self.per_expert_scale.is_none()
-            && shared.activation == Activation::Silu
-            && self
-                .experts
-                .iter()
-                .all(|e| e.activation == Activation::Silu))
+            && self.router.bias().is_none()
+            && plain_swiglu(shared)
+            && self.experts.iter().all(plain_swiglu))
         .then_some((&self.router, self.experts.as_slice(), self.top_k, shared))
     }
 

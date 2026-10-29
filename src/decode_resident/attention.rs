@@ -821,6 +821,14 @@ impl FullAttentionMetalState {
                 buffer.length()
             )));
         }
+        // Le setup a déjà replié ce KV en dense : signalé une fois, comme le
+        // repli `KV_QUANT` des couches sans attention quantifiée.
+        if crate::runtime_flags::kv_quant_format().is_quantized() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!("SARAGOSSA_RUST_KV_QUANT ignoré (couches à sinks) : KV résident dense");
+            });
+        }
         self.sinks = Some(AttentionSinks {
             buffer,
             kernels: arena.sink_kernels()?.clone(),
@@ -1391,6 +1399,13 @@ impl FullAttentionMetalState {
         rows: &GpuPositionRows<'_>,
         row: usize,
     ) -> Result<()> {
+        // Ce chemin (bloc MTP) suppose une fenêtre nulle et n'a pas de variante
+        // avec sink : refus explicite plutôt qu'une attention fausse.
+        if self.sinks.is_some() {
+            return Err(InferError::Config(
+                "attention en position GPU avec sinks ou fenêtre non supportée".to_string(),
+            ));
+        }
         let len_bound = rows
             .position()
             .max_position
@@ -1454,6 +1469,7 @@ impl FullAttentionMetalState {
                 out_buf,
                 len_bound,
                 two_pass_dims,
+                None,
             );
         }
         // Bascule 2-passes split-K pour les longs KV (dédup GQA + tuiles L1) :
@@ -1473,6 +1489,7 @@ impl FullAttentionMetalState {
                 out_buf,
                 len_bound,
                 two_pass_dims,
+                None,
             );
         }
         // Le chemin fenêtré privilégie d'abord la correction : le kernel naïf
@@ -1524,28 +1541,6 @@ impl FullAttentionMetalState {
         Ok(())
     }
 
-    /// SDPA decode 2-passes split-K (head_dim 128/256) dans l'encoder partagé. Passe 1 :
-    /// un threadgroup par `(kv_head, bloc)`, `gqa` simdgroups (un q_head chacun) → les
-    /// lectures KV redondantes du groupe GQA touchent le L1, pas la DRAM ; la longueur
-    /// est tuilée en `blocks`. Passe 2 : réduit les `blocks` partiels par q_head vers
-    /// `out_buf`. Partials/sums/maxs = scratch loué (vivant jusqu'au wait, hazard-ordonné).
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si une dimension déborde ou si l'allocation scratch échoue.
-    fn encode_attention_decode_2pass(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        q_buf: &BufferRef,
-        out_buf: &BufferRef,
-        len_bound: usize,
-        dims: U32x4Param<'_>,
-    ) -> Result<()> {
-        self.encode_attention_decode_2pass_with_sinks(
-            encoder, q_buf, out_buf, len_bound, dims, None,
-        )
-    }
-
     /// Attention decode d'une couche à sinks. Fenêtre nulle, d128 et GQA réelle :
     /// 2-passes avec le sink en passe 2 (quelle que soit la longueur, les blocs
     /// vides étant neutralisés par la passe 2). Sinon naïf fenêtré avec sink.
@@ -1564,9 +1559,22 @@ impl FullAttentionMetalState {
         (sdpa_dims, two_pass_dims): (U32x4Param<'_>, U32x4Param<'_>),
         sinks: &AttentionSinks,
     ) -> Result<()> {
+        // La passe 1 lance `32 × gqa` threads par threadgroup : borne par le
+        // pipeline, sinon naïf (comme une GQA non divisible).
         let gqa = self.q_heads / self.kv_heads.max(1);
-        if window_start == 0 && sdpa_2pass_enabled() && self.head_dim == 128 && gqa > 1 {
-            return self.encode_attention_decode_2pass_with_sinks(
+        let pass1_threads = match self.keys.element() {
+            GpuElement::Bf16 => &self.attention_2pass_1_d128_bf16,
+            _ => &self.attention_2pass_1_d128,
+        }
+        .max_total_threads_per_threadgroup();
+        let two_pass = window_start == 0
+            && sdpa_2pass_enabled()
+            && self.head_dim == 128
+            && gqa > 1
+            && self.q_heads % self.kv_heads == 0
+            && u64::try_from(32 * gqa).is_ok_and(|threads| threads <= pass1_threads);
+        if two_pass {
+            return self.encode_attention_decode_2pass(
                 encoder,
                 q_buf,
                 out_buf,
@@ -1610,9 +1618,19 @@ impl FullAttentionMetalState {
         Ok(())
     }
 
-    /// Cœur du 2-passes ; `sinks = Some` remplace la passe 2 d128 par sa variante
-    /// avec sink (passe 1 inchangée : le sink ne touche aucune partition).
-    fn encode_attention_decode_2pass_with_sinks(
+    /// SDPA decode 2-passes split-K (head_dim 128/256) dans l'encoder partagé. Passe 1 :
+    /// un threadgroup par `(kv_head, bloc)`, `gqa` simdgroups (un q_head chacun) → les
+    /// lectures KV redondantes du groupe GQA touchent le L1, pas la DRAM ; la longueur
+    /// est tuilée en `blocks`. Passe 2 : réduit les `blocks` partiels par q_head vers
+    /// `out_buf`. Partials/sums/maxs = scratch loué (vivant jusqu'au wait, hazard-ordonné).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde ou si l'allocation scratch échoue.
+    ///
+    /// `sinks = Some` remplace la passe 2 d128 par sa variante avec sink (passe 1
+    /// inchangée : le sink ne touche aucune partition).
+    fn encode_attention_decode_2pass(
         &self,
         encoder: &ComputeCommandEncoderRef,
         q_buf: &BufferRef,

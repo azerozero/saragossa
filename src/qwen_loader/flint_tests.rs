@@ -400,12 +400,17 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
             );
         }
     }
+    let steps_before = resident_decode_steps();
     assert_eq!(
         gpu.generate_greedy(&prompt, 8)
             .expect("invariant: greedy GPU"),
         cpu.generate_greedy(&prompt, 8)
             .expect("invariant: greedy CPU"),
         "tokens greedy résident != CPU"
+    );
+    assert!(
+        resident_decode_steps() - steps_before >= 7,
+        "greedy GPU passé par le decode résident"
     );
     let err = gpu
         .generate_greedy_lightbatch_with_options(
@@ -661,6 +666,7 @@ fn flint_int4_resident_decode_matches_mlx_oracle() {
         "decode résident complet attendu pour flint"
     );
 
+    let steps_before = resident_decode_steps();
     let output = model
         .generate_greedy_timed_with_options(
             &prompt_ids,
@@ -668,6 +674,11 @@ fn flint_int4_resident_decode_matches_mlx_oracle() {
             &crate::GenerationOptions::default(),
         )
         .expect("invariant: génération résidente");
+    assert_eq!(
+        resident_decode_steps() - steps_before,
+        output.timings.decode_tokens,
+        "chaque pas de decode doit passer par le decode résident Metal"
+    );
     let timings = &output.timings;
     let decode_secs = timings.decode.as_secs_f64();
     println!(
@@ -710,4 +721,9 @@ fn flint_int4_resident_decode_matches_mlx_oracle() {
     assert!(argmax_ok, "argmax résident divergent sur au moins un pas");
     assert!(max < MAX_GAP_F32, "écart max {max} ≥ {MAX_GAP_F32}");
     assert!(mean < MEAN_GAP_F32, "écart moyen {mean} ≥ {MEAN_GAP_F32}");
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn resident_decode_steps() -> usize {
+    crate::decoder::resident_decode_steps_for_test()
 }
