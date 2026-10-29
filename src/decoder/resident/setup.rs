@@ -140,7 +140,7 @@ impl CausalDecoder {
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn resident_full_decode_unsupported_reason(&self) -> Option<String> {
-        if self.forward_runtime().metal_executor().is_none() {
+        if self.resident_metal().is_none() {
             return Some("executor Metal absent".to_string());
         }
         if self.config.head_dim.is_none() {
@@ -326,7 +326,7 @@ impl CausalDecoder {
         slot: u64,
         kv_bf16: bool,
     ) -> Result<bool> {
-        let Some(metal) = self.forward_runtime().metal_executor() else {
+        let Some(metal) = self.resident_metal() else {
             return Ok(false);
         };
         let Some(base_head_dim) = self.config.head_dim else {
@@ -428,8 +428,14 @@ impl CausalDecoder {
                 let Some(post_norm) = layer.post_attention_norm.as_ref() else {
                     return Ok(false);
                 };
+                // MoE flint : expert partagé sans gate porté par le tail dense,
+                // routé sigmoïde en plus (cf. `FullAttnDenseLayerWeights::sigmoid_moe`).
+                let sigmoid_moe = match layer.mlp.as_ref() {
+                    Some(FeedForward::Moe(mlp)) => mlp.sigmoid_metal_parts(),
+                    _ => None,
+                };
                 match layer.mlp.as_ref() {
-                    Some(FeedForward::Moe(mlp)) => {
+                    Some(FeedForward::Moe(mlp)) if sigmoid_moe.is_none() => {
                         let (pre_feedforward_norm, post_feedforward_norm, layer_scalar) =
                             resolve_gemma_tail_buffers(metal, layer)?;
                         let input_norm = metal.cached_buffer_from_f32(
@@ -520,10 +526,18 @@ impl CausalDecoder {
                             return Ok(false);
                         }
                     }
-                    Some(FeedForward::Dense(mlp)) => {
+                    Some(mlp) => {
+                        let (dense_mlp, sigmoid_moe) = match (mlp, sigmoid_moe) {
+                            (FeedForward::Dense(mlp), _) => (mlp.as_ref(), None),
+                            (FeedForward::Moe(_), Some((router, experts, top_k, shared))) => (
+                                shared,
+                                Some((metal.resolve_moe_routed_weights(router, experts)?, top_k)),
+                            ),
+                            (FeedForward::Moe(_), None) => return Ok(false),
+                        };
                         let (pre_feedforward_norm, post_feedforward_norm, layer_scalar) =
                             resolve_gemma_tail_buffers(metal, layer)?;
-                        let (gate_proj, up_proj, down_proj) = mlp.projections();
+                        let (gate_proj, up_proj, down_proj) = dense_mlp.projections();
                         let dense_inter_dim =
                             gate_proj.weight().shape().first().copied().ok_or_else(|| {
                                 InferError::Dimension(
@@ -541,7 +555,10 @@ impl CausalDecoder {
                             attention.k_proj.weight(),
                             v_proj.weight(),
                         ];
+                        // NOTE: flint (sans porte de sortie, v_proj séparé) n'emploie
+                        // jamais le QKV concaténé : ne pas en payer la copie.
                         let qkv_proj = if decode_resident_full_qkv_concat_enabled()
+                            && !self.config.attention_sinks
                             && !metal.concat_would_duplicate_affine_storage(&qkv_sources)
                         {
                             match metal.resolve_concat_linear_weight_buffers(
@@ -607,6 +624,7 @@ impl CausalDecoder {
                                     "resident_dense_down_proj",
                                 )?,
                                 parallel_moe,
+                                sigmoid_moe,
                             },
                         ));
                     }
@@ -716,16 +734,31 @@ impl CausalDecoder {
             }
             let head_dim = self.config.layer_head_dim(index)?;
             let kv_heads = self.config.layer_num_key_value_heads(index);
+            let sinks = match &self.layers[index].attention {
+                AttentionBlock::Full(attention) => attention.sinks.as_ref(),
+                AttentionBlock::Linear(_) => None,
+            };
             match resident_full_attention_state(
                 &arena,
                 layer_cache,
                 (capacity, prefill_len),
                 (q_heads, kv_heads, head_dim),
                 kv_bf16,
-                self.config.layer_sliding_window(index).is_some(),
+                // Les sinks n'ont pas de variante quantifiée : KV dense, comme
+                // une fenêtre glissante.
+                self.config.layer_sliding_window(index).is_some() || sinks.is_some(),
                 self.memory_guard.as_ref(),
             ) {
-                Ok(full) => layer_cache.full = Some(full),
+                Ok(mut full) => {
+                    if let Some(sinks) = sinks {
+                        full.set_sinks(
+                            &arena,
+                            metal
+                                .cached_buffer_from_f32(sinks.data(), "resident_attention_sinks")?,
+                        )?;
+                    }
+                    layer_cache.full = Some(full);
+                }
                 // Adoption ratée hors budget : decode per-op, comme la garde.
                 Err(InferError::MemoryGuard(error)) => {
                     for layer_cache in &mut cache.layers {
@@ -874,6 +907,7 @@ impl CausalDecoder {
                 )?,
                 fc: metal.resolve_linear_weight_buffers(head.fc.weight(), "resident_mtp_fc")?,
                 layer: ResidentFullDenseBuffers {
+                    sigmoid_moe: None,
                     input_norm: metal.cached_buffer_from_f32(
                         head.layer.input_norm.data(),
                         "resident_mtp_input_norm",

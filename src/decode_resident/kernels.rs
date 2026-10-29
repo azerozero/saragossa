@@ -917,6 +917,199 @@ kernel void attention_decode_2pass_2_d128_f32(
 }
 "#;
 
+/// Attention decode avec **sinks appris** (flint, `softmax_offset`) : un logit
+/// par tête, compté dans le max et ajouté UNE fois au dénominateur, sans valeur.
+///
+/// Source distincte de [`ATTENTION_DECODE_KERNEL`], compilée au premier usage :
+/// les kernels sans sink (Qwen, Gemma) restent textuellement inchangés, donc
+/// bit-identiques. En 2-passes, le sink n'entre qu'en passe 2 (réduction
+/// finale), jamais par partition split-K : l'ajouter à chaque bloc le
+/// compterait `blocks` fois. Le recalage du numérateur quand le sink relève le
+/// maximum passe par le facteur `exp(max_bloc - max)` existant.
+pub(super) const ATTENTION_SINK_KERNELS: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+template <typename T>
+inline void attention_decode_naive_sink(
+    device const float* q,
+    device const T* keys,
+    device const T* values,
+    device float* scores,
+    device float* out,
+    constant uint4& dims,
+    uint window_start,
+    device const float* sinks,
+    threadgroup float* partial,
+    uint tid,
+    uint q_head
+) {
+    const uint q_heads = dims.x;
+    const uint kv_heads = dims.y;
+    const uint head_dim = dims.z;
+    const uint len = dims.w;
+    if (q_head >= q_heads || len == 0u) {
+        return;
+    }
+
+    const uint group = q_heads / kv_heads;
+    const uint kv_head = q_head / group;
+    const uint kv_dim = kv_heads * head_dim;
+    const uint q_start = q_head * head_dim;
+    const uint kv_head_start = kv_head * head_dim;
+    const uint score_base = q_head * len;
+    const float scale = rsqrt(float(head_dim));
+
+    for (uint r = window_start; r < len; ++r) {
+        const uint k_start = r * kv_dim + kv_head_start;
+        float dot = 0.0f;
+        for (uint c = tid; c < head_dim; c += 256u) {
+            dot += q[q_start + c] * float(keys[k_start + c]);
+        }
+        partial[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0u) {
+            scores[score_base + r] = partial[0] * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        const float sink = sinks[q_head];
+        float max_score = sink;
+        for (uint r = window_start; r < len; ++r) {
+            max_score = max(max_score, scores[score_base + r]);
+        }
+        float sum = exp(sink - max_score);
+        for (uint r = window_start; r < len; ++r) {
+            const float value = exp(scores[score_base + r] - max_score);
+            scores[score_base + r] = value;
+            sum += value;
+        }
+        const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        for (uint r = window_start; r < len; ++r) {
+            scores[score_base + r] *= inv_sum;
+        }
+    }
+    // Les probabilités écrites par le thread 0 vivent en mémoire `device` :
+    // seule une barrière `mem_device` les rend visibles aux autres threads.
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (uint c = tid; c < head_dim; c += 256u) {
+        float acc = 0.0f;
+        for (uint r = window_start; r < len; ++r) {
+            acc += scores[score_base + r] * float(values[r * kv_dim + kv_head_start + c]);
+        }
+        out[q_start + c] = acc;
+    }
+}
+
+kernel void attention_decode_naive_sink_f32(
+    device const float* q [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* scores [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    constant uint& window_start [[buffer(6)]],
+    device const float* sinks [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint q_head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float partial[256];
+    attention_decode_naive_sink<float>(
+        q, keys, values, scores, out, dims, window_start, sinks, partial, tid, q_head);
+}
+
+kernel void attention_decode_naive_sink_bf16(
+    device const float* q [[buffer(0)]],
+    device const bfloat* keys [[buffer(1)]],
+    device const bfloat* values [[buffer(2)]],
+    device float* scores [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    constant uint& window_start [[buffer(6)]],
+    device const float* sinks [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint q_head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float partial[256];
+    attention_decode_naive_sink<bfloat>(
+        q, keys, values, scores, out, dims, window_start, sinks, partial, tid, q_head);
+}
+
+// Passe 2 du 2-passes d128 avec sink : identique à
+// `attention_decode_2pass_2_d128_f32`, plus `max(max_blocs, sink)` et
+// `exp(sink - max)` ajouté une fois à la somme réduite.
+kernel void attention_decode_2pass_2_d128_sink_f32(
+    device const float* partials [[buffer(0)]],
+    device const float* sums [[buffer(1)]],
+    device const float* maxs [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& blocks [[buffer(4)]],
+    device const float* sinks [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
+) {
+    constexpr uint BN = 32u;
+    constexpr uint BD = 32u;
+    constexpr uint D = 128u;
+    constexpr uint EPT = D / BD; // 4
+    const uint head_idx = tid.x;
+
+    const device float* part = partials + head_idx * blocks * D + simd_gid * D + simd_lid * EPT;
+    const device float* sm = sums + head_idx * blocks;
+    const device float* mx = maxs + head_idx * blocks;
+    device float* out_ = out + head_idx * D + simd_gid * EPT;
+
+    float o[EPT];
+    for (uint i = 0u; i < EPT; ++i) { o[i] = 0.0f; }
+    threadgroup float outputs[BN * BD];
+
+    const float sink = sinks[head_idx];
+    float max_score = -INFINITY;
+    for (uint b = 0u; b < blocks / BN; ++b) {
+        max_score = max(max_score, mx[simd_lid + BN * b]);
+    }
+    max_score = max(simd_max(max_score), sink);
+
+    float sum_exp = 0.0f;
+    for (uint b = 0u; b < blocks / BN; ++b) {
+        const float factor = fast::exp(mx[simd_lid + BN * b] - max_score);
+        sum_exp += factor * sm[simd_lid + BN * b];
+    }
+    sum_exp = simd_sum(sum_exp) + fast::exp(sink - max_score);
+
+    const device float* mx_b = mx;
+    const device float* part_b = part;
+    for (uint b = 0u; b < blocks / BN; ++b) {
+        const float factor = fast::exp(mx_b[simd_gid] - max_score);
+        for (uint i = 0u; i < EPT; ++i) { o[i] += factor * part_b[i]; }
+        mx_b += BN;
+        part_b += BN * D;
+    }
+
+    for (uint i = 0u; i < EPT; ++i) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float reduced = simd_sum(outputs[simd_gid * BD + simd_lid]);
+        reduced = (sum_exp == 0.0f) ? reduced : (reduced / sum_exp);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lid == 0u) {
+            out_[i] = reduced;
+        }
+    }
+}
+"#;
+
 /// Kernels du gate de sortie full-attn (modèle `attn_output_gate=true`).
 ///
 /// `split_q_gate_f32` désinterleave la projection q_proj `[2*q_dim]` (layout par

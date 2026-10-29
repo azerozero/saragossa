@@ -355,14 +355,71 @@ fn flint_rejects_missing_sink_and_orphan_tensors() {
     assert!(err.to_string().contains("non consommés"), "{err}");
 }
 
+/// Decode résident complet (sinks, NoPE, fenêtre dépassée, MoE sigmoïde et
+/// expert partagé sans gate) contre l'oracle CPU, sur prefill CPU commun.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
-fn flint_refuses_metal_runtime_explicitly() {
-    let model = load(flint_tensors(true)).expect("invariant: flint synthétique");
-    let err = model
+fn synthetic_flint_resident_decode_matches_cpu_oracle() {
+    let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
         .with_metal_runtime()
-        .expect_err("runtime Metal refusé pour flint");
-    assert!(err.to_string().contains("backend CPU"), "{err}");
+        .expect("invariant: runtime Metal attaché pour le decode résident");
+    assert!(gpu.supports_resident_full_decode(), "decode résident flint");
+
+    let prompt = [1, 2, 3];
+    let forced = [4, 0, 5, 6, 3, 2];
+    let mut cache = cpu.empty_cache();
+    let mut expected = Vec::new();
+    for (step, token) in prompt.iter().chain(&forced).enumerate() {
+        let logits = cpu
+            .next_logits_cached(&mut cache, *token)
+            .expect("invariant: oracle CPU");
+        if step >= prompt.len() {
+            expected.push(logits.data().to_vec());
+        }
+    }
+    // KV f32 : seul l'ordre d'accumulation diffère du CPU (écart absolu).
+    // KV bf16 : l'arrondi relatif 2^-9 des K/V, propagé par trois couches,
+    // borne l'écart à 1 % de la plus grande magnitude de logit.
+    for (kv_bf16, rel) in [(false, None), (true, Some(1.0e-2_f32))] {
+        let rows = gpu
+            .resident_forced_logits_for_test(&prompt, &forced, kv_bf16)
+            .expect("invariant: decode résident flint");
+        for (step, (got, want)) in rows.iter().zip(&expected).enumerate() {
+            let gap = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            let scale = want.iter().fold(0.0_f32, |acc, value| acc.max(value.abs()));
+            let eps = rel.map_or(1.0e-4, |rel| rel * scale);
+            assert!(
+                gap <= eps,
+                "pas {step} kv_bf16={kv_bf16}: écart {gap} > {eps}"
+            );
+        }
+    }
+    let steps_before = resident_decode_steps();
+    assert_eq!(
+        gpu.generate_greedy(&prompt, 8)
+            .expect("invariant: greedy GPU"),
+        cpu.generate_greedy(&prompt, 8)
+            .expect("invariant: greedy CPU"),
+        "tokens greedy résident != CPU"
+    );
+    assert!(
+        resident_decode_steps() - steps_before >= 7,
+        "greedy GPU passé par le decode résident"
+    );
+    let err = gpu
+        .generate_greedy_lightbatch_with_options(
+            &[prompt.to_vec()],
+            2,
+            &crate::GenerationOptions::default(),
+        )
+        .expect_err("light-batch refusé pour flint");
+    assert!(err.to_string().contains("light-batch"), "{err}");
 }
 
 /// Lit un `.npy` v1 f32 little-endian (en-tête puis données brutes).
@@ -568,3 +625,105 @@ fn flint_int4_real_weights_match_mlx_oracle() {
 // 3 à 4× sous l'écart propre de mlx bf16 contre mlx f32 (17,0 et 2,6).
 const MAX_GAP_F32: f32 = 6.0;
 const MEAN_GAP_F32: f32 = 1.0;
+
+/// Decode résident Metal de flint-int4 (chargement Metal du CLI, prefill CPU)
+/// contre l'oracle mlx-lm float32 : 16 tokens greedy identiques par le chemin
+/// de production, puis logits GPU sur la continuation de référence forcée.
+///
+/// Mêmes variables d'environnement que [`flint_int4_real_weights_match_mlx_oracle`].
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) et oracle mlx-lm requis"]
+fn flint_int4_resident_decode_matches_mlx_oracle() {
+    let (Some(model_dir), Some(oracle_dir)) = (
+        std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from),
+        std::env::var_os("SARAGOSSA_FLINT_ORACLE_DIR").map(PathBuf::from),
+    ) else {
+        eprintln!(
+            "test flint Metal sauté : définir SARAGOSSA_FLINT_MODEL_DIR et \
+             SARAGOSSA_FLINT_ORACLE_DIR"
+        );
+        return;
+    };
+    let oracle: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(oracle_dir.join("oracle.json")).expect("invariant: oracle.json"),
+    )
+    .expect("invariant: oracle JSON");
+    let prompt_ids = oracle_ids(&oracle, "ids");
+    let greedy_ids = oracle_ids(&oracle, "greedy");
+
+    let started = std::time::Instant::now();
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    // Même séquence que `saragossa run` (main.rs, `load_decoder_metal`).
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+        .expect("invariant: flint-int4 chargeable en Metal")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    println!("chargement Metal: {:.1?}", started.elapsed());
+    assert!(
+        model.supports_resident_full_decode(),
+        "decode résident complet attendu pour flint"
+    );
+
+    let steps_before = resident_decode_steps();
+    let output = model
+        .generate_greedy_timed_with_options(
+            &prompt_ids,
+            greedy_ids.len(),
+            &crate::GenerationOptions::default(),
+        )
+        .expect("invariant: génération résidente");
+    assert_eq!(
+        resident_decode_steps() - steps_before,
+        output.timings.decode_tokens,
+        "chaque pas de decode doit passer par le decode résident Metal"
+    );
+    let timings = &output.timings;
+    let decode_secs = timings.decode.as_secs_f64();
+    println!(
+        "prefill (CPU) {} tokens: {:.1?} ; decode résident {} tokens: {:.1?} → {:.1} tok/s",
+        prompt_ids.len(),
+        timings.prefill,
+        timings.decode_tokens,
+        timings.decode,
+        timings.decode_tokens as f64 / decode_secs.max(f64::EPSILON)
+    );
+    println!("tokens résidents={:?}", output.tokens);
+    assert_eq!(
+        output.tokens, greedy_ids,
+        "tokens greedy résidents divergents"
+    );
+
+    // Logits GPU des pas 1..16 : continuation de référence forcée, comparée
+    // ligne à ligne aux logits mlx (la ligne 0 vient du prefill CPU).
+    let rows = model
+        .resident_forced_logits_for_test(&prompt_ids, &greedy_ids[..greedy_ids.len() - 1], false)
+        .expect("invariant: logits résidents");
+    let (_, reference) = read_npy_f32(&oracle_dir.join("oracle_greedy_logits.npy"));
+    let vocab = rows[0].len();
+    let (mut max, mut mean, mut argmax_ok) = (0.0_f32, 0.0_f32, true);
+    for (index, row) in rows.iter().enumerate() {
+        let step = index + 1;
+        let gap = compare_rows(
+            &format!("résident greedy[{step}]"),
+            row,
+            &reference[step * vocab..(step + 1) * vocab],
+        );
+        max = max.max(gap.max);
+        mean = mean.max(gap.mean);
+        argmax_ok &= gap.same_argmax;
+    }
+    println!("résident contre mlx-f32: pire max={max:.4}, pire moyenne={mean:.5}");
+    // Le decode résident calcule en f32 (KV f32 en greedy court) la même
+    // formule que l'oracle CPU ; seuls l'ordre d'accumulation et les kernels
+    // diffèrent. Les seuils CPU contre mlx f32 s'appliquent donc tels quels.
+    assert!(argmax_ok, "argmax résident divergent sur au moins un pas");
+    assert!(max < MAX_GAP_F32, "écart max {max} ≥ {MAX_GAP_F32}");
+    assert!(mean < MEAN_GAP_F32, "écart moyen {mean} ≥ {MEAN_GAP_F32}");
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn resident_decode_steps() -> usize {
+    crate::decoder::resident_decode_steps_for_test()
+}

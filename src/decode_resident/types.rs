@@ -65,6 +65,9 @@ pub(crate) struct FullAttnDenseLayerWeights<'a> {
     pub down_proj: &'a MetalLinearWeightBuffers,
     pub tail_score: &'a Buffer,
     pub parallel_moe: Option<GemmaParallelMoeTailWeights<'a>>,
+    /// MoE routé sigmoïde flint `(poids, top_k)` : `gate/up/down` portent alors
+    /// l'expert partagé sans gate, sommé avec un score de 1,0.
+    pub sigmoid_moe: Option<(&'a MetalMoeRoutedWeights, usize)>,
 }
 
 /// Dimensions + paramètres RoPE d'UNE couche full-attn de decode résident.

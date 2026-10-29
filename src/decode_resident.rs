@@ -67,6 +67,8 @@ mod types;
 mod utils;
 
 #[cfg(test)]
+mod sink_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) use self::arena::{
@@ -123,6 +125,8 @@ pub(crate) struct DecodeResidentState {
     rows_kernels: OnceLock<rows::RowsKernels>,
     /// Kernels du KV quantifié, compilés au premier KV quantifié construit.
     kv_quant_kernels: OnceLock<kv_quant::KvQuantKernels>,
+    /// Kernels d'attention avec sinks appris (flint), compilés au premier usage.
+    sink_kernels: OnceLock<attention::SinkKernels>,
     /// Instrumentation per-section (tranche 3), active si `SARAGOSSA_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,
     /// Slot de flux (light-batch) : namespace du scratch label-keyed de

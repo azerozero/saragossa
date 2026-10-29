@@ -677,6 +677,30 @@ impl MoeMlp {
             })
     }
 
+    /// Renvoie les poids du MoE flint pour le decode résident : routeur
+    /// sigmoïde, experts routés et expert partagé sans gate. `None` pour tout
+    /// autre contrat (softmax, gate partagée, normes ou échelles Gemma), ou
+    /// si un poids porte un biais : les buffers résidents n'en transmettent
+    /// aucun, l'ignorer donnerait un résultat faux.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn sigmoid_metal_parts(&self) -> Option<(&Linear, &[GatedMlp], usize, &GatedMlp)> {
+        let shared = self.ungated_shared_expert.as_ref()?;
+        let plain_swiglu = |mlp: &GatedMlp| {
+            mlp.activation == Activation::Silu
+                && [&mlp.gate_proj, &mlp.up_proj, &mlp.down_proj]
+                    .iter()
+                    .all(|projection| projection.bias().is_none())
+        };
+        (self.router_score == RouterScore::Sigmoid
+            && self.shared_expert.is_none()
+            && self.router_norm.is_none()
+            && self.per_expert_scale.is_none()
+            && self.router.bias().is_none()
+            && plain_swiglu(shared)
+            && self.experts.iter().all(plain_swiglu))
+        .then_some((&self.router, self.experts.as_slice(), self.top_k, shared))
+    }
+
     fn top_weights(&self, logits: &[f32]) -> Result<Vec<(usize, f32)>> {
         let (top, weights) = match self.router_score {
             RouterScore::Softmax => {
@@ -839,7 +863,7 @@ fn sigmoid(value: f32) -> f32 {
 /// Routage sigmoïde flint : top-k sur les scores `sigmoid(logit)` (pas sur les
 /// logits, pour départager comme la référence les scores saturés à 1,0 en
 /// f32), puis poids = score / somme des scores retenus.
-fn sigmoid_top_weights(logits: &[f32], top_k: usize) -> (Vec<usize>, Vec<f32>) {
+pub(crate) fn sigmoid_top_weights(logits: &[f32], top_k: usize) -> (Vec<usize>, Vec<f32>) {
     let scores = logits.iter().copied().map(sigmoid).collect::<Vec<_>>();
     let top = top_k_indices(&scores, top_k);
     let selected = top.iter().map(|idx| scores[*idx]).collect::<Vec<_>>();

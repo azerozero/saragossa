@@ -268,7 +268,37 @@ impl DecodeResidentState {
             copy_at_f32_to_bf16: self.copy_at_f32_to_bf16_kernel.clone(),
             copy_at_bf16: self.copy_at_bf16_kernel.clone(),
             copy_at_bf16_to_f32: self.copy_at_bf16_to_f32_kernel.clone(),
+            sinks: None,
         })
+    }
+
+    /// Compile (une fois) les kernels d'attention avec sinks.
+    fn sink_kernels(&self) -> Result<&SinkKernels> {
+        if let Some(kernels) = self.sink_kernels.get() {
+            return Ok(kernels);
+        }
+        let mut pipelines = super::kernels::compile_kernels(
+            &self.device,
+            super::kernels::ATTENTION_SINK_KERNELS,
+            &[
+                "attention_decode_naive_sink_f32",
+                "attention_decode_naive_sink_bf16",
+                "attention_decode_2pass_2_d128_sink_f32",
+            ],
+            true,
+        )?
+        .into_iter();
+        let mut next = || {
+            pipelines
+                .next()
+                .ok_or_else(|| InferError::Metal("pipeline sink absent".to_string()))
+        };
+        let kernels = SinkKernels {
+            naive_f32: next()?,
+            naive_bf16: next()?,
+            two_pass_2_d128: next()?,
+        };
+        Ok(self.sink_kernels.get_or_init(|| kernels))
     }
 
     /// Désinterleave la projection q_proj `[2·q_dim]` (gate de sortie full-attn) en
@@ -742,9 +772,75 @@ pub(crate) struct FullAttentionMetalState {
     copy_at_f32_to_bf16: ComputePipelineState,
     copy_at_bf16: ComputePipelineState,
     copy_at_bf16_to_f32: ComputePipelineState,
+    /// Sinks appris par tête (flint) et leurs kernels ; `None` = attention
+    /// historique, kernels sans sink inchangés.
+    sinks: Option<AttentionSinks>,
+}
+
+/// Pipelines de l'attention decode avec sinks (source distincte, cf.
+/// `ATTENTION_SINK_KERNELS`).
+#[derive(Clone, Debug)]
+pub(crate) struct SinkKernels {
+    naive_f32: ComputePipelineState,
+    naive_bf16: ComputePipelineState,
+    two_pass_2_d128: ComputePipelineState,
+}
+
+/// Buffer `[q_heads]` f32 des sinks d'une couche et kernels associés.
+#[derive(Clone, Debug)]
+struct AttentionSinks {
+    buffer: Buffer,
+    kernels: SinkKernels,
 }
 
 impl FullAttentionMetalState {
+    /// Attache les sinks appris `[q_heads]` (f32) de la couche : l'attention
+    /// decode passe alors par les kernels avec sink (naïf fenêtré ou 2-passes
+    /// d128), jamais par le flash. Refusé sur un KV quantifié, dont le 2-passes
+    /// n'a pas de variante avec sink.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le KV est quantifié, si le buffer est trop court ou
+    /// si la compilation des kernels échoue.
+    pub(crate) fn set_sinks(&mut self, arena: &DecodeResidentState, buffer: Buffer) -> Result<()> {
+        if self.quant.is_some() {
+            return Err(InferError::Config(format!(
+                "sinks d'attention sur KV {:?} non supportés",
+                self.format
+            )));
+        }
+        let needed = self
+            .q_heads
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| InferError::Dimension("sinks: taille déborde".to_string()))?;
+        if buffer.length() < needed {
+            return Err(InferError::Dimension(format!(
+                "sinks: buffer de {} octets, attendu {needed}",
+                buffer.length()
+            )));
+        }
+        // Le setup a déjà replié ce KV en dense : signalé une fois, comme le
+        // repli `KV_QUANT` des couches sans attention quantifiée.
+        if crate::runtime_flags::kv_quant_format().is_quantized() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!("SARAGOSSA_RUST_KV_QUANT ignoré (couches à sinks) : KV résident dense");
+            });
+        }
+        self.sinks = Some(AttentionSinks {
+            buffer,
+            kernels: arena.sink_kernels()?.clone(),
+        });
+        Ok(())
+    }
+
+    /// Indique si la couche porte des sinks (chemins en lignes refusés).
+    pub(super) fn has_sinks(&self) -> bool {
+        self.sinks.is_some()
+    }
+
     /// Renvoie la dimension d'une ligne KV (`kv_heads * head_dim`).
     pub(crate) fn kv_dim(&self) -> usize {
         self.kv_heads * self.head_dim
@@ -1303,6 +1399,13 @@ impl FullAttentionMetalState {
         rows: &GpuPositionRows<'_>,
         row: usize,
     ) -> Result<()> {
+        // Ce chemin (bloc MTP) suppose une fenêtre nulle et n'a pas de variante
+        // avec sink : refus explicite plutôt qu'une attention fausse.
+        if self.sinks.is_some() {
+            return Err(InferError::Config(
+                "attention en position GPU avec sinks ou fenêtre non supportée".to_string(),
+            ));
+        }
         let len_bound = rows
             .position()
             .max_position
@@ -1338,6 +1441,18 @@ impl FullAttentionMetalState {
         sdpa_dims: U32x4Param<'_>,
         two_pass_dims: U32x4Param<'_>,
     ) -> Result<()> {
+        if let Some(sinks) = &self.sinks {
+            return self.encode_attention_decode_sink(
+                encoder,
+                q_buf,
+                scores_buf,
+                out_buf,
+                window_start,
+                len_bound,
+                (sdpa_dims, two_pass_dims),
+                sinks,
+            );
+        }
         // KV quantifié : 2-passes quelle que soit la longueur, seul kernel qui
         // le lit (aucune variante flash ni naïve). Les fenêtres glissantes sont
         // exclues dès la construction (`full_attention_dense`).
@@ -1354,6 +1469,7 @@ impl FullAttentionMetalState {
                 out_buf,
                 len_bound,
                 two_pass_dims,
+                None,
             );
         }
         // Bascule 2-passes split-K pour les longs KV (dédup GQA + tuiles L1) :
@@ -1373,6 +1489,7 @@ impl FullAttentionMetalState {
                 out_buf,
                 len_bound,
                 two_pass_dims,
+                None,
             );
         }
         // Le chemin fenêtré privilégie d'abord la correction : le kernel naïf
@@ -1424,6 +1541,83 @@ impl FullAttentionMetalState {
         Ok(())
     }
 
+    /// Attention decode d'une couche à sinks. Fenêtre nulle, d128 et GQA réelle :
+    /// 2-passes avec le sink en passe 2 (quelle que soit la longueur, les blocs
+    /// vides étant neutralisés par la passe 2). Sinon naïf fenêtré avec sink.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: buffers + fenêtre + borne + dims + sinks"
+    )]
+    fn encode_attention_decode_sink(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buf: &BufferRef,
+        scores_buf: &BufferRef,
+        out_buf: &BufferRef,
+        window_start: usize,
+        len_bound: usize,
+        (sdpa_dims, two_pass_dims): (U32x4Param<'_>, U32x4Param<'_>),
+        sinks: &AttentionSinks,
+    ) -> Result<()> {
+        // La passe 1 lance `32 × gqa` threads par threadgroup : borne par le
+        // pipeline, sinon naïf (comme une GQA non divisible).
+        let gqa = self.q_heads / self.kv_heads.max(1);
+        let pass1_threads = match self.keys.element() {
+            GpuElement::Bf16 => &self.attention_2pass_1_d128_bf16,
+            _ => &self.attention_2pass_1_d128,
+        }
+        .max_total_threads_per_threadgroup();
+        let two_pass = window_start == 0
+            && sdpa_2pass_enabled()
+            && self.head_dim == 128
+            && gqa > 1
+            && self.q_heads % self.kv_heads == 0
+            && u64::try_from(32 * gqa).is_ok_and(|threads| threads <= pass1_threads);
+        if two_pass {
+            return self.encode_attention_decode_2pass(
+                encoder,
+                q_buf,
+                out_buf,
+                len_bound,
+                two_pass_dims,
+                Some(sinks),
+            );
+        }
+        // ponytail: naïf sériel sur la fenêtre (513 lignes flint) ; un 2-passes
+        // fenêtré avec sink viendra si le decode des couches glissantes domine.
+        let pipeline = match self.keys.element() {
+            GpuElement::F32 => &sinks.kernels.naive_f32,
+            GpuElement::Bf16 => &sinks.kernels.naive_bf16,
+            element @ (GpuElement::U32 | GpuElement::U8) => {
+                return Err(InferError::Metal(format!(
+                    "attention_decode sink sur KV {element:?} invalide"
+                )));
+            }
+        };
+        let window_start = u32::try_from(window_start)
+            .map_err(|_| InferError::Dimension("window_start hors u32".to_string()))?;
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(self.keys.buffer()), 0);
+        encoder.set_buffer(2, Some(self.values.buffer()), 0);
+        encoder.set_buffer(3, Some(scores_buf), 0);
+        encoder.set_buffer(4, Some(out_buf), 0);
+        sdpa_dims.bind(encoder, 5);
+        encoder.set_bytes(
+            6,
+            std::mem::size_of::<u32>() as u64,
+            std::ptr::from_ref(&window_start).cast::<c_void>(),
+        );
+        encoder.set_buffer(7, Some(&sinks.buffer), 0);
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(to_u32(self.q_heads, "q_heads")?), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
     /// SDPA decode 2-passes split-K (head_dim 128/256) dans l'encoder partagé. Passe 1 :
     /// un threadgroup par `(kv_head, bloc)`, `gqa` simdgroups (un q_head chacun) → les
     /// lectures KV redondantes du groupe GQA touchent le L1, pas la DRAM ; la longueur
@@ -1433,6 +1627,9 @@ impl FullAttentionMetalState {
     /// # Errors
     ///
     /// Renvoie une erreur si une dimension déborde ou si l'allocation scratch échoue.
+    ///
+    /// `sinks = Some` remplace la passe 2 d128 par sa variante avec sink (passe 1
+    /// inchangée : le sink ne touche aucune partition).
     fn encode_attention_decode_2pass(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1440,6 +1637,7 @@ impl FullAttentionMetalState {
         out_buf: &BufferRef,
         len_bound: usize,
         dims: U32x4Param<'_>,
+        sinks: Option<&AttentionSinks>,
     ) -> Result<()> {
         // Grille dimensionnée par la borne : en position GPU, les blocs au-delà de
         // la longueur effective restent vides (max=-inf, somme 0) et la passe 2
@@ -1499,10 +1697,16 @@ impl FullAttentionMetalState {
         crate::metal_backend::post_dispatch_barrier(encoder);
 
         // Passe 2 : réduction des blocs par q_head.
-        let pass2 = match self.head_dim {
-            256 => &self.attention_2pass_2,
-            128 => &self.attention_2pass_2_d128,
-            other => {
+        let pass2 = match (self.head_dim, sinks) {
+            (128, Some(sinks)) => &sinks.kernels.two_pass_2_d128,
+            (other, Some(_)) => {
+                return Err(InferError::Metal(format!(
+                    "attention_decode 2pass avec sink head_dim={other} non supporté"
+                )));
+            }
+            (256, None) => &self.attention_2pass_2,
+            (128, None) => &self.attention_2pass_2_d128,
+            (other, None) => {
                 return Err(InferError::Metal(format!(
                     "attention_decode 2pass pass2 head_dim={other} non supporté"
                 )));
@@ -1518,6 +1722,9 @@ impl FullAttentionMetalState {
             std::mem::size_of::<u32>() as u64,
             std::ptr::from_ref(&blocks_u32).cast::<c_void>(),
         );
+        if let Some(sinks) = sinks {
+            encoder.set_buffer(5, Some(&sinks.buffer), 0);
+        }
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(u64::from(to_u32(self.q_heads, "2pass q_heads")?), 1, 1),

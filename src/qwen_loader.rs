@@ -344,14 +344,9 @@ fn load_causal_decoder_from_shards_for_metal(
     executor: &crate::MetalExecutor,
 ) -> Result<CausalDecoder> {
     validate_supported_config(config, catalog)?;
-    // Refus avant de lire 20 Go de poids : aucun chemin Metal ne connaît ce
-    // contrat (cf. `CausalDecoderConfig::metal_unsupported_reason`).
-    if let Some(reason) = crate::CausalDecoderConfig::from(config).metal_unsupported_reason() {
-        return Err(InferError::Config(format!(
-            "backend Metal non supporté pour {} ({reason}) : utiliser le backend CPU",
-            config.model_type
-        )));
-    }
+    // NOTE: Un modèle hors chemins per-op (flint, cf.
+    // `CausalDecoderConfig::metal_unsupported_reason`) se charge quand même :
+    // son prefill reste CPU et seul le decode résident complet emploie Metal.
     let prefixes = QwenPrefixes::detect(catalog);
     let context = DecoderLoadContext::metal(executor);
     let tensors = load_decoder_tensors_with_context(config, shards, catalog, &prefixes, &context)?;

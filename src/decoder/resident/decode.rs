@@ -1,6 +1,12 @@
 use super::super::*;
 use super::types::*;
 
+/// Pas encodés par le decode résident complet : prouve en test qu'une
+/// génération est passée par ce chemin, pas par un repli per-op.
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) static RESIDENT_DECODE_STEPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl CausalDecoder {
     /// Forward d'UN token de decode par le chemin résident COMPLET (1c) : embed
     /// gather (CPU, input upload) → boucle des 40 couches en **UN** command buffer →
@@ -75,6 +81,57 @@ impl CausalDecoder {
             .ok_or_else(|| InferError::Metal("decode résident sans token".to_string()))?;
         usize::try_from(raw)
             .map_err(|_| InferError::Metal(format!("token résident hors usize: {raw}")))
+    }
+
+    /// Oracle de test : prefill (CPU pour flint) de `prompt`, puis decode résident
+    /// complet des tokens `forced` ; renvoie les logits GPU bruts de chaque pas,
+    /// relus depuis le lm_head résident. Erreur si l'arène ne s'établit pas,
+    /// pour qu'un repli per-op silencieux ne passe pas pour un succès.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le decode résident est indisponible ou échoue.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn resident_forced_logits_for_test(
+        &self,
+        prompt: &[usize],
+        forced: &[usize],
+        kv_bf16: bool,
+    ) -> Result<Vec<Vec<f32>>> {
+        let (mut cache, _) = self.prefill_cache_state(prompt)?;
+        if !self.supports_resident_full_decode()
+            || !self.setup_resident_full_decode(&mut cache, forced.len(), 0, kv_bf16)?
+        {
+            return Err(InferError::Config(
+                "decode résident complet indisponible".to_string(),
+            ));
+        }
+        let mut rows = Vec::with_capacity(forced.len());
+        for &token in forced {
+            let spec = ResidentSampleSpec {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 0,
+                rng_state: 0,
+                mode: ResidentSampleMode::Readback,
+            };
+            let inflight = self.enqueue_decode_token_resident(
+                &mut cache,
+                ResidentDecodeInput::CpuToken(token),
+                None,
+                None,
+                Some(spec),
+            )?;
+            crate::metal_backend::wait_for_completion(&inflight.command_buffer)?;
+            let readback = inflight
+                .logits_readback
+                .ok_or_else(|| InferError::Metal("logits résidents absents".to_string()))?;
+            rows.push(crate::metal_backend::read_f32_buffer(
+                &readback.buffer,
+                readback.len,
+            )?);
+        }
+        Ok(rows)
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -188,11 +245,13 @@ impl CausalDecoder {
         pipeline_slot: Option<usize>,
         sample: Option<ResidentSampleSpec>,
     ) -> Result<ResidentDecodeInflight> {
-        let Some(metal) = self.forward_runtime().metal_executor() else {
+        let Some(metal) = self.resident_metal() else {
             return Err(InferError::Metal(
                 "decode résident sans executor Metal".to_string(),
             ));
         };
+        #[cfg(test)]
+        RESIDENT_DECODE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let theta = self.config.rope_theta.ok_or_else(|| {
             InferError::Config("rope_theta manquant (decode résident)".to_string())
         })?;

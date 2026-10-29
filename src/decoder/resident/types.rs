@@ -102,7 +102,10 @@ pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Op
             if layer.pre_feedforward_norm.is_some() && mlp.shared_metal_parts().is_some() {
                 return Some("MoE Gemma shared non supporté".to_string());
             }
-            if mlp.shared_metal_parts().is_none() && mlp.metal_parts().is_none() {
+            if mlp.shared_metal_parts().is_none()
+                && mlp.metal_parts().is_none()
+                && mlp.sigmoid_metal_parts().is_none()
+            {
                 return Some("MoE non encodable Metal".to_string());
             }
         }

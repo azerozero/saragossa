@@ -37,7 +37,7 @@ mod attention_ops;
 mod kv_rows;
 #[cfg(test)]
 pub(crate) use attention_ops::{
-    gemma_global_attention_prefill_oracle, GemmaGlobalAttentionOracleSpec,
+    attention_probs_in_place, gemma_global_attention_prefill_oracle, GemmaGlobalAttentionOracleSpec,
 };
 mod duo;
 pub(crate) mod flags;
@@ -59,6 +59,12 @@ pub fn force_resident_full_linear_decode() {
 
 #[cfg(test)]
 mod flint_oracle_tests;
+
+/// Compte les pas encodés par le decode résident complet (tests flint).
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn resident_decode_steps_for_test() -> usize {
+    resident::RESIDENT_DECODE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+}
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
 #[cfg(test)]
@@ -771,6 +777,9 @@ struct ResidentFullDenseBuffers {
     up_proj: MetalLinearWeightBuffers,
     down_proj: MetalLinearWeightBuffers,
     parallel_moe: Option<ResidentGemmaParallelMoeBuffers>,
+    /// MoE routé sigmoïde flint `(poids, top_k)` ; `gate/up/down` sont alors
+    /// ceux de l'expert partagé sans gate.
+    sigmoid_moe: Option<(MetalMoeRoutedWeights, usize)>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -788,6 +797,10 @@ struct ResidentGemmaParallelMoeBuffers {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 impl ResidentFullDenseBuffers {
+    fn sigmoid_moe_weights(&self) -> Option<(&MetalMoeRoutedWeights, usize)> {
+        self.sigmoid_moe.as_ref().map(|(moe, top_k)| (moe, *top_k))
+    }
+
     fn parallel_moe_weights(&self) -> Option<GemmaParallelMoeTailWeights<'_>> {
         let parallel = self.parallel_moe.as_ref()?;
         Some(GemmaParallelMoeTailWeights {
@@ -1150,7 +1163,13 @@ impl CausalDecoderConfig {
             kv_heads: self.layer_num_key_value_heads(layer_index),
             head_dim,
             attn_scalar: self.query_pre_attn_scalar.unwrap_or(head_dim as f32),
-            rope_dims: self.layer_rope_dims(layer_index, head_dim),
+            // NoPE (flint) : `rope_dims = 0` garde la QK-RMSNorm du kernel
+            // fusionné et saute la rotation.
+            rope_dims: if self.is_no_rope_layer(layer_index) {
+                0
+            } else {
+                self.layer_rope_dims(layer_index, head_dim)
+            },
             rope_frequency_dim: self.layer_rope_frequency_dim(layer_index, head_dim),
             position,
             window_start: 0,
@@ -1165,13 +1184,14 @@ impl CausalDecoderConfig {
         self.no_rope_layers.contains(&layer_index)
     }
 
-    /// Renvoie la raison pour laquelle les chemins Metal ne connaissent pas
-    /// ce modèle, ou `None` s'ils le couvrent.
+    /// Renvoie la raison pour laquelle les chemins Metal per-op, spéculatifs
+    /// et de prefill ne connaissent pas ce modèle, ou `None` s'ils le couvrent.
     ///
-    /// Les kernels Metal (per-op, decode et prefill résidents, MTP, DFlash)
+    /// Ces kernels (per-op, prefill résident, MTP, DFlash, light-batch)
     /// ignorent les sinks, le NoPE, le routeur sigmoïde et l'expert partagé
     /// sans gate : les laisser tourner produirait un résultat faux sans
-    /// erreur. Le support Metal de flint viendra avec ses kernels dédiés.
+    /// erreur. Seul le decode résident complet couvre flint ; pour un tel
+    /// modèle, le runtime Metal ne sert qu'à lui (prefill CPU).
     pub fn metal_unsupported_reason(&self) -> Option<&'static str> {
         if self.attention_sinks {
             Some("sinks d'attention appris (softmax_offset)")
@@ -1979,7 +1999,11 @@ impl CausalDecoder {
     ) -> Result<bool> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
-            if !self.supports_resident_full_decode() {
+            // Le pas depuis embedding (`next_resident_embedding_step`) n'emploie
+            // que le runtime per-op : hors périmètre pour flint, pas d'arène.
+            if self.config.metal_unsupported_reason().is_some()
+                || !self.supports_resident_full_decode()
+            {
                 return Ok(false);
             }
             // Chemins greedy (TTS talker argmax, spéculatif/DFlash) → KV f32 exact.
@@ -2119,7 +2143,6 @@ impl CausalDecoder {
     /// Renvoie une erreur si Metal est indisponible ou si un kernel ne compile pas.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn with_metal_runtime(mut self) -> Result<Self> {
-        self.ensure_metal_supported()?;
         let executor = crate::MetalExecutor::new()?;
         self.enable_single_copy_weights(&executor)?;
         self.runtime.metal = Some(Arc::new(executor));
@@ -2133,13 +2156,12 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si la conversion single-copy d'un poids est invalide.
     pub fn with_metal_executor(mut self, executor: crate::MetalExecutor) -> Result<Self> {
-        self.ensure_metal_supported()?;
         self.enable_single_copy_weights(&executor)?;
         self.runtime.metal = Some(Arc::new(executor));
         Ok(self)
     }
 
-    /// Refuse les chemins Metal et spéculatifs pour un modèle qu'ils ne
+    /// Refuse les chemins Metal per-op et spéculatifs pour un modèle qu'ils ne
     /// connaissent pas (flint) : erreur explicite plutôt qu'un résultat faux.
     fn ensure_metal_supported(&self) -> Result<()> {
         match self.config.metal_unsupported_reason() {
@@ -2184,6 +2206,10 @@ impl CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn warmup_and_release_cpu_weights(&mut self, prompt: &[usize]) -> Result<usize> {
         if self.runtime.cpu_weights_released {
+            return Ok(0);
+        }
+        // Prefill CPU (flint) : ses poids CPU restent indispensables.
+        if self.config.metal_unsupported_reason().is_some() {
             return Ok(0);
         }
         // La libération CPU n'est prouvée byte-identique que sur les modèles
@@ -2389,12 +2415,25 @@ impl CausalDecoder {
         }
     }
 
+    /// Runtime des chemins per-op, de prefill et spéculatifs : CPU pour un
+    /// modèle que leurs kernels ne connaissent pas (flint), qui n'emploie Metal
+    /// que via [`Self::resident_metal`].
     fn forward_runtime(&self) -> ForwardRuntime<'_> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(metal) = self.runtime.metal.as_deref() {
+        if let Some(metal) = self
+            .resident_metal()
+            .filter(|_| self.config.metal_unsupported_reason().is_none())
+        {
             return ForwardRuntime::metal(metal);
         }
         ForwardRuntime::cpu()
+    }
+
+    /// Executor du decode résident complet, seul chemin Metal couvrant flint.
+    /// Identique à `forward_runtime().metal_executor()` pour les autres modèles.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn resident_metal(&self) -> Option<&crate::MetalExecutor> {
+        self.runtime.metal.as_deref()
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]

@@ -645,6 +645,13 @@ impl FullAttentionMetalState {
                 "attention rows: rows={rows} hors [1, len={len}]"
             )));
         }
+        // Les kernels en lignes n'ont pas de variante avec sink : refus
+        // explicite plutôt qu'une attention fausse (MTP, DFlash, prefill résident).
+        if self.has_sinks() {
+            return Err(InferError::Config(
+                "attention en lignes avec sinks non supportée".to_string(),
+            ));
+        }
         let (q_heads, kv_heads, head_dim) = (self.q_heads(), self.kv_heads(), self.head_dim());
         let gqa = q_heads / kv_heads.max(1);
         let len0 = len - rows + 1;
