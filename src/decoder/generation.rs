@@ -754,7 +754,8 @@ impl CausalDecoder {
             });
         }
         let prefill_started = Instant::now();
-        let (cache, final_state) = self.prefill_cache_state(prompt)?;
+        let (cache, final_state) =
+            with_prefill_kv_reserve(max_new_tokens, || self.prefill_cache_state(prompt))?;
         // Decode résident COMPLET (1c) si le flag est ON ET le modèle est supporté
         // (validation en amont, tout-ou-rien). Sinon, decode résident full-attn (1b)
         // si son flag est ON : alloue/seed le KV GPU des couches full-attn.
@@ -794,7 +795,8 @@ impl CausalDecoder {
             });
         }
         let prefill_started = Instant::now();
-        let (cache, final_state) = self.prefill_cache_state(prompt)?;
+        let (cache, final_state) =
+            with_prefill_kv_reserve(max_new_tokens, || self.prefill_cache_state(prompt))?;
         let prefill = prefill_started.elapsed();
         self.generate_greedy_timed_from_prompt_state_with_options_and_callback(
             CausalDecoderPromptState::new(cache, final_state),
@@ -1361,6 +1363,7 @@ impl CausalDecoder {
         };
         let mut lookup = (lookup_draft > 0).then(|| NgramLookup::new(prompt));
         let draft_headroom = max_draft_tokens.max(lookup_draft);
+        let decode_reserve = max_new_tokens.saturating_add(draft_headroom);
 
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let trace_setup = mtp_setup_trace_enabled();
@@ -1391,10 +1394,14 @@ impl CausalDecoder {
                     Ok(!early_stop)
                 };
                 let (cache, final_state, mtp_history, reused) =
-                    self.prefill_cache_state_with_mtp_history(prompt, &mut on_final_state)?;
+                    with_prefill_kv_reserve(decode_reserve, || {
+                        self.prefill_cache_state_with_mtp_history(prompt, &mut on_final_state)
+                    })?;
                 (cache, final_state, Some(mtp_history), reused)
             } else {
-                let (cache, final_state, reused) = self.prefill_cache_state_reused(prompt)?;
+                let (cache, final_state, reused) = with_prefill_kv_reserve(decode_reserve, || {
+                    self.prefill_cache_state_reused(prompt)
+                })?;
                 (cache, final_state, None, reused)
             };
         if let Some(t) = t_prefill {

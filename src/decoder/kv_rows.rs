@@ -200,6 +200,20 @@ impl KvRows {
         }
     }
 
+    /// Buffer bf16 dont le premier segment est la vue entière (non tronquée,
+    /// depuis le début) et nombre d'éléments de cette vue : une arène de
+    /// decode peut l'adopter et écrire à la suite, aucune vue ne couvrant
+    /// d'élément au-delà (cf. `FullAttentionMetalState::full_attention_adopting`).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn adoptable_bf16_prefix(&self) -> Option<(metal::Buffer, usize)> {
+        match self.segments.first().map(AsRef::as_ref) {
+            Some(Segment::SharedBf16(rows)) if rows.is_whole() => {
+                Some((rows.buffer().to_owned(), rows.len()))
+            }
+            _ => None,
+        }
+    }
+
     /// Ajoute le K ou V d'un prefill résident, vue GPU comprise, sans copie.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn push_prefill(&mut self, rows: crate::metal_backend::PrefillKvRows) {
@@ -329,5 +343,31 @@ mod tests {
         rows.truncate(3);
         assert_eq!(rows.to_vec(), vec![1.0, -2.0, 0.5]);
         assert_eq!(snapshot.to_vec(), vec![1.0, -2.0, 0.5, 3.0]);
+    }
+
+    /// Seule la vue entière d'un prefill bf16 est adoptable : un clone
+    /// tronqué laisserait l'arène écrire dans des lignes encore vues par un
+    /// autre état (snapshot plus long).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn only_whole_bf16_prefill_view_is_adoptable() -> crate::Result<()> {
+        let Some(device) = metal::Device::system_default() else {
+            return Ok(());
+        };
+        let buffer = device.new_buffer(64, metal::MTLResourceOptions::StorageModeShared);
+        // SAFETY: buffer neuf propre au test, jamais écrit.
+        #[expect(unsafe_code, reason = "vue partagée sur un buffer de test")]
+        let view = unsafe { crate::metal_backend::SharedBf16Rows::new(buffer, 0, 16)? };
+        let mut rows = KvRows::default();
+        rows.push_prefill(crate::metal_backend::PrefillKvRows::SharedBf16(view));
+        assert_eq!(rows.adoptable_bf16_prefix().map(|(_, len)| len), Some(16));
+        let mut truncated = rows.clone();
+        truncated.truncate(8);
+        assert!(truncated.adoptable_bf16_prefix().is_none());
+        assert!(rows.adoptable_bf16_prefix().is_some());
+        // Une queue possédée après la vue n'empêche pas l'adoption du préfixe.
+        rows.push_owned_bf16(vec![0; 8]);
+        assert_eq!(rows.adoptable_bf16_prefix().map(|(_, len)| len), Some(16));
+        Ok(())
     }
 }

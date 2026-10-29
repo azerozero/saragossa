@@ -363,7 +363,23 @@ fn resolve_kv_bf16(env_override: Option<bool>, default_bf16: bool) -> bool {
 /// Une arène dont le défaut est bf16 (prompt long) reste-t-elle en bf16 dense,
 /// ni forcée en f32 ni quantifiée ? Condition du K/V de prefill stocké en bf16.
 pub(crate) fn kv_bf16_dense_by_default() -> bool {
-    kv_format_for(true) == KvFormat::Bf16
+    kv_bf16_dense(true)
+}
+
+/// L'arène d'un KV de défaut `default_bf16` sera-t-elle en bf16 dense, seul
+/// format qui adopte les buffers d'un prefill ?
+pub(crate) fn kv_bf16_dense(default_bf16: bool) -> bool {
+    kv_format_for(default_bf16) == KvFormat::Bf16
+}
+
+/// Octets par valeur du KV résident de défaut `default_bf16`, format résolu
+/// (overrides compris) ; un format quantifié est compté comme le bf16, borne
+/// haute de ses codes et échelles.
+pub(crate) fn kv_element_bytes(default_bf16: bool) -> usize {
+    match kv_format_for(default_bf16) {
+        KvFormat::F32 => std::mem::size_of::<f32>(),
+        KvFormat::Bf16 | KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4 => std::mem::size_of::<u16>(),
+    }
 }
 
 /// Override explicite de `SARAGOSSA_RUST_KV_BF16` (lu une fois), cf. [`kv_bf16_for`].

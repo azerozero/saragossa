@@ -72,6 +72,21 @@ impl GpuTensor {
         self.element
     }
 
+    /// Enveloppe un buffer existant (K/V d'un prefill adopté par l'arène).
+    pub(crate) fn adopt(buffer: Buffer, len: usize, element: GpuElement) -> Result<Self> {
+        if checked_bytes(len, element, "tenseur adopté")? > buffer.length() {
+            return Err(InferError::Metal(format!(
+                "tenseur adopté de {len} éléments hors d'un buffer de {} octets",
+                buffer.length()
+            )));
+        }
+        Ok(Self {
+            buffer,
+            len,
+            element,
+        })
+    }
+
     /// Renvoie la taille logique en octets.
     pub(crate) fn byte_len(&self) -> usize {
         self.len * self.element.byte_size()

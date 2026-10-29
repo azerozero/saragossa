@@ -25,6 +25,10 @@ pub(crate) struct SharedRows<T> {
     buffer: metal::Buffer,
     offset: usize,
     len: usize,
+    /// Longueur figée à la construction, gardée par clones et troncatures :
+    /// toutes les vues d'un buffer en dérivent (une seule construction par
+    /// prefill), donc aucune ne couvre d'élément au-delà.
+    frozen: usize,
     element: std::marker::PhantomData<T>,
 }
 
@@ -74,6 +78,7 @@ impl<T: SharedElement> SharedRows<T> {
             buffer,
             offset,
             len,
+            frozen: len,
             element: std::marker::PhantomData,
         })
     }
@@ -122,9 +127,46 @@ impl<T: SharedElement> SharedRows<T> {
         self.len
     }
 
+    /// Vue entière du buffer figé, depuis son début et non tronquée : aucune
+    /// vue dérivée ne couvre d'élément au-delà de `len`, qui peuvent donc être
+    /// écrits (sous [`InPlaceClaim`]).
+    pub(crate) fn is_whole(&self) -> bool {
+        self.offset == 0 && self.len == self.frozen
+    }
+
     /// Raccourcit la vue ; le buffer reste alloué tant qu'une vue le tient.
     pub(crate) fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
+    }
+}
+
+/// Allocations K/V dont la réserve est en cours d'écriture (prolongement en
+/// place d'un prefill, arène de decode qui a adopté le buffer), tous
+/// executors confondus.
+static IN_PLACE_ALLOCATIONS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Droit exclusif d'écrire la réserve de K et V, rendu au drop. Le détenteur
+/// garantit qu'aucune commande GPU n'y écrit plus quand il le rend.
+#[derive(Debug)]
+pub(crate) struct InPlaceClaim([usize; 2]);
+
+impl InPlaceClaim {
+    pub(crate) fn try_new(buffers: [&Buffer; 2]) -> Option<Self> {
+        let ids = buffers.map(|buffer| buffer.contents().addr());
+        let mut claimed = IN_PLACE_ALLOCATIONS.lock().ok()?;
+        if ids.iter().any(|id| claimed.contains(id)) {
+            return None;
+        }
+        claimed.extend(ids);
+        Some(Self(ids))
+    }
+}
+
+impl Drop for InPlaceClaim {
+    fn drop(&mut self) {
+        if let Ok(mut claimed) = IN_PLACE_ALLOCATIONS.lock() {
+            claimed.retain(|id| !self.0.contains(id));
+        }
     }
 }
 

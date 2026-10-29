@@ -25,27 +25,54 @@ pub(super) struct ResidentPrefillChunk {
 /// servi (moins d'un bloc du cache de préfixe serve, 256 par défaut) s'y
 /// prolonge en place. Sans elle, le prolongement recopiait tout le KV f32 du
 /// préfixe dans un buffer neuf : +30 Go transitoires à 256k sur le 27B.
-// ponytail: réserve fixe, ~34 Mo sur le 27B ; une queue plus longue (bloc
-// serve agrandi, prolongement sur plusieurs blocs) retombe sur la copie.
+// ponytail: réserve minimale, ~34 Mo sur le 27B ; une queue plus longue
+// (bloc serve agrandi, prolongement sur plusieurs blocs) retombe sur la copie.
 const PREFILL_KV_RESERVE_ROWS: usize = 256;
 
-/// `segments` est-il exactement une vue de `buffer` depuis son début, en bf16
-/// si `bf16`, sinon en f32 ?
-fn is_sole_view_of(segments: &[KvSegment<'_>], buffer: &BufferRef, bf16: bool) -> bool {
-    let view = match (segments, bf16) {
-        ([KvSegment::Shared(rows)], false) => (rows.buffer(), rows.byte_offset()),
-        ([KvSegment::SharedBf16(rows)], true) => (rows.buffer(), rows.byte_offset()),
-        _ => return false,
-    };
-    view.1 == 0 && view.0.contents() == buffer.contents()
+thread_local! {
+    /// Réserve demandée par l'appelant du prefill en cours sur ce thread, cf.
+    /// [`with_prefill_kv_reserve`].
+    static PREFILL_KV_RESERVE_HINT: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Buffers K/V d'un préfixe de `start` lignes réutilisables pour un
+/// Exécute `run` avec une réserve K/V d'au moins `rows` lignes derrière tout
+/// prefill à froid stocké en bf16 de ce thread (un K/V f32 n'est jamais
+/// adopté : sa réserve reste minimale) : la queue servie et le decode qui suivent
+/// (`max_tokens` + marge spéculative) y tiennent, et l'arène de decode peut
+/// adopter les buffers au lieu de les recopier
+/// (`FullAttentionMetalState`). Hors de `run`, la réserve revient à 256.
+// ponytail: réglage par thread plutôt qu'un paramètre traversant serve,
+// décodeur et prefill ; un prefill lancé ailleurs garde la réserve minimale.
+pub(crate) fn with_prefill_kv_reserve<R>(rows: usize, run: impl FnOnce() -> R) -> R {
+    /// Rétablit la réserve précédente, panique comprise.
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREFILL_KV_RESERVE_HINT.with(|hint| hint.set(self.0));
+        }
+    }
+    // Scopes imbriqués : la plus grande réserve demandée l'emporte.
+    let _restore = Restore(PREFILL_KV_RESERVE_HINT.with(|hint| hint.replace(hint.get().max(rows))));
+    run()
+}
+
+/// `segments` est-il exactement la vue entière (non tronquée) de `buffer`,
+/// en bf16 si `bf16`, sinon en f32 ?
+fn is_sole_view_of(segments: &[KvSegment<'_>], buffer: &BufferRef, bf16: bool) -> bool {
+    let (view, whole) = match (segments, bf16) {
+        ([KvSegment::Shared(rows)], false) => (rows.buffer(), rows.is_whole()),
+        ([KvSegment::SharedBf16(rows)], true) => (rows.buffer(), rows.is_whole()),
+        _ => return false,
+    };
+    whole && view.contents() == buffer.contents()
+}
+
+/// Buffers K/V d'un préfixe réutilisables pour un
 /// prolongement jusqu'à `seq` lignes : ils portent le préfixe depuis leur
-/// début (vérifié sur les pointeurs), ont la place des lignes nouvelles et
-/// sont ceux d'un prefill à froid d'exactement `start` lignes. Aucune vue ne
-/// couvre alors les lignes réservées (un prolongement les relit dans un `Vec`)
-/// : un état tronqué sous une vue encore vivante ne passe pas par ici. Deux
+/// début (vérifié sur les pointeurs), ont la place des lignes nouvelles et la
+/// vue du préfixe est entière (`is_whole`). Aucune vue ne couvre alors les
+/// lignes réservées (un prolongement les relit dans un `Vec`) : un état
+/// tronqué sous une vue encore vivante ne passe pas par ici. Deux
 /// clones d'un même état prolongés en même temps se disputeraient la réserve
 /// (l'un l'écraserait pendant la relecture de l'autre) : le premier la
 /// réserve dans `claims` jusqu'à la fin du prefill, le second recopie.
@@ -53,27 +80,20 @@ fn prefix_kv_in_place(
     in_place: Option<&[Buffer; 2]>,
     key: &[KvSegment<'_>],
     value: &[KvSegment<'_>],
-    (start, seq): (usize, usize),
+    seq: usize,
     (kv_dim, bf16): (usize, bool),
     claims: &mut Vec<InPlaceClaim>,
 ) -> Result<Option<[Buffer; 2]>> {
     let Some([key_buffer, value_buffer]) = in_place else {
         return Ok(None);
     };
-    if seq > start.saturating_add(PREFILL_KV_RESERVE_ROWS) {
-        return Ok(None);
-    }
-    let reserved_len = checked_len(
-        start + PREFILL_KV_RESERVE_ROWS,
-        kv_dim,
-        "prolongement en place",
-    )?;
-    let reserved = if bf16 {
-        byte_len::<u16>(reserved_len)?
+    let needed_len = checked_len(seq, kv_dim, "prolongement en place")?;
+    let needed = if bf16 {
+        byte_len::<u16>(needed_len)?
     } else {
-        byte_len::<f32>(reserved_len)?
+        byte_len::<f32>(needed_len)?
     };
-    let fits = |buffer: &Buffer| buffer.length() == reserved;
+    let fits = |buffer: &Buffer| buffer.length() >= needed;
     if !(fits(key_buffer)
         && fits(value_buffer)
         && is_sole_view_of(key, key_buffer, bf16)
@@ -86,33 +106,6 @@ fn prefix_kv_in_place(
     };
     claims.push(claim);
     Ok(Some([key_buffer.clone(), value_buffer.clone()]))
-}
-
-/// Allocations K/V dont la réserve est en cours d'écriture par un
-/// prolongement en place, tous executors confondus.
-static IN_PLACE_ALLOCATIONS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-
-/// Droit exclusif d'écrire la réserve de K et V, rendu au drop.
-struct InPlaceClaim([usize; 2]);
-
-impl InPlaceClaim {
-    fn try_new(buffers: [&Buffer; 2]) -> Option<Self> {
-        let ids = buffers.map(|buffer| buffer.contents().addr());
-        let mut claimed = IN_PLACE_ALLOCATIONS.lock().ok()?;
-        if ids.iter().any(|id| claimed.contains(id)) {
-            return None;
-        }
-        claimed.extend(ids);
-        Some(Self(ids))
-    }
-}
-
-impl Drop for InPlaceClaim {
-    fn drop(&mut self) {
-        if let Ok(mut claimed) = IN_PLACE_ALLOCATIONS.lock() {
-            claimed.retain(|id| !self.0.contains(id));
-        }
-    }
 }
 
 /// Entrée du prefill une fois sur le GPU : flux plongé complet, ou ids et
@@ -338,7 +331,13 @@ impl MetalExecutor {
                     &layer_shape,
                     // Réserve pour la queue d'un prompt servi, prolongée en
                     // place (cf. `prefix_kv_in_place`).
-                    spec.seq.saturating_add(PREFILL_KV_RESERVE_ROWS),
+                    spec.seq.saturating_add(if bf16_store {
+                        PREFILL_KV_RESERVE_HINT
+                            .with(Cell::get)
+                            .max(PREFILL_KV_RESERVE_ROWS)
+                    } else {
+                        PREFILL_KV_RESERVE_ROWS
+                    }),
                     kv_dim,
                     bf16_mirror,
                     bf16_store,
@@ -361,7 +360,7 @@ impl MetalExecutor {
                         in_place.as_ref(),
                         key,
                         value,
-                        (start, spec.seq),
+                        spec.seq,
                         (kv_dim, bf16_store),
                         &mut in_place_claims,
                     )?,

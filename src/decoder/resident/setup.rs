@@ -270,19 +270,15 @@ impl CausalDecoder {
             {
                 continue;
             }
-            // Fenêtre glissante : attention naïve fenêtrée, sans variante
-            // quantifiée → KV dense même si `SARAGOSSA_RUST_KV_QUANT` est posé.
-            let mut full = if self.config.layer_sliding_window(index).is_some() {
-                arena.full_attention_dense(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
-            } else {
-                arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
-            };
-            full.seed_segments(
-                &layer_cache.keys.segments(),
-                &layer_cache.values.segments(),
-                prefill_len,
-            )?;
-            layer_cache.full = Some(full);
+            layer_cache.full = Some(resident_full_attention_state(
+                &arena,
+                layer_cache,
+                (capacity, prefill_len),
+                (q_heads, kv_heads, head_dim),
+                kv_bf16,
+                self.config.layer_sliding_window(index).is_some(),
+                None,
+            )?);
         }
         Ok(())
     }
@@ -391,9 +387,13 @@ impl CausalDecoder {
         // (empreinte plus basse) au lieu d'échouer la génération — même patron
         // de repli que les early-returns voisins. C'est l'esprit de la garde :
         // continuer avec moins de mémoire, jamais geler ni casser le tour.
-        if let Err(error) =
-            self.check_resident_full_decode_allocation(capacity, hidden, max_new_tokens)
-        {
+        if let Err(error) = self.check_resident_full_decode_allocation(
+            cache,
+            capacity,
+            hidden,
+            max_new_tokens,
+            kv_bf16,
+        ) {
             if crate::decoder::flags::trace_resident_enabled() {
                 eprintln!("decode résident full setup désactivé: budget mémoire ({error})");
             }
@@ -716,19 +716,28 @@ impl CausalDecoder {
             }
             let head_dim = self.config.layer_head_dim(index)?;
             let kv_heads = self.config.layer_num_key_value_heads(index);
-            // Fenêtre glissante : attention naïve fenêtrée, sans variante
-            // quantifiée → KV dense même si `SARAGOSSA_RUST_KV_QUANT` est posé.
-            let mut full = if self.config.layer_sliding_window(index).is_some() {
-                arena.full_attention_dense(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
-            } else {
-                arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
-            };
-            full.seed_segments(
-                &layer_cache.keys.segments(),
-                &layer_cache.values.segments(),
-                prefill_len,
-            )?;
-            layer_cache.full = Some(full);
+            match resident_full_attention_state(
+                &arena,
+                layer_cache,
+                (capacity, prefill_len),
+                (q_heads, kv_heads, head_dim),
+                kv_bf16,
+                self.config.layer_sliding_window(index).is_some(),
+                self.memory_guard.as_ref(),
+            ) {
+                Ok(full) => layer_cache.full = Some(full),
+                // Adoption ratée hors budget : decode per-op, comme la garde.
+                Err(InferError::MemoryGuard(error)) => {
+                    for layer_cache in &mut cache.layers {
+                        layer_cache.full = None;
+                    }
+                    if crate::decoder::flags::trace_resident_enabled() {
+                        eprintln!("decode résident full setup désactivé: budget mémoire ({error})");
+                    }
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
         }
         if let Some(t) = t_kv_seed {
             eprintln!(
@@ -956,22 +965,32 @@ impl CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn check_resident_full_decode_allocation(
         &self,
+        cache: &CausalDecoderCache,
         capacity: usize,
         hidden: usize,
         max_new_tokens: usize,
+        kv_bf16: bool,
     ) -> Result<()> {
         let Some(guard) = self.memory_guard.as_ref() else {
             return Ok(());
         };
+        // Une couche dont les buffers du prefill ont la place sera adoptée,
+        // sans allocation ; si l'adoption échoue (droit d'écriture déjà pris),
+        // `resident_full_attention_state` revérifie le budget avant d'allouer.
+        let element = crate::decode_resident::kv_element_bytes(kv_bf16);
         let mut kv_bytes = 0_u64;
-        for index in 0..self.layers.len() {
+        for (index, layer_cache) in cache.layers.iter().enumerate() {
             if !self.config.is_resident_full_attention_layer(index) {
                 continue;
             }
             let kv_dim = self.config.resident_full_attention_kv_dim(index)?;
+            let sliding = self.config.layer_sliding_window(index).is_some();
+            if layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16, sliding) {
+                continue;
+            }
             kv_bytes = kv_bytes.saturating_add(checked_bytes(
                 &[2, capacity, kv_dim],
-                std::mem::size_of::<f32>(),
+                element,
                 "KV résident",
             )?);
         }
@@ -1035,4 +1054,94 @@ fn checked_bytes(factors: &[usize], element_bytes: usize, label: &str) -> Result
         .checked_mul(element_bytes)
         .ok_or_else(|| InferError::Dimension(format!("{label} bytes déborde")))?;
     u64::try_from(bytes).map_err(|_| InferError::Dimension(format!("{label} hors u64")))
+}
+
+/// État full-attn résident d'une couche : adopte les buffers K/V bf16 du
+/// prefill quand ils ont la place (préfixe laissé en place, segments suivants
+/// semés à la suite, sans second exemplaire du K/V), sinon alloue et sème tout.
+/// Fenêtre glissante : attention naïve fenêtrée, sans variante quantifiée →
+/// KV dense même si `SARAGOSSA_RUST_KV_QUANT` est posé, jamais adopté.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn resident_full_attention_state(
+    arena: &DecodeResidentState,
+    layer_cache: &LayerKvCache,
+    (capacity, prefill_len): (usize, usize),
+    (q_heads, kv_heads, head_dim): (usize, usize, usize),
+    kv_bf16: bool,
+    sliding: bool,
+    budget: Option<&MemoryGuard>,
+) -> Result<crate::decode_resident::FullAttentionMetalState> {
+    let (keys, values) = (layer_cache.keys.segments(), layer_cache.values.segments());
+    let kv_dim = kv_heads * head_dim;
+    let adoptable = layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16, sliding);
+    if let (true, Some((key_buffer, key_len)), Some((value_buffer, value_len))) = (
+        adoptable,
+        layer_cache.keys.adoptable_bf16_prefix(),
+        layer_cache.values.adoptable_bf16_prefix(),
+    ) {
+        if key_len == value_len && kv_dim > 0 && key_len % kv_dim == 0 {
+            if let Some(mut full) = arena.full_attention_adopting(
+                capacity,
+                q_heads,
+                kv_heads,
+                head_dim,
+                kv_bf16,
+                [key_buffer, value_buffer],
+                key_len / kv_dim,
+            )? {
+                full.seed_segments(&keys[1..], &values[1..], prefill_len)?;
+                if crate::decoder::flags::trace_resident_enabled() {
+                    eprintln!(
+                        "kv résident adopté : préfixe {} lignes, {} semées",
+                        key_len / kv_dim,
+                        prefill_len - key_len / kv_dim
+                    );
+                }
+                return Ok(full);
+            }
+        }
+    }
+    // Allocation que la garde a supposée évitée : budget revérifié.
+    if let (true, Some(guard)) = (adoptable, budget) {
+        guard
+            .check_allocation(checked_bytes(
+                &[2, capacity, kv_dim],
+                crate::decode_resident::kv_element_bytes(kv_bf16),
+                "KV résident",
+            )?)
+            .map_err(InferError::MemoryGuard)?;
+    }
+    let mut full = if sliding {
+        arena.full_attention_dense(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
+    } else {
+        arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
+    };
+    full.seed_segments(&keys, &values, prefill_len)?;
+    Ok(full)
+}
+
+/// Les buffers K/V du prefill de cette couche seront-ils adoptés par une
+/// arène de `capacity` lignes : bf16 dense résolu, pas de fenêtre glissante,
+/// vues entières du prefill avec la place nécessaire. Le droit d'écriture,
+/// lui, n'est pris qu'à l'adoption.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn layer_adoptable(
+    layer_cache: &LayerKvCache,
+    capacity: usize,
+    kv_dim: usize,
+    kv_bf16: bool,
+    sliding: bool,
+) -> bool {
+    let bytes = capacity
+        .checked_mul(kv_dim)
+        .and_then(|cells| cells.checked_mul(std::mem::size_of::<u16>()))
+        .and_then(|bytes| u64::try_from(bytes).ok());
+    !sliding
+        && crate::decode_resident::kv_bf16_dense(kv_bf16)
+        && bytes.is_some_and(|bytes| {
+            [&layer_cache.keys, &layer_cache.values].iter().all(|rows| {
+                rows.adoptable_bf16_prefix()
+                    .is_some_and(|(buffer, _)| buffer.length() >= bytes)
+            })
+        })
 }
