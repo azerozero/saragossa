@@ -812,19 +812,21 @@ pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
 }
 
 /// Stocke en bf16 le K/V full-attention du prefill résident par morceaux,
-/// au lieu du f32 : `SARAGOSSA_RUST_PREFILL_KV_BF16_STORE=1`. Seulement si le
-/// NAX d256 lit déjà ce K/V en bf16 et que l'arène de decode sera bf16
-/// (prompt ≥ [`kv_bf16_greedy_min_tokens`], ni `SARAGOSSA_RUST_KV_BF16=0` ni
-/// KV quantifié) : sorties du prefill et arène bit-identiques, 2 octets au
-/// lieu de 4 par valeur (−17 Go à 256k sur le 27B). Les lecteurs f32 (attention
+/// au lieu du f32. Seulement si le NAX d256 lit déjà ce K/V en bf16 et que
+/// l'arène de decode sera bf16 (prompt ≥ [`kv_bf16_greedy_min_tokens`], ni
+/// `SARAGOSSA_RUST_KV_BF16=0` ni KV quantifié) : sorties du prefill et arène
+/// bit-identiques, 2 octets au lieu de 4 par valeur. Défaut ON depuis le
+/// 2026-10-29 (serve AR, M5 Max, 27B 4 bits, empreinte `footprint`) : pic
+/// 32k 25 → 23 Go, 115k 41 → 34 Go, 256k 67 → 51 Go ; TTFT et decode
+/// inchangés au bruit près, textes identiques. Les lecteurs f32 (attention
 /// CPU de repli, arène f32 d'une queue de moins de
 /// [`prefix_extend_resident_min_tokens`] tokens ou de DFlash) voient alors le
 /// préfixe arrondi ; l'attention CPU élargit alors tout le KV à chaque token.
-/// Opt-in tant que mémoire et TTFT ne sont pas mesurés.
+/// Kill-switch `SARAGOSSA_RUST_PREFILL_KV_BF16_STORE=0`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_kv_bf16_store_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_BF16_STORE", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_BF16_STORE", true))
 }
 
 /// Suffixe minimal (tokens) pour prolonger un préfixe en cache par le prefill
