@@ -1,5 +1,6 @@
 //! Orchestration du prefill résident Qwen MoE.
 
+use super::buffers::embedding_indices;
 use super::*;
 
 pub(super) struct ResidentPrefillEncodeContext<'a> {
@@ -17,6 +18,18 @@ pub(super) struct ResidentPrefillChunk {
     pub(super) start: usize,
     pub(super) rows: usize,
     pub(super) total: usize,
+}
+
+/// Entrée du prefill une fois sur le GPU : flux plongé complet, ou ids et
+/// table pour plonger chaque morceau.
+enum ResidentPrefillSource {
+    Hidden(Buffer),
+    Tokens {
+        weights: MetalEmbeddingWeightBuffers,
+        indices: Buffer,
+        scale: f32,
+        recast_bf16: bool,
+    },
 }
 
 fn f32_byte_offset(len: usize) -> Result<u64> {
@@ -37,14 +50,20 @@ impl MetalExecutor {
         layers: &[PrefillMoeLayer<'_>],
         spec: PrefillAttentionSpec,
     ) -> Result<(Tensor, Vec<PrefillResidentLayerCache>)> {
-        let (output, caches, _) =
-            self.qwen_moe_prefill_resident_with_captures(input, layers, spec, &[], 0, false)?;
+        let (output, caches, _) = self.qwen_moe_prefill_resident_with_captures(
+            PrefillInput::Hidden(input),
+            layers,
+            spec,
+            &[],
+            0,
+            false,
+        )?;
         Ok((output.into_tensor(spec.hidden_dim)?, caches))
     }
 
     pub(crate) fn qwen_moe_prefill_resident_with_captures(
         &self,
-        input: &Tensor,
+        input: PrefillInput<'_>,
         layers: &[PrefillMoeLayer<'_>],
         spec: PrefillAttentionSpec,
         capture_layer_ids: &[usize],
@@ -92,7 +111,7 @@ impl MetalExecutor {
     /// n'alimentent rien), et seule cette ligne est relue.
     pub(crate) fn qwen_moe_prefill_resident_from(
         &self,
-        input: &Tensor,
+        input: PrefillInput<'_>,
         layers: &[PrefillMoeLayer<'_>],
         spec: PrefillAttentionSpec,
         capture_layer_ids: &[usize],
@@ -109,7 +128,12 @@ impl MetalExecutor {
             reset_prefill_f32_to_bf16_shapes();
         }
         let start = prefix.map_or(0, |prefix| prefix.rows);
-        let (rows, hidden_dim) = input.as_matrix()?;
+        let (rows, hidden_dim) = match input {
+            PrefillInput::Hidden(hidden) => hidden.as_matrix()?,
+            PrefillInput::Tokens { ids, embedding, .. } => {
+                (ids.len(), embedding.shape().get(1).copied().unwrap_or(0))
+            }
+        };
         if rows.checked_add(start) != Some(spec.seq) || hidden_dim != spec.hidden_dim {
             return Err(InferError::Dimension(format!(
                 "prefill résident input=[{rows},{hidden_dim}] après {start}, spec seq={} hidden={}",
@@ -142,14 +166,31 @@ impl MetalExecutor {
         let hidden_len = checked_len(rows, hidden_dim, "prefill résident hidden")?;
         let chunk_hidden_capacity =
             checked_len(chunk_rows, hidden_dim, "prefill résident hidden morceau")?;
-        let input_buffer = self.upload_f32_buffer(input.data(), "resident_input")?;
+        let source = match input {
+            PrefillInput::Hidden(hidden) => ResidentPrefillSource::Hidden(
+                self.upload_f32_buffer(hidden.data(), "resident_input")?,
+            ),
+            PrefillInput::Tokens {
+                ids,
+                embedding,
+                scale,
+                recast_bf16,
+            } => ResidentPrefillSource::Tokens {
+                weights: self.resolve_embedding_weight_buffers(embedding)?,
+                indices: self
+                    .upload_u32_buffer(&embedding_indices(embedding, ids)?, "resident_input_ids")?,
+                scale,
+                recast_bf16,
+            },
+        };
         let hidden_a = self.private_f32_buffer(chunk_hidden_capacity, "resident_hidden_a")?;
         let hidden_b = self.private_f32_buffer(chunk_hidden_capacity, "resident_hidden_b")?;
-        let chunk_input = if chunk_count > 1 {
-            Some(self.private_f32_buffer(chunk_hidden_capacity, "resident_chunk_input")?)
-        } else {
-            None
-        };
+        let chunk_input =
+            if chunk_count > 1 || matches!(source, ResidentPrefillSource::Tokens { .. }) {
+                Some(self.private_f32_buffer(chunk_hidden_capacity, "resident_chunk_input")?)
+            } else {
+                None
+            };
         if let Some(bad) = capture_layer_ids.iter().find(|&&id| id >= layers.len()) {
             return Err(InferError::Config(format!(
                 "prefill résident capture couche {bad} hors des {} couches",
@@ -256,7 +297,12 @@ impl MetalExecutor {
             ensure_completed(command_buffer.status())?;
         }
         let encode_started = trace.then(std::time::Instant::now);
-        let mut current_buffer = input_buffer.clone();
+        let mut current_buffer = match &source {
+            ResidentPrefillSource::Hidden(buffer) => buffer.clone(),
+            ResidentPrefillSource::Tokens { .. } => chunk_input
+                .clone()
+                .expect("invariant: chunk_input alloué en entrée par jetons"),
+        };
         {
             let mut encode_context = ResidentPrefillEncodeContext {
                 profile_sections,
@@ -283,15 +329,32 @@ impl MetalExecutor {
                     self.run_resident_prefill_section(
                         &mut encode_context,
                         "chunk_input",
-                        |encoder, _owned| {
-                            self.encode_copy_with_offsets(
+                        |encoder, _owned| match &source {
+                            ResidentPrefillSource::Hidden(input_buffer) => self
+                                .encode_copy_with_offsets(
+                                    encoder,
+                                    input_buffer,
+                                    chunk_offset_bytes,
+                                    chunk_input,
+                                    0,
+                                    chunk_hidden_len,
+                                ),
+                            ResidentPrefillSource::Tokens {
+                                weights,
+                                indices,
+                                scale,
+                                recast_bf16,
+                            } => self.encode_embedding_from_index_buffers_with_offset_scaled(
                                 encoder,
-                                &input_buffer,
-                                chunk_offset_bytes,
+                                weights,
+                                indices,
+                                byte_len::<u32>(chunk.start - start)?,
                                 chunk_input,
-                                0,
-                                chunk_hidden_len,
-                            )
+                                hidden_dim,
+                                chunk.rows,
+                                *scale,
+                                *recast_bf16,
+                            ),
                         },
                     )?;
                     current_buffer = chunk_input.clone();

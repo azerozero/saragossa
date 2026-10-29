@@ -1362,6 +1362,9 @@ impl CausalDecoder {
 struct DecoderRuntime {
     metal: Option<Arc<crate::MetalExecutor>>,
     cpu_weights_released: bool,
+    /// Gather Metal de l'embedding vérifié octet près le CPU au warmup : le
+    /// prefill résident peut alors plonger ses morceaux sur le GPU.
+    embed_gather_byte_exact: bool,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2114,6 +2117,7 @@ impl CausalDecoder {
         if release_embedding {
             self.embed_tokens.release_affine_cpu_data(&mut released);
         }
+        self.runtime.embed_gather_byte_exact = release_embedding;
         self.materialize_and_release_cpu_weight_buffers(&metal, &mut released)?;
         self.runtime.cpu_weights_released = true;
         let _ = self.generate_greedy(prompt, 2)?;

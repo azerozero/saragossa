@@ -707,6 +707,22 @@ pub(crate) struct PrefillMoeLayer<'a> {
     pub tail: PrefillMoeTail<'a>,
 }
 
+/// Entrée d'un prefill résident.
+#[derive(Clone, Copy)]
+pub(crate) enum PrefillInput<'a> {
+    /// Flux résiduel déjà plongé `[rows, hidden]`.
+    Hidden(&'a Tensor),
+    /// Jetons plongés sur le GPU morceau par morceau : ni `[rows, hidden]` CPU
+    /// ni sa copie GPU (2 × 5,4 Go à 256k sur le 27B). Réservé à un embedding
+    /// dont le gather Metal est l'octet près celui du CPU.
+    Tokens {
+        ids: &'a [usize],
+        embedding: &'a EmbeddingWeight,
+        scale: f32,
+        recast_bf16: bool,
+    },
+}
+
 /// Préfixe déjà calculé d'un prefill prolongé : `rows` positions, puis par
 /// couche le KV CPU `[rows, kv_dim]` ou l'état linéaire GPU, mis à jour en place.
 pub(crate) struct PrefillResidentPrefix<'a> {
