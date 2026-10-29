@@ -42,6 +42,10 @@ pub(super) struct ChatCompletionRequest {
     /// Identifiant utilisateur OpenAI, utilisé comme session de repli.
     #[serde(default)]
     pub(super) user: Option<String>,
+    /// Outils OpenAI (`{"type":"function","function":{...}}`), rendus et
+    /// parsés pour flint seulement.
+    #[serde(default)]
+    pub(super) tools: Option<Vec<Value>>,
 }
 
 impl ChatCompletionRequest {
@@ -70,8 +74,15 @@ impl ChatCompletionRequest {
             .map(|message| ChatTemplateMessage {
                 role: message.role.clone(),
                 content: Some(message.content_text()),
+                reasoning_content: message.reasoning_content.clone(),
+                tool_calls: message.tool_calls.clone().unwrap_or_default(),
             })
             .collect()
+    }
+
+    /// Renvoie les outils déclarés par la requête.
+    pub(super) fn tools(&self) -> &[Value] {
+        self.tools.as_deref().unwrap_or_default()
     }
 
     /// Renvoie les chaînes stop demandées.
@@ -146,6 +157,12 @@ pub(super) struct WireMessage {
     /// Contenu OpenAI: string ou segments.
     #[serde(default)]
     pub(super) content: Option<Value>,
+    /// Raisonnement d'un tour assistant passé.
+    #[serde(default)]
+    pub(super) reasoning_content: Option<String>,
+    /// Appels d'outils d'un tour assistant passé.
+    #[serde(default)]
+    pub(super) tool_calls: Option<Vec<Value>>,
 }
 
 impl WireMessage {
@@ -283,7 +300,12 @@ pub(super) struct ChatCompletionResponse {
 
 impl ChatCompletionResponse {
     /// Construit une réponse complète.
-    pub(super) fn new(model: &str, content: String, finish_reason: &str, usage: Usage) -> Self {
+    pub(super) fn new(
+        model: &str,
+        message: AssistantMessage,
+        finish_reason: &str,
+        usage: Usage,
+    ) -> Self {
         Self {
             id: response_id("chatcmpl"),
             object: "chat.completion",
@@ -291,10 +313,7 @@ impl ChatCompletionResponse {
             model: model.to_string(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: Some(AssistantMessage {
-                    role: "assistant",
-                    content,
-                }),
+                message: Some(message),
                 delta: None,
                 finish_reason: Some(finish_reason.to_string()),
             }],
@@ -303,10 +322,61 @@ impl ChatCompletionResponse {
     }
 }
 
+/// Message assistant d'une réponse non-streaming.
 #[derive(Debug, Serialize)]
-struct AssistantMessage {
+pub(super) struct AssistantMessage {
     role: &'static str,
-    content: String,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<ToolCall>,
+}
+
+impl AssistantMessage {
+    /// Message texte seul.
+    pub(super) fn text(content: String) -> Self {
+        Self::new(Some(content), None, Vec::new())
+    }
+
+    /// Message complet : `content` vaut `null` quand seuls des appels d'outils
+    /// ont été produits, comme l'API OpenAI.
+    pub(super) fn new(
+        content: Option<String>,
+        reasoning_content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        Self {
+            role: "assistant",
+            content,
+            reasoning_content,
+            tool_calls,
+        }
+    }
+}
+
+/// Appel d'outil OpenAI (`tool_calls[]`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(super) struct ToolCall {
+    /// Position de l'appel, présente dans les deltas streamés seulement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) index: Option<usize>,
+    /// Identifiant de l'appel, repris par le message `tool` de réponse.
+    pub(super) id: String,
+    /// Toujours `function`.
+    #[serde(rename = "type")]
+    pub(super) kind: &'static str,
+    /// Fonction appelée.
+    pub(super) function: ToolCallFunction,
+}
+
+/// Fonction d'un appel d'outil OpenAI.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(super) struct ToolCallFunction {
+    /// Nom de la fonction.
+    pub(super) name: String,
+    /// Arguments sérialisés en JSON (objet).
+    pub(super) arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,12 +389,16 @@ struct ChatChoice {
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct DeltaMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// Chunk SSE OpenAI.
@@ -344,7 +418,7 @@ impl ChatCompletionChunk {
             model,
             DeltaMessage {
                 role: Some("assistant"),
-                content: None,
+                ..DeltaMessage::default()
             },
             None,
         )
@@ -355,8 +429,32 @@ impl ChatCompletionChunk {
         Self::chunk(
             model,
             DeltaMessage {
-                role: None,
                 content: Some(content),
+                ..DeltaMessage::default()
+            },
+            None,
+        )
+    }
+
+    /// Construit un chunk de raisonnement.
+    pub(super) fn reasoning(model: &str, reasoning: String) -> Self {
+        Self::chunk(
+            model,
+            DeltaMessage {
+                reasoning_content: Some(reasoning),
+                ..DeltaMessage::default()
+            },
+            None,
+        )
+    }
+
+    /// Construit un chunk portant un appel d'outil complet.
+    pub(super) fn tool_call(model: &str, call: ToolCall) -> Self {
+        Self::chunk(
+            model,
+            DeltaMessage {
+                tool_calls: Some(vec![call]),
+                ..DeltaMessage::default()
             },
             None,
         )
@@ -372,10 +470,7 @@ impl ChatCompletionChunk {
             choices: vec![ChatChoice {
                 index: 0,
                 message: None,
-                delta: Some(DeltaMessage {
-                    role: None,
-                    content: None,
-                }),
+                delta: Some(DeltaMessage::default()),
                 finish_reason: Some(finish_reason.to_string()),
             }],
         }
@@ -524,6 +619,45 @@ mod tests {
                 .expect("invariant: JSON valide");
 
         assert_eq!(req.session_key(Some("agent-b")).as_deref(), Some("agent-b"));
+    }
+
+    #[test]
+    fn request_carries_tools_reasoning_and_tool_calls_to_template() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"flint","tools":[{"type":"function","function":{"name":"heure"}}],
+                "messages":[{"role":"assistant","content":null,"reasoning_content":"r",
+                "tool_calls":[{"id":"c0","type":"function","function":{"name":"heure","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"c0","content":"12:00"}]}"#,
+        )
+        .expect("invariant: JSON valide");
+
+        let messages = req.template_messages();
+        assert_eq!(req.tools().len(), 1);
+        assert_eq!(messages[0].reasoning_content.as_deref(), Some("r"));
+        assert_eq!(messages[0].tool_calls[0]["function"]["name"], "heure");
+    }
+
+    #[test]
+    fn tool_call_message_serializes_null_content() {
+        let call = ToolCall {
+            index: None,
+            id: "c0".to_string(),
+            kind: "function",
+            function: ToolCallFunction {
+                name: "heure".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let message = AssistantMessage::new(None, Some("r".to_string()), vec![call]);
+        let value: Value =
+            serde_json::from_slice(&json_bytes(&message).expect("invariant: message sérialisable"))
+                .expect("invariant: JSON");
+
+        assert_eq!(value["content"], Value::Null);
+        assert_eq!(value["reasoning_content"], "r");
+        assert_eq!(value["tool_calls"][0]["type"], "function");
+        assert_eq!(value["tool_calls"][0]["function"]["arguments"], "{}");
+        assert!(value["tool_calls"][0].get("index").is_none());
     }
 
     #[test]

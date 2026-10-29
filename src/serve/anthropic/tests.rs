@@ -50,7 +50,7 @@ fn request_translates_blocks_system_and_stop_sequences() {
     assert_eq!(messages[2].role, "tool");
     assert_eq!(
         messages[2].content.as_deref(),
-        Some(r#"{"content":"ok","tool_use_id":"toolu_1"}"#)
+        Some(r#"{"tool_use_id":"toolu_1","content":"ok"}"#)
     );
     assert_eq!(messages[3].role, "assistant");
     let assistant = messages[3]
@@ -509,6 +509,7 @@ fn fake_completion(
 ) -> ServedCompletion {
     ServedCompletion {
         model: model.to_string(),
+        flint: false,
         content: content.to_string(),
         finish_reason,
         matched_stop,

@@ -335,7 +335,7 @@ fn encode_chat_prompt(
         normalize_qwen_assistant_history(&mut messages);
     }
     let rendered = if assets.config.is_flint() {
-        render_flint_chat(&messages, true)
+        render_flint_chat(&messages, &[], true)
     } else if assets.config.is_gemma4() {
         render_gemma4_chat(&messages, true, false)
     } else if assets.config.is_gemma() {

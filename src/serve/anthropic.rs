@@ -142,6 +142,7 @@ impl AnthropicMessagesRequest {
             stop,
             response_format: None,
             user: None,
+            tools: None,
         })
     }
 }
@@ -373,6 +374,8 @@ fn wire_message(role: &str, content: String) -> WireMessage {
     WireMessage {
         role: role.to_string(),
         content: Some(Value::String(content)),
+        reasoning_content: None,
+        tool_calls: None,
     }
 }
 

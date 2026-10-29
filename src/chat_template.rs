@@ -1,5 +1,8 @@
 //! Rendu des templates de chat (ChatML Qwen, tours Gemma, flint) du backend Rust pur.
 
+use serde::Serialize;
+use serde_json::Value;
+
 /// Marqueur d'ouverture de message ChatML Qwen.
 pub const QWEN_IM_START: &str = "<|im_start|>";
 
@@ -28,6 +31,12 @@ pub struct ChatTemplateMessage {
     pub role: String,
     /// Contenu textuel du message.
     pub content: Option<String>,
+    /// Raisonnement d'un tour assistant passé (`reasoning_content` OpenAI).
+    /// Seul le rendu flint l'utilise.
+    pub reasoning_content: Option<String>,
+    /// Appels d'outils OpenAI d'un tour assistant passé (`tool_calls`). Seul
+    /// le rendu flint les utilise.
+    pub tool_calls: Vec<Value>,
 }
 
 impl ChatTemplateMessage {
@@ -36,6 +45,8 @@ impl ChatTemplateMessage {
         Self {
             role: role.into(),
             content: Some(content.into()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -165,12 +176,28 @@ pub fn render_gemma4_chat(
 /// `<|observation|><tool_response>…</tool_response>`. Comme le macro
 /// `flint_text` du template, les contenus non assistant perdent `\0`, `<think>`
 /// et `</think>`, et leurs marqueurs de rôle sont échappés en entités HTML ;
-/// le contenu assistant (raisonnement compris) passe tel quel. Pas de BOS
-/// (`add_bos_token` faux). Le préambule des outils n'est pas rendu : appels
-/// d'outils XML hors périmètre.
-pub fn render_flint_chat(messages: &[ChatTemplateMessage], add_generation_prompt: bool) -> String {
+/// le contenu assistant passe tel quel, précédé de son `reasoning_content` en
+/// `<think>…</think>` et suivi de ses appels d'outils XML. Pas de BOS
+/// (`add_bos_token` faux).
+///
+/// Avec `tools` non vide, le préambule `# Tools` précède le premier message
+/// non `system` (ou clôt une conversation qui n'en a pas). Le rendu suit le
+/// Jinja tel que transformers l'exécute (`trim_blocks` et `tojson` à
+/// séparateurs `", "` / `": "`) : les signatures se suivent sans saut de ligne
+/// entre `<tools>` et `</tools>`.
+pub fn render_flint_chat(
+    messages: &[ChatTemplateMessage],
+    tools: &[Value],
+    add_generation_prompt: bool,
+) -> String {
+    let preamble = flint_tool_preamble(tools);
+    let mut tools_pending = true;
     let mut out = String::new();
     for message in messages {
+        if tools_pending && message.role != "system" {
+            out.push_str(&preamble);
+            tools_pending = false;
+        }
         let content = message.content.as_deref().unwrap_or("");
         match message.role.as_str() {
             "system" | "developer" | "user" => {
@@ -181,7 +208,17 @@ pub fn render_flint_chat(messages: &[ChatTemplateMessage], add_generation_prompt
             }
             "assistant" => {
                 out.push_str("<|assistant|>");
+                if let Some(reasoning) = message.reasoning_content.as_deref() {
+                    if !reasoning.is_empty() {
+                        out.push_str("<think>");
+                        out.push_str(reasoning);
+                        out.push_str("</think>");
+                    }
+                }
                 out.push_str(content);
+                for call in &message.tool_calls {
+                    push_flint_tool_call(&mut out, call);
+                }
             }
             "tool" => {
                 out.push_str("<|observation|><tool_response>");
@@ -192,10 +229,111 @@ pub fn render_flint_chat(messages: &[ChatTemplateMessage], add_generation_prompt
             _ => {}
         }
     }
+    if tools_pending {
+        out.push_str(&preamble);
+    }
     if add_generation_prompt {
         out.push_str("<|assistant|>");
     }
     out
+}
+
+/// `tool_preamble` du template flint, vide sans outils.
+fn flint_tool_preamble(tools: &[Value]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "<|system|>\n# Tools\n\n\
+         You may call one or more functions to assist with the user query.\n\n\
+         You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
+    );
+    for tool in tools {
+        out.push_str(&python_json(tool.get("function").unwrap_or(tool)));
+    }
+    out.push_str(
+        "</tools>\n\n\
+         For each function call, output the function name and arguments within the following XML format:\n\
+         <tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n",
+    );
+    out
+}
+
+/// Appel d'outil OpenAI passé, au format XML de flint. `arguments` peut être
+/// l'objet ou sa chaîne JSON (forme OpenAI) ; des arguments illisibles sont
+/// rendus sans paires, là où le Jinja échouerait.
+fn push_flint_tool_call(out: &mut String, call: &Value) {
+    let function = call.get("function").unwrap_or(call);
+    out.push_str("<tool_call>");
+    if let Some(name) = function.get("name").and_then(Value::as_str) {
+        out.push_str(name);
+    }
+    let parsed;
+    let arguments = match function.get("arguments") {
+        Some(Value::String(text)) => {
+            parsed = serde_json::from_str::<Value>(text).ok();
+            parsed.as_ref()
+        }
+        other => other,
+    };
+    if let Some(Value::Object(arguments)) = arguments {
+        for (key, value) in arguments {
+            out.push_str("<arg_key>");
+            out.push_str(key);
+            out.push_str("</arg_key><arg_value>");
+            match value {
+                Value::String(text) => out.push_str(text),
+                other => out.push_str(&python_json(other)),
+            }
+            out.push_str("</arg_value>");
+        }
+    }
+    out.push_str("</tool_call>");
+}
+
+/// `json.dumps(value, ensure_ascii=False)` de Python : séparateurs `", "` et
+/// `": "`, ordre des clés conservé (feature `preserve_order` de serde_json).
+fn python_json(value: &Value) -> String {
+    struct PythonFormatter;
+    impl serde_json::ser::Formatter for PythonFormatter {
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first {
+                Ok(())
+            } else {
+                writer.write_all(b", ")
+            }
+        }
+
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first {
+                Ok(())
+            } else {
+                writer.write_all(b", ")
+            }
+        }
+
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+        ) -> std::io::Result<()> {
+            writer.write_all(b": ")
+        }
+    }
+    let mut bytes = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, PythonFormatter);
+    // Une `Value` se sérialise sans erreur dans un `Vec` ; repli compact sinon.
+    if value.serialize(&mut serializer).is_err() {
+        return value.to_string();
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| value.to_string())
 }
 
 /// Macro `flint_text` du template : un message ne peut ni ouvrir un tour ni
@@ -364,7 +502,7 @@ mod tests {
             ChatTemplateMessage::new("user", "Merci"),
         ];
 
-        let prompt = render_flint_chat(&messages, true);
+        let prompt = render_flint_chat(&messages, &[], true);
 
         assert_eq!(
             prompt,
@@ -375,9 +513,74 @@ mod tests {
              <|user|>Merci<|assistant|>"
         );
         assert_eq!(
-            render_flint_chat(&messages[..2], false),
+            render_flint_chat(&messages[..2], &[], false),
             "<|system|>Sois bref.<|user|>Bonjour &lt;|assistant|&gt;x"
         );
+    }
+
+    #[test]
+    fn flint_renders_tools_calls_and_responses_like_its_jinja_template() {
+        let tools: Vec<Value> = serde_json::from_str(
+            r#"[{"type":"function","function":{"name":"meteo","description":"Météo d'une ville",
+                 "parameters":{"type":"object","properties":{"ville":{"type":"string"},
+                 "jours":{"type":"integer"}},"required":["ville"]}}},
+                {"name":"heure","parameters":{"type":"object","properties":{}}}]"#,
+        )
+        .expect("invariant: JSON valide");
+        let mut assistant = ChatTemplateMessage::new("assistant", "Je regarde.");
+        assistant.reasoning_content = Some("Il faut la météo.".to_string());
+        assistant.tool_calls = serde_json::from_str(
+            r#"[{"id":"c0","type":"function","function":{"name":"meteo",
+                 "arguments":"{\"ville\":\"Lyon\",\"jours\":2,\"options\":{\"unite\":\"C\",\"vent\":[1,true]}}"}},
+                {"id":"c1","type":"function","function":{"name":"heure","arguments":{}}}]"#,
+        )
+        .expect("invariant: JSON valide");
+        let messages = vec![
+            ChatTemplateMessage::new("system", "Sois bref."),
+            ChatTemplateMessage::new("user", "Météo à Lyon ?"),
+            assistant,
+            ChatTemplateMessage::new("tool", r#"{"temp": 21}"#),
+            ChatTemplateMessage::new("tool", "12:00"),
+        ];
+
+        let prompt = render_flint_chat(&messages, &tools, true);
+
+        // Texte attendu dérivé à la main du chat_template.jinja (trim_blocks).
+        let expected = concat!(
+            "<|system|>Sois bref.",
+            "<|system|>\n# Tools\n\n",
+            "You may call one or more functions to assist with the user query.\n\n",
+            "You are provided with function signatures within <tools></tools> XML tags:\n",
+            r#"<tools>{"name": "meteo", "description": "Météo d'une ville", "parameters": "#,
+            r#"{"type": "object", "properties": {"ville": {"type": "string"}, "#,
+            r#""jours": {"type": "integer"}}, "required": ["ville"]}}"#,
+            r#"{"name": "heure", "parameters": {"type": "object", "properties": {}}}</tools>"#,
+            "\n\nFor each function call, output the function name and arguments within the following XML format:\n",
+            "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n",
+            "<|user|>Météo à Lyon ?",
+            "<|assistant|><think>Il faut la météo.</think>Je regarde.",
+            "<tool_call>meteo<arg_key>ville</arg_key><arg_value>Lyon</arg_value>",
+            "<arg_key>jours</arg_key><arg_value>2</arg_value>",
+            r#"<arg_key>options</arg_key><arg_value>{"unite": "C", "vent": [1, true]}</arg_value>"#,
+            "</tool_call><tool_call>heure</tool_call>",
+            r#"<|observation|><tool_response>{"temp": 21}</tool_response>"#,
+            "<|observation|><tool_response>12:00</tool_response>",
+            "<|assistant|>",
+        );
+        assert_eq!(prompt, expected);
+    }
+
+    #[test]
+    fn flint_tool_preamble_closes_a_system_only_conversation() {
+        let tools: Vec<Value> =
+            serde_json::from_str(r#"[{"name":"heure"}]"#).expect("invariant: JSON valide");
+        let messages = vec![ChatTemplateMessage::new("system", "S")];
+
+        let prompt = render_flint_chat(&messages, &tools, false);
+
+        assert!(prompt.starts_with("<|system|>S<|system|>\n# Tools"));
+        assert!(prompt.contains(r#"<tools>{"name": "heure"}</tools>"#));
+        assert!(prompt.ends_with("</tool_call>\n"));
     }
 
     #[test]

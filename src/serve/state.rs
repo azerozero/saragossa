@@ -39,6 +39,8 @@ use crate::RuntimeKind;
 pub(super) struct ServedCompletion {
     /// Identifiant OpenAI du modèle.
     pub(super) model: String,
+    /// Sortie au format flint (`<think>`, `<tool_call>` XML) à parser.
+    pub(super) flint: bool,
     /// Texte assistant généré.
     pub(super) content: String,
     /// Raison de fin OpenAI.
@@ -519,6 +521,7 @@ impl LoadedModel {
         );
         Ok(ServedCompletion {
             model: self.id.clone(),
+            flint: self.assets.config.is_flint(),
             content,
             finish_reason,
             matched_stop,
@@ -562,6 +565,7 @@ impl LoadedModel {
         if !use_mtp {
             let start = StreamingCompletionStart {
                 model: self.id.clone(),
+                flint: self.assets.config.is_flint(),
                 prompt_tokens,
                 reused_prefix_tokens,
                 prefill,
@@ -589,6 +593,7 @@ impl LoadedModel {
                     if !stream_started {
                         let start = StreamingCompletionStart {
                             model: self.id.clone(),
+                            flint: self.assets.config.is_flint(),
                             prompt_tokens,
                             // NOTE: le hit MTP n'est connu qu'en fin de génération ;
                             // l'en-tête reste à 0, le journal de fin le porte.
@@ -639,6 +644,7 @@ impl LoadedModel {
         if !stream_started {
             let start = StreamingCompletionStart {
                 model: self.id.clone(),
+                flint: self.assets.config.is_flint(),
                 prompt_tokens,
                 reused_prefix_tokens,
                 prefill: output.timings.prefill,
@@ -686,6 +692,7 @@ impl LoadedModel {
         );
         Ok(ServedCompletion {
             model: self.id.clone(),
+            flint: self.assets.config.is_flint(),
             content,
             finish_reason,
             matched_stop,
@@ -704,7 +711,7 @@ impl LoadedModel {
             normalize_qwen_assistant_history(&mut messages);
         }
         let rendered = if self.assets.config.is_flint() {
-            render_flint_chat(&messages, true)
+            render_flint_chat(&messages, request.tools(), true)
         } else if self.assets.config.is_gemma4() {
             render_gemma4_chat(&messages, true, false)
         } else if self.assets.config.is_gemma() {
