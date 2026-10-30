@@ -415,8 +415,9 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
 }
 
 /// Light-batch flint : time-slicing (le pas duo ne connaît pas flint), deux
-/// flux dont un prompt au-delà de la fenêtre de 513 du vrai modèle, chacun
-/// identique au flux seul, et chaque pas par le decode résident.
+/// flux, chacun identique au flux seul, et chaque pas par le decode résident.
+/// Le flux de 600 tokens dépasse de loin la fenêtre synthétique de 2 ; il
+/// tient en un morceau de prefill résident (4096 par défaut).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn synthetic_flint_lightbatch_matches_solo_on_resident_decode() {

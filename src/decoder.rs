@@ -1416,7 +1416,9 @@ impl PrefixCache {
     /// entrée plus courte à buffer propre (retour en arrière du REPL) reste.
     /// L'historique MTP et les captures DFlash des entrées retirées sont perdus :
     /// `prefix_cache_hit` ne regarde que la plus longue entrée, qui devient la
-    /// nouvelle.
+    /// nouvelle. L'entrée préfixe est retirée même si son hit a été décliné
+    /// (prefill à froid), et une branche divergente qui partage l'allocation
+    /// remplacée l'est aussi, comme dans serve.
     fn remove_superseded(&mut self, prompt: &[usize], live: &CausalDecoderCache) {
         let Some(index) = generation::longest_prefix_entry_index(&self.entries, prompt) else {
             return;

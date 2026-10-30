@@ -508,9 +508,11 @@ fn prefix_cache_byte_cap_counts_shared_segments_once() {
     assert_eq!(cache.entries.len(), 1, "entrée la plus récente gardée");
 }
 
-/// `prefix_cache_put` retire l'entrée dont le prolongement a recopié le K/V,
-/// garde celles qui partagent une allocation avec le nouvel état, les branches
-/// divergentes et les entrées plus courtes à buffer propre.
+/// `prefix_cache_put` retire l'entrée dont le prolongement a recopié le K/V et
+/// toute entrée, même divergente, qui partage son allocation sans en partager
+/// avec le nouvel état ; il garde celles qui partagent une allocation avec le
+/// nouvel état, et les branches divergentes ou entrées plus courtes à buffer
+/// propre.
 #[test]
 fn prefix_cache_put_removes_superseded_copies() -> Result<()> {
     let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
@@ -538,13 +540,22 @@ fn prefix_cache_put_removes_superseded_copies() -> Result<()> {
     put(&[1, 3], own(None))?;
     put(&[1], own(None))?;
     // Prolongement en place : la vue partage l'allocation de [1, 2].
-    put(&[1, 2, 4], own(Some(&turn2)))?;
+    let turn3 = own(Some(&turn2));
+    put(&[1, 2, 4], turn3.clone())?;
     assert_eq!(
         cached()?,
         vec![vec![1, 2, 4], vec![1], vec![1, 3], vec![1, 2]]
     );
-    // Prolongement par copie de [1, 2, 4] : elle et [1, 2], qui partage son
-    // allocation, sont retirées ; [1] et [1, 3] restent.
+    // Branche [1, 2, 4, 9] en place sur [1, 2, 4] ; le plafond de 4 entrées
+    // pousse [1, 2] dehors.
+    put(&[1, 2, 4, 9], own(Some(&turn3)))?;
+    assert_eq!(
+        cached()?,
+        vec![vec![1, 2, 4, 9], vec![1, 2, 4], vec![1], vec![1, 3]]
+    );
+    // Prolongement par copie de [1, 2, 4] : elle est retirée, et la branche
+    // divergente [1, 2, 4, 9] aussi, puisqu'elle partage l'allocation remplacée
+    // et aucune du nouvel état ; [1] et [1, 3] restent.
     put(&[1, 2, 4, 5], own(None))?;
     assert_eq!(cached()?, vec![vec![1, 2, 4, 5], vec![1], vec![1, 3]]);
     Ok(())
