@@ -196,6 +196,42 @@ pub(crate) fn moe_routed_coop_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_ROUTED_COOP_PREFILL", true))
 }
+/// Étend la bascule routed coop du prefill au MoE flint (routeur sigmoïde et
+/// expert partagé sans gate). Exige aussi `SARAGOSSA_RUST_MOE_ROUTED_COOP_PREFILL`.
+///
+/// Profilage : ce chemin publie une seule section `moe_routed_coop`, qui couvre
+/// `router_topk` + `moe_gate_up` + `moe_down` + `moe_weighted_sum` du chemin qmv.
+/// Kill-switch : `SARAGOSSA_RUST_FLINT_MOE_COOP=0`.
+pub(crate) fn flint_moe_coop_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FLINT_MOE_COOP_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_MOE_COOP", true))
+}
+
+#[cfg(test)]
+thread_local! {
+    // Par thread : les tests parallèles comparent coop et qmv sans se gêner.
+    static FLINT_MOE_COOP_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force la bascule flint coop sur ce thread le temps de `run`, pour un
+/// oracle coop contre qmv (`OnceLock` non réglable dans le processus de test).
+#[cfg(test)]
+pub(crate) fn with_flint_moe_coop_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    /// Rétablit le réglage précédent, panique comprise.
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FLINT_MOE_COOP_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(FLINT_MOE_COOP_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
+}
 pub(super) fn qmm_na_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMM_NA", true))

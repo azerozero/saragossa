@@ -1556,16 +1556,20 @@ impl MetalExecutor {
             ) => {
                 let total_topk = checked_len(spec.seq, top_k, "resident topk total")?;
                 let inter_dim = stacked.gate.out_dim;
-                // Bascule routed-only coop gatée par un flag DÉDIÉ (défaut OFF) :
-                // l'oracle greedy 30B n'est pas qualifié (cf.
-                // `moe_routed_coop_prefill_enabled`). Le défaut garde le chemin
-                // gather-qmv par lignes, byte-identique à la base. Le routeur n'est
-                // résolu que dans la branche coop.
-                // Le coop route en softmax : le MoE sigmoïde flint garde le
-                // chemin gather par lignes.
-                if sigmoid_shared.is_none()
-                    && moe_routed_coop_prefill_enabled()
+                // flint (expert partagé sans gate) route en sigmoïde ; Qwen en softmax.
+                let router_score = if sigmoid_shared.is_some() {
+                    crate::RouterScore::Sigmoid
+                } else {
+                    crate::RouterScore::Softmax
+                };
+                // Bascule routed coop, défaut ON (cf. `moe_routed_coop_prefill_enabled`,
+                // politique near-tie bf16) ; flint a son kill-switch dédié. Repli
+                // gather qmv si la quantification ou les pipelines MPP manquent. Le
+                // routeur n'est résolu que dans la branche coop.
+                if moe_routed_coop_prefill_enabled()
+                    && (sigmoid_shared.is_none() || flint_moe_coop_enabled())
                     && MetalMoeRoutedWeights::stacked_coop_compatible(&stacked)
+                    && self.routed_coop_pipelines_ready(&stacked)
                 {
                     let weights = MetalMoeRoutedWeights {
                         router: self.resolve_linear_weight_buffers(
@@ -1592,9 +1596,10 @@ impl MetalExecutor {
                                 hidden_dim,
                                 &weights,
                                 top_k,
+                                router_score,
                             )
                         },
-                    )
+                    )?;
                 } else {
                     self.run_resident_prefill_section(context, "router_topk", |encoder, owned| {
                         self.encode_matmul_weight(
@@ -1606,8 +1611,8 @@ impl MetalExecutor {
                             router.weight(),
                             &router_buffer,
                         )?;
-                        if sigmoid_shared.is_some() {
-                            self.encode_topk_sigmoid_rows(
+                        match router_score {
+                            crate::RouterScore::Sigmoid => self.encode_topk_sigmoid_rows(
                                 encoder,
                                 &router_buffer,
                                 &indices_buffer,
@@ -1615,9 +1620,8 @@ impl MetalExecutor {
                                 spec.seq,
                                 expert_count,
                                 top_k,
-                            )
-                        } else {
-                            self.encode_topk_softmax_rows(
+                            ),
+                            crate::RouterScore::Softmax => self.encode_topk_softmax_rows(
                                 encoder,
                                 &router_buffer,
                                 &indices_buffer,
@@ -1625,7 +1629,7 @@ impl MetalExecutor {
                                 spec.seq,
                                 expert_count,
                                 top_k,
-                            )
+                            ),
                         }
                     })?;
                     self.run_resident_prefill_section(context, "moe_gate_up", |encoder, owned| {
@@ -1700,37 +1704,38 @@ impl MetalExecutor {
                             )
                         },
                     )?;
-                    match (sigmoid_shared, sigmoid_shared_scratch) {
-                        (None, None) => Ok(()),
-                        // Expert partagé flint, sans gate : ajouté tel quel au
-                        // flux qui porte déjà résiduel et experts routés.
-                        (Some(mlp), Some(scratch)) => self.run_resident_prefill_section(
-                            context,
-                            "moe_shared_ungated",
-                            |encoder, owned| {
-                                self.encode_resident_dense_mlp(
-                                    encoder,
-                                    owned,
-                                    post_normed_buffer,
-                                    &mlp,
-                                    &scratch,
-                                    spec.seq,
-                                    hidden_dim,
-                                )?;
-                                self.encode_accumulate_scaled(
-                                    encoder,
-                                    owned,
-                                    &scratch.down,
-                                    output_buffer,
-                                    1.0,
-                                    hidden_len,
-                                )
-                            },
-                        ),
-                        _ => Err(InferError::Dimension(format!(
-                            "prefill résident expert partagé sigmoïde incohérent couche {layer_index}"
-                        ))),
-                    }
+                }
+                match (sigmoid_shared, sigmoid_shared_scratch) {
+                    (None, None) => Ok(()),
+                    // Expert partagé flint, sans gate : ajouté tel quel au flux
+                    // qui porte déjà résiduel et experts routés (les deux chemins
+                    // écrivent `output = residual + Σ scores·down`).
+                    (Some(mlp), Some(scratch)) => self.run_resident_prefill_section(
+                        context,
+                        "moe_shared_ungated",
+                        |encoder, owned| {
+                            self.encode_resident_dense_mlp(
+                                encoder,
+                                owned,
+                                post_normed_buffer,
+                                &mlp,
+                                &scratch,
+                                spec.seq,
+                                hidden_dim,
+                            )?;
+                            self.encode_accumulate_scaled(
+                                encoder,
+                                owned,
+                                &scratch.down,
+                                output_buffer,
+                                1.0,
+                                hidden_len,
+                            )
+                        },
+                    ),
+                    _ => Err(InferError::Dimension(format!(
+                        "prefill résident expert partagé sigmoïde incohérent couche {layer_index}"
+                    ))),
                 }
             }
             (

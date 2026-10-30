@@ -427,8 +427,44 @@ impl MetalExecutor {
         self.dispatch_1d(encoder, pso, total)
     }
 
+    /// Renvoie vrai si tous les pipelines du chemin routed coop existent pour
+    /// cette quantification. Les kernels groupés exigent MPP (macOS 26) : sans
+    /// eux, l'appelant garde le chemin gather qmv au lieu d'échouer.
+    pub(crate) fn routed_coop_pipelines_ready(&self, stacked: &StackedMoeBuffers) -> bool {
+        let u4 = stacked.gate.bits == FAST_QMV_BITS;
+        let gate_up = if moe_coop_fused_swiglu_enabled() {
+            if u4 {
+                &self.na_gemm_coop_qb_grouped_gate_up_swiglu_u4
+            } else {
+                &self.na_gemm_coop_qb_grouped_gate_up_swiglu
+            }
+        } else {
+            // Le gather non fusionné n'existe qu'en u8.
+            &self.na_gemm_coop_qb_grouped_gather
+        };
+        let scatter = if u4 {
+            &self.na_gemm_coop_qb_grouped_scatter_u4
+        } else {
+            &self.na_gemm_coop_qb_grouped_scatter
+        };
+        [
+            gate_up,
+            scatter,
+            &self.moe_g_fill_u32,
+            &self.moe_g_histogram,
+            &self.moe_g_offsets,
+            &self.moe_g_perm,
+        ]
+        .iter()
+        .all(|pso| pso.is_some())
+    }
+
     /// Encode MoE routed-only prefill, experts routés sur tensor-cores, dans
     /// l'encoder appelant. Réutilise les buffers rows déjà alloués par le résident.
+    ///
+    /// `router_score` choisit le top-k (softmax Qwen ou sigmoïde renormalisée
+    /// flint). Les kernels groupés ne lisent jamais les scores : seule la somme
+    /// pondérée finale les consomme, dans le layout `[rows, top_k]` d'origine.
     ///
     /// # Errors
     ///
@@ -453,6 +489,7 @@ impl MetalExecutor {
         in_dim: usize,
         weights: &MetalMoeRoutedWeights,
         top_k: usize,
+        router_score: crate::RouterScore,
     ) -> Result<()> {
         let shape = self.check_moe_routed_buffer_shapes(in_dim, weights, top_k)?;
         let experts = shape.expert_count;
@@ -488,15 +525,26 @@ impl MetalExecutor {
                 "routeur MoE routed coop sort {router_out}, attendu {experts}"
             )));
         }
-        self.encode_topk_softmax_rows(
-            encoder,
-            router_buffer,
-            indices_buffer,
-            scores_buffer,
-            rows,
-            experts,
-            top_k,
-        )?;
+        match router_score {
+            crate::RouterScore::Softmax => self.encode_topk_softmax_rows(
+                encoder,
+                router_buffer,
+                indices_buffer,
+                scores_buffer,
+                rows,
+                experts,
+                top_k,
+            )?,
+            crate::RouterScore::Sigmoid => self.encode_topk_sigmoid_rows(
+                encoder,
+                router_buffer,
+                indices_buffer,
+                scores_buffer,
+                rows,
+                experts,
+                top_k,
+            )?,
+        }
         self.encode_moe_g_fill(encoder, &counts, experts, 0)?;
         self.encode_moe_g_fill(encoder, &tile_expert, max_tiles, SENTINEL)?;
         self.encode_moe_g_fill(encoder, &perm, max_m, SENTINEL)?;

@@ -383,9 +383,12 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
     // KV bf16 : l'arrondi relatif 2^-9 des K/V, propagé par trois couches,
     // borne l'écart à 1 % de la plus grande magnitude de logit.
     for (kv_bf16, rel) in [(false, None), (true, Some(1.0e-2_f32))] {
-        let rows = gpu
-            .resident_forced_logits_for_test(&prompt, &forced, kv_bf16)
-            .expect("invariant: decode résident flint");
+        // Prefill MoE qmv : l'écart absolu 1e-4 ne tolère pas l'arrondi bf16
+        // du coop groupé, couvert par `synthetic_flint_moe_coop_matches_qmv`.
+        let rows = crate::metal_backend::with_flint_moe_coop_override(false, || {
+            gpu.resident_forced_logits_for_test(&prompt, &forced, kv_bf16)
+        })
+        .expect("invariant: decode résident flint");
         for (step, (got, want)) in rows.iter().zip(&expected).enumerate() {
             let gap = got
                 .iter()
@@ -475,13 +478,15 @@ fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
         .prefill_hidden_for_test(&prompt, None)
         .expect("invariant: prefill per-op flint")
         .expect("invariant: hidden per-op");
-    let resident = gpu
-        .prefill_hidden_for_test(
+    // MoE qmv : oracle f32 exact ; le coop groupé (bf16) a son propre test.
+    let resident = crate::metal_backend::with_flint_moe_coop_override(false, || {
+        gpu.prefill_hidden_for_test(
             &prompt,
             Some(crate::runtime_flags::prefill_resident_chunk_tokens()),
         )
-        .expect("invariant: prefill résident flint")
-        .expect("prefill résident flint attendu");
+    })
+    .expect("invariant: prefill résident flint")
+    .expect("prefill résident flint attendu");
     assert_eq!(per_op.shape(), resident.shape());
     let gap = per_op
         .data()
@@ -498,6 +503,51 @@ fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
             .expect("invariant: greedy CPU"),
         "tokens greedy (prefill Metal) != CPU"
     );
+}
+
+/// MoE routé groupé (coop, tensor-core) contre le qmv par paire, sur le
+/// prefill résident flint u4 gs64 (routeur sigmoïde, expert partagé sans
+/// gate). Le coop arrondit en bf16 les activations d'entrée et l'intermédiaire
+/// SwiGLU ; le qmv garde du f32 : l'écart relatif attendu est de l'ordre de
+/// quelques 2^-9 par couche MoE.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_moe_coop_matches_qmv() {
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6, 1, 0, 4, 5, 7, 6];
+    let run = |coop| {
+        crate::metal_backend::with_flint_moe_coop_override(coop, || {
+            let hidden = gpu
+                .prefill_hidden_for_test(
+                    &prompt,
+                    Some(crate::runtime_flags::prefill_resident_chunk_tokens()),
+                )
+                .expect("invariant: prefill résident flint")
+                .expect("prefill résident flint attendu");
+            let greedy = gpu
+                .generate_greedy(&prompt, 6)
+                .expect("invariant: greedy GPU");
+            (hidden, greedy)
+        })
+    };
+    let (qmv, qmv_greedy) = run(false);
+    let (coop, coop_greedy) = run(true);
+    let gap = max_gap(qmv.data(), coop.data());
+    let scale = qmv.data().iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+    eprintln!("flint coop vs qmv: écart {gap} échelle {scale}");
+    // Écart non nul : le coop a bien remplacé le qmv (pipelines MPP présents).
+    if gap == 0.0 {
+        eprintln!("skip: coop groupé indisponible (macOS < 26 ?)");
+        return;
+    }
+    assert!(
+        gap <= 2.0e-2 * scale,
+        "coop vs qmv: écart {gap} échelle {scale}"
+    );
+    assert_eq!(coop_greedy, qmv_greedy, "greedy coop != qmv");
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1518,6 +1568,92 @@ fn flint_int4_prefill_kv_bf16_store_drift() {
 const MAX_GAP_MLX_BF16: f32 = 17.0;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 const MEAN_GAP_MLX_BF16: f32 = 2.6;
+
+/// MoE routé groupé (coop) contre qmv sur flint-int4 réel : prompt
+/// synthétique de `SARAGOSSA_FLINT_COOP_LEN` tokens (16 384 par défaut),
+/// logits aux frontières et milieux des morceaux, argmax et 16 tokens greedy.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure de dérive, pas un gate"]
+fn flint_int4_moe_coop_matches_qmv() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("test flint coop sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    let len = std::env::var("SARAGOSSA_FLINT_COOP_LEN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16_384);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let prompt = synthetic_long_prompt(&assets, len);
+    let target = crate::runtime_flags::prefill_resident_chunk_tokens();
+    let chunk = len.div_ceil(len.div_ceil(target.max(1)));
+    let mut rows = (0..len)
+        .step_by(chunk)
+        .flat_map(|start| [start.saturating_sub(1), start, start + chunk / 2])
+        .chain(len.saturating_sub(4)..len)
+        .filter(|&row| row < len)
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows.dedup();
+    let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+        .expect("invariant: flint-int4 chargeable en Metal")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let run = |coop: bool| {
+        crate::metal_backend::with_flint_moe_coop_override(coop, || {
+            let started = std::time::Instant::now();
+            let hidden = model
+                .prefill_hidden_for_test(&prompt, Some(target))
+                .expect("invariant: prefill résident")
+                .expect("prefill résident Metal attendu pour flint");
+            println!(
+                "MoE coop={coop}: prefill {len} tokens en {:.1?}",
+                started.elapsed()
+            );
+            let logits = model
+                .logits_of_hidden_rows_for_test(&hidden, &rows)
+                .expect("invariant: logits du prefill");
+            drop(hidden);
+            let tokens = model
+                .generate_greedy_timed_with_options(
+                    &prompt,
+                    16,
+                    &crate::GenerationOptions::default(),
+                )
+                .expect("invariant: génération résidente")
+                .tokens;
+            (logits, tokens)
+        })
+    };
+    let (qmv_logits, qmv_tokens) = run(false);
+    let (coop_logits, coop_tokens) = run(true);
+    let (mut max, mut mean, mut argmax_ok) = (0.0_f32, 0.0_f32, 0_usize);
+    for (row, (coop, qmv)) in rows.iter().zip(coop_logits.iter().zip(&qmv_logits)) {
+        let gap = compare_rows(&format!("ligne {row}"), coop, qmv);
+        max = max.max(gap.max);
+        mean = mean.max(gap.mean);
+        argmax_ok += usize::from(gap.same_argmax);
+    }
+    println!(
+        "dérive MoE coop vs qmv sur {} lignes : max {max:.4}, pire moyenne {mean:.5}, argmax {argmax_ok}/{}",
+        rows.len(),
+        rows.len()
+    );
+    println!("greedy qmv={qmv_tokens:?} coop={coop_tokens:?}");
+    assert_eq!(coop_tokens, qmv_tokens, "greedy MoE coop != qmv");
+    assert_eq!(argmax_ok, rows.len(), "argmax MoE coop divergent");
+    // Garde-fou de mesure, pas un budget de qualité (cf. MAX_GAP_MLX_BF16).
+    assert!(
+        max < MAX_GAP_MLX_BF16,
+        "écart max {max} ≥ {MAX_GAP_MLX_BF16}"
+    );
+    assert!(
+        mean < MEAN_GAP_MLX_BF16,
+        "écart moyen {mean} ≥ {MEAN_GAP_MLX_BF16}"
+    );
+}
 
 /// Hidden non normés du prefill per-op CPU puis du prefill résident Metal, et
 /// leurs durées.
