@@ -28,6 +28,9 @@ pub(super) struct ResidentPrefillChunk {
 // ponytail: réserve minimale, ~34 Mo sur le 27B ; une queue plus longue
 // (bloc serve agrandi, prolongement sur plusieurs blocs) retombe sur la copie.
 const PREFILL_KV_RESERVE_ROWS: usize = 256;
+/// Part du prompt ajoutée à la réserve d'un K/V bf16 adoptable : une recopie
+/// tous les `seq / 8` tokens prolongés au plus (≈14k à 115k).
+const PREFILL_KV_RESERVE_GROWTH_DIVISOR: usize = 8;
 
 thread_local! {
     /// Réserve demandée par l'appelant du prefill en cours sur ce thread, cf.
@@ -424,11 +427,20 @@ impl MetalExecutor {
             && bf16_min_rows.is_some_and(|min_rows| spec.seq >= min_rows);
         // Réserve d'un K/V écrit dans un buffer neuf (prefill à froid, préfixe
         // recopié) : la demande de l'appelant pour un K/V bf16, adoptable par
-        // l'arène ; jamais adopté en f32, il garde la réserve minimale.
+        // l'arène, plus un huitième du prompt. Un tour de conversation ajoute
+        // des milliers de lignes, bien au-delà de `max_tokens` : sans cette
+        // marge géométrique (comme un `Vec`), chaque tour recopiait tout le
+        // K/V, la conversation existant deux fois au pic (+8 Go à 115k sur le
+        // 27B). Mesuré : les lignes jamais écrites n'entrent pas dans
+        // `phys_footprint` (pic des tours 2-3 de 35 à 29 Go à 115k), mais elles
+        // comptent dans les plafonds d'octets des caches de préfixe, qui
+        // lisent `buffer.length()`. Jamais adopté en f32, il garde la réserve
+        // minimale.
         let fresh_reserve = if bf16_store {
             PREFILL_KV_RESERVE_HINT
                 .with(Cell::get)
                 .max(PREFILL_KV_RESERVE_ROWS)
+                .saturating_add(spec.seq / PREFILL_KV_RESERVE_GROWTH_DIVISOR)
         } else {
             PREFILL_KV_RESERVE_ROWS
         };

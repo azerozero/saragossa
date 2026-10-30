@@ -1474,7 +1474,11 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
         };
         let (_, reserved, _) = prefill(&executor)?;
         if crate::runtime_flags::prefill_kv_shared_enabled() {
-            assert_eq!(reserve_len(&reserved), Some((SEQ + 1000) * kv_dim));
+            // Réserve de l'appelant plus un huitième du prompt.
+            assert_eq!(
+                reserve_len(&reserved),
+                Some((SEQ + 1000 + SEQ / 8) * kv_dim)
+            );
         }
         // Prompt sous le seuil : K/V f32 inchangé.
         executor.prefill_kv_bf16_store_min_rows = Some(SEQ + 1);
@@ -1931,7 +1935,9 @@ fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
     const BLOCK_2: usize = 1280;
     const TURN_2: usize = 1350;
     const RESERVE: usize = 1000;
-    const TOTAL: usize = BLOCK_1 + RESERVE + 30;
+    // Au-delà de la réserve du tour 1 : celle de l'appelant plus un huitième
+    // du prompt (`PREFILL_KV_RESERVE_GROWTH_DIVISOR`).
+    const TOTAL: usize = BLOCK_1 + RESERVE + BLOCK_1 / 8 + 30;
 
     let input = deterministic_tensor(TOTAL, HIDDEN, 811, 0.5)?;
     // Autre conversation sur le même bloc : ses lignes nouvelles diffèrent,
