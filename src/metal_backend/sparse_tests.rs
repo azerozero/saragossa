@@ -356,6 +356,41 @@ fn last_pool_keeps_heaps_with_leaked_tiles() -> Result<()> {
 }
 
 #[test]
+#[expect(unsafe_code, reason = "retainCount du heap observé par le test")]
+fn poisoned_pool_lock_still_keeps_leaked_heaps() -> Result<()> {
+    let Some((_device, pool)) = sparse_pool("poisoned_pool_lock_still_keeps_leaked_heaps") else {
+        return Ok(());
+    };
+    let mut kv = pool.new_buffer(1000, MIB)?;
+    kv.ensure_rows(2)?;
+    let heap = {
+        let state = pool.shared.lock()?;
+        let slot = state
+            .ledger
+            .heaps()
+            .next()
+            .expect("invariant: un heap vient d'être créé");
+        slot.heap.heap.clone()
+    };
+    // Empoisonne le mutex du pool : un thread panique en le tenant.
+    let shared = std::sync::Arc::clone(&pool.shared);
+    let poisoned = std::thread::spawn(move || {
+        let _guard = shared.state.lock();
+        panic!("empoisonnement volontaire du pool");
+    })
+    .join();
+    assert!(poisoned.is_err() && pool.shared.state.is_poisoned());
+    drop(kv);
+    drop(pool);
+    // SAFETY: `heap` est un `id<MTLHeap>` vivant ; `retainCount` rend un
+    // `NSUInteger`.
+    let retained =
+        unsafe { send::<_, NSUInteger>(heap.as_ptr().cast::<Object>(), "retainCount", ())? };
+    assert!(retained >= 2, "retainCount {retained}");
+    Ok(())
+}
+
+#[test]
 fn transfers_span_several_staging_ranges() -> Result<()> {
     let Some((device, pool)) = sparse_pool("transfers_span_several_staging_ranges") else {
         return Ok(());

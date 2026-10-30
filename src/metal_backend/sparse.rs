@@ -929,11 +929,18 @@ impl SparseKvBuffer {
     /// donc ses mappings restent valides pour une commande encore en vol.
     fn leak(&mut self, reason: &str) {
         let tiles = self.tiles.len();
-        if let Ok(mut state) = self.pool.lock() {
-            if !self.poisoned {
-                state.ledger.leak(&self.tiles);
-            }
+        // Un verrou empoisonné est repris quand même : sans la marque `leaked`,
+        // la destruction du dernier pool libérerait des heaps encore mappés par
+        // ce buffer. Marquer des tuiles perdues ne peut pas aggraver l'état.
+        let mut state = self
+            .pool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.poisoned {
+            state.ledger.leak(&self.tiles);
         }
+        drop(state);
         self.tiles.clear();
         std::mem::forget(self.buffer.clone());
         eprintln!("saragossa: buffer K/V sparse perdu ({reason}, {tiles} tuiles) : jamais recyclé");
