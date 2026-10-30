@@ -745,7 +745,7 @@ impl CausalDecoder {
                 (q_heads, kv_heads, head_dim),
                 kv_bf16,
                 // Les sinks n'ont pas de variante quantifiée : KV dense, comme
-                // une fenêtre glissante.
+                // une fenêtre glissante. Dense n'interdit pas l'adoption.
                 self.config.layer_sliding_window(index).is_some() || sinks.is_some(),
                 self.memory_guard.as_ref(),
             ) {
@@ -1019,8 +1019,7 @@ impl CausalDecoder {
                 continue;
             }
             let kv_dim = self.config.resident_full_attention_kv_dim(index)?;
-            let sliding = self.config.layer_sliding_window(index).is_some();
-            if layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16, sliding) {
+            if layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16) {
                 continue;
             }
             kv_bytes = kv_bytes.saturating_add(checked_bytes(
@@ -1094,8 +1093,10 @@ fn checked_bytes(factors: &[usize], element_bytes: usize, label: &str) -> Result
 /// État full-attn résident d'une couche : adopte les buffers K/V bf16 du
 /// prefill quand ils ont la place (préfixe laissé en place, segments suivants
 /// semés à la suite, sans second exemplaire du K/V), sinon alloue et sème tout.
-/// Fenêtre glissante : attention naïve fenêtrée, sans variante quantifiée →
-/// KV dense même si `SARAGOSSA_RUST_KV_QUANT` est posé, jamais adopté.
+/// `dense` (fenêtre glissante ou sinks : attention sans variante quantifiée)
+/// impose un KV f32 ou bf16 même si `SARAGOSSA_RUST_KV_QUANT` est posé, sans
+/// empêcher l'adoption : l'arène garde ses lignes à leur position absolue et
+/// le decode fenêtré lit `window_start..len`, comme sur une copie.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn resident_full_attention_state(
     arena: &DecodeResidentState,
@@ -1103,12 +1104,12 @@ fn resident_full_attention_state(
     (capacity, prefill_len): (usize, usize),
     (q_heads, kv_heads, head_dim): (usize, usize, usize),
     kv_bf16: bool,
-    sliding: bool,
+    dense: bool,
     budget: Option<&MemoryGuard>,
 ) -> Result<crate::decode_resident::FullAttentionMetalState> {
     let (keys, values) = (layer_cache.keys.segments(), layer_cache.values.segments());
     let kv_dim = kv_heads * head_dim;
-    let adoptable = layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16, sliding);
+    let adoptable = layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16);
     if let (true, Some(key_prefix), Some(value_prefix)) = (
         adoptable,
         layer_cache.keys.adoptable_bf16_prefix(),
@@ -1147,7 +1148,7 @@ fn resident_full_attention_state(
             )?)
             .map_err(InferError::MemoryGuard)?;
     }
-    let mut full = if sliding {
+    let mut full = if dense {
         arena.full_attention_dense(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
     } else {
         arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
@@ -1157,23 +1158,21 @@ fn resident_full_attention_state(
 }
 
 /// Les buffers K/V du prefill de cette couche seront-ils adoptés par une
-/// arène de `capacity` lignes : bf16 dense résolu, pas de fenêtre glissante,
-/// vues entières du prefill avec la place nécessaire. Le droit d'écriture,
-/// lui, n'est pris qu'à l'adoption.
+/// arène de `capacity` lignes : bf16 dense résolu, vues entières du prefill
+/// avec la place nécessaire. Fenêtre glissante et sinks n'y changent rien.
+/// Le droit d'écriture, lui, n'est pris qu'à l'adoption.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn layer_adoptable(
     layer_cache: &LayerKvCache,
     capacity: usize,
     kv_dim: usize,
     kv_bf16: bool,
-    sliding: bool,
 ) -> bool {
     let bytes = capacity
         .checked_mul(kv_dim)
         .and_then(|cells| cells.checked_mul(std::mem::size_of::<u16>()))
         .and_then(|bytes| u64::try_from(bytes).ok());
-    !sliding
-        && crate::decode_resident::kv_bf16_dense(kv_bf16)
+    crate::decode_resident::kv_bf16_dense(kv_bf16)
         && bytes.is_some_and(|bytes| {
             [&layer_cache.keys, &layer_cache.values].iter().all(|rows| {
                 rows.adoptable_bf16_prefix()
@@ -1234,7 +1233,7 @@ mod tests {
             &layout,
         )?;
         // Estimation de la garde : couche adoptée, K/V hors budget.
-        assert!(layer_adoptable(&layer_cache, capacity, kv_dim, true, false));
+        assert!(layer_adoptable(&layer_cache, capacity, kv_dim, true));
         // Prolongement en place publié entre l'estimation et l'adoption.
         let claim = crate::metal_backend::InPlaceClaim::try_after([&key, &value])
             .expect("invariant: réserve libre");

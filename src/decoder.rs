@@ -294,6 +294,24 @@ impl CausalDecoderPromptState {
         &self.final_state
     }
 
+    /// Vues K/V bf16 entières, adoptables par une arène, de chaque couche qui
+    /// en a : les tests y reprennent le claim pour savoir qui tient la réserve.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn kv_bf16_prefixes_for_test(
+        &self,
+    ) -> Vec<[crate::metal_backend::SharedBf16Rows; 2]> {
+        self.cache
+            .layers
+            .iter()
+            .filter_map(|layer| {
+                Some([
+                    layer.keys.adoptable_bf16_prefix()?.clone(),
+                    layer.values.adoptable_bf16_prefix()?.clone(),
+                ])
+            })
+            .collect()
+    }
+
     fn into_parts(self) -> (CausalDecoderCache, Tensor) {
         (self.cache, self.final_state)
     }
