@@ -201,6 +201,13 @@ pub(crate) fn moe_routed_coop_prefill_enabled() -> bool {
 ///
 /// Profilage : ce chemin publie une seule section `moe_routed_coop`, qui couvre
 /// `router_topk` + `moe_gate_up` + `moe_down` + `moe_weighted_sum` du chemin qmv.
+///
+/// Défaut ON (mesuré le 30 oct. 2026 sur flint-int4) : à 32k, MoE routé
+/// 18,5 → 5,2 s et prefill 37,2 → 24,6 s ; à 16k, logits coop contre qmv
+/// max 3,3 / moyenne 0,50, argmax 15/15 et 16 tokens greedy identiques ; 16
+/// tokens greedy mlx identiques. Seule la position 3 de l'oracle mlx dépasse
+/// les seuils f32 (14,4 / 2,1), comme mlx bf16 contre mlx f32 (16,9 / 2,6) :
+/// quasi-égalité de routage sensible à l'arrondi bf16.
 /// Kill-switch : `SARAGOSSA_RUST_FLINT_MOE_COOP=0`.
 pub(crate) fn flint_moe_coop_enabled() -> bool {
     #[cfg(test)]

@@ -1206,7 +1206,11 @@ fn flint_int4_metal_matches_mlx_oracle() {
     // 1. Logits du prompt : prefill résident (et per-op CPU, pour le temps
     //    « avant ») contre mlx f32. Le premier prefill Metal paie aussi la
     //    résolution des poids GPU ; le temps retenu est celui du greedy.
-    let (cpu_hidden, metal_hidden, cpu_time, metal_time) = timed_prefills(&model, &prompt_ids);
+    //    MoE qmv (f32) ici ; le coop groupé (bf16), défaut, est mesuré après.
+    let (cpu_hidden, metal_hidden, cpu_time, metal_time) =
+        crate::metal_backend::with_flint_moe_coop_override(false, || {
+            timed_prefills(&model, &prompt_ids)
+        });
     println!(
         "prompt {} tokens : prefill CPU per-op {cpu_time:.1?}, prefill Metal à froid {metal_time:.1?}",
         prompt_ids.len()
@@ -1227,7 +1231,7 @@ fn flint_int4_metal_matches_mlx_oracle() {
         &metal_rows,
         prompt_ids.len(),
     );
-    // Le prefill résident calcule en f32 la formule de l'oracle CPU ; seuls
+    // Le prefill résident qmv calcule en f32 la formule de l'oracle CPU ; seuls
     // l'ordre d'accumulation et les kernels diffèrent : seuils CPU contre mlx.
     assert!(argmax_ok, "argmax du prefill Metal divergent");
     assert!(
@@ -1237,6 +1241,38 @@ fn flint_int4_metal_matches_mlx_oracle() {
     assert!(
         mean < MEAN_GAP_F32,
         "prefill: écart moyen {mean} ≥ {MEAN_GAP_F32}"
+    );
+    // MoE coop groupé : activations et intermédiaire SwiGLU arrondis en bf16,
+    // donc bornes de mlx bf16 contre mlx f32.
+    // NOTE: Mesuré le 30 oct. 2026 : pire max 14,39 et moyenne 2,13 à la
+    // position 3, celle où mlx bf16 s'écarte lui-même de mlx f32 (16,94 et
+    // 2,62) ; le qmv y est à 0,05. Quasi-égalité de routage sensible à
+    // l'arrondi bf16, argmax identique.
+    let coop_hidden = crate::metal_backend::with_flint_moe_coop_override(true, || {
+        model.prefill_hidden_for_test(
+            &prompt_ids,
+            Some(crate::runtime_flags::prefill_resident_chunk_tokens()),
+        )
+    })
+    .expect("invariant: prefill résident coop")
+    .expect("prefill résident Metal attendu pour flint");
+    let coop_rows = model
+        .logits_of_hidden_rows_for_test(&coop_hidden, &all_rows)
+        .expect("invariant: logits du prefill coop");
+    let (max, mean, argmax_ok) = compare_oracle(
+        "prefill Metal coop mlx-f32",
+        &oracle_dir,
+        &coop_rows,
+        prompt_ids.len(),
+    );
+    assert!(argmax_ok, "argmax du prefill coop divergent");
+    assert!(
+        max < MAX_GAP_MLX_BF16,
+        "prefill coop: écart max {max} ≥ {MAX_GAP_MLX_BF16}"
+    );
+    assert!(
+        mean < MEAN_GAP_MLX_BF16,
+        "prefill coop: écart moyen {mean} ≥ {MEAN_GAP_MLX_BF16}"
     );
 
     // 2. Greedy de production : prefill Metal (à chaud) puis decode résident.
@@ -1271,9 +1307,15 @@ fn flint_int4_metal_matches_mlx_oracle() {
 
     // 3. Logits GPU des pas 1..16 : continuation de référence forcée, comparée
     //    ligne à ligne aux logits mlx (la ligne 0 vient du prefill).
-    let rows = model
-        .resident_forced_logits_for_test(&prompt_ids, &greedy_ids[..greedy_ids.len() - 1], false)
-        .expect("invariant: logits résidents");
+    //    Prefill MoE qmv, pour garder les seuils f32.
+    let rows = crate::metal_backend::with_flint_moe_coop_override(false, || {
+        model.resident_forced_logits_for_test(
+            &prompt_ids,
+            &greedy_ids[..greedy_ids.len() - 1],
+            false,
+        )
+    })
+    .expect("invariant: logits résidents");
     let (_, reference) = read_npy_f32(&oracle_dir.join("oracle_greedy_logits.npy"));
     let vocab = rows[0].len();
     let (mut max, mut mean, mut argmax_ok) = (0.0_f32, 0.0_f32, true);
@@ -1295,8 +1337,12 @@ fn flint_int4_metal_matches_mlx_oracle() {
 
     // 4. Prompt long synthétique contre le prefill per-op CPU (oracle F1) :
     //    positions de part et d'autre de la fenêtre de 513 tokens.
+    //    MoE qmv (f32) ; le coop est mesuré à 16k par `flint_int4_moe_coop_matches_qmv`.
     let long_ids = synthetic_long_prompt(&assets, 1000);
-    let (cpu_hidden, metal_hidden, cpu_time, metal_time) = timed_prefills(&model, &long_ids);
+    let (cpu_hidden, metal_hidden, cpu_time, metal_time) =
+        crate::metal_backend::with_flint_moe_coop_override(false, || {
+            timed_prefills(&model, &long_ids)
+        });
     println!(
         "prompt long {} tokens : prefill CPU per-op {cpu_time:.1?}, prefill Metal {metal_time:.1?} → {:.0} tok/s",
         long_ids.len(),
