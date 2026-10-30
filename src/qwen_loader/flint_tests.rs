@@ -584,11 +584,11 @@ fn synthetic_flint_prefix_extension_matches_full_prefill() {
     }
 }
 
-/// Stockage bf16 du K/V de prefill (seuil forcé à 0, opt-in flint forcé)
+/// Stockage bf16 du K/V de prefill (seuil forcé à 0, flag flint forcé)
 /// contre le stockage f32 : prefill par morceaux, dont les morceaux relisent
 /// le K/V arrondi par les jumeaux bf16 des kernels à sinks (pleine et
 /// fenêtrée), puis prolongement d'un préfixe et greedy. La dérive des hidden
-/// est chiffrée ; les tokens greedy doivent rester ceux du CPU. Sans l'opt-in,
+/// est chiffrée ; les tokens greedy doivent rester ceux du CPU. Sans le flag flint,
 /// le seuil seul ne change aucun octet.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
@@ -616,7 +616,7 @@ fn synthetic_flint_prefill_kv_bf16_store_drift() {
         assert_eq!(
             max_gap(reference.data(), hidden(&opted_out).data()),
             0.0,
-            "morceaux de {chunk_tokens}: stockage bf16 pris sans l'opt-in flint"
+            "morceaux de {chunk_tokens}: stockage bf16 pris sans le flag flint"
         );
         let gap = max_gap(reference.data(), hidden(&bf16_store).data());
         let scale = reference
@@ -662,11 +662,11 @@ fn synthetic_flint_prefill_kv_bf16_store_drift() {
     }
 }
 
-/// Adoption par l'arène de decode du K/V bf16 de flint (opt-in forcé, seuil
+/// Adoption par l'arène de decode du K/V bf16 de flint (flag flint forcé, seuil
 /// 0) : couche pleine à sinks et couches fenêtrées (fenêtre 2, dépassée par
 /// le prompt et le decode). L'arène tient la réserve du prefill de chaque
 /// couche pendant le decode, et les tokens échantillonnés (arène bf16) sont
-/// ceux du semis par copie. Sans l'opt-in, le K/V reste f32 : rien n'est
+/// ceux du semis par copie. Sans le flag flint, le K/V reste f32 : rien n'est
 /// adoptable.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
@@ -687,7 +687,7 @@ fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
     .expect("invariant: prefill résident flint");
     assert!(
         opted_out.kv_bf16_prefixes_for_test().is_empty(),
-        "K/V bf16 sans l'opt-in flint"
+        "K/V bf16 sans le flag flint"
     );
     if !crate::decode_resident::kv_bf16_dense_by_default() {
         return;
@@ -1276,7 +1276,7 @@ fn flint_int4_prefill_ttft_bench() {
 /// Stockage bf16 du K/V de prefill sur flint-int4 réel : prompt synthétique
 /// de `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, au-delà du seuil de
 /// 16 384), prefill résident par morceaux avec K/V f32 puis bf16 (seuil et
-/// opt-in flint forcés par override), format du cache vérifié (tout bf16 ou
+/// flag flint forcés par override), format du cache vérifié (tout bf16 ou
 /// tout f32), logits comparés aux frontières réelles des morceaux (écarts
 /// centrés, argmax) et 16 tokens greedy de production identiques. Une seule
 /// copie des poids en mémoire à la fois.
@@ -1376,9 +1376,9 @@ fn flint_int4_prefill_kv_bf16_store_drift() {
     // identique. Hors frontières, une mesure précédente relevait 4,06/0,77
     // (ligne 2048) et 7,32/1,34 (ligne 16 384) : la dérive dépend de la
     // position, pas du découpage.
-    // Bornes larges d'un garde-fou de mesure, pas un budget de qualité :
-    // l'opt-in reste requis tant que la dérive n'est pas validée sur
-    // d'autres prompts.
+    // Bornes larges d'un garde-fou de mesure, pas un budget de qualité : la
+    // qualité est validée en serve (intégrité 4/4 sur 7 contextes de 32k à
+    // 115k, cf. `flint_prefill_kv_bf16_store_enabled`).
     assert!(
         max < MAX_GAP_MLX_BF16,
         "écart max {max} ≥ {MAX_GAP_MLX_BF16}"
@@ -1473,7 +1473,7 @@ fn resident_decode_steps() -> usize {
 
 /// Adoption du K/V bf16 de flint-int4 réel par l'arène de decode : prompt de
 /// `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, au-delà des seuils
-/// de stockage et d'arène bf16), opt-in forcé, 16 tokens greedy identiques
+/// de stockage et d'arène bf16), flag flint forcé, 16 tokens greedy identiques
 /// au semis par copie et réserve tenue par l'arène de toutes les couches.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
