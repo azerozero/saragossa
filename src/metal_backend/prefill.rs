@@ -18,6 +18,14 @@ mod sink_tests;
 #[cfg(test)]
 mod tests;
 
+impl MetalExecutor {
+    /// Le prefill borne-t-il le K/V des couches glissantes à sinks à leur
+    /// fenêtre (`SARAGOSSA_RUST_FLINT_WINDOW_KV`, forcé en test) ?
+    pub(crate) fn prefill_window_kv(&self) -> bool {
+        self.prefill_window_kv
+    }
+}
+
 #[cfg(test)]
 impl MetalExecutor {
     /// Seuil du stockage bf16 du K/V de prefill, pour les tests hors de ce
@@ -29,6 +37,11 @@ impl MetalExecutor {
     /// Opt-in du stockage bf16 pour les couches à sinks (flint), hors env.
     pub(crate) fn set_prefill_kv_bf16_store_sinks_for_test(&mut self, enabled: bool) {
         self.prefill_kv_bf16_store_sinks = enabled;
+    }
+
+    /// K/V borné à la fenêtre des couches glissantes à sinks, hors env.
+    pub(crate) fn set_prefill_window_kv_for_test(&mut self, enabled: bool) {
+        self.prefill_window_kv = enabled;
     }
 }
 
@@ -239,10 +252,26 @@ enum PrefillResidentLayerCacheBuffer {
         replaces_prefix: bool,
         /// `key`/`value` sont les buffers du préfixe, prolongés en place.
         in_place: Option<InPlaceReuse>,
+        /// Couche glissante à sinks bornée à sa fenêtre : `key`/`value` ne
+        /// portent que les lignes `[base, ...)`, cf. [`PrefillWindowKv`].
+        window: Option<PrefillWindowKv>,
     },
     Linear {
         state: LinearAttentionMetalState,
     },
+}
+
+/// K/V borné d'une couche glissante à sinks : le buffer de `capacity`
+/// lignes porte les lignes absolues `[base, base + capacity)`. Avant un
+/// morceau qui déborderait, les `keep` dernières lignes (la fenêtre) sont
+/// recopiées au début et `base` avance. `capacity` vaut au plus
+/// `2 × keep + morceau` : une compaction ne part que d'au-delà de `2 × keep`
+/// lignes, source et destination sont disjointes.
+struct PrefillWindowKv {
+    keep: usize,
+    capacity: usize,
+    /// Ligne absolue du début du buffer, dans l'ordre d'encodage.
+    base: Cell<usize>,
 }
 
 /// Copie bf16 persistante du K/V (après RoPE) d'une couche full-attention,

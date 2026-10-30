@@ -675,6 +675,7 @@ fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
         let mut executor = crate::MetalExecutor::new().expect("invariant: executor Metal");
         executor.set_prefill_kv_bf16_store_min_rows_for_test(Some(0));
         executor.set_prefill_kv_bf16_store_sinks_for_test(sinks);
+        executor.set_prefill_window_kv_for_test(false);
         load(flint_tensors(true))
             .expect("invariant: flint synthétique")
             .with_metal_executor(executor)
@@ -701,9 +702,130 @@ fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
     let bf16 = gpu(true);
     let (copied, tokens, adopted) =
         bf16.decode_with_and_without_adoption_for_test(&prompt, 3, 6, &options);
-    assert!(adopted, "arène sans adoption du K/V bf16 de flint");
+    assert!(
+        adopted.iter().all(|&adopted| adopted),
+        "arène sans adoption du K/V bf16 de flint: {adopted:?}"
+    );
     assert_eq!(tokens.len(), 6);
     assert_eq!(tokens, copied, "adoption != semis par copie");
+    // K/V borné (défaut) : les couches glissantes sèment leur queue par
+    // copie, seule la couche pleine est adoptée ; mêmes tokens.
+    let mut executor = crate::MetalExecutor::new().expect("invariant: executor Metal");
+    executor.set_prefill_kv_bf16_store_min_rows_for_test(Some(0));
+    executor.set_prefill_kv_bf16_store_sinks_for_test(true);
+    let window = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let (window_copied, window_tokens, window_adopted) =
+        window.decode_with_and_without_adoption_for_test(&prompt, 3, 6, &options);
+    // Couche 0 pleine adoptée, couches 1 et 2 glissantes bornées semées
+    // par copie de leur queue.
+    assert_eq!(
+        window_adopted,
+        vec![true, false, false],
+        "adoption par couche (pleine, glissante, glissante)"
+    );
+    assert_eq!(window_tokens, window_copied, "K/V borné: adoption != copie");
+    assert_eq!(window_tokens, tokens, "K/V borné != K/V plein");
+}
+
+/// K/V des couches glissantes borné à la fenêtre (2 lignes ici) contre le
+/// K/V plein du kill-switch, en f32 puis en bf16 : hidden de toutes les
+/// positions et tokens (greedy, arène f32 ; échantillonné, arène bf16)
+/// bit-identiques, sur des morceaux de 1 (une compaction par morceau), 2
+/// (dernier morceau plus court que la fenêtre), 3 et 5 lignes, puis sur un
+/// tour 2 dont le préfixe est plus court ou plus long que la fenêtre. Les
+/// couches glissantes ne gardent que leur fenêtre, la couche pleine tout.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_window_kv_matches_full_kv_bit_for_bit() {
+    let gpu = |window, bf16| {
+        let mut executor = crate::MetalExecutor::new().expect("invariant: executor Metal");
+        executor.set_prefill_window_kv_for_test(window);
+        executor.set_prefill_kv_bf16_store_min_rows_for_test(Some(0));
+        executor.set_prefill_kv_bf16_store_sinks_for_test(bf16);
+        load(flint_tensors(true))
+            .expect("invariant: flint synthétique")
+            .with_metal_executor(executor)
+            .expect("invariant: runtime Metal attaché")
+    };
+    let bits = |tensor: &crate::Tensor| -> Vec<u32> {
+        tensor.data().iter().map(|value| value.to_bits()).collect()
+    };
+    let decode = |gpu: &CausalDecoder, state, options: &crate::GenerationOptions| {
+        gpu.generate_greedy_timed_from_prompt_state_with_options(
+            state,
+            std::time::Duration::ZERO,
+            6,
+            options,
+        )
+        .expect("invariant: decode résident")
+        .tokens
+    };
+    let sampled = crate::GenerationOptions {
+        temperature: 0.8,
+        seed: 7,
+        ..crate::GenerationOptions::default()
+    };
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
+    let len = prompt.len();
+    for bf16 in [false, true] {
+        let (bounded, full) = (gpu(true, bf16), gpu(false, bf16));
+        let state = |gpu: &CausalDecoder, chunk, split: usize| {
+            crate::metal_backend::with_prefill_kv_layout_override(chunk, 0, || {
+                let mut state = gpu.prefill_prompt_state_uncached(&prompt[..split])?;
+                gpu.extend_prompt_state(&mut state, &prompt[split..])?;
+                Ok::<_, crate::InferError>(state)
+            })
+            .expect("invariant: prefill résident flint")
+        };
+        for chunk in [1, 2, 3, 5] {
+            let hidden = |gpu: &CausalDecoder| {
+                gpu.prefill_hidden_for_test(&prompt, Some(chunk))
+                    .expect("invariant: prefill résident flint")
+                    .expect("prefill résident flint attendu")
+            };
+            assert_eq!(
+                bits(&hidden(&bounded)),
+                bits(&hidden(&full)),
+                "bf16={bf16} morceaux de {chunk}: hidden"
+            );
+        }
+        // Préfixe complet (tour 1), puis plus court (1) ou plus long (4, 9)
+        // que la fenêtre.
+        for (chunk, split) in [
+            (1, len),
+            (2, len),
+            (3, len),
+            (5, len),
+            (3, 1),
+            (3, 4),
+            (2, 9),
+        ] {
+            let label = format!("bf16={bf16} morceaux de {chunk}, préfixe {split}");
+            let (kept, all) = (state(&bounded, chunk, split), state(&full, chunk, split));
+            assert_eq!(
+                kept.kv_rows_for_test(),
+                vec![(0, len), (len - 2, 2), (len - 2, 2)],
+                "{label}: K/V borné"
+            );
+            assert_eq!(all.kv_rows_for_test(), vec![(0, len); 3], "{label}");
+            assert_eq!(
+                bits(kept.final_state_for_test()),
+                bits(all.final_state_for_test()),
+                "{label}: hidden final"
+            );
+            for options in [&crate::GenerationOptions::default(), &sampled] {
+                assert_eq!(
+                    decode(&bounded, kept.clone(), options),
+                    decode(&full, all.clone(), options),
+                    "{label}: tokens (température {})",
+                    options.temperature
+                );
+            }
+        }
+    }
 }
 
 /// Le scratch du prefill résident flint passe par le scope de purge (marquage
@@ -1471,6 +1593,92 @@ fn resident_decode_steps() -> usize {
     crate::decoder::resident_decode_steps_for_test()
 }
 
+/// K/V des couches glissantes borné à la fenêtre sur flint-int4 réel contre
+/// le K/V plein du kill-switch, en f32 puis en bf16 (stockage forcé) : prompt
+/// de `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, cinq morceaux),
+/// hidden de toutes les positions et 16 tokens greedy bit-identiques, couches
+/// glissantes réduites à leur fenêtre. Une seule copie des poids à la fois.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis"]
+fn flint_int4_window_kv_matches_full_kv() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("test flint fenêtre sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    let len = std::env::var("SARAGOSSA_FLINT_BF16_LEN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16_400);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let prompt = synthetic_long_prompt(&assets, len);
+    let chunk = crate::runtime_flags::prefill_resident_chunk_tokens();
+    let run = |window: bool, bf16: bool| {
+        let mut executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+        executor.set_prefill_window_kv_for_test(window);
+        executor.set_prefill_kv_bf16_store_min_rows_for_test(bf16.then_some(0));
+        executor.set_prefill_kv_bf16_store_sinks_for_test(bf16);
+        let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+            .expect("invariant: flint-int4 chargeable en Metal")
+            .with_metal_executor(executor)
+            .expect("invariant: runtime Metal attaché");
+        let started = std::time::Instant::now();
+        let hidden = model
+            .prefill_hidden_for_test(&prompt, Some(chunk))
+            .expect("invariant: prefill résident")
+            .expect("prefill résident Metal attendu pour flint");
+        let hidden = hidden
+            .data()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let state = model
+            .prefill_prompt_state_uncached(&prompt)
+            .expect("invariant: prefill résident");
+        let rows = state.kv_rows_for_test();
+        let tokens = model
+            .generate_greedy_timed_from_prompt_state_with_options(
+                state,
+                std::time::Duration::ZERO,
+                16,
+                &crate::GenerationOptions::default(),
+            )
+            .expect("invariant: génération résidente")
+            .tokens;
+        println!(
+            "fenêtre={window} bf16={bf16}: {:.1?}, greedy {tokens:?}",
+            started.elapsed()
+        );
+        (hidden, rows, tokens)
+    };
+    for bf16 in [false, true] {
+        let (window_hidden, window_rows, window_tokens) = run(true, bf16);
+        let (full_hidden, full_rows, full_tokens) = run(false, bf16);
+        let bounded = window_rows
+            .iter()
+            .filter(|(_, stored)| *stored == 513)
+            .count();
+        println!(
+            "bf16={bf16}: {bounded}/{} couches réduites à 513 lignes",
+            window_rows.len()
+        );
+        assert!(
+            bounded > 0
+                && full_rows
+                    .iter()
+                    .all(|&(base, stored)| (base, stored) == (0, len))
+        );
+        assert!(window_rows
+            .iter()
+            .all(|&(base, stored)| base + stored == len && (base == 0 || stored == 513)));
+        assert!(
+            window_hidden == full_hidden,
+            "bf16={bf16}: hidden K/V borné != K/V plein"
+        );
+        assert_eq!(window_tokens, full_tokens, "bf16={bf16}: greedy");
+    }
+}
+
 /// Adoption du K/V bf16 de flint-int4 réel par l'arène de decode : prompt de
 /// `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, au-delà des seuils
 /// de stockage et d'arène bf16), flag flint forcé, 16 tokens greedy identiques
@@ -1492,6 +1700,9 @@ fn flint_int4_arena_adopts_prefill_kv_bf16() {
     let mut executor = crate::MetalExecutor::new().expect("invariant: device Metal");
     executor.set_prefill_kv_bf16_store_min_rows_for_test(Some(0));
     executor.set_prefill_kv_bf16_store_sinks_for_test(true);
+    // Couches glissantes bornées à leur fenêtre : queue recopiée, l'adoption
+    // de toutes les couches n'existe que sous le kill-switch.
+    executor.set_prefill_window_kv_for_test(false);
     let model = crate::load_causal_decoder_for_metal(&assets, &executor)
         .expect("invariant: flint-int4 chargeable en Metal")
         .with_metal_executor(executor)
@@ -1508,6 +1719,9 @@ fn flint_int4_arena_adopts_prefill_kv_bf16() {
         "{len} tokens en {:.1?} : copie {copied:?}, adoption {tokens:?}",
         started.elapsed()
     );
-    assert!(adopted, "arène sans adoption du K/V bf16 de flint-int4");
+    assert!(
+        adopted.iter().all(|&adopted| adopted),
+        "arène sans adoption du K/V bf16 de flint-int4: {adopted:?}"
+    );
     assert_eq!(tokens, copied, "greedy adopté != semis par copie");
 }

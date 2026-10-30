@@ -235,6 +235,108 @@ fn neutral_sink_is_bit_identical_to_historical_kernels() -> Result<()> {
     Ok(())
 }
 
+/// Arène bornée à la fenêtre 513 (queue semée à la ligne 0, base tenue côté
+/// hôte) contre l'arène pleine : octets identiques en f32 et bf16, sur le
+/// choix de production (2-passes fenêtré), le naïf et le 2-passes forcés, à
+/// 512, 513 et 514 lignes, puis pendant un decode qui franchit la fenêtre
+/// (`base + 513`, `+ 1`, `+ 513`). Positions sous la base refusées.
+#[test]
+fn bounded_arena_matches_full_arena_bit_for_bit() -> Result<()> {
+    const WINDOW: usize = 513;
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    let sinks = sinks();
+    let kv_dim = KV_HEADS * HEAD_DIM;
+    let with_sinks = |mut kv: FullAttentionMetalState| -> Result<FullAttentionMetalState> {
+        let buffer = state.device.new_buffer_with_data(
+            sinks.as_ptr().cast(),
+            std::mem::size_of_val(sinks.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        kv.set_sinks(&state, buffer)?;
+        Ok(kv)
+    };
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    for format in [KvFormat::F32, KvFormat::Bf16] {
+        for (len, decode) in [(512, 0), (513, 0), (514, 0), (700 + WINDOW, WINDOW)] {
+            let total = len + decode;
+            let case = case(total);
+            let base = len.saturating_sub(WINDOW);
+            let mut full =
+                state.full_attention_format_for_test(total, Q_HEADS, KV_HEADS, HEAD_DIM, format)?;
+            full.seed(
+                &case.keys[..len * kv_dim],
+                &case.values[..len * kv_dim],
+                len,
+            )?;
+            let mut bounded = state.full_attention_format_for_test(
+                total - base,
+                Q_HEADS,
+                KV_HEADS,
+                HEAD_DIM,
+                format,
+            )?;
+            bounded.rebase(base)?;
+            bounded.seed_segments(
+                &[KvSegment::Cpu(&case.keys[base * kv_dim..len * kv_dim])],
+                &[KvSegment::Cpu(&case.values[base * kv_dim..len * kv_dim])],
+                len,
+            )?;
+            let (mut full, mut bounded) = (with_sinks(full)?, with_sinks(bounded)?);
+            for step in 0..=decode {
+                let rows = len + step;
+                if step == 0 || step == 1 || step == decode {
+                    let window_start = rows.saturating_sub(WINDOW);
+                    let label = format!("{format:?} len={len} decode={step}");
+                    assert!(
+                        same(
+                            &full.attention_decode_windowed(&case.q, window_start)?,
+                            &bounded.attention_decode_windowed(&case.q, window_start)?,
+                        ),
+                        "{label}: production"
+                    );
+                    assert!(
+                        same(
+                            &full.attention_decode_sink_naive(&case.q, window_start)?,
+                            &bounded.attention_decode_sink_naive(&case.q, window_start)?,
+                        ),
+                        "{label}: naïf"
+                    );
+                    assert!(
+                        same(
+                            &full.attention_decode_sink_two_pass(&case.q, window_start)?,
+                            &bounded.attention_decode_sink_two_pass(&case.q, window_start)?,
+                        ),
+                        "{label}: 2-passes"
+                    );
+                }
+                if step < decode {
+                    let row = (rows * kv_dim)..((rows + 1) * kv_dim);
+                    for kv in [&mut full, &mut bounded] {
+                        kv.append_row(&case.keys[row.clone()], &case.values[row.clone()])?;
+                    }
+                }
+            }
+            assert_eq!(bounded.len(), total);
+            assert_eq!(
+                full.read_rows(base, total - base)?,
+                bounded.read_rows(base, total - base)?
+            );
+            if base > 0 {
+                assert!(bounded.read_rows(base - 1, 1).is_err());
+                assert!(bounded
+                    .attention_decode_windowed(&case.q, base - 1)
+                    .is_err());
+                assert!(bounded.truncate(base - 1).is_err());
+                bounded.truncate(base)?;
+                assert_eq!(bounded.len(), base);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn sinks_refused_on_quantized_kv() -> Result<()> {
     let Some(state) = try_state()? else {

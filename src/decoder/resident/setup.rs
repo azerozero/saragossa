@@ -1002,7 +1002,10 @@ impl CausalDecoder {
     /// L'arène peut-elle adopter le K/V du prefill de cette couche ? Oui hors
     /// fenêtre glissante, et pour une fenêtrée à sinks (flint) : l'arène y
     /// garde ses lignes à leur position absolue et le decode fenêtré lit
-    /// `window_start..len`, comme sur une copie.
+    /// `window_start..len`, comme sur une copie. Une couche dont le K/V est
+    /// borné à la fenêtre (`SARAGOSSA_RUST_FLINT_WINDOW_KV`, base non nulle)
+    /// n'est jamais adoptée : sa queue est recopiée
+    /// (`resident_full_attention_state`).
     ///
     /// TODO: adopter aussi les fenêtrées sans sinks (Gemma 4, prefill résident
     /// opt-in, NAX d256) une fois couvertes par un test d'adoption contre
@@ -1043,12 +1046,14 @@ impl CausalDecoder {
             }
             let kv_dim = self.config.resident_full_attention_kv_dim(index)?;
             if self.layer_kv_adoption_allowed(index)
+                && layer_cache.base_rows() == 0
                 && layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16)
             {
                 continue;
             }
+            // Couche bornée à sa fenêtre : l'arène ne porte que sa queue.
             kv_bytes = kv_bytes.saturating_add(checked_bytes(
-                &[2, capacity, kv_dim],
+                &[2, arena_rows(layer_cache, capacity)?, kv_dim],
                 element,
                 "KV résident",
             )?);
@@ -1134,7 +1139,14 @@ fn resident_full_attention_state(
 ) -> Result<crate::decode_resident::FullAttentionMetalState> {
     let (keys, values) = (layer_cache.keys.segments(), layer_cache.values.segments());
     let kv_dim = kv_heads * head_dim;
-    let adoptable = adoption_allowed && layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16);
+    // K/V borné à la fenêtre (couche glissante à sinks) : l'arène sème la
+    // queue à la ligne 0 de son buffer et traduit les positions absolues.
+    // ponytail: pas d'adoption en v1, la queue (≈ 0,5 Mio par couche) est
+    // recopiée ; adopter exigerait une réserve derrière le buffer de queue.
+    let base = layer_cache.base_rows();
+    let capacity = arena_rows(layer_cache, capacity)?;
+    let adoptable =
+        adoption_allowed && base == 0 && layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16);
     if let (true, Some(key_prefix), Some(value_prefix)) = (
         adoptable,
         layer_cache.keys.adoptable_bf16_prefix(),
@@ -1178,8 +1190,21 @@ fn resident_full_attention_state(
     } else {
         arena.full_attention(capacity, q_heads, kv_heads, head_dim, kv_bf16)?
     };
+    full.rebase(base)?;
     full.seed_segments(&keys, &values, prefill_len)?;
     Ok(full)
+}
+
+/// Lignes de l'arène d'une couche pour `capacity` positions absolues : sans
+/// les lignes sorties de la fenêtre (`LayerKvCache::base_rows`).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn arena_rows(layer_cache: &LayerKvCache, capacity: usize) -> Result<usize> {
+    let base = layer_cache.base_rows();
+    capacity.checked_sub(base).ok_or_else(|| {
+        InferError::Dimension(format!(
+            "arène KV de {capacity} positions sous la base {base}"
+        ))
+    })
 }
 
 /// Les buffers K/V du prefill de cette couche seront-ils adoptés par une
@@ -1255,6 +1280,7 @@ mod tests {
             crate::metal_backend::PrefillKvRows::SharedBf16(key.clone()),
             crate::metal_backend::PrefillKvRows::SharedBf16(value.clone()),
             kv_dim,
+            0,
             &layout,
         )?;
         // Estimation de la garde : couche adoptée, K/V hors budget.

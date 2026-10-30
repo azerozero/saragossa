@@ -299,6 +299,9 @@ pub struct MetalExecutor {
     prefill_kv_bf16_store_sinks: bool,
     /// Choix du Steel avec sinks (lu du flag, forcé en test).
     prefill_sink_steel: bool,
+    /// K/V des couches glissantes à sinks borné à la fenêtre (lu du flag,
+    /// forcé en test).
+    prefill_window_kv: bool,
     causal_attention_prefill_steel_nax_d256: Option<attention::NaxCausalAttention>,
     /// Miroir bf16 du K/V pour le NAX par morceaux (lu du flag, forcé en test).
     prefill_kv_bf16_mirror: bool,
@@ -778,10 +781,13 @@ pub(crate) enum PrefillResidentPrefixLayer<'a> {
     /// leur début (vue partagée d'un prefill à froid) ; s'ils ont la place
     /// des lignes nouvelles, le prolongement y écrit à la suite au lieu de
     /// recopier le préfixe dans un buffer neuf.
+    /// `base` : lignes absentes devant les segments (couche glissante
+    /// bornée à sa fenêtre), qui couvrent alors `[base, rows)`.
     Full {
         key: Vec<crate::decode_resident::KvSegment<'a>>,
         value: Vec<crate::decode_resident::KvSegment<'a>>,
         in_place: Option<[metal::Buffer; 2]>,
+        base: usize,
     },
     Linear {
         state: &'a LinearAttentionMetalState,
@@ -812,11 +818,14 @@ impl PrefillKvPlacement {
 
 #[derive(Debug)]
 pub(crate) enum PrefillResidentLayerCache {
+    /// `base` : lignes absolues absentes devant `key`/`value` (couche
+    /// glissante bornée à sa fenêtre), 0 sinon.
     Full {
         key: PrefillKvRows,
         value: PrefillKvRows,
         kv_dim: usize,
         placement: PrefillKvPlacement,
+        base: usize,
     },
     Linear {
         state: LinearAttentionMetalState,

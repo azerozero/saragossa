@@ -249,6 +249,7 @@ impl DecodeResidentState {
             quant,
             adopted: None,
             floor: 0,
+            base: 0,
             capacity,
             len: 0,
             q_heads,
@@ -752,6 +753,12 @@ pub(crate) struct FullAttentionMetalState {
     /// Lignes du préfixe adopté, vues par le cache CPU : jamais réécrites,
     /// `len` ne descend pas en dessous.
     floor: usize,
+    /// Lignes absolues absentes devant la ligne 0 du buffer (couche
+    /// glissante bornée à sa fenêtre, cf. [`Self::rebase`]). `capacity`,
+    /// `len` et `floor` comptent les lignes du buffer ; l'API publique
+    /// (`len()`, `truncate`, `read_rows`, `seed_segments`, fenêtre) parle en
+    /// lignes absolues.
+    base: usize,
     capacity: usize,
     len: usize,
     q_heads: usize,
@@ -850,24 +857,62 @@ impl FullAttentionMetalState {
         self.kv_heads * self.head_dim
     }
 
-    /// Renvoie le nombre de lignes valides (= position courante).
+    /// Renvoie le nombre de lignes valides (= position courante), lignes
+    /// absentes devant le buffer comprises.
     pub(crate) fn len(&self) -> usize {
+        self.base + self.len
+    }
+
+    /// Lignes écrites dans le buffer, depuis sa ligne 0.
+    pub(super) fn stored_len(&self) -> usize {
         self.len
+    }
+
+    /// Déclare `base` lignes absolues absentes devant la ligne 0 d'une arène
+    /// encore vide : le semis suivant porte les lignes `[base, n)` (couche
+    /// glissante bornée à sa fenêtre). Les kernels lisent le buffer comme
+    /// avant ; seule la traduction des positions absolues change.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si l'arène porte déjà des lignes ou un préfixe adopté.
+    pub(crate) fn rebase(&mut self, base: usize) -> Result<()> {
+        if self.len != 0 || self.floor != 0 || self.adopted.is_some() {
+            return Err(InferError::Dimension(format!(
+                "base KV {base} sur une arène de {} lignes (plancher {})",
+                self.len, self.floor
+            )));
+        }
+        self.base = base;
+        Ok(())
+    }
+
+    /// Ligne du buffer de la ligne absolue `row`.
+    fn stored_row(&self, row: usize, label: &str) -> Result<usize> {
+        row.checked_sub(self.base).ok_or_else(|| {
+            InferError::Dimension(format!(
+                "{label}: ligne {row} sortie du K/V borné (base {})",
+                self.base
+            ))
+        })
     }
 
     /// Tronque le nombre de lignes K/V valides sans recopier les buffers.
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si `len` dépasse la capacité allouée.
+    /// Renvoie une erreur si `len` dépasse la capacité allouée ou descend
+    /// sous le préfixe adopté ou la base.
     pub(crate) fn truncate(&mut self, len: usize) -> Result<()> {
-        if len > self.capacity || len < self.floor {
+        let stored = self.stored_row(len, "truncate KV")?;
+        if stored > self.capacity || stored < self.floor {
             return Err(InferError::Dimension(format!(
-                "truncate KV {len} hors [{}, {}] (préfixe adopté, capacité)",
-                self.floor, self.capacity
+                "truncate KV {len} hors [{}, {}] (base, préfixe adopté, capacité)",
+                self.base + self.floor,
+                self.base + self.capacity
             )));
         }
-        self.len = len;
+        self.len = stored;
         Ok(())
     }
 
@@ -919,6 +964,7 @@ impl FullAttentionMetalState {
     ///
     /// Renvoie une erreur si `from + rows` dépasse les lignes valides.
     pub(crate) fn read_rows(&self, from: usize, rows: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let from = self.stored_row(from, "read KV rows")?;
         let end = from
             .checked_add(rows)
             .filter(|end| *end <= self.len)
@@ -1021,8 +1067,10 @@ impl FullAttentionMetalState {
         n_rows: usize,
     ) -> Result<()> {
         // Arène adoptée : les segments suivent le préfixe déjà en place, à
-        // partir du plancher, jamais réécrit.
+        // partir du plancher, jamais réécrit. Arène bornée : ils commencent
+        // à la base.
         let first = self.floor;
+        let n_rows = self.stored_row(n_rows, "seed KV")?;
         if n_rows > self.capacity || first > n_rows {
             return Err(InferError::Dimension(format!(
                 "seed KV {first}..{n_rows} hors [{}, {}]",
@@ -1298,6 +1346,7 @@ impl FullAttentionMetalState {
             .sinks
             .as_ref()
             .ok_or_else(|| InferError::Config("naïf avec sink sans sinks".to_string()))?;
+        let window_start = self.stored_row(window_start, "naïf avec sink")?;
         let dims = U32x4Param::Bytes([
             to_u32(self.q_heads, "q_heads")?,
             to_u32(self.kv_heads, "kv_heads")?,
@@ -1329,6 +1378,7 @@ impl FullAttentionMetalState {
             .sinks
             .as_ref()
             .ok_or_else(|| InferError::Config("2-passes avec sink sans sinks".to_string()))?;
+        let window_start = self.stored_row(window_start, "2-passes avec sink")?;
         self.attention_decode_with(q, |encoder, q_buf, _scores, out_buf| {
             self.encode_attention_decode_sink_windowed_2pass(
                 encoder,
@@ -1421,6 +1471,9 @@ impl FullAttentionMetalState {
                 "attention_decode sur KV vide".to_string(),
             ));
         }
+        // Fenêtre absolue → ligne du buffer : une arène bornée relit les
+        // mêmes lignes, dans le même ordre, depuis un pointeur décalé.
+        let window_start = self.stored_row(window_start, "attention_decode fenêtre")?;
         if window_start >= self.len {
             return Err(InferError::Dimension(format!(
                 "attention_decode fenêtre vide: début={window_start}, len={}",
@@ -1469,8 +1522,9 @@ impl FullAttentionMetalState {
         row: usize,
     ) -> Result<()> {
         // Ce chemin (bloc MTP) suppose une fenêtre nulle et n'a pas de variante
-        // avec sink : refus explicite plutôt qu'une attention fausse.
-        if self.sinks.is_some() {
+        // avec sink : refus explicite plutôt qu'une attention fausse. La
+        // position GPU est absolue : une arène bornée est refusée aussi.
+        if self.sinks.is_some() || self.base != 0 {
             return Err(InferError::Config(
                 "attention en position GPU avec sinks ou fenêtre non supportée".to_string(),
             ));
@@ -1987,6 +2041,11 @@ impl FullAttentionMetalState {
         rows: &GpuPositionRows<'_>,
         row: usize,
     ) -> Result<()> {
+        if self.base != 0 {
+            return Err(InferError::Config(
+                "append KV en position GPU sur une arène bornée".to_string(),
+            ));
+        }
         let position = rows.position();
         let pipeline = rows.copy_at_position();
         check_gpu_position_rows(

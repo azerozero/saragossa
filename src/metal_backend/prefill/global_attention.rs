@@ -42,11 +42,19 @@ impl MetalExecutor {
                     kv_dim,
                     bf16_mirror,
                     bf16_store,
+                    window,
                     ..
                 },
             ) => {
                 let kv_chunk_len = checked_len(spec.seq, *kv_dim, "resident kv morceau")?;
-                let kv_cache_offset = checked_len(chunk.start, *kv_dim, "resident kv offset")?
+                // Ligne du buffer où écrire le morceau : la position absolue
+                // (RoPE, causalité) reste `chunk.start`. Couche bornée qui
+                // déborderait : la fenêtre est d'abord recopiée au début.
+                let (kv_row, compaction) = match window {
+                    Some(window) => window_kv_row(window, chunk)?,
+                    None => (chunk.start, None),
+                };
+                let kv_cache_offset = checked_len(kv_row, *kv_dim, "resident kv offset")?
                     .checked_mul(std::mem::size_of::<f32>())
                     .and_then(|bytes| u64::try_from(bytes).ok())
                     .ok_or_else(|| InferError::Shape("resident kv offset déborde".to_string()))?;
@@ -66,6 +74,19 @@ impl MetalExecutor {
                     sinks: sinks_buffer,
                 } = full_scratch;
                 self.run_resident_prefill_section(context, "qkv", |encoder, owned| {
+                    if let Some((from, keep)) = compaction {
+                        for cache in [key_cache, value_cache] {
+                            self.encode_kv_copy(
+                                encoder,
+                                cache,
+                                checked_len(from, *kv_dim, "K/V fenêtré compaction")?,
+                                cache,
+                                0,
+                                checked_len(keep, *kv_dim, "K/V fenêtré compaction")?,
+                                *bf16_store,
+                            )?;
+                        }
+                    }
                     if kv_only {
                         // Seul le K/V de ces positions sert : Q et la suite sont sautés.
                     } else if gated {
@@ -162,7 +183,7 @@ impl MetalExecutor {
                     if *bf16_store {
                         // Même `bfloat(x)` que la conversion du NAX ou du
                         // miroir : K/V lus à l'identique.
-                        let kv_start = checked_len(chunk.start, *kv_dim, "resident kv bf16")?;
+                        let kv_start = checked_len(kv_row, *kv_dim, "resident kv bf16")?;
                         for (chunk_kv, cache) in
                             [(&k_rope_buffer, key_cache), (&v_buffer, value_cache)]
                         {
@@ -217,7 +238,7 @@ impl MetalExecutor {
                                 &context_buffer,
                                 sinks_buffer,
                                 spec,
-                                chunk.start + chunk.rows,
+                                kv_row + chunk.rows,
                                 *bf16_store,
                             );
                         }
@@ -410,6 +431,97 @@ impl MetalExecutor {
             MTLSize::new(RMS_HEADS_TG_WIDTH, 1, 1),
         );
         post_dispatch_barrier(encoder);
+        Ok(())
+    }
+}
+
+/// Ligne du buffer borné où écrire `chunk`, et la compaction à encoder avant
+/// (`(première ligne de la fenêtre dans le buffer, lignes gardées)`) si le
+/// morceau déborderait. Le kernel à sinks relit alors exactement les mêmes
+/// lignes : sa fenêtre `[abs + 1 - keep, abs]`, ramenée au buffer, commence
+/// à `rel + 1 - keep ≥ 0` dès que `rel ≥ keep - 1` lignes précèdent la
+/// requête, ce que garantit la queue de `keep` lignes.
+fn window_kv_row(
+    window: &PrefillWindowKv,
+    chunk: ResidentPrefillChunk,
+) -> Result<(usize, Option<(usize, usize)>)> {
+    let base = window.base.get();
+    let row = chunk.start.checked_sub(base).ok_or_else(|| {
+        InferError::Shape(format!(
+            "K/V fenêtré: morceau {} avant la base {base}",
+            chunk.start
+        ))
+    })?;
+    if row + chunk.rows <= window.capacity {
+        return Ok((row, None));
+    }
+    // Débordement : `row > capacity - rows ≥ 2 × keep`, la source
+    // `[row - keep, row)` ne recouvre pas la destination `[0, keep)`.
+    let from = row - window.keep.min(row);
+    if from < window.keep || window.keep + chunk.rows > window.capacity {
+        return Err(InferError::Shape(format!(
+            "K/V fenêtré: compaction {from}..{row} sur {} lignes gardées, capacité {}",
+            window.keep, window.capacity
+        )));
+    }
+    window.base.set(chunk.start - window.keep);
+    Ok((window.keep, Some((from, window.keep))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(capacity: usize, base: usize) -> PrefillWindowKv {
+        PrefillWindowKv {
+            keep: 513,
+            capacity,
+            base: Cell::new(base),
+        }
+    }
+
+    fn chunk(start: usize, rows: usize) -> ResidentPrefillChunk {
+        ResidentPrefillChunk {
+            start,
+            rows,
+            total: usize::MAX,
+        }
+    }
+
+    /// Fenêtre flint (513) : lignes d'écriture, compactions disjointes et
+    /// base absolue, en morceaux de 4096 (dernier plus court), de 100 (plus
+    /// courts que la fenêtre) et après la queue d'un préfixe.
+    #[test]
+    fn window_kv_row_compacts_disjoint_tail_at_window_513() -> Result<()> {
+        let big = window(2 * 513 + 4096, 0);
+        assert_eq!(window_kv_row(&big, chunk(0, 4096))?, (0, None));
+        assert_eq!(
+            window_kv_row(&big, chunk(4096, 4096))?,
+            (513, Some((3583, 513)))
+        );
+        assert_eq!(big.base.get(), 3583);
+        assert_eq!(
+            window_kv_row(&big, chunk(8192, 1000))?,
+            (513, Some((4096, 513)))
+        );
+        assert_eq!(big.base.get(), 8192 - 513);
+        let small = window(2 * 513 + 100, 0);
+        let mut compactions = Vec::new();
+        for start in (0..3000).step_by(100) {
+            let (row, compaction) = window_kv_row(&small, chunk(start, 100))?;
+            assert_eq!(start - small.base.get(), row, "début {start}");
+            assert!(row + 100 <= small.capacity);
+            if let Some((from, keep)) = compaction {
+                assert!(from >= keep, "compaction chevauchante à {start}");
+                compactions.push(start);
+            }
+        }
+        assert_eq!(compactions.first(), Some(&1100));
+        assert!(compactions.len() > 3);
+        // Tour 2 : queue de 513 lignes du préfixe, morceau qui tient.
+        let tail = window(513 + 300, 10_000 - 513);
+        assert_eq!(window_kv_row(&tail, chunk(10_000, 300))?, (513, None));
+        assert!(window_kv_row(&tail, chunk(9_000, 1)).is_err());
         Ok(())
     }
 }
