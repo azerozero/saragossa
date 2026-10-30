@@ -903,15 +903,17 @@ pub(crate) fn prefill_resident_chunk_tokens() -> usize {
     })
 }
 
-/// Plafond de longueur du prefill flint (défaut 32 768 tokens), au-delà
-/// duquel le prompt est refusé explicitement.
+/// Plafond de longueur d'un prompt flint, prefill à froid ou préfixe prolongé
+/// (défaut 131 072 tokens), au-delà duquel il est refusé explicitement.
 ///
-/// Le prefill résident flint tient en un seul morceau (pas d'attention par
-/// morceaux avec sinks) : son scratch croît avec le prompt, ≈ 0,25 Mo par
-/// token (activations, Q/K/V, MoE top-6 en f32), plus ≈ 0,2 Mo de K/V f32 sur
-/// 49 couches, soit ≈ 15 Go à 32k, et l'attention à sinks est en O(n²) sans
-/// tuilage. Au-delà, un échec mémoire retomberait sur le prefill CPU, environ
-/// 500 fois plus lent. `SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS` le règle.
+/// Le prefill résident flint passe par morceaux de
+/// [`prefill_resident_chunk_tokens`] : son scratch (≈ 0,25 Mo par token :
+/// activations, Q/K/V, MoE top-6 en f32) est borné par le morceau, ≈ 1 Go à
+/// 4096. Reste le K/V f32 pleine longueur des 49 couches, ≈ 0,2 Mo par token :
+/// ≈ 26 Go à 128k, autant pour l'arène de decode qui le recopie, plus 22 Go de
+/// poids : ≈ 75 Go, qui tiennent sur 128 Go. Les 262 144 positions de
+/// `max_position_embeddings` en demanderaient ≈ 125 : swap plutôt qu'échec.
+/// `SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS` le règle.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn flint_prefill_max_tokens() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
@@ -919,8 +921,21 @@ pub(crate) fn flint_prefill_max_tokens() -> usize {
         env_var("SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|max| *max > 0)
-            .unwrap_or(32_768)
+            .unwrap_or(131_072)
     })
+}
+
+/// Attention des couches pleines flint (sinks, sans fenêtre, d128) par le
+/// template Steel tuilé de MLX (`has_sinks`, BQ32/BK16) au lieu du kernel F3
+/// `attention_prefill_sink_f32`, une simdgroup par requête. Les couches
+/// glissantes gardent le F3, déjà en O(n·513). Mesuré le 2026-10-30 (M5 Max,
+/// flint-int4, sections de profil) : 14 couches pleines 965 → 195 ms à 4k,
+/// 20,3 → 3,8 s à 16k (46 % du prefill avant). Sorties à 6e-8 près du F3 et
+/// du CPU (`sink_tests`). Kill-switch `SARAGOSSA_RUST_FLINT_PREFILL_STEEL=0`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn flint_prefill_steel_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_PREFILL_STEEL", true))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

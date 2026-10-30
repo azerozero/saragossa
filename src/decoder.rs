@@ -65,6 +65,8 @@ mod flint_oracle_tests;
 pub(crate) fn resident_decode_steps_for_test() -> usize {
     resident::RESIDENT_DECODE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
 }
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) use generation::with_prefill_chunk_tokens_for_test;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
 #[cfg(test)]
@@ -287,6 +289,11 @@ impl CausalDecoderPromptState {
                 .len()
                 .saturating_mul(std::mem::size_of::<f32>()),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn final_state_for_test(&self) -> &Tensor {
+        &self.final_state
     }
 
     fn into_parts(self) -> (CausalDecoderCache, Tensor) {
@@ -1187,12 +1194,12 @@ impl CausalDecoderConfig {
     /// Renvoie la raison pour laquelle les chemins Metal per-op et spéculatifs
     /// ne connaissent pas ce modèle, ou `None` s'ils le couvrent.
     ///
-    /// Ces kernels (per-op, MTP, DFlash, light-batch, prefill par morceaux et
-    /// prolongement de préfixe) ignorent les sinks, le NoPE, le routeur
-    /// sigmoïde et l'expert partagé sans gate : les laisser tourner produirait
-    /// un résultat faux sans erreur. Seuls le prefill résident en un morceau et
-    /// le decode résident complet couvrent flint ; pour un tel modèle, le
-    /// runtime Metal ne sert qu'à eux (repli CPU sinon).
+    /// Ces kernels (per-op, MTP, DFlash, light-batch, extension en lignes)
+    /// ignorent les sinks, le NoPE, le routeur sigmoïde et l'expert partagé
+    /// sans gate : les laisser tourner produirait un résultat faux sans erreur.
+    /// Seuls le prefill résident (par morceaux et prolongement de préfixe
+    /// compris) et le decode résident complet couvrent flint ; pour un tel
+    /// modèle, le runtime Metal ne sert qu'à eux (repli CPU sinon).
     pub fn metal_unsupported_reason(&self) -> Option<&'static str> {
         if self.attention_sinks {
             Some("sinks d'attention appris (softmax_offset)")

@@ -31,6 +31,39 @@ fn emit_mtp_committed(
     true
 }
 
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+thread_local! {
+    /// Taille de morceau imposée par un test (le flag plafonne à 512 au moins).
+    static CHUNK_TOKENS_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Exécute `run` avec des morceaux de prefill résident de `chunk_tokens`
+/// lignes sur ce thread.
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn with_prefill_chunk_tokens_for_test<R>(
+    chunk_tokens: usize,
+    run: impl FnOnce() -> R,
+) -> R {
+    let previous = CHUNK_TOKENS_FOR_TEST.replace(Some(chunk_tokens));
+    let result = run();
+    CHUNK_TOKENS_FOR_TEST.set(previous);
+    result
+}
+
+/// Lignes par morceau du prefill résident, cf.
+/// [`crate::runtime_flags::prefill_resident_chunk_tokens`].
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn prefill_resident_chunk_tokens() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(chunk_tokens) = CHUNK_TOKENS_FOR_TEST.get() {
+            return chunk_tokens;
+        }
+    }
+    crate::runtime_flags::prefill_resident_chunk_tokens()
+}
+
 #[cfg(test)]
 mod emission_tests {
     use super::emit_mtp_committed;
@@ -3480,7 +3513,9 @@ impl CausalDecoder {
         if !prefill_resident_enabled() || self.config.is_gemma4 {
             return None;
         }
-        let metal = self.forward_runtime().metal_executor()?;
+        // `resident_metal` comme le prefill à froid : flint n'a pas de
+        // runtime per-op Metal, mais son prefill résident prolonge un préfixe.
+        let metal = self.resident_metal()?;
         let spec = self.resident_prefill_spec(seq, self.final_norm.data().len())?;
         let layers = self
             .layers
@@ -3527,8 +3562,24 @@ impl CausalDecoder {
         last_row_only: bool,
     ) -> Result<Option<(Tensor, Option<Tensor>)>> {
         let start = cache.position;
-        if start == 0 || suffix.len() < crate::runtime_flags::prefix_extend_resident_min_tokens() {
+        // Le seuil départage le prefill résident et l'extension en lignes,
+        // que flint n'a pas : son repli est le forward CPU (~0,6 s par token).
+        let resident_only = self.config.metal_unsupported_reason().is_some();
+        let min_tokens = if resident_only {
+            1
+        } else {
+            crate::runtime_flags::prefix_extend_resident_min_tokens()
+        };
+        if start == 0 || suffix.len() < min_tokens {
             return Ok(None);
+        }
+        let max_tokens = crate::runtime_flags::flint_prefill_max_tokens();
+        if resident_only && start + suffix.len() > max_tokens {
+            return Err(InferError::Config(format!(
+                "prompt flint prolongé à {} tokens au-delà du plafond de prefill de \
+                 {max_tokens} (SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS)",
+                start + suffix.len()
+            )));
         }
         // Un KV déjà monté sur le GPU (decode résident) deviendrait périmé.
         if cache.resident.is_some() || cache.layers.iter().any(|layer| layer.full.is_some()) {
@@ -3572,7 +3623,7 @@ impl CausalDecoder {
             &layers,
             spec,
             capture_layer_ids,
-            crate::runtime_flags::prefill_resident_chunk_tokens(),
+            prefill_resident_chunk_tokens(),
             Some(&prefix),
             last_row_only,
         )?;
@@ -4959,7 +5010,7 @@ impl CausalDecoder {
         if resident_only && prompt.len() > max_tokens {
             return Err(InferError::Config(format!(
                 "prompt flint de {} tokens au-delà du plafond de prefill de {max_tokens} \
-                 (SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS) : prefill en un seul morceau",
+                 (SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS)",
                 prompt.len()
             )));
         }
@@ -4980,7 +5031,7 @@ impl CausalDecoder {
             &layers,
             spec,
             capture_layer_ids,
-            crate::runtime_flags::prefill_resident_chunk_tokens(),
+            prefill_resident_chunk_tokens(),
             last_row_only,
         ) {
             Ok((final_hidden, layer_states, captures)) => {

@@ -11,6 +11,9 @@ const STEEL_ATTN_BD: usize = 64;
 const STEEL_CAUSAL_ATTN_D256_BQ: usize = 32;
 const STEEL_CAUSAL_ATTN_D256_BK: usize = 64;
 const STEEL_CAUSAL_ATTN_D256_BD: usize = 256;
+const STEEL_SINK_ATTN_D128_BQ: usize = 32;
+const STEEL_SINK_ATTN_D128_BK: usize = 16;
+const STEEL_SINK_ATTN_D128_BD: usize = 128;
 
 /// Instanciation du NAX dsplit d256 : nom Metal, tuiles Q/K, simdgroups
 /// (WM lignes × WN = 2 tranches de D) et ordre de la grille.
@@ -1357,13 +1360,20 @@ impl MetalExecutor {
     }
 
     /// Encode l'attention prefill causale avec sinks appris `[q_heads]` (flint),
-    /// fenêtrée si `spec.window` : `attention_prefill_sink_f32`, toutes
-    /// longueurs, une simdgroup par (tête Q, position).
+    /// fenêtrée si `spec.window`. Les `spec.seq` requêtes sont les dernières
+    /// des `kv_rows` clés déjà écrites dans `k_buffer`/`v_buffer` (morceau ou
+    /// préfixe prolongé ; `kv_rows == spec.seq` en un seul morceau) : Q et la
+    /// sortie sont locaux, K/V, causalité et fenêtre absolus.
+    ///
+    /// Sans fenêtre en d128, le Steel tuilé avec sinks
+    /// (`SARAGOSSA_RUST_FLINT_PREFILL_STEEL`) ; sinon
+    /// `attention_prefill_sink_f32`, une simdgroup par (tête Q, position).
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si `head_dim` sort du kernel (32, 64, 128 ou 256),
-    /// si la GQA est invalide ou si une dimension déborde.
+    /// si la GQA est invalide, si `kv_rows < spec.seq` ou si une dimension
+    /// déborde.
     pub(super) fn encode_attention_prefill_sink(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1373,15 +1383,61 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         sinks_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
+        kv_rows: usize,
     ) -> Result<()> {
         if !matches!(spec.head_dim, 32 | 64 | 128 | 256)
             || spec.kv_heads == 0
             || spec.q_heads % spec.kv_heads != 0
+            || kv_rows < spec.seq
         {
             return Err(InferError::Dimension(format!(
-                "prefill avec sinks: head_dim={} q_heads={} kv_heads={} hors kernel",
-                spec.head_dim, spec.q_heads, spec.kv_heads
+                "prefill avec sinks: head_dim={} q_heads={} kv_heads={} q={} kv={kv_rows} hors kernel",
+                spec.head_dim, spec.q_heads, spec.kv_heads, spec.seq
             )));
+        }
+        if let Some(pipeline) = self
+            .attention_prefill_steel_sink_d128_f32
+            .as_ref()
+            .filter(|_| {
+                self.prefill_sink_steel
+                    && spec.window.is_none()
+                    && spec.head_dim == STEEL_SINK_ATTN_D128_BD
+            })
+        {
+            let params = steel_attn_params(
+                spec,
+                STEEL_SINK_ATTN_D128_BQ,
+                STEEL_SINK_ATTN_D128_BK,
+                kv_rows,
+                "steel sinks d128 attention",
+            )?;
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(q_buffer), 0);
+            encoder.set_buffer(1, Some(k_buffer), 0);
+            encoder.set_buffer(2, Some(v_buffer), 0);
+            encoder.set_buffer(3, Some(output_buffer), 0);
+            encoder.set_bytes(
+                4,
+                std::mem::size_of::<SteelAttnParams>() as NSUInteger,
+                (&params as *const SteelAttnParams).cast::<c_void>(),
+            );
+            // Le template amorce chaque ligne à `max = log2(e)·sink`, `somme = 1`
+            // (softmax en base 2) : le sink compte une fois, sans valeur.
+            encoder.set_buffer(7, Some(sinks_buffer), 0);
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    checked_nsuint(
+                        spec.seq.div_ceil(STEEL_SINK_ATTN_D128_BQ),
+                        "steel sinks d128 NQ",
+                    )?,
+                    checked_nsuint(spec.q_heads, "steel sinks d128 heads")?,
+                    1,
+                ),
+                MTLSize::new(32, 4, 1),
+            );
+            post_dispatch_barrier(encoder);
+            return Ok(());
         }
         let dims = [
             checked_u32(spec.seq, "attention sinks seq")?,
@@ -1389,6 +1445,7 @@ impl MetalExecutor {
             checked_u32(spec.kv_heads, "attention sinks kv_heads")?,
             checked_u32(spec.head_dim, "attention sinks head_dim")?,
             checked_u32(spec.window.unwrap_or(0), "attention sinks window")?,
+            checked_u32(kv_rows - spec.seq, "attention sinks q_off")?,
         ];
         encoder.set_compute_pipeline_state(&self.attention_prefill_sink_f32);
         encoder.set_buffer(0, Some(q_buffer), 0);

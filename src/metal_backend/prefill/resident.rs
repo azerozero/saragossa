@@ -201,12 +201,14 @@ impl MetalExecutor {
     }
 
     /// Indique si un prefill peut prolonger un préfixe : toutes les attentions
-    /// complètes doivent passer par l'attention Steel/NAX à décalage.
+    /// complètes doivent passer par une attention à décalage (Steel/NAX, ou
+    /// kernels à sinks de flint).
     pub(crate) fn prefill_resident_extend_supported(&self, layers: &[PrefillMoeLayer<'_>]) -> bool {
         layers.iter().all(|layer| match layer.attention {
-            // Les sinks (flint) n'ont pas d'attention par morceaux : prefill
-            // en un seul morceau, prolongement de préfixe refusé.
-            PrefillAttentionLayer::Full { sinks: Some(_), .. } => false,
+            // Les deux kernels à sinks (Steel d128, `attention_prefill_sink_f32`)
+            // prennent le décalage des requêtes ; la forme est vérifiée à
+            // l'encodage.
+            PrefillAttentionLayer::Full { sinks: Some(_), .. } => true,
             PrefillAttentionLayer::Full { .. } => {
                 self.causal_attention_prefill_chunk_supported(layer.attention_spec)
             }
@@ -334,8 +336,16 @@ impl MetalExecutor {
         // morceaux ; tout le reste est un scratch dimensionné sur un morceau.
         // Le miroir ne sert qu'à l'attention par morceaux (plusieurs morceaux
         // ou préfixe), et seulement si elle passe par le NAX bf16.
+        // Les couches à sinks (flint) lisent un K/V f32 : ni miroir ni stockage
+        // bf16, même quand le pipeline NAX d256 existe.
         let chunked_nax = (chunk_count > 1 || start > 0)
-            && self.causal_attention_prefill_steel_nax_d256.is_some();
+            && self.causal_attention_prefill_steel_nax_d256.is_some()
+            && !layers.iter().any(|layer| {
+                matches!(
+                    layer.attention,
+                    PrefillAttentionLayer::Full { sinks: Some(_), .. }
+                )
+            });
         let bf16_mirror = self.prefill_kv_bf16_mirror && chunked_nax;
         // Le NAX lit déjà ce K/V en bf16 et l'arène d'un prompt de cette
         // longueur sera bf16 : le stocker arrondi ne change aucun octet lu.

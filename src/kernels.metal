@@ -8804,7 +8804,10 @@ kernel void causal_attention_prefill_batch_long_d128_f32(
 // amorcé par le sink (max = sink, somme = e^0 = 1) : le sink compte dans le
 // max et UNE fois au dénominateur, sans valeur, comme `attention_probs_in_place`.
 // `dims[4]` = fenêtre : 0 pour le masque causal plein, sinon les `window`
-// dernières positions, courante comprise. Le corps reprend l'arithmétique de
+// dernières positions, courante comprise. `dims[5]` = décalage des requêtes
+// (morceau ou préfixe prolongé) : la requête locale `pos` est à la position
+// absolue `q_off + pos`, qui indexe K/V, causalité et fenêtre ; Q et la sortie
+// restent indexés localement. Le corps reprend l'arithmétique de
 // `causal_attention_prefill_batch_long_d128_f32` (QK constant, fast::exp,
 // inverse multiplié) : un sink neutre sans fenêtre rend ses octets en d128, ce
 // que vérifie un test.
@@ -8821,7 +8824,8 @@ inline void attention_prefill_sink_body(
     const float sink,
     const uint simd_lid,
     const uint q_head,
-    const uint pos
+    const uint pos,
+    const uint q_off
 ) {
     constexpr uint D = QK * 32u;
     const uint kv_group = q_heads / kv_heads;
@@ -8842,9 +8846,11 @@ inline void attention_prefill_sink_body(
     }
     float max_score = sink;
     float sum_exp = 1.0f;
-    const uint row_start = (window > 0u && pos + 1u > window) ? (pos + 1u - window) : 0u;
+    const uint abs_pos = q_off + pos;
+    const uint row_start =
+        (window > 0u && abs_pos + 1u > window) ? (abs_pos + 1u - window) : 0u;
 
-    for (uint row = row_start; row <= pos; ++row) {
+    for (uint row = row_start; row <= abs_pos; ++row) {
         const device float* k_ptr = k + row * kv_dim + kv_head * D + lane_base;
         const device float* v_ptr = v + row * kv_dim + kv_head * D + lane_base;
         float score = 0.0f;
@@ -8885,6 +8891,7 @@ kernel void attention_prefill_sink_f32(
     const uint kv_heads = dims[2];
     const uint head_dim = dims[3];
     const uint window = dims[4];
+    const uint q_off = dims[5];
     const uint q_head = tile.x;
     const uint pos = tile.y;
     if (q_heads == 0u || kv_heads == 0u || (q_heads % kv_heads) != 0u || q_head >= q_heads ||
@@ -8896,19 +8903,19 @@ kernel void attention_prefill_sink_f32(
     switch (head_dim) {
         case 32u:
             attention_prefill_sink_body<1u>(
-                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos);
+                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos, q_off);
             break;
         case 64u:
             attention_prefill_sink_body<2u>(
-                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos);
+                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos, q_off);
             break;
         case 128u:
             attention_prefill_sink_body<4u>(
-                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos);
+                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos, q_off);
             break;
         case 256u:
             attention_prefill_sink_body<8u>(
-                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos);
+                q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos, q_off);
             break;
         default:
             break;

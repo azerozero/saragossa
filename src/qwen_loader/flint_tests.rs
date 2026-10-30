@@ -461,6 +461,91 @@ fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
     );
 }
 
+fn max_gap(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f32, f32::max)
+}
+
+/// Prefill résident par morceaux (sinks à décalage : requêtes locales,
+/// K/V, causalité et fenêtre absolus) contre le même prefill en un morceau,
+/// sur des coupes qui tombent dans la fenêtre de 2 et autour.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_chunked_prefill_matches_single_chunk() {
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
+    let hidden = |chunk_tokens| {
+        crate::decoder::with_prefill_chunk_tokens_for_test(chunk_tokens, || {
+            gpu.prefill_hidden_for_test(&prompt, true)
+                .expect("invariant: prefill résident flint")
+                .expect("prefill résident flint attendu")
+        })
+    };
+    let single = hidden(0);
+    for chunk_tokens in [1, 2, 3, 5] {
+        let chunked = hidden(chunk_tokens);
+        let gap = max_gap(single.data(), chunked.data());
+        // Même arithmétique par ligne ; seuls les GEMM, dont la tuile dépend
+        // du nombre de lignes, peuvent réordonner une somme.
+        assert!(gap <= 1.0e-5, "morceaux de {chunk_tokens}: écart {gap}");
+    }
+}
+
+/// Prolongement résident d'un préfixe (reliquat sous le seuil de 32 tokens
+/// des autres modèles) contre le prefill complet, puis greedy depuis l'état
+/// prolongé contre le CPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_prefix_extension_matches_full_prefill() {
+    let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
+    assert!(
+        gpu.prefix_extend_as_cheap_as_cold(prompt.len()),
+        "prolongement résident attendu pour flint"
+    );
+    let full = gpu
+        .prefill_prompt_state_uncached(&prompt)
+        .expect("invariant: prefill complet");
+    for split in [1, 4, 9, 10] {
+        let mut state = gpu
+            .prefill_prompt_state_uncached(&prompt[..split])
+            .expect("invariant: prefill du préfixe");
+        gpu.extend_prompt_state(&mut state, &prompt[split..])
+            .expect("invariant: prolongement résident");
+        assert_eq!(state.position(), prompt.len());
+        let gap = max_gap(
+            full.final_state_for_test().data(),
+            state.final_state_for_test().data(),
+        );
+        assert!(gap <= 1.0e-5, "préfixe de {split}: écart {gap}");
+        let tokens = gpu
+            .generate_greedy_timed_from_prompt_state_with_options(
+                state,
+                std::time::Duration::ZERO,
+                4,
+                &crate::GenerationOptions::default(),
+            )
+            .expect("invariant: greedy depuis l'état prolongé")
+            .tokens;
+        assert_eq!(
+            tokens,
+            cpu.generate_greedy(&prompt, 4)
+                .expect("invariant: greedy CPU"),
+            "greedy après préfixe de {split} != CPU"
+        );
+    }
+}
+
 /// Le scratch du prefill résident flint passe par le scope de purge (marquage
 /// volatil, éviction LRU au-delà de `SARAGOSSA_RUST_SCRATCH_CAP_GB`) après
 /// chaque prefill, quelle que soit sa taille, et reste sous ce plafond.
@@ -891,6 +976,55 @@ fn flint_int4_metal_matches_mlx_oracle() {
         mean < MEAN_GAP_F32,
         "long: écart moyen {mean} ≥ {MEAN_GAP_F32}"
     );
+}
+
+/// Mesure du prefill résident flint (chemin AR, dernière ligne seulement) à
+/// 1k, 4k et 16k tokens, une exécution par longueur après un échauffement.
+/// L'état « avant » se mesure avec le même binaire :
+/// `SARAGOSSA_RUST_FLINT_PREFILL_STEEL=0 SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0`
+/// (kernel F3 seul, un seul morceau). `SARAGOSSA_FLINT_BENCH_LENS` remplace les
+/// longueurs (liste séparée par des virgules).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure, pas un gate"]
+fn flint_int4_prefill_ttft_bench() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("bench flint sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    let lens = std::env::var("SARAGOSSA_FLINT_BENCH_LENS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|len| len.trim().parse::<usize>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![1024, 4096, 16384]);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+        .expect("invariant: flint-int4 chargeable en Metal")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let warmup = synthetic_long_prompt(&assets, 64);
+    model
+        .prefill_cache_state_metal_resident_for_test(&warmup)
+        .expect("invariant: échauffement");
+    for len in lens {
+        let prompt = synthetic_long_prompt(&assets, len);
+        let started = std::time::Instant::now();
+        let state = model
+            .prefill_cache_state_metal_resident_for_test(&prompt)
+            .expect("invariant: prefill résident flint");
+        let elapsed = started.elapsed();
+        assert!(state.is_some(), "prefill résident flint attendu");
+        drop(state);
+        println!(
+            "flint prefill {len} tokens: {:.2} s, {:.0} tok/s",
+            elapsed.as_secs_f64(),
+            len as f64 / elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
 }
 
 /// Hidden non normés du prefill per-op CPU puis du prefill résident Metal, et
