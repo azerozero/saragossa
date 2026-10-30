@@ -662,55 +662,31 @@ fn synthetic_flint_prefill_kv_bf16_store_drift() {
     }
 }
 
-/// Adoption par l'arène de decode du K/V bf16 de flint (opt-in forcé, seuil
-/// 0) : couche pleine à sinks et couches fenêtrées (fenêtre 2, dépassée par
-/// le prompt et le decode). L'arène tient la réserve du prefill pendant le
-/// decode, donc écrit dans ses buffers (un K/V par couche, pas de copie), et
-/// les tokens échantillonnés (arène bf16) sont ceux du semis par copie, forcé
-/// en tenant la réserve. Sans l'opt-in, le K/V reste f32 : rien n'est
-/// adoptable.
+/// Prefill de `prompt` par morceaux de `chunk` tokens (réserve de
+/// `new_tokens` lignes), puis decode de `new_tokens` tokens, deux fois : la
+/// réserve du K/V bf16 tenue par le test (l'arène sème par copie), puis libre.
+/// Rend les tokens des deux decodes et si, au second, l'arène a tenu la
+/// réserve de toutes les couches à chaque token : elle écrit alors dans les
+/// buffers du prefill, sans second exemplaire du K/V.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-#[test]
-fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
+fn decode_with_and_without_adoption(
+    model: &CausalDecoder,
+    prompt: &[usize],
+    chunk: usize,
+    new_tokens: usize,
+    options: &crate::GenerationOptions,
+) -> (Vec<usize>, Vec<usize>, bool) {
     use crate::metal_backend::InPlaceClaim;
-    let gpu = |sinks| {
-        let mut executor = crate::MetalExecutor::new().expect("invariant: executor Metal");
-        executor.set_prefill_kv_bf16_store_min_rows_for_test(Some(0));
-        executor.set_prefill_kv_bf16_store_sinks_for_test(sinks);
-        load(flint_tensors(true))
-            .expect("invariant: flint synthétique")
-            .with_metal_executor(executor)
-            .expect("invariant: runtime Metal attaché")
-    };
-    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
-    let new_tokens = 6;
-    let prefill = |gpu: &CausalDecoder| {
-        // Morceaux de 3 : le stockage bf16 exige un prefill par morceaux.
-        crate::metal_backend::with_prefill_kv_layout_override(3, 0, || {
+    let run = |hold_reserve: bool| {
+        // Morceaux forcés : le stockage bf16 exige un prefill par morceaux.
+        let state = crate::metal_backend::with_prefill_kv_layout_override(chunk, 0, || {
             crate::decoder::with_prefill_kv_reserve(new_tokens, || {
-                gpu.prefill_prompt_state_uncached(&prompt)
+                model.prefill_prompt_state_uncached(prompt)
             })
         })
-        .expect("invariant: prefill résident flint")
-    };
-    assert!(
-        prefill(&gpu(false)).kv_bf16_prefixes_for_test().is_empty(),
-        "K/V bf16 sans l'opt-in flint"
-    );
-    if !crate::decode_resident::kv_bf16_dense_by_default() {
-        return;
-    }
-    // Échantillonné : l'arène est bf16 quelle que soit la longueur du prompt.
-    let options = crate::GenerationOptions {
-        temperature: 0.8,
-        seed: 7,
-        ..crate::GenerationOptions::default()
-    };
-    let bf16 = gpu(true);
-    let run = |hold_reserve: bool| {
-        let state = prefill(&bf16);
+        .expect("invariant: prefill résident flint");
         let prefixes = state.kv_bf16_prefixes_for_test();
-        assert_eq!(prefixes.len(), 3, "toutes les couches en vue bf16 entière");
+        assert!(!prefixes.is_empty(), "aucune couche en vue bf16 entière");
         let held: Vec<_> = if hold_reserve {
             prefixes
                 .iter()
@@ -722,12 +698,12 @@ fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
             Vec::new()
         };
         let mut adopted = true;
-        let tokens = bf16
+        let tokens = model
             .generate_greedy_timed_from_prompt_state_with_options_and_callback(
                 state,
                 std::time::Duration::ZERO,
                 new_tokens,
-                &options,
+                options,
                 |_| {
                     adopted &= prefixes
                         .iter()
@@ -748,8 +724,50 @@ fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
     };
     let (copied, _) = run(true);
     let (tokens, adopted) = run(false);
+    (copied, tokens, adopted)
+}
+
+/// Adoption par l'arène de decode du K/V bf16 de flint (opt-in forcé, seuil
+/// 0) : couche pleine à sinks et couches fenêtrées (fenêtre 2, dépassée par
+/// le prompt et le decode). L'arène tient la réserve du prefill de chaque
+/// couche pendant le decode, et les tokens échantillonnés (arène bf16) sont
+/// ceux du semis par copie. Sans l'opt-in, le K/V reste f32 : rien n'est
+/// adoptable.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
+    let gpu = |sinks| {
+        let mut executor = crate::MetalExecutor::new().expect("invariant: executor Metal");
+        executor.set_prefill_kv_bf16_store_min_rows_for_test(Some(0));
+        executor.set_prefill_kv_bf16_store_sinks_for_test(sinks);
+        load(flint_tensors(true))
+            .expect("invariant: flint synthétique")
+            .with_metal_executor(executor)
+            .expect("invariant: runtime Metal attaché")
+    };
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
+    let opted_out = crate::metal_backend::with_prefill_kv_layout_override(3, 0, || {
+        gpu(false).prefill_prompt_state_uncached(&prompt)
+    })
+    .expect("invariant: prefill résident flint");
+    assert!(
+        opted_out.kv_bf16_prefixes_for_test().is_empty(),
+        "K/V bf16 sans l'opt-in flint"
+    );
+    if !crate::decode_resident::kv_bf16_dense_by_default() {
+        return;
+    }
+    // Échantillonné : l'arène est bf16 quelle que soit la longueur du prompt.
+    let options = crate::GenerationOptions {
+        temperature: 0.8,
+        seed: 7,
+        ..crate::GenerationOptions::default()
+    };
+    let bf16 = gpu(true);
+    let (copied, tokens, adopted) =
+        decode_with_and_without_adoption(&bf16, &prompt, 3, 6, &options);
     assert!(adopted, "arène sans adoption du K/V bf16 de flint");
-    assert_eq!(tokens.len(), new_tokens);
+    assert_eq!(tokens.len(), 6);
     assert_eq!(tokens, copied, "adoption != semis par copie");
 }
 
@@ -1516,4 +1534,46 @@ fn synthetic_long_prompt(assets: &ModelAssets, len: usize) -> Vec<usize> {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn resident_decode_steps() -> usize {
     crate::decoder::resident_decode_steps_for_test()
+}
+
+/// Adoption du K/V bf16 de flint-int4 réel par l'arène de decode : prompt de
+/// `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, au-delà des seuils
+/// de stockage et d'arène bf16), opt-in forcé, 16 tokens greedy identiques
+/// au semis par copie et réserve tenue par l'arène de toutes les couches.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis"]
+fn flint_int4_arena_adopts_prefill_kv_bf16() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("test flint adoption sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    let len = std::env::var("SARAGOSSA_FLINT_BF16_LEN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16_400);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let prompt = synthetic_long_prompt(&assets, len);
+    let mut executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    executor.set_prefill_kv_bf16_store_min_rows_for_test(Some(0));
+    executor.set_prefill_kv_bf16_store_sinks_for_test(true);
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+        .expect("invariant: flint-int4 chargeable en Metal")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let chunk = crate::runtime_flags::prefill_resident_chunk_tokens();
+    let started = std::time::Instant::now();
+    let (copied, tokens, adopted) = decode_with_and_without_adoption(
+        &model,
+        &prompt,
+        chunk,
+        16,
+        &crate::GenerationOptions::default(),
+    );
+    println!(
+        "{len} tokens en {:.1?} : copie {copied:?}, adoption {tokens:?}",
+        started.elapsed()
+    );
+    assert!(adopted, "arène sans adoption du K/V bf16 de flint-int4");
+    assert_eq!(tokens, copied, "greedy adopté != semis par copie");
 }
