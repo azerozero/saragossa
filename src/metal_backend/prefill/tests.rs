@@ -1313,6 +1313,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                             PrefillResidentPrefixLayer::Full {
                                 key: vec![key.segment()],
                                 value: vec![value.segment()],
+                                base: 0,
                                 in_place: None,
                             }
                         }
@@ -1634,6 +1635,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                             PrefillResidentPrefixLayer::Full {
                                 key: vec![key.segment()],
                                 value: vec![value.segment()],
+                                base: 0,
                                 in_place: match (in_place, key, value) {
                                     (
                                         true,
@@ -2054,6 +2056,7 @@ fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
                 key: vec![state.0.segment()],
                 value: vec![state.1.segment()],
                 in_place,
+                base: 0,
             }],
         };
         let (_, caches, _) = executor.qwen_moe_prefill_resident_from(

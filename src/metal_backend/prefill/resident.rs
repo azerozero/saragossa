@@ -107,7 +107,8 @@ pub(crate) fn with_prefill_kv_layout_override<R>(
 //   segments, le tour suivant recopie) ;
 // - l'état après decode (`release_suffix_arena`) ajoute un segment f32
 //   possédé : il n'a plus de vue unique et recopie ;
-// - les couches à sinks (flint) n'ont pas de stockage bf16 ;
+// - les couches glissantes à sinks bornées à leur fenêtre recopient toujours
+//   leur queue dans un buffer neuf (`PrefillWindowKv`) ;
 // - une réserve épuisée (queue ou decode plus longs que la réserve) recopie
 //   dans un buffer neuf.
 fn prefix_kv_in_place(
@@ -453,117 +454,184 @@ impl MetalExecutor {
             let (_, kv_dim, layer_shape) =
                 self.resident_prefill_layer_shape(layer, layer_index, spec, hidden_dim)?;
             let prefix_layer = prefix.map(|prefix| &prefix.layers[layer_index]);
-            let cache = match (prefix_layer, &layer_shape.attention) {
+            // Couche glissante à sinks : K/V borné à la fenêtre, sans réserve
+            // ni prolongement en place ; le préfixe n'apporte que sa queue.
+            let window_keep = match layer.attention {
+                PrefillAttentionLayer::Full { sinks: Some(_), .. } if self.prefill_window_kv => {
+                    layer.attention_spec.window.filter(|window| *window > 0)
+                }
+                _ => None,
+            };
+            let cache = match (window_keep, prefix_layer, &layer_shape.attention) {
                 (
-                    Some(PrefillResidentPrefixLayer::Linear { state }),
-                    PrefillResidentAttentionShape::Linear { .. },
-                ) => PrefillResidentLayerCacheBuffer::Linear {
-                    state: (*state).clone(),
-                },
-                (None, _) => self.allocate_prefill_resident_layer_cache(
-                    &layer_shape,
-                    // Réserve pour la queue d'un prompt servi, prolongée en
-                    // place (cf. `prefix_kv_in_place`).
-                    spec.seq.saturating_add(fresh_reserve),
-                    kv_dim,
-                    bf16_mirror,
-                    bf16_store,
-                    None,
-                )?,
-                (
-                    Some(PrefillResidentPrefixLayer::Full {
-                        key,
-                        value,
-                        in_place,
-                    }),
+                    Some(keep),
+                    None | Some(PrefillResidentPrefixLayer::Full { .. }),
                     PrefillResidentAttentionShape::Full { .. },
                 ) => {
-                    // Réserve tenue (claim) jusqu'à la relecture ou la
-                    // publication des lignes nouvelles, en fin de fonction.
-                    let (in_place, reuse) = prefix_kv_in_place(
-                        in_place.as_ref(),
-                        key,
-                        value,
-                        spec.seq,
-                        (kv_dim, bf16_store),
-                    )?
-                    .unzip();
-                    // Préfixe recopié dans un buffer neuf : s'il est déjà tout en
-                    // bf16, le buffer prend la réserve d'un prefill à froid et
-                    // remplace le préfixe du cache (vue entière, adoptable et
-                    // prolongeable en place au tour suivant). Un préfixe avec du
-                    // f32 garde ses valeurs : seules les lignes nouvelles repartent.
-                    let replaces_prefix = in_place.is_none()
-                        && bf16_store
-                        && crate::runtime_flags::prefill_kv_shared_enabled()
-                        && [key, value].iter().all(|segments| {
-                            segments.iter().all(|segment| {
-                                matches!(segment, KvSegment::CpuBf16(_) | KvSegment::SharedBf16(_))
-                            })
-                        });
+                    let prefix_rows = start.min(keep);
+                    let capacity = keep
+                        .checked_mul(2)
+                        .and_then(|rows| rows.checked_add(chunk_rows))
+                        .ok_or_else(|| InferError::Shape("K/V fenêtré déborde".to_string()))?
+                        .min(prefix_rows + rows);
                     let mut cache = self.allocate_prefill_resident_layer_cache(
                         &layer_shape,
-                        if replaces_prefix {
-                            spec.seq.saturating_add(fresh_reserve)
-                        } else {
-                            spec.seq
-                        },
+                        capacity,
                         kv_dim,
-                        bf16_mirror,
+                        false,
                         bf16_store,
-                        in_place,
+                        None,
                     )?;
-                    if let PrefillResidentLayerCacheBuffer::Full {
-                        replaces_prefix: replaces,
-                        in_place,
-                        ..
-                    } = &mut cache
-                    {
-                        *replaces = replaces_prefix;
-                        *in_place = reuse;
+                    if let PrefillResidentLayerCacheBuffer::Full { window, .. } = &mut cache {
+                        *window = Some(PrefillWindowKv {
+                            keep,
+                            capacity,
+                            base: Cell::new(start - prefix_rows),
+                        });
                     }
                     cache
                 }
-                _ => {
-                    return Err(InferError::Config(format!(
-                        "préfixe résident incohérent couche {layer_index}"
-                    )))
-                }
+                (_, prefix_layer, attention) => match (prefix_layer, attention) {
+                    (
+                        Some(PrefillResidentPrefixLayer::Linear { state }),
+                        PrefillResidentAttentionShape::Linear { .. },
+                    ) => PrefillResidentLayerCacheBuffer::Linear {
+                        state: (*state).clone(),
+                    },
+                    (None, _) => self.allocate_prefill_resident_layer_cache(
+                        &layer_shape,
+                        // Réserve pour la queue d'un prompt servi, prolongée en
+                        // place (cf. `prefix_kv_in_place`).
+                        spec.seq.saturating_add(fresh_reserve),
+                        kv_dim,
+                        bf16_mirror,
+                        bf16_store,
+                        None,
+                    )?,
+                    (
+                        Some(PrefillResidentPrefixLayer::Full {
+                            key,
+                            value,
+                            in_place,
+                            base: 0,
+                        }),
+                        PrefillResidentAttentionShape::Full { .. },
+                    ) => {
+                        // Réserve tenue (claim) jusqu'à la relecture ou la
+                        // publication des lignes nouvelles, en fin de fonction.
+                        let (in_place, reuse) = prefix_kv_in_place(
+                            in_place.as_ref(),
+                            key,
+                            value,
+                            spec.seq,
+                            (kv_dim, bf16_store),
+                        )?
+                        .unzip();
+                        // Préfixe recopié dans un buffer neuf : s'il est déjà tout en
+                        // bf16, le buffer prend la réserve d'un prefill à froid et
+                        // remplace le préfixe du cache (vue entière, adoptable et
+                        // prolongeable en place au tour suivant). Un préfixe avec du
+                        // f32 garde ses valeurs : seules les lignes nouvelles repartent.
+                        let replaces_prefix = in_place.is_none()
+                            && bf16_store
+                            && crate::runtime_flags::prefill_kv_shared_enabled()
+                            && [key, value].iter().all(|segments| {
+                                segments.iter().all(|segment| {
+                                    matches!(
+                                        segment,
+                                        KvSegment::CpuBf16(_) | KvSegment::SharedBf16(_)
+                                    )
+                                })
+                            });
+                        let mut cache = self.allocate_prefill_resident_layer_cache(
+                            &layer_shape,
+                            if replaces_prefix {
+                                spec.seq.saturating_add(fresh_reserve)
+                            } else {
+                                spec.seq
+                            },
+                            kv_dim,
+                            bf16_mirror,
+                            bf16_store,
+                            in_place,
+                        )?;
+                        if let PrefillResidentLayerCacheBuffer::Full {
+                            replaces_prefix: replaces,
+                            in_place,
+                            ..
+                        } = &mut cache
+                        {
+                            *replaces = replaces_prefix;
+                            *in_place = reuse;
+                        }
+                        cache
+                    }
+                    _ => {
+                        return Err(InferError::Config(format!(
+                            "préfixe résident incohérent couche {layer_index}"
+                        )))
+                    }
+                },
             };
             if let (
-                Some(PrefillResidentPrefixLayer::Full { key, value, .. }),
+                Some(PrefillResidentPrefixLayer::Full {
+                    key,
+                    value,
+                    base: prefix_base,
+                    ..
+                }),
                 PrefillResidentLayerCacheBuffer::Full {
                     key: key_cache,
                     value: value_cache,
                     bf16_store,
                     in_place,
+                    window,
                     ..
                 },
             ) = (prefix_layer, &cache)
             {
-                let prefix_len = checked_len(start, kv_dim, "préfixe résident kv")?;
+                // Le préfixe stocke les lignes `[prefix_base, start)` ; une
+                // couche bornée n'en recopie que la queue `[window.base, start)`.
+                let stored = start.checked_sub(*prefix_base).ok_or_else(|| {
+                    InferError::Dimension(format!(
+                        "préfixe résident couche {layer_index}: base {prefix_base} > {start}"
+                    ))
+                })?;
+                let first = window
+                    .as_ref()
+                    .map_or(*prefix_base, |window| window.base.get());
+                let prefix_len = checked_len(stored, kv_dim, "préfixe résident kv")?;
                 let key_len: usize = key.iter().map(|segment| segment.len()).sum();
                 let value_len: usize = value.iter().map(|segment| segment.len()).sum();
-                if key_len != prefix_len || value_len != prefix_len {
+                if key_len != prefix_len || value_len != prefix_len || first < *prefix_base {
                     return Err(InferError::Dimension(format!(
-                        "préfixe résident KV couche {layer_index}: {key_len}/{value_len} attendu {prefix_len}"
+                        "préfixe résident KV couche {layer_index}: {key_len}/{value_len} attendu {prefix_len}, lignes {first}.. sous la base {prefix_base}"
                     )));
                 }
+                let skip = checked_len(first - *prefix_base, kv_dim, "préfixe résident kv")?;
                 for (buffer, segments) in [(key_cache, key), (value_cache, value)] {
                     // Prolongement en place : le préfixe est déjà au début.
                     if in_place.is_some() {
                         continue;
                     }
                     let mut offset = 0;
+                    let mut skip = skip;
                     for segment in segments {
+                        // Segment entièrement sorti de la fenêtre gardée.
+                        if skip >= segment.len() {
+                            skip -= segment.len();
+                            continue;
+                        }
+                        let from = std::mem::take(&mut skip);
+                        let len = segment.len() - from;
                         match (*bf16_store, segment) {
                             (true, KvSegment::SharedBf16(rows)) => {
                                 prefix_copies.push(PrefixCopy::Bf16 {
                                     source: rows.buffer().to_owned(),
-                                    source_offset: rows.byte_offset(),
+                                    source_offset: rows.byte_offset() + byte_len::<u16>(from)?,
                                     target: buffer.clone(),
                                     target_offset: byte_len::<u16>(offset)?,
-                                    len: segment.len(),
+                                    len,
                                 });
                             }
                             (true, KvSegment::Shared(rows)) => {
@@ -571,39 +639,46 @@ impl MetalExecutor {
                                     source: rows.buffer().to_owned(),
                                     source_start: usize::try_from(rows.byte_offset())
                                         .map_err(|_| InferError::Shape("offset préfixe".into()))?
-                                        / std::mem::size_of::<f32>(),
+                                        / std::mem::size_of::<f32>()
+                                        + from,
                                     target: buffer.clone(),
                                     target_start: offset,
-                                    len: segment.len(),
+                                    len,
                                 });
                             }
                             (false, KvSegment::Shared(rows)) => {
                                 prefix_copies.push(PrefixCopy::F32 {
                                     source: rows.buffer().to_owned(),
-                                    source_offset: rows.byte_offset(),
+                                    source_offset: rows.byte_offset() + byte_len::<f32>(from)?,
                                     target: buffer.clone(),
                                     target_offset: byte_len::<f32>(offset)?,
-                                    len: segment.len(),
+                                    len,
                                 });
                             }
                             (true, KvSegment::CpuBf16(data)) => {
-                                write_u16_buffer_at(buffer, offset, data)?;
+                                write_u16_buffer_at(buffer, offset, &data[from..])?;
                             }
                             // Arrondi RNE, comme `bfloat(x)` sur le GPU.
                             (true, _) => write_u16_buffer_at(
                                 buffer,
                                 offset,
-                                &super::buffers::f32_slice_to_bf16(&segment.as_f32()),
+                                &super::buffers::f32_slice_to_bf16(&segment.as_f32()[from..]),
                             )?,
-                            (false, _) => write_f32_buffer_at(buffer, offset, &segment.as_f32())?,
+                            (false, _) => {
+                                write_f32_buffer_at(buffer, offset, &segment.as_f32()[from..])?;
+                            }
                         }
-                        offset += segment.len();
+                        offset += len;
                     }
                 }
             }
             layer_cache_buffers.push(cache);
         }
         let mut owned_buffers = Vec::new();
+        // Queue publiée de chaque couche bornée : buffers K/V et première
+        // ligne absolue.
+        let mut window_tails: Vec<Option<([Buffer; 2], usize)>> =
+            layer_cache_buffers.iter().map(|_| None).collect();
 
         let command_buffer = self.queue.new_command_buffer();
         let use_shared_encoder = kernel_timing
@@ -882,6 +957,58 @@ impl MetalExecutor {
                     )?;
                 }
             }
+            // Couches bornées : la fenêtre finale part dans un buffer à sa
+            // taille, que le cache et ses snapshots tiennent seul ; le buffer
+            // de travail (2 × fenêtre + morceau) meurt avec ce prefill.
+            for (cache, tail) in layer_cache_buffers.iter().zip(window_tails.iter_mut()) {
+                let PrefillResidentLayerCacheBuffer::Full {
+                    key,
+                    value,
+                    kv_dim,
+                    bf16_store,
+                    window: Some(window),
+                    ..
+                } = cache
+                else {
+                    continue;
+                };
+                let stored = spec.seq - window.base.get();
+                if stored <= window.keep {
+                    continue;
+                }
+                let from = checked_len(stored - window.keep, *kv_dim, "K/V fenêtré queue")?;
+                let len = checked_len(window.keep, *kv_dim, "K/V fenêtré queue")?;
+                let buffers = if *bf16_store {
+                    [
+                        self.uncached_bf16_buffer(len, "resident_window_k_bf16")?,
+                        self.uncached_bf16_buffer(len, "resident_window_v_bf16")?,
+                    ]
+                } else {
+                    [
+                        self.uncached_f32_buffer(len, "resident_window_k")?,
+                        self.uncached_f32_buffer(len, "resident_window_v")?,
+                    ]
+                };
+                self.run_resident_prefill_section(
+                    &mut encode_context,
+                    "window_tail",
+                    |encoder, _owned| {
+                        for (source, target) in [(key, &buffers[0]), (value, &buffers[1])] {
+                            self.encode_kv_copy(
+                                encoder,
+                                source,
+                                from,
+                                target,
+                                0,
+                                len,
+                                *bf16_store,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
+                *tail = Some((buffers, spec.seq - window.keep));
+            }
         }
         let final_output_used = final_output.is_some();
         let final_read_buffer = final_output.unwrap_or(current_buffer);
@@ -952,8 +1079,45 @@ impl MetalExecutor {
             })
             .transpose()?;
         let mut layer_caches = Vec::with_capacity(layer_cache_buffers.len());
-        for cache_buffer in layer_cache_buffers {
+        for (cache_buffer, tail) in layer_cache_buffers.into_iter().zip(window_tails) {
             match cache_buffer {
+                PrefillResidentLayerCacheBuffer::Full {
+                    key,
+                    value,
+                    kv_dim,
+                    bf16_store,
+                    window: Some(window),
+                    ..
+                } => {
+                    // Couche bornée : seule la fenêtre `[base, seq)` est
+                    // rendue, et remplace les segments d'un préfixe.
+                    let ([key, value], base) = tail.unwrap_or(([key, value], window.base.get()));
+                    let kv_len = checked_len(spec.seq - base, kv_dim, "K/V fenêtré rendu")?;
+                    let (key, value) = if crate::runtime_flags::prefill_kv_shared_enabled() {
+                        shared_kv_rows(key, value, kv_len, bf16_store)?
+                    } else if bf16_store {
+                        (
+                            PrefillKvRows::OwnedBf16(read_u16_buffer_at(&key, 0, kv_len)?),
+                            PrefillKvRows::OwnedBf16(read_u16_buffer_at(&value, 0, kv_len)?),
+                        )
+                    } else {
+                        (
+                            PrefillKvRows::Owned(read_f32_buffer_at(&key, 0, kv_len)?),
+                            PrefillKvRows::Owned(read_f32_buffer_at(&value, 0, kv_len)?),
+                        )
+                    };
+                    layer_caches.push(PrefillResidentLayerCache::Full {
+                        key,
+                        value,
+                        kv_dim,
+                        placement: if start == 0 {
+                            PrefillKvPlacement::Appended
+                        } else {
+                            PrefillKvPlacement::CopiedPrefix
+                        },
+                        base,
+                    });
+                }
                 PrefillResidentLayerCacheBuffer::Full {
                     key,
                     value,
@@ -1028,6 +1192,7 @@ impl MetalExecutor {
                         value,
                         kv_dim,
                         placement,
+                        base: 0,
                     });
                 }
                 PrefillResidentLayerCacheBuffer::Linear { state } => {
@@ -1708,6 +1873,46 @@ fn extended_kv_rows(
             PrefillKvRows::SharedBf16(key.extended(claim, whole)?),
             PrefillKvRows::SharedBf16(value.extended(claim, whole)?),
         ))
+    }
+}
+
+impl MetalExecutor {
+    /// Copie GPU de `len` éléments K/V (f32, ou bf16 si `bf16`) de `source`
+    /// à partir de l'élément `from` vers `target` à partir de `to` : queue
+    /// d'une fenêtre bornée (compaction entre morceaux, publication).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "copie Metal: buffers, offsets, longueur et format explicites"
+    )]
+    pub(super) fn encode_kv_copy(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        source: &BufferRef,
+        from: usize,
+        target: &BufferRef,
+        to: usize,
+        len: usize,
+        bf16: bool,
+    ) -> Result<()> {
+        if bf16 {
+            self.encode_copy_u16_with_offsets(
+                encoder,
+                source,
+                byte_len::<u16>(from)?,
+                target,
+                byte_len::<u16>(to)?,
+                len,
+            )
+        } else {
+            self.encode_copy_with_offsets(
+                encoder,
+                source,
+                byte_len::<f32>(from)?,
+                target,
+                byte_len::<f32>(to)?,
+                len,
+            )
+        }
     }
 }
 

@@ -3565,6 +3565,7 @@ impl CausalDecoder {
                     crate::metal_backend::PrefillResidentPrefixLayer::Full {
                         key: layer_cache.keys.segments(),
                         value: layer_cache.values.segments(),
+                        base: layer_cache.base_rows(),
                         in_place: layer_cache
                             .keys
                             .sole_shared_buffer()
@@ -3604,6 +3605,7 @@ impl CausalDecoder {
                 value,
                 kv_dim,
                 placement,
+                base,
             } = layer_state
             {
                 let layer_spec = layer.attention_spec;
@@ -3623,11 +3625,11 @@ impl CausalDecoder {
                         key,
                         value,
                         kv_dim,
-                        (start + suffix.len(), 0),
+                        (start + suffix.len(), base),
                         &layout,
                     )?;
                 } else {
-                    layer_cache.append_prefill(key, value, kv_dim, 0, &layout)?;
+                    layer_cache.append_prefill(key, value, kv_dim, base, &layout)?;
                 }
             }
         }
@@ -5071,6 +5073,7 @@ impl CausalDecoder {
                             key,
                             value,
                             kv_dim,
+                            base,
                             ..
                         } => {
                             let layer_spec = prefill_layer.attention_spec;
@@ -5082,7 +5085,7 @@ impl CausalDecoder {
                                 attn_scalar: layer_spec.attn_scalar,
                                 sliding_window: layer_spec.window,
                             };
-                            layer_cache.append_prefill(key, value, kv_dim, 0, &layout)?;
+                            layer_cache.append_prefill(key, value, kv_dim, base, &layout)?;
                         }
                         crate::metal_backend::PrefillResidentLayerCache::Linear { state } => {
                             layer_cache
@@ -5160,8 +5163,19 @@ impl CausalDecoder {
                 .recommended_max_working_set_size()
                 .saturating_sub(weights)
                 .saturating_sub(SCRATCH_RESERVE_BYTES);
+            // Une couche glissante à sinks bornée à sa fenêtre garde un K/V de
+            // taille fixe, hors du coût par token.
+            let window_kv = crate::runtime_flags::flint_window_kv_enabled();
             let bytes_per_token = (0..self.layers.len())
                 .filter(|&index| self.config.is_resident_full_attention_layer(index))
+                .filter(|&index| {
+                    !(window_kv
+                        && self.config.layer_sliding_window(index).is_some()
+                        && matches!(
+                            self.layers.get(index).map(|layer| &layer.attention),
+                            Some(AttentionBlock::Full(attention)) if attention.sinks.is_some()
+                        ))
+                })
                 .filter_map(|index| self.config.resident_full_attention_kv_dim(index).ok())
                 .map(|kv_dim| 2 * kv_dim * KV_BYTES_PER_VALUE)
                 .sum::<usize>()

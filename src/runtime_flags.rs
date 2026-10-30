@@ -849,6 +849,21 @@ pub(crate) fn flint_prefill_kv_bf16_store_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_PREFILL_KV_BF16_STORE", true))
 }
 
+/// K/V des couches glissantes à sinks (flint) borné à leur fenêtre : le
+/// prefill résident ne garde que les `window` dernières lignes de chaque
+/// couche fenêtrée (buffer de `2 × window + morceau` lignes, queue recopiée
+/// entre morceaux, base absolue tenue côté hôte), et le cache CPU, ses
+/// snapshots et l'arène de decode n'en tiennent que la queue. Les kernels
+/// lisent les mêmes lignes dans le même ordre : sortie bit-identique au K/V
+/// plein, en f32 comme en bf16. Sur flint-int4 (35 couches glissantes), le
+/// K/V bf16 retenu passe de ≈ 7,7 Gio à ≈ 0,3 Gio à 115k tokens.
+/// Kill-switch `SARAGOSSA_RUST_FLINT_WINDOW_KV=0`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn flint_window_kv_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_WINDOW_KV", true))
+}
+
 /// K/V full-attention en buffers « placement sparse » Metal 4
 /// (`SARAGOSSA_RUST_KV_SPARSE=1`, opt-in) : un buffer privé virtuel au
 /// contexte maximal dont seules les tuiles écrites occupent de la RAM
@@ -946,7 +961,9 @@ pub(crate) fn prefill_resident_chunk_tokens() -> usize {
 /// flint). Octets par token : K/V f32 du prefill (4 octets) plus arène de
 /// decode bf16 (2 octets), K et V, sur chaque couche d'attention, soit
 /// 49 × 2 × 512 × 6 = 301 056 octets pour flint-int4 : ≈ 39 Go à 128k
-/// (26 Go de K/V f32, 13 Go d'arène). Le scratch, ≈ 0,25 Mo par token
+/// (26 Go de K/V f32, 13 Go d'arène). Avec [`flint_window_kv_enabled`]
+/// (défaut), les 35 couches glissantes bornées à leur fenêtre sortent du
+/// compte : 14 × 2 × 512 × 6 = 86 016 octets par token. Le scratch, ≈ 0,25 Mo par token
 /// (activations, Q/K/V, MoE top-6 en f32), est borné par le morceau de
 /// [`prefill_resident_chunk_tokens`] : ≈ 1 Go à 4096. Mesuré le 2026-10-30
 /// (M5 Max 128 Go) : working set 115,4 Go, poids 23,7 Go, soit ≈ 297k, borné

@@ -294,6 +294,18 @@ impl CausalDecoderPromptState {
         &self.final_state
     }
 
+    /// `(base, lignes stockées)` du K/V de chaque couche full-attention :
+    /// prouve en test qu'une couche glissante ne garde que sa fenêtre.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn kv_rows_for_test(&self) -> Vec<(usize, usize)> {
+        self.cache
+            .layers
+            .iter()
+            .filter(|layer| layer.len() > 0)
+            .map(|layer| (layer.base_rows(), layer.len() - layer.base_rows()))
+            .collect()
+    }
+
     /// Vues K/V bf16 entières, adoptables par une arène, de chaque couche qui
     /// en a : les tests y reprennent le claim pour savoir qui tient la réserve.
     #[cfg(all(test, target_os = "macos", feature = "metal"))]

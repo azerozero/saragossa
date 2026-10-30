@@ -42,11 +42,19 @@ impl MetalExecutor {
                     kv_dim,
                     bf16_mirror,
                     bf16_store,
+                    window,
                     ..
                 },
             ) => {
                 let kv_chunk_len = checked_len(spec.seq, *kv_dim, "resident kv morceau")?;
-                let kv_cache_offset = checked_len(chunk.start, *kv_dim, "resident kv offset")?
+                // Ligne du buffer où écrire le morceau : la position absolue
+                // (RoPE, causalité) reste `chunk.start`. Couche bornée qui
+                // déborderait : la fenêtre est d'abord recopiée au début.
+                let (kv_row, compaction) = match window {
+                    Some(window) => window_kv_row(window, chunk)?,
+                    None => (chunk.start, None),
+                };
+                let kv_cache_offset = checked_len(kv_row, *kv_dim, "resident kv offset")?
                     .checked_mul(std::mem::size_of::<f32>())
                     .and_then(|bytes| u64::try_from(bytes).ok())
                     .ok_or_else(|| InferError::Shape("resident kv offset déborde".to_string()))?;
@@ -66,6 +74,19 @@ impl MetalExecutor {
                     sinks: sinks_buffer,
                 } = full_scratch;
                 self.run_resident_prefill_section(context, "qkv", |encoder, owned| {
+                    if let Some((from, keep)) = compaction {
+                        for cache in [key_cache, value_cache] {
+                            self.encode_kv_copy(
+                                encoder,
+                                cache,
+                                checked_len(from, *kv_dim, "K/V fenêtré compaction")?,
+                                cache,
+                                0,
+                                checked_len(keep, *kv_dim, "K/V fenêtré compaction")?,
+                                *bf16_store,
+                            )?;
+                        }
+                    }
                     if kv_only {
                         // Seul le K/V de ces positions sert : Q et la suite sont sautés.
                     } else if gated {
@@ -162,7 +183,7 @@ impl MetalExecutor {
                     if *bf16_store {
                         // Même `bfloat(x)` que la conversion du NAX ou du
                         // miroir : K/V lus à l'identique.
-                        let kv_start = checked_len(chunk.start, *kv_dim, "resident kv bf16")?;
+                        let kv_start = checked_len(kv_row, *kv_dim, "resident kv bf16")?;
                         for (chunk_kv, cache) in
                             [(&k_rope_buffer, key_cache), (&v_buffer, value_cache)]
                         {
@@ -217,7 +238,7 @@ impl MetalExecutor {
                                 &context_buffer,
                                 sinks_buffer,
                                 spec,
-                                chunk.start + chunk.rows,
+                                kv_row + chunk.rows,
                                 *bf16_store,
                             );
                         }
@@ -412,4 +433,37 @@ impl MetalExecutor {
         post_dispatch_barrier(encoder);
         Ok(())
     }
+}
+
+/// Ligne du buffer borné où écrire `chunk`, et la compaction à encoder avant
+/// (`(première ligne de la fenêtre dans le buffer, lignes gardées)`) si le
+/// morceau déborderait. Le kernel à sinks relit alors exactement les mêmes
+/// lignes : sa fenêtre `[abs + 1 - keep, abs]`, ramenée au buffer, commence
+/// à `rel + 1 - keep ≥ 0` dès que `rel ≥ keep - 1` lignes précèdent la
+/// requête, ce que garantit la queue de `keep` lignes.
+fn window_kv_row(
+    window: &PrefillWindowKv,
+    chunk: ResidentPrefillChunk,
+) -> Result<(usize, Option<(usize, usize)>)> {
+    let base = window.base.get();
+    let row = chunk.start.checked_sub(base).ok_or_else(|| {
+        InferError::Shape(format!(
+            "K/V fenêtré: morceau {} avant la base {base}",
+            chunk.start
+        ))
+    })?;
+    if row + chunk.rows <= window.capacity {
+        return Ok((row, None));
+    }
+    // Débordement : `row > capacity - rows ≥ 2 × keep`, la source
+    // `[row - keep, row)` ne recouvre pas la destination `[0, keep)`.
+    let from = row - window.keep.min(row);
+    if from < window.keep || window.keep + chunk.rows > window.capacity {
+        return Err(InferError::Shape(format!(
+            "K/V fenêtré: compaction {from}..{row} sur {} lignes gardées, capacité {}",
+            window.keep, window.capacity
+        )));
+    }
+    window.base.set(chunk.start - window.keep);
+    Ok((window.keep, Some((from, window.keep))))
 }

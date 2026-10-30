@@ -842,6 +842,7 @@ impl MetalExecutor {
             prefill_kv_bf16_store_sinks: crate::runtime_flags::flint_prefill_kv_bf16_store_enabled(
             ),
             prefill_sink_steel: crate::runtime_flags::flint_prefill_steel_enabled(),
+            prefill_window_kv: crate::runtime_flags::flint_window_kv_enabled(),
             causal_attention_prefill_steel_nax_d256,
             prefill_kv_bf16_mirror: crate::runtime_flags::prefill_kv_bf16_mirror_enabled(),
             prefill_kv_bf16_store_min_rows: (crate::runtime_flags::prefill_kv_bf16_store_enabled()
