@@ -1263,6 +1263,9 @@ template <
     short kDstStrCol,
     short reduction_dim,
     short tgp_size,
+    // Type de la source : un K/V bf16 est élargi au chargement, la tuile
+    // threadgroup reste en `T`.
+    typename SrcT = T,
     short n_reads = (BCOLS * BROWS) / (tgp_size),
     short TCOLS = BCOLS / n_reads,
     short TROWS = tgp_size / TCOLS>
@@ -1281,11 +1284,11 @@ struct BlockLoaderT {
 
   // threadgroup and device memory
   threadgroup T* dst;
-  const device T* src;
+  const device SrcT* src;
 
   /* Constructor */
   METAL_FUNC BlockLoaderT(
-      const device T* src_,
+      const device SrcT* src_,
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -1317,7 +1320,7 @@ struct BlockLoaderT {
     for (short i = 0; i < BROWS; i += TROWS) {
       STEEL_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
-        dst[i * kDstStrRow + j * kDstStrCol] = src[i * src_ld + j];
+        dst[i * kDstStrRow + j * kDstStrCol] = T(src[i * src_ld + j]);
       }
     }
   }
@@ -1353,7 +1356,7 @@ struct BlockLoaderT {
       // Read valid indices into tmp_val
       STEEL_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
-        tmp_val[j] = src[(tmp_idx[j] ? i * src_ld + j : 0)];
+        tmp_val[j] = T(src[(tmp_idx[j] ? i * src_ld + j : 0)]);
       }
 
       // Zero out unneeded values
@@ -2933,11 +2936,14 @@ template <
     int WM,
     int WN,
     typename MaskType = float,
-    typename AccumType = float>
+    typename AccumType = float,
+    // K/V peuvent être stockés en bf16 (prefill flint) : élargis au
+    // chargement des tuiles, Q/O/sinks et le calcul restent en `T`.
+    typename KVT = T>
 [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void attention(
     const device T* Q [[buffer(0)]],
-    const device T* K [[buffer(1)]],
-    const device T* V [[buffer(2)]],
+    const device KVT* K [[buffer(1)]],
+    const device KVT* V [[buffer(2)]],
     device T* O [[buffer(3)]],
     const constant AttnParams* params [[buffer(4)]],
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
@@ -3012,7 +3018,8 @@ template <
       /* short kDstStrRow = */ 1,
       /* short kDstStrCol = */ LDK_tgp,
       /* short reduction_dim = */ 0,
-      /* short tgp_size = */ WM * WN * 32>;
+      /* short tgp_size = */ WM * WN * 32,
+      /* typename SrcT = */ KVT>;
 
   using VBlockLoader = BlockLoaderT<
       /* typename T = */ T,
@@ -3021,7 +3028,8 @@ template <
       /* short kDstStrRow = */ LDV_tgp,
       /* short kDstStrCol = */ 1,
       /* short reduction_dim = */ 0,
-      /* short tgp_size = */ WM * WN * 32>;
+      /* short tgp_size = */ WM * WN * 32,
+      /* typename SrcT = */ KVT>;
 
   QBlockLoader loader_q(
       Q, params->Q_strides[2], Qs, simd_group_id, simd_lane_id);
@@ -3356,6 +3364,12 @@ attention<float, 32, 32, 64, 4, 1, float>;
 template [[host_name("steel_attention_float32_bq32_bk16_bd128_wm4_wn1_sinks")]]
 [[kernel]] decltype(attention<float, 32, 16, 128, 4, 1, float>)
 attention<float, 32, 16, 128, 4, 1, float>;
+
+// Même kernel sur un K/V stocké en bf16 : la conversion se fait au chargement,
+// les tuiles threadgroup restent f32 et le budget de 26,5 Kio ne change pas.
+template [[host_name("steel_attention_float32_bq32_bk16_bd128_wm4_wn1_sinks_kvbf16")]]
+[[kernel]] decltype(attention<float, 32, 16, 128, 4, 1, float, float, bfloat16_t>)
+attention<float, 32, 16, 128, 4, 1, float, float, bfloat16_t>;
 
 // Variante causale d256 pour le prefill 35B. Elle derive le kernel Steel BD64 :
 // QK accumule les 4 sous-tuiles D avant softmax, puis applique la meme tuile de
