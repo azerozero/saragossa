@@ -829,6 +829,19 @@ pub(crate) fn prefill_kv_bf16_store_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_BF16_STORE", true))
 }
 
+/// K/V full-attention en buffers « placement sparse » Metal 4
+/// (`SARAGOSSA_RUST_KV_SPARSE=1`, opt-in) : un buffer privé virtuel au
+/// contexte maximal dont seules les tuiles écrites occupent de la RAM
+/// (`metal_backend::sparse`). Exige `supportsPlacementSparse` (macOS 26.4) ;
+/// sans lui, le chemin partagé actuel reste utilisé. Déclaré pour A2 : aucun
+/// chemin ne le lit encore.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[expect(dead_code, reason = "lu par le branchement du K/V sparse (A2)")]
+pub(crate) fn kv_sparse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_SPARSE", false))
+}
+
 /// Suffixe minimal (tokens) pour prolonger un préfixe en cache par le prefill
 /// résident par morceaux plutôt que par l'extension en lignes. Mesuré le
 /// 2026-10-25 (serve AR, 27B 4 bits, préfixe ~10k) : égalité jusqu'à 16 tokens
