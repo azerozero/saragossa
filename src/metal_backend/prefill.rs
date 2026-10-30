@@ -10,8 +10,12 @@ mod gemma_parallel;
 mod global_attention;
 mod resident;
 #[cfg(test)]
+pub(crate) use self::resident::routed_coop_trace_for_test;
+#[cfg(test)]
 pub(crate) use self::resident::with_prefill_kv_layout_override;
 pub(crate) use self::resident::with_prefill_kv_reserve;
+#[cfg(test)]
+pub(crate) use self::resident::with_router_logits_capture;
 mod scratch;
 #[cfg(test)]
 mod sink_tests;

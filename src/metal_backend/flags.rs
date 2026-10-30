@@ -177,8 +177,9 @@ pub(crate) fn moe_coop_u4_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_COOP_U4", true))
 }
 
-/// Active la bascule routed-only coop du prefill (MoE sans expert partagé, ex.
-/// Qwen3-30B-A3B) vers les kernels groupés `gemm_nax_coop_qb_grouped_*`.
+/// Active la bascule routed coop du prefill (MoE routé du tail résident : Qwen3-30B-A3B
+/// sans expert partagé, et flint avec son expert partagé sans gate, cf.
+/// [`flint_moe_coop_enabled`]) vers les kernels groupés `gemm_nax_coop_qb_grouped_*`.
 ///
 /// Défaut ON (décision produit 2026-07-04, politique near-tie). Historique :
 /// la « divergence » initiale de D-30B était contaminée par le bug du plafond
@@ -196,6 +197,7 @@ pub(crate) fn moe_routed_coop_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_ROUTED_COOP_PREFILL", true))
 }
+
 /// Étend la bascule routed coop du prefill au MoE flint (routeur sigmoïde et
 /// expert partagé sans gate). Exige aussi `SARAGOSSA_RUST_MOE_ROUTED_COOP_PREFILL`.
 ///
@@ -207,7 +209,9 @@ pub(crate) fn moe_routed_coop_prefill_enabled() -> bool {
 /// max 3,3 / moyenne 0,50, argmax 15/15 et 16 tokens greedy identiques ; 16
 /// tokens greedy mlx identiques. Seule la position 3 de l'oracle mlx dépasse
 /// les seuils f32 (14,4 / 2,1), comme mlx bf16 contre mlx f32 (16,9 / 2,6) :
-/// quasi-égalité de routage sensible à l'arrondi bf16.
+/// quasi-égalité de routage sensible à l'arrondi bf16. Les 21 écarts de
+/// top-k coop contre qmv tracés sur ce prompt sont tous des quasi-égalités
+/// (`flint_int4_metal_matches_mlx_oracle`).
 /// Kill-switch : `SARAGOSSA_RUST_FLINT_MOE_COOP=0`.
 pub(crate) fn flint_moe_coop_enabled() -> bool {
     #[cfg(test)]

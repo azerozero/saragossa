@@ -79,8 +79,12 @@ mod prefill;
 #[cfg(test)]
 pub(crate) use self::flags::with_flint_moe_coop_override;
 #[cfg(test)]
+pub(crate) use self::prefill::routed_coop_trace_for_test;
+#[cfg(test)]
 pub(crate) use self::prefill::with_prefill_kv_layout_override;
 pub(crate) use self::prefill::with_prefill_kv_reserve;
+#[cfg(test)]
+pub(crate) use self::prefill::with_router_logits_capture;
 mod profiling;
 mod scratch;
 // Fondation du K/V sparse : seuls ses tests l'utilisent avant A2.

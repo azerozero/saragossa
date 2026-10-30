@@ -92,6 +92,45 @@ pub(crate) fn with_prefill_kv_layout_override<R>(
     run()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Couches MoE routées éligibles au coop sur ce thread : (coop exécuté,
+    /// repli qmv faute de pipelines MPP).
+    static ROUTED_COOP_TRACE: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Copies des logits de routeur `[rows, experts]` de chaque couche MoE
+    /// routée, actives seulement sous [`with_router_logits_capture`].
+    static ROUTER_LOGITS_CAPTURE: std::cell::RefCell<Option<Vec<(Buffer, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Exécute `run` en capturant, sur ce thread, les logits de routeur de chaque
+/// couche MoE routée du prefill résident (un morceau : lignes locales), dans
+/// l'ordre des couches. Sert à tracer les experts choisis par coop et qmv.
+#[cfg(test)]
+pub(crate) fn with_router_logits_capture<R>(run: impl FnOnce() -> R) -> Result<(R, Vec<Vec<f32>>)> {
+    ROUTER_LOGITS_CAPTURE.with(|capture| capture.replace(Some(Vec::new())));
+    let result = run();
+    let captured = ROUTER_LOGITS_CAPTURE
+        .with(|capture| capture.take())
+        .unwrap_or_default();
+    let layers = captured
+        .iter()
+        .map(|(buffer, len)| read_f32_buffer(buffer, *len))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((result, layers))
+}
+
+/// Compteurs (coop exécuté, repli qmv faute de pipelines) des couches MoE
+/// routées éligibles du prefill résident sur ce thread : prouve le chemin pris.
+#[cfg(test)]
+pub(crate) fn routed_coop_trace_for_test() -> (usize, usize) {
+    ROUTED_COOP_TRACE.with(Cell::get)
+}
+
 /// Réserve des buffers K/V d'un préfixe pour un prolongement en place
 /// jusqu'à `seq` lignes : `in_place` désigne ces buffers, le préfixe en est
 /// la vue unique depuis leur début, ils ont la place des lignes nouvelles et,
@@ -1566,11 +1605,22 @@ impl MetalExecutor {
                 // politique near-tie bf16) ; flint a son kill-switch dédié. Repli
                 // gather qmv si la quantification ou les pipelines MPP manquent. Le
                 // routeur n'est résolu que dans la branche coop.
-                if moe_routed_coop_prefill_enabled()
+                let eligible = moe_routed_coop_prefill_enabled()
                     && (sigmoid_shared.is_none() || flint_moe_coop_enabled())
-                    && MetalMoeRoutedWeights::stacked_coop_compatible(&stacked)
-                    && self.routed_coop_pipelines_ready(&stacked)
-                {
+                    && MetalMoeRoutedWeights::stacked_coop_compatible(&stacked);
+                let coop = eligible && self.routed_coop_pipelines_ready(&stacked);
+                #[cfg(test)]
+                if eligible {
+                    ROUTED_COOP_TRACE.with(|trace| {
+                        let (ran, fallback) = trace.get();
+                        trace.set(if coop {
+                            (ran + 1, fallback)
+                        } else {
+                            (ran, fallback + 1)
+                        });
+                    });
+                }
+                if coop {
                     let weights = MetalMoeRoutedWeights {
                         router: self.resolve_linear_weight_buffers(
                             router.weight(),
@@ -1704,6 +1754,19 @@ impl MetalExecutor {
                             )
                         },
                     )?;
+                }
+                #[cfg(test)]
+                if ROUTER_LOGITS_CAPTURE.with(|capture| capture.borrow().is_some()) {
+                    let len = checked_len(spec.seq, expert_count, "capture routeur")?;
+                    let copy = self.uncached_f32_buffer(len, "router_logits_capture")?;
+                    self.run_resident_prefill_section(context, "router_capture", |encoder, _| {
+                        self.encode_copy(encoder, &router_buffer, &copy, len)
+                    })?;
+                    ROUTER_LOGITS_CAPTURE.with(|capture| {
+                        if let Some(layers) = capture.borrow_mut().as_mut() {
+                            layers.push((copy, len));
+                        }
+                    });
                 }
                 match (sigmoid_shared, sigmoid_shared_scratch) {
                     (None, None) => Ok(()),
