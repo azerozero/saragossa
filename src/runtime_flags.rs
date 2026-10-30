@@ -822,6 +822,9 @@ pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
 /// CPU de repli, arène f32 d'une queue de moins de
 /// [`prefix_extend_resident_min_tokens`] tokens ou de DFlash) voient alors le
 /// préfixe arrondi ; l'attention CPU élargit alors tout le KV à chaque token.
+/// Flint (sinks) y entre aussi quand ses kernels à sinks bf16 ont compilé :
+/// là, l'arrondi change les K/V relus par les morceaux suivants (5,8e-3
+/// relatif sur les hidden du flint synthétique).
 /// Kill-switch `SARAGOSSA_RUST_PREFILL_KV_BF16_STORE=0`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_kv_bf16_store_enabled() -> bool {

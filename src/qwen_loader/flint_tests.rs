@@ -584,6 +584,76 @@ fn synthetic_flint_prefix_extension_matches_full_prefill() {
     }
 }
 
+/// Stockage bf16 du K/V de prefill (seuil forcé à 0) contre le stockage f32 :
+/// prefill par morceaux, dont les morceaux suivants relisent le K/V arrondi
+/// par les jumeaux bf16 des kernels à sinks (pleine et fenêtrée), puis
+/// prolongement d'un préfixe et greedy. La dérive des hidden est chiffrée ;
+/// les tokens greedy doivent rester ceux du CPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_prefill_kv_bf16_store_drift() {
+    let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
+    let gpu = |min_rows| {
+        let mut executor = crate::MetalExecutor::new().expect("invariant: executor Metal");
+        executor.set_prefill_kv_bf16_store_min_rows_for_test(min_rows);
+        load(flint_tensors(true))
+            .expect("invariant: flint synthétique")
+            .with_metal_executor(executor)
+            .expect("invariant: runtime Metal attaché")
+    };
+    let (f32_store, bf16_store) = (gpu(None), gpu(Some(0)));
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
+    for chunk_tokens in [1, 3, 5] {
+        let hidden = |gpu: &CausalDecoder| {
+            gpu.prefill_hidden_for_test(&prompt, Some(chunk_tokens))
+                .expect("invariant: prefill résident flint")
+                .expect("prefill résident flint attendu")
+        };
+        let reference = hidden(&f32_store);
+        let gap = max_gap(reference.data(), hidden(&bf16_store).data());
+        let scale = reference
+            .data()
+            .iter()
+            .fold(0.0_f32, |acc, value| acc.max(value.abs()));
+        println!(
+            "morceaux de {chunk_tokens}: dérive K/V bf16 {gap:.2e} (max |hidden| {scale:.2e}, relatif {:.2e})",
+            gap / scale
+        );
+        // Écart nul : le stockage bf16 n'a pas été pris (tous les morceaux, le
+        // premier compris, relisent le K/V depuis le cache). Mesuré le
+        // 2026-10-30 : 5,8e-3 relatif à toutes les coupes, l'ordre de l'arrondi
+        // bf16 (2⁻⁸) des K/V.
+        assert!(
+            gap > 0.0 && gap / scale <= 1.0e-2,
+            "morceaux de {chunk_tokens}: dérive {gap}"
+        );
+    }
+    let want = cpu
+        .generate_greedy(&prompt, 4)
+        .expect("invariant: greedy CPU");
+    for split in [1, 4, 10] {
+        let mut state = bf16_store
+            .prefill_prompt_state_uncached(&prompt[..split])
+            .expect("invariant: prefill du préfixe");
+        bf16_store
+            .extend_prompt_state(&mut state, &prompt[split..])
+            .expect("invariant: prolongement résident");
+        let tokens = bf16_store
+            .generate_greedy_timed_from_prompt_state_with_options(
+                state,
+                std::time::Duration::ZERO,
+                4,
+                &crate::GenerationOptions::default(),
+            )
+            .expect("invariant: greedy depuis l'état prolongé")
+            .tokens;
+        assert_eq!(
+            tokens, want,
+            "greedy K/V bf16 après préfixe de {split} != CPU"
+        );
+    }
+}
+
 /// Le scratch du prefill résident flint passe par le scope de purge (marquage
 /// volatil, éviction LRU au-delà de `SARAGOSSA_RUST_SCRATCH_CAP_GB`) après
 /// chaque prefill, quelle que soit sa taille, et reste sous ce plafond.
@@ -1150,6 +1220,102 @@ fn flint_int4_prefill_ttft_bench() {
         );
     }
 }
+
+/// Stockage bf16 du K/V de prefill sur flint-int4 réel : prompt synthétique
+/// de `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, au-delà du seuil de
+/// 16 384), prefill résident par morceaux avec K/V f32 puis bf16 (seuil forcé),
+/// logits comparés sur des lignes de chaque morceau (écarts centrés, argmax)
+/// et 16 tokens greedy de production identiques. Une seule copie des poids en
+/// mémoire à la fois.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure de dérive, pas un gate"]
+fn flint_int4_prefill_kv_bf16_store_drift() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("test flint bf16 sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    let len = std::env::var("SARAGOSSA_FLINT_BF16_LEN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16_400);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let prompt = synthetic_long_prompt(&assets, len);
+    let chunk = crate::runtime_flags::prefill_resident_chunk_tokens();
+    // Première ligne, milieu et fin de chaque morceau, puis les dernières.
+    let mut rows = (0..len)
+        .step_by(chunk.max(1))
+        .flat_map(|start| [start, start + chunk / 2, start + chunk - 1])
+        .chain(len.saturating_sub(4)..len)
+        .filter(|&row| row < len)
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows.dedup();
+    let run = |min_rows: Option<usize>| {
+        let mut executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+        executor.set_prefill_kv_bf16_store_min_rows_for_test(min_rows);
+        let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+            .expect("invariant: flint-int4 chargeable en Metal")
+            .with_metal_executor(executor)
+            .expect("invariant: runtime Metal attaché");
+        let started = std::time::Instant::now();
+        let hidden = model
+            .prefill_hidden_for_test(&prompt, Some(chunk))
+            .expect("invariant: prefill résident")
+            .expect("prefill résident Metal attendu pour flint");
+        println!(
+            "K/V {}: prefill {len} tokens en {:.1?}",
+            if min_rows.is_some() { "bf16" } else { "f32" },
+            started.elapsed()
+        );
+        let logits = model
+            .logits_of_hidden_rows_for_test(&hidden, &rows)
+            .expect("invariant: logits du prefill");
+        drop(hidden);
+        let tokens = model
+            .generate_greedy_timed_with_options(&prompt, 16, &crate::GenerationOptions::default())
+            .expect("invariant: génération résidente")
+            .tokens;
+        (logits, tokens)
+    };
+    let (f32_logits, f32_tokens) = run(None);
+    let (bf16_logits, bf16_tokens) = run(Some(0));
+    let (mut max, mut mean, mut argmax_ok) = (0.0_f32, 0.0_f32, 0_usize);
+    for (row, (bf16, f32)) in rows.iter().zip(bf16_logits.iter().zip(&f32_logits)) {
+        let gap = compare_rows(&format!("ligne {row}"), bf16, f32);
+        max = max.max(gap.max);
+        mean = mean.max(gap.mean);
+        argmax_ok += usize::from(gap.same_argmax);
+    }
+    println!(
+        "dérive K/V bf16 vs f32 sur {} lignes : max {max:.4}, pire moyenne {mean:.5}, argmax {argmax_ok}/{}",
+        rows.len(),
+        rows.len()
+    );
+    println!("greedy f32={f32_tokens:?} bf16={bf16_tokens:?}");
+    assert_eq!(bf16_tokens, f32_tokens, "greedy K/V bf16 != f32");
+    assert_eq!(argmax_ok, rows.len(), "argmax K/V bf16 divergent");
+    // NOTE: Mesuré le 30 oct. 2026 (16 400 tokens, morceaux de 4096) : max
+    // 7,32 et pire moyenne 1,34 (ligne 16 384, premier pas du dernier
+    // morceau), ailleurs 0,8 à 4,1 et 0,12 à 0,77 ; argmax 17/17, greedy
+    // identique. Au-dessus de l'écart Metal/mlx f32 toléré (6 et 1), sous
+    // celui de mlx bf16 contre mlx f32 (17,0 et 2,6) : bornes retenues.
+    assert!(
+        max < MAX_GAP_MLX_BF16,
+        "écart max {max} ≥ {MAX_GAP_MLX_BF16}"
+    );
+    assert!(
+        mean < MEAN_GAP_MLX_BF16,
+        "écart moyen {mean} ≥ {MEAN_GAP_MLX_BF16}"
+    );
+}
+
+// Écart propre de mlx bf16 contre mlx f32 sur l'oracle flint (cf. les seuils
+// f32 ci-dessus) : borne de la dérive d'un K/V de prefill stocké en bf16.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const MAX_GAP_MLX_BF16: f32 = 17.0;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const MEAN_GAP_MLX_BF16: f32 = 2.6;
 
 /// Hidden non normés du prefill per-op CPU puis du prefill résident Metal, et
 /// leurs durées.

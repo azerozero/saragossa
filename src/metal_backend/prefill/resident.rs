@@ -384,23 +384,40 @@ impl MetalExecutor {
         // morceaux ; tout le reste est un scratch dimensionné sur un morceau.
         // Le miroir ne sert qu'à l'attention par morceaux (plusieurs morceaux
         // ou préfixe), et seulement si elle passe par le NAX bf16.
-        // Les couches à sinks (flint) lisent un K/V f32 : ni miroir ni stockage
-        // bf16, même quand le pipeline NAX d256 existe.
-        let chunked_nax = (chunk_count > 1 || start > 0)
-            && self.causal_attention_prefill_steel_nax_d256.is_some()
-            && !layers.iter().any(|layer| {
-                matches!(
-                    layer.attention,
-                    PrefillAttentionLayer::Full { sinks: Some(_), .. }
-                )
-            });
-        let bf16_mirror = self.prefill_kv_bf16_mirror && chunked_nax;
-        // Le NAX lit déjà ce K/V en bf16 et l'arène d'un prompt de cette
-        // longueur sera bf16 : le stocker arrondi ne change aucun octet lu.
+        let chunked = chunk_count > 1 || start > 0;
+        let has_sinks = layers.iter().any(|layer| {
+            matches!(
+                layer.attention,
+                PrefillAttentionLayer::Full { sinks: Some(_), .. }
+            )
+        });
+        // Les couches à sinks (flint) lisent le K/V f32 tel quel : le miroir
+        // ne sert qu'au NAX, qu'elles ne prennent pas.
+        let bf16_mirror = self.prefill_kv_bf16_mirror
+            && chunked
+            && !has_sinks
+            && self.causal_attention_prefill_steel_nax_d256.is_some();
+        // Le stockage bf16 vaut pour toutes les couches : il faut un lecteur
+        // bf16 à chacune, le NAX d256 sans sinks, le Steel d128 bf16 avec (le
+        // fenêtré bf16 est toujours compilé). L'arène d'un prompt de cette
+        // longueur sera bf16 : sans sinks, le NAX lisait déjà ces octets ;
+        // avec, l'arrondi change les K/V lus par les morceaux suivants (dérive
+        // mesurée par `synthetic_flint_prefill_kv_bf16_store_drift`).
+        let kv_bf16_readable = layers.iter().all(|layer| match layer.attention {
+            PrefillAttentionLayer::Full { sinks: Some(_), .. } => {
+                self.attention_prefill_steel_sink_d128_kv_bf16.is_some()
+            }
+            PrefillAttentionLayer::Full { .. } => {
+                self.causal_attention_prefill_steel_nax_d256.is_some()
+            }
+            PrefillAttentionLayer::Linear { .. } => true,
+        });
         let bf16_min_rows = self.prefill_kv_bf16_store_min_rows;
         #[cfg(test)]
         let bf16_min_rows = layout_override.map_or(bf16_min_rows, |(_, min_rows)| Some(min_rows));
-        let bf16_store = chunked_nax && bf16_min_rows.is_some_and(|min_rows| spec.seq >= min_rows);
+        let bf16_store = chunked
+            && kv_bf16_readable
+            && bf16_min_rows.is_some_and(|min_rows| spec.seq >= min_rows);
         // Réserve d'un K/V écrit dans un buffer neuf (prefill à froid, préfixe
         // recopié) : la demande de l'appelant pour un K/V bf16, adoptable par
         // l'arène ; jamais adopté en f32, il garde la réserve minimale.
