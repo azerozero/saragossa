@@ -3414,12 +3414,22 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
     let (p1, p2) = (&tokens[..1100], &tokens[..1200]);
     let branch = [p1, &ids(100, 17, 3)].concat();
     let p3 = [&tokens[..1150], &ids(60, 13, 5)].concat();
-    // Vue bf16 unique de K : (allocation, éléments).
-    let sole_view = |cache: &CausalDecoderCache| match cache.layers[0].keys.segments().as_slice() {
-        [crate::decode_resident::KvSegment::SharedBf16(rows)] => {
-            Some((rows.allocation_id(), rows.len()))
+    // Vue bf16 unique de K et de V : (allocations K/V, éléments). K et V
+    // doivent suivre le même placement (même allocation propre, même longueur).
+    let sole_view = |cache: &CausalDecoderCache| {
+        let layer = &cache.layers[0];
+        match (
+            layer.keys.segments().as_slice(),
+            layer.values.segments().as_slice(),
+        ) {
+            (
+                [crate::decode_resident::KvSegment::SharedBf16(keys)],
+                [crate::decode_resident::KvSegment::SharedBf16(values)],
+            ) if keys.len() == values.len() => {
+                Some(((keys.allocation_id(), values.allocation_id()), keys.len()))
+            }
+            _ => None,
         }
-        _ => None,
     };
     let kv = |cache: &CausalDecoderCache| cache.layer_kv_for_test(0);
     let cold = |prompt: &[usize]| -> Result<_> {
