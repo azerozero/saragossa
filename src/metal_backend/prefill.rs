@@ -25,6 +25,11 @@ impl MetalExecutor {
     pub(crate) fn set_prefill_kv_bf16_store_min_rows_for_test(&mut self, min_rows: Option<usize>) {
         self.prefill_kv_bf16_store_min_rows = min_rows;
     }
+
+    /// Opt-in du stockage bf16 pour les couches à sinks (flint), hors env.
+    pub(crate) fn set_prefill_kv_bf16_store_sinks_for_test(&mut self, enabled: bool) {
+        self.prefill_kv_bf16_store_sinks = enabled;
+    }
 }
 
 struct PrefillTailMoeShape<'a> {

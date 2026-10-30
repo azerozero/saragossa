@@ -294,6 +294,9 @@ pub struct MetalExecutor {
     /// Même Steel d128 avec sinks, K/V lus en bf16 ; `None` s'il ne compile
     /// pas, le jumeau `attention_prefill_sink_bf16` prend alors le relais.
     attention_prefill_steel_sink_d128_kv_bf16: Option<ComputePipelineState>,
+    /// Stockage bf16 du K/V de prefill permis aux couches à sinks (lu du flag
+    /// opt-in, forcé en test).
+    prefill_kv_bf16_store_sinks: bool,
     /// Choix du Steel avec sinks (lu du flag, forcé en test).
     prefill_sink_steel: bool,
     causal_attention_prefill_steel_nax_d256: Option<attention::NaxCausalAttention>,

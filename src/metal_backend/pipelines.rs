@@ -839,6 +839,8 @@ impl MetalExecutor {
             causal_attention_prefill_steel_d256_f32,
             attention_prefill_steel_sink_d128_f32,
             attention_prefill_steel_sink_d128_kv_bf16,
+            prefill_kv_bf16_store_sinks: crate::runtime_flags::flint_prefill_kv_bf16_store_enabled(
+            ),
             prefill_sink_steel: crate::runtime_flags::flint_prefill_steel_enabled(),
             causal_attention_prefill_steel_nax_d256,
             prefill_kv_bf16_mirror: crate::runtime_flags::prefill_kv_bf16_mirror_enabled(),

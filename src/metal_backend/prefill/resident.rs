@@ -398,14 +398,18 @@ impl MetalExecutor {
             && !has_sinks
             && self.causal_attention_prefill_steel_nax_d256.is_some();
         // Le stockage bf16 vaut pour toutes les couches : il faut un lecteur
-        // bf16 à chacune, le NAX d256 sans sinks, le Steel d128 bf16 avec (le
-        // fenêtré bf16 est toujours compilé). L'arène d'un prompt de cette
-        // longueur sera bf16 : sans sinks, le NAX lisait déjà ces octets ;
-        // avec, l'arrondi change les K/V lus par les morceaux suivants (dérive
-        // mesurée par `synthetic_flint_prefill_kv_bf16_store_drift`).
+        // bf16 à chacune, le NAX d256 sans sinks ; avec sinks, l'opt-in flint
+        // puis le Steel d128 bf16 pour une couche pleine, le naïf bf16
+        // (toujours compilé) suffisant à une fenêtrée. L'arène d'un prompt de
+        // cette longueur sera bf16 : sans sinks, le NAX lisait déjà ces
+        // octets ; avec, l'arrondi change les K/V lus (dérive mesurée par
+        // `synthetic_flint_prefill_kv_bf16_store_drift` et
+        // `flint_int4_prefill_kv_bf16_store_drift`).
         let kv_bf16_readable = layers.iter().all(|layer| match layer.attention {
             PrefillAttentionLayer::Full { sinks: Some(_), .. } => {
-                self.attention_prefill_steel_sink_d128_kv_bf16.is_some()
+                self.prefill_kv_bf16_store_sinks
+                    && (layer.attention_spec.window.is_some()
+                        || self.attention_prefill_steel_sink_d128_kv_bf16.is_some())
             }
             PrefillAttentionLayer::Full { .. } => {
                 self.causal_attention_prefill_steel_nax_d256.is_some()
