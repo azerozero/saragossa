@@ -68,15 +68,22 @@ pub(crate) mod mtp_control;
 mod mtp_seed;
 mod shared_rows;
 pub(crate) use self::mtp_seed::{MtpSeedStates, MtpSeedWeights};
-pub(crate) use self::shared_rows::{InPlaceClaim, PrefillKvRows, SharedBf16Rows, SharedF32Rows};
+pub(crate) use self::shared_rows::{
+    allocation_identity, InPlaceClaim, PrefillKvRows, SharedBf16Rows, SharedF32Rows,
+};
 mod na_gemm;
 mod pipelines;
 mod prefill;
 pub(crate) use self::prefill::with_prefill_kv_reserve;
 mod profiling;
 mod scratch;
+// Fondation du K/V sparse : seuls ses tests l'utilisent avant A2.
+#[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
+mod sparse;
 #[cfg(test)]
 mod tests;
+#[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
+mod transfer;
 mod whisper_encode;
 
 #[doc(hidden)]

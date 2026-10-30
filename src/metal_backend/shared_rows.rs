@@ -108,9 +108,12 @@ impl<T: SharedElement> SharedRows<T> {
     }
 
     /// Identité de l'allocation, partagée par toutes ses vues (troncatures et
-    /// clones compris) : le comptage mémoire n'en retient qu'une.
+    /// clones compris) : le comptage mémoire n'en retient qu'une. C'est
+    /// l'adresse de l'objet `MTLBuffer`, et non `contents()` : un buffer privé
+    /// n'a pas de pointeur CPU, alors que l'objet, retenu par chaque vue, reste
+    /// à la même adresse tant qu'une vue vit.
     pub(crate) fn allocation_id(&self) -> usize {
-        self.buffer.contents().addr()
+        allocation_identity(&self.buffer)
     }
 
     /// Taille entière de l'allocation en octets, qu'une vue tronquée garde en vie.
@@ -140,32 +143,48 @@ impl<T: SharedElement> SharedRows<T> {
     }
 }
 
+/// Identité stable d'une allocation Metal : l'adresse de l'objet `MTLBuffer`.
+/// Toute vue et tout claim retiennent l'objet, donc deux allocations vivantes
+/// ne partagent jamais cette adresse, même en stockage privé (sans
+/// `contents()`).
+pub(crate) fn allocation_identity(buffer: &BufferRef) -> usize {
+    buffer.as_ptr().addr()
+}
+
 /// Allocations K/V dont la réserve est en cours d'écriture (prolongement en
 /// place d'un prefill, arène de decode qui a adopté le buffer), tous
 /// executors confondus.
 static IN_PLACE_ALLOCATIONS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
 /// Droit exclusif d'écrire la réserve de K et V, rendu au drop. Le détenteur
-/// garantit qu'aucune commande GPU n'y écrit plus quand il le rend.
+/// garantit qu'aucune commande GPU n'y écrit plus quand il le rend. Il
+/// retient les buffers : leurs identités ([`allocation_identity`]) ne peuvent
+/// pas être reprises par une autre allocation tant que le claim vit.
 #[derive(Debug)]
-pub(crate) struct InPlaceClaim([usize; 2]);
+pub(crate) struct InPlaceClaim {
+    ids: [usize; 2],
+    _buffers: [Buffer; 2],
+}
 
 impl InPlaceClaim {
     pub(crate) fn try_new(buffers: [&Buffer; 2]) -> Option<Self> {
-        let ids = buffers.map(|buffer| buffer.contents().addr());
+        let ids = buffers.map(|buffer| allocation_identity(buffer));
         let mut claimed = IN_PLACE_ALLOCATIONS.lock().ok()?;
         if ids.iter().any(|id| claimed.contains(id)) {
             return None;
         }
         claimed.extend(ids);
-        Some(Self(ids))
+        Some(Self {
+            ids,
+            _buffers: buffers.map(Clone::clone),
+        })
     }
 }
 
 impl Drop for InPlaceClaim {
     fn drop(&mut self) {
         if let Ok(mut claimed) = IN_PLACE_ALLOCATIONS.lock() {
-            claimed.retain(|id| !self.0.contains(id));
+            claimed.retain(|id| !self.ids.contains(id));
         }
     }
 }
@@ -229,5 +248,54 @@ impl MetalExecutor {
         write_f32_buffer(&buffer, data)?;
         // SAFETY: buffer neuf, hors scratch, que plus rien n'écrit ensuite.
         unsafe { SharedF32Rows::new(buffer, 0, data.len()) }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    #[expect(unsafe_code, reason = "buffers neufs propres au test")]
+    fn views_share_identity_and_allocations_do_not() -> Result<()> {
+        let Some(device) = metal::Device::system_default() else {
+            return Ok(());
+        };
+        let first = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
+        let second = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
+        // SAFETY: buffers neufs (mis à zéro par Metal) que rien n'écrit ensuite.
+        let (whole, other) = unsafe {
+            (
+                SharedF32Rows::new(first.clone(), 0, 16)?,
+                SharedF32Rows::new(second, 0, 16)?,
+            )
+        };
+        // SAFETY: même buffer neuf, vue décalée en lecture seule.
+        let shifted = unsafe { SharedF32Rows::new(first.clone(), 4, 8)? };
+        let mut truncated = whole.clone();
+        truncated.truncate(3);
+        assert_eq!(whole.allocation_id(), truncated.allocation_id());
+        assert_eq!(whole.allocation_id(), shifted.allocation_id());
+        assert_eq!(whole.allocation_id(), allocation_identity(&first));
+        assert_ne!(whole.allocation_id(), other.allocation_id());
+        Ok(())
+    }
+
+    #[test]
+    fn private_buffers_have_distinct_identities_and_exclusive_claims() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let new = || device.new_buffer(64, MTLResourceOptions::StorageModePrivate);
+        let (key, value, other) = (new(), new(), new());
+        // `contents()` d'un buffer privé n'est pas une identité garantie
+        // (nul pour un buffer sparse) : seule l'adresse de l'objet compte.
+        let ids = [&key, &value, &other].map(|buffer| allocation_identity(buffer));
+        assert!(ids.iter().all(|id| *id != 0));
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+        let claim = InPlaceClaim::try_new([&key, &value]);
+        assert!(claim.is_some());
+        assert!(InPlaceClaim::try_new([&other, &value]).is_none());
+        assert!(InPlaceClaim::try_new([&other, &new()]).is_some());
     }
 }

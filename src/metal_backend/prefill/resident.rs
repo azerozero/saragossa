@@ -64,7 +64,8 @@ fn is_sole_view_of(segments: &[KvSegment<'_>], buffer: &BufferRef, bf16: bool) -
         ([KvSegment::SharedBf16(rows)], true) => (rows.buffer(), rows.is_whole()),
         _ => return false,
     };
-    whole && view.contents() == buffer.contents()
+    // Identité de l'objet, valable aussi sans pointeur CPU (stockage privé).
+    whole && allocation_identity(view) == allocation_identity(buffer)
 }
 
 /// Buffers K/V d'un préfixe réutilisables pour un
