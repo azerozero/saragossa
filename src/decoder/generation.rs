@@ -4645,6 +4645,7 @@ impl CausalDecoder {
             mtp_history = mtp_history.or(previous.mtp_history);
             captures = captures.or(previous.captures);
         }
+        cache.remove_superseded(prompt, &state.0);
         cache.entries.insert(
             0,
             PrefixCacheEntry {

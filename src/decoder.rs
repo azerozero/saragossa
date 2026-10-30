@@ -1408,6 +1408,35 @@ impl PrefixCache {
         Some(entry.estimated_bytes_unseen(&mut seen))
     }
 
+    /// Retire, avant l'insertion de `live` sur `prompt`, les entrées qui tiennent
+    /// une allocation K/V de la plus longue entrée préfixe strict de `prompt`
+    /// sans en partager aucune avec `live` : le prolongement a recopié leur K/V
+    /// dans le nouvel état, les garder retiendrait une seconde copie complète de
+    /// la conversation. Même règle que `serve::cache::remove_superseded`. Une
+    /// entrée plus courte à buffer propre (retour en arrière du REPL) reste.
+    /// L'historique MTP et les captures DFlash des entrées retirées sont perdus :
+    /// `prefix_cache_hit` ne regarde que la plus longue entrée, qui devient la
+    /// nouvelle.
+    fn remove_superseded(&mut self, prompt: &[usize], live: &CausalDecoderCache) {
+        let Some(index) = generation::longest_prefix_entry_index(&self.entries, prompt) else {
+            return;
+        };
+        if self.entries[index].tokens.len() == prompt.len() {
+            return;
+        }
+        let mut superseded = std::collections::HashSet::new();
+        self.entries[index]
+            .cache
+            .estimated_cpu_bytes_unseen(&mut superseded);
+        let mut live_allocations = std::collections::HashSet::new();
+        live.estimated_cpu_bytes_unseen(&mut live_allocations);
+        self.entries.retain(|entry| {
+            let mut allocations = std::collections::HashSet::new();
+            entry.cache.estimated_cpu_bytes_unseen(&mut allocations);
+            allocations.is_disjoint(&superseded) || !allocations.is_disjoint(&live_allocations)
+        });
+    }
+
     /// Évince les entrées les moins récentes au-delà de `max_bytes`, segments
     /// partagés comptés une fois ; l'entrée la plus récente reste toujours.
     fn enforce_byte_cap(&mut self, max_bytes: u64) {
