@@ -217,9 +217,9 @@ pub(super) fn compile_steel_causal_nax_d256_attention(
 /// flint). `None` dans les mêmes cas que le d256.
 ///
 /// NOTE: `compile_nax_function` recompile toute la source NAX : avec le d256
-/// actif, la source est compilée deux fois au démarrage. Le d256 ne sert que
-/// Qwen et ce pipeline que flint (opt-in), d'où un coût accepté plutôt
-/// qu'une `Library` partagée entre deux familles.
+/// actif, la source est compilée deux fois au démarrage. Coût accepté plutôt
+/// qu'une `Library` partagée : `load_ms` de flint-int4 inchangé avec et sans
+/// ce pipeline (4,5 s, le cache du compilateur Metal absorbe la seconde).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn compile_nax_sink_d128_attention(
     device: &Device,

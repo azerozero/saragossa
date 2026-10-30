@@ -1439,12 +1439,10 @@ impl MetalExecutor {
             );
             encoder.set_buffer(7, Some(sinks_buffer), 0);
             profile_dispatch();
+            // Grille `(NQ, H)` seulement : `attention_nax` ignore la constante
+            // 304, `NAX_SINK_ATTN_D128.head_major` reste faux.
             encoder.dispatch_thread_groups(
-                if nax.shape.head_major {
-                    MTLSize::new(grid_heads, grid_rows, 1)
-                } else {
-                    MTLSize::new(grid_rows, grid_heads, 1)
-                },
+                MTLSize::new(grid_rows, grid_heads, 1),
                 MTLSize::new(32, nax.shape.simdgroups, 1),
             );
             post_dispatch_barrier(encoder);

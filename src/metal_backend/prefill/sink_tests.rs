@@ -540,8 +540,15 @@ fn nax_sink_pipeline(
         STEEL_ATTENTION_NAX_KERNELS,
         super::super::attention::NAX_SINK_ATTN_D128,
     );
+    // Le GEMM NAX compile dès que MPP est là (macOS 26 et accélérateur) :
+    // l'attention NAX doit alors compiler aussi, sinon le test échoue au
+    // lieu de passer en silence.
+    assert!(
+        nax.is_some() || executor.na_gemm_bf16.is_none(),
+        "MPP disponible mais le NAX d128 avec sinks ne compile pas"
+    );
     if nax.is_none() {
-        eprintln!("NAX d128 avec sinks indisponible : test sauté");
+        eprintln!("NAX d128 avec sinks non supporté (MPP absent) : test sauté");
     }
     nax
 }
@@ -554,10 +561,11 @@ const NAX_SINK_TOL: f32 = 5.0e-4;
 /// NAX d128 avec sinks à entrées bf16 identiques — Q arrondi comme le NAX le
 /// convertit, K/V stockés en bf16 — contre l'oracle CPU et contre le Steel
 /// d128 bf16 : un bloc de 1, 300, 513, 1100 et 4133 requêtes, puis des
-/// morceaux finaux (1, 300, 1100 requêtes) derrière un préfixe de 4133 clés,
-/// en GQA 8, scores doux puis ×10 avec des sinks ±8 (le maximum passe du sink
-/// aux scores). Seules différences attendues : P arrondi en bf16 avant P·V et
-/// l'ordre des MMA.
+/// morceaux finaux (1, 300, 1100 requêtes) derrière un préfixe de 4133 clés.
+/// GQA 8 (une tête KV) en scores doux puis ×10 avec des sinks ±8 (le maximum
+/// passe du sink aux scores), et GQA 2 sur quatre têtes KV en scores ×10 pour
+/// les transitions de groupe (`kv_head_idx`). Seules différences attendues :
+/// P arrondi en bf16 avant P·V et l'ordre des MMA.
 #[test]
 fn prefill_sink_nax_matches_steel_and_cpu() -> Result<()> {
     const KV_TOTAL: usize = 4133;
@@ -572,8 +580,12 @@ fn prefill_sink_nax_matches_steel_and_cpu() -> Result<()> {
         .collect::<Vec<_>>();
     let q_dim = Q_HEADS * HEAD_DIM;
     let mut nax = Some(nax);
-    for (q_scale, sinks) in [(1.0_f32, sinks(Q_HEADS)), (10.0, hard_sinks)] {
-        let (q, keys, values) = inputs(KV_TOTAL, Q_HEADS, KV_HEADS);
+    for (kv_heads, q_scale, sinks) in [
+        (KV_HEADS, 1.0_f32, sinks(Q_HEADS)),
+        (KV_HEADS, 10.0, hard_sinks.clone()),
+        (4, 10.0, hard_sinks),
+    ] {
+        let (q, keys, values) = inputs(KV_TOTAL, Q_HEADS, kv_heads);
         let q = bf16_rounded(&q.iter().map(|value| value * q_scale).collect::<Vec<_>>());
         let (keys, values) = (bf16_rounded(&keys), bf16_rounded(&values));
         // (requêtes, clés) : `kv_rows > seq` place les requêtes en fin de préfixe.
@@ -587,12 +599,12 @@ fn prefill_sink_nax_matches_steel_and_cpu() -> Result<()> {
             (300, KV_TOTAL),
             (1100, KV_TOTAL),
         ] {
-            let label = format!("q×{q_scale} q={seq} kv={kv_rows}");
-            let kv_len = kv_rows * KV_HEADS * HEAD_DIM;
+            let label = format!("kv_heads={kv_heads} q×{q_scale} q={seq} kv={kv_rows}");
+            let kv_len = kv_rows * kv_heads * HEAD_DIM;
             let q_off = kv_rows - seq;
             let q = &q[q_off * q_dim..kv_rows * q_dim];
             let (keys, values) = (&keys[..kv_len], &values[..kv_len]);
-            let spec = spec(seq, Q_HEADS, KV_HEADS, None);
+            let spec = spec(seq, Q_HEADS, kv_heads, None);
             let rows = oracle_rows(seq);
             let want = cpu_sink_attention(q, (keys, values), spec, &sinks, q_off, &rows);
             let steel = gpu_attention(&executor, (q, keys, values), spec, Some(&sinks), true)?;

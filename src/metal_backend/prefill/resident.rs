@@ -395,8 +395,9 @@ impl MetalExecutor {
                 PrefillAttentionLayer::Full { sinks: Some(_), .. }
             )
         });
-        // Les couches à sinks (flint) lisent le K/V f32 tel quel : le miroir
-        // ne sert qu'au NAX, qu'elles ne prennent pas.
+        // Le miroir ne sert qu'au NAX d256 sans sinks : les couches à sinks
+        // (flint) lisent leur K/V dans son format de stockage, le NAX d128
+        // avec sinks seulement sur un stockage bf16.
         let bf16_mirror = self.prefill_kv_bf16_mirror
             && chunked
             && !has_sinks
