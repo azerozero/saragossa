@@ -199,46 +199,44 @@ fn steel_executor() -> Result<Option<MetalExecutor>> {
 /// Longueurs autour de la fenêtre flint (513, token courant compris), d'un
 /// bord de tuile Steel (BQ32, BK16) et au-delà des seuils 256/2048 des kernels
 /// sans sink, en plein et fenêtré, par le Steel et par le F3 : chacun contre
-/// le CPU, et le Steel contre le F3 sur toutes les lignes.
+/// le CPU, et le Steel contre le F3 sur toutes les lignes. Deux régimes : les
+/// scores doux de `inputs`, puis des scores ×10 avec des sinks ±8, où le
+/// maximum passe tour à tour du sink aux scores et force le recalage.
 #[test]
 fn prefill_sink_attention_matches_cpu_oracle() -> Result<()> {
     let Some(mut executor) = steel_executor()? else {
         return Ok(());
     };
-    let sinks = sinks(Q_HEADS);
+    let hard_sinks = (0..Q_HEADS)
+        .map(|head| if head % 2 == 0 { 8.0 } else { -8.0 })
+        .collect::<Vec<_>>();
     let q_dim = Q_HEADS * HEAD_DIM;
-    for seq in [1, 300, 513, 514, 1100, 4000] {
-        let (q, keys, values) = inputs(seq, Q_HEADS, KV_HEADS);
-        let rows = oracle_rows(seq);
-        for window in [None, Some(WINDOW)] {
-            let spec = spec(seq, Q_HEADS, KV_HEADS, window);
-            let want = cpu_sink_attention(&q, (&keys, &values), spec, &sinks, 0, &rows);
-            let mut outputs = Vec::new();
-            for steel in [false, true] {
-                executor.prefill_sink_steel = steel;
-                let got = gpu_attention(&executor, (&q, &keys, &values), spec, Some(&sinks))?;
-                let gap = row_gap(&got, &want, &rows, q_dim);
-                // Sorties d'ordre 1e-2 : seuls l'ordre d'accumulation (softmax
-                // en ligne, simd_sum ou MMA) et `fast::exp`/`exp2` séparent le
-                // GPU du CPU.
-                assert!(
-                    gap <= 1.0e-5,
-                    "seq={seq} window={window:?} steel={steel}: écart CPU {gap}"
-                );
-                println!("seq={seq} window={window:?} steel={steel}: écart CPU {gap:.2e}");
-                outputs.push(got);
+    for (q_scale, sinks) in [(1.0_f32, sinks(Q_HEADS)), (10.0, hard_sinks)] {
+        for seq in [1, 300, 513, 514, 1100, 4000] {
+            let (q, keys, values) = inputs(seq, Q_HEADS, KV_HEADS);
+            let q = q.iter().map(|value| value * q_scale).collect::<Vec<_>>();
+            let rows = oracle_rows(seq);
+            for window in [None, Some(WINDOW)] {
+                let label = format!("q×{q_scale} seq={seq} window={window:?}");
+                let spec = spec(seq, Q_HEADS, KV_HEADS, window);
+                let want = cpu_sink_attention(&q, (&keys, &values), spec, &sinks, 0, &rows);
+                let mut outputs = Vec::new();
+                for steel in [false, true] {
+                    executor.prefill_sink_steel = steel;
+                    let got = gpu_attention(&executor, (&q, &keys, &values), spec, Some(&sinks))?;
+                    let gap = row_gap(&got, &want, &rows, q_dim);
+                    // Sorties d'ordre 1e-2 : seuls l'ordre d'accumulation
+                    // (softmax en ligne, simd_sum ou MMA) et `fast::exp`/`exp2`
+                    // séparent le GPU du CPU.
+                    assert!(gap <= 1.0e-5, "{label} steel={steel}: écart CPU {gap}");
+                    println!("{label} steel={steel}: écart CPU {gap:.2e}");
+                    outputs.push(got);
+                }
+                let all_rows = (0..seq).collect::<Vec<_>>();
+                let gap = row_gap(&outputs[0], &outputs[1], &all_rows, q_dim);
+                assert!(gap <= 1.0e-5, "{label}: Steel vs F3 {gap}");
+                println!("{label}: Steel vs F3 {gap:.2e}");
             }
-            let gap = row_gap(
-                &outputs[0],
-                &outputs[1],
-                &(0..seq).collect::<Vec<_>>(),
-                q_dim,
-            );
-            assert!(
-                gap <= 1.0e-5,
-                "seq={seq} window={window:?}: Steel vs F3 {gap}"
-            );
-            println!("seq={seq} window={window:?}: Steel vs F3 {gap:.2e}");
         }
     }
     Ok(())
@@ -367,6 +365,97 @@ fn topk_sigmoid_rows_matches_cpu_routing() -> Result<()> {
         assert_eq!(got_indices, want_indices, "ligne {row}: sélection");
         for (got, want) in scores[row * top_k..][..top_k].iter().zip(&want_scores) {
             assert!((got - want).abs() <= 1.0e-6, "ligne {row}: {got} != {want}");
+        }
+    }
+    Ok(())
+}
+
+/// Oracle f64 de l'attention à sinks pleine (sans fenêtre), toutes lignes.
+fn f64_sink_attention(
+    q: &[f32],
+    (keys, values): (&[f32], &[f32]),
+    seq: usize,
+    sinks: &[f32],
+) -> Vec<f64> {
+    let (q_dim, kv_dim) = (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
+    let group = Q_HEADS / KV_HEADS;
+    let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+    let mut out = vec![0.0_f64; seq * q_dim];
+    for pos in 0..seq {
+        for head in 0..Q_HEADS {
+            let kv_head = head / group;
+            let query = &q[pos * q_dim + head * HEAD_DIM..][..HEAD_DIM];
+            let scores = (0..=pos)
+                .map(|row| {
+                    let key = &keys[row * kv_dim + kv_head * HEAD_DIM..][..HEAD_DIM];
+                    query
+                        .iter()
+                        .zip(key)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                        .sum::<f64>()
+                        * scale
+                })
+                .collect::<Vec<_>>();
+            let sink = f64::from(sinks[head]);
+            let max = scores.iter().copied().fold(sink, f64::max);
+            let weights = scores
+                .iter()
+                .map(|score| (score - max).exp())
+                .collect::<Vec<_>>();
+            let denom = (sink - max).exp() + weights.iter().sum::<f64>();
+            let dst = &mut out[pos * q_dim + head * HEAD_DIM..][..HEAD_DIM];
+            for (row, weight) in weights.iter().enumerate() {
+                let value = &values[row * kv_dim + kv_head * HEAD_DIM..][..HEAD_DIM];
+                for (acc, v) in dst.iter_mut().zip(value) {
+                    *acc += weight / denom * f64::from(*v);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Scores réels de grande amplitude (jusqu'à ~700 en nats) : Steel et F3
+/// contre un oracle f64, en écart relatif par ligne. Mesuré le 2026-10-30 :
+/// F3 ≤ 3,9e-6, Steel ≤ 1,5e-5 (l'échelle appliquée après le produit, en
+/// base 2, perd un peu plus sur les grands scores), très en deçà de l'écart
+/// GPU/CPU de 5,5e-3 relevé en sortie de la couche 0 de flint-int4.
+#[test]
+fn prefill_sink_attention_large_scores_match_f64() -> Result<()> {
+    let Some(mut executor) = steel_executor()? else {
+        return Ok(());
+    };
+    let seq = 600;
+    let (q_dim, kv_dim) = (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
+    let sinks = sinks(Q_HEADS);
+    for amp in [1.0_f32, 6.0, 20.0] {
+        let q = pattern(seq * q_dim, 97, 0.04 * amp);
+        let keys = pattern(seq * kv_dim, 89, 0.04 * amp);
+        let values = pattern(seq * kv_dim, 83, 0.02);
+        let want = f64_sink_attention(&q, (&keys, &values), seq, &sinks);
+        for steel in [false, true] {
+            executor.prefill_sink_steel = steel;
+            let got = gpu_attention(
+                &executor,
+                (&q, &keys, &values),
+                spec(seq, Q_HEADS, KV_HEADS, None),
+                Some(&sinks),
+            )?;
+            let worst = (0..seq)
+                .map(|pos| {
+                    let got = &got[pos * q_dim..][..q_dim];
+                    let want = &want[pos * q_dim..][..q_dim];
+                    let num = got
+                        .iter()
+                        .zip(want)
+                        .map(|(a, b)| (f64::from(*a) - b).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    num / want.iter().map(|b| b * b).sum::<f64>().sqrt().max(1e-30)
+                })
+                .fold(0.0_f64, f64::max);
+            println!("amp={amp} steel={steel}: écart relatif f64 {worst:.2e}");
+            assert!(worst <= 5.0e-5, "amp={amp} steel={steel}: {worst}");
         }
     }
     Ok(())

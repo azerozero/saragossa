@@ -903,25 +903,28 @@ pub(crate) fn prefill_resident_chunk_tokens() -> usize {
     })
 }
 
-/// Plafond de longueur d'un prompt flint, prefill à froid ou préfixe prolongé
-/// (défaut 131 072 tokens), au-delà duquel il est refusé explicitement.
+/// Plafond imposé de longueur d'un prompt flint, prefill à froid ou préfixe
+/// prolongé (`SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS`), prioritaire sur le
+/// plafond dérivé de la mémoire.
 ///
-/// Le prefill résident flint passe par morceaux de
-/// [`prefill_resident_chunk_tokens`] : son scratch (≈ 0,25 Mo par token :
-/// activations, Q/K/V, MoE top-6 en f32) est borné par le morceau, ≈ 1 Go à
-/// 4096. Reste le K/V f32 pleine longueur des 49 couches, ≈ 0,2 Mo par token :
-/// ≈ 26 Go à 128k, autant pour l'arène de decode qui le recopie, plus 22 Go de
-/// poids : ≈ 75 Go, qui tiennent sur 128 Go. Les 262 144 positions de
-/// `max_position_embeddings` en demanderaient ≈ 125 : swap plutôt qu'échec.
-/// `SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS` le règle.
+/// Sans lui, le plafond vaut `(working set Metal recommandé − empreinte du
+/// processus au premier prefill (poids) − 2 Gio de scratch d'un morceau) /
+/// octets par token`, borné à [4096, 262 144] (`max_position_embeddings` de
+/// flint). Octets par token : K/V f32 du prefill (4 octets) plus arène de
+/// decode bf16 (2 octets), K et V, sur chaque couche d'attention, soit
+/// 49 × 2 × 512 × 6 = 301 056 octets pour flint-int4 : ≈ 39 Go à 128k
+/// (26 Go de K/V f32, 13 Go d'arène). Le scratch, ≈ 0,25 Mo par token
+/// (activations, Q/K/V, MoE top-6 en f32), est borné par le morceau de
+/// [`prefill_resident_chunk_tokens`] : ≈ 1 Go à 4096. Mesuré le 2026-10-30
+/// (M5 Max 128 Go) : working set 115,4 Go, poids 23,7 Go, soit ≈ 297k, borné
+/// à 262 144 ; un Mac de 64 Go (≈ 48 Go de working set) tomberait vers 73k.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub(crate) fn flint_prefill_max_tokens() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
+pub(crate) fn flint_prefill_max_tokens_override() -> Option<usize> {
+    static MAX: OnceLock<Option<usize>> = OnceLock::new();
     *MAX.get_or_init(|| {
         env_var("SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|max| *max > 0)
-            .unwrap_or(131_072)
     })
 }
 

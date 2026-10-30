@@ -152,7 +152,7 @@ fn compile_steel_causal_attentions(
     let library = match device.new_library_with_source(source, &options) {
         Ok(library) => library,
         Err(message) => {
-            trace_steel_causal_d256_compile_error("compile", &message);
+            trace_steel_compile_error("steel causal", "compile", &message);
             return (None, None);
         }
     };
@@ -182,14 +182,14 @@ fn steel_causal_function(
     let function = match library.get_function(name, Some(constants)) {
         Ok(function) => function,
         Err(message) => {
-            trace_steel_causal_d256_compile_error("function", &message);
+            trace_steel_compile_error(name, "function", &message);
             return None;
         }
     };
     match device.new_compute_pipeline_state_with_function(&function) {
         Ok(pipeline) => Some(pipeline),
         Err(message) => {
-            trace_steel_causal_d256_compile_error("pipeline", &message);
+            trace_steel_compile_error(name, "pipeline", &message);
             None
         }
     }
@@ -239,7 +239,7 @@ fn compile_nax_function(
     let library = match device.new_library_with_source(source, &options) {
         Ok(library) => library,
         Err(message) => {
-            trace_steel_causal_d256_compile_error("nax compile", &message);
+            trace_steel_compile_error(name, "nax compile", &message);
             return None;
         }
     };
@@ -250,23 +250,23 @@ fn compile_nax_function(
     let function = match library.get_function(name, Some(constants)) {
         Ok(function) => function,
         Err(message) => {
-            trace_steel_causal_d256_compile_error("nax function", &message);
+            trace_steel_compile_error(name, "nax function", &message);
             return None;
         }
     };
     match device.new_compute_pipeline_state_with_function(&function) {
         Ok(pipeline) => Some(pipeline),
         Err(message) => {
-            trace_steel_causal_d256_compile_error("nax pipeline", &message);
+            trace_steel_compile_error(name, "nax pipeline", &message);
             None
         }
     }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn trace_steel_causal_d256_compile_error(stage: &str, message: &str) {
+fn trace_steel_compile_error(kernel: &str, stage: &str, message: &str) {
     if crate::runtime_flags::trace_prefill_enabled() {
-        eprintln!("steel causal d256 {stage}: {message}");
+        eprintln!("{kernel} {stage}: {message}");
     }
 }
 

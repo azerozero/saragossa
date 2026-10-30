@@ -65,8 +65,6 @@ mod flint_oracle_tests;
 pub(crate) fn resident_decode_steps_for_test() -> usize {
     resident::RESIDENT_DECODE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
 }
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
-pub(crate) use generation::with_prefill_chunk_tokens_for_test;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
 #[cfg(test)]
@@ -291,7 +289,7 @@ impl CausalDecoderPromptState {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
     pub(crate) fn final_state_for_test(&self) -> &Tensor {
         &self.final_state
     }
@@ -1468,6 +1466,9 @@ struct DecoderRuntime {
     /// Gather Metal de l'embedding vérifié octet près le CPU au warmup : le
     /// prefill résident peut alors plonger ses morceaux sur le GPU.
     embed_gather_byte_exact: bool,
+    /// Plafond de prompt flint dérivé de la mémoire au premier prefill, cf.
+    /// [`crate::runtime_flags::flint_prefill_max_tokens_override`].
+    flint_prefill_cap: OnceLock<usize>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
