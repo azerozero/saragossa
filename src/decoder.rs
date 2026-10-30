@@ -63,7 +63,7 @@ mod flint_oracle_tests;
 /// Compte les pas encodés par le decode résident complet (tests flint).
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 pub(crate) fn resident_decode_steps_for_test() -> usize {
-    resident::RESIDENT_DECODE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+    resident::RESIDENT_DECODE_STEPS.with(std::cell::Cell::get)
 }
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
@@ -1192,7 +1192,7 @@ impl CausalDecoderConfig {
     /// Renvoie la raison pour laquelle les chemins Metal per-op et spéculatifs
     /// ne connaissent pas ce modèle, ou `None` s'ils le couvrent.
     ///
-    /// Ces kernels (per-op, MTP, DFlash, light-batch, extension en lignes)
+    /// Ces kernels (per-op, MTP, DFlash, pas duo du light-batch, extension en lignes)
     /// ignorent les sinks, le NoPE, le routeur sigmoïde et l'expert partagé
     /// sans gate : les laisser tourner produirait un résultat faux sans erreur.
     /// Seuls le prefill résident (par morceaux et prolongement de préfixe

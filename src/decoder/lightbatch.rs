@@ -232,13 +232,6 @@ impl CausalDecoder {
         if prompts.is_empty() {
             return Err(InferError::Dimension("light-batch sans prompt".to_string()));
         }
-        // Le duo résident encode deux flux en lignes, sans sinks ni MoE
-        // sigmoïde : refus explicite pour un modèle hors chemins per-op (flint).
-        if let Some(reason) = self.config.metal_unsupported_reason() {
-            return Err(InferError::Config(format!(
-                "light-batch non supporté pour ce modèle ({reason})"
-            )));
-        }
         if prompts.len() != max_new_tokens.len() {
             return Err(InferError::Dimension(format!(
                 "light-batch: {} prompts pour {} budgets",
