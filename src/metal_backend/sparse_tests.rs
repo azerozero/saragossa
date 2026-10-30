@@ -79,6 +79,23 @@ fn ledger_never_recycles_leaked_tiles() {
 }
 
 #[test]
+fn ledger_hands_over_only_heaps_with_leaked_tiles() {
+    let mut ledger = Ledger::<u8>::new(2);
+    ledger.add_heap(0);
+    ledger.add_heap(1);
+    ledger.add_heap(2);
+    let mut taken = Vec::new();
+    ledger.take(5, &mut taken);
+    // Empoisonnement simulé d'une tuile du heap 2, recyclage du reste.
+    assert_eq!(taken[4].slot, 2);
+    ledger.leak(&taken[4..]);
+    ledger.recycle(&taken[..4]);
+    assert_eq!(ledger.take_leaked_heaps(), [2]);
+    assert_eq!(ledger.heaps().count(), 2);
+    assert!(ledger.take_leaked_heaps().is_empty());
+}
+
+#[test]
 fn contiguous_runs_split_on_heap_or_gap() {
     let tile = |slot, index| Tile { slot, index };
     let tiles = [tile(0, 4), tile(0, 5), tile(0, 7), tile(1, 8), tile(1, 9)];
@@ -264,14 +281,97 @@ fn missing_or_late_proof_never_recycles() -> Result<()> {
         value: 5,
     };
     assert!(kv.release_from(0, late).is_err());
-    assert!(!kv.is_poisoned());
+    assert!(kv.is_poisoned());
     assert_eq!(pool.stats()?.mapped_tiles, mapped);
-    // Drop sans preuve connue : tuiles et buffer perdus, jamais recyclés.
     drop(kv);
     let stats = pool.stats()?;
     assert_eq!(stats.leaked_tiles, mapped);
     assert_eq!(stats.mapped_tiles, mapped);
     assert_eq!(stats.free_bytes, HEAP_BYTES - mapped * stats.tile_bytes);
+
+    // Drop sans preuve connue : tuiles et buffer perdus, jamais recyclés.
+    let mut silent = pool.new_buffer(1000, MIB)?;
+    silent.ensure_rows(1)?;
+    let more = pool.stats()?.mapped_tiles - mapped;
+    drop(silent);
+    assert_eq!(pool.stats()?.leaked_tiles, mapped + more);
+    Ok(())
+}
+
+#[test]
+fn expired_proof_overrides_an_older_completed_one() -> Result<()> {
+    let Some((device, pool)) = sparse_pool("expired_proof_overrides_an_older_completed_one") else {
+        return Ok(());
+    };
+    pool.set_wait_timeout_ms(20)?;
+    let queue = device.new_command_queue();
+    let event = device.new_shared_event();
+    let mut kv = pool.new_buffer(1000, MIB)?;
+    kv.ensure_rows(4)?;
+    let mapped = pool.stats()?.mapped_tiles;
+    // Preuve 1 atteinte et retenue, puis un usage dont la preuve 2 expire.
+    let first = signal_after(&queue, &event, 1);
+    assert!(wait_signaled(&first.event, 1, 5_000));
+    kv.record_use(first);
+    let second = UseProof {
+        event: event.clone(),
+        value: 2,
+    };
+    assert!(kv.release_from(1, second).is_err());
+    assert!(kv.is_poisoned());
+    assert_eq!(kv.valid_rows(), 0);
+    // Le drop ne se rabat pas sur la preuve 1 : tout est perdu.
+    drop(kv);
+    let stats = pool.stats()?;
+    assert_eq!((stats.leaked_tiles, stats.mapped_tiles), (mapped, mapped));
+    Ok(())
+}
+
+#[test]
+#[expect(unsafe_code, reason = "retainCount du heap observé par le test")]
+fn last_pool_keeps_heaps_with_leaked_tiles() -> Result<()> {
+    let Some((_device, pool)) = sparse_pool("last_pool_keeps_heaps_with_leaked_tiles") else {
+        return Ok(());
+    };
+    let mut kv = pool.new_buffer(1000, MIB)?;
+    kv.ensure_rows(2)?;
+    let heap = {
+        let state = pool.shared.lock()?;
+        let slot = state
+            .ledger
+            .heaps()
+            .next()
+            .expect("invariant: un heap vient d'être créé");
+        slot.heap.heap.clone()
+    };
+    drop(kv);
+    drop(pool);
+    // SAFETY: `heap` est un `id<MTLHeap>` vivant ; `retainCount` rend un
+    // `NSUInteger`.
+    let retained =
+        unsafe { send::<_, NSUInteger>(heap.as_ptr().cast::<Object>(), "retainCount", ())? };
+    // Notre clone plus la référence oubliée par le pool détruit.
+    assert!(retained >= 2, "retainCount {retained}");
+    Ok(())
+}
+
+#[test]
+fn transfers_span_several_staging_ranges() -> Result<()> {
+    let Some((device, pool)) = sparse_pool("transfers_span_several_staging_ranges") else {
+        return Ok(());
+    };
+    let queue = device.new_command_queue();
+    let mut staging = transfer::Staging::new(&device)?;
+    let mut kv = pool.new_buffer(16, MIB)?;
+    kv.ensure_rows(16)?;
+    // 9 Mio + 123 octets à un offset non aligné : trois plages de staging.
+    let data = pattern(9 * MIB as usize + 123, 11);
+    transfer::write_bytes(&queue, &mut staging, kv.buffer(), 4096 + 7, &data)?;
+    let mut back = vec![0u8; data.len()];
+    transfer::read_bytes(&queue, &mut staging, kv.buffer(), 4096 + 7, &mut back)?;
+    assert_eq!(back, data);
+    let event = device.new_shared_event();
+    kv.record_use(signal_after(&queue, &event, 1));
     Ok(())
 }
 
@@ -318,6 +418,41 @@ fn refused_budget_is_a_typed_error() -> Result<()> {
     assert!(!kv.is_poisoned());
     let stats = pool.stats()?;
     assert_eq!((stats.heap_bytes, stats.mapped_tiles), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn second_heap_is_refused_while_the_first_is_unseen() -> Result<()> {
+    let Some(device) = Device::system_default() else {
+        return Ok(());
+    };
+    if supports(&device).is_none() {
+        eprintln!("second_heap_is_refused_while_the_first_is_unseen ignoré : placement sparse indisponible");
+        return Ok(());
+    }
+    // Plafond d'un heap et demi, footprint simulé nul : seule la réservation
+    // gardée par le premier heap peut refuser le second.
+    let limits = MemoryLimits {
+        static_cap: Some(HEAP_BYTES + HEAP_BYTES / 2),
+        host_memory: None,
+        headroom_bytes: 0,
+        metal_cap: None,
+    };
+    let guard = MemoryGuard::from_limits(true, limits, Arc::new(|| Some(0)));
+    let pool = SparseKvPool::new(&device, guard)?;
+    let mut kv = pool.new_buffer(1000, MIB)?;
+    kv.ensure_rows(100)?;
+    let mapped = pool.stats()?.mapped_tiles;
+    assert!(matches!(
+        kv.ensure_rows(300),
+        Err(InferError::MemoryGuard(_))
+    ));
+    assert!(!kv.is_poisoned());
+    let stats = pool.stats()?;
+    assert_eq!((stats.heap_bytes, stats.mapped_tiles), (HEAP_BYTES, mapped));
+    let queue = device.new_command_queue();
+    let event = device.new_shared_event();
+    kv.record_use(signal_after(&queue, &event, 1));
     Ok(())
 }
 

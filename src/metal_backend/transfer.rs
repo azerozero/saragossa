@@ -19,9 +19,14 @@ pub(crate) struct Staging {
 impl Staging {
     /// # Errors
     ///
-    /// Renvoie une erreur si Metal ne donne pas de pointeur CPU au staging.
+    /// Renvoie une erreur si Metal refuse le staging ou ne lui donne pas de
+    /// pointeur CPU.
     pub(crate) fn new(device: &DeviceRef) -> Result<Self> {
-        let buffer = device.new_buffer(STAGING_BYTES, MTLResourceOptions::StorageModeShared);
+        let buffer = super::sparse::checked_buffer(
+            device,
+            STAGING_BYTES,
+            MTLResourceOptions::StorageModeShared,
+        )?;
         if buffer.contents().is_null() {
             return Err(InferError::Metal(
                 "staging de transfert sans pointeur CPU".to_string(),

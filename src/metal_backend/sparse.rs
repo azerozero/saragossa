@@ -19,7 +19,13 @@
 //! Ordre : attente de la preuve, unmap, confirmation MTL4, recyclage. Tout
 //! échec (preuve absente, timeout, confirmation manquante) laisse les tuiles
 //! hors de la liste libre : une tuile peut-être encore lue ne sert jamais à un
-//! autre buffer.
+//! autre buffer. Une preuve qui expire empoisonne le buffer : le drop le perd
+//! au lieu de se fier à une preuve plus ancienne.
+//!
+//! **Toute soumission qui lie le buffer est suivie d'un
+//! [`SparseKvBuffer::record_use`]** avec une preuve signalée après elle : le
+//! drop recycle sur la dernière preuve connue, et recyclerait à tort des
+//! tuiles qu'une commande non déclarée lit encore.
 //!
 //! # Contrats pour le branchement (A2)
 //!
@@ -44,7 +50,7 @@
 //!   seule la destruction d'un heap vide la rend.
 
 use super::*;
-use crate::memory_guard::MemoryGuard;
+use crate::memory_guard::{MemoryGuard, MemoryReservation};
 use metal::foreign_types::ForeignType;
 use metal::objc::runtime::{Object, Sel, BOOL, YES};
 use metal::objc::{Message, MessageArguments};
@@ -313,6 +319,53 @@ fn new_sparse_buffer(device: &DeviceRef, bytes: u64) -> Result<Buffer> {
     Ok(unsafe { Buffer::from_ptr(raw.cast()) })
 }
 
+/// `newBufferWithLength:options:` avec test de nil : metal-rs 0.29 construit
+/// sinon un wrapper non nul sur un retour nil.
+///
+/// # Errors
+///
+/// Renvoie une erreur si Metal refuse le buffer.
+#[expect(
+    unsafe_code,
+    reason = "retour nullable de newBufferWithLength:options:"
+)]
+pub(super) fn checked_buffer(
+    device: &DeviceRef,
+    bytes: u64,
+    options: MTLResourceOptions,
+) -> Result<Buffer> {
+    // SAFETY: device vivant ; `(NSUInteger, MTLResourceOptions)`, retour +1
+    // ou nil, vérifié avant la prise de propriété.
+    let raw = unsafe {
+        send::<_, *mut Object>(
+            device.as_ptr().cast::<Object>(),
+            "newBufferWithLength:options:",
+            (bytes, options),
+        )?
+    };
+    if raw.is_null() {
+        return Err(InferError::Metal(format!(
+            "buffer de {bytes} octets refusé"
+        )));
+    }
+    // SAFETY: `raw` est un `id<MTLBuffer>` +1 non nul.
+    Ok(unsafe { Buffer::from_ptr(raw.cast()) })
+}
+
+/// `newSharedEvent` avec test de nil (même raison que [`checked_buffer`]).
+#[expect(unsafe_code, reason = "retour nullable de newSharedEvent")]
+fn new_shared_event(device: &DeviceRef) -> Result<SharedEvent> {
+    // SAFETY: device vivant ; retour +1 ou nil, vérifié avant la prise de
+    // propriété.
+    let raw =
+        unsafe { send::<_, *mut Object>(device.as_ptr().cast::<Object>(), "newSharedEvent", ())? };
+    if raw.is_null() {
+        return Err(InferError::Metal("événement partagé refusé".to_string()));
+    }
+    // SAFETY: `raw` est un `id<MTLSharedEvent>` +1 non nul.
+    Ok(unsafe { SharedEvent::from_ptr(raw.cast()) })
+}
+
 /// Tuile `index` du heap rangé à `slot` dans le registre.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Tile {
@@ -328,6 +381,8 @@ struct HeapSlot<H> {
     free: Vec<u32>,
     /// Tuiles prêtes à un buffer ou perdues (jamais recyclées).
     used: u32,
+    /// Tuiles perdues : le heap ne doit jamais être libéré.
+    leaked: u32,
 }
 
 /// Registre des tuiles, sans appel Metal (testable sans GPU). `H` est le heap.
@@ -356,6 +411,7 @@ impl<H> Ledger<H> {
             heap,
             free: (0..self.tiles_per_heap).rev().collect(),
             used: 0,
+            leaked: 0,
         };
         match self.slots.iter().position(Option::is_none) {
             Some(index) => self.slots[index] = Some(slot),
@@ -391,6 +447,21 @@ impl<H> Ledger<H> {
     /// n'est jamais détruit.
     fn leak(&mut self, tiles: &[Tile]) {
         self.leaked_tiles += tiles.len() as u64;
+        for tile in tiles {
+            if let Some(Some(heap)) = self.slots.get_mut(tile.slot) {
+                heap.leaked += 1;
+            }
+        }
+    }
+
+    /// Retire les heaps qui portent au moins une tuile perdue, pour que le
+    /// détenteur les garde à jamais.
+    fn take_leaked_heaps(&mut self) -> Vec<H> {
+        self.slots
+            .iter_mut()
+            .filter(|slot| slot.as_ref().is_some_and(|heap| heap.leaked > 0))
+            .filter_map(|slot| slot.take().map(|heap| heap.heap))
+            .collect()
     }
 
     fn free_tiles(&self) -> u64 {
@@ -437,23 +508,47 @@ pub(crate) struct SparseKvStats {
     pub(crate) leaked_tiles: u64,
 }
 
+/// Heap et sa réservation auprès de la garde mémoire, rendue avec lui.
+// ponytail: un heap écrit est compté deux fois (réservation et
+// `phys_footprint`) ; prudent, à compenser en A2 si la garde refuse trop tôt.
+struct PoolHeap {
+    heap: Heap,
+    _reservation: MemoryReservation,
+}
+
 struct PoolState {
-    ledger: Ledger<Heap>,
+    ledger: Ledger<PoolHeap>,
     queue: Mtl4Queue,
     event: SharedEvent,
     /// Dernière valeur signalée sur `event` : strictement croissante.
     event_value: u64,
     virtual_bytes: u64,
-    wait_timeout_ms: u64,
 }
 
 impl PoolState {
     /// Signale la valeur suivante après les opérations déjà soumises et
-    /// l'attend, au plus `wait_timeout_ms`.
-    fn confirm(&mut self) -> bool {
+    /// l'attend, au plus `timeout_ms`.
+    fn confirm(&mut self, timeout_ms: u64) -> bool {
         self.event_value += 1;
         self.queue.signal(&self.event, self.event_value).is_ok()
-            && wait_signaled(&self.event, self.event_value, self.wait_timeout_ms)
+            && wait_signaled(&self.event, self.event_value, timeout_ms)
+    }
+}
+
+impl Drop for PoolState {
+    fn drop(&mut self) {
+        // Une tuile perdue peut encore être lue par une commande en vol : son
+        // heap n'est jamais libéré, même quand le pool disparaît.
+        let leaked = self.ledger.take_leaked_heaps();
+        if !leaked.is_empty() {
+            eprintln!(
+                "saragossa: pool K/V sparse détruit, {} heaps gardés (tuiles perdues)",
+                leaked.len()
+            );
+        }
+        for heap in leaked {
+            std::mem::forget(heap);
+        }
     }
 }
 
@@ -461,10 +556,17 @@ struct PoolShared {
     device: Device,
     tile_bytes: u64,
     guard: MemoryGuard,
+    /// Attente bornée des mappings et des preuves, lisible sans le verrou.
+    wait_timeout_ms: std::sync::atomic::AtomicU64,
     state: Mutex<PoolState>,
 }
 
 impl PoolShared {
+    fn timeout_ms(&self) -> u64 {
+        self.wait_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, PoolState>> {
         self.state
             .lock()
@@ -494,16 +596,16 @@ impl SparseKvPool {
         let state = PoolState {
             ledger: Ledger::new(tiles_per_heap),
             queue: Mtl4Queue::new(device)?,
-            event: device.new_shared_event(),
+            event: new_shared_event(device)?,
             event_value: 0,
             virtual_bytes: 0,
-            wait_timeout_ms: WAIT_TIMEOUT_MS,
         };
         Ok(Self {
             shared: Arc::new(PoolShared {
                 device: device.to_owned(),
                 tile_bytes,
                 guard,
+                wait_timeout_ms: std::sync::atomic::AtomicU64::new(WAIT_TIMEOUT_MS),
                 state: Mutex::new(state),
             }),
         })
@@ -530,7 +632,9 @@ impl SparseKvPool {
 
     #[cfg(test)]
     fn set_wait_timeout_ms(&self, timeout_ms: u64) -> Result<()> {
-        self.shared.lock()?.wait_timeout_ms = timeout_ms;
+        self.shared
+            .wait_timeout_ms
+            .store(timeout_ms, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -686,15 +790,21 @@ impl SparseKvBuffer {
         let mut taken = Vec::with_capacity(missing);
         state.ledger.take(missing, &mut taken);
         while taken.len() < missing {
-            // NOTE: la réservation ne couvre que la création. Mesuré sur M5 Max :
-            // un heap placement n'entre dans `phys_footprint` qu'à la première
-            // écriture de ses tuiles, et sa destruction n'en sort qu'en
-            // différé (~0,5 s).
+            // NOTE: la réservation vit avec le heap. Mesuré sur M5 Max : un heap
+            // placement n'entre dans `phys_footprint` qu'à la première écriture
+            // de ses tuiles, et sa destruction n'en sort qu'en différé
+            // (~0,5 s) ; une réservation rendue à la création laisserait
+            // passer plusieurs heaps contre un footprint encore nul.
             let heap = pool
                 .guard
                 .reserve_allocation(HEAP_BYTES)
                 .map_err(InferError::MemoryGuard)
-                .and_then(|_reservation| new_placement_heap(&pool.device, HEAP_BYTES));
+                .and_then(|reservation| {
+                    Ok(PoolHeap {
+                        heap: new_placement_heap(&pool.device, HEAP_BYTES)?,
+                        _reservation: reservation,
+                    })
+                });
             match heap {
                 Ok(heap) => state.ledger.add_heap(heap),
                 Err(error) => {
@@ -716,17 +826,19 @@ impl SparseKvBuffer {
             };
             let heap = state.ledger.slots.get(run[0].slot).and_then(Option::as_ref);
             submitted = submitted.and_then(|()| match heap {
-                Some(slot) => state.queue.update(&self.buffer, Some(&slot.heap), &[op]),
+                Some(slot) => state
+                    .queue
+                    .update(&self.buffer, Some(&slot.heap.heap), &[op]),
                 None => Err(InferError::Metal("tuile sparse sans heap".to_string())),
             });
         }
-        let confirmed = submitted.is_ok() && state.confirm();
+        let timeout_ms = pool.timeout_ms();
+        let confirmed = submitted.is_ok() && state.confirm(timeout_ms);
         self.tiles.extend(taken);
         if !confirmed {
             self.poison(&mut state);
             return Err(InferError::Metal(format!(
-                "mapping sparse non confirmé en {} ms",
-                state.wait_timeout_ms
+                "mapping sparse non confirmé en {timeout_ms} ms"
             )));
         }
         Ok(())
@@ -739,37 +851,45 @@ impl SparseKvBuffer {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si le buffer est empoisonné, si la preuve n'arrive
-    /// pas (rien n'est rendu) ou si l'unmap n'est pas confirmé (buffer
-    /// empoisonné, tuiles perdues).
+    /// Renvoie une erreur si le buffer est empoisonné, ou si la preuve ou la
+    /// confirmation de l'unmap n'arrivent pas : le buffer est alors
+    /// empoisonné et ses tuiles perdues.
     pub(crate) fn release_from(&mut self, row: usize, quiesced: UseProof) -> Result<()> {
         self.ensure_usable()?;
-        self.valid_rows = self.valid_rows.min(row);
         let keep = self.tiles_for_rows(row)?;
         if keep >= self.tiles.len() {
+            self.valid_rows = self.valid_rows.min(row);
             self.record_use(quiesced);
             return Ok(());
         }
         let pool = Arc::clone(&self.pool);
-        let mut state = pool.lock()?;
-        if !wait_signaled(&quiesced.event, quiesced.value, state.wait_timeout_ms) {
+        let timeout_ms = pool.timeout_ms();
+        // Attente hors du verrou : un decode lent ne bloque pas les mappings
+        // des autres buffers.
+        if !wait_signaled(&quiesced.event, quiesced.value, timeout_ms) {
+            // Une commande peut encore lire : aucune preuve plus ancienne ne
+            // doit servir au drop, qui perdra le buffer.
+            self.last_proof = None;
+            let mut state = pool.lock()?;
+            self.poison(&mut state);
             return Err(InferError::Metal(format!(
-                "preuve de fin d'usage {} non atteinte en {} ms : tuiles gardées",
-                quiesced.value, state.wait_timeout_ms
+                "preuve de fin d'usage {} non atteinte en {timeout_ms} ms : buffer empoisonné",
+                quiesced.value
             )));
         }
+        self.valid_rows = self.valid_rows.min(row);
         self.record_use(quiesced);
+        let mut state = pool.lock()?;
         let op = MappingOperation {
             mode: MAPPING_MODE_UNMAP,
             buffer_range: NSRange::new(keep as u64, (self.tiles.len() - keep) as u64),
             heap_offset: 0,
         };
         let submitted = state.queue.update(&self.buffer, None, &[op]);
-        if submitted.is_err() || !state.confirm() {
+        if submitted.is_err() || !state.confirm(timeout_ms) {
             self.poison(&mut state);
             return Err(InferError::Metal(format!(
-                "unmap sparse non confirmé en {} ms",
-                state.wait_timeout_ms
+                "unmap sparse non confirmé en {timeout_ms} ms"
             )));
         }
         let released = self.tiles.split_off(keep);
@@ -792,7 +912,7 @@ impl SparseKvBuffer {
         slots.dedup();
         for slot in slots {
             if let Some(Some(heap)) = state.ledger.slots.get(slot) {
-                encoder.use_heap(&heap.heap);
+                encoder.use_heap(&heap.heap.heap);
             }
         }
         Ok(())
