@@ -1584,6 +1584,92 @@ fn resident_decode_steps() -> usize {
     crate::decoder::resident_decode_steps_for_test()
 }
 
+/// K/V des couches glissantes borné à la fenêtre sur flint-int4 réel contre
+/// le K/V plein du kill-switch, en f32 puis en bf16 (opt-in forcé) : prompt
+/// de `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, cinq morceaux),
+/// hidden de toutes les positions et 16 tokens greedy bit-identiques, couches
+/// glissantes réduites à leur fenêtre. Une seule copie des poids à la fois.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis"]
+fn flint_int4_window_kv_matches_full_kv() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("test flint fenêtre sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    let len = std::env::var("SARAGOSSA_FLINT_BF16_LEN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16_400);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let prompt = synthetic_long_prompt(&assets, len);
+    let chunk = crate::runtime_flags::prefill_resident_chunk_tokens();
+    let run = |window: bool, bf16: bool| {
+        let mut executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+        executor.set_prefill_window_kv_for_test(window);
+        executor.set_prefill_kv_bf16_store_min_rows_for_test(bf16.then_some(0));
+        executor.set_prefill_kv_bf16_store_sinks_for_test(bf16);
+        let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+            .expect("invariant: flint-int4 chargeable en Metal")
+            .with_metal_executor(executor)
+            .expect("invariant: runtime Metal attaché");
+        let started = std::time::Instant::now();
+        let hidden = model
+            .prefill_hidden_for_test(&prompt, Some(chunk))
+            .expect("invariant: prefill résident")
+            .expect("prefill résident Metal attendu pour flint");
+        let hidden = hidden
+            .data()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let state = model
+            .prefill_prompt_state_uncached(&prompt)
+            .expect("invariant: prefill résident");
+        let rows = state.kv_rows_for_test();
+        let tokens = model
+            .generate_greedy_timed_from_prompt_state_with_options(
+                state,
+                std::time::Duration::ZERO,
+                16,
+                &crate::GenerationOptions::default(),
+            )
+            .expect("invariant: génération résidente")
+            .tokens;
+        println!(
+            "fenêtre={window} bf16={bf16}: {:.1?}, greedy {tokens:?}",
+            started.elapsed()
+        );
+        (hidden, rows, tokens)
+    };
+    for bf16 in [false, true] {
+        let (window_hidden, window_rows, window_tokens) = run(true, bf16);
+        let (full_hidden, full_rows, full_tokens) = run(false, bf16);
+        let bounded = window_rows
+            .iter()
+            .filter(|(_, stored)| *stored == 513)
+            .count();
+        println!(
+            "bf16={bf16}: {bounded}/{} couches réduites à 513 lignes",
+            window_rows.len()
+        );
+        assert!(
+            bounded > 0
+                && full_rows
+                    .iter()
+                    .all(|&(base, stored)| (base, stored) == (0, len))
+        );
+        assert!(window_rows
+            .iter()
+            .all(|&(base, stored)| base + stored == len && (base == 0 || stored == 513)));
+        assert!(
+            window_hidden == full_hidden,
+            "bf16={bf16}: hidden K/V borné != K/V plein"
+        );
+        assert_eq!(window_tokens, full_tokens, "bf16={bf16}: greedy");
+    }
+}
+
 /// Adoption du K/V bf16 de flint-int4 réel par l'arène de decode : prompt de
 /// `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, au-delà des seuils
 /// de stockage et d'arène bf16), flag flint forcé, 16 tokens greedy identiques
