@@ -413,7 +413,8 @@ impl MetalExecutor {
             PrefillAttentionLayer::Full { sinks: Some(_), .. } => {
                 self.prefill_kv_bf16_store_sinks
                     && (layer.attention_spec.window.is_some()
-                        || self.attention_prefill_steel_sink_d128_kv_bf16.is_some())
+                        || self.attention_prefill_steel_sink_d128_kv_bf16.is_some()
+                        || self.attention_prefill_nax_sink_d128.is_some())
             }
             PrefillAttentionLayer::Full { .. } => {
                 self.causal_attention_prefill_steel_nax_d256.is_some()

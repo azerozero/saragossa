@@ -54,6 +54,15 @@ pub(super) const NAX_CAUSAL_ATTN_BQ128: NaxCausalAttnShape = NaxCausalAttnShape 
     head_major: false,
 };
 
+/// NAX d128 avec sinks des couches pleines flint (BQ=64, BK=32, WM=4).
+pub(super) const NAX_SINK_ATTN_D128: NaxCausalAttnShape = NaxCausalAttnShape {
+    host_name: "steel_attention_nax_bf16_f32out_bq64_bk32_bd128_wm4_wn1",
+    block_q: 64,
+    block_k: 32,
+    simdgroups: 4,
+    head_major: false,
+};
+
 impl NaxCausalAttnShape {
     /// Instanciation retenue par les flags `SARAGOSSA_RUST_PREFILL_ATTN_NAX_*`.
     pub(super) fn from_flags() -> Self {
@@ -1365,7 +1374,9 @@ impl MetalExecutor {
     /// préfixe prolongé ; `kv_rows == spec.seq` en un seul morceau) : Q et la
     /// sortie sont locaux, K/V, causalité et fenêtre absolus.
     ///
-    /// Sans fenêtre en d128, le Steel tuilé avec sinks
+    /// Sans fenêtre en d128 sur K/V bf16, le NAX avec sinks s'il est compilé
+    /// (`SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS`, Q converti en bf16).
+    /// Sinon, sans fenêtre en d128, le Steel tuilé avec sinks
     /// (`SARAGOSSA_RUST_FLINT_PREFILL_STEEL`) ; sinon
     /// `attention_prefill_sink_f32`, une simdgroup par (tête Q, position).
     /// `kv_bf16` : K/V stockés en bf16, lus par les jumeaux bf16 de ces deux
@@ -1398,6 +1409,46 @@ impl MetalExecutor {
                 "prefill avec sinks: head_dim={} q_heads={} kv_heads={} q={} kv={kv_rows} hors kernel",
                 spec.head_dim, spec.q_heads, spec.kv_heads, spec.seq
             )));
+        }
+        if let Some(nax) = self.attention_prefill_nax_sink_d128.as_ref().filter(|_| {
+            kv_bf16 && spec.window.is_none() && spec.head_dim == STEEL_SINK_ATTN_D128_BD
+        }) {
+            // Le NAX lit Q, K et V dans le même type : Q est converti en bf16
+            // comme pour le d256 ; un K/V f32 garde le Steel (pas de TF32).
+            let q_len = checked_len(spec.seq, spec.q_heads * spec.head_dim, "nax sinks q")?;
+            let q_bf16 = self.private_bf16_buffer(q_len, "prefill_attn_nax_q_bf16")?;
+            self.encode_f32_to_bf16(encoder, q_buffer, &q_bf16, q_len)?;
+            let params = steel_attn_params(
+                spec,
+                nax.shape.block_q,
+                nax.shape.block_k,
+                kv_rows,
+                "nax sinks d128 attention",
+            )?;
+            let grid_rows = checked_nsuint(spec.seq.div_ceil(nax.shape.block_q), "nax sinks NQ")?;
+            let grid_heads = checked_nsuint(spec.q_heads, "nax sinks heads")?;
+            encoder.set_compute_pipeline_state(&nax.pipeline);
+            encoder.set_buffer(0, Some(&q_bf16), 0);
+            encoder.set_buffer(1, Some(k_buffer), 0);
+            encoder.set_buffer(2, Some(v_buffer), 0);
+            encoder.set_buffer(3, Some(output_buffer), 0);
+            encoder.set_bytes(
+                4,
+                std::mem::size_of::<SteelAttnParams>() as NSUInteger,
+                (&params as *const SteelAttnParams).cast::<c_void>(),
+            );
+            encoder.set_buffer(7, Some(sinks_buffer), 0);
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                if nax.shape.head_major {
+                    MTLSize::new(grid_heads, grid_rows, 1)
+                } else {
+                    MTLSize::new(grid_rows, grid_heads, 1)
+                },
+                MTLSize::new(32, nax.shape.simdgroups, 1),
+            );
+            post_dispatch_barrier(encoder);
+            return Ok(());
         }
         let steel = if kv_bf16 {
             &self.attention_prefill_steel_sink_d128_kv_bf16

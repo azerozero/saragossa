@@ -767,6 +767,17 @@ pub(crate) fn prefill_attn_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX", true))
 }
 
+/// Attention des couches pleines flint (sinks, sans fenêtre, d128) sur les
+/// accélérateurs neuronaux quand le K/V de prefill est stocké en bf16 (≥ 16k
+/// par morceaux) : NAX de MLX avec sinks f32, Q converti en bf16, sortie f32.
+/// Opt-in `SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS=1` ; sans lui, ou si le
+/// pipeline ne compile pas (MPP absent avant macOS 26), le Steel d128 bf16.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_attn_nax_sinks_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS", false))
+}
+
 /// Ordre de la grille du NAX d256 : `SARAGOSSA_RUST_PREFILL_ATTN_NAX_GRID` =
 /// `head` (défaut, `(H, NQ)`, la tête la plus rapide : les têtes Q d'un groupe
 /// KV partent côte à côte et partagent les tuiles K/V en cache) ou `seq`

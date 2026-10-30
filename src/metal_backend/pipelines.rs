@@ -210,6 +210,32 @@ pub(super) fn compile_steel_causal_nax_d256_attention(
     source: &str,
     shape: attention::NaxCausalAttnShape,
 ) -> Option<attention::NaxCausalAttention> {
+    compile_nax_causal_attention(device, source, shape, false)
+}
+
+/// Compile l'attention causale NAX d128 avec sinks f32 (couches pleines
+/// flint). `None` dans les mêmes cas que le d256.
+///
+/// NOTE: `compile_nax_function` recompile toute la source NAX : avec le d256
+/// actif, la source est compilée deux fois au démarrage. Le d256 ne sert que
+/// Qwen et ce pipeline que flint (opt-in), d'où un coût accepté plutôt
+/// qu'une `Library` partagée entre deux familles.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(super) fn compile_nax_sink_d128_attention(
+    device: &Device,
+    source: &str,
+    shape: attention::NaxCausalAttnShape,
+) -> Option<attention::NaxCausalAttention> {
+    compile_nax_causal_attention(device, source, shape, true)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn compile_nax_causal_attention(
+    device: &Device,
+    source: &str,
+    shape: attention::NaxCausalAttnShape,
+    sinks: bool,
+) -> Option<attention::NaxCausalAttention> {
     let pipeline = compile_nax_function(
         device,
         source,
@@ -219,7 +245,7 @@ pub(super) fn compile_steel_causal_nax_d256_attention(
             (201, false),
             (300, false),
             (301, true),
-            (302, false),
+            (302, sinks),
             (303, false),
             (304, shape.head_major),
         ],
@@ -649,6 +675,20 @@ impl MetalExecutor {
             } else {
                 None
             };
+        let attention_prefill_nax_sink_d128 =
+            if crate::runtime_flags::prefill_attn_nax_sinks_enabled() {
+                let pipeline = compile_nax_sink_d128_attention(
+                    &device,
+                    sources.steel_attention_nax.as_ref(),
+                    attention::NAX_SINK_ATTN_D128,
+                );
+                if pipeline.is_none() {
+                    eprintln!("attention prefill NAX avec sinks indisponible : repli Steel d128");
+                }
+                pipeline
+            } else {
+                None
+            };
         let noncausal_attention_prefill_f32 =
             pipeline(&library, &device, "noncausal_attention_prefill_f32")?;
         let steel_attention_f32_bq32_bk32_bd64 =
@@ -844,6 +884,7 @@ impl MetalExecutor {
             prefill_sink_steel: crate::runtime_flags::flint_prefill_steel_enabled(),
             prefill_window_kv: crate::runtime_flags::flint_window_kv_enabled(),
             causal_attention_prefill_steel_nax_d256,
+            attention_prefill_nax_sink_d128,
             prefill_kv_bf16_mirror: crate::runtime_flags::prefill_kv_bf16_mirror_enabled(),
             prefill_kv_bf16_store_min_rows: (crate::runtime_flags::prefill_kv_bf16_store_enabled()
                 && crate::decode_resident::kv_bf16_dense_by_default())
