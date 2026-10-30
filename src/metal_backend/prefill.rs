@@ -18,6 +18,14 @@ mod sink_tests;
 #[cfg(test)]
 mod tests;
 
+impl MetalExecutor {
+    /// Le prefill borne-t-il le K/V des couches glissantes à sinks à leur
+    /// fenêtre (`SARAGOSSA_RUST_FLINT_WINDOW_KV`, forcé en test) ?
+    pub(crate) fn prefill_window_kv(&self) -> bool {
+        self.prefill_window_kv
+    }
+}
+
 #[cfg(test)]
 impl MetalExecutor {
     /// Seuil du stockage bf16 du K/V de prefill, pour les tests hors de ce

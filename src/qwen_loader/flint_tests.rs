@@ -702,7 +702,10 @@ fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
     let bf16 = gpu(true);
     let (copied, tokens, adopted) =
         bf16.decode_with_and_without_adoption_for_test(&prompt, 3, 6, &options);
-    assert!(adopted, "arène sans adoption du K/V bf16 de flint");
+    assert!(
+        adopted.iter().all(|&adopted| adopted),
+        "arène sans adoption du K/V bf16 de flint: {adopted:?}"
+    );
     assert_eq!(tokens.len(), 6);
     assert_eq!(tokens, copied, "adoption != semis par copie");
     // K/V borné (défaut) : les couches glissantes sèment leur queue par
@@ -716,7 +719,13 @@ fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
         .expect("invariant: runtime Metal attaché");
     let (window_copied, window_tokens, window_adopted) =
         window.decode_with_and_without_adoption_for_test(&prompt, 3, 6, &options);
-    assert!(!window_adopted, "couches glissantes bornées adoptées");
+    // Couche 0 pleine adoptée, couches 1 et 2 glissantes bornées semées
+    // par copie de leur queue.
+    assert_eq!(
+        window_adopted,
+        vec![true, false, false],
+        "adoption par couche (pleine, glissante, glissante)"
+    );
     assert_eq!(window_tokens, window_copied, "K/V borné: adoption != copie");
     assert_eq!(window_tokens, tokens, "K/V borné != K/V plein");
 }
@@ -1585,7 +1594,7 @@ fn resident_decode_steps() -> usize {
 }
 
 /// K/V des couches glissantes borné à la fenêtre sur flint-int4 réel contre
-/// le K/V plein du kill-switch, en f32 puis en bf16 (opt-in forcé) : prompt
+/// le K/V plein du kill-switch, en f32 puis en bf16 (stockage forcé) : prompt
 /// de `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, cinq morceaux),
 /// hidden de toutes les positions et 16 tokens greedy bit-identiques, couches
 /// glissantes réduites à leur fenêtre. Une seule copie des poids à la fois.
@@ -1710,6 +1719,9 @@ fn flint_int4_arena_adopts_prefill_kv_bf16() {
         "{len} tokens en {:.1?} : copie {copied:?}, adoption {tokens:?}",
         started.elapsed()
     );
-    assert!(adopted, "arène sans adoption du K/V bf16 de flint-int4");
+    assert!(
+        adopted.iter().all(|&adopted| adopted),
+        "arène sans adoption du K/V bf16 de flint-int4: {adopted:?}"
+    );
     assert_eq!(tokens, copied, "greedy adopté != semis par copie");
 }

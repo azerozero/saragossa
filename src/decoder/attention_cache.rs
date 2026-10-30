@@ -94,13 +94,10 @@ impl LayerKvCache {
         }
         self.kv_dim = Some(expected_dim);
         if let Some(base_len) = base_len.filter(|len| *len > 0) {
-            // Cache vide vérifié ci-dessus : la base est toujours acceptée.
             let accepted = self.keys.set_base(base_len) && self.values.set_base(base_len);
-            if !accepted {
-                return Err(InferError::Dimension(
-                    "base K/V sur un cache non vide".to_string(),
-                ));
-            }
+            accepted
+                .then_some(())
+                .expect("invariant: base posée sur un cache vide, vérifié ci-dessus");
         }
         self.keys.push_prefill(key);
         self.values.push_prefill(value);

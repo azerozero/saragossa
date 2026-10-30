@@ -987,16 +987,17 @@ impl CausalDecoder {
     /// stocke), puis decode de `new_tokens` tokens, deux fois : la réserve
     /// tenue par le test (l'arène sème par copie), puis libre. Exige une vue
     /// bf16 entière à chaque couche full-attn résidente. Rend les tokens des
-    /// deux decodes et si, au second, l'arène a tenu la réserve de toutes les
-    /// couches à chaque token : seul l'adoptant la prend, l'arène écrit alors
-    /// dans les deux buffers K/V du prefill, sans second exemplaire.
+    /// deux decodes et, par couche full-attn dans l'ordre, si au second
+    /// l'arène a tenu sa réserve à chaque token : seul l'adoptant la prend,
+    /// l'arène écrit alors dans les deux buffers K/V du prefill, sans second
+    /// exemplaire.
     pub(crate) fn decode_with_and_without_adoption_for_test(
         &self,
         prompt: &[usize],
         chunk: usize,
         new_tokens: usize,
         options: &GenerationOptions,
-    ) -> (Vec<usize>, Vec<usize>, bool) {
+    ) -> (Vec<usize>, Vec<usize>, Vec<bool>) {
         use crate::metal_backend::InPlaceClaim;
         let attention_layers = (0..self.layers.len())
             .filter(|&index| self.config.is_resident_full_attention_layer(index))
@@ -1023,7 +1024,7 @@ impl CausalDecoder {
             } else {
                 Vec::new()
             };
-            let mut adopted = true;
+            let mut adopted = vec![true; prefixes.len()];
             let tokens = self
                 .generate_greedy_timed_from_prompt_state_with_options_and_callback(
                     state,
@@ -1031,9 +1032,9 @@ impl CausalDecoder {
                     new_tokens,
                     options,
                     |_| {
-                        adopted &= prefixes
-                            .iter()
-                            .all(|[key, value]| InPlaceClaim::try_after([key, value]).is_none());
+                        for (adopted, [key, value]) in adopted.iter_mut().zip(&prefixes) {
+                            *adopted &= InPlaceClaim::try_after([key, value]).is_none();
+                        }
                         true
                     },
                 )

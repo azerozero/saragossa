@@ -5163,29 +5163,46 @@ impl CausalDecoder {
                 .recommended_max_working_set_size()
                 .saturating_sub(weights)
                 .saturating_sub(SCRATCH_RESERVE_BYTES);
-            // Une couche glissante à sinks bornée à sa fenêtre garde un K/V de
-            // taille fixe, hors du coût par token.
-            let window_kv = crate::runtime_flags::flint_window_kv_enabled();
-            let bytes_per_token = (0..self.layers.len())
+            // Une couche glissante à sinks bornée à sa fenêtre garde un buffer
+            // de `2 × fenêtre + morceau` lignes, hors du coût par token, si le
+            // prefill est vraiment découpé : sans morceaux
+            // (`SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0`, timestamps GPU),
+            // son buffer couvre tout le prompt et compte par token.
+            let chunk = crate::runtime_flags::prefill_resident_chunk_tokens();
+            let chunked = metal.prefill_window_kv()
+                && chunk > 0
+                && !crate::runtime_flags::gpu_timestamps_enabled();
+            let (mut bytes_per_token, mut fixed_bytes) = (0_usize, 0_usize);
+            for index in (0..self.layers.len())
                 .filter(|&index| self.config.is_resident_full_attention_layer(index))
-                .filter(|&index| {
-                    !(window_kv
-                        && self.config.layer_sliding_window(index).is_some()
+            {
+                let Ok(kv_dim) = self.config.resident_full_attention_kv_dim(index) else {
+                    continue;
+                };
+                let row_bytes = 2 * kv_dim * KV_BYTES_PER_VALUE;
+                let window = self.config.layer_sliding_window(index).filter(|_| {
+                    chunked
                         && matches!(
                             self.layers.get(index).map(|layer| &layer.attention),
                             Some(AttentionBlock::Full(attention)) if attention.sinks.is_some()
-                        ))
-                })
-                .filter_map(|index| self.config.resident_full_attention_kv_dim(index).ok())
-                .map(|kv_dim| 2 * kv_dim * KV_BYTES_PER_VALUE)
-                .sum::<usize>()
-                .max(1);
+                        )
+                });
+                match window {
+                    Some(window) => {
+                        let rows = window.saturating_mul(2).saturating_add(chunk);
+                        fixed_bytes = fixed_bytes.saturating_add(row_bytes.saturating_mul(rows));
+                    }
+                    None => bytes_per_token = bytes_per_token.saturating_add(row_bytes),
+                }
+            }
+            let free = free.saturating_sub(u64::try_from(fixed_bytes).unwrap_or(u64::MAX));
+            let bytes_per_token = bytes_per_token.max(1);
             let cap = usize::try_from(free / bytes_per_token as u64)
                 .unwrap_or(MAX_TOKENS)
                 .clamp(MIN_TOKENS, MAX_TOKENS);
             if trace_prefill_enabled() {
                 eprintln!(
-                    "flint_prefill_cap working_set={} weights={weights} bytes_per_token={bytes_per_token} cap={cap}",
+                    "flint_prefill_cap working_set={} weights={weights} bytes_per_token={bytes_per_token} fixed_bytes={fixed_bytes} cap={cap}",
                     device.recommended_max_working_set_size()
                 );
             }

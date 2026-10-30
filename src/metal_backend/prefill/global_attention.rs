@@ -467,3 +467,61 @@ fn window_kv_row(
     window.base.set(chunk.start - window.keep);
     Ok((window.keep, Some((from, window.keep))))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(capacity: usize, base: usize) -> PrefillWindowKv {
+        PrefillWindowKv {
+            keep: 513,
+            capacity,
+            base: Cell::new(base),
+        }
+    }
+
+    fn chunk(start: usize, rows: usize) -> ResidentPrefillChunk {
+        ResidentPrefillChunk {
+            start,
+            rows,
+            total: usize::MAX,
+        }
+    }
+
+    /// Fenêtre flint (513) : lignes d'écriture, compactions disjointes et
+    /// base absolue, en morceaux de 4096 (dernier plus court), de 100 (plus
+    /// courts que la fenêtre) et après la queue d'un préfixe.
+    #[test]
+    fn window_kv_row_compacts_disjoint_tail_at_window_513() -> Result<()> {
+        let big = window(2 * 513 + 4096, 0);
+        assert_eq!(window_kv_row(&big, chunk(0, 4096))?, (0, None));
+        assert_eq!(
+            window_kv_row(&big, chunk(4096, 4096))?,
+            (513, Some((3583, 513)))
+        );
+        assert_eq!(big.base.get(), 3583);
+        assert_eq!(
+            window_kv_row(&big, chunk(8192, 1000))?,
+            (513, Some((4096, 513)))
+        );
+        assert_eq!(big.base.get(), 8192 - 513);
+        let small = window(2 * 513 + 100, 0);
+        let mut compactions = Vec::new();
+        for start in (0..3000).step_by(100) {
+            let (row, compaction) = window_kv_row(&small, chunk(start, 100))?;
+            assert_eq!(start - small.base.get(), row, "début {start}");
+            assert!(row + 100 <= small.capacity);
+            if let Some((from, keep)) = compaction {
+                assert!(from >= keep, "compaction chevauchante à {start}");
+                compactions.push(start);
+            }
+        }
+        assert_eq!(compactions.first(), Some(&1100));
+        assert!(compactions.len() > 3);
+        // Tour 2 : queue de 513 lignes du préfixe, morceau qui tient.
+        let tail = window(513 + 300, 10_000 - 513);
+        assert_eq!(window_kv_row(&tail, chunk(10_000, 300))?, (513, None));
+        assert!(window_kv_row(&tail, chunk(9_000, 1)).is_err());
+        Ok(())
+    }
+}
