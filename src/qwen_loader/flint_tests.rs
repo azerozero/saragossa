@@ -662,71 +662,6 @@ fn synthetic_flint_prefill_kv_bf16_store_drift() {
     }
 }
 
-/// Prefill de `prompt` par morceaux de `chunk` tokens (réserve de
-/// `new_tokens` lignes), puis decode de `new_tokens` tokens, deux fois : la
-/// réserve du K/V bf16 tenue par le test (l'arène sème par copie), puis libre.
-/// Rend les tokens des deux decodes et si, au second, l'arène a tenu la
-/// réserve de toutes les couches à chaque token : elle écrit alors dans les
-/// buffers du prefill, sans second exemplaire du K/V.
-#[cfg(all(target_os = "macos", feature = "metal"))]
-fn decode_with_and_without_adoption(
-    model: &CausalDecoder,
-    prompt: &[usize],
-    chunk: usize,
-    new_tokens: usize,
-    options: &crate::GenerationOptions,
-) -> (Vec<usize>, Vec<usize>, bool) {
-    use crate::metal_backend::InPlaceClaim;
-    let run = |hold_reserve: bool| {
-        // Morceaux forcés : le stockage bf16 exige un prefill par morceaux.
-        let state = crate::metal_backend::with_prefill_kv_layout_override(chunk, 0, || {
-            crate::decoder::with_prefill_kv_reserve(new_tokens, || {
-                model.prefill_prompt_state_uncached(prompt)
-            })
-        })
-        .expect("invariant: prefill résident flint");
-        let prefixes = state.kv_bf16_prefixes_for_test();
-        assert!(!prefixes.is_empty(), "aucune couche en vue bf16 entière");
-        let held: Vec<_> = if hold_reserve {
-            prefixes
-                .iter()
-                .map(|[key, value]| {
-                    InPlaceClaim::try_after([key, value]).expect("invariant: réserve libre")
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let mut adopted = true;
-        let tokens = model
-            .generate_greedy_timed_from_prompt_state_with_options_and_callback(
-                state,
-                std::time::Duration::ZERO,
-                new_tokens,
-                options,
-                |_| {
-                    adopted &= prefixes
-                        .iter()
-                        .all(|[key, value]| InPlaceClaim::try_after([key, value]).is_none());
-                    true
-                },
-            )
-            .expect("invariant: decode flint")
-            .tokens;
-        drop(held);
-        assert!(
-            prefixes
-                .iter()
-                .all(|[key, value]| InPlaceClaim::try_after([key, value]).is_some()),
-            "réserve rendue après le decode"
-        );
-        (tokens, adopted)
-    };
-    let (copied, _) = run(true);
-    let (tokens, adopted) = run(false);
-    (copied, tokens, adopted)
-}
-
 /// Adoption par l'arène de decode du K/V bf16 de flint (opt-in forcé, seuil
 /// 0) : couche pleine à sinks et couches fenêtrées (fenêtre 2, dépassée par
 /// le prompt et le decode). L'arène tient la réserve du prefill de chaque
@@ -765,7 +700,7 @@ fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
     };
     let bf16 = gpu(true);
     let (copied, tokens, adopted) =
-        decode_with_and_without_adoption(&bf16, &prompt, 3, 6, &options);
+        bf16.decode_with_and_without_adoption_for_test(&prompt, 3, 6, &options);
     assert!(adopted, "arène sans adoption du K/V bf16 de flint");
     assert_eq!(tokens.len(), 6);
     assert_eq!(tokens, copied, "adoption != semis par copie");
@@ -1563,8 +1498,7 @@ fn flint_int4_arena_adopts_prefill_kv_bf16() {
         .expect("invariant: runtime Metal attaché");
     let chunk = crate::runtime_flags::prefill_resident_chunk_tokens();
     let started = std::time::Instant::now();
-    let (copied, tokens, adopted) = decode_with_and_without_adoption(
-        &model,
+    let (copied, tokens, adopted) = model.decode_with_and_without_adoption_for_test(
         &prompt,
         chunk,
         16,

@@ -968,6 +968,80 @@ impl CausalDecoderCache {
     }
 }
 
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+impl CausalDecoder {
+    /// Prefill de `prompt` par morceaux de `chunk` tokens (réserve de
+    /// `new_tokens` lignes, K/V bf16 dès la première ligne si le modèle le
+    /// stocke), puis decode de `new_tokens` tokens, deux fois : la réserve
+    /// tenue par le test (l'arène sème par copie), puis libre. Exige une vue
+    /// bf16 entière à chaque couche full-attn résidente. Rend les tokens des
+    /// deux decodes et si, au second, l'arène a tenu la réserve de toutes les
+    /// couches à chaque token : seul l'adoptant la prend, l'arène écrit alors
+    /// dans les deux buffers K/V du prefill, sans second exemplaire.
+    pub(crate) fn decode_with_and_without_adoption_for_test(
+        &self,
+        prompt: &[usize],
+        chunk: usize,
+        new_tokens: usize,
+        options: &GenerationOptions,
+    ) -> (Vec<usize>, Vec<usize>, bool) {
+        use crate::metal_backend::InPlaceClaim;
+        let attention_layers = (0..self.layers.len())
+            .filter(|&index| self.config.is_resident_full_attention_layer(index))
+            .count();
+        let run = |hold_reserve: bool| {
+            // Morceaux forcés : le stockage bf16 exige un prefill par morceaux.
+            let state = crate::metal_backend::with_prefill_kv_layout_override(chunk, 0, || {
+                with_prefill_kv_reserve(new_tokens, || self.prefill_prompt_state_uncached(prompt))
+            })
+            .expect("invariant: prefill résident");
+            let prefixes = state.kv_bf16_prefixes_for_test();
+            assert_eq!(
+                prefixes.len(),
+                attention_layers,
+                "vue bf16 entière attendue à chaque couche full-attn"
+            );
+            let held: Vec<_> = if hold_reserve {
+                prefixes
+                    .iter()
+                    .map(|[key, value]| {
+                        InPlaceClaim::try_after([key, value]).expect("invariant: réserve libre")
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut adopted = true;
+            let tokens = self
+                .generate_greedy_timed_from_prompt_state_with_options_and_callback(
+                    state,
+                    Duration::ZERO,
+                    new_tokens,
+                    options,
+                    |_| {
+                        adopted &= prefixes
+                            .iter()
+                            .all(|[key, value]| InPlaceClaim::try_after([key, value]).is_none());
+                        true
+                    },
+                )
+                .expect("invariant: decode résident")
+                .tokens;
+            drop(held);
+            assert!(
+                prefixes
+                    .iter()
+                    .all(|[key, value]| InPlaceClaim::try_after([key, value]).is_some()),
+                "réserve rendue après le decode"
+            );
+            (tokens, adopted)
+        };
+        let (copied, _) = run(true);
+        let (tokens, adopted) = run(false);
+        (copied, tokens, adopted)
+    }
+}
+
 /// Exécute `run` avec une réserve d'au moins `rows` lignes derrière le K/V
 /// stocké en bf16 de tout prefill à froid lancé sur ce thread : le decode qui
 /// suit (`max_tokens` + marge spéculative, queue de prompt servie) y écrit au

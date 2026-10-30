@@ -276,7 +276,10 @@ impl CausalDecoder {
                 (capacity, prefill_len),
                 (q_heads, kv_heads, head_dim),
                 kv_bf16,
-                self.config.layer_sliding_window(index).is_some(),
+                (
+                    self.config.layer_sliding_window(index).is_some(),
+                    self.layer_kv_adoption_allowed(index),
+                ),
                 None,
             )?);
         }
@@ -745,8 +748,11 @@ impl CausalDecoder {
                 (q_heads, kv_heads, head_dim),
                 kv_bf16,
                 // Les sinks n'ont pas de variante quantifiée : KV dense, comme
-                // une fenêtre glissante. Dense n'interdit pas l'adoption.
-                self.config.layer_sliding_window(index).is_some() || sinks.is_some(),
+                // une fenêtre glissante.
+                (
+                    self.config.layer_sliding_window(index).is_some() || sinks.is_some(),
+                    self.layer_kv_adoption_allowed(index),
+                ),
                 self.memory_guard.as_ref(),
             ) {
                 Ok(mut full) => {
@@ -993,6 +999,23 @@ impl CausalDecoder {
         Ok(true)
     }
 
+    /// L'arène peut-elle adopter le K/V du prefill de cette couche ? Oui hors
+    /// fenêtre glissante, et pour une fenêtrée à sinks (flint) : l'arène y
+    /// garde ses lignes à leur position absolue et le decode fenêtré lit
+    /// `window_start..len`, comme sur une copie.
+    ///
+    /// TODO: adopter aussi les fenêtrées sans sinks (Gemma 4, prefill résident
+    /// opt-in, NAX d256) une fois couvertes par un test d'adoption contre
+    /// copie ; aucun modèle synthétique ne prend encore ce chemin.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn layer_kv_adoption_allowed(&self, index: usize) -> bool {
+        self.config.layer_sliding_window(index).is_none()
+            || matches!(
+                self.layers.get(index).map(|layer| &layer.attention),
+                Some(AttentionBlock::Full(attention)) if attention.sinks.is_some()
+            )
+    }
+
     // Ne sert qu'au chemin résident Metal (`setup_resident_full_decode_with_slot`)
     // et référence `RESIDENT_PIPELINE_WINDOW`, lui-même gaté : sans ce `cfg`, la
     // compilation sans la feature `metal` échoue.
@@ -1019,7 +1042,9 @@ impl CausalDecoder {
                 continue;
             }
             let kv_dim = self.config.resident_full_attention_kv_dim(index)?;
-            if layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16) {
+            if self.layer_kv_adoption_allowed(index)
+                && layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16)
+            {
                 continue;
             }
             kv_bytes = kv_bytes.saturating_add(checked_bytes(
@@ -1094,9 +1119,9 @@ fn checked_bytes(factors: &[usize], element_bytes: usize, label: &str) -> Result
 /// prefill quand ils ont la place (préfixe laissé en place, segments suivants
 /// semés à la suite, sans second exemplaire du K/V), sinon alloue et sème tout.
 /// `dense` (fenêtre glissante ou sinks : attention sans variante quantifiée)
-/// impose un KV f32 ou bf16 même si `SARAGOSSA_RUST_KV_QUANT` est posé, sans
-/// empêcher l'adoption : l'arène garde ses lignes à leur position absolue et
-/// le decode fenêtré lit `window_start..len`, comme sur une copie.
+/// impose un KV f32 ou bf16 même si `SARAGOSSA_RUST_KV_QUANT` est posé ;
+/// `adoption_allowed` faux force la copie
+/// ([`CausalDecoder::layer_kv_adoption_allowed`]).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn resident_full_attention_state(
     arena: &DecodeResidentState,
@@ -1104,12 +1129,12 @@ fn resident_full_attention_state(
     (capacity, prefill_len): (usize, usize),
     (q_heads, kv_heads, head_dim): (usize, usize, usize),
     kv_bf16: bool,
-    dense: bool,
+    (dense, adoption_allowed): (bool, bool),
     budget: Option<&MemoryGuard>,
 ) -> Result<crate::decode_resident::FullAttentionMetalState> {
     let (keys, values) = (layer_cache.keys.segments(), layer_cache.values.segments());
     let kv_dim = kv_heads * head_dim;
-    let adoptable = layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16);
+    let adoptable = adoption_allowed && layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16);
     if let (true, Some(key_prefix), Some(value_prefix)) = (
         adoptable,
         layer_cache.keys.adoptable_bf16_prefix(),
@@ -1159,7 +1184,7 @@ fn resident_full_attention_state(
 
 /// Les buffers K/V du prefill de cette couche seront-ils adoptés par une
 /// arène de `capacity` lignes : bf16 dense résolu, vues entières du prefill
-/// avec la place nécessaire. Fenêtre glissante et sinks n'y changent rien.
+/// avec la place nécessaire.
 /// Le droit d'écriture, lui, n'est pris qu'à l'adoption.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn layer_adoptable(
@@ -1264,7 +1289,7 @@ mod tests {
                 (capacity, prefix),
                 (q_heads, kv_heads, head_dim),
                 true,
-                false,
+                (false, true),
                 budget,
             )
         };
