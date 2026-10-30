@@ -507,7 +507,12 @@ impl FullAttentionMetalState {
     /// longueur). Un KV quantifié (d128/d256 par construction) passe toujours
     /// par le 2-passes en lignes, comme son chemin mono-ligne.
     pub(super) fn rows_fused_supported(&self) -> bool {
-        flash_sdpa_enabled() && self.head_dim() <= 256 && self.head_dim() % 32 == 0
+        // Arène bornée (couche glissante à sinks) : fenêtre non nulle, hors
+        // du chemin en lignes.
+        self.len() == self.stored_len()
+            && flash_sdpa_enabled()
+            && self.head_dim() <= 256
+            && self.head_dim() % 32 == 0
     }
 
     /// Append des `rows` K puis V (lignes contiguës à partir de `len`) en deux
@@ -536,13 +541,13 @@ impl FullAttentionMetalState {
         // Capacité vérifiée AVANT tout encodage : rien n'est lié ni dispatché hors
         // du KV (le `advance_len` final ne fait que consommer les lignes).
         let fits = self
-            .len()
+            .stored_len()
             .checked_add(rows)
             .is_some_and(|next| next <= self.capacity());
         if rows == 0 || !fits {
             return Err(InferError::Dimension(format!(
                 "append KV rows: {} + {rows} lignes hors capacité {}",
-                self.len(),
+                self.stored_len(),
                 self.capacity()
             )));
         }
@@ -557,7 +562,7 @@ impl FullAttentionMetalState {
                     input,
                     offset,
                     stride,
-                    self.len(),
+                    self.stored_len(),
                     rows,
                     kv_dim,
                 )?;
@@ -578,7 +583,7 @@ impl FullAttentionMetalState {
             }
         };
         let base = self
-            .len()
+            .stored_len()
             .checked_mul(kv_dim)
             .ok_or_else(|| InferError::Dimension("append KV rows offset déborde".to_string()))?;
         let output_offset = byte_offset(base, element, "append KV rows offset")?;
@@ -639,7 +644,7 @@ impl FullAttentionMetalState {
         rows: usize,
         max_rows_per_group: Option<usize>,
     ) -> Result<()> {
-        let len = self.len();
+        let len = self.stored_len();
         if rows == 0 || rows > len {
             return Err(InferError::Dimension(format!(
                 "attention rows: rows={rows} hors [1, len={len}]"

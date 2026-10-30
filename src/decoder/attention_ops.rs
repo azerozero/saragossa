@@ -1071,12 +1071,19 @@ pub(super) fn cached_attention_one(
     let mut out = vec![0.0_f32; expected_q_dim];
     // Lignes du cache segmenté, sans copie des segments f32 ; un segment bf16
     // est élargi à chaque appel (repli CPU d'un KV stocké en bf16).
+    // K/V borné à la fenêtre : les segments commencent à la ligne `base`.
+    let base = cache.base_rows();
+    let first = window_start.checked_sub(base).ok_or_else(|| {
+        InferError::Dimension(format!(
+            "attention CPU: ligne {window_start} sortie du K/V borné (base {base})"
+        ))
+    })?;
     let key_segments = cache.keys.f32_segments();
     let value_segments = cache.values.f32_segments();
     let keys: Vec<&[f32]> =
-        super::kv_rows::rows_from(&key_segments, expected_kv_dim, window_start).collect();
+        super::kv_rows::rows_from(&key_segments, expected_kv_dim, first).collect();
     let values: Vec<&[f32]> =
-        super::kv_rows::rows_from(&value_segments, expected_kv_dim, window_start).collect();
+        super::kv_rows::rows_from(&value_segments, expected_kv_dim, first).collect();
     if cache_len >= attention_parallel_threshold() {
         out.par_chunks_mut(layout.head_dim)
             .enumerate()

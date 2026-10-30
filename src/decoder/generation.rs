@@ -3623,11 +3623,11 @@ impl CausalDecoder {
                         key,
                         value,
                         kv_dim,
-                        start + suffix.len(),
+                        (start + suffix.len(), 0),
                         &layout,
                     )?;
                 } else {
-                    layer_cache.append_prefill(key, value, kv_dim, &layout)?;
+                    layer_cache.append_prefill(key, value, kv_dim, 0, &layout)?;
                 }
             }
         }
@@ -5082,7 +5082,7 @@ impl CausalDecoder {
                                 attn_scalar: layer_spec.attn_scalar,
                                 sliding_window: layer_spec.window,
                             };
-                            layer_cache.append_prefill(key, value, kv_dim, &layout)?;
+                            layer_cache.append_prefill(key, value, kv_dim, 0, &layout)?;
                         }
                         crate::metal_backend::PrefillResidentLayerCache::Linear { state } => {
                             layer_cache

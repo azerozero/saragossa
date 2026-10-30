@@ -211,3 +211,79 @@ fn nope_layer_normalizes_qk_without_rotation() {
     // Couche RoPE : la position change K.
     assert_ne!(keys_at(1, 0), keys_at(1, 37));
 }
+
+/// K/V borné à la fenêtre 513 (base + queue) contre le K/V plein, sur
+/// l'oracle CPU à sinks : sorties bit-identiques à `base + 513`, `+ 1` et
+/// `+ 513` lignes, troncature jusqu'à la base seulement, lecture sous la base
+/// refusée, et un snapshot intact après le prolongement de son clone.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn bounded_window_kv_matches_full_kv_on_cpu_oracle() {
+    use crate::metal_backend::PrefillKvRows;
+    let layout = layout(2, Some(513));
+    let sinks = [0.5_f32, -2.0];
+    let row = |i: usize| [((i * 37 % 101) as f32 - 50.0) * 0.01, (i % 7) as f32 * 0.1];
+    let (base, tail) = (700, 513);
+    let mut full = LayerKvCache::default();
+    for i in 0..base + tail {
+        full.append(&rows(1, |_| row(i)), &rows(1, |_| row(i + 3)), &layout)
+            .expect("invariant: append");
+    }
+    let stored =
+        |offset: usize| -> Vec<f32> { (base..base + tail).flat_map(|i| row(i + offset)).collect() };
+    let mut bounded = LayerKvCache::default();
+    bounded
+        .append_prefill(
+            PrefillKvRows::Owned(stored(0)),
+            PrefillKvRows::Owned(stored(3)),
+            2,
+            base,
+            &layout,
+        )
+        .expect("invariant: K/V borné");
+    assert_eq!((bounded.len(), bounded.base_rows()), (base + tail, base));
+    let q = Tensor::from_vec(vec![1, 4], vec![0.3, -0.2, 0.1, 0.4]).expect("invariant: q");
+    let attend = |cache: &mut LayerKvCache| {
+        cached_attention_one(&q, cache, &layout, Some(&sinks))
+            .expect("invariant: attention")
+            .data()
+            .to_vec()
+    };
+    let snapshot = bounded.clone();
+    let at_window = attend(&mut bounded);
+    for step in 0..=513 {
+        if [0, 1, 513].contains(&step) {
+            assert_eq!(
+                attend(&mut full),
+                attend(&mut bounded),
+                "base + 513 + {step}"
+            );
+        }
+        let i = base + tail + step;
+        for cache in [&mut full, &mut bounded] {
+            cache
+                .append(&rows(1, |_| row(i)), &rows(1, |_| row(i + 3)), &layout)
+                .expect("invariant: append");
+        }
+    }
+    // Le snapshot garde sa propre fenêtre, à sa position.
+    let mut restored = snapshot.clone();
+    assert_eq!(restored.len(), base + tail);
+    assert_eq!(attend(&mut restored), at_window);
+    // Troncature : jusqu'à la base, jamais en dessous ; une lecture dont la
+    // fenêtre descend sous la base est refusée, pas fausse.
+    assert!(restored.truncate(base - 1).is_err());
+    assert_eq!(restored.len(), base + tail);
+    restored
+        .truncate(base + 100)
+        .expect("invariant: troncature au-dessus de la base");
+    assert!(matches!(
+        cached_attention_one(&q, &mut restored, &layout, Some(&sinks)),
+        Err(InferError::Dimension(_))
+    ));
+    restored
+        .truncate(base)
+        .expect("invariant: troncature à la base");
+    assert_eq!(restored.len(), base);
+    assert!(snapshot.len() == base + tail && snapshot.keys.to_vec() == stored(0));
+}

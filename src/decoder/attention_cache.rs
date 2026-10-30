@@ -62,55 +62,74 @@ impl LayerKvCache {
     }
 
     /// Ajoute le K/V `[rows, kv_dim]` d'un prefill résident, vues GPU
-    /// partagées comprises, sans recopie.
+    /// partagées comprises, sans recopie. `base` > 0 (couche glissante
+    /// bornée à sa fenêtre) : `base` lignes absentes précèdent `key`/`value`,
+    /// sur un cache vide seulement.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn append_prefill(
         &mut self,
         key: crate::metal_backend::PrefillKvRows,
         value: crate::metal_backend::PrefillKvRows,
         kv_dim: usize,
+        base: usize,
         layout: &AttentionLayout,
     ) -> Result<()> {
         let expected_dim = layout.num_key_value_heads * layout.head_dim;
         let (key_len, value_len) = (key.len(), value.len());
+        let base_len = base.checked_mul(expected_dim);
         if expected_dim == 0
             || kv_dim != expected_dim
             || key_len == 0
             || key_len != value_len
             || key_len % expected_dim != 0
             || self.kv_dim.is_some_and(|dim| dim != expected_dim)
+            || base_len.is_none()
+            || (base > 0 && self.keys.len() + self.values.len() > 0)
         {
             return Err(InferError::Dimension(format!(
-                "cache KV prefill attend [seq,{expected_dim}], reçu key={key_len} value={value_len} (dim courante {:?})",
-                self.kv_dim
+                "cache KV prefill attend [seq,{expected_dim}] (base {base} sur cache vide), reçu key={key_len} value={value_len} (dim courante {:?}, {} lignes)",
+                self.kv_dim,
+                self.len()
             )));
         }
         self.kv_dim = Some(expected_dim);
+        if let Some(base_len) = base_len.filter(|len| *len > 0) {
+            // Cache vide vérifié ci-dessus : la base est toujours acceptée.
+            let accepted = self.keys.set_base(base_len) && self.values.set_base(base_len);
+            if !accepted {
+                return Err(InferError::Dimension(
+                    "base K/V sur un cache non vide".to_string(),
+                ));
+            }
+        }
         self.keys.push_prefill(key);
         self.values.push_prefill(value);
         Ok(())
     }
 
     /// Remplace tout le K/V par celui d'un prolongement résident (`rows`
-    /// lignes, préfixe compris), recopié dans un buffer neuf ou prolongé en
-    /// place dans le sien, validé avant toute mutation.
+    /// lignes, préfixe compris, dont les `base` premières absentes),
+    /// recopié dans un buffer neuf ou prolongé en place dans le sien, validé
+    /// avant toute mutation.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn replace_prefill(
         &mut self,
         key: crate::metal_backend::PrefillKvRows,
         value: crate::metal_backend::PrefillKvRows,
         kv_dim: usize,
-        rows: usize,
+        (rows, base): (usize, usize),
         layout: &AttentionLayout,
     ) -> Result<()> {
-        let expected = rows.checked_mul(kv_dim);
+        let expected = rows
+            .checked_sub(base)
+            .and_then(|stored| stored.checked_mul(kv_dim));
         if expected != Some(key.len())
             || expected != Some(value.len())
             || kv_dim != layout.num_key_value_heads * layout.head_dim
             || self.kv_dim.is_some_and(|dim| dim != kv_dim)
         {
             return Err(InferError::Dimension(format!(
-                "K/V prolongé recopié: {}/{} au lieu de {rows}×{kv_dim}",
+                "K/V prolongé recopié: {}/{} au lieu de ({rows} - {base})×{kv_dim}",
                 key.len(),
                 value.len()
             )));
@@ -118,7 +137,16 @@ impl LayerKvCache {
         // Tout ce qu'`append_prefill` vérifie l'a été ci-dessus : vider est sûr.
         self.keys = Default::default();
         self.values = Default::default();
-        self.append_prefill(key, value, kv_dim, layout)
+        self.append_prefill(key, value, kv_dim, base, layout)
+    }
+
+    /// Lignes absentes devant le K/V stocké (couche glissante bornée à sa
+    /// fenêtre) : aucune lecture ni troncature ne descend en dessous.
+    pub(super) fn base_rows(&self) -> usize {
+        match self.kv_dim {
+            Some(dim) if dim > 0 => self.keys.base() / dim,
+            _ => 0,
+        }
     }
 
     fn check_batch(
@@ -176,6 +204,13 @@ impl LayerKvCache {
             return Err(InferError::Dimension(format!(
                 "truncate KV CPU {len} > len {}",
                 self.len()
+            )));
+        }
+        // Lignes sorties de la fenêtre : elles ne peuvent pas revenir.
+        if new_len < self.keys.base() || new_len < self.values.base() {
+            return Err(InferError::Dimension(format!(
+                "truncate KV CPU {len} sous la base {} (fenêtre bornée)",
+                self.base_rows()
             )));
         }
         self.keys.truncate(new_len);

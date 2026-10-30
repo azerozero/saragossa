@@ -22,7 +22,11 @@ const MIN_SEGMENT_FLOATS: usize = 1 << 18;
 #[derive(Clone, Debug, Default)]
 pub(super) struct KvRows {
     segments: Vec<Arc<Segment>>,
+    /// f32 logiques, `base` compris : les segments couvrent `[base, len)`.
     len: usize,
+    /// f32 absents devant le premier segment : lignes d'une couche glissante
+    /// sorties de sa fenêtre, jamais relues (cf. `LayerKvCache::base_rows`).
+    base: usize,
 }
 
 /// Bloc de lignes : possédé, ou vue figée du buffer GPU d'un prefill (relu en
@@ -119,9 +123,25 @@ pub(super) fn rows_from<'a>(
 }
 
 impl KvRows {
-    /// Nombre de f32 stockés.
+    /// Nombre de f32 logiques, `base` compris.
     pub(super) fn len(&self) -> usize {
         self.len
+    }
+
+    /// f32 absents devant les segments.
+    pub(super) fn base(&self) -> usize {
+        self.base
+    }
+
+    /// Déclare `base` f32 absents devant des lignes encore à ajouter ; refusé
+    /// (`false`) sur des lignes non vides.
+    pub(super) fn set_base(&mut self, base: usize) -> bool {
+        if self.len != self.base {
+            return false;
+        }
+        self.base = base;
+        self.len = base;
+        true
     }
 
     /// Segments f32 dans l'ordre, chacun formé de lignes entières ; un
@@ -246,9 +266,11 @@ impl KvRows {
     }
 
     /// Ramène à `len` f32 ; seul le segment coupé en deux est recopié s'il
-    /// est partagé. `len` au-delà de la longueur actuelle est ignoré.
+    /// est partagé. `len` au-delà de la longueur actuelle est ignoré, `len`
+    /// sous `base` s'arrête à `base` (refusé plus haut, cf.
+    /// `LayerKvCache::truncate`).
     pub(super) fn truncate(&mut self, len: usize) {
-        while self.len > len {
+        while self.len > len.max(self.base) {
             let Some(last) = self.segments.last_mut() else {
                 break;
             };
