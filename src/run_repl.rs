@@ -2,7 +2,6 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::time::Instant;
 
 use saragossa::{
     qwen_assistant_history_content, render_flint_chat, render_gemma4_chat, render_gemma_chat,
@@ -289,12 +288,12 @@ impl ChatTurnGenerator for ReplModel {
                 )?
                 .tokens
         } else {
-            let started = Instant::now();
-            let state = self.decoder.prefill_prompt_state_uncached(&prompt_ids)?;
+            // Prefill via le cache de préfixe : chaque tour prolonge le prompt du
+            // tour précédent, qui n'est donc pas recalculé (et la réserve de
+            // génération est passée au prefill pour que l'arène l'adopte).
             self.decoder
-                .generate_greedy_timed_from_prompt_state_with_options_and_callback(
-                    state,
-                    started.elapsed(),
+                .generate_greedy_streaming_with_options(
+                    &prompt_ids,
                     self.max_tokens,
                     &self.options,
                     on_token,
