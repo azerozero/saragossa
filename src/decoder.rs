@@ -63,7 +63,7 @@ mod flint_oracle_tests;
 /// Compte les pas encodés par le decode résident complet (tests flint).
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 pub(crate) fn resident_decode_steps_for_test() -> usize {
-    resident::RESIDENT_DECODE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+    resident::RESIDENT_DECODE_STEPS.with(std::cell::Cell::get)
 }
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
@@ -1192,7 +1192,7 @@ impl CausalDecoderConfig {
     /// Renvoie la raison pour laquelle les chemins Metal per-op et spéculatifs
     /// ne connaissent pas ce modèle, ou `None` s'ils le couvrent.
     ///
-    /// Ces kernels (per-op, MTP, DFlash, light-batch, extension en lignes)
+    /// Ces kernels (per-op, MTP, DFlash, pas duo du light-batch, extension en lignes)
     /// ignorent les sinks, le NoPE, le routeur sigmoïde et l'expert partagé
     /// sans gate : les laisser tourner produirait un résultat faux sans erreur.
     /// Seuls le prefill résident (par morceaux et prolongement de préfixe
@@ -1406,6 +1406,37 @@ impl PrefixCache {
             kept.estimated_bytes_unseen(&mut seen);
         }
         Some(entry.estimated_bytes_unseen(&mut seen))
+    }
+
+    /// Retire, avant l'insertion de `live` sur `prompt`, les entrées qui tiennent
+    /// une allocation K/V de la plus longue entrée préfixe strict de `prompt`
+    /// sans en partager aucune avec `live` : le prolongement a recopié leur K/V
+    /// dans le nouvel état, les garder retiendrait une seconde copie complète de
+    /// la conversation. Même règle que `serve::cache::remove_superseded`. Une
+    /// entrée plus courte à buffer propre (retour en arrière du REPL) reste.
+    /// L'historique MTP et les captures DFlash des entrées retirées sont perdus :
+    /// `prefix_cache_hit` ne regarde que la plus longue entrée, qui devient la
+    /// nouvelle. L'entrée préfixe est retirée même si son hit a été décliné
+    /// (prefill à froid), et une branche divergente qui partage l'allocation
+    /// remplacée l'est aussi, comme dans serve.
+    fn remove_superseded(&mut self, prompt: &[usize], live: &CausalDecoderCache) {
+        let Some(index) = generation::longest_prefix_entry_index(&self.entries, prompt) else {
+            return;
+        };
+        if self.entries[index].tokens.len() == prompt.len() {
+            return;
+        }
+        let mut superseded = std::collections::HashSet::new();
+        self.entries[index]
+            .cache
+            .estimated_cpu_bytes_unseen(&mut superseded);
+        let mut live_allocations = std::collections::HashSet::new();
+        live.estimated_cpu_bytes_unseen(&mut live_allocations);
+        self.entries.retain(|entry| {
+            let mut allocations = std::collections::HashSet::new();
+            entry.cache.estimated_cpu_bytes_unseen(&mut allocations);
+            allocations.is_disjoint(&superseded) || !allocations.is_disjoint(&live_allocations)
+        });
     }
 
     /// Évince les entrées les moins récentes au-delà de `max_bytes`, segments

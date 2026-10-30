@@ -412,14 +412,50 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
         resident_decode_steps() - steps_before >= 7,
         "greedy GPU passé par le decode résident"
     );
-    let err = gpu
-        .generate_greedy_lightbatch_with_options(
-            &[prompt.to_vec()],
-            2,
-            &crate::GenerationOptions::default(),
-        )
-        .expect_err("light-batch refusé pour flint");
-    assert!(err.to_string().contains("light-batch"), "{err}");
+}
+
+/// Light-batch flint : time-slicing (le pas duo ne connaît pas flint), deux
+/// flux, chacun identique au flux seul, et chaque pas par le decode résident.
+/// Le flux de 600 tokens dépasse de loin la fenêtre synthétique de 2 ; il
+/// tient en un morceau de prefill résident (4096 par défaut).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_lightbatch_matches_solo_on_resident_decode() {
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let options = crate::GenerationOptions::default();
+    let short = vec![1, 2, 3];
+    let long = (0..600)
+        .map(|index| (index * 5 + 1) % VOCAB)
+        .collect::<Vec<_>>();
+    let max_new = 8;
+    let steps = resident_decode_steps();
+    let batch = gpu
+        .generate_greedy_lightbatch_with_options(&[short.clone(), long.clone()], max_new, &options)
+        .expect("invariant: light-batch flint");
+    assert_eq!(
+        resident_decode_steps() - steps,
+        batch
+            .iter()
+            .map(|output| output.timings.decode_tokens)
+            .sum::<usize>(),
+        "chaque pas du light-batch doit passer par le decode résident"
+    );
+    for (output, prompt) in batch.iter().zip([&short, &long]) {
+        assert_eq!(output.tokens.len(), max_new);
+        let solo = gpu
+            .generate_greedy_timed_with_options(prompt, max_new, &options)
+            .expect("invariant: solo flint")
+            .tokens;
+        assert_eq!(
+            output.tokens,
+            solo,
+            "flux de {} tokens != solo",
+            prompt.len()
+        );
+    }
 }
 
 /// Prefill résident Metal (sinks, NoPE, fenêtre 2 dépassée, MLP dense puis MoE

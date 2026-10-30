@@ -508,6 +508,77 @@ fn prefix_cache_byte_cap_counts_shared_segments_once() {
     assert_eq!(cache.entries.len(), 1, "entrée la plus récente gardée");
 }
 
+/// `prefix_cache_put` retire l'entrée dont le prolongement a recopié le K/V et
+/// toute entrée, même divergente, qui partage son allocation sans en partager
+/// avec le nouvel état ; il garde celles qui partagent une allocation avec le
+/// nouvel état, et les branches divergentes ou entrées plus courtes à buffer
+/// propre.
+#[test]
+fn prefix_cache_put_removes_superseded_copies() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let final_state = Tensor::row(vec![0.0])?;
+    let own = |base: Option<&CausalDecoderCache>| {
+        let mut cache = base.cloned().unwrap_or_else(|| model.empty_cache());
+        cache.layers[0].keys.push_owned(vec![0.0; 8]);
+        cache
+    };
+    let put = |tokens: &[usize], cache: CausalDecoderCache| {
+        model.prefix_cache_put(tokens, &(cache, final_state.clone()), None, None)
+    };
+    let cached = || -> Result<Vec<Vec<usize>>> {
+        let cache = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+        Ok(cache.entries.iter().map(|e| e.tokens.clone()).collect())
+    };
+
+    // Retour en arrière : [1] a son propre buffer, inséré après [1, 2].
+    let turn2 = own(None);
+    put(&[1, 2], turn2.clone())?;
+    // Branche divergente, buffer propre.
+    put(&[1, 3], own(None))?;
+    put(&[1], own(None))?;
+    // Prolongement en place : la vue partage l'allocation de [1, 2].
+    let turn3 = own(Some(&turn2));
+    put(&[1, 2, 4], turn3.clone())?;
+    assert_eq!(
+        cached()?,
+        vec![vec![1, 2, 4], vec![1], vec![1, 3], vec![1, 2]]
+    );
+    // Branche [1, 2, 4, 9] en place sur [1, 2, 4] ; le plafond de 4 entrées
+    // pousse [1, 2] dehors.
+    put(&[1, 2, 4, 9], own(Some(&turn3)))?;
+    assert_eq!(
+        cached()?,
+        vec![vec![1, 2, 4, 9], vec![1, 2, 4], vec![1], vec![1, 3]]
+    );
+    // Prolongement par copie de [1, 2, 4] : elle est retirée, et la branche
+    // divergente [1, 2, 4, 9] aussi, puisqu'elle partage l'allocation remplacée
+    // et aucune du nouvel état ; [1] et [1, 3] restent.
+    put(&[1, 2, 4, 5], own(None))?;
+    assert_eq!(cached()?, vec![vec![1, 2, 4, 5], vec![1], vec![1, 3]]);
+    Ok(())
+}
+
+/// Le remplacement exact d'une entrée garde son historique MTP.
+#[test]
+fn prefix_cache_put_exact_replacement_keeps_metadata() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let state = (model.empty_cache(), Tensor::row(vec![0.0])?);
+    let mut history = LayerKvCache::default();
+    history.keys.push_owned(vec![0.0; 4]);
+    model.prefix_cache_put(&[1, 2], &state, Some(&history), None)?;
+    model.prefix_cache_put(&[1, 2], &state, None, None)?;
+    let cache = model
+        .prefix_cache
+        .lock()
+        .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+    assert_eq!(cache.entries.len(), 1);
+    assert!(cache.entries[0].mtp_history.is_some());
+    Ok(())
+}
+
 /// Un hit DFlash exige les mêmes couches et des captures couvrant la fenêtre
 /// demandée ; une entrée à fenêtre plus courte est ignorée (prefill complet).
 #[test]

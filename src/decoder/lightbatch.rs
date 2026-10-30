@@ -232,12 +232,13 @@ impl CausalDecoder {
         if prompts.is_empty() {
             return Err(InferError::Dimension("light-batch sans prompt".to_string()));
         }
-        // Le duo résident encode deux flux en lignes, sans sinks ni MoE
-        // sigmoïde : refus explicite pour un modèle hors chemins per-op (flint).
-        if let Some(reason) = self.config.metal_unsupported_reason() {
-            return Err(InferError::Config(format!(
-                "light-batch non supporté pour ce modèle ({reason})"
-            )));
+        // Une contrainte porte un seul état d'automate, que les flux se
+        // partageraient, et le decode résident ne masque pas les logits : le
+        // solo la sert sans résident, le light-batch la refuse.
+        if options.token_constraint.is_some() {
+            return Err(InferError::Config(
+                "light-batch: génération guidée (token_constraint) non supportée".to_string(),
+            ));
         }
         if prompts.len() != max_new_tokens.len() {
             return Err(InferError::Dimension(format!(
@@ -658,6 +659,32 @@ mod tests {
             assert_eq!(strided[0].tokens, baseline[0].tokens, "stride={stride}");
             assert_eq!(strided[1].tokens, baseline[1].tokens, "stride={stride}");
         }
+    }
+
+    /// La génération guidée est refusée : sa contrainte n'aurait qu'un état
+    /// pour tous les flux et le decode résident l'ignorerait.
+    #[test]
+    fn lightbatch_rejects_token_constraint() {
+        struct Constraint;
+        impl crate::guided::TokenConstraint for Constraint {
+            fn mask_logits(&self, _: &mut [f32]) -> Result<()> {
+                Ok(())
+            }
+            fn accept_token(&self, _: usize) -> Result<()> {
+                Ok(())
+            }
+            fn is_finished(&self) -> bool {
+                false
+            }
+        }
+        let options = GenerationOptions {
+            token_constraint: Some(Arc::new(Constraint)),
+            ..GenerationOptions::default()
+        };
+        let err = tiny_model()
+            .generate_greedy_lightbatch_with_options(&[vec![0, 1], vec![1, 0]], 4, &options)
+            .expect_err("invariant: contrainte refusée en light-batch");
+        assert!(matches!(err, InferError::Config(_)));
     }
 
     /// Les budgets invalides sont rejetés (longueurs divergentes, budget nul).

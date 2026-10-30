@@ -22,7 +22,13 @@ impl CausalDecoder {
         let Some(arena) = cache.resident.as_ref() else {
             return false;
         };
-        if !self.config.attn_output_gate || self.config.head_dim.is_none() {
+        // Le duo encode les deux flux en lignes, sans sinks, NoPE ni MoE
+        // sigmoïde : un tel modèle (flint) reste en time-slicing, dont chaque
+        // pas est le decode résident solo.
+        if self.config.metal_unsupported_reason().is_some()
+            || !self.config.attn_output_gate
+            || self.config.head_dim.is_none()
+        {
             return false;
         }
         if self.final_norm.data().len() % 512 != 0 {
