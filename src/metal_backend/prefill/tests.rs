@@ -1683,7 +1683,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     PrefillResidentLayerCache::Full {
                         key,
                         value,
-                        replaces_prefix: true,
+                        placement: PrefillKvPlacement::CopiedPrefix,
                         ..
                     },
                 ) = (prefix_cache, extended_cache)
@@ -1717,15 +1717,34 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                             ..
                         },
                         PrefillResidentLayerCache::Full {
-                            key: extended_key, ..
+                            key: extended_key,
+                            placement,
+                            ..
                         },
                     ) = (prefix_cache, extended_cache)
                     {
-                        // Lignes nouvelles possédées, hors de la vue du préfixe.
-                        assert!(matches!(
-                            extended_key,
-                            PrefillKvRows::Owned(_) | PrefillKvRows::OwnedBf16(_)
-                        ));
+                        // f32 : lignes nouvelles possédées. bf16 : vue entière
+                        // dérivée de celle du préfixe, dans la même allocation,
+                        // qui interdit ensuite tout prolongement en place du
+                        // préfixe (vue plus longue vivante).
+                        let extended_rows = extended_key.segment().as_f32().into_owned();
+                        let new_rows = match (prefix_key, extended_key) {
+                            (
+                                PrefillKvRows::SharedBf16(prefix),
+                                PrefillKvRows::SharedBf16(rows),
+                            ) => {
+                                assert_eq!(*placement, PrefillKvPlacement::ExtendedInPlace);
+                                assert_eq!(rows.allocation_id(), prefix.allocation_id());
+                                assert_eq!(rows.len(), SEQ * kv_dim);
+                                assert!(rows.is_whole() && !prefix.is_whole());
+                                &extended_rows[prefix_rows * kv_dim..]
+                            }
+                            (PrefillKvRows::Shared(_), PrefillKvRows::Owned(_)) => {
+                                assert_eq!(*placement, PrefillKvPlacement::Appended);
+                                &extended_rows[..]
+                            }
+                            _ => panic!("prolongement en place : K/V rendu inattendu"),
+                        };
                         let written: Vec<f32> = match prefix_key {
                             PrefillKvRows::SharedBf16(key) => {
                                 crate::metal_backend::read_u16_buffer(key.buffer(), SEQ * kv_dim)?
@@ -1740,7 +1759,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                         };
                         assert_eq!(
                             &written[prefix_rows * kv_dim..],
-                            &*extended_key.segment().as_f32(),
+                            new_rows,
                             "prolongement en place"
                         );
                         assert_eq!(
@@ -1768,7 +1787,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     cache,
                     PrefillResidentLayerCache::Full {
                         key: PrefillKvRows::SharedBf16(_),
-                        replaces_prefix: true,
+                        placement: PrefillKvPlacement::CopiedPrefix,
                         ..
                     }
                 )));
@@ -1865,5 +1884,322 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// K et V `[rows, kv_dim]` d'un état de cache simulé (une couche full).
+type KvPair = (PrefillKvRows, PrefillKvRows);
+
+/// Parcours serve multi-tours sur une seule couche full-attention (K/V
+/// indépendant du découpage en morceaux, donc comparable à l'octet au
+/// prefill à froid) : frontière mémorisée puis queue prolongée en place,
+/// état du tour relâché, tour suivant depuis le bloc. Les prolongements
+/// restent dans l'allocation du prefill à froid tant qu'aucune vue plus
+/// longue ne vit ; sinon (vue vivante, réserve épuisée, préfixe f32) ils
+/// recopient, sans toucher aux lignes publiées.
+#[test]
+fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    if executor.causal_attention_prefill_steel_nax_d256.is_none() {
+        executor.causal_attention_prefill_steel_nax_d256 =
+            super::super::pipelines::compile_steel_causal_nax_d256_attention(
+                &executor.device,
+                STEEL_ATTENTION_NAX_KERNELS,
+                super::super::attention::NAX_CAUSAL_ATTN_BQ64,
+            );
+    }
+    // Le stockage bf16 exige le NAX ; les vues, le K/V partagé.
+    if executor.causal_attention_prefill_steel_nax_d256.is_none()
+        || !crate::runtime_flags::prefill_kv_shared_enabled()
+    {
+        eprintln!("prolongement en place multi-tours sauté : NAX ou K/V partagé absent");
+        return Ok(());
+    }
+    executor.prefill_kv_bf16_mirror = false;
+    const HIDDEN: usize = 64;
+    const Q_HEADS: usize = 16;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 256;
+    const INTER: usize = 32;
+    const KV_DIM: usize = KV_HEADS * HEAD_DIM;
+    // Blocs de 256 lignes : frontière 1024 (tour 1), 1280 (tour 2) ; réserve
+    // de 1000 lignes derrière le prefill à froid, épuisée au-delà de 2024.
+    const BLOCK_1: usize = 1024;
+    const TURN_1: usize = 1100;
+    const BLOCK_2: usize = 1280;
+    const TURN_2: usize = 1350;
+    const RESERVE: usize = 1000;
+    const TOTAL: usize = BLOCK_1 + RESERVE + 30;
+
+    let input = deterministic_tensor(TOTAL, HIDDEN, 811, 0.5)?;
+    // Autre conversation sur le même bloc : ses lignes nouvelles diffèrent,
+    // une réécriture des lignes publiées se verrait.
+    let branch = deterministic_tensor(TOTAL, HIDDEN, 911, 0.5)?;
+    let input_norm = deterministic_norm(HIDDEN, 821)?;
+    let post_norm = deterministic_norm(HIDDEN, 823)?;
+    let gate = Linear::new(deterministic_tensor(INTER, HIDDEN, 827, 0.1)?, None)?;
+    let up = Linear::new(deterministic_tensor(INTER, HIDDEN, 829, 0.1)?, None)?;
+    let down = Linear::new(deterministic_tensor(HIDDEN, INTER, 839, 0.1)?, None)?;
+    let q_norm = deterministic_norm(HEAD_DIM, 853)?;
+    let k_norm = deterministic_norm(HEAD_DIM, 857)?;
+    let q_proj = Linear::new(
+        deterministic_tensor(2 * Q_HEADS * HEAD_DIM, HIDDEN, 859, 0.06)?,
+        None,
+    )?;
+    let k_proj = Linear::new(deterministic_tensor(KV_DIM, HIDDEN, 863, 0.06)?, None)?;
+    let v_proj = Linear::new(deterministic_tensor(KV_DIM, HIDDEN, 877, 0.06)?, None)?;
+    let o_proj = Linear::new(
+        deterministic_tensor(HIDDEN, Q_HEADS * HEAD_DIM, 881, 0.02)?,
+        None,
+    )?;
+    let spec_of = |seq| PrefillAttentionSpec {
+        seq,
+        hidden_dim: HIDDEN,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        rope_theta: 10_000_000.0,
+        attn_scalar: HEAD_DIM as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let layers_of = |seq| {
+        [PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Full {
+                q_proj: &q_proj,
+                k_proj: &k_proj,
+                v_proj: &v_proj,
+                o_proj: &o_proj,
+                q_norm: &q_norm,
+                k_norm: &k_norm,
+                gated: true,
+                sinks: None,
+            },
+            attention_spec: spec_of(seq),
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail: PrefillMoeTail::Dense {
+                gate_proj: &gate,
+                up_proj: &up,
+                down_proj: &down,
+            },
+        }]
+    };
+    let rows = |source: &Tensor, from: usize, to: usize| {
+        Tensor::from_vec(
+            vec![to - from, HIDDEN],
+            source.data()[from * HIDDEN..to * HIDDEN].to_vec(),
+        )
+    };
+    let only_full =
+        |caches: Vec<PrefillResidentLayerCache>| -> Result<(KvPair, PrefillKvPlacement)> {
+            match caches.into_iter().next() {
+                Some(PrefillResidentLayerCache::Full {
+                    key,
+                    value,
+                    placement,
+                    ..
+                }) => Ok(((key, value), placement)),
+                _ => Err(InferError::Dimension("cache full attendu".to_string())),
+            }
+        };
+    // Prefill à froid de `[0, seq)` en morceaux de 512 (stockage bf16).
+    let cold = |executor: &MetalExecutor, seq: usize| -> Result<KvPair> {
+        let (_, caches, _) = super::super::with_prefill_kv_reserve(RESERVE, || {
+            executor.qwen_moe_prefill_resident_from(
+                PrefillInput::Hidden(&rows(&input, 0, seq)?),
+                &layers_of(seq),
+                spec_of(seq),
+                &[],
+                512,
+                None,
+                false,
+            )
+        })?;
+        Ok(only_full(caches)?.0)
+    };
+    // Prolongement de `state` (`from` lignes) jusqu'à `to`, comme
+    // `prefill_extend_resident` : buffers en place si l'état n'a qu'une vue.
+    let extend = |executor: &MetalExecutor,
+                  source: &Tensor,
+                  state: &KvPair,
+                  from: usize,
+                  to: usize|
+     -> Result<(KvPair, PrefillKvPlacement)> {
+        let in_place = match state {
+            (PrefillKvRows::SharedBf16(key), PrefillKvRows::SharedBf16(value)) => {
+                Some([key.buffer().to_owned(), value.buffer().to_owned()])
+            }
+            (PrefillKvRows::Shared(key), PrefillKvRows::Shared(value)) => {
+                Some([key.buffer().to_owned(), value.buffer().to_owned()])
+            }
+            _ => None,
+        };
+        let prefix = PrefillResidentPrefix {
+            rows: from,
+            layers: vec![PrefillResidentPrefixLayer::Full {
+                key: vec![state.0.segment()],
+                value: vec![state.1.segment()],
+                in_place,
+            }],
+        };
+        let (_, caches, _) = executor.qwen_moe_prefill_resident_from(
+            PrefillInput::Hidden(&rows(source, from, to)?),
+            &layers_of(to),
+            spec_of(to),
+            &[],
+            512,
+            Some(&prefix),
+            false,
+        )?;
+        only_full(caches)
+    };
+    let allocation = |rows: &PrefillKvRows| match rows {
+        PrefillKvRows::SharedBf16(rows) => Some(rows.allocation_id()),
+        _ => None,
+    };
+    let bits = |rows: &PrefillKvRows| -> Vec<u16> {
+        match rows {
+            PrefillKvRows::SharedBf16(rows) => rows.as_slice().to_vec(),
+            PrefillKvRows::OwnedBf16(data) => data.clone(),
+            _ => Vec::new(),
+        }
+    };
+    let assert_whole_of = |state: &KvPair, seq: usize, label: &str| {
+        for rows in [&state.0, &state.1] {
+            assert!(
+                matches!(rows, PrefillKvRows::SharedBf16(_)),
+                "{label}: vue bf16 attendue"
+            );
+            assert_eq!(rows.len(), seq * KV_DIM, "{label}: longueur");
+        }
+    };
+
+    executor.prefill_kv_bf16_store_min_rows = Some(0);
+    // Tour 1 : bloc à froid mémorisé (clone de l'état), queue en place.
+    let mut live = cold(&executor, BLOCK_1)?;
+    let home = allocation(&live.0).expect("invariant: prefill à froid bf16 partagé");
+    let block_1 = live.clone();
+    let (tail, placement) = extend(&executor, &input, &live, BLOCK_1, TURN_1)?;
+    assert_eq!(
+        placement,
+        PrefillKvPlacement::ExtendedInPlace,
+        "tour 1 : queue"
+    );
+    assert_eq!(allocation(&tail.0), Some(home), "tour 1 : même allocation");
+    assert_whole_of(&tail, TURN_1, "tour 1");
+    // Le cache remplace ses segments : l'ancienne vue du tour meurt.
+    live = tail;
+
+    // Course : le bloc était entier quand l'état vivant l'a prolongé ; une
+    // vue plus longue vit désormais, son prolongement recopie, et les lignes
+    // que l'état vivant expose ne bougent pas.
+    let published: &[u16] = match &live.0 {
+        PrefillKvRows::SharedBf16(rows) => rows.as_slice(),
+        _ => unreachable!("invariant: vue vérifiée ci-dessus"),
+    };
+    let published_before = published.to_vec();
+    let (copied, placement) = extend(&executor, &branch, &block_1, BLOCK_1, BLOCK_2)?;
+    assert_eq!(
+        published,
+        published_before.as_slice(),
+        "slices publiées intactes"
+    );
+    assert_eq!(
+        placement,
+        PrefillKvPlacement::CopiedPrefix,
+        "bloc sous une vue vivante"
+    );
+    assert_ne!(
+        allocation(&copied.0),
+        Some(home),
+        "copie dans un buffer neuf"
+    );
+    drop(copied);
+
+    // Fin du tour 1 : l'état vivant est relâché, le bloc reste.
+    drop(live);
+    // Tour 2 depuis le bloc : frontière suivante, puis queue, en place.
+    let (mut live, placement) = extend(&executor, &input, &block_1, BLOCK_1, BLOCK_2)?;
+    assert_eq!(
+        placement,
+        PrefillKvPlacement::ExtendedInPlace,
+        "tour 2 : bloc"
+    );
+    assert_eq!(allocation(&live.0), Some(home), "tour 2 : même allocation");
+    let block_2 = live.clone();
+    let (tail, placement) = extend(&executor, &input, &live, BLOCK_2, TURN_2)?;
+    assert_eq!(
+        placement,
+        PrefillKvPlacement::ExtendedInPlace,
+        "tour 2 : queue"
+    );
+    assert_eq!(
+        allocation(&tail.0),
+        Some(home),
+        "tour 2 : queue même allocation"
+    );
+    live = tail;
+    assert_whole_of(&live, TURN_2, "tour 2");
+    // Mêmes octets qu'un prefill à froid du prompt entier.
+    let reference = cold(&executor, TURN_2)?;
+    assert_eq!(bits(&live.0), bits(&reference.0), "tour 2 : K vs froid");
+    assert_eq!(bits(&live.1), bits(&reference.1), "tour 2 : V vs froid");
+    drop(reference);
+    // Les blocs mémorisés gardent leurs lignes.
+    assert_eq!(
+        bits(&block_1.0),
+        bits(&live.0)[..BLOCK_1 * KV_DIM],
+        "bloc 1 intact"
+    );
+    assert_eq!(
+        bits(&block_2.0),
+        bits(&live.0)[..BLOCK_2 * KV_DIM],
+        "bloc 2 intact"
+    );
+
+    // Cache décodeur : une entrée plus ancienne prolongée de nouveau recopie
+    // tant qu'une vue plus longue vit.
+    let (copied, placement) = extend(&executor, &input, &block_2, BLOCK_2, TURN_2)?;
+    assert_eq!(
+        placement,
+        PrefillKvPlacement::CopiedPrefix,
+        "entrée ancienne"
+    );
+    assert_eq!(bits(&copied.0), bits(&live.0), "copie identique");
+    drop(copied);
+
+    // Réserve épuisée : recopie, correcte.
+    let (beyond, placement) = extend(&executor, &input, &live, TURN_2, TOTAL)?;
+    assert_eq!(
+        placement,
+        PrefillKvPlacement::CopiedPrefix,
+        "réserve épuisée"
+    );
+    assert_ne!(allocation(&beyond.0), Some(home));
+    assert_eq!(
+        bits(&beyond.0)[..TURN_2 * KV_DIM],
+        bits(&live.0),
+        "préfixe recopié"
+    );
+    drop((beyond, live, block_1, block_2));
+
+    // Préfixe f32 (sous le seuil bf16) : jamais prolongé en place en bf16,
+    // seules les lignes nouvelles repartent, possédées.
+    executor.prefill_kv_bf16_store_min_rows = Some(TURN_1);
+    let f32_block = cold(&executor, BLOCK_1)?;
+    assert!(matches!(f32_block.0, PrefillKvRows::Shared(_)));
+    executor.prefill_kv_bf16_store_min_rows = Some(0);
+    let (crossed, placement) = extend(&executor, &input, &f32_block, BLOCK_1, TURN_1)?;
+    assert_eq!(placement, PrefillKvPlacement::Appended, "préfixe f32");
+    assert!(matches!(crossed.0, PrefillKvRows::OwnedBf16(_)));
+    executor.prefill_kv_bf16_store_min_rows = None;
     Ok(())
 }

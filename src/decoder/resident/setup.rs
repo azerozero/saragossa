@@ -1108,31 +1108,28 @@ fn resident_full_attention_state(
     let (keys, values) = (layer_cache.keys.segments(), layer_cache.values.segments());
     let kv_dim = kv_heads * head_dim;
     let adoptable = layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16, sliding);
-    if let (true, Some((key_buffer, key_len)), Some((value_buffer, value_len))) = (
+    if let (true, Some(key_prefix), Some(value_prefix)) = (
         adoptable,
         layer_cache.keys.adoptable_bf16_prefix(),
         layer_cache.values.adoptable_bf16_prefix(),
     ) {
-        if key_len == value_len && kv_dim > 0 && key_len % kv_dim == 0 {
-            if let Some(mut full) = arena.full_attention_adopting(
-                capacity,
-                q_heads,
-                kv_heads,
-                head_dim,
-                kv_bf16,
-                [key_buffer, value_buffer],
-                key_len / kv_dim,
-            )? {
-                full.seed_segments(&keys[1..], &values[1..], prefill_len)?;
-                if crate::decoder::flags::trace_resident_enabled() {
-                    eprintln!(
-                        "kv résident adopté : préfixe {} lignes, {} semées",
-                        key_len / kv_dim,
-                        prefill_len - key_len / kv_dim
-                    );
-                }
-                return Ok(full);
+        if let Some(mut full) = arena.full_attention_adopting(
+            capacity,
+            q_heads,
+            kv_heads,
+            head_dim,
+            kv_bf16,
+            [key_prefix, value_prefix],
+        )? {
+            let floor = full.len();
+            full.seed_segments(&keys[1..], &values[1..], prefill_len)?;
+            if crate::decoder::flags::trace_resident_enabled() {
+                eprintln!(
+                    "kv résident adopté : préfixe {floor} lignes, {} semées",
+                    prefill_len - floor
+                );
             }
+            return Ok(full);
         }
     }
     // Allocation que la garde a supposée évitée : budget revérifié.
@@ -1175,7 +1172,7 @@ fn layer_adoptable(
         && bytes.is_some_and(|bytes| {
             [&layer_cache.keys, &layer_cache.values].iter().all(|rows| {
                 rows.adoptable_bf16_prefix()
-                    .is_some_and(|(buffer, _)| buffer.length() >= bytes)
+                    .is_some_and(|prefix| prefix.buffer().length() >= bytes)
             })
         })
 }

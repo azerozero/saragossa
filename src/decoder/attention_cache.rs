@@ -91,9 +91,9 @@ impl LayerKvCache {
         Ok(())
     }
 
-    /// Remplace tout le K/V par celui d'un prolongement résident recopié
-    /// dans un buffer neuf (`rows` lignes, préfixe compris), validé avant
-    /// toute mutation.
+    /// Remplace tout le K/V par celui d'un prolongement résident (`rows`
+    /// lignes, préfixe compris), recopié dans un buffer neuf ou prolongé en
+    /// place dans le sien, validé avant toute mutation.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn replace_prefill(
         &mut self,

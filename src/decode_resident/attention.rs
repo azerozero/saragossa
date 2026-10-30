@@ -129,22 +129,18 @@ impl DecodeResidentState {
     }
 
     /// Comme [`Self::full_attention`], sur les buffers K/V bf16 d'un prefill
-    /// au lieu d'une allocation neuve : leurs `floor` premières lignes sont
-    /// celles du préfixe, déjà en place, et l'arène écrit à la suite. Renvoie
-    /// `None` (l'appelant alloue et sème) si le format résolu n'est pas bf16
-    /// dense, si les buffers n'ont pas la place de `capacity` lignes ou si un
-    /// autre écrivain tient déjà leur réserve.
-    ///
-    /// L'appelant garantit qu'aucune vue de ces buffers ne couvre de ligne au
-    /// delà de `floor` (vue entière du prefill, `SharedRows::is_whole`).
+    /// au lieu d'une allocation neuve : les lignes de `prefix` (vues K et V
+    /// du préfixe, depuis leur début) sont déjà en place et l'arène écrit à
+    /// la suite. Renvoie `None` (l'appelant alloue et sème) si le format
+    /// résolu n'est pas bf16 dense, si les vues ne sont pas de même longueur
+    /// en lignes entières, si les buffers n'ont pas la place de `capacity`
+    /// lignes, si un autre écrivain tient déjà leur réserve ou si, une fois
+    /// la réserve prise, une vue vivante la couvre
+    /// ([`crate::metal_backend::InPlaceClaim::try_after`]).
     ///
     /// # Errors
     ///
     /// Mêmes erreurs que [`Self::full_attention`].
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "dimensions de la couche, buffers adoptés et lignes du préfixe"
-    )]
     pub(crate) fn full_attention_adopting(
         &self,
         capacity: usize,
@@ -152,12 +148,18 @@ impl DecodeResidentState {
         kv_heads: usize,
         head_dim: usize,
         kv_bf16: bool,
-        buffers: [Buffer; 2],
-        floor: usize,
+        prefix: [&crate::metal_backend::SharedBf16Rows; 2],
     ) -> Result<Option<FullAttentionMetalState>> {
+        let kv_dim = kv_heads * head_dim;
+        let [key_len, value_len] = prefix.map(crate::metal_backend::SharedBf16Rows::len);
+        if key_len != value_len || kv_dim == 0 || key_len % kv_dim != 0 {
+            return Ok(None);
+        }
+        let floor = key_len / kv_dim;
         if !kv_bf16_dense(kv_bf16) || floor > capacity {
             return Ok(None);
         }
+        let buffers = prefix.map(|view| view.buffer().to_owned());
         let bytes = kv_heads
             .checked_mul(head_dim)
             .and_then(|kv_dim| kv_dim.checked_mul(capacity))
@@ -167,8 +169,10 @@ impl DecodeResidentState {
         if buffers.iter().any(|buffer| buffer.length() < bytes) {
             return Ok(None);
         }
-        let Some(claim) = crate::metal_backend::InPlaceClaim::try_new([&buffers[0], &buffers[1]])
-        else {
+        // Claim pris puis revalidé : aucune vue vivante (snapshot plus long,
+        // prolongement en place publié) ne couvre les lignes que l'arène
+        // écrira.
+        let Some(claim) = crate::metal_backend::InPlaceClaim::try_after(prefix) else {
             return Ok(None);
         };
         let mut state = self.full_attention_with_format(

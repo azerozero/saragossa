@@ -3603,7 +3603,7 @@ impl CausalDecoder {
                 key,
                 value,
                 kv_dim,
-                replaces_prefix,
+                placement,
             } = layer_state
             {
                 let layer_spec = layer.attention_spec;
@@ -3615,9 +3615,10 @@ impl CausalDecoder {
                     attn_scalar: layer_spec.attn_scalar,
                     sliding_window: layer_spec.window,
                 };
-                if replaces_prefix {
-                    // Préfixe recopié dans un buffer neuf : la vue entière
-                    // remplace les segments (les snapshots gardent les leurs).
+                if placement.replaces_segments() {
+                    // Vue entière de tout le K/V (préfixe recopié dans un
+                    // buffer neuf, ou prolongé en place dans le sien) : elle
+                    // remplace les segments, les snapshots gardent les leurs.
                     layer_cache.replace_prefill(
                         key,
                         value,

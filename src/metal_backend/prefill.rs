@@ -200,6 +200,15 @@ enum PrefillResidentTailScratch {
     Shared,
 }
 
+/// Réserve du préfixe réutilisée par un prolongement en place. Le claim,
+/// revalidé après les vues du préfixe, vit jusqu'à la relecture ou la
+/// publication des lignes nouvelles ; en bf16, les vues du préfixe donnent
+/// la vue entière rendue (`SharedRows::extended`).
+struct InPlaceReuse {
+    claim: InPlaceClaim,
+    bf16_prefix: Option<[SharedBf16Rows; 2]>,
+}
+
 enum PrefillResidentLayerCacheBuffer {
     Full {
         key: Buffer,
@@ -210,8 +219,10 @@ enum PrefillResidentLayerCacheBuffer {
         /// les lit directement, sans miroir ni conversion.
         bf16_store: bool,
         /// Buffer neuf où le préfixe bf16 est recopié : rendu en vue entière
-        /// qui remplace le préfixe du cache (cf. `PrefillResidentLayerCache`).
+        /// qui remplace le préfixe du cache (cf. `PrefillKvPlacement`).
         replaces_prefix: bool,
+        /// `key`/`value` sont les buffers du préfixe, prolongés en place.
+        in_place: Option<InPlaceReuse>,
     },
     Linear {
         state: LinearAttentionMetalState,
