@@ -761,9 +761,17 @@ impl LoadedModel {
         memory_guard: &MemoryGuard,
     ) -> ServeResult<(CausalDecoderPromptState, usize, Duration)> {
         let started = Instant::now();
+        // Plafond flint vérifié avant toute recherche ou construction de
+        // blocs : sinon les blocs complets seraient préremplis pour rien.
+        self.decoder
+            .ensure_prompt_within_prefill_cap(tokens.len())?;
+        // NOTE: l'extension en lignes coûte ~2,3× un prefill à froid par token
+        // (29k étendus en 127 s contre 32k à froid en 63 s, 27B) : sans prefill
+        // résident, un hit qui couvre moins de la moitié des blocs est ignoré.
+        let cheap_extend = self.decoder.prefix_extend_as_cheap_as_cold(tokens.len());
         // NOTE: serve utilise les APIs uncached/extend ; le cache interne du
         // décodeur reste hors chemin pour éviter un partage inter-session.
-        if !prefix_blocks_usable(&self.assets.config) {
+        if !prefix_blocks_usable(self.assets.config.is_flint(), cheap_extend) {
             let state = self.decoder.prefill_prompt_state_uncached(tokens)?;
             return Ok((state, 0, started.elapsed()));
         }
@@ -771,10 +779,6 @@ impl LoadedModel {
         let block_tokens = self.prefix_cache.block_tokens();
         let full_block_tokens = tokens.len() / block_tokens * block_tokens;
         let root = BlockHash::for_session(session_key);
-        // NOTE: l'extension en lignes coûte ~2,3× un prefill à froid par token
-        // (29k étendus en 127 s contre 32k à froid en 63 s, 27B) : sans prefill
-        // résident, un hit qui couvre moins de la moitié des blocs est ignoré.
-        let cheap_extend = self.decoder.prefix_extend_as_cheap_as_cold(tokens.len());
         let hit = self
             .prefix_cache
             .match_prefix(root, tokens)
@@ -1011,13 +1015,12 @@ fn ensure_guided_finished(constraint: Option<&dyn TokenConstraint>) -> ServeResu
 
 /// Le cache de préfixe par blocs de serve est-il utilisable pour ce modèle ?
 ///
-/// NOTE: flint n'a pas d'extension GPU (`extend_prompt_state` passe en CPU
-/// per-op, ~0,6 s par token) : préremplir les blocs complets puis étendre le
-/// reliquat (jusqu'à un bloc) ou le suffixe d'un hit coûterait des minutes.
-/// Son prompt entier passe donc par le prefill Metal à froid, sans blocs. À
-/// lever quand le prolongement résident couvrira les sinks.
-fn prefix_blocks_usable(config: &saragossa::ModelConfig) -> bool {
-    serve_prefix_cache_enabled() && !config.is_flint()
+/// NOTE: flint n'étend un reliquat de bloc ou le suffixe d'un hit que par le
+/// prefill résident prolongé (`resident_extend`), dès un token ; sans lui,
+/// l'extension passerait par le forward CPU per-op (~0,6 s par token) et son
+/// prompt entier reste au prefill à froid, sans blocs.
+fn prefix_blocks_usable(flint: bool, resident_extend: bool) -> bool {
+    serve_prefix_cache_enabled() && (!flint || resident_extend)
 }
 
 fn normalize_qwen_assistant_history(messages: &mut [ChatTemplateMessage]) {
@@ -1096,27 +1099,15 @@ fn kv_allocations(state: &CausalDecoderPromptState) -> std::collections::HashSet
 mod tests {
     use super::*;
 
+    /// Blocs du cache de préfixe : toujours hors flint ; pour flint, seulement
+    /// si le prolongement résident existe, sans quoi le reliquat passerait par
+    /// le forward CPU.
     #[test]
-    fn flint_skips_prefix_blocks() {
-        let raw = r#"{
-            "model_type":"qwen3",
-            "hidden_size":64,
-            "num_hidden_layers":1,
-            "num_attention_heads":2,
-            "num_key_value_heads":1,
-            "head_dim":32,
-            "intermediate_size":64,
-            "rms_norm_eps":0.000001,
-            "rope_theta":10000.0,
-            "vocab_size":8
-        }"#;
-        let mut config = serde_json::from_str::<saragossa::RawModelConfig>(raw)
-            .expect("invariant: JSON valide")
-            .resolve()
-            .expect("invariant: config valide");
-        assert_eq!(prefix_blocks_usable(&config), serve_prefix_cache_enabled());
-        config.model_type = "flint".to_string();
-        assert!(!prefix_blocks_usable(&config));
+    fn flint_uses_prefix_blocks_only_with_resident_extend() {
+        let enabled = serve_prefix_cache_enabled();
+        assert_eq!(prefix_blocks_usable(false, false), enabled);
+        assert_eq!(prefix_blocks_usable(true, true), enabled);
+        assert!(!prefix_blocks_usable(true, false));
     }
 
     #[test]

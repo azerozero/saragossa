@@ -3151,8 +3151,13 @@ impl CausalDecoder {
         // cibles pendant l'encodage (3 s contre ~21 s per-op sur 732 tokens). Même
         // prefill que l'AR et le MTP du CLI, donc même trajectoire greedy.
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some((cache, final_hidden, captures)) =
-            self.prefill_resident_cache_hidden_and_captures(prompt, layer_ids, false)?
+        if let Some((cache, final_hidden, captures)) = self
+            .prefill_resident_cache_hidden_and_captures(
+                prompt,
+                layer_ids,
+                false,
+                crate::runtime_flags::prefill_resident_chunk_tokens(),
+            )?
         {
             let target_hidden = captures.ok_or_else(|| {
                 InferError::Config("prefill résident sans captures de couches".to_string())
@@ -3480,7 +3485,9 @@ impl CausalDecoder {
         if !prefill_resident_enabled() || self.config.is_gemma4 {
             return None;
         }
-        let metal = self.forward_runtime().metal_executor()?;
+        // `resident_metal` comme le prefill à froid : flint n'a pas de
+        // runtime per-op Metal, mais son prefill résident prolonge un préfixe.
+        let metal = self.resident_metal()?;
         let spec = self.resident_prefill_spec(seq, self.final_norm.data().len())?;
         let layers = self
             .layers
@@ -3527,22 +3534,33 @@ impl CausalDecoder {
         last_row_only: bool,
     ) -> Result<Option<(Tensor, Option<Tensor>)>> {
         let start = cache.position;
-        if start == 0 || suffix.len() < crate::runtime_flags::prefix_extend_resident_min_tokens() {
+        // Le seuil départage le prefill résident et l'extension en lignes,
+        // que flint n'a pas : son repli est le forward CPU (~0,6 s par token).
+        let resident_only = self.config.metal_unsupported_reason().is_some();
+        let min_tokens = if resident_only {
+            1
+        } else {
+            crate::runtime_flags::prefix_extend_resident_min_tokens()
+        };
+        if start == 0 || suffix.len() < min_tokens {
             return Ok(None);
         }
+        self.ensure_prompt_within_prefill_cap(start + suffix.len())?;
+        // Les replis ci-dessous avertissent une fois pour flint, dont
+        // l'extension retombe alors sur le forward CPU.
         // Un KV déjà monté sur le GPU (decode résident) deviendrait périmé.
         if cache.resident.is_some() || cache.layers.iter().any(|layer| layer.full.is_some()) {
-            return Ok(None);
+            return self.resident_prefill_ineligible("K/V déjà monté sur le GPU");
         }
         let Some((metal, spec, layers)) = self.resident_extend_layers(start + suffix.len()) else {
-            return Ok(None);
+            return self.resident_prefill_ineligible("prolongement résident hors contrat");
         };
         let mut prefix_layers = Vec::with_capacity(layers.len());
         for (layer_cache, layer) in cache.layers.iter().zip(&layers) {
             prefix_layers.push(match layer.attention {
                 crate::metal_backend::PrefillAttentionLayer::Full { .. } => {
                     if layer_cache.len() != start {
-                        return Ok(None);
+                        return self.resident_prefill_ineligible("K/V du préfixe incomplet");
                     }
                     crate::metal_backend::PrefillResidentPrefixLayer::Full {
                         key: layer_cache.keys.segments(),
@@ -4754,8 +4772,9 @@ impl CausalDecoder {
     }
 
     /// Oracle de test : hidden non normé `[seq, hidden]` de toutes les
-    /// positions, par le prefill résident Metal si `resident` (`None` s'il se
-    /// dérobe), sinon par le prefill per-op (CPU pour flint).
+    /// positions, par le prefill résident Metal en morceaux de `chunk_tokens`
+    /// lignes si `resident = Some(chunk_tokens)` (0 : un seul morceau ; `None`
+    /// s'il se dérobe), sinon par le prefill per-op (CPU pour flint).
     ///
     /// # Errors
     ///
@@ -4764,14 +4783,61 @@ impl CausalDecoder {
     pub(crate) fn prefill_hidden_for_test(
         &self,
         prompt: &[usize],
-        resident: bool,
+        resident: Option<usize>,
     ) -> Result<Option<Tensor>> {
-        if !resident {
+        let Some(chunk_tokens) = resident else {
             return Ok(Some(self.prefill_cache_state_batched_per_op(prompt)?.1));
-        }
-        self.prefill_resident_cache_and_hidden(prompt)?
-            .map(|(_, hidden)| hidden.into_tensor(self.final_norm.data().len()))
+        };
+        self.prefill_resident_cache_hidden_and_captures(prompt, &[], false, chunk_tokens)?
+            .map(|(_, hidden, _)| hidden.into_tensor(self.final_norm.data().len()))
             .transpose()
+    }
+
+    /// Oracle de test : sorties `[seq, hidden]` des `layers` premières couches
+    /// par le forward per-op (CPU pour flint), dans l'ordre.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le forward échoue.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn per_op_layer_outputs_for_test(
+        &self,
+        prompt: &[usize],
+        layers: usize,
+    ) -> Result<Vec<Tensor>> {
+        let runtime = self.forward_runtime();
+        let mut cache = self.empty_cache();
+        let mut hidden = self.embed_scaled(prompt)?;
+        let mut outputs = Vec::with_capacity(layers);
+        for (layer_index, layer) in self.layers.iter().enumerate().take(layers) {
+            hidden = layer.forward_prefill(
+                &self.config,
+                &hidden,
+                &mut cache.layers[layer_index],
+                0,
+                runtime,
+            )?;
+            outputs.push(hidden.clone());
+        }
+        Ok(outputs)
+    }
+
+    /// Captures `[seq, n * hidden]` du flux résiduel en sortie des couches
+    /// `layer_ids` par le prefill résident (morceaux de `chunk_tokens`).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le prefill échoue.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn prefill_captures_for_test(
+        &self,
+        prompt: &[usize],
+        layer_ids: &[usize],
+        chunk_tokens: usize,
+    ) -> Result<Option<Tensor>> {
+        Ok(self
+            .prefill_resident_cache_hidden_and_captures(prompt, layer_ids, false, chunk_tokens)?
+            .and_then(|(_, _, captures)| captures))
     }
 
     /// Oracle de test : logits des lignes `rows` d'un hidden non normé
@@ -4804,8 +4870,12 @@ impl CausalDecoder {
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
         // Chemin AR : n'a besoin que du dernier état normé (1er token décodé).
-        let Some((cache, final_hidden, _)) =
-            self.prefill_resident_cache_hidden_and_captures(prompt, &[], true)?
+        let Some((cache, final_hidden, _)) = self.prefill_resident_cache_hidden_and_captures(
+            prompt,
+            &[],
+            true,
+            crate::runtime_flags::prefill_resident_chunk_tokens(),
+        )?
         else {
             return Ok(None);
         };
@@ -4837,7 +4907,12 @@ impl CausalDecoder {
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, crate::metal_backend::PrefillKvRows)>> {
         Ok(self
-            .prefill_resident_cache_hidden_and_captures(prompt, &[], false)?
+            .prefill_resident_cache_hidden_and_captures(
+                prompt,
+                &[],
+                false,
+                crate::runtime_flags::prefill_resident_chunk_tokens(),
+            )?
             .map(|(cache, hidden, _)| (cache, hidden)))
     }
 
@@ -4933,6 +5008,7 @@ impl CausalDecoder {
         prompt: &[usize],
         capture_layer_ids: &[usize],
         last_row_only: bool,
+        chunk_tokens: usize,
     ) -> Result<
         Option<(
             CausalDecoderCache,
@@ -4955,14 +5031,7 @@ impl CausalDecoder {
         if self.config.is_gemma4 && !prefill_resident_gemma4_enabled() {
             return Ok(None);
         }
-        let max_tokens = crate::runtime_flags::flint_prefill_max_tokens();
-        if resident_only && prompt.len() > max_tokens {
-            return Err(InferError::Config(format!(
-                "prompt flint de {} tokens au-delà du plafond de prefill de {max_tokens} \
-                 (SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS) : prefill en un seul morceau",
-                prompt.len()
-            )));
-        }
+        self.ensure_prompt_within_prefill_cap(prompt.len())?;
         let Some(spec) = self.resident_prefill_spec(prompt.len(), self.final_norm.data().len())
         else {
             return self.resident_prefill_ineligible("spec d'attention hors contrat");
@@ -4980,7 +5049,7 @@ impl CausalDecoder {
             &layers,
             spec,
             capture_layer_ids,
-            crate::runtime_flags::prefill_resident_chunk_tokens(),
+            chunk_tokens,
             last_row_only,
         ) {
             Ok((final_hidden, layer_states, captures)) => {
@@ -5033,6 +5102,79 @@ impl CausalDecoder {
                 Ok(None)
             }
         }
+    }
+
+    /// Refuse un prompt flint de `tokens` positions au-delà du plafond de
+    /// prefill résident (`SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS`, sinon dérivé
+    /// de la mémoire disponible). À appeler
+    /// avant tout travail : serve le vérifie avant de chercher ou de construire
+    /// ses blocs de préfixe. Sans effet hors flint ou sans prefill résident.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de configuration si le prompt dépasse le plafond.
+    pub fn ensure_prompt_within_prefill_cap(&self, tokens: usize) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(max_tokens) = self.flint_prefill_max_tokens() {
+                if tokens > max_tokens {
+                    return Err(InferError::Config(format!(
+                        "prompt flint de {tokens} tokens au-delà du plafond de prefill de \
+                         {max_tokens} (SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS)"
+                    )));
+                }
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = tokens;
+        Ok(())
+    }
+
+    /// Plafond de prompt flint, `None` hors flint ou sans prefill résident.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn flint_prefill_max_tokens(&self) -> Option<usize> {
+        const MIN_TOKENS: usize = 4096;
+        // `max_position_embeddings` de flint, absent de la config résolue.
+        const MAX_TOKENS: usize = 262_144;
+        const SCRATCH_RESERVE_BYTES: u64 = 2 << 30;
+        // K/V f32 du prefill plus arène de decode bf16.
+        const KV_BYTES_PER_VALUE: usize = 4 + 2;
+        let metal = self.resident_metal()?;
+        if self.config.metal_unsupported_reason().is_none() || !prefill_resident_enabled() {
+            return None;
+        }
+        if let Some(max_tokens) = crate::runtime_flags::flint_prefill_max_tokens_override() {
+            return Some(max_tokens);
+        }
+        Some(*self.runtime.flint_prefill_cap.get_or_init(|| {
+            let device = metal.device();
+            // Au premier prefill, l'empreinte du processus est faite des poids.
+            // `current_allocated_size` seul ne les voit pas tous (buffers
+            // Metal sans copie sur le mmap des shards) : le plus grand des deux.
+            let weights = crate::memory_guard::process_footprint_bytes()
+                .unwrap_or(0)
+                .max(device.current_allocated_size());
+            let free = device
+                .recommended_max_working_set_size()
+                .saturating_sub(weights)
+                .saturating_sub(SCRATCH_RESERVE_BYTES);
+            let bytes_per_token = (0..self.layers.len())
+                .filter(|&index| self.config.is_resident_full_attention_layer(index))
+                .filter_map(|index| self.config.resident_full_attention_kv_dim(index).ok())
+                .map(|kv_dim| 2 * kv_dim * KV_BYTES_PER_VALUE)
+                .sum::<usize>()
+                .max(1);
+            let cap = usize::try_from(free / bytes_per_token as u64)
+                .unwrap_or(MAX_TOKENS)
+                .clamp(MIN_TOKENS, MAX_TOKENS);
+            if trace_prefill_enabled() {
+                eprintln!(
+                    "flint_prefill_cap working_set={} weights={weights} bytes_per_token={bytes_per_token} cap={cap}",
+                    device.recommended_max_working_set_size()
+                );
+            }
+            cap
+        }))
     }
 
     /// Prefill résident inéligible : repli per-op silencieux (Qwen, Gemma),

@@ -289,6 +289,11 @@ impl CausalDecoderPromptState {
         )
     }
 
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn final_state_for_test(&self) -> &Tensor {
+        &self.final_state
+    }
+
     fn into_parts(self) -> (CausalDecoderCache, Tensor) {
         (self.cache, self.final_state)
     }
@@ -1187,12 +1192,12 @@ impl CausalDecoderConfig {
     /// Renvoie la raison pour laquelle les chemins Metal per-op et spéculatifs
     /// ne connaissent pas ce modèle, ou `None` s'ils le couvrent.
     ///
-    /// Ces kernels (per-op, MTP, DFlash, light-batch, prefill par morceaux et
-    /// prolongement de préfixe) ignorent les sinks, le NoPE, le routeur
-    /// sigmoïde et l'expert partagé sans gate : les laisser tourner produirait
-    /// un résultat faux sans erreur. Seuls le prefill résident en un morceau et
-    /// le decode résident complet couvrent flint ; pour un tel modèle, le
-    /// runtime Metal ne sert qu'à eux (repli CPU sinon).
+    /// Ces kernels (per-op, MTP, DFlash, light-batch, extension en lignes)
+    /// ignorent les sinks, le NoPE, le routeur sigmoïde et l'expert partagé
+    /// sans gate : les laisser tourner produirait un résultat faux sans erreur.
+    /// Seuls le prefill résident (par morceaux et prolongement de préfixe
+    /// compris) et le decode résident complet couvrent flint ; pour un tel
+    /// modèle, le runtime Metal ne sert qu'à eux (repli CPU sinon).
     pub fn metal_unsupported_reason(&self) -> Option<&'static str> {
         if self.attention_sinks {
             Some("sinks d'attention appris (softmax_offset)")
@@ -1461,6 +1466,9 @@ struct DecoderRuntime {
     /// Gather Metal de l'embedding vérifié octet près le CPU au warmup : le
     /// prefill résident peut alors plonger ses morceaux sur le GPU.
     embed_gather_byte_exact: bool,
+    /// Plafond de prompt flint dérivé de la mémoire au premier prefill, cf.
+    /// [`crate::runtime_flags::flint_prefill_max_tokens_override`].
+    flint_prefill_cap: OnceLock<usize>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

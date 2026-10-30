@@ -3350,6 +3350,13 @@ template [[host_name("steel_attention_float32_bq32_bk32_bd64_wm4_wn1_maskfloat32
 [[kernel]] decltype(attention<float, 32, 32, 64, 4, 1, float>)
 attention<float, 32, 32, 64, 4, 1, float>;
 
+// Attention causale d128 avec sinks du prefill flint (constantes 301 et 302).
+// BK16 : Q 32×132 et K/V 20×128 floats tiennent en 26,5 Kio de threadgroup ;
+// BK32 en demanderait 34,5, au-delà des 32 Kio.
+template [[host_name("steel_attention_float32_bq32_bk16_bd128_wm4_wn1_sinks")]]
+[[kernel]] decltype(attention<float, 32, 16, 128, 4, 1, float>)
+attention<float, 32, 16, 128, 4, 1, float>;
+
 // Variante causale d256 pour le prefill 35B. Elle derive le kernel Steel BD64 :
 // QK accumule les 4 sous-tuiles D avant softmax, puis applique la meme tuile de
 // scores aux 4 sous-tuiles V. Le footprint threadgroup reste sous 32 KiB.

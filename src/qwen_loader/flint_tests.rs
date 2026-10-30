@@ -436,11 +436,14 @@ fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
         .expect("invariant: runtime Metal attaché");
     let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3];
     let per_op = gpu
-        .prefill_hidden_for_test(&prompt, false)
+        .prefill_hidden_for_test(&prompt, None)
         .expect("invariant: prefill per-op flint")
         .expect("invariant: hidden per-op");
     let resident = gpu
-        .prefill_hidden_for_test(&prompt, true)
+        .prefill_hidden_for_test(
+            &prompt,
+            Some(crate::runtime_flags::prefill_resident_chunk_tokens()),
+        )
         .expect("invariant: prefill résident flint")
         .expect("prefill résident flint attendu");
     assert_eq!(per_op.shape(), resident.shape());
@@ -459,6 +462,90 @@ fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
             .expect("invariant: greedy CPU"),
         "tokens greedy (prefill Metal) != CPU"
     );
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn max_gap(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f32, f32::max)
+}
+
+/// Prefill résident par morceaux (sinks à décalage : requêtes locales,
+/// K/V, causalité et fenêtre absolus) contre le même prefill en un morceau,
+/// sur des coupes qui tombent dans la fenêtre de 2 et autour.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_chunked_prefill_matches_single_chunk() {
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
+    let hidden = |chunk_tokens| {
+        gpu.prefill_hidden_for_test(&prompt, Some(chunk_tokens))
+            .expect("invariant: prefill résident flint")
+            .expect("prefill résident flint attendu")
+    };
+    let single = hidden(0);
+    for chunk_tokens in [1, 2, 3, 5] {
+        let chunked = hidden(chunk_tokens);
+        let gap = max_gap(single.data(), chunked.data());
+        // Même arithmétique par ligne ; seuls les GEMM, dont la tuile dépend
+        // du nombre de lignes, peuvent réordonner une somme.
+        assert!(gap <= 1.0e-5, "morceaux de {chunk_tokens}: écart {gap}");
+    }
+}
+
+/// Prolongement résident d'un préfixe (reliquat sous le seuil de 32 tokens
+/// des autres modèles) contre le prefill complet, puis greedy depuis l'état
+/// prolongé contre le CPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_prefix_extension_matches_full_prefill() {
+    let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
+    assert!(
+        gpu.prefix_extend_as_cheap_as_cold(prompt.len()),
+        "prolongement résident attendu pour flint"
+    );
+    let full = gpu
+        .prefill_prompt_state_uncached(&prompt)
+        .expect("invariant: prefill complet");
+    for split in [1, 4, 9, 10] {
+        let mut state = gpu
+            .prefill_prompt_state_uncached(&prompt[..split])
+            .expect("invariant: prefill du préfixe");
+        gpu.extend_prompt_state(&mut state, &prompt[split..])
+            .expect("invariant: prolongement résident");
+        assert_eq!(state.position(), prompt.len());
+        let gap = max_gap(
+            full.final_state_for_test().data(),
+            state.final_state_for_test().data(),
+        );
+        assert!(gap <= 1.0e-5, "préfixe de {split}: écart {gap}");
+        let tokens = gpu
+            .generate_greedy_timed_from_prompt_state_with_options(
+                state,
+                std::time::Duration::ZERO,
+                4,
+                &crate::GenerationOptions::default(),
+            )
+            .expect("invariant: greedy depuis l'état prolongé")
+            .tokens;
+        assert_eq!(
+            tokens,
+            cpu.generate_greedy(&prompt, 4)
+                .expect("invariant: greedy CPU"),
+            "greedy après préfixe de {split} != CPU"
+        );
+    }
 }
 
 /// Le scratch du prefill résident flint passe par le scope de purge (marquage
@@ -497,7 +584,8 @@ fn synthetic_flint_resident_prefill_scratch_is_released() {
 }
 
 /// Au-delà du plafond de prefill flint, refus explicite avant tout calcul
-/// plutôt qu'un échec mémoire suivi d'un repli CPU.
+/// plutôt qu'un échec mémoire suivi d'un repli CPU : même règle pour la
+/// vérification préalable de serve, le prefill à froid et le prolongement.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn synthetic_flint_refuses_prompt_beyond_prefill_cap() {
@@ -505,14 +593,34 @@ fn synthetic_flint_refuses_prompt_beyond_prefill_cap() {
         .expect("invariant: flint synthétique")
         .with_metal_runtime()
         .expect("invariant: runtime Metal attaché");
-    let prompt = vec![1; crate::runtime_flags::flint_prefill_max_tokens() + 1];
-    let err = gpu
-        .generate_greedy(&prompt, 1)
-        .expect_err("prompt flint au-delà du plafond refusé");
-    assert!(
-        err.to_string()
-            .contains("SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS"),
-        "{err}"
+    let cap = gpu
+        .flint_prefill_max_tokens()
+        .expect("invariant: plafond flint sous Metal");
+    assert!((4096..=262_144).contains(&cap), "plafond {cap}");
+    gpu.ensure_prompt_within_prefill_cap(cap)
+        .expect("prompt au plafond accepté");
+    let prompt = vec![1; cap + 1];
+    let refused = |err: crate::InferError| {
+        assert!(
+            err.to_string()
+                .contains("SARAGOSSA_RUST_FLINT_PREFILL_MAX_TOKENS"),
+            "{err}"
+        );
+    };
+    refused(
+        gpu.ensure_prompt_within_prefill_cap(prompt.len())
+            .expect_err("vérification préalable refusée"),
+    );
+    refused(
+        gpu.generate_greedy(&prompt, 1)
+            .expect_err("prefill à froid refusé"),
+    );
+    let mut state = gpu
+        .prefill_prompt_state_uncached(&prompt[..4])
+        .expect("invariant: prefill du préfixe");
+    refused(
+        gpu.extend_prompt_state(&mut state, &prompt[4..])
+            .expect_err("prolongement refusé"),
     );
 }
 
@@ -893,6 +1001,120 @@ fn flint_int4_metal_matches_mlx_oracle() {
     );
 }
 
+/// Diagnostic de dérive : écrit dans `SARAGOSSA_FLINT_DUMP` (f32 LE) les
+/// captures du flux résiduel en sortie des couches 0 (pleine, MLP dense),
+/// 1 (pleine, MLP dense), 5 (pleine, après routage MoE) et 48 du prompt
+/// synthétique de 1000 tokens, puis les logits de sa dernière ligne. Deux
+/// exécutions sous des flags différents (`SARAGOSSA_RUST_FLINT_PREFILL_STEEL`,
+/// morceaux `SARAGOSSA_FLINT_DUMP_CHUNK`) se comparent ensuite hors processus.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis ; diagnostic, pas un gate"]
+fn flint_int4_prefill_capture_dump() {
+    let (Some(model_dir), Some(dump)) = (
+        std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from),
+        std::env::var_os("SARAGOSSA_FLINT_DUMP").map(PathBuf::from),
+    ) else {
+        eprintln!("dump flint sauté : définir SARAGOSSA_FLINT_MODEL_DIR et SARAGOSSA_FLINT_DUMP");
+        return;
+    };
+    let chunk_tokens = std::env::var("SARAGOSSA_FLINT_DUMP_CHUNK")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+        .expect("invariant: flint-int4 chargeable en Metal")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let prompt = synthetic_long_prompt(&assets, 1000);
+    let captures = model
+        .prefill_captures_for_test(&prompt, &[0, 1, 5, 48], chunk_tokens)
+        .expect("invariant: prefill résident flint")
+        .expect("captures attendues");
+    let hidden = model
+        .prefill_hidden_for_test(&prompt, Some(chunk_tokens))
+        .expect("invariant: prefill résident flint")
+        .expect("hidden attendu");
+    let logits = model
+        .logits_of_hidden_rows_for_test(&hidden, &[prompt.len() - 1])
+        .expect("invariant: logits");
+    let bytes = captures
+        .data()
+        .iter()
+        .chain(&logits[0])
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    std::fs::write(&dump, bytes).expect("invariant: écriture du dump");
+    // Oracle CPU per-op des couches 0 et 1 (attention pleine, MLP dense),
+    // sur demande : ~20 s.
+    if let Some(cpu_dump) = std::env::var_os("SARAGOSSA_FLINT_DUMP_CPU") {
+        let outputs = model
+            .per_op_layer_outputs_for_test(&prompt, 2)
+            .expect("invariant: forward per-op");
+        let bytes = outputs
+            .iter()
+            .flat_map(|output| output.data().iter())
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        std::fs::write(cpu_dump, bytes).expect("invariant: écriture du dump CPU");
+    }
+}
+
+/// Mesure du prefill résident flint (chemin AR, dernière ligne seulement) à
+/// 1k, 4k et 16k tokens, une exécution par longueur après un échauffement.
+/// L'état « avant » se mesure avec le même binaire :
+/// `SARAGOSSA_RUST_FLINT_PREFILL_STEEL=0 SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0`
+/// (kernel F3 seul, un seul morceau). `SARAGOSSA_FLINT_BENCH_LENS` remplace les
+/// longueurs (liste séparée par des virgules).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure, pas un gate"]
+fn flint_int4_prefill_ttft_bench() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("bench flint sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    let lens = std::env::var("SARAGOSSA_FLINT_BENCH_LENS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|len| len.trim().parse::<usize>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![1024, 4096, 16384]);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+        .expect("invariant: flint-int4 chargeable en Metal")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let warmup = synthetic_long_prompt(&assets, 64);
+    model
+        .prefill_cache_state_metal_resident_for_test(&warmup)
+        .expect("invariant: échauffement");
+    println!(
+        "plafond de prefill flint: {:?} tokens",
+        model.flint_prefill_max_tokens()
+    );
+    for len in lens {
+        let prompt = synthetic_long_prompt(&assets, len);
+        let started = std::time::Instant::now();
+        let state = model
+            .prefill_cache_state_metal_resident_for_test(&prompt)
+            .expect("invariant: prefill résident flint");
+        let elapsed = started.elapsed();
+        assert!(state.is_some(), "prefill résident flint attendu");
+        drop(state);
+        println!(
+            "flint prefill {len} tokens: {:.2} s, {:.0} tok/s",
+            elapsed.as_secs_f64(),
+            len as f64 / elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
+}
+
 /// Hidden non normés du prefill per-op CPU puis du prefill résident Metal, et
 /// leurs durées.
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -902,12 +1124,15 @@ fn timed_prefills(
 ) -> (Tensor, Tensor, std::time::Duration, std::time::Duration) {
     let started = std::time::Instant::now();
     let cpu = model
-        .prefill_hidden_for_test(prompt, false)
+        .prefill_hidden_for_test(prompt, None)
         .expect("invariant: prefill per-op");
     let cpu_time = started.elapsed();
     let started = std::time::Instant::now();
     let metal = model
-        .prefill_hidden_for_test(prompt, true)
+        .prefill_hidden_for_test(
+            prompt,
+            Some(crate::runtime_flags::prefill_resident_chunk_tokens()),
+        )
         .expect("invariant: prefill résident");
     let metal_time = started.elapsed();
     let metal = metal.expect("prefill résident Metal attendu pour flint");

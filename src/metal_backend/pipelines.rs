@@ -139,38 +139,57 @@ fn compile_steel_attention(device: &Device, source: &str) -> Option<ComputePipel
         .ok()
 }
 
+/// Pipelines Steel causaux tirés d'une seule compilation de la bibliothèque :
+/// le d256 du prefill Qwen et le d128 avec sinks du prefill flint. `None` pour
+/// un pipeline qui ne compile pas (trace sous `SARAGOSSA_RUST_TRACE_PREFILL`).
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn compile_steel_causal_d256_attention(
+fn compile_steel_causal_attentions(
     device: &Device,
     source: &str,
-) -> Option<ComputePipelineState> {
+) -> (Option<ComputePipelineState>, Option<ComputePipelineState>) {
     let options = CompileOptions::new();
     options.set_fast_math_enabled(true);
     let library = match device.new_library_with_source(source, &options) {
         Ok(library) => library,
         Err(message) => {
-            trace_steel_causal_d256_compile_error("compile", &message);
-            return None;
+            trace_steel_compile_error("steel causal", "compile", &message);
+            return (None, None);
         }
     };
+    let d256 = steel_causal_function(
+        device,
+        &library,
+        STEEL_CAUSAL_ATTN_D256_F32_BQ32_BK64_BD64X4,
+        false,
+    );
+    let sink_d128 = steel_causal_function(device, &library, STEEL_SINK_ATTN_D128_F32, true);
+    (d256, sink_d128)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn steel_causal_function(
+    device: &Device,
+    library: &metal::Library,
+    name: &str,
+    sinks: bool,
+) -> Option<ComputePipelineState> {
     let constants = FunctionConstantValues::new();
     set_metal_bool_constant(&constants, 200, false);
     set_metal_bool_constant(&constants, 201, false);
     set_metal_bool_constant(&constants, 300, false);
     set_metal_bool_constant(&constants, 301, true);
-    set_metal_bool_constant(&constants, 302, false);
-    let function =
-        match library.get_function(STEEL_CAUSAL_ATTN_D256_F32_BQ32_BK64_BD64X4, Some(constants)) {
-            Ok(function) => function,
-            Err(message) => {
-                trace_steel_causal_d256_compile_error("function", &message);
-                return None;
-            }
-        };
+    set_metal_bool_constant(&constants, 302, sinks);
+    let function = match library.get_function(name, Some(constants)) {
+        Ok(function) => function,
+        Err(message) => {
+            trace_steel_compile_error(name, "function", &message);
+            return None;
+        }
+    };
     match device.new_compute_pipeline_state_with_function(&function) {
         Ok(pipeline) => Some(pipeline),
         Err(message) => {
-            trace_steel_causal_d256_compile_error("pipeline", &message);
+            trace_steel_compile_error(name, "pipeline", &message);
             None
         }
     }
@@ -220,7 +239,7 @@ fn compile_nax_function(
     let library = match device.new_library_with_source(source, &options) {
         Ok(library) => library,
         Err(message) => {
-            trace_steel_causal_d256_compile_error("nax compile", &message);
+            trace_steel_compile_error(name, "nax compile", &message);
             return None;
         }
     };
@@ -231,23 +250,23 @@ fn compile_nax_function(
     let function = match library.get_function(name, Some(constants)) {
         Ok(function) => function,
         Err(message) => {
-            trace_steel_causal_d256_compile_error("nax function", &message);
+            trace_steel_compile_error(name, "nax function", &message);
             return None;
         }
     };
     match device.new_compute_pipeline_state_with_function(&function) {
         Ok(pipeline) => Some(pipeline),
         Err(message) => {
-            trace_steel_causal_d256_compile_error("nax pipeline", &message);
+            trace_steel_compile_error(name, "nax pipeline", &message);
             None
         }
     }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn trace_steel_causal_d256_compile_error(stage: &str, message: &str) {
+fn trace_steel_compile_error(kernel: &str, stage: &str, message: &str) {
     if crate::runtime_flags::trace_prefill_enabled() {
-        eprintln!("steel causal d256 {stage}: {message}");
+        eprintln!("{kernel} {stage}: {message}");
     }
 }
 
@@ -257,11 +276,11 @@ fn compile_steel_attention(_device: &Device, _source: &str) -> Option<ComputePip
 }
 
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
-fn compile_steel_causal_d256_attention(
+fn compile_steel_causal_attentions(
     _device: &Device,
     _source: &str,
-) -> Option<ComputePipelineState> {
-    None
+) -> (Option<ComputePipelineState>, Option<ComputePipelineState>) {
+    (None, None)
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -605,8 +624,8 @@ impl MetalExecutor {
             &device,
             "causal_attention_prefill_batch_gqa8x4_d256_f32",
         )?;
-        let causal_attention_prefill_steel_d256_f32 =
-            compile_steel_causal_d256_attention(&device, sources.steel_attention.as_ref());
+        let (causal_attention_prefill_steel_d256_f32, attention_prefill_steel_sink_d128_f32) =
+            compile_steel_causal_attentions(&device, sources.steel_attention.as_ref());
         let causal_attention_prefill_steel_nax_d256 =
             if crate::runtime_flags::prefill_attn_nax_enabled() {
                 let pipeline = compile_steel_causal_nax_d256_attention(
@@ -808,6 +827,8 @@ impl MetalExecutor {
             causal_attention_prefill_batch_long_d256_f32,
             causal_attention_prefill_batch_gqa8x4_d256_f32,
             causal_attention_prefill_steel_d256_f32,
+            attention_prefill_steel_sink_d128_f32,
+            prefill_sink_steel: crate::runtime_flags::flint_prefill_steel_enabled(),
             causal_attention_prefill_steel_nax_d256,
             prefill_kv_bf16_mirror: crate::runtime_flags::prefill_kv_bf16_mirror_enabled(),
             prefill_kv_bf16_store_min_rows: (crate::runtime_flags::prefill_kv_bf16_store_enabled()
