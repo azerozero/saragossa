@@ -401,7 +401,7 @@ impl MetalExecutor {
             && !has_sinks
             && self.causal_attention_prefill_steel_nax_d256.is_some();
         // Le stockage bf16 vaut pour toutes les couches : il faut un lecteur
-        // bf16 à chacune, le NAX d256 sans sinks ; avec sinks, l'opt-in flint
+        // bf16 à chacune, le NAX d256 sans sinks ; avec sinks, le flag flint (actif par défaut)
         // puis le Steel d128 bf16 pour une couche pleine, le naïf bf16
         // (toujours compilé) suffisant à une fenêtrée. L'arène d'un prompt de
         // cette longueur sera bf16 : sans sinks, le NAX lisait déjà ces

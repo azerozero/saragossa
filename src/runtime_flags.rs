@@ -833,19 +833,20 @@ pub(crate) fn prefill_kv_bf16_store_enabled() -> bool {
 
 /// Étend le stockage bf16 du K/V de prefill
 /// ([`prefill_kv_bf16_store_enabled`], qui reste un kill-switch global) aux
-/// modèles à sinks (flint), lus par les jumeaux bf16 des kernels à sinks
-/// (`SARAGOSSA_RUST_FLINT_PREFILL_KV_BF16_STORE=1`, opt-in). Contrairement au
-/// NAX, qui lisait déjà ces octets en bf16, l'arrondi change les K/V lus, le
-/// morceau courant compris. Mesuré le 2026-10-30 sur flint-int4 à 16 400
-/// tokens (cinq morceaux de 3280) contre le stockage f32 : argmax et 16
-/// tokens greedy identiques, écarts centrés de logits cités par
-/// `flint_int4_prefill_kv_bf16_store_drift`. Un seul prompt : reste opt-in
-/// tant que la dérive n'est pas validée plus largement. Sans le flag, flint
-/// garde le K/V f32 et la réserve minimale.
+/// modèles à sinks (flint), lus par les jumeaux bf16 des kernels à sinks ;
+/// l'arène de decode adopte alors ce K/V au lieu de le recopier. Contrairement
+/// au NAX, qui lisait déjà ces octets en bf16, l'arrondi change les K/V lus,
+/// le morceau courant compris : le greedy peut diverger sur des quasi-égalités
+/// (5 prompts de 32k à 64k, divergences de formulation dans le raisonnement).
+/// Mesuré le 2026-10-30 en serve sur flint-int4, 7 contextes de 32k à 115k :
+/// intégrité 4/4 partout comme en f32, pic 31 → 26 Go à 32k, 39 → 30 Go à
+/// 64k, 52 → 35 Go à 115k, TTFT −3 à −8 %, decode inchangé. Écarts de logits
+/// cités par `flint_int4_prefill_kv_bf16_store_drift`. Kill-switch
+/// `SARAGOSSA_RUST_FLINT_PREFILL_KV_BF16_STORE=0`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn flint_prefill_kv_bf16_store_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_PREFILL_KV_BF16_STORE", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_PREFILL_KV_BF16_STORE", true))
 }
 
 /// K/V full-attention en buffers « placement sparse » Metal 4
