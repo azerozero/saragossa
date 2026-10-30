@@ -1368,6 +1368,9 @@ impl MetalExecutor {
     /// Sans fenêtre en d128, le Steel tuilé avec sinks
     /// (`SARAGOSSA_RUST_FLINT_PREFILL_STEEL`) ; sinon
     /// `attention_prefill_sink_f32`, une simdgroup par (tête Q, position).
+    /// `kv_bf16` : K/V stockés en bf16, lus par les jumeaux bf16 de ces deux
+    /// kernels (Q, sortie et sinks restent f32) ; le naïf bf16 remplace le
+    /// Steel bf16 s'il n'a pas compilé.
     ///
     /// # Errors
     ///
@@ -1384,6 +1387,7 @@ impl MetalExecutor {
         sinks_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
         kv_rows: usize,
+        kv_bf16: bool,
     ) -> Result<()> {
         if !matches!(spec.head_dim, 32 | 64 | 128 | 256)
             || spec.kv_heads == 0
@@ -1395,15 +1399,16 @@ impl MetalExecutor {
                 spec.head_dim, spec.q_heads, spec.kv_heads, spec.seq
             )));
         }
-        if let Some(pipeline) = self
-            .attention_prefill_steel_sink_d128_f32
-            .as_ref()
-            .filter(|_| {
-                self.prefill_sink_steel
-                    && spec.window.is_none()
-                    && spec.head_dim == STEEL_SINK_ATTN_D128_BD
-            })
-        {
+        let steel = if kv_bf16 {
+            &self.attention_prefill_steel_sink_d128_kv_bf16
+        } else {
+            &self.attention_prefill_steel_sink_d128_f32
+        };
+        if let Some(pipeline) = steel.as_ref().filter(|_| {
+            self.prefill_sink_steel
+                && spec.window.is_none()
+                && spec.head_dim == STEEL_SINK_ATTN_D128_BD
+        }) {
             let params = steel_attn_params(
                 spec,
                 STEEL_SINK_ATTN_D128_BQ,
@@ -1447,7 +1452,11 @@ impl MetalExecutor {
             checked_u32(spec.window.unwrap_or(0), "attention sinks window")?,
             checked_u32(kv_rows - spec.seq, "attention sinks q_off")?,
         ];
-        encoder.set_compute_pipeline_state(&self.attention_prefill_sink_f32);
+        encoder.set_compute_pipeline_state(if kv_bf16 {
+            &self.attention_prefill_sink_bf16
+        } else {
+            &self.attention_prefill_sink_f32
+        });
         encoder.set_buffer(0, Some(q_buffer), 0);
         encoder.set_buffer(1, Some(k_buffer), 0);
         encoder.set_buffer(2, Some(v_buffer), 0);

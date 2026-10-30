@@ -18,6 +18,20 @@ mod sink_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+impl MetalExecutor {
+    /// Seuil du stockage bf16 du K/V de prefill, pour les tests hors de ce
+    /// module (flint synthétique) ; `None` garde le K/V en f32.
+    pub(crate) fn set_prefill_kv_bf16_store_min_rows_for_test(&mut self, min_rows: Option<usize>) {
+        self.prefill_kv_bf16_store_min_rows = min_rows;
+    }
+
+    /// Opt-in du stockage bf16 pour les couches à sinks (flint), hors env.
+    pub(crate) fn set_prefill_kv_bf16_store_sinks_for_test(&mut self, enabled: bool) {
+        self.prefill_kv_bf16_store_sinks = enabled;
+    }
+}
+
 struct PrefillTailMoeShape<'a> {
     hidden_dim: usize,
     q_dim: usize,

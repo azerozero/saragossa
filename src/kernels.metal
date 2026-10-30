@@ -8811,11 +8811,13 @@ kernel void causal_attention_prefill_batch_long_d128_f32(
 // `causal_attention_prefill_batch_long_d128_f32` (QK constant, fast::exp,
 // inverse multiplié) : un sink neutre sans fenêtre rend ses octets en d128, ce
 // que vérifie un test.
-template <uint QK>
+// `KV` : `float`, ou `bfloat` pour un K/V de prefill stocké en bf16 ; la
+// conversion `float(bfloat)` est exacte et le calcul reste en f32.
+template <uint QK, typename KV>
 inline void attention_prefill_sink_body(
     device const float* q,
-    device const float* k,
-    device const float* v,
+    device const KV* k,
+    device const KV* v,
     device float* out,
     const uint q_heads,
     const uint kv_heads,
@@ -8851,11 +8853,11 @@ inline void attention_prefill_sink_body(
         (window > 0u && abs_pos + 1u > window) ? (abs_pos + 1u - window) : 0u;
 
     for (uint row = row_start; row <= abs_pos; ++row) {
-        const device float* k_ptr = k + row * kv_dim + kv_head * D + lane_base;
-        const device float* v_ptr = v + row * kv_dim + kv_head * D + lane_base;
+        const device KV* k_ptr = k + row * kv_dim + kv_head * D + lane_base;
+        const device KV* v_ptr = v + row * kv_dim + kv_head * D + lane_base;
         float score = 0.0f;
         for (uint j = 0u; j < QK; ++j) {
-            score += ql[j] * k_ptr[j];
+            score += ql[j] * float(k_ptr[j]);
         }
         score = simd_sum(score);
         const float new_max = max(max_score, score);
@@ -8864,7 +8866,7 @@ inline void attention_prefill_sink_body(
         max_score = new_max;
         sum_exp = sum_exp * factor + exp_score;
         for (uint j = 0u; j < QK; ++j) {
-            o[j] = o[j] * factor + exp_score * v_ptr[j];
+            o[j] = o[j] * factor + exp_score * float(v_ptr[j]);
         }
     }
 
@@ -8875,16 +8877,17 @@ inline void attention_prefill_sink_body(
     }
 }
 
-kernel void attention_prefill_sink_f32(
-    device const float* q [[buffer(0)]],
-    device const float* k [[buffer(1)]],
-    device const float* v [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant uint* dims [[buffer(4)]],
-    constant float2& scale_params [[buffer(5)]],
-    device const float* sinks [[buffer(6)]],
-    uint simd_lid [[thread_index_in_simdgroup]],
-    uint2 tile [[threadgroup_position_in_grid]]
+template <typename KV>
+inline void attention_prefill_sink_dispatch(
+    device const float* q,
+    device const KV* k,
+    device const KV* v,
+    device float* out,
+    constant uint* dims,
+    constant float2& scale_params,
+    device const float* sinks,
+    uint simd_lid,
+    uint2 tile
 ) {
     const uint seq = dims[0];
     const uint q_heads = dims[1];
@@ -8902,24 +8905,56 @@ kernel void attention_prefill_sink_f32(
     const float sink = sinks[q_head];
     switch (head_dim) {
         case 32u:
-            attention_prefill_sink_body<1u>(
+            attention_prefill_sink_body<1u, KV>(
                 q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos, q_off);
             break;
         case 64u:
-            attention_prefill_sink_body<2u>(
+            attention_prefill_sink_body<2u, KV>(
                 q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos, q_off);
             break;
         case 128u:
-            attention_prefill_sink_body<4u>(
+            attention_prefill_sink_body<4u, KV>(
                 q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos, q_off);
             break;
         case 256u:
-            attention_prefill_sink_body<8u>(
+            attention_prefill_sink_body<8u, KV>(
                 q, k, v, out, q_heads, kv_heads, window, scale, sink, simd_lid, q_head, pos, q_off);
             break;
         default:
             break;
     }
+}
+
+kernel void attention_prefill_sink_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint* dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
+    device const float* sinks [[buffer(6)]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    attention_prefill_sink_dispatch<float>(
+        q, k, v, out, dims, scale_params, sinks, simd_lid, tile);
+}
+
+// Jumeau du précédent pour un K/V de prefill stocké en bf16 (flint au-delà du
+// seuil de stockage) : Q, sortie et sinks restent f32.
+kernel void attention_prefill_sink_bf16(
+    device const float* q [[buffer(0)]],
+    device const bfloat* k [[buffer(1)]],
+    device const bfloat* v [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint* dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
+    device const float* sinks [[buffer(6)]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    attention_prefill_sink_dispatch<bfloat>(
+        q, k, v, out, dims, scale_params, sinks, simd_lid, tile);
 }
 
 kernel void causal_attention_prefill_batch_long_d256_f32(

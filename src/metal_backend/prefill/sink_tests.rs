@@ -110,19 +110,49 @@ fn cpu_sink_attention(
     out
 }
 
+/// Arrondi bf16 (RNE) d'un K/V f32, élargi en f32 : ce que lit un kernel sur
+/// le même K/V stocké en bf16.
+fn bf16_rounded(data: &[f32]) -> Vec<f32> {
+    crate::metal_backend::buffers::f32_slice_to_bf16(data)
+        .into_iter()
+        .map(|bits| f32::from_bits(u32::from(bits) << 16))
+        .collect()
+}
+
+/// K ou V de test, en f32 ou arrondi et stocké en bf16.
+fn upload_kv(
+    executor: &MetalExecutor,
+    data: &[f32],
+    bf16: bool,
+    label: &'static str,
+) -> Result<metal::Buffer> {
+    if !bf16 {
+        return executor.upload_f32_buffer(data, label);
+    }
+    let buffer = executor.uncached_bf16_buffer(data.len(), label)?;
+    write_u16_buffer_at(
+        &buffer,
+        0,
+        &crate::metal_backend::buffers::f32_slice_to_bf16(data),
+    )?;
+    Ok(buffer)
+}
+
 /// Attention prefill GPU : kernel à sinks si `sinks` (Steel ou F3 selon
-/// `executor.prefill_sink_steel`), sinon le d128 sans sink. Les `spec.seq`
-/// requêtes sont les dernières des lignes de `keys`/`values`.
+/// `executor.prefill_sink_steel`, K/V stockés en bf16 si `kv_bf16`), sinon le
+/// d128 sans sink. Les `spec.seq` requêtes sont les dernières des lignes de
+/// `keys`/`values`.
 fn gpu_attention(
     executor: &MetalExecutor,
     (q, keys, values): (&[f32], &[f32], &[f32]),
     spec: PrefillAttentionSpec,
     sinks: Option<&[f32]>,
+    kv_bf16: bool,
 ) -> Result<Vec<f32>> {
     let kv_rows = keys.len() / (spec.kv_heads * HEAD_DIM);
     let q_buffer = executor.upload_f32_buffer(q, "sink_test_q")?;
-    let k_buffer = executor.upload_f32_buffer(keys, "sink_test_k")?;
-    let v_buffer = executor.upload_f32_buffer(values, "sink_test_v")?;
+    let k_buffer = upload_kv(executor, keys, kv_bf16, "sink_test_k")?;
+    let v_buffer = upload_kv(executor, values, kv_bf16, "sink_test_v")?;
     let out_buffer = executor.uncached_f32_buffer(q.len(), "sink_test_out")?;
     let sinks_buffer = sinks
         .map(|sinks| executor.upload_f32_buffer(sinks, "sink_test_sinks"))
@@ -139,6 +169,7 @@ fn gpu_attention(
             sinks_buffer,
             spec,
             kv_rows,
+            kv_bf16,
         ),
         None => executor.encode_causal_attention_prefill(
             encoder,
@@ -183,14 +214,18 @@ fn row_gap(got: &[f32], want: &[f32], rows: &[usize], q_dim: usize) -> f32 {
         .fold(0.0_f32, f32::max)
 }
 
-/// Le Steel d128 avec sinks doit compiler : sinon les tests ci-dessous ne
-/// mesureraient que le kernel F3.
+/// Les Steel d128 avec sinks (K/V f32 et bf16) doivent compiler : sinon les
+/// tests ci-dessous ne mesureraient que le kernel F3.
 fn steel_executor() -> Result<Option<MetalExecutor>> {
     let executor = test_executor()?;
     if let Some(executor) = executor.as_ref() {
         assert!(
             executor.attention_prefill_steel_sink_d128_f32.is_some(),
             "pipeline Steel d128 avec sinks absent"
+        );
+        assert!(
+            executor.attention_prefill_steel_sink_d128_kv_bf16.is_some(),
+            "pipeline Steel d128 avec sinks et K/V bf16 absent"
         );
     }
     Ok(executor)
@@ -202,6 +237,9 @@ fn steel_executor() -> Result<Option<MetalExecutor>> {
 /// le CPU, et le Steel contre le F3 sur toutes les lignes. Deux régimes : les
 /// scores doux de `inputs`, puis des scores ×10 avec des sinks ±8, où le
 /// maximum passe tour à tour du sink aux scores et force le recalage.
+/// K/V bf16 (sauf à 4000, pour la durée de l'oracle) : contre le CPU sur le
+/// K/V arrondi, et bit à bit contre la variante f32 nourrie du même K/V
+/// arrondi, puisque l'élargissement `float(bfloat)` est exact.
 #[test]
 fn prefill_sink_attention_matches_cpu_oracle() -> Result<()> {
     let Some(mut executor) = steel_executor()? else {
@@ -216,20 +254,46 @@ fn prefill_sink_attention_matches_cpu_oracle() -> Result<()> {
             let (q, keys, values) = inputs(seq, Q_HEADS, KV_HEADS);
             let q = q.iter().map(|value| value * q_scale).collect::<Vec<_>>();
             let rows = oracle_rows(seq);
-            for window in [None, Some(WINDOW)] {
-                let label = format!("q×{q_scale} seq={seq} window={window:?}");
+            let (keys_bf16, values_bf16) = (bf16_rounded(&keys), bf16_rounded(&values));
+            for (window, kv_bf16) in [None, Some(WINDOW)]
+                .into_iter()
+                .flat_map(|window| [(window, false), (window, true)])
+                .filter(|&(_, kv_bf16)| !kv_bf16 || seq <= 1100)
+            {
+                let label = format!("q×{q_scale} seq={seq} window={window:?} kv_bf16={kv_bf16}");
                 let spec = spec(seq, Q_HEADS, KV_HEADS, window);
-                let want = cpu_sink_attention(&q, (&keys, &values), spec, &sinks, 0, &rows);
+                let (keys, values) = if kv_bf16 {
+                    (&keys_bf16, &values_bf16)
+                } else {
+                    (&keys, &values)
+                };
+                let want = cpu_sink_attention(&q, (keys, values), spec, &sinks, 0, &rows);
                 let mut outputs = Vec::new();
                 for steel in [false, true] {
                     executor.prefill_sink_steel = steel;
-                    let got = gpu_attention(&executor, (&q, &keys, &values), spec, Some(&sinks))?;
+                    let got =
+                        gpu_attention(&executor, (&q, keys, values), spec, Some(&sinks), kv_bf16)?;
                     let gap = row_gap(&got, &want, &rows, q_dim);
                     // Sorties d'ordre 1e-2 : seuls l'ordre d'accumulation
                     // (softmax en ligne, simd_sum ou MMA) et `fast::exp`/`exp2`
                     // séparent le GPU du CPU.
                     assert!(gap <= 1.0e-5, "{label} steel={steel}: écart CPU {gap}");
                     println!("{label} steel={steel}: écart CPU {gap:.2e}");
+                    if kv_bf16 {
+                        let widened = gpu_attention(
+                            &executor,
+                            (&q, keys, values),
+                            spec,
+                            Some(&sinks),
+                            false,
+                        )?;
+                        assert!(
+                            got.iter()
+                                .zip(&widened)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{label} steel={steel}: K/V bf16 != f32 arrondi"
+                        );
+                    }
                     outputs.push(got);
                 }
                 let all_rows = (0..seq).collect::<Vec<_>>();
@@ -256,7 +320,7 @@ fn prefill_sink_attention_chunks_match_single_block() -> Result<()> {
     let (q_dim, kv_dim) = (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
     let seq = 1100;
     let (q, keys, values) = inputs(seq, Q_HEADS, KV_HEADS);
-    for steel in [false, true] {
+    for (steel, kv_bf16) in [(false, false), (true, false), (false, true), (true, true)] {
         executor.prefill_sink_steel = steel;
         for window in [None, Some(WINDOW)] {
             let single = gpu_attention(
@@ -264,6 +328,7 @@ fn prefill_sink_attention_chunks_match_single_block() -> Result<()> {
                 (&q, &keys, &values),
                 spec(seq, Q_HEADS, KV_HEADS, window),
                 Some(&sinks),
+                kv_bf16,
             )?;
             for chunk in [1, 256, 300, 513] {
                 let mut chunked = Vec::with_capacity(single.len());
@@ -278,6 +343,7 @@ fn prefill_sink_attention_chunks_match_single_block() -> Result<()> {
                         ),
                         spec(end - start, Q_HEADS, KV_HEADS, window),
                         Some(&sinks),
+                        kv_bf16,
                     )?);
                 }
                 assert!(
@@ -285,7 +351,7 @@ fn prefill_sink_attention_chunks_match_single_block() -> Result<()> {
                         .iter()
                         .zip(&chunked)
                         .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "steel={steel} window={window:?} morceaux de {chunk} != un bloc"
+                    "steel={steel} kv_bf16={kv_bf16} window={window:?} morceaux de {chunk} != un bloc"
                 );
             }
         }
@@ -310,8 +376,8 @@ fn prefill_sink_attention_neutral_is_bit_identical_to_d128() -> Result<()> {
     let (q, keys, values) = inputs(seq, q_heads, kv_heads);
     let spec = spec(seq, q_heads, kv_heads, None);
     let neutral = vec![NEUTRAL_SINK; q_heads];
-    let with_sink = gpu_attention(&executor, (&q, &keys, &values), spec, Some(&neutral))?;
-    let without = gpu_attention(&executor, (&q, &keys, &values), spec, None)?;
+    let with_sink = gpu_attention(&executor, (&q, &keys, &values), spec, Some(&neutral), false)?;
+    let without = gpu_attention(&executor, (&q, &keys, &values), spec, None, false)?;
     assert!(
         with_sink
             .iter()
@@ -440,6 +506,7 @@ fn prefill_sink_attention_large_scores_match_f64() -> Result<()> {
                 (&q, &keys, &values),
                 spec(seq, Q_HEADS, KV_HEADS, None),
                 Some(&sinks),
+                false,
             )?;
             let worst = (0..seq)
                 .map(|pos| {

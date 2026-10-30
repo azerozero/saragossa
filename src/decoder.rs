@@ -876,6 +876,30 @@ impl Clone for LayerKvCache {
 }
 
 impl CausalDecoderCache {
+    /// Couches full-attention dont tout le K/V est stocké en bf16, et couches
+    /// full-attention au K/V non vide : prouve en test que le stockage bf16 du
+    /// prefill a bien été pris.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn bf16_kv_layers_for_test(&self) -> (usize, usize) {
+        use crate::decode_resident::KvSegment;
+        let full = self
+            .layers
+            .iter()
+            .filter(|layer| layer.keys.len() > 0)
+            .collect::<Vec<_>>();
+        let bf16 = full
+            .iter()
+            .filter(|layer| {
+                [&layer.keys, &layer.values].iter().all(|rows| {
+                    rows.segments().iter().all(|segment| {
+                        matches!(segment, KvSegment::SharedBf16(_) | KvSegment::CpuBf16(_))
+                    })
+                })
+            })
+            .count();
+        (bf16, full.len())
+    }
+
     /// Renvoie la position absolue du prochain token.
     #[must_use]
     pub fn position(&self) -> usize {

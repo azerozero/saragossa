@@ -140,20 +140,18 @@ fn compile_steel_attention(device: &Device, source: &str) -> Option<ComputePipel
 }
 
 /// Pipelines Steel causaux tirés d'une seule compilation de la bibliothèque :
-/// le d256 du prefill Qwen et le d128 avec sinks du prefill flint. `None` pour
-/// un pipeline qui ne compile pas (trace sous `SARAGOSSA_RUST_TRACE_PREFILL`).
+/// le d256 du prefill Qwen et le d128 avec sinks du prefill flint (K/V f32,
+/// puis K/V bf16). `None` pour un pipeline qui ne compile pas (trace sous
+/// `SARAGOSSA_RUST_TRACE_PREFILL`).
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn compile_steel_causal_attentions(
-    device: &Device,
-    source: &str,
-) -> (Option<ComputePipelineState>, Option<ComputePipelineState>) {
+fn compile_steel_causal_attentions(device: &Device, source: &str) -> SteelCausalAttentions {
     let options = CompileOptions::new();
     options.set_fast_math_enabled(true);
     let library = match device.new_library_with_source(source, &options) {
         Ok(library) => library,
         Err(message) => {
             trace_steel_compile_error("steel causal", "compile", &message);
-            return (None, None);
+            return (None, None, None);
         }
     };
     let d256 = steel_causal_function(
@@ -163,8 +161,17 @@ fn compile_steel_causal_attentions(
         false,
     );
     let sink_d128 = steel_causal_function(device, &library, STEEL_SINK_ATTN_D128_F32, true);
-    (d256, sink_d128)
+    let sink_d128_kv_bf16 =
+        steel_causal_function(device, &library, STEEL_SINK_ATTN_D128_KV_BF16, true);
+    (d256, sink_d128, sink_d128_kv_bf16)
 }
+
+/// d256 Qwen, d128 avec sinks sur K/V f32, puis sur K/V bf16.
+type SteelCausalAttentions = (
+    Option<ComputePipelineState>,
+    Option<ComputePipelineState>,
+    Option<ComputePipelineState>,
+);
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn steel_causal_function(
@@ -276,11 +283,8 @@ fn compile_steel_attention(_device: &Device, _source: &str) -> Option<ComputePip
 }
 
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
-fn compile_steel_causal_attentions(
-    _device: &Device,
-    _source: &str,
-) -> (Option<ComputePipelineState>, Option<ComputePipelineState>) {
-    (None, None)
+fn compile_steel_causal_attentions(_device: &Device, _source: &str) -> SteelCausalAttentions {
+    (None, None, None)
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -609,6 +613,8 @@ impl MetalExecutor {
         let windowed_attention_prefill_long_f32 =
             pipeline(&library, &device, "windowed_attention_prefill_long_f32")?;
         let attention_prefill_sink_f32 = pipeline(&library, &device, "attention_prefill_sink_f32")?;
+        let attention_prefill_sink_bf16 =
+            pipeline(&library, &device, "attention_prefill_sink_bf16")?;
         let causal_attention_prefill_batch_long_d128_f32 = pipeline(
             &library,
             &device,
@@ -624,8 +630,11 @@ impl MetalExecutor {
             &device,
             "causal_attention_prefill_batch_gqa8x4_d256_f32",
         )?;
-        let (causal_attention_prefill_steel_d256_f32, attention_prefill_steel_sink_d128_f32) =
-            compile_steel_causal_attentions(&device, sources.steel_attention.as_ref());
+        let (
+            causal_attention_prefill_steel_d256_f32,
+            attention_prefill_steel_sink_d128_f32,
+            attention_prefill_steel_sink_d128_kv_bf16,
+        ) = compile_steel_causal_attentions(&device, sources.steel_attention.as_ref());
         let causal_attention_prefill_steel_nax_d256 =
             if crate::runtime_flags::prefill_attn_nax_enabled() {
                 let pipeline = compile_steel_causal_nax_d256_attention(
@@ -823,11 +832,15 @@ impl MetalExecutor {
             windowed_attention_prefill_mid_f32,
             windowed_attention_prefill_long_f32,
             attention_prefill_sink_f32,
+            attention_prefill_sink_bf16,
             causal_attention_prefill_batch_long_d128_f32,
             causal_attention_prefill_batch_long_d256_f32,
             causal_attention_prefill_batch_gqa8x4_d256_f32,
             causal_attention_prefill_steel_d256_f32,
             attention_prefill_steel_sink_d128_f32,
+            attention_prefill_steel_sink_d128_kv_bf16,
+            prefill_kv_bf16_store_sinks: crate::runtime_flags::flint_prefill_kv_bf16_store_enabled(
+            ),
             prefill_sink_steel: crate::runtime_flags::flint_prefill_steel_enabled(),
             causal_attention_prefill_steel_nax_d256,
             prefill_kv_bf16_mirror: crate::runtime_flags::prefill_kv_bf16_mirror_enabled(),

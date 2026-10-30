@@ -206,15 +206,9 @@ impl MetalExecutor {
                     },
                     |encoder, _owned| {
                         if let Some(sinks_buffer) = sinks_buffer.as_ref() {
-                            // Sinks (flint) : K/V f32 seulement, le K/V bf16
-                            // n'existe que pour le NAX d256 (exclu par
-                            // `chunked_nax`). Morceau ou préfixe : les requêtes
-                            // finissent à `chunk.start + chunk.rows`.
-                            if *bf16_store {
-                                return Err(InferError::Config(format!(
-                                    "prefill avec sinks sur K/V bf16 non supporté couche {layer_index}"
-                                )));
-                            }
+                            // Sinks (flint) : K/V lu dans son format de
+                            // stockage, f32 ou bf16. Morceau ou préfixe : les
+                            // requêtes finissent à `chunk.start + chunk.rows`.
                             return self.encode_attention_prefill_sink(
                                 encoder,
                                 &q_rope_buffer,
@@ -224,6 +218,7 @@ impl MetalExecutor {
                                 sinks_buffer,
                                 spec,
                                 chunk.start + chunk.rows,
+                                *bf16_store,
                             );
                         }
                         if chunk.rows < chunk.total {

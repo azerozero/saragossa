@@ -27,6 +27,8 @@ const STEEL_ATTN_F32_BQ32_BK32_BD64: &str =
 const STEEL_CAUSAL_ATTN_D256_F32_BQ32_BK64_BD64X4: &str =
     "steel_attention_float32_bq32_bk64_bd64x4_wm4_wn1_causal_d256";
 const STEEL_SINK_ATTN_D128_F32: &str = "steel_attention_float32_bq32_bk16_bd128_wm4_wn1_sinks";
+const STEEL_SINK_ATTN_D128_KV_BF16: &str =
+    "steel_attention_float32_bq32_bk16_bd128_wm4_wn1_sinks_kvbf16";
 #[cfg(all(target_os = "macos", feature = "metal"))]
 const STEEL_ATTENTION_NAX_KERNELS: &str = include_str!("../../assets/steel_attention_nax.metal");
 const GATED_DELTA_NAX_KERNELS: &str = include_str!("../../assets/gated_delta_nax.metal");
@@ -280,6 +282,8 @@ pub struct MetalExecutor {
     windowed_attention_prefill_mid_f32: ComputePipelineState,
     windowed_attention_prefill_long_f32: ComputePipelineState,
     attention_prefill_sink_f32: ComputePipelineState,
+    /// Jumeau de `attention_prefill_sink_f32` sur un K/V stocké en bf16.
+    attention_prefill_sink_bf16: ComputePipelineState,
     causal_attention_prefill_batch_long_d128_f32: ComputePipelineState,
     causal_attention_prefill_batch_long_d256_f32: ComputePipelineState,
     causal_attention_prefill_batch_gqa8x4_d256_f32: ComputePipelineState,
@@ -287,6 +291,12 @@ pub struct MetalExecutor {
     /// Steel causal d128 avec sinks (couches pleines flint) ; `None` s'il ne
     /// compile pas, le kernel `attention_prefill_sink_f32` prend alors le relais.
     attention_prefill_steel_sink_d128_f32: Option<ComputePipelineState>,
+    /// Même Steel d128 avec sinks, K/V lus en bf16 ; `None` s'il ne compile
+    /// pas, le jumeau `attention_prefill_sink_bf16` prend alors le relais.
+    attention_prefill_steel_sink_d128_kv_bf16: Option<ComputePipelineState>,
+    /// Stockage bf16 du K/V de prefill permis aux couches à sinks (lu du flag
+    /// opt-in, forcé en test).
+    prefill_kv_bf16_store_sinks: bool,
     /// Choix du Steel avec sinks (lu du flag, forcé en test).
     prefill_sink_steel: bool,
     causal_attention_prefill_steel_nax_d256: Option<attention::NaxCausalAttention>,
