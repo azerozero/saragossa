@@ -15,7 +15,7 @@ pub(crate) use self::resident::routed_coop_trace_for_test;
 pub(crate) use self::resident::with_prefill_kv_layout_override;
 pub(crate) use self::resident::with_prefill_kv_reserve;
 #[cfg(test)]
-pub(crate) use self::resident::with_router_logits_capture;
+pub(crate) use self::resident::{with_router_capture, RouterCapture};
 mod scratch;
 #[cfg(test)]
 mod sink_tests;

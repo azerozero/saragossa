@@ -513,38 +513,23 @@ fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn synthetic_flint_moe_coop_matches_qmv() {
+    let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    // Support détecté hors du compteur : la bibliothèque NA (MPP) contient les
+    // pipelines coop groupés ; si elle compile, le coop doit s'exécuter.
+    let supported = executor.na_library_available_for_test();
     let gpu = load(flint_tensors(true))
         .expect("invariant: flint synthétique")
-        .with_metal_runtime()
+        .with_metal_executor(executor)
         .expect("invariant: runtime Metal attaché");
-    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6, 1, 0, 4, 5, 7, 6];
-    // Renvoie aussi les couches routées (coop exécuté, repli qmv faute de
-    // pipelines) comptées pendant le prefill seul.
-    let run = |coop| {
-        crate::metal_backend::with_flint_moe_coop_override(coop, || {
-            let (ran, fallback) = crate::metal_backend::routed_coop_trace_for_test();
-            let hidden = gpu
-                .prefill_hidden_for_test(
-                    &prompt,
-                    Some(crate::runtime_flags::prefill_resident_chunk_tokens()),
-                )
-                .expect("invariant: prefill résident flint")
-                .expect("prefill résident flint attendu");
-            let (ran_after, fallback_after) = crate::metal_backend::routed_coop_trace_for_test();
-            let greedy = gpu
-                .generate_greedy(&prompt, 6)
-                .expect("invariant: greedy GPU");
-            (hidden, greedy, (ran_after - ran, fallback_after - fallback))
-        })
-    };
-    let (qmv, qmv_greedy, qmv_trace) = run(false);
-    let (coop, coop_greedy, coop_trace) = run(true);
+    let (qmv, qmv_trace) = traced_coop_prefill(&gpu, false);
+    let (coop, coop_trace) = traced_coop_prefill(&gpu, true);
     // Kill-switch flint coupé : aucune couche éligible.
     assert_eq!(qmv_trace, (0, 0), "qmv: couches coop inattendues");
-    // Fixture u4 gs64 : ses deux couches MoE sont éligibles ; seul le manque
-    // de pipelines MPP (macOS < 26) autorise le repli qmv.
-    if coop_trace == (0, 2) {
-        eprintln!("skip: pipelines coop groupés indisponibles (macOS < 26 ?)");
+    if !supported {
+        // Fixture u4 gs64 : ses deux couches MoE restent éligibles et
+        // retombent sur le qmv faute de pipelines.
+        assert_eq!(coop_trace, (0, 2), "repli qmv attendu sans bibliothèque NA");
+        eprintln!("skip: bibliothèque NA indisponible (macOS < 26 ?)");
         return;
     }
     assert_eq!(
@@ -560,7 +545,57 @@ fn synthetic_flint_moe_coop_matches_qmv() {
         gap <= 1.0e-2 * scale,
         "coop vs qmv: écart {gap} échelle {scale}"
     );
-    assert_eq!(coop_greedy, qmv_greedy, "greedy coop != qmv");
+    let greedy = |coop| {
+        crate::metal_backend::with_flint_moe_coop_override(coop, || {
+            gpu.generate_greedy(&SYNTHETIC_COOP_PROMPT, 6)
+                .expect("invariant: greedy GPU")
+        })
+    };
+    assert_eq!(greedy(true), greedy(false), "greedy coop != qmv");
+}
+
+/// Repli exécuté : sans le pipeline scatter u4 du coop groupé, le prefill
+/// résident flint doit passer par le qmv sur ses deux couches MoE et rendre
+/// exactement les hidden du qmv.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_moe_coop_falls_back_without_pipelines() {
+    let mut executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    executor.drop_routed_coop_scatter_u4_for_test();
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let (fallback, fallback_trace) = traced_coop_prefill(&gpu, true);
+    let (qmv, qmv_trace) = traced_coop_prefill(&gpu, false);
+    assert_eq!(
+        fallback_trace,
+        (0, 2),
+        "repli qmv attendu sur les deux couches MoE"
+    );
+    assert_eq!(qmv_trace, (0, 0), "qmv: couches coop inattendues");
+    assert_eq!(fallback.data(), qmv.data(), "repli != qmv");
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const SYNTHETIC_COOP_PROMPT: [usize; 17] = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6, 1, 0, 4, 5, 7, 6];
+
+/// Prefill résident du prompt synthétique, bascule flint coop forcée, et
+/// couches MoE routées (coop exécuté, repli qmv faute de pipelines) comptées.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn traced_coop_prefill(gpu: &CausalDecoder, coop: bool) -> (Tensor, (usize, usize)) {
+    crate::metal_backend::with_flint_moe_coop_override(coop, || {
+        let (ran, fallback) = crate::metal_backend::routed_coop_trace_for_test();
+        let hidden = gpu
+            .prefill_hidden_for_test(
+                &SYNTHETIC_COOP_PROMPT,
+                Some(crate::runtime_flags::prefill_resident_chunk_tokens()),
+            )
+            .expect("invariant: prefill résident flint")
+            .expect("prefill résident flint attendu");
+        let (ran_after, fallback_after) = crate::metal_backend::routed_coop_trace_for_test();
+        (hidden, (ran_after - ran, fallback_after - fallback))
+    })
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1265,7 +1300,7 @@ fn flint_int4_metal_matches_mlx_oracle() {
     // position 3, qualifiée par la trace des experts choisis.
     let resident_with_router = |coop: bool| {
         crate::metal_backend::with_flint_moe_coop_override(coop, || {
-            crate::metal_backend::with_router_logits_capture(|| {
+            crate::metal_backend::with_router_capture(|| {
                 model.prefill_hidden_for_test(
                     &prompt_ids,
                     Some(crate::runtime_flags::prefill_resident_chunk_tokens()),
@@ -1310,14 +1345,14 @@ fn flint_int4_metal_matches_mlx_oracle() {
     // diffère entre coop et qmv doit être une quasi-égalité, c'est-à-dire un
     // écart entre le k-ième et le (k+1)-ième logit du qmv inférieur à la
     // perturbation coop des logits de routeur de cette ligne.
-    // NOTE: Mesuré le 30 oct. 2026 : 21 écarts sur 47 couches × 5 positions,
+    // NOTE: Mesuré le 30 oct. 2026 sur les indices du kernel : 21 écarts sur 47 couches × 5 positions,
     // tous des quasi-égalités. Premier écart couche MoE 10, position 4 (marge
     // 0,00056, perturbation 0,011) ; position 3 dès la couche 24 (0,0015 pour
     // 0,021), puis perturbation de 8 à 22 aux couches 44-46, d'où l'écart de
     // 14,4 / 2,1 de cette position.
-    let top_k = 6;
-    let experts = qmv_router[0].len() / prompt_ids.len();
     assert_eq!(coop_router.len(), qmv_router.len(), "couches MoE capturées");
+    let top_k = qmv_router[0].indices.len() / prompt_ids.len();
+    let experts = qmv_router[0].logits.len() / prompt_ids.len();
     let ranked = |logits: &[f32]| {
         let mut order = (0..logits.len()).collect::<Vec<_>>();
         order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
@@ -1326,20 +1361,24 @@ fn flint_int4_metal_matches_mlx_oracle() {
     let mut flipped_positions = vec![false; prompt_ids.len()];
     for (layer, (coop, qmv)) in coop_router.iter().zip(&qmv_router).enumerate() {
         for (position, flipped) in flipped_positions.iter_mut().enumerate() {
-            let span = position * experts..(position + 1) * experts;
-            let (coop, qmv) = (&coop[span.clone()], &qmv[span]);
-            let mut coop_set = ranked(coop)[..top_k].to_vec();
-            let qmv_order = ranked(qmv);
-            let mut qmv_set = qmv_order[..top_k].to_vec();
-            coop_set.sort_unstable();
-            qmv_set.sort_unstable();
+            // Écart qualifié sur les indices choisis par le kernel ; les
+            // logits ne servent qu'à mesurer marge et perturbation.
+            let chosen = |capture: &crate::metal_backend::RouterCapture| {
+                let mut set = capture.indices[position * top_k..(position + 1) * top_k].to_vec();
+                set.sort_unstable();
+                set
+            };
+            let (coop_set, qmv_set) = (chosen(coop), chosen(qmv));
             if coop_set == qmv_set {
                 continue;
             }
-            let margin = qmv[qmv_order[top_k - 1]] - qmv[qmv_order[top_k]];
-            let perturbation = coop
+            let span = position * experts..(position + 1) * experts;
+            let (coop_logits, qmv_logits) = (&coop.logits[span.clone()], &qmv.logits[span]);
+            let qmv_order = ranked(qmv_logits);
+            let margin = qmv_logits[qmv_order[top_k - 1]] - qmv_logits[qmv_order[top_k]];
+            let perturbation = coop_logits
                 .iter()
-                .zip(qmv)
+                .zip(qmv_logits)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f32, f32::max);
             println!(

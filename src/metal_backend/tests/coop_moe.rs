@@ -1564,31 +1564,3 @@ fn fused_dense_mlp_supported_rejects_offsets_dense_and_shape() -> Result<()> {
     );
     Ok(())
 }
-
-/// Éligibilité du coop routé u4 gs64 et repli qmv quand un pipeline groupé
-/// manque : le prefill résident doit retomber sur le gather au lieu d'échouer.
-#[test]
-fn routed_coop_falls_back_when_pipelines_missing() -> Result<()> {
-    let Some(mut executor) = test_executor()? else {
-        return Ok(());
-    };
-    let stacked = StackedMoeBuffers {
-        gate: test_stacked_affine_varied_u4_group(&executor, 2, 64, 64, 3)?,
-        up: test_stacked_affine_varied_u4_group(&executor, 2, 64, 64, 11)?,
-        down: test_stacked_affine_varied_u4_group(&executor, 2, 64, 64, 19)?,
-    };
-    assert!(
-        MetalMoeRoutedWeights::stacked_coop_compatible(&stacked),
-        "u4 gs64 attendu éligible au coop routé"
-    );
-    if executor.routed_coop_pipelines_ready(&stacked) {
-        executor.na_gemm_coop_qb_grouped_scatter_u4 = None;
-    } else {
-        eprintln!("pipelines coop groupés absents (macOS < 26 ?) : repli déjà actif");
-    }
-    assert!(
-        !executor.routed_coop_pipelines_ready(&stacked),
-        "scatter u4 absent : repli qmv attendu"
-    );
-    Ok(())
-}

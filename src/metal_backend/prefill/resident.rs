@@ -101,25 +101,47 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
-    /// Copies des logits de routeur `[rows, experts]` de chaque couche MoE
-    /// routée, actives seulement sous [`with_router_logits_capture`].
-    static ROUTER_LOGITS_CAPTURE: std::cell::RefCell<Option<Vec<(Buffer, usize)>>> =
+    /// Copies, par couche MoE routée, des logits de routeur `[rows, experts]`
+    /// et des indices top-k `[rows, top_k]` choisis par le kernel, actives
+    /// seulement sous [`with_router_capture`].
+    static ROUTER_CAPTURE: std::cell::RefCell<Option<Vec<RouterCaptureBuffers>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Exécute `run` en capturant, sur ce thread, les logits de routeur de chaque
-/// couche MoE routée du prefill résident (un morceau : lignes locales), dans
-/// l'ordre des couches. Sert à tracer les experts choisis par coop et qmv.
 #[cfg(test)]
-pub(crate) fn with_router_logits_capture<R>(run: impl FnOnce() -> R) -> Result<(R, Vec<Vec<f32>>)> {
-    ROUTER_LOGITS_CAPTURE.with(|capture| capture.replace(Some(Vec::new())));
+struct RouterCaptureBuffers {
+    logits: Buffer,
+    logits_len: usize,
+    indices: Buffer,
+    indices_len: usize,
+}
+
+/// Routeur d'une couche MoE capturé : logits `[rows, experts]` et indices
+/// top-k réellement sélectionnés `[rows, top_k]`.
+#[cfg(test)]
+pub(crate) struct RouterCapture {
+    pub logits: Vec<f32>,
+    pub indices: Vec<u32>,
+}
+
+/// Exécute `run` en capturant, sur ce thread, le routeur de chaque couche MoE
+/// routée du prefill résident (un morceau : lignes locales), dans l'ordre des
+/// couches. Sert à tracer les experts choisis par coop et qmv.
+#[cfg(test)]
+pub(crate) fn with_router_capture<R>(run: impl FnOnce() -> R) -> Result<(R, Vec<RouterCapture>)> {
+    ROUTER_CAPTURE.with(|capture| capture.replace(Some(Vec::new())));
     let result = run();
-    let captured = ROUTER_LOGITS_CAPTURE
+    let captured = ROUTER_CAPTURE
         .with(|capture| capture.take())
         .unwrap_or_default();
     let layers = captured
         .iter()
-        .map(|(buffer, len)| read_f32_buffer(buffer, *len))
+        .map(|layer| {
+            Ok(RouterCapture {
+                logits: read_f32_buffer(&layer.logits, layer.logits_len)?,
+                indices: read_u32_buffer(&layer.indices, layer.indices_len)?,
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok((result, layers))
 }
@@ -1756,15 +1778,24 @@ impl MetalExecutor {
                     )?;
                 }
                 #[cfg(test)]
-                if ROUTER_LOGITS_CAPTURE.with(|capture| capture.borrow().is_some()) {
-                    let len = checked_len(spec.seq, expert_count, "capture routeur")?;
-                    let copy = self.uncached_f32_buffer(len, "router_logits_capture")?;
+                if ROUTER_CAPTURE.with(|capture| capture.borrow().is_some()) {
+                    let logits_len = checked_len(spec.seq, expert_count, "capture routeur")?;
+                    let logits = self.uncached_f32_buffer(logits_len, "router_logits_capture")?;
+                    let indices = self.uncached_u32_buffer(total_topk, "router_indices_capture")?;
                     self.run_resident_prefill_section(context, "router_capture", |encoder, _| {
-                        self.encode_copy(encoder, &router_buffer, &copy, len)
+                        self.encode_copy(encoder, &router_buffer, &logits, logits_len)?;
+                        // Copie par demi-mots : les petits u32 seraient des
+                        // f32 dénormaux, qu'une copie f32 pourrait aplatir.
+                        self.encode_copy_u16(encoder, &indices_buffer, &indices, 2 * total_topk)
                     })?;
-                    ROUTER_LOGITS_CAPTURE.with(|capture| {
+                    ROUTER_CAPTURE.with(|capture| {
                         if let Some(layers) = capture.borrow_mut().as_mut() {
-                            layers.push((copy, len));
+                            layers.push(RouterCaptureBuffers {
+                                logits,
+                                logits_len,
+                                indices,
+                                indices_len: total_topk,
+                            });
                         }
                     });
                 }

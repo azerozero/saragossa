@@ -459,6 +459,19 @@ impl MetalExecutor {
         .all(|pso| pso.is_some())
     }
 
+    /// Vrai si la bibliothèque NA (MPP, macOS 26) compile sur cette machine :
+    /// les pipelines coop groupés en font partie et doivent alors exister.
+    #[cfg(test)]
+    pub(crate) fn na_library_available_for_test(&self) -> bool {
+        self.na_gemm_bf16.is_some()
+    }
+
+    /// Retire le pipeline scatter u4 du coop groupé pour exercer le repli qmv.
+    #[cfg(test)]
+    pub(crate) fn drop_routed_coop_scatter_u4_for_test(&mut self) {
+        self.na_gemm_coop_qb_grouped_scatter_u4 = None;
+    }
+
     /// Encode MoE routed-only prefill, experts routés sur tensor-cores, dans
     /// l'encoder appelant. Réutilise les buffers rows déjà alloués par le résident.
     ///
