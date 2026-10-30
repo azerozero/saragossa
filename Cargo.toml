@@ -37,7 +37,7 @@ devtools = []
 thiserror = "2"
 safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
 rayon = "1"
 bytemuck = "1"

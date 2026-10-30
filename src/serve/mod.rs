@@ -13,6 +13,7 @@ mod audio;
 mod cache;
 mod embeddings;
 pub(crate) mod error;
+mod flint_output;
 mod http;
 mod model_selection;
 pub(crate) mod mtp;

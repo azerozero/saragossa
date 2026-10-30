@@ -514,6 +514,7 @@ fn encode_prompt_ids(assets: &ModelAssets, prompt: &str, raw: bool) -> CliResult
     } else if assets.config.is_flint() {
         assets.encode_prompt(&render_flint_chat(
             &[ChatTemplateMessage::new("user", prompt)],
+            &[],
             true,
         ))?
     } else if assets.config.is_gemma4() {

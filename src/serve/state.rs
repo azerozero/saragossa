@@ -204,6 +204,21 @@ impl ServeState {
         Ok(completion)
     }
 
+    /// Le modèle `model` écrit-il au format flint (`<think>`, `<tool_call>`
+    /// XML) ? Le charge au besoin, comme la complétion qui suit.
+    pub(super) fn model_is_flint(&mut self, model: &str) -> ServeResult<bool> {
+        let index = self
+            .models
+            .iter()
+            .position(|slot| slot.id == model)
+            .ok_or_else(|| ServeError::UnknownModel(model.to_string()))?;
+        self.ensure_loaded_index(index)?;
+        Ok(self.models[index]
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| loaded.assets.config.is_flint()))
+    }
+
     fn ensure_loaded_index(&mut self, index: usize) -> ServeResult<()> {
         if self.models[index].loaded.is_some() {
             return Ok(());
@@ -704,7 +719,12 @@ impl LoadedModel {
             normalize_qwen_assistant_history(&mut messages);
         }
         let rendered = if self.assets.config.is_flint() {
-            render_flint_chat(&messages, true)
+            let tools: Vec<String> = request
+                .active_tools()?
+                .iter()
+                .map(|tool| tool.json.clone())
+                .collect();
+            render_flint_chat(&messages, &tools, true)
         } else if self.assets.config.is_gemma4() {
             render_gemma4_chat(&messages, true, false)
         } else if self.assets.config.is_gemma() {

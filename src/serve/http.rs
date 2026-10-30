@@ -18,8 +18,9 @@ use super::anthropic::{handle_anthropic_messages, send_anthropic_error};
 use super::audio::{handle_speech, handle_transcription};
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
+use super::flint_output::{FlintEvent, FlintOutputParser};
 use super::protocol::{
-    json_bytes, sse_done, sse_event, ChatCompletionChunk, ChatCompletionRequest,
+    json_bytes, sse_done, sse_event, AssistantMessage, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, HealthResponse, StreamErrorEvent,
 };
 use super::state::ServeState;
@@ -222,20 +223,70 @@ fn handle_chat<S: Write>(
     chat.max_tokens_capped(state.max_tokens_cap())?;
     chat.response_format_mode()?;
     let session_key = chat.session_key(request.header(SESSION_HEADER));
+    // NOTE: `tools` et `tool_choice` ne servent qu'à flint ; les autres
+    // familles les ignorent, comme avant.
+    let flint = if state.model_is_flint(&chat.model)? {
+        let tools = chat
+            .active_tools()?
+            .iter()
+            .map(|tool| tool.value.clone())
+            .collect();
+        Some(FlintOutputParser::new(tools, chat.parallel_tool_calls()))
+    } else {
+        None
+    };
     let stream_enabled = chat.stream;
     if stream_enabled {
-        send_sse_streaming(stream, state, chat, session_key)
+        send_sse_streaming(stream, state, chat, session_key, flint)
     } else {
         let completion = state.complete(chat, session_key.as_deref())?;
         let headers = completion.metric_headers();
+        let mut finish_reason = completion.finish_reason;
+        let message = if let Some(parser) = flint {
+            let output = parser.parse(&completion.content);
+            finish_reason = flint_finish_reason(finish_reason, !output.tool_calls.is_empty());
+            let content = if output.content.is_empty() && !output.tool_calls.is_empty() {
+                None
+            } else {
+                Some(output.content)
+            };
+            AssistantMessage::new(content, output.reasoning, output.tool_calls)
+        } else {
+            AssistantMessage::text(completion.content)
+        };
         let response = ChatCompletionResponse::new(
             &completion.model,
-            completion.content,
-            completion.finish_reason,
+            message,
+            finish_reason,
             completion.usage,
         );
         send_json(stream, 200, &response, headers)
     }
+}
+
+/// `stop` devient `tool_calls` quand le tour a appelé des outils (SGLang).
+fn flint_finish_reason(finish_reason: &'static str, has_tool_calls: bool) -> &'static str {
+    if has_tool_calls && finish_reason == "stop" {
+        "tool_calls"
+    } else {
+        finish_reason
+    }
+}
+
+fn write_flint_events<S: Write>(
+    stream: &mut S,
+    model: &str,
+    events: Vec<FlintEvent>,
+) -> ServeResult<()> {
+    for event in events {
+        let chunk = match event {
+            FlintEvent::Reasoning(text) => ChatCompletionChunk::reasoning(model, text),
+            FlintEvent::Content(text) => ChatCompletionChunk::content(model, text),
+            FlintEvent::ToolCall(call) => ChatCompletionChunk::tool_call(model, call),
+        };
+        write_sse_event(stream, &chunk)?;
+    }
+    Ok(())
 }
 
 fn send_sse_streaming<S: Write>(
@@ -243,6 +294,7 @@ fn send_sse_streaming<S: Write>(
     state: &mut ServeState,
     chat: ChatCompletionRequest,
     session_key: Option<String>,
+    mut flint: Option<FlintOutputParser>,
 ) -> ServeResult<()> {
     let mut stream_started = false;
     let mut stream_model = String::new();
@@ -265,10 +317,13 @@ fn send_sse_streaming<S: Write>(
             if delta.is_empty() {
                 return Ok(());
             }
-            write_sse_event(
-                stream,
-                &ChatCompletionChunk::content(&stream_model, delta.to_string()),
-            )?;
+            match flint.as_mut() {
+                Some(parser) => write_flint_events(stream, &stream_model, parser.push(delta))?,
+                None => write_sse_event(
+                    stream,
+                    &ChatCompletionChunk::content(&stream_model, delta.to_string()),
+                )?,
+            }
             stream.flush().map_err(|e| ServeError::io("flush SSE", e))
         }
         CompletionStreamEvent::TerminalError(error) => {
@@ -287,9 +342,14 @@ fn send_sse_streaming<S: Write>(
         }
         Err(error) => return Err(error),
     };
+    let mut finish_reason = completion.finish_reason;
+    if let Some(parser) = flint.as_mut() {
+        write_flint_events(stream, &completion.model, parser.finish())?;
+        finish_reason = flint_finish_reason(finish_reason, parser.has_tool_calls());
+    }
     write_sse_event(
         stream,
-        &ChatCompletionChunk::done(&completion.model, completion.finish_reason),
+        &ChatCompletionChunk::done(&completion.model, finish_reason),
     )?;
     stream
         .write_all(&sse_done())
