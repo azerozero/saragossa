@@ -74,6 +74,8 @@ pub(crate) use self::shared_rows::{
 mod na_gemm;
 mod pipelines;
 mod prefill;
+#[cfg(test)]
+pub(crate) use self::prefill::with_prefill_kv_layout_override;
 pub(crate) use self::prefill::with_prefill_kv_reserve;
 mod profiling;
 mod scratch;
@@ -776,16 +778,35 @@ pub(crate) enum PrefillResidentPrefixLayer<'a> {
     },
 }
 
+/// Ce que portent `key`/`value` d'un [`PrefillResidentLayerCache::Full`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrefillKvPlacement {
+    /// Les lignes nouvelles seules (ou tout un prefill à froid) : elles
+    /// s'ajoutent aux segments du cache.
+    Appended,
+    /// Tout le K/V, préfixe recopié compris, en vue entière d'un buffer neuf.
+    CopiedPrefix,
+    /// Tout le K/V, en vue entière de la même allocation que le préfixe,
+    /// dérivée de sa vue : les lignes nouvelles y ont été écrites en place
+    /// sous claim, sans copie ni nouvelle réserve.
+    ExtendedInPlace,
+}
+
+impl PrefillKvPlacement {
+    /// `key`/`value` remplacent les segments du cache au lieu de s'y ajouter
+    /// (les snapshots gardent les leurs).
+    pub(crate) fn replaces_segments(self) -> bool {
+        self != Self::Appended
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum PrefillResidentLayerCache {
-    /// `replaces_prefix` : `key`/`value` portent tout le K/V (préfixe recopié
-    /// compris, vue entière d'un buffer neuf) et remplacent les segments du
-    /// cache au lieu de s'y ajouter.
     Full {
         key: PrefillKvRows,
         value: PrefillKvRows,
         kv_dim: usize,
-        replaces_prefix: bool,
+        placement: PrefillKvPlacement,
     },
     Linear {
         state: LinearAttentionMetalState,

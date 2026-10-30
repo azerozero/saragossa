@@ -200,16 +200,14 @@ impl KvRows {
         }
     }
 
-    /// Buffer bf16 dont le premier segment est la vue entière (non tronquée,
-    /// depuis le début) et nombre d'éléments de cette vue : une arène de
-    /// decode peut l'adopter et écrire à la suite, aucune vue ne couvrant
-    /// d'élément au-delà (cf. `FullAttentionMetalState::full_attention_adopting`).
+    /// Premier segment, vue bf16 entière (depuis le début, qu'aucune vue
+    /// vivante ne dépasse) : une arène de decode peut adopter son buffer et
+    /// écrire à la suite. Simple indice : l'adoption le revalide sous claim
+    /// (`DecodeResidentState::full_attention_adopting`).
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub(super) fn adoptable_bf16_prefix(&self) -> Option<(metal::Buffer, usize)> {
+    pub(super) fn adoptable_bf16_prefix(&self) -> Option<&crate::metal_backend::SharedBf16Rows> {
         match self.segments.first().map(AsRef::as_ref) {
-            Some(Segment::SharedBf16(rows)) if rows.is_whole() => {
-                Some((rows.buffer().to_owned(), rows.len()))
-            }
+            Some(Segment::SharedBf16(rows)) if rows.is_whole() => Some(rows),
             _ => None,
         }
     }
@@ -360,14 +358,27 @@ mod tests {
         let view = unsafe { crate::metal_backend::SharedBf16Rows::new(buffer, 0, 16)? };
         let mut rows = KvRows::default();
         rows.push_prefill(crate::metal_backend::PrefillKvRows::SharedBf16(view));
-        assert_eq!(rows.adoptable_bf16_prefix().map(|(_, len)| len), Some(16));
+        assert_eq!(
+            rows.adoptable_bf16_prefix().map(|prefix| prefix.len()),
+            Some(16)
+        );
         let mut truncated = rows.clone();
         truncated.truncate(8);
         assert!(truncated.adoptable_bf16_prefix().is_none());
         assert!(rows.adoptable_bf16_prefix().is_some());
         // Une queue possédée après la vue n'empêche pas l'adoption du préfixe.
         rows.push_owned_bf16(vec![0; 8]);
-        assert_eq!(rows.adoptable_bf16_prefix().map(|(_, len)| len), Some(16));
+        assert_eq!(
+            rows.adoptable_bf16_prefix().map(|prefix| prefix.len()),
+            Some(16)
+        );
+        // Rollback (`CausalDecoderCache::truncate`) : l'état tronqué redevient
+        // prolongeable en place dès qu'aucune vue plus longue ne vit.
+        drop(rows);
+        assert_eq!(
+            truncated.adoptable_bf16_prefix().map(|prefix| prefix.len()),
+            Some(8)
+        );
         Ok(())
     }
 }

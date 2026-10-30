@@ -3304,3 +3304,203 @@ fn kv_quant_logit_drift_vs_bf16_real_model() -> Result<()> {
     );
     Ok(())
 }
+
+/// Poids d'un Qwen dense synthétique à une couche full-attention d256
+/// (16 têtes Q, 2 K/V, QK-norm, MLP SwiGLU) : la forme qu'emprunte le
+/// prefill résident par morceaux avec K/V stocké en bf16 (NAX d256).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn resident_bf16_qwen_weights(vocab: usize, hidden: usize) -> Result<HashMap<String, Tensor>> {
+    let (q_heads, kv_heads, head_dim, inter) = (16, 2, 256, 32);
+    let tensor = |rows: usize, cols: usize, seed: usize, scale: f32| {
+        let data = (0..rows * cols)
+            .map(|i| ((i * 7919 + seed * 104_729) as f32 * 0.000_37).sin() * scale)
+            .collect();
+        if cols == 1 {
+            Tensor::from_vec(vec![rows], data)
+        } else {
+            Tensor::from_vec(vec![rows, cols], data)
+        }
+    };
+    let norm = |dim: usize, seed: usize| {
+        Tensor::from_vec(
+            vec![dim],
+            (0..dim)
+                .map(|i| 1.0 + ((i + seed) as f32 * 0.37).sin() * 0.1)
+                .collect(),
+        )
+    };
+    let mut weights = HashMap::new();
+    for (name, value) in [
+        ("embed_tokens.weight", tensor(vocab, hidden, 1, 0.5)?),
+        ("layers.0.input_layernorm.weight", norm(hidden, 2)?),
+        (
+            "layers.0.self_attn.q_proj.weight",
+            tensor(q_heads * head_dim, hidden, 3, 0.06)?,
+        ),
+        (
+            "layers.0.self_attn.k_proj.weight",
+            tensor(kv_heads * head_dim, hidden, 4, 0.06)?,
+        ),
+        (
+            "layers.0.self_attn.v_proj.weight",
+            tensor(kv_heads * head_dim, hidden, 5, 0.06)?,
+        ),
+        (
+            "layers.0.self_attn.o_proj.weight",
+            tensor(hidden, q_heads * head_dim, 6, 0.02)?,
+        ),
+        ("layers.0.self_attn.q_norm.weight", norm(head_dim, 7)?),
+        ("layers.0.self_attn.k_norm.weight", norm(head_dim, 8)?),
+        ("layers.0.post_attention_layernorm.weight", norm(hidden, 9)?),
+        (
+            "layers.0.mlp.gate_proj.weight",
+            tensor(inter, hidden, 10, 0.1)?,
+        ),
+        (
+            "layers.0.mlp.up_proj.weight",
+            tensor(inter, hidden, 11, 0.1)?,
+        ),
+        (
+            "layers.0.mlp.down_proj.weight",
+            tensor(hidden, inter, 12, 0.1)?,
+        ),
+        ("norm.weight", norm(hidden, 13)?),
+        ("lm_head.weight", tensor(vocab, hidden, 14, 0.1)?),
+    ] {
+        weights.insert(name.to_string(), value);
+    }
+    Ok(weights)
+}
+
+/// Parcours multi-tours par le vrai cache de préfixe du décodeur
+/// (`prefill_cache_state` → `prefix_cache_get`/`prefix_cache_put`,
+/// `PrefillKvPlacement` raccordé à `replace_prefill`) :
+/// - tour 2 prolongé en place dans l'allocation du tour 1, K/V identique au
+///   prefill à froid, snapshot du tour 1 conservé ;
+/// - entrée ancienne prolongée sur une autre branche sous une vue plus
+///   longue : copie, lignes publiées intactes, entrées remplacées libérées ;
+/// - rollback (troncature du cache) puis prolongement : de nouveau en place.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
+    if !prefix_cache_enabled()
+        || prefix_cache_capacity() < 2
+        || !crate::runtime_flags::prefill_kv_shared_enabled()
+    {
+        return Ok(());
+    }
+    const VOCAB: usize = 97;
+    const HIDDEN: usize = 64;
+    const KV_DIM: usize = 2 * 256;
+    let config = CausalDecoderConfig {
+        num_attention_heads: 16,
+        num_key_value_heads: 2,
+        head_dim: Some(256),
+        rope_theta: Some(10_000_000.0),
+        ..CausalDecoderConfig::default()
+    };
+    let model =
+        match CausalDecoder::from_tensors(resident_bf16_qwen_weights(VOCAB, HIDDEN)?, config)?
+            .with_metal_runtime()
+        {
+            Ok(model) => model,
+            Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
+            Err(error) => return Err(error),
+        };
+    let ids = |len: usize, step: usize, offset: usize| -> Vec<usize> {
+        (0..len).map(|i| (i * step + offset) % VOCAB).collect()
+    };
+    let tokens = ids(1200, 31, 7);
+    let (p1, p2) = (&tokens[..1100], &tokens[..1200]);
+    let branch = [p1, &ids(100, 17, 3)].concat();
+    let p3 = [&tokens[..1150], &ids(60, 13, 5)].concat();
+    // Vue bf16 unique de K et de V : (allocations K/V, éléments). K et V
+    // doivent suivre le même placement (même allocation propre, même longueur).
+    let sole_view = |cache: &CausalDecoderCache| {
+        let layer = &cache.layers[0];
+        match (
+            layer.keys.segments().as_slice(),
+            layer.values.segments().as_slice(),
+        ) {
+            (
+                [crate::decode_resident::KvSegment::SharedBf16(keys)],
+                [crate::decode_resident::KvSegment::SharedBf16(values)],
+            ) if keys.len() == values.len() => {
+                Some(((keys.allocation_id(), values.allocation_id()), keys.len()))
+            }
+            _ => None,
+        }
+    };
+    let kv = |cache: &CausalDecoderCache| cache.layer_kv_for_test(0);
+    let cold = |prompt: &[usize]| -> Result<_> {
+        Ok(kv(&model.prefill_prompt_state_uncached(prompt)?.cache))
+    };
+    let cached = || -> Result<Vec<Vec<usize>>> {
+        let cache = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+        Ok(cache
+            .entries
+            .iter()
+            .map(|entry| entry.tokens.clone())
+            .collect())
+    };
+
+    // Morceaux de 512 et stockage bf16 dès la première ligne : le chemin de
+    // production des longs prompts, à l'échelle d'un modèle synthétique.
+    crate::metal_backend::with_prefill_kv_layout_override(512, 0, || -> Result<()> {
+        let (turn1, _) = model.prefill_cache_state(p1)?;
+        let Some((home, len)) = sole_view(&turn1) else {
+            eprintln!("prolongement en place du décodeur sauté : K/V bf16 indisponible (NAX)");
+            return Ok(());
+        };
+        assert_eq!(len, 1100 * KV_DIM);
+        let turn1_kv = kv(&turn1);
+
+        // Tour 2 : hit sur l'entrée du tour 1, prolongée en place.
+        let (turn2, _) = model.prefill_cache_state(p2)?;
+        assert_eq!(
+            sole_view(&turn2),
+            Some((home, 1200 * KV_DIM)),
+            "tour 2 en place"
+        );
+        assert_eq!(kv(&turn2), cold(p2)?, "tour 2 : K/V vs froid");
+        assert_eq!(
+            cached()?,
+            vec![p2.to_vec(), p1.to_vec()],
+            "snapshot du tour 1 gardé"
+        );
+        assert_eq!(kv(&turn1), turn1_kv, "état du tour 1 intact");
+
+        // Autre branche depuis l'entrée du tour 1 : une vue plus longue vit
+        // (tour 2), le prolongement recopie sans toucher aux lignes publiées.
+        let turn2_kv = kv(&turn2);
+        let (branched, _) = model.prefill_cache_state(&branch)?;
+        let (copy, _) = sole_view(&branched).expect("vue entière d'un buffer neuf");
+        assert_ne!(copy, home, "branche recopiée");
+        assert_eq!(kv(&branched), cold(&branch)?, "branche : K/V vs froid");
+        assert_eq!(kv(&turn2), turn2_kv, "lignes publiées intactes");
+        // Les entrées de l'allocation remplacée sont libérées.
+        assert_eq!(cached()?, vec![branch.clone()]);
+        drop((turn1, branched));
+
+        // Rollback du tour 2 à 1150 positions, mémorisé, puis prolongé :
+        // plus aucune vue ne couvre au-delà, le prolongement reste en place.
+        let mut rolled = turn2;
+        for layer in &mut rolled.layers {
+            layer.truncate(1150)?;
+        }
+        rolled.position = 1150;
+        let final_state = Tensor::row(vec![0.0; HIDDEN])?;
+        model.prefix_cache_put(&p3[..1150], &(rolled, final_state), None, None)?;
+        let (turn3, _) = model.prefill_cache_state(&p3)?;
+        assert_eq!(
+            sole_view(&turn3),
+            Some((home, 1210 * KV_DIM)),
+            "rollback puis prolongement en place"
+        );
+        assert_eq!(kv(&turn3), cold(&p3)?, "rollback : K/V vs froid");
+        Ok(())
+    })
+}

@@ -1009,7 +1009,8 @@ impl CausalDecoder {
             return Ok(());
         };
         // Une couche dont les buffers du prefill ont la place sera adoptée,
-        // sans allocation ; si l'adoption échoue (droit d'écriture déjà pris),
+        // sans allocation ; si l'adoption échoue ensuite (droit d'écriture
+        // déjà pris, vue plus longue publiée entre-temps),
         // `resident_full_attention_state` revérifie le budget avant d'allouer.
         let element = crate::decode_resident::kv_element_bytes(kv_bf16);
         let mut kv_bytes = 0_u64;
@@ -1108,35 +1109,36 @@ fn resident_full_attention_state(
     let (keys, values) = (layer_cache.keys.segments(), layer_cache.values.segments());
     let kv_dim = kv_heads * head_dim;
     let adoptable = layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16, sliding);
-    if let (true, Some((key_buffer, key_len)), Some((value_buffer, value_len))) = (
+    if let (true, Some(key_prefix), Some(value_prefix)) = (
         adoptable,
         layer_cache.keys.adoptable_bf16_prefix(),
         layer_cache.values.adoptable_bf16_prefix(),
     ) {
-        if key_len == value_len && kv_dim > 0 && key_len % kv_dim == 0 {
-            if let Some(mut full) = arena.full_attention_adopting(
-                capacity,
-                q_heads,
-                kv_heads,
-                head_dim,
-                kv_bf16,
-                [key_buffer, value_buffer],
-                key_len / kv_dim,
-            )? {
-                full.seed_segments(&keys[1..], &values[1..], prefill_len)?;
-                if crate::decoder::flags::trace_resident_enabled() {
-                    eprintln!(
-                        "kv résident adopté : préfixe {} lignes, {} semées",
-                        key_len / kv_dim,
-                        prefill_len - key_len / kv_dim
-                    );
-                }
-                return Ok(full);
+        if let Some(mut full) = arena.full_attention_adopting(
+            capacity,
+            q_heads,
+            kv_heads,
+            head_dim,
+            kv_bf16,
+            [key_prefix, value_prefix],
+        )? {
+            let floor = full.len();
+            full.seed_segments(&keys[1..], &values[1..], prefill_len)?;
+            if crate::decoder::flags::trace_resident_enabled() {
+                eprintln!(
+                    "kv résident adopté : préfixe {floor} lignes, {} semées",
+                    prefill_len - floor
+                );
             }
+            return Ok(full);
         }
     }
-    // Allocation que la garde a supposée évitée : budget revérifié.
-    if let (true, Some(guard)) = (adoptable, budget) {
+    // Budget revérifié avant toute allocation de repli, quel que soit
+    // l'indice `adoptable` : il change entre l'estimation de la garde et ici
+    // (un prolongement en place publie une vue plus longue, une arène prend
+    // la réserve), et une couche que la garde a crue adoptée n'a pas été
+    // comptée.
+    if let Some(guard) = budget {
         guard
             .check_allocation(checked_bytes(
                 &[2, capacity, kv_dim],
@@ -1175,7 +1177,108 @@ fn layer_adoptable(
         && bytes.is_some_and(|bytes| {
             [&layer_cache.keys, &layer_cache.values].iter().all(|rows| {
                 rows.adoptable_bf16_prefix()
-                    .is_some_and(|(buffer, _)| buffer.length() >= bytes)
+                    .is_some_and(|prefix| prefix.buffer().length() >= bytes)
             })
         })
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod tests {
+    use super::*;
+    use crate::decoder::attention_ops::AttentionLayout;
+
+    /// Course entre la garde mémoire et l'adoption : la couche était
+    /// adoptable à l'estimation (K/V hors budget), puis un prolongement en
+    /// place publie une vue plus longue. L'adoption refuse, et l'allocation de
+    /// repli repasse par la garde au lieu de la contourner.
+    #[test]
+    fn fallback_allocation_rechecks_budget_after_adoption_race() -> Result<()> {
+        let Some(device) = metal::Device::system_default() else {
+            return Ok(());
+        };
+        if !crate::decode_resident::kv_bf16_dense_by_default() {
+            return Ok(());
+        }
+        let arena = DecodeResidentState::new(device.clone())?;
+        let (q_heads, kv_heads, head_dim) = (8, 2, 128);
+        let kv_dim = kv_heads * head_dim;
+        let (prefix, published, capacity) = (5, 7, 10);
+        let buffer = || {
+            device.new_buffer(
+                (capacity * kv_dim * std::mem::size_of::<u16>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        // SAFETY: buffers neufs propres au test, mis à zéro par Metal ; seule
+        // la réserve, hors des vues, serait écrite, sous claim.
+        #[expect(unsafe_code, reason = "vues partagées sur des buffers de test")]
+        let (key, value) = unsafe {
+            (
+                crate::metal_backend::SharedBf16Rows::new(buffer(), 0, prefix * kv_dim)?,
+                crate::metal_backend::SharedBf16Rows::new(buffer(), 0, prefix * kv_dim)?,
+            )
+        };
+        let layout = AttentionLayout {
+            num_attention_heads: q_heads,
+            num_key_value_heads: kv_heads,
+            head_dim,
+            rope_dims: head_dim,
+            attn_scalar: head_dim as f32,
+            sliding_window: None,
+        };
+        let mut layer_cache = LayerKvCache::default();
+        layer_cache.append_prefill(
+            crate::metal_backend::PrefillKvRows::SharedBf16(key.clone()),
+            crate::metal_backend::PrefillKvRows::SharedBf16(value.clone()),
+            kv_dim,
+            &layout,
+        )?;
+        // Estimation de la garde : couche adoptée, K/V hors budget.
+        assert!(layer_adoptable(&layer_cache, capacity, kv_dim, true, false));
+        // Prolongement en place publié entre l'estimation et l'adoption.
+        let claim = crate::metal_backend::InPlaceClaim::try_after([&key, &value])
+            .expect("invariant: réserve libre");
+        // SAFETY: lignes réservées mises à zéro par Metal, aucune commande en
+        // vol ; seule la fin publiée compte ici.
+        #[expect(unsafe_code, reason = "publication de lignes sous claim")]
+        let longer = unsafe {
+            (
+                key.extended(&claim, published * kv_dim)?,
+                value.extended(&claim, published * kv_dim)?,
+            )
+        };
+        drop(claim);
+        let refusing = MemoryGuard::from_limits(
+            true,
+            crate::memory_guard::MemoryLimits {
+                static_cap: Some(1),
+                host_memory: None,
+                headroom_bytes: 0,
+                metal_cap: None,
+            },
+            std::sync::Arc::new(|| Some(0)),
+        );
+        let state = |budget| {
+            resident_full_attention_state(
+                &arena,
+                &layer_cache,
+                (capacity, prefix),
+                (q_heads, kv_heads, head_dim),
+                true,
+                false,
+                budget,
+            )
+        };
+        assert!(
+            matches!(state(Some(&refusing)), Err(InferError::MemoryGuard(_))),
+            "allocation de repli hors budget"
+        );
+        // Sans garde, le repli alloue et sème une arène propre.
+        let fallback = state(None)?;
+        assert_ne!(
+            fallback.keys().buffer().contents(),
+            longer.0.buffer().contents()
+        );
+        Ok(())
+    }
 }

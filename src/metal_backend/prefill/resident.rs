@@ -56,36 +56,65 @@ pub(crate) fn with_prefill_kv_reserve<R>(rows: usize, run: impl FnOnce() -> R) -
     run()
 }
 
-/// `segments` est-il exactement la vue entière (non tronquée) de `buffer`,
-/// en bf16 si `bf16`, sinon en f32 ?
-fn is_sole_view_of(segments: &[KvSegment<'_>], buffer: &BufferRef, bf16: bool) -> bool {
-    let (view, whole) = match (segments, bf16) {
-        ([KvSegment::Shared(rows)], false) => (rows.buffer(), rows.is_whole()),
-        ([KvSegment::SharedBf16(rows)], true) => (rows.buffer(), rows.is_whole()),
-        _ => return false,
-    };
-    // Identité de l'objet, valable aussi sans pointeur CPU (stockage privé).
-    whole && allocation_identity(view) == allocation_identity(buffer)
+#[cfg(test)]
+thread_local! {
+    /// Morceaux et seuil du stockage bf16 imposés par un test du décodeur,
+    /// cf. [`with_prefill_kv_layout_override`].
+    static PREFILL_KV_LAYOUT_OVERRIDE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
-/// Buffers K/V d'un préfixe réutilisables pour un
-/// prolongement jusqu'à `seq` lignes : ils portent le préfixe depuis leur
-/// début (vérifié sur les pointeurs), ont la place des lignes nouvelles et la
-/// vue du préfixe est entière (`is_whole`). Aucune vue ne couvre alors les
-/// lignes réservées (un prolongement les relit dans un `Vec`) : un état
-/// tronqué sous une vue encore vivante ne passe pas par ici. Deux
-/// clones d'un même état prolongés en même temps se disputeraient la réserve
-/// (l'un l'écraserait pendant la relecture de l'autre) : le premier la
-/// réserve dans `claims` jusqu'à la fin du prefill, le second recopie.
+/// Exécute `run` avec, sur ce thread, des morceaux de prefill d'au plus
+/// `chunk_tokens` et le K/V stocké en bf16 dès `bf16_min_rows` lignes (si le
+/// NAX existe) : un modèle synthétique de quelques centaines de tokens
+/// emprunte alors, via le décodeur, les chemins que la production ne prend
+/// qu'au-delà de 4096 tokens et du seuil bf16 (`OnceLock` de
+/// `runtime_flags`, non réglables dans le processus de test).
+#[cfg(test)]
+pub(crate) fn with_prefill_kv_layout_override<R>(
+    chunk_tokens: usize,
+    bf16_min_rows: usize,
+    run: impl FnOnce() -> R,
+) -> R {
+    /// Rétablit le réglage précédent, panique comprise.
+    struct Restore(Option<(usize, usize)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREFILL_KV_LAYOUT_OVERRIDE.with(|layout| layout.set(self.0));
+        }
+    }
+    let _restore = Restore(
+        PREFILL_KV_LAYOUT_OVERRIDE
+            .with(|layout| layout.replace(Some((chunk_tokens, bf16_min_rows)))),
+    );
+    run()
+}
+
+/// Réserve des buffers K/V d'un préfixe pour un prolongement en place
+/// jusqu'à `seq` lignes : `in_place` désigne ces buffers, le préfixe en est
+/// la vue unique depuis leur début, ils ont la place des lignes nouvelles et,
+/// **sous le claim**, aucune vue vivante de leur allocation (snapshot plus
+/// long, prolongement concurrent déjà publié) ne couvre la réserve
+/// ([`InPlaceClaim::try_after`]). Sinon `None` : l'appelant recopie.
+///
+/// Seul un préfixe bf16 rend une vue entière `[0, seq)` du même buffer
+/// (`PrefillKvPlacement::ExtendedInPlace`), prolongeable en place au tour
+/// suivant.
+// NOTE: restent hors du prolongement multi-tours en place, chacun correct :
+// - un préfixe f32 relit ses lignes nouvelles en `Vec` sous le claim (deux
+//   segments, le tour suivant recopie) ;
+// - l'état après decode (`release_suffix_arena`) ajoute un segment f32
+//   possédé : il n'a plus de vue unique et recopie ;
+// - les couches à sinks (flint) n'ont pas de stockage bf16 ;
+// - une réserve épuisée (queue ou decode plus longs que la réserve) recopie
+//   dans un buffer neuf.
 fn prefix_kv_in_place(
     in_place: Option<&[Buffer; 2]>,
     key: &[KvSegment<'_>],
     value: &[KvSegment<'_>],
     seq: usize,
     (kv_dim, bf16): (usize, bool),
-    claims: &mut Vec<InPlaceClaim>,
-) -> Result<Option<[Buffer; 2]>> {
-    let Some([key_buffer, value_buffer]) = in_place else {
+) -> Result<Option<([Buffer; 2], InPlaceReuse)>> {
+    let Some(buffers @ [key_buffer, value_buffer]) = in_place else {
         return Ok(None);
     };
     let needed_len = checked_len(seq, kv_dim, "prolongement en place")?;
@@ -94,19 +123,33 @@ fn prefix_kv_in_place(
     } else {
         byte_len::<f32>(needed_len)?
     };
-    let fits = |buffer: &Buffer| buffer.length() >= needed;
-    if !(fits(key_buffer)
-        && fits(value_buffer)
-        && is_sole_view_of(key, key_buffer, bf16)
-        && is_sole_view_of(value, value_buffer, bf16))
-    {
+    if key_buffer.length() < needed || value_buffer.length() < needed {
         return Ok(None);
     }
-    let Some(claim) = InPlaceClaim::try_new([key_buffer, value_buffer]) else {
-        return Ok(None);
+    // Identité de l'objet, valable aussi sans pointeur CPU (stockage privé).
+    let same = |view: &BufferRef, buffer: &Buffer| {
+        allocation_identity(view) == allocation_identity(buffer)
     };
-    claims.push(claim);
-    Ok(Some([key_buffer.clone(), value_buffer.clone()]))
+    let reuse = match (key, value, bf16) {
+        ([KvSegment::SharedBf16(key)], [KvSegment::SharedBf16(value)], true)
+            if same(key.buffer(), key_buffer) && same(value.buffer(), value_buffer) =>
+        {
+            InPlaceClaim::try_after([*key, *value]).map(|claim| InPlaceReuse {
+                claim,
+                bf16_prefix: Some([(*key).clone(), (*value).clone()]),
+            })
+        }
+        ([KvSegment::Shared(key)], [KvSegment::Shared(value)], false)
+            if same(key.buffer(), key_buffer) && same(value.buffer(), value_buffer) =>
+        {
+            InPlaceClaim::try_after([*key, *value]).map(|claim| InPlaceReuse {
+                claim,
+                bf16_prefix: None,
+            })
+        }
+        _ => None,
+    };
+    Ok(reuse.map(|reuse| (buffers.clone(), reuse)))
 }
 
 /// Copie GPU d'un segment partagé du préfixe vers le K/V d'un prolongement
@@ -273,6 +316,10 @@ impl MetalExecutor {
                 "prefill résident prolongé hors périmètre".to_string(),
             ));
         }
+        #[cfg(test)]
+        let layout_override = PREFILL_KV_LAYOUT_OVERRIDE.with(Cell::get);
+        #[cfg(test)]
+        let chunk_tokens = layout_override.map_or(chunk_tokens, |(chunk, _)| chunk);
         let chunk_rows = self.resident_prefill_chunk_rows(layers, rows, chunk_tokens);
         let chunk_count = rows.div_ceil(chunk_rows);
         let mut kernel_timing = if profile_sections {
@@ -350,10 +397,10 @@ impl MetalExecutor {
         let bf16_mirror = self.prefill_kv_bf16_mirror && chunked_nax;
         // Le NAX lit déjà ce K/V en bf16 et l'arène d'un prompt de cette
         // longueur sera bf16 : le stocker arrondi ne change aucun octet lu.
-        let bf16_store = chunked_nax
-            && self
-                .prefill_kv_bf16_store_min_rows
-                .is_some_and(|min_rows| spec.seq >= min_rows);
+        let bf16_min_rows = self.prefill_kv_bf16_store_min_rows;
+        #[cfg(test)]
+        let bf16_min_rows = layout_override.map_or(bf16_min_rows, |(_, min_rows)| Some(min_rows));
+        let bf16_store = chunked_nax && bf16_min_rows.is_some_and(|min_rows| spec.seq >= min_rows);
         // Réserve d'un K/V écrit dans un buffer neuf (prefill à froid, préfixe
         // recopié) : la demande de l'appelant pour un K/V bf16, adoptable par
         // l'arène ; jamais adopté en f32, il garde la réserve minimale.
@@ -369,8 +416,6 @@ impl MetalExecutor {
         // faute de page par 16 Kio.
         let mut prefix_copies = Vec::new();
         let mut layer_cache_buffers = Vec::with_capacity(layers.len());
-        // Tenus jusqu'à la relecture des lignes nouvelles, en fin de fonction.
-        let mut in_place_claims = Vec::new();
         for (layer_index, layer) in layers.iter().enumerate() {
             let (_, kv_dim, layer_shape) =
                 self.resident_prefill_layer_shape(layer, layer_index, spec, hidden_dim)?;
@@ -400,14 +445,16 @@ impl MetalExecutor {
                     }),
                     PrefillResidentAttentionShape::Full { .. },
                 ) => {
-                    let in_place = prefix_kv_in_place(
+                    // Réserve tenue (claim) jusqu'à la relecture ou la
+                    // publication des lignes nouvelles, en fin de fonction.
+                    let (in_place, reuse) = prefix_kv_in_place(
                         in_place.as_ref(),
                         key,
                         value,
                         spec.seq,
                         (kv_dim, bf16_store),
-                        &mut in_place_claims,
-                    )?;
+                    )?
+                    .unzip();
                     // Préfixe recopié dans un buffer neuf : s'il est déjà tout en
                     // bf16, le buffer prend la réserve d'un prefill à froid et
                     // remplace le préfixe du cache (vue entière, adoptable et
@@ -435,10 +482,12 @@ impl MetalExecutor {
                     )?;
                     if let PrefillResidentLayerCacheBuffer::Full {
                         replaces_prefix: replaces,
+                        in_place,
                         ..
                     } = &mut cache
                     {
                         *replaces = replaces_prefix;
+                        *in_place = reuse;
                     }
                     cache
                 }
@@ -454,6 +503,7 @@ impl MetalExecutor {
                     key: key_cache,
                     value: value_cache,
                     bf16_store,
+                    in_place,
                     ..
                 },
             ) = (prefix_layer, &cache)
@@ -468,7 +518,7 @@ impl MetalExecutor {
                 }
                 for (buffer, segments) in [(key_cache, key), (value_cache, value)] {
                     // Prolongement en place : le préfixe est déjà au début.
-                    if is_sole_view_of(segments, buffer, *bf16_store) {
+                    if in_place.is_some() {
                         continue;
                     }
                     let mut offset = 0;
@@ -877,6 +927,7 @@ impl MetalExecutor {
                     kv_dim,
                     bf16_store,
                     replaces_prefix,
+                    in_place,
                     ..
                 } => {
                     // Seules les positions nouvelles repartent au CPU : le préfixe
@@ -886,8 +937,25 @@ impl MetalExecutor {
                     // Prefill complet : le buffer, que plus rien n'écrit, devient
                     // le stockage CPU du K/V. Extension : il porte aussi le
                     // préfixe, seules les lignes nouvelles sont relues.
-                    let (key, value) = if replaces_prefix {
+                    let mut placement = PrefillKvPlacement::Appended;
+                    let (key, value) = if let Some(InPlaceReuse {
+                        claim,
+                        bf16_prefix: Some([key_prefix, value_prefix]),
+                    }) = in_place
+                        .as_ref()
+                        .filter(|_| crate::runtime_flags::prefill_kv_shared_enabled())
+                    {
+                        // Prolongement bf16 en place : vue entière `[0, seq)`
+                        // dérivée de celle du préfixe (même registre), qui
+                        // remplace les segments du cache. Tant qu'elle vit,
+                        // aucun autre prolongement du même préfixe n'écrit
+                        // plus en place.
+                        let whole = checked_len(spec.seq, kv_dim, "prefill résident kv en place")?;
+                        placement = PrefillKvPlacement::ExtendedInPlace;
+                        extended_kv_rows([key_prefix, value_prefix], claim, whole)?
+                    } else if replaces_prefix {
                         // Buffer neuf, préfixe recopié : vue entière de tout le K/V.
+                        placement = PrefillKvPlacement::CopiedPrefix;
                         shared_kv_rows(
                             key,
                             value,
@@ -897,9 +965,10 @@ impl MetalExecutor {
                     } else if start == 0 && crate::runtime_flags::prefill_kv_shared_enabled() {
                         shared_kv_rows(key, value, kv_len, bf16_store)?
                     } else if bf16_store {
-                        // Lignes possédées, hors de toute vue : un prolongement
-                        // en place ultérieur du même préfixe peut réécrire la
-                        // réserve.
+                        // Lignes possédées, hors de toute vue : relues sous le
+                        // claim d'un prolongement en place f32 ou sans vues
+                        // partagées ; un prolongement ultérieur du même préfixe
+                        // peut réécrire la réserve.
                         (
                             PrefillKvRows::OwnedBf16(read_u16_buffer_at(&key, kv_offset, kv_len)?),
                             PrefillKvRows::OwnedBf16(read_u16_buffer_at(
@@ -912,11 +981,20 @@ impl MetalExecutor {
                             PrefillKvRows::Owned(read_f32_buffer_at(&value, kv_offset, kv_len)?),
                         )
                     };
+                    // Fin de la relecture ou de la publication : la réserve
+                    // est rendue.
+                    // NOTE: le claim (ici, ou au drop sur une sortie d'erreur)
+                    // ne survit à aucune écriture GPU parce que rien ne sépare
+                    // `commit` de `wait_until_completed` : aucune sortie `?`
+                    // entre les deux. Déplacer l'attente (soumission
+                    // asynchrone) exigerait d'attendre avant tout drop du claim,
+                    // comme `AdoptedKv`.
+                    drop(in_place);
                     layer_caches.push(PrefillResidentLayerCache::Full {
                         key,
                         value,
                         kv_dim,
-                        replaces_prefix,
+                        placement,
                     });
                 }
                 PrefillResidentLayerCacheBuffer::Linear { state } => {
@@ -1581,6 +1659,25 @@ impl MetalExecutor {
     }
 }
 
+/// Vues entières `[0, whole)` dérivées des vues K et V `prefix` d'un
+/// prolongement bf16 en place, sous le `claim` revalidé après elles.
+#[expect(unsafe_code, reason = "publication du prolongement en place")]
+fn extended_kv_rows(
+    [key, value]: [&SharedBf16Rows; 2],
+    claim: &InPlaceClaim,
+    whole: usize,
+) -> Result<(PrefillKvRows, PrefillKvRows)> {
+    // SAFETY: les lignes `[start, whole)` ont été écrites par ce prefill sous
+    // `claim`, pris puis revalidé après `key` et `value` (`prefix_kv_in_place`),
+    // et son command buffer est terminé ; plus rien ne les écrit.
+    unsafe {
+        Ok((
+            PrefillKvRows::SharedBf16(key.extended(claim, whole)?),
+            PrefillKvRows::SharedBf16(value.extended(claim, whole)?),
+        ))
+    }
+}
+
 /// Remet les buffers K/V d'un prefill terminé comme vues partagées.
 #[expect(
     unsafe_code,
@@ -1592,11 +1689,12 @@ fn shared_kv_rows(
     kv_len: usize,
     bf16: bool,
 ) -> Result<(PrefillKvRows, PrefillKvRows)> {
-    // SAFETY: buffers `uncached_f32_buffer` ou `uncached_bf16_buffer` propres à
-    // ce prefill, hors scratch : son command buffer est terminé et l'appelant
-    // les cède ici. Seules les lignes réservées au-delà de `kv_len` seront
-    // encore écrites (prolongement en place, `prefix_kv_in_place`), hors de
-    // la vue.
+    // SAFETY: buffers `uncached_f32_buffer` ou `uncached_bf16_buffer` neufs,
+    // propres à ce prefill et hors scratch : aucune autre vue n'en existe
+    // (première vue, registre créé ici), son command buffer est terminé et
+    // l'appelant les cède. Seules les lignes au-delà de toute vue vivante
+    // seront encore écrites, sous claim revalidé (`prefix_kv_in_place`,
+    // adoption par l'arène).
     unsafe {
         Ok(if bf16 {
             (
@@ -1609,26 +1707,5 @@ fn shared_kv_rows(
                 PrefillKvRows::Shared(SharedF32Rows::new(value, 0, kv_len)?),
             )
         })
-    }
-}
-
-#[cfg(test)]
-mod in_place_claim_tests {
-    use super::*;
-
-    #[test]
-    fn in_place_claim_is_exclusive_until_dropped() -> Result<()> {
-        let Some(device) = metal::Device::system_default() else {
-            return Ok(());
-        };
-        let new = || device.new_buffer(64, MTLResourceOptions::StorageModeShared);
-        let (key, value, other) = (new(), new(), new());
-        let first = InPlaceClaim::try_new([&key, &value]);
-        assert!(first.is_some());
-        // Un autre détenteur de la même allocation recopie.
-        assert!(InPlaceClaim::try_new([&key, &other]).is_none());
-        drop(first);
-        assert!(InPlaceClaim::try_new([&key, &value]).is_some());
-        Ok(())
     }
 }

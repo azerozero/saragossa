@@ -29,7 +29,7 @@
 //!
 //! # Contrats pour le branchement (A2)
 //!
-//! - **Snapshots.** Une vue (lignes `0..n`) suit le contrat `frozen` de
+//! - **Snapshots.** Une vue (lignes `0..n`) suit le contrat de vivacité de
 //!   [`super::shared_rows::SharedRows`] : on n'écrit jamais sous une vue vivante. Un
 //!   prolongement n'écrit en place qu'au-delà de toutes les vues vivantes du
 //!   buffer ; sinon il recopie.

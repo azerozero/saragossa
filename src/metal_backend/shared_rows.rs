@@ -2,6 +2,8 @@
 //! d'écrire.
 
 use super::*;
+use std::collections::BTreeMap;
+use std::sync::{Arc, MutexGuard, PoisonError};
 
 /// Élément d'une vue partagée : f32, ou bits bf16 (`u16`). Scellé : seuls des
 /// types sans invalide ni padding peuvent être lus depuis la mémoire GPU.
@@ -20,16 +22,56 @@ impl SharedElement for u16 {}
 /// partir de l'élément `offset`. Le K/V d'un prefill complet y reste : sa
 /// relecture vers un `Vec` neuf payait une faute de page par 16 Kio (382 ms à
 /// 32k).
-#[derive(Clone, Debug)]
+///
+/// Toutes les vues d'une allocation partagent un registre de vivacité
+/// ([`LiveEnds`]) : une seule construction par [`Self::new`], puis des vues
+/// dérivées (clone, [`Self::truncate`], [`Self::extended`]). Un écrivain sous
+/// [`InPlaceClaim`] n'écrit qu'au-delà de la plus longue vue vivante : une
+/// plage publiée n'est jamais réécrite tant qu'une vue la couvre.
+#[derive(Debug)]
 pub(crate) struct SharedRows<T> {
     buffer: metal::Buffer,
     offset: usize,
     len: usize,
-    /// Longueur figée à la construction, gardée par clones et troncatures :
-    /// toutes les vues d'un buffer en dérivent (une seule construction par
-    /// prefill), donc aucune ne couvre d'élément au-delà.
-    frozen: usize,
+    live: Arc<LiveEnds>,
     element: std::marker::PhantomData<T>,
+}
+
+/// Fins (en éléments, `offset + len`) des vues vivantes d'une allocation,
+/// comptées par valeur. Seul un détenteur d'[`InPlaceClaim`] peut y ajouter
+/// une fin au-delà du maximum courant (cf. [`SharedRows::extended`]).
+#[derive(Debug, Default)]
+struct LiveEnds(Mutex<BTreeMap<usize, usize>>);
+
+impl LiveEnds {
+    fn ends(&self) -> MutexGuard<'_, BTreeMap<usize, usize>> {
+        // Les sections critiques ne font que des opérations de table, qui
+        // laissent le compte cohérent même si un autre thread a paniqué.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn add(&self, end: usize) {
+        *self.ends().entry(end).or_insert(0) += 1;
+    }
+
+    fn remove(&self, end: usize) {
+        let mut ends = self.ends();
+        let count = ends.get_mut(&end);
+        // Chaque vue retire la fin qu'elle a ajoutée : une fin absente
+        // trahirait un registre désynchronisé (vue créée hors dérivation).
+        debug_assert!(count.is_some(), "fin {end} absente du registre");
+        if let Some(count) = count {
+            *count -= 1;
+            if *count == 0 {
+                ends.remove(&end);
+            }
+        }
+    }
+
+    /// Fin de la plus longue vue vivante (0 sans vue).
+    fn max(&self) -> usize {
+        self.ends().last_key_value().map_or(0, |(end, _)| *end)
+    }
 }
 
 /// Lignes f32 (K/V ou hidden d'un prefill).
@@ -37,18 +79,47 @@ pub(crate) type SharedF32Rows = SharedRows<f32>;
 /// Lignes bf16 stockées en bits `u16` (K/V d'un prefill stocké en bf16).
 pub(crate) type SharedBf16Rows = SharedRows<u16>;
 
+/// Vérifie qu'une vue de `offset + len` éléments `T` tient dans `buffer` et
+/// qu'il a un pointeur CPU.
+fn check_view<T>(buffer: &BufferRef, offset: usize, len: usize) -> Result<()> {
+    let end = offset
+        .checked_add(len)
+        .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
+        .ok_or_else(|| InferError::Dimension("vue partagée déborde".to_string()))?;
+    if u64::try_from(end)
+        .ok()
+        .is_none_or(|end| end > buffer.length())
+    {
+        return Err(InferError::Dimension(format!(
+            "vue partagée {offset}+{len} éléments hors du buffer de {} octets",
+            buffer.length()
+        )));
+    }
+    if buffer.contents().is_null() {
+        return Err(InferError::Metal(
+            "vue partagée sur un buffer sans pointeur CPU".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl<T: SharedElement> SharedRows<T> {
-    /// Fige `buffer[offset..offset + len]` (en éléments `T`).
+    /// Première vue de `buffer[offset..offset + len]` (en éléments `T`) : crée
+    /// le registre de vivacité de l'allocation.
     ///
     /// # Safety
     ///
-    /// `buffer[offset..offset + len]` doit être initialisé et ses écritures
-    /// GPU terminées ; ensuite plus aucune écriture, GPU ou CPU, ne doit le
-    /// viser (les lectures GPU, semis de l'arène, restent permises) : la vue
-    /// en expose le contenu en `&[T]` à durée de vie libre côté lecteur. Seules les lignes qu'aucune vue
-    /// vivante du buffer (clones et troncatures compris) ne couvre peuvent
-    /// encore être écrites (prolongement en place d'un prefill dans ses lignes
-    /// réservées).
+    /// - `buffer[offset..offset + len]` est initialisé et ses écritures GPU
+    ///   sont terminées.
+    /// - Aucune autre vue de `buffer` ne vient de `new` : les suivantes
+    ///   dérivent de celle-ci (clone, troncature, [`Self::extended`]), sans
+    ///   quoi deux registres s'ignoreraient. Seule exception : un buffer que
+    ///   plus rien n'écrit du tout.
+    /// - Ensuite, aucune écriture, GPU ou CPU, ne vise un élément couvert par
+    ///   une vue vivante de l'allocation (les lectures GPU, semis de l'arène,
+    ///   restent permises) : la vue expose son contenu en `&[T]`. Seul le
+    ///   détenteur d'un [`InPlaceClaim`] revalidé ([`InPlaceClaim::try_after`])
+    ///   écrit, et seulement au-delà de la plus longue vue vivante.
     ///
     /// # Errors
     ///
@@ -59,26 +130,49 @@ impl<T: SharedElement> SharedRows<T> {
         reason = "contrat d'immuabilité du buffer reporté sur l'appelant"
     )]
     pub(crate) unsafe fn new(buffer: metal::Buffer, offset: usize, len: usize) -> Result<Self> {
-        let end = offset
-            .checked_add(len)
-            .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
-            .ok_or_else(|| InferError::Dimension("vue partagée déborde".to_string()))?;
-        if u64::try_from(end).map_or(true, |end| end > buffer.length()) {
-            return Err(InferError::Dimension(format!(
-                "vue partagée {offset}+{len} éléments hors du buffer de {} octets",
-                buffer.length()
-            )));
-        }
-        if buffer.contents().is_null() {
-            return Err(InferError::Metal(
-                "vue partagée sur un buffer sans pointeur CPU".to_string(),
-            ));
-        }
+        check_view::<T>(&buffer, offset, len)?;
+        let live = Arc::new(LiveEnds::default());
+        live.add(offset + len);
         Ok(Self {
             buffer,
             offset,
             len,
-            frozen: len,
+            live,
+            element: std::marker::PhantomData,
+        })
+    }
+
+    /// Vue `[offset, offset + len)` du même buffer, dérivée de `self` (même
+    /// registre) : publie les éléments `[self.end(), offset + len)` écrits
+    /// en place sous `claim`. `claim` doit avoir été pris après `self`
+    /// ([`InPlaceClaim::try_after`]) : la revalidation a alors établi
+    /// qu'aucune vue vivante ne couvrait ces éléments.
+    ///
+    /// # Safety
+    ///
+    /// Les éléments `[self.end(), offset + len)` ont été écrits par le
+    /// détenteur de `claim` et ses écritures GPU sont terminées ; plus rien ne
+    /// les écrit ensuite (contrat de [`Self::new`]).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `claim` ne couvre pas cette allocation après
+    /// `self`, si la vue raccourcit `self` ou si elle dépasse le buffer.
+    #[expect(unsafe_code, reason = "publication de lignes écrites sous claim")]
+    pub(crate) unsafe fn extended(&self, claim: &InPlaceClaim, len: usize) -> Result<Self> {
+        if claim.start_of(self.allocation_id()) != Some(self.end()) || len < self.len {
+            return Err(InferError::Metal(format!(
+                "vue prolongée à {len} hors du claim pris après {}",
+                self.end()
+            )));
+        }
+        check_view::<T>(&self.buffer, self.offset, len)?;
+        self.live.add(self.offset + len);
+        Ok(Self {
+            buffer: self.buffer.clone(),
+            offset: self.offset,
+            len,
+            live: Arc::clone(&self.live),
             element: std::marker::PhantomData,
         })
     }
@@ -91,9 +185,9 @@ impl<T: SharedElement> SharedRows<T> {
         // SAFETY: `new` a vérifié que `offset + len` éléments tiennent dans le
         // buffer partagé et que son pointeur CPU existe (aligné page, donc
         // aligné pour `T`, f32 ou u16 scellés : toute suite d'octets est une
-        // valeur valide). Plus
-        // rien n'écrit cette plage (contrat `# Safety` de `new`) et les vues ne
-        // donnent qu'un accès en lecture : aucune écriture concurrente.
+        // valeur valide). Tant que `self` vit, sa fin compte dans le registre :
+        // aucun écrivain, revalidé sous claim, ne touche cette plage (contrat
+        // `# Safety` de `new`), et les vues ne donnent qu'un accès en lecture.
         unsafe {
             std::slice::from_raw_parts(
                 self.buffer.contents().cast::<T>().add(self.offset),
@@ -130,16 +224,46 @@ impl<T: SharedElement> SharedRows<T> {
         self.len
     }
 
-    /// Vue entière du buffer figé, depuis son début et non tronquée : aucune
-    /// vue dérivée ne couvre d'élément au-delà de `len`, qui peuvent donc être
-    /// écrits (sous [`InPlaceClaim`]).
+    /// Fin de la vue dans le buffer, en éléments.
+    fn end(&self) -> usize {
+        self.offset + self.len
+    }
+
+    /// Vue depuis le début du buffer qu'aucune vue vivante ne dépasse : les
+    /// éléments au-delà de `len` peuvent être écrits. Sans claim, ce n'est
+    /// qu'un indice (une autre vue peut naître entre-temps) ; seul
+    /// [`InPlaceClaim::try_after`] le revalide avant d'écrire.
     pub(crate) fn is_whole(&self) -> bool {
-        self.offset == 0 && self.len == self.frozen
+        self.offset == 0 && self.live.max() == self.len
     }
 
     /// Raccourcit la vue ; le buffer reste alloué tant qu'une vue le tient.
+    /// Les éléments qu'aucune vue ne couvre plus redeviennent inscriptibles.
     pub(crate) fn truncate(&mut self, len: usize) {
-        self.len = self.len.min(len);
+        if len < self.len {
+            self.live.add(self.offset + len);
+            self.live.remove(self.end());
+            self.len = len;
+        }
+    }
+}
+
+impl<T> Clone for SharedRows<T> {
+    fn clone(&self) -> Self {
+        self.live.add(self.offset + self.len);
+        Self {
+            buffer: self.buffer.clone(),
+            offset: self.offset,
+            len: self.len,
+            live: Arc::clone(&self.live),
+            element: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> Drop for SharedRows<T> {
+    fn drop(&mut self) {
+        self.live.remove(self.offset + self.len);
     }
 }
 
@@ -163,12 +287,16 @@ static IN_PLACE_ALLOCATIONS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::ne
 #[derive(Debug)]
 pub(crate) struct InPlaceClaim {
     ids: [usize; 2],
+    /// Fin, en éléments, de la vue après laquelle chaque allocation a été
+    /// réservée.
+    starts: [usize; 2],
     _buffers: [Buffer; 2],
 }
 
 impl InPlaceClaim {
-    pub(crate) fn try_new(buffers: [&Buffer; 2]) -> Option<Self> {
-        let ids = buffers.map(|buffer| allocation_identity(buffer));
+    /// Réserve brute, sans revalidation : réservée à [`Self::try_after`].
+    fn try_new(buffers: [&BufferRef; 2], starts: [usize; 2]) -> Option<Self> {
+        let ids = buffers.map(allocation_identity);
         let mut claimed = IN_PLACE_ALLOCATIONS.lock().ok()?;
         if ids.iter().any(|id| claimed.contains(id)) {
             return None;
@@ -176,8 +304,29 @@ impl InPlaceClaim {
         claimed.extend(ids);
         Some(Self {
             ids,
-            _buffers: buffers.map(Clone::clone),
+            starts,
+            _buffers: buffers.map(ToOwned::to_owned),
         })
+    }
+
+    /// Droit d'écrire K et V au-delà de leurs vues `views` (K puis V). Le
+    /// claim est pris **avant** de vérifier qu'aucune vue vivante ne les
+    /// dépasse : sous le claim, aucune vue plus longue ne peut naître (seul
+    /// [`SharedRows::extended`], qui l'exige, en crée). Vérifier d'abord
+    /// laissait un autre écrivain prolonger et publier entre la vérification
+    /// et le claim, puis être écrasé. `None` : la réserve est tenue ou
+    /// couverte par une vue vivante, l'appelant recopie.
+    pub(crate) fn try_after<T: SharedElement>(views: [&SharedRows<T>; 2]) -> Option<Self> {
+        let claim = Self::try_new(views.map(SharedRows::buffer), views.map(SharedRows::end))?;
+        views.iter().all(|view| view.is_whole()).then_some(claim)
+    }
+
+    /// Fin de la vue après laquelle l'allocation `id` a été réservée.
+    fn start_of(&self, id: usize) -> Option<usize> {
+        self.ids
+            .iter()
+            .position(|claimed| *claimed == id)
+            .map(|index| self.starts[index])
     }
 }
 
@@ -293,9 +442,66 @@ mod identity_tests {
         let ids = [&key, &value, &other].map(|buffer| allocation_identity(buffer));
         assert!(ids.iter().all(|id| *id != 0));
         assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
-        let claim = InPlaceClaim::try_new([&key, &value]);
+        let claim = InPlaceClaim::try_new([&key, &value], [0, 0]);
         assert!(claim.is_some());
-        assert!(InPlaceClaim::try_new([&other, &value]).is_none());
-        assert!(InPlaceClaim::try_new([&other, &new()]).is_some());
+        assert!(InPlaceClaim::try_new([&other, &value], [0, 0]).is_none());
+        assert!(InPlaceClaim::try_new([&other, &new()], [0, 0]).is_some());
+    }
+
+    /// Le registre suit clones, troncatures, prolongements et drops : une
+    /// vue vivante plus longue interdit l'écriture au-delà d'une vue plus
+    /// courte (revalidation sous claim), sa mort l'autorise de nouveau.
+    #[test]
+    #[expect(unsafe_code, reason = "buffers neufs propres au test")]
+    fn liveness_registry_gates_writes_beyond_live_views() -> Result<()> {
+        let Some(device) = metal::Device::system_default() else {
+            return Ok(());
+        };
+        // 16 f32 par buffer.
+        let new = || device.new_buffer(64, MTLResourceOptions::StorageModeShared);
+        let (key, value) = (new(), new());
+        // SAFETY: buffers neufs (mis à zéro par Metal) ; seules les lignes
+        // au-delà des vues sont réservées, et rien ne les écrit ici.
+        let (k, v) = unsafe {
+            (
+                SharedF32Rows::new(key.clone(), 0, 4)?,
+                SharedF32Rows::new(value.clone(), 0, 4)?,
+            )
+        };
+        let k2 = k.clone();
+        assert!(k.is_whole() && k2.is_whole(), "clone de même fin");
+        let mut short = k.clone();
+        short.truncate(2);
+        assert!(!short.is_whole(), "vue plus longue vivante");
+
+        let claim = InPlaceClaim::try_after([&k, &v]).expect("réserve libre");
+        assert!(
+            InPlaceClaim::try_after([&k, &v]).is_none(),
+            "claim exclusif"
+        );
+        // SAFETY: rien n'écrit la réserve ; seules les fins comptent ici.
+        let (long, long_v) = unsafe { (k.extended(&claim, 8)?, v.extended(&claim, 8)?) };
+        // Le claim ne publie qu'après les vues pour lesquelles il a été pris.
+        // SAFETY: appels refusés avant toute création de vue.
+        unsafe {
+            assert!(short.extended(&claim, 8).is_err(), "vue plus courte");
+            assert!(long.extended(&claim, 12).is_err(), "vue déjà prolongée");
+            assert!(k.extended(&claim, 17).is_err(), "hors du buffer");
+        }
+        drop(claim);
+        assert!(long.is_whole() && !k.is_whole() && !k2.is_whole());
+        // Course : `k` était entière avant le prolongement ; la revalidation
+        // sous claim refuse et rend la réserve.
+        assert!(InPlaceClaim::try_after([&k, &v]).is_none());
+        drop((long, long_v));
+        assert!(k.is_whole(), "vue plus longue morte");
+        assert!(
+            InPlaceClaim::try_after([&k, &v]).is_some(),
+            "réserve rendue"
+        );
+        // Rollback : la seule vue restante, tronquée, devient entière.
+        drop((k, k2));
+        assert!(short.is_whole());
+        Ok(())
     }
 }

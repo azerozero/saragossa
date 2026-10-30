@@ -3175,8 +3175,7 @@ fn kv_arena_adopts_prefill_bf16_buffers() -> Result<()> {
             kv_heads,
             head_dim,
             true,
-            [keys.clone(), values.clone()],
-            prefix,
+            [&key_view, &value_view],
         )
     };
     let tail_segments = [KvSegment::CpuBf16(&bits[prefix * kv_dim..])];
@@ -3213,10 +3212,107 @@ fn kv_arena_adopts_prefill_bf16_buffers() -> Result<()> {
         );
     }
     assert_eq!(key_view.as_slice(), &bits[..prefix * kv_dim]);
+    // L'arène tient la réserve : un prolongement recopie.
+    assert!(crate::metal_backend::InPlaceClaim::try_after([&key_view, &value_view]).is_none());
     drop(adopted);
+    // Prolongement en place qui tient la réserve : l'arène recopie.
+    let held = crate::metal_backend::InPlaceClaim::try_after([&key_view, &value_view]);
+    assert!(held.is_some(), "réserve rendue par l'arène");
+    assert!(
+        adopt(capacity)?.is_none(),
+        "réserve tenue par le prolongement"
+    );
+    drop(held);
     assert!(adopt(capacity + 1)?.is_none(), "réserve trop courte");
     assert!(adopt(capacity)?.is_some(), "réserve rendue au drop");
     Ok(())
+}
+
+/// Course prefill contre adoption : l'arène a jugé la vue du préfixe
+/// adoptable (`is_whole`) avant qu'un prolongement en place ne prenne la
+/// réserve, écrive et publie une vue plus longue. Revalidée sous le claim,
+/// l'adoption refuse alors, sans toucher aux lignes publiées, puis accepte
+/// dès que la vue plus longue meurt.
+#[test]
+fn kv_arena_adoption_revalidates_after_concurrent_extension() -> Result<()> {
+    let Some(state) = try_state()? else {
+        return Ok(());
+    };
+    if !super::kv_bf16_dense_by_default() {
+        return Ok(());
+    }
+    let (q_heads, kv_heads, head_dim) = (8, 2, 128);
+    let kv_dim = kv_heads * head_dim;
+    let (prefix, published, capacity) = (5, 7, 10);
+    let buffer = || {
+        state.device().new_buffer(
+            (capacity * kv_dim * std::mem::size_of::<u16>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let (keys, values) = (buffer(), buffer());
+    // SAFETY: buffers neufs propres au test, mis à zéro par Metal ; seules
+    // les lignes réservées sont écrites ensuite, sous claim.
+    #[expect(unsafe_code, reason = "vues partagées sur des buffers de test")]
+    let (key_view, value_view) = unsafe {
+        (
+            crate::metal_backend::SharedBf16Rows::new(keys.clone(), 0, prefix * kv_dim)?,
+            crate::metal_backend::SharedBf16Rows::new(values.clone(), 0, prefix * kv_dim)?,
+        )
+    };
+    let adopt = || {
+        state.full_attention_adopting(
+            capacity,
+            q_heads,
+            kv_heads,
+            head_dim,
+            true,
+            [&key_view, &value_view],
+        )
+    };
+    // L'arène lit l'état avant tout claim : adoptable.
+    assert!(key_view.is_whole() && value_view.is_whole());
+    // Le prolongement prend la réserve, écrit ses lignes et les publie.
+    let claim = crate::metal_backend::InPlaceClaim::try_after([&key_view, &value_view])
+        .expect("invariant: réserve libre");
+    let marker = 0x3f80_u16;
+    write_u16_rows(
+        &keys,
+        prefix * kv_dim,
+        (published - prefix) * kv_dim,
+        marker,
+    );
+    // SAFETY: lignes `[prefix, published)` écrites ci-dessus sur le CPU sous
+    // `claim`, aucune commande GPU en vol.
+    #[expect(unsafe_code, reason = "publication de lignes écrites sous claim")]
+    let longer = unsafe {
+        (
+            key_view.extended(&claim, published * kv_dim)?,
+            value_view.extended(&claim, published * kv_dim)?,
+        )
+    };
+    drop(claim);
+    assert!(adopt()?.is_none(), "vue publiée plus longue que le préfixe");
+    assert!(longer.0.as_slice()[prefix * kv_dim..]
+        .iter()
+        .all(|&bits| bits == marker));
+    drop(longer);
+    let adopted = adopt()?.expect("plus aucune vue au-delà du préfixe");
+    assert_eq!(adopted.len(), prefix);
+    Ok(())
+}
+
+/// Écrit `len` bits bf16 `value` à partir de l'élément `offset` d'un buffer
+/// partagé (lignes réservées, sous claim).
+#[expect(unsafe_code, reason = "écriture CPU d'un buffer de test sous claim")]
+fn write_u16_rows(buffer: &Buffer, offset: usize, len: usize, value: u16) {
+    assert!((offset + len) * std::mem::size_of::<u16>() <= buffer.length() as usize);
+    // SAFETY: buffer partagé dont la plage est vérifiée ci-dessus ; l'appelant
+    // tient la réserve et aucune vue ne la couvre.
+    unsafe {
+        std::slice::from_raw_parts_mut(buffer.contents().cast::<u16>().add(offset), len)
+            .fill(value);
+    }
 }
 
 /// Valeur synthétique d'un KV quantifié : amplitude et centre variables par
