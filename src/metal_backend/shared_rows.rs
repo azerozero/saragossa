@@ -56,7 +56,11 @@ impl LiveEnds {
 
     fn remove(&self, end: usize) {
         let mut ends = self.ends();
-        if let Some(count) = ends.get_mut(&end) {
+        let count = ends.get_mut(&end);
+        // Chaque vue retire la fin qu'elle a ajoutée : une fin absente
+        // trahirait un registre désynchronisé (vue créée hors dérivation).
+        debug_assert!(count.is_some(), "fin {end} absente du registre");
+        if let Some(count) = count {
             *count -= 1;
             if *count == 0 {
                 ends.remove(&end);
@@ -82,7 +86,10 @@ fn check_view<T>(buffer: &BufferRef, offset: usize, len: usize) -> Result<()> {
         .checked_add(len)
         .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
         .ok_or_else(|| InferError::Dimension("vue partagée déborde".to_string()))?;
-    if u64::try_from(end).map_or(true, |end| end > buffer.length()) {
+    if u64::try_from(end)
+        .ok()
+        .is_none_or(|end| end > buffer.length())
+    {
         return Err(InferError::Dimension(format!(
             "vue partagée {offset}+{len} éléments hors du buffer de {} octets",
             buffer.length()

@@ -9,6 +9,8 @@ mod gemma_dense;
 mod gemma_parallel;
 mod global_attention;
 mod resident;
+#[cfg(test)]
+pub(crate) use self::resident::with_prefill_kv_layout_override;
 pub(crate) use self::resident::with_prefill_kv_reserve;
 mod scratch;
 #[cfg(test)]

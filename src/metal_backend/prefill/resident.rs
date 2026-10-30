@@ -56,6 +56,39 @@ pub(crate) fn with_prefill_kv_reserve<R>(rows: usize, run: impl FnOnce() -> R) -
     run()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Morceaux et seuil du stockage bf16 imposés par un test du décodeur,
+    /// cf. [`with_prefill_kv_layout_override`].
+    static PREFILL_KV_LAYOUT_OVERRIDE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+}
+
+/// Exécute `run` avec, sur ce thread, des morceaux de prefill d'au plus
+/// `chunk_tokens` et le K/V stocké en bf16 dès `bf16_min_rows` lignes (si le
+/// NAX existe) : un modèle synthétique de quelques centaines de tokens
+/// emprunte alors, via le décodeur, les chemins que la production ne prend
+/// qu'au-delà de 4096 tokens et du seuil bf16 (`OnceLock` de
+/// `runtime_flags`, non réglables dans le processus de test).
+#[cfg(test)]
+pub(crate) fn with_prefill_kv_layout_override<R>(
+    chunk_tokens: usize,
+    bf16_min_rows: usize,
+    run: impl FnOnce() -> R,
+) -> R {
+    /// Rétablit le réglage précédent, panique comprise.
+    struct Restore(Option<(usize, usize)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREFILL_KV_LAYOUT_OVERRIDE.with(|layout| layout.set(self.0));
+        }
+    }
+    let _restore = Restore(
+        PREFILL_KV_LAYOUT_OVERRIDE
+            .with(|layout| layout.replace(Some((chunk_tokens, bf16_min_rows)))),
+    );
+    run()
+}
+
 /// Réserve des buffers K/V d'un préfixe pour un prolongement en place
 /// jusqu'à `seq` lignes : `in_place` désigne ces buffers, le préfixe en est
 /// la vue unique depuis leur début, ils ont la place des lignes nouvelles et,
@@ -283,6 +316,10 @@ impl MetalExecutor {
                 "prefill résident prolongé hors périmètre".to_string(),
             ));
         }
+        #[cfg(test)]
+        let layout_override = PREFILL_KV_LAYOUT_OVERRIDE.with(Cell::get);
+        #[cfg(test)]
+        let chunk_tokens = layout_override.map_or(chunk_tokens, |(chunk, _)| chunk);
         let chunk_rows = self.resident_prefill_chunk_rows(layers, rows, chunk_tokens);
         let chunk_count = rows.div_ceil(chunk_rows);
         let mut kernel_timing = if profile_sections {
@@ -360,10 +397,10 @@ impl MetalExecutor {
         let bf16_mirror = self.prefill_kv_bf16_mirror && chunked_nax;
         // Le NAX lit déjà ce K/V en bf16 et l'arène d'un prompt de cette
         // longueur sera bf16 : le stocker arrondi ne change aucun octet lu.
-        let bf16_store = chunked_nax
-            && self
-                .prefill_kv_bf16_store_min_rows
-                .is_some_and(|min_rows| spec.seq >= min_rows);
+        let bf16_min_rows = self.prefill_kv_bf16_store_min_rows;
+        #[cfg(test)]
+        let bf16_min_rows = layout_override.map_or(bf16_min_rows, |(_, min_rows)| Some(min_rows));
+        let bf16_store = chunked_nax && bf16_min_rows.is_some_and(|min_rows| spec.seq >= min_rows);
         // Réserve d'un K/V écrit dans un buffer neuf (prefill à froid, préfixe
         // recopié) : la demande de l'appelant pour un K/V bf16, adoptable par
         // l'arène ; jamais adopté en f32, il garde la réserve minimale.
@@ -946,6 +983,12 @@ impl MetalExecutor {
                     };
                     // Fin de la relecture ou de la publication : la réserve
                     // est rendue.
+                    // NOTE: le claim (ici, ou au drop sur une sortie d'erreur)
+                    // ne survit à aucune écriture GPU parce que rien ne sépare
+                    // `commit` de `wait_until_completed` : aucune sortie `?`
+                    // entre les deux. Déplacer l'attente (soumission
+                    // asynchrone) exigerait d'attendre avant tout drop du claim,
+                    // comme `AdoptedKv`.
                     drop(in_place);
                     layer_caches.push(PrefillResidentLayerCache::Full {
                         key,
