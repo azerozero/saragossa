@@ -1688,6 +1688,11 @@ fn skinny_matmul(
         before + 1,
         "{kernel:?} M={batch} {in_dim}→{out_dim} : kernel skinny non dispatché"
     );
+    // `f32::max` ignore les NaN dans les réductions d'écart des appelants.
+    assert!(
+        out.iter().all(|value| value.is_finite()),
+        "{kernel:?} M={batch} {in_dim}→{out_dim} : sortie non finie"
+    );
     Ok(out)
 }
 
