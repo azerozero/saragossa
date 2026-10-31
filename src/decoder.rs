@@ -2202,7 +2202,8 @@ impl CausalDecoder {
             {
                 return Ok(false);
             }
-            // Chemins greedy (TTS talker argmax, spéculatif/DFlash) → KV f32 exact.
+            // Chemins greedy (TTS talker argmax, boucle DFlash CPU de référence) →
+            // KV f32 exact. Le DFlash résident suit `resident_kv_bf16`.
             self.setup_resident_full_decode(cache, max_steps, 0, false)
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
