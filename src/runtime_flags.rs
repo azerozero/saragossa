@@ -767,6 +767,27 @@ pub(crate) fn prefill_attn_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX", true))
 }
 
+/// Attention des couches pleines flint (sinks, sans fenêtre, d128) sur les
+/// accélérateurs neuronaux quand le K/V de prefill est stocké en bf16 (≥ 16k
+/// par morceaux) : NAX de MLX avec sinks f32, Q converti en bf16, sortie f32.
+/// Défaut ON pour le gain, pas pour la précision. Mesuré le 2026-10-30
+/// (M5 Max, flint-int4) : attention pleine 9,2-10,1 → 2,1-2,4 s et prefill
+/// 38,9-44,3 → 31,0-33,0 s à 29 201 tokens (ABBA) ; 41,3 → 10,3 s et
+/// 109,1 → 76,6 s (−30 %) à 58 829 tokens. À entrées bf16 égales, écart de
+/// 1,1e-4 au CPU et au Steel bf16 (`prefill_sink_nax_matches_steel_and_cpu`),
+/// dû à P arrondi en bf16 et à Q converti. Dérive totale contre le K/V f32 à
+/// 16 400 tokens (`flint_int4_prefill_kv_bf16_store_drift`) : NAX max 5,44
+/// et pire moyenne 0,86 (ligne 3280), contre 2,02 et 0,34 pour le Steel
+/// bf16 : le NAX l'augmente (×2,7 sur la pire ligne), sous l'écart propre de
+/// mlx bf16 à mlx f32 (17 et 2,6), argmax 18/18 et greedy identique. Si le
+/// pipeline ne compile pas (MPP absent avant macOS 26), repli sur le Steel
+/// d128 bf16. Kill-switch `SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS=0`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_attn_nax_sinks_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS", true))
+}
+
 /// Ordre de la grille du NAX d256 : `SARAGOSSA_RUST_PREFILL_ATTN_NAX_GRID` =
 /// `head` (défaut, `(H, NQ)`, la tête la plus rapide : les têtes Q d'un groupe
 /// KV partent côte à côte et partagent les tuiles K/V en cache) ou `seq`
@@ -985,6 +1006,9 @@ pub(crate) fn flint_prefill_max_tokens_override() -> Option<usize> {
 /// flint-int4, sections de profil) : 14 couches pleines 965 → 195 ms à 4k,
 /// 20,3 → 3,8 s à 16k (46 % du prefill avant). Sorties à 6e-8 près du F3 et
 /// du CPU (`sink_tests`). Kill-switch `SARAGOSSA_RUST_FLINT_PREFILL_STEEL=0`.
+/// Le NAX ([`prefill_attn_nax_sinks_enabled`]) passe avant le Steel sur un
+/// K/V bf16 : pour le kernel naïf F3 avec K/V bf16, il faut aussi
+/// `SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS=0`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn flint_prefill_steel_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

@@ -217,8 +217,11 @@ fn row_gap(got: &[f32], want: &[f32], rows: &[usize], q_dim: usize) -> f32 {
 /// Les Steel d128 avec sinks (K/V f32 et bf16) doivent compiler : sinon les
 /// tests ci-dessous ne mesureraient que le kernel F3.
 fn steel_executor() -> Result<Option<MetalExecutor>> {
-    let executor = test_executor()?;
-    if let Some(executor) = executor.as_ref() {
+    let mut executor = test_executor()?;
+    if let Some(executor) = executor.as_mut() {
+        // Le NAX (opt-in) passerait devant le Steel bf16 : ces tests
+        // mesurent le Steel et le F3 quel que soit l'environnement.
+        executor.attention_prefill_nax_sink_d128 = None;
         assert!(
             executor.attention_prefill_steel_sink_d128_f32.is_some(),
             "pipeline Steel d128 avec sinks absent"
@@ -524,6 +527,160 @@ fn prefill_sink_attention_large_scores_match_f64() -> Result<()> {
             println!("amp={amp} steel={steel}: écart relatif f64 {worst:.2e}");
             assert!(worst <= 5.0e-5, "amp={amp} steel={steel}: {worst}");
         }
+    }
+    Ok(())
+}
+
+/// Pipeline NAX d128 avec sinks ; `None` sans accélérateur (MPP, macOS 26).
+fn nax_sink_pipeline(
+    executor: &MetalExecutor,
+) -> Option<super::super::attention::NaxCausalAttention> {
+    let nax = super::super::pipelines::compile_nax_sink_d128_attention(
+        &executor.device,
+        STEEL_ATTENTION_NAX_KERNELS,
+        super::super::attention::NAX_SINK_ATTN_D128,
+    );
+    // Le GEMM NAX compile dès que MPP est là (macOS 26 et accélérateur) :
+    // l'attention NAX doit alors compiler aussi, sinon le test échoue au
+    // lieu de passer en silence.
+    assert!(
+        nax.is_some() || executor.na_gemm_bf16.is_none(),
+        "MPP disponible mais le NAX d128 avec sinks ne compile pas"
+    );
+    if nax.is_none() {
+        eprintln!("NAX d128 avec sinks non supporté (MPP absent) : test sauté");
+    }
+    nax
+}
+
+/// Écart absolu toléré du NAX d128 avec sinks (sorties d'ordre 1e-2) :
+/// l'arrondi bf16 de P avant P·V domine. Mesuré le 2026-10-30 : pire 1,06e-4
+/// contre le CPU comme contre le Steel bf16.
+const NAX_SINK_TOL: f32 = 5.0e-4;
+
+/// NAX d128 avec sinks à entrées bf16 identiques — Q arrondi comme le NAX le
+/// convertit, K/V stockés en bf16 — contre l'oracle CPU et contre le Steel
+/// d128 bf16 : un bloc de 1, 300, 513, 1100 et 4133 requêtes, puis des
+/// morceaux finaux (1, 300, 1100 requêtes) derrière un préfixe de 4133 clés.
+/// GQA 8 (une tête KV) en scores doux puis ×10 avec des sinks ±8 (le maximum
+/// passe du sink aux scores), et GQA 2 sur quatre têtes KV en scores ×10 pour
+/// les transitions de groupe (`kv_head_idx`). Seules différences attendues :
+/// P arrondi en bf16 avant P·V et l'ordre des MMA.
+#[test]
+fn prefill_sink_nax_matches_steel_and_cpu() -> Result<()> {
+    const KV_TOTAL: usize = 4133;
+    let Some(mut executor) = steel_executor()? else {
+        return Ok(());
+    };
+    let Some(nax) = nax_sink_pipeline(&executor) else {
+        return Ok(());
+    };
+    let hard_sinks = (0..Q_HEADS)
+        .map(|head| if head % 2 == 0 { 8.0 } else { -8.0 })
+        .collect::<Vec<_>>();
+    let q_dim = Q_HEADS * HEAD_DIM;
+    let mut nax = Some(nax);
+    for (kv_heads, q_scale, sinks) in [
+        (KV_HEADS, 1.0_f32, sinks(Q_HEADS)),
+        (KV_HEADS, 10.0, hard_sinks.clone()),
+        (4, 10.0, hard_sinks),
+    ] {
+        let (q, keys, values) = inputs(KV_TOTAL, Q_HEADS, kv_heads);
+        let q = bf16_rounded(&q.iter().map(|value| value * q_scale).collect::<Vec<_>>());
+        let (keys, values) = (bf16_rounded(&keys), bf16_rounded(&values));
+        // (requêtes, clés) : `kv_rows > seq` place les requêtes en fin de préfixe.
+        for (seq, kv_rows) in [
+            (1, 1),
+            (300, 300),
+            (513, 513),
+            (1100, 1100),
+            (KV_TOTAL, KV_TOTAL),
+            (1, KV_TOTAL),
+            (300, KV_TOTAL),
+            (1100, KV_TOTAL),
+        ] {
+            let label = format!("kv_heads={kv_heads} q×{q_scale} q={seq} kv={kv_rows}");
+            let kv_len = kv_rows * kv_heads * HEAD_DIM;
+            let q_off = kv_rows - seq;
+            let q = &q[q_off * q_dim..kv_rows * q_dim];
+            let (keys, values) = (&keys[..kv_len], &values[..kv_len]);
+            let spec = spec(seq, Q_HEADS, kv_heads, None);
+            let rows = oracle_rows(seq);
+            let want = cpu_sink_attention(q, (keys, values), spec, &sinks, q_off, &rows);
+            let steel = gpu_attention(&executor, (q, keys, values), spec, Some(&sinks), true)?;
+            executor.attention_prefill_nax_sink_d128 = nax.take();
+            let got = gpu_attention(&executor, (q, keys, values), spec, Some(&sinks), true);
+            nax = executor.attention_prefill_nax_sink_d128.take();
+            let got = got?;
+            let gap_cpu = row_gap(&got, &want, &rows, q_dim);
+            let gap_steel = row_gap(&got, &steel, &(0..seq).collect::<Vec<_>>(), q_dim);
+            println!("{label}: écart CPU {gap_cpu:.2e}, NAX vs Steel {gap_steel:.2e}");
+            assert!(
+                got.iter().all(|value| value.is_finite()),
+                "{label}: NaN/inf"
+            );
+            assert!(gap_cpu <= NAX_SINK_TOL, "{label}: écart CPU {gap_cpu}");
+            assert!(
+                gap_steel <= NAX_SINK_TOL,
+                "{label}: NAX vs Steel {gap_steel}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Microbench des couches pleines flint (32 têtes Q, 4 KV, d128, morceau de
+/// 4096 requêtes derrière 16k-64k clés, K/V bf16) : Steel d128 bf16 contre
+/// NAX, conversion de Q comprise, meilleur temps de 4 exécutions (GPU au repos).
+#[test]
+#[ignore = "microbench NAX d128 avec sinks (GPU au repos)"]
+fn nax_sink_d128_chunk_microbench() -> Result<()> {
+    let Some(mut executor) = steel_executor()? else {
+        return Ok(());
+    };
+    let Some(nax) = nax_sink_pipeline(&executor) else {
+        return Ok(());
+    };
+    const SEQ: usize = 4096;
+    const FLINT_Q_HEADS: usize = 32;
+    const FLINT_KV_HEADS: usize = 4;
+    let spec = spec(SEQ, FLINT_Q_HEADS, FLINT_KV_HEADS, None);
+    let kv_dim = FLINT_KV_HEADS * HEAD_DIM;
+    let sinks = executor.upload_f32_buffer(&sinks(FLINT_Q_HEADS), "mb_sinks")?;
+    let q = pattern(SEQ * FLINT_Q_HEADS * HEAD_DIM, 97, 0.02);
+    let q_buf = executor.upload_f32_buffer(&q, "mb_q")?;
+    let out = executor.uncached_f32_buffer(q.len(), "mb_out")?;
+    let mut nax = Some(nax);
+    for kv_rows in [16 * 1024, 32 * 1024, 64 * 1024] {
+        let kv = pattern(kv_rows * kv_dim, 89, 0.02);
+        let k_buf = upload_kv(&executor, &kv, true, "mb_k")?;
+        let v_buf = upload_kv(&executor, &kv, true, "mb_v")?;
+        let attended = (kv_rows - SEQ / 2) as f64;
+        let flops = 4.0 * (FLINT_Q_HEADS * HEAD_DIM * SEQ) as f64 * attended;
+        for label in ["steel bf16", "nax"] {
+            if label == "nax" {
+                executor.attention_prefill_nax_sink_d128 = nax.take();
+            }
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let cb = executor.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                let encoded = executor.encode_attention_prefill_sink(
+                    enc, &q_buf, &k_buf, &v_buf, &out, &sinks, spec, kv_rows, true,
+                );
+                enc.end_encoding();
+                encoded?;
+                let t = std::time::Instant::now();
+                commit_and_wait(cb)?;
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "[sinks d128] kv={kv_rows} q={SEQ} {label} : {:.1} ms, {:.1} TFLOP/s",
+                best * 1.0e3,
+                flops / best / 1.0e12
+            );
+        }
+        nax = executor.attention_prefill_nax_sink_d128.take();
     }
     Ok(())
 }

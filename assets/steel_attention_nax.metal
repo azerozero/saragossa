@@ -2651,7 +2651,8 @@ template <
     const constant AttnParams* params [[buffer(4)]],
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
-    const device T* sinks [[buffer(7), function_constant(has_sinks)]],
+    // Sinks f32 quel que soit T : en bf16, le logit appris serait arrondi.
+    const device float* sinks [[buffer(7), function_constant(has_sinks)]],
     device float* lse [[buffer(8), function_constant(save_lse)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -3096,7 +3097,8 @@ template <
     const constant AttnParams* params [[buffer(4)]],
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
-    const device T* sinks [[buffer(7), function_constant(has_sinks)]],
+    // Sinks f32 quel que soit T (cf. `attention_nax`).
+    const device float* sinks [[buffer(7), function_constant(has_sinks)]],
     device float* LSE [[buffer(8), function_constant(save_lse)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -3534,3 +3536,11 @@ attention_nax_dsplit<bfloat, 64, 64, 256, 4, 2, float, float, float>;
 template [[host_name("steel_attention_nax_dsplit_bf16_f32out_bq128_bk32_bd256_wm8_wn2")]]
 [[kernel]] decltype(attention_nax_dsplit<bfloat, 128, 32, 256, 8, 2, float, float, float>)
 attention_nax_dsplit<bfloat, 128, 32, 256, 8, 2, float, float, float>;
+
+// Couches pleines de flint (d128, sinks appris, constante 302) : Q et K/V
+// bf16, sinks et sortie f32, noyau plein retenu par MLX pour d ≤ 128. Mesuré
+// le 2026-10-30 (M5 Max, 32/4 têtes, morceau de 4096 derrière 16k-64k clés) :
+// 32-33 TFLOP/s contre 29-31 pour le dsplit WN=2 du d256 et 10 pour le Steel.
+template [[host_name("steel_attention_nax_bf16_f32out_bq64_bk32_bd128_wm4_wn1")]]
+[[kernel]] decltype(attention_nax<bfloat, 64, 32, 128, 128, 4, 1, float, float, float>)
+attention_nax<bfloat, 64, 32, 128, 128, 4, 1, float, float, float>;
