@@ -2409,35 +2409,156 @@ fn encode_matmul_weight_buffers_na_fused_tiled_matches_cpu_when_enabled() -> Res
 
 #[test]
 fn qmm_na_fused_tiled_u4_accepts_dense_and_rejects_shared_shapes() {
+    let eligible = |batch, in_dim, out_dim, min_dim| {
+        can_use_qmm_na_fused_tiled_u4_buffers(
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_BITS,
+            min_dim,
+        )
+    };
+    let default = QMM_NA_U4_DEFAULT_MIN_DIM;
     // Seuil de largeur mesuré (qmm_na_min_batch, défaut 32) : 33 lignes passent, 31 non.
-    assert!(can_use_qmm_na_fused_tiled_u4_buffers(
-        33,
-        2048,
-        2048,
-        FAST_QMV_GROUP_SIZE,
-        FAST_QMV_BITS
-    ));
-    assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        31,
-        2048,
-        2048,
-        FAST_QMV_GROUP_SIZE,
-        FAST_QMV_BITS
-    ));
-    assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        33,
-        2048,
-        512,
-        FAST_QMV_GROUP_SIZE,
-        FAST_QMV_BITS
-    ));
-    assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        33,
-        512,
-        2048,
-        FAST_QMV_GROUP_SIZE,
-        FAST_QMV_BITS
-    ));
+    assert!(eligible(33, 2048, 2048, default));
+    assert!(!eligible(31, 2048, 2048, default));
+    // Plancher par défaut (Qwen, Gemma) : les petites projections restent au qmv.
+    assert!(!eligible(33, 2048, 512, default));
+    assert!(!eligible(33, 512, 2048, default));
+    assert!(!eligible(33, 2048, 1024, default));
+    assert!(!eligible(33, 1024, 2048, default));
+    // Plancher flint : expert partagé 2048↔1024 et k/v 2048→512 passent au NA,
+    // la largeur minimale et le plancher lui-même restent appliqués.
+    let flint = QMM_NA_U4_FLINT_MIN_DIM;
+    assert!(eligible(33, 2048, 512, flint));
+    assert!(eligible(33, 2048, 1024, flint));
+    assert!(eligible(33, 1024, 2048, flint));
+    assert!(!eligible(31, 2048, 512, flint));
+    assert!(!eligible(33, 2048, 448, flint));
+}
+
+/// Formes flint (expert partagé 2048↔1024, k/v 2048→512) : le GEMM NA u4
+/// sous plancher flint contre le qmv f32 du plancher par défaut. Le NA arrondit
+/// entrée et poids déquantifiés en bf16 (erreur relative u = 2⁻⁹ chacun) puis
+/// accumule en f32 : son écart au qmv est borné, élément par élément, par
+/// `Σ|x·w| · (2u + u²)` plus le jeu d'accumulation f32. Il doit aussi coller à
+/// l'oracle CPU qui reproduit ces arrondis bf16.
+#[test]
+fn qmm_na_fused_tiled_u4_flint_shapes_match_qmv_within_bf16_bound() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    if !qmm_na_fused_tiled_u4_enabled() || executor.na_gemm_coop_qb_tiled_u4.is_none() {
+        eprintln!("skip: GEMM NA u4 indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    // 65 lignes : une tuile de 64 et une queue partielle.
+    let batch = 65;
+    let shapes = [(2048_usize, 512_usize), (2048, 1024), (1024, 2048)];
+    let mut runs = Vec::new();
+    for (in_dim, out_dim) in shapes {
+        let weight = test_affine_varied(out_dim, in_dim)?;
+        let buffers = executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(weight.clone()),
+            "flint_small_nax_weight",
+        )?;
+        let mut lhs = Vec::with_capacity(batch * in_dim);
+        for row in 0..batch {
+            lhs.extend_from_slice(&varied_row(in_dim, 17 + row));
+        }
+        runs.push((in_dim, out_dim, weight, buffers, lhs));
+    }
+    let encode = |executor: &MetalExecutor,
+                  in_dim: usize,
+                  out_dim: usize,
+                  buffers: &MetalLinearWeightBuffers,
+                  lhs: &[f32]|
+     -> Result<Vec<f32>> {
+        let lhs_buf = executor.upload_f32_buffer(lhs, "flint_small_nax_lhs")?;
+        let out_buf = executor.uncached_f32_buffer(batch * out_dim, "flint_small_nax_out")?;
+        let command_buffer = executor.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        executor.encode_matmul_weight_buffers(
+            encoder, &lhs_buf, batch, in_dim, buffers, &out_buf, false,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        read_f32_buffer(&out_buf, batch * out_dim)
+    };
+    let select = |executor: &MetalExecutor, in_dim: usize, out_dim: usize| {
+        executor.select_resident_affine_matmul_kernel(
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_BITS,
+            false,
+        )
+    };
+    let mut qmv_outputs = Vec::new();
+    for (in_dim, out_dim, _, buffers, lhs) in &runs {
+        assert!(
+            matches!(
+                select(&executor, *in_dim, *out_dim),
+                AffineMatmulKernel::FastQmvU4
+            ),
+            "plancher par défaut : {in_dim}→{out_dim} doit rester au qmv"
+        );
+        qmv_outputs.push(encode(&executor, *in_dim, *out_dim, buffers, lhs)?);
+    }
+    executor.enable_flint_small_nax_gemm();
+    let u = 2.0_f32.powi(-9);
+    for ((in_dim, out_dim, weight, buffers, lhs), qmv) in runs.iter().zip(&qmv_outputs) {
+        assert!(
+            matches!(
+                select(&executor, *in_dim, *out_dim),
+                AffineMatmulKernel::QmmNaFusedTiledU4
+            ),
+            "plancher flint : {in_dim}→{out_dim} doit passer au GEMM NA"
+        );
+        let nax = encode(&executor, *in_dim, *out_dim, buffers, lhs)?;
+        assert_ne!(&nax, qmv, "{in_dim}→{out_dim} : sortie identique au qmv");
+        let qb = qmm_na_qb_reference(weight, lhs, batch)?;
+        let scales = weight.scales_f32();
+        let biases = weight.biases_f32();
+        let packed = weight.packed_data();
+        let packed_cols = in_dim / 8;
+        let groups = in_dim / 64;
+        let (mut worst_qmv, mut worst_qb) = (0.0_f32, 0.0_f32);
+        for bb in 0..batch {
+            for nn in 0..*out_dim {
+                let mut abs_dot = 0.0_f32;
+                for kk in 0..*in_dim {
+                    let q = (packed[nn * packed_cols + kk / 8] >> ((kk % 8) * 4)) & 0xf;
+                    let g = nn * groups + kk / 64;
+                    let w = q as f32 * scales.as_ref()[g] + biases.as_ref()[g];
+                    abs_dot += (lhs[bb * in_dim + kk] * w).abs();
+                }
+                let idx = bb * out_dim + nn;
+                // Jeu f32 : `in_dim · ε` sur Σ|x·w| (borne de sommation naïve).
+                let accum = *in_dim as f32 * f32::EPSILON * abs_dot;
+                let bound = abs_dot * (2.0 * u + u * u) + 2.0 * accum;
+                let diff_qmv = (nax[idx] - qmv[idx]).abs();
+                let diff_qb = (nax[idx] - qb[idx]).abs();
+                assert!(
+                    diff_qmv <= bound,
+                    "{in_dim}→{out_dim} [{bb},{nn}] : |nax−qmv|={diff_qmv} > borne {bound}"
+                );
+                assert!(
+                    diff_qb <= accum.max(f32::MIN_POSITIVE),
+                    "{in_dim}→{out_dim} [{bb},{nn}] : |nax−qb|={diff_qb} > jeu f32 {accum}"
+                );
+                worst_qmv = worst_qmv.max(diff_qmv / bound.max(f32::MIN_POSITIVE));
+                worst_qb = worst_qb.max(diff_qb / accum.max(f32::MIN_POSITIVE));
+            }
+        }
+        eprintln!(
+            "flint small NAX {in_dim}→{out_dim} : écart/borne qmv max={worst_qmv:.3}, \
+             qb max={worst_qb:.3}"
+        );
+    }
+    Ok(())
 }
 
 #[test]

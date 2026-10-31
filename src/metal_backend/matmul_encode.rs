@@ -271,6 +271,7 @@ impl MetalExecutor {
                 inter_dim,
                 FAST_QMV_GROUP_SIZE,
                 FAST_QMV_BITS,
+                self.qmm_na_u4_min_dim(),
             )
             && can_use_qmm_na_fused_tiled_u4_buffers(
                 batch,
@@ -278,6 +279,7 @@ impl MetalExecutor {
                 in_dim,
                 FAST_QMV_GROUP_SIZE,
                 FAST_QMV_BITS,
+                self.qmm_na_u4_min_dim(),
             )
     }
 

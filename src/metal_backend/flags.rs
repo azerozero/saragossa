@@ -243,6 +243,35 @@ pub(crate) fn with_flint_moe_coop_override<R>(enabled: bool, run: impl FnOnce() 
     let _restore = Restore(FLINT_MOE_COOP_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
     run()
 }
+#[cfg(test)]
+thread_local! {
+    // Par thread, comme la bascule coop : greedy NA contre qmv sur un même
+    // modèle chargé, sans recharger 22 Go de poids.
+    static QMM_NA_U4_MIN_DIM_TEST_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Plancher du GEMM NA u4 forcé sur ce thread, prioritaire sur l'executor.
+#[cfg(test)]
+pub(super) fn qmm_na_u4_min_dim_test_override() -> Option<usize> {
+    QMM_NA_U4_MIN_DIM_TEST_OVERRIDE.with(std::cell::Cell::get)
+}
+
+/// Force le plancher du GEMM NA u4 sur ce thread le temps de `run`.
+#[cfg(test)]
+pub(crate) fn with_qmm_na_u4_min_dim_override<R>(min_dim: usize, run: impl FnOnce() -> R) -> R {
+    /// Rétablit le réglage précédent, panique comprise.
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QMM_NA_U4_MIN_DIM_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore =
+        Restore(QMM_NA_U4_MIN_DIM_TEST_OVERRIDE.with(|cell| cell.replace(Some(min_dim))));
+    run()
+}
+
 pub(super) fn qmm_na_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMM_NA", true))

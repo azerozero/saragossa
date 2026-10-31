@@ -949,6 +949,24 @@ pub(crate) fn flint_prefill_kv_bf16_store_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_PREFILL_KV_BF16_STORE", true))
 }
 
+/// GEMM NA u4 tuilé pour les petites projections de flint (expert partagé
+/// 2048↔1024, k/v 2048→512) au prefill, au lieu du qmv f32. Le plancher
+/// 2048 reste en place pour Qwen et Gemma, dont les mêmes formes divergent en
+/// oracle greedy.
+///
+/// Opt-in `SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM=1`. NOTE: Mesuré le 31 oct.
+/// 2026 sur flint-int4 (M5 Max) : prefill 32k 17,6 → 12,4 s, 64k 42,5 →
+/// 31,6 s, mais l'arrondi bf16 des activations dérive trop pour un défaut.
+/// Prompt long de l'oracle mlx contre le CPU : position 513 à 11,8 / 1,92
+/// (seuils f32 6 / 1, 0,98 / 0,16 sans le flag). Greedy 16k sur du code :
+/// premier token changé (marge qmv 5,4), dérive 20,8 / 3,28 au-delà de mlx
+/// bf16 contre f32 (17 / 2,6) ; l'expert partagé seul en fait 14,8 / 2,0.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", false))
+}
+
 /// K/V des couches glissantes à sinks (flint) borné à leur fenêtre : le
 /// prefill résident ne garde que les `window` dernières lignes de chaque
 /// couche fenêtrée (buffer de `2 × window + morceau` lignes, queue recopiée
