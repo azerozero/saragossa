@@ -946,15 +946,19 @@ impl DecodeResidentState {
         } else {
             (v_raw.tensor().buffer(), 0)
         };
-        let fused = kv.encode_rope_append_kv(
-            encoder,
-            k_source,
-            k_offset,
-            weights.k_norm,
-            v_source,
-            v_offset,
-            &dims,
-        )?;
+        // TODO: élargir l'append fusionné à Qwen et Gemma (value_norm, V séparé,
+        // K=V) après un A/B intégré aux dimensions réelles ; seul flint (sinks)
+        // est prouvé sur poids réels.
+        let fused = kv.has_sinks()
+            && kv.encode_rope_append_kv(
+                encoder,
+                k_source,
+                k_offset,
+                weights.k_norm,
+                v_source,
+                v_offset,
+                &dims,
+            )?;
         if !fused {
             self.encode_rms_norm_rope_decode_with_offset(
                 encoder,

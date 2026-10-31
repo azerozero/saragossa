@@ -1095,12 +1095,12 @@ fn qwen_dense_gated_tensors() -> Vec<(String, Fixture)> {
     out
 }
 
-/// Rotation de K et append K/V fusionnés sur le chemin dense commun, côté
-/// Qwen à porte de sortie : logits du decode résident (K/V f32 et bf16)
-/// bit-identiques au chemin historique du kill-switch, chemin emprunté.
+/// L'append fusionné est réservé à flint (sinks) : un Qwen dense à porte de
+/// sortie garde la rotation puis l'append historiques (aucun passage compté),
+/// avec des logits (K/V f32 et bf16) bit-identiques, flag actif ou non.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
-fn synthetic_qwen_dense_gated_rope_append_kv_is_bit_identical() {
+fn synthetic_qwen_dense_gated_keeps_historical_kv_append() {
     let raw = serde_json::json!({
         "model_type": "qwen3",
         "hidden_size": HIDDEN,
@@ -1153,12 +1153,9 @@ fn synthetic_qwen_dense_gated_rope_append_kv_is_bit_identical() {
         start,
         "append fusionné employé malgré le kill-switch"
     );
-    let fused = crate::runtime_flags::with_rope_append_kv_override(true, fingerprint);
-    assert!(hits() - start >= 2 * 2 * 4, "append fusionné non emprunté");
-    assert_eq!(
-        fused, split,
-        "Qwen dense: append fusionné != rotation puis append"
-    );
+    let enabled = crate::runtime_flags::with_rope_append_kv_override(true, fingerprint);
+    assert_eq!(hits(), start, "Qwen dense hors du chemin historique");
+    assert_eq!(enabled, split, "Qwen dense: decode modifié par le flag");
 }
 
 /// Rotation de K et append K/V fusionnés dans le decode de flint : un
