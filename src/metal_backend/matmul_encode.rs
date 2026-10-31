@@ -4,6 +4,13 @@ use super::*;
 
 const MATMUL_ROW_TG_WIDTH: u64 = 256;
 
+#[cfg(test)]
+thread_local! {
+    // Dispatches skinny encodés sur ce thread : les tests de précision vérifient
+    // qu'ils comparent bien le kernel skinny et non deux replis qmv identiques.
+    pub(super) static SKINNY_DISPATCHES: Cell<usize> = const { Cell::new(0) };
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "wrappers d'encodage Metal: buffers, dimensions et offsets restent explicites"
@@ -81,6 +88,8 @@ impl MetalExecutor {
             4,
         ));
         trace_dispatch_path("qmm_skinny_u4_gs64_f32", batch, out_dim, in_dim);
+        #[cfg(test)]
+        SKINNY_DISPATCHES.with(|count| count.set(count.get() + 1));
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(

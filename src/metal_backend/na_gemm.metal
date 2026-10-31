@@ -772,12 +772,12 @@ kernel void gemm_nax_skinny_u4_x3(device const float* A [[buffer(0)]],
 // Variante « ×2 » du skinny u4 gs64 : l'entier q ∈ [0, 15] est exact en bf16, donc
 // le MMA porte sur q brut et seule l'activation est scindée (hi + lo, deux MMA au
 // lieu de trois, sans déquantification ni scission de B). L'échelle et le biais
-// changent tous les 64 de K : chaque groupe accumule P = Σ A·q dans ses propres
-// fragments, puis l'épilogue f32 ajoute s·P + b·Σ_g A au résultat. Σ_g A (somme
-// f32 de l'activation sur le groupe) se réduit par shuffles : les lanes d'une même
-// ligne de fragment ne diffèrent que par les bits 0 et 3 (cf. `get_coord`).
-// Les produits A_hi·q et A_lo·q sont exacts en f32 ; l'erreur vient de A_hi + A_lo
-// (2⁻¹⁶ relatif) et des sommes f32, contre 2⁻¹⁶ sur A **et** sur B pour le ×3.
+// changent tous les 64 de K : chaque groupe accumule P = Σ Â·q (Â = A_hi + A_lo)
+// dans ses propres fragments, puis l'épilogue f32 ajoute s·P + b·Σ_g Â, soit
+// Σ (s·q + b)·Â. Σ_g Â se réduit par shuffles : les lanes d'une même ligne de
+// fragment ne diffèrent que par les bits 0 et 3 (cf. `get_coord`). Les produits
+// A_hi·q et A_lo·q sont exacts en f32 ; l'erreur vient de Â − A (2⁻¹⁶ relatif) et
+// des sommes f32, contre 2⁻¹⁶ sur A **et** sur B pour le ×3.
 // Split-K : span = K/4 multiple de 128 (K % 512 == 0), aucun groupe n'est coupé.
 static inline void gemm_nax_skinny_u4_x2_body(device const float* A, device const uint* Bp,
                                               device const bfloat* Bs, device const bfloat* Bb,
@@ -812,8 +812,12 @@ static inline void gemm_nax_skinny_u4_x2_body(device const float* A, device cons
           float x = (row < M) ? pa[j] : 0.0f;
           bfloat h = bfloat(x);
           Ah[i * 4 + j] = h;
-          Al[i * 4 + j] = bfloat(x - float(h));
-          rs += x;
+          bfloat l = bfloat(x - float(h));
+          Al[i * 4 + j] = l;
+          // Σ_g Â et non Σ_g A : le biais doit porter sur la même activation que
+          // le MMA, sinon s·Σ q(Â − A) ne s'annule plus avec b (3 % d'erreur
+          // quand s·q + b ≈ 0). h + l est exact en f32 (deux mantisses de 8 bits).
+          rs += float(h) + float(l);
         }
         if (i == 0) { sa0 += rs; } else { sa1 += rs; }
       }
