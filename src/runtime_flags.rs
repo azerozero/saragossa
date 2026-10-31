@@ -953,19 +953,21 @@ pub(crate) fn flint_prefill_kv_bf16_store_enabled() -> bool {
 /// partagé 2048↔1024, k/v 2048→512) au prefill, au lieu du qmv f32. Le
 /// plancher 2048 reste en place pour Qwen et Gemma.
 ///
-/// Opt-in `SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM=1`. NOTE: Mesuré le 31 oct.
-/// 2026 sur flint-int4 (M5 Max) : prefill 32k 15,6 → 10,7 s, 64k 38,4 →
-/// 28,7 s. Le bf16×3 colle à la référence f32 (écart relatif ~5e-7) et
-/// l'oracle mlx passe : prompt long 2,32 / 0,33 au pire, position 513 à
-/// 1,13 / 0,20 (2,51 / 0,42 et 0,98 / 0,16 sans le flag ; 11,8 / 1,92 avec
-/// l'ancien GEMM bf16). Reste opt-in faute de greedy identique au qmv sur
-/// le prompt de code 16k : le premier token y est une quasi-égalité à
-/// plusieurs candidats (marge 0,40), que le qmv seul tranche autrement selon
-/// la taille de morceau du prefill (4096 contre 2048).
+/// Actif par défaut, kill-switch `SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM=0`.
+/// NOTE: Mesuré le 31 oct. 2026 sur flint-int4 (M5 Max). Prefill seul : 32k
+/// 15,6 → 10,7 s, 64k 38,4 → 28,7 s. Serve, même binaire, flag 0 puis 1 :
+/// TTFT 32k 13,2 / 13,7 / 16,0 → 9,9 / 11,5 / 11,4 s, 64k 35,8 → 27,0 s,
+/// 115k 77,9 → 62,1 s, intégrité 4/4 sur les six contextes, decode et pic
+/// mémoire inchangés. Le bf16×3 colle à la référence f32 (écart relatif
+/// ~5e-7) ; oracle mlx du prompt long 2,32 / 0,33 au pire contre 2,51 / 0,42
+/// pour le qmv (11,8 / 1,92 avec l'ancien GEMM bf16). Le greedy de code 16k
+/// change au premier token, une quasi-égalité (marge 0,40) que le qmv seul
+/// tranche aussi autrement avec des morceaux de prefill de 2048 au lieu de
+/// 4096.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", true))
 }
 
 /// K/V des couches glissantes à sinks (flint) borné à leur fenêtre : le

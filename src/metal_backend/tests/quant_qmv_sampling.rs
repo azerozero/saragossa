@@ -2576,6 +2576,12 @@ fn qmm_na_fused_tiled_u4_flint_shapes_x3_match_f32_reference() -> Result<()> {
         };
         let mut worst = 0.0_f64;
         for idx in 0..batch * out_dim {
+            // `f64::max` ignore un NaN : une sortie non finie passerait sinon.
+            assert!(
+                nax[idx].is_finite(),
+                "{in_dim}→{out_dim} [{idx}] : sortie non finie {}",
+                nax[idx]
+            );
             let rel = (f64::from(nax[idx]) - exact[idx]).abs() / abs_dot[idx].max(1e-30);
             worst = worst.max(rel);
             if let Some(qb) = &qb {
