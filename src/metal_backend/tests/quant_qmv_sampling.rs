@@ -2610,6 +2610,86 @@ fn qmm_na_fused_tiled_u4_flint_shapes_x3_match_f32_reference() -> Result<()> {
     Ok(())
 }
 
+/// k/v du Qwen 27B (5120→1024) ouverts par forme exacte : seul ce couple
+/// passe au GEMM NA bf16×3, les autres petites formes Qwen gardent le qmv, et
+/// la sortie colle à la référence f32 pure (f64), finie partout.
+#[test]
+fn qmm_na_fused_tiled_u4_qwen_kv_x3_matches_f32_reference() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    if !qmm_na_fused_tiled_u4_enabled() || executor.na_gemm_coop_qb_tiled_u4_x3.is_none() {
+        eprintln!("skip: GEMM NA u4 x3 indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    // 65 lignes : une tuile de 64 et une queue partielle.
+    let (batch, in_dim, out_dim) = (65_usize, 5120_usize, 1024_usize);
+    let select = |executor: &MetalExecutor, in_dim: usize, out_dim: usize| {
+        executor.select_resident_affine_matmul_kernel(
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_BITS,
+            false,
+        )
+    };
+    let is_qmv = |kernel| matches!(kernel, AffineMatmulKernel::FastQmvU4);
+    assert!(is_qmv(select(&executor, in_dim, out_dim)), "plancher par défaut");
+    executor.allow_qmm_na_u4_x3_shape(in_dim, out_dim);
+    assert!(matches!(
+        select(&executor, in_dim, out_dim),
+        AffineMatmulKernel::QmmNaFusedTiledU4
+    ));
+    // Expert partagé Qwen 30B/Next (2048↔512), k/v 2048→512 et une autre
+    // sortie 1024 : toujours au qmv.
+    for (other_in, other_out) in [(2048, 512), (512, 2048), (4096, 1024), (5120, 512)] {
+        assert!(
+            is_qmv(select(&executor, other_in, other_out)),
+            "{other_in}→{other_out} doit rester au qmv"
+        );
+    }
+    let weight = test_affine_varied(out_dim, in_dim)?;
+    let buffers = executor.resolve_linear_weight_buffers(
+        &LinearWeight::AffineQuantized(weight.clone()),
+        "qwen_kv_x3_weight",
+    )?;
+    let mut lhs = Vec::with_capacity(batch * in_dim);
+    for row in 0..batch {
+        lhs.extend_from_slice(&varied_row(in_dim, 29 + row));
+    }
+    let lhs_buf = executor.upload_f32_buffer(&lhs, "qwen_kv_x3_lhs")?;
+    let out_buf = executor.uncached_f32_buffer(batch * out_dim, "qwen_kv_x3_out")?;
+    let before = crate::metal_backend::qmm_na_u4_x3_dispatches_for_test();
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_matmul_weight_buffers(
+        encoder, &lhs_buf, batch, in_dim, &buffers, &out_buf, false,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    assert_eq!(
+        crate::metal_backend::qmm_na_u4_x3_dispatches_for_test(),
+        before + 1,
+        "le bf16×3 doit être dispatché"
+    );
+    let nax = read_f32_buffer(&out_buf, batch * out_dim)?;
+    let (exact, abs_dot) = qmm_u4_f64_reference(&weight, &lhs, batch);
+    let mut worst = 0.0_f64;
+    for idx in 0..batch * out_dim {
+        // `f64::max` ignore un NaN : une sortie non finie passerait sinon.
+        assert!(nax[idx].is_finite(), "[{idx}] : sortie non finie {}", nax[idx]);
+        let rel = (f64::from(nax[idx]) - exact[idx]).abs() / abs_dot[idx].max(1e-30);
+        worst = worst.max(rel);
+    }
+    // Même garde-fou empirique que les formes flint (≈3u² de représentation,
+    // plus le jeu de l'accumulation f32 sur K = 5120).
+    let budget = 1e-5;
+    eprintln!("Qwen k/v NAX x3 {in_dim}→{out_dim} : écart relatif max {worst:.3e}, budget {budget:.3e}");
+    assert!(worst <= budget, "écart relatif {worst:.3e} > {budget:.3e}");
+    Ok(())
+}
+
 #[test]
 fn affine_qmv_one_u8_gs64_matches_cpu_on_shared_gate_shape() -> Result<()> {
     let Some(executor) = test_executor()? else {

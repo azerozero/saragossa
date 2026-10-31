@@ -87,6 +87,31 @@ pub enum RopeStyle {
     Interleaved,
 }
 
+/// Forme `(in_dim, out_dim)` des k/v full-attention du Qwen 27B dense
+/// (hidden 5120, 4 têtes K/V de 256), seule forme Qwen validée sous le
+/// plancher du GEMM NA u4 par ses oracles (référence f64, greedy réel).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const QWEN_27B_KV_SHAPE: (usize, usize) = (5120, 1024);
+
+/// Forme `(in_dim, out_dim)` des k/v full-attention (`kv_shapes`, poids
+/// `[out, in]`) à ouvrir au GEMM NA u4 bf16×3, pour le seul Qwen 27B dense
+/// ([`QWEN_27B_KV_SHAPE`] sur toutes ses couches full). Les MoE Qwen (30B,
+/// Qwen3-Next) ont des experts partagés sous le plancher, non validés, et
+/// restent exclus comme flint et Gemma.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn qwen_kv_nax_x3_shape(
+    config: &CausalDecoderConfig,
+    kv_shapes: &[&[usize]],
+) -> Option<(usize, usize)> {
+    let dense_qwen = config.is_qwen
+        && config.num_experts.unwrap_or(0) == 0
+        && !config.attention_sinks
+        && !config.is_gemma4;
+    let validated = |shape: &&[usize]| matches!(shape, [out_dim, in_dim] if (*in_dim, *out_dim) == QWEN_27B_KV_SHAPE);
+    (dense_qwen && !kv_shapes.is_empty() && kv_shapes.iter().all(validated))
+        .then_some(QWEN_27B_KV_SHAPE)
+}
+
 #[derive(Clone, Debug)]
 /// Décrit les dimensions et options d'un décodeur causal.
 pub struct CausalDecoderConfig {
@@ -2329,9 +2354,28 @@ impl CausalDecoder {
         if flint && crate::runtime_flags::flint_small_nax_gemm_enabled() {
             executor.enable_flint_small_nax_gemm();
         }
+        if let Some((in_dim, out_dim)) = self.qwen_kv_nax_x3_shape() {
+            if crate::runtime_flags::qwen_kv_nax_x3_enabled() {
+                executor.allow_qmm_na_u4_x3_shape(in_dim, out_dim);
+            }
+        }
         self.enable_single_copy_weights(&executor)?;
         self.runtime.metal = Some(Arc::new(executor));
         Ok(self)
+    }
+
+    /// Forme k/v à ouvrir au GEMM NA u4 bf16×3 ([`qwen_kv_nax_x3_shape`]).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn qwen_kv_nax_x3_shape(&self) -> Option<(usize, usize)> {
+        let kv_shapes = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attention {
+                AttentionBlock::Full(attention) => Some(attention.k_proj.weight().shape()),
+                AttentionBlock::Linear(_) => None,
+            })
+            .collect::<Vec<_>>();
+        qwen_kv_nax_x3_shape(&self.config, &kv_shapes)
     }
 
     /// Refuse les chemins Metal per-op et spéculatifs pour un modèle qu'ils ne

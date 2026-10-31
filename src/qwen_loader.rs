@@ -1130,6 +1130,8 @@ mod flint_tests;
 mod gemma4_test_fixtures;
 #[cfg(test)]
 mod gemma4_tests;
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod qwen_kv_x3_tests;
 #[cfg(test)]
 mod test_fixtures;
 #[cfg(test)]

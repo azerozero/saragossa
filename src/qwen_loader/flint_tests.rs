@@ -1335,7 +1335,7 @@ struct RowGap {
     same_argmax: bool,
 }
 
-fn argmax(row: &[f32]) -> Option<usize> {
+pub(super) fn argmax(row: &[f32]) -> Option<usize> {
     row.iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))
@@ -2132,9 +2132,9 @@ fn flint_int4_prefill_nax_window_drift() {
 // f32 ci-dessus) : garde-fou large de la dérive d'un K/V de prefill stocké en
 // bf16, pas un budget transférable.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-const MAX_GAP_MLX_BF16: f32 = 17.0;
+pub(super) const MAX_GAP_MLX_BF16: f32 = 17.0;
 #[cfg(all(target_os = "macos", feature = "metal"))]
-const MEAN_GAP_MLX_BF16: f32 = 2.6;
+pub(super) const MEAN_GAP_MLX_BF16: f32 = 2.6;
 
 /// MoE routé groupé (coop) contre qmv sur flint-int4 réel : prompt
 /// synthétique de `SARAGOSSA_FLINT_COOP_LEN` tokens (16 384 par défaut),
@@ -2457,7 +2457,7 @@ fn flint_int4_small_nax_gemm_greedy_matches_qmv() {
 
 /// Écart max entre deux lignes de logits, après retrait du décalage moyen.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn centered_max_gap(a: &[f32], b: &[f32]) -> f32 {
+pub(super) fn centered_max_gap(a: &[f32], b: &[f32]) -> f32 {
     let shift = a.iter().zip(b).map(|(x, y)| x - y).sum::<f32>() / b.len() as f32;
     a.iter()
         .zip(b)
@@ -2496,7 +2496,7 @@ fn timed_prefills(
 
 /// Texte synthétique déterministe tokenisé, tronqué à `len` tokens.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn synthetic_long_prompt(assets: &ModelAssets, len: usize) -> Vec<usize> {
+pub(super) fn synthetic_long_prompt(assets: &ModelAssets, len: usize) -> Vec<usize> {
     const SUBJECTS: [&str; 5] = [
         "The engineer",
         "A small robot",

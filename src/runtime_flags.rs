@@ -970,6 +970,18 @@ pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", true))
 }
 
+/// GEMM NA u4 tuilé bf16×3 pour les seules projections k/v (5120→1024) des
+/// couches full-attention du Qwen 27B dense au prefill, au lieu du qmv f32.
+/// Les autres petites projections Qwen (beta/alpha, expert partagé de Qwen
+/// 30B et Qwen3-Next) restent au qmv.
+///
+/// Actif par défaut, kill-switch `SARAGOSSA_RUST_QWEN_KV_NAX_X3=0`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn qwen_kv_nax_x3_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QWEN_KV_NAX_X3", true))
+}
+
 /// K/V des couches glissantes à sinks (flint) borné à leur fenêtre : le
 /// prefill résident ne garde que les `window` dernières lignes de chaque
 /// couche fenêtrée (buffer de `2 × window + morceau` lignes, queue recopiée

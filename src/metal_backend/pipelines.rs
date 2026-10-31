@@ -911,6 +911,7 @@ impl MetalExecutor {
             ),
             prefill_sink_steel: crate::runtime_flags::flint_prefill_steel_enabled(),
             qmm_na_u4_min_dim: QMM_NA_U4_DEFAULT_MIN_DIM,
+            qmm_na_u4_x3_shapes: Vec::new(),
             prefill_window_kv: crate::runtime_flags::flint_window_kv_enabled(),
             causal_attention_prefill_steel_nax_d256,
             attention_prefill_nax_sink_d128,

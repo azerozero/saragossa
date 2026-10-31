@@ -35,6 +35,36 @@ impl MetalExecutor {
         }
     }
 
+    /// Ouvre la seule forme `in_dim → out_dim` au GEMM NA u4 sous le
+    /// plancher, servie par le bf16×3 : appelé pour les k/v 5120→1024 du
+    /// Qwen 27B dense, sans abaisser le plancher des autres projections (les
+    /// petites formes de Qwen 30B et Qwen3-Next restent au qmv). Sans le
+    /// pipeline x3, rien ne change (repli qmv).
+    pub(crate) fn allow_qmm_na_u4_x3_shape(&mut self, in_dim: usize, out_dim: usize) {
+        if self.na_gemm_coop_qb_tiled_u4_x3.is_some()
+            && in_dim.min(out_dim) < QMM_NA_U4_DEFAULT_MIN_DIM
+            && !self.qmm_na_u4_x3_shapes.contains(&(in_dim, out_dim))
+        {
+            self.qmm_na_u4_x3_shapes.push((in_dim, out_dim));
+        }
+    }
+
+    /// Plancher du GEMM NA u4 pour la forme `in_dim → out_dim` : nul pour une
+    /// forme ouverte par [`Self::allow_qmm_na_u4_x3_shape`], sinon le plancher
+    /// de l'executor. La surcharge de test l'emporte sur les deux.
+    #[inline]
+    fn qmm_na_u4_min_dim_for(&self, in_dim: usize, out_dim: usize) -> usize {
+        #[cfg(test)]
+        if let Some(min_dim) = super::flags::qmm_na_u4_min_dim_test_override() {
+            return min_dim;
+        }
+        if self.qmm_na_u4_x3_shapes.contains(&(in_dim, out_dim)) {
+            0
+        } else {
+            self.qmm_na_u4_min_dim
+        }
+    }
+
     /// Plancher effectif du GEMM NA u4 (surcharge de test comprise).
     #[inline]
     pub(super) fn qmm_na_u4_min_dim(&self) -> usize {
@@ -73,7 +103,7 @@ impl MetalExecutor {
                 out_dim,
                 group_size,
                 bits,
-                self.qmm_na_u4_min_dim(),
+                self.qmm_na_u4_min_dim_for(in_dim, out_dim),
             )
         {
             AffineMatmulKernel::QmmNaFusedTiledU4
@@ -139,7 +169,14 @@ impl MetalExecutor {
         } else if can_use_fast_affine_qmm8(batch, in_dim, weight) {
             AffineMatmulKernel::Qmm8
         } else if self.qmm_na_fused_tiled_u4_available(weight.group_size())
-            && can_use_qmm_na_fused_tiled_u4(batch, in_dim, weight, self.qmm_na_u4_min_dim())
+            && can_use_qmm_na_fused_tiled_u4(
+                batch,
+                in_dim,
+                weight,
+                fast_affine_qmv_out_dim(weight).map_or(self.qmm_na_u4_min_dim(), |out_dim| {
+                    self.qmm_na_u4_min_dim_for(in_dim, out_dim)
+                }),
+            )
         {
             AffineMatmulKernel::QmmNaFusedTiledU4
         } else if self.qmm_na_fused_tiled_u4_align64_available(weight.group_size())
