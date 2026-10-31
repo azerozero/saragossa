@@ -879,9 +879,10 @@ fn encode_block_layer(
 }
 
 /// Attention du bloc : RoPE Q/K aux positions `context_len + ligne`, K/V du bloc
-/// apposés transitoirement après le contexte, attention causale en lignes (ou
-/// ligne par ligne fenêtrée quand la fenêtre glissante borne le contexte), puis
-/// KV ramené à `context_len`.
+/// apposés transitoirement après le contexte, attention causale en lignes (la
+/// fenêtre glissante bornant chaque ligne à ses `window` dernières positions),
+/// puis KV ramené à `context_len`. Repli ligne par ligne sur le kernel naïf
+/// fenêtré hors chemin en lignes ou sous `SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS=0`.
 #[expect(
     clippy::too_many_arguments,
     reason = "Q/K/V bruts, contexte de sortie et dimensions d'une couche"
@@ -929,7 +930,7 @@ fn encode_block_attention(
     }
     let window = layer.sliding_window;
     let windowed = window.is_some_and(|window| context_len + block > window);
-    if !windowed && layer.kv.rows_fused_supported() {
+    if (!windowed || windowed_rows_enabled()) && layer.kv.rows_fused_supported() {
         layer.kv.encode_append_kv_rows(
             encoder,
             kernels,
@@ -947,6 +948,7 @@ fn encode_block_attention(
             q_roped.tensor().buffer(),
             ctx,
             block,
+            window.filter(|_| windowed),
         )?;
     } else {
         // Ligne par ligne : chaque ligne n'attend que le contexte et les lignes ≤ elle.
@@ -997,6 +999,14 @@ fn encode_block_attention(
         }
     }
     layer.kv.truncate(context_len)
+}
+
+/// Attention fenêtrée du bloc en lignes (défaut) ; `SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS=0`
+/// rétablit la boucle naïve ligne par ligne, référence de dérive et de débit.
+fn windowed_rows_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS", true))
 }
 
 /// `prepare` de la convolution : noyau dynamique (projection) puis entrée convolée

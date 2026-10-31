@@ -30,6 +30,7 @@ kernel void attention_decode_flash_rows_SUFFIX(
     device const KV_T* values [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
+    constant uint& window [[buffer(5)]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tg [[threadgroup_position_in_grid]]
@@ -72,7 +73,10 @@ kernel void attention_decode_flash_rows_SUFFIX(
 
     float max_score = -INFINITY;
     float sum_exp_score = 0.0f;
-    for (uint r = simd_gid; r < len; r += BN) {
+    // Fenêtre glissante (`window` > 0) : la ligne n'attend que ses `window`
+    // dernières positions, début propre à chaque ligne.
+    const uint start = (window != 0u && len > window) ? (len - window) : 0u;
+    for (uint r = start + simd_gid; r < len; r += BN) {
         const uint k_start = r * kv_dim + kv_head_start;
         float score = 0.0f;
         for (uint j = 0u; j < elems_per_thread; ++j) {
@@ -212,6 +216,7 @@ kernel void attention_decode_flash_rows_dDHEAD_SUFFIX(
     device const KV_T* values [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
+    constant uint& window [[buffer(5)]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tg [[threadgroup_position_in_grid]]
@@ -247,7 +252,10 @@ kernel void attention_decode_flash_rows_dDHEAD_SUFFIX(
 
     float max_score = -INFINITY;
     float sum_exp_score = 0.0f;
-    for (uint r = simd_gid; r < len; r += BN) {
+    // Fenêtre glissante (`window` > 0) : la ligne n'attend que ses `window`
+    // dernières positions, début propre à chaque ligne.
+    const uint start = (window != 0u && len > window) ? (len - window) : 0u;
+    for (uint r = start + simd_gid; r < len; r += BN) {
         const uint k_start = r * kv_dim + kv_head_start;
         float score = 0.0f;
         for (uint j = 0u; j < ELEMS_PER_THREAD; ++j) {
@@ -307,6 +315,7 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
     device float* sums [[buffer(4)]],
     device float* maxs [[buffer(5)]],
     constant uint4& dims [[buffer(6)]],
+    constant uint& window [[buffer(7)]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]
@@ -334,15 +343,19 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
         const device float* q_ = q + slot * D + simd_lid * QK;
         for (uint j = 0u; j < QK; ++j) { ql[j] = scale * q_[j]; }
     }
-    const device KV_T* k_ = keys + block_idx * kv_dim + kv_head * D + simd_lid * QK;
-    const device KV_T* v_ = values + block_idx * kv_dim + kv_head * D + simd_lid * QK;
+    // Fenêtre glissante (`window` > 0) : début propre à chaque ligne, les blocs
+    // split-K partitionnent `[start, len)` au lieu de `[0, len)`.
+    const uint start = (window != 0u && len > window) ? (len - window) : 0u;
+    const uint first = start + block_idx;
+    const device KV_T* k_ = keys + first * kv_dim + kv_head * D + simd_lid * QK;
+    const device KV_T* v_ = values + first * kv_dim + kv_head * D + simd_lid * QK;
 
     float o[QK];
     for (uint j = 0u; j < QK; ++j) { o[j] = 0.0f; }
     float max_score = -INFINITY;
     float sum_exp = 0.0f;
 
-    for (uint i = block_idx; i < len; i += blocks) {
+    for (uint i = first; i < len; i += blocks) {
         float score = 0.0f;
         for (uint j = 0u; j < QK; ++j) { score += ql[j] * float(k_[j]); }
         score = simd_sum(score);
@@ -609,12 +622,14 @@ impl FullAttentionMetalState {
     /// Attention des `rows` dernières lignes appendues : la ligne `row` (requête
     /// `q_rows[row·q_dim ..]`) attend sur `len - rows + row + 1` positions et écrit
     /// `out_rows[row·q_dim ..]`. 2-passes en lignes dès `len ≥ seuil` (chunks de
-    /// lignes bornés par le threadgroup), flash en lignes sinon.
+    /// lignes bornés par le threadgroup), flash en lignes sinon. Avec une fenêtre
+    /// glissante `window`, la ligne de longueur `l` n'attend que les positions
+    /// `[max(0, l − window), l)` (KV dense non borné : positions absolues).
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si `rows > len`, si le KV n'est pas f32/bf16 ou si une
-    /// dimension déborde.
+    /// Renvoie une erreur si `rows > len`, si le KV n'est pas f32/bf16, si une
+    /// fenêtre est nulle ou demandée sur un KV quantifié, ou si une dimension déborde.
     pub(super) fn encode_attention_decode_rows(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -622,6 +637,7 @@ impl FullAttentionMetalState {
         q_rows: &BufferRef,
         out_rows: &BufferRef,
         rows: usize,
+        window: Option<usize>,
     ) -> Result<()> {
         self.encode_attention_decode_rows_chunked(
             encoder,
@@ -629,12 +645,17 @@ impl FullAttentionMetalState {
             q_rows,
             out_rows,
             rows,
+            window,
             rows_group_override(),
         )
     }
 
     /// Cœur de [`Self::encode_attention_decode_rows`] ; `max_rows_per_group`
     /// borne les lignes par threadgroup du 2-passes (tests : chunks forcés).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: buffers Q/sortie, lignes, fenêtre et découpage"
+    )]
     pub(super) fn encode_attention_decode_rows_chunked(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -642,6 +663,7 @@ impl FullAttentionMetalState {
         q_rows: &BufferRef,
         out_rows: &BufferRef,
         rows: usize,
+        window: Option<usize>,
         max_rows_per_group: Option<usize>,
     ) -> Result<()> {
         let len = self.stored_len();
@@ -665,7 +687,27 @@ impl FullAttentionMetalState {
         // Même choix flash/2-passes que `encode_attention_decode_dims`, évalué sur la
         // longueur de la DERNIÈRE ligne du chunk (toujours 2-passes si quantifié).
         let quant = self.quant();
+        // Fenêtre → `u32` lu par les kernels (0 = sans fenêtre). Le 2-passes
+        // quantifié n'a pas de borne basse : refus plutôt qu'une attention fausse.
+        let window_u32 = match window {
+            None => 0,
+            Some(0) => {
+                return Err(InferError::Dimension(
+                    "attention rows: fenêtre nulle".to_string(),
+                ));
+            }
+            Some(_) if quant.is_some() => {
+                return Err(InferError::Config(
+                    "attention rows fenêtrée sur KV quantifié non supportée".to_string(),
+                ));
+            }
+            Some(window) => to_u32(window, "attention rows window")?,
+        };
+        // Longueur réellement lue par une ligne : c'est elle qui choisit le kernel
+        // et la grille split-K, comme pour un KV de cette longueur.
+        let effective = |length: usize| window.map_or(length, |window| length.min(window));
         let two_pass_for = |length: usize| {
+            let length = effective(length);
             quant.is_some()
                 || sdpa_2pass_enabled()
                     && flash_sdpa_enabled()
@@ -709,7 +751,8 @@ impl FullAttentionMetalState {
         // avec le choix et les blocs de SA longueur, pour rester bit-identique à la
         // boucle par ligne.
         let boundary = two_pass_for(len0) != two_pass_for(len)
-            || (two_pass_for(len) && sdpa_2pass_blocks(len0) != sdpa_2pass_blocks(len));
+            || (two_pass_for(len)
+                && sdpa_2pass_blocks(effective(len0)) != sdpa_2pass_blocks(effective(len)));
         let threads_per_row = 32 * gqa;
         let group_limit = usize::try_from(pass1.max_total_threads_per_threadgroup())
             .unwrap_or(threads_per_row)
@@ -744,6 +787,7 @@ impl FullAttentionMetalState {
                 encoder.set_buffer(2, Some(self.values().buffer()), 0);
                 encoder.set_buffer(3, Some(out_rows), row_offset);
                 set_bytes(encoder, 4, &dims);
+                set_bytes(encoder, 5, &[window_u32]);
                 crate::metal_backend::profile_dispatch();
                 encoder.dispatch_thread_groups(
                     MTLSize::new(u64::from(dims[0]), to_u64(chunk, "attention rows")?, 1),
@@ -753,7 +797,7 @@ impl FullAttentionMetalState {
                 start += chunk;
                 continue;
             }
-            let blocks = sdpa_2pass_blocks(chunk_len0 + chunk - 1);
+            let blocks = sdpa_2pass_blocks(effective(chunk_len0 + chunk - 1));
             let blocks_u32 = to_u32(blocks, "attention rows blocks")?;
             let reduce_cells = q_heads
                 .checked_mul(chunk)
@@ -784,6 +828,8 @@ impl FullAttentionMetalState {
             if let Some(quant) = quant {
                 encoder.set_buffer(7, Some(quant.keys.scales().buffer()), 0);
                 encoder.set_buffer(8, Some(quant.values.scales().buffer()), 0);
+            } else {
+                set_bytes(encoder, 7, &[window_u32]);
             }
             crate::metal_backend::profile_dispatch();
             encoder.dispatch_thread_groups(
