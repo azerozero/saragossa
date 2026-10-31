@@ -1821,14 +1821,13 @@ fn flint_int4_prefill_nax_window_drift() {
     assert!(max > 0.0, "logits identiques : NAX fenêtré non exécuté ?");
     assert_eq!(nax_tokens, naive_tokens, "greedy NAX fenêtré != naïf");
     assert_eq!(argmax_ok, rows.len(), "argmax NAX fenêtré divergent");
-    assert!(
-        max < MAX_GAP_MLX_BF16,
-        "écart max {max} ≥ {MAX_GAP_MLX_BF16}"
-    );
-    assert!(
-        mean < MEAN_GAP_MLX_BF16,
-        "écart moyen {mean} ≥ {MEAN_GAP_MLX_BF16}"
-    );
+    // NOTE: Mesuré le 31 oct. 2026 (16 400 tokens, cinq morceaux de 3280) :
+    // max 3,57 (ligne 9840), pire moyenne 0,34, argmax 18/18, greedy
+    // identique. Bornes propres à cette dérive (bf16 contre bf16), reprises
+    // des seuils f32 de l'oracle mlx et non des bornes mlx bf16 (17/2,6),
+    // trop larges pour détecter une régression du masque de fenêtre.
+    assert!(max < MAX_GAP_F32, "écart max {max} ≥ {MAX_GAP_F32}");
+    assert!(mean < MEAN_GAP_F32, "écart moyen {mean} ≥ {MEAN_GAP_F32}");
 }
 
 // Écart propre de mlx bf16 contre mlx f32 sur l'oracle flint (cf. les seuils
