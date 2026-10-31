@@ -930,7 +930,9 @@ fn encode_block_attention(
     }
     let window = layer.sliding_window;
     let windowed = window.is_some_and(|window| context_len + block > window);
-    if (!windowed || windowed_rows_enabled()) && layer.kv.rows_fused_supported() {
+    if (!windowed || crate::runtime_flags::dflash_windowed_rows())
+        && layer.kv.rows_fused_supported()
+    {
         layer.kv.encode_append_kv_rows(
             encoder,
             kernels,
@@ -999,14 +1001,6 @@ fn encode_block_attention(
         }
     }
     layer.kv.truncate(context_len)
-}
-
-/// Attention fenêtrée du bloc en lignes (défaut) ; `SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS=0`
-/// rétablit la boucle naïve ligne par ligne, référence de dérive et de débit.
-fn windowed_rows_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS", true))
 }
 
 /// `prepare` de la convolution : noyau dynamique (projection) puis entrée convolée

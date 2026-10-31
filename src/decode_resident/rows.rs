@@ -5,8 +5,11 @@
 //! kernel 2-passes en lignes lit chaque bloc KV une fois pour `gqa × rows`
 //! simdgroups (le L1 sert les relectures), là où la boucle par ligne relisait
 //! tout le KV par ligne. Les kernels reprennent l'arithmétique des kernels
-//! mono-ligne (même ordre d'accumulation) : résultats bit-identiques, prouvés
-//! par `full_attn_rows_fused_matches_row_loop` (tests).
+//! mono-ligne (même ordre d'accumulation) : résultats bit-identiques sans
+//! fenêtre, prouvés par `full_attn_rows_fused_matches_row_loop` (tests). Avec
+//! fenêtre (drafter DFlash), flash/2-passes et split-K se choisissent sur la
+//! longueur effective de chaque ligne : l'ordre de réduction diffère du naïf
+//! (écart ≤ 2e-8, `full_attn_rows_windowed_matches_naive_and_cpu`).
 
 use super::attention::FullAttentionMetalState;
 use super::gpu_position::to_u32;

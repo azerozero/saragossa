@@ -296,6 +296,8 @@ Chantier mesuré machine libre (`dflash_resident.sh` dans le scratchpad : `oracl
   dernières positions du prompt (toutes les couches sont fenêtrées). Oracle modèle
   réel ignoré `dflash_resident_matches_cpu_loop_real_model` (résident == CPU == AR).
   `SARAGOSSA_RUST_DFLASH_PROFILE=1` imprime le coût moyen par tour par segment.
+  Au-delà de la fenêtre, l'attention du bloc passe en lignes (un dispatch par
+  couche) ; `SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS=0` rétablit la boucle naïve.
 
 Oracle modèle réel (32 tokens) : résident == CPU == AR en dense et en u4, mêmes
 acceptations (26 / 30). Acceptance CPU sur 64 tokens, acceptés / proposés :

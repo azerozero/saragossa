@@ -3125,13 +3125,18 @@ fn run_rows_windowed_case(
     commit_and_wait(command_buffer)?;
 
     let (rows_out, loop_out) = (read_f32(ctx_rows.tensor()), read_f32(ctx_loop.tensor()));
+    let label = format!("context={context} block={block} window={window} d{head_dim} {format:?}");
+    // `f32::max` ignore les NaN : une sortie non finie passerait l'écart à 0.
     let max_delta = |a: &[f32], b: &[f32]| {
+        assert!(
+            a.iter().chain(b).all(|value| value.is_finite()),
+            "{label}: sortie non finie"
+        );
         a.iter()
             .zip(b)
             .map(|(x, y)| (x - y).abs())
             .fold(0.0_f32, f32::max)
     };
-    let label = format!("context={context} block={block} window={window} d{head_dim} {format:?}");
     let (mut vs_loop, mut vs_cpu) = (0.0_f32, 0.0_f32);
     for row in 0..block {
         let len = context + row + 1;
@@ -3206,6 +3211,11 @@ fn full_attn_rows_windowed_matches_naive_and_cpu() -> Result<()> {
                 (40, 8, 16, None),    // contexte > fenêtre
                 (40, 8, 16, Some(3)), // queue de chunk (3 + 3 + 2)
                 (40, 8, 16, Some(1)),
+                // Fenêtre < bloc : la borne basse tombe dans les lignes du bloc.
+                (10, 8, 4, None),
+                (40, 8, 3, None),
+                (40, 8, 3, Some(3)),
+                (40, 8, 1, None), // chaque ligne ne voit que sa propre position
                 // 2-passes (longueur effective = fenêtre ≥ seuil 2048) : bloc qui
                 // franchit la bascule flash → 2-passes, puis fenêtre pleine.
                 (2044, 8, 2048, None),
