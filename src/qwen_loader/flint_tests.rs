@@ -2175,6 +2175,181 @@ fn flint_int4_moe_coop_matches_qmv() {
     );
 }
 
+/// GEMM NA u4 des petites projections flint (k/v, expert partagé) contre le
+/// qmv f32 du plancher 2048, sur flint-int4 réel : prompt de
+/// `SARAGOSSA_FLINT_SMALL_NAX_LEN` tokens (16 384 par défaut), texte de
+/// `SARAGOSSA_FLINT_SMALL_NAX_PROMPT` ou synthétique, puis
+/// `SARAGOSSA_FLINT_SMALL_NAX_STEPS` tokens greedy (256 par défaut). Les k/v
+/// NA entrent dans le cache : la dérive des logits est suivie à chaque pas le
+/// long de la continuation qmv. Une divergence des greedy est rapportée avec
+/// sa marge et le bruit du qmv contre lui-même ; seul le garde-fou de dérive
+/// (bornes mlx bf16 contre f32) fait échouer le test.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure de dérive, pas un gate"]
+fn flint_int4_small_nax_gemm_greedy_matches_qmv() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("test flint small NAX sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    // Le cache de préfixe rendrait au second run l'état du premier : les deux
+    // greedy partageraient le K/V qmv et seraient identiques par construction.
+    assert!(
+        !crate::runtime_flags::prefix_cache_enabled(),
+        "lancer avec SARAGOSSA_RUST_PREFIX_CACHE=0"
+    );
+    let env_usize = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    let len = env_usize("SARAGOSSA_FLINT_SMALL_NAX_LEN", 16_384);
+    let steps = env_usize("SARAGOSSA_FLINT_SMALL_NAX_STEPS", 256);
+    // 1024 isole l'expert partagé (les k/v 2048→512 restent au qmv).
+    let nax_min_dim = env_usize("SARAGOSSA_FLINT_SMALL_NAX_MIN_DIM", 512);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let prompt = match std::env::var_os("SARAGOSSA_FLINT_SMALL_NAX_PROMPT") {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).expect("invariant: prompt lisible");
+            let ids = assets
+                .tokenizer
+                .encode(&text)
+                .expect("invariant: tokenisation");
+            assert!(ids.len() >= len, "prompt de {} tokens < {len}", ids.len());
+            ids[..len].iter().map(|&id| id as usize).collect::<Vec<_>>()
+        }
+        None => synthetic_long_prompt(&assets, len),
+    };
+    let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+        .expect("invariant: flint-int4 chargeable en Metal")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let target = crate::runtime_flags::prefill_resident_chunk_tokens();
+    let greedy = |min_dim: usize| {
+        crate::metal_backend::with_qmm_na_u4_min_dim_override(min_dim, || {
+            let output = model
+                .generate_greedy_timed_with_options(
+                    &prompt,
+                    steps,
+                    &crate::GenerationOptions::default(),
+                )
+                .expect("invariant: génération résidente");
+            println!(
+                "plancher {min_dim}: prefill {len} tokens en {:.1?}, {} tokens, début {:?}",
+                output.timings.prefill,
+                output.tokens.len(),
+                &output.tokens[..output.tokens.len().min(8)]
+            );
+            output.tokens
+        })
+    };
+    // Logits du dernier rang du prompt puis de chaque pas forcé : la ligne `i`
+    // prédit le token `i` de la continuation.
+    let forced_rows = |min_dim: usize, forced: &[usize]| {
+        crate::metal_backend::with_qmm_na_u4_min_dim_override(min_dim, || {
+            let hidden = model
+                .prefill_hidden_for_test(&prompt, Some(target))
+                .expect("invariant: prefill résident")
+                .expect("prefill résident Metal attendu pour flint");
+            let mut rows = model
+                .logits_of_hidden_rows_for_test(&hidden, &[len - 1])
+                .expect("invariant: logits du prefill");
+            drop(hidden);
+            rows.extend(
+                model
+                    .resident_forced_logits_for_test(&prompt, forced, false)
+                    .expect("invariant: logits résidents"),
+            );
+            rows
+        })
+    };
+    let qmv_tokens = greedy(2048);
+    let nax_tokens = greedy(nax_min_dim);
+    let forced = &qmv_tokens[..qmv_tokens.len().saturating_sub(1)];
+    let qmv_rows = forced_rows(2048, forced);
+    let nax_rows = forced_rows(nax_min_dim, forced);
+    let (mut max, mut mean, mut argmax_ok) = (0.0_f32, 0.0_f32, 0_usize);
+    let mut step_gaps = Vec::with_capacity(qmv_rows.len());
+    for (step, (nax, qmv)) in nax_rows.iter().zip(&qmv_rows).enumerate() {
+        // `f32::max` ignore les NaN : une ligne invalide passerait pour un
+        // écart nul dans les réductions ci-dessous.
+        assert!(
+            nax.iter().chain(qmv).all(|value| value.is_finite()),
+            "logits non finis au pas {step}"
+        );
+        let len = qmv.len() as f32;
+        let shift = nax.iter().zip(qmv).map(|(a, b)| a - b).sum::<f32>() / len;
+        let centered = nax.iter().zip(qmv).map(|(a, b)| (a - b - shift).abs());
+        let row_max = centered.clone().fold(0.0_f32, f32::max);
+        max = max.max(row_max);
+        mean = mean.max(centered.sum::<f32>() / len);
+        argmax_ok += usize::from(argmax(nax) == argmax(qmv));
+        step_gaps.push(row_max);
+    }
+    println!(
+        "dérive NA vs qmv sur {} pas forcés : max {max:.4}, pire moyenne {mean:.5}, argmax {argmax_ok}/{}",
+        qmv_rows.len(),
+        qmv_rows.len()
+    );
+    // Diagnostic, pas critère d'activation : sur un prompt long, le premier
+    // token peut être une quasi-égalité que tout changement d'ordre de
+    // réduction f32 tranche autrement. Le bruit du qmv contre lui-même, avec
+    // des morceaux de prefill deux fois plus petits, situe la divergence.
+    assert_eq!(qmv_tokens.len(), steps, "greedy qmv écourté");
+    assert_eq!(nax_tokens.len(), steps, "greedy NA écourté");
+    let qmv_half = crate::metal_backend::with_qmm_na_u4_min_dim_override(2048, || {
+        let hidden = model
+            .prefill_hidden_for_test(&prompt, Some((target / 2).max(512)))
+            .expect("invariant: prefill résident")
+            .expect("prefill résident Metal attendu pour flint");
+        model
+            .logits_of_hidden_rows_for_test(&hidden, &[len - 1])
+            .expect("invariant: logits du prefill")
+            .remove(0)
+    });
+    let noise = centered_max_gap(&qmv_half, &qmv_rows[0]);
+    println!(
+        "bruit qmv au pas 0 (morceaux {target} contre {}) : max {noise:.5}, argmax {:?} / {:?}",
+        (target / 2).max(512),
+        argmax(&qmv_rows[0]),
+        argmax(&qmv_half)
+    );
+    match qmv_tokens.iter().zip(&nax_tokens).position(|(a, b)| a != b) {
+        None => println!("greedy {steps} tokens comparés, identiques NA/qmv"),
+        Some(step) => {
+            let row = &qmv_rows[step];
+            println!(
+                "première divergence au pas {step} : qmv {} / NA {}, marge qmv {:.5}, dérive du pas {:.5}",
+                qmv_tokens[step],
+                nax_tokens[step],
+                row[qmv_tokens[step]] - row[nax_tokens[step]],
+                step_gaps[step]
+            );
+        }
+    }
+    // Garde-fou de mesure, pas un budget de qualité (cf. MAX_GAP_MLX_BF16).
+    assert!(
+        max < MAX_GAP_MLX_BF16,
+        "écart max {max} ≥ {MAX_GAP_MLX_BF16}"
+    );
+    assert!(
+        mean < MEAN_GAP_MLX_BF16,
+        "écart moyen {mean} ≥ {MEAN_GAP_MLX_BF16}"
+    );
+}
+
+/// Écart max entre deux lignes de logits, après retrait du décalage moyen.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn centered_max_gap(a: &[f32], b: &[f32]) -> f32 {
+    let shift = a.iter().zip(b).map(|(x, y)| x - y).sum::<f32>() / b.len() as f32;
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y - shift).abs())
+        .fold(0.0_f32, f32::max)
+}
+
 /// Hidden non normés du prefill per-op CPU puis du prefill résident Metal, et
 /// leurs durées.
 #[cfg(all(target_os = "macos", feature = "metal"))]

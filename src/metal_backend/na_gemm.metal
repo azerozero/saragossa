@@ -372,8 +372,12 @@ static void load_b_tile_quant_gs64(threadgroup bfloat* Ws,
 // relus par poids dans la version scalaire (16 fois moins de lectures device).
 // Ws est paddé à BKP = BK + 8 colonnes pour étaler les fragments sur les banques.
 // Précondition : K % 64 == 0 et k0 + 64 <= K (pas de masque sur K).
-static void load_b_tile_quant_u4_gs64_vec(threadgroup bfloat* Ws,
-                                          const device uint* Bp,
+// SPLIT : Wl reçoit en plus lo = bf16(w - hi), le poids déquantifié f32 étant
+// w = q·s + b ; hi + lo porte ~16 bits de mantisse au lieu de 8.
+template <bool SPLIT>
+static void load_b_tile_quant_u4_gs64_split(threadgroup bfloat* Ws,
+                                            threadgroup bfloat* Wl,
+                                            const device uint* Bp,
                                           const device bfloat* Bs,
                                           const device bfloat* Bb,
                                           uint n0,
@@ -389,8 +393,13 @@ static void load_b_tile_quant_u4_gs64_vec(threadgroup bfloat* Ws,
   // sont alignés sur 16 octets (stride de ligne 144 octets, offsets multiples de 16).
   threadgroup metal::vec<bfloat,8>* dst =
       (threadgroup metal::vec<bfloat,8>*)(Ws + nl * BKP + kl0);
+  threadgroup metal::vec<bfloat,8>* dst_lo =
+      (threadgroup metal::vec<bfloat,8>*)(Wl + nl * BKP + kl0);
   if (nn >= N) {
-    for (uint w = 0; w < 4u; w++) { dst[w] = metal::vec<bfloat,8>(bfloat(0.0f)); }
+    for (uint w = 0; w < 4u; w++) {
+      dst[w] = metal::vec<bfloat,8>(bfloat(0.0f));
+      if (SPLIT) { dst_lo[w] = metal::vec<bfloat,8>(bfloat(0.0f)); }
+    }
     return;
   }
   uint packed_cols = K / 8u;
@@ -403,12 +412,26 @@ static void load_b_tile_quant_u4_gs64_vec(threadgroup bfloat* Ws,
   metal::vec<uint,4> words = *src;
   for (uint w = 0; w < 4u; w++) {
     uint word = words[w];
-    metal::vec<bfloat,8> out;
+    metal::vec<bfloat,8> out, out_lo;
     for (uint j = 0; j < 8u; j++) {
-      out[j] = bfloat(float((word >> (4u * j)) & 0x0fu) * s + b);
+      float v = float((word >> (4u * j)) & 0x0fu) * s + b;
+      out[j] = bfloat(v);
+      if (SPLIT) { out_lo[j] = bfloat(v - float(out[j])); }
     }
     dst[w] = out;
+    if (SPLIT) { dst_lo[w] = out_lo; }
   }
+}
+static void load_b_tile_quant_u4_gs64_vec(threadgroup bfloat* Ws,
+                                          const device uint* Bp,
+                                          const device bfloat* Bs,
+                                          const device bfloat* Bb,
+                                          uint n0,
+                                          uint k0,
+                                          uint N,
+                                          uint K,
+                                          uint lid) {
+  load_b_tile_quant_u4_gs64_split<false>(Ws, Ws, Bp, Bs, Bb, n0, k0, N, K, lid);
 }
 static void load_b_tile_quant_gs128(threadgroup bfloat* Ws,
                                     const device uint* Bp,
@@ -513,6 +536,60 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
       NaxFrag::load_a_tg(b1, Ws + (ns + 16u) * BKP + kk, int(BKP));
       NaxFrag::mma(c0a, c0b, af0, b0, b1);
       NaxFrag::mma(c1a, c1b, af1, b0, b1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
+  NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
+  NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
+  NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+}
+// Variante « bf16×3 » de `gemm_nax_coop_qb_tiled_u4` pour les petites
+// projections de flint : A est lu en f32 et scindé en hi + lo, la tuile B
+// déquantifiée aussi, et chaque pas fait hi·hi + hi·lo + lo·hi (lo·lo, d'ordre
+// 2⁻¹⁶, est abandonné). Les deux arrondis bf16 du GEMM tuilé (activations et
+// poids déquantifiés, unité 2⁻⁸ chacun) faisaient diverger le greedy de flint ;
+// ici l'erreur relative descend vers 2⁻¹⁶ pour 3× les MMA. Deux tuiles B
+// (hi, lo) : 18 Ko de threadgroup, ce qui exclut une variante gate+up fusionnée
+// (quatre tuiles, au-delà des 32 Ko).
+kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
+                                         device const uint* Bp   [[buffer(1)]],
+                                         device const bfloat* Bs [[buffer(2)]],
+                                         device const bfloat* Bb [[buffer(3)]],
+                                         device float* C         [[buffer(4)]],
+                                         constant uint3& mnk     [[buffer(5)]],
+                                         uint2 tgid [[threadgroup_position_in_grid]],
+                                         uint lid [[thread_index_in_threadgroup]],
+                                         uint sgid [[simdgroup_index_in_threadgroup]]) {
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
+  constexpr uint BN = 64, BK = 64, BKP = BK + 8, WN = 2;
+  threadgroup metal::vec<bfloat,8> Wh8[BN * BKP / 8];
+  threadgroup metal::vec<bfloat,8> Wl8[BN * BKP / 8];
+  threadgroup bfloat* Wh = (threadgroup bfloat*)Wh8;
+  threadgroup bfloat* Wl = (threadgroup bfloat*)Wl8;
+  uint sg_m = sgid / WN;
+  uint sg_n = sgid - sg_m * WN;
+  uint m0 = tgid.x * 64u + sg_m * 32u;
+  uint n0 = tgid.y * BN;
+  uint ns = sg_n * 32u;
+  metal::vec<float,8> c0a = float(0), c0b = float(0), c1a = float(0), c1b = float(0);
+  for (uint k = 0; k < K; k += BK) {
+    load_b_tile_quant_u4_gs64_split<true>(Wh, Wl, Bp, Bs, Bb, n0, k, N, K, lid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 0; kk < BK; kk += 16u) {
+      metal::vec<bfloat,8> a0h, a0l, a1h, a1l, b0h, b1h, b0l, b1l;
+      NaxFrag::load_a_f32_masked<true>(a0h, a0l, A, m0, k + kk, K, M);
+      NaxFrag::load_a_f32_masked<true>(a1h, a1l, A, m0 + 16u, k + kk, K, M);
+      NaxFrag::load_a_tg(b0h, Wh + ns * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b1h, Wh + (ns + 16u) * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b0l, Wl + ns * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b1l, Wl + (ns + 16u) * BKP + kk, int(BKP));
+      NaxFrag::mma(c0a, c0b, a0h, b0h, b1h);
+      NaxFrag::mma(c0a, c0b, a0h, b0l, b1l);
+      NaxFrag::mma(c0a, c0b, a0l, b0h, b1h);
+      NaxFrag::mma(c1a, c1b, a1h, b0h, b1h);
+      NaxFrag::mma(c1a, c1b, a1h, b0l, b1l);
+      NaxFrag::mma(c1a, c1b, a1l, b0h, b1h);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

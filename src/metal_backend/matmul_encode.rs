@@ -183,6 +183,32 @@ impl MetalExecutor {
         in_dim: usize,
         out_dim: usize,
     ) -> Result<()> {
+        // Sous le plancher par défaut (formes que seul flint abaisse), le
+        // bf16×3 lit le lhs f32 directement : pas de conversion bf16 préalable.
+        if in_dim.min(out_dim) < QMM_NA_U4_DEFAULT_MIN_DIM {
+            if out_dim % 64 != 0 {
+                return Err(InferError::Dimension(format!(
+                    "qmm na tiled u4 x3 attend out_dim%64=0, reçu out_dim={out_dim}"
+                )));
+            }
+            let pso = self.na_gemm_coop_qb_tiled_u4_x3.as_ref().ok_or_else(|| {
+                InferError::Config("gemm_nax_coop_qb_tiled_u4_x3: NA indisponible".into())
+            })?;
+            return self.dispatch_affine_qmm_na_fused_tiled_u4(
+                encoder,
+                pso,
+                lhs_buffer,
+                packed_buffer,
+                scales_buffer,
+                biases_buffer,
+                output_buffer,
+                batch,
+                in_dim,
+                out_dim,
+                "gemm_nax_coop_qb_tiled_u4_x3",
+                "qmm_na_fused_tiled_u4_x3_gs64",
+            );
+        }
         self.encode_affine_qmm_na_fused_tiled_u4_pipeline(
             encoder,
             lhs_buffer,
@@ -229,7 +255,9 @@ impl MetalExecutor {
 
     /// Vrai quand gate, up et down sont des poids u4 gs64 éligibles au GEMM
     /// tuilé NA (même prédicat que la sélection résidente) et que le kernel
-    /// fusionné gate+up+SwiGLU est disponible et activé.
+    /// fusionné gate+up+SwiGLU est disponible et activé. Les formes sous le
+    /// plancher par défaut en sont exclues : le kernel fusionné arrondit A et H
+    /// en bf16, et ces formes passent par le bf16×3 non fusionné.
     pub(crate) fn fused_dense_mlp_supported(
         &self,
         batch: usize,
@@ -260,6 +288,7 @@ impl MetalExecutor {
             )
         };
         super::flags::prefill_fused_mlp_enabled()
+            && in_dim.min(inter_dim) >= QMM_NA_U4_DEFAULT_MIN_DIM
             && self.na_gemm_coop_qb_tiled_u4_gate_up_swiglu.is_some()
             && self.qmm_na_fused_tiled_u4_available(FAST_QMV_GROUP_SIZE)
             && u4_gs64(gate, in_dim, inter_dim)
@@ -271,6 +300,7 @@ impl MetalExecutor {
                 inter_dim,
                 FAST_QMV_GROUP_SIZE,
                 FAST_QMV_BITS,
+                self.qmm_na_u4_min_dim(),
             )
             && can_use_qmm_na_fused_tiled_u4_buffers(
                 batch,
@@ -278,6 +308,7 @@ impl MetalExecutor {
                 in_dim,
                 FAST_QMV_GROUP_SIZE,
                 FAST_QMV_BITS,
+                self.qmm_na_u4_min_dim(),
             )
     }
 
@@ -444,7 +475,7 @@ impl MetalExecutor {
         )
     }
 
-    /// Dispatch du GEMM tuilé u4 sur un lhs déjà converti en bf16.
+    /// Dispatch du GEMM tuilé u4 : lhs bf16, ou f32 pour la variante x3.
     fn dispatch_affine_qmm_na_fused_tiled_u4(
         &self,
         encoder: &ComputeCommandEncoderRef,

@@ -2409,35 +2409,205 @@ fn encode_matmul_weight_buffers_na_fused_tiled_matches_cpu_when_enabled() -> Res
 
 #[test]
 fn qmm_na_fused_tiled_u4_accepts_dense_and_rejects_shared_shapes() {
+    let eligible = |batch, in_dim, out_dim, min_dim| {
+        can_use_qmm_na_fused_tiled_u4_buffers(
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_BITS,
+            min_dim,
+        )
+    };
+    let default = QMM_NA_U4_DEFAULT_MIN_DIM;
     // Seuil de largeur mesuré (qmm_na_min_batch, défaut 32) : 33 lignes passent, 31 non.
-    assert!(can_use_qmm_na_fused_tiled_u4_buffers(
-        33,
-        2048,
-        2048,
-        FAST_QMV_GROUP_SIZE,
-        FAST_QMV_BITS
-    ));
-    assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        31,
-        2048,
-        2048,
-        FAST_QMV_GROUP_SIZE,
-        FAST_QMV_BITS
-    ));
-    assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        33,
-        2048,
-        512,
-        FAST_QMV_GROUP_SIZE,
-        FAST_QMV_BITS
-    ));
-    assert!(!can_use_qmm_na_fused_tiled_u4_buffers(
-        33,
-        512,
-        2048,
-        FAST_QMV_GROUP_SIZE,
-        FAST_QMV_BITS
-    ));
+    assert!(eligible(33, 2048, 2048, default));
+    assert!(!eligible(31, 2048, 2048, default));
+    // Plancher par défaut (Qwen, Gemma) : les petites projections restent au qmv.
+    assert!(!eligible(33, 2048, 512, default));
+    assert!(!eligible(33, 512, 2048, default));
+    assert!(!eligible(33, 2048, 1024, default));
+    assert!(!eligible(33, 1024, 2048, default));
+    // Plancher flint : expert partagé 2048↔1024 et k/v 2048→512 passent au NA,
+    // la largeur minimale et le plancher lui-même restent appliqués.
+    let flint = QMM_NA_U4_FLINT_MIN_DIM;
+    assert!(eligible(33, 2048, 512, flint));
+    assert!(eligible(33, 2048, 1024, flint));
+    assert!(eligible(33, 1024, 2048, flint));
+    assert!(!eligible(31, 2048, 512, flint));
+    assert!(!eligible(33, 2048, 448, flint));
+}
+
+/// Unité d'arrondi du bf16 au plus proche : 8 bits de mantisse, donc
+/// u = 2⁻⁸. Cas limite : 1 + 2⁻⁸ tombe à égalité et s'arrondit à 1, avec une
+/// erreur relative 1/257, au-delà de 2⁻⁹ mais sous 2⁻⁸.
+const BF16_UNIT_ROUNDOFF: f32 = 1.0 / 256.0;
+
+#[test]
+fn bf16_unit_roundoff_covers_halfway_case() {
+    let x = 1.0_f32 + BF16_UNIT_ROUNDOFF;
+    let rounded = bf16_round(x);
+    assert_eq!(rounded, 1.0);
+    let rel = (x - rounded).abs() / x;
+    assert!(
+        rel > 2.0_f32.powi(-9) && rel <= BF16_UNIT_ROUNDOFF,
+        "erreur {rel}"
+    );
+}
+
+/// Produit `lhs · deq(W)ᵀ` sans arrondi bf16, accumulé en f64, et `Σ|x·w|`
+/// par sortie : référence f32 pure des bornes du GEMM NA u4.
+fn qmm_u4_f64_reference(
+    weight: &AffineQuantizedTensor,
+    lhs: &[f32],
+    batch: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let (out_dim, in_dim) = (weight.shape()[0], weight.shape()[1]);
+    let scales = weight.scales_f32();
+    let biases = weight.biases_f32();
+    let packed = weight.packed_data();
+    let (packed_cols, groups) = (in_dim / 8, in_dim / 64);
+    let mut dot = vec![0.0_f64; batch * out_dim];
+    let mut abs_dot = vec![0.0_f64; batch * out_dim];
+    for bb in 0..batch {
+        for nn in 0..out_dim {
+            for kk in 0..in_dim {
+                let q = (packed[nn * packed_cols + kk / 8] >> ((kk % 8) * 4)) & 0xf;
+                let g = nn * groups + kk / 64;
+                let w = f64::from(q as f32 * scales.as_ref()[g] + biases.as_ref()[g]);
+                let term = f64::from(lhs[bb * in_dim + kk]) * w;
+                dot[bb * out_dim + nn] += term;
+                abs_dot[bb * out_dim + nn] += term.abs();
+            }
+        }
+    }
+    (dot, abs_dot)
+}
+
+/// Formes flint (expert partagé 2048↔1024, k/v 2048→512) sous plancher
+/// flint : le GEMM tuilé bf16×3 contre la référence f32 pure. Garde-fou
+/// empirique, pas borne analytique : hi·hi + hi·lo + lo·hi laisse ~3u² de
+/// représentation (u = 2⁻⁸) et l'accumulation f32 tensor-core ajoute son jeu.
+/// La forme 2048→2048, au-dessus du plancher, garde le GEMM bf16 : collé à son
+/// oracle qui arrondit en bf16, et à moins de `(2u + u²)·Σ|x·w|` de la
+/// référence f32.
+#[test]
+fn qmm_na_fused_tiled_u4_flint_shapes_x3_match_f32_reference() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    if !qmm_na_fused_tiled_u4_enabled()
+        || executor.na_gemm_coop_qb_tiled_u4.is_none()
+        || executor.na_gemm_coop_qb_tiled_u4_x3.is_none()
+    {
+        eprintln!("skip: GEMM NA u4 indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    // 65 lignes : une tuile de 64 et une queue partielle.
+    let batch = 65;
+    let u = f64::from(BF16_UNIT_ROUNDOFF);
+    let encode = |executor: &MetalExecutor,
+                  in_dim: usize,
+                  out_dim: usize,
+                  buffers: &MetalLinearWeightBuffers,
+                  lhs: &[f32]|
+     -> Result<Vec<f32>> {
+        let lhs_buf = executor.upload_f32_buffer(lhs, "flint_small_nax_lhs")?;
+        let out_buf = executor.uncached_f32_buffer(batch * out_dim, "flint_small_nax_out")?;
+        let command_buffer = executor.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        executor.encode_matmul_weight_buffers(
+            encoder, &lhs_buf, batch, in_dim, buffers, &out_buf, false,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        read_f32_buffer(&out_buf, batch * out_dim)
+    };
+    let select = |executor: &MetalExecutor, in_dim: usize, out_dim: usize| {
+        executor.select_resident_affine_matmul_kernel(
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_BITS,
+            false,
+        )
+    };
+    let shapes = [
+        (2048_usize, 512_usize),
+        (2048, 1024),
+        (1024, 2048),
+        (2048, 2048),
+    ];
+    for &(in_dim, out_dim) in &shapes[..3] {
+        assert!(
+            matches!(
+                select(&executor, in_dim, out_dim),
+                AffineMatmulKernel::FastQmvU4
+            ),
+            "plancher par défaut : {in_dim}→{out_dim} doit rester au qmv"
+        );
+    }
+    executor.enable_flint_small_nax_gemm();
+    for (in_dim, out_dim) in shapes {
+        let small = in_dim.min(out_dim) < QMM_NA_U4_DEFAULT_MIN_DIM;
+        let weight = test_affine_varied(out_dim, in_dim)?;
+        let buffers = executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(weight.clone()),
+            "flint_small_nax_weight",
+        )?;
+        let mut lhs = Vec::with_capacity(batch * in_dim);
+        for row in 0..batch {
+            lhs.extend_from_slice(&varied_row(in_dim, 17 + row));
+        }
+        assert!(
+            matches!(
+                select(&executor, in_dim, out_dim),
+                AffineMatmulKernel::QmmNaFusedTiledU4
+            ),
+            "{in_dim}→{out_dim} doit passer au GEMM NA"
+        );
+        let nax = encode(&executor, in_dim, out_dim, &buffers, &lhs)?;
+        let (exact, abs_dot) = qmm_u4_f64_reference(&weight, &lhs, batch);
+        let qb = if small {
+            None
+        } else {
+            Some(qmm_na_qb_reference(&weight, &lhs, batch)?)
+        };
+        let mut worst = 0.0_f64;
+        for idx in 0..batch * out_dim {
+            // `f64::max` ignore un NaN : une sortie non finie passerait sinon.
+            assert!(
+                nax[idx].is_finite(),
+                "{in_dim}→{out_dim} [{idx}] : sortie non finie {}",
+                nax[idx]
+            );
+            let rel = (f64::from(nax[idx]) - exact[idx]).abs() / abs_dot[idx].max(1e-30);
+            worst = worst.max(rel);
+            if let Some(qb) = &qb {
+                // Jeu f32 : `in_dim · ε` sur Σ|x·w| (borne de sommation naïve).
+                let accum = in_dim as f64 * f64::from(f32::EPSILON) * abs_dot[idx];
+                assert!(
+                    f64::from((nax[idx] - qb[idx]).abs()) <= accum,
+                    "{in_dim}→{out_dim} [{idx}] : écart à l'oracle bf16 > {accum}"
+                );
+            }
+        }
+        let budget = if small {
+            1e-5
+        } else {
+            2.0 * u + u * u + 1e-6
+        };
+        eprintln!(
+            "flint NAX {in_dim}→{out_dim} ({}) : écart relatif max {worst:.3e}, budget {budget:.3e}",
+            if small { "x3" } else { "bf16" }
+        );
+        assert!(
+            worst <= budget,
+            "{in_dim}→{out_dim} : écart relatif {worst:.3e} > {budget:.3e}"
+        );
+    }
+    Ok(())
 }
 
 #[test]
