@@ -1,7 +1,8 @@
 //! Arène Metal résidente et pool scratch à bail.
 
 use super::kernels::{
-    compile_kernel, ATTENTION_DECODE_KERNEL, GATE_KERNELS, ROPE_DECODE_COPY_KERNELS,
+    compile_kernel, compile_kernels, ATTENTION_DECODE_KERNEL, GATE_KERNELS,
+    ROPE_DECODE_COPY_KERNELS,
 };
 use super::utils::{write_f32_at, write_u32_at};
 use super::*;
@@ -340,6 +341,17 @@ impl DecodeResidentState {
             compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_bf16")?;
         let copy_at_bf16_to_f32_kernel =
             compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_bf16_to_f32")?;
+        let rope_append_kv_kernels: [ComputePipelineState; 2] = compile_kernels(
+            &device,
+            ROPE_DECODE_COPY_KERNELS,
+            &[
+                "rms_norm_rope_append_kv_f32",
+                "rms_norm_rope_append_kv_bf16",
+            ],
+            true,
+        )?
+        .try_into()
+        .map_err(|_| InferError::Metal("pipelines rope + append KV absents".to_string()))?;
         let timer = GpuSectionTimer::try_new();
         Ok(Self {
             device,
@@ -367,6 +379,7 @@ impl DecodeResidentState {
             copy_at_f32_to_bf16_kernel,
             copy_at_bf16_kernel,
             copy_at_bf16_to_f32_kernel,
+            rope_append_kv_kernels,
             gpu_position_kernels: OnceLock::new(),
             rows_kernels: OnceLock::new(),
             kv_quant_kernels: OnceLock::new(),

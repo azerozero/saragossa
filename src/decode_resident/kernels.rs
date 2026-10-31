@@ -1165,31 +1165,35 @@ kernel void attn_gate_f32(
 /// `copy_at_f32` : `out[i] = in[i]` ; en liant `out` à un offset, écrit la ligne
 /// `KV[position]` device-side (append, hazard read-after-write prouvé en R3).
 /// `copy_at_f32_to_bf16` applique le même append vers un KV compact bf16 ;
+/// `rms_norm_rope_append_kv_{f32,bf16}` fusionnent la rotation de K et
+/// l'append K/V (un dispatch au lieu de trois), aux mêmes bits ;
 /// `copy_at_bf16` et `copy_at_bf16_to_f32` sèment l'arène depuis un K/V de
 /// prefill stocké en bf16 (copie exacte, élargissement exact).
 pub(super) const ROPE_DECODE_COPY_KERNELS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void rms_norm_rope_heads_decode_f32(
-    device const float* input [[buffer(0)]],
-    device const float* weight [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant uint4& dims [[buffer(3)]],
-    constant float2& params [[buffer(4)]],
-    constant uint& frequency_dim [[buffer(5)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]]
+// Corps partagé par la rotation seule et la rotation fusionnée à l'append :
+// mêmes instructions, donc mêmes bits (la conversion `T(value)` vers bfloat
+// est celle de `copy_at_f32_to_bf16`).
+template <typename T>
+inline void rms_norm_rope_head(
+    device const float* input,
+    device const float* weight,
+    device T* out,
+    uint4 dims,
+    float2 params,
+    uint frequency_dim,
+    uint tid,
+    uint head,
+    threadgroup float* partial
 ) {
-    const uint heads = dims.x;
     const uint head_dim = dims.y;
     const uint rope_dims = dims.z;
     const uint position = dims.w;
     const float eps = params.x;
     const float base_theta = params.y;
-    if (head >= heads) { return; }
 
-    threadgroup float partial[256];
     const uint start = head * head_dim;
     float sumsq = 0.0f;
     for (uint col = tid; col < head_dim; col += 256u) {
@@ -1218,8 +1222,80 @@ kernel void rms_norm_rope_heads_decode_f32(
             const float second = input[start + pair + pairs] * inv_rms * weight[pair + pairs];
             value = (col < pairs) ? (first * c - second * s) : (first * s + second * c);
         }
-        out[start + col] = value;
+        out[start + col] = T(value);
     }
+}
+
+kernel void rms_norm_rope_heads_decode_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    constant float2& params [[buffer(4)]],
+    constant uint& frequency_dim [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    if (head >= dims.x) { return; }
+    threadgroup float partial[256];
+    rms_norm_rope_head(input, weight, out, dims, params, frequency_dim, tid, head, partial);
+}
+
+// Append K/V du token courant en un dispatch : K normé et roté écrit
+// directement dans `keys` (lié à l'offset de la ligne), V copié dans `values`.
+template <typename T>
+inline void rope_append_kv(
+    device const float* k_in,
+    device const float* weight,
+    device T* keys,
+    uint4 dims,
+    float2 params,
+    uint frequency_dim,
+    device const float* v_in,
+    device T* values,
+    uint tid,
+    uint head,
+    threadgroup float* partial
+) {
+    rms_norm_rope_head(k_in, weight, keys, dims, params, frequency_dim, tid, head, partial);
+    const uint start = head * dims.y;
+    for (uint col = tid; col < dims.y; col += 256u) {
+        values[start + col] = T(v_in[start + col]);
+    }
+}
+
+kernel void rms_norm_rope_append_kv_f32(
+    device const float* k_in [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* keys [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    constant float2& params [[buffer(4)]],
+    constant uint& frequency_dim [[buffer(5)]],
+    device const float* v_in [[buffer(6)]],
+    device float* values [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    if (head >= dims.x) { return; }
+    threadgroup float partial[256];
+    rope_append_kv(k_in, weight, keys, dims, params, frequency_dim, v_in, values, tid, head, partial);
+}
+
+kernel void rms_norm_rope_append_kv_bf16(
+    device const float* k_in [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device bfloat* keys [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    constant float2& params [[buffer(4)]],
+    constant uint& frequency_dim [[buffer(5)]],
+    device const float* v_in [[buffer(6)]],
+    device bfloat* values [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    if (head >= dims.x) { return; }
+    threadgroup float partial[256];
+    rope_append_kv(k_in, weight, keys, dims, params, frequency_dim, v_in, values, tid, head, partial);
 }
 
 kernel void copy_at_f32(
