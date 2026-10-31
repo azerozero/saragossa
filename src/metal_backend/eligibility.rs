@@ -177,11 +177,12 @@ pub(super) fn can_use_fast_affine_qmm8(
 /// (3 lignes) n'est pas concerné. Variantes (`SARAGOSSA_RUST_QMM_SKINNY_KERNEL`,
 /// voir [`SkinnyKernel`]) : `x2` par défaut (q brut exact × A hi+lo, deux MMA,
 /// échelle et biais par groupe en f32), `x3` (A et B scindés en bf16 hi+lo, trois
-/// MMA) et `bf16` (un seul MMA, gate/up 0,14 ms, lm_head 1,8, écart 5e-3). x2 et
-/// x3 restent à 4-7e-6 de l'échelle contre une référence f64 (formes du Qwen 27B)
-/// et donnent des sorties greedy identiques (DFlash et MTP+lookup, prompts code et
-/// prose 4k, 400 tokens) ; mesuré le 2026-10-31 (M5 Max, code 4k), la
-/// vérification à 8 lignes passe de 71 à 61 ms, à 16 lignes de 95 à 89 ms.
+/// MMA) et `bf16` (un seul MMA, gate/up 0,14 ms, lm_head 1,8, écart 5e-3). Contre
+/// une référence f64 (formes du Qwen 27B), x2 reste à 2-3e-6 de l'échelle et x3 à
+/// 5-6e-6, y compris en régime d'annulation (`s·q + b ≈ 0`) ; sorties greedy
+/// identiques (DFlash et MTP+lookup, prompts code et prose 4k, 400 tokens, deux
+/// essais). Mesuré le 2026-10-31 (M5 Max, code 4k) : vérification à 8 lignes de
+/// 66-72 à 61-62 ms, à 16 lignes de 94-96 à 89-90 ms.
 /// `SARAGOSSA_RUST_QMM_SKINNY=0` rétablit le qmv répliqué.
 pub(super) fn can_use_qmm_skinny_buffers(
     batch: usize,
