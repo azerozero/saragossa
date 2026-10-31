@@ -589,7 +589,15 @@ fn synthetic_flint_moe_coop_tiled_matches_16x32() {
         tiled_calls >= 2,
         "tuilé: {tiled_calls} appels sur 2 couches"
     );
-    assert_eq!(base.data(), tiled.data(), "hidden tuilé != 16×32");
+    // Bits exacts : `==` sur f32 confondrait +0.0 et -0.0.
+    assert_eq!(base.data().len(), tiled.data().len(), "longueurs hidden");
+    assert!(
+        base.data()
+            .iter()
+            .zip(tiled.data())
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "hidden tuilé != 16×32"
+    );
     assert_eq!(base_greedy, tiled_greedy, "greedy tuilé != 16×32");
 }
 
@@ -2268,6 +2276,7 @@ fn flint_int4_moe_coop_tiled_matches_16x32() {
     assert_eq!(base_calls, 0, "16×32 : appels tuilés inattendus");
     // 47 couches MoE routées, au moins une fois chacune.
     assert!(tiled_calls >= 47, "tuilé : {tiled_calls} appels seulement");
+    assert_eq!(base.data().len(), tiled.data().len(), "longueurs hidden");
     let same_bits = base
         .data()
         .iter()
