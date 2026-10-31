@@ -1564,3 +1564,162 @@ fn fused_dense_mlp_supported_rejects_offsets_dense_and_shape() -> Result<()> {
     );
     Ok(())
 }
+
+/// Exécute le MoE routé coop flint (sigmoïde) avec un routeur identité sur
+/// les `experts` premières colonnes : `select(t)` fixe exactement les experts
+/// du token `t`. Renvoie (sortie, indices, appels tuilés).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "harnais de test : dimensions et sélection"
+)]
+fn run_routed_coop_selected(
+    executor: &MetalExecutor,
+    weights: &MetalMoeRoutedWeights,
+    rows: usize,
+    hidden: usize,
+    experts: usize,
+    top_k: usize,
+    select: &dyn Fn(usize) -> Vec<usize>,
+    tiled: bool,
+) -> Result<(Vec<f32>, Vec<u32>, usize)> {
+    let total = rows * top_k;
+    let mut input = Vec::with_capacity(rows * hidden);
+    for t in 0..rows {
+        let mut row = varied_row(hidden, 300 + t);
+        let chosen = select(t);
+        assert_eq!(chosen.len(), top_k, "sélection de {top_k} experts attendue");
+        for (e, logit) in row.iter_mut().take(experts).enumerate() {
+            *logit = if chosen.contains(&e) { 4.0 } else { -4.0 };
+        }
+        input.extend_from_slice(&row);
+    }
+    let input_buf = executor.upload_f32_buffer(&input, "tiled_input")?;
+    let router_buf = executor.uncached_f32_buffer(rows * experts, "tiled_router")?;
+    let indices_buf = executor.uncached_u32_buffer(total, "tiled_indices")?;
+    let scores_buf = executor.uncached_f32_buffer(total, "tiled_scores")?;
+    let down_buf = executor.uncached_f32_buffer(total * hidden, "tiled_down")?;
+    let out_buf = executor.uncached_f32_buffer(rows * hidden, "tiled_out")?;
+    let before = moe_coop_tiled_trace_for_test();
+    with_flint_moe_coop_tiled_override(tiled, || -> Result<()> {
+        let cb = executor.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        let guard = EncoderEndGuard::new(enc);
+        let mut owned = Vec::new();
+        executor.encode_moe_routed_rows_coop(
+            enc,
+            &mut owned,
+            &input_buf,
+            None,
+            &out_buf,
+            &router_buf,
+            &indices_buf,
+            &scores_buf,
+            &down_buf,
+            rows,
+            hidden,
+            weights,
+            top_k,
+            crate::RouterScore::Sigmoid,
+        )?;
+        guard.end();
+        commit_and_wait(cb)
+    })?;
+    Ok((
+        read_f32_buffer(&out_buf, rows * hidden)?,
+        read_u32_buffer(&indices_buf, total)?,
+        moe_coop_tiled_trace_for_test() - before,
+    ))
+}
+
+/// Kernels groupés tuilés (BM × 64) contre les kernels 16 × 32 sur le MoE
+/// routé coop flint complet (grouping GPU, gather, SwiGLU, scatter, somme).
+/// Même arithmétique et même ordre de K par fragment : sorties bit à bit
+/// identiques. Histogrammes : un expert sur toutes les lignes (tuiles pleines
+/// et queue), un expert à une ligne, 64 lignes tout juste, de 60 à 299
+/// lignes, experts vides ; puis un seul expert sur une tuile partielle.
+#[test]
+fn moe_routed_coop_tiled_matches_16x32() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    if executor
+        .na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled
+        .is_none()
+    {
+        assert!(
+            !executor.na_library_available_for_test(),
+            "bibliothèque NA présente mais kernels tuilés absents"
+        );
+        eprintln!("skip: coop tuilé indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    let (experts, inter, hidden) = (16_usize, 128_usize, 256_usize);
+    let router = (0..experts * hidden)
+        .map(|i| if i / hidden == i % hidden { 1.0 } else { 0.0 })
+        .collect::<Vec<f32>>();
+    let weights = MetalMoeRoutedWeights {
+        router: MetalLinearWeightBuffers::Dense {
+            rhs: executor.upload_f32_buffer(&router, "tiled_router_w")?,
+            rhs_bf16: None,
+            out_dim: experts,
+            in_dim: hidden,
+        },
+        stacked: StackedMoeBuffers {
+            gate: test_stacked_affine_varied_u4_group(&executor, experts, inter, hidden, 5)?,
+            up: test_stacked_affine_varied_u4_group(&executor, experts, inter, hidden, 13)?,
+            down: test_stacked_affine_varied_u4_group(&executor, experts, hidden, inter, 23)?,
+        },
+    };
+    let unbalanced = |t: usize| {
+        vec![
+            0,
+            if t == 0 { 1 } else { 7 },
+            2 + t % 3,
+            5 + t % 2,
+            if t < 64 { 8 } else { 9 },
+            if t % 5 == 0 { 10 } else { 11 },
+        ]
+    };
+    let single = |_t: usize| vec![3];
+    type Select<'a> = &'a dyn Fn(usize) -> Vec<usize>;
+    let cases: [(&str, usize, usize, Select); 2] = [
+        ("déséquilibré", 300, 6, &unbalanced),
+        ("un expert", 5, 1, &single),
+    ];
+    for (label, rows, top_k, select) in cases {
+        let run = |tiled| {
+            run_routed_coop_selected(
+                &executor, &weights, rows, hidden, experts, top_k, select, tiled,
+            )
+        };
+        let (base, base_idx, base_calls) = run(false)?;
+        let (tiled, tiled_idx, tiled_calls) = run(true)?;
+        assert_eq!((base_calls, tiled_calls), (0, 1), "{label}: chemin tuilé");
+        assert_eq!(base_idx, tiled_idx, "{label}: routage");
+        let mut counts = vec![0_usize; experts];
+        for &e in &tiled_idx {
+            counts[e as usize] += 1;
+        }
+        let mut expected = vec![0_usize; experts];
+        for t in 0..rows {
+            for e in select(t) {
+                expected[e] += 1;
+            }
+        }
+        assert_eq!(counts, expected, "{label}: histogramme");
+        let gap = base
+            .iter()
+            .zip(&tiled)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let scale = base.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+        eprintln!("coop tuilé {label}: histogramme {counts:?} écart {gap} échelle {scale}");
+        assert!(scale > 0.0, "{label}: sortie nulle");
+        let same_bits = base
+            .iter()
+            .zip(&tiled)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(same_bits, "{label}: tuilé != 16×32, écart {gap}");
+    }
+    Ok(())
+}

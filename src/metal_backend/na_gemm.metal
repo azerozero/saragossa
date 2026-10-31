@@ -958,6 +958,153 @@ kernel void gemm_nax_coop_qb_grouped_scatter_u4(device const bfloat* A   [[buffe
   NaxFrag::store_c_scattered(Cn0, C, perm, m0, n0, N);
   NaxFrag::store_c_scattered(Cn1, C, perm, m0, n0 + 16u, N);
 }
+// MoE groupé u4 TUILÉ (flint) : les kernels ci-dessus font un simdgroup par
+// tuile 16×32 et re-déquantifient le poids de l'expert toutes les 16 lignes,
+// relisant aussi A pour chaque tuile N : borné mémoire/L2. Ici une tuile de BM
+// lignes (un seul expert, `moe_g_offsets` padde chaque expert à BM) × 64
+// colonnes par threadgroup de 4 simdgroups (2×2) : le poids est déquantifié
+// une fois par BM lignes en mémoire threadgroup (chargeur u4 vectorisé), A une
+// fois par tuile. Même arithmétique que les kernels 16×32 (bfloat(x),
+// bfloat(q·s+b), MMA 16×32×16 dans le même ordre de K) : sorties identiques.
+// Préconditions côté Rust : N % 64 == 0, K % 64 == 0.
+constexpr constant uint MOE_TILED_BN = 64u, MOE_TILED_BK = 64u, MOE_TILED_BKP = 72u;
+// gate+up fusionnés + SwiGLU. A est gathéré (perm/top_k) f32→bf16 en mémoire
+// threadgroup : BM×72 bf16 + deux tuiles poids 64×72 (22,5 Ko pour BM = 32).
+template <uint BM>
+static void moe_grouped_gate_up_swiglu_u4_tiled(
+    device const float* input, device const uint* Gp, device const bfloat* Gs,
+    device const bfloat* Gb, device const uint* Up, device const bfloat* Us,
+    device const bfloat* Ub, device bfloat* H, device const uint* tile_expert,
+    device const uint* perm, uint4 mnkt, uint2 tgid, uint lid, uint sgid,
+    threadgroup bfloat* As, threadgroup bfloat* Wg, threadgroup bfloat* Wu) {
+  constexpr uint BN = MOE_TILED_BN, BK = MOE_TILED_BK, BKP = MOE_TILED_BKP;
+  constexpr uint FM = BM / 32u;          // fragments M par simdgroup
+  constexpr uint TPR = 128u / BM;        // threads par ligne de A
+  constexpr uint CPT = BK / TPR;         // colonnes A par thread (16 ou 32)
+  uint N = mnkt.y, K = mnkt.z, top_k = mnkt.w;
+  uint e = tile_expert[tgid.x];
+  // Tuile sentinelle : tout le threadgroup sort avant la moindre barrière.
+  if (e == 0xFFFFFFFFu) { return; }
+  uint m0 = tgid.x * BM, n0 = tgid.y * BN;
+  uint pe = e * N * (K / 8u);
+  uint ge = e * N * (K / 64u);
+  uint sg_m = sgid >> 1u, sg_n = sgid & 1u;
+  uint ms = sg_m * 16u * FM, ns = sg_n * 32u;
+  // Ligne de A chargée par ce thread : perm lu une fois, padding → zéros.
+  uint arow = lid / TPR, acol = (lid % TPR) * CPT;
+  uint slot = perm[m0 + arow];
+  bool avalid = slot != 0xFFFFFFFFu;
+  const device float* asrc = input + (avalid ? (slot / top_k) * K + acol : 0u);
+  threadgroup metal::vec<bfloat,8>* adst =
+      (threadgroup metal::vec<bfloat,8>*)(As + arow * BKP + acol);
+  metal::vec<float,8> g[FM][2], u[FM][2];
+  for (uint f = 0; f < FM; f++) {
+    g[f][0] = float(0); g[f][1] = float(0); u[f][0] = float(0); u[f][1] = float(0);
+  }
+  for (uint k = 0; k < K; k += BK) {
+    for (uint v = 0; v < CPT / 8u; v++) {
+      metal::vec<bfloat,8> out = bfloat(0.0f);
+      if (avalid) {
+        const device float4* s4 = (const device float4*)(asrc + k + v * 8u);
+        float4 lo = s4[0], hi = s4[1];
+        out = metal::vec<bfloat,8>(bfloat(lo.x), bfloat(lo.y), bfloat(lo.z), bfloat(lo.w),
+                                   bfloat(hi.x), bfloat(hi.y), bfloat(hi.z), bfloat(hi.w));
+      }
+      adst[v] = out;
+    }
+    load_b_tile_quant_u4_gs64_vec(Wg, Gp + pe, Gs + ge, Gb + ge, n0, k, N, K, lid);
+    load_b_tile_quant_u4_gs64_vec(Wu, Up + pe, Us + ge, Ub + ge, n0, k, N, K, lid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 0; kk < BK; kk += 16u) {
+      metal::vec<bfloat,8> af[FM], b0, b1;
+      for (uint f = 0; f < FM; f++) {
+        NaxFrag::load_a_tg(af[f], As + (ms + 16u * f) * BKP + kk, int(BKP));
+      }
+      NaxFrag::load_a_tg(b0, Wg + ns * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b1, Wg + (ns + 16u) * BKP + kk, int(BKP));
+      for (uint f = 0; f < FM; f++) { NaxFrag::mma(g[f][0], g[f][1], af[f], b0, b1); }
+      NaxFrag::load_a_tg(b0, Wu + ns * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b1, Wu + (ns + 16u) * BKP + kk, int(BKP));
+      for (uint f = 0; f < FM; f++) { NaxFrag::mma(u[f][0], u[f][1], af[f], b0, b1); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint f = 0; f < FM; f++) {
+    device bfloat* dst = H + (m0 + ms + 16u * f) * N + n0 + ns;
+    NaxFrag::store_swiglu_bf16(g[f][0], u[f][0], dst, int(N));
+    NaxFrag::store_swiglu_bf16(g[f][1], u[f][1], dst + 16u, int(N));
+  }
+}
+// down + scatter par slot : A = hidden2 bf16 contigu [max_m, K], lu en
+// fragments directement (pas de gather), une tuile poids 64×72 partagée.
+template <uint BM>
+static void moe_grouped_scatter_u4_tiled(
+    device const bfloat* A, device const uint* Bp, device const bfloat* Bs,
+    device const bfloat* Bb, device float* C, device const uint* tile_expert,
+    device const uint* perm, uint3 mnk, uint2 tgid, uint lid, uint sgid,
+    threadgroup bfloat* Ws) {
+  constexpr uint BN = MOE_TILED_BN, BK = MOE_TILED_BK, BKP = MOE_TILED_BKP;
+  constexpr uint FM = BM / 32u;
+  uint N = mnk.y, K = mnk.z;
+  uint e = tile_expert[tgid.x];
+  if (e == 0xFFFFFFFFu) { return; }
+  uint m0 = tgid.x * BM, n0 = tgid.y * BN;
+  uint pe = e * N * (K / 8u);
+  uint ge = e * N * (K / 64u);
+  uint sg_m = sgid >> 1u, sg_n = sgid & 1u;
+  uint ms = m0 + sg_m * 16u * FM, ns = sg_n * 32u;
+  metal::vec<float,8> c[FM][2];
+  for (uint f = 0; f < FM; f++) { c[f][0] = float(0); c[f][1] = float(0); }
+  for (uint k = 0; k < K; k += BK) {
+    load_b_tile_quant_u4_gs64_vec(Ws, Bp + pe, Bs + ge, Bb + ge, n0, k, N, K, lid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 0; kk < BK; kk += 16u) {
+      metal::vec<bfloat,8> b0, b1;
+      NaxFrag::load_a_tg(b0, Ws + ns * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b1, Ws + (ns + 16u) * BKP + kk, int(BKP));
+      for (uint f = 0; f < FM; f++) {
+        metal::vec<bfloat,8> af;
+        NaxFrag::load_a(af, A + (ms + 16u * f) * K + k + kk, int(K));
+        NaxFrag::mma(c[f][0], c[f][1], af, b0, b1);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint f = 0; f < FM; f++) {
+    NaxFrag::store_c_scattered(c[f][0], C, perm, ms + 16u * f, n0 + ns, N);
+    NaxFrag::store_c_scattered(c[f][1], C, perm, ms + 16u * f, n0 + ns + 16u, N);
+  }
+}
+#define MOE_TILED_KERNELS(BM)                                                              \
+kernel void gemm_nax_coop_qb_grouped_gate_up_swiglu_u4_bm##BM(                             \
+    device const float* input [[buffer(0)]], device const uint* Gp [[buffer(1)]],          \
+    device const bfloat* Gs [[buffer(2)]], device const bfloat* Gb [[buffer(3)]],          \
+    device const uint* Up [[buffer(4)]], device const bfloat* Us [[buffer(5)]],            \
+    device const bfloat* Ub [[buffer(6)]], device bfloat* H [[buffer(7)]],                 \
+    device const uint* tile_expert [[buffer(8)]], device const uint* perm [[buffer(9)]],   \
+    constant uint4& mnkt [[buffer(10)]], uint2 tgid [[threadgroup_position_in_grid]],      \
+    uint lid [[thread_index_in_threadgroup]], uint sgid [[simdgroup_index_in_threadgroup]]) { \
+  threadgroup metal::vec<bfloat,8> As8[BM * MOE_TILED_BKP / 8];                            \
+  threadgroup metal::vec<bfloat,8> Wg8[MOE_TILED_BN * MOE_TILED_BKP / 8];                  \
+  threadgroup metal::vec<bfloat,8> Wu8[MOE_TILED_BN * MOE_TILED_BKP / 8];                  \
+  moe_grouped_gate_up_swiglu_u4_tiled<BM>(input, Gp, Gs, Gb, Up, Us, Ub, H, tile_expert,   \
+      perm, mnkt, tgid, lid, sgid, (threadgroup bfloat*)As8, (threadgroup bfloat*)Wg8,     \
+      (threadgroup bfloat*)Wu8);                                                           \
+}                                                                                          \
+kernel void gemm_nax_coop_qb_grouped_scatter_u4_bm##BM(                                    \
+    device const bfloat* A [[buffer(0)]], device const uint* Bp [[buffer(1)]],             \
+    device const bfloat* Bs [[buffer(2)]], device const bfloat* Bb [[buffer(3)]],          \
+    device float* C [[buffer(4)]], device const uint* tile_expert [[buffer(5)]],           \
+    device const uint* perm [[buffer(6)]], constant uint3& mnk [[buffer(7)]],              \
+    uint2 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]], \
+    uint sgid [[simdgroup_index_in_threadgroup]]) {                                        \
+  threadgroup metal::vec<bfloat,8> Ws8[MOE_TILED_BN * MOE_TILED_BKP / 8];                  \
+  moe_grouped_scatter_u4_tiled<BM>(A, Bp, Bs, Bb, C, tile_expert, perm, mnk, tgid, lid,    \
+      sgid, (threadgroup bfloat*)Ws8);                                                     \
+}
+// NOTE: BM = 64 mesuré 3,4× plus lent que BM = 32 sur flint-int4 (MoE routé à
+// 32k 4,5 s en 16×32, 3,2 s en BM 32, 15 s en BM 64) : seul BM = 32 est instancié.
+MOE_TILED_KERNELS(32)
 // Port qmm_t_nax brique 6 : GROUPING SUR GPU (zéro readback). histogram atomique →
 // scan offsets 16-alignés + remplit tile_expert (sentinel 0xFFFFFFFF) → build perm
 // atomique. Tout en 1 command buffer, comme adjust_matrix_offsets de MLX.
@@ -974,22 +1121,25 @@ kernel void moe_g_histogram(device const uint* indices [[buffer(0)]],
   if (gid >= total) { return; }
   atomic_fetch_add_explicit(&counts[indices[gid]], 1u, memory_order_relaxed);
 }
-// 1 threadgroup, 1 thread : scan exclusif des counts padés à 16 → padded_offset +
-// remplit tile_expert + cursor=padded_offset. experts petit (256).
+// 1 threadgroup, 1 thread : scan exclusif des counts padés à `tile_m` lignes
+// (16 pour les kernels 16×32, BM pour les tuilés : une tuile ne traverse
+// jamais deux experts) → padded_offset + remplit tile_expert + cursor=
+// padded_offset. experts petit (256).
 kernel void moe_g_offsets(device const uint* counts [[buffer(0)]],
                           device uint* padded_offset [[buffer(1)]],
                           device uint* tile_expert [[buffer(2)]],
                           device atomic_uint* cursor [[buffer(3)]],
-                          constant uint& experts [[buffer(4)]],
+                          constant uint2& experts_tile [[buffer(4)]], // (experts, tile_m)
                           uint gid [[thread_position_in_grid]]) {
   if (gid != 0) { return; }
+  uint experts = experts_tile.x, tile_m = experts_tile.y;
   uint moff = 0u, toff = 0u;
   for (uint e = 0; e < experts; e++) {
     padded_offset[e] = moff;
     atomic_store_explicit(&cursor[e], moff, memory_order_relaxed);
-    uint tiles = (counts[e] + 15u) / 16u;
+    uint tiles = (counts[e] + tile_m - 1u) / tile_m;
     for (uint t = 0; t < tiles; t++) { tile_expert[toff + t] = e; }
-    moff += tiles * 16u;
+    moff += tiles * tile_m;
     toff += tiles;
   }
 }

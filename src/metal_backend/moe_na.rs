@@ -6,6 +6,55 @@
 
 use super::*;
 
+/// Colonnes N (et pas de K) d'une tuile des kernels groupés tuilés.
+const COOP_TILED_BN: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    /// Appels du MoE routé coop servis par les kernels tuilés sur ce thread.
+    static MOE_COOP_TILED_TRACE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Compteur des appels du MoE routé coop servis par les kernels tuilés sur ce
+/// thread : prouve le chemin pris.
+#[cfg(test)]
+pub(crate) fn moe_coop_tiled_trace_for_test() -> usize {
+    MOE_COOP_TILED_TRACE.with(std::cell::Cell::get)
+}
+
+/// Grille des kernels groupés : (tuiles M, tuiles N).
+fn coop_grid(max_m: usize, n: usize, tiled: bool) -> MTLSize {
+    if tiled {
+        MTLSize::new(
+            (max_m / MOE_COOP_TILED_BM) as u64,
+            n.div_ceil(COOP_TILED_BN) as u64,
+            1,
+        )
+    } else {
+        MTLSize::new((max_m / MOE_COOP_TILE_M) as u64, n.div_ceil(32) as u64, 1)
+    }
+}
+
+/// Threads par threadgroup : un simdgroup (16 × 32) ou quatre (tuilé, 2 × 2).
+fn coop_threads(tiled: bool) -> MTLSize {
+    MTLSize::new(if tiled { 128 } else { 32 }, 1, 1)
+}
+
+/// Préconditions des kernels tuilés, sans masque : u4, M en tuiles entières
+/// de [`MOE_COOP_TILED_BM`], N et K multiples de 64.
+fn check_coop_tiled_shape(bits: usize, max_m: usize, n: usize, k: usize) -> Result<()> {
+    if bits != FAST_QMV_BITS
+        || max_m % MOE_COOP_TILED_BM != 0
+        || n % COOP_TILED_BN != 0
+        || k % COOP_TILED_BN != 0
+    {
+        return Err(InferError::Dimension(format!(
+            "coop tuilé exige u4, M%{MOE_COOP_TILED_BM}, N%64 et K%64 : u{bits} M={max_m} N={n} K={k}"
+        )));
+    }
+    Ok(())
+}
+
 impl MetalExecutor {
     /// GEMM quantifié groupé : `out[M_pad,N] = a[M_pad,K] · deq(W_e[N,K])^T`, l'expert e
     /// de chaque tuile M (16 lignes) lu dans `tile_expert`. Poids empilé `[experts,N,K]`.
@@ -109,6 +158,8 @@ impl MetalExecutor {
     }
 
     /// GEMM groupé gate+up + SwiGLU fusé : écrit directement hidden bf16.
+    /// `tiled` choisit le kernel u4 tuilé ([`MOE_COOP_TILED_BM`] × 64), dont
+    /// les tuiles de `tile_expert` font [`MOE_COOP_TILED_BM`] lignes.
     #[expect(
         clippy::too_many_arguments,
         reason = "GEMM groupé fusé : buffers + dims"
@@ -126,6 +177,7 @@ impl MetalExecutor {
         n: usize,
         k: usize,
         top_k: usize,
+        tiled: bool,
     ) -> Result<()> {
         if gate.bits != up.bits || gate.group_size != 64 || up.group_size != 64 {
             return Err(InferError::Config(format!(
@@ -146,7 +198,14 @@ impl MetalExecutor {
                 gate.experts, gate.out_dim, gate.in_dim, up.experts, up.out_dim, up.in_dim
             )));
         }
-        let (pso, kernel_name) = if gate.bits == FAST_QMV_BITS {
+        let (pso, kernel_name) = if tiled {
+            check_coop_tiled_shape(gate.bits, max_m, n, k)?;
+            (
+                self.na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled
+                    .as_ref(),
+                "gemm_nax_coop_qb_grouped_gate_up_swiglu_u4_tiled",
+            )
+        } else if gate.bits == FAST_QMV_BITS {
             (
                 self.na_gemm_coop_qb_grouped_gate_up_swiglu_u4.as_ref(),
                 "gemm_nax_coop_qb_grouped_gate_up_swiglu_u4",
@@ -183,10 +242,7 @@ impl MetalExecutor {
         encoder.set_bytes(10, 16, mnkt.as_ptr().cast::<c_void>());
         trace_dispatch_path(kernel_name, max_m, n, k);
         profile_dispatch();
-        encoder.dispatch_thread_groups(
-            MTLSize::new((max_m / 16) as u64, n.div_ceil(32) as u64, 1),
-            MTLSize::new(32, 1, 1),
-        );
+        encoder.dispatch_thread_groups(coop_grid(max_m, n, tiled), coop_threads(tiled));
         post_dispatch_barrier(encoder);
         Ok(())
     }
@@ -207,6 +263,7 @@ impl MetalExecutor {
         max_m: usize,
         n: usize,
         k: usize,
+        tiled: bool,
     ) -> Result<()> {
         if weight.group_size != 64 {
             return Err(InferError::Config(format!(
@@ -214,7 +271,13 @@ impl MetalExecutor {
                 weight.bits, weight.group_size
             )));
         }
-        let (pso, kernel_name) = if weight.bits == FAST_QMV_BITS {
+        let (pso, kernel_name) = if tiled {
+            check_coop_tiled_shape(weight.bits, max_m, n, k)?;
+            (
+                self.na_gemm_coop_qb_grouped_scatter_u4_tiled.as_ref(),
+                "gemm_nax_coop_qb_grouped_scatter_u4_tiled",
+            )
+        } else if weight.bits == FAST_QMV_BITS {
             (
                 self.na_gemm_coop_qb_grouped_scatter_u4.as_ref(),
                 "gemm_nax_coop_qb_grouped_scatter_u4",
@@ -247,10 +310,7 @@ impl MetalExecutor {
         encoder.set_bytes(7, 12, mnk.as_ptr().cast::<c_void>());
         trace_dispatch_path(kernel_name, max_m, n, k);
         profile_dispatch();
-        encoder.dispatch_thread_groups(
-            MTLSize::new((max_m / 16) as u64, n.div_ceil(32) as u64, 1),
-            MTLSize::new(32, 1, 1),
-        );
+        encoder.dispatch_thread_groups(coop_grid(max_m, n, tiled), coop_threads(tiled));
         post_dispatch_barrier(encoder);
         Ok(())
     }
@@ -373,6 +433,10 @@ impl MetalExecutor {
         self.dispatch_1d(encoder, pso, total)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel de grouping : buffers + dimensions"
+    )]
     fn encode_moe_g_offsets(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -381,6 +445,7 @@ impl MetalExecutor {
         tile_expert: &BufferRef,
         cursor: &BufferRef,
         experts: usize,
+        tile_m: usize,
     ) -> Result<()> {
         let pso = self
             .moe_g_offsets
@@ -394,7 +459,10 @@ impl MetalExecutor {
         set_u32_bytes(
             encoder,
             4,
-            &[checked_u32(experts, "offsets experts")?],
+            &[
+                checked_u32(experts, "offsets experts")?,
+                checked_u32(tile_m, "offsets tile_m")?,
+            ],
             "moe_g_off_e",
         )?;
         trace_dispatch_path("moe_g_offsets", 1, experts, 0);
@@ -459,6 +527,24 @@ impl MetalExecutor {
         .all(|pso| pso.is_some())
     }
 
+    /// Vrai si les kernels tuilés servent ces poids : u4 gs64, gate+up
+    /// fusionné, pipelines compilés et dimensions multiples de 64 (tuile N et
+    /// pas de K des kernels, sans masque).
+    fn routed_coop_tiled_ready(&self, stacked: &StackedMoeBuffers) -> bool {
+        let aligned = |b: &StackedAffineBuffers| {
+            b.out_dim % COOP_TILED_BN == 0 && b.in_dim % COOP_TILED_BN == 0
+        };
+        stacked.gate.bits == FAST_QMV_BITS
+            && moe_coop_fused_swiglu_enabled()
+            && aligned(&stacked.gate)
+            && aligned(&stacked.up)
+            && aligned(&stacked.down)
+            && self
+                .na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled
+                .is_some()
+            && self.na_gemm_coop_qb_grouped_scatter_u4_tiled.is_some()
+    }
+
     /// Vrai si la bibliothèque NA (MPP, macOS 26) compile sur cette machine :
     /// les pipelines coop groupés en font partie et doivent alors exister.
     #[cfg(test)]
@@ -511,8 +597,23 @@ impl MetalExecutor {
         trace_dispatch_path("moe_routed_rows_coop", rows, out_dim, in_dim);
         let total = checked_len(rows, top_k, "moe routed coop total")?;
 
-        let max_tiles = total.div_ceil(16) + experts;
-        let max_m = checked_len(max_tiles, 16, "moe routed coop max_m")?;
+        // Kernels tuilés : flint (sigmoïde) seulement, cf. `flint_moe_coop_tiled_enabled`.
+        let tiled = matches!(router_score, crate::RouterScore::Sigmoid)
+            && flint_moe_coop_tiled_enabled()
+            && self.routed_coop_tiled_ready(&weights.stacked);
+        #[cfg(test)]
+        if tiled {
+            MOE_COOP_TILED_TRACE.with(|trace| trace.set(trace.get() + 1));
+        }
+        let tile_m = if tiled {
+            MOE_COOP_TILED_BM
+        } else {
+            MOE_COOP_TILE_M
+        };
+        // Pire cas sans readback : chaque expert padé au multiple de `tile_m`
+        // au-dessus, soit au plus une tuile partielle par expert.
+        let max_tiles = total.div_ceil(tile_m) + experts;
+        let max_m = checked_len(max_tiles, tile_m, "moe routed coop max_m")?;
         const SENTINEL: u32 = 0xFFFF_FFFF;
         let counts = self.private_u32_buffer(experts, "moe_routed_coop_counts")?;
         let padded_offset = self.private_u32_buffer(experts, "moe_routed_coop_padded_offset")?;
@@ -569,6 +670,7 @@ impl MetalExecutor {
             &tile_expert,
             &cursor,
             experts,
+            tile_m,
         )?;
         self.encode_moe_g_perm(encoder, indices_buffer, &cursor, &perm, total)?;
 
@@ -585,6 +687,7 @@ impl MetalExecutor {
                 inter,
                 in_dim,
                 top_k,
+                tiled,
             )?;
         } else {
             let gate_out = self.private_f32_buffer(
@@ -648,6 +751,7 @@ impl MetalExecutor {
             max_m,
             out_dim,
             inter,
+            tiled,
         )?;
         match residual {
             Some(r) => self.encode_weighted_sum_add_grouped_topk(
@@ -770,6 +874,7 @@ impl MetalExecutor {
             &tile_expert,
             &cursor,
             experts,
+            MOE_COOP_TILE_M,
         )?;
         self.encode_moe_g_perm(encoder, &scratch.indices, &cursor, &perm, total)?;
         // gate/up : GEMM + GATHER fusé (lit input via perm). swiglu padé.
@@ -796,6 +901,7 @@ impl MetalExecutor {
                 inter,
                 hidden,
                 top_k,
+                false,
             )?;
         } else {
             self.encode_coop_qb_grouped_gather(
@@ -845,6 +951,7 @@ impl MetalExecutor {
                 max_m,
                 hidden,
                 inter,
+                false,
             )?;
         }
         // Expert partagé + combine (même encodeur). DIAGNOSTIC : SKIP_SHARED saute

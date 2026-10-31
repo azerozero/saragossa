@@ -222,6 +222,49 @@ pub(crate) fn flint_moe_coop_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_MOE_COOP", true))
 }
 
+/// Kernels groupés TUILÉS pour le MoE routé coop de flint
+/// (`gemm_nax_coop_qb_grouped_*_u4_bm*`) : tuiles d'un expert de
+/// `MOE_COOP_TILED_BM` lignes × 64 colonnes au lieu de 16 × 32, poids
+/// déquantifié une fois par tuile en mémoire threadgroup. Même arithmétique
+/// que les kernels 16 × 32 (oracle bit à bit dans les tests). Qwen3-30B
+/// (softmax) garde les kernels 16 × 32 : pas de modèle local pour mesurer.
+///
+/// NOTE: Mesuré le 31 oct. 2026 sur flint-int4 (prefill seul, morceaux de
+/// 4096) : MoE routé 4,49 → 3,17 s à 32k et 9,89 → 6,99 s à 64k, prefill
+/// 10,6 → 9,4 s et 27,2 → 23,5 s. Hidden du prefill 16k bit à bit identiques
+/// aux kernels 16 × 32 et greedy identique
+/// (`flint_int4_moe_coop_tiled_matches_16x32`).
+/// Kill-switch `SARAGOSSA_RUST_FLINT_MOE_COOP_TILED=0`.
+pub(crate) fn flint_moe_coop_tiled_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FLINT_MOE_COOP_TILED_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_MOE_COOP_TILED", true))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FLINT_MOE_COOP_TILED_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force les kernels coop tuilés de flint sur ce thread le temps de `run`.
+#[cfg(test)]
+pub(crate) fn with_flint_moe_coop_tiled_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    /// Rétablit le réglage précédent, panique comprise.
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FLINT_MOE_COOP_TILED_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore =
+        Restore(FLINT_MOE_COOP_TILED_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
+}
+
 #[cfg(test)]
 thread_local! {
     // Par thread : les tests parallèles comparent coop et qmv sans se gêner.

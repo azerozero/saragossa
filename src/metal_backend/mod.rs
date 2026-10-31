@@ -38,6 +38,10 @@ pub(crate) const MAX_SAMPLER_TOP_K: usize = 32;
 const FAST_QMV_GROUP_SIZE: usize = 64;
 const QMM_NA_GS128_GROUP_SIZE: usize = 128;
 const FAST_QMV_BITS: usize = 4;
+/// Lignes par tuile (un seul expert) des kernels MoE groupés tuilés de flint.
+const MOE_COOP_TILED_BM: usize = 32;
+/// Lignes par tuile des kernels MoE groupés 16 × 32.
+const MOE_COOP_TILE_M: usize = 16;
 const FAST_QMV_U2_BITS: usize = 2;
 const FAST_QMV_U3_BITS: usize = 3;
 const FAST_QMV_U6_BITS: usize = 6;
@@ -79,9 +83,13 @@ mod prefill;
 #[cfg(test)]
 pub(crate) use self::flags::with_flint_moe_coop_override;
 #[cfg(test)]
+pub(crate) use self::flags::with_flint_moe_coop_tiled_override;
+#[cfg(test)]
 pub(crate) use self::flags::with_qmm_na_u4_min_dim_override;
 #[cfg(test)]
 pub(crate) use self::matmul::with_concat_vram_fraction_override;
+#[cfg(test)]
+pub(crate) use self::moe_na::moe_coop_tiled_trace_for_test;
 #[cfg(test)]
 pub(crate) use self::prefill::routed_coop_trace_for_test;
 #[cfg(test)]
@@ -370,6 +378,10 @@ pub struct MetalExecutor {
     na_gemm_coop_qb_grouped_gate_up_swiglu_u4: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_scatter: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_scatter_u4: Option<ComputePipelineState>,
+    /// MoE groupé u4 tuilé (flint) : tuiles d'un expert de
+    /// [`MOE_COOP_TILED_BM`] lignes × 64 colonnes.
+    na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled: Option<ComputePipelineState>,
+    na_gemm_coop_qb_grouped_scatter_u4_tiled: Option<ComputePipelineState>,
     moe_coop_gather_padded: Option<ComputePipelineState>,
     moe_coop_scatter_padded: Option<ComputePipelineState>,
     moe_g_fill_u32: Option<ComputePipelineState>,
