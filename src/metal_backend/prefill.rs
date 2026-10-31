@@ -47,6 +47,15 @@ impl MetalExecutor {
     pub(crate) fn set_prefill_window_kv_for_test(&mut self, enabled: bool) {
         self.prefill_window_kv = enabled;
     }
+
+    /// Garde (`keep`) ou retire le NAX fenêtré avec sinks ; rend sa présence
+    /// effective, pour que le test journalise le chemin réellement pris.
+    pub(crate) fn keep_prefill_attn_nax_window_for_test(&mut self, keep: bool) -> bool {
+        if !keep {
+            self.attention_prefill_nax_sink_d128_window = None;
+        }
+        self.attention_prefill_nax_sink_d128_window.is_some()
+    }
 }
 
 struct PrefillTailMoeShape<'a> {

@@ -788,6 +788,26 @@ pub(crate) fn prefill_attn_nax_sinks_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS", true))
 }
 
+/// Attention des couches glissantes flint (sinks, fenêtre de 513, d128, K/V
+/// bf16) par le NAX d128 avec fenêtre (constante 305) au lieu du naïf bf16
+/// `attention_prefill_sink_bf16`. Un K/V f32 (prompt sous le seuil du
+/// stockage bf16) garde le naïf f32. Indépendant de
+/// [`prefill_attn_nax_sinks_enabled`]. Mesuré le 2026-10-31 (M5 Max,
+/// flint-int4, sections de profil) : couches glissantes 2,40 → 0,38 s et
+/// prefill 17,7 → 15,7 s à 29 201 tokens (deux passes de chaque),
+/// 5,13 → 0,79 s et 41,5 → 37,3 s à 58 829 tokens. À entrées bf16 égales,
+/// écart ≤ 1,1e-4 au CPU et au naïf bf16
+/// (`prefill_sink_nax_window_matches_naive_and_cpu`). Dérive contre le naïf
+/// bf16 à 16 400 tokens (`flint_int4_prefill_nax_window_drift`) : max 3,57
+/// et pire moyenne 0,34 sur les logits, argmax 18/18, greedy identique.
+/// Kill-switch
+/// `SARAGOSSA_RUST_PREFILL_ATTN_NAX_WINDOW=0`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_attn_nax_window_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX_WINDOW", true))
+}
+
 /// Ordre de la grille du NAX d256 : `SARAGOSSA_RUST_PREFILL_ATTN_NAX_GRID` =
 /// `head` (défaut, `(H, NQ)`, la tête la plus rapide : les têtes Q d'un groupe
 /// KV partent côte à côte et partagent les tuiles K/V en cache) ou `seq`

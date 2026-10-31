@@ -210,11 +210,13 @@ pub(super) fn compile_steel_causal_nax_d256_attention(
     source: &str,
     shape: attention::NaxCausalAttnShape,
 ) -> Option<attention::NaxCausalAttention> {
-    compile_nax_causal_attention(device, source, shape, false)
+    compile_nax_causal_attention(device, source, shape, false, false)
 }
 
-/// Compile l'attention causale NAX d128 avec sinks f32 (couches pleines
-/// flint). `None` dans les mêmes cas que le d256.
+/// Compile l'attention causale NAX d128 avec sinks f32 : couches pleines
+/// flint, ou glissantes si `window` (constante 305, longueur en `buffer(9)`).
+/// Le pipeline sans fenêtre élimine ce code à la compilation : il reste celui
+/// d'avant la fenêtre. `None` dans les mêmes cas que le d256.
 ///
 /// NOTE: `compile_nax_function` recompile toute la source NAX : avec le d256
 /// actif, la source est compilée deux fois au démarrage. Coût accepté plutôt
@@ -225,8 +227,9 @@ pub(super) fn compile_nax_sink_d128_attention(
     device: &Device,
     source: &str,
     shape: attention::NaxCausalAttnShape,
+    window: bool,
 ) -> Option<attention::NaxCausalAttention> {
-    compile_nax_causal_attention(device, source, shape, true)
+    compile_nax_causal_attention(device, source, shape, true, window)
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -235,6 +238,7 @@ fn compile_nax_causal_attention(
     source: &str,
     shape: attention::NaxCausalAttnShape,
     sinks: bool,
+    window: bool,
 ) -> Option<attention::NaxCausalAttention> {
     let pipeline = compile_nax_function(
         device,
@@ -248,6 +252,7 @@ fn compile_nax_causal_attention(
             (302, sinks),
             (303, false),
             (304, shape.head_major),
+            (305, window),
         ],
     )?;
     Some(attention::NaxCausalAttention { pipeline, shape })
@@ -681,9 +686,25 @@ impl MetalExecutor {
                     &device,
                     sources.steel_attention_nax.as_ref(),
                     attention::NAX_SINK_ATTN_D128,
+                    false,
                 );
                 if pipeline.is_none() {
                     eprintln!("attention prefill NAX avec sinks indisponible : repli Steel d128");
+                }
+                pipeline
+            } else {
+                None
+            };
+        let attention_prefill_nax_sink_d128_window =
+            if crate::runtime_flags::prefill_attn_nax_window_enabled() {
+                let pipeline = compile_nax_sink_d128_attention(
+                    &device,
+                    sources.steel_attention_nax.as_ref(),
+                    attention::NAX_SINK_ATTN_D128,
+                    true,
+                );
+                if pipeline.is_none() {
+                    eprintln!("attention prefill NAX fenêtrée indisponible : repli naïf bf16");
                 }
                 pipeline
             } else {
@@ -885,6 +906,7 @@ impl MetalExecutor {
             prefill_window_kv: crate::runtime_flags::flint_window_kv_enabled(),
             causal_attention_prefill_steel_nax_d256,
             attention_prefill_nax_sink_d128,
+            attention_prefill_nax_sink_d128_window,
             prefill_kv_bf16_mirror: crate::runtime_flags::prefill_kv_bf16_mirror_enabled(),
             prefill_kv_bf16_store_min_rows: (crate::runtime_flags::prefill_kv_bf16_store_enabled()
                 && crate::decode_resident::kv_bf16_dense_by_default())

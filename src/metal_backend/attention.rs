@@ -1374,8 +1374,9 @@ impl MetalExecutor {
     /// préfixe prolongé ; `kv_rows == spec.seq` en un seul morceau) : Q et la
     /// sortie sont locaux, K/V, causalité et fenêtre absolus.
     ///
-    /// Sans fenêtre en d128 sur K/V bf16, le NAX avec sinks s'il est compilé
-    /// (`SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS`, Q converti en bf16).
+    /// En d128 sur K/V bf16, le NAX avec sinks s'il est compilé (Q converti
+    /// en bf16) : sans fenêtre `SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS`, avec
+    /// fenêtre `SARAGOSSA_RUST_PREFILL_ATTN_NAX_WINDOW`.
     /// Sinon, sans fenêtre en d128, le Steel tuilé avec sinks
     /// (`SARAGOSSA_RUST_FLINT_PREFILL_STEEL`) ; sinon
     /// `attention_prefill_sink_f32`, une simdgroup par (tête Q, position).
@@ -1410,9 +1411,12 @@ impl MetalExecutor {
                 spec.head_dim, spec.q_heads, spec.kv_heads, spec.seq
             )));
         }
-        if let Some(nax) = self.attention_prefill_nax_sink_d128.as_ref().filter(|_| {
-            kv_bf16 && spec.window.is_none() && spec.head_dim == STEEL_SINK_ATTN_D128_BD
-        }) {
+        let nax = if spec.window.is_some() {
+            self.attention_prefill_nax_sink_d128_window.as_ref()
+        } else {
+            self.attention_prefill_nax_sink_d128.as_ref()
+        };
+        if let Some(nax) = nax.filter(|_| kv_bf16 && spec.head_dim == STEEL_SINK_ATTN_D128_BD) {
             // Le NAX lit Q, K et V dans le même type : Q est converti en bf16
             // comme pour le d256 ; un K/V f32 garde le Steel (pas de TF32).
             let q_len = checked_len(spec.seq, spec.q_heads * spec.head_dim, "nax sinks q")?;
@@ -1438,6 +1442,16 @@ impl MetalExecutor {
                 (&params as *const SteelAttnParams).cast::<c_void>(),
             );
             encoder.set_buffer(7, Some(sinks_buffer), 0);
+            if let Some(window) = spec.window {
+                // Le pipeline fenêtré est compilé avec la constante 305 :
+                // fenêtre relative au buffer K/V, comme `qL_off` (F6).
+                let window = checked_i32(window, "nax sinks fenêtre")?;
+                encoder.set_bytes(
+                    9,
+                    std::mem::size_of::<i32>() as NSUInteger,
+                    (&window as *const i32).cast::<c_void>(),
+                );
+            }
             profile_dispatch();
             // Grille `(NQ, H)` seulement : `attention_nax` ignore la constante
             // 304, `NAX_SINK_ATTN_D128.head_major` reste faux.
