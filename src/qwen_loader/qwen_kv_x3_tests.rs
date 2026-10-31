@@ -12,9 +12,10 @@ use super::*;
 /// `SARAGOSSA_QWEN_KV_X3_STEPS` tokens greedy (128 par défaut). La dérive des
 /// logits est suivie à chaque pas le long de la continuation qmv. Une
 /// divergence des greedy est rapportée avec sa marge et le bruit du qmv
-/// contre lui-même (morceaux de prefill deux fois plus petits) ; seul le
-/// garde-fou de dérive fait échouer le test, avec la preuve par compteur que
-/// le bf16×3 a servi (et que le plancher forcé l'a coupé).
+/// contre lui-même (morceaux de prefill deux fois plus petits ; bit-identique
+/// sur Qwen, il ne situe donc rien). Seuls le garde-fou large de dérive et la
+/// preuve par compteur (bf16×3 servi, coupé sous plancher forcé) font
+/// échouer le test : ce n'est pas un budget de qualité.
 #[test]
 #[ignore = "poids réels Qwen 27B 4-bit (≈15 Go) requis ; mesure de dérive, pas un gate"]
 fn qwen27b_kv_nax_x3_greedy_matches_qmv() {
@@ -178,8 +179,10 @@ fn qwen27b_kv_nax_x3_greedy_matches_qmv() {
                 );
             }
         }
-        // Garde-fou large de mesure, pas un budget de qualité (cf.
-        // MAX_GAP_MLX_BF16) : le bf16×3 colle au f32 à ~2e-7 près.
+        // NOTE: Seuils 17 / 2,6 hérités de l'oracle flint (mlx bf16 contre
+        // f32) : garde-fou large contre une sortie cassée, pas un budget de
+        // qualité Qwen. La validation qualité du défaut ON est la matrice
+        // d'intégrité serve ON/OFF à long contexte, hors de ce test.
         assert!(
             max < MAX_GAP_MLX_BF16,
             "écart max {max} ≥ {MAX_GAP_MLX_BF16}"

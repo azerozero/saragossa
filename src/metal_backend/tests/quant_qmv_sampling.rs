@@ -2610,9 +2610,11 @@ fn qmm_na_fused_tiled_u4_flint_shapes_x3_match_f32_reference() -> Result<()> {
     Ok(())
 }
 
-/// k/v du Qwen 27B (5120→1024) ouverts par forme exacte : seul ce couple
-/// passe au GEMM NA bf16×3, les autres petites formes Qwen gardent le qmv, et
-/// la sortie colle à la référence f32 pure (f64), finie partout.
+/// k/v d'un Qwen dense 5120→1024 ouverts par identité de poids : seul le
+/// poids enregistré passe au GEMM NA bf16×3 par le sélecteur owned (chemin du
+/// prefill cible), et sa sortie colle à la référence f32 pure (f64), finie
+/// partout. Un poids de même forme non enregistré (tête MTP) et les mêmes
+/// buffers par le chemin résident (drafter DFlash) gardent le qmv.
 #[test]
 fn qmm_na_fused_tiled_u4_qwen_kv_x3_matches_f32_reference() -> Result<()> {
     let Some(mut executor) = test_executor()? else {
@@ -2624,69 +2626,127 @@ fn qmm_na_fused_tiled_u4_qwen_kv_x3_matches_f32_reference() -> Result<()> {
     }
     // 65 lignes : une tuile de 64 et une queue partielle.
     let (batch, in_dim, out_dim) = (65_usize, 5120_usize, 1024_usize);
-    let select = |executor: &MetalExecutor, in_dim: usize, out_dim: usize| {
-        executor.select_resident_affine_matmul_kernel(
-            batch,
-            in_dim,
-            out_dim,
-            FAST_QMV_GROUP_SIZE,
-            FAST_QMV_BITS,
-            false,
-        )
-    };
-    let is_qmv = |kernel| matches!(kernel, AffineMatmulKernel::FastQmvU4);
-    assert!(is_qmv(select(&executor, in_dim, out_dim)), "plancher par défaut");
-    executor.allow_qmm_na_u4_x3_shape(in_dim, out_dim);
-    assert!(matches!(
-        select(&executor, in_dim, out_dim),
-        AffineMatmulKernel::QmmNaFusedTiledU4
-    ));
-    // Expert partagé Qwen 30B/Next (2048↔512), k/v 2048→512 et une autre
-    // sortie 1024 : toujours au qmv.
-    for (other_in, other_out) in [(2048, 512), (512, 2048), (4096, 1024), (5120, 512)] {
-        assert!(
-            is_qmv(select(&executor, other_in, other_out)),
-            "{other_in}→{other_out} doit rester au qmv"
-        );
-    }
-    let weight = test_affine_varied(out_dim, in_dim)?;
-    let buffers = executor.resolve_linear_weight_buffers(
-        &LinearWeight::AffineQuantized(weight.clone()),
-        "qwen_kv_x3_weight",
-    )?;
+    let target = test_affine_varied(out_dim, in_dim)?;
+    let other = test_affine_varied(out_dim, in_dim)?;
+    let is_na = |kernel| matches!(kernel, AffineMatmulKernel::QmmNaFusedTiledU4);
+    assert!(!is_na(executor.select_owned_affine_matmul_kernel(
+        batch, in_dim, &target, false
+    )));
+    executor.allow_qmm_na_u4_x3_weight(&target);
+    assert!(is_na(executor.select_owned_affine_matmul_kernel(
+        batch, in_dim, &target, false
+    )));
     let mut lhs = Vec::with_capacity(batch * in_dim);
     for row in 0..batch {
         lhs.extend_from_slice(&varied_row(in_dim, 29 + row));
     }
     let lhs_buf = executor.upload_f32_buffer(&lhs, "qwen_kv_x3_lhs")?;
     let out_buf = executor.uncached_f32_buffer(batch * out_dim, "qwen_kv_x3_out")?;
-    let before = crate::metal_backend::qmm_na_u4_x3_dispatches_for_test();
-    let command_buffer = executor.queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    executor.encode_matmul_weight_buffers(
-        encoder, &lhs_buf, batch, in_dim, &buffers, &out_buf, false,
-    )?;
-    encoder.end_encoding();
-    commit_and_wait(command_buffer)?;
-    assert_eq!(
-        crate::metal_backend::qmm_na_u4_x3_dispatches_for_test(),
-        before + 1,
-        "le bf16×3 doit être dispatché"
-    );
-    let nax = read_f32_buffer(&out_buf, batch * out_dim)?;
-    let (exact, abs_dot) = qmm_u4_f64_reference(&weight, &lhs, batch);
+    // Encode puis rend (sortie, dispatches x3) ; `resident` force le chemin
+    // par buffers, celui du drafter DFlash.
+    let run = |weight: &AffineQuantizedTensor, resident: bool| -> Result<(Vec<f32>, usize)> {
+        let linear = LinearWeight::AffineQuantized(weight.clone());
+        let before = crate::metal_backend::qmm_na_u4_x3_dispatches_for_test();
+        let command_buffer = executor.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let mut owned = Vec::new();
+        if resident {
+            let buffers = executor.resolve_linear_weight_buffers(&linear, "qwen_kv_x3_weight")?;
+            executor.encode_matmul_weight_buffers(
+                encoder, &lhs_buf, batch, in_dim, &buffers, &out_buf, false,
+            )?;
+        } else {
+            executor.encode_matmul_weight(
+                encoder, &mut owned, &lhs_buf, batch, in_dim, &linear, &out_buf,
+            )?;
+        }
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        let dispatched = crate::metal_backend::qmm_na_u4_x3_dispatches_for_test() - before;
+        Ok((read_f32_buffer(&out_buf, batch * out_dim)?, dispatched))
+    };
+    assert_eq!(run(&other, false)?.1, 0, "poids non enregistré (MTP) au x3");
+    assert_eq!(run(&target, true)?.1, 0, "chemin résident (DFlash) au x3");
+    let (nax, dispatched) = run(&target, false)?;
+    assert_eq!(dispatched, 1, "le bf16×3 doit servir le poids enregistré");
+    let (exact, abs_dot) = qmm_u4_f64_reference(&target, &lhs, batch);
     let mut worst = 0.0_f64;
     for idx in 0..batch * out_dim {
         // `f64::max` ignore un NaN : une sortie non finie passerait sinon.
-        assert!(nax[idx].is_finite(), "[{idx}] : sortie non finie {}", nax[idx]);
+        assert!(
+            nax[idx].is_finite(),
+            "[{idx}] : sortie non finie {}",
+            nax[idx]
+        );
         let rel = (f64::from(nax[idx]) - exact[idx]).abs() / abs_dot[idx].max(1e-30);
         worst = worst.max(rel);
     }
     // Même garde-fou empirique que les formes flint (≈3u² de représentation,
     // plus le jeu de l'accumulation f32 sur K = 5120).
     let budget = 1e-5;
-    eprintln!("Qwen k/v NAX x3 {in_dim}→{out_dim} : écart relatif max {worst:.3e}, budget {budget:.3e}");
+    eprintln!(
+        "Qwen k/v NAX x3 {in_dim}→{out_dim} : écart relatif max {worst:.3e}, budget {budget:.3e}"
+    );
     assert!(worst <= budget, "écart relatif {worst:.3e} > {budget:.3e}");
+    Ok(())
+}
+
+/// Matrice négative de l'autorisation par poids, sur les deux sélecteurs :
+/// u6, u4 gs128, petit batch, forme au-dessus du plancher et poids non
+/// enregistré ne prennent jamais le GEMM NA ; le résident ignore
+/// l'autorisation.
+#[test]
+fn qmm_na_u4_x3_weight_allowance_rejects_other_cases() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    if !qmm_na_fused_tiled_u4_enabled() || executor.na_gemm_coop_qb_tiled_u4_x3.is_none() {
+        eprintln!("skip: GEMM NA u4 x3 indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    let is_na = |kernel| {
+        matches!(
+            kernel,
+            AffineMatmulKernel::QmmNaFusedTiledU4 | AffineMatmulKernel::QmmNaFusedTiledU4Align64
+        )
+    };
+    let (in_dim, out_dim) = (5120_usize, 1024_usize);
+    let kv = test_affine_varied(out_dim, in_dim)?;
+    let u6 = test_affine_varied_u6(out_dim, in_dim)?;
+    let gs128 = test_affine_varied_group(out_dim, in_dim, 128)?;
+    // Forme au-dessus du plancher : refusée à l'enregistrement, son
+    // éligibilité reste celle du GEMM bf16 par défaut.
+    let large = test_affine_varied(2048, 2048)?;
+    let unregistered = test_affine_varied(out_dim, in_dim)?;
+    for weight in [&kv, &u6, &gs128, &large] {
+        executor.allow_qmm_na_u4_x3_weight(weight);
+    }
+    assert_eq!(executor.qmm_na_u4_x3_weights, vec![kv.weight_id()]);
+    for (label, weight) in [
+        ("u6", &u6),
+        ("gs128", &gs128),
+        ("non enregistré", &unregistered),
+    ] {
+        assert!(
+            !is_na(executor.select_owned_affine_matmul_kernel(65, in_dim, weight, false)),
+            "owned {label} au GEMM NA"
+        );
+    }
+    // Petit batch, sous le seuil de largeur du NA.
+    assert!(!is_na(executor.select_owned_affine_matmul_kernel(
+        31, in_dim, &kv, false
+    )));
+    assert!(is_na(executor.select_owned_affine_matmul_kernel(
+        33, in_dim, &kv, false
+    )));
+    for (batch, bits, group_size) in [(65, 4, 64), (65, 6, 64), (65, 4, 128), (31, 4, 64)] {
+        assert!(
+            !is_na(executor.select_resident_affine_matmul_kernel(
+                batch, in_dim, out_dim, group_size, bits, false,
+            )),
+            "résident {batch}×{in_dim}→{out_dim} u{bits} gs{group_size} au GEMM NA"
+        );
+    }
     Ok(())
 }
 
@@ -2743,10 +2803,19 @@ fn affine_qmv_one_u8_gs64_matches_cpu_on_shared_gate_shape() -> Result<()> {
 /// les buffers GPU) — `test_affine` (scale constant, bias nul) annulerait le
 /// terme `sum * bias` et masquerait une divergence d'accumulation.
 fn test_affine_varied(out_dim: usize, in_dim: usize) -> Result<AffineQuantizedTensor> {
+    test_affine_varied_group(out_dim, in_dim, 64)
+}
+
+/// Affine 4-bit déterministe à scales/biases variés, groupes de `group_size`.
+fn test_affine_varied_group(
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) -> Result<AffineQuantizedTensor> {
     let bits = 4;
     let values_per_word = 32 / bits;
     let packed_cols = in_dim / values_per_word;
-    let groups = in_dim / 64;
+    let groups = in_dim / group_size;
     let mut packed = Vec::with_capacity(out_dim * packed_cols);
     for row in 0..out_dim {
         for word in 0..packed_cols {
@@ -2769,7 +2838,7 @@ fn test_affine_varied(out_dim: usize, in_dim: usize) -> Result<AffineQuantizedTe
             .map(|i| bf16_round(-0.01 + 0.000_5 * ((i % 11) as f32)))
             .collect(),
     )?;
-    AffineQuantizedTensor::new(&[out_dim, packed_cols], packed, scales, biases, 64, bits)
+    AffineQuantizedTensor::new(&[out_dim, packed_cols], packed, scales, biases, group_size, bits)
 }
 
 /// Affine 8-bit gs64 déterministe à scales/biases variés (poids DWQ :

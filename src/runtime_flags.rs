@@ -970,10 +970,12 @@ pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", true))
 }
 
-/// GEMM NA u4 tuilé bf16×3 pour les seules projections k/v (5120→1024) des
-/// couches full-attention du Qwen 27B dense au prefill, au lieu du qmv f32.
-/// Les autres petites projections Qwen (beta/alpha, expert partagé de Qwen
-/// 30B et Qwen3-Next) restent au qmv.
+/// GEMM NA u4 tuilé bf16×3, au lieu du qmv f32, pour les seules projections
+/// k/v des couches full-attention du modèle cible quand c'est un Qwen dense
+/// (sans experts ni sinks) à k/v 5120→1024 en u4 gs64, comme Qwen3.8 27B.
+/// L'autorisation suit l'identité des poids k/v, pas leur forme : tête MTP,
+/// drafter DFlash, beta/alpha et experts partagés de Qwen 30B et Qwen3-Next
+/// gardent le qmv. Seul le chemin owned (prefill cible) la consulte.
 ///
 /// Actif par défaut, kill-switch `SARAGOSSA_RUST_QWEN_KV_NAX_X3=0`.
 /// NOTE: Mesuré le 31 oct. 2026 sur Qwen3.8-27B-4bit (M5 Max), prefill seul

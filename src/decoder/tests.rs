@@ -3505,9 +3505,9 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
     })
 }
 
-/// Seul le Qwen 27B dense ouvre ses k/v 5120→1024 au bf16×3 : Qwen 30B et
-/// Qwen3-Next (MoE), flint (sinks), un autre Qwen dense et un modèle
-/// hétérogène gardent le plancher.
+/// Seul un Qwen dense à k/v 5120→1024 (Qwen3.8 27B) ouvre ses k/v au
+/// bf16×3 : Qwen 30B et Qwen3-Next (MoE), flint (sinks), un autre Qwen dense
+/// et un modèle hétérogène gardent le plancher.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn qwen_kv_nax_x3_shape_targets_dense_qwen_27b_only() {

@@ -87,17 +87,19 @@ pub enum RopeStyle {
     Interleaved,
 }
 
-/// Forme `(in_dim, out_dim)` des k/v full-attention du Qwen 27B dense
-/// (hidden 5120, 4 têtes K/V de 256), seule forme Qwen validée sous le
-/// plancher du GEMM NA u4 par ses oracles (référence f64, greedy réel).
+/// Forme `(in_dim, out_dim)` des k/v full-attention d'un Qwen dense à hidden
+/// 5120 et 4 têtes K/V de 256 (Qwen3.8 27B), seule forme Qwen validée sous
+/// le plancher du GEMM NA u4 par ses oracles (référence f64, greedy réel).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 const QWEN_27B_KV_SHAPE: (usize, usize) = (5120, 1024);
 
-/// Forme `(in_dim, out_dim)` des k/v full-attention (`kv_shapes`, poids
-/// `[out, in]`) à ouvrir au GEMM NA u4 bf16×3, pour le seul Qwen 27B dense
-/// ([`QWEN_27B_KV_SHAPE`] sur toutes ses couches full). Les MoE Qwen (30B,
-/// Qwen3-Next) ont des experts partagés sous le plancher, non validés, et
-/// restent exclus comme flint et Gemma.
+/// Le modèle cible ouvre-t-il ses k/v full-attention au GEMM NA u4 bf16×3 ?
+/// Oui pour un Qwen dense (sans experts, sans sinks, hors Gemma 4) dont
+/// toutes les couches full ont des k (`kv_shapes`, poids `[out, in]`) de
+/// forme [`QWEN_27B_KV_SHAPE`]. Les MoE Qwen (30B, Qwen3-Next) ont des
+/// experts partagés sous le plancher, non validés, et restent exclus comme
+/// flint et Gemma. Seuls les poids k/v de ces couches sont ouverts, pas la
+/// forme : drafter DFlash et tête MTP gardent le qmv.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn qwen_kv_nax_x3_shape(
     config: &CausalDecoderConfig,
@@ -2354,26 +2356,37 @@ impl CausalDecoder {
         if flint && crate::runtime_flags::flint_small_nax_gemm_enabled() {
             executor.enable_flint_small_nax_gemm();
         }
-        if let Some((in_dim, out_dim)) = self.qwen_kv_nax_x3_shape() {
-            if crate::runtime_flags::qwen_kv_nax_x3_enabled() {
-                executor.allow_qmm_na_u4_x3_shape(in_dim, out_dim);
+        self.enable_single_copy_weights(&executor)?;
+        if self.qwen_kv_nax_x3_shape().is_some() && crate::runtime_flags::qwen_kv_nax_x3_enabled() {
+            for attention in self.full_attentions() {
+                for linear in [&attention.k_proj, attention.resident_v_proj()] {
+                    if let LinearWeight::AffineQuantized(weight) = linear.weight() {
+                        executor.allow_qmm_na_u4_x3_weight(weight);
+                    }
+                }
             }
         }
-        self.enable_single_copy_weights(&executor)?;
         self.runtime.metal = Some(Arc::new(executor));
         Ok(self)
+    }
+
+    /// Couches full-attention du modèle cible (tête MTP exclue).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn full_attentions(&self) -> impl Iterator<Item = &FullAttention> {
+        self.layers
+            .iter()
+            .filter_map(|layer| match &layer.attention {
+                AttentionBlock::Full(attention) => Some(attention.as_ref()),
+                AttentionBlock::Linear(_) => None,
+            })
     }
 
     /// Forme k/v à ouvrir au GEMM NA u4 bf16×3 ([`qwen_kv_nax_x3_shape`]).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn qwen_kv_nax_x3_shape(&self) -> Option<(usize, usize)> {
         let kv_shapes = self
-            .layers
-            .iter()
-            .filter_map(|layer| match &layer.attention {
-                AttentionBlock::Full(attention) => Some(attention.k_proj.weight().shape()),
-                AttentionBlock::Linear(_) => None,
-            })
+            .full_attentions()
+            .map(|attention| attention.k_proj.weight().shape())
             .collect::<Vec<_>>();
         qwen_kv_nax_x3_shape(&self.config, &kv_shapes)
     }
