@@ -1628,8 +1628,8 @@ fn qmm_skinny_u4_gs64_matches_qmv_for_5_to_31_rows() -> Result<()> {
             .zip(&expected)
             .map(|(a, e)| (a - e).abs() / scale)
             .fold(0.0f32, f32::max);
-        // bf16 hi+lo sur A et B, trois MMA : ~1e-5 de l'échelle (le qmv f32
-        // réordonné est à 8e-7) ; 5e-5 laisse la marge d'une autre génération de GPU.
+        // Variante par défaut (x2, A en bf16 hi+lo) : ~5e-6 de l'échelle (x3 1e-5, le qmv
+        // f32 réordonné est à 8e-7) ; 5e-5 laisse la marge d'une autre génération de GPU.
         eprintln!("qmm skinny batch={batch}: écart max {worst:.2e} de l'échelle");
         assert!(worst <= 5.0e-5, "qmm skinny u4 batch={batch}: écart {worst:e}");
     }

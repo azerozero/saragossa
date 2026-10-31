@@ -167,7 +167,7 @@ pub(super) fn can_use_fast_affine_qmm8(
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
-/// GEMM « skinny » u4 gs64 sur unités matricielles (`gemm_nax_skinny_u4_x3`,
+/// GEMM « skinny » u4 gs64 sur unités matricielles (`gemm_nax_skinny_u4_x2`,
 /// `na_gemm.metal`) pour les largeurs de `qmm_skinny_min_batch()` à
 /// `qmm_na_min_batch() - 1` (vérification spéculative large) : les poids d'une
 /// tuile sont dé-quantifiés une fois pour seize lignes au lieu d'un qmv par ligne.
@@ -175,10 +175,13 @@ pub(super) fn can_use_fast_affine_qmm8(
 /// contre 0,30 en qmv répliqué, lm_head 2,4 contre 4,4 ; rentable dès 5 lignes,
 /// d'où le défaut de `SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH`. Le défaut D2 fusionné
 /// (3 lignes) n'est pas concerné. Variantes (`SARAGOSSA_RUST_QMM_SKINNY_KERNEL`,
-/// voir [`SkinnyKernel`]) : `x3` (A et B scindés en bf16 hi+lo, trois MMA, écart
-/// 1e-5 de l'échelle, sorties greedy identiques sur les prompts de campagne),
-/// `x2` (q brut exact × A hi+lo, deux MMA, échelle et biais par groupe en f32) et
-/// `bf16` (un seul MMA, gate/up 0,14 ms, lm_head 1,8, écart 5e-3).
+/// voir [`SkinnyKernel`]) : `x2` par défaut (q brut exact × A hi+lo, deux MMA,
+/// échelle et biais par groupe en f32), `x3` (A et B scindés en bf16 hi+lo, trois
+/// MMA) et `bf16` (un seul MMA, gate/up 0,14 ms, lm_head 1,8, écart 5e-3). x2 et
+/// x3 restent à 4-7e-6 de l'échelle contre une référence f64 (formes du Qwen 27B)
+/// et donnent des sorties greedy identiques (DFlash et MTP+lookup, prompts code et
+/// prose 4k, 400 tokens) ; mesuré le 2026-10-31 (M5 Max, code 4k), la
+/// vérification à 8 lignes passe de 71 à 61 ms, à 16 lignes de 95 à 89 ms.
 /// `SARAGOSSA_RUST_QMM_SKINNY=0` rétablit le qmv répliqué.
 pub(super) fn can_use_qmm_skinny_buffers(
     batch: usize,
@@ -226,7 +229,7 @@ pub(super) enum SkinnyKernel {
 }
 
 /// Variante précise par défaut quand ni l'environnement ni une portée ne la fixent.
-const SKINNY_PRECISE_DEFAULT: SkinnyKernel = SkinnyKernel::X3;
+const SKINNY_PRECISE_DEFAULT: SkinnyKernel = SkinnyKernel::X2;
 
 thread_local! {
     // Forçage local de la variante skinny (drafter DFlash en bf16 : ses sorties ne

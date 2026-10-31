@@ -129,7 +129,11 @@ protocole pairwise : elles ne touchent pas le défaut D2 fusionné (3 lignes).
   les vérifications de 5 à 31 lignes : T0 à draft fixe 8 passe de 28,5 à
   37,8 tok/s, un appel de vérification à 9 lignes de 140 à 75 ms. Variante
   `SARAGOSSA_RUST_QMM_SKINNY_KERNEL=bf16` (42,6 tok/s, écart 5e-3) et retrait
-  `SARAGOSSA_RUST_QMM_SKINNY=0`.
+  `SARAGOSSA_RUST_QMM_SKINNY=0`. Depuis le 31 octobre, la variante par défaut
+  est `gemm_nax_skinny_u4_x2` (q brut exact, activation hi+lo, échelle et
+  biais par groupe en f32) : vérification à 8 lignes de 71 à 61 ms à 4k,
+  sorties greedy identiques ; `SARAGOSSA_RUST_QMM_SKINNY_KERNEL=x3` rétablit
+  l'ancienne.
 - Couches linear-attention batchées sur les lignes du draft
   (`SARAGOSSA_RUST_LINEAR_ROWS_BATCHED=0` pour la boucle par ligne) : environ
   5 ms de moins par vérification à 9 lignes.
