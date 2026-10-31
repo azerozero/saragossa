@@ -554,6 +554,53 @@ fn synthetic_flint_moe_coop_matches_qmv() {
     assert_eq!(greedy(true), greedy(false), "greedy coop != qmv");
 }
 
+/// Kernels coop tuilés contre 16 × 32 sur le prefill résident flint
+/// synthétique (deux couches MoE) : hidden bit à bit identiques, puis greedy
+/// identique. Le compteur prouve que le tuilé sert les deux couches.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_moe_coop_tiled_matches_16x32() {
+    let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    if !executor.na_library_available_for_test() {
+        eprintln!("skip: bibliothèque NA indisponible (macOS < 26 ?)");
+        return;
+    }
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let run = |tiled| {
+        crate::metal_backend::with_flint_moe_coop_tiled_override(tiled, || {
+            let before = crate::metal_backend::moe_coop_tiled_trace_for_test();
+            let (hidden, trace) = traced_coop_prefill(&gpu, true);
+            let calls = crate::metal_backend::moe_coop_tiled_trace_for_test() - before;
+            assert_eq!(trace, (2, 0), "coop attendu sur les deux couches MoE");
+            let greedy = crate::metal_backend::with_flint_moe_coop_override(true, || {
+                gpu.generate_greedy(&SYNTHETIC_COOP_PROMPT, 6)
+                    .expect("invariant: greedy GPU")
+            });
+            (hidden, calls, greedy)
+        })
+    };
+    let (base, base_calls, base_greedy) = run(false);
+    let (tiled, tiled_calls, tiled_greedy) = run(true);
+    assert_eq!(base_calls, 0, "16×32: appels tuilés inattendus");
+    assert!(
+        tiled_calls >= 2,
+        "tuilé: {tiled_calls} appels sur 2 couches"
+    );
+    // Bits exacts : `==` sur f32 confondrait +0.0 et -0.0.
+    assert_eq!(base.data().len(), tiled.data().len(), "longueurs hidden");
+    assert!(
+        base.data()
+            .iter()
+            .zip(tiled.data())
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "hidden tuilé != 16×32"
+    );
+    assert_eq!(base_greedy, tiled_greedy, "greedy tuilé != 16×32");
+}
+
 /// Repli exécuté : sans le pipeline scatter u4 du coop groupé, le prefill
 /// résident flint doit passer par le qmv sur ses deux couches MoE et rendre
 /// exactement les hidden du qmv.
@@ -2173,6 +2220,74 @@ fn flint_int4_moe_coop_matches_qmv() {
         mean < MEAN_GAP_MLX_BF16,
         "écart moyen {mean} ≥ {MEAN_GAP_MLX_BF16}"
     );
+}
+
+/// Kernels coop tuilés contre 16 × 32 sur flint-int4 réel : prompt
+/// synthétique de `SARAGOSSA_FLINT_COOP_LEN` tokens (16 384 par défaut),
+/// hidden du prefill résident bit à bit identiques et 16 tokens greedy
+/// identiques. Le compteur prouve que le tuilé sert chaque couche MoE.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis"]
+fn flint_int4_moe_coop_tiled_matches_16x32() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("test flint coop tuilé sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    let len = std::env::var("SARAGOSSA_FLINT_COOP_LEN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16_384);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let prompt = synthetic_long_prompt(&assets, len);
+    let target = crate::runtime_flags::prefill_resident_chunk_tokens();
+    let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+        .expect("invariant: flint-int4 chargeable en Metal")
+        .with_metal_executor(executor)
+        .expect("invariant: runtime Metal attaché");
+    let run = |tiled: bool| {
+        crate::metal_backend::with_flint_moe_coop_tiled_override(tiled, || {
+            let before = crate::metal_backend::moe_coop_tiled_trace_for_test();
+            let started = std::time::Instant::now();
+            let hidden = model
+                .prefill_hidden_for_test(&prompt, Some(target))
+                .expect("invariant: prefill résident")
+                .expect("prefill résident Metal attendu pour flint");
+            let calls = crate::metal_backend::moe_coop_tiled_trace_for_test() - before;
+            println!(
+                "MoE coop tuilé={tiled}: prefill {len} tokens en {:.1?}, {calls} appels tuilés",
+                started.elapsed()
+            );
+            let tokens = model
+                .generate_greedy_timed_with_options(
+                    &prompt,
+                    16,
+                    &crate::GenerationOptions::default(),
+                )
+                .expect("invariant: génération résidente")
+                .tokens;
+            (hidden, calls, tokens)
+        })
+    };
+    let (base, base_calls, base_tokens) = run(false);
+    let (tiled, tiled_calls, tiled_tokens) = run(true);
+    println!("greedy 16×32={base_tokens:?} tuilé={tiled_tokens:?}");
+    assert_eq!(base_calls, 0, "16×32 : appels tuilés inattendus");
+    // 47 couches MoE routées, au moins une fois chacune.
+    assert!(tiled_calls >= 47, "tuilé : {tiled_calls} appels seulement");
+    assert_eq!(base.data().len(), tiled.data().len(), "longueurs hidden");
+    let same_bits = base
+        .data()
+        .iter()
+        .zip(tiled.data())
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    assert!(
+        same_bits,
+        "hidden tuilé != 16×32 : écart {}",
+        max_gap(base.data(), tiled.data())
+    );
+    assert_eq!(tiled_tokens, base_tokens, "greedy tuilé != 16×32");
 }
 
 /// GEMM NA u4 des petites projections flint (k/v, expert partagé) contre le

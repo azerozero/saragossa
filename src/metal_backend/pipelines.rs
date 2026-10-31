@@ -730,7 +730,7 @@ impl MetalExecutor {
         let f32_to_bf16 = pipeline(&library, &device, "f32_to_bf16")?;
         let dequant_u8_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u8_to_bf16_t_gs64")?;
         let na_source = sources.na_gemm.as_ref();
-        let compile_na = |name| compile_na_gemm_named(&device, na_source, name);
+        let compile_na = |name: &str| compile_na_gemm_named(&device, na_source, name);
         let na_gemm_bf16 = compile_na_gemm(&device, na_source);
         let na_gemm_bf16_bn128 = compile_na("gemm_nax_bf16_bn128");
         let chunk_delta_seq_layout = compile_na("chunk_delta_seq_layout");
@@ -763,6 +763,12 @@ impl MetalExecutor {
             compile_na("gemm_nax_coop_qb_grouped_gate_up_swiglu_u4");
         let na_gemm_coop_qb_grouped_scatter = compile_na("gemm_nax_coop_qb_grouped_scatter");
         let na_gemm_coop_qb_grouped_scatter_u4 = compile_na("gemm_nax_coop_qb_grouped_scatter_u4");
+        let na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled = compile_na(
+            format!("gemm_nax_coop_qb_grouped_gate_up_swiglu_u4_bm{MOE_COOP_TILED_BM}").as_str(),
+        );
+        let na_gemm_coop_qb_grouped_scatter_u4_tiled = compile_na(
+            format!("gemm_nax_coop_qb_grouped_scatter_u4_bm{MOE_COOP_TILED_BM}").as_str(),
+        );
         let moe_coop_gather_padded = compile_na("moe_coop_gather_padded");
         let moe_coop_scatter_padded = compile_na("moe_coop_scatter_padded");
         let moe_g_fill_u32 = compile_na("moe_g_fill_u32");
@@ -951,6 +957,8 @@ impl MetalExecutor {
             na_gemm_coop_qb_grouped_gate_up_swiglu_u4,
             na_gemm_coop_qb_grouped_scatter,
             na_gemm_coop_qb_grouped_scatter_u4,
+            na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled,
+            na_gemm_coop_qb_grouped_scatter_u4_tiled,
             moe_coop_gather_padded,
             moe_coop_scatter_padded,
             moe_g_fill_u32,
