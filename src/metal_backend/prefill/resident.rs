@@ -92,6 +92,67 @@ pub(crate) fn with_prefill_kv_layout_override<R>(
     run()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Couches MoE routées éligibles au coop sur ce thread : (coop exécuté,
+    /// repli qmv faute de pipelines MPP).
+    static ROUTED_COOP_TRACE: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Copies, par couche MoE routée, des logits de routeur `[rows, experts]`
+    /// et des indices top-k `[rows, top_k]` choisis par le kernel, actives
+    /// seulement sous [`with_router_capture`].
+    static ROUTER_CAPTURE: std::cell::RefCell<Option<Vec<RouterCaptureBuffers>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct RouterCaptureBuffers {
+    logits: Buffer,
+    logits_len: usize,
+    indices: Buffer,
+    indices_len: usize,
+}
+
+/// Routeur d'une couche MoE capturé : logits `[rows, experts]` et indices
+/// top-k réellement sélectionnés `[rows, top_k]`.
+#[cfg(test)]
+pub(crate) struct RouterCapture {
+    pub logits: Vec<f32>,
+    pub indices: Vec<u32>,
+}
+
+/// Exécute `run` en capturant, sur ce thread, le routeur de chaque couche MoE
+/// routée du prefill résident (un morceau : lignes locales), dans l'ordre des
+/// couches. Sert à tracer les experts choisis par coop et qmv.
+#[cfg(test)]
+pub(crate) fn with_router_capture<R>(run: impl FnOnce() -> R) -> Result<(R, Vec<RouterCapture>)> {
+    ROUTER_CAPTURE.with(|capture| capture.replace(Some(Vec::new())));
+    let result = run();
+    let captured = ROUTER_CAPTURE
+        .with(|capture| capture.take())
+        .unwrap_or_default();
+    let layers = captured
+        .iter()
+        .map(|layer| {
+            Ok(RouterCapture {
+                logits: read_f32_buffer(&layer.logits, layer.logits_len)?,
+                indices: read_u32_buffer(&layer.indices, layer.indices_len)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((result, layers))
+}
+
+/// Compteurs (coop exécuté, repli qmv faute de pipelines) des couches MoE
+/// routées éligibles du prefill résident sur ce thread : prouve le chemin pris.
+#[cfg(test)]
+pub(crate) fn routed_coop_trace_for_test() -> (usize, usize) {
+    ROUTED_COOP_TRACE.with(Cell::get)
+}
+
 /// Réserve des buffers K/V d'un préfixe pour un prolongement en place
 /// jusqu'à `seq` lignes : `in_place` désigne ces buffers, le préfixe en est
 /// la vue unique depuis leur début, ils ont la place des lignes nouvelles et,
@@ -1556,17 +1617,32 @@ impl MetalExecutor {
             ) => {
                 let total_topk = checked_len(spec.seq, top_k, "resident topk total")?;
                 let inter_dim = stacked.gate.out_dim;
-                // Bascule routed-only coop gatée par un flag DÉDIÉ (défaut OFF) :
-                // l'oracle greedy 30B n'est pas qualifié (cf.
-                // `moe_routed_coop_prefill_enabled`). Le défaut garde le chemin
-                // gather-qmv par lignes, byte-identique à la base. Le routeur n'est
-                // résolu que dans la branche coop.
-                // Le coop route en softmax : le MoE sigmoïde flint garde le
-                // chemin gather par lignes.
-                if sigmoid_shared.is_none()
-                    && moe_routed_coop_prefill_enabled()
-                    && MetalMoeRoutedWeights::stacked_coop_compatible(&stacked)
-                {
+                // flint (expert partagé sans gate) route en sigmoïde ; Qwen en softmax.
+                let router_score = if sigmoid_shared.is_some() {
+                    crate::RouterScore::Sigmoid
+                } else {
+                    crate::RouterScore::Softmax
+                };
+                // Bascule routed coop, défaut ON (cf. `moe_routed_coop_prefill_enabled`,
+                // politique near-tie bf16) ; flint a son kill-switch dédié. Repli
+                // gather qmv si la quantification ou les pipelines MPP manquent. Le
+                // routeur n'est résolu que dans la branche coop.
+                let eligible = moe_routed_coop_prefill_enabled()
+                    && (sigmoid_shared.is_none() || flint_moe_coop_enabled())
+                    && MetalMoeRoutedWeights::stacked_coop_compatible(&stacked);
+                let coop = eligible && self.routed_coop_pipelines_ready(&stacked);
+                #[cfg(test)]
+                if eligible {
+                    ROUTED_COOP_TRACE.with(|trace| {
+                        let (ran, fallback) = trace.get();
+                        trace.set(if coop {
+                            (ran + 1, fallback)
+                        } else {
+                            (ran, fallback + 1)
+                        });
+                    });
+                }
+                if coop {
                     let weights = MetalMoeRoutedWeights {
                         router: self.resolve_linear_weight_buffers(
                             router.weight(),
@@ -1592,9 +1668,10 @@ impl MetalExecutor {
                                 hidden_dim,
                                 &weights,
                                 top_k,
+                                router_score,
                             )
                         },
-                    )
+                    )?;
                 } else {
                     self.run_resident_prefill_section(context, "router_topk", |encoder, owned| {
                         self.encode_matmul_weight(
@@ -1606,8 +1683,8 @@ impl MetalExecutor {
                             router.weight(),
                             &router_buffer,
                         )?;
-                        if sigmoid_shared.is_some() {
-                            self.encode_topk_sigmoid_rows(
+                        match router_score {
+                            crate::RouterScore::Sigmoid => self.encode_topk_sigmoid_rows(
                                 encoder,
                                 &router_buffer,
                                 &indices_buffer,
@@ -1615,9 +1692,8 @@ impl MetalExecutor {
                                 spec.seq,
                                 expert_count,
                                 top_k,
-                            )
-                        } else {
-                            self.encode_topk_softmax_rows(
+                            ),
+                            crate::RouterScore::Softmax => self.encode_topk_softmax_rows(
                                 encoder,
                                 &router_buffer,
                                 &indices_buffer,
@@ -1625,7 +1701,7 @@ impl MetalExecutor {
                                 spec.seq,
                                 expert_count,
                                 top_k,
-                            )
+                            ),
                         }
                     })?;
                     self.run_resident_prefill_section(context, "moe_gate_up", |encoder, owned| {
@@ -1700,37 +1776,60 @@ impl MetalExecutor {
                             )
                         },
                     )?;
-                    match (sigmoid_shared, sigmoid_shared_scratch) {
-                        (None, None) => Ok(()),
-                        // Expert partagé flint, sans gate : ajouté tel quel au
-                        // flux qui porte déjà résiduel et experts routés.
-                        (Some(mlp), Some(scratch)) => self.run_resident_prefill_section(
-                            context,
-                            "moe_shared_ungated",
-                            |encoder, owned| {
-                                self.encode_resident_dense_mlp(
-                                    encoder,
-                                    owned,
-                                    post_normed_buffer,
-                                    &mlp,
-                                    &scratch,
-                                    spec.seq,
-                                    hidden_dim,
-                                )?;
-                                self.encode_accumulate_scaled(
-                                    encoder,
-                                    owned,
-                                    &scratch.down,
-                                    output_buffer,
-                                    1.0,
-                                    hidden_len,
-                                )
-                            },
-                        ),
-                        _ => Err(InferError::Dimension(format!(
-                            "prefill résident expert partagé sigmoïde incohérent couche {layer_index}"
-                        ))),
-                    }
+                }
+                #[cfg(test)]
+                if ROUTER_CAPTURE.with(|capture| capture.borrow().is_some()) {
+                    let logits_len = checked_len(spec.seq, expert_count, "capture routeur")?;
+                    let logits = self.uncached_f32_buffer(logits_len, "router_logits_capture")?;
+                    let indices = self.uncached_u32_buffer(total_topk, "router_indices_capture")?;
+                    self.run_resident_prefill_section(context, "router_capture", |encoder, _| {
+                        self.encode_copy(encoder, &router_buffer, &logits, logits_len)?;
+                        // Copie par demi-mots : les petits u32 seraient des
+                        // f32 dénormaux, qu'une copie f32 pourrait aplatir.
+                        self.encode_copy_u16(encoder, &indices_buffer, &indices, 2 * total_topk)
+                    })?;
+                    ROUTER_CAPTURE.with(|capture| {
+                        if let Some(layers) = capture.borrow_mut().as_mut() {
+                            layers.push(RouterCaptureBuffers {
+                                logits,
+                                logits_len,
+                                indices,
+                                indices_len: total_topk,
+                            });
+                        }
+                    });
+                }
+                match (sigmoid_shared, sigmoid_shared_scratch) {
+                    (None, None) => Ok(()),
+                    // Expert partagé flint, sans gate : ajouté tel quel au flux
+                    // qui porte déjà résiduel et experts routés (les deux chemins
+                    // écrivent `output = residual + Σ scores·down`).
+                    (Some(mlp), Some(scratch)) => self.run_resident_prefill_section(
+                        context,
+                        "moe_shared_ungated",
+                        |encoder, owned| {
+                            self.encode_resident_dense_mlp(
+                                encoder,
+                                owned,
+                                post_normed_buffer,
+                                &mlp,
+                                &scratch,
+                                spec.seq,
+                                hidden_dim,
+                            )?;
+                            self.encode_accumulate_scaled(
+                                encoder,
+                                owned,
+                                &scratch.down,
+                                output_buffer,
+                                1.0,
+                                hidden_len,
+                            )
+                        },
+                    ),
+                    _ => Err(InferError::Dimension(format!(
+                        "prefill résident expert partagé sigmoïde incohérent couche {layer_index}"
+                    ))),
                 }
             }
             (

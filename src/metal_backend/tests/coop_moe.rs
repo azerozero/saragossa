@@ -56,6 +56,7 @@ impl MetalExecutor {
             hidden,
             &weights,
             top_k,
+            crate::RouterScore::Softmax,
         )?;
         guard.end();
         commit_and_wait(command_buffer)?;
@@ -910,6 +911,7 @@ fn moe_routed_rows_coop_full_matches_cpu() -> Result<()> {
         hidden,
         &weights,
         top_k,
+        crate::RouterScore::Softmax,
     )?;
     guard.end();
     commit_and_wait(cb)?;
@@ -1044,6 +1046,7 @@ fn moe_routed_rows_coop_matches_gather_30b_multitile() -> Result<()> {
         hidden,
         &weights,
         top_k,
+        crate::RouterScore::Softmax,
     )?;
     guard.end();
     commit_and_wait(cb)?;
