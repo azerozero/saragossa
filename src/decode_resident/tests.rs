@@ -2928,6 +2928,7 @@ fn run_rows_fused_case(
         q_rows.tensor().buffer(),
         ctx_rows.tensor().buffer(),
         ROWS,
+        None,
         max_rows_per_group,
     )?;
     encoder.end_encoding();
@@ -3012,6 +3013,239 @@ fn full_attn_rows_fused_matches_row_loop() -> Result<()> {
     ));
     encoder.end_encoding();
     assert_eq!(kv.len(), 2);
+    Ok(())
+}
+
+/// Attention en lignes fenêtrée (drafter DFlash) contre la boucle naïve fenêtrée
+/// ligne par ligne et l'oracle CPU, mêmes entrées : la ligne `row` d'un bloc posé
+/// après `context` positions n'attend que `[max(0, context+row+1−window), context+row+1)`.
+/// Retourne l'écart max (rows vs naïf, rows vs CPU).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "cas de test : contexte, bloc, fenêtre, format et découpage explicites"
+)]
+fn run_rows_windowed_case(
+    state: &DecodeResidentState,
+    context: usize,
+    block: usize,
+    window: usize,
+    head_dim: usize,
+    format: KvFormat,
+    max_rows_per_group: Option<usize>,
+    eps: f32,
+) -> Result<(f32, f32)> {
+    let total = context + block;
+    let q_dim = POS_Q * head_dim;
+    let kv_dim = POS_KV * head_dim;
+    // q amplifié : softmax piquée, pour qu'une position hors fenêtre comptée à
+    // tort se voie nettement au-dessus de la tolérance.
+    let q: Vec<f32> = (0..block * q_dim)
+        .map(|i| 30.0 * pseudo(5000 + i))
+        .collect();
+    let keys: Vec<f32> = (0..total * kv_dim).map(|i| pseudo(i + 3)).collect();
+    let values: Vec<f32> = (0..total * kv_dim).map(|i| pseudo(i + 11)).collect();
+    let (keys_ref, values_ref): (Vec<f32>, Vec<f32>) = if format == KvFormat::Bf16 {
+        (
+            keys.iter().copied().map(bf16_round_to_f32).collect(),
+            values.iter().copied().map(bf16_round_to_f32).collect(),
+        )
+    } else {
+        (keys.clone(), values.clone())
+    };
+    let kernels = state.rows_kernels()?;
+    let make_kv = |len: usize| -> Result<FullAttentionMetalState> {
+        let mut kv =
+            state.full_attention_format_for_test(total, POS_Q, POS_KV, head_dim, format)?;
+        kv.seed(&keys[..len * kv_dim], &values[..len * kv_dim], len)?;
+        Ok(kv)
+    };
+    let kv_rows = make_kv(total)?;
+    let mut kv_loop = make_kv(context)?;
+    let q_buf = lease_with(state, &q)?;
+    let k_block = lease_with(state, &keys[context * kv_dim..])?;
+    let v_block = lease_with(state, &values[context * kv_dim..])?;
+    let ctx_rows = state.scratch().lease(block * q_dim, GpuElement::F32)?;
+    let ctx_loop = state.scratch().lease(block * q_dim, GpuElement::F32)?;
+    let q_row = state.scratch().lease(q_dim, GpuElement::F32)?;
+    let ctx_row = state.scratch().lease(q_dim, GpuElement::F32)?;
+    let scores = state.scratch().lease(POS_Q * total, GpuElement::F32)?;
+    let executor = MetalExecutor::new()?;
+
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    kv_rows.encode_attention_decode_rows_chunked(
+        encoder,
+        kernels,
+        q_buf.tensor().buffer(),
+        ctx_rows.tensor().buffer(),
+        block,
+        Some(window),
+        max_rows_per_group,
+    )?;
+    // Référence GPU : boucle naïve de `encode_block_attention` (dflash.rs).
+    for row in 0..block {
+        let q_offset = (row * q_dim * 4) as u64;
+        let kv_offset = (row * kv_dim * 4) as u64;
+        kv_loop.encode_append_kv_rows(
+            encoder,
+            kernels,
+            k_block.tensor().buffer(),
+            kv_offset,
+            kv_dim,
+            v_block.tensor().buffer(),
+            kv_offset,
+            kv_dim,
+            1,
+        )?;
+        executor.encode_copy_with_offsets(
+            encoder,
+            q_buf.tensor().buffer(),
+            q_offset,
+            q_row.tensor().buffer(),
+            0,
+            q_dim,
+        )?;
+        kv_loop.encode_attention_decode_windowed(
+            encoder,
+            q_row.tensor().buffer(),
+            scores.tensor().buffer(),
+            ctx_row.tensor().buffer(),
+            (context + row + 1).saturating_sub(window),
+        )?;
+        executor.encode_copy_with_offsets(
+            encoder,
+            ctx_row.tensor().buffer(),
+            0,
+            ctx_loop.tensor().buffer(),
+            q_offset,
+            q_dim,
+        )?;
+    }
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+
+    let (rows_out, loop_out) = (read_f32(ctx_rows.tensor()), read_f32(ctx_loop.tensor()));
+    let max_delta = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    };
+    let label = format!("context={context} block={block} window={window} d{head_dim} {format:?}");
+    let (mut vs_loop, mut vs_cpu) = (0.0_f32, 0.0_f32);
+    for row in 0..block {
+        let len = context + row + 1;
+        let start = len.saturating_sub(window);
+        let range = row * q_dim..(row + 1) * q_dim;
+        let cpu = cpu_attention_windowed(
+            &q[range.clone()],
+            &keys_ref,
+            &values_ref,
+            POS_Q,
+            POS_KV,
+            head_dim,
+            len,
+            start,
+        );
+        let d_loop = max_delta(&rows_out[range.clone()], &loop_out[range.clone()]);
+        let d_cpu = max_delta(&rows_out[range.clone()], &cpu);
+        assert!(
+            d_loop <= eps,
+            "{label} ligne {row}: rows vs naïf {d_loop:e} > {eps:e}"
+        );
+        assert!(
+            d_cpu <= eps,
+            "{label} ligne {row}: rows vs CPU {d_cpu:e} > {eps:e}"
+        );
+        if 4 * start >= window {
+            // Quand la fenêtre exclut une part notable du contexte, elle change
+            // réellement le résultat : sans elle, l'écart dépasse largement la
+            // tolérance (le test discrimine bien la borne basse). Exclure quelques
+            // positions sur 2048 reste, lui, sous la tolérance.
+            let unwindowed = cpu_attention_windowed(
+                &q[range.clone()],
+                &keys_ref,
+                &values_ref,
+                POS_Q,
+                POS_KV,
+                head_dim,
+                len,
+                0,
+            );
+            let gap = max_delta(&cpu, &unwindowed);
+            assert!(
+                gap > 10.0 * eps,
+                "{label} ligne {row}: fenêtre sans effet ({gap:e})"
+            );
+        }
+        vs_loop = vs_loop.max(d_loop);
+        vs_cpu = vs_cpu.max(d_cpu);
+    }
+    Ok((vs_loop, vs_cpu))
+}
+
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn full_attn_rows_windowed_matches_naive_and_cpu() -> Result<()> {
+    let state = try_state()?.ok_or_else(|| {
+        InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
+    })?;
+    // Tolérance : naïf, flash et split-K réduisent la même softmax dans des
+    // ordres différents (exp rapide, max glissant). Écart observé ≤ 2e-8 sur des
+    // sorties ~1e-1 (imprimé en fin de test) : 1e-6 garde une marge ×50.
+    const EPS: f32 = 1.0e-6;
+    let mut worst = (0.0_f32, 0.0_f32);
+    for head_dim in [128, 256] {
+        for format in [KvFormat::F32, KvFormat::Bf16] {
+            // (contexte, bloc, fenêtre, lignes par groupe) : flash en lignes.
+            for (context, block, window, group) in [
+                (5, 4, 16, None),     // contexte + bloc < fenêtre
+                (12, 4, 16, None),    // dernière ligne = fenêtre
+                (14, 4, 16, None),    // bloc qui franchit la fenêtre
+                (16, 4, 16, None),    // contexte = fenêtre
+                (40, 8, 16, None),    // contexte > fenêtre
+                (40, 8, 16, Some(3)), // queue de chunk (3 + 3 + 2)
+                (40, 8, 16, Some(1)),
+                // 2-passes (longueur effective = fenêtre ≥ seuil 2048) : bloc qui
+                // franchit la bascule flash → 2-passes, puis fenêtre pleine.
+                (2044, 8, 2048, None),
+                (4000, 16, 2048, None),
+                (4000, 16, 2048, Some(3)),
+                // Bascule du nombre de blocs split-K (4223 → 32, 4224 → 64).
+                (4220, 6, 4224, None),
+                (4300, 6, 4224, None),
+            ] {
+                let (d_loop, d_cpu) = run_rows_windowed_case(
+                    &state, context, block, window, head_dim, format, group, EPS,
+                )?;
+                worst = (worst.0.max(d_loop), worst.1.max(d_cpu));
+            }
+        }
+    }
+    eprintln!(
+        "rows fenêtré : écart max vs naïf {:e}, vs CPU {:e}",
+        worst.0, worst.1
+    );
+    // Fenêtre sur KV quantifié ou nulle : refus explicite.
+    let kernels = state.rows_kernels()?;
+    let kv_dim = POS_KV * 128;
+    let mut kv = state.full_attention_format_for_test(8, POS_Q, POS_KV, 128, KvFormat::Q8)?;
+    kv.seed(&vec![0.0; 4 * kv_dim], &vec![0.0; 4 * kv_dim], 4)?;
+    let q = state.scratch().lease(POS_Q * 128, GpuElement::F32)?;
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let buffer = q.tensor().buffer();
+    assert!(matches!(
+        kv.encode_attention_decode_rows_chunked(encoder, kernels, buffer, buffer, 1, Some(2), None),
+        Err(InferError::Config(_))
+    ));
+    let mut kv = state.full_attention_format_for_test(8, POS_Q, POS_KV, 128, KvFormat::F32)?;
+    kv.seed(&vec![0.0; 4 * kv_dim], &vec![0.0; 4 * kv_dim], 4)?;
+    assert!(matches!(
+        kv.encode_attention_decode_rows_chunked(encoder, kernels, buffer, buffer, 1, Some(0), None),
+        Err(InferError::Dimension(_))
+    ));
+    encoder.end_encoding();
     Ok(())
 }
 
