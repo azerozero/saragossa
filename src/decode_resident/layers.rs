@@ -4,6 +4,14 @@ use super::gpu_position::{rope_dims_param, GpuPosition, GpuPositionRows};
 use super::utils::{byte_offset_f32, full_rows_fused_enabled};
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Couches decode passées par le QKV concaténé sans porte de sortie :
+    /// prouve aux tests flint que le chemin est emprunté.
+    pub(crate) static QKV_CONCAT_NO_GATE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl DecodeResidentState {
     fn encode_query_attention_scale(
         executor: &MetalExecutor,
@@ -821,6 +829,8 @@ impl DecodeResidentState {
                             "full-attn dense qkv sort {projected}, attendu {qkv_proj_dim}"
                         )));
                     }
+                    #[cfg(test)]
+                    QKV_CONCAT_NO_GATE_HITS.with(|hits| hits.set(hits.get() + 1));
                     qkv_concat_used = true;
                 }
             }

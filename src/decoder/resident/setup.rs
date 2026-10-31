@@ -558,11 +558,13 @@ impl CausalDecoder {
                             attention.k_proj.weight(),
                             v_proj.weight(),
                         ];
-                        // NOTE: flint (sans porte de sortie, v_proj séparé) n'emploie
-                        // jamais le QKV concaténé : ne pas en payer la copie.
+                        // NOTE: une projection au lieu de trois (−2 dispatches par
+                        // couche, chaque ligne de qmv reste calculée à l'identique).
+                        // La copie des poids adossés au stockage (~250 Mo sur flint)
+                        // n'est payée que si le budget VRAM la tient ; sinon repli
+                        // sur les trois projections séparées.
                         let qkv_proj = if decode_resident_full_qkv_concat_enabled()
-                            && !self.config.attention_sinks
-                            && !metal.concat_would_duplicate_affine_storage(&qkv_sources)
+                            && !metal.concat_duplication_worth_avoiding(&qkv_sources)
                         {
                             match metal.resolve_concat_linear_weight_buffers(
                                 &qkv_sources,

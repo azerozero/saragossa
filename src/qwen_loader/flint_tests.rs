@@ -926,6 +926,73 @@ fn synthetic_flint_window_kv_matches_full_kv_bit_for_bit() {
     }
 }
 
+/// Empreinte du decode résident flint pour comparer deux chemins bit à bit :
+/// bits des logits forcés (K/V f32 puis bf16, la dernière ligne remplit la
+/// capacité de l'arène), puis tokens échantillonnés avec arène adoptée et
+/// semée par copie, en K/V plein puis borné (base non nulle des couches
+/// glissantes).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn flint_decode_fingerprint() -> Vec<Vec<u32>> {
+    let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
+    let forced = [4, 0, 5, 6, 3, 2];
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let mut fingerprint = Vec::new();
+    for kv_bf16 in [false, true] {
+        let rows = crate::metal_backend::with_flint_moe_coop_override(false, || {
+            gpu.resident_forced_logits_for_test(&prompt, &forced, kv_bf16)
+        })
+        .expect("invariant: decode résident flint");
+        fingerprint.extend(
+            rows.iter()
+                .map(|row| row.iter().map(|value| value.to_bits()).collect()),
+        );
+    }
+    if !crate::decode_resident::kv_bf16_dense_by_default() {
+        return fingerprint;
+    }
+    let options = crate::GenerationOptions {
+        temperature: 0.8,
+        seed: 7,
+        ..crate::GenerationOptions::default()
+    };
+    for window in [false, true] {
+        let mut executor = crate::MetalExecutor::new().expect("invariant: executor Metal");
+        executor.set_prefill_kv_bf16_store_min_rows_for_test(Some(0));
+        executor.set_prefill_kv_bf16_store_sinks_for_test(true);
+        executor.set_prefill_window_kv_for_test(window);
+        let gpu = load(flint_tensors(true))
+            .expect("invariant: flint synthétique")
+            .with_metal_executor(executor)
+            .expect("invariant: runtime Metal attaché");
+        let (copied, adopted, flags) =
+            gpu.decode_with_and_without_adoption_for_test(&prompt, 3, 6, &options);
+        assert!(flags[0], "couche pleine adoptée (window={window})");
+        for tokens in [copied, adopted] {
+            fingerprint.push(tokens.iter().map(|&token| token as u32).collect());
+        }
+    }
+    fingerprint
+}
+
+/// QKV concaténé de flint : un qmv au lieu de trois par couche, chaque ligne
+/// de sortie calculée à l'identique. Empreinte du decode bit-identique au
+/// chemin à trois projections, et chemin effectivement emprunté.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_qkv_concat_is_bit_identical() {
+    let hits = || crate::decode_resident::QKV_CONCAT_NO_GATE_HITS.with(std::cell::Cell::get);
+    let start = hits();
+    let split = crate::runtime_flags::with_qkv_concat_override(false, flint_decode_fingerprint);
+    assert_eq!(hits(), start, "QKV concaténé employé malgré le kill-switch");
+    let fused = crate::runtime_flags::with_qkv_concat_override(true, flint_decode_fingerprint);
+    // Trois couches par pas, six pas forcés, K/V f32 puis bf16 au moins.
+    assert!(hits() - start >= 2 * 3 * 6, "QKV concaténé non emprunté");
+    assert_eq!(fused, split, "QKV concaténé != trois projections");
+}
+
 /// Le scratch du prefill résident flint passe par le scope de purge (marquage
 /// volatil, éviction LRU au-delà de `SARAGOSSA_RUST_SCRATCH_CAP_GB`) après
 /// chaque prefill, quelle que soit sa taille, et reste sous ce plafond.

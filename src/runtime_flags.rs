@@ -587,8 +587,46 @@ pub(super) fn decode_resident_full_linear_enabled() -> bool {
 /// projections séparées sans recompiler.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn decode_resident_full_qkv_concat_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = QKV_CONCAT_TEST_OVERRIDE.with(Cell::get) {
+        return forced;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_RESIDENT_FULL_QKV_CONCAT", true))
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+thread_local! {
+    // Par thread : les tests comparent les chemins fusionné et historique en
+    // parallèle (`OnceLock` non réglable dans le processus de test).
+    static QKV_CONCAT_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Exécute `run` avec `cell` forcé à `Some(enabled)` sur ce thread, puis
+/// rétablit le réglage précédent, panique comprise.
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+fn with_test_override<R>(
+    cell: &'static std::thread::LocalKey<Cell<Option<bool>>>,
+    enabled: bool,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(
+        &'static std::thread::LocalKey<Cell<Option<bool>>>,
+        Option<bool>,
+    );
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.0.with(|value| value.set(self.1));
+        }
+    }
+    let _restore = Restore(cell, cell.with(|value| value.replace(Some(enabled))));
+    run()
+}
+
+/// Force le QKV concaténé résident sur ce thread le temps de `run`.
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn with_qkv_concat_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    with_test_override(&QKV_CONCAT_TEST_OVERRIDE, enabled, run)
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
