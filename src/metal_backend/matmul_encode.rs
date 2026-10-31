@@ -4,6 +4,13 @@ use super::*;
 
 const MATMUL_ROW_TG_WIDTH: u64 = 256;
 
+#[cfg(test)]
+thread_local! {
+    // Dispatches skinny encodés sur ce thread : les tests de précision vérifient
+    // qu'ils comparent bien le kernel skinny et non deux replis qmv identiques.
+    pub(super) static SKINNY_DISPATCHES: Cell<usize> = const { Cell::new(0) };
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "wrappers d'encodage Metal: buffers, dimensions et offsets restent explicites"
@@ -26,10 +33,14 @@ impl MetalExecutor {
     }
 
     pub(super) fn qmm_skinny_available(&self) -> bool {
-        if qmm_skinny_bf16() {
-            self.na_gemm_skinny_u4.is_some()
-        } else {
-            self.na_gemm_skinny_u4_x3.is_some()
+        self.qmm_skinny_pipeline().is_some()
+    }
+
+    fn qmm_skinny_pipeline(&self) -> Option<&ComputePipelineState> {
+        match qmm_skinny_kernel() {
+            SkinnyKernel::Bf16 => self.na_gemm_skinny_u4.as_ref(),
+            SkinnyKernel::X3 => self.na_gemm_skinny_u4_x3.as_ref(),
+            SkinnyKernel::X2 => self.na_gemm_skinny_u4_x2.as_ref(),
         }
     }
 
@@ -57,12 +68,9 @@ impl MetalExecutor {
             checked_u32(groups, "qmm skinny groups")?,
         ];
         let batch_u32 = [checked_u32(batch, "qmm skinny batch")?];
-        let pso = if qmm_skinny_bf16() {
-            self.na_gemm_skinny_u4.as_ref()
-        } else {
-            self.na_gemm_skinny_u4_x3.as_ref()
-        }
-        .ok_or_else(|| InferError::Config("qmm skinny NA indisponible".into()))?;
+        let pso = self
+            .qmm_skinny_pipeline()
+            .ok_or_else(|| InferError::Config("qmm skinny NA indisponible".into()))?;
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(packed), packed_offset);
@@ -80,6 +88,8 @@ impl MetalExecutor {
             4,
         ));
         trace_dispatch_path("qmm_skinny_u4_gs64_f32", batch, out_dim, in_dim);
+        #[cfg(test)]
+        SKINNY_DISPATCHES.with(|count| count.set(count.get() + 1));
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(

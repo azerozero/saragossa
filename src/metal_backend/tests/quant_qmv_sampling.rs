@@ -1628,10 +1628,291 @@ fn qmm_skinny_u4_gs64_matches_qmv_for_5_to_31_rows() -> Result<()> {
             .zip(&expected)
             .map(|(a, e)| (a - e).abs() / scale)
             .fold(0.0f32, f32::max);
-        // bf16 hi+lo sur A et B, trois MMA : ~1e-5 de l'échelle (le qmv f32
-        // réordonné est à 8e-7) ; 5e-5 laisse la marge d'une autre génération de GPU.
+        // Variante par défaut (x2, A en bf16 hi+lo) : ~5e-6 de l'échelle (x3 1e-5, le qmv
+        // f32 réordonné est à 8e-7) ; 5e-5 laisse la marge d'une autre génération de GPU.
         eprintln!("qmm skinny batch={batch}: écart max {worst:.2e} de l'échelle");
         assert!(worst <= 5.0e-5, "qmm skinny u4 batch={batch}: écart {worst:e}");
+    }
+    Ok(())
+}
+
+/// Poids u4 gs64 pseudo-aléatoire au profil MLX (`b ≈ −7,5·s`, échelles variées).
+fn test_affine_random_u4(out_dim: usize, in_dim: usize, seed: u64) -> Result<AffineQuantizedTensor> {
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let groups = in_dim / 64;
+    let packed = (0..out_dim * in_dim / 8)
+        .map(|_| {
+            let lanes: Vec<u32> = (0..8).map(|_| (next() * 16.0) as u32 & 15).collect();
+            pack_lanes(&lanes, 4)
+        })
+        .collect();
+    let scales: Vec<f32> = (0..out_dim * groups)
+        .map(|_| bf16_round((0.002 + 0.018 * next()) as f32))
+        .collect();
+    let biases = scales
+        .iter()
+        .map(|s| bf16_round(-s * (7.5 + (next() as f32 - 0.5))))
+        .collect();
+    AffineQuantizedTensor::new(
+        &[out_dim, in_dim / 8],
+        packed,
+        Tensor::from_vec(vec![out_dim, groups], scales)?,
+        Tensor::from_vec(vec![out_dim, groups], biases)?,
+        64,
+        4,
+    )
+}
+
+/// Matmul par la variante skinny `kernel`, en vérifiant que le sélecteur a bien
+/// dispatché le kernel skinny (et non un repli qmv).
+fn skinny_matmul(
+    executor: &MetalExecutor,
+    kernel: SkinnyKernel,
+    weight: &AffineQuantizedTensor,
+    lhs: &[f32],
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>> {
+    let _guard = install_qmm_skinny_kernel_scope(kernel);
+    let before = crate::metal_backend::matmul_encode::SKINNY_DISPATCHES.with(Cell::get);
+    let out = matmul_via_selected_kernel(executor, weight, lhs, batch, in_dim, out_dim)?;
+    assert_eq!(
+        crate::metal_backend::matmul_encode::SKINNY_DISPATCHES.with(Cell::get),
+        before + 1,
+        "{kernel:?} M={batch} {in_dim}→{out_dim} : kernel skinny non dispatché"
+    );
+    // `f32::max` ignore les NaN dans les réductions d'écart des appelants.
+    assert!(
+        out.iter().all(|value| value.is_finite()),
+        "{kernel:?} M={batch} {in_dim}→{out_dim} : sortie non finie"
+    );
+    Ok(out)
+}
+
+fn skinny_pipelines_available(executor: &MetalExecutor) -> bool {
+    let available = executor.na_gemm_skinny_u4_x2.is_some() && executor.na_gemm_skinny_u4_x3.is_some();
+    if !available {
+        eprintln!("skip: GEMM NA skinny indisponible (macOS < 26 ?)");
+    }
+    available
+}
+
+/// Contre-exemple d'annulation (relecture Astra) : s = 1, b = −8, q = 8 partout
+/// sauf un 9 par ligne, activation constante non représentable en bf16. Le
+/// résultat exact vaut x ; un terme de biais calculé sur A au lieu de A_hi + A_lo
+/// laisse b·Σ(A − Â) ≈ 3 % d'erreur.
+#[test]
+fn qmm_skinny_u4_x2_cancels_bias_on_split_activation() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    if !skinny_pipelines_available(&executor) {
+        return Ok(());
+    }
+    let (in_dim, out_dim, batch) = (512_usize, 32_usize, 5_usize);
+    let groups = in_dim / 64;
+    let packed = (0..out_dim * in_dim / 8)
+        .map(|word| {
+            let mut lanes = [8_u32; 8];
+            if word % (in_dim / 8) == 0 {
+                lanes[0] = 9;
+            }
+            pack_lanes(&lanes, 4)
+        })
+        .collect();
+    let weight = AffineQuantizedTensor::new(
+        &[out_dim, in_dim / 8],
+        packed,
+        Tensor::from_vec(vec![out_dim, groups], vec![1.0; out_dim * groups])?,
+        Tensor::from_vec(vec![out_dim, groups], vec![-8.0; out_dim * groups])?,
+        64,
+        4,
+    )?;
+    // 1,0038986206054688 : hi = 1,00390625, lo = −7,6e-6 (bits explicites).
+    let x = f32::from_bits(0x3f80_7fc0);
+    let lhs = vec![x; batch * in_dim];
+    for kernel in [SkinnyKernel::X3, SkinnyKernel::X2] {
+        let actual = skinny_matmul(&executor, kernel, &weight, &lhs, batch, in_dim, out_dim)?;
+        let worst = actual.iter().map(|v| (v - x).abs() / x).fold(0.0f32, f32::max);
+        eprintln!("skinny {kernel:?} annulation : écart relatif {worst:.2e}");
+        assert!(worst <= 1.0e-5, "{kernel:?} annulation : écart relatif {worst:e}");
+    }
+    Ok(())
+}
+
+/// Oracle f64 en régime d'annulation : `s·q + b` nul sur 90 % des poids
+/// (q = 8, b = −8·s), activations aléatoires. L'écart est rapporté à la somme
+/// des |w·x| d'une sortie, pas au résultat, quasi nul par construction.
+#[test]
+fn qmm_skinny_u4_x2_matches_f64_under_cancellation() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    if !skinny_pipelines_available(&executor) {
+        return Ok(());
+    }
+    let (in_dim, out_dim, batch) = (5120_usize, 64_usize, 8_usize);
+    let groups = in_dim / 64;
+    let mut state = 0x2545_F491_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let packed = (0..out_dim * in_dim / 8)
+        .map(|_| {
+            let lanes: Vec<u32> = (0..8)
+                .map(|_| if next() < 0.9 { 8 } else { (next() * 16.0) as u32 & 15 })
+                .collect();
+            pack_lanes(&lanes, 4)
+        })
+        .collect::<Vec<u32>>();
+    let scales: Vec<f32> = (0..out_dim * groups)
+        .map(|_| bf16_round((0.002 + 0.018 * next()) as f32))
+        .collect();
+    let biases: Vec<f32> = scales.iter().map(|s| -8.0 * s).collect();
+    let lhs: Vec<f32> = (0..batch * in_dim).map(|_| (next() * 8.0 - 4.0) as f32).collect();
+    let weight = AffineQuantizedTensor::new(
+        &[out_dim, in_dim / 8],
+        packed.clone(),
+        Tensor::from_vec(vec![out_dim, groups], scales.clone())?,
+        Tensor::from_vec(vec![out_dim, groups], biases.clone())?,
+        64,
+        4,
+    )?;
+    let mut reference = Vec::with_capacity(batch * out_dim);
+    let mut magnitude = Vec::with_capacity(batch * out_dim);
+    for row in 0..batch {
+        for n in 0..out_dim {
+            let (mut acc, mut abs) = (0.0f64, 0.0f64);
+            for k in 0..in_dim {
+                let q = (packed[n * in_dim / 8 + k / 8] >> (4 * (k % 8))) & 15;
+                let g = n * groups + k / 64;
+                let w = f64::from(q) * f64::from(scales[g]) + f64::from(biases[g]);
+                let term = f64::from(lhs[row * in_dim + k]) * w;
+                acc += term;
+                abs += term.abs();
+            }
+            reference.push(acc);
+            magnitude.push(abs);
+        }
+    }
+    let mut errors = Vec::new();
+    for kernel in [SkinnyKernel::X3, SkinnyKernel::X2] {
+        let actual = skinny_matmul(&executor, kernel, &weight, &lhs, batch, in_dim, out_dim)?;
+        let worst = actual
+            .iter()
+            .zip(reference.iter().zip(&magnitude))
+            .map(|(&a, (&r, &m))| (f64::from(a) - r).abs() / m)
+            .fold(0.0f64, f64::max);
+        eprintln!("skinny {kernel:?} annulation f64 : écart {worst:.2e} de Σ|w·x|");
+        errors.push(worst);
+    }
+    assert!(errors[0] <= 5.0e-5, "x3 annulation : {:e}", errors[0]);
+    assert!(errors[1] <= 5.0e-5, "x2 annulation : {:e}", errors[1]);
+    assert!(errors[1] <= errors[0] * 1.5, "x2 moins précis que x3 : {errors:?}");
+    Ok(())
+}
+
+/// Les portées de variante skinny s'imbriquent et restaurent le choix précédent.
+#[test]
+fn qmm_skinny_kernel_scopes_restore_nested_choice() {
+    let initial = qmm_skinny_kernel();
+    {
+        let _outer = install_qmm_skinny_kernel_scope(SkinnyKernel::X3);
+        assert_eq!(qmm_skinny_kernel(), SkinnyKernel::X3);
+        {
+            let _inner = install_qmm_skinny_bf16_scope(true);
+            assert_eq!(qmm_skinny_kernel(), SkinnyKernel::Bf16);
+            {
+                let _precise = install_qmm_skinny_bf16_scope(false);
+                assert_ne!(qmm_skinny_kernel(), SkinnyKernel::Bf16);
+            }
+            assert_eq!(qmm_skinny_kernel(), SkinnyKernel::Bf16);
+        }
+        assert_eq!(qmm_skinny_kernel(), SkinnyKernel::X3);
+    }
+    assert_eq!(qmm_skinny_kernel(), initial);
+}
+
+/// Oracle f64 des variantes skinny x2 et x3 sur les formes du Qwen 27B (MLP
+/// 5120↔17408, projections linéaires 5120→10240 et 6144→5120), de 5 à 17 lignes.
+/// Activations avec quelques valeurs aberrantes, comme les états cachés réels. Le
+/// x2 doit rester dans la classe f32 et ne pas faire pire que le x3.
+#[test]
+fn qmm_skinny_u4_x2_and_x3_match_f64_on_qwen_shapes() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    if !skinny_pipelines_available(&executor) {
+        return Ok(());
+    }
+    for (index, (in_dim, out_dim)) in [(5120_usize, 17408_usize), (17408, 5120), (5120, 10240), (6144, 5120)]
+        .into_iter()
+        .enumerate()
+    {
+        let weight = test_affine_random_u4(out_dim, in_dim, 0x9E37_79B9 + index as u64)?;
+        let packed = weight.packed_data();
+        let scales = weight.scales_f32();
+        let biases = weight.biases_f32();
+        let groups = in_dim / 64;
+        for batch in [5_usize, 8, 16, 17] {
+            let lhs: Vec<f32> = (0..batch * in_dim)
+                .map(|i| {
+                    let x = ((i * 2_654_435_761) % 10_007) as f32 / 10_007.0 - 0.5;
+                    if i % 997 == 0 {
+                        x * 40.0
+                    } else {
+                        x
+                    }
+                })
+                .collect();
+            // Sous-ensemble de colonnes : la référence f64 complète coûterait des
+            // milliards d'opérations en profil test.
+            let cols: Vec<usize> = (0..out_dim).step_by(37).collect();
+            let mut reference = Vec::with_capacity(batch * cols.len());
+            for row in 0..batch {
+                let x = &lhs[row * in_dim..(row + 1) * in_dim];
+                for &n in &cols {
+                    let mut acc = 0.0f64;
+                    for (k, &xk) in x.iter().enumerate() {
+                        let q = (packed[n * in_dim / 8 + k / 8] >> (4 * (k % 8))) & 15;
+                        let g = n * groups + k / 64;
+                        acc += f64::from(xk) * (f64::from(q) * f64::from(scales[g]) + f64::from(biases[g]));
+                    }
+                    reference.push(acc);
+                }
+            }
+            let scale = reference.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+            let mut errors = Vec::new();
+            for kernel in [SkinnyKernel::X3, SkinnyKernel::X2] {
+                let actual = skinny_matmul(&executor, kernel, &weight, &lhs, batch, in_dim, out_dim)?;
+                let mut worst = 0.0f64;
+                for row in 0..batch {
+                    for (c, &n) in cols.iter().enumerate() {
+                        let value = f64::from(actual[row * out_dim + n]);
+                        assert!(value.is_finite(), "{kernel:?} {in_dim}→{out_dim} non fini");
+                        worst = worst.max((value - reference[row * cols.len() + c]).abs() / scale);
+                    }
+                }
+                eprintln!("skinny {kernel:?} {in_dim}→{out_dim} M={batch}: écart max {worst:.2e} de l'échelle");
+                errors.push(worst);
+            }
+            assert!(errors[0] <= 5.0e-5, "x3 {in_dim}→{out_dim} M={batch}: {:e}", errors[0]);
+            assert!(errors[1] <= 5.0e-5, "x2 {in_dim}→{out_dim} M={batch}: {:e}", errors[1]);
+            assert!(
+                errors[1] <= errors[0] * 1.5,
+                "x2 moins précis que x3 {in_dim}→{out_dim} M={batch}: {errors:?}"
+            );
+        }
     }
     Ok(())
 }

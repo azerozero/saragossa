@@ -196,6 +196,7 @@ pub struct MetalExecutor {
     affine_qmm8_fast_aligned_u4_gs64_f32: ComputePipelineState,
     na_gemm_skinny_u4: Option<ComputePipelineState>,
     na_gemm_skinny_u4_x3: Option<ComputePipelineState>,
+    na_gemm_skinny_u4_x2: Option<ComputePipelineState>,
     affine_qmm2_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs128_f32: ComputePipelineState,
