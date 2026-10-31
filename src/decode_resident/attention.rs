@@ -13,6 +13,13 @@ use super::utils::{
 use super::*;
 use crate::metal_backend::EncoderEndGuard;
 
+#[cfg(test)]
+thread_local! {
+    /// Appends K/V passés par la rotation fusionnée : prouve aux tests que le
+    /// chemin est emprunté.
+    pub(crate) static ROPE_APPEND_KV_HITS: Cell<usize> = const { Cell::new(0) };
+}
+
 impl DecodeResidentState {
     /// Crée le KV-cache full-attn résident d'UNE couche (factory). L'état renvoyé
     /// est **auto-suffisant** : il embarque des clones bon marché de la queue, du
@@ -273,6 +280,7 @@ impl DecodeResidentState {
             copy_at_f32_to_bf16: self.copy_at_f32_to_bf16_kernel.clone(),
             copy_at_bf16: self.copy_at_bf16_kernel.clone(),
             copy_at_bf16_to_f32: self.copy_at_bf16_to_f32_kernel.clone(),
+            rope_append_kv: self.rope_append_kv_kernels.clone(),
             sinks: None,
         })
     }
@@ -783,6 +791,8 @@ pub(crate) struct FullAttentionMetalState {
     copy_at_f32_to_bf16: ComputePipelineState,
     copy_at_bf16: ComputePipelineState,
     copy_at_bf16_to_f32: ComputePipelineState,
+    /// Rotation de K et append K/V fusionnés, KV f32 puis bf16.
+    rope_append_kv: [ComputePipelineState; 2],
     /// Sinks appris par tête (flint) et leurs kernels ; `None` = attention
     /// historique, kernels sans sink inchangés.
     sinks: Option<AttentionSinks>,
@@ -2018,6 +2028,86 @@ impl FullAttentionMetalState {
         )?;
         self.len += 1;
         Ok(())
+    }
+
+    /// Rotation de K (rms_norm par tête + RoPE à `position`) et append K/V du
+    /// token courant en UN dispatch, au lieu de rotation puis deux copies.
+    /// Mêmes bits que [`Self::encode_append_kv_with_offsets`] après la
+    /// rotation seule (corps de kernel partagé, même conversion bf16), même
+    /// contrôle de capacité, même ligne stockée et même incrément de `len`.
+    ///
+    /// Renvoie `Ok(false)` sans rien encoder si le KV est quantifié ou si le
+    /// kill-switch est actif : l'appelant replie sur le chemin en trois
+    /// dispatches.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur (overflow) si la capacité KV est atteinte.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: sources K/V + offsets + paramètres rms_norm+RoPE"
+    )]
+    pub(crate) fn encode_rope_append_kv(
+        &mut self,
+        encoder: &ComputeCommandEncoderRef,
+        k_raw: &BufferRef,
+        k_offset: u64,
+        k_norm: &BufferRef,
+        v_buf: &BufferRef,
+        v_offset: u64,
+        rope: &FullAttnLayerDims,
+    ) -> Result<bool> {
+        let pipeline = match self.format {
+            KvFormat::F32 => &self.rope_append_kv[0],
+            KvFormat::Bf16 => &self.rope_append_kv[1],
+            KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4 => return Ok(false),
+        };
+        if !crate::runtime_flags::decode_resident_rope_append_kv_enabled() {
+            return Ok(false);
+        }
+        if self.len >= self.capacity {
+            return Err(InferError::Dimension(format!(
+                "append KV résident: capacité {} atteinte (overflow)",
+                self.capacity
+            )));
+        }
+        let element = self.keys.element();
+        let offset = byte_offset(self.len * self.kv_dim(), element, "rope append KV offset")?;
+        let dims = rope_dims_param(self.kv_heads, self.head_dim, rope.rope_dims, rope.position)?;
+        let params: [f32; 2] = [rope.eps, rope.theta];
+        let frequency_dim = u32::try_from(rope.rope_frequency_dim)
+            .map_err(|_| InferError::Dimension("rope frequency_dim hors u32".to_string()))?;
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(k_raw), k_offset);
+        encoder.set_buffer(1, Some(k_norm), 0);
+        encoder.set_buffer(2, Some(self.keys.buffer()), offset);
+        dims.bind(encoder, 3);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<[f32; 2]>() as u64,
+            params.as_ptr().cast::<c_void>(),
+        );
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            std::ptr::from_ref(&frequency_dim).cast::<c_void>(),
+        );
+        encoder.set_buffer(6, Some(v_buf), v_offset);
+        encoder.set_buffer(7, Some(self.values.buffer()), offset);
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(to_u32(self.kv_heads, "rope append kv_heads")?),
+                1,
+                1,
+            ),
+            MTLSize::new(256, 1, 1),
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        self.len += 1;
+        #[cfg(test)]
+        ROPE_APPEND_KV_HITS.with(|hits| hits.set(hits.get() + 1));
+        Ok(true)
     }
 
     /// Append K/V à la position GPU `min(ctrl[slot], max_position) + row`, sans

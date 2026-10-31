@@ -74,6 +74,8 @@ mod tests;
 pub(crate) use self::arena::{
     install_pipeline_scratch_slot, GpuElement, GpuTensor, ScratchLease, ScratchPool,
 };
+#[cfg(test)]
+pub(crate) use self::attention::ROPE_APPEND_KV_HITS;
 pub(crate) use self::attention::{FullAttentionMetalState, KvSegment};
 pub(crate) use self::gpu_position::{check_gpu_position_rows, GpuPosition};
 pub(crate) use self::kv_quant::KvFormat;
@@ -121,6 +123,8 @@ pub(crate) struct DecodeResidentState {
     copy_at_f32_to_bf16_kernel: ComputePipelineState,
     copy_at_bf16_kernel: ComputePipelineState,
     copy_at_bf16_to_f32_kernel: ComputePipelineState,
+    /// Rotation de K et append K/V fusionnés, KV f32 puis bf16.
+    rope_append_kv_kernels: [ComputePipelineState; 2],
     /// Kernels position GPU (bloc MTP), compilés au premier usage seulement.
     gpu_position_kernels: OnceLock<gpu_position::GpuPositionKernels>,
     /// Kernels du chemin full-attn en lignes fusionné, compilés au premier usage.

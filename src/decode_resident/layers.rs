@@ -904,17 +904,61 @@ impl DecodeResidentState {
             dims.head_dim,
             dims.attn_scalar,
         )?;
-        if qkv_concat_used {
-            let k_offset = byte_offset_f32(q_proj_dim, "full-attn dense k offset")?;
-            let v_offset = byte_offset_f32(
-                q_proj_dim.checked_add(kv_dim).ok_or_else(|| {
-                    InferError::Dimension("full-attn dense v offset déborde".to_string())
-                })?,
-                "full-attn dense v offset",
+        // Sources K/V du token : sous-vues du QKV concaténé ou projections
+        // séparées ; V normé d'abord (indépendant de la rotation de K).
+        let (k_source, k_offset, v_offset) = if qkv_concat_used {
+            (
+                qkv_proj_out.tensor().buffer(),
+                byte_offset_f32(q_proj_dim, "full-attn dense k offset")?,
+                byte_offset_f32(
+                    q_proj_dim.checked_add(kv_dim).ok_or_else(|| {
+                        InferError::Dimension("full-attn dense v offset déborde".to_string())
+                    })?,
+                    "full-attn dense v offset",
+                )?,
+            )
+        } else {
+            (k_raw.tensor().buffer(), 0, 0)
+        };
+        let (v_source, v_offset) = if weights.value_norm {
+            if qkv_concat_used {
+                executor.encode_copy_with_offsets(
+                    encoder,
+                    qkv_proj_out.tensor().buffer(),
+                    v_offset,
+                    v_raw.tensor().buffer(),
+                    0,
+                    kv_dim,
+                )?;
+            }
+            executor.encode_rms_norm_heads_no_scale_rows(
+                encoder,
+                v_raw.tensor().buffer(),
+                v_normed.tensor().buffer(),
+                1,
+                dims.kv_heads,
+                dims.head_dim,
+                dims.eps,
             )?;
+            (v_normed.tensor().buffer(), 0)
+        } else if qkv_concat_used {
+            (qkv_proj_out.tensor().buffer(), v_offset)
+        } else {
+            (v_raw.tensor().buffer(), 0)
+        };
+        let fused = kv.encode_rope_append_kv(
+            encoder,
+            k_source,
+            k_offset,
+            weights.k_norm,
+            v_source,
+            v_offset,
+            &dims,
+        )?;
+        if !fused {
             self.encode_rms_norm_rope_decode_with_offset(
                 encoder,
-                qkv_proj_out.tensor().buffer(),
+                k_source,
                 k_offset,
                 weights.k_norm,
                 k_roped.tensor().buffer(),
@@ -926,70 +970,13 @@ impl DecodeResidentState {
                 dims.eps,
                 dims.theta,
             )?;
-            if weights.value_norm {
-                executor.encode_copy_with_offsets(
-                    encoder,
-                    qkv_proj_out.tensor().buffer(),
-                    v_offset,
-                    v_raw.tensor().buffer(),
-                    0,
-                    kv_dim,
-                )?;
-                executor.encode_rms_norm_heads_no_scale_rows(
-                    encoder,
-                    v_raw.tensor().buffer(),
-                    v_normed.tensor().buffer(),
-                    1,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.eps,
-                )?;
-                kv.encode_append_kv(
-                    encoder,
-                    k_roped.tensor().buffer(),
-                    v_normed.tensor().buffer(),
-                )?;
-            } else {
-                kv.encode_append_kv_with_offsets(
-                    encoder,
-                    k_roped.tensor().buffer(),
-                    0,
-                    qkv_proj_out.tensor().buffer(),
-                    v_offset,
-                )?;
-            }
-        } else {
-            self.encode_rms_norm_rope_decode(
+            kv.encode_append_kv_with_offsets(
                 encoder,
-                k_raw.tensor().buffer(),
-                weights.k_norm,
                 k_roped.tensor().buffer(),
-                dims.kv_heads,
-                dims.head_dim,
-                dims.rope_dims,
-                dims.rope_frequency_dim,
-                dims.position,
-                dims.eps,
-                dims.theta,
+                0,
+                v_source,
+                v_offset,
             )?;
-            if weights.value_norm {
-                executor.encode_rms_norm_heads_no_scale_rows(
-                    encoder,
-                    v_raw.tensor().buffer(),
-                    v_normed.tensor().buffer(),
-                    1,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.eps,
-                )?;
-                kv.encode_append_kv(
-                    encoder,
-                    k_roped.tensor().buffer(),
-                    v_normed.tensor().buffer(),
-                )?;
-            } else {
-                kv.encode_append_kv(encoder, k_roped.tensor().buffer(), v_raw.tensor().buffer())?;
-            }
         }
         kv.encode_attention_decode_windowed(
             encoder,

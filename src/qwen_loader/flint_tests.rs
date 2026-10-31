@@ -993,6 +993,25 @@ fn synthetic_flint_qkv_concat_is_bit_identical() {
     assert_eq!(fused, split, "QKV concaténé != trois projections");
 }
 
+/// Rotation de K et append K/V fusionnés dans le decode de flint : un
+/// dispatch au lieu de trois par couche. Empreinte du decode bit-identique
+/// au chemin historique, et chemin effectivement emprunté.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_rope_append_kv_is_bit_identical() {
+    let hits = || crate::decode_resident::ROPE_APPEND_KV_HITS.with(std::cell::Cell::get);
+    let start = hits();
+    let split = crate::runtime_flags::with_rope_append_kv_override(false, flint_decode_fingerprint);
+    assert_eq!(
+        hits(),
+        start,
+        "append fusionné employé malgré le kill-switch"
+    );
+    let fused = crate::runtime_flags::with_rope_append_kv_override(true, flint_decode_fingerprint);
+    assert!(hits() - start >= 2 * 3 * 6, "append fusionné non emprunté");
+    assert_eq!(fused, split, "append fusionné != rotation puis append");
+}
+
 /// Le scratch du prefill résident flint passe par le scope de purge (marquage
 /// volatil, éviction LRU au-delà de `SARAGOSSA_RUST_SCRATCH_CAP_GB`) après
 /// chaque prefill, quelle que soit sa taille, et reste sous ce plafond.

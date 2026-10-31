@@ -2040,6 +2040,146 @@ fn encode_append_kv_device_bf16_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/// Rotation de K fusionnée à l'append (F8c) == rotation seule puis append,
+/// bit à bit, en KV f32 et bf16, sur une arène rebasée (F6, lignes stockées
+/// et non absolues) remplie jusqu'à sa capacité ; l'append suivant déborde.
+/// Le kill-switch replie sans rien encoder.
+#[test]
+fn rope_append_kv_matches_rope_then_append_bitwise() -> Result<()> {
+    let Some(mut state) = try_state()? else {
+        return Ok(());
+    };
+    let (q_heads, kv_heads, head_dim, capacity, base) = (4, 2, 64, 3, 5);
+    let kv_dim = kv_heads * head_dim;
+    let mut dims = FullAttnLayerDims {
+        hidden: 0,
+        q_heads,
+        kv_heads,
+        head_dim,
+        attn_scalar: 1.0,
+        rope_dims: 32,
+        rope_frequency_dim: 64,
+        position: 0,
+        window_start: 0,
+        eps: 1.0e-6,
+        theta: 10_000.0,
+        attn_output_gate: false,
+    };
+    let k_in = state.persistent(kv_dim, GpuElement::F32)?;
+    let v_in = state.persistent(kv_dim, GpuElement::F32)?;
+    let k_roped = state.persistent(kv_dim, GpuElement::F32)?;
+    let weight = state.persistent(head_dim, GpuElement::F32)?;
+    let norm: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 / 64.0).collect();
+    write_f32_at(&weight, 0, &norm)?;
+    let queue = state.device().new_command_queue();
+    for kv_bf16 in [false, true] {
+        let make = |state: &DecodeResidentState| {
+            let mut kv = if kv_bf16 {
+                state.full_attention_bf16_for_test(capacity, q_heads, kv_heads, head_dim)
+            } else {
+                state.full_attention(capacity, q_heads, kv_heads, head_dim, false)
+            }?;
+            kv.rebase(base)?;
+            Ok::<_, InferError>(kv)
+        };
+        let (mut fused, mut split) = (make(&state)?, make(&state)?);
+        for row in 0..capacity {
+            dims.position = base + row;
+            let k_data: Vec<f32> = (0..kv_dim)
+                .map(|i| ((i * 7 + row * 13) % 23) as f32 * 0.37 - 4.1)
+                .collect();
+            let v_data: Vec<f32> = (0..kv_dim)
+                .map(|i| ((i * 5 + row * 11) % 19) as f32 * 0.29 - 2.3)
+                .collect();
+            write_f32_at(&k_in, 0, &k_data)?;
+            write_f32_at(&v_in, 0, &v_data)?;
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            let hit = crate::runtime_flags::with_rope_append_kv_override(true, || {
+                fused.encode_rope_append_kv(
+                    encoder,
+                    k_in.buffer(),
+                    0,
+                    weight.buffer(),
+                    v_in.buffer(),
+                    0,
+                    &dims,
+                )
+            })?;
+            assert!(hit, "append fusionné attendu (kv_bf16={kv_bf16})");
+            let fallback = crate::runtime_flags::with_rope_append_kv_override(false, || {
+                split.encode_rope_append_kv(
+                    encoder,
+                    k_in.buffer(),
+                    0,
+                    weight.buffer(),
+                    v_in.buffer(),
+                    0,
+                    &dims,
+                )
+            })?;
+            assert!(!fallback, "kill-switch ignoré");
+            state.encode_rms_norm_rope_decode_with_offset(
+                encoder,
+                k_in.buffer(),
+                0,
+                weight.buffer(),
+                k_roped.buffer(),
+                kv_heads,
+                head_dim,
+                dims.rope_dims,
+                dims.rope_frequency_dim,
+                dims.position,
+                dims.eps,
+                dims.theta,
+            )?;
+            split.encode_append_kv(encoder, k_roped.buffer(), v_in.buffer())?;
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+        }
+        assert_eq!(fused.len(), base + capacity);
+        assert_eq!(split.len(), fused.len());
+        let bits = |tensor: &GpuTensor| -> Vec<u32> {
+            if kv_bf16 {
+                read_bf16_as_f32(tensor)
+            } else {
+                read_f32(tensor)
+            }
+            .iter()
+            .map(|value| value.to_bits())
+            .collect()
+        };
+        assert_eq!(
+            bits(fused.keys()),
+            bits(split.keys()),
+            "K kv_bf16={kv_bf16}"
+        );
+        assert_eq!(
+            bits(fused.values()),
+            bits(split.values()),
+            "V kv_bf16={kv_bf16}"
+        );
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let overflow = crate::runtime_flags::with_rope_append_kv_override(true, || {
+            fused.encode_rope_append_kv(
+                encoder,
+                k_in.buffer(),
+                0,
+                weight.buffer(),
+                v_in.buffer(),
+                0,
+                &dims,
+            )
+        });
+        encoder.end_encoding();
+        assert!(overflow.is_err(), "append au-delà de la capacité accepté");
+        assert_eq!(fused.len(), base + capacity, "len avancé sur overflow");
+    }
+    Ok(())
+}
+
 /// Oracle BIT-EXACT dé-fusion du gate o_proj (gate E2.2 light-batch) :
 /// `attn_gate` (ctx · σ(gate)) suivi du qmv == le kernel FUSIONNÉ
 /// `affine_qmv_gated_input_fast` (chemin solo prod de l'o_proj), en bits —
