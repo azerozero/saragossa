@@ -48,7 +48,7 @@ pub(crate) struct FullAttnDenseLayerWeights<'a> {
     pub input_norm: &'a Buffer,
     pub qkv_proj: Option<&'a MetalLinearWeightBuffers>,
     /// Emploie `qkv_proj` (si présent) hors porte de sortie : layout K=V
-    /// sans `v_proj` séparé, ou q/k/v séparés de flint et Gemma.
+    /// sans `v_proj` séparé, ou q/k/v séparés de flint (sinks).
     pub qkv_proj_without_gate: bool,
     pub value_norm: bool,
     pub q_proj: &'a MetalLinearWeightBuffers,

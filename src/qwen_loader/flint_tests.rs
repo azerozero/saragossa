@@ -993,6 +993,174 @@ fn synthetic_flint_qkv_concat_is_bit_identical() {
     assert_eq!(fused, split, "QKV concaténé != trois projections");
 }
 
+/// Sous budget VRAM contraint, le QKV concaténé de flint n'est pas copié :
+/// repli sur les trois projections, logits identiques. La garde tient aussi
+/// après préparation à la libération des poids CPU (caches préservés), où
+/// l'ancienne politique ignorait le budget.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_qkv_concat_falls_back_over_vram_budget() {
+    let prompt = [1, 2, 3];
+    let forced = [4, 0, 5];
+    let logits = |preserve: bool| {
+        let executor = crate::MetalExecutor::new().expect("invariant: executor Metal");
+        if preserve {
+            executor.prepare_cpu_weight_release();
+        }
+        let gpu = load(flint_tensors(true))
+            .expect("invariant: flint synthétique")
+            .with_metal_executor(executor)
+            .expect("invariant: runtime Metal attaché");
+        crate::metal_backend::with_flint_moe_coop_override(false, || {
+            gpu.resident_forced_logits_for_test(&prompt, &forced, false)
+        })
+        .expect("invariant: decode résident flint")
+        .iter()
+        .map(|row| row.iter().map(|value| value.to_bits()).collect::<Vec<_>>())
+        .collect::<Vec<_>>()
+    };
+    let hits = || crate::decode_resident::QKV_CONCAT_NO_GATE_HITS.with(std::cell::Cell::get);
+    let split = crate::runtime_flags::with_qkv_concat_override(false, || logits(false));
+    for preserve in [false, true] {
+        let start = hits();
+        let constrained = crate::runtime_flags::with_qkv_concat_override(true, || {
+            crate::metal_backend::with_concat_vram_fraction_override(1.0e-9, || logits(preserve))
+        });
+        assert_eq!(
+            hits(),
+            start,
+            "concat copié hors budget (preserve={preserve})"
+        );
+        assert_eq!(constrained, split, "repli != trois projections");
+        let roomy = crate::runtime_flags::with_qkv_concat_override(true, || logits(preserve));
+        assert!(
+            hits() > start,
+            "concat absent avec budget (preserve={preserve})"
+        );
+        assert_eq!(roomy, split, "concat != trois projections");
+    }
+}
+
+/// Qwen dense synthétique à porte de sortie (`attn_output_gate`) : deux
+/// couches full-attn, q_proj doublé (requêtes et porte), MLP dense.
+fn qwen_dense_gated_tensors() -> Vec<(String, Fixture)> {
+    let mut rng = Lcg(11);
+    let mut out = Vec::new();
+    push_affine(&mut out, &mut rng, "model.embed_tokens", &[VOCAB], 8, true);
+    push_affine(&mut out, &mut rng, "lm_head", &[VOCAB], 4, true);
+    out.push((
+        "model.norm.weight".into(),
+        bf16(vec![HIDDEN], vec![1.0; HIDDEN]),
+    ));
+    for layer in 0..2 {
+        let p = format!("model.layers.{layer}");
+        for norm in ["input_layernorm", "post_attention_layernorm"] {
+            out.push((
+                format!("{p}.{norm}.weight"),
+                bf16(vec![HIDDEN], vec![1.0; HIDDEN]),
+            ));
+        }
+        for (proj, rows) in [
+            ("q_proj", 2 * HEADS * HEAD_DIM),
+            ("k_proj", KV_DIM),
+            ("v_proj", KV_DIM),
+            ("o_proj", HIDDEN),
+        ] {
+            push_affine(
+                &mut out,
+                &mut rng,
+                &format!("{p}.self_attn.{proj}"),
+                &[rows],
+                4,
+                true,
+            );
+        }
+        for norm in ["q_norm", "k_norm"] {
+            out.push((
+                format!("{p}.self_attn.{norm}.weight"),
+                bf16(vec![HEAD_DIM], vec![1.0; HEAD_DIM]),
+            ));
+        }
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            push_affine(
+                &mut out,
+                &mut rng,
+                &format!("{p}.mlp.{proj}"),
+                &[INTER],
+                4,
+                true,
+            );
+        }
+    }
+    out
+}
+
+/// Rotation de K et append K/V fusionnés sur le chemin dense commun, côté
+/// Qwen à porte de sortie : logits du decode résident (K/V f32 et bf16)
+/// bit-identiques au chemin historique du kill-switch, chemin emprunté.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_qwen_dense_gated_rope_append_kv_is_bit_identical() {
+    let raw = serde_json::json!({
+        "model_type": "qwen3",
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": 2,
+        "num_attention_heads": HEADS,
+        "num_key_value_heads": 1,
+        "head_dim": HEAD_DIM,
+        "intermediate_size": INTER,
+        "attn_output_gate": true,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "vocab_size": VOCAB,
+        "eos_token_id": [7],
+        "tie_word_embeddings": false,
+        "quantization": {"bits": 4, "group_size": 64},
+    });
+    let config = serde_json::from_value::<crate::config::RawModelConfig>(raw)
+        .expect("invariant: config Qwen JSON valide")
+        .resolve()
+        .expect("invariant: config Qwen résolue");
+    assert_eq!(config.attn_output_gate, Some(true));
+    let tmp = write_shard(qwen_dense_gated_tensors());
+    let shards = [tmp.path().to_path_buf()];
+    let catalog = WeightCatalog::from_shards(&shards).expect("invariant: catalogue");
+    verify_decoder_contract_from_shards(&config, &shards, &catalog)
+        .expect("invariant: contrat Qwen dense");
+    let gpu = load_causal_decoder_from_shards(&config, &shards, &catalog)
+        .expect("invariant: Qwen dense synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    assert!(
+        gpu.supports_resident_full_decode(),
+        "decode résident Qwen dense"
+    );
+    let fingerprint = || {
+        [false, true]
+            .into_iter()
+            .flat_map(|kv_bf16| {
+                gpu.resident_forced_logits_for_test(&[1, 2, 3], &[4, 0, 5, 6], kv_bf16)
+                    .expect("invariant: decode résident Qwen dense")
+            })
+            .map(|row| row.iter().map(|value| value.to_bits()).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    let hits = || crate::decode_resident::ROPE_APPEND_KV_HITS.with(std::cell::Cell::get);
+    let start = hits();
+    let split = crate::runtime_flags::with_rope_append_kv_override(false, fingerprint);
+    assert_eq!(
+        hits(),
+        start,
+        "append fusionné employé malgré le kill-switch"
+    );
+    let fused = crate::runtime_flags::with_rope_append_kv_override(true, fingerprint);
+    assert!(hits() - start >= 2 * 2 * 4, "append fusionné non emprunté");
+    assert_eq!(
+        fused, split,
+        "Qwen dense: append fusionné != rotation puis append"
+    );
+}
+
 /// Rotation de K et append K/V fusionnés dans le decode de flint : un
 /// dispatch au lieu de trois par couche. Empreinte du decode bit-identique
 /// au chemin historique, et chemin effectivement emprunté.

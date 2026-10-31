@@ -2041,61 +2041,144 @@ fn encode_append_kv_device_bf16_roundtrip() -> Result<()> {
 }
 
 /// Rotation de K fusionnée à l'append (F8c) == rotation seule puis append,
-/// bit à bit, en KV f32 et bf16, sur une arène rebasée (F6, lignes stockées
-/// et non absolues) remplie jusqu'à sa capacité ; l'append suivant déborde.
-/// Le kill-switch replie sans rien encoder.
+/// bit à bit, en KV f32 et bf16, aux dimensions réelles (head_dim 64, 128 et
+/// 256, RoPE complète ou partielle), sur une arène rebasée (F6, lignes
+/// stockées et non absolues) remplie jusqu'à sa capacité ; l'append suivant
+/// déborde. Le kill-switch replie sans rien encoder. La rotation seule est
+/// aussi comparée au kernel d'avant la factorisation de son corps.
 #[test]
 fn rope_append_kv_matches_rope_then_append_bitwise() -> Result<()> {
     let Some(mut state) = try_state()? else {
         return Ok(());
     };
-    let (q_heads, kv_heads, head_dim, capacity, base) = (4, 2, 64, 3, 5);
-    let kv_dim = kv_heads * head_dim;
-    let mut dims = FullAttnLayerDims {
-        hidden: 0,
-        q_heads,
-        kv_heads,
-        head_dim,
-        attn_scalar: 1.0,
-        rope_dims: 32,
-        rope_frequency_dim: 64,
-        position: 0,
-        window_start: 0,
-        eps: 1.0e-6,
-        theta: 10_000.0,
-        attn_output_gate: false,
-    };
-    let k_in = state.persistent(kv_dim, GpuElement::F32)?;
-    let v_in = state.persistent(kv_dim, GpuElement::F32)?;
-    let k_roped = state.persistent(kv_dim, GpuElement::F32)?;
-    let weight = state.persistent(head_dim, GpuElement::F32)?;
-    let norm: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 / 64.0).collect();
-    write_f32_at(&weight, 0, &norm)?;
+    let legacy = super::kernels::compile_kernel(
+        state.device(),
+        LEGACY_ROPE_DECODE_KERNEL,
+        "rms_norm_rope_heads_decode_f32",
+    )?;
     let queue = state.device().new_command_queue();
-    for kv_bf16 in [false, true] {
-        let make = |state: &DecodeResidentState| {
-            let mut kv = if kv_bf16 {
-                state.full_attention_bf16_for_test(capacity, q_heads, kv_heads, head_dim)
-            } else {
-                state.full_attention(capacity, q_heads, kv_heads, head_dim, false)
-            }?;
-            kv.rebase(base)?;
-            Ok::<_, InferError>(kv)
+    let (q_heads, kv_heads, capacity, base) = (8, 2, 3, 5);
+    for (head_dim, rope_dims) in [(64, 32), (128, 128), (256, 64)] {
+        let kv_dim = kv_heads * head_dim;
+        let mut dims = FullAttnLayerDims {
+            hidden: 0,
+            q_heads,
+            kv_heads,
+            head_dim,
+            attn_scalar: 1.0,
+            rope_dims,
+            rope_frequency_dim: head_dim,
+            position: 0,
+            window_start: 0,
+            eps: 1.0e-6,
+            theta: 10_000.0,
+            attn_output_gate: false,
         };
-        let (mut fused, mut split) = (make(&state)?, make(&state)?);
-        for row in 0..capacity {
-            dims.position = base + row;
-            let k_data: Vec<f32> = (0..kv_dim)
-                .map(|i| ((i * 7 + row * 13) % 23) as f32 * 0.37 - 4.1)
-                .collect();
-            let v_data: Vec<f32> = (0..kv_dim)
-                .map(|i| ((i * 5 + row * 11) % 19) as f32 * 0.29 - 2.3)
-                .collect();
-            write_f32_at(&k_in, 0, &k_data)?;
-            write_f32_at(&v_in, 0, &v_data)?;
+        let k_in = state.persistent(kv_dim, GpuElement::F32)?;
+        let v_in = state.persistent(kv_dim, GpuElement::F32)?;
+        let k_roped = state.persistent(kv_dim, GpuElement::F32)?;
+        let k_legacy = state.persistent(kv_dim, GpuElement::F32)?;
+        let weight = state.persistent(head_dim, GpuElement::F32)?;
+        let norm: Vec<f32> = (0..head_dim)
+            .map(|i| 0.5 + i as f32 / head_dim as f32)
+            .collect();
+        write_f32_at(&weight, 0, &norm)?;
+        for kv_bf16 in [false, true] {
+            let label = format!("head_dim={head_dim} kv_bf16={kv_bf16}");
+            let make = |state: &DecodeResidentState| {
+                let mut kv = if kv_bf16 {
+                    state.full_attention_bf16_for_test(capacity, q_heads, kv_heads, head_dim)
+                } else {
+                    state.full_attention(capacity, q_heads, kv_heads, head_dim, false)
+                }?;
+                kv.rebase(base)?;
+                Ok::<_, InferError>(kv)
+            };
+            let (mut fused, mut split) = (make(&state)?, make(&state)?);
+            for row in 0..capacity {
+                dims.position = base + row;
+                let k_data: Vec<f32> = (0..kv_dim)
+                    .map(|i| ((i * 7 + row * 13) % 23) as f32 * 0.37 - 4.1)
+                    .collect();
+                let v_data: Vec<f32> = (0..kv_dim)
+                    .map(|i| ((i * 5 + row * 11) % 19) as f32 * 0.29 - 2.3)
+                    .collect();
+                write_f32_at(&k_in, 0, &k_data)?;
+                write_f32_at(&v_in, 0, &v_data)?;
+                let command_buffer = queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                let hit = crate::runtime_flags::with_rope_append_kv_override(true, || {
+                    fused.encode_rope_append_kv(
+                        encoder,
+                        k_in.buffer(),
+                        0,
+                        weight.buffer(),
+                        v_in.buffer(),
+                        0,
+                        &dims,
+                    )
+                })?;
+                assert!(hit, "{label}: append fusionné attendu");
+                let fallback = crate::runtime_flags::with_rope_append_kv_override(false, || {
+                    split.encode_rope_append_kv(
+                        encoder,
+                        k_in.buffer(),
+                        0,
+                        weight.buffer(),
+                        v_in.buffer(),
+                        0,
+                        &dims,
+                    )
+                })?;
+                assert!(!fallback, "{label}: kill-switch ignoré");
+                state.encode_rms_norm_rope_decode_with_offset(
+                    encoder,
+                    k_in.buffer(),
+                    0,
+                    weight.buffer(),
+                    k_roped.buffer(),
+                    kv_heads,
+                    head_dim,
+                    rope_dims,
+                    dims.rope_frequency_dim,
+                    dims.position,
+                    dims.eps,
+                    dims.theta,
+                )?;
+                split.encode_append_kv(encoder, k_roped.buffer(), v_in.buffer())?;
+                encode_legacy_rope(encoder, &legacy, &k_in, &weight, &k_legacy, &dims)?;
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+                let bits = |tensor: &GpuTensor| -> Vec<u32> {
+                    read_f32(tensor)
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect()
+                };
+                assert_eq!(
+                    bits(&k_roped),
+                    bits(&k_legacy),
+                    "{label} ligne {row}: rotation != kernel d'avant factorisation"
+                );
+            }
+            assert_eq!(fused.len(), base + capacity);
+            assert_eq!(split.len(), fused.len());
+            let bits = |tensor: &GpuTensor| -> Vec<u32> {
+                if kv_bf16 {
+                    read_bf16_as_f32(tensor)
+                } else {
+                    read_f32(tensor)
+                }
+                .iter()
+                .map(|value| value.to_bits())
+                .collect()
+            };
+            assert_eq!(bits(fused.keys()), bits(split.keys()), "{label}: K");
+            assert_eq!(bits(fused.values()), bits(split.values()), "{label}: V");
             let command_buffer = queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            let hit = crate::runtime_flags::with_rope_append_kv_override(true, || {
+            let overflow = crate::runtime_flags::with_rope_append_kv_override(true, || {
                 fused.encode_rope_append_kv(
                     encoder,
                     k_in.buffer(),
@@ -2105,80 +2188,126 @@ fn rope_append_kv_matches_rope_then_append_bitwise() -> Result<()> {
                     0,
                     &dims,
                 )
-            })?;
-            assert!(hit, "append fusionné attendu (kv_bf16={kv_bf16})");
-            let fallback = crate::runtime_flags::with_rope_append_kv_override(false, || {
-                split.encode_rope_append_kv(
-                    encoder,
-                    k_in.buffer(),
-                    0,
-                    weight.buffer(),
-                    v_in.buffer(),
-                    0,
-                    &dims,
-                )
-            })?;
-            assert!(!fallback, "kill-switch ignoré");
-            state.encode_rms_norm_rope_decode_with_offset(
-                encoder,
-                k_in.buffer(),
-                0,
-                weight.buffer(),
-                k_roped.buffer(),
-                kv_heads,
-                head_dim,
-                dims.rope_dims,
-                dims.rope_frequency_dim,
-                dims.position,
-                dims.eps,
-                dims.theta,
-            )?;
-            split.encode_append_kv(encoder, k_roped.buffer(), v_in.buffer())?;
+            });
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            assert!(
+                overflow.is_err(),
+                "{label}: append au-delà de la capacité accepté"
+            );
+            assert_eq!(
+                fused.len(),
+                base + capacity,
+                "{label}: len avancé sur overflow"
+            );
         }
-        assert_eq!(fused.len(), base + capacity);
-        assert_eq!(split.len(), fused.len());
-        let bits = |tensor: &GpuTensor| -> Vec<u32> {
-            if kv_bf16 {
-                read_bf16_as_f32(tensor)
-            } else {
-                read_f32(tensor)
-            }
-            .iter()
-            .map(|value| value.to_bits())
-            .collect()
-        };
-        assert_eq!(
-            bits(fused.keys()),
-            bits(split.keys()),
-            "K kv_bf16={kv_bf16}"
-        );
-        assert_eq!(
-            bits(fused.values()),
-            bits(split.values()),
-            "V kv_bf16={kv_bf16}"
-        );
-        let command_buffer = queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        let overflow = crate::runtime_flags::with_rope_append_kv_override(true, || {
-            fused.encode_rope_append_kv(
-                encoder,
-                k_in.buffer(),
-                0,
-                weight.buffer(),
-                v_in.buffer(),
-                0,
-                &dims,
-            )
-        });
-        encoder.end_encoding();
-        assert!(overflow.is_err(), "append au-delà de la capacité accepté");
-        assert_eq!(fused.len(), base + capacity, "len avancé sur overflow");
     }
     Ok(())
 }
+
+/// Encode le kernel de rotation d'avant la factorisation de son corps
+/// (référence figée), avec les liaisons de `encode_rms_norm_rope_decode_param`.
+fn encode_legacy_rope(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    input: &GpuTensor,
+    weight: &GpuTensor,
+    output: &GpuTensor,
+    dims: &FullAttnLayerDims,
+) -> Result<()> {
+    let to_u32 = |value: usize| {
+        u32::try_from(value).map_err(|_| InferError::Dimension("rope hors u32".to_string()))
+    };
+    let packed = [
+        to_u32(dims.kv_heads)?,
+        to_u32(dims.head_dim)?,
+        to_u32(dims.rope_dims)?,
+        to_u32(dims.position)?,
+    ];
+    let params = [dims.eps, dims.theta];
+    let frequency_dim = to_u32(dims.rope_frequency_dim)?;
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(input.buffer()), 0);
+    encoder.set_buffer(1, Some(weight.buffer()), 0);
+    encoder.set_buffer(2, Some(output.buffer()), 0);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<[u32; 4]>() as u64,
+        packed.as_ptr().cast::<c_void>(),
+    );
+    encoder.set_bytes(
+        4,
+        std::mem::size_of::<[f32; 2]>() as u64,
+        params.as_ptr().cast::<c_void>(),
+    );
+    encoder.set_bytes(
+        5,
+        std::mem::size_of::<u32>() as u64,
+        std::ptr::from_ref(&frequency_dim).cast::<c_void>(),
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(u64::from(packed[0]), 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    crate::metal_backend::post_dispatch_barrier(encoder);
+    Ok(())
+}
+
+/// Kernel de rotation decode tel qu'avant F8c (ebd515a), copie figée : la
+/// rotation actuelle partage son corps avec l'append fusionné et doit rester
+/// bit-identique à cette version.
+const LEGACY_ROPE_DECODE_KERNEL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rms_norm_rope_heads_decode_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    constant float2& params [[buffer(4)]],
+    constant uint& frequency_dim [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    const uint heads = dims.x;
+    const uint head_dim = dims.y;
+    const uint rope_dims = dims.z;
+    const uint position = dims.w;
+    const float eps = params.x;
+    const float base_theta = params.y;
+    if (head >= heads) { return; }
+
+    threadgroup float partial[256];
+    const uint start = head * head_dim;
+    float sumsq = 0.0f;
+    for (uint col = tid; col < head_dim; col += 256u) {
+        const float value = input[start + col];
+        sumsq += value * value;
+    }
+    partial[tid] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { partial[tid] += partial[tid + stride]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
+    const uint pairs = rope_dims / 2u;
+    for (uint col = tid; col < head_dim; col += 256u) {
+        float value = input[start + col] * inv_rms * weight[col];
+        if (col < rope_dims) {
+            const uint pair = (col < pairs) ? col : (col - pairs);
+            const float exponent = float(2u * pair) / float(frequency_dim);
+            const float angle = float(position) / pow(base_theta, exponent);
+            const float c = cos(angle);
+            const float s = sin(angle);
+            const float first = input[start + pair] * inv_rms * weight[pair];
+            const float second = input[start + pair + pairs] * inv_rms * weight[pair + pairs];
+            value = (col < pairs) ? (first * c - second * s) : (first * s + second * c);
+        }
+        out[start + col] = value;
+    }
+}
+"#;
 
 /// Oracle BIT-EXACT dé-fusion du gate o_proj (gate E2.2 light-batch) :
 /// `attn_gate` (ctx · σ(gate)) suivi du qmv == le kernel FUSIONNÉ

@@ -34,6 +34,54 @@ fn linear_weight_id(weight: &LinearWeight) -> LinearWeightId {
     }
 }
 
+/// Octets du buffer que bâtirait la concaténation de `weights` (paquets u32,
+/// échelles et biais bf16 ; f32 en dense). `None` si les données CPU d'un poids
+/// quantifié sont libérées (concat impossible) ou si le compte déborde.
+fn concat_copy_bytes(weights: &[&LinearWeight]) -> Option<u64> {
+    weights.iter().try_fold(0_u64, |total, weight| {
+        let bytes = match weight {
+            LinearWeight::Dense(weight) => weight.len().checked_mul(4)?,
+            LinearWeight::AffineQuantized(weight) => {
+                if !weight.cpu_data_available() {
+                    return None;
+                }
+                let params = weight
+                    .shape()
+                    .iter()
+                    .product::<usize>()
+                    .checked_div(weight.group_size())?;
+                weight
+                    .packed_len()
+                    .checked_mul(4)?
+                    .checked_add(params.checked_mul(2 * 2)?)?
+            }
+        };
+        total.checked_add(u64::try_from(bytes).ok()?)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    // Par thread : un test contraint le budget sans gêner les autres.
+    static CONCAT_VRAM_FRACTION_TEST_OVERRIDE: std::cell::Cell<Option<f64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force la fraction du budget VRAM des concats sur ce thread le temps de
+/// `run`, pour tester le repli sous budget contraint.
+#[cfg(test)]
+pub(crate) fn with_concat_vram_fraction_override<R>(fraction: f64, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<f64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CONCAT_VRAM_FRACTION_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore =
+        Restore(CONCAT_VRAM_FRACTION_TEST_OVERRIDE.with(|cell| cell.replace(Some(fraction))));
+    run()
+}
+
 /// Construit la clé de cache d'une concaténation : la suite ordonnée des identités
 /// sources. `None` si la liste est vide (l'appel échouera de toute façon), pour
 /// ne jamais mémoïser une entrée dégénérée.
@@ -851,20 +899,40 @@ impl MetalExecutor {
     pub(super) fn concat_reusable(&self, weights: &[&LinearWeight]) -> bool {
         let cache_enabled = crate::runtime_flags::resident_concat_cache_enabled()
             || self.preserving_weight_caches();
-        let Some(key) = cache_enabled.then(|| concat_weight_key(weights)).flatten() else {
+        cache_enabled
+            && (self.concat_cached(weights)
+                || ((self.preserving_weight_caches() || self.concat_cache_within_vram_budget())
+                    && weights.iter().all(|weight| {
+                        weight
+                            .affine_quantized()
+                            .is_none_or(AffineQuantizedTensor::cpu_data_available)
+                    })))
+    }
+
+    /// Vrai si le concat de `weights` est déjà mémoïsé (rien à allouer).
+    fn concat_cached(&self, weights: &[&LinearWeight]) -> bool {
+        let Some(key) = concat_weight_key(weights) else {
             return false;
         };
-        let cached = self
-            .concat_buffers
+        self.concat_buffers
             .lock()
-            .is_ok_and(|cache| matches!(cache.get(&key), Some(ConcatCacheEntry::Buffers(_))));
-        cached
-            || ((self.preserving_weight_caches() || self.concat_cache_within_vram_budget())
-                && weights.iter().all(|weight| {
-                    weight
-                        .affine_quantized()
-                        .is_none_or(AffineQuantizedTensor::cpu_data_available)
-                }))
+            .is_ok_and(|cache| matches!(cache.get(&key), Some(ConcatCacheEntry::Buffers(_))))
+    }
+
+    /// Vrai si la copie concaténée de `weights` tient dans le budget VRAM,
+    /// nouvelle allocation comprise, y compris quand les caches de poids sont
+    /// préservés : déjà mémoïsée, ou bâtissable depuis les données CPU avec
+    /// `allocation courante + octets de la copie` sous le budget.
+    pub(crate) fn concat_copy_fits_vram_budget(&self, weights: &[&LinearWeight]) -> bool {
+        if self.concat_cached(weights) {
+            return true;
+        }
+        let Some(bytes) = concat_copy_bytes(weights) else {
+            return false;
+        };
+        self.concat_vram_budget().is_none_or(|budget| {
+            self.device.current_allocated_size().saturating_add(bytes) < budget
+        })
     }
 
     /// Renvoie `true` s'il reste de la marge VRAM pour retenir un buffer concat.
@@ -874,9 +942,20 @@ impl MetalExecutor {
     /// les fusions (rebuild par génération) — cache adaptatif, plein sur grosse RAM,
     /// dégradé sans OOM sur machine tendue.
     fn concat_cache_within_vram_budget(&self) -> bool {
+        self.concat_vram_budget()
+            .is_none_or(|budget| self.device.current_allocated_size() < budget)
+    }
+
+    /// Budget VRAM des concats en octets ; `None` si le device n'annonce pas
+    /// de working-set recommandé.
+    fn concat_vram_budget(&self) -> Option<u64> {
         let recommended = self.device.recommended_max_working_set_size();
         if recommended == 0 {
-            return true;
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(fraction) = CONCAT_VRAM_FRACTION_TEST_OVERRIDE.with(std::cell::Cell::get) {
+            return Some((recommended as f64 * fraction) as u64);
         }
         // Fraction ajustable par machine (`SARAGOSSA_RUST_CONCAT_CACHE_VRAM_FRACTION`) ;
         // valeur hors ]0, +∞[ ignorée → défaut `CONCAT_CACHE_VRAM_FRACTION`.
@@ -884,8 +963,7 @@ impl MetalExecutor {
             .and_then(|value| value.trim().parse::<f64>().ok())
             .filter(|value| value.is_finite() && *value > 0.0)
             .unwrap_or(CONCAT_CACHE_VRAM_FRACTION);
-        let budget = (recommended as f64 * fraction) as u64;
-        self.device.current_allocated_size() < budget
+        Some((recommended as f64 * fraction) as u64)
     }
 
     fn resolve_concat_linear_weight_buffers_inner(

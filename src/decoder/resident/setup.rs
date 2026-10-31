@@ -558,25 +558,30 @@ impl CausalDecoder {
                             attention.k_proj.weight(),
                             v_proj.weight(),
                         ];
-                        // NOTE: une projection au lieu de trois (−2 dispatches par
-                        // couche, chaque ligne de qmv reste calculée à l'identique).
-                        // La copie des poids adossés au stockage (~250 Mo sur flint)
-                        // n'est payée que si le budget VRAM la tient ; sinon repli
-                        // sur les trois projections séparées.
-                        let qkv_proj = if decode_resident_full_qkv_concat_enabled()
-                            && !metal.concat_duplication_worth_avoiding(&qkv_sources)
-                        {
-                            match metal.resolve_concat_linear_weight_buffers(
-                                &qkv_sources,
-                                "resident_dense_full_qkv_proj",
-                            ) {
-                                Ok(weights) => Some(weights),
-                                Err(InferError::Dimension(_)) => None,
-                                Err(error) => return Err(error),
-                            }
+                        // NOTE: flint (sinks) concatène q/k/v : une projection au
+                        // lieu de trois, chaque ligne de qmv calculée à
+                        // l'identique. Sa copie des poids adossés au stockage
+                        // (~250 Mo) n'est faite que si elle tient, elle comprise,
+                        // dans le budget VRAM ; sinon trois projections. Les
+                        // autres modèles gardent leur règle : aucune duplication.
+                        let concat_allowed = if self.config.attention_sinks {
+                            metal.concat_copy_fits_vram_budget(&qkv_sources)
                         } else {
-                            None
+                            !metal.concat_would_duplicate_affine_storage(&qkv_sources)
                         };
+                        let qkv_proj =
+                            if decode_resident_full_qkv_concat_enabled() && concat_allowed {
+                                match metal.resolve_concat_linear_weight_buffers(
+                                    &qkv_sources,
+                                    "resident_dense_full_qkv_proj",
+                                ) {
+                                    Ok(weights) => Some(weights),
+                                    Err(InferError::Dimension(_)) => None,
+                                    Err(error) => return Err(error),
+                                }
+                            } else {
+                                None
+                            };
                         layer_buffers.push(ResidentLayerBuffers::FullDense(
                             ResidentFullDenseBuffers {
                                 input_norm: metal.cached_buffer_from_f32(

@@ -107,7 +107,8 @@ impl CausalDecoder {
                 let weights = FullAttnDenseLayerWeights {
                     input_norm: &resolved.input_norm,
                     qkv_proj: resolved.qkv_proj.as_ref(),
-                    qkv_proj_without_gate: !self.config.attn_output_gate,
+                    qkv_proj_without_gate: attention.v_proj.is_none()
+                        || self.config.attention_sinks,
                     value_norm: resolved.value_norm,
                     q_proj: &resolved.q_proj,
                     k_proj: &resolved.k_proj,
@@ -358,7 +359,7 @@ impl CausalDecoder {
         let weights = FullAttnDenseLayerWeights {
             input_norm: &resolved.input_norm,
             qkv_proj: resolved.qkv_proj.as_ref(),
-            qkv_proj_without_gate: !self.config.attn_output_gate,
+            qkv_proj_without_gate: attention.v_proj.is_none() || self.config.attention_sinks,
             value_norm: resolved.value_norm,
             q_proj: &resolved.q_proj,
             k_proj: &resolved.k_proj,
