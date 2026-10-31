@@ -949,18 +949,19 @@ pub(crate) fn flint_prefill_kv_bf16_store_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_PREFILL_KV_BF16_STORE", true))
 }
 
-/// GEMM NA u4 tuilé pour les petites projections de flint (expert partagé
-/// 2048↔1024, k/v 2048→512) au prefill, au lieu du qmv f32. Le plancher
-/// 2048 reste en place pour Qwen et Gemma, dont les mêmes formes divergent en
-/// oracle greedy.
+/// GEMM NA u4 tuilé bf16×3 pour les petites projections de flint (expert
+/// partagé 2048↔1024, k/v 2048→512) au prefill, au lieu du qmv f32. Le
+/// plancher 2048 reste en place pour Qwen et Gemma.
 ///
 /// Opt-in `SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM=1`. NOTE: Mesuré le 31 oct.
-/// 2026 sur flint-int4 (M5 Max) : prefill 32k 17,6 → 12,4 s, 64k 42,5 →
-/// 31,6 s, mais l'arrondi bf16 des activations dérive trop pour un défaut.
-/// Prompt long de l'oracle mlx contre le CPU : position 513 à 11,8 / 1,92
-/// (seuils f32 6 / 1, 0,98 / 0,16 sans le flag). Greedy 16k sur du code :
-/// premier token changé (marge qmv 5,4), dérive 20,8 / 3,28 au-delà de mlx
-/// bf16 contre f32 (17 / 2,6) ; l'expert partagé seul en fait 14,8 / 2,0.
+/// 2026 sur flint-int4 (M5 Max) : prefill 32k 15,6 → 10,7 s, 64k 38,4 →
+/// 28,7 s. Le bf16×3 colle à la référence f32 (écart relatif ~5e-7) et
+/// l'oracle mlx passe : prompt long 2,32 / 0,33 au pire, position 513 à
+/// 1,13 / 0,20 (2,51 / 0,42 et 0,98 / 0,16 sans le flag ; 11,8 / 1,92 avec
+/// l'ancien GEMM bf16). Reste opt-in faute de greedy identique au qmv sur
+/// le prompt de code 16k : le premier token y est une quasi-égalité à
+/// plusieurs candidats (marge 0,40), que le qmv seul tranche autrement selon
+/// la taille de morceau du prefill (4096 contre 2048).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

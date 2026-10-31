@@ -372,7 +372,8 @@ pub(super) fn can_use_qmm_na_fused_tiled_u8(
 /// Plancher par défaut de `in_dim` et `out_dim` pour le GEMM NA u4 gs64.
 pub(super) const QMM_NA_U4_DEFAULT_MIN_DIM: usize = 2048;
 
-/// Plancher abaissé pour flint, validé par son oracle mlx et son greedy long.
+/// Plancher abaissé pour flint. Les formes entre ce plancher et le défaut
+/// passent par le bf16×3, plus précis que le GEMM bf16 qui sert au-delà.
 pub(super) const QMM_NA_U4_FLINT_MIN_DIM: usize = 512;
 
 /// Variante 4-bit gs64 du GEMM NA tuilé. Le chemin reste borné aux grandes

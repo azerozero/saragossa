@@ -2181,8 +2181,8 @@ fn flint_int4_moe_coop_matches_qmv() {
 /// `SARAGOSSA_FLINT_SMALL_NAX_PROMPT` ou synthétique, puis
 /// `SARAGOSSA_FLINT_SMALL_NAX_STEPS` tokens greedy (256 par défaut). Les k/v
 /// NA entrent dans le cache : la dérive des logits est suivie à chaque pas le
-/// long de la continuation qmv, et une première divergence des tokens doit être
-/// une quasi-égalité (marge qmv du token NA sous la dérive mesurée à ce pas).
+/// long de la continuation qmv, et les deux greedy doivent être identiques sur
+/// tous les pas demandés.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure de dérive, pas un gate"]
@@ -2236,9 +2236,10 @@ fn flint_int4_small_nax_gemm_greedy_matches_qmv() {
                 )
                 .expect("invariant: génération résidente");
             println!(
-                "plancher {min_dim}: prefill {len} tokens en {:.1?}, {} tokens",
+                "plancher {min_dim}: prefill {len} tokens en {:.1?}, {} tokens, début {:?}",
                 output.timings.prefill,
-                output.tokens.len()
+                output.tokens.len(),
+                &output.tokens[..output.tokens.len().min(8)]
             );
             output.tokens
         })
@@ -2285,24 +2286,23 @@ fn flint_int4_small_nax_gemm_greedy_matches_qmv() {
         qmv_rows.len(),
         qmv_rows.len()
     );
-    let divergence = qmv_tokens.iter().zip(&nax_tokens).position(|(a, b)| a != b);
-    match divergence {
-        None => println!("greedy {steps} tokens identiques NA/qmv"),
-        Some(step) => {
-            let row = &qmv_rows[step];
-            let margin = row[qmv_tokens[step]] - row[nax_tokens[step]];
-            println!(
-                "première divergence au pas {step} : qmv {} / NA {}, marge qmv {margin:.5}, \
-                 dérive du pas {:.5}",
-                qmv_tokens[step], nax_tokens[step], step_gaps[step]
-            );
-            assert!(
-                margin <= 2.0 * step_gaps[step],
-                "divergence au pas {step} sans quasi-égalité : marge {margin} > 2 × dérive {}",
-                step_gaps[step]
-            );
-        }
+    // Critère d'activation par défaut : greedy identique au qmv sur toute la
+    // continuation. Une marge comparée à la dérive du même pas ne prouverait
+    // rien (un argmax changé implique déjà marge ≤ dérive) : toute divergence
+    // échoue, après diagnostic.
+    assert_eq!(qmv_tokens.len(), steps, "greedy qmv écourté");
+    assert_eq!(nax_tokens.len(), steps, "greedy NA écourté");
+    if let Some(step) = qmv_tokens.iter().zip(&nax_tokens).position(|(a, b)| a != b) {
+        let row = &qmv_rows[step];
+        panic!(
+            "première divergence au pas {step} : qmv {} / NA {}, marge qmv {:.5}, dérive du pas {:.5}",
+            qmv_tokens[step],
+            nax_tokens[step],
+            row[qmv_tokens[step]] - row[nax_tokens[step]],
+            step_gaps[step]
+        );
     }
+    println!("greedy {steps} tokens comparés, identiques NA/qmv");
     // Garde-fou de mesure, pas un budget de qualité (cf. MAX_GAP_MLX_BF16).
     assert!(
         max < MAX_GAP_MLX_BF16,
