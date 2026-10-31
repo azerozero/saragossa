@@ -2272,7 +2272,13 @@ fn flint_int4_small_nax_gemm_greedy_matches_qmv() {
     let nax_rows = forced_rows(nax_min_dim, forced);
     let (mut max, mut mean, mut argmax_ok) = (0.0_f32, 0.0_f32, 0_usize);
     let mut step_gaps = Vec::with_capacity(qmv_rows.len());
-    for (nax, qmv) in nax_rows.iter().zip(&qmv_rows) {
+    for (step, (nax, qmv)) in nax_rows.iter().zip(&qmv_rows).enumerate() {
+        // `f32::max` ignore les NaN : une ligne invalide passerait pour un
+        // écart nul dans les réductions ci-dessous.
+        assert!(
+            nax.iter().chain(qmv).all(|value| value.is_finite()),
+            "logits non finis au pas {step}"
+        );
         let len = qmv.len() as f32;
         let shift = nax.iter().zip(qmv).map(|(a, b)| a - b).sum::<f32>() / len;
         let centered = nax.iter().zip(qmv).map(|(a, b)| (a - b - shift).abs());
