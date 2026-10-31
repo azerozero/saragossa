@@ -81,6 +81,8 @@ mod na_gemm;
 mod pipelines;
 mod prefill;
 #[cfg(test)]
+pub(crate) use self::flags::qmm_na_u4_x3_dispatches_for_test;
+#[cfg(test)]
 pub(crate) use self::flags::with_flint_moe_coop_override;
 #[cfg(test)]
 pub(crate) use self::flags::with_flint_moe_coop_tiled_override;
@@ -320,6 +322,10 @@ pub struct MetalExecutor {
     /// Plancher de `in_dim`/`out_dim` du GEMM NA u4 gs64 : 2048 par défaut,
     /// abaissé pour flint seul par [`Self::enable_flint_small_nax_gemm`].
     qmm_na_u4_min_dim: usize,
+    /// `weight_id` des poids ouverts au GEMM NA u4 sous le plancher : les k/v
+    /// des couches full du modèle cible
+    /// ([`Self::allow_qmm_na_u4_x3_weight`]). Vide par défaut.
+    qmm_na_u4_x3_weights: Vec<u64>,
     /// K/V des couches glissantes à sinks borné à la fenêtre (lu du flag,
     /// forcé en test).
     prefill_window_kv: bool,

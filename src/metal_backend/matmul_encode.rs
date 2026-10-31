@@ -183,8 +183,9 @@ impl MetalExecutor {
         in_dim: usize,
         out_dim: usize,
     ) -> Result<()> {
-        // Sous le plancher par défaut (formes que seul flint abaisse), le
-        // bf16×3 lit le lhs f32 directement : pas de conversion bf16 préalable.
+        // Sous le plancher par défaut (formes que seuls flint et les poids k/v
+        // d'un Qwen dense ouvrent), le bf16×3 lit le lhs f32 directement : pas
+        // de conversion bf16 préalable.
         if in_dim.min(out_dim) < QMM_NA_U4_DEFAULT_MIN_DIM {
             if out_dim % 64 != 0 {
                 return Err(InferError::Dimension(format!(
@@ -194,6 +195,8 @@ impl MetalExecutor {
             let pso = self.na_gemm_coop_qb_tiled_u4_x3.as_ref().ok_or_else(|| {
                 InferError::Config("gemm_nax_coop_qb_tiled_u4_x3: NA indisponible".into())
             })?;
+            #[cfg(test)]
+            super::flags::count_qmm_na_u4_x3_dispatch();
             return self.dispatch_affine_qmm_na_fused_tiled_u4(
                 encoder,
                 pso,

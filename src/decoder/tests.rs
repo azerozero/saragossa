@@ -3504,3 +3504,42 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         Ok(())
     })
 }
+
+/// Seul un Qwen dense à k/v 5120→1024 (Qwen3.8 27B) ouvre ses k/v au
+/// bf16×3 : Qwen 30B et Qwen3-Next (MoE), flint (sinks), un autre Qwen dense
+/// et un modèle hétérogène gardent le plancher.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn qwen_kv_nax_x3_shape_targets_dense_qwen_27b_only() {
+    let qwen = CausalDecoderConfig {
+        is_qwen: true,
+        ..CausalDecoderConfig::default()
+    };
+    let kv_27b: &[usize] = &[1024, 5120];
+    assert_eq!(
+        qwen_kv_nax_x3_shape(&qwen, &[kv_27b; 16]),
+        Some((5120, 1024))
+    );
+    let moe = |experts| CausalDecoderConfig {
+        num_experts: Some(experts),
+        ..qwen.clone()
+    };
+    // Qwen 30B-A3B (2048→512, 128 experts) et Qwen3-Next (2048→512, 512).
+    let kv_moe: &[usize] = &[512, 2048];
+    assert_eq!(qwen_kv_nax_x3_shape(&moe(128), &[kv_moe; 4]), None);
+    assert_eq!(qwen_kv_nax_x3_shape(&moe(512), &[kv_moe; 4]), None);
+    // Même forme k/v sous MoE : refusée par l'identité, pas par la forme.
+    assert_eq!(qwen_kv_nax_x3_shape(&moe(128), &[kv_27b; 4]), None);
+    let flint = CausalDecoderConfig {
+        attention_sinks: true,
+        ..qwen.clone()
+    };
+    assert_eq!(qwen_kv_nax_x3_shape(&flint, &[kv_27b; 4]), None);
+    let not_qwen = CausalDecoderConfig::default();
+    assert_eq!(qwen_kv_nax_x3_shape(&not_qwen, &[kv_27b; 4]), None);
+    // Autre Qwen dense (4096→1024) et modèle hétérogène.
+    let kv_8b: &[usize] = &[1024, 4096];
+    assert_eq!(qwen_kv_nax_x3_shape(&qwen, &[kv_8b; 4]), None);
+    assert_eq!(qwen_kv_nax_x3_shape(&qwen, &[kv_27b, kv_8b]), None);
+    assert_eq!(qwen_kv_nax_x3_shape(&qwen, &[]), None);
+}

@@ -35,6 +35,49 @@ impl MetalExecutor {
         }
     }
 
+    /// Ouvre ce seul poids au GEMM NA u4 sous le plancher, servi par le
+    /// bf16×3 : appelé pour les k/v des couches full du modèle cible (Qwen
+    /// dense à k/v 5120→1024). L'autorisation suit l'identité du poids
+    /// (`weight_id`, stable quand son stockage passe en mémoire partagée) et
+    /// non sa forme : un drafter DFlash ou une tête MTP de même forme garde le
+    /// qmv. Seul le sélecteur owned la consulte, le chemin du prefill cible ;
+    /// le sélecteur résident (buffers sans identité de poids) garde le
+    /// plancher. Refusé hors u4 gs64, au-dessus du plancher ou sans pipeline
+    /// x3 (repli qmv).
+    pub(crate) fn allow_qmm_na_u4_x3_weight(&mut self, weight: &AffineQuantizedTensor) {
+        let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+            return;
+        };
+        let in_dim = match weight.shape() {
+            [_, in_dim] => *in_dim,
+            _ => return,
+        };
+        if self.na_gemm_coop_qb_tiled_u4_x3.is_some()
+            && weight.bits() == 4
+            && weight.group_size() == FAST_QMV_GROUP_SIZE
+            && in_dim.min(out_dim) < QMM_NA_U4_DEFAULT_MIN_DIM
+            && !self.qmm_na_u4_x3_weights.contains(&weight.weight_id())
+        {
+            self.qmm_na_u4_x3_weights.push(weight.weight_id());
+        }
+    }
+
+    /// Plancher du GEMM NA u4 pour `weight` : nul pour un poids ouvert par
+    /// [`Self::allow_qmm_na_u4_x3_weight`], sinon le plancher de l'executor.
+    /// La surcharge de test l'emporte sur les deux.
+    #[inline]
+    fn qmm_na_u4_min_dim_for(&self, weight: &AffineQuantizedTensor) -> usize {
+        #[cfg(test)]
+        if let Some(min_dim) = super::flags::qmm_na_u4_min_dim_test_override() {
+            return min_dim;
+        }
+        if self.qmm_na_u4_x3_weights.contains(&weight.weight_id()) {
+            0
+        } else {
+            self.qmm_na_u4_min_dim
+        }
+    }
+
     /// Plancher effectif du GEMM NA u4 (surcharge de test comprise).
     #[inline]
     pub(super) fn qmm_na_u4_min_dim(&self) -> usize {
@@ -139,7 +182,12 @@ impl MetalExecutor {
         } else if can_use_fast_affine_qmm8(batch, in_dim, weight) {
             AffineMatmulKernel::Qmm8
         } else if self.qmm_na_fused_tiled_u4_available(weight.group_size())
-            && can_use_qmm_na_fused_tiled_u4(batch, in_dim, weight, self.qmm_na_u4_min_dim())
+            && can_use_qmm_na_fused_tiled_u4(
+                batch,
+                in_dim,
+                weight,
+                self.qmm_na_u4_min_dim_for(weight),
+            )
         {
             AffineMatmulKernel::QmmNaFusedTiledU4
         } else if self.qmm_na_fused_tiled_u4_align64_available(weight.group_size())

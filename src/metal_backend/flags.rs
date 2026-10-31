@@ -315,6 +315,25 @@ pub(crate) fn with_qmm_na_u4_min_dim_override<R>(min_dim: usize, run: impl FnOnc
     run()
 }
 
+#[cfg(test)]
+thread_local! {
+    // Par thread comme le plancher forcé : prouve qu'un greedy réel a bien
+    // emprunté le bf16×3, sans compter les dispatches des autres tests.
+    static QMM_NA_U4_X3_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Compte un dispatch du GEMM NA u4 bf16×3 sur ce thread.
+#[cfg(test)]
+pub(super) fn count_qmm_na_u4_x3_dispatch() {
+    QMM_NA_U4_X3_DISPATCHES.with(|cell| cell.set(cell.get() + 1));
+}
+
+/// Nombre de dispatches du GEMM NA u4 bf16×3 encodés sur ce thread.
+#[cfg(test)]
+pub(crate) fn qmm_na_u4_x3_dispatches_for_test() -> usize {
+    QMM_NA_U4_X3_DISPATCHES.with(std::cell::Cell::get)
+}
+
 pub(super) fn qmm_na_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMM_NA", true))

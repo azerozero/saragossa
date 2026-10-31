@@ -970,6 +970,27 @@ pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", true))
 }
 
+/// GEMM NA u4 tuilé bf16×3, au lieu du qmv f32, pour les seules projections
+/// k/v des couches full-attention du modèle cible quand c'est un Qwen dense
+/// (sans experts ni sinks) à k/v 5120→1024 en u4 gs64, comme Qwen3.8 27B.
+/// L'autorisation suit l'identité des poids k/v, pas leur forme : tête MTP,
+/// drafter DFlash, beta/alpha et experts partagés de Qwen 30B et Qwen3-Next
+/// gardent le qmv. Seul le chemin owned (prefill cible) la consulte.
+///
+/// Actif par défaut, kill-switch `SARAGOSSA_RUST_QWEN_KV_NAX_X3=0`.
+/// NOTE: Mesuré le 31 oct. 2026 sur Qwen3.8-27B-4bit (M5 Max), prefill seul
+/// 32k : section qkv 4,0 → 2,3-2,4 s ; prefill 53,6 → 51,5 s en moyenne sur
+/// trois paires sans profil (bruit ±1,5 s). Le bf16×3 colle à la référence
+/// f64 (écart relatif 1,7e-7). Greedy 128 tokens identiques à 4k et 16k ; à
+/// 32k, divergence au pas 17 sur une quasi-égalité (marge qmv 0,013, dérive
+/// du pas 0,09), dérive max 1,32 et argmax forcé 127/128. Le qmv seul est
+/// bit-identique entre morceaux de 4096 et 2048 : ce bruit ne situe rien ici.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn qwen_kv_nax_x3_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QWEN_KV_NAX_X3", true))
+}
+
 /// K/V des couches glissantes à sinks (flint) borné à leur fenêtre : le
 /// prefill résident ne garde que les `window` dernières lignes de chaque
 /// couche fenêtrée (buffer de `2 × window + morceau` lignes, queue recopiée

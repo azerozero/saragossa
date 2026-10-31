@@ -87,6 +87,33 @@ pub enum RopeStyle {
     Interleaved,
 }
 
+/// Forme `(in_dim, out_dim)` des k/v full-attention d'un Qwen dense à hidden
+/// 5120 et 4 têtes K/V de 256 (Qwen3.8 27B), seule forme Qwen validée sous
+/// le plancher du GEMM NA u4 par ses oracles (référence f64, greedy réel).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const QWEN_27B_KV_SHAPE: (usize, usize) = (5120, 1024);
+
+/// Le modèle cible ouvre-t-il ses k/v full-attention au GEMM NA u4 bf16×3 ?
+/// Oui pour un Qwen dense (sans experts, sans sinks, hors Gemma 4) dont
+/// toutes les couches full ont des k (`kv_shapes`, poids `[out, in]`) de
+/// forme [`QWEN_27B_KV_SHAPE`]. Les MoE Qwen (30B, Qwen3-Next) ont des
+/// experts partagés sous le plancher, non validés, et restent exclus comme
+/// flint et Gemma. Seuls les poids k/v de ces couches sont ouverts, pas la
+/// forme : drafter DFlash et tête MTP gardent le qmv.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn qwen_kv_nax_x3_shape(
+    config: &CausalDecoderConfig,
+    kv_shapes: &[&[usize]],
+) -> Option<(usize, usize)> {
+    let dense_qwen = config.is_qwen
+        && config.num_experts.unwrap_or(0) == 0
+        && !config.attention_sinks
+        && !config.is_gemma4;
+    let validated = |shape: &&[usize]| matches!(shape, [out_dim, in_dim] if (*in_dim, *out_dim) == QWEN_27B_KV_SHAPE);
+    (dense_qwen && !kv_shapes.is_empty() && kv_shapes.iter().all(validated))
+        .then_some(QWEN_27B_KV_SHAPE)
+}
+
 #[derive(Clone, Debug)]
 /// Décrit les dimensions et options d'un décodeur causal.
 pub struct CausalDecoderConfig {
@@ -2330,8 +2357,38 @@ impl CausalDecoder {
             executor.enable_flint_small_nax_gemm();
         }
         self.enable_single_copy_weights(&executor)?;
+        if self.qwen_kv_nax_x3_shape().is_some() && crate::runtime_flags::qwen_kv_nax_x3_enabled() {
+            for attention in self.full_attentions() {
+                for linear in [&attention.k_proj, attention.resident_v_proj()] {
+                    if let LinearWeight::AffineQuantized(weight) = linear.weight() {
+                        executor.allow_qmm_na_u4_x3_weight(weight);
+                    }
+                }
+            }
+        }
         self.runtime.metal = Some(Arc::new(executor));
         Ok(self)
+    }
+
+    /// Couches full-attention du modèle cible (tête MTP exclue).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn full_attentions(&self) -> impl Iterator<Item = &FullAttention> {
+        self.layers
+            .iter()
+            .filter_map(|layer| match &layer.attention {
+                AttentionBlock::Full(attention) => Some(attention.as_ref()),
+                AttentionBlock::Linear(_) => None,
+            })
+    }
+
+    /// Forme k/v à ouvrir au GEMM NA u4 bf16×3 ([`qwen_kv_nax_x3_shape`]).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn qwen_kv_nax_x3_shape(&self) -> Option<(usize, usize)> {
+        let kv_shapes = self
+            .full_attentions()
+            .map(|attention| attention.k_proj.weight().shape())
+            .collect::<Vec<_>>();
+        qwen_kv_nax_x3_shape(&self.config, &kv_shapes)
     }
 
     /// Refuse les chemins Metal per-op et spéculatifs pour un modèle qu'ils ne
