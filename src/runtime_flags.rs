@@ -976,6 +976,13 @@ pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
 /// 30B et Qwen3-Next) restent au qmv.
 ///
 /// Actif par défaut, kill-switch `SARAGOSSA_RUST_QWEN_KV_NAX_X3=0`.
+/// NOTE: Mesuré le 31 oct. 2026 sur Qwen3.8-27B-4bit (M5 Max), prefill seul
+/// 32k : section qkv 4,0 → 2,3-2,4 s ; prefill 53,6 → 51,5 s en moyenne sur
+/// trois paires sans profil (bruit ±1,5 s). Le bf16×3 colle à la référence
+/// f64 (écart relatif 1,7e-7). Greedy 128 tokens identiques à 4k et 16k ; à
+/// 32k, divergence au pas 17 sur une quasi-égalité (marge qmv 0,013, dérive
+/// du pas 0,09), dérive max 1,32 et argmax forcé 127/128. Le qmv seul est
+/// bit-identique entre morceaux de 4096 et 2048 : ce bruit ne situe rien ici.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn qwen_kv_nax_x3_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
