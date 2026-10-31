@@ -1367,6 +1367,14 @@ pub(super) fn dflash_switch_min() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Attention fenêtrée du drafter DFlash en lignes (défaut) ;
+/// `SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS=0` rétablit la boucle naïve ligne par
+/// ligne, référence de dérive et de débit.
+pub(crate) fn dflash_windowed_rows() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS", true))
+}
+
 pub(super) fn prefix_cache_capacity() -> usize {
     static CAPACITY: OnceLock<usize> = OnceLock::new();
     *CAPACITY.get_or_init(|| {

@@ -1509,6 +1509,7 @@ impl DecodeResidentState {
                 q_roped_rows.tensor().buffer(),
                 ctx.tensor().buffer(),
                 rows,
+                None,
             )?;
         }
         let loop_rows = if fused_rows { 0 } else { rows };
