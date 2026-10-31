@@ -769,6 +769,107 @@ kernel void gemm_nax_skinny_u4_x3(device const float* A [[buffer(0)]],
   threadgroup float red[4u * 512u];
   gemm_nax_skinny_u4_body<true>(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red);
 }
+// Variante « ×2 » du skinny u4 gs64 : l'entier q ∈ [0, 15] est exact en bf16, donc
+// le MMA porte sur q brut et seule l'activation est scindée (hi + lo, deux MMA au
+// lieu de trois, sans déquantification ni scission de B). L'échelle et le biais
+// changent tous les 64 de K : chaque groupe accumule P = Σ A·q dans ses propres
+// fragments, puis l'épilogue f32 ajoute s·P + b·Σ_g A au résultat. Σ_g A (somme
+// f32 de l'activation sur le groupe) se réduit par shuffles : les lanes d'une même
+// ligne de fragment ne diffèrent que par les bits 0 et 3 (cf. `get_coord`).
+// Les produits A_hi·q et A_lo·q sont exacts en f32 ; l'erreur vient de A_hi + A_lo
+// (2⁻¹⁶ relatif) et des sommes f32, contre 2⁻¹⁶ sur A **et** sur B pour le ×3.
+// Split-K : span = K/4 multiple de 128 (K % 512 == 0), aucun groupe n'est coupé.
+static inline void gemm_nax_skinny_u4_x2_body(device const float* A, device const uint* Bp,
+                                              device const bfloat* Bs, device const bfloat* Bb,
+                                              device float* C, uint M, uint N, uint K,
+                                              uint2 tgid, uint sgid, uint lid,
+                                              threadgroup float* red) {
+  constexpr uint SG = 4u;
+  uint m0 = tgid.y * 16u, n0 = tgid.x * 32u;
+  uint span = K / SG;
+  uint kb = sgid * span, ke = kb + span;
+  uint groups = K / 64u;
+  uint packed_cols = K / 8u;
+  short2 sc = NaxFrag::get_coord();
+  // Lignes A de ce thread (fragment A et fragment C partagent le mapping lane→ligne).
+  uint row0 = m0 + uint(sc.y), row1 = row0 + 8u;
+  // Colonnes C de ce thread : n0 + sc.x + j (Cn0) et + 16 (Cn1).
+  uint nc = n0 + uint(sc.x);
+  // Lignes B (poids) chargées par ce thread : n + sc.y + i·8, fragments 0 et 1.
+  uint nb = n0 + uint(sc.y);
+  metal::vec<float,8> Cn0 = float(0), Cn1 = float(0);
+  for (uint g0 = kb; g0 < ke; g0 += 64u) {
+    metal::vec<float,8> P0 = float(0), P1 = float(0);
+    float sa0 = 0.0f, sa1 = 0.0f;
+    for (uint k = g0; k < g0 + 64u; k += 16u) {
+      metal::vec<bfloat,8> Ah, Al, Q0, Q1;
+      uint kk = k + uint(sc.x);
+      for (short i = 0; i < 2; i++) {
+        uint row = i == 0 ? row0 : row1;
+        const device float* pa = A + row * K + kk;
+        float rs = 0.0f;
+        for (short j = 0; j < 4; j++) {
+          float x = (row < M) ? pa[j] : 0.0f;
+          bfloat h = bfloat(x);
+          Ah[i * 4 + j] = h;
+          Al[i * 4 + j] = bfloat(x - float(h));
+          rs += x;
+        }
+        if (i == 0) { sa0 += rs; } else { sa1 += rs; }
+      }
+      uint shift = (kk & 7u) * 4u;
+      for (short i = 0; i < 2; i++) {
+        uint w0 = Bp[(nb + uint(i) * 8u) * packed_cols + (kk >> 3)] >> shift;
+        uint w1 = Bp[(nb + 16u + uint(i) * 8u) * packed_cols + (kk >> 3)] >> shift;
+        for (short j = 0; j < 4; j++) {
+          Q0[i * 4 + j] = bfloat(float((w0 >> (4u * uint(j))) & 0x0fu));
+          Q1[i * 4 + j] = bfloat(float((w1 >> (4u * uint(j))) & 0x0fu));
+        }
+      }
+      NaxFrag::mma(P0, P1, Ah, Q0, Q1);
+      NaxFrag::mma(P0, P1, Al, Q0, Q1);
+    }
+    sa0 += simd_shuffle_xor(sa0, ushort(1));
+    sa0 += simd_shuffle_xor(sa0, ushort(8));
+    sa1 += simd_shuffle_xor(sa1, ushort(1));
+    sa1 += simd_shuffle_xor(sa1, ushort(8));
+    uint g = g0 >> 6u;
+    for (short j = 0; j < 4; j++) {
+      uint i0 = (nc + uint(j)) * groups + g;
+      uint i1 = (nc + 16u + uint(j)) * groups + g;
+      float s0 = float(Bs[i0]), b0 = float(Bb[i0]);
+      float s1 = float(Bs[i1]), b1 = float(Bb[i1]);
+      Cn0[j] += fma(s0, P0[j], b0 * sa0);
+      Cn0[4 + j] += fma(s0, P0[4 + j], b0 * sa1);
+      Cn1[j] += fma(s1, P1[j], b1 * sa0);
+      Cn1[4 + j] += fma(s1, P1[4 + j], b1 * sa1);
+    }
+  }
+  threadgroup float* mine = red + sgid * 512u;
+  NaxFrag::store_c_tg(Cn0, mine, 32);
+  NaxFrag::store_c_tg(Cn1, mine + 16u, 32);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint tid = sgid * 32u + lid;
+  for (uint idx = tid; idx < 512u; idx += SG * 32u) {
+    uint m = idx >> 5u, nn = idx & 31u;
+    if (m0 + m < M) {
+      C[(m0 + m) * N + n0 + nn] = red[idx] + red[512u + idx] + red[1024u + idx] + red[1536u + idx];
+    }
+  }
+}
+kernel void gemm_nax_skinny_u4_x2(device const float* A [[buffer(0)]],
+                                  device const uint* Bp   [[buffer(1)]],
+                                  device const bfloat* Bs [[buffer(2)]],
+                                  device const bfloat* Bb [[buffer(3)]],
+                                  device float* C         [[buffer(4)]],
+                                  constant uint4& dims    [[buffer(5)]],
+                                  constant uint& batch    [[buffer(6)]],
+                                  uint2 tgid [[threadgroup_position_in_grid]],
+                                  uint sgid [[simdgroup_index_in_threadgroup]],
+                                  uint lid [[thread_index_in_simdgroup]]) {
+  threadgroup float red[4u * 512u];
+  gemm_nax_skinny_u4_x2_body(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red);
+}
 kernel void gemm_nax_coop_qb_tiled_gs128(device const bfloat* A [[buffer(0)]],
                                          device const uint* Bp   [[buffer(1)]],
                                          device const bfloat* Bs [[buffer(2)]],

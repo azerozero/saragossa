@@ -1636,6 +1636,115 @@ fn qmm_skinny_u4_gs64_matches_qmv_for_5_to_31_rows() -> Result<()> {
     Ok(())
 }
 
+/// Poids u4 gs64 pseudo-aléatoire au profil MLX (`b ≈ −7,5·s`, échelles variées).
+fn test_affine_random_u4(out_dim: usize, in_dim: usize, seed: u64) -> Result<AffineQuantizedTensor> {
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let groups = in_dim / 64;
+    let packed = (0..out_dim * in_dim / 8)
+        .map(|_| {
+            let lanes: Vec<u32> = (0..8).map(|_| (next() * 16.0) as u32 & 15).collect();
+            pack_lanes(&lanes, 4)
+        })
+        .collect();
+    let scales: Vec<f32> = (0..out_dim * groups)
+        .map(|_| bf16_round((0.002 + 0.018 * next()) as f32))
+        .collect();
+    let biases = scales
+        .iter()
+        .map(|s| bf16_round(-s * (7.5 + (next() as f32 - 0.5))))
+        .collect();
+    AffineQuantizedTensor::new(
+        &[out_dim, in_dim / 8],
+        packed,
+        Tensor::from_vec(vec![out_dim, groups], scales)?,
+        Tensor::from_vec(vec![out_dim, groups], biases)?,
+        64,
+        4,
+    )
+}
+
+/// Oracle f64 des variantes skinny x2 et x3 sur les formes du Qwen 27B (MLP
+/// 5120↔17408, projections linéaires 5120→10240 et 6144→5120), de 5 à 17 lignes.
+/// Activations avec quelques valeurs aberrantes, comme les états cachés réels. Le
+/// x2 doit rester dans la classe f32 et ne pas faire pire que le x3.
+#[test]
+fn qmm_skinny_u4_x2_and_x3_match_f64_on_qwen_shapes() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    if executor.na_gemm_skinny_u4_x2.is_none() || executor.na_gemm_skinny_u4_x3.is_none() {
+        eprintln!("skip: GEMM NA skinny indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    for (index, (in_dim, out_dim)) in [(5120_usize, 17408_usize), (17408, 5120), (5120, 10240), (6144, 5120)]
+        .into_iter()
+        .enumerate()
+    {
+        let weight = test_affine_random_u4(out_dim, in_dim, 0x9E37_79B9 + index as u64)?;
+        let packed = weight.packed_data();
+        let scales = weight.scales_f32();
+        let biases = weight.biases_f32();
+        let groups = in_dim / 64;
+        for batch in [5_usize, 8, 16, 17] {
+            let lhs: Vec<f32> = (0..batch * in_dim)
+                .map(|i| {
+                    let x = ((i * 2_654_435_761) % 10_007) as f32 / 10_007.0 - 0.5;
+                    if i % 997 == 0 {
+                        x * 40.0
+                    } else {
+                        x
+                    }
+                })
+                .collect();
+            // Sous-ensemble de colonnes : la référence f64 complète coûterait des
+            // milliards d'opérations en profil test.
+            let cols: Vec<usize> = (0..out_dim).step_by(37).collect();
+            let mut reference = Vec::with_capacity(batch * cols.len());
+            for row in 0..batch {
+                let x = &lhs[row * in_dim..(row + 1) * in_dim];
+                for &n in &cols {
+                    let mut acc = 0.0f64;
+                    for (k, &xk) in x.iter().enumerate() {
+                        let q = (packed[n * in_dim / 8 + k / 8] >> (4 * (k % 8))) & 15;
+                        let g = n * groups + k / 64;
+                        acc += f64::from(xk) * (f64::from(q) * f64::from(scales[g]) + f64::from(biases[g]));
+                    }
+                    reference.push(acc);
+                }
+            }
+            let scale = reference.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+            let mut errors = Vec::new();
+            for kernel in [SkinnyKernel::X3, SkinnyKernel::X2] {
+                let _guard = install_qmm_skinny_kernel_scope(kernel);
+                let actual = matmul_via_selected_kernel(&executor, &weight, &lhs, batch, in_dim, out_dim)?;
+                let mut worst = 0.0f64;
+                for row in 0..batch {
+                    for (c, &n) in cols.iter().enumerate() {
+                        let value = f64::from(actual[row * out_dim + n]);
+                        assert!(value.is_finite(), "{kernel:?} {in_dim}→{out_dim} non fini");
+                        worst = worst.max((value - reference[row * cols.len() + c]).abs() / scale);
+                    }
+                }
+                eprintln!("skinny {kernel:?} {in_dim}→{out_dim} M={batch}: écart max {worst:.2e} de l'échelle");
+                errors.push(worst);
+            }
+            assert!(errors[0] <= 5.0e-5, "x3 {in_dim}→{out_dim} M={batch}: {:e}", errors[0]);
+            assert!(errors[1] <= 5.0e-5, "x2 {in_dim}→{out_dim} M={batch}: {:e}", errors[1]);
+            assert!(
+                errors[1] <= errors[0] * 1.5,
+                "x2 moins précis que x3 {in_dim}→{out_dim} M={batch}: {errors:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn affine_qmm2_u3_gs64_matches_two_qmv_bit_exact() -> Result<()> {
     let Some(executor) = test_executor()? else {

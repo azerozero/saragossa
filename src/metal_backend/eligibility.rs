@@ -174,10 +174,11 @@ pub(super) fn can_use_fast_affine_qmm8(
 /// Mesuré le 2026-10-16 (M5 Max, `small_m_qmm_microbench`) : gate/up M=8 0,19 ms
 /// contre 0,30 en qmv répliqué, lm_head 2,4 contre 4,4 ; rentable dès 5 lignes,
 /// d'où le défaut de `SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH`. Le défaut D2 fusionné
-/// (3 lignes) n'est pas concerné. Précision : A et B scindés en bf16 hi+lo, trois
-/// MMA, écart 1e-5 de l'échelle (classe f32, sorties greedy identiques sur les
-/// prompts de campagne). `SARAGOSSA_RUST_QMM_SKINNY_KERNEL=bf16` prend la variante
-/// à un seul MMA (gate/up 0,14 ms, lm_head 1,8) au prix d'un écart 5e-3.
+/// (3 lignes) n'est pas concerné. Variantes (`SARAGOSSA_RUST_QMM_SKINNY_KERNEL`,
+/// voir [`SkinnyKernel`]) : `x3` (A et B scindés en bf16 hi+lo, trois MMA, écart
+/// 1e-5 de l'échelle, sorties greedy identiques sur les prompts de campagne),
+/// `x2` (q brut exact × A hi+lo, deux MMA, échelle et biais par groupe en f32) et
+/// `bf16` (un seul MMA, gate/up 0,14 ms, lm_head 1,8, écart 5e-3).
 /// `SARAGOSSA_RUST_QMM_SKINNY=0` rétablit le qmv répliqué.
 pub(super) fn can_use_qmm_skinny_buffers(
     batch: usize,
@@ -213,38 +214,77 @@ fn qmm_skinny_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMM_SKINNY", true))
 }
 
+/// Variante du GEMM skinny u4 gs64 (`na_gemm.metal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SkinnyKernel {
+    /// Un seul MMA bf16 : rapide, mais fait diverger le greedy du tronc.
+    Bf16,
+    /// A et B déquantifié scindés hi+lo, trois MMA.
+    X3,
+    /// q brut exact × A hi+lo, deux MMA, échelle et biais par groupe en f32.
+    X2,
+}
+
+/// Variante précise par défaut quand ni l'environnement ni une portée ne la fixent.
+const SKINNY_PRECISE_DEFAULT: SkinnyKernel = SkinnyKernel::X3;
+
 thread_local! {
-    // Forçage local du kernel skinny bf16 (drafter DFlash : ses sorties ne sont
-    // que des propositions, la vérification garantit la parité ; le tronc garde
-    // le x3 car bf16 fait diverger le greedy).
-    static SKINNY_BF16_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    // Forçage local de la variante skinny (drafter DFlash en bf16 : ses sorties ne
+    // sont que des propositions, la vérification garantit la parité ; le tronc
+    // garde une variante précise car bf16 fait diverger le greedy).
+    static SKINNY_OVERRIDE: Cell<Option<SkinnyKernel>> = const { Cell::new(None) };
 }
 
 /// Garde RAII restaurant le choix précédent du kernel skinny à sa sortie de portée.
-pub(crate) struct SkinnyBf16ScopeGuard(Option<bool>);
+pub(crate) struct SkinnyBf16ScopeGuard(Option<SkinnyKernel>);
 
 impl Drop for SkinnyBf16ScopeGuard {
     fn drop(&mut self) {
-        SKINNY_BF16_OVERRIDE.with(|slot| slot.set(self.0));
+        SKINNY_OVERRIDE.with(|slot| slot.set(self.0));
     }
 }
 
-/// Force le kernel skinny bf16 (`enabled`) ou x3 (`!enabled`) pour les matmuls
-/// encodés sur ce thread tant que la garde vit, indépendamment de
-/// `SARAGOSSA_RUST_QMM_SKINNY_KERNEL`.
+/// Force le kernel skinny bf16 (`enabled`) ou la variante précise (`!enabled` :
+/// `x2`/`x3` de `SARAGOSSA_RUST_QMM_SKINNY_KERNEL`, sinon le défaut) pour les
+/// matmuls encodés sur ce thread tant que la garde vit.
 pub(crate) fn install_qmm_skinny_bf16_scope(enabled: bool) -> SkinnyBf16ScopeGuard {
-    SKINNY_BF16_OVERRIDE.with(|slot| SkinnyBf16ScopeGuard(slot.replace(Some(enabled))))
+    let kernel = if enabled {
+        SkinnyKernel::Bf16
+    } else {
+        precise_skinny_kernel()
+    };
+    install_qmm_skinny_kernel_scope(kernel)
 }
 
-pub(super) fn qmm_skinny_bf16() -> bool {
-    if let Some(forced) = SKINNY_BF16_OVERRIDE.with(Cell::get) {
-        return forced;
-    }
-    static BF16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *BF16.get_or_init(|| {
-        crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_SKINNY_KERNEL")
-            .is_some_and(|value| value.trim() == "bf16")
+/// Force une variante skinny sur ce thread (tests de précision croisés).
+pub(super) fn install_qmm_skinny_kernel_scope(kernel: SkinnyKernel) -> SkinnyBf16ScopeGuard {
+    SKINNY_OVERRIDE.with(|slot| SkinnyBf16ScopeGuard(slot.replace(Some(kernel))))
+}
+
+fn env_skinny_kernel() -> Option<SkinnyKernel> {
+    static KERNEL: std::sync::OnceLock<Option<SkinnyKernel>> = std::sync::OnceLock::new();
+    *KERNEL.get_or_init(|| {
+        match crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_SKINNY_KERNEL")?.trim() {
+            "bf16" => Some(SkinnyKernel::Bf16),
+            "x3" => Some(SkinnyKernel::X3),
+            "x2" => Some(SkinnyKernel::X2),
+            _ => None,
+        }
     })
+}
+
+fn precise_skinny_kernel() -> SkinnyKernel {
+    match env_skinny_kernel() {
+        Some(kernel @ (SkinnyKernel::X2 | SkinnyKernel::X3)) => kernel,
+        _ => SKINNY_PRECISE_DEFAULT,
+    }
+}
+
+pub(super) fn qmm_skinny_kernel() -> SkinnyKernel {
+    SKINNY_OVERRIDE
+        .with(Cell::get)
+        .or_else(env_skinny_kernel)
+        .unwrap_or(SKINNY_PRECISE_DEFAULT)
 }
 
 pub(super) fn qmm_skinny_min_batch() -> usize {
