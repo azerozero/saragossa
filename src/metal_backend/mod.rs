@@ -79,6 +79,8 @@ mod prefill;
 #[cfg(test)]
 pub(crate) use self::flags::with_flint_moe_coop_override;
 #[cfg(test)]
+pub(crate) use self::flags::with_qmm_na_u4_min_dim_override;
+#[cfg(test)]
 pub(crate) use self::prefill::routed_coop_trace_for_test;
 #[cfg(test)]
 pub(crate) use self::prefill::with_prefill_kv_layout_override;
@@ -305,6 +307,9 @@ pub struct MetalExecutor {
     prefill_kv_bf16_store_sinks: bool,
     /// Choix du Steel avec sinks (lu du flag, forcé en test).
     prefill_sink_steel: bool,
+    /// Plancher de `in_dim`/`out_dim` du GEMM NA u4 gs64 : 2048 par défaut,
+    /// abaissé pour flint seul par [`Self::enable_flint_small_nax_gemm`].
+    qmm_na_u4_min_dim: usize,
     /// K/V des couches glissantes à sinks borné à la fenêtre (lu du flag,
     /// forcé en test).
     prefill_window_kv: bool,

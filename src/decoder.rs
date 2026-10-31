@@ -2311,11 +2311,8 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si Metal est indisponible ou si un kernel ne compile pas.
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub fn with_metal_runtime(mut self) -> Result<Self> {
-        let executor = crate::MetalExecutor::new()?;
-        self.enable_single_copy_weights(&executor)?;
-        self.runtime.metal = Some(Arc::new(executor));
-        Ok(self)
+    pub fn with_metal_runtime(self) -> Result<Self> {
+        self.with_metal_executor(crate::MetalExecutor::new()?)
     }
 
     /// Active le runtime Metal avec un executor déjà initialisé.
@@ -2324,7 +2321,14 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Renvoie une erreur si la conversion single-copy d'un poids est invalide.
-    pub fn with_metal_executor(mut self, executor: crate::MetalExecutor) -> Result<Self> {
+    pub fn with_metal_executor(mut self, mut executor: crate::MetalExecutor) -> Result<Self> {
+        // L'executor appartient à ce seul décodeur : abaisser ici le plancher
+        // du GEMM NA u4 ne touche aucun autre modèle. Sinks appris et expert
+        // partagé sans gate signent flint ; Qwen et Gemma n'en ont aucun.
+        let flint = self.config.attention_sinks && self.config.ungated_shared_expert;
+        if flint && crate::runtime_flags::flint_small_nax_gemm_enabled() {
+            executor.enable_flint_small_nax_gemm();
+        }
         self.enable_single_copy_weights(&executor)?;
         self.runtime.metal = Some(Arc::new(executor));
         Ok(self)

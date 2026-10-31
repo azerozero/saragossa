@@ -369,22 +369,32 @@ pub(super) fn can_use_qmm_na_fused_tiled_u8(
     ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
+/// Plancher par défaut de `in_dim` et `out_dim` pour le GEMM NA u4 gs64.
+pub(super) const QMM_NA_U4_DEFAULT_MIN_DIM: usize = 2048;
+
+/// Plancher abaissé pour flint, validé par son oracle mlx et son greedy long.
+pub(super) const QMM_NA_U4_FLINT_MIN_DIM: usize = 512;
+
 /// Variante 4-bit gs64 du GEMM NA tuilé. Le chemin reste borné aux grandes
-/// projections denses : les petites projections shared-expert divergent en
-/// oracle greedy avec l'accumulation bf16 tensor-core et gardent le qmv f32.
+/// projections denses (`min_dim` = [`QMM_NA_U4_DEFAULT_MIN_DIM`]) : les petites
+/// projections shared-expert de Qwen divergent en oracle greedy avec
+/// l'accumulation bf16 tensor-core et gardent le qmv f32. Le plancher est porté
+/// par l'executor parce que flint partage ces formes avec Qwen : seule
+/// l'identité du modèle, validée par ses propres oracles, peut l'abaisser.
 pub(super) fn can_use_qmm_na_fused_tiled_u4_buffers(
     batch: usize,
     in_dim: usize,
     out_dim: usize,
     group_size: usize,
     bits: usize,
+    min_dim: usize,
 ) -> bool {
     qmm_na_fused_tiled_enabled()
         && qmm_na_fused_tiled_u4_enabled()
         && batch >= qmm_na_min_batch()
         && out_dim % 64 == 0
-        && out_dim >= 2048
-        && in_dim >= 2048
+        && out_dim >= min_dim
+        && in_dim >= min_dim
         && bits == 4
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
@@ -394,6 +404,7 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4(
     batch: usize,
     in_dim: usize,
     weight: &AffineQuantizedTensor,
+    min_dim: usize,
 ) -> bool {
     let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
         return false;
@@ -404,6 +415,7 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4(
         out_dim,
         weight.group_size(),
         weight.bits(),
+        min_dim,
     ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 

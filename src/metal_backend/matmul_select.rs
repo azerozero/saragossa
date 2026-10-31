@@ -24,6 +24,23 @@ pub(super) enum AffineMatmulKernel {
 }
 
 impl MetalExecutor {
+    /// Abaisse le plancher du GEMM NA u4 aux petites projections de flint.
+    /// Appelé à l'installation de l'executor sur un décodeur flint seulement :
+    /// Qwen et Gemma gardent le plancher 2048 et restent bit-identiques.
+    pub(crate) fn enable_flint_small_nax_gemm(&mut self) {
+        self.qmm_na_u4_min_dim = QMM_NA_U4_FLINT_MIN_DIM;
+    }
+
+    /// Plancher effectif du GEMM NA u4 (surcharge de test comprise).
+    #[inline]
+    pub(super) fn qmm_na_u4_min_dim(&self) -> usize {
+        #[cfg(test)]
+        if let Some(min_dim) = super::flags::qmm_na_u4_min_dim_test_override() {
+            return min_dim;
+        }
+        self.qmm_na_u4_min_dim
+    }
+
     #[inline]
     pub(super) fn select_resident_affine_matmul_kernel(
         &self,
@@ -46,7 +63,14 @@ impl MetalExecutor {
         } else if can_use_fast_affine_qmm8_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::Qmm8
         } else if self.qmm_na_fused_tiled_u4_available(group_size)
-            && can_use_qmm_na_fused_tiled_u4_buffers(batch, in_dim, out_dim, group_size, bits)
+            && can_use_qmm_na_fused_tiled_u4_buffers(
+                batch,
+                in_dim,
+                out_dim,
+                group_size,
+                bits,
+                self.qmm_na_u4_min_dim(),
+            )
         {
             AffineMatmulKernel::QmmNaFusedTiledU4
         } else if self.qmm_na_fused_tiled_u4_align64_available(group_size)
@@ -111,7 +135,7 @@ impl MetalExecutor {
         } else if can_use_fast_affine_qmm8(batch, in_dim, weight) {
             AffineMatmulKernel::Qmm8
         } else if self.qmm_na_fused_tiled_u4_available(weight.group_size())
-            && can_use_qmm_na_fused_tiled_u4(batch, in_dim, weight)
+            && can_use_qmm_na_fused_tiled_u4(batch, in_dim, weight, self.qmm_na_u4_min_dim())
         {
             AffineMatmulKernel::QmmNaFusedTiledU4
         } else if self.qmm_na_fused_tiled_u4_align64_available(weight.group_size())
