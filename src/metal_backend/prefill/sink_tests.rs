@@ -222,6 +222,7 @@ fn steel_executor() -> Result<Option<MetalExecutor>> {
         // Le NAX (opt-in) passerait devant le Steel bf16 : ces tests
         // mesurent le Steel et le F3 quel que soit l'environnement.
         executor.attention_prefill_nax_sink_d128 = None;
+        executor.attention_prefill_nax_sink_d128_window = None;
         assert!(
             executor.attention_prefill_steel_sink_d128_f32.is_some(),
             "pipeline Steel d128 avec sinks absent"
@@ -531,21 +532,24 @@ fn prefill_sink_attention_large_scores_match_f64() -> Result<()> {
     Ok(())
 }
 
-/// Pipeline NAX d128 avec sinks ; `None` sans accélérateur (MPP, macOS 26).
+/// Pipeline NAX d128 avec sinks, fenêtré si `window` ; `None` sans
+/// accélérateur (MPP, macOS 26).
 fn nax_sink_pipeline(
     executor: &MetalExecutor,
+    window: bool,
 ) -> Option<super::super::attention::NaxCausalAttention> {
     let nax = super::super::pipelines::compile_nax_sink_d128_attention(
         &executor.device,
         STEEL_ATTENTION_NAX_KERNELS,
         super::super::attention::NAX_SINK_ATTN_D128,
+        window,
     );
     // Le GEMM NAX compile dès que MPP est là (macOS 26 et accélérateur) :
     // l'attention NAX doit alors compiler aussi, sinon le test échoue au
     // lieu de passer en silence.
     assert!(
         nax.is_some() || executor.na_gemm_bf16.is_none(),
-        "MPP disponible mais le NAX d128 avec sinks ne compile pas"
+        "MPP disponible mais le NAX d128 avec sinks (fenêtre={window}) ne compile pas"
     );
     if nax.is_none() {
         eprintln!("NAX d128 avec sinks non supporté (MPP absent) : test sauté");
@@ -572,7 +576,7 @@ fn prefill_sink_nax_matches_steel_and_cpu() -> Result<()> {
     let Some(mut executor) = steel_executor()? else {
         return Ok(());
     };
-    let Some(nax) = nax_sink_pipeline(&executor) else {
+    let Some(nax) = nax_sink_pipeline(&executor, false) else {
         return Ok(());
     };
     let hard_sinks = (0..Q_HEADS)
@@ -629,6 +633,84 @@ fn prefill_sink_nax_matches_steel_and_cpu() -> Result<()> {
     Ok(())
 }
 
+/// NAX d128 fenêtré avec sinks (fenêtre flint de 513) à entrées bf16
+/// identiques contre l'oracle CPU et contre le naïf bf16
+/// (`attention_prefill_sink_bf16`, le chemin qu'il remplace). Un bloc de 1,
+/// 300, 512, 513, 514, 1100 et 4133 requêtes ; puis des morceaux derrière un
+/// préfixe comme le K/V borné de F6 : `q_off = 513` (après compaction, non
+/// aligné sur BK = 32), `q_off = 1100` ou `3833` (avant compaction), avec des
+/// queues non alignées sur BQ = 64. GQA 8 sur une tête KV en scores doux,
+/// puis ×10 avec des sinks ±8, puis GQA 2 sur quatre têtes KV avec des sinks
+/// ±30 (sink seul maître d'une tête sur deux).
+#[test]
+fn prefill_sink_nax_window_matches_naive_and_cpu() -> Result<()> {
+    const KV_TOTAL: usize = 4133;
+    let Some(mut executor) = steel_executor()? else {
+        return Ok(());
+    };
+    let Some(nax) = nax_sink_pipeline(&executor, true) else {
+        return Ok(());
+    };
+    let signed_sinks = |magnitude: f32| {
+        (0..Q_HEADS)
+            .map(|head| if head % 2 == 0 { magnitude } else { -magnitude })
+            .collect::<Vec<_>>()
+    };
+    let q_dim = Q_HEADS * HEAD_DIM;
+    let mut nax = Some(nax);
+    for (kv_heads, q_scale, sinks) in [
+        (KV_HEADS, 1.0_f32, sinks(Q_HEADS)),
+        (KV_HEADS, 10.0, signed_sinks(8.0)),
+        (4, 10.0, signed_sinks(30.0)),
+    ] {
+        let (q, keys, values) = inputs(KV_TOTAL, Q_HEADS, kv_heads);
+        let q = bf16_rounded(&q.iter().map(|value| value * q_scale).collect::<Vec<_>>());
+        let (keys, values) = (bf16_rounded(&keys), bf16_rounded(&values));
+        // (requêtes, clés) : `kv_rows > seq` place les requêtes en fin de buffer.
+        for (seq, kv_rows) in [
+            (1, 1),
+            (300, 300),
+            (512, 512),
+            (513, 513),
+            (514, 514),
+            (1100, 1100),
+            (KV_TOTAL, KV_TOTAL),
+            (1, 514),
+            (300, 813),
+            (1100, 1613),
+            (77, 1177),
+            (300, KV_TOTAL),
+        ] {
+            let label = format!("kv_heads={kv_heads} q×{q_scale} q={seq} kv={kv_rows}");
+            let kv_len = kv_rows * kv_heads * HEAD_DIM;
+            let q_off = kv_rows - seq;
+            let q = &q[q_off * q_dim..kv_rows * q_dim];
+            let (keys, values) = (&keys[..kv_len], &values[..kv_len]);
+            let spec = spec(seq, Q_HEADS, kv_heads, Some(WINDOW));
+            let rows = oracle_rows(seq);
+            let want = cpu_sink_attention(q, (keys, values), spec, &sinks, q_off, &rows);
+            let naive = gpu_attention(&executor, (q, keys, values), spec, Some(&sinks), true)?;
+            executor.attention_prefill_nax_sink_d128_window = nax.take();
+            let got = gpu_attention(&executor, (q, keys, values), spec, Some(&sinks), true);
+            nax = executor.attention_prefill_nax_sink_d128_window.take();
+            let got = got?;
+            let gap_cpu = row_gap(&got, &want, &rows, q_dim);
+            let gap_naive = row_gap(&got, &naive, &(0..seq).collect::<Vec<_>>(), q_dim);
+            println!("{label}: écart CPU {gap_cpu:.2e}, NAX vs naïf {gap_naive:.2e}");
+            assert!(
+                got.iter().all(|value| value.is_finite()),
+                "{label}: NaN/inf"
+            );
+            assert!(gap_cpu <= NAX_SINK_TOL, "{label}: écart CPU {gap_cpu}");
+            assert!(
+                gap_naive <= NAX_SINK_TOL,
+                "{label}: NAX vs naïf {gap_naive}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Microbench des couches pleines flint (32 têtes Q, 4 KV, d128, morceau de
 /// 4096 requêtes derrière 16k-64k clés, K/V bf16) : Steel d128 bf16 contre
 /// NAX, conversion de Q comprise, meilleur temps de 4 exécutions (GPU au repos).
@@ -638,7 +720,7 @@ fn nax_sink_d128_chunk_microbench() -> Result<()> {
     let Some(mut executor) = steel_executor()? else {
         return Ok(());
     };
-    let Some(nax) = nax_sink_pipeline(&executor) else {
+    let Some(nax) = nax_sink_pipeline(&executor, false) else {
         return Ok(());
     };
     const SEQ: usize = 4096;

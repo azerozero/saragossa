@@ -1741,6 +1741,96 @@ fn flint_int4_prefill_kv_bf16_store_drift() {
     );
 }
 
+/// NAX fenêtré avec sinks (35 couches glissantes) contre le naïf bf16 sur
+/// flint-int4 réel : prompt synthétique de `SARAGOSSA_FLINT_BF16_LEN` tokens
+/// (16 400 par défaut), K/V stocké en bf16 dans les deux exécutions (seul
+/// cas où le NAX fenêtré s'applique), logits aux frontières et milieux des
+/// morceaux, argmax et 16 tokens greedy. Le chemin pris est journalisé et
+/// vérifié (pipeline présent ou retiré) ; des logits bit à bit égaux
+/// signaleraient un NAX jamais exécuté.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure de dérive, pas un gate"]
+fn flint_int4_prefill_nax_window_drift() {
+    let Some(model_dir) = std::env::var_os("SARAGOSSA_FLINT_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("test flint NAX fenêtré sauté : définir SARAGOSSA_FLINT_MODEL_DIR");
+        return;
+    };
+    let len = std::env::var("SARAGOSSA_FLINT_BF16_LEN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16_400);
+    let assets = ModelAssets::load_local(&model_dir).expect("invariant: assets flint");
+    let prompt = synthetic_long_prompt(&assets, len);
+    let target = crate::runtime_flags::prefill_resident_chunk_tokens();
+    let chunk = len.div_ceil(len.div_ceil(target.max(1)));
+    let mut rows = (0..len)
+        .step_by(chunk)
+        .flat_map(|start| [start.saturating_sub(1), start, start + chunk / 2])
+        .chain(len.saturating_sub(4)..len)
+        .filter(|&row| row < len)
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows.dedup();
+    println!("{len} tokens : morceaux de {chunk}, lignes {rows:?}");
+    let run = |nax: bool| {
+        let mut executor = crate::MetalExecutor::new().expect("invariant: device Metal");
+        executor.set_prefill_kv_bf16_store_min_rows_for_test(Some(0));
+        executor.set_prefill_kv_bf16_store_sinks_for_test(true);
+        let present = executor.keep_prefill_attn_nax_window_for_test(nax);
+        println!("NAX fenêtré demandé={nax}, pipeline présent={present}");
+        assert_eq!(present, nax, "NAX fenêtré absent (MPP ? flag ?)");
+        let model = crate::load_causal_decoder_for_metal(&assets, &executor)
+            .expect("invariant: flint-int4 chargeable en Metal")
+            .with_metal_executor(executor)
+            .expect("invariant: runtime Metal attaché");
+        let started = std::time::Instant::now();
+        let hidden = model
+            .prefill_hidden_for_test(&prompt, Some(target))
+            .expect("invariant: prefill résident")
+            .expect("prefill résident Metal attendu pour flint");
+        println!(
+            "NAX fenêtré={nax}: prefill {len} tokens en {:.1?}",
+            started.elapsed()
+        );
+        let logits = model
+            .logits_of_hidden_rows_for_test(&hidden, &rows)
+            .expect("invariant: logits du prefill");
+        drop(hidden);
+        let tokens = model
+            .generate_greedy_timed_with_options(&prompt, 16, &crate::GenerationOptions::default())
+            .expect("invariant: génération résidente")
+            .tokens;
+        (logits, tokens)
+    };
+    let (naive_logits, naive_tokens) = run(false);
+    let (nax_logits, nax_tokens) = run(true);
+    let (mut max, mut mean, mut argmax_ok) = (0.0_f32, 0.0_f32, 0_usize);
+    for (row, (nax, naive)) in rows.iter().zip(nax_logits.iter().zip(&naive_logits)) {
+        let gap = compare_rows(&format!("ligne {row}"), nax, naive);
+        max = max.max(gap.max);
+        mean = mean.max(gap.mean);
+        argmax_ok += usize::from(gap.same_argmax);
+    }
+    println!(
+        "dérive NAX fenêtré vs naïf sur {} lignes : max {max:.4}, pire moyenne {mean:.5}, argmax {argmax_ok}/{}",
+        rows.len(),
+        rows.len()
+    );
+    println!("greedy naïf={naive_tokens:?} nax={nax_tokens:?}");
+    assert!(max > 0.0, "logits identiques : NAX fenêtré non exécuté ?");
+    assert_eq!(nax_tokens, naive_tokens, "greedy NAX fenêtré != naïf");
+    assert_eq!(argmax_ok, rows.len(), "argmax NAX fenêtré divergent");
+    assert!(
+        max < MAX_GAP_MLX_BF16,
+        "écart max {max} ≥ {MAX_GAP_MLX_BF16}"
+    );
+    assert!(
+        mean < MEAN_GAP_MLX_BF16,
+        "écart moyen {mean} ≥ {MEAN_GAP_MLX_BF16}"
+    );
+}
+
 // Écart propre de mlx bf16 contre mlx f32 sur l'oracle flint (cf. les seuils
 // f32 ci-dessus) : garde-fou large de la dérive d'un K/V de prefill stocké en
 // bf16, pas un budget transférable.

@@ -2578,6 +2578,9 @@ constant bool save_lse [[function_constant(303)]];
 // d'un même groupe KV partent côte à côte et relisent les mêmes tuiles K/V
 // pendant qu'elles sont en cache ; le calcul d'un threadgroup est inchangé.
 constant bool head_major [[function_constant(304)]];
+// saragossa : fenêtre glissante de `attention_nax` (couches glissantes flint),
+// longueur en `buffer(9)` : hors `AttnParams` pour garder le layout MLX.
+constant bool has_window [[function_constant(305)]];
 
 template <typename T>
 struct TransformScale {
@@ -2654,6 +2657,9 @@ template <
     // Sinks f32 quel que soit T : en bf16, le logit appris serait arrondi.
     const device float* sinks [[buffer(7), function_constant(has_sinks)]],
     device float* lse [[buffer(8), function_constant(save_lse)]],
+    // Clés gardées par la requête r (relative au buffer K/V) :
+    // max(0, r + 1 - W) <= c <= r, token courant compris (cf. le naïf).
+    const constant int* window [[buffer(9), function_constant(has_window)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -2767,8 +2773,24 @@ template <
   const short lim_rows_q = params->qL_rem - tm;
   const short lim_rows_k = params->kL_rem;
 
+  // saragossa : avec fenêtre, la tuile Q saute les blocs K entièrement sous
+  // la fenêtre de sa première requête, et masque la borne basse jusqu'au
+  // dernier bloc qui tombe sous celle de sa dernière requête. La boucle
+  // avance K/V de façon incrémentale : le départ les décale une fois.
+  int kb_start = 0;
+  int kb_max_window = -1;
+  if (has_window) {
+    const int W = *window;
+    const int r_first = int(tid.x) * BQ + params->qL_off;
+    kb_start = max(0, r_first + 1 - W) / BK;
+    const int r_last = r_first + BQ - 1;
+    kb_max_window = (r_last >= W) ? (r_last - W) / BK : -1;
+    K += kb_start * BK * params->K_strides[2];
+    V += kb_start * BK * params->V_strides[2];
+  }
+
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int kb = kb_start; kb < kb_lim; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
 
     // Do S = Q @ K.T
@@ -2875,6 +2897,36 @@ template <
               const auto c = base_col + ik * kU + jj + sn;
               const auto loc = ii * stile_t::kFragThrCols + jj;
               fg[loc] = (r < c) ? neg_inf : fg[loc];
+            }
+          }
+        }
+      }
+    }
+
+    // saragossa : borne basse de la fenêtre, indépendante du masque causal
+    // (bord haut) : c est masquée dès que c + W <= r.
+    if (has_window && kb <= kb_max_window) {
+      constexpr auto neg_inf = Limits<AccumType>::finite_min;
+
+      const int W = *window;
+      const int base_row = tid.x * BQ + params->qL_off + tm;
+      const int base_col = kb * BK;
+
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
+        STEEL_PRAGMA_UNROLL
+        for (short ik = 0; ik < TK; ik++) {
+          thread auto& fg = Stile.frag_at(iq, ik);
+
+          STEEL_PRAGMA_UNROLL
+          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+              const auto r =
+                  base_row + iq * kU + ii * stile_t::kFragRowsJump + sm;
+              const auto c = base_col + ik * kU + jj + sn;
+              const auto loc = ii * stile_t::kFragThrCols + jj;
+              fg[loc] = (c + W <= r) ? neg_inf : fg[loc];
             }
           }
         }

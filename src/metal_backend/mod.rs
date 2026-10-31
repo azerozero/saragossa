@@ -312,6 +312,9 @@ pub struct MetalExecutor {
     /// NAX d128 avec sinks (couches pleines flint, K/V bf16) ; `None` hors
     /// flag ou s'il ne compile pas, le Steel d128 bf16 prend alors le relais.
     attention_prefill_nax_sink_d128: Option<attention::NaxCausalAttention>,
+    /// NAX d128 avec sinks et fenêtre (couches glissantes flint, K/V bf16) ;
+    /// `None` hors flag ou s'il ne compile pas, le naïf bf16 prend le relais.
+    attention_prefill_nax_sink_d128_window: Option<attention::NaxCausalAttention>,
     /// Miroir bf16 du K/V pour le NAX par morceaux (lu du flag, forcé en test).
     prefill_kv_bf16_mirror: bool,
     /// Longueur minimale (lignes totales) d'un prefill par morceaux dont le
