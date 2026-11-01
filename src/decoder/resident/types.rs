@@ -2,7 +2,7 @@ use super::super::*;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 impl CausalDecoderConfig {
-    pub(super) fn resident_windowed_full_attn_layer_dims(
+    pub(in crate::decoder) fn resident_windowed_full_attn_layer_dims(
         &self,
         layer_index: usize,
         hidden: usize,

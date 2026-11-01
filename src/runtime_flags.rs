@@ -682,6 +682,18 @@ pub(super) fn lightbatch_qmm2_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LIGHTBATCH_QMM2", true))
 }
 
+/// Active le pas multi-flux dense du light-batch (N flux dans UN command
+/// buffer, projections batchées sur N lignes) pour les modèles denses hybrides
+/// éligibles (gate [`crate::decoder::CausalDecoder::supports_resident_multi_dense`]).
+/// **Défaut OFF** : les projections en lignes dérivent de ~1e-6 par rapport au
+/// qmv du solo (near-ties possibles) ; `SARAGOSSA_RUST_LIGHTBATCH_MULTI=1`
+/// l'active, sinon le time-slicing E2.1 reste servi.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(super) fn lightbatch_multi_dense_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LIGHTBATCH_MULTI", false))
+}
+
 /// Active le tail MoE duo du light-batch (E2.3) : router + shared expert
 /// batchés qmm2, topk/gathers routés par flux. **Défaut ON** quand les poids
 /// MoE sont qmm2-éligibles, kill-switch `SARAGOSSA_RUST_LIGHTBATCH_MOE2=0` →

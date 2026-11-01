@@ -52,6 +52,9 @@ pub fn run_lightbatch_acceptance(
     load_elapsed: Duration,
     warmup_elapsed: Duration,
 ) -> Result<()> {
+    if let Some(streams) = lightbatch_streams() {
+        return run_lightbatch_streams(decoder, prompt_a, prompt_b, streams, max_tokens, options);
+    }
     let solo_a = decoder.generate_greedy_timed_with_options(prompt_a, max_tokens, options)?;
     let solo_b = decoder.generate_greedy_timed_with_options(prompt_b, max_tokens, options)?;
     let batch_started = Instant::now();
@@ -120,6 +123,148 @@ pub fn run_lightbatch_acceptance(
     if !tokens_equal_a || !tokens_equal_b {
         return Err(InferError::Config(
             "oracle light-batch échoué: un flux du batch diverge de son solo".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Nombre de flux du harnais multi-flux (`SARAGOSSA_RUST_LIGHTBATCH_STREAMS=N`,
+/// N ≥ 1) ; absent ou invalide → harnais deux flux historique.
+fn lightbatch_streams() -> Option<usize> {
+    crate::runtime_flags::env_var("SARAGOSSA_RUST_LIGHTBATCH_STREAMS")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|streams| *streams >= 1)
+}
+
+/// Indice du premier token où `batch` quitte `solo` (`None` si identiques).
+fn first_divergence(batch: &[usize], solo: &[usize]) -> Option<usize> {
+    if batch == solo {
+        return None;
+    }
+    Some(
+        batch
+            .iter()
+            .zip(solo)
+            .position(|(left, right)| left != right)
+            .unwrap_or(batch.len().min(solo.len())),
+    )
+}
+
+/// Harnais multi-flux : le flux `i` décode `prompt_{i % 2}` privé de ses `i`
+/// premiers tokens (tous `prompt_a` avec `SARAGOSSA_RUST_LIGHTBATCH_SAME_PROMPT=1`).
+/// Chaque flux est d'abord décodé seul (référence prod), puis tous ensemble ;
+/// chaque pas partagé est chronométré une fois avec sa largeur active.
+///
+/// Gain = Σ temps decode solo / temps decode du batch. Échoue si le pas
+/// multi-flux dense n'a pas tourné (N ≥ 2) ou si des flux au prompt identique
+/// divergent entre eux ; les écarts au solo sont rapportés (near-ties possibles).
+fn run_lightbatch_streams(
+    decoder: &CausalDecoder,
+    prompt_a: &[usize],
+    prompt_b: &[usize],
+    streams: usize,
+    max_tokens: usize,
+    options: &GenerationOptions,
+) -> Result<()> {
+    let same_prompt = env_flag("SARAGOSSA_RUST_LIGHTBATCH_SAME_PROMPT", false);
+    let prompts = (0..streams)
+        .map(|stream| {
+            let (base, skip) = match (same_prompt, stream % 2) {
+                (true, _) => (prompt_a, 0),
+                (false, 0) => (prompt_a, stream),
+                (false, _) => (prompt_b, stream),
+            };
+            base.get(skip..)
+                .filter(|prompt| !prompt.is_empty())
+                .map(<[usize]>::to_vec)
+                .ok_or_else(|| {
+                    InferError::Dimension(format!(
+                        "flux {stream}: prompt de {} tokens trop court pour en retirer {skip}",
+                        base.len()
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut solos = Vec::with_capacity(streams);
+    for prompt in &prompts {
+        solos.push(decoder.generate_greedy_timed_with_options(prompt, max_tokens, options)?);
+    }
+    let budgets = vec![max_tokens; streams];
+    let (batch, profile) =
+        decoder.generate_greedy_lightbatch_profiled(&prompts, &budgets, options)?;
+
+    let batch_decode: Duration = profile.steps.iter().map(|(_, elapsed)| *elapsed).sum();
+    let solo_decode: Duration = solos.iter().map(|solo| solo.timings.decode).sum();
+    let batch_tokens: usize = batch
+        .iter()
+        .map(|output| output.timings.decode_tokens)
+        .sum();
+    let solo_tokens: usize = solos.iter().map(|solo| solo.timings.decode_tokens).sum();
+    let per_second = |tokens: usize, elapsed: Duration| {
+        let seconds = elapsed.as_secs_f64();
+        if seconds > 0.0 {
+            tokens as f64 / seconds
+        } else {
+            0.0
+        }
+    };
+    for (stream, (output, solo)) in batch.iter().zip(&solos).enumerate() {
+        eprintln!(
+            "lightbatch_streams flux={stream} prompt_tokens={} generated={} solo_generated={} \
+             premiere_divergence={} solo_decode_tok_s={:.3}",
+            prompts[stream].len(),
+            output.tokens.len(),
+            solo.tokens.len(),
+            first_divergence(&output.tokens, &solo.tokens)
+                .map_or_else(|| "aucune".to_string(), |index| index.to_string()),
+            per_second(solo.timings.decode_tokens, solo.timings.decode),
+        );
+    }
+    let mut widths = std::collections::BTreeMap::<usize, (usize, Duration)>::new();
+    for (width, elapsed) in &profile.steps {
+        let entry = widths.entry(*width).or_default();
+        entry.0 += 1;
+        entry.1 += *elapsed;
+    }
+    let widths = widths
+        .iter()
+        .map(|(width, (count, elapsed))| {
+            format!(
+                "N{width}:{count}x{:.2}ms",
+                elapsed.as_secs_f64() * 1000.0 / *count as f64
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let gain = if batch_decode.is_zero() {
+        0.0
+    } else {
+        solo_decode.as_secs_f64() / batch_decode.as_secs_f64()
+    };
+    let identical = batch
+        .iter()
+        .zip(&solos)
+        .filter(|(output, solo)| output.tokens == solo.tokens)
+        .count();
+    let cross_identical = batch.iter().all(|output| output.tokens == batch[0].tokens);
+    eprintln!(
+        "lightbatch_streams streams={streams} same_prompt={same_prompt} multi_steps={} \
+         pas={} largeurs=[{widths}] solo_agg_tok_s={:.3} batch_agg_tok_s={:.3} gain={gain:.3} \
+         identiques_au_solo={identical}/{streams} identiques_entre_flux={cross_identical}",
+        profile.multi_steps,
+        profile.steps.len(),
+        per_second(solo_tokens, solo_decode),
+        per_second(batch_tokens, batch_decode),
+    );
+    if streams >= 2 && profile.multi_steps == 0 {
+        return Err(InferError::Config(
+            "harnais multi-flux: le pas multi-flux dense n'a pas tourné (repli time-slicing)"
+                .to_string(),
+        ));
+    }
+    if same_prompt && !cross_identical {
+        return Err(InferError::Config(
+            "harnais multi-flux: des flux au prompt identique divergent entre eux".to_string(),
         ));
     }
     Ok(())
@@ -607,4 +752,16 @@ fn token_prefix(tokens: &[usize], limit: usize) -> String {
         out.push_str(",...");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_divergence;
+
+    #[test]
+    fn first_divergence_reports_mismatch_or_length_gap() {
+        assert_eq!(first_divergence(&[1, 2, 3], &[1, 2, 3]), None);
+        assert_eq!(first_divergence(&[1, 9, 3], &[1, 2, 3]), Some(1));
+        assert_eq!(first_divergence(&[1, 2], &[1, 2, 3]), Some(2));
+    }
 }

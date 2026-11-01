@@ -32,6 +32,73 @@ type LinearAttentionStateCaptures = (
     Vec<crate::decode_resident::ScratchLease>,
 );
 
+/// Sources `(buffer, offset octets)` d'UNE ligne du pas linear-attn : qkv (entrée
+/// de la conv), z (rms-gate), beta et gate (normes/gates). Les variantes concat,
+/// paires et z+beta+gate du solo, comme les lignes d'un pas multi-flux, ne
+/// diffèrent que par ces vues.
+pub(super) struct LinearAttnRowSources<'a> {
+    pub(super) qkv: (&'a BufferRef, u64),
+    pub(super) z: (&'a BufferRef, u64),
+    pub(super) beta: (&'a BufferRef, u64),
+    pub(super) gate: (&'a BufferRef, u64),
+}
+
+impl<'a> LinearAttnRowSources<'a> {
+    /// Vues d'une ligne de la projection concaténée `[qkv | z | beta | gate]`
+    /// commençant à l'élément `row_base`.
+    pub(super) fn concat(
+        buffer: &'a BufferRef,
+        row_base: usize,
+        conv_dim: usize,
+        value_dim: usize,
+        spec: LinearAttentionStepSpec,
+    ) -> Result<Self> {
+        let at = |elements: Option<usize>, label: &'static str| {
+            elements
+                .ok_or_else(|| InferError::Dimension(format!("{label} déborde")))
+                .and_then(|elements| byte_offset_f32(elements, label))
+        };
+        let z = row_base.checked_add(conv_dim);
+        let beta = z.and_then(|value| value.checked_add(value_dim));
+        let gate = beta.and_then(|value| value.checked_add(spec.num_value_heads));
+        Ok(Self {
+            qkv: (buffer, at(Some(row_base), "linear-attn qkv offset")?),
+            z: (buffer, at(z, "linear-attn z offset")?),
+            beta: (buffer, at(beta, "linear-attn beta offset")?),
+            gate: (buffer, at(gate, "linear-attn gate offset")?),
+        })
+    }
+}
+
+/// Poids par ligne du cœur linear-attn, communs aux variantes concat et dense.
+#[derive(Clone, Copy)]
+pub(super) struct LinearAttnCoreWeights<'a> {
+    conv_weight: &'a BufferRef,
+    a_log: &'a BufferRef,
+    dt_bias: &'a BufferRef,
+    norm_weight: &'a BufferRef,
+}
+
+impl<'a> LinearAttnCoreWeights<'a> {
+    pub(super) fn from_full(weights: &'a MetalLinearAttnResidentWeights) -> Self {
+        Self {
+            conv_weight: &weights.conv_weight,
+            a_log: &weights.a_log,
+            dt_bias: &weights.dt_bias,
+            norm_weight: &weights.norm_weight,
+        }
+    }
+
+    pub(super) fn from_dense(weights: &'a MetalLinearAttnResidentDenseWeights) -> Self {
+        Self {
+            conv_weight: &weights.conv_weight,
+            a_log: &weights.a_log,
+            dt_bias: &weights.dt_bias,
+            norm_weight: &weights.norm_weight,
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "wrappers d'encodage Metal: buffers, dimensions et offsets restent explicites"
@@ -1500,6 +1567,153 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Cœur d'UNE ligne du pas linear-attn sur l'état `state` : conv → normes et
+    /// gates → delta → rms-gate écrit à `gated`. `full_kernels` reprend le choix
+    /// de kernels du chemin concaténé (conv+normes fusionnées, delta `inv`), sinon
+    /// celui du chemin dense par paires. Le solo et le pas multi-flux passent par
+    /// ici : une ligne de flux exécute exactement les dispatches du solo.
+    pub(super) fn encode_linear_attn_row_core(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        sources: LinearAttnRowSources<'_>,
+        weights: LinearAttnCoreWeights<'_>,
+        state: &LinearAttentionMetalState,
+        spec: LinearAttentionStepSpec,
+        dims: LinearAttnResidentDims,
+        gated: (&BufferRef, u64),
+        full_kernels: bool,
+    ) -> Result<()> {
+        let LinearAttnResidentDims {
+            conv_dim,
+            value_dim,
+            key_dim,
+            ..
+        } = dims;
+        let conv_out_buffer = self.private_f32_buffer(conv_dim, "linear_attn_conv_out")?;
+        let q_norm_buffer = self.private_f32_buffer(key_dim, "linear_attn_q_norm")?;
+        let k_norm_buffer = self.private_f32_buffer(key_dim, "linear_attn_k_norm")?;
+        let beta_buffer = self.private_f32_buffer(spec.num_value_heads, "linear_attn_beta")?;
+        let decay_buffer = self.private_f32_buffer(spec.num_value_heads, "linear_attn_decay")?;
+        let y_buffer = self.private_f32_buffer(value_dim, "linear_attn_y")?;
+        let use_inv_delta = full_kernels
+            && linear_inv_delta_enabled()
+            && spec.key_head_dim == 128
+            && spec.value_head_dim == 128
+            && linear_delta_dk128_enabled();
+        if full_kernels
+            && linear_conv_norm_fused_enabled()
+            && !use_inv_delta
+            && spec.conv_kernel_dim == 4
+            && spec.key_head_dim == 128
+            && spec.value_head_dim == 128
+        {
+            self.encode_linear_attn_conv_norm_gates_k4_dk128_with_offsets(
+                encoder,
+                sources.qkv.0,
+                sources.qkv.1,
+                sources.beta.0,
+                sources.beta.1,
+                sources.gate.0,
+                sources.gate.1,
+                weights.conv_weight,
+                &state.conv,
+                weights.a_log,
+                weights.dt_bias,
+                &conv_out_buffer,
+                &q_norm_buffer,
+                &k_norm_buffer,
+                &beta_buffer,
+                &decay_buffer,
+                spec,
+            )?;
+        } else {
+            self.encode_linear_attn_conv_with_offset(
+                encoder,
+                sources.qkv.0,
+                sources.qkv.1,
+                weights.conv_weight,
+                &state.conv,
+                &conv_out_buffer,
+                conv_dim,
+                spec.conv_kernel_dim,
+            )?;
+            if use_inv_delta {
+                let q_inv_buffer =
+                    self.private_f32_buffer(spec.num_key_heads, "linear_attn_q_inv")?;
+                let k_inv_buffer =
+                    self.private_f32_buffer(spec.num_key_heads, "linear_attn_k_inv")?;
+                self.encode_linear_attn_norm_gates_inv_dk128_with_offsets(
+                    encoder,
+                    &conv_out_buffer,
+                    sources.beta.0,
+                    sources.beta.1,
+                    sources.gate.0,
+                    sources.gate.1,
+                    weights.a_log,
+                    weights.dt_bias,
+                    &q_inv_buffer,
+                    &k_inv_buffer,
+                    &beta_buffer,
+                    &decay_buffer,
+                    spec,
+                )?;
+                self.encode_linear_attn_gated_delta_inv_dk128(
+                    encoder,
+                    &conv_out_buffer,
+                    &q_inv_buffer,
+                    &k_inv_buffer,
+                    &beta_buffer,
+                    &decay_buffer,
+                    &state.ssm,
+                    state.ssm_bf16,
+                    &y_buffer,
+                    spec,
+                )?;
+            } else {
+                self.encode_linear_attn_norm_gates_with_offsets(
+                    encoder,
+                    &conv_out_buffer,
+                    sources.beta.0,
+                    sources.beta.1,
+                    sources.gate.0,
+                    sources.gate.1,
+                    weights.a_log,
+                    weights.dt_bias,
+                    &q_norm_buffer,
+                    &k_norm_buffer,
+                    &beta_buffer,
+                    &decay_buffer,
+                    spec,
+                )?;
+            }
+        }
+        if !use_inv_delta {
+            self.encode_linear_attn_gated_delta(
+                encoder,
+                &conv_out_buffer,
+                &q_norm_buffer,
+                &k_norm_buffer,
+                &beta_buffer,
+                &decay_buffer,
+                &state.ssm,
+                state.ssm_bf16,
+                &y_buffer,
+                spec,
+            )?;
+        }
+        self.encode_linear_attn_rms_gate_with_offsets(
+            encoder,
+            &y_buffer,
+            0,
+            sources.z.0,
+            sources.z.1,
+            weights.norm_weight,
+            gated.0,
+            gated.1,
+            spec,
+        )
+    }
+
     /// Variante résidente du pas linear-attn utilisant des buffers de poids déjà
     /// résolus au setup de la génération.
     #[expect(
@@ -1521,7 +1735,7 @@ impl MetalExecutor {
             in_dim,
             conv_dim,
             value_dim,
-            key_dim,
+            key_dim: _,
         } = dims;
         let in_proj_dim = conv_dim
             .checked_add(value_dim)
@@ -1531,17 +1745,7 @@ impl MetalExecutor {
                 InferError::Dimension("linear-attn in_proj concat déborde".to_string())
             })?;
         let in_proj_buffer = self.private_f32_buffer(in_proj_dim, "linear_attn_in_proj")?;
-        let conv_out_buffer = self.private_f32_buffer(conv_dim, "linear_attn_conv_out")?;
-        let q_norm_buffer = self.private_f32_buffer(key_dim, "linear_attn_q_norm")?;
-        let k_norm_buffer = self.private_f32_buffer(key_dim, "linear_attn_k_norm")?;
-        let beta_buffer = self.private_f32_buffer(spec.num_value_heads, "linear_attn_beta")?;
-        let decay_buffer = self.private_f32_buffer(spec.num_value_heads, "linear_attn_decay")?;
-        let y_buffer = self.private_f32_buffer(value_dim, "linear_attn_y")?;
         let gated_buffer = self.private_f32_buffer(value_dim, "linear_attn_gated")?;
-        let use_inv_delta = linear_inv_delta_enabled()
-            && spec.key_head_dim == 128
-            && spec.value_head_dim == 128
-            && linear_delta_dk128_enabled();
         let in_proj_fused = match input_norm {
             Some((norm_weight, eps)) => self
                 .encode_matmul_weight_buffers_rms_prologue(
@@ -1584,130 +1788,15 @@ impl MetalExecutor {
                 false,
             )?;
         }
-        let z_offset = byte_offset_f32(conv_dim, "linear-attn z offset")?;
-        let beta_offset = byte_offset_f32(
-            conv_dim.checked_add(value_dim).ok_or_else(|| {
-                InferError::Dimension("linear-attn beta offset déborde".to_string())
-            })?,
-            "linear-attn beta offset",
-        )?;
-        let gate_offset = byte_offset_f32(
-            conv_dim
-                .checked_add(value_dim)
-                .and_then(|value| value.checked_add(spec.num_value_heads))
-                .ok_or_else(|| {
-                    InferError::Dimension("linear-attn gate offset déborde".to_string())
-                })?,
-            "linear-attn gate offset",
-        )?;
-        if linear_conv_norm_fused_enabled()
-            && !use_inv_delta
-            && spec.conv_kernel_dim == 4
-            && spec.key_head_dim == 128
-            && spec.value_head_dim == 128
-        {
-            self.encode_linear_attn_conv_norm_gates_k4_dk128_with_offsets(
-                encoder,
-                &in_proj_buffer,
-                0,
-                &in_proj_buffer,
-                beta_offset,
-                &in_proj_buffer,
-                gate_offset,
-                &weights.conv_weight,
-                &state.conv,
-                &weights.a_log,
-                &weights.dt_bias,
-                &conv_out_buffer,
-                &q_norm_buffer,
-                &k_norm_buffer,
-                &beta_buffer,
-                &decay_buffer,
-                spec,
-            )?;
-        } else {
-            self.encode_linear_attn_conv_with_offset(
-                encoder,
-                &in_proj_buffer,
-                0,
-                &weights.conv_weight,
-                &state.conv,
-                &conv_out_buffer,
-                conv_dim,
-                spec.conv_kernel_dim,
-            )?;
-            if use_inv_delta {
-                let q_inv_buffer =
-                    self.private_f32_buffer(spec.num_key_heads, "linear_attn_q_inv")?;
-                let k_inv_buffer =
-                    self.private_f32_buffer(spec.num_key_heads, "linear_attn_k_inv")?;
-                self.encode_linear_attn_norm_gates_inv_dk128_with_offsets(
-                    encoder,
-                    &conv_out_buffer,
-                    &in_proj_buffer,
-                    beta_offset,
-                    &in_proj_buffer,
-                    gate_offset,
-                    &weights.a_log,
-                    &weights.dt_bias,
-                    &q_inv_buffer,
-                    &k_inv_buffer,
-                    &beta_buffer,
-                    &decay_buffer,
-                    spec,
-                )?;
-                self.encode_linear_attn_gated_delta_inv_dk128(
-                    encoder,
-                    &conv_out_buffer,
-                    &q_inv_buffer,
-                    &k_inv_buffer,
-                    &beta_buffer,
-                    &decay_buffer,
-                    &state.ssm,
-                    state.ssm_bf16,
-                    &y_buffer,
-                    spec,
-                )?;
-            } else {
-                self.encode_linear_attn_norm_gates_with_offsets(
-                    encoder,
-                    &conv_out_buffer,
-                    &in_proj_buffer,
-                    beta_offset,
-                    &in_proj_buffer,
-                    gate_offset,
-                    &weights.a_log,
-                    &weights.dt_bias,
-                    &q_norm_buffer,
-                    &k_norm_buffer,
-                    &beta_buffer,
-                    &decay_buffer,
-                    spec,
-                )?;
-            }
-        }
-        if !use_inv_delta {
-            self.encode_linear_attn_gated_delta(
-                encoder,
-                &conv_out_buffer,
-                &q_norm_buffer,
-                &k_norm_buffer,
-                &beta_buffer,
-                &decay_buffer,
-                &state.ssm,
-                state.ssm_bf16,
-                &y_buffer,
-                spec,
-            )?;
-        }
-        self.encode_linear_attn_rms_gate_with_offset(
+        self.encode_linear_attn_row_core(
             encoder,
-            &y_buffer,
-            &in_proj_buffer,
-            z_offset,
-            &weights.norm_weight,
-            &gated_buffer,
+            LinearAttnRowSources::concat(&in_proj_buffer, 0, conv_dim, value_dim, spec)?,
+            LinearAttnCoreWeights::from_full(weights),
+            state,
             spec,
+            dims,
+            (&gated_buffer, 0),
+            true,
         )?;
         self.encode_matmul_weight_buffers(
             encoder,
@@ -1756,19 +1845,13 @@ impl MetalExecutor {
             in_dim,
             conv_dim,
             value_dim,
-            key_dim,
+            key_dim: _,
         } = dims;
         enum PairOutput {
             Concat(Buffer),
             Split { first: Buffer, second: Buffer },
         }
 
-        let conv_out_buffer = self.private_f32_buffer(conv_dim, "linear_attn_conv_out")?;
-        let q_norm_buffer = self.private_f32_buffer(key_dim, "linear_attn_q_norm")?;
-        let k_norm_buffer = self.private_f32_buffer(key_dim, "linear_attn_k_norm")?;
-        let beta_buffer = self.private_f32_buffer(spec.num_value_heads, "linear_attn_beta")?;
-        let decay_buffer = self.private_f32_buffer(spec.num_value_heads, "linear_attn_decay")?;
-        let y_buffer = self.private_f32_buffer(value_dim, "linear_attn_y")?;
         let gated_buffer = self.private_f32_buffer(value_dim, "linear_attn_gated")?;
 
         let qkv_z_concat_len = conv_dim
@@ -1868,15 +1951,6 @@ impl MetalExecutor {
                     "linear-attn z+beta+gate attendu {z_beta_gate_concat_len}, reçu {z_beta_gate_dim}"
                 )));
             }
-            self.encode_linear_attn_conv(
-                encoder,
-                &qkv_buffer,
-                &weights.conv_weight,
-                &state.conv,
-                &conv_out_buffer,
-                conv_dim,
-                spec.conv_kernel_dim,
-            )?;
             let beta_offset = byte_offset_f32(value_dim, "linear-attn zbg beta offset")?;
             let gate_offset = byte_offset_f32(
                 value_dim.checked_add(spec.num_value_heads).ok_or_else(|| {
@@ -1884,41 +1958,20 @@ impl MetalExecutor {
                 })?,
                 "linear-attn zbg gate offset",
             )?;
-            self.encode_linear_attn_norm_gates_with_offsets(
+            self.encode_linear_attn_row_core(
                 encoder,
-                &conv_out_buffer,
-                &z_beta_gate_buffer,
-                beta_offset,
-                &z_beta_gate_buffer,
-                gate_offset,
-                &weights.a_log,
-                &weights.dt_bias,
-                &q_norm_buffer,
-                &k_norm_buffer,
-                &beta_buffer,
-                &decay_buffer,
+                LinearAttnRowSources {
+                    qkv: (&qkv_buffer, 0),
+                    z: (&z_beta_gate_buffer, 0),
+                    beta: (&z_beta_gate_buffer, beta_offset),
+                    gate: (&z_beta_gate_buffer, gate_offset),
+                },
+                LinearAttnCoreWeights::from_dense(weights),
+                state,
                 spec,
-            )?;
-            self.encode_linear_attn_gated_delta(
-                encoder,
-                &conv_out_buffer,
-                &q_norm_buffer,
-                &k_norm_buffer,
-                &beta_buffer,
-                &decay_buffer,
-                &state.ssm,
-                state.ssm_bf16,
-                &y_buffer,
-                spec,
-            )?;
-            self.encode_linear_attn_rms_gate_with_offset(
-                encoder,
-                &y_buffer,
-                &z_beta_gate_buffer,
-                0,
-                &weights.norm_weight,
-                &gated_buffer,
-                spec,
+                dims,
+                (&gated_buffer, 0),
+                false,
             )?;
             self.encode_matmul_weight_buffers(
                 encoder,
@@ -2030,94 +2083,38 @@ impl MetalExecutor {
             memory_barrier_buffers(encoder);
         }
 
-        match &qkv_z {
-            PairOutput::Concat(buffer) => self.encode_linear_attn_conv_with_offset(
-                encoder,
-                buffer,
-                0,
-                &weights.conv_weight,
-                &state.conv,
-                &conv_out_buffer,
-                conv_dim,
-                spec.conv_kernel_dim,
-            )?,
-            PairOutput::Split { first, .. } => self.encode_linear_attn_conv(
-                encoder,
-                first,
-                &weights.conv_weight,
-                &state.conv,
-                &conv_out_buffer,
-                conv_dim,
-                spec.conv_kernel_dim,
-            )?,
-        }
-        match &beta_gate {
-            PairOutput::Concat(buffer) => {
-                let gate_offset = byte_offset_f32(spec.num_value_heads, "linear-attn gate offset")?;
-                self.encode_linear_attn_norm_gates_with_offsets(
-                    encoder,
-                    &conv_out_buffer,
+        let (qkv, z) = match &qkv_z {
+            PairOutput::Concat(buffer) => (
+                (buffer, 0),
+                (buffer, byte_offset_f32(conv_dim, "linear-attn z offset")?),
+            ),
+            PairOutput::Split { first, second } => ((first, 0), (second, 0)),
+        };
+        let (beta, gate) = match &beta_gate {
+            PairOutput::Concat(buffer) => (
+                (buffer, 0),
+                (
                     buffer,
-                    0,
-                    buffer,
-                    gate_offset,
-                    &weights.a_log,
-                    &weights.dt_bias,
-                    &q_norm_buffer,
-                    &k_norm_buffer,
-                    &beta_buffer,
-                    &decay_buffer,
-                    spec,
-                )?;
-            }
-            PairOutput::Split { first, second } => self.encode_linear_attn_norm_gates(
-                encoder,
-                &conv_out_buffer,
-                first,
-                second,
-                &weights.a_log,
-                &weights.dt_bias,
-                &q_norm_buffer,
-                &k_norm_buffer,
-                &beta_buffer,
-                &decay_buffer,
-                spec,
-            )?,
-        }
-        self.encode_linear_attn_gated_delta(
+                    byte_offset_f32(spec.num_value_heads, "linear-attn gate offset")?,
+                ),
+            ),
+            PairOutput::Split { first, second } => ((first, 0), (second, 0)),
+        };
+        self.encode_linear_attn_row_core(
             encoder,
-            &conv_out_buffer,
-            &q_norm_buffer,
-            &k_norm_buffer,
-            &beta_buffer,
-            &decay_buffer,
-            &state.ssm,
-            state.ssm_bf16,
-            &y_buffer,
+            LinearAttnRowSources {
+                qkv: (qkv.0, qkv.1),
+                z: (z.0, z.1),
+                beta: (beta.0, beta.1),
+                gate: (gate.0, gate.1),
+            },
+            LinearAttnCoreWeights::from_dense(weights),
+            state,
             spec,
+            dims,
+            (&gated_buffer, 0),
+            false,
         )?;
-        match &qkv_z {
-            PairOutput::Concat(buffer) => {
-                let z_offset = byte_offset_f32(conv_dim, "linear-attn z offset")?;
-                self.encode_linear_attn_rms_gate_with_offset(
-                    encoder,
-                    &y_buffer,
-                    buffer,
-                    z_offset,
-                    &weights.norm_weight,
-                    &gated_buffer,
-                    spec,
-                )?;
-            }
-            PairOutput::Split { second, .. } => self.encode_linear_attn_rms_gate(
-                encoder,
-                &y_buffer,
-                second,
-                &weights.norm_weight,
-                &gated_buffer,
-                spec,
-            )?,
-        }
         self.encode_matmul_weight_buffers(
             encoder,
             &gated_buffer,

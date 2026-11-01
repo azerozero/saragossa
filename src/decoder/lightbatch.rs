@@ -138,6 +138,16 @@ fn report_expert_stats() {
     eprintln!("lightbatch expert_stats par couche: {per_layer}");
 }
 
+/// Profil d'un run light-batch : un échantillon par pas de decode encodé.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LightBatchProfile {
+    /// `(largeur active, durée)` de chaque pas : un pas partagé par N flux est
+    /// chronométré une seule fois avec sa largeur N.
+    pub(crate) steps: Vec<(usize, Duration)>,
+    /// Pas encodés par le chemin multi-flux dense (N ≥ 2 en un command buffer).
+    pub(crate) multi_steps: usize,
+}
+
 /// Progression d'UN flux du light-batch (bookkeeping du time-slicing).
 ///
 /// Reproduit EXACTEMENT la sémantique de la boucle solo
@@ -215,18 +225,66 @@ impl CausalDecoder {
         on_token: impl FnMut(usize, usize),
     ) -> Result<Vec<GenerationOutput>> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
+        let (stride, multi) = (
+            lightbatch_background_stride(),
+            lightbatch_multi_dense_enabled(),
+        );
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let (stride, multi) = (1, false);
+        let mut profile = LightBatchProfile::default();
+        self.lightbatch_generate(
+            prompts,
+            max_new_tokens,
+            options,
+            stride,
+            multi,
+            &mut profile,
+            on_token,
+        )
+    }
+
+    /// Light-batch greedy profilé (harnais de mesure) : tente toujours le pas
+    /// multi-flux dense et rend, avec les sorties, la durée et la largeur de
+    /// chaque pas encodé. Le stride du flux de fond est celui de la prod.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que [`Self::generate_greedy_lightbatch_streaming_with_options`].
+    pub(crate) fn generate_greedy_lightbatch_profiled(
+        &self,
+        prompts: &[Vec<usize>],
+        max_new_tokens: &[usize],
+        options: &GenerationOptions,
+    ) -> Result<(Vec<GenerationOutput>, LightBatchProfile)> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         let stride = lightbatch_background_stride();
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let stride = 1;
-        self.lightbatch_generate(prompts, max_new_tokens, options, stride, on_token)
+        let mut profile = LightBatchProfile::default();
+        let outputs = self.lightbatch_generate(
+            prompts,
+            max_new_tokens,
+            options,
+            stride,
+            true,
+            &mut profile,
+            |_, _| {},
+        )?;
+        Ok((outputs, profile))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "boucle light-batch : prompts, budgets, options, politique et profil"
+    )]
     fn lightbatch_generate(
         &self,
         prompts: &[Vec<usize>],
         max_new_tokens: &[usize],
         options: &GenerationOptions,
         stride: u64,
+        multi: bool,
+        profile: &mut LightBatchProfile,
         mut on_token: impl FnMut(usize, usize),
     ) -> Result<Vec<GenerationOutput>> {
         if prompts.is_empty() {
@@ -268,11 +326,29 @@ impl CausalDecoder {
             && streams.iter().all(|stream| {
                 stream.use_resident_full && self.supports_resident_duo(&stream.cache)
             });
+        // Pas multi-flux dense : N ≥ 2 flux denses hybrides en greedy, chacun
+        // sur son arène résidente complète. Sinon time-slicing E2.1.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let multi_ok = multi
+            && !duo_ok
+            && streams.len() >= 2
+            && options.temperature <= f32::EPSILON
+            && streams.iter().all(|stream| {
+                stream.use_resident_full && self.supports_resident_multi_dense(&stream.cache)
+            });
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = multi;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if trace_lightbatch_enabled() {
             eprintln!(
                 "lightbatch: mode={} (flux={})",
-                if duo_ok { "duo-qmm2" } else { "time-slicing" },
+                if duo_ok {
+                    "duo-qmm2"
+                } else if multi_ok {
+                    "multi-dense"
+                } else {
+                    "time-slicing"
+                },
                 streams.len()
             );
         }
@@ -288,12 +364,35 @@ impl CausalDecoder {
             // décodent qu'un tour sur `stride` — sauf si le principal est fini.
             let background_turn = stride <= 1 || round % stride == 0 || streams[0].done;
             #[cfg(all(target_os = "macos", feature = "metal"))]
+            if multi_ok {
+                // Ligne compacte = rang parmi les flux vivants de ce pas ;
+                // l'identité du flux reste `stream.index` (callback, sorties).
+                let mut live = Vec::with_capacity(streams.len());
+                for (row, stream) in streams.iter_mut().enumerate() {
+                    if stream.index > 0 && !background_turn {
+                        continue;
+                    }
+                    if self.resolve_lightbatch_push(stream, options, &mut on_token) {
+                        live.push(row);
+                    }
+                }
+                match live.as_slice() {
+                    [] if streams.iter().all(|stream| stream.done) => break,
+                    [] => {}
+                    [single] => {
+                        self.decode_lightbatch_step(&mut streams[*single], options, profile)?;
+                    }
+                    _ => self.decode_lightbatch_multi_step(&mut streams, &live, profile)?,
+                }
+                continue;
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
             if duo_ok {
                 if !background_turn {
                     let will_decode =
                         self.resolve_lightbatch_push(&mut streams[0], options, &mut on_token);
                     if will_decode {
-                        self.decode_lightbatch_step(&mut streams[0], options)?;
+                        self.decode_lightbatch_step(&mut streams[0], options, profile)?;
                     }
                     continue;
                 }
@@ -326,6 +425,7 @@ impl CausalDecoder {
                         samples,
                     )?;
                     let elapsed = decode_started.elapsed();
+                    profile.steps.push((2, elapsed));
                     for (stream, token) in [first, second].into_iter().zip(tokens) {
                         stream.token = token;
                         stream.decode += elapsed;
@@ -337,7 +437,7 @@ impl CausalDecoder {
                 // Queue de batch : au plus un flux décode encore → pas solo.
                 for (stream, decode) in streams.iter_mut().zip(will_decode) {
                     if decode {
-                        advanced |= self.decode_lightbatch_step(stream, options)?;
+                        advanced |= self.decode_lightbatch_step(stream, options, profile)?;
                     }
                 }
                 if !advanced && streams.iter().all(|stream| stream.done) {
@@ -349,7 +449,8 @@ impl CausalDecoder {
                 if stream.index > 0 && !background_turn {
                     continue;
                 }
-                advanced |= self.advance_lightbatch_stream(stream, options, &mut on_token)?;
+                advanced |=
+                    self.advance_lightbatch_stream(stream, options, profile, &mut on_token)?;
             }
             if !advanced && streams.iter().all(|stream| stream.done) {
                 break;
@@ -437,12 +538,13 @@ impl CausalDecoder {
         &self,
         stream: &mut LightBatchStream,
         options: &GenerationOptions,
+        profile: &mut LightBatchProfile,
         on_token: &mut impl FnMut(usize, usize),
     ) -> Result<bool> {
         if !self.resolve_lightbatch_push(stream, options, on_token) {
             return Ok(false);
         }
-        self.decode_lightbatch_step(stream, options)
+        self.decode_lightbatch_step(stream, options, profile)
     }
 
     /// Résout le bookkeeping du tour pour UN flux (stop-check + push +
@@ -477,13 +579,48 @@ impl CausalDecoder {
         &self,
         stream: &mut LightBatchStream,
         options: &GenerationOptions,
+        profile: &mut LightBatchProfile,
     ) -> Result<bool> {
         let decode_started = Instant::now();
         stream.token = self.decode_lightbatch_token(stream, options)?;
-        stream.decode += decode_started.elapsed();
+        let elapsed = decode_started.elapsed();
+        profile.steps.push((1, elapsed));
+        stream.decode += elapsed;
         stream.decode_tokens += 1;
         stream.step += 1;
         Ok(true)
+    }
+
+    /// Décode un token pour chacun des flux `live` (indices dans `streams`, au
+    /// moins 2) en UN pas multi-flux dense, chronométré une fois pour tous.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn decode_lightbatch_multi_step(
+        &self,
+        streams: &mut [LightBatchStream],
+        live: &[usize],
+        profile: &mut LightBatchProfile,
+    ) -> Result<()> {
+        let decode_started = Instant::now();
+        let mut batch: Vec<&mut LightBatchStream> = streams
+            .iter_mut()
+            .enumerate()
+            .filter(|(row, _)| live.contains(row))
+            .map(|(_, stream)| stream)
+            .collect();
+        let tokens: Vec<usize> = batch.iter().map(|stream| stream.token).collect();
+        let mut caches: Vec<&mut CausalDecoderCache> =
+            batch.iter_mut().map(|stream| &mut stream.cache).collect();
+        let next = self.decode_tokens_resident_multi(&mut caches, &tokens)?;
+        let elapsed = decode_started.elapsed();
+        profile.steps.push((batch.len(), elapsed));
+        profile.multi_steps += 1;
+        for (stream, token) in batch.into_iter().zip(next) {
+            stream.token = token;
+            stream.decode += elapsed;
+            stream.decode_tokens += 1;
+            stream.step += 1;
+        }
+        Ok(())
     }
 
     /// Décode UN token du flux par le chemin solo correspondant (résident 1c ou
@@ -650,11 +787,27 @@ mod tests {
         let prompts = [vec![0_usize, 1], vec![1_usize, 0, 1]];
         let maxes = [16_usize, 16];
         let baseline = model
-            .lightbatch_generate(&prompts, &maxes, &options, 1, |_, _| {})
+            .lightbatch_generate(
+                &prompts,
+                &maxes,
+                &options,
+                1,
+                false,
+                &mut LightBatchProfile::default(),
+                |_, _| {},
+            )
             .expect("invariant: stride 1 valide");
         for stride in [2_u64, 3] {
             let strided = model
-                .lightbatch_generate(&prompts, &maxes, &options, stride, |_, _| {})
+                .lightbatch_generate(
+                    &prompts,
+                    &maxes,
+                    &options,
+                    stride,
+                    false,
+                    &mut LightBatchProfile::default(),
+                    |_, _| {},
+                )
                 .expect("invariant: stride > 1 valide");
             assert_eq!(strided[0].tokens, baseline[0].tokens, "stride={stride}");
             assert_eq!(strided[1].tokens, baseline[1].tokens, "stride={stride}");

@@ -826,6 +826,27 @@ partout : DFlash code 4k +1,8 %, prose 4k +0,1 %, code 32k +2,1 % (médianes de
 decode) ; MTP −1,0 / −0,7 / +0,1 % (la plupart de ses vérifications n'ont qu'une
 capture, hors journal). Reste opt-in : gain sous le seuil de 2 % hors DFlash code.
 
+### Decode multi-flux dense (2 nov. 2026, opt-in)
+
+`SARAGOSSA_RUST_LIGHTBATCH_MULTI=1` : le light-batch décode N séquences du dense
+hybride (Qwen3.8-27B) dans un command buffer par pas ; normes, projections, tail
+dense et lm_head batchés sur N lignes, RoPE/KV/attention et conv/SSM par flux
+(namespaces de scratch par slot). Harnais `SARAGOSSA_RUST_LIGHTBATCH_ACCEPTANCE=1`
++ `SARAGOSSA_RUST_LIGHTBATCH_STREAMS=N`, 4k, 200 tokens :
+
+| N | ms/pas | agrégé tok/s | gain vs solo |
+|---|---|---|---|
+| 1 | 32,0 | 31,2 | ×0,99 |
+| 2 | 43,2 | 46,3 | ×1,47 |
+| 4 | 72,4 | 55,3 | ×1,78 |
+| 8 | 80,9 | 98,9 | ×3,20 |
+
+Tokens identiques au solo pour chaque flux (N = 2, 4, 8, défaut et
+`SARAGOSSA_RUST_QMM_SKINNY=0`), transitions 5 → 1 à fins non contiguës conformes.
+N = 3-4 tombe sur le qmv répliqué (qmm2 à 2 lignes, skinny dès 5) :
+`SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH=3` donne 66 → 64 ms à N = 4 ; un kernel qmm4
+reste à écrire. Serve n'utilise pas encore ce chemin (mono-thread).
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.
