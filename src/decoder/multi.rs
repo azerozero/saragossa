@@ -39,7 +39,9 @@ impl CausalDecoder {
                 return false;
             }
             if self.config.is_resident_full_attention_layer(index) {
-                matches!(&layer.attention, AttentionBlock::Full(_))
+                // `v_proj` absent (k_eq_v) : le solo prend la disposition `[q|k|v]`
+                // sans porte, alors que le pas multi suppose `[q+gate|k|v]`.
+                matches!(&layer.attention, AttentionBlock::Full(attention) if attention.v_proj.is_some())
                     && self.config.layer_sliding_window(index).is_none()
                     && matches!(
                         arena.layers.get(index),
@@ -416,9 +418,12 @@ mod tests {
                     .tokens;
                 let divergence = first_divergence(&output.tokens, &solo);
                 eprintln!("multi N={streams} flux={stream} première_divergence={divergence:?}");
+                // Aucune divergence observée (défaut et QMM_SKINNY=0) : l'oracle exige
+                // l'identité ; une dérive de kernel future devra être justifiée par
+                // un quasi ex aequo mesuré, pas absorbée par une tolérance d'indice.
                 assert!(
-                    divergence.is_none_or(|index| index >= 16),
-                    "N={streams} flux {stream}: divergence précoce {divergence:?}"
+                    divergence.is_none(),
+                    "N={streams} flux {stream}: divergence {divergence:?}"
                 );
             }
         }
