@@ -266,7 +266,7 @@ pub(super) fn compile_gated_delta_nax(
     compile_nax_function(device, source, GATED_DELTA_NAX_HK16_HV48, &[(200, false)])
 }
 
-fn compile_nax_function(
+pub(super) fn compile_nax_function(
     device: &Device,
     source: &str,
     name: &str,

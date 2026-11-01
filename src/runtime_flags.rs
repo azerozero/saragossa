@@ -867,6 +867,41 @@ pub(crate) fn prefill_attn_nax_window_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX_WINDOW", true))
 }
 
+/// Attention full en lignes de la vérification (MTP, lookup, DFlash) sur les
+/// accélérateurs neuronaux (`SARAGOSSA_RUST_VERIFY_ROWS_NAX=1`, **défaut
+/// OFF**) : le préfixe passe par le NAX du prefill en split-K (Q packé en
+/// bf16, une tuile par tête KV), la diagonale et la fusion par un kernel
+/// scalaire. Périmètre : d128/d256, KV bf16 dense, sans fenêtre ni sinks,
+/// longueur ≥ seuil du 2-passes, au moins 2 lignes (à 1 ligne le 2-passes,
+/// limité par la bande passante, reste plus rapide). Hors périmètre, ou si
+/// le NAX ne compile pas, repli sur le 2-passes en lignes. Attention seule
+/// (bench `bench_rows_attention_long_context`, 16 couches, M5 Max) à 32k :
+/// 2 lignes 7,5 → 6,7 ms, 3 lignes 10,0 → 6,8, 8 lignes 24,6 → 7,4 ; à 64k,
+/// 8 lignes 48,1 → 12,8 ms.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn verify_rows_nax_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_ROWS_NAX", false))
+}
+
+/// Nombre visé de blocs split-K du préfixe NAX en lignes
+/// (`SARAGOSSA_RUST_VERIFY_ROWS_NAX_BLOCKS`, défaut 128) : assez de
+/// threadgroups pour remplir le GPU, sans que les partiels f32 pèsent autant
+/// que le K/V relu (25 Mo contre 128 Mo de K/V par couche à 32k, 8 lignes).
+/// Mesuré le 2026-11-01 (M5 Max, 24/4 têtes d256, 16 couches, 8 lignes) :
+/// 32 → 8,45 ms, 64 → 7,62, 128 → 7,43, 256 → 8,59 à 32k ; 128 aussi le
+/// meilleur à 64k (12,8 ms).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn verify_rows_nax_blocks() -> usize {
+    static BLOCKS: OnceLock<usize> = OnceLock::new();
+    *BLOCKS.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_VERIFY_ROWS_NAX_BLOCKS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|blocks| *blocks > 0)
+            .unwrap_or(128)
+    })
+}
+
 /// Ordre de la grille du NAX d256 : `SARAGOSSA_RUST_PREFILL_ATTN_NAX_GRID` =
 /// `head` (défaut, `(H, NQ)`, la tête la plus rapide : les têtes Q d'un groupe
 /// KV partent côte à côte et partagent les tuiles K/V en cache) ou `seq`

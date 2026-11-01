@@ -88,24 +88,24 @@ pub(super) struct NaxCausalAttention {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct SteelAttnParams {
-    b: i32,
-    h: i32,
-    d: i32,
-    q_l: i32,
-    k_l: i32,
-    gqa_factor: i32,
-    scale: f32,
-    n_q: i32,
-    n_k: i32,
-    n_q_aligned: i32,
-    n_k_aligned: i32,
-    q_l_rem: i32,
-    k_l_rem: i32,
-    q_l_off: i32,
-    q_strides: [i64; 3],
-    k_strides: [i64; 3],
-    v_strides: [i64; 3],
-    o_strides: [i64; 3],
+    pub(super) b: i32,
+    pub(super) h: i32,
+    pub(super) d: i32,
+    pub(super) q_l: i32,
+    pub(super) k_l: i32,
+    pub(super) gqa_factor: i32,
+    pub(super) scale: f32,
+    pub(super) n_q: i32,
+    pub(super) n_k: i32,
+    pub(super) n_q_aligned: i32,
+    pub(super) n_k_aligned: i32,
+    pub(super) q_l_rem: i32,
+    pub(super) k_l_rem: i32,
+    pub(super) q_l_off: i32,
+    pub(super) q_strides: [i64; 3],
+    pub(super) k_strides: [i64; 3],
+    pub(super) v_strides: [i64; 3],
+    pub(super) o_strides: [i64; 3],
 }
 
 struct TailMoeSharedScratch {
@@ -1800,12 +1800,12 @@ impl MetalExecutor {
     }
 }
 
-fn checked_i32(value: usize, label: &'static str) -> Result<i32> {
+pub(super) fn checked_i32(value: usize, label: &'static str) -> Result<i32> {
     i32::try_from(value)
         .map_err(|_| InferError::Dimension(format!("{label}={value} depasse la capacite i32")))
 }
 
-fn checked_i64(value: usize) -> Result<i64> {
+pub(super) fn checked_i64(value: usize) -> Result<i64> {
     i64::try_from(value)
         .map_err(|_| InferError::Dimension(format!("{value} depasse la capacite i64")))
 }
