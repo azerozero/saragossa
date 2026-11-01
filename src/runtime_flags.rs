@@ -1439,6 +1439,16 @@ pub(crate) fn dflash_windowed_rows() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS", true))
 }
 
+/// Diagnostic hors chemin prod : `SARAGOSSA_RUST_DFLASH_TREE_TRACE=<chemin>` écrit en
+/// JSONL, à chaque tour DFlash 2 résident, les candidats et le treillis des scores du
+/// sélecteur, puis la séquence générée ; sert à estimer hors ligne une vérification
+/// en arbre. Absent (défaut) : aucune trace, aucun calcul supplémentaire.
+pub(crate) fn dflash_tree_trace_path() -> Option<std::path::PathBuf> {
+    crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_TREE_TRACE")
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 pub(super) fn prefix_cache_capacity() -> usize {
     static CAPACITY: OnceLock<usize> = OnceLock::new();
     *CAPACITY.get_or_init(|| {

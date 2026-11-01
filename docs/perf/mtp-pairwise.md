@@ -785,6 +785,33 @@ La récurrence gated delta du prefill linéaire utilise le noyau
 Textes greedy AR identiques à 16k et 32k ; à 8k, divergence au 1 775e
 caractère sur 1 783.
 
+### Vérification en arbre DFlash 2 (1er nov. 2026, estimée, écartée)
+
+Trace `SARAGOSSA_RUST_DFLASH_TREE_TRACE` : à chaque tour, les top-16 candidats par
+ligne et le treillis des scores du sélecteur (`DFlashSelector::transition_scores`).
+Arbres best-first sur la somme des log-softmax conditionnels du sélecteur, budget
+B nœuds hors ancre, vérité = trajectoire greedy ; contrôle chaîne = acceptance
+observée exacte. Prompts code/prose 4k/32k, 400 tokens, 104-133 tours chacun ;
+chaîne de production à 8 drafts (9 lignes).
+
+| Cas | Chaîne (tok/tour) | B = 8 | B = 15 | B = 24 | Oracle top-16 |
+|---|---|---|---|---|---|
+| code 4k | 3,83 | +11 % | +22 % | +30 % | +74 % |
+| prose 4k | 2,96 | +14 % | +26 % | +31 % | +87 % |
+| code 32k | 3,51 | +11 % | +20 % | +28 % | +73 % |
+| prose 32k | 3,36 | +9 % | +21 % | +27 % | +79 % |
+
+Coût de la vérification résidente (`verify_rows_cost_bench_real_model`, médiane de
+8, ms) : 9 lignes 62,2 avec captures linéaires / 59,3 sans à 4k (63,9 / 60,6 à 32k),
+13 lignes 64,3 (65,7), 16 lignes 67,3 (68,4), 17 lignes 97 (103-113), 25 lignes 105
+(114-122), 33 lignes 134. La 17e ligne ouvre une seconde tuile skinny (groupes de 16).
+Au meilleur point (B = 15, 16 lignes), le budget restant pour les surcoûts propres à
+l'arbre (masque d'ancêtres, scan gated-delta en arbre, compaction KV) est de −1 à
++2 ms par tour pour +15 % de tok/s. Verdict : écartée. Les états gated-delta par
+nœud (151 Mo chacun) ne sont pas le verrou : une transformée WY en arbre (TreeWY,
+arXiv 2608.20961) ne garde que les pseudo-valeurs et reconstruit l'état accepté.
+Le plafond vient du coût des lignes et du gain d'acceptance borné.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

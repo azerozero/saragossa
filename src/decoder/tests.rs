@@ -3562,3 +3562,82 @@ fn qwen_kv_nax_x3_shape_targets_dense_qwen_27b_only() {
     assert_eq!(qwen_kv_nax_x3_shape(&qwen, &[kv_27b, kv_8b]), None);
     assert_eq!(qwen_kv_nax_x3_shape(&qwen, &[]), None);
 }
+
+/// Coût de la vérification résidente en fonction du nombre de lignes, au contexte
+/// `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CTX` (défaut 4096) : substitut de coût pour un
+/// arbre DFlash de B nœuds (B + 1 lignes). Lignes > 9 sans captures linéaires (le
+/// scan séquentiel en a 8 au plus ; un arbre n'en utiliserait pas) ; 9 lignes
+/// mesurées avec et sans, pour isoler leur part. Médiane de 8 répétitions après 2
+/// d'échauffement, rollback par troncature entre deux répétitions.
+#[test]
+#[ignore = "modèle réel + draft DFlash requis, bench"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn verify_rows_cost_bench_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none() {
+        eprintln!("skip bench lignes: SARAGOSSA_RUST_DFLASH_DRAFT_DIR absent");
+        return Ok(());
+    }
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let layer_ids = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config("drafter non chargé".to_string()))?
+        .info
+        .target_layer_ids
+        .clone();
+    let context = crate::runtime_flags::env_var("SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CTX")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(4096);
+    // Tokens synthétiques : le coût ne dépend pas du contenu.
+    let prompt: Vec<usize> = (0..context).map(|i| 1000 + (i * 7919) % 50_000).collect();
+    let (mut cache, _, _, _) =
+        model.prefill_cache_state_with_layer_capture_cached(&prompt, &layer_ids, usize::MAX)?;
+    let kv_bf16 = CausalDecoder::resident_kv_bf16(false, cache.position);
+    assert!(model.setup_resident_full_decode(&mut cache, 64, 0, kv_bf16)?);
+    let base = cache.position;
+    for (rows, capture) in [
+        (9, true),
+        (9, false),
+        (13, false),
+        (16, false),
+        (17, false),
+        (25, false),
+        (33, false),
+    ] {
+        let tokens: Vec<usize> = (0..rows).map(|i| 2000 + i * 31).collect();
+        let mut times = Vec::new();
+        for rep in 0..10 {
+            let started = std::time::Instant::now();
+            model
+                .next_final_states_resident_verify(
+                    &mut cache,
+                    &tokens,
+                    crate::decoder::ResidentVerifyHead::Argmax,
+                    capture,
+                    Some(&layer_ids),
+                )?
+                .ok_or_else(|| InferError::Config("vérification indisponible".to_string()))?;
+            if rep >= 2 {
+                times.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            cache.position = base;
+            for layer in &mut cache.layers {
+                if let Some(full) = layer.full.as_mut() {
+                    full.truncate(base)?;
+                }
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "verify_rows_bench ctx={context} kv_bf16={kv_bf16} rows={rows} captures={capture} median_ms={:.2} min_ms={:.2}",
+            times[times.len() / 2],
+            times[0]
+        );
+    }
+    Ok(())
+}

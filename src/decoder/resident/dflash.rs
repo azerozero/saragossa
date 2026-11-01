@@ -233,6 +233,18 @@ impl CausalDecoder {
             .max(1);
         let mut segments = [std::time::Duration::ZERO; 4];
         let mut tours = 0usize;
+        let mut tree_trace = match crate::runtime_flags::dflash_tree_trace_path() {
+            Some(path) if draft.selector.is_some() => Some((
+                std::io::BufWriter::new(std::fs::File::create(&path).map_err(|source| {
+                    InferError::Io {
+                        path: path.clone(),
+                        source,
+                    }
+                })?),
+                path,
+            )),
+            _ => None,
+        };
 
         while generated.len() < max_new_tokens {
             let primary = pending;
@@ -253,7 +265,7 @@ impl CausalDecoder {
 
             tours += 1;
             let mut segment_started = Instant::now();
-            let drafts = self.dflash_resident_drafts(
+            let (drafts, lattice) = self.dflash_resident_drafts(
                 &mut cache,
                 metal,
                 &mut drafter,
@@ -261,7 +273,13 @@ impl CausalDecoder {
                 draft,
                 primary,
                 draft_limit,
+                tree_trace.is_some(),
             )?;
+            if let (Some((writer, path)), Some(mut lattice)) = (tree_trace.as_mut(), lattice) {
+                lattice["anchor_index"] = (generated.len() - 1).into();
+                lattice["drafts"] = drafts.clone().into();
+                write_trace_line(writer, path, &lattice)?;
+            }
             segments[0] += segment_started.elapsed();
             segment_started = Instant::now();
             // Bloc de vérification = ancre + tous les drafts : la dernière ligne
@@ -374,6 +392,14 @@ impl CausalDecoder {
                 break;
             }
         }
+        if let Some((mut writer, path)) = tree_trace {
+            write_trace_line(
+                &mut writer,
+                &path,
+                &serde_json::json!({ "prompt_len": prompt.len(), "generated": generated }),
+            )?;
+            std::io::Write::flush(&mut writer).map_err(|source| InferError::Io { path, source })?;
+        }
         if profile && tours > 0 {
             let per_tour = |d: std::time::Duration| d.as_secs_f64() * 1e3 / tours as f64;
             eprintln!(
@@ -394,7 +420,8 @@ impl CausalDecoder {
     }
 
     /// Un tour du drafter : embeddings ancre + masques, bloc résident, top-k et
-    /// projection, parcours du sélecteur sur CPU. Renvoie `draft_limit` tokens.
+    /// projection, parcours du sélecteur sur CPU. Renvoie `draft_limit` tokens et,
+    /// si `lattice` (diagnostic d'arbre), les candidats et le treillis des scores.
     #[expect(
         clippy::too_many_arguments,
         reason = "cache résident, exécuteur, drafter, buffers persistants et draft"
@@ -408,7 +435,8 @@ impl CausalDecoder {
         draft: &DFlashDraft,
         primary: usize,
         draft_limit: usize,
-    ) -> Result<Vec<usize>> {
+        lattice: bool,
+    ) -> Result<(Vec<usize>, Option<serde_json::Value>)> {
         let block = buffers.block;
         let mut noise_tokens = Vec::with_capacity(block);
         noise_tokens.push(primary);
@@ -462,6 +490,7 @@ impl CausalDecoder {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut trace = None;
         let drafts = match (draft.selector.as_ref(), buffers.projected.as_ref()) {
             (Some(selector), Some(projected)) => {
                 let values = read_f32_buffer(buffers.value.buffer(), count)?;
@@ -478,12 +507,22 @@ impl CausalDecoder {
                     })
                     .collect::<Vec<_>>();
                 let projection = read_f32_buffer(projected.buffer(), block * buffers.rank)?;
-                selector.select_projected(&projection[buffers.rank..], &candidates, primary)?
+                let projection = &projection[buffers.rank..];
+                let drafts = selector.select_projected(projection, &candidates, primary)?;
+                if lattice {
+                    let scores = selector.transition_scores(projection, &candidates, primary)?;
+                    let tokens: Vec<Vec<usize>> = candidates
+                        .iter()
+                        .map(|row| row.iter().map(|&(token, _)| token).collect())
+                        .collect();
+                    trace = Some(serde_json::json!({ "candidates": tokens, "scores": scores }));
+                }
+                drafts
             }
             // DFlash 1 : argmax par position (top-1).
             _ => tokens.iter().step_by(buffers.top_k).copied().collect(),
         };
-        Ok(drafts.into_iter().take(draft_limit).collect())
+        Ok((drafts.into_iter().take(draft_limit).collect(), trace))
     }
 
     /// Projette les lignes `start..end` de `hidden` (`[rows, context_cols]`) dans
@@ -543,4 +582,19 @@ impl CausalDecoder {
         }
         Ok(())
     }
+}
+
+/// Une ligne JSONL de la trace d'arbre (`SARAGOSSA_RUST_DFLASH_TREE_TRACE`).
+fn write_trace_line(
+    writer: &mut impl std::io::Write,
+    path: &std::path::Path,
+    value: &serde_json::Value,
+) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value)
+        .map_err(std::io::Error::from)
+        .and_then(|()| writer.write_all(b"\n"))
+        .map_err(|source| InferError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
 }
