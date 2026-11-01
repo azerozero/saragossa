@@ -543,6 +543,13 @@ impl MtpD1Kernels {
         pre: &LinearAttentionMetalState,
     ) -> Result<()> {
         for capture in [row0, pre] {
+            // Une capture en journal ne contient pas l'état de sa ligne : seule
+            // `restore_linear_attn_captures` sait la relire.
+            if capture.ssm_journal {
+                return Err(InferError::Config(
+                    "rollback MTP linear-attn: capture en mode journal".to_string(),
+                ));
+            }
             if capture.conv_len != state.conv_len
                 || capture.ssm_len != state.ssm_len
                 || capture.ssm_bf16 != state.ssm_bf16
@@ -877,6 +884,7 @@ mod tests {
             value_head_dim: SSM_LEN,
             key_head_dim: 1,
             ssm_bf16: true,
+            ssm_journal: false,
         }
     }
 

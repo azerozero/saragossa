@@ -1156,6 +1156,8 @@ impl CausalDecoder {
             ));
         }
         let row = accepted_len - 1;
+        // NOTE: les captures passent entières : en mode journal, l'état de la ligne
+        // `row` est rejoué depuis la capture 0, pas lu dans la capture `row`.
         cache.position = captures
             .base_position
             .checked_add(accepted_len)
@@ -1168,17 +1170,15 @@ impl CausalDecoder {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(());
         };
-        let pairs = cache
+        let layers = cache
             .layers
             .iter()
             .zip(captures.linear.iter())
             .filter_map(|(layer, captures)| {
-                let current = layer.linear.metal_state()?;
-                let capture = captures.as_ref()?.get(row)?;
-                Some((current, capture))
+                Some((layer.linear.metal_state()?, captures.as_deref()?))
             })
             .collect::<Vec<_>>();
-        metal.restore_linear_attn_states(&pairs)
+        metal.restore_linear_attn_captures(&layers, row)
     }
 
     fn restore_mtp_snapshot_replay(

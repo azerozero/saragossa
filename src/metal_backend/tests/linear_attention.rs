@@ -508,6 +508,7 @@ fn linear_attn_gated_delta_seq_capture_dk128_matches_step_loop_states() -> Resul
         &seq_y,
         steps,
         &capture_refs,
+        false,
         spec,
     )?;
     encoder.end_encoding();
@@ -528,6 +529,68 @@ fn linear_attn_gated_delta_seq_capture_dk128_matches_step_loop_states() -> Resul
         assert!(
             actual.iter().zip(expected).any(|(a, e)| a == e) && actual != state_seed,
             "capture {index} non écrite"
+        );
+    }
+
+    // Mode journal : même scan, état d'entrée + journal au lieu des captures ; le
+    // replay de chaque ligne doit redonner la capture au bit près, et y et l'état
+    // final rester identiques au bit près au mode captures.
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let journal_ssm = executor.upload_f32_buffer(&state_seed, "delta_journal_ssm")?;
+    let journal_y = executor.uncached_f32_buffer(steps * value_dim, "delta_journal_y")?;
+    let initial = executor.uncached_f32_buffer(state_len, "delta_journal_initial")?;
+    let journal = executor.uncached_f32_buffer(state_len, "delta_journal_log")?;
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_linear_attn_gated_delta_seq_captures_dk128(
+        encoder,
+        &conv_out_buffer,
+        &q_norm_buffer,
+        &k_norm_buffer,
+        &beta_buffer,
+        &decay_buffer,
+        &journal_ssm,
+        &journal_y,
+        steps,
+        &[initial.as_ref(), journal.as_ref()],
+        true,
+        spec,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    assert_eq!(
+        bits(&read_f32_buffer(&journal_y, steps * value_dim)?),
+        bits(&read_f32_buffer(&seq_y, steps * value_dim)?)
+    );
+    assert_eq!(
+        bits(&read_f32_buffer(&journal_ssm, state_len)?),
+        bits(&read_f32_buffer(&seq_ssm, state_len)?)
+    );
+    assert_eq!(bits(&read_f32_buffer(&initial, state_len)?), bits(&state_seed));
+    let mut expected_states: Vec<Vec<f32>> = capture_buffers
+        .iter()
+        .map(|capture| read_f32_buffer(capture, state_len))
+        .collect::<Result<_>>()?;
+    expected_states.push(read_f32_buffer(&seq_ssm, state_len)?);
+    for (row, expected) in expected_states.iter().enumerate() {
+        let restored = executor.uncached_f32_buffer(state_len, "delta_journal_restored")?;
+        let command_buffer = executor.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        executor.encode_linear_attn_gated_delta_replay_dk128(
+            encoder,
+            &initial,
+            &journal,
+            &restored,
+            spec.num_value_heads,
+            spec.value_head_dim,
+            row + 1,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        assert_eq!(
+            bits(&read_f32_buffer(&restored, state_len)?),
+            bits(expected),
+            "replay ligne {row}"
         );
     }
     Ok(())

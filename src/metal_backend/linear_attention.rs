@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// Lignes réservées dans le journal SSM (`LINEAR_ATTN_JOURNAL_ROWS` de
+/// `kernels.metal`) : 8 captures plus la ligne finale du scan.
+const LINEAR_ATTN_JOURNAL_ROWS: usize = 9;
+
+/// Une série de `rows` captures passe en mode journal quand le scan fusionné f32
+/// l'écrira (même éligibilité que le chemin en lignes) et que le journal tient dans
+/// le `ssm` de la capture 1. Décidé une fois à l'allocation et mémorisé dans
+/// `ssm_journal` : l'encodage et la restauration lisent ce marqueur.
+fn linear_capture_journal(state: &LinearAttentionMetalState, rows: usize) -> bool {
+    let journal_len = state
+        .num_value_heads
+        .checked_mul(state.value_head_dim + state.key_head_dim + 1)
+        .and_then(|per_row| per_row.checked_mul(LINEAR_ATTN_JOURNAL_ROWS));
+    linear_capture_journal_enabled()
+        && !state.ssm_bf16
+        && state.conv_kernel_dim == 4
+        && state.key_head_dim == 128
+        && state.value_head_dim == 128
+        && linear_delta_dk128_enabled()
+        && linear_rows_batched_enabled()
+        && linear_rows_seq_delta_enabled()
+        && (2..=MetalExecutor::LINEAR_ATTN_SEQ_MAX_CAPTURES).contains(&rows)
+        && journal_len.is_some_and(|len| len <= state.ssm_len)
+}
+
 type LinearAttentionStateCaptures = (
     Vec<Option<Vec<LinearAttentionMetalState>>>,
     Vec<crate::decode_resident::ScratchLease>,
@@ -60,8 +85,9 @@ impl MetalExecutor {
                 captures.push(None);
                 continue;
             };
+            let journal = linear_capture_journal(state, rows);
             let mut rows_out = Vec::with_capacity(rows);
-            for _ in 0..rows {
+            for row in 0..rows {
                 let conv =
                     scratch.lease(state.conv_len, crate::decode_resident::GpuElement::F32)?;
                 let ssm_element = if state.ssm_bf16 {
@@ -81,6 +107,7 @@ impl MetalExecutor {
                     value_head_dim: state.value_head_dim,
                     key_head_dim: state.key_head_dim,
                     ssm_bf16: state.ssm_bf16,
+                    ssm_journal: journal && row == 0,
                 });
                 leases.push(conv);
                 leases.push(ssm);
@@ -2929,13 +2956,22 @@ impl MetalExecutor {
             let fused_seq = !state.ssm_bf16
                 && capture_rows <= Self::LINEAR_ATTN_SEQ_MAX_CAPTURES
                 && linear_rows_seq_delta_enabled();
+            // Mode journal (décidé à l'allocation) : capture 0 = état d'entrée, capture 1
+            // = journal ; seul le scan fusionné sait l'écrire, sur au plus
+            // `LINEAR_ATTN_JOURNAL_ROWS` lignes.
+            let journal = captures
+                .and_then(|c| c.first())
+                .is_some_and(|first| first.ssm_journal);
+            if journal && (!fused_seq || capture_rows < 2 || rows > LINEAR_ATTN_JOURNAL_ROWS) {
+                return Err(InferError::Config(format!(
+                    "captures linear-attn en journal hors du scan fusionné ({capture_rows} captures, {rows} lignes)"
+                )));
+            }
             if fused_seq {
                 let ssm_captures: Vec<&BufferRef> = captures
                     .map(|c| {
-                        c[..capture_rows]
-                            .iter()
-                            .map(|cap| cap.ssm.as_ref())
-                            .collect()
+                        let used = if journal { 2 } else { capture_rows };
+                        c[..used].iter().map(|cap| cap.ssm.as_ref()).collect()
                     })
                     .unwrap_or_default();
                 self.encode_linear_attn_gated_delta_seq_captures_dk128(
@@ -2949,6 +2985,7 @@ impl MetalExecutor {
                     &y_rows,
                     rows,
                     &ssm_captures,
+                    journal,
                     spec,
                 )?;
             }
@@ -3213,6 +3250,7 @@ impl MetalExecutor {
             value_head_dim: spec.value_head_dim,
             key_head_dim: spec.key_head_dim,
             ssm_bf16,
+            ssm_journal: false,
         });
         Ok(())
     }
@@ -3255,6 +3293,7 @@ impl MetalExecutor {
             value_head_dim: state.value_head_dim,
             key_head_dim: state.key_head_dim,
             ssm_bf16: state.ssm_bf16,
+            ssm_journal: false,
         })
     }
 
@@ -3291,6 +3330,7 @@ impl MetalExecutor {
                 value_head_dim: state.value_head_dim,
                 key_head_dim: state.key_head_dim,
                 ssm_bf16: state.ssm_bf16,
+                ssm_journal: false,
             }));
         }
         blit.end_encoding();
@@ -3392,6 +3432,80 @@ impl MetalExecutor {
         blit.end_encoding();
         commit_and_wait(command_buffer)?;
         Ok(())
+    }
+
+    /// Restaure chaque état linéaire à sa capture `row` (état après la ligne `row` de
+    /// la vérification) : copie de la capture, ou replay du journal pour une série en
+    /// mode journal (`ssm_journal`), en un command buffer.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `row` sort des captures, si les formes divergent ou si
+    /// l'encodage échoue.
+    pub(crate) fn restore_linear_attn_captures(
+        &self,
+        layers: &[(&LinearAttentionMetalState, &[LinearAttentionMetalState])],
+        row: usize,
+    ) -> Result<()> {
+        let mut copies = Vec::with_capacity(layers.len());
+        let mut replays = Vec::new();
+        for (state, captures) in layers {
+            let capture = captures.get(row).ok_or_else(|| {
+                InferError::Dimension(format!(
+                    "restore linear-attn: capture {row} absente ({} captures)",
+                    captures.len()
+                ))
+            })?;
+            if state.conv_len != capture.conv_len
+                || state.ssm_len != capture.ssm_len
+                || state.ssm_bf16 != capture.ssm_bf16
+            {
+                return Err(InferError::Shape(
+                    "restore linear-attn: capture et état de formes différentes".to_string(),
+                ));
+            }
+            let journal = captures.first().is_some_and(|first| first.ssm_journal);
+            if journal {
+                if captures.len() < 2 || state.ssm_len != captures[0].ssm_len {
+                    return Err(InferError::Shape(
+                        "restore linear-attn: journal incomplet".to_string(),
+                    ));
+                }
+                replays.push((*state, &captures[0], &captures[1]));
+            }
+            copies.push((*state, capture, !journal));
+        }
+        let command_buffer = self.queue.new_command_buffer();
+        if !replays.is_empty() {
+            let encoder = command_buffer.new_compute_command_encoder();
+            for (state, initial, journal) in &replays {
+                self.encode_linear_attn_gated_delta_replay_dk128(
+                    encoder,
+                    &initial.ssm,
+                    &journal.ssm,
+                    &state.ssm,
+                    state.num_value_heads,
+                    state.value_head_dim,
+                    row + 1,
+                )?;
+            }
+            encoder.end_encoding();
+        }
+        let blit = command_buffer.new_blit_command_encoder();
+        for (state, capture, copy_ssm) in copies {
+            blit.copy_from_buffer(
+                &capture.conv,
+                0,
+                &state.conv,
+                0,
+                byte_len::<f32>(state.conv_len)?,
+            );
+            if copy_ssm {
+                blit.copy_from_buffer(&capture.ssm, 0, &state.ssm, 0, linear_ssm_byte_len(state)?);
+            }
+        }
+        blit.end_encoding();
+        commit_and_wait(command_buffer)
     }
 
     pub(crate) fn restore_linear_attn_states(

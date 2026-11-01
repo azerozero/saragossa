@@ -3293,6 +3293,9 @@ kernel void linear_attn_gated_delta_seq_dk128_tg4_f32(
     ssm_state[idx3] = state3;
 }
 
+// Lignes réservées dans le journal du scan (8 captures + la ligne finale).
+constant constexpr uint LINEAR_ATTN_JOURNAL_ROWS = 9u;
+
 // Variante du kernel précédent qui écrit aussi l'état SSM après chaque pas `t <
 // capture_count` dans `capture_t` (vérification en lignes : états intermédiaires
 // pour le rollback), au lieu d'un dispatch delta par ligne suivi d'une copie
@@ -3316,6 +3319,7 @@ kernel void linear_attn_gated_delta_seq_capture_dk128_tg4_f32(
     device float* capture_5 [[buffer(15)]],
     device float* capture_6 [[buffer(16)]],
     device float* capture_7 [[buffer(17)]],
+    constant uint& journal [[buffer(18)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
@@ -3352,6 +3356,20 @@ kernel void linear_attn_gated_delta_seq_capture_dk128_tg4_f32(
     float state1 = ssm_state[idx1];
     float state2 = ssm_state[idx2];
     float state3 = ssm_state[idx3];
+    // Mode journal : état d'entrée dans `capture_0`, puis delta/k/decay de chaque pas
+    // dans `capture_1` ; `linear_attn_gated_delta_replay_dk128_tg4_f32` reconstruit
+    // l'état d'un pas au rollback (2 écritures d'état par couche au lieu de 8). k est
+    // recopié par tête de valeur : le replay n'a pas besoin du facteur GQA. Disposition
+    // à pas fixe (LINEAR_ATTN_JOURNAL_ROWS lignes) : le replay ne dépend pas du nombre de pas du scan.
+    const uint journal_keys = LINEAR_ATTN_JOURNAL_ROWS * value_dim;
+    const uint journal_decay = journal_keys + LINEAR_ATTN_JOURNAL_ROWS * value_heads * 128u;
+    const uint journal_key_base = value_head * 128u + lane;
+    if (journal != 0u) {
+        capture_0[idx0] = state0;
+        capture_0[idx1] = state1;
+        capture_0[idx2] = state2;
+        capture_0[idx3] = state3;
+    }
 
     for (uint t = 0u; t < steps; ++t) {
         const uint key_offset = t * key_dim;
@@ -3397,7 +3415,21 @@ kernel void linear_attn_gated_delta_seq_capture_dk128_tg4_f32(
         if (lane == 0u) {
             y[value_offset + value_index] = out;
         }
-        if (t < capture_count) {
+        if (journal != 0u) {
+            if (lane == 0u) {
+                capture_1[value_offset + value_index] = delta;
+                if (value_col == 0u) {
+                    capture_1[journal_decay + gate_offset + value_head] = d;
+                }
+            }
+            if (value_col == 0u) {
+                const uint key_slot = journal_keys + t * value_heads * 128u + journal_key_base;
+                capture_1[key_slot] = k0;
+                capture_1[key_slot + 32u] = k1;
+                capture_1[key_slot + 64u] = k2;
+                capture_1[key_slot + 96u] = k3;
+            }
+        } else if (t < capture_count) {
             device float* capture = capture_0;
             switch (t) {
                 case 1u: capture = capture_1; break;
@@ -3416,6 +3448,62 @@ kernel void linear_attn_gated_delta_seq_capture_dk128_tg4_f32(
         }
     }
 
+    ssm_state[idx0] = state0;
+    ssm_state[idx1] = state1;
+    ssm_state[idx2] = state2;
+    ssm_state[idx3] = state3;
+}
+
+// Rollback du mode journal : repart de l'état d'entrée (`initial`) et rejoue
+// `S *= d ; S += delta·k` sur `steps` pas avec le journal du kernel précédent. Même
+// arithmétique, même ordre et mêmes valeurs que le scan : état bit-identique à la
+// capture du pas `steps - 1`.
+kernel void linear_attn_gated_delta_replay_dk128_tg4_f32(
+    device const float* initial [[buffer(0)]],
+    device const float* journal [[buffer(1)]],
+    device float* ssm_state [[buffer(2)]],
+    constant uint3& dims [[buffer(3)]],
+    constant uint& steps [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]
+) {
+    const uint value_heads = dims.x;
+    const uint value_head_dim = dims.y;
+    const uint key_head_dim = dims.z;
+    const uint lane = tid.x;
+    const uint value_col = gid.y;
+    const uint value_head = gid.z;
+    if (value_head >= value_heads || value_col >= value_head_dim || lane >= 32u || key_head_dim != 128u) {
+        return;
+    }
+    const uint value_dim = value_heads * value_head_dim;
+    const uint value_index = value_head * value_head_dim + value_col;
+    const uint state_base = value_index * 128u;
+    const uint journal_keys = LINEAR_ATTN_JOURNAL_ROWS * value_dim;
+    const uint journal_decay = journal_keys + LINEAR_ATTN_JOURNAL_ROWS * value_heads * 128u;
+    const uint idx0 = state_base + lane;
+    const uint idx1 = idx0 + 32u;
+    const uint idx2 = idx0 + 64u;
+    const uint idx3 = idx0 + 96u;
+    const uint key0 = value_head * 128u + lane;
+
+    float state0 = initial[idx0];
+    float state1 = initial[idx1];
+    float state2 = initial[idx2];
+    float state3 = initial[idx3];
+    for (uint t = 0u; t < steps; ++t) {
+        const float d = journal[journal_decay + t * value_heads + value_head];
+        const float delta = journal[t * value_dim + value_index];
+        const uint key_offset = journal_keys + t * value_heads * 128u;
+        state0 *= d;
+        state1 *= d;
+        state2 *= d;
+        state3 *= d;
+        state0 += delta * journal[key_offset + key0];
+        state1 += delta * journal[key_offset + key0 + 32u];
+        state2 += delta * journal[key_offset + key0 + 64u];
+        state3 += delta * journal[key_offset + key0 + 96u];
+    }
     ssm_state[idx0] = state0;
     ssm_state[idx1] = state1;
     ssm_state[idx2] = state2;

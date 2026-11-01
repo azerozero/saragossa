@@ -1978,16 +1978,14 @@ impl CausalDecoder {
                 }
             }
             if let Some(linear_captures) = linear_captures.as_ref() {
-                let pairs = layers
+                let captured = layers
                     .iter()
                     .zip(linear_captures.0.iter())
                     .filter_map(|(layer, captures)| {
-                        let current = layer.linear.metal_state()?;
-                        let capture = captures.as_ref()?.first()?;
-                        Some((current, capture))
+                        Some((layer.linear.metal_state()?, captures.as_deref()?))
                     })
                     .collect::<Vec<_>>();
-                metal.restore_linear_attn_states(&pairs)?;
+                metal.restore_linear_attn_captures(&captured, 0)?;
             }
             if let Some(arena) = resident.as_mut() {
                 if let Some(mtp) = arena.mtp.as_mut() {
@@ -2690,16 +2688,14 @@ impl CausalDecoder {
                 let capture_row = committed_rows.checked_sub(1).ok_or_else(|| {
                     InferError::Dimension("rollback MTP D2 sans position".to_string())
                 })?;
-                let pairs = layers
+                let captured = layers
                     .iter()
                     .zip(linear_captures.0.iter())
                     .filter_map(|(layer, captures)| {
-                        let current = layer.linear.metal_state()?;
-                        let capture = captures.as_ref()?.get(capture_row)?;
-                        Some((current, capture))
+                        Some((layer.linear.metal_state()?, captures.as_deref()?))
                     })
                     .collect::<Vec<_>>();
-                metal.restore_linear_attn_states(&pairs)?;
+                metal.restore_linear_attn_captures(&captured, capture_row)?;
             }
         }
         if let Some(arena) = resident.as_mut() {
