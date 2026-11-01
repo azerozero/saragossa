@@ -814,6 +814,18 @@ nœud (151 Mo chacun) ne sont pas le verrou : une transformée WY en arbre (Tree
 arXiv 2608.20961) ne garde que les pseudo-valeurs et reconstruit l'état accepté.
 Le plafond vient du coût des lignes et du gain d'acceptance borné.
 
+### Captures SSM en journal de pseudo-valeurs (1er nov. 2026, opt-in)
+
+`SARAGOSSA_RUST_LINEAR_CAPTURE_JOURNAL=1` : le scan fusionné de la vérification en
+lignes écrit l'état d'entrée et un journal delta/k/decay (forme chaîne de ReplaySSM
+et TreeWY) au lieu de 8 états complets par couche ; le rollback rejoue l'état
+accepté, bit-identique aux captures (test `..._seq_capture_dk128_matches_step_loop_states`).
+Vérification 9 lignes à 4k : 62,6 → 59,8 ms (le coût des captures disparaît).
+Pairwise flag 0/1, même binaire, ABBA, 3 paires, 400 tokens greedy, textes identiques
+partout : DFlash code 4k +1,8 %, prose 4k +0,1 %, code 32k +2,1 % (médianes de
+decode) ; MTP −1,0 / −0,7 / +0,1 % (la plupart de ses vérifications n'ont qu'une
+capture, hors journal). Reste opt-in : gain sous le seuil de 2 % hors DFlash code.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.
