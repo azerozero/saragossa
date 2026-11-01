@@ -69,11 +69,12 @@ impl DecodeResidentState {
 
         // Norm d'entrée en miroir du solo (rms_simd si le solo fusionne le
         // prologue 4-bit, rms_norm_rows sinon — DWQ 8-bit) → qkv qmm2.
-        executor.encode_rms_norm_duo_matching_solo(
+        executor.encode_rms_norm_rows_matching_solo(
             encoder,
             layer_in,
             weights.input_norm,
             normed2.tensor().buffer(),
+            2,
             hidden,
             dims.eps,
             qkv_proj,

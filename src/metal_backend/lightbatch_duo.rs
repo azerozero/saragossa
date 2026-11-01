@@ -156,19 +156,20 @@ impl MetalExecutor {
         }
     }
 
-    /// Encode la norm d'entrée duo en MIROIR du chemin solo : `rms_norm_simd`
-    /// si le solo fusionne le prologue rms avec `weight`, sinon
-    /// `rms_norm_rows` (rows=2, même kernel que le solo dé-fusionné).
+    /// Encode la norm d'entrée de `rows` flux en MIROIR du chemin solo :
+    /// `rms_norm_simd` si le solo fusionne le prologue rms avec `weight`, sinon
+    /// `rms_norm_rows` (même kernel que le solo dé-fusionné, ligne par ligne).
     #[expect(
         clippy::too_many_arguments,
         reason = "wrapper d'encodage : buffers + dims + poids pilote du choix"
     )]
-    pub(crate) fn encode_rms_norm_duo_matching_solo(
+    pub(crate) fn encode_rms_norm_rows_matching_solo(
         &self,
         encoder: &ComputeCommandEncoderRef,
         input_buffer: &BufferRef,
         weight_buffer: &BufferRef,
         output_buffer: &BufferRef,
+        rows: usize,
         dim: usize,
         eps: f32,
         proj_weight: &MetalLinearWeightBuffers,
@@ -198,7 +199,7 @@ impl MetalExecutor {
                 input_buffer,
                 weight_buffer,
                 output_buffer,
-                2,
+                rows,
                 dim,
                 eps,
             );
@@ -209,7 +210,7 @@ impl MetalExecutor {
                 input_buffer,
                 weight_buffer,
                 output_buffer,
-                2,
+                rows,
                 dim,
                 eps,
             )
@@ -219,7 +220,7 @@ impl MetalExecutor {
                 input_buffer,
                 weight_buffer,
                 output_buffer,
-                2,
+                rows,
                 dim,
                 eps,
             )
@@ -279,11 +280,12 @@ impl MetalExecutor {
         let gated2 = self.private_f32_buffer(2 * value_dim, "lightbatch_la_gated2")?;
 
         let (norm_weight, eps) = input_norm;
-        self.encode_rms_norm_duo_matching_solo(
+        self.encode_rms_norm_rows_matching_solo(
             encoder,
             input_buffer,
             norm_weight,
             &normed2,
+            2,
             in_dim,
             eps,
             &weights.in_proj,
