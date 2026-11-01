@@ -1,7 +1,7 @@
 //! Attention full en lignes de la vérification : préfixe NAX contre l'oracle
 //! CPU f64, et coût mesuré des deux chemins à long contexte (Qwen 27B).
 
-use super::rows::RowsNax;
+use super::rows::{rows_nax_indices_fit, RowsNax};
 use super::tests::{bf16_round_to_f32, lease_with, pseudo, read_f32, try_state};
 use super::*;
 use crate::metal_backend::commit_and_wait;
@@ -114,6 +114,11 @@ fn run_nax_case(
     let q_buf = lease_with(state, &q)?;
     let out_nax = state.scratch().lease(rows * q_dim, GpuElement::F32)?;
     let out_ref = state.scratch().lease(rows * q_dim, GpuElement::F32)?;
+    // Périmètre : préfixe non vide et au moins 2 lignes, sans fenêtre.
+    assert!(!kv.rows_nax_eligible(len, None), "préfixe vide éligible");
+    assert!(!kv.rows_nax_eligible(rows, Some(16)), "fenêtre éligible");
+    // Seuil du 2-passes par défaut (2048) : les cas longs sont éligibles.
+    assert_eq!(kv.rows_nax_eligible(rows, None), rows > 1 && prefix >= 2047);
     let kernels = state.rows_kernels()?;
     let command_buffer = state.queue().new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -215,8 +220,10 @@ fn verify_rows_nax_matches_cpu_oracle() -> Result<()> {
     // l'ordre des réductions. Écart observé ≤ 2,3e-5 (sorties jusqu'à ~50 sur
     // la diagonale) : marge ×4. La variante sans dernière position diagonale
     // s'écarte d'au moins 1,7e-2, le test discrimine. L'écart à l'oracle en Q
-    // f32 (dérive totale due à Q en bf16) est imprimé, pas borné.
+    // f32 (dérive totale due à Q en bf16) monte à 1,5e-3 sur le préfixe de 5
+    // positions (V diagonal ~50) et ~4e-6 à 4k clés : borne ×3.
     const EPS_SAME_INPUTS: f64 = 1.0e-4;
+    const EPS_TOTAL: f64 = 5.0e-3;
     let mut worst = (0.0_f64, 0.0_f64, 0.0_f64);
     for (geometry, cases) in [
         (
@@ -242,6 +249,11 @@ fn verify_rows_nax_matches_cpu_oracle() -> Result<()> {
             assert!(
                 same <= EPS_SAME_INPUTS,
                 "d{} prefix={prefix} rows={rows}: écart {same:e} > {EPS_SAME_INPUTS:e}",
+                geometry.2
+            );
+            assert!(
+                total <= EPS_TOTAL,
+                "d{} prefix={prefix} rows={rows}: dérive {total:e} > {EPS_TOTAL:e}",
                 geometry.2
             );
             assert!(
@@ -271,12 +283,6 @@ fn bench_rows_attention_long_context() -> Result<()> {
     let kernel = nax(&state, head_dim)?;
     let kv_dim = KV_HEADS * head_dim;
     let q_dim = Q_HEADS * head_dim;
-    eprintln!(
-        "pass1 max_total_threads_per_threadgroup = {}",
-        kernels
-            .two_pass_rows_d256_bf16
-            .max_total_threads_per_threadgroup()
-    );
     for len in [32_768, 65_536] {
         let keys: Vec<f32> = (0..len * kv_dim).map(|i| pseudo(i + 3)).collect();
         let values: Vec<f32> = (0..len * kv_dim).map(|i| pseudo(i + 11)).collect();
@@ -300,12 +306,14 @@ fn bench_rows_attention_long_context() -> Result<()> {
                     let encoder = command_buffer.new_compute_command_encoder();
                     for _ in 0..LAYERS {
                         if path == 0 {
-                            kv.encode_attention_decode_rows(
+                            // Chemin historique explicite, quel que soit le flag.
+                            kv.encode_attention_decode_rows_chunked(
                                 encoder,
                                 kernels,
                                 q_buf.tensor().buffer(),
                                 out.tensor().buffer(),
                                 rows,
+                                None,
                                 None,
                             )?;
                         } else {
@@ -331,4 +339,37 @@ fn bench_rows_attention_long_context() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Garde des indices `uint` des noyaux scalaires : refus dès que
+/// `len·kv_dim` ou les partiels sortent de `u32` (aucune allocation).
+#[test]
+fn rows_nax_indices_fit_refuse_u32_overflow() {
+    // 24/4 d256 : kv_dim = 1024, `len·kv_dim` atteint 2^32 à len = 4 194 304.
+    assert!(rows_nax_indices_fit(65_536, 8, Q_HEADS, KV_HEADS, 256, 128));
+    assert!(rows_nax_indices_fit(
+        4_194_303, 8, Q_HEADS, KV_HEADS, 256, 128
+    ));
+    assert!(!rows_nax_indices_fit(
+        4_194_304 + 8,
+        8,
+        Q_HEADS,
+        KV_HEADS,
+        256,
+        128
+    ));
+    // Partiels : blocs·lignes·q_heads·d > u32 malgré un K/V qui tient.
+    assert!(!rows_nax_indices_fit(
+        65_536, 4096, Q_HEADS, KV_HEADS, 256, 1024
+    ));
+    // Préfixe négatif ou produit qui déborde `usize` : refus.
+    assert!(!rows_nax_indices_fit(4, 8, Q_HEADS, KV_HEADS, 256, 128));
+    assert!(!rows_nax_indices_fit(
+        usize::MAX,
+        2,
+        Q_HEADS,
+        KV_HEADS,
+        256,
+        128
+    ));
 }

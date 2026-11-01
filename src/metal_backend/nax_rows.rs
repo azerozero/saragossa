@@ -9,7 +9,7 @@
 
 use super::attention::{checked_i32, checked_i64, SteelAttnParams, NAX_CAUSAL_ATTN_BQ64};
 use super::byte_helpers::checked_len;
-use super::pipelines::compile_nax_function;
+use super::pipelines::{compile_nax_function, steel_attention_nax_source};
 use super::*;
 
 /// Instanciation d128 (noyau plein, WM=4, WN=1), la seule compilée par MLX.
@@ -60,7 +60,7 @@ impl NaxRowsAttention {
         };
         let pipeline = compile_nax_function(
             device,
-            STEEL_ATTENTION_NAX_KERNELS,
+            &steel_attention_nax_source(),
             name,
             &[
                 (200, false),

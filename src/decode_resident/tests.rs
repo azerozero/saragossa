@@ -1032,7 +1032,7 @@ fn cpu_attention(
     clippy::too_many_arguments,
     reason = "oracle CPU de test: tenseurs, dimensions et fenêtre doivent rester explicites"
 )]
-pub(super) fn cpu_attention_windowed(
+fn cpu_attention_windowed(
     q: &[f32],
     keys: &[f32],
     values: &[f32],
