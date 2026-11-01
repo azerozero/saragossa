@@ -461,6 +461,43 @@ fn synthetic_flint_lightbatch_matches_solo_on_resident_decode() {
     }
 }
 
+/// Le pas multi-flux dense refuse flint (sinks, fenêtre, MoE sigmoïde) : le
+/// light-batch profilé retombe sur le time-slicing, un pas par flux et par
+/// token, chaque flux identique à son solo.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn synthetic_flint_lightbatch_multi_falls_back_to_time_slicing() {
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: runtime Metal attaché");
+    let options = crate::GenerationOptions::default();
+    let prompts = [vec![1, 2, 3], vec![3, 2], vec![4, 1, 2, 5]];
+    let budgets = [5, 3, 6];
+    let (outputs, profile) = gpu
+        .generate_greedy_lightbatch_profiled(&prompts, &budgets, &options)
+        .expect("invariant: light-batch flint profilé");
+    assert_eq!(
+        profile.multi_steps, 0,
+        "flint ne passe pas par le pas multi"
+    );
+    assert!(profile.steps.iter().all(|(width, _)| *width == 1));
+    assert_eq!(
+        profile.steps.len(),
+        outputs
+            .iter()
+            .map(|output| output.timings.decode_tokens)
+            .sum::<usize>()
+    );
+    for ((output, prompt), budget) in outputs.iter().zip(&prompts).zip(budgets) {
+        let solo = gpu
+            .generate_greedy_timed_with_options(prompt, budget, &options)
+            .expect("invariant: solo flint")
+            .tokens;
+        assert_eq!(output.tokens, solo);
+    }
+}
+
 /// Prefill résident Metal (sinks, NoPE, fenêtre 2 dépassée, MLP dense puis MoE
 /// sigmoïde avec expert partagé sans gate) contre le prefill per-op CPU sur
 /// toutes les positions, puis greedy (prefill Metal + decode résident) contre

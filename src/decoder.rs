@@ -47,6 +47,7 @@ mod loading;
 mod lookup;
 mod mtp;
 mod mtp_adaptive;
+mod multi;
 mod resident;
 
 use self::flags::*;

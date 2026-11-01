@@ -62,6 +62,7 @@ mod kernels;
 mod kv_quant;
 mod layers;
 mod moe_tail;
+mod multi;
 mod rows;
 mod types;
 mod utils;
@@ -83,6 +84,7 @@ pub(crate) use self::gpu_position::{check_gpu_position_rows, GpuPosition};
 pub(crate) use self::kv_quant::KvFormat;
 #[cfg(test)]
 pub(crate) use self::layers::QKV_CONCAT_NO_GATE_HITS;
+pub(crate) use self::multi::MultiFullAttnStream;
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,

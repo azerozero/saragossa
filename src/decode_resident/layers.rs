@@ -13,7 +13,7 @@ thread_local! {
 }
 
 impl DecodeResidentState {
-    fn encode_query_attention_scale(
+    pub(super) fn encode_query_attention_scale(
         executor: &MetalExecutor,
         encoder: &ComputeCommandEncoderRef,
         owned: &mut Vec<Buffer>,

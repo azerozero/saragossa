@@ -56,6 +56,7 @@ mod eligibility;
 mod flags;
 mod kernel_timing;
 mod lightbatch_duo;
+mod lightbatch_multi;
 mod linear_attention;
 mod linear_attention_encode;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
