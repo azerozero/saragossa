@@ -4,7 +4,7 @@ use super::*;
 
 /// Lignes réservées dans le journal SSM (`LINEAR_ATTN_JOURNAL_ROWS` de
 /// `kernels.metal`) : 8 captures plus la ligne finale du scan.
-const LINEAR_ATTN_JOURNAL_ROWS: usize = 9;
+pub(super) const LINEAR_ATTN_JOURNAL_ROWS: usize = 9;
 
 /// Une série de `rows` captures passe en mode journal quand le scan fusionné f32
 /// l'écrira (même éligibilité que le chemin en lignes) et que le journal tient dans
@@ -123,6 +123,12 @@ impl MetalExecutor {
         state: &LinearAttentionMetalState,
         capture: &LinearAttentionMetalState,
     ) -> Result<()> {
+        // Copie d'un état complet : une série en journal n'en attend que du scan.
+        if capture.ssm_journal {
+            return Err(InferError::Config(
+                "capture linear-attn en journal hors du scan fusionné".to_string(),
+            ));
+        }
         self.encode_capture_linear_attn_conv_state(encoder, state, capture)?;
         self.encode_capture_linear_attn_ssm_state(encoder, state, capture)
     }
@@ -3447,6 +3453,9 @@ impl MetalExecutor {
         layers: &[(&LinearAttentionMetalState, &[LinearAttentionMetalState])],
         row: usize,
     ) -> Result<()> {
+        if layers.is_empty() {
+            return Ok(());
+        }
         let mut copies = Vec::with_capacity(layers.len());
         let mut replays = Vec::new();
         for (state, captures) in layers {

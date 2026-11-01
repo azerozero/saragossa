@@ -355,7 +355,9 @@ impl MetalExecutor {
         if steps == 0
             || captures.len() > Self::LINEAR_ATTN_SEQ_MAX_CAPTURES
             || captures.len() >= steps
-            || (journal && captures.len() != 2)
+            || (journal
+                && (captures.len() != 2
+                    || steps > super::linear_attention::LINEAR_ATTN_JOURNAL_ROWS))
         {
             return Err(InferError::Dimension(format!(
                 "linear-attn seq captures : {} captures pour {steps} pas (max {})",
