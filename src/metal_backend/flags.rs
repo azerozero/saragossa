@@ -477,6 +477,16 @@ pub(super) fn linear_delta_dk128_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_DELTA_DK128", true))
 }
 
+/// Captures SSM de la vérification en lignes en mode journal : état d'entrée et
+/// journal delta/k/decay au lieu d'un état complet par ligne, état accepté rejoué au
+/// rollback (bit-identique). `SARAGOSSA_RUST_LINEAR_CAPTURE_JOURNAL=1` (défaut OFF).
+pub(super) fn linear_capture_journal_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::runtime_flags::env_flag("SARAGOSSA_RUST_LINEAR_CAPTURE_JOURNAL", false)
+    })
+}
+
 /// Vérification MTP : conv/normes/gates et rms-gate batchés sur les lignes du
 /// draft (kernels du prefill) au lieu d'une boucle de dispatches par ligne.
 /// `SARAGOSSA_RUST_LINEAR_ROWS_BATCHED=0` rétablit la boucle (repli A/B).

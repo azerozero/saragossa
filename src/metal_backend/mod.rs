@@ -243,6 +243,7 @@ pub struct MetalExecutor {
     linear_attn_gated_delta_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_seq_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_seq_capture_dk128_tg4_f32: ComputePipelineState,
+    linear_attn_gated_delta_replay_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_seq_dk128_bf16_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_dk128_bf16_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_inv_dk128_tg4_f32: ComputePipelineState,
@@ -675,6 +676,11 @@ pub(crate) struct LinearAttentionMetalState {
     value_head_dim: usize,
     key_head_dim: usize,
     ssm_bf16: bool,
+    /// Capture 0 d'une série en mode journal (`lease_linear_attn_state_captures`) :
+    /// son `ssm` reçoit l'état d'entrée et le `ssm` de la capture 1 le journal
+    /// delta/k/decay ; les `ssm` des captures suivantes ne sont pas écrits. Faux
+    /// partout ailleurs.
+    ssm_journal: bool,
 }
 
 impl LinearAttentionMetalState {

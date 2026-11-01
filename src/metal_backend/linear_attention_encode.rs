@@ -348,11 +348,16 @@ impl MetalExecutor {
         y_buffer: &BufferRef,
         steps: usize,
         captures: &[&BufferRef],
+        journal: bool,
         spec: LinearAttentionStepSpec,
     ) -> Result<()> {
+        // Journal : `captures` = [état d'entrée, journal], aucune capture par pas.
         if steps == 0
             || captures.len() > Self::LINEAR_ATTN_SEQ_MAX_CAPTURES
             || captures.len() >= steps
+            || (journal
+                && (captures.len() != 2
+                    || steps > super::linear_attention::LINEAR_ATTN_JOURNAL_ROWS))
         {
             return Err(InferError::Dimension(format!(
                 "linear-attn seq captures : {} captures pour {steps} pas (max {})",
@@ -394,8 +399,17 @@ impl MetalExecutor {
         set_u32_bytes(
             encoder,
             9,
-            &[checked_u32(captures.len(), "linear-attn seq captures")?],
+            &[checked_u32(
+                if journal { 0 } else { captures.len() },
+                "linear-attn seq captures",
+            )?],
             "linear_attn_seq_delta_captures",
+        )?;
+        set_u32_bytes(
+            encoder,
+            18,
+            &[u32::from(journal)],
+            "linear_attn_seq_delta_journal",
         )?;
         // Les emplacements non utilisés pointent sur la première capture (jamais lus
         // au-delà de `capture_count`) : tous les buffers du kernel restent liés.
@@ -411,6 +425,49 @@ impl MetalExecutor {
                 LINEAR_ATTN_TG_WIDTH,
                 value_head_dim,
                 checked_nsuint(spec.num_value_heads, "linear-attn seq value heads")?,
+            ),
+            MTLSize::new(LINEAR_ATTN_TG_WIDTH, tg_rows, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Rollback du mode journal : rejoue les `steps` premiers pas du journal depuis
+    /// l'état d'entrée et écrit l'état obtenu dans `ssm_state_buffer`.
+    pub(super) fn encode_linear_attn_gated_delta_replay_dk128(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        initial_buffer: &BufferRef,
+        journal_buffer: &BufferRef,
+        ssm_state_buffer: &BufferRef,
+        num_value_heads: usize,
+        value_head_dim: usize,
+        steps: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(num_value_heads, "linear-attn replay value heads")?,
+            checked_u32(value_head_dim, "linear-attn replay value dim")?,
+            128,
+        ];
+        encoder.set_compute_pipeline_state(&self.linear_attn_gated_delta_replay_dk128_tg4_f32);
+        encoder.set_buffer(0, Some(initial_buffer), 0);
+        encoder.set_buffer(1, Some(journal_buffer), 0);
+        encoder.set_buffer(2, Some(ssm_state_buffer), 0);
+        set_u32_bytes(encoder, 3, &dims, "linear_attn_replay_dims")?;
+        set_u32_bytes(
+            encoder,
+            4,
+            &[checked_u32(steps, "linear-attn replay steps")?],
+            "linear_attn_replay_steps",
+        )?;
+        profile_dispatch();
+        let value_head_dim = checked_nsuint(value_head_dim, "linear-attn replay value dim")?;
+        let tg_rows = linear_delta_tg_rows().min(value_head_dim);
+        encoder.dispatch_threads(
+            MTLSize::new(
+                LINEAR_ATTN_TG_WIDTH,
+                value_head_dim,
+                checked_nsuint(num_value_heads, "linear-attn replay value heads")?,
             ),
             MTLSize::new(LINEAR_ATTN_TG_WIDTH, tg_rows, 1),
         );
