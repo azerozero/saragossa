@@ -230,6 +230,11 @@ mono-ligne dans le même ordre ; quand les lignes chevauchent une frontière de 
 passe en chunks d'une ligne avec le choix et les blocs de chaque ligne.
 `full_attn_rows_fused_matches_row_loop` vérifie l'égalité bit à bit (contextes et KV) en
 flash et en 2-passes, d128 et d256, f32 et bf16, chunks d'une ligne et frontières compris.
+Depuis le 2026-11-02, sur KV bf16 dense (d128/d256, GQA réelle), à partir de 2 lignes et
+de 16k de contexte (`SARAGOSSA_RUST_VERIFY_ROWS_NAX_MIN_LEN`), le préfixe passe par le
+NAX du prefill (Q en bf16, `verify_rows_nax_matches_cpu_oracle`) : vérification DFlash à
+32k 86 → 68 ms par tour, MTP serve 115k 21,6 → 24,0 tok/s ; ce chemin n'est plus
+bit-identique. Kill-switch `SARAGOSSA_RUST_VERIFY_ROWS_NAX=0`.
 
 Mesures du 17 octobre (64 tokens, draft fixe 2, profil D2 segmenté, runs alternés OFF/ON,
 sorties byte-identiques par hachage sur T0, T6, T7 et T6 avec lookup) :

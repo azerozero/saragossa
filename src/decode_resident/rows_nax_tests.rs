@@ -118,7 +118,10 @@ fn run_nax_case(
     assert!(!kv.rows_nax_eligible(len, None), "préfixe vide éligible");
     assert!(!kv.rows_nax_eligible(rows, Some(16)), "fenêtre éligible");
     // Seuil du 2-passes par défaut (2048) : les cas longs sont éligibles.
-    assert_eq!(kv.rows_nax_eligible(rows, None), rows > 1 && prefix >= 2047);
+    assert_eq!(
+        kv.rows_nax_eligible(rows, None),
+        rows > 1 && prefix >= 2047 && len >= crate::runtime_flags::verify_rows_nax_min_len()
+    );
     let kernels = state.rows_kernels()?;
     let command_buffer = state.queue().new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();

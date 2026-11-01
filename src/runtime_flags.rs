@@ -868,11 +868,12 @@ pub(crate) fn prefill_attn_nax_window_enabled() -> bool {
 }
 
 /// Attention full en lignes de la vérification (MTP, lookup, DFlash) sur les
-/// accélérateurs neuronaux (`SARAGOSSA_RUST_VERIFY_ROWS_NAX=1`, **défaut
-/// OFF**) : le préfixe passe par le NAX du prefill en split-K (Q packé en
-/// bf16, une tuile par tête KV), la diagonale et la fusion par un kernel
-/// scalaire. Périmètre : d128/d256, KV bf16 dense, sans fenêtre ni sinks,
-/// longueur ≥ seuil du 2-passes, au moins 2 lignes (à 1 ligne le 2-passes,
+/// accélérateurs neuronaux (défaut ON depuis le 2026-11-02, mesures des 1er
+/// et 2 nov., kill-switch `SARAGOSSA_RUST_VERIFY_ROWS_NAX=0`) : le préfixe
+/// passe par le NAX du prefill en split-K (Q packé en bf16, une tuile par
+/// tête KV), la diagonale et la fusion par un kernel scalaire. Périmètre :
+/// d128/d256, KV bf16 dense, sans fenêtre ni sinks, longueur ≥ seuil du
+/// 2-passes et ≥ [`verify_rows_nax_min_len`], au moins 2 lignes (à 1 ligne le 2-passes,
 /// limité par la bande passante, reste plus rapide). Hors périmètre, ou si
 /// le NAX ne compile pas, repli sur le 2-passes en lignes. Attention seule
 /// (bench `bench_rows_attention_long_context`, 16 couches, M5 Max) à 32k :
@@ -884,10 +885,32 @@ pub(crate) fn prefill_attn_nax_window_enabled() -> bool {
 /// Textes identiques dans les 6 cas. Écart à l'oracle CPU f64 à entrées
 /// égales ≤ 2,3e-5 (`verify_rows_nax_matches_cpu_oracle`) ; flag actif, le
 /// chemin en lignes n'est plus bit-identique à la boucle par ligne.
+/// Matrice serve (MTP, 27B 4 bits, même binaire, flag 0 → 1) : intégrité
+/// 4/4 dans les 12 runs 32k/64k/115k × 2 contextes, TTFT inchangé, decode
+/// 32k 33,9 → 34,4 et 32,7 → 33,9, 64k 27,4 → 29,5 et 26,9 → 28,6, 115k
+/// 21,6 → 24,0 et 22,9 → 25,1 tok/s ; textes identiques dans 4 cas, les deux
+/// autres divergent après ~670 caractères sur un quasi-ex aequo.
+/// Sous [`verify_rows_nax_min_len`] (16k), le 2-passes reste en place : le MTP
+/// échantillonné à 4k y perdait jusqu'à 7 %. Lookup non mesuré à part.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn verify_rows_nax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_ROWS_NAX", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_ROWS_NAX", true))
+}
+
+/// Contexte minimal du préfixe NAX en lignes
+/// (`SARAGOSSA_RUST_VERIFY_ROWS_NAX_MIN_LEN`, défaut 16384, le seuil greedy
+/// bf16) : MTP échantillonné à 4k (KV bf16 dès le prompt court, même binaire,
+/// 2026-11-02) code 47,4/45,0 → 44,1/41,7 tok/s, prose inchangée ; le gain
+/// n'est mesuré qu'à partir de 32k. Le 2-passes reste en deçà.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn verify_rows_nax_min_len() -> usize {
+    static TOKENS: OnceLock<usize> = OnceLock::new();
+    *TOKENS.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_VERIFY_ROWS_NAX_MIN_LEN")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(16 * 1024)
+    })
 }
 
 /// Nombre visé de blocs split-K du préfixe NAX en lignes

@@ -10,6 +10,10 @@
 //! fenêtre (drafter DFlash), flash/2-passes et split-K se choisissent sur la
 //! longueur effective de chaque ligne : l'ordre de réduction diffère du naïf
 //! (écart ≤ 2e-8, `full_attn_rows_windowed_matches_naive_and_cpu`).
+//! Sur KV bf16 dense, à partir de 2 lignes et de 16k de contexte, le préfixe
+//! passe par défaut par le NAX du prefill (`SARAGOSSA_RUST_VERIFY_ROWS_NAX=0`
+//! pour l'écarter) : Q en bf16, plus bit-identique à la boucle par ligne
+//! (écart ≤ 2,3e-5 à l'oracle CPU, `verify_rows_nax_matches_cpu_oracle`).
 
 use super::attention::FullAttentionMetalState;
 use super::gpu_position::to_u32;
@@ -533,7 +537,7 @@ pub(super) struct RowsKernels {
     rope_rows: ComputePipelineState,
     copy_rows: ComputePipelineState,
     copy_rows_bf16: ComputePipelineState,
-    /// Préfixe NAX opt-in (`SARAGOSSA_RUST_VERIFY_ROWS_NAX`), compilé au
+    /// Préfixe NAX (`SARAGOSSA_RUST_VERIFY_ROWS_NAX`, défaut ON), compilé au
     /// premier usage de chaque `head_dim` (`None` : NAX indisponible).
     device: Device,
     nax_d128: OnceLock<Option<RowsNax>>,
@@ -1074,7 +1078,8 @@ impl FullAttentionMetalState {
 
     /// Périmètre du préfixe NAX (hors flag) : d128/d256 en GQA réelle, KV bf16
     /// dense sans fenêtre ni sinks, préfixe non vide (`1 < rows < len`),
-    /// longueur ≥ seuil du 2-passes et indices `u32` des noyaux scalaires. À
+    /// longueur ≥ seuil du 2-passes et ≥ `verify_rows_nax_min_len`, indices
+    /// `u32` des noyaux scalaires. À
     /// une ligne, le 2-passes (limité par la bande passante) reste plus rapide.
     pub(super) fn rows_nax_eligible(&self, rows: usize, window: Option<usize>) -> bool {
         let len = self.stored_len();
@@ -1092,6 +1097,7 @@ impl FullAttentionMetalState {
             && sdpa_2pass_enabled()
             && flash_sdpa_enabled()
             && len - rows + 1 >= sdpa_2pass_min_len()
+            && len >= crate::runtime_flags::verify_rows_nax_min_len()
             && rows_nax_indices_fit(
                 len,
                 rows,
