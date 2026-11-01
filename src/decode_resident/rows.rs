@@ -10,6 +10,10 @@
 //! fenêtre (drafter DFlash), flash/2-passes et split-K se choisissent sur la
 //! longueur effective de chaque ligne : l'ordre de réduction diffère du naïf
 //! (écart ≤ 2e-8, `full_attn_rows_windowed_matches_naive_and_cpu`).
+//! Sur KV bf16 dense, à partir de 2 lignes et du seuil 2-passes, le préfixe
+//! passe par défaut par le NAX du prefill (`SARAGOSSA_RUST_VERIFY_ROWS_NAX=0`
+//! pour l'écarter) : Q en bf16, plus bit-identique à la boucle par ligne
+//! (écart ≤ 2,3e-5 à l'oracle CPU, `verify_rows_nax_matches_cpu_oracle`).
 
 use super::attention::FullAttentionMetalState;
 use super::gpu_position::to_u32;
@@ -533,7 +537,7 @@ pub(super) struct RowsKernels {
     rope_rows: ComputePipelineState,
     copy_rows: ComputePipelineState,
     copy_rows_bf16: ComputePipelineState,
-    /// Préfixe NAX opt-in (`SARAGOSSA_RUST_VERIFY_ROWS_NAX`), compilé au
+    /// Préfixe NAX (`SARAGOSSA_RUST_VERIFY_ROWS_NAX`, défaut ON), compilé au
     /// premier usage de chaque `head_dim` (`None` : NAX indisponible).
     device: Device,
     nax_d128: OnceLock<Option<RowsNax>>,
