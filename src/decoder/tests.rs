@@ -2950,6 +2950,25 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         resident.stats.accepted,
         cpu.stats.accepted
     );
+    // Au-delà du seuil greedy, l'arène du vérifieur passe en bf16
+    // (`resident_kv_bf16`) : forcée ici sur un prompt court, déjà en cache de
+    // préfixe, elle exerce adoption, vérification bf16 et rollback par troncature.
+    let resident_bf16 = crate::decode_resident::with_kv_format_override(
+        crate::decode_resident::KvFormat::Bf16,
+        || {
+            model.generate_greedy_dflash_resident_with_options(
+                &prompt,
+                max_new_tokens,
+                &options,
+                &draft,
+                draft.info.block_size,
+            )
+        },
+    )?;
+    assert_eq!(
+        resident_bf16.tokens, ar,
+        "boucle résidente bf16 divergente de l'AR"
+    );
     let mut streamed = Vec::new();
     let streaming = model.generate_greedy_dflash_resident_streaming_with_options(
         &prompt,

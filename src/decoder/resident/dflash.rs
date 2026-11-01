@@ -32,8 +32,10 @@ struct DFlashResidentBuffers {
 
 impl CausalDecoder {
     /// Génère en greedy avec le drafter DFlash résident et la vérification
-    /// résidente en lignes. Sorties identiques à l'AR (vérifieur exact) et à la
-    /// boucle CPU, à la précision des matmuls près pour la proposition.
+    /// résidente en lignes. Sorties identiques à l'AR résident de même précision
+    /// KV (vérifieur exact) ; face à la boucle CPU f32, l'écart vient des matmuls
+    /// de la proposition et, au-delà du seuil greedy, du KV bf16 du vérifieur
+    /// (`resident_kv_bf16`), qui peut trancher autrement un quasi-ex aequo.
     ///
     /// # Errors
     ///

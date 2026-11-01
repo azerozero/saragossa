@@ -920,7 +920,7 @@ pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
 /// 32k 25 → 23 Go, 115k 41 → 34 Go, 256k 67 → 51 Go ; TTFT et decode
 /// inchangés au bruit près, textes identiques. Les lecteurs f32 (attention
 /// CPU de repli, arène f32 d'une queue de moins de
-/// [`prefix_extend_resident_min_tokens`] tokens ou de DFlash) voient alors le
+/// [`prefix_extend_resident_min_tokens`] tokens ou boucle DFlash CPU) voient alors le
 /// préfixe arrondi ; l'attention CPU élargit alors tout le KV à chaque token.
 /// Les couches à sinks (flint) n'y entrent qu'avec
 /// [`flint_prefill_kv_bf16_store_enabled`].
@@ -1398,8 +1398,9 @@ pub(crate) fn kv_bf16_greedy_min_tokens() -> usize {
 
 /// Format du KV résident full-attn là où le dtype résolu est bf16
 /// (`SARAGOSSA_RUST_KV_QUANT`) : `bf16` (défaut), `8`, `k8v4` ou `4`. Les
-/// arènes f32 (greedy court, extension, TTS, DFlash, `SARAGOSSA_RUST_KV_BF16=0`)
-/// ne sont jamais quantifiées ; une couche sans attention quantifiée (fenêtre
+/// arènes f32 (greedy court, extension, TTS, boucle DFlash CPU,
+/// `SARAGOSSA_RUST_KV_BF16=0`) ne sont jamais quantifiées ; le DFlash résident
+/// long suit la règle bf16 du greedy, donc ce réglage ; une couche sans attention quantifiée (fenêtre
 /// glissante, head_dim ≠ 128/256, GQA 1, flash ou 2-passes coupés) reste bf16.
 /// Une valeur inconnue garde bf16, avec un avertissement.
 ///

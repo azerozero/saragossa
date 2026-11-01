@@ -1123,7 +1123,7 @@ impl FullAttentionMetalState {
             let mut offset = first * kv_dim;
             for segment in segments {
                 // Un segment bf16 sème une arène bf16 à l'identique ; une arène
-                // f32 (queue courte, DFlash) le reçoit élargi : valeurs arrondies.
+                // f32 (queue courte, DFlash court) le reçoit élargi : valeurs arrondies.
                 match (segment.shared(), tensor.element()) {
                     (Some((buffer, byte_offset, input)), GpuElement::F32 | GpuElement::Bf16)
                         if !round =>
