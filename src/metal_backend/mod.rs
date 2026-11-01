@@ -78,6 +78,8 @@ pub(crate) use self::shared_rows::{
     allocation_identity, InPlaceClaim, PrefillKvRows, SharedBf16Rows, SharedF32Rows,
 };
 mod na_gemm;
+mod nax_rows;
+pub(crate) use self::nax_rows::{NaxRowsAttention, NaxRowsBuffers, NaxRowsDispatch};
 mod pipelines;
 mod prefill;
 #[cfg(test)]

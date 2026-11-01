@@ -382,6 +382,140 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
 
 "#;
 
+/// Noyaux scalaires autour du préfixe NAX en lignes (KV bf16, `DHEAD` → 128/256).
+const ROWS_NAX_KERNELS_TEMPLATE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+// Q f32 `[ligne][q_head][d]` → bf16 `[kv_head][ligne·gqa + h][d]`, où
+// `q_head = kv_head·gqa + h` : une tuile NAX par tête KV. dims = (q_heads, kv_heads, lignes).
+kernel void rows_nax_pack_q_dDHEAD(
+    device const float* q [[buffer(0)]],
+    device bfloat* packed [[buffer(1)]],
+    constant uint3& dims [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    constexpr uint D = DHEADu;
+    const uint q_heads = dims.x;
+    const uint rows = dims.z;
+    if (i >= rows * q_heads * D) { return; }
+    const uint gqa = q_heads / dims.y;
+    const uint row = i / (q_heads * D);
+    const uint q_head = (i / D) % q_heads;
+    const uint kv = q_head / gqa;
+    const uint h = q_head - kv * gqa;
+    packed[((kv * rows + row) * gqa + h) * D + i % D] = bfloat(q[i]);
+}
+
+// Threadgroup (q_head, ligne), un thread par composante : la diagonale
+// `[prefix, prefix + ligne]` en scalaire (Q f32), puis fusion en ligne des
+// `blocks` partiels NAX (sortie normalisée, LSE en log naturel) :
+// `out = Σ exp(lse_b − M)·O_b / Σ exp(lse_b − M)`, exact quand chaque bloc
+// est non vide. dims = (q_heads, kv_heads, prefix, blocks).
+kernel void rows_nax_reduce_dDHEAD(
+    device const float* q [[buffer(0)]],
+    device const bfloat* keys [[buffer(1)]],
+    device const bfloat* values [[buffer(2)]],
+    device const float* partials [[buffer(3)]],
+    device const float* lse [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant uint4& dims [[buffer(6)]],
+    uint d [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 grid [[threadgroups_per_grid]]
+) {
+    constexpr uint D = DHEADu;
+    constexpr uint SG = D / 32u;
+    const uint q_heads = dims.x;
+    const uint kv_heads = dims.y;
+    const uint prefix = dims.z;
+    const uint blocks = dims.w;
+    const uint q_head = tg.x;
+    const uint row = tg.y;
+    const uint gqa = q_heads / kv_heads;
+    const uint kv = q_head / gqa;
+    const uint q_rows = gqa * grid.y;
+    const uint s = row * gqa + (q_head - kv * gqa);
+    const uint kv_dim = kv_heads * D;
+    const uint slot = row * q_heads + q_head;
+    const float qd = q[slot * D + d] * rsqrt(float(D));
+
+    threadgroup float partial[SG];
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc = 0.0f;
+    for (uint p = prefix; p <= prefix + row; ++p) {
+        const uint base = p * kv_dim + kv * D + d;
+        const float dot = simd_sum(qd * float(keys[base]));
+        if (simd_lid == 0u) { partial[simd_gid] = dot; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float score = 0.0f;
+        for (uint g = 0u; g < SG; ++g) { score += partial[g]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float m_new = max(m, score);
+        const float f = fast::exp(m - m_new);
+        const float e = fast::exp(score - m_new);
+        l = l * f + e;
+        acc = acc * f + e * float(values[base]);
+        m = m_new;
+    }
+    for (uint b = 0u; b < blocks; ++b) {
+        const uint cell = (b * kv_heads + kv) * q_rows + s;
+        const float lb = lse[cell];
+        const float m_new = max(m, lb);
+        const float f = fast::exp(m - m_new);
+        const float e = fast::exp(lb - m_new);
+        l = l * f + e;
+        acc = acc * f + e * partials[cell * D + d];
+        m = m_new;
+    }
+    out[slot * D + d] = acc / l;
+}
+"#;
+
+/// Chemin NAX en lignes d'une `head_dim` : NAX du prefill et ses deux noyaux
+/// scalaires (packing de Q, diagonale + fusion).
+#[derive(Debug)]
+pub(super) struct RowsNax {
+    nax: crate::metal_backend::NaxRowsAttention,
+    pack_q: ComputePipelineState,
+    reduce: ComputePipelineState,
+}
+
+impl RowsNax {
+    /// `Ok(None)` si le NAX ne compile pas pour cette forme (repli 2-passes).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les noyaux scalaires ne compilent pas.
+    pub(super) fn compile(device: &Device, head_dim: usize) -> Result<Option<Self>> {
+        let Some(nax) = crate::metal_backend::NaxRowsAttention::compile(device, head_dim) else {
+            return Ok(None);
+        };
+        let source = ROWS_NAX_KERNELS_TEMPLATE.replace("DHEAD", &head_dim.to_string());
+        let pack = format!("rows_nax_pack_q_d{head_dim}");
+        let reduce = format!("rows_nax_reduce_d{head_dim}");
+        let mut pipelines = super::kernels::compile_kernels(
+            device,
+            &source,
+            &[pack.as_str(), reduce.as_str()],
+            true,
+        )?
+        .into_iter();
+        let (Some(pack_q), Some(reduce)) = (pipelines.next(), pipelines.next()) else {
+            return Err(InferError::Metal("rows NAX: pipelines absents".to_string()));
+        };
+        Ok(Some(Self {
+            nax,
+            pack_q,
+            reduce,
+        }))
+    }
+}
+
 /// Pipelines du chemin en lignes, compilés au premier usage (hors MTP : aucun coût).
 #[derive(Debug)]
 pub(super) struct RowsKernels {
@@ -399,6 +533,73 @@ pub(super) struct RowsKernels {
     rope_rows: ComputePipelineState,
     copy_rows: ComputePipelineState,
     copy_rows_bf16: ComputePipelineState,
+    /// Préfixe NAX opt-in (`SARAGOSSA_RUST_VERIFY_ROWS_NAX`), compilé au
+    /// premier usage de chaque `head_dim` (`None` : NAX indisponible).
+    device: Device,
+    nax_d128: OnceLock<Option<RowsNax>>,
+    nax_d256: OnceLock<Option<RowsNax>>,
+}
+
+impl RowsKernels {
+    /// Chemin NAX de `head_dim`, compilé à la première demande.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les noyaux scalaires ne compilent pas.
+    fn nax(&self, head_dim: usize) -> Result<Option<&RowsNax>> {
+        let cell = match head_dim {
+            128 => &self.nax_d128,
+            256 => &self.nax_d256,
+            _ => return Ok(None),
+        };
+        if let Some(nax) = cell.get() {
+            return Ok(nax.as_ref());
+        }
+        let nax = RowsNax::compile(&self.device, head_dim)?;
+        if nax.is_none() {
+            eprintln!("attention NAX en lignes d{head_dim} indisponible : repli 2-passes");
+        }
+        Ok(cell.get_or_init(|| nax).as_ref())
+    }
+}
+
+/// Découpage split-K du préfixe : `(clés par bloc, blocs pleins, reste, blocs)`.
+/// Les blocs font `⌈préfixe / cible⌉` clés arrondies à 32 ; le reste forme un
+/// dernier bloc.
+fn rows_nax_layout(prefix: usize, target_blocks: usize) -> (usize, usize, usize, usize) {
+    let block_len = prefix
+        .div_ceil(target_blocks.max(1))
+        .max(1)
+        .next_multiple_of(32);
+    let (full, rem) = (prefix / block_len, prefix % block_len);
+    (block_len, full, rem, full + usize::from(rem > 0))
+}
+
+/// Les noyaux scalaires indexent K/V (`position·kv_dim`) et les partiels
+/// (`cellule·d`) en `uint` : refus du NAX dès qu'un de ces indices sortirait
+/// de `u32` (le 2-passes prend le relais).
+pub(super) fn rows_nax_indices_fit(
+    len: usize,
+    rows: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    target_blocks: usize,
+) -> bool {
+    let limit = u32::MAX as usize;
+    let Some(prefix) = len.checked_sub(rows) else {
+        return false;
+    };
+    let (_, _, _, blocks) = rows_nax_layout(prefix, target_blocks);
+    let kv_cells = len
+        .checked_mul(kv_heads)
+        .and_then(|cells| cells.checked_mul(head_dim));
+    let partial_cells = blocks
+        .checked_mul(rows)
+        .and_then(|cells| cells.checked_mul(q_heads))
+        .and_then(|cells| cells.checked_mul(head_dim));
+    kv_cells.is_some_and(|cells| cells <= limit)
+        && partial_cells.is_some_and(|cells| cells <= limit)
 }
 
 fn rows_source(kv_type: &str, suffix: &str) -> String {
@@ -423,6 +624,9 @@ impl DecodeResidentState {
         let bf16_source = rows_source("bfloat", "bf16");
         let compile = |source: &str, name: &str| compile_kernel(&self.device, source, name);
         let kernels = RowsKernels {
+            device: self.device.clone(),
+            nax_d128: OnceLock::new(),
+            nax_d256: OnceLock::new(),
             flash_rows: compile(&f32_source, "attention_decode_flash_rows_f32")?,
             flash_rows_bf16: compile(&bf16_source, "attention_decode_flash_rows_bf16")?,
             flash_rows_d256: compile(
@@ -642,6 +846,11 @@ impl FullAttentionMetalState {
         rows: usize,
         window: Option<usize>,
     ) -> Result<()> {
+        if crate::runtime_flags::verify_rows_nax_enabled() && self.rows_nax_eligible(rows, window) {
+            if let Some(nax) = kernels.nax(self.head_dim())? {
+                return self.encode_attention_rows_nax(encoder, nax, q_rows, out_rows, rows);
+            }
+        }
         self.encode_attention_decode_rows_chunked(
             encoder,
             kernels,
@@ -653,8 +862,9 @@ impl FullAttentionMetalState {
         )
     }
 
-    /// Cœur de [`Self::encode_attention_decode_rows`] ; `max_rows_per_group`
-    /// borne les lignes par threadgroup du 2-passes (tests : chunks forcés).
+    /// Chemin historique de [`Self::encode_attention_decode_rows`] (flash ou
+    /// 2-passes en lignes, jamais le NAX) ; `max_rows_per_group` borne les
+    /// lignes par threadgroup du 2-passes (tests : chunks forcés).
     #[expect(
         clippy::too_many_arguments,
         reason = "encodage Metal: buffers Q/sortie, lignes, fenêtre et découpage"
@@ -859,6 +1069,156 @@ impl FullAttentionMetalState {
             crate::metal_backend::post_dispatch_barrier(encoder);
             start += chunk;
         }
+        Ok(())
+    }
+
+    /// Périmètre du préfixe NAX (hors flag) : d128/d256 en GQA réelle, KV bf16
+    /// dense sans fenêtre ni sinks, préfixe non vide (`1 < rows < len`),
+    /// longueur ≥ seuil du 2-passes et indices `u32` des noyaux scalaires. À
+    /// une ligne, le 2-passes (limité par la bande passante) reste plus rapide.
+    pub(super) fn rows_nax_eligible(&self, rows: usize, window: Option<usize>) -> bool {
+        let len = self.stored_len();
+        let (q_heads, kv_heads, head_dim) = (self.q_heads(), self.kv_heads(), self.head_dim());
+        rows > 1
+            && rows < len
+            && window.is_none()
+            && self.quant().is_none()
+            && !self.has_sinks()
+            && self.keys().element() == GpuElement::Bf16
+            && matches!(head_dim, 128 | 256)
+            && kv_heads > 0
+            && q_heads > kv_heads
+            && q_heads % kv_heads == 0
+            && sdpa_2pass_enabled()
+            && flash_sdpa_enabled()
+            && len - rows + 1 >= sdpa_2pass_min_len()
+            && rows_nax_indices_fit(
+                len,
+                rows,
+                q_heads,
+                kv_heads,
+                head_dim,
+                crate::runtime_flags::verify_rows_nax_blocks(),
+            )
+    }
+
+    /// Attention des `rows` dernières lignes par le NAX : le préfixe
+    /// `[0, len − rows)` en split-K sur la dimension batch (Q packé en bf16),
+    /// la diagonale (lignes du tour, causale) et la fusion des blocs par
+    /// `rows_nax_reduce`. Périmètre vérifié par l'appelant
+    /// ([`Self::rows_nax_eligible`]). Le reste du préfixe (voir
+    /// `rows_nax_layout`) est dispatché à part.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `rows` n'est pas dans `[1, len)`, si le KV n'est pas
+    /// bf16, ou si une dimension ou un indice des noyaux déborde.
+    pub(super) fn encode_attention_rows_nax(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        nax: &RowsNax,
+        q_rows: &BufferRef,
+        out_rows: &BufferRef,
+        rows: usize,
+    ) -> Result<()> {
+        let len = self.stored_len();
+        if rows == 0 || rows >= len || self.keys().element() != GpuElement::Bf16 {
+            return Err(InferError::Dimension(format!(
+                "attention rows NAX: rows={rows} hors [1, len={len}) ou KV non bf16"
+            )));
+        }
+        let (q_heads, kv_heads, head_dim) = (self.q_heads(), self.kv_heads(), self.head_dim());
+        let gqa = q_heads / kv_heads.max(1);
+        let q_dim = q_heads * head_dim;
+        let kv_dim = self.kv_dim();
+        let target_blocks = crate::runtime_flags::verify_rows_nax_blocks();
+        if !rows_nax_indices_fit(len, rows, q_heads, kv_heads, head_dim, target_blocks) {
+            return Err(InferError::Dimension(format!(
+                "attention rows NAX: indices hors u32 (len={len}, rows={rows})"
+            )));
+        }
+        let prefix = len - rows;
+        let (block_len, full, rem, blocks) = rows_nax_layout(prefix, target_blocks);
+        let overflow = || InferError::Dimension("attention rows NAX déborde".to_string());
+        let q_cells = rows.checked_mul(q_dim).ok_or_else(overflow)?;
+        let lse_cells = blocks.checked_mul(rows * q_heads).ok_or_else(overflow)?;
+        let partial_cells = q_cells.checked_mul(blocks).ok_or_else(overflow)?;
+        // NOTE: les baux sont rendus au retour, avant le commit : c'est sûr
+        // seulement parce que tout réemploi suit dans le même encodeur,
+        // derrière la barrière de fin de dispatch (`post_dispatch_barrier`).
+        let packed = self.scratch().lease(q_cells, GpuElement::Bf16)?;
+        let partials = self.scratch().lease(partial_cells, GpuElement::F32)?;
+        let lse = self.scratch().lease(lse_cells, GpuElement::F32)?;
+        let dims = [
+            to_u32(q_heads, "rows NAX q_heads")?,
+            to_u32(kv_heads, "rows NAX kv_heads")?,
+            to_u32(rows, "rows NAX rows")?,
+        ];
+        encoder.set_compute_pipeline_state(&nax.pack_q);
+        encoder.set_buffer(0, Some(q_rows), 0);
+        encoder.set_buffer(1, Some(packed.tensor().buffer()), 0);
+        set_bytes(encoder, 2, &dims);
+        let width = nax.pack_q.thread_execution_width().max(1);
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_threads(
+            MTLSize::new(to_u64(q_cells, "rows NAX q")?, 1, 1),
+            MTLSize::new(width, 1, 1),
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
+
+        let (keys, values) = (self.keys().buffer(), self.values().buffer());
+        // Bloc plein puis reste : `(premier bloc, blocs, clés par bloc)`.
+        for (first, batches, block) in [(0, full, block_len), (full, 1, rem)] {
+            if batches == 0 || block == 0 {
+                continue;
+            }
+            let kv_offset =
+                byte_offset(first * block_len * kv_dim, GpuElement::Bf16, "rows NAX kv")?;
+            let buffers = crate::metal_backend::NaxRowsBuffers {
+                q: packed.tensor().buffer(),
+                keys: (keys, kv_offset),
+                values: (values, kv_offset),
+                out: (
+                    partials.tensor().buffer(),
+                    byte_offset(first * q_cells, GpuElement::F32, "rows NAX out")?,
+                ),
+                lse: (
+                    lse.tensor().buffer(),
+                    byte_offset(first * rows * q_heads, GpuElement::F32, "rows NAX lse")?,
+                ),
+            };
+            nax.nax.encode(
+                encoder,
+                &buffers,
+                crate::metal_backend::NaxRowsDispatch {
+                    kv_heads,
+                    q_rows: gqa * rows,
+                    block_len: block,
+                    batches,
+                },
+            )?;
+        }
+
+        let dims = [
+            to_u32(q_heads, "rows NAX q_heads")?,
+            to_u32(kv_heads, "rows NAX kv_heads")?,
+            to_u32(prefix, "rows NAX prefix")?,
+            to_u32(blocks, "rows NAX blocks")?,
+        ];
+        encoder.set_compute_pipeline_state(&nax.reduce);
+        encoder.set_buffer(0, Some(q_rows), 0);
+        encoder.set_buffer(1, Some(keys), 0);
+        encoder.set_buffer(2, Some(values), 0);
+        encoder.set_buffer(3, Some(partials.tensor().buffer()), 0);
+        encoder.set_buffer(4, Some(lse.tensor().buffer()), 0);
+        encoder.set_buffer(5, Some(out_rows), 0);
+        set_bytes(encoder, 6, &dims);
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(dims[0]), to_u64(rows, "rows NAX rows")?, 1),
+            MTLSize::new(to_u64(head_dim, "rows NAX head_dim")?, 1, 1),
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
         Ok(())
     }
 }

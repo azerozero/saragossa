@@ -34,7 +34,7 @@ kernel void resident_add_f32(
 /// Renvoie l'état résident, ou `None` proprement si aucun device Metal n'est
 /// disponible (miroir des tests `metal_backend`, pour la CI sans GPU). Une
 /// erreur de compilation des kernels FAIT échouer le test (pas de skip).
-fn try_state() -> Result<Option<DecodeResidentState>> {
+pub(super) fn try_state() -> Result<Option<DecodeResidentState>> {
     match Device::system_default() {
         Some(device) => Ok(Some(DecodeResidentState::new(device)?)),
         None => Ok(None),
@@ -75,7 +75,7 @@ fn set_u32(encoder: &metal::ComputeCommandEncoderRef, index: u64, value: u32) {
     unsafe_code,
     reason = "écriture d'un MTLBuffer partagé avant commit (test)"
 )]
-fn seed_f32(tensor: &GpuTensor, data: &[f32]) {
+pub(super) fn seed_f32(tensor: &GpuTensor, data: &[f32]) {
     assert_eq!(tensor.len(), data.len(), "seed: longueur incohérente");
     let ptr = tensor.buffer().contents().cast::<f32>();
     assert!(!ptr.is_null(), "MTLBuffer partagé sans pointeur CPU");
@@ -90,7 +90,7 @@ fn seed_f32(tensor: &GpuTensor, data: &[f32]) {
     unsafe_code,
     reason = "lecture d'un MTLBuffer partagé après wait_until_completed (test)"
 )]
-fn read_f32(tensor: &GpuTensor) -> Vec<f32> {
+pub(super) fn read_f32(tensor: &GpuTensor) -> Vec<f32> {
     let ptr = tensor.buffer().contents().cast::<f32>();
     assert!(!ptr.is_null(), "MTLBuffer partagé sans pointeur CPU");
     let mut out = vec![0.0_f32; tensor.len()];
@@ -109,7 +109,7 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
     (rounded >> 16) as u16
 }
 
-fn bf16_round_to_f32(value: f32) -> f32 {
+pub(super) fn bf16_round_to_f32(value: f32) -> f32 {
     f32::from_bits(u32::from(f32_to_bf16_bits(value)) << 16)
 }
 
@@ -541,7 +541,7 @@ fn full_attention_state_rejects_non_multiple_gqa() -> Result<()> {
 
 /// Données pseudo-aléatoires déterministes dans `[-0.1, 0.1]` (pas de crate
 /// rand ; reproductible). Garde des produits scalaires modérés (softmax sain).
-fn pseudo(seed: usize) -> f32 {
+pub(super) fn pseudo(seed: usize) -> f32 {
     let x = (seed.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9) % 1000;
     (x as f32 / 1000.0 - 0.5) * 0.2
 }
@@ -2572,7 +2572,7 @@ fn encode_position_cycle(
     Ok(())
 }
 
-fn lease_with(state: &DecodeResidentState, data: &[f32]) -> Result<ScratchLease> {
+pub(super) fn lease_with(state: &DecodeResidentState, data: &[f32]) -> Result<ScratchLease> {
     let lease = state.scratch().lease(data.len(), GpuElement::F32)?;
     seed_f32(lease.tensor(), data);
     Ok(lease)

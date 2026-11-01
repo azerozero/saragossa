@@ -48,15 +48,26 @@ impl KernelSources {
                 &root,
                 &["steel_attention", "steel_attention.metal"],
             )?),
-            // Optionnelle : un répertoire préparé avant le NAX reste valide.
-            steel_attention_nax: match read_runtime_kernel(
-                &root,
-                &["steel_attention_nax", "steel_attention_nax.metal"],
-            ) {
-                Ok(source) => Cow::Owned(source),
-                Err(_) => Cow::Borrowed(STEEL_ATTENTION_NAX_KERNELS),
-            },
+            steel_attention_nax: steel_attention_nax_at(&root),
         })
+    }
+}
+
+/// Source NAX sous `root`, optionnelle : un répertoire préparé avant le NAX
+/// reste valide (repli sur la source embarquée).
+fn steel_attention_nax_at(root: &Path) -> Cow<'static, str> {
+    match read_runtime_kernel(root, &["steel_attention_nax", "steel_attention_nax.metal"]) {
+        Ok(source) => Cow::Owned(source),
+        Err(_) => Cow::Borrowed(STEEL_ATTENTION_NAX_KERNELS),
+    }
+}
+
+/// Source NAX que compile le prefill : override `SARAGOSSA_RUST_KERNELS_PATH`
+/// s'il en fournit une, source embarquée sinon.
+pub(super) fn steel_attention_nax_source() -> Cow<'static, str> {
+    match crate::runtime_flags::env_var_os("SARAGOSSA_RUST_KERNELS_PATH") {
+        Some(root) => steel_attention_nax_at(Path::new(&root)),
+        None => Cow::Borrowed(STEEL_ATTENTION_NAX_KERNELS),
     }
 }
 
@@ -266,7 +277,7 @@ pub(super) fn compile_gated_delta_nax(
     compile_nax_function(device, source, GATED_DELTA_NAX_HK16_HV48, &[(200, false)])
 }
 
-fn compile_nax_function(
+pub(super) fn compile_nax_function(
     device: &Device,
     source: &str,
     name: &str,

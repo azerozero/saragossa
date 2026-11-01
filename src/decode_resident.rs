@@ -67,6 +67,8 @@ mod types;
 mod utils;
 
 #[cfg(test)]
+mod rows_nax_tests;
+#[cfg(test)]
 mod sink_tests;
 #[cfg(test)]
 mod tests;
