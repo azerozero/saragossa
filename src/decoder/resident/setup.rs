@@ -211,8 +211,8 @@ impl CausalDecoder {
     /// 64k 25,7 → 31,4 tok/s, empreinte −2,3 / −4,6 Go, 25 oct. 2026, 27B 4 bits ;
     /// seule divergence de texte vue à 64k, un near-tie de marge 0,0015 contre
     /// 3,09 en médiane). Le greedy court reste f32 pour ses oracles md5 ; les
-    /// arènes d'extension, DFlash, TTS et oracles passent `false` : leurs lignes
-    /// relues vers le cache CPU restent f32 exactes.
+    /// arènes d'extension, TTS et oracles passent `false` : leurs lignes relues
+    /// vers le cache CPU restent f32 exactes. Le DFlash résident suit cette règle.
     // NOTE: Les oracles md5 du harnais pairwise portent sur des prompts courts
     // (≤ 3,5k tokens) et ne franchissent pas ce seuil ; ctxbench vérifie des
     // marqueurs, pas des md5.

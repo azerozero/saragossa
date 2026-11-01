@@ -513,7 +513,8 @@ mod kv_bf16_resolution_tests {
     fn table_de_verite_du_format_kv() {
         // (SARAGOSSA_RUST_KV_BF16, défaut de l'appelant, SARAGOSSA_RUST_KV_QUANT) → format.
         let cases = [
-            // Arènes f32 exactes (greedy court, extension, TTS, DFlash) : jamais quantifiées.
+            // Arènes f32 exactes (greedy court, extension, TTS, boucle DFlash CPU) :
+            // jamais quantifiées.
             (None, false, KvFormat::Q8, KvFormat::F32),
             (None, false, KvFormat::Bf16, KvFormat::F32),
             // Défaut de KV_QUANT : bf16 inchangé.

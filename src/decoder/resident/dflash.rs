@@ -32,8 +32,10 @@ struct DFlashResidentBuffers {
 
 impl CausalDecoder {
     /// Génère en greedy avec le drafter DFlash résident et la vérification
-    /// résidente en lignes. Sorties identiques à l'AR (vérifieur exact) et à la
-    /// boucle CPU, à la précision des matmuls près pour la proposition.
+    /// résidente en lignes. Sorties identiques à l'AR résident de même précision
+    /// KV (vérifieur exact) ; face à la boucle CPU f32, l'écart vient des matmuls
+    /// de la proposition et, au-delà du seuil greedy, du KV bf16 du vérifieur
+    /// (`resident_kv_bf16`), qui peut trancher autrement un quasi-ex aequo.
     ///
     /// # Errors
     ///
@@ -134,7 +136,19 @@ impl CausalDecoder {
             .unwrap_or(usize::MAX);
         let (mut cache, final_state, target_hidden, captured_from) =
             self.prefill_cache_state_with_layer_capture_cached(prompt, layer_ids, keep_rows)?;
-        if !self.setup_resident_decode_from_prefill(&mut cache, max_new_tokens + draft_limit + 1)? {
+        // Même règle KV que la vérification MTP (`resident_kv_bf16`) : bf16 au-delà du
+        // seuil greedy, où la lecture du KV domine la vérification en lignes. Le
+        // drafter garde son propre KV dense ; la boucle CPU de référence reste f32.
+        let kv_bf16 = Self::resident_kv_bf16(false, cache.position);
+        if self.config.metal_unsupported_reason().is_some()
+            || !self.supports_resident_full_decode()
+            || !self.setup_resident_full_decode(
+                &mut cache,
+                max_new_tokens + draft_limit + 1,
+                0,
+                kv_bf16,
+            )?
+        {
             return Err(InferError::Config(
                 "decode DFlash résident: decode résident complet indisponible".to_string(),
             ));
