@@ -3568,7 +3568,8 @@ fn qwen_kv_nax_x3_shape_targets_dense_qwen_27b_only() {
 /// arbre DFlash de B nœuds (B + 1 lignes). Lignes > 9 sans captures linéaires (le
 /// scan séquentiel en a 8 au plus ; un arbre n'en utiliserait pas) ; 9 lignes
 /// mesurées avec et sans, pour isoler leur part. Médiane de 8 répétitions après 2
-/// d'échauffement, rollback par troncature entre deux répétitions.
+/// d'échauffement, rollback par troncature du KV entre deux répétitions ; les états
+/// linéaires ne sont pas restaurés (coût seul, pas un oracle numérique).
 #[test]
 #[ignore = "modèle réel + draft DFlash requis, bench"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]

@@ -301,6 +301,8 @@ Chantier mesuré machine libre (`dflash_resident.sh` dans le scratchpad : `oracl
   dernières positions du prompt (toutes les couches sont fenêtrées). Oracle modèle
   réel ignoré `dflash_resident_matches_cpu_loop_real_model` (résident == CPU == AR).
   `SARAGOSSA_RUST_DFLASH_PROFILE=1` imprime le coût moyen par tour par segment.
+  `SARAGOSSA_RUST_DFLASH_TREE_TRACE=<chemin>` écrit la trace d'arbre JSONL (chaque
+  génération écrase le fichier, y compris sous `serve`).
   Au-delà de la fenêtre, l'attention du bloc passe en lignes (un dispatch par
   couche) ; `SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS=0` rétablit la boucle naïve.
 
