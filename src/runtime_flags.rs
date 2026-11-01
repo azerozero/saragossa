@@ -877,7 +877,13 @@ pub(crate) fn prefill_attn_nax_window_enabled() -> bool {
 /// le NAX ne compile pas, repli sur le 2-passes en lignes. Attention seule
 /// (bench `bench_rows_attention_long_context`, 16 couches, M5 Max) à 32k :
 /// 2 lignes 7,5 → 6,7 ms, 3 lignes 10,0 → 6,8, 8 lignes 24,6 → 7,4 ; à 64k,
-/// 8 lignes 48,1 → 12,8 ms.
+/// 8 lignes 48,1 → 12,8 ms. De bout en bout (27B, 400 tokens greedy, même
+/// binaire, 2026-11-01) : DFlash code 32k 37,7 → 46,2 tok/s (vérification
+/// 86 → 68 ms par tour), prose 32k 34,9 → 44,2, code 64k 18,5 → 28,8
+/// (117 → 73 ms) ; MTP 39,8 → 40,3, 37,1 → 38,1 et 28,4 → 30,5 tok/s.
+/// Textes identiques dans les 6 cas. Écart à l'oracle CPU f64 à entrées
+/// égales ≤ 2,3e-5 (`verify_rows_nax_matches_cpu_oracle`) ; flag actif, le
+/// chemin en lignes n'est plus bit-identique à la boucle par ligne.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn verify_rows_nax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
