@@ -370,32 +370,17 @@ impl DFlashSelector {
         anchor: usize,
     ) -> Result<Vec<usize>> {
         let positions = candidates.len();
-        if projected.len() != positions * self.rank {
-            return Err(InferError::Dimension(format!(
-                "draft DFlash sélecteur : projection de {} valeurs, attendu {positions}×{}",
-                projected.len(),
-                self.rank
-            )));
-        }
-        let vocab = self.predecessor_codebook.shape()[0];
-        fn codebook_row(codebook: &Tensor, token: usize, vocab: usize) -> Result<&[f32]> {
-            if token >= vocab {
-                return Err(InferError::Dimension(format!(
-                    "draft DFlash sélecteur token {token} hors vocabulaire {vocab}"
-                )));
-            }
-            codebook.row_slice(token)
-        }
+        self.check_projection(projected, positions)?;
         let mut previous = anchor;
         let mut path = Vec::with_capacity(positions);
         for (position, row_candidates) in candidates.iter().enumerate() {
-            let proj = &projected[position * self.rank..(position + 1) * self.rank];
-            let pred = codebook_row(&self.predecessor_codebook, previous, vocab)?;
-            let gate: Vec<f32> = pred.iter().zip(proj).map(|(p, h)| p * h).collect();
+            let gate = self.gate(
+                previous,
+                &projected[position * self.rank..(position + 1) * self.rank],
+            )?;
             let mut best: Option<(usize, f32)> = None;
             for &(token, unary) in row_candidates {
-                let score =
-                    unary + dot(&gate, codebook_row(&self.successor_codebook, token, vocab)?);
+                let score = self.edge_score(&gate, token, unary)?;
                 if best.is_none_or(|(_, b)| score > b) {
                     best = Some((token, score));
                 }
@@ -407,6 +392,74 @@ impl DFlashSelector {
             previous = token;
         }
         Ok(path)
+    }
+
+    /// Scores de toutes les arêtes du treillis des candidats, pour le diagnostic de
+    /// vérification en arbre (`SARAGOSSA_RUST_DFLASH_TREE_TRACE`) : la ligne 0 donne
+    /// `top_k` scores depuis l'ancre, la ligne `p > 0` une matrice `[prev][cand]`
+    /// aplatie depuis chaque candidat de la ligne `p - 1`. Même score que
+    /// [`Self::select_projected`], dont le parcours glouton est un chemin de ce treillis.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les tailles divergent ou si un candidat sort du
+    /// vocabulaire.
+    pub fn transition_scores(
+        &self,
+        projected: &[f32],
+        candidates: &[Vec<(usize, f32)>],
+        anchor: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.check_projection(projected, candidates.len())?;
+        let mut rows = Vec::with_capacity(candidates.len());
+        for (position, row_candidates) in candidates.iter().enumerate() {
+            let proj = &projected[position * self.rank..(position + 1) * self.rank];
+            let previous: Vec<usize> = match position.checked_sub(1) {
+                Some(before) => candidates[before].iter().map(|&(token, _)| token).collect(),
+                None => vec![anchor],
+            };
+            let mut scores = Vec::with_capacity(previous.len() * row_candidates.len());
+            for prev in previous {
+                let gate = self.gate(prev, proj)?;
+                for &(token, unary) in row_candidates {
+                    scores.push(self.edge_score(&gate, token, unary)?);
+                }
+            }
+            rows.push(scores);
+        }
+        Ok(rows)
+    }
+
+    fn check_projection(&self, projected: &[f32], positions: usize) -> Result<()> {
+        if projected.len() != positions * self.rank {
+            return Err(InferError::Dimension(format!(
+                "draft DFlash sélecteur : projection de {} valeurs, attendu {positions}×{}",
+                projected.len(),
+                self.rank
+            )));
+        }
+        Ok(())
+    }
+
+    fn codebook_row<'a>(&self, codebook: &'a Tensor, token: usize) -> Result<&'a [f32]> {
+        let vocab = self.predecessor_codebook.shape()[0];
+        if token >= vocab {
+            return Err(InferError::Dimension(format!(
+                "draft DFlash sélecteur token {token} hors vocabulaire {vocab}"
+            )));
+        }
+        codebook.row_slice(token)
+    }
+
+    /// `pred[previous] ⊙ proj(h)` : ne dépend que du prédécesseur, calculé une fois
+    /// par ligne et réutilisé pour tous les candidats.
+    fn gate(&self, previous: usize, proj: &[f32]) -> Result<Vec<f32>> {
+        let pred = self.codebook_row(&self.predecessor_codebook, previous)?;
+        Ok(pred.iter().zip(proj).map(|(p, h)| p * h).collect())
+    }
+
+    fn edge_score(&self, gate: &[f32], token: usize, unary: f32) -> Result<f32> {
+        Ok(unary + dot(gate, self.codebook_row(&self.successor_codebook, token)?))
     }
 }
 
@@ -1510,5 +1563,27 @@ mod dflash2_tests {
             )
             .unwrap();
         assert_eq!(path, vec![0, 2]);
+
+        // Treillis complet : ligne 0 depuis l'ancre, ligne 1 [prev][cand] ; le parcours
+        // glouton sur ces scores redonne le chemin du sélecteur.
+        let candidates = vec![vec![(0, 0.5), (2, 0.4)], vec![(0, 0.5), (2, 0.4)]];
+        let scores = selector
+            .transition_scores(&[1.0, -1.0], &candidates, 1)
+            .unwrap();
+        let close = |left: &[f32], right: &[f32]| {
+            left.len() == right.len() && left.iter().zip(right).all(|(l, r)| (l - r).abs() < 1e-6)
+        };
+        assert!(close(&scores[0], &[2.5, -1.6]));
+        // prev 0 (pred 1, h −1) : 0.5 − 1, 0.4 + 1 ; prev 2 (pred 3) : 0.5 − 3, 0.4 + 3.
+        assert!(close(&scores[1], &[-0.5, 1.4, -2.5, 3.4]));
+        let greedy0 = if scores[0][0] >= scores[0][1] { 0 } else { 1 };
+        let row1 = &scores[1][greedy0 * 2..greedy0 * 2 + 2];
+        let greedy1 = if row1[0] >= row1[1] { 0 } else { 1 };
+        assert_eq!(
+            vec![candidates[0][greedy0].0, candidates[1][greedy1].0],
+            selector
+                .select_projected(&[1.0, -1.0], &candidates, 1)
+                .unwrap()
+        );
     }
 }
