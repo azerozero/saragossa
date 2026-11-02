@@ -1563,6 +1563,34 @@ pub fn serve_lru_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SERVE_LRU", true))
 }
 
+/// Plafond de connexions de `saragossa serve` en cours de lecture
+/// (`SARAGOSSA_SERVE_MAX_CONNECTIONS`, 64 par défaut). Chaque connexion lit sa
+/// requête dans son propre thread : le plafond borne les threads qu'un client
+/// au goutte-à-goutte peut épingler ; au-delà, le serveur répond 503.
+pub fn serve_max_connections() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_SERVE_MAX_CONNECTIONS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|max| *max > 0)
+            .unwrap_or(64)
+    })
+}
+
+/// Profondeur de la file de requêtes en attente du thread moteur de
+/// `saragossa serve` (`SARAGOSSA_SERVE_QUEUE`, 32 par défaut). L'inférence
+/// reste sérielle : une file pleine répond 503 plutôt que d'accumuler des
+/// sockets ouvertes sans borne.
+pub fn serve_queue_depth() -> usize {
+    static DEPTH: OnceLock<usize> = OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_SERVE_QUEUE")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|depth| *depth > 0)
+            .unwrap_or(32)
+    })
+}
+
 /// Active la garde OOM prédictive de `saragossa serve`.
 pub fn serve_oom_guard_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

@@ -269,11 +269,11 @@ pub(super) struct ModelsResponse {
 }
 
 impl ModelsResponse {
-    /// Construit une réponse models.
-    pub(super) fn new(models: Vec<ModelInfo>) -> Self {
+    /// Construit la réponse models depuis les identifiants exposés.
+    pub(super) fn from_ids(ids: &[String]) -> Self {
         Self {
             object: "list",
-            data: models,
+            data: ids.iter().map(ModelInfo::new).collect(),
         }
     }
 }

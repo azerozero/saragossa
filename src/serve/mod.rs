@@ -1,8 +1,12 @@
 //! Sous-commande `saragossa serve`.
 //!
-//! Le serveur est volontairement mono-thread: il cible un usage local
-//! mono-utilisateur, donc une requête longue bloque les suivantes
-//! (head-of-line blocking assumé).
+//! Concurrence d'E/S seulement (voir `dispatch`) : un thread d'accept et un
+//! thread par connexion (plafond `SARAGOSSA_SERVE_MAX_CONNECTIONS`, 64) lisent
+//! les requêtes et servent `/health` et `/v1/models` même pendant une
+//! génération. L'inférence reste sérielle sur le thread moteur, le thread
+//! principal qui possède `ServeState` ; les requêtes en attente passent par une
+//! file bornée (`SARAGOSSA_SERVE_QUEUE`, 32). Au-delà de l'un des deux
+//! plafonds, le serveur répond 503 immédiatement.
 //!
 //! Le parseur HTTP accepte uniquement les corps à `Content-Length`.
 //! `Transfer-Encoding: chunked` n'est pas pris en charge.
@@ -11,6 +15,7 @@ mod anthropic;
 mod args;
 mod audio;
 mod cache;
+mod dispatch;
 mod embeddings;
 pub(crate) mod error;
 mod flint_output;
