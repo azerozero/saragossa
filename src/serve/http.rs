@@ -45,13 +45,9 @@ pub(super) fn serve_tcp(
     eprintln!("saragossa serve TCP listening on http://{addr}/v1");
     eprintln!("saragossa serve TCP bearer auth enabled");
     let front = Front::new(Some(api_key.to_string()), state.model_ids());
-    dispatch::serve(
-        state,
-        front,
-        read_timeout,
-        configure_tcp_stream,
-        move |dispatcher| dispatcher.accept_all(listener.incoming(), "accept TCP"),
-    )
+    dispatch::serve(state, front, read_timeout, move |dispatcher| {
+        dispatcher.accept_all(listener.incoming(), "accept TCP")
+    })
 }
 
 /// Sert en HTTP sur socket Unix avec permissions propriétaire.
@@ -72,13 +68,9 @@ pub(super) fn serve_unix(
         path.display()
     );
     let front = Front::new(None, state.model_ids());
-    dispatch::serve(
-        state,
-        front,
-        read_timeout,
-        configure_unix_stream,
-        move |dispatcher| dispatcher.accept_all(listener.incoming(), "accept socket Unix"),
-    )
+    dispatch::serve(state, front, read_timeout, move |dispatcher| {
+        dispatcher.accept_all(listener.incoming(), "accept socket Unix")
+    })
 }
 
 /// Echec explicite hors Unix.
@@ -132,14 +124,29 @@ fn prepare_socket_path(path: &Path) -> ServeResult<()> {
     }
 }
 
-/// Lit la requête ; une requête illisible reçoit sa réponse d'erreur ici.
-pub(super) fn read_or_reject<S: Read + Write>(
+/// Lit avec `read` ; une requête illisible reçoit sa réponse d'erreur ici.
+pub(super) fn read_or_reject<S: Read + Write, T>(
     stream: &mut S,
-    read_deadline: Instant,
-) -> ServeResult<Option<HttpRequest>> {
-    read_request(stream, read_deadline).inspect_err(|error| {
+    read: impl FnOnce(&mut S) -> ServeResult<T>,
+) -> ServeResult<T> {
+    read(stream).inspect_err(|error| {
         let _ = send_error(stream, error_status(error), &error.to_string());
     })
+}
+
+/// Erreur au format de la route : Anthropic pour `/v1/messages`, comme les
+/// autres erreurs de cette route.
+pub(super) fn send_route_error<S: Write>(
+    stream: &mut S,
+    request: &HttpRequest,
+    status: u16,
+    message: &str,
+) -> ServeResult<()> {
+    if request.route() == "/v1/messages" {
+        send_anthropic_error(stream, status, message)
+    } else {
+        send_error(stream, status, message)
+    }
 }
 
 /// Tente d'envoyer une réponse d'erreur avant de propager l'échec.
@@ -483,7 +490,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 #[derive(Debug)]
 pub(super) struct HttpRequest {
-    method: String,
+    pub(super) method: String,
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -504,7 +511,23 @@ impl HttpRequest {
     }
 }
 
+/// Lit headers puis corps d'un trait (chemin des tests sans threads).
+#[cfg(test)]
 fn read_request<S: Read>(stream: &mut S, deadline: Instant) -> ServeResult<Option<HttpRequest>> {
+    let Some((mut request, content_length)) = read_head(stream, deadline)? else {
+        return Ok(None);
+    };
+    read_body(stream, &mut request, content_length, deadline)?;
+    Ok(Some(request))
+}
+
+/// Lit les headers seuls : le corps reste sur la socket pour qu'un client non
+/// authentifié ne fasse jamais allouer ses 16 Mio. Le corps de la requête
+/// rendue ne contient que les octets déjà reçus ; la longueur annoncée suit.
+pub(super) fn read_head<S: Read>(
+    stream: &mut S,
+    deadline: Instant,
+) -> ServeResult<Option<(HttpRequest, usize)>> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
     let header_end = loop {
@@ -542,8 +565,28 @@ fn read_request<S: Read>(stream: &mut S, deadline: Instant) -> ServeResult<Optio
     if content_length > MAX_BODY_BYTES {
         return Err(ServeError::Http("body trop grand".to_string()));
     }
-    let body_start = header_end + 4;
-    let mut body = buffer[body_start..].to_vec();
+    let body = buffer[header_end + 4..].to_vec();
+    Ok(Some((
+        HttpRequest {
+            method,
+            path,
+            headers,
+            body,
+        },
+        content_length,
+    )))
+}
+
+/// Complète le corps annoncé par `Content-Length` (déjà borné par
+/// [`read_head`]).
+pub(super) fn read_body<S: Read>(
+    stream: &mut S,
+    request: &mut HttpRequest,
+    content_length: usize,
+    deadline: Instant,
+) -> ServeResult<()> {
+    let mut chunk = [0_u8; 1024];
+    let body = &mut request.body;
     while body.len() < content_length {
         if Instant::now() >= deadline {
             return Err(ServeError::Http(
@@ -559,12 +602,7 @@ fn read_request<S: Read>(stream: &mut S, deadline: Instant) -> ServeResult<Optio
         body.extend_from_slice(&chunk[..read]);
     }
     body.truncate(content_length);
-    Ok(Some(HttpRequest {
-        method,
-        path,
-        headers,
-        body,
-    }))
+    Ok(())
 }
 
 fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
@@ -638,7 +676,7 @@ mod tests {
         api_key: Option<&str>,
         read_deadline: Instant,
     ) -> ServeResult<()> {
-        let Some(request) = read_or_reject(stream, read_deadline)? else {
+        let Some(request) = read_or_reject(stream, |s| read_request(s, read_deadline))? else {
             return Ok(());
         };
         let front = Front::new(api_key.map(str::to_string), state.model_ids());

@@ -1570,7 +1570,7 @@ pub fn serve_lru_enabled() -> bool {
 pub fn serve_max_connections() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
-        crate::runtime_flags::env_var("SARAGOSSA_SERVE_MAX_CONNECTIONS")
+        env_var("SARAGOSSA_SERVE_MAX_CONNECTIONS")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|max| *max > 0)
             .unwrap_or(64)
@@ -1584,10 +1584,23 @@ pub fn serve_max_connections() -> usize {
 pub fn serve_queue_depth() -> usize {
     static DEPTH: OnceLock<usize> = OnceLock::new();
     *DEPTH.get_or_init(|| {
-        crate::runtime_flags::env_var("SARAGOSSA_SERVE_QUEUE")
+        env_var("SARAGOSSA_SERVE_QUEUE")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|depth| *depth > 0)
             .unwrap_or(32)
+    })
+}
+
+/// Budget global d'octets de corps de requête lus ou en attente du moteur de
+/// `saragossa serve` (`SARAGOSSA_SERVE_MAX_INFLIGHT_BYTES`, 256 Mio par
+/// défaut). Sans lui, 64 connexions × 16 Mio de corps retiendraient ~1 Gio ;
+/// au-delà, 503 avant de lire le corps.
+pub fn serve_max_inflight_bytes() -> usize {
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        env_var("SARAGOSSA_SERVE_MAX_INFLIGHT_BYTES")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(256 << 20)
     })
 }
 
