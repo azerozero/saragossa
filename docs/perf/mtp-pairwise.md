@@ -963,6 +963,23 @@ restaure un préfixe cohérent par captures (un token accepté par répétition)
 | 2 | −1,6 % | +1,1 % | +0,1 % | +19,6 % | −1,5 % |
 | 8 | −2,4 % | +2,1 % | 0,0 % | +87,0 % | −2,5 % |
 
+### Stop sequences sur le chemin spéculatif (2 nov. 2026)
+
+Les requêtes avec `stop`, et Anthropic avec outils (`</tool_call>` ajouté),
+passent désormais par MTP ou DFlash au lieu de l'AR : `supports_options`
+n'exige plus de liste vide. Le cœur MTP balaie une fois les tokens committés
+de chaque tour, DFlash teste chaque token émis (chaîne et arbre) ; la sortie
+est celle de l'AR, séquence incluse, rien n'est émis au-delà. La bascule
+DFlash → MTP reste coupée avec des séquences, et le bloc GPU D1 leur reste
+fermé. Une stop texte est tokenisée seule : si le modèle l'écrit avec une
+autre découpe, seul le filtre texte de serve la retire, comme en AR.
+
+Mesure CLI (`--stop`, nouveau), 27B 4 bits, prompt de code de 28 tokens,
+300 tokens max, `--stop "Invalid semantic version"` : arrêt identique à
+252 tokens sur les trois chemins, 3 passes. Decode : AR 29,4 / 32,3 /
+32,3 tok/s, MTP 53,1 / 56,7 / 55,3, DFlash (`SARAGOSSA_RUST_DFLASH_DRAFT_DIR`)
+75,5 / 79,6 / 69,5.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.
