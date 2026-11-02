@@ -2843,6 +2843,157 @@ fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
     Ok(())
 }
 
+/// Stop sequences dans le cœur MTP sans drafter : sortie et flux identiques à
+/// l'AR avec les mêmes séquences, à toutes les positions, en défaut de
+/// production (fresh adaptatif) et forcés D1, D2, émission différée et lookup
+/// (vérifieur général). En échantillonné, la sortie est le préfixe de la
+/// trajectoire sans séquence, terminé par la séquence. Requiert
+/// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
+#[test]
+#[ignore = "modèle réel avec sidecar MTP requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn mtp_stop_sequences_match_ar_real_model() -> Result<()> {
+    use crate::runtime_flags::pairwise::{Case, Guard, Mode};
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+        eprintln!("skip stop sequences MTP : sidecar MTP absent");
+        return Ok(());
+    };
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(mtp_path)?;
+    let prompt = mtp_verifier_prompt_ids(
+        &assets,
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+    )?;
+    let max_new_tokens = 32;
+    let options = mtp_verifier_options(Vec::new());
+    let ar = model.generate_greedy_cached_with_options(&prompt, max_new_tokens, &options)?;
+    let with_sequence = |sequence: Vec<usize>, base: &GenerationOptions| GenerationOptions {
+        stop_sequences: vec![sequence],
+        ..base.clone()
+    };
+    let cases = stop_sequence_cases(&ar);
+    for (sequence, end) in &cases {
+        let ar_seq = model.generate_greedy_cached_with_options(
+            &prompt,
+            max_new_tokens,
+            &with_sequence(sequence.clone(), &options),
+        )?;
+        assert_eq!(ar_seq, ar[..=*end], "AR, stop sequence en {end}");
+    }
+    let configs = [
+        ("défaut", None),
+        ("D1", Some(Case::default())),
+        (
+            "D1 différé",
+            Some(Case {
+                overlap: true,
+                ..Case::default()
+            }),
+        ),
+        (
+            "D2",
+            Some(Case {
+                mode: Mode::D2,
+                ..Case::default()
+            }),
+        ),
+        (
+            "D2 différé",
+            Some(Case {
+                mode: Mode::D2,
+                overlap: true,
+                ..Case::default()
+            }),
+        ),
+        (
+            "lookup",
+            Some(Case {
+                lookup: 8,
+                ..Case::default()
+            }),
+        ),
+        (
+            "fresh",
+            Some(Case {
+                mode: Mode::Fresh,
+                ..Case::default()
+            }),
+        ),
+    ];
+    for (name, case) in configs {
+        let _guard = case.map(|case| Guard::set(case, false)).transpose()?;
+        let depth = case.map_or(2, Case::depth);
+        for (sequence, end) in &cases {
+            let mut streamed = Vec::new();
+            let spec = model.generate_greedy_mtp_streaming_with_options(
+                &prompt,
+                max_new_tokens,
+                &with_sequence(sequence.clone(), &options),
+                depth,
+                |token| {
+                    streamed.push(token);
+                    true
+                },
+            )?;
+            assert_eq!(
+                spec.tokens,
+                ar[..=*end],
+                "MTP {name}, stop sequence en {end}"
+            );
+            assert_eq!(
+                streamed, spec.tokens,
+                "flux MTP {name}, stop sequence en {end}"
+            );
+        }
+        eprintln!("stop sequences MTP {name} : {} positions ok", cases.len());
+    }
+    // Plusieurs séquences et stop token au même token, chemin par défaut.
+    let multiple = GenerationOptions {
+        stop_sequences: vec![cases[20].0.clone(), cases[8].0.clone()],
+        ..options.clone()
+    };
+    let spec =
+        model.generate_greedy_mtp_batched_with_options(&prompt, max_new_tokens, &multiple, 2)?;
+    assert_eq!(spec.tokens, ar[..=8], "MTP, séquences multiples");
+    let both = GenerationOptions {
+        stop_sequences: vec![cases[10].0.clone()],
+        ..mtp_verifier_options(vec![ar[10]])
+    };
+    let ar_both = model.generate_greedy_cached_with_options(&prompt, max_new_tokens, &both)?;
+    let spec = model.generate_greedy_mtp_batched_with_options(&prompt, max_new_tokens, &both, 2)?;
+    assert_eq!(
+        spec.tokens, ar_both,
+        "MTP, stop token et séquence au même token"
+    );
+    // Échantillonné : préfixe de la trajectoire libre, à seed fixe.
+    let warm = GenerationOptions {
+        temperature: 0.7,
+        seed: 7,
+        ..options.clone()
+    };
+    let free = model.generate_greedy_mtp_core(&prompt, max_new_tokens, &warm, 2, |_| true)?;
+    for (sequence, end) in stop_sequence_cases(&free.tokens).into_iter().step_by(3) {
+        let sampled = model.generate_greedy_mtp_core(
+            &prompt,
+            max_new_tokens,
+            &with_sequence(sequence, &warm),
+            2,
+            |_| true,
+        )?;
+        assert_eq!(
+            sampled.tokens,
+            free.tokens[..=end],
+            "MTP échantillonné, stop sequence en {end}"
+        );
+    }
+    Ok(())
+}
+
 /// Premier token MTP émis avant le semis de l'historique : le flux émet chaque
 /// token une seule fois, et un refus dès le premier rend ce seul token, à froid
 /// comme en extension du cache de préfixe. Requiert
