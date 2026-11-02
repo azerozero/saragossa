@@ -27,9 +27,7 @@ impl CausalDecoder {
                         Some(ResidentLayerBuffers::FullMoe(_))
                     )
                 }
-                (false, Some(FeedForward::Moe(_)))
-                    if crate::runtime_flags::moe_verify_rows_enabled() =>
-                {
+                (false, Some(FeedForward::Moe(_))) if prefill_moe_rows_enabled() => {
                     matches!(
                         arena.layers.get(index),
                         Some(ResidentLayerBuffers::LinearMoe(_))

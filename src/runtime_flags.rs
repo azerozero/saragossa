@@ -765,11 +765,10 @@ pub(crate) fn prefill_moe_rows_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_MOE_ROWS", true))
 }
 
-/// Vérification résidente en lignes des modèles MoE (couches `LinearMoe` et
-/// `FullMoe`, Qwen3.5/3.6 MoE) : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Défaut OFF
-/// tant que le coût de R lignes (experts distincts par ligne) n'est pas mesuré ;
-/// sans lui la vérification MoE reste séquentielle. Remplace, pour la
-/// vérification, l'ancien couplage au flag de prefill `SARAGOSSA_RUST_PREFILL_MOE_ROWS`.
+/// Vérification résidente en lignes des couches full-attn MoE shared
+/// (`FullMoe`, Qwen3.5/3.6 MoE) : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Défaut OFF :
+/// ρ(2) = 1,83 mesuré sur le 35B (docs/perf/mtp-pairwise.md). Les couches
+/// `LinearMoe` restent sous `SARAGOSSA_RUST_PREFILL_MOE_ROWS`, comme avant.
 pub(crate) fn moe_verify_rows_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_VERIFY_ROWS", false))
@@ -779,7 +778,10 @@ pub(crate) fn moe_verify_rows_enabled() -> bool {
 /// tête MTP ni drafter, vérification résidente en lignes) :
 /// `SARAGOSSA_RUST_LOOKUP_GREEDY=n`, borné à 8 (neuf lignes, limite des captures
 /// linéaires en journal). Défaut 0 = désactivé. Exige la vérification en lignes
-/// de tout le modèle (MoE : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`).
+/// de tout le modèle (MoE : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`). CLI seulement :
+/// les entrées depuis un état pré-rempli (`serve`) n'ont pas le prompt et
+/// gardent le decode habituel. Inactif sous plafond de débit
+/// (`SARAGOSSA_RUST_MAX_TOK_S`, `set_decode_max_tokens_per_s`).
 ///
 /// MESURE (2 nov. 2026, Qwen3.6-35B-A3B 4 bits, ABBA 3 paires contre le greedy
 /// AR, 400 tokens, sorties identiques à l'AR partout) : T6 (code qui recopie)
@@ -812,15 +814,6 @@ pub(crate) fn with_lookup_greedy_override<R>(drafts: usize, run: impl FnOnce() -
     let result = run();
     LOOKUP_GREEDY_OVERRIDE.with(|cell| cell.set(previous));
     result
-}
-
-/// Queue MoE shared de la vérification en lignes sur tensor-cores
-/// (`encode_moe_shared_rows_coop`, experts groupés) au lieu du gather par slot :
-/// `SARAGOSSA_RUST_MOE_VERIFY_COOP=1`. Défaut OFF : le seuil de rentabilité en
-/// nombre de lignes reste à mesurer.
-pub(crate) fn moe_verify_coop_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_VERIFY_COOP", false))
 }
 
 pub(super) fn prefill_chunk_size() -> usize {

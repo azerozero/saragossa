@@ -1204,8 +1204,9 @@ impl DecodeResidentState {
                 "full-attn MoE batché sans normes feed-forward Gemma".to_string(),
             ));
         }
-        // NOTE: gate/up/down et `tail_score` ne servent qu'à la queue dense, que
-        // `shared_moe` remplace : des poids de la couche tiennent leur place.
+        // NOTE: poids de remplissage. gate/up/down et `tail_score` ne servent qu'à
+        // la queue dense, que `shared_moe` remplace : `o_proj` et `input_norm`
+        // tiennent leur place sans jamais être lus à ce titre.
         let attention = FullAttnDenseLayerWeights {
             input_norm: weights.input_norm,
             qkv_proj: weights.qkv_proj,
@@ -2035,9 +2036,9 @@ impl DecodeResidentState {
     }
 
     /// Queue MoE shared en lignes de la vérification : `input` post-normé,
-    /// `residual` ajouté à la sortie. Gather par slot (`rows × top_k`) par
-    /// défaut ; experts groupés sur tensor-cores sous
-    /// `SARAGOSSA_RUST_MOE_VERIFY_COOP=1` quand les poids s'y prêtent.
+    /// `residual` ajouté à la sortie, gather par slot (`rows × top_k`). Le coop
+    /// sur tensor-cores, plus lent et hors tolérance ici, a été écarté
+    /// (docs/perf/mtp-pairwise.md).
     #[expect(
         clippy::too_many_arguments,
         reason = "queue MoE en lignes: buffers d'entrée, résiduel et sortie + poids"
@@ -2054,19 +2055,6 @@ impl DecodeResidentState {
         moe: &MetalMoeSharedWeights,
         top_k: usize,
     ) -> Result<()> {
-        if rows > 1 && crate::runtime_flags::moe_verify_coop_enabled() && moe.coop_compatible() {
-            return executor.encode_moe_shared_rows_coop(
-                encoder,
-                owned,
-                input,
-                Some(residual),
-                layer_out,
-                rows,
-                hidden,
-                moe,
-                top_k,
-            );
-        }
         executor.encode_moe_shared_buffers_rows(
             encoder,
             owned,
