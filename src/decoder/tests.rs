@@ -2152,6 +2152,24 @@ fn mtp_verifier_options(stop_token_ids: Vec<usize>) -> GenerationOptions {
     }
 }
 
+/// Stop sequences couvrant chaque position de `generated` : pour `end`, le plus
+/// court suffixe de `generated[..=end]` dont la première occurrence finit en
+/// `end`. L'AR avec cette seule séquence rend donc exactement
+/// `generated[..=end]` ; balayer toutes les positions couvre les arrêts au
+/// milieu des drafts acceptés comme les séquences à cheval sur deux tours.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn stop_sequence_cases(generated: &[usize]) -> Vec<(Vec<usize>, usize)> {
+    (0..generated.len())
+        .map(|end| {
+            let sequence = (1..=end + 1)
+                .map(|len| &generated[end + 1 - len..=end])
+                .find(|suffix| (0..end).all(|i| !generated[..=i].ends_with(suffix)))
+                .unwrap_or(&generated[..=end]);
+            (sequence.to_vec(), end)
+        })
+        .collect()
+}
+
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn mtp_verifier_case(
     model: &CausalDecoder,
@@ -3040,6 +3058,19 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
         let tree = run(&prompt, 32, &options, DFlashTreeMode::BestFirst(budget))?;
         assert_eq!(tree.tokens, ar, "arbre B={budget}");
     }
+    // Stop sequences, toutes positions : oracle AR par construction de
+    // `stop_sequence_cases` (vérifié dans le test de la chaîne), B = 8 partout,
+    // B = 1 sur quelques positions.
+    for (sequence, end) in stop_sequence_cases(&ar) {
+        let mut options_seq = options.clone();
+        options_seq.stop_sequences = vec![sequence];
+        let tree = run(&prompt, 32, &options_seq, DFlashTreeMode::BestFirst(8))?;
+        assert_eq!(tree.tokens, ar[..=end], "arbre B=8, stop sequence en {end}");
+        if [3, 11, 22].contains(&end) {
+            let tree = run(&prompt, 32, &options_seq, DFlashTreeMode::BestFirst(1))?;
+            assert_eq!(tree.tokens, ar[..=end], "arbre B=1, stop sequence en {end}");
+        }
+    }
     // Au-delà du journal (17 lignes) : refus explicite avant toute génération.
     assert!(run(&prompt, 32, &options, DFlashTreeMode::BestFirst(16)).is_err());
     Ok(())
@@ -3204,6 +3235,73 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         "boucle résidente avec stop token"
     );
     assert_eq!(streamed_stop, ar_stop, "callback avec stop token");
+    // Stop sequences (incluses dans la sortie) contre l'oracle AR, toutes
+    // positions. Un tour au moins accepte deux drafts : une séquence finissant
+    // sur le premier tombe au milieu des tokens acceptés.
+    assert!(
+        resident
+            .stats
+            .accepted_by_position
+            .get(1)
+            .is_some_and(|&count| count > 0),
+        "aucun tour à deux drafts acceptés : milieu de tour non couvert"
+    );
+    let with_stops = |sequences: Vec<Vec<usize>>, stop_token_ids: Vec<usize>| {
+        let mut options = mtp_verifier_options(stop_token_ids);
+        options.stop_sequences = sequences;
+        options
+    };
+    let check_chain = |options: &GenerationOptions, label: &str| -> Result<Vec<usize>> {
+        let ar = model.generate_greedy_cached_with_options(&prompt, max_new_tokens, options)?;
+        let mut streamed = Vec::new();
+        let chain = model.generate_greedy_dflash_resident_streaming_with_options(
+            &prompt,
+            max_new_tokens,
+            options,
+            &draft,
+            draft.info.block_size,
+            |token| {
+                streamed.push(token);
+                true
+            },
+        )?;
+        assert_eq!(chain.tokens, ar, "chaîne, stop sequence {label}");
+        assert_eq!(streamed, ar, "callback, stop sequence {label}");
+        Ok(ar)
+    };
+    for (sequence, end) in stop_sequence_cases(&ar) {
+        let label = format!("finissant en {end}");
+        let ar_seq = check_chain(&with_stops(vec![sequence], Vec::new()), &label)?;
+        assert_eq!(ar_seq, ar[..=end], "AR, stop sequence {label}");
+    }
+    let cases = stop_sequence_cases(&ar);
+    // Plusieurs séquences : la première terminée gagne.
+    let multiple = with_stops(vec![cases[20].0.clone(), cases[8].0.clone()], Vec::new());
+    assert_eq!(check_chain(&multiple, "multiple")?, ar[..=8]);
+    // Séquence présente seulement dans le prompt : sans effet.
+    if let Some(window) = prompt
+        .windows(2)
+        .find(|window| !ar.windows(2).any(|other| other == *window))
+    {
+        let prompt_only = with_stops(vec![window.to_vec()], Vec::new());
+        assert_eq!(check_chain(&prompt_only, "du prompt")?, ar);
+    }
+    // Stop token et séquence finissant au même token : le stop token gagne.
+    let both = with_stops(vec![cases[10].0.clone()], vec![ar[10]]);
+    check_chain(&both, "et stop token")?;
+    // Routage MTP → DFlash avec stop sequence.
+    let routed_seq = model.generate_greedy_mtp_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &with_stops(vec![cases[13].0.clone()], Vec::new()),
+        2,
+        |_| true,
+    )?;
+    assert_eq!(
+        routed_seq.tokens,
+        ar[..=13],
+        "routage DFlash, stop sequence"
+    );
     // Extension du cache de préfixe : prompt + 3 tokens déjà générés, suffixe
     // et captures calculés per-op sur l'entrée précédente, même sortie que l'AR.
     let mut extended = prompt.clone();
