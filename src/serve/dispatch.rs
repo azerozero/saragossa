@@ -254,15 +254,21 @@ struct Reservation {
 
 impl Reservation {
     fn acquire(counter: &Arc<AtomicUsize>, amount: usize, max: usize) -> Option<Self> {
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_add(amount).filter(|total| *total <= max)
-            })
-            .ok()
-            .map(|_| Self {
-                counter: Arc::clone(counter),
-                amount,
-            })
+        // NOTE: boucle compare-exchange plutôt que `fetch_update`, déprécié au
+        // profit de `try_update` absent de la MSRV 1.85.
+        let mut count = counter.load(Ordering::Acquire);
+        loop {
+            let total = count.checked_add(amount).filter(|total| *total <= max)?;
+            match counter.compare_exchange_weak(count, total, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    return Some(Self {
+                        counter: Arc::clone(counter),
+                        amount,
+                    })
+                }
+                Err(current) => count = current,
+            }
+        }
     }
 }
 
