@@ -33,7 +33,22 @@ fn emit_mtp_committed(
 
 #[cfg(test)]
 mod emission_tests {
-    use super::emit_mtp_committed;
+    use super::{emit_mtp_committed, first_stop_end};
+
+    #[test]
+    fn first_stop_end_sees_sequences_started_before_from() {
+        let generated = [1, 2, 3, 4, 2, 3];
+        let stops = [vec![2, 3]];
+        // Séquence commencée avant `from` (2 en position 1, 3 en position 2).
+        assert_eq!(first_stop_end(&generated, 2, &stops), Some(2));
+        // Fin avant `from` : déjà balayée, la suivante est rendue.
+        assert_eq!(first_stop_end(&generated, 3, &stops), Some(5));
+        assert_eq!(first_stop_end(&generated, 6, &stops), None);
+        // Première fin parmi plusieurs séquences, séquences vides ignorées.
+        let several = [Vec::new(), vec![4, 2, 3], vec![3, 4]];
+        assert_eq!(first_stop_end(&generated, 0, &several), Some(3));
+        assert_eq!(first_stop_end(&generated, 0, &[]), None);
+    }
 
     #[test]
     fn committed_prefix_stops_once_and_is_not_duplicated() {
