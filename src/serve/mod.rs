@@ -9,6 +9,13 @@
 //! connexion ne coûte que cette connexion et n'abat plus le process ; une
 //! panique moteur l'abat toujours.
 //!
+//! Lots opt-in (`SARAGOSSA_SERVE_BATCH=1` avec
+//! `SARAGOSSA_RUST_LIGHTBATCH_MULTI=1`) : quand le moteur prend une requête
+//! chat streamée greedy pour un modèle dense éligible, il y joint les requêtes
+//! éligibles du même modèle déjà en file (`SARAGOSSA_SERVE_MAX_STREAMS`, 8) et
+//! les décode ensemble par le pas multi-flux dense. Un lot d'une requête garde
+//! le chemin solo (MTP, cache de préfixe par blocs).
+//!
 //! Plafonds, chacun répondant 503 immédiatement une fois atteint :
 //! - `SARAGOSSA_SERVE_MAX_CONNECTIONS` (64) : connexions en cours de lecture ;
 //! - `SARAGOSSA_SERVE_QUEUE` (32) : requêtes en attente du moteur ;

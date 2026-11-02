@@ -40,6 +40,9 @@ pub(crate) enum ServeError {
     /// Ressources mémoire insuffisantes.
     #[error("ressource mémoire: {0}")]
     Memory(String),
+    /// Echec d'un lot multi-flux, rapporté à chacun de ses clients.
+    #[error("lot multi-flux: {0}")]
+    Batch(String),
     /// Erreur d'inférence.
     #[error("inférence: {0}")]
     Inference(#[from] saragossa::InferError),

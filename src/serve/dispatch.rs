@@ -3,28 +3,33 @@
 //! Un thread d'accept confie chaque connexion à un thread de connexion qui lit
 //! la requête et sert les routes statiques (`/health`, `/v1/models`). Le reste
 //! part dans une file bornée vers le thread moteur, seul propriétaire de
-//! [`ServeState`] : l'inférence reste sérielle, seules les E/S sont parallèles.
+//! [`ServeState`] : l'inférence reste sérielle, seules les E/S sont parallèles,
+//! sauf les lots opt-in (`SARAGOSSA_SERVE_BATCH=1`, voir [`run_engine`]) qui
+//! décodent ensemble plusieurs requêtes chat streamées greedy.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use saragossa::runtime_flags::{
-    serve_max_connections, serve_max_inflight_bytes, serve_queue_depth,
+    serve_batch_enabled, serve_max_connections, serve_max_inflight_bytes, serve_max_streams,
+    serve_queue_depth,
 };
 
 use super::error::{ServeError, ServeResult};
 #[cfg(unix)]
 use super::http::configure_unix_stream;
 use super::http::{
-    configure_tcp_stream, handle_job, read_body, read_head, read_or_reject, reply_on_error,
-    route_front, send_error, send_route_error, HttpRequest,
+    batch_chat, configure_tcp_stream, handle_batch, handle_job, read_body, read_head,
+    read_or_reject, reply_on_error, route_front, send_error, send_route_error, BatchChat,
+    HttpRequest,
 };
 use super::state::ServeState;
 
@@ -166,12 +171,137 @@ where
         .map_err(|e| ServeError::io("thread d'accept", e))?;
     // La boucle s'arrête quand l'accept et toutes les connexions ont lâché
     // leur émetteur.
-    for job in queue {
-        run_job(job, state);
-    }
+    let max_streams = if serve_batch_enabled() {
+        serve_max_streams()
+    } else {
+        1
+    };
+    run_engine(&queue, state, max_streams);
     acceptor
         .join()
         .map_err(|_| ServeError::io("thread d'accept", io::Error::other("panique")))?
+}
+
+/// Job en attente du moteur, avec son analyse pour un lot (`None` : chemin
+/// solo).
+struct Queued<S> {
+    job: Job<S>,
+    batch: Option<BatchChat>,
+}
+
+impl<S> Queued<S> {
+    fn new(job: Job<S>, batching: bool) -> Self {
+        let batch = if batching {
+            batch_chat(&job.request)
+        } else {
+            None
+        };
+        Self { job, batch }
+    }
+
+    fn model(&self) -> Option<&str> {
+        self.batch.as_ref().map(BatchChat::model)
+    }
+}
+
+/// Boucle du thread moteur. Avec `max_streams > 1` (B2), un job chat éligible
+/// réunit les jobs éligibles du même modèle déjà en file, sans attendre ; les
+/// autres restent dans `pending`, dans leur ordre, pour les tours suivants.
+///
+/// NOTE: l'admission n'a lieu qu'entre deux générations ; un job arrivé
+/// pendant un lot attend la fin de tout le lot.
+fn run_engine<S: ServeStream>(
+    queue: &Receiver<Job<S>>,
+    state: &mut ServeState,
+    max_streams: usize,
+) {
+    let batching = max_streams > 1;
+    // Borne de `pending` : drainer libère des places dans la file bornée, sans
+    // cette borne la file locale grandirait sans contre-pression.
+    let pending_cap = serve_queue_depth();
+    let mut pending: VecDeque<Queued<S>> = VecDeque::new();
+    loop {
+        let leader = match pending.pop_front() {
+            Some(queued) => queued,
+            None => match queue.recv() {
+                Ok(job) => Queued::new(job, batching),
+                Err(_) => break,
+            },
+        };
+        let Some(model) = leader
+            .model()
+            .map(str::to_string)
+            .filter(|model| state.batch_ready(model))
+        else {
+            run_job(leader.job, state);
+            continue;
+        };
+        drain_queue(queue, &mut pending, pending_cap, |job| {
+            Queued::new(job, batching)
+        });
+        let others = take_batch(
+            &mut pending,
+            &model,
+            max_streams.saturating_sub(1),
+            Queued::model,
+        );
+        if others.is_empty() {
+            run_job(leader.job, state);
+            continue;
+        }
+        let mut batch = vec![leader];
+        batch.extend(others);
+        run_batch(batch, state);
+    }
+}
+
+/// Déplace sans bloquer les jobs déjà en file vers `pending`, jusqu'à `cap`.
+fn drain_queue<J, T>(
+    queue: &Receiver<J>,
+    pending: &mut VecDeque<T>,
+    cap: usize,
+    wrap: impl Fn(J) -> T,
+) {
+    while pending.len() < cap {
+        match queue.try_recv() {
+            Ok(job) => pending.push_back(wrap(job)),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Retire de `pending` au plus `max` éléments du modèle `model`, dans l'ordre ;
+/// les autres y restent dans leur ordre.
+fn take_batch<T>(
+    pending: &mut VecDeque<T>,
+    model: &str,
+    max: usize,
+    model_of: impl Fn(&T) -> Option<&str>,
+) -> Vec<T> {
+    let mut taken = Vec::new();
+    let mut kept = VecDeque::with_capacity(pending.len());
+    for item in pending.drain(..) {
+        if taken.len() < max && model_of(&item) == Some(model) {
+            taken.push(item);
+        } else {
+            kept.push_back(item);
+        }
+    }
+    *pending = kept;
+    taken
+}
+
+/// Exécute un lot de jobs éligibles du même modèle.
+fn run_batch<S: ServeStream>(batch: Vec<Queued<S>>, state: &mut ServeState) {
+    let (mut jobs, chats): (Vec<Job<S>>, Vec<BatchChat>) = batch
+        .into_iter()
+        .filter_map(|queued| queued.batch.map(|chat| (queued.job, chat)))
+        .unzip();
+    let mut sockets: Vec<(&mut S, &HttpRequest)> = jobs
+        .iter_mut()
+        .map(|job| (&mut job.stream, &job.request))
+        .collect();
+    handle_batch(state, &mut sockets, chats);
 }
 
 /// Exécute un job sur le thread moteur.
@@ -281,7 +411,6 @@ impl Drop for Reservation {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::net::UnixStream;
-    use std::sync::mpsc::Receiver;
 
     use super::super::args::ServeArgs;
     use super::*;
@@ -353,6 +482,96 @@ mod tests {
             .read_to_string(&mut response)
             .expect("invariant: réponse lisible avant le timeout");
         response
+    }
+
+    /// Le lot prend les éléments du même modèle dans l'ordre, sous le
+    /// plafond ; les autres restent en file locale dans leur ordre.
+    #[test]
+    fn take_batch_keeps_set_aside_jobs_in_order() {
+        let mut pending: VecDeque<(u32, Option<&str>)> = [
+            (1, Some("a")),
+            (2, Some("b")),
+            (3, None),
+            (4, Some("a")),
+            (5, Some("a")),
+            (6, Some("b")),
+        ]
+        .into_iter()
+        .collect();
+
+        let taken = take_batch(&mut pending, "a", 2, |item| item.1);
+
+        assert_eq!(taken.iter().map(|item| item.0).collect::<Vec<_>>(), [1, 4]);
+        assert_eq!(
+            pending.iter().map(|item| item.0).collect::<Vec<_>>(),
+            [2, 3, 5, 6]
+        );
+        assert!(take_batch(&mut pending, "a", 0, |item| item.1).is_empty());
+        assert_eq!(pending.len(), 4);
+    }
+
+    #[test]
+    fn drain_queue_stops_at_cap_without_blocking() {
+        let (tx, rx) = sync_channel(8);
+        for job in 0..5 {
+            tx.send(job).expect("invariant: file ouverte");
+        }
+        let mut pending = VecDeque::from([100]);
+
+        drain_queue(&rx, &mut pending, 3, |job| job);
+
+        assert_eq!(pending, [100, 0, 1]);
+        // File vide mais ouverte : rend la main au lieu d'attendre.
+        drain_queue(&rx, &mut pending, 10, |job| job);
+        assert_eq!(pending, [100, 0, 1, 2, 3, 4]);
+    }
+
+    /// Lots actifs sur un modèle non chargeable : chaque job éligible retombe
+    /// sur le chemin solo et reçoit sa réponse, aucun n'est perdu.
+    #[test]
+    fn batching_engine_answers_every_job_when_model_not_batchable() {
+        let args = ServeArgs::parse(["--model".to_string(), "alpha=/nonexistent/a".to_string()])
+            .expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let (tx, rx) = sync_channel(4);
+        let body = br#"{"model":"alpha","messages":[],"stream":true}"#;
+        let raw = [
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+            body,
+        ]
+        .concat();
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let (client, server) = UnixStream::pair().expect("invariant: paire Unix locale");
+            let mut cursor = std::io::Cursor::new(raw.clone());
+            let request = super::super::http::read_request(
+                &mut cursor,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("invariant: requête lisible")
+            .expect("invariant: requête présente");
+            let counter = Arc::new(AtomicUsize::new(0));
+            tx.send(Job {
+                request,
+                stream: server,
+                _bytes: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
+            })
+            .expect("invariant: file ouverte");
+            clients.push(client);
+        }
+        drop(tx);
+
+        run_engine(&rx, &mut state, 8);
+
+        for client in clients {
+            let answer = response(client);
+            assert!(answer.starts_with("HTTP/1.1 "), "réponse absente: {answer}");
+            assert!(!answer.starts_with("HTTP/1.1 200"));
+        }
     }
 
     #[test]

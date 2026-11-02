@@ -5,6 +5,7 @@ use std::time::Duration;
 use saragossa::ModelAssets;
 
 use super::error::{ServeError, ServeResult};
+use super::state::ServedCompletion;
 
 /// Métadonnées connues avant le premier token streamé.
 #[derive(Debug)]
@@ -67,11 +68,24 @@ impl<'a> StreamTerminalError<'a> {
     }
 }
 
+/// Réponse streamée d'un client : reçoit les événements d'une complétion,
+/// puis son issue. Le chemin solo et le lot partagent ainsi le même format
+/// SSE par dialecte (OpenAI, Anthropic).
+pub(super) trait CompletionSink {
+    /// Ecrit un événement ; une erreur arrête la génération de ce client.
+    fn event(&mut self, event: CompletionStreamEvent<'_>) -> ServeResult<()>;
+
+    /// Termine la réponse. Une erreur rendue n'a pas encore été écrite : la
+    /// réponse n'a pas démarré, l'appelant envoie l'erreur HTTP.
+    fn finish(&mut self, result: ServeResult<ServedCompletion>) -> ServeResult<()>;
+}
+
 pub(crate) struct StreamingTextDetokenizer<'a> {
     assets: &'a ModelAssets,
     stop_texts: &'a [String],
     generated: Vec<u32>,
     emitter: StreamingTextEmitter,
+    stopped: bool,
 }
 
 impl<'a> StreamingTextDetokenizer<'a> {
@@ -85,6 +99,7 @@ impl<'a> StreamingTextDetokenizer<'a> {
             stop_texts,
             generated: Vec::with_capacity(max_tokens),
             emitter: StreamingTextEmitter::default(),
+            stopped: false,
         }
     }
 
@@ -97,8 +112,15 @@ impl<'a> StreamingTextDetokenizer<'a> {
             .map_err(|_| ServeError::args(format!("token généré hors plage: {token}")))?;
         self.generated.push(token);
         let decoded = self.assets.decode_tokens(&self.generated, true)?;
+        self.stopped = contains_stop(strip_empty_think_streaming(&decoded), self.stop_texts);
         let visible = streaming_visible_text(&decoded, self.stop_texts);
         self.emitter.emit_streaming(visible, on_event)
+    }
+
+    /// Une stop sequence texte est-elle apparue ? Le lot n'a pas l'arrêt sur
+    /// séquence de tokens du solo : il arrête le flux sur ce signal.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped
     }
 
     pub(crate) fn finish(
@@ -173,6 +195,12 @@ fn strip_empty_think_streaming(text: &str) -> &str {
     text
 }
 
+fn contains_stop(text: &str, stop_texts: &[String]) -> bool {
+    stop_texts
+        .iter()
+        .any(|stop| !stop.is_empty() && text.contains(stop.as_str()))
+}
+
 fn strip_after_first_stop<'a>(text: &'a str, stop_texts: &[String]) -> &'a str {
     let Some(index) = stop_texts
         .iter()
@@ -203,6 +231,24 @@ fn longest_stop_prefix_suffix_len(text: &str, stop_texts: &[String]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le bloc think vide du template n'arrête pas un flux dont le stop est
+    /// `\n\n` ; seul le texte visible compte.
+    #[test]
+    fn contains_stop_ignores_empty_think_block() {
+        let stops = vec!["\n\n".to_string(), String::new()];
+        let think = saragossa::QWEN_EMPTY_THINK_BLOCK;
+
+        assert!(!contains_stop(strip_empty_think_streaming(think), &stops));
+        assert!(!contains_stop(
+            strip_empty_think_streaming(&format!("{think}Bonjour")),
+            &stops
+        ));
+        assert!(contains_stop(
+            strip_empty_think_streaming(&format!("{think}Bonjour\n\nSuite")),
+            &stops
+        ));
+    }
 
     #[test]
     fn streamed_deltas_match_non_stream_oracle_without_model() {

@@ -161,6 +161,16 @@ impl ChatCompletionRequest {
         }
     }
 
+    /// Requête servable par un lot multi-flux : greedy, texte libre, budget
+    /// non nul et outils acceptés. Le streaming se vérifie à part, le champ
+    /// `stream` n'étant pas porté par la conversion Anthropic.
+    pub(super) fn batchable(&self) -> bool {
+        self.temperature.unwrap_or(0.0) <= f32::EPSILON
+            && matches!(self.response_format_mode(), Ok(ResponseFormatMode::Text))
+            && self.max_tokens() > 0
+            && self.active_tools().is_ok()
+    }
+
     /// Dérive la clé de session effective.
     pub(super) fn session_key(&self, header: Option<&str>) -> Option<String> {
         header
