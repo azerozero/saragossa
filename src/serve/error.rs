@@ -40,6 +40,9 @@ pub(crate) enum ServeError {
     /// Ressources mémoire insuffisantes.
     #[error("ressource mémoire: {0}")]
     Memory(String),
+    /// Echec d'un lot multi-flux, rapporté à chacun de ses clients.
+    #[error("lot multi-flux: {0}")]
+    Batch(String),
     /// Erreur d'inférence.
     #[error("inférence: {0}")]
     Inference(#[from] saragossa::InferError),
@@ -83,6 +86,23 @@ impl ServeError {
     /// Construit une erreur de pression mémoire.
     pub(super) fn memory(message: impl Into<String>) -> Self {
         Self::Memory(message.into())
+    }
+
+    /// Copie de l'erreur pour chaque client d'un lot : même statut HTTP que
+    /// le solo (503 mémoire, 404 modèle…) ; les sources non clonables
+    /// gardent leur message.
+    pub(super) fn replicate(&self) -> Self {
+        match self {
+            Self::Args(message) => Self::Args(message.clone()),
+            Self::Http(message) => Self::Http(message.clone()),
+            Self::Json { .. } => Self::Http(self.to_string()),
+            Self::IncompleteJson(message) => Self::IncompleteJson(message.clone()),
+            Self::NotImplemented(message) => Self::NotImplemented(message.clone()),
+            Self::UnknownModel(model) => Self::UnknownModel(model.clone()),
+            Self::Memory(message) => Self::Memory(message.clone()),
+            Self::Batch(message) => Self::Batch(message.clone()),
+            Self::Io { .. } | Self::Inference(_) => Self::Batch(self.to_string()),
+        }
     }
 
     /// Construit une erreur 501.

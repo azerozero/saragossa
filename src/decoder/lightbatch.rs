@@ -222,8 +222,37 @@ impl CausalDecoder {
         prompts: &[Vec<usize>],
         max_new_tokens: &[usize],
         options: &GenerationOptions,
-        on_token: impl FnMut(usize, usize),
+        mut on_token: impl FnMut(usize, usize),
     ) -> Result<Vec<GenerationOutput>> {
+        // Signature publique historique conservée : l'arrêt par flux passe par
+        // `generate_greedy_lightbatch_streaming_counted`.
+        self.generate_greedy_lightbatch_streaming_counted(
+            prompts,
+            max_new_tokens,
+            options,
+            |stream, token| {
+                on_token(stream, token);
+                true
+            },
+        )
+        .map(|(outputs, _)| outputs)
+    }
+
+    /// [`Self::generate_greedy_lightbatch_streaming_with_options`] dont le
+    /// callback peut arrêter un flux seul (`false`, après ce token) et qui rend
+    /// aussi le nombre de pas multi-flux dense encodés (N ≥ 2 flux en un
+    /// command buffer) : 0 signifie que le lot est resté en time-slicing.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que [`Self::generate_greedy_lightbatch_streaming_with_options`].
+    pub fn generate_greedy_lightbatch_streaming_counted(
+        &self,
+        prompts: &[Vec<usize>],
+        max_new_tokens: &[usize],
+        options: &GenerationOptions,
+        on_token: impl FnMut(usize, usize) -> bool,
+    ) -> Result<(Vec<GenerationOutput>, usize)> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let (stride, multi) = (
             lightbatch_background_stride(),
@@ -232,7 +261,7 @@ impl CausalDecoder {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let (stride, multi) = (1, false);
         let mut profile = LightBatchProfile::default();
-        self.lightbatch_generate(
+        let outputs = self.lightbatch_generate(
             prompts,
             max_new_tokens,
             options,
@@ -240,7 +269,27 @@ impl CausalDecoder {
             multi,
             &mut profile,
             on_token,
-        )
+        )?;
+        Ok((outputs, profile.multi_steps))
+    }
+
+    /// Le modèle peut-il servir un lot par le pas multi-flux dense ? Flag
+    /// `SARAGOSSA_RUST_LIGHTBATCH_MULTI` actif, decode résident complet et
+    /// structure de couches éligible. La partie qui dépend de l'arène reste
+    /// vérifiée par lot : si elle échoue, le lot retombe sur le time-slicing,
+    /// correct mais sans gain.
+    pub fn lightbatch_multi_dense_ready(&self) -> bool {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            lightbatch_multi_dense_enabled()
+                && decode_resident_full_enabled()
+                && self.supports_resident_full_decode()
+                && self.multi_dense_layers_eligible()
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            false
+        }
     }
 
     /// Light-batch greedy profilé (harnais de mesure) : tente toujours le pas
@@ -268,7 +317,7 @@ impl CausalDecoder {
             stride,
             true,
             &mut profile,
-            |_, _| {},
+            |_, _| true,
         )?;
         Ok((outputs, profile))
     }
@@ -285,7 +334,7 @@ impl CausalDecoder {
         stride: u64,
         multi: bool,
         profile: &mut LightBatchProfile,
-        mut on_token: impl FnMut(usize, usize),
+        mut on_token: impl FnMut(usize, usize) -> bool,
     ) -> Result<Vec<GenerationOutput>> {
         if prompts.is_empty() {
             return Err(InferError::Dimension("light-batch sans prompt".to_string()));
@@ -539,7 +588,7 @@ impl CausalDecoder {
         stream: &mut LightBatchStream,
         options: &GenerationOptions,
         profile: &mut LightBatchProfile,
-        on_token: &mut impl FnMut(usize, usize),
+        on_token: &mut impl FnMut(usize, usize) -> bool,
     ) -> Result<bool> {
         if !self.resolve_lightbatch_push(stream, options, on_token) {
             return Ok(false);
@@ -555,7 +604,7 @@ impl CausalDecoder {
         &self,
         stream: &mut LightBatchStream,
         options: &GenerationOptions,
-        on_token: &mut impl FnMut(usize, usize),
+        on_token: &mut impl FnMut(usize, usize) -> bool,
     ) -> bool {
         if stream.done {
             return false;
@@ -565,7 +614,12 @@ impl CausalDecoder {
             return false;
         }
         stream.generated.push(stream.token);
-        on_token(stream.index, stream.token);
+        // Le consommateur arrête CE flux (client parti, stop texte) : les
+        // autres continuent, le pas multi suivant ne compte que les vivants.
+        if !on_token(stream.index, stream.token) {
+            stream.done = true;
+            return false;
+        }
         if stream.step + 1 >= stream.max_new {
             stream.done = true;
             return false;
@@ -794,7 +848,7 @@ mod tests {
                 1,
                 false,
                 &mut LightBatchProfile::default(),
-                |_, _| {},
+                |_, _| true,
             )
             .expect("invariant: stride 1 valide");
         for stride in [2_u64, 3] {
@@ -806,7 +860,7 @@ mod tests {
                     stride,
                     false,
                     &mut LightBatchProfile::default(),
-                    |_, _| {},
+                    |_, _| true,
                 )
                 .expect("invariant: stride > 1 valide");
             assert_eq!(strided[0].tokens, baseline[0].tokens, "stride={stride}");

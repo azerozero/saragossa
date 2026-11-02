@@ -1591,6 +1591,28 @@ pub fn serve_queue_depth() -> usize {
     })
 }
 
+/// Active les lots multi-flux de `saragossa serve` (`SARAGOSSA_SERVE_BATCH=1`,
+/// défaut OFF). Les requêtes chat streamées greedy déjà en file pour le même
+/// modèle dense sont décodées ensemble par le light-batch ; exige aussi
+/// `SARAGOSSA_RUST_LIGHTBATCH_MULTI=1`, sans quoi le lot n'apporterait rien.
+pub fn serve_batch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SERVE_BATCH", false))
+}
+
+/// Plafond de flux d'un lot de `saragossa serve`
+/// (`SARAGOSSA_SERVE_MAX_STREAMS`, 8 par défaut, au moins 1). Le gain mesuré
+/// du pas multi-flux dense (×3,2 à 8 flux sur le 27B) plafonne au-delà.
+pub fn serve_max_streams() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        env_var("SARAGOSSA_SERVE_MAX_STREAMS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|max| *max > 0)
+            .unwrap_or(8)
+    })
+}
+
 /// Budget global d'octets de corps de requête lus ou en attente du moteur de
 /// `saragossa serve` (`SARAGOSSA_SERVE_MAX_INFLIGHT_BYTES`, 256 Mio par
 /// défaut). Sans lui, 64 connexions × 16 Mio de corps retiendraient ~1 Gio ;

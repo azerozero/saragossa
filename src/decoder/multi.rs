@@ -21,13 +21,37 @@ impl CausalDecoder {
     /// normes Gemma ni MoE flint) et linear-attn denses, buffers résidents
     /// `FullDense`/`LinearDense` — exactement ceux que le pas encode.
     pub(crate) fn supports_resident_multi_dense(&self, cache: &CausalDecoderCache) -> bool {
-        if self.forward_runtime().metal_executor().is_none() {
-            return false;
-        }
         let Some(arena) = cache.resident.as_ref() else {
             return false;
         };
-        if self.config.metal_unsupported_reason().is_some()
+        if !self.multi_dense_layers_eligible() {
+            return false;
+        }
+        self.layers.iter().enumerate().all(|(index, _)| {
+            if self.config.is_resident_full_attention_layer(index) {
+                matches!(
+                    arena.layers.get(index),
+                    Some(ResidentLayerBuffers::FullDense(resolved))
+                        if resolved.parallel_moe_weights().is_none()
+                            && resolved.sigmoid_moe_weights().is_none()
+                            && resolved.pre_feedforward_norm.is_none()
+                            && resolved.post_feedforward_norm.is_none()
+                )
+            } else {
+                matches!(
+                    arena.layers.get(index),
+                    Some(ResidentLayerBuffers::LinearDense(_))
+                )
+            }
+        })
+    }
+
+    /// Partie de [`Self::supports_resident_multi_dense`] indépendante de
+    /// l'arène : executor, config et forme des couches. `serve` l'interroge
+    /// avant d'avoir un cache pour décider de former un lot.
+    pub(super) fn multi_dense_layers_eligible(&self) -> bool {
+        if self.forward_runtime().metal_executor().is_none()
+            || self.config.metal_unsupported_reason().is_some()
             || !self.config.attn_output_gate
             || self.config.head_dim.is_none()
             || self.config.attention_sinks
@@ -43,20 +67,8 @@ impl CausalDecoder {
                 // sans porte, alors que le pas multi suppose `[q+gate|k|v]`.
                 matches!(&layer.attention, AttentionBlock::Full(attention) if attention.v_proj.is_some())
                     && self.config.layer_sliding_window(index).is_none()
-                    && matches!(
-                        arena.layers.get(index),
-                        Some(ResidentLayerBuffers::FullDense(resolved))
-                            if resolved.parallel_moe_weights().is_none()
-                                && resolved.sigmoid_moe_weights().is_none()
-                                && resolved.pre_feedforward_norm.is_none()
-                                && resolved.post_feedforward_norm.is_none()
-                    )
             } else {
                 matches!(&layer.attention, AttentionBlock::Linear(_))
-                    && matches!(
-                        arena.layers.get(index),
-                        Some(ResidentLayerBuffers::LinearDense(_))
-                    )
             }
         })
     }

@@ -12,7 +12,7 @@ use super::protocol::{
     json_bytes, normalize_session_key, ChatCompletionRequest, StopSpec, Usage, WireMessage,
 };
 use super::state::{ServeState, ServedCompletion};
-use super::streaming::CompletionStreamEvent;
+use super::streaming::{CompletionSink, CompletionStreamEvent};
 
 mod live;
 
@@ -25,10 +25,7 @@ pub(super) fn handle_anthropic_messages<S: Write>(
     session_header: Option<&str>,
     body: &[u8],
 ) -> ServeResult<()> {
-    let request = parse_anthropic_messages_request(body)?;
-    let session_key = request.session_key(session_header);
-    let stream_enabled = request.stream;
-    let chat = request.to_chat_request()?;
+    let (chat, session_key, stream_enabled) = anthropic_chat(body, session_header)?;
     if stream_enabled {
         send_anthropic_sse_streaming(stream, state, chat, session_key.as_deref())
     } else {
@@ -36,6 +33,17 @@ pub(super) fn handle_anthropic_messages<S: Write>(
         let response = AnthropicMessageResponse::from_completion(&completion);
         send_json(stream, 200, &response, completion.metric_headers())
     }
+}
+
+/// Convertit un corps Messages en requête chat : (chat, clé de session,
+/// streaming demandé).
+pub(super) fn anthropic_chat(
+    body: &[u8],
+    session_header: Option<&str>,
+) -> ServeResult<(ChatCompletionRequest, Option<String>, bool)> {
+    let request = parse_anthropic_messages_request(body)?;
+    let session_key = request.session_key(session_header);
+    Ok((request.to_chat_request()?, session_key, request.stream))
 }
 
 pub(super) fn send_anthropic_error<S: Write>(
@@ -604,97 +612,124 @@ fn send_anthropic_sse_streaming<S: Write>(
     chat: ChatCompletionRequest,
     session_key: Option<&str>,
 ) -> ServeResult<()> {
-    let mut stream_started = false;
-    let mut live_blocks = AnthropicLiveBlocks::new();
-    let message_id = response_id();
-    let result = state.complete_streaming(chat, session_key, |event| match event {
-        CompletionStreamEvent::Start(start) => {
-            stream_started = true;
-            write_headers(
-                stream,
-                200,
-                "OK",
-                "text/event-stream; charset=utf-8",
-                None,
-                start.metric_headers(),
-            )?;
-            write_anthropic_sse_event(
-                stream,
-                "message_start",
-                &json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": message_id.as_str(),
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": start.model.as_str(),
-                        "stop_reason": null,
-                        "stop_sequence": null,
-                        "usage": {
-                            "input_tokens": start.prompt_tokens,
-                            "output_tokens": 0
-                        }
-                    }
-                }),
-            )?;
-            stream
-                .flush()
-                .map_err(|e| ServeError::io("flush SSE Anthropic", e))
+    let mut sink = AnthropicSse::new(stream);
+    let result = state.complete_streaming(chat, session_key, |event| sink.event(event));
+    sink.finish(result)
+}
+
+/// Réponse SSE Anthropic Messages d'un client.
+pub(super) struct AnthropicSse<'a, S> {
+    stream: &'a mut S,
+    started: bool,
+    live_blocks: AnthropicLiveBlocks,
+    message_id: String,
+}
+
+impl<'a, S: Write> AnthropicSse<'a, S> {
+    pub(super) fn new(stream: &'a mut S) -> Self {
+        Self {
+            stream,
+            started: false,
+            live_blocks: AnthropicLiveBlocks::new(),
+            message_id: response_id(),
         }
-        CompletionStreamEvent::Delta(delta) => {
-            if delta.is_empty() {
+    }
+
+    fn flush(&mut self) -> ServeResult<()> {
+        self.stream
+            .flush()
+            .map_err(|e| ServeError::io("flush SSE Anthropic", e))
+    }
+}
+
+impl<S: Write> CompletionSink for AnthropicSse<'_, S> {
+    fn event(&mut self, event: CompletionStreamEvent<'_>) -> ServeResult<()> {
+        match event {
+            CompletionStreamEvent::Start(start) => {
+                self.started = true;
+                write_headers(
+                    self.stream,
+                    200,
+                    "OK",
+                    "text/event-stream; charset=utf-8",
+                    None,
+                    start.metric_headers(),
+                )?;
+                write_anthropic_sse_event(
+                    self.stream,
+                    "message_start",
+                    &json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": self.message_id.as_str(),
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": start.model.as_str(),
+                            "stop_reason": null,
+                            "stop_sequence": null,
+                            "usage": {
+                                "input_tokens": start.prompt_tokens,
+                                "output_tokens": 0
+                            }
+                        }
+                    }),
+                )?;
+            }
+            CompletionStreamEvent::Delta(delta) => {
+                if delta.is_empty() {
+                    return Ok(());
+                }
+                self.live_blocks.push_text_delta(self.stream, delta)?;
+            }
+            CompletionStreamEvent::TerminalError(error) => {
+                write_anthropic_sse_event(
+                    self.stream,
+                    "error",
+                    &json!({
+                        "type": "error",
+                        "error": {
+                            "type": error.error_type,
+                            "message": error.message
+                        }
+                    }),
+                )?;
+            }
+        }
+        self.flush()
+    }
+
+    fn finish(&mut self, result: ServeResult<ServedCompletion>) -> ServeResult<()> {
+        let completion = match result {
+            Ok(completion) => completion,
+            Err(error) if self.started => {
+                eprintln!("saragossa serve stream Anthropic interrompu: {error}");
                 return Ok(());
             }
-            live_blocks.push_text_delta(stream, delta)?;
-            stream
-                .flush()
-                .map_err(|e| ServeError::io("flush SSE Anthropic", e))
-        }
-        CompletionStreamEvent::TerminalError(error) => {
-            write_anthropic_sse_event(
-                stream,
-                "error",
-                &json!({
-                    "type": "error",
-                    "error": {
-                        "type": error.error_type,
-                        "message": error.message
-                    }
-                }),
-            )?;
-            stream
-                .flush()
-                .map_err(|e| ServeError::io("flush SSE Anthropic", e))
-        }
-    });
-    let completion = match result {
-        Ok(completion) => completion,
-        Err(error) if stream_started => {
-            eprintln!("saragossa serve stream Anthropic interrompu: {error}");
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    let has_tool_use = live_blocks.finish(stream, &completion)?;
-    write_anthropic_sse_event(
-        stream,
-        "message_delta",
-        &json!({
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": anthropic_stop_reason(&completion, has_tool_use),
-                "stop_sequence": anthropic_stop_sequence(&completion, has_tool_use)
-            },
-            "usage": {
-                "output_tokens": completion.usage.completion_tokens()
-            }
-        }),
-    )?;
-    write_anthropic_sse_event(stream, "message_stop", &json!({"type": "message_stop"}))?;
-    stream
-        .flush()
-        .map_err(|e| ServeError::io("flush SSE Anthropic", e))
+            Err(error) => return Err(error),
+        };
+        let has_tool_use = self.live_blocks.finish(self.stream, &completion)?;
+        write_anthropic_sse_event(
+            self.stream,
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": anthropic_stop_reason(&completion, has_tool_use),
+                    "stop_sequence": anthropic_stop_sequence(&completion, has_tool_use)
+                },
+                "usage": {
+                    "output_tokens": completion.usage.completion_tokens()
+                }
+            }),
+        )?;
+        write_anthropic_sse_event(
+            self.stream,
+            "message_stop",
+            &json!({"type": "message_stop"}),
+        )?;
+        self.flush()
+    }
 }
 
 fn write_anthropic_content_block<S: Write>(
