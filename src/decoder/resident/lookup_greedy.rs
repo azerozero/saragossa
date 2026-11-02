@@ -70,9 +70,19 @@ impl CausalDecoder {
         let mut generated = Vec::with_capacity(max_new_tokens);
         // Tokens produits à émettre ; le dernier n'est pas encore injecté.
         let mut pending = vec![first];
+        // Drafts acceptés en tête de `pending` (après une vérification) ; ne sert
+        // qu'aux compteurs de test.
+        #[cfg(test)]
+        let mut accepted_drafts = 0;
         loop {
-            for &next in &pending {
+            for (index, &next) in pending.iter().enumerate() {
                 if options.stop_token_ids.contains(&next) {
+                    #[cfg(test)]
+                    if index < accepted_drafts {
+                        trace(|trace| trace.stop_in_drafts += 1);
+                    }
+                    #[cfg(not(test))]
+                    let _ = index;
                     return Ok(generated);
                 }
                 generated.push(next);
@@ -84,11 +94,19 @@ impl CausalDecoder {
                 .last()
                 .ok_or_else(|| InferError::Config("lookup greedy: aucun token".into()))?;
             pending.clear();
+            #[cfg(test)]
+            {
+                accepted_drafts = 0;
+            }
             lookup.sync(&generated);
             // NOTE: `propose` a des effets de bord (index du dernier n-gramme,
             // décompte du repos) : un appel par position, comme la boucle MTP.
             if let Some(drafts) = lookup.propose(draft_cap(generated.len())) {
                 pending = self.verify_lookup_drafts(cache, &mut lookup, token, &drafts)?;
+                #[cfg(test)]
+                {
+                    accepted_drafts = pending.len() - 1;
+                }
                 continue;
             }
             if !pipelined {
@@ -127,6 +145,8 @@ impl CausalDecoder {
                 }
                 return Ok(generated);
             }
+            #[cfg(test)]
+            trace(|trace| trace.drains += 1);
         }
     }
 
@@ -161,6 +181,10 @@ impl CausalDecoder {
             .take_while(|(draft, target)| draft == target)
             .count();
         lookup.observe(drafts.len(), accepted);
+        #[cfg(test)]
+        if accepted > 0 {
+            trace(|trace| trace.accepted_verifies += 1);
+        }
         if accepted < drafts.len() {
             let captures = output.captures.as_ref().ok_or_else(|| {
                 InferError::Config("lookup greedy: captures de rollback absentes".into())
@@ -173,6 +197,40 @@ impl CausalDecoder {
         })?);
         Ok(emitted)
     }
+}
+
+/// Compteurs de la boucle lookup sur ce thread (tests modèle réel : prouvent
+/// que propositions, vidanges et arrêts dans les drafts sont exercés).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::decoder) struct LookupGreedyTrace {
+    /// Vérifications avec au moins un draft accepté.
+    pub accepted_verifies: usize,
+    /// Vidanges du pipeline suivies d'une reprise de la boucle.
+    pub drains: usize,
+    /// Arrêts sur un token d'arrêt parmi des drafts acceptés.
+    pub stop_in_drafts: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOOKUP_TRACE: std::cell::Cell<LookupGreedyTrace> =
+        const { std::cell::Cell::new(LookupGreedyTrace { accepted_verifies: 0, drains: 0, stop_in_drafts: 0 }) };
+}
+
+#[cfg(test)]
+fn trace(update: impl FnOnce(&mut LookupGreedyTrace)) {
+    LOOKUP_TRACE.with(|cell| {
+        let mut trace = cell.get();
+        update(&mut trace);
+        cell.set(trace);
+    });
+}
+
+/// Rend et remet à zéro les compteurs de la boucle lookup de ce thread.
+#[cfg(test)]
+pub(in crate::decoder) fn take_lookup_greedy_trace() -> LookupGreedyTrace {
+    LOOKUP_TRACE.with(|cell| cell.replace(LookupGreedyTrace::default()))
 }
 
 #[cfg(test)]

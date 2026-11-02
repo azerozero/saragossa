@@ -4109,9 +4109,11 @@ fn lookup_greedy_abba_vs_ar_real_model() -> Result<()> {
 /// (`SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` ; MoE : avec
 /// `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`). Prompt qui fait recopier un fichier de
 /// ce dépôt, pour que le lookup propose et que le pipeline soit vidangé. Sorties
-/// identiques exigées pour 0, 1, 2 et 8 drafts et des budgets de 1, 2 et 96
-/// tokens ; arrêts sur des tokens de la sortie AR (EOS au milieu des drafts
-/// acceptés) ; callback qui interrompt le streaming.
+/// identiques exigées pour 0, 1, 2 et 8 drafts et des budgets de 0, 1, 2, 9 et
+/// 96 tokens ; arrêts sur des tokens de la sortie AR ; callback qui interrompt
+/// le streaming. Les compteurs de la boucle prouvent qu'au moins une proposition
+/// est acceptée, qu'au moins une vidange du pipeline est suivie d'une reprise et
+/// qu'au moins un arrêt tombe parmi des drafts acceptés.
 #[test]
 #[ignore = "modèle réel requis"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
@@ -4144,14 +4146,20 @@ fn lookup_greedy_matches_ar_real_model() -> Result<()> {
         .map(|output| output.tokens)
     };
     let reference = generate(0, 96, &options)?;
+    let mut traces = crate::decoder::resident::take_lookup_greedy_trace();
+    let mut stops_in_drafts = 0;
     for drafts in [1, 2, 8] {
-        for max_new in [1, 2, 96] {
+        for max_new in [0, 1, 2, 9, 96] {
             let expected = &reference[..max_new.min(reference.len())];
+            crate::decoder::resident::take_lookup_greedy_trace();
             assert_eq!(
                 generate(drafts, max_new, &options)?,
                 expected,
                 "drafts={drafts} budget={max_new}"
             );
+            let trace = crate::decoder::resident::take_lookup_greedy_trace();
+            traces.accepted_verifies += trace.accepted_verifies;
+            traces.drains += trace.drains;
         }
         // Arrêt sur un token de la sortie : la sortie AR s'arrête juste avant
         // sa première occurrence, la boucle lookup doit faire de même.
@@ -4162,11 +4170,13 @@ fn lookup_greedy_matches_ar_real_model() -> Result<()> {
             let mut stopping = options.clone();
             stopping.stop_token_ids.push(stop);
             let expected = generate(0, 96, &stopping)?;
+            crate::decoder::resident::take_lookup_greedy_trace();
             assert_eq!(
                 generate(drafts, 96, &stopping)?,
                 expected,
                 "drafts={drafts} arrêt sur {stop}"
             );
+            stops_in_drafts += crate::decoder::resident::take_lookup_greedy_trace().stop_in_drafts;
         }
         // Callback qui interrompt : mêmes tokens émis qu'en AR.
         for limit in [1, 7, 33] {
@@ -4187,9 +4197,16 @@ fn lookup_greedy_matches_ar_real_model() -> Result<()> {
             );
         }
     }
+    // Le scénario doit être exercé : propositions vérifiées et acceptées, et
+    // pipeline vidangé puis repris (chemin non streamé) ; arrêt sur un token
+    // d'arrêt tombé parmi des drafts acceptés (tokens fréquents de la sortie
+    // recopiée : retour à la ligne, indentation).
     eprintln!(
-        "lookup greedy ≡ AR : {} tokens de référence",
+        "lookup greedy ≡ AR : {} tokens de référence, {traces:?}, arrêts dans les drafts={stops_in_drafts}",
         reference.len()
     );
+    assert!(traces.accepted_verifies > 0, "aucune proposition acceptée");
+    assert!(traces.drains > 0, "aucune vidange du pipeline");
+    assert!(stops_in_drafts > 0, "aucun arrêt parmi des drafts acceptés");
     Ok(())
 }

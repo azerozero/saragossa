@@ -929,6 +929,13 @@ Les couches `FullMoe` passent en lignes sous `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`
 quasi-égalité). La queue coop sur tensor-cores (flag d'essai retiré depuis) est plus
 lente et dérive au-delà de 5e-3 relatif : écartée.
 
+Lecture de la table : la colonne séquentielle est une mesure synthétique.
+Sans captures, le bench tronque le KV entre deux répétitions mais ne restaure
+pas les états linéaires, qui avancent à chaque répétition : entrées et routage
+MoE dérivent, ce n'est pas une comparaison contrôlée. La colonne en lignes
+restaure un préfixe cohérent par captures (un token accepté par répétition) ;
+ρ(R) est rapporté au pas d'une ligne mesuré dans les mêmes conditions.
+
 | R | séquentiel (ms) | en lignes (ms) | ρ(R) | queue MoE seule (ms) |
 |---:|---:|---:|---:|---:|
 | 1 | 7,93 | 7,97 | 1,00 | 3,63 |
