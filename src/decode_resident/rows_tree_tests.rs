@@ -400,3 +400,97 @@ fn rope_rows_tree_rotates_at_depth() -> Result<()> {
     }
     Ok(())
 }
+
+/// Compaction du KV après un tour en arbre : lignes du chemin ramenées au bout
+/// du préfixe (oracle CPU), longueur, préfixe adopté intact, refus des chemins
+/// invalides et du KV quantifié ; éligibilité arbre par format.
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn compact_tree_rows_matches_cpu_and_refuses_invalid_paths() -> Result<()> {
+    let state = gpu_state()?;
+    let head_dim = 128;
+    let kv_dim = KV_HEADS * head_dim;
+    let (context, rows) = (6usize, 9usize);
+    let total = context + rows;
+    let keys: Vec<f32> = (0..total * kv_dim).map(|i| pseudo(i + 21)).collect();
+    let values: Vec<f32> = (0..total * kv_dim).map(|i| pseudo(i + 77)).collect();
+    for format in [KvFormat::F32, KvFormat::Bf16] {
+        let round = |data: &[f32]| -> Vec<f32> {
+            if format == KvFormat::Bf16 {
+                data.iter().copied().map(bf16_round_to_f32).collect()
+            } else {
+                data.to_vec()
+            }
+        };
+        let (keys_ref, values_ref) = (round(&keys), round(&values));
+        let make = || -> Result<FullAttentionMetalState> {
+            let mut kv = state.full_attention_format_for_test(
+                total + 2,
+                Q_HEADS,
+                KV_HEADS,
+                head_dim,
+                format,
+            )?;
+            kv.seed(&keys, &values, total)?;
+            Ok(kv)
+        };
+        assert!(make()?.verify_tree_supported(), "{format:?} éligible");
+        // Feuille sur la dernière ligne physique compris ([0, 2, 8], [0..9]).
+        let paths: [&[usize]; 6] = [
+            &[0],
+            &[0, 2, 3],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+            &[0, 5],
+            &[0, 2, 8],
+            &[0, 1, 4, 7, 8],
+        ];
+        for path in paths {
+            let mut kv = make()?;
+            kv.set_floor_for_test(context);
+            kv.compact_tree_rows(context, path)?;
+            assert_eq!(
+                kv.len(),
+                context + path.len(),
+                "{format:?} {path:?}: longueur"
+            );
+            let (got_keys, got_values) = kv.read_rows(0, context + path.len())?;
+            let source = (0..context).chain(path.iter().map(|&row| context + row));
+            for (row, src) in source.enumerate() {
+                let expect = |data: &[f32]| data[src * kv_dim..(src + 1) * kv_dim].to_vec();
+                let range = row * kv_dim..(row + 1) * kv_dim;
+                assert_eq!(
+                    got_keys[range.clone()],
+                    expect(&keys_ref)[..],
+                    "{format:?} {path:?} K ligne {row}"
+                );
+                assert_eq!(
+                    got_values[range],
+                    expect(&values_ref)[..],
+                    "{format:?} {path:?} V ligne {row}"
+                );
+            }
+        }
+        // Refus : chemin non croissant, hors des lignes valides, sous le préfixe
+        // adopté, ne partant pas de la racine.
+        for (first, path) in [
+            (context, &[0usize, 3, 2][..]),
+            (context, &[0, 9][..]),
+            (context, &[1, 2][..]),
+            (context - 1, &[0, 1][..]),
+        ] {
+            let mut kv = make()?;
+            kv.set_floor_for_test(context);
+            assert!(
+                kv.compact_tree_rows(first, path).is_err(),
+                "{format:?} {first} {path:?}"
+            );
+            assert_eq!(kv.len(), total, "refus sans effet");
+        }
+    }
+    let mut quantized =
+        state.full_attention_format_for_test(total, Q_HEADS, KV_HEADS, head_dim, KvFormat::Q8)?;
+    quantized.seed(&keys, &values, total)?;
+    assert!(!quantized.verify_tree_supported(), "Q8 refusé");
+    assert!(quantized.compact_tree_rows(context, &[0, 2]).is_err());
+    Ok(())
+}

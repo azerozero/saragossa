@@ -996,6 +996,12 @@ impl FullAttentionMetalState {
         Ok(())
     }
 
+    /// Simule un préfixe adopté de `floor` lignes (immuable) pour les tests.
+    #[cfg(test)]
+    pub(super) fn set_floor_for_test(&mut self, floor: usize) {
+        self.floor = floor;
+    }
+
     /// Renvoie la capacité en lignes.
     pub(super) fn scratch(&self) -> &ScratchPool {
         &self.scratch

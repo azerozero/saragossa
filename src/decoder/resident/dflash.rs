@@ -42,6 +42,47 @@ impl DFlashTreeMode {
             Self::BestFirst(budget) => budget,
         }
     }
+
+    /// Lignes de vérification au plus d'un tour : `B + 1` pour l'arbre
+    /// best-first (même si le bloc du drafter est plus long : l'arbre n'a que
+    /// `B` nœuds), le bloc entier pour la chaîne passée par la plomberie arbre.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unused_variables,
+            reason = "le bloc ne compte que pour la chaîne de test"
+        )
+    )]
+    fn verify_rows(self, draft_limit: usize) -> usize {
+        match self {
+            Self::Off => 0,
+            #[cfg(test)]
+            Self::Chain => draft_limit + 1,
+            Self::BestFirst(budget) => budget + 1,
+        }
+    }
+}
+
+/// Raison du refus de la vérification en arbre (`None` : supportée), sur les
+/// propriétés du modèle : couches glissantes, couches full-attn sans variante
+/// arbre (KV quantifié, sinks, chemin en lignes fusionné désactivé), refus
+/// des états linéaires (cf. `linear_tree_journal_refusal`).
+fn dflash_tree_refusal(
+    sliding: bool,
+    full_supported: impl IntoIterator<Item = bool>,
+    linear_refusals: impl IntoIterator<Item = Option<String>>,
+) -> Option<String> {
+    if sliding {
+        return Some("couches à fenêtre glissante".to_string());
+    }
+    if full_supported.into_iter().any(|supported| !supported) {
+        return Some("KV quantifié, sinks ou chemin en lignes fusionné indisponible".to_string());
+    }
+    linear_refusals
+        .into_iter()
+        .flatten()
+        .next()
+        .map(|reason| format!("états linéaires : {reason}"))
 }
 
 /// Lignes de hidden states cibles téléversées par command buffer (prefill du
@@ -191,6 +232,15 @@ impl CausalDecoder {
                 )));
             }
         }
+        // La trace d'arbre décrit la chaîne gloutonne : refus avant d'ouvrir
+        // (et tronquer) le fichier plutôt qu'une trace incohérente.
+        if tree_mode != DFlashTreeMode::Off
+            && crate::runtime_flags::dflash_tree_trace_path().is_some()
+        {
+            return Err(InferError::Config(
+                "decode DFlash résident: SARAGOSSA_RUST_DFLASH_TREE et SARAGOSSA_RUST_DFLASH_TREE_TRACE sont exclusifs".to_string(),
+            ));
+        }
         let layer_ids = draft.info.target_layer_ids.as_slice();
         let hidden = self.final_norm.len();
         let context_cols = layer_ids
@@ -244,7 +294,7 @@ impl CausalDecoder {
             ));
         }
         if tree_mode != DFlashTreeMode::Off {
-            self.check_dflash_tree_supported(&cache, tree_budget.max(draft_limit) + 1)?;
+            self.check_dflash_tree_supported(&cache, tree_mode.verify_rows(draft_limit))?;
         }
         let top_k = draft.selector.as_ref().map_or(1, |selector| selector.top_k);
         let rank = draft.selector.as_ref().map_or(0, |selector| selector.rank);
@@ -841,6 +891,10 @@ impl CausalDecoder {
                 break;
             }
             state.generated.push(target);
+            // NOTE: arrêt (callback ou limite de sortie) : sortie sans rollback
+            // ni append. Le cache est local à la génération et détruit avec
+            // elle ; ses états (KV non compacté, états linéaires d'entrée) ne
+            // sont plus relus.
             if !(state.on_token)(target) {
                 return Ok(TourEnd::Stop);
             }
@@ -919,29 +973,34 @@ impl CausalDecoder {
     /// glissantes, KV quantifié ou à sinks, chemin en lignes fusionné désactivé,
     /// états linéaires hors du journal arbre pour `rows` lignes.
     fn check_dflash_tree_supported(&self, cache: &CausalDecoderCache, rows: usize) -> Result<()> {
-        let refuse = |reason: &str| {
-            Err(InferError::Config(format!(
+        let sliding =
+            (0..self.layers.len()).any(|index| self.config.layer_sliding_window(index).is_some());
+        let full = cache.layers.iter().filter_map(|layer| layer.full.as_ref());
+        let refusal = dflash_tree_refusal(
+            sliding,
+            full.clone().map(|full| full.verify_tree_supported()),
+            cache.layers.iter().filter_map(|layer| {
+                layer
+                    .linear
+                    .metal_state()
+                    .map(|state| crate::metal_backend::linear_tree_journal_refusal(state, rows))
+            }),
+        );
+        if let Some(reason) = refusal {
+            return Err(InferError::Config(format!(
                 "decode DFlash résident: vérification en arbre non supportée ({reason})"
-            )))
-        };
-        if (0..self.layers.len()).any(|index| self.config.layer_sliding_window(index).is_some()) {
-            return refuse("couches à fenêtre glissante");
+            )));
         }
-        for layer in &cache.layers {
-            if layer
-                .full
-                .as_ref()
-                .is_some_and(|full| !full.verify_tree_supported())
-            {
-                return refuse("KV quantifié, sinks ou chemin en lignes fusionné indisponible");
-            }
-            if layer.linear.metal_state().is_some_and(|state| {
-                !crate::metal_backend::linear_tree_journal_supported(state, rows)
-            }) {
-                return refuse("états linéaires hors du journal arbre (SSM bf16, dims, lignes)");
-            }
-        }
-        Ok(())
+        // Compilation des kernels arbre ici, hors encodeur et hors du tour 1.
+        let mut head_dims = full.map(|full| full.head_dim()).collect::<Vec<_>>();
+        head_dims.sort_unstable();
+        head_dims.dedup();
+        cache
+            .resident
+            .as_ref()
+            .ok_or_else(|| InferError::Config("decode DFlash résident: arène absente".to_string()))?
+            .state
+            .warm_verify_tree_kernels(&head_dims)
     }
 
     /// Projette les lignes `start..end` de `hidden` (`[rows, context_cols]`) dans
@@ -1039,4 +1098,73 @@ fn write_trace_line(
             path: path.to_path_buf(),
             source,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_rows_follow_the_tree_budget() {
+        // Bloc long (16 drafts) et B = 8 : 9 lignes, pas 17.
+        assert_eq!(DFlashTreeMode::BestFirst(8).verify_rows(16), 9);
+        assert_eq!(DFlashTreeMode::BestFirst(15).verify_rows(8), 16);
+        assert_eq!(DFlashTreeMode::Chain.verify_rows(16), 17);
+        assert_eq!(DFlashTreeMode::Off.verify_rows(8), 0);
+    }
+
+    #[test]
+    fn tree_refusals_name_their_cause() {
+        assert_eq!(dflash_tree_refusal(false, [true], [None, None]), None);
+        let sliding = dflash_tree_refusal(true, [true], [None]);
+        assert!(sliding.is_some_and(|r| r.contains("glissante")));
+        let quantized = dflash_tree_refusal(false, [true, false], [None]);
+        assert!(quantized.is_some_and(|r| r.contains("KV quantifié")));
+        let linear = dflash_tree_refusal(false, [true], [None, Some("état SSM bf16".to_string())]);
+        assert!(linear.is_some_and(|r| r.contains("SSM bf16")));
+    }
+
+    /// Refus linéaires au niveau de la forme : SSM bf16, dims, lignes au-delà
+    /// du journal (message « B ≤ 15 »), journal plus grand que l'état.
+    #[test]
+    fn linear_tree_refusals() {
+        use crate::metal_backend::{linear_tree_refusal, LinearTreeShape};
+        let shape = LinearTreeShape {
+            ssm_bf16: false,
+            conv_kernel_dim: 4,
+            key_head_dim: 128,
+            value_head_dim: 128,
+            num_value_heads: 48,
+            ssm_len: 48 * 128 * 128,
+        };
+        assert_eq!(linear_tree_refusal(shape, 9, true), None);
+        assert_eq!(linear_tree_refusal(shape, 16, true), None);
+        assert!(linear_tree_refusal(shape, 17, true).is_some_and(|r| r.contains("B ≤ 15")));
+        assert!(linear_tree_refusal(shape, 1, true).is_some());
+        let bf16 = LinearTreeShape {
+            ssm_bf16: true,
+            ..shape
+        };
+        assert!(linear_tree_refusal(bf16, 9, true).is_some_and(|r| r.contains("bf16")));
+        let k2 = LinearTreeShape {
+            conv_kernel_dim: 2,
+            ..shape
+        };
+        assert!(linear_tree_refusal(k2, 9, true).is_some());
+        assert!(linear_tree_refusal(shape, 9, false).is_some());
+        let small = LinearTreeShape {
+            ssm_len: 1024,
+            ..shape
+        };
+        assert!(linear_tree_refusal(small, 9, true).is_some_and(|r| r.contains("journal")));
+    }
+
+    #[test]
+    fn tree_budget_flag_parses_integers_only() {
+        use crate::runtime_flags::parse_dflash_tree_budget;
+        assert_eq!(parse_dflash_tree_budget(" 8 "), Some(8));
+        assert_eq!(parse_dflash_tree_budget("0"), Some(0));
+        assert_eq!(parse_dflash_tree_budget("huit"), None);
+        assert_eq!(parse_dflash_tree_budget("-1"), None);
+    }
 }

@@ -5,6 +5,9 @@ use super::*;
 /// Lignes réservées dans le journal SSM (`LINEAR_ATTN_JOURNAL_ROWS` de
 /// `kernels.metal`) : 8 captures plus la ligne finale du scan en chaîne, jusqu'à
 /// 16 lignes d'un arbre de vérification DFlash (B ≤ 15).
+/// NOTE: disposition fixe partagée par le journal chaîne (MTP/DFlash, opt-in) et
+/// le journal arbre : la chaîne n'en remplit que ses 9 premières lignes, scan et
+/// replay calculant les mêmes décalages depuis cette seule constante.
 pub(super) const LINEAR_ATTN_JOURNAL_ROWS: usize = 16;
 
 /// Une série de `rows` captures passe en mode journal quand le scan fusionné f32
@@ -28,26 +31,79 @@ fn linear_capture_journal(state: &LinearAttentionMetalState, rows: usize) -> boo
         && journal_len.is_some_and(|len| len <= state.ssm_len)
 }
 
-/// Une série de `rows` captures peut porter un arbre de vérification : scan arbre
-/// f32 dk128 et conv k4 batchée, journal de `rows ≤ LINEAR_ATTN_JOURNAL_ROWS`
-/// lignes tenant dans le `ssm` de la capture 0. Indépendant du flag journal de
-/// la chaîne : l'arbre n'a pas d'autre mode de capture.
+/// Forme d'un état linéaire vue par l'éligibilité du journal arbre.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinearTreeShape {
+    pub(crate) ssm_bf16: bool,
+    pub(crate) conv_kernel_dim: usize,
+    pub(crate) key_head_dim: usize,
+    pub(crate) value_head_dim: usize,
+    pub(crate) num_value_heads: usize,
+    pub(crate) ssm_len: usize,
+}
+
+/// Raison du refus d'un arbre de `rows` lignes sur un état de forme `shape`
+/// (`None` : supporté). Scan arbre f32 dk128 et conv k4 batchée (`kernels`),
+/// journal de `rows ≤ LINEAR_ATTN_JOURNAL_ROWS` lignes tenant dans le `ssm`
+/// de la capture 0. Indépendant du flag journal de la chaîne.
+pub(crate) fn linear_tree_refusal(
+    shape: LinearTreeShape,
+    rows: usize,
+    kernels: bool,
+) -> Option<String> {
+    let journal_len = shape
+        .num_value_heads
+        .checked_mul(shape.value_head_dim + shape.key_head_dim + 1)
+        .and_then(|per_row| per_row.checked_mul(LINEAR_ATTN_JOURNAL_ROWS));
+    if !(2..=LINEAR_ATTN_JOURNAL_ROWS).contains(&rows) {
+        return Some(format!(
+            "{rows} lignes hors du journal arbre de {LINEAR_ATTN_JOURNAL_ROWS} lignes (B ≤ {})",
+            LINEAR_ATTN_JOURNAL_ROWS - 1
+        ));
+    }
+    if shape.ssm_bf16 {
+        return Some("état SSM bf16".to_string());
+    }
+    if shape.conv_kernel_dim != 4 || shape.key_head_dim != 128 || shape.value_head_dim != 128 {
+        return Some(format!(
+            "conv k{} dk{}/dv{} (attendu k4 dk128/dv128)",
+            shape.conv_kernel_dim, shape.key_head_dim, shape.value_head_dim
+        ));
+    }
+    if !kernels {
+        return Some("delta dk128 ou chemin linéaire batché désactivé".to_string());
+    }
+    if !journal_len.is_some_and(|len| len <= shape.ssm_len) {
+        return Some("journal arbre plus grand que l'état SSM".to_string());
+    }
+    None
+}
+
+/// Refus d'un arbre de `rows` lignes pour cet état (cf. [`linear_tree_refusal`]).
+pub(crate) fn linear_tree_journal_refusal(
+    state: &LinearAttentionMetalState,
+    rows: usize,
+) -> Option<String> {
+    linear_tree_refusal(
+        LinearTreeShape {
+            ssm_bf16: state.ssm_bf16,
+            conv_kernel_dim: state.conv_kernel_dim,
+            key_head_dim: state.key_head_dim,
+            value_head_dim: state.value_head_dim,
+            num_value_heads: state.num_value_heads,
+            ssm_len: state.ssm_len,
+        },
+        rows,
+        linear_delta_dk128_enabled() && linear_rows_batched_enabled(),
+    )
+}
+
+/// Vrai si l'état supporte un arbre de `rows` lignes.
 pub(crate) fn linear_tree_journal_supported(
     state: &LinearAttentionMetalState,
     rows: usize,
 ) -> bool {
-    let journal_len = state
-        .num_value_heads
-        .checked_mul(state.value_head_dim + state.key_head_dim + 1)
-        .and_then(|per_row| per_row.checked_mul(LINEAR_ATTN_JOURNAL_ROWS));
-    !state.ssm_bf16
-        && state.conv_kernel_dim == 4
-        && state.key_head_dim == 128
-        && state.value_head_dim == 128
-        && linear_delta_dk128_enabled()
-        && linear_rows_batched_enabled()
-        && (2..=LINEAR_ATTN_JOURNAL_ROWS).contains(&rows)
-        && journal_len.is_some_and(|len| len <= state.ssm_len)
+    linear_tree_journal_refusal(state, rows).is_none()
 }
 
 type LinearAttentionStateCaptures = (

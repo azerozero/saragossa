@@ -641,14 +641,24 @@ impl RowsKernels {
         let Some(tree) = crate::metal_backend::verify_tree() else {
             return Ok((self, None));
         };
+        Ok((self.tree_variant()?, Some(tree)))
+    }
+
+    /// Variante arbre de ces kernels (`self` s'il l'est déjà), compilée à la
+    /// première demande.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la variante arbre ne compile pas.
+    fn tree_variant(&self) -> Result<&Self> {
         if self.tree {
-            return Ok((self, Some(tree)));
+            return Ok(self);
         }
         if let Some(variant) = self.tree_variant.get() {
-            return Ok((variant, Some(tree)));
+            return Ok(variant);
         }
         let variant = Box::new(compile_rows_kernels(&self.device, true)?);
-        Ok((self.tree_variant.get_or_init(|| variant), Some(tree)))
+        Ok(self.tree_variant.get_or_init(|| variant))
     }
 }
 
@@ -776,6 +786,23 @@ fn compile_rows_kernels(device: &Device, tree: bool) -> Result<RowsKernels> {
 }
 
 impl DecodeResidentState {
+    /// Compile d'avance les kernels en lignes de la vérification en arbre (et
+    /// leur NAX pour `head_dims` si le NAX en lignes est actif) : hors de tout
+    /// encodeur ouvert, pour ne pas payer la compilation au premier tour.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si un kernel ne compile pas.
+    pub(crate) fn warm_verify_tree_kernels(&self, head_dims: &[usize]) -> Result<()> {
+        let tree = self.rows_kernels()?.tree_variant()?;
+        if crate::runtime_flags::verify_rows_nax_enabled() {
+            for &head_dim in head_dims {
+                tree.nax(head_dim)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn rows_kernels(&self) -> Result<&RowsKernels> {
         if let Some(kernels) = self.rows_kernels.get() {
             return Ok(kernels);

@@ -136,7 +136,9 @@ pub(crate) use self::lightbatch_duo::{
     begin_expert_indices_collection, take_expert_indices_collection, DuoSampleParams,
 };
 #[cfg(feature = "devtools")]
-pub(crate) use self::linear_attention::linear_tree_journal_supported;
+pub(crate) use self::linear_attention::linear_tree_journal_refusal;
+#[cfg(test)]
+pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) use self::matmul::take_concat_profile;
 pub(crate) use self::matmul::{whisper_bf16_gemm_enabled, whisper_decode_bf16_qmv_enabled};

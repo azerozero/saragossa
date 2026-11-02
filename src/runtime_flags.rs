@@ -1456,9 +1456,23 @@ pub(crate) fn dflash_windowed_rows() -> bool {
 /// lieu de la chaîne gloutonne, vérifiés en `B + 1` lignes. Lu à chaque
 /// génération ; une configuration hors périmètre est refusée avant la boucle.
 pub(crate) fn dflash_tree_budget() -> usize {
-    crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_TREE")
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+    let Some(value) = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_TREE") else {
+        return 0;
+    };
+    parse_dflash_tree_budget(&value).unwrap_or_else(|| {
+        // Une coquille ne doit pas faire mesurer la chaîne en croyant mesurer
+        // l'arbre : diagnostic à chaque génération (lu par génération).
+        eprintln!(
+            "saragossa: SARAGOSSA_RUST_DFLASH_TREE={value:?} invalide (entier B ≥ 0), chaîne"
+        );
+        0
+    })
+}
+
+/// Parse `SARAGOSSA_RUST_DFLASH_TREE` (entier, espaces ignorés) ; `None` si
+/// invalide.
+pub(crate) fn parse_dflash_tree_budget(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok()
 }
 
 /// Diagnostic hors chemin prod : `SARAGOSSA_RUST_DFLASH_TREE_TRACE=<chemin>` écrit en

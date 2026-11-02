@@ -3772,7 +3772,9 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
     let base = cache.position;
     for (rows, capture) in [
         (9, true),
+        (11, true),
         (9, false),
+        (11, false),
         (13, false),
         (16, false),
         (17, false),
