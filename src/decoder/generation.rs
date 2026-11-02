@@ -1295,8 +1295,8 @@ impl CausalDecoder {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         // Drafter DFlash opt-in (`with_dflash_draft_from_env`) : le greedy non
-        // contraint passe par la boucle résidente ; échantillonnage et contraintes
-        // gardent la tête MTP. Phase 7 pairwise : code +31 à +88 %, prose longue
+        // contraint passe par la boucle résidente, stop sequences comprises ;
+        // échantillonnage et contraintes gardent la tête MTP. Phase 7 pairwise : code +31 à +88 %, prose longue
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
         #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
         if let Some(draft) = self.dflash.as_ref() {
@@ -1560,6 +1560,8 @@ impl CausalDecoder {
             && mtp_fresh_cache_enabled()
             && options.temperature.abs() <= f32::EPSILON
             && options.token_constraint.is_none()
+            // Le bloc GPU enchaîne des tours sans rendre la main à l'hôte entre
+            // deux tokens : il reste réservé aux requêtes sans stop sequence.
             && options.stop_sequences.is_empty()
         {
             cache
@@ -1575,7 +1577,18 @@ impl CausalDecoder {
         let overlap_stream = crate::runtime_flags::mtp_overlap_stream_enabled();
         let decode_started = Instant::now();
 
+        // Stop sequences : un seul balayage des tokens committés par le tour
+        // précédent, quel que soit le chemin (D1, D2, vérifieur général),
+        // avant toute émission ; les tokens au-delà de la séquence sont retirés.
+        // NOTE: les statistiques comptent le tour entier, y compris les drafts
+        // acceptés après la séquence.
+        let mut stop_scanned = 0usize;
         while generated.len() < max_new_tokens {
+            if let Some(end) = first_stop_end(&generated, stop_scanned, &options.stop_sequences) {
+                generated.truncate(end + 1);
+                break;
+            }
+            stop_scanned = generated.len();
             let committed_prefix = generated.len();
             let defer_emit = overlap_stream
                 && emitted < committed_prefix
@@ -1635,7 +1648,10 @@ impl CausalDecoder {
             if early_emitted && generated.len() == 1 {
                 emitted = 1;
             }
-            if generated.len() >= max_new_tokens {
+            // Stop sequence terminée par le primaire : pas de draft inutile.
+            if generated.len() >= max_new_tokens
+                || generated_matches_stop_sequence(&generated, &options.stop_sequences)
+            {
                 break;
             }
 
@@ -2083,7 +2099,14 @@ impl CausalDecoder {
         let loop_duration = decode_started.elapsed();
         #[cfg(all(target_os = "macos", feature = "metal"))]
         DecodeProfiler::report_gpu_sections(self, &cache);
+        // Sorties de boucle sans repasser par le balayage de tête (limite de
+        // sortie, primaire) : même troncature avant le flush.
+        if let Some(end) = first_stop_end(&generated, stop_scanned, &options.stop_sequences) {
+            generated.truncate(end + 1);
+        }
         // Flush final : émet les derniers tokens committés non encore streamés.
+        // Un arrêt par stop sequence le garde ; seule l'annulation par le
+        // callback le saute.
         if !stop_streaming {
             while emitted < generated.len() {
                 let committed = generated[emitted];
@@ -5330,6 +5353,21 @@ impl CausalDecoder {
         }
         Ok(generated)
     }
+}
+
+/// Fin (index inclus) de la première stop sequence terminée à une position
+/// `>= from` de `generated`. La fenêtre de chaque test remonte avant `from` :
+/// une séquence à cheval sur des tokens déjà balayés est trouvée.
+fn first_stop_end(
+    generated: &[usize],
+    from: usize,
+    stop_sequences: &[Vec<usize>],
+) -> Option<usize> {
+    if stop_sequences.is_empty() {
+        return None;
+    }
+    (from..generated.len())
+        .find(|&end| generated_matches_stop_sequence(&generated[..=end], stop_sequences))
 }
 
 /// Indique si `generated` se termine par une stop sequence non vide.
