@@ -926,7 +926,7 @@ cache de préfixe.
 poids), contexte 4096, temps mural médian (`verify_rows_cost_bench_real_model`).
 Les couches `FullMoe` passent en lignes sous `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`
 (oracle R lignes contre R pas mono-ligne, rollback compris : vert, aucune
-quasi-égalité). La queue coop (`SARAGOSSA_RUST_MOE_VERIFY_COOP=1`) est plus
+quasi-égalité). La queue coop sur tensor-cores (flag d'essai retiré depuis) est plus
 lente et dérive au-delà de 5e-3 relatif : écartée.
 
 | R | séquentiel (ms) | en lignes (ms) | ρ(R) | queue MoE seule (ms) |
