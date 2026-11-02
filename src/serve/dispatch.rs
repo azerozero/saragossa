@@ -45,17 +45,11 @@ impl Front {
 pub(super) trait ServeStream: Read + Write + Send + 'static {
     /// Applique les timeouts de lecture et d'écriture.
     fn configure(&self, read_timeout: Duration) -> ServeResult<()>;
-    /// Bascule le mode non bloquant (sonde de client parti).
-    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
 }
 
 impl ServeStream for TcpStream {
     fn configure(&self, read_timeout: Duration) -> ServeResult<()> {
         configure_tcp_stream(self, read_timeout)
-    }
-
-    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        TcpStream::set_nonblocking(self, nonblocking)
     }
 }
 
@@ -63,10 +57,6 @@ impl ServeStream for TcpStream {
 impl ServeStream for UnixStream {
     fn configure(&self, read_timeout: Duration) -> ServeResult<()> {
         configure_unix_stream(self, read_timeout)
-    }
-
-    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        UnixStream::set_nonblocking(self, nonblocking)
     }
 }
 
@@ -184,42 +174,17 @@ where
         .map_err(|_| ServeError::io("thread d'accept", io::Error::other("panique")))?
 }
 
-/// Exécute un job sur le thread moteur ; `false` si son client est parti.
-fn run_job<S: ServeStream>(mut job: Job<S>, state: &mut ServeState) -> bool {
-    if peer_gone(&mut job.stream) {
-        eprintln!(
-            "saragossa serve requête abandonnée par le client, ignorée: {} {}",
-            job.request.method,
-            job.request.route()
-        );
-        return false;
-    }
+/// Exécute un job sur le thread moteur.
+///
+/// NOTE: un client parti pendant l'attente en file n'est pas détecté avant
+/// l'exécution : une sonde de lecture confond fermeture complète et
+/// demi-fermeture (`shutdown(Write)` après la requête, client toujours à
+/// l'écoute), toutes deux vues comme EOF. En streaming, les premières
+/// écritures SSE échouent vite (EPIPE) et coupent la génération.
+fn run_job<S: ServeStream>(mut job: Job<S>, state: &mut ServeState) {
     if let Err(error) = handle_job(&mut job.stream, state, job.request) {
         eprintln!("saragossa serve request error: {error}");
     }
-    true
-}
-
-/// Le client a-t-il fermé sa socket pendant l'attente en file ? La requête
-/// est déjà lue en entier : un octet de plus serait du pipelining, ignoré
-/// avec `Connection: close`, donc le consommer est sans conséquence.
-fn peer_gone<S: ServeStream>(stream: &mut S) -> bool {
-    if stream.set_nonblocking(true).is_err() {
-        return false;
-    }
-    let gone = match stream.read(&mut [0_u8; 1]) {
-        Ok(read) => read == 0,
-        Err(error) => !matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ),
-    };
-    // NOTE: sans retour au mode bloquant, l'écriture de la réponse
-    // échouerait en WouldBlock dès que le tampon socket est plein.
-    if stream.set_nonblocking(false).is_err() {
-        return true;
-    }
-    gone
 }
 
 /// Contexte d'un thread de connexion.
@@ -482,41 +447,20 @@ mod tests {
     }
 
     #[test]
-    fn peer_gone_detects_closed_client_and_restores_blocking() {
-        let (client, mut server) = UnixStream::pair().expect("invariant: paire Unix locale");
-        server
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("invariant: timeout serveur");
-
-        assert!(!peer_gone(&mut server));
-        // Mode bloquant restauré : la lecture attend le timeout au lieu de
-        // rendre WouldBlock immédiatement.
-        let started = Instant::now();
-        assert!(server.read(&mut [0_u8; 1]).is_err());
-        assert!(started.elapsed() >= Duration::from_millis(40));
-
-        drop(client);
-        assert!(peer_gone(&mut server));
-    }
-
-    #[test]
-    fn engine_skips_job_of_departed_client() {
+    fn engine_serves_half_closed_client() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
         let (dispatcher, rx) = dispatcher(4, 2);
-        // `settle` entre les deux connexions fixe l'ordre de la file.
-        let departed = connect(&dispatcher, CHAT);
+        let client = connect(&dispatcher, CHAT);
         settle(&dispatcher);
-        let present = connect(&dispatcher, CHAT);
-        settle(&dispatcher);
-        drop(departed);
+        // Demi-fermeture : la requête est envoyée, le client écoute encore.
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("invariant: demi-fermeture locale");
 
-        let first = rx.recv().expect("invariant: job du client parti");
-        let second = rx.recv().expect("invariant: job du client présent");
+        run_job(rx.recv().expect("invariant: job en file"), &mut state);
 
-        assert!(!run_job(first, &mut state));
-        assert!(run_job(second, &mut state));
-        assert!(response(present).starts_with("HTTP/1.1 400"));
+        assert!(response(client).starts_with("HTTP/1.1 400"));
     }
 
     #[test]
