@@ -16,7 +16,7 @@ fn gpu_state() -> Result<DecodeResidentState> {
         .ok_or_else(|| InferError::Metal("aucun device Metal : test GPU non exécuté".to_string()))
 }
 
-/// Arbre de 9 lignes donné par ses parents.
+/// Arbre donné par ses parents (ordre topologique).
 fn tree(parents: &[usize]) -> Result<Rc<VerifyTree>> {
     let mut depths = vec![0usize; parents.len()];
     let mut masks = vec![1u32; parents.len()];
@@ -27,12 +27,25 @@ fn tree(parents: &[usize]) -> Result<Rc<VerifyTree>> {
     Ok(Rc::new(VerifyTree::new(parents, &depths, &masks)?))
 }
 
-/// Chaîne, arbre touffu et arbre mêlant branches profondes et feuilles.
-const TREES: [[usize; 9]; 3] = [
-    [0, 0, 1, 2, 3, 4, 5, 6, 7],
-    [0, 0, 0, 1, 1, 2, 3, 3, 5],
-    [0, 0, 1, 2, 1, 4, 0, 6, 3],
+/// Chaînes (9 et 16 lignes), arbres touffus et arbres mêlant branches
+/// profondes et feuilles, jusqu'aux 16 lignes du journal (B = 15).
+const TREES: [&[usize]; 5] = [
+    &[0, 0, 1, 2, 3, 4, 5, 6, 7],
+    &[0, 0, 0, 1, 1, 2, 3, 3, 5],
+    &[0, 0, 1, 2, 1, 4, 0, 6, 3],
+    &[0, 0, 0, 1, 1, 2, 3, 3, 5, 4, 6, 8, 9],
+    &[0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
 ];
+
+/// Vrai pour une chaîne (`parent = ligne − 1`) : comparée bit à bit au chemin
+/// historique.
+fn is_chain(parents: &[usize]) -> bool {
+    parents
+        .iter()
+        .enumerate()
+        .skip(1)
+        .all(|(row, &parent)| parent + 1 == row)
+}
 
 /// Oracle f64 de la ligne `row` : préfixe `[0, context)` (requête `q_prefix`)
 /// puis lignes d'arbre visibles selon `mask` (requête `q_tree`).
@@ -104,11 +117,11 @@ struct Case {
 fn run_case(
     state: &DecodeResidentState,
     case: &Case,
+    rows: usize,
     tree: Option<Rc<VerifyTree>>,
     group: Option<usize>,
     nax: bool,
 ) -> Result<CaseRun> {
-    let rows = 9;
     let Case {
         head_dim,
         format,
@@ -188,18 +201,20 @@ fn full_attn_rows_tree_matches_cpu() -> Result<()> {
                     context,
                 };
                 for group in [None, Some(1), Some(3)] {
-                    let (chain_ref, ..) = run_case(&state, &case, None, group, false)?;
-                    for (index, parents) in TREES.iter().enumerate() {
+                    for parents in TREES {
+                        let rows = parents.len();
                         let tree = tree(parents)?;
                         let masks = tree.masks().to_vec();
                         let (got, q, keys, values) =
-                            run_case(&state, &case, Some(tree), group, false)?;
+                            run_case(&state, &case, rows, Some(tree), group, false)?;
                         let label = format!(
                             "d{head_dim} {format:?} contexte {context} groupe {group:?} arbre {parents:?}"
                         );
                         assert!(got.iter().all(|v| v.is_finite()), "{label}: non fini");
-                        if index == 0 {
+                        if is_chain(parents) {
                             // Chaîne : bit à bit le chemin historique.
+                            let (chain_ref, ..) =
+                                run_case(&state, &case, rows, None, group, false)?;
                             let bits =
                                 |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
                             assert_eq!(bits(&got), bits(&chain_ref), "{label}: chaîne");
@@ -210,7 +225,7 @@ fn full_attn_rows_tree_matches_cpu() -> Result<()> {
                             let range = row * q_dim..(row + 1) * q_dim;
                             let q_row = &q[range.clone()];
                             let expected = cpu_tree_row(
-                                q_row, q_row, &keys, &values, head_dim, context, mask, 9,
+                                q_row, q_row, &keys, &values, head_dim, context, mask, rows,
                             );
                             let causal = cpu_tree_row(
                                 q_row,
@@ -220,7 +235,7 @@ fn full_attn_rows_tree_matches_cpu() -> Result<()> {
                                 head_dim,
                                 context,
                                 (1u32 << (row + 1)) - 1,
-                                9,
+                                rows,
                             );
                             for (i, (&g, &e)) in got[range].iter().zip(&expected).enumerate() {
                                 let delta = (f64::from(g) - e).abs();
@@ -235,7 +250,7 @@ fn full_attn_rows_tree_matches_cpu() -> Result<()> {
                         }
                         // Le masque change réellement le résultat hors chaîne
                         // (contexte court : les lignes d'arbre pèsent).
-                        if index > 0 && context < 100 {
+                        if !is_chain(parents) && context < 100 {
                             assert!(discriminant > 100.0 * EPS, "{label}: masque sans effet");
                         }
                     }
@@ -262,13 +277,14 @@ fn full_attn_rows_tree_nax_matches_cpu() -> Result<()> {
                 format: KvFormat::Bf16,
                 context,
             };
-            let (chain_ref, ..) = run_case(&state, &case, None, None, true)?;
-            for (index, parents) in TREES.iter().enumerate() {
+            for parents in TREES {
+                let rows = parents.len();
                 let tree = tree(parents)?;
                 let masks = tree.masks().to_vec();
-                let (got, q, keys, values) = run_case(&state, &case, Some(tree), None, true)?;
+                let (got, q, keys, values) = run_case(&state, &case, rows, Some(tree), None, true)?;
                 let label = format!("NAX d{head_dim} contexte {context} arbre {parents:?}");
-                if index == 0 {
+                if is_chain(parents) {
+                    let (chain_ref, ..) = run_case(&state, &case, rows, None, None, true)?;
                     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
                     assert_eq!(bits(&got), bits(&chain_ref), "{label}: chaîne");
                 }
@@ -284,7 +300,7 @@ fn full_attn_rows_tree_nax_matches_cpu() -> Result<()> {
                         head_dim,
                         context,
                         mask,
-                        9,
+                        rows,
                     );
                     for (i, (&g, &e)) in got[range].iter().zip(&expected).enumerate() {
                         let delta = (f64::from(g) - e).abs();
@@ -305,16 +321,17 @@ fn full_attn_rows_tree_nax_matches_cpu() -> Result<()> {
 #[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn rope_rows_tree_rotates_at_depth() -> Result<()> {
     let state = gpu_state()?;
-    let (heads, head_dim, rows, base) = (4usize, 256usize, 9usize, 4093usize);
+    let (heads, head_dim, max_rows, base) = (4usize, 256usize, 16usize, 4093usize);
     let width = heads * head_dim;
-    let input: Vec<f32> = (0..rows * width).map(|i| pseudo(300 + i)).collect();
+    let input: Vec<f32> = (0..max_rows * width).map(|i| pseudo(300 + i)).collect();
     let weight: Vec<f32> = (0..head_dim).map(|i| 1.0 + 0.1 * pseudo(i)).collect();
     let input_buf = lease_with(&state, &input)?;
     let weight_buf = lease_with(&state, &weight)?;
     let kernels = state.rows_kernels()?;
     let executor = crate::metal_backend::MetalExecutor::new()?;
     for parents in TREES {
-        let tree = tree(&parents)?;
+        let rows = parents.len();
+        let tree = tree(parents)?;
         let depths = tree.depths().to_vec();
         let got = state.scratch().lease(rows * width, GpuElement::F32)?;
         let expected = state.scratch().lease(rows * width, GpuElement::F32)?;

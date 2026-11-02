@@ -2883,8 +2883,9 @@ fn mtp_early_first_token_streams_once_and_stops_real_model() -> Result<()> {
 /// - la chaîne gloutonne passée par la plomberie arbre (scan arbre, rollback
 ///   par chemin, compaction KV, rassemblement des hidden) redonne exactement la
 ///   boucle en chaîne : tokens, statistiques et contexte du drafter ;
-/// - l'arbre best-first B=8 sort les tokens de l'AR (code et prose), y compris
-///   sous KV bf16, arrêt par callback, stop token et petites limites de sortie ;
+/// - l'arbre best-first B=8 sort les tokens de l'AR et de la boucle CPU f32
+///   (code et prose), y compris sous KV bf16, arrêt par callback, stop token
+///   et petites limites de sortie ; B = 1, 4, 10, 12, 15 aussi, B = 16 refusé ;
 /// - le contexte du drafter (hidden des lignes du chemin) reste celui de la
 ///   chaîne aux réductions près.
 ///
@@ -2972,6 +2973,11 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
             common / cols
         );
         assert_eq!(tree.tokens, ar, "arbre B=8 divergent de l'AR");
+        // Oracle f32 : la boucle CPU de référence sort les mêmes tokens.
+        let cpu = model.generate_greedy_dflash_batched_with_options(
+            &prompt, max_new, &options, &draft, block,
+        )?;
+        assert_eq!(cpu.tokens, tree.tokens, "arbre B=8 contre la boucle CPU f32");
         // Contexte du drafter : mêmes positions dans le même ordre, calculées
         // dans des lots différents (écart de réduction seul). Une ligne mal
         // rassemblée s'écarterait d'un ordre de grandeur.
@@ -3029,12 +3035,13 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
         let tree = run(&prompt, max_new, &options, DFlashTreeMode::BestFirst(8))?;
         assert_eq!(tree.tokens, ar[..max_new], "arbre, {max_new} tokens");
     }
-    for budget in [1, 4] {
+    // Budgets sous la chaîne et au-delà (jusqu'aux 16 lignes du journal).
+    for budget in [1, 4, 10, 12, 15] {
         let tree = run(&prompt, 32, &options, DFlashTreeMode::BestFirst(budget))?;
         assert_eq!(tree.tokens, ar, "arbre B={budget}");
     }
-    // Hors périmètre V1 : refus explicite avant toute génération.
-    assert!(run(&prompt, 32, &options, DFlashTreeMode::BestFirst(12)).is_err());
+    // Au-delà du journal (17 lignes) : refus explicite avant toute génération.
+    assert!(run(&prompt, 32, &options, DFlashTreeMode::BestFirst(16)).is_err());
     Ok(())
 }
 

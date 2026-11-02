@@ -3450,8 +3450,9 @@ kernel void linear_attn_gated_delta_seq_dk128_tg4_f32(
     ssm_state[idx3] = state3;
 }
 
-// Lignes réservées dans le journal du scan (8 captures + la ligne finale).
-constant constexpr uint LINEAR_ATTN_JOURNAL_ROWS = 9u;
+// Lignes réservées dans le journal du scan : 8 captures + la ligne finale en
+// chaîne, jusqu'à 16 lignes d'un arbre de vérification DFlash (B ≤ 15).
+constant constexpr uint LINEAR_ATTN_JOURNAL_ROWS = 16u;
 
 // Variante du kernel précédent qui écrit aussi l'état SSM après chaque pas `t <
 // capture_count` dans `capture_t` (vérification en lignes : états intermédiaires

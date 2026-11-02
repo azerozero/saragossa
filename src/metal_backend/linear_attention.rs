@@ -3,8 +3,9 @@
 use super::*;
 
 /// Lignes réservées dans le journal SSM (`LINEAR_ATTN_JOURNAL_ROWS` de
-/// `kernels.metal`) : 8 captures plus la ligne finale du scan.
-pub(super) const LINEAR_ATTN_JOURNAL_ROWS: usize = 9;
+/// `kernels.metal`) : 8 captures plus la ligne finale du scan en chaîne, jusqu'à
+/// 16 lignes d'un arbre de vérification DFlash (B ≤ 15).
+pub(super) const LINEAR_ATTN_JOURNAL_ROWS: usize = 16;
 
 /// Une série de `rows` captures passe en mode journal quand le scan fusionné f32
 /// l'écrira (même éligibilité que le chemin en lignes) et que le journal tient dans
@@ -197,13 +198,11 @@ impl MetalExecutor {
                 };
                 // Arbre : seul le `ssm` de la capture 0 (journal) sert ; les autres
                 // le partagent sans jamais y toucher (ni bail ni mémoire en plus).
-                let ssm = match rows_out.first() {
-                    Some(first) if tree => first.ssm.clone(),
+                let (ssm, ssm_lease) = match rows_out.first() {
+                    Some(first) if tree => (first.ssm.clone(), None),
                     _ => {
                         let lease = scratch.lease(state.ssm_len, ssm_element)?;
-                        let buffer = lease.tensor().buffer().clone();
-                        leases.push(lease);
-                        buffer
+                        (lease.tensor().buffer().clone(), Some(lease))
                     }
                 };
                 rows_out.push(LinearAttentionMetalState {
@@ -221,6 +220,7 @@ impl MetalExecutor {
                     tree,
                 });
                 leases.push(conv);
+                leases.extend(ssm_lease);
             }
             captures.push(Some(rows_out));
         }

@@ -44,19 +44,21 @@ fn linear_attn_tree_kernels_match_chain_per_path() -> Result<()> {
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
     };
-    let rows = 9_usize;
+    // Entrées pour 16 lignes (journal plein, B = 15) ; chaque arbre en prend
+    // ses premières lignes.
+    let max_rows = 16_usize;
     let heads = spec.num_value_heads;
     let key_dim = spec.num_key_heads * spec.key_head_dim;
     let value_dim = heads * spec.value_head_dim;
     let conv_dim = key_dim * 2 + value_dim;
     let state_len = heads * spec.value_head_dim * spec.key_head_dim;
-    let qkv: Vec<f32> = (0..rows * conv_dim)
+    let qkv: Vec<f32> = (0..max_rows * conv_dim)
         .map(|idx| ((idx as f32) * 0.017).sin() * 0.8)
         .collect();
-    let beta_in: Vec<f32> = (0..rows * heads)
+    let beta_in: Vec<f32> = (0..max_rows * heads)
         .map(|idx| ((idx as f32) * 0.37).cos())
         .collect();
-    let gate_in: Vec<f32> = (0..rows * heads)
+    let gate_in: Vec<f32> = (0..max_rows * heads)
         .map(|idx| ((idx as f32) * 0.29).sin() - 0.5)
         .collect();
     let conv_weight: Vec<f32> = (0..conv_dim * 4)
@@ -104,7 +106,10 @@ fn linear_attn_tree_kernels_match_chain_per_path() -> Result<()> {
         vec![0u32, 0, 1, 2, 3, 4, 5, 6, 7],
         vec![0u32, 0, 0, 1, 1, 2, 3, 3, 5],
         vec![0u32, 0, 1, 2, 1, 4, 0, 6, 3],
+        vec![0u32, 0, 0, 1, 1, 2, 3, 3, 5, 4, 6, 8, 9, 7, 12, 13],
+        (0..16u32).map(|row| row.saturating_sub(1)).collect(),
     ] {
+        let rows = parents.len();
         let depths = tree_depths(&parents);
         let mut tree_data = parents.clone();
         tree_data.extend_from_slice(&depths);
@@ -282,7 +287,7 @@ fn linear_attn_tree_kernels_match_chain_per_path() -> Result<()> {
             &buffer,
             heads,
             spec.value_head_dim,
-            &[0, 9],
+            &[0, 16],
         )
         .is_err());
     assert!(executor

@@ -182,8 +182,8 @@ impl CausalDecoder {
         let block = draft_limit + 1;
         let tree_budget = tree_mode.budget();
         if let DFlashTreeMode::BestFirst(budget) = tree_mode {
-            // Périmètre V1 : arbre du sélecteur DFlash 2, au plus `B + 1` lignes
-            // dans le journal linéaire (vérifié couche par couche plus bas).
+            // Arbre du sélecteur DFlash 2, au plus `B + 1` lignes dans le journal
+            // linéaire (16, vérifié couche par couche plus bas).
             if draft.selector.is_none() || budget >= super::dflash_tree::DFLASH_TREE_MAX_ROWS {
                 return Err(InferError::Config(format!(
                     "decode DFlash résident: arbre B={budget} exige DFlash 2 (sélecteur) et B < {}",
