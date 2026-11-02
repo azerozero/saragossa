@@ -963,7 +963,7 @@ restaure un préfixe cohérent par captures (un token accepté par répétition)
 | 2 | −1,6 % | +1,1 % | +0,1 % | +19,6 % | −1,5 % |
 | 8 | −2,4 % | +2,1 % | 0,0 % | +87,0 % | −2,5 % |
 
-### Stop sequences sur le chemin spéculatif (2 nov. 2026)
+## Stop sequences sur le chemin spéculatif (2 nov. 2026)
 
 Les requêtes avec `stop`, et Anthropic avec outils (`</tool_call>` ajouté),
 passent désormais par MTP ou DFlash au lieu de l'AR : `supports_options`
