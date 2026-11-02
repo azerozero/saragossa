@@ -847,6 +847,30 @@ N = 3-4 tombe sur le qmv répliqué (qmm2 à 2 lignes, skinny dès 5) :
 `SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH=3` donne 66 → 64 ms à N = 4 ; un kernel qmm4
 reste à écrire. Serve n'utilise pas encore ce chemin (mono-thread).
 
+### DFlash contre MTP selon le contexte (2 nov. 2026, pairwise)
+
+Main #95, même binaire, 3 paires ABBA par cas, 300 tokens greedy, cache de
+préfixe coupé ; textes DFlash et MTP identiques partout. Débit de decode (tok/s) :
+
+| Cas | Contexte | DFlash | MTP | Écart (médiane des paires) |
+|---|---|---|---|---|
+| code | 3,9k | 50,3 | 46,2 | +7,3 % |
+| prose | 3,8k | 42,5 | 43,6 | −5,1 % |
+| code | 32k | 44,2 | 39,7 | +11,4 % |
+| prose | 29k | 42,1 | 38,6 | +9,5 % |
+| prose | 57k | 41,7 | 34,0 | +22,7 % |
+| code | 65k | 28,8 | 30,4 | −5,6 % |
+
+Toutes les paires d'un même cas vont dans le même sens. À 64k, le tour DFlash
+coûte ~80 ms en code comme en prose (`SARAGOSSA_RUST_DFLASH_PROFILE=1`) ; seule
+l'acceptance diffère (2,3 contre 3,3 tokens par tour). L'écart dépend donc du
+contenu, pas de la longueur du contexte : une règle par longueur de contexte n'a
+pas de base. Avec un drafter configuré (`SARAGOSSA_RUST_DFLASH_DRAFT_DIR`),
+DFlash gagne en moyenne +6,7 % sur ces six cas (4 gains de +7 à +23 %, 2 pertes
+de 5-6 %) : le comportement actuel est conservé. Une bascule par acceptance
+récupérerait les pertes, mais son re-prefill coûte cher à long contexte sans
+cache de préfixe.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.
