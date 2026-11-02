@@ -3737,81 +3737,551 @@ fn qwen_kv_nax_x3_shape_targets_dense_qwen_27b_only() {
 }
 
 /// Coût de la vérification résidente en fonction du nombre de lignes, au contexte
-/// `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CTX` (défaut 4096) : substitut de coût pour un
-/// arbre DFlash de B nœuds (B + 1 lignes). Lignes > 9 sans captures linéaires (le
-/// scan séquentiel en a 8 au plus ; un arbre n'en utiliserait pas) ; 9 lignes
-/// mesurées avec et sans, pour isoler leur part. Médiane de 8 répétitions après 2
-/// d'échauffement, rollback par troncature du KV entre deux répétitions ; les états
-/// linéaires ne sont pas restaurés (coût seul, pas un oracle numérique).
+/// `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CTX` (défaut 4096). Avec
+/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` : substitut de coût pour un arbre DFlash de
+/// B nœuds (B + 1 lignes), 9 et 11 lignes mesurées avec et sans captures. Sans
+/// drafter (modèles MoE, lookup) : `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_ROWS=1,2,4`
+/// choisit les lignes, captures linéaires actives si le modèle en a. Médiane de
+/// 8 répétitions après 2 d'échauffement, temps mural (soumission, attente et
+/// relecture comprises). Entre deux répétitions : avec captures, rollback réel à
+/// une position acceptée (le KV et les états linéaires avancent d'un token,
+/// comme un pas où seul le premier token est gardé) ; sans, troncature du KV,
+/// états linéaires non restaurés (coût seul). Échoue si plus d'une ligne est
+/// demandée sans le chemin en lignes, sauf `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_SEQUENTIAL=1`
+/// (référence séquentielle voulue).
 #[test]
-#[ignore = "modèle réel + draft DFlash requis, bench"]
+#[ignore = "modèle réel requis, bench"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn verify_rows_cost_bench_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
     };
-    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none() {
-        eprintln!("skip bench lignes: SARAGOSSA_RUST_DFLASH_DRAFT_DIR absent");
-        return Ok(());
-    }
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let model = crate::load_causal_decoder(&assets)?
-        .with_metal_runtime()?
-        .with_dflash_draft_from_env(&assets.config)?;
-    let layer_ids = model
-        .dflash_draft()
-        .ok_or_else(|| InferError::Config("drafter non chargé".to_string()))?
-        .info
-        .target_layer_ids
-        .clone();
+    let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    // Captures hidden du drafter DFlash si présent (coût DFlash), sinon aucune.
+    let layer_ids = if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_some()
+    {
+        model = model.with_dflash_draft_from_env(&assets.config)?;
+        model
+            .dflash_draft()
+            .ok_or_else(|| InferError::Config("drafter non chargé".to_string()))?
+            .info
+            .target_layer_ids
+            .clone()
+    } else {
+        Vec::new()
+    };
     let context = crate::runtime_flags::env_var("SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CTX")
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(4096);
-    // Tokens synthétiques : le coût ne dépend pas du contenu.
+    let sequential_ok =
+        crate::runtime_flags::env_flag("SARAGOSSA_RUST_VERIFY_ROWS_BENCH_SEQUENTIAL", false);
+    let has_linear = model.has_resident_linear_attention_layer();
+    let rows_list: Vec<(usize, bool)> =
+        match crate::runtime_flags::env_var("SARAGOSSA_RUST_VERIFY_ROWS_BENCH_ROWS") {
+            Some(list) => list
+                .split(',')
+                .filter_map(|value| value.trim().parse::<usize>().ok())
+                .map(|rows| {
+                    (
+                        rows,
+                        has_linear
+                            && crate::runtime_flags::env_flag(
+                                "SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CAPTURES",
+                                true,
+                            ),
+                    )
+                })
+                .collect(),
+            None => vec![
+                (9, true),
+                (11, true),
+                (9, false),
+                (11, false),
+                (13, false),
+                (16, false),
+                (17, false),
+                (25, false),
+                (33, false),
+            ],
+        };
+    // Tokens synthétiques : le coût ne dépend pas du contenu (au routage MoE près).
     let prompt: Vec<usize> = (0..context).map(|i| 1000 + (i * 7919) % 50_000).collect();
-    let (mut cache, _, _, _) =
-        model.prefill_cache_state_with_layer_capture_cached(&prompt, &layer_ids, usize::MAX)?;
+    let mut cache = if layer_ids.is_empty() {
+        model.prefill_cache_state(&prompt)?.0
+    } else {
+        model
+            .prefill_cache_state_with_layer_capture_cached(&prompt, &layer_ids, usize::MAX)?
+            .0
+    };
     let kv_bf16 = CausalDecoder::resident_kv_bf16(false, cache.position);
-    assert!(model.setup_resident_full_decode(&mut cache, 64, 0, kv_bf16)?);
-    let base = cache.position;
-    for (rows, capture) in [
-        (9, true),
-        (11, true),
-        (9, false),
-        (11, false),
-        (13, false),
-        (16, false),
-        (17, false),
-        (25, false),
-        (33, false),
-    ] {
+    // Une avance d'un token par répétition avec captures : réserve large.
+    assert!(model.setup_resident_full_decode(&mut cache, 512, 0, kv_bf16)?);
+    let batched = cache
+        .resident
+        .as_ref()
+        .is_some_and(|arena| model.resident_layer_batch_supported(arena));
+    for (rows, capture) in rows_list {
+        if rows > 1 && !batched && !sequential_ok {
+            return Err(InferError::Config(format!(
+                "bench {rows} lignes: chemin en lignes indisponible (repli séquentiel)"
+            )));
+        }
         let tokens: Vec<usize> = (0..rows).map(|i| 2000 + i * 31).collect();
         let mut times = Vec::new();
         for rep in 0..10 {
+            let base = cache.position;
             let started = std::time::Instant::now();
-            model
+            let output = model
                 .next_final_states_resident_verify(
                     &mut cache,
                     &tokens,
                     crate::decoder::ResidentVerifyHead::Argmax,
                     capture,
-                    Some(&layer_ids),
+                    (!layer_ids.is_empty()).then_some(layer_ids.as_slice()),
                     None,
                 )?
                 .ok_or_else(|| InferError::Config("vérification indisponible".to_string()))?;
             if rep >= 2 {
                 times.push(started.elapsed().as_secs_f64() * 1e3);
             }
-            cache.position = base;
-            for layer in &mut cache.layers {
-                if let Some(full) = layer.full.as_mut() {
-                    full.truncate(base)?;
+            match output.captures.as_ref() {
+                Some(captures) => model.restore_mtp_resident_progress(&mut cache, captures, 1)?,
+                None if rows == 1 => {}
+                None => {
+                    cache.position = base;
+                    for layer in &mut cache.layers {
+                        if let Some(full) = layer.full.as_mut() {
+                            full.truncate(base)?;
+                        }
+                    }
                 }
             }
         }
         times.sort_by(f64::total_cmp);
         eprintln!(
-            "verify_rows_bench ctx={context} kv_bf16={kv_bf16} rows={rows} captures={capture} median_ms={:.2} min_ms={:.2}",
+            "verify_rows_bench ctx={context} kv_bf16={kv_bf16} batched={batched} rows={rows} captures={capture} median_ms={:.2} min_ms={:.2}",
+            times[times.len() / 2],
+            times[0]
+        );
+    }
+    Ok(())
+}
+
+/// Oracle de la vérification MoE en lignes (`SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`,
+/// modèle `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`, Qwen3.5/3.6 MoE) : R lignes
+/// d'un coup contre R pas mono-ligne sur le même texte imposé. Exige
+/// l'argmax identique (sauf quasi-égalité top-1/top-2 de la référence, comptée)
+/// et des états finaux à 5e-3 relatif. Puis, pour plusieurs longueurs acceptées
+/// `j`, rollback par captures à `j` et suite mono-ligne : les états qui suivent
+/// valident KV et états linéaires restaurés contre la référence.
+#[test]
+#[ignore = "modèle MoE réel requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
+    const PROMPT_TOKENS: usize = 512;
+    const FORCED: usize = 16;
+    const NEAR_TIE: f32 = 0.05;
+    if !crate::runtime_flags::moe_verify_rows_enabled() {
+        eprintln!("skip oracle MoE en lignes: SARAGOSSA_RUST_MOE_VERIFY_ROWS absent");
+        return Ok(());
+    }
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let text = concat!(
+        include_str!("../decode_resident/attention.rs"),
+        include_str!("../decode_resident/rows.rs"),
+    );
+    let ids = mtp_verifier_prompt_ids(&assets, text)?;
+    let prompt_len = PROMPT_TOKENS.min(ids.len().saturating_sub(FORCED));
+    let (prompt, forced) = (&ids[..prompt_len], &ids[prompt_len..prompt_len + FORCED]);
+    let fresh = || -> Result<CausalDecoderCache> {
+        let mut cache = model.prefill_cache_state(prompt)?.0;
+        if !model.setup_resident_full_decode(&mut cache, FORCED + 8, 0, false)? {
+            return Err(InferError::Config("setup résident refusé".to_string()));
+        }
+        Ok(cache)
+    };
+    let hidden = model.final_norm.data().len();
+    let verify = |cache: &mut CausalDecoderCache,
+                  tokens: &[usize],
+                  capture: bool|
+     -> Result<ResidentVerifyOutput> {
+        model
+            .next_final_states_resident_verify(
+                cache,
+                tokens,
+                ResidentVerifyHead::Argmax,
+                capture,
+                None,
+                None,
+            )?
+            .ok_or_else(|| InferError::Config("vérification résidente non exercée".into()))
+    };
+
+    // Référence : un pas mono-ligne par token imposé.
+    let mut reference = fresh()?;
+    let batched = reference
+        .resident
+        .as_ref()
+        .is_some_and(|arena| model.resident_layer_batch_supported(arena));
+    assert!(batched, "chemin MoE en lignes non éligible sur ce modèle");
+    let mut ref_states = Vec::with_capacity(FORCED);
+    let mut ref_tokens = Vec::with_capacity(FORCED);
+    let mut ref_margins = Vec::with_capacity(FORCED);
+    for &token in forced {
+        let output = verify(&mut reference, &[token], false)?;
+        let state = output.states.data().to_vec();
+        let (_, margin) = top2(
+            model
+                .logits_from_final_state(&Tensor::from_vec(vec![1, hidden], state.clone())?)?
+                .as_row()?,
+        );
+        ref_tokens.extend(
+            output
+                .tokens
+                .ok_or_else(|| InferError::Config("argmax mono-ligne absent".to_string()))?,
+        );
+        ref_states.push(state);
+        ref_margins.push(margin);
+    }
+
+    let mut near_ties = 0;
+    let mut compare = |label: &str, offset: usize, tokens: &[usize], states: &[f32]| {
+        for (row, (token, state)) in tokens.iter().zip(states.chunks(hidden)).enumerate() {
+            let at = offset + row;
+            let expected = &ref_states[at];
+            let scale = expected.iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
+            let max_err = expected
+                .iter()
+                .zip(state)
+                .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+            assert!(
+                state.iter().all(|value| value.is_finite()),
+                "{label} ligne {at}: état non fini"
+            );
+            assert!(
+                max_err <= 5e-3 * scale,
+                "{label} ligne {at}: dérive {max_err:e} / {scale:e}"
+            );
+            if *token != ref_tokens[at] {
+                assert!(
+                    ref_margins[at] < NEAR_TIE,
+                    "{label} ligne {at}: argmax {token} contre {} (marge {})",
+                    ref_tokens[at],
+                    ref_margins[at]
+                );
+                near_ties += 1;
+            }
+        }
+    };
+
+    for rows in [2, 3, 5, 9] {
+        // Tout accepté : R lignes puis la suite mono-ligne.
+        let mut cache = fresh()?;
+        let output = verify(&mut cache, &forced[..rows], false)?;
+        let tokens = output
+            .tokens
+            .ok_or_else(|| InferError::Config("argmax en lignes absent".to_string()))?;
+        compare(&format!("lignes={rows}"), 0, &tokens, output.states.data());
+        for (step, &token) in forced[rows..rows + 3].iter().enumerate() {
+            let next = verify(&mut cache, &[token], false)?;
+            let tokens = next.tokens.unwrap_or_default();
+            compare(
+                &format!("lignes={rows} suite"),
+                rows + step,
+                &tokens,
+                next.states.data(),
+            );
+        }
+        // Rollback par captures à `accepted` lignes, puis suite mono-ligne.
+        for accepted in [1, rows / 2, rows - 1] {
+            if accepted == 0 {
+                continue;
+            }
+            let mut cache = fresh()?;
+            let output = verify(&mut cache, &forced[..rows], true)?;
+            let captures = output.captures.as_ref().ok_or_else(|| {
+                InferError::Config("captures de vérification absentes".to_string())
+            })?;
+            model.restore_mtp_resident_progress(&mut cache, captures, accepted)?;
+            assert_eq!(cache.position, prompt_len + accepted);
+            for (step, &token) in forced[accepted..accepted + 3].iter().enumerate() {
+                let next = verify(&mut cache, &[token], false)?;
+                let tokens = next.tokens.unwrap_or_default();
+                compare(
+                    &format!("lignes={rows} rollback={accepted}"),
+                    accepted + step,
+                    &tokens,
+                    next.states.data(),
+                );
+            }
+        }
+    }
+    eprintln!("oracle MoE en lignes: vert, quasi-égalités tolérées={near_ties}");
+    Ok(())
+}
+
+/// Mesures préalables de la spéculation MoE, sans chemin de production.
+/// Prompts `SARAGOSSA_RUST_MOESPEC_PROMPTS` (JSON `{nom: texte}`), noms
+/// `SARAGOSSA_RUST_MOESPEC_CASES` (défaut `T0,T1,T2,T6`), sortie greedy AR de
+/// `SARAGOSSA_RUST_MOESPEC_TOKENS` tokens (défaut 256, arrêt sur EOS).
+///
+/// - M1 : prompt + sortie AR repréfillés sous capture du routeur ; sur la sortie,
+///   experts distincts par couche dans R tokens consécutifs, contre l'espérance
+///   d'un routage uniforme `E·(1 − (1 − k/E)^R)`. NOTE: routage du prefill, pas
+///   du decode (mêmes poids, ordre d'accumulation différent).
+/// - M3 : boucle lookup greedy rejouée hors GPU sur la sortie AR (sync, propose,
+///   observe, bonus en fin de vérification), coûts `ρ(R)` lus dans
+///   `SARAGOSSA_RUST_MOESPEC_RHO` (`1,ρ2,ρ3,…`) ; gain = temps AR / temps cumulé.
+#[test]
+#[ignore = "modèle MoE réel requis, mesure"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn moe_spec_overlap_and_lookup_sim_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let Some(prompts_path) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MOESPEC_PROMPTS")
+    else {
+        eprintln!("skip moespec: SARAGOSSA_RUST_MOESPEC_PROMPTS absent");
+        return Ok(());
+    };
+    let prompts: std::collections::BTreeMap<String, String> = serde_json::from_str(
+        &std::fs::read_to_string(&prompts_path)
+            .map_err(|error| InferError::Config(format!("prompts moespec: {error}")))?,
+    )
+    .map_err(|error| InferError::Config(format!("prompts moespec: {error}")))?;
+    let cases = crate::runtime_flags::env_var("SARAGOSSA_RUST_MOESPEC_CASES")
+        .unwrap_or_else(|| "T0,T1,T2,T6".to_string());
+    let max_new = crate::runtime_flags::env_var("SARAGOSSA_RUST_MOESPEC_TOKENS")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(256);
+    let rho: Vec<f64> = crate::runtime_flags::env_var("SARAGOSSA_RUST_MOESPEC_RHO")
+        .map(|list| {
+            list.split(',')
+                .filter_map(|value| value.trim().parse::<f64>().ok())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![1.0, 1.33, 1.65, 1.96, 2.3, 2.6, 2.9, 3.1, 3.36]);
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let options = mtp_verifier_options(assets.stop_token_ids());
+    const WINDOWS: [usize; 5] = [2, 3, 4, 5, 9];
+    for name in cases.split(',').map(str::trim) {
+        let text = prompts
+            .get(name)
+            .ok_or_else(|| InferError::Config(format!("prompt {name} absent")))?;
+        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
+        let output = model.generate_greedy_cached_with_options(&prompt, max_new, &options)?;
+        let mut full = prompt.clone();
+        full.extend_from_slice(&output);
+
+        // M1 : recouvrement des experts sur les positions de la sortie.
+        let (_, routers) = crate::metal_backend::with_router_capture(|| {
+            model.prefill_hidden_for_test(&full, Some(0))
+        })?;
+        let mut distinct = [0.0f64; WINDOWS.len()];
+        let mut windows = [0usize; WINDOWS.len()];
+        let mut overlap_sum = 0.0f64;
+        let mut overlap_count = 0usize;
+        let (mut experts, mut top_k) = (0, 0);
+        for router in &routers {
+            let rows = full.len();
+            top_k = router.indices.len() / rows;
+            experts = router.logits.len() / rows;
+            assert_eq!(
+                top_k * rows,
+                router.indices.len(),
+                "{name}: capture partielle"
+            );
+            let sets: Vec<&[u32]> = router.indices.chunks(top_k).skip(prompt.len()).collect();
+            for pair in sets.windows(2) {
+                overlap_sum += pair[1].iter().filter(|e| pair[0].contains(e)).count() as f64;
+                overlap_count += 1;
+            }
+            for (slot, &width) in WINDOWS.iter().enumerate() {
+                for window in sets.windows(width) {
+                    let mut seen: Vec<u32> =
+                        window.iter().flat_map(|set| set.iter()).copied().collect();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    distinct[slot] += seen.len() as f64;
+                    windows[slot] += 1;
+                }
+            }
+        }
+        eprintln!(
+            "moespec M1 case={name} prompt={} sortie={} couches={} experts={experts} top_k={top_k} recouvrement_consecutif={:.2}/{top_k} (uniforme {:.2})",
+            prompt.len(),
+            output.len(),
+            routers.len(),
+            overlap_sum / overlap_count.max(1) as f64,
+            (top_k * top_k) as f64 / experts.max(1) as f64,
+        );
+        for (slot, &width) in WINDOWS.iter().enumerate() {
+            let measured = distinct[slot] / windows[slot].max(1) as f64;
+            let uniform = experts as f64
+                * (1.0 - (1.0 - top_k as f64 / experts.max(1) as f64).powi(width as i32));
+            eprintln!(
+                "moespec M1 case={name} R={width} distincts={measured:.2} uniforme={uniform:.2} ratio={:.3}",
+                measured / uniform.max(f64::MIN_POSITIVE)
+            );
+        }
+
+        // M3 : boucle lookup greedy rejouée, plafonds de drafts croissants.
+        for cap in [1usize, 2, 3, 4, 8] {
+            let mut lookup = super::lookup::NgramLookup::new(&prompt);
+            let mut generated: Vec<usize> = Vec::new();
+            let (mut cost, mut verifies, mut proposed, mut accepted_total) = (0.0f64, 0, 0, 0);
+            // Le premier token vient du prefill, hors boucle (comme le decode).
+            if let Some(&first) = output.first() {
+                generated.push(first);
+            }
+            while generated.len() < output.len() {
+                lookup.sync(&generated);
+                let remaining = output.len() - generated.len();
+                let cap_now = cap
+                    .min(rho.len().saturating_sub(1))
+                    .min(remaining.saturating_sub(1));
+                match lookup.propose(cap_now) {
+                    Some(drafts) => {
+                        let at = generated.len();
+                        let accepted = drafts
+                            .iter()
+                            .zip(&output[at..])
+                            .take_while(|(draft, target)| draft == target)
+                            .count();
+                        lookup.observe(drafts.len(), accepted);
+                        cost += rho[drafts.len()];
+                        verifies += 1;
+                        proposed += drafts.len();
+                        accepted_total += accepted;
+                        let gained = (accepted + 1).min(remaining);
+                        generated.extend_from_slice(&output[at..at + gained]);
+                    }
+                    None => {
+                        cost += 1.0;
+                        generated.push(output[generated.len()]);
+                    }
+                }
+            }
+            let ar = output.len().saturating_sub(1) as f64;
+            eprintln!(
+                "moespec M3 case={name} cap={cap} vérifs={verifies} proposés={proposed} acceptés={accepted_total} coût={cost:.1} AR={ar:.0} gain={:+.1}%",
+                (ar / cost.max(f64::MIN_POSITIVE) - 1.0) * 100.0
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Coût de la seule queue MoE shared par nombre de lignes, sur toutes les
+/// couches MoE de l'arène résidente (un command buffer, une queue par couche,
+/// entrées = embeddings de tokens distincts pour varier le routage). `R = 1`
+/// prend le chemin mono-ligne fusionné du decode ; `R > 1` le gather en lignes
+/// de la vérification (ou le coop sous `SARAGOSSA_RUST_MOE_VERIFY_COOP=1`, via
+/// `SARAGOSSA_RUST_MOE_TAIL_BENCH_COOP=1`). Isole la part MoE de `ρ(R)`.
+#[test]
+#[ignore = "modèle MoE réel requis, bench"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn moe_tail_rows_cost_bench_real_model() -> Result<()> {
+    use crate::decode_resident::GpuElement;
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let metal = model
+        .forward_runtime()
+        .metal_executor()
+        .ok_or_else(|| InferError::Metal("executor Metal absent".to_string()))?;
+    let prompt: Vec<usize> = (0..64).map(|i| 1000 + i * 7919 % 50_000).collect();
+    let mut cache = model.prefill_cache_state(&prompt)?.0;
+    assert!(model.setup_resident_full_decode(&mut cache, 64, 0, false)?);
+    let arena = cache
+        .resident
+        .as_ref()
+        .ok_or_else(|| InferError::Config("arène absente".to_string()))?;
+    let moes: Vec<(&crate::metal_backend::MetalMoeSharedWeights, usize)> = arena
+        .layers
+        .iter()
+        .filter_map(|layer| match layer {
+            ResidentLayerBuffers::FullMoe(buffers) => Some((&buffers.moe, buffers.top_k)),
+            ResidentLayerBuffers::LinearMoe(buffers) => Some((&buffers.moe, buffers.top_k)),
+            _ => None,
+        })
+        .collect();
+    assert!(!moes.is_empty(), "aucune couche MoE shared");
+    let coop = crate::runtime_flags::env_flag("SARAGOSSA_RUST_MOE_TAIL_BENCH_COOP", false);
+    let hidden = model.final_norm.data().len();
+    for rows in [1usize, 2, 3, 4, 5, 9] {
+        let mut times = Vec::new();
+        for rep in 0..12 {
+            let tokens: Vec<usize> = (0..rows).map(|i| 3000 + rep * 97 + i * 31).collect();
+            let embed = model.embed_scaled(&tokens)?;
+            let input = arena
+                .state
+                .scratch()
+                .lease(rows * hidden, GpuElement::F32)?;
+            let residual = arena
+                .state
+                .scratch()
+                .lease(rows * hidden, GpuElement::F32)?;
+            let output = arena
+                .state
+                .scratch()
+                .lease(rows * hidden, GpuElement::F32)?;
+            arena.state.upload(input.tensor(), embed.data())?;
+            arena.state.upload(residual.tensor(), embed.data())?;
+            let command_buffer = arena.state.queue().new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            let mut owned = Vec::new();
+            let started = std::time::Instant::now();
+            for &(moe, top_k) in &moes {
+                let (input, residual, output) = (
+                    input.tensor().buffer(),
+                    residual.tensor().buffer(),
+                    output.tensor().buffer(),
+                );
+                if coop && rows > 1 {
+                    metal.encode_moe_shared_rows_coop(
+                        encoder,
+                        &mut owned,
+                        input,
+                        Some(residual),
+                        output,
+                        rows,
+                        hidden,
+                        moe,
+                        top_k,
+                    )?;
+                } else {
+                    metal.encode_moe_shared_buffers_rows(
+                        encoder,
+                        &mut owned,
+                        input,
+                        Some(residual),
+                        output,
+                        rows,
+                        hidden,
+                        moe,
+                        top_k,
+                    )?;
+                }
+            }
+            encoder.end_encoding();
+            crate::metal_backend::commit_and_wait(command_buffer)?;
+            if rep >= 2 {
+                times.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "moe_tail_bench couches={} coop={coop} rows={rows} median_ms={:.2} min_ms={:.2}",
+            moes.len(),
             times[times.len() / 2],
             times[0]
         );
