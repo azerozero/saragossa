@@ -146,6 +146,31 @@ impl CausalDecoder {
         options: &GenerationOptions,
         sampler: &mut DeterministicSampler,
     ) -> Result<Option<ResidentPipelineOutput>> {
+        self.decode_tokens_resident_pipelined_until(
+            cache,
+            first_token,
+            max_new_tokens,
+            options,
+            sampler,
+            |_| false,
+        )
+    }
+
+    /// [`Self::decode_tokens_resident_pipelined`] interrompu dès que `until`
+    /// (appelé sur les tokens produits, `first_token` en tête) répond vrai : plus
+    /// aucun pas n'est enfilé, les pas en vol sont lus et gardés (ce sont des
+    /// tokens AR valides), puis `drained` est vrai. Le dernier token rendu n'est
+    /// alors pas encore injecté dans le modèle.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(in crate::decoder) fn decode_tokens_resident_pipelined_until(
+        &self,
+        cache: &mut CausalDecoderCache,
+        first_token: usize,
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        sampler: &mut DeterministicSampler,
+        mut until: impl FnMut(&[usize]) -> bool,
+    ) -> Result<Option<ResidentPipelineOutput>> {
         let Some(arena) = cache.resident.as_ref() else {
             return Ok(None);
         };
@@ -159,6 +184,7 @@ impl CausalDecoder {
                 tokens: generated,
                 decode: Duration::ZERO,
                 decode_tokens: 0,
+                drained: false,
             }));
         }
         generated.push(first_token);
@@ -167,6 +193,7 @@ impl CausalDecoder {
                 tokens: generated,
                 decode: Duration::ZERO,
                 decode_tokens: 0,
+                drained: false,
             }));
         }
 
@@ -177,8 +204,10 @@ impl CausalDecoder {
         let decode_limit = max_new_tokens - 1;
         let mut previous_index: Option<metal::Buffer> = None;
         let mut stopped = false;
+        let mut draining = false;
         while generated.len() < max_new_tokens && !stopped {
-            while enqueued < decode_limit && inflight.len() < RESIDENT_PIPELINE_WINDOW {
+            while !draining && enqueued < decode_limit && inflight.len() < RESIDENT_PIPELINE_WINDOW
+            {
                 let slot = enqueued % RESIDENT_PIPELINE_WINDOW;
                 let output_index = cache
                     .resident
@@ -225,6 +254,7 @@ impl CausalDecoder {
                 stopped = true;
             } else {
                 generated.push(token);
+                draining = draining || until(&generated);
             }
         }
 
@@ -233,6 +263,7 @@ impl CausalDecoder {
         }
 
         Ok(Some(ResidentPipelineOutput {
+            drained: draining && !stopped && generated.len() < max_new_tokens,
             tokens: generated,
             decode: started.elapsed(),
             decode_tokens: enqueued,

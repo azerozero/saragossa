@@ -4288,3 +4288,91 @@ fn moe_tail_rows_cost_bench_real_model() -> Result<()> {
     }
     Ok(())
 }
+
+/// Pairwise ABBA de la boucle lookup greedy (`SARAGOSSA_RUST_LOOKUP_GREEDY`)
+/// contre le greedy AR, même processus, même modèle : `SARAGOSSA_RUST_MOESPEC_PAIRS`
+/// paires (défaut 3) par cas, drafts `SARAGOSSA_RUST_MOESPEC_LOOKUP` (défaut 2),
+/// mêmes prompts et budget que [`moe_spec_overlap_and_lookup_sim_real_model`].
+/// Affiche le débit de decode de chaque passage, le gain médian et l'égalité des
+/// sorties (premier écart sinon). Exige `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1` sur
+/// un modèle MoE.
+#[test]
+#[ignore = "modèle réel requis, bench"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn lookup_greedy_abba_vs_ar_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let Some(prompts_path) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MOESPEC_PROMPTS")
+    else {
+        eprintln!("skip lookup ABBA: SARAGOSSA_RUST_MOESPEC_PROMPTS absent");
+        return Ok(());
+    };
+    let prompts: std::collections::BTreeMap<String, String> = serde_json::from_str(
+        &std::fs::read_to_string(&prompts_path)
+            .map_err(|error| InferError::Config(format!("prompts lookup: {error}")))?,
+    )
+    .map_err(|error| InferError::Config(format!("prompts lookup: {error}")))?;
+    let env_usize = |name: &str, default: usize| {
+        crate::runtime_flags::env_var(name)
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    let cases = crate::runtime_flags::env_var("SARAGOSSA_RUST_MOESPEC_CASES")
+        .unwrap_or_else(|| "T0,T2,T6".to_string());
+    let max_new = env_usize("SARAGOSSA_RUST_MOESPEC_TOKENS", 256);
+    let pairs = env_usize("SARAGOSSA_RUST_MOESPEC_PAIRS", 3);
+    let drafts = env_usize("SARAGOSSA_RUST_MOESPEC_LOOKUP", 2);
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let options = mtp_verifier_options(assets.stop_token_ids());
+    let run = |prompt: &[usize], lookup: usize| -> Result<(Vec<usize>, f64)> {
+        let output = crate::runtime_flags::with_lookup_greedy_override(lookup, || {
+            model.generate_greedy_timed_with_options(prompt, max_new, &options)
+        })?;
+        let rate = output.timings.decode_tokens as f64
+            / output.timings.decode.as_secs_f64().max(f64::MIN_POSITIVE);
+        Ok((output.tokens, rate))
+    };
+    for name in cases.split(',').map(str::trim) {
+        let text = prompts
+            .get(name)
+            .ok_or_else(|| InferError::Config(format!("prompt {name} absent")))?;
+        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
+        // Échauffement des deux chemins (pipelines, scratch).
+        let (reference, _) = run(&prompt, 0)?;
+        run(&prompt, drafts)?;
+        let mut gains = Vec::with_capacity(pairs * 2);
+        let mut identical = true;
+        let mut first_gap = None;
+        for pair in 0..pairs {
+            let mut rates = [0.0f64; 2];
+            for (slot, lookup) in [(0, 0), (1, drafts), (1, drafts), (0, 0)] {
+                let (tokens, rate) = run(&prompt, lookup)?;
+                if tokens != reference {
+                    identical = false;
+                    first_gap.get_or_insert_with(|| {
+                        tokens
+                            .iter()
+                            .zip(&reference)
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(tokens.len().min(reference.len()))
+                    });
+                }
+                rates[slot] += rate / 2.0;
+                eprintln!(
+                    "lookup_abba case={name} paire={pair} lookup={lookup} tokens={} tok_s={rate:.1}",
+                    tokens.len()
+                );
+            }
+            gains.push((rates[1] / rates[0] - 1.0) * 100.0);
+        }
+        gains.sort_by(f64::total_cmp);
+        eprintln!(
+            "lookup_abba case={name} drafts={drafts} sortie={} gain_median={:+.1}% gains={gains:.1?} identique_ar={identical} premier_ecart={first_gap:?}",
+            reference.len(),
+            gains[gains.len() / 2],
+        );
+    }
+    Ok(())
+}

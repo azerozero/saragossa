@@ -775,6 +775,45 @@ pub(crate) fn moe_verify_rows_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_VERIFY_ROWS", false))
 }
 
+/// Drafts par pas de la boucle greedy « lookup seul » (lookup n-grammes sans
+/// tête MTP ni drafter, vérification résidente en lignes) :
+/// `SARAGOSSA_RUST_LOOKUP_GREEDY=n`, borné à 8 (neuf lignes, limite des captures
+/// linéaires en journal). Défaut 0 = désactivé. Exige la vérification en lignes
+/// de tout le modèle (MoE : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`).
+///
+/// MESURE (2 nov. 2026, Qwen3.6-35B-A3B 4 bits, ABBA 3 paires contre le greedy
+/// AR, 400 tokens, sorties identiques à l'AR partout) : T6 (code qui recopie)
+/// +19,6 % à 2 drafts, +87 % à 8 ; T0, T1, T2, T7 entre −2,5 et +2,1 %.
+pub(crate) fn lookup_greedy_draft_tokens() -> usize {
+    #[cfg(test)]
+    if let Some(forced) = LOOKUP_GREEDY_OVERRIDE.with(std::cell::Cell::get) {
+        return forced.min(8);
+    }
+    static DRAFT: OnceLock<usize> = OnceLock::new();
+    *DRAFT.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_LOOKUP_GREEDY")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(8)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOOKUP_GREEDY_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Exécute `run` avec `n` drafts de lookup greedy sur ce thread (bench A/B dans
+/// un même processus), puis rétablit la valeur précédente.
+#[cfg(test)]
+pub(crate) fn with_lookup_greedy_override<R>(drafts: usize, run: impl FnOnce() -> R) -> R {
+    let previous = LOOKUP_GREEDY_OVERRIDE.with(|cell| cell.replace(Some(drafts)));
+    let result = run();
+    LOOKUP_GREEDY_OVERRIDE.with(|cell| cell.set(previous));
+    result
+}
+
 /// Queue MoE shared de la vérification en lignes sur tensor-cores
 /// (`encode_moe_shared_rows_coop`, experts groupés) au lieu du gather par slot :
 /// `SARAGOSSA_RUST_MOE_VERIFY_COOP=1`. Défaut OFF : le seuil de rentabilité en

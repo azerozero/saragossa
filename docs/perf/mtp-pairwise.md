@@ -920,6 +920,42 @@ de 5-6 %) : le comportement actuel est conservé. Une bascule par acceptance
 récupérerait les pertes, mais son re-prefill coûte cher à long contexte sans
 cache de préfixe.
 
+## Vérification MoE en lignes et lookup sans tête MTP (Qwen3.6-35B-A3B)
+
+2 novembre, Qwen3.6-35B-A3B 4 bits (mlx-community, sans tête MTP dans les
+poids), contexte 4096, temps mural médian (`verify_rows_cost_bench_real_model`).
+Les couches `FullMoe` passent en lignes sous `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`
+(oracle R lignes contre R pas mono-ligne, rollback compris : vert, aucune
+quasi-égalité). La queue coop (`SARAGOSSA_RUST_MOE_VERIFY_COOP=1`) est plus
+lente et dérive au-delà de 5e-3 relatif : écartée.
+
+| R | séquentiel (ms) | en lignes (ms) | ρ(R) | queue MoE seule (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 7,93 | 7,97 | 1,00 | 3,63 |
+| 2 | 15,60 | 14,60 | 1,83 | 8,54 |
+| 3 | 23,17 | 14,69 | 1,84 | 9,30 |
+| 4 | 30,61 | 16,32 | 2,05 | 10,45 |
+| 5 | 38,12 | 19,76 | 2,48 | 12,15 |
+| 9 | 68,80 | 24,35 | 3,05 | 15,81 |
+
+- Le saut de 1 à 2 lignes vient surtout de la queue MoE en lignes (+4,9 ms sur
+  40 couches) ; au-delà, une ligne coûte ≈ 1,1 ms de MoE, proche de la bande
+  passante des 8 experts. Les captures, l'attention en lignes et le scan
+  linéaire n'expliquent pas le saut (ablations sans effet notable).
+- Recouvrement des experts (routeur du prefill sur la sortie AR, 400 tokens) :
+  3,1 à 3,7 experts sur 8 communs entre tokens consécutifs (1,8 sur T6), contre
+  0,25 pour un routage uniforme ; experts distincts sur 9 tokens = 0,51 à 0,69
+  fois l'uniforme. Le gather par slot n'en profite pas.
+- MTP : non-go en l'état (ρ(2) = 1,83 > 1,30, ρ(3) = 1,84 > 1,55).
+- Lookup sans tête MTP (`SARAGOSSA_RUST_LOOKUP_GREEDY=n`, opt-in, decode
+  pipeliné interrompu dès qu'une proposition existe), ABBA 3 paires contre le
+  greedy AR, 400 tokens, sorties identiques à l'AR :
+
+| drafts | T0 | T1 | T2 | T6 | T7 |
+|---:|---:|---:|---:|---:|---:|
+| 2 | −1,6 % | +1,1 % | +0,1 % | +19,6 % | −1,5 % |
+| 8 | −2,4 % | +2,1 % | 0,0 % | +87,0 % | −2,5 % |
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

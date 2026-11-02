@@ -6,6 +6,8 @@ pub(in crate::decoder) mod dflash;
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 mod dflash_tree;
 mod encode;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+mod lookup_greedy;
 mod mtp;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod mtp_block;
