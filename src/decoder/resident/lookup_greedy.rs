@@ -5,23 +5,34 @@ use super::super::lookup::NgramLookup;
 use super::super::*;
 use crate::decoder::ResidentVerifyHead;
 
+/// Conditions de la boucle lookup indépendantes du modèle : drafts demandés,
+/// greedy sans contrainte ni séquence d'arrêt, et pas de plafond de débit
+/// (`throttled`) : la boucle ne temporise pas, elle le contournerait.
+fn lookup_greedy_options_ok(drafts: usize, options: &GenerationOptions, throttled: bool) -> bool {
+    drafts > 0
+        && !throttled
+        && options.temperature <= f32::EPSILON
+        && options.token_constraint.is_none()
+        && options.stop_sequences.is_empty()
+}
+
 impl CausalDecoder {
-    /// Vrai si la boucle lookup greedy peut tourner sur ce cache : flag actif,
-    /// greedy sans contrainte ni séquence d'arrêt, arène résidente prête et
+    /// Vrai si la boucle lookup greedy peut tourner sur ce cache : options
+    /// éligibles (cf. [`lookup_greedy_options_ok`]), arène résidente prête et
     /// vérification en lignes de toutes les couches (rollback par captures).
     pub(in crate::decoder) fn lookup_greedy_eligible(
         &self,
         cache: &CausalDecoderCache,
         options: &GenerationOptions,
     ) -> bool {
-        crate::runtime_flags::lookup_greedy_draft_tokens() > 0
-            && options.temperature <= f32::EPSILON
-            && options.token_constraint.is_none()
-            && options.stop_sequences.is_empty()
-            && cache
-                .resident
-                .as_ref()
-                .is_some_and(|arena| self.resident_layer_batch_supported(arena))
+        lookup_greedy_options_ok(
+            crate::runtime_flags::lookup_greedy_draft_tokens(),
+            options,
+            crate::runtime_flags::decode_min_interval().is_some(),
+        ) && cache
+            .resident
+            .as_ref()
+            .is_some_and(|arena| self.resident_layer_batch_supported(arena))
     }
 
     /// Decode greedy depuis `first` (premier token, issu du prefill) : à chaque
@@ -74,6 +85,8 @@ impl CausalDecoder {
                 .ok_or_else(|| InferError::Config("lookup greedy: aucun token".into()))?;
             pending.clear();
             lookup.sync(&generated);
+            // NOTE: `propose` a des effets de bord (index du dernier n-gramme,
+            // décompte du repos) : un appel par position, comme la boucle MTP.
             if let Some(drafts) = lookup.propose(draft_cap(generated.len())) {
                 pending = self.verify_lookup_drafts(cache, &mut lookup, token, &drafts)?;
                 continue;
@@ -159,5 +172,39 @@ impl CausalDecoder {
             InferError::Dimension("lookup greedy: ligne de correction absente".into())
         })?);
         Ok(emitted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_options_refuse_throttle_sampling_and_constraints() {
+        let greedy = GenerationOptions {
+            stop_token_ids: vec![2],
+            stop_sequences: Vec::new(),
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: 0,
+            token_constraint: None,
+        };
+        assert!(lookup_greedy_options_ok(2, &greedy, false));
+        assert!(!lookup_greedy_options_ok(0, &greedy, false), "flag à 0");
+        assert!(
+            !lookup_greedy_options_ok(2, &greedy, true),
+            "plafond de débit actif"
+        );
+        let sampled = GenerationOptions {
+            temperature: 0.7,
+            ..greedy.clone()
+        };
+        assert!(!lookup_greedy_options_ok(2, &sampled, false));
+        let stop_sequence = GenerationOptions {
+            stop_sequences: vec![vec![1, 2]],
+            ..greedy
+        };
+        assert!(!lookup_greedy_options_ok(2, &stop_sequence, false));
     }
 }
