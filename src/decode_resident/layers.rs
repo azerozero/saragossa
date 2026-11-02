@@ -1165,7 +1165,81 @@ impl DecodeResidentState {
             );
         }
         self.encode_full_attn_dense_layer_rows_impl(
-            executor, encoder, owned, kv, weights, dims, rows, None, layer_in, layer_out,
+            executor, encoder, owned, kv, weights, dims, rows, None, None, layer_in, layer_out,
+        )
+    }
+
+    /// Encode une couche full-attn MoE shared (Qwen3.5/3.6 MoE) sur `rows`
+    /// positions contiguës : attention en lignes du chemin dense (porte de
+    /// sortie), puis queue MoE shared en lignes. `rows == 1` délègue au
+    /// mono-ligne [`Self::encode_full_attn_layer`], comme le chemin dense.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sur des normes feed-forward Gemma (hors périmètre) ou
+    /// si l'encodage échoue.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "data flow batché d'une couche full-attn MoE"
+    )]
+    pub(crate) fn encode_full_attn_moe_layer_rows(
+        &self,
+        executor: &MetalExecutor,
+        encoder: &ComputeCommandEncoderRef,
+        owned: &mut Vec<Buffer>,
+        kv: &mut FullAttentionMetalState,
+        weights: FullAttnLayerWeights<'_>,
+        dims: FullAttnLayerDims,
+        rows: usize,
+        layer_in: &BufferRef,
+        layer_out: &BufferRef,
+    ) -> Result<()> {
+        if rows == 1 {
+            return self.encode_full_attn_layer(
+                executor, encoder, owned, kv, weights, dims, layer_in, layer_out,
+            );
+        }
+        if weights.pre_feedforward_norm.is_some() || weights.post_feedforward_norm.is_some() {
+            return Err(InferError::Config(
+                "full-attn MoE batché sans normes feed-forward Gemma".to_string(),
+            ));
+        }
+        // NOTE: gate/up/down et `tail_score` ne servent qu'à la queue dense, que
+        // `shared_moe` remplace : des poids de la couche tiennent leur place.
+        let attention = FullAttnDenseLayerWeights {
+            input_norm: weights.input_norm,
+            qkv_proj: weights.qkv_proj,
+            qkv_proj_without_gate: false,
+            value_norm: false,
+            q_proj: weights.q_proj,
+            k_proj: weights.k_proj,
+            v_proj: weights.v_proj,
+            o_proj: weights.o_proj,
+            q_norm: weights.q_norm,
+            k_norm: weights.k_norm,
+            post_norm: weights.post_norm,
+            pre_feedforward_norm: None,
+            post_feedforward_norm: None,
+            layer_scalar: weights.layer_scalar,
+            gate_proj: weights.o_proj,
+            up_proj: weights.o_proj,
+            down_proj: weights.o_proj,
+            tail_score: weights.input_norm,
+            parallel_moe: None,
+            sigmoid_moe: None,
+        };
+        self.encode_full_attn_dense_layer_rows_impl(
+            executor,
+            encoder,
+            owned,
+            kv,
+            attention,
+            dims,
+            rows,
+            None,
+            Some((weights.moe, weights.top_k)),
+            layer_in,
+            layer_out,
         )
     }
 
@@ -1206,6 +1280,7 @@ impl DecodeResidentState {
             dims,
             rows,
             Some(position),
+            None,
             layer_in,
             layer_out,
         )
@@ -1243,6 +1318,7 @@ impl DecodeResidentState {
         dims: FullAttnLayerDims,
         rows: usize,
         gpu_position: Option<GpuPosition<'_>>,
+        shared_moe: Option<(&MetalMoeSharedWeights, usize)>,
         layer_in: &BufferRef,
         layer_out: &BufferRef,
     ) -> Result<()> {
@@ -1743,6 +1819,20 @@ impl DecodeResidentState {
                 dims.eps,
             )?;
         }
+        if let Some((moe, top_k)) = shared_moe {
+            return Self::encode_moe_shared_tail_rows(
+                executor,
+                encoder,
+                owned,
+                post_normed.tensor().buffer(),
+                summed.tensor().buffer(),
+                layer_out,
+                rows,
+                hidden,
+                moe,
+                top_k,
+            );
+        }
         if let Some(parallel_moe) = weights.parallel_moe {
             return self.encode_gemma_parallel_moe_tail(
                 executor,
@@ -1930,16 +2020,63 @@ impl DecodeResidentState {
             hidden,
             eps,
         )?;
-        executor.encode_moe_shared_buffers_rows(
+        Self::encode_moe_shared_tail_rows(
+            executor,
             encoder,
             owned,
             post_normed.tensor().buffer(),
-            Some(summed.tensor().buffer()),
+            summed.tensor().buffer(),
             layer_out,
             rows,
             hidden,
             weights.moe,
             weights.top_k,
+        )
+    }
+
+    /// Queue MoE shared en lignes de la vérification : `input` post-normé,
+    /// `residual` ajouté à la sortie. Gather par slot (`rows × top_k`) par
+    /// défaut ; experts groupés sur tensor-cores sous
+    /// `SARAGOSSA_RUST_MOE_VERIFY_COOP=1` quand les poids s'y prêtent.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "queue MoE en lignes: buffers d'entrée, résiduel et sortie + poids"
+    )]
+    fn encode_moe_shared_tail_rows(
+        executor: &MetalExecutor,
+        encoder: &ComputeCommandEncoderRef,
+        owned: &mut Vec<Buffer>,
+        input: &BufferRef,
+        residual: &BufferRef,
+        layer_out: &BufferRef,
+        rows: usize,
+        hidden: usize,
+        moe: &MetalMoeSharedWeights,
+        top_k: usize,
+    ) -> Result<()> {
+        if rows > 1 && crate::runtime_flags::moe_verify_coop_enabled() && moe.coop_compatible() {
+            return executor.encode_moe_shared_rows_coop(
+                encoder,
+                owned,
+                input,
+                Some(residual),
+                layer_out,
+                rows,
+                hidden,
+                moe,
+                top_k,
+            );
+        }
+        executor.encode_moe_shared_buffers_rows(
+            encoder,
+            owned,
+            input,
+            Some(residual),
+            layer_out,
+            rows,
+            hidden,
+            moe,
+            top_k,
         )
     }
 

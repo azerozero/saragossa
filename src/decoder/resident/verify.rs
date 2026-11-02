@@ -19,7 +19,17 @@ impl CausalDecoder {
                         Some(ResidentLayerBuffers::FullDense(_))
                     )
                 }
-                (false, Some(FeedForward::Moe(_))) if prefill_moe_rows_enabled() => {
+                (true, Some(FeedForward::Moe(_)))
+                    if crate::runtime_flags::moe_verify_rows_enabled() =>
+                {
+                    matches!(
+                        arena.layers.get(index),
+                        Some(ResidentLayerBuffers::FullMoe(_))
+                    )
+                }
+                (false, Some(FeedForward::Moe(_)))
+                    if crate::runtime_flags::moe_verify_rows_enabled() =>
+                {
                     matches!(
                         arena.layers.get(index),
                         Some(ResidentLayerBuffers::LinearMoe(_))
@@ -200,19 +210,39 @@ impl CausalDecoder {
                         eps,
                         theta,
                     )?;
-                    self.encode_resident_full_dense_layer_rows(
-                        metal,
-                        arena,
-                        layer_cache,
-                        layer,
-                        index,
-                        encoder,
-                        &mut owned,
-                        dims,
-                        batch,
-                        current,
-                        other,
-                    )?;
+                    // flint (MoE sigmoïde) est résolu en `FullDense` : seul le
+                    // type des buffers résidents choisit la queue MoE shared.
+                    if matches!(
+                        arena.layers.get(index),
+                        Some(ResidentLayerBuffers::FullMoe(_))
+                    ) {
+                        self.encode_resident_full_moe_layer_rows(
+                            metal,
+                            arena,
+                            layer_cache,
+                            index,
+                            encoder,
+                            &mut owned,
+                            dims,
+                            batch,
+                            current,
+                            other,
+                        )?;
+                    } else {
+                        self.encode_resident_full_dense_layer_rows(
+                            metal,
+                            arena,
+                            layer_cache,
+                            layer,
+                            index,
+                            encoder,
+                            &mut owned,
+                            dims,
+                            batch,
+                            current,
+                            other,
+                        )?;
+                    }
                 } else {
                     let Some((la_spec, key_dim, value_dim, conv_dim)) = linear_dims else {
                         return Err(InferError::Config(

@@ -224,6 +224,60 @@ impl CausalDecoder {
         }
     }
 
+    /// Couche full-attn MoE shared (`FullMoe`, Qwen3.5/3.6 MoE) sur `rows`
+    /// positions contiguës de la vérification résidente : attention en lignes,
+    /// puis queue MoE shared en lignes (routeur et top-k par ligne).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "routage full-attn MoE résident batché: état couche + arena + ping-pong + encoder"
+    )]
+    pub(super) fn encode_resident_full_moe_layer_rows(
+        &self,
+        metal: &MetalExecutor,
+        arena: &ResidentArena,
+        layer_cache: &mut LayerKvCache,
+        index: usize,
+        encoder: &metal::ComputeCommandEncoderRef,
+        owned: &mut Vec<metal::Buffer>,
+        dims: FullAttnLayerDims,
+        rows: usize,
+        layer_in: &metal::BufferRef,
+        layer_out: &metal::BufferRef,
+    ) -> Result<()> {
+        let kv = layer_cache.full.as_mut().ok_or_else(|| {
+            InferError::Metal("KV full-attn résident absent (verify MoE batché)".to_string())
+        })?;
+        let ResidentLayerBuffers::FullMoe(resolved) = arena
+            .layers
+            .get(index)
+            .ok_or_else(|| InferError::Config(format!("poids résidents couche {index} absents")))?
+        else {
+            return Err(InferError::Config(format!(
+                "poids full-attn MoE shared résidents absents couche {index}"
+            )));
+        };
+        let weights = FullAttnLayerWeights {
+            input_norm: &resolved.input_norm,
+            qkv_proj: resolved.qkv_proj.as_ref(),
+            q_proj: &resolved.q_proj,
+            k_proj: &resolved.k_proj,
+            v_proj: &resolved.v_proj,
+            o_proj: &resolved.o_proj,
+            q_norm: &resolved.q_norm,
+            k_norm: &resolved.k_norm,
+            post_norm: &resolved.post_norm,
+            pre_feedforward_norm: resolved.pre_feedforward_norm.as_ref(),
+            post_feedforward_norm: resolved.post_feedforward_norm.as_ref(),
+            layer_scalar: resolved.layer_scalar,
+            moe: &resolved.moe,
+            top_k: resolved.top_k,
+        };
+        arena.state.encode_full_attn_moe_layer_rows(
+            metal, encoder, owned, kv, weights, dims, rows, layer_in, layer_out,
+        )
+    }
+
     #[cfg(all(target_os = "macos", feature = "metal"))]
     #[allow(
         dead_code,

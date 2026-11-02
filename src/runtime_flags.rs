@@ -765,6 +765,25 @@ pub(crate) fn prefill_moe_rows_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_MOE_ROWS", true))
 }
 
+/// Vérification résidente en lignes des modèles MoE (couches `LinearMoe` et
+/// `FullMoe`, Qwen3.5/3.6 MoE) : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Défaut OFF
+/// tant que le coût de R lignes (experts distincts par ligne) n'est pas mesuré ;
+/// sans lui la vérification MoE reste séquentielle. Remplace, pour la
+/// vérification, l'ancien couplage au flag de prefill `SARAGOSSA_RUST_PREFILL_MOE_ROWS`.
+pub(crate) fn moe_verify_rows_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_VERIFY_ROWS", false))
+}
+
+/// Queue MoE shared de la vérification en lignes sur tensor-cores
+/// (`encode_moe_shared_rows_coop`, experts groupés) au lieu du gather par slot :
+/// `SARAGOSSA_RUST_MOE_VERIFY_COOP=1`. Défaut OFF : le seuil de rentabilité en
+/// nombre de lignes reste à mesurer.
+pub(crate) fn moe_verify_coop_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_VERIFY_COOP", false))
+}
+
 pub(super) fn prefill_chunk_size() -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();
     *CHUNK.get_or_init(|| {
