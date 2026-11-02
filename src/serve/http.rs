@@ -24,7 +24,7 @@ use super::error::{ServeError, ServeResult};
 use super::flint_output::{FlintEvent, FlintOutputParser};
 use super::protocol::{
     json_bytes, sse_done, sse_event, AssistantMessage, ChatCompletionChunk, ChatCompletionRequest,
-    ChatCompletionResponse, HealthResponse, ModelsResponse, StreamErrorEvent,
+    ChatCompletionResponse, HealthResponse, ModelsResponse, ResponseFormatMode, StreamErrorEvent,
 };
 use super::state::{ServeState, ServedCompletion};
 use super::streaming::{CompletionSink, CompletionStreamEvent};
@@ -294,12 +294,19 @@ impl BatchChat {
 }
 
 /// Analyse `request` pour un lot : chat OpenAI ou Messages Anthropic streamé,
-/// valide, greedy, sans sortie structurée ni clé de session. `None` laisse la
-/// requête au chemin solo, qui rapporte ses erreurs avant tout chargement.
+/// valide, greedy, sans sortie structurée. `None` laisse la requête au chemin
+/// solo, qui rapporte ses erreurs avant tout chargement. `mtp_model` dit si un
+/// modèle est chargé avec son decode MTP actif.
 ///
 /// NOTE: une requête avec session garde le solo et son cache de préfixe par
-/// blocs ; dans un lot, elle perdrait le TTFT de son tour suivant.
-pub(super) fn batch_chat(request: &HttpRequest, max_tokens_cap: usize) -> Option<BatchChat> {
+/// blocs ; dans un lot, elle perdrait le TTFT de son tour suivant. Sauf quand
+/// le solo la servirait en MTP (modèle MTP, texte, sans `stop`) : ce chemin
+/// ignore déjà la session (cf. `complete_streaming`), le lot ne perd rien.
+pub(super) fn batch_chat(
+    request: &HttpRequest,
+    max_tokens_cap: usize,
+    mtp_model: impl Fn(&str) -> bool,
+) -> Option<BatchChat> {
     let header = request.header(SESSION_HEADER);
     let (chat, session_key, stream, anthropic) = match (request.method.as_str(), request.route()) {
         ("POST", "/v1/chat/completions") => {
@@ -314,7 +321,14 @@ pub(super) fn batch_chat(request: &HttpRequest, max_tokens_cap: usize) -> Option
         }
         _ => return None,
     };
-    (stream && session_key.is_none() && chat.batchable(max_tokens_cap))
+    // `batchable` garantit greedy et texte libre ; le solo prend alors le MTP
+    // si le modèle l'a et qu'aucun `stop` ne coupe ses options.
+    let session_ignored = || {
+        mtp_model(&chat.model)
+            && chat.stop_texts().is_empty()
+            && super::mtp::routes_request(&chat, ResponseFormatMode::Text)
+    };
+    (stream && chat.batchable(max_tokens_cap) && (session_key.is_none() || session_ignored()))
         .then_some(BatchChat { chat, anthropic })
 }
 
@@ -326,7 +340,7 @@ pub(super) fn handle_batch<S: Write>(state: &mut ServeState, jobs: &mut [(&mut S
     let mut batched = Vec::with_capacity(jobs.len());
     let mut solo = Vec::new();
     for (index, (_, request)) in jobs.iter().enumerate() {
-        match batch_chat(request, cap) {
+        match batch_chat(request, cap, |model| state.model_routes_mtp(model)) {
             Some(chat) => batched.push((index, chat)),
             None => solo.push(index),
         }
@@ -898,7 +912,7 @@ mod tests {
     }
 
     fn admit(request: &HttpRequest) -> Option<BatchChat> {
-        batch_chat(request, 1024)
+        batch_chat(request, 1024, |_| false)
     }
 
     /// Seules les requêtes chat streamées greedy en texte libre entrent dans
@@ -932,6 +946,33 @@ mod tests {
         .is_none());
         assert!(admit(&post("/v1/chat/completions", "{")).is_none());
         assert!(admit(&post("/v1/embeddings", r#"{"model":"m","input":"x"}"#)).is_none());
+    }
+
+    /// Avec session, le lot n'admet que ce que le solo servirait en MTP, qui
+    /// ignore déjà la session : modèle MTP chargé, sans `stop`.
+    #[test]
+    fn batch_chat_admits_session_only_when_solo_would_route_mtp() {
+        let chat = |extra: &str| {
+            post(
+                "/v1/chat/completions",
+                &format!(r#"{{"model":"m","messages":[],"stream":true,"user":"alice"{extra}}}"#),
+            )
+        };
+        let mtp = |model: &str| model == "m";
+
+        assert!(batch_chat(&chat(""), 1024, mtp).is_some());
+        assert!(batch_chat(&chat(""), 1024, |_| false).is_none());
+        assert!(batch_chat(&chat(r#","stop":"fin""#), 1024, mtp).is_none());
+        let body = r#"{"model":"m","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"x"}]}"#;
+        let raw = format!(
+            "POST /v1/messages HTTP/1.1\r\n{SESSION_HEADER}: s1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let anthropic = read_request(&mut Cursor::new(raw.into_bytes()), far_deadline())
+            .expect("invariant: requête lisible")
+            .expect("invariant: requête présente");
+        assert!(batch_chat(&anthropic, 1024, |_| false).is_none());
+        assert!(batch_chat(&anthropic, 1024, mtp).is_some());
     }
 
     #[test]

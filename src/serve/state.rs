@@ -332,6 +332,16 @@ impl ServeState {
         (results, multi_steps)
     }
 
+    /// Le modèle `model` est-il chargé avec son decode MTP actif ? Ne charge
+    /// rien : un modèle absent répond `false`.
+    pub(super) fn model_routes_mtp(&self, model: &str) -> bool {
+        self.models
+            .iter()
+            .find(|slot| slot.id == model)
+            .and_then(|slot| slot.loaded.as_ref())
+            .is_some_and(|loaded| loaded.mtp_active)
+    }
+
     /// Le modèle `model` écrit-il au format flint (`<think>`, `<tool_call>`
     /// XML) ? Le charge au besoin, comme la complétion qui suit.
     pub(super) fn model_is_flint(&mut self, model: &str) -> ServeResult<bool> {

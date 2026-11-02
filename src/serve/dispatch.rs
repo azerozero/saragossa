@@ -202,9 +202,9 @@ struct Queued<S> {
 }
 
 impl<S> Queued<S> {
-    fn new(job: Job<S>, batching: Option<usize>) -> Self {
+    fn new(job: Job<S>, batching: Option<usize>, state: &ServeState) -> Self {
         let model = batching
-            .and_then(|cap| batch_chat(&job.request, cap))
+            .and_then(|cap| batch_chat(&job.request, cap, |model| state.model_routes_mtp(model)))
             .map(|chat| chat.model().to_string());
         Self { job, model }
     }
@@ -235,7 +235,7 @@ fn run_engine<S: ServeStream>(
         let leader = match pending.pop_front() {
             Some(queued) => queued,
             None => match queue.recv() {
-                Ok(job) => Queued::new(job, batching),
+                Ok(job) => Queued::new(job, batching, state),
                 Err(_) => break,
             },
         };
@@ -248,7 +248,7 @@ fn run_engine<S: ServeStream>(
             continue;
         };
         drain_queue(queue, &mut pending, pending_cap, |job| {
-            Queued::new(job, batching)
+            Queued::new(job, batching, state)
         });
         let others = take_batch(
             &mut pending,
