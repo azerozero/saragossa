@@ -1428,6 +1428,14 @@ impl DecodeResidentState {
             && !weights.value_norm
             && full_rows_fused_enabled()
             && kv.rows_fused_supported();
+        // La boucle par ligne suppose une chaîne (position + ligne, causale) :
+        // refus plutôt qu'une attention fausse sous un arbre de vérification.
+        if !fused_rows && crate::metal_backend::verify_tree().is_some() {
+            return Err(InferError::Config(
+                "vérification en arbre: chemin full-attn en lignes fusionné indisponible"
+                    .to_string(),
+            ));
+        }
         if fused_rows {
             let kernels = self.rows_kernels()?;
             let q_roped_rows = self.scratch().lease(batch_q, GpuElement::F32)?;

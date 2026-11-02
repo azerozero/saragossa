@@ -22,6 +22,8 @@ use super::utils::{
     byte_offset, flash_sdpa_enabled, sdpa_2pass_blocks, sdpa_2pass_enabled, sdpa_2pass_min_len,
 };
 use super::*;
+use crate::metal_backend::VerifyTree;
+use std::rc::Rc;
 
 /// Source compilée deux fois : `KV_T` → `float`/`bfloat`, `SUFFIX` → `f32`/`bf16`.
 /// Le kernel RoPE en lignes (f32 seul) n'est pris que dans la variante f32.
@@ -38,6 +40,11 @@ kernel void attention_decode_flash_rows_SUFFIX(
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
     constant uint& window [[buffer(5)]],
+#ifdef TREE_ROWS
+    // Arbre (vérification DFlash) : tree[0] = ligne stockée de la racine,
+    // tree[1] = première ligne du chunk, tree[2 + ligne] = masque d'ancêtres.
+    constant uint* tree [[buffer(6)]],
+#endif
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tg [[threadgroup_position_in_grid]]
@@ -84,6 +91,13 @@ kernel void attention_decode_flash_rows_SUFFIX(
     // dernières positions, début propre à chaque ligne.
     const uint start = (window != 0u && len > window) ? (len - window) : 0u;
     for (uint r = start + simd_gid; r < len; r += BN) {
+#ifdef TREE_ROWS
+        // Clés de l'arbre hors des ancêtres de la ligne : sautées (uniforme sur
+        // le simdgroup, aucune divergence).
+        if (r >= tree[0] && ((tree[2u + tree[1] + row] >> (r - tree[0])) & 1u) == 0u) {
+            continue;
+        }
+#endif
         const uint k_start = r * kv_dim + kv_head_start;
         float score = 0.0f;
         for (uint j = 0u; j < elems_per_thread; ++j) {
@@ -162,6 +176,10 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
     constant float2& params [[buffer(4)]],
     constant uint& frequency_dim [[buffer(5)]],
     constant uint2& strides [[buffer(6)]],
+#ifdef TREE_ROWS
+    // Arbre : la ligne tourne à `dims.w + profondeur` (frères à la même position).
+    constant uint* depths [[buffer(7)]],
+#endif
     uint tid [[thread_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]]
 ) {
@@ -170,7 +188,11 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
     const uint rope_dims = dims.z;
     const uint head = tg.x;
     const uint row = tg.y;
+#ifdef TREE_ROWS
+    const uint position = dims.w + depths[row];
+#else
     const uint position = dims.w + row;
+#endif
     const float eps = params.x;
     const float base_theta = params.y;
     if (head >= heads) { return; }
@@ -224,6 +246,11 @@ kernel void attention_decode_flash_rows_dDHEAD_SUFFIX(
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
     constant uint& window [[buffer(5)]],
+#ifdef TREE_ROWS
+    // Arbre (vérification DFlash) : tree[0] = ligne stockée de la racine,
+    // tree[1] = première ligne du chunk, tree[2 + ligne] = masque d'ancêtres.
+    constant uint* tree [[buffer(6)]],
+#endif
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tg [[threadgroup_position_in_grid]]
@@ -263,6 +290,13 @@ kernel void attention_decode_flash_rows_dDHEAD_SUFFIX(
     // dernières positions, début propre à chaque ligne.
     const uint start = (window != 0u && len > window) ? (len - window) : 0u;
     for (uint r = start + simd_gid; r < len; r += BN) {
+#ifdef TREE_ROWS
+        // Clés de l'arbre hors des ancêtres de la ligne : sautées (uniforme sur
+        // le simdgroup, aucune divergence).
+        if (r >= tree[0] && ((tree[2u + tree[1] + row] >> (r - tree[0])) & 1u) == 0u) {
+            continue;
+        }
+#endif
         const uint k_start = r * kv_dim + kv_head_start;
         float score = 0.0f;
         for (uint j = 0u; j < ELEMS_PER_THREAD; ++j) {
@@ -323,6 +357,9 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
     device float* maxs [[buffer(5)]],
     constant uint4& dims [[buffer(6)]],
     constant uint& window [[buffer(7)]],
+#ifdef TREE_ROWS
+    constant uint* tree [[buffer(8)]],
+#endif
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]
@@ -363,6 +400,11 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
     float sum_exp = 0.0f;
 
     for (uint i = first; i < len; i += blocks) {
+#ifdef TREE_ROWS
+        // Clé hors des ancêtres : bloc éventuellement vide (max −∞, somme 0),
+        // que la passe 2 pondère à zéro comme un bloc au-delà de `len`.
+        if (i < tree[0] || ((tree[2u + tree[1] + row] >> (i - tree[0])) & 1u) != 0u) {
+#endif
         float score = 0.0f;
         for (uint j = 0u; j < QK; ++j) { score += ql[j] * float(k_[j]); }
         score = simd_sum(score);
@@ -372,6 +414,9 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
         max_score = new_max;
         sum_exp = sum_exp * factor + exp_score;
         for (uint j = 0u; j < QK; ++j) { o[j] = o[j] * factor + exp_score * float(v_[j]); }
+#ifdef TREE_ROWS
+        }
+#endif
         k_ += blocks * kv_dim;
         v_ += blocks * kv_dim;
     }
@@ -425,6 +470,10 @@ kernel void rows_nax_reduce_dDHEAD(
     device const float* lse [[buffer(4)]],
     device float* out [[buffer(5)]],
     constant uint4& dims [[buffer(6)]],
+#ifdef TREE_ROWS
+    // Arbre : tree[2 + ligne] = masque d'ancêtres (tree[0], tree[1] inutilisés).
+    constant uint* tree [[buffer(7)]],
+#endif
     uint d [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
@@ -452,6 +501,13 @@ kernel void rows_nax_reduce_dDHEAD(
     float l = 0.0f;
     float acc = 0.0f;
     for (uint p = prefix; p <= prefix + row; ++p) {
+#ifdef TREE_ROWS
+        // Uniforme sur le threadgroup (ligne et position partagées) : les
+        // barrières de la boucle restent atteintes par tous.
+        if (((tree[2u + row] >> (p - prefix)) & 1u) == 0u) {
+            continue;
+        }
+#endif
         const uint base = p * kv_dim + kv * D + d;
         const float dot = simd_sum(qd * float(keys[base]));
         if (simd_lid == 0u) { partial[simd_gid] = dot; }
@@ -487,6 +543,8 @@ pub(super) struct RowsNax {
     nax: crate::metal_backend::NaxRowsAttention,
     pack_q: ComputePipelineState,
     reduce: ComputePipelineState,
+    /// Réduction compilée en variante arbre (`TREE_ROWS`).
+    tree: bool,
 }
 
 impl RowsNax {
@@ -495,11 +553,12 @@ impl RowsNax {
     /// # Errors
     ///
     /// Renvoie une erreur si les noyaux scalaires ne compilent pas.
-    pub(super) fn compile(device: &Device, head_dim: usize) -> Result<Option<Self>> {
+    pub(super) fn compile(device: &Device, head_dim: usize, tree: bool) -> Result<Option<Self>> {
         let Some(nax) = crate::metal_backend::NaxRowsAttention::compile(device, head_dim) else {
             return Ok(None);
         };
-        let source = ROWS_NAX_KERNELS_TEMPLATE.replace("DHEAD", &head_dim.to_string());
+        let source =
+            tree_define(tree) + &ROWS_NAX_KERNELS_TEMPLATE.replace("DHEAD", &head_dim.to_string());
         let pack = format!("rows_nax_pack_q_d{head_dim}");
         let reduce = format!("rows_nax_reduce_d{head_dim}");
         let mut pipelines = super::kernels::compile_kernels(
@@ -516,6 +575,7 @@ impl RowsNax {
             nax,
             pack_q,
             reduce,
+            tree,
         }))
     }
 }
@@ -542,6 +602,11 @@ pub(super) struct RowsKernels {
     device: Device,
     nax_d128: OnceLock<Option<RowsNax>>,
     nax_d256: OnceLock<Option<RowsNax>>,
+    /// Variante arbre (`TREE_ROWS`) : masque d'ancêtres et RoPE par profondeur.
+    tree: bool,
+    /// Variante arbre de ces kernels, compilée au premier arbre installé
+    /// ([`crate::metal_backend::install_verify_tree_scope`]).
+    tree_variant: OnceLock<Box<RowsKernels>>,
 }
 
 impl RowsKernels {
@@ -559,12 +624,52 @@ impl RowsKernels {
         if let Some(nax) = cell.get() {
             return Ok(nax.as_ref());
         }
-        let nax = RowsNax::compile(&self.device, head_dim)?;
+        let nax = RowsNax::compile(&self.device, head_dim, self.tree)?;
         if nax.is_none() {
             eprintln!("attention NAX en lignes d{head_dim} indisponible : repli 2-passes");
         }
         Ok(cell.get_or_init(|| nax).as_ref())
     }
+
+    /// Kernels à utiliser pour un encodage : la variante arbre si un arbre est
+    /// installé sur ce thread (rendu avec), sinon `self` inchangé.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la variante arbre ne compile pas.
+    fn select(&self) -> Result<(&Self, Option<Rc<VerifyTree>>)> {
+        let Some(tree) = crate::metal_backend::verify_tree() else {
+            return Ok((self, None));
+        };
+        if self.tree {
+            return Ok((self, Some(tree)));
+        }
+        if let Some(variant) = self.tree_variant.get() {
+            return Ok((variant, Some(tree)));
+        }
+        let variant = Box::new(compile_rows_kernels(&self.device, true)?);
+        Ok((self.tree_variant.get_or_init(|| variant), Some(tree)))
+    }
+}
+
+/// `#define TREE_ROWS` en tête de source pour la variante arbre ; rien sinon
+/// (source historique inchangée).
+fn tree_define(tree: bool) -> String {
+    if tree {
+        "#define TREE_ROWS 1\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Données d'arbre d'un dispatch d'attention : `[racine stockée, première ligne
+/// du chunk, masques…]` (cf. `tree` des kernels `TREE_ROWS`).
+fn tree_attention_bytes(tree: &VerifyTree, base: usize, first_row: usize) -> Result<Vec<u32>> {
+    let mut bytes = Vec::with_capacity(tree.rows() + 2);
+    bytes.push(to_u32(base, "attention arbre base")?);
+    bytes.push(to_u32(first_row, "attention arbre ligne")?);
+    bytes.extend_from_slice(tree.masks());
+    Ok(bytes)
 }
 
 /// Découpage split-K du préfixe : `(clés par bloc, blocs pleins, reste, blocs)`.
@@ -606,17 +711,68 @@ pub(super) fn rows_nax_indices_fit(
         && partial_cells.is_some_and(|cells| cells <= limit)
 }
 
-fn rows_source(kv_type: &str, suffix: &str) -> String {
-    ROWS_KERNELS_TEMPLATE
-        .replace("KV_T", kv_type)
-        .replace("SUFFIX", suffix)
+fn rows_source(kv_type: &str, suffix: &str, tree: bool) -> String {
+    tree_define(tree)
+        + &ROWS_KERNELS_TEMPLATE
+            .replace("KV_T", kv_type)
+            .replace("SUFFIX", suffix)
 }
 
-fn rows_head_source(kv_type: &str, suffix: &str, head_dim: usize) -> String {
-    ROWS_HEAD_KERNELS_TEMPLATE
-        .replace("KV_T", kv_type)
-        .replace("SUFFIX", suffix)
-        .replace("DHEAD", &head_dim.to_string())
+fn rows_head_source(kv_type: &str, suffix: &str, head_dim: usize, tree: bool) -> String {
+    tree_define(tree)
+        + &ROWS_HEAD_KERNELS_TEMPLATE
+            .replace("KV_T", kv_type)
+            .replace("SUFFIX", suffix)
+            .replace("DHEAD", &head_dim.to_string())
+}
+
+/// Compile les kernels en lignes, historiques ou variante arbre (`tree`).
+///
+/// # Errors
+///
+/// Renvoie une erreur si un kernel ne compile pas.
+fn compile_rows_kernels(device: &Device, tree: bool) -> Result<RowsKernels> {
+    let f32_source = rows_source("float", "f32", tree);
+    let bf16_source = rows_source("bfloat", "bf16", tree);
+    let rows_head_source =
+        |kv_type: &str, suffix: &str, head_dim| rows_head_source(kv_type, suffix, head_dim, tree);
+    let compile = |source: &str, name: &str| compile_kernel(device, source, name);
+    Ok(RowsKernels {
+        device: device.clone(),
+        nax_d128: OnceLock::new(),
+        nax_d256: OnceLock::new(),
+        tree,
+        tree_variant: OnceLock::new(),
+        flash_rows: compile(&f32_source, "attention_decode_flash_rows_f32")?,
+        flash_rows_bf16: compile(&bf16_source, "attention_decode_flash_rows_bf16")?,
+        flash_rows_d256: compile(
+            &rows_head_source("float", "f32", 256),
+            "attention_decode_flash_rows_d256_f32",
+        )?,
+        flash_rows_d256_bf16: compile(
+            &rows_head_source("bfloat", "bf16", 256),
+            "attention_decode_flash_rows_d256_bf16",
+        )?,
+        two_pass_rows_d128: compile(
+            &rows_head_source("float", "f32", 128),
+            "attention_decode_2pass_1_rows_d128_f32",
+        )?,
+        two_pass_rows_d128_bf16: compile(
+            &rows_head_source("bfloat", "bf16", 128),
+            "attention_decode_2pass_1_rows_d128_bf16",
+        )?,
+        two_pass_rows_d256: compile(
+            &rows_head_source("float", "f32", 256),
+            "attention_decode_2pass_1_rows_d256_f32",
+        )?,
+        two_pass_rows_d256_bf16: compile(
+            &rows_head_source("bfloat", "bf16", 256),
+            "attention_decode_2pass_1_rows_d256_bf16",
+        )?,
+        rope_rows: compile(&f32_source, "rms_norm_rope_heads_decode_rows_f32")?,
+        copy_rows: compile(&f32_source, "copy_rows_at_f32")?,
+        copy_rows_bf16: compile(&bf16_source, "copy_rows_at_bf16")?,
+    })
 }
 
 impl DecodeResidentState {
@@ -624,43 +780,7 @@ impl DecodeResidentState {
         if let Some(kernels) = self.rows_kernels.get() {
             return Ok(kernels);
         }
-        let f32_source = rows_source("float", "f32");
-        let bf16_source = rows_source("bfloat", "bf16");
-        let compile = |source: &str, name: &str| compile_kernel(&self.device, source, name);
-        let kernels = RowsKernels {
-            device: self.device.clone(),
-            nax_d128: OnceLock::new(),
-            nax_d256: OnceLock::new(),
-            flash_rows: compile(&f32_source, "attention_decode_flash_rows_f32")?,
-            flash_rows_bf16: compile(&bf16_source, "attention_decode_flash_rows_bf16")?,
-            flash_rows_d256: compile(
-                &rows_head_source("float", "f32", 256),
-                "attention_decode_flash_rows_d256_f32",
-            )?,
-            flash_rows_d256_bf16: compile(
-                &rows_head_source("bfloat", "bf16", 256),
-                "attention_decode_flash_rows_d256_bf16",
-            )?,
-            two_pass_rows_d128: compile(
-                &rows_head_source("float", "f32", 128),
-                "attention_decode_2pass_1_rows_d128_f32",
-            )?,
-            two_pass_rows_d128_bf16: compile(
-                &rows_head_source("bfloat", "bf16", 128),
-                "attention_decode_2pass_1_rows_d128_bf16",
-            )?,
-            two_pass_rows_d256: compile(
-                &rows_head_source("float", "f32", 256),
-                "attention_decode_2pass_1_rows_d256_f32",
-            )?,
-            two_pass_rows_d256_bf16: compile(
-                &rows_head_source("bfloat", "bf16", 256),
-                "attention_decode_2pass_1_rows_d256_bf16",
-            )?,
-            rope_rows: compile(&f32_source, "rms_norm_rope_heads_decode_rows_f32")?,
-            copy_rows: compile(&f32_source, "copy_rows_at_f32")?,
-            copy_rows_bf16: compile(&bf16_source, "copy_rows_at_bf16")?,
-        };
+        let kernels = compile_rows_kernels(&self.device, false)?;
         Ok(self.rows_kernels.get_or_init(|| kernels))
     }
 
@@ -706,6 +826,11 @@ impl DecodeResidentState {
             to_u32(input_stride, "rope rows input_stride")?,
             to_u32(output_stride, "rope rows output_stride")?,
         ];
+        let (kernels, tree) = kernels.select()?;
+        if let Some(tree) = &tree {
+            tree.check_rows(rows, "RoPE en lignes")?;
+            set_bytes(encoder, 7, tree.depths());
+        }
         encoder.set_compute_pipeline_state(&kernels.rope_rows);
         encoder.set_buffer(0, Some(input), input_offset);
         encoder.set_buffer(1, Some(weight), 0);
@@ -730,6 +855,16 @@ impl FullAttentionMetalState {
     /// réelle, sinon le flash en lignes prend le relais quelle que soit la
     /// longueur). Un KV quantifié (d128/d256 par construction) passe toujours
     /// par le 2-passes en lignes, comme son chemin mono-ligne.
+    /// La vérification en arbre (DFlash) passe uniquement par le chemin en
+    /// lignes fusionné sur KV dense sans sinks : seuls ces kernels ont une
+    /// variante masquée par ancêtres.
+    pub(crate) fn verify_tree_supported(&self) -> bool {
+        self.rows_fused_supported()
+            && super::utils::full_rows_fused_enabled()
+            && self.quant().is_none()
+            && !self.has_sinks()
+    }
+
     pub(super) fn rows_fused_supported(&self) -> bool {
         // Arène bornée (couche glissante à sinks) : fenêtre non nulle, hors
         // du chemin en lignes.
@@ -850,6 +985,7 @@ impl FullAttentionMetalState {
         rows: usize,
         window: Option<usize>,
     ) -> Result<()> {
+        let (kernels, _) = kernels.select()?;
         if crate::runtime_flags::verify_rows_nax_enabled() && self.rows_nax_eligible(rows, window) {
             if let Some(nax) = kernels.nax(self.head_dim())? {
                 return self.encode_attention_rows_nax(encoder, nax, q_rows, out_rows, rows);
@@ -888,6 +1024,17 @@ impl FullAttentionMetalState {
             return Err(InferError::Dimension(format!(
                 "attention rows: rows={rows} hors [1, len={len}]"
             )));
+        }
+        let (kernels, tree) = kernels.select()?;
+        if let Some(tree) = &tree {
+            tree.check_rows(rows, "attention en lignes")?;
+            // Le 2-passes quantifié et la fenêtre n'ont pas de variante arbre.
+            if self.quant().is_some() || window.is_some() {
+                return Err(InferError::Config(
+                    "attention en lignes arbre sur KV quantifié ou fenêtré non supportée"
+                        .to_string(),
+                ));
+            }
         }
         // Les kernels en lignes n'ont pas de variante avec sink : refus
         // explicite plutôt qu'une attention fausse (MTP, DFlash, prefill résident).
@@ -1005,6 +1152,9 @@ impl FullAttentionMetalState {
                 encoder.set_buffer(3, Some(out_rows), row_offset);
                 set_bytes(encoder, 4, &dims);
                 set_bytes(encoder, 5, &[window_u32]);
+                if let Some(tree) = &tree {
+                    set_bytes(encoder, 6, &tree_attention_bytes(tree, len - rows, start)?);
+                }
                 crate::metal_backend::profile_dispatch();
                 encoder.dispatch_thread_groups(
                     MTLSize::new(u64::from(dims[0]), to_u64(chunk, "attention rows")?, 1),
@@ -1047,6 +1197,9 @@ impl FullAttentionMetalState {
                 encoder.set_buffer(8, Some(quant.values.scales().buffer()), 0);
             } else {
                 set_bytes(encoder, 7, &[window_u32]);
+            }
+            if let Some(tree) = &tree {
+                set_bytes(encoder, 8, &tree_attention_bytes(tree, len - rows, start)?);
             }
             crate::metal_backend::profile_dispatch();
             encoder.dispatch_thread_groups(
@@ -1132,6 +1285,15 @@ impl FullAttentionMetalState {
             return Err(InferError::Dimension(format!(
                 "attention rows NAX: rows={rows} hors [1, len={len}) ou KV non bf16"
             )));
+        }
+        let tree = crate::metal_backend::verify_tree();
+        if tree.is_some() != nax.tree {
+            return Err(InferError::Config(
+                "attention rows NAX: variante arbre et arbre installé divergent".to_string(),
+            ));
+        }
+        if let Some(tree) = &tree {
+            tree.check_rows(rows, "attention rows NAX")?;
         }
         let (q_heads, kv_heads, head_dim) = (self.q_heads(), self.kv_heads(), self.head_dim());
         let gqa = q_heads / kv_heads.max(1);
@@ -1219,6 +1381,9 @@ impl FullAttentionMetalState {
         encoder.set_buffer(4, Some(lse.tensor().buffer()), 0);
         encoder.set_buffer(5, Some(out_rows), 0);
         set_bytes(encoder, 6, &dims);
+        if let Some(tree) = &tree {
+            set_bytes(encoder, 7, &tree_attention_bytes(tree, prefix, 0)?);
+        }
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(u64::from(dims[0]), to_u64(rows, "rows NAX rows")?, 1),

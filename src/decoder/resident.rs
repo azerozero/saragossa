@@ -2,12 +2,8 @@
 
 mod decode;
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-mod dflash;
+pub(in crate::decoder) mod dflash;
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "branché sur la boucle DFlash à l'étape suivante")
-)]
 mod dflash_tree;
 mod encode;
 mod mtp;

@@ -1442,6 +1442,7 @@ impl CausalDecoder {
                 arena.state.scratch(),
                 &linear_states,
                 capture_rows,
+                false,
             )?)
         } else {
             None
@@ -2118,6 +2119,7 @@ impl CausalDecoder {
                 arena.state.scratch(),
                 &linear_states,
                 capture_rows,
+                false,
             )?)
         } else {
             None

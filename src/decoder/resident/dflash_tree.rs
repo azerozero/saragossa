@@ -87,6 +87,7 @@ impl DFlashTree {
     /// # Errors
     ///
     /// Renvoie une erreur si la chaîne dépasse [`DFLASH_TREE_MAX_ROWS`] lignes.
+    #[cfg(test)]
     pub(in crate::decoder) fn chain(anchor: usize, drafts: &[usize]) -> Result<Self> {
         let mut tree = Self::root(anchor);
         for &token in drafts {

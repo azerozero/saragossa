@@ -311,8 +311,10 @@ impl CausalDecoder {
             .iter()
             .map(|layer| layer.linear.metal_state())
             .collect::<Vec<_>>();
-        let pre = metal.lease_linear_attn_state_captures(arena.state.scratch(), &states, 1)?;
-        let captured = metal.lease_linear_attn_state_captures(arena.state.scratch(), &states, 1)?;
+        let pre =
+            metal.lease_linear_attn_state_captures(arena.state.scratch(), &states, 1, false)?;
+        let captured =
+            metal.lease_linear_attn_state_captures(arena.state.scratch(), &states, 1, false)?;
         // Buffers de sortie conservés pour les deux cycles ; réutilisation GPU
         // ordonnée, sans remise au pool avant la fin du command buffer.
         let a = arena.state.scratch().lease(elements, GpuElement::F32)?;

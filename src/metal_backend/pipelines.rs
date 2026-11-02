@@ -496,6 +496,18 @@ impl MetalExecutor {
         )?;
         let linear_attn_conv_state_shift_f32 =
             pipeline(&library, &device, "linear_attn_conv_state_shift_f32")?;
+        let linear_attn_conv_norm_gates_k4_dk128_tree_f32 = pipeline(
+            &library,
+            &device,
+            "linear_attn_conv_norm_gates_k4_dk128_tree_f32",
+        )?;
+        let linear_attn_conv_state_tree_f32 =
+            pipeline(&library, &device, "linear_attn_conv_state_tree_f32")?;
+        let linear_attn_gated_delta_tree_journal_dk128_tg4_f32 = pipeline(
+            &library,
+            &device,
+            "linear_attn_gated_delta_tree_journal_dk128_tg4_f32",
+        )?;
         let linear_attn_gated_delta_f32 =
             pipeline(&library, &device, "linear_attn_gated_delta_f32")?;
         let linear_attn_gated_delta_dk128_tg4_f32 =
@@ -851,6 +863,9 @@ impl MetalExecutor {
             linear_attn_conv_norm_gates_k4_dk128_f32,
             linear_attn_conv_norm_gates_k4_dk128_batch_f32,
             linear_attn_conv_state_shift_f32,
+            linear_attn_conv_norm_gates_k4_dk128_tree_f32,
+            linear_attn_conv_state_tree_f32,
+            linear_attn_gated_delta_tree_journal_dk128_tg4_f32,
             linear_attn_gated_delta_f32,
             linear_attn_gated_delta_dk128_tg4_f32,
             linear_attn_gated_delta_seq_dk128_tg4_f32,

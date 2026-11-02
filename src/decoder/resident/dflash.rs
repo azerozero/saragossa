@@ -6,14 +6,55 @@
 //! par la vérification.
 
 use super::super::*;
+use super::dflash_tree::DFlashTree;
 use crate::decode_resident::dflash::DFlashResident;
 use crate::decode_resident::GpuTensor;
 use crate::metal_backend::{commit_and_wait, read_f32_buffer, read_u32_buffer, MetalExecutor};
 use crate::DFlashDraft;
 
+/// Forme des drafts vérifiés à chaque tour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::decoder) enum DFlashTreeMode {
+    /// Chaîne gloutonne du sélecteur, vérifiée par le chemin historique.
+    Off,
+    /// Même chaîne, vérifiée par la plomberie arbre (oracle : sorties
+    /// identiques à `Off`).
+    #[cfg(test)]
+    Chain,
+    /// Arbre best-first de `B` nœuds (`SARAGOSSA_RUST_DFLASH_TREE=B`).
+    BestFirst(usize),
+}
+
+impl DFlashTreeMode {
+    fn from_env() -> Self {
+        match crate::runtime_flags::dflash_tree_budget() {
+            0 => Self::Off,
+            budget => Self::BestFirst(budget),
+        }
+    }
+
+    /// Lignes de vérification au plus, au-delà du bloc du drafter.
+    fn budget(self) -> usize {
+        match self {
+            Self::Off => 0,
+            #[cfg(test)]
+            Self::Chain => 0,
+            Self::BestFirst(budget) => budget,
+        }
+    }
+}
+
 /// Lignes de hidden states cibles téléversées par command buffer (prefill du
 /// contexte du drafter et append des lignes commitées).
 const CONTEXT_UPLOAD_ROWS: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    /// Lignes de contexte données au drafter, enregistrées si `Some` (tests :
+    /// le rassemblement des hidden du chemin arbre contre la chaîne).
+    pub(in crate::decoder) static DFLASH_APPENDED_CONTEXT: std::cell::RefCell<Option<Vec<f32>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 struct DFlashResidentBuffers {
     /// Kernel skinny bf16 pour les matmuls du drafter (−20 % sur le bloc).
@@ -75,6 +116,32 @@ impl CausalDecoder {
         options: &GenerationOptions,
         draft: &DFlashDraft,
         max_draft_tokens: usize,
+        on_token: impl FnMut(usize) -> bool,
+    ) -> Result<SpeculativeOutput> {
+        self.generate_greedy_dflash_resident_tree(
+            prompt,
+            max_new_tokens,
+            options,
+            draft,
+            max_draft_tokens,
+            DFlashTreeMode::from_env(),
+            on_token,
+        )
+    }
+
+    /// Boucle DFlash résidente, vérification en chaîne ou en arbre (`tree`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "options de génération, drafter, mode d'arbre et callback de streaming"
+    )]
+    pub(in crate::decoder) fn generate_greedy_dflash_resident_tree(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        draft: &DFlashDraft,
+        max_draft_tokens: usize,
+        tree_mode: DFlashTreeMode,
         mut on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
         if options.temperature > f32::EPSILON {
@@ -113,6 +180,17 @@ impl CausalDecoder {
             .min(draft.info.block_size)
             .min(max_new_tokens);
         let block = draft_limit + 1;
+        let tree_budget = tree_mode.budget();
+        if let DFlashTreeMode::BestFirst(budget) = tree_mode {
+            // Périmètre V1 : arbre du sélecteur DFlash 2, au plus `B + 1` lignes
+            // dans le journal linéaire (vérifié couche par couche plus bas).
+            if draft.selector.is_none() || budget >= super::dflash_tree::DFLASH_TREE_MAX_ROWS {
+                return Err(InferError::Config(format!(
+                    "decode DFlash résident: arbre B={budget} exige DFlash 2 (sélecteur) et B < {}",
+                    super::dflash_tree::DFLASH_TREE_MAX_ROWS
+                )));
+            }
+        }
         let layer_ids = draft.info.target_layer_ids.as_slice();
         let hidden = self.final_norm.len();
         let context_cols = layer_ids
@@ -144,7 +222,7 @@ impl CausalDecoder {
             || !self.supports_resident_full_decode()
             || !self.setup_resident_full_decode(
                 &mut cache,
-                max_new_tokens + draft_limit + 1,
+                max_new_tokens + draft_limit.max(tree_budget) + 1,
                 0,
                 kv_bf16,
             )?
@@ -164,6 +242,9 @@ impl CausalDecoder {
                 "decode DFlash résident: vérification résidente batchée indisponible (couches en lignes requises)"
                     .to_string(),
             ));
+        }
+        if tree_mode != DFlashTreeMode::Off {
+            self.check_dflash_tree_supported(&cache, tree_budget.max(draft_limit) + 1)?;
         }
         let top_k = draft.selector.as_ref().map_or(1, |selector| selector.top_k);
         let rank = draft.selector.as_ref().map_or(0, |selector| selector.rank);
@@ -231,7 +312,7 @@ impl CausalDecoder {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(6)
             .max(1);
-        let mut segments = [std::time::Duration::ZERO; 4];
+        let mut segments = [std::time::Duration::ZERO; 5];
         let mut tours = 0usize;
         let mut tree_trace = match crate::runtime_flags::dflash_tree_trace_path() {
             Some(path) if draft.selector.is_some() => Some((
@@ -264,6 +345,30 @@ impl CausalDecoder {
             }
 
             tours += 1;
+            if tree_mode != DFlashTreeMode::Off {
+                let tour = self.dflash_resident_tree_tour(
+                    &mut cache,
+                    metal,
+                    &mut drafter,
+                    &buffers,
+                    draft,
+                    primary,
+                    draft_limit,
+                    (tree_mode, max_new_tokens),
+                    options,
+                    &mut DFlashTourState {
+                        generated: &mut generated,
+                        stats: &mut stats,
+                        pending: &mut pending,
+                        segments: &mut segments,
+                        on_token: &mut on_token,
+                    },
+                )?;
+                if tour == TourEnd::Stop || generated.len() >= max_new_tokens {
+                    break;
+                }
+                continue;
+            }
             let mut segment_started = Instant::now();
             let (drafts, lattice) = self.dflash_resident_drafts(
                 &mut cache,
@@ -295,6 +400,7 @@ impl CausalDecoder {
                     crate::decoder::ResidentVerifyHead::Argmax,
                     true,
                     Some(layer_ids),
+                    None,
                 )?
                 .ok_or_else(|| {
                     InferError::Config(
@@ -402,8 +508,14 @@ impl CausalDecoder {
         }
         if profile && tours > 0 {
             let per_tour = |d: std::time::Duration| d.as_secs_f64() * 1e3 / tours as f64;
+            // Arbre : construction CPU comptée à part (incluse dans draft).
+            let tree = if tree_mode == DFlashTreeMode::Off {
+                String::new()
+            } else {
+                format!(" tree_build={:.2}", per_tour(segments[4]))
+            };
             eprintln!(
-                "dflash_profile tours={tours} ms/tour draft={:.1} verify={:.1} rollback={:.1} append={:.1} total={:.1}",
+                "dflash_profile tours={tours} ms/tour draft={:.1} verify={:.1} rollback={:.1} append={:.1} total={:.1}{tree}",
                 per_tour(segments[0]),
                 per_tour(segments[1]),
                 per_tour(segments[2]),
@@ -437,6 +549,56 @@ impl CausalDecoder {
         draft_limit: usize,
         lattice: bool,
     ) -> Result<(Vec<usize>, Option<serde_json::Value>)> {
+        let tokens = self.dflash_resident_block(cache, metal, drafter, buffers, draft, primary)?;
+        let block = buffers.block;
+        let count = (block - 1) * buffers.top_k;
+        let mut trace = None;
+        let drafts = match (draft.selector.as_ref(), buffers.projected.as_ref()) {
+            (Some(selector), Some(projected)) => {
+                let values = read_f32_buffer(buffers.value.buffer(), count)?;
+                let candidates = (0..block - 1)
+                    .map(|row| {
+                        (0..buffers.top_k)
+                            .map(|k| {
+                                (
+                                    tokens[row * buffers.top_k + k],
+                                    values[row * buffers.top_k + k],
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let projection = read_f32_buffer(projected.buffer(), block * buffers.rank)?;
+                let projection = &projection[buffers.rank..];
+                let drafts = selector.select_projected(projection, &candidates, primary)?;
+                if lattice {
+                    let scores = selector.transition_scores(projection, &candidates, primary)?;
+                    let tokens: Vec<Vec<usize>> = candidates
+                        .iter()
+                        .map(|row| row.iter().map(|&(token, _)| token).collect())
+                        .collect();
+                    trace = Some(serde_json::json!({ "candidates": tokens, "scores": scores }));
+                }
+                drafts
+            }
+            // DFlash 1 : argmax par position (top-1).
+            _ => tokens.iter().step_by(buffers.top_k).copied().collect(),
+        };
+        Ok((drafts.into_iter().take(draft_limit).collect(), trace))
+    }
+
+    /// Bloc du drafter sur GPU (embeddings ancre + masques, bloc résident, top-k
+    /// et projection) ; rend les `top_k` tokens candidats de chaque position, les
+    /// valeurs et la projection restant dans `buffers`.
+    fn dflash_resident_block(
+        &self,
+        cache: &mut CausalDecoderCache,
+        metal: &MetalExecutor,
+        drafter: &mut DFlashResident,
+        buffers: &DFlashResidentBuffers,
+        draft: &DFlashDraft,
+        primary: usize,
+    ) -> Result<Vec<usize>> {
         let block = buffers.block;
         let mut noise_tokens = Vec::with_capacity(block);
         noise_tokens.push(primary);
@@ -482,47 +644,304 @@ impl CausalDecoder {
 
         let count = (block - 1) * buffers.top_k;
         let indices = read_u32_buffer(buffers.index.buffer(), count)?;
-        let tokens = indices
+        indices
             .iter()
             .map(|index| {
                 usize::try_from(*index).map_err(|_| {
                     InferError::Metal(format!("drafter résident: index trop grand {index}"))
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
-        let mut trace = None;
-        let drafts = match (draft.selector.as_ref(), buffers.projected.as_ref()) {
-            (Some(selector), Some(projected)) => {
-                let values = read_f32_buffer(buffers.value.buffer(), count)?;
-                let candidates = (0..block - 1)
-                    .map(|row| {
-                        (0..buffers.top_k)
-                            .map(|k| {
-                                (
-                                    tokens[row * buffers.top_k + k],
-                                    values[row * buffers.top_k + k],
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                let projection = read_f32_buffer(projected.buffer(), block * buffers.rank)?;
-                let projection = &projection[buffers.rank..];
-                let drafts = selector.select_projected(projection, &candidates, primary)?;
-                if lattice {
-                    let scores = selector.transition_scores(projection, &candidates, primary)?;
-                    let tokens: Vec<Vec<usize>> = candidates
-                        .iter()
-                        .map(|row| row.iter().map(|&(token, _)| token).collect())
-                        .collect();
-                    trace = Some(serde_json::json!({ "candidates": tokens, "scores": scores }));
-                }
-                drafts
-            }
-            // DFlash 1 : argmax par position (top-1).
-            _ => tokens.iter().step_by(buffers.top_k).copied().collect(),
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Arbre best-first du tour : bloc du drafter puis construction CPU sur le
+    /// treillis du sélecteur, une ligne de scores par nœud développé (le
+    /// parcours glouton de la chaîne n'est pas calculé). Rend l'arbre et la durée
+    /// de sa construction.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cache résident, exécuteur, drafter, buffers, draft et forme de l'arbre"
+    )]
+    fn dflash_resident_tree(
+        &self,
+        cache: &mut CausalDecoderCache,
+        metal: &MetalExecutor,
+        drafter: &mut DFlashResident,
+        buffers: &DFlashResidentBuffers,
+        draft: &DFlashDraft,
+        primary: usize,
+        budget: usize,
+        max_depth: usize,
+    ) -> Result<(DFlashTree, std::time::Duration)> {
+        let tokens = self.dflash_resident_block(cache, metal, drafter, buffers, draft, primary)?;
+        let started = Instant::now();
+        let (Some(selector), Some(projected)) =
+            (draft.selector.as_ref(), buffers.projected.as_ref())
+        else {
+            return Err(InferError::Config(
+                "decode DFlash résident: arbre sans sélecteur DFlash 2".to_string(),
+            ));
         };
-        Ok((drafts.into_iter().take(draft_limit).collect(), trace))
+        let positions = buffers.block - 1;
+        let top_k = buffers.top_k;
+        let values = read_f32_buffer(buffers.value.buffer(), positions * top_k)?;
+        let candidates = (0..positions)
+            .map(|row| {
+                (0..top_k)
+                    .map(|k| (tokens[row * top_k + k], values[row * top_k + k]))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let candidate_tokens = candidates
+            .iter()
+            .map(|row| row.iter().map(|&(token, _)| token).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let projection = read_f32_buffer(projected.buffer(), buffers.block * buffers.rank)?;
+        // Ligne 0 de la projection : l'ancre, sans candidats (comme la chaîne).
+        let projection = &projection[buffers.rank..];
+        let rank = buffers.rank;
+        let tree = DFlashTree::best_first(
+            primary,
+            &candidate_tokens,
+            budget,
+            max_depth,
+            |position, previous| {
+                selector.edge_scores_from(
+                    &projection[position * rank..(position + 1) * rank],
+                    previous,
+                    &candidates[position],
+                )
+            },
+        )?;
+        Ok((tree, started.elapsed()))
+    }
+
+    /// Un tour en arbre : drafts, vérification des lignes de l'arbre, parcours
+    /// d'acceptation depuis la racine, rollback le long du chemin accepté
+    /// (toujours : la vérification laisse les états linéaires d'entrée intacts)
+    /// et append au drafter des hidden des lignes du chemin.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cache résident, exécuteur, drafter, buffers, draft, forme et état du tour"
+    )]
+    fn dflash_resident_tree_tour(
+        &self,
+        cache: &mut CausalDecoderCache,
+        metal: &MetalExecutor,
+        drafter: &mut DFlashResident,
+        buffers: &DFlashResidentBuffers,
+        draft: &DFlashDraft,
+        primary: usize,
+        draft_limit: usize,
+        (mode, max_new_tokens): (DFlashTreeMode, usize),
+        options: &GenerationOptions,
+        state: &mut DFlashTourState<'_, impl FnMut(usize) -> bool>,
+    ) -> Result<TourEnd> {
+        let mut segment_started = Instant::now();
+        let tree = match mode {
+            DFlashTreeMode::BestFirst(budget) => {
+                // Pas de nœud au-delà des tokens encore permis.
+                let max_depth = draft_limit.min(max_new_tokens - state.generated.len());
+                let (tree, build) = self.dflash_resident_tree(
+                    cache, metal, drafter, buffers, draft, primary, budget, max_depth,
+                )?;
+                state.segments[4] += build;
+                tree
+            }
+            #[cfg(test)]
+            DFlashTreeMode::Chain => {
+                let (drafts, _) = self.dflash_resident_drafts(
+                    cache,
+                    metal,
+                    drafter,
+                    buffers,
+                    draft,
+                    primary,
+                    draft_limit,
+                    false,
+                )?;
+                DFlashTree::chain(primary, &drafts)?
+            }
+            DFlashTreeMode::Off => {
+                return Err(InferError::Config(
+                    "decode DFlash résident: tour en arbre sans arbre".to_string(),
+                ));
+            }
+        };
+        state.segments[0] += segment_started.elapsed();
+        segment_started = Instant::now();
+        let verify_tree = std::rc::Rc::new(crate::metal_backend::VerifyTree::new(
+            tree.parents(),
+            tree.depths(),
+            tree.masks(),
+        )?);
+        let output = self
+            .next_final_states_resident_verify(
+                cache,
+                tree.tokens(),
+                crate::decoder::ResidentVerifyHead::Argmax,
+                true,
+                Some(draft.info.target_layer_ids.as_slice()),
+                Some(verify_tree),
+            )?
+            .ok_or_else(|| {
+                InferError::Config(
+                    "decode DFlash résident: vérification en arbre indisponible".to_string(),
+                )
+            })?;
+        state.segments[1] += segment_started.elapsed();
+        let targets = output.tokens.as_ref().ok_or_else(|| {
+            InferError::Config("decode DFlash résident: argmax résident absent".to_string())
+        })?;
+        let hidden = output.target_hidden.as_ref().ok_or_else(|| {
+            InferError::Config("decode DFlash résident: capture cible absente".to_string())
+        })?;
+        let captures = output.captures.as_ref().ok_or_else(|| {
+            InferError::Config(
+                "decode DFlash résident: captures linéaires absentes pour le rollback".to_string(),
+            )
+        })?;
+        if targets.len() != tree.len() {
+            return Err(InferError::Dimension(format!(
+                "decode DFlash résident: {} cibles pour {} lignes d'arbre",
+                targets.len(),
+                tree.len()
+            )));
+        }
+        // Parcours : même acceptation que la chaîne, nœud par nœud ; les
+        // statistiques par position comptent les profondeurs parcourues.
+        let mut path = vec![0usize];
+        let mut node = 0usize;
+        loop {
+            let target = targets[node];
+            let depth = tree.depths()[node];
+            if !tree.parents()[node + 1..].contains(&node) {
+                // Feuille : sa cible devient le token suivant (bonus).
+                *state.pending = target;
+                break;
+            }
+            state.stats.verifications += 1;
+            state.stats.proposed += 1;
+            if let Some(slot) = state.stats.proposed_by_position.get_mut(depth) {
+                *slot += 1;
+            }
+            let Some(child) = tree.child(node, target) else {
+                state.stats.rejected += 1;
+                *state.pending = target;
+                break;
+            };
+            state.stats.accepted += 1;
+            if let Some(slot) = state.stats.accepted_by_position.get_mut(depth) {
+                *slot += 1;
+            }
+            if options.stop_token_ids.contains(&target) {
+                // Stop token accepté : exclu de la sortie comme en chaîne ; le
+                // tour suivant s'arrête sur ce `pending`.
+                *state.pending = target;
+                break;
+            }
+            state.generated.push(target);
+            if !(state.on_token)(target) {
+                return Ok(TourEnd::Stop);
+            }
+            if state.generated.len() >= max_new_tokens {
+                return Ok(TourEnd::Stop);
+            }
+            path.push(child);
+            node = child;
+        }
+        if path.len() < tree.len() {
+            state.stats.rollbacks += 1;
+        }
+        segment_started = Instant::now();
+        self.restore_tree_resident_progress(cache, captures, &path)?;
+        state.segments[2] += segment_started.elapsed();
+        segment_started = Instant::now();
+        // Contexte du drafter : hidden des lignes commitées (ancre comprise,
+        // sans le `pending`), dans l'ordre du chemin.
+        let (_, cols) = hidden.as_matrix()?;
+        let mut gathered = Vec::with_capacity(path.len() * cols);
+        for &row in &path {
+            gathered.extend_from_slice(hidden.row_slice(row)?);
+        }
+        let gathered = Tensor::from_vec(vec![path.len(), cols], gathered)?;
+        self.dflash_resident_append_context(
+            cache,
+            metal,
+            drafter,
+            buffers,
+            &gathered,
+            0,
+            path.len(),
+        )?;
+        state.segments[3] += segment_started.elapsed();
+        Ok(TourEnd::Continue)
+    }
+
+    /// Rollback d'un tour en arbre le long de `path` (lignes acceptées, racine
+    /// comprise) : KV full-attn compacté au bout du préfixe, états linéaires
+    /// rejoués depuis leur état d'entrée, position = base + `path.len()`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le chemin est vide ou invalide, ou si la
+    /// restauration GPU échoue.
+    fn restore_tree_resident_progress(
+        &self,
+        cache: &mut CausalDecoderCache,
+        captures: &ResidentVerifyCaptures,
+        path: &[usize],
+    ) -> Result<()> {
+        cache.position = captures
+            .base_position
+            .checked_add(path.len())
+            .ok_or_else(|| InferError::Dimension("position rollback arbre déborde".to_string()))?;
+        for layer in &mut cache.layers {
+            if let Some(full) = layer.full.as_mut() {
+                full.compact_tree_rows(captures.base_position, path)?;
+            }
+        }
+        let Some(metal) = self.forward_runtime().metal_executor() else {
+            return Ok(());
+        };
+        let layers = cache
+            .layers
+            .iter()
+            .zip(captures.linear.iter())
+            .filter_map(|(layer, captures)| {
+                Some((layer.linear.metal_state()?, captures.as_deref()?))
+            })
+            .collect::<Vec<_>>();
+        metal.restore_linear_attn_tree(&layers, path)
+    }
+
+    /// Refus avant la boucle des configurations sans variante arbre : couches
+    /// glissantes, KV quantifié ou à sinks, chemin en lignes fusionné désactivé,
+    /// états linéaires hors du journal arbre pour `rows` lignes.
+    fn check_dflash_tree_supported(&self, cache: &CausalDecoderCache, rows: usize) -> Result<()> {
+        let refuse = |reason: &str| {
+            Err(InferError::Config(format!(
+                "decode DFlash résident: vérification en arbre non supportée ({reason})"
+            )))
+        };
+        if (0..self.layers.len()).any(|index| self.config.layer_sliding_window(index).is_some()) {
+            return refuse("couches à fenêtre glissante");
+        }
+        for layer in &cache.layers {
+            if layer
+                .full
+                .as_ref()
+                .is_some_and(|full| !full.verify_tree_supported())
+            {
+                return refuse("KV quantifié, sinks ou chemin en lignes fusionné indisponible");
+            }
+            if layer.linear.metal_state().is_some_and(|state| {
+                !crate::metal_backend::linear_tree_journal_supported(state, rows)
+            }) {
+                return refuse("états linéaires hors du journal arbre (SSM bf16, dims, lignes)");
+            }
+        }
+        Ok(())
     }
 
     /// Projette les lignes `start..end` de `hidden` (`[rows, context_cols]`) dans
@@ -549,6 +968,12 @@ impl CausalDecoder {
                 buffers.context_cols
             )));
         }
+        #[cfg(test)]
+        DFLASH_APPENDED_CONTEXT.with(|slot| {
+            if let Some(rows) = slot.borrow_mut().as_mut() {
+                rows.extend_from_slice(&hidden.data()[start * cols..end * cols]);
+            }
+        });
         let arena = cache.resident.as_mut().ok_or_else(|| {
             InferError::Config("decode DFlash résident: arène absente".to_string())
         })?;
@@ -582,6 +1007,23 @@ impl CausalDecoder {
         }
         Ok(())
     }
+}
+
+/// Fin d'un tour en arbre.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TourEnd {
+    Continue,
+    /// Arrêt demandé par le callback de streaming.
+    Stop,
+}
+
+/// État de la génération que modifie un tour en arbre.
+struct DFlashTourState<'a, F> {
+    generated: &'a mut Vec<usize>,
+    stats: &'a mut SpeculativeStats,
+    pending: &'a mut usize,
+    segments: &'a mut [std::time::Duration; 5],
+    on_token: &'a mut F,
 }
 
 /// Une ligne JSONL de la trace d'arbre (`SARAGOSSA_RUST_DFLASH_TREE_TRACE`).

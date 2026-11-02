@@ -471,6 +471,7 @@ fn conv_norm_gates_batch_real_perf() -> Result<()> {
             spec,
             LinearAttnBatchLayout::contiguous(spec),
             true,
+            None,
         )?;
     }
     g.end();

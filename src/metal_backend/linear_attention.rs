@@ -27,6 +27,28 @@ fn linear_capture_journal(state: &LinearAttentionMetalState, rows: usize) -> boo
         && journal_len.is_some_and(|len| len <= state.ssm_len)
 }
 
+/// Une série de `rows` captures peut porter un arbre de vérification : scan arbre
+/// f32 dk128 et conv k4 batchée, journal de `rows ≤ LINEAR_ATTN_JOURNAL_ROWS`
+/// lignes tenant dans le `ssm` de la capture 0. Indépendant du flag journal de
+/// la chaîne : l'arbre n'a pas d'autre mode de capture.
+pub(crate) fn linear_tree_journal_supported(
+    state: &LinearAttentionMetalState,
+    rows: usize,
+) -> bool {
+    let journal_len = state
+        .num_value_heads
+        .checked_mul(state.value_head_dim + state.key_head_dim + 1)
+        .and_then(|per_row| per_row.checked_mul(LINEAR_ATTN_JOURNAL_ROWS));
+    !state.ssm_bf16
+        && state.conv_kernel_dim == 4
+        && state.key_head_dim == 128
+        && state.value_head_dim == 128
+        && linear_delta_dk128_enabled()
+        && linear_rows_batched_enabled()
+        && (2..=LINEAR_ATTN_JOURNAL_ROWS).contains(&rows)
+        && journal_len.is_some_and(|len| len <= state.ssm_len)
+}
+
 type LinearAttentionStateCaptures = (
     Vec<Option<Vec<LinearAttentionMetalState>>>,
     Vec<crate::decode_resident::ScratchLease>,
@@ -133,11 +155,16 @@ impl MetalExecutor {
         self.buffer_from_f32(seed, label)
     }
 
+    /// Captures de `rows` lignes par couche linéaire. `tree` : série d'un arbre
+    /// de vérification (journal arbre, une fenêtre conv par ligne, cf. le champ
+    /// `tree` de [`LinearAttentionMetalState`]), refusée si une couche ne la
+    /// supporte pas ([`linear_tree_journal_supported`]).
     pub(crate) fn lease_linear_attn_state_captures(
         &self,
         scratch: &crate::decode_resident::ScratchPool,
         states: &[Option<&LinearAttentionMetalState>],
         rows: usize,
+        tree: bool,
     ) -> Result<LinearAttentionStateCaptures> {
         let _ = self;
         if rows == 0 {
@@ -152,8 +179,14 @@ impl MetalExecutor {
                 captures.push(None);
                 continue;
             };
-            let journal = linear_capture_journal(state, rows);
-            let mut rows_out = Vec::with_capacity(rows);
+            if tree && !linear_tree_journal_supported(state, rows) {
+                return Err(InferError::Config(format!(
+                    "captures linear-attn arbre non supportées ({rows} lignes, ssm bf16={}, conv k{}, dk{}/dv{})",
+                    state.ssm_bf16, state.conv_kernel_dim, state.key_head_dim, state.value_head_dim
+                )));
+            }
+            let journal = !tree && linear_capture_journal(state, rows);
+            let mut rows_out: Vec<LinearAttentionMetalState> = Vec::with_capacity(rows);
             for row in 0..rows {
                 let conv =
                     scratch.lease(state.conv_len, crate::decode_resident::GpuElement::F32)?;
@@ -162,10 +195,20 @@ impl MetalExecutor {
                 } else {
                     crate::decode_resident::GpuElement::F32
                 };
-                let ssm = scratch.lease(state.ssm_len, ssm_element)?;
+                // Arbre : seul le `ssm` de la capture 0 (journal) sert ; les autres
+                // le partagent sans jamais y toucher (ni bail ni mémoire en plus).
+                let ssm = match rows_out.first() {
+                    Some(first) if tree => first.ssm.clone(),
+                    _ => {
+                        let lease = scratch.lease(state.ssm_len, ssm_element)?;
+                        let buffer = lease.tensor().buffer().clone();
+                        leases.push(lease);
+                        buffer
+                    }
+                };
                 rows_out.push(LinearAttentionMetalState {
                     conv: conv.tensor().buffer().clone(),
-                    ssm: ssm.tensor().buffer().clone(),
+                    ssm,
                     conv_len: state.conv_len,
                     ssm_len: state.ssm_len,
                     conv_dim: state.conv_dim,
@@ -175,9 +218,9 @@ impl MetalExecutor {
                     key_head_dim: state.key_head_dim,
                     ssm_bf16: state.ssm_bf16,
                     ssm_journal: journal && row == 0,
+                    tree,
                 });
                 leases.push(conv);
-                leases.push(ssm);
             }
             captures.push(Some(rows_out));
         }
@@ -191,7 +234,7 @@ impl MetalExecutor {
         capture: &LinearAttentionMetalState,
     ) -> Result<()> {
         // Copie d'un état complet : une série en journal n'en attend que du scan.
-        if capture.ssm_journal {
+        if capture.ssm_journal || capture.tree {
             return Err(InferError::Config(
                 "capture linear-attn en journal hors du scan fusionné".to_string(),
             ));
@@ -680,6 +723,7 @@ impl MetalExecutor {
                     spec,
                     LinearAttnBatchLayout::contiguous(spec),
                     true,
+                    None,
                 )?;
             } else {
                 for pos in 0..batch {
@@ -1169,6 +1213,7 @@ impl MetalExecutor {
                     spec,
                     LinearAttnBatchLayout::contiguous(spec),
                     true,
+                    None,
                 )?;
             } else {
                 for pos in 0..rows {
@@ -2658,6 +2703,32 @@ impl MetalExecutor {
                 "linear-attn résident rows vide".to_string(),
             ));
         }
+        // Arbre de vérification : uniquement le chemin batché (conv, scan arbre et
+        // une fenêtre conv par ligne), avec une série de captures arbre complète.
+        let tree = super::verify_tree();
+        let tree_captures = match &tree {
+            Some(tree) => {
+                tree.check_rows(rows, "linear-attn en lignes")?;
+                let captures = captures
+                    .filter(|captures| {
+                        captures.len() == rows && captures.iter().all(|capture| capture.tree)
+                    })
+                    .ok_or_else(|| {
+                        InferError::Config(
+                            "linear-attn arbre sans série de captures arbre complète".to_string(),
+                        )
+                    })?;
+                if !linear_tree_journal_supported(state, rows) {
+                    return Err(InferError::Config(
+                        "linear-attn arbre non supporté pour cet état".to_string(),
+                    ));
+                }
+                let mut data = tree.parents().to_vec();
+                data.extend_from_slice(tree.depths());
+                Some((captures, data))
+            }
+            None => None,
+        };
         if rows == 1 {
             self.encode_linear_attn_resident_dense_buffers(
                 encoder,
@@ -2864,6 +2935,11 @@ impl MetalExecutor {
             && spec.value_head_dim == 128
             && linear_delta_dk128_enabled()
             && linear_rows_batched_enabled();
+        if tree_captures.is_some() && !batched {
+            return Err(InferError::Config(
+                "linear-attn arbre hors du chemin batché".to_string(),
+            ));
+        }
         if batched {
             let (qkv_buffer, layout_qkv_stride, z_buffer, z_offset, z_stride) = match &qkv_z {
                 PairOutput::Concat { buffer, stride } => (
@@ -2934,6 +3010,79 @@ impl MetalExecutor {
                 checked_len(rows, value_dim, "linear-attn rows y")?,
                 "linear_attn_rows_y_batch",
             )?;
+            if let (Some((captures, data)), Some(tree)) = (&tree_captures, &tree) {
+                // Arbre : conv par ancêtres, scan par parent (journal dans le `ssm`
+                // de la capture 0), fenêtre conv de chaque ligne ; l'état d'entrée
+                // (conv et SSM) reste intact, le rollback le fait avancer le long
+                // du chemin accepté.
+                self.encode_linear_attn_conv_norm_gates_k4_dk128_batch(
+                    encoder,
+                    qkv_buffer,
+                    beta_input,
+                    gate_input,
+                    &weights.conv_weight,
+                    &state.conv,
+                    &weights.a_log,
+                    &weights.dt_bias,
+                    &conv_out_rows,
+                    &q_norm_rows,
+                    &k_norm_rows,
+                    &beta_rows,
+                    &decay_rows,
+                    rows,
+                    spec,
+                    layout,
+                    false,
+                    Some(data),
+                )?;
+                self.encode_linear_attn_gated_delta_tree_journal_dk128(
+                    encoder,
+                    &conv_out_rows,
+                    &q_norm_rows,
+                    &k_norm_rows,
+                    &beta_rows,
+                    &decay_rows,
+                    &state.ssm,
+                    &y_rows,
+                    &captures[0].ssm,
+                    tree.parents(),
+                    spec,
+                )?;
+                for (row, capture) in captures.iter().enumerate() {
+                    self.encode_linear_attn_conv_state_tree(
+                        encoder,
+                        qkv_buffer,
+                        layout.qkv_stride,
+                        &state.conv,
+                        &capture.conv,
+                        conv_dim,
+                        row,
+                        data,
+                    )?;
+                }
+                self.encode_linear_attn_rms_gate_batch(
+                    encoder,
+                    &y_rows,
+                    z_buffer,
+                    z_offset,
+                    z_stride,
+                    &weights.norm_weight,
+                    &gated_batch_buffer,
+                    rows,
+                    spec,
+                )?;
+                return self
+                    .encode_matmul_weight_buffers(
+                        encoder,
+                        &gated_batch_buffer,
+                        rows,
+                        value_dim,
+                        &weights.out_proj,
+                        output_buffer,
+                        false,
+                    )
+                    .map(|_| ());
+            }
             self.encode_linear_attn_conv_norm_gates_k4_dk128_batch(
                 encoder,
                 qkv_buffer,
@@ -2952,6 +3101,7 @@ impl MetalExecutor {
                 spec,
                 layout,
                 false,
+                None,
             )?;
             // Delta : un dispatch par séquence qui écrit aussi les captures SSM
             // (f32, au plus 8 captures), sinon la boucle par ligne avec copies.
@@ -3254,6 +3404,7 @@ impl MetalExecutor {
             key_head_dim: spec.key_head_dim,
             ssm_bf16,
             ssm_journal: false,
+            tree: false,
         });
         Ok(())
     }
@@ -3297,6 +3448,7 @@ impl MetalExecutor {
             key_head_dim: state.key_head_dim,
             ssm_bf16: state.ssm_bf16,
             ssm_journal: false,
+            tree: false,
         })
     }
 
@@ -3334,6 +3486,7 @@ impl MetalExecutor {
                 key_head_dim: state.key_head_dim,
                 ssm_bf16: state.ssm_bf16,
                 ssm_journal: false,
+                tree: false,
             }));
         }
         blit.end_encoding();
@@ -3470,6 +3623,12 @@ impl MetalExecutor {
                     "restore linear-attn: capture et état de formes différentes".to_string(),
                 ));
             }
+            if captures.iter().any(|capture| capture.tree) {
+                return Err(InferError::Config(
+                    "restore linear-attn: captures d'arbre hors de restore_linear_attn_tree"
+                        .to_string(),
+                ));
+            }
             let journal = captures.first().is_some_and(|first| first.ssm_journal);
             if journal {
                 if captures.len() < 2 || state.ssm_len != captures[0].ssm_len {
@@ -3481,6 +3640,10 @@ impl MetalExecutor {
             }
             copies.push((*state, capture, !journal));
         }
+        // Chaîne : pas `0..=row` du journal, dans l'ordre.
+        let chain_rows = (0..=row)
+            .map(|step| checked_u32(step, "restore linear-attn ligne"))
+            .collect::<Result<Vec<_>>>()?;
         let command_buffer = self.queue.new_command_buffer();
         if !replays.is_empty() {
             let encoder = command_buffer.new_compute_command_encoder();
@@ -3492,7 +3655,7 @@ impl MetalExecutor {
                     &state.ssm,
                     state.num_value_heads,
                     state.value_head_dim,
-                    row + 1,
+                    &chain_rows,
                 )?;
             }
             encoder.end_encoding();
@@ -3509,6 +3672,72 @@ impl MetalExecutor {
             if copy_ssm {
                 blit.copy_from_buffer(&capture.ssm, 0, &state.ssm, 0, linear_ssm_byte_len(state)?);
             }
+        }
+        blit.end_encoding();
+        commit_and_wait(command_buffer)
+    }
+
+    /// Avance chaque état linéaire le long du chemin accepté `path` (lignes de
+    /// l'arbre, racine comprise, ordre topologique) d'une vérification en arbre :
+    /// rejoue le journal de ces lignes depuis l'état d'entrée, resté intact dans
+    /// l'état, et copie la fenêtre conv de la dernière ligne. En un command buffer.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une série n'est pas une série arbre complète, si le
+    /// chemin est vide ou sort des captures, ou si l'encodage échoue.
+    pub(crate) fn restore_linear_attn_tree(
+        &self,
+        layers: &[(&LinearAttentionMetalState, &[LinearAttentionMetalState])],
+        path: &[usize],
+    ) -> Result<()> {
+        let Some(&leaf) = path.last() else {
+            return Err(InferError::Dimension(
+                "restore linear-attn arbre: chemin vide".to_string(),
+            ));
+        };
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let rows = path
+            .iter()
+            .map(|&row| checked_u32(row, "restore linear-attn arbre ligne"))
+            .collect::<Result<Vec<_>>>()?;
+        for (state, captures) in layers {
+            if leaf >= captures.len()
+                || !captures.iter().all(|capture| capture.tree)
+                || state.conv_len != captures[leaf].conv_len
+                || state.ssm_len != captures[0].ssm_len
+            {
+                return Err(InferError::Shape(format!(
+                    "restore linear-attn arbre: ligne {leaf} sur {} captures arbre",
+                    captures.len()
+                )));
+            }
+        }
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        for (state, captures) in layers {
+            self.encode_linear_attn_gated_delta_replay_dk128(
+                encoder,
+                &state.ssm,
+                &captures[0].ssm,
+                &state.ssm,
+                state.num_value_heads,
+                state.value_head_dim,
+                &rows,
+            )?;
+        }
+        encoder.end_encoding();
+        let blit = command_buffer.new_blit_command_encoder();
+        for (state, captures) in layers {
+            blit.copy_from_buffer(
+                &captures[leaf].conv,
+                0,
+                &state.conv,
+                0,
+                byte_len::<f32>(state.conv_len)?,
+            );
         }
         blit.end_encoding();
         commit_and_wait(command_buffer)

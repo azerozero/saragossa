@@ -926,6 +926,76 @@ impl FullAttentionMetalState {
         Ok(())
     }
 
+    /// Après une vérification en arbre ajoutée à partir de la ligne absolue
+    /// `first`, ramène les lignes du chemin accepté au bout du préfixe : la ligne
+    /// `first + path[j]` passe en `first + j`, puis le KV est tronqué à
+    /// `first + path.len()`. Copies dans l'ordre `j` croissant : `path` étant
+    /// strictement croissant depuis 0, chaque source est lue avant qu'une
+    /// destination ne l'écrase (`[0, 2, 3]` : 2 → 1 puis 3 → 2). Copie CPU des
+    /// buffers partagés : aucun command buffer ne doit être en vol.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sur un KV quantifié, un chemin invalide ou des lignes
+    /// hors des lignes valides ou sous le préfixe adopté.
+    #[expect(
+        unsafe_code,
+        reason = "copie CPU de lignes d'un MTLBuffer StorageModeShared hors command buffer"
+    )]
+    pub(crate) fn compact_tree_rows(&mut self, first: usize, path: &[usize]) -> Result<()> {
+        let valid = path.first() == Some(&0) && path.windows(2).all(|pair| pair[0] < pair[1]);
+        let stored = self.stored_row(first, "compaction KV arbre")?;
+        let last = path.last().map_or(stored, |&row| stored + row);
+        if self.quant.is_some() || !valid || stored < self.floor || last >= self.len {
+            return Err(InferError::Dimension(format!(
+                "compaction KV arbre: chemin {path:?} depuis {first} hors des {} lignes \
+                 (plancher {}, quantifié={})",
+                self.len(),
+                self.base + self.floor,
+                self.quant.is_some()
+            )));
+        }
+        let kv_dim = self.kv_dim();
+        for tensor in [&self.keys, &self.values] {
+            let element_bytes = match tensor.element() {
+                GpuElement::F32 => std::mem::size_of::<f32>(),
+                GpuElement::Bf16 => std::mem::size_of::<u16>(),
+                element => {
+                    return Err(InferError::Metal(format!(
+                        "compaction KV arbre sur un buffer {element:?}"
+                    )));
+                }
+            };
+            let row_bytes = kv_dim * element_bytes;
+            if (last + 1) * kv_dim > tensor.len() {
+                return Err(InferError::Dimension(
+                    "compaction KV arbre hors du buffer".to_string(),
+                ));
+            }
+            let contents = tensor.buffer().contents().cast::<u8>();
+            if contents.is_null() {
+                return Err(InferError::Metal(
+                    "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
+                ));
+            }
+            for (j, &row) in path.iter().enumerate().filter(|&(j, &row)| j != row) {
+                // SAFETY: buffer StorageModeShared sans command buffer en vol ;
+                // lignes `stored + row` et `stored + j` (j < row) dans les
+                // `last + 1 ≤ len` lignes vérifiées ; source et destination
+                // distinctes d'une ligne entière, `copy` tolère tout recouvrement.
+                unsafe {
+                    std::ptr::copy(
+                        contents.add((stored + row) * row_bytes),
+                        contents.add((stored + j) * row_bytes),
+                        row_bytes,
+                    );
+                }
+            }
+        }
+        self.len = stored + path.len();
+        Ok(())
+    }
+
     /// Renvoie la capacité en lignes.
     pub(super) fn scratch(&self) -> &ScratchPool {
         &self.scratch

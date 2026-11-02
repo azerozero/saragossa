@@ -12,3 +12,4 @@ include!("tests/moe_duo.rs");
 include!("tests/linear_attention.rs");
 include!("tests/attention.rs");
 include!("tests/mtp_seed.rs");
+include!("tests/verify_tree.rs");

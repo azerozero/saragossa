@@ -454,6 +454,7 @@ impl CausalDecoder {
             ResidentVerifyHead::Skip,
             false,
             None,
+            None,
         )? {
             return Ok(output.states);
         }
@@ -497,6 +498,7 @@ impl CausalDecoder {
                 token_ids,
                 head,
                 capture_linear,
+                None,
                 None,
             )? {
                 return Ok((output.states, output.tokens, output.captures, output.logits));
@@ -2312,6 +2314,7 @@ impl CausalDecoder {
                 ResidentVerifyHead::Skip,
                 false,
                 Some(&layer_ids),
+                None,
             )?
             .ok_or_else(|| {
                 InferError::Config("xray résident-linear: verify résident absent".to_string())
@@ -3226,6 +3229,7 @@ impl CausalDecoder {
             ResidentVerifyHead::Skip,
             false,
             Some(layer_ids),
+            None,
         )? {
             if let Some(target_hidden) = output.target_hidden {
                 return Ok((output.states, target_hidden));

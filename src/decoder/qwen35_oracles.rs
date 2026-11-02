@@ -530,6 +530,7 @@ fn qwen35_cpu_gpu_teacher_forced_oracle_matrix() -> Result<()> {
                 ResidentVerifyHead::Argmax,
                 false,
                 None,
+                None,
             )?
             .ok_or_else(|| InferError::Config("verify résident-full non exercé".to_string()))?;
         let predictions = output

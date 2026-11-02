@@ -720,6 +720,7 @@ impl CausalDecoder {
             crate::decoder::ResidentVerifyHead::Skip,
             false,
             None,
+            None,
         )? {
             return Tensor::row(output.states.row_slice(0)?.to_vec());
         }
