@@ -41,9 +41,18 @@ impl NgramLookup {
 
     /// Ajoute les tokens générés non encore vus (`generated` est la sortie complète).
     pub(super) fn sync(&mut self, generated: &[usize]) {
-        let fresh = &generated[self.consumed_generated.min(generated.len())..];
-        self.consumed_generated = generated.len();
-        self.push(fresh);
+        self.sync_from(0, generated);
+    }
+
+    /// [`Self::sync`] d'une sortie dont seule la fin `tail` (à partir de
+    /// `offset`) est passée : les tokens avant `offset` sont déjà indexés.
+    pub(super) fn sync_from(&mut self, offset: usize, tail: &[usize]) {
+        let start = self
+            .consumed_generated
+            .saturating_sub(offset)
+            .min(tail.len());
+        self.consumed_generated = offset + tail.len();
+        self.push(&tail[start..]);
     }
 
     fn push(&mut self, tokens: &[usize]) {
@@ -136,6 +145,20 @@ mod tests {
         assert_eq!(short.propose(4), None);
         assert_eq!(NgramLookup::new(&[1, 2]).propose(4), None);
         assert_eq!(lookup.propose(0), None);
+
+        let (mut whole, mut split) = (
+            NgramLookup::new(&[1, 2, 3, 4, 5, 6, 7]),
+            NgramLookup::new(&[1, 2, 3, 4, 5, 6, 7]),
+        );
+        whole.sync(&[1, 2, 3, 4, 5, 6]);
+        split.sync(&[1, 2]);
+        split.sync_from(1, &[2, 3, 4]);
+        split.sync_from(3, &[4, 5, 6]);
+        assert_eq!(
+            whole.tokens, split.tokens,
+            "sync par morceaux = sync entier"
+        );
+        assert_eq!(whole.propose(4), split.propose(4));
 
         let mut cold = NgramLookup::new(&[1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 6]);
         assert_eq!(cold.propose(4), Some(vec![7, 1, 2, 3]));

@@ -3737,84 +3737,476 @@ fn qwen_kv_nax_x3_shape_targets_dense_qwen_27b_only() {
 }
 
 /// Coût de la vérification résidente en fonction du nombre de lignes, au contexte
-/// `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CTX` (défaut 4096) : substitut de coût pour un
-/// arbre DFlash de B nœuds (B + 1 lignes). Lignes > 9 sans captures linéaires (le
-/// scan séquentiel en a 8 au plus ; un arbre n'en utiliserait pas) ; 9 lignes
-/// mesurées avec et sans, pour isoler leur part. Médiane de 8 répétitions après 2
-/// d'échauffement, rollback par troncature du KV entre deux répétitions ; les états
-/// linéaires ne sont pas restaurés (coût seul, pas un oracle numérique).
+/// `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CTX` (défaut 4096). Avec
+/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` : substitut de coût pour un arbre DFlash de
+/// B nœuds (B + 1 lignes), 9 et 11 lignes mesurées avec et sans captures. Sans
+/// drafter (modèles MoE, lookup) : `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_ROWS=1,2,4`
+/// choisit les lignes, captures linéaires actives si le modèle en a. Médiane de
+/// 8 répétitions après 2 d'échauffement, temps mural (soumission, attente et
+/// relecture comprises). Entre deux répétitions : avec captures, rollback réel à
+/// une position acceptée (le KV et les états linéaires avancent d'un token,
+/// comme un pas où seul le premier token est gardé) ; sans (dont la référence
+/// séquentielle, qui n'en rend pas), troncature du KV seule : les états
+/// linéaires avancent à chaque répétition, donc entrées et routage MoE dérivent.
+/// Ces temps-là sont synthétiques, pas une comparaison contrôlée. Échoue si plus d'une ligne est
+/// demandée sans le chemin en lignes, sauf `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_SEQUENTIAL=1`
+/// (référence séquentielle voulue).
 #[test]
-#[ignore = "modèle réel + draft DFlash requis, bench"]
+#[ignore = "modèle réel requis, bench"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn verify_rows_cost_bench_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
     };
-    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none() {
-        eprintln!("skip bench lignes: SARAGOSSA_RUST_DFLASH_DRAFT_DIR absent");
-        return Ok(());
-    }
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let model = crate::load_causal_decoder(&assets)?
-        .with_metal_runtime()?
-        .with_dflash_draft_from_env(&assets.config)?;
-    let layer_ids = model
-        .dflash_draft()
-        .ok_or_else(|| InferError::Config("drafter non chargé".to_string()))?
-        .info
-        .target_layer_ids
-        .clone();
+    let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    // Captures hidden du drafter DFlash si présent (coût DFlash), sinon aucune.
+    let layer_ids = if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_some()
+    {
+        model = model.with_dflash_draft_from_env(&assets.config)?;
+        model
+            .dflash_draft()
+            .ok_or_else(|| InferError::Config("drafter non chargé".to_string()))?
+            .info
+            .target_layer_ids
+            .clone()
+    } else {
+        Vec::new()
+    };
     let context = crate::runtime_flags::env_var("SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CTX")
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(4096);
-    // Tokens synthétiques : le coût ne dépend pas du contenu.
+    let sequential_ok =
+        crate::runtime_flags::env_flag("SARAGOSSA_RUST_VERIFY_ROWS_BENCH_SEQUENTIAL", false);
+    let has_linear = model.has_resident_linear_attention_layer();
+    let rows_list: Vec<(usize, bool)> =
+        match crate::runtime_flags::env_var("SARAGOSSA_RUST_VERIFY_ROWS_BENCH_ROWS") {
+            Some(list) => list
+                .split(',')
+                .filter_map(|value| value.trim().parse::<usize>().ok())
+                .map(|rows| {
+                    (
+                        rows,
+                        has_linear
+                            && crate::runtime_flags::env_flag(
+                                "SARAGOSSA_RUST_VERIFY_ROWS_BENCH_CAPTURES",
+                                true,
+                            ),
+                    )
+                })
+                .collect(),
+            None => vec![
+                (9, true),
+                (11, true),
+                (9, false),
+                (11, false),
+                (13, false),
+                (16, false),
+                (17, false),
+                (25, false),
+                (33, false),
+            ],
+        };
+    // Tokens synthétiques : le coût ne dépend pas du contenu (au routage MoE près).
     let prompt: Vec<usize> = (0..context).map(|i| 1000 + (i * 7919) % 50_000).collect();
-    let (mut cache, _, _, _) =
-        model.prefill_cache_state_with_layer_capture_cached(&prompt, &layer_ids, usize::MAX)?;
+    let mut cache = if layer_ids.is_empty() {
+        model.prefill_cache_state(&prompt)?.0
+    } else {
+        model
+            .prefill_cache_state_with_layer_capture_cached(&prompt, &layer_ids, usize::MAX)?
+            .0
+    };
     let kv_bf16 = CausalDecoder::resident_kv_bf16(false, cache.position);
-    assert!(model.setup_resident_full_decode(&mut cache, 64, 0, kv_bf16)?);
-    let base = cache.position;
-    for (rows, capture) in [
-        (9, true),
-        (11, true),
-        (9, false),
-        (11, false),
-        (13, false),
-        (16, false),
-        (17, false),
-        (25, false),
-        (33, false),
-    ] {
+    // Une avance d'un token par répétition avec captures : réserve large.
+    assert!(model.setup_resident_full_decode(&mut cache, 512, 0, kv_bf16)?);
+    let batched = cache
+        .resident
+        .as_ref()
+        .is_some_and(|arena| model.resident_layer_batch_supported(arena));
+    for (rows, capture) in rows_list {
+        if rows > 1 && !batched && !sequential_ok {
+            return Err(InferError::Config(format!(
+                "bench {rows} lignes: chemin en lignes indisponible (repli séquentiel)"
+            )));
+        }
         let tokens: Vec<usize> = (0..rows).map(|i| 2000 + i * 31).collect();
         let mut times = Vec::new();
         for rep in 0..10 {
+            let base = cache.position;
             let started = std::time::Instant::now();
-            model
+            let output = model
                 .next_final_states_resident_verify(
                     &mut cache,
                     &tokens,
                     crate::decoder::ResidentVerifyHead::Argmax,
                     capture,
-                    Some(&layer_ids),
+                    (!layer_ids.is_empty()).then_some(layer_ids.as_slice()),
                     None,
                 )?
                 .ok_or_else(|| InferError::Config("vérification indisponible".to_string()))?;
             if rep >= 2 {
                 times.push(started.elapsed().as_secs_f64() * 1e3);
             }
-            cache.position = base;
-            for layer in &mut cache.layers {
-                if let Some(full) = layer.full.as_mut() {
-                    full.truncate(base)?;
+            match output.captures.as_ref() {
+                Some(captures) => model.restore_mtp_resident_progress(&mut cache, captures, 1)?,
+                None if rows == 1 => {}
+                None => {
+                    cache.position = base;
+                    for layer in &mut cache.layers {
+                        if let Some(full) = layer.full.as_mut() {
+                            full.truncate(base)?;
+                        }
+                    }
                 }
             }
         }
         times.sort_by(f64::total_cmp);
         eprintln!(
-            "verify_rows_bench ctx={context} kv_bf16={kv_bf16} rows={rows} captures={capture} median_ms={:.2} min_ms={:.2}",
+            "verify_rows_bench ctx={context} kv_bf16={kv_bf16} batched={batched} rows={rows} captures={capture} median_ms={:.2} min_ms={:.2}",
             times[times.len() / 2],
             times[0]
         );
     }
+    Ok(())
+}
+
+/// Oracle de la vérification MoE en lignes (`SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`,
+/// modèle `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`, Qwen3.5/3.6 MoE) : R lignes
+/// d'un coup contre R pas mono-ligne sur le même texte imposé. Exige
+/// l'argmax identique (sauf quasi-égalité top-1/top-2 de la référence, comptée)
+/// et des états finaux à 5e-3 relatif. Puis, pour plusieurs longueurs acceptées
+/// `j`, rollback par captures à `j` et suite mono-ligne : les états qui suivent
+/// valident KV et états linéaires restaurés contre la référence.
+#[test]
+#[ignore = "modèle MoE réel requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
+    const PROMPT_TOKENS: usize = 512;
+    const FORCED: usize = 16;
+    const NEAR_TIE: f32 = 0.05;
+    if !crate::runtime_flags::moe_verify_rows_enabled() {
+        eprintln!("skip oracle MoE en lignes: SARAGOSSA_RUST_MOE_VERIFY_ROWS absent");
+        return Ok(());
+    }
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let text = concat!(
+        include_str!("../decode_resident/attention.rs"),
+        include_str!("../decode_resident/rows.rs"),
+    );
+    let ids = mtp_verifier_prompt_ids(&assets, text)?;
+    let prompt_len = PROMPT_TOKENS.min(ids.len().saturating_sub(FORCED));
+    let (prompt, forced) = (&ids[..prompt_len], &ids[prompt_len..prompt_len + FORCED]);
+    let fresh = || -> Result<CausalDecoderCache> {
+        let mut cache = model.prefill_cache_state(prompt)?.0;
+        if !model.setup_resident_full_decode(&mut cache, FORCED + 8, 0, false)? {
+            return Err(InferError::Config("setup résident refusé".to_string()));
+        }
+        Ok(cache)
+    };
+    let hidden = model.final_norm.data().len();
+    let verify = |cache: &mut CausalDecoderCache,
+                  tokens: &[usize],
+                  capture: bool|
+     -> Result<ResidentVerifyOutput> {
+        model
+            .next_final_states_resident_verify(
+                cache,
+                tokens,
+                ResidentVerifyHead::Argmax,
+                capture,
+                None,
+                None,
+            )?
+            .ok_or_else(|| InferError::Config("vérification résidente non exercée".into()))
+    };
+
+    // Référence : un pas mono-ligne par token imposé.
+    let mut reference = fresh()?;
+    let batched = reference
+        .resident
+        .as_ref()
+        .is_some_and(|arena| model.resident_layer_batch_supported(arena));
+    assert!(batched, "chemin MoE en lignes non éligible sur ce modèle");
+    let mut ref_states = Vec::with_capacity(FORCED);
+    let mut ref_tokens = Vec::with_capacity(FORCED);
+    let mut ref_margins = Vec::with_capacity(FORCED);
+    for &token in forced {
+        let output = verify(&mut reference, &[token], false)?;
+        let state = output.states.data().to_vec();
+        let (_, margin) = top2(
+            model
+                .logits_from_final_state(&Tensor::from_vec(vec![1, hidden], state.clone())?)?
+                .as_row()?,
+        );
+        ref_tokens.extend(
+            output
+                .tokens
+                .ok_or_else(|| InferError::Config("argmax mono-ligne absent".to_string()))?,
+        );
+        ref_states.push(state);
+        ref_margins.push(margin);
+    }
+
+    let mut near_ties = 0;
+    let mut compare = |label: &str, offset: usize, tokens: &[usize], states: &[f32]| {
+        for (row, (token, state)) in tokens.iter().zip(states.chunks(hidden)).enumerate() {
+            let at = offset + row;
+            let expected = &ref_states[at];
+            let scale = expected.iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
+            let max_err = expected
+                .iter()
+                .zip(state)
+                .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+            assert!(
+                state.iter().all(|value| value.is_finite()),
+                "{label} ligne {at}: état non fini"
+            );
+            assert!(
+                max_err <= 5e-3 * scale,
+                "{label} ligne {at}: dérive {max_err:e} / {scale:e}"
+            );
+            if *token != ref_tokens[at] {
+                assert!(
+                    ref_margins[at] < NEAR_TIE,
+                    "{label} ligne {at}: argmax {token} contre {} (marge {})",
+                    ref_tokens[at],
+                    ref_margins[at]
+                );
+                near_ties += 1;
+            }
+        }
+    };
+
+    for rows in [2, 3, 5, 9] {
+        // Tout accepté : R lignes puis la suite mono-ligne.
+        let mut cache = fresh()?;
+        let output = verify(&mut cache, &forced[..rows], false)?;
+        let tokens = output
+            .tokens
+            .ok_or_else(|| InferError::Config("argmax en lignes absent".to_string()))?;
+        compare(&format!("lignes={rows}"), 0, &tokens, output.states.data());
+        for (step, &token) in forced[rows..rows + 3].iter().enumerate() {
+            let next = verify(&mut cache, &[token], false)?;
+            let tokens = next.tokens.unwrap_or_default();
+            compare(
+                &format!("lignes={rows} suite"),
+                rows + step,
+                &tokens,
+                next.states.data(),
+            );
+        }
+        // Rollback par captures à `accepted` lignes, puis suite mono-ligne.
+        for accepted in [1, rows / 2, rows - 1] {
+            if accepted == 0 {
+                continue;
+            }
+            let mut cache = fresh()?;
+            let output = verify(&mut cache, &forced[..rows], true)?;
+            let captures = output.captures.as_ref().ok_or_else(|| {
+                InferError::Config("captures de vérification absentes".to_string())
+            })?;
+            model.restore_mtp_resident_progress(&mut cache, captures, accepted)?;
+            assert_eq!(cache.position, prompt_len + accepted);
+            for (step, &token) in forced[accepted..accepted + 3].iter().enumerate() {
+                let next = verify(&mut cache, &[token], false)?;
+                let tokens = next.tokens.unwrap_or_default();
+                compare(
+                    &format!("lignes={rows} rollback={accepted}"),
+                    accepted + step,
+                    &tokens,
+                    next.states.data(),
+                );
+            }
+        }
+    }
+    eprintln!("oracle MoE en lignes: vert, quasi-égalités tolérées={near_ties}");
+    Ok(())
+}
+
+/// Pairwise ABBA de la boucle lookup greedy (`SARAGOSSA_RUST_LOOKUP_GREEDY`)
+/// contre le greedy AR, même processus, même modèle : `SARAGOSSA_RUST_MOESPEC_PAIRS`
+/// paires (défaut 3) par cas, drafts `SARAGOSSA_RUST_MOESPEC_LOOKUP` (défaut 2),
+/// prompts JSON `SARAGOSSA_RUST_MOESPEC_PROMPTS` (`{nom: texte}`), budget
+/// `SARAGOSSA_RUST_MOESPEC_TOKENS` (défaut 256).
+/// Affiche le débit de decode de chaque passage et le gain médian ; échoue si
+/// une sortie diffère de l'AR. Exige `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1` sur
+/// un modèle MoE.
+#[test]
+#[ignore = "modèle réel requis, bench"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn lookup_greedy_abba_vs_ar_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let Some(prompts_path) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MOESPEC_PROMPTS")
+    else {
+        eprintln!("skip lookup ABBA: SARAGOSSA_RUST_MOESPEC_PROMPTS absent");
+        return Ok(());
+    };
+    let prompts: std::collections::BTreeMap<String, String> = serde_json::from_str(
+        &std::fs::read_to_string(&prompts_path)
+            .map_err(|error| InferError::Config(format!("prompts lookup: {error}")))?,
+    )
+    .map_err(|error| InferError::Config(format!("prompts lookup: {error}")))?;
+    let env_usize = |name: &str, default: usize| {
+        crate::runtime_flags::env_var(name)
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    let cases = crate::runtime_flags::env_var("SARAGOSSA_RUST_MOESPEC_CASES")
+        .unwrap_or_else(|| "T0,T2,T6".to_string());
+    let max_new = env_usize("SARAGOSSA_RUST_MOESPEC_TOKENS", 256);
+    let pairs = env_usize("SARAGOSSA_RUST_MOESPEC_PAIRS", 3);
+    let drafts = env_usize("SARAGOSSA_RUST_MOESPEC_LOOKUP", 2);
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let options = mtp_verifier_options(assets.stop_token_ids());
+    let run = |prompt: &[usize], lookup: usize| -> Result<(Vec<usize>, f64)> {
+        let output = crate::runtime_flags::with_lookup_greedy_override(lookup, || {
+            model.generate_greedy_timed_with_options(prompt, max_new, &options)
+        })?;
+        let rate = output.timings.decode_tokens as f64
+            / output.timings.decode.as_secs_f64().max(f64::MIN_POSITIVE);
+        Ok((output.tokens, rate))
+    };
+    for name in cases.split(',').map(str::trim) {
+        let text = prompts
+            .get(name)
+            .ok_or_else(|| InferError::Config(format!("prompt {name} absent")))?;
+        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
+        // Échauffement des deux chemins (pipelines, scratch).
+        let (reference, _) = run(&prompt, 0)?;
+        run(&prompt, drafts)?;
+        let mut gains = Vec::with_capacity(pairs * 2);
+        for pair in 0..pairs {
+            let mut rates = [0.0f64; 2];
+            for (slot, lookup) in [(0, 0), (1, drafts), (1, drafts), (0, 0)] {
+                let (tokens, rate) = run(&prompt, lookup)?;
+                assert_eq!(tokens, reference, "{name} lookup={lookup}: sortie ≠ AR");
+                rates[slot] += rate / 2.0;
+                eprintln!(
+                    "lookup_abba case={name} paire={pair} lookup={lookup} tokens={} tok_s={rate:.1}",
+                    tokens.len()
+                );
+            }
+            gains.push((rates[1] / rates[0] - 1.0) * 100.0);
+        }
+        gains.sort_by(f64::total_cmp);
+        eprintln!(
+            "lookup_abba case={name} drafts={drafts} sortie={} gain_median={:+.1}% gains={gains:.1?}",
+            reference.len(),
+            gains[gains.len() / 2],
+        );
+    }
+    Ok(())
+}
+
+/// Oracle de la boucle lookup greedy contre le greedy AR, modèle réel
+/// (`SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` ; MoE : avec
+/// `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`). Prompt qui fait recopier un fichier de
+/// ce dépôt, pour que le lookup propose et que le pipeline soit vidangé. Sorties
+/// identiques exigées pour 0, 1, 2 et 8 drafts et des budgets de 0, 1, 2, 9 et
+/// 96 tokens ; arrêts sur des tokens de la sortie AR ; callback qui interrompt
+/// le streaming. Les compteurs de la boucle prouvent qu'au moins une proposition
+/// est acceptée, qu'au moins une vidange du pipeline est suivie d'une reprise et
+/// qu'au moins un arrêt tombe parmi des drafts acceptés.
+#[test]
+#[ignore = "modèle réel requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn lookup_greedy_matches_ar_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let text = format!(
+        "Recopie ce fichier à l'identique.\n\n```rust\n{}\n```",
+        include_str!("lookup.rs")
+    );
+    let prompt = mtp_verifier_prompt_ids(&assets, &text)?;
+    let options = mtp_verifier_options(assets.stop_token_ids());
+    // Éligibilité réelle : sans elle, l'égalité serait triviale.
+    let mut cache = model.prefill_cache_state(&prompt)?.0;
+    assert!(model.setup_resident_full_decode(&mut cache, 96, 0, false)?);
+    assert!(
+        crate::runtime_flags::with_lookup_greedy_override(2, || {
+            model.lookup_greedy_eligible(&cache, &options)
+        }),
+        "boucle lookup inéligible sur ce modèle (MoE : SARAGOSSA_RUST_MOE_VERIFY_ROWS=1)"
+    );
+    drop(cache);
+    let generate = |drafts: usize, max_new: usize, options: &GenerationOptions| {
+        crate::runtime_flags::with_lookup_greedy_override(drafts, || {
+            model.generate_greedy_timed_with_options(&prompt, max_new, options)
+        })
+        .map(|output| output.tokens)
+    };
+    let reference = generate(0, 96, &options)?;
+    let mut traces = crate::decoder::resident::take_lookup_greedy_trace();
+    let mut stops_in_drafts = 0;
+    for drafts in [1, 2, 8] {
+        for max_new in [0, 1, 2, 9, 96] {
+            let expected = &reference[..max_new.min(reference.len())];
+            crate::decoder::resident::take_lookup_greedy_trace();
+            assert_eq!(
+                generate(drafts, max_new, &options)?,
+                expected,
+                "drafts={drafts} budget={max_new}"
+            );
+            let trace = crate::decoder::resident::take_lookup_greedy_trace();
+            traces.accepted_verifies += trace.accepted_verifies;
+            traces.drains += trace.drains;
+        }
+        // Arrêt sur un token de la sortie : la sortie AR s'arrête juste avant
+        // sa première occurrence, la boucle lookup doit faire de même.
+        for &at in &[5, 20, 40, 70] {
+            let Some(&stop) = reference.get(at) else {
+                continue;
+            };
+            let mut stopping = options.clone();
+            stopping.stop_token_ids.push(stop);
+            let expected = generate(0, 96, &stopping)?;
+            crate::decoder::resident::take_lookup_greedy_trace();
+            assert_eq!(
+                generate(drafts, 96, &stopping)?,
+                expected,
+                "drafts={drafts} arrêt sur {stop}"
+            );
+            stops_in_drafts += crate::decoder::resident::take_lookup_greedy_trace().stop_in_drafts;
+        }
+        // Callback qui interrompt : mêmes tokens émis qu'en AR.
+        for limit in [1, 7, 33] {
+            let stream = |lookup: usize| -> Result<Vec<usize>> {
+                let mut seen = Vec::new();
+                crate::runtime_flags::with_lookup_greedy_override(lookup, || {
+                    model.generate_greedy_streaming_with_options(&prompt, 96, &options, |token| {
+                        seen.push(token);
+                        seen.len() < limit
+                    })
+                })?;
+                Ok(seen)
+            };
+            assert_eq!(
+                stream(drafts)?,
+                stream(0)?,
+                "drafts={drafts} callback={limit}"
+            );
+        }
+    }
+    // Le scénario doit être exercé : propositions vérifiées et acceptées, et
+    // pipeline vidangé puis repris (chemin non streamé) ; arrêt sur un token
+    // d'arrêt tombé parmi des drafts acceptés (tokens fréquents de la sortie
+    // recopiée : retour à la ligne, indentation).
+    eprintln!(
+        "lookup greedy ≡ AR : {} tokens de référence, {traces:?}, arrêts dans les drafts={stops_in_drafts}",
+        reference.len()
+    );
+    assert!(traces.accepted_verifies > 0, "aucune proposition acceptée");
+    assert!(traces.drains > 0, "aucune vidange du pipeline");
+    assert!(stops_in_drafts > 0, "aucun arrêt parmi des drafts acceptés");
     Ok(())
 }

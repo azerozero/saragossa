@@ -71,6 +71,10 @@ pub(in crate::decoder) struct ResidentPipelineOutput {
     pub(in crate::decoder) tokens: Vec<usize>,
     pub(in crate::decoder) decode: Duration,
     pub(in crate::decoder) decode_tokens: usize,
+    /// Arrêt demandé par le prédicat de
+    /// `decode_tokens_resident_pipelined_until`, ni token d'arrêt ni budget
+    /// atteint : le dernier token n'est pas encore injecté.
+    pub(in crate::decoder) drained: bool,
 }
 
 /// Sortie d'un pas résident piloté par embedding : soit le `final_state` post-norm

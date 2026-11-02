@@ -333,7 +333,8 @@ impl CausalDecoder {
             ));
         }
         // Le rollback par troncature exige la vérification batchée (captures) ; le
-        // repli séquentiel (`SARAGOSSA_RUST_PREFILL_MOE_ROWS=0`) n'en fournit pas.
+        // repli séquentiel (`SARAGOSSA_RUST_PREFILL_MOE_ROWS=0`, ou couches full-attn
+        // MoE sans `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`) n'en fournit pas.
         if !cache
             .resident
             .as_ref()

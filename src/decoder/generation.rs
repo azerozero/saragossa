@@ -762,11 +762,14 @@ impl CausalDecoder {
         // (validation en amont, tout-ou-rien). Sinon, decode résident full-attn (1b)
         // si son flag est ON : alloue/seed le KV GPU des couches full-attn.
         let prefill = prefill_started.elapsed();
-        self.generate_greedy_timed_from_prompt_state_with_options(
+        self.generate_greedy_timed_from_prompt_state_inner(
             CausalDecoderPromptState::new(cache, final_state),
             prefill,
             max_new_tokens,
             options,
+            true,
+            |_| true,
+            Some(prompt),
         )
     }
 
@@ -800,12 +803,14 @@ impl CausalDecoder {
         let (cache, final_state) =
             with_prefill_kv_reserve(max_new_tokens, || self.prefill_cache_state(prompt))?;
         let prefill = prefill_started.elapsed();
-        self.generate_greedy_timed_from_prompt_state_with_options_and_callback(
+        self.generate_greedy_timed_from_prompt_state_inner(
             CausalDecoderPromptState::new(cache, final_state),
             prefill,
             max_new_tokens,
             options,
+            false,
             on_token,
+            Some(prompt),
         )
     }
 
@@ -828,6 +833,7 @@ impl CausalDecoder {
             options,
             true,
             |_| true,
+            None,
         )
     }
 
@@ -853,9 +859,14 @@ impl CausalDecoder {
             options,
             false,
             on_token,
+            None,
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "entrée commune des chemins greedy: état, options, callback et prompt du lookup"
+    )]
     fn generate_greedy_timed_from_prompt_state_inner(
         &self,
         state: CausalDecoderPromptState,
@@ -864,6 +875,7 @@ impl CausalDecoder {
         options: &GenerationOptions,
         allow_pipelined: bool,
         on_token: impl FnMut(usize) -> bool,
+        prompt: Option<&[usize]>,
     ) -> Result<GenerationOutput> {
         if max_new_tokens == 0 {
             return Ok(GenerationOutput {
@@ -887,6 +899,7 @@ impl CausalDecoder {
             options,
             allow_pipelined,
             on_token,
+            prompt,
         )
     }
 
@@ -903,6 +916,7 @@ impl CausalDecoder {
         options: &GenerationOptions,
         allow_pipelined: bool,
         mut on_token: impl FnMut(usize) -> bool,
+        prompt: Option<&[usize]>,
     ) -> Result<GenerationOutput> {
         if max_new_tokens == 0 {
             return Ok(GenerationOutput {
@@ -943,6 +957,37 @@ impl CausalDecoder {
         let mut decode = Duration::ZERO;
         let mut decode_tokens = 0_usize;
         let mut token = self.sample_token_from_state(&final_state, options, &mut sampler)?;
+        // Lookup n-grammes sans tête MTP (`SARAGOSSA_RUST_LOOKUP_GREEDY`, opt-in) :
+        // il lui faut le prompt, absent des états pré-remplis.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(prompt) = prompt.filter(|_| {
+            use_resident_full
+                && oracle_dump_logits_topk().is_none()
+                && self.lookup_greedy_eligible(&cache, options)
+        }) {
+            let started = Instant::now();
+            let pipelined =
+                allow_pipelined && decode_pipeline_enabled() && decode_min_interval().is_none();
+            let tokens = self.decode_tokens_resident_lookup(
+                &mut cache,
+                prompt,
+                token,
+                max_new_tokens,
+                options,
+                pipelined,
+                &mut on_token,
+            )?;
+            return Ok(GenerationOutput {
+                timings: GenerationTimings {
+                    prefill,
+                    decode: started.elapsed(),
+                    decode_tokens: tokens.len().saturating_sub(1),
+                },
+                tokens,
+            });
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = prompt;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let decode_profiler = DecodeProfiler::start();
         #[cfg(all(target_os = "macos", feature = "metal"))]
