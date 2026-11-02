@@ -788,8 +788,10 @@ impl LoadedModel {
                         }
                         stream_started = true;
                     }
+                    // Stop texte vu sans séquence d'ids terminée (découpe
+                    // différente) : le decode s'arrête là aussi.
                     match detokenizer.push_token(token, on_event) {
-                        Ok(()) => true,
+                        Ok(()) => !detokenizer.stopped(),
                         Err(error) => {
                             stream_error = Some(error);
                             false
@@ -812,7 +814,7 @@ impl LoadedModel {
                             return false;
                         }
                         match detokenizer.push_token(token, on_event) {
-                            Ok(()) => true,
+                            Ok(()) => !detokenizer.stopped(),
                             Err(error) => {
                                 stream_error = Some(error);
                                 false
