@@ -18,7 +18,8 @@
 //!
 //! Plafonds, chacun répondant 503 immédiatement une fois atteint :
 //! - `SARAGOSSA_SERVE_MAX_CONNECTIONS` (64) : connexions en cours de lecture ;
-//! - `SARAGOSSA_SERVE_QUEUE` (32) : requêtes en attente du moteur ;
+//! - `SARAGOSSA_SERVE_QUEUE` (32) : requêtes en attente du moteur, file du
+//!   canal et file locale des lots confondues ;
 //! - `SARAGOSSA_SERVE_MAX_INFLIGHT_BYTES` (256 Mio) : octets de corps lus ou
 //!   en file.
 //!

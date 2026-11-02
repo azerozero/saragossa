@@ -76,6 +76,12 @@ impl<'de> Deserialize<'de> for DeclaredTool {
     }
 }
 
+/// Plafond du nombre de stop sequences (OpenAI en accepte 4 ; Anthropic peut
+/// en déclarer davantage, plus `</tool_call>` ajouté pour les outils).
+const MAX_STOP_SEQUENCES: usize = 16;
+/// Plafond de taille d'une stop sequence.
+const MAX_STOP_BYTES: usize = 1024;
+
 impl ChatCompletionRequest {
     /// Renvoie le budget effectif.
     pub(super) fn max_tokens(&self) -> usize {
@@ -93,6 +99,29 @@ impl ChatCompletionRequest {
             )));
         }
         Ok(requested)
+    }
+
+    /// Validation commune avant tout chargement de modèle, solo comme lot :
+    /// budget plafonné, format de sortie et stop sequences bornées. Rend le
+    /// budget effectif.
+    pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
+        let max_tokens = self.max_tokens_capped(max_tokens_cap)?;
+        self.response_format_mode()?;
+        // Un tableau de chaînes vides pèse ~12× son JSON une fois désérialisé :
+        // bornées, les stops ne peuvent plus amplifier la mémoire des requêtes.
+        let stops = self.stop_texts();
+        if stops.len() > MAX_STOP_SEQUENCES {
+            return Err(ServeError::Http(format!(
+                "stop: {} séquences, au plus {MAX_STOP_SEQUENCES}",
+                stops.len()
+            )));
+        }
+        if stops.iter().any(|stop| stop.len() > MAX_STOP_BYTES) {
+            return Err(ServeError::Http(format!(
+                "stop: séquence de plus de {MAX_STOP_BYTES} octets"
+            )));
+        }
+        Ok(max_tokens)
     }
 
     /// Convertit les messages wire en messages de template.
@@ -161,13 +190,15 @@ impl ChatCompletionRequest {
         }
     }
 
-    /// Requête servable par un lot multi-flux : greedy, texte libre, budget
-    /// non nul et outils acceptés. Le streaming se vérifie à part, le champ
+    /// Requête servable par un lot multi-flux : valide (sinon le solo rend
+    /// son erreur sans charger de modèle), greedy, texte libre, budget non nul
+    /// et outils acceptés. Le streaming se vérifie à part, le champ
     /// `stream` n'étant pas porté par la conversion Anthropic.
-    pub(super) fn batchable(&self) -> bool {
-        self.temperature.unwrap_or(0.0) <= f32::EPSILON
+    pub(super) fn batchable(&self, max_tokens_cap: usize) -> bool {
+        self.validate(max_tokens_cap)
+            .is_ok_and(|max_tokens| max_tokens > 0)
+            && self.temperature.unwrap_or(0.0) <= f32::EPSILON
             && matches!(self.response_format_mode(), Ok(ResponseFormatMode::Text))
-            && self.max_tokens() > 0
             && self.active_tools().is_ok()
     }
 
@@ -616,6 +647,24 @@ fn response_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_bounds_stop_sequences() {
+        let request = |stop: serde_json::Value| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [], "stop": stop
+            }))
+            .expect("invariant: requête test valide")
+        };
+
+        assert!(request(serde_json::json!(["a", "b"]))
+            .validate(1024)
+            .is_ok());
+        let many = request(serde_json::json!(vec![""; 17])).validate(1024);
+        assert!(matches!(many, Err(ServeError::Http(message)) if message.contains("au plus 16")));
+        let long = request(serde_json::json!("x".repeat(1025))).validate(1024);
+        assert!(matches!(long, Err(ServeError::Http(_))));
+    }
 
     #[test]
     fn request_accepts_string_stop() {

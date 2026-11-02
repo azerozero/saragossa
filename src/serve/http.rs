@@ -194,9 +194,9 @@ pub(super) fn route_front<S: Write>(
 pub(super) fn handle_job<S: Write>(
     stream: &mut S,
     state: &mut ServeState,
-    request: HttpRequest,
+    request: &HttpRequest,
 ) -> ServeResult<()> {
-    let result = route_engine(stream, state, &request);
+    let result = route_engine(stream, state, request);
     reply_on_error(stream, result)
 }
 
@@ -237,8 +237,7 @@ fn handle_chat<S: Write>(
 ) -> ServeResult<()> {
     let chat: ChatCompletionRequest = serde_json::from_slice(&request.body)
         .map_err(|e| ServeError::json("désérialisation chat/completions", e))?;
-    chat.max_tokens_capped(state.max_tokens_cap())?;
-    chat.response_format_mode()?;
+    chat.validate(state.max_tokens_cap())?;
     let session_key = chat.session_key(request.header(SESSION_HEADER));
     // NOTE: `tools` et `tool_choice` ne servent qu'à flint ; les autres
     // familles les ignorent, comme avant.
@@ -281,10 +280,9 @@ fn handle_chat<S: Write>(
     }
 }
 
-/// Requête chat admissible à un lot, analysée une fois à l'entrée en file.
+/// Requête chat admissible à un lot.
 pub(super) struct BatchChat {
     chat: ChatCompletionRequest,
-    session_key: Option<String>,
     anthropic: bool,
 }
 
@@ -296,9 +294,12 @@ impl BatchChat {
 }
 
 /// Analyse `request` pour un lot : chat OpenAI ou Messages Anthropic streamé,
-/// greedy, sans sortie structurée. `None` laisse la requête au chemin solo,
-/// qui rapporte aussi ses erreurs de format.
-pub(super) fn batch_chat(request: &HttpRequest) -> Option<BatchChat> {
+/// valide, greedy, sans sortie structurée ni clé de session. `None` laisse la
+/// requête au chemin solo, qui rapporte ses erreurs avant tout chargement.
+///
+/// NOTE: une requête avec session garde le solo et son cache de préfixe par
+/// blocs ; dans un lot, elle perdrait le TTFT de son tour suivant.
+pub(super) fn batch_chat(request: &HttpRequest, max_tokens_cap: usize) -> Option<BatchChat> {
     let header = request.header(SESSION_HEADER);
     let (chat, session_key, stream, anthropic) = match (request.method.as_str(), request.route()) {
         ("POST", "/v1/chat/completions") => {
@@ -313,27 +314,34 @@ pub(super) fn batch_chat(request: &HttpRequest) -> Option<BatchChat> {
         }
         _ => return None,
     };
-    (stream && chat.batchable()).then_some(BatchChat {
-        chat,
-        session_key,
-        anthropic,
-    })
+    (stream && session_key.is_none() && chat.batchable(max_tokens_cap))
+        .then_some(BatchChat { chat, anthropic })
 }
 
 /// Sert ensemble des requêtes acceptées par [`batch_chat`] pour un même
 /// modèle : chaque client reçoit le même flux SSE que sur le chemin solo, ou
 /// son erreur au format de sa route.
-pub(super) fn handle_batch<S: Write>(
-    state: &mut ServeState,
-    jobs: &mut [(&mut S, &HttpRequest)],
-    chats: Vec<BatchChat>,
-) {
-    let flint = chats
+pub(super) fn handle_batch<S: Write>(state: &mut ServeState, jobs: &mut [(&mut S, &HttpRequest)]) {
+    let cap = state.max_tokens_cap();
+    let mut batched = Vec::with_capacity(jobs.len());
+    let mut solo = Vec::new();
+    for (index, (_, request)) in jobs.iter().enumerate() {
+        match batch_chat(request, cap) {
+            Some(chat) => batched.push((index, chat)),
+            None => solo.push(index),
+        }
+    }
+    let flint = batched
         .first()
-        .is_some_and(|chat| state.model_is_flint(chat.model()).unwrap_or(false));
-    let mut requests = Vec::with_capacity(chats.len());
-    let mut sinks: Vec<Box<dyn CompletionSink + '_>> = Vec::with_capacity(chats.len());
-    for ((stream, _), batch) in jobs.iter_mut().zip(chats) {
+        .is_some_and(|(_, chat)| state.model_is_flint(chat.model()).unwrap_or(false));
+    let mut requests = Vec::with_capacity(batched.len());
+    let mut sinks: Vec<Box<dyn CompletionSink + '_>> = Vec::with_capacity(batched.len());
+    let mut slots = Vec::with_capacity(batched.len());
+    let mut batched = batched.into_iter().peekable();
+    for (index, (stream, _)) in jobs.iter_mut().enumerate() {
+        let Some((_, batch)) = batched.next_if(|(slot, _)| *slot == index) else {
+            continue;
+        };
         let stream: &mut S = stream;
         if batch.anthropic {
             sinks.push(Box::new(AnthropicSse::new(stream)));
@@ -348,19 +356,24 @@ pub(super) fn handle_batch<S: Write>(
             });
             sinks.push(Box::new(OpenAiSse::new(stream, parser)));
         }
-        requests.push((batch.chat, batch.session_key));
+        requests.push(batch.chat);
+        slots.push(index);
     }
-    let (results, _) = state.complete_streaming_batch(requests, &mut sinks);
-    let outcomes: Vec<ServeResult<()>> = sinks
-        .iter_mut()
-        .zip(results)
-        .map(|(sink, result)| sink.finish(result))
-        .collect();
+    let (outcomes, _) = state.complete_streaming_batch(requests, &mut sinks);
     drop(sinks);
-    for ((stream, request), outcome) in jobs.iter_mut().zip(outcomes) {
+    for (index, outcome) in slots.into_iter().zip(outcomes) {
         if let Err(error) = outcome {
+            let (stream, request) = &mut jobs[index];
             eprintln!("saragossa serve request error: {error}");
             let _ = send_route_error(*stream, request, error_status(&error), &error.to_string());
+        }
+    }
+    // NOTE: l'analyse est déterministe, ce cas ne survient pas ; le solo
+    // reste la réponse sûre s'il survenait.
+    for index in solo {
+        let (stream, request) = &mut jobs[index];
+        if let Err(error) = handle_job(*stream, state, request) {
+            eprintln!("saragossa serve request error: {error}");
         }
     }
 }
@@ -806,7 +819,7 @@ mod tests {
         if let Some(result) = route_front(stream, &front, &request) {
             return reply_on_error(stream, result);
         }
-        handle_job(stream, state, request)
+        handle_job(stream, state, &request)
     }
 
     fn far_deadline() -> Instant {
@@ -884,6 +897,10 @@ mod tests {
             .expect("invariant: requête présente")
     }
 
+    fn admit(request: &HttpRequest) -> Option<BatchChat> {
+        batch_chat(request, 1024)
+    }
+
     /// Seules les requêtes chat streamées greedy en texte libre entrent dans
     /// un lot ; le reste garde le chemin solo, qui rapporte ses erreurs.
     #[test]
@@ -895,21 +912,26 @@ mod tests {
             )
         };
 
-        let admitted = batch_chat(&chat("")).expect("invariant: chat streamé greedy admis");
+        let admitted = admit(&chat("")).expect("invariant: chat streamé greedy admis");
         assert_eq!(admitted.model(), "m");
         assert!(!admitted.anthropic);
-        assert!(batch_chat(&chat(r#","temperature":0"#)).is_some());
-        assert!(batch_chat(&chat(r#","temperature":0.7"#)).is_none());
-        assert!(batch_chat(&chat(r#","response_format":{"type":"json_object"}"#)).is_none());
-        assert!(batch_chat(&chat(r#","max_tokens":0"#)).is_none());
-        assert!(batch_chat(&chat(r#","tool_choice":"required""#)).is_none());
-        assert!(batch_chat(&post(
+        assert!(admit(&chat(r#","temperature":0"#)).is_some());
+        assert!(admit(&chat(r#","temperature":0.7"#)).is_none());
+        assert!(admit(&chat(r#","response_format":{"type":"json_object"}"#)).is_none());
+        assert!(admit(&chat(r#","max_tokens":0"#)).is_none());
+        assert!(admit(&chat(r#","tool_choice":"required""#)).is_none());
+        // Invalide : le solo répond 400 sans charger le modèle.
+        assert!(admit(&chat(r#","max_tokens":1025"#)).is_none());
+        assert!(admit(&chat(&format!(r#","stop":{:?}"#, vec![""; 17]))).is_none());
+        // Avec session : solo, pour garder le cache de préfixe par blocs.
+        assert!(admit(&chat(r#","user":"alice""#)).is_none());
+        assert!(admit(&post(
             "/v1/chat/completions",
             r#"{"model":"m","messages":[]}"#
         ))
         .is_none());
-        assert!(batch_chat(&post("/v1/chat/completions", "{")).is_none());
-        assert!(batch_chat(&post("/v1/embeddings", r#"{"model":"m","input":"x"}"#)).is_none());
+        assert!(admit(&post("/v1/chat/completions", "{")).is_none());
+        assert!(admit(&post("/v1/embeddings", r#"{"model":"m","input":"x"}"#)).is_none());
     }
 
     #[test]
@@ -917,11 +939,11 @@ mod tests {
         let body = r#"{"model":"m","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"x"}]}"#;
 
         let admitted =
-            batch_chat(&post("/v1/messages", body)).expect("invariant: Messages streamé admis");
+            admit(&post("/v1/messages", body)).expect("invariant: Messages streamé admis");
 
         assert_eq!(admitted.model(), "m");
         assert!(admitted.anthropic);
-        assert!(batch_chat(&post("/v1/messages", &body.replace("true", "false"))).is_none());
+        assert!(admit(&post("/v1/messages", &body.replace("true", "false"))).is_none());
     }
 
     #[test]

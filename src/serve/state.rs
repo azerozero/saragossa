@@ -163,7 +163,7 @@ impl ServeState {
         session_key: Option<&str>,
     ) -> ServeResult<ServedCompletion> {
         let max_tokens_cap = self.max_tokens_cap;
-        let max_tokens = request.max_tokens_capped(max_tokens_cap)?;
+        let max_tokens = request.validate(max_tokens_cap)?;
         let index = self
             .models
             .iter()
@@ -191,7 +191,7 @@ impl ServeState {
         mut on_event: impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
         let max_tokens_cap = self.max_tokens_cap;
-        let max_tokens = request.max_tokens_capped(max_tokens_cap)?;
+        let max_tokens = request.validate(max_tokens_cap)?;
         let index = self
             .models
             .iter()
@@ -231,23 +231,22 @@ impl ServeState {
                 .is_some_and(|loaded| loaded.decoder.lightbatch_multi_dense_ready())
     }
 
-    /// Exécute un lot de complétions chat streamées greedy d'un même modèle,
-    /// une issue par requête, dans l'ordre. `sinks[i]` reçoit les événements
-    /// de `requests[i]`.
+    /// Exécute un lot de complétions chat streamées greedy d'un même modèle.
+    /// `sinks[i]` reçoit les événements de `requests[i]` puis est terminé ;
+    /// l'issue `Err` d'un client n'a pas encore été écrite, l'appelant envoie
+    /// l'erreur HTTP.
     ///
     /// Les requêtes sont découpées en sous-lots consécutifs qui tiennent dans
     /// la garde mémoire ; un sous-lot d'une requête prend le chemin solo
-    /// inchangé (MTP, cache de préfixe). Rend aussi le nombre de pas
-    /// multi-flux dense encodés.
+    /// inchangé (MTP). Rend aussi le nombre de pas multi-flux dense encodés.
     pub(super) fn complete_streaming_batch(
         &mut self,
-        requests: Vec<(ChatCompletionRequest, Option<String>)>,
+        requests: Vec<ChatCompletionRequest>,
         sinks: &mut [Box<dyn CompletionSink + '_>],
-    ) -> (Vec<ServeResult<ServedCompletion>>, usize) {
-        let mut results: Vec<Option<ServeResult<ServedCompletion>>> =
-            requests.iter().map(|_| None).collect();
+    ) -> (Vec<ServeResult<()>>, usize) {
+        let mut results: Vec<Option<ServeResult<()>>> = requests.iter().map(|_| None).collect();
         let mut multi_steps = 0;
-        let Some(model) = requests.first().map(|(request, _)| request.model.clone()) else {
+        let Some(model) = requests.first().map(|request| request.model.clone()) else {
             return (Vec::new(), 0);
         };
         let max_tokens_cap = self.max_tokens_cap;
@@ -260,21 +259,18 @@ impl ServeState {
         let index = match loaded {
             Ok(index) => index,
             Err(error) => {
-                let message = error.to_string();
-                return (
-                    requests
-                        .iter()
-                        .map(|_| Err(ServeError::Batch(message.clone())))
-                        .collect(),
-                    0,
-                );
+                let outcomes = sinks
+                    .iter_mut()
+                    .map(|sink| sink.finish(Err(error.replicate())))
+                    .collect();
+                return (outcomes, 0);
             }
         };
         self.clock = self.clock.saturating_add(1);
         self.models[index].last_used = self.clock;
         let mut prepared = Vec::with_capacity(requests.len());
-        for (slot, (request, _)) in requests.iter().enumerate() {
-            let outcome = request.max_tokens_capped(max_tokens_cap).and_then(|max| {
+        for (slot, request) in requests.iter().enumerate() {
+            let outcome = request.validate(max_tokens_cap).and_then(|max| {
                 self.models[index]
                     .loaded
                     .as_ref()
@@ -283,7 +279,7 @@ impl ServeState {
             });
             match outcome {
                 Ok(request) => prepared.push((slot, request)),
-                Err(error) => results[slot] = Some(Err(error)),
+                Err(error) => results[slot] = Some(sinks[slot].finish(Err(error))),
             }
         }
         let mut requests: Vec<Option<_>> = requests.into_iter().map(Some).collect();
@@ -299,18 +295,15 @@ impl ServeState {
             rest = tail;
             if let [(slot, _)] = chunk {
                 // NOTE: seul dans son sous-lot (mémoire) : chemin solo inchangé.
-                let Some((request, session_key)) = requests[*slot].take() else {
+                let Some(request) = requests[*slot].take() else {
                     continue;
                 };
                 let sink = &mut sinks[*slot];
-                results[*slot] = Some(self.complete_streaming(
-                    request,
-                    session_key.as_deref(),
-                    |event| sink.event(event),
-                ));
+                let result = self.complete_streaming(request, None, |event| sink.event(event));
+                results[*slot] = Some(sink.finish(result));
                 continue;
             }
-            let Some(loaded) = self.models[index].loaded.as_mut() else {
+            let Some(loaded) = self.models[index].loaded.as_ref() else {
                 continue;
             };
             let slots: Vec<usize> = chunk.iter().map(|(slot, _)| *slot).collect();
@@ -602,8 +595,11 @@ struct PreparedRequest {
 /// Etat de streaming d'un flux du lot, possédé par ce flux.
 struct BatchFlux<'a> {
     detokenizer: StreamingTextDetokenizer<'a>,
+    tokens: Vec<usize>,
+    first_token: Option<Instant>,
     started: bool,
-    error: Option<ServeError>,
+    /// Issue du client, posée dès que son flux s'arrête.
+    outcome: Option<ServeResult<()>>,
 }
 
 /// Nombre de requêtes en tête de `rest` dont la somme des octets estimés tient
@@ -918,26 +914,47 @@ impl LoadedModel {
     }
 
     /// Décode `streams` ensemble par le light-batch (pas multi-flux dense si
-    /// éligible) ; une issue par flux. Rend aussi le nombre de pas multi.
+    /// éligible) et termine chaque client ; rend aussi le nombre de pas multi.
     ///
     /// NOTE: le prefill passe par le cache longest-prefix du décodeur, comme
-    /// MTP, pas par les snapshots par blocs de serve ; les stops texte arrêtent
-    /// le flux dès qu'ils apparaissent, faute d'arrêt sur séquence de tokens
-    /// dans le light-batch.
+    /// MTP, pas par les snapshots par blocs de serve (les requêtes avec
+    /// session restent en solo).
     fn complete_lightbatch(
-        &mut self,
+        &self,
         streams: &[&PreparedRequest],
         sinks: &mut [&mut Box<dyn CompletionSink + '_>],
-    ) -> (Vec<ServeResult<ServedCompletion>>, usize) {
-        let started = Instant::now();
+    ) -> (Vec<ServeResult<()>>, usize) {
         let prompts: Vec<Vec<usize>> = streams.iter().map(|stream| stream.tokens.clone()).collect();
         let budgets: Vec<usize> = streams.iter().map(|stream| stream.max_tokens).collect();
-        // Les options ne diffèrent que par les stops (gérés par flux plus bas) :
-        // greedy, sans contrainte, mêmes tokens d'arrêt pour un même modèle.
+        let stop_ids = streams[0].options.stop_token_ids.clone();
+        // Tokens d'arrêt et stops texte sont vus par flux dans `drive_batch` :
+        // le light-batch rend chaque token, qui finalise son flux sur-le-champ.
         let options = GenerationOptions {
+            stop_token_ids: Vec::new(),
             stop_sequences: Vec::new(),
             ..streams[0].options.clone()
         };
+        self.drive_batch(streams, sinks, &stop_ids, |on_token| {
+            self.decoder
+                .generate_greedy_lightbatch_streaming_counted(
+                    &prompts, &budgets, &options, on_token,
+                )
+                .map(|(_, multi_steps)| multi_steps)
+        })
+    }
+
+    /// Distribue les tokens de `generate` aux flux : SSE, stops, puis issue de
+    /// chaque client dès que SON flux s'arrête (token d'arrêt, stop texte,
+    /// budget, client parti). Une erreur de `generate` ne touche que les flux
+    /// encore actifs.
+    fn drive_batch(
+        &self,
+        streams: &[&PreparedRequest],
+        sinks: &mut [&mut Box<dyn CompletionSink + '_>],
+        stop_ids: &[usize],
+        generate: impl FnOnce(&mut dyn FnMut(usize, usize) -> bool) -> saragossa::Result<usize>,
+    ) -> (Vec<ServeResult<()>>, usize) {
+        let started = Instant::now();
         let mut flux: Vec<BatchFlux<'_>> = streams
             .iter()
             .map(|stream| BatchFlux {
@@ -946,127 +963,160 @@ impl LoadedModel {
                     &stream.stop_texts,
                     stream.max_tokens,
                 ),
+                tokens: Vec::with_capacity(stream.max_tokens),
+                first_token: None,
                 started: false,
-                error: None,
+                outcome: None,
             })
             .collect();
-        let id = &self.id;
-        let outcome = self.decoder.generate_greedy_lightbatch_streaming_counted(
-            &prompts,
-            &budgets,
-            &options,
-            |index, token| {
-                let (Some(flux), Some(sink)) = (flux.get_mut(index), sinks.get_mut(index)) else {
-                    return false;
-                };
-                if flux.error.is_some() {
-                    return false;
-                }
-                let mut on_event = |event: CompletionStreamEvent<'_>| sink.event(event);
-                if !flux.started {
-                    let start = StreamingCompletionStart {
-                        model: id.clone(),
-                        prompt_tokens: prompts[index].len(),
-                        reused_prefix_tokens: 0,
-                        // Les prefills de tout le lot précèdent le premier token.
-                        prefill: started.elapsed(),
-                    };
-                    if let Err(error) = on_event(CompletionStreamEvent::Start(&start)) {
-                        flux.error = Some(error);
-                        return false;
-                    }
-                    flux.started = true;
-                }
-                match flux.detokenizer.push_token(token, &mut on_event) {
-                    Ok(()) => !flux.detokenizer.stopped(),
-                    Err(error) => {
-                        flux.error = Some(error);
-                        false
-                    }
-                }
-            },
+        let mut on_token = |index: usize, token: usize| {
+            let (Some(flux), Some(sink), Some(stream)) = (
+                flux.get_mut(index),
+                sinks.get_mut(index),
+                streams.get(index),
+            ) else {
+                return false;
+            };
+            if flux.outcome.is_some() {
+                return false;
+            }
+            flux.first_token.get_or_insert_with(Instant::now);
+            if let Err(error) = self.start_flux(flux, sink, stream, started.elapsed()) {
+                flux.outcome = Some(sink.finish(Err(error)));
+                return false;
+            }
+            if stop_ids.contains(&token) {
+                flux.outcome = Some(self.finish_flux(flux, sink, stream, started));
+                return false;
+            }
+            flux.tokens.push(token);
+            let pushed = flux
+                .detokenizer
+                .push_token(token, &mut |event| sink.event(event));
+            if let Err(error) = pushed {
+                flux.outcome = Some(sink.finish(Err(error)));
+                return false;
+            }
+            if flux.detokenizer.stopped() || flux.tokens.len() >= stream.max_tokens {
+                flux.outcome = Some(self.finish_flux(flux, sink, stream, started));
+                return false;
+            }
+            true
+        };
+        let generated = generate(&mut on_token);
+        let multi_steps = match &generated {
+            Ok(steps) => *steps,
+            Err(_) => 0,
+        };
+        eprintln!(
+            "saragossa serve batch model={} streams={} multi_steps={} total_ms={}{}",
+            self.id,
+            streams.len(),
+            multi_steps,
+            started.elapsed().as_millis(),
+            generated
+                .as_ref()
+                .err()
+                .map_or(String::new(), |error| format!(" erreur: {error}"))
         );
-        let (outputs, multi_steps) = match outcome {
-            Ok(done) => done,
-            Err(error) => {
-                let message = error.to_string();
-                eprintln!(
-                    "saragossa serve batch model={} streams={} erreur: {message}",
-                    self.id,
-                    streams.len()
-                );
-                let results = flux
-                    .iter_mut()
-                    .zip(sinks.iter_mut())
-                    .map(|(flux, sink)| {
-                        if flux.started && flux.error.is_none() {
+        let outcomes = flux
+            .iter_mut()
+            .zip(sinks.iter_mut())
+            .zip(streams)
+            .map(|((flux, sink), stream)| {
+                if let Some(outcome) = flux.outcome.take() {
+                    return outcome;
+                }
+                match &generated {
+                    // Le light-batch s'est arrêté sans token final pour ce
+                    // flux : on le termine avec ce qu'il a produit.
+                    Ok(_) => self.finish_flux(flux, sink, stream, started),
+                    Err(error) => {
+                        let message = error.to_string();
+                        if flux.started {
                             let terminal = StreamTerminalError {
                                 message: &message,
                                 error_type: "server_error",
                             };
                             let _ = sink.event(CompletionStreamEvent::TerminalError(&terminal));
                         }
-                        Err(ServeError::Batch(message.clone()))
-                    })
-                    .collect();
-                return (results, 0);
-            }
-        };
-        eprintln!(
-            "saragossa serve batch model={} streams={} multi_steps={} total_ms={}",
-            self.id,
-            streams.len(),
-            multi_steps,
-            started.elapsed().as_millis()
-        );
-        let mut results = Vec::with_capacity(streams.len());
-        for (((flux, sink), output), stream) in flux
-            .into_iter()
-            .zip(sinks.iter_mut())
-            .zip(outputs)
-            .zip(streams)
-        {
-            results.push(self.finish_flux(flux, sink, output, stream, started));
-        }
-        (results, multi_steps)
+                        sink.finish(Err(ServeError::Batch(message)))
+                    }
+                }
+            })
+            .collect();
+        (outcomes, multi_steps)
     }
 
-    /// Issue d'un flux du lot : démarrage tardif, texte final, journal.
+    /// Envoie le début de réponse d'un flux s'il n'est pas encore parti.
+    fn start_flux(
+        &self,
+        flux: &mut BatchFlux<'_>,
+        sink: &mut Box<dyn CompletionSink + '_>,
+        stream: &PreparedRequest,
+        prefill: Duration,
+    ) -> ServeResult<()> {
+        if flux.started {
+            return Ok(());
+        }
+        let start = StreamingCompletionStart {
+            model: self.id.clone(),
+            prompt_tokens: stream.tokens.len(),
+            reused_prefix_tokens: 0,
+            // Les prefills de tout le lot précèdent le premier token.
+            prefill,
+        };
+        sink.event(CompletionStreamEvent::Start(&start))?;
+        flux.started = true;
+        Ok(())
+    }
+
+    /// Termine un client : texte final, `finish_reason`, usage, journal et
+    /// fin de réponse SSE.
     fn finish_flux(
         &self,
-        mut flux: BatchFlux<'_>,
+        flux: &mut BatchFlux<'_>,
         sink: &mut Box<dyn CompletionSink + '_>,
-        output: GenerationOutput,
         stream: &PreparedRequest,
-        started: Instant,
-    ) -> ServeResult<ServedCompletion> {
-        if let Some(error) = flux.error {
-            return Err(error);
+        batch_started: Instant,
+    ) -> ServeResult<()> {
+        let now = Instant::now();
+        let first = flux.first_token.unwrap_or(now);
+        let prefill = first.saturating_duration_since(batch_started);
+        if let Err(error) = self.start_flux(flux, sink, stream, prefill) {
+            return sink.finish(Err(error));
         }
-        let mut on_event = |event: CompletionStreamEvent<'_>| sink.event(event);
-        if !flux.started {
-            let start = StreamingCompletionStart {
-                model: self.id.clone(),
-                prompt_tokens: stream.tokens.len(),
-                reused_prefix_tokens: 0,
-                prefill: output.timings.prefill,
-            };
-            on_event(CompletionStreamEvent::Start(&start))?;
-        }
+        let tokens = std::mem::take(&mut flux.tokens);
+        let output = GenerationOutput {
+            timings: GenerationTimings {
+                prefill,
+                decode: now.saturating_duration_since(first),
+                decode_tokens: tokens.len().saturating_sub(1),
+            },
+            tokens,
+        };
         let completion = self.finish_completion(
             stream,
             output,
             0,
-            started.elapsed(),
+            batch_started.elapsed(),
             CompletionPath {
                 prefix_cache: "decoder-longest-prefix",
                 decode_path: "batch",
                 streaming: true,
             },
-        )?;
-        flux.detokenizer
-            .finish(&completion.content, &mut on_event)?;
-        Ok(completion)
+        );
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(error) => return sink.finish(Err(error)),
+        };
+        if let Err(error) = flux
+            .detokenizer
+            .finish(&completion.content, &mut |event| sink.event(event))
+        {
+            return sink.finish(Err(error));
+        }
+        sink.finish(Ok(completion))
     }
 
     /// Majorant des octets propres à un flux du lot : K/V des couches
@@ -1478,6 +1528,9 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 
 #[cfg(test)]
 mod json_tests;
+
+#[cfg(test)]
+mod batch_drive_tests;
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod batch_tests;

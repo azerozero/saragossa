@@ -19,6 +19,8 @@ const MAX_TOKENS: usize = 48;
 /// client parti après ce nombre de deltas.
 struct Collect<'a> {
     text: &'a mut String,
+    /// Contenu final, ou message d'erreur, posé par `finish`.
+    done: &'a mut Option<Result<String, String>>,
     fail_after: Option<usize>,
     deltas: usize,
 }
@@ -38,7 +40,12 @@ impl CompletionSink for Collect<'_> {
         Ok(())
     }
 
-    fn finish(&mut self, _result: ServeResult<ServedCompletion>) -> ServeResult<()> {
+    fn finish(&mut self, result: ServeResult<ServedCompletion>) -> ServeResult<()> {
+        *self.done = Some(
+            result
+                .map(|completion| completion.content)
+                .map_err(|error| error.to_string()),
+        );
         Ok(())
     }
 }
@@ -86,30 +93,36 @@ fn sequential(state: &mut ServeState) -> Vec<String> {
 }
 
 /// Lance le lot ; `fail` désigne le client qui part après deux deltas.
+/// Rend l'issue finale de chaque client, son texte streamé et le nombre de
+/// pas multi-flux.
 fn batch(
     state: &mut ServeState,
     fail: Option<usize>,
-) -> (Vec<ServeResult<ServedCompletion>>, Vec<String>, usize) {
+) -> (Vec<Result<String, String>>, Vec<String>, usize) {
     let mut texts = vec![String::new(); PROMPTS.len()];
-    let (results, multi_steps) = {
+    let mut done: Vec<Option<Result<String, String>>> = vec![None; PROMPTS.len()];
+    let multi_steps = {
         let mut sinks: Vec<Box<dyn CompletionSink + '_>> = texts
             .iter_mut()
+            .zip(done.iter_mut())
             .enumerate()
-            .map(|(index, text)| {
+            .map(|(index, (text, done))| {
                 Box::new(Collect {
                     text,
+                    done,
                     fail_after: (fail == Some(index)).then_some(2),
                     deltas: 0,
                 }) as Box<dyn CompletionSink + '_>
             })
             .collect();
-        let requests = PROMPTS
-            .iter()
-            .map(|prompt| (request(prompt), None))
-            .collect();
-        state.complete_streaming_batch(requests, &mut sinks)
+        let requests = PROMPTS.iter().map(|prompt| request(prompt)).collect();
+        state.complete_streaming_batch(requests, &mut sinks).1
     };
-    (results, texts, multi_steps)
+    let done = done
+        .into_iter()
+        .map(|done| done.expect("invariant: chaque client terminé"))
+        .collect();
+    (done, texts, multi_steps)
 }
 
 #[test]
@@ -125,8 +138,8 @@ fn batch_matches_sequential_with_multi_steps() {
 
     assert!(multi_steps > 0, "aucun pas multi-flux (largeur ≥ 2)");
     for (index, result) in results.into_iter().enumerate() {
-        let completion = result.expect("invariant: flux du lot terminé");
-        assert_eq!(completion.content, solo[index], "flux {index} ≠ solo");
+        let content = result.expect("invariant: flux du lot terminé");
+        assert_eq!(content, solo[index], "flux {index} ≠ solo");
         assert_eq!(streamed[index], solo[index], "flux {index} streamé ≠ solo");
     }
 }
@@ -147,6 +160,6 @@ fn departed_client_does_not_stop_the_batch() {
     let departed = results.next().expect("invariant: flux 1");
     let last = results.next().expect("invariant: flux 2");
     assert!(departed.is_err(), "le client parti doit finir en erreur");
-    assert_eq!(first.expect("invariant: flux 0 terminé").content, solo[0]);
-    assert_eq!(last.expect("invariant: flux 2 terminé").content, solo[2]);
+    assert_eq!(first.expect("invariant: flux 0 terminé"), solo[0]);
+    assert_eq!(last.expect("invariant: flux 2 terminé"), solo[2]);
 }

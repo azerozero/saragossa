@@ -28,8 +28,7 @@ use super::error::{ServeError, ServeResult};
 use super::http::configure_unix_stream;
 use super::http::{
     batch_chat, configure_tcp_stream, handle_batch, handle_job, read_body, read_head,
-    read_or_reject, reply_on_error, route_front, send_error, send_route_error, BatchChat,
-    HttpRequest,
+    read_or_reject, reply_on_error, route_front, send_error, send_route_error, HttpRequest,
 };
 use super::state::ServeState;
 
@@ -66,17 +65,21 @@ impl ServeStream for UnixStream {
 }
 
 /// Requête lue, en attente du thread moteur avec la socket de sa réponse. La
-/// réservation d'octets suit le corps jusqu'à la fin du traitement.
+/// réservation d'octets suit le corps jusqu'à la fin du traitement ; la place
+/// d'attente est rendue quand le moteur prend le job.
 struct Job<S> {
     request: HttpRequest,
     stream: S,
     _bytes: Reservation,
+    waiting: Reservation,
 }
 
 /// Plafonds de la façade d'E/S.
 struct Limits {
     max_connections: usize,
     max_inflight_bytes: usize,
+    /// Jobs en attente du moteur, canal et file locale des lots confondus.
+    queue_depth: usize,
     read_timeout: Duration,
 }
 
@@ -86,6 +89,7 @@ pub(super) struct Dispatcher<S> {
     jobs: SyncSender<Job<S>>,
     connections: Arc<AtomicUsize>,
     inflight_bytes: Arc<AtomicUsize>,
+    waiting: Arc<AtomicUsize>,
     limits: Arc<Limits>,
 }
 
@@ -120,6 +124,7 @@ impl<S: ServeStream> Dispatcher<S> {
             front: Arc::clone(&self.front),
             jobs: self.jobs.clone(),
             inflight_bytes: Arc::clone(&self.inflight_bytes),
+            waiting: Arc::clone(&self.waiting),
             limits: Arc::clone(&self.limits),
         };
         let spawned = thread::Builder::new()
@@ -151,15 +156,18 @@ where
     S: ServeStream,
     A: FnOnce(Dispatcher<S>) -> ServeResult<()> + Send + 'static,
 {
-    let (jobs, queue) = sync_channel(serve_queue_depth());
+    let queue_depth = serve_queue_depth();
+    let (jobs, queue) = sync_channel(queue_depth);
     let dispatcher = Dispatcher {
         front: Arc::new(front),
         jobs,
         connections: Arc::new(AtomicUsize::new(0)),
         inflight_bytes: Arc::new(AtomicUsize::new(0)),
+        waiting: Arc::new(AtomicUsize::new(0)),
         limits: Arc::new(Limits {
             max_connections: serve_max_connections(),
             max_inflight_bytes: serve_max_inflight_bytes(),
+            queue_depth,
             read_timeout,
         }),
     };
@@ -182,25 +190,27 @@ where
         .map_err(|_| ServeError::io("thread d'accept", io::Error::other("panique")))?
 }
 
-/// Job en attente du moteur, avec son analyse pour un lot (`None` : chemin
-/// solo).
+/// Job en attente du moteur, avec le modèle visé s'il est admissible à un
+/// lot (`None` : chemin solo).
+///
+/// NOTE: seul l'identifiant du modèle est gardé, pas la requête décodée : la
+/// file locale ne retient que le corps brut déjà compté dans le budget
+/// d'octets. Le lot ré-analyse le corps au moment de servir.
 struct Queued<S> {
     job: Job<S>,
-    batch: Option<BatchChat>,
+    model: Option<String>,
 }
 
 impl<S> Queued<S> {
-    fn new(job: Job<S>, batching: bool) -> Self {
-        let batch = if batching {
-            batch_chat(&job.request)
-        } else {
-            None
-        };
-        Self { job, batch }
+    fn new(job: Job<S>, batching: Option<usize>) -> Self {
+        let model = batching
+            .and_then(|cap| batch_chat(&job.request, cap))
+            .map(|chat| chat.model().to_string());
+        Self { job, model }
     }
 
     fn model(&self) -> Option<&str> {
-        self.batch.as_ref().map(BatchChat::model)
+        self.model.as_deref()
     }
 }
 
@@ -215,9 +225,10 @@ fn run_engine<S: ServeStream>(
     state: &mut ServeState,
     max_streams: usize,
 ) {
-    let batching = max_streams > 1;
-    // Borne de `pending` : drainer libère des places dans la file bornée, sans
-    // cette borne la file locale grandirait sans contre-pression.
+    // Plafond `max_tokens` pour la validation d'admission, `None` sans lots.
+    let batching = (max_streams > 1).then(|| state.max_tokens_cap());
+    // NOTE: les jobs de `pending` gardent leur place d'attente : canal et
+    // file locale restent ensemble sous `SARAGOSSA_SERVE_QUEUE`.
     let pending_cap = serve_queue_depth();
     let mut pending: VecDeque<Queued<S>> = VecDeque::new();
     loop {
@@ -293,15 +304,24 @@ fn take_batch<T>(
 
 /// Exécute un lot de jobs éligibles du même modèle.
 fn run_batch<S: ServeStream>(batch: Vec<Queued<S>>, state: &mut ServeState) {
-    let (mut jobs, chats): (Vec<Job<S>>, Vec<BatchChat>) = batch
+    let mut jobs: Vec<(S, HttpRequest, Reservation)> = batch
         .into_iter()
-        .filter_map(|queued| queued.batch.map(|chat| (queued.job, chat)))
-        .unzip();
+        .map(|queued| {
+            let Job {
+                request,
+                stream,
+                _bytes,
+                waiting,
+            } = queued.job;
+            drop(waiting);
+            (stream, request, _bytes)
+        })
+        .collect();
     let mut sockets: Vec<(&mut S, &HttpRequest)> = jobs
         .iter_mut()
-        .map(|job| (&mut job.stream, &job.request))
+        .map(|(stream, request, _)| (stream, &*request))
         .collect();
-    handle_batch(state, &mut sockets, chats);
+    handle_batch(state, &mut sockets);
 }
 
 /// Exécute un job sur le thread moteur.
@@ -311,8 +331,15 @@ fn run_batch<S: ServeStream>(batch: Vec<Queued<S>>, state: &mut ServeState) {
 /// demi-fermeture (`shutdown(Write)` après la requête, client toujours à
 /// l'écoute), toutes deux vues comme EOF. En streaming, les premières
 /// écritures SSE échouent vite (EPIPE) et coupent la génération.
-fn run_job<S: ServeStream>(mut job: Job<S>, state: &mut ServeState) {
-    if let Err(error) = handle_job(&mut job.stream, state, job.request) {
+fn run_job<S: ServeStream>(job: Job<S>, state: &mut ServeState) {
+    let Job {
+        request,
+        mut stream,
+        _bytes,
+        waiting,
+    } = job;
+    drop(waiting);
+    if let Err(error) = handle_job(&mut stream, state, &request) {
         eprintln!("saragossa serve request error: {error}");
     }
 }
@@ -322,6 +349,7 @@ struct Connection<S> {
     front: Arc<Front>,
     jobs: SyncSender<Job<S>>,
     inflight_bytes: Arc<AtomicUsize>,
+    waiting: Arc<AtomicUsize>,
     limits: Arc<Limits>,
 }
 
@@ -353,10 +381,19 @@ impl<S: ServeStream> Connection<S> {
         read_or_reject(&mut stream, |s| {
             read_body(s, &mut request, content_length, deadline)
         })?;
+        let Some(waiting) = Reservation::acquire(&self.waiting, 1, self.limits.queue_depth) else {
+            return send_route_error(
+                &mut stream,
+                &request,
+                503,
+                "file d'inférence pleine, réessayer",
+            );
+        };
         let job = Job {
             request,
             stream,
             _bytes: bytes,
+            waiting,
         };
         match self.jobs.try_send(job) {
             Ok(()) => Ok(()),
@@ -442,9 +479,11 @@ mod tests {
             jobs,
             connections: Arc::new(AtomicUsize::new(0)),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            waiting: Arc::new(AtomicUsize::new(0)),
             limits: Arc::new(Limits {
                 max_connections,
                 max_inflight_bytes,
+                queue_depth: queue,
                 read_timeout: Duration::from_secs(5),
             }),
         };
@@ -559,6 +598,7 @@ mod tests {
                 request,
                 stream: server,
                 _bytes: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
+                waiting: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
             })
             .expect("invariant: file ouverte");
             clients.push(client);

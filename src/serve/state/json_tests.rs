@@ -235,7 +235,7 @@ fn json_lines_rejects_user_stop_sequences() {
     assert!(error.to_string().contains("json_lines"));
 }
 
-fn tiny_loaded_model() -> LoadedModel {
+pub(super) fn tiny_loaded_model() -> LoadedModel {
     tiny_loaded_model_with_vocab(r#"{"{}":0,"<pad>":1,"<eos>":2}"#, "{}")
 }
 
