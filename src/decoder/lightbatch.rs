@@ -201,14 +201,11 @@ impl CausalDecoder {
                 .collect());
         }
         let maxes = vec![max_new_tokens; prompts.len()];
-        self.generate_greedy_lightbatch_streaming_with_options(prompts, &maxes, options, |_, _| {
-            true
-        })
+        self.generate_greedy_lightbatch_streaming_with_options(prompts, &maxes, options, |_, _| {})
     }
 
     /// Variante streaming du light-batch (E2.5) : `on_token(flux, token)` est
-    /// appelé pour CHAQUE token émis, dans l'ordre d'émission de chaque flux ;
-    /// `false` arrête ce flux seul, après ce token —
+    /// appelé pour CHAQUE token émis, dans l'ordre d'émission de chaque flux —
     /// le flux 0 (principal, prioritaire) peut être consommé incrémentalement
     /// pendant que le flux de fond avance. `max_new_tokens` est PAR FLUX
     /// (chaque flux suit la sémantique solo avec SON budget). La priorité du
@@ -225,18 +222,24 @@ impl CausalDecoder {
         prompts: &[Vec<usize>],
         max_new_tokens: &[usize],
         options: &GenerationOptions,
-        on_token: impl FnMut(usize, usize) -> bool,
+        mut on_token: impl FnMut(usize, usize),
     ) -> Result<Vec<GenerationOutput>> {
+        // Signature publique historique conservée : l'arrêt par flux passe par
+        // `generate_greedy_lightbatch_streaming_counted`.
         self.generate_greedy_lightbatch_streaming_counted(
             prompts,
             max_new_tokens,
             options,
-            on_token,
+            |stream, token| {
+                on_token(stream, token);
+                true
+            },
         )
         .map(|(outputs, _)| outputs)
     }
 
-    /// [`Self::generate_greedy_lightbatch_streaming_with_options`] qui rend
+    /// [`Self::generate_greedy_lightbatch_streaming_with_options`] dont le
+    /// callback peut arrêter un flux seul (`false`, après ce token) et qui rend
     /// aussi le nombre de pas multi-flux dense encodés (N ≥ 2 flux en un
     /// command buffer) : 0 signifie que le lot est resté en time-slicing.
     ///
@@ -810,10 +813,7 @@ mod tests {
                 &prompts,
                 &maxes,
                 &options,
-                |stream, token| {
-                    streamed[stream].push(token);
-                    true
-                },
+                |stream, token| streamed[stream].push(token),
             )
             .expect("invariant: light-batch streaming valide");
 
@@ -901,9 +901,7 @@ mod tests {
         let options = GenerationOptions::default();
         let prompts = [vec![0_usize, 1], vec![1_usize]];
         let err = model
-            .generate_greedy_lightbatch_streaming_with_options(&prompts, &[4], &options, |_, _| {
-                true
-            })
+            .generate_greedy_lightbatch_streaming_with_options(&prompts, &[4], &options, |_, _| {})
             .expect_err("invariant: longueurs divergentes rejetées");
         assert!(matches!(err, InferError::Dimension(_)));
         let err = model
@@ -911,7 +909,7 @@ mod tests {
                 &prompts,
                 &[4, 0],
                 &options,
-                |_, _| true,
+                |_, _| {},
             )
             .expect_err("invariant: budget nul rejeté");
         assert!(matches!(err, InferError::Dimension(_)));
