@@ -420,14 +420,34 @@ impl DFlashSelector {
             };
             let mut scores = Vec::with_capacity(previous.len() * row_candidates.len());
             for prev in previous {
-                let gate = self.gate(prev, proj)?;
-                for &(token, unary) in row_candidates {
-                    scores.push(self.edge_score(&gate, token, unary)?);
-                }
+                scores.extend(self.edge_scores_from(proj, prev, row_candidates)?);
             }
             rows.push(scores);
         }
         Ok(rows)
+    }
+
+    /// Scores des arêtes `previous → candidat` d'UNE position (projection `proj` de
+    /// rang `rank`), dans l'ordre de `row_candidates` : une ligne du treillis de
+    /// [`Self::transition_scores`], calculée à la demande par la vérification en
+    /// arbre (seuls les nœuds développés paient leur ligne).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `proj` n'a pas `rank` valeurs ou si un token sort
+    /// du vocabulaire.
+    pub(crate) fn edge_scores_from(
+        &self,
+        proj: &[f32],
+        previous: usize,
+        row_candidates: &[(usize, f32)],
+    ) -> Result<Vec<f32>> {
+        self.check_projection(proj, 1)?;
+        let gate = self.gate(previous, proj)?;
+        row_candidates
+            .iter()
+            .map(|&(token, unary)| self.edge_score(&gate, token, unary))
+            .collect()
     }
 
     fn check_projection(&self, projected: &[f32], positions: usize) -> Result<()> {
