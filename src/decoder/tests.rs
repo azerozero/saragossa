@@ -2877,6 +2877,174 @@ fn mtp_early_first_token_streams_once_and_stops_real_model() -> Result<()> {
     Ok(())
 }
 
+// --- DFlash : vérification en arbre (GPU + modèle réel + draft) ---
+
+/// Vérification en arbre DFlash 2 sur le modèle réel :
+/// - la chaîne gloutonne passée par la plomberie arbre (scan arbre, rollback
+///   par chemin, compaction KV, rassemblement des hidden) redonne exactement la
+///   boucle en chaîne : tokens, statistiques et contexte du drafter ;
+/// - l'arbre best-first B=8 sort les tokens de l'AR et de la boucle CPU f32
+///   (code et prose), y compris sous KV bf16, arrêt par callback, stop token
+///   et petites limites de sortie ; B = 1, 4, 10, 12, 15 aussi, B = 16 refusé ;
+/// - le contexte du drafter (hidden des lignes du chemin) reste celui de la
+///   chaîne aux réductions près.
+///
+/// Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` et
+/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`.
+#[test]
+#[ignore = "modèle réel + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
+    use crate::decoder::resident::dflash::{DFlashTreeMode, DFLASH_APPENDED_CONTEXT};
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none() {
+        eprintln!("skip DFlash arbre: SARAGOSSA_RUST_DFLASH_DRAFT_DIR absent");
+        return Ok(());
+    }
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config("drafter DFlash non chargé".to_string()))?
+        .clone();
+    let block = draft.info.block_size;
+    let options = mtp_verifier_options(Vec::new());
+    let run = |prompt: &[usize], max_new: usize, options: &GenerationOptions, mode| {
+        model.generate_greedy_dflash_resident_tree(
+            prompt,
+            max_new,
+            options,
+            &draft,
+            block,
+            mode,
+            |_| true,
+        )
+    };
+    let recorded =
+        |prompt: &[usize], max_new: usize, mode| -> Result<(SpeculativeOutput, Vec<f32>)> {
+            DFLASH_APPENDED_CONTEXT.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+            let output = run(prompt, max_new, &options, mode);
+            let context = DFLASH_APPENDED_CONTEXT.with(|slot| slot.borrow_mut().take());
+            Ok((output?, context.unwrap_or_default()))
+        };
+    let cols = draft.info.target_layer_ids.len() * model.final_norm.len();
+    for text in [
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+        "Raconte en quelques phrases l'histoire d'un phare isolé sur une côte bretonne.",
+    ] {
+        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
+        let max_new = 64;
+        let ar = model.generate_greedy_cached_with_options(&prompt, max_new, &options)?;
+        let (chain, chain_context) = recorded(&prompt, max_new, DFlashTreeMode::Off)?;
+        let (plumbing, plumbing_context) = recorded(&prompt, max_new, DFlashTreeMode::Chain)?;
+        let (tree, tree_context) = recorded(&prompt, max_new, DFlashTreeMode::BestFirst(8))?;
+        eprintln!(
+            "DFlash arbre « {} » : chaîne {} acceptés / {} vérifiés, arbre B=8 {} / {} ({} tokens)",
+            &text[..20],
+            chain.stats.accepted,
+            chain.stats.proposed,
+            tree.stats.accepted,
+            tree.stats.proposed,
+            tree.tokens.len()
+        );
+        assert_eq!(chain.tokens, ar, "chaîne divergente de l'AR");
+        // Plomberie arbre en chaîne dégénérée : bit à bit la chaîne.
+        assert_eq!(plumbing.tokens, chain.tokens, "plomberie arbre : tokens");
+        assert_eq!(plumbing.stats.accepted, chain.stats.accepted);
+        assert_eq!(plumbing.stats.proposed, chain.stats.proposed);
+        assert_eq!(plumbing.stats.rejected, chain.stats.rejected);
+        assert_eq!(
+            plumbing.stats.accepted_by_position,
+            chain.stats.accepted_by_position
+        );
+        // Le dernier tour s'arrête à la limite de sortie : la chaîne appende
+        // encore ses lignes, l'arbre non (génération finie). Préfixe commun.
+        let common = plumbing_context.len().min(chain_context.len());
+        assert!(chain_context.len() - common <= (block + 1) * cols);
+        let first_diff = (0..common).find(|&i| plumbing_context[i].to_bits() != chain_context[i].to_bits());
+        assert_eq!(
+            first_diff.map(|i| (i / cols, i % cols)),
+            None,
+            "plomberie arbre : contexte du drafter (ligne, colonne) sur {} lignes",
+            common / cols
+        );
+        assert_eq!(tree.tokens, ar, "arbre B=8 divergent de l'AR");
+        // Oracle f32 : la boucle CPU de référence sort les mêmes tokens.
+        let cpu = model.generate_greedy_dflash_batched_with_options(
+            &prompt, max_new, &options, &draft, block,
+        )?;
+        assert_eq!(cpu.tokens, tree.tokens, "arbre B=8 contre la boucle CPU f32");
+        // Contexte du drafter : mêmes positions dans le même ordre, calculées
+        // dans des lots différents (écart de réduction seul). Une ligne mal
+        // rassemblée s'écarterait d'un ordre de grandeur.
+        let rows = chain_context.len().min(tree_context.len()) / cols;
+        assert!(rows > prompt.len(), "contexte du drafter trop court ({rows} lignes)");
+        let mut worst = 0.0_f32;
+        for row in 0..rows {
+            let range = row * cols..(row + 1) * cols;
+            let scale = chain_context[range.clone()]
+                .iter()
+                .fold(0.0_f32, |m, v| m.max(v.abs()))
+                .max(1.0);
+            let delta = chain_context[range.clone()]
+                .iter()
+                .zip(&tree_context[range])
+                .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()))
+                / scale;
+            worst = worst.max(delta);
+        }
+        eprintln!("DFlash arbre : écart relatif max du contexte drafter {worst:e} sur {rows} lignes");
+        assert!(worst <= 1.0e-3, "contexte du drafter divergent : {worst:e}");
+    }
+    // Bords : KV bf16 (compaction bf16), arrêt par callback, stop token, petites
+    // limites de sortie (profondeur bornée par les tokens restants).
+    let prompt = mtp_verifier_prompt_ids(
+        &assets,
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+    )?;
+    let ar = model.generate_greedy_cached_with_options(&prompt, 32, &options)?;
+    let bf16 = crate::decode_resident::with_kv_format_override(
+        crate::decode_resident::KvFormat::Bf16,
+        || run(&prompt, 32, &options, DFlashTreeMode::BestFirst(8)),
+    )?;
+    assert_eq!(bf16.tokens, ar, "arbre B=8 sous KV bf16");
+    let mut seen = 0usize;
+    let early = model.generate_greedy_dflash_resident_tree(
+        &prompt,
+        32,
+        &options,
+        &draft,
+        block,
+        DFlashTreeMode::BestFirst(8),
+        |_| {
+            seen += 1;
+            seen < 5
+        },
+    )?;
+    assert_eq!(early.tokens, ar[..5], "arbre : arrêt par callback");
+    let stop = ar[10];
+    let options_stop = mtp_verifier_options(vec![stop]);
+    let ar_stop = model.generate_greedy_cached_with_options(&prompt, 32, &options_stop)?;
+    let tree_stop = run(&prompt, 32, &options_stop, DFlashTreeMode::BestFirst(8))?;
+    assert_eq!(tree_stop.tokens, ar_stop, "arbre avec stop token");
+    for max_new in [1, 2, 3, 9] {
+        let tree = run(&prompt, max_new, &options, DFlashTreeMode::BestFirst(8))?;
+        assert_eq!(tree.tokens, ar[..max_new], "arbre, {max_new} tokens");
+    }
+    // Budgets sous la chaîne et au-delà (jusqu'aux 16 lignes du journal).
+    for budget in [1, 4, 10, 12, 15] {
+        let tree = run(&prompt, 32, &options, DFlashTreeMode::BestFirst(budget))?;
+        assert_eq!(tree.tokens, ar, "arbre B={budget}");
+    }
+    // Au-delà du journal (17 lignes) : refus explicite avant toute génération.
+    assert!(run(&prompt, 32, &options, DFlashTreeMode::BestFirst(16)).is_err());
+    Ok(())
+}
+
 // --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
 
 /// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
@@ -3224,6 +3392,7 @@ fn kv_quant_forced_logits(
                 chunk,
                 ResidentVerifyHead::Skip,
                 false,
+                None,
                 None,
             )?
             .ok_or_else(|| InferError::Config("vérification résidente non exercée".into()))?;
@@ -3603,7 +3772,9 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
     let base = cache.position;
     for (rows, capture) in [
         (9, true),
+        (11, true),
         (9, false),
+        (11, false),
         (13, false),
         (16, false),
         (17, false),
@@ -3621,6 +3792,7 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
                     crate::decoder::ResidentVerifyHead::Argmax,
                     capture,
                     Some(&layer_ids),
+                    None,
                 )?
                 .ok_or_else(|| InferError::Config("vérification indisponible".to_string()))?;
             if rep >= 2 {

@@ -545,7 +545,7 @@ impl MtpD1Kernels {
         for capture in [row0, pre] {
             // Une capture en journal ne contient pas l'état de sa ligne : seule
             // `restore_linear_attn_captures` sait la relire.
-            if capture.ssm_journal {
+            if capture.ssm_journal || capture.tree {
                 return Err(InferError::Config(
                     "rollback MTP linear-attn: capture en mode journal".to_string(),
                 ));
@@ -885,6 +885,7 @@ mod tests {
             key_head_dim: 1,
             ssm_bf16: true,
             ssm_journal: false,
+            tree: false,
         }
     }
 

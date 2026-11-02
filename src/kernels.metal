@@ -2952,6 +2952,129 @@ static inline float linear_attn_conv_k4_batch_channel(
     return acc / (1.0f + exp(-acc));
 }
 
+// Variante arbre (vérification DFlash) : le tap `k` lit l'ancêtre à distance
+// `3 − k` du token (lui-même, parent, grand-parent…) ; au-delà de la racine,
+// l'état conv initial comme pour `token < 3`. `tree` = [parents…, profondeurs…]
+// sur `batch` lignes. Une chaîne (parent = ligne − 1) relit `token − 3 + k` :
+// mêmes valeurs, même ordre d'accumulation.
+static inline float linear_attn_conv_k4_tree_channel(
+    device const float* qkv,
+    device const float* conv_weight,
+    device const float* conv_state0,
+    uint conv_dim,
+    uint qkv_stride,
+    uint channel,
+    uint token,
+    uint batch,
+    constant uint* tree
+) {
+    const uint w = channel * 4u;
+    float x[4];
+    uint node = token;
+    const int depth = int(tree[batch + token]);
+    for (int k = 3; k >= 0; k--) {
+        const int p = depth - (3 - k);
+        if (p >= 0) {
+            x[k] = qkv[node * qkv_stride + channel];
+            node = tree[node];
+        } else {
+            x[k] = conv_state0[uint(p + 3) * conv_dim + channel];
+        }
+    }
+    float acc = 0.0f;
+    for (int k = 0; k < 4; k++) {
+        acc += x[k] * conv_weight[w + uint(k)];
+    }
+    return acc / (1.0f + exp(-acc));
+}
+
+// Conv/normes/gates batchés d'un arbre de vérification : copie du kernel
+// `linear_attn_conv_norm_gates_k4_dk128_batch_f32` (laissé intact) aux taps
+// conv près, lus le long des parents.
+kernel void linear_attn_conv_norm_gates_k4_dk128_tree_f32(
+    device const float* qkv [[buffer(0)]],
+    device const float* beta_input [[buffer(1)]],
+    device const float* gate_input [[buffer(2)]],
+    device const float* conv_weight [[buffer(3)]],
+    device const float* conv_state0 [[buffer(4)]],
+    device const float* a_log [[buffer(5)]],
+    device const float* dt_bias [[buffer(6)]],
+    device float* conv_out [[buffer(7)]],
+    device float* q_norm [[buffer(8)]],
+    device float* k_norm [[buffer(9)]],
+    device float* beta [[buffer(10)]],
+    device float* decay [[buffer(11)]],
+    constant uint4& dims [[buffer(12)]],
+    constant float2& scales [[buffer(13)]],
+    constant uint& batch [[buffer(14)]],
+    constant uint2& strides [[buffer(15)]],
+    constant uint* tree [[buffer(16)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint key_heads = dims.x;
+    const uint value_heads = dims.y;
+    const uint key_head_dim = dims.z;
+    const uint value_head_dim = dims.w;
+    if (key_head_dim != 128u || value_head_dim != 128u) {
+        return;
+    }
+    const uint item = tg.x;
+    const uint token = tg.y;
+    if (token >= batch) {
+        return;
+    }
+    const uint key_dim = key_heads * 128u;
+    const uint conv_dim = (2u * key_dim) + (value_heads * 128u);
+    const uint qrow = token * key_dim;
+    const uint crow = token * conv_dim;
+    const uint grow = token * value_heads;
+    const uint qkv_stride = strides.x;
+    const uint gin = token * strides.y;
+
+    if (item < key_heads) {
+        const uint base = item * 128u;
+        const uint l0 = base + lane, l1 = l0 + 32u, l2 = l0 + 64u, l3 = l0 + 96u;
+        const uint k0c = key_dim + l0, k1c = key_dim + l1, k2c = key_dim + l2, k3c = key_dim + l3;
+        const float q0 = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l0, token, batch, tree);
+        const float q1 = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l1, token, batch, tree);
+        const float q2 = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l2, token, batch, tree);
+        const float q3 = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l3, token, batch, tree);
+        const float kk0 = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, k0c, token, batch, tree);
+        const float kk1 = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, k1c, token, batch, tree);
+        const float kk2 = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, k2c, token, batch, tree);
+        const float kk3 = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, k3c, token, batch, tree);
+        float q_ss = q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3;
+        float k_ss = kk0 * kk0 + kk1 * kk1 + kk2 * kk2 + kk3 * kk3;
+        const float q_inv = rsqrt(simd_sum(q_ss) / float(key_head_dim) + 1.0e-6f) * scales.x;
+        const float k_inv = rsqrt(simd_sum(k_ss) / float(key_head_dim) + 1.0e-6f) * scales.y;
+        q_norm[qrow + l0] = q0 * q_inv;
+        q_norm[qrow + l1] = q1 * q_inv;
+        q_norm[qrow + l2] = q2 * q_inv;
+        q_norm[qrow + l3] = q3 * q_inv;
+        k_norm[qrow + l0] = kk0 * k_inv;
+        k_norm[qrow + l1] = kk1 * k_inv;
+        k_norm[qrow + l2] = kk2 * k_inv;
+        k_norm[qrow + l3] = kk3 * k_inv;
+    }
+
+    if (item < value_heads) {
+        const uint vbase = (2u * key_dim) + (item * 128u);
+        const uint l0 = vbase + lane, l1 = l0 + 32u, l2 = l0 + 64u, l3 = l0 + 96u;
+        conv_out[crow + l0] = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l0, token, batch, tree);
+        conv_out[crow + l1] = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l1, token, batch, tree);
+        conv_out[crow + l2] = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l2, token, batch, tree);
+        conv_out[crow + l3] = linear_attn_conv_k4_tree_channel(qkv, conv_weight, conv_state0, conv_dim, qkv_stride, l3, token, batch, tree);
+        if (lane == 0u) {
+            const float b = beta_input[gin + item];
+            beta[grow + item] = 1.0f / (1.0f + exp(-b));
+            const float dt_arg = gate_input[gin + item] + dt_bias[item];
+            const float dt = (dt_arg > 20.0f) ? dt_arg : log(1.0f + exp(dt_arg));
+            decay[grow + item] = exp(-exp(a_log[item]) * dt);
+        }
+    }
+}
+
 kernel void linear_attn_conv_norm_gates_k4_dk128_batch_f32(
     device const float* qkv [[buffer(0)]],
     device const float* beta_input [[buffer(1)]],
@@ -3059,6 +3182,40 @@ kernel void linear_attn_conv_state_shift_f32(
     for (int k = 0; k < 3; k++) {
         const int p = batch - 3 + k;
         w[k] = (p >= 0) ? qkv[uint(p) * qkv_stride + gid] : src[uint(p + 3) * conv_dim + gid];
+    }
+    for (uint k = 0u; k < 3u; k++) {
+        state_out[k * conv_dim + gid] = w[k];
+    }
+}
+
+// Fenêtre conv après la ligne `dims.y` d'un arbre de vérification : ses trois
+// derniers taps (grand-parent, parent, elle-même) en suivant les parents, l'état
+// d'entrée au-delà de la racine. `tree` = [parents…, profondeurs…] sur `dims.w`
+// lignes. Pour une chaîne : `linear_attn_conv_state_shift_f32` à `batch = ligne + 1`.
+kernel void linear_attn_conv_state_tree_f32(
+    device const float* qkv [[buffer(0)]],
+    device const float* state_in [[buffer(1)]],
+    device float* state_out [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]], // (conv_dim, ligne, qkv_stride, lignes)
+    constant uint* tree [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint conv_dim = dims.x;
+    const uint qkv_stride = dims.z;
+    if (gid >= conv_dim) {
+        return;
+    }
+    uint node = dims.y;
+    const int depth = int(tree[dims.w + node]);
+    float w[3];
+    for (int k = 2; k >= 0; k--) {
+        const int p = depth - (2 - k);
+        if (p >= 0) {
+            w[k] = qkv[node * qkv_stride + gid];
+            node = tree[node];
+        } else {
+            w[k] = state_in[uint(p + 3) * conv_dim + gid];
+        }
     }
     for (uint k = 0u; k < 3u; k++) {
         state_out[k * conv_dim + gid] = w[k];
@@ -3293,8 +3450,9 @@ kernel void linear_attn_gated_delta_seq_dk128_tg4_f32(
     ssm_state[idx3] = state3;
 }
 
-// Lignes réservées dans le journal du scan (8 captures + la ligne finale).
-constant constexpr uint LINEAR_ATTN_JOURNAL_ROWS = 9u;
+// Lignes réservées dans le journal du scan : 8 captures + la ligne finale en
+// chaîne, jusqu'à 16 lignes d'un arbre de vérification DFlash (B ≤ 15).
+constant constexpr uint LINEAR_ATTN_JOURNAL_ROWS = 16u;
 
 // Variante du kernel précédent qui écrit aussi l'état SSM après chaque pas `t <
 // capture_count` dans `capture_t` (vérification en lignes : états intermédiaires
@@ -3454,16 +3612,151 @@ kernel void linear_attn_gated_delta_seq_capture_dk128_tg4_f32(
     ssm_state[idx3] = state3;
 }
 
+// Scan gated-delta d'un arbre de vérification (DFlash) : la ligne `t` part de
+// l'état de son parent (`parents[t]`, l'état d'entrée pour la racine) au lieu de
+// la ligne `t − 1`. Même arithmétique et même ordre que le kernel précédent le
+// long de chaque chemin : une chaîne redonne ses `y` et son journal bit à bit.
+// États des lignes en mémoire thread (`LINEAR_ATTN_JOURNAL_ROWS` × 4 floats).
+// Écrit `y` et le journal delta/k/decay de chaque ligne (même disposition) ;
+// l'état d'entrée reste intact : le rollback rejoue le chemin accepté depuis lui.
+kernel void linear_attn_gated_delta_tree_journal_dk128_tg4_f32(
+    device const float* conv_out [[buffer(0)]],
+    device const float* q_norm [[buffer(1)]],
+    device const float* k_norm [[buffer(2)]],
+    device const float* beta [[buffer(3)]],
+    device const float* decay [[buffer(4)]],
+    device const float* ssm_state [[buffer(5)]],
+    device float* y [[buffer(6)]],
+    constant uint4& dims [[buffer(7)]],
+    constant uint& steps [[buffer(8)]],
+    device float* journal [[buffer(9)]],
+    constant uint* parents [[buffer(10)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]
+) {
+    const uint value_heads = dims.x;
+    const uint value_head_dim = dims.y;
+    const uint key_head_dim = dims.z;
+    const uint repeat = dims.w;
+    const uint lane = tid.x;
+    const uint value_col = gid.y;
+    const uint value_head = gid.z;
+    if (value_head >= value_heads || value_col >= value_head_dim || repeat == 0u || lane >= 32u
+        || key_head_dim != 128u || steps > LINEAR_ATTN_JOURNAL_ROWS) {
+        return;
+    }
+
+    const uint key_heads = value_heads / repeat;
+    const uint key_dim = key_heads * 128u;
+    const uint value_dim = value_heads * value_head_dim;
+    const uint conv_dim = (2u * key_dim) + value_dim;
+    const uint key_head = value_head / repeat;
+    const uint key_base = key_head * 128u;
+    const uint value_index = value_head * value_head_dim + value_col;
+    const uint state_base = value_index * 128u;
+
+    const uint idx0 = state_base + lane;
+    const uint key0 = key_base + lane;
+    const uint key1 = key0 + 32u;
+    const uint key2 = key0 + 64u;
+    const uint key3 = key0 + 96u;
+    const uint journal_keys = LINEAR_ATTN_JOURNAL_ROWS * value_dim;
+    const uint journal_decay = journal_keys + LINEAR_ATTN_JOURNAL_ROWS * value_heads * 128u;
+    const uint journal_key_base = value_head * 128u + lane;
+
+    float nodes[LINEAR_ATTN_JOURNAL_ROWS][4];
+    for (uint t = 0u; t < steps; ++t) {
+        float state0;
+        float state1;
+        float state2;
+        float state3;
+        if (t == 0u) {
+            state0 = ssm_state[idx0];
+            state1 = ssm_state[idx0 + 32u];
+            state2 = ssm_state[idx0 + 64u];
+            state3 = ssm_state[idx0 + 96u];
+        } else {
+            const uint parent = parents[t];
+            state0 = nodes[parent][0];
+            state1 = nodes[parent][1];
+            state2 = nodes[parent][2];
+            state3 = nodes[parent][3];
+        }
+        const uint key_offset = t * key_dim;
+        const uint value_offset = t * value_dim;
+        const uint conv_offset = t * conv_dim;
+        const uint gate_offset = t * value_heads;
+        const float d = decay[gate_offset + value_head];
+        const float beta_v = beta[gate_offset + value_head];
+
+        state0 *= d;
+        state1 *= d;
+        state2 *= d;
+        state3 *= d;
+
+        const float k0 = k_norm[key_offset + key0];
+        const float k1 = k_norm[key_offset + key1];
+        const float k2 = k_norm[key_offset + key2];
+        const float k3 = k_norm[key_offset + key3];
+        float kv_part = 0.0f;
+        kv_part += state0 * k0;
+        kv_part += state1 * k1;
+        kv_part += state2 * k2;
+        kv_part += state3 * k3;
+        const float kv_mem = simd_sum(kv_part);
+        const float v = conv_out[conv_offset + (2u * key_dim) + value_index];
+        const float delta = (v - kv_mem) * beta_v;
+
+        state0 += delta * k0;
+        state1 += delta * k1;
+        state2 += delta * k2;
+        state3 += delta * k3;
+
+        const float q0 = q_norm[key_offset + key0];
+        const float q1 = q_norm[key_offset + key1];
+        const float q2 = q_norm[key_offset + key2];
+        const float q3 = q_norm[key_offset + key3];
+        float y_part = 0.0f;
+        y_part += state0 * q0;
+        y_part += state1 * q1;
+        y_part += state2 * q2;
+        y_part += state3 * q3;
+        const float out = simd_sum(y_part);
+        if (lane == 0u) {
+            y[value_offset + value_index] = out;
+            journal[value_offset + value_index] = delta;
+            if (value_col == 0u) {
+                journal[journal_decay + gate_offset + value_head] = d;
+            }
+        }
+        if (value_col == 0u) {
+            const uint key_slot = journal_keys + t * value_heads * 128u + journal_key_base;
+            journal[key_slot] = k0;
+            journal[key_slot + 32u] = k1;
+            journal[key_slot + 64u] = k2;
+            journal[key_slot + 96u] = k3;
+        }
+        nodes[t][0] = state0;
+        nodes[t][1] = state1;
+        nodes[t][2] = state2;
+        nodes[t][3] = state3;
+    }
+}
+
 // Rollback du mode journal : repart de l'état d'entrée (`initial`) et rejoue
 // `S *= d ; S += delta·k` sur `steps` pas avec le journal du kernel précédent. Même
 // arithmétique, même ordre et mêmes valeurs que le scan : état bit-identique à la
-// capture du pas `steps - 1`.
+// capture du pas `steps - 1`. `rows[t]` donne la ligne du journal du pas `t` :
+// `0..steps` en chaîne, le chemin accepté (racine comprise) pour un arbre, dont
+// l'état d'entrée est l'état lui-même (`initial` = `ssm_state`, chaque thread lit
+// ses quatre valeurs avant de les écrire).
 kernel void linear_attn_gated_delta_replay_dk128_tg4_f32(
     device const float* initial [[buffer(0)]],
     device const float* journal [[buffer(1)]],
     device float* ssm_state [[buffer(2)]],
     constant uint3& dims [[buffer(3)]],
     constant uint& steps [[buffer(4)]],
+    constant uint* rows [[buffer(5)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
@@ -3491,7 +3784,8 @@ kernel void linear_attn_gated_delta_replay_dk128_tg4_f32(
     float state1 = initial[idx1];
     float state2 = initial[idx2];
     float state3 = initial[idx3];
-    for (uint t = 0u; t < steps; ++t) {
+    for (uint step = 0u; step < steps; ++step) {
+        const uint t = rows[step];
         const float d = journal[journal_decay + t * value_heads + value_head];
         const float delta = journal[t * value_dim + value_index];
         const uint key_offset = journal_keys + t * value_heads * 128u;

@@ -432,8 +432,86 @@ impl MetalExecutor {
         Ok(())
     }
 
-    /// Rollback du mode journal : rejoue les `steps` premiers pas du journal depuis
-    /// l'état d'entrée et écrit l'état obtenu dans `ssm_state_buffer`.
+    /// Scan gated-delta d'un arbre de vérification (f32, dk128, mode journal) :
+    /// la ligne `t` part de l'état de `parents[t]` (état d'entrée pour la racine).
+    /// Écrit `y` et le journal delta/k/decay dans `journal_buffer` ; l'état
+    /// d'entrée `ssm_state_buffer` n'est que lu.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "buffers d'un pas linear-attn + journal et parents de l'arbre"
+    )]
+    pub(super) fn encode_linear_attn_gated_delta_tree_journal_dk128(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        conv_out_buffer: &BufferRef,
+        q_norm_buffer: &BufferRef,
+        k_norm_buffer: &BufferRef,
+        beta_buffer: &BufferRef,
+        decay_buffer: &BufferRef,
+        ssm_state_buffer: &BufferRef,
+        y_buffer: &BufferRef,
+        journal_buffer: &BufferRef,
+        parents: &[u32],
+        spec: LinearAttentionStepSpec,
+    ) -> Result<()> {
+        let steps = parents.len();
+        if steps == 0
+            || steps > super::linear_attention::LINEAR_ATTN_JOURNAL_ROWS
+            || spec.key_head_dim != 128
+        {
+            return Err(InferError::Dimension(format!(
+                "linear-attn scan arbre : {steps} lignes (max {}), key_head_dim={}",
+                super::linear_attention::LINEAR_ATTN_JOURNAL_ROWS,
+                spec.key_head_dim
+            )));
+        }
+        let repeat = spec
+            .num_value_heads
+            .checked_div(spec.num_key_heads)
+            .ok_or_else(|| InferError::Metal("linear-attn scan arbre repeat nul".to_string()))?;
+        let dims = [
+            checked_u32(spec.num_value_heads, "linear-attn scan arbre value heads")?,
+            checked_u32(spec.value_head_dim, "linear-attn scan arbre value dim")?,
+            checked_u32(spec.key_head_dim, "linear-attn scan arbre key dim")?,
+            checked_u32(repeat, "linear-attn scan arbre repeat")?,
+        ];
+        encoder
+            .set_compute_pipeline_state(&self.linear_attn_gated_delta_tree_journal_dk128_tg4_f32);
+        encoder.set_buffer(0, Some(conv_out_buffer), 0);
+        encoder.set_buffer(1, Some(q_norm_buffer), 0);
+        encoder.set_buffer(2, Some(k_norm_buffer), 0);
+        encoder.set_buffer(3, Some(beta_buffer), 0);
+        encoder.set_buffer(4, Some(decay_buffer), 0);
+        encoder.set_buffer(5, Some(ssm_state_buffer), 0);
+        encoder.set_buffer(6, Some(y_buffer), 0);
+        set_u32_bytes(encoder, 7, &dims, "linear_attn_tree_scan_dims")?;
+        set_u32_bytes(
+            encoder,
+            8,
+            &[checked_u32(steps, "linear-attn scan arbre steps")?],
+            "linear_attn_tree_scan_steps",
+        )?;
+        encoder.set_buffer(9, Some(journal_buffer), 0);
+        set_u32_bytes(encoder, 10, parents, "linear_attn_tree_scan_parents")?;
+        profile_dispatch();
+        let value_head_dim =
+            checked_nsuint(spec.value_head_dim, "linear-attn scan arbre value dim")?;
+        let tg_rows = linear_delta_tg_rows().min(value_head_dim);
+        encoder.dispatch_threads(
+            MTLSize::new(
+                LINEAR_ATTN_TG_WIDTH,
+                value_head_dim,
+                checked_nsuint(spec.num_value_heads, "linear-attn scan arbre value heads")?,
+            ),
+            MTLSize::new(LINEAR_ATTN_TG_WIDTH, tg_rows, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Rollback du mode journal : rejoue les lignes `rows` du journal (dans cet
+    /// ordre : `0..n` en chaîne, le chemin accepté d'un arbre) depuis l'état
+    /// d'entrée et écrit l'état obtenu dans `ssm_state_buffer`.
     pub(super) fn encode_linear_attn_gated_delta_replay_dk128(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -442,8 +520,15 @@ impl MetalExecutor {
         ssm_state_buffer: &BufferRef,
         num_value_heads: usize,
         value_head_dim: usize,
-        steps: usize,
+        rows: &[u32],
     ) -> Result<()> {
+        let journal_rows = super::linear_attention::LINEAR_ATTN_JOURNAL_ROWS;
+        if rows.is_empty() || rows.iter().any(|&row| row as usize >= journal_rows) {
+            return Err(InferError::Dimension(format!(
+                "linear-attn replay: lignes {rows:?} hors du journal ({journal_rows} lignes)"
+            )));
+        }
+        let steps = rows.len();
         let dims = [
             checked_u32(num_value_heads, "linear-attn replay value heads")?,
             checked_u32(value_head_dim, "linear-attn replay value dim")?,
@@ -460,6 +545,7 @@ impl MetalExecutor {
             &[checked_u32(steps, "linear-attn replay steps")?],
             "linear_attn_replay_steps",
         )?;
+        set_u32_bytes(encoder, 5, rows, "linear_attn_replay_rows")?;
         profile_dispatch();
         let value_head_dim = checked_nsuint(value_head_dim, "linear-attn replay value dim")?;
         let tg_rows = linear_delta_tg_rows().min(value_head_dim);
@@ -775,7 +861,16 @@ impl MetalExecutor {
         spec: LinearAttentionStepSpec,
         layout: LinearAttnBatchLayout,
         finalize_state: bool,
+        tree: Option<&[u32]>,
     ) -> Result<()> {
+        // Arbre de vérification : `[parents…, profondeurs…]` sur `batch` lignes ;
+        // l'état conv n'avance pas (chaque ligne a sa propre fenêtre).
+        if tree.is_some_and(|tree| tree.len() != 2 * batch || finalize_state) {
+            return Err(InferError::Dimension(format!(
+                "linear-attn conv arbre : {} valeurs pour {batch} lignes (finalize={finalize_state})",
+                tree.map_or(0, <[u32]>::len)
+            )));
+        }
         let dims = [
             checked_u32(spec.num_key_heads, "linear-attn batch key heads")?,
             checked_u32(spec.num_value_heads, "linear-attn batch value heads")?,
@@ -793,7 +888,14 @@ impl MetalExecutor {
         )?;
         let conv_dim = 2 * key_dim + value_dim;
         let batch_u32 = checked_u32(batch, "linear-attn batch")?;
-        encoder.set_compute_pipeline_state(&self.linear_attn_conv_norm_gates_k4_dk128_batch_f32);
+        encoder.set_compute_pipeline_state(if tree.is_some() {
+            &self.linear_attn_conv_norm_gates_k4_dk128_tree_f32
+        } else {
+            &self.linear_attn_conv_norm_gates_k4_dk128_batch_f32
+        });
+        if let Some(tree) = tree {
+            set_u32_bytes(encoder, 16, tree, "linear_attn_batch_conv_norm_tree")?;
+        }
         encoder.set_buffer(0, Some(qkv_buffer), 0);
         encoder.set_buffer(1, Some(beta_input_buffer), layout.beta_offset);
         encoder.set_buffer(2, Some(gate_input_buffer), layout.gate_offset);
@@ -878,6 +980,56 @@ impl MetalExecutor {
         encoder.dispatch_thread_groups(
             MTLSize::new(
                 checked_nsuint(conv_dim.div_ceil(64), "linear-attn shift groups")?,
+                1,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Fenêtre conv après la ligne `row` d'un arbre de vérification (taps le long
+    /// des parents, `state_in` au-delà de la racine) dans `state_out`, distinct
+    /// de `state_in`. `tree` = `[parents…, profondeurs…]`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "signature d'encodage Metal: buffers + dimensions + arbre"
+    )]
+    pub(super) fn encode_linear_attn_conv_state_tree(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        qkv_buffer: &BufferRef,
+        qkv_stride: usize,
+        state_in: &BufferRef,
+        state_out: &BufferRef,
+        conv_dim: usize,
+        row: usize,
+        tree: &[u32],
+    ) -> Result<()> {
+        let rows = tree.len() / 2;
+        if std::ptr::eq(state_in.as_ptr(), state_out.as_ptr()) || row >= rows || tree.len() % 2 != 0
+        {
+            return Err(InferError::Dimension(format!(
+                "linear-attn fenêtre conv arbre : ligne {row} sur {rows}, état en place interdit"
+            )));
+        }
+        let dims = [
+            checked_u32(conv_dim, "linear-attn conv arbre conv_dim")?,
+            checked_u32(row, "linear-attn conv arbre ligne")?,
+            checked_u32(qkv_stride, "linear-attn conv arbre qkv stride")?,
+            checked_u32(rows, "linear-attn conv arbre lignes")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.linear_attn_conv_state_tree_f32);
+        encoder.set_buffer(0, Some(qkv_buffer), 0);
+        encoder.set_buffer(1, Some(state_in), 0);
+        encoder.set_buffer(2, Some(state_out), 0);
+        set_u32_bytes(encoder, 3, &dims, "linear_attn_conv_tree_dims")?;
+        set_u32_bytes(encoder, 4, tree, "linear_attn_conv_tree")?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(conv_dim.div_ceil(64), "linear-attn conv arbre groups")?,
                 1,
                 1,
             ),

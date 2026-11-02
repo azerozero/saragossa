@@ -814,6 +814,36 @@ nœud (151 Mo chacun) ne sont pas le verrou : une transformée WY en arbre (Tree
 arXiv 2608.20961) ne garde que les pseudo-valeurs et reconstruit l'état accepté.
 Le plafond vient du coût des lignes et du gain d'acceptance borné.
 
+### Vérification en arbre DFlash 2 implémentée (2 nov. 2026, opt-in)
+
+`SARAGOSSA_RUST_DFLASH_TREE=B` (B ≤ 15, absent ou 0 = chaîne) reprend l'estimation
+ci-dessus avec la mesure de coût qui manquait : à B = 8 l'arbre garde les 9 lignes de
+la chaîne, le surcoût propre est le rollback par chemin à chaque tour (+0,2 ms), la
+construction CPU (0,05 ms) et la compaction KV. Le verdict « écartée » portait sur
+B = 15 ; B = 8 coûte la même vérification que la chaîne.
+
+Mise en œuvre : constructeur best-first (`src/decoder/resident/dflash_tree.rs`),
+attention en lignes masquée par ancêtres avec RoPE à base + profondeur (flash,
+2-passes, NAX), conv k4 et scan gated-delta par parent, journal SSM à 16 lignes et
+replay par chemin, compaction KV des lignes acceptées, contexte du drafter rassemblé
+sur le chemin. Refus explicite avant la boucle : KV quantifié, couches glissantes,
+SSM bf16, B > 15, trace d'arbre. Oracles : kernels arbre bit-identiques aux kernels
+chaîne sur chaque chemin, attention vs f64 (écart 1,3e-8, NAX 1,6e-6), chaîne
+dégénérée bit-identique au chemin historique, tokens = AR pour B = 1..15.
+
+Pairwise flag 0 contre 8, même binaire, ABBA, 3 paires, 400 tokens greedy, textes
+identiques partout (médiane de decode, tok/s) :
+
+| Cas | Chaîne | Arbre B = 8 | Gain par paire | Médiane |
+|---|---|---|---|---|
+| code 4k | 49,6 | 57,0 | +14,6 / +15,9 / +14,9 % | +14,9 % |
+| prose 4k | 38,8 | 45,8 | +20,1 / +12,4 / +21,5 % | +20,1 % |
+| code 32k | 45,0 | 50,8 | +15,5 / +12,9 / +12,0 % | +12,9 % |
+| prose 32k | 43,1 | 48,4 | +14,3 / +12,3 / +13,5 % | +13,5 % |
+
+B = 12 (13 lignes) ajoute ~5,5 ms de vérification pour un débit voisin de B = 8 (une
+exécution). Reste opt-in comme le drafter DFlash lui-même.
+
 ### Captures SSM en journal de pseudo-valeurs (1er nov. 2026, opt-in)
 
 `SARAGOSSA_RUST_LINEAR_CAPTURE_JOURNAL=1` : le scan fusionné de la vérification en

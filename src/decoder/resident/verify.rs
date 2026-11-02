@@ -36,6 +36,11 @@ impl CausalDecoder {
         })
     }
 
+    /// Vérification résidente de `token_ids` en lignes. `tree` (DFlash) : les
+    /// lignes forment cet arbre (positions par profondeur, attention et états
+    /// linéaires par ancêtres) ; exige le chemin batché et des captures, laisse
+    /// les états linéaires d'entrée intacts (rollback obligatoire, cf.
+    /// `restore_tree_resident_progress`).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(in crate::decoder) fn next_final_states_resident_verify(
         &self,
@@ -44,9 +49,18 @@ impl CausalDecoder {
         head: ResidentVerifyHead,
         capture_linear: bool,
         capture_layer_ids: Option<&[usize]>,
+        tree: Option<std::rc::Rc<crate::metal_backend::VerifyTree>>,
     ) -> Result<Option<ResidentVerifyOutput>> {
         if token_ids.is_empty() {
             return Ok(None);
+        }
+        if let Some(tree) = &tree {
+            tree.check_rows(token_ids.len(), "vérification résidente")?;
+            if !capture_linear {
+                return Err(InferError::Config(
+                    "vérification en arbre sans captures linéaires".to_string(),
+                ));
+            }
         }
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
@@ -90,6 +104,11 @@ impl CausalDecoder {
 
         let layer_batch_supported =
             token_ids.len() > 1 && self.resident_layer_batch_supported(arena);
+        if tree.is_some() && !layer_batch_supported {
+            return Err(InferError::Config(
+                "vérification en arbre: couches en lignes requises".to_string(),
+            ));
+        }
         if layer_batch_supported {
             let base_position = *cache_position;
             let embed = self.embed_scaled(token_ids)?;
@@ -134,7 +153,13 @@ impl CausalDecoder {
                 None
             };
             let linear_captures = if capture_linear {
-                let capture_rows = batch.saturating_sub(1);
+                // Arbre : une capture par ligne (la feuille acceptée peut être la
+                // dernière) ; chaîne : la dernière ligne vit dans l'état lui-même.
+                let capture_rows = if tree.is_some() {
+                    batch
+                } else {
+                    batch.saturating_sub(1)
+                };
                 if capture_rows == 0 {
                     None
                 } else {
@@ -146,6 +171,7 @@ impl CausalDecoder {
                         arena.state.scratch(),
                         &linear_states,
                         capture_rows,
+                        tree.is_some(),
                     )?)
                 }
             } else {
@@ -156,6 +182,7 @@ impl CausalDecoder {
                 .then(crate::metal_backend::install_dispatch_barrier_scope);
             let _namespace_guard =
                 crate::metal_backend::install_scratch_namespace(arena.state.scratch_namespace());
+            let _tree_guard = tree.map(crate::metal_backend::install_verify_tree_scope);
             let encoder = new_resident_compute_encoder(command_buffer);
             let mut owned: Vec<metal::Buffer> = Vec::new();
             let mut current = batch_a.tensor().buffer();

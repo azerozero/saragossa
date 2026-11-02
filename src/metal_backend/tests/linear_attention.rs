@@ -583,7 +583,8 @@ fn linear_attn_gated_delta_seq_capture_dk128_matches_step_loop_states() -> Resul
             &restored,
             spec.num_value_heads,
             spec.value_head_dim,
-            row + 1,
+            &(0..=u32::try_from(row).map_err(|_| InferError::Dimension("ligne".into()))?)
+                .collect::<Vec<_>>(),
         )?;
         encoder.end_encoding();
         commit_and_wait(command_buffer)?;

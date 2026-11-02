@@ -111,6 +111,12 @@ mod sparse;
 mod tests;
 #[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
 mod transfer;
+// Arbre de vérification DFlash : construit par la boucle DFlash (devtools).
+#[cfg_attr(
+    not(feature = "devtools"),
+    expect(dead_code, reason = "arbre construit par la boucle DFlash (devtools)")
+)]
+mod verify_tree;
 mod whisper_encode;
 
 #[doc(hidden)]
@@ -129,6 +135,10 @@ pub(crate) use self::flags::resident_concurrent_enabled;
 pub(crate) use self::lightbatch_duo::{
     begin_expert_indices_collection, take_expert_indices_collection, DuoSampleParams,
 };
+#[cfg(feature = "devtools")]
+pub(crate) use self::linear_attention::linear_tree_journal_refusal;
+#[cfg(test)]
+pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) use self::matmul::take_concat_profile;
 pub(crate) use self::matmul::{whisper_bf16_gemm_enabled, whisper_decode_bf16_qmv_enabled};
@@ -142,6 +152,7 @@ pub use self::profiling::{
 };
 pub(crate) use self::profiling::{profile_dispatch, profile_dispatch_shape, trace_dispatch_path};
 pub(crate) use self::scratch::install_scratch_namespace;
+pub(crate) use self::verify_tree::{install_verify_tree_scope, verify_tree, VerifyTree};
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
@@ -240,6 +251,11 @@ pub struct MetalExecutor {
     linear_attn_conv_norm_gates_k4_dk128_f32: ComputePipelineState,
     linear_attn_conv_norm_gates_k4_dk128_batch_f32: ComputePipelineState,
     linear_attn_conv_state_shift_f32: ComputePipelineState,
+    /// Vérification en arbre (DFlash) : conv par ancêtres, fenêtre conv d'une
+    /// ligne et scan gated-delta par parent.
+    linear_attn_conv_norm_gates_k4_dk128_tree_f32: ComputePipelineState,
+    linear_attn_conv_state_tree_f32: ComputePipelineState,
+    linear_attn_gated_delta_tree_journal_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_f32: ComputePipelineState,
     linear_attn_gated_delta_dk128_tg4_f32: ComputePipelineState,
     linear_attn_gated_delta_seq_dk128_tg4_f32: ComputePipelineState,
@@ -682,6 +698,11 @@ pub(crate) struct LinearAttentionMetalState {
     /// delta/k/decay ; les `ssm` des captures suivantes ne sont pas écrits. Faux
     /// partout ailleurs.
     ssm_journal: bool,
+    /// Série de captures d'un arbre de vérification (DFlash) : le `ssm` de la
+    /// capture 0 reçoit le journal du scan arbre (l'état d'entrée reste dans
+    /// l'état lui-même), chaque capture `r` la fenêtre conv après la ligne `r`.
+    /// Les `ssm` des captures suivantes ne sont jamais lus ni écrits.
+    tree: bool,
 }
 
 impl LinearAttentionMetalState {

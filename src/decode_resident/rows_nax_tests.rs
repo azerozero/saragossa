@@ -18,7 +18,7 @@ fn gpu_state() -> Result<DecodeResidentState> {
 }
 
 fn nax(state: &DecodeResidentState, head_dim: usize) -> Result<RowsNax> {
-    RowsNax::compile(state.device(), head_dim)?
+    RowsNax::compile(state.device(), head_dim, false)?
         .ok_or_else(|| InferError::Metal(format!("NAX d{head_dim} indisponible sur ce device")))
 }
 
