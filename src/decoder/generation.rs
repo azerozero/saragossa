@@ -4342,6 +4342,10 @@ impl CausalDecoder {
     /// bascule retrouve alors l'entrée du cache de préfixe au lieu de re-préremplir
     /// prompt + généré. `None` sans bascule, sans sidecar MTP ou hors politique
     /// committed.
+    ///
+    /// NOTE: semé aussi pour une requête avec stop sequences, pour laquelle la
+    /// boucle résidente coupe pourtant la bascule ; le prefill ne voit pas les
+    /// options et l'entrée reste utile aux requêtes suivantes du même préfixe.
     #[cfg(feature = "devtools")]
     fn dflash_switch_mtp_history(
         &self,
@@ -5328,7 +5332,11 @@ impl CausalDecoder {
     }
 }
 
-fn generated_matches_stop_sequence(generated: &[usize], stop_sequences: &[Vec<usize>]) -> bool {
+/// Indique si `generated` se termine par une stop sequence non vide.
+pub(in crate::decoder) fn generated_matches_stop_sequence(
+    generated: &[usize],
+    stop_sequences: &[Vec<usize>],
+) -> bool {
     stop_sequences
         .iter()
         .any(|sequence| !sequence.is_empty() && generated.ends_with(sequence))
