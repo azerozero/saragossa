@@ -144,3 +144,33 @@ fn budget_reached_finishes_stream_with_length() {
         Some("0:done:length")
     );
 }
+
+/// Un sous-lot réduit à une requête part en solo SANS session : une
+/// requête-session (clé d'en-tête) n'y est admise que si ce solo est le MTP.
+#[test]
+fn batched_session_request_alone_would_be_served_by_mtp() {
+    let mut loaded = tiny_loaded_model();
+    loaded.mtp_active = true;
+    for (stop, admitted) in [("", true), (r#","stop":"{}""#, false)] {
+        let body = format!(
+            r#"{{"model":"tiny","messages":[{{"role":"user","content":"x"}}],"stream":true{stop}}}"#
+        );
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nx-saragossa-session: s1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let http =
+            super::super::http::read_request(&mut std::io::Cursor::new(raw.into_bytes()), deadline)
+                .expect("invariant: requête lisible")
+                .expect("invariant: requête présente");
+        let batched = super::super::http::batch_chat(&http, 1024, |_| loaded.mtp_active);
+        assert_eq!(batched.is_some(), admitted, "stop {stop}");
+        let chat: ChatCompletionRequest =
+            serde_json::from_str(&body).expect("invariant: requête test valide");
+        let prepared = loaded
+            .prepare(&chat, 4)
+            .expect("invariant: requête préparée");
+        assert_eq!(loaded.routes_mtp(&chat, &prepared), admitted, "stop {stop}");
+    }
+}

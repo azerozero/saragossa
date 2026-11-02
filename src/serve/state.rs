@@ -294,7 +294,9 @@ impl ServeState {
             let (chunk, tail) = rest.split_at(take);
             rest = tail;
             if let [(slot, _)] = chunk {
-                // NOTE: seul dans son sous-lot (mémoire) : chemin solo inchangé.
+                // NOTE: seul dans son sous-lot (mémoire) : chemin solo inchangé,
+                // sans session. Une requête-session n'arrive ici que si le solo
+                // la servirait en MTP, qui ignore la session (cf. `batch_chat`).
                 let Some(request) = requests[*slot].take() else {
                     continue;
                 };
@@ -330,6 +332,16 @@ impl ServeState {
             })
             .collect();
         (results, multi_steps)
+    }
+
+    /// Le modèle `model` est-il chargé avec son decode MTP actif ? Ne charge
+    /// rien : un modèle absent répond `false`.
+    pub(super) fn model_routes_mtp(&self, model: &str) -> bool {
+        self.models
+            .iter()
+            .find(|slot| slot.id == model)
+            .and_then(|slot| slot.loaded.as_ref())
+            .is_some_and(|loaded| loaded.mtp_active)
     }
 
     /// Le modèle `model` écrit-il au format flint (`<think>`, `<tool_call>`
@@ -629,6 +641,13 @@ struct CompletionPath {
 }
 
 impl LoadedModel {
+    /// Le solo sert-il `request` en MTP ? Même règle en non-stream et stream.
+    fn routes_mtp(&self, request: &ChatCompletionRequest, prepared: &PreparedRequest) -> bool {
+        self.mtp_active
+            && mtp::routes_request(request, prepared.response_format)
+            && mtp::supports_options(&prepared.options)
+    }
+
     fn complete(
         &mut self,
         request: ChatCompletionRequest,
@@ -640,14 +659,11 @@ impl LoadedModel {
         let PreparedRequest {
             tokens: prompt_tokens_ids,
             options,
-            response_format,
             ..
         } = &prepared;
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
-        let use_mtp = self.mtp_active
-            && mtp::routes_request(&request, *response_format)
-            && mtp::supports_options(options);
+        let use_mtp = self.routes_mtp(&request, &prepared);
         let (output, reused_prefix_tokens, prefix_cache) = if use_mtp {
             // NOTE: v1 MTP assume son propre prefill via le prefix-cache du
             // décodeur (longest-prefix + extension). Il by-passe donc les
@@ -711,15 +727,12 @@ impl LoadedModel {
             tokens: prompt_tokens_ids,
             options,
             stop_texts,
-            response_format,
             ..
         } = &prepared;
         let prompt_tokens = prompt_tokens_ids.len();
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
-        let use_mtp = self.mtp_active
-            && mtp::routes_request(&request, *response_format)
-            && mtp::supports_options(options);
+        let use_mtp = self.routes_mtp(&request, &prepared);
         let (prompt_state, mut reused_prefix_tokens, prefill) = if use_mtp {
             (None, 0, Duration::ZERO)
         } else {
@@ -918,7 +931,7 @@ impl LoadedModel {
     ///
     /// NOTE: le prefill passe par le cache longest-prefix du décodeur, comme
     /// MTP, pas par les snapshots par blocs de serve (les requêtes avec
-    /// session restent en solo).
+    /// session restent en solo, sauf celles que le solo servirait en MTP).
     fn complete_lightbatch(
         &self,
         streams: &[&PreparedRequest],

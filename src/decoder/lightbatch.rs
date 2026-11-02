@@ -610,21 +610,31 @@ impl CausalDecoder {
             return false;
         }
         if options.stop_token_ids.contains(&stream.token) {
-            stream.done = true;
+            self.finish_lightbatch_stream(stream);
             return false;
         }
         stream.generated.push(stream.token);
         // Le consommateur arrête CE flux (client parti, stop texte) : les
         // autres continuent, le pas multi suivant ne compte que les vivants.
         if !on_token(stream.index, stream.token) {
-            stream.done = true;
+            self.finish_lightbatch_stream(stream);
             return false;
         }
         if stream.step + 1 >= stream.max_new {
-            stream.done = true;
+            self.finish_lightbatch_stream(stream);
             return false;
         }
         true
+    }
+
+    /// Marque le flux fini et libère tout de suite son KV et son arène
+    /// résidente : un flux fini n'est plus jamais décodé (pas solo, duo et
+    /// multi ne prennent que des flux vivants, le multi l'arène du premier
+    /// vivant) et la sortie ne lit que `generated` et les compteurs. Sans
+    /// cela, la mémoire d'un flux court reste tenue jusqu'à la fin du lot.
+    fn finish_lightbatch_stream(&self, stream: &mut LightBatchStream) {
+        stream.done = true;
+        stream.cache = self.empty_cache();
     }
 
     /// Décode le prochain token d'UN flux (chemin solo) et met à jour ses
@@ -763,6 +773,27 @@ mod tests {
 
         assert_eq!(batch[0].tokens, solo_a, "flux A divergent du solo");
         assert_eq!(batch[1].tokens, solo_b, "flux B divergent du solo");
+    }
+
+    /// Un flux fini rend son KV tout de suite, les autres gardent le leur.
+    #[test]
+    fn lightbatch_finished_stream_releases_its_cache() {
+        let model = tiny_model();
+        let options = GenerationOptions::default();
+        let mut stream = model
+            .prefill_lightbatch_stream(&[0, 1], 4, &options, 0)
+            .expect("invariant: prefill valide");
+        assert!(stream.cache.position > 0);
+        assert!(model.resolve_lightbatch_push(&mut stream, &options, &mut |_, _| true));
+        assert!(stream.cache.position > 0, "flux vivant: KV conservé");
+        assert!(!model.resolve_lightbatch_push(&mut stream, &options, &mut |_, _| false));
+        assert!(stream.done);
+        assert_eq!(stream.cache.position, 0);
+        assert!(stream
+            .cache
+            .layers
+            .iter()
+            .all(|layer| layer.keys.len() == 0));
     }
 
     /// Le stop-token interrompt chaque flux indépendamment, comme en solo.
