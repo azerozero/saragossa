@@ -146,12 +146,13 @@ fn budget_reached_finishes_stream_with_length() {
 }
 
 /// Un sous-lot réduit à une requête part en solo SANS session : une
-/// requête-session (clé d'en-tête) n'y est admise que si ce solo est le MTP.
+/// requête-session (clé d'en-tête) n'y est admise que si ce solo est le MTP,
+/// `stop` compris.
 #[test]
 fn batched_session_request_alone_would_be_served_by_mtp() {
     let mut loaded = tiny_loaded_model();
     loaded.mtp_active = true;
-    for (stop, admitted) in [("", true), (r#","stop":"{}""#, false)] {
+    for (stop, admitted) in [("", true), (r#","stop":"{}""#, true)] {
         let body = format!(
             r#"{{"model":"tiny","messages":[{{"role":"user","content":"x"}}],"stream":true{stop}}}"#
         );

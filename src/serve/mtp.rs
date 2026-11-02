@@ -39,22 +39,14 @@ fn temperature_supported(temperature: f32, sampled: bool) -> bool {
 /// l'AR, séquence incluse).
 ///
 /// NOTE: une stop texte est tokenisée seule (`LoadedModel::stop_sequences`) ;
-/// si le modèle l'écrit avec une autre découpe, l'arrêt sur ids manque et seul
-/// le filtre texte de serve la retire, sans arrêt précoce, comme en AR.
+/// si le modèle l'écrit avec une autre découpe, l'arrêt sur ids manque et le
+/// filtre texte de serve la retire, en arrêtant le decode en streaming.
 pub(crate) fn supports_options(options: &saragossa::GenerationOptions) -> bool {
     supports_options_with(options, saragossa::runtime_flags::mtp_sampled_enabled())
 }
 
 fn supports_options_with(options: &saragossa::GenerationOptions, sampled: bool) -> bool {
     temperature_supported(options.temperature, sampled) && options.token_constraint.is_none()
-}
-
-/// Les `stop` de la requête laissent-ils le MTP servir ? Pendant, au niveau
-/// requête, du refus de `stop_sequences` par [`supports_options_with`] : le lot
-/// de serve s'en sert pour savoir, avant `prepare`, si le solo prendrait le
-/// MTP. Toute évolution de l'un se reporte sur l'autre (test d'équivalence).
-pub(super) fn request_stops_supported(request: &ChatCompletionRequest) -> bool {
-    request.stop_texts().is_empty()
 }
 
 /// Indique si une requête doit emprunter le chemin MTP.
@@ -195,37 +187,6 @@ mod tests {
             ResponseFormatMode::Text,
             false
         ));
-    }
-
-    /// Verrou : le prédicat requête suit `supports_options_with` sur des
-    /// options dont les `stop_sequences` dérivent des mêmes `stop`.
-    #[test]
-    fn request_stops_predicate_matches_options_predicate() {
-        for stop in [
-            "",
-            r#","stop":"x""#,
-            r#","stop":["a","b"]"#,
-            r#","stop":[]"#,
-            r#","stop":[""]"#,
-        ] {
-            let chat = request(&format!(r#"{{"model":"m","messages":[]{stop}}}"#));
-            let options = saragossa::GenerationOptions {
-                temperature: 0.0,
-                stop_sequences: chat
-                    .stop_texts()
-                    .iter()
-                    .map(|text| text.bytes().map(usize::from).collect())
-                    .collect(),
-                ..Default::default()
-            };
-            for sampled in [false, true] {
-                assert_eq!(
-                    request_stops_supported(&chat),
-                    supports_options_with(&options, sampled),
-                    "stop {stop}"
-                );
-            }
-        }
     }
 
     #[test]

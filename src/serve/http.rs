@@ -300,9 +300,9 @@ impl BatchChat {
 ///
 /// NOTE: une requête avec session garde le solo et son cache de préfixe par
 /// blocs ; dans un lot, elle perdrait le TTFT de son tour suivant. Sauf quand
-/// le solo la servirait en MTP (modèle MTP, `mtp::routes_request` et
-/// `mtp::request_stops_supported`) : ce chemin ignore déjà la session (cf.
-/// `complete_streaming`), le lot ne perd rien.
+/// le solo la servirait en MTP (modèle MTP et `mtp::routes_request`, `stop`
+/// compris) : ce chemin ignore déjà la session (cf. `complete_streaming`), le
+/// lot ne perd rien ; ses stops texte arrêtent le flux (`drive_batch`).
 pub(super) fn batch_chat(
     request: &HttpRequest,
     max_tokens_cap: usize,
@@ -324,11 +324,8 @@ pub(super) fn batch_chat(
     };
     // `batchable` garantit greedy et texte libre ; le solo prend alors le MTP
     // si le modèle l'a et que ses options l'admettent.
-    let session_ignored = || {
-        mtp_model(&chat.model)
-            && super::mtp::request_stops_supported(&chat)
-            && super::mtp::routes_request(&chat, ResponseFormatMode::Text)
-    };
+    let session_ignored =
+        || mtp_model(&chat.model) && super::mtp::routes_request(&chat, ResponseFormatMode::Text);
     (stream && chat.batchable(max_tokens_cap) && (session_key.is_none() || session_ignored()))
         .then_some(BatchChat { chat, anthropic })
 }
@@ -950,8 +947,7 @@ mod tests {
     }
 
     /// Avec session, le lot n'admet que ce que le solo servirait en MTP, qui
-    /// ignore déjà la session : modèle MTP chargé et `stop` refusés par
-    /// `mtp::request_stops_supported`.
+    /// ignore déjà la session : modèle MTP chargé, `stop` compris.
     #[test]
     fn batch_chat_admits_session_only_when_solo_would_route_mtp() {
         let chat = |extra: &str| {
@@ -964,7 +960,8 @@ mod tests {
 
         assert!(batch_chat(&chat(""), 1024, mtp).is_some());
         assert!(batch_chat(&chat(""), 1024, |_| false).is_none());
-        assert!(batch_chat(&chat(r#","stop":"fin""#), 1024, mtp).is_none());
+        assert!(batch_chat(&chat(r#","stop":"fin""#), 1024, mtp).is_some());
+        assert!(batch_chat(&chat(r#","stop":"fin""#), 1024, |_| false).is_none());
         let body = r#"{"model":"m","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"x"}]}"#;
         let raw = format!(
             "POST /v1/messages HTTP/1.1\r\n{SESSION_HEADER}: s1\r\nContent-Length: {}\r\n\r\n{body}",
