@@ -34,15 +34,19 @@ fn temperature_supported(temperature: f32, sampled: bool) -> bool {
 }
 
 /// Le MTP vérifie le greedy non contraint et, par défaut, l'échantillonnage
-/// (accept/reject lossless) ; `SARAGOSSA_RUST_MTP_SAMPLED=0` le coupe.
+/// (accept/reject lossless) ; `SARAGOSSA_RUST_MTP_SAMPLED=0` le coupe. Les
+/// stop sequences sont tenues par le cœur MTP comme par DFlash (sortie de
+/// l'AR, séquence incluse).
+///
+/// NOTE: une stop texte est tokenisée seule (`LoadedModel::stop_sequences`) ;
+/// si le modèle l'écrit avec une autre découpe, l'arrêt sur ids manque et seul
+/// le filtre texte de serve la retire, sans arrêt précoce, comme en AR.
 pub(crate) fn supports_options(options: &saragossa::GenerationOptions) -> bool {
     supports_options_with(options, saragossa::runtime_flags::mtp_sampled_enabled())
 }
 
 fn supports_options_with(options: &saragossa::GenerationOptions, sampled: bool) -> bool {
-    temperature_supported(options.temperature, sampled)
-        && options.token_constraint.is_none()
-        && options.stop_sequences.is_empty()
+    temperature_supported(options.temperature, sampled) && options.token_constraint.is_none()
 }
 
 /// Les `stop` de la requête laissent-ils le MTP servir ? Pendant, au niveau
@@ -225,13 +229,18 @@ mod tests {
     }
 
     #[test]
-    fn options_reject_custom_stop_sequences() {
+    fn options_accept_custom_stop_sequences() {
         let options = saragossa::GenerationOptions {
             temperature: 0.0,
             stop_sequences: vec![vec![1, 2]],
             ..Default::default()
         };
-        assert!(!supports_options(&options));
+        assert!(supports_options_with(&options, false));
+        let sampled = saragossa::GenerationOptions {
+            temperature: 0.7,
+            ..options
+        };
+        assert!(supports_options_with(&sampled, true));
     }
 
     #[test]
