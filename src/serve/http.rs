@@ -300,8 +300,9 @@ impl BatchChat {
 ///
 /// NOTE: une requête avec session garde le solo et son cache de préfixe par
 /// blocs ; dans un lot, elle perdrait le TTFT de son tour suivant. Sauf quand
-/// le solo la servirait en MTP (modèle MTP, texte, sans `stop`) : ce chemin
-/// ignore déjà la session (cf. `complete_streaming`), le lot ne perd rien.
+/// le solo la servirait en MTP (modèle MTP, `mtp::routes_request` et
+/// `mtp::request_stops_supported`) : ce chemin ignore déjà la session (cf.
+/// `complete_streaming`), le lot ne perd rien.
 pub(super) fn batch_chat(
     request: &HttpRequest,
     max_tokens_cap: usize,
@@ -322,10 +323,10 @@ pub(super) fn batch_chat(
         _ => return None,
     };
     // `batchable` garantit greedy et texte libre ; le solo prend alors le MTP
-    // si le modèle l'a et qu'aucun `stop` ne coupe ses options.
+    // si le modèle l'a et que ses options l'admettent.
     let session_ignored = || {
         mtp_model(&chat.model)
-            && chat.stop_texts().is_empty()
+            && super::mtp::request_stops_supported(&chat)
             && super::mtp::routes_request(&chat, ResponseFormatMode::Text)
     };
     (stream && chat.batchable(max_tokens_cap) && (session_key.is_none() || session_ignored()))
@@ -949,7 +950,8 @@ mod tests {
     }
 
     /// Avec session, le lot n'admet que ce que le solo servirait en MTP, qui
-    /// ignore déjà la session : modèle MTP chargé, sans `stop`.
+    /// ignore déjà la session : modèle MTP chargé et `stop` refusés par
+    /// `mtp::request_stops_supported`.
     #[test]
     fn batch_chat_admits_session_only_when_solo_would_route_mtp() {
         let chat = |extra: &str| {
