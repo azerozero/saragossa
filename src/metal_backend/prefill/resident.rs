@@ -1839,49 +1839,6 @@ impl MetalExecutor {
                 PrefillResidentTailShape::Shared { weights },
                 PrefillResidentTailScratch::Shared,
             ) => {
-                // Routeur et top-k recalculés sur l'entrée post-normée, comme le
-                // fait le MoE shared lui-même : trace des experts (Qwen MoE).
-                #[cfg(test)]
-                if ROUTER_CAPTURE.with(|capture| capture.borrow().is_some()) {
-                    let expert_count = self
-                        .check_moe_shared_buffer_shapes(hidden_dim, &weights, top_k)?
-                        .expert_count;
-                    let logits_len = checked_len(spec.seq, expert_count, "capture routeur")?;
-                    let total_topk = checked_len(spec.seq, top_k, "capture top-k")?;
-                    let logits = self.uncached_f32_buffer(logits_len, "router_logits_capture")?;
-                    let indices = self.uncached_u32_buffer(total_topk, "router_indices_capture")?;
-                    let scores = self.uncached_f32_buffer(total_topk, "router_scores_capture")?;
-                    self.run_resident_prefill_section(context, "router_capture", |encoder, _| {
-                        self.encode_matmul_weight_buffers(
-                            encoder,
-                            post_normed_buffer,
-                            spec.seq,
-                            hidden_dim,
-                            &weights.router,
-                            &logits,
-                            false,
-                        )?;
-                        self.encode_topk_softmax_rows(
-                            encoder,
-                            &logits,
-                            &indices,
-                            &scores,
-                            spec.seq,
-                            expert_count,
-                            top_k,
-                        )
-                    })?;
-                    ROUTER_CAPTURE.with(|capture| {
-                        if let Some(layers) = capture.borrow_mut().as_mut() {
-                            layers.push(RouterCaptureBuffers {
-                                logits,
-                                logits_len,
-                                indices,
-                                indices_len: total_topk,
-                            });
-                        }
-                    });
-                }
                 if moe_coop_enabled() && weights.coop_compatible() {
                     self.run_resident_prefill_section(
                         context,

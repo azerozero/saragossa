@@ -3745,8 +3745,10 @@ fn qwen_kv_nax_x3_shape_targets_dense_qwen_27b_only() {
 /// 8 répétitions après 2 d'échauffement, temps mural (soumission, attente et
 /// relecture comprises). Entre deux répétitions : avec captures, rollback réel à
 /// une position acceptée (le KV et les états linéaires avancent d'un token,
-/// comme un pas où seul le premier token est gardé) ; sans, troncature du KV,
-/// états linéaires non restaurés (coût seul). Échoue si plus d'une ligne est
+/// comme un pas où seul le premier token est gardé) ; sans (dont la référence
+/// séquentielle, qui n'en rend pas), troncature du KV seule : les états
+/// linéaires avancent à chaque répétition, donc entrées et routage MoE dérivent.
+/// Ces temps-là sont synthétiques, pas une comparaison contrôlée. Échoue si plus d'une ligne est
 /// demandée sans le chemin en lignes, sauf `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_SEQUENTIAL=1`
 /// (référence séquentielle voulue).
 #[test]
@@ -4025,276 +4027,13 @@ fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
     Ok(())
 }
 
-/// Mesures préalables de la spéculation MoE, sans chemin de production.
-/// Prompts `SARAGOSSA_RUST_MOESPEC_PROMPTS` (JSON `{nom: texte}`), noms
-/// `SARAGOSSA_RUST_MOESPEC_CASES` (défaut `T0,T1,T2,T6`), sortie greedy AR de
-/// `SARAGOSSA_RUST_MOESPEC_TOKENS` tokens (défaut 256, arrêt sur EOS).
-///
-/// - M1 : prompt + sortie AR repréfillés sous capture du routeur ; sur la sortie,
-///   experts distincts par couche dans R tokens consécutifs, contre l'espérance
-///   d'un routage uniforme `E·(1 − (1 − k/E)^R)`. NOTE: routage du prefill, pas
-///   du decode (mêmes poids, ordre d'accumulation différent).
-/// - M3 : boucle lookup greedy rejouée hors GPU sur la sortie AR (sync, propose,
-///   observe, bonus en fin de vérification), coûts `ρ(R)` lus dans
-///   `SARAGOSSA_RUST_MOESPEC_RHO` (`1,ρ2,ρ3,…`) ; gain = temps AR / temps cumulé.
-#[test]
-#[ignore = "modèle MoE réel requis, mesure"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-fn moe_spec_overlap_and_lookup_sim_real_model() -> Result<()> {
-    let Some(model_dir) = mtp_verifier_model_dir() else {
-        return Ok(());
-    };
-    let Some(prompts_path) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MOESPEC_PROMPTS")
-    else {
-        eprintln!("skip moespec: SARAGOSSA_RUST_MOESPEC_PROMPTS absent");
-        return Ok(());
-    };
-    let prompts: std::collections::BTreeMap<String, String> = serde_json::from_str(
-        &std::fs::read_to_string(&prompts_path)
-            .map_err(|error| InferError::Config(format!("prompts moespec: {error}")))?,
-    )
-    .map_err(|error| InferError::Config(format!("prompts moespec: {error}")))?;
-    let cases = crate::runtime_flags::env_var("SARAGOSSA_RUST_MOESPEC_CASES")
-        .unwrap_or_else(|| "T0,T1,T2,T6".to_string());
-    let max_new = crate::runtime_flags::env_var("SARAGOSSA_RUST_MOESPEC_TOKENS")
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(256);
-    let rho: Vec<f64> = crate::runtime_flags::env_var("SARAGOSSA_RUST_MOESPEC_RHO")
-        .map(|list| {
-            list.split(',')
-                .filter_map(|value| value.trim().parse::<f64>().ok())
-                .collect()
-        })
-        .unwrap_or_else(|| vec![1.0, 1.33, 1.65, 1.96, 2.3, 2.6, 2.9, 3.1, 3.36]);
-    let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
-    let options = mtp_verifier_options(assets.stop_token_ids());
-    const WINDOWS: [usize; 5] = [2, 3, 4, 5, 9];
-    for name in cases.split(',').map(str::trim) {
-        let text = prompts
-            .get(name)
-            .ok_or_else(|| InferError::Config(format!("prompt {name} absent")))?;
-        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
-        let output = model.generate_greedy_cached_with_options(&prompt, max_new, &options)?;
-        let mut full = prompt.clone();
-        full.extend_from_slice(&output);
-
-        // M1 : recouvrement des experts sur les positions de la sortie.
-        let (_, routers) = crate::metal_backend::with_router_capture(|| {
-            model.prefill_hidden_for_test(&full, Some(0))
-        })?;
-        let mut distinct = [0.0f64; WINDOWS.len()];
-        let mut windows = [0usize; WINDOWS.len()];
-        let mut overlap_sum = 0.0f64;
-        let mut overlap_count = 0usize;
-        let (mut experts, mut top_k) = (0, 0);
-        for router in &routers {
-            let rows = full.len();
-            top_k = router.indices.len() / rows;
-            experts = router.logits.len() / rows;
-            assert_eq!(
-                top_k * rows,
-                router.indices.len(),
-                "{name}: capture partielle"
-            );
-            let sets: Vec<&[u32]> = router.indices.chunks(top_k).skip(prompt.len()).collect();
-            for pair in sets.windows(2) {
-                overlap_sum += pair[1].iter().filter(|e| pair[0].contains(e)).count() as f64;
-                overlap_count += 1;
-            }
-            for (slot, &width) in WINDOWS.iter().enumerate() {
-                for window in sets.windows(width) {
-                    let mut seen: Vec<u32> =
-                        window.iter().flat_map(|set| set.iter()).copied().collect();
-                    seen.sort_unstable();
-                    seen.dedup();
-                    distinct[slot] += seen.len() as f64;
-                    windows[slot] += 1;
-                }
-            }
-        }
-        eprintln!(
-            "moespec M1 case={name} prompt={} sortie={} couches={} experts={experts} top_k={top_k} recouvrement_consecutif={:.2}/{top_k} (uniforme {:.2})",
-            prompt.len(),
-            output.len(),
-            routers.len(),
-            overlap_sum / overlap_count.max(1) as f64,
-            (top_k * top_k) as f64 / experts.max(1) as f64,
-        );
-        for (slot, &width) in WINDOWS.iter().enumerate() {
-            let measured = distinct[slot] / windows[slot].max(1) as f64;
-            let uniform = experts as f64
-                * (1.0 - (1.0 - top_k as f64 / experts.max(1) as f64).powi(width as i32));
-            eprintln!(
-                "moespec M1 case={name} R={width} distincts={measured:.2} uniforme={uniform:.2} ratio={:.3}",
-                measured / uniform.max(f64::MIN_POSITIVE)
-            );
-        }
-
-        // M3 : boucle lookup greedy rejouée, plafonds de drafts croissants.
-        for cap in [1usize, 2, 3, 4, 8] {
-            let mut lookup = super::lookup::NgramLookup::new(&prompt);
-            let mut generated: Vec<usize> = Vec::new();
-            let (mut cost, mut verifies, mut proposed, mut accepted_total) = (0.0f64, 0, 0, 0);
-            // Le premier token vient du prefill, hors boucle (comme le decode).
-            if let Some(&first) = output.first() {
-                generated.push(first);
-            }
-            while generated.len() < output.len() {
-                lookup.sync(&generated);
-                let remaining = output.len() - generated.len();
-                let cap_now = cap
-                    .min(rho.len().saturating_sub(1))
-                    .min(remaining.saturating_sub(1));
-                match lookup.propose(cap_now) {
-                    Some(drafts) => {
-                        let at = generated.len();
-                        let accepted = drafts
-                            .iter()
-                            .zip(&output[at..])
-                            .take_while(|(draft, target)| draft == target)
-                            .count();
-                        lookup.observe(drafts.len(), accepted);
-                        cost += rho[drafts.len()];
-                        verifies += 1;
-                        proposed += drafts.len();
-                        accepted_total += accepted;
-                        let gained = (accepted + 1).min(remaining);
-                        generated.extend_from_slice(&output[at..at + gained]);
-                    }
-                    None => {
-                        cost += 1.0;
-                        generated.push(output[generated.len()]);
-                    }
-                }
-            }
-            let ar = output.len().saturating_sub(1) as f64;
-            eprintln!(
-                "moespec M3 case={name} cap={cap} vérifs={verifies} proposés={proposed} acceptés={accepted_total} coût={cost:.1} AR={ar:.0} gain={:+.1}%",
-                (ar / cost.max(f64::MIN_POSITIVE) - 1.0) * 100.0
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Coût de la seule queue MoE shared par nombre de lignes, sur toutes les
-/// couches MoE de l'arène résidente (un command buffer, une queue par couche,
-/// entrées = embeddings de tokens distincts pour varier le routage). `R = 1`
-/// prend le chemin mono-ligne fusionné du decode ; `R > 1` le gather en lignes
-/// de la vérification (ou le coop sous `SARAGOSSA_RUST_MOE_VERIFY_COOP=1`, via
-/// `SARAGOSSA_RUST_MOE_TAIL_BENCH_COOP=1`). Isole la part MoE de `ρ(R)`.
-#[test]
-#[ignore = "modèle MoE réel requis, bench"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-fn moe_tail_rows_cost_bench_real_model() -> Result<()> {
-    use crate::decode_resident::GpuElement;
-    let Some(model_dir) = mtp_verifier_model_dir() else {
-        return Ok(());
-    };
-    let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
-    let metal = model
-        .forward_runtime()
-        .metal_executor()
-        .ok_or_else(|| InferError::Metal("executor Metal absent".to_string()))?;
-    let prompt: Vec<usize> = (0..64).map(|i| 1000 + i * 7919 % 50_000).collect();
-    let mut cache = model.prefill_cache_state(&prompt)?.0;
-    assert!(model.setup_resident_full_decode(&mut cache, 64, 0, false)?);
-    let arena = cache
-        .resident
-        .as_ref()
-        .ok_or_else(|| InferError::Config("arène absente".to_string()))?;
-    let moes: Vec<(&crate::metal_backend::MetalMoeSharedWeights, usize)> = arena
-        .layers
-        .iter()
-        .filter_map(|layer| match layer {
-            ResidentLayerBuffers::FullMoe(buffers) => Some((&buffers.moe, buffers.top_k)),
-            ResidentLayerBuffers::LinearMoe(buffers) => Some((&buffers.moe, buffers.top_k)),
-            _ => None,
-        })
-        .collect();
-    assert!(!moes.is_empty(), "aucune couche MoE shared");
-    let coop = crate::runtime_flags::env_flag("SARAGOSSA_RUST_MOE_TAIL_BENCH_COOP", false);
-    let hidden = model.final_norm.data().len();
-    for rows in [1usize, 2, 3, 4, 5, 9] {
-        let mut times = Vec::new();
-        for rep in 0..12 {
-            let tokens: Vec<usize> = (0..rows).map(|i| 3000 + rep * 97 + i * 31).collect();
-            let embed = model.embed_scaled(&tokens)?;
-            let input = arena
-                .state
-                .scratch()
-                .lease(rows * hidden, GpuElement::F32)?;
-            let residual = arena
-                .state
-                .scratch()
-                .lease(rows * hidden, GpuElement::F32)?;
-            let output = arena
-                .state
-                .scratch()
-                .lease(rows * hidden, GpuElement::F32)?;
-            arena.state.upload(input.tensor(), embed.data())?;
-            arena.state.upload(residual.tensor(), embed.data())?;
-            let command_buffer = arena.state.queue().new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            let mut owned = Vec::new();
-            let started = std::time::Instant::now();
-            for &(moe, top_k) in &moes {
-                let (input, residual, output) = (
-                    input.tensor().buffer(),
-                    residual.tensor().buffer(),
-                    output.tensor().buffer(),
-                );
-                if coop && rows > 1 {
-                    metal.encode_moe_shared_rows_coop(
-                        encoder,
-                        &mut owned,
-                        input,
-                        Some(residual),
-                        output,
-                        rows,
-                        hidden,
-                        moe,
-                        top_k,
-                    )?;
-                } else {
-                    metal.encode_moe_shared_buffers_rows(
-                        encoder,
-                        &mut owned,
-                        input,
-                        Some(residual),
-                        output,
-                        rows,
-                        hidden,
-                        moe,
-                        top_k,
-                    )?;
-                }
-            }
-            encoder.end_encoding();
-            crate::metal_backend::commit_and_wait(command_buffer)?;
-            if rep >= 2 {
-                times.push(started.elapsed().as_secs_f64() * 1e3);
-            }
-        }
-        times.sort_by(f64::total_cmp);
-        eprintln!(
-            "moe_tail_bench couches={} coop={coop} rows={rows} median_ms={:.2} min_ms={:.2}",
-            moes.len(),
-            times[times.len() / 2],
-            times[0]
-        );
-    }
-    Ok(())
-}
-
 /// Pairwise ABBA de la boucle lookup greedy (`SARAGOSSA_RUST_LOOKUP_GREEDY`)
 /// contre le greedy AR, même processus, même modèle : `SARAGOSSA_RUST_MOESPEC_PAIRS`
 /// paires (défaut 3) par cas, drafts `SARAGOSSA_RUST_MOESPEC_LOOKUP` (défaut 2),
-/// mêmes prompts et budget que [`moe_spec_overlap_and_lookup_sim_real_model`].
-/// Affiche le débit de decode de chaque passage, le gain médian et l'égalité des
-/// sorties (premier écart sinon). Exige `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1` sur
+/// prompts JSON `SARAGOSSA_RUST_MOESPEC_PROMPTS` (`{nom: texte}`), budget
+/// `SARAGOSSA_RUST_MOESPEC_TOKENS` (défaut 256).
+/// Affiche le débit de decode de chaque passage et le gain médian ; échoue si
+/// une sortie diffère de l'AR. Exige `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1` sur
 /// un modèle MoE.
 #[test]
 #[ignore = "modèle réel requis, bench"]
@@ -4343,22 +4082,11 @@ fn lookup_greedy_abba_vs_ar_real_model() -> Result<()> {
         let (reference, _) = run(&prompt, 0)?;
         run(&prompt, drafts)?;
         let mut gains = Vec::with_capacity(pairs * 2);
-        let mut identical = true;
-        let mut first_gap = None;
         for pair in 0..pairs {
             let mut rates = [0.0f64; 2];
             for (slot, lookup) in [(0, 0), (1, drafts), (1, drafts), (0, 0)] {
                 let (tokens, rate) = run(&prompt, lookup)?;
-                if tokens != reference {
-                    identical = false;
-                    first_gap.get_or_insert_with(|| {
-                        tokens
-                            .iter()
-                            .zip(&reference)
-                            .position(|(a, b)| a != b)
-                            .unwrap_or(tokens.len().min(reference.len()))
-                    });
-                }
+                assert_eq!(tokens, reference, "{name} lookup={lookup}: sortie ≠ AR");
                 rates[slot] += rate / 2.0;
                 eprintln!(
                     "lookup_abba case={name} paire={pair} lookup={lookup} tokens={} tok_s={rate:.1}",
@@ -4369,10 +4097,99 @@ fn lookup_greedy_abba_vs_ar_real_model() -> Result<()> {
         }
         gains.sort_by(f64::total_cmp);
         eprintln!(
-            "lookup_abba case={name} drafts={drafts} sortie={} gain_median={:+.1}% gains={gains:.1?} identique_ar={identical} premier_ecart={first_gap:?}",
+            "lookup_abba case={name} drafts={drafts} sortie={} gain_median={:+.1}% gains={gains:.1?}",
             reference.len(),
             gains[gains.len() / 2],
         );
     }
+    Ok(())
+}
+
+/// Oracle de la boucle lookup greedy contre le greedy AR, modèle réel
+/// (`SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` ; MoE : avec
+/// `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`). Prompt qui fait recopier un fichier de
+/// ce dépôt, pour que le lookup propose et que le pipeline soit vidangé. Sorties
+/// identiques exigées pour 0, 1, 2 et 8 drafts et des budgets de 1, 2 et 96
+/// tokens ; arrêts sur des tokens de la sortie AR (EOS au milieu des drafts
+/// acceptés) ; callback qui interrompt le streaming.
+#[test]
+#[ignore = "modèle réel requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn lookup_greedy_matches_ar_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let text = format!(
+        "Recopie ce fichier à l'identique.\n\n```rust\n{}\n```",
+        include_str!("lookup.rs")
+    );
+    let prompt = mtp_verifier_prompt_ids(&assets, &text)?;
+    let options = mtp_verifier_options(assets.stop_token_ids());
+    // Éligibilité réelle : sans elle, l'égalité serait triviale.
+    let mut cache = model.prefill_cache_state(&prompt)?.0;
+    assert!(model.setup_resident_full_decode(&mut cache, 96, 0, false)?);
+    assert!(
+        crate::runtime_flags::with_lookup_greedy_override(2, || {
+            model.lookup_greedy_eligible(&cache, &options)
+        }),
+        "boucle lookup inéligible sur ce modèle (MoE : SARAGOSSA_RUST_MOE_VERIFY_ROWS=1)"
+    );
+    drop(cache);
+    let generate = |drafts: usize, max_new: usize, options: &GenerationOptions| {
+        crate::runtime_flags::with_lookup_greedy_override(drafts, || {
+            model.generate_greedy_timed_with_options(&prompt, max_new, options)
+        })
+        .map(|output| output.tokens)
+    };
+    let reference = generate(0, 96, &options)?;
+    for drafts in [1, 2, 8] {
+        for max_new in [1, 2, 96] {
+            let expected = &reference[..max_new.min(reference.len())];
+            assert_eq!(
+                generate(drafts, max_new, &options)?,
+                expected,
+                "drafts={drafts} budget={max_new}"
+            );
+        }
+        // Arrêt sur un token de la sortie : la sortie AR s'arrête juste avant
+        // sa première occurrence, la boucle lookup doit faire de même.
+        for &at in &[5, 20, 40, 70] {
+            let Some(&stop) = reference.get(at) else {
+                continue;
+            };
+            let mut stopping = options.clone();
+            stopping.stop_token_ids.push(stop);
+            let expected = generate(0, 96, &stopping)?;
+            assert_eq!(
+                generate(drafts, 96, &stopping)?,
+                expected,
+                "drafts={drafts} arrêt sur {stop}"
+            );
+        }
+        // Callback qui interrompt : mêmes tokens émis qu'en AR.
+        for limit in [1, 7, 33] {
+            let stream = |lookup: usize| -> Result<Vec<usize>> {
+                let mut seen = Vec::new();
+                crate::runtime_flags::with_lookup_greedy_override(lookup, || {
+                    model.generate_greedy_streaming_with_options(&prompt, 96, &options, |token| {
+                        seen.push(token);
+                        seen.len() < limit
+                    })
+                })?;
+                Ok(seen)
+            };
+            assert_eq!(
+                stream(drafts)?,
+                stream(0)?,
+                "drafts={drafts} callback={limit}"
+            );
+        }
+    }
+    eprintln!(
+        "lookup greedy ≡ AR : {} tokens de référence",
+        reference.len()
+    );
     Ok(())
 }
