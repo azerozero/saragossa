@@ -4,8 +4,8 @@
 //! thread par connexion lisent les requêtes, refusent un bearer invalide avant
 //! de lire le corps et servent `/health` et `/v1/models` même pendant une
 //! génération. L'inférence reste sérielle sur le thread moteur, le thread
-//! principal qui possède `ServeState` ; une requête dont le client est parti
-//! pendant l'attente en file est ignorée. Une panique dans un thread de
+//! principal qui possède `ServeState` ; un client parti pendant l'attente en
+//! file n'est détecté qu'à l'écriture de la réponse. Une panique dans un thread de
 //! connexion ne coûte que cette connexion et n'abat plus le process ; une
 //! panique moteur l'abat toujours.
 //!
