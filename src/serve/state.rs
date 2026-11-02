@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use saragossa::decoder::GenerationTimings;
@@ -25,9 +26,7 @@ use super::cache::{BlockAwarePrefixCache, BlockHash};
 use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
 use super::mtp;
-use super::protocol::{
-    ChatCompletionRequest, ModelInfo, ModelsResponse, ResponseFormatMode, Usage,
-};
+use super::protocol::{ChatCompletionRequest, ResponseFormatMode, Usage};
 use super::streaming::{
     CompletionStreamEvent, StreamTerminalError, StreamingCompletionStart, StreamingTextDetokenizer,
 };
@@ -84,7 +83,12 @@ impl ServedCompletion {
 }
 
 /// Etat mutable du serveur. Les decodeurs restent vivants entre requêtes.
+///
+/// L'état appartient au thread moteur, celui qui l'a construit : les arènes et
+/// pools scratch GPU sont `thread_local`, un décodeur appelé depuis un autre
+/// thread perdrait ses buffers résidents.
 pub(super) struct ServeState {
+    engine_thread: ThreadId,
     models: Vec<ModelSlot>,
     max_tokens_cap: usize,
     clock: u64,
@@ -97,6 +101,7 @@ impl ServeState {
     /// Construit l'état à partir des chemins CLI, sans charger les poids.
     pub(super) fn new(args: &ServeArgs) -> Self {
         Self {
+            engine_thread: thread::current().id(),
             models: args
                 .models
                 .iter()
@@ -117,11 +122,13 @@ impl ServeState {
 
     /// Renvoie l'état audio mutable pour les endpoints STT/TTS.
     pub(super) fn audio_mut(&mut self) -> &mut AudioState {
+        self.assert_engine_thread();
         &mut self.audio
     }
 
     /// Renvoie l'état embeddings mutable pour l'endpoint `/v1/embeddings`.
     pub(super) fn embeddings_mut(&mut self) -> &mut EmbeddingsState {
+        self.assert_engine_thread();
         &mut self.embeddings
     }
 
@@ -133,14 +140,19 @@ impl ServeState {
         Ok(())
     }
 
-    /// Réponse `/v1/models`.
-    pub(super) fn models_response(&self) -> ModelsResponse {
-        ModelsResponse::new(
-            self.models
-                .iter()
-                .map(|model| ModelInfo::new(model.id.clone()))
-                .collect(),
-        )
+    /// Identifiants exposés par `/v1/models`, figés au démarrage : les threads
+    /// de connexion servent cette route sans toucher à l'état moteur.
+    pub(super) fn model_ids(&self) -> Vec<String> {
+        self.models.iter().map(|model| model.id.clone()).collect()
+    }
+
+    /// Garde de l'invariant thread moteur (voir [`ServeState`]).
+    fn assert_engine_thread(&self) {
+        debug_assert_eq!(
+            thread::current().id(),
+            self.engine_thread,
+            "invariant: ServeState n'est utilisé que sur le thread moteur"
+        );
     }
 
     /// Exécute une complétion chat OpenAI.
@@ -220,6 +232,8 @@ impl ServeState {
     }
 
     fn ensure_loaded_index(&mut self, index: usize) -> ServeResult<()> {
+        // NOTE: tout appel décodeur LLM passe par ici, chargé ou non.
+        self.assert_engine_thread();
         if self.models[index].loaded.is_some() {
             return Ok(());
         }

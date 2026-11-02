@@ -16,12 +16,13 @@ use serde::Serialize;
 
 use super::anthropic::{handle_anthropic_messages, send_anthropic_error};
 use super::audio::{handle_speech, handle_transcription};
+use super::dispatch::{self, Front};
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
 use super::flint_output::{FlintEvent, FlintOutputParser};
 use super::protocol::{
     json_bytes, sse_done, sse_event, AssistantMessage, ChatCompletionChunk, ChatCompletionRequest,
-    ChatCompletionResponse, HealthResponse, StreamErrorEvent,
+    ChatCompletionResponse, HealthResponse, ModelsResponse, StreamErrorEvent,
 };
 use super::state::ServeState;
 use super::streaming::CompletionStreamEvent;
@@ -43,22 +44,10 @@ pub(super) fn serve_tcp(
         TcpListener::bind(addr).map_err(|e| ServeError::io(format!("bind TCP {addr}"), e))?;
     eprintln!("saragossa serve TCP listening on http://{addr}/v1");
     eprintln!("saragossa serve TCP bearer auth enabled");
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                if let Err(error) = configure_tcp_stream(&stream, read_timeout) {
-                    eprintln!("saragossa serve request error: {error}");
-                    continue;
-                }
-                let deadline = Instant::now() + read_timeout;
-                if let Err(error) = handle_connection(&mut stream, state, Some(api_key), deadline) {
-                    eprintln!("saragossa serve request error: {error}");
-                }
-            }
-            Err(error) => return Err(ServeError::io("accept TCP", error)),
-        }
-    }
-    Ok(())
+    let front = Front::new(Some(api_key.to_string()), state.model_ids());
+    dispatch::serve(state, front, read_timeout, move |dispatcher| {
+        dispatcher.accept_all(listener.incoming(), "accept TCP")
+    })
 }
 
 /// Sert en HTTP sur socket Unix avec permissions propriétaire.
@@ -78,22 +67,10 @@ pub(super) fn serve_unix(
         "saragossa serve Unix socket listening on {} (0600)",
         path.display()
     );
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                if let Err(error) = configure_unix_stream(&stream, read_timeout) {
-                    eprintln!("saragossa serve request error: {error}");
-                    continue;
-                }
-                let deadline = Instant::now() + read_timeout;
-                if let Err(error) = handle_connection(&mut stream, state, None, deadline) {
-                    eprintln!("saragossa serve request error: {error}");
-                }
-            }
-            Err(error) => return Err(ServeError::io("accept socket Unix", error)),
-        }
-    }
-    Ok(())
+    let front = Front::new(None, state.model_ids());
+    dispatch::serve(state, front, read_timeout, move |dispatcher| {
+        dispatcher.accept_all(listener.incoming(), "accept socket Unix")
+    })
 }
 
 /// Echec explicite hors Unix.
@@ -108,7 +85,7 @@ pub(super) fn serve_unix(
     ))
 }
 
-fn configure_tcp_stream(stream: &TcpStream, read_timeout: Duration) -> ServeResult<()> {
+pub(super) fn configure_tcp_stream(stream: &TcpStream, read_timeout: Duration) -> ServeResult<()> {
     stream
         .set_read_timeout(Some(read_timeout))
         .map_err(|e| ServeError::io("set read timeout TCP", e))?;
@@ -118,7 +95,10 @@ fn configure_tcp_stream(stream: &TcpStream, read_timeout: Duration) -> ServeResu
 }
 
 #[cfg(unix)]
-fn configure_unix_stream(stream: &UnixStream, read_timeout: Duration) -> ServeResult<()> {
+pub(super) fn configure_unix_stream(
+    stream: &UnixStream,
+    read_timeout: Duration,
+) -> ServeResult<()> {
     stream
         .set_read_timeout(Some(read_timeout))
         .map_err(|e| ServeError::io("set read timeout socket Unix", e))?;
@@ -144,52 +124,87 @@ fn prepare_socket_path(path: &Path) -> ServeResult<()> {
     }
 }
 
-fn handle_connection<S: Read + Write>(
+/// Lit avec `read` ; une requête illisible reçoit sa réponse d'erreur ici.
+pub(super) fn read_or_reject<S: Read + Write, T>(
     stream: &mut S,
-    state: &mut ServeState,
-    api_key: Option<&str>,
-    read_deadline: Instant,
-) -> ServeResult<()> {
-    let request = match read_request(stream, read_deadline) {
-        Ok(Some(request)) => request,
-        Ok(None) => return Ok(()),
-        Err(error) => {
-            let _ = send_error(stream, error_status(&error), &error.to_string());
-            return Err(error);
-        }
-    };
-    if let Err(error) = route_request(stream, state, api_key, request) {
-        let _ = send_error(stream, error_status(&error), &error.to_string());
-        return Err(error);
-    }
-    Ok(())
+    read: impl FnOnce(&mut S) -> ServeResult<T>,
+) -> ServeResult<T> {
+    read(stream).inspect_err(|error| {
+        let _ = send_error(stream, error_status(error), &error.to_string());
+    })
 }
 
-fn route_request<S: Write>(
+/// Erreur au format de la route : Anthropic pour `/v1/messages`, comme les
+/// autres erreurs de cette route.
+pub(super) fn send_route_error<S: Write>(
     stream: &mut S,
-    state: &mut ServeState,
-    api_key: Option<&str>,
-    request: HttpRequest,
+    request: &HttpRequest,
+    status: u16,
+    message: &str,
 ) -> ServeResult<()> {
-    let path = request
-        .path
-        .split('?')
-        .next()
-        .unwrap_or(request.path.as_str());
-    if request.method == "GET" && path == "/health" {
-        return send_json(stream, 200, &HealthResponse::ok(), Vec::new());
+    if request.route() == "/v1/messages" {
+        send_anthropic_error(stream, status, message)
+    } else {
+        send_error(stream, status, message)
     }
-    if let Some(expected) = api_key {
-        if !is_authorized(&request, expected) {
+}
+
+/// Tente d'envoyer une réponse d'erreur avant de propager l'échec.
+pub(super) fn reply_on_error<S: Write>(stream: &mut S, result: ServeResult<()>) -> ServeResult<()> {
+    result.inspect_err(|error| {
+        let _ = send_error(stream, error_status(error), &error.to_string());
+    })
+}
+
+/// Routes indépendantes de `ServeState`, servies par le thread de connexion
+/// même pendant une génération : santé, bearer et liste des modèles. `None`
+/// laisse la requête au thread moteur.
+pub(super) fn route_front<S: Write>(
+    stream: &mut S,
+    front: &Front,
+    request: &HttpRequest,
+) -> Option<ServeResult<()>> {
+    let path = request.route();
+    if request.method == "GET" && path == "/health" {
+        return Some(send_json(stream, 200, &HealthResponse::ok(), Vec::new()));
+    }
+    if let Some(expected) = front.api_key.as_deref() {
+        if !is_authorized(request, expected) {
             if path == "/v1/messages" {
-                return send_anthropic_error(stream, 401, "authentification bearer requise");
+                return Some(send_anthropic_error(
+                    stream,
+                    401,
+                    "authentification bearer requise",
+                ));
             }
-            return send_error(stream, 401, "authentification bearer requise");
+            return Some(send_error(stream, 401, "authentification bearer requise"));
         }
     }
-    match (request.method.as_str(), path) {
-        ("GET", "/v1/models") => send_json(stream, 200, &state.models_response(), Vec::new()),
-        ("POST", "/v1/chat/completions") => handle_chat(stream, state, &request),
+    if request.method == "GET" && path == "/v1/models" {
+        let models = ModelsResponse::from_ids(&front.model_ids);
+        return Some(send_json(stream, 200, &models, Vec::new()));
+    }
+    None
+}
+
+/// Traite sur le thread moteur une requête déjà authentifiée par
+/// [`route_front`].
+pub(super) fn handle_job<S: Write>(
+    stream: &mut S,
+    state: &mut ServeState,
+    request: HttpRequest,
+) -> ServeResult<()> {
+    let result = route_engine(stream, state, &request);
+    reply_on_error(stream, result)
+}
+
+fn route_engine<S: Write>(
+    stream: &mut S,
+    state: &mut ServeState,
+    request: &HttpRequest,
+) -> ServeResult<()> {
+    match (request.method.as_str(), request.route()) {
+        ("POST", "/v1/chat/completions") => handle_chat(stream, state, request),
         ("POST", "/v1/messages") => match handle_anthropic_messages(
             stream,
             state,
@@ -386,7 +401,7 @@ pub(super) fn send_json<S: Write, T: Serialize>(
         .map_err(|e| ServeError::io("flush réponse JSON", e))
 }
 
-fn send_error<S: Write>(stream: &mut S, status: u16, message: &str) -> ServeResult<()> {
+pub(super) fn send_error<S: Write>(stream: &mut S, status: u16, message: &str) -> ServeResult<()> {
     let body = serde_json::json!({
         "error": {
             "message": message,
@@ -447,6 +462,7 @@ fn reason_phrase(status: u16) -> &'static str {
         404 => "Not Found",
         501 => "Not Implemented",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     }
 }
@@ -473,14 +489,19 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 #[derive(Debug)]
-struct HttpRequest {
-    method: String,
+pub(super) struct HttpRequest {
+    pub(super) method: String,
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
 impl HttpRequest {
+    /// Chemin sans query string.
+    pub(super) fn route(&self) -> &str {
+        self.path.split('?').next().unwrap_or(self.path.as_str())
+    }
+
     fn header(&self, name: &str) -> Option<&str> {
         let target = name.to_ascii_lowercase();
         self.headers
@@ -490,7 +511,23 @@ impl HttpRequest {
     }
 }
 
+/// Lit headers puis corps d'un trait (chemin des tests sans threads).
+#[cfg(test)]
 fn read_request<S: Read>(stream: &mut S, deadline: Instant) -> ServeResult<Option<HttpRequest>> {
+    let Some((mut request, content_length)) = read_head(stream, deadline)? else {
+        return Ok(None);
+    };
+    read_body(stream, &mut request, content_length, deadline)?;
+    Ok(Some(request))
+}
+
+/// Lit les headers seuls : le corps reste sur la socket pour qu'un client non
+/// authentifié ne fasse jamais allouer ses 16 Mio. Le corps de la requête
+/// rendue ne contient que les octets déjà reçus ; la longueur annoncée suit.
+pub(super) fn read_head<S: Read>(
+    stream: &mut S,
+    deadline: Instant,
+) -> ServeResult<Option<(HttpRequest, usize)>> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
     let header_end = loop {
@@ -528,8 +565,28 @@ fn read_request<S: Read>(stream: &mut S, deadline: Instant) -> ServeResult<Optio
     if content_length > MAX_BODY_BYTES {
         return Err(ServeError::Http("body trop grand".to_string()));
     }
-    let body_start = header_end + 4;
-    let mut body = buffer[body_start..].to_vec();
+    let body = buffer[header_end + 4..].to_vec();
+    Ok(Some((
+        HttpRequest {
+            method,
+            path,
+            headers,
+            body,
+        },
+        content_length,
+    )))
+}
+
+/// Complète le corps annoncé par `Content-Length` (déjà borné par
+/// [`read_head`]).
+pub(super) fn read_body<S: Read>(
+    stream: &mut S,
+    request: &mut HttpRequest,
+    content_length: usize,
+    deadline: Instant,
+) -> ServeResult<()> {
+    let mut chunk = [0_u8; 1024];
+    let body = &mut request.body;
     while body.len() < content_length {
         if Instant::now() >= deadline {
             return Err(ServeError::Http(
@@ -545,12 +602,7 @@ fn read_request<S: Read>(stream: &mut S, deadline: Instant) -> ServeResult<Optio
         body.extend_from_slice(&chunk[..read]);
     }
     body.truncate(content_length);
-    Ok(Some(HttpRequest {
-        method,
-        path,
-        headers,
-        body,
-    }))
+    Ok(())
 }
 
 fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
@@ -616,6 +668,23 @@ mod tests {
     use super::super::args::ServeArgs;
     use super::super::state::ServeState;
     use super::*;
+
+    /// Chemin complet d'une connexion sans threads : front puis moteur.
+    fn handle_connection<S: Read + Write>(
+        stream: &mut S,
+        state: &mut ServeState,
+        api_key: Option<&str>,
+        read_deadline: Instant,
+    ) -> ServeResult<()> {
+        let Some(request) = read_or_reject(stream, |s| read_request(s, read_deadline))? else {
+            return Ok(());
+        };
+        let front = Front::new(api_key.map(str::to_string), state.model_ids());
+        if let Some(result) = route_front(stream, &front, &request) {
+            return reply_on_error(stream, result);
+        }
+        handle_job(stream, state, request)
+    }
 
     fn far_deadline() -> Instant {
         Instant::now() + Duration::from_secs(30)
