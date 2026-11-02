@@ -2920,7 +2920,7 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
             options,
             &draft,
             block,
-            mode,
+            (mode, true),
             |_| true,
         )
     };
@@ -3019,7 +3019,7 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
         &options,
         &draft,
         block,
-        DFlashTreeMode::BestFirst(8),
+        (DFlashTreeMode::BestFirst(8), true),
         |_| {
             seen += 1;
             seen < 5
@@ -3057,6 +3057,10 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
 #[ignore = "modèle réel + draft DFlash requis"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
+    // NOTE: les points d'entrée publics lisent `SARAGOSSA_RUST_DFLASH_TREE` ; sans
+    // la variable, le résident comparé ici est l'arbre B = 8 par défaut. La chaîne
+    // résidente reste couverte explicitement par
+    // `dflash_tree_resident_matches_chain_and_ar_real_model` (mode `Off`).
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
     };

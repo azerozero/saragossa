@@ -26,10 +26,26 @@ pub(in crate::decoder) enum DFlashTreeMode {
 }
 
 impl DFlashTreeMode {
-    fn from_env() -> Self {
-        match crate::runtime_flags::dflash_tree_budget() {
-            0 => Self::Off,
-            budget => Self::BestFirst(budget),
+    /// Mode demandé par l'environnement et s'il est explicite : sans
+    /// `SARAGOSSA_RUST_DFLASH_TREE`, l'arbre par défaut retombe sur la chaîne
+    /// quand le modèle ne le supporte pas, au lieu d'échouer.
+    fn from_env() -> Result<(Self, bool)> {
+        Self::from_flag(crate::runtime_flags::dflash_tree_budget())
+    }
+
+    /// `None` : variable absente ; `Some(Err(valeur))` : valeur invalide, refusée
+    /// comme toute demande explicite hors périmètre.
+    fn from_flag(flag: Option<std::result::Result<usize, String>>) -> Result<(Self, bool)> {
+        match flag {
+            None => Ok((
+                Self::BestFirst(crate::runtime_flags::DFLASH_TREE_DEFAULT_BUDGET),
+                false,
+            )),
+            Some(Ok(0)) => Ok((Self::Off, true)),
+            Some(Ok(budget)) => Ok((Self::BestFirst(budget), true)),
+            Some(Err(value)) => Err(InferError::Config(format!(
+                "SARAGOSSA_RUST_DFLASH_TREE={value:?} invalide (entier B ≥ 0)"
+            ))),
         }
     }
 
@@ -64,16 +80,21 @@ impl DFlashTreeMode {
 }
 
 /// Raison du refus de la vérification en arbre (`None` : supportée), sur les
-/// propriétés du modèle : couches glissantes, couches full-attn sans variante
-/// arbre (KV quantifié, sinks, chemin en lignes fusionné désactivé), refus
-/// des états linéaires (cf. `linear_tree_journal_refusal`).
+/// propriétés du modèle : couches glissantes, norme V (hors du chemin en lignes
+/// fusionné), couches full-attn sans variante arbre (KV quantifié, sinks, chemin
+/// en lignes fusionné désactivé), refus des états linéaires (cf.
+/// `linear_tree_journal_refusal`).
 fn dflash_tree_refusal(
     sliding: bool,
+    value_norm: bool,
     full_supported: impl IntoIterator<Item = bool>,
     linear_refusals: impl IntoIterator<Item = Option<String>>,
 ) -> Option<String> {
     if sliding {
         return Some("couches à fenêtre glissante".to_string());
+    }
+    if value_norm {
+        return Some("norme V hors du chemin en lignes fusionné".to_string());
     }
     if full_supported.into_iter().any(|supported| !supported) {
         return Some("KV quantifié, sinks ou chemin en lignes fusionné indisponible".to_string());
@@ -83,6 +104,22 @@ fn dflash_tree_refusal(
         .flatten()
         .next()
         .map(|reason| format!("états linéaires : {reason}"))
+}
+
+/// Refus de l'arbre : erreur pour une demande explicite ; l'arbre par défaut
+/// retombe sur la chaîne avec un diagnostic, pour qu'un bench ne mesure pas la
+/// chaîne en croyant mesurer l'arbre.
+fn tree_fallback(
+    tree_mode: &mut DFlashTreeMode,
+    explicit: bool,
+    refusal: InferError,
+) -> Result<()> {
+    if explicit {
+        return Err(refusal);
+    }
+    eprintln!("saragossa: arbre DFlash par défaut indisponible, chaîne ({refusal})");
+    *tree_mode = DFlashTreeMode::Off;
+    Ok(())
 }
 
 /// Lignes de hidden states cibles téléversées par command buffer (prefill du
@@ -165,7 +202,7 @@ impl CausalDecoder {
             options,
             draft,
             max_draft_tokens,
-            DFlashTreeMode::from_env(),
+            DFlashTreeMode::from_env()?,
             on_token,
         )
     }
@@ -182,9 +219,12 @@ impl CausalDecoder {
         options: &GenerationOptions,
         draft: &DFlashDraft,
         max_draft_tokens: usize,
-        tree_mode: DFlashTreeMode,
+        (tree_mode, tree_explicit): (DFlashTreeMode, bool),
         mut on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
+        // Arbre par défaut (non explicite) : toute raison de refus le ramène à la
+        // chaîne ; une demande explicite reste refusée avec son erreur.
+        let mut tree_mode = tree_mode;
         if options.temperature > f32::EPSILON {
             return Err(InferError::Config(
                 "decode DFlash résident supporte uniquement greedy temperature=0".to_string(),
@@ -221,15 +261,18 @@ impl CausalDecoder {
             .min(draft.info.block_size)
             .min(max_new_tokens);
         let block = draft_limit + 1;
-        let tree_budget = tree_mode.budget();
         if let DFlashTreeMode::BestFirst(budget) = tree_mode {
             // Arbre du sélecteur DFlash 2, au plus `B + 1` lignes dans le journal
             // linéaire (16, vérifié couche par couche plus bas).
             if draft.selector.is_none() || budget >= super::dflash_tree::DFLASH_TREE_MAX_ROWS {
-                return Err(InferError::Config(format!(
-                    "decode DFlash résident: arbre B={budget} exige DFlash 2 (sélecteur) et B < {}",
-                    super::dflash_tree::DFLASH_TREE_MAX_ROWS
-                )));
+                tree_fallback(
+                    &mut tree_mode,
+                    tree_explicit,
+                    InferError::Config(format!(
+                        "decode DFlash résident: arbre B={budget} exige DFlash 2 (sélecteur) et B < {}",
+                        super::dflash_tree::DFLASH_TREE_MAX_ROWS
+                    )),
+                )?;
             }
         }
         // La trace d'arbre décrit la chaîne gloutonne : refus avant d'ouvrir
@@ -237,10 +280,18 @@ impl CausalDecoder {
         if tree_mode != DFlashTreeMode::Off
             && crate::runtime_flags::dflash_tree_trace_path().is_some()
         {
-            return Err(InferError::Config(
-                "decode DFlash résident: SARAGOSSA_RUST_DFLASH_TREE et SARAGOSSA_RUST_DFLASH_TREE_TRACE sont exclusifs".to_string(),
-            ));
+            tree_fallback(
+                &mut tree_mode,
+                tree_explicit,
+                InferError::Config(
+                    "decode DFlash résident: SARAGOSSA_RUST_DFLASH_TREE et SARAGOSSA_RUST_DFLASH_TREE_TRACE sont exclusifs".to_string(),
+                ),
+            )?;
         }
+        // Après les replis qui précèdent l'allocation : une chaîne repliée réserve
+        // les lignes de la chaîne. Le repli sur le support du modèle vient après
+        // l'allocation (il lit l'arène) et garde la réserve de l'arbre.
+        let tree_budget = tree_mode.budget();
         let layer_ids = draft.info.target_layer_ids.as_slice();
         let hidden = self.final_norm.len();
         let context_cols = layer_ids
@@ -294,7 +345,11 @@ impl CausalDecoder {
             ));
         }
         if tree_mode != DFlashTreeMode::Off {
-            self.check_dflash_tree_supported(&cache, tree_mode.verify_rows(draft_limit))?;
+            if let Err(error) =
+                self.check_dflash_tree_supported(&cache, tree_mode.verify_rows(draft_limit))
+            {
+                tree_fallback(&mut tree_mode, tree_explicit, error)?;
+            }
         }
         let top_k = draft.selector.as_ref().map_or(1, |selector| selector.top_k);
         let rank = draft.selector.as_ref().map_or(0, |selector| selector.rank);
@@ -978,6 +1033,7 @@ impl CausalDecoder {
         let full = cache.layers.iter().filter_map(|layer| layer.full.as_ref());
         let refusal = dflash_tree_refusal(
             sliding,
+            self.config.attention_value_norm,
             full.clone().map(|full| full.verify_tree_supported()),
             cache.layers.iter().filter_map(|layer| {
                 layer
@@ -1113,14 +1169,50 @@ mod tests {
         assert_eq!(DFlashTreeMode::Off.verify_rows(8), 0);
     }
 
+    /// Variable absente = arbre B = 8 non explicite ; 0, B et valeur invalide
+    /// sont explicites ; un refus replie seulement le défaut.
+    #[test]
+    fn tree_default_falls_back_and_explicit_refuses() {
+        assert_eq!(
+            DFlashTreeMode::from_flag(None).ok(),
+            Some((DFlashTreeMode::BestFirst(8), false))
+        );
+        assert_eq!(
+            DFlashTreeMode::from_flag(Some(Ok(0))).ok(),
+            Some((DFlashTreeMode::Off, true))
+        );
+        assert_eq!(
+            DFlashTreeMode::from_flag(Some(Ok(12))).ok(),
+            Some((DFlashTreeMode::BestFirst(12), true))
+        );
+        assert!(DFlashTreeMode::from_flag(Some(Err("huit".to_string()))).is_err());
+        let refusal = || InferError::Config("refus".to_string());
+        let mut mode = DFlashTreeMode::BestFirst(8);
+        assert!(tree_fallback(&mut mode, false, refusal()).is_ok());
+        assert_eq!(mode, DFlashTreeMode::Off);
+        let mut mode = DFlashTreeMode::BestFirst(8);
+        assert!(tree_fallback(&mut mode, true, refusal()).is_err());
+        assert_eq!(mode, DFlashTreeMode::BestFirst(8));
+    }
+
     #[test]
     fn tree_refusals_name_their_cause() {
-        assert_eq!(dflash_tree_refusal(false, [true], [None, None]), None);
-        let sliding = dflash_tree_refusal(true, [true], [None]);
+        assert_eq!(
+            dflash_tree_refusal(false, false, [true], [None, None]),
+            None
+        );
+        let sliding = dflash_tree_refusal(true, false, [true], [None]);
         assert!(sliding.is_some_and(|r| r.contains("glissante")));
-        let quantized = dflash_tree_refusal(false, [true, false], [None]);
+        let value_norm = dflash_tree_refusal(false, true, [true], [None]);
+        assert!(value_norm.is_some_and(|r| r.contains("norme V")));
+        let quantized = dflash_tree_refusal(false, false, [true, false], [None]);
         assert!(quantized.is_some_and(|r| r.contains("KV quantifié")));
-        let linear = dflash_tree_refusal(false, [true], [None, Some("état SSM bf16".to_string())]);
+        let linear = dflash_tree_refusal(
+            false,
+            false,
+            [true],
+            [None, Some("état SSM bf16".to_string())],
+        );
         assert!(linear.is_some_and(|r| r.contains("SSM bf16")));
     }
 

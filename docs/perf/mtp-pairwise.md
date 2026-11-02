@@ -814,9 +814,10 @@ nœud (151 Mo chacun) ne sont pas le verrou : une transformée WY en arbre (Tree
 arXiv 2608.20961) ne garde que les pseudo-valeurs et reconstruit l'état accepté.
 Le plafond vient du coût des lignes et du gain d'acceptance borné.
 
-### Vérification en arbre DFlash 2 implémentée (2 nov. 2026, opt-in)
+### Vérification en arbre DFlash 2 implémentée (2 nov. 2026, B = 8 par défaut)
 
-`SARAGOSSA_RUST_DFLASH_TREE=B` (B ≤ 15, absent ou 0 = chaîne) reprend l'estimation
+`SARAGOSSA_RUST_DFLASH_TREE=B` (B ≤ 15, 0 = chaîne ; absent = B = 8 quand le modèle le
+supporte, chaîne sinon) reprend l'estimation
 ci-dessus avec la mesure de coût qui manquait : à B = 8 l'arbre garde les 9 lignes de
 la chaîne, le surcoût propre est le rollback par chemin à chaque tour (+0,2 ms), la
 construction CPU (0,05 ms) et la compaction KV. Le verdict « écartée » portait sur
@@ -826,8 +827,9 @@ Mise en œuvre : constructeur best-first (`src/decoder/resident/dflash_tree.rs`)
 attention en lignes masquée par ancêtres avec RoPE à base + profondeur (flash,
 2-passes, NAX), conv k4 et scan gated-delta par parent, journal SSM à 16 lignes et
 replay par chemin, compaction KV des lignes acceptées, contexte du drafter rassemblé
-sur le chemin. Refus explicite avant la boucle : KV quantifié, couches glissantes,
-SSM bf16, B > 15, trace d'arbre. Oracles : kernels arbre bit-identiques aux kernels
+sur le chemin. Configurations sans variante arbre (KV quantifié, couches glissantes, norme V,
+SSM bf16, B > 15, trace d'arbre) : l'arbre par défaut retombe sur la chaîne avec
+un diagnostic ; une valeur explicite, ou invalide, est refusée avant la boucle. Oracles : kernels arbre bit-identiques aux kernels
 chaîne sur chaque chemin, attention vs f64 (écart 1,3e-8, NAX 1,6e-6), chaîne
 dégénérée bit-identique au chemin historique, tokens = AR pour B = 1..15.
 
@@ -842,7 +844,24 @@ identiques partout (médiane de decode, tok/s) :
 | prose 32k | 43,1 | 48,4 | +14,3 / +12,3 / +13,5 % | +13,5 % |
 
 B = 12 (13 lignes) ajoute ~5,5 ms de vérification pour un débit voisin de B = 8 (une
-exécution). Reste opt-in comme le drafter DFlash lui-même.
+exécution). Arbre B = 8 par défaut dès que le drafter DFlash est chargé (le drafter reste
+opt-in par `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`).
+
+Contre le défaut MTP, même binaire, ABBA, 3 paires, 300 tokens greedy, textes
+identiques sur les 18 paires (médiane de decode, tok/s) :
+
+| Cas | Arbre B = 8 | MTP | Écart médian |
+|---|---|---|---|
+| code 4k | 57,4 | 47,2 | +23,2 % |
+| prose 4k | 48,5 | 43,7 | +11,5 % |
+| code 32k | 52,3 | 41,3 | +28,0 % |
+| prose 32k | 48,7 | 41,9 | +16,5 % |
+| code 64k | 36,4 | 31,0 | +17,6 % |
+| prose 64k | 47,2 | 34,8 | +35,2 % |
+
+La chaîne perdait contre MTP en prose 4k (−5 %) et code 65k (−6 %) ; l'arbre
+gagne partout. Matrice d'intégrité serve (MTP, chaîne, arbre ; streamé ou non,
+max_tokens 1/2/9/300, Anthropic, deux requêtes concurrentes) : sorties identiques.
 
 ### Captures SSM en journal de pseudo-valeurs (1er nov. 2026, opt-in)
 

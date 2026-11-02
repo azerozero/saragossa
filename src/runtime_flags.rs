@@ -1451,23 +1451,23 @@ pub(crate) fn dflash_windowed_rows() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS", true))
 }
 
-/// Vérification en arbre DFlash 2 (`SARAGOSSA_RUST_DFLASH_TREE=B`, défaut 0 =
-/// chaîne historique) : `B` nœuds best-first sur le treillis du sélecteur au
-/// lieu de la chaîne gloutonne, vérifiés en `B + 1` lignes. Lu à chaque
-/// génération ; une configuration hors périmètre est refusée avant la boucle.
-pub(crate) fn dflash_tree_budget() -> usize {
-    let Some(value) = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_TREE") else {
-        return 0;
-    };
-    parse_dflash_tree_budget(&value).unwrap_or_else(|| {
-        // Une coquille ne doit pas faire mesurer la chaîne en croyant mesurer
-        // l'arbre : diagnostic à chaque génération (lu par génération).
-        eprintln!(
-            "saragossa: SARAGOSSA_RUST_DFLASH_TREE={value:?} invalide (entier B ≥ 0), chaîne"
-        );
-        0
-    })
+/// Vérification en arbre DFlash 2 (`SARAGOSSA_RUST_DFLASH_TREE=B`) : `B` nœuds
+/// best-first sur le treillis du sélecteur au lieu de la chaîne gloutonne,
+/// vérifiés en `B + 1` lignes ; `0` = chaîne historique. `None` (variable
+/// absente) : défaut `DFLASH_TREE_DEFAULT_BUDGET` quand le modèle le supporte,
+/// chaîne sinon. Lu à chaque génération ; une valeur explicite invalide ou hors
+/// périmètre est refusée avant la boucle.
+pub(crate) fn dflash_tree_budget() -> Option<Result<usize, String>> {
+    let value = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_TREE")?;
+    // Une coquille ne doit pas faire mesurer la chaîne en croyant mesurer
+    // l'arbre : la valeur invalide est rendue telle quelle et refusée.
+    Some(parse_dflash_tree_budget(&value).ok_or(value))
 }
+
+/// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` : B = 8 garde les
+/// 9 lignes de la chaîne (même coût de vérification) et gagne +12 à +35 % de
+/// decode en pairwise (`docs/perf/mtp-pairwise.md`).
+pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
 
 /// Parse `SARAGOSSA_RUST_DFLASH_TREE` (entier, espaces ignorés) ; `None` si
 /// invalide.
