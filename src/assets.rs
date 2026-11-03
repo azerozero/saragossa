@@ -66,7 +66,11 @@ impl ModelAssets {
             });
         }
         let catalog = WeightCatalog::from_shards(&shards)?;
-        let mtp = detect_mtp_weights(model_dir, &raw_config_json)?;
+        let mtp = detect_mtp_weights(
+            model_dir,
+            &raw_config_json,
+            crate::runtime_flags::env_var_os(MTP_SIDECAR_ENV).map(PathBuf::from),
+        )?;
 
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
@@ -185,26 +189,43 @@ fn mtp_sidecar_candidates(model_dir: &Path, config: &serde_json::Value) -> Vec<P
     paths
 }
 
-fn detect_mtp_weights(model_dir: &Path, config: &serde_json::Value) -> Result<MtpWeightsInfo> {
+fn detect_mtp_weights(
+    model_dir: &Path,
+    config: &serde_json::Value,
+    sidecar_override: Option<PathBuf>,
+) -> Result<MtpWeightsInfo> {
+    // Tête posée hors du répertoire du modèle (dossier en lecture seule) :
+    // l'override explicite remplace la détection et ne se replie jamais
+    // silencieusement sur un sidecar local.
+    if let Some(path) = sidecar_override {
+        require_file(&path, "sidecar MTP (SARAGOSSA_RUST_MTP_SIDECAR)")?;
+        return mtp_weights_info(path);
+    }
     for path in mtp_sidecar_candidates(model_dir, config) {
-        if !path.is_file() {
-            continue;
+        if path.is_file() {
+            return mtp_weights_info(path);
         }
-        let keys = read_safetensors_keys(&path)?;
-        let normalized = keys
-            .iter()
-            .map(|key| normalize_mtp_sidecar_key(key))
-            .collect::<Vec<_>>();
-        let has_fc_weight = normalized.iter().any(|key| key == "mtp.fc.weight");
-        let has_mtp_tensors = normalized.iter().any(|key| key.starts_with("mtp."));
-        return Ok(MtpWeightsInfo {
-            path: Some(path),
-            tensor_count: keys.len(),
-            has_fc_weight,
-            has_mtp_tensors,
-        });
     }
     Ok(MtpWeightsInfo::default())
+}
+
+/// Variable désignant explicitement le sidecar MTP (opt-in).
+const MTP_SIDECAR_ENV: &str = "SARAGOSSA_RUST_MTP_SIDECAR";
+
+fn mtp_weights_info(path: PathBuf) -> Result<MtpWeightsInfo> {
+    let keys = read_safetensors_keys(&path)?;
+    let normalized = keys
+        .iter()
+        .map(|key| normalize_mtp_sidecar_key(key))
+        .collect::<Vec<_>>();
+    let has_fc_weight = normalized.iter().any(|key| key == "mtp.fc.weight");
+    let has_mtp_tensors = normalized.iter().any(|key| key.starts_with("mtp."));
+    Ok(MtpWeightsInfo {
+        path: Some(path),
+        tensor_count: keys.len(),
+        has_fc_weight,
+        has_mtp_tensors,
+    })
 }
 
 fn normalize_mtp_sidecar_key(key: &str) -> String {
@@ -381,6 +402,30 @@ mod tests {
         assert!(!assets.mtp.is_available());
         assert!(assets.mtp.has_mtp_tensors);
         assert!(!assets.mtp.has_fc_weight);
+    }
+
+    #[test]
+    fn explicit_mtp_sidecar_replaces_detection_and_must_exist() {
+        let model = tempfile::tempdir().expect("invariant: tempdir");
+        let outside = tempfile::tempdir().expect("invariant: tempdir");
+        write_safetensors(
+            &model.path().join("mtp.safetensors"),
+            "layers.0.input_layernorm.weight",
+        );
+        let explicit = outside.path().join("tete.safetensors");
+        write_safetensors(&explicit, "mtp.fc.weight");
+        let config = serde_json::json!({});
+
+        let info = super::detect_mtp_weights(model.path(), &config, Some(explicit.clone()))
+            .expect("invariant: sidecar explicite lisible");
+        assert_eq!(info.path.as_deref(), Some(explicit.as_path()));
+        assert!(info.is_available());
+
+        let missing = outside.path().join("absent.safetensors");
+        assert!(matches!(
+            super::detect_mtp_weights(model.path(), &config, Some(missing)),
+            Err(InferError::MissingArtifact { .. })
+        ));
     }
 
     #[test]
