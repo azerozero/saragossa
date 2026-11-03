@@ -29,7 +29,7 @@ use super::mtp;
 use super::protocol::{ChatCompletionRequest, ResponseFormatMode, Usage};
 use super::streaming::{
     CompletionSink, CompletionStreamEvent, StreamTerminalError, StreamingCompletionStart,
-    StreamingTextDetokenizer,
+    StreamingTextDetokenizer, TextStop,
 };
 use super::warmup;
 use crate::RuntimeKind;
@@ -659,6 +659,7 @@ impl LoadedModel {
         let PreparedRequest {
             tokens: prompt_tokens_ids,
             options,
+            stop_texts,
             ..
         } = &prepared;
         let token_constraint = options.token_constraint.clone();
@@ -669,12 +670,15 @@ impl LoadedModel {
             // décodeur (longest-prefix + extension). Il by-passe donc les
             // snapshots par blocs de serve pour ces seules requêtes greedy
             // non guidées ; le chemin AR reste strictement inchangé.
-            let output = self.decoder.generate_greedy_mtp_batched_with_options(
+            let mut text_stop = TextStop::new(&self.assets, stop_texts, max_tokens);
+            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
+                |token| text_stop.push(token),
             )?;
+            text_stop.finish()?;
             let reused = output.stats.reused_prefix_tokens;
             (
                 mtp::into_generation_output(output, started.elapsed()),
@@ -690,14 +694,29 @@ impl LoadedModel {
                     memory_guard,
                 )?;
             // TODO: Câbler une annulation non-stream quand serve aura un signal partagé fiable.
-            let output = self
-                .decoder
-                .generate_greedy_timed_from_prompt_state_with_options(
-                    prompt_state,
-                    prefill,
-                    max_tokens,
-                    options,
-                )?;
+            // Sans stop texte, la variante sans callback garde le decode pipeliné.
+            let output = if stop_texts.is_empty() {
+                self.decoder
+                    .generate_greedy_timed_from_prompt_state_with_options(
+                        prompt_state,
+                        prefill,
+                        max_tokens,
+                        options,
+                    )?
+            } else {
+                let mut text_stop = TextStop::new(&self.assets, stop_texts, max_tokens);
+                let output = self
+                    .decoder
+                    .generate_greedy_timed_from_prompt_state_with_options_and_callback(
+                        prompt_state,
+                        prefill,
+                        max_tokens,
+                        options,
+                        |token| text_stop.push(token),
+                    )?;
+                text_stop.finish()?;
+                output
+            };
             (output, reused_prefix_tokens, "block-snapshots")
         };
         ensure_guided_finished(token_constraint.as_deref())?;

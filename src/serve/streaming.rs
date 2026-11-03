@@ -80,6 +80,47 @@ pub(super) trait CompletionSink {
     fn finish(&mut self, result: ServeResult<ServedCompletion>) -> ServeResult<()>;
 }
 
+/// Arrêt du decode non streamé sur stop texte, même règle que le streaming :
+/// un stop dont les ids ne ferment aucune séquence coupe aussi le decode, d'où
+/// contenu et usage identiques entre les deux modes.
+pub(crate) struct TextStop<'a> {
+    detokenizer: Option<StreamingTextDetokenizer<'a>>,
+    error: Option<ServeError>,
+}
+
+impl<'a> TextStop<'a> {
+    pub(crate) fn new(
+        assets: &'a ModelAssets,
+        stop_texts: &'a [String],
+        max_tokens: usize,
+    ) -> Self {
+        Self {
+            detokenizer: (!stop_texts.is_empty())
+                .then(|| StreamingTextDetokenizer::new(assets, stop_texts, max_tokens)),
+            error: None,
+        }
+    }
+
+    /// `true` tant que la génération continue.
+    pub(crate) fn push(&mut self, token: usize) -> bool {
+        let Some(detokenizer) = self.detokenizer.as_mut() else {
+            return true;
+        };
+        match detokenizer.push_token(token, &mut |_| Ok(())) {
+            Ok(()) => !detokenizer.stopped(),
+            Err(error) => {
+                self.error = Some(error);
+                false
+            }
+        }
+    }
+
+    /// Rend l'erreur de détokenisation qui a arrêté le decode, s'il y en a une.
+    pub(crate) fn finish(self) -> ServeResult<()> {
+        self.error.map_or(Ok(()), Err)
+    }
+}
+
 pub(crate) struct StreamingTextDetokenizer<'a> {
     assets: &'a ModelAssets,
     stop_texts: &'a [String],
