@@ -156,6 +156,10 @@ impl AnthropicMessagesRequest {
             seed: None,
             chat_template_kwargs: None,
             stream_options: None,
+            min_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            repetition_penalty: None,
         })
     }
 }

@@ -63,6 +63,19 @@ pub(super) struct ChatCompletionRequest {
     /// Options du flux SSE (`stream_options` OpenAI).
     #[serde(default)]
     pub(super) stream_options: Option<StreamOptions>,
+    /// Filtre min-p : non implémenté, seule la valeur neutre 0 est admise.
+    #[serde(default)]
+    pub(super) min_p: Option<f32>,
+    /// Pénalité de présence OpenAI : non implémentée, neutre 0 seulement.
+    #[serde(default)]
+    pub(super) presence_penalty: Option<f32>,
+    /// Pénalité de fréquence OpenAI : non implémentée, neutre 0 seulement.
+    #[serde(default)]
+    pub(super) frequency_penalty: Option<f32>,
+    /// Pénalité de répétition (vLLM, llama.cpp) : non implémentée, neutre 1
+    /// seulement.
+    #[serde(default)]
+    pub(super) repetition_penalty: Option<f32>,
 }
 
 /// `stream_options` OpenAI.
@@ -126,6 +139,7 @@ impl ChatCompletionRequest {
         let max_tokens = self.max_tokens_capped(max_tokens_cap)?;
         self.response_format_mode()?;
         self.enable_thinking()?;
+        self.reject_unsupported_sampling()?;
         // Un tableau de chaînes vides pèse ~12× son JSON une fois désérialisé :
         // bornées, les stops ne peuvent plus amplifier la mémoire des requêtes.
         let stops = self.stop_texts();
@@ -199,6 +213,27 @@ impl ChatCompletionRequest {
             }
         }
         Ok(thinking)
+    }
+
+    /// Refuse un filtre ou une pénalité que le sampler n'applique pas : une
+    /// valeur non neutre acceptée en silence changerait la distribution
+    /// annoncée au client. La valeur neutre, ou l'absence, reste admise.
+    fn reject_unsupported_sampling(&self) -> ServeResult<()> {
+        let fields = [
+            ("min_p", self.min_p, 0.0),
+            ("presence_penalty", self.presence_penalty, 0.0),
+            ("frequency_penalty", self.frequency_penalty, 0.0),
+            ("repetition_penalty", self.repetition_penalty, 1.0),
+        ];
+        for (name, value, neutral) in fields {
+            // NaN est refusé aussi : `!=` est vrai pour lui.
+            if let Some(value) = value.filter(|value| *value != neutral) {
+                return Err(ServeError::not_implemented(format!(
+                    "{name}={value} n'est pas supporté (seule la valeur neutre {neutral} l'est)"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Le flux SSE se termine-t-il par un chunk d'usage ?
@@ -787,6 +822,35 @@ mod tests {
             r#"{"reasoning_effort":"low"}"#,
         ] {
             assert!(parse(refused).validate(1024).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn unsupported_sampling_accepts_only_neutral_values() {
+        let validate = |fields: &str| {
+            serde_json::from_str::<ChatCompletionRequest>(&format!(
+                r#"{{"model":"m","messages":[]{fields}}}"#
+            ))
+            .expect("invariant: JSON valide")
+            .validate(1024)
+        };
+
+        assert!(validate("").is_ok());
+        assert!(validate(
+            r#","min_p":0,"presence_penalty":0.0,"frequency_penalty":0,"repetition_penalty":1"#
+        )
+        .is_ok());
+        for refused in [
+            r#","min_p":0.05"#,
+            r#","presence_penalty":0.5"#,
+            r#","frequency_penalty":-1"#,
+            r#","repetition_penalty":1.1"#,
+            r#","repetition_penalty":0"#,
+        ] {
+            assert!(
+                matches!(validate(refused), Err(ServeError::NotImplemented(_))),
+                "{refused}"
+            );
         }
     }
 
