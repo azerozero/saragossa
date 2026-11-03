@@ -795,6 +795,109 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Lignes de logits `[rows, vocab]` → un token échantillonné par ligne, avec
+    /// l'état RNG propre à chaque ligne (`rng_states[row]`) : mêmes kernels que
+    /// le sampler résident solo (Gumbel si `top_k = 0` et `top_p = 1`, top-k/top-p
+    /// sinon), une passe par ligne comme la tête argmax en lignes.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `rng_states` est vide, si les offsets débordent ou
+    /// si les paramètres sortent du sampler GPU.
+    pub(crate) fn encode_sample_rows_with_states(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buffer: &BufferRef,
+        out_dim: usize,
+        index_buffer: &BufferRef,
+        index_offset: u64,
+        (temperature, top_p, top_k): (f32, f32, usize),
+        rng_states: &[u64],
+    ) -> Result<()> {
+        if rng_states.is_empty() {
+            return Err(InferError::Dimension(
+                "sample rows exige au moins une ligne".to_string(),
+            ));
+        }
+        for (row, &rng_state) in rng_states.iter().enumerate() {
+            let logits_offset = byte_offset_f32(
+                row.checked_mul(out_dim).ok_or_else(|| {
+                    InferError::Dimension("sample rows logits offset déborde".to_string())
+                })?,
+                "sample rows logits offset",
+            )?;
+            let out_offset = row
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|value| u64::try_from(value).ok())
+                .and_then(|value| index_offset.checked_add(value))
+                .ok_or_else(|| InferError::Metal("sample rows index offset déborde".to_string()))?;
+            self.encode_sample_topk_topp_with_offsets(
+                encoder,
+                logits_buffer,
+                logits_offset,
+                index_buffer,
+                out_offset,
+                out_dim,
+                top_k,
+                temperature,
+                top_p,
+                rng_state,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// lm_head projeté une fois pour toutes les lignes, puis un token
+    /// échantillonné par ligne (`encode_sample_rows_with_states`) : tête de la
+    /// vérification DFlash échantillonnée, aucun logit relu.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la projection ou l'échantillonnage échoue.
+    pub(crate) fn encode_lm_head_sample_rows_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        lm_head: &MetalLinearWeightBuffers,
+        index_buffer: &BufferRef,
+        in_dim: usize,
+        params: (f32, f32, usize),
+        rng_states: &[u64],
+    ) -> Result<()> {
+        let rows = rng_states.len();
+        let out_dim = self.linear_weight_out_dim(lm_head);
+        let logits_len = rows
+            .checked_mul(out_dim)
+            .ok_or_else(|| InferError::Dimension("sample rows logits déborde".to_string()))?;
+        let logits_buffer = self.private_f32_buffer(logits_len, "sample_rows_logits")?;
+        // NOTE: même option que les samplers solo (`prefer_fast_affine = false`) ;
+        // le kernel du matmul dépend toutefois du nombre de lignes, donc les
+        // logits peuvent différer de ceux du decode à une ligne aux arrondis près.
+        let projected_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            input_buffer,
+            rows,
+            in_dim,
+            lm_head,
+            &logits_buffer,
+            false,
+        )?;
+        if projected_dim != out_dim {
+            return Err(InferError::Dimension(format!(
+                "sample rows projection sort {projected_dim}, attendu {out_dim}"
+            )));
+        }
+        self.encode_sample_rows_with_states(
+            encoder,
+            &logits_buffer,
+            out_dim,
+            index_buffer,
+            0,
+            params,
+            rng_states,
+        )
+    }
+
     pub(crate) fn argmax_linear_biasless_rows_buffers(
         &self,
         input: &Tensor,

@@ -4314,3 +4314,105 @@ fn qmv_u4_residual_falls_back_without_mutation() -> Result<()> {
     assert_eq!(read_f32_buffer(&out, 64)?, sentinel);
     Ok(())
 }
+
+/// Sampler en lignes (tête de la vérification DFlash échantillonnée) : chaque
+/// ligne, à son offset et avec son état (profondeurs répétées comme des sœurs
+/// d'arbre), rend le token du même sampler appelé seul sur la même ligne, et
+/// celui de la référence CPU ; les cases sentinelles autour restent intactes.
+/// Rejoué en encodeur sériel et en encodeur concurrent sous le scope de
+/// barrières de production : les buffers partiels réutilisés entre lignes
+/// n'y tiennent que par les barrières.
+#[test]
+fn sample_rows_with_states_match_isolated_and_cpu() -> Result<()> {
+    let executor = match MetalExecutor::new() {
+        Ok(executor) => executor,
+        Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let vocab = 300_usize;
+    let depths = [0_usize, 1, 1, 2, 3, 3];
+    let rows = depths.len();
+    let logits: Vec<f32> = (0..rows * vocab)
+        .map(|idx| {
+            let (row, col) = (idx / vocab, idx % vocab);
+            ((col * 37 + row * 11) % 101) as f32 * 0.05 - 2.0
+        })
+        .collect();
+    const SENTINEL: u32 = u32::MAX;
+    for (temperature, top_p, top_k) in [
+        (0.7_f32, 1.0_f32, 0_usize),
+        (0.7, 0.9, 20),
+        (1.3, 0.5, 2),
+        (0.7, 0.9, 1),
+        (0.7, 1.0, 32),
+    ] {
+        for seed in [1_u64, 0xdead_beef] {
+            let states: Vec<u64> = depths
+                .iter()
+                .map(|&depth| crate::sampling::rng_state_for_draw(seed, 5 + depth))
+                .collect();
+            let logits_buffer = executor.upload_f32_buffer(&logits, "rows_test_logits")?;
+            let index_buffer =
+                executor.upload_u32_buffer(&vec![SENTINEL; rows + 2], "rows_test_index")?;
+            for concurrent in [false, true] {
+            let command_buffer = executor.queue.new_command_buffer();
+            let _barrier_guard = concurrent.then(install_dispatch_barrier_scope);
+            let encoder = if concurrent {
+                command_buffer
+                    .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+            } else {
+                command_buffer.new_compute_command_encoder()
+            };
+            executor.encode_sample_rows_with_states(
+                encoder,
+                &logits_buffer,
+                vocab,
+                &index_buffer,
+                4,
+                (temperature, top_p, top_k),
+                &states,
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command_buffer)?;
+            let out = read_u32_buffer(&index_buffer, rows + 2)?;
+            write_u32_buffer(&index_buffer, &vec![SENTINEL; rows + 2])?;
+            assert_eq!(out[0], SENTINEL);
+            assert_eq!(out[rows + 1], SENTINEL);
+            for (row, &state) in states.iter().enumerate() {
+                let line = &logits[row * vocab..(row + 1) * vocab];
+                let single_logits = executor.upload_f32_buffer(line, "rows_test_single")?;
+                let single_index = executor.new_u32_buffer(1, "rows_test_single_index")?;
+                let command_buffer = executor.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                executor.encode_sample_topk_topp_with_offsets(
+                    encoder,
+                    &single_logits,
+                    0,
+                    &single_index,
+                    0,
+                    vocab,
+                    top_k,
+                    temperature,
+                    top_p,
+                    state,
+                )?;
+                encoder.end_encoding();
+                commit_and_wait(command_buffer)?;
+                let isolated = read_u32_buffer(&single_index, 1)?[0];
+                let cpu = if top_k == 0 {
+                    cpu_gumbel_argmax_for_test(line, temperature, state)
+                } else {
+                    let mut sampler = crate::DeterministicSampler::new(state);
+                    crate::sample_token_top_k_top_p(line, temperature, top_p, top_k, &mut sampler)?
+                };
+                let params = format!(
+                    "T={temperature} top_p={top_p} top_k={top_k} seed={seed} concurrent={concurrent}"
+                );
+                assert_eq!(out[row + 1], isolated, "ligne {row} {params}");
+                assert_eq!(out[row + 1] as usize, cpu, "ligne {row} {params}");
+            }
+            }
+        }
+    }
+    Ok(())
+}

@@ -13,6 +13,17 @@ pub struct DeterministicSampler {
     state: u64,
 }
 
+/// Incrément de l'état SplitMix64 par tirage (`next_u64`, kernels GPU).
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// État de `DeterministicSampler::new(seed)` AVANT son tirage `index` (0 = le
+/// premier) : l'état avance d'une constante par tirage, l'état du tirage `i` se
+/// calcule donc sans rejouer les précédents. Le DFlash échantillonné tire ainsi
+/// chaque ligne de vérification à l'indice du token qu'elle produirait.
+pub(crate) fn rng_state_for_draw(seed: u64, index: usize) -> u64 {
+    seed.wrapping_add((index as u64).wrapping_mul(SPLITMIX_GAMMA))
+}
+
 impl DeterministicSampler {
     /// Crée un sampler déterministe depuis une graine.
     pub fn new(seed: u64) -> Self {
@@ -20,14 +31,16 @@ impl DeterministicSampler {
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.state = self.state.wrapping_add(SPLITMIX_GAMMA);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
 
-    fn next_unit_f32(&mut self) -> f32 {
+    /// Tire un uniforme dans [0, 1) sur 24 bits (même calcul que `splitmix_unit_f32`
+    /// des kernels).
+    pub(crate) fn next_unit_f32(&mut self) -> f32 {
         let mantissa = (self.next_u64() >> 40) as u32;
         mantissa as f32 / (1_u32 << 24) as f32
     }
@@ -655,6 +668,17 @@ mod tests {
             .expect("invariant: sampling valide");
 
         assert!(token <= 1, "token={token}");
+    }
+
+    #[test]
+    fn rng_state_for_draw_is_state_before_draw() {
+        for seed in [0_u64, 7, u64::MAX - 3] {
+            let mut sampler = DeterministicSampler::new(seed);
+            for index in 0..64 {
+                assert_eq!(rng_state_for_draw(seed, index), sampler.state());
+                sampler.advance();
+            }
+        }
     }
 
     #[test]

@@ -611,12 +611,23 @@ struct ResidentVerifyCaptures;
 
 /// Tête appliquée aux états finaux du verify résident.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ResidentVerifyHead {
     Skip,
     Argmax,
     /// Ligne de logits complète par état, relue sur le CPU (échantillonné).
     Logits,
+    /// Un token échantillonné sur le GPU par ligne (DFlash échantillonné) : la
+    /// ligne de profondeur `d` tire avec `rng_state_for_draw(seed, first_draw + d)`,
+    /// l'indice du token qu'elle produirait dans la sortie. Profondeur = rang de
+    /// la ligne en chaîne, profondeur du nœud en arbre.
+    Sample {
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+        seed: u64,
+        first_draw: usize,
+    },
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

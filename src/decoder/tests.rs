@@ -4612,3 +4612,271 @@ fn lookup_greedy_matches_ar_real_model() -> Result<()> {
     assert!(stops_in_drafts > 0, "aucun arrêt parmi des drafts acceptés");
     Ok(())
 }
+
+// --- DFlash échantillonné : tirage par ligne et descente, modèle réel ---
+
+/// Diagnostic d'un écart AR/DFlash au token `index` : probabilités, sous la
+/// cible filtrée de l'AR (logits du decode résident forcé sur le préfixe
+/// commun), des deux tokens et uniforme du tirage `index` de la graine.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_sampled_divergence(
+    model: &CausalDecoder,
+    prompt: &[usize],
+    ar: &[usize],
+    other: &[usize],
+    options: &GenerationOptions,
+) -> Result<String> {
+    let Some(index) = ar.iter().zip(other).position(|(a, b)| a != b) else {
+        return Ok(format!("longueurs {} contre {}", ar.len(), other.len()));
+    };
+    if index == 0 {
+        return Ok("premier token différent".to_string());
+    }
+    let kv_bf16 = CausalDecoder::resident_kv_bf16(true, prompt.len());
+    let forced = model.resident_forced_logits_for_test(prompt, &ar[..index], kv_bf16)?;
+    let distribution = crate::sampling::token_distribution_top_k_top_p(
+        &forced[index - 1],
+        options.temperature,
+        options.top_p,
+        options.top_k,
+    )?;
+    let probability = |token: usize| {
+        distribution
+            .iter()
+            .find(|(candidate, _)| *candidate == token)
+            .map_or(0.0, |(_, p)| *p)
+    };
+    let u =
+        crate::DeterministicSampler::new(crate::sampling::rng_state_for_draw(options.seed, index))
+            .next_unit_f32();
+    Ok(format!(
+        "écart au token {index} : AR {} (p = {}) contre {} (p = {}), u = {u}",
+        ar[index],
+        probability(ar[index]),
+        other[index],
+        probability(other[index])
+    ))
+}
+
+/// DFlash échantillonné sur le modèle réel (`SARAGOSSA_RUST_DFLASH_SAMPLED=1`) :
+/// - à T = 0,05 (top-k 20, top-p 0,9), chaîne et arbre B = 8 sortent les tokens
+///   de l'AR échantillonné de même graine, et une graine rejoue sa sortie ;
+/// - à T = 0,7, sur `SARAGOSSA_RUST_DFLASH_SAMPLED_SEEDS` graines (24 par
+///   défaut), chaîne et arbre B = 8 sortent exactement les tokens de l'AR de
+///   même graine (campagne déterministe : 96/96 le 3 novembre). Un écart échoue
+///   avec son diagnostic (probabilités des deux tokens sous l'AR, uniforme).
+///
+/// Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`,
+/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` et `SARAGOSSA_RUST_DFLASH_SAMPLED=1`.
+#[test]
+#[ignore = "modèle réel + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_sampled_matches_ar_real_model() -> Result<()> {
+    use crate::decoder::resident::dflash::DFlashTreeMode;
+    let Some((model, assets, draft)) = dflash_sampled_model()? else {
+        return Ok(());
+    };
+    let seeds = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SAMPLED_SEEDS")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(24);
+    let block = draft.info.block_size;
+    let run = |prompt: &[usize], max_new: usize, options: &GenerationOptions, mode| {
+        model.generate_greedy_dflash_resident_tree(
+            prompt,
+            max_new,
+            options,
+            &draft,
+            block,
+            (mode, true),
+            |_| true,
+        )
+    };
+    for text in [
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+        "Raconte en quelques phrases l'histoire d'un phare isolé sur une côte bretonne.",
+    ] {
+        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
+        let cold = GenerationOptions {
+            temperature: 0.05,
+            seed: 7,
+            ..dflash_sampled_options()
+        };
+        let ar = model.generate_greedy_cached_with_options(&prompt, 32, &cold)?;
+        for mode in [DFlashTreeMode::Off, DFlashTreeMode::BestFirst(8)] {
+            let first = run(&prompt, 32, &cold, mode)?;
+            let second = run(&prompt, 32, &cold, mode)?;
+            assert_eq!(first.tokens, ar, "T=0,05 {mode:?} « {} »", &text[..20]);
+            assert_eq!(first.tokens, second.tokens, "rejeu de graine {mode:?}");
+        }
+        let max_new = 32;
+        for mode in [DFlashTreeMode::Off, DFlashTreeMode::BestFirst(8)] {
+            let (mut accepted, mut proposed) = (0, 0);
+            for seed in 0..seeds {
+                let warm = GenerationOptions {
+                    temperature: 0.7,
+                    seed,
+                    ..dflash_sampled_options()
+                };
+                let ar = model.generate_greedy_cached_with_options(&prompt, max_new, &warm)?;
+                let spec = run(&prompt, max_new, &warm, mode)?;
+                accepted += spec.stats.accepted;
+                proposed += spec.stats.proposed;
+                if spec.tokens != ar {
+                    let why = dflash_sampled_divergence(&model, &prompt, &ar, &spec.tokens, &warm)?;
+                    panic!("DFlash échantillonné {mode:?} graine {seed} différent de l'AR : {why}");
+                }
+            }
+            eprintln!(
+                "DFlash échantillonné T=0,7 {mode:?} « {} » : {seeds}/{seeds} sorties identiques à l'AR, acceptance {accepted}/{proposed}",
+                &text[..20],
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Modèle, assets et drafter des tests DFlash échantillonnés (`None` : skip).
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_sampled_model() -> Result<Option<(CausalDecoder, crate::ModelAssets, crate::DFlashDraft)>>
+{
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(None);
+    };
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none()
+        || !crate::runtime_flags::dflash_sampled_enabled()
+    {
+        eprintln!("skip DFlash échantillonné: drafter ou SARAGOSSA_RUST_DFLASH_SAMPLED=1 absent");
+        return Ok(None);
+    }
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config("drafter DFlash non chargé".to_string()))?
+        .clone();
+    Ok(Some((model, assets, draft)))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_sampled_options() -> GenerationOptions {
+    GenerationOptions {
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 20,
+        ..mtp_verifier_options(Vec::new())
+    }
+}
+
+/// Arrêts du DFlash échantillonné sur les entrées de production, chaîne
+/// (`Off`) et arbre B = 8, à T = 0,7 : stop token à chaque position de la
+/// trajectoire libre (stop initial, stop accepté parmi les drafts, rejet ou
+/// bonus devenu stop), stop sequence de deux tokens à chaque position (donc à
+/// cheval sur deux tours quelque part), callback qui arrête et limite de sortie
+/// à chaque longueur. Les tokens rendus ET émis valent ceux de l'AR
+/// échantillonné de même graine avec les mêmes arrêts.
+///
+/// Requiert les mêmes variables que `dflash_sampled_matches_ar_real_model`.
+#[test]
+#[ignore = "modèle réel + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_sampled_stops_match_ar_real_model() -> Result<()> {
+    use crate::decoder::resident::dflash::DFlashTreeMode;
+    let Some((model, assets, draft)) = dflash_sampled_model()? else {
+        return Ok(());
+    };
+    let block = draft.info.block_size;
+    let prompt = mtp_verifier_prompt_ids(
+        &assets,
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+    )?;
+    let max_new = 24;
+    for seed in [3_u64, 11] {
+        let base = GenerationOptions {
+            seed,
+            ..dflash_sampled_options()
+        };
+        let free = model.generate_greedy_cached_with_options(&prompt, max_new, &base)?;
+        assert_eq!(
+            free.len(),
+            max_new,
+            "trajectoire libre courte (graine {seed})"
+        );
+        let mut cases: Vec<(String, GenerationOptions, usize, usize)> = Vec::new();
+        for position in 0..max_new {
+            cases.push((
+                format!("stop token {} (position {position})", free[position]),
+                GenerationOptions {
+                    stop_token_ids: vec![free[position]],
+                    ..base.clone()
+                },
+                max_new,
+                usize::MAX,
+            ));
+            if position + 1 < max_new {
+                cases.push((
+                    format!("stop sequence en {position}"),
+                    GenerationOptions {
+                        stop_sequences: vec![free[position..position + 2].to_vec()],
+                        ..base.clone()
+                    },
+                    max_new,
+                    usize::MAX,
+                ));
+            }
+            cases.push((
+                format!("callback {}", position + 1),
+                base.clone(),
+                max_new,
+                position + 1,
+            ));
+            cases.push((
+                format!("limite {}", position + 1),
+                base.clone(),
+                position + 1,
+                usize::MAX,
+            ));
+        }
+        for (label, options, limit, callback) in &cases {
+            fn recorder(
+                emitted: &mut Vec<usize>,
+                callback: usize,
+            ) -> impl FnMut(usize) -> bool + '_ {
+                move |token| {
+                    emitted.push(token);
+                    emitted.len() < callback
+                }
+            }
+            let mut ar_emitted = Vec::new();
+            let ar = model
+                .generate_greedy_streaming_with_options(
+                    &prompt,
+                    *limit,
+                    options,
+                    recorder(&mut ar_emitted, *callback),
+                )?
+                .tokens;
+            assert_eq!(ar, ar_emitted, "AR {label} : sortie et flux");
+            for mode in [DFlashTreeMode::Off, DFlashTreeMode::BestFirst(8)] {
+                let mut emitted = Vec::new();
+                let spec = model.generate_greedy_dflash_resident_tree(
+                    &prompt,
+                    *limit,
+                    options,
+                    &draft,
+                    block,
+                    (mode, true),
+                    recorder(&mut emitted, *callback),
+                )?;
+                assert_eq!(spec.tokens, ar, "graine {seed} {mode:?} {label}");
+                assert_eq!(emitted, ar, "flux graine {seed} {mode:?} {label}");
+            }
+        }
+        eprintln!(
+            "DFlash échantillonné arrêts graine {seed} : {} cas identiques à l'AR",
+            cases.len()
+        );
+    }
+    Ok(())
+}

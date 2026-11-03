@@ -1626,6 +1626,16 @@ pub fn mtp_sampled_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SAMPLED", true))
 }
 
+/// Route les requêtes échantillonnées (température > 0) vers le drafter DFlash
+/// quand il est configuré (`SARAGOSSA_RUST_DFLASH_DRAFT_DIR`), au lieu de la tête
+/// MTP : chaque ligne de vérification (chaîne ou arbre) est tirée sur le GPU par
+/// le sampler de l'AR, à l'aléa du token qu'elle produirait, et le parcours
+/// greedy descend vers l'enfant tiré. Opt-in (`SARAGOSSA_RUST_DFLASH_SAMPLED=1`).
+pub fn dflash_sampled_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DFLASH_SAMPLED", false))
+}
+
 /// Active le prefix-cache par blocs de `saragossa serve`.
 pub fn serve_prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
