@@ -4248,6 +4248,8 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
         .resident
         .as_ref()
         .is_some_and(|arena| model.resident_layer_batch_supported(arena));
+    // Seule portée où `SARAGOSSA_RUST_VERIFY_SKIP` agit (ablation par poste).
+    let _skip_scope = crate::runtime_flags::VerifySkipScope::install();
     for (rows, capture) in rows_list {
         if rows > 1 && !batched && !sequential_ok {
             return Err(InferError::Config(format!(

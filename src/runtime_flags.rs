@@ -779,7 +779,10 @@ pub(crate) fn moe_verify_rows_enabled() -> bool {
 /// 0 = chemin batché générique du prefill (11 dispatches, top-k un thread par
 /// ligne), 1 = top-k parallèle du mono par ligne seul, 2 (défaut) = structure
 /// du mono en 8 dispatches (gate+up partagé fusionné, combine avec partagé).
-/// Niveaux gardés comme référence et pour les ablations.
+/// Niveaux gardés comme référence et pour les ablations. NOTE: le niveau 2 est
+/// actif par défaut sur les couches `LinearMoe` de toute vérification en lignes
+/// (chemin sous `SARAGOSSA_RUST_PREFILL_MOE_ROWS`, défaut ON), pas seulement
+/// sous `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1` ; `=0` rend l'ancien chemin.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn moe_verify_tail_level() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();
@@ -804,25 +807,61 @@ pub(crate) fn moe_verify_shared_fused_max_rows() -> usize {
 }
 
 /// Ablation de diagnostic du pas de vérification résidente
-/// (`SARAGOSSA_RUST_VERIFY_SKIP=moe_full,moe_linear,linear_attn,full_layer,head`,
-/// devtools seulement) : la partie nommée est remplacée par une copie de son
-/// entrée, pour attribuer le temps mural par poste. Les sorties sont fausses ;
-/// jamais en production, jamais pendant un oracle.
+/// (`SARAGOSSA_RUST_VERIFY_SKIP=moe_full,moe_linear,linear_attn,full_layer,head`) :
+/// la partie nommée est remplacée par une copie de son entrée (la tête ne rend
+/// aucun token), pour attribuer le temps mural par poste. Compilée sous
+/// `devtools` (feature par défaut), mais active seulement dans la portée
+/// `VerifySkipScope` (tests seulement) que seul le bench de vérification
+/// installe : le decode AR, `serve` et les oracles l'ignorent même si la
+/// variable est posée.
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(crate) fn verify_skip(part: &str) -> bool {
     static PARTS: OnceLock<Vec<String>> = OnceLock::new();
-    PARTS
-        .get_or_init(|| {
-            env_var("SARAGOSSA_RUST_VERIFY_SKIP")
-                .map(|list| {
-                    list.split(',')
-                        .map(|item| item.trim().to_string())
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .iter()
-        .any(|item| item == part)
+    VERIFY_SKIP_SCOPE.with(std::cell::Cell::get)
+        && PARTS
+            .get_or_init(|| {
+                let parts: Vec<String> = env_var("SARAGOSSA_RUST_VERIFY_SKIP")
+                    .map(|list| {
+                        list.split(',')
+                            .map(|item| item.trim().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !parts.is_empty() {
+                    eprintln!(
+                        "SARAGOSSA_RUST_VERIFY_SKIP={parts:?} : ablation active, sorties fausses"
+                    );
+                }
+                parts
+            })
+            .iter()
+            .any(|item| item == part)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+thread_local! {
+    static VERIFY_SKIP_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Portée où [`verify_skip`] lit `SARAGOSSA_RUST_VERIFY_SKIP` (thread courant,
+/// restaurée au drop). Réservée au bench de vérification : compilée pour les
+/// tests seulement, aucun binaire ne peut l'installer.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools", test))]
+pub(crate) struct VerifySkipScope(bool);
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools", test))]
+impl VerifySkipScope {
+    /// Active l'ablation sur ce thread jusqu'au drop.
+    pub(crate) fn install() -> Self {
+        Self(VERIFY_SKIP_SCOPE.with(|scope| scope.replace(true)))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools", test))]
+impl Drop for VerifySkipScope {
+    fn drop(&mut self) {
+        VERIFY_SKIP_SCOPE.with(|scope| scope.set(self.0));
+    }
 }
 
 /// Sans devtools, aucune ablation : constante pour que l'appel disparaisse.

@@ -365,22 +365,25 @@ impl CausalDecoder {
                 hidden,
                 eps,
             )?;
-            let final_indices = if head == ResidentVerifyHead::Argmax {
+            // Ablation devtools de la tête : aucun token rendu (le scratch des
+            // indices n'est pas réinitialisé, il serait lu comme des tokens).
+            let skip_head = crate::runtime_flags::verify_skip("head");
+            let final_indices = if head == ResidentVerifyHead::Argmax && !skip_head {
                 let indices = arena.state.scratch().lease(batch, GpuElement::U32)?;
                 // lm_head projeté une fois pour toutes les lignes, argmax par ligne.
-                if !crate::runtime_flags::verify_skip("head") {
-                    metal.encode_lm_head_argmax_rows_buffers(
-                        encoder,
-                        final_states.tensor().buffer(),
-                        &arena.lm_head,
-                        indices.tensor().buffer(),
-                        0,
-                        0,
-                        batch,
-                        hidden,
-                    )?;
-                }
+                metal.encode_lm_head_argmax_rows_buffers(
+                    encoder,
+                    final_states.tensor().buffer(),
+                    &arena.lm_head,
+                    indices.tensor().buffer(),
+                    0,
+                    0,
+                    batch,
+                    hidden,
+                )?;
                 Some(indices)
+            } else if head == ResidentVerifyHead::Argmax {
+                None
             } else if let ResidentVerifyHead::Sample {
                 temperature,
                 top_p,
@@ -625,7 +628,10 @@ impl CausalDecoder {
                 hidden,
             )?;
         }
-        let final_indices = if head == ResidentVerifyHead::Argmax {
+        // Ablation devtools de la tête : aucun token rendu (voir le chemin en
+        // lignes).
+        let skip_head = crate::runtime_flags::verify_skip("head");
+        let final_indices = if head == ResidentVerifyHead::Argmax && !skip_head {
             let indices = arena
                 .state
                 .scratch()
@@ -644,18 +650,16 @@ impl CausalDecoder {
                     .ok_or_else(|| {
                         InferError::Metal("verify argmax index offset déborde".to_string())
                     })?;
-                if !crate::runtime_flags::verify_skip("head") {
-                    metal.encode_lm_head_argmax_buffers_with_index_offset(
-                        encoder,
-                        &mut owned,
-                        final_states.tensor().buffer(),
-                        &arena.lm_head,
-                        indices.tensor().buffer(),
-                        input_offset,
-                        index_offset,
-                        hidden,
-                    )?;
-                }
+                metal.encode_lm_head_argmax_buffers_with_index_offset(
+                    encoder,
+                    &mut owned,
+                    final_states.tensor().buffer(),
+                    &arena.lm_head,
+                    indices.tensor().buffer(),
+                    input_offset,
+                    index_offset,
+                    hidden,
+                )?;
             }
             Some(indices)
         } else {

@@ -2110,7 +2110,9 @@ impl DecodeResidentState {
                 0,
                 layer_out,
                 0,
-                rows * hidden,
+                rows.checked_mul(hidden).ok_or_else(|| {
+                    InferError::Dimension("ablation MoE en lignes: taille déborde".to_string())
+                })?,
             );
         }
         executor.encode_moe_shared_buffers_verify_rows(
