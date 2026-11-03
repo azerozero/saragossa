@@ -497,7 +497,11 @@ fn load_mtp_fused_experts(
     resolve: &HashMap<String, String>,
     expected_hidden: usize,
     quant: MtpMoeQuant,
-    _context: &MtpLoadContext<'_>,
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "metal")),
+        expect(unused_variables, reason = "quantification Metal seulement")
+    )]
+    context: &MtpLoadContext<'_>,
 ) -> Result<(Vec<LinearWeight>, Vec<LinearWeight>, Vec<LinearWeight>)> {
     let gate_up = st_view(st, resolve, MTP_MOE_MARKER)?;
     let down_key = MTP_MOE_DOWN;
@@ -540,7 +544,7 @@ fn load_mtp_fused_experts(
     let gate_up_offset = sidecar.data_offset(resolve, MTP_MOE_MARKER)?;
     let down_offset = sidecar.data_offset(resolve, down_key)?;
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    if let (MtpMoeQuant::Affine, Some(metal)) = (quant, _context.metal) {
+    if let (MtpMoeQuant::Affine, Some(metal)) = (quant, context.metal) {
         if crate::runtime_flags::single_copy_weights_enabled() {
             // gate = première moitié de chaque expert `gate_up`, up = seconde.
             let half_bytes = gate_up_stride / 2;
@@ -664,8 +668,15 @@ fn quantize_experts_into_metal(
     };
     let matrix_bytes = (rows * cols)
         .checked_mul(dtype.bitsize() / 8)
-        .filter(|&bytes| bytes > 0 && bytes <= stride)
-        .ok_or_else(|| InferError::Dimension(format!("experts MTP {key} : dtype {dtype:?}")))?;
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| {
+            InferError::Dimension(format!("experts MTP {key} : dtype {dtype:?} non supporté"))
+        })?;
+    if matrix_bytes > stride {
+        return Err(InferError::Dimension(format!(
+            "experts MTP {key} : matrice [{rows}, {cols}] de {matrix_bytes} octets, stride de {stride}"
+        )));
+    }
     let (packed, scales, biases) = metal.weight_buffers_affine_with(
         total(packed_len)?,
         total(affine_len)?,
@@ -729,6 +740,10 @@ fn quantize_experts_into_metal(
 /// experts (1,6 Go en bf16 sur le 35B-A3B) ne sont jamais touchées : un
 /// `vec![0; n]` de cette taille vient de `calloc`, en pages zéro paresseuses
 /// hors de l'empreinte physique. Les experts sont lus expert par expert.
+///
+/// NOTE: `read_metadata` seul suffirait à trouver les offsets, mais les
+/// chemins dense et MoE consomment des `TensorView` de `SafeTensors`, qui
+/// exige un buffer de la taille exacte du fichier. Le coût n'est que virtuel.
 struct LazySidecar {
     file: std::fs::File,
     bytes: Vec<u8>,

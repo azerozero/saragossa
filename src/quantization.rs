@@ -879,7 +879,7 @@ pub(crate) fn affine_layout(
 
 /// Cœur de [`AffineQuantizedTensor::quantize`] : écrit les codes, scales et
 /// minimums de `data` (`[rows, cols]` ligne à ligne) dans des tranches fournies,
-/// pour quantifier sans tampon intermédiaire. `packed` doit être à zéro.
+/// pour quantifier sans tampon intermédiaire.
 pub(crate) fn quantize_affine_into(
     data: &[f32],
     cols: usize,
@@ -904,6 +904,8 @@ pub(crate) fn quantize_affine_into(
             biases.len()
         )));
     }
+    // Les codes sont combinés par `|=` : un `packed` non nul les corromprait.
+    packed.fill(0);
     let lanes = 32 / bits;
     let levels = ((1_u32 << bits) - 1) as f32;
     for row in 0..rows {
