@@ -48,7 +48,14 @@ pub(super) fn serve_tcp(
     eprintln!("saragossa serve TCP bearer auth enabled");
     let front = Front::new(Some(api_key.to_string()), state.model_ids());
     dispatch::serve(state, front, read_timeout, move |dispatcher| {
-        dispatcher.accept_all(listener.incoming(), "accept TCP")
+        // NOTE: sans TCP_NODELAY, Nagle et l'ACK retardé regroupent les petits
+        // événements SSE d'un flux ; un échec de réglage laisse le défaut.
+        let incoming = listener.incoming().map(|stream| {
+            stream.inspect(|stream| {
+                let _ = stream.set_nodelay(true);
+            })
+        });
+        dispatcher.accept_all(incoming, "accept TCP")
     })
 }
 
