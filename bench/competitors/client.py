@@ -18,6 +18,13 @@ HTTP_ERROR = "http_error"
 TIMEOUT = "timeout"
 CONNECTION_LOST = "connection_lost"
 STREAM_INCOMPLETE = "stream_incomplete"
+# Événement `error` ou JSON invalide dans le flux : terminal, même si la fin
+# du flux arrive ensuite (le contenu est alors incomplet ou inconnu).
+STREAM_ERROR = "stream_error"
+
+
+class _StreamError(Exception):
+    pass
 
 
 class _Wire:
@@ -101,22 +108,32 @@ def chat_stream(host, port, body, headers=None, deadline_s=3600.0):
     request = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + payload
     record = {"events": [], "content": "", "reasoning": "", "usage": None,
               "finish_reason": None, "timings": None, "done": False}
-    sock = socket.create_connection((host, port), timeout=60)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock = None
     record["t0_wall"] = time.time()
     t0 = time.perf_counter_ns()
-    wire = _Wire(sock, t0, int(deadline_s * 1e9))
+    # Origine commune aux échantillons mémoire (même horloge, valeur absolue).
+    record["t0_ns"] = t0
     try:
+        sock = socket.create_connection((host, port), timeout=60)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # t0 au plus près de l'envoi : l'ouverture de connexion ne compte pas.
+        t0 = time.perf_counter_ns()
+        record["t0_ns"] = t0
+        wire = _Wire(sock, t0, int(deadline_s * 1e9))
         sock.sendall(request)
         _read_response(wire, record)
     except (socket.timeout, TimeoutError):
         record["status"] = TIMEOUT
+    except _StreamError as error:
+        record["status"] = STREAM_ERROR
+        record["error"] = str(error)
     except (EOFError, OSError, ValueError, IndexError) as error:
         record["status"] = CONNECTION_LOST
         record["error"] = repr(error)
     finally:
         record["t_end_ns"] = time.perf_counter_ns() - t0
-        sock.close()
+        if sock is not None:
+            sock.close()
     if "status" not in record:
         complete = record["done"] and record["finish_reason"] is not None
         record["status"] = OK if complete else STREAM_INCOMPLETE
@@ -159,14 +176,17 @@ def _read_response(wire, record):
             try:
                 chunk = json.loads(data)
             except json.JSONDecodeError:
-                record["events"].append({"t_ns": t, "bytes": len(line), "invalid": True})
-                continue
+                record["events"].append({"t_ns": t, "bytes": len(line), "invalid": True,
+                                         "raw": data[:2000].decode("utf-8", "replace")})
+                raise _StreamError("JSON invalide dans le flux") from None
             _absorb(chunk, t, len(line), record)
+            if "error" in chunk:
+                raise _StreamError(f"événement error: {chunk['error']}")
 
 
 def _absorb(chunk, t, nbytes, record):
     """Ajoute un chunk : seuls `content` et `reasoning_content` non vides comptent comme sortie."""
-    event = {"t_ns": t, "bytes": nbytes, "content_chars": 0, "reasoning_chars": 0}
+    event = {"t_ns": t, "bytes": nbytes, "content_chars": 0, "reasoning_chars": 0, "text": ""}
     if "error" in chunk:
         event["error"] = chunk["error"]
         record["stream_error"] = chunk["error"]
@@ -178,6 +198,8 @@ def _absorb(chunk, t, nbytes, record):
         record["reasoning"] += reasoning
         event["content_chars"] += len(content)
         event["reasoning_chars"] += len(reasoning)
+        # Fragment brut conservé : le comptage par événement se recalcule.
+        event["text"] += reasoning + content
         if choice.get("finish_reason"):
             record["finish_reason"] = choice["finish_reason"]
             event["finish_reason"] = choice["finish_reason"]
@@ -225,6 +247,20 @@ def _self_check():
     assert record["usage"] == {"completion_tokens": 2}
     assert [e["content_chars"] for e in record["events"]] == [2, 0]
     assert record["events"][0]["t_ns"] <= record["events"][1]["t_ns"]
+    assert record["events"][0]["text"] == "ab"
+    # Un événement error est terminal même si finish_reason et [DONE] suivent.
+    frames = [b'HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n'
+              b'data: {"error":{"message":"x"}}\n\n'
+              b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n']
+    wire = _Wire(None, time.perf_counter_ns(), int(1e9), recv=lambda _: frames.pop(0))
+    record = {"events": [], "content": "", "reasoning": "", "usage": None,
+              "finish_reason": None, "timings": None, "done": False}
+    try:
+        _read_response(wire, record)
+        raise AssertionError("événement error non terminal")
+    except _StreamError:
+        pass
+    assert record["finish_reason"] is None and not record["done"]
 
 
 if __name__ == "__main__":
