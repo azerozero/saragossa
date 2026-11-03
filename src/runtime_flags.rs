@@ -322,6 +322,13 @@ impl Drop for MtpHistoryForPrompt {
     }
 }
 
+/// Sidecar MTP désigné explicitement (`SARAGOSSA_RUST_MTP_SIDECAR=<fichier>`,
+/// opt-in) : remplace la détection dans le répertoire du modèle, qui peut être
+/// en lecture seule. Aucun repli silencieux (cf. `assets::detect_mtp_weights`).
+pub(crate) fn mtp_sidecar_override() -> Option<std::path::PathBuf> {
+    env_var_os("SARAGOSSA_RUST_MTP_SIDECAR").map(std::path::PathBuf::from)
+}
+
 pub(crate) fn mtp_resident_hidden_enabled() -> bool {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     if let Some(case) = pairwise::current() {

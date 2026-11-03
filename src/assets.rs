@@ -69,7 +69,7 @@ impl ModelAssets {
         let mtp = detect_mtp_weights(
             model_dir,
             &raw_config_json,
-            crate::runtime_flags::env_var_os(MTP_SIDECAR_ENV).map(PathBuf::from),
+            crate::runtime_flags::mtp_sidecar_override(),
         )?;
 
         Ok(Self {
@@ -199,7 +199,18 @@ fn detect_mtp_weights(
     // silencieusement sur un sidecar local.
     if let Some(path) = sidecar_override {
         require_file(&path, "sidecar MTP (SARAGOSSA_RUST_MTP_SIDECAR)")?;
-        return mtp_weights_info(path);
+        let info = mtp_weights_info(path)?;
+        if !info.has_mtp_tensors {
+            // Sans `mtp.*`, le MTP disparaîtrait en silence derrière un flag
+            // explicite.
+            return Err(InferError::MissingWeight(format!(
+                "sidecar MTP explicite sans tenseur mtp.* : {}",
+                info.path
+                    .as_deref()
+                    .map_or_else(String::new, |p| p.display().to_string())
+            )));
+        }
+        return Ok(info);
     }
     for path in mtp_sidecar_candidates(model_dir, config) {
         if path.is_file() {
@@ -208,9 +219,6 @@ fn detect_mtp_weights(
     }
     Ok(MtpWeightsInfo::default())
 }
-
-/// Variable désignant explicitement le sidecar MTP (opt-in).
-const MTP_SIDECAR_ENV: &str = "SARAGOSSA_RUST_MTP_SIDECAR";
 
 fn mtp_weights_info(path: PathBuf) -> Result<MtpWeightsInfo> {
     let keys = read_safetensors_keys(&path)?;
@@ -309,11 +317,12 @@ mod tests {
         write_safetensors(&tmp.path().join("mtp/weights.safetensors"), "fc.weight");
 
         let assets = ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
+        let mtp = local_mtp(tmp.path());
         assert_eq!(assets.config.hidden_size, 4);
         assert_eq!(assets.shards.len(), 1);
         assert_eq!(assets.catalog.tensor_count(), 1);
-        assert!(assets.mtp.is_available());
-        assert_eq!(assets.mtp.tensor_count, 1);
+        assert!(mtp.is_available());
+        assert_eq!(mtp.tensor_count, 1);
         assert_eq!(
             assets.encode_prompt("bonjour reti").expect("encode"),
             vec![1, 2]
@@ -397,11 +406,20 @@ mod tests {
             "layers.0.input_layernorm.weight",
         );
 
-        let assets = ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
+        ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
 
-        assert!(!assets.mtp.is_available());
-        assert!(assets.mtp.has_mtp_tensors);
-        assert!(!assets.mtp.has_fc_weight);
+        let mtp = local_mtp(tmp.path());
+        assert!(!mtp.is_available());
+        assert!(mtp.has_mtp_tensors);
+        assert!(!mtp.has_fc_weight);
+    }
+
+    /// Détection locale seule : l'override de l'environnement (sidecar officiel
+    /// posé pour les oracles) ne doit pas remplacer la fixture du test.
+    fn local_mtp(dir: &Path) -> super::MtpWeightsInfo {
+        let config = super::read_json_value(&dir.join("config.json"))
+            .expect("invariant: config de test lisible");
+        super::detect_mtp_weights(dir, &config, None).expect("invariant: détection locale")
     }
 
     #[test]
@@ -420,6 +438,13 @@ mod tests {
             .expect("invariant: sidecar explicite lisible");
         assert_eq!(info.path.as_deref(), Some(explicit.as_path()));
         assert!(info.is_available());
+
+        let foreign = outside.path().join("autre.safetensors");
+        write_safetensors(&foreign, "dummy.weight");
+        assert!(matches!(
+            super::detect_mtp_weights(model.path(), &config, Some(foreign)),
+            Err(InferError::MissingWeight(_))
+        ));
 
         let missing = outside.path().join("absent.safetensors");
         assert!(matches!(
