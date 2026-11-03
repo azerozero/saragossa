@@ -1139,6 +1139,28 @@ La marge restante sous ρ(2) = 1,30 est de 0,3 ms. Le hors-MoE à R=2 vaut
 La queue MoE reste à +1,05 ms pour une ligne de plus, soit environ le
 trafic des 8 experts supplémentaires.
 
+Bout en bout, lookup greedy sans tête MTP (`SARAGOSSA_RUST_LOOKUP_GREEDY=8`,
+`SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`), `lookup_greedy_abba_vs_ar_real_model`,
+prompts `models/pairwise/prompts6.json`, 400 tokens, ABBA 3 paires contre
+l'AR dans le même processus, sorties identiques à l'AR partout. Médianes des
+gains contre l'AR, et débit de decode médian (tok/s) :
+
+| cas | base 7069020 | branche | AR base / branche | lookup base / branche |
+|---|---:|---:|---:|---:|
+| T0 | −2,5 % | −1,9 % | 151,4 / 150,4 | 148,6 / 148,6 |
+| T1 | +2,2 % | +2,8 % | 151,0 / 149,8 | 154,4 / 154,0 |
+| T2 | −0,1 % | +0,1 % | 146,4 / 145,4 | 146,4 / 145,6 |
+| T6 | +87,0 % | +92,5 % | 148,6 / 145,8 | 278,0 / 281,9 |
+| T7 | −2,6 % | −2,4 % | 134,0 / 129,2 | 130,6 / 126,2 |
+
+Le gain de la vérification se voit là où le lookup propose (T6). Sur la
+prose, le lookup propose rarement : la perte d'environ 2 % (T0, T7) vient de
+la boucle elle-même (decode pipeliné interrompu), pas du coût d'une
+vérification. Les écarts d'AR entre les deux binaires (jusqu'à 4,8 tok/s sur
+T7) sont du bruit entre processus : l'AR n'emprunte aucun chemin modifié.
+`SARAGOSSA_RUST_MOE_VERIFY_ROWS` reste donc OFF par défaut. Avec le lookup
+actif, la branche régresse encore contre `=0` (l'AR) sur T0 et T7.
+
 ## Stop sequences sur le chemin spéculatif (2 nov. 2026)
 
 Les requêtes avec `stop`, et Anthropic avec outils (`</tool_call>` ajouté),
