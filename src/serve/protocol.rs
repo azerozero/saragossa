@@ -56,6 +56,10 @@ pub(super) struct ChatCompletionRequest {
     /// Graine du sampler (`seed` OpenAI) ; absente, la graine historique 0.
     #[serde(default)]
     pub(super) seed: Option<u64>,
+    /// Arguments du template de chat (extension vLLM / llama.cpp) : seul
+    /// `enable_thinking` est reconnu, toute autre clé est refusée.
+    #[serde(default)]
+    pub(super) chat_template_kwargs: Option<serde_json::Map<String, Value>>,
 }
 
 /// Outil déclaré par la requête, lu une seule fois.
@@ -110,6 +114,7 @@ impl ChatCompletionRequest {
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
         let max_tokens = self.max_tokens_capped(max_tokens_cap)?;
         self.response_format_mode()?;
+        self.enable_thinking()?;
         // Un tableau de chaînes vides pèse ~12× son JSON une fois désérialisé :
         // bornées, les stops ne peuvent plus amplifier la mémoire des requêtes.
         let stops = self.stop_texts();
@@ -159,6 +164,30 @@ impl ChatCompletionRequest {
             )),
             Some(other) => Err(ServeError::Http(format!("tool_choice invalide: {other}"))),
         }
+    }
+
+    /// `chat_template_kwargs.enable_thinking` demandé, `None` s'il est absent.
+    /// Une autre clé ou une valeur non booléenne est refusée : un argument de
+    /// template ignoré en silence changerait le prompt sans le dire.
+    pub(super) fn enable_thinking(&self) -> ServeResult<Option<bool>> {
+        let Some(kwargs) = &self.chat_template_kwargs else {
+            return Ok(None);
+        };
+        let mut thinking = None;
+        for (key, value) in kwargs {
+            match (key.as_str(), value) {
+                ("enable_thinking", Value::Bool(flag)) => thinking = Some(*flag),
+                ("enable_thinking", other) => {
+                    return Err(ServeError::Http(format!(
+                        "chat_template_kwargs.enable_thinking doit être un booléen, reçu {other}"
+                    )))
+                }
+                (other, _) => return Err(ServeError::Http(format!(
+                    "chat_template_kwargs.{other} n'est pas supporté (seul enable_thinking l'est)"
+                ))),
+            }
+        }
+        Ok(thinking)
     }
 
     /// Appels d'outils multiples autorisés ?
@@ -700,6 +729,32 @@ mod tests {
             r#"{"model":"m","messages":[],"seed":-1}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn chat_template_kwargs_accepts_only_boolean_thinking() {
+        let parse = |kwargs: &str| -> ChatCompletionRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model":"m","messages":[],"chat_template_kwargs":{kwargs}}}"#
+            ))
+            .expect("invariant: JSON valide")
+        };
+
+        assert_eq!(
+            parse(r#"{"enable_thinking":false}"#).enable_thinking().ok(),
+            Some(Some(false))
+        );
+        assert_eq!(
+            parse(r#"{"enable_thinking":true}"#).enable_thinking().ok(),
+            Some(Some(true))
+        );
+        assert_eq!(parse("{}").enable_thinking().ok(), Some(None));
+        for refused in [
+            r#"{"enable_thinking":"no"}"#,
+            r#"{"reasoning_effort":"low"}"#,
+        ] {
+            assert!(parse(refused).validate(1024).is_err(), "{refused}");
+        }
     }
 
     #[test]

@@ -1195,7 +1195,9 @@ impl LoadedModel {
         if !self.assets.config.is_gemma() && !self.assets.config.is_flint() {
             normalize_qwen_assistant_history(&mut messages);
         }
+        let thinking = request.enable_thinking()?;
         let rendered = if self.assets.config.is_flint() {
+            thinking_switch(thinking, false)?;
             let tools: Vec<String> = request
                 .active_tools()?
                 .iter()
@@ -1203,11 +1205,12 @@ impl LoadedModel {
                 .collect();
             render_flint_chat(&messages, &tools, true)
         } else if self.assets.config.is_gemma4() {
-            render_gemma4_chat(&messages, true, false)
+            render_gemma4_chat(&messages, true, thinking_switch(thinking, true)?)
         } else if self.assets.config.is_gemma() {
+            thinking_switch(thinking, false)?;
             render_gemma_chat(&messages, true)
         } else {
-            render_qwen_chatml(&messages, true, false)
+            render_qwen_chatml(&messages, true, thinking_switch(thinking, true)?)
         };
         let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
         Ok(PromptEncoding {
@@ -1561,6 +1564,18 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+/// Thinking du rendu : désactivé par défaut (comportement historique). Un
+/// rendu sans interrupteur (`configurable` faux : flint, Gemma 3) refuse une
+/// demande explicite plutôt que de l'ignorer.
+fn thinking_switch(requested: Option<bool>, configurable: bool) -> ServeResult<bool> {
+    match requested {
+        Some(_) if !configurable => Err(ServeError::Http(
+            "chat_template_kwargs.enable_thinking n'est pas supporté pour ce modèle".to_string(),
+        )),
+        requested => Ok(requested.unwrap_or(false)),
+    }
+}
+
 #[cfg(test)]
 mod json_tests;
 
@@ -1591,6 +1606,16 @@ mod tests {
         assert_eq!(prefix_blocks_usable(false, false), enabled);
         assert_eq!(prefix_blocks_usable(true, true), enabled);
         assert!(!prefix_blocks_usable(true, false));
+    }
+
+    #[test]
+    fn thinking_switch_defaults_off_and_refuses_fixed_templates() {
+        assert!(!thinking_switch(None, true).expect("invariant: défaut admis"));
+        assert!(thinking_switch(Some(true), true).expect("invariant: rendu configurable"));
+        assert!(!thinking_switch(Some(false), true).expect("invariant: rendu configurable"));
+        assert!(!thinking_switch(None, false).expect("invariant: défaut admis"));
+        assert!(thinking_switch(Some(false), false).is_err());
+        assert!(thinking_switch(Some(true), false).is_err());
     }
 
     #[test]

@@ -154,6 +154,7 @@ impl AnthropicMessagesRequest {
             tool_choice: None,
             parallel_tool_calls: None,
             seed: None,
+            chat_template_kwargs: None,
         })
     }
 }
