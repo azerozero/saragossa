@@ -1422,6 +1422,26 @@ impl CausalDecoder {
         } else {
             None
         };
+        // Baux du verify pris AVANT d'encoder la tête : un slot libéré par la
+        // couche MTP serait encore écrit par le GPU de ce même command buffer, et
+        // l'upload CPU de la ligne 0 ci-dessous serait écrasé (35B : verify de
+        // 2 × 2048 = q_dim, même classe de taille que les scratch de la tête).
+        let verify_rows = 2usize;
+        let verify_elements = verify_rows
+            .checked_mul(hidden)
+            .ok_or_else(|| InferError::Dimension("verify MTP rows déborde".to_string()))?;
+        let verify_a = arena
+            .state
+            .scratch()
+            .lease(verify_elements, GpuElement::F32)?;
+        let verify_b = arena
+            .state
+            .scratch()
+            .lease(verify_elements, GpuElement::F32)?;
+        let draft_embed = arena.state.scratch().lease(hidden, GpuElement::F32)?;
+        if let Some(embed) = &embed {
+            arena.state.upload(verify_a.tensor(), embed.data())?;
+        }
         let command_buffer = arena.state.queue().new_command_buffer();
         let _barrier_guard = crate::metal_backend::resident_concurrent_enabled()
             .then(crate::metal_backend::install_dispatch_barrier_scope);
@@ -1564,22 +1584,6 @@ impl CausalDecoder {
             scratch.push(layer_out);
         }
 
-        let verify_rows = 2usize;
-        let verify_elements = verify_rows
-            .checked_mul(hidden)
-            .ok_or_else(|| InferError::Dimension("verify MTP rows déborde".to_string()))?;
-        let verify_a = arena
-            .state
-            .scratch()
-            .lease(verify_elements, GpuElement::F32)?;
-        let verify_b = arena
-            .state
-            .scratch()
-            .lease(verify_elements, GpuElement::F32)?;
-        let draft_embed = arena.state.scratch().lease(hidden, GpuElement::F32)?;
-        if let Some(embed) = &embed {
-            arena.state.upload(verify_a.tensor(), embed.data())?;
-        }
         {
             let mtp = arena
                 .mtp
@@ -1601,12 +1605,17 @@ impl CausalDecoder {
                     crate::runtime_flags::pairwise::Hit::Embedding,
                 );
             }
-            metal.encode_embedding_from_index_buffers(
+            // Même gather que l'AR (échelle et recast bf16 Qwen) : la ligne du
+            // draft doit être l'embedding exact que le decode aurait lu, sinon le
+            // bonus et le KV de cette position dérivent (35B, embedding u4).
+            metal.encode_embedding_from_index_buffers_scaled(
                 encoder_guard.encoder(),
                 &arena.embed_tokens,
                 mtp.draft_indices.buffer(),
                 draft_embed.tensor().buffer(),
                 hidden,
+                embed_scale,
+                embed_bf16,
             )?;
         }
         let draft_row_offset = hidden
@@ -2041,6 +2050,16 @@ impl CausalDecoder {
         } else {
             None
         };
+        // Baux du verify pris avant la tête : l'upload CPU de la ligne 0 ne doit
+        // pas tomber dans un slot que la couche MTP écrit encore (cf. D1).
+        let verify_a = arena
+            .state
+            .scratch()
+            .lease(verify_elements, GpuElement::F32)?;
+        let verify_b = arena
+            .state
+            .scratch()
+            .lease(verify_elements, GpuElement::F32)?;
         let queue = arena.state.queue();
         let mut command_buffer = queue.new_command_buffer();
         let _barrier_guard = crate::metal_backend::resident_concurrent_enabled()
@@ -2257,14 +2276,6 @@ impl CausalDecoder {
             segments.head_ns += cut_fused_segment(queue, &mut command_buffer, &mut encoder_guard)?;
         }
 
-        let verify_a = arena
-            .state
-            .scratch()
-            .lease(verify_elements, GpuElement::F32)?;
-        let verify_b = arena
-            .state
-            .scratch()
-            .lease(verify_elements, GpuElement::F32)?;
         if crate::runtime_flags::mtp_gpu_embedding_enabled() {
             // D2 : ligne 0 du verify gathered depuis `mtp.index` (token primaire).
             metal.encode_embedding_from_index_buffers_scaled(
@@ -2302,7 +2313,8 @@ impl CausalDecoder {
                 .ok_or_else(|| {
                     InferError::Metal("verify draft index offset déborde".to_string())
                 })?;
-            metal.encode_embedding_from_index_buffers_with_offset(
+            // Gather de l'AR (échelle, recast bf16) : cf. D1.
+            metal.encode_embedding_from_index_buffers_with_offset_scaled(
                 encoder_guard.encoder(),
                 &arena.embed_tokens,
                 arena
@@ -2314,6 +2326,9 @@ impl CausalDecoder {
                 source_index_offset,
                 draft_embed.tensor().buffer(),
                 hidden,
+                1,
+                self.config.embed_scale.unwrap_or(1.0),
+                self.config.is_qwen && qwen_embed_bf16_enabled(),
             )?;
             let target_row_offset = row
                 .checked_mul(hidden)
