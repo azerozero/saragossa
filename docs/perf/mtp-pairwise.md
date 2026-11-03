@@ -974,9 +974,10 @@ DFlash → MTP reste coupée avec des séquences, et le bloc GPU D1 leur reste
 fermé. Les statistiques MTP comptent le tour entier, drafts acceptés après
 la séquence compris ; DFlash cesse de compter au stop. Une stop texte est
 tokenisée seule : si le modèle l'écrit avec une autre découpe, l'arrêt sur
-ids manque ; le filtre texte de serve la retire et, en streaming, arrête
-aussi le decode (callback solo AR et MTP). Sans streaming, le decode va
-jusqu'à la limite.
+ids manque ; le filtre texte de serve la retire et arrête aussi le decode,
+streamé ou non (solo AR et MTP, lot), d'où contenu et usage identiques entre
+les deux modes. Une annulation par le client rend la sortie jusqu'au dernier
+token émis.
 
 Mesure CLI (`--stop`, nouveau), 27B 4 bits, prompt de code de 28 tokens,
 300 tokens max, `--stop "Invalid semantic version"` : arrêt identique à

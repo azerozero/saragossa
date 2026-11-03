@@ -40,7 +40,7 @@ fn temperature_supported(temperature: f32, sampled: bool) -> bool {
 ///
 /// NOTE: une stop texte est tokenisée seule (`LoadedModel::stop_sequences`) ;
 /// si le modèle l'écrit avec une autre découpe, l'arrêt sur ids manque et le
-/// filtre texte de serve la retire, en arrêtant le decode en streaming.
+/// filtre texte de serve la retire et arrête le decode, streamé ou non.
 pub(crate) fn supports_options(options: &saragossa::GenerationOptions) -> bool {
     supports_options_with(options, saragossa::runtime_flags::mtp_sampled_enabled())
 }
