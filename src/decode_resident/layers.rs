@@ -357,16 +357,27 @@ impl DecodeResidentState {
                 dims.eps,
             )?;
         }
-        executor.encode_moe_shared_buffers(
-            encoder,
-            owned,
-            post_normed.tensor().buffer(),
-            Some(summed.tensor().buffer()),
-            layer_out,
-            hidden,
-            weights.moe,
-            weights.top_k,
-        )?;
+        if crate::runtime_flags::verify_skip("moe_full") {
+            executor.encode_copy_with_offsets(
+                encoder,
+                summed.tensor().buffer(),
+                0,
+                layer_out,
+                0,
+                hidden,
+            )?;
+        } else {
+            executor.encode_moe_shared_buffers(
+                encoder,
+                owned,
+                post_normed.tensor().buffer(),
+                Some(summed.tensor().buffer()),
+                layer_out,
+                hidden,
+                weights.moe,
+                weights.top_k,
+            )?;
+        }
         // Bails droppés ICI (fin de couche) ; pool propriétaire → buffers vivants
         // jusqu'au wait, slots réutilisés par la couche suivante (R1).
         Ok(())
@@ -1822,6 +1833,7 @@ impl DecodeResidentState {
         }
         if let Some((moe, top_k)) = shared_moe {
             return Self::encode_moe_shared_tail_rows(
+                "moe_full",
                 executor,
                 encoder,
                 owned,
@@ -1926,16 +1938,27 @@ impl DecodeResidentState {
         let summed = self.scratch().lease(hidden, GpuElement::F32)?;
         let post_normed = self.scratch().lease(hidden, GpuElement::F32)?;
 
-        executor.encode_linear_attn_resident_dense_buffers(
-            encoder,
-            layer_in,
-            Some((weights.input_norm, eps)),
-            attn_out.tensor().buffer(),
-            weights.linear,
-            state,
-            spec,
-            res_dims,
-        )?;
+        if crate::runtime_flags::verify_skip("linear_attn") {
+            executor.encode_copy_with_offsets(
+                encoder,
+                layer_in,
+                0,
+                attn_out.tensor().buffer(),
+                0,
+                hidden,
+            )?;
+        } else {
+            executor.encode_linear_attn_resident_dense_buffers(
+                encoder,
+                layer_in,
+                Some((weights.input_norm, eps)),
+                attn_out.tensor().buffer(),
+                weights.linear,
+                state,
+                spec,
+                res_dims,
+            )?;
+        }
         executor.encode_add_rms_norm_rows(
             encoder,
             layer_in,
@@ -1947,16 +1970,27 @@ impl DecodeResidentState {
             hidden,
             eps,
         )?;
-        executor.encode_moe_shared_buffers(
-            encoder,
-            owned,
-            post_normed.tensor().buffer(),
-            Some(summed.tensor().buffer()),
-            layer_out,
-            hidden,
-            weights.moe,
-            weights.top_k,
-        )?;
+        if crate::runtime_flags::verify_skip("moe_linear") {
+            executor.encode_copy_with_offsets(
+                encoder,
+                summed.tensor().buffer(),
+                0,
+                layer_out,
+                0,
+                hidden,
+            )?;
+        } else {
+            executor.encode_moe_shared_buffers(
+                encoder,
+                owned,
+                post_normed.tensor().buffer(),
+                Some(summed.tensor().buffer()),
+                layer_out,
+                hidden,
+                weights.moe,
+                weights.top_k,
+            )?;
+        }
         Ok(())
     }
 
@@ -1998,18 +2032,29 @@ impl DecodeResidentState {
         let summed = self.scratch().lease(elements, GpuElement::F32)?;
         let post_normed = self.scratch().lease(elements, GpuElement::F32)?;
 
-        executor.encode_linear_attn_resident_dense_buffers_rows(
-            encoder,
-            layer_in,
-            Some((weights.input_norm, eps)),
-            attn_out.tensor().buffer(),
-            rows,
-            weights.linear,
-            state,
-            captures,
-            spec,
-            res_dims,
-        )?;
+        if crate::runtime_flags::verify_skip("linear_attn") {
+            executor.encode_copy_with_offsets(
+                encoder,
+                layer_in,
+                0,
+                attn_out.tensor().buffer(),
+                0,
+                elements,
+            )?;
+        } else {
+            executor.encode_linear_attn_resident_dense_buffers_rows(
+                encoder,
+                layer_in,
+                Some((weights.input_norm, eps)),
+                attn_out.tensor().buffer(),
+                rows,
+                weights.linear,
+                state,
+                captures,
+                spec,
+                res_dims,
+            )?;
+        }
         executor.encode_add_rms_norm_rows(
             encoder,
             layer_in,
@@ -2022,6 +2067,7 @@ impl DecodeResidentState {
             eps,
         )?;
         Self::encode_moe_shared_tail_rows(
+            "moe_linear",
             executor,
             encoder,
             owned,
@@ -2045,6 +2091,7 @@ impl DecodeResidentState {
         reason = "queue MoE en lignes: buffers d'entrée, résiduel et sortie + poids"
     )]
     fn encode_moe_shared_tail_rows(
+        skip_part: &str,
         executor: &MetalExecutor,
         encoder: &ComputeCommandEncoderRef,
         owned: &mut Vec<Buffer>,
@@ -2056,6 +2103,16 @@ impl DecodeResidentState {
         moe: &MetalMoeSharedWeights,
         top_k: usize,
     ) -> Result<()> {
+        if crate::runtime_flags::verify_skip(skip_part) {
+            return executor.encode_copy_with_offsets(
+                encoder,
+                residual,
+                0,
+                layer_out,
+                0,
+                rows * hidden,
+            );
+        }
         executor.encode_moe_shared_buffers_verify_rows(
             encoder, owned, input, residual, layer_out, rows, hidden, moe, top_k,
         )

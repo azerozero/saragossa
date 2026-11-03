@@ -802,6 +802,35 @@ pub(crate) fn moe_verify_shared_fused_max_rows() -> usize {
     })
 }
 
+/// Ablation de diagnostic du pas de vérification résidente
+/// (`SARAGOSSA_RUST_VERIFY_SKIP=moe_full,moe_linear,linear_attn,full_layer,head`,
+/// devtools seulement) : la partie nommée est remplacée par une copie de son
+/// entrée, pour attribuer le temps mural par poste. Les sorties sont fausses ;
+/// jamais en production, jamais pendant un oracle.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+pub(crate) fn verify_skip(part: &str) -> bool {
+    static PARTS: OnceLock<Vec<String>> = OnceLock::new();
+    PARTS
+        .get_or_init(|| {
+            env_var("SARAGOSSA_RUST_VERIFY_SKIP")
+                .map(|list| {
+                    list.split(',')
+                        .map(|item| item.trim().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|item| item == part)
+}
+
+/// Sans devtools, aucune ablation : constante pour que l'appel disparaisse.
+#[cfg(all(target_os = "macos", feature = "metal", not(feature = "devtools")))]
+#[inline(always)]
+pub(crate) const fn verify_skip(_part: &str) -> bool {
+    false
+}
+
 /// Drafts par pas de la boucle greedy « lookup seul » (lookup n-grammes sans
 /// tête MTP ni drafter, vérification résidente en lignes) :
 /// `SARAGOSSA_RUST_LOOKUP_GREEDY=n`, borné à 8 (neuf lignes, limite des captures
