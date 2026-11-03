@@ -1218,9 +1218,11 @@ expert partagé en u4, `fc` et attention en u8, routeur et gate partagée en u8.
 Les normes du checkpoint officiel sont lues en `1 + weight`. Le chemin
 résident encode la couche par la queue mono-ligne `FullMoe` du tronc, et les
 cycles D1/D2 fusionnés acceptent désormais un tronc MoE sous
-`SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Le MoE reste exclu de `serve`, de la CLI et
-du REPL (`serve::mtp::active_for`) : seuls le harnais d'acceptance et les tests
-chargent la tête.
+la vérification MoE en lignes, active d'office quand une tête MTP MoE est
+chargée (`SARAGOSSA_RUST_MOE_VERIFY_ROWS=0` la coupe). Depuis É7 (plus bas),
+serve, la CLI et le REPL chargent la tête quand le flag la désigne. Chemin
+conseillé : `<35B>/mtp-official/mtp.safetensors`, un sous-dossier, pour que le
+chargeur du tronc ne ramasse pas le fichier comme un shard.
 
 Trois défauts trouvés en route, corrigés :
 
@@ -1283,26 +1285,74 @@ et 1,45 en adaptatif.
 (T6), pour une acceptance de 90 à 97 %. L'AR échantillonné ne fait que
 79 tok/s contre 150 en greedy : le tirage sur 248 320 tokens domine le pas, et
 le MTP le paie à chaque token accepté. G5 est négatif : l'échantillonné MoE
-n'est pas exposé. Une exposition future (É7) devra le couper par une garde
-dans le routage, pas par une variable d'environnement.
+n'est pas exposé. La garde `serve::mtp::sampled_for` le renvoie à l'AR dans le
+routage, sans variable d'environnement.
 
-Reproduction (`$SIDECAR` = la tête officielle, `$PROMPTS` =
+### Exposition É7 : serve, CLI et REPL en greedy
+
+Un tronc MoE active le MTP seulement quand `SARAGOSSA_RUST_MTP_SIDECAR` désigne
+la tête détectée (`serve::mtp::active_for`) ; les sidecars MoE détectés seuls ne
+sont pas exposés. Les requêtes échantillonnées restent en AR
+(`serve::mtp::sampled_for`). Correctif lié : la chauffe MTP de la CLI laissait
+un préfixe du prompt en cache. Le vrai run faisait alors une extension de préfixe au
+lieu du prefill à froid de l'AR, et divergeait de l'AR sur T1 (near-tie). Le
+cache est maintenant vidé après la chauffe.
+
+CLI, greedy D2 (`SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0`) contre l'AR (sans tête),
+3 paires ABBA, 400 tokens. Les 6 sorties de chaque prompt sont identiques
+(md5). Décode médian et empreinte physique de pointe (`/usr/bin/time -l`,
+« peak memory footprint ») :
+
+| prompt | AR tok/s | MTP D2 tok/s | rapport | pic AR (Go) | pic AR + tête (Go) |
+|---|---:|---:|---:|---:|---:|
+| T0 | 153,0 | 224,1 | 1,46 | 21,20 | 24,39 |
+| T1 | 151,8 | 231,5 | 1,52 | 21,22 | 24,41 |
+| T6 | 148,2 | 295,3 | 1,99 | 21,42 | 24,99 |
+
+T6 s'arrête à l'EOS vers 365 tokens. Le rapport CLI dépasse celui du harnais
+(1,60) : le chronométrage CLI compte autrement le premier token.
+
+Serve (`--preload`, socket Unix), même binaire, AR (`SARAGOSSA_RUST_MTP_DECODE=0`)
+contre MTP. Les 14 cas sont identiques à l'AR (texte, `finish_reason`, usage) :
+
+| cas | résultat |
+|---|---|
+| chat non streamé, max_tokens 1, 2, 9 et 300 | identique ; chemin `mtp` |
+| chat streamé, max_tokens 1, 2, 9 et 300 | identique ; chemin `mtp` |
+| `stop` (`"return"`), non streamé et streamé | identique, arrêt à 134 tokens |
+| Anthropic `/v1/messages`, non streamé et streamé | identique, 300 tokens |
+| échantillonné (T = 0,7, seed 5) | identique à l'AR, chemin `ar` |
+| contexte de 5078 tokens, 32 générés | identique ; decode 250 ms (AR) contre 200 ms (MTP) |
+
+Empreinte physique après la requête de 5078 tokens (`footprint_bytes` du
+journal serve) : 22,84 Go en AR contre 26,52 Go avec la tête (+3,67 Go). Dans
+la CLI, le surcoût de pointe est de +3,2 Go. La tête ne pèse qu'environ 1 Go
+(poids u4/u8 sur le GPU, plus leur copie CPU, gardée pour le forward CPU de
+repli). Le reste n'est pas attribué. Pistes : libérer la copie CPU des
+experts comme le fait le tronc, lire le sidecar sans charger le fichier entier
+(1,69 Go pendant la charge).
+
+Reproduction (`$SIDECAR` = `<35B>/mtp-official/mtp.safetensors`, `$PROMPTS` =
 `models/pairwise/prompts6.json`) :
 
 ```bash
-# Oracles G0 à G2 et débit échantillonné.
+# Oracles G0 à G2 et banc échantillonné.
 SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL=<35B> SARAGOSSA_RUST_MTP_SIDECAR=$SIDECAR \
-SARAGOSSA_RUST_MTP_ORACLE_PROMPTS=$PROMPTS SARAGOSSA_RUST_MOE_VERIFY_ROWS=1 \
+SARAGOSSA_RUST_MTP_ORACLE_PROMPTS=$PROMPTS \
   cargo test --release --all-features --lib -- --ignored --nocapture \
   --test-threads=1 decoder::mtp_moe_oracles
-# Pairwise : env.sh, plus la tête et les lignes en vérification.
+# Pairwise : env.sh, plus la tête.
 source models/pairwise/env.sh
-SARAGOSSA_RUST_MTP_SIDECAR=$SIDECAR SARAGOSSA_RUST_MOE_VERIFY_ROWS=1 \
+SARAGOSSA_RUST_MTP_SIDECAR=$SIDECAR \
 SARAGOSSA_RUST_PAIRWISE_IDS=PW00,PW02,PW03,PW15 SARAGOSSA_RUST_PAIRWISE_ACTION=bench \
 SARAGOSSA_RUST_PAIRWISE_CONTROL=row:PW06 SARAGOSSA_RUST_PAIRWISE_PAIRS=6 \
   target/release/saragossa --model-dir <35B> --backend metal \
   --prompt "$(jq -r .T1 $PROMPTS)" --max-tokens 400 --temperature 0
 ```
+
+CLI É7 : `SARAGOSSA_RUST_MTP_SIDECAR=$SIDECAR SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0
+saragossa --model-dir <35B> --prompt … --max-tokens 400 --temperature 0 --metrics`
+(AR : même commande sans le flag).
 
 Les tests `mtp_d1_resident_hidden_*` lisent des compteurs de profil globaux
 au processus : ils se lancent avec `--test-threads=1`.
