@@ -260,6 +260,12 @@ def build(out_dir):
             "content": content, "source": meta,
         })
     for prompt in prompts:
+        # Le rendu jinja du checkpoint doit égaler le ChatML natif de saragossa
+        # (`render_qwen_chatml`, thinking désactivé) octet pour octet.
+        chatml = (f"<|im_start|>user\n{prompt['content']}<|im_end|>\n"
+                  "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        if renderer.render(prompt["content"]) != chatml:
+            raise SystemExit(f"{prompt['id']}: rendu jinja différent du ChatML saragossa")
         ids = renderer.ids(prompt["content"])
         prompt["prompt_tokens"] = len(ids)
         prompt["content_sha256"] = sha256_bytes(prompt["content"].encode("utf-8"))
