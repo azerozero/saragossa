@@ -643,9 +643,10 @@ struct CompletionPath {
 impl LoadedModel {
     /// Le solo sert-il `request` en MTP ? Même règle en non-stream et stream.
     fn routes_mtp(&self, request: &ChatCompletionRequest, prepared: &PreparedRequest) -> bool {
+        let sampled = mtp::sampled_for(&self.assets.config);
         self.mtp_active
-            && mtp::routes_request(request, prepared.response_format)
-            && mtp::supports_options(&prepared.options)
+            && mtp::routes_request(request, prepared.response_format, sampled)
+            && mtp::supports_options(&prepared.options, sampled)
     }
 
     fn complete(

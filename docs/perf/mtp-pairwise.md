@@ -1207,6 +1207,156 @@ Queue : à 300 tokens sans stop le decode tombe à 53 tok/s contre 56 à 252
 adaptatifs, 1,85 token par pas contre 2,55 sur les 252 premiers : acceptance
 plus basse, pas un coût du chemin.
 
+## Tête MTP officielle sur le 35B-A3B (3 nov. 2026)
+
+Qwen3.6-35B-A3B 4 bits (mlx-community, sans `mtp.*`) avec la tête MTP
+officielle Qwen (19 tenseurs bf16, MoE à 256 experts et expert partagé),
+désignée explicitement par `SARAGOSSA_RUST_MTP_SIDECAR=<fichier>`. Le fichier
+reste hors du répertoire du modèle, et l'override ne se replie jamais sur la
+détection locale. La tête est quantifiée à la charge en affine gs64 : experts et
+expert partagé en u4, `fc` et attention en u8, routeur et gate partagée en u8.
+Les normes du checkpoint officiel sont lues en `1 + weight`. Le chemin
+résident encode la couche par la queue mono-ligne `FullMoe` du tronc, et les
+cycles D1/D2 fusionnés acceptent désormais un tronc MoE sous
+la vérification MoE en lignes, active d'office quand une tête MTP MoE est
+chargée (`SARAGOSSA_RUST_MOE_VERIFY_ROWS=0` la coupe). Depuis É7 (plus bas),
+serve, la CLI et le REPL chargent la tête quand le flag la désigne. Chemin
+conseillé : `<35B>/mtp-official/mtp.safetensors`, un sous-dossier, pour que le
+chargeur du tronc ne ramasse pas le fichier comme un shard.
+
+Trois défauts trouvés en route, corrigés :
+
+- La tête MTP (27B compris) portait `rope_frequency_dim = head_dim` au lieu
+  des `rope_dims` tournées. Le forward CPU et le semis de l'historique
+  calculaient leurs fréquences sur 256 dimensions au lieu de 64, et
+  divergeaient du draft résident. Sur le 35B, l'accord du draft passe de 0,794
+  à 0,850 ; sur le 27B, l'acceptance monte de 92,3 à 94,2 % en D1 (T1).
+- Dans les cycles fusionnés, les baux du verify étaient pris après l'encodage
+  de la tête. Sur le 35B, 2 × 2048 = q_dim, donc la même classe de taille : un
+  slot encore écrit par la couche MTP du même command buffer recevait l'upload
+  CPU de la ligne 0.
+- La ligne du draft était lue sans le recast bf16 Qwen de l'AR. Avec
+  l'embedding u4, le bonus et le KV de la position dérivaient (divergence au
+  231e token sur T1).
+
+Portes, dans l'ordre :
+
+| porte | critère | résultat |
+|---|---|---|
+| G0 format/numérique | tenseurs finis, RMS dans un rapport [¼, 4] avec la couche 39 du tronc, erreur de quantification u4 < 0,15, u8 < 0,02 | vert : rapports de 0,81 à 1,55, u8 ≤ 0,007, u4 ≤ 0,105 |
+| G0 qualité | accord top-1 du draft f32 avec l'AR ≥ 0,5 | 0,850 sur 1200 positions (T1 0,94, T2 0,83, T7 0,78) |
+| G1 quantification | perte ≤ 2 points, bascules appariées | u4 partout : −1,5 point (37 perdues, 19 gagnées) ; fc et attention en u8 : 0,849 contre 0,850 (10 perdues, 9 gagnées) |
+| G2 GPU/CPU | cosinus médian ≥ 0,999, écart ≤ 2e-2 hors quasi-égalités du routeur (écart 8e/9e < 2e-2, ≤ 33 %), argmax identique | cosinus 0,99997, écart max 1,05e-2, 38 sur 160 positions en quasi-égalité, aucune bascule d'argmax |
+| G2 sorties | AR == MTP en D1, D2 et adaptatif sur les 5 prompts ; chemins fusionnés activés ; rejets et rollback exercés ; arrêts, budgets, échantillonné à T = 0,05 | vert : compteurs `Hidden`/`Embedding`/`Overlap` > 0 (PW07, PW14, PW15), tests `mtp_d1_resident_hidden_*`, `mtp_committed_two_row_*`, `mtp_stop_sequences_*`, `mtp_sampled_*` et semis sur le 35B |
+| G3 27B | tests verts, débit ±2 % | 7 oracles verts ; T1 200 tokens, 2 × 3 paires : D1/AR 1,476 → 1,449, adaptatif/AR 1,562 → 1,598 |
+| G4 greedy | moyenne géométrique ≥ 1,10 sur T0, T1, T6, aucun prompt < 0,97 | vert (tableau ci-dessous) |
+| G5 échantillonné | ≥ 1,05 sur T0, T1, T6 | **rouge** : 0,94 à 0,99 |
+
+Greedy, ABBA 6 paires en avant puis 6 en arrière (12 par cas) contre l'AR
+(`row:PW06`), même processus, sorties identiques à l'AR à chaque passe. Budgets
+de 400 tokens, sauf T6 (320) et T7 (256), où l'AR s'arrête avant. Rapport
+moyen des paires, avec l'IC 95 % bootstrap :
+
+| prompt | AR tok/s | D1 (PW00) | D2 (PW02) | adaptatif (PW03) | adaptatif + hidden/embedding/overlap (PW15) |
+|---|---:|---:|---:|---:|---:|
+| T0 | 151,2 | 1,267 [1,264 ; 1,269] | 1,399 [1,356 ; 1,439] | 1,401 [1,383 ; 1,416] | 1,404 [1,388 ; 1,418] |
+| T1 | 151,4 | 1,197 [1,174 ; 1,220] | 1,368 [1,330 ; 1,412] | 1,356 [1,321 ; 1,394] | 1,364 [1,332 ; 1,398] |
+| T2 | 146,9 | 1,178 [1,177 ; 1,179] | 1,228 [1,190 ; 1,263] | 1,183 [1,167 ; 1,200] | 1,193 [1,177 ; 1,209] |
+| T6 | 148,9 | 1,282 [1,273 ; 1,286] | 1,605 [1,603 ; 1,606] | 1,604 [1,602 ; 1,606] | 1,577 [1,547 ; 1,604] |
+| T7 | 132,3 | 1,116 [1,112 ; 1,119] | 1,189 [1,182 ; 1,195] | 1,172 [1,162 ; 1,181] | 1,177 [1,161 ; 1,193] |
+
+Acceptance par profondeur (acceptés / proposés). a2 est conditionnelle à
+l'acceptation du premier draft :
+
+| prompt | D1 a1 | D2 a1 | D2 a2 | adaptatif a1 | adaptatif a2 |
+|---|---:|---:|---:|---:|---:|
+| T0 | 0,956 | 0,893 | 0,866 | 0,920 | 0,888 |
+| T1 | 0,923 | 0,931 | 0,896 | 0,930 | 0,896 |
+| T2 | 0,818 | 0,818 | 0,659 | 0,799 | 0,778 |
+| T6 | 1,000 | 1,000 | 0,991 | 1,000 | 0,991 |
+| T7 | 0,766 | 0,821 | 0,713 | 0,800 | 0,756 |
+
+D2 fixe est le meilleur réglage partout. L'adaptatif s'en approche sauf sur
+T2, où il reste trop souvent en D1. Moyenne géométrique T0/T1/T6 : 1,45 en D2
+et 1,45 en adaptatif.
+
+Échantillonné (banc `mtp_moe_sampled_bench_vs_ar`, T = 0,7, top-p 0,95, D2,
+6 paires, 400 tokens) : rapports médians de 0,939 (T0), 0,951 (T1) et 0,987
+(T6), pour une acceptance de 90 à 97 %. L'AR échantillonné ne fait que
+79 tok/s contre 150 en greedy : le tirage sur 248 320 tokens domine le pas, et
+le MTP le paie à chaque token accepté. G5 est négatif : l'échantillonné MoE
+n'est pas exposé. La garde `serve::mtp::sampled_for` le renvoie à l'AR dans le
+routage, sans variable d'environnement.
+
+### Exposition É7 : serve, CLI et REPL en greedy
+
+Un tronc MoE active le MTP seulement quand `SARAGOSSA_RUST_MTP_SIDECAR` désigne
+la tête détectée (`serve::mtp::active_for`) ; les sidecars MoE détectés seuls ne
+sont pas exposés. Les requêtes échantillonnées restent en AR
+(`serve::mtp::sampled_for`). Correctif lié : la chauffe MTP de la CLI laissait
+un préfixe du prompt en cache. Le vrai run faisait alors une extension de préfixe au
+lieu du prefill à froid de l'AR, et divergeait de l'AR sur T1 (near-tie). Le
+cache est maintenant vidé après la chauffe.
+
+CLI, greedy D2 (`SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0`) contre l'AR (sans tête),
+3 paires ABBA, 400 tokens. Les 6 sorties de chaque prompt sont identiques
+(md5). Décode médian et empreinte physique de pointe (`/usr/bin/time -l`,
+« peak memory footprint ») :
+
+| prompt | AR tok/s | MTP D2 tok/s | rapport | pic AR (Go) | pic AR + tête (Go) |
+|---|---:|---:|---:|---:|---:|
+| T0 | 153,0 | 224,1 | 1,46 | 21,20 | 24,39 |
+| T1 | 151,8 | 231,5 | 1,52 | 21,22 | 24,41 |
+| T6 | 148,2 | 295,3 | 1,99 | 21,42 | 24,99 |
+
+T6 s'arrête à l'EOS vers 365 tokens. Le rapport CLI dépasse celui du harnais
+(1,60) : le chronométrage CLI compte autrement le premier token.
+
+Serve (`--preload`, socket Unix), même binaire, AR (`SARAGOSSA_RUST_MTP_DECODE=0`)
+contre MTP. Les 14 cas sont identiques à l'AR (texte, `finish_reason`, usage) :
+
+| cas | résultat |
+|---|---|
+| chat non streamé, max_tokens 1, 2, 9 et 300 | identique ; chemin `mtp` |
+| chat streamé, max_tokens 1, 2, 9 et 300 | identique ; chemin `mtp` |
+| `stop` (`"return"`), non streamé et streamé | identique, arrêt à 134 tokens |
+| Anthropic `/v1/messages`, non streamé et streamé | identique, 300 tokens |
+| échantillonné (T = 0,7 ; `seed` envoyé ignoré, graine serve effective 0) | identique à l'AR, chemin `ar` |
+| contexte de 5078 tokens, 32 générés | identique ; decode 250 ms (AR) contre 200 ms (MTP) |
+
+Empreinte physique après la requête de 5078 tokens (`footprint_bytes` du
+journal serve) : 22,84 Go en AR contre 26,52 Go avec la tête (+3,67 Go). Dans
+la CLI, le surcoût de pointe est de +3,2 Go. La tête ne pèse qu'environ 1 Go
+(poids u4/u8 sur le GPU, plus leur copie CPU, gardée pour le forward CPU de
+repli). Le reste n'est pas attribué. Pistes : libérer la copie CPU des
+experts comme le fait le tronc, lire le sidecar sans charger le fichier entier
+(1,69 Go pendant la charge).
+
+Reproduction (`$SIDECAR` = `<35B>/mtp-official/mtp.safetensors`, `$PROMPTS` =
+`models/pairwise/prompts6.json`) :
+
+```bash
+# Oracles G0 à G2 et banc échantillonné.
+SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL=<35B> SARAGOSSA_RUST_MTP_SIDECAR=$SIDECAR \
+SARAGOSSA_RUST_MTP_ORACLE_PROMPTS=$PROMPTS \
+  cargo test --release --all-features --lib -- --ignored --nocapture \
+  --test-threads=1 decoder::mtp_moe_oracles
+# Pairwise : env.sh, plus la tête.
+source models/pairwise/env.sh
+SARAGOSSA_RUST_MTP_SIDECAR=$SIDECAR \
+SARAGOSSA_RUST_PAIRWISE_IDS=PW00,PW02,PW03,PW15 SARAGOSSA_RUST_PAIRWISE_ACTION=bench \
+SARAGOSSA_RUST_PAIRWISE_CONTROL=row:PW06 SARAGOSSA_RUST_PAIRWISE_PAIRS=6 \
+  target/release/saragossa --model-dir <35B> --backend metal \
+  --prompt "$(jq -r .T1 $PROMPTS)" --max-tokens 400 --temperature 0
+```
+
+CLI É7 : `SARAGOSSA_RUST_MTP_SIDECAR=$SIDECAR SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0
+saragossa --model-dir <35B> --prompt … --max-tokens 400 --temperature 0 --metrics`
+(AR : même commande sans le flag).
+
+Les tests `mtp_d1_resident_hidden_*` lisent des compteurs de profil globaux
+au processus : ils se lancent avec `--test-threads=1`.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.

@@ -42,7 +42,15 @@ impl MtpWeightsInfo {
 
 impl ModelAssets {
     pub fn load_local(model_dir: impl AsRef<Path>) -> Result<Self> {
-        let model_dir = model_dir.as_ref();
+        Self::load_local_with_mtp(
+            model_dir.as_ref(),
+            crate::runtime_flags::mtp_sidecar_override(),
+        )
+    }
+
+    /// [`Self::load_local`] avec l'override MTP explicite : les tests y passent
+    /// `None` pour ne pas dépendre de l'environnement des oracles.
+    fn load_local_with_mtp(model_dir: &Path, sidecar_override: Option<PathBuf>) -> Result<Self> {
         if !model_dir.is_dir() {
             return Err(InferError::MissingArtifact {
                 path: model_dir.to_path_buf(),
@@ -66,7 +74,7 @@ impl ModelAssets {
             });
         }
         let catalog = WeightCatalog::from_shards(&shards)?;
-        let mtp = detect_mtp_weights(model_dir, &raw_config_json)?;
+        let mtp = detect_mtp_weights(model_dir, &raw_config_json, sidecar_override)?;
 
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
@@ -185,26 +193,51 @@ fn mtp_sidecar_candidates(model_dir: &Path, config: &serde_json::Value) -> Vec<P
     paths
 }
 
-fn detect_mtp_weights(model_dir: &Path, config: &serde_json::Value) -> Result<MtpWeightsInfo> {
-    for path in mtp_sidecar_candidates(model_dir, config) {
-        if !path.is_file() {
-            continue;
+fn detect_mtp_weights(
+    model_dir: &Path,
+    config: &serde_json::Value,
+    sidecar_override: Option<PathBuf>,
+) -> Result<MtpWeightsInfo> {
+    // Tête posée hors du répertoire du modèle (dossier en lecture seule) :
+    // l'override explicite remplace la détection et ne se replie jamais
+    // silencieusement sur un sidecar local.
+    if let Some(path) = sidecar_override {
+        require_file(&path, "sidecar MTP (SARAGOSSA_RUST_MTP_SIDECAR)")?;
+        let info = mtp_weights_info(path)?;
+        if !info.is_available() {
+            // Sans `mtp.fc.weight` ni tenseur `mtp.*`, le MTP disparaîtrait en
+            // silence derrière un flag explicite.
+            return Err(InferError::MissingWeight(format!(
+                "sidecar MTP explicite incomplet (mtp.fc.weight et mtp.* requis) : {}",
+                info.path
+                    .as_deref()
+                    .map_or_else(String::new, |p| p.display().to_string())
+            )));
         }
-        let keys = read_safetensors_keys(&path)?;
-        let normalized = keys
-            .iter()
-            .map(|key| normalize_mtp_sidecar_key(key))
-            .collect::<Vec<_>>();
-        let has_fc_weight = normalized.iter().any(|key| key == "mtp.fc.weight");
-        let has_mtp_tensors = normalized.iter().any(|key| key.starts_with("mtp."));
-        return Ok(MtpWeightsInfo {
-            path: Some(path),
-            tensor_count: keys.len(),
-            has_fc_weight,
-            has_mtp_tensors,
-        });
+        return Ok(info);
+    }
+    for path in mtp_sidecar_candidates(model_dir, config) {
+        if path.is_file() {
+            return mtp_weights_info(path);
+        }
     }
     Ok(MtpWeightsInfo::default())
+}
+
+fn mtp_weights_info(path: PathBuf) -> Result<MtpWeightsInfo> {
+    let keys = read_safetensors_keys(&path)?;
+    let normalized = keys
+        .iter()
+        .map(|key| normalize_mtp_sidecar_key(key))
+        .collect::<Vec<_>>();
+    let has_fc_weight = normalized.iter().any(|key| key == "mtp.fc.weight");
+    let has_mtp_tensors = normalized.iter().any(|key| key.starts_with("mtp."));
+    Ok(MtpWeightsInfo {
+        path: Some(path),
+        tensor_count: keys.len(),
+        has_fc_weight,
+        has_mtp_tensors,
+    })
 }
 
 fn normalize_mtp_sidecar_key(key: &str) -> String {
@@ -287,7 +320,8 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("mtp")).expect("invariant: mkdir mtp");
         write_safetensors(&tmp.path().join("mtp/weights.safetensors"), "fc.weight");
 
-        let assets = ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
+        let assets = ModelAssets::load_local_with_mtp(tmp.path(), None)
+            .expect("invariant: assets chargeables");
         assert_eq!(assets.config.hidden_size, 4);
         assert_eq!(assets.shards.len(), 1);
         assert_eq!(assets.catalog.tensor_count(), 1);
@@ -323,7 +357,8 @@ mod tests {
         save_gemma_test_tokenizer(&tmp.path().join("tokenizer.json"));
         write_safetensors(&tmp.path().join("model.safetensors"), "dummy.weight");
 
-        let assets = ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
+        let assets = ModelAssets::load_local_with_mtp(tmp.path(), None)
+            .expect("invariant: assets chargeables");
         assert_eq!(assets.stop_token_ids(), vec![1, 3]);
     }
 
@@ -376,11 +411,51 @@ mod tests {
             "layers.0.input_layernorm.weight",
         );
 
-        let assets = ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
+        let assets = ModelAssets::load_local_with_mtp(tmp.path(), None)
+            .expect("invariant: assets chargeables");
 
         assert!(!assets.mtp.is_available());
         assert!(assets.mtp.has_mtp_tensors);
         assert!(!assets.mtp.has_fc_weight);
+    }
+
+    #[test]
+    fn explicit_mtp_sidecar_replaces_detection_and_must_exist() {
+        let model = tempfile::tempdir().expect("invariant: tempdir");
+        let outside = tempfile::tempdir().expect("invariant: tempdir");
+        write_safetensors(
+            &model.path().join("mtp.safetensors"),
+            "layers.0.input_layernorm.weight",
+        );
+        let explicit = outside.path().join("tete.safetensors");
+        write_safetensors(&explicit, "mtp.fc.weight");
+        let config = serde_json::json!({});
+
+        let info = super::detect_mtp_weights(model.path(), &config, Some(explicit.clone()))
+            .expect("invariant: sidecar explicite lisible");
+        assert_eq!(info.path.as_deref(), Some(explicit.as_path()));
+        assert!(info.is_available());
+
+        let foreign = outside.path().join("autre.safetensors");
+        write_safetensors(&foreign, "dummy.weight");
+        assert!(matches!(
+            super::detect_mtp_weights(model.path(), &config, Some(foreign)),
+            Err(InferError::MissingWeight(_))
+        ));
+
+        // Tenseur mtp.* présent mais sans `fc` : la tête serait inutilisable.
+        let without_fc = outside.path().join("sans-fc.safetensors");
+        write_safetensors(&without_fc, "mtp.norm.weight");
+        assert!(matches!(
+            super::detect_mtp_weights(model.path(), &config, Some(without_fc)),
+            Err(InferError::MissingWeight(_))
+        ));
+
+        let missing = outside.path().join("absent.safetensors");
+        assert!(matches!(
+            super::detect_mtp_weights(model.path(), &config, Some(missing)),
+            Err(InferError::MissingArtifact { .. })
+        ));
     }
 
     #[test]
@@ -402,7 +477,8 @@ mod tests {
         );
         save_test_tokenizer(&tmp.path().join("tokenizer.json"));
 
-        let err = ModelAssets::load_local(tmp.path()).expect_err("invariant: shards requis");
+        let err = ModelAssets::load_local_with_mtp(tmp.path(), None)
+            .expect_err("invariant: shards requis");
         assert!(matches!(
             err,
             InferError::MissingArtifact {

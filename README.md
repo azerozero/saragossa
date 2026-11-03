@@ -97,8 +97,14 @@ high fidelity (smaller, same quality).
 
 **Speculative decode (MTP)**: on a **dense** model carrying a native MTP head,
 in greedy (T=0), saragossa verifies the draft **byte-exactly** → +15 to +40%
-throughput (`u4` 27→~40, `u3` 35→~46 tok/s). NO-GO on MoE (disjoint-expert
-verify cost). See `generate_greedy_mtp_streaming_with_options`.
+throughput (`u4` 27→~40, `u3` 35→~46 tok/s). On the **Qwen3.6-35B-A3B** MoE,
+the official Qwen MTP head (not shipped in mlx-community weights) is opt-in:
+point `SARAGOSSA_RUST_MTP_SIDECAR` at its `mtp.safetensors` (in a subdirectory,
+not directly in the model root, e.g. `<model>/mtp-official/`). Greedy only, byte-identical to
+AR: ×1.19 to ×1.61 decode (pairwise, 5 prompts), CLI 151→224-295 tok/s;
+sampled requests stay on AR (the sampled path measured 0.94-0.99× AR). Cost:
++3.2 GB peak physical footprint (CLI), +3.7 GB in serve after a 5,078-token request. See
+`generate_greedy_mtp_streaming_with_options` and `docs/perf/mtp-pairwise.md`.
 
 ## Install
 

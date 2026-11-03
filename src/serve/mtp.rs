@@ -12,56 +12,59 @@ const MTP_MAX_DRAFT_ENV: &str = "SARAGOSSA_RUST_MTP_MAX_DRAFT";
 /// Indique si le modèle peut charger automatiquement sa tête MTP.
 pub(crate) fn active_for(assets: &ModelAssets, backend: crate::RuntimeKind) -> bool {
     decode_enabled(saragossa::runtime_flags::env_var(MTP_DECODE_ENV).as_deref())
-        && supports_model(&assets.config, &assets.mtp, backend)
+        && supports_model(
+            &assets.config,
+            &assets.mtp,
+            backend,
+            saragossa::runtime_flags::mtp_sidecar_override().as_deref(),
+        )
 }
 
+/// Un tronc MoE n'active le MTP qu'avec une tête désignée explicitement par
+/// `SARAGOSSA_RUST_MTP_SIDECAR` (tête officielle du 35B-A3B, qualifiée en
+/// greedy) : aucun sidecar MoE détecté en silence n'a passé ces portes.
 fn supports_model(
     config: &saragossa::ModelConfig,
     mtp: &saragossa::MtpWeightsInfo,
     backend: crate::RuntimeKind,
+    explicit_sidecar: Option<&std::path::Path>,
 ) -> bool {
     backend == crate::RuntimeKind::Metal
         && mtp.path.is_some()
         && mtp.is_available()
-        && !config.is_moe()
+        && (!config.is_moe()
+            || explicit_sidecar.is_some_and(|path| mtp.path.as_deref() == Some(path)))
+}
+
+/// Le MTP échantillonné est-il admis pour ce modèle ? Coupé sur un tronc MoE :
+/// 0,94 à 0,99× l'AR mesurés (porte G5, docs/perf/mtp-pairwise.md), ces
+/// requêtes restent donc en AR. Ailleurs, kill-switch
+/// `SARAGOSSA_RUST_MTP_SAMPLED=0`.
+pub(crate) fn sampled_for(config: &saragossa::ModelConfig) -> bool {
+    saragossa::runtime_flags::mtp_sampled_enabled() && !config.is_moe()
 }
 
 /// Température admise par le decode MTP : greedy, ou toute température finie
 /// strictement positive quand l'échantillonnage lossless est activé
-/// (défaut, kill-switch `SARAGOSSA_RUST_MTP_SAMPLED=0`, lu par l'appelant).
+/// (cf. [`sampled_for`], résolu par l'appelant pour son modèle).
 fn temperature_supported(temperature: f32, sampled: bool) -> bool {
     temperature.abs() <= f32::EPSILON || (sampled && temperature.is_finite() && temperature > 0.0)
 }
 
 /// Le MTP vérifie le greedy non contraint et, par défaut, l'échantillonnage
-/// (accept/reject lossless) ; `SARAGOSSA_RUST_MTP_SAMPLED=0` le coupe. Les
+/// (accept/reject lossless) quand `sampled` (cf. [`sampled_for`]) l'admet. Les
 /// stop sequences sont tenues par le cœur MTP comme par DFlash (sortie de
 /// l'AR, séquence incluse).
 ///
 /// NOTE: une stop texte est tokenisée seule (`LoadedModel::stop_sequences`) ;
 /// si le modèle l'écrit avec une autre découpe, l'arrêt sur ids manque et le
 /// filtre texte de serve la retire et arrête le decode, streamé ou non.
-pub(crate) fn supports_options(options: &saragossa::GenerationOptions) -> bool {
-    supports_options_with(options, saragossa::runtime_flags::mtp_sampled_enabled())
-}
-
-fn supports_options_with(options: &saragossa::GenerationOptions, sampled: bool) -> bool {
+pub(crate) fn supports_options(options: &saragossa::GenerationOptions, sampled: bool) -> bool {
     temperature_supported(options.temperature, sampled) && options.token_constraint.is_none()
 }
 
 /// Indique si une requête doit emprunter le chemin MTP.
 pub(super) fn routes_request(
-    request: &ChatCompletionRequest,
-    response_format: ResponseFormatMode,
-) -> bool {
-    routes_request_with(
-        request,
-        response_format,
-        saragossa::runtime_flags::mtp_sampled_enabled(),
-    )
-}
-
-fn routes_request_with(
     request: &ChatCompletionRequest,
     response_format: ResponseFormatMode,
     sampled: bool,
@@ -124,22 +127,78 @@ mod tests {
         }))
         .expect("invariant: configuration test valide");
         let mut mtp = saragossa::MtpWeightsInfo::default();
-        assert!(!supports_model(&config, &mtp, crate::RuntimeKind::Metal));
+        assert!(!supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Metal,
+            None
+        ));
         mtp.path = Some("mtp.safetensors".into());
-        assert!(!supports_model(&config, &mtp, crate::RuntimeKind::Metal));
+        assert!(!supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Metal,
+            None
+        ));
         mtp.has_mtp_tensors = true;
-        assert!(!supports_model(&config, &mtp, crate::RuntimeKind::Metal));
+        assert!(!supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Metal,
+            None
+        ));
         mtp.has_fc_weight = true;
-        assert!(supports_model(&config, &mtp, crate::RuntimeKind::Metal));
-        assert!(!supports_model(&config, &mtp, crate::RuntimeKind::Cpu));
+        assert!(supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Metal,
+            None
+        ));
+        assert!(!supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Cpu,
+            None
+        ));
         config.num_experts = Some(8);
-        assert!(!supports_model(&config, &mtp, crate::RuntimeKind::Metal));
+        assert!(!supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Metal,
+            None
+        ));
+        // Tronc MoE : seulement avec la tête désignée explicitement.
+        let explicit = std::path::Path::new("mtp.safetensors");
+        let other = std::path::Path::new("autre.safetensors");
+        assert!(supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Metal,
+            Some(explicit)
+        ));
+        assert!(!supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Metal,
+            Some(other)
+        ));
+        assert!(!sampled_for(&config));
         config.num_experts = None;
         config.model_type = "qwen3_moe".into();
-        assert!(!supports_model(&config, &mtp, crate::RuntimeKind::Metal));
+        assert!(!supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Metal,
+            None
+        ));
         config.model_type = "qwen3_5_text".into();
         mtp.path = None;
-        assert!(!supports_model(&config, &mtp, crate::RuntimeKind::Metal));
+        assert!(!supports_model(
+            &config,
+            &mtp,
+            crate::RuntimeKind::Metal,
+            None
+        ));
     }
 
     #[test]
@@ -148,45 +207,29 @@ mod tests {
             temperature: 0.0,
             ..Default::default()
         };
-        assert!(supports_options_with(&options, false));
-        assert!(supports_options_with(&options, true));
+        assert!(supports_options(&options, false));
+        assert!(supports_options(&options, true));
         for temperature in [0.7, -0.7, f32::NAN, f32::INFINITY] {
             options.temperature = temperature;
-            assert!(!supports_options_with(&options, false));
+            assert!(!supports_options(&options, false));
         }
         options.temperature = 0.7;
-        assert!(supports_options_with(&options, true));
+        assert!(supports_options(&options, true));
         for temperature in [-0.7, f32::NAN, f32::INFINITY] {
             options.temperature = temperature;
-            assert!(!supports_options_with(&options, true));
+            assert!(!supports_options(&options, true));
         }
     }
 
     #[test]
     fn request_routing_follows_sampled_opt_in() {
         let sampled = request(r#"{"model":"m","messages":[],"temperature":0.7}"#);
-        assert!(!routes_request_with(
-            &sampled,
-            ResponseFormatMode::Text,
-            false
-        ));
-        assert!(routes_request_with(
-            &sampled,
-            ResponseFormatMode::Text,
-            true
-        ));
+        assert!(!routes_request(&sampled, ResponseFormatMode::Text, false));
+        assert!(routes_request(&sampled, ResponseFormatMode::Text, true));
         let negative = request(r#"{"model":"m","messages":[],"temperature":-0.7}"#);
-        assert!(!routes_request_with(
-            &negative,
-            ResponseFormatMode::Text,
-            true
-        ));
+        assert!(!routes_request(&negative, ResponseFormatMode::Text, true));
         let greedy = request(r#"{"model":"m","messages":[],"temperature":0}"#);
-        assert!(routes_request_with(
-            &greedy,
-            ResponseFormatMode::Text,
-            false
-        ));
+        assert!(routes_request(&greedy, ResponseFormatMode::Text, false));
     }
 
     #[test]
@@ -196,12 +239,12 @@ mod tests {
             stop_sequences: vec![vec![1, 2]],
             ..Default::default()
         };
-        assert!(supports_options_with(&options, false));
+        assert!(supports_options(&options, false));
         let sampled = saragossa::GenerationOptions {
             temperature: 0.7,
             ..options
         };
-        assert!(supports_options_with(&sampled, true));
+        assert!(supports_options(&sampled, true));
     }
 
     #[test]
@@ -223,7 +266,7 @@ mod tests {
             token_constraint: Some(std::sync::Arc::new(Constraint)),
             ..Default::default()
         };
-        assert!(!supports_options(&options));
+        assert!(!supports_options(&options, true));
     }
 
     #[test]
@@ -242,31 +285,15 @@ mod tests {
         let sampled = request(r#"{"model":"m","messages":[],"temperature":0.7}"#);
         let negative = request(r#"{"model":"m","messages":[],"temperature":-0.7}"#);
 
-        assert!(routes_request_with(
-            &absent,
-            ResponseFormatMode::Text,
-            false
-        ));
-        assert!(routes_request_with(&zero, ResponseFormatMode::Text, false));
-        assert!(!routes_request_with(
-            &sampled,
-            ResponseFormatMode::Text,
-            false
-        ));
-        assert!(!routes_request_with(
-            &negative,
-            ResponseFormatMode::Text,
-            false
-        ));
-        assert!(!routes_request_with(
+        assert!(routes_request(&absent, ResponseFormatMode::Text, false));
+        assert!(routes_request(&zero, ResponseFormatMode::Text, false));
+        assert!(!routes_request(&sampled, ResponseFormatMode::Text, false));
+        assert!(!routes_request(&negative, ResponseFormatMode::Text, false));
+        assert!(!routes_request(
             &zero,
             ResponseFormatMode::JsonObject,
             false
         ));
-        assert!(!routes_request_with(
-            &zero,
-            ResponseFormatMode::JsonLines,
-            true
-        ));
+        assert!(!routes_request(&zero, ResponseFormatMode::JsonLines, true));
     }
 }

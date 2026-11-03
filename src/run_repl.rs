@@ -277,7 +277,9 @@ impl ChatTurnGenerator for ReplModel {
                 }
             }
         };
-        let tokens = if self.mtp_active && crate::serve::mtp::supports_options(&self.options) {
+        // Le REPL n'active le MTP qu'en greedy (cf. `load`) : pas d'échantillonné.
+        let tokens = if self.mtp_active && crate::serve::mtp::supports_options(&self.options, false)
+        {
             self.decoder
                 .generate_greedy_mtp_streaming_with_options(
                     &prompt_ids,

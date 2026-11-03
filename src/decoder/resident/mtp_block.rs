@@ -99,28 +99,7 @@ impl CausalDecoder {
         if width != hidden {
             return Err(InferError::Dimension("MTP fc hidden incompatible".into()));
         }
-        let weights = FullAttnDenseLayerWeights {
-            input_norm: &mtp.layer.input_norm,
-            qkv_proj: mtp.layer.qkv_proj.as_ref(),
-            qkv_proj_without_gate: false,
-            value_norm: mtp.layer.value_norm,
-            q_proj: &mtp.layer.q_proj,
-            k_proj: &mtp.layer.k_proj,
-            v_proj: &mtp.layer.v_proj,
-            o_proj: &mtp.layer.o_proj,
-            q_norm: &mtp.layer.q_norm,
-            k_norm: &mtp.layer.k_norm,
-            post_norm: &mtp.layer.post_norm,
-            pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
-            post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
-            layer_scalar: mtp.layer.layer_scalar,
-            gate_proj: &mtp.layer.gate_proj,
-            up_proj: &mtp.layer.up_proj,
-            down_proj: &mtp.layer.down_proj,
-            tail_score: &arena.dense_tail_score,
-            parallel_moe: mtp.layer.parallel_moe_weights(),
-            sigmoid_moe: None,
-        };
+
         let dims = FullAttnLayerDims {
             hidden,
             q_heads: self.config.num_attention_heads,
@@ -135,12 +114,13 @@ impl CausalDecoder {
             theta,
             attn_output_gate: self.config.attn_output_gate,
         };
-        arena.state.encode_full_attn_dense_layer(
+        mtp.layer.encode(
+            &arena.state,
             metal,
             encoder,
             owned,
             &mut mtp.kv,
-            weights,
+            &arena.dense_tail_score,
             dims,
             mtp.fc_out.buffer(),
             layer_out.tensor().buffer(),

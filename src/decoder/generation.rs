@@ -3473,11 +3473,47 @@ impl CausalDecoder {
             .mtp
             .as_ref()
             .ok_or_else(|| InferError::Config("forward MTP sans tête chargée".to_string()))?;
+        self.mtp_head_forward(
+            head,
+            hidden,
+            next_id,
+            position,
+            mtp_cache,
+            self.forward_runtime(),
+        )
+    }
+
+    /// Forward d'une tête MTP sous un runtime donné : les oracles forcent le
+    /// CPU et comparent des têtes chargées autrement que `self.mtp`.
+    pub(super) fn mtp_head_forward(
+        &self,
+        head: &MtpHead,
+        hidden: &Tensor,
+        next_id: usize,
+        position: usize,
+        mtp_cache: &mut LayerKvCache,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<Tensor> {
+        self.mtp_head_forward_parts(head, hidden, next_id, position, mtp_cache, runtime)
+            .map(|(post, _)| post)
+    }
+
+    /// [`Self::mtp_head_forward`] avec l'entrée de la MLP, dont les oracles tirent
+    /// l'écart du routeur MoE.
+    pub(super) fn mtp_head_forward_parts(
+        &self,
+        head: &MtpHead,
+        hidden: &Tensor,
+        next_id: usize,
+        position: usize,
+        mtp_cache: &mut LayerKvCache,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<(Tensor, Tensor)> {
         let embedding = self.embed_scaled(&[next_id])?;
         let embedding = rms_norm(&embedding, &head.pre_fc_norm_embedding, self.config.rms_eps)?;
         let hidden = rms_norm(hidden, &head.pre_fc_norm_hidden, self.config.rms_eps)?;
         let x = concat_row_pair(&embedding, &hidden)?;
-        let x = head.fc.forward_with_runtime(&x, self.forward_runtime())?;
+        let x = head.fc.forward_with_runtime(&x, runtime)?;
 
         let residual = x.clone();
         let normed = rms_norm(&x, &head.layer.input_norm, self.config.rms_eps)?;
@@ -3487,23 +3523,20 @@ impl CausalDecoder {
             mtp_cache,
             position,
             &head.layer.attention,
-            self.forward_runtime(),
+            runtime,
         )?;
         let attn = head
             .layer
             .attention
             .o_proj
-            .forward_with_runtime(&context, self.forward_runtime())?;
+            .forward_with_runtime(&context, runtime)?;
         let h = residual.add(&attn)?;
 
         let residual = h.clone();
         let mlp_input = rms_norm(&h, &head.layer.post_attention_norm, self.config.rms_eps)?;
-        let mlp = head
-            .layer
-            .mlp
-            .forward_with_runtime(&mlp_input, self.forward_runtime())?;
+        let mlp = head.layer.mlp.forward_with_runtime(&mlp_input, runtime)?;
         let h = residual.add(&mlp)?;
-        rms_norm(&h, &head.norm, self.config.rms_eps)
+        Ok((rms_norm(&h, &head.norm, self.config.rms_eps)?, mlp_input))
     }
 
     fn ensure_speculative_cache_snapshot_supported(&self) -> Result<()> {

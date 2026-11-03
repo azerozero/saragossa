@@ -125,7 +125,10 @@ fn run() -> CliResult<()> {
     let load_started = Instant::now();
     let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
     let mtp_active = serve::mtp::active_for(&assets, args.backend)
-        && serve::mtp::supports_options(&generation_options(&args, &assets, args.top_p)?);
+        && serve::mtp::supports_options(
+            &generation_options(&args, &assets, args.top_p)?,
+            serve::mtp::sampled_for(&assets.config),
+        );
     // Charger avant la chauffe ; l'oracle explicite conserve son erreur sans tête.
     if saragossa::devtools::mtp_acceptance_enabled() || mtp_active {
         let path =
@@ -179,6 +182,10 @@ fn run() -> CliResult<()> {
             &options,
             mtp_decode_max_draft(),
         )?;
+        // La chauffe MTP a mis un préfixe du prompt en cache : le vrai run ferait
+        // une extension de préfixe au lieu du prefill à froid de l'AR (35B, T1 :
+        // near-tie, sortie différente de l'AR).
+        decoder.clear_prefix_cache();
         warmup_elapsed + started.elapsed()
     } else {
         warmup_elapsed

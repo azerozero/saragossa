@@ -67,6 +67,8 @@ pub(crate) fn resident_decode_steps_for_test() -> usize {
     resident::RESIDENT_DECODE_STEPS.with(std::cell::Cell::get)
 }
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+mod mtp_moe_oracles;
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
 #[cfg(test)]
 mod tests;
@@ -575,7 +577,7 @@ struct ResidentMtpArena {
     pre_fc_norm_embedding: metal::Buffer,
     pre_fc_norm_hidden: metal::Buffer,
     fc: MetalLinearWeightBuffers,
-    layer: ResidentFullDenseBuffers,
+    layer: ResidentMtpLayer,
     norm: metal::Buffer,
     draft_lm_head: MetalLinearWeightBuffers,
     kv: FullAttentionMetalState,
@@ -595,6 +597,19 @@ struct ResidentMtpArena {
     embedding: GpuTensor,
     concat: GpuTensor,
     fc_out: GpuTensor,
+}
+
+/// Couche unique de la tête MTP résidente : MLP dense (27B) ou MoE à expert
+/// partagé (35B-A3B), encodée par la queue mono-ligne du tronc correspondant.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "une seule instance par arène, jamais déplacée au decode"
+)]
+enum ResidentMtpLayer {
+    Dense(ResidentFullDenseBuffers),
+    Moe(ResidentFullMoeBuffers),
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2505,9 +2520,7 @@ impl CausalDecoder {
         // near-tie non byte-identique sur prompt long (c'était le « md5
         // divergent d62b5537 » attribué à tort au drop MoE pendant 6 rounds).
         // On purge : le cache se repeuple proprement dès le premier vrai tour.
-        if let Ok(mut cache) = self.prefix_cache.lock() {
-            cache.entries.clear();
-        }
+        self.clear_prefix_cache();
 
         let bytes = released
             .iter()
@@ -2571,6 +2584,15 @@ impl CausalDecoder {
         Ok(())
     }
 
+    /// Vide le cache de préfixe. Une chauffe qui l'a peuplé changerait le
+    /// chemin du vrai run (extension de préfixe au lieu d'un prefill à froid,
+    /// near-tie possible contre l'AR).
+    pub fn clear_prefix_cache(&self) {
+        if let Ok(mut cache) = self.prefix_cache.lock() {
+            cache.entries.clear();
+        }
+    }
+
     /// Charge une tête MTP depuis un sidecar safetensors.
     ///
     /// # Errors
@@ -2586,7 +2608,12 @@ impl CausalDecoder {
             .map_or_else(mtp::MtpLoadContext::cpu, mtp::MtpLoadContext::metal);
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let context = mtp::MtpLoadContext::cpu();
-        self.mtp = Some(MtpHead::from_sidecar(path, &self.config, &context)?);
+        self.mtp = Some(MtpHead::from_sidecar(
+            path,
+            &self.config,
+            self.final_norm.data().len(),
+            &context,
+        )?);
         Ok(self)
     }
 
