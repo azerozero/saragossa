@@ -1387,12 +1387,37 @@ Deux postes restent au-delà des poids :
   prefill), non attribué buffer par buffer.
 - Serve sur un prompt impair : le prefill résident découpe 5079 tokens en
   morceaux de 2540 et 2539. Les scratch internes (linear-attn batché, MoE en
-  lignes) sont indexés par longueur exacte : le second morceau alloue un jeu
-  complet de plus (≈ 0,6 Go). Ce n'est pas un coût de la tête : l'AR CLI paie
-  la même chose (pic 22,81 Go à 5012 tokens, 23,43 Go à 5013). Le serve AR
-  l'évite parce qu'il découpe le prompt en blocs pour ses instantanés. Piste :
-  dimensionner ces scratch sur la taille du morceau, comme la scratch de
-  couche (`allocate_prefill_resident_layer_scratch`).
+  lignes, LHS bf16 des matmuls, Q de l'attention NAX) sont indexés par longueur
+  exacte : le second morceau allouait un jeu complet de plus (≈ 0,6 Go). Ce
+  n'est pas un coût de la tête : l'AR CLI payait la même chose. Le serve AR
+  l'évite parce qu'il découpe le prompt en blocs pour ses instantanés. Corrigé
+  ensuite, voir plus bas.
+
+### Scratch du dernier morceau de prefill (4 nov. 2026)
+
+Pendant l'encodage d'un morceau plus court que les autres, une garde de thread
+(`enter_scratch_row_capacity`) porte à la capacité du morceau toute demande
+scratch multiple de ses lignes. Le dernier morceau reprend ainsi les entrées des
+morceaux pleins, comme la scratch de couche
+(`allocate_prefill_resident_layer_scratch`). Les kernels reçoivent toujours le
+vrai nombre de lignes : seuls les buffers sont plus grands. Un faux positif (un
+buffer non proportionnel aux lignes mais multiple) alloue seulement plus grand.
+
+ABBA, A = branche RAM de la tête, B = correctif, 2 passes chacun, Go. Les
+réponses sont identiques entre A et B, en AR comme en MTP (texte serve, md5
+CLI) :
+
+| cas | A | B |
+|---|---:|---:|
+| serve AR, 5078 tokens, régime / pic | 22,85 / 22,87 | 22,83 / 22,88 |
+| serve MTP, 5078 tokens, régime / pic | 23,87 / 23,95 | 23,86 / 23,96 |
+| serve AR, 5079 tokens, régime / pic | 22,83 / 22,88 | 22,86 / 22,88 |
+| serve MTP, 5079 tokens, régime / pic | 24,47 / 24,56 | 23,81 / 23,96 |
+| CLI AR, 5012 tokens, pic | 22,80 | 22,80 |
+| CLI AR, 5013 tokens, pic | 23,42 | 22,83 |
+
+Sur 5079 tokens, le surcoût de la tête retombe à +0,95 Go en régime et
++1,08 Go au pic, comme sur un prompt pair.
 
 Reproduction (`$SIDECAR` = `<35B>/mtp-official/mtp.safetensors`, `$PROMPTS` =
 `models/pairwise/prompts6.json`) :
