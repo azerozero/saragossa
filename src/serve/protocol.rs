@@ -53,6 +53,9 @@ pub(super) struct ChatCompletionRequest {
     /// Appels d'outils multiples autorisés (défaut vrai).
     #[serde(default)]
     pub(super) parallel_tool_calls: Option<bool>,
+    /// Graine du sampler (`seed` OpenAI) ; absente, la graine historique 0.
+    #[serde(default)]
+    pub(super) seed: Option<u64>,
 }
 
 /// Outil déclaré par la requête, lu une seule fois.
@@ -680,6 +683,23 @@ mod tests {
                 .expect("invariant: max_tokens sous plafond"),
             4
         );
+    }
+
+    #[test]
+    fn request_reads_seed() {
+        let parse = |json: &str| -> ChatCompletionRequest {
+            serde_json::from_str(json).expect("invariant: JSON valide")
+        };
+
+        assert_eq!(
+            parse(r#"{"model":"m","messages":[],"seed":42}"#).seed,
+            Some(42)
+        );
+        assert_eq!(parse(r#"{"model":"m","messages":[]}"#).seed, None);
+        assert!(serde_json::from_str::<ChatCompletionRequest>(
+            r#"{"model":"m","messages":[],"seed":-1}"#
+        )
+        .is_err());
     }
 
     #[test]

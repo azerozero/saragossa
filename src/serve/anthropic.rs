@@ -153,6 +153,7 @@ impl AnthropicMessagesRequest {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            seed: None,
         })
     }
 }
