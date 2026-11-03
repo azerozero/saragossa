@@ -215,6 +215,26 @@ returning truncated JSON; in SSE, the deltas stay a valid JSON prefix and an
 unclosed object ends with an `error` event of type `incomplete_json`, without the
 normal `[DONE]`.
 
+### Sampling and request fields
+
+`POST /v1/chat/completions` honours `temperature`, `top_p`, `top_k` (temperature
+first, then top-k, then top-p on the scaled distribution), `seed` (unsigned; defaults to `0`, so an unseeded sampled
+request stays reproducible), `stop` and `max_tokens` / `max_completion_tokens`.
+
+- `chat_template_kwargs`: only `{"enable_thinking": bool}` is accepted. Qwen
+  ChatML and Gemma 4 render it (thinking is **off** by default, which injects
+  the empty `<think>` block); with thinking on, the reasoning stays in
+  `content`. Flint and Gemma 3 have no switch and refuse an explicit value.
+  Any other key is refused (HTTP 400) rather than silently ignored.
+- `stream_options: {"include_usage": true}`: like the OpenAI API, a final
+  chunk with `"choices": []` and `usage` precedes `data: [DONE]`.
+- `min_p`, `presence_penalty`, `frequency_penalty` and `repetition_penalty`
+  are not implemented: only their neutral value (`0`, `0`, `0`, `1`) is
+  accepted, anything else returns 501.
+- Each completion logs `prompt_tokens=…` and `prompt_fnv1a64=…` (FNV-1a 64 of
+  the prompt ids as little-endian `u32`) on stderr, so a client can check that
+  the ingested ids are the ones it tokenized.
+
 ### Warm cache (block-wise prefix cache)
 
 Prompts are split into 256-token blocks, hashed as a chain (SHA-256 of
