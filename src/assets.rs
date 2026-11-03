@@ -42,7 +42,15 @@ impl MtpWeightsInfo {
 
 impl ModelAssets {
     pub fn load_local(model_dir: impl AsRef<Path>) -> Result<Self> {
-        let model_dir = model_dir.as_ref();
+        Self::load_local_with_mtp(
+            model_dir.as_ref(),
+            crate::runtime_flags::mtp_sidecar_override(),
+        )
+    }
+
+    /// [`Self::load_local`] avec l'override MTP explicite : les tests y passent
+    /// `None` pour ne pas dépendre de l'environnement des oracles.
+    fn load_local_with_mtp(model_dir: &Path, sidecar_override: Option<PathBuf>) -> Result<Self> {
         if !model_dir.is_dir() {
             return Err(InferError::MissingArtifact {
                 path: model_dir.to_path_buf(),
@@ -66,11 +74,7 @@ impl ModelAssets {
             });
         }
         let catalog = WeightCatalog::from_shards(&shards)?;
-        let mtp = detect_mtp_weights(
-            model_dir,
-            &raw_config_json,
-            crate::runtime_flags::mtp_sidecar_override(),
-        )?;
+        let mtp = detect_mtp_weights(model_dir, &raw_config_json, sidecar_override)?;
 
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
@@ -200,11 +204,11 @@ fn detect_mtp_weights(
     if let Some(path) = sidecar_override {
         require_file(&path, "sidecar MTP (SARAGOSSA_RUST_MTP_SIDECAR)")?;
         let info = mtp_weights_info(path)?;
-        if !info.has_mtp_tensors {
-            // Sans `mtp.*`, le MTP disparaîtrait en silence derrière un flag
-            // explicite.
+        if !info.is_available() {
+            // Sans `mtp.fc.weight` ni tenseur `mtp.*`, le MTP disparaîtrait en
+            // silence derrière un flag explicite.
             return Err(InferError::MissingWeight(format!(
-                "sidecar MTP explicite sans tenseur mtp.* : {}",
+                "sidecar MTP explicite incomplet (mtp.fc.weight et mtp.* requis) : {}",
                 info.path
                     .as_deref()
                     .map_or_else(String::new, |p| p.display().to_string())
@@ -316,13 +320,13 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("mtp")).expect("invariant: mkdir mtp");
         write_safetensors(&tmp.path().join("mtp/weights.safetensors"), "fc.weight");
 
-        let assets = ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
-        let mtp = local_mtp(tmp.path());
+        let assets = ModelAssets::load_local_with_mtp(tmp.path(), None)
+            .expect("invariant: assets chargeables");
         assert_eq!(assets.config.hidden_size, 4);
         assert_eq!(assets.shards.len(), 1);
         assert_eq!(assets.catalog.tensor_count(), 1);
-        assert!(mtp.is_available());
-        assert_eq!(mtp.tensor_count, 1);
+        assert!(assets.mtp.is_available());
+        assert_eq!(assets.mtp.tensor_count, 1);
         assert_eq!(
             assets.encode_prompt("bonjour reti").expect("encode"),
             vec![1, 2]
@@ -353,7 +357,8 @@ mod tests {
         save_gemma_test_tokenizer(&tmp.path().join("tokenizer.json"));
         write_safetensors(&tmp.path().join("model.safetensors"), "dummy.weight");
 
-        let assets = ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
+        let assets = ModelAssets::load_local_with_mtp(tmp.path(), None)
+            .expect("invariant: assets chargeables");
         assert_eq!(assets.stop_token_ids(), vec![1, 3]);
     }
 
@@ -406,20 +411,12 @@ mod tests {
             "layers.0.input_layernorm.weight",
         );
 
-        ModelAssets::load_local(tmp.path()).expect("invariant: assets chargeables");
+        let assets = ModelAssets::load_local_with_mtp(tmp.path(), None)
+            .expect("invariant: assets chargeables");
 
-        let mtp = local_mtp(tmp.path());
-        assert!(!mtp.is_available());
-        assert!(mtp.has_mtp_tensors);
-        assert!(!mtp.has_fc_weight);
-    }
-
-    /// Détection locale seule : l'override de l'environnement (sidecar officiel
-    /// posé pour les oracles) ne doit pas remplacer la fixture du test.
-    fn local_mtp(dir: &Path) -> super::MtpWeightsInfo {
-        let config = super::read_json_value(&dir.join("config.json"))
-            .expect("invariant: config de test lisible");
-        super::detect_mtp_weights(dir, &config, None).expect("invariant: détection locale")
+        assert!(!assets.mtp.is_available());
+        assert!(assets.mtp.has_mtp_tensors);
+        assert!(!assets.mtp.has_fc_weight);
     }
 
     #[test]
@@ -443,6 +440,14 @@ mod tests {
         write_safetensors(&foreign, "dummy.weight");
         assert!(matches!(
             super::detect_mtp_weights(model.path(), &config, Some(foreign)),
+            Err(InferError::MissingWeight(_))
+        ));
+
+        // Tenseur mtp.* présent mais sans `fc` : la tête serait inutilisable.
+        let without_fc = outside.path().join("sans-fc.safetensors");
+        write_safetensors(&without_fc, "mtp.norm.weight");
+        assert!(matches!(
+            super::detect_mtp_weights(model.path(), &config, Some(without_fc)),
             Err(InferError::MissingWeight(_))
         ));
 
@@ -472,7 +477,8 @@ mod tests {
         );
         save_test_tokenizer(&tmp.path().join("tokenizer.json"));
 
-        let err = ModelAssets::load_local(tmp.path()).expect_err("invariant: shards requis");
+        let err = ModelAssets::load_local_with_mtp(tmp.path(), None)
+            .expect_err("invariant: shards requis");
         assert!(matches!(
             err,
             InferError::MissingArtifact {
