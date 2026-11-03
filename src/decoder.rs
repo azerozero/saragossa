@@ -2520,9 +2520,7 @@ impl CausalDecoder {
         // near-tie non byte-identique sur prompt long (c'était le « md5
         // divergent d62b5537 » attribué à tort au drop MoE pendant 6 rounds).
         // On purge : le cache se repeuple proprement dès le premier vrai tour.
-        if let Ok(mut cache) = self.prefix_cache.lock() {
-            cache.entries.clear();
-        }
+        self.clear_prefix_cache();
 
         let bytes = released
             .iter()
@@ -2584,6 +2582,15 @@ impl CausalDecoder {
             draft_lm_head.release_affine_cpu_data(released);
         }
         Ok(())
+    }
+
+    /// Vide le cache de préfixe. Une chauffe qui l'a peuplé changerait le
+    /// chemin du vrai run (extension de préfixe au lieu d'un prefill à froid,
+    /// near-tie possible contre l'AR).
+    pub fn clear_prefix_cache(&self) {
+        if let Ok(mut cache) = self.prefix_cache.lock() {
+            cache.entries.clear();
+        }
     }
 
     /// Charge une tête MTP depuis un sidecar safetensors.

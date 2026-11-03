@@ -182,6 +182,10 @@ fn run() -> CliResult<()> {
             &options,
             mtp_decode_max_draft(),
         )?;
+        // La chauffe MTP a mis un préfixe du prompt en cache : le vrai run ferait
+        // une extension de préfixe au lieu du prefill à froid de l'AR (35B, T1 :
+        // near-tie, sortie différente de l'AR).
+        decoder.clear_prefix_cache();
         warmup_elapsed + started.elapsed()
     } else {
         warmup_elapsed
