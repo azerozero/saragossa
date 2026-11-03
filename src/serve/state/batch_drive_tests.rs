@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use saragossa::InferError;
 
-use super::json_tests::tiny_loaded_model;
+use super::json_tests::{tiny_loaded_model, tiny_loaded_model_with_vocab};
 use super::*;
 
 /// Client qui journalise ses événements dans un fil commun aux flux.
@@ -112,6 +112,38 @@ fn short_stream_finishes_before_late_decoder_error() {
     assert!(matches!(outcomes[2], Err(ServeError::Batch(_))));
 }
 
+/// Stop texte dont les ids ne ferment aucune séquence (`}` seul se tokenise en
+/// `<pad>`) : le flux s'arrête dès le token qui l'écrit, sans rien de visible
+/// au-delà, terminé en `stop`.
+#[test]
+fn text_stop_finishes_stream_without_token_sequence() {
+    let loaded = tiny_loaded_model_with_vocab(r#"{"{}":0,"<pad>":1,"<eos>":2}"#, "<pad>");
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "tiny", "messages": [{"role": "user", "content": "x"}],
+        "temperature": 0, "stream": true, "stop": "}", "max_tokens": 8
+    }))
+    .expect("invariant: requête test valide");
+    let prepared = loaded
+        .prepare(&request, 8)
+        .expect("invariant: requête préparée");
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut boxes: Vec<Box<dyn CompletionSink + '_>> = vec![Box::new(Recorder {
+        flux: 0,
+        log: Rc::clone(&log),
+        started: false,
+    })];
+    let mut sinks: Vec<&mut Box<dyn CompletionSink + '_>> = boxes.iter_mut().collect();
+
+    let (outcomes, _) = loaded.drive_batch(&[&prepared], &mut sinks, &[], |on_token| {
+        assert!(!on_token(0, 0), "stop texte vu au premier token");
+        assert!(!on_token(0, 0), "flux déjà terminé");
+        Ok(0)
+    });
+
+    assert!(outcomes[0].is_ok());
+    assert_eq!(log.borrow().last().map(String::as_str), Some("0:done:stop"));
+}
+
 /// Le budget atteint termine le flux sur son dernier token.
 #[test]
 fn budget_reached_finishes_stream_with_length() {
@@ -146,12 +178,13 @@ fn budget_reached_finishes_stream_with_length() {
 }
 
 /// Un sous-lot réduit à une requête part en solo SANS session : une
-/// requête-session (clé d'en-tête) n'y est admise que si ce solo est le MTP.
+/// requête-session (clé d'en-tête) n'y est admise que si ce solo est le MTP,
+/// `stop` compris.
 #[test]
 fn batched_session_request_alone_would_be_served_by_mtp() {
     let mut loaded = tiny_loaded_model();
     loaded.mtp_active = true;
-    for (stop, admitted) in [("", true), (r#","stop":"{}""#, false)] {
+    for (stop, admitted) in [("", true), (r#","stop":"{}""#, true)] {
         let body = format!(
             r#"{{"model":"tiny","messages":[{{"role":"user","content":"x"}}],"stream":true{stop}}}"#
         );

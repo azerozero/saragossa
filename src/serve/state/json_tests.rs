@@ -11,31 +11,60 @@ use saragossa::{
 use super::*;
 
 #[test]
-fn custom_stop_falls_back_to_ar_even_when_mtp_is_active() {
+fn custom_stop_routes_to_mtp_when_active() {
     for streaming in [false, true] {
         let mut loaded = tiny_loaded_model();
-        // Pas de tête chargée : un mauvais routage MTP échouerait immédiatement.
+        // Pas de tête chargée : le routage MTP se voit à son erreur.
         loaded.mtp_active = true;
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "tiny", "messages": [{"role": "user", "content": "JSON"}],
             "temperature": 0, "stop": "{}", "stream": streaming
         }))
         .expect("invariant: requête test valide");
+        let error = if streaming {
+            loaded.complete_streaming(request, 4, None, &MemoryGuard::serve(), &mut |_| Ok(()))
+        } else {
+            loaded.complete(request, 4, None, &MemoryGuard::serve())
+        }
+        .expect_err("invariant: arrêt personnalisé routé vers MTP sans tête");
+        assert!(error.to_string().contains("MTP"), "{error}");
+    }
+}
+
+#[test]
+fn text_stop_ends_decode_when_token_ids_differ() {
+    // `}` seul se tokenise en `<pad>` : la séquence d'ids ne se termine jamais,
+    // seul le stop texte vu dans `{}` peut arrêter le decode, streamé ou non.
+    for streaming in [false, true] {
+        let mut loaded = tiny_loaded_model_with_vocab(r#"{"{}":0,"<pad>":1,"<eos>":2}"#, "<pad>");
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "tiny", "messages": [{"role": "user", "content": "JSON"}],
+            "temperature": 0, "stop": "}", "stream": streaming
+        }))
+        .expect("invariant: requête test valide");
         let mut deltas = String::new();
         let completion = if streaming {
-            loaded.complete_streaming(request, 4, None, &MemoryGuard::serve(), &mut |event| {
+            loaded.complete_streaming(request, 8, None, &MemoryGuard::serve(), &mut |event| {
                 if let CompletionStreamEvent::Delta(delta) = event {
                     deltas.push_str(delta);
                 }
                 Ok(())
             })
         } else {
-            loaded.complete(request, 4, None, &MemoryGuard::serve())
+            loaded.complete(request, 8, None, &MemoryGuard::serve())
         }
-        .expect("invariant: arrêt personnalisé routé vers AR");
-        assert!(completion.content.is_empty());
-        assert!(deltas.is_empty());
+        .expect("invariant: stop texte");
+        assert_eq!(completion.content, "{", "streaming={streaming}");
+        if streaming {
+            assert_eq!(deltas, "{");
+        }
         assert_eq!(completion.finish_reason, "stop");
+        let usage = serde_json::to_value(completion.usage).expect("invariant: usage sérialisable");
+        assert_eq!(usage["completion_tokens"], 1, "streaming={streaming}");
+        assert_eq!(
+            completion.timings.decode_tokens, 0,
+            "decode poursuivi après le stop (streaming={streaming})"
+        );
     }
 }
 
@@ -239,7 +268,7 @@ pub(super) fn tiny_loaded_model() -> LoadedModel {
     tiny_loaded_model_with_vocab(r#"{"{}":0,"<pad>":1,"<eos>":2}"#, "{}")
 }
 
-fn tiny_loaded_model_with_vocab(vocab_json: &str, unk_token: &str) -> LoadedModel {
+pub(super) fn tiny_loaded_model_with_vocab(vocab_json: &str, unk_token: &str) -> LoadedModel {
     let tmp = tempfile::tempdir().expect("invariant: tempdir");
     let model_dir = tmp.path().to_path_buf();
     let config_path = tmp.path().join("config.json");

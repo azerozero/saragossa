@@ -33,7 +33,22 @@ fn emit_mtp_committed(
 
 #[cfg(test)]
 mod emission_tests {
-    use super::emit_mtp_committed;
+    use super::{emit_mtp_committed, first_stop_end};
+
+    #[test]
+    fn first_stop_end_sees_sequences_started_before_from() {
+        let generated = [1, 2, 3, 4, 2, 3];
+        let stops = [vec![2, 3]];
+        // Séquence commencée avant `from` (2 en position 1, 3 en position 2).
+        assert_eq!(first_stop_end(&generated, 2, &stops), Some(2));
+        // Fin avant `from` : déjà balayée, la suivante est rendue.
+        assert_eq!(first_stop_end(&generated, 3, &stops), Some(5));
+        assert_eq!(first_stop_end(&generated, 6, &stops), None);
+        // Première fin parmi plusieurs séquences, séquences vides ignorées.
+        let several = [Vec::new(), vec![4, 2, 3], vec![3, 4]];
+        assert_eq!(first_stop_end(&generated, 0, &several), Some(3));
+        assert_eq!(first_stop_end(&generated, 0, &[]), None);
+    }
 
     #[test]
     fn committed_prefix_stops_once_and_is_not_duplicated() {
@@ -1295,8 +1310,8 @@ impl CausalDecoder {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         // Drafter DFlash opt-in (`with_dflash_draft_from_env`) : le greedy non
-        // contraint passe par la boucle résidente ; échantillonnage et contraintes
-        // gardent la tête MTP. Phase 7 pairwise : code +31 à +88 %, prose longue
+        // contraint passe par la boucle résidente, stop sequences comprises ;
+        // échantillonnage et contraintes gardent la tête MTP. Phase 7 pairwise : code +31 à +88 %, prose longue
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
         #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
         if let Some(draft) = self.dflash.as_ref() {
@@ -1560,6 +1575,8 @@ impl CausalDecoder {
             && mtp_fresh_cache_enabled()
             && options.temperature.abs() <= f32::EPSILON
             && options.token_constraint.is_none()
+            // Le bloc GPU enchaîne des tours sans rendre la main à l'hôte entre
+            // deux tokens : il reste réservé aux requêtes sans stop sequence.
             && options.stop_sequences.is_empty()
         {
             cache
@@ -1575,7 +1592,18 @@ impl CausalDecoder {
         let overlap_stream = crate::runtime_flags::mtp_overlap_stream_enabled();
         let decode_started = Instant::now();
 
+        // Stop sequences : un seul balayage des tokens committés par le tour
+        // précédent, quel que soit le chemin (D1, D2, vérifieur général),
+        // avant toute émission ; les tokens au-delà de la séquence sont retirés.
+        // NOTE: les statistiques comptent le tour entier, y compris les drafts
+        // acceptés après la séquence.
+        let mut stop_scanned = 0usize;
         while generated.len() < max_new_tokens {
+            if let Some(end) = first_stop_end(&generated, stop_scanned, &options.stop_sequences) {
+                generated.truncate(end + 1);
+                break;
+            }
+            stop_scanned = generated.len();
             let committed_prefix = generated.len();
             let defer_emit = overlap_stream
                 && emitted < committed_prefix
@@ -1635,7 +1663,10 @@ impl CausalDecoder {
             if early_emitted && generated.len() == 1 {
                 emitted = 1;
             }
-            if generated.len() >= max_new_tokens {
+            // Stop sequence terminée par le primaire : pas de draft inutile.
+            if generated.len() >= max_new_tokens
+                || generated_matches_stop_sequence(&generated, &options.stop_sequences)
+            {
                 break;
             }
 
@@ -2083,15 +2114,28 @@ impl CausalDecoder {
         let loop_duration = decode_started.elapsed();
         #[cfg(all(target_os = "macos", feature = "metal"))]
         DecodeProfiler::report_gpu_sections(self, &cache);
+        // Sorties de boucle sans repasser par le balayage de tête (limite de
+        // sortie, primaire) : même troncature avant le flush.
+        if let Some(end) = first_stop_end(&generated, stop_scanned, &options.stop_sequences) {
+            generated.truncate(end + 1);
+        }
         // Flush final : émet les derniers tokens committés non encore streamés.
+        // Un arrêt par stop sequence le garde ; seule l'annulation par le
+        // callback le saute.
         if !stop_streaming {
             while emitted < generated.len() {
                 let committed = generated[emitted];
                 emitted += 1;
                 if !on_token(committed) {
+                    stop_streaming = true;
                     break;
                 }
             }
+        }
+        // Annulation par le callback : la sortie s'arrête au dernier token
+        // émis (sortie et usage identiques au flux, comme l'AR et DFlash).
+        if stop_streaming {
+            generated.truncate(emitted);
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         decode_profiler.report_decode_loop(loop_duration, generated.len());
@@ -4342,6 +4386,10 @@ impl CausalDecoder {
     /// bascule retrouve alors l'entrée du cache de préfixe au lieu de re-préremplir
     /// prompt + généré. `None` sans bascule, sans sidecar MTP ou hors politique
     /// committed.
+    ///
+    /// NOTE: semé aussi pour une requête avec stop sequences, pour laquelle la
+    /// boucle résidente coupe pourtant la bascule ; le prefill ne voit pas les
+    /// options et l'entrée reste utile aux requêtes suivantes du même préfixe.
     #[cfg(feature = "devtools")]
     fn dflash_switch_mtp_history(
         &self,
@@ -5328,7 +5376,26 @@ impl CausalDecoder {
     }
 }
 
-fn generated_matches_stop_sequence(generated: &[usize], stop_sequences: &[Vec<usize>]) -> bool {
+/// Fin (index inclus) de la première stop sequence terminée à une position
+/// `>= from` de `generated`. La fenêtre de chaque test remonte avant `from` :
+/// une séquence à cheval sur des tokens déjà balayés est trouvée.
+fn first_stop_end(
+    generated: &[usize],
+    from: usize,
+    stop_sequences: &[Vec<usize>],
+) -> Option<usize> {
+    if stop_sequences.is_empty() {
+        return None;
+    }
+    (from..generated.len())
+        .find(|&end| generated_matches_stop_sequence(&generated[..=end], stop_sequences))
+}
+
+/// Indique si `generated` se termine par une stop sequence non vide.
+pub(in crate::decoder) fn generated_matches_stop_sequence(
+    generated: &[usize],
+    stop_sequences: &[Vec<usize>],
+) -> bool {
     stop_sequences
         .iter()
         .any(|sequence| !sequence.is_empty() && generated.ends_with(sequence))

@@ -413,7 +413,13 @@ impl CausalDecoder {
         // Bascule par acceptance observée : sous `switch_min` tokens par tour en
         // moyenne après `switch_warmup` tours, la boucle rend la main (le reste de
         // la génération revient à la boucle MTP, cf. harnais d'acceptance).
-        let switch_min = crate::runtime_flags::dflash_switch_min();
+        // NOTE: le repli MTP repart avec une sortie vide et manquerait une stop
+        // sequence à cheval sur la bascule : pas de bascule avec des séquences.
+        let switch_min = if options.stop_sequences.is_empty() {
+            crate::runtime_flags::dflash_switch_min()
+        } else {
+            0.0
+        };
         let switch_warmup = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_WARMUP")
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(6)
@@ -445,8 +451,9 @@ impl CausalDecoder {
                 stats.dflash_switched_at = Some(generated.len());
                 break;
             }
-            generated.push(primary);
-            if !on_token(primary) || generated.len() >= max_new_tokens {
+            if !commit_token(&mut generated, primary, options, &mut on_token)
+                || generated.len() >= max_new_tokens
+            {
                 break;
             }
 
@@ -548,8 +555,7 @@ impl CausalDecoder {
                         accepted_all = false;
                         break;
                     }
-                    generated.push(draft_token);
-                    if !on_token(draft_token) {
+                    if !commit_token(&mut generated, draft_token, options, &mut on_token) {
                         stopped = true;
                         accepted_all = false;
                         break;
@@ -946,12 +952,11 @@ impl CausalDecoder {
                 *state.pending = target;
                 break;
             }
-            state.generated.push(target);
-            // NOTE: arrêt (callback ou limite de sortie) : sortie sans rollback
-            // ni append. Le cache est local à la génération et détruit avec
-            // elle ; ses états (KV non compacté, états linéaires d'entrée) ne
-            // sont plus relus.
-            if !(state.on_token)(target) {
+            // NOTE: arrêt (callback, stop sequence ou limite de sortie) : sortie
+            // sans rollback ni append. Le cache est local à la génération et
+            // détruit avec elle ; ses états (KV non compacté, états linéaires
+            // d'entrée) ne sont plus relus.
+            if !commit_token(state.generated, target, options, state.on_token) {
                 return Ok(TourEnd::Stop);
             }
             if state.generated.len() >= max_new_tokens {
@@ -1129,7 +1134,7 @@ impl CausalDecoder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TourEnd {
     Continue,
-    /// Arrêt demandé par le callback de streaming.
+    /// Arrêt : callback de streaming, stop sequence ou limite de sortie.
     Stop,
 }
 
@@ -1140,6 +1145,24 @@ struct DFlashTourState<'a, F> {
     pending: &'a mut usize,
     segments: &'a mut [std::time::Duration; 5],
     on_token: &'a mut F,
+}
+
+/// Pousse un token définitif, l'émet, puis dit si la génération continue :
+/// `false` si le callback arrête ou si une stop sequence vient de se terminer
+/// (incluse dans la sortie, comme en AR). La limite de sortie reste à
+/// l'appelant ; les stop tokens, exclus, sont testés avant.
+fn commit_token(
+    generated: &mut Vec<usize>,
+    token: usize,
+    options: &GenerationOptions,
+    on_token: &mut impl FnMut(usize) -> bool,
+) -> bool {
+    generated.push(token);
+    on_token(token)
+        && !crate::decoder::generation::generated_matches_stop_sequence(
+            generated,
+            &options.stop_sequences,
+        )
 }
 
 /// Une ligne JSONL de la trace d'arbre (`SARAGOSSA_RUST_DFLASH_TREE_TRACE`).
@@ -1194,6 +1217,35 @@ mod tests {
         let mut mode = DFlashTreeMode::BestFirst(8);
         assert!(tree_fallback(&mut mode, true, refusal()).is_err());
         assert_eq!(mode, DFlashTreeMode::BestFirst(8));
+    }
+
+    #[test]
+    fn commit_token_stops_after_emitting_a_stop_sequence() {
+        let options = GenerationOptions {
+            stop_sequences: vec![Vec::new(), vec![3, 4]],
+            ..GenerationOptions::default()
+        };
+        let mut generated = Vec::new();
+        let mut seen = Vec::new();
+        let mut on_token = |token| {
+            seen.push(token);
+            true
+        };
+        let continues: Vec<bool> = [1, 3, 4]
+            .into_iter()
+            .map(|token| commit_token(&mut generated, token, &options, &mut on_token))
+            .collect();
+        assert_eq!(continues, [true, true, false]);
+        assert_eq!(generated, [1, 3, 4]);
+        assert_eq!(seen, [1, 3, 4]);
+        let mut cancelled = Vec::new();
+        assert!(!commit_token(
+            &mut cancelled,
+            1,
+            &GenerationOptions::default(),
+            &mut |_| false
+        ));
+        assert_eq!(cancelled, [1]);
     }
 
     #[test]

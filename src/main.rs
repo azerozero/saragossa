@@ -45,6 +45,8 @@ struct CliArgs {
     metrics: bool,
     raw: bool,
     ignore_stop_tokens: bool,
+    /// Stop sequences texte (`--stop`, répétable), tokenisées seules.
+    stop: Vec<String>,
     backend: RuntimeKind,
 }
 
@@ -123,7 +125,7 @@ fn run() -> CliResult<()> {
     let load_started = Instant::now();
     let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
     let mtp_active = serve::mtp::active_for(&assets, args.backend)
-        && serve::mtp::supports_options(&generation_options(&args, &assets, args.top_p));
+        && serve::mtp::supports_options(&generation_options(&args, &assets, args.top_p)?);
     // Charger avant la chauffe ; l'oracle explicite conserve son erreur sans tête.
     if saragossa::devtools::mtp_acceptance_enabled() || mtp_active {
         let path =
@@ -170,7 +172,7 @@ fn run() -> CliResult<()> {
     let warmup_elapsed = if mtp_active && warmup_enabled() {
         let started = Instant::now();
         let warmup_len = prompt_ids.len().min(warmup_prompt_tokens()).max(1);
-        let options = generation_options(&args, &assets, args.top_p);
+        let options = generation_options(&args, &assets, args.top_p)?;
         decoder.generate_greedy_mtp_batched_with_options(
             &prompt_ids[..warmup_len],
             MTP_DECODE_WARMUP_TOKENS,
@@ -186,7 +188,7 @@ fn run() -> CliResult<()> {
             cli_error("SARAGOSSA_RUST_LIGHTBATCH_ACCEPTANCE=1 requiert --prompt-b")
         })?;
         let prompt_b_ids = encode_prompt_ids(&assets, prompt_b, args.raw)?;
-        let options = generation_options(&args, &assets, args.top_p);
+        let options = generation_options(&args, &assets, args.top_p)?;
         return Ok(saragossa::devtools::run_lightbatch_acceptance(
             &assets,
             &decoder,
@@ -282,7 +284,7 @@ fn run() -> CliResult<()> {
         return Ok(());
     }
     if saragossa::devtools::mtp_acceptance_enabled() {
-        let options = generation_options(&args, &assets, 1.0);
+        let options = generation_options(&args, &assets, 1.0)?;
         return Ok(saragossa::devtools::run_mtp_acceptance(
             &assets,
             &decoder,
@@ -305,7 +307,7 @@ fn run() -> CliResult<()> {
             PathBuf::from(draft_dir),
             saragossa::devtools::DFlashQuant::from_env()?,
         )?;
-        let options = generation_options(&args, &assets, 1.0);
+        let options = generation_options(&args, &assets, 1.0)?;
         return Ok(saragossa::devtools::run_dflash_acceptance(
             &assets,
             &decoder,
@@ -319,7 +321,7 @@ fn run() -> CliResult<()> {
     }
     #[cfg(all(target_os = "macos", feature = "metal"))]
     if saragossa::devtools::resident_linear_xray_enabled() {
-        let options = generation_options(&args, &assets, args.top_p);
+        let options = generation_options(&args, &assets, args.top_p)?;
         return Ok(saragossa::devtools::run_resident_linear_xray(
             &assets,
             &decoder,
@@ -334,7 +336,7 @@ fn run() -> CliResult<()> {
             saragossa::metal_backend::decode_profile_dispatch_shapes_snapshot(),
         )
     });
-    let options = generation_options(&args, &assets, args.top_p);
+    let options = generation_options(&args, &assets, args.top_p)?;
     let generate_started = Instant::now();
     // Decode MTP automatique si la tête et les options sont compatibles.
     // `SARAGOSSA_RUST_MTP_DECODE=0` force l'AR. Le résultat spéculatif ne
@@ -534,7 +536,11 @@ fn encode_prompt_ids(assets: &ModelAssets, prompt: &str, raw: bool) -> CliResult
     .collect::<CliResult<Vec<_>>>()
 }
 
-fn generation_options(args: &CliArgs, assets: &ModelAssets, top_p: f32) -> GenerationOptions {
+fn generation_options(
+    args: &CliArgs,
+    assets: &ModelAssets,
+    top_p: f32,
+) -> CliResult<GenerationOptions> {
     let mut options = GenerationOptions {
         temperature: args.temperature,
         top_p,
@@ -545,7 +551,19 @@ fn generation_options(args: &CliArgs, assets: &ModelAssets, top_p: f32) -> Gener
     if !args.ignore_stop_tokens {
         options.stop_token_ids = assets.stop_token_ids();
     }
-    options
+    for stop in &args.stop {
+        let sequence = assets
+            .encode_prompt(stop)?
+            .into_iter()
+            .map(|id| {
+                usize::try_from(id).map_err(|_| cli_error(format!("token id hors plage: {id}")))
+            })
+            .collect::<CliResult<Vec<_>>>()?;
+        if !sequence.is_empty() {
+            options.stop_sequences.push(sequence);
+        }
+    }
+    Ok(options)
 }
 
 fn generate_benchmark_prompt(
@@ -655,6 +673,7 @@ impl CliArgs {
         let mut metrics = false;
         let mut raw = false;
         let mut ignore_stop_tokens = false;
+        let mut stop = Vec::new();
         let mut backend = RuntimeKind::default_backend();
         let mut iter = args.into_iter();
 
@@ -687,6 +706,7 @@ impl CliArgs {
                 "--metrics" => metrics = true,
                 "--raw" => raw = true,
                 "--ignore-stop-tokens" => ignore_stop_tokens = true,
+                "--stop" => stop.push(next_value(&mut iter, "--stop")?),
                 "--backend" | "--runtime" => {
                     backend = RuntimeKind::parse(&next_value(&mut iter, "--backend")?)?;
                 }
@@ -754,6 +774,7 @@ impl CliArgs {
             metrics,
             raw,
             ignore_stop_tokens,
+            stop,
             backend,
         })
     }
@@ -804,7 +825,7 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error> {
 
 fn print_help() {
     println!(
-        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve> [options]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N]\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
+        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve> [options]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--stop TEXT]... [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N]\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
     );
 }
 
@@ -1076,6 +1097,23 @@ mod tests {
         .expect("invariant: ignore-stop-tokens valide");
 
         assert!(args.ignore_stop_tokens);
+    }
+
+    #[test]
+    fn cli_args_accept_repeated_stop() {
+        let args = CliArgs::parse([
+            "--model-dir".to_string(),
+            "models/tiny".to_string(),
+            "--prompt".to_string(),
+            "bonjour".to_string(),
+            "--stop".to_string(),
+            "}".to_string(),
+            "--stop".to_string(),
+            "\n\n".to_string(),
+        ])
+        .expect("invariant: stop répété valide");
+
+        assert_eq!(args.stop, ["}", "\n\n"]);
     }
 
     #[test]

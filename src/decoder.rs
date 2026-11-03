@@ -467,6 +467,10 @@ fn new_resident_compute_encoder(
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 /// Compte les décisions d'une génération spéculative.
+///
+/// Avec des stop sequences, MTP compte le tour entier, y compris les drafts
+/// acceptés après la séquence puis retirés de la sortie ; DFlash cesse de
+/// compter au stop.
 pub struct SpeculativeStats {
     /// Nombre de tokens proposés par le draft.
     pub proposed: usize,

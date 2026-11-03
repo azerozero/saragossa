@@ -2152,6 +2152,75 @@ fn mtp_verifier_options(stop_token_ids: Vec<usize>) -> GenerationOptions {
     }
 }
 
+/// Stop sequences couvrant chaque position de `generated` : pour `end`, le plus
+/// court suffixe de `generated[..=end]` dont la première occurrence finit en
+/// `end`. L'AR avec cette seule séquence rend donc exactement
+/// `generated[..=end]` ; balayer toutes les positions couvre les arrêts au
+/// milieu des drafts acceptés comme les séquences à cheval sur deux tours.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn stop_sequence_cases(generated: &[usize]) -> Vec<(Vec<usize>, usize)> {
+    (0..generated.len())
+        .map(|end| {
+            let sequence = (1..=end + 1)
+                .map(|len| &generated[end + 1 - len..=end])
+                .find(|suffix| (0..end).all(|i| !generated[..=i].ends_with(suffix)))
+                .unwrap_or(&generated[..=end]);
+            (sequence.to_vec(), end)
+        })
+        .collect()
+}
+
+/// Stop sequence qui traverse une frontière de tour observée sur un flux
+/// horodaté : chaque tour émet ses tokens en rafale, séparées par le travail
+/// GPU. Rend la plus courte séquence (première occurrence) finissant en `end`
+/// et commençant avant `end`, où `end` ouvre une rafale et est suivi d'un token
+/// de la même rafale : le stop tombe au milieu des tokens d'un tour, la
+/// séquence commence dans le tour précédent.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn crossing_stop_case(tokens: &[usize], times: &[Instant]) -> Option<(Vec<usize>, usize)> {
+    let gap = Duration::from_millis(2);
+    let burst = Duration::from_micros(500);
+    // Au-delà des premiers tokens : le premier est émis à part (prefill ou
+    // émission anticipée), la frontière cherchée est celle d'un tour plein.
+    (3..tokens.len().saturating_sub(1)).find_map(|end| {
+        let opens_burst = times[end].duration_since(times[end - 1]) >= gap
+            && times[end + 1].duration_since(times[end]) <= burst;
+        if !opens_burst {
+            return None;
+        }
+        let sequence = (2..=end + 1)
+            .map(|len| &tokens[end + 1 - len..=end])
+            .find(|suffix| (0..end).all(|i| !tokens[..=i].ends_with(suffix)))?;
+        Some((sequence.to_vec(), end))
+    })
+}
+
+/// Annulation par le callback avant ou sur le stop : aucun callback après
+/// `false`, tokens émis = préfixe de l'oracle = tokens rendus.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn assert_cancelled_stream(
+    label: &str,
+    oracle: &[usize],
+    cancel_at: usize,
+    run: impl FnOnce(&mut dyn FnMut(usize) -> bool) -> Result<SpeculativeOutput>,
+) -> Result<()> {
+    let mut seen = Vec::new();
+    let output = run(&mut |token| {
+        seen.push(token);
+        seen.len() <= cancel_at
+    })?;
+    assert_eq!(
+        seen,
+        oracle[..=cancel_at],
+        "{label}, annulation en {cancel_at}"
+    );
+    assert_eq!(
+        output.tokens, seen,
+        "{label}, sortie après annulation en {cancel_at}"
+    );
+    Ok(())
+}
+
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn mtp_verifier_case(
     model: &CausalDecoder,
@@ -2825,6 +2894,210 @@ fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
     Ok(())
 }
 
+/// Stop sequences dans le cœur MTP sans drafter : sortie et flux identiques à
+/// l'AR avec les mêmes séquences, à toutes les positions, en défaut de
+/// production (fresh adaptatif) et forcés D1, D2, émission différée et lookup
+/// (vérifieur général). En échantillonné, la sortie est le préfixe de la
+/// trajectoire sans séquence, terminé par la séquence. Requiert
+/// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
+#[test]
+#[ignore = "modèle réel avec sidecar MTP requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn mtp_stop_sequences_match_ar_real_model() -> Result<()> {
+    use crate::runtime_flags::pairwise::{Case, Guard, Mode};
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+        eprintln!("skip stop sequences MTP : sidecar MTP absent");
+        return Ok(());
+    };
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(mtp_path)?;
+    let prompt = mtp_verifier_prompt_ids(
+        &assets,
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+    )?;
+    let max_new_tokens = 32;
+    let options = mtp_verifier_options(Vec::new());
+    let ar = model.generate_greedy_cached_with_options(&prompt, max_new_tokens, &options)?;
+    let with_sequence = |sequence: Vec<usize>, base: &GenerationOptions| GenerationOptions {
+        stop_sequences: vec![sequence],
+        ..base.clone()
+    };
+    let cases = stop_sequence_cases(&ar);
+    for (sequence, end) in &cases {
+        let ar_seq = model.generate_greedy_cached_with_options(
+            &prompt,
+            max_new_tokens,
+            &with_sequence(sequence.clone(), &options),
+        )?;
+        assert_eq!(ar_seq, ar[..=*end], "AR, stop sequence en {end}");
+    }
+    // Frontière de tour observée sur le flux par défaut (horodaté).
+    let mut times = Vec::new();
+    let timed = model.generate_greedy_mtp_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &options,
+        2,
+        |_| {
+            times.push(Instant::now());
+            true
+        },
+    )?;
+    assert_eq!(timed.tokens, ar, "MTP horodaté divergent de l'AR");
+    let crossing = crossing_stop_case(&ar, &times)
+        .ok_or_else(|| InferError::Config("aucune frontière de tour MTP observée".into()))?;
+    eprintln!(
+        "stop sequence MTP à cheval : {:?} en {}",
+        crossing.0, crossing.1
+    );
+    let mut cases = cases;
+    cases.push(crossing.clone());
+    let configs = [
+        ("défaut", None),
+        ("D1", Some(Case::default())),
+        (
+            "D1 différé",
+            Some(Case {
+                overlap: true,
+                ..Case::default()
+            }),
+        ),
+        (
+            "D2",
+            Some(Case {
+                mode: Mode::D2,
+                ..Case::default()
+            }),
+        ),
+        (
+            "D2 différé",
+            Some(Case {
+                mode: Mode::D2,
+                overlap: true,
+                ..Case::default()
+            }),
+        ),
+        (
+            "lookup",
+            Some(Case {
+                lookup: 8,
+                ..Case::default()
+            }),
+        ),
+        (
+            "fresh",
+            Some(Case {
+                mode: Mode::Fresh,
+                ..Case::default()
+            }),
+        ),
+    ];
+    for (name, case) in configs {
+        let _guard = case.map(|case| Guard::set(case, false)).transpose()?;
+        let depth = case.map_or(2, Case::depth);
+        // Le chemin attendu accepte bien des drafts (deux par tour en D2).
+        let free = model.generate_greedy_mtp_batched_with_options(
+            &prompt,
+            max_new_tokens,
+            &options,
+            depth,
+        )?;
+        assert_eq!(free.tokens, ar, "MTP {name} sans séquence");
+        assert!(free.stats.accepted > 0, "MTP {name} : aucun draft accepté");
+        if depth == 2 && case.is_some() {
+            assert!(
+                free.stats.accepted_by_position[1] > 0,
+                "MTP {name} : second draft jamais accepté"
+            );
+        }
+        let crossing_options = with_sequence(crossing.0.clone(), &options);
+        for cancel_at in [crossing.1 - 1, crossing.1] {
+            assert_cancelled_stream(&format!("MTP {name}"), &ar, cancel_at, |on_token| {
+                model.generate_greedy_mtp_streaming_with_options(
+                    &prompt,
+                    max_new_tokens,
+                    &crossing_options,
+                    depth,
+                    on_token,
+                )
+            })?;
+        }
+        for (sequence, end) in &cases {
+            let mut streamed = Vec::new();
+            let spec = model.generate_greedy_mtp_streaming_with_options(
+                &prompt,
+                max_new_tokens,
+                &with_sequence(sequence.clone(), &options),
+                depth,
+                |token| {
+                    streamed.push(token);
+                    true
+                },
+            )?;
+            assert_eq!(
+                spec.tokens,
+                ar[..=*end],
+                "MTP {name}, stop sequence en {end}"
+            );
+            assert_eq!(
+                streamed, spec.tokens,
+                "flux MTP {name}, stop sequence en {end}"
+            );
+        }
+        eprintln!("stop sequences MTP {name} : {} positions ok", cases.len());
+    }
+    // Plusieurs séquences et stop token au même token, chemin par défaut.
+    let multiple = GenerationOptions {
+        stop_sequences: vec![cases[20].0.clone(), cases[8].0.clone()],
+        ..options.clone()
+    };
+    let spec =
+        model.generate_greedy_mtp_batched_with_options(&prompt, max_new_tokens, &multiple, 2)?;
+    assert_eq!(spec.tokens, ar[..=8], "MTP, séquences multiples");
+    let both = GenerationOptions {
+        stop_sequences: vec![cases[10].0.clone()],
+        ..mtp_verifier_options(vec![ar[10]])
+    };
+    let ar_both = model.generate_greedy_cached_with_options(&prompt, max_new_tokens, &both)?;
+    let spec = model.generate_greedy_mtp_batched_with_options(&prompt, max_new_tokens, &both, 2)?;
+    assert_eq!(
+        spec.tokens, ar_both,
+        "MTP, stop token et séquence au même token"
+    );
+    // Échantillonné : préfixe de la trajectoire libre, à seed fixe.
+    let warm = GenerationOptions {
+        temperature: 0.7,
+        seed: 7,
+        ..options.clone()
+    };
+    let free = model.generate_greedy_mtp_core(&prompt, max_new_tokens, &warm, 2, |_| true)?;
+    for (sequence, end) in stop_sequence_cases(&free.tokens).into_iter().step_by(3) {
+        let mut streamed = Vec::new();
+        let sampled = model.generate_greedy_mtp_core(
+            &prompt,
+            max_new_tokens,
+            &with_sequence(sequence, &warm),
+            2,
+            |token| {
+                streamed.push(token);
+                true
+            },
+        )?;
+        assert_eq!(streamed, sampled.tokens, "flux MTP échantillonné en {end}");
+        assert_eq!(
+            sampled.tokens,
+            free.tokens[..=end],
+            "MTP échantillonné, stop sequence en {end}"
+        );
+    }
+    Ok(())
+}
+
 /// Premier token MTP émis avant le semis de l'historique : le flux émet chaque
 /// token une seule fois, et un refus dès le premier rend ce seul token, à froid
 /// comme en extension du cache de préfixe. Requiert
@@ -3040,6 +3313,19 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
         let tree = run(&prompt, 32, &options, DFlashTreeMode::BestFirst(budget))?;
         assert_eq!(tree.tokens, ar, "arbre B={budget}");
     }
+    // Stop sequences, toutes positions : oracle AR par construction de
+    // `stop_sequence_cases` (vérifié dans le test de la chaîne), B = 8 partout,
+    // B = 1 sur quelques positions.
+    for (sequence, end) in stop_sequence_cases(&ar) {
+        let mut options_seq = options.clone();
+        options_seq.stop_sequences = vec![sequence];
+        let tree = run(&prompt, 32, &options_seq, DFlashTreeMode::BestFirst(8))?;
+        assert_eq!(tree.tokens, ar[..=end], "arbre B=8, stop sequence en {end}");
+        if [3, 11, 22].contains(&end) {
+            let tree = run(&prompt, 32, &options_seq, DFlashTreeMode::BestFirst(1))?;
+            assert_eq!(tree.tokens, ar[..=end], "arbre B=1, stop sequence en {end}");
+        }
+    }
     // Au-delà du journal (17 lignes) : refus explicite avant toute génération.
     assert!(run(&prompt, 32, &options, DFlashTreeMode::BestFirst(16)).is_err());
     Ok(())
@@ -3057,6 +3343,7 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
 #[ignore = "modèle réel + draft DFlash requis"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
+    use crate::decoder::resident::dflash::DFlashTreeMode;
     // NOTE: les points d'entrée publics lisent `SARAGOSSA_RUST_DFLASH_TREE` ; sans
     // la variable, le résident comparé ici est l'arbre B = 8 par défaut. La chaîne
     // résidente reste couverte explicitement par
@@ -3204,6 +3491,121 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         "boucle résidente avec stop token"
     );
     assert_eq!(streamed_stop, ar_stop, "callback avec stop token");
+    // Stop sequences (incluses dans la sortie) contre l'oracle AR, toutes
+    // positions. Un tour au moins accepte deux drafts : une séquence finissant
+    // sur le premier tombe au milieu des tokens acceptés.
+    assert!(
+        resident
+            .stats
+            .accepted_by_position
+            .get(1)
+            .is_some_and(|&count| count > 0),
+        "aucun tour à deux drafts acceptés : milieu de tour non couvert"
+    );
+    let with_stops = |sequences: Vec<Vec<usize>>, stop_token_ids: Vec<usize>| {
+        let mut options = mtp_verifier_options(stop_token_ids);
+        options.stop_sequences = sequences;
+        options
+    };
+    // Point d'entrée public (arbre B = 8 par défaut) et chaîne explicite.
+    let resident_modes = [
+        ("défaut", None),
+        ("chaîne", Some((DFlashTreeMode::Off, true))),
+    ];
+    let run_resident = |options: &GenerationOptions,
+                        mode: Option<(DFlashTreeMode, bool)>,
+                        on_token: &mut dyn FnMut(usize) -> bool| {
+        match mode {
+            None => model.generate_greedy_dflash_resident_streaming_with_options(
+                &prompt,
+                max_new_tokens,
+                options,
+                &draft,
+                draft.info.block_size,
+                on_token,
+            ),
+            Some(mode) => model.generate_greedy_dflash_resident_tree(
+                &prompt,
+                max_new_tokens,
+                options,
+                &draft,
+                draft.info.block_size,
+                mode,
+                on_token,
+            ),
+        }
+    };
+    let check_chain = |options: &GenerationOptions, label: &str| -> Result<Vec<usize>> {
+        let ar = model.generate_greedy_cached_with_options(&prompt, max_new_tokens, options)?;
+        for (mode_name, mode) in resident_modes {
+            let mut streamed = Vec::new();
+            let output = run_resident(options, mode, &mut |token| {
+                streamed.push(token);
+                true
+            })?;
+            assert_eq!(
+                output.tokens, ar,
+                "DFlash {mode_name}, stop sequence {label}"
+            );
+            assert_eq!(streamed, ar, "callback {mode_name}, stop sequence {label}");
+        }
+        Ok(ar)
+    };
+    for (sequence, end) in stop_sequence_cases(&ar) {
+        let label = format!("finissant en {end}");
+        let ar_seq = check_chain(&with_stops(vec![sequence], Vec::new()), &label)?;
+        assert_eq!(ar_seq, ar[..=end], "AR, stop sequence {label}");
+    }
+    let cases = stop_sequence_cases(&ar);
+    // Plusieurs séquences : la première terminée gagne.
+    let multiple = with_stops(vec![cases[20].0.clone(), cases[8].0.clone()], Vec::new());
+    assert_eq!(check_chain(&multiple, "multiple")?, ar[..=8]);
+    // Séquence présente seulement dans le prompt : sans effet.
+    if let Some(window) = prompt
+        .windows(2)
+        .find(|window| !ar.windows(2).any(|other| other == *window))
+    {
+        let prompt_only = with_stops(vec![window.to_vec()], Vec::new());
+        assert_eq!(check_chain(&prompt_only, "du prompt")?, ar);
+    }
+    // Stop token et séquence finissant au même token : le stop token gagne.
+    let both = with_stops(vec![cases[10].0.clone()], vec![ar[10]]);
+    check_chain(&both, "et stop token")?;
+    // Frontière de tour observée (flux horodaté) : séquence commencée dans un
+    // tour, stop au milieu des drafts acceptés du suivant ; annulation par le
+    // callback juste avant et sur le stop.
+    for (mode_name, mode) in resident_modes {
+        let mut times = Vec::new();
+        let timed = run_resident(&options, mode, &mut |_| {
+            times.push(Instant::now());
+            true
+        })?;
+        assert_eq!(timed.tokens, ar, "DFlash {mode_name} horodaté");
+        let (sequence, end) = crossing_stop_case(&ar, &times).ok_or_else(|| {
+            InferError::Config(format!("aucune frontière de tour DFlash {mode_name}"))
+        })?;
+        eprintln!("stop sequence DFlash {mode_name} à cheval : {sequence:?} en {end}");
+        let crossing = with_stops(vec![sequence], Vec::new());
+        assert_eq!(check_chain(&crossing, "à cheval")?, ar[..=end]);
+        for cancel_at in [end - 1, end] {
+            assert_cancelled_stream(&format!("DFlash {mode_name}"), &ar, cancel_at, |on_token| {
+                run_resident(&crossing, mode, on_token)
+            })?;
+        }
+    }
+    // Routage MTP → DFlash avec stop sequence.
+    let routed_seq = model.generate_greedy_mtp_streaming_with_options(
+        &prompt,
+        max_new_tokens,
+        &with_stops(vec![cases[13].0.clone()], Vec::new()),
+        2,
+        |_| true,
+    )?;
+    assert_eq!(
+        routed_seq.tokens,
+        ar[..=13],
+        "routage DFlash, stop sequence"
+    );
     // Extension du cache de préfixe : prompt + 3 tokens déjà générés, suffixe
     // et captures calculés per-op sur l'entrée précédente, même sortie que l'AR.
     let mut extended = prompt.clone();

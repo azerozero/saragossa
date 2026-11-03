@@ -506,8 +506,8 @@ le chemin greedy de production. `SARAGOSSA_RUST_DFLASH_DRAFT_DIR=<dossier>`
 sur `serve`, `run` ou la CLI le charge à côté du sidecar MTP (u4 gs64 par
 défaut, `SARAGOSSA_RUST_DFLASH_QUANT_BITS=0|8` pour dense ou u8) et
 `generate_greedy_mtp_inner` aiguille le greedy non contraint vers la boucle
-résidente, désormais streamée et annulable ; échantillonnage, contraintes et
-stop sequences gardent la tête MTP, et les harnais d'acceptance et pairwise
+résidente, désormais streamée et annulable ; échantillonnage et contraintes
+gardent la tête MTP, et les harnais d'acceptance et pairwise
 ne sont pas détournés. Sans la variable, rien ne change. Le prefill DFlash
 passe par le cache de préfixe comme MTP : l'entrée porte en plus les captures
 des couches cibles sur les 2048 dernières positions (fenêtre du drafter), un
@@ -571,7 +571,7 @@ MTP vérifie déjà les drafts avec température par accept/reject lossless
 (`lossless_speculative_sample`, distribution du draft fournie par la tête MTP),
 mais seules les requêtes greedy y étaient routées. `SARAGOSSA_RUST_MTP_SAMPLED=1`
 (opt-in) étend le routage de `serve`, `run` et la CLI aux requêtes à
-température > 0 sans contrainte ni stop sequence. Oracle réel : à T = 0,05 la
+température > 0 sans contrainte. Oracle réel : à T = 0,05 la
 sortie est celle de l'AR greedy sur 32 tokens, une même graine rejoue la même
 sortie, 18 drafts acceptés sur 21 à T = 0,7. Mesure CLI, 200 tokens, T = 0,7,
 graine 1 : AR échantillonné 32,6 / 32,0 / 32,4 tok/s (T0 / T2 / T6) contre MTP
@@ -962,6 +962,52 @@ restaure un préfixe cohérent par captures (un token accepté par répétition)
 |---:|---:|---:|---:|---:|---:|
 | 2 | −1,6 % | +1,1 % | +0,1 % | +19,6 % | −1,5 % |
 | 8 | −2,4 % | +2,1 % | 0,0 % | +87,0 % | −2,5 % |
+
+## Stop sequences sur le chemin spéculatif (2 nov. 2026)
+
+Les requêtes avec `stop`, et Anthropic avec outils (`</tool_call>` ajouté),
+passent désormais par MTP ou DFlash au lieu de l'AR : `supports_options`
+n'exige plus de liste vide. Le cœur MTP balaie une fois les tokens committés
+de chaque tour, DFlash teste chaque token émis (chaîne et arbre) ; la sortie
+est celle de l'AR, séquence incluse, rien n'est émis au-delà. La bascule
+DFlash → MTP reste coupée avec des séquences, et le bloc GPU D1 leur reste
+fermé. Les statistiques MTP comptent le tour entier, drafts acceptés après
+la séquence compris ; DFlash cesse de compter au stop. Une stop texte est
+tokenisée seule : si le modèle l'écrit avec une autre découpe, l'arrêt sur
+ids manque ; le filtre texte de serve la retire et arrête aussi le decode,
+streamé ou non (solo AR et MTP, lot), d'où contenu et usage identiques entre
+les deux modes. Une annulation par le client rend la sortie jusqu'au dernier
+token émis.
+
+Mesure CLI (`--stop`, nouveau), 27B 4 bits, prompt de code de 28 tokens,
+300 tokens max, `--stop "Invalid semantic version"` : arrêt identique à
+252 tokens sur les trois chemins, 3 passes. Decode : AR 29,4 / 32,3 /
+32,3 tok/s, MTP 53,1 / 56,7 / 55,3, DFlash (`SARAGOSSA_RUST_DFLASH_DRAFT_DIR`)
+75,5 / 79,6 / 69,5.
+
+Passe serve manuelle (même modèle, `--preload`, greedy), MTP, AR
+(`SARAGOSSA_RUST_MTP_DECODE=0`) et DFlash : chat avec `stop`, non streamé et
+streamé, contenu identique sur les trois chemins et entre les deux modes,
+séquence retirée, `finish_reason = "stop"`, 252 tokens, decode 5,1 s (MTP),
+8,1 s (AR), 3,3 s (DFlash). Anthropic avec un outil : `tool_use`
+`get_weather` avec `{"city":"Paris","unit":"celsius"}` complet,
+`stop_reason = "tool_use"`, `stop_sequence = null`, aucun texte après la
+fermeture, streamé ou non, identique sur les trois chemins ; 19 tokens,
+decode 0,37 s (MTP), 0,61 s (AR), 0,21 s (DFlash), `decode_path=mtp` hors AR.
+
+Absence de régression sans stop, même prompt, 300 tokens, 5 blocs ABBA
+(A = main 54d42f9, B = branche), decode tok/s : A 53,9 / 53,0 / 49,9 / 52,2
+/ 50,7 / 52,3 / 51,0 / 54,4 / 54,3 / 49,8 (médiane 52,3), B 47,2 / 47,6 /
+52,2 / 52,4 / 51,4 / 50,8 / 52,6 / 54,5 / 52,1 / 50,3 (médiane 51,8). Écarts
+par bloc −11 %, +3 %, 0 %, +3 %, −4 % : bruit de ±5 % hors premier bloc,
+même travail (125 pas adaptatifs, 82 profonds, sur les deux binaires). Le
+chemin sans séquence ne fait qu'un test de liste vide par tour.
+
+Queue : à 300 tokens sans stop le decode tombe à 53 tok/s contre 56 à 252
+(41 tok/s mesurés une première fois, non reproduits). Les 48 derniers tokens
+(fin de la chaîne de format puis `parts[0].parse`) prennent 26 pas
+adaptatifs, 1,85 token par pas contre 2,55 sur les 252 premiers : acceptance
+plus basse, pas un coût du chemin.
 
 ## Limites
 
