@@ -67,3 +67,42 @@ pub(super) fn scratch_len_for_rows(len: usize) -> usize {
         .and_then(|(rows, capacity)| (len / rows).checked_mul(capacity))
         .unwrap_or(len)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sous la garde, une demande proportionnelle aux lignes du morceau court
+    /// reprend l'entrée du morceau plein ; le reste et l'après-garde sont
+    /// inchangés.
+    #[test]
+    fn short_chunk_scratch_reuses_full_chunk_entry() -> Result<()> {
+        let executor = match crate::MetalExecutor::new() {
+            Ok(executor) => executor,
+            Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let (rows, capacity, width) = (2539, 2540, 8);
+        let full = executor.private_f32_buffer(capacity * width, "test_rows")?;
+        {
+            let _guard = enter_scratch_row_capacity(rows, capacity);
+            let short = executor.private_f32_buffer(rows * width, "test_rows")?;
+            assert_eq!(
+                short.as_ptr(),
+                full.as_ptr(),
+                "entrée du morceau plein reprise"
+            );
+            let other = executor.private_f32_buffer(rows * width + 1, "test_other")?;
+            assert_eq!(other.length(), ((rows * width + 1) * 4) as u64);
+            // Morceau plein : garde sans effet.
+            let _nested = enter_scratch_row_capacity(capacity, capacity);
+            assert_eq!(scratch_len_for_rows(rows * width), rows * width);
+        }
+        assert_eq!(
+            scratch_len_for_rows(rows * width),
+            rows * width,
+            "garde restaurée"
+        );
+        Ok(())
+    }
+}
