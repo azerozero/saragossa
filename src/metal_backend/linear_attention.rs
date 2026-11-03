@@ -2820,9 +2820,12 @@ impl MetalExecutor {
             key_dim,
         } = dims;
         enum PairOutput {
+            // `offset` : décalage en octets de la paire dans la ligne (non nul
+            // seulement pour beta/gate lus dans la projection complète).
             Concat {
                 buffer: Buffer,
                 stride: usize,
+                offset: u64,
             },
             Split {
                 first: Buffer,
@@ -2871,118 +2874,6 @@ impl MetalExecutor {
             .checked_mul(2)
             .ok_or_else(|| InferError::Dimension("linear-attn beta+gate déborde".to_string()))?;
 
-        let qkv_z = match &weights.qkv_z {
-            MetalLinearAttnResidentPairWeights::Concat(weight) => {
-                let buffer = self.private_f32_buffer(
-                    checked_len(rows, qkv_z_concat_len, "linear-attn rows qkv+z")?,
-                    "linear_attn_rows_qkv_z",
-                )?;
-                self.encode_matmul_weight_buffers(
-                    encoder,
-                    matmul_input,
-                    rows,
-                    in_dim,
-                    weight,
-                    &buffer,
-                    false,
-                )?;
-                PairOutput::Concat {
-                    buffer,
-                    stride: qkv_z_concat_len,
-                }
-            }
-            MetalLinearAttnResidentPairWeights::Split { first, second } => {
-                let qkv_buffer = self.private_f32_buffer(
-                    checked_len(rows, conv_dim, "linear-attn rows qkv")?,
-                    "linear_attn_rows_qkv",
-                )?;
-                let z_buffer = self.private_f32_buffer(
-                    checked_len(rows, value_dim, "linear-attn rows z")?,
-                    "linear_attn_rows_z",
-                )?;
-                self.encode_matmul_weight_buffers(
-                    encoder,
-                    matmul_input,
-                    rows,
-                    in_dim,
-                    first,
-                    &qkv_buffer,
-                    false,
-                )?;
-                self.encode_matmul_weight_buffers(
-                    encoder,
-                    matmul_input,
-                    rows,
-                    in_dim,
-                    second,
-                    &z_buffer,
-                    false,
-                )?;
-                PairOutput::Split {
-                    first: qkv_buffer,
-                    first_stride: conv_dim,
-                    second: z_buffer,
-                    second_stride: value_dim,
-                }
-            }
-        };
-
-        let beta_gate = match &weights.beta_gate {
-            MetalLinearAttnResidentPairWeights::Concat(weight) => {
-                let buffer = self.private_f32_buffer(
-                    checked_len(rows, beta_gate_concat_len, "linear-attn rows beta+gate")?,
-                    "linear_attn_rows_beta_gate_input",
-                )?;
-                self.encode_matmul_weight_buffers(
-                    encoder,
-                    matmul_input,
-                    rows,
-                    in_dim,
-                    weight,
-                    &buffer,
-                    false,
-                )?;
-                PairOutput::Concat {
-                    buffer,
-                    stride: beta_gate_concat_len,
-                }
-            }
-            MetalLinearAttnResidentPairWeights::Split { first, second } => {
-                let beta_input_buffer = self.private_f32_buffer(
-                    checked_len(rows, spec.num_value_heads, "linear-attn rows beta input")?,
-                    "linear_attn_rows_beta_input",
-                )?;
-                let gate_input_buffer = self.private_f32_buffer(
-                    checked_len(rows, spec.num_value_heads, "linear-attn rows gate input")?,
-                    "linear_attn_rows_gate_input",
-                )?;
-                self.encode_matmul_weight_buffers(
-                    encoder,
-                    matmul_input,
-                    rows,
-                    in_dim,
-                    first,
-                    &beta_input_buffer,
-                    false,
-                )?;
-                self.encode_matmul_weight_buffers(
-                    encoder,
-                    matmul_input,
-                    rows,
-                    in_dim,
-                    second,
-                    &gate_input_buffer,
-                    false,
-                )?;
-                PairOutput::Split {
-                    first: beta_input_buffer,
-                    first_stride: spec.num_value_heads,
-                    second: gate_input_buffer,
-                    second_stride: spec.num_value_heads,
-                }
-            }
-        };
-
         // Chantier 3' : conv/normes/gates et rms-gate batchés sur les lignes (kernels
         // du prefill), delta et captures par ligne. La conv lit l'état initial et les
         // captures le glissent elles-mêmes ; l'état n'avance qu'après les captures.
@@ -2991,6 +2882,174 @@ impl MetalExecutor {
             && spec.value_head_dim == 128
             && linear_delta_dk128_enabled()
             && linear_rows_batched_enabled();
+        // Projection complète qkv|z|beta|gate en UN matmul en lignes, comme le
+        // mono-ligne (`weights.full`, `SARAGOSSA_RUST_LINEAR_FULL_CONCAT`) : quatre
+        // dispatches (dont deux qmm de 32 sorties, pure latence) en un seul. Le
+        // chemin batché lit les quatre parts par décalage et pas de ligne.
+        let full_in_proj = if batched && linear_full_concat_enabled() {
+            weights.full.as_ref().map(|full| &full.in_proj)
+        } else {
+            None
+        };
+        let full_projection = match full_in_proj {
+            Some(in_proj) => {
+                let stride = qkv_z_concat_len
+                    .checked_add(beta_gate_concat_len)
+                    .ok_or_else(|| {
+                        InferError::Dimension("linear-attn in_proj complet déborde".to_string())
+                    })?;
+                let buffer = self.private_f32_buffer(
+                    checked_len(rows, stride, "linear-attn rows in_proj complet")?,
+                    "linear_attn_rows_in_proj_full",
+                )?;
+                let projected = self.encode_matmul_weight_buffers(
+                    encoder,
+                    matmul_input,
+                    rows,
+                    in_dim,
+                    in_proj,
+                    &buffer,
+                    false,
+                )?;
+                if projected != stride {
+                    return Err(InferError::Dimension(format!(
+                        "linear-attn rows in_proj complet sort {projected}, attendu {stride}"
+                    )));
+                }
+                Some((buffer, stride))
+            }
+            None => None,
+        };
+        let qkv_z = if let Some((buffer, stride)) = &full_projection {
+            PairOutput::Concat {
+                buffer: buffer.clone(),
+                stride: *stride,
+                offset: 0,
+            }
+        } else {
+            match &weights.qkv_z {
+                MetalLinearAttnResidentPairWeights::Concat(weight) => {
+                    let buffer = self.private_f32_buffer(
+                        checked_len(rows, qkv_z_concat_len, "linear-attn rows qkv+z")?,
+                        "linear_attn_rows_qkv_z",
+                    )?;
+                    self.encode_matmul_weight_buffers(
+                        encoder,
+                        matmul_input,
+                        rows,
+                        in_dim,
+                        weight,
+                        &buffer,
+                        false,
+                    )?;
+                    PairOutput::Concat {
+                        buffer,
+                        stride: qkv_z_concat_len,
+                        offset: 0,
+                    }
+                }
+                MetalLinearAttnResidentPairWeights::Split { first, second } => {
+                    let qkv_buffer = self.private_f32_buffer(
+                        checked_len(rows, conv_dim, "linear-attn rows qkv")?,
+                        "linear_attn_rows_qkv",
+                    )?;
+                    let z_buffer = self.private_f32_buffer(
+                        checked_len(rows, value_dim, "linear-attn rows z")?,
+                        "linear_attn_rows_z",
+                    )?;
+                    self.encode_matmul_weight_buffers(
+                        encoder,
+                        matmul_input,
+                        rows,
+                        in_dim,
+                        first,
+                        &qkv_buffer,
+                        false,
+                    )?;
+                    self.encode_matmul_weight_buffers(
+                        encoder,
+                        matmul_input,
+                        rows,
+                        in_dim,
+                        second,
+                        &z_buffer,
+                        false,
+                    )?;
+                    PairOutput::Split {
+                        first: qkv_buffer,
+                        first_stride: conv_dim,
+                        second: z_buffer,
+                        second_stride: value_dim,
+                    }
+                }
+            }
+        };
+
+        let beta_gate = if let Some((buffer, stride)) = &full_projection {
+            PairOutput::Concat {
+                buffer: buffer.clone(),
+                stride: *stride,
+                offset: byte_offset_f32(qkv_z_concat_len, "linear-attn rows beta offset")?,
+            }
+        } else {
+            match &weights.beta_gate {
+                MetalLinearAttnResidentPairWeights::Concat(weight) => {
+                    let buffer = self.private_f32_buffer(
+                        checked_len(rows, beta_gate_concat_len, "linear-attn rows beta+gate")?,
+                        "linear_attn_rows_beta_gate_input",
+                    )?;
+                    self.encode_matmul_weight_buffers(
+                        encoder,
+                        matmul_input,
+                        rows,
+                        in_dim,
+                        weight,
+                        &buffer,
+                        false,
+                    )?;
+                    PairOutput::Concat {
+                        buffer,
+                        stride: beta_gate_concat_len,
+                        offset: 0,
+                    }
+                }
+                MetalLinearAttnResidentPairWeights::Split { first, second } => {
+                    let beta_input_buffer = self.private_f32_buffer(
+                        checked_len(rows, spec.num_value_heads, "linear-attn rows beta input")?,
+                        "linear_attn_rows_beta_input",
+                    )?;
+                    let gate_input_buffer = self.private_f32_buffer(
+                        checked_len(rows, spec.num_value_heads, "linear-attn rows gate input")?,
+                        "linear_attn_rows_gate_input",
+                    )?;
+                    self.encode_matmul_weight_buffers(
+                        encoder,
+                        matmul_input,
+                        rows,
+                        in_dim,
+                        first,
+                        &beta_input_buffer,
+                        false,
+                    )?;
+                    self.encode_matmul_weight_buffers(
+                        encoder,
+                        matmul_input,
+                        rows,
+                        in_dim,
+                        second,
+                        &gate_input_buffer,
+                        false,
+                    )?;
+                    PairOutput::Split {
+                        first: beta_input_buffer,
+                        first_stride: spec.num_value_heads,
+                        second: gate_input_buffer,
+                        second_stride: spec.num_value_heads,
+                    }
+                }
+            }
+        };
+
         if tree_captures.is_some() && !batched {
             return Err(InferError::Config(
                 "linear-attn arbre hors du chemin batché".to_string(),
@@ -2998,7 +3057,7 @@ impl MetalExecutor {
         }
         if batched {
             let (qkv_buffer, layout_qkv_stride, z_buffer, z_offset, z_stride) = match &qkv_z {
-                PairOutput::Concat { buffer, stride } => (
+                PairOutput::Concat { buffer, stride, .. } => (
                     buffer,
                     *stride,
                     buffer,
@@ -3013,16 +3072,24 @@ impl MetalExecutor {
                 } => (first, *first_stride, second, 0, *second_stride),
             };
             let (beta_input, gate_input, layout) = match &beta_gate {
-                PairOutput::Concat { buffer, stride } => (
+                PairOutput::Concat {
+                    buffer,
+                    stride,
+                    offset,
+                } => (
                     buffer,
                     buffer,
                     LinearAttnBatchLayout {
                         qkv_stride: layout_qkv_stride,
-                        beta_offset: 0,
-                        gate_offset: byte_offset_f32(
-                            spec.num_value_heads,
-                            "linear-attn rows gate offset",
-                        )?,
+                        beta_offset: *offset,
+                        gate_offset: offset
+                            .checked_add(byte_offset_f32(
+                                spec.num_value_heads,
+                                "linear-attn rows gate offset",
+                            )?)
+                            .ok_or_else(|| {
+                                InferError::Dimension("linear-attn rows gate offset déborde".into())
+                            })?,
                         gate_stride: *stride,
                     },
                 ),
@@ -3263,7 +3330,7 @@ impl MetalExecutor {
         }
         for row in 0..rows {
             match &qkv_z {
-                PairOutput::Concat { buffer, stride } => {
+                PairOutput::Concat { buffer, stride, .. } => {
                     let qkv_offset = byte_offset_f32(row * *stride, "linear-attn rows qkv offset")?;
                     self.encode_linear_attn_conv_with_offset(
                         encoder,
@@ -3297,7 +3364,7 @@ impl MetalExecutor {
             }
             memory_barrier_buffers(encoder);
             match &beta_gate {
-                PairOutput::Concat { buffer, stride } => {
+                PairOutput::Concat { buffer, stride, .. } => {
                     let beta_offset =
                         byte_offset_f32(row * *stride, "linear-attn rows beta offset")?;
                     let gate_offset = byte_offset_f32(
@@ -3363,7 +3430,7 @@ impl MetalExecutor {
                 self.encode_capture_linear_attn_state(encoder, state, &captures[row])?;
             }
             match &qkv_z {
-                PairOutput::Concat { buffer, stride } => {
+                PairOutput::Concat { buffer, stride, .. } => {
                     let z_offset =
                         byte_offset_f32(row * *stride + conv_dim, "linear-attn rows z offset")?;
                     self.encode_linear_attn_rms_gate_with_offset(
