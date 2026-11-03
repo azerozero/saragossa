@@ -31,7 +31,7 @@
    "extra": {"chat_template_kwargs": {"enable_thinking": false}}
   },
   "llmd": {
-   "model": "qwen38", "health": "/v1/models", "ingest": "offline", "seed": false,
+   "model": "qwen38", "health": ["/v1/models", "/health"], "ingest": "offline", "seed": false,
    "send": ["temperature", "top_p"],
    "extra": {}
   }

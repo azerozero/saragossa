@@ -202,17 +202,19 @@ class Engine:
 
     def wait_ready(self, timeout_s):
         dialect = self.matrix["engines"][self.engine]
+        paths = dialect["health"] if isinstance(dialect["health"], list) else [dialect["health"]]
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if not self.alive():
                 return False
-            try:
-                status, _ = client.http_json("127.0.0.1", self.port, "GET", dialect["health"],
-                                             headers=dialect.get("headers"), timeout=5)
-                if status == 200:
-                    return True
-            except OSError:
-                pass
+            for path in paths:
+                try:
+                    status, _ = client.http_json("127.0.0.1", self.port, "GET", path,
+                                                 headers=dialect.get("headers"), timeout=5)
+                    if status == 200:
+                        return True
+                except OSError:
+                    pass
             time.sleep(1)
         return False
 
