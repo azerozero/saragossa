@@ -102,7 +102,12 @@ impl MtpHead {
                 )));
             }
         }
-        let dims = MtpDims::new(config, hidden)?;
+        let q_rows = st_view(&st, &resolve, "mtp.layers.0.self_attn.q_proj.weight")?
+            .shape()
+            .first()
+            .copied()
+            .unwrap_or(0);
+        let dims = MtpDims::new(config, hidden, q_rows)?;
         match (
             resolve.contains_key(MTP_DENSE_MARKER),
             resolve.contains_key(MTP_MOE_MARKER),
@@ -250,17 +255,31 @@ pub(super) struct MtpDims {
 }
 
 impl MtpDims {
-    fn new(config: &CausalDecoderConfig, hidden: usize) -> Result<Self> {
-        let head_dim = config
-            .head_dim
-            .ok_or_else(|| InferError::Config("tête MTP : head_dim absent de la config".into()))?;
+    /// `q_rows` : sorties de `q_proj` dans le sidecar. Sans `head_dim` dans la
+    /// config, il en est déduit comme pour l'attention du tronc
+    /// (`infer_attention_head_dim`).
+    fn new(config: &CausalDecoderConfig, hidden: usize, q_rows: usize) -> Result<Self> {
+        let gate = if config.attn_output_gate { 2 } else { 1 };
+        let head_dim = match config.head_dim {
+            Some(head_dim) => head_dim,
+            None => {
+                let divisor = config.num_attention_heads * gate;
+                if divisor == 0 || q_rows % divisor != 0 {
+                    return Err(InferError::Dimension(format!(
+                        "tête MTP : q_proj {q_rows} sorties, incompatible avec {} têtes (porte={})",
+                        config.num_attention_heads, config.attn_output_gate
+                    )));
+                }
+                q_rows / divisor
+            }
+        };
         let product = |a: usize, b: usize| {
             a.checked_mul(b)
                 .ok_or_else(|| InferError::Dimension("tête MTP : dimension déborde".into()))
         };
         let o_in = product(config.num_attention_heads, head_dim)?;
         // Q porte la gate de sortie concaténée par tête quand elle existe.
-        let q_out = product(o_in, if config.attn_output_gate { 2 } else { 1 })?;
+        let q_out = product(o_in, gate)?;
         Ok(Self {
             hidden,
             head_dim,
@@ -938,7 +957,7 @@ mod tests {
     mod moe_head {
         use super::super::{MtpHead, MtpLoadContext, MtpMoeQuant};
         use crate::decoder::CausalDecoderConfig;
-        use crate::{FeedForward, InferError, LinearWeight};
+        use crate::{FeedForward, InferError, LinearWeight, Tensor};
         use safetensors::{tensor::TensorView, Dtype};
 
         const H: usize = 64;
@@ -1037,6 +1056,14 @@ mod tests {
         }
 
         fn load(tensors: &[(String, Raw)], quant: MtpMoeQuant) -> crate::Result<MtpHead> {
+            load_with_head_dim(tensors, quant, Some(16))
+        }
+
+        fn load_with_head_dim(
+            tensors: &[(String, Raw)],
+            quant: MtpMoeQuant,
+            head_dim: Option<usize>,
+        ) -> crate::Result<MtpHead> {
             let views = tensors
                 .iter()
                 .map(|(name, (shape, bytes))| {
@@ -1050,7 +1077,7 @@ mod tests {
             std::fs::write(tmp.path(), buffer).expect("invariant: écriture sidecar");
             let config = CausalDecoderConfig {
                 attn_output_gate: true,
-                head_dim: Some(16),
+                head_dim,
                 num_attention_heads: 4,
                 num_key_value_heads: 4,
                 num_experts: Some(E),
@@ -1091,6 +1118,16 @@ mod tests {
             assert_eq!(head.norm.data()[0], 2.875);
             let q_norm = head.layer.attention.q_norm.as_ref().map(|n| n.data()[0]);
             assert_eq!(q_norm, Some(1.625));
+        }
+
+        #[test]
+        fn head_dim_is_inferred_from_q_proj_without_override() {
+            // `CausalDecoderConfig::head_dim` facultatif : déduit de q_proj
+            // (128 sorties, 4 têtes à porte → 16), comme l'attention du tronc.
+            let head = load_with_head_dim(&moe_tensors(), MtpMoeQuant::Dense, None)
+                .expect("invariant: head_dim déductible");
+            let q_norm = head.layer.attention.q_norm.as_ref().map(Tensor::len);
+            assert_eq!(q_norm, Some(16));
         }
 
         #[test]
