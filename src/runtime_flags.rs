@@ -325,7 +325,7 @@ impl Drop for MtpHistoryForPrompt {
 /// Sidecar MTP désigné explicitement (`SARAGOSSA_RUST_MTP_SIDECAR=<fichier>`,
 /// opt-in) : remplace la détection dans le répertoire du modèle, qui peut être
 /// en lecture seule. Aucun repli silencieux (cf. `assets::detect_mtp_weights`).
-pub(crate) fn mtp_sidecar_override() -> Option<std::path::PathBuf> {
+pub fn mtp_sidecar_override() -> Option<std::path::PathBuf> {
     env_var_os("SARAGOSSA_RUST_MTP_SIDECAR").map(std::path::PathBuf::from)
 }
 
@@ -773,13 +773,17 @@ pub(crate) fn prefill_moe_rows_enabled() -> bool {
 }
 
 /// Vérification résidente en lignes des couches full-attn MoE shared
-/// (`FullMoe`, Qwen3.5/3.6 MoE) : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Défaut OFF.
+/// (`FullMoe`, Qwen3.5/3.6 MoE) : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Défaut OFF,
+/// sauf tête MTP MoE chargée (`CausalDecoder::moe_verify_rows`) : `None` quand
+/// la variable est absente.
 /// Sur le 35B, ρ(2) = 1,26 et ρ(3) = 1,36 depuis la queue MoE calquée sur le
 /// mono-ligne (1,83 et 1,85 avant, docs/perf/mtp-pairwise.md). Les couches
 /// `LinearMoe` restent sous `SARAGOSSA_RUST_PREFILL_MOE_ROWS`, comme avant.
-pub(crate) fn moe_verify_rows_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_VERIFY_ROWS", false))
+pub(crate) fn moe_verify_rows_override() -> Option<bool> {
+    static VALUE: OnceLock<Option<bool>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MOE_VERIFY_ROWS").and_then(|value| env_flag_value(&value))
+    })
 }
 
 /// Queue MoE de la vérification en lignes (`SARAGOSSA_RUST_MOE_VERIFY_TAIL`) :

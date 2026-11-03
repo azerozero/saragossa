@@ -4,6 +4,21 @@ use super::types::*;
 use crate::decoder::ResidentVerifyHead;
 
 impl CausalDecoder {
+    /// Vérification MoE en lignes : la valeur explicite de
+    /// `SARAGOSSA_RUST_MOE_VERIFY_ROWS`, sinon active dès qu'une tête MTP MoE est
+    /// chargée. Ses cycles D1/D2 fusionnés n'existent qu'en lignes et portent tout
+    /// le gain (×1,2 à ×1,6 contre l'AR, docs/perf/mtp-pairwise.md) ; sans tête,
+    /// le défaut reste OFF (lookup seul : régression sur T0 et T7).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(in crate::decoder) fn moe_verify_rows(&self) -> bool {
+        crate::runtime_flags::moe_verify_rows_override().unwrap_or_else(|| {
+            matches!(
+                self.mtp.as_ref().map(|head| &head.layer.mlp),
+                Some(FeedForward::Moe(_))
+            )
+        })
+    }
+
     /// Vrai si toutes les couches ont leurs buffers résidents en lignes : la
     /// vérification batchée (captures, rollback par troncature) est possible.
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -19,9 +34,7 @@ impl CausalDecoder {
                         Some(ResidentLayerBuffers::FullDense(_))
                     )
                 }
-                (true, Some(FeedForward::Moe(_)))
-                    if crate::runtime_flags::moe_verify_rows_enabled() =>
-                {
+                (true, Some(FeedForward::Moe(_))) if self.moe_verify_rows() => {
                     matches!(
                         arena.layers.get(index),
                         Some(ResidentLayerBuffers::FullMoe(_))

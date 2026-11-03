@@ -4317,7 +4317,7 @@ fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
     const PROMPT_TOKENS: usize = 512;
     const FORCED: usize = 16;
     const NEAR_TIE: f32 = 0.05;
-    if !crate::runtime_flags::moe_verify_rows_enabled() {
+    if crate::runtime_flags::moe_verify_rows_override() != Some(true) {
         eprintln!("skip oracle MoE en lignes: SARAGOSSA_RUST_MOE_VERIFY_ROWS absent");
         return Ok(());
     }
