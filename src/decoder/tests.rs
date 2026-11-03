@@ -2196,7 +2196,7 @@ fn crossing_stop_case(tokens: &[usize], times: &[Instant]) -> Option<(Vec<usize>
 }
 
 /// Annulation par le callback avant ou sur le stop : aucun callback après
-/// `false`, tokens émis = préfixe de l'oracle.
+/// `false`, tokens émis = préfixe de l'oracle = tokens rendus.
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn assert_cancelled_stream(
     label: &str,
@@ -2205,7 +2205,7 @@ fn assert_cancelled_stream(
     run: impl FnOnce(&mut dyn FnMut(usize) -> bool) -> Result<SpeculativeOutput>,
 ) -> Result<()> {
     let mut seen = Vec::new();
-    run(&mut |token| {
+    let output = run(&mut |token| {
         seen.push(token);
         seen.len() <= cancel_at
     })?;
@@ -2213,6 +2213,10 @@ fn assert_cancelled_stream(
         seen,
         oracle[..=cancel_at],
         "{label}, annulation en {cancel_at}"
+    );
+    assert_eq!(
+        output.tokens, seen,
+        "{label}, sortie après annulation en {cancel_at}"
     );
     Ok(())
 }

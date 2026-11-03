@@ -2127,9 +2127,15 @@ impl CausalDecoder {
                 let committed = generated[emitted];
                 emitted += 1;
                 if !on_token(committed) {
+                    stop_streaming = true;
                     break;
                 }
             }
+        }
+        // Annulation par le callback : la sortie s'arrête au dernier token
+        // émis (sortie et usage identiques au flux, comme l'AR et DFlash).
+        if stop_streaming {
+            generated.truncate(emitted);
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         decode_profiler.report_decode_loop(loop_duration, generated.len());
