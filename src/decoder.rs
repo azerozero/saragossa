@@ -2601,7 +2601,12 @@ impl CausalDecoder {
             .map_or_else(mtp::MtpLoadContext::cpu, mtp::MtpLoadContext::metal);
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let context = mtp::MtpLoadContext::cpu();
-        self.mtp = Some(MtpHead::from_sidecar(path, &self.config, &context)?);
+        self.mtp = Some(MtpHead::from_sidecar(
+            path,
+            &self.config,
+            self.final_norm.data().len(),
+            &context,
+        )?);
         Ok(self)
     }
 

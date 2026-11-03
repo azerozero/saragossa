@@ -307,9 +307,12 @@ fn mtp_moe_draft_agreement_and_quantization_loss() -> Result<()> {
     };
     let sidecar = sidecar_path(&assets)?;
     let model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let hidden = model.final_norm.data().len();
     let cpu = MtpLoadContext::cpu();
-    let dense = MtpHead::from_sidecar_with(&sidecar, &model.config, &cpu, MtpMoeQuant::Dense)?;
-    let affine = MtpHead::from_sidecar_with(&sidecar, &model.config, &cpu, MtpMoeQuant::Affine)?;
+    let dense =
+        MtpHead::from_sidecar_with(&sidecar, &model.config, hidden, &cpu, MtpMoeQuant::Dense)?;
+    let affine =
+        MtpHead::from_sidecar_with(&sidecar, &model.config, hidden, &cpu, MtpMoeQuant::Affine)?;
     let options = GenerationOptions {
         stop_token_ids: Vec::new(),
         stop_sequences: Vec::new(),

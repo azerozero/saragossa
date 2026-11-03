@@ -70,14 +70,19 @@ impl MtpHead {
     pub(super) fn from_sidecar(
         path: impl AsRef<Path>,
         config: &CausalDecoderConfig,
+        hidden: usize,
         context: &MtpLoadContext<'_>,
     ) -> Result<Self> {
-        Self::from_sidecar_with(path, config, context, MtpMoeQuant::Affine)
+        Self::from_sidecar_with(path, config, hidden, context, MtpMoeQuant::Affine)
     }
 
+    /// `hidden` est la largeur du tronc (norme finale) : toutes les formes de la
+    /// tête sont validées contre elle et la config avant tout encodage GPU,
+    /// dont les kernels lisent `hidden` coefficients sans borner le buffer.
     pub(super) fn from_sidecar_with(
         path: impl AsRef<Path>,
         config: &CausalDecoderConfig,
+        hidden: usize,
         context: &MtpLoadContext<'_>,
         moe_quant: MtpMoeQuant,
     ) -> Result<Self> {
@@ -97,12 +102,15 @@ impl MtpHead {
                 )));
             }
         }
+        let dims = MtpDims::new(config, hidden)?;
         match (
             resolve.contains_key(MTP_DENSE_MARKER),
             resolve.contains_key(MTP_MOE_MARKER),
         ) {
-            (true, false) => Self::dense_from_tensors(&st, &resolve, config, context),
-            (false, true) => Self::moe_from_tensors(&st, &resolve, config, context, moe_quant),
+            (true, false) => Self::dense_from_tensors(&st, &resolve, config, &dims, context),
+            (false, true) => {
+                Self::moe_from_tensors(&st, &resolve, config, &dims, context, moe_quant)
+            }
             (true, true) => Err(InferError::Config(
                 "sidecar MTP ambigu : MLP dense et experts MoE présents".to_string(),
             )),
@@ -118,6 +126,7 @@ impl MtpHead {
         st: &SafeTensors,
         resolve: &HashMap<String, String>,
         config: &CausalDecoderConfig,
+        dims: &MtpDims,
         context: &MtpLoadContext<'_>,
     ) -> Result<Self> {
         let norms = MtpNorms::load(st, resolve, MtpNormConvention::MeanHeuristic)?;
@@ -133,12 +142,15 @@ impl MtpHead {
             norms.k_norm.clone(),
             config,
         );
-        let mlp = FeedForward::Dense(Box::new(GatedMlp::new(
+        let mlp = GatedMlp::new(
             load_mtp_linear(st, resolve, "mtp.layers.0.mlp.gate_proj", context)?,
             load_mtp_linear(st, resolve, "mtp.layers.0.mlp.up_proj", context)?,
             load_mtp_linear(st, resolve, "mtp.layers.0.mlp.down_proj", context)?,
-        )));
-        Ok(norms.into_head(fc, attention, mlp))
+        );
+        dims.check_gated_mlp(&mlp, "mtp.layers.0.mlp")?;
+        let head = norms.into_head(fc, attention, FeedForward::Dense(Box::new(mlp)));
+        dims.check_common(&head)?;
+        Ok(head)
     }
 
     /// Tête officielle Qwen3.6-35B-A3B : attention complète avec porte de
@@ -147,6 +159,7 @@ impl MtpHead {
         st: &SafeTensors,
         resolve: &HashMap<String, String>,
         config: &CausalDecoderConfig,
+        dims: &MtpDims,
         context: &MtpLoadContext<'_>,
         quant: MtpMoeQuant,
     ) -> Result<Self> {
@@ -175,7 +188,8 @@ impl MtpHead {
             norms.k_norm.clone(),
             config,
         );
-        let (gate_weights, up_weights, down_weights) = load_mtp_fused_experts(st, resolve, quant)?;
+        let (gate_weights, up_weights, down_weights) =
+            load_mtp_fused_experts(st, resolve, dims.hidden, quant)?;
         let expert_count = gate_weights.len();
         if config
             .num_experts
@@ -198,17 +212,147 @@ impl MtpHead {
             linear("mtp.layers.0.mlp.shared_expert.up_proj", 4)?,
             linear("mtp.layers.0.mlp.shared_expert.down_proj", 4)?,
         );
+        dims.check_gated_mlp(&shared_expert, "mtp.layers.0.mlp.shared_expert")?;
         // Routeur et gate partagée en u8, comme dans le tronc mlx-community.
+        let router = linear("mtp.layers.0.mlp.gate", 8)?;
+        expect_shape(
+            &router,
+            [expert_count, dims.hidden],
+            "mtp.layers.0.mlp.gate",
+        )?;
+        let shared_gate = linear("mtp.layers.0.mlp.shared_expert_gate", 8)?;
+        expect_shape(
+            &shared_gate,
+            [1, dims.hidden],
+            "mtp.layers.0.mlp.shared_expert_gate",
+        )?;
         let moe = crate::MoeMlp::new(
-            linear("mtp.layers.0.mlp.gate", 8)?,
+            router,
             experts,
             Some(shared_expert),
-            Some(linear("mtp.layers.0.mlp.shared_expert_gate", 8)?),
+            Some(shared_gate),
             top_k,
         )?
         .with_router_score(config.router_score);
-        Ok(norms.into_head(fc, attention, FeedForward::Moe(Box::new(moe))))
+        let head = norms.into_head(fc, attention, FeedForward::Moe(Box::new(moe)));
+        dims.check_common(&head)?;
+        Ok(head)
     }
+}
+
+/// Formes attendues de la tête, tirées du tronc et de sa config.
+pub(super) struct MtpDims {
+    hidden: usize,
+    head_dim: usize,
+    q_out: usize,
+    kv_out: usize,
+    o_in: usize,
+}
+
+impl MtpDims {
+    fn new(config: &CausalDecoderConfig, hidden: usize) -> Result<Self> {
+        let head_dim = config
+            .head_dim
+            .ok_or_else(|| InferError::Config("tête MTP : head_dim absent de la config".into()))?;
+        let product = |a: usize, b: usize| {
+            a.checked_mul(b)
+                .ok_or_else(|| InferError::Dimension("tête MTP : dimension déborde".into()))
+        };
+        let o_in = product(config.num_attention_heads, head_dim)?;
+        // Q porte la gate de sortie concaténée par tête quand elle existe.
+        let q_out = product(o_in, if config.attn_output_gate { 2 } else { 1 })?;
+        Ok(Self {
+            hidden,
+            head_dim,
+            q_out,
+            kv_out: product(config.num_key_value_heads, head_dim)?,
+            o_in,
+        })
+    }
+
+    /// Normes, `fc` et attention, communes aux têtes dense et MoE.
+    fn check_common(&self, head: &MtpHead) -> Result<()> {
+        let hidden = self.hidden;
+        for (norm, name) in [
+            (&head.pre_fc_norm_embedding, "mtp.pre_fc_norm_embedding"),
+            (&head.pre_fc_norm_hidden, "mtp.pre_fc_norm_hidden"),
+            (&head.layer.input_norm, "mtp.layers.0.input_layernorm"),
+            (
+                &head.layer.post_attention_norm,
+                "mtp.layers.0.post_attention_layernorm",
+            ),
+            (&head.norm, "mtp.norm"),
+        ] {
+            expect_len(norm, hidden, name)?;
+        }
+        let attention = &head.layer.attention;
+        for (norm, name) in [
+            (&attention.q_norm, "mtp.layers.0.self_attn.q_norm"),
+            (&attention.k_norm, "mtp.layers.0.self_attn.k_norm"),
+        ] {
+            let norm = norm
+                .as_ref()
+                .ok_or_else(|| InferError::MissingWeight(name.to_string()))?;
+            expect_len(norm, self.head_dim, name)?;
+        }
+        let double = hidden
+            .checked_mul(2)
+            .ok_or_else(|| InferError::Dimension("tête MTP : fc déborde".into()))?;
+        expect_shape(&head.fc, [hidden, double], "mtp.fc")?;
+        expect_shape(
+            &attention.q_proj,
+            [self.q_out, hidden],
+            "mtp.layers.0.self_attn.q_proj",
+        )?;
+        expect_shape(
+            &attention.k_proj,
+            [self.kv_out, hidden],
+            "mtp.layers.0.self_attn.k_proj",
+        )?;
+        let v_proj = attention
+            .v_proj
+            .as_ref()
+            .ok_or_else(|| InferError::MissingWeight("mtp.layers.0.self_attn.v_proj".into()))?;
+        expect_shape(
+            v_proj,
+            [self.kv_out, hidden],
+            "mtp.layers.0.self_attn.v_proj",
+        )?;
+        expect_shape(
+            &attention.o_proj,
+            [hidden, self.o_in],
+            "mtp.layers.0.self_attn.o_proj",
+        )
+    }
+
+    /// MLP SwiGLU : gate et up `[I, hidden]`, down `[hidden, I]`.
+    fn check_gated_mlp(&self, mlp: &GatedMlp, prefix: &str) -> Result<()> {
+        let (gate, up, down) = mlp.projections();
+        let inter = gate.weight().shape().first().copied().unwrap_or(0);
+        expect_shape(gate, [inter, self.hidden], &format!("{prefix}.gate_proj"))?;
+        expect_shape(up, [inter, self.hidden], &format!("{prefix}.up_proj"))?;
+        expect_shape(down, [self.hidden, inter], &format!("{prefix}.down_proj"))
+    }
+}
+
+fn expect_shape(linear: &Linear, expected: [usize; 2], name: &str) -> Result<()> {
+    let shape = linear.weight().shape();
+    if shape != expected.as_slice() || expected.contains(&0) {
+        return Err(InferError::Dimension(format!(
+            "tête MTP {name} : forme {shape:?}, attendu {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn expect_len(norm: &Tensor, len: usize, name: &str) -> Result<()> {
+    if norm.shape() != [len] {
+        return Err(InferError::Dimension(format!(
+            "tête MTP {name} : forme {:?}, attendu [{len}]",
+            norm.shape()
+        )));
+    }
+    Ok(())
 }
 
 /// Normes de la tête, chargées selon une même convention.
@@ -315,6 +459,7 @@ fn quantize_mtp_linear(linear: Linear, quant: MtpMoeQuant, bits: usize) -> Resul
 fn load_mtp_fused_experts(
     st: &SafeTensors,
     resolve: &HashMap<String, String>,
+    expected_hidden: usize,
     quant: MtpMoeQuant,
 ) -> Result<(Vec<LinearWeight>, Vec<LinearWeight>, Vec<LinearWeight>)> {
     let gate_up = st_view(st, resolve, MTP_MOE_MARKER)?;
@@ -330,7 +475,9 @@ fn load_mtp_fused_experts(
         )));
     };
     if experts == 0
-        || two_inter != inter * 2
+        || inter == 0
+        || hidden != expected_hidden
+        || Some(two_inter) != inter.checked_mul(2)
         || down_experts != experts
         || down_hidden != hidden
         || gate_up.data().len() % experts != 0
@@ -359,7 +506,16 @@ fn load_mtp_fused_experts(
         .map(|expert| -> Result<_> {
             let bytes = &gate_up.data()[expert * gate_up_stride..(expert + 1) * gate_up_stride];
             let mut rows = bytes_to_dense_f32(bytes, gate_up.dtype(), MTP_MOE_MARKER)?;
-            let up_rows = rows.split_off(inter * hidden);
+            // Garde explicite : `split_off` paniquerait sur un expert tronqué.
+            let half = inter * hidden;
+            if rows.len() != 2 * half {
+                return Err(InferError::Dimension(format!(
+                    "expert MTP {expert} : {} valeurs gate_up, attendu {}",
+                    rows.len(),
+                    2 * half
+                )));
+            }
+            let up_rows = rows.split_off(half);
             let gate = weight(Tensor::from_vec(vec![inter, hidden], rows)?)?;
             let up = weight(Tensor::from_vec(vec![inter, hidden], up_rows)?)?;
             let bytes = &down.data()[expert * down_stride..(expert + 1) * down_stride];
@@ -856,12 +1012,21 @@ mod tests {
                     tensor(&[H, I], ramp),
                 ),
             ];
-            for name in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            // 4 têtes Q à porte (4 × 16 × 2 = 128 sorties), 4 têtes KV de 16.
+            out.push((
+                "mtp.layers.0.self_attn.q_proj.weight".into(),
+                tensor(&[2 * H, H], ramp),
+            ));
+            for name in ["k_proj", "v_proj"] {
                 out.push((
                     format!("mtp.layers.0.self_attn.{name}.weight"),
                     tensor(&[H, H], ramp),
                 ));
             }
+            out.push((
+                "mtp.layers.0.self_attn.o_proj.weight".into(),
+                tensor(&[H, H], ramp),
+            ));
             for name in ["gate_proj", "up_proj"] {
                 out.push((
                     format!("mtp.layers.0.mlp.shared_expert.{name}.weight"),
@@ -885,11 +1050,14 @@ mod tests {
             std::fs::write(tmp.path(), buffer).expect("invariant: écriture sidecar");
             let config = CausalDecoderConfig {
                 attn_output_gate: true,
+                head_dim: Some(16),
+                num_attention_heads: 4,
+                num_key_value_heads: 4,
                 num_experts: Some(E),
                 num_experts_per_tok: 2,
                 ..CausalDecoderConfig::default()
             };
-            MtpHead::from_sidecar_with(tmp.path(), &config, &MtpLoadContext::cpu(), quant)
+            MtpHead::from_sidecar_with(tmp.path(), &config, H, &MtpLoadContext::cpu(), quant)
         }
 
         fn first(weight: &LinearWeight) -> Option<f32> {
@@ -961,6 +1129,30 @@ mod tests {
             assert!(matches!(
                 load(&collision, MtpMoeQuant::Dense),
                 Err(InferError::Config(_))
+            ));
+
+            // Norme finale trop courte : refusée avant tout encodage GPU, dont
+            // les kernels liraient `hidden` coefficients hors du buffer.
+            let mut short = moe_tensors();
+            for (name, raw) in &mut short {
+                if name == "mtp.norm.weight" {
+                    *raw = tensor(&[1], |_| 0.0);
+                }
+            }
+            assert!(matches!(
+                load(&short, MtpMoeQuant::Dense),
+                Err(InferError::Dimension(_))
+            ));
+
+            let mut wide = moe_tensors();
+            for (name, raw) in &mut wide {
+                if name == "mtp.layers.0.self_attn.o_proj.weight" {
+                    *raw = tensor(&[H, 2 * H], ramp);
+                }
+            }
+            assert!(matches!(
+                load(&wide, MtpMoeQuant::Dense),
+                Err(InferError::Dimension(_))
             ));
 
             let mut missing = moe_tensors();
