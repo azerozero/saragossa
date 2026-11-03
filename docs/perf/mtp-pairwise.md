@@ -1066,7 +1066,12 @@ alternés base (main 7069020) / branche, même binaire de bench, trace coupée :
 | 9 | 24,35 | 3,06 | 18,78 | 2,34 |
 
 T(1) est inchangé (écart dans le bruit de ±0,05 ms) : le gain de ρ ne vient
-pas du dénominateur. Sur du code réel (`SARAGOSSA_RUST_VERIFY_ROWS_BENCH_TEXT=1`,
+pas du dénominateur. La queue de niveau 2 sert aussi, par défaut, aux 30 couches
+`LinearMoe` de toute vérification en lignes (elles passent par le chemin en
+lignes sous `SARAGOSSA_RUST_PREFILL_MOE_ROWS`, défaut ON) ;
+`SARAGOSSA_RUST_MOE_VERIFY_TAIL=0` rend l'ancien chemin. La projection
+concaténée des couches linéaires suit `SARAGOSSA_RUST_LINEAR_FULL_CONCAT`, qui
+coupe aussi le mono-ligne. Sur du code réel (`SARAGOSSA_RUST_VERIFY_ROWS_BENCH_TEXT=1`,
 un lancement), T(2) = 9,98 ms et T(9) = 19,21 ms, contre 13,78 et 23,84 ms avec
 l'ancienne queue (`SARAGOSSA_RUST_MOE_VERIFY_TAIL=0`).
 
@@ -1094,8 +1099,11 @@ Effet par étape (R=2, puis R=9, même binaire) :
   9,32) à R=9. Moins de threadgroups actifs et le scan du propriétaire coûtent
   plus que les relectures qu'il évite. Il est retiré.
 
-Oracles : top-k, gate+up partagé et combine en lignes égaux bit à bit au mono
-(M5), combine égal aussi à l'ancien combine en deux dispatches. L'oracle réel
+Oracles : les kernels top-k, gate+up partagé et combine en lignes sont égaux
+bit à bit à leur kernel mono (M5), le combine aussi à l'ancien combine en deux
+dispatches. La queue entière n'est pas bit à bit égale au pas mono-ligne
+(routeur, gate scalaire et down partagé passent par des matmuls en lignes) :
+c'est l'oracle réel qui la couvre, à 5e-3 relatif. L'oracle réel
 `moe_verify_rows_match_single_rows_real_model`, renforcé (comptes exacts,
 passage avec captures comparé, relance en lignes après rollback, aucune
 quasi-égalité tolérée), est vert sans quasi-égalité. Le lookup greedy reste
@@ -1104,8 +1112,9 @@ identique à l'AR (`lookup_greedy_matches_ar_real_model`). Les oracles MTP du
 `mtp_sampled_matches_ar_at_low_temperature_real_model`), qui passent par la
 même projection linéaire en lignes, sont verts.
 
-Décomposition par poste (ablation `SARAGOSSA_RUST_VERIFY_SKIP`, devtools :
-chaque poste remplacé par une copie de son entrée ; les compteurs GPU aux
+Décomposition par poste (ablation `SARAGOSSA_RUST_VERIFY_SKIP`, active
+seulement dans le bench de vérification : chaque poste remplacé par une copie
+de son entrée ; les compteurs GPU aux
 frontières de dispatch ne sont pas disponibles sur M5). Les postes ne sont pas
 exactement additifs (écart ≤ 0,2 ms) :
 

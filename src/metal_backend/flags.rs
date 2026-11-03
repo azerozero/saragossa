@@ -408,6 +408,10 @@ pub(super) fn linear_z_beta_gate_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_Z_BETA_GATE", true))
 }
 
+/// Projection d'entrée linear-attn concaténée (`weights.full`),
+/// `SARAGOSSA_RUST_LINEAR_FULL_CONCAT`, défaut ON. NOTE: un seul interrupteur
+/// pour le mono-ligne ET la vérification en lignes (27B dense compris) : `=0`
+/// coupe les deux, il n'y a pas de repli propre aux lignes.
 pub(super) fn linear_full_concat_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_FULL_CONCAT", true))

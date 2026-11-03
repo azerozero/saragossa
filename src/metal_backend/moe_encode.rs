@@ -1190,8 +1190,8 @@ impl MetalExecutor {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si `rows` est nul, si `topk` est invalide ou si une
-    /// dimension déborde.
+    /// Renvoie une erreur si une dimension déborde, ou, via le repli
+    /// [`Self::encode_topk_softmax_rows`], si `rows` est nul ou `topk` invalide.
     pub(super) fn encode_topk_softmax_verify_rows(
         &self,
         encoder: &ComputeCommandEncoderRef,

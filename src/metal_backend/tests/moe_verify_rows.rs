@@ -1,5 +1,8 @@
-// Oracles de la queue MoE de vérification en lignes : chaque kernel en lignes
-// doit reproduire, ligne par ligne, le kernel mono-ligne du decode résident.
+// Oracles des kernels de la queue MoE de vérification en lignes : chaque
+// kernel en lignes doit reproduire, ligne par ligne, le kernel mono-ligne du
+// decode résident. La queue entière n'est pas bit à bit égale au mono (ordre
+// et matmuls en lignes du routeur et du partagé) : l'oracle sur modèle réel la
+// couvre à 5e-3.
 // Égalité de bits sur la machine de référence (M5), ±1 ULP ailleurs
 // (`assert_bits_equal`).
 
