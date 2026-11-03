@@ -1321,7 +1321,7 @@ contre MTP. Les 14 cas sont identiques à l'AR (texte, `finish_reason`, usage) :
 | chat streamé, max_tokens 1, 2, 9 et 300 | identique ; chemin `mtp` |
 | `stop` (`"return"`), non streamé et streamé | identique, arrêt à 134 tokens |
 | Anthropic `/v1/messages`, non streamé et streamé | identique, 300 tokens |
-| échantillonné (T = 0,7, seed 5) | identique à l'AR, chemin `ar` |
+| échantillonné (T = 0,7 ; `seed` envoyé ignoré, graine serve effective 0) | identique à l'AR, chemin `ar` |
 | contexte de 5078 tokens, 32 générés | identique ; decode 250 ms (AR) contre 200 ms (MTP) |
 
 Empreinte physique après la requête de 5078 tokens (`footprint_bytes` du
