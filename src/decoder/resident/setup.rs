@@ -130,6 +130,34 @@ fn experts_are_affine(experts: &[GatedMlp]) -> bool {
 }
 
 impl CausalDecoder {
+    /// Vrai si la tête MTP tient le contrat du decode résident. Sinon (MoE sans
+    /// porte de sortie, routeur non softmax, experts non affines), la raison est
+    /// tracée et l'arène MTP reste absente.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn resident_mtp_head_supported(&self, head: &MtpHead) -> bool {
+        let FeedForward::Moe(mlp) = &head.layer.mlp else {
+            return true;
+        };
+        let reason = if !self.config.attn_output_gate {
+            Some("attn_output_gate absent")
+        } else {
+            match mlp.shared_metal_parts() {
+                None => Some("MoE hors contrat (softmax + expert partagé gated)"),
+                Some((_, experts, ..)) if !experts_are_affine(experts) => {
+                    Some("experts non affines")
+                }
+                Some(_) => None,
+            }
+        };
+        if let Some(reason) = reason {
+            if crate::decoder::flags::trace_resident_enabled() {
+                eprintln!("decode résident full: arène MTP désactivée, tête MoE : {reason}");
+            }
+            return false;
+        }
+        true
+    }
+
     /// Buffers résidents de la couche de la tête MTP : MLP dense (27B) ou MoE
     /// à expert partagé (35B-A3B), même résolution que la couche du tronc.
     ///
@@ -928,8 +956,14 @@ impl CausalDecoder {
         for _ in 0..RESIDENT_PIPELINE_WINDOW {
             index_ring.push(arena.persistent(1, GpuElement::U32)?);
         }
+        // Une tête hors contrat résident désactive l'arène MTP (trace) au lieu de
+        // faire échouer tout le decode résident : même politique qu'avant la tête MoE.
         let mtp =
-            if let Some(head) = self.mtp.as_ref() {
+            if let Some(head) = self
+                .mtp
+                .as_ref()
+                .filter(|head| self.resident_mtp_head_supported(head))
+            {
                 let q_norm = head.layer.attention.q_norm.as_ref().ok_or_else(|| {
                     InferError::Config("q_norm MTP manquant (résident)".to_string())
                 })?;
