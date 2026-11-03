@@ -4209,8 +4209,31 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
                 (33, false),
             ],
         };
-    // Tokens synthétiques : le coût ne dépend pas du contenu (au routage MoE près).
-    let prompt: Vec<usize> = (0..context).map(|i| 1000 + (i * 7919) % 50_000).collect();
+    // Tokens synthétiques : le coût ne dépend pas du contenu, au routage MoE
+    // près. `SARAGOSSA_RUST_VERIFY_ROWS_BENCH_TEXT=1` prend préfixe et lignes
+    // candidates dans du code réel (recouvrement d'experts représentatif).
+    let text_ids = if crate::runtime_flags::env_flag("SARAGOSSA_RUST_VERIFY_ROWS_BENCH_TEXT", false)
+    {
+        let text = concat!(
+            include_str!("../decode_resident/attention.rs"),
+            include_str!("../decode_resident/rows.rs"),
+            include_str!("../decode_resident/layers.rs"),
+        );
+        let ids = mtp_verifier_prompt_ids(&assets, text)?;
+        if ids.len() < context + 64 {
+            return Err(InferError::Config(format!(
+                "texte du bench trop court: {} tokens pour un contexte {context}",
+                ids.len()
+            )));
+        }
+        Some(ids)
+    } else {
+        None
+    };
+    let prompt: Vec<usize> = match &text_ids {
+        Some(ids) => ids[..context].to_vec(),
+        None => (0..context).map(|i| 1000 + (i * 7919) % 50_000).collect(),
+    };
     let mut cache = if layer_ids.is_empty() {
         model.prefill_cache_state(&prompt)?.0
     } else {
@@ -4225,13 +4248,18 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
         .resident
         .as_ref()
         .is_some_and(|arena| model.resident_layer_batch_supported(arena));
+    // Seule portée où `SARAGOSSA_RUST_VERIFY_SKIP` agit (ablation par poste).
+    let _skip_scope = crate::runtime_flags::VerifySkipScope::install();
     for (rows, capture) in rows_list {
         if rows > 1 && !batched && !sequential_ok {
             return Err(InferError::Config(format!(
                 "bench {rows} lignes: chemin en lignes indisponible (repli séquentiel)"
             )));
         }
-        let tokens: Vec<usize> = (0..rows).map(|i| 2000 + i * 31).collect();
+        let tokens: Vec<usize> = match &text_ids {
+            Some(ids) => ids[context..context + rows].to_vec(),
+            None => (0..rows).map(|i| 2000 + i * 31).collect(),
+        };
         let mut times = Vec::new();
         for rep in 0..10 {
             let base = cache.position;
@@ -4264,7 +4292,8 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
         }
         times.sort_by(f64::total_cmp);
         eprintln!(
-            "verify_rows_bench ctx={context} kv_bf16={kv_bf16} batched={batched} rows={rows} captures={capture} median_ms={:.2} min_ms={:.2}",
+            "verify_rows_bench ctx={context} text={} kv_bf16={kv_bf16} batched={batched} rows={rows} captures={capture} median_ms={:.2} min_ms={:.2}",
+            text_ids.is_some(),
             times[times.len() / 2],
             times[0]
         );
@@ -4274,11 +4303,13 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
 
 /// Oracle de la vérification MoE en lignes (`SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`,
 /// modèle `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`, Qwen3.5/3.6 MoE) : R lignes
-/// d'un coup contre R pas mono-ligne sur le même texte imposé. Exige
-/// l'argmax identique (sauf quasi-égalité top-1/top-2 de la référence, comptée)
-/// et des états finaux à 5e-3 relatif. Puis, pour plusieurs longueurs acceptées
-/// `j`, rollback par captures à `j` et suite mono-ligne : les états qui suivent
-/// valident KV et états linéaires restaurés contre la référence.
+/// d'un coup contre R pas mono-ligne sur le même texte imposé. Exige des
+/// comptes exacts (tokens et états), l'argmax identique (aucune quasi-égalité
+/// tolérée : la référence documentée est zéro) et des états finaux à 5e-3
+/// relatif. Le passage avec captures est comparé lui aussi. Puis, pour
+/// plusieurs longueurs acceptées `j`, rollback par captures à `j`, nouvelle
+/// vérification en lignes, puis suite mono-ligne : KV et états linéaires
+/// restaurés sont validés contre la référence.
 #[test]
 #[ignore = "modèle MoE réel requis"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
@@ -4313,8 +4344,8 @@ fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
     let verify = |cache: &mut CausalDecoderCache,
                   tokens: &[usize],
                   capture: bool|
-     -> Result<ResidentVerifyOutput> {
-        model
+     -> Result<(Vec<usize>, Vec<f32>, Option<ResidentVerifyOutput>)> {
+        let output = model
             .next_final_states_resident_verify(
                 cache,
                 tokens,
@@ -4323,7 +4354,21 @@ fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
                 None,
                 None,
             )?
-            .ok_or_else(|| InferError::Config("vérification résidente non exercée".into()))
+            .ok_or_else(|| InferError::Config("vérification résidente non exercée".into()))?;
+        let argmax = output
+            .tokens
+            .clone()
+            .ok_or_else(|| InferError::Config("argmax de vérification absent".to_string()))?;
+        let states = output.states.data().to_vec();
+        if argmax.len() != tokens.len() || states.len() != tokens.len() * hidden {
+            return Err(InferError::Dimension(format!(
+                "vérification de {} lignes: {} argmax, {} valeurs d'état",
+                tokens.len(),
+                argmax.len(),
+                states.len()
+            )));
+        }
+        Ok((argmax, states, capture.then_some(output)))
     };
 
     // Référence : un pas mono-ligne par token imposé.
@@ -4337,24 +4382,23 @@ fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
     let mut ref_tokens = Vec::with_capacity(FORCED);
     let mut ref_margins = Vec::with_capacity(FORCED);
     for &token in forced {
-        let output = verify(&mut reference, &[token], false)?;
-        let state = output.states.data().to_vec();
+        let (tokens, state, _) = verify(&mut reference, &[token], false)?;
         let (_, margin) = top2(
             model
                 .logits_from_final_state(&Tensor::from_vec(vec![1, hidden], state.clone())?)?
                 .as_row()?,
         );
-        ref_tokens.extend(
-            output
-                .tokens
-                .ok_or_else(|| InferError::Config("argmax mono-ligne absent".to_string()))?,
-        );
+        ref_tokens.extend(tokens);
         ref_states.push(state);
         ref_margins.push(margin);
     }
 
-    let mut near_ties = 0;
-    let mut compare = |label: &str, offset: usize, tokens: &[usize], states: &[f32]| {
+    let compare = |label: &str, offset: usize, tokens: &[usize], states: &[f32]| {
+        assert_eq!(
+            states.len(),
+            tokens.len() * hidden,
+            "{label}: taille d'état"
+        );
         for (row, (token, state)) in tokens.iter().zip(states.chunks(hidden)).enumerate() {
             let at = offset + row;
             let expected = &ref_states[at];
@@ -4371,61 +4415,52 @@ fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
                 max_err <= 5e-3 * scale,
                 "{label} ligne {at}: dérive {max_err:e} / {scale:e}"
             );
-            if *token != ref_tokens[at] {
-                assert!(
-                    ref_margins[at] < NEAR_TIE,
-                    "{label} ligne {at}: argmax {token} contre {} (marge {})",
-                    ref_tokens[at],
-                    ref_margins[at]
-                );
-                near_ties += 1;
-            }
+            assert_eq!(
+                *token, ref_tokens[at],
+                "{label} ligne {at}: argmax divergent (marge de référence {}, < {NEAR_TIE} = quasi-égalité)",
+                ref_margins[at]
+            );
         }
     };
+    let continue_single =
+        |cache: &mut CausalDecoderCache, label: &str, from: usize| -> Result<()> {
+            for (step, &token) in forced[from..from + 3].iter().enumerate() {
+                let (tokens, states, _) = verify(cache, &[token], false)?;
+                compare(label, from + step, &tokens, &states);
+            }
+            Ok(())
+        };
 
     for rows in [2, 3, 5, 9] {
         // Tout accepté : R lignes puis la suite mono-ligne.
         let mut cache = fresh()?;
-        let output = verify(&mut cache, &forced[..rows], false)?;
-        let tokens = output
-            .tokens
-            .ok_or_else(|| InferError::Config("argmax en lignes absent".to_string()))?;
-        compare(&format!("lignes={rows}"), 0, &tokens, output.states.data());
-        for (step, &token) in forced[rows..rows + 3].iter().enumerate() {
-            let next = verify(&mut cache, &[token], false)?;
-            let tokens = next.tokens.unwrap_or_default();
-            compare(
-                &format!("lignes={rows} suite"),
-                rows + step,
-                &tokens,
-                next.states.data(),
-            );
-        }
-        // Rollback par captures à `accepted` lignes, puis suite mono-ligne.
+        let (tokens, states, _) = verify(&mut cache, &forced[..rows], false)?;
+        compare(&format!("lignes={rows}"), 0, &tokens, &states);
+        continue_single(&mut cache, &format!("lignes={rows} suite"), rows)?;
+        // Rollback par captures à `accepted` lignes, nouvelle vérification en
+        // lignes depuis l'état restauré, puis suite mono-ligne.
         for accepted in [1, rows / 2, rows - 1] {
             if accepted == 0 {
                 continue;
             }
+            let label = format!("lignes={rows} rollback={accepted}");
             let mut cache = fresh()?;
-            let output = verify(&mut cache, &forced[..rows], true)?;
+            let (tokens, states, output) = verify(&mut cache, &forced[..rows], true)?;
+            compare(&format!("{label} captures"), 0, &tokens, &states);
+            let output = output
+                .ok_or_else(|| InferError::Config("sortie avec captures absente".to_string()))?;
             let captures = output.captures.as_ref().ok_or_else(|| {
                 InferError::Config("captures de vérification absentes".to_string())
             })?;
             model.restore_mtp_resident_progress(&mut cache, captures, accepted)?;
             assert_eq!(cache.position, prompt_len + accepted);
-            for (step, &token) in forced[accepted..accepted + 3].iter().enumerate() {
-                let next = verify(&mut cache, &[token], false)?;
-                let tokens = next.tokens.unwrap_or_default();
-                compare(
-                    &format!("lignes={rows} rollback={accepted}"),
-                    accepted + step,
-                    &tokens,
-                    next.states.data(),
-                );
-            }
+            let again = accepted + 2;
+            let (tokens, states, _) = verify(&mut cache, &forced[accepted..again], false)?;
+            compare(&format!("{label} relance"), accepted, &tokens, &states);
+            continue_single(&mut cache, &format!("{label} suite"), again)?;
         }
     }
-    eprintln!("oracle MoE en lignes: vert, quasi-égalités tolérées={near_ties}");
+    eprintln!("oracle MoE en lignes: vert, aucune quasi-égalité");
     Ok(())
 }
 

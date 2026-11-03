@@ -475,6 +475,54 @@ impl MetalExecutor {
                 "shared gate rows Metal sort {projected_gate_dim}, attendu 1"
             )));
         }
+        self.encode_moe_shared_rows_gate_up(
+            encoder,
+            owned_buffers,
+            input_buffer,
+            rows,
+            in_dim,
+            weights,
+            scratch,
+            shared_inter_dim,
+        )?;
+        let projected_shared_down_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            &scratch.shared_hidden,
+            rows,
+            shared_inter_dim,
+            &weights.shared_down_proj,
+            &scratch.shared_down,
+            false,
+        )?;
+        if projected_shared_down_dim != out_dim {
+            return Err(InferError::Dimension(format!(
+                "shared expert rows Metal down sort {projected_shared_down_dim}, attendu {out_dim}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Encode gate_proj et up_proj du shared expert batché (deux matmuls en
+    /// lignes) puis le SwiGLU vers `scratch.shared_hidden`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une projection diverge ou si un dispatch échoue.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "phase shared batchée: poids, buffers et dimensions restent explicites"
+    )]
+    pub(super) fn encode_moe_shared_rows_gate_up(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        owned_buffers: &mut Vec<Buffer>,
+        input_buffer: &BufferRef,
+        rows: usize,
+        in_dim: usize,
+        weights: &MetalMoeSharedWeights,
+        scratch: &MoeSharedRowsScratch,
+        shared_inter_dim: usize,
+    ) -> Result<()> {
         let projected_shared_gate_dim = self.encode_matmul_weight_buffers(
             encoder,
             input_buffer,
@@ -508,20 +556,6 @@ impl MetalExecutor {
             &scratch.shared_hidden,
             checked_len(rows, shared_inter_dim, "moe shared rows shared swiglu")?,
         )?;
-        let projected_shared_down_dim = self.encode_matmul_weight_buffers(
-            encoder,
-            &scratch.shared_hidden,
-            rows,
-            shared_inter_dim,
-            &weights.shared_down_proj,
-            &scratch.shared_down,
-            false,
-        )?;
-        if projected_shared_down_dim != out_dim {
-            return Err(InferError::Dimension(format!(
-                "shared expert rows Metal down sort {projected_shared_down_dim}, attendu {out_dim}"
-            )));
-        }
         Ok(())
     }
 

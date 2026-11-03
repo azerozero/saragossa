@@ -748,6 +748,7 @@ impl MetalExecutor {
         let topk_sigmoid_rows_f32 = pipeline(&library, &device, "topk_sigmoid_rows_f32")?;
         let topk_softmax_serial_f32 = pipeline(&library, &device, "topk_softmax_serial_f32")?;
         let topk8_softmax_256_f32 = pipeline(&library, &device, "topk8_softmax_256_f32")?;
+        let topk8_softmax_256_rows_f32 = pipeline(&library, &device, "topk8_softmax_256_rows_f32")?;
         let topk_softmax_rows_f32 = pipeline(&library, &device, "topk_softmax_rows_f32")?;
         let sample_gumbel_blocks_f32 = pipeline(&library, &device, "sample_gumbel_blocks_f32")?;
         let sample_topk_blocks_f32 = pipeline(&library, &device, "sample_topk_blocks_f32")?;
@@ -961,6 +962,7 @@ impl MetalExecutor {
             topk_sigmoid_rows_f32,
             topk_softmax_serial_f32,
             topk8_softmax_256_f32,
+            topk8_softmax_256_rows_f32,
             topk_softmax_rows_f32,
             sample_gumbel_blocks_f32,
             sample_topk_blocks_f32,

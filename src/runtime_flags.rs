@@ -766,12 +766,109 @@ pub(crate) fn prefill_moe_rows_enabled() -> bool {
 }
 
 /// Vérification résidente en lignes des couches full-attn MoE shared
-/// (`FullMoe`, Qwen3.5/3.6 MoE) : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Défaut OFF :
-/// ρ(2) = 1,83 mesuré sur le 35B (docs/perf/mtp-pairwise.md). Les couches
+/// (`FullMoe`, Qwen3.5/3.6 MoE) : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Défaut OFF.
+/// Sur le 35B, ρ(2) = 1,26 et ρ(3) = 1,36 depuis la queue MoE calquée sur le
+/// mono-ligne (1,83 et 1,85 avant, docs/perf/mtp-pairwise.md). Les couches
 /// `LinearMoe` restent sous `SARAGOSSA_RUST_PREFILL_MOE_ROWS`, comme avant.
 pub(crate) fn moe_verify_rows_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_VERIFY_ROWS", false))
+}
+
+/// Queue MoE de la vérification en lignes (`SARAGOSSA_RUST_MOE_VERIFY_TAIL`) :
+/// 0 = chemin batché générique du prefill (11 dispatches, top-k un thread par
+/// ligne), 1 = top-k parallèle du mono par ligne seul, 2 (défaut) = structure
+/// du mono en 8 dispatches (gate+up partagé fusionné, combine avec partagé).
+/// Niveaux gardés comme référence et pour les ablations. NOTE: le niveau 2 est
+/// actif par défaut sur les couches `LinearMoe` de toute vérification en lignes
+/// (chemin sous `SARAGOSSA_RUST_PREFILL_MOE_ROWS`, défaut ON), pas seulement
+/// sous `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1` ; `=0` rend l'ancien chemin.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn moe_verify_tail_level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MOE_VERIFY_TAIL")
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .map_or(2, |level| level.min(2))
+    })
+}
+
+/// Lignes maximales pour le gate+up+SwiGLU partagé fusionné de la vérification
+/// (`SARAGOSSA_RUST_MOE_VERIFY_SHARED_FUSED_MAX_ROWS`) : un threadgroup par ligne
+/// relit les poids partagés, au-delà le qmm2/skinny (lecture unique) reprend.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn moe_verify_shared_fused_max_rows() -> usize {
+    static ROWS: OnceLock<usize> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MOE_VERIFY_SHARED_FUSED_MAX_ROWS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(16)
+    })
+}
+
+/// Ablation de diagnostic du pas de vérification résidente
+/// (`SARAGOSSA_RUST_VERIFY_SKIP=moe_full,moe_linear,linear_attn,full_layer,head`) :
+/// la partie nommée est remplacée par une copie de son entrée (la tête ne rend
+/// aucun token), pour attribuer le temps mural par poste. Compilée sous
+/// `devtools` (feature par défaut), mais active seulement dans la portée
+/// `VerifySkipScope` (tests seulement) que seul le bench de vérification
+/// installe : le decode AR, `serve` et les oracles l'ignorent même si la
+/// variable est posée.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+pub(crate) fn verify_skip(part: &str) -> bool {
+    static PARTS: OnceLock<Vec<String>> = OnceLock::new();
+    VERIFY_SKIP_SCOPE.with(std::cell::Cell::get)
+        && PARTS
+            .get_or_init(|| {
+                let parts: Vec<String> = env_var("SARAGOSSA_RUST_VERIFY_SKIP")
+                    .map(|list| {
+                        list.split(',')
+                            .map(|item| item.trim().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !parts.is_empty() {
+                    eprintln!(
+                        "SARAGOSSA_RUST_VERIFY_SKIP={parts:?} : ablation active, sorties fausses"
+                    );
+                }
+                parts
+            })
+            .iter()
+            .any(|item| item == part)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+thread_local! {
+    static VERIFY_SKIP_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Portée où [`verify_skip`] lit `SARAGOSSA_RUST_VERIFY_SKIP` (thread courant,
+/// restaurée au drop). Réservée au bench de vérification : compilée pour les
+/// tests seulement, aucun binaire ne peut l'installer.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools", test))]
+pub(crate) struct VerifySkipScope(bool);
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools", test))]
+impl VerifySkipScope {
+    /// Active l'ablation sur ce thread jusqu'au drop.
+    pub(crate) fn install() -> Self {
+        Self(VERIFY_SKIP_SCOPE.with(|scope| scope.replace(true)))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools", test))]
+impl Drop for VerifySkipScope {
+    fn drop(&mut self) {
+        VERIFY_SKIP_SCOPE.with(|scope| scope.set(self.0));
+    }
+}
+
+/// Sans devtools, aucune ablation : constante pour que l'appel disparaisse.
+#[cfg(all(target_os = "macos", feature = "metal", not(feature = "devtools")))]
+#[inline(always)]
+pub(crate) const fn verify_skip(_part: &str) -> bool {
+    false
 }
 
 /// Drafts par pas de la boucle greedy « lookup seul » (lookup n-grammes sans

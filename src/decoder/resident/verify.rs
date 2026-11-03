@@ -222,18 +222,29 @@ impl CausalDecoder {
                         arena.layers.get(index),
                         Some(ResidentLayerBuffers::FullMoe(_))
                     ) {
-                        self.encode_resident_full_moe_layer_rows(
-                            metal,
-                            arena,
-                            layer_cache,
-                            index,
-                            encoder,
-                            &mut owned,
-                            dims,
-                            batch,
-                            current,
-                            other,
-                        )?;
+                        if crate::runtime_flags::verify_skip("full_layer") {
+                            metal.encode_copy_with_offsets(
+                                encoder,
+                                current,
+                                0,
+                                other,
+                                0,
+                                batch * hidden,
+                            )?;
+                        } else {
+                            self.encode_resident_full_moe_layer_rows(
+                                metal,
+                                arena,
+                                layer_cache,
+                                index,
+                                encoder,
+                                &mut owned,
+                                dims,
+                                batch,
+                                current,
+                                other,
+                            )?;
+                        }
                     } else {
                         self.encode_resident_full_dense_layer_rows(
                             metal,
@@ -354,7 +365,10 @@ impl CausalDecoder {
                 hidden,
                 eps,
             )?;
-            let final_indices = if head == ResidentVerifyHead::Argmax {
+            // Ablation devtools de la tête : aucun token rendu (le scratch des
+            // indices n'est pas réinitialisé, il serait lu comme des tokens).
+            let skip_head = crate::runtime_flags::verify_skip("head");
+            let final_indices = if head == ResidentVerifyHead::Argmax && !skip_head {
                 let indices = arena.state.scratch().lease(batch, GpuElement::U32)?;
                 // lm_head projeté une fois pour toutes les lignes, argmax par ligne.
                 metal.encode_lm_head_argmax_rows_buffers(
@@ -368,6 +382,8 @@ impl CausalDecoder {
                     hidden,
                 )?;
                 Some(indices)
+            } else if head == ResidentVerifyHead::Argmax {
+                None
             } else if let ResidentVerifyHead::Sample {
                 temperature,
                 top_p,
@@ -519,18 +535,22 @@ impl CausalDecoder {
                     let dims = self.config.resident_windowed_full_attn_layer_dims(
                         index, hidden, position, eps, theta,
                     )?;
-                    self.encode_resident_full_layer(
-                        metal,
-                        arena,
-                        layer_cache,
-                        layer,
-                        index,
-                        encoder,
-                        &mut owned,
-                        dims,
-                        current,
-                        other,
-                    )?;
+                    if crate::runtime_flags::verify_skip("full_layer") {
+                        metal.encode_copy_with_offsets(encoder, current, 0, other, 0, hidden)?;
+                    } else {
+                        self.encode_resident_full_layer(
+                            metal,
+                            arena,
+                            layer_cache,
+                            layer,
+                            index,
+                            encoder,
+                            &mut owned,
+                            dims,
+                            current,
+                            other,
+                        )?;
+                    }
                 } else {
                     let Some((la_spec, key_dim, value_dim, conv_dim)) = linear_dims else {
                         return Err(InferError::Config(
@@ -608,7 +628,10 @@ impl CausalDecoder {
                 hidden,
             )?;
         }
-        let final_indices = if head == ResidentVerifyHead::Argmax {
+        // Ablation devtools de la tête : aucun token rendu (voir le chemin en
+        // lignes).
+        let skip_head = crate::runtime_flags::verify_skip("head");
+        let final_indices = if head == ResidentVerifyHead::Argmax && !skip_head {
             let indices = arena
                 .state
                 .scratch()

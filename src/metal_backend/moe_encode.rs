@@ -278,6 +278,37 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         in_dim: usize,
     ) -> Result<bool> {
+        self.encode_gate_up_swiglu_fast_buffers_rows(
+            encoder,
+            lhs_buffer,
+            gate,
+            up,
+            output_buffer,
+            1,
+            in_dim,
+        )
+    }
+
+    /// Variante en lignes du gate+up+SwiGLU fusionné de l'expert partagé : les
+    /// kernels `affine_gate_up_swiglu_fast_*` indexent déjà la ligne par
+    /// `tile.x` (entrée `[rows, in_dim]`, sortie `[rows, out_dim]`), seule la
+    /// grille change. Un threadgroup par ligne relit les poids : la rentabilité
+    /// face au qmm2/skinny dépend de `rows` (mesuré par l'appelant).
+    pub(crate) fn encode_gate_up_swiglu_fast_buffers_rows(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        gate: &MetalLinearWeightBuffers,
+        up: &MetalLinearWeightBuffers,
+        output_buffer: &BufferRef,
+        rows: usize,
+        in_dim: usize,
+    ) -> Result<bool> {
+        if rows == 0 {
+            return Err(InferError::Dimension(
+                "gate/up partagé en lignes: batch vide".to_string(),
+            ));
+        }
         let (
             MetalLinearWeightBuffers::AffineQuantized {
                 packed: gate_packed,
@@ -358,11 +389,11 @@ impl MetalExecutor {
         encoder.set_buffer(6, Some(up_biases), *up_biases_offset);
         encoder.set_buffer(7, Some(output_buffer), 0);
         set_u32_bytes(encoder, 8, &dims, "shared_gate_up_dims")?;
-        trace_dispatch_path(kernel_name, 1, *gate_out, in_dim);
+        trace_dispatch_path(kernel_name, rows, *gate_out, in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
-                1,
+                checked_nsuint(rows, "shared gate/up rows")?,
                 checked_nsuint(gate_out.div_ceil(8), "shared gate/up out groups")?,
                 1,
             ),
@@ -734,21 +765,60 @@ impl MetalExecutor {
         topk_per_row: usize,
         out_dim: usize,
     ) -> Result<()> {
+        self.encode_weighted_sum_add_grouped_topk_shared(
+            encoder,
+            src_buffer,
+            scores_buffer,
+            residual_buffer,
+            None,
+            output_buffer,
+            rows,
+            topk_per_row,
+            out_dim,
+        )
+    }
+
+    /// Combine groupé par ligne : résiduel + somme pondérée des `topk_per_row`
+    /// slots de la ligne, plus, si `shared = Some((shared_down, shared_gate))`,
+    /// l'expert partagé `shared_down[row] * sigmoid(shared_gate[row])` dans le
+    /// même dispatch (expression du combine mono-ligne).
+    pub(super) fn encode_weighted_sum_add_grouped_topk_shared(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        src_buffer: &BufferRef,
+        scores_buffer: &BufferRef,
+        residual_buffer: &BufferRef,
+        shared: Option<(&BufferRef, &BufferRef)>,
+        output_buffer: &BufferRef,
+        rows: usize,
+        topk_per_row: usize,
+        out_dim: usize,
+    ) -> Result<()> {
         let len = checked_len(rows, out_dim, "weighted grouped add output")?;
         let dims = [
             checked_u32(rows, "weighted grouped add rows")?,
             checked_u32(topk_per_row, "weighted grouped add topk")?,
             checked_u32(out_dim, "weighted grouped add out_dim")?,
-            0,
+            u32::from(shared.is_some()),
         ];
+        // NOTE: sans partagé, le kernel ne lit pas les buffers 5 et 6 ; le
+        // résiduel y est lié pour que tous les arguments restent liés.
+        let (shared_buffer, shared_gate_buffer) =
+            shared.unwrap_or((residual_buffer, residual_buffer));
         encoder.set_compute_pipeline_state(&self.weighted_sum_add_grouped_topk_f32);
         encoder.set_buffer(0, Some(src_buffer), 0);
         encoder.set_buffer(1, Some(scores_buffer), 0);
         encoder.set_buffer(2, Some(residual_buffer), 0);
         encoder.set_buffer(3, Some(output_buffer), 0);
         set_u32_bytes(encoder, 4, &dims, "weighted_grouped_add_dims")?;
+        encoder.set_buffer(5, Some(shared_buffer), 0);
+        encoder.set_buffer(6, Some(shared_gate_buffer), 0);
         trace_dispatch_path(
-            "weighted_sum_add_grouped_topk_f32",
+            if shared.is_some() {
+                "weighted_sum_add_grouped_topk_f32+shared"
+            } else {
+                "weighted_sum_add_grouped_topk_f32"
+            },
             rows,
             out_dim,
             topk_per_row,
@@ -1110,6 +1180,56 @@ impl MetalExecutor {
         set_u32_bytes(encoder, 3, &dims, "topk_rows_dims")?;
         trace_dispatch_path("topk_softmax_rows_f32", rows, topk, count);
         self.dispatch_1d(encoder, &self.topk_softmax_rows_f32, rows)
+    }
+
+    /// Top-k softmax en lignes de la vérification MoE : une ligne par
+    /// threadgroup avec le kernel parallèle du mono (`topk8_softmax_256`) quand
+    /// 256 experts / top-8 et `SARAGOSSA_RUST_TOPK8_FAST` actif, sinon le kernel
+    /// générique un thread par ligne. Le prefill garde
+    /// [`Self::encode_topk_softmax_rows`].
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde, ou, via le repli
+    /// [`Self::encode_topk_softmax_rows`], si `rows` est nul ou `topk` invalide.
+    pub(super) fn encode_topk_softmax_verify_rows(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits_buffer: &BufferRef,
+        indices_buffer: &BufferRef,
+        scores_buffer: &BufferRef,
+        rows: usize,
+        count: usize,
+        topk: usize,
+    ) -> Result<()> {
+        if !(topk8_fast_enabled() && count == 256 && topk == 8 && rows > 0) {
+            return self.encode_topk_softmax_rows(
+                encoder,
+                logits_buffer,
+                indices_buffer,
+                scores_buffer,
+                rows,
+                count,
+                topk,
+            );
+        }
+        let dims = [
+            checked_u32(count, "topk8 rows count")?,
+            checked_u32(topk, "topk8 rows topk")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.topk8_softmax_256_rows_f32);
+        encoder.set_buffer(0, Some(logits_buffer), 0);
+        encoder.set_buffer(1, Some(indices_buffer), 0);
+        encoder.set_buffer(2, Some(scores_buffer), 0);
+        set_u32_bytes(encoder, 3, &dims, "topk8_rows_dims")?;
+        trace_dispatch_path("topk8_softmax_256_rows_f32", rows, topk, count);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(checked_nsuint(rows, "topk8 rows")?, 1, 1),
+            MTLSize::new(TOPK_SOFTMAX_TG_WIDTH, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
     }
 
     /// Top-k du routeur sigmoïde flint sur `rows` lignes (prefill), jumeau de

@@ -13,3 +13,4 @@ include!("tests/linear_attention.rs");
 include!("tests/attention.rs");
 include!("tests/mtp_seed.rs");
 include!("tests/verify_tree.rs");
+include!("tests/moe_verify_rows.rs");

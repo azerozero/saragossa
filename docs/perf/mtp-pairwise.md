@@ -1039,7 +1039,8 @@ restaure un préfixe cohérent par captures (un token accepté par répétition)
   3,1 à 3,7 experts sur 8 communs entre tokens consécutifs (1,8 sur T6), contre
   0,25 pour un routage uniforme ; experts distincts sur 9 tokens = 0,51 à 0,69
   fois l'uniforme. Le gather par slot n'en profite pas.
-- MTP : non-go en l'état (ρ(2) = 1,83 > 1,30, ρ(3) = 1,84 > 1,55).
+- MTP : non-go en l'état (ρ(2) = 1,83 > 1,30, ρ(3) = 1,84 > 1,55). Voir la
+  section du 3 novembre : ρ(2) = 1,26, ρ(3) = 1,36 depuis.
 - Lookup sans tête MTP (`SARAGOSSA_RUST_LOOKUP_GREEDY=n`, opt-in, decode
   pipeliné interrompu dès qu'une proposition existe), ABBA 3 paires contre le
   greedy AR, 400 tokens, sorties identiques à l'AR :
@@ -1048,6 +1049,117 @@ restaure un préfixe cohérent par captures (un token accepté par répétition)
 |---:|---:|---:|---:|---:|---:|
 | 2 | −1,6 % | +1,1 % | +0,1 % | +19,6 % | −1,5 % |
 | 8 | −2,4 % | +2,1 % | 0,0 % | +87,0 % | −2,5 % |
+
+## Vérification MoE en lignes : queue calquée sur le mono-ligne (3 nov. 2026)
+
+Qwen3.6-35B-A3B 4 bits, contexte 4096, `verify_rows_cost_bench_real_model`
+avec captures, `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Médianes de 3 lancements
+alternés base (main 7069020) / branche, même binaire de bench, trace coupée :
+
+| R | base (ms) | ρ base | branche (ms) | ρ branche |
+|---:|---:|---:|---:|---:|
+| 1 | 7,96 | 1,00 | 8,01 | 1,00 |
+| 2 | 14,58 | 1,83 | 10,07 | 1,26 |
+| 3 | 14,72 | 1,85 | 10,90 | 1,36 |
+| 4 | 16,35 | 2,05 | 12,39 | 1,55 |
+| 5 | 19,80 | 2,49 | 14,46 | 1,81 |
+| 9 | 24,35 | 3,06 | 18,78 | 2,34 |
+
+T(1) est inchangé (écart dans le bruit de ±0,05 ms) : le gain de ρ ne vient
+pas du dénominateur. La queue de niveau 2 sert aussi, par défaut, aux 30 couches
+`LinearMoe` de toute vérification en lignes (elles passent par le chemin en
+lignes sous `SARAGOSSA_RUST_PREFILL_MOE_ROWS`, défaut ON) ;
+`SARAGOSSA_RUST_MOE_VERIFY_TAIL=0` rend l'ancien chemin. La projection
+concaténée des couches linéaires suit `SARAGOSSA_RUST_LINEAR_FULL_CONCAT`, qui
+coupe aussi le mono-ligne. Sur du code réel (`SARAGOSSA_RUST_VERIFY_ROWS_BENCH_TEXT=1`,
+un lancement), T(2) = 9,98 ms et T(9) = 19,21 ms, contre 13,78 et 23,84 ms avec
+l'ancienne queue (`SARAGOSSA_RUST_MOE_VERIFY_TAIL=0`).
+
+Effet par étape (R=2, puis R=9, même binaire) :
+
+- Top-k : `topk_softmax_rows_f32` faisait tout le top-k 8/256 d'une ligne sur
+  un seul thread. Une copie en lignes de `topk8_softmax_256` (un threadgroup
+  par ligne) ramène T(2) de 14,57 à 11,15 ms et T(9) de 24,07 à 20,31 ms.
+- Structure du mono : gate+up+SwiGLU partagé en un dispatch (grille x du
+  kernel mono) et partagé ajouté dans le combine groupé, soit 8 dispatches par
+  couche au lieu de 11. T(2) passe de 11,15 à 10,75 ms, T(9) de 20,31 à
+  19,71 ms. La grille x relit les poids partagés par ligne, mais bat le
+  qmm2/skinny à toutes les tailles mesurées (R=9 : 19,68 contre 20,23 ms) :
+  pas de plafond utile, `SARAGOSSA_RUST_MOE_VERIFY_SHARED_FUSED_MAX_ROWS` = 16.
+- Couches linéaires : la projection d'entrée lançait quatre matmuls en lignes
+  (qkv, z, beta, gate, dont deux de 32 sorties). La projection concaténée du
+  mono-ligne la réduit à un seul. T(2) passe de 10,76 à 10,05 ms.
+- Dédup des experts entre lignes : écartée. La porte gratuite (gathers routés
+  seuls, 40 couches, poids synthétiques de la forme du 35B) donne 2,03 ms
+  quand les deux lignes demandent les mêmes experts, 2,60 ms pour des experts
+  distincts, 1,55 ms pour une ligne. Le cache absorbe déjà une partie des
+  doublons. Un kernel « propriétaire » (premier slot global de l'expert,
+  qui calcule tous ses slots) est plus lent partout : 2,23 ms à recouvrement
+  total, 2,80 ms sans recouvrement à R=2 ; 6,74 et 13,62 ms (contre 5,56 et
+  9,32) à R=9. Moins de threadgroups actifs et le scan du propriétaire coûtent
+  plus que les relectures qu'il évite. Il est retiré.
+
+Oracles : les kernels top-k, gate+up partagé et combine en lignes sont égaux
+bit à bit à leur kernel mono (M5), le combine aussi à l'ancien combine en deux
+dispatches. La queue entière n'est pas bit à bit égale au pas mono-ligne
+(routeur, gate scalaire et down partagé passent par des matmuls en lignes) :
+c'est l'oracle réel qui la couvre, à 5e-3 relatif. L'oracle réel
+`moe_verify_rows_match_single_rows_real_model`, renforcé (comptes exacts,
+passage avec captures comparé, relance en lignes après rollback, aucune
+quasi-égalité tolérée), est vert sans quasi-égalité. Le lookup greedy reste
+identique à l'AR (`lookup_greedy_matches_ar_real_model`). Les oracles MTP du
+27B dense (`mtp_stop_sequences_match_ar_real_model`,
+`mtp_sampled_matches_ar_at_low_temperature_real_model`), qui passent par la
+même projection linéaire en lignes, sont verts.
+
+Décomposition par poste (ablation `SARAGOSSA_RUST_VERIFY_SKIP`, active
+seulement dans le bench de vérification : chaque poste remplacé par une copie
+de son entrée ; les compteurs GPU aux
+frontières de dispatch ne sont pas disponibles sur M5). Les postes ne sont pas
+exactement additifs (écart ≤ 0,2 ms) :
+
+| poste (ms) | R=1 avant | R=2 avant | R=1 après | R=2 après |
+|---|---:|---:|---:|---:|
+| queue MoE, 40 couches | 3,70 | 8,56 | 3,70 | 4,75 |
+| dont les 10 couches full | 0,85 | 2,12 | 0,87 | 1,20 |
+| attention linéaire, 30 couches (captures comprises) | 1,97 | 3,42 | 2,03 | 2,83 |
+| attention full, 10 couches | 1,42 | 1,70 | 1,44 | 1,67 |
+| lm_head + argmax | 0,41 | 0,48 | 0,41 | 0,53 |
+| reste (embedding, normes, soumission, relecture) | 0,44 | 0,51 | 0,45 | 0,48 |
+| total mesuré | 7,97 | 14,58 | 7,98 | 10,09 |
+
+La marge restante sous ρ(2) = 1,30 est de 0,3 ms. Le hors-MoE à R=2 vaut
+5,34 ms contre 4,28 à R=1 (+1,06 ms). Il se répartit ainsi :
+
+- l'attention linéaire, +0,80 ms, dont 0,32 ms de captures ;
+- l'attention full, +0,23 ms ;
+- la tête, +0,12 ms : le lm_head est lu une fois en qmm2, puis vient un
+  argmax en deux dispatches par ligne.
+
+La queue MoE reste à +1,05 ms pour une ligne de plus, soit environ le
+trafic des 8 experts supplémentaires.
+
+Bout en bout, lookup greedy sans tête MTP (`SARAGOSSA_RUST_LOOKUP_GREEDY=8`,
+`SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`), `lookup_greedy_abba_vs_ar_real_model`,
+prompts `models/pairwise/prompts6.json`, 400 tokens, ABBA 3 paires contre
+l'AR dans le même processus, sorties identiques à l'AR partout. Médianes des
+gains contre l'AR, et débit de decode médian (tok/s) :
+
+| cas | base 7069020 | branche | AR base / branche | lookup base / branche |
+|---|---:|---:|---:|---:|
+| T0 | −2,5 % | −1,9 % | 151,4 / 150,4 | 148,6 / 148,6 |
+| T1 | +2,2 % | +2,8 % | 151,0 / 149,8 | 154,4 / 154,0 |
+| T2 | −0,1 % | +0,1 % | 146,4 / 145,4 | 146,4 / 145,6 |
+| T6 | +87,0 % | +92,5 % | 148,6 / 145,8 | 278,0 / 281,9 |
+| T7 | −2,6 % | −2,4 % | 134,0 / 129,2 | 130,6 / 126,2 |
+
+Le gain de la vérification se voit là où le lookup propose (T6). Sur la
+prose, le lookup propose rarement : la perte d'environ 2 % (T0, T7) vient de
+la boucle elle-même (decode pipeliné interrompu), pas du coût d'une
+vérification. Les écarts d'AR entre les deux binaires (jusqu'à 4,8 tok/s sur
+T7) sont du bruit entre processus : l'AR n'emprunte aucun chemin modifié.
+`SARAGOSSA_RUST_MOE_VERIFY_ROWS` reste donc OFF par défaut. Avec le lookup
+actif, la branche régresse encore contre `=0` (l'AR) sur T0 et T7.
 
 ## Stop sequences sur le chemin spéculatif (2 nov. 2026)
 

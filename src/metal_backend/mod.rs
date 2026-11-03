@@ -371,6 +371,7 @@ pub struct MetalExecutor {
     topk_sigmoid_rows_f32: ComputePipelineState,
     topk_softmax_serial_f32: ComputePipelineState,
     topk8_softmax_256_f32: ComputePipelineState,
+    topk8_softmax_256_rows_f32: ComputePipelineState,
     topk_softmax_rows_f32: ComputePipelineState,
     sample_gumbel_blocks_f32: ComputePipelineState,
     sample_topk_blocks_f32: ComputePipelineState,
