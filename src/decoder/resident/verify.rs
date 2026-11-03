@@ -112,6 +112,12 @@ impl CausalDecoder {
 
         let layer_batch_supported =
             token_ids.len() > 1 && self.resident_layer_batch_supported(arena);
+        if matches!(head, ResidentVerifyHead::Sample { .. }) && !layer_batch_supported {
+            return Err(InferError::Config(
+                "vérification échantillonnée: couches en lignes et au moins deux lignes requises"
+                    .to_string(),
+            ));
+        }
         if tree.is_some() && !layer_batch_supported {
             return Err(InferError::Config(
                 "vérification en arbre: couches en lignes requises".to_string(),
@@ -190,7 +196,9 @@ impl CausalDecoder {
                 .then(crate::metal_backend::install_dispatch_barrier_scope);
             let _namespace_guard =
                 crate::metal_backend::install_scratch_namespace(arena.state.scratch_namespace());
-            let _tree_guard = tree.map(crate::metal_backend::install_verify_tree_scope);
+            let _tree_guard = tree
+                .clone()
+                .map(crate::metal_backend::install_verify_tree_scope);
             let encoder = new_resident_compute_encoder(command_buffer);
             let mut owned: Vec<metal::Buffer> = Vec::new();
             let mut current = batch_a.tensor().buffer();
@@ -358,6 +366,36 @@ impl CausalDecoder {
                     0,
                     batch,
                     hidden,
+                )?;
+                Some(indices)
+            } else if let ResidentVerifyHead::Sample {
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                first_draw,
+            } = head
+            {
+                let indices = arena.state.scratch().lease(batch, GpuElement::U32)?;
+                // NOTE: les lignes sœurs d'un arbre partagent l'état de leur
+                // profondeur ; le parcours n'en visite qu'une par profondeur.
+                let rng_states = (0..batch)
+                    .map(|row| {
+                        let depth = match &tree {
+                            Some(tree) => tree.depths()[row] as usize,
+                            None => row,
+                        };
+                        crate::sampling::rng_state_for_draw(seed, first_draw + depth)
+                    })
+                    .collect::<Vec<_>>();
+                metal.encode_lm_head_sample_rows_buffers(
+                    encoder,
+                    final_states.tensor().buffer(),
+                    &arena.lm_head,
+                    indices.tensor().buffer(),
+                    hidden,
+                    (temperature, top_p, top_k),
+                    &rng_states,
                 )?;
                 Some(indices)
             } else {

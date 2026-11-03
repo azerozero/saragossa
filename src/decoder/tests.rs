@@ -4612,3 +4612,155 @@ fn lookup_greedy_matches_ar_real_model() -> Result<()> {
     assert!(stops_in_drafts > 0, "aucun arrêt parmi des drafts acceptés");
     Ok(())
 }
+
+// --- DFlash échantillonné : tirage par ligne et descente, modèle réel ---
+
+/// Uniforme du tirage d'état `state` (même calcul que `DeterministicSampler`
+/// et `splitmix_unit_f32` des kernels).
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn splitmix_unit_for_test(state: u64) -> f32 {
+    let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    ((z >> 40) as u32 & 0x00ff_ffff) as f32 / 16_777_216.0
+}
+
+/// Distance du tirage `u` à la frontière de CDF la plus proche de la cible
+/// filtrée (`None` si la distribution n'a qu'un token) : un écart AR/DFlash à
+/// logits voisins n'est possible que si `u` tombe près d'une frontière.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn cdf_margin_for_test(logits: &[f32], options: &GenerationOptions, u: f32) -> Result<Option<f32>> {
+    let distribution = crate::sampling::token_distribution_top_k_top_p(
+        logits,
+        options.temperature,
+        options.top_p,
+        options.top_k,
+    )?;
+    let sum: f32 = distribution.iter().map(|(_, p)| *p).sum();
+    let roll = u * sum;
+    let mut cumulative = 0.0_f32;
+    let mut margin: Option<f32> = None;
+    for (_, p) in &distribution[..distribution.len() - 1] {
+        cumulative += p;
+        let distance = (roll - cumulative).abs() / sum;
+        margin = Some(margin.map_or(distance, |m| m.min(distance)));
+    }
+    Ok(margin)
+}
+
+/// DFlash échantillonné sur le modèle réel (`SARAGOSSA_RUST_DFLASH_SAMPLED=1`) :
+/// - à T = 0,05 (top-k 20, top-p 0,9), chaîne et arbre B = 8 sortent les tokens
+///   de l'AR échantillonné de même graine, et une graine rejoue sa sortie ;
+/// - à T = 0,7, sur `SARAGOSSA_RUST_DFLASH_SAMPLED_SEEDS` graines (24 par
+///   défaut), l'arbre B = 8 et la chaîne rejoignent l'AR de même graine sauf au
+///   voisinage d'une frontière de CDF : au premier écart, le tirage de l'AR
+///   (logits du decode résident forcé sur le préfixe commun) tombe à moins de
+///   `MARGIN` d'une frontière. Le taux d'identité et l'acceptance sont imprimés.
+///
+/// Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`,
+/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` et `SARAGOSSA_RUST_DFLASH_SAMPLED=1`.
+#[test]
+#[ignore = "modèle réel + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_sampled_matches_ar_real_model() -> Result<()> {
+    use crate::decoder::resident::dflash::DFlashTreeMode;
+    // Marge de CDF au-delà de laquelle un écart AR/DFlash n'est plus imputable à
+    // la numérique des lignes de vérification (calibrée par mesure, cf. doc).
+    const MARGIN: f32 = 0.02;
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none()
+        || !crate::runtime_flags::dflash_sampled_enabled()
+    {
+        eprintln!("skip DFlash échantillonné: drafter ou SARAGOSSA_RUST_DFLASH_SAMPLED=1 absent");
+        return Ok(());
+    }
+    let seeds = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SAMPLED_SEEDS")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(24);
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config("drafter DFlash non chargé".to_string()))?
+        .clone();
+    let block = draft.info.block_size;
+    let run = |prompt: &[usize], max_new: usize, options: &GenerationOptions, mode| {
+        model.generate_greedy_dflash_resident_tree(
+            prompt,
+            max_new,
+            options,
+            &draft,
+            block,
+            (mode, true),
+            |_| true,
+        )
+    };
+    let base = GenerationOptions {
+        top_p: 0.9,
+        top_k: 20,
+        ..mtp_verifier_options(Vec::new())
+    };
+    for text in [
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+        "Raconte en quelques phrases l'histoire d'un phare isolé sur une côte bretonne.",
+    ] {
+        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
+        let cold = GenerationOptions {
+            temperature: 0.05,
+            seed: 7,
+            ..base.clone()
+        };
+        let ar = model.generate_greedy_cached_with_options(&prompt, 32, &cold)?;
+        for mode in [DFlashTreeMode::Off, DFlashTreeMode::BestFirst(8)] {
+            let first = run(&prompt, 32, &cold, mode)?;
+            let second = run(&prompt, 32, &cold, mode)?;
+            assert_eq!(first.tokens, ar, "T=0,05 {mode:?} « {} »", &text[..20]);
+            assert_eq!(first.tokens, second.tokens, "rejeu de graine {mode:?}");
+        }
+        let max_new = 32;
+        let kv_bf16 = CausalDecoder::resident_kv_bf16(true, prompt.len());
+        for mode in [DFlashTreeMode::Off, DFlashTreeMode::BestFirst(8)] {
+            let (mut identical, mut accepted, mut proposed, mut worst) = (0, 0, 0, 0.0_f32);
+            for seed in 0..seeds {
+                let warm = GenerationOptions {
+                    temperature: 0.7,
+                    seed,
+                    ..base.clone()
+                };
+                let ar = model.generate_greedy_cached_with_options(&prompt, max_new, &warm)?;
+                let spec = run(&prompt, max_new, &warm, mode)?;
+                accepted += spec.stats.accepted;
+                proposed += spec.stats.proposed;
+                let Some(index) = ar.iter().zip(&spec.tokens).position(|(a, b)| a != b) else {
+                    assert_eq!(ar.len(), spec.tokens.len(), "graine {seed} {mode:?}");
+                    identical += 1;
+                    continue;
+                };
+                assert!(index > 0, "premier token différent (graine {seed})");
+                let forced = model.resident_forced_logits_for_test(&prompt, &ar[..index], kv_bf16)?;
+                let u = splitmix_unit_for_test(crate::sampling::rng_state_for_draw(seed, index));
+                let margin = cdf_margin_for_test(&forced[index - 1], &warm, u)?;
+                eprintln!(
+                    "DFlash échantillonné {mode:?} graine {seed} : écart au token {index} ({} contre {}), marge CDF {margin:?}",
+                    ar[index], spec.tokens[index]
+                );
+                let margin = margin.unwrap_or(f32::INFINITY);
+                worst = worst.max(margin);
+                assert!(
+                    margin < MARGIN,
+                    "écart loin d'une frontière de CDF ({margin}) : graine {seed} {mode:?}"
+                );
+            }
+            eprintln!(
+                "DFlash échantillonné T=0,7 {mode:?} « {} » : {identical}/{seeds} sorties identiques à l'AR, acceptance {accepted}/{proposed}, pire marge {worst}",
+                &text[..20],
+            );
+        }
+    }
+    Ok(())
+}

@@ -1311,11 +1311,16 @@ impl CausalDecoder {
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         // Drafter DFlash opt-in (`with_dflash_draft_from_env`) : le greedy non
         // contraint passe par la boucle résidente, stop sequences comprises ;
-        // échantillonnage et contraintes gardent la tête MTP. Phase 7 pairwise : code +31 à +88 %, prose longue
+        // l'échantillonné aussi sous `SARAGOSSA_RUST_DFLASH_SAMPLED=1` quand le
+        // sampler GPU sait tirer ses paramètres, sinon il garde la tête MTP comme
+        // les contraintes. Phase 7 pairwise : code +31 à +88 %, prose longue
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
         #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
         if let Some(draft) = self.dflash.as_ref() {
-            if options.temperature <= f32::EPSILON && options.token_constraint.is_none() {
+            let sampled_ok = options.temperature <= f32::EPSILON
+                || (crate::runtime_flags::dflash_sampled_enabled()
+                    && super::resident::resident_sampling_on_device(options));
+            if sampled_ok && options.token_constraint.is_none() {
                 return self.generate_greedy_dflash_then_mtp(
                     prompt,
                     max_new_tokens,

@@ -158,7 +158,8 @@ impl CausalDecoder {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si le mode n'est pas greedy, si le decode résident
+    /// Renvoie une erreur si l'échantillonnage (température > 0) n'est pas permis
+    /// (`SARAGOSSA_RUST_DFLASH_SAMPLED=1` et paramètres du sampler GPU), si le decode résident
     /// complet n'est pas disponible pour ce modèle, ou si un encodage échoue.
     pub fn generate_greedy_dflash_resident_with_options(
         &self,
@@ -225,10 +226,10 @@ impl CausalDecoder {
         // Arbre par défaut (non explicite) : toute raison de refus le ramène à la
         // chaîne ; une demande explicite reste refusée avec son erreur.
         let mut tree_mode = tree_mode;
-        if options.temperature > f32::EPSILON {
-            return Err(InferError::Config(
-                "decode DFlash résident supporte uniquement greedy temperature=0".to_string(),
-            ));
+        if let Some(reason) = dflash_sampling_refusal(options) {
+            return Err(InferError::Config(format!(
+                "decode DFlash résident: {reason}"
+            )));
         }
         if max_draft_tokens == 0 {
             return Err(InferError::Config(
@@ -318,7 +319,7 @@ impl CausalDecoder {
         // Même règle KV que la vérification MTP (`resident_kv_bf16`) : bf16 au-delà du
         // seuil greedy, où la lecture du KV domine la vérification en lignes. Le
         // drafter garde son propre KV dense ; la boucle CPU de référence reste f32.
-        let kv_bf16 = Self::resident_kv_bf16(false, cache.position);
+        let kv_bf16 = Self::resident_kv_bf16(options.temperature > f32::EPSILON, cache.position);
         if self.config.metal_unsupported_reason().is_some()
             || !self.supports_resident_full_decode()
             || !self.setup_resident_full_decode(
@@ -415,7 +416,10 @@ impl CausalDecoder {
         // la génération revient à la boucle MTP, cf. harnais d'acceptance).
         // NOTE: le repli MTP repart avec une sortie vide et manquerait une stop
         // sequence à cheval sur la bascule : pas de bascule avec des séquences.
-        let switch_min = if options.stop_sequences.is_empty() {
+        // À T > 0 le repli MTP repartirait de la graine et rejouerait les aléas
+        // déjà consommés : pas de bascule non plus.
+        let switch_min = if options.stop_sequences.is_empty() && options.temperature <= f32::EPSILON
+        {
             crate::runtime_flags::dflash_switch_min()
         } else {
             0.0
@@ -510,7 +514,7 @@ impl CausalDecoder {
                 .next_final_states_resident_verify(
                     &mut cache,
                     &verify_tokens,
-                    crate::decoder::ResidentVerifyHead::Argmax,
+                    dflash_verify_head(options, generated.len()),
                     true,
                     Some(layer_ids),
                     None,
@@ -891,7 +895,7 @@ impl CausalDecoder {
             .next_final_states_resident_verify(
                 cache,
                 tree.tokens(),
-                crate::decoder::ResidentVerifyHead::Argmax,
+                dflash_verify_head(options, state.generated.len()),
                 true,
                 Some(draft.info.target_layer_ids.as_slice()),
                 Some(verify_tree),
@@ -920,51 +924,9 @@ impl CausalDecoder {
                 tree.len()
             )));
         }
-        // Parcours : même acceptation que la chaîne, nœud par nœud ; les
-        // statistiques par position comptent les profondeurs parcourues.
-        let mut path = vec![0usize];
-        let mut node = 0usize;
-        loop {
-            let target = targets[node];
-            let depth = tree.depths()[node];
-            if !tree.parents()[node + 1..].contains(&node) {
-                // Feuille : sa cible devient le token suivant (bonus).
-                *state.pending = target;
-                break;
-            }
-            state.stats.verifications += 1;
-            state.stats.proposed += 1;
-            if let Some(slot) = state.stats.proposed_by_position.get_mut(depth) {
-                *slot += 1;
-            }
-            let Some(child) = tree.child(node, target) else {
-                state.stats.rejected += 1;
-                *state.pending = target;
-                break;
-            };
-            state.stats.accepted += 1;
-            if let Some(slot) = state.stats.accepted_by_position.get_mut(depth) {
-                *slot += 1;
-            }
-            if options.stop_token_ids.contains(&target) {
-                // Stop token accepté : exclu de la sortie comme en chaîne ; le
-                // tour suivant s'arrête sur ce `pending`.
-                *state.pending = target;
-                break;
-            }
-            // NOTE: arrêt (callback, stop sequence ou limite de sortie) : sortie
-            // sans rollback ni append. Le cache est local à la génération et
-            // détruit avec elle ; ses états (KV non compacté, états linéaires
-            // d'entrée) ne sont plus relus.
-            if !commit_token(state.generated, target, options, state.on_token) {
-                return Ok(TourEnd::Stop);
-            }
-            if state.generated.len() >= max_new_tokens {
-                return Ok(TourEnd::Stop);
-            }
-            path.push(child);
-            node = child;
-        }
+        let Some(path) = walk_tree_tour(&tree, targets, max_new_tokens, options, state) else {
+            return Ok(TourEnd::Stop);
+        };
         if path.len() < tree.len() {
             state.stats.rollbacks += 1;
         }
@@ -1147,6 +1109,107 @@ struct DFlashTourState<'a, F> {
     on_token: &'a mut F,
 }
 
+/// Raison du refus de l'échantillonnage DFlash (`None` : greedy, ou
+/// échantillonnage permis) : le flag opt-in et des paramètres que le sampler
+/// GPU de l'AR sait tirer (sinon l'AR relit les logits et tire sur le CPU, et
+/// l'identité à graine fixée avec l'AR se perdrait).
+fn dflash_sampling_refusal(options: &GenerationOptions) -> Option<&'static str> {
+    if options.temperature <= f32::EPSILON {
+        return None;
+    }
+    if !crate::runtime_flags::dflash_sampled_enabled() {
+        return Some("échantillonnage (temperature > 0) exige SARAGOSSA_RUST_DFLASH_SAMPLED=1");
+    }
+    if !super::resident_sampling_on_device(options) {
+        return Some(
+            "échantillonnage hors du sampler GPU (top_k entre 1 et 32, ou top_k = 0 et top_p = 1)",
+        );
+    }
+    None
+}
+
+/// Tête de vérification d'un tour dont l'ancre est le token d'indice
+/// `generated - 1` : argmax en greedy ; en échantillonné, la ligne de
+/// profondeur `d` produit le token d'indice `generated + d` et tire avec l'aléa
+/// de cet indice, celui que l'AR de même graine utiliserait (un tirage par
+/// token, le premier consommé au prefill).
+fn dflash_verify_head(
+    options: &GenerationOptions,
+    generated: usize,
+) -> crate::decoder::ResidentVerifyHead {
+    if options.temperature <= f32::EPSILON {
+        return crate::decoder::ResidentVerifyHead::Argmax;
+    }
+    crate::decoder::ResidentVerifyHead::Sample {
+        temperature: options.temperature,
+        top_p: options.top_p,
+        top_k: options.top_k,
+        seed: options.seed,
+        first_draw: generated,
+    }
+}
+
+/// Parcours d'acceptation d'un tour en arbre sur les cibles de chaque ligne
+/// (argmax en greedy, tirage en échantillonné) : descente vers l'enfant dont le
+/// token égale la cible du nœud courant, arrêt sur une feuille (bonus), un rejet
+/// ou un stop token accepté, qui deviennent `pending`. Rend le chemin commité
+/// (racine comprise), ou `None` si la génération s'arrête dans le tour
+/// (callback, stop sequence, limite de sortie).
+fn walk_tree_tour(
+    tree: &DFlashTree,
+    targets: &[usize],
+    max_new_tokens: usize,
+    options: &GenerationOptions,
+    state: &mut DFlashTourState<'_, impl FnMut(usize) -> bool>,
+) -> Option<Vec<usize>> {
+    // Parcours : même acceptation que la chaîne, nœud par nœud ; les
+    // statistiques par position comptent les profondeurs parcourues.
+    let mut path = vec![0usize];
+    let mut node = 0usize;
+    loop {
+        let target = targets[node];
+        let depth = tree.depths()[node];
+        if !tree.parents()[node + 1..].contains(&node) {
+            // Feuille : sa cible devient le token suivant (bonus).
+            *state.pending = target;
+            break;
+        }
+        state.stats.verifications += 1;
+        state.stats.proposed += 1;
+        if let Some(slot) = state.stats.proposed_by_position.get_mut(depth) {
+            *slot += 1;
+        }
+        let Some(child) = tree.child(node, target) else {
+            state.stats.rejected += 1;
+            *state.pending = target;
+            break;
+        };
+        state.stats.accepted += 1;
+        if let Some(slot) = state.stats.accepted_by_position.get_mut(depth) {
+            *slot += 1;
+        }
+        if options.stop_token_ids.contains(&target) {
+            // Stop token accepté : exclu de la sortie comme en chaîne ; le
+            // tour suivant s'arrête sur ce `pending`.
+            *state.pending = target;
+            break;
+        }
+        // NOTE: arrêt (callback, stop sequence ou limite de sortie) : sortie
+        // sans rollback ni append. Le cache est local à la génération et
+        // détruit avec elle ; ses états (KV non compacté, états linéaires
+        // d'entrée) ne sont plus relus.
+        if !commit_token(state.generated, target, options, state.on_token) {
+            return None;
+        }
+        if state.generated.len() >= max_new_tokens {
+            return None;
+        }
+        path.push(child);
+        node = child;
+    }
+    Some(path)
+}
+
 /// Pousse un token définitif, l'émet, puis dit si la génération continue :
 /// `false` si le callback arrête ou si une stop sequence vient de se terminer
 /// (incluse dans la sortie, comme en AR). La limite de sortie reste à
@@ -1179,6 +1242,10 @@ fn write_trace_line(
             source,
         })
 }
+
+#[cfg(test)]
+#[path = "dflash_sampled_tests.rs"]
+mod sampled_tests;
 
 #[cfg(test)]
 mod tests {
