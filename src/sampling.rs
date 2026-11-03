@@ -38,7 +38,9 @@ impl DeterministicSampler {
         z ^ (z >> 31)
     }
 
-    fn next_unit_f32(&mut self) -> f32 {
+    /// Tire un uniforme dans [0, 1) sur 24 bits (même calcul que `splitmix_unit_f32`
+    /// des kernels).
+    pub(crate) fn next_unit_f32(&mut self) -> f32 {
         let mantissa = (self.next_u64() >> 40) as u32;
         mantissa as f32 / (1_u32 << 24) as f32
     }

@@ -870,8 +870,9 @@ impl MetalExecutor {
             .checked_mul(out_dim)
             .ok_or_else(|| InferError::Dimension("sample rows logits déborde".to_string()))?;
         let logits_buffer = self.private_f32_buffer(logits_len, "sample_rows_logits")?;
-        // NOTE: même projection que le sampler solo (`prefer_fast_affine = false`),
-        // pas celle de la tête argmax.
+        // NOTE: même option que les samplers solo (`prefer_fast_affine = false`) ;
+        // le kernel du matmul dépend toutefois du nombre de lignes, donc les
+        // logits peuvent différer de ceux du decode à une ligne aux arrondis près.
         let projected_dim = self.encode_matmul_weight_buffers(
             encoder,
             input_buffer,

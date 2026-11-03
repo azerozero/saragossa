@@ -4319,6 +4319,9 @@ fn qmv_u4_residual_falls_back_without_mutation() -> Result<()> {
 /// ligne, à son offset et avec son état (profondeurs répétées comme des sœurs
 /// d'arbre), rend le token du même sampler appelé seul sur la même ligne, et
 /// celui de la référence CPU ; les cases sentinelles autour restent intactes.
+/// Rejoué en encodeur sériel et en encodeur concurrent sous le scope de
+/// barrières de production : les buffers partiels réutilisés entre lignes
+/// n'y tiennent que par les barrières.
 #[test]
 fn sample_rows_with_states_match_isolated_and_cpu() -> Result<()> {
     let executor = match MetalExecutor::new() {
@@ -4351,8 +4354,15 @@ fn sample_rows_with_states_match_isolated_and_cpu() -> Result<()> {
             let logits_buffer = executor.upload_f32_buffer(&logits, "rows_test_logits")?;
             let index_buffer =
                 executor.upload_u32_buffer(&vec![SENTINEL; rows + 2], "rows_test_index")?;
+            for concurrent in [false, true] {
             let command_buffer = executor.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
+            let _barrier_guard = concurrent.then(install_dispatch_barrier_scope);
+            let encoder = if concurrent {
+                command_buffer
+                    .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+            } else {
+                command_buffer.new_compute_command_encoder()
+            };
             executor.encode_sample_rows_with_states(
                 encoder,
                 &logits_buffer,
@@ -4365,6 +4375,7 @@ fn sample_rows_with_states_match_isolated_and_cpu() -> Result<()> {
             encoder.end_encoding();
             commit_and_wait(command_buffer)?;
             let out = read_u32_buffer(&index_buffer, rows + 2)?;
+            write_u32_buffer(&index_buffer, &vec![SENTINEL; rows + 2])?;
             assert_eq!(out[0], SENTINEL);
             assert_eq!(out[rows + 1], SENTINEL);
             for (row, &state) in states.iter().enumerate() {
@@ -4394,9 +4405,12 @@ fn sample_rows_with_states_match_isolated_and_cpu() -> Result<()> {
                     let mut sampler = crate::DeterministicSampler::new(state);
                     crate::sample_token_top_k_top_p(line, temperature, top_p, top_k, &mut sampler)?
                 };
-                let params = format!("T={temperature} top_p={top_p} top_k={top_k} seed={seed}");
+                let params = format!(
+                    "T={temperature} top_p={top_p} top_k={top_k} seed={seed} concurrent={concurrent}"
+                );
                 assert_eq!(out[row + 1], isolated, "ligne {row} {params}");
                 assert_eq!(out[row + 1] as usize, cpu, "ligne {row} {params}");
+            }
             }
         }
     }

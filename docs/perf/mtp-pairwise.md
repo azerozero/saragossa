@@ -951,9 +951,15 @@ contrôle négatif SpecInfer χ² = 31 752, sampler en lignes égal au sampler i
 et au CPU (profondeurs répétées, sentinelles). Modèle réel
 (`dflash_sampled_matches_ar_real_model`) : à T = 0,05 chaîne et arbre = AR ; à
 T = 0,7, top-p 0,9, top-k 20, 24 graines × 32 tokens sur code et prose, **96/96
-trajectoires identiques à l'AR** (chaîne et arbre B = 8) : le critère de marge de
-CDF au premier écart (0,02) n'a pas eu à servir. Acceptance des drafts : code
-606/724 (chaîne) et 613/690 (arbre), prose 337/744 et 385/712.
+trajectoires identiques à l'AR** (chaîne et arbre B = 8), identité exigée par
+le test (un écart échoue avec les probabilités des deux tokens sous l'AR et
+l'uniforme du tirage). Acceptance des drafts : code 606/724 (chaîne) et 613/690
+(arbre), prose 337/744 et 385/712. Arrêts sur les entrées de production
+(`dflash_sampled_stops_match_ar_real_model`, chaîne et arbre, 2 graines × 95
+cas : stop token à chacune des 24 positions, stop sequence de deux tokens à
+chaque position, callback et limite à chaque longueur) : tokens rendus et émis
+identiques à l'AR échantillonné. Le sampler en lignes est vérifié en encodeur
+sériel et concurrent sous le scope de barrières de production.
 
 Pairwise même binaire, T = 0,7, top-p 0,9, top-k 20, 400 tokens (stop tokens
 ignorés), cache de préfixe coupé, 3 tours d'ordre MTC / CTM / MTC, graine = tour.

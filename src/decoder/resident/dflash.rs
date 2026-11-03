@@ -1113,7 +1113,9 @@ struct DFlashTourState<'a, F> {
 /// échantillonnage permis) : le flag opt-in et des paramètres que le sampler
 /// GPU de l'AR sait tirer (sinon l'AR relit les logits et tire sur le CPU, et
 /// l'identité à graine fixée avec l'AR se perdrait).
-fn dflash_sampling_refusal(options: &GenerationOptions) -> Option<&'static str> {
+pub(in crate::decoder) fn dflash_sampling_refusal(
+    options: &GenerationOptions,
+) -> Option<&'static str> {
     if options.temperature <= f32::EPSILON {
         return None;
     }

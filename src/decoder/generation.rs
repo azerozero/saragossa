@@ -1317,10 +1317,9 @@ impl CausalDecoder {
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
         #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
         if let Some(draft) = self.dflash.as_ref() {
-            let sampled_ok = options.temperature <= f32::EPSILON
-                || (crate::runtime_flags::dflash_sampled_enabled()
-                    && super::resident::resident_sampling_on_device(options));
-            if sampled_ok && options.token_constraint.is_none() {
+            if super::resident::dflash::dflash_sampling_refusal(options).is_none()
+                && options.token_constraint.is_none()
+            {
                 return self.generate_greedy_dflash_then_mtp(
                     prompt,
                     max_new_tokens,
