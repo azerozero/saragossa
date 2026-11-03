@@ -766,8 +766,9 @@ pub(crate) fn prefill_moe_rows_enabled() -> bool {
 }
 
 /// Vérification résidente en lignes des couches full-attn MoE shared
-/// (`FullMoe`, Qwen3.5/3.6 MoE) : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Défaut OFF :
-/// ρ(2) = 1,83 mesuré sur le 35B (docs/perf/mtp-pairwise.md). Les couches
+/// (`FullMoe`, Qwen3.5/3.6 MoE) : `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1`. Défaut OFF.
+/// Sur le 35B, ρ(2) = 1,26 et ρ(3) = 1,36 depuis la queue MoE calquée sur le
+/// mono-ligne (1,83 et 1,85 avant, docs/perf/mtp-pairwise.md). Les couches
 /// `LinearMoe` restent sous `SARAGOSSA_RUST_PREFILL_MOE_ROWS`, comme avant.
 pub(crate) fn moe_verify_rows_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
