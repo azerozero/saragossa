@@ -1214,7 +1214,7 @@ mod tests {
         use super::super::{MtpHead, MtpLoadContext, MtpMoeQuant};
         use crate::decoder::CausalDecoderConfig;
         use crate::{FeedForward, InferError, LinearWeight, Tensor};
-        use safetensors::{tensor::TensorView, Dtype};
+        use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 
         const H: usize = 64;
         const I: usize = 64;
@@ -1323,33 +1323,52 @@ mod tests {
             load_in(tensors, quant, head_dim, &MtpLoadContext::cpu())
         }
 
-        fn load_in(
-            tensors: &[(String, Raw)],
-            quant: MtpMoeQuant,
-            head_dim: Option<usize>,
-            context: &MtpLoadContext<'_>,
-        ) -> crate::Result<MtpHead> {
-            let views = tensors
+        /// Tenseur typé d'un sidecar de test.
+        type Typed = (String, Dtype, Vec<usize>, Vec<u8>);
+
+        fn f32_typed(tensors: &[(String, Raw)]) -> Vec<Typed> {
+            tensors
                 .iter()
                 .map(|(name, (shape, bytes))| {
-                    TensorView::new(Dtype::F32, shape.clone(), bytes)
-                        .map(|view| (name.clone(), view))
+                    (name.clone(), Dtype::F32, shape.clone(), bytes.clone())
+                })
+                .collect()
+        }
+
+        fn write_sidecar(tensors: &[Typed]) -> tempfile::NamedTempFile {
+            let views = tensors
+                .iter()
+                .map(|(name, dtype, shape, bytes)| {
+                    TensorView::new(*dtype, shape.clone(), bytes).map(|view| (name.clone(), view))
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("invariant: vues safetensors valides");
             let buffer = safetensors::serialize(views, None).expect("invariant: sérialisation");
             let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
             std::fs::write(tmp.path(), buffer).expect("invariant: écriture sidecar");
-            let config = CausalDecoderConfig {
+            tmp
+        }
+
+        fn moe_config(head_dim: Option<usize>, experts: usize) -> CausalDecoderConfig {
+            CausalDecoderConfig {
                 attn_output_gate: true,
                 head_dim,
                 num_attention_heads: 4,
                 num_key_value_heads: 4,
-                num_experts: Some(E),
+                num_experts: Some(experts),
                 num_experts_per_tok: 2,
                 ..CausalDecoderConfig::default()
-            };
-            MtpHead::from_sidecar_with(tmp.path(), &config, H, context, quant)
+            }
+        }
+
+        fn load_in(
+            tensors: &[(String, Raw)],
+            quant: MtpMoeQuant,
+            head_dim: Option<usize>,
+            context: &MtpLoadContext<'_>,
+        ) -> crate::Result<MtpHead> {
+            let tmp = write_sidecar(&f32_typed(tensors));
+            MtpHead::from_sidecar_with(tmp.path(), &moe_config(head_dim, E), H, context, quant)
         }
 
         fn first(weight: &LinearWeight) -> Option<f32> {
@@ -1411,64 +1430,570 @@ mod tests {
             }
         }
 
-        /// Les experts quantifiés directement en Metal portent les mêmes codes
-        /// que la quantification CPU, et ses scales et minimums arrondis en bf16
-        /// (ce que lisaient déjà les kernels via `contiguous_metal_expert_stacks`).
+        /// Chemin Metal de la tête : quantification directe des experts,
+        /// single-copy des linéaires par `with_mtp_sidecar` et forward CPU
+        /// après conversion. Chaque test suit `RETI_RUST_SINGLE_COPY_WEIGHTS`
+        /// (mémorisé par processus) : coupé, la tête doit rester sur le CPU.
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        #[test]
-        fn metal_experts_match_cpu_quantization_in_bf16() -> crate::Result<()> {
-            let executor = match crate::MetalExecutor::new() {
-                Ok(executor) => executor,
-                Err(InferError::Metal(message)) if message.contains("aucun device") => {
-                    return Ok(())
+        mod metal {
+            use super::*;
+            use crate::decoder::mtp::{MTP_MOE_DOWN, MTP_MOE_MARKER, MTP_QUANT_GROUP};
+            use crate::decoder::{CausalDecoder, LayerKvCache};
+            use crate::runtime_flags::single_copy_weights_enabled;
+            use crate::{AffineQuantizedTensor, ForwardRuntime, Linear};
+            use std::collections::HashMap;
+
+            const H2: usize = 128;
+            const I2: usize = 192;
+            const E2: usize = 3;
+            const VOCAB: usize = 8;
+
+            fn executor() -> crate::Result<Option<crate::MetalExecutor>> {
+                match crate::MetalExecutor::new() {
+                    Ok(executor) => Ok(Some(executor)),
+                    Err(InferError::Metal(message)) if message.contains("aucun device") => Ok(None),
+                    Err(error) => Err(error),
                 }
-                Err(error) => return Err(error),
-            };
-            let tensors = moe_tensors();
-            let cpu = load_in(
-                &tensors,
-                MtpMoeQuant::Affine,
-                Some(16),
-                &MtpLoadContext::cpu(),
-            )?;
-            let metal = load_in(
-                &tensors,
-                MtpMoeQuant::Affine,
-                Some(16),
-                &MtpLoadContext::metal(&executor),
-            )?;
-            fn experts(head: &MtpHead) -> &[crate::GatedMlp] {
+            }
+
+            /// Arrondi bf16 au plus proche, égalités au pair, par comparaison
+            /// des deux voisins en f64 : indépendant de `bf16_bits`.
+            fn bf16_oracle(value: f32) -> f32 {
+                let bits = value.to_bits();
+                let low = f32::from_bits(bits & 0xffff_0000);
+                let high = f32::from_bits((bits & 0xffff_0000).wrapping_add(0x1_0000));
+                let to_low = (f64::from(value) - f64::from(low)).abs();
+                let to_high = (f64::from(high) - f64::from(value)).abs();
+                if to_low < to_high || (to_low == to_high && (bits >> 16) & 1 == 0) {
+                    low
+                } else {
+                    high
+                }
+            }
+
+            fn bf16_round_trip(value: f32) -> f32 {
+                f32::from_bits(u32::from(crate::quantization::bf16_bits(value)) << 16)
+            }
+
+            #[test]
+            fn bf16_bits_matches_independent_oracle_on_ties() {
+                // Égalités exactes : au pair, vers le bas puis vers le haut.
+                for (input, expected) in [
+                    (0x3F80_8000_u32, 0x3F80_u16),
+                    (0x3F81_8000, 0x3F82),
+                    (0xBF80_8000, 0xBF80),
+                    (0xBF81_8000, 0xBF82),
+                    (0x3F80_8001, 0x3F81),
+                    (0x3F80_7FFF, 0x3F80),
+                    (0x0000_8000, 0x0000),
+                    (0x0001_8000, 0x0002),
+                ] {
+                    let value = f32::from_bits(input);
+                    assert_eq!(
+                        crate::quantization::bf16_bits(value),
+                        expected,
+                        "{input:#x}"
+                    );
+                    assert_eq!(bf16_oracle(value).to_bits() >> 16, u32::from(expected));
+                }
+                // Balayage pseudo-aléatoire des valeurs finies.
+                let mut state = 0x9E37_79B9_u32;
+                for _ in 0..100_000 {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let value = f32::from_bits(state);
+                    // Voisin haut infini : débordement, hors du domaine de l'oracle.
+                    let high = f32::from_bits((state & 0xffff_0000).wrapping_add(0x1_0000));
+                    if value.is_finite() && high.is_finite() {
+                        assert_eq!(
+                            bf16_round_trip(value).to_bits(),
+                            bf16_oracle(value).to_bits(),
+                            "{state:#x}"
+                        );
+                    }
+                }
+            }
+
+            /// Valeur distincte par tenseur, expert, ligne et groupe de 64.
+            fn distinct(seed: usize, expert: usize, row: usize, col: usize) -> f32 {
+                let hash = (seed * 104_729 + expert * 7_919 + row * 131 + col * 17) % 1_009;
+                let group = col / MTP_QUANT_GROUP;
+                (hash as f32 / 1_009.0 - 0.5) * 0.05 * (1 + group) as f32 + 0.01 * expert as f32
+            }
+
+            /// Valeur bf16 stockée (troncature : c'est elle qui fait foi).
+            fn stored(value: f32) -> f32 {
+                f32::from_bits(value.to_bits() & 0xffff_0000)
+            }
+
+            fn bf16_bytes(len: usize, f: impl Fn(usize) -> f32) -> Vec<u8> {
+                (0..len)
+                    .flat_map(|i| ((f(i).to_bits() >> 16) as u16).to_le_bytes())
+                    .collect()
+            }
+
+            fn bf16_matrix(name: &str, seed: usize, rows: usize, cols: usize) -> Typed {
+                let bytes = bf16_bytes(rows * cols, |i| distinct(seed, 0, i / cols, i % cols));
+                (name.to_string(), Dtype::BF16, vec![rows, cols], bytes)
+            }
+
+            fn bf16_vector(name: &str, len: usize, value: f32) -> Typed {
+                (
+                    name.to_string(),
+                    Dtype::BF16,
+                    vec![len],
+                    bf16_bytes(len, |_| value),
+                )
+            }
+
+            /// Tête MoE bf16 non carrée : hidden 128 (2 groupes), intermédiaire
+            /// 192 (3 groupes), 3 experts, valeurs distinctes partout.
+            fn bf16_moe_tensors() -> Vec<Typed> {
+                let mut out = vec![
+                    bf16_matrix("mtp.fc.weight", 10, H2, 2 * H2),
+                    bf16_vector("mtp.pre_fc_norm_embedding.weight", H2, 0.25),
+                    bf16_vector("mtp.pre_fc_norm_hidden.weight", H2, 0.5),
+                    bf16_vector("mtp.norm.weight", H2, 0.875),
+                    bf16_vector("mtp.layers.0.input_layernorm.weight", H2, 0.0),
+                    bf16_vector("mtp.layers.0.post_attention_layernorm.weight", H2, 0.75),
+                    bf16_vector("mtp.layers.0.self_attn.q_norm.weight", 16, 0.625),
+                    bf16_vector("mtp.layers.0.self_attn.k_norm.weight", 16, 0.625),
+                    bf16_matrix("mtp.layers.0.self_attn.q_proj.weight", 11, 128, H2),
+                    bf16_matrix("mtp.layers.0.self_attn.k_proj.weight", 12, 64, H2),
+                    bf16_matrix("mtp.layers.0.self_attn.v_proj.weight", 13, 64, H2),
+                    bf16_matrix("mtp.layers.0.self_attn.o_proj.weight", 14, H2, 64),
+                    bf16_matrix("mtp.layers.0.mlp.gate.weight", 15, E2, H2),
+                    bf16_matrix("mtp.layers.0.mlp.shared_expert_gate.weight", 16, 1, H2),
+                    bf16_matrix(
+                        "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+                        17,
+                        I2,
+                        H2,
+                    ),
+                    bf16_matrix("mtp.layers.0.mlp.shared_expert.up_proj.weight", 18, I2, H2),
+                    bf16_matrix(
+                        "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+                        19,
+                        H2,
+                        I2,
+                    ),
+                ];
+                out.push((
+                    MTP_MOE_MARKER.to_string(),
+                    Dtype::BF16,
+                    vec![E2, 2 * I2, H2],
+                    bf16_bytes(E2 * 2 * I2 * H2, |i| {
+                        distinct(1, i / (2 * I2 * H2), (i / H2) % (2 * I2), i % H2)
+                    }),
+                ));
+                out.push((
+                    MTP_MOE_DOWN.to_string(),
+                    Dtype::BF16,
+                    vec![E2, H2, I2],
+                    bf16_bytes(E2 * H2 * I2, |i| {
+                        distinct(2, i / (H2 * I2), (i / I2) % H2, i % I2)
+                    }),
+                ));
+                out
+            }
+
+            /// Projection `projection` (gate, up, down) de l'expert `expert`,
+            /// recalculée depuis la formule du fixture, sans le sidecar.
+            fn expected_expert(projection: usize, expert: usize) -> crate::Result<Tensor> {
+                // (lignes, colonnes, graine, décalage de ligne dans `gate_up`).
+                let (rows, cols, seed, row_offset) = match projection {
+                    0 => (I2, H2, 1, 0),
+                    1 => (I2, H2, 1, I2),
+                    _ => (H2, I2, 2, 0),
+                };
+                let data = (0..rows * cols)
+                    .map(|i| stored(distinct(seed, expert, row_offset + i / cols, i % cols)))
+                    .collect();
+                Tensor::from_vec(vec![rows, cols], data)
+            }
+
+            fn routed(head: &MtpHead) -> &[crate::GatedMlp] {
                 match &head.layer.mlp {
                     FeedForward::Moe(moe) => moe.routed_parts_for_test().1,
                     FeedForward::Dense(_) => &[],
                 }
             }
-            let bf16 = |values: &[f32]| -> Vec<f32> {
+
+            type View = (usize, usize);
+
+            fn views(weight: &AffineQuantizedTensor) -> Option<[View; 3]> {
+                let view = |v: Option<(&::metal::Buffer, usize)>| {
+                    v.map(|(buffer, offset)| (buffer.contents() as usize, offset))
+                };
+                Some([
+                    view(weight.packed_metal_view())?,
+                    view(weight.scales_metal_view())?,
+                    view(weight.biases_metal_view())?,
+                ])
+            }
+
+            fn affine(linear: &Linear) -> &AffineQuantizedTensor {
+                linear
+                    .affine_quantized()
+                    .expect("invariant: linéaire quantifiée attendue")
+            }
+
+            /// Scales ou minimums attendus : arrondis bf16 en single-copy,
+            /// f32 du CPU sinon.
+            fn expected_params(values: &[f32], single_copy: bool) -> Vec<f32> {
                 values
                     .iter()
-                    .map(|&v| f32::from_bits(u32::from(crate::quantization::bf16_bits(v)) << 16))
+                    .map(|&v| if single_copy { bf16_oracle(v) } else { v })
                     .collect()
-            };
-            let (cpu_experts, metal_experts) = (experts(&cpu), experts(&metal));
-            assert_eq!((cpu_experts.len(), metal_experts.len()), (E, E));
-            for (cpu_mlp, metal_mlp) in cpu_experts.iter().zip(metal_experts) {
-                let (cg, cu, cd) = cpu_mlp.projections();
-                let (mg, mu, md) = metal_mlp.projections();
-                for (cpu_linear, metal_linear) in [(cg, mg), (cu, mu), (cd, md)] {
-                    let (Some(cpu_w), Some(metal_w)) = (
-                        cpu_linear.affine_quantized(),
-                        metal_linear.affine_quantized(),
-                    ) else {
-                        panic!("experts affines attendus");
-                    };
-                    assert!(cpu_w.packed_metal_view().is_none());
-                    assert!(metal_w.packed_metal_view().is_some());
-                    assert_eq!(metal_w.packed_data(), cpu_w.packed_data());
-                    assert_eq!(*metal_w.scales_f32(), *bf16(&cpu_w.scales_f32()));
-                    assert_eq!(*metal_w.biases_f32(), *bf16(&cpu_w.biases_f32()));
+            }
+
+            #[test]
+            fn bf16_experts_quantize_into_contiguous_metal_stacks() -> crate::Result<()> {
+                let Some(executor) = executor()? else {
+                    return Ok(());
+                };
+                let single_copy = single_copy_weights_enabled();
+                let tmp = write_sidecar(&bf16_moe_tensors());
+                let config = moe_config(Some(16), E2);
+                let load = |context: &MtpLoadContext<'_>| {
+                    MtpHead::from_sidecar_with(
+                        tmp.path(),
+                        &config,
+                        H2,
+                        context,
+                        MtpMoeQuant::Affine,
+                    )
+                };
+                let cpu = load(&MtpLoadContext::cpu())?;
+                let mut metal = load(&MtpLoadContext::metal(&executor))?;
+                assert_eq!((routed(&cpu).len(), routed(&metal).len()), (E2, E2));
+                let mut before = Vec::new();
+                for (expert, (cpu_mlp, metal_mlp)) in
+                    routed(&cpu).iter().zip(routed(&metal)).enumerate()
+                {
+                    let (cg, cu, cd) = cpu_mlp.projections();
+                    let (mg, mu, md) = metal_mlp.projections();
+                    for (projection, (cpu_linear, metal_linear)) in
+                        [(cg, mg), (cu, mu), (cd, md)].into_iter().enumerate()
+                    {
+                        let reference = AffineQuantizedTensor::quantize(
+                            &expected_expert(projection, expert)?,
+                            MTP_QUANT_GROUP,
+                            4,
+                        )?;
+                        let label = format!("expert {expert} projection {projection}");
+                        // Lecture paresseuse : offsets gate/up/down et stride exacts.
+                        let (cpu_w, metal_w) = (affine(cpu_linear), affine(metal_linear));
+                        assert_eq!(cpu_w.packed_data(), reference.packed_data(), "CPU {label}");
+                        assert_eq!(metal_w.packed_data(), reference.packed_data(), "{label}");
+                        assert_eq!(*cpu_w.scales_f32(), *reference.scales_f32(), "{label}");
+                        assert_eq!(
+                            *metal_w.scales_f32(),
+                            *expected_params(&reference.scales_f32(), single_copy),
+                            "scales {label}"
+                        );
+                        assert_eq!(
+                            *metal_w.biases_f32(),
+                            *expected_params(&reference.biases_f32(), single_copy),
+                            "minimums {label}"
+                        );
+                        assert!(views(cpu_w).is_none());
+                        match views(metal_w) {
+                            Some(view) => before.push((projection, expert, view, reference)),
+                            None => assert!(!single_copy, "vue Metal attendue {label}"),
+                        }
+                    }
+                }
+                if !single_copy {
+                    return Ok(());
+                }
+                // Stacks contigus : l'expert `e` suit le premier à e · stride
+                // dans le même buffer, ce qu'exige `contiguous_metal_expert_stacks`.
+                for (projection, expert, view, reference) in &before {
+                    let (_, _, first, _) = before
+                        .iter()
+                        .find(|(p, e, _, _)| p == projection && *e == 0)
+                        .expect("invariant: premier expert");
+                    let strides = [
+                        reference.packed_len() * 4,
+                        reference.scales_len() * 2,
+                        reference.biases_len() * 2,
+                    ];
+                    for ((got, start), stride) in view.iter().zip(first).zip(strides) {
+                        assert_eq!(got.0, start.0, "même buffer");
+                        assert_eq!(got.1, start.1 + expert * stride, "offset contigu");
+                    }
+                }
+                // La passe single-copy du décodeur ne recopie rien.
+                metal.move_packed_to_metal_shared(&executor)?;
+                let after: Vec<_> = routed(&metal)
+                    .iter()
+                    .flat_map(|mlp| {
+                        let (g, u, d) = mlp.projections();
+                        [g, u, d].map(|linear| views(affine(linear)))
+                    })
+                    .collect();
+                let mut expected: Vec<_> = before.iter().map(|b| (b.1, b.0, Some(b.2))).collect();
+                expected.sort_by_key(|(e, p, _)| (*e, *p));
+                assert_eq!(after, expected.into_iter().map(|e| e.2).collect::<Vec<_>>());
+                Ok(())
+            }
+
+            /// Tronc minimal sans MLP, à la largeur de la tête ; l'attention du
+            /// tronc ne tourne pas dans ces tests, d'où la config de la tête
+            /// posée après construction.
+            fn tiny_trunk(
+                hidden: usize,
+                experts: Option<usize>,
+            ) -> crate::Result<Option<CausalDecoder>> {
+                let matrix = |seed: usize, rows: usize, cols: usize| {
+                    let data = (0..rows * cols)
+                        .map(|i| distinct(seed, 0, i / cols, i % cols))
+                        .collect();
+                    Tensor::from_vec(vec![rows, cols], data)
+                };
+                let mut tensors = HashMap::new();
+                tensors.insert(
+                    "embed_tokens.weight".to_string(),
+                    matrix(30, VOCAB, hidden)?,
+                );
+                tensors.insert("lm_head.weight".to_string(), matrix(31, VOCAB, hidden)?);
+                tensors.insert(
+                    "layers.0.input_layernorm.weight".to_string(),
+                    Tensor::from_vec(vec![hidden], vec![1.0; hidden])?,
+                );
+                tensors.insert(
+                    "norm.weight".to_string(),
+                    Tensor::from_vec(vec![hidden], vec![1.0; hidden])?,
+                );
+                for (name, seed, rows, cols) in [
+                    ("q_proj", 32, 64, hidden),
+                    ("k_proj", 33, 64, hidden),
+                    ("v_proj", 34, 64, hidden),
+                    ("o_proj", 35, hidden, 64),
+                ] {
+                    tensors.insert(
+                        format!("layers.0.self_attn.{name}.weight"),
+                        matrix(seed, rows, cols)?,
+                    );
+                }
+                let config = CausalDecoderConfig {
+                    num_attention_heads: 4,
+                    num_key_value_heads: 4,
+                    head_dim: Some(16),
+                    ..CausalDecoderConfig::default()
+                };
+                let mut model = CausalDecoder::from_tensors(tensors, config)?;
+                model.config.attn_output_gate = true;
+                model.config.num_experts = experts;
+                model.config.num_experts_per_tok = 2;
+                match model.with_metal_runtime() {
+                    Ok(model) => Ok(Some(model)),
+                    Err(InferError::Metal(message)) if message.contains("aucun device") => Ok(None),
+                    Err(error) => Err(error),
                 }
             }
-            Ok(())
+
+            /// Linéaires quantifiées de la tête, dans un ordre fixe.
+            fn quantized_linears(head: &MtpHead) -> Vec<&Linear> {
+                let attention = &head.layer.attention;
+                let mut out = vec![&head.fc, &attention.q_proj, &attention.k_proj];
+                out.extend(attention.v_proj.as_ref());
+                out.push(&attention.o_proj);
+                match &head.layer.mlp {
+                    FeedForward::Moe(moe) => {
+                        let (router, _, _, shared, shared_gate) = moe
+                            .shared_metal_parts()
+                            .expect("invariant: MoE à expert partagé");
+                        let (g, u, d) = shared.projections();
+                        out.extend([router, g, u, d, shared_gate]);
+                    }
+                    FeedForward::Dense(mlp) => {
+                        let (g, u, d) = mlp.projections();
+                        out.extend([g, u, d]);
+                    }
+                }
+                out.retain(|linear| linear.affine_quantized().is_some());
+                out
+            }
+
+            fn cpu_forward(model: &CausalDecoder, head: &MtpHead) -> crate::Result<Vec<f32>> {
+                let hidden = model.final_norm.data().len();
+                let mut cache = LayerKvCache::default();
+                let mut out = Vec::new();
+                for (position, token) in [3_usize, 5].into_iter().enumerate() {
+                    let row = Tensor::row(
+                        (0..hidden)
+                            .map(|c| distinct(40 + position, 0, 0, c))
+                            .collect(),
+                    )?;
+                    let post = model.mtp_head_forward(
+                        head,
+                        &row,
+                        token,
+                        position,
+                        &mut cache,
+                        ForwardRuntime::cpu(),
+                    )?;
+                    out.extend_from_slice(post.data());
+                }
+                Ok(out)
+            }
+
+            /// Tête MoE par `with_mtp_sidecar` : fc, attention, routeur et expert
+            /// partagé passent en single-copy (codes inchangés, paramètres bf16),
+            /// et le forward CPU tourne sur les buffers partagés.
+            #[test]
+            fn with_mtp_sidecar_moves_moe_linears_and_cpu_forward_runs() -> crate::Result<()> {
+                let Some(model) = tiny_trunk(H, Some(E))? else {
+                    return Ok(());
+                };
+                let single_copy = single_copy_weights_enabled();
+                let tmp = write_sidecar(&f32_typed(&moe_tensors()));
+                let cpu_head = MtpHead::from_sidecar_with(
+                    tmp.path(),
+                    &model.config,
+                    H,
+                    &MtpLoadContext::cpu(),
+                    MtpMoeQuant::Affine,
+                )?;
+                let model = model.with_mtp_sidecar(tmp.path())?;
+                let head = model.mtp.as_ref().expect("invariant: tête chargée");
+                let (cpu_linears, linears) =
+                    (quantized_linears(&cpu_head), quantized_linears(head));
+                assert_eq!((cpu_linears.len(), linears.len()), (10, 10));
+                for (index, (cpu_linear, linear)) in cpu_linears.iter().zip(&linears).enumerate() {
+                    let (cpu_w, w) = (affine(cpu_linear), affine(linear));
+                    assert_eq!(w.packed_data(), cpu_w.packed_data(), "linéaire {index}");
+                    assert_eq!(
+                        *w.scales_f32(),
+                        *expected_params(&cpu_w.scales_f32(), single_copy),
+                        "linéaire {index}"
+                    );
+                    assert_eq!(views(w).is_some(), single_copy, "linéaire {index}");
+                }
+                let got = cpu_forward(&model, head)?;
+                let reference = cpu_forward(&model, &cpu_head)?;
+                let scale = reference.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+                assert!(got.iter().all(|v| v.is_finite()) && scale > 0.0);
+                let diff = got
+                    .iter()
+                    .zip(&reference)
+                    .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+                // Seul écart : scales et minimums arrondis en bf16 (2^-8 relatif).
+                assert!(
+                    diff <= 2e-2 * scale,
+                    "écart {diff} pour une échelle {scale}"
+                );
+                Ok(())
+            }
+
+            /// Linéaire OptiQ u4 gs64 sérialisée comme le sidecar du 27B :
+            /// codes `u32`, scales et minimums bf16.
+            fn optiq_linear(prefix: &str, seed: usize, rows: usize, cols: usize) -> Vec<Typed> {
+                let data = (0..rows * cols)
+                    .map(|i| distinct(seed, 0, i / cols, i % cols))
+                    .collect();
+                let dense =
+                    Tensor::from_vec(vec![rows, cols], data).expect("invariant: matrice dense");
+                let quant = AffineQuantizedTensor::quantize(&dense, MTP_QUANT_GROUP, 4)
+                    .expect("invariant: quantification");
+                let groups = cols / MTP_QUANT_GROUP;
+                let params = |values: &[f32]| {
+                    values
+                        .iter()
+                        .flat_map(|&v| crate::quantization::bf16_bits(v).to_le_bytes())
+                        .collect::<Vec<u8>>()
+                };
+                vec![
+                    (
+                        format!("{prefix}.weight"),
+                        Dtype::U32,
+                        vec![rows, cols / 8],
+                        quant
+                            .packed_data()
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                    ),
+                    (
+                        format!("{prefix}.scales"),
+                        Dtype::BF16,
+                        vec![rows, groups],
+                        params(&quant.scales_f32()),
+                    ),
+                    (
+                        format!("{prefix}.biases"),
+                        Dtype::BF16,
+                        vec![rows, groups],
+                        params(&quant.biases_f32()),
+                    ),
+                ]
+            }
+
+            /// Tête dense du 27B par `with_mtp_sidecar` : linéaires OptiQ en vues
+            /// Metal natives, fc bf16 dense, forward CPU identique au bit près à
+            /// la même tête chargée sur le CPU.
+            #[test]
+            fn with_mtp_sidecar_dense_27b_head_matches_cpu_load() -> crate::Result<()> {
+                let Some(model) = tiny_trunk(H, None)? else {
+                    return Ok(());
+                };
+                let single_copy = single_copy_weights_enabled();
+                let mut tensors = vec![
+                    bf16_matrix("mtp.fc.weight", 20, H, 2 * H),
+                    bf16_vector("mtp.pre_fc_norm_embedding.weight", H, 1.0),
+                    bf16_vector("mtp.pre_fc_norm_hidden.weight", H, 1.0),
+                    bf16_vector("mtp.norm.weight", H, 1.0),
+                    bf16_vector("mtp.layers.0.input_layernorm.weight", H, 1.0),
+                    bf16_vector("mtp.layers.0.post_attention_layernorm.weight", H, 1.0),
+                    bf16_vector("mtp.layers.0.self_attn.q_norm.weight", 16, 1.0),
+                    bf16_vector("mtp.layers.0.self_attn.k_norm.weight", 16, 1.0),
+                ];
+                for (name, seed, rows, cols) in [
+                    ("self_attn.q_proj", 21, 2 * H, H),
+                    ("self_attn.k_proj", 22, H, H),
+                    ("self_attn.v_proj", 23, H, H),
+                    ("self_attn.o_proj", 24, H, H),
+                    ("mlp.gate_proj", 25, I, H),
+                    ("mlp.up_proj", 26, I, H),
+                    ("mlp.down_proj", 27, H, I),
+                ] {
+                    tensors.extend(optiq_linear(
+                        &format!("mtp.layers.0.{name}"),
+                        seed,
+                        rows,
+                        cols,
+                    ));
+                }
+                let tmp = write_sidecar(&tensors);
+                let cpu_head = MtpHead::from_sidecar_with(
+                    tmp.path(),
+                    &model.config,
+                    H,
+                    &MtpLoadContext::cpu(),
+                    MtpMoeQuant::Affine,
+                )?;
+                let model = model.with_mtp_sidecar(tmp.path())?;
+                let head = model.mtp.as_ref().expect("invariant: tête chargée");
+                assert!(matches!(head.layer.mlp, FeedForward::Dense(_)));
+                assert!(matches!(head.fc.weight(), LinearWeight::Dense(_)));
+                let linears = quantized_linears(head);
+                assert_eq!(linears.len(), 7);
+                for (index, (cpu_linear, linear)) in quantized_linears(&cpu_head)
+                    .iter()
+                    .zip(&linears)
+                    .enumerate()
+                {
+                    let (cpu_w, w) = (affine(cpu_linear), affine(linear));
+                    assert_eq!(w.packed_data(), cpu_w.packed_data(), "linéaire {index}");
+                    assert_eq!(*w.scales_f32(), *cpu_w.scales_f32(), "linéaire {index}");
+                    assert_eq!(views(w).is_some(), single_copy, "linéaire {index}");
+                }
+                assert_eq!(cpu_forward(&model, head)?, cpu_forward(&model, &cpu_head)?);
+                Ok(())
+            }
         }
 
         #[test]
@@ -1520,6 +2045,91 @@ mod tests {
             let mut missing = moe_tensors();
             missing.retain(|(name, _)| name != "mtp.layers.0.mlp.experts.down_proj");
             assert!(load(&missing, MtpMoeQuant::Dense).is_err());
+        }
+
+        /// Header tronqué, longueur de header hors fichier, offsets invalides
+        /// et fichier raccourci : erreur, jamais de panique ni de pages à zéro
+        /// acceptées comme poids.
+        #[test]
+        fn partial_or_corrupt_sidecar_reads_are_errors() {
+            use super::super::LazySidecar;
+            use std::io::Write;
+
+            let config = moe_config(Some(16), E);
+            let load_path = |path: &std::path::Path| {
+                MtpHead::from_sidecar_with(
+                    path,
+                    &config,
+                    H,
+                    &MtpLoadContext::cpu(),
+                    MtpMoeQuant::Affine,
+                )
+            };
+            let write = |bytes: &[u8]| {
+                let mut tmp =
+                    tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+                tmp.write_all(bytes).expect("invariant: écriture");
+                tmp
+            };
+            let valid = std::fs::read(write_sidecar(&f32_typed(&moe_tensors())).path())
+                .expect("invariant: lecture sidecar");
+            let header_len = usize::try_from(u64::from_le_bytes(
+                valid[..8].try_into().expect("invariant: 8 octets"),
+            ))
+            .expect("invariant: header usize");
+
+            // Moins de 8 octets : pas même la longueur du header.
+            assert!(load_path(write(&valid[..4]).path()).is_err());
+            // Header annoncé plus long que le fichier.
+            let mut huge = valid.clone();
+            huge[..8].copy_from_slice(&(valid.len() as u64).to_le_bytes());
+            assert!(load_path(write(&huge).path()).is_err());
+            // Header coupé en plein JSON.
+            assert!(load_path(write(&valid[..8 + header_len / 2]).path()).is_err());
+            // Données tronquées : les offsets ne couvrent plus le fichier.
+            assert!(load_path(write(&valid[..valid.len() - 16]).path()).is_err());
+            // Offsets invalides : un tenseur annonce une fin au-delà des données.
+            let header =
+                std::str::from_utf8(&valid[8..8 + header_len]).expect("invariant: header UTF-8");
+            let data_len = valid.len() - 8 - header_len;
+            let needle = format!(",{data_len}]");
+            assert!(
+                header.contains(&needle),
+                "fin des données attendue dans le header"
+            );
+            let bad = header.replacen(&needle, &format!(",{}]", data_len + 64), 1);
+            let mut corrupt = Vec::new();
+            corrupt.extend_from_slice(&(bad.len() as u64).to_le_bytes());
+            corrupt.extend_from_slice(bad.as_bytes());
+            corrupt.extend_from_slice(&valid[8 + header_len..]);
+            assert!(load_path(write(&corrupt).path()).is_err());
+
+            // Fichier raccourci après l'ouverture, avant la lecture d'un expert.
+            let tmp = write(&valid);
+            let sidecar = LazySidecar::open(tmp.path()).expect("invariant: sidecar valide");
+            let st = SafeTensors::deserialize(&sidecar.bytes).expect("invariant: header valide");
+            let resolve: std::collections::HashMap<String, String> = st
+                .names()
+                .into_iter()
+                .map(|name| {
+                    (
+                        super::super::normalize_mtp_sidecar_key(name),
+                        name.to_string(),
+                    )
+                })
+                .collect();
+            let offset = sidecar
+                .data_offset(&resolve, super::super::MTP_MOE_MARKER)
+                .expect("invariant: offset des experts");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(tmp.path())
+                .and_then(|file| file.set_len(offset as u64 + 8))
+                .expect("invariant: troncature");
+            assert!(
+                sidecar.read(offset, 64).is_err(),
+                "pages absentes lues comme zéro"
+            );
         }
     }
 }
