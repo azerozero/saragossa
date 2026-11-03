@@ -920,6 +920,63 @@ de 5-6 %) : le comportement actuel est conservé. Une bascule par acceptance
 récupérerait les pertes, mais son re-prefill coûte cher à long contexte sans
 cache de préfixe.
 
+### DFlash échantillonné, chaîne et arbre (3 nov. 2026, opt-in)
+
+`SARAGOSSA_RUST_DFLASH_SAMPLED=1` (défaut 0) route les requêtes à température > 0
+vers le drafter DFlash quand le sampler GPU de l'AR sait tirer leurs paramètres
+(top_k de 1 à 32, ou top_k = 0 et top_p = 1) ; sinon elles gardent la tête MTP.
+La tête de vérification `Sample` tire chaque ligne sur le GPU avec le sampler de
+l'AR (Gumbel ou top-k/top-p) et l'aléa du token qu'elle produirait : la ligne de
+profondeur d d'un tour ouvert après `n` tokens tire avec l'état du tirage `n + d`
+(`rng_state_for_draw`). Le parcours greedy, inchangé, descend vers l'enfant égal
+au tirage ; une feuille, un rejet ou un stop token accepté donne le `pending`.
+
+Exactitude : l'arbre d'un tour ne dépend que des tokens déjà commis, et le nœud
+visité à la profondeur d est fixé par les tirages d'indice < n + d avant que le
+tirage n + d soit lu ; ce tirage suit donc p(· | préfixe), comme dans l'AR. À
+logits identiques, la sortie est celle de l'AR échantillonné de même graine,
+arrêts compris (l'indépendance des aléas SplitMix64 reste une hypothèse du
+modèle, pas une propriété démontrée). La probabilité de poursuivre sous un nœud
+vaut p(S \ stops) pour ses enfants S, le maximum pour un arbre fixé. Le rejet
+récursif SpecInfer (résidu (p − q)+) supposerait des enfants tirés de q : sur
+les enfants déterministes du best-first il biaise la loi (contrôle négatif). La
+bascule MTP reste refusée à T > 0 : elle rejouerait les aléas déjà consommés.
+
+Oracles : identité stricte avec l'AR sur cible synthétique (stop token, stop
+sequence, callback et limite en milieu de tour, chaîne et B = 1 à 15, rejets
+racine, acceptations profondes, bonus de feuille et enfants non premiers
+couverts), χ² de la loi jointe des 3 premiers tokens sur 100 000 graines (180
+pour 204 ddl en loi complète, 13 pour 13 ddl en top-k 3 / top-p 0,9, seuil 300),
+contrôle négatif SpecInfer χ² = 31 752, sampler en lignes égal au sampler isolé
+et au CPU (profondeurs répétées, sentinelles). Modèle réel
+(`dflash_sampled_matches_ar_real_model`) : à T = 0,05 chaîne et arbre = AR ; à
+T = 0,7, top-p 0,9, top-k 20, 24 graines × 32 tokens sur code et prose, **96/96
+trajectoires identiques à l'AR** (chaîne et arbre B = 8) : le critère de marge de
+CDF au premier écart (0,02) n'a pas eu à servir. Acceptance des drafts : code
+606/724 (chaîne) et 613/690 (arbre), prose 337/744 et 385/712.
+
+Pairwise même binaire, T = 0,7, top-p 0,9, top-k 20, 400 tokens (stop tokens
+ignorés), cache de préfixe coupé, 3 tours d'ordre MTC / CTM / MTC, graine = tour.
+M = MTP échantillonné (défaut), T = arbre B = 8, C = chaîne. Médianes (tok/s de
+decode, tokens par tour ou par cycle MTP) et gain médian par tour :
+
+| Cas | M | C | T | T/M | C/M | T/C | tokens/tour M · C · T |
+|---|---|---|---|---|---|---|---|
+| code 4k | 33,2 | 45,2 | 51,5 | +54,9 % | +30,7 % | +10,3 % | 2,21 · 3,42 · 3,85 |
+| prose 4k | 31,6 | 37,5 | 43,5 | +38,3 % | +19,4 % | +15,8 % | 2,03 · 2,84 · 3,23 |
+| code 32k | 29,9 | 42,6 | 47,9 | +69,7 % | +50,7 % | +17,4 % | 2,16 · 3,45 · 3,77 |
+| prose 32k | 29,2 | 38,7 | 45,2 | +53,1 % | +35,1 % | +13,4 % | 2,03 · 3,13 · 3,57 |
+
+Les trois tours de chaque cas vont dans le même sens. Vérification par tour :
+65-66 ms (arbre, 9 lignes) contre 67-68 ms (chaîne du bloc complet) à 4k, 67-71
+contre 72 ms à 32k. L'arm MTP n'est pas couplé par graine aux deux autres (il
+consomme des aléas pour ses drafts, l'acceptation et le résidu) : ses textes
+diffèrent, ceux de C et T suivent l'AR. Avec top-k 20, le MTP échantillonné
+passe par la distribution par paires (tri CPU du vocabulaire par ligne) et ne
+dépasse guère l'AR (~32 tok/s, non remesuré ici) : une part de l'écart T/M vient
+de ce chemin. Le flag reste opt-in ; le passer par défaut avec un drafter
+configuré demande la même mesure à top-k 0 / top-p 1 (Gumbel) et sur `serve`.
+
 ## Vérification MoE en lignes et lookup sans tête MTP (Qwen3.6-35B-A3B)
 
 2 novembre, Qwen3.6-35B-A3B 4 bits (mlx-community, sans tête MTP dans les
