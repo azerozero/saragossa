@@ -12,6 +12,79 @@ enum MtpDraftResident {
     Logits(Vec<f32>),
 }
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl ResidentMtpLayer {
+    /// Encode la couche de la tête sur une ligne : seul point de dispatch
+    /// dense/MoE de tous les cycles MTP (draft, historique, oracles).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mêmes entrées que les encodeurs mono-ligne du tronc"
+    )]
+    pub(in crate::decoder) fn encode(
+        &self,
+        state: &DecodeResidentState,
+        metal: &MetalExecutor,
+        encoder: &metal::ComputeCommandEncoderRef,
+        owned: &mut Vec<metal::Buffer>,
+        kv: &mut FullAttentionMetalState,
+        dense_tail_score: &metal::Buffer,
+        dims: FullAttnLayerDims,
+        layer_in: &metal::BufferRef,
+        layer_out: &metal::BufferRef,
+    ) -> Result<()> {
+        match self {
+            Self::Dense(layer) => {
+                let weights = FullAttnDenseLayerWeights {
+                    input_norm: &layer.input_norm,
+                    qkv_proj: layer.qkv_proj.as_ref(),
+                    qkv_proj_without_gate: false,
+                    value_norm: layer.value_norm,
+                    q_proj: &layer.q_proj,
+                    k_proj: &layer.k_proj,
+                    v_proj: &layer.v_proj,
+                    o_proj: &layer.o_proj,
+                    q_norm: &layer.q_norm,
+                    k_norm: &layer.k_norm,
+                    post_norm: &layer.post_norm,
+                    pre_feedforward_norm: layer.pre_feedforward_norm.as_ref(),
+                    post_feedforward_norm: layer.post_feedforward_norm.as_ref(),
+                    layer_scalar: layer.layer_scalar,
+                    gate_proj: &layer.gate_proj,
+                    up_proj: &layer.up_proj,
+                    down_proj: &layer.down_proj,
+                    tail_score: dense_tail_score,
+                    parallel_moe: layer.parallel_moe_weights(),
+                    sigmoid_moe: None,
+                };
+                state.encode_full_attn_dense_layer(
+                    metal, encoder, owned, kv, weights, dims, layer_in, layer_out,
+                )
+            }
+            Self::Moe(layer) => {
+                let weights = FullAttnLayerWeights {
+                    input_norm: &layer.input_norm,
+                    qkv_proj: layer.qkv_proj.as_ref(),
+                    q_proj: &layer.q_proj,
+                    k_proj: &layer.k_proj,
+                    v_proj: &layer.v_proj,
+                    o_proj: &layer.o_proj,
+                    q_norm: &layer.q_norm,
+                    k_norm: &layer.k_norm,
+                    post_norm: &layer.post_norm,
+                    pre_feedforward_norm: layer.pre_feedforward_norm.as_ref(),
+                    post_feedforward_norm: layer.post_feedforward_norm.as_ref(),
+                    layer_scalar: layer.layer_scalar,
+                    moe: &layer.moe,
+                    top_k: layer.top_k,
+                };
+                state.encode_full_attn_layer(
+                    metal, encoder, owned, kv, weights, dims, layer_in, layer_out,
+                )
+            }
+        }
+    }
+}
+
 impl CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     fn reset_mtp_append_oracle(mtp: &mut ResidentMtpArena) {
@@ -351,7 +424,7 @@ impl CausalDecoder {
         pre_fc_norm_embedding: &metal::Buffer,
         pre_fc_norm_hidden: &metal::Buffer,
         fc: &MetalLinearWeightBuffers,
-        layer: &ResidentFullDenseBuffers,
+        layer: &ResidentMtpLayer,
         hidden_rows: &GpuTensor,
         token_indices: &GpuTensor,
         kv: &mut FullAttentionMetalState,
@@ -455,38 +528,18 @@ impl CausalDecoder {
                     "MTP oracle fc sort {fc_dim}, attendu {hidden}"
                 )));
             }
-            let weights = FullAttnDenseLayerWeights {
-                input_norm: &layer.input_norm,
-                qkv_proj: layer.qkv_proj.as_ref(),
-                qkv_proj_without_gate: false,
-                value_norm: layer.value_norm,
-                q_proj: &layer.q_proj,
-                k_proj: &layer.k_proj,
-                v_proj: &layer.v_proj,
-                o_proj: &layer.o_proj,
-                q_norm: &layer.q_norm,
-                k_norm: &layer.k_norm,
-                post_norm: &layer.post_norm,
-                pre_feedforward_norm: layer.pre_feedforward_norm.as_ref(),
-                post_feedforward_norm: layer.post_feedforward_norm.as_ref(),
-                layer_scalar: layer.layer_scalar,
-                gate_proj: &layer.gate_proj,
-                up_proj: &layer.up_proj,
-                down_proj: &layer.down_proj,
-                tail_score: dense_tail_score,
-                parallel_moe: layer.parallel_moe_weights(),
-                sigmoid_moe: None,
-            };
+
             let mut row_dims = dims;
             row_dims.position = start_position.checked_add(row).ok_or_else(|| {
                 InferError::Dimension("MTP oracle append position déborde".to_string())
             })?;
-            state.encode_full_attn_dense_layer(
+            layer.encode(
+                state,
                 metal,
                 encoder,
                 owned,
                 kv,
-                weights,
+                dense_tail_score,
                 row_dims,
                 fc_out.tensor().buffer(),
                 layer_out.tensor().buffer(),
@@ -745,28 +798,7 @@ impl CausalDecoder {
                     "MTP fc sort {fc_dim}, attendu {hidden}"
                 )));
             }
-            let weights = FullAttnDenseLayerWeights {
-                input_norm: &mtp.layer.input_norm,
-                qkv_proj: mtp.layer.qkv_proj.as_ref(),
-                qkv_proj_without_gate: false,
-                value_norm: mtp.layer.value_norm,
-                q_proj: &mtp.layer.q_proj,
-                k_proj: &mtp.layer.k_proj,
-                v_proj: &mtp.layer.v_proj,
-                o_proj: &mtp.layer.o_proj,
-                q_norm: &mtp.layer.q_norm,
-                k_norm: &mtp.layer.k_norm,
-                post_norm: &mtp.layer.post_norm,
-                pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
-                post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
-                layer_scalar: mtp.layer.layer_scalar,
-                gate_proj: &mtp.layer.gate_proj,
-                up_proj: &mtp.layer.up_proj,
-                down_proj: &mtp.layer.down_proj,
-                tail_score: &arena.dense_tail_score,
-                parallel_moe: mtp.layer.parallel_moe_weights(),
-                sigmoid_moe: None,
-            };
+
             let dims = FullAttnLayerDims {
                 hidden,
                 q_heads,
@@ -781,12 +813,13 @@ impl CausalDecoder {
                 theta,
                 attn_output_gate: self.config.attn_output_gate,
             };
-            arena.state.encode_full_attn_dense_layer(
+            mtp.layer.encode(
+                &arena.state,
                 metal,
                 encoder_guard.encoder(),
                 &mut owned,
                 &mut mtp.kv,
-                weights,
+                &arena.dense_tail_score,
                 dims,
                 mtp.fc_out.buffer(),
                 layer_out.tensor().buffer(),
@@ -961,28 +994,7 @@ impl CausalDecoder {
                 "MTP fc sort {fc_dim}, attendu {hidden}"
             )));
         }
-        let weights = FullAttnDenseLayerWeights {
-            input_norm: &mtp.layer.input_norm,
-            qkv_proj: mtp.layer.qkv_proj.as_ref(),
-            qkv_proj_without_gate: false,
-            value_norm: mtp.layer.value_norm,
-            q_proj: &mtp.layer.q_proj,
-            k_proj: &mtp.layer.k_proj,
-            v_proj: &mtp.layer.v_proj,
-            o_proj: &mtp.layer.o_proj,
-            q_norm: &mtp.layer.q_norm,
-            k_norm: &mtp.layer.k_norm,
-            post_norm: &mtp.layer.post_norm,
-            pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
-            post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
-            layer_scalar: mtp.layer.layer_scalar,
-            gate_proj: &mtp.layer.gate_proj,
-            up_proj: &mtp.layer.up_proj,
-            down_proj: &mtp.layer.down_proj,
-            tail_score: &arena.dense_tail_score,
-            parallel_moe: mtp.layer.parallel_moe_weights(),
-            sigmoid_moe: None,
-        };
+
         let dims = FullAttnLayerDims {
             hidden,
             q_heads,
@@ -997,12 +1009,13 @@ impl CausalDecoder {
             theta,
             attn_output_gate: self.config.attn_output_gate,
         };
-        arena.state.encode_full_attn_dense_layer(
+        mtp.layer.encode(
+            &arena.state,
             metal,
             encoder,
             &mut owned,
             &mut mtp.kv,
-            weights,
+            &arena.dense_tail_score,
             dims,
             mtp.fc_out.buffer(),
             layer_out.tensor().buffer(),
@@ -1199,28 +1212,7 @@ impl CausalDecoder {
                     "MTP fc sort {fc_dim}, attendu {hidden}"
                 )));
             }
-            let weights = FullAttnDenseLayerWeights {
-                input_norm: &mtp.layer.input_norm,
-                qkv_proj: mtp.layer.qkv_proj.as_ref(),
-                qkv_proj_without_gate: false,
-                value_norm: mtp.layer.value_norm,
-                q_proj: &mtp.layer.q_proj,
-                k_proj: &mtp.layer.k_proj,
-                v_proj: &mtp.layer.v_proj,
-                o_proj: &mtp.layer.o_proj,
-                q_norm: &mtp.layer.q_norm,
-                k_norm: &mtp.layer.k_norm,
-                post_norm: &mtp.layer.post_norm,
-                pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
-                post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
-                layer_scalar: mtp.layer.layer_scalar,
-                gate_proj: &mtp.layer.gate_proj,
-                up_proj: &mtp.layer.up_proj,
-                down_proj: &mtp.layer.down_proj,
-                tail_score: &arena.dense_tail_score,
-                parallel_moe: mtp.layer.parallel_moe_weights(),
-                sigmoid_moe: None,
-            };
+
             let dims = FullAttnLayerDims {
                 hidden,
                 q_heads,
@@ -1237,12 +1229,13 @@ impl CausalDecoder {
                 theta,
                 attn_output_gate: self.config.attn_output_gate,
             };
-            arena.state.encode_full_attn_dense_layer(
+            mtp.layer.encode(
+                &arena.state,
                 metal,
                 encoder_guard.encoder(),
                 &mut owned,
                 &mut mtp.kv,
-                weights,
+                &arena.dense_tail_score,
                 dims,
                 mtp.fc_out.buffer(),
                 layer_out.tensor().buffer(),
@@ -1356,27 +1349,9 @@ impl CausalDecoder {
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
         };
-        let trunk_batch_supported = self.layers.iter().enumerate().all(|(index, layer)| {
-            match (
-                self.config.is_resident_full_attention_layer(index),
-                layer.mlp.as_ref(),
-            ) {
-                (true, Some(FeedForward::Dense(_))) => {
-                    matches!(
-                        arena.layers.get(index),
-                        Some(ResidentLayerBuffers::FullDense(_))
-                    )
-                }
-                (false, Some(FeedForward::Dense(_))) => {
-                    matches!(
-                        arena.layers.get(index),
-                        Some(ResidentLayerBuffers::LinearDense(_))
-                    )
-                }
-                _ => false,
-            }
-        });
-        if !trunk_batch_supported {
+        // Tronc dense, ou MoE sous `MOE_VERIFY_ROWS` et `PREFILL_MOE_ROWS` :
+        // même contrat que le vérifieur général en lignes.
+        if !self.resident_layer_batch_supported(arena) {
             return Ok(None);
         }
         let Some(mtp) = arena.mtp.as_mut() else {
@@ -1539,28 +1514,7 @@ impl CausalDecoder {
                     "MTP fc sort {fc_dim}, attendu {hidden}"
                 )));
             }
-            let weights = FullAttnDenseLayerWeights {
-                input_norm: &mtp.layer.input_norm,
-                qkv_proj: mtp.layer.qkv_proj.as_ref(),
-                qkv_proj_without_gate: false,
-                value_norm: mtp.layer.value_norm,
-                q_proj: &mtp.layer.q_proj,
-                k_proj: &mtp.layer.k_proj,
-                v_proj: &mtp.layer.v_proj,
-                o_proj: &mtp.layer.o_proj,
-                q_norm: &mtp.layer.q_norm,
-                k_norm: &mtp.layer.k_norm,
-                post_norm: &mtp.layer.post_norm,
-                pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
-                post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
-                layer_scalar: mtp.layer.layer_scalar,
-                gate_proj: &mtp.layer.gate_proj,
-                up_proj: &mtp.layer.up_proj,
-                down_proj: &mtp.layer.down_proj,
-                tail_score: &arena.dense_tail_score,
-                parallel_moe: mtp.layer.parallel_moe_weights(),
-                sigmoid_moe: None,
-            };
+
             let dims = FullAttnLayerDims {
                 hidden,
                 q_heads,
@@ -1575,12 +1529,13 @@ impl CausalDecoder {
                 theta,
                 attn_output_gate: self.config.attn_output_gate,
             };
-            arena.state.encode_full_attn_dense_layer(
+            mtp.layer.encode(
+                &arena.state,
                 metal,
                 encoder_guard.encoder(),
                 &mut owned,
                 &mut mtp.kv,
-                weights,
+                &arena.dense_tail_score,
                 dims,
                 mtp.fc_out.buffer(),
                 layer_out.tensor().buffer(),
@@ -1680,7 +1635,7 @@ impl CausalDecoder {
                     eps,
                     theta,
                 )?;
-                self.encode_resident_full_dense_layer_rows(
+                self.encode_resident_full_any_layer_rows(
                     metal,
                     arena,
                     layer_cache,
@@ -1710,7 +1665,7 @@ impl CausalDecoder {
                     .and_then(|(captures, _)| captures.get(index))
                     .and_then(|captures| captures.as_ref())
                     .map(Vec::as_slice);
-                self.encode_resident_linear_dense_layer_rows(
+                self.encode_resident_linear_any_layer_rows(
                     metal,
                     arena,
                     layer_cache,
@@ -1842,28 +1797,7 @@ impl CausalDecoder {
                     "MTP fc sort {fc_dim}, attendu {hidden}"
                 )));
             }
-            let weights = FullAttnDenseLayerWeights {
-                input_norm: &mtp.layer.input_norm,
-                qkv_proj: mtp.layer.qkv_proj.as_ref(),
-                qkv_proj_without_gate: false,
-                value_norm: mtp.layer.value_norm,
-                q_proj: &mtp.layer.q_proj,
-                k_proj: &mtp.layer.k_proj,
-                v_proj: &mtp.layer.v_proj,
-                o_proj: &mtp.layer.o_proj,
-                q_norm: &mtp.layer.q_norm,
-                k_norm: &mtp.layer.k_norm,
-                post_norm: &mtp.layer.post_norm,
-                pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
-                post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
-                layer_scalar: mtp.layer.layer_scalar,
-                gate_proj: &mtp.layer.gate_proj,
-                up_proj: &mtp.layer.up_proj,
-                down_proj: &mtp.layer.down_proj,
-                tail_score: &arena.dense_tail_score,
-                parallel_moe: mtp.layer.parallel_moe_weights(),
-                sigmoid_moe: None,
-            };
+
             let dims = FullAttnLayerDims {
                 hidden,
                 q_heads,
@@ -1880,12 +1814,13 @@ impl CausalDecoder {
                 theta,
                 attn_output_gate: self.config.attn_output_gate,
             };
-            arena.state.encode_full_attn_dense_layer(
+            mtp.layer.encode(
+                &arena.state,
                 metal,
                 encoder_guard.encoder(),
                 &mut owned,
                 &mut mtp.kv,
-                weights,
+                &arena.dense_tail_score,
                 dims,
                 mtp.fc_out.buffer(),
                 layer_out.tensor().buffer(),
@@ -2064,27 +1999,9 @@ impl CausalDecoder {
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
         };
-        let trunk_batch_supported = self.layers.iter().enumerate().all(|(index, layer)| {
-            match (
-                self.config.is_resident_full_attention_layer(index),
-                layer.mlp.as_ref(),
-            ) {
-                (true, Some(FeedForward::Dense(_))) => {
-                    matches!(
-                        arena.layers.get(index),
-                        Some(ResidentLayerBuffers::FullDense(_))
-                    )
-                }
-                (false, Some(FeedForward::Dense(_))) => {
-                    matches!(
-                        arena.layers.get(index),
-                        Some(ResidentLayerBuffers::LinearDense(_))
-                    )
-                }
-                _ => false,
-            }
-        });
-        if !trunk_batch_supported {
+        // Tronc dense, ou MoE sous `MOE_VERIFY_ROWS` et `PREFILL_MOE_ROWS` :
+        // même contrat que le vérifieur général en lignes.
+        if !self.resident_layer_batch_supported(arena) {
             return Ok(None);
         }
         let Some(mtp) = arena.mtp.as_mut() else {
@@ -2282,28 +2199,7 @@ impl CausalDecoder {
                         "MTP fc sort {fc_dim}, attendu {hidden}"
                     )));
                 }
-                let weights = FullAttnDenseLayerWeights {
-                    input_norm: &mtp.layer.input_norm,
-                    qkv_proj: mtp.layer.qkv_proj.as_ref(),
-                    qkv_proj_without_gate: false,
-                    value_norm: mtp.layer.value_norm,
-                    q_proj: &mtp.layer.q_proj,
-                    k_proj: &mtp.layer.k_proj,
-                    v_proj: &mtp.layer.v_proj,
-                    o_proj: &mtp.layer.o_proj,
-                    q_norm: &mtp.layer.q_norm,
-                    k_norm: &mtp.layer.k_norm,
-                    post_norm: &mtp.layer.post_norm,
-                    pre_feedforward_norm: mtp.layer.pre_feedforward_norm.as_ref(),
-                    post_feedforward_norm: mtp.layer.post_feedforward_norm.as_ref(),
-                    layer_scalar: mtp.layer.layer_scalar,
-                    gate_proj: &mtp.layer.gate_proj,
-                    up_proj: &mtp.layer.up_proj,
-                    down_proj: &mtp.layer.down_proj,
-                    tail_score: &arena.dense_tail_score,
-                    parallel_moe: mtp.layer.parallel_moe_weights(),
-                    sigmoid_moe: None,
-                };
+
                 let dims = FullAttnLayerDims {
                     hidden,
                     q_heads,
@@ -2320,12 +2216,13 @@ impl CausalDecoder {
                     theta,
                     attn_output_gate: self.config.attn_output_gate,
                 };
-                arena.state.encode_full_attn_dense_layer(
+                mtp.layer.encode(
+                    &arena.state,
                     metal,
                     encoder_guard.encoder(),
                     &mut owned,
                     &mut mtp.kv,
-                    weights,
+                    &arena.dense_tail_score,
                     dims,
                     mtp.fc_out.buffer(),
                     layer_out.tensor().buffer(),
@@ -2448,7 +2345,7 @@ impl CausalDecoder {
                     eps,
                     theta,
                 )?;
-                self.encode_resident_full_dense_layer_rows(
+                self.encode_resident_full_any_layer_rows(
                     metal,
                     arena,
                     layer_cache,
@@ -2478,7 +2375,7 @@ impl CausalDecoder {
                     .and_then(|(captures, _)| captures.get(index))
                     .and_then(|captures| captures.as_ref())
                     .map(Vec::as_slice);
-                self.encode_resident_linear_dense_layer_rows(
+                self.encode_resident_linear_any_layer_rows(
                     metal,
                     arena,
                     layer_cache,

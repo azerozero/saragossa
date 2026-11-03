@@ -101,7 +101,7 @@ impl MtpHead {
             resolve.contains_key(MTP_DENSE_MARKER),
             resolve.contains_key(MTP_MOE_MARKER),
         ) {
-            (true, false) => Self::dense_from_tensors(&st, &resolve, context),
+            (true, false) => Self::dense_from_tensors(&st, &resolve, config, context),
             (false, true) => Self::moe_from_tensors(&st, &resolve, config, context, moe_quant),
             (true, true) => Err(InferError::Config(
                 "sidecar MTP ambigu : MLP dense et experts MoE présents".to_string(),
@@ -117,6 +117,7 @@ impl MtpHead {
     fn dense_from_tensors(
         st: &SafeTensors,
         resolve: &HashMap<String, String>,
+        config: &CausalDecoderConfig,
         context: &MtpLoadContext<'_>,
     ) -> Result<Self> {
         let norms = MtpNorms::load(st, resolve, MtpNormConvention::MeanHeuristic)?;
@@ -130,6 +131,7 @@ impl MtpHead {
             ],
             norms.q_norm.clone(),
             norms.k_norm.clone(),
+            config,
         );
         let mlp = FeedForward::Dense(Box::new(GatedMlp::new(
             load_mtp_linear(st, resolve, "mtp.layers.0.mlp.gate_proj", context)?,
@@ -158,16 +160,20 @@ impl MtpHead {
         let linear = |prefix: &str, bits: usize| -> Result<Linear> {
             quantize_mtp_linear(load_mtp_linear(st, resolve, prefix, context)?, quant, bits)
         };
-        let fc = linear("mtp.fc", 4)?;
+        // fc et attention en u8 : +18 Mio par draft (≈ 40 µs) contre 1,5 point
+        // d'accord perdu en u4 (porte G1, 1200 positions) ; experts et
+        // expert partagé en u4, format du stack MoE résident.
+        let fc = linear("mtp.fc", 8)?;
         let attention = mtp_attention(
             [
-                linear("mtp.layers.0.self_attn.q_proj", 4)?,
-                linear("mtp.layers.0.self_attn.k_proj", 4)?,
-                linear("mtp.layers.0.self_attn.v_proj", 4)?,
-                linear("mtp.layers.0.self_attn.o_proj", 4)?,
+                linear("mtp.layers.0.self_attn.q_proj", 8)?,
+                linear("mtp.layers.0.self_attn.k_proj", 8)?,
+                linear("mtp.layers.0.self_attn.v_proj", 8)?,
+                linear("mtp.layers.0.self_attn.o_proj", 8)?,
             ],
             norms.q_norm.clone(),
             norms.k_norm.clone(),
+            config,
         );
         let (gate_weights, up_weights, down_weights) = load_mtp_fused_experts(st, resolve, quant)?;
         let expert_count = gate_weights.len();
@@ -254,6 +260,7 @@ fn mtp_attention(
     [q_proj, k_proj, v_proj, o_proj]: [Linear; 4],
     q_norm: Tensor,
     k_norm: Tensor,
+    config: &CausalDecoderConfig,
 ) -> FullAttention {
     FullAttention {
         q_proj,
@@ -264,8 +271,12 @@ fn mtp_attention(
         k_norm: Some(k_norm),
         num_key_value_heads: None,
         head_dim: None,
-        rope_dims: None,
-        rope_frequency_dim: None,
+        // RoPE partielle : fréquences sur les `rope_dims` tournées, comme les
+        // couches du tronc et le decode résident. Sans ce réglage, le forward
+        // CPU et le semis de l'historique retombaient sur `head_dim` (256 au
+        // lieu de 64 sur Qwen3.5/3.6) et divergeaient du draft résident.
+        rope_dims: config.rope_dims,
+        rope_frequency_dim: config.rope_dims,
         value_norm: false,
         // MTP = sidecar Qwen, base RoPE unique de la config, positions
         // brutes, attention pleine.

@@ -224,6 +224,125 @@ impl CausalDecoder {
         }
     }
 
+    /// Couche full-attn du tronc sur `rows` lignes, dense ou MoE shared selon
+    /// les buffers résidents : boucle commune des cycles MTP fusionnés.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mêmes entrées que les encodeurs en lignes dense et MoE"
+    )]
+    pub(super) fn encode_resident_full_any_layer_rows(
+        &self,
+        metal: &MetalExecutor,
+        arena: &ResidentArena,
+        layer_cache: &mut LayerKvCache,
+        layer: &DecoderLayer,
+        index: usize,
+        encoder: &metal::ComputeCommandEncoderRef,
+        owned: &mut Vec<metal::Buffer>,
+        dims: FullAttnLayerDims,
+        rows: usize,
+        layer_in: &metal::BufferRef,
+        layer_out: &metal::BufferRef,
+    ) -> Result<()> {
+        // flint (MoE sigmoïde) est résolu en `FullDense` : seul le type des
+        // buffers choisit la queue MoE shared, comme dans le vérifieur général.
+        if matches!(
+            arena.layers.get(index),
+            Some(ResidentLayerBuffers::FullMoe(_))
+        ) {
+            self.encode_resident_full_moe_layer_rows(
+                metal,
+                arena,
+                layer_cache,
+                index,
+                encoder,
+                owned,
+                dims,
+                rows,
+                layer_in,
+                layer_out,
+            )
+        } else {
+            self.encode_resident_full_dense_layer_rows(
+                metal,
+                arena,
+                layer_cache,
+                layer,
+                index,
+                encoder,
+                owned,
+                dims,
+                rows,
+                layer_in,
+                layer_out,
+            )
+        }
+    }
+
+    /// Couche linear-attn du tronc sur `rows` lignes, queue dense ou MoE.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mêmes entrées que les encodeurs en lignes dense et MoE"
+    )]
+    pub(super) fn encode_resident_linear_any_layer_rows(
+        &self,
+        metal: &MetalExecutor,
+        arena: &ResidentArena,
+        layer_cache: &mut LayerKvCache,
+        layer: &DecoderLayer,
+        index: usize,
+        encoder: &metal::ComputeCommandEncoderRef,
+        owned: &mut Vec<metal::Buffer>,
+        la_spec: LinearAttentionStepSpec,
+        res_dims: LinearAttnResidentDims,
+        rows: usize,
+        hidden: usize,
+        eps: f32,
+        layer_in: &metal::BufferRef,
+        layer_out: &metal::BufferRef,
+        captures: Option<&[LinearAttentionMetalState]>,
+    ) -> Result<()> {
+        if matches!(layer.mlp.as_ref(), Some(FeedForward::Moe(_))) {
+            self.encode_resident_linear_layer_rows(
+                metal,
+                arena,
+                layer_cache,
+                layer,
+                index,
+                encoder,
+                owned,
+                la_spec,
+                res_dims,
+                rows,
+                hidden,
+                eps,
+                layer_in,
+                layer_out,
+                captures,
+            )
+        } else {
+            self.encode_resident_linear_dense_layer_rows(
+                metal,
+                arena,
+                layer_cache,
+                layer,
+                index,
+                encoder,
+                owned,
+                la_spec,
+                res_dims,
+                rows,
+                hidden,
+                eps,
+                layer_in,
+                layer_out,
+                captures,
+            )
+        }
+    }
+
     /// Couche full-attn MoE shared (`FullMoe`, Qwen3.5/3.6 MoE) sur `rows`
     /// positions contiguës de la vérification résidente : attention en lignes,
     /// puis queue MoE shared en lignes (routeur et top-k par ligne).

@@ -117,7 +117,128 @@ fn resolve_gemma_parallel_moe_buffers(
     }))
 }
 
+/// Vrai si toutes les projections des experts sont affines : le stack MoE
+/// résident (`build_stacked_affine`) n'accepte rien d'autre.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn experts_are_affine(experts: &[GatedMlp]) -> bool {
+    experts.iter().all(|expert| {
+        let (gate, up, down) = expert.projections();
+        [gate, up, down]
+            .iter()
+            .all(|linear| linear.weight().affine_quantized().is_some())
+    })
+}
+
 impl CausalDecoder {
+    /// Buffers résidents de la couche de la tête MTP : MLP dense (27B) ou MoE
+    /// à expert partagé (35B-A3B), même résolution que la couche du tronc.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur typée pour une tête MoE hors du contrat résident
+    /// (routeur non softmax, expert partagé absent, experts non affines).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn resident_mtp_layer(
+        &self,
+        metal: &MetalExecutor,
+        head: &MtpHead,
+        qkv_proj: Option<MetalLinearWeightBuffers>,
+        v_proj: &Linear,
+        q_norm: &Tensor,
+        k_norm: &Tensor,
+    ) -> Result<ResidentMtpLayer> {
+        let input_norm = metal
+            .cached_buffer_from_f32(head.layer.input_norm.data(), "resident_mtp_input_norm")?;
+        let q_proj = metal.resolve_linear_weight_buffers(
+            head.layer.attention.q_proj.weight(),
+            "resident_mtp_q_proj",
+        )?;
+        let k_proj = metal.resolve_linear_weight_buffers(
+            head.layer.attention.k_proj.weight(),
+            "resident_mtp_k_proj",
+        )?;
+        let v_proj = metal.resolve_linear_weight_buffers(v_proj.weight(), "resident_mtp_v_proj")?;
+        let o_proj = metal.resolve_linear_weight_buffers(
+            head.layer.attention.o_proj.weight(),
+            "resident_mtp_o_proj",
+        )?;
+        let q_norm = metal.cached_buffer_from_f32(q_norm.data(), "resident_mtp_q_norm")?;
+        let k_norm = metal.cached_buffer_from_f32(k_norm.data(), "resident_mtp_k_norm")?;
+        let post_norm = metal.cached_buffer_from_f32(
+            head.layer.post_attention_norm.data(),
+            "resident_mtp_post_norm",
+        )?;
+        match &head.layer.mlp {
+            FeedForward::Dense(mlp) => {
+                let (gate_proj, up_proj, down_proj) = mlp.projections();
+                Ok(ResidentMtpLayer::Dense(ResidentFullDenseBuffers {
+                    sigmoid_moe: None,
+                    input_norm,
+                    qkv_proj,
+                    value_norm: false,
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    q_norm,
+                    k_norm,
+                    post_norm,
+                    pre_feedforward_norm: None,
+                    post_feedforward_norm: None,
+                    layer_scalar: None,
+                    gate_proj: metal
+                        .resolve_linear_weight_buffers(gate_proj.weight(), "resident_mtp_gate")?,
+                    up_proj: metal
+                        .resolve_linear_weight_buffers(up_proj.weight(), "resident_mtp_up")?,
+                    down_proj: metal
+                        .resolve_linear_weight_buffers(down_proj.weight(), "resident_mtp_down")?,
+                    parallel_moe: None,
+                }))
+            }
+            FeedForward::Moe(mlp) => {
+                if !self.config.attn_output_gate {
+                    return Err(InferError::Config(
+                        "tête MTP MoE résidente : attn_output_gate requis".to_string(),
+                    ));
+                }
+                let (router, experts, top_k, shared_expert, shared_gate) =
+                    mlp.shared_metal_parts().ok_or_else(|| {
+                        InferError::Config(
+                            "tête MTP MoE hors contrat résident (softmax + expert partagé gated)"
+                                .to_string(),
+                        )
+                    })?;
+                if !experts_are_affine(experts) {
+                    return Err(InferError::Config(
+                        "tête MTP MoE résidente : experts affines requis (quantifier à la charge)"
+                            .to_string(),
+                    ));
+                }
+                Ok(ResidentMtpLayer::Moe(ResidentFullMoeBuffers {
+                    input_norm,
+                    qkv_proj,
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    q_norm,
+                    k_norm,
+                    post_norm,
+                    pre_feedforward_norm: None,
+                    post_feedforward_norm: None,
+                    layer_scalar: None,
+                    moe: metal.resolve_moe_shared_weights(
+                        router,
+                        experts,
+                        shared_expert,
+                        shared_gate,
+                    )?,
+                    top_k,
+                }))
+            }
+        }
+    }
+
     /// Renvoie `true` si le decode résident COMPLET (1c) est applicable : un
     /// executor Metal, des dimensions GQA valides, un lm_head biasless (argmax
     /// GPU), et TOUTES les couches encodables en résident
@@ -807,183 +928,107 @@ impl CausalDecoder {
         for _ in 0..RESIDENT_PIPELINE_WINDOW {
             index_ring.push(arena.persistent(1, GpuElement::U32)?);
         }
-        let mtp = if let Some(head) = self.mtp.as_ref() {
-            let mlp = match &head.layer.mlp {
-                FeedForward::Dense(mlp) => mlp,
-                _ => {
-                    if crate::decoder::flags::trace_resident_enabled() {
-                        eprintln!("decode résident full: arène MTP désactivée, tête MTP non dense");
-                    }
-                    cache.resident = Some(ResidentArena {
-                        state: arena,
-                        layers: layer_buffers,
-                        embed_tokens: metal.resolve_embedding_weight_buffers(&self.embed_tokens)?,
-                        final_norm: metal.cached_buffer_from_f32(
-                            self.final_norm.data(),
-                            "resident_final_norm",
-                        )?,
-                        lm_head: metal.resolve_linear_weight_buffers(
-                            self.lm_head.weight(),
-                            "resident_lm_head",
-                        )?,
-                        dense_tail_score: metal
-                            .cached_buffer_from_f32(&[1.0], "resident_dense_tail_score")?,
-                        hidden_a,
-                        hidden_b,
-                        pipeline_hidden_ring,
-                        index,
-                        index_ring,
-                        mtp: None,
-                    });
-                    if let Some(t) = t_mtp_arena {
-                        eprintln!(
-                            "mtp_setup mtp_arena_us={} (tête non dense)",
-                            t.elapsed().as_micros()
-                        );
-                    }
-                    return Ok(true);
-                }
-            };
-            let (gate_proj, up_proj, down_proj) = mlp.projections();
-            let q_norm =
-                head.layer.attention.q_norm.as_ref().ok_or_else(|| {
+        let mtp =
+            if let Some(head) = self.mtp.as_ref() {
+                let q_norm = head.layer.attention.q_norm.as_ref().ok_or_else(|| {
                     InferError::Config("q_norm MTP manquant (résident)".to_string())
                 })?;
-            let k_norm =
-                head.layer.attention.k_norm.as_ref().ok_or_else(|| {
+                let k_norm = head.layer.attention.k_norm.as_ref().ok_or_else(|| {
                     InferError::Config("k_norm MTP manquant (résident)".to_string())
                 })?;
-            let v_proj =
-                head.layer.attention.v_proj.as_ref().ok_or_else(|| {
+                let v_proj = head.layer.attention.v_proj.as_ref().ok_or_else(|| {
                     InferError::Config("v_proj MTP manquant (résident)".to_string())
                 })?;
-            let qkv_sources = [
-                head.layer.attention.q_proj.weight(),
-                head.layer.attention.k_proj.weight(),
-                v_proj.weight(),
-            ];
-            let qkv_proj = if metal.concat_would_duplicate_affine_storage(&qkv_sources) {
-                None
+                let qkv_sources = [
+                    head.layer.attention.q_proj.weight(),
+                    head.layer.attention.k_proj.weight(),
+                    v_proj.weight(),
+                ];
+                let qkv_proj = if metal.concat_would_duplicate_affine_storage(&qkv_sources) {
+                    None
+                } else {
+                    match metal
+                        .resolve_concat_linear_weight_buffers(&qkv_sources, "resident_mtp_qkv_proj")
+                    {
+                        Ok(weights) => Some(weights),
+                        Err(InferError::Dimension(_)) => None,
+                        Err(error) => return Err(error),
+                    }
+                };
+                // KV de l'arène MTP : même dtype f32/bf16 résolu que le KV principal,
+                // jamais quantifié (son oracle compare les octets bruts).
+                let kv = arena.full_attention_dense(
+                    capacity,
+                    q_heads,
+                    base_kv_heads,
+                    base_head_dim,
+                    kv_bf16,
+                )?;
+                #[cfg(feature = "devtools")]
+                let append_oracle_kv = arena.full_attention_dense(
+                    capacity,
+                    q_heads,
+                    base_kv_heads,
+                    base_head_dim,
+                    kv_bf16,
+                )?;
+                let hidden_a = arena.persistent(hidden, GpuElement::F32)?;
+                let hidden_b = arena.persistent(hidden, GpuElement::F32)?;
+                let index = arena.persistent(1, GpuElement::U32)?;
+                let draft_indices = arena.persistent(max_new_tokens.max(1), GpuElement::U32)?;
+                let verify_hidden_rows = arena.persistent(
+                    3usize.checked_mul(hidden).ok_or_else(|| {
+                        InferError::Dimension("MTP verify hidden rows déborde".to_string())
+                    })?,
+                    GpuElement::F32,
+                )?;
+                let pending_append_indices = arena.persistent(2, GpuElement::U32)?;
+                let embedding = arena.persistent(hidden, GpuElement::F32)?;
+                let concat = arena.persistent(
+                    hidden.checked_mul(2).ok_or_else(|| {
+                        InferError::Dimension("MTP concat hidden déborde".to_string())
+                    })?,
+                    GpuElement::F32,
+                )?;
+                let fc_out = arena.persistent(hidden, GpuElement::F32)?;
+                Some(ResidentMtpArena {
+                    pre_fc_norm_embedding: metal.cached_buffer_from_f32(
+                        head.pre_fc_norm_embedding.data(),
+                        "resident_mtp_pre_fc_norm_embedding",
+                    )?,
+                    pre_fc_norm_hidden: metal.cached_buffer_from_f32(
+                        head.pre_fc_norm_hidden.data(),
+                        "resident_mtp_pre_fc_norm_hidden",
+                    )?,
+                    fc: metal.resolve_linear_weight_buffers(head.fc.weight(), "resident_mtp_fc")?,
+                    layer: self
+                        .resident_mtp_layer(metal, head, qkv_proj, v_proj, q_norm, k_norm)?,
+                    norm: metal.cached_buffer_from_f32(head.norm.data(), "resident_mtp_norm")?,
+                    draft_lm_head: metal.resolve_linear_weight_buffers(
+                        self.mtp_draft_lm_head().weight(),
+                        "resident_mtp_draft_lm_head",
+                    )?,
+                    kv,
+                    #[cfg(feature = "devtools")]
+                    append_oracle_kv,
+                    #[cfg(feature = "devtools")]
+                    append_oracle_len: 0,
+                    hidden_a,
+                    hidden_b,
+                    current_is_a: true,
+                    index,
+                    draft_indices,
+                    verify_hidden_rows,
+                    pending_append_indices,
+                    pending_append_start: 0,
+                    pending_append_count: 0,
+                    embedding,
+                    concat,
+                    fc_out,
+                })
             } else {
-                match metal
-                    .resolve_concat_linear_weight_buffers(&qkv_sources, "resident_mtp_qkv_proj")
-                {
-                    Ok(weights) => Some(weights),
-                    Err(InferError::Dimension(_)) => None,
-                    Err(error) => return Err(error),
-                }
+                None
             };
-            // KV de l'arène MTP : même dtype f32/bf16 résolu que le KV principal,
-            // jamais quantifié (son oracle compare les octets bruts).
-            let kv = arena.full_attention_dense(
-                capacity,
-                q_heads,
-                base_kv_heads,
-                base_head_dim,
-                kv_bf16,
-            )?;
-            #[cfg(feature = "devtools")]
-            let append_oracle_kv = arena.full_attention_dense(
-                capacity,
-                q_heads,
-                base_kv_heads,
-                base_head_dim,
-                kv_bf16,
-            )?;
-            let hidden_a = arena.persistent(hidden, GpuElement::F32)?;
-            let hidden_b = arena.persistent(hidden, GpuElement::F32)?;
-            let index = arena.persistent(1, GpuElement::U32)?;
-            let draft_indices = arena.persistent(max_new_tokens.max(1), GpuElement::U32)?;
-            let verify_hidden_rows = arena.persistent(
-                3usize.checked_mul(hidden).ok_or_else(|| {
-                    InferError::Dimension("MTP verify hidden rows déborde".to_string())
-                })?,
-                GpuElement::F32,
-            )?;
-            let pending_append_indices = arena.persistent(2, GpuElement::U32)?;
-            let embedding = arena.persistent(hidden, GpuElement::F32)?;
-            let concat = arena.persistent(
-                hidden.checked_mul(2).ok_or_else(|| {
-                    InferError::Dimension("MTP concat hidden déborde".to_string())
-                })?,
-                GpuElement::F32,
-            )?;
-            let fc_out = arena.persistent(hidden, GpuElement::F32)?;
-            Some(ResidentMtpArena {
-                pre_fc_norm_embedding: metal.cached_buffer_from_f32(
-                    head.pre_fc_norm_embedding.data(),
-                    "resident_mtp_pre_fc_norm_embedding",
-                )?,
-                pre_fc_norm_hidden: metal.cached_buffer_from_f32(
-                    head.pre_fc_norm_hidden.data(),
-                    "resident_mtp_pre_fc_norm_hidden",
-                )?,
-                fc: metal.resolve_linear_weight_buffers(head.fc.weight(), "resident_mtp_fc")?,
-                layer: ResidentFullDenseBuffers {
-                    sigmoid_moe: None,
-                    input_norm: metal.cached_buffer_from_f32(
-                        head.layer.input_norm.data(),
-                        "resident_mtp_input_norm",
-                    )?,
-                    qkv_proj,
-                    value_norm: false,
-                    q_proj: metal.resolve_linear_weight_buffers(
-                        head.layer.attention.q_proj.weight(),
-                        "resident_mtp_q_proj",
-                    )?,
-                    k_proj: metal.resolve_linear_weight_buffers(
-                        head.layer.attention.k_proj.weight(),
-                        "resident_mtp_k_proj",
-                    )?,
-                    v_proj: metal
-                        .resolve_linear_weight_buffers(v_proj.weight(), "resident_mtp_v_proj")?,
-                    o_proj: metal.resolve_linear_weight_buffers(
-                        head.layer.attention.o_proj.weight(),
-                        "resident_mtp_o_proj",
-                    )?,
-                    q_norm: metal.cached_buffer_from_f32(q_norm.data(), "resident_mtp_q_norm")?,
-                    k_norm: metal.cached_buffer_from_f32(k_norm.data(), "resident_mtp_k_norm")?,
-                    post_norm: metal.cached_buffer_from_f32(
-                        head.layer.post_attention_norm.data(),
-                        "resident_mtp_post_norm",
-                    )?,
-                    pre_feedforward_norm: None,
-                    post_feedforward_norm: None,
-                    layer_scalar: None,
-                    gate_proj: metal
-                        .resolve_linear_weight_buffers(gate_proj.weight(), "resident_mtp_gate")?,
-                    up_proj: metal
-                        .resolve_linear_weight_buffers(up_proj.weight(), "resident_mtp_up")?,
-                    down_proj: metal
-                        .resolve_linear_weight_buffers(down_proj.weight(), "resident_mtp_down")?,
-                    parallel_moe: None,
-                },
-                norm: metal.cached_buffer_from_f32(head.norm.data(), "resident_mtp_norm")?,
-                draft_lm_head: metal.resolve_linear_weight_buffers(
-                    self.mtp_draft_lm_head().weight(),
-                    "resident_mtp_draft_lm_head",
-                )?,
-                kv,
-                #[cfg(feature = "devtools")]
-                append_oracle_kv,
-                #[cfg(feature = "devtools")]
-                append_oracle_len: 0,
-                hidden_a,
-                hidden_b,
-                current_is_a: true,
-                index,
-                draft_indices,
-                verify_hidden_rows,
-                pending_append_indices,
-                pending_append_start: 0,
-                pending_append_count: 0,
-                embedding,
-                concat,
-                fc_out,
-            })
-        } else {
-            None
-        };
         cache.resident = Some(ResidentArena {
             state: arena,
             hidden_a,
