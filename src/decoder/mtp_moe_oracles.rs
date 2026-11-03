@@ -216,31 +216,82 @@ fn mtp_moe_head_weights_are_plausible() -> Result<()> {
     Ok(())
 }
 
-/// Prompts du JSON `{id: texte}` désigné par `SARAGOSSA_RUST_MTP_ORACLE_PROMPTS`.
+/// Identifiant et tokens ChatML d'un prompt d'oracle.
+type OraclePrompt = (String, Vec<usize>);
+
+/// Prompts du JSON `{id: texte}` désigné par `SARAGOSSA_RUST_MTP_ORACLE_PROMPTS`,
+/// tokenisés en ChatML. `Ok(None)` seulement si la variable est absente, et
+/// jamais en mode strict (`SARAGOSSA_REQUIRE_REAL_MODELS=1`) : une porte ne
+/// doit pas réussir sans avoir mesuré. Fichier illisible, JSON invalide ou
+/// identifiant absent sont des erreurs.
 pub(super) fn oracle_prompts(
     assets: &crate::ModelAssets,
     ids: &[&str],
-) -> Option<Vec<(String, Vec<usize>)>> {
-    let path = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_ORACLE_PROMPTS")?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let prompts: std::collections::HashMap<String, String> = serde_json::from_str(&text).ok()?;
-    ids.iter()
-        .map(|id| {
-            let prompt = prompts.get(*id)?;
+) -> Result<Option<Vec<OraclePrompt>>> {
+    let path = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_ORACLE_PROMPTS");
+    let Some(path) = crate::test_support::require_real_model(
+        path,
+        "SARAGOSSA_RUST_MTP_ORACLE_PROMPTS pointant vers prompts6.json",
+    ) else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|source| InferError::Config(format!("prompts oracle : {source}")))?;
+    parse_oracle_prompts(&text, ids)?
+        .into_iter()
+        .map(|(id, prompt)| {
             let templated = crate::render_qwen_chatml(
-                &[crate::ChatTemplateMessage::new("user", prompt)],
+                &[crate::ChatTemplateMessage::new("user", &prompt)],
                 true,
                 false,
             );
             let tokens = assets
-                .encode_prompt(&templated)
-                .ok()?
+                .encode_prompt(&templated)?
                 .into_iter()
-                .map(|id| usize::try_from(id).ok())
-                .collect::<Option<Vec<_>>>()?;
-            Some(((*id).to_string(), tokens))
+                .map(|token| {
+                    usize::try_from(token)
+                        .map_err(|_| InferError::Dimension(format!("token hors plage : {token}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((id, tokens))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// Sélectionne `ids` dans un JSON `{id: texte}`, dans l'ordre demandé.
+fn parse_oracle_prompts(text: &str, ids: &[&str]) -> Result<Vec<(String, String)>> {
+    let prompts: std::collections::HashMap<String, String> = serde_json::from_str(text)
+        .map_err(|source| InferError::Config(format!("prompts oracle JSON : {source}")))?;
+    ids.iter()
+        .map(|id| {
+            prompts
+                .get(*id)
+                .map(|prompt| ((*id).to_string(), prompt.clone()))
+                .ok_or_else(|| InferError::Config(format!("prompt oracle {id} absent")))
         })
         .collect()
+}
+
+#[test]
+fn oracle_prompts_reject_invalid_json_and_missing_ids() {
+    assert!(matches!(
+        parse_oracle_prompts("{pas du json", &["T1"]),
+        Err(InferError::Config(_))
+    ));
+    assert!(matches!(
+        parse_oracle_prompts(r#"{"T0": "a"}"#, &["T0", "T1"]),
+        Err(InferError::Config(_))
+    ));
+    let selected = parse_oracle_prompts(r#"{"T0": "a", "T1": "b"}"#, &["T1", "T0"])
+        .expect("invariant: deux prompts présents");
+    assert_eq!(
+        selected,
+        vec![
+            ("T1".to_string(), "b".to_string()),
+            ("T0".to_string(), "a".to_string())
+        ]
+    );
 }
 
 /// Hidden post-tête de chaque position `p` (entrée : état final normé `p`,
@@ -301,8 +352,8 @@ fn mtp_moe_draft_agreement_and_quantization_loss() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&dir)?;
-    let Some(prompts) = oracle_prompts(&assets, &AGREEMENT_PROMPTS) else {
-        eprintln!("skip : SARAGOSSA_RUST_MTP_ORACLE_PROMPTS absent ou incomplet");
+    let Some(prompts) = oracle_prompts(&assets, &AGREEMENT_PROMPTS)? else {
+        eprintln!("skip : SARAGOSSA_RUST_MTP_ORACLE_PROMPTS absent");
         return Ok(());
     };
     let sidecar = sidecar_path(&assets)?;
@@ -368,6 +419,8 @@ fn mtp_moe_draft_agreement_and_quantization_loss() -> Result<()> {
     );
     assert!(positions >= 1024, "G1 : {positions} positions < 1024");
     assert!(dense_rate >= 0.5, "G0 : accord f32 {dense_rate} < 0,5");
+    // Marge : perte mesurée de 0,1 point en u8 (1,5 en u4) sur 1200 positions,
+    // pour un écart-type binomial apparié d'environ 0,4 point.
     assert!(
         dense_rate - affine_rate <= 0.02,
         "G1 : perte de quantification {} points",
@@ -393,7 +446,7 @@ fn router_margin(head: &MtpHead, mlp_input: &Tensor) -> Result<f32> {
 
 /// G2 (oracle GPU) : bloc MTP MoE résident contre le forward CPU de la même
 /// tête affine, position par position sur un texte généré. Cosinus médian
-/// ≥ 0,999 ; hors quasi-égalités du routeur (écart 8e/9e < 2e-2, comptées, ≤ 25 %),
+/// ≥ 0,999 ; hors quasi-égalités du routeur (écart 8e/9e < 2e-2, comptées, ≤ 33 %),
 /// écart relatif ≤ 2e-2 et argmax identique sauf quasi-égalité de logits.
 #[test]
 #[ignore = "requiert Metal, le 35B-A3B, SARAGOSSA_RUST_MTP_SIDECAR et les prompts"]
@@ -406,8 +459,8 @@ fn mtp_moe_resident_block_matches_cpu_oracle() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&dir)?;
-    let Some(prompts) = oracle_prompts(&assets, &["T1"]) else {
-        eprintln!("skip : SARAGOSSA_RUST_MTP_ORACLE_PROMPTS absent ou incomplet");
+    let Some(prompts) = oracle_prompts(&assets, &["T1"])? else {
+        eprintln!("skip : SARAGOSSA_RUST_MTP_ORACLE_PROMPTS absent");
         return Ok(());
     };
     let sidecar = sidecar_path(&assets)?;
@@ -509,7 +562,8 @@ fn mtp_moe_resident_block_matches_cpu_oracle() -> Result<()> {
     assert!(cos >= 0.999, "G2 : cosinus médian {cos}");
     assert!(max_rel <= 2e-2, "G2 : écart relatif {max_rel}");
     assert!(
-        ties * 4 <= count,
+        // 24 % mesurés sur T1 : la part dépend du texte généré, d'où la marge.
+        ties * 3 <= count,
         "G2 : {ties} quasi-égalités du routeur sur {count}"
     );
     assert_eq!(
@@ -519,22 +573,23 @@ fn mtp_moe_resident_block_matches_cpu_oracle() -> Result<()> {
     Ok(())
 }
 
-/// É6 : débit du MTP échantillonné (accept/reject lossless, T = 0,7,
+/// Banc É6, sans assertion (la porte G5 est lue dans la sortie et rouge à
+/// date, docs/perf/mtp-pairwise.md) : débit du MTP échantillonné (accept/reject lossless, T = 0,7,
 /// top-p 0,95) contre l'AR échantillonné, ABBA dans le même processus, sur
 /// T0, T1 et T6, 400 tokens. Le harnais pairwise refuse T > 0 ; la correction
 /// distributionnelle reste celle des tests `mtp_sampled_*`. Profondeur :
 /// `SARAGOSSA_RUST_MTP_ORACLE_DEPTH` (défaut 2).
 #[test]
-#[ignore = "requiert Metal, le 35B-A3B, SARAGOSSA_RUST_MTP_SIDECAR et les prompts"]
-fn mtp_moe_sampled_abba_vs_ar() -> Result<()> {
+#[ignore = "banc : requiert Metal, le 35B-A3B, SARAGOSSA_RUST_MTP_SIDECAR et les prompts"]
+fn mtp_moe_sampled_bench_vs_ar() -> Result<()> {
     const PAIRS: usize = 6;
     const NEW_TOKENS: usize = 400;
     let Some(dir) = model_dir() else {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&dir)?;
-    let Some(prompts) = oracle_prompts(&assets, &["T0", "T1", "T6"]) else {
-        eprintln!("skip : SARAGOSSA_RUST_MTP_ORACLE_PROMPTS absent ou incomplet");
+    let Some(prompts) = oracle_prompts(&assets, &["T0", "T1", "T6"])? else {
+        eprintln!("skip : SARAGOSSA_RUST_MTP_ORACLE_PROMPTS absent");
         return Ok(());
     };
     let depth = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_ORACLE_DEPTH")

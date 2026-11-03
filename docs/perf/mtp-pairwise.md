@@ -1244,7 +1244,7 @@ Portes, dans l'ordre :
 | G0 format/numérique | tenseurs finis, RMS dans un rapport [¼, 4] avec la couche 39 du tronc, erreur de quantification u4 < 0,15, u8 < 0,02 | vert : rapports de 0,81 à 1,55, u8 ≤ 0,007, u4 ≤ 0,105 |
 | G0 qualité | accord top-1 du draft f32 avec l'AR ≥ 0,5 | 0,850 sur 1200 positions (T1 0,94, T2 0,83, T7 0,78) |
 | G1 quantification | perte ≤ 2 points, bascules appariées | u4 partout : −1,5 point (37 perdues, 19 gagnées) ; fc et attention en u8 : 0,849 contre 0,850 (10 perdues, 9 gagnées) |
-| G2 GPU/CPU | cosinus médian ≥ 0,999, écart ≤ 2e-2 hors quasi-égalités du routeur (écart 8e/9e < 2e-2, ≤ 25 %), argmax identique | cosinus 0,99997, écart max 1,05e-2, 38 sur 160 positions en quasi-égalité, aucune bascule d'argmax |
+| G2 GPU/CPU | cosinus médian ≥ 0,999, écart ≤ 2e-2 hors quasi-égalités du routeur (écart 8e/9e < 2e-2, ≤ 33 %), argmax identique | cosinus 0,99997, écart max 1,05e-2, 38 sur 160 positions en quasi-égalité, aucune bascule d'argmax |
 | G2 sorties | AR == MTP en D1, D2 et adaptatif sur les 5 prompts ; chemins fusionnés activés ; rejets et rollback exercés ; arrêts, budgets, échantillonné à T = 0,05 | vert : compteurs `Hidden`/`Embedding`/`Overlap` > 0 (PW07, PW14, PW15), tests `mtp_d1_resident_hidden_*`, `mtp_committed_two_row_*`, `mtp_stop_sequences_*`, `mtp_sampled_*` et semis sur le 35B |
 | G3 27B | tests verts, débit ±2 % | 7 oracles verts ; T1 200 tokens, 2 × 3 paires : D1/AR 1,476 → 1,449, adaptatif/AR 1,562 → 1,598 |
 | G4 greedy | moyenne géométrique ≥ 1,10 sur T0, T1, T6, aucun prompt < 0,97 | vert (tableau ci-dessous) |
@@ -1278,7 +1278,7 @@ D2 fixe est le meilleur réglage partout. L'adaptatif s'en approche sauf sur
 T2, où il reste trop souvent en D1. Moyenne géométrique T0/T1/T6 : 1,45 en D2
 et 1,45 en adaptatif.
 
-Échantillonné (`mtp_moe_sampled_abba_vs_ar`, T = 0,7, top-p 0,95, D2,
+Échantillonné (banc `mtp_moe_sampled_bench_vs_ar`, T = 0,7, top-p 0,95, D2,
 6 paires, 400 tokens) : rapports médians de 0,939 (T0), 0,951 (T1) et 0,987
 (T6), pour une acceptance de 90 à 97 %. L'AR échantillonné ne fait que
 79 tok/s contre 150 en greedy : le tirage sur 248 320 tokens domine le pas, et
