@@ -515,3 +515,72 @@ fn mtp_moe_resident_block_matches_cpu_oracle() -> Result<()> {
     );
     Ok(())
 }
+
+/// É6 : débit du MTP échantillonné (accept/reject lossless, T = 0,7,
+/// top-p 0,95) contre l'AR échantillonné, ABBA dans le même processus, sur
+/// T0, T1 et T6, 400 tokens. Le harnais pairwise refuse T > 0 ; la correction
+/// distributionnelle reste celle des tests `mtp_sampled_*`. Profondeur :
+/// `SARAGOSSA_RUST_MTP_ORACLE_DEPTH` (défaut 2).
+#[test]
+#[ignore = "requiert Metal, le 35B-A3B, SARAGOSSA_RUST_MTP_SIDECAR et les prompts"]
+fn mtp_moe_sampled_abba_vs_ar() -> Result<()> {
+    const PAIRS: usize = 6;
+    const NEW_TOKENS: usize = 400;
+    let Some(dir) = model_dir() else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(&dir)?;
+    let Some(prompts) = oracle_prompts(&assets, &["T0", "T1", "T6"]) else {
+        eprintln!("skip : SARAGOSSA_RUST_MTP_ORACLE_PROMPTS absent ou incomplet");
+        return Ok(());
+    };
+    let depth = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_ORACLE_DEPTH")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(2);
+    let sidecar = sidecar_path(&assets)?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(&sidecar)?;
+    let options = GenerationOptions {
+        stop_token_ids: Vec::new(),
+        stop_sequences: Vec::new(),
+        temperature: 0.7,
+        top_p: 0.95,
+        top_k: 0,
+        seed: 11,
+        token_constraint: None,
+    };
+    let ar = |prompt: &[usize]| -> Result<f64> {
+        let out = model.generate_greedy_timed_with_options(prompt, NEW_TOKENS, &options)?;
+        Ok(out.timings.decode_tokens as f64 / out.timings.decode.as_secs_f64().max(1e-9))
+    };
+    let mtp = |prompt: &[usize]| -> Result<(f64, usize, usize)> {
+        let out = model.generate_greedy_mtp_core(prompt, NEW_TOKENS, &options, depth, |_| true)?;
+        let rate = out.tokens.len() as f64 / out.loop_duration.as_secs_f64().max(1e-9);
+        Ok((rate, out.stats.accepted, out.stats.proposed))
+    };
+    for (id, prompt) in prompts {
+        ar(&prompt)?;
+        mtp(&prompt)?;
+        let mut ratios = Vec::with_capacity(PAIRS);
+        let (mut accepted, mut proposed) = (0usize, 0usize);
+        for pair in 0..PAIRS {
+            let (a, (m, acc, prop)) = if pair % 2 == 0 {
+                let a = ar(&prompt)?;
+                (a, mtp(&prompt)?)
+            } else {
+                let m = mtp(&prompt)?;
+                (ar(&prompt)?, m)
+            };
+            accepted += acc;
+            proposed += prop;
+            ratios.push((m / a) as f32);
+            eprintln!("É6 {id} paire={pair} ar={a:.1} mtp={m:.1} tok/s");
+        }
+        eprintln!(
+            "É6 {id} profondeur={depth} rapport_médian={:.3} acceptance={accepted}/{proposed}",
+            median(ratios)
+        );
+    }
+    Ok(())
+}
