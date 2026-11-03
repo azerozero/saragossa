@@ -369,7 +369,11 @@ pub(super) fn handle_batch<S: Write>(state: &mut ServeState, jobs: &mut [(&mut S
                     .unwrap_or_default();
                 FlintOutputParser::new(tools, batch.chat.parallel_tool_calls())
             });
-            sinks.push(Box::new(OpenAiSse::new(stream, parser)));
+            sinks.push(Box::new(OpenAiSse::new(
+                stream,
+                parser,
+                batch.chat.include_usage(),
+            )));
         }
         requests.push(batch.chat);
         slots.push(index);
@@ -425,7 +429,7 @@ fn send_sse_streaming<S: Write>(
     session_key: Option<String>,
     flint: Option<FlintOutputParser>,
 ) -> ServeResult<()> {
-    let mut sink = OpenAiSse::new(stream, flint);
+    let mut sink = OpenAiSse::new(stream, flint, chat.include_usage());
     let result = state.complete_streaming(chat, session_key.as_deref(), |event| sink.event(event));
     sink.finish(result)
 }
@@ -436,15 +440,18 @@ struct OpenAiSse<'a, S> {
     flint: Option<FlintOutputParser>,
     started: bool,
     model: String,
+    /// `stream_options.include_usage` : chunk d'usage avant `[DONE]`.
+    include_usage: bool,
 }
 
 impl<'a, S: Write> OpenAiSse<'a, S> {
-    fn new(stream: &'a mut S, flint: Option<FlintOutputParser>) -> Self {
+    fn new(stream: &'a mut S, flint: Option<FlintOutputParser>, include_usage: bool) -> Self {
         Self {
             stream,
             flint,
             started: false,
             model: String::new(),
+            include_usage,
         }
     }
 
@@ -513,6 +520,12 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
             self.stream,
             &ChatCompletionChunk::done(&completion.model, finish_reason),
         )?;
+        if self.include_usage {
+            write_sse_event(
+                self.stream,
+                &ChatCompletionChunk::usage(&completion.model, completion.usage),
+            )?;
+        }
         self.stream
             .write_all(&sse_done())
             .map_err(|e| ServeError::io("écriture SSE [DONE]", e))?;
@@ -1243,5 +1256,44 @@ mod tests {
         assert!(value["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("max_tokens")));
+    }
+
+    /// `stream_options.include_usage` : chunk d'usage entre le chunk de fin
+    /// et `[DONE]` ; sans l'option, le flux reste inchangé.
+    #[test]
+    fn openai_sse_writes_usage_chunk_only_on_request() {
+        let completion = || ServedCompletion {
+            model: "m".to_string(),
+            content: "ok".to_string(),
+            finish_reason: "stop",
+            matched_stop: None,
+            usage: super::super::protocol::Usage::new(7, 3),
+            prompt_tokens: 7,
+            reused_prefix_tokens: 0,
+            timings: saragossa::GenerationTimings::default(),
+            total: Duration::from_millis(1),
+        };
+        let frames = |include_usage: bool| -> Vec<serde_json::Value> {
+            let mut bytes = Vec::new();
+            OpenAiSse::new(&mut bytes, None, include_usage)
+                .finish(Ok(completion()))
+                .expect("invariant: écriture en mémoire");
+            String::from_utf8(bytes)
+                .expect("invariant: SSE UTF-8")
+                .split("\n\n")
+                .filter_map(|frame| frame.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).expect("invariant: data JSON"))
+                .collect()
+        };
+
+        let with_usage = frames(true);
+        assert_eq!(with_usage.len(), 2);
+        assert_eq!(with_usage[0]["choices"][0]["finish_reason"], "stop");
+        assert!(with_usage[0].get("usage").is_none());
+        assert_eq!(with_usage[1]["choices"], serde_json::json!([]));
+        assert_eq!(with_usage[1]["usage"]["prompt_tokens"], 7);
+        assert_eq!(with_usage[1]["usage"]["completion_tokens"], 3);
+        assert_eq!(frames(false).len(), 1);
     }
 }

@@ -60,6 +60,17 @@ pub(super) struct ChatCompletionRequest {
     /// `enable_thinking` est reconnu, toute autre clé est refusée.
     #[serde(default)]
     pub(super) chat_template_kwargs: Option<serde_json::Map<String, Value>>,
+    /// Options du flux SSE (`stream_options` OpenAI).
+    #[serde(default)]
+    pub(super) stream_options: Option<StreamOptions>,
+}
+
+/// `stream_options` OpenAI.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub(super) struct StreamOptions {
+    /// Ajoute avant `[DONE]` un chunk `choices: []` qui porte l'usage.
+    #[serde(default)]
+    pub(super) include_usage: bool,
 }
 
 /// Outil déclaré par la requête, lu une seule fois.
@@ -188,6 +199,12 @@ impl ChatCompletionRequest {
             }
         }
         Ok(thinking)
+    }
+
+    /// Le flux SSE se termine-t-il par un chunk d'usage ?
+    pub(super) fn include_usage(&self) -> bool {
+        self.stream_options
+            .is_some_and(|options| options.include_usage)
     }
 
     /// Appels d'outils multiples autorisés ?
@@ -539,9 +556,23 @@ pub(super) struct ChatCompletionChunk {
     created: u64,
     model: String,
     choices: Vec<ChatChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
 }
 
 impl ChatCompletionChunk {
+    /// Construit le chunk d'usage final (`stream_options.include_usage`).
+    pub(super) fn usage(model: &str, usage: Usage) -> Self {
+        Self {
+            id: response_id("chatcmpl"),
+            object: "chat.completion.chunk",
+            created: created_now(),
+            model: model.to_string(),
+            choices: Vec::new(),
+            usage: Some(usage),
+        }
+    }
+
     /// Construit le chunk de rôle initial.
     pub(super) fn role(model: &str) -> Self {
         Self::chunk(
@@ -603,6 +634,7 @@ impl ChatCompletionChunk {
                 delta: Some(DeltaMessage::default()),
                 finish_reason: Some(finish_reason.to_string()),
             }],
+            usage: None,
         }
     }
 
@@ -618,6 +650,7 @@ impl ChatCompletionChunk {
                 delta: Some(delta),
                 finish_reason,
             }],
+            usage: None,
         }
     }
 }
