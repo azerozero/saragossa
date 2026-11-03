@@ -324,8 +324,11 @@ pub(super) fn batch_chat(
     };
     // `batchable` garantit greedy et texte libre ; le solo prend alors le MTP
     // si le modèle l'a et que ses options l'admettent.
-    let session_ignored =
-        || mtp_model(&chat.model) && super::mtp::routes_request(&chat, ResponseFormatMode::Text);
+    let session_ignored = || {
+        mtp_model(&chat.model)
+            // Lot greedy seulement (`batchable`) : la règle d'échantillonnage est sans objet.
+            && super::mtp::routes_request(&chat, ResponseFormatMode::Text, false)
+    };
     (stream && chat.batchable(max_tokens_cap) && (session_key.is_none() || session_ignored()))
         .then_some(BatchChat { chat, anthropic })
 }

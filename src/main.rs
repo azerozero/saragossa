@@ -125,7 +125,10 @@ fn run() -> CliResult<()> {
     let load_started = Instant::now();
     let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
     let mtp_active = serve::mtp::active_for(&assets, args.backend)
-        && serve::mtp::supports_options(&generation_options(&args, &assets, args.top_p)?);
+        && serve::mtp::supports_options(
+            &generation_options(&args, &assets, args.top_p)?,
+            serve::mtp::sampled_for(&assets.config),
+        );
     // Charger avant la chauffe ; l'oracle explicite conserve son erreur sans tête.
     if saragossa::devtools::mtp_acceptance_enabled() || mtp_active {
         let path =
