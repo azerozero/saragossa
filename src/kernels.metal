@@ -7605,6 +7605,8 @@ kernel void weighted_sum_add_grouped_topk_f32(
     device const float* residual [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant uint4& dims [[buffer(4)]],
+    device const float* shared [[buffer(5)]],
+    device const float* shared_gate [[buffer(6)]],
     uint gid [[thread_position_in_grid]]
 ) {
     const uint rows = dims.x;
@@ -7621,6 +7623,14 @@ kernel void weighted_sum_add_grouped_topk_f32(
     for (uint slot = 0; slot < topk_per_row; ++slot) {
         const uint source_slot = slot_base + slot;
         acc += src[(source_slot * out_dim) + col] * scores[source_slot];
+    }
+    if (dims.w != 0u) {
+        // Expert partagé fusionné (vérification en lignes) : même expression
+        // que `weighted_sum_add_shared_topk_f32`, ligne par ligne, pour un
+        // seul dispatch au lieu de somme + `add_sigmoid_scaled_rows`.
+        const float shared_scale = 1.0f / (1.0f + fast::exp(-shared_gate[row]));
+        out[gid] = acc + shared[gid] * shared_scale;
+        return;
     }
     out[gid] = acc;
 }
@@ -9947,6 +9957,107 @@ kernel void topk8_softmax_256_f32(
     if (count != 256u || topk != 8u) {
         return;
     }
+    threadgroup float partial_values[32u * 8u];
+    threadgroup uint partial_indices[32u * 8u];
+
+    float best_values[8];
+    uint best_indices[8];
+    for (uint slot = 0u; slot < 8u; ++slot) {
+        best_values[slot] = -3.402823466e38f;
+        best_indices[slot] = 0xffffffffu;
+    }
+
+    for (uint idx = tid; idx < 256u; idx += 32u) {
+        const float value = logits[idx];
+        for (uint slot = 0u; slot < 8u; ++slot) {
+            if (topk_better(value, idx, best_values[slot], best_indices[slot])) {
+                for (uint shift = 7u; shift > slot; --shift) {
+                    best_values[shift] = best_values[shift - 1u];
+                    best_indices[shift] = best_indices[shift - 1u];
+                }
+                best_values[slot] = value;
+                best_indices[slot] = idx;
+                break;
+            }
+        }
+    }
+
+    const uint local_base = tid * 8u;
+    for (uint slot = 0u; slot < 8u; ++slot) {
+        partial_values[local_base + slot] = best_values[slot];
+        partial_indices[local_base + slot] = best_indices[slot];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const uint left_base = tid * 8u;
+            const uint right_base = (tid + stride) * 8u;
+            float merged_values[8];
+            uint merged_indices[8];
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                merged_values[slot] = partial_values[left_base + slot];
+                merged_indices[slot] = partial_indices[left_base + slot];
+            }
+            for (uint src = 0u; src < 8u; ++src) {
+                const float value = partial_values[right_base + src];
+                const uint index = partial_indices[right_base + src];
+                for (uint slot = 0u; slot < 8u; ++slot) {
+                    if (topk_better(value, index, merged_values[slot], merged_indices[slot])) {
+                        for (uint shift = 7u; shift > slot; --shift) {
+                            merged_values[shift] = merged_values[shift - 1u];
+                            merged_indices[shift] = merged_indices[shift - 1u];
+                        }
+                        merged_values[slot] = value;
+                        merged_indices[slot] = index;
+                        break;
+                    }
+                }
+            }
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                partial_values[left_base + slot] = merged_values[slot];
+                partial_indices[left_base + slot] = merged_indices[slot];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        const float max_value = partial_values[0];
+        float denom = 0.0f;
+        for (uint slot = 0u; slot < 8u; ++slot) {
+            denom += exp(partial_values[slot] - max_value);
+        }
+        denom = max(denom, 1.0e-20f);
+        for (uint slot = 0u; slot < 8u; ++slot) {
+            indices[slot] = partial_indices[slot];
+            scores[slot] = exp(partial_values[slot] - max_value) / denom;
+        }
+    }
+}
+
+// Top-k 8 parmi 256 en lignes de la vérification MoE : une ligne par
+// threadgroup, corps identique à `topk8_softmax_256_f32` (même départage
+// `topk_better`, même softmax) pour que chaque ligne reproduise le pas
+// mono-ligne. NOTE: copie volontaire, le kernel mono reste intouché ; toute
+// modification de l'un doit être reportée sur l'autre (test bit à bit
+// `topk8_rows_matches_mono_bitwise`).
+kernel void topk8_softmax_256_rows_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* indices [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint2& dims [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    const uint count = dims.x;
+    const uint topk = dims.y;
+    if (count != 256u || topk != 8u) {
+        return;
+    }
+    logits += row * 256u;
+    indices += row * 8u;
+    scores += row * 8u;
     threadgroup float partial_values[32u * 8u];
     threadgroup uint partial_indices[32u * 8u];
 

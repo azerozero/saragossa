@@ -340,4 +340,237 @@ impl MetalExecutor {
             &scratch,
         )
     }
+
+    /// Queue MoE shared de la vérification résidente en lignes (`rows` petits).
+    ///
+    /// Reprend la structure du mono-ligne au lieu du chemin batché générique
+    /// du prefill : top-k parallèle par ligne, gate+up+SwiGLU partagé fusionné
+    /// (jusqu'à [`crate::runtime_flags::moe_verify_shared_fused_max_rows`]
+    /// lignes) et combine résiduel + routé + partagé en un dispatch, soit
+    /// 8 dispatches par couche au lieu de 11. Niveaux de
+    /// [`crate::runtime_flags::moe_verify_tail_level`] : 0 délègue à
+    /// [`Self::encode_moe_shared_buffers_rows`]. `rows == 1` délègue au
+    /// mono-ligne.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `rows == 0`, si une dimension est incompatible
+    /// ou si un dispatch échoue.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirror batché des poids MoE (routeur + experts + shared-expert)"
+    )]
+    pub(crate) fn encode_moe_shared_buffers_verify_rows(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        owned_buffers: &mut Vec<Buffer>,
+        input_buffer: &BufferRef,
+        residual: &BufferRef,
+        output_buffer: &BufferRef,
+        rows: usize,
+        in_dim: usize,
+        weights: &MetalMoeSharedWeights,
+        top_k: usize,
+    ) -> Result<()> {
+        let level = crate::runtime_flags::moe_verify_tail_level();
+        if rows <= 1 || level == 0 {
+            return self.encode_moe_shared_buffers_rows(
+                encoder,
+                owned_buffers,
+                input_buffer,
+                Some(residual),
+                output_buffer,
+                rows,
+                in_dim,
+                weights,
+                top_k,
+            );
+        }
+        let shape = self.check_moe_shared_buffer_shapes(in_dim, weights, top_k)?;
+        let expert_count = shape.expert_count;
+        let inter_dim = shape.inter_dim;
+        let out_dim = shape.out_dim;
+        let shared_inter_dim = shape.shared_inter_dim;
+        trace_dispatch_path("moe_shared_verify_rows", rows, out_dim, in_dim);
+        let total_topk = checked_len(rows, top_k, "moe shared verify rows topk total")?;
+        let scratch = self.allocate_moe_shared_rows_scratch(
+            rows,
+            top_k,
+            expert_count,
+            inter_dim,
+            out_dim,
+            shared_inter_dim,
+        )?;
+
+        let router_out_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            input_buffer,
+            rows,
+            in_dim,
+            &weights.router,
+            &scratch.router,
+            false,
+        )?;
+        if router_out_dim != expert_count {
+            return Err(InferError::Dimension(format!(
+                "routeur MoE shared verify rows sort {router_out_dim}, attendu {expert_count}"
+            )));
+        }
+        self.encode_topk_softmax_verify_rows(
+            encoder,
+            &scratch.router,
+            &scratch.indices,
+            &scratch.scores,
+            rows,
+            expert_count,
+            top_k,
+        )?;
+        if level == 1 {
+            // Ablation : top-k seul, le reste suit le chemin batché générique.
+            let mut routed_phase = MoeRoutedSharedPhase {
+                encoder,
+                owned_buffers,
+                input_buffer,
+                rows,
+                stacked: &weights.stacked,
+                indices: &scratch.indices,
+                gate: &scratch.gate,
+                up: &scratch.up,
+                hidden: &scratch.hidden,
+                down: &scratch.down,
+                slots: total_topk,
+                inter_dim,
+                swiglu_label: "moe shared verify rows swiglu",
+            };
+            self.encode_moe_shared_routed_phase(&mut routed_phase)?;
+            self.encode_moe_shared_rows_expert_phase(
+                encoder,
+                owned_buffers,
+                input_buffer,
+                rows,
+                in_dim,
+                weights,
+                &scratch,
+                shared_inter_dim,
+                out_dim,
+            )?;
+            return self.encode_moe_shared_rows_combine_phase(
+                encoder,
+                owned_buffers,
+                Some(residual),
+                output_buffer,
+                rows,
+                top_k,
+                out_dim,
+                &scratch,
+            );
+        }
+
+        // Ordre du mono : gate/up routé, gate scalaire et gate/up partagés,
+        // puis down routé, down partagé, combine.
+        let mut routed_phase = MoeRoutedSharedPhase {
+            encoder,
+            owned_buffers,
+            input_buffer,
+            rows,
+            stacked: &weights.stacked,
+            indices: &scratch.indices,
+            gate: &scratch.gate,
+            up: &scratch.up,
+            hidden: &scratch.hidden,
+            down: &scratch.down,
+            slots: total_topk,
+            inter_dim,
+            swiglu_label: "moe shared verify rows swiglu",
+        };
+        let routed_fused = self.encode_moe_shared_routed_gate_up_phase(&mut routed_phase)?;
+        if !routed_fused {
+            self.encode_swiglu(
+                encoder,
+                owned_buffers,
+                &scratch.gate,
+                &scratch.up,
+                &scratch.hidden,
+                checked_len(total_topk, inter_dim, "moe shared verify rows swiglu")?,
+            )?;
+        }
+        let projected_gate_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            input_buffer,
+            rows,
+            in_dim,
+            &weights.shared_gate,
+            &scratch.shared_gate,
+            false,
+        )?;
+        if projected_gate_dim != 1 {
+            return Err(InferError::Dimension(format!(
+                "shared gate verify rows Metal sort {projected_gate_dim}, attendu 1"
+            )));
+        }
+        let shared_fused = rows <= crate::runtime_flags::moe_verify_shared_fused_max_rows()
+            && can_fuse_shared_gate_up_buffers(&weights.shared_gate_proj, &weights.shared_up_proj)
+            && self.encode_gate_up_swiglu_fast_buffers_rows(
+                encoder,
+                input_buffer,
+                &weights.shared_gate_proj,
+                &weights.shared_up_proj,
+                &scratch.shared_hidden,
+                rows,
+                in_dim,
+            )?;
+        if !shared_fused {
+            self.encode_moe_shared_rows_gate_up(
+                encoder,
+                owned_buffers,
+                input_buffer,
+                rows,
+                in_dim,
+                weights,
+                &scratch,
+                shared_inter_dim,
+            )?;
+        }
+        let mut routed_phase = MoeRoutedSharedPhase {
+            encoder,
+            owned_buffers,
+            input_buffer,
+            rows,
+            stacked: &weights.stacked,
+            indices: &scratch.indices,
+            gate: &scratch.gate,
+            up: &scratch.up,
+            hidden: &scratch.hidden,
+            down: &scratch.down,
+            slots: total_topk,
+            inter_dim,
+            swiglu_label: "moe shared verify rows swiglu",
+        };
+        self.encode_moe_shared_routed_down_phase(&mut routed_phase)?;
+        let projected_shared_down_dim = self.encode_matmul_weight_buffers(
+            encoder,
+            &scratch.shared_hidden,
+            rows,
+            shared_inter_dim,
+            &weights.shared_down_proj,
+            &scratch.shared_down,
+            false,
+        )?;
+        if projected_shared_down_dim != out_dim {
+            return Err(InferError::Dimension(format!(
+                "shared expert verify rows down sort {projected_shared_down_dim}, attendu {out_dim}"
+            )));
+        }
+        self.encode_weighted_sum_add_grouped_topk_shared(
+            encoder,
+            &scratch.down,
+            &scratch.scores,
+            residual,
+            Some((&scratch.shared_down, &scratch.shared_gate)),
+            output_buffer,
+            rows,
+            top_k,
+            out_dim,
+        )
+    }
 }

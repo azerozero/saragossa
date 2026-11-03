@@ -2036,7 +2036,8 @@ impl DecodeResidentState {
     }
 
     /// Queue MoE shared en lignes de la vérification : `input` post-normé,
-    /// `residual` ajouté à la sortie, gather par slot (`rows × top_k`). Le coop
+    /// `residual` ajouté à la sortie, structure du mono-ligne en 8 dispatches
+    /// ([`MetalExecutor::encode_moe_shared_buffers_verify_rows`]). Le coop
     /// sur tensor-cores, plus lent et hors tolérance ici, a été écarté
     /// (docs/perf/mtp-pairwise.md).
     #[expect(
@@ -2055,16 +2056,8 @@ impl DecodeResidentState {
         moe: &MetalMoeSharedWeights,
         top_k: usize,
     ) -> Result<()> {
-        executor.encode_moe_shared_buffers_rows(
-            encoder,
-            owned,
-            input,
-            Some(residual),
-            layer_out,
-            rows,
-            hidden,
-            moe,
-            top_k,
+        executor.encode_moe_shared_buffers_verify_rows(
+            encoder, owned, input, residual, layer_out, rows, hidden, moe, top_k,
         )
     }
 

@@ -774,6 +774,34 @@ pub(crate) fn moe_verify_rows_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_VERIFY_ROWS", false))
 }
 
+/// Queue MoE de la vérification en lignes (`SARAGOSSA_RUST_MOE_VERIFY_TAIL`) :
+/// 0 = chemin batché générique du prefill (11 dispatches, top-k un thread par
+/// ligne), 1 = top-k parallèle du mono par ligne seul, 2 (défaut) = structure
+/// du mono en 8 dispatches (gate+up partagé fusionné, combine avec partagé).
+/// Niveaux gardés comme référence et pour les ablations.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn moe_verify_tail_level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MOE_VERIFY_TAIL")
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .map_or(2, |level| level.min(2))
+    })
+}
+
+/// Lignes maximales pour le gate+up+SwiGLU partagé fusionné de la vérification
+/// (`SARAGOSSA_RUST_MOE_VERIFY_SHARED_FUSED_MAX_ROWS`) : un threadgroup par ligne
+/// relit les poids partagés, au-delà le qmm2/skinny (lecture unique) reprend.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn moe_verify_shared_fused_max_rows() -> usize {
+    static ROWS: OnceLock<usize> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MOE_VERIFY_SHARED_FUSED_MAX_ROWS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(16)
+    })
+}
+
 /// Drafts par pas de la boucle greedy « lookup seul » (lookup n-grammes sans
 /// tête MTP ni drafter, vérification résidente en lignes) :
 /// `SARAGOSSA_RUST_LOOKUP_GREEDY=n`, borné à 8 (neuf lignes, limite des captures
