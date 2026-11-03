@@ -481,6 +481,54 @@ impl MetalExecutor {
         Ok(buffer)
     }
 
+    /// Alloue le stockage partagé définitif d'un poids affine (codes `u32`,
+    /// scales et minimums bf16) et le fait remplir par `fill` en place, sans
+    /// copie CPU intermédiaire. Metal rend des buffers neufs à zéro.
+    #[expect(
+        unsafe_code,
+        reason = "écriture initiale de MTLBuffer StorageModeShared neufs"
+    )]
+    pub(crate) fn weight_buffers_affine_with(
+        &self,
+        packed_len: usize,
+        affine_len: usize,
+        fill: impl FnOnce(&mut [u32], &mut [u16], &mut [u16]) -> Result<()>,
+    ) -> Result<(metal::Buffer, metal::Buffer, metal::Buffer)> {
+        if packed_len == 0 || affine_len == 0 {
+            return Err(InferError::Metal(
+                "poids affine single-copy vide".to_string(),
+            ));
+        }
+        let new = |bytes: usize| -> Result<metal::Buffer> {
+            let buffer = self.device.new_buffer(
+                checked_nsuint(bytes, "single_copy_weight_affine")?,
+                MTLResourceOptions::StorageModeShared,
+            );
+            if buffer.contents().is_null() {
+                return Err(InferError::Metal(
+                    "MTLBuffer affine StorageModeShared sans pointeur CPU".to_string(),
+                ));
+            }
+            Ok(buffer)
+        };
+        let packed = new(byte_len_usize::<u32>(packed_len)?)?;
+        let scales = new(byte_len_usize::<u16>(affine_len)?)?;
+        let biases = new(byte_len_usize::<u16>(affine_len)?)?;
+        // SAFETY: trois buffers distincts, alloués juste au-dessus en
+        // StorageModeShared avec exactement ces longueurs ; leurs pointeurs CPU
+        // sont non nuls et alignés sur la page. Aucun command buffer ne les
+        // référence avant le retour et les tranches ne survivent pas à `fill`.
+        let (packed_slice, scales_slice, biases_slice) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(packed.contents().cast::<u32>(), packed_len),
+                std::slice::from_raw_parts_mut(scales.contents().cast::<u16>(), affine_len),
+                std::slice::from_raw_parts_mut(biases.contents().cast::<u16>(), affine_len),
+            )
+        };
+        fill(packed_slice, scales_slice, biases_slice)?;
+        Ok((packed, scales, biases))
+    }
+
     /// Alloue le stockage bf16 partagé définitif depuis une source f32 générique.
     pub(crate) fn weight_buffer_from_f32_as_bf16(&self, data: &[f32]) -> Result<metal::Buffer> {
         self.buffer_from_f32_as_bf16(data, "single_copy_weight_affine")

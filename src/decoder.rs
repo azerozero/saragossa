@@ -2446,9 +2446,7 @@ impl CausalDecoder {
         }
         self.lm_head.move_packed_to_metal_shared(metal)?;
         if let Some(mtp) = &mut self.mtp {
-            mtp.fc.move_packed_to_metal_shared(metal)?;
-            mtp.layer.attention.move_packed_to_metal_shared(metal)?;
-            mtp.layer.mlp.move_packed_to_metal_shared(metal)?;
+            mtp.move_packed_to_metal_shared(metal)?;
         }
         if let Some(draft_lm_head) = &mut self.mtp_draft_lm_head {
             draft_lm_head.move_packed_to_metal_shared(metal)?;
@@ -2608,12 +2606,24 @@ impl CausalDecoder {
             .map_or_else(mtp::MtpLoadContext::cpu, mtp::MtpLoadContext::metal);
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let context = mtp::MtpLoadContext::cpu();
-        self.mtp = Some(MtpHead::from_sidecar(
-            path,
-            &self.config,
-            self.final_norm.data().len(),
-            &context,
-        )?);
+        #[cfg_attr(
+            not(all(target_os = "macos", feature = "metal")),
+            expect(unused_mut, reason = "single-copy Metal seulement")
+        )]
+        let mut head =
+            MtpHead::from_sidecar(path, &self.config, self.final_norm.data().len(), &context)?;
+        // La tête arrive après `enable_single_copy_weights` du tronc : sans ce
+        // passage, ses linéaires quantifiées à la charge (fc, attention, expert
+        // partagé, routeur) gardaient une copie CPU à scales f32 en plus de la
+        // copie GPU. Les scales passent en bf16, ce que lisaient déjà les
+        // kernels. Les experts sont, eux, quantifiés directement en Metal.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = self.runtime.metal.as_deref() {
+            if crate::runtime_flags::single_copy_weights_enabled() {
+                head.move_packed_to_metal_shared(metal)?;
+            }
+        }
+        self.mtp = Some(head);
         Ok(self)
     }
 

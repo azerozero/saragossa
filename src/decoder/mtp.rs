@@ -14,6 +14,7 @@ use crate::AffineQuantizedTensor;
 use safetensors::Dtype;
 use safetensors::{tensor::TensorView, SafeTensors};
 use std::collections::HashMap;
+use std::os::unix::fs::FileExt;
 
 pub(super) struct MtpLoadContext<'a> {
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -64,9 +65,24 @@ pub(super) enum MtpMoeQuant {
 
 const MTP_DENSE_MARKER: &str = "mtp.layers.0.mlp.gate_proj.weight";
 const MTP_MOE_MARKER: &str = "mtp.layers.0.mlp.experts.gate_up_proj";
+/// `down_proj` des experts fusionnés. Avec `MTP_MOE_MARKER`, seuls tenseurs
+/// laissés sur disque jusqu'à leur quantification (`LazySidecar`).
+const MTP_MOE_DOWN: &str = "mtp.layers.0.mlp.experts.down_proj";
 const MTP_QUANT_GROUP: usize = 64;
 
 impl MtpHead {
+    /// Déplace les poids quantifiés dans des `MTLBuffer` partagés, experts en
+    /// stacks contigus (`contiguous_metal_expert_stacks`) : une seule copie.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn move_packed_to_metal_shared(
+        &mut self,
+        metal: &crate::MetalExecutor,
+    ) -> Result<()> {
+        self.fc.move_packed_to_metal_shared(metal)?;
+        self.layer.attention.move_packed_to_metal_shared(metal)?;
+        self.layer.mlp.move_packed_to_metal_shared(metal)
+    }
+
     pub(super) fn from_sidecar(
         path: impl AsRef<Path>,
         config: &CausalDecoderConfig,
@@ -86,9 +102,8 @@ impl MtpHead {
         context: &MtpLoadContext<'_>,
         moe_quant: MtpMoeQuant,
     ) -> Result<Self> {
-        let bytes = std::fs::read(path.as_ref())
-            .map_err(|source| InferError::Config(format!("lecture sidecar MTP: {source}")))?;
-        let st = SafeTensors::deserialize(&bytes)
+        let sidecar = LazySidecar::open(path.as_ref())?;
+        let st = SafeTensors::deserialize(&sidecar.bytes)
             .map_err(|source| InferError::Config(format!("parse sidecar MTP: {source}")))?;
         // Résout les clés normalisées (sans préfixe `language_model.`) → clé réelle.
         let mut resolve: HashMap<String, String> = HashMap::new();
@@ -114,7 +129,7 @@ impl MtpHead {
         ) {
             (true, false) => Self::dense_from_tensors(&st, &resolve, config, &dims, context),
             (false, true) => {
-                Self::moe_from_tensors(&st, &resolve, config, &dims, context, moe_quant)
+                Self::moe_from_tensors(&st, &sidecar, &resolve, config, &dims, context, moe_quant)
             }
             (true, true) => Err(InferError::Config(
                 "sidecar MTP ambigu : MLP dense et experts MoE présents".to_string(),
@@ -162,6 +177,7 @@ impl MtpHead {
     /// sortie et MoE softmax top-k à expert partagé gated, tout en bf16.
     fn moe_from_tensors(
         st: &SafeTensors,
+        sidecar: &LazySidecar,
         resolve: &HashMap<String, String>,
         config: &CausalDecoderConfig,
         dims: &MtpDims,
@@ -194,7 +210,7 @@ impl MtpHead {
             config,
         );
         let (gate_weights, up_weights, down_weights) =
-            load_mtp_fused_experts(st, resolve, dims.hidden, quant)?;
+            load_mtp_fused_experts(st, sidecar, resolve, dims.hidden, quant, context)?;
         let expert_count = gate_weights.len();
         if config
             .num_experts
@@ -477,12 +493,14 @@ fn quantize_mtp_linear(linear: Linear, quant: MtpMoeQuant, bits: usize) -> Resul
 )]
 fn load_mtp_fused_experts(
     st: &SafeTensors,
+    sidecar: &LazySidecar,
     resolve: &HashMap<String, String>,
     expected_hidden: usize,
     quant: MtpMoeQuant,
+    _context: &MtpLoadContext<'_>,
 ) -> Result<(Vec<LinearWeight>, Vec<LinearWeight>, Vec<LinearWeight>)> {
     let gate_up = st_view(st, resolve, MTP_MOE_MARKER)?;
-    let down_key = "mtp.layers.0.mlp.experts.down_proj";
+    let down_key = MTP_MOE_DOWN;
     let down = st_view(st, resolve, down_key)?;
     let (&[experts, two_inter, hidden], &[down_experts, down_hidden, inter]) =
         (gate_up.shape(), down.shape())
@@ -519,12 +537,64 @@ fn load_mtp_fused_experts(
     };
     let gate_up_stride = gate_up.data().len() / experts;
     let down_stride = down.data().len() / experts;
-    // Experts indépendants : quantifiés en parallèle (≈ 800 M poids).
+    let gate_up_offset = sidecar.data_offset(resolve, MTP_MOE_MARKER)?;
+    let down_offset = sidecar.data_offset(resolve, down_key)?;
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if let (MtpMoeQuant::Affine, Some(metal)) = (quant, _context.metal) {
+        if crate::runtime_flags::single_copy_weights_enabled() {
+            // gate = première moitié de chaque expert `gate_up`, up = seconde.
+            let half_bytes = gate_up_stride / 2;
+            let projection =
+                |offset: usize, stride: usize, rows: usize, cols: usize, dtype, key| {
+                    quantize_experts_into_metal(
+                        metal,
+                        sidecar,
+                        ExpertSlices {
+                            offset,
+                            stride,
+                            rows,
+                            cols,
+                            dtype,
+                            key,
+                        },
+                        experts,
+                    )
+                };
+            return Ok((
+                projection(
+                    gate_up_offset,
+                    gate_up_stride,
+                    inter,
+                    hidden,
+                    gate_up.dtype(),
+                    MTP_MOE_MARKER,
+                )?,
+                projection(
+                    gate_up_offset + half_bytes,
+                    gate_up_stride,
+                    inter,
+                    hidden,
+                    gate_up.dtype(),
+                    MTP_MOE_MARKER,
+                )?,
+                projection(
+                    down_offset,
+                    down_stride,
+                    hidden,
+                    inter,
+                    down.dtype(),
+                    down_key,
+                )?,
+            ));
+        }
+    }
+    // Experts indépendants : quantifiés en parallèle (≈ 800 M poids), chacun lu
+    // depuis le fichier, jamais les 1,6 Go d'experts bf16 d'un coup.
     let triples = (0..experts)
         .into_par_iter()
         .map(|expert| -> Result<_> {
-            let bytes = &gate_up.data()[expert * gate_up_stride..(expert + 1) * gate_up_stride];
-            let mut rows = bytes_to_dense_f32(bytes, gate_up.dtype(), MTP_MOE_MARKER)?;
+            let bytes = sidecar.read(gate_up_offset + expert * gate_up_stride, gate_up_stride)?;
+            let mut rows = bytes_to_dense_f32(&bytes, gate_up.dtype(), MTP_MOE_MARKER)?;
             // Garde explicite : `split_off` paniquerait sur un expert tronqué.
             let half = inter * hidden;
             if rows.len() != 2 * half {
@@ -537,8 +607,8 @@ fn load_mtp_fused_experts(
             let up_rows = rows.split_off(half);
             let gate = weight(Tensor::from_vec(vec![inter, hidden], rows)?)?;
             let up = weight(Tensor::from_vec(vec![inter, hidden], up_rows)?)?;
-            let bytes = &down.data()[expert * down_stride..(expert + 1) * down_stride];
-            let rows = bytes_to_dense_f32(bytes, down.dtype(), down_key)?;
+            let bytes = sidecar.read(down_offset + expert * down_stride, down_stride)?;
+            let rows = bytes_to_dense_f32(&bytes, down.dtype(), down_key)?;
             let down = weight(Tensor::from_vec(vec![hidden, inter], rows)?)?;
             Ok((gate, up, down))
         })
@@ -552,6 +622,177 @@ fn load_mtp_fused_experts(
         downs.push(down);
     }
     Ok((gates, ups, downs))
+}
+
+/// Une projection des experts dans le fichier : expert `e` à
+/// `offset + e·stride`, matrice `[rows, cols]` de type `dtype`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+struct ExpertSlices<'a> {
+    offset: usize,
+    stride: usize,
+    rows: usize,
+    cols: usize,
+    dtype: Dtype,
+    key: &'a str,
+}
+
+/// Quantifie une projection des experts en u4 gs64 directement dans des
+/// `MTLBuffer` partagés contigus, au format que `contiguous_metal_expert_stacks`
+/// sert sans copie. Passer par des poids CPU puis `move_packed_to_metal_shared`
+/// laissait ≈ 0,6 Go dans l'empreinte : malloc garde les blocs libérés.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn quantize_experts_into_metal(
+    metal: &crate::MetalExecutor,
+    sidecar: &LazySidecar,
+    slices: ExpertSlices<'_>,
+    experts: usize,
+) -> Result<Vec<LinearWeight>> {
+    let ExpertSlices {
+        offset,
+        stride,
+        rows,
+        cols,
+        dtype,
+        key,
+    } = slices;
+    let (packed_cols, groups) = crate::quantization::affine_layout(rows, cols, MTP_QUANT_GROUP, 4)?;
+    let packed_len = rows * packed_cols;
+    let affine_len = rows * groups;
+    let total = |len: usize| {
+        len.checked_mul(experts)
+            .ok_or_else(|| InferError::Shape(format!("experts MTP {key} trop grands")))
+    };
+    let matrix_bytes = (rows * cols)
+        .checked_mul(dtype.bitsize() / 8)
+        .filter(|&bytes| bytes > 0 && bytes <= stride)
+        .ok_or_else(|| InferError::Dimension(format!("experts MTP {key} : dtype {dtype:?}")))?;
+    let (packed, scales, biases) = metal.weight_buffers_affine_with(
+        total(packed_len)?,
+        total(affine_len)?,
+        |packed, scales, biases| {
+            packed
+                .par_chunks_mut(packed_len)
+                .zip(scales.par_chunks_mut(affine_len))
+                .zip(biases.par_chunks_mut(affine_len))
+                .enumerate()
+                .try_for_each(|(expert, ((packed, scales), biases))| -> Result<()> {
+                    let bytes = sidecar.read(offset + expert * stride, matrix_bytes)?;
+                    let data = bytes_to_dense_f32(&bytes, dtype, key)?;
+                    let mut scales_f32 = vec![0.0_f32; affine_len];
+                    let mut biases_f32 = vec![0.0_f32; affine_len];
+                    crate::quantization::quantize_affine_into(
+                        &data,
+                        cols,
+                        MTP_QUANT_GROUP,
+                        4,
+                        packed,
+                        &mut scales_f32,
+                        &mut biases_f32,
+                    )?;
+                    for (out, value) in scales.iter_mut().zip(&scales_f32) {
+                        *out = crate::quantization::bf16_bits(*value);
+                    }
+                    for (out, value) in biases.iter_mut().zip(&biases_f32) {
+                        *out = crate::quantization::bf16_bits(*value);
+                    }
+                    Ok(())
+                })
+        },
+    )?;
+    (0..experts)
+        .map(|expert| {
+            AffineQuantizedTensor::new_metal_shared_bf16(
+                &[rows, packed_cols],
+                packed.clone(),
+                expert * packed_len,
+                packed_len,
+                &[rows, groups],
+                scales.clone(),
+                expert * affine_len,
+                affine_len,
+                &[rows, groups],
+                biases.clone(),
+                expert * affine_len,
+                affine_len,
+                MTP_QUANT_GROUP,
+                4,
+            )
+            .map(LinearWeight::AffineQuantized)
+        })
+        .collect()
+}
+
+/// Sidecar dont les experts fusionnés restent sur disque.
+///
+/// `bytes` a la taille du fichier pour que `SafeTensors` valide le header,
+/// mais seuls le header et les petits tenseurs y sont lus. Les pages des
+/// experts (1,6 Go en bf16 sur le 35B-A3B) ne sont jamais touchées : un
+/// `vec![0; n]` de cette taille vient de `calloc`, en pages zéro paresseuses
+/// hors de l'empreinte physique. Les experts sont lus expert par expert.
+struct LazySidecar {
+    file: std::fs::File,
+    bytes: Vec<u8>,
+    /// Tenseur réel → décalage de ses données dans le fichier.
+    offsets: HashMap<String, usize>,
+}
+
+impl LazySidecar {
+    fn open(path: &Path) -> Result<Self> {
+        let io =
+            |source: std::io::Error| InferError::Config(format!("lecture sidecar MTP: {source}"));
+        let file = std::fs::File::open(path).map_err(io)?;
+        let len = usize::try_from(file.metadata().map_err(io)?.len())
+            .map_err(|_| InferError::Config("sidecar MTP trop grand".to_string()))?;
+        let mut bytes = vec![0_u8; len];
+        let mut len_bytes = [0_u8; 8];
+        file.read_exact_at(&mut len_bytes, 0).map_err(io)?;
+        let data_start = usize::try_from(u64::from_le_bytes(len_bytes))
+            .ok()
+            .and_then(|header| header.checked_add(8))
+            .filter(|&start| start <= len)
+            .ok_or_else(|| InferError::Config("header sidecar MTP invalide".to_string()))?;
+        file.read_exact_at(&mut bytes[..data_start], 0)
+            .map_err(io)?;
+        let (_, metadata) = SafeTensors::read_metadata(&bytes)
+            .map_err(|source| InferError::Config(format!("parse sidecar MTP: {source}")))?;
+        let mut offsets = HashMap::new();
+        for (name, info) in metadata.tensors() {
+            let (start, end) = info.data_offsets;
+            // `read_metadata` a validé `end` contre la taille du fichier.
+            let start = data_start + start;
+            let end = data_start + end;
+            if !matches!(
+                normalize_mtp_sidecar_key(&name).as_str(),
+                MTP_MOE_MARKER | MTP_MOE_DOWN
+            ) {
+                file.read_exact_at(&mut bytes[start..end], start as u64)
+                    .map_err(io)?;
+            }
+            offsets.insert(name, start);
+        }
+        Ok(Self {
+            file,
+            bytes,
+            offsets,
+        })
+    }
+
+    /// Décalage fichier des données du tenseur de clé normalisée `norm_key`.
+    fn data_offset(&self, resolve: &HashMap<String, String>, norm_key: &str) -> Result<usize> {
+        resolve
+            .get(norm_key)
+            .and_then(|actual| self.offsets.get(actual))
+            .copied()
+            .ok_or_else(|| InferError::MissingWeight(norm_key.to_string()))
+    }
+
+    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0_u8; len];
+        self.file
+            .read_exact_at(&mut out, offset as u64)
+            .map_err(|source| InferError::Config(format!("lecture experts MTP: {source}")))?;
+        Ok(out)
+    }
 }
 
 /// Concatène ligne à ligne deux matrices de même hauteur : `[n, a] ++ [n, b] -> [n, a+b]`.
@@ -1064,6 +1305,15 @@ mod tests {
             quant: MtpMoeQuant,
             head_dim: Option<usize>,
         ) -> crate::Result<MtpHead> {
+            load_in(tensors, quant, head_dim, &MtpLoadContext::cpu())
+        }
+
+        fn load_in(
+            tensors: &[(String, Raw)],
+            quant: MtpMoeQuant,
+            head_dim: Option<usize>,
+            context: &MtpLoadContext<'_>,
+        ) -> crate::Result<MtpHead> {
             let views = tensors
                 .iter()
                 .map(|(name, (shape, bytes))| {
@@ -1084,7 +1334,7 @@ mod tests {
                 num_experts_per_tok: 2,
                 ..CausalDecoderConfig::default()
             };
-            MtpHead::from_sidecar_with(tmp.path(), &config, H, &MtpLoadContext::cpu(), quant)
+            MtpHead::from_sidecar_with(tmp.path(), &config, H, context, quant)
         }
 
         fn first(weight: &LinearWeight) -> Option<f32> {
@@ -1144,6 +1394,66 @@ mod tests {
                 let (gate, up, down) = mlp.projections();
                 assert!(affine(gate.weight()) && affine(up.weight()) && affine(down.weight()));
             }
+        }
+
+        /// Les experts quantifiés directement en Metal portent les mêmes codes
+        /// que la quantification CPU, et ses scales et minimums arrondis en bf16
+        /// (ce que lisaient déjà les kernels via `contiguous_metal_expert_stacks`).
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[test]
+        fn metal_experts_match_cpu_quantization_in_bf16() -> crate::Result<()> {
+            let executor = match crate::MetalExecutor::new() {
+                Ok(executor) => executor,
+                Err(InferError::Metal(message)) if message.contains("aucun device") => {
+                    return Ok(())
+                }
+                Err(error) => return Err(error),
+            };
+            let tensors = moe_tensors();
+            let cpu = load_in(
+                &tensors,
+                MtpMoeQuant::Affine,
+                Some(16),
+                &MtpLoadContext::cpu(),
+            )?;
+            let metal = load_in(
+                &tensors,
+                MtpMoeQuant::Affine,
+                Some(16),
+                &MtpLoadContext::metal(&executor),
+            )?;
+            fn experts(head: &MtpHead) -> &[crate::GatedMlp] {
+                match &head.layer.mlp {
+                    FeedForward::Moe(moe) => moe.routed_parts_for_test().1,
+                    FeedForward::Dense(_) => &[],
+                }
+            }
+            let bf16 = |values: &[f32]| -> Vec<f32> {
+                values
+                    .iter()
+                    .map(|&v| f32::from_bits(u32::from(crate::quantization::bf16_bits(v)) << 16))
+                    .collect()
+            };
+            let (cpu_experts, metal_experts) = (experts(&cpu), experts(&metal));
+            assert_eq!((cpu_experts.len(), metal_experts.len()), (E, E));
+            for (cpu_mlp, metal_mlp) in cpu_experts.iter().zip(metal_experts) {
+                let (cg, cu, cd) = cpu_mlp.projections();
+                let (mg, mu, md) = metal_mlp.projections();
+                for (cpu_linear, metal_linear) in [(cg, mg), (cu, mu), (cd, md)] {
+                    let (Some(cpu_w), Some(metal_w)) = (
+                        cpu_linear.affine_quantized(),
+                        metal_linear.affine_quantized(),
+                    ) else {
+                        panic!("experts affines attendus");
+                    };
+                    assert!(cpu_w.packed_metal_view().is_none());
+                    assert!(metal_w.packed_metal_view().is_some());
+                    assert_eq!(metal_w.packed_data(), cpu_w.packed_data());
+                    assert_eq!(*metal_w.scales_f32(), *bf16(&cpu_w.scales_f32()));
+                    assert_eq!(*metal_w.biases_f32(), *bf16(&cpu_w.biases_f32()));
+                }
+            }
+            Ok(())
         }
 
         #[test]
