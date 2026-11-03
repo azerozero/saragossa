@@ -4658,7 +4658,7 @@ fn dflash_sampled_divergence(
     ))
 }
 
-/// DFlash échantillonné sur le modèle réel (`SARAGOSSA_RUST_DFLASH_SAMPLED=1`) :
+/// DFlash échantillonné sur le modèle réel (défaut, coupé par `SARAGOSSA_RUST_DFLASH_SAMPLED=0`) :
 /// - à T = 0,05 (top-k 20, top-p 0,9), chaîne et arbre B = 8 sortent les tokens
 ///   de l'AR échantillonné de même graine, et une graine rejoue sa sortie ;
 /// - à T = 0,7, sur `SARAGOSSA_RUST_DFLASH_SAMPLED_SEEDS` graines (24 par
@@ -4667,7 +4667,7 @@ fn dflash_sampled_divergence(
 ///   avec son diagnostic (probabilités des deux tokens sous l'AR, uniforme).
 ///
 /// Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`,
-/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` et `SARAGOSSA_RUST_DFLASH_SAMPLED=1`.
+/// et `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`.
 #[test]
 #[ignore = "modèle réel + draft DFlash requis"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
@@ -4745,7 +4745,7 @@ fn dflash_sampled_model() -> Result<Option<(CausalDecoder, crate::ModelAssets, c
     if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none()
         || !crate::runtime_flags::dflash_sampled_enabled()
     {
-        eprintln!("skip DFlash échantillonné: drafter ou SARAGOSSA_RUST_DFLASH_SAMPLED=1 absent");
+        eprintln!("skip DFlash échantillonné: drafter absent ou SARAGOSSA_RUST_DFLASH_SAMPLED=0");
         return Ok(None);
     }
     let assets = crate::ModelAssets::load_local(&model_dir)?;

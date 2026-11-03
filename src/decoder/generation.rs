@@ -1311,7 +1311,7 @@ impl CausalDecoder {
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         // Drafter DFlash opt-in (`with_dflash_draft_from_env`) : le greedy non
         // contraint passe par la boucle résidente, stop sequences comprises ;
-        // l'échantillonné aussi sous `SARAGOSSA_RUST_DFLASH_SAMPLED=1` quand le
+        // l'échantillonné aussi (sauf `SARAGOSSA_RUST_DFLASH_SAMPLED=0`) quand le
         // sampler GPU sait tirer ses paramètres, sinon il garde la tête MTP comme
         // les contraintes. Phase 7 pairwise : code +31 à +88 %, prose longue
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).

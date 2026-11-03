@@ -920,9 +920,9 @@ de 5-6 %) : le comportement actuel est conservé. Une bascule par acceptance
 récupérerait les pertes, mais son re-prefill coûte cher à long contexte sans
 cache de préfixe.
 
-### DFlash échantillonné, chaîne et arbre (3 nov. 2026, opt-in)
+### DFlash échantillonné, chaîne et arbre (3 nov. 2026, par défaut)
 
-`SARAGOSSA_RUST_DFLASH_SAMPLED=1` (défaut 0) route les requêtes à température > 0
+`SARAGOSSA_RUST_DFLASH_SAMPLED` (défaut 1 depuis le 3 nov., 0 pour revenir à la tête MTP) route les requêtes à température > 0
 vers le drafter DFlash quand le sampler GPU de l'AR sait tirer leurs paramètres
 (top_k de 1 à 32, ou top_k = 0 et top_p = 1) ; sinon elles gardent la tête MTP.
 La tête de vérification `Sample` tire chaque ligne sur le GPU avec le sampler de
@@ -980,8 +980,31 @@ consomme des aléas pour ses drafts, l'acceptation et le résidu) : ses textes
 diffèrent, ceux de C et T suivent l'AR. Avec top-k 20, le MTP échantillonné
 passe par la distribution par paires (tri CPU du vocabulaire par ligne) et ne
 dépasse guère l'AR (~32 tok/s, non remesuré ici) : une part de l'écart T/M vient
-de ce chemin. Le flag reste opt-in ; le passer par défaut avec un drafter
-configuré demande la même mesure à top-k 0 / top-p 1 (Gumbel) et sur `serve`.
+de ce chemin.
+
+Mesures de passage au défaut (3 nov., même binaire, `main` 7069020) :
+
+- **Gumbel** (top-k 0, top-p 1, T = 0,7), même protocole, 3 tours M T / T M /
+  M T : l'arbre garde l'avantage sans le chemin top-k du MTP. Le texte de T
+  au tour 1 est celui de l'AR échantillonné de même graine sur les quatre cas.
+
+| Cas | M (tok/s) | T (tok/s) | T/M médian |
+|---|---|---|---|
+| code 4k | 41,0-46,8 | 51,4-60,1 | +32,3 % |
+| prose 4k | 42,2-44,2 | 43,5-50,6 | +6,5 % |
+| code 32k | 36,6-40,2 | 46,7-64,6 | +29,7 % |
+| prose 32k | 37,0-37,6 | 42,8-48,1 | +22,8 % |
+
+- **`serve`** (prompts de chat courts et code 4k, 300 tokens, T = 0,7, graine
+  serve 0, deux passes AR / MTP / DFlash puis l'inverse) : les 22 réponses de
+  DFlash, streamées ou non, `stop` compris, sont celles de l'AR. Débit mural
+  moyen (prefill inclus) DFlash contre MTP : top-k 20 de +4 % (prose + `stop`)
+  à +131 % (code court) ; Gumbel de −10 % (prose courte + `stop`) et −7 %
+  (prose courte) à +56 % (code court). La prose courte reste le cas faible,
+  comme en greedy où l'arbre est déjà le défaut.
+
+Le flag passe donc par défaut dès qu'un drafter est configuré ;
+`SARAGOSSA_RUST_DFLASH_SAMPLED=0` rend l'échantillonné à la tête MTP.
 
 ## Vérification MoE en lignes et lookup sans tête MTP (Qwen3.6-35B-A3B)
 

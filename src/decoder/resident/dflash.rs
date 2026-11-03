@@ -159,7 +159,7 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Renvoie une erreur si l'échantillonnage (température > 0) n'est pas permis
-    /// (`SARAGOSSA_RUST_DFLASH_SAMPLED=1` et paramètres du sampler GPU), si le decode résident
+    /// (`SARAGOSSA_RUST_DFLASH_SAMPLED=0` ou paramètres hors du sampler GPU), si le decode résident
     /// complet n'est pas disponible pour ce modèle, ou si un encodage échoue.
     pub fn generate_greedy_dflash_resident_with_options(
         &self,
@@ -1120,7 +1120,7 @@ pub(in crate::decoder) fn dflash_sampling_refusal(
         return None;
     }
     if !crate::runtime_flags::dflash_sampled_enabled() {
-        return Some("échantillonnage (temperature > 0) exige SARAGOSSA_RUST_DFLASH_SAMPLED=1");
+        return Some("échantillonnage (temperature > 0) coupé par SARAGOSSA_RUST_DFLASH_SAMPLED=0");
     }
     if !super::resident_sampling_on_device(options) {
         return Some(
