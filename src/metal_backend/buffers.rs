@@ -874,6 +874,7 @@ impl MetalExecutor {
         label: &'static str,
         options: MTLResourceOptions,
     ) -> Result<metal::Buffer> {
+        let len = scratch_len_for_rows(len);
         let key = ScratchBufferKey {
             label,
             len,

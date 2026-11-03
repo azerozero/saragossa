@@ -840,6 +840,9 @@ impl MetalExecutor {
                     rows: chunk_rows.min(spec.seq - chunk_start),
                     total: spec.seq,
                 };
+                // Dernier morceau plus court : ses scratch internes reprennent
+                // ceux des morceaux pleins au lieu d'un second jeu.
+                let _scratch_rows = enter_scratch_row_capacity(chunk.rows, chunk_rows);
                 let chunk_hidden_len =
                     checked_len(chunk.rows, hidden_dim, "prefill résident hidden morceau")?;
                 let chunk_offset_bytes = f32_byte_offset(checked_len(
