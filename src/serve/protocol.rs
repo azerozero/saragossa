@@ -57,7 +57,8 @@ pub(super) struct ChatCompletionRequest {
     #[serde(default)]
     pub(super) seed: Option<u64>,
     /// Arguments du template de chat (extension vLLM / llama.cpp) : seul
-    /// `enable_thinking` est reconnu, toute autre clé est refusée.
+    /// `enable_thinking` est reconnu (et seulement à `false`, cf. `check_thinking`),
+    /// toute autre clé est refusée.
     #[serde(default)]
     pub(super) chat_template_kwargs: Option<serde_json::Map<String, Value>>,
     /// Options du flux SSE (`stream_options` OpenAI).

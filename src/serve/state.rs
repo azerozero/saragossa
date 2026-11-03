@@ -1198,7 +1198,7 @@ impl LoadedModel {
         }
         let thinking = request.enable_thinking()?;
         let rendered = if self.assets.config.is_flint() {
-            thinking_switch(thinking, false)?;
+            check_thinking(thinking, false)?;
             let tools: Vec<String> = request
                 .active_tools()?
                 .iter()
@@ -1206,12 +1206,14 @@ impl LoadedModel {
                 .collect();
             render_flint_chat(&messages, &tools, true)
         } else if self.assets.config.is_gemma4() {
-            render_gemma4_chat(&messages, true, thinking_switch(thinking, true)?)
+            check_thinking(thinking, true)?;
+            render_gemma4_chat(&messages, true, false)
         } else if self.assets.config.is_gemma() {
-            thinking_switch(thinking, false)?;
+            check_thinking(thinking, false)?;
             render_gemma_chat(&messages, true)
         } else {
-            render_qwen_chatml(&messages, true, thinking_switch(thinking, true)?)
+            check_thinking(thinking, true)?;
+            render_qwen_chatml(&messages, true, false)
         };
         let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
         Ok(PromptEncoding {
@@ -1577,15 +1579,25 @@ fn prompt_fingerprint(tokens: &[usize]) -> u64 {
         })
 }
 
-/// Thinking du rendu : désactivé par défaut (comportement historique). Un
-/// rendu sans interrupteur (`configurable` faux : flint, Gemma 3) refuse une
-/// demande explicite plutôt que de l'ignorer.
-fn thinking_switch(requested: Option<bool>, configurable: bool) -> ServeResult<bool> {
+/// Thinking demandé par `chat_template_kwargs` : seul `false` (le rendu
+/// historique) est admis, et seulement par un rendu qui désactive le thinking
+/// (`renders_off` : Qwen ChatML, Gemma 4). Flint et Gemma 3, sans
+/// interrupteur, refusent toute valeur explicite plutôt que de l'ignorer.
+///
+/// NOTE: `enable_thinking=true` est refusé partout : le rendu natif ne pose
+/// pas le préfixe `<think>\n` du template Qwen et normalise l'historique
+/// assistant en thinking désactivé. Le router demande un rendu qualifié contre
+/// le template de référence, sur plusieurs tours.
+fn check_thinking(requested: Option<bool>, renders_off: bool) -> ServeResult<()> {
     match requested {
-        Some(_) if !configurable => Err(ServeError::Http(
+        Some(true) => Err(ServeError::Http(
+            "chat_template_kwargs.enable_thinking=true n'est pas supporté (thinking désactivé)"
+                .to_string(),
+        )),
+        Some(false) if !renders_off => Err(ServeError::Http(
             "chat_template_kwargs.enable_thinking n'est pas supporté pour ce modèle".to_string(),
         )),
-        requested => Ok(requested.unwrap_or(false)),
+        _ => Ok(()),
     }
 }
 
@@ -1632,13 +1644,13 @@ mod tests {
     }
 
     #[test]
-    fn thinking_switch_defaults_off_and_refuses_fixed_templates() {
-        assert!(!thinking_switch(None, true).expect("invariant: défaut admis"));
-        assert!(thinking_switch(Some(true), true).expect("invariant: rendu configurable"));
-        assert!(!thinking_switch(Some(false), true).expect("invariant: rendu configurable"));
-        assert!(!thinking_switch(None, false).expect("invariant: défaut admis"));
-        assert!(thinking_switch(Some(false), false).is_err());
-        assert!(thinking_switch(Some(true), false).is_err());
+    fn check_thinking_admits_only_disabled_thinking() {
+        assert!(check_thinking(None, true).is_ok());
+        assert!(check_thinking(Some(false), true).is_ok());
+        assert!(check_thinking(None, false).is_ok());
+        assert!(check_thinking(Some(true), true).is_err());
+        assert!(check_thinking(Some(false), false).is_err());
+        assert!(check_thinking(Some(true), false).is_err());
     }
 
     #[test]
