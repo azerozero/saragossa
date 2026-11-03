@@ -599,6 +599,17 @@ pub(super) struct ChatCompletionChunk {
 }
 
 impl ChatCompletionChunk {
+    /// Identifiant neuf d'un flux, partagé par tous ses chunks (comme OpenAI).
+    pub(super) fn stream_id() -> String {
+        response_id("chatcmpl")
+    }
+
+    /// Remplace l'identifiant du chunk par celui de son flux.
+    pub(super) fn with_id(mut self, id: &str) -> Self {
+        id.clone_into(&mut self.id);
+        self
+    }
+
     /// Construit le chunk d'usage final (`stream_options.include_usage`).
     pub(super) fn usage(model: &str, usage: Usage) -> Self {
         Self {

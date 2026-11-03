@@ -415,6 +415,7 @@ fn flint_finish_reason(finish_reason: &'static str, has_tool_calls: bool) -> &'s
 
 fn write_flint_events<S: Write>(
     stream: &mut S,
+    id: &str,
     model: &str,
     events: Vec<FlintEvent>,
 ) -> ServeResult<()> {
@@ -424,7 +425,7 @@ fn write_flint_events<S: Write>(
             FlintEvent::Content(text) => ChatCompletionChunk::content(model, text),
             FlintEvent::ToolCall(call) => ChatCompletionChunk::tool_call(model, call),
         };
-        write_sse_event(stream, &chunk)?;
+        write_sse_event(stream, &chunk.with_id(id))?;
     }
     Ok(())
 }
@@ -449,6 +450,8 @@ struct OpenAiSse<'a, S> {
     model: String,
     /// `stream_options.include_usage` : chunk d'usage avant `[DONE]`.
     include_usage: bool,
+    /// Identifiant commun à tous les chunks du flux.
+    id: String,
 }
 
 impl<'a, S: Write> OpenAiSse<'a, S> {
@@ -459,6 +462,7 @@ impl<'a, S: Write> OpenAiSse<'a, S> {
             started: false,
             model: String::new(),
             include_usage,
+            id: ChatCompletionChunk::stream_id(),
         }
     }
 
@@ -483,7 +487,10 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
                     None,
                     start.metric_headers(),
                 )?;
-                write_sse_event(self.stream, &ChatCompletionChunk::role(&start.model))?;
+                write_sse_event(
+                    self.stream,
+                    &ChatCompletionChunk::role(&start.model).with_id(&self.id),
+                )?;
             }
             CompletionStreamEvent::Delta(delta) => {
                 if delta.is_empty() {
@@ -491,11 +498,12 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
                 }
                 match self.flint.as_mut() {
                     Some(parser) => {
-                        write_flint_events(self.stream, &self.model, parser.push(delta))?;
+                        write_flint_events(self.stream, &self.id, &self.model, parser.push(delta))?;
                     }
                     None => write_sse_event(
                         self.stream,
-                        &ChatCompletionChunk::content(&self.model, delta.to_string()),
+                        &ChatCompletionChunk::content(&self.model, delta.to_string())
+                            .with_id(&self.id),
                     )?,
                 }
             }
@@ -520,17 +528,17 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
         };
         let mut finish_reason = completion.finish_reason;
         if let Some(parser) = self.flint.as_mut() {
-            write_flint_events(self.stream, &completion.model, parser.finish())?;
+            write_flint_events(self.stream, &self.id, &completion.model, parser.finish())?;
             finish_reason = flint_finish_reason(finish_reason, parser.has_tool_calls());
         }
         write_sse_event(
             self.stream,
-            &ChatCompletionChunk::done(&completion.model, finish_reason),
+            &ChatCompletionChunk::done(&completion.model, finish_reason).with_id(&self.id),
         )?;
         if self.include_usage {
             write_sse_event(
                 self.stream,
-                &ChatCompletionChunk::usage(&completion.model, completion.usage),
+                &ChatCompletionChunk::usage(&completion.model, completion.usage).with_id(&self.id),
             )?;
         }
         self.stream
@@ -1301,6 +1309,7 @@ mod tests {
         assert_eq!(with_usage[1]["choices"], serde_json::json!([]));
         assert_eq!(with_usage[1]["usage"]["prompt_tokens"], 7);
         assert_eq!(with_usage[1]["usage"]["completion_tokens"], 3);
+        assert_eq!(with_usage[0]["id"], with_usage[1]["id"]);
         assert_eq!(frames(false).len(), 1);
     }
 }
