@@ -921,7 +921,7 @@ impl LoadedModel {
         };
         let content = strip_text_stops(decoded, &prepared.stop_texts);
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{} footprint_bytes={} prefix_cache_bytes={}",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{} footprint_bytes={} prefix_cache_bytes={} prompt_fnv1a64={:016x}",
             self.id,
             prompt_tokens,
             output.tokens.len(),
@@ -933,7 +933,8 @@ impl LoadedModel {
             path.decode_path,
             if path.streaming { " streaming=true" } else { "" },
             process_footprint_bytes().unwrap_or(0),
-            self.prefix_cache_bytes()
+            self.prefix_cache_bytes(),
+            prompt_fingerprint(&prepared.tokens)
         );
         Ok(ServedCompletion {
             model: self.id.clone(),
@@ -1564,6 +1565,18 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+/// Empreinte FNV-1a 64 bits des ids du prompt, chacun en u32 little-endian.
+/// Publiée dans le journal de complétion, elle prouve à un client que les ids
+/// réellement ingérés sont ceux qu'il a calculés de son côté.
+fn prompt_fingerprint(tokens: &[usize]) -> u64 {
+    tokens
+        .iter()
+        .flat_map(|&token| u32::try_from(token).unwrap_or(u32::MAX).to_le_bytes())
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+}
+
 /// Thinking du rendu : désactivé par défaut (comportement historique). Un
 /// rendu sans interrupteur (`configurable` faux : flint, Gemma 3) refuse une
 /// demande explicite plutôt que de l'ignorer.
@@ -1606,6 +1619,16 @@ mod tests {
         assert_eq!(prefix_blocks_usable(false, false), enabled);
         assert_eq!(prefix_blocks_usable(true, true), enabled);
         assert!(!prefix_blocks_usable(true, false));
+    }
+
+    /// Vecteurs recalculés indépendamment (FNV-1a 64 de référence).
+    #[test]
+    fn prompt_fingerprint_matches_reference_fnv1a() {
+        assert_eq!(prompt_fingerprint(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(
+            prompt_fingerprint(&[248_045, 872, 198]),
+            0xa5c9_7340_54dc_81d8
+        );
     }
 
     #[test]

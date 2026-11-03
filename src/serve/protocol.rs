@@ -207,9 +207,11 @@ impl ChatCompletionRequest {
                         "chat_template_kwargs.enable_thinking doit être un booléen, reçu {other}"
                     )))
                 }
-                (other, _) => return Err(ServeError::Http(format!(
+                (other, _) => {
+                    return Err(ServeError::Http(format!(
                     "chat_template_kwargs.{other} n'est pas supporté (seul enable_thinking l'est)"
-                ))),
+                )))
+                }
             }
         }
         Ok(thinking)
