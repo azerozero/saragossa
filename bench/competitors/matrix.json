@@ -63,7 +63,8 @@
      "enable_thinking": false
     }
    },
-   "usage_counts_eos": null
+   "usage_counts_eos": null,
+   "injected_content_prefix": "<think>\n\n</think>\n\n"
   },
   "mlx": {
    "model": "default_model",

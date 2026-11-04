@@ -192,6 +192,27 @@ def cache_probes(rows):
     return verdicts, ratios
 
 
+def strip_injected_prefix(line, prefix):
+    """Retire un préfixe que le serveur ajoute au contenu sans que le modèle l'ait généré.
+
+    llama-server (`--reasoning-format none`) recopie en tête de `content` le bloc
+    `<think>\\n\\n</think>\\n\\n` déjà présent dans le prompt : `usage` ne le compte
+    pas (« Paris » + EOS = 2 tokens). Il est retiré du premier événement et du
+    texte, et la ligne le signale (`injected_prefix_stripped`).
+    """
+    if not prefix or not line.get("content", "").startswith(prefix):
+        return
+    for event in line["events"]:
+        if event.get("content_chars", 0) + event.get("reasoning_chars", 0) > 0:
+            if not event.get("text", "").startswith(prefix):
+                return
+            event["text"] = event["text"][len(prefix):]
+            event["content_chars"] -= len(prefix)
+            break
+    line["content"] = line["content"][len(prefix):]
+    line["injected_prefix_stripped"] = True
+
+
 def load_matrix(run_dir):
     frozen = pathlib.Path(run_dir) / "matrix.frozen.json"
     return json.loads((frozen if frozen.exists() else HERE / "matrix.json").read_text())
@@ -220,6 +241,8 @@ def load(run_dir):
             continue
         line["prompt_kind"] = kinds.get(line["prompt"], "?")
         if line.get("status") == "ok":
+            strip_injected_prefix(line, matrix["engines"][line["engine"]].get(
+                "injected_content_prefix"))
             eos = matrix["engines"][line["engine"]].get("usage_counts_eos")
             line["m"] = derive(line, tok, eos)
         line["throttled"] = bool(line.get("thermal_before_load")) or (
@@ -689,6 +712,11 @@ def _self_check():
                 "finish_reason": finish}
 
     tok = Tok()
+    injected = line(["<t>x", "y"], 3)
+    injected["content"] = "<t>xy"
+    strip_injected_prefix(injected, "<t>")
+    assert injected["content"] == "xy" and injected["events"][0]["text"] == "x"
+    assert derive(injected, tok, True)["exact"]
     m = derive(line(["x", "y", "z"], 4), tok, True)
     assert m["exact"] and m["k"] == 1 and m["delivery_tok_s"] == 1.0
     # Deux événements pour trois tokens (« y », puis « zw ») : jamais exact.
