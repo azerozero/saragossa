@@ -236,9 +236,9 @@
     "--topk=1"
    ],
    "slots": {
-    "llmd-batching": {},
-    "llmd-native": {}
-   }
+    "llmd-batching": {}
+   },
+   "unsupported": "llmd 20261029 : --speculative-drafter-model=native s'arrête au chargement (\"Resolving speculative drafter model repo\" puis \"error: FileNotFound\"), essai de validation du 4 nov. 2026"
   },
   "llmd-ar-s": {
    "engine": "llmd",
@@ -265,9 +265,9 @@
     "--topk=20"
    ],
    "slots": {
-    "llmd-batching": {},
-    "llmd-native": {}
-   }
+    "llmd-batching": {}
+   },
+   "unsupported": "llmd 20261029 : --speculative-drafter-model=native s'arrête au chargement (\"Resolving speculative drafter model repo\" puis \"error: FileNotFound\"), essai de validation du 4 nov. 2026"
   },
   "mlx-ar": {
    "engine": "mlx",
@@ -499,36 +499,6 @@
      ]
     }
    ]
-  },
-  "llmd-native": {
-   "probe": "llmd-native",
-   "metric": "delivery_tok_s",
-   "prompts": [
-    "tune-chat-1",
-    "tune-code4k-1",
-    "tune-prose4k-1"
-   ],
-   "candidates": [
-    {
-     "args": []
-    },
-    {
-     "args": [
-      "--speculative-draft-count=1"
-     ]
-    },
-    {
-     "args": [
-      "--speculative-draft-count=2"
-     ]
-    },
-    {
-     "args": [
-      "--speculative-draft-count=3"
-     ]
-    }
-   ],
-   "reference": "llmd-ar"
   },
   "mlx-prefill": {
    "probe": "mlx-ar",
