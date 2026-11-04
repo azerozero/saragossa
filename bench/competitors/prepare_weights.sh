@@ -8,14 +8,14 @@
 # Usage : prepare_weights.sh [--check-only]
 #   --check-only : sha256 des entrées seulement, sans quantifier.
 set -euo pipefail
+source "$(dirname "$0")/paths.sh"
 
-SRC_DIR="${SRC_DIR:-/Users/ludwig/workspace/ai_model/Qwen3.8-27B-GGUF-ggml}"
-DFLASH_GGUF="${DFLASH_GGUF:-/Users/ludwig/workspace/ai_model/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-BF16.gguf}"
-OUT="${OUT:-/Users/ludwig/workspace/ai_model/Qwen3.8-27B-GGUF-bench}"
+DFLASH_GGUF="${GGUF_DFLASH}"
+OUT="${GGUF_DIR}"
 QUANTIZE="${QUANTIZE:-llama-quantize}"
 
-trunk_bf16="${SRC_DIR}/Qwen3.8-27B-BF16.gguf"
-mtp_bf16="${SRC_DIR}/mtp-Qwen3.8-27B-BF16.gguf"
+trunk_bf16="${GGUF_BF16}"
+mtp_bf16="${GGUF_MTP_BF16}"
 
 mkdir -p "${OUT}"
 cd "${OUT}"
