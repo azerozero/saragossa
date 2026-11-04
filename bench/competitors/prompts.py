@@ -71,6 +71,9 @@ CHAT = {
               "beans, grind, water, timing, and the most common mistakes.",
     "tune-chat-1": "Explain in depth how a garbage collector based on generational "
                    "copying works, with diagrams described in text and pseudo-code.",
+    # Sondes EOS de la validation : arrêt naturel attendu bien avant 400 tokens.
+    "eos-short-1": "What is the capital of France? Answer with one word only.",
+    "eos-short-2": "List the three primary colors of paint, separated by commas, and nothing else.",
 }
 
 # (id, split, target_tokens, source). Sources de code : chemin relatif à
@@ -230,7 +233,7 @@ def build(out_dir):
     for prompt_id, text in CHAT.items():
         content = NONCE_LINE.format(nonce=NONCE_PLACEHOLDER) + text
         prompts.append({
-            "id": prompt_id, "kind": "chat", "split": "tune" if prompt_id.startswith("tune") else "eval",
+            "id": prompt_id, "kind": "chat", "split": ("tune" if prompt_id.startswith("tune") else "probe" if prompt_id.startswith("eos") else "eval"),
             "target_tokens": None, "content": content, "source": {"origin": "harness"},
         })
     for prompt_id, split, target, source in DOCS:
