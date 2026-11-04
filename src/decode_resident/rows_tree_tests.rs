@@ -494,3 +494,127 @@ fn compact_tree_rows_matches_cpu_and_refuses_invalid_paths() -> Result<()> {
     assert!(quantized.compact_tree_rows(context, &[0, 2]).is_err());
     Ok(())
 }
+
+/// Attention en lignes de `rows` requêtes `q` sur le KV `keys`/`values`
+/// (`len` positions), sous `tree` éventuel, hors NAX.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "cas de test : géométrie, KV, requêtes et arbre explicites"
+)]
+fn run_attention_rows(
+    state: &DecodeResidentState,
+    head_dim: usize,
+    format: KvFormat,
+    keys: &[f32],
+    values: &[f32],
+    len: usize,
+    q: &[f32],
+    rows: usize,
+    tree: Option<Rc<VerifyTree>>,
+) -> Result<Vec<f32>> {
+    let mut kv = state.full_attention_format_for_test(len, Q_HEADS, KV_HEADS, head_dim, format)?;
+    kv.seed(keys, values, len)?;
+    let q_buf = lease_with(state, q)?;
+    let out = state
+        .scratch()
+        .lease(rows * Q_HEADS * head_dim, GpuElement::F32)?;
+    let kernels = state.rows_kernels()?;
+    let command_buffer = state.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    {
+        let _scope = tree.map(install_verify_tree_scope);
+        kv.encode_attention_decode_rows_chunked(
+            encoder,
+            kernels,
+            q_buf.tensor().buffer(),
+            out.tensor().buffer(),
+            rows,
+            None,
+            None,
+        )?;
+    }
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    Ok(read_f32(out.tensor()))
+}
+
+/// Oracle O1 de l'arbre : la ligne d'un nœud, calculée sous l'arbre (KV du
+/// préfixe puis de tous les nœuds, masque d'ancêtres), doit rendre les bits de
+/// la même requête en dernière ligne d'une chaîne dont le KV ne contient que
+/// le préfixe puis le chemin du nœud (ce que voit le pas AR). Diagnostic :
+/// imprime les nœuds divergents.
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn full_attn_rows_tree_node_matches_path_chain_bits() -> Result<()> {
+    let state = gpu_state()?;
+    let mut report = Vec::new();
+    for head_dim in [128, 256] {
+        for format in [KvFormat::F32, KvFormat::Bf16] {
+            for context in [5usize, 2100, 4220] {
+                for parents in TREES {
+                    let rows = parents.len();
+                    let tree = tree(parents)?;
+                    let kv_dim = KV_HEADS * head_dim;
+                    let q_dim = Q_HEADS * head_dim;
+                    let total = context + rows;
+                    let keys: Vec<f32> = (0..total * kv_dim).map(|i| pseudo(i + 3)).collect();
+                    let values: Vec<f32> = (0..total * kv_dim).map(|i| pseudo(i + 11)).collect();
+                    let q: Vec<f32> = (0..rows * q_dim).map(|i| 30.0 * pseudo(7000 + i)).collect();
+                    let got = run_attention_rows(
+                        &state,
+                        head_dim,
+                        format,
+                        &keys,
+                        &values,
+                        total,
+                        &q,
+                        rows,
+                        Some(tree.clone()),
+                    )?;
+                    for node in 0..rows {
+                        let mut path = vec![node];
+                        while *path.last().expect("invariant: chemin non vide") != 0 {
+                            let parent = parents[*path.last().expect("invariant: chemin")];
+                            path.push(parent);
+                        }
+                        path.reverse();
+                        let mut chain_keys = keys[..context * kv_dim].to_vec();
+                        let mut chain_values = values[..context * kv_dim].to_vec();
+                        let mut chain_q = Vec::new();
+                        for &p in &path {
+                            let at = (context + p) * kv_dim;
+                            chain_keys.extend_from_slice(&keys[at..at + kv_dim]);
+                            chain_values.extend_from_slice(&values[at..at + kv_dim]);
+                            chain_q.extend_from_slice(&q[p * q_dim..(p + 1) * q_dim]);
+                        }
+                        let chain = run_attention_rows(
+                            &state,
+                            head_dim,
+                            format,
+                            &chain_keys,
+                            &chain_values,
+                            context + path.len(),
+                            &chain_q,
+                            path.len(),
+                            None,
+                        )?;
+                        let last = (path.len() - 1) * q_dim;
+                        let differing = got[node * q_dim..(node + 1) * q_dim]
+                            .iter()
+                            .zip(&chain[last..last + q_dim])
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        if differing > 0 && report.len() < 12 {
+                            report.push(format!(
+                                "d{head_dim} {format:?} contexte {context} arbre {parents:?} nœud {node} (profondeur {}): {differing}/{q_dim}",
+                                path.len() - 1
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(report.is_empty(), "arbre ≠ chaîne du chemin : {report:#?}");
+    Ok(())
+}
