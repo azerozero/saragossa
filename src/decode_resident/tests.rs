@@ -2993,6 +2993,12 @@ fn full_attn_rows_fused_matches_row_loop_all_rows() -> Result<()> {
         }
         run_rows_fused_case(&state, 4221, 4232, 256, KvFormat::F32, None, rows)?;
     }
+    // Contextes longs du greedy à KV bf16 (≥ 16k), hors préfixe NAX.
+    for rows in 2..=4 {
+        for prefix in [16390, 32819] {
+            run_rows_fused_case(&state, prefix, prefix + 8, 256, KvFormat::Bf16, None, rows)?;
+        }
+    }
     Ok(())
 }
 

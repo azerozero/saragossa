@@ -1013,7 +1013,7 @@ impl FullAttentionMetalState {
         window: Option<usize>,
     ) -> Result<()> {
         let (kernels, _) = kernels.select()?;
-        if crate::runtime_flags::verify_rows_nax_enabled() && self.rows_nax_eligible(rows, window) {
+        if crate::metal_backend::verify_rows_nax_allowed() && self.rows_nax_eligible(rows, window) {
             if let Some(nax) = kernels.nax(self.head_dim())? {
                 return self.encode_attention_rows_nax(encoder, nax, q_rows, out_rows, rows);
             }

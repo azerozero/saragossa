@@ -1298,6 +1298,8 @@ impl CausalDecoder {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };
+        // Cycle fusionné : greedy seulement (température nulle).
+        let _greedy_guard = crate::metal_backend::install_verify_greedy_scope(true);
         let head_dim = self
             .config
             .head_dim
@@ -1978,6 +1980,8 @@ impl CausalDecoder {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };
+        // Cycle fusionné : greedy seulement (température nulle).
+        let _greedy_guard = crate::metal_backend::install_verify_greedy_scope(true);
         let head_dim = self
             .config
             .head_dim

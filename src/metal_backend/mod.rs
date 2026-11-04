@@ -152,7 +152,10 @@ pub use self::profiling::{
 };
 pub(crate) use self::profiling::{profile_dispatch, profile_dispatch_shape, trace_dispatch_path};
 pub(crate) use self::scratch::install_scratch_namespace;
-pub(crate) use self::verify_tree::{install_verify_tree_scope, verify_tree, VerifyTree};
+pub(crate) use self::verify_tree::{
+    install_verify_greedy_scope, install_verify_tree_scope, verify_rows_nax_allowed, verify_tree,
+    VerifyTree,
+};
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
