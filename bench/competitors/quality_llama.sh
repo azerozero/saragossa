@@ -19,14 +19,33 @@ venv=("${MLX_VENV}/bin/python" -I -B)
 llama-server -m "${GGUF_Q4_0}" --host 127.0.0.1 --port "${port}" -np 1 -c 4096 \
   > "${out}/llama-ids-server.log" 2>&1 &
 server=$!
-trap 'kill "${server}" 2>/dev/null || true; wait "${server}" 2>/dev/null || true' EXIT
+
+# Arrêt avec escalade : SIGTERM, 30 s, puis SIGKILL ; échec si le PID survit.
+stop_server() {
+  kill "${server}" 2>/dev/null || return 0
+  for _ in $(seq 30); do
+    kill -0 "${server}" 2>/dev/null || { wait "${server}" 2>/dev/null || true; return 0; }
+    sleep 1
+  done
+  kill -9 "${server}" 2>/dev/null || true
+  sleep 2
+  if kill -0 "${server}" 2>/dev/null; then
+    echo "llama-server ${server} survit à SIGKILL" >&2
+    return 1
+  fi
+}
+trap stop_server EXIT
+deadline=$((SECONDS + 600))
 until curl -sf "http://127.0.0.1:${port}/health" > /dev/null; do
   kill -0 "${server}" 2>/dev/null || { echo "llama-server arrêté" >&2; exit 1; }
+  if ((SECONDS > deadline)); then
+    echo "llama-server pas prêt en 600 s" >&2
+    exit 1
+  fi
   sleep 1
 done
 "${venv[@]}" "${here}/quality.py" llama-ids "${WIKITEXT_TEST}" "${port}" | tee "${out}/llama-ids.json"
-kill "${server}"
-wait "${server}" 2>/dev/null || true
+stop_server
 trap - EXIT
 
 common=(-f "${WIKITEXT_TEST}" -c 512 --chunks 32 -ngl all -fa on -b 512 -ub 512)

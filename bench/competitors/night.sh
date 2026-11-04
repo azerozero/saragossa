@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Enchaîne une nuit de campagne (protocole v4, §12). Machine libre, secteur.
+# Enchaîne une nuit de campagne (protocole v5, §12). Machine libre, secteur.
 #
 # Usage : night.sh validate|1|2 RUN_DIR
-#   validate : essai de validation (1 prompt de réglage à 4k, chaque config)
+#   validate : essai de validation (prompts de réglage 4k et sondes EOS)
 #   1        : réglage, gel des réglages (freeze), puis eval-S et eval-M
 #   2        : qualité (ids du corpus, PPL, KL, llama-bench), échantillonné
 #              exploratoire, 256k
 # RUN_DIR doit contenir prompts/prompts.json (prompts.py build).
-# Le verrou GPU des agents est pris s'il est défini (GPU_LOCK) et rendu à la fin.
+#
+# Reprise : relancer la même nuit reprend l'étape interrompue. Un plan déjà tiré
+# (plan-<phases>.json) n'est jamais retiré : il est réutilisé tel quel, et
+# `run` saute les entrées terminées. Un gel déjà écrit n'est pas refait.
 # Toute étape en échec (empreintes en désaccord, gel impossible, moteur
 # survivant) arrête la nuit : rien n'est mesuré sur une base non validée.
 set -euo pipefail
@@ -16,8 +19,15 @@ source "${here}/paths.sh"
 
 night="$1"
 run="$2"
-sys_py=(python3 -I -B)
-venv=("${MLX_VENV}/bin/python" -I -B)
+
+# Environnement maîtrisé pour tout ce que la nuit lance (Python, moteurs de la
+# phase qualité) : rien n'est hérité de l'environnement ambiant hors de cette liste.
+clean=(env -i PATH="${PATH}" HOME="${HOME}" TMPDIR="${TMPDIR:-/tmp}" USER="${USER:-}"
+  LANG=en_US.UTF-8 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  MODELS="${MODELS}" AI_MODEL="${AI_MODEL}" RUST_SRC="${RUST_SRC}" CORPUS_DIR="${CORPUS_DIR}"
+  BENCH_ENV="${BENCH_ENV:-${here}/local.env}")
+sys_py=("${clean[@]}" python3 -I -B)
+venv=("${clean[@]}" "${MLX_VENV}/bin/python" -I -B)
 
 if [[ -n "${GPU_LOCK:-}" ]]; then
   until mkdir "${GPU_LOCK}" 2>/dev/null; do sleep 60; done
@@ -26,7 +36,13 @@ if [[ -n "${GPU_LOCK:-}" ]]; then
 fi
 
 phase_run() {
-  "${sys_py[@]}" "${here}/run_matrix.py" plan "${run}" "$@"
+  local name
+  name="$(IFS=+; echo "$*")"
+  if [[ -f "${run}/plan-${name}.json" ]]; then
+    cp "${run}/plan-${name}.json" "${run}/plan.json"
+  else
+    "${sys_py[@]}" "${here}/run_matrix.py" plan "${run}" "$@"
+  fi
   "${venv[@]}" "${here}/prompts.py" expect "${run}/prompts" "${run}/plan.json"
   "${sys_py[@]}" "${here}/run_matrix.py" run "${run}"
 }
@@ -39,11 +55,13 @@ case "${night}" in
     ;;
   1)
     phase_run tune
-    "${venv[@]}" "${here}/run_matrix.py" freeze "${run}"
+    if [[ ! -f "${run}/matrix.frozen.json" ]]; then
+      "${venv[@]}" "${here}/run_matrix.py" freeze "${run}"
+    fi
     phase_run eval-S eval-M
     ;;
   2)
-    "${here}/quality_llama.sh" "${run}/quality"
+    "${clean[@]}" "${here}/quality_llama.sh" "${run}/quality"
     "${venv[@]}" "${here}/quality.py" mlx-ppl "${WIKITEXT_TEST}" > "${run}/quality/ppl-mlx.json"
     phase_run sampled-S eval-L
     ;;
