@@ -1910,6 +1910,7 @@ impl CausalDecoder {
                     &[primary, draft_raw as usize],
                     None,
                     &states,
+                    true,
                 );
             }
         }
@@ -2548,7 +2549,7 @@ impl CausalDecoder {
             )?;
             let mut tokens = vec![primary];
             tokens.extend(draft_values.iter().map(|&index| index as usize));
-            super::verify::record_verify(target_position, &tokens, None, &states);
+            super::verify::record_verify(target_position, &tokens, None, &states, true);
         }
         drop(scratch);
         drop(target_indices);

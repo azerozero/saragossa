@@ -4976,8 +4976,8 @@ fn identity_corpus() -> Result<Vec<(String, String)>> {
 struct IdentityTally {
     /// Lignes vérifiées dont le chemin d'entrée est celui de l'AR.
     compared_rows: usize,
-    /// Parmi elles, lignes issues d'un lot d'au moins deux lignes (chemin en
-    /// lignes réellement exercé, pas le repli séquentiel).
+    /// Parmi elles, lignes d'un lot d'au moins deux lignes passé par les
+    /// kernels en lignes (le repli séquentiel, enregistré comme tel, est exclu).
     multi_row_compared: usize,
     /// Vérifications en arbre réellement branché (au moins un frère).
     branched_records: usize,
@@ -5049,7 +5049,7 @@ fn identity_compare_records(
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
             tally.compared_rows += 1;
-            tally.multi_row_compared += usize::from(rows >= 2);
+            tally.multi_row_compared += usize::from(record.batched && rows >= 2);
             if differing > 0 {
                 tally.state_mismatches += 1;
                 if tally.first_mismatch.is_none() {
