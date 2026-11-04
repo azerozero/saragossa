@@ -37,7 +37,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import client  # noqa: E402
 import memwatch  # noqa: E402
-from config import path as config_path, sanitize  # noqa: E402
+from config import path as config_path, paths as config_paths, sanitize  # noqa: E402
 from prompts import fnv1a64  # noqa: E402  (stdlib seule au niveau module)
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -51,6 +51,8 @@ CRASH = "crash"
 SKIPPED = "skipped_after_failure"
 OOM_MARKERS = ("out of memory", "outofmemory", "insufficient memory", "failed to allocate",
                "kiogpucommandbuffercallbackerroroutofmemory", "ressource mémoire")
+REFUSED_BUSY = "refused_busy"
+ADMISSION_MARKERS = ("budget mémoire des requêtes en cours", "file d'inférence pleine")
 BIND_MARKERS = ("address already in use", "bind tcp", "failed to bind", "eaddrinuse")
 JETSAM_DIR = pathlib.Path("/Library/Logs/DiagnosticReports")
 MAX_ATTEMPTS = 3
@@ -98,6 +100,19 @@ def tuning_entries(matrix):
                    resolve(matrix, spec["probe"], (family, candidate)))
 
 
+def tuning_references(matrix):
+    """Références AR du réglage : une par configuration AR citée par une famille
+    spéculative (`reference`), sur l'union des prompts de ces familles. Mêmes
+    nonces que les candidats : l'identité greedy de chaque candidat se vérifie
+    contre elle (analyze.pair_function)."""
+    refs = {}
+    for spec in matrix["tuning"].values():
+        if spec.get("reference"):
+            refs.setdefault(spec["reference"], set()).update(spec["prompts"])
+    for config, prompts in sorted(refs.items()):
+        yield (f"tune-ref:{config}", sorted(prompts), resolve(matrix, config))
+
+
 def nonce(*parts):
     """16 chiffres dérivés de la graine et de la clé d'observation."""
     digest = hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()
@@ -121,7 +136,7 @@ def plan(run_dir, phases):
         # configurations appariées (même phase, bloc, prompt, graine, répétition).
         same = spec.get("identical_repeats", False)
         if spec["configs"] == "tuning":
-            candidates = list(tuning_entries(matrix))
+            candidates = list(tuning_entries(matrix)) + list(tuning_references(matrix))
         else:
             candidates = [(c, spec.get("prompts", cls["prompts"]), resolve(matrix, c))
                           for c in spec["configs"]]
@@ -154,8 +169,10 @@ def plan(run_dir, phases):
     path.write_text(text)
     # Copie nommée : `plan.json` est le plan courant, chaque plan publié reste.
     (path.parent / f"plan-{'+'.join(phases)}.json").write_text(text)
-    n = sum(len(e["requests"]) for e in entries)
-    print(f"{len(entries)} chargements, {n} requêtes mesurées, "
+    real = [e for e in entries if not e["config_spec"].get("unsupported")]
+    n = sum(len(e["requests"]) for e in real)
+    print(f"{len(real)} chargements, {n} requêtes mesurées "
+          f"(hors {len(entries) - len(real)} entrées non supportées), "
           f"sha256 {hashlib.sha256(text.encode()).hexdigest()}")
 
 
@@ -234,6 +251,8 @@ def engine_env(extra):
     env.update({"LANG": "en_US.UTF-8", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
     if "BENCH_ENV" in os.environ:
         env["BENCH_ENV"] = os.environ["BENCH_ENV"]
+    # Chemins déjà résolus par paths.sh : le lanceur n'a pas besoin de local.env.
+    env.update(config_paths())
     env.update(extra)
     return env
 
@@ -315,7 +334,10 @@ class Engine:
                     self.proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     os.killpg(self.proc.pid, signal.SIGKILL)
-                    self.proc.wait(timeout=30)
+                    try:
+                        self.proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        return False
             # Fils éventuels du même groupe : SIGKILL, puis vérification.
             try:
                 os.killpg(self.proc.pid, signal.SIGKILL)
@@ -394,9 +416,13 @@ def run_request(camp, eng, entry, request, kind, meta):
     if record["status"] in (client.CONNECTION_LOST, client.STREAM_INCOMPLETE,
                             client.STREAM_ERROR) and not eng.alive():
         record["status"] = eng.failure_status()
-    if (record["status"] == client.HTTP_ERROR and record.get("http_status") == 503
-            and any(m in record.get("error_body", "").lower() for m in OOM_MARKERS)):
-        record["status"] = OOM
+    if record["status"] == client.HTTP_ERROR and record.get("http_status") == 503:
+        body = record.get("error_body", "").lower()
+        if any(m in body for m in ADMISSION_MARKERS):
+            # Refus d'admission (octets en vol, file pleine) : pas un manque de mémoire.
+            record["status"] = REFUSED_BUSY
+        elif any(m in body for m in OOM_MARKERS):
+            record["status"] = OOM
     t0 = record["t0_ns"]
     line = {
         "kind": kind, **meta, "engine": engine, **request,
@@ -528,9 +554,13 @@ def run_entry(camp, entry):
 def run(run_dir):
     """Exécute le plan courant ; reprise idempotente (voir l'en-tête du module)."""
     run_dir = pathlib.Path(run_dir)
-    matrix, matrix_path = load_matrix(run_dir)
     plan_path = run_dir / "plan.json"
     plan_data = json.loads(plan_path.read_text())
+    # La matrice est celle du tirage du plan : un plan de réglage repris après le
+    # gel reste lié à matrix.json, pas à matrix.frozen.json.
+    matrix_path = (run_dir / plan_data["matrix"] if plan_data["matrix"] == "matrix.frozen.json"
+                   else HERE / "matrix.json")
+    matrix = json.loads(matrix_path.read_text())
     prompts_path = run_dir / "prompts" / "prompts.json"
     manifest = json.loads(prompts_path.read_text())
     manifest["by_id"] = {p["id"]: p for p in manifest["prompts"]}
@@ -578,8 +608,9 @@ def freeze(run_dir):
     """Applique la règle de sélection aux mesures **admissibles** de la phase `tune`.
 
     Par famille : un candidat est retenu s'il a, pour chaque prompt de sa
-    famille, toutes les répétitions du plan admissibles (`analyze.admissible`)
-    et une métrique exacte. Score = moyenne géométrique, sur ces prompts, de la
+    famille, toutes les répétitions du plan admissibles (preuves et, pour un
+    spéculatif, identité greedy avec la référence AR `tune-ref:*`) et au moins
+    une valeur de la métrique (exacte pour le débit). Score = moyenne géométrique, sur ces prompts, de la
     médiane de la métrique ; le meilleur remplace le défaut (premier candidat)
     seulement s'il le bat de plus de `tie_margin`. Une famille sans candidat
     admissible arrête le gel : aucune évaluation ne part d'un réglage non mesuré.
@@ -594,15 +625,18 @@ def freeze(run_dir):
         for request in entry["requests"]:
             key = (entry["config"], request["prompt"])
             expected_reps[key] = expected_reps.get(key, 0) + 1
-    rows = [r for r in analyze.load(run_dir)[0] if r.get("phase") == "tune"]
-    values = {}
+    rows = [r for r in analyze.load(run_dir)[0]
+            if r.get("phase") == "tune" and r["config"].startswith("tune:")]
+    values, admissible = {}, {}
     for row in rows:
-        _, family, index = row["config"].split(":")
+        if row.get("admissibility") != "admissible":
+            continue
+        key = (row["config"], row["prompt"])
+        admissible[key] = admissible.get(key, 0) + 1
+        family = row["config"].split(":")[1]
         metric = matrix["tuning"][family]["metric"]
         m = row.get("m") or {}
-        if row.get("admissibility") != "admissible" or m.get(metric) is None:
-            continue
-        if metric == "delivery_tok_s" and not m.get("exact"):
+        if m.get(metric) is None or (metric == "delivery_tok_s" and not m.get("exact")):
             continue
         values.setdefault(row["config"], {}).setdefault(row["prompt"], []).append(m[metric])
     report, failures = {}, []
@@ -612,8 +646,10 @@ def freeze(run_dir):
         for index in range(len(spec["candidates"])):
             config = f"tune:{family}:{index}"
             per_prompt = values.get(config, {})
-            complete = all(len(per_prompt.get(p, [])) == expected_reps.get((config, p), -1)
-                           for p in spec["prompts"])
+            # Toutes les répétitions prévues admissibles (preuves et identité),
+            # et au moins une valeur de la métrique par prompt.
+            complete = all(admissible.get((config, p), 0) == expected_reps.get((config, p), -1)
+                           and per_prompt.get(p) for p in spec["prompts"])
             if complete:
                 scores[index] = analyze.geomean_of_medians(per_prompt)
         if not scores:
@@ -717,7 +753,8 @@ def _self_check():
     env = engine_env({"X": "1"})
     assert env["X"] == "1" and env["HF_HUB_OFFLINE"] == "1"
     assert not set(env) - {"PATH", "HOME", "TMPDIR", "USER", "LANG", "HF_HUB_OFFLINE",
-                           "TRANSFORMERS_OFFLINE", "BENCH_ENV", "X"}
+                           "TRANSFORMERS_OFFLINE", "BENCH_ENV", "X"} - set(config_paths())
+    assert env["MODELS"] == config_paths()["MODELS"]
     with socket.socket() as busy:
         busy.bind(("127.0.0.1", 0))
         busy.listen()
@@ -762,6 +799,8 @@ def _freeze_check():
             {"prompt": p, "repeat": r} for p in prompts for r in range(2)]})
         rows += [row(config, p, gap, r) for p in prompts for r in range(2)
                  if not (index == 1 and r == 1 and p == prompts[0])]
+    # Référence AR du réglage : sans elle, aucun candidat spéculatif n'est admissible.
+    rows += [row("tune-ref:sar-ar", p, 100, r) for p in prompts for r in range(2)]
     expected = {f"{p}|{r:016d}": {"prompt_tokens": 5, "fnv1a64": "f"}
                 for p in prompts for r in range(2)}
     original = (analyze.tokenizer, analyze.load_matrix)

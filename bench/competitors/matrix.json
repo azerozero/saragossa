@@ -394,7 +394,8 @@
       "2"
      ]
     }
-   ]
+   ],
+   "reference": "llkm-ar"
   },
   "llama-dflash": {
    "probe": "llkm-dflash",
@@ -423,7 +424,8 @@
       "7"
      ]
     }
-   ]
+   ],
+   "reference": "llkm-ar"
   },
   "sar-mtp": {
    "probe": "sar-mtp",
@@ -449,7 +451,8 @@
       "SARAGOSSA_RUST_MTP_MAX_DRAFT": "3"
      }
     }
-   ]
+   ],
+   "reference": "sar-ar"
   },
   "sar-dflash": {
    "probe": "sar-dflash",
@@ -473,7 +476,8 @@
       "SARAGOSSA_RUST_DFLASH_TREE": "16"
      }
     }
-   ]
+   ],
+   "reference": "sar-ar"
   },
   "llmd-batching": {
    "probe": "llmd-ar",
@@ -521,7 +525,8 @@
       "--speculative-draft-count=3"
      ]
     }
-   ]
+   ],
+   "reference": "llmd-ar"
   },
   "mlx-prefill": {
    "probe": "mlx-ar",
@@ -551,7 +556,10 @@
    "ctx": 8192,
    "warmup": "tune-prose4k-1",
    "prompts": [
-    "tune-code4k-1"
+    "tune-code4k-1",
+    "tune-prose4k-1",
+    "eos-short-1",
+    "eos-short-2"
    ]
   },
   "T": {
