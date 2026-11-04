@@ -102,10 +102,6 @@ class Sampler:
         self._stop.set()
         self._thread.join()
 
-    def max_between(self, start_ns, end_ns):
-        values = [value for t, value in self.samples if start_ns <= t <= end_ns]
-        return max(values) if values else None
-
 
 def file_backed(pid):
     """Résident adossé à des fichiers selon `vmmap -summary` (lent : hors mesure de débit)."""
