@@ -7,16 +7,43 @@
 // suive le code. Lancement explicite (`--ignored`) : échoue sans device Metal.
 // Voir docs/perf/greedy-identity.md.
 
-/// Écarts connus (préfixe « kernel cas », R minimal) : le matmul u4 gs64 passe
-/// au kernel skinny (MMA bf16 hi+lo) à partir de 5 lignes, et tout bloc qui en
-/// contient un hérite de l'écart.
-const ROWS_EXACT_EXCEPTIONS: &[(&str, usize)] = &[
-    ("matmul u4", 5),
-    ("linear bloc", 5),
-    ("linear S1 projection", 5),
-    ("queue MoE", 5),
-    ("queue dense", 5),
+/// Écarts connus (préfixe « kernel cas », R minimal, écart relatif max) : le
+/// matmul u4 gs64 passe au kernel skinny (MMA bf16 hi+lo) à partir de 5 lignes,
+/// et tout bloc qui en contient un hérite de l'écart. Bornes : 1e-5 pour un
+/// matmul (mesuré 2,4 à 4,6e-6, x2 et x3) et 5e-5 pour un bloc qui en enchaîne
+/// plusieurs (mesuré ≤ 1,7e-5). En mode strict (skinny coupé, mêmes lots),
+/// aucune exception ne s'applique.
+const ROWS_EXACT_EXCEPTIONS: &[(&str, usize, f32)] = &[
+    ("matmul u4", 5, 1.0e-5),
+    ("attn QKV u4", 5, 1.0e-5),
+    ("linear bloc", 5, 5.0e-5),
+    ("linear S1 projection", 5, 1.0e-5),
+    ("queue MoE", 5, 5.0e-5),
+    ("queue dense", 5, 5.0e-5),
 ];
+
+thread_local! {
+    /// Vrai pendant la passe stricte d'un oracle (skinny coupé).
+    static ROWS_EXACT_STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lance `body` deux fois : réglages par défaut (exceptions connues, bornées),
+/// puis skinny coupé (qmv répliqué sur les mêmes lots), en égalité stricte.
+fn rows_exact_both_modes(body: fn() -> Result<()>) -> Result<()> {
+    body()?;
+    with_qmm_skinny_min_batch_override(usize::MAX, || {
+        /// Rétablit le mode, panique comprise.
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ROWS_EXACT_STRICT.with(|cell| cell.set(false));
+            }
+        }
+        let _restore = Restore;
+        ROWS_EXACT_STRICT.with(|cell| cell.set(true));
+        body()
+    })
+}
 
 fn rows_exact_executor() -> Result<MetalExecutor> {
     test_executor()?.ok_or_else(|| {
@@ -71,13 +98,34 @@ fn rows_exact_check_lot(
         .filter(|(_, n)| *n > 0)
         .collect();
     let full = format!("{kernel} {case}");
-    let excepted = ROWS_EXACT_EXCEPTIONS
+    let strict = ROWS_EXACT_STRICT.with(std::cell::Cell::get);
+    let bound = ROWS_EXACT_EXCEPTIONS
         .iter()
-        .any(|(key, from)| full.starts_with(key) && rows >= *from);
-    if excepted {
+        .filter(|(key, from, _)| !strict && full.starts_with(key) && rows >= *from)
+        .map(|(_, _, bound)| *bound)
+        .reduce(f32::max);
+    if let Some(bound) = bound {
         assert!(
             !bad.is_empty(),
             "{label}: exception obsolète, les bits sont égaux (mettre à jour ROWS_EXACT_EXCEPTIONS)"
+        );
+        let span = slices * width;
+        assert!(
+            batch[..span].iter().all(|x| x.is_finite()),
+            "{label}: sortie non finie"
+        );
+        let scale = mono[..span]
+            .iter()
+            .fold(0.0f32, |m, x| m.max(x.abs()))
+            .max(1e-30);
+        let err = mono[..span]
+            .iter()
+            .zip(&batch[..span])
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            err <= bound * scale,
+            "{label}: écart {:.2e} relatif au-delà de la borne {bound:e}",
+            err / scale
         );
     } else {
         assert!(
@@ -121,6 +169,10 @@ fn rows_exact_u4(out_dim: usize, in_dim: usize, seed: u64) -> Result<Linear> {
 #[test]
 #[ignore = "oracle GPU en bits : lancer avec --ignored"]
 fn rows_exact_matmul_formats() -> Result<()> {
+    rows_exact_both_modes(rows_exact_matmul_formats_body)
+}
+
+fn rows_exact_matmul_formats_body() -> Result<()> {
     let executor = rows_exact_executor()?;
     let dense = |o: usize, i: usize| -> Result<LinearWeight> {
         Ok(LinearWeight::Dense(Tensor::from_vec(
@@ -399,6 +451,10 @@ impl RowsExactLinear {
 #[test]
 #[ignore = "oracle GPU en bits : lancer avec --ignored"]
 fn rows_exact_linear_block() -> Result<()> {
+    rows_exact_both_modes(rows_exact_linear_block_body)
+}
+
+fn rows_exact_linear_block_body() -> Result<()> {
     let executor = rows_exact_executor()?;
     for (model, hidden, value_heads) in [("35B", 2048usize, 32usize), ("27B", 5120, 48)] {
         let layer = RowsExactLinear::new(&executor, hidden, value_heads)?;
@@ -479,6 +535,10 @@ fn rows_exact_linear_block() -> Result<()> {
 #[test]
 #[ignore = "oracle GPU en bits : lancer avec --ignored"]
 fn rows_exact_linear_stages() -> Result<()> {
+    rows_exact_both_modes(rows_exact_linear_stages_body)
+}
+
+fn rows_exact_linear_stages_body() -> Result<()> {
     let executor = rows_exact_executor()?;
     for (model, hidden, vh) in [("35B", 2048usize, 32usize), ("27B", 5120, 48)] {
         let layer = RowsExactLinear::new(&executor, hidden, vh)?;
@@ -842,6 +902,10 @@ fn rows_exact_router_u8(out_dim: usize, in_dim: usize) -> Result<AffineQuantized
 #[test]
 #[ignore = "oracle GPU en bits : lancer avec --ignored"]
 fn rows_exact_moe_tail() -> Result<()> {
+    rows_exact_both_modes(rows_exact_moe_tail_body)
+}
+
+fn rows_exact_moe_tail_body() -> Result<()> {
     let executor = rows_exact_executor()?;
     let (hidden, inter, experts_n, top_k) = (2048usize, 512usize, 256usize, 8usize);
     let base: Vec<GatedMlp> = (0..8)
@@ -926,6 +990,10 @@ fn rows_exact_moe_tail() -> Result<()> {
 #[test]
 #[ignore = "oracle GPU en bits : lancer avec --ignored"]
 fn rows_exact_dense_tail() -> Result<()> {
+    rows_exact_both_modes(rows_exact_dense_tail_body)
+}
+
+fn rows_exact_dense_tail_body() -> Result<()> {
     let executor = rows_exact_executor()?;
     let (hidden, inter) = (5120usize, 17408usize);
     let resolve = |w: AffineQuantizedTensor, label: &'static str| {
@@ -1069,6 +1137,110 @@ fn rows_exact_argmax_ties() -> Result<()> {
             "R={rows}: argmax mono {mono:?}, attendu 300"
         );
         assert_eq!(batch, mono, "R={rows}: argmax en lignes ≠ mono");
+    }
+    Ok(())
+}
+
+/// QKV concaténé du full-attn : le mono fusionne la norme d'entrée au matmul
+/// (`encode_full_attn_qkv_split_rms_buffers`, sorties q, gate et k|v) ; les
+/// lignes normalisent par le miroir (`encode_rms_norm_rows_matching_solo`,
+/// prédicat `full_attn_qkv_split_rms_applies`) puis projettent. Formes : dense
+/// 27B (5120, 24/4 têtes de 256), MoE 35B (2048, 16/2), et u8 gs64 (miroir
+/// u8, actif en test).
+#[test]
+#[ignore = "oracle GPU en bits : lancer avec --ignored"]
+fn rows_exact_full_attn_qkv_prologue() -> Result<()> {
+    rows_exact_both_modes(rows_exact_full_attn_qkv_prologue_body)
+}
+
+fn rows_exact_full_attn_qkv_prologue_body() -> Result<()> {
+    let executor = rows_exact_executor()?;
+    let head_dim = 256usize;
+    let cases: [(&str, usize, usize, usize, bool); 3] = [
+        ("attn QKV u4", 5120, 24, 4, false),
+        ("attn QKV u4", 2048, 16, 2, false),
+        ("attn QKV u8", 2048, 16, 2, true),
+    ];
+    for (kernel, hidden, q_heads, kv_heads, u8) in cases {
+        let q_gate_dim = 2 * q_heads * head_dim;
+        let out_dim = q_gate_dim + 2 * kv_heads * head_dim;
+        let weight = if u8 {
+            test_affine_varied_u8_group(out_dim, hidden, 64)?
+        } else {
+            test_affine_random_u4(out_dim, hidden, 41)?
+        };
+        let proj = executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(weight),
+            "rexact_qkv_w",
+        )?;
+        let norm = executor.buffer_from_slice(&varied_row(hidden, 61), "rexact_qkv_n")?;
+        let applies = executor.full_attn_qkv_split_rms_applies(&proj, hidden);
+        let x = rows_exact_lhs(9, hidden, 900, 1.0);
+        // Mono : ligne complète reconstituée (q et gate entrelacés par tête, puis k|v).
+        let mut mono = Vec::new();
+        for r in 0..9 {
+            let xr =
+                executor.buffer_from_slice(&x[r * hidden..(r + 1) * hidden], "rexact_qkv_x1")?;
+            let full = executor.uncached_f32_buffer(out_dim, "rexact_qkv_full1")?;
+            let q = executor.uncached_f32_buffer(q_heads * head_dim, "rexact_qkv_q1")?;
+            let gate = executor.uncached_f32_buffer(q_heads * head_dim, "rexact_qkv_g1")?;
+            let normed = executor.uncached_f32_buffer(hidden, "rexact_qkv_n1")?;
+            let mut fused = false;
+            rows_exact_cb(&executor, |enc| {
+                fused = executor
+                    .encode_full_attn_qkv_split_rms_buffers(
+                        enc, &xr, &norm, 1e-6, hidden, &proj, &full, &q, &gate, q_heads, head_dim,
+                    )?
+                    .is_some();
+                if !fused {
+                    executor.encode_rms_norm_rows(enc, &xr, &norm, &normed, 1, hidden, 1e-6)?;
+                    executor.encode_matmul_weight_buffers(
+                        enc, &normed, 1, hidden, &proj, &full, false,
+                    )?;
+                }
+                Ok(())
+            })?;
+            assert_eq!(fused, applies, "{kernel} h{hidden}: prédicat ≠ encodeur");
+            let mut row = read_f32_buffer(&full, out_dim)?;
+            if fused {
+                let (qv, gv) = (
+                    read_f32_buffer(&q, q_heads * head_dim)?,
+                    read_f32_buffer(&gate, q_heads * head_dim)?,
+                );
+                for pair in 0..q_heads {
+                    for col in 0..head_dim {
+                        row[pair * 2 * head_dim + col] = qv[pair * head_dim + col];
+                        row[pair * 2 * head_dim + head_dim + col] = gv[pair * head_dim + col];
+                    }
+                }
+            }
+            mono.extend(row);
+        }
+        for rows in 1..=9 {
+            let xb = executor.buffer_from_slice(&x[..rows * hidden], "rexact_qkv_xr")?;
+            let normed = executor.uncached_f32_buffer(rows * hidden, "rexact_qkv_nr")?;
+            let out = executor.uncached_f32_buffer(rows * out_dim, "rexact_qkv_or")?;
+            rows_exact_cb(&executor, |enc| {
+                if applies {
+                    executor.encode_rms_norm_rows_matching_solo(
+                        enc, &xb, &norm, &normed, rows, hidden, 1e-6, &proj, true,
+                    )?;
+                } else {
+                    executor.encode_rms_norm_rows(enc, &xb, &norm, &normed, rows, hidden, 1e-6)?;
+                }
+                executor
+                    .encode_matmul_weight_buffers(enc, &normed, rows, hidden, &proj, &out, false)
+                    .map(|_| ())
+            })?;
+            rows_exact_check(
+                kernel,
+                &format!("h{hidden} fusionné={applies}"),
+                rows,
+                out_dim,
+                &mono[..rows * out_dim],
+                &read_f32_buffer(&out, rows * out_dim)?,
+            );
+        }
     }
     Ok(())
 }
