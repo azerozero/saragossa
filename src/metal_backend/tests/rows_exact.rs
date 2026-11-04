@@ -12,13 +12,6 @@
 /// contient un hérite de l'écart.
 const ROWS_EXACT_EXCEPTIONS: &[(&str, usize)] = &[
     ("matmul u4", 5),
-    // Bloc linear-attn batché : y du scan et rms-gate contractés autrement que
-    // le mono (fast-math), norme d'entrée hors miroir du prologue à 5120.
-    ("linear bloc 35B sorties", 2),
-    ("linear bloc 27B", 2),
-    ("linear S3 35B y", 1),
-    ("linear S3 27B y", 1),
-    ("linear S4", 1),
     ("linear bloc", 5),
     ("linear S1 projection", 5),
     ("queue MoE", 5),

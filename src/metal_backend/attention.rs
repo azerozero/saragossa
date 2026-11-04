@@ -922,6 +922,38 @@ impl MetalExecutor {
         Ok(Some(*out_dim))
     }
 
+    /// Vrai si [`Self::encode_full_attn_qkv_split_rms_buffers`] fusionne la norme
+    /// d'entrée pour ce poids (même prédicat). La vérification en lignes s'en
+    /// sert pour normaliser comme le mono et garder ses bits.
+    pub(crate) fn full_attn_qkv_split_rms_applies(
+        &self,
+        weight: &MetalLinearWeightBuffers,
+        in_dim: usize,
+    ) -> bool {
+        if !fused_rms_prologue_enabled() || !fused_attn_epilogue_enabled() {
+            return false;
+        }
+        let MetalLinearWeightBuffers::AffineQuantized {
+            out_dim,
+            in_dim: weight_in_dim,
+            group_size,
+            bits,
+            ..
+        } = weight
+        else {
+            return false;
+        };
+        in_dim == *weight_in_dim
+            && ((fast_affine_qmv_enabled(*out_dim)
+                && *bits == FAST_QMV_BITS
+                && *group_size == FAST_QMV_GROUP_SIZE
+                && in_dim % 512 == 0)
+                || can_use_fast_affine_qmv_u3_buffers(1, in_dim, *out_dim, *group_size, *bits)
+                || (full_qkv_split_rms_u8_enabled()
+                    && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
+                    && *group_size == FAST_QMV_GROUP_SIZE))
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "kernel spécialisé full-attn: rms_norm prologue + QKV concat + split q/gate"
