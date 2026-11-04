@@ -49,7 +49,7 @@ fn is_chain(parents: &[usize]) -> bool {
 
 /// Oracle f64 de la ligne `row` : préfixe `[0, context)` (requête `q_prefix`)
 /// puis lignes d'arbre visibles selon `mask` (requête `q_tree`).
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "oracle CPU de test : requêtes, K/V, masque et géométrie explicites"
 )]
@@ -497,7 +497,7 @@ fn compact_tree_rows_matches_cpu_and_refuses_invalid_paths() -> Result<()> {
 
 /// Attention en lignes de `rows` requêtes `q` sur le KV `keys`/`values`
 /// (`len` positions), sous `tree` éventuel, hors NAX.
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "cas de test : géométrie, KV, requêtes et arbre explicites"
 )]

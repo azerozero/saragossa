@@ -454,8 +454,11 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
         max_score = new_max;
         sum_exp = sum_exp * factor + exp_score;
         for (uint j = 0u; j < QK; ++j) { o[j] = o[j] * factor + exp_score * float(v_[j]); }
+#ifndef TREE_ROWS
+        // Sous arbre, les pointeurs sont recalculés par position virtuelle.
         k_ += blocks * kv_dim;
         v_ += blocks * kv_dim;
+#endif
     }
 
     if (simd_lid == 0u) {
@@ -473,17 +476,6 @@ const ROWS_NAX_KERNELS_TEMPLATE: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup>
 using namespace metal;
-#ifdef TREE_ROWS
-// Position virtuelle `v` d'une ligne d'arbre → ligne stockée : le préfixe
-// `[0, root)` tel quel, puis le k-ième ancêtre du masque (ordre topologique,
-// donc par profondeur croissante).
-static inline uint tree_stored_row(uint v, uint root, uint mask) {
-    if (v < root) { return v; }
-    uint m = mask;
-    for (uint k = v - root; k > 0u; --k) { m &= m - 1u; }
-    return root + ctz(m);
-}
-#endif
 
 // Q f32 `[ligne][q_head][d]` → bf16 `[kv_head][ligne·gqa + h][d]`, où
 // `q_head = kv_head·gqa + h` : une tuile NAX par tête KV. dims = (q_heads, kv_heads, lignes).
