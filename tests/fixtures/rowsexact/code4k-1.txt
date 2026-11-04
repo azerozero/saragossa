@@ -388,6 +388,6 @@ impl<'a, T: Ord, A: Allocator> PeekMut<'a, T, A> {
     ///     }
     /// }
     ///
-   
+
 
 Above is source code from the Rust standard library. Write a detailed technical review of it: explain the purpose of each main type and function, how they interact, and the invariants they rely on, then propose three concrete improvements with example code. Write at least 600 words.

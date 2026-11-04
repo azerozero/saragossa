@@ -4022,6 +4022,10 @@ kernel void linear_attn_gated_delta_inv_dk128_tg4_f32(
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
