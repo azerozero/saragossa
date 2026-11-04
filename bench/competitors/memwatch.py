@@ -11,6 +11,7 @@ MLX) se lit à part, une fois, par `vmmap -summary` (voir `file_backed`).
 """
 
 import ctypes
+import errno
 import re
 import subprocess
 import threading
@@ -60,16 +61,23 @@ class RusageInfoV4(ctypes.Structure):
     ]
 
 
-_libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+_libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
 _libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(RusageInfoV4)]
 _libproc.proc_pid_rusage.restype = ctypes.c_int
 
 
 def rusage(pid):
-    """phys_footprint courant, maximum à vie et résident, en octets ; None si le processus est parti."""
+    """phys_footprint courant, maximum à vie et résident, en octets.
+
+    None si le processus n'existe plus (ESRCH) ; `{"error": "EPERM"}` (ou autre
+    code) si la lecture est refusée : les deux cas ne se confondent pas.
+    """
     info = RusageInfoV4()
     if _libproc.proc_pid_rusage(pid, RUSAGE_INFO_V4, ctypes.byref(info)) != 0:
-        return None
+        code = ctypes.get_errno()
+        if code == errno.ESRCH:
+            return None
+        return {"error": errno.errorcode.get(code, str(code))}
     return {
         "phys_footprint": info.ri_phys_footprint,
         "lifetime_max_phys_footprint": info.ri_lifetime_max_phys_footprint,
@@ -90,7 +98,7 @@ class Sampler:
     def _run(self):
         while not self._stop.is_set():
             sample = rusage(self.pid)
-            if sample is not None:
+            if sample is not None and "phys_footprint" in sample:
                 self.samples.append((time.perf_counter_ns(), sample["phys_footprint"]))
             self._stop.wait(self.period)
 
@@ -149,5 +157,7 @@ if __name__ == "__main__":
 
     me = rusage(os.getpid())
     assert me is not None and me["phys_footprint"] > 0
+    # PID inexistant (au-delà de kern.maxproc) : disparition, pas refus.
+    assert rusage(99_999_999) is None
     assert me["lifetime_max_phys_footprint"] >= me["phys_footprint"]
     print(me, f"{collector_overhead(os.getpid()):.1f} µs/appel", system_memory())
