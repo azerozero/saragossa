@@ -1409,19 +1409,21 @@ vrai nombre de lignes et n'utilisent que le début des buffers repris.
 
 ABBA, A = branche RAM de la tête, B = correctif, 2 passes chacun, Go. Les
 réponses sont identiques entre A et B, en AR comme en MTP (texte serve, md5
-CLI) :
+CLI). 4097 tokens se découpent en morceaux de 2049 et 2048 : c'est le faux
+positif des relectures, que la première version (longueur arrondie allouée)
+ne corrigeait qu'en partie :
 
-| cas | A | B |
-|---|---:|---:|
-| serve AR, 5078 tokens, régime / pic | 22,85 / 22,87 | 22,83 / 22,88 |
-| serve MTP, 5078 tokens, régime / pic | 23,87 / 23,95 | 23,86 / 23,96 |
-| serve AR, 5079 tokens, régime / pic | 22,83 / 22,88 | 22,86 / 22,88 |
-| serve MTP, 5079 tokens, régime / pic | 24,47 / 24,56 | 23,81 / 23,96 |
-| CLI AR, 5012 tokens, pic | 22,80 | 22,80 |
-| CLI AR, 5013 tokens, pic | 23,42 | 22,83 |
+| cas | A | B | garde arrondie (abandonnée) |
+|---|---:|---:|---:|
+| serve AR, 5078 tokens, régime / pic | 22,84 / 22,87 | 22,86 / 22,88 | |
+| serve MTP, 5078 tokens, régime / pic | 23,84 / 23,96 | 23,84 / 23,96 | |
+| serve AR, 5079 tokens, régime / pic | 22,83 / 22,88 | 22,85 / 22,88 | |
+| serve MTP, 5079 tokens, régime / pic | 24,41 / 24,56 | 23,81 / 23,95 | |
+| CLI AR, 4097 tokens, pic | 23,01 | 22,53 | 22,85 |
+| CLI MTP, 4097 tokens, pic | 24,07 | 23,60 | 23,92 |
 
-Sur 5079 tokens, le surcoût de la tête retombe à +0,95 Go en régime et
-+1,08 Go au pic, comme sur un prompt pair.
+Sur 5079 tokens, le surcoût de la tête retombe à +0,96 Go en régime et
++1,07 Go au pic, comme sur un prompt pair.
 
 Reproduction (`$SIDECAR` = `<35B>/mtp-official/mtp.safetensors`, `$PROMPTS` =
 `models/pairwise/prompts6.json`) :
