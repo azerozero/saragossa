@@ -98,11 +98,13 @@ high fidelity (smaller, same quality).
 **Speculative decode (MTP)**: on a **dense** model carrying a native MTP head,
 in greedy (T=0), saragossa verifies the draft against the target model → +15
 to +40% throughput (`u4` 27→~40, `u3` 35→~46 tok/s). The output matches the
-autoregressive (AR) decode except near a tie between the top two logits: the
-batched verification is not yet bit-identical to the single-row step (attention
-prefix past 16k tokens of context, batched linear-attention block, skinny
-matmul from 5 rows), and a tiny drift can flip such a tie (measured: 1 request
-in 66 on a 32k prompt). See
+autoregressive (AR) decode except near a tie between the top two logits. Two
+default-on kernels of the batched verification are not bit-identical to the
+single-row step: the skinny u4 matmul, from 5 rows (DFlash, lookup, MTP with
+lookup drafts on long prompts), and the attention prefix, from 16k tokens of
+context with a bf16 KV cache. A tiny drift can then flip such a tie (before the
+other fixes: 1 request in 66 on a 32k prompt). With both disabled, verified
+states match the AR bit for bit on the test corpus; see
 [docs/perf/greedy-identity.md](docs/perf/greedy-identity.md). On the
 **Qwen3.6-35B-A3B** MoE,
 the official Qwen MTP head (not shipped in mlx-community weights) is opt-in:
