@@ -137,24 +137,35 @@ def proofs(line, expected, cache_probe):
     elif "prompt_fnv1a64" in ingest:
         checks["ids"] = ingest["prompt_fnv1a64"] == exp["fnv1a64"]
     elif ingest.get("kind") == "offline":
+        # Calcul hors moteur, déjà bloquant dans `expect` : vrai par construction.
+        # La seule preuve mesurée côté moteur est alors `prompt_tokens`.
         key = "llmd_offline_fnv1a64" if line["engine"] == "llmd" else "transformers_fnv1a64"
         checks["ids"] = exp[key] == exp["fnv1a64"]
     else:
         checks["ids"] = None
     no_reuse = None
-    if "reused_prefix_tokens" in ingest:
-        no_reuse = ingest["reused_prefix_tokens"] == "0"
-    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
-    if cached is not None:
-        no_reuse = cached == 0
+    engine = line["engine"]
     timings = line.get("timings") or {}
-    if "cache_n" in timings:
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    if engine == "saragossa" and "reused_prefix_tokens" in ingest:
+        no_reuse = ingest["reused_prefix_tokens"] == "0"
+    elif engine == "llama" and "cache_n" in timings:
         no_reuse = timings["cache_n"] == 0
-    if no_reuse is None:
-        # Moteur sans compteur (llmd) : seul le diagnostic de validation prouve.
-        no_reuse = cache_probe.get(line["engine"])
+    elif engine == "mlx" and cached is not None:
+        no_reuse = cached == 0
+    elif engine == "llmd":
+        # llmd n'a pas de compteur : seul le diagnostic de validation prouve.
+        # Ce repli est réservé à llmd ; ailleurs, compteur absent = non vérifié.
+        no_reuse = cache_probe.get("llmd")
     checks["no_reuse"] = no_reuse
     return checks
+
+
+# Nature de la preuve `ids` par moteur, écrite dans le rapport (protocole §5.4).
+IDS_NATURE = {"saragossa": "lecture (journal de la requête)",
+              "llama": "reconstruction serveur (/apply-template + /tokenize)",
+              "mlx": "calcul hors moteur (transformers) ; mesure moteur = prompt_tokens seul",
+              "llmd": "calcul hors moteur (tokenizer NVFP4) ; mesure moteur = prompt_tokens seul"}
 
 
 def cache_probes(rows):
@@ -223,11 +234,9 @@ def load(run_dir):
         values = [row["proofs"][name] for name in REQUIRED]
         row["admissibility"] = ("validation_failed" if False in values
                                 else "unverified" if None in values else "admissible")
-    divergences = integrity(rows)
-    for row in rows:
-        if row.get("request_key") in divergences and row["admissibility"] == "admissible":
-            row["admissibility"] = "validation_failed"
-            row.setdefault("proofs", {})["greedy_identity"] = False
+    # Identité greedy obligatoire pour tout spéculatif, réglage compris : la
+    # référence est l'AR apparié (même requête), lui-même admissible.
+    apply_identity(rows, pair_function(matrix))
     return rows, others, {"cache_probe": probes, "cache_probe_ratios": probe_ratios}
 
 
@@ -242,26 +251,65 @@ def first_divergence(a, b):
     return None if len(a) == len(b) else min(len(a), len(b))
 
 
-def integrity(rows, pairs=None, mark=True):
-    """Greedy : texte du spéculatif contre l'AR du même moteur, même requête (même nonce).
+def pair_function(matrix):
+    """Référence AR de chaque configuration spéculative, réglage compris.
 
-    Rend les clés des requêtes divergentes (`mark`) ou le rapport de comparaison.
+    En réglage, un candidat d'une famille spéculative se compare à
+    `tune-ref:<config AR>` (clé `reference` de la famille), mesuré dans la même
+    phase avec les mêmes nonces.
     """
-    pairs = pairs or SPEC_PAIRS
-    by_key = {}
+    def pair_of(config):
+        if config in SPEC_PAIRS:
+            return SPEC_PAIRS[config]
+        if config.startswith("tune:"):
+            family = config.split(":")[1]
+            reference = matrix["tuning"].get(family, {}).get("reference")
+            return f"tune-ref:{reference}" if reference else None
+        return None
+    return pair_of
+
+
+def request_key(row):
+    return (row["phase"], row["prompt"], row["nonce"]) + obs_key(row)
+
+
+def identity_checks(rows, pair_of):
+    """(ligne, verdict) des spéculatifs greedy : vrai si texte identique à une
+    référence AR admissible, faux si différent, None si la référence manque ou
+    n'est pas admissible."""
+    refs = {(row["config"],) + request_key(row): row for row in rows
+            if row.get("status") == "ok" and row["sampling"] == "greedy"}
     for row in rows:
-        if row.get("status") == "ok" and row["sampling"] == "greedy":
-            key = (row["phase"], row["prompt"], row["nonce"]) + obs_key(row)
-            row["request_key"] = (row["config"],) + key
-            by_key[row["request_key"]] = row
-    divergent, report = set(), {}
-    for (config, *key), row in by_key.items():
-        base = pairs.get(config)
-        ref = by_key.get((base, *key)) if base else None
-        stats = report.setdefault(config, {"pairs": 0, "identical": 0, "missing_pair": 0,
-                                           "first_divergences": []}) if base else None
-        if base is None:
+        base = pair_of(row["config"])
+        if base is None or row.get("status") != "ok" or row["sampling"] != "greedy":
             continue
+        ref = refs.get((base,) + request_key(row))
+        if ref is None or ref.get("admissibility") != "admissible":
+            yield row, None
+        else:
+            yield row, row["content"] == ref["content"]
+
+
+def apply_identity(rows, pair_of):
+    """Rend non admissible tout spéculatif greedy sans identité prouvée."""
+    for row, value in list(identity_checks(rows, pair_of)):
+        row.setdefault("proofs", {})["greedy_identity"] = value
+        if row["admissibility"] == "admissible" and value is not True:
+            row["admissibility"] = "validation_failed" if value is False else "unverified"
+
+
+def text_identity_report(rows, pair_of):
+    """Taux d'identité, paires manquantes et premiers écarts, par configuration."""
+    refs = {(row["config"],) + request_key(row): row for row in rows
+            if row.get("status") == "ok" and row["sampling"] == "greedy"}
+    report = {}
+    for row in rows:
+        base = pair_of(row["config"])
+        if base is None or row.get("status") != "ok" or row["sampling"] != "greedy":
+            continue
+        stats = report.setdefault(row["config"], {"against": base, "pairs": 0, "identical": 0,
+                                                  "missing_pair": 0, "first_divergences": []})
+        ref = refs.get((base,) + request_key(row))
         if ref is None:
             stats["missing_pair"] += 1
             continue
@@ -271,8 +319,7 @@ def integrity(rows, pairs=None, mark=True):
             stats["identical"] += 1
         else:
             stats["first_divergences"].append({"prompt": row["prompt"], "char": div})
-            divergent.add(row["request_key"])
-    return divergent if mark else report
+    return report
 
 
 def repeatability(rows):
@@ -406,7 +453,10 @@ def add_common_length(rows):
     for row in rows:
         m = row.get("m") or {}
         common = lengths.get((row["phase"], row["prompt"]))
-        if m.get("t_at_token_s") and common:
+        # Mêmes lignes que celles qui fixent L : une sortie rejetée (plus courte
+        # que L) n'en reçoit pas.
+        if (row.get("admissibility") == "admissible" and m.get("t_at_token_s") and common
+                and len(m["t_at_token_s"]) >= common):
             m["latency_L_s"] = m["t_at_token_s"][common - 1]
             m["common_length"] = common
 
@@ -474,28 +524,98 @@ def tables(rows, reference):
 
 
 def drift(rows):
-    """Pente de log(débit) en fonction du rang dans le bloc et de l'heure, par config."""
+    """Dérive de log(débit) selon le rang dans le bloc et selon l'heure, par config.
+
+    Seules des observations de même charge se comparent : chaque groupe (config,
+    phase, prompt, sampling) est centré sur sa moyenne, puis la pente commune
+    intra-groupe est estimée. Les effets de prompt, de contexte, de phase et de
+    sampling ne peuvent donc pas passer pour une dérive.
+    """
+    groups = {}
+    for r in rows:
+        if r.get("admissibility") == "admissible" and (r.get("m") or {}).get("delivery_tok_s"):
+            key = (r["config"], r["phase"], r["prompt"], r["sampling"])
+            groups.setdefault(key, []).append(
+                (r["position"], r["t0_wall"] / 3600, math.log(r["m"]["delivery_tok_s"])))
     result = {}
-    for config in sorted({r["config"] for r in rows}):
-        points = [(r["position"], r["t0_wall"], math.log(r["m"]["delivery_tok_s"]))
-                  for r in rows if r["config"] == config and r.get("admissibility") == "admissible"
-                  and r["m"].get("delivery_tok_s")]
-        if len(points) < 3:
-            continue
+    for config in sorted({key[0] for key in groups}):
         entry = {}
         for name, index in (("rank", 0), ("hour", 1)):
-            xs = [p[index] / (3600 if name == "hour" else 1) for p in points]
-            ys = [p[2] for p in points]
-            mx, my = statistics.fmean(xs), statistics.fmean(ys)
-            var = sum((x - mx) ** 2 for x in xs)
-            if var == 0:
+            sxy = sxx = 0.0
+            spans = []
+            for key, points in groups.items():
+                if key[0] != config or len(points) < 2:
+                    continue
+                mx = statistics.fmean(p[index] for p in points)
+                my = statistics.fmean(p[2] for p in points)
+                sxy += sum((p[index] - mx) * (p[2] - my) for p in points)
+                sxx += sum((p[index] - mx) ** 2 for p in points)
+                spans.append(max(p[index] for p in points) - min(p[index] for p in points))
+            if sxx == 0 or not spans:
                 continue
-            slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
-            span = max(xs) - min(xs)
-            change = math.exp(slope * span) - 1
+            slope = sxy / sxx
+            change = math.exp(slope * max(spans)) - 1
             entry[name] = {"slope_log_per_unit": slope, "change_over_span": change,
-                           "flag": abs(change) > PRACTICAL}
-        result[config] = entry
+                           "groups": len(spans), "flag": abs(change) > PRACTICAL}
+        if entry:
+            result[config] = entry
+    return result
+
+
+GAP_BINS_MS = (0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500)
+
+
+def gap_histogram(rows):
+    """Écarts inter-événements de sortie par moteur et par config (requêtes `ok`).
+
+    Sert à juger le regroupement d'événements (TCP_NODELAY, rétention) : des
+    écarts quasi nuls après un long écart signalent des événements livrés ensemble.
+    """
+    hist = {}
+    for row in rows:
+        if row.get("status") != "ok":
+            continue
+        times = [e["t_ns"] for e in row["events"]
+                 if e.get("content_chars", 0) + e.get("reasoning_chars", 0) > 0]
+        for scope in (row["engine"], row["config"]):
+            entry = hist.setdefault(scope, {f"<{b}ms": 0 for b in GAP_BINS_MS} | {">=500ms": 0})
+            for a, b in zip(times, times[1:]):
+                gap = (b - a) / 1e6
+                label = next((f"<{edge}ms" for edge in GAP_BINS_MS if gap < edge), ">=500ms")
+                entry[label] += 1
+    return hist
+
+
+def int_lists(value):
+    """Toutes les listes d'entiers d'un JSON (recherche des ids dans /slots)."""
+    if isinstance(value, list):
+        if value and all(isinstance(item, int) for item in value):
+            yield value
+        for item in value:
+            yield from int_lists(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from int_lists(item)
+
+
+def slots_qualification(rows, others, expected):
+    """llama.cpp : /slots porte-t-il les ids de la requête, et égalent-ils la reconstruction ?"""
+    from prompts import fnv1a64
+
+    result = []
+    for probe in (o for o in others if o.get("kind") == "slots_probe"):
+        status, body = probe.get("slots") or (None, None)
+        same = [r for r in rows if r.get("entry_key") == probe.get("entry_key")
+                and r.get("run_seq") == probe.get("run_seq") and r.get("status") == "ok"]
+        fingerprints = {fnv1a64(ids) for ids in int_lists(body)}
+        entry = {"entry_key": probe.get("entry_key"), "http_status": status,
+                 "int_lists": len(fingerprints)}
+        if same:
+            exp = expected.get(f"{same[0]['prompt']}|{same[0]['nonce']}", {})
+            reconstruction = (same[0].get("ingest") or {}).get("prompt_fnv1a64")
+            entry["slots_has_expected_ids"] = exp.get("fnv1a64") in fingerprints
+            entry["reconstruction_equals_expected"] = reconstruction == exp.get("fnv1a64")
+        result.append(entry)
     return result
 
 
@@ -597,6 +717,47 @@ def _self_check():
     exp = {"p|n": {"prompt_tokens": 10, "fnv1a64": "aa", "llmd_offline_fnv1a64": "aa"}}
     assert proofs(row, exp, {})["no_reuse"] is None
     assert proofs(row, exp, {"llmd": True})["no_reuse"] is True
+    # Astra v4-2 : le diagnostic temporel ne remplace pas un compteur absent hors llmd.
+    for engine in ("saragossa", "llama", "mlx"):
+        other = dict(row, engine=engine, ingest={"kind": "log", "prompt_fnv1a64": "aa"})
+        assert proofs(other, exp, {engine: True, "llmd": True})["no_reuse"] is None
+
+    def greedy(config, content, admissibility="admissible", phase="eval-S"):
+        return {"config": config, "content": content, "admissibility": admissibility,
+                "status": "ok", "sampling": "greedy", "phase": phase, "prompt": "p",
+                "nonce": "n", "block": 0, "seed": None, "repeat": 0, "proofs": {}}
+
+    pair_of = pair_function({"tuning": {"sar-mtp": {"reference": "sar-ar"}}})
+    # Astra v4-1a : spéculatif sans référence AR -> non vérifié.
+    alone = [greedy("sar-mtp", "abc")]
+    apply_identity(alone, pair_of)
+    assert alone[0]["admissibility"] == "unverified"
+    # Référence AR elle-même non vérifiée -> non vérifié.
+    weak = [greedy("sar-ar", "abc", "unverified"), greedy("sar-mtp", "abc")]
+    apply_identity(weak, pair_of)
+    assert weak[1]["admissibility"] == "unverified"
+    # Astra v4-1b : candidat de réglage divergent de sa référence -> validation_failed.
+    tune = [greedy("tune-ref:sar-ar", "abc", phase="tune"),
+            greedy("tune:sar-mtp:1", "abd", phase="tune"),
+            greedy("tune:sar-mtp:0", "abc", phase="tune")]
+    apply_identity(tune, pair_of)
+    assert [r["admissibility"] for r in tune] == ["admissible", "validation_failed", "admissible"]
+    # Astra v4-3 : sortie rejetée plus courte que L -> pas d'IndexError, pas de L.
+    short = greedy("sar-mtp", "a", "validation_failed")
+    short["m"] = {"t_at_token_s": [1.0]}
+    long = greedy("sar-ar", "abcd")
+    long["m"] = {"t_at_token_s": [1.0, 2.0, 3.0, 4.0]}
+    add_common_length([long, short])
+    assert long["m"]["latency_L_s"] == 4.0 and "latency_L_s" not in short["m"]
+    # Astra v4-6 : débit constant par prompt (100 en court, 50 en long) -> pas de dérive.
+    drift_rows = []
+    for position, (prompt, rate) in enumerate([("court", 100), ("court", 100),
+                                               ("long", 50), ("long", 50)]):
+        drift_rows.append({"config": "c", "phase": "x", "prompt": prompt, "sampling": "greedy",
+                           "admissibility": "admissible", "position": position,
+                           "t0_wall": position * 3600, "m": {"delivery_tok_s": rate}})
+    assert all(not v["flag"] and abs(v["change_over_span"]) < 1e-9
+               for v in drift(drift_rows)["c"].values())
 
 
 if __name__ == "__main__":
@@ -612,10 +773,15 @@ if __name__ == "__main__":
         "admissibility": admissibility_summary(rows),
         **probes,
         "eos": eos_table(rows),
-        "integrity": integrity(rows, mark=False),
-        "cross_engine_text_identity_informative": integrity(rows, CROSS_PAIRS, mark=False),
+        "integrity": text_identity_report(rows, pair_function(load_matrix(run_dir))),
+        "cross_engine_text_identity_informative": text_identity_report(rows, CROSS_PAIRS.get),
         "repeatability": repeatability(rows),
         "drift": drift(rows),
+        "gap_histogram": gap_histogram(rows),
+        "ids_nature": IDS_NATURE,
+        "slots_qualification": slots_qualification(
+            rows, others, json.loads((run_dir / "prompts" / "expected.json").read_text())
+            if (run_dir / "prompts" / "expected.json").exists() else {}),
         "memory_gb": memory_summary(rows),
         "argmax_checks": [o for o in others if o.get("kind") == "argmax_check"],
         "loads": loads,
@@ -623,6 +789,8 @@ if __name__ == "__main__":
     }
     (run_dir / "analysis.json").write_text(json.dumps(report, indent=1, ensure_ascii=False,
                                                       default=str))
+    # Tableaux d'abord : ils calculent latency_L_s, publiée ensuite par requête.
+    (run_dir / "tables.md").write_text(tables(rows, reference))
     keep = ("phase", "block", "config", "prompt", "prompt_kind", "seed", "repeat", "status",
             "admissibility", "throttled", "proofs", "request_id")
     per_request = [{k: r.get(k) for k in keep}
@@ -630,7 +798,6 @@ if __name__ == "__main__":
                    for r in rows]
     (run_dir / "per_request.jsonl").write_text(
         "\n".join(json.dumps(p, ensure_ascii=False) for p in per_request) + "\n")
-    (run_dir / "tables.md").write_text(tables(rows, reference))
     print(json.dumps({k: report[k] for k in ("admissibility", "cache_probe", "eos",
                                              "integrity", "repeatability")},
                      indent=1, ensure_ascii=False))
