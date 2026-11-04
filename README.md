@@ -103,7 +103,9 @@ point `SARAGOSSA_RUST_MTP_SIDECAR` at its `mtp.safetensors` (in a subdirectory,
 not directly in the model root, e.g. `<model>/mtp-official/`). Greedy only, byte-identical to
 AR: ×1.19 to ×1.61 decode (pairwise, 5 prompts), CLI 151→224-295 tok/s;
 sampled requests stay on AR (the sampled path measured 0.94-0.99× AR). Cost:
-+3.2 GB peak physical footprint (CLI), +3.7 GB in serve after a 5,078-token request. See
++0.95 GB peak physical footprint in the CLI (+1.33 GB on a 424-token prompt),
++0.96 GB in serve after a 5,078-token request: the head is quantized straight
+into shared Metal buffers, one copy. See
 `generate_greedy_mtp_streaming_with_options` and `docs/perf/mtp-pairwise.md`.
 
 ## Install

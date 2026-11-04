@@ -347,52 +347,19 @@ impl AffineQuantizedTensor {
     /// pas finie.
     pub fn quantize(weight: &Tensor, group_size: usize, bits: usize) -> Result<Self> {
         let (rows, cols) = weight.as_matrix()?;
-        if group_size == 0 || cols % group_size != 0 || bits == 0 || bits > 16 || 32 % bits != 0 {
-            return Err(InferError::Config(format!(
-                "quantification affine impossible: shape={:?}, group_size={group_size}, bits={bits}",
-                weight.shape()
-            )));
-        }
-        let lanes = 32 / bits;
-        if group_size % lanes != 0 {
-            return Err(InferError::Config(format!(
-                "quantification affine: group_size={group_size} non multiple de {lanes} codes par u32"
-            )));
-        }
-        let groups = cols / group_size;
-        let packed_cols = cols / lanes;
-        let levels = ((1_u32 << bits) - 1) as f32;
-        let data = weight.data();
+        let (packed_cols, groups) = affine_layout(rows, cols, group_size, bits)?;
         let mut packed = vec![0_u32; rows * packed_cols];
         let mut scales = vec![0.0_f32; rows * groups];
         let mut biases = vec![0.0_f32; rows * groups];
-        for row in 0..rows {
-            for group in 0..groups {
-                let start = row * cols + group * group_size;
-                let slice = &data[start..start + group_size];
-                // `min`/`max` ignorent NaN : chaque valeur est contrôlée.
-                if slice.iter().any(|value| !value.is_finite()) {
-                    return Err(InferError::Config(format!(
-                        "quantification affine: valeur non finie (ligne {row}, groupe {group})"
-                    )));
-                }
-                let (min, max) = slice
-                    .iter()
-                    .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &value| {
-                        (lo.min(value), hi.max(value))
-                    });
-                let scale = ((max - min) / levels).max(1.0e-7);
-                let inv = scale.recip();
-                scales[row * groups + group] = scale;
-                biases[row * groups + group] = min;
-                for (lane, &value) in slice.iter().enumerate() {
-                    // Code borné dans [0, levels] : la conversion ne tronque rien.
-                    let code = ((value - min) * inv).round().clamp(0.0, levels) as u32;
-                    let col = group * group_size + lane;
-                    packed[row * packed_cols + col / lanes] |= code << ((col % lanes) * bits);
-                }
-            }
-        }
+        quantize_affine_into(
+            weight.data(),
+            cols,
+            group_size,
+            bits,
+            &mut packed,
+            &mut scales,
+            &mut biases,
+        )?;
         Self::new(
             &[rows, packed_cols],
             packed,
@@ -887,6 +854,95 @@ fn next_weight_id() -> Result<u64> {
             Err(current) => id = current,
         }
     }
+}
+
+/// Valide un layout affine `[rows, cols]` et renvoie `(packed_cols, groups)`.
+pub(crate) fn affine_layout(
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    bits: usize,
+) -> Result<(usize, usize)> {
+    if group_size == 0 || cols % group_size != 0 || bits == 0 || bits > 16 || 32 % bits != 0 {
+        return Err(InferError::Config(format!(
+            "quantification affine impossible: shape=[{rows}, {cols}], group_size={group_size}, bits={bits}"
+        )));
+    }
+    let lanes = 32 / bits;
+    if group_size % lanes != 0 {
+        return Err(InferError::Config(format!(
+            "quantification affine: group_size={group_size} non multiple de {lanes} codes par u32"
+        )));
+    }
+    Ok((cols / lanes, cols / group_size))
+}
+
+/// Cœur de [`AffineQuantizedTensor::quantize`] : écrit les codes, scales et
+/// minimums de `data` (`[rows, cols]` ligne à ligne) dans des tranches fournies,
+/// pour quantifier sans tampon intermédiaire.
+pub(crate) fn quantize_affine_into(
+    data: &[f32],
+    cols: usize,
+    group_size: usize,
+    bits: usize,
+    packed: &mut [u32],
+    scales: &mut [f32],
+    biases: &mut [f32],
+) -> Result<()> {
+    let rows = data.len().checked_div(cols).unwrap_or(0);
+    let (packed_cols, groups) = affine_layout(rows, cols, group_size, bits)?;
+    if rows * cols != data.len()
+        || packed.len() != rows * packed_cols
+        || scales.len() != rows * groups
+        || biases.len() != rows * groups
+    {
+        return Err(InferError::Dimension(format!(
+            "quantification affine: {} valeurs, {cols} colonnes, sorties {}/{}/{}",
+            data.len(),
+            packed.len(),
+            scales.len(),
+            biases.len()
+        )));
+    }
+    // Les codes sont combinés par `|=` : un `packed` non nul les corromprait.
+    packed.fill(0);
+    let lanes = 32 / bits;
+    let levels = ((1_u32 << bits) - 1) as f32;
+    for row in 0..rows {
+        for group in 0..groups {
+            let start = row * cols + group * group_size;
+            let slice = &data[start..start + group_size];
+            // `min`/`max` ignorent NaN : chaque valeur est contrôlée.
+            if slice.iter().any(|value| !value.is_finite()) {
+                return Err(InferError::Config(format!(
+                    "quantification affine: valeur non finie (ligne {row}, groupe {group})"
+                )));
+            }
+            let (min, max) = slice
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &value| {
+                    (lo.min(value), hi.max(value))
+                });
+            let scale = ((max - min) / levels).max(1.0e-7);
+            let inv = scale.recip();
+            scales[row * groups + group] = scale;
+            biases[row * groups + group] = min;
+            for (lane, &value) in slice.iter().enumerate() {
+                // Code borné dans [0, levels] : la conversion ne tronque rien.
+                let code = ((value - min) * inv).round().clamp(0.0, levels) as u32;
+                let col = group * group_size + lane;
+                packed[row * packed_cols + col / lanes] |= code << ((col % lanes) * bits);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bits bf16 de `value`, arrondi au plus proche pair comme les uploads Metal
+/// (`f32_slice_to_bf16`).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn bf16_bits(value: f32) -> u16 {
+    (bf16_round(value).to_bits() >> 16) as u16
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

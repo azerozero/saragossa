@@ -1326,11 +1326,73 @@ contre MTP. Les 14 cas sont identiques à l'AR (texte, `finish_reason`, usage) :
 
 Empreinte physique après la requête de 5078 tokens (`footprint_bytes` du
 journal serve) : 22,84 Go en AR contre 26,52 Go avec la tête (+3,67 Go). Dans
-la CLI, le surcoût de pointe est de +3,2 Go. La tête ne pèse qu'environ 1 Go
-(poids u4/u8 sur le GPU, plus leur copie CPU, gardée pour le forward CPU de
-repli). Le reste n'est pas attribué. Pistes : libérer la copie CPU des
-experts comme le fait le tronc, lire le sidecar sans charger le fichier entier
-(1,69 Go pendant la charge).
+la CLI, le surcoût de pointe était de +3,2 Go. La section suivante attribue et
+réduit ce surcoût.
+
+### Empreinte de la tête (3 nov. 2026)
+
+Attribution par `phys_footprint` (Mach `task_vm_info`) relevé à chaque étape
+de la CLI (tronc chargé, sidecar lu, experts quantifiés, tête chargée, chauffes,
+génération), plus `vmmap -summary` à la fin de la charge. T1, 400 tokens, D2.
+Surcoût contre l'AR sans tête, en Go :
+
+| poste | avant | après |
+|---|---:|---:|
+| sidecar lu en entier (`std::fs::read`, 1,69 Go bf16), bloc libéré mais gardé par malloc | 1,69 | 0,08 |
+| copie CPU des poids quantifiés (codes `u32`, scales et minimums f32) et temporaires de quantification, gardés par malloc | 0,83 | ≈ 0,25 |
+| poids GPU de la tête (experts u4 ≈ 0,45, linéaires u8 ≈ 0,04) | 0,49 | 0,49 |
+| scratch du decode MTP | 0,12 | 0,12 |
+| **total au pic (`/usr/bin/time -l`)** | **3,19** | **0,95** |
+
+Le premier poste devient le header et les petits tenseurs : le buffer a la
+taille du fichier, mais les pages des experts ne sont jamais touchées (pages
+zéro paresseuses de `calloc`). Chaque expert est relu depuis le fichier au
+moment de sa quantification. Le deuxième poste vient de ce que malloc garde les
+blocs libérés dans l'empreinte : `vmmap` montre +494 Mo de `MALLOC_SMALL
+(empty)` et +404 Mo de `MALLOC_LARGE (empty)` après la charge, et
+`malloc_zone_pressure_relief` n'en rend rien. Libérer la copie CPU ne suffit
+donc pas : les experts sont quantifiés directement dans des `MTLBuffer`
+partagés contigus (`quantize_experts_into_metal`), que
+`contiguous_metal_expert_stacks` sert sans copie. Les linéaires (fc, attention,
+expert partagé, routeur) passent en single-copy dès `with_mtp_sidecar`, que la
+tête manquait parce qu'elle arrive après `enable_single_copy_weights` du tronc.
+Les codes sont ceux de la quantification CPU, avec des scales et minimums
+arrondis en bf16, comme les lisaient déjà les kernels (test
+`metal_experts_match_cpu_quantization_in_bf16`). Le forward CPU de la tête lit
+donc les mêmes scales que le GPU : la porte G2 passe d'un cosinus médian de
+0,99997 (écart max 1,05e-2) à 1,000000 (1,0e-3), sans bascule d'argmax ; G1
+ne change pas (0,849, 10 perdues, 9 gagnées). Le reliquat CPU est fait des
+temporaires f32 par expert et des linéaires, que l'AR réutilise ensuite.
+
+ABBA (A = main 527ecbf, B = correctif), 2 passes chacun, pic de footprint en
+Go. Les sorties sont identiques entre AR, MTP avant et MTP après (md5) :
+
+| cas | AR | MTP avant | MTP après | surcoût avant → après |
+|---|---:|---:|---:|---:|
+| CLI T0, 400 tokens | 21,20 | 24,39 | 22,15 | +3,19 → +0,95 |
+| CLI T1, 400 tokens | 21,22 | 24,41 | 22,17 | +3,19 → +0,95 |
+| CLI T6, prompt de 424 tokens | 21,42 | 24,98 | 22,75 | +3,56 → +1,33 |
+| serve, 5078 tokens, régime | 22,84 | 26,07 | 23,80 | +3,23 → +0,96 |
+| serve, 5078 tokens, pic | 22,87 | 26,21 | 23,96 | +3,34 → +1,08 |
+| serve, 5079 tokens, régime | 22,86 | 26,71 | 24,42 | +3,85 → +1,56 |
+| serve, 5079 tokens, pic | 22,88 | 26,81 | 24,56 | +3,94 → +1,69 |
+
+Débit inchangé à la mesure près : decode MTP D2 de 231,7 contre 230,9 tok/s
+(T1), 223,3 contre 223,0 (T0), 296,7 contre 294,8 (T6).
+
+Deux postes restent au-delà des poids :
+
+- T6 (prompt long, historique `committed`) : +0,3 Go de scratch GPU propre au
+  chemin MTP (second instantané linear-attn, semis de l'historique, hidden du
+  prefill), non attribué buffer par buffer.
+- Serve sur un prompt impair : le prefill résident découpe 5079 tokens en
+  morceaux de 2540 et 2539. Les scratch internes (linear-attn batché, MoE en
+  lignes) sont indexés par longueur exacte : le second morceau alloue un jeu
+  complet de plus (≈ 0,6 Go). Ce n'est pas un coût de la tête : l'AR CLI paie
+  la même chose (pic 22,81 Go à 5012 tokens, 23,43 Go à 5013). Le serve AR
+  l'évite parce qu'il découpe le prompt en blocs pour ses instantanés. Piste :
+  dimensionner ces scratch sur la taille du morceau, comme la scratch de
+  couche (`allocate_prefill_resident_layer_scratch`).
 
 Reproduction (`$SIDECAR` = `<35B>/mtp-official/mtp.safetensors`, `$PROMPTS` =
 `models/pairwise/prompts6.json`) :
