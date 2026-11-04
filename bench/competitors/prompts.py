@@ -150,6 +150,15 @@ class Renderer:
         return self.tokenizer.decode(ids, skip_special_tokens=False)
 
 
+def detokenize_wikitext(text):
+    """Espacement de prose ordinaire : pas d'espace avant la ponctuation fermante
+    ni après l'ouvrante, pas d'espace autour des sauts de ligne."""
+    text = re.sub(r" ([,.;:!?)\]]|'s\b|'t\b|n't\b|'re\b|'ve\b|'m\b|'ll\b|'d\b)", r"\1", text)
+    text = re.sub(r"([(\[]) ", r"\1", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n[ \t]+", "\n", text)
+
+
 def wiki_articles():
     data = WIKITEXT.read_bytes()
     if sha256_bytes(data) != WIKITEXT_TRAIN_SHA256:
@@ -161,8 +170,11 @@ def wiki_articles():
     for index in range(1, len(parts) - 1, 2):
         title = parts[index].strip("= ").strip()
         body = parts[index + 1]
-        # Détokenisation wikitext standard des nombres ; le reste est laissé tel quel.
+        # Détokenisation wikitext des nombres, puis de l'espacement : le tokenizer de
+        # llmd découpait autrement le wikitext brut (prompt_tokens +7 à +102),
+        # pas la prose ordinaire (décision post-validation, protocole §15).
         body = body.replace(" @-@ ", "-").replace(" @,@ ", ",").replace(" @.@ ", ".")
+        body = detokenize_wikitext(body)
         articles.append((title, f"{title}\n{body.strip()}\n"))
     return articles
 
@@ -348,6 +360,8 @@ def _self_check():
     assert with_nonce(NONCE_LINE.format(nonce=NONCE_PLACEHOLDER) + "x", "1" * 16).startswith(
         "Request id: 1111111111111111\n\nx")
     assert has_combining_mark("é") and not has_combining_mark("é")
+    assert detokenize_wikitext("Rock 's first ( 1840 ) , then .\n = = B = = \n") == (
+        "Rock's first (1840), then.\n= = B = =\n")
 
 
 if __name__ == "__main__":
