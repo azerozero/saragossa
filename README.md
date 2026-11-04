@@ -96,12 +96,19 @@ the 35B-A3B MoE drops from 40.5 to 19.4 GB.
 high fidelity (smaller, same quality).
 
 **Speculative decode (MTP)**: on a **dense** model carrying a native MTP head,
-in greedy (T=0), saragossa verifies the draft **byte-exactly** → +15 to +40%
-throughput (`u4` 27→~40, `u3` 35→~46 tok/s). On the **Qwen3.6-35B-A3B** MoE,
+in greedy (T=0), saragossa verifies the draft against the target model → +15
+to +40% throughput (`u4` 27→~40, `u3` 35→~46 tok/s). The output matches the
+autoregressive (AR) decode except near a tie between the top two logits: the
+batched verification is not yet bit-identical to the single-row step (attention
+prefix past 16k tokens of context, batched linear-attention block, skinny
+matmul from 5 rows), and a tiny drift can flip such a tie (measured: 1 request
+in 66 on a 32k prompt). See
+[docs/perf/greedy-identity.md](docs/perf/greedy-identity.md). On the
+**Qwen3.6-35B-A3B** MoE,
 the official Qwen MTP head (not shipped in mlx-community weights) is opt-in:
 point `SARAGOSSA_RUST_MTP_SIDECAR` at its `mtp.safetensors` (in a subdirectory,
-not directly in the model root, e.g. `<model>/mtp-official/`). Greedy only, byte-identical to
-AR: ×1.19 to ×1.61 decode (pairwise, 5 prompts), CLI 151→224-295 tok/s;
+not directly in the model root, e.g. `<model>/mtp-official/`). Greedy only, same
+AR caveat on near ties: ×1.19 to ×1.61 decode (pairwise, 5 prompts), CLI 151→224-295 tok/s;
 sampled requests stay on AR (the sampled path measured 0.94-0.99× AR). Cost:
 +0.95 GB peak physical footprint in the CLI (+1.33 GB on a 424-token prompt),
 +0.96 GB in serve after a 5,078-token request: the head is quantized straight
