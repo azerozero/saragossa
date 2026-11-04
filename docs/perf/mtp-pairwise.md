@@ -1387,12 +1387,43 @@ Deux postes restent au-delà des poids :
   prefill), non attribué buffer par buffer.
 - Serve sur un prompt impair : le prefill résident découpe 5079 tokens en
   morceaux de 2540 et 2539. Les scratch internes (linear-attn batché, MoE en
-  lignes) sont indexés par longueur exacte : le second morceau alloue un jeu
-  complet de plus (≈ 0,6 Go). Ce n'est pas un coût de la tête : l'AR CLI paie
-  la même chose (pic 22,81 Go à 5012 tokens, 23,43 Go à 5013). Le serve AR
-  l'évite parce qu'il découpe le prompt en blocs pour ses instantanés. Piste :
-  dimensionner ces scratch sur la taille du morceau, comme la scratch de
-  couche (`allocate_prefill_resident_layer_scratch`).
+  lignes, LHS bf16 des matmuls, Q de l'attention NAX) sont indexés par longueur
+  exacte : le second morceau allouait un jeu complet de plus (≈ 0,6 Go). Ce
+  n'est pas un coût de la tête : l'AR CLI payait la même chose. Le serve AR
+  l'évite parce qu'il découpe le prompt en blocs pour ses instantanés. Corrigé
+  ensuite, voir plus bas.
+
+### Scratch du dernier morceau de prefill (4 nov. 2026)
+
+Pendant l'encodage d'un morceau plus court que les autres, une garde de thread
+(`enter_scratch_row_capacity`) fait chercher, pour toute demande scratch
+multiple des lignes du morceau, l'entrée de même label à la capacité du
+morceau. Si elle existe, le dernier morceau la reprend, comme la scratch de
+couche (`allocate_prefill_resident_layer_scratch`) dimensionnée d'office à la
+capacité. Sinon la demande garde sa longueur exacte : une longueur arrondie
+n'est jamais allouée, et la garde ne fait jamais pire que sans elle. Les faux
+positifs retombent donc sur leur longueur exacte : la scratch de couche déjà à
+la capacité (4097 tokens → morceaux de 2049 et 2048), les poids déquantifiés
+`qmm_na_wt_bf16`, un morceau d'une ligne. Les kernels reçoivent toujours le
+vrai nombre de lignes et n'utilisent que le début des buffers repris.
+
+ABBA, A = branche RAM de la tête, B = correctif, 2 passes chacun, Go. Les
+réponses sont identiques entre A et B, en AR comme en MTP (texte serve, md5
+CLI). 4097 tokens se découpent en morceaux de 2049 et 2048 : c'est le faux
+positif des relectures, que la première version (longueur arrondie allouée)
+ne corrigeait qu'en partie :
+
+| cas | A | B | garde arrondie (abandonnée) |
+|---|---:|---:|---:|
+| serve AR, 5078 tokens, régime / pic | 22,84 / 22,87 | 22,86 / 22,88 | |
+| serve MTP, 5078 tokens, régime / pic | 23,84 / 23,96 | 23,84 / 23,96 | |
+| serve AR, 5079 tokens, régime / pic | 22,83 / 22,88 | 22,85 / 22,88 | |
+| serve MTP, 5079 tokens, régime / pic | 24,41 / 24,56 | 23,81 / 23,95 | |
+| CLI AR, 4097 tokens, pic | 23,01 | 22,53 | 22,85 |
+| CLI MTP, 4097 tokens, pic | 24,07 | 23,60 | 23,92 |
+
+Sur 5079 tokens, le surcoût de la tête retombe à +0,96 Go en régime et
++1,07 Go au pic, comme sur un prompt pair.
 
 Reproduction (`$SIDECAR` = `<35B>/mtp-official/mtp.safetensors`, `$PROMPTS` =
 `models/pairwise/prompts6.json`) :
