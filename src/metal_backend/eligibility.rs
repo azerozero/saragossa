@@ -299,7 +299,7 @@ thread_local! {
 /// Force le seuil du skinny sur ce thread le temps de `run` (oracles : même lot
 /// en qmv répliqué, comparé en bits).
 #[cfg(test)]
-pub(super) fn with_qmm_skinny_min_batch_override<R>(min: usize, run: impl FnOnce() -> R) -> R {
+pub(crate) fn with_qmm_skinny_min_batch_override<R>(min: usize, run: impl FnOnce() -> R) -> R {
     /// Rétablit le réglage précédent, panique comprise.
     struct Restore(Option<usize>);
     impl Drop for Restore {

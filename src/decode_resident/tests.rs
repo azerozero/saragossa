@@ -2981,6 +2981,181 @@ fn run_rows_fused_case(
 #[test]
 #[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn full_attn_rows_fused_matches_row_loop_all_rows() -> Result<()> {
+    full_attn_rows_fused_matches_row_loop_all_rows_body()
+}
+
+/// Poids affine u4 gs64 synthétique `[out_dim, in_dim]`, résolu sur `executor`.
+fn dense_layer_u4(
+    executor: &MetalExecutor,
+    out_dim: usize,
+    in_dim: usize,
+    seed: usize,
+    label: &'static str,
+) -> Result<crate::metal_backend::MetalLinearWeightBuffers> {
+    let groups = in_dim / 64;
+    let packed = (0..out_dim * in_dim / 8)
+        .map(|word| {
+            (0..8).fold(0_u32, |acc, lane| {
+                let q = ((word * 8 + lane).wrapping_mul(2_654_435_761) ^ seed) % 16;
+                acc | ((q as u32) << (lane * 4))
+            })
+        })
+        .collect();
+    let scales: Vec<f32> = (0..out_dim * groups)
+        .map(|i| bf16_round_to_f32(0.002 + 0.0001 * ((i + seed) % 17) as f32))
+        .collect();
+    let biases: Vec<f32> = scales.iter().map(|s| bf16_round_to_f32(-s * 7.5)).collect();
+    let weight = crate::AffineQuantizedTensor::new(
+        &[out_dim, in_dim / 8],
+        packed,
+        crate::Tensor::from_vec(vec![out_dim, groups], scales)?,
+        crate::Tensor::from_vec(vec![out_dim, groups], biases)?,
+        64,
+        4,
+    )?;
+    executor.resolve_linear_weight_buffers(&crate::LinearWeight::AffineQuantized(weight), label)
+}
+
+/// Oracle O1 d'une couche full-attn dense (27B : hidden 5120, 24/4 têtes de
+/// 256, gate de sortie, QKV concaténé) : la ligne `r` de
+/// `encode_full_attn_dense_layer_rows` (norme d'entrée, QKV, RoPE, append,
+/// attention, o_proj, queue dense) contre `encode_full_attn_dense_layer` pas
+/// par pas, en bits, R = 1..9, skinny coupé. Couvre la condition de miroir de
+/// la norme fusionnée au QKV dans `encode_full_attn_dense_layer_rows_impl`.
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn full_attn_dense_layer_rows_matches_mono_bits() -> Result<()> {
+    let state = try_state()?.ok_or_else(|| {
+        InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
+    })?;
+    let executor = MetalExecutor::new()?;
+    let (hidden, q_heads, kv_heads, head_dim, inter) =
+        (5120usize, 24usize, 4usize, 256usize, 1024usize);
+    let (q_dim, kv_dim) = (q_heads * head_dim, kv_heads * head_dim);
+    let qkv = dense_layer_u4(&executor, 2 * q_dim + 2 * kv_dim, hidden, 11, "dl_qkv")?;
+    assert!(
+        executor.full_attn_qkv_split_rms_applies(&qkv, hidden),
+        "le mono doit fusionner la norme au QKV pour que l'oracle couvre le miroir"
+    );
+    let o_proj = dense_layer_u4(&executor, hidden, q_dim, 12, "dl_o")?;
+    let gate_proj = dense_layer_u4(&executor, inter, hidden, 13, "dl_gate")?;
+    let up_proj = dense_layer_u4(&executor, inter, hidden, 14, "dl_up")?;
+    let down_proj = dense_layer_u4(&executor, hidden, inter, 15, "dl_down")?;
+    let norm = |seed: usize, len: usize| -> Vec<f32> {
+        (0..len).map(|i| 1.0 + 0.1 * pseudo(seed + i)).collect()
+    };
+    let (input_norm_data, post_norm_data) = (norm(100, hidden), norm(200, hidden));
+    let (q_norm_data, k_norm_data) = (norm(300, head_dim), norm(400, head_dim));
+    let input_norm = executor.cached_buffer_from_f32(&input_norm_data, "dl_input_norm")?;
+    let post_norm = executor.cached_buffer_from_f32(&post_norm_data, "dl_post_norm")?;
+    let q_norm = executor.cached_buffer_from_f32(&q_norm_data, "dl_q_norm")?;
+    let k_norm = executor.cached_buffer_from_f32(&k_norm_data, "dl_k_norm")?;
+    let tail_score_data = [1.0_f32];
+    let tail_score = executor.cached_buffer_from_f32(&tail_score_data, "dl_tail_score")?;
+    let weights = || FullAttnDenseLayerWeights {
+        input_norm: &input_norm,
+        qkv_proj: Some(&qkv),
+        qkv_proj_without_gate: false,
+        value_norm: false,
+        // Projections séparées inutilisées : le QKV concaténé les remplace.
+        q_proj: &qkv,
+        k_proj: &qkv,
+        v_proj: &qkv,
+        o_proj: &o_proj,
+        q_norm: &q_norm,
+        k_norm: &k_norm,
+        post_norm: &post_norm,
+        pre_feedforward_norm: None,
+        post_feedforward_norm: None,
+        layer_scalar: None,
+        gate_proj: &gate_proj,
+        up_proj: &up_proj,
+        down_proj: &down_proj,
+        tail_score: &tail_score,
+        parallel_moe: None,
+        sigmoid_moe: None,
+    };
+    let dims = |position: usize| FullAttnLayerDims {
+        hidden,
+        q_heads,
+        kv_heads,
+        head_dim,
+        attn_scalar: head_dim as f32,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        position,
+        window_start: 0,
+        eps: 1.0e-6,
+        theta: 1.0e7,
+        attn_output_gate: true,
+    };
+    let prefix = 40usize;
+    let keys: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 3)).collect();
+    let values: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 11)).collect();
+    let input: Vec<f32> = (0..9 * hidden).map(|i| 4.0 * pseudo(5000 + i)).collect();
+    crate::metal_backend::with_qmm_skinny_min_batch_override(usize::MAX, || -> Result<()> {
+        for rows in 1..=9 {
+            let mut kv_mono =
+                state.full_attention_f32_for_test(prefix + 16, q_heads, kv_heads, head_dim)?;
+            kv_mono.seed(&keys, &values, prefix)?;
+            let mut kv_rows =
+                state.full_attention_f32_for_test(prefix + 16, q_heads, kv_heads, head_dim)?;
+            kv_rows.seed(&keys, &values, prefix)?;
+            let mut mono = Vec::new();
+            for r in 0..rows {
+                let layer_in = lease_with(&state, &input[r * hidden..(r + 1) * hidden])?;
+                let layer_out = state.scratch().lease(hidden, GpuElement::F32)?;
+                let command_buffer = state.queue().new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                state.encode_full_attn_dense_layer(
+                    &executor,
+                    encoder,
+                    &mut Vec::new(),
+                    &mut kv_mono,
+                    weights(),
+                    dims(prefix + r),
+                    layer_in.tensor().buffer(),
+                    layer_out.tensor().buffer(),
+                )?;
+                encoder.end_encoding();
+                commit_and_wait(command_buffer)?;
+                mono.extend(read_f32(layer_out.tensor()));
+            }
+            let layer_in = lease_with(&state, &input[..rows * hidden])?;
+            let layer_out = state.scratch().lease(rows * hidden, GpuElement::F32)?;
+            let command_buffer = state.queue().new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            state.encode_full_attn_dense_layer_rows(
+                &executor,
+                encoder,
+                &mut Vec::new(),
+                &mut kv_rows,
+                weights(),
+                dims(prefix),
+                rows,
+                layer_in.tensor().buffer(),
+                layer_out.tensor().buffer(),
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command_buffer)?;
+            let got = read_f32(layer_out.tensor());
+            for r in 0..rows {
+                let bad = got[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(&mono[r * hidden..(r + 1) * hidden])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    bad, 0,
+                    "couche dense R={rows} ligne {r}: {bad}/{hidden} sorties ≠ mono"
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
+fn full_attn_rows_fused_matches_row_loop_all_rows_body() -> Result<()> {
     let state = try_state()?.ok_or_else(|| {
         InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
     })?;

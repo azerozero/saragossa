@@ -84,6 +84,8 @@ pub(crate) use self::nax_rows::{NaxRowsAttention, NaxRowsBuffers, NaxRowsDispatc
 mod pipelines;
 mod prefill;
 #[cfg(test)]
+pub(crate) use self::eligibility::with_qmm_skinny_min_batch_override;
+#[cfg(test)]
 pub(crate) use self::flags::qmm_na_u4_x3_dispatches_for_test;
 #[cfg(test)]
 pub(crate) use self::flags::with_flint_moe_coop_override;
