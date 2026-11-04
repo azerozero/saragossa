@@ -5,14 +5,17 @@
 Le tokenizer HF du checkpoint (`tokenizers`, venv MLX) compte les tokens de
 chaque événement ; sans lui, aucun débit n'est exact.
 
-Règles (protocole v4) :
+Règles (protocole v5, décisions post-nuit 1) :
 - Comptage par événement : retokenisation des préfixes cumulés des fragments
   bruts ; nᵢ = |tok(préfixe i)| − |tok(préfixe i−1)|. Le débit est **exact**
   si et seulement si la convention EOS du moteur est fixée
-  (`usage_counts_eos` de matrix.json), que chaque nᵢ vaut 1, que le nombre
-  d'événements égale N_texte = N_usage − [EOS compté et arrêt « stop »] et
-  que la retokenisation du texte entier l'égale aussi. Sinon il est marqué
-  « ≈ » et la requête est exclue de la latence à L tokens.
+  (`usage_counts_eos` de matrix.json), que chaque nᵢ vaut au moins 1 (aucun
+  fragment fusionné au précédent) et que Σ nᵢ = |tok(texte entier)| =
+  N_texte = N_usage − [EOS compté et arrêt « stop »], sans tolérance. Un
+  événement de plusieurs tokens (rafale spéculative, caractère UTF-8 sur deux
+  tokens) est alors compté exactement : k = n₁, et ses tokens partagent son
+  heure. Sinon le débit est marqué « ≈ » et la requête est exclue de la
+  latence à L tokens.
 - Admissibilité : statut `ok` et toutes les preuves requises vraies ; une
   preuve fausse donne `validation_failed`, une preuve absente `unverified`.
   Seules les lignes `admissible` entrent dans les tableaux et le gel.
@@ -100,12 +103,18 @@ def derive(line, tok, eos_counted):
     if eos_counted is not None and n_usage is not None:
         expected = n_usage - (1 if eos_counted and m["finish_reason"] == "stop" else 0)
     m["n_text_expected"] = expected
-    exact = (counts is not None and expected is not None and all(c == 1 for c in counts)
-             and len(out_events) == expected == n_retok)
+    # Exact si chaque événement porte au moins un token entier (nᵢ ≥ 1 : aucun
+    # fragment fusionné avec le précédent) et si la somme des nᵢ égale
+    # exactement le compte du moteur. Un événement de plusieurs tokens (rafale
+    # spéculative, caractère UTF-8 sur deux tokens retenu) reste exact : ses
+    # tokens partagent son heure d'arrivée.
+    exact = (counts is not None and expected is not None and all(c >= 1 for c in counts)
+             and sum(counts) == n_retok == expected)
     m["exact"] = exact
     if exact:
-        k, n_text = 1, len(out_events)
-        m["t_at_token_s"] = [e["t_ns"] / 1e9 for e in out_events]
+        k, n_text = counts[0], expected
+        m["t_at_token_s"] = [e["t_ns"] / 1e9 for e, c in zip(out_events, counts)
+                             for _ in range(c)]
     else:
         k = max(counts[0], 1) if counts else 1
         n_text = n_retok if n_retok is not None else (n_usage or 0)
@@ -731,9 +740,16 @@ def _self_check():
     assert derive(injected, tok, True)["exact"]
     m = derive(line(["x", "y", "z"], 4), tok, True)
     assert m["exact"] and m["k"] == 1 and m["delivery_tok_s"] == 1.0
-    # Deux événements pour trois tokens (« y », puis « zw ») : jamais exact.
+    # Rafale : deux événements pour trois tokens (« y », puis « zw ») ; comptés
+    # exactement, les deux tokens du second événement partagent son heure.
     m = derive(line(["y", "zw"], 3), tok, False)
-    assert not m["exact"] and m["event_tokens_max"] == 2 and "t_at_token_s" not in m
+    assert m["exact"] and m["event_tokens_max"] == 2 and m["k"] == 1
+    assert m["t_at_token_s"] == [1.0, 2.0, 2.0] and m["delivery_tok_s"] == 2.0
+    # Rafale en tête : k = 2, débit sur le seul token suivant.
+    m = derive(line(["yz", "w"], 3), tok, False)
+    assert m["exact"] and m["k"] == 2 and m["delivery_tok_s"] == 1.0
+    # Somme différente du compte du moteur : jamais exact.
+    assert not derive(line(["y", "zw"], 4), tok, False)["exact"]
     # Convention EOS inconnue : jamais exact.
     assert not derive(line(["x", "y"], 2), tok, None)["exact"]
     # Fusion « a » + « b » en un token : le comptage cumulé le voit (0 au 2e).
