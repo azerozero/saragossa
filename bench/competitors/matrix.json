@@ -97,7 +97,8 @@
     "top_p"
    ],
    "extra": {},
-   "usage_counts_eos": null
+   "usage_counts_eos": null,
+   "nonce_probe": true
   }
  },
  "configs": {

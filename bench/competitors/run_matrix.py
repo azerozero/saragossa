@@ -176,11 +176,11 @@ def plan(run_dir, phases):
           f"sha256 {hashlib.sha256(text.encode()).hexdigest()}")
 
 
-def request_body(matrix, engine, sampling, content, seed):
+def request_body(matrix, engine, sampling, content, seed, max_tokens=None):
     dialect = matrix["engines"][engine]
     params = dict(matrix["sampling"][sampling])
     body = {"model": dialect["model"], "messages": [{"role": "user", "content": content}],
-            "stream": True, "max_tokens": matrix["max_tokens"],
+            "stream": True, "max_tokens": max_tokens or matrix["max_tokens"],
             "stream_options": {"include_usage": True}}
     for key in dialect["send"]:
         if key in params:
@@ -397,6 +397,7 @@ class Campaign:
         self.run_seq = run_seq
 
     def write(self, line):
+        self.last = line
         self.out.write(json.dumps({"campaign": self.campaign, "run_seq": self.run_seq,
                                    **sanitize(line)}, ensure_ascii=False) + "\n")
         self.out.flush()
@@ -406,7 +407,8 @@ def run_request(camp, eng, entry, request, kind, meta):
     matrix = camp.matrix
     engine = eng.engine
     content = content_for(camp.prompts, request["prompt"], request["nonce"])
-    body = request_body(matrix, engine, entry["sampling"], content, request["seed"])
+    body = request_body(matrix, engine, entry["sampling"], content, request["seed"],
+                        request.get("max_tokens"))
     headers = matrix["engines"][engine].get("headers")
     before = memwatch.rusage(eng.proc.pid)
     with memwatch.Sampler(eng.proc.pid, matrix["memory_period_s"]) as sampler:
@@ -439,6 +441,37 @@ def run_request(camp, eng, entry, request, kind, meta):
     print(f"  {kind:7} {request['prompt']:16} {record['status']:17} "
           f"{record['t_end_ns'] / 1e9:8.1f} s", flush=True)
     return record["status"]
+
+
+def nonce_probe(camp, eng, entry, meta, measure_meta):
+    """Sonde de cache par chargement (llmd, sans compteur de réutilisation).
+
+    Même document, deux nonces : A est froid (document jamais envoyé à ce
+    chargement), B ne diffère que par le nonce. Si le cache réutilisait le
+    document au-delà du nonce, le TTFT de B s'effondrerait ; la sonde passe si
+    TTFT(B) ≥ 0,8 × TTFT(A). Le document n'est pas celui de la chauffe.
+    """
+    warmup_doc = entry["warmup"]["prompt"]
+    doc = "tune-prose4k-1" if warmup_doc != "tune-prose4k-1" else "tune-code4k-1"
+    ttfts = []
+    for index in range(2):
+        request = {"prompt": doc, "seed": None, "repeat": index, "max_tokens": 1,
+                   "nonce": nonce(camp.matrix["seed"], entry["phase"], entry["block"],
+                                  "nonce-probe", entry["config"], index),
+                   "request_id": request_id(entry["phase"], entry["block"], entry["config"],
+                                            f"nonce-probe-{doc}", None, index)}
+        status = run_request(camp, eng, entry, request, "probe", measure_meta)
+        if status != client.OK:
+            camp.write({"kind": "nonce_probe", **meta, "status": status, "passed": None})
+            return status
+        line = camp.last
+        ttft = next((e["t_ns"] for e in line["events"]
+                     if e.get("content_chars", 0) + e.get("reasoning_chars", 0) > 0), None)
+        ttfts.append(ttft if ttft is not None else line["t_end_ns"])
+    ratio = ttfts[1] / ttfts[0]
+    camp.write({"kind": "nonce_probe", **meta, "doc": doc, "ttft_ns": ttfts,
+                "ratio": round(ratio, 3), "passed": ratio >= 0.8})
+    return client.OK
 
 
 def argmax_check(camp, eng, entry):
@@ -521,6 +554,8 @@ def run_entry(camp, entry):
                       f"{entry['config']} prêt en {load['load_s']} s", flush=True)
                 measure_meta = {**meta, "thermal_before_load": state["throttled"]}
                 status = run_request(camp, eng, entry, entry["warmup"], "warmup", measure_meta)
+                if status == client.OK and camp.matrix["engines"][eng.engine].get("nonce_probe"):
+                    status = nonce_probe(camp, eng, entry, meta, measure_meta)
                 while pending and status == client.OK:
                     status = run_request(camp, eng, entry, pending[0], "measure", measure_meta)
                     pending.pop(0)

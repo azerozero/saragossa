@@ -154,9 +154,10 @@ def proofs(line, expected, cache_probe):
     elif engine == "mlx" and cached is not None:
         no_reuse = cached == 0
     elif engine == "llmd":
-        # llmd n'a pas de compteur : seul le diagnostic de validation prouve.
-        # Ce repli est réservé à llmd ; ailleurs, compteur absent = non vérifié.
-        no_reuse = cache_probe.get("llmd")
+        # llmd n'a pas de compteur : la sonde « même document, nonce différent »
+        # de son chargement prouve (None si absente). Repli réservé à llmd ;
+        # ailleurs, compteur absent = non vérifié.
+        no_reuse = cache_probe.get(load_key(line))
     checks["no_reuse"] = no_reuse
     return checks
 
@@ -166,6 +167,10 @@ IDS_NATURE = {"saragossa": "lecture (journal de la requête)",
               "llama": "reconstruction serveur (/apply-template + /tokenize)",
               "mlx": "calcul hors moteur (transformers) ; mesure moteur = prompt_tokens seul",
               "llmd": "calcul hors moteur (tokenizer NVFP4) ; mesure moteur = prompt_tokens seul"}
+
+
+def load_key(line):
+    return (line.get("entry_key"), line.get("run_seq"), line.get("attempt"))
 
 
 def cache_probes(rows):
@@ -248,19 +253,26 @@ def load(run_dir):
         line["throttled"] = bool(line.get("thermal_before_load")) or (
             line.get("entry_key"), line.get("run_seq"), line.get("attempt")) in throttled
         rows.append(line)
+    # Diagnostic informatif de la validation (requêtes identiques), et sonde
+    # par chargement « nonce différent », seule preuve d'absence de cache de llmd.
     probes, probe_ratios = cache_probes(rows)
+    nonce_probes = {load_key(o): o.get("passed") for o in others if o.get("kind") == "nonce_probe"}
     for row in rows:
         if row.get("status") != "ok":
             row["admissibility"] = f"failed:{row.get('status')}"
             continue
-        row["proofs"] = proofs(row, expected, probes)
+        row["proofs"] = proofs(row, expected, nonce_probes)
         values = [row["proofs"][name] for name in REQUIRED]
         row["admissibility"] = ("validation_failed" if False in values
                                 else "unverified" if None in values else "admissible")
     # Identité greedy obligatoire pour tout spéculatif, réglage compris : la
     # référence est l'AR apparié (même requête), lui-même admissible.
     apply_identity(rows, pair_function(matrix))
-    return rows, others, {"cache_probe": probes, "cache_probe_ratios": probe_ratios}
+    return rows, others, {"cache_probe_identical_requests": probes,
+                          "cache_probe_ratios": probe_ratios,
+                          "nonce_probes": [{k: o.get(k) for k in ("entry_key", "run_seq", "attempt",
+                                                                  "doc", "ratio", "passed")}
+                                           for o in others if o.get("kind") == "nonce_probe"]}
 
 
 def obs_key(row):
@@ -744,11 +756,14 @@ def _self_check():
         "completion_tokens": 3, "prompt_tokens": 10}, "ingest": {"kind": "offline"}}
     exp = {"p|n": {"prompt_tokens": 10, "fnv1a64": "aa", "llmd_offline_fnv1a64": "aa"}}
     assert proofs(row, exp, {})["no_reuse"] is None
-    assert proofs(row, exp, {"llmd": True})["no_reuse"] is True
+    row.update(entry_key="k", run_seq=1, attempt=0)
+    assert proofs(row, exp, {("k", 1, 0): True})["no_reuse"] is True
+    assert proofs(row, exp, {("k", 1, 0): False})["no_reuse"] is False
+    assert proofs(row, exp, {("k", 1, 1): True})["no_reuse"] is None
     # Astra v4-2 : le diagnostic temporel ne remplace pas un compteur absent hors llmd.
     for engine in ("saragossa", "llama", "mlx"):
         other = dict(row, engine=engine, ingest={"kind": "log", "prompt_fnv1a64": "aa"})
-        assert proofs(other, exp, {engine: True, "llmd": True})["no_reuse"] is None
+        assert proofs(other, exp, {("k", 1, 0): True})["no_reuse"] is None
 
     def greedy(config, content, admissibility="admissible", phase="eval-S"):
         return {"config": config, "content": content, "admissibility": admissibility,
@@ -826,6 +841,6 @@ if __name__ == "__main__":
                    for r in rows]
     (run_dir / "per_request.jsonl").write_text(
         "\n".join(json.dumps(p, ensure_ascii=False) for p in per_request) + "\n")
-    print(json.dumps({k: report[k] for k in ("admissibility", "cache_probe", "eos",
+    print(json.dumps({k: report[k] for k in ("admissibility", "nonce_probes", "eos",
                                              "integrity", "repeatability")},
                      indent=1, ensure_ascii=False))
