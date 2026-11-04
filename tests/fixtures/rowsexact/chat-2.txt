@@ -1,0 +1,3 @@
+Request id: 0000000000000000
+
+Explain how the TCP congestion control algorithms Reno, CUBIC and BBR differ. Give a thorough comparison with concrete examples and numbers.

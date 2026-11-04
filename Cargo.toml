@@ -13,7 +13,9 @@ build = "build.rs"
 # `tools/` regroupe des utilitaires Python annexes (quantification, mesure de
 # qualité) : utiles dans le dépôt, inutiles à qui compile le crate. Les exclure
 # garde le paquet crates.io strictement Rust.
-exclude = ["tools/"]
+# `tests/fixtures/` : corpus de prompts des oracles (textes tiers sous leurs
+# propres licences), réservé aux tests du dépôt.
+exclude = ["tools/", "tests/fixtures/"]
 
 [lib]
 name = "saragossa"

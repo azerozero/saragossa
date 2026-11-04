@@ -113,6 +113,16 @@ pub(super) fn bf16_round_to_f32(value: f32) -> f32 {
     f32::from_bits(u32::from(f32_to_bf16_bits(value)) << 16)
 }
 
+/// Égalité de bits (zéros signés et NaN compris), longueurs vérifiées.
+fn assert_bits_rows(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len(), "longueurs");
+    let bad = actual
+        .iter()
+        .zip(expected)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    assert!(bad.is_none(), "bits divergents à l'index {bad:?}");
+}
+
 fn assert_close_eps(actual: &[f32], expected: &[f32], eps: f32) {
     assert_eq!(actual.len(), expected.len(), "longueurs différentes");
     let mut max_abs = 0.0_f32;
@@ -2763,9 +2773,9 @@ fn run_rows_fused_case(
     head_dim: usize,
     format: KvFormat,
     max_rows_per_group: Option<usize>,
+    rows: usize,
 ) -> Result<()> {
     use super::gpu_position::rope_dims_param;
-    const ROWS: usize = 3;
     let (eps, theta) = (1.0e-6_f32, 1.0e7_f32);
     let q_dim = POS_Q * head_dim;
     let kv_dim = POS_KV * head_dim;
@@ -2798,19 +2808,19 @@ fn run_rows_fused_case(
     )?;
     let q_raw = lease_with(
         state,
-        &(0..ROWS * q_dim)
+        &(0..rows * q_dim)
             .map(|i| pseudo(2000 + i))
             .collect::<Vec<_>>(),
     )?;
     let k_raw = lease_with(
         state,
-        &(0..ROWS * kv_dim)
+        &(0..rows * kv_dim)
             .map(|i| pseudo(2007 + i))
             .collect::<Vec<_>>(),
     )?;
     let v_raw = lease_with(
         state,
-        &(0..ROWS * kv_dim)
+        &(0..rows * kv_dim)
             .map(|i| pseudo(2013 + i))
             .collect::<Vec<_>>(),
     )?;
@@ -2820,7 +2830,7 @@ fn run_rows_fused_case(
     let k_roped = state.scratch().lease(kv_dim, GpuElement::F32)?;
     let scores = state.scratch().lease(POS_Q * capacity, GpuElement::F32)?;
     let mut ctx_loop = Vec::new();
-    for _ in 0..ROWS {
+    for _ in 0..rows {
         ctx_loop.push(state.scratch().lease(q_dim, GpuElement::F32)?);
     }
     let command_buffer = state.queue().new_command_buffer();
@@ -2870,9 +2880,9 @@ fn run_rows_fused_case(
 
     // Chemin en lignes : un dispatch par étape.
     let kernels = state.rows_kernels()?;
-    let q_rows = state.scratch().lease(ROWS * q_dim, GpuElement::F32)?;
-    let k_rows = state.scratch().lease(ROWS * kv_dim, GpuElement::F32)?;
-    let ctx_rows = state.scratch().lease(ROWS * q_dim, GpuElement::F32)?;
+    let q_rows = state.scratch().lease(rows * q_dim, GpuElement::F32)?;
+    let k_rows = state.scratch().lease(rows * kv_dim, GpuElement::F32)?;
+    let ctx_rows = state.scratch().lease(rows * q_dim, GpuElement::F32)?;
     let command_buffer = state.queue().new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     state.encode_rms_norm_rope_decode_rows(
@@ -2889,7 +2899,7 @@ fn run_rows_fused_case(
         POS_ROPE,
         POS_ROPE,
         prefix,
-        ROWS,
+        rows,
         eps,
         theta,
     )?;
@@ -2907,7 +2917,7 @@ fn run_rows_fused_case(
         POS_ROPE,
         POS_ROPE,
         prefix,
-        ROWS,
+        rows,
         eps,
         theta,
     )?;
@@ -2920,28 +2930,27 @@ fn run_rows_fused_case(
         v_raw.tensor().buffer(),
         0,
         kv_dim,
-        ROWS,
+        rows,
     )?;
     kv_fused.encode_attention_decode_rows_chunked(
         encoder,
         kernels,
         q_rows.tensor().buffer(),
         ctx_rows.tensor().buffer(),
-        ROWS,
+        rows,
         None,
         max_rows_per_group,
     )?;
     encoder.end_encoding();
     commit_and_wait(command_buffer)?;
 
-    assert_eq!(kv_fused.len(), prefix + ROWS, "len après append en lignes");
-    assert_eq!(kv_loop.len(), prefix + ROWS);
+    assert_eq!(kv_fused.len(), prefix + rows, "len après append en lignes");
+    assert_eq!(kv_loop.len(), prefix + rows);
     let fused_ctx = read_f32(ctx_rows.tensor());
     for (row, expected) in ctx_loop.iter().enumerate() {
-        assert_close_eps(
+        assert_bits_rows(
             &fused_ctx[row * q_dim..(row + 1) * q_dim],
             &read_f32(expected.tensor()),
-            0.0,
         );
     }
     if format.is_quantized() {
@@ -2951,7 +2960,7 @@ fn run_rows_fused_case(
         );
         return Ok(());
     }
-    let cells = (prefix + ROWS) * kv_dim;
+    let cells = (prefix + rows) * kv_dim;
     let read_kv = |tensor: &GpuTensor| {
         if format == KvFormat::Bf16 {
             read_bf16_as_f32(tensor)
@@ -2961,8 +2970,29 @@ fn run_rows_fused_case(
     };
     let (keys_fused, keys_loop) = (read_kv(kv_fused.keys()), read_kv(kv_loop.keys()));
     let (values_fused, values_loop) = (read_kv(kv_fused.values()), read_kv(kv_loop.values()));
-    assert_close_eps(&keys_fused[..cells], &keys_loop[..cells], 0.0);
-    assert_close_eps(&values_fused[..cells], &values_loop[..cells], 0.0);
+    assert_bits_rows(&keys_fused[..cells], &keys_loop[..cells]);
+    assert_bits_rows(&values_fused[..cells], &values_loop[..cells]);
+    Ok(())
+}
+
+/// Oracle O1 de l'attention full en lignes (RoPE q/k, append KV, flash ou
+/// 2-passes, hors préfixe NAX) : bits de la boucle par ligne pour R = 1..9,
+/// KV f32, bf16 et quantifiés, de part et d'autre du seuil 2-passes.
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn full_attn_rows_fused_matches_row_loop_all_rows() -> Result<()> {
+    let state = try_state()?.ok_or_else(|| {
+        InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
+    })?;
+    for rows in 1..=9 {
+        for head_dim in [128, 256] {
+            for format in [KvFormat::F32, KvFormat::Bf16, KvFormat::Q8] {
+                run_rows_fused_case(&state, 5, 16, head_dim, format, None, rows)?;
+                run_rows_fused_case(&state, 2050, 2064, head_dim, format, None, rows)?;
+            }
+        }
+        run_rows_fused_case(&state, 4221, 4232, 256, KvFormat::F32, None, rows)?;
+    }
     Ok(())
 }
 
@@ -2983,17 +3013,17 @@ fn full_attn_rows_fused_matches_row_loop() -> Result<()> {
         for format in formats {
             // Flash en lignes (len courte, 2-passes si quantifié), puis 2-passes en
             // lignes (len ≥ 2048) en un chunk et en chunks d'une ligne.
-            run_rows_fused_case(&state, 5, 16, head_dim, format, None)?;
-            run_rows_fused_case(&state, 2050, 2060, head_dim, format, None)?;
-            run_rows_fused_case(&state, 2050, 2060, head_dim, format, Some(1))?;
+            run_rows_fused_case(&state, 5, 16, head_dim, format, None, 3)?;
+            run_rows_fused_case(&state, 2050, 2060, head_dim, format, None, 3)?;
+            run_rows_fused_case(&state, 2050, 2060, head_dim, format, Some(1), 3)?;
         }
     }
     // Frontières de partition chevauchées par les 3 lignes : seuil flash/2-passes
     // (lignes 2047, 2048, 2049) et nombre de blocs split-K (4222 → 32, 4224 → 64).
-    run_rows_fused_case(&state, 2046, 2052, 128, KvFormat::F32, None)?;
-    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::F32, None)?;
-    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::Q4, None)?;
-    run_rows_fused_case(&state, 4221, 4226, 128, KvFormat::K8V4, None)?;
+    run_rows_fused_case(&state, 2046, 2052, 128, KvFormat::F32, None, 3)?;
+    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::F32, None, 3)?;
+    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::Q4, None, 3)?;
+    run_rows_fused_case(&state, 4221, 4226, 128, KvFormat::K8V4, None, 3)?;
     // Capacité insuffisante : erreur AVANT tout encodage, `len` inchangé.
     let kernels = state.rows_kernels()?;
     let mut kv = state.full_attention_f32_for_test(4, POS_Q, POS_KV, 128)?;

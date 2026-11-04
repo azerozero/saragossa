@@ -25,3 +25,5 @@ pub(in crate::decoder) use decode::{
 };
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(in crate::decoder) use types::{ResidentEmbeddingOut, ResidentSampleSpec};
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(in crate::decoder) use verify::{VerifyRecord, VERIFY_RECORDER};

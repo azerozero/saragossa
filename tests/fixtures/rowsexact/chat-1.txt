@@ -1,0 +1,3 @@
+Request id: 0000000000000000
+
+Write a detailed tutorial on implementing a thread-safe LRU cache in Rust, with complete code and an explanation of every design choice.

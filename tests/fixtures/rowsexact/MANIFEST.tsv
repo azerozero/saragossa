@@ -1,0 +1,11 @@
+fichier	nonce	sha256	source
+chat-1.txt	0000000000000000	9740ee2a14a2a91bf4a30e5d42b91c5cc6f36f3810263902ae7d615fead95093	{"origin": "harness"}
+chat-2.txt	0000000000000000	0fe1bfbb93fa0931d1bed69763bc0728302b45481f30338278563948ae1386d2	{"origin": "harness"}
+chat-3.txt	0000000000000000	3f170cec1bfc656a145f9c16a11f8656954067611a067b7ffc85bd99ced580e5	{"origin": "harness"}
+chat-4.txt	0000000000000000	57f2e6b8edaa3786c5017973edeb1ec98993ed9b489408b39e10201dcf00f2f4	{"origin": "harness"}
+chat-5.txt	0000000000000000	eb1706e657e3c2bfd6f657e1d87395af5c70a015bf2bc0569b22993add43be8b	{"origin": "harness"}
+chat-6.txt	0000000000000000	0fed682adc4dbea638cb9e14884433af1b97c288129daed98cf279ff4bb81ba3	{"origin": "harness"}
+code4k-1.txt	0000000000000000	4c0f199fff571cb8dce751c5e17e4699f522dbc726bd3fe97989730ae38896b7	{"origin": "rust-src 1.98.1", "files": [{"path": "alloc/src/collections/binary_heap/mod.rs", "sha256": "ac485fa63173ef06090252bb88921995f6d22ea289ec6d2660725a5931ad306a"}]}
+code4k-2.txt	0000000000000000	ca0bf59230018f9a5e1a11f69aa43e573ed6017f153f540fb5b525ff8a611f48	{"origin": "rust-src 1.98.1", "files": [{"path": "core/src/str/pattern.rs", "sha256": "878333fb2b4371194f0853b93ff4fc53efe02be878f603b546ab5ae00fa3eefd"}]}
+code4k-3.txt	0000000000000000	0dc77c7ae608a6f5a51293bd262e84e50ce8a562ceafa437d55024c5c5fe40dc	{"origin": "rust-src 1.98.1", "files": [{"path": "std/src/io/stdio.rs", "sha256": "0e2f8b4e87deaa3b9998f92c234167810aaa461ee4eb4c17292f8e0b23e2b52f"}]}
+prose32k-1.txt	9784136873970414	e357de5d099f58d141f58d8559f660a653d8e8f06d082575b0672b38706aaf9b	{"origin": "wikitext-2-raw-v1 train", "articles": ["SMS Markgraf", "Coldrum Long Barrow", "Wrapped in Red", "Sholay", "Loose ( Nelly Furtado album )", "Antimony"], "zip_sha256": "ef7edb566e3e2b2d31b29c1fdb0c89a4cc683597484c3dc2517919c615435a11", "train_sha256": "6707892fa3788b5ab9ed78ab5ff37d9fe825f6011a2ad4fcd6a6d467f0e7da57"}

@@ -1895,6 +1895,22 @@ impl CausalDecoder {
         let bonus_raw = target_rows
             .next()
             .ok_or_else(|| InferError::Metal("MTP fused sans bonus".to_string()))?;
+        // Oracle O2 : lignes du cycle fusionné D1 (`verify_final`, dernier bail).
+        #[cfg(test)]
+        if super::verify::verify_recorder_active() {
+            if let Some(verify_final) = scratch.last() {
+                let states = crate::metal_backend::read_f32_buffer(
+                    verify_final.tensor().buffer(),
+                    verify_rows * hidden,
+                )?;
+                super::verify::record_verify(
+                    target_position,
+                    &[primary, draft_raw as usize],
+                    None,
+                    &states,
+                );
+            }
+        }
         // Le wait ci-dessus couvre les écritures des deux états. En mode résident,
         // leurs baux survivent au retour et empêchent toute réutilisation du scratch.
         let state = MtpFinalState::from_lease(target_final, retain_hidden)?;
@@ -2519,6 +2535,17 @@ impl CausalDecoder {
                 verify_elements,
             )?)
         };
+        // Oracle O2 : lignes du cycle fusionné (entrée puis deux drafts).
+        #[cfg(test)]
+        if super::verify::verify_recorder_active() {
+            let states = crate::metal_backend::read_f32_buffer(
+                verify_final.tensor().buffer(),
+                verify_elements,
+            )?;
+            let mut tokens = vec![primary];
+            tokens.extend(draft_values.iter().map(|&index| index as usize));
+            super::verify::record_verify(target_position, &tokens, None, &states);
+        }
         drop(scratch);
         drop(target_indices);
 
