@@ -513,10 +513,11 @@ def approx_configs(rows):
 def tables(rows, reference):
     rng = random.Random(BOOTSTRAP_SEED)
     add_common_length(rows)
-    approx = approx_configs(rows)
     lines = []
     for group in sorted({(r["phase"], r["prompt_kind"]) for r in rows}):
         grows = [r for r in rows if (r["phase"], r["prompt_kind"]) == group]
+        # ≈ par groupe : une requête approximative d'une autre phase ne marque pas celui-ci.
+        approx = approx_configs(grows)
         configs = sorted({r["config"] for r in grows})
         label = f"{group[0]} / {group[1]}"
         for metric, higher, title, compared in METRICS:
