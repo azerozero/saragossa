@@ -1450,6 +1450,142 @@ saragossa --model-dir <35B> --prompt … --max-tokens 400 --temperature 0 --metr
 Les tests `mtp_d1_resident_hidden_*` lisent des compteurs de profil globaux
 au processus : ils se lancent avec `--test-threads=1`.
 
+## DFlash 2 sur le 35B-A3B (4 nov. 2026, non exposé)
+
+Qwen3.6-35B-A3B 4 bits avec le drafter DFlash 2 publié pour ce modèle :
+6 couches glissantes (fenêtre 2048), hidden 2048, inter 6144, 8 captures
+(couches 1, 6, 11, 16, 22, 27, 32, 37), mask 248077, quantifié en u4 gs64
+comme sur serve. Aucun code n'est nécessaire. Les couches `FullMoe` et
+`LinearMoe` passent par l'attention et le scan en lignes communs, variante
+arbre comprise, et le prefill avec captures est le prefill MoE. Seule
+condition : la vérification MoE en lignes (`SARAGOSSA_RUST_MOE_VERIFY_ROWS`),
+active d'office avec la tête MTP. Or serve et la CLI ne chargent le drafter
+qu'avec cette tête. **Le chemin n'est ni exposé ni activé par défaut :** il ne
+sort pas exactement les tokens de l'AR (voir plus bas).
+
+### Débit (CLI, greedy, 400 tokens)
+
+`main` 527ecbf, deux passes en ordres inverses, médiane de `decode_tok_s`,
+cache de préfixe coupé, arbre demandé explicitement
+(`SARAGOSSA_RUST_DFLASH_TREE=B`, aucun repli). Ce n'est pas un ABBA : ces
+chiffres sont des estimations. MTP D2 = `SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0`.
+
+| prompt (tokens) | AR | MTP D2 | MTP adaptatif | chaîne | B=2 | B=4 | B=6 | B=8 | B=10 |
+|---|---|---|---|---|---|---|---|---|---|
+| T0 (26) | 151,0 | 209,7 | 216,5 | 256,9 | 182,2 | 240,0 | 258,9 | **281,6** | 268,5 |
+| T1 (33) | 151,1 | 230,2 | 217,2 | 237,4 | 190,2 | 226,3 | 237,9 | **259,6** | 235,7 |
+| T2 (732) | 145,9 | 188,8 | 180,3 | 148,0 | 160,4* | 164,9 | 176,6 | **176,3*** | 166,3* |
+| T6 (424) | 148,2 | 295,0 | 295,2 | 375,1 | 199,0 | 269,2 | 341,6 | **385,7** | 355,9 |
+| T7 (8297) | 134,3 | 166,7 | 152,0 | 108,5* | 138,7 | 140,5* | 134,8* | **115,0*** | 105,1* |
+
+\* sortie différente de l'AR.
+
+À B = 8, profil par tour (`SARAGOSSA_RUST_DFLASH_PROFILE=1`) :
+
+| prompt | tokens/tour | drafter | vérif. | rollback | append | total (ms) |
+|---|---|---|---|---|---|---|
+| T0 | 5,71 | 3,3 | 15,9 | 0,6 | 0,5 | 20,2 |
+| T1 | 5,26 | 3,3 | 15,9 | 0,6 | 0,5 | 20,3 |
+| T2 | 3,92 | 4,5 | 16,8 | 0,5 | 0,4 | 22,2 |
+| T6 | 8,64 | 4,0 | 17,2 | 0,6 | 0,5 | 22,4 |
+| T7 | 3,01 | 4,0 | 21,3 | 0,6 | 0,5 | 26,4 |
+
+Vérification sur T1 selon B : 9,8 (B = 2), 12,7 (4), 15,1 (6), 15,9 (8) et
+18,7 ms (10) ; 16,9 ms pour la chaîne de 9 lignes. Le surcoût hors
+vérification (drafter, rollback, append) vaut 4,4 à 5,6 ms par tour.
+L'acceptance dépasse celle du drafter du 27B (5,3-5,7 tokens par tour en code,
+contre 3,8 sur le 27B) : B = 8 bat le MTP D2 de +34 % (T0), +13 % (T1) et
++31 % (T6). Il perd sur T2 (−7 %) et sur le contexte de 8k (T7, −31 %), où la
+vérification de 9 lignes s'alourdit et l'acceptance tombe à 3,0. Moyenne
+géométrique contre le MTP D2 : 1,05 (1,085 contre le MTP adaptatif). B = 8 est
+le meilleur B fixe.
+
+### Écarts avec l'AR : cause
+
+Les sorties diffèrent de l'AR sur deux prompts, de façon déterministe :
+
+- T7, token 50 (chaîne, B = 4, 6, 8, 10) : l'AR choisit 318 (20,5218), DFlash
+  11 (20,4675), marge 0,054 ;
+- T2, token 250 (B = 2, 8, 10) : 9578 contre 5724, marge 0,020.
+
+En échantillonné, `dflash_sampled_matches_ar_real_model` échoue en prose
+(chaîne, graine 2, token 22, tirage à 0,007 de la frontière). Le code (48
+graines), les arrêts (190 cas), l'arbre contre la chaîne, la boucle CPU et
+`moe_verify_rows_match_single_rows_real_model` sont verts.
+
+Attribution sur T7 (tests de diagnostic non commités, contexte rejoué par pas
+mono-ligne puis une seule vérification en lignes) :
+
+1. **Au token contesté, la vérification en lignes ne suffit pas à inverser.**
+   À R = 2 à 9, la ligne vérifiée diffère du mono-ligne en bits dès la
+   couche 0. Le logit contesté ne bouge pourtant que de 1,5e-5 au plus, contre
+   une marge de 0,054. Le rollback après un lot de R = 3 à 9 lignes, avec des
+   tokens de queue corrects ou faux, ne déplace pas non plus le logit (≤ 6e-6).
+2. **L'écart naît 44 tokens plus tôt, sur un seul token.** Un lot de R ≥ 5
+   lignes qui contient le token généré d'indice 6 fait passer le logit
+   contesté à 20,3957 (marge 0,189, l'AR s'inverse). Quel que soit le décalage
+   du lot, la valeur reste la même à 1e-5 près. Placé ailleurs, le même lot ne
+   change rien. Un lot de 4 lignes qui contient ce token ne change rien non
+   plus.
+3. **Kernel en cause : le matmul affine u4 skinny (R ≥ 5).** Une ligne calculée
+   dans un lot de R lignes, comparée à la même ligne à R = 1 (formes du 35B,
+   poids synthétiques), est égale au bit près pour R = 2 à 4 (qmv répliqué,
+   qmm2). Dès R = 5, 98 à 99 % des sorties diffèrent, à ~2-3e-6 relatif : le
+   kernel skinny réduit dans un autre ordre (projections linéaires, o_proj,
+   QKV, expert partagé). Les routeurs et gates partagés en u8 restent égaux
+   au bit près à tout R.
+4. **Amplification : le routage top-8.** Un écart de ~1e-6 suffit pour faire
+   basculer un choix d'experts en quasi-égalité sur ce token. Son hidden, puis
+   son KV et l'état gated-delta, changent alors d'un ordre de grandeur sans
+   rapport avec l'arrondi, et l'effet se propage jusqu'au token 50. Le saut
+   est discret : la valeur ne dépend que de la présence de ce token dans un
+   lot de R ≥ 5 lignes. Le routeur n'a pas été instrumenté : cette explication
+   est déduite de ce saut, pas observée.
+
+Sur T2, la divergence touche l'arbre (B = 2 : 3 lignes, B = 8, B = 10) et pas
+la chaîne. Le même mécanisme est probable : écart de bits en lignes, puis
+bascule du routage. Il n'est pas localisé.
+
+**Risque pour le MTP D2.** Le MTP D2 vérifie 3 lignes : ses matmuls sont
+égaux au bit près au mono. En revanche, d'autres kernels en lignes (couche 0
+dès R = 2 : normes, scan linéaire ou queue MoE, non isolés) diffèrent du
+mono-ligne en bits. Le mécanisme d'amplification par le routage s'applique
+donc aussi au MTP D2 : ses sorties identiques sur 5 prompts ne prouvent pas
+l'exactitude, et la probabilité d'une bascule par token reste inconnue. Le
+dense (27B) partage l'écart du skinny, mais sans routage discret, l'écart y
+reste de l'ordre de l'arrondi. Il ne peut inverser qu'un quasi-ex aequo final
+de l'ordre de 1e-5.
+
+**Correction bit-exacte : possible en principe, pas gratuite.** Il faudrait que
+chaque kernel en lignes (matmul skinny et kernels de la couche 0 restant à
+identifier) réduise chaque ligne dans l'ordre exact du mono-ligne, comme le font
+déjà le top-k, le gate+up partagé et le combine. Pour le matmul, l'alternative
+est de vérifier en qmv répliqué au-delà de 4 lignes, au prix du débit (le
+skinny est là pour le ρ(R)). Rien n'est corrigé ici.
+
+### Sampler AR en top-p seul
+
+Mesure annexe (AR sans tête, T = 0,7, greedy à 151 tok/s, soit 6,62 ms par
+token) :
+
+| réglage | chemin | tok/s (T0 / T1 / T6) | surcoût par token |
+|---|---|---|---|
+| Gumbel (top-k 0, top-p 1) | GPU, pipeliné | 152 / 153 / 151 | ~0 |
+| top-k 20, top-p 0,95 | GPU (`sample_topk_topp`) | 139 / 140 / 138 | +0,55 ms |
+| top-p 0,95, top-k 0 | `ResidentSampleMode::Readback` | 80 / 80 / 80 | +5,9 ms |
+
+Le top-p seul est refusé par le sampler GPU (`resident_sampling_on_device`).
+Il relit les 248 320 logits en f32 et calcule, sur CPU, un softmax, un tri
+complet du vocabulaire, puis le nucleus (`token_distribution_top_k_top_p`).
+Le pipeline GPU/CPU est rompu à chaque token. C'est la source des 79 tok/s de
+l'AR échantillonné du banc G5 du MTP. Le preset du 35B (top-k 20) n'emprunte
+pas ce chemin. Pistes, non mises en œuvre :
+
+- top-p sur GPU restreint aux top-K candidats, exact dès que leur masse atteint
+  top_p, et repli sur le chemin actuel sinon ;
+- à défaut, sur CPU, une sélection partielle (`select_nth_unstable` sur un k
+  croissant) au lieu du tri complet.
+
 ## Limites
 
 - Une seule machine et trois prompts. Aucune garantie pour d'autres entrées.
