@@ -874,17 +874,21 @@ impl MetalExecutor {
         label: &'static str,
         options: MTLResourceOptions,
     ) -> Result<metal::Buffer> {
-        let len = scratch_len_for_rows(len);
-        let key = ScratchBufferKey {
-            label,
-            len,
-            element,
-            namespace: current_scratch_namespace(),
-        };
+        let namespace = current_scratch_namespace();
         let mut buffers = self
             .scratch_buffers
             .lock()
             .map_err(|_| InferError::Metal(format!("cache scratch Metal empoisonné: {label}")))?;
+        let key_for = |len| ScratchBufferKey {
+            label,
+            len,
+            element,
+            namespace,
+        };
+        let len = scratch_len_for_rows(len, |rounded| {
+            buffers.entries.contains_key(&key_for(rounded))
+        });
+        let key = key_for(len);
         let last_used = buffers.next_use();
         if let Some(entry) = buffers.entries.get_mut(&key) {
             entry.last_used = last_used;
