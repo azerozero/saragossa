@@ -42,7 +42,7 @@
      "enable_thinking": false
     }
    },
-   "usage_counts_eos": null
+   "usage_counts_eos": false
   },
   "llama": {
    "model": "qwen38",
@@ -63,7 +63,7 @@
      "enable_thinking": false
     }
    },
-   "usage_counts_eos": null,
+   "usage_counts_eos": true,
    "injected_content_prefix": "<think>\n\n</think>\n\n"
   },
   "mlx": {
@@ -82,7 +82,7 @@
      "enable_thinking": false
     }
    },
-   "usage_counts_eos": null
+   "usage_counts_eos": true
   },
   "llmd": {
    "model": "qwen38",
@@ -97,7 +97,7 @@
     "top_p"
    ],
    "extra": {},
-   "usage_counts_eos": null,
+   "usage_counts_eos": false,
    "nonce_probe": true
   }
  },
