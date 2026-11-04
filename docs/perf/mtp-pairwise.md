@@ -1396,12 +1396,16 @@ Deux postes restent au-delà des poids :
 ### Scratch du dernier morceau de prefill (4 nov. 2026)
 
 Pendant l'encodage d'un morceau plus court que les autres, une garde de thread
-(`enter_scratch_row_capacity`) porte à la capacité du morceau toute demande
-scratch multiple de ses lignes. Le dernier morceau reprend ainsi les entrées des
-morceaux pleins, comme la scratch de couche
-(`allocate_prefill_resident_layer_scratch`). Les kernels reçoivent toujours le
-vrai nombre de lignes : seuls les buffers sont plus grands. Un faux positif (un
-buffer non proportionnel aux lignes mais multiple) alloue seulement plus grand.
+(`enter_scratch_row_capacity`) fait chercher, pour toute demande scratch
+multiple des lignes du morceau, l'entrée de même label à la capacité du
+morceau. Si elle existe, le dernier morceau la reprend, comme la scratch de
+couche (`allocate_prefill_resident_layer_scratch`) dimensionnée d'office à la
+capacité. Sinon la demande garde sa longueur exacte : une longueur arrondie
+n'est jamais allouée, et la garde ne fait jamais pire que sans elle. Les faux
+positifs retombent donc sur leur longueur exacte : la scratch de couche déjà à
+la capacité (4097 tokens → morceaux de 2049 et 2048), les poids déquantifiés
+`qmm_na_wt_bf16`, un morceau d'une ligne. Les kernels reçoivent toujours le
+vrai nombre de lignes et n'utilisent que le début des buffers repris.
 
 ABBA, A = branche RAM de la tête, B = correctif, 2 passes chacun, Go. Les
 réponses sont identiques entre A et B, en AR comme en MTP (texte serve, md5
