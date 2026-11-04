@@ -18,6 +18,9 @@ bench/competitors/night.sh 1 "$RUN"          # réglage, freeze, eval-S, eval-M
 bench/competitors/night.sh 2 "$RUN"          # qualité, échantillonné, 256k
 ```
 
+Relancer une nuit interrompue la reprend : les plans déjà tirés sont
+réutilisés, les entrées terminées sautées, un gel écrit n'est pas refait.
+
 Avant la nuit 1, l'essai de validation fixe `usage_counts_eos` de chaque
 moteur dans `matrix.json` : sans cette convention, aucun débit n'est exact
 et le gel s'arrête.
