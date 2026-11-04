@@ -676,8 +676,9 @@ def freeze(run_dir):
 
 def capture(argv):
     try:
-        return subprocess.run(argv, capture_output=True, text=True, check=False,
-                              timeout=60).stdout.strip()
+        out = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=60)
+        # llama-server --version écrit sur stderr.
+        return (out.stdout.strip() or out.stderr.strip())
     except (OSError, subprocess.TimeoutExpired) as error:
         return repr(error)
 
