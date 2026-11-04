@@ -1,19 +1,36 @@
 #!/usr/bin/env bash
 # Qualité des GGUF (llama-perplexity, KL) et ligne llama-bench, sous le verrou GPU.
 #
-# Usage : quality_llama.sh CORPUS OUT_DIR
-#   CORPUS : wikitext-2-raw/wiki.test.raw (sha256 publié dans le protocole)
-# Le BF16 sert de référence : ses logits sont sauvés une fois, puis Q4_0 pur
-# et Q4_K_M sont comparés à lui (PPL, KL, top-1 identique).
+# Usage : quality_llama.sh OUT_DIR [PORT]
+#   Corpus : $WIKITEXT_TEST (paths.sh), sha256 vérifié par quality.py.
+# 1. Contrôle bloquant : ids du corpus selon llama-server (/tokenize) égaux à
+#    ceux du tokenizer HF, sinon arrêt avant toute PPL.
+# 2. Le BF16 sert de référence : ses logits sont sauvés une fois, puis Q4_0
+#    pur et Q4_K_M sont comparés à lui (PPL, KL, top-1 identique).
 set -euo pipefail
-source "$(dirname "$0")/paths.sh"
+here="$(cd "$(dirname "$0")" && pwd)"
+source "${here}/paths.sh"
 
-corpus="$1"
-out="$2"
+out="$1"
+port="${2:-18081}"
 mkdir -p "${out}"
-common=(-f "${corpus}" -c 512 --chunks 32 -ngl all -fa on -b 512 -ub 512)
+venv=("${MLX_VENV}/bin/python" -I -B)
 
-llama-perplexity -m "${AI_MODEL}/Qwen3.8-27B-GGUF-ggml/Qwen3.8-27B-BF16.gguf" \
+llama-server -m "${GGUF_Q4_0}" --host 127.0.0.1 --port "${port}" -np 1 -c 4096 \
+  > "${out}/llama-ids-server.log" 2>&1 &
+server=$!
+trap 'kill "${server}" 2>/dev/null || true; wait "${server}" 2>/dev/null || true' EXIT
+until curl -sf "http://127.0.0.1:${port}/health" > /dev/null; do
+  kill -0 "${server}" 2>/dev/null || { echo "llama-server arrêté" >&2; exit 1; }
+  sleep 1
+done
+"${venv[@]}" "${here}/quality.py" llama-ids "${WIKITEXT_TEST}" "${port}" | tee "${out}/llama-ids.json"
+kill "${server}"
+wait "${server}" 2>/dev/null || true
+trap - EXIT
+
+common=(-f "${WIKITEXT_TEST}" -c 512 --chunks 32 -ngl all -fa on -b 512 -ub 512)
+llama-perplexity -m "${GGUF_BF16}" \
   "${common[@]}" --kl-divergence-base "${out}/bf16.kld" 2>&1 | tee "${out}/ppl-bf16.log"
 for name in Q4_0-pure Q4_K_M; do
   llama-perplexity -m "${GGUF_DIR}/Qwen3.8-27B-${name}.gguf" "${common[@]}" \

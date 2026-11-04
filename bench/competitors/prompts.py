@@ -15,18 +15,20 @@ du checkpoint, et `transformers.apply_chat_template` (le chemin de mlx-lm).
 
 import hashlib
 import json
-import os
 import pathlib
 import re
 import sys
 import unicodedata
 
-CHECKPOINT = pathlib.Path("/Users/ludwig/workspace/saragossa-oss/models/Qwen3.8-27B-4bit")
-NVFP4 = pathlib.Path("/Users/ludwig/workspace/saragossa-oss/models/nvfp4/Qwen3.8-27B-NVFP4")
-RUST_SRC = pathlib.Path("/opt/homebrew/Cellar/rust/1.98.1/lib/rustlib/src/rust/library")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from config import path  # noqa: E402
+
+CHECKPOINT = path("MLX_CKPT")
+NVFP4 = path("NVFP4_CKPT")
+RUST_SRC = path("RUST_SRC")
 # wiki.train.raw extrait de wikitext-2-raw-v1.zip (source unique :
 # https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip).
-WIKITEXT = pathlib.Path(os.environ.get("WIKITEXT_TRAIN", "corpus/wikitext-2-raw/wiki.train.raw"))
+WIKITEXT = path("WIKITEXT_TRAIN")
 # sha256 publiés des sources : toute dérive arrête la construction.
 WIKITEXT_ZIP_SHA256 = "ef7edb566e3e2b2d31b29c1fdb0c89a4cc683597484c3dc2517919c615435a11"
 WIKITEXT_TRAIN_SHA256 = "6707892fa3788b5ab9ed78ab5ff37d9fe825f6011a2ad4fcd6a6d467f0e7da57"
@@ -197,7 +199,11 @@ def rust_concat(root, exclude, renderer, min_tokens):
 
 
 def fit(renderer, doc, instruction, target):
-    """Plus long préfixe de `doc` (en tokens) tel que le prompt complet tienne en `target`."""
+    """Plus long préfixe de `doc` (en tokens) tel que le prompt complet tienne en `target`.
+
+    La longueur rendue est **au plus** la cible (publiée telle quelle) : la
+    frontière de tokenisation peut empêcher de l'atteindre exactement.
+    """
     doc_ids = renderer.encode(doc)
 
     def content(n):
@@ -324,9 +330,12 @@ def expect(out_dir, plan_path):
         if len(ids) != prompts[prompt_id]["prompt_tokens"]:
             raise SystemExit(f"{prompt_id}: la longueur dépend du nonce")
     (out / "expected.json").write_text(json.dumps(expected, indent=1))
-    agree = sum(e["fnv1a64"] == e["transformers_fnv1a64"] == e["llmd_offline_fnv1a64"]
-                for e in expected.values())
-    print(f"{len(expected)} couples, {agree} identiques par les trois chemins")
+    disagree = sorted(key for key, e in expected.items()
+                      if not e["fnv1a64"] == e["transformers_fnv1a64"] == e["llmd_offline_fnv1a64"])
+    print(f"{len(expected)} couples, {len(expected) - len(disagree)} identiques par les trois chemins")
+    # Bloquant : un désaccord entre tokenizers interdit la campagne sur ces prompts.
+    if disagree:
+        raise SystemExit(f"ids différents selon le tokenizer : {disagree[:5]}")
 
 
 def _self_check():
