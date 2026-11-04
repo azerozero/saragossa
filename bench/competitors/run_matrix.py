@@ -662,8 +662,14 @@ def freeze(run_dir):
             expected_reps[key] = expected_reps.get(key, 0) + 1
     rows = [r for r in analyze.load(run_dir)[0]
             if r.get("phase") == "tune" and r["config"].startswith("tune:")]
-    values, admissible = {}, {}
+    values, admissible, only_identity = {}, {}, {}
     for row in rows:
+        # Requête exclue par sa seule identité greedy (statut ok, toutes les
+        # autres preuves vraies) : vraie divergence avec l'AR, pas un défaut.
+        others_ok = all(v is True for k, v in (row.get("proofs") or {}).items()
+                        if k != "greedy_identity")
+        if row.get("status") == client.OK and others_ok:
+            only_identity[row["config"]] = only_identity.get(row["config"], 0) + 1
         if row.get("admissibility") != "admissible":
             continue
         key = (row["config"], row["prompt"])
@@ -688,8 +694,26 @@ def freeze(run_dir):
             if complete:
                 scores[index] = analyze.geomean_of_medians(per_prompt)
         if not scores:
-            failures.append(family)
-            report[family] = {"metric": spec["metric"], "scores": {}, "winner": None}
+            # Tous les candidats mesurés en entier mais divergents de l'AR : le
+            # réglage est impossible, pas la mesure. Le défaut documenté du
+            # moteur est gardé sans réglage ; en évaluation, chaque requête
+            # reste soumise à l'identité greedy. Tout autre cas arrête le gel.
+            planned = {i: sum(n for (c, _), n in expected_reps.items()
+                              if c == f"tune:{family}:{i}")
+                       for i in range(len(spec["candidates"]))}
+            divergent = all(only_identity.get(f"tune:{family}:{i}", 0) == planned[i] > 0
+                            for i in planned)
+            if not divergent:
+                failures.append(family)
+                report[family] = {"metric": spec["metric"], "scores": {}, "winner": None}
+                continue
+            report[family] = {"metric": spec["metric"], "scores": {}, "winner": 0,
+                              "value": spec["candidates"][0], "default_admissible": False,
+                              "reason": "aucun candidat identique à l'AR : défaut du moteur "
+                                        "conservé sans réglage"}
+            for config in matrix["configs"].values():
+                if family in config.get("slots", {}):
+                    config["slots"][family] = spec["candidates"][0]
             continue
         best = (min if lower else max)(scores, key=scores.get)
         default = scores.get(0)
@@ -865,6 +889,75 @@ def _freeze_check():
         analyze.tokenizer, analyze.load_matrix = original
     assert report["sar-mtp"]["winner"] == 2 and set(report["sar-mtp"]["scores"]) == {"0", "2"}
     assert report["llama-mtp"]["winner"] is None
+    _freeze_divergent_check()
+
+
+def _freeze_divergent_check():
+    """Une famille dont tous les candidats, mesurés en entier, divergent de l'AR
+    garde le défaut sans arrêter le gel ; les autres familles restent soumises
+    à la règle (ici, données absentes : arrêt)."""
+    import contextlib
+    import io
+    import tempfile
+
+    import analyze
+
+    class Tok:
+        def encode(self, text, add_special_tokens=False):
+            class Out:
+                ids = list(text)
+            return Out()
+
+    matrix, _ = load_matrix()
+    family = "llama-dflash"
+    spec = matrix["tuning"][family]
+
+    def row(config, prompt, repeat, text):
+        events = [{"t_ns": (i + 1) * 100, "content_chars": 1, "reasoning_chars": 0, "text": ch}
+                  for i, ch in enumerate(text)]
+        return {"kind": "measure", "phase": "tune", "block": 0, "position": 0, "config": config,
+                "prompt": prompt, "nonce": f"{repeat:016d}", "seed": None, "repeat": repeat,
+                "engine": "llama", "status": "ok", "events": events, "sampling": "greedy",
+                "usage": {"completion_tokens": len(text), "prompt_tokens": 5},
+                "ingest": {"kind": "server_reconstruction", "prompt_fnv1a64": "f"},
+                "timings": {"cache_n": 0}, "content": text, "finish_reason": "length",
+                "t0_wall": 0, "run_seq": 1, "entry_key": config}
+
+    rows, entries = [], []
+    for index in range(len(spec["candidates"])):
+        config = f"tune:{family}:{index}"
+        entries.append({"config": config, "requests": [{"prompt": p, "repeat": r}
+                                                       for p in spec["prompts"] for r in range(2)]})
+        rows += [row(config, p, r, "xyz" if r == 0 else "xyw") for p in spec["prompts"]
+                 for r in range(2)]
+    rows += [row(f"tune-ref:{spec['reference']}", p, r, "xyz") for p in spec["prompts"]
+             for r in range(2)]
+    expected = {f"{p}|{r:016d}": {"prompt_tokens": 5, "fnv1a64": "f"}
+                for p in spec["prompts"] for r in range(2)}
+    original = (analyze.tokenizer, analyze.load_matrix)
+    eos_matrix = json.loads(json.dumps(matrix))
+    eos_matrix["engines"]["llama"]["usage_counts_eos"] = True
+    eos_matrix["engines"]["llama"].pop("injected_content_prefix", None)
+    analyze.tokenizer = Tok
+    analyze.load_matrix = lambda _run_dir: eos_matrix
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "prompts").mkdir()
+            (root / "prompts" / "prompts.json").write_text(json.dumps(
+                {"prompts": [{"id": p, "kind": "code"} for p in spec["prompts"]]}))
+            (root / "prompts" / "expected.json").write_text(json.dumps(expected))
+            (root / "plan-tune.json").write_text(json.dumps({"entries": entries}))
+            (root / "results.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    freeze(tmp)
+                except SystemExit as error:
+                    assert family not in str(error), error
+            report = json.loads((root / "freeze.json").read_text())
+    finally:
+        analyze.tokenizer, analyze.load_matrix = original
+    assert report[family]["winner"] == 0 and "reason" in report[family]
 
 
 if __name__ == "__main__":
