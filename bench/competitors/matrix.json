@@ -98,7 +98,29 @@
    ],
    "extra": {},
    "usage_counts_eos": false,
-   "nonce_probe": true
+   "nonce_probe": true,
+   "class_args": {
+    "V": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ],
+    "T": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ],
+    "S": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ],
+    "M": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ],
+    "L": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ]
+   }
   }
  },
  "configs": {
