@@ -1416,11 +1416,13 @@ impl DecodeResidentState {
         let summed = self.scratch().lease(batch_hidden, GpuElement::F32)?;
         let post_normed = self.scratch().lease(batch_hidden, GpuElement::F32)?;
 
-        // Le mono MoE fusionne la norme d'entrée au QKV concaténé
-        // (`qkv_split_rms`, réduction de `rms_norm_simd`) : on normalise comme lui
-        // pour garder ses bits. Le mono dense normalise par `rms_norm_rows`.
-        let mono_fused_norm = shared_moe
-            .and(weights.qkv_proj)
+        // Le mono fusionne la norme d'entrée au QKV concaténé (`qkv_split_rms`,
+        // réduction de `rms_norm_simd`) : toujours en MoE, avec gate de sortie en
+        // dense. On normalise comme lui pour garder ses bits.
+        let mono_tries_fused = shared_moe.is_some() || dims.attn_output_gate;
+        let mono_fused_norm = weights
+            .qkv_proj
+            .filter(|_| mono_tries_fused)
             .filter(|qkv_proj| executor.full_attn_qkv_split_rms_applies(qkv_proj, hidden));
         match mono_fused_norm {
             Some(qkv_proj) => executor.encode_rms_norm_rows_matching_solo(

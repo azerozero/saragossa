@@ -922,16 +922,17 @@ impl MetalExecutor {
         Ok(Some(*out_dim))
     }
 
-    /// Vrai si [`Self::encode_full_attn_qkv_split_rms_buffers`] fusionne la norme
-    /// d'entrée pour ce poids (même prédicat). La vérification en lignes s'en
-    /// sert pour normaliser comme le mono et garder ses bits.
-    pub(crate) fn full_attn_qkv_split_rms_applies(
+    /// Variante du kernel QKV fusionné à la norme d'entrée
+    /// (`affine_qkv_split_rms_qmv_*`) pour ce poids, `None` si le mono ne
+    /// fusionne pas. Prédicat unique : l'encodeur et la vérification en lignes
+    /// (qui doit normaliser comme le mono pour garder ses bits) le partagent.
+    fn qkv_split_rms_bits(
         &self,
         weight: &MetalLinearWeightBuffers,
         in_dim: usize,
-    ) -> bool {
+    ) -> Option<usize> {
         if !fused_rms_prologue_enabled() || !fused_attn_epilogue_enabled() {
-            return false;
+            return None;
         }
         let MetalLinearWeightBuffers::AffineQuantized {
             out_dim,
@@ -941,17 +942,37 @@ impl MetalExecutor {
             ..
         } = weight
         else {
-            return false;
+            return None;
         };
-        in_dim == *weight_in_dim
-            && ((fast_affine_qmv_enabled(*out_dim)
-                && *bits == FAST_QMV_BITS
-                && *group_size == FAST_QMV_GROUP_SIZE
-                && in_dim % 512 == 0)
-                || can_use_fast_affine_qmv_u3_buffers(1, in_dim, *out_dim, *group_size, *bits)
-                || (full_qkv_split_rms_u8_enabled()
-                    && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
-                    && *group_size == FAST_QMV_GROUP_SIZE))
+        if in_dim != *weight_in_dim {
+            return None;
+        }
+        if fast_affine_qmv_enabled(*out_dim)
+            && *bits == FAST_QMV_BITS
+            && *group_size == FAST_QMV_GROUP_SIZE
+            && in_dim % 512 == 0
+        {
+            Some(4)
+        } else if can_use_fast_affine_qmv_u3_buffers(1, in_dim, *out_dim, *group_size, *bits) {
+            Some(3)
+        } else if full_qkv_split_rms_u8_enabled()
+            && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
+            && *group_size == FAST_QMV_GROUP_SIZE
+        {
+            Some(8)
+        } else {
+            None
+        }
+    }
+
+    /// Vrai si [`Self::encode_full_attn_qkv_split_rms_buffers`] fusionne la norme
+    /// d'entrée pour ce poids.
+    pub(crate) fn full_attn_qkv_split_rms_applies(
+        &self,
+        weight: &MetalLinearWeightBuffers,
+        in_dim: usize,
+    ) -> bool {
+        self.qkv_split_rms_bits(weight, in_dim).is_some()
     }
 
     #[expect(
@@ -985,9 +1006,8 @@ impl MetalExecutor {
             out_dim,
             in_dim: weight_in_dim,
             packed_cols,
-            group_size,
-            bits,
             groups,
+            ..
         } = weight
         else {
             return Ok(None);
@@ -997,18 +1017,9 @@ impl MetalExecutor {
                 "full-attn qkv split rms x=[1,{in_dim}] rhs=[{out_dim},{weight_in_dim}]"
             )));
         }
-        let can_use_u4 = fast_affine_qmv_enabled(*out_dim)
-            && *bits == FAST_QMV_BITS
-            && *group_size == FAST_QMV_GROUP_SIZE
-            && in_dim % 512 == 0;
-        let can_use_u3 =
-            can_use_fast_affine_qmv_u3_buffers(1, in_dim, *out_dim, *group_size, *bits);
-        let can_use_u8 = full_qkv_split_rms_u8_enabled()
-            && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
-            && *group_size == FAST_QMV_GROUP_SIZE;
-        if !can_use_u4 && !can_use_u3 && !can_use_u8 {
+        let Some(kernel_bits) = self.qkv_split_rms_bits(weight, in_dim) else {
             return Ok(None);
-        }
+        };
         let q_dim = q_heads
             .checked_mul(head_dim)
             .ok_or_else(|| InferError::Dimension("full-attn q_dim déborde".to_string()))?;
@@ -1030,12 +1041,10 @@ impl MetalExecutor {
             checked_u32(q_heads, "full qkv split rms q_heads")?,
             checked_u32(head_dim, "full qkv split rms head_dim")?,
         ];
-        let pipeline = if can_use_u4 {
-            &self.affine_qkv_split_rms_qmv_fast_u4_gs64_f32
-        } else if can_use_u3 {
-            &self.affine_qkv_split_rms_qmv_fast_u3_gs64_f32
-        } else {
-            &self.affine_qkv_split_rms_qmv_fast_u8_gs64_f32
+        let pipeline = match kernel_bits {
+            4 => &self.affine_qkv_split_rms_qmv_fast_u4_gs64_f32,
+            3 => &self.affine_qkv_split_rms_qmv_fast_u3_gs64_f32,
+            _ => &self.affine_qkv_split_rms_qmv_fast_u8_gs64_f32,
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
