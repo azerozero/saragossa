@@ -4976,6 +4976,11 @@ fn identity_corpus() -> Result<Vec<(String, String)>> {
 struct IdentityTally {
     /// Lignes vérifiées dont le chemin d'entrée est celui de l'AR.
     compared_rows: usize,
+    /// Parmi elles, lignes issues d'un lot d'au moins deux lignes (chemin en
+    /// lignes réellement exercé, pas le repli séquentiel).
+    multi_row_compared: usize,
+    /// Vérifications en arbre réellement branché (au moins un frère).
+    branched_records: usize,
     /// Parmi elles, lignes dont l'état final diffère de l'AR en bits.
     state_mismatches: usize,
     /// Premier écart (position absolue, valeurs différentes, lignes du lot, ligne).
@@ -4998,6 +5003,14 @@ fn identity_compare_records(
 ) {
     for record in records {
         let rows = record.tokens.len();
+        let branched = record.parents.as_ref().is_some_and(|parents| {
+            parents
+                .iter()
+                .enumerate()
+                .skip(1)
+                .any(|(row, &p)| p as usize + 1 != row)
+        });
+        tally.branched_records += usize::from(branched);
         let parent = |row: usize| -> Option<usize> {
             if row == 0 {
                 return None;
@@ -5036,6 +5049,7 @@ fn identity_compare_records(
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
             tally.compared_rows += 1;
+            tally.multi_row_compared += usize::from(rows >= 2);
             if differing > 0 {
                 tally.state_mismatches += 1;
                 if tally.first_mismatch.is_none() {
@@ -5056,9 +5070,13 @@ fn identity_compare_records(
 ///   celui de l'AR égale en bits l'état AR à la même position, relevé depuis
 ///   les entrées de production (captures linéaires comprises).
 ///
-/// Budget : `SARAGOSSA_RUST_IDENTITY_TOKENS` (128 par défaut). Échoue au
-/// premier mode non identique, avec son bilan. Lancer avec `--ignored` ; la
-/// promesse ne vaut que pour la configuration (flags, GPU) de ce lancement.
+/// Budget : `SARAGOSSA_RUST_IDENTITY_TOKENS` (128 par défaut, au moins 200
+/// pour `prose32k-1`, dont l'écart historique tombe au token 182). Échoue si
+/// un mode n'est pas identique, si un mode n'a comparé aucune ligne issue d'un
+/// lot de plusieurs lignes sur tout le corpus, si l'arbre DFlash n'a jamais
+/// été branché, ou si tout le corpus est sauté. La promesse ne vaut que pour la
+/// configuration (flags, GPU) du lancement ; commandes et résultats attendus
+/// dans docs/perf/greedy-identity.md.
 #[test]
 #[ignore = "modèle réel requis"]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
@@ -5090,8 +5108,20 @@ fn greedy_identity_states_real_model() -> Result<()> {
     let hidden = model.final_norm.data().len();
     let (mut ties_2, mut ties_3, mut tokens_seen) = (0usize, 0usize, 0usize);
     let mut failures = Vec::new();
-    for (name, text) in identity_corpus()? {
+    let mut coverage: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    let corpus = identity_corpus()?;
+    if corpus.is_empty() {
+        return Err(InferError::Config(
+            "corpus d'identité entièrement sauté".into(),
+        ));
+    }
+    for (name, text) in corpus {
         let prompt = mtp_verifier_prompt_ids(&assets, &text)?;
+        let max_new = if name == "prose32k-1" {
+            max_new.max(200)
+        } else {
+            max_new
+        };
         let ar = model.generate_greedy_cached_with_options(&prompt, max_new, &options)?;
         let kv_bf16 = CausalDecoder::resident_kv_bf16(false, prompt.len());
         // Marges de la tête de production : logits du decode résident forcé.
@@ -5140,6 +5170,17 @@ fn greedy_identity_states_real_model() -> Result<()> {
         }
         if draft.is_some() {
             modes.extend(["dflash-chaîne", "dflash-arbre"]);
+        }
+        // Sélection explicite (`SARAGOSSA_RUST_IDENTITY_MODES`, virgules) : un mode
+        // demandé mais indisponible (sidecar ou drafter absent) fait échouer.
+        if let Some(wanted) = crate::runtime_flags::env_var("SARAGOSSA_RUST_IDENTITY_MODES") {
+            let wanted: Vec<String> = wanted.split(',').map(|m| m.trim().to_string()).collect();
+            if let Some(missing) = wanted.iter().find(|m| !modes.contains(&m.as_str())) {
+                return Err(InferError::Config(format!(
+                    "mode d'identité {missing} indisponible"
+                )));
+            }
+            modes.retain(|mode| wanted.iter().any(|m| m == mode));
         }
         for mode in modes {
             VERIFY_RECORDER.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
@@ -5205,17 +5246,27 @@ fn greedy_identity_states_real_model() -> Result<()> {
                 min_margin.0,
                 min_margin.1
             );
-            if tally.compared_rows == 0 {
-                eprintln!("identité {name} {mode}: aucune ligne vérifiée sur le chemin AR (mode non exercé)");
-            }
+            let seen = coverage.entry(mode).or_default();
+            seen.0 += tally.multi_row_compared;
+            seen.1 += tally.branched_records;
             if tally.first_token_divergence.is_some() || tally.state_mismatches > 0 {
                 failures.push(format!("{name} {mode}: {tally:?}"));
             }
         }
     }
     eprintln!(
-        "identité : {tokens_seen} tokens AR, quasi-égalités traversées < 1e-2 : {ties_2}, < 1e-3 : {ties_3}"
+        "identité : {tokens_seen} tokens AR, quasi-égalités traversées < 1e-2 : {ties_2}, < 1e-3 : {ties_3}, couverture {coverage:?}"
     );
+    for (mode, (multi, branched)) in &coverage {
+        if *multi == 0 {
+            failures.push(format!(
+                "{mode}: aucune ligne d'un lot de plusieurs lignes comparée"
+            ));
+        }
+        if *mode == "dflash-arbre" && *branched == 0 {
+            failures.push(format!("{mode}: aucun arbre branché vérifié"));
+        }
+    }
     assert!(
         failures.is_empty(),
         "identité greedy rompue : {failures:#?}"
