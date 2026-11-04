@@ -4925,19 +4925,49 @@ fn identity_corpus() -> Result<Vec<(String, String)>> {
         crate::runtime_flags::env_var("SARAGOSSA_RUST_IDENTITY_PROMPTS").unwrap_or_else(|| {
             "chat-1,chat-2,chat-3,chat-4,chat-5,chat-6,code4k-1,code4k-2,code4k-3".to_string()
         });
-    names
-        .split(',')
-        .map(|name| {
-            let name = name.trim().to_string();
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/rowsexact")
-                .join(format!("{name}.txt"));
-            let text = std::fs::read_to_string(&path).map_err(|error| {
-                InferError::Config(format!("corpus {}: {error}", path.display()))
-            })?;
-            Ok((name, text))
-        })
-        .collect()
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rowsexact");
+    let manifest = std::fs::read_to_string(fixtures.join("MANIFEST.tsv"))
+        .map_err(|error| InferError::Config(format!("manifeste du corpus: {error}")))?;
+    let external =
+        crate::runtime_flags::env_var_os("SARAGOSSA_RUST_IDENTITY_EXTERNAL_DIR").map(PathBuf::from);
+    let mut corpus = Vec::new();
+    for name in names.split(',').map(str::trim) {
+        let file = format!("{name}.txt");
+        let expected = manifest
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split('\t');
+                (fields.next() == Some(file.as_str())).then(|| fields.nth(1))?
+            })
+            .ok_or_else(|| InferError::Config(format!("{file} absent du manifeste")))?;
+        // Versionné dans le dépôt, sinon (texte sous licence tierce) dossier externe.
+        let candidates = [
+            Some(fixtures.join(&file)),
+            external.as_ref().map(|dir| dir.join(&file)),
+        ];
+        let Some(path) = crate::test_support::require_real_model(
+            candidates.into_iter().flatten().find(|path| path.is_file()),
+            &format!("{file} (SARAGOSSA_RUST_IDENTITY_EXTERNAL_DIR)"),
+        ) else {
+            eprintln!(
+                "skip corpus {file}: hors dépôt, SARAGOSSA_RUST_IDENTITY_EXTERNAL_DIR absent"
+            );
+            continue;
+        };
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| InferError::Config(format!("corpus {}: {error}", path.display())))?;
+        let digest: String = <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if digest != expected {
+            return Err(InferError::Config(format!(
+                "{file}: sha256 {digest} ≠ manifeste {expected}"
+            )));
+        }
+        corpus.push((name.to_string(), text));
+    }
+    Ok(corpus)
 }
 
 /// Bilan d'un mode spéculatif contre l'AR sur un prompt.
@@ -4948,8 +4978,8 @@ struct IdentityTally {
     compared_rows: usize,
     /// Parmi elles, lignes dont l'état final diffère de l'AR en bits.
     state_mismatches: usize,
-    /// Premier écart (position absolue, nombre de valeurs différentes).
-    first_mismatch: Option<(usize, usize)>,
+    /// Premier écart (position absolue, valeurs différentes, lignes du lot, ligne).
+    first_mismatch: Option<(usize, usize, usize, usize)>,
     /// Premier token généré différent de l'AR.
     first_token_divergence: Option<usize>,
 }
@@ -5009,7 +5039,7 @@ fn identity_compare_records(
             if differing > 0 {
                 tally.state_mismatches += 1;
                 if tally.first_mismatch.is_none() {
-                    tally.first_mismatch = Some((position, differing));
+                    tally.first_mismatch = Some((position, differing, rows, row));
                 }
             }
         }
