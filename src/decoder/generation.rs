@@ -1389,6 +1389,11 @@ impl CausalDecoder {
         max_draft_tokens: usize,
         mut on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
+        // Politique greedy de la requête, lue par chaque vérification en lignes
+        // quel que soit son type de tête.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _request_greedy =
+            crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
         if self.mtp.is_none() {
             return Err(InferError::Config(
                 "decode MTP demandé sans sidecar MTP chargé".to_string(),
@@ -2189,6 +2194,11 @@ impl CausalDecoder {
         draft: &DFlashDraft,
         max_draft_tokens: usize,
     ) -> Result<SpeculativeOutput> {
+        // Politique greedy de la requête, lue par chaque vérification en lignes
+        // quel que soit son type de tête.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _request_greedy =
+            crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
         if options.temperature > f32::EPSILON {
             return Err(InferError::Config(
                 "decode DFlash supporte uniquement greedy temperature=0".to_string(),

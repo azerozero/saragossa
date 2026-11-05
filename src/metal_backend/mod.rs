@@ -157,8 +157,8 @@ pub(crate) use self::scratch::install_scratch_namespace;
 #[cfg(test)]
 pub(crate) use self::verify_tree::with_verify_strict_override;
 pub(crate) use self::verify_tree::{
-    install_verify_greedy_scope, install_verify_tree_scope, verify_rows_nax_allowed,
-    verify_strict_active, verify_tree, VerifyTree,
+    install_request_greedy_scope, install_verify_greedy_scope, install_verify_tree_scope,
+    request_greedy, verify_rows_nax_allowed, verify_strict_active, verify_tree, VerifyTree,
 };
 
 /// Dispatches qmv-T encodés sur ce thread (oracles du mode strict).

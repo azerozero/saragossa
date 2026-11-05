@@ -259,12 +259,14 @@ impl CausalDecoder {
             let _tree_guard = tree
                 .clone()
                 .map(crate::metal_backend::install_verify_tree_scope);
-            // Politique d'exactitude de la requête : seule la tête argmax est greedy
-            // (logits et tirage GPU servent l'échantillonné).
-            let _greedy_guard = crate::metal_backend::install_verify_greedy_scope(matches!(
-                head,
-                ResidentVerifyHead::Argmax
-            ));
+            // Politique d'exactitude de la requête : posée par la boucle
+            // spéculative (température nulle), quel que soit le type de tête
+            // (`Skip` sous `SARAGOSSA_RUST_GPU_ARGMAX=0`) ; à défaut, seule la
+            // tête argmax est greedy.
+            let _greedy_guard = crate::metal_backend::install_verify_greedy_scope(
+                crate::metal_backend::request_greedy()
+                    .unwrap_or(matches!(head, ResidentVerifyHead::Argmax)),
+            );
             let encoder = new_resident_compute_encoder(command_buffer);
             let mut owned: Vec<metal::Buffer> = Vec::new();
             let mut current = batch_a.tensor().buffer();

@@ -228,6 +228,10 @@ impl CausalDecoder {
         let mut tree_mode = tree_mode;
         if let Some(reason) = dflash_sampling_refusal(options) {
             return Err(InferError::Config(format!(
+        // Politique greedy de la requête, lue par chaque vérification en lignes
+        // quel que soit son type de tête.
+        let _request_greedy =
+            crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
                 "decode DFlash résident: {reason}"
             )));
         }
