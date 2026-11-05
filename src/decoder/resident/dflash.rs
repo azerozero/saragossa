@@ -28,19 +28,24 @@ pub(in crate::decoder) enum DFlashTreeMode {
 impl DFlashTreeMode {
     /// Mode demandé par l'environnement et s'il est explicite : sans
     /// `SARAGOSSA_RUST_DFLASH_TREE`, l'arbre par défaut retombe sur la chaîne
-    /// quand le modèle ne le supporte pas, au lieu d'échouer.
-    fn from_env() -> Result<(Self, bool)> {
-        Self::from_flag(crate::runtime_flags::dflash_tree_budget())
+    /// quand le modèle ne le supporte pas, au lieu d'échouer. `greedy` : requête
+    /// à température nulle (le mode strict n'abaisse le défaut qu'en greedy).
+    fn from_env(greedy: bool) -> Result<(Self, bool)> {
+        Self::from_flag(
+            crate::runtime_flags::dflash_tree_budget(),
+            crate::runtime_flags::dflash_tree_default_budget(greedy),
+        )
     }
 
-    /// `None` : variable absente ; `Some(Err(valeur))` : valeur invalide, refusée
-    /// comme toute demande explicite hors périmètre.
-    fn from_flag(flag: Option<std::result::Result<usize, String>>) -> Result<(Self, bool)> {
+    /// `None` : variable absente, arbre de `default_budget` nœuds ;
+    /// `Some(Err(valeur))` : valeur invalide, refusée comme toute demande
+    /// explicite hors périmètre.
+    fn from_flag(
+        flag: Option<std::result::Result<usize, String>>,
+        default_budget: usize,
+    ) -> Result<(Self, bool)> {
         match flag {
-            None => Ok((
-                Self::BestFirst(crate::runtime_flags::dflash_tree_default_budget()),
-                false,
-            )),
+            None => Ok((Self::BestFirst(default_budget), false)),
             Some(Ok(0)) => Ok((Self::Off, true)),
             Some(Ok(budget)) => Ok((Self::BestFirst(budget), true)),
             Some(Err(value)) => Err(InferError::Config(format!(
@@ -203,7 +208,7 @@ impl CausalDecoder {
             options,
             draft,
             max_draft_tokens,
-            DFlashTreeMode::from_env()?,
+            DFlashTreeMode::from_env(options.temperature <= f32::EPSILON)?,
             on_token,
         )
     }
@@ -223,15 +228,15 @@ impl CausalDecoder {
         (tree_mode, tree_explicit): (DFlashTreeMode, bool),
         mut on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
+        // Politique greedy de la requête, lue par chaque vérification en lignes
+        // quel que soit son type de tête.
+        let _request_greedy =
+            crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
         // Arbre par défaut (non explicite) : toute raison de refus le ramène à la
         // chaîne ; une demande explicite reste refusée avec son erreur.
         let mut tree_mode = tree_mode;
         if let Some(reason) = dflash_sampling_refusal(options) {
             return Err(InferError::Config(format!(
-        // Politique greedy de la requête, lue par chaque vérification en lignes
-        // quel que soit son type de tête.
-        let _request_greedy =
-            crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
                 "decode DFlash résident: {reason}"
             )));
         }
@@ -1266,23 +1271,32 @@ mod tests {
         assert_eq!(DFlashTreeMode::Off.verify_rows(8), 0);
     }
 
-    /// Variable absente = arbre B = 8 non explicite ; 0, B et valeur invalide
-    /// sont explicites ; un refus replie seulement le défaut.
+    /// Variable absente = arbre du budget par défaut, non explicite ; 0, B et
+    /// valeur invalide sont explicites et l'emportent sur le défaut ; un refus
+    /// replie seulement le défaut. Indépendant de l'environnement.
     #[test]
     fn tree_default_falls_back_and_explicit_refuses() {
         assert_eq!(
-            DFlashTreeMode::from_flag(None).ok(),
+            DFlashTreeMode::from_flag(None, 8).ok(),
             Some((DFlashTreeMode::BestFirst(8), false))
         );
         assert_eq!(
-            DFlashTreeMode::from_flag(Some(Ok(0))).ok(),
+            DFlashTreeMode::from_flag(None, 3).ok(),
+            Some((DFlashTreeMode::BestFirst(3), false))
+        );
+        assert_eq!(
+            DFlashTreeMode::from_flag(Some(Ok(8)), 3).ok(),
+            Some((DFlashTreeMode::BestFirst(8), true))
+        );
+        assert_eq!(
+            DFlashTreeMode::from_flag(Some(Ok(0)), 8).ok(),
             Some((DFlashTreeMode::Off, true))
         );
         assert_eq!(
-            DFlashTreeMode::from_flag(Some(Ok(12))).ok(),
+            DFlashTreeMode::from_flag(Some(Ok(12)), 8).ok(),
             Some((DFlashTreeMode::BestFirst(12), true))
         );
-        assert!(DFlashTreeMode::from_flag(Some(Err("huit".to_string()))).is_err());
+        assert!(DFlashTreeMode::from_flag(Some(Err("huit".to_string())), 8).is_err());
         let refusal = || InferError::Config("refus".to_string());
         let mut mode = DFlashTreeMode::BestFirst(8);
         assert!(tree_fallback(&mut mode, false, refusal()).is_ok());

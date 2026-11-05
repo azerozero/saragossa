@@ -1087,7 +1087,7 @@ pub(crate) fn verify_rows_nax_greedy_enabled() -> bool {
 /// sous la portée greedy, chaque ligne vérifiée rend les bits du pas mono-ligne.
 /// Le préfixe NAX en lignes est coupé et les matmuls u4 gs64 de 3 à 16 lignes
 /// passent par le qmv-T exact au lieu du skinny (MMA bf16 hi+lo, non exact dès
-/// 5 lignes). Sans `SARAGOSSA_RUST_DFLASH_TREE`, l'arbre DFlash passe à B = 3
+/// 5 lignes). Sans `SARAGOSSA_RUST_DFLASH_TREE`, l'arbre DFlash greedy passe à B = 3
 /// ([`DFLASH_TREE_STRICT_DEFAULT_BUDGET`]). Le défaut reste le chemin rapide, à
 /// identité greedy approchée.
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1662,13 +1662,16 @@ pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
 /// B = 8 strict en qmv-T, et 55,1-56,5 et 50,3-51,3 pour le défaut rapide.
 pub(crate) const DFLASH_TREE_STRICT_DEFAULT_BUDGET: usize = 3;
 
-/// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE`, selon le mode
-/// de vérification.
-pub(crate) fn dflash_tree_default_budget() -> usize {
+/// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` : B = 3 pour une
+/// requête greedy (`greedy`, température nulle) en mode strict, B = 8 sinon
+/// (échantillonné compris, que le mode strict ne touche pas).
+pub(crate) fn dflash_tree_default_budget(greedy: bool) -> usize {
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    if verify_strict_enabled() {
+    if greedy && verify_strict_enabled() {
         return DFLASH_TREE_STRICT_DEFAULT_BUDGET;
     }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let _ = greedy;
     DFLASH_TREE_DEFAULT_BUDGET
 }
 
