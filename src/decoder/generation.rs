@@ -2784,11 +2784,12 @@ impl CausalDecoder {
         let mut verify_tokens = Vec::with_capacity(verified_drafts + 1);
         verify_tokens.push(primary);
         verify_tokens.extend(drafts.iter().take(verified_drafts).copied());
-        // Politique greedy de la requête pour cette seule vérification spéculative,
-        // quel que soit le type de tête (`Skip` sous `SARAGOSSA_RUST_GPU_ARGMAX=0`) ;
-        // le prefill et l'extension de préfixe gardent la sélection de l'AR.
+        // Politique greedy de la requête pour cette vérification spéculative et ses
+        // rejeux (rollback après rejet), quel que soit le type de tête (`Skip` sous
+        // `SARAGOSSA_RUST_GPU_ARGMAX=0`) ; le prefill et l'extension de préfixe,
+        // hors de cette fonction, gardent la sélection de l'AR.
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        let request_greedy =
+        let _request_greedy =
             crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
         let (target_states, target_tokens, resident_captures, target_logits) =
             if options.temperature <= f32::EPSILON && gpu_argmax_enabled() {
@@ -2815,8 +2816,6 @@ impl CausalDecoder {
                     None,
                 )
             };
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        drop(request_greedy);
         // Logits finalisés d'une ligne cible : relus du verify résident, sinon
         // lm_head CPU sur l'état.
         let target_logits_row = |position: usize, state: &Tensor| -> Result<Tensor> {
@@ -3074,19 +3073,18 @@ impl CausalDecoder {
         let mut verify_tokens = Vec::with_capacity(drafts.len());
         verify_tokens.push(primary);
         verify_tokens.extend(drafts.iter().take(drafts.len().saturating_sub(1)).copied());
-        // Politique greedy de la requête pour cette seule vérification spéculative,
-        // quel que soit le type de tête (`Skip` sous `SARAGOSSA_RUST_GPU_ARGMAX=0`) ;
-        // le prefill et l'extension de préfixe gardent la sélection de l'AR.
+        // Politique greedy de la requête pour cette vérification spéculative et ses
+        // rejeux (rollback après rejet), quel que soit le type de tête (`Skip` sous
+        // `SARAGOSSA_RUST_GPU_ARGMAX=0`) ; le prefill et l'extension de préfixe,
+        // hors de cette fonction, gardent la sélection de l'AR.
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        let request_greedy =
+        let _request_greedy =
             crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
         let (target_states, target_hidden) = self.next_final_states_batched_with_layer_capture(
             cache,
             &verify_tokens,
             &draft.info.target_layer_ids,
         )?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        drop(request_greedy);
         let mut accepted_all = true;
         let mut verify_token = primary;
         let mut committed_len = 0usize;
