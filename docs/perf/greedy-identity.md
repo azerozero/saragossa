@@ -36,16 +36,24 @@ Le flag rend la vérification greedy exacte sans réglage manuel. Sous la porté
 greedy, il fait trois choses :
 - il coupe le préfixe NAX en lignes ;
 - les matmuls u4 gs64 de 3 à 16 lignes passent par le qmv-T au lieu du skinny ;
-- l'arbre DFlash passe à B = 3 nœuds quand `SARAGOSSA_RUST_DFLASH_TREE` est
-  absent.
+- l'arbre DFlash greedy passe à B = 3 nœuds quand `SARAGOSSA_RUST_DFLASH_TREE`
+  est absent ; une valeur explicite garde la priorité.
+
+La politique greedy vient de la requête (température nulle), quel que soit le
+type de tête de vérification, y compris sous `SARAGOSSA_RUST_GPU_ARGMAX=0`.
 
 L'échantillonné et le décodage AR ne changent pas.
 
 Le qmv-T (`affine_qmvt_*`) calcule `xt` et `sum` une fois par ligne et par
 bloc, puis convertit les poids une fois pour les R lignes. Chaque ligne garde
 le contrat canonique du qmv mono. Il existe en deux variantes :
-- device, pour `in_dim` ≤ 8192 ;
-- threadgroup, pour down (S = 8) et pour les sorties d'au moins 65536 (S = 16).
+- device, pour `in_dim` ≤ 8192 (gate, up, qkv) et pour 16 lignes ;
+- threadgroup, pour down (S = 8) et pour les sorties d'au moins 65536, dont le
+  lm_head (S = 16).
+
+Au-delà de 16 lignes, le mode strict garde le qmv répliqué : le skinny et les
+GEMM NA sont exclus à toute largeur. Le qmv-T ne s'engage que là où le pas
+mono-ligne prend le qmv rapide (`SARAGOSSA_RUST_QMV_FAST`).
 
 Coût du matmul à 9 lignes (ms) :
 

@@ -63,11 +63,12 @@ impl MetalExecutor {
     }
 
     /// qmv-T u4 gs64 exact du mode strict (voir [`can_use_qmvt_buffers`]).
-    /// `in_dim` court (gate, up, qkv, lm_head à 5120) : `xt`/`sum` préparés une
-    /// fois en mémoire device puis lus par toutes les tuiles (variante la plus
-    /// rapide à 5120, 0,251 ms contre 0,279 en threadgroup sur gate R = 9).
-    /// `in_dim` long (down à 17408) : préparation par threadgroup, S = 8 (0,284
-    /// ms contre 0,386 en device). Sorties très larges (lm_head) : S = 16.
+    /// `in_dim` court (gate, up, qkv à 5120) : `xt`/`sum` préparés une fois en
+    /// mémoire device puis lus par toutes les tuiles (variante la plus rapide à
+    /// 5120, 0,251 ms contre 0,279 en threadgroup sur gate R = 9). `in_dim` long
+    /// (down à 17408) : préparation par threadgroup, S = 8 (0,284 ms contre
+    /// 0,386 en device). Sorties d'au moins 65536 (lm_head 248320×5120) :
+    /// threadgroup S = 16 (3,9 ms contre 4,2 en device). R = 16 : device seule.
     pub(super) fn encode_affine_qmvt_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
