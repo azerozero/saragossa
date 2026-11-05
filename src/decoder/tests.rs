@@ -5111,6 +5111,7 @@ fn greedy_identity_states_real_model() -> Result<()> {
     let mut coverage: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
     let mut tree_widths: std::collections::BTreeMap<&str, usize> = Default::default();
     let mut skip_coverage: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut replay_coverage: std::collections::BTreeMap<&str, usize> = Default::default();
     let corpus = identity_corpus()?;
     if corpus.is_empty() {
         return Err(InferError::Config(
@@ -5168,12 +5169,20 @@ fn greedy_identity_states_real_model() -> Result<()> {
         sequence.extend_from_slice(&ar);
         let mut modes: Vec<&str> = vec!["lookup"];
         if has_mtp {
-            modes.push("mtp");
+            // `mtp-skip` : repli sans argmax GPU (tête `Skip`) avec une
+            // proposition lookup multiligne, posés par le test lui-même.
+            modes.extend(["mtp", "mtp-skip"]);
         }
         if draft.is_some() {
             // `dflash-défaut` : entrée publique, arbre choisi par l'environnement
             // (B = 3 en mode strict greedy, B = 8 sinon, sauf `SARAGOSSA_RUST_DFLASH_TREE`).
-            modes.extend(["dflash-chaîne", "dflash-arbre", "dflash-défaut"]);
+            // `dflash-cpu` : boucle batchée de référence, rejeu en lignes après rejet.
+            modes.extend([
+                "dflash-chaîne",
+                "dflash-arbre",
+                "dflash-défaut",
+                "dflash-cpu",
+            ]);
         }
         // Sélection explicite (`SARAGOSSA_RUST_IDENTITY_MODES`, virgules) : un mode
         // demandé mais indisponible (sidecar ou drafter absent) fait échouer.
@@ -5202,6 +5211,30 @@ fn greedy_identity_states_real_model() -> Result<()> {
                         |_| true,
                     )
                     .map(|output| output.tokens),
+                "mtp-skip" => crate::runtime_flags::with_mtp_skip_override(8, || {
+                    model.generate_greedy_mtp_streaming_with_options(
+                        &prompt,
+                        max_new,
+                        &options,
+                        2,
+                        |_| true,
+                    )
+                })
+                .map(|output| output.tokens),
+                "dflash-cpu" => {
+                    let draft = draft
+                        .as_ref()
+                        .ok_or_else(|| InferError::Config("drafter".into()))?;
+                    model
+                        .generate_greedy_dflash_batched_with_options(
+                            &prompt,
+                            max_new,
+                            &options,
+                            draft,
+                            draft.info.block_size,
+                        )
+                        .map(|output| output.tokens)
+                }
                 "dflash-défaut" => {
                     // Le défaut se lit sans surcharge : un `DFLASH_TREE` hérité
                     // mesurerait autre chose que le budget choisi par le mode.
@@ -5291,6 +5324,21 @@ fn greedy_identity_states_real_model() -> Result<()> {
                 .filter(|record| record.skip_head && record.batched && record.tokens.len() >= 5)
                 .count();
             *skip_coverage.entry(mode).or_insert(0) += skip_rows;
+            // Rejeux en lignes après rejet : lot `Skip` de 5 lignes et plus qui
+            // reprend, à la même position, le début de la vérification précédente.
+            let replays = records
+                .windows(2)
+                .filter(|pair| {
+                    let (verify, replay) = (&pair[0], &pair[1]);
+                    replay.skip_head
+                        && replay.batched
+                        && replay.tokens.len() >= 5
+                        && replay.base_position == verify.base_position
+                        && replay.tokens.len() < verify.tokens.len()
+                        && verify.tokens.starts_with(&replay.tokens)
+                })
+                .count();
+            *replay_coverage.entry(mode).or_insert(0) += replays;
             if tally.first_token_divergence.is_some() || tally.state_mismatches > 0 {
                 failures.push(format!("{name} {mode}: {tally:?}"));
             }
@@ -5320,13 +5368,18 @@ fn greedy_identity_states_real_model() -> Result<()> {
             ));
         }
     }
-    // `SARAGOSSA_RUST_IDENTITY_REQUIRE_SKIP=1` (lancement sous
-    // `SARAGOSSA_RUST_GPU_ARGMAX=0`) : le MTP doit avoir vérifié par la tête
-    // `Skip` des lots de 5 lignes et plus (proposition lookup).
-    if crate::runtime_flags::env_flag("SARAGOSSA_RUST_IDENTITY_REQUIRE_SKIP", false)
-        && skip_coverage.get("mtp").copied().unwrap_or(0) == 0
+    eprintln!("identité : rejeux en lignes ≥ 5 lignes {replay_coverage:?}");
+    // Couvertures obligatoires des modes de repli : `mtp-skip` a vérifié par la
+    // tête `Skip` des lots de 5 lignes et plus (proposition lookup), `dflash-cpu`
+    // a rejoué en lignes au moins 5 tokens acceptés après un rejet.
+    if skip_coverage.get("mtp-skip").is_some_and(|&rows| rows == 0) {
+        failures.push("mtp-skip : aucune vérification Skip de 5 lignes et plus".to_string());
+    }
+    if replay_coverage
+        .get("dflash-cpu")
+        .is_some_and(|&rows| rows == 0)
     {
-        failures.push("mtp : aucune vérification Skip de 5 lignes et plus".to_string());
+        failures.push("dflash-cpu : aucun rejeu de 5 lignes et plus".to_string());
     }
     assert!(
         failures.is_empty(),

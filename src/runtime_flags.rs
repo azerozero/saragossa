@@ -383,6 +383,10 @@ pub(crate) fn mtp_gpu_block_enabled() -> bool {
 /// que la tête MTP au dernier pas coûte une vérification. D'où la coupure sur la
 /// même longueur que le choix fresh/committed.
 pub(super) fn mtp_lookup_draft_tokens() -> usize {
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    if let Some(forced) = MTP_LOOKUP_DRAFT_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced.min(15);
+    }
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     if let Some(case) = pairwise::current() {
         return case.lookup.min(15);
@@ -450,8 +454,39 @@ pub(super) fn mtp_adaptive_probe_period() -> u32 {
     })
 }
 
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+thread_local! {
+    static GPU_ARGMAX_TEST_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static MTP_LOOKUP_DRAFT_TEST_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force l'argmax GPU et les drafts lookup du MTP sur ce thread le temps de
+/// `run` (oracle O2 du repli `Skip` : vérification sans argmax GPU d'une
+/// proposition lookup multiligne).
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn with_mtp_skip_override<R>(lookup_drafts: usize, run: impl FnOnce() -> R) -> R {
+    /// Rétablit les réglages précédents, panique comprise.
+    struct Restore(Option<bool>, Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GPU_ARGMAX_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+            MTP_LOOKUP_DRAFT_TEST_OVERRIDE.with(|cell| cell.set(self.1));
+        }
+    }
+    let _restore = Restore(
+        GPU_ARGMAX_TEST_OVERRIDE.with(|cell| cell.replace(Some(false))),
+        MTP_LOOKUP_DRAFT_TEST_OVERRIDE.with(|cell| cell.replace(Some(lookup_drafts))),
+    );
+    run()
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn gpu_argmax_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = GPU_ARGMAX_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_ARGMAX", true))
 }
