@@ -593,3 +593,79 @@ fn real_checkpoint_hash_goldens() {
         320_001_536
     );
 }
+
+fn digests(files: &[super::OutputFile]) -> BTreeMap<String, String> {
+    files
+        .iter()
+        .map(|f| (f.name.clone(), f.sha256.clone()))
+        .collect()
+}
+
+/// Altère `ngram_e4m3.bin` après une conversion complète, puis relance sans
+/// `--verify` : la reprise doit refaire les segments touchés et retrouver les
+/// empreintes d'origine.
+fn ngram_damage_is_repaired(damage: impl FnOnce(&Path)) {
+    let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    write_source(src.path(), |_| {});
+    let first = convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: conversion");
+    damage(&dst.path().join("ngram/ngram_e4m3.bin"));
+    let second = convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: reprise");
+    assert!(
+        second.units_written.iter().any(|u| u.starts_with("ngram-")),
+        "aucun segment refait: {:?}",
+        second.units_written
+    );
+    assert_eq!(digests(&second.files), digests(&first.files));
+}
+
+#[test]
+fn resume_repairs_deleted_ngram_file_without_verify() {
+    ngram_damage_is_repaired(|path| std::fs::remove_file(path).expect("invariant: suppression"));
+}
+
+#[test]
+fn resume_repairs_truncated_ngram_file_without_verify() {
+    ngram_damage_is_repaired(|path| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("invariant: ouverture");
+        let len = file.metadata().expect("invariant: taille").len();
+        file.set_len(len / 3).expect("invariant: troncature");
+    });
+}
+
+#[test]
+fn resume_repairs_same_size_ngram_corruption_without_verify() {
+    ngram_damage_is_repaired(|path| {
+        let mut bytes = std::fs::read(path).expect("invariant: lecture");
+        let at = bytes.len() / 2;
+        bytes[at] ^= 0x01;
+        std::fs::write(path, bytes).expect("invariant: écriture");
+    });
+}
+
+#[test]
+fn finalize_invalidates_corrupt_shard_then_resume_repairs_it() {
+    let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    write_source(src.path(), |_| {});
+    let first = convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: conversion");
+    let shard = dst.path().join("model-00001-of-00002.safetensors");
+    let mut bytes = std::fs::read(&shard).expect("invariant: lecture");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&shard, bytes).expect("invariant: écriture");
+    // Même taille : la reprise sans --verify saute l'unité, la finalisation la
+    // rejette et l'invalide.
+    let error = convert_qwen4exp(&options(src.path(), dst.path()))
+        .err()
+        .unwrap_or_else(|| panic!("shard corrompu accepté"));
+    assert!(error.to_string().contains("invalidée"), "{error}");
+    let third = convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: réparation");
+    assert!(third
+        .units_written
+        .contains(&"model-00001-of-00002".to_string()));
+    assert_eq!(digests(&third.files), digests(&first.files));
+}

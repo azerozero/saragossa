@@ -341,6 +341,21 @@ fn segment_unit(part: usize) -> String {
     format!("ngram-{part:03}")
 }
 
+/// sha256 de la plage `[offset, offset + len)` d'un fichier.
+fn range_sha256(file: &File, path: &Path, offset: u64, len: u64) -> Result<String> {
+    let mut sha = Sha256::new();
+    let mut buf = vec![0_u8; plan::IO_CHUNK];
+    let mut at = 0_u64;
+    while at < len {
+        let take = (plan::IO_CHUNK as u64).min(len - at) as usize;
+        std::os::unix::fs::FileExt::read_exact_at(file, &mut buf[..take], offset + at)
+            .map_err(|e| io_err(path, e))?;
+        sha.update(&buf[..take]);
+        at += take as u64;
+    }
+    Ok(hex(sha.finalize()))
+}
+
 /// Contrôle rapide d'une unité terminée : taille, et sha256 si `verify`.
 fn check_done(path: &Path, size: u64, sha: &str, verify: bool) -> Result<bool> {
     let Ok(meta) = std::fs::metadata(path) else {
@@ -510,8 +525,18 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
             .write(true)
             .open(&ngram_path)
             .map_err(|e| io_err(&ngram_path, e))?;
+        // Un fichier absent, tronqué ou rallongé invalide les segments qu'il ne
+        // contient plus intégralement, AVANT tout redimensionnement : `set_len`
+        // comblerait les trous de zéros qu'aucun contrôle de taille ne verrait.
         let len = file.metadata().map_err(|e| io_err(&ngram_path, e))?.len();
         if len != ngram_total {
+            let before = journal.segments.len();
+            journal
+                .segments
+                .retain(|_, done| done.offset + done.len <= len.min(ngram_total));
+            if journal.segments.len() != before {
+                write_json(&journal_path, &journal)?;
+            }
             file.set_len(ngram_total)
                 .map_err(|e| io_err(&ngram_path, e))?;
         }
@@ -527,25 +552,13 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
                 )));
             }
             let offset = part as u64 * segment_len;
+            // Un segment journalisé est toujours rehaché (même sans --verify) :
+            // une corruption de même taille serait sinon invisible.
             if let Some(done) = journal.segments.get(&part) {
-                let intact = !options.verify || {
-                    let mut sha = Sha256::new();
-                    let mut buf = vec![0_u8; plan::IO_CHUNK];
-                    let mut at = 0_u64;
-                    while at < done.len {
-                        let take = (plan::IO_CHUNK as u64).min(done.len - at) as usize;
-                        std::os::unix::fs::FileExt::read_exact_at(
-                            &file,
-                            &mut buf[..take],
-                            offset + at,
-                        )
-                        .map_err(|e| io_err(&ngram_path, e))?;
-                        sha.update(&buf[..take]);
-                        at += take as u64;
-                    }
-                    hex(sha.finalize()) == done.sha256
-                };
-                if intact && done.offset == offset {
+                if done.offset == offset
+                    && done.len == segment_len
+                    && range_sha256(&file, &ngram_path, offset, done.len)? == done.sha256
+                {
                     resumed.push(unit);
                     continue;
                 }
@@ -566,7 +579,8 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
             &source,
             &inventory,
             &plans,
-            &journal,
+            &mut journal,
+            &journal_path,
             &src_config,
             &hash_params,
             &identity,
@@ -611,7 +625,7 @@ struct NgramMeta<'a> {
     weight_scale: f32,
     source_scale_tensor: &'a str,
     hash: &'a HashParams,
-    segments: Vec<&'a SegmentRecord>,
+    segments: Vec<SegmentRecord>,
     sha256: String,
 }
 
@@ -629,6 +643,36 @@ struct Manifest<'a> {
     tensors: Vec<&'a TensorRecord>,
 }
 
+/// sha256 du fichier n-gram en une passe, et segments dont l'empreinte
+/// diffère du journal.
+fn ngram_file_sha(path: &Path, segments: &[SegmentRecord]) -> Result<(String, Vec<usize>)> {
+    let file = File::open(path).map_err(|e| io_err(path, e))?;
+    let total = file.metadata().map_err(|e| io_err(path, e))?.len();
+    let expected: u64 = segments.iter().map(|s| s.len).sum();
+    if total != expected {
+        return Ok((String::new(), segments.iter().map(|s| s.part).collect()));
+    }
+    let mut whole = Sha256::new();
+    let mut corrupt = Vec::new();
+    let mut buf = vec![0_u8; plan::IO_CHUNK];
+    for segment in segments {
+        let mut sha = Sha256::new();
+        let mut at = 0_u64;
+        while at < segment.len {
+            let take = (plan::IO_CHUNK as u64).min(segment.len - at) as usize;
+            std::os::unix::fs::FileExt::read_exact_at(&file, &mut buf[..take], segment.offset + at)
+                .map_err(|e| io_err(path, e))?;
+            sha.update(&buf[..take]);
+            whole.update(&buf[..take]);
+            at += take as u64;
+        }
+        if hex(sha.finalize()) != segment.sha256 {
+            corrupt.push(segment.part);
+        }
+    }
+    Ok((hex(whole.finalize()), corrupt))
+}
+
 /// Validation finale puis écriture des métadonnées (config en dernier).
 #[expect(
     clippy::too_many_arguments,
@@ -639,7 +683,8 @@ fn finalize(
     source: &Source,
     inventory: &Inventory,
     plans: &[ShardPlan],
-    journal: &Journal,
+    journal: &mut Journal,
+    journal_path: &Path,
     src_config: &serde_json::Value,
     hash_params: &HashParams,
     identity: &Identity,
@@ -672,9 +717,13 @@ fn finalize(
         }
         let sha256 = file_sha256(&path)?;
         if sha256 != done.sha256 {
+            // L'unité corrompue sort du journal : une relance la réécrit.
+            let expected = done.sha256.clone();
+            journal.shards.remove(&unit);
+            write_json(journal_path, journal)?;
             return Err(InferError::Config(format!(
-                "{}: sha256 {sha256} ≠ journal {}",
-                plan.file, done.sha256
+                "{}: sha256 {sha256} ≠ journal {expected} ; unité invalidée, relancer la conversion",
+                plan.file
             )));
         }
         if plan.file != "mtp.safetensors" {
@@ -689,16 +738,26 @@ fn finalize(
         });
         records.extend(done.tensors.iter());
     }
-    let segments: Vec<&SegmentRecord> = (0..inventory.ngram.len())
+    let segments: Vec<SegmentRecord> = (0..inventory.ngram.len())
         .map(|part| {
             journal
                 .segments
                 .get(&part)
+                .cloned()
                 .ok_or_else(|| InferError::Config(format!("segment n-gram {part} non terminé")))
         })
         .collect::<Result<_>>()?;
     let ngram_path = dst.join(NGRAM_FILE);
-    let ngram_sha = file_sha256(&ngram_path)?;
+    let (ngram_sha, corrupt) = ngram_file_sha(&ngram_path, &segments)?;
+    if !corrupt.is_empty() {
+        for part in &corrupt {
+            journal.segments.remove(part);
+        }
+        write_json(journal_path, journal)?;
+        return Err(InferError::Config(format!(
+            "table n-gram: segments {corrupt:?} différents du journal ; invalidés, relancer la conversion"
+        )));
+    }
     let ngram_size = segments.iter().map(|s| s.len).sum::<u64>();
     files.push(OutputFile {
         name: NGRAM_FILE.to_string(),
