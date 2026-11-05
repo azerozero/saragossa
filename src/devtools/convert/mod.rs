@@ -478,7 +478,7 @@ fn check_done(path: &Path, size: u64, sha: &str, verify: bool) -> Result<bool> {
 /// erreur de lecture, de quantification ou d'écriture.
 pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
     let started = Instant::now();
-    let mut peak = PeakTracker::default();
+    let peak = PeakTracker::default();
     refuse_in_place(&options.src, &options.dst)?;
     let config_path = options.src.join("config.json");
     let src_config = read_json(&config_path)?;
@@ -512,7 +512,7 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
             units_resumed: Vec::new(),
             finalized: false,
             elapsed_s: started.elapsed().as_secs_f64(),
-            peak_footprint_bytes: peak.peak_bytes,
+            peak_footprint_bytes: peak.peak(),
             bytes_by_category: BTreeMap::new(),
             files: Vec::new(),
         });
@@ -592,7 +592,7 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
             .open(&tmp)
             .map_err(|e| io_err(&tmp, e))?;
         file.set_len(size).map_err(|e| io_err(&tmp, e))?;
-        let tensors = write_shard(&source, &inventory, plan, &file, &tmp, &mut peak)?;
+        let tensors = write_shard(&source, &inventory, plan, &file, &tmp, &peak)?;
         file.sync_all().map_err(|e| io_err(&tmp, e))?;
         drop(file);
         std::fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))?;
@@ -707,7 +707,7 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
         units_resumed: resumed,
         finalized,
         elapsed_s: started.elapsed().as_secs_f64(),
-        peak_footprint_bytes: peak.peak_bytes,
+        peak_footprint_bytes: peak.peak(),
         output_bytes,
         bytes_by_category,
         files,

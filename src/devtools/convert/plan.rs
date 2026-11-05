@@ -872,17 +872,23 @@ fn dequantize_expert(source: &Source, expert: &ExpertSrc) -> Result<Vec<f32>> {
     Ok(values)
 }
 
-/// Suivi du pic de mémoire (empreinte physique du processus).
+/// Suivi du pic de mémoire (empreinte physique du processus), échantillonné
+/// aussi depuis les tâches rayon, blocs encore vivants.
 #[derive(Default)]
 pub(crate) struct PeakTracker {
-    pub(crate) peak_bytes: u64,
+    peak_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl PeakTracker {
-    pub(crate) fn sample(&mut self) {
+    pub(crate) fn sample(&self) {
         if let Some(bytes) = crate::memory_guard::process_footprint_bytes() {
-            self.peak_bytes = self.peak_bytes.max(bytes);
+            self.peak_bytes
+                .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -898,7 +904,7 @@ pub(crate) fn write_shard(
     plan: &ShardPlan,
     file: &File,
     path: &Path,
-    peak: &mut PeakTracker,
+    peak: &PeakTracker,
 ) -> Result<Vec<TensorRecord>> {
     let (header, offsets) = build_header(plan)?;
     file.write_all_at(&header, 0)
@@ -970,6 +976,8 @@ pub(crate) fn write_shard(
                     let bytes = source.read(src, row * cols * 2, take * cols * 2)?;
                     let data = bytes_to_dense_f32(&bytes, src.dtype, &src.name)?;
                     let block = quantize_block(&data, cols, *bits)?;
+                    // Source et sortie du bloc encore vivantes : pic réel du bloc.
+                    peak.sample();
                     weight.write(bytemuck::cast_slice(&block.packed))?;
                     scales.write(bytemuck::cast_slice(&block.scales))?;
                     biases.write(bytemuck::cast_slice(&block.biases))?;
@@ -1010,7 +1018,9 @@ pub(crate) fn write_shard(
                         .par_iter()
                         .map(|expert| {
                             let values = dequantize_expert(source, expert)?;
-                            quantize_block(&values, cols, EXPERT_BITS)
+                            let block = quantize_block(&values, cols, EXPERT_BITS)?;
+                            peak.sample();
+                            Ok(block)
                         })
                         .collect::<Result<_>>()?;
                     for block in blocks {
