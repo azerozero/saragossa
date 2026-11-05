@@ -1556,23 +1556,28 @@ fn rows_exact_rms_prologue_u8_body() -> Result<()> {
     Ok(())
 }
 
-/// Le mode strict engage bien le qmv-T (variantes device, threadgroup S = 8 et
-/// S = 16 ; device seule à 16 lignes) sur les lots de 3 à 16 lignes, et pas sur
-/// les paires (qmm2). Chaque ligne du lot rend les bits du qmv mono.
+/// Mode strict, matmuls u4 gs64 isolés : chaque lot de 2 à 16 lignes, puis 17
+/// et 32, rend en bits les lignes du qmv mono, sur les trois variantes du
+/// qmv-T (device 1024×5120, threadgroup S = 8 en 5120×17408, S = 16 en
+/// 65536×2048 ; R = 15 au plafond threadgroup, R = 16 en device seule). Le
+/// qmv-T s'engage de 3 à 16 lignes quand le mono prend le qmv rapide
+/// (`SARAGOSSA_RUST_QMV_FAST`), jamais sur les paires (qmm2) ni au-delà de 16
+/// lignes (qmv répliqué : ni skinny ni GEMM NA en strict).
 #[test]
 #[ignore = "oracle GPU en bits : lancer avec --ignored"]
 fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
     let executor = rows_exact_executor()?;
+    let max_rows = 32usize;
     for (out_dim, in_dim) in [(1024usize, 5120usize), (5120, 17408), (65536, 2048)] {
         let buffers = executor.resolve_linear_weight_buffers(
             &LinearWeight::AffineQuantized(test_affine_random_u4(out_dim, in_dim, 21)?),
             "rexact_qmvt",
         )?;
-        let x = rows_exact_lhs(16, in_dim, 3, 1.0);
+        let x = rows_exact_lhs(max_rows, in_dim, 3, 1.0);
         let lhs = executor.buffer_from_slice(&x, "rexact_qmvt_lhs")?;
-        let out = executor.uncached_f32_buffer(16 * out_dim, "rexact_qmvt_out")?;
-        let mut mono = Vec::with_capacity(16 * out_dim);
-        for r in 0..16 {
+        let out = executor.uncached_f32_buffer(max_rows * out_dim, "rexact_qmvt_out")?;
+        let mut mono = Vec::with_capacity(max_rows * out_dim);
+        for r in 0..max_rows {
             let xr = executor.buffer_from_slice(&x[r * in_dim..(r + 1) * in_dim], "rexact_qmvt_x1")?;
             let o = executor.uncached_f32_buffer(out_dim, "rexact_qmvt_o1")?;
             rows_exact_cb(&executor, |enc| {
@@ -1582,7 +1587,8 @@ fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
             })?;
             mono.extend(read_f32_buffer(&o, out_dim)?);
         }
-        for rows in [2usize, 3, 9, 16] {
+        let fast = super::flags::fast_affine_qmv_enabled(out_dim);
+        for rows in (2..=16).chain([17, 32]) {
             let count = || super::matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get);
             let before = count();
             let _greedy = install_verify_greedy_scope(true);
@@ -1596,7 +1602,7 @@ fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
             let engaged = count() > before;
             assert_eq!(
                 engaged,
-                (3..=16).contains(&rows),
+                fast && (3..=16).contains(&rows),
                 "qmv-T {out_dim}x{in_dim} R={rows} : engagé = {engaged}"
             );
             assert_eq!(
@@ -1606,9 +1612,70 @@ fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
                     "qmv-T"
                 ),
                 0,
-                "qmv-T {out_dim}x{in_dim} R={rows} : lot ≠ mono"
+                "strict {out_dim}x{in_dim} R={rows} : lot ≠ mono"
             );
         }
+    }
+    Ok(())
+}
+
+/// Mode strict, matmuls enchaînés dans un même encodeur : deux projections
+/// 5120×5120 (même scratch device `xt`/`sum`, réécrit par le second prep après
+/// lecture par le premier qmv-T), puis down 5120×17408 en threadgroup ; chaque
+/// ligne du lot égale la même chaîne en mono, en bits.
+#[test]
+#[ignore = "oracle GPU en bits : lancer avec --ignored"]
+fn rows_exact_qmvt_chained_in_one_encoder() -> Result<()> {
+    let executor = rows_exact_executor()?;
+    let hidden = 5120usize;
+    let inter = 17408usize;
+    let resolve = |out_dim: usize, in_dim: usize, seed: u64| {
+        executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(test_affine_random_u4(out_dim, in_dim, seed)?),
+            "rexact_qmvt_chain",
+        )
+    };
+    let (first, second, up, down) = (
+        resolve(hidden, hidden, 31)?,
+        resolve(hidden, hidden, 32)?,
+        resolve(inter, hidden, 33)?,
+        resolve(hidden, inter, 34)?,
+    );
+    let chain = |rows: usize, x: &[f32]| -> Result<Vec<f32>> {
+        let lhs = executor.buffer_from_slice(x, "rexact_chain_x")?;
+        let a = executor.uncached_f32_buffer(rows * hidden, "rexact_chain_a")?;
+        let b = executor.uncached_f32_buffer(rows * hidden, "rexact_chain_b")?;
+        let c = executor.uncached_f32_buffer(rows * inter, "rexact_chain_c")?;
+        let d = executor.uncached_f32_buffer(rows * hidden, "rexact_chain_d")?;
+        rows_exact_cb(&executor, |enc| {
+            executor.encode_matmul_weight_buffers(enc, &lhs, rows, hidden, &first, &a, false)?;
+            executor.encode_matmul_weight_buffers(enc, &a, rows, hidden, &second, &b, false)?;
+            executor.encode_matmul_weight_buffers(enc, &b, rows, hidden, &up, &c, false)?;
+            executor
+                .encode_matmul_weight_buffers(enc, &c, rows, inter, &down, &d, false)
+                .map(|_| ())
+        })?;
+        read_f32_buffer(&d, rows * hidden)
+    };
+    let x = rows_exact_lhs(16, hidden, 5, 1.0);
+    let mut mono = Vec::with_capacity(16 * hidden);
+    for r in 0..16 {
+        mono.extend(chain(1, &x[r * hidden..(r + 1) * hidden])?);
+    }
+    for rows in [3usize, 9, 15, 16] {
+        let before = super::matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get);
+        let _greedy = install_verify_greedy_scope(true);
+        let got = with_verify_strict_override(true, || chain(rows, &x[..rows * hidden]))?;
+        assert_eq!(
+            super::matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get) - before,
+            4,
+            "chaîne R={rows} : quatre qmv-T attendus"
+        );
+        assert_eq!(
+            rows_exact_ndiff(&mono[..rows * hidden], &got, "chaîne qmv-T"),
+            0,
+            "chaîne strict R={rows} : lot ≠ mono"
+        );
     }
     Ok(())
 }

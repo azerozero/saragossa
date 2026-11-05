@@ -5169,7 +5169,9 @@ fn greedy_identity_states_real_model() -> Result<()> {
             modes.push("mtp");
         }
         if draft.is_some() {
-            modes.extend(["dflash-chaîne", "dflash-arbre"]);
+            // `dflash-défaut` : entrée publique, arbre choisi par l'environnement
+            // (B = 3 en mode strict greedy, B = 8 sinon, sauf `SARAGOSSA_RUST_DFLASH_TREE`).
+            modes.extend(["dflash-chaîne", "dflash-arbre", "dflash-défaut"]);
         }
         // Sélection explicite (`SARAGOSSA_RUST_IDENTITY_MODES`, virgules) : un mode
         // demandé mais indisponible (sidecar ou drafter absent) fait échouer.
@@ -5198,6 +5200,21 @@ fn greedy_identity_states_real_model() -> Result<()> {
                         |_| true,
                     )
                     .map(|output| output.tokens),
+                "dflash-défaut" => {
+                    let draft = draft
+                        .as_ref()
+                        .ok_or_else(|| InferError::Config("drafter".into()))?;
+                    model
+                        .generate_greedy_dflash_resident_streaming_with_options(
+                            &prompt,
+                            max_new,
+                            &options,
+                            draft,
+                            draft.info.block_size,
+                            |_| true,
+                        )
+                        .map(|output| output.tokens)
+                }
                 _ => {
                     let draft = draft
                         .as_ref()
@@ -5263,7 +5280,7 @@ fn greedy_identity_states_real_model() -> Result<()> {
                 "{mode}: aucune ligne d'un lot de plusieurs lignes comparée"
             ));
         }
-        if *mode == "dflash-arbre" && *branched == 0 {
+        if matches!(*mode, "dflash-arbre" | "dflash-défaut") && *branched == 0 {
             failures.push(format!("{mode}: aucun arbre branché vérifié"));
         }
     }
