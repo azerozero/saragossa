@@ -183,7 +183,8 @@ pub(super) fn can_use_fast_affine_qmm8(
 /// identiques (DFlash et MTP+lookup, prompts code et prose 4k, 400 tokens, deux
 /// essais). Mesuré le 2026-10-31 (M5 Max, code 4k) : vérification à 8 lignes de
 /// 66-72 à 61-62 ms, à 16 lignes de 94-96 à 89-90 ms.
-/// `SARAGOSSA_RUST_QMM_SKINNY=0` rétablit le qmv répliqué.
+/// `SARAGOSSA_RUST_QMM_SKINNY=0` rétablit le qmv répliqué. Exclu en vérification
+/// greedy stricte, où il n'est pas exact.
 pub(super) fn can_use_qmm_skinny_buffers(
     batch: usize,
     in_dim: usize,
@@ -192,6 +193,7 @@ pub(super) fn can_use_qmm_skinny_buffers(
     bits: usize,
 ) -> bool {
     qmm_skinny_enabled()
+        && !super::verify_strict_active()
         && fast_affine_qmv_enabled(out_dim)
         && batch >= qmm_skinny_min_batch()
         && batch < qmm_na_min_batch()
@@ -202,7 +204,8 @@ pub(super) fn can_use_qmm_skinny_buffers(
 }
 
 /// Largeur maximale servie par le qmv-T (instances `r3` à `r16` de
-/// `kernels.metal`) ; au-delà, le mode strict garde le qmv répliqué, exact aussi.
+/// `kernels.metal`, `r16` en variante device seule) ; au-delà, le mode strict
+/// exclut le skinny et garde le qmv répliqué, exact aussi.
 pub(super) const QMVT_MAX_BATCH: usize = 16;
 
 /// qmv-T u4 gs64 exact (`affine_qmvt_*`) : en vérification greedy stricte

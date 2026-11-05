@@ -11086,4 +11086,6 @@ kernel void affine_qmvt_tg_u4_gs64_f32(
     device const bfloat*, device float*, constant uint4&, uint, uint, uint, uint2);
 #define QMVT_ALL(R) QMVT_DEV(R) QMVT_TG(R, 8) QMVT_TG(R, 16)
 QMVT_ALL(3) QMVT_ALL(4) QMVT_ALL(5) QMVT_ALL(6) QMVT_ALL(7) QMVT_ALL(8) QMVT_ALL(9)
-QMVT_ALL(10) QMVT_ALL(11) QMVT_ALL(12) QMVT_ALL(13) QMVT_ALL(14) QMVT_ALL(15) QMVT_ALL(16)
+QMVT_ALL(10) QMVT_ALL(11) QMVT_ALL(12) QMVT_ALL(13) QMVT_ALL(14) QMVT_ALL(15)
+// R = 16 : variante device seule ; `txt` threadgroup (R × 2176 octets) dépasserait 32 Ko.
+QMVT_DEV(16)

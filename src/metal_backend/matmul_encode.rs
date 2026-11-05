@@ -89,6 +89,9 @@ impl MetalExecutor {
         const QMVT_DEVICE_MAX_IN_DIM: usize = 8192;
         /// À partir de cette largeur de sortie (lm_head), S = 16 et threadgroup.
         const QMVT_WIDE_OUT_DIM: usize = 65536;
+        /// Au-delà, `xt` en mémoire threadgroup (R × 2176 octets) dépasse 32 Ko :
+        /// variante device seule.
+        const QMVT_TG_MAX_BATCH: usize = 15;
         let dims = [
             checked_u32(out_dim, "qmvt out_dim")?,
             checked_u32(in_dim, "qmvt in_dim")?,
@@ -105,7 +108,9 @@ impl MetalExecutor {
         trace_dispatch_path("qmvt_u4_gs64_f32", batch, out_dim, in_dim);
         #[cfg(test)]
         QMVT_DISPATCHES.with(|count| count.set(count.get() + 1));
-        if in_dim <= QMVT_DEVICE_MAX_IN_DIM && out_dim < QMVT_WIDE_OUT_DIM {
+        if batch > QMVT_TG_MAX_BATCH
+            || (in_dim <= QMVT_DEVICE_MAX_IN_DIM && out_dim < QMVT_WIDE_OUT_DIM)
+        {
             let lanes = batch * in_dim / 16;
             let xt = self.scratch_buffer_with_options(
                 batch * in_dim,

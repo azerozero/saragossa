@@ -1557,8 +1557,8 @@ fn rows_exact_rms_prologue_u8_body() -> Result<()> {
 }
 
 /// Le mode strict engage bien le qmv-T (variantes device, threadgroup S = 8 et
-/// S = 16) sur les lots de 3 à 16 lignes, et pas sur les paires (qmm2). Les
-/// bits sont vérifiés par `rows_exact_matmul_formats`.
+/// S = 16 ; device seule à 16 lignes) sur les lots de 3 à 16 lignes, et pas sur
+/// les paires (qmm2). Chaque ligne du lot rend les bits du qmv mono.
 #[test]
 #[ignore = "oracle GPU en bits : lancer avec --ignored"]
 fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
@@ -1568,8 +1568,20 @@ fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
             &LinearWeight::AffineQuantized(test_affine_random_u4(out_dim, in_dim, 21)?),
             "rexact_qmvt",
         )?;
-        let lhs = executor.buffer_from_slice(&rows_exact_lhs(16, in_dim, 3, 1.0), "rexact_qmvt_lhs")?;
+        let x = rows_exact_lhs(16, in_dim, 3, 1.0);
+        let lhs = executor.buffer_from_slice(&x, "rexact_qmvt_lhs")?;
         let out = executor.uncached_f32_buffer(16 * out_dim, "rexact_qmvt_out")?;
+        let mut mono = Vec::with_capacity(16 * out_dim);
+        for r in 0..16 {
+            let xr = executor.buffer_from_slice(&x[r * in_dim..(r + 1) * in_dim], "rexact_qmvt_x1")?;
+            let o = executor.uncached_f32_buffer(out_dim, "rexact_qmvt_o1")?;
+            rows_exact_cb(&executor, |enc| {
+                executor
+                    .encode_matmul_weight_buffers(enc, &xr, 1, in_dim, &buffers, &o, false)
+                    .map(|_| ())
+            })?;
+            mono.extend(read_f32_buffer(&o, out_dim)?);
+        }
         for rows in [2usize, 3, 9, 16] {
             let count = || super::matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get);
             let before = count();
@@ -1586,6 +1598,15 @@ fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
                 engaged,
                 (3..=16).contains(&rows),
                 "qmv-T {out_dim}x{in_dim} R={rows} : engagé = {engaged}"
+            );
+            assert_eq!(
+                rows_exact_ndiff(
+                    &mono[..rows * out_dim],
+                    &read_f32_buffer(&out, rows * out_dim)?,
+                    "qmv-T"
+                ),
+                0,
+                "qmv-T {out_dim}x{in_dim} R={rows} : lot ≠ mono"
             );
         }
     }
