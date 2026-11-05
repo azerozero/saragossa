@@ -357,158 +357,220 @@ enum Expect {
     Int(Vec<usize>),
 }
 
-fn expected_tensors(c: &Qwen4ExpConfig) -> Vec<(String, Expect)> {
-    let (h, hc) = (c.hidden, c.hc_width());
-    let affine = |rows, cols| Expect::Affine {
+fn affine(rows: usize, cols: usize) -> Expect {
+    Expect::Affine {
         rows,
         cols,
         stack: None,
-    };
-    let mut out: Vec<(String, Expect)> = Vec::new();
-    let mut add = |name: String, e: Expect| out.push((name, e));
-    add(format!("{TRUNK}embed_tokens"), affine(c.vocab, h));
-    add(LM_HEAD.to_string(), affine(c.vocab, h));
-    let mixer = |add: &mut dyn FnMut(String, Expect), p: &str| {
-        add(format!("{p}hc_norm.weight"), Expect::Float(vec![hc]));
-        add(
-            format!("{p}input_mix_weight_down"),
-            affine(c.hc_lowrank, hc),
-        );
-        add(format!("{p}input_mix_weight_up"), affine(hc, c.hc_lowrank));
-    };
-    mixer(&mut add, &format!("{TRUNK}hyper_connection_mixer."));
+    }
+}
+
+/// Mixer d'hyper-connections (norme groupée, `W_down`, `W_up`) sous `p`.
+fn push_mixer(c: &Qwen4ExpConfig, p: &str, out: &mut Vec<(String, Expect)>) {
+    let hc = c.hc_width();
+    out.push((format!("{p}hc_norm.weight"), Expect::Float(vec![hc])));
+    out.push((
+        format!("{p}input_mix_weight_down"),
+        affine(c.hc_lowrank, hc),
+    ));
+    out.push((format!("{p}input_mix_weight_up"), affine(hc, c.hc_lowrank)));
+}
+
+/// Tenseurs d'une couche (tronc ou MTP) sous le préfixe `p`.
+fn push_layer(
+    c: &Qwen4ExpConfig,
+    p: &str,
+    kind: Qwen4ExpLayerKind,
+    with_ple: bool,
+    out: &mut Vec<(String, Expect)>,
+) {
+    let (h, hc) = (c.hidden, c.hc_width());
+    for hcn in ["attn_hyper_connection.", "mlp_hyper_connection."] {
+        push_mixer(c, &format!("{p}{hcn}"), out);
+        out.push((
+            format!("{p}{hcn}block_inject_weight.weight"),
+            Expect::Float(vec![c.hc_count, hc]),
+        ));
+    }
+    out.push((
+        format!("{p}mlp.gate.weight"),
+        Expect::Float(vec![c.experts, h]),
+    ));
+    out.push((
+        format!("{p}mlp.shared_expert_gate.weight"),
+        Expect::Float(vec![1, h]),
+    ));
+    out.push((
+        format!("{p}mlp.shared_expert.gate_proj"),
+        affine(c.shared_inter, h),
+    ));
+    out.push((
+        format!("{p}mlp.shared_expert.up_proj"),
+        affine(c.shared_inter, h),
+    ));
+    out.push((
+        format!("{p}mlp.shared_expert.down_proj"),
+        affine(h, c.shared_inter),
+    ));
+    for (proj, rows, cols) in [
+        ("gate_proj", c.moe_inter, h),
+        ("up_proj", c.moe_inter, h),
+        ("down_proj", h, c.moe_inter),
+    ] {
+        out.push((
+            format!("{p}mlp.switch_mlp.{proj}"),
+            Expect::Affine {
+                rows,
+                cols,
+                stack: Some(c.experts),
+            },
+        ));
+    }
     let key_dim = c.linear_key_heads * c.linear_key_dim;
     let value_dim = c.linear_value_heads * c.linear_value_dim;
-    for (layer, kind) in c.layer_kinds.iter().enumerate() {
-        let p = format!("{TRUNK}layers.{layer}.");
-        for hcn in ["attn_hyper_connection.", "mlp_hyper_connection."] {
-            mixer(&mut add, &format!("{p}{hcn}"));
-            add(
-                format!("{p}{hcn}block_inject_weight.weight"),
-                Expect::Float(vec![c.hc_count, hc]),
-            );
+    match kind {
+        Qwen4ExpLayerKind::Linear => {
+            let l = format!("{p}linear_attn.");
+            let vh = c.linear_value_heads;
+            out.push((
+                format!("{l}in_proj_qkv"),
+                affine(2 * key_dim + value_dim, h),
+            ));
+            out.push((format!("{l}in_proj_z"), affine(value_dim, h)));
+            out.push((format!("{l}out_proj"), affine(h, value_dim)));
+            out.push((format!("{l}in_proj_a.weight"), Expect::Float(vec![vh, h])));
+            out.push((format!("{l}in_proj_b.weight"), Expect::Float(vec![vh, h])));
+            out.push((
+                format!("{l}conv1d.weight"),
+                Expect::Float(vec![2 * key_dim + value_dim, 1, c.conv_kernel]),
+            ));
+            out.push((format!("{l}A_log"), Expect::Float(vec![vh])));
+            out.push((format!("{l}dt_bias"), Expect::Float(vec![vh])));
+            out.push((
+                format!("{l}norm.weight"),
+                Expect::Float(vec![c.linear_value_dim]),
+            ));
         }
-        add(
-            format!("{p}mlp.gate.weight"),
-            Expect::Float(vec![c.experts, h]),
-        );
-        add(
-            format!("{p}mlp.shared_expert_gate.weight"),
-            Expect::Float(vec![1, h]),
-        );
-        add(
-            format!("{p}mlp.shared_expert.gate_proj"),
-            affine(c.shared_inter, h),
-        );
-        add(
-            format!("{p}mlp.shared_expert.up_proj"),
-            affine(c.shared_inter, h),
-        );
-        add(
-            format!("{p}mlp.shared_expert.down_proj"),
-            affine(h, c.shared_inter),
-        );
-        for (proj, rows, cols) in [
-            ("gate_proj", c.moe_inter, h),
-            ("up_proj", c.moe_inter, h),
-            ("down_proj", h, c.moe_inter),
-        ] {
-            add(
-                format!("{p}mlp.switch_mlp.{proj}"),
-                Expect::Affine {
-                    rows,
-                    cols,
-                    stack: Some(c.experts),
-                },
-            );
-        }
-        match kind {
-            Qwen4ExpLayerKind::Linear => {
-                let l = format!("{p}linear_attn.");
-                add(
-                    format!("{l}in_proj_qkv"),
-                    affine(2 * key_dim + value_dim, h),
-                );
-                add(format!("{l}in_proj_z"), affine(value_dim, h));
-                add(format!("{l}out_proj"), affine(h, value_dim));
-                add(
-                    format!("{l}in_proj_a.weight"),
-                    Expect::Float(vec![c.linear_value_heads, h]),
-                );
-                add(
-                    format!("{l}in_proj_b.weight"),
-                    Expect::Float(vec![c.linear_value_heads, h]),
-                );
-                add(
-                    format!("{l}conv1d.weight"),
-                    Expect::Float(vec![2 * key_dim + value_dim, 1, c.conv_kernel]),
-                );
-                add(
-                    format!("{l}A_log"),
-                    Expect::Float(vec![c.linear_value_heads]),
-                );
-                add(
-                    format!("{l}dt_bias"),
-                    Expect::Float(vec![c.linear_value_heads]),
-                );
-                add(
-                    format!("{l}norm.weight"),
-                    Expect::Float(vec![c.linear_value_dim]),
-                );
-            }
-            Qwen4ExpLayerKind::Full => {
-                let a = format!("{p}self_attn.");
-                add(format!("{a}q_proj"), affine(2 * c.heads * c.head_dim, h));
-                add(format!("{a}k_proj"), affine(c.kv_heads * c.head_dim, h));
-                add(format!("{a}v_proj"), affine(c.kv_heads * c.head_dim, h));
-                add(format!("{a}o_proj"), affine(h, c.heads * c.head_dim));
-                add(format!("{a}q_norm.weight"), Expect::Float(vec![c.head_dim]));
-                add(format!("{a}k_norm.weight"), Expect::Float(vec![c.head_dim]));
-                add(
-                    format!("{a}indexer.index_qk_proj"),
-                    affine((c.indexer_heads + 1) * c.indexer_head_dim, h),
-                );
-                add(
-                    format!("{a}indexer.q_layernorm.weight"),
-                    Expect::Float(vec![c.indexer_head_dim]),
-                );
-                add(
-                    format!("{a}indexer.k_layernorm.weight"),
-                    Expect::Float(vec![c.indexer_head_dim]),
-                );
-            }
-        }
-        if layer == c.ple_layer {
-            let e = format!("{p}ple.");
-            add(format!("{e}key_proj"), affine(hc, c.ple_dim));
-            add(format!("{e}value_proj"), affine(h, c.ple_dim));
-            for norm in ["norm_conv", "norm_key", "norm_query"] {
-                add(format!("{e}{norm}.weight"), Expect::Float(vec![hc]));
-            }
-            add(
-                format!("{e}conv1d.weight"),
-                Expect::Float(vec![hc, 1, c.ple_conv_kernel]),
-            );
-            let heads = c.ngram_heads();
-            add(
-                format!("{e}ple_embedding.layer_multipliers"),
-                Expect::Int(vec![c.ngram_size]),
-            );
-            add(
-                format!("{e}ple_embedding.ngram_heads_vocab_sizes"),
-                Expect::Int(vec![heads]),
-            );
-            add(
-                format!("{e}ple_embedding.ngram_heads_offsets"),
-                Expect::Int(vec![heads]),
-            );
-            add(
-                format!("{e}ple_embedding.ngram_embedding.weight_scale"),
-                Expect::Float(vec![1]),
-            );
+        Qwen4ExpLayerKind::Full => {
+            let a = format!("{p}self_attn.");
+            let ihd = c.indexer_head_dim;
+            out.push((format!("{a}q_proj"), affine(2 * c.heads * c.head_dim, h)));
+            out.push((format!("{a}k_proj"), affine(c.kv_heads * c.head_dim, h)));
+            out.push((format!("{a}v_proj"), affine(c.kv_heads * c.head_dim, h)));
+            out.push((format!("{a}o_proj"), affine(h, c.heads * c.head_dim)));
+            out.push((format!("{a}q_norm.weight"), Expect::Float(vec![c.head_dim])));
+            out.push((format!("{a}k_norm.weight"), Expect::Float(vec![c.head_dim])));
+            out.push((
+                format!("{a}indexer.index_qk_proj"),
+                affine((c.indexer_heads + 1) * ihd, h),
+            ));
+            out.push((
+                format!("{a}indexer.q_layernorm.weight"),
+                Expect::Float(vec![ihd]),
+            ));
+            out.push((
+                format!("{a}indexer.k_layernorm.weight"),
+                Expect::Float(vec![ihd]),
+            ));
         }
     }
+    if with_ple {
+        let e = format!("{p}ple.");
+        let heads = c.ngram_heads();
+        out.push((format!("{e}key_proj"), affine(hc, c.ple_dim)));
+        out.push((format!("{e}value_proj"), affine(h, c.ple_dim)));
+        for norm in ["norm_conv", "norm_key", "norm_query"] {
+            out.push((format!("{e}{norm}.weight"), Expect::Float(vec![hc])));
+        }
+        out.push((
+            format!("{e}conv1d.weight"),
+            Expect::Float(vec![hc, 1, c.ple_conv_kernel]),
+        ));
+        let pe = format!("{e}ple_embedding.");
+        out.push((
+            format!("{pe}layer_multipliers"),
+            Expect::Int(vec![c.ngram_size]),
+        ));
+        out.push((
+            format!("{pe}ngram_heads_vocab_sizes"),
+            Expect::Int(vec![heads]),
+        ));
+        out.push((format!("{pe}ngram_heads_offsets"), Expect::Int(vec![heads])));
+        out.push((
+            format!("{pe}ngram_embedding.weight_scale"),
+            Expect::Float(vec![1]),
+        ));
+    }
+}
+
+/// Inventaire attendu du tronc (shards indexés).
+fn expected_tensors(c: &Qwen4ExpConfig) -> Vec<(String, Expect)> {
+    let mut out = vec![
+        (format!("{TRUNK}embed_tokens"), affine(c.vocab, c.hidden)),
+        (LM_HEAD.to_string(), affine(c.vocab, c.hidden)),
+    ];
+    push_mixer(c, &format!("{TRUNK}hyper_connection_mixer."), &mut out);
+    for (layer, kind) in c.layer_kinds.iter().enumerate() {
+        push_layer(
+            c,
+            &format!("{TRUNK}layers.{layer}."),
+            *kind,
+            layer == c.ple_layer,
+            &mut out,
+        );
+    }
     out
+}
+
+/// Inventaire attendu du sidecar `mtp.safetensors` (une couche QSA + MoE).
+fn expected_mtp_tensors(c: &Qwen4ExpConfig) -> Vec<(String, Expect)> {
+    let (h, hc) = (c.hidden, c.hc_width());
+    let mut out = vec![
+        ("mtp.fc_embedding".to_string(), affine(h, h)),
+        ("mtp.fc_hidden".to_string(), affine(h, h)),
+        (
+            "mtp.pre_fc_norm_embedding.weight".to_string(),
+            Expect::Float(vec![h]),
+        ),
+        (
+            "mtp.pre_fc_norm_hidden.weight".to_string(),
+            Expect::Float(vec![hc]),
+        ),
+    ];
+    push_mixer(c, "mtp.hyper_connection_mixer.", &mut out);
+    push_layer(c, "mtp.layers.0.", Qwen4ExpLayerKind::Full, false, &mut out);
+    out
+}
+
+/// Indexe les tenseurs d'un shard après contrôle physique : dtype connu,
+/// longueur = produit(forme) × taille, plage dans le fichier.
+fn index_shard(
+    header: &ShardHeader,
+    file_len: u64,
+    shard: usize,
+    entries: &mut HashMap<String, (usize, ShardTensorEntry)>,
+) -> Result<()> {
+    for (tensor, entry) in &header.tensors {
+        let size = dtype_size(entry.dtype)
+            .ok_or_else(|| cfg_err(format!("{tensor}: dtype {:?} inattendu", entry.dtype)))?;
+        let expected = entry
+            .shape
+            .iter()
+            .try_fold(size, |acc, d| acc.checked_mul(*d))
+            .ok_or_else(|| cfg_err(format!("{tensor}: forme trop grande")))?;
+        let [start, end] = entry.data_offsets;
+        let physical = header.data_start.checked_add(end as u64);
+        if end.checked_sub(start) != Some(expected) || physical.is_none_or(|p| p > file_len) {
+            return Err(cfg_err(format!("{tensor}: plage incohérente")));
+        }
+        if entries
+            .insert(tensor.clone(), (shard, entry.clone()))
+            .is_some()
+        {
+            return Err(cfg_err(format!("{tensor}: doublon")));
+        }
+    }
+    Ok(())
 }
 
 fn dtype_size(dtype: Dtype) -> Option<usize> {
@@ -573,25 +635,12 @@ impl Qwen4ExpCheckpoint {
             let header = read_shard_header(&path)?;
             let file = File::open(&path).map_err(|e| io(&path, e))?;
             let len = file.metadata().map_err(|e| io(&path, e))?.len();
-            for (tensor, entry) in &header.tensors {
+            for tensor in header.tensors.keys() {
                 if weight_map.get(tensor).and_then(|v| v.as_str()) != Some(name.as_str()) {
                     return Err(cfg_err(format!("{tensor}: index et en-tête divergent")));
                 }
-                let size = dtype_size(entry.dtype).ok_or_else(|| {
-                    cfg_err(format!("{tensor}: dtype {:?} inattendu", entry.dtype))
-                })?;
-                let expected = entry
-                    .shape
-                    .iter()
-                    .try_fold(size, |acc, d| acc.checked_mul(*d))
-                    .ok_or_else(|| cfg_err(format!("{tensor}: forme trop grande")))?;
-                let [start, end] = entry.data_offsets;
-                let physical = header.data_start.checked_add(end as u64);
-                if end.checked_sub(start) != Some(expected) || physical.is_none_or(|p| p > len) {
-                    return Err(cfg_err(format!("{tensor}: plage incohérente")));
-                }
-                entries.insert(tensor.clone(), (shard_index, entry.clone()));
             }
+            index_shard(&header, len, shard_index, &mut entries)?;
             shards.push(header);
             files.push(file);
         }
@@ -663,8 +712,33 @@ impl Qwen4ExpCheckpoint {
     }
 
     fn validate_inventory(&self) -> Result<()> {
+        self.validate_entries(&self.index, &expected_tensors(&self.config))
+    }
+
+    /// Vérifie que `index` contient exactement `expected` (formes, dtypes, triplets).
+    fn validate_entries(
+        &self,
+        index: &HashMap<String, (usize, ShardTensorEntry)>,
+        expected: &[(String, Expect)],
+    ) -> Result<()> {
+        let entry = |name: &str| {
+            index
+                .get(name)
+                .map(|(_, e)| e)
+                .ok_or_else(|| InferError::MissingWeight(name.to_string()))
+        };
+        let expect_entry = |name: &str, dtype: Dtype, shape: &[usize]| -> Result<()> {
+            let e = entry(name)?;
+            if e.dtype != dtype || e.shape != shape {
+                return Err(cfg_err(format!(
+                    "{name}: {:?} {:?}, attendu {dtype:?} {shape:?}",
+                    e.dtype, e.shape
+                )));
+            }
+            Ok(())
+        };
         let mut seen = BTreeSet::new();
-        for (name, expect) in expected_tensors(&self.config) {
+        for (name, expect) in expected.iter().cloned() {
             match expect {
                 Expect::Affine { rows, cols, stack } => {
                     let bits = self.bits_of(&name);
@@ -678,19 +752,19 @@ impl Qwen4ExpCheckpoint {
                         s.extend([rows, last]);
                         s
                     };
-                    self.expect_entry(
+                    expect_entry(
                         &format!("{name}.weight"),
                         Dtype::U32,
                         &shape(cols * bits / 32),
                     )?;
-                    self.expect_entry(&format!("{name}.scales"), Dtype::BF16, &shape(groups))?;
-                    self.expect_entry(&format!("{name}.biases"), Dtype::BF16, &shape(groups))?;
+                    expect_entry(&format!("{name}.scales"), Dtype::BF16, &shape(groups))?;
+                    expect_entry(&format!("{name}.biases"), Dtype::BF16, &shape(groups))?;
                     for suffix in [".weight", ".scales", ".biases"] {
                         seen.insert(format!("{name}{suffix}"));
                     }
                 }
                 Expect::Float(shape) => {
-                    let (_, entry) = self.entry(&name)?;
+                    let entry = entry(&name)?;
                     if !matches!(entry.dtype, Dtype::BF16 | Dtype::F32 | Dtype::F16)
                         || entry.shape != shape
                     {
@@ -702,24 +776,13 @@ impl Qwen4ExpCheckpoint {
                     seen.insert(name);
                 }
                 Expect::Int(shape) => {
-                    self.expect_entry(&name, Dtype::I64, &shape)?;
+                    expect_entry(&name, Dtype::I64, &shape)?;
                     seen.insert(name);
                 }
             }
         }
-        if let Some(extra) = self.index.keys().find(|name| !seen.contains(*name)) {
+        if let Some(extra) = index.keys().find(|name| !seen.contains(*name)) {
             return Err(cfg_err(format!("tenseur inattendu: {extra}")));
-        }
-        Ok(())
-    }
-
-    fn expect_entry(&self, name: &str, dtype: Dtype, shape: &[usize]) -> Result<()> {
-        let (_, entry) = self.entry(name)?;
-        if entry.dtype != dtype || entry.shape != shape {
-            return Err(cfg_err(format!(
-                "{name}: {:?} {:?}, attendu {dtype:?} {shape:?}",
-                entry.dtype, entry.shape
-            )));
         }
         Ok(())
     }
@@ -760,30 +823,16 @@ impl Qwen4ExpCheckpoint {
         })
     }
 
+    /// Inventaire complet du sidecar MTP sur métadonnées seules (formes,
+    /// dtypes, triplets, plages physiques), sans lire les valeurs.
     fn validate_mtp_metadata(&self) -> Result<()> {
         let path = self.dir.join("mtp.safetensors");
         let header = read_shard_header(&path)?;
-        let c = &self.config;
-        for proj in ["gate_proj", "up_proj", "down_proj"] {
-            let name = format!("mtp.layers.0.mlp.switch_mlp.{proj}.weight");
-            let entry = header
-                .tensors
-                .get(&name)
-                .ok_or_else(|| cfg_err(format!("MTP: {name} absent")))?;
-            if entry.shape.first() != Some(&c.experts) {
-                return Err(cfg_err(format!("MTP: {name} forme {:?}", entry.shape)));
-            }
-        }
-        for name in [
-            "mtp.fc_embedding.weight",
-            "mtp.fc_hidden.weight",
-            "mtp.pre_fc_norm_hidden.weight",
-        ] {
-            if !header.tensors.contains_key(name) {
-                return Err(cfg_err(format!("MTP: {name} absent")));
-            }
-        }
-        Ok(())
+        let len = std::fs::metadata(&path).map_err(|e| io(&path, e))?.len();
+        let mut index = HashMap::new();
+        index_shard(&header, len, 0, &mut index)?;
+        self.validate_entries(&index, &expected_mtp_tensors(&self.config))
+            .map_err(|e| cfg_err(format!("MTP: {e}")))
     }
 
     fn entry(&self, name: &str) -> Result<(usize, &ShardTensorEntry)> {
@@ -1017,5 +1066,102 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("group_size 0 accepté"));
         assert!(error.to_string().contains("group_size"), "{error}");
+    }
+
+    /// Écrit un safetensors minimal (données nulles) depuis un inventaire.
+    #[cfg(feature = "devtools")]
+    fn write_inventory(path: &Path, expected: &[(String, Expect)], group_size: usize, skip: &str) {
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_usize;
+        let mut push = |name: String, dtype: &str, shape: Vec<usize>, size: usize| {
+            if name == skip {
+                return;
+            }
+            let bytes = shape.iter().product::<usize>() * size;
+            header.insert(
+                name,
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes]}),
+            );
+            offset += bytes;
+        };
+        for (name, expect) in expected {
+            match expect {
+                Expect::Affine { rows, cols, stack } => {
+                    let lead: Vec<usize> = stack.iter().copied().collect();
+                    let shape = |last: usize| {
+                        let mut s = lead.clone();
+                        s.extend([*rows, last]);
+                        s
+                    };
+                    push(format!("{name}.weight"), "U32", shape(cols * 4 / 32), 4);
+                    push(
+                        format!("{name}.scales"),
+                        "BF16",
+                        shape(cols / group_size),
+                        2,
+                    );
+                    push(
+                        format!("{name}.biases"),
+                        "BF16",
+                        shape(cols / group_size),
+                        2,
+                    );
+                }
+                Expect::Float(shape) => push(name.clone(), "BF16", shape.clone(), 2),
+                Expect::Int(shape) => push(name.clone(), "I64", shape.clone(), 8),
+            }
+        }
+        let mut json = serde_json::to_vec(&header).expect("invariant: json");
+        while json.len() % 8 != 0 {
+            json.push(b' ');
+        }
+        let mut out = (json.len() as u64).to_le_bytes().to_vec();
+        out.extend(json);
+        out.resize(out.len() + offset, 0);
+        std::fs::write(path, out).expect("invariant: écriture");
+    }
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn mtp_sidecar_inventory_is_fully_validated() {
+        use crate::devtools::convert::{convert_qwen4exp, ConvertOptions};
+        let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+        convert_qwen4exp(&ConvertOptions {
+            src: Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4exp_mini/source"),
+            dst: dst.path().to_path_buf(),
+            source_revision: "fixture".to_string(),
+            source_repo: None,
+            converter_commit: None,
+            only: None,
+            verify: false,
+            plan_only: false,
+        })
+        .expect("invariant: conversion");
+        let config_path = dst.path().join("config.json");
+        let mut config = read_json(&config_path).expect("invariant: config");
+        config["text_config"]["mtp_num_hidden_layers"] = 1.into();
+        std::fs::write(&config_path, config.to_string()).expect("invariant: écriture");
+        let parsed = Qwen4ExpConfig::from_json(&config).expect("invariant: config MTP");
+        let mtp = dst.path().join("mtp.safetensors");
+        let expected = expected_mtp_tensors(&parsed);
+        write_inventory(&mtp, &expected, 64, "");
+        Qwen4ExpCheckpoint::open(dst.path()).expect("invariant: MTP complet accepté");
+
+        write_inventory(&mtp, &expected, 64, "mtp.layers.0.self_attn.o_proj.scales");
+        let error = Qwen4ExpCheckpoint::open(dst.path())
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains("MTP")),
+            "{error:?}"
+        );
+
+        write_inventory(&mtp, &expected, 64, "");
+        let bytes = std::fs::read(&mtp).expect("invariant: lecture");
+        std::fs::write(&mtp, &bytes[..bytes.len() - 16]).expect("invariant: troncature");
+        assert!(
+            Qwen4ExpCheckpoint::open(dst.path()).is_err(),
+            "MTP tronqué accepté"
+        );
     }
 }
