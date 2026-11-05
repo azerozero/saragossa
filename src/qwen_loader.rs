@@ -105,7 +105,7 @@ const FLINT_ATTENTION_LAYER_WEIGHTS: &[&str] = &[
     "self_attn.k_norm.weight",
 ];
 
-const FP8_SCALE_BLOCK: usize = 128;
+use crate::safetensor::FP8_SCALE_BLOCK;
 
 struct DecoderLoadContext<'a> {
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -730,10 +730,10 @@ struct TensorMeta {
 }
 
 #[derive(Debug)]
-struct ShardHeader {
-    path: PathBuf,
-    data_start: u64,
-    tensors: HashMap<String, ShardTensorEntry>,
+pub(crate) struct ShardHeader {
+    pub(crate) path: PathBuf,
+    pub(crate) data_start: u64,
+    pub(crate) tensors: HashMap<String, ShardTensorEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -743,10 +743,10 @@ struct TensorEntryRef {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ShardTensorEntry {
-    dtype: Dtype,
-    shape: Vec<usize>,
-    data_offsets: [usize; 2],
+pub(crate) struct ShardTensorEntry {
+    pub(crate) dtype: Dtype,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) data_offsets: [usize; 2],
 }
 
 fn load_decoder_tensors(
@@ -868,7 +868,7 @@ fn index_shard_entries(headers: &[ShardHeader]) -> Result<HashMap<String, Tensor
     Ok(entries)
 }
 
-fn read_shard_header(path: &Path) -> Result<ShardHeader> {
+pub(crate) fn read_shard_header(path: &Path) -> Result<ShardHeader> {
     let mut file = std::fs::File::open(path).map_err(|source| InferError::Io {
         path: path.to_path_buf(),
         source,

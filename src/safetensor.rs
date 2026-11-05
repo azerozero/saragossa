@@ -123,7 +123,13 @@ pub fn load_float_tensors_with_fp8_scale_inv(
             );
             if let Ok(scale_view) = tensors.tensor(&scale_key) {
                 let scales = bytes_to_dense_f32(scale_view.data(), scale_view.dtype(), &scale_key)?;
-                tensor = apply_fp8_scales(tensor, &scales, scale_view.shape(), &scale_key, 128)?;
+                tensor = apply_fp8_scales(
+                    tensor,
+                    &scales,
+                    scale_view.shape(),
+                    &scale_key,
+                    FP8_SCALE_BLOCK,
+                )?;
             }
         }
         out.insert(name.to_string(), tensor);
@@ -172,13 +178,50 @@ fn apply_fp8_scales(
     scale_key: &str,
     block: usize,
 ) -> Result<Tensor> {
-    if scales.len() == 1 {
-        let scale = scales
-            .first()
-            .ok_or_else(|| InferError::Shape(format!("scale FP8 {scale_key} vide")))?;
-        return Ok(tensor.map(|value| value * *scale));
+    let shape = tensor.shape().to_vec();
+    let mut data = tensor.into_data();
+    apply_fp8_block_scales_in_place(&mut data, &shape, scales, scale_shape, scale_key, block)?;
+    Tensor::from_vec(shape, data)
+}
+
+/// Taille de bloc des échelles FP8 « fine-grained » (blocs `128×128`).
+pub(crate) const FP8_SCALE_BLOCK: usize = 128;
+
+/// Applique en place les échelles FP8 d'un poids déjà décodé.
+///
+/// Une échelle unique (`[1]` ou `[]`) multiplie tout le tenseur ; sinon le poids
+/// est une matrice `[rows, cols]` et `scale_shape` vaut exactement
+/// `[ceil(rows/block), ceil(cols/block)]` (blocs partiels en bord inclus). Le
+/// fichier stocke `weight_scale_inv` déjà inversée : `w = e4m3 · scale`.
+///
+/// # Errors
+///
+/// Renvoie une erreur si la forme de l'échelle ne correspond pas au poids ou si
+/// une échelle n'est pas finie.
+pub(crate) fn apply_fp8_block_scales_in_place(
+    values: &mut [f32],
+    shape: &[usize],
+    scales: &[f32],
+    scale_shape: &[usize],
+    scale_key: &str,
+    block: usize,
+) -> Result<()> {
+    if let Some(bad) = scales.iter().find(|scale| !scale.is_finite()) {
+        return Err(InferError::Config(format!(
+            "scale FP8 {scale_key} non finie: {bad}"
+        )));
     }
-    let (rows, cols) = tensor.as_matrix()?;
+    if scales.len() == 1 {
+        let scale = scales[0];
+        values.iter_mut().for_each(|value| *value *= scale);
+        return Ok(());
+    }
+    let [rows, cols] = shape else {
+        return Err(InferError::Dimension(format!(
+            "poids FP8 à blocs attendu rang 2, reçu {shape:?} ({scale_key})"
+        )));
+    };
+    let (rows, cols) = (*rows, *cols);
     let [scale_rows, scale_cols] = scale_shape else {
         return Err(InferError::Dimension(format!(
             "scale FP8 {scale_key} attendu rang 2, reçu {scale_shape:?}"
@@ -191,21 +234,20 @@ fn apply_fp8_scales(
             "scale FP8 {scale_key} attendu [{expected_rows},{expected_cols}], reçu {scale_shape:?}"
         )));
     }
-    if scales.len() != scale_rows * scale_cols {
+    if scales.len() != scale_rows * scale_cols || values.len() != rows * cols {
         return Err(InferError::Shape(format!(
-            "scale FP8 {scale_key} shape={scale_shape:?}, éléments={}",
-            scales.len()
+            "scale FP8 {scale_key} shape={scale_shape:?}, éléments={}, poids {}",
+            scales.len(),
+            values.len()
         )));
     }
-    let mut out = tensor.data().to_vec();
-    for row in 0..rows {
-        let scale_row = row / block;
-        for col in 0..cols {
-            let scale_col = col / block;
-            out[row * cols + col] *= scales[scale_row * scale_cols + scale_col];
+    for (row, out_row) in values.chunks_exact_mut(cols).enumerate() {
+        let scale_row = &scales[(row / block) * scale_cols..(row / block + 1) * scale_cols];
+        for (col, value) in out_row.iter_mut().enumerate() {
+            *value *= scale_row[col / block];
         }
     }
-    Tensor::from_vec(vec![rows, cols], out)
+    Ok(())
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
@@ -295,26 +337,56 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 }
 
 fn bytes_to_f8_e4m3_f32(bytes: &[u8]) -> Result<Vec<f32>> {
-    Ok(bytes.iter().copied().map(f8_e4m3_to_f32).collect())
+    let mut out = vec![0.0_f32; bytes.len()];
+    decode_f8_e4m3_into(bytes, &mut out, "e4m3")?;
+    Ok(out)
 }
 
 fn bytes_to_f8_e5m2_f32(bytes: &[u8]) -> Result<Vec<f32>> {
     Ok(bytes.iter().copied().map(f8_e5m2_to_f32).collect())
 }
 
-fn f8_e4m3_to_f32(byte: u8) -> f32 {
+/// Décode des octets E4M3FN dans `out`.
+///
+/// # Errors
+///
+/// Renvoie une erreur si les longueurs diffèrent ou si un octet code NaN
+/// (`0x7f`/`0xff` : E4M3FN n'a pas d'infini, ces deux codes sont ses seuls NaN).
+pub(crate) fn decode_f8_e4m3_into(bytes: &[u8], out: &mut [f32], name: &str) -> Result<()> {
+    if bytes.len() != out.len() {
+        return Err(InferError::Shape(format!(
+            "décodage E4M3 {name}: {} octets pour {} valeurs",
+            bytes.len(),
+            out.len()
+        )));
+    }
+    for (index, (slot, &byte)) in out.iter_mut().zip(bytes).enumerate() {
+        *slot = f8_e4m3_to_f32(byte).ok_or_else(|| {
+            InferError::Config(format!(
+                "E4M3 {name}: NaN (0x{byte:02x}) à l'indice {index}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Valeur finie d'un octet E4M3FN, `None` pour ses deux codes NaN.
+pub(crate) fn f8_e4m3_to_f32(byte: u8) -> Option<f32> {
+    if byte & 0x7f == 0x7f {
+        return None;
+    }
     let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
     let exponent = (byte >> 3) & 0x0f;
     let mantissa = byte & 0x07;
     if exponent == 0 && mantissa == 0 {
-        return sign * 0.0;
+        return Some(sign * 0.0);
     }
     let decoded = if exponent == 0 {
         (f32::from(mantissa) / 8.0) * 2.0_f32.powi(-6)
     } else {
         (1.0 + f32::from(mantissa) / 8.0) * 2.0_f32.powi(i32::from(exponent) - 7)
     };
-    sign * decoded
+    Some(sign * decoded)
 }
 
 fn f8_e5m2_to_f32(byte: u8) -> f32 {
@@ -505,5 +577,88 @@ mod tests {
         fn data_len(&self) -> usize {
             self.data.len()
         }
+    }
+}
+
+#[cfg(test)]
+mod fp8_tests {
+    use super::*;
+
+    #[test]
+    fn e4m3_decodes_all_finite_codes_and_rejects_nan() {
+        let mut finite = 0;
+        for byte in 0_u8..=255 {
+            match f8_e4m3_to_f32(byte) {
+                Some(value) => {
+                    finite += 1;
+                    assert!(value.is_finite() && value.abs() <= 448.0, "0x{byte:02x}");
+                }
+                None => assert!(byte == 0x7f || byte == 0xff, "0x{byte:02x}"),
+            }
+        }
+        assert_eq!(finite, 254);
+        assert_eq!(f8_e4m3_to_f32(0x7e), Some(448.0));
+        assert_eq!(f8_e4m3_to_f32(0xfe), Some(-448.0));
+        // Plus petit sous-normal : 2^-9.
+        assert_eq!(f8_e4m3_to_f32(0x01), Some(2.0_f32.powi(-9)));
+        assert_eq!(f8_e4m3_to_f32(0x08), Some(2.0_f32.powi(-6)));
+        assert_eq!(f8_e4m3_to_f32(0x38), Some(1.0));
+    }
+
+    #[test]
+    fn e4m3_nan_bytes_are_errors() {
+        let mut out = [0.0_f32; 3];
+        assert!(decode_f8_e4m3_into(&[0x38, 0x7f, 0x00], &mut out, "t").is_err());
+        assert!(decode_f8_e4m3_into(&[0xff], &mut out[..1], "t").is_err());
+        assert!(decode_f8_e4m3_into(&[0x38, 0x00], &mut out, "t").is_err());
+        decode_f8_e4m3_into(&[0x38, 0xb8, 0x00], &mut out, "t").expect("invariant: codes finis");
+        assert_eq!(out, [1.0, -1.0, 0.0]);
+    }
+
+    #[test]
+    fn synthetic_partial_blocks_scale_edges() {
+        // Synthétique : 3×3 avec blocs de 2 (toutes les dimensions réelles du
+        // checkpoint sont multiples de 128, les blocs partiels n'y existent pas).
+        let mut values = vec![1.0_f32; 9];
+        apply_fp8_block_scales_in_place(
+            &mut values,
+            &[3, 3],
+            &[1.0, 2.0, 3.0, 4.0],
+            &[2, 2],
+            "t",
+            2,
+        )
+        .expect("invariant: forme cohérente");
+        assert_eq!(values, [1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 3.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn block_scales_reject_bad_shape_and_non_finite() {
+        let mut values = vec![1.0_f32; 4];
+        assert!(apply_fp8_block_scales_in_place(
+            &mut values,
+            &[2, 2],
+            &[1.0, 2.0],
+            &[1, 2],
+            "t",
+            2
+        )
+        .is_err());
+        assert!(
+            apply_fp8_block_scales_in_place(&mut values, &[2, 2], &[f32::NAN], &[1], "t", 2)
+                .is_err()
+        );
+        assert!(apply_fp8_block_scales_in_place(
+            &mut values,
+            &[2, 2],
+            &[f32::INFINITY, 1.0, 1.0, 1.0],
+            &[2, 2],
+            "t",
+            1
+        )
+        .is_err());
+        apply_fp8_block_scales_in_place(&mut values, &[2, 2], &[0.5], &[1], "t", 128)
+            .expect("invariant: échelle per-tensor");
+        assert_eq!(values, [0.5; 4]);
     }
 }

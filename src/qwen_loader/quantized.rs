@@ -751,35 +751,17 @@ pub(super) fn apply_fp8_scales(
     scale_key: &str,
     block: usize,
 ) -> Result<Tensor> {
-    if scales.len() == 1 {
-        let scale = scales
-            .first()
-            .ok_or_else(|| InferError::Shape(format!("scale FP8 {scale_key} vide")))?;
-        return Ok(tensor.map(|value| value * *scale));
-    }
-    let (rows, cols) = tensor.as_matrix()?;
-    validate_fp8_scale_shape(tensor.shape(), scale_shape, scale_key, block)?;
-    let [scale_rows, scale_cols] = scale_shape else {
-        return Err(InferError::Dimension(format!(
-            "scale FP8 {scale_key} attendu rang 2, reçu {scale_shape:?}"
-        )));
-    };
-    if scales.len() != scale_rows * scale_cols {
-        return Err(InferError::Shape(format!(
-            "scale FP8 {scale_key} shape={scale_shape:?}, éléments={}",
-            scales.len()
-        )));
-    }
-    let mut out = tensor.data().to_vec();
-    for row in 0..rows {
-        let scale_row = row / block;
-        for col in 0..cols {
-            let scale_col = col / block;
-            let scale = scales[scale_row * scale_cols + scale_col];
-            out[row * cols + col] *= scale;
-        }
-    }
-    Tensor::from_vec(vec![rows, cols], out)
+    let shape = tensor.shape().to_vec();
+    let mut data = tensor.into_data();
+    crate::safetensor::apply_fp8_block_scales_in_place(
+        &mut data,
+        &shape,
+        scales,
+        scale_shape,
+        scale_key,
+        block,
+    )?;
+    Tensor::from_vec(shape, data)
 }
 
 fn replace_weight_suffix(source: &str, suffix: &str) -> Result<String> {
