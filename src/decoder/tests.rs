@@ -5404,12 +5404,32 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
     };
-    if crate::runtime_flags::env_var("SARAGOSSA_RUST_PREFIX_CACHE").is_some_and(|v| v.trim() == "0")
-    {
-        return Err(InferError::Config(
-            "cache de préfixe coupé : oracle de réutilisation sans objet".into(),
-        ));
+    for name in [
+        "SARAGOSSA_RUST_PREFIX_CACHE",
+        "SARAGOSSA_RUST_PREFIX_CACHE_CAP",
+    ] {
+        if crate::runtime_flags::env_var(name).is_some_and(|v| v.trim() == "0") {
+            return Err(InferError::Config(format!(
+                "{name}=0 : oracle de réutilisation sans objet"
+            )));
+        }
     }
+    // Chaque génération du prompt complet doit reprendre exactement le préfixe
+    // déposé et prolonger le suffixe une seule fois, par le chemin résident.
+    let traced = |label: &str, suffix: usize, run: &mut dyn FnMut() -> Result<()>| -> Result<()> {
+        super::generation::PREFIX_EXTEND_TRACE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        let result = run();
+        let trace = super::generation::PREFIX_EXTEND_TRACE
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap_or_default();
+        result?;
+        if trace != [(suffix, true)] {
+            return Err(InferError::Config(format!(
+                "{label} : extension {trace:?}, attendu une reprise de suffixe {suffix} résidente"
+            )));
+        }
+        Ok(())
+    };
     let max_new = 48usize;
     let assets = crate::ModelAssets::load_local(&model_dir)?;
     let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
@@ -5467,12 +5487,22 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
             // AR : préfixe en cache, puis le prompt complet le reprend.
             model.clear_prefix_cache();
             model.generate_greedy_cached_with_options(head, 1, &options)?;
-            let ar = model.generate_greedy_cached_with_options(&prompt, max_new, &options)?;
+            let mut ar = Vec::new();
+            traced(&format!("{name} {suffix} AR"), suffix, &mut || {
+                ar = model.generate_greedy_cached_with_options(&prompt, max_new, &options)?;
+                Ok(())
+            })?;
             // États AR après la même reprise partielle : pas mono-ligne.
             model.clear_prefix_cache();
             model.generate_greedy_cached_with_options(head, 1, &options)?;
             let kv_bf16 = CausalDecoder::resident_kv_bf16(false, prompt.len());
-            let mut cache = model.prefill_cache_state(&prompt)?.0;
+            let mut cache = None;
+            traced(&format!("{name} {suffix} états AR"), suffix, &mut || {
+                cache = Some(model.prefill_cache_state(&prompt)?.0);
+                Ok(())
+            })?;
+            let mut cache =
+                cache.ok_or_else(|| InferError::Config("cache AR absent".to_string()))?;
             if !model.setup_resident_full_decode(&mut cache, max_new + 16, 16, kv_bf16)? {
                 return Err(InferError::Config("setup résident refusé".to_string()));
             }
@@ -5498,11 +5528,16 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
                 model.clear_prefix_cache();
                 run_mode(mode, head, 1)?;
                 VERIFY_RECORDER.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
-                let tokens = run_mode(mode, &prompt, max_new);
+                let mut tokens = Ok(Vec::new());
+                let traced_run = traced(&format!("{name} {suffix} {mode}"), suffix, &mut || {
+                    tokens = run_mode(mode, &prompt, max_new);
+                    Ok(())
+                });
                 let records = VERIFY_RECORDER
                     .with(|slot| slot.borrow_mut().take())
                     .unwrap_or_default();
                 let tokens = tokens?;
+                traced_run?;
                 let mut tally = IdentityTally {
                     first_token_divergence: tokens
                         .iter()

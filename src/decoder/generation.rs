@@ -4573,6 +4573,8 @@ impl CausalDecoder {
                 !all_states,
             )? {
                 let states = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+                #[cfg(test)]
+                record_prefix_extend(suffix.len(), true);
                 if trace_prefill_enabled() {
                     eprintln!(
                         "prefix_extend rows={} path=prefill_resident ms={}",
@@ -4595,6 +4597,8 @@ impl CausalDecoder {
             && self.setup_resident_decode_from_prefill(cache, suffix.len())?;
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let resident = false;
+        #[cfg(test)]
+        record_prefix_extend(suffix.len(), resident);
         let setup_elapsed = started.elapsed();
         // Sans arène le forward per-op traite tout le suffixe d'un coup, comme avant.
         let chunk = if resident {
@@ -5657,4 +5661,21 @@ enum PromptStates {
     /// Hidden final non normé lu en place dans le buffer du prefill résident.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     Raw(crate::metal_backend::SharedF32Rows),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Extensions de préfixe de ce thread (oracle de réutilisation) : `Some`
+    /// pendant l'enregistrement, `(tokens du suffixe, chemin résident)`.
+    pub(super) static PREFIX_EXTEND_TRACE: std::cell::RefCell<Option<Vec<(usize, bool)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_prefix_extend(suffix: usize, resident: bool) {
+    PREFIX_EXTEND_TRACE.with(|slot| {
+        if let Some(trace) = slot.borrow_mut().as_mut() {
+            trace.push((suffix, resident));
+        }
+    });
 }
