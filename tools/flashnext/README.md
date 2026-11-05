@@ -58,7 +58,12 @@ Coût : environ 2 min pour `--layers` (8000 tokens, 4 couches) et 18 min pour
 `--full`. Le pic est d'environ 17 Go, dont les experts f32 d'une couche, soit
 10 Go.
 
-Les tests vérifient `provenance.json` avant l'inférence :
-- l'empreinte de chaque golden ;
-- les empreintes des poids, comparées au manifeste du checkpoint ouvert ;
+Chaque golden a sa propre entrée dans `provenance.json`. Les tests la vérifient
+avant l'inférence :
+- l'empreinte du golden ;
+- les empreintes de `config.json` et de chaque fichier de poids ouvert,
+  recalculées sur disque ;
 - la version de transformers et le backend `sdpa`.
+
+Un même dossier refuse des goldens d'origines différentes. Vérification :
+`python -I tools/flashnext/oracle_dump.py --selftest`.

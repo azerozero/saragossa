@@ -113,10 +113,17 @@ et `SARAGOSSA_QWEN4EXP_GOLDEN`.
 
 Les goldens viennent de `tools/flashnext/oracle_dump.py` : couches officielles
 `Qwen4ExpTextDecoderLayer`, experts placés dans le module officiel. Avant
-l'inférence, les tests vérifient `provenance.json` :
-- les empreintes des goldens ;
-- les empreintes des poids, comparées au manifeste du checkpoint ouvert ;
+l'inférence, les tests vérifient `provenance.json`, qui contient une entrée par
+golden :
+- l'empreinte du golden ;
+- les empreintes de `config.json` et de chaque fichier de poids réellement
+  ouvert (shards, MTP, table n-gram), **recalculées sur disque** ;
 - la version de transformers, le backend sdpa et le dtype f32.
+
+`oracle_dump.py` refuse de mélanger dans un même dossier des goldens issus
+d'autres poids, d'une autre config ou d'un autre environnement. Un test Rust
+modifie tour à tour un shard, la table, la config et le golden, et exige le
+refus.
 
 Pour les couches 0 à 3, une seule séquence de 8000 tokens suffit : comme tout
 est causal, ses préfixes donnent les longueurs 64, 2047 à 2052 et 3000. La porte
