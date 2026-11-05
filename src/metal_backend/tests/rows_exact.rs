@@ -147,10 +147,10 @@ fn rows_exact_cb(
 }
 
 /// `rows` lignes d'activations distinctes, amplitude `scale`.
-fn rows_exact_lhs(rows: usize, dim: usize, salt: usize, scale: f32) -> Vec<f32> {
+fn rows_exact_lhs(rows: usize, dim: usize, variant: usize, scale: f32) -> Vec<f32> {
     (0..rows)
         .flat_map(|r| {
-            varied_row(dim, salt + r * 7)
+            varied_row(dim, variant + r * 7)
                 .into_iter()
                 .map(move |x| x * scale)
         })
@@ -234,8 +234,8 @@ fn rows_exact_matmul_formats_body() -> Result<()> {
             })?;
             read_f32_buffer(&out, rows * out_dim)
         };
-        for (salt, scale) in [(3usize, 1.0f32), (500, 37.0)] {
-            let lhs = rows_exact_lhs(9, in_dim, salt, scale);
+        for (variant, scale) in [(3usize, 1.0f32), (500, 37.0)] {
+            let lhs = rows_exact_lhs(9, in_dim, variant, scale);
             let mono = (0..9)
                 .map(|r| run(1, &lhs[r * in_dim..(r + 1) * in_dim]))
                 .collect::<Result<Vec<_>>>()?
@@ -244,7 +244,7 @@ fn rows_exact_matmul_formats_body() -> Result<()> {
                 let batch = run(rows, &lhs[..rows * in_dim])?;
                 rows_exact_check(
                     kernel,
-                    &format!("{case} graine {salt}"),
+                    &format!("{case} graine {variant}"),
                     rows,
                     out_dim,
                     &mono[..rows * out_dim],
