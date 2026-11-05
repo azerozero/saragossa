@@ -21,6 +21,8 @@ use crate::safetensor::{bytes_to_dense_f32, f8_e4m3_to_f32};
 use crate::{dequantize_affine_u32, InferError, Result, Tensor};
 
 const TRUNK: &str = "language_model.model.";
+/// Borne des dimensions de config (2^20) : les produits restent représentables.
+const MAX_DIM: usize = 1 << 20;
 const LM_HEAD: &str = "language_model.lm_head";
 
 /// Type d'une couche du tronc.
@@ -67,6 +69,7 @@ pub struct Qwen4ExpConfig {
     pub vocab: usize,
     pub eos: u64,
     pub rms_eps: f32,
+    /// Gate de sortie DeltaNet : `σ(z)` (Flash-Next) ou `SiLU(z)`.
     pub sigmoid_output_gate: bool,
     pub mtp_layers: usize,
 }
@@ -212,45 +215,72 @@ impl Qwen4ExpConfig {
         Ok(cfg)
     }
 
+    /// Invariants vérifiés **dans l'ordre** : chaque condition ne s'évalue que
+    /// si les précédentes tiennent (aucune division par zéro ni débordement).
     fn validate(&self, indexer_kv_heads: usize) -> Result<()> {
-        let checks = [
-            (self.hc_count > 1, "hc_count > 1"),
-            (indexer_kv_heads == 1, "indexer_kv_heads = 1"),
-            (
-                self.indexer_compress > 0 && self.indexer_budget % self.indexer_compress == 0,
-                "indexer_budget multiple de indexer_compress_ratio",
-            ),
-            (
-                self.layer_kinds[self.ple_layer] == Qwen4ExpLayerKind::Linear,
-                "couche PLE de type linear_attention",
-            ),
-            (
-                self.rotary_dim <= self.indexer_head_dim && self.rotary_dim <= self.head_dim,
-                "rotary_dim ≤ indexer_head_dim et head_dim",
-            ),
-            (
-                self.heads > 0 && self.kv_heads > 0 && self.heads % self.kv_heads == 0,
-                "têtes GQA",
-            ),
-            (
-                self.linear_key_heads > 0 && self.linear_value_heads % self.linear_key_heads == 0,
-                "têtes DeltaNet",
-            ),
-            (
-                self.top_k >= 1 && self.top_k <= self.experts,
-                "top_k ≤ experts",
-            ),
-            (self.ngram_size >= 2 && self.heads_per_ngram >= 1, "n-gram"),
-            (
-                self.ple_dim % ((self.ngram_size - 1) * self.heads_per_ngram) == 0,
-                "ple_embed_dim divisible par le nombre de têtes n-gram",
-            ),
-            (self.mtp_layers <= 1, "mtp_num_hidden_layers ≤ 1"),
+        let fail = |what: &str| Err(cfg_err(format!("invariant violé: {what}")));
+        // Bornes : les produits de trois dimensions restent < 2^60.
+        let dims = [
+            self.hidden,
+            self.heads,
+            self.kv_heads,
+            self.head_dim,
+            self.linear_key_heads,
+            self.linear_value_heads,
+            self.linear_key_dim,
+            self.linear_value_dim,
+            self.conv_kernel,
+            self.experts,
+            self.moe_inter,
+            self.shared_inter,
+            self.hc_count,
+            self.hc_lowrank,
+            self.indexer_budget,
+            self.indexer_compress,
+            self.indexer_head_dim,
+            self.indexer_heads,
+            self.ple_dim,
+            self.ple_conv_kernel,
+            self.vocab,
         ];
-        for (ok, what) in checks {
-            if !ok {
-                return Err(cfg_err(format!("invariant violé: {what}")));
-            }
+        if dims.iter().any(|d| *d == 0 || *d > MAX_DIM) {
+            return fail("dimensions dans 1..=2^20");
+        }
+        if self.hc_count < 2 {
+            return fail("hc_count > 1");
+        }
+        if indexer_kv_heads != 1 {
+            return fail("indexer_kv_heads = 1");
+        }
+        if self.indexer_budget % self.indexer_compress != 0 {
+            return fail("indexer_budget multiple de indexer_compress_ratio");
+        }
+        if self.layer_kinds[self.ple_layer] != Qwen4ExpLayerKind::Linear {
+            return fail("couche PLE de type linear_attention");
+        }
+        if self.rotary_dim > self.indexer_head_dim || self.rotary_dim > self.head_dim {
+            return fail("rotary_dim ≤ indexer_head_dim et head_dim");
+        }
+        if self.heads % self.kv_heads != 0 {
+            return fail("têtes GQA");
+        }
+        if self.linear_value_heads % self.linear_key_heads != 0 {
+            return fail("têtes DeltaNet");
+        }
+        if self.top_k == 0 || self.top_k > self.experts {
+            return fail("1 ≤ top_k ≤ experts");
+        }
+        if self.ngram_size < 2 || self.ngram_size > 8 || self.heads_per_ngram == 0 {
+            return fail("ngram_size dans 2..=8 et heads_per_ngram ≥ 1");
+        }
+        let heads = (self.ngram_size - 1)
+            .checked_mul(self.heads_per_ngram)
+            .filter(|h| *h <= MAX_DIM);
+        if heads.is_none_or(|h| self.ple_dim % h != 0) {
+            return fail("ple_embed_dim divisible par le nombre de têtes n-gram");
+        }
+        if self.mtp_layers > 1 {
+            return fail("mtp_num_hidden_layers ≤ 1");
         }
         Ok(())
     }
@@ -509,7 +539,9 @@ impl Qwen4ExpCheckpoint {
         let group_size = quant
             .get("group_size")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| cfg_err("quantization.group_size"))? as usize;
+            .filter(|gs| *gs > 0 && *gs as usize <= MAX_DIM)
+            .ok_or_else(|| cfg_err("quantization.group_size dans 1..=2^20"))?
+            as usize;
         let default_bits = quant
             .get("bits")
             .and_then(|v| v.as_u64())
@@ -914,5 +946,76 @@ impl Qwen4ExpCheckpoint {
     /// Nom de base du lm_head.
     pub fn lm_head() -> &'static str {
         LM_HEAD
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mini_config() -> serde_json::Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qwen4exp_mini/source/config.json");
+        read_json(&path).expect("invariant: config de fixture")
+    }
+
+    fn with_text(edit: impl FnOnce(&mut serde_json::Value)) -> Result<Qwen4ExpConfig> {
+        let mut config = mini_config();
+        edit(&mut config["text_config"]);
+        Qwen4ExpConfig::from_json(&config)
+    }
+
+    #[test]
+    fn degenerate_ngram_configs_are_errors_not_panics() {
+        for (key, value) in [
+            ("ngram_size", 1),
+            ("ngram_size", 0),
+            ("heads_per_ngram", 0),
+            ("indexer_compress_ratio", 0),
+            ("num_key_value_heads", 0),
+            ("linear_num_key_heads", 0),
+            ("hidden_size", 0),
+            ("hc_count", 1),
+        ] {
+            let result = with_text(|t| t[key] = value.into());
+            assert!(result.is_err(), "{key}={value} accepté");
+        }
+        assert!(with_text(|t| t["ple_embed_dim"] = 63.into()).is_err());
+        assert!(with_text(|t| t["hidden_size"] = (1_u64 << 40).into()).is_err());
+    }
+
+    #[test]
+    fn both_output_gates_are_accepted() {
+        let sigmoid = with_text(|_| {}).expect("invariant: config fixture");
+        assert!(sigmoid.sigmoid_output_gate);
+        let silu = with_text(|t| t["output_gate_type"] = "silu".into()).expect("invariant: silu");
+        assert!(!silu.sigmoid_output_gate);
+        assert!(with_text(|t| t["output_gate_type"] = "relu".into()).is_err());
+    }
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn zero_group_size_is_refused_at_open() {
+        use crate::devtools::convert::{convert_qwen4exp, ConvertOptions};
+        let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+        convert_qwen4exp(&ConvertOptions {
+            src: Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4exp_mini/source"),
+            dst: dst.path().to_path_buf(),
+            source_revision: "fixture".to_string(),
+            source_repo: None,
+            converter_commit: None,
+            only: None,
+            verify: false,
+            plan_only: false,
+        })
+        .expect("invariant: conversion");
+        let path = dst.path().join("config.json");
+        let mut config = read_json(&path).expect("invariant: config");
+        config["quantization"]["group_size"] = 0.into();
+        std::fs::write(&path, config.to_string()).expect("invariant: écriture");
+        let error = Qwen4ExpCheckpoint::open(dst.path())
+            .err()
+            .unwrap_or_else(|| panic!("group_size 0 accepté"));
+        assert!(error.to_string().contains("group_size"), "{error}");
     }
 }

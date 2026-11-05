@@ -582,7 +582,7 @@ impl LinearAttention {
     /// Variante Flash-Next (`qwen4_exp`), CPU seul, sans cache : normalisation l2
     /// des têtes q/k `x/√(Σx²+ε)` (ε = 1e-6, q multiplié ensuite par `d_k^(−1/2)`)
     /// au lieu de l'unité RMS `x/√(Σx²+d·ε)` des autres familles, et gate de
-    /// sortie `σ(z)` au lieu de `SiLU(z)` (`output_gate_type = sigmoid`).
+    /// sortie `σ(z)` si `sigmoid_gate` (`output_gate_type = sigmoid`), `SiLU(z)` sinon.
     ///
     /// # Errors
     ///
@@ -591,6 +591,7 @@ impl LinearAttention {
         &self,
         config: LinearAttentionConfig,
         x: &Tensor,
+        sigmoid_gate: bool,
     ) -> Result<Tensor> {
         config.validate()?;
         validate_weights(self, config)?;
@@ -634,8 +635,13 @@ impl LinearAttention {
             &self.norm_weight,
             config.rms_eps,
         )?;
-        // Équation : out_t = W_out·(y'_t ⊙ σ(z_t)).
-        let gated = y.mul_elementwise(&z.map(sigmoid))?;
+        // Équation : out_t = W_out·(y'_t ⊙ σ(z_t)), ou SiLU(z_t) (`output_gate_type`).
+        let gate = if sigmoid_gate {
+            z.map(sigmoid)
+        } else {
+            silu(&z)
+        };
+        let gated = y.mul_elementwise(&gate)?;
         self.out_proj
             .forward_with_runtime(&gated, ForwardRuntime::cpu())
     }

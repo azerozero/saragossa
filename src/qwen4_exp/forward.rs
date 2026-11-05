@@ -141,12 +141,7 @@ impl Qwen4ExpReference {
             conv_kernel_dim: c.conv_kernel,
             rms_eps: c.rms_eps,
         };
-        if !c.sigmoid_output_gate {
-            return Err(InferError::Config(
-                "qwen4_exp: référence écrite pour output_gate_type=sigmoid".to_string(),
-            ));
-        }
-        LinearAttention::new(weights).forward_flash_next_cpu(config, x)
+        LinearAttention::new(weights).forward_flash_next_cpu(config, x, c.sigmoid_output_gate)
     }
 
     fn attention(
