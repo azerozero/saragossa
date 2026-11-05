@@ -226,25 +226,12 @@ fn validate_fp8_scale_shape(
     scale_key: &str,
     block: usize,
 ) -> Result<()> {
+    // Une échelle scalaire (per-tensor) s'applique à toute forme.
     if element_count(scale_shape, scale_key)? == 1 {
         return Ok(());
     }
-    let [rows, cols] = weight_shape else {
-        return Err(InferError::Dimension(format!(
-            "scale FP8 {scale_key} matriciel pour poids non rang 2: {weight_shape:?}"
-        )));
-    };
-    let expected = [
-        div_ceil_checked(*rows, block, scale_key)?,
-        div_ceil_checked(*cols, block, scale_key)?,
-    ];
-    if scale_shape != expected {
-        return Err(InferError::Dimension(format!(
-            "scale FP8 {scale_key} attendu {:?} ou scalaire, reçu {:?}",
-            expected, scale_shape
-        )));
-    }
-    Ok(())
+    crate::safetensor::check_fp8_block_scale_shape(weight_shape, scale_shape, scale_key, block)
+        .map(|_| ())
 }
 
 fn element_count(shape: &[usize], name: &str) -> Result<usize> {
@@ -255,16 +242,6 @@ fn element_count(shape: &[usize], name: &str) -> Result<usize> {
         acc.checked_mul(*dim)
             .ok_or_else(|| InferError::Shape(format!("shape trop grande pour {name}")))
     })
-}
-
-fn div_ceil_checked(value: usize, divisor: usize, name: &str) -> Result<usize> {
-    if divisor == 0 {
-        return Err(InferError::Config(format!("diviseur nul pour {name}")));
-    }
-    value
-        .checked_add(divisor - 1)
-        .map(|sum| sum / divisor)
-        .ok_or_else(|| InferError::Shape(format!("ceil_div trop grand pour {name}")))
 }
 
 fn expect_entry_shape(name: &str, entry: &ShardTensorEntry, expected: &[usize]) -> Result<()> {

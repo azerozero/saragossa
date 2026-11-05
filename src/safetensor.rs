@@ -187,6 +187,39 @@ fn apply_fp8_scales(
 /// Taille de bloc des échelles FP8 « fine-grained » (blocs `128×128`).
 pub(crate) const FP8_SCALE_BLOCK: usize = 128;
 
+/// Contrôle qu'une échelle FP8 par blocs vaut exactement
+/// `[ceil(rows/block), ceil(cols/block)]` pour un poids `[rows, cols]`, et
+/// renvoie `(rows, cols)`.
+///
+/// # Errors
+///
+/// Renvoie une erreur si le poids n'est pas une matrice, si `block` est nul ou
+/// si la forme de l'échelle diffère.
+pub(crate) fn check_fp8_block_scale_shape(
+    shape: &[usize],
+    scale_shape: &[usize],
+    scale_key: &str,
+    block: usize,
+) -> Result<(usize, usize)> {
+    let [rows, cols] = shape else {
+        return Err(InferError::Dimension(format!(
+            "poids FP8 à blocs attendu rang 2, reçu {shape:?} ({scale_key})"
+        )));
+    };
+    if block == 0 {
+        return Err(InferError::Config(format!(
+            "scale FP8 {scale_key}: bloc nul"
+        )));
+    }
+    let expected = [rows.div_ceil(block), cols.div_ceil(block)];
+    if scale_shape != expected {
+        return Err(InferError::Dimension(format!(
+            "scale FP8 {scale_key} attendu {expected:?}, reçu {scale_shape:?}"
+        )));
+    }
+    Ok((*rows, *cols))
+}
+
 /// Applique en place les échelles FP8 d'un poids déjà décodé.
 ///
 /// Une échelle unique (`[1]` ou `[]`) multiplie tout le tenseur ; sinon le poids
@@ -216,25 +249,9 @@ pub(crate) fn apply_fp8_block_scales_in_place(
         values.iter_mut().for_each(|value| *value *= scale);
         return Ok(());
     }
-    let [rows, cols] = shape else {
-        return Err(InferError::Dimension(format!(
-            "poids FP8 à blocs attendu rang 2, reçu {shape:?} ({scale_key})"
-        )));
-    };
-    let (rows, cols) = (*rows, *cols);
-    let [scale_rows, scale_cols] = scale_shape else {
-        return Err(InferError::Dimension(format!(
-            "scale FP8 {scale_key} attendu rang 2, reçu {scale_shape:?}"
-        )));
-    };
-    let expected_rows = rows.div_ceil(block);
-    let expected_cols = cols.div_ceil(block);
-    if *scale_rows != expected_rows || *scale_cols != expected_cols {
-        return Err(InferError::Dimension(format!(
-            "scale FP8 {scale_key} attendu [{expected_rows},{expected_cols}], reçu {scale_shape:?}"
-        )));
-    }
-    if scales.len() != scale_rows * scale_cols || values.len() != rows * cols {
+    let (rows, cols) = check_fp8_block_scale_shape(shape, scale_shape, scale_key, block)?;
+    let scale_cols = cols.div_ceil(block);
+    if scales.len() != rows.div_ceil(block) * scale_cols || values.len() != rows * cols {
         return Err(InferError::Shape(format!(
             "scale FP8 {scale_key} shape={scale_shape:?}, éléments={}, poids {}",
             scales.len(),
