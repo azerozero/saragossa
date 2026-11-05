@@ -62,8 +62,10 @@ Chaque golden a sa propre entrée dans `provenance.json`. Les tests la vérifien
 avant l'inférence :
 - l'empreinte du golden ;
 - les empreintes de `config.json` et de chaque fichier de poids ouvert,
-  recalculées sur disque ;
+  recalculées sur disque, dont `ngram/meta.json` et la table qu'il désigne ;
 - la version de transformers et le backend `sdpa`.
 
-Un même dossier refuse des goldens d'origines différentes. Vérification :
+Un même dossier refuse des goldens d'origines différentes. La compatibilité est
+vérifiée avant le calcul, puis de nouveau avant une publication atomique : en
+cas de refus, les fichiers existants restent intacts. Vérification :
 `python -I tools/flashnext/oracle_dump.py --selftest`.
