@@ -59,7 +59,8 @@ const CONFIG_DROPPED: &[&str] = &[
     "vision_end_token_id",
 ];
 const PARAMS: &str = "experts u4 gs64 (FP8 b128 déquantifié) ; denses u8 gs64 ; lm_head u6 gs64 ; \
-scales/biais bf16 (biais vers −∞, scale vers +∞) ; copies à l'octet ; n-gram E4M3 compact";
+scales/biais bf16 (biais vers −∞, scale vers +∞, étendue en f64) ; codes round((w − b) / s) en f64 ; \
+copies à l'octet ; n-gram E4M3 compact";
 
 /// Options du convertisseur.
 #[derive(Clone, Debug)]

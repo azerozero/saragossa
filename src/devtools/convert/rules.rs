@@ -8,7 +8,7 @@ use crate::{InferError, Result};
 
 /// Version des règles, incluse dans l'identité du travail : toute
 /// modification de cette table invalide une reprise.
-pub(crate) const RULES_VERSION: &str = "qwen4_exp-q4e8-v1";
+pub(crate) const RULES_VERSION: &str = "qwen4_exp-q4e8-v2";
 
 /// Taille de groupe affine commune à toutes les sorties quantifiées.
 pub(crate) const GROUP_SIZE: usize = 64;

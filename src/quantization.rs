@@ -1042,15 +1042,17 @@ pub(crate) fn quantize_affine_bitstream_bf16(
                 .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &value| {
                     (lo.min(value), hi.max(value))
                 });
-            let (scale_bits, bias_bits) = affine_params_bf16(min, max, levels);
+            let (scale_bits, bias_bits) = affine_params_bf16(min, max, levels)?;
             let scale = bf16_value(scale_bits);
             let bias = bf16_value(bias_bits);
             scales[row * groups + group] = scale_bits;
             biases[row * groups + group] = bias_bits;
-            let inv = scale.recip();
             for (lane, &value) in slice.iter().enumerate() {
-                // Code borné dans [0, levels] : la conversion ne tronque rien.
-                let code = ((value - bias) * inv).round().clamp(0.0, levels) as u32;
+                // Division (et non produit par l'inverse) : un ulp d'écart sur le
+                // quotient peut basculer l'arrondi. Code borné dans [0, levels].
+                let code = ((f64::from(value) - f64::from(bias)) / f64::from(scale))
+                    .round()
+                    .clamp(0.0, f64::from(levels)) as u32;
                 let restored = code as f32 * scale + bias;
                 error.sum_sq_err += f64::from(value - restored).powi(2);
                 error.sum_sq += f64::from(value).powi(2);
@@ -1072,18 +1074,28 @@ pub(crate) fn quantize_affine_bitstream_bf16(
 /// jusqu'à couvrir `max` (`bias + levels·scale ≥ max`) : aucun code n'est alors
 /// écrêté et l'erreur reste bornée par un demi-pas de la scale sérialisée.
 #[cfg(feature = "devtools")]
-pub(crate) fn affine_params_bf16(min: f32, max: f32, levels: f32) -> (u16, u16) {
+pub(crate) fn affine_params_bf16(min: f32, max: f32, levels: f32) -> Result<(u16, u16)> {
     let mut bias_bits = bf16_bits(min);
     if bf16_value(bias_bits) > min {
         bias_bits = bf16_step_down(bias_bits);
     }
     let bias = bf16_value(bias_bits);
-    let mut scale_bits = bf16_bits(((max - bias) / levels).max(1.0e-7));
+    // Étendue en f64 : `max − bias` déborde en f32 près des extrêmes bf16 finis.
+    let span = f64::from(max) - f64::from(bias);
+    let mut scale_bits = bf16_bits(((span / f64::from(levels)) as f32).max(1.0e-7));
     // Deux pas au plus : l'arrondi au plus proche perd moins d'un ulp bf16.
-    while bias + levels * bf16_value(scale_bits) < max {
+    while f64::from(bias) + f64::from(levels) * f64::from(bf16_value(scale_bits)) < f64::from(max) {
         scale_bits = bf16_step_up_positive(scale_bits);
     }
-    (scale_bits, bias_bits)
+    let scale = bf16_value(scale_bits);
+    // La restitution maximale doit rester finie en f32, comme le calcul du loader.
+    if !bias.is_finite() || !scale.is_finite() || !(levels * scale + bias).is_finite() {
+        return Err(InferError::Config(format!(
+            "groupe affine hors plage f32: min={min}, max={max}, {} niveaux",
+            levels + 1.0
+        )));
+    }
+    Ok((scale_bits, bias_bits))
 }
 
 #[cfg(feature = "devtools")]
@@ -1544,8 +1556,12 @@ mod bitstream_tests {
                     };
                 }
                 let bv = f32::from_bits(u32::from(b) << 16);
-                let mut s = bf16_bits(((max - bv) / levels).max(1.0e-7));
-                while bv + levels * f32::from_bits(u32::from(s) << 16) < max {
+                let span = f64::from(max) - f64::from(bv);
+                let mut s = bf16_bits(((span / f64::from(levels)) as f32).max(1.0e-7));
+                while f64::from(bv)
+                    + f64::from(levels) * f64::from(f32::from_bits(u32::from(s) << 16))
+                    < f64::from(max)
+                {
                     s += 1;
                 }
                 scales.push(s);
@@ -1555,7 +1571,9 @@ mod bitstream_tests {
                     f32::from_bits(u32::from(b) << 16),
                 );
                 for (lane, &value) in slice.iter().enumerate() {
-                    let code = ((value - bf) / sf).round().clamp(0.0, levels) as u32;
+                    // Quotient exact à l'arrondi f64 près, par division.
+                    let q = (f64::from(value) - f64::from(bf)) / f64::from(sf);
+                    let code = q.round().clamp(0.0, f64::from(levels)) as u32;
                     for bit in 0..bits {
                         if code >> bit & 1 == 1 {
                             let pos = (group * gs + lane) * bits + bit;
@@ -1724,6 +1742,39 @@ mod bitstream_tests {
                 .all(|(r, w)| (r - w).abs() <= small * 0.5 + 1.0e-12),
             "faible amplitude à un demi-pas"
         );
+    }
+
+    #[test]
+    fn bf16_extremes_never_yield_non_finite_restoration() {
+        let max = f32::from_bits(0x7f7f_0000); // plus grand bf16 fini ≈ 3,3895e38
+        for (bits, data) in [
+            (4, vec![-max, max]),
+            (8, vec![-max, max]),
+            (4, vec![0.0, max]),
+            (4, vec![-max, 0.0]),
+        ] {
+            let mut group = vec![data[0]; 64];
+            group[63] = data[1];
+            let mut packed = vec![0_u32; 64 * bits / 32];
+            let (mut s, mut b) = (vec![0_u16; 1], vec![0_u16; 1]);
+            match quantize_affine_bitstream_bf16(&group, 64, 64, bits, &mut packed, &mut s, &mut b)
+            {
+                Err(error) => assert!(error.to_string().contains("hors plage"), "{error}"),
+                Ok(error) => {
+                    let restored = dequantize_affine_u32(
+                        &[1, 64 * bits / 32],
+                        &packed,
+                        &bf16_tensor([1, 1], &s),
+                        &bf16_tensor([1, 1], &b),
+                        64,
+                        bits,
+                    )
+                    .expect("invariant: layout");
+                    assert!(restored.data().iter().all(|v| v.is_finite()), "bits={bits}");
+                    assert!(error.relative().is_finite());
+                }
+            }
+        }
     }
 
     #[test]
