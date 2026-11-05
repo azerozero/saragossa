@@ -1249,9 +1249,14 @@ fn rows_exact_full_attn_qkv_prologue_body() -> Result<()> {
     Ok(())
 }
 
-/// Ancre du contrat qmv u4 gs64, aligné (`out_dim` multiple de 8) et non aligné
-/// (`out_dim` = 60 : dernière tuile incomplète, sorties gardées par
-/// `row_base + row < out_dim`). Trois égalités en bits, par graine :
+/// Ancre du contrat qmv u4 gs64 sur ses trois variantes :
+/// - alignée (`out_dim` multiple de 8, `in_dim` multiple de 512) ;
+/// - non alignée, `out_dim` = 61 : le dernier simdgroup ne garde qu'une sortie
+///   sur quatre (`row_base + row < out_dim`) ;
+/// - `align64`, `in_dim` = 1088 (multiple de 64, pas de 512) : deux blocs pleins
+///   puis la queue de 64 valeurs servie par 4 voies, en `out_dim` 64 et 61.
+///
+/// Trois égalités en bits, par graine :
 /// 1. les partiels de chaque voie avant `simd_sum`, relevés sur une copie du
 ///    kernel de `kernels.metal` dont seule la réduction finale est redirigée,
 ///    égalent une réplique CPU f32 de la forme canonique (32 voies × 16
@@ -1259,7 +1264,9 @@ fn rows_exact_full_attn_qkv_prologue_body() -> Result<()> {
 ///    produits en `mul_add`, `r = scale·accum + (sum·bias + r)` fusionnés) ;
 /// 2. ces partiels réduits par le même `simd_sum` égalent la sortie du kernel
 ///    intact compilé dans la même bibliothèque ;
-/// 3. cette sortie égale celle du pipeline de production (`MetalExecutor`).
+/// 3. cette sortie égale celle du pipeline de production (`MetalExecutor`),
+///    pour les formes que la production sert par ce kernel (`align64` exige
+///    `out_dim` multiple de 8 : le cas 61 s'arrête au kernel intact).
 ///
 /// Portée : la preuve vaut pour les compilations exercées (fast-math, ce
 /// compilateur et ce GPU). `contract(off)` ne coupe pas la réassociation
@@ -1284,17 +1291,21 @@ fn rows_exact_qmv_contract_cpu_oracle() -> Result<()> {
     };
     let partial_store =
         "            out[(tile.x * out_dim + row_base + row) * 32u + simd_lid] = result[row];\n";
-    let cases = [
+    let masked = "        if (simd_lid == 0u && row_base + row < out_dim) {\n";
+    let kernels = [
         (
             "affine_qmv_fast_aligned_u4_gs64_f32",
             "        if (simd_lid == 0u) {\n",
-            64usize,
         ),
-        (
-            "affine_qmv_fast_u4_gs64_f32",
-            "        if (simd_lid == 0u && row_base + row < out_dim) {\n",
-            60,
-        ),
+        ("affine_qmv_fast_u4_gs64_f32", masked),
+        ("affine_qmv_fast_u4_gs64_align64_f32", masked),
+    ];
+    // (kernel, out_dim, in_dim, comparé à la production)
+    let cases = [
+        ("affine_qmv_fast_aligned_u4_gs64_f32", 64usize, 2048usize, true),
+        ("affine_qmv_fast_u4_gs64_f32", 61, 2048, true),
+        ("affine_qmv_fast_u4_gs64_align64_f32", 64, 1088, true),
+        ("affine_qmv_fast_u4_gs64_align64_f32", 61, 1088, false),
     ];
     let mut library_source = String::from(
         "#include <metal_stdlib>\n#include <metal_simdgroup>\nusing namespace metal;\n\
@@ -1304,7 +1315,7 @@ fn rows_exact_qmv_contract_cpu_oracle() -> Result<()> {
              if (lid == 0u) { out[gid] = r; }\n\
          }\n",
     );
-    for (name, guard, _) in cases {
+    for (name, guard) in kernels {
         let intact = kernel_text(name)?;
         let reduce = format!(
             "        const float reduced = simd_sum(result[row]);\n{guard}            out[tile.x * out_dim + row_base + row] = reduced;\n        }}\n"
@@ -1338,8 +1349,7 @@ fn rows_exact_qmv_contract_cpu_oracle() -> Result<()> {
             .map_err(InferError::Metal)
     };
     let reduce_pipeline = pipeline("anchor_reduce")?;
-    let in_dim = 2048usize;
-    for (name, _, out_dim) in cases {
+    for (name, out_dim, in_dim, compare_production) in cases {
         let intact_pipeline = pipeline(name)?;
         let partial_pipeline = pipeline(&format!("{name}_partials"))?;
         let weight = test_affine_random_u4(out_dim, in_dim, 77)?;
@@ -1406,8 +1416,13 @@ fn rows_exact_qmv_contract_cpu_oracle() -> Result<()> {
             for o in 0..out_dim {
                 for lane in 0..32usize {
                     let mut result = 0.0f32;
-                    for block in 0..in_dim / 512 {
+                    for block in 0..in_dim.div_ceil(512) {
                         let base = block * 512 + lane * 16;
+                        // Queue `align64` : seules les voies couvrant des valeurs
+                        // réelles accumulent.
+                        if base >= in_dim {
+                            continue;
+                        }
                         let mut sum = 0.0f32;
                         let mut xt = [0.0f32; 16];
                         for i in (0..16).step_by(4) {
@@ -1442,7 +1457,7 @@ fn rows_exact_qmv_contract_cpu_oracle() -> Result<()> {
             assert_eq!(
                 bad,
                 0,
-                "{name} : {bad}/{} partiels ≠ réplique CPU (graine {salt})",
+                "{name} {out_dim}x{in_dim} : {bad}/{} partiels ≠ réplique CPU (graine {salt})",
                 out_dim * 32
             );
             let reduced = read_f32_buffer(&reduced, out_dim)?;
@@ -1451,12 +1466,15 @@ fn rows_exact_qmv_contract_cpu_oracle() -> Result<()> {
             assert_eq!(
                 rows_exact_ndiff(&intact, &reduced, name),
                 0,
-                "{name} : simd_sum des partiels ≠ kernel intact (graine {salt})"
+                "{name} {out_dim}x{in_dim} : simd_sum des partiels ≠ kernel intact (graine {salt})"
             );
+            if !compare_production {
+                continue;
+            }
             assert_eq!(
                 rows_exact_ndiff(&intact, &production, name),
                 0,
-                "{name} : kernel intact ≠ pipeline de production (graine {salt})"
+                "{name} {out_dim}x{in_dim} : kernel intact ≠ pipeline de production (graine {salt})"
             );
         }
     }
