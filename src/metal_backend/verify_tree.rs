@@ -139,6 +139,33 @@ impl Drop for VerifyGreedyScope {
     }
 }
 
+thread_local! {
+    // Politique de la requête en cours (température nulle ou non), posée par les
+    // boucles spéculatives : la vérification en dérive sa portée greedy quel que
+    // soit le type de tête (`Skip` sous `SARAGOSSA_RUST_GPU_ARGMAX=0`).
+    static REQUEST_GREEDY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Rétablit la politique de requête précédente à la sortie du scope.
+pub(crate) struct RequestGreedyScope(Option<bool>);
+
+impl Drop for RequestGreedyScope {
+    fn drop(&mut self) {
+        REQUEST_GREEDY.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Pose la politique greedy de la requête (`true` à température nulle) pour
+/// les vérifications de ce thread jusqu'au drop du guard.
+pub(crate) fn install_request_greedy_scope(greedy: bool) -> RequestGreedyScope {
+    RequestGreedyScope(REQUEST_GREEDY.with(|slot| slot.replace(Some(greedy))))
+}
+
+/// Politique greedy de la requête en cours, si une boucle spéculative l'a posée.
+pub(crate) fn request_greedy() -> Option<bool> {
+    REQUEST_GREEDY.with(std::cell::Cell::get)
+}
+
 /// Marque les encodages en lignes de ce thread comme greedy (`true`) ou
 /// échantillonnés (`false`) jusqu'au drop du guard.
 pub(crate) fn install_verify_greedy_scope(greedy: bool) -> VerifyGreedyScope {
@@ -146,11 +173,45 @@ pub(crate) fn install_verify_greedy_scope(greedy: bool) -> VerifyGreedyScope {
 }
 
 /// Préfixe NAX en lignes autorisé pour l'encodage en cours : flag global, et
-/// pour une vérification greedy, `SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY`.
+/// pour une vérification greedy, `SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY` hors
+/// mode strict.
 pub(crate) fn verify_rows_nax_allowed() -> bool {
     crate::runtime_flags::verify_rows_nax_enabled()
         && (!VERIFY_GREEDY.with(std::cell::Cell::get)
-            || crate::runtime_flags::verify_rows_nax_greedy_enabled())
+            || (crate::runtime_flags::verify_rows_nax_greedy_enabled() && !verify_strict_active()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static VERIFY_STRICT_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force le mode strict sur ce thread le temps de `run` (oracles O1).
+#[cfg(test)]
+pub(crate) fn with_verify_strict_override<R>(strict: bool, run: impl FnOnce() -> R) -> R {
+    /// Rétablit le réglage précédent, panique comprise.
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VERIFY_STRICT_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(VERIFY_STRICT_TEST_OVERRIDE.with(|cell| cell.replace(Some(strict))));
+    run()
+}
+
+/// Vérification greedy stricte en cours d'encodage : portée greedy installée et
+/// `SARAGOSSA_RUST_VERIFY_STRICT` actif.
+pub(crate) fn verify_strict_active() -> bool {
+    if !VERIFY_GREEDY.with(std::cell::Cell::get) {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(strict) = VERIFY_STRICT_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return strict;
+    }
+    crate::runtime_flags::verify_strict_enabled()
 }
 
 #[cfg(test)]
@@ -172,5 +233,25 @@ mod greedy_scope_tests {
             assert!(greedy());
         }
         assert!(!greedy());
+    }
+
+    /// La politique de requête s'empile, se rétablit, et rend le mode strict
+    /// actif quand la vérification en dérive sa portée greedy (tête `Skip`).
+    #[test]
+    fn request_greedy_scope_drives_strict_policy() {
+        assert_eq!(request_greedy(), None);
+        {
+            let _request = install_request_greedy_scope(true);
+            assert_eq!(request_greedy(), Some(true));
+            // Comme `next_final_states_resident_verify` avec une tête non argmax.
+            let _verify = install_verify_greedy_scope(request_greedy().unwrap_or(false));
+            assert!(with_verify_strict_override(true, verify_strict_active));
+            {
+                let _sampled = install_request_greedy_scope(false);
+                assert_eq!(request_greedy(), Some(false));
+            }
+            assert_eq!(request_greedy(), Some(true));
+        }
+        assert_eq!(request_greedy(), None);
     }
 }

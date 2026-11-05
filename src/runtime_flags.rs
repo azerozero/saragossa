@@ -383,6 +383,10 @@ pub(crate) fn mtp_gpu_block_enabled() -> bool {
 /// que la tête MTP au dernier pas coûte une vérification. D'où la coupure sur la
 /// même longueur que le choix fresh/committed.
 pub(super) fn mtp_lookup_draft_tokens() -> usize {
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    if let Some(forced) = MTP_LOOKUP_DRAFT_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced.min(15);
+    }
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     if let Some(case) = pairwise::current() {
         return case.lookup.min(15);
@@ -450,8 +454,39 @@ pub(super) fn mtp_adaptive_probe_period() -> u32 {
     })
 }
 
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+thread_local! {
+    static GPU_ARGMAX_TEST_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static MTP_LOOKUP_DRAFT_TEST_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force l'argmax GPU et les drafts lookup du MTP sur ce thread le temps de
+/// `run` (oracle O2 du repli `Skip` : vérification sans argmax GPU d'une
+/// proposition lookup multiligne).
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn with_mtp_skip_override<R>(lookup_drafts: usize, run: impl FnOnce() -> R) -> R {
+    /// Rétablit les réglages précédents, panique comprise.
+    struct Restore(Option<bool>, Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GPU_ARGMAX_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+            MTP_LOOKUP_DRAFT_TEST_OVERRIDE.with(|cell| cell.set(self.1));
+        }
+    }
+    let _restore = Restore(
+        GPU_ARGMAX_TEST_OVERRIDE.with(|cell| cell.replace(Some(false))),
+        MTP_LOOKUP_DRAFT_TEST_OVERRIDE.with(|cell| cell.replace(Some(lookup_drafts))),
+    );
+    run()
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn gpu_argmax_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = GPU_ARGMAX_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_ARGMAX", true))
 }
@@ -1083,6 +1118,19 @@ pub(crate) fn verify_rows_nax_greedy_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY", true))
 }
 
+/// Vérification greedy stricte (`SARAGOSSA_RUST_VERIFY_STRICT=1`, défaut OFF) :
+/// sous la portée greedy, chaque ligne vérifiée rend les bits du pas mono-ligne.
+/// Le préfixe NAX en lignes est coupé et les matmuls u4 gs64 de 3 à 16 lignes
+/// passent par le qmv-T exact au lieu du skinny (MMA bf16 hi+lo, non exact dès
+/// 5 lignes). Sans `SARAGOSSA_RUST_DFLASH_TREE`, l'arbre DFlash greedy passe à B = 3
+/// ([`DFLASH_TREE_STRICT_DEFAULT_BUDGET`]). Le défaut reste le chemin rapide, à
+/// identité greedy approchée.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn verify_strict_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_STRICT", false))
+}
+
 /// Contexte minimal du préfixe NAX en lignes
 /// (`SARAGOSSA_RUST_VERIFY_ROWS_NAX_MIN_LEN`, défaut 16384, le seuil greedy
 /// bf16) : MTP échantillonné à 4k (KV bf16 dès le prompt court, même binaire,
@@ -1641,6 +1689,26 @@ pub(crate) fn dflash_tree_budget() -> Option<Result<usize, String>> {
 /// 9 lignes de la chaîne (même coût de vérification) et gagne +12 à +35 % de
 /// decode en pairwise (`docs/perf/mtp-pairwise.md`).
 pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
+
+/// Budget de l'arbre DFlash 2 par défaut en vérification stricte
+/// (`SARAGOSSA_RUST_VERIFY_STRICT=1`) : B = 3, le plus rapide des deux chemins
+/// exacts. Mesuré le 5 nov. 2026 (27B, ABBA, M5 Max, tok/s) : B = 3 strict
+/// 52,4-53,8 à 4k et 44,9-45,1 à 32k, contre 39,1-39,5 et 29,6-30,1 pour
+/// B = 8 strict en qmv-T, et 55,1-56,5 et 50,3-51,3 pour le défaut rapide.
+pub(crate) const DFLASH_TREE_STRICT_DEFAULT_BUDGET: usize = 3;
+
+/// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` : B = 3 pour une
+/// requête greedy (`greedy`, température nulle) en mode strict, B = 8 sinon
+/// (échantillonné compris, que le mode strict ne touche pas).
+pub(crate) fn dflash_tree_default_budget(greedy: bool) -> usize {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if greedy && verify_strict_enabled() {
+        return DFLASH_TREE_STRICT_DEFAULT_BUDGET;
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let _ = greedy;
+    DFLASH_TREE_DEFAULT_BUDGET
+}
 
 /// Parse `SARAGOSSA_RUST_DFLASH_TREE` (entier, espaces ignorés) ; `None` si
 /// invalide.

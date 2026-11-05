@@ -8,7 +8,11 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-fn pipeline(library: &metal::Library, device: &Device, name: &str) -> Result<ComputePipelineState> {
+pub(super) fn pipeline(
+    library: &metal::Library,
+    device: &Device,
+    name: &str,
+) -> Result<ComputePipelineState> {
     let function = library
         .get_function(name, None)
         .map_err(|message| InferError::Metal(format!("kernel {name}: {message}")))?;
@@ -1007,6 +1011,8 @@ impl MetalExecutor {
             scratch_buffers: Mutex::new(ScratchBufferCache::default()),
             moe_stacks: Mutex::new(HashMap::new()),
             concat_buffers: Mutex::new(HashMap::new()),
+            library: library.clone(),
+            qmvt_pipelines: Mutex::new(HashMap::new()),
             preserve_weight_caches: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             scratch_releases: std::sync::atomic::AtomicUsize::new(0),

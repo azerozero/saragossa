@@ -10852,3 +10852,240 @@ kernel void talker_greedy_argmax_f32(
         out_index[0] = indices[0];
     }
 }
+
+// ---------------------------------------------------------------------------
+// qmv-T u4 gs64 : vérification en R lignes exacte, mode strict opt-in.
+// Chaque ligne suit le contrat du qmv mono (`affine_qmv_fast_aligned_u4_gs64_f32`) :
+// `xt` (x, x/16, x/256, x/4096) et `sum` par voie et par bloc de 512, chaîne de
+// 16 fma par sortie, `r = fma(scale, accum, fma(sum, bias, r))`, `simd_sum`.
+// `xt` et `sum` sont calculés une fois par ligne et par bloc au lieu d'une fois
+// par sortie ; les poids sont masqués et convertis une fois pour les R lignes.
+// Deux sorties par simdgroup. `xt` est rangé en float4 `[ligne][bloc][quart][voie]`
+// pour des lectures contiguës entre voies.
+// ---------------------------------------------------------------------------
+
+// Prep device : une tâche = (ligne, voie d'un bloc) -> 4 float4 de `xt` et sa somme.
+kernel void affine_qmvt_prep_u4_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device float4* xt_out [[buffer(1)]],
+    device float* sum_out [[buffer(2)]],
+    constant uint2& shape [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    // NOTE: même contrat que le qmv mono (O1 rows_exact) : contraction coupée.
+    #pragma METAL fp contract(off)
+    const uint in_dim = shape.x;
+    const uint lanes = in_dim / 16u;
+    if (gid >= shape.y * lanes) {
+        return;
+    }
+    const uint m = gid / lanes;
+    const uint c = gid - m * lanes;
+    const uint block = c / 32u;
+    const uint lane = c - block * 32u;
+    const device float* x = lhs + m * in_dim + c * 16u;
+    float sum = 0.0f;
+    for (uint i = 0u; i < 16u; i += 4u) {
+        const float x0 = x[i];
+        const float x1 = x[i + 1u];
+        const float x2 = x[i + 2u];
+        const float x3 = x[i + 3u];
+        sum += x0 + x1 + x2 + x3;
+        xt_out[((m * (in_dim / 512u) + block) * 4u + i / 4u) * 32u + lane] =
+            float4(x0, x1 * 0.0625f, x2 * 0.00390625f, x3 * 0.000244140625f);
+    }
+    sum_out[gid] = sum;
+}
+
+// Variante device : lit `xt`/`sum` préparés par `affine_qmvt_prep_u4_gs64_f32`.
+// Deux simdgroups par threadgroup, deux sorties chacun.
+template <uint R>
+kernel void affine_qmvt_dev_u4_gs64_f32(
+    device const float4* xt [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    device const float* sums [[buffer(6)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    // NOTE: même contrat que le qmv mono (O1 rows_exact) : contraction coupée.
+    #pragma METAL fp contract(off)
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint blocks = in_dim / 512u;
+    const uint row_base = (tile.y * 2u + simd_gid) * 2u;
+    const uint row_bytes = packed_cols * 4u;
+    const device uchar* ws = ((const device uchar*)packed) + row_base * row_bytes + simd_lid * 8u;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / 4u;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / 4u;
+    float result[2][R];
+    for (uint o = 0u; o < 2u; ++o) {
+        for (uint m = 0u; m < R; ++m) {
+            result[o][m] = 0.0f;
+        }
+    }
+    for (uint b = 0u; b < blocks; ++b) {
+        float accum[2][R];
+        for (uint o = 0u; o < 2u; ++o) {
+            for (uint m = 0u; m < R; ++m) {
+                accum[o][m] = 0.0f;
+            }
+        }
+        for (uint i = 0u; i < 4u; ++i) {
+            float w[2][4];
+            for (uint o = 0u; o < 2u; ++o) {
+                const ushort word = ((const device ushort*)(ws + o * row_bytes))[i];
+                w[o][0] = float(word & 0x000fu);
+                w[o][1] = float(word & 0x00f0u);
+                w[o][2] = float(word & 0x0f00u);
+                w[o][3] = float(word & 0xf000u);
+            }
+            for (uint m = 0u; m < R; ++m) {
+                const float4 t = xt[((m * blocks + b) * 4u + i) * 32u + simd_lid];
+                for (uint o = 0u; o < 2u; ++o) {
+                    accum[o][m] = fma(t.x, w[o][0], accum[o][m]);
+                    accum[o][m] = fma(t.y, w[o][1], accum[o][m]);
+                    accum[o][m] = fma(t.z, w[o][2], accum[o][m]);
+                    accum[o][m] = fma(t.w, w[o][3], accum[o][m]);
+                }
+            }
+        }
+        for (uint o = 0u; o < 2u; ++o) {
+            const float sc = scale_base[o * groups];
+            const float bi = bias_base[o * groups];
+            for (uint m = 0u; m < R; ++m) {
+                const float s = sums[(m * blocks + b) * 32u + simd_lid];
+                result[o][m] = fma(sc, accum[o][m], fma(s, bi, result[o][m]));
+            }
+        }
+        ws += 256u;
+        scale_base += 8u;
+        bias_base += 8u;
+    }
+    for (uint o = 0u; o < 2u; ++o) {
+        for (uint m = 0u; m < R; ++m) {
+            const float reduced = simd_sum(result[o][m]);
+            if (simd_lid == 0u) {
+                out[m * out_dim + row_base + o] = reduced;
+            }
+        }
+    }
+}
+
+// Variante threadgroup : `xt`/`sum` préparés en coopération par les S
+// simdgroups dans la mémoire threadgroup, bloc par bloc, sans retour anticipé.
+template <uint R, uint S>
+kernel void affine_qmvt_tg_u4_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    // NOTE: même contrat que le qmv mono (O1 rows_exact) : contraction coupée.
+    #pragma METAL fp contract(off)
+    threadgroup float4 txt[R * 4u * 32u];
+    threadgroup float tsum[R * 32u];
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint row_base = (tile.y * S + simd_gid) * 2u;
+    const uint row_bytes = packed_cols * 4u;
+    const device uchar* ws = ((const device uchar*)packed) + row_base * row_bytes + simd_lid * 8u;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / 4u;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / 4u;
+    float result[2][R];
+    for (uint o = 0u; o < 2u; ++o) {
+        for (uint m = 0u; m < R; ++m) {
+            result[o][m] = 0.0f;
+        }
+    }
+    for (uint k = 0u; k < in_dim; k += 512u) {
+        for (uint task = tid; task < R * 32u; task += S * 32u) {
+            const uint m = task / 32u;
+            const uint lane = task - m * 32u;
+            const device float* x = lhs + m * in_dim + k + lane * 16u;
+            float sum = 0.0f;
+            for (uint i = 0u; i < 16u; i += 4u) {
+                const float x0 = x[i];
+                const float x1 = x[i + 1u];
+                const float x2 = x[i + 2u];
+                const float x3 = x[i + 3u];
+                sum += x0 + x1 + x2 + x3;
+                txt[(m * 4u + i / 4u) * 32u + lane] =
+                    float4(x0, x1 * 0.0625f, x2 * 0.00390625f, x3 * 0.000244140625f);
+            }
+            tsum[task] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float accum[2][R];
+        for (uint o = 0u; o < 2u; ++o) {
+            for (uint m = 0u; m < R; ++m) {
+                accum[o][m] = 0.0f;
+            }
+        }
+        for (uint i = 0u; i < 4u; ++i) {
+            float w[2][4];
+            for (uint o = 0u; o < 2u; ++o) {
+                const ushort word = ((const device ushort*)(ws + o * row_bytes))[i];
+                w[o][0] = float(word & 0x000fu);
+                w[o][1] = float(word & 0x00f0u);
+                w[o][2] = float(word & 0x0f00u);
+                w[o][3] = float(word & 0xf000u);
+            }
+            for (uint m = 0u; m < R; ++m) {
+                const float4 t = txt[(m * 4u + i) * 32u + simd_lid];
+                for (uint o = 0u; o < 2u; ++o) {
+                    accum[o][m] = fma(t.x, w[o][0], accum[o][m]);
+                    accum[o][m] = fma(t.y, w[o][1], accum[o][m]);
+                    accum[o][m] = fma(t.z, w[o][2], accum[o][m]);
+                    accum[o][m] = fma(t.w, w[o][3], accum[o][m]);
+                }
+            }
+        }
+        for (uint o = 0u; o < 2u; ++o) {
+            const float sc = scale_base[o * groups];
+            const float bi = bias_base[o * groups];
+            for (uint m = 0u; m < R; ++m) {
+                result[o][m] = fma(sc, accum[o][m], fma(tsum[m * 32u + simd_lid], bi, result[o][m]));
+            }
+        }
+        // Synchronisation avant que le bloc suivant réécrive `txt`.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ws += 256u;
+        scale_base += 8u;
+        bias_base += 8u;
+    }
+    for (uint o = 0u; o < 2u; ++o) {
+        for (uint m = 0u; m < R; ++m) {
+            const float reduced = simd_sum(result[o][m]);
+            if (simd_lid == 0u) {
+                out[m * out_dim + row_base + o] = reduced;
+            }
+        }
+    }
+}
+
+#define QMVT_DEV(R) template [[host_name("affine_qmvt_dev_u4_gs64_f32_r" #R)]] kernel void \
+    affine_qmvt_dev_u4_gs64_f32<R>(device const float4*, device const uint*, device const bfloat*, \
+    device const bfloat*, device float*, constant uint4&, device const float*, uint, uint, uint2);
+#define QMVT_TG(R, S) template [[host_name("affine_qmvt_tg_u4_gs64_f32_r" #R "_s" #S)]] kernel void \
+    affine_qmvt_tg_u4_gs64_f32<R, S>(device const float*, device const uint*, device const bfloat*, \
+    device const bfloat*, device float*, constant uint4&, uint, uint, uint, uint2);
+#define QMVT_ALL(R) QMVT_DEV(R) QMVT_TG(R, 8) QMVT_TG(R, 16)
+QMVT_ALL(3) QMVT_ALL(4) QMVT_ALL(5) QMVT_ALL(6) QMVT_ALL(7) QMVT_ALL(8) QMVT_ALL(9)
+QMVT_ALL(10) QMVT_ALL(11) QMVT_ALL(12) QMVT_ALL(13) QMVT_ALL(14) QMVT_ALL(15)
+// R = 16 : variante device seule ; `txt` threadgroup (R × 2176 octets) dépasserait 32 Ko.
+QMVT_DEV(16)

@@ -5109,6 +5109,12 @@ fn greedy_identity_states_real_model() -> Result<()> {
     let (mut ties_2, mut ties_3, mut tokens_seen) = (0usize, 0usize, 0usize);
     let mut failures = Vec::new();
     let mut coverage: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    let mut tree_widths: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut skip_coverage: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut replay_coverage: std::collections::BTreeMap<&str, usize> = Default::default();
+    // Modes sélectionnés, enregistrés avant tout saut : un mode dont tous les
+    // prompts sont sautés échoue au lieu de passer sans couverture.
+    let mut selected: std::collections::BTreeSet<&str> = Default::default();
     let corpus = identity_corpus()?;
     if corpus.is_empty() {
         return Err(InferError::Config(
@@ -5166,10 +5172,20 @@ fn greedy_identity_states_real_model() -> Result<()> {
         sequence.extend_from_slice(&ar);
         let mut modes: Vec<&str> = vec!["lookup"];
         if has_mtp {
-            modes.push("mtp");
+            // `mtp-skip` : repli sans argmax GPU (tête `Skip`) avec une
+            // proposition lookup multiligne, posés par le test lui-même.
+            modes.extend(["mtp", "mtp-skip"]);
         }
         if draft.is_some() {
-            modes.extend(["dflash-chaîne", "dflash-arbre"]);
+            // `dflash-défaut` : entrée publique, arbre choisi par l'environnement
+            // (B = 3 en mode strict greedy, B = 8 sinon, sauf `SARAGOSSA_RUST_DFLASH_TREE`).
+            // `dflash-cpu` : boucle batchée de référence, rejeu en lignes après rejet.
+            modes.extend([
+                "dflash-chaîne",
+                "dflash-arbre",
+                "dflash-défaut",
+                "dflash-cpu",
+            ]);
         }
         // Sélection explicite (`SARAGOSSA_RUST_IDENTITY_MODES`, virgules) : un mode
         // demandé mais indisponible (sidecar ou drafter absent) fait échouer.
@@ -5183,6 +5199,16 @@ fn greedy_identity_states_real_model() -> Result<()> {
             modes.retain(|mode| wanted.iter().any(|m| m == mode));
         }
         for mode in modes {
+            selected.insert(mode);
+            // NOTE: la boucle DFlash CPU de référence prend son propre prefill avec
+            // captures, distinct de celui de l'AR au-delà de 16k : hors périmètre.
+            if mode == "dflash-cpu" && prompt.len() > 16 * 1024 {
+                eprintln!(
+                    "identité {name} dflash-cpu : prompt de {} tokens sauté",
+                    prompt.len()
+                );
+                continue;
+            }
             VERIFY_RECORDER.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
             let tokens = match mode {
                 "lookup" => crate::runtime_flags::with_lookup_greedy_override(8, || {
@@ -5198,6 +5224,48 @@ fn greedy_identity_states_real_model() -> Result<()> {
                         |_| true,
                     )
                     .map(|output| output.tokens),
+                // Boucle MTP directe : avec un drafter chargé, l'entrée publique
+                // MTP passe par DFlash (tête argmax) et ne vérifie jamais en `Skip`.
+                "mtp-skip" => crate::runtime_flags::with_mtp_skip_override(8, || {
+                    model.generate_greedy_mtp_core(&prompt, max_new, &options, 2, |_| true)
+                })
+                .map(|output| output.tokens),
+                "dflash-cpu" => {
+                    let draft = draft
+                        .as_ref()
+                        .ok_or_else(|| InferError::Config("drafter".into()))?;
+                    model
+                        .generate_greedy_dflash_batched_with_options(
+                            &prompt,
+                            max_new,
+                            &options,
+                            draft,
+                            draft.info.block_size,
+                        )
+                        .map(|output| output.tokens)
+                }
+                "dflash-défaut" => {
+                    // Le défaut se lit sans surcharge : un `DFLASH_TREE` hérité
+                    // mesurerait autre chose que le budget choisi par le mode.
+                    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_TREE").is_some() {
+                        return Err(InferError::Config(
+                            "dflash-défaut : SARAGOSSA_RUST_DFLASH_TREE hérité refusé".into(),
+                        ));
+                    }
+                    let draft = draft
+                        .as_ref()
+                        .ok_or_else(|| InferError::Config("drafter".into()))?;
+                    model
+                        .generate_greedy_dflash_resident_streaming_with_options(
+                            &prompt,
+                            max_new,
+                            &options,
+                            draft,
+                            draft.info.block_size,
+                            |_| true,
+                        )
+                        .map(|output| output.tokens)
+                }
                 _ => {
                     let draft = draft
                         .as_ref()
@@ -5249,6 +5317,37 @@ fn greedy_identity_states_real_model() -> Result<()> {
             let seen = coverage.entry(mode).or_default();
             seen.0 += tally.multi_row_compared;
             seen.1 += tally.branched_records;
+            // Largeur d'arbre réellement vérifiée (B + 1 lignes au plus).
+            let widest_tree = records
+                .iter()
+                .filter(|record| record.parents.is_some())
+                .map(|record| record.tokens.len())
+                .max()
+                .unwrap_or(0);
+            let tree_width = tree_widths.entry(mode).or_insert(0);
+            *tree_width = (*tree_width).max(widest_tree);
+            // Repli sans argmax GPU : vérifications `Skip` de 5 lignes et plus
+            // (lookup multiligne), lignes comparées à l'AR comprises.
+            let skip_rows = records
+                .iter()
+                .filter(|record| record.skip_head && record.batched && record.tokens.len() >= 5)
+                .count();
+            *skip_coverage.entry(mode).or_insert(0) += skip_rows;
+            // Rejeux en lignes après rejet : lot `Skip` de 5 lignes et plus qui
+            // reprend, à la même position, le début de la vérification précédente.
+            let replays = records
+                .windows(2)
+                .filter(|pair| {
+                    let (verify, replay) = (&pair[0], &pair[1]);
+                    replay.skip_head
+                        && replay.batched
+                        && replay.tokens.len() >= 5
+                        && replay.base_position == verify.base_position
+                        && replay.tokens.len() < verify.tokens.len()
+                        && verify.tokens.starts_with(&replay.tokens)
+                })
+                .count();
+            *replay_coverage.entry(mode).or_insert(0) += replays;
             if tally.first_token_divergence.is_some() || tally.state_mismatches > 0 {
                 failures.push(format!("{name} {mode}: {tally:?}"));
             }
@@ -5263,13 +5362,240 @@ fn greedy_identity_states_real_model() -> Result<()> {
                 "{mode}: aucune ligne d'un lot de plusieurs lignes comparée"
             ));
         }
-        if *mode == "dflash-arbre" && *branched == 0 {
+        if matches!(*mode, "dflash-arbre" | "dflash-défaut") && *branched == 0 {
             failures.push(format!("{mode}: aucun arbre branché vérifié"));
         }
+    }
+    eprintln!("identité : largeur d'arbre max {tree_widths:?}, vérifications Skip ≥ 5 lignes {skip_coverage:?}");
+    // `dflash-défaut` : la largeur observée est celle du budget par défaut
+    // (B = 3 en greedy strict, B = 8 sinon), pas une autre.
+    for mode in &selected {
+        if !coverage.contains_key(mode) {
+            failures.push(format!(
+                "{mode}: tous ses prompts sautés, aucune vérification"
+            ));
+        }
+    }
+    if selected.contains("dflash-défaut") {
+        let width = tree_widths.get("dflash-défaut").copied().unwrap_or(0);
+        let expected = crate::runtime_flags::dflash_tree_default_budget(true) + 1;
+        if width != expected {
+            failures.push(format!(
+                "dflash-défaut : arbre de {width} lignes au plus, {expected} attendu"
+            ));
+        }
+    }
+    eprintln!("identité : rejeux en lignes ≥ 5 lignes {replay_coverage:?}");
+    // Couvertures obligatoires des modes de repli : `mtp-skip` a vérifié par la
+    // tête `Skip` des lots de 5 lignes et plus (proposition lookup), `dflash-cpu`
+    // a rejoué en lignes au moins 5 tokens acceptés après un rejet.
+    if selected.contains("mtp-skip") && skip_coverage.get("mtp-skip").copied().unwrap_or(0) == 0 {
+        failures.push("mtp-skip : aucune vérification Skip de 5 lignes et plus".to_string());
+    }
+    if selected.contains("dflash-cpu")
+        && replay_coverage.get("dflash-cpu").copied().unwrap_or(0) == 0
+    {
+        failures.push("dflash-cpu : aucun rejeu de 5 lignes et plus".to_string());
     }
     assert!(
         failures.is_empty(),
         "identité greedy rompue : {failures:#?}"
+    );
+    Ok(())
+}
+
+/// Oracle O2 de la réutilisation partielle du cache de préfixe : le prompt moins
+/// un suffixe de 5, 17 ou 31 tokens est mis en cache par le mode lui-même, puis
+/// le prompt complet le reprend et prolonge le suffixe. Les tokens et les états
+/// des lignes vérifiées doivent égaler ceux de l'AR soumis à la même reprise :
+/// la portée greedy (mode strict compris) ne couvre que les vérifications
+/// spéculatives, pas l'extension du préfixe. Exige le cache de préfixe actif ;
+/// à lancer en mode strict et en défaut (le défaut peut diverger par le skinny
+/// et le NAX des vérifications, voir docs/perf/greedy-identity.md).
+#[test]
+#[ignore = "modèle réel requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
+    use crate::decoder::resident::VERIFY_RECORDER;
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    for name in [
+        "SARAGOSSA_RUST_PREFIX_CACHE",
+        "SARAGOSSA_RUST_PREFIX_CACHE_CAP",
+    ] {
+        if crate::runtime_flags::env_var(name).is_some_and(|v| v.trim() == "0") {
+            return Err(InferError::Config(format!(
+                "{name}=0 : oracle de réutilisation sans objet"
+            )));
+        }
+    }
+    // Chaque génération du prompt complet doit reprendre exactement le préfixe
+    // déposé et prolonger le suffixe une seule fois, par le chemin résident.
+    let traced = |label: &str, suffix: usize, run: &mut dyn FnMut() -> Result<()>| -> Result<()> {
+        super::generation::PREFIX_EXTEND_TRACE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        let result = run();
+        let trace = super::generation::PREFIX_EXTEND_TRACE
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap_or_default();
+        result?;
+        if trace != [(suffix, true)] {
+            return Err(InferError::Config(format!(
+                "{label} : extension {trace:?}, attendu une reprise de suffixe {suffix} résidente"
+            )));
+        }
+        Ok(())
+    };
+    let max_new = 48usize;
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let has_mtp = match assets.mtp.path.as_ref() {
+        Some(path) => {
+            model = model.with_mtp_sidecar(path)?;
+            true
+        }
+        None => false,
+    };
+    let draft = if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_some() {
+        model = model.with_dflash_draft_from_env(&assets.config)?;
+        model.dflash_draft().cloned()
+    } else {
+        None
+    };
+    let mut modes = Vec::new();
+    if has_mtp {
+        modes.push("mtp");
+    }
+    if draft.is_some() {
+        modes.push("dflash-défaut");
+    }
+    if modes.is_empty() {
+        return Err(InferError::Config("ni tête MTP ni drafter DFlash".into()));
+    }
+    let options = mtp_verifier_options(Vec::new());
+    let hidden = model.final_norm.data().len();
+    let run_mode = |mode: &str, prompt: &[usize], tokens: usize| -> Result<Vec<usize>> {
+        match (mode, draft.as_ref()) {
+            ("dflash-défaut", Some(draft)) => model
+                .generate_greedy_dflash_resident_streaming_with_options(
+                    prompt,
+                    tokens,
+                    &options,
+                    draft,
+                    draft.info.block_size,
+                    |_| true,
+                )
+                .map(|output| output.tokens),
+            _ => model
+                .generate_greedy_mtp_streaming_with_options(prompt, tokens, &options, 2, |_| true)
+                .map(|output| output.tokens),
+        }
+    };
+    let mut failures = Vec::new();
+    let mut compared = 0usize;
+    let mut exercised = std::collections::BTreeSet::new();
+    for (name, text) in identity_corpus()? {
+        let prompt = mtp_verifier_prompt_ids(&assets, &text)?;
+        for suffix in [5usize, 17, 31] {
+            // Le cache de préfixe refuse une reprise dont le suffixe dépasse la
+            // moitié du prompt (repli à froid, plus rapide) : cas sauté ici, mais
+            // chaque taille de suffixe doit être exercée au moins une fois.
+            if suffix * 2 > prompt.len() {
+                continue;
+            }
+            exercised.insert(suffix);
+            let head = &prompt[..prompt.len() - suffix];
+            // AR : préfixe en cache, puis le prompt complet le reprend.
+            model.clear_prefix_cache();
+            model.generate_greedy_cached_with_options(head, 1, &options)?;
+            let mut ar = Vec::new();
+            traced(&format!("{name} {suffix} AR"), suffix, &mut || {
+                ar = model.generate_greedy_cached_with_options(&prompt, max_new, &options)?;
+                Ok(())
+            })?;
+            // États AR après la même reprise partielle : pas mono-ligne.
+            model.clear_prefix_cache();
+            model.generate_greedy_cached_with_options(head, 1, &options)?;
+            let kv_bf16 = CausalDecoder::resident_kv_bf16(false, prompt.len());
+            let mut cache = None;
+            traced(&format!("{name} {suffix} états AR"), suffix, &mut || {
+                cache = Some(model.prefill_cache_state(&prompt)?.0);
+                Ok(())
+            })?;
+            let mut cache =
+                cache.ok_or_else(|| InferError::Config("cache AR absent".to_string()))?;
+            if !model.setup_resident_full_decode(&mut cache, max_new + 16, 16, kv_bf16)? {
+                return Err(InferError::Config("setup résident refusé".to_string()));
+            }
+            let mut ar_states = Vec::with_capacity(ar.len());
+            for &token in &ar[..ar.len().saturating_sub(1)] {
+                let out = model
+                    .next_final_states_resident_verify(
+                        &mut cache,
+                        &[token],
+                        ResidentVerifyHead::Argmax,
+                        false,
+                        None,
+                        None,
+                    )?
+                    .ok_or_else(|| InferError::Config("pas mono indisponible".into()))?;
+                ar_states.push(out.states.data().to_vec());
+            }
+            drop(cache);
+            let mut sequence = prompt.clone();
+            sequence.extend_from_slice(&ar);
+            for &mode in &modes {
+                // Préfixe déposé par le mode lui-même (historique MTP, captures DFlash).
+                model.clear_prefix_cache();
+                run_mode(mode, head, 1)?;
+                VERIFY_RECORDER.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+                let mut tokens = Ok(Vec::new());
+                let traced_run = traced(&format!("{name} {suffix} {mode}"), suffix, &mut || {
+                    tokens = run_mode(mode, &prompt, max_new);
+                    Ok(())
+                });
+                let records = VERIFY_RECORDER
+                    .with(|slot| slot.borrow_mut().take())
+                    .unwrap_or_default();
+                let tokens = tokens?;
+                traced_run?;
+                let mut tally = IdentityTally {
+                    first_token_divergence: tokens
+                        .iter()
+                        .zip(&ar)
+                        .position(|(a, b)| a != b)
+                        .or((tokens.len() != ar.len()).then(|| tokens.len().min(ar.len()))),
+                    ..IdentityTally::default()
+                };
+                identity_compare_records(
+                    &records,
+                    &sequence,
+                    prompt.len(),
+                    &ar_states,
+                    hidden,
+                    &mut tally,
+                );
+                eprintln!("réutilisation {name} suffixe {suffix} {mode}: {tally:?}");
+                compared += tally.compared_rows;
+                if tally.first_token_divergence.is_some() || tally.state_mismatches > 0 {
+                    failures.push(format!("{name} suffixe {suffix} {mode}: {tally:?}"));
+                }
+            }
+        }
+    }
+    model.clear_prefix_cache();
+    assert!(
+        compared > 0,
+        "réutilisation de préfixe : aucune ligne comparée"
+    );
+    assert_eq!(
+        exercised.into_iter().collect::<Vec<_>>(),
+        vec![5, 17, 31],
+        "réutilisation de préfixe : chaque suffixe doit être exercé (prompts trop courts ?)"
+    );
+    assert!(
+        failures.is_empty(),
+        "réutilisation de préfixe ≠ AR : {failures:#?}"
     );
     Ok(())
 }

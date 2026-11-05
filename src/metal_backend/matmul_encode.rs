@@ -9,6 +9,9 @@ thread_local! {
     // Dispatches skinny encodés sur ce thread : les tests de précision vérifient
     // qu'ils comparent bien le kernel skinny et non deux replis qmv identiques.
     pub(super) static SKINNY_DISPATCHES: Cell<usize> = const { Cell::new(0) };
+    // Dispatches qmv-T encodés sur ce thread : l'oracle strict vérifie qu'il
+    // compare bien le qmv-T et non le qmv répliqué.
+    pub(crate) static QMVT_DISPATCHES: Cell<usize> = const { Cell::new(0) };
 }
 
 #[expect(
@@ -42,6 +45,142 @@ impl MetalExecutor {
             SkinnyKernel::X3 => self.na_gemm_skinny_u4_x3.as_ref(),
             SkinnyKernel::X2 => self.na_gemm_skinny_u4_x2.as_ref(),
         }
+    }
+
+    /// Pipeline qmv-T `name`, créé à la première demande : seul le mode strict
+    /// les utilise, le démarrage n'en paie aucun.
+    fn qmvt_pipeline(&self, name: &str) -> Result<ComputePipelineState> {
+        let mut cache = self
+            .qmvt_pipelines
+            .lock()
+            .map_err(|_| InferError::Metal(format!("cache pipelines qmv-T empoisonné: {name}")))?;
+        if let Some(pipeline) = cache.get(name) {
+            return Ok(pipeline.clone());
+        }
+        let pipeline = super::pipelines::pipeline(&self.library, &self.device, name)?;
+        cache.insert(name.to_string(), pipeline.clone());
+        Ok(pipeline)
+    }
+
+    /// qmv-T u4 gs64 exact du mode strict (voir [`can_use_qmvt_buffers`]).
+    /// `in_dim` court (gate, up, qkv à 5120) : `xt`/`sum` préparés une fois en
+    /// mémoire device puis lus par toutes les tuiles (variante la plus rapide à
+    /// 5120, 0,251 ms contre 0,279 en threadgroup sur gate R = 9). `in_dim` long
+    /// (down à 17408) : préparation par threadgroup, S = 8 (0,284 ms contre
+    /// 0,386 en device). Sorties d'au moins 65536 (lm_head 248320×5120) :
+    /// threadgroup S = 16 (3,9 ms contre 4,2 en device). R = 16 : device seule.
+    pub(super) fn encode_affine_qmvt_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed: &BufferRef,
+        packed_offset: NSUInteger,
+        scales: &BufferRef,
+        scales_offset: NSUInteger,
+        biases: &BufferRef,
+        biases_offset: NSUInteger,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        packed_cols: usize,
+        groups: usize,
+    ) -> Result<()> {
+        /// Au-delà, `xt` déborde du cache et la préparation par threadgroup gagne.
+        const QMVT_DEVICE_MAX_IN_DIM: usize = 8192;
+        /// À partir de cette largeur de sortie (lm_head), S = 16 et threadgroup.
+        const QMVT_WIDE_OUT_DIM: usize = 65536;
+        /// Au-delà, `xt` en mémoire threadgroup (R × 2176 octets) dépasse 32 Ko :
+        /// variante device seule.
+        const QMVT_TG_MAX_BATCH: usize = 15;
+        let dims = [
+            checked_u32(out_dim, "qmvt out_dim")?,
+            checked_u32(in_dim, "qmvt in_dim")?,
+            checked_u32(packed_cols, "qmvt packed_cols")?,
+            checked_u32(groups, "qmvt groups")?,
+        ];
+        let set_weights = |encoder: &ComputeCommandEncoderRef| -> Result<()> {
+            encoder.set_buffer(1, Some(packed), packed_offset);
+            encoder.set_buffer(2, Some(scales), scales_offset);
+            encoder.set_buffer(3, Some(biases), biases_offset);
+            encoder.set_buffer(4, Some(output_buffer), 0);
+            set_u32_bytes(encoder, 5, &dims, "qmvt_dims")
+        };
+        trace_dispatch_path("qmvt_u4_gs64_f32", batch, out_dim, in_dim);
+        #[cfg(test)]
+        QMVT_DISPATCHES.with(|count| count.set(count.get() + 1));
+        if batch > QMVT_TG_MAX_BATCH
+            || (in_dim <= QMVT_DEVICE_MAX_IN_DIM && out_dim < QMVT_WIDE_OUT_DIM)
+        {
+            let lanes = batch * in_dim / 16;
+            let xt = self.scratch_buffer_with_options(
+                batch * in_dim,
+                MetalBufferElement::F32,
+                "qmvt_xt",
+                scratch_resource_options(),
+            )?;
+            let sums = self.scratch_buffer_with_options(
+                lanes,
+                MetalBufferElement::F32,
+                "qmvt_sums",
+                scratch_resource_options(),
+            )?;
+            let prep = self.qmvt_pipeline("affine_qmvt_prep_u4_gs64_f32")?;
+            encoder.set_compute_pipeline_state(&prep);
+            encoder.set_buffer(0, Some(lhs_buffer), 0);
+            encoder.set_buffer(1, Some(&xt), 0);
+            encoder.set_buffer(2, Some(&sums), 0);
+            set_u32_bytes(
+                encoder,
+                3,
+                &[
+                    checked_u32(in_dim, "qmvt in_dim")?,
+                    checked_u32(batch, "qmvt batch")?,
+                ],
+                "qmvt_prep_shape",
+            )?;
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    checked_nsuint(lanes.div_ceil(256), "qmvt prep groups")?,
+                    1,
+                    1,
+                ),
+                MTLSize::new(256, 1, 1),
+            );
+            post_dispatch_barrier(encoder);
+            let main = self.qmvt_pipeline(&format!("affine_qmvt_dev_u4_gs64_f32_r{batch}"))?;
+            encoder.set_compute_pipeline_state(&main);
+            encoder.set_buffer(0, Some(&xt), 0);
+            set_weights(encoder)?;
+            encoder.set_buffer(6, Some(&sums), 0);
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(1, checked_nsuint(out_dim / 4, "qmvt out tiles")?, 1),
+                MTLSize::new(64, 1, 1),
+            );
+            // Barrière complète : le prep du matmul suivant réécrit `xt`.
+            post_dispatch_barrier(encoder);
+            return Ok(());
+        }
+        let simdgroups = if out_dim >= QMVT_WIDE_OUT_DIM { 16 } else { 8 };
+        let main = self.qmvt_pipeline(&format!(
+            "affine_qmvt_tg_u4_gs64_f32_r{batch}_s{simdgroups}"
+        ))?;
+        encoder.set_compute_pipeline_state(&main);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        set_weights(encoder)?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                1,
+                checked_nsuint(out_dim / (2 * simdgroups), "qmvt out tiles")?,
+                1,
+            ),
+            MTLSize::new(checked_nsuint(32 * simdgroups, "qmvt threads")?, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
     }
 
     pub(super) fn encode_affine_qmm_skinny_buffers(

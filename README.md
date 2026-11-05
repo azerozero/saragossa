@@ -103,8 +103,12 @@ default-on kernels of the batched verification are not bit-identical to the
 single-row step: the skinny u4 matmul, from 5 rows (DFlash, lookup, MTP with
 lookup drafts on long prompts), and the attention prefix, from 16k tokens of
 context with a bf16 KV cache. A tiny drift can then flip such a tie (before the
-other fixes: 1 request in 66 on a 32k prompt). With both disabled, verified
-states match the AR bit for bit on the test corpus; see
+other fixes: 1 request in 66 on a 32k prompt). `SARAGOSSA_RUST_VERIFY_STRICT=1`
+(opt-in) makes greedy verification exact: the attention prefix stays on the
+exact path, matmuls of 3 to 16 rows use an exact kernel instead of the skinny
+one, and the DFlash tree defaults to 3 nodes. Cost on the 27B with DFlash: −4 %
+at 4k and −12 % at 32k decode versus the default. Verified states then match
+the AR bit for bit on the test corpus; see
 [docs/perf/greedy-identity.md](docs/perf/greedy-identity.md). On the
 **Qwen3.6-35B-A3B** MoE,
 the official Qwen MTP head (not shipped in mlx-community weights) is opt-in:

@@ -183,7 +183,8 @@ pub(super) fn can_use_fast_affine_qmm8(
 /// identiques (DFlash et MTP+lookup, prompts code et prose 4k, 400 tokens, deux
 /// essais). Mesuré le 2026-10-31 (M5 Max, code 4k) : vérification à 8 lignes de
 /// 66-72 à 61-62 ms, à 16 lignes de 94-96 à 89-90 ms.
-/// `SARAGOSSA_RUST_QMM_SKINNY=0` rétablit le qmv répliqué.
+/// `SARAGOSSA_RUST_QMM_SKINNY=0` rétablit le qmv répliqué. Exclu en vérification
+/// greedy stricte, où il n'est pas exact.
 pub(super) fn can_use_qmm_skinny_buffers(
     batch: usize,
     in_dim: usize,
@@ -192,6 +193,7 @@ pub(super) fn can_use_qmm_skinny_buffers(
     bits: usize,
 ) -> bool {
     qmm_skinny_enabled()
+        && !super::verify_strict_active()
         && fast_affine_qmv_enabled(out_dim)
         && batch >= qmm_skinny_min_batch()
         && batch < qmm_na_min_batch()
@@ -199,6 +201,57 @@ pub(super) fn can_use_qmm_skinny_buffers(
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && out_dim % 32 == 0
+}
+
+/// Largeur maximale servie par le qmv-T (instances `r3` à `r16` de
+/// `kernels.metal`, `r16` en variante device seule) ; au-delà, le mode strict
+/// exclut le skinny et les GEMM NA et garde le qmv répliqué, exact aussi.
+pub(super) const QMVT_MAX_BATCH: usize = 16;
+
+/// qmv-T u4 gs64 exact (`affine_qmvt_*`) : en vérification greedy stricte
+/// seulement, de 3 à [`QMVT_MAX_BATCH`] lignes. Il prend la place du skinny,
+/// du qmm8 et du qmv répliqué ; chaque ligne rend les bits du qmv mono.
+/// Mesuré le 2026-11-05 (M5 Max, formes 27B, R = 9) : gate 0,251 ms, down
+/// 0,284 ms, lm_head 3,9 ms, contre 0,19 / 0,21 / 2,1 en skinny et 0,36 /
+/// 0,38 / 5,7 en qmv répliqué.
+///
+/// `prefer_fast_affine` : même règle que le qmv mono (`FastQmvU4` sous
+/// `fast_affine_qmv_enabled(out_dim) || prefer_fast_affine`) ; quand le mono
+/// quitte le qmv rapide (`SARAGOSSA_RUST_QMV_FAST`), le qmv-T aussi.
+pub(super) fn can_use_qmvt_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+    prefer_fast_affine: bool,
+) -> bool {
+    (3..=QMVT_MAX_BATCH).contains(&batch)
+        && (fast_affine_qmv_enabled(out_dim) || prefer_fast_affine)
+        && bits == FAST_QMV_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 512 == 0
+        && out_dim % 32 == 0
+        && super::verify_strict_active()
+}
+
+pub(super) fn can_use_qmvt(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+    prefer_fast_affine: bool,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_qmvt_buffers(
+        batch,
+        in_dim,
+        out_dim,
+        weight.group_size(),
+        weight.bits(),
+        prefer_fast_affine,
+    ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
 pub(super) fn can_use_qmm_skinny(

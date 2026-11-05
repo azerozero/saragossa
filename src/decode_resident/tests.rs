@@ -3025,6 +3025,18 @@ fn dense_layer_u4(
 #[test]
 #[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn full_attn_dense_layer_rows_matches_mono_bits() -> Result<()> {
+    dense_layer_rows_vs_mono(false)
+}
+
+/// Même oracle en vérification greedy stricte : skinny au seuil par défaut,
+/// matmuls de 3 lignes et plus servis par le qmv-T (engagement vérifié).
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn full_attn_dense_layer_rows_strict_qmvt_matches_mono_bits() -> Result<()> {
+    dense_layer_rows_vs_mono(true)
+}
+
+fn dense_layer_rows_vs_mono(strict: bool) -> Result<()> {
     let state = try_state()?.ok_or_else(|| {
         InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
     })?;
@@ -3093,7 +3105,7 @@ fn full_attn_dense_layer_rows_matches_mono_bits() -> Result<()> {
     let keys: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 3)).collect();
     let values: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 11)).collect();
     let input: Vec<f32> = (0..9 * hidden).map(|i| 4.0 * pseudo(5000 + i)).collect();
-    crate::metal_backend::with_qmm_skinny_min_batch_override(usize::MAX, || -> Result<()> {
+    let run = || -> Result<()> {
         let mut failures = Vec::new();
         for rows in 1..=9 {
             let mut kv_mono =
@@ -3159,7 +3171,18 @@ fn full_attn_dense_layer_rows_matches_mono_bits() -> Result<()> {
         }
         assert!(failures.is_empty(), "couche dense ≠ mono : {failures:#?}");
         Ok(())
-    })
+    };
+    if !strict {
+        return crate::metal_backend::with_qmm_skinny_min_batch_override(usize::MAX, run);
+    }
+    let before = crate::metal_backend::qmvt_dispatches_for_test();
+    let _greedy = crate::metal_backend::install_verify_greedy_scope(true);
+    crate::metal_backend::with_verify_strict_override(true, run)?;
+    assert!(
+        crate::metal_backend::qmvt_dispatches_for_test() > before,
+        "mode strict : aucun qmv-T engagé"
+    );
+    Ok(())
 }
 
 fn full_attn_rows_fused_matches_row_loop_all_rows_body() -> Result<()> {
