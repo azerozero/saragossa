@@ -30,6 +30,42 @@ Coût mesuré le 3 nov. 2026 (27B, ABBA, M5 Max) :
 - skinny coupé : DFlash −49 à −52 % ;
 - NAX greedy coupé : DFlash −25 % à 32k et −36 % à 64k, MTP −6 à −9 %.
 
+### Mode strict (`SARAGOSSA_RUST_VERIFY_STRICT=1`, opt-in)
+
+Le flag rend la vérification greedy exacte sans réglage manuel. Sous la portée
+greedy, il fait trois choses :
+- il coupe le préfixe NAX en lignes ;
+- les matmuls u4 gs64 de 3 à 16 lignes passent par le qmv-T au lieu du skinny ;
+- l'arbre DFlash passe à B = 3 nœuds quand `SARAGOSSA_RUST_DFLASH_TREE` est
+  absent.
+
+L'échantillonné et le décodage AR ne changent pas.
+
+Le qmv-T (`affine_qmvt_*`) calcule `xt` et `sum` une fois par ligne et par
+bloc, puis convertit les poids une fois pour les R lignes. Chaque ligne garde
+le contrat canonique du qmv mono. Il existe en deux variantes :
+- device, pour `in_dim` ≤ 8192 ;
+- threadgroup, pour down (S = 8) et pour les sorties d'au moins 65536 (S = 16).
+
+Coût du matmul à 9 lignes (ms) :
+
+| Matmul | skinny | qmv-T | qmv répliqué |
+|---|---|---|---|
+| gate 17408×5120 | 0,19 | 0,25 | 0,36 |
+| down 5120×17408 | 0,21 | 0,28 | 0,38 |
+| lm_head 248320×5120 | 2,1 | 3,9 | 5,7 |
+
+Choix du budget d'arbre (27B, DFlash, ABBA, 200 tokens, tok/s) :
+
+| Contexte | défaut rapide (B = 8) | strict B = 8 (qmv-T) | strict B = 3 |
+|---|---|---|---|
+| 4k | 55,3 / 55,3 | 39,5 / 39,1 | 53,8 / 53,1 |
+| 32k | 50,8 / 50,3 | 29,6 / 29,8 | 44,9 / 44,9 |
+
+Le strict B = 3 coûte −4 % à 4k et −12 % à 32k face au défaut rapide. Le
+strict B = 8 coûte −29 % et −41 %. Mesures croisées strict B = 8 / B = 3 :
+39,5 / 52,4 à 4k et 30,1 / 45,1 à 32k.
+
 Le scan gated-delta inverse
 (`SARAGOSSA_RUST_LINEAR_INV_DELTA`, opt-in) reste hors périmètre : la
 vérification en lignes n'a pas de variante inverse.
@@ -146,12 +182,15 @@ changent avec l'arrondi ; ce n'est pas un gain des kernels.
   SARAGOSSA_RUST_IDENTITY_EXTERNAL_DIR=<dossier de prose32k-1.txt> \
   SARAGOSSA_RUST_IDENTITY_PROMPTS=chat-1,chat-2,chat-3,chat-4,chat-5,chat-6,code4k-1,code4k-2,code4k-3,prose32k-1 \
   SARAGOSSA_RUST_IDENTITY_MODES=mtp,dflash-chaîne,dflash-arbre \
-  SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH=32 SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY=0 \
+  SARAGOSSA_RUST_VERIFY_STRICT=1 \
   cargo test --release --all-features --lib -- --ignored --exact \
     decoder::tests::greedy_identity_states_real_model
   ```
 
-  - **Avec les deux coupures, le test doit passer.**
+  - **En mode strict, le test doit passer.** Les deux coupures manuelles
+    (`SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH=32` et
+    `SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY=0`) donnent le même résultat, plus
+    lentement.
   - **Avec les réglages par défaut, il doit échouer** : les états en lignes
     du skinny, et du NAX au-delà de 16k, diffèrent de l'AR, même quand les
     tokens restent identiques.
