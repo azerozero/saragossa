@@ -669,3 +669,30 @@ fn finalize_invalidates_corrupt_shard_then_resume_repairs_it() {
         .contains(&"model-00001-of-00002".to_string()));
     assert_eq!(digests(&third.files), digests(&first.files));
 }
+
+#[test]
+fn refuses_in_place_conversion_even_through_a_symlink() {
+    let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+    write_source(src.path(), |_| {});
+    let config = std::fs::read(src.path().join("config.json")).expect("invariant: config");
+    let error = convert_qwen4exp(&options(src.path(), src.path()))
+        .err()
+        .unwrap_or_else(|| panic!("conversion sur place acceptée"));
+    assert!(error.to_string().contains("sur place"), "{error}");
+    let alias = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let link = alias.path().join("alias");
+    std::os::unix::fs::symlink(src.path(), &link).expect("invariant: lien");
+    let error = convert_qwen4exp(&options(src.path(), &link))
+        .err()
+        .unwrap_or_else(|| panic!("conversion via alias acceptée"));
+    assert!(error.to_string().contains("sur place"), "{error}");
+    // Alias par composant `.` non normalisé.
+    let dotted = link.join(".");
+    assert!(convert_qwen4exp(&options(src.path(), &dotted)).is_err());
+    assert_eq!(
+        std::fs::read(src.path().join("config.json")).expect("invariant: config"),
+        config,
+        "la config source ne doit pas changer"
+    );
+    assert!(!src.path().join(".convert").exists());
+}

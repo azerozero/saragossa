@@ -341,6 +341,50 @@ fn segment_unit(part: usize) -> String {
     format!("ngram-{part:03}")
 }
 
+/// Chemin résolu (liens symboliques compris) d'un dossier éventuellement
+/// inexistant : ancêtre existant canonisé, puis composants restants.
+fn resolved(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| io_err(path, e))?
+            .join(path)
+    };
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(canonical) => {
+                return Ok(rest
+                    .iter()
+                    .rev()
+                    .fold(canonical, |acc, part| acc.join(part)));
+            }
+            Err(_) => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return Ok(absolute);
+                };
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+        }
+    }
+}
+
+/// Refuse une conversion sur place : la finalisation écraserait l'index et la
+/// config de la source.
+fn refuse_in_place(src: &Path, dst: &Path) -> Result<()> {
+    if resolved(src)? == resolved(dst)? {
+        return Err(InferError::Config(format!(
+            "conversion sur place refusée: {} et {} désignent le même dossier",
+            src.display(),
+            dst.display()
+        )));
+    }
+    Ok(())
+}
+
 /// sha256 de la plage `[offset, offset + len)` d'un fichier.
 fn range_sha256(file: &File, path: &Path, offset: u64, len: u64) -> Result<String> {
     let mut sha = Sha256::new();
@@ -380,6 +424,7 @@ fn check_done(path: &Path, size: u64, sha: &str, verify: bool) -> Result<bool> {
 pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
     let started = Instant::now();
     let mut peak = PeakTracker::default();
+    refuse_in_place(&options.src, &options.dst)?;
     let config_path = options.src.join("config.json");
     let src_config = read_json(&config_path)?;
     let (expected, ngram_config) = expected_from(&src_config)?;
