@@ -27,9 +27,6 @@ pub(crate) const OUT_TRUNK_PREFIX: &str = "language_model.model.";
 /// Nom du lm_head en sortie, apparié au préfixe `language_model.model.`.
 pub(crate) const OUT_LM_HEAD: &str = "language_model.lm_head.weight";
 
-/// Couche portant le PLE (indice 0-based ; `ple_layer_ids=[2]` est 1-indexé).
-pub(crate) const PLE_LAYER: usize = 1;
-
 /// Projection d'un expert routé.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Proj {
@@ -201,7 +198,7 @@ const LAYER_RULES: &[(&str, Kind, Applies)] = &[
     ("self_attn.v_proj.weight", Kind::U8, Applies::Full),
 ];
 
-/// Suffixes exacts du PLE (couche [`PLE_LAYER`] du tronc uniquement).
+/// Suffixes exacts du PLE (couche PLE du tronc uniquement, lue dans `ple_layer_ids`).
 const PLE_RULES: &[(&str, Kind)] = &[
     ("ple.conv1d.weight", Kind::Copy),
     ("ple.key_proj.weight", Kind::U8),
@@ -291,7 +288,13 @@ fn parse_expert(tail: &str) -> Option<(usize, Proj, bool)> {
     }
 }
 
-fn layer_role(group: ExpertGroup, layer: usize, tail: &str, name: &str) -> Result<Role> {
+fn layer_role(
+    group: ExpertGroup,
+    layer: usize,
+    tail: &str,
+    name: &str,
+    ple_layer: usize,
+) -> Result<Role> {
     if let Some((expert, proj, is_scale)) = parse_expert(tail) {
         return Ok(if is_scale {
             Role::ExpertScale {
@@ -310,7 +313,7 @@ fn layer_role(group: ExpertGroup, layer: usize, tail: &str, name: &str) -> Resul
     if let Some((_, kind, _)) = LAYER_RULES.iter().find(|(suffix, _, _)| *suffix == tail) {
         return Ok(kind_role(*kind));
     }
-    let is_ple_layer = group == ExpertGroup::Trunk(PLE_LAYER) && layer == PLE_LAYER;
+    let is_ple_layer = group == ExpertGroup::Trunk(ple_layer) && layer == ple_layer;
     if is_ple_layer {
         if let Some(role) = lookup(PLE_RULES, tail) {
             return Ok(role);
@@ -329,12 +332,12 @@ fn layer_role(group: ExpertGroup, layer: usize, tail: &str, name: &str) -> Resul
     Err(unknown(name))
 }
 
-/// Classe un tenseur source.
+/// Classe un tenseur source ; `ple_layer` est l'indice 0-based de la couche PLE.
 ///
 /// # Errors
 ///
 /// Renvoie une erreur pour tout nom sans règle explicite.
-pub(crate) fn classify(name: &str) -> Result<Role> {
+pub(crate) fn classify(name: &str, ple_layer: usize) -> Result<Role> {
     if name.starts_with(VISION_PREFIX) {
         return Ok(Role::Vision);
     }
@@ -349,7 +352,7 @@ pub(crate) fn classify(name: &str) -> Result<Role> {
             return Ok(role);
         }
         let (layer, tail) = split_layer(rest).ok_or_else(|| unknown(name))?;
-        return layer_role(ExpertGroup::Trunk(layer), layer, tail, name);
+        return layer_role(ExpertGroup::Trunk(layer), layer, tail, name, ple_layer);
     }
     if let Some(rest) = name.strip_prefix(MTP_PREFIX) {
         if let Some(role) = lookup(MIXER_RULES, rest).or_else(|| lookup(MTP_GLOBAL_RULES, rest)) {
@@ -359,7 +362,7 @@ pub(crate) fn classify(name: &str) -> Result<Role> {
         if layer != 0 {
             return Err(unknown(name));
         }
-        return layer_role(ExpertGroup::Mtp, layer, tail, name);
+        return layer_role(ExpertGroup::Mtp, layer, tail, name, ple_layer);
     }
     Err(unknown(name))
 }
@@ -423,7 +426,11 @@ fn layer_names(prefix: &str, layer: usize, kind: LayerType, out: &mut Vec<String
 
 /// Noms source attendus hors experts, shards n-gram et vision : la partition
 /// doit les contenir tous, et rien d'autre.
-pub(crate) fn expected_source_names(trunk: &[LayerType], mtp: Option<LayerType>) -> Vec<String> {
+pub(crate) fn expected_source_names(
+    trunk: &[LayerType],
+    mtp: Option<LayerType>,
+    ple_layer: usize,
+) -> Vec<String> {
     let mut names = vec![
         "lm_head.weight".to_string(),
         format!("{TRUNK_PREFIX}embed_tokens.weight"),
@@ -433,7 +440,7 @@ pub(crate) fn expected_source_names(trunk: &[LayerType], mtp: Option<LayerType>)
     }
     for (layer, kind) in trunk.iter().enumerate() {
         layer_names(TRUNK_PREFIX, layer, *kind, &mut names);
-        if layer == PLE_LAYER {
+        if layer == ple_layer {
             for (suffix, _) in PLE_RULES {
                 names.push(format!("{TRUNK_PREFIX}layers.{layer}.{suffix}"));
             }

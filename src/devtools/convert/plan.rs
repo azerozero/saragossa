@@ -268,6 +268,8 @@ pub(crate) struct Inventory {
     pub(crate) ngram_scale: TensorRef,
     pub(crate) vision: Vec<String>,
     pub(crate) counts: Counts,
+    /// Couche PLE (indice 0-based), lue dans la config.
+    pub(crate) ple_layer: usize,
 }
 
 /// Paramètres structurels attendus, lus dans la config source.
@@ -275,6 +277,8 @@ pub(crate) struct Inventory {
 pub(crate) struct Expected {
     pub(crate) layer_types: Vec<LayerType>,
     pub(crate) mtp_type: Option<LayerType>,
+    /// Couche PLE, indice 0-based (`ple_layer_ids` est 1-indexé).
+    pub(crate) ple_layer: usize,
     pub(crate) layers: usize,
     pub(crate) experts: usize,
     pub(crate) mtp_layers: usize,
@@ -352,7 +356,7 @@ impl Inventory {
         let mut vision = Vec::new();
         let mut counts = Counts::default();
         for tensor in refs {
-            let role = classify(&tensor.name)?;
+            let role = classify(&tensor.name, expected.ple_layer)?;
             check_role_dtype(role, tensor)?;
             match role {
                 Role::Expert {
@@ -509,7 +513,8 @@ impl Inventory {
         }
         let mut present: Vec<&str> = others.iter().map(|(_, t, _, _)| t.name.as_str()).collect();
         present.sort_unstable();
-        let wanted = expected_source_names(&expected.layer_types, expected.mtp_type);
+        let wanted =
+            expected_source_names(&expected.layer_types, expected.mtp_type, expected.ple_layer);
         if let Some(missing) = wanted
             .iter()
             .find(|name| present.binary_search(&name.as_str()).is_err())
@@ -533,6 +538,7 @@ impl Inventory {
             ngram_scale,
             vision,
             counts,
+            ple_layer: expected.ple_layer,
         })
     }
 }

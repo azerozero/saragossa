@@ -6,12 +6,14 @@ use saragossa::devtools::convert::{convert_qwen4exp, ConvertOptions};
 
 use crate::{cli_error, CliResult};
 
-const USAGE: &str = "usage: saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--only <unité,…>] [--verify] [--plan]";
+const USAGE: &str = "usage: saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--source-repo <org/nom>] [--converter-commit <sha>] [--only <unité,…>] [--verify] [--plan]";
 
 pub(crate) fn run(args: impl Iterator<Item = String>) -> CliResult<()> {
     let mut src = None;
     let mut dst = None;
     let mut revision = None;
+    let mut repo = None;
+    let mut commit = None;
     let mut only = None;
     let mut verify = false;
     let mut plan_only = false;
@@ -25,6 +27,8 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> CliResult<()> {
             "--src" => src = Some(PathBuf::from(value("--src")?)),
             "--dst" => dst = Some(PathBuf::from(value("--dst")?)),
             "--source-revision" => revision = Some(value("--source-revision")?),
+            "--source-repo" => repo = Some(value("--source-repo")?),
+            "--converter-commit" => commit = Some(value("--converter-commit")?),
             "--only" => {
                 only = Some(
                     value("--only")?
@@ -47,6 +51,8 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> CliResult<()> {
         dst: dst.ok_or_else(|| cli_error(format!("--dst requis\n{USAGE}")))?,
         source_revision: revision
             .ok_or_else(|| cli_error(format!("--source-revision requis\n{USAGE}")))?,
+        source_repo: repo,
+        converter_commit: commit,
         only,
         verify,
         plan_only,

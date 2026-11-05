@@ -121,7 +121,7 @@ fn tensor_for(name: &str, seed: usize) -> Raw {
 /// Écrit un checkpoint `qwen4_exp` miniature, réparti sur deux shards.
 fn write_source(dir: &Path, mutate: impl FnOnce(&mut BTreeMap<String, Raw>)) {
     let mut tensors: BTreeMap<String, Raw> = BTreeMap::new();
-    for (seed, name) in expected_source_names(&layer_types(), Some(LayerType::Full))
+    for (seed, name) in expected_source_names(&layer_types(), Some(LayerType::Full), 1)
         .into_iter()
         .enumerate()
     {
@@ -229,6 +229,7 @@ fn write_source(dir: &Path, mutate: impl FnOnce(&mut BTreeMap<String, Raw>)) {
             "heads_per_ngram": 1,
             "ngram_vocab_size_base": 50,
             "make_ngram_vocab_size_divisible_by": PARTS,
+            "ple_layer_ids": [2],
         }
     });
     std::fs::write(dir.join("config.json"), config.to_string()).expect("invariant: config test");
@@ -242,6 +243,8 @@ fn options(src: &Path, dst: &Path) -> ConvertOptions {
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
         source_revision: REVISION.to_string(),
+        source_repo: Some("test/qwen4-exp-mini".to_string()),
+        converter_commit: Some("cafe".to_string()),
         only: None,
         verify: false,
         plan_only: false,
@@ -289,7 +292,10 @@ fn find_shard(dst: &Path, name: &str) -> std::path::PathBuf {
 #[test]
 fn classify_rejects_unknown_and_non_canonical_indices() {
     assert!(matches!(
-        classify("model.language_model.layers.3.mlp.experts.17.down_proj.weight"),
+        classify(
+            "model.language_model.layers.3.mlp.experts.17.down_proj.weight",
+            1
+        ),
         Ok(Role::Expert {
             group: ExpertGroup::Trunk(3),
             expert: 17,
@@ -298,27 +304,29 @@ fn classify_rejects_unknown_and_non_canonical_indices() {
     ));
     assert_eq!(
         classify(
-            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_100.weight"
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_100.weight",
+            1
         )
         .ok(),
         Some(Role::NgramShard(100))
     );
     assert_eq!(
-        classify("lm_head.weight").ok(),
+        classify("lm_head.weight", 1).ok(),
         Some(Role::Affine { bits: 6 })
     );
     assert_eq!(
-        classify("model.visual.blocks.0.attn.qkv.weight").ok(),
+        classify("model.visual.blocks.0.attn.qkv.weight", 1).ok(),
         Some(Role::Vision)
     );
     for bad in [
         "model.language_model.layers.3.mlp.experts.017.down_proj.weight",
         "model.language_model.layers.3.some_norm.weight",
         "model.language_model.layers.2.ple.key_proj.weight",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight.x",
         "mtp.layers.1.self_attn.q_proj.weight",
         "other.weight",
     ] {
-        assert!(classify(bad).is_err(), "{bad}");
+        assert!(classify(bad, 1).is_err(), "{bad}");
     }
 }
 
@@ -413,6 +421,12 @@ fn converts_synthetic_checkpoint_end_to_end() {
         "model.visual.patch_embed.proj.weight"
     );
     assert_eq!(manifest["source"]["revision"], REVISION);
+    assert_eq!(manifest["source"]["repo"], "test/qwen4-exp-mini");
+    assert_eq!(manifest["converter"]["commit"], "cafe");
+    assert_eq!(manifest["conventions"]["ple_layer"], 1);
+    assert!(manifest["conventions"]["norms"]["gain_w"]
+        .as_str()
+        .is_some_and(|s| s.contains("linear_attn.norm")));
 }
 
 #[test]
@@ -845,6 +859,22 @@ fn degenerate_configs_are_errors_not_panics() {
         std::fs::write(&path, config.to_string()).expect("invariant: config");
         let error = plan_error(src.path());
         assert!(!error.is_empty(), "{key}");
+    }
+    for ids in [
+        serde_json::json!([]),
+        serde_json::json!([0]),
+        serde_json::json!([3]),
+        serde_json::json!([1, 2]),
+    ] {
+        let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+        write_source(src.path(), |_| {});
+        let path = src.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("invariant: config"))
+                .expect("invariant: json");
+        config["text_config"]["ple_layer_ids"] = ids.clone();
+        std::fs::write(&path, config.to_string()).expect("invariant: config");
+        assert!(plan_error(src.path()).contains("ple_layer_ids"), "{ids}");
     }
     let src = tempfile::tempdir().expect("invariant: dossier temporaire");
     write_source(src.path(), |t| {

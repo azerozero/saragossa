@@ -71,6 +71,10 @@ pub struct ConvertOptions {
     pub dst: PathBuf,
     /// Révision Hugging Face complète de la source, consignée au manifeste.
     pub source_revision: String,
+    /// Dépôt Hugging Face de la source, consigné au manifeste s'il est fourni.
+    pub source_repo: Option<String>,
+    /// Commit du convertisseur, consigné au manifeste s'il est fourni.
+    pub converter_commit: Option<String>,
     /// Unités à traiter seules (pilote) ; `None` = conversion complète et finalisation.
     pub only: Option<Vec<String>>,
     /// Vérifie le sha256 complet des unités déjà terminées au lieu de leur taille.
@@ -87,7 +91,6 @@ struct Identity {
     source_config_sha256: String,
     rules_version: String,
     params: String,
-    converter_binary_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -246,9 +249,24 @@ fn expected_from(config: &serde_json::Value) -> Result<(Expected, NgramConfig)> 
             Some(LayerType::parse(kind)?)
         }
     };
+    // Une seule couche PLE est prise en charge ; `ple_layer_ids` est 1-indexé.
+    let ple_ids: Vec<u64> = text
+        .get("ple_layer_ids")
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| ids.iter().filter_map(serde_json::Value::as_u64).collect())
+        .unwrap_or_default();
+    let ple_layer = match ple_ids[..] {
+        [id] if id >= 1 && (id as usize) <= layers => id as usize - 1,
+        _ => {
+            return Err(InferError::Config(format!(
+                "ple_layer_ids={ple_ids:?}: une couche PLE dans 1..={layers} attendue"
+            )))
+        }
+    };
     let expected = Expected {
         layer_types,
         mtp_type,
+        ple_layer,
         layers,
         experts: usize_field(config, "num_experts")?,
         mtp_layers,
@@ -503,14 +521,12 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
     let index_bytes = std::fs::read(source.dir.join("model.safetensors.index.json"))
         .map_err(|e| io_err(&source.dir, e))?;
     let config_bytes = std::fs::read(&config_path).map_err(|e| io_err(&config_path, e))?;
-    let exe = std::env::current_exe().map_err(|e| io_err(Path::new("current_exe"), e))?;
     let identity = Identity {
         source_revision: options.source_revision.clone(),
         source_index_sha256: sha256_bytes(&index_bytes),
         source_config_sha256: sha256_bytes(&config_bytes),
         rules_version: RULES_VERSION.to_string(),
         params: PARAMS.to_string(),
-        converter_binary_sha256: file_sha256(&exe)?,
     };
 
     let dst = &options.dst;
@@ -717,6 +733,7 @@ struct Manifest<'a> {
     format: &'a str,
     source: serde_json::Value,
     identity: &'a Identity,
+    converter: serde_json::Value,
     conventions: serde_json::Value,
     counts: &'a Counts,
     excluded_vision: &'a [String],
@@ -906,21 +923,32 @@ fn finalize(
         format: "saragossa-convert-qwen4exp/1",
         source: serde_json::json!({
             "path": options.src,
-            "repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+            "repo": options.source_repo,
             "revision": options.source_revision,
             "index_sha256": identity.source_index_sha256,
             "config_sha256": identity.source_config_sha256,
             "tokenizer_sha256": tokenizer_sha,
         }),
         identity,
+        converter: serde_json::json!({
+            "binary_sha256": file_sha256(
+                &std::env::current_exe().map_err(|e| io_err(Path::new("current_exe"), e))?
+            )?,
+            "commit": options.converter_commit,
+            "crate_version": env!("CARGO_PKG_VERSION"),
+        }),
         conventions: serde_json::json!({
             "trunk_prefix": rules::OUT_TRUNK_PREFIX,
             "lm_head": rules::OUT_LM_HEAD,
             "experts": "switch_mlp.{gate,up,down}_proj empilés [E, rows, packed] ; scales/biases [E, rows, groups]",
             "mtp": "sidecar mtp.safetensors, clés mtp.*, experts mtp.layers.0.mlp.switch_mlp.* u4 ; fc_embedding/fc_hidden séparés u8",
             "affine": "w = q·scale + bias, codes LSB-first en flux de bits par ligne (u4/u8 = lanes, u6 chevauche les u32)",
-            "norms": "gains copiés à l'octet ; convention de lecture 1 + w (Qwen4ExpTextRMSNorm), aucun ajout",
-            "ple_layer": rules::PLE_LAYER,
+            "norms": {
+                "copie": "gains copiés à l'octet, aucun ajout",
+                "gain_1_plus_w": "Qwen4ExpTextRMSNorm : hc_norm, q_norm, k_norm, indexer.{q,k}_layernorm, ple.norm_{conv,key,query}, mtp.pre_fc_norm_*",
+                "gain_w": "Qwen4ExpTextRMSNormGated : linear_attn.norm (gain direct, initialisé à 1)",
+            },
+            "ple_layer": inventory.ple_layer,
             "ngram": "fichier ngram/ngram_e4m3.bin + ngram/meta.json",
             "text_only": true,
         }),
