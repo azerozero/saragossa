@@ -608,9 +608,18 @@ impl Qwen4ExpCheckpoint {
             .get("bits")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| cfg_err("quantization.bits"))? as usize;
+        let valid_bits = |bits: u64| matches!(bits, 2 | 3 | 4 | 5 | 6 | 8);
+        if !valid_bits(default_bits as u64) {
+            return Err(cfg_err(format!(
+                "quantization.bits={default_bits} hors {{2,3,4,5,6,8}}"
+            )));
+        }
         let mut overrides = HashMap::new();
         for (key, value) in quant {
             if let Some(bits) = value.get("bits").and_then(|v| v.as_u64()) {
+                if !valid_bits(bits) {
+                    return Err(cfg_err(format!("{key}: bits={bits} hors {{2,3,4,5,6,8}}")));
+                }
                 let gs = value.get("group_size").and_then(|v| v.as_u64());
                 if gs != Some(group_size as u64) {
                     return Err(cfg_err(format!("{key}: group_size {gs:?} ≠ {group_size}")));
@@ -687,19 +696,28 @@ impl Qwen4ExpCheckpoint {
             .get("file")
             .and_then(|v| v.as_str())
             .ok_or_else(|| cfg_err("ngram/meta.json: file"))?;
-        let width = shape.1 as usize;
-        if width * config.ngram_heads() != config.ple_dim || !scale.is_finite() || scale <= 0.0 {
+        let width = usize::try_from(shape.1)
+            .ok()
+            .filter(|w| *w <= MAX_DIM)
+            .ok_or_else(|| cfg_err(format!("ngram/meta.json: largeur {}", shape.1)))?;
+        if width.checked_mul(config.ngram_heads()) != Some(config.ple_dim)
+            || !scale.is_finite()
+            || scale <= 0.0
+        {
             return Err(cfg_err(format!(
                 "table n-gram largeur {width}, échelle {scale} incohérentes"
             )));
         }
+        let expected_len = shape
+            .0
+            .checked_mul(shape.1)
+            .ok_or_else(|| cfg_err("ngram/meta.json: forme trop grande"))?;
         let path = dir.join("ngram").join(file_name);
         let file = File::open(&path).map_err(|e| io(&path, e))?;
         let len = file.metadata().map_err(|e| io(&path, e))?.len();
-        if len != shape.0 * shape.1 {
+        if len != expected_len {
             return Err(cfg_err(format!(
-                "table n-gram: {len} octets, {} attendus",
-                shape.0 * shape.1
+                "table n-gram: {len} octets, {expected_len} attendus"
             )));
         }
         Ok(NgramTable {
@@ -743,7 +761,11 @@ impl Qwen4ExpCheckpoint {
                 Expect::Affine { rows, cols, stack } => {
                     let bits = self.bits_of(&name);
                     let groups = cols / self.group_size;
-                    if cols % self.group_size != 0 || (cols * bits) % 32 != 0 {
+                    // bits ∈ {2,3,4,5,6,8} (vérifié à l'ouverture) : produit borné.
+                    let packed_bits = cols
+                        .checked_mul(bits)
+                        .ok_or_else(|| cfg_err(format!("{name}: {cols}×{bits} déborde")))?;
+                    if cols % self.group_size != 0 || packed_bits % 32 != 0 {
                         return Err(cfg_err(format!("{name}: {cols} colonnes / u{bits}")));
                     }
                     let lead: Vec<usize> = stack.into_iter().collect();
@@ -755,7 +777,7 @@ impl Qwen4ExpCheckpoint {
                     expect_entry(
                         &format!("{name}.weight"),
                         Dtype::U32,
-                        &shape(cols * bits / 32),
+                        &shape(packed_bits / 32),
                     )?;
                     expect_entry(&format!("{name}.scales"), Dtype::BF16, &shape(groups))?;
                     expect_entry(&format!("{name}.biases"), Dtype::BF16, &shape(groups))?;
@@ -1042,9 +1064,9 @@ mod tests {
         assert!(with_text(|t| t["output_gate_type"] = "relu".into()).is_err());
     }
 
+    /// Convertit la fixture N1 dans un dossier temporaire.
     #[cfg(feature = "devtools")]
-    #[test]
-    fn zero_group_size_is_refused_at_open() {
+    fn converted_fixture() -> tempfile::TempDir {
         use crate::devtools::convert::{convert_qwen4exp, ConvertOptions};
         let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
         convert_qwen4exp(&ConvertOptions {
@@ -1058,14 +1080,50 @@ mod tests {
             plan_only: false,
         })
         .expect("invariant: conversion");
-        let path = dst.path().join("config.json");
-        let mut config = read_json(&path).expect("invariant: config");
-        config["quantization"]["group_size"] = 0.into();
-        std::fs::write(&path, config.to_string()).expect("invariant: écriture");
-        let error = Qwen4ExpCheckpoint::open(dst.path())
-            .err()
-            .unwrap_or_else(|| panic!("group_size 0 accepté"));
-        assert!(error.to_string().contains("group_size"), "{error}");
+        dst
+    }
+
+    #[cfg(feature = "devtools")]
+    fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let mut value = read_json(path).expect("invariant: json");
+        edit(&mut value);
+        std::fs::write(path, value.to_string()).expect("invariant: écriture");
+    }
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn hostile_quantization_and_ngram_metadata_are_errors_not_panics() {
+        type Edit = fn(&mut serde_json::Value);
+        let config_cases: [(Edit, &str); 4] = [
+            (|c| c["quantization"]["group_size"] = 0.into(), "group_size"),
+            (|c| c["quantization"]["bits"] = (1_u64 << 63).into(), "bits"),
+            (|c| c["quantization"]["bits"] = 7.into(), "bits"),
+            (
+                |c| c["quantization"]["language_model.lm_head"]["bits"] = (1_u64 << 62).into(),
+                "bits",
+            ),
+        ];
+        for (edit, needle) in config_cases {
+            let dst = converted_fixture();
+            edit_json(&dst.path().join("config.json"), edit);
+            let error = Qwen4ExpCheckpoint::open(dst.path())
+                .err()
+                .unwrap_or_else(|| panic!("{needle}: config hostile acceptée"));
+            assert!(error.to_string().contains(needle), "{error}");
+        }
+        let meta_cases: [Edit; 3] = [
+            |m| m["shape"] = serde_json::json!([u64::MAX, u64::MAX]),
+            |m| m["shape"] = serde_json::json!([4, u64::MAX]),
+            |m| m["shape"][1] = 17.into(),
+        ];
+        for edit in meta_cases {
+            let dst = converted_fixture();
+            edit_json(&dst.path().join("ngram/meta.json"), edit);
+            assert!(
+                Qwen4ExpCheckpoint::open(dst.path()).is_err(),
+                "meta hostile acceptée"
+            );
+        }
     }
 
     /// Écrit un safetensors minimal (données nulles) depuis un inventaire.
