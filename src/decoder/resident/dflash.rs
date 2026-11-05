@@ -228,10 +228,6 @@ impl CausalDecoder {
         (tree_mode, tree_explicit): (DFlashTreeMode, bool),
         mut on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
-        // Politique greedy de la requête, lue par chaque vérification en lignes
-        // quel que soit son type de tête.
-        let _request_greedy =
-            crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
         // Arbre par défaut (non explicite) : toute raison de refus le ramène à la
         // chaîne ; une demande explicite reste refusée avec son erreur.
         let mut tree_mode = tree_mode;

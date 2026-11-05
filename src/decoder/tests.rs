@@ -5290,3 +5290,154 @@ fn greedy_identity_states_real_model() -> Result<()> {
     );
     Ok(())
 }
+
+/// Oracle O2 de la réutilisation partielle du cache de préfixe : le prompt moins
+/// un suffixe de 5, 17 ou 31 tokens est mis en cache par le mode lui-même, puis
+/// le prompt complet le reprend et prolonge le suffixe. Les tokens et les états
+/// des lignes vérifiées doivent égaler ceux de l'AR soumis à la même reprise :
+/// la portée greedy (mode strict compris) ne couvre que les vérifications
+/// spéculatives, pas l'extension du préfixe. Exige le cache de préfixe actif ;
+/// à lancer en mode strict et en défaut (le défaut peut diverger par le skinny
+/// et le NAX des vérifications, voir docs/perf/greedy-identity.md).
+#[test]
+#[ignore = "modèle réel requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
+    use crate::decoder::resident::VERIFY_RECORDER;
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var("SARAGOSSA_RUST_PREFIX_CACHE").is_some_and(|v| v.trim() == "0")
+    {
+        return Err(InferError::Config(
+            "cache de préfixe coupé : oracle de réutilisation sans objet".into(),
+        ));
+    }
+    let max_new = 48usize;
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let has_mtp = match assets.mtp.path.as_ref() {
+        Some(path) => {
+            model = model.with_mtp_sidecar(path)?;
+            true
+        }
+        None => false,
+    };
+    let draft = if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_some() {
+        model = model.with_dflash_draft_from_env(&assets.config)?;
+        model.dflash_draft().cloned()
+    } else {
+        None
+    };
+    let mut modes = Vec::new();
+    if has_mtp {
+        modes.push("mtp");
+    }
+    if draft.is_some() {
+        modes.push("dflash-défaut");
+    }
+    if modes.is_empty() {
+        return Err(InferError::Config("ni tête MTP ni drafter DFlash".into()));
+    }
+    let options = mtp_verifier_options(Vec::new());
+    let hidden = model.final_norm.data().len();
+    let run_mode = |mode: &str, prompt: &[usize], tokens: usize| -> Result<Vec<usize>> {
+        match (mode, draft.as_ref()) {
+            ("dflash-défaut", Some(draft)) => model
+                .generate_greedy_dflash_resident_streaming_with_options(
+                    prompt,
+                    tokens,
+                    &options,
+                    draft,
+                    draft.info.block_size,
+                    |_| true,
+                )
+                .map(|output| output.tokens),
+            _ => model
+                .generate_greedy_mtp_streaming_with_options(prompt, tokens, &options, 2, |_| true)
+                .map(|output| output.tokens),
+        }
+    };
+    let mut failures = Vec::new();
+    let mut compared = 0usize;
+    for (name, text) in identity_corpus()? {
+        let prompt = mtp_verifier_prompt_ids(&assets, &text)?;
+        for suffix in [5usize, 17, 31] {
+            if prompt.len() <= suffix + 8 {
+                continue;
+            }
+            let head = &prompt[..prompt.len() - suffix];
+            // AR : préfixe en cache, puis le prompt complet le reprend.
+            model.clear_prefix_cache();
+            model.generate_greedy_cached_with_options(head, 1, &options)?;
+            let ar = model.generate_greedy_cached_with_options(&prompt, max_new, &options)?;
+            // États AR après la même reprise partielle : pas mono-ligne.
+            model.clear_prefix_cache();
+            model.generate_greedy_cached_with_options(head, 1, &options)?;
+            let kv_bf16 = CausalDecoder::resident_kv_bf16(false, prompt.len());
+            let mut cache = model.prefill_cache_state(&prompt)?.0;
+            if !model.setup_resident_full_decode(&mut cache, max_new + 16, 16, kv_bf16)? {
+                return Err(InferError::Config("setup résident refusé".to_string()));
+            }
+            let mut ar_states = Vec::with_capacity(ar.len());
+            for &token in &ar[..ar.len().saturating_sub(1)] {
+                let out = model
+                    .next_final_states_resident_verify(
+                        &mut cache,
+                        &[token],
+                        ResidentVerifyHead::Argmax,
+                        false,
+                        None,
+                        None,
+                    )?
+                    .ok_or_else(|| InferError::Config("pas mono indisponible".into()))?;
+                ar_states.push(out.states.data().to_vec());
+            }
+            drop(cache);
+            let mut sequence = prompt.clone();
+            sequence.extend_from_slice(&ar);
+            for &mode in &modes {
+                // Préfixe déposé par le mode lui-même (historique MTP, captures DFlash).
+                model.clear_prefix_cache();
+                run_mode(mode, head, 1)?;
+                VERIFY_RECORDER.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+                let tokens = run_mode(mode, &prompt, max_new);
+                let records = VERIFY_RECORDER
+                    .with(|slot| slot.borrow_mut().take())
+                    .unwrap_or_default();
+                let tokens = tokens?;
+                let mut tally = IdentityTally {
+                    first_token_divergence: tokens
+                        .iter()
+                        .zip(&ar)
+                        .position(|(a, b)| a != b)
+                        .or((tokens.len() != ar.len()).then(|| tokens.len().min(ar.len()))),
+                    ..IdentityTally::default()
+                };
+                identity_compare_records(
+                    &records,
+                    &sequence,
+                    prompt.len(),
+                    &ar_states,
+                    hidden,
+                    &mut tally,
+                );
+                eprintln!("réutilisation {name} suffixe {suffix} {mode}: {tally:?}");
+                compared += tally.compared_rows;
+                if tally.first_token_divergence.is_some() || tally.state_mismatches > 0 {
+                    failures.push(format!("{name} suffixe {suffix} {mode}: {tally:?}"));
+                }
+            }
+        }
+    }
+    model.clear_prefix_cache();
+    assert!(
+        compared > 0,
+        "réutilisation de préfixe : aucune ligne comparée"
+    );
+    assert!(
+        failures.is_empty(),
+        "réutilisation de préfixe ≠ AR : {failures:#?}"
+    );
+    Ok(())
+}
