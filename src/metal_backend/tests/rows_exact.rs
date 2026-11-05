@@ -27,18 +27,25 @@ thread_local! {
     static ROWS_EXACT_STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Lance `body` deux fois : réglages par défaut (exceptions connues, bornées),
-/// puis skinny coupé (qmv répliqué sur les mêmes lots), en égalité stricte.
+/// Lance `body` trois fois : réglages par défaut (exceptions connues, bornées),
+/// skinny coupé (qmv répliqué sur les mêmes lots), puis vérification greedy
+/// stricte (qmv-T à partir de 3 lignes), ces deux dernières en égalité stricte.
 fn rows_exact_both_modes(body: fn() -> Result<()>) -> Result<()> {
+    /// Rétablit le mode, panique comprise.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ROWS_EXACT_STRICT.with(|cell| cell.set(false));
+        }
+    }
     body()?;
     with_qmm_skinny_min_batch_override(usize::MAX, || {
-        /// Rétablit le mode, panique comprise.
-        struct Restore;
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                ROWS_EXACT_STRICT.with(|cell| cell.set(false));
-            }
-        }
+        let _restore = Restore;
+        ROWS_EXACT_STRICT.with(|cell| cell.set(true));
+        body()
+    })?;
+    let _greedy = install_verify_greedy_scope(true);
+    with_verify_strict_override(true, || {
         let _restore = Restore;
         ROWS_EXACT_STRICT.with(|cell| cell.set(true));
         body()
@@ -202,6 +209,16 @@ fn rows_exact_matmul_formats_body() -> Result<()> {
             "matmul u4",
             "27B kv 1024x5120",
             LinearWeight::AffineQuantized(test_affine_random_u4(1024, 5120, 15)?),
+        ),
+        (
+            "matmul u4",
+            "27B down 5120x17408",
+            LinearWeight::AffineQuantized(test_affine_random_u4(5120, 17408, 16)?),
+        ),
+        (
+            "matmul u4",
+            "sortie large 65536x2048",
+            LinearWeight::AffineQuantized(test_affine_random_u4(65536, 2048, 17)?),
         ),
         (
             "matmul u8",
@@ -1533,6 +1550,42 @@ fn rows_exact_rms_prologue_u8_body() -> Result<()> {
                 out_dim,
                 &mono[..rows * out_dim],
                 &read_f32_buffer(&out, rows * out_dim)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Le mode strict engage bien le qmv-T (variantes device, threadgroup S = 8 et
+/// S = 16) sur les lots de 3 à 16 lignes, et pas sur les paires (qmm2). Les
+/// bits sont vérifiés par `rows_exact_matmul_formats`.
+#[test]
+#[ignore = "oracle GPU en bits : lancer avec --ignored"]
+fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
+    let executor = rows_exact_executor()?;
+    for (out_dim, in_dim) in [(1024usize, 5120usize), (5120, 17408), (65536, 2048)] {
+        let buffers = executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(test_affine_random_u4(out_dim, in_dim, 21)?),
+            "rexact_qmvt",
+        )?;
+        let lhs = executor.buffer_from_slice(&rows_exact_lhs(16, in_dim, 3, 1.0), "rexact_qmvt_lhs")?;
+        let out = executor.uncached_f32_buffer(16 * out_dim, "rexact_qmvt_out")?;
+        for rows in [2usize, 3, 9, 16] {
+            let count = || super::matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get);
+            let before = count();
+            let _greedy = install_verify_greedy_scope(true);
+            with_verify_strict_override(true, || {
+                rows_exact_cb(&executor, |enc| {
+                    executor
+                        .encode_matmul_weight_buffers(enc, &lhs, rows, in_dim, &buffers, &out, false)
+                        .map(|_| ())
+                })
+            })?;
+            let engaged = count() > before;
+            assert_eq!(
+                engaged,
+                (3..=16).contains(&rows),
+                "qmv-T {out_dim}x{in_dim} R={rows} : engagé = {engaged}"
             );
         }
     }
