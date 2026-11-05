@@ -10,22 +10,24 @@ avec le chemin résident.
 
 ## Ce que la référence implémente
 
-- **Gated residual.** La norme est groupée par `hidden`, avec un gain `1 + w`.
-  Les poids de mélange valent `a = σ(W_up·SiLU(W_down·n/hc))`, l'entrée de la
-  branche est `x = mean_flux(a ⊙ n)`, et l'injection `2σ(W_inject·n/hc)`
-  s'applique au résiduel non normalisé. Le mixer final ne fait pas d'injection,
-  et aucune norme n'est ajoutée avant le lm_head.
+- **Gated residual.**
+  - Norme groupée par `hidden`, avec un gain `1 + w`.
+  - Poids de mélange `a = σ(W_up·SiLU(W_down·n/hc))` et entrée de branche
+    `x = mean_flux(a ⊙ n)`.
+  - Injection `2σ(W_inject·n/hc)` sur le résiduel non normalisé.
+  - Le mixer final ne fait pas d'injection, et aucune norme n'est ajoutée avant
+    le lm_head.
 - **Gated DeltaNet.** Cette variante est propre à Flash-Next :
   - normalisation l2 des têtes `x/√(Σx²+ε)`, au lieu de l'unité RMS des autres
     familles, qui calcule `x/√(Σx²+d·ε)` ;
-  - gate de sortie `σ(z)` ;
+  - gate `σ(z)` ou `SiLU(z)` selon `output_gate_type` ;
   - `linear_attn.norm` à gain `w` direct.
 - **QSA.**
   - Indexeur : requêtes normées par `q_layernorm` puis tournées par la RoPE ;
-    clés brutes moyennées par blocs de 4, puis normées par `k_layernorm`, puis
-    tournées par la RoPE au premier token du bloc.
-  - Score `Σ_têtes ReLU(q·k)/√d`, top-`budget/4` blocs, plus la queue :
-    `4·min(⌊V/4⌋, 512) + V mod 4` tokens.
+    clés brutes moyennées par blocs de `compress` tokens, puis normées par
+    `k_layernorm`, puis tournées par la RoPE au premier token du bloc.
+  - Score `Σ_têtes ReLU(q·k)/√d`, top-`budget/compress` blocs, plus la queue :
+    `compress·min(⌊V/compress⌋, budget/compress) + V mod compress` tokens.
   - Attention GQA avec un `q_proj` entrelacé par tête (query | gate), et
     `σ(gate)` appliquée avant `o_proj`.
   - mRoPE sur 64 dimensions, θ = 1e7, avec les mêmes positions sur les trois
@@ -42,14 +44,15 @@ avec le chemin résident.
   partagé multiplié par `σ(gate)`. Les experts sont déquantifiés un par un et
   seulement s'ils sont routés.
 - **Loader.**
-  - Vérifie la config, en ne refusant que les invariants supposés par le code.
-  - Vérifie l'inventaire exact des tenseurs, les triplets affines et leurs bits,
-    les plages de chaque tenseur, la table n-gram et ses buffers de hachage
-    (recalculés par SplitMix64 avec seed 1234).
-  - Ne valide le MTP que sur ses métadonnées.
-  - Les lectures sont bornées et la déquantification se fait à la demande.
+  - Config : invariants vérifiés dans l'ordre, dimensions bornées à 2^20,
+    arithmétique vérifiée, `group_size` nul refusé.
+  - Inventaire exact des tenseurs du tronc **et du sidecar MTP** : formes,
+    dtypes, triplets affines et leurs bits, plages physiques.
+  - Table n-gram, avec des buffers de hachage recalculés par SplitMix64 (seed
+    1234).
+  - Lectures bornées et déquantification à la demande.
 
-## Oracles
+## Oracles et quasi-égalités
 
 Tolérances :
 - par couche : norme relative `‖a−b‖/‖b‖` ≤ 1e-4, mesurée sur l'entrée torch de
@@ -57,80 +60,97 @@ Tolérances :
 - logits : KL(oracle‖rust) ≤ 1e-3, en moyenne comme au maximum par token ;
 - top-1 identique.
 
-Quasi-égalités : un token dont le routeur a une marge inférieure à 1e-5 au seuil
-du top-k, ou une requête QSA à scores ReLU nuls ex æquo au seuil, est listé à
-part. Pour QSA, la sélection torch est alors imposée afin de comparer les
-sorties. La dérive cumulée (couches enchaînées) est mesurée, sans servir de
-porte.
+Les goldens figent les **scores de l'oracle** : logits du routeur et scores de
+l'indexeur pour chaque requête.
+
+Une quasi-égalité n'est admise que si l'oracle la justifie :
+- **Expert échangé** : sa probabilité torch doit être au seuil torch du top-k, à
+  1e-5 près. Les échanges sont journalisés.
+- **Bloc QSA échangé** : même règle, avec les scores torch. De plus, les scores
+  Rust de l'indexeur doivent égaler ceux de torch à 1e-4 près, sur toutes les
+  requêtes.
+
+Un test négatif vérifie qu'un indexeur dont les scores Rust sont tous nuls est
+bien rejeté.
+
+Deux passes sont mesurées :
+- **Ablation** : la sélection torch est imposée à toute couche QSA. C'est elle
+  qui sert de porte sur les sorties.
+- **Passe chaînée native** : sélection propre de l'indexeur, sur l'entrée Rust
+  enchaînée. Elle est mesurée, avec un garde-fou large de 1e-2 en norme
+  relative.
 
 ### N1 : modèle synthétique, dans le dépôt, sans poids
 
-La fixture `tests/fixtures/qwen4exp_mini` fait 987 288 octets. Elle contient un
-petit modèle de 4 couches (3 DeltaNet, dont une avec PLE, puis 1 QSA), avec
-hidden 64, hc 2, 4 experts top-2 et un budget QSA de 16 tokens par blocs de 4.
-La séquence fait 40 tokens, avec un EOS en position 17.
+La fixture `tests/fixtures/qwen4exp_mini` fait 825 490 octets. Elle contient un
+modèle de 3 couches (DeltaNet, DeltaNet + PLE, QSA), avec hidden 64, hc 2,
+4 experts top-2, un indexeur à 4 têtes non alignées et un budget QSA de 16
+tokens par blocs de 4. La séquence fait 40 tokens, avec un EOS en position 17.
 
 Tous les poids sont aléatoires mais exactement représentables en q4e8 : la
-conversion est sans perte, vérifiée sur ses 151 tenseurs. Le test convertit la
-source, ouvre la sortie, exécute la référence et la compare aux sorties
-officielles.
+conversion est sans perte. Le test enchaîne conversion, loader et forward, puis
+compare aux sorties officielles. La sortie de la dernière couche est capturée
+par un hook.
 
 | mesure | valeur |
 |---|---|
-| couches 0 à 2 (locale / chaînée) | ≤ 5,1e-7 / ≤ 2,6e-7 |
-| mixer final | 8,5e-8 (local), 2,2e-7 (chaîné) |
-| logits | KL moyen 3,1e-15, max 1,8e-14, top-1 identique |
-| routage | identique sur toutes les couches |
-| QSA | 3 requêtes à ex æquo de ReLU nulles, toutes au seuil ; les autres sont identiques |
+| couches 0 à 2 (locale / chaînée imposée / chaînée native) | ≤ 4,4e-7 / ≤ 2,8e-7 / ≤ 2,8e-7 |
+| mixer final | 2,1e-7 |
+| logits | KL moyen 2,6e-15, max 1,2e-14, top-1 identique ; idem en passe native |
+| routage | identique ; marge minimale de l'oracle au seuil : 4,2e-3 |
+| QSA (indexeur aléatoire) | scores Rust égaux aux scores torch ; 0 ex æquo |
+| golden QSA à marge nette (marge 2,8e-2) | sélection identique sans quasi-égalité, sortie 2,4e-7 |
 
-Régénération : `make_mini_fixture.py` (hors dépôt, sha256
-`974eb8bf…603c`), avec la graine 20261109, torch 2.14.1 et transformers 5.20.2.
-Les paramètres sont dans `RECIPE.json` et les sha256 sont figés dans le test.
+Régénération : `tools/flashnext/make_mini_fixture.py`, graine 20261110,
+torch 2.14.1 et transformers 5.20.2 (voir `tools/flashnext/README.md` et
+`RECIPE.json`). Les sha256 sont figés dans le test, et la fixture est sous la
+licence du dépôt.
 
 ### N2 : vrais poids q4e8 v2
 
 Ces tests sont ignorés par défaut. Ils s'activent avec `SARAGOSSA_QWEN4EXP_DIR`
 et `SARAGOSSA_QWEN4EXP_GOLDEN`.
 
-Les goldens viennent de `oracle_dump.py` (hors dépôt, sha256 `e81c392f…ab84`) :
-- couches officielles `Qwen4ExpTextDecoderLayer`, en f32, sdpa et mode eval ;
-- poids q4e8 déquantifiés, experts placés dans le module officiel
-  `Qwen4ExpTextExperts` (le MoE n'est pas réimplémenté) ;
-- empreintes des poids copiées dans les métadonnées des goldens.
+Les goldens viennent de `tools/flashnext/oracle_dump.py` : couches officielles
+`Qwen4ExpTextDecoderLayer`, experts placés dans le module officiel. Avant
+l'inférence, les tests vérifient `provenance.json` :
+- les empreintes des goldens ;
+- les empreintes des poids, comparées au manifeste du checkpoint ouvert ;
+- la version de transformers, le backend sdpa et le dtype f32.
 
 Pour les couches 0 à 3, une seule séquence de 8000 tokens suffit : comme tout
-est causal, ses préfixes donnent les longueurs 64, 2047 à 2052 et 3000.
+est causal, ses préfixes donnent les longueurs 64, 2047 à 2052 et 3000. La porte
+locale est vérifiée sur chacun de ces préfixes.
 
-| couche | locale, hors quasi-égalités (tous préfixes) | chaînée (8000) | quasi-égalités |
+| couche | locale (tous préfixes, hors échanges justifiés) | chaînée native (8000) | échanges et écarts natifs |
 |---|---|---|---|
-| 0 (DeltaNet) | ≤ 1,7e-6 | 1,6e-6 | aucune |
-| 1 (DeltaNet + PLE) | ≤ 7,6e-7 | 2,1e-6 | aucune |
-| 2 (DeltaNet) | ≤ 7,1e-7 | 1,1e-4 | 1 bascule de routage dans le chemin chaîné (token 313) |
-| 3 (QSA) | ≤ 5,0e-7 | 1,6e-4 | routage du token 159 (marge < 1e-5) ; 0 ex æquo QSA |
+| 0 (DeltaNet) | ≤ 1,7e-6 | 1,6e-6 | aucun |
+| 1 (DeltaNet + PLE) | ≤ 7,6e-7 | 2,1e-6 | aucun |
+| 2 (DeltaNet) | ≤ 7,1e-7 | 1,1e-4 | passe native : 1 routage basculé |
+| 3 (QSA) | ≤ 5,0e-7 | 1,6e-4 | token 159 : experts 79 ↔ 373, justifiés par l'oracle ; passe native : 2 routages et 36 sélections QSA ≠ torch |
 
 Frontières QSA : de V = 2047 à 2051, la sélection est dense et identique à
 torch. À V = 2052, la sélection réelle retient 2048 tokens, identiques à torch.
-La taille `4·min(⌊V/4⌋, 512) + V mod 4` est vérifiée pour chacune des 8000
-requêtes.
+Sur les vrais poids, les scores Rust de l'indexeur sont égaux à ceux de torch,
+sans aucun ex æquo.
 
-Sans exclusion du token 159, l'erreur locale brute de la couche 3 monte à
-1,5e-4 sur les préfixes de 2047 à 3000 tokens : c'est l'effet du seul token dont
-le routage est quasi égal.
+Dans la passe native, la dérive d'entrée fait basculer quelques routages et
+sélections, d'où une erreur relative de 1e-4 en enchaînant les couches. Avec la
+sélection imposée, l'erreur locale de la couche 3 reste à 4,2e-7, hors token
+159.
 
 Modèle complet (48 couches, mixer, lm_head) sur 4 prompts de 14 à 32 tokens :
 KL moyen au plus 6,8e-11, KL max au plus 5,3e-10, logits à une erreur relative
 de 2,7e-6 à 5,8e-6, top-1 identique partout.
 
-Empreintes des goldens N2 : `layers.safetensors` `0bea534b…e90f`,
-`full.safetensors` `f030ea98…15ed`.
-
-## Coût mesuré (M5 Max, CPU)
+## Coût mesuré (M5 Max, CPU, binaire de test seul)
 
 | passage | durée | pic (`peak memory footprint`) |
 |---|---|---|
-| modèle complet, 4 prompts courts | 280 s | 0,99 Go |
-| couches 0 à 3 sur 8000 tokens, test compris | 378 s | 5,1 Go |
+| modèle complet, 4 prompts courts | 286 s | 0,96 Go |
+| couches 0 à 3 sur 8000 tokens, test compris | 394 s | 5,1 Go |
 
-Le second pic inclut les goldens chargés et quatre résiduels `[8000, 10240]`
-f32 (328 Mo chacun). Les activations de la référence croissent avec la longueur
-de la séquence ; les poids, eux, restent bornés à une couche à la fois.
+Le second pic inclut les goldens chargés et plusieurs résiduels `[8000, 10240]`
+f32 (328 Mo chacun) conservés par le test. Il ne mesure donc pas isolément la
+référence. Celle-ci garde les poids bornés à une couche à la fois, mais ses
+activations croissent avec la longueur de la séquence.
