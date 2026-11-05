@@ -1,0 +1,156 @@
+"""Goldens N2 : couches officielles transformers sur les poids q4e8 déquantifiés.
+
+Chaque couche est le module officiel `Qwen4ExpTextDecoderLayer` (sdpa, f32,
+eval, sans autocast), experts déquantifiés en f32 dans `Qwen4ExpTextExperts` :
+le MoE n'est pas réimplémenté. Sont figés : sorties de couche, logits et
+indices du routeur, masque et scores de l'indexeur QSA. `provenance.json`
+enregistre les empreintes des goldens, des poids (manifeste du checkpoint),
+les versions et le backend ; les tests Rust la vérifient avant l'inférence.
+
+  --layers : une séquence de 8000 tokens (couches 0-3) ; ses préfixes couvrent
+             les longueurs 64, 2047-2052 et 3000 (tout est causal).
+  --full   : logits du modèle complet sur quatre prompts courts.
+
+Usage :
+  python -I tools/flashnext/oracle_dump.py --layers <q4e8> <tokenizer.json> <texte> <sortie>
+  python -I tools/flashnext/oracle_dump.py --full   <q4e8> <tokenizer.json> <sortie>
+"""
+
+import hashlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import transformers  # noqa: E402
+from tokenizers import Tokenizer  # noqa: E402
+
+import oracle_common as C  # noqa: E402
+
+PROMPTS = [
+    "Le moteur saragossa exécute les modèles Qwen sur Apple Silicon.",
+    "def fibonacci(n):\n    if n < 2:\n        return n\n    return",
+    "The quick brown fox jumps over the lazy dog. The quick brown fox",
+    '{"name": "get_weather", "arguments": {"city": "Lyon", "date": "2026-11-06"}}',
+]
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 24), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def update_provenance(out, qdir, golden_file, extra):
+    path = out / "provenance.json"
+    prov = json.loads(path.read_text()) if path.exists() else {"files": {}}
+    manifest = json.loads((Path(qdir) / "convert_manifest.json").read_text())
+    prov.update({
+        "transformers": transformers.__version__,
+        "torch": torch.__version__,
+        "attn_implementation": "sdpa",
+        "dtype": "float32",
+        "mode": "eval, no_grad, sans autocast",
+        "weights_dir": str(qdir),
+        "weights": {f["name"]: f["sha256"] for f in manifest["files"]},
+    })
+    prov["files"][golden_file] = sha256(out / golden_file)
+    prov.setdefault("runs", {})[golden_file] = extra
+    path.write_text(json.dumps(prov, indent=1, ensure_ascii=False))
+
+
+def run_layers(qdir, tokenizer, text, out):
+    tc = C.text_config(qdir)
+    weights = C.QWeights(qdir)
+    ids_list = Tokenizer.from_file(tokenizer).encode(Path(text).read_text()).ids[:8000]
+    assert len(ids_list) == 8000, len(ids_list)
+    ids = torch.tensor([ids_list])
+    n = ids.shape[1]
+    pos, mask = C.rope(tc, n), C.causal_mask(n)
+    h = C.embed(tc, weights, ids)
+    tensors = {"input_ids": ("I64", (n,), np.array(ids_list, dtype=np.int64).tobytes())}
+    for index in range(4):
+        started = time.time()
+        layer = C.build_layer(tc, index, weights)
+        cap = {}
+        layer.mlp.gate.register_forward_hook(
+            lambda _m, _i, o: cap.update(logits=o[0].clone(), ids=o[2].clone()))
+        if layer.layer_type != "linear_attention":
+            layer.self_attn.indexer.register_forward_hook(lambda _m, _i, o: cap.update(mask=o.clone()))
+        with C.TopkCapture() as topk:
+            h = layer(h, position_embeddings=pos, attention_mask=mask, conv_mask=None,
+                      past_key_values=None, ple_input_ids=ids)
+        tensors[f"layer.{index}"] = ("F32", tuple(h.shape[1:]), h[0].float().numpy().tobytes())
+        r = cap["ids"].to(torch.int64)
+        tensors[f"routing.{index}"] = ("I64", tuple(r.shape), r.numpy().tobytes())
+        lg = cap["logits"].float()
+        tensors[f"router_logits.{index}"] = ("F32", tuple(lg.shape), lg.numpy().tobytes())
+        if "mask" in cap:
+            m = cap["mask"][0, 0].to(torch.uint8)
+            tensors[f"qsa_mask.{index}"] = ("U8", tuple(m.shape), m.numpy().tobytes())
+            compress = tc.indexer_compress_ratio
+            it = iter(topk.indexer)
+            rows = [next(it) if (i + 1) // compress > 0 else torch.zeros(0) for i in range(n)]
+            assert next(it, None) is None, "scores d'indexeur en surnombre"
+            flat, offsets = C.flatten_scores(rows)
+            tensors[f"qsa_scores.{index}"] = ("F32", flat.shape, flat.tobytes())
+            tensors[f"qsa_offsets.{index}"] = ("I64", offsets.shape, offsets.tobytes())
+        del layer
+        print(f"couche {index}: {time.time() - started:.0f} s, pic RSS {C.footprint_gb():.1f} Go", flush=True)
+    C.write_safetensors(out / "layers.safetensors", tensors, {"tokens": n})
+    update_provenance(out, qdir, "layers.safetensors", {"tokens": n, "text": str(text)})
+
+
+def run_full(qdir, tokenizer, out):
+    tc = C.text_config(qdir)
+    weights = C.QWeights(qdir)
+    tok = Tokenizer.from_file(tokenizer)
+    ids = [torch.tensor([tok.encode(p).ids]) for p in PROMPTS]
+    pos = [C.rope(tc, t.shape[1]) for t in ids]
+    masks = [C.causal_mask(t.shape[1]) for t in ids]
+    hs = [C.embed(tc, weights, t) for t in ids]
+    started = time.time()
+    for index in range(tc.num_hidden_layers):
+        layer = C.build_layer(tc, index, weights)
+        hs = [layer(h, position_embeddings=p, attention_mask=m, conv_mask=None, past_key_values=None,
+                    ple_input_ids=t) for h, p, m, t in zip(hs, pos, masks, ids)]
+        del layer
+        print(f"couche {index}: {time.time() - started:.0f} s, pic RSS {C.footprint_gb():.1f} Go", flush=True)
+    mixer = C.M.Qwen4ExpTextGatedResidual(tc, use_combine=False)
+    mixer.load_state_dict({k: weights.dense(f"model.language_model.hyper_connection_mixer.{k}")
+                           for k in mixer.state_dict()})
+    head = weights.dense("lm_head.weight")
+    tensors = {}
+    for i, (h, t) in enumerate(zip(hs, ids)):
+        logits = mixer(h)[0] @ head.T
+        tensors[f"prompt.{i}.ids"] = ("I64", (t.shape[1],), t[0].numpy().astype(np.int64).tobytes())
+        tensors[f"prompt.{i}.logits"] = ("F32", tuple(logits.shape), logits.float().numpy().tobytes())
+    C.write_safetensors(out / "full.safetensors", tensors, {"prompts": json.dumps(PROMPTS)})
+    update_provenance(out, qdir, "full.safetensors", {"prompts": PROMPTS})
+
+
+def main():
+    torch.set_num_threads(os.cpu_count() or 8)
+    mode = sys.argv[1]
+    if mode == "--layers":
+        _, _, qdir, tokenizer, text, out = sys.argv
+        out = Path(out)
+        out.mkdir(parents=True, exist_ok=True)
+        run_layers(qdir, tokenizer, text, out)
+    elif mode == "--full":
+        _, _, qdir, tokenizer, out = sys.argv
+        out = Path(out)
+        out.mkdir(parents=True, exist_ok=True)
+        run_full(qdir, tokenizer, out)
+    else:
+        raise SystemExit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
