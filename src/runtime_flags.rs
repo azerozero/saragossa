@@ -1083,6 +1083,17 @@ pub(crate) fn verify_rows_nax_greedy_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY", true))
 }
 
+/// Vérification greedy stricte (`SARAGOSSA_RUST_VERIFY_STRICT=1`, défaut OFF) :
+/// sous la portée greedy, chaque ligne vérifiée rend les bits du pas mono-ligne.
+/// Le préfixe NAX en lignes est coupé et les matmuls u4 gs64 de 3 à 16 lignes
+/// passent par le qmv-T exact au lieu du skinny (MMA bf16 hi+lo, non exact dès
+/// 5 lignes). Le défaut reste le chemin rapide, à identité greedy approchée.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn verify_strict_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_STRICT", false))
+}
+
 /// Contexte minimal du préfixe NAX en lignes
 /// (`SARAGOSSA_RUST_VERIFY_ROWS_NAX_MIN_LEN`, défaut 16384, le seuil greedy
 /// bf16) : MTP échantillonné à 4k (KV bf16 dès le prompt court, même binaire,

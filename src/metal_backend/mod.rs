@@ -154,10 +154,18 @@ pub use self::profiling::{
 };
 pub(crate) use self::profiling::{profile_dispatch, profile_dispatch_shape, trace_dispatch_path};
 pub(crate) use self::scratch::install_scratch_namespace;
+#[cfg(test)]
+pub(crate) use self::verify_tree::with_verify_strict_override;
 pub(crate) use self::verify_tree::{
-    install_verify_greedy_scope, install_verify_tree_scope, verify_rows_nax_allowed, verify_tree,
-    VerifyTree,
+    install_verify_greedy_scope, install_verify_tree_scope, verify_rows_nax_allowed,
+    verify_strict_active, verify_tree, VerifyTree,
 };
+
+/// Dispatches qmv-T encodés sur ce thread (oracles du mode strict).
+#[cfg(test)]
+pub(crate) fn qmvt_dispatches_for_test() -> usize {
+    matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get)
+}
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
@@ -431,6 +439,11 @@ pub struct MetalExecutor {
     /// au lieu d'être re-payée à chaque génération. Clé = suite des identités
     /// stables des poids sources (cf. [`ConcatWeightKey`]).
     concat_buffers: Mutex<HashMap<ConcatWeightKey, ConcatCacheEntry>>,
+    /// Bibliothèque `kernels.metal` compilée, gardée pour les pipelines créés à la
+    /// demande (qmv-T du mode strict, une instance par largeur de lot).
+    library: metal::Library,
+    /// Pipelines qmv-T déjà créés, par nom de kernel.
+    qmvt_pipelines: Mutex<HashMap<String, ComputePipelineState>>,
     /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
     preserve_weight_caches: std::sync::atomic::AtomicBool,
     /// Passages du scope de purge du scratch, vérifiés par les tests.

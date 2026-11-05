@@ -5,6 +5,7 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum AffineMatmulKernel {
     Qmm2,
+    QmvT,
     Skinny,
     Qmm8,
     QmmNaFusedTiledU4,
@@ -103,6 +104,8 @@ impl MetalExecutor {
             || can_use_fast_affine_qmm2_u8_buffers(batch, in_dim, out_dim, group_size, bits)
         {
             AffineMatmulKernel::Qmm2
+        } else if can_use_qmvt_buffers(batch, in_dim, out_dim, group_size, bits) {
+            AffineMatmulKernel::QmvT
         } else if self.qmm_skinny_available()
             && can_use_qmm_skinny_buffers(batch, in_dim, out_dim, group_size, bits)
         {
@@ -177,6 +180,8 @@ impl MetalExecutor {
             || can_use_fast_affine_qmm2_u8(batch, in_dim, weight)
         {
             AffineMatmulKernel::Qmm2
+        } else if can_use_qmvt(batch, in_dim, weight) {
+            AffineMatmulKernel::QmvT
         } else if self.qmm_skinny_available() && can_use_qmm_skinny(batch, in_dim, weight) {
             AffineMatmulKernel::Skinny
         } else if can_use_fast_affine_qmm8(batch, in_dim, weight) {
