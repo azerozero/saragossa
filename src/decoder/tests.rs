@@ -5196,6 +5196,15 @@ fn greedy_identity_states_real_model() -> Result<()> {
             modes.retain(|mode| wanted.iter().any(|m| m == mode));
         }
         for mode in modes {
+            // NOTE: la boucle DFlash CPU de référence prend son propre prefill avec
+            // captures, distinct de celui de l'AR au-delà de 16k : hors périmètre.
+            if mode == "dflash-cpu" && prompt.len() > 16 * 1024 {
+                eprintln!(
+                    "identité {name} dflash-cpu : prompt de {} tokens sauté",
+                    prompt.len()
+                );
+                continue;
+            }
             VERIFY_RECORDER.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
             let tokens = match mode {
                 "lookup" => crate::runtime_flags::with_lookup_greedy_override(8, || {
@@ -5211,14 +5220,10 @@ fn greedy_identity_states_real_model() -> Result<()> {
                         |_| true,
                     )
                     .map(|output| output.tokens),
+                // Boucle MTP directe : avec un drafter chargé, l'entrée publique
+                // MTP passe par DFlash (tête argmax) et ne vérifie jamais en `Skip`.
                 "mtp-skip" => crate::runtime_flags::with_mtp_skip_override(8, || {
-                    model.generate_greedy_mtp_streaming_with_options(
-                        &prompt,
-                        max_new,
-                        &options,
-                        2,
-                        |_| true,
-                    )
+                    model.generate_greedy_mtp_core(&prompt, max_new, &options, 2, |_| true)
                 })
                 .map(|output| output.tokens),
                 "dflash-cpu" => {
@@ -5477,12 +5482,17 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
     };
     let mut failures = Vec::new();
     let mut compared = 0usize;
+    let mut exercised = std::collections::BTreeSet::new();
     for (name, text) in identity_corpus()? {
         let prompt = mtp_verifier_prompt_ids(&assets, &text)?;
         for suffix in [5usize, 17, 31] {
-            if prompt.len() <= suffix + 8 {
+            // Le cache de préfixe refuse une reprise dont le suffixe dépasse la
+            // moitié du prompt (repli à froid, plus rapide) : cas sauté ici, mais
+            // chaque taille de suffixe doit être exercée au moins une fois.
+            if suffix * 2 > prompt.len() {
                 continue;
             }
+            exercised.insert(suffix);
             let head = &prompt[..prompt.len() - suffix];
             // AR : préfixe en cache, puis le prompt complet le reprend.
             model.clear_prefix_cache();
@@ -5566,6 +5576,11 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
     assert!(
         compared > 0,
         "réutilisation de préfixe : aucune ligne comparée"
+    );
+    assert_eq!(
+        exercised.into_iter().collect::<Vec<_>>(),
+        vec![5, 17, 31],
+        "réutilisation de préfixe : chaque suffixe doit être exercé (prompts trop courts ?)"
     );
     assert!(
         failures.is_empty(),
