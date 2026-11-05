@@ -1621,8 +1621,10 @@ fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
 
 /// Mode strict, matmuls enchaînés dans un même encodeur : deux projections
 /// 5120×5120 (même scratch device `xt`/`sum`, réécrit par le second prep après
-/// lecture par le premier qmv-T), puis down 5120×17408 en threadgroup ; chaque
-/// ligne du lot égale la même chaîne en mono, en bits.
+/// lecture par le premier qmv-T), puis up et down 5120×17408 en threadgroup ;
+/// chaque ligne du lot égale la même chaîne en mono, en bits. Le nombre de qmv-T
+/// suit `SARAGOSSA_RUST_QMV_FAST` (0, `q`, `o`, `kv` : le mono et le lot gardent
+/// alors leur kernel commun).
 #[test]
 #[ignore = "oracle GPU en bits : lancer avec --ignored"]
 fn rows_exact_qmvt_chained_in_one_encoder() -> Result<()> {
@@ -1666,10 +1668,15 @@ fn rows_exact_qmvt_chained_in_one_encoder() -> Result<()> {
         let before = super::matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get);
         let _greedy = install_verify_greedy_scope(true);
         let got = with_verify_strict_override(true, || chain(rows, &x[..rows * hidden]))?;
+        // Le qmv-T suit la garde du qmv rapide du mono (`SARAGOSSA_RUST_QMV_FAST`).
+        let expected = [hidden, hidden, inter, hidden]
+            .into_iter()
+            .filter(|&out_dim| super::flags::fast_affine_qmv_enabled(out_dim))
+            .count();
         assert_eq!(
             super::matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get) - before,
-            4,
-            "chaîne R={rows} : quatre qmv-T attendus"
+            expected,
+            "chaîne R={rows} : {expected} qmv-T attendus"
         );
         assert_eq!(
             rows_exact_ndiff(&mono[..rows * hidden], &got, "chaîne qmv-T"),
