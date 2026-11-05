@@ -5109,6 +5109,8 @@ fn greedy_identity_states_real_model() -> Result<()> {
     let (mut ties_2, mut ties_3, mut tokens_seen) = (0usize, 0usize, 0usize);
     let mut failures = Vec::new();
     let mut coverage: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    let mut tree_widths: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut skip_coverage: std::collections::BTreeMap<&str, usize> = Default::default();
     let corpus = identity_corpus()?;
     if corpus.is_empty() {
         return Err(InferError::Config(
@@ -5201,6 +5203,13 @@ fn greedy_identity_states_real_model() -> Result<()> {
                     )
                     .map(|output| output.tokens),
                 "dflash-défaut" => {
+                    // Le défaut se lit sans surcharge : un `DFLASH_TREE` hérité
+                    // mesurerait autre chose que le budget choisi par le mode.
+                    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_TREE").is_some() {
+                        return Err(InferError::Config(
+                            "dflash-défaut : SARAGOSSA_RUST_DFLASH_TREE hérité refusé".into(),
+                        ));
+                    }
                     let draft = draft
                         .as_ref()
                         .ok_or_else(|| InferError::Config("drafter".into()))?;
@@ -5266,6 +5275,22 @@ fn greedy_identity_states_real_model() -> Result<()> {
             let seen = coverage.entry(mode).or_default();
             seen.0 += tally.multi_row_compared;
             seen.1 += tally.branched_records;
+            // Largeur d'arbre réellement vérifiée (B + 1 lignes au plus).
+            let widest_tree = records
+                .iter()
+                .filter(|record| record.parents.is_some())
+                .map(|record| record.tokens.len())
+                .max()
+                .unwrap_or(0);
+            let tree_width = tree_widths.entry(mode).or_insert(0);
+            *tree_width = (*tree_width).max(widest_tree);
+            // Repli sans argmax GPU : vérifications `Skip` de 5 lignes et plus
+            // (lookup multiligne), lignes comparées à l'AR comprises.
+            let skip_rows = records
+                .iter()
+                .filter(|record| record.skip_head && record.batched && record.tokens.len() >= 5)
+                .count();
+            *skip_coverage.entry(mode).or_insert(0) += skip_rows;
             if tally.first_token_divergence.is_some() || tally.state_mismatches > 0 {
                 failures.push(format!("{name} {mode}: {tally:?}"));
             }
@@ -5283,6 +5308,25 @@ fn greedy_identity_states_real_model() -> Result<()> {
         if matches!(*mode, "dflash-arbre" | "dflash-défaut") && *branched == 0 {
             failures.push(format!("{mode}: aucun arbre branché vérifié"));
         }
+    }
+    eprintln!("identité : largeur d'arbre max {tree_widths:?}, vérifications Skip ≥ 5 lignes {skip_coverage:?}");
+    // `dflash-défaut` : la largeur observée est celle du budget par défaut
+    // (B = 3 en greedy strict, B = 8 sinon), pas une autre.
+    if let Some(&width) = tree_widths.get("dflash-défaut") {
+        let expected = crate::runtime_flags::dflash_tree_default_budget(true) + 1;
+        if width != expected {
+            failures.push(format!(
+                "dflash-défaut : arbre de {width} lignes au plus, {expected} attendu"
+            ));
+        }
+    }
+    // `SARAGOSSA_RUST_IDENTITY_REQUIRE_SKIP=1` (lancement sous
+    // `SARAGOSSA_RUST_GPU_ARGMAX=0`) : le MTP doit avoir vérifié par la tête
+    // `Skip` des lots de 5 lignes et plus (proposition lookup).
+    if crate::runtime_flags::env_flag("SARAGOSSA_RUST_IDENTITY_REQUIRE_SKIP", false)
+        && skip_coverage.get("mtp").copied().unwrap_or(0) == 0
+    {
+        failures.push("mtp : aucune vérification Skip de 5 lignes et plus".to_string());
     }
     assert!(
         failures.is_empty(),

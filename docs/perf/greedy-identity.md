@@ -189,7 +189,7 @@ changent avec l'arrondi ; ce n'est pas un gain des kernels.
   SARAGOSSA_RUST_DFLASH_DRAFT_DIR=<Qwen3.8-27B-DFlash2> \
   SARAGOSSA_RUST_IDENTITY_EXTERNAL_DIR=<dossier de prose32k-1.txt> \
   SARAGOSSA_RUST_IDENTITY_PROMPTS=chat-1,chat-2,chat-3,chat-4,chat-5,chat-6,code4k-1,code4k-2,code4k-3,prose32k-1 \
-  SARAGOSSA_RUST_IDENTITY_MODES=mtp,dflash-chaîne,dflash-arbre \
+  SARAGOSSA_RUST_IDENTITY_MODES=mtp,dflash-chaîne,dflash-arbre,dflash-défaut \
   SARAGOSSA_RUST_VERIFY_STRICT=1 \
   cargo test --release --all-features --lib -- --ignored --exact \
     decoder::tests::greedy_identity_states_real_model

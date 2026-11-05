@@ -15,6 +15,8 @@ pub(in crate::decoder) struct VerifyRecord {
     pub(in crate::decoder) parents: Option<Vec<u32>>,
     pub(in crate::decoder) states: Vec<f32>,
     pub(in crate::decoder) batched: bool,
+    /// Vérification par la tête `Skip` (repli sans argmax GPU, états seuls).
+    pub(in crate::decoder) skip_head: bool,
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
@@ -36,6 +38,7 @@ pub(super) fn record_verify(
     tree: Option<&crate::metal_backend::VerifyTree>,
     states: &[f32],
     batched: bool,
+    skip_head: bool,
 ) {
     VERIFY_RECORDER.with(|slot| {
         if let Some(records) = slot.borrow_mut().as_mut() {
@@ -45,6 +48,7 @@ pub(super) fn record_verify(
                 parents: tree.map(|tree| tree.parents().to_vec()),
                 states: states.to_vec(),
                 batched,
+                skip_head,
             });
         }
     });
@@ -535,7 +539,14 @@ impl CausalDecoder {
                 })
                 .transpose()?;
             #[cfg(test)]
-            record_verify(base_position, token_ids, tree.as_deref(), &output, true);
+            record_verify(
+                base_position,
+                token_ids,
+                tree.as_deref(),
+                &output,
+                true,
+                head == ResidentVerifyHead::Skip,
+            );
             return Ok(Some(ResidentVerifyOutput {
                 states: Tensor::from_vec(vec![batch, hidden], output)?,
                 tokens,
@@ -745,7 +756,14 @@ impl CausalDecoder {
             token_ids.len() * hidden,
         )?;
         #[cfg(test)]
-        record_verify(base_position, token_ids, None, &output, false);
+        record_verify(
+            base_position,
+            token_ids,
+            None,
+            &output,
+            false,
+            head == ResidentVerifyHead::Skip,
+        );
         let tokens = final_indices
             .as_ref()
             .map(|indices| {
