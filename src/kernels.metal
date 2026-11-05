@@ -453,6 +453,10 @@ kernel void affine_qmv_fast_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -486,9 +490,9 @@ kernel void affine_qmv_fast_u4_gs64_f32(
             const float x3 = x[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -499,12 +503,12 @@ kernel void affine_qmv_fast_u4_gs64_f32(
                 float accum = 0.0f;
                 for (uint i = 0u; i < 4u; ++i) {
                     const ushort word = w16[i];
-                    accum += xt[4u * i] * float(word & 0x000fu);
-                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                    accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                    accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                    accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                    accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
                 }
-                result[row] += scale * accum + sum * bias;
+                result[row] = fma(scale, accum, fma(sum, bias, result[row]));
             }
         }
 
@@ -598,6 +602,10 @@ kernel void affine_qmv_fast_aligned_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -628,9 +636,9 @@ kernel void affine_qmv_fast_aligned_u4_gs64_f32(
             const float x3 = x[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -640,12 +648,12 @@ kernel void affine_qmv_fast_aligned_u4_gs64_f32(
             float accum = 0.0f;
             for (uint i = 0u; i < 4u; ++i) {
                 const ushort word = w16[i];
-                accum += xt[4u * i] * float(word & 0x000fu);
-                accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
             }
-            result[row] += scale * accum + sum * bias;
+            result[row] = fma(scale, accum, fma(sum, bias, result[row]));
         }
 
         ws += 256u;
@@ -676,6 +684,10 @@ kernel void affine_qmv_fast_aligned_u4_gs64_residual_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -706,9 +718,9 @@ kernel void affine_qmv_fast_aligned_u4_gs64_residual_f32(
             const float x3 = x[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -718,12 +730,12 @@ kernel void affine_qmv_fast_aligned_u4_gs64_residual_f32(
             float accum = 0.0f;
             for (uint i = 0u; i < 4u; ++i) {
                 const ushort word = w16[i];
-                accum += xt[4u * i] * float(word & 0x000fu);
-                accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
             }
-            result[row] += scale * accum + sum * bias;
+            result[row] = fma(scale, accum, fma(sum, bias, result[row]));
         }
 
         ws += 256u;
@@ -872,6 +884,10 @@ kernel void affine_qmv_fast_u4_gs64_align64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -909,9 +925,9 @@ kernel void affine_qmv_fast_u4_gs64_align64_f32(
             const float x3 = x[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -924,12 +940,12 @@ kernel void affine_qmv_fast_u4_gs64_align64_f32(
             float accum = 0.0f;
             for (uint i = 0u; i < 4u; ++i) {
                 const ushort word = w16[i];
-                accum += xt[4u * i] * float(word & 0x000fu);
-                accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
             }
-            result[row] += scale * accum + sum * bias;
+            result[row] = fma(scale, accum, fma(sum, bias, result[row]));
         }
 
         ws += 256u;
@@ -950,9 +966,9 @@ kernel void affine_qmv_fast_u4_gs64_align64_f32(
             const float x3 = x[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -965,12 +981,12 @@ kernel void affine_qmv_fast_u4_gs64_align64_f32(
             float accum = 0.0f;
             for (uint i = 0u; i < 4u; ++i) {
                 const ushort word = w16[i];
-                accum += xt[4u * i] * float(word & 0x000fu);
-                accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
             }
-            result[row] += scale * accum + sum * bias;
+            result[row] = fma(scale, accum, fma(sum, bias, result[row]));
         }
     }
 
@@ -2195,6 +2211,10 @@ kernel void affine_qmm2_fast_aligned_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -2226,11 +2246,11 @@ kernel void affine_qmm2_fast_aligned_u4_gs64_f32(
             const float a0 = x0[i]; const float a1 = x0[i + 1u];
             const float a2 = x0[i + 2u]; const float a3 = x0[i + 3u];
             s0 += a0 + a1 + a2 + a3;
-            xt0[i] = a0; xt0[i + 1u] = a1 / 16.0f; xt0[i + 2u] = a2 / 256.0f; xt0[i + 3u] = a3 / 4096.0f;
+            xt0[i] = a0; xt0[i + 1u] = a1 * 0.0625f; xt0[i + 2u] = a2 * 0.00390625f; xt0[i + 3u] = a3 * 0.000244140625f;
             const float c0 = x1[i]; const float c1 = x1[i + 1u];
             const float c2 = x1[i + 2u]; const float c3 = x1[i + 3u];
             s1 += c0 + c1 + c2 + c3;
-            xt1[i] = c0; xt1[i + 1u] = c1 / 16.0f; xt1[i + 2u] = c2 / 256.0f; xt1[i + 3u] = c3 / 4096.0f;
+            xt1[i] = c0; xt1[i + 1u] = c1 * 0.0625f; xt1[i + 2u] = c2 * 0.00390625f; xt1[i + 3u] = c3 * 0.000244140625f;
         }
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
             const device ushort* w16 = (const device ushort*)(ws + row * row_bytes);
@@ -2240,17 +2260,17 @@ kernel void affine_qmm2_fast_aligned_u4_gs64_f32(
             float ac1 = 0.0f;
             for (uint i = 0u; i < 4u; ++i) {
                 const ushort word = w16[i];
-                ac0 += xt0[4u * i] * float(word & 0x000fu);
-                ac0 += xt0[4u * i + 1u] * float(word & 0x00f0u);
-                ac0 += xt0[4u * i + 2u] * float(word & 0x0f00u);
-                ac0 += xt0[4u * i + 3u] * float(word & 0xf000u);
-                ac1 += xt1[4u * i] * float(word & 0x000fu);
-                ac1 += xt1[4u * i + 1u] * float(word & 0x00f0u);
-                ac1 += xt1[4u * i + 2u] * float(word & 0x0f00u);
-                ac1 += xt1[4u * i + 3u] * float(word & 0xf000u);
+                ac0 = fma(xt0[4u * i], float(word & 0x000fu), ac0);
+                ac0 = fma(xt0[4u * i + 1u], float(word & 0x00f0u), ac0);
+                ac0 = fma(xt0[4u * i + 2u], float(word & 0x0f00u), ac0);
+                ac0 = fma(xt0[4u * i + 3u], float(word & 0xf000u), ac0);
+                ac1 = fma(xt1[4u * i], float(word & 0x000fu), ac1);
+                ac1 = fma(xt1[4u * i + 1u], float(word & 0x00f0u), ac1);
+                ac1 = fma(xt1[4u * i + 2u], float(word & 0x0f00u), ac1);
+                ac1 = fma(xt1[4u * i + 3u], float(word & 0xf000u), ac1);
             }
-            r0[row] += scale * ac0 + s0 * bias;
-            r1[row] += scale * ac1 + s1 * bias;
+            r0[row] = fma(scale, ac0, fma(s0, bias, r0[row]));
+            r1[row] = fma(scale, ac1, fma(s1, bias, r1[row]));
         }
         ws += 256u;
         scale_base += 8u;
@@ -2286,6 +2306,10 @@ kernel void affine_qmm8_fast_aligned_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     constexpr uint ROWS = 8u;
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
@@ -2341,20 +2365,20 @@ kernel void affine_qmm8_fast_aligned_u4_gs64_f32(
                 const float x3 = xm[i + 3u];
                 sum += x0 + x1 + x2 + x3;
                 xt[i] = x0;
-                xt[i + 1u] = x1 / 16.0f;
-                xt[i + 2u] = x2 / 256.0f;
-                xt[i + 3u] = x3 / 4096.0f;
+                xt[i + 1u] = x1 * 0.0625f;
+                xt[i + 2u] = x2 * 0.00390625f;
+                xt[i + 3u] = x3 * 0.000244140625f;
             }
             for (uint row = 0u; row < results_per_simdgroup; ++row) {
                 float accum = 0.0f;
                 for (uint i = 0u; i < 4u; ++i) {
                     const ushort word = words[row][i];
-                    accum += xt[4u * i] * float(word & 0x000fu);
-                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                    accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                    accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                    accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                    accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
                 }
-                acc[row][m] += scale[row] * accum + sum * bias[row];
+                acc[row][m] = fma(scale[row], accum, fma(sum, bias[row], acc[row][m]));
             }
         }
         ws += 256u;
@@ -4463,6 +4487,10 @@ kernel void affine_gather_qmv_fast_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint topk = dims.x;
     const uint out_dim = dims.y;
     const uint in_dim = dims.z;
@@ -4507,9 +4535,9 @@ kernel void affine_gather_qmv_fast_u4_gs64_f32(
             const float x3 = x[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < 4u; ++row) {
@@ -4520,12 +4548,12 @@ kernel void affine_gather_qmv_fast_u4_gs64_f32(
                 float accum = 0.0f;
                 for (uint i = 0u; i < 4u; ++i) {
                     const uint word = uint(w16[i]);
-                    accum += xt[4u * i] * float(word & 0x000fu);
-                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                    accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                    accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                    accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                    accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
                 }
-                result[row] += scale * accum + sum * bias;
+                result[row] = fma(scale, accum, fma(sum, bias, result[row]));
             }
         }
         ws += 256u;
@@ -5249,6 +5277,10 @@ kernel void affine_gather_qmv_tail_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint topk = dims.x;
     const uint out_dim = dims.y;
     const uint in_dim = dims.z;
@@ -5295,9 +5327,9 @@ kernel void affine_gather_qmv_tail_u4_gs64_f32(
                 const float x3 = x[i + 3u];
                 sum += x0 + x1 + x2 + x3;
                 xt[i] = x0;
-                xt[i + 1u] = x1 / 16.0f;
-                xt[i + 2u] = x2 / 256.0f;
-                xt[i + 3u] = x3 / 4096.0f;
+                xt[i + 1u] = x1 * 0.0625f;
+                xt[i + 2u] = x2 * 0.00390625f;
+                xt[i + 3u] = x3 * 0.000244140625f;
             }
         }
 
@@ -5309,12 +5341,12 @@ kernel void affine_gather_qmv_tail_u4_gs64_f32(
                 float accum = 0.0f;
                 for (uint i = 0u; i < 4u; ++i) {
                     const uint word = uint(w16[i]);
-                    accum += xt[4u * i] * float(word & 0x000fu);
-                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                    accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                    accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                    accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                    accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
                 }
-                result[row] += scale * accum + sum * bias;
+                result[row] = fma(scale, accum, fma(sum, bias, result[row]));
             }
         }
         ws += 256u;
@@ -5550,6 +5582,10 @@ kernel void affine_gather_gate_up_swiglu_fast_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint topk = dims.x;
     const uint out_dim = dims.y;
     const uint in_dim = dims.z;
@@ -5603,9 +5639,9 @@ kernel void affine_gather_gate_up_swiglu_fast_u4_gs64_f32(
                 const float x3 = x[i + 3u];
                 sum += x0 + x1 + x2 + x3;
                 xt[i] = x0;
-                xt[i + 1u] = x1 / 16.0f;
-                xt[i + 2u] = x2 / 256.0f;
-                xt[i + 3u] = x3 / 4096.0f;
+                xt[i + 1u] = x1 * 0.0625f;
+                xt[i + 2u] = x2 * 0.00390625f;
+                xt[i + 3u] = x3 * 0.000244140625f;
             }
         }
 
@@ -5622,17 +5658,17 @@ kernel void affine_gather_gate_up_swiglu_fast_u4_gs64_f32(
                 for (uint i = 0u; i < 4u; ++i) {
                     const uint gate_word = uint(gate_w16[i]);
                     const uint up_word = uint(up_w16[i]);
-                    gate_accum += xt[4u * i] * float(gate_word & 0x000fu);
-                    gate_accum += xt[4u * i + 1u] * float(gate_word & 0x00f0u);
-                    gate_accum += xt[4u * i + 2u] * float(gate_word & 0x0f00u);
-                    gate_accum += xt[4u * i + 3u] * float(gate_word & 0xf000u);
-                    up_accum += xt[4u * i] * float(up_word & 0x000fu);
-                    up_accum += xt[4u * i + 1u] * float(up_word & 0x00f0u);
-                    up_accum += xt[4u * i + 2u] * float(up_word & 0x0f00u);
-                    up_accum += xt[4u * i + 3u] * float(up_word & 0xf000u);
+                    gate_accum = fma(xt[4u * i], float(gate_word & 0x000fu), gate_accum);
+                    gate_accum = fma(xt[4u * i + 1u], float(gate_word & 0x00f0u), gate_accum);
+                    gate_accum = fma(xt[4u * i + 2u], float(gate_word & 0x0f00u), gate_accum);
+                    gate_accum = fma(xt[4u * i + 3u], float(gate_word & 0xf000u), gate_accum);
+                    up_accum = fma(xt[4u * i], float(up_word & 0x000fu), up_accum);
+                    up_accum = fma(xt[4u * i + 1u], float(up_word & 0x00f0u), up_accum);
+                    up_accum = fma(xt[4u * i + 2u], float(up_word & 0x0f00u), up_accum);
+                    up_accum = fma(xt[4u * i + 3u], float(up_word & 0xf000u), up_accum);
                 }
-                gate_result[row] += gate_scale * gate_accum + sum * gate_bias;
-                up_result[row] += up_scale * up_accum + sum * up_bias;
+                gate_result[row] = fma(gate_scale, gate_accum, fma(sum, gate_bias, gate_result[row]));
+                up_result[row] = fma(up_scale, up_accum, fma(sum, up_bias, up_result[row]));
             }
         }
         gate_ws += 256u;
@@ -5917,6 +5953,10 @@ kernel void affine_gate_up_swiglu_fast_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -5959,9 +5999,9 @@ kernel void affine_gate_up_swiglu_fast_u4_gs64_f32(
             const float x3 = x[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -5977,17 +6017,17 @@ kernel void affine_gate_up_swiglu_fast_u4_gs64_f32(
                 for (uint i = 0u; i < 4u; ++i) {
                     const ushort gate_word = gate_w16[i];
                     const ushort up_word = up_w16[i];
-                    gate_accum += xt[4u * i] * float(gate_word & 0x000fu);
-                    gate_accum += xt[4u * i + 1u] * float(gate_word & 0x00f0u);
-                    gate_accum += xt[4u * i + 2u] * float(gate_word & 0x0f00u);
-                    gate_accum += xt[4u * i + 3u] * float(gate_word & 0xf000u);
-                    up_accum += xt[4u * i] * float(up_word & 0x000fu);
-                    up_accum += xt[4u * i + 1u] * float(up_word & 0x00f0u);
-                    up_accum += xt[4u * i + 2u] * float(up_word & 0x0f00u);
-                    up_accum += xt[4u * i + 3u] * float(up_word & 0xf000u);
+                    gate_accum = fma(xt[4u * i], float(gate_word & 0x000fu), gate_accum);
+                    gate_accum = fma(xt[4u * i + 1u], float(gate_word & 0x00f0u), gate_accum);
+                    gate_accum = fma(xt[4u * i + 2u], float(gate_word & 0x0f00u), gate_accum);
+                    gate_accum = fma(xt[4u * i + 3u], float(gate_word & 0xf000u), gate_accum);
+                    up_accum = fma(xt[4u * i], float(up_word & 0x000fu), up_accum);
+                    up_accum = fma(xt[4u * i + 1u], float(up_word & 0x00f0u), up_accum);
+                    up_accum = fma(xt[4u * i + 2u], float(up_word & 0x0f00u), up_accum);
+                    up_accum = fma(xt[4u * i + 3u], float(up_word & 0xf000u), up_accum);
                 }
-                gate_result[row] += gate_scale * gate_accum + sum * gate_bias;
-                up_result[row] += up_scale * up_accum + sum * up_bias;
+                gate_result[row] = fma(gate_scale, gate_accum, fma(sum, gate_bias, gate_result[row]));
+                up_result[row] = fma(up_scale, up_accum, fma(sum, up_bias, up_result[row]));
             }
         }
 
@@ -6521,6 +6561,10 @@ kernel void affine_qkv_split_qmv_fast_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -6557,9 +6601,9 @@ kernel void affine_qkv_split_qmv_fast_u4_gs64_f32(
             const float x3 = x[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -6570,12 +6614,12 @@ kernel void affine_qkv_split_qmv_fast_u4_gs64_f32(
                 float accum = 0.0f;
                 for (uint i = 0u; i < 4u; ++i) {
                     const ushort word = w16[i];
-                    accum += xt[4u * i] * float(word & 0x000fu);
-                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                    accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                    accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                    accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                    accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
                 }
-                result[row] += scale * accum + sum * bias;
+                result[row] = fma(scale, accum, fma(sum, bias, result[row]));
             }
         }
         ws += block_size / 2u;
@@ -6705,6 +6749,9 @@ kernel void affine_qmv_rms_fast_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact) : contraction coupée, comme
+    // le qmv et le miroir `rms_norm_simd_rows_f32` de la vérification en lignes.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -6726,7 +6773,7 @@ kernel void affine_qmv_rms_fast_u4_gs64_f32(
         for (uint k = 0u; k < in_dim; k += block_size) {
             for (uint i = 0u; i < values_per_thread; ++i) {
                 const float value = norm_x[i];
-                sumsq += value * value;
+                sumsq = fma(value, value, sumsq);
             }
             norm_x += block_size;
         }
@@ -6758,9 +6805,9 @@ kernel void affine_qmv_rms_fast_u4_gs64_f32(
             const float x3 = x[i + 3u] * inv_rms * gamma[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -6771,12 +6818,12 @@ kernel void affine_qmv_rms_fast_u4_gs64_f32(
                 float accum = 0.0f;
                 for (uint i = 0u; i < 4u; ++i) {
                     const ushort word = w16[i];
-                    accum += xt[4u * i] * float(word & 0x000fu);
-                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                    accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                    accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                    accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                    accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
                 }
-                result[row] += scale * accum + sum * bias;
+                result[row] = fma(scale, accum, fma(sum, bias, result[row]));
             }
         }
         ws += block_size / 2u;
@@ -6824,11 +6871,15 @@ kernel void affine_qmv_rms_fast_u8_gs64_f32(
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
     if (simd_gid == 0u) {
+        // NOTE: prologue rms seul sous contraction coupée, comme son miroir en lignes
+        // (`rms_norm_simd*_rows_f32`) : `sumsq` et `sumsq / dim + eps` y rendent les
+        // mêmes bits. La boucle quantifiée garde sa contraction implicite.
+        #pragma METAL fp contract(off)
         const device float* norm_x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
         for (uint k = 0u; k < in_dim; k += values_per_block) {
             for (uint i = 0u; i < values_per_thread; ++i) {
                 const float value = norm_x[i];
-                sumsq += value * value;
+                sumsq = fma(value, value, sumsq);
             }
             norm_x += values_per_block;
         }
@@ -6920,11 +6971,15 @@ kernel void affine_qmv_rms_fast_u8_gs128_f32(
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
     if (simd_gid == 0u) {
+        // NOTE: prologue rms seul sous contraction coupée, comme son miroir en lignes
+        // (`rms_norm_simd*_rows_f32`) : `sumsq` et `sumsq / dim + eps` y rendent les
+        // mêmes bits. La boucle quantifiée garde sa contraction implicite.
+        #pragma METAL fp contract(off)
         const device float* norm_x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
         for (uint k = 0u; k < in_dim; k += values_per_block) {
             for (uint i = 0u; i < values_per_thread; ++i) {
                 const float value = norm_x[i];
-                sumsq += value * value;
+                sumsq = fma(value, value, sumsq);
             }
             norm_x += values_per_block;
         }
@@ -7002,6 +7057,9 @@ kernel void affine_qkv_split_rms_qmv_fast_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact) : contraction coupée, comme
+    // le qmv et le miroir `rms_norm_simd_rows_f32` de la vérification en lignes.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -7026,7 +7084,7 @@ kernel void affine_qkv_split_rms_qmv_fast_u4_gs64_f32(
         for (uint k = 0u; k < in_dim; k += block_size) {
             for (uint i = 0u; i < values_per_thread; ++i) {
                 const float value = norm_x[i];
-                sumsq += value * value;
+                sumsq = fma(value, value, sumsq);
             }
             norm_x += block_size;
         }
@@ -7058,9 +7116,9 @@ kernel void affine_qkv_split_rms_qmv_fast_u4_gs64_f32(
             const float x3 = x[i + 3u] * inv_rms * gamma[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -7071,12 +7129,12 @@ kernel void affine_qkv_split_rms_qmv_fast_u4_gs64_f32(
                 float accum = 0.0f;
                 for (uint i = 0u; i < 4u; ++i) {
                     const ushort word = w16[i];
-                    accum += xt[4u * i] * float(word & 0x000fu);
-                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                    accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                    accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                    accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                    accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
                 }
-                result[row] += scale * accum + sum * bias;
+                result[row] = fma(scale, accum, fma(sum, bias, result[row]));
             }
         }
         ws += block_size / 2u;
@@ -7141,11 +7199,15 @@ kernel void affine_qkv_split_rms_qmv_fast_u3_gs64_f32(
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
     if (simd_gid == 0u) {
+        // NOTE: prologue rms seul sous contraction coupée, comme son miroir en lignes
+        // (`rms_norm_simd*_rows_f32`) : `sumsq` et `sumsq / dim + eps` y rendent les
+        // mêmes bits. La boucle quantifiée garde sa contraction implicite.
+        #pragma METAL fp contract(off)
         const device float* norm_x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
         for (uint k = 0u; k < in_dim; k += block_size) {
             for (uint i = 0u; i < values_per_thread; ++i) {
                 const float value = norm_x[i];
-                sumsq += value * value;
+                sumsq = fma(value, value, sumsq);
             }
             norm_x += block_size;
         }
@@ -7254,11 +7316,15 @@ kernel void affine_qkv_split_rms_qmv_fast_u8_gs64_f32(
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
     if (simd_gid == 0u) {
+        // NOTE: prologue rms seul sous contraction coupée, comme son miroir en lignes
+        // (`rms_norm_simd*_rows_f32`) : `sumsq` et `sumsq / dim + eps` y rendent les
+        // mêmes bits. La boucle quantifiée garde sa contraction implicite.
+        #pragma METAL fp contract(off)
         const device float* norm_x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
         for (uint k = 0u; k < in_dim; k += values_per_block) {
             for (uint i = 0u; i < values_per_thread; ++i) {
                 const float value = norm_x[i];
-                sumsq += value * value;
+                sumsq = fma(value, value, sumsq);
             }
             norm_x += values_per_block;
         }
@@ -7346,6 +7412,9 @@ kernel void affine_qmv_gated_input_fast_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact) : contraction coupée, comme
+    // le qmv et le miroir `rms_norm_simd_rows_f32` de la vérification en lignes.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -7380,9 +7449,9 @@ kernel void affine_qmv_gated_input_fast_u4_gs64_f32(
             const float x3 = x[i + 3u] * (1.0f / (1.0f + exp(-g[i + 3u])));
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
@@ -7393,12 +7462,12 @@ kernel void affine_qmv_gated_input_fast_u4_gs64_f32(
                 float accum = 0.0f;
                 for (uint i = 0u; i < 4u; ++i) {
                     const ushort word = w16[i];
-                    accum += xt[4u * i] * float(word & 0x000fu);
-                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                    accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                    accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                    accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                    accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
                 }
-                result[row] += scale * accum + sum * bias;
+                result[row] = fma(scale, accum, fma(sum, bias, result[row]));
             }
         }
         ws += block_size / 2u;
@@ -7507,6 +7576,10 @@ kernel void affine_argmax_qmv_fast_u4_gs64_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contrat du qmv u4 gs64 (O1 rows_exact, oracle CPU f32) : produits en
+    // fma() explicites, `r = fma(scale, accum, fma(sum, bias, r))`, contraction
+    // coupée ; le mono et la vérification en lignes rendent les mêmes bits.
+    #pragma METAL fp contract(off)
     const uint out_dim = dims.x;
     const uint in_dim = dims.y;
     const uint packed_cols = dims.z;
@@ -7534,9 +7607,9 @@ kernel void affine_argmax_qmv_fast_u4_gs64_f32(
             const float x3 = x[i + 3u];
             sum += x0 + x1 + x2 + x3;
             xt[i] = x0;
-            xt[i + 1u] = x1 / 16.0f;
-            xt[i + 2u] = x2 / 256.0f;
-            xt[i + 3u] = x3 / 4096.0f;
+            xt[i + 1u] = x1 * 0.0625f;
+            xt[i + 2u] = x2 * 0.00390625f;
+            xt[i + 3u] = x3 * 0.000244140625f;
         }
 
         for (uint row = 0u; row < 4u; ++row) {
@@ -7547,12 +7620,12 @@ kernel void affine_argmax_qmv_fast_u4_gs64_f32(
                 float accum = 0.0f;
                 for (uint i = 0u; i < 4u; ++i) {
                     const uint word = uint(w16[i]);
-                    accum += xt[4u * i] * float(word & 0x000fu);
-                    accum += xt[4u * i + 1u] * float(word & 0x00f0u);
-                    accum += xt[4u * i + 2u] * float(word & 0x0f00u);
-                    accum += xt[4u * i + 3u] * float(word & 0xf000u);
+                    accum = fma(xt[4u * i], float(word & 0x000fu), accum);
+                    accum = fma(xt[4u * i + 1u], float(word & 0x00f0u), accum);
+                    accum = fma(xt[4u * i + 2u], float(word & 0x0f00u), accum);
+                    accum = fma(xt[4u * i + 3u], float(word & 0xf000u), accum);
                 }
-                result[row] += scale * accum + sum * bias;
+                result[row] = fma(scale, accum, fma(sum, bias, result[row]));
             }
         }
 
@@ -7922,6 +7995,10 @@ kernel void rms_norm_simd_rows_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint row [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: miroir en lignes des prologues rms fusionnés, sous la même contraction
+    // coupée qu'eux : `sumsq` et `sumsq / dim + eps` sont les seuls candidats à une
+    // contraction (le produit `x * inv_rms * gamma` n'a pas d'addition).
+    #pragma METAL fp contract(off)
     const uint values_per_thread = 16u;
     const uint block_size = values_per_thread * 32u;
     const uint offset = row * dim;
@@ -7931,7 +8008,7 @@ kernel void rms_norm_simd_rows_f32(
     for (uint k = 0u; k < dim; k += block_size) {
         for (uint i = 0u; i < values_per_thread; ++i) {
             const float value = norm_x[i];
-            sumsq += value * value;
+            sumsq = fma(value, value, sumsq);
         }
         norm_x += block_size;
     }
@@ -7960,6 +8037,10 @@ kernel void rms_norm_simd_u3_rows_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint row [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: miroir en lignes des prologues rms fusionnés, sous la même contraction
+    // coupée qu'eux : `sumsq` et `sumsq / dim + eps` sont les seuls candidats à une
+    // contraction (le produit `x * inv_rms * gamma` n'a pas d'addition).
+    #pragma METAL fp contract(off)
     const uint values_per_thread = 8u;
     const uint block_size = values_per_thread * 32u;
     const uint offset = row * dim;
@@ -7969,7 +8050,7 @@ kernel void rms_norm_simd_u3_rows_f32(
     for (uint k = 0u; k < dim; k += block_size) {
         for (uint i = 0u; i < values_per_thread; ++i) {
             const float value = norm_x[i];
-            sumsq += value * value;
+            sumsq = fma(value, value, sumsq);
         }
         norm_x += block_size;
     }

@@ -1156,18 +1156,22 @@ fn rows_exact_full_attn_qkv_prologue() -> Result<()> {
 fn rows_exact_full_attn_qkv_prologue_body() -> Result<()> {
     let executor = rows_exact_executor()?;
     let head_dim = 256usize;
-    let cases: [(&str, usize, usize, usize, bool); 3] = [
-        ("attn QKV u4", 5120, 24, 4, false),
-        ("attn QKV u4", 2048, 16, 2, false),
-        ("attn QKV u8", 2048, 16, 2, true),
+    // Le cas u3 couvre le miroir `rms_norm_simd_u3_rows_f32` ; le cas u8 ne
+    // fusionne que sous `SARAGOSSA_RUST_FULL_QKV_SPLIT_RMS_U8` (sinon miroir
+    // `rms_norm_rows`, prédicat vérifié ci-dessous).
+    let cases: [(&str, usize, usize, usize, usize); 4] = [
+        ("attn QKV u4", 5120, 24, 4, 4),
+        ("attn QKV u4", 2048, 16, 2, 4),
+        ("attn QKV u8", 2048, 16, 2, 8),
+        ("attn QKV u3", 2048, 16, 2, 3),
     ];
-    for (kernel, hidden, q_heads, kv_heads, u8) in cases {
+    for (kernel, hidden, q_heads, kv_heads, bits) in cases {
         let q_gate_dim = 2 * q_heads * head_dim;
         let out_dim = q_gate_dim + 2 * kv_heads * head_dim;
-        let weight = if u8 {
-            test_affine_varied_u8_group(out_dim, hidden, 64)?
-        } else {
-            test_affine_random_u4(out_dim, hidden, 41)?
+        let weight = match bits {
+            8 => test_affine_varied_u8_group(out_dim, hidden, 64)?,
+            3 => test_affine_mlx_u3(out_dim, hidden)?,
+            _ => test_affine_random_u4(out_dim, hidden, 41)?,
         };
         let proj = executor.resolve_linear_weight_buffers(
             &LinearWeight::AffineQuantized(weight),
@@ -1235,6 +1239,296 @@ fn rows_exact_full_attn_qkv_prologue_body() -> Result<()> {
             rows_exact_check(
                 kernel,
                 &format!("h{hidden} fusionné={applies}"),
+                rows,
+                out_dim,
+                &mono[..rows * out_dim],
+                &read_f32_buffer(&out, rows * out_dim)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Ancre du contrat qmv u4 gs64 sur ses trois variantes :
+/// - alignée (`out_dim` multiple de 8, `in_dim` multiple de 512) ;
+/// - non alignée, `out_dim` = 61 : le dernier simdgroup ne garde qu'une sortie
+///   sur quatre (`row_base + row < out_dim`) ;
+/// - `align64`, `in_dim` = 1088 (multiple de 64, pas de 512) : deux blocs pleins
+///   puis la queue de 64 valeurs servie par 4 voies, en `out_dim` 64 et 61.
+///
+/// Trois égalités en bits, par graine :
+/// 1. les partiels de chaque voie avant `simd_sum`, relevés sur une copie du
+///    kernel de `kernels.metal` dont seule la réduction finale est redirigée,
+///    égalent une réplique CPU f32 de la forme canonique (32 voies × 16
+///    activations par bloc de 512, `sum` en sous-sommes `((x0 + x1) + x2) + x3`,
+///    produits en `mul_add`, `r = scale·accum + (sum·bias + r)` fusionnés) ;
+/// 2. ces partiels réduits par le même `simd_sum` égalent la sortie du kernel
+///    intact compilé dans la même bibliothèque ;
+/// 3. cette sortie égale celle du pipeline de production (`MetalExecutor`),
+///    pour les formes que la production sert par ce kernel (`align64` exige
+///    `out_dim` multiple de 8 : le cas 61 s'arrête au kernel intact).
+///
+/// Portée : la preuve vaut pour les compilations exercées (fast-math, ce
+/// compilateur et ce GPU). `contract(off)` ne coupe pas la réassociation
+/// fast-math de la somme ; c'est ce test qui garde l'ordre, pas le pragma.
+#[test]
+#[ignore = "oracle GPU en bits : lancer avec --ignored"]
+fn rows_exact_qmv_contract_cpu_oracle() -> Result<()> {
+    let executor = rows_exact_executor()?;
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/kernels.metal"))
+        .map_err(|error| InferError::Config(format!("kernels.metal: {error}")))?;
+    let kernel_text = |name: &str| -> Result<String> {
+        let head = format!("kernel void {name}(");
+        let start = source
+            .find(&head)
+            .ok_or_else(|| InferError::Config(format!("{name} absent")))?;
+        let end = start
+            + source[start..]
+                .find("\n}\n")
+                .ok_or_else(|| InferError::Config(format!("fin de {name}")))?
+            + 3;
+        Ok(source[start..end].to_string())
+    };
+    let partial_store =
+        "            out[(tile.x * out_dim + row_base + row) * 32u + simd_lid] = result[row];\n";
+    let masked = "        if (simd_lid == 0u && row_base + row < out_dim) {\n";
+    let kernels = [
+        (
+            "affine_qmv_fast_aligned_u4_gs64_f32",
+            "        if (simd_lid == 0u) {\n",
+        ),
+        ("affine_qmv_fast_u4_gs64_f32", masked),
+        ("affine_qmv_fast_u4_gs64_align64_f32", masked),
+    ];
+    // (kernel, out_dim, in_dim, comparé à la production)
+    let cases = [
+        ("affine_qmv_fast_aligned_u4_gs64_f32", 64usize, 2048usize, true),
+        ("affine_qmv_fast_u4_gs64_f32", 61, 2048, true),
+        ("affine_qmv_fast_u4_gs64_align64_f32", 64, 1088, true),
+        ("affine_qmv_fast_u4_gs64_align64_f32", 61, 1088, false),
+    ];
+    let mut library_source = String::from(
+        "#include <metal_stdlib>\n#include <metal_simdgroup>\nusing namespace metal;\n\
+         kernel void anchor_reduce(device const float* p [[buffer(0)]], device float* out [[buffer(1)]],\n\
+             uint gid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_simdgroup]]) {\n\
+             const float r = simd_sum(p[gid * 32u + lid]);\n\
+             if (lid == 0u) { out[gid] = r; }\n\
+         }\n",
+    );
+    for (name, guard) in kernels {
+        let intact = kernel_text(name)?;
+        let reduce = format!(
+            "        const float reduced = simd_sum(result[row]);\n{guard}            out[tile.x * out_dim + row_base + row] = reduced;\n        }}\n"
+        );
+        let instrumented = intact
+            .replace(
+                &reduce,
+                &format!("        if (row_base + row < out_dim) {{\n{partial_store}        }}\n"),
+            )
+            .replace(&format!("kernel void {name}("), &format!("kernel void {name}_partials("));
+        assert!(
+            instrumented.contains(partial_store),
+            "{name} : réduction finale introuvable"
+        );
+        library_source.push_str(&intact);
+        library_source.push_str(&instrumented);
+    }
+    let library = {
+        let options = metal::CompileOptions::new();
+        options.set_fast_math_enabled(true);
+        executor
+            .device
+            .new_library_with_source(&library_source, &options)
+            .map_err(InferError::Metal)?
+    };
+    let pipeline = |name: &str| -> Result<ComputePipelineState> {
+        let function = library.get_function(name, None).map_err(InferError::Metal)?;
+        executor
+            .device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(InferError::Metal)
+    };
+    let reduce_pipeline = pipeline("anchor_reduce")?;
+    for (name, out_dim, in_dim, compare_production) in cases {
+        let intact_pipeline = pipeline(name)?;
+        let partial_pipeline = pipeline(&format!("{name}_partials"))?;
+        let weight = test_affine_random_u4(out_dim, in_dim, 77)?;
+        let groups = in_dim / 64;
+        let packed = weight.packed_data().to_vec();
+        let scales = weight.scales_f32().into_owned();
+        let biases = weight.biases_f32().into_owned();
+        let buffers = executor
+            .resolve_linear_weight_buffers(&LinearWeight::AffineQuantized(weight), "rexact_anchor_w")?;
+        let MetalLinearWeightBuffers::AffineQuantized {
+            packed: packed_buf,
+            scales: scales_buf,
+            biases: biases_buf,
+            packed_cols,
+            ..
+        } = &buffers
+        else {
+            return Err(InferError::Config("poids affine attendu".into()));
+        };
+        let dims = [out_dim as u32, in_dim as u32, *packed_cols as u32, groups as u32];
+        for (salt, scale_x) in [(9usize, 1.0f32), (40, 300.0)] {
+            let x: Vec<f32> = varied_row(in_dim, salt)
+                .into_iter()
+                .map(|v| v * scale_x)
+                .collect();
+            let x_buf = executor.buffer_from_slice(&x, "rexact_anchor_x")?;
+            let partials = executor.uncached_f32_buffer(out_dim * 32, "rexact_anchor_partials")?;
+            let reduced = executor.uncached_f32_buffer(out_dim, "rexact_anchor_reduced")?;
+            let intact = executor.uncached_f32_buffer(out_dim, "rexact_anchor_intact")?;
+            let production = executor.uncached_f32_buffer(out_dim, "rexact_anchor_prod")?;
+            rows_exact_cb(&executor, |enc| {
+                for (kernel, out) in [(&partial_pipeline, &partials), (&intact_pipeline, &intact)] {
+                    enc.set_compute_pipeline_state(kernel);
+                    enc.set_buffer(0, Some(&x_buf), 0);
+                    enc.set_buffer(1, Some(packed_buf), 0);
+                    enc.set_buffer(2, Some(scales_buf), 0);
+                    enc.set_buffer(3, Some(biases_buf), 0);
+                    enc.set_buffer(4, Some(out), 0);
+                    set_u32_bytes(enc, 5, &dims, "rexact_anchor_dims")?;
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(1, out_dim.div_ceil(8) as u64, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
+                }
+                enc.set_compute_pipeline_state(&reduce_pipeline);
+                enc.set_buffer(0, Some(&partials), 0);
+                enc.set_buffer(1, Some(&reduced), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(out_dim as u64, 1, 1),
+                    MTLSize::new(32, 1, 1),
+                );
+                executor
+                    .encode_matmul_weight_buffers(enc, &x_buf, 1, in_dim, &buffers, &production, false)
+                    .map(|_| ())
+            })?;
+            let gpu = read_f32_buffer(&partials, out_dim * 32)?;
+            // Réplique CPU : mots u4 lus comme le kernel (octets little-endian).
+            let row_words = in_dim / 8;
+            let ushort_at = |o: usize, byte: usize| -> u32 {
+                let word = packed[o * row_words + byte / 4];
+                (word >> ((byte % 4) * 8)) & 0xffff
+            };
+            let mut bad = 0usize;
+            for o in 0..out_dim {
+                for lane in 0..32usize {
+                    let mut result = 0.0f32;
+                    for block in 0..in_dim.div_ceil(512) {
+                        let base = block * 512 + lane * 16;
+                        // Queue `align64` : seules les voies couvrant des valeurs
+                        // réelles accumulent.
+                        if base >= in_dim {
+                            continue;
+                        }
+                        let mut sum = 0.0f32;
+                        let mut xt = [0.0f32; 16];
+                        for i in (0..16).step_by(4) {
+                            let (x0, x1, x2, x3) = (
+                                x[base + i],
+                                x[base + i + 1],
+                                x[base + i + 2],
+                                x[base + i + 3],
+                            );
+                            sum += ((x0 + x1) + x2) + x3;
+                            xt[i] = x0;
+                            xt[i + 1] = x1 / 16.0;
+                            xt[i + 2] = x2 / 256.0;
+                            xt[i + 3] = x3 / 4096.0;
+                        }
+                        let group = block * 8 + lane / 4;
+                        let (scale, bias) = (scales[o * groups + group], biases[o * groups + group]);
+                        let mut accum = 0.0f32;
+                        for i in 0..4usize {
+                            let word = ushort_at(o, block * 256 + lane * 8 + i * 2);
+                            for (j, mask) in
+                                [0x000fu32, 0x00f0, 0x0f00, 0xf000].into_iter().enumerate()
+                            {
+                                accum = xt[4 * i + j].mul_add((word & mask) as f32, accum);
+                            }
+                        }
+                        result = scale.mul_add(accum, sum.mul_add(bias, result));
+                    }
+                    bad += usize::from(result.to_bits() != gpu[o * 32 + lane].to_bits());
+                }
+            }
+            assert_eq!(
+                bad,
+                0,
+                "{name} {out_dim}x{in_dim} : {bad}/{} partiels ≠ réplique CPU (graine {salt})",
+                out_dim * 32
+            );
+            let reduced = read_f32_buffer(&reduced, out_dim)?;
+            let intact = read_f32_buffer(&intact, out_dim)?;
+            let production = read_f32_buffer(&production, out_dim)?;
+            assert_eq!(
+                rows_exact_ndiff(&intact, &reduced, name),
+                0,
+                "{name} {out_dim}x{in_dim} : simd_sum des partiels ≠ kernel intact (graine {salt})"
+            );
+            if !compare_production {
+                continue;
+            }
+            assert_eq!(
+                rows_exact_ndiff(&intact, &production, name),
+                0,
+                "{name} {out_dim}x{in_dim} : kernel intact ≠ pipeline de production (graine {salt})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Prologues rms fusionnés au qmv u8 (gs64 et gs128) : le mono fusionne la norme
+/// au qmv, les lignes passent par le miroir `rms_norm_simd_rows_f32` puis le qmv
+/// u8 en lignes ; égalité stricte en bits, R = 1..9.
+#[test]
+#[ignore = "oracle GPU en bits : lancer avec --ignored"]
+fn rows_exact_rms_prologue_u8() -> Result<()> {
+    rows_exact_both_modes(rows_exact_rms_prologue_u8_body)
+}
+
+fn rows_exact_rms_prologue_u8_body() -> Result<()> {
+    let executor = rows_exact_executor()?;
+    let hidden = 2048usize;
+    for (case, out_dim, group) in [("u8 gs64 512x2048", 512usize, 64usize), ("u8 gs128 512x2048", 512, 128)] {
+        let proj = executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(test_affine_varied_u8_group(out_dim, hidden, group)?),
+            "rexact_rmsu8_w",
+        )?;
+        let norm = executor.buffer_from_slice(&varied_row(hidden, 67), "rexact_rmsu8_n")?;
+        let x = rows_exact_lhs(9, hidden, 950, 1.0);
+        let mut mono = Vec::new();
+        for r in 0..9 {
+            let xr = executor.buffer_from_slice(&x[r * hidden..(r + 1) * hidden], "rexact_rmsu8_x1")?;
+            let out = executor.uncached_f32_buffer(out_dim, "rexact_rmsu8_o1")?;
+            let mut fused = false;
+            rows_exact_cb(&executor, |enc| {
+                fused = executor
+                    .encode_matmul_weight_buffers_rms_prologue(enc, &xr, &norm, 1e-6, hidden, &proj, &out)?
+                    .is_some();
+                Ok(())
+            })?;
+            assert!(fused, "{case} : prologue rms u8 non fusionné");
+            mono.extend(read_f32_buffer(&out, out_dim)?);
+        }
+        for rows in 1..=9 {
+            let xb = executor.buffer_from_slice(&x[..rows * hidden], "rexact_rmsu8_xr")?;
+            let normed = executor.uncached_f32_buffer(rows * hidden, "rexact_rmsu8_nr")?;
+            let out = executor.uncached_f32_buffer(rows * out_dim, "rexact_rmsu8_or")?;
+            rows_exact_cb(&executor, |enc| {
+                executor.encode_rms_norm_rows_matching_solo(
+                    enc, &xb, &norm, &normed, rows, hidden, 1e-6, &proj, false,
+                )?;
+                executor
+                    .encode_matmul_weight_buffers(enc, &normed, rows, hidden, &proj, &out, false)
+                    .map(|_| ())
+            })?;
+            rows_exact_check(
+                "prologue rms u8",
+                case,
                 rows,
                 out_dim,
                 &mono[..rows * out_dim],

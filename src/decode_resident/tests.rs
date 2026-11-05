@@ -3094,6 +3094,7 @@ fn full_attn_dense_layer_rows_matches_mono_bits() -> Result<()> {
     let values: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 11)).collect();
     let input: Vec<f32> = (0..9 * hidden).map(|i| 4.0 * pseudo(5000 + i)).collect();
     crate::metal_backend::with_qmm_skinny_min_batch_override(usize::MAX, || -> Result<()> {
+        let mut failures = Vec::new();
         for rows in 1..=9 {
             let mut kv_mono =
                 state.full_attention_f32_for_test(prefix + 16, q_heads, kv_heads, head_dim)?;
@@ -3145,12 +3146,18 @@ fn full_attn_dense_layer_rows_matches_mono_bits() -> Result<()> {
                     .zip(&mono[r * hidden..(r + 1) * hidden])
                     .filter(|(a, b)| a.to_bits() != b.to_bits())
                     .count();
-                assert_eq!(
-                    bad, 0,
-                    "couche dense R={rows} ligne {r}: {bad}/{hidden} sorties ≠ mono"
-                );
+                let worst = got[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(&mono[r * hidden..(r + 1) * hidden])
+                    .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                if bad > 0 {
+                    failures.push(format!(
+                        "R={rows} ligne {r}: {bad}/{hidden} (écart max {worst:e})"
+                    ));
+                }
             }
         }
+        assert!(failures.is_empty(), "couche dense ≠ mono : {failures:#?}");
         Ok(())
     })
 }
