@@ -4,14 +4,17 @@ Chaque couche est le module officiel `Qwen4ExpTextDecoderLayer` (sdpa, f32,
 eval, sans autocast), experts déquantifiés en f32 dans `Qwen4ExpTextExperts` :
 le MoE n'est pas réimplémenté. Sont figés : sorties de couche, logits et
 indices du routeur, masque et scores de l'indexeur QSA. `provenance.json`
-enregistre les empreintes des goldens, des poids (manifeste du checkpoint),
-les versions et le backend ; les tests Rust la vérifient avant l'inférence.
+contient une entrée par golden : son empreinte, celles des fichiers de poids
+recalculées sur disque, la config, les versions et le backend. Un même dossier
+refuse des goldens d'origines différentes. Les tests Rust recalculent les
+empreintes des fichiers ouverts avant l'inférence.
 
   --layers : une séquence de 8000 tokens (couches 0-3) ; ses préfixes couvrent
              les longueurs 64, 2047-2052 et 3000 (tout est causal).
   --full   : logits du modèle complet sur quatre prompts courts.
 
 Usage :
+  python -I tools/flashnext/oracle_dump.py --selftest
   python -I tools/flashnext/oracle_dump.py --layers <q4e8> <tokenizer.json> <texte> <sortie>
   python -I tools/flashnext/oracle_dump.py --full   <q4e8> <tokenizer.json> <sortie>
 """
@@ -47,22 +50,86 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def update_provenance(out, qdir, golden_file, extra):
-    path = out / "provenance.json"
-    prov = json.loads(path.read_text()) if path.exists() else {"files": {}}
-    manifest = json.loads((Path(qdir) / "convert_manifest.json").read_text())
-    prov.update({
+def weight_files(qdir):
+    """Fichiers réellement lus par les oracles : config, shards indexés, MTP, n-gram."""
+    qdir = Path(qdir)
+    index = json.loads((qdir / "model.safetensors.index.json").read_text())
+    names = sorted(set(index["weight_map"].values()))
+    if (qdir / "mtp.safetensors").exists():
+        names.append("mtp.safetensors")
+    names.append("ngram/ngram_e4m3.bin")
+    return names
+
+
+def environment():
+    return {
         "transformers": transformers.__version__,
         "torch": torch.__version__,
         "attn_implementation": "sdpa",
         "dtype": "float32",
         "mode": "eval, no_grad, sans autocast",
+    }
+
+
+def provenance_entry(out, qdir, golden_file, run):
+    """Provenance propre à un golden : son empreinte, celles des fichiers de poids
+    **recalculées sur disque** (et confrontées au manifeste), la config, l'environnement."""
+    qdir = Path(qdir)
+    manifest = {f["name"]: f["sha256"] for f in json.loads((qdir / "convert_manifest.json").read_text())["files"]}
+    weights = {}
+    for name in weight_files(qdir):
+        weights[name] = sha256(qdir / name)
+        if manifest.get(name) != weights[name]:
+            raise SystemExit(f"{name}: sha disque {weights[name]} ≠ manifeste {manifest.get(name)}")
+    return {
+        "sha256": sha256(out / golden_file),
         "weights_dir": str(qdir),
-        "weights": {f["name"]: f["sha256"] for f in manifest["files"]},
-    })
-    prov["files"][golden_file] = sha256(out / golden_file)
-    prov.setdefault("runs", {})[golden_file] = extra
+        "weights": weights,
+        "config_sha256": sha256(qdir / "config.json"),
+        **environment(),
+        "run": run,
+    }
+
+
+def merge_provenance(path, golden_file, entry):
+    """Ajoute l'entrée d'un golden ; refuse de mélanger dans un même dossier des
+    goldens issus de poids, de config ou d'environnements différents."""
+    prov = json.loads(path.read_text()) if path.exists() else {"goldens": {}}
+    if "goldens" not in prov:
+        raise SystemExit(f"{path}: format de provenance inconnu, dossier à recréer")
+    keys = ("weights", "config_sha256", "transformers", "torch", "attn_implementation", "dtype")
+    for other, existing in prov["goldens"].items():
+        if other == golden_file:
+            continue
+        for key in keys:
+            if existing.get(key) != entry.get(key):
+                raise SystemExit(f"{path}: {golden_file} et {other} diffèrent sur {key} ; dossier séparé requis")
+    prov["goldens"][golden_file] = entry
     path.write_text(json.dumps(prov, indent=1, ensure_ascii=False))
+
+
+def record(out, qdir, golden_file, run):
+    merge_provenance(out / "provenance.json", golden_file, provenance_entry(out, qdir, golden_file, run))
+
+
+def selftest():
+    """Vérifie le refus de mélange : deux goldens de poids différents dans un dossier."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "provenance.json"
+        base = {"weights": {"a": "1"}, "config_sha256": "c", **environment()}
+        merge_provenance(path, "layers.safetensors", {**base, "sha256": "x"})
+        merge_provenance(path, "layers.safetensors", {**base, "sha256": "y"})  # remplacement
+        for key, value in (("weights", {"a": "2"}), ("config_sha256", "d"), ("torch", "0")):
+            try:
+                merge_provenance(path, "full.safetensors", {**base, key: value, "sha256": "z"})
+            except SystemExit:
+                continue
+            raise AssertionError(f"mélange accepté sur {key}")
+        merge_provenance(path, "full.safetensors", {**base, "sha256": "z"})
+        assert set(json.loads(path.read_text())["goldens"]) == {"layers.safetensors", "full.safetensors"}
+    print("selftest provenance : ok")
 
 
 def run_layers(qdir, tokenizer, text, out):
@@ -104,7 +171,7 @@ def run_layers(qdir, tokenizer, text, out):
         del layer
         print(f"couche {index}: {time.time() - started:.0f} s, pic RSS {C.footprint_gb():.1f} Go", flush=True)
     C.write_safetensors(out / "layers.safetensors", tensors, {"tokens": n})
-    update_provenance(out, qdir, "layers.safetensors", {"tokens": n, "text": str(text)})
+    record(out, qdir, "layers.safetensors", {"tokens": n, "text": str(text), "text_sha256": sha256(text)})
 
 
 def run_full(qdir, tokenizer, out):
@@ -132,12 +199,15 @@ def run_full(qdir, tokenizer, out):
         tensors[f"prompt.{i}.ids"] = ("I64", (t.shape[1],), t[0].numpy().astype(np.int64).tobytes())
         tensors[f"prompt.{i}.logits"] = ("F32", tuple(logits.shape), logits.float().numpy().tobytes())
     C.write_safetensors(out / "full.safetensors", tensors, {"prompts": json.dumps(PROMPTS)})
-    update_provenance(out, qdir, "full.safetensors", {"prompts": PROMPTS})
+    record(out, qdir, "full.safetensors", {"prompts": PROMPTS})
 
 
 def main():
     torch.set_num_threads(os.cpu_count() or 8)
-    mode = sys.argv[1]
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "--selftest":
+        selftest()
+        return
     if mode == "--layers":
         _, _, qdir, tokenizer, text, out = sys.argv
         out = Path(out)
