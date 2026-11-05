@@ -6,7 +6,7 @@
 //! segment démarre après le dernier EOS strictement antérieur).
 
 /// Seed du hachage : défaut de `Qwen4ExpTextConfig`, absent de `config.json`.
-pub const NGRAM_SEED: u64 = 1234;
+pub(crate) const NGRAM_SEED: u64 = 1234;
 
 const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const SPLITMIX_M1: u64 = 0xBF58_476D_1CE4_E5B9;
@@ -21,7 +21,7 @@ fn splitmix64(value: u64) -> u64 {
 }
 
 /// Multiplicateurs de couche (`_build_layer_multipliers`).
-pub fn layer_multipliers(
+pub(crate) fn layer_multipliers(
     unigram_vocab: u64,
     ngram_size: usize,
     ple_layer_index: u64,
@@ -58,7 +58,7 @@ fn is_prime(value: u64) -> bool {
 }
 
 /// Tailles de vocabulaire par tête : `(i+1)`-ième premier après `base − 1`.
-pub fn head_vocab_sizes(base: u64, heads: usize) -> Vec<i64> {
+pub(crate) fn head_vocab_sizes(base: u64, heads: usize) -> Vec<i64> {
     let mut sizes = Vec::with_capacity(heads);
     let mut prime = base.saturating_sub(1);
     for _ in 0..heads {
@@ -99,7 +99,7 @@ fn shifted(history: &[u64], eos: u64, shift: usize) -> Vec<u64> {
 /// checkpoint ; les produits et le XOR sont faits en u64 (les multiplicateurs
 /// sont bornés par `2^63 / vocab`, le produit ne déborde pas), le modulo par
 /// un premier positif est donc positif.
-pub fn ngram_ids(
+pub(crate) fn ngram_ids(
     tokens: &[u64],
     eos: u64,
     ngram_size: usize,

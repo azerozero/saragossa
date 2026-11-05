@@ -71,7 +71,8 @@ pub(crate) fn rope_in_place(head: &mut [f32], freqs: &[f32], position: usize) {
 }
 
 /// Erreur relative `‖a − b‖ / max(‖b‖, 1e-30)` et écart absolu maximal.
-pub fn relative_error(a: &[f32], b: &[f32]) -> (f64, f64) {
+#[cfg(test)]
+pub(crate) fn relative_error(a: &[f32], b: &[f32]) -> (f64, f64) {
     let mut num = 0.0_f64;
     let mut den = 0.0_f64;
     let mut max = 0.0_f64;

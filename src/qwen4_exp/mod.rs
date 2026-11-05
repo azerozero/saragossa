@@ -7,9 +7,9 @@
 
 mod attention;
 mod forward;
-pub mod math;
+pub(crate) mod math;
 mod moe;
-pub mod ngram;
+pub(crate) mod ngram;
 mod ple;
 mod residual;
 
