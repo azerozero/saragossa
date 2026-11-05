@@ -1,5 +1,6 @@
 //! Harnais et chargeurs de diagnostic hors moteur nominal.
 
+pub mod convert;
 pub mod dflash;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod pairwise;

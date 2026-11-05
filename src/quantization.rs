@@ -940,12 +940,187 @@ pub(crate) fn quantize_affine_into(
 
 /// Bits bf16 de `value`, arrondi au plus proche pair comme les uploads Metal
 /// (`f32_slice_to_bf16`).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 pub(crate) fn bf16_bits(value: f32) -> u16 {
     (bf16_round(value).to_bits() >> 16) as u16
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+/// Erreur cumulée d'une quantification : `Σ(w − dq)²` et `Σw²`, en f64.
+#[cfg(feature = "devtools")]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct QuantError {
+    pub(crate) sum_sq_err: f64,
+    pub(crate) sum_sq: f64,
+}
+
+#[cfg(feature = "devtools")]
+impl QuantError {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.sum_sq_err += other.sum_sq_err;
+        self.sum_sq += other.sum_sq;
+    }
+
+    /// `‖W − dq(q(W))‖ / ‖W‖`, et 0 pour un poids identiquement nul (restitué
+    /// exactement : scale minimale, biais nul).
+    pub(crate) fn relative(&self) -> f64 {
+        if self.sum_sq == 0.0 {
+            return self.sum_sq_err.sqrt();
+        }
+        (self.sum_sq_err / self.sum_sq).sqrt()
+    }
+}
+
+/// Quantifie `data` (`[rows, cols]`) en affine MLX avec scales et biais
+/// **arrondis en bf16 avant le calcul des codes**, codes packés en flux de bits
+/// LSB-first par ligne.
+///
+/// Le flux de bits est le format MLX : un code peut chevaucher deux `u32`
+/// (6 bits) et, quand `bits` divise 32, il coïncide avec le packing par lanes de
+/// [`quantize_affine_into`]. Les codes sont calculés contre les paramètres bf16
+/// effectivement sérialisés, et l'erreur renvoyée est celle de la restitution
+/// `q·scale + bias` lue par le loader.
+///
+/// # Errors
+///
+/// Renvoie une erreur si `bits ∉ {2,3,4,5,6,8}`, si `cols` n'est pas un
+/// multiple de `group_size`, si une ligne ne tombe pas sur une frontière de
+/// `u32`, si les tranches ont une mauvaise taille ou si une valeur n'est pas
+/// finie.
+#[cfg(feature = "devtools")]
+pub(crate) fn quantize_affine_bitstream_bf16(
+    data: &[f32],
+    cols: usize,
+    group_size: usize,
+    bits: usize,
+    packed: &mut [u32],
+    scales: &mut [u16],
+    biases: &mut [u16],
+) -> Result<QuantError> {
+    if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8)
+        || group_size == 0
+        || cols == 0
+        || cols % group_size != 0
+        || (cols * bits) % 32 != 0
+    {
+        return Err(InferError::Config(format!(
+            "quantification affine bitstream impossible: cols={cols}, group_size={group_size}, bits={bits}"
+        )));
+    }
+    let rows = data.len() / cols;
+    let packed_cols = cols * bits / 32;
+    let groups = cols / group_size;
+    if rows * cols != data.len()
+        || packed.len() != rows * packed_cols
+        || scales.len() != rows * groups
+        || biases.len() != rows * groups
+    {
+        return Err(InferError::Dimension(format!(
+            "quantification bitstream: {} valeurs, {cols} colonnes, sorties {}/{}/{}",
+            data.len(),
+            packed.len(),
+            scales.len(),
+            biases.len()
+        )));
+    }
+    // Les codes sont combinés par `|=` : un `packed` non nul les corromprait.
+    packed.fill(0);
+    let levels = ((1_u32 << bits) - 1) as f32;
+    let mut error = QuantError::default();
+    for row in 0..rows {
+        let words = &mut packed[row * packed_cols..(row + 1) * packed_cols];
+        for group in 0..groups {
+            let start = row * cols + group * group_size;
+            let slice = &data[start..start + group_size];
+            // `min`/`max` ignorent NaN : chaque valeur est contrôlée.
+            if slice.iter().any(|value| !value.is_finite()) {
+                return Err(InferError::Config(format!(
+                    "quantification affine: valeur non finie (ligne {row}, groupe {group})"
+                )));
+            }
+            let (min, max) = slice
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &value| {
+                    (lo.min(value), hi.max(value))
+                });
+            let (scale_bits, bias_bits) = affine_params_bf16(min, max, levels)?;
+            let scale = bf16_value(scale_bits);
+            let bias = bf16_value(bias_bits);
+            scales[row * groups + group] = scale_bits;
+            biases[row * groups + group] = bias_bits;
+            for (lane, &value) in slice.iter().enumerate() {
+                // Division (et non produit par l'inverse) : un ulp d'écart sur le
+                // quotient peut basculer l'arrondi. Code borné dans [0, levels].
+                let code = ((f64::from(value) - f64::from(bias)) / f64::from(scale))
+                    .round()
+                    .clamp(0.0, f64::from(levels)) as u32;
+                let restored = code as f32 * scale + bias;
+                error.sum_sq_err += f64::from(value - restored).powi(2);
+                error.sum_sq += f64::from(value).powi(2);
+                let bit = (group * group_size + lane) * bits;
+                let (word, shift) = (bit / 32, bit % 32);
+                words[word] |= code << shift;
+                if shift + bits > 32 {
+                    words[word + 1] |= code >> (32 - shift);
+                }
+            }
+        }
+    }
+    Ok(error)
+}
+
+/// Paramètres affines bf16 `(scale, bias)` d'un groupe `[min, max]`.
+///
+/// Le biais est arrondi **vers −∞** (`bias ≤ min`) et la scale **vers +∞**
+/// jusqu'à couvrir `max` (`bias + levels·scale ≥ max`) : aucun code n'est alors
+/// écrêté et l'erreur reste bornée par un demi-pas de la scale sérialisée.
+#[cfg(feature = "devtools")]
+pub(crate) fn affine_params_bf16(min: f32, max: f32, levels: f32) -> Result<(u16, u16)> {
+    let mut bias_bits = bf16_bits(min);
+    if bf16_value(bias_bits) > min {
+        bias_bits = bf16_step_down(bias_bits);
+    }
+    let bias = bf16_value(bias_bits);
+    // Étendue en f64 : `max − bias` déborde en f32 près des extrêmes bf16 finis.
+    let span = f64::from(max) - f64::from(bias);
+    let mut scale_bits = bf16_bits(((span / f64::from(levels)) as f32).max(1.0e-7));
+    // Deux pas au plus : l'arrondi au plus proche perd moins d'un ulp bf16.
+    while f64::from(bias) + f64::from(levels) * f64::from(bf16_value(scale_bits)) < f64::from(max) {
+        scale_bits = bf16_step_up_positive(scale_bits);
+    }
+    let scale = bf16_value(scale_bits);
+    // La restitution maximale doit rester finie en f32, comme le calcul du loader.
+    if !bias.is_finite() || !scale.is_finite() || !(levels * scale + bias).is_finite() {
+        return Err(InferError::Config(format!(
+            "groupe affine hors plage f32: min={min}, max={max}, {} niveaux",
+            levels + 1.0
+        )));
+    }
+    Ok((scale_bits, bias_bits))
+}
+
+#[cfg(feature = "devtools")]
+pub(crate) fn bf16_value(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// bf16 immédiatement inférieur (vers −∞) à une valeur finie.
+#[cfg(feature = "devtools")]
+fn bf16_step_down(bits: u16) -> u16 {
+    match bits {
+        // +0 → plus petit sous-normal négatif.
+        0x0000 => 0x8001,
+        b if b & 0x8000 == 0 => b - 1,
+        b => b + 1,
+    }
+}
+
+/// bf16 immédiatement supérieur d'une scale strictement positive et finie.
+#[cfg(feature = "devtools")]
+fn bf16_step_up_positive(bits: u16) -> u16 {
+    bits + 1
+}
+
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 fn bf16_round(value: f32) -> f32 {
     let bits = value.to_bits();
     let rounding = 0x7fff_u32 + ((bits >> 16) & 1);
@@ -1344,5 +1519,280 @@ mod tests {
         for (idx, (a, b)) in left.iter().zip(right.iter()).enumerate() {
             assert!((a - b).abs() <= 1.0e-6, "index={idx} left={a} right={b}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "devtools"))]
+mod bitstream_tests {
+    use super::*;
+
+    /// Référence scalaire indépendante : paramètres bf16 par troncature
+    /// arrondie au pair, codes écrits bit à bit (aucun chemin partagé avec
+    /// l'encodeur testé hors `bf16_bits`).
+    fn reference(
+        data: &[f32],
+        cols: usize,
+        gs: usize,
+        bits: usize,
+    ) -> (Vec<u32>, Vec<u16>, Vec<u16>) {
+        let rows = data.len() / cols;
+        let packed_cols = cols * bits / 32;
+        let mut packed = vec![0_u32; rows * packed_cols];
+        let mut scales = Vec::new();
+        let mut biases = Vec::new();
+        let levels = ((1_u32 << bits) - 1) as f32;
+        for row in 0..rows {
+            for group in 0..cols / gs {
+                let slice = &data[row * cols + group * gs..row * cols + (group + 1) * gs];
+                let min = slice.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                // Biais : plus grand bf16 ≤ min ; scale : plus petit bf16 couvrant max.
+                let mut b = bf16_bits(min);
+                while f32::from_bits(u32::from(b) << 16) > min {
+                    b = match b {
+                        0 => 0x8001,
+                        b if b & 0x8000 == 0 => b - 1,
+                        b => b + 1,
+                    };
+                }
+                let bv = f32::from_bits(u32::from(b) << 16);
+                let span = f64::from(max) - f64::from(bv);
+                let mut s = bf16_bits(((span / f64::from(levels)) as f32).max(1.0e-7));
+                while f64::from(bv)
+                    + f64::from(levels) * f64::from(f32::from_bits(u32::from(s) << 16))
+                    < f64::from(max)
+                {
+                    s += 1;
+                }
+                scales.push(s);
+                biases.push(b);
+                let (sf, bf) = (
+                    f32::from_bits(u32::from(s) << 16),
+                    f32::from_bits(u32::from(b) << 16),
+                );
+                for (lane, &value) in slice.iter().enumerate() {
+                    // Quotient exact à l'arrondi f64 près, par division.
+                    let q = (f64::from(value) - f64::from(bf)) / f64::from(sf);
+                    let code = q.round().clamp(0.0, f64::from(levels)) as u32;
+                    for bit in 0..bits {
+                        if code >> bit & 1 == 1 {
+                            let pos = (group * gs + lane) * bits + bit;
+                            packed[row * packed_cols + pos / 32] |= 1 << (pos % 32);
+                        }
+                    }
+                }
+            }
+        }
+        (packed, scales, biases)
+    }
+
+    fn bf16_tensor(shape: [usize; 2], bits: &[u16]) -> Tensor {
+        let values = bits
+            .iter()
+            .map(|b| f32::from_bits(u32::from(*b) << 16))
+            .collect();
+        Tensor::from_vec(shape.to_vec(), values).expect("invariant: forme test")
+    }
+
+    fn sample(rows: usize, cols: usize) -> Vec<f32> {
+        // Valeurs déterministes variées : rampe, signe alterné, amplitudes mêlées.
+        (0..rows * cols)
+            .map(|i| {
+                let x = i as f32;
+                ((x * 0.37).sin() * 3.0 + (x * 0.011).cos()) * if i % 7 == 0 { 0.01 } else { 1.0 }
+            })
+            .collect()
+    }
+
+    fn encode(
+        data: &[f32],
+        cols: usize,
+        gs: usize,
+        bits: usize,
+    ) -> (Vec<u32>, Vec<u16>, Vec<u16>, QuantError) {
+        let rows = data.len() / cols;
+        let mut packed = vec![0_u32; rows * cols * bits / 32];
+        let mut scales = vec![0_u16; rows * cols / gs];
+        let mut biases = vec![0_u16; rows * cols / gs];
+        let error = quantize_affine_bitstream_bf16(
+            data,
+            cols,
+            gs,
+            bits,
+            &mut packed,
+            &mut scales,
+            &mut biases,
+        )
+        .expect("invariant: entrée valide");
+        (packed, scales, biases, error)
+    }
+
+    #[test]
+    fn bitstream_matches_independent_reference_bit_for_bit() {
+        for bits in [4, 6, 8] {
+            let (rows, cols, gs) = (3, 192, 64);
+            let data = sample(rows, cols);
+            let (packed, scales, biases, _) = encode(&data, cols, gs, bits);
+            let (rp, rs, rb) = reference(&data, cols, gs, bits);
+            assert_eq!(packed, rp, "codes bits={bits}");
+            assert_eq!(scales, rs, "scales bits={bits}");
+            assert_eq!(biases, rb, "biais bits={bits}");
+        }
+    }
+
+    #[test]
+    fn bitstream_roundtrips_through_loader_dequantizer() {
+        for bits in [4, 6, 8] {
+            let (rows, cols, gs) = (5, 128, 64);
+            let data = sample(rows, cols);
+            let (packed, scales, biases, error) = encode(&data, cols, gs, bits);
+            let packed_cols = cols * bits / 32;
+            let groups = cols / gs;
+            let restored = dequantize_affine_u32(
+                &[rows, packed_cols],
+                &packed,
+                &bf16_tensor([rows, groups], &scales),
+                &bf16_tensor([rows, groups], &biases),
+                gs,
+                bits,
+            )
+            .expect("invariant: layout cohérent");
+            let mut sum_sq_err = 0.0_f64;
+            for (idx, (&w, &r)) in data.iter().zip(restored.data()).enumerate() {
+                let g = idx / gs;
+                let scale = f32::from_bits(u32::from(scales[g]) << 16);
+                // Sans écrêtage : demi-pas de la scale bf16 effective + arrondi f32.
+                assert!(
+                    (w - r).abs() <= scale * 0.5 + scale * 1.0e-2 + 1.0e-6,
+                    "bits={bits} idx={idx} w={w} r={r}"
+                );
+                sum_sq_err += f64::from(w - r).powi(2);
+            }
+            let rel = (sum_sq_err / data.iter().map(|w| f64::from(*w).powi(2)).sum::<f64>()).sqrt();
+            assert!(
+                (rel - error.relative()).abs() < 1.0e-6,
+                "erreur rapportée bits={bits}"
+            );
+        }
+    }
+
+    #[test]
+    fn u6_codes_straddle_word_boundaries() {
+        // 16 codes de 6 bits = 96 bits : les codes 5 et 10 chevauchent deux u32.
+        let cols = 64;
+        let data: Vec<f32> = (0..cols).map(|i| (i % 64) as f32).collect();
+        let (packed, scales, biases, error) = encode(&data, cols, 64, 6);
+        assert_eq!(packed.len(), 12);
+        assert_eq!(scales.len(), 1);
+        assert!(error.relative() < 1.0e-6, "rampe 0..63 exacte en u6");
+        let restored = dequantize_affine_u32(
+            &[1, 12],
+            &packed,
+            &bf16_tensor([1, 1], &scales),
+            &bf16_tensor([1, 1], &biases),
+            64,
+            6,
+        )
+        .expect("invariant: layout u6");
+        assert_eq!(restored.data(), data.as_slice());
+    }
+
+    #[test]
+    fn lm_head_u6_layout_matches_mlx_shapes() {
+        let (rows, cols) = (2, 2560);
+        let data = sample(rows, cols);
+        let (packed, scales, _, _) = encode(&data, cols, 64, 6);
+        assert_eq!(packed.len(), rows * 480);
+        assert_eq!(scales.len(), rows * 40);
+    }
+
+    #[test]
+    fn edge_groups_are_exact_or_bounded() {
+        let cols = 64;
+        // Groupe constant, groupe nul, très faible amplitude, égalités d'arrondi.
+        let mut data = vec![0.75_f32; cols];
+        data.extend(std::iter::repeat_n(0.0, cols));
+        data.extend((0..cols).map(|i| 1.0e-6 * i as f32));
+        data.extend((0..cols).map(|i| if i % 2 == 0 { -448.0 } else { 448.0 }));
+        let (packed, scales, biases, _) = encode(&data, cols, 64, 4);
+        let restored = dequantize_affine_u32(
+            &[4, 8],
+            &packed,
+            &bf16_tensor([4, 1], &scales),
+            &bf16_tensor([4, 1], &biases),
+            64,
+            4,
+        )
+        .expect("invariant: layout u4");
+        let r = restored.data();
+        assert!(r[..cols].iter().all(|v| *v == 0.75), "groupe constant");
+        assert!(r[cols..2 * cols].iter().all(|v| *v == 0.0), "groupe nul");
+        let step = bf16_value(scales[3]);
+        assert!(
+            r[3 * cols..]
+                .iter()
+                .all(|v| (v.abs() - 448.0).abs() <= step * 0.5),
+            "extrêmes ±448 à un demi-pas"
+        );
+        let small = bf16_value(scales[2]);
+        assert!(
+            r[2 * cols..3 * cols]
+                .iter()
+                .zip(&data[2 * cols..3 * cols])
+                .all(|(r, w)| (r - w).abs() <= small * 0.5 + 1.0e-12),
+            "faible amplitude à un demi-pas"
+        );
+    }
+
+    #[test]
+    fn bf16_extremes_never_yield_non_finite_restoration() {
+        let max = f32::from_bits(0x7f7f_0000); // plus grand bf16 fini ≈ 3,3895e38
+        for (bits, data) in [
+            (4, vec![-max, max]),
+            (8, vec![-max, max]),
+            (4, vec![0.0, max]),
+            (4, vec![-max, 0.0]),
+        ] {
+            let mut group = vec![data[0]; 64];
+            group[63] = data[1];
+            let mut packed = vec![0_u32; 64 * bits / 32];
+            let (mut s, mut b) = (vec![0_u16; 1], vec![0_u16; 1]);
+            match quantize_affine_bitstream_bf16(&group, 64, 64, bits, &mut packed, &mut s, &mut b)
+            {
+                Err(error) => assert!(error.to_string().contains("hors plage"), "{error}"),
+                Ok(error) => {
+                    let restored = dequantize_affine_u32(
+                        &[1, 64 * bits / 32],
+                        &packed,
+                        &bf16_tensor([1, 1], &s),
+                        &bf16_tensor([1, 1], &b),
+                        64,
+                        bits,
+                    )
+                    .expect("invariant: layout");
+                    assert!(restored.data().iter().all(|v| v.is_finite()), "bits={bits}");
+                    assert!(error.relative().is_finite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_and_bad_layouts() {
+        let mut packed = vec![0_u32; 8];
+        let (mut s, mut b) = (vec![0_u16; 1], vec![0_u16; 1]);
+        let mut data = vec![0.0_f32; 64];
+        data[3] = f32::NAN;
+        assert!(
+            quantize_affine_bitstream_bf16(&data, 64, 64, 4, &mut packed, &mut s, &mut b).is_err()
+        );
+        assert!(
+            quantize_affine_bitstream_bf16(&[0.0; 64], 64, 64, 7, &mut packed, &mut s, &mut b)
+                .is_err()
+        );
+        assert!(
+            quantize_affine_bitstream_bf16(&[0.0; 64], 64, 48, 4, &mut packed, &mut s, &mut b)
+                .is_err()
+        );
     }
 }
