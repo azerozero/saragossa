@@ -107,7 +107,8 @@ impl MetalExecutor {
             || can_use_fast_affine_qmm2_u8_buffers(batch, in_dim, out_dim, group_size, bits)
         {
             AffineMatmulKernel::Qmm2
-        } else if can_use_qmvt_buffers(batch, in_dim, out_dim, group_size, bits) {
+        } else if can_use_qmvt_buffers(batch, in_dim, out_dim, group_size, bits, prefer_fast_affine)
+        {
             AffineMatmulKernel::QmvT
         } else if self.qmm_skinny_available()
             && can_use_qmm_skinny_buffers(batch, in_dim, out_dim, group_size, bits)
@@ -182,15 +183,15 @@ impl MetalExecutor {
         weight: &AffineQuantizedTensor,
         prefer_fast_affine: bool,
     ) -> AffineMatmulKernel {
-        if can_use_fast_affine_qmm2(batch, in_dim, weight)
         // Vérification greedy stricte : seuls les chemins exacts en lignes (qmm2,
         // qmv-T, qmv répliqué) ; les GEMM NA (MMA bf16) sont exclus à toute largeur.
         let strict = super::verify_strict_active();
+        if can_use_fast_affine_qmm2(batch, in_dim, weight)
             || can_use_fast_affine_qmm2_u3(batch, in_dim, weight)
             || can_use_fast_affine_qmm2_u8(batch, in_dim, weight)
         {
             AffineMatmulKernel::Qmm2
-        } else if can_use_qmvt(batch, in_dim, weight) {
+        } else if can_use_qmvt(batch, in_dim, weight, prefer_fast_affine) {
             AffineMatmulKernel::QmvT
         } else if self.qmm_skinny_available() && can_use_qmm_skinny(batch, in_dim, weight) {
             AffineMatmulKernel::Skinny
