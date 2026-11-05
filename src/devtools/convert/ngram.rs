@@ -15,72 +15,7 @@ use sha2::{Digest, Sha256};
 use super::plan::{hex, io_err, Source, TensorRef, IO_CHUNK};
 use crate::{InferError, Result};
 
-/// Seed du hachage n-gram : défaut de `Qwen4ExpTextConfig`, absent de
-/// `config.json` ; vérifié contre les multiplicateurs du checkpoint.
-pub(crate) const NGRAM_SEED: u64 = 1234;
-
-const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
-const SPLITMIX_M1: u64 = 0xBF58_476D_1CE4_E5B9;
-const SPLITMIX_M2: u64 = 0x94D0_49BB_1331_11EB;
-const PRIME_1: u64 = 10_007;
-
-fn splitmix64(value: u64) -> u64 {
-    let value = value.wrapping_add(SPLITMIX_GAMMA);
-    let value = (value ^ (value >> 30)).wrapping_mul(SPLITMIX_M1);
-    let value = (value ^ (value >> 27)).wrapping_mul(SPLITMIX_M2);
-    value ^ (value >> 31)
-}
-
-/// Multiplicateurs de couche (`_build_layer_multipliers` de transformers).
-pub(crate) fn layer_multipliers(
-    unigram_vocab: u64,
-    ngram_size: usize,
-    ple_layer_index: u64,
-    seed: u64,
-) -> Vec<i64> {
-    let max_long = i64::MAX as u64;
-    let multiplier_max = max_long / unigram_vocab.max(1);
-    let half_bound = (multiplier_max / 2).max(1);
-    let base_seed = seed.wrapping_add(PRIME_1.wrapping_mul(ple_layer_index));
-    (0..ngram_size as u64)
-        .map(|index| {
-            let value = base_seed.wrapping_add(SPLITMIX_GAMMA.wrapping_mul(index + 1));
-            // Borné par 2·half_bound+1 ≤ i64::MAX : la conversion est exacte.
-            (2 * (splitmix64(value) % half_bound) + 1) as i64
-        })
-        .collect()
-}
-
-fn is_prime(value: u64) -> bool {
-    if value < 2 {
-        return false;
-    }
-    if value % 2 == 0 {
-        return value == 2;
-    }
-    let mut divisor = 3;
-    while divisor * divisor <= value {
-        if value % divisor == 0 {
-            return false;
-        }
-        divisor += 2;
-    }
-    true
-}
-
-/// Tailles de vocabulaire par tête : `(i+1)`-ième premier après `base − 1`.
-pub(crate) fn head_vocab_sizes(base: u64, heads: usize) -> Vec<i64> {
-    let mut sizes = Vec::with_capacity(heads);
-    let mut prime = base - 1;
-    for _ in 0..heads {
-        prime += 1;
-        while !is_prime(prime) {
-            prime += 1;
-        }
-        sizes.push(prime as i64);
-    }
-    sizes
-}
+pub(crate) use crate::qwen4_exp::ngram::{head_vocab_sizes, layer_multipliers, NGRAM_SEED};
 
 /// Paramètres de hachage vérifiés, publiés dans `meta.json`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

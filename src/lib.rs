@@ -34,6 +34,7 @@ pub mod metal_backend;
 pub mod mlp;
 pub mod norm;
 pub mod quantization;
+pub mod qwen4_exp;
 pub mod qwen_loader;
 pub mod runtime;
 pub mod runtime_flags;
