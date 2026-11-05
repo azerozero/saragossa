@@ -205,7 +205,7 @@ pub(super) fn can_use_qmm_skinny_buffers(
 
 /// Largeur maximale servie par le qmv-T (instances `r3` à `r16` de
 /// `kernels.metal`, `r16` en variante device seule) ; au-delà, le mode strict
-/// exclut le skinny et garde le qmv répliqué, exact aussi.
+/// exclut le skinny et les GEMM NA et garde le qmv répliqué, exact aussi.
 pub(super) const QMVT_MAX_BATCH: usize = 16;
 
 /// qmv-T u4 gs64 exact (`affine_qmvt_*`) : en vérification greedy stricte

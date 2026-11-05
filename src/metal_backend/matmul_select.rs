@@ -99,6 +99,9 @@ impl MetalExecutor {
         bits: usize,
         prefer_fast_affine: bool,
     ) -> AffineMatmulKernel {
+        // Vérification greedy stricte : seuls les chemins exacts en lignes (qmm2,
+        // qmv-T, qmv répliqué) ; les GEMM NA (MMA bf16) sont exclus à toute largeur.
+        let strict = super::verify_strict_active();
         if can_use_fast_affine_qmm2_buffers(batch, in_dim, out_dim, group_size, bits)
             || can_use_fast_affine_qmm2_u3_buffers(batch, in_dim, out_dim, group_size, bits)
             || can_use_fast_affine_qmm2_u8_buffers(batch, in_dim, out_dim, group_size, bits)
@@ -112,7 +115,8 @@ impl MetalExecutor {
             AffineMatmulKernel::Skinny
         } else if can_use_fast_affine_qmm8_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::Qmm8
-        } else if self.qmm_na_fused_tiled_u4_available(group_size)
+        } else if !strict
+            && self.qmm_na_fused_tiled_u4_available(group_size)
             && can_use_qmm_na_fused_tiled_u4_buffers(
                 batch,
                 in_dim,
@@ -123,7 +127,8 @@ impl MetalExecutor {
             )
         {
             AffineMatmulKernel::QmmNaFusedTiledU4
-        } else if self.qmm_na_fused_tiled_u4_align64_available(group_size)
+        } else if !strict
+            && self.qmm_na_fused_tiled_u4_align64_available(group_size)
             && can_use_qmm_na_fused_tiled_u4_align64_buffers(
                 batch, in_dim, out_dim, group_size, bits,
             )
@@ -144,11 +149,13 @@ impl MetalExecutor {
             AffineMatmulKernel::FastQmvU6
         } else if can_use_fast_affine_qmv_one_u8_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::FastQmvOneU8
-        } else if self.qmm_na_fused_tiled_available(group_size)
+        } else if !strict
+            && self.qmm_na_fused_tiled_available(group_size)
             && can_use_qmm_na_fused_tiled_u8_buffers(batch, in_dim, out_dim, group_size, bits)
         {
             AffineMatmulKernel::QmmNaFusedTiledU8
-        } else if self.na_gemm_coop_qb_gs128.is_some()
+        } else if !strict
+            && self.na_gemm_coop_qb_gs128.is_some()
             && can_use_qmm_na_u8_gs128_buffers(batch, in_dim, out_dim, group_size, bits)
         {
             AffineMatmulKernel::QmmNaU8Gs128
@@ -176,6 +183,9 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> AffineMatmulKernel {
         if can_use_fast_affine_qmm2(batch, in_dim, weight)
+        // Vérification greedy stricte : seuls les chemins exacts en lignes (qmm2,
+        // qmv-T, qmv répliqué) ; les GEMM NA (MMA bf16) sont exclus à toute largeur.
+        let strict = super::verify_strict_active();
             || can_use_fast_affine_qmm2_u3(batch, in_dim, weight)
             || can_use_fast_affine_qmm2_u8(batch, in_dim, weight)
         {
@@ -186,7 +196,8 @@ impl MetalExecutor {
             AffineMatmulKernel::Skinny
         } else if can_use_fast_affine_qmm8(batch, in_dim, weight) {
             AffineMatmulKernel::Qmm8
-        } else if self.qmm_na_fused_tiled_u4_available(weight.group_size())
+        } else if !strict
+            && self.qmm_na_fused_tiled_u4_available(weight.group_size())
             && can_use_qmm_na_fused_tiled_u4(
                 batch,
                 in_dim,
@@ -195,7 +206,8 @@ impl MetalExecutor {
             )
         {
             AffineMatmulKernel::QmmNaFusedTiledU4
-        } else if self.qmm_na_fused_tiled_u4_align64_available(weight.group_size())
+        } else if !strict
+            && self.qmm_na_fused_tiled_u4_align64_available(weight.group_size())
             && can_use_qmm_na_fused_tiled_u4_align64(batch, in_dim, weight)
         {
             AffineMatmulKernel::QmmNaFusedTiledU4Align64
@@ -211,15 +223,18 @@ impl MetalExecutor {
             AffineMatmulKernel::FastQmvU6
         } else if can_use_fast_affine_qmv_one_u8(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvOneU8
-        } else if self.qmm_na_fused_tiled_available(weight.group_size())
+        } else if !strict
+            && self.qmm_na_fused_tiled_available(weight.group_size())
             && can_use_qmm_na_fused_tiled_u8(batch, in_dim, weight)
         {
             AffineMatmulKernel::QmmNaFusedTiledU8
-        } else if self.na_gemm_coop_qb_gs128.is_some()
+        } else if !strict
+            && self.na_gemm_coop_qb_gs128.is_some()
             && can_use_qmm_na_u8_gs128(batch, in_dim, weight)
         {
             AffineMatmulKernel::QmmNaU8Gs128
-        } else if self.na_gemm_bf16.is_some() && can_use_qmm_na_u8(batch, in_dim, weight) {
+        } else if !strict && self.na_gemm_bf16.is_some() && can_use_qmm_na_u8(batch, in_dim, weight)
+        {
             AffineMatmulKernel::QmmNaU8
         } else if can_use_fast_affine_qmv_u8(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvU8
