@@ -596,35 +596,124 @@ fn sha256_file(path: &Path) -> String {
     sha.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Provenance N2 vérifiée avant l'inférence : empreinte du golden contre
-/// `provenance.json`, poids annoncés par le golden contre le manifeste du
-/// checkpoint ouvert, versions et backend.
-fn check_provenance(dir: &Path, golden_dir: &Path, file: &str) {
+/// Fichiers de poids réellement ouverts : config, shards indexés, MTP, n-gram.
+fn opened_weight_files(dir: &Path) -> Vec<String> {
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("model.safetensors.index.json")).expect("invariant: index"),
+    )
+    .expect("invariant: json");
+    let mut names: BTreeSet<String> = index["weight_map"]
+        .as_object()
+        .expect("invariant: weight_map")
+        .values()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if dir.join("mtp.safetensors").exists() {
+        names.insert("mtp.safetensors".to_string());
+    }
+    names.insert("ngram/ngram_e4m3.bin".to_string());
+    names.into_iter().collect()
+}
+
+/// Provenance N2 vérifiée avant l'inférence, **sur les fichiers réels** :
+/// empreinte du golden, empreintes recalculées de la config et de chaque
+/// fichier de poids ouvert, comparées à l'entrée propre au golden ; versions
+/// et backend.
+fn check_provenance(dir: &Path, golden_dir: &Path, file: &str) -> Result<(), String> {
     let provenance: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(golden_dir.join("provenance.json")).expect("invariant: provenance.json"),
+        &std::fs::read(golden_dir.join("provenance.json")).map_err(|e| e.to_string())?,
     )
-    .expect("invariant: json");
-    assert_eq!(
-        provenance["files"][file].as_str(),
-        Some(sha256_file(&golden_dir.join(file)).as_str()),
-        "empreinte de {file}"
-    );
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(dir.join("convert_manifest.json")).expect("invariant: manifeste"),
-    )
-    .expect("invariant: json");
-    for entry in manifest["files"].as_array().expect("invariant: fichiers") {
-        let name = entry["name"].as_str().expect("invariant: nom");
-        if name.ends_with(".safetensors") || name.starts_with("ngram/") {
-            assert_eq!(
-                provenance["weights"][name], entry["sha256"],
-                "poids {name} : golden produit sur d'autres poids"
-            );
+    .map_err(|e| e.to_string())?;
+    let entry = &provenance["goldens"][file];
+    if entry.is_null() {
+        return Err(format!("provenance sans entrée pour {file}"));
+    }
+    let golden_sha = sha256_file(&golden_dir.join(file));
+    if entry["sha256"].as_str() != Some(golden_sha.as_str()) {
+        return Err(format!("{file}: empreinte {golden_sha} ≠ provenance"));
+    }
+    let config_sha = sha256_file(&dir.join("config.json"));
+    if entry["config_sha256"].as_str() != Some(config_sha.as_str()) {
+        return Err(format!("config.json {config_sha} ≠ config du golden"));
+    }
+    let names = opened_weight_files(dir);
+    let recorded = entry["weights"]
+        .as_object()
+        .ok_or_else(|| "provenance sans poids".to_string())?;
+    if recorded.len() != names.len() {
+        return Err(format!(
+            "{} fichiers de poids ouverts, {} dans la provenance",
+            names.len(),
+            recorded.len()
+        ));
+    }
+    for name in &names {
+        let actual = sha256_file(&dir.join(name));
+        if recorded.get(name).and_then(|v| v.as_str()) != Some(actual.as_str()) {
+            return Err(format!("{name}: {actual} ≠ poids du golden"));
         }
     }
-    assert_eq!(provenance["transformers"], "5.20.2");
-    assert_eq!(provenance["attn_implementation"], "sdpa");
-    assert_eq!(provenance["dtype"], "float32");
+    for (key, expected) in [
+        ("transformers", "5.20.2"),
+        ("attn_implementation", "sdpa"),
+        ("dtype", "float32"),
+    ] {
+        if entry[key] != expected {
+            return Err(format!("{key} = {}, attendu {expected}", entry[key]));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "devtools")]
+#[test]
+fn provenance_check_rejects_modified_weights_config_or_golden() {
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let _ = mini_reference(dst.path());
+    let golden = tempfile::tempdir().expect("invariant: dossier temporaire");
+    std::fs::write(golden.path().join("layers.safetensors"), b"golden").expect("invariant: golden");
+    let weights: serde_json::Map<String, serde_json::Value> = opened_weight_files(dst.path())
+        .into_iter()
+        .map(|name| {
+            let sha = sha256_file(&dst.path().join(&name));
+            (name, sha.into())
+        })
+        .collect();
+    let provenance = serde_json::json!({"goldens": {"layers.safetensors": {
+        "sha256": sha256_file(&golden.path().join("layers.safetensors")),
+        "weights": weights,
+        "config_sha256": sha256_file(&dst.path().join("config.json")),
+        "transformers": "5.20.2",
+        "attn_implementation": "sdpa",
+        "dtype": "float32",
+    }}});
+    std::fs::write(
+        golden.path().join("provenance.json"),
+        provenance.to_string(),
+    )
+    .expect("invariant: provenance");
+    check_provenance(dst.path(), golden.path(), "layers.safetensors")
+        .expect("invariant: provenance cohérente acceptée");
+    assert!(check_provenance(dst.path(), golden.path(), "full.safetensors").is_err());
+
+    // Désaccords volontaires, un à la fois, à taille de fichier égale.
+    let flip = |path: &Path| {
+        let mut bytes = std::fs::read(path).expect("invariant: lecture");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(path, bytes).expect("invariant: écriture");
+    };
+    for target in [
+        dst.path().join("model-00001-of-00002.safetensors"),
+        dst.path().join("ngram/ngram_e4m3.bin"),
+        dst.path().join("config.json"),
+        golden.path().join("layers.safetensors"),
+    ] {
+        flip(&target);
+        let result = check_provenance(dst.path(), golden.path(), "layers.safetensors");
+        assert!(result.is_err(), "{} modifié accepté", target.display());
+        flip(&target);
+    }
 }
 
 /// Erreur relative sur les `rows` premières lignes (préfixe causal), hors
@@ -644,7 +733,8 @@ fn prefix_error(a: &Tensor, b: &Tensor, rows: usize, skip: &[usize]) -> f64 {
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
     let (dir, golden_dir) = n2_paths();
-    check_provenance(&dir, &golden_dir, "layers.safetensors");
+    check_provenance(&dir, &golden_dir, "layers.safetensors")
+        .unwrap_or_else(|e| panic!("provenance N2: {e}"));
     let reference =
         Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
     let golden = Golden {
@@ -751,7 +841,8 @@ fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_full_model_logits_match_transformers() {
     let (dir, golden_dir) = n2_paths();
-    check_provenance(&dir, &golden_dir, "full.safetensors");
+    check_provenance(&dir, &golden_dir, "full.safetensors")
+        .unwrap_or_else(|e| panic!("provenance N2: {e}"));
     let reference =
         Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
     let golden = Golden {
