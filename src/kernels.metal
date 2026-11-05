@@ -6871,6 +6871,10 @@ kernel void affine_qmv_rms_fast_u8_gs64_f32(
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
     if (simd_gid == 0u) {
+        // NOTE: prologue rms seul sous contraction coupée, comme son miroir en lignes
+        // (`rms_norm_simd*_rows_f32`) : `sumsq` et `sumsq / dim + eps` y rendent les
+        // mêmes bits. La boucle quantifiée garde sa contraction implicite.
+        #pragma METAL fp contract(off)
         const device float* norm_x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
         for (uint k = 0u; k < in_dim; k += values_per_block) {
             for (uint i = 0u; i < values_per_thread; ++i) {
@@ -6967,6 +6971,10 @@ kernel void affine_qmv_rms_fast_u8_gs128_f32(
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
     if (simd_gid == 0u) {
+        // NOTE: prologue rms seul sous contraction coupée, comme son miroir en lignes
+        // (`rms_norm_simd*_rows_f32`) : `sumsq` et `sumsq / dim + eps` y rendent les
+        // mêmes bits. La boucle quantifiée garde sa contraction implicite.
+        #pragma METAL fp contract(off)
         const device float* norm_x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
         for (uint k = 0u; k < in_dim; k += values_per_block) {
             for (uint i = 0u; i < values_per_thread; ++i) {
@@ -7191,6 +7199,10 @@ kernel void affine_qkv_split_rms_qmv_fast_u3_gs64_f32(
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
     if (simd_gid == 0u) {
+        // NOTE: prologue rms seul sous contraction coupée, comme son miroir en lignes
+        // (`rms_norm_simd*_rows_f32`) : `sumsq` et `sumsq / dim + eps` y rendent les
+        // mêmes bits. La boucle quantifiée garde sa contraction implicite.
+        #pragma METAL fp contract(off)
         const device float* norm_x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
         for (uint k = 0u; k < in_dim; k += block_size) {
             for (uint i = 0u; i < values_per_thread; ++i) {
@@ -7304,6 +7316,10 @@ kernel void affine_qkv_split_rms_qmv_fast_u8_gs64_f32(
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
     if (simd_gid == 0u) {
+        // NOTE: prologue rms seul sous contraction coupée, comme son miroir en lignes
+        // (`rms_norm_simd*_rows_f32`) : `sumsq` et `sumsq / dim + eps` y rendent les
+        // mêmes bits. La boucle quantifiée garde sa contraction implicite.
+        #pragma METAL fp contract(off)
         const device float* norm_x = lhs + tile.x * in_dim + simd_lid * values_per_thread;
         for (uint k = 0u; k < in_dim; k += values_per_block) {
             for (uint i = 0u; i < values_per_thread; ++i) {
@@ -7979,8 +7995,9 @@ kernel void rms_norm_simd_rows_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint row [[threadgroup_position_in_grid]]
 ) {
-    // NOTE: miroir en lignes des prologues rms fusionnés : même contraction coupée
-    // qu'eux, sinon `x * inv_rms * gamma` ne rend pas les mêmes bits.
+    // NOTE: miroir en lignes des prologues rms fusionnés, sous la même contraction
+    // coupée qu'eux : `sumsq` et `sumsq / dim + eps` sont les seuls candidats à une
+    // contraction (le produit `x * inv_rms * gamma` n'a pas d'addition).
     #pragma METAL fp contract(off)
     const uint values_per_thread = 16u;
     const uint block_size = values_per_thread * 32u;
@@ -8020,8 +8037,9 @@ kernel void rms_norm_simd_u3_rows_f32(
     uint simd_lid [[thread_index_in_simdgroup]],
     uint row [[threadgroup_position_in_grid]]
 ) {
-    // NOTE: miroir en lignes des prologues rms fusionnés : même contraction coupée
-    // qu'eux, sinon `x * inv_rms * gamma` ne rend pas les mêmes bits.
+    // NOTE: miroir en lignes des prologues rms fusionnés, sous la même contraction
+    // coupée qu'eux : `sumsq` et `sumsq / dim + eps` sont les seuls candidats à une
+    // contraction (le produit `x * inv_rms * gamma` n'a pas d'addition).
     #pragma METAL fp contract(off)
     const uint values_per_thread = 8u;
     const uint block_size = values_per_thread * 32u;
