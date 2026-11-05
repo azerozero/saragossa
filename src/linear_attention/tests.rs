@@ -558,3 +558,21 @@ fn assert_close(left: &[f32], right: &[f32], tolerance: f32) {
         );
     }
 }
+
+#[test]
+fn flash_next_l2_norm_keeps_epsilon_unscaled_on_low_norm_heads() {
+    // Tête de très faible norme : l'ε de transformers (1e-6) n'est pas multiplié
+    // par d (≠ unité RMS des autres familles, ×128 à d=128).
+    let d = 128;
+    let x = Tensor::from_vec(vec![1, d], vec![1.0e-4; d]).expect("invariant: forme");
+    let l2 = super::l2_norm_heads(&x, 1, d, 1.0e-6).expect("invariant: norme");
+    let sum: f32 = 1.0e-8 * d as f32;
+    let expected = 1.0e-4 / (sum + 1.0e-6).sqrt();
+    assert!((l2.data()[0] - expected).abs() <= expected * 1.0e-6);
+    let rms = super::rms_norm_heads_unit(&x, 1, d, 1.0e-6).expect("invariant: norme");
+    let rms_as_l2 = rms.data()[0] / (d as f32).sqrt();
+    assert!(
+        (rms_as_l2 - expected).abs() > expected * 0.1,
+        "les deux ε doivent différer"
+    );
+}
