@@ -596,7 +596,8 @@ fn sha256_file(path: &Path) -> String {
     sha.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Fichiers de poids réellement ouverts : config, shards indexés, MTP, n-gram.
+/// Fichiers de poids réellement ouverts : shards indexés, MTP, `ngram/meta.json`
+/// et la table qu'il désigne (celle qu'ouvre le loader, pas un nom supposé).
 fn opened_weight_files(dir: &Path) -> Vec<String> {
     let index: serde_json::Value = serde_json::from_slice(
         &std::fs::read(dir.join("model.safetensors.index.json")).expect("invariant: index"),
@@ -611,7 +612,15 @@ fn opened_weight_files(dir: &Path) -> Vec<String> {
     if dir.join("mtp.safetensors").exists() {
         names.insert("mtp.safetensors".to_string());
     }
-    names.insert("ngram/ngram_e4m3.bin".to_string());
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("ngram/meta.json")).expect("invariant: ngram/meta.json"),
+    )
+    .expect("invariant: json");
+    names.insert("ngram/meta.json".to_string());
+    names.insert(format!(
+        "ngram/{}",
+        meta["file"].as_str().expect("invariant: meta.file")
+    ));
     names.into_iter().collect()
 }
 
@@ -714,6 +723,23 @@ fn provenance_check_rejects_modified_weights_config_or_golden() {
         assert!(result.is_err(), "{} modifié accepté", target.display());
         flip(&target);
     }
+    check_provenance(dst.path(), golden.path(), "layers.safetensors")
+        .expect("invariant: état restauré accepté");
+
+    // meta.json redirigé vers une autre table (copie altérée) : refusé.
+    let other = dst.path().join("ngram/other_e4m3.bin");
+    std::fs::copy(dst.path().join("ngram/ngram_e4m3.bin"), &other).expect("invariant: copie");
+    flip(&other);
+    let meta_path = dst.path().join("ngram/meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).expect("invariant: meta"))
+            .expect("invariant: json");
+    meta["file"] = "other_e4m3.bin".into();
+    std::fs::write(&meta_path, meta.to_string()).expect("invariant: meta redirigé");
+    assert!(
+        check_provenance(dst.path(), golden.path(), "layers.safetensors").is_err(),
+        "meta.json redirigé accepté"
+    );
 }
 
 /// Erreur relative sur les `rows` premières lignes (préfixe causal), hors
