@@ -38,7 +38,7 @@ impl DFlashTreeMode {
     fn from_flag(flag: Option<std::result::Result<usize, String>>) -> Result<(Self, bool)> {
         match flag {
             None => Ok((
-                Self::BestFirst(crate::runtime_flags::DFLASH_TREE_DEFAULT_BUDGET),
+                Self::BestFirst(crate::runtime_flags::dflash_tree_default_budget()),
                 false,
             )),
             Some(Ok(0)) => Ok((Self::Off, true)),
