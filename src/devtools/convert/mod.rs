@@ -253,6 +253,12 @@ fn expected_from(config: &serde_json::Value) -> Result<(Expected, NgramConfig)> 
         mtp_layers,
         ngram_parts: usize_field(config, "split_ngram_parts")?,
     };
+    if expected.layers == 0 || expected.experts == 0 || expected.ngram_parts == 0 {
+        return Err(InferError::Config(format!(
+            "config dégénérée: {} couches, {} experts, {} shards n-gram",
+            expected.layers, expected.experts, expected.ngram_parts
+        )));
+    }
     if expected.mtp_layers > 1 {
         return Err(InferError::Config(format!(
             "mtp_num_hidden_layers={} non supporté",
@@ -266,6 +272,16 @@ fn expected_from(config: &serde_json::Value) -> Result<(Expected, NgramConfig)> 
         vocab_base: usize_field(config, "ngram_vocab_size_base")? as u64,
         divisible_by: usize_field(config, "make_ngram_vocab_size_divisible_by")? as u64,
     };
+    if ngram.ngram_size < 2
+        || ngram.heads_per_ngram == 0
+        || ngram.divisible_by == 0
+        || ngram.vocab_base < 2
+        || ngram.vocab_size == 0
+    {
+        return Err(InferError::Config(format!(
+            "config n-gram dégénérée: {ngram:?}"
+        )));
+    }
     Ok((expected, ngram))
 }
 
@@ -276,6 +292,26 @@ fn other_bytes(source: &Source, inventory: &Inventory, suffix: &str) -> Result<V
         .find(|(role, tensor, _, _)| *role == Role::CopyI64 && tensor.name.ends_with(suffix))
         .ok_or_else(|| InferError::MissingWeight(suffix.to_string()))?;
     source.read(tensor, 0, tensor.len)
+}
+
+/// Échelle per-tensor de la table n-gram : finie et strictement positive.
+fn check_ngram_scale(source: &Source, inventory: &Inventory) -> Result<f32> {
+    let tensor = &inventory.ngram_scale;
+    let bytes = source.read(tensor, 0, tensor.len)?;
+    let [lo, hi] = bytes[..] else {
+        return Err(InferError::Shape(format!(
+            "{}: scalaire bf16 attendu",
+            tensor.name
+        )));
+    };
+    let scale = f32::from_bits(u32::from(u16::from_le_bytes([lo, hi])) << 16);
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(InferError::Config(format!(
+            "{}: échelle n-gram invalide {scale}",
+            tensor.name
+        )));
+    }
+    Ok(scale)
 }
 
 /// Config de sortie : quantification MLX, vision retirée, texte seul.
@@ -430,6 +466,7 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
     let (expected, ngram_config) = expected_from(&src_config)?;
     let (source, refs) = Source::open(&options.src)?;
     let inventory = Inventory::build(&refs, &expected)?;
+    check_ngram_scale(&source, &inventory)?;
     let table_rows: u64 = inventory.ngram.iter().map(|t| t.shape[0] as u64).sum();
     let hash_params = verify_hash_params(
         ngram_config,

@@ -696,3 +696,159 @@ fn refuses_in_place_conversion_even_through_a_symlink() {
     );
     assert!(!src.path().join(".convert").exists());
 }
+
+/// Réécrit l'en-tête JSON d'un shard source (données inchangées).
+fn rewrite_header(path: &Path, edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) {
+    let bytes = std::fs::read(path).expect("invariant: shard");
+    let n = u64::from_le_bytes(bytes[..8].try_into().expect("invariant: 8 octets")) as usize;
+    let mut header: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&bytes[8..8 + n]).expect("invariant: en-tête");
+    edit(&mut header);
+    let mut json = serde_json::to_vec(&header).expect("invariant: json");
+    while json.len() % 8 != 0 {
+        json.push(b' ');
+    }
+    let mut out = (json.len() as u64).to_le_bytes().to_vec();
+    out.extend(json);
+    out.extend_from_slice(&bytes[8 + n..]);
+    std::fs::write(path, out).expect("invariant: réécriture");
+}
+
+fn plan_error(src: &Path) -> String {
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let mut opts = options(src, dst.path());
+    opts.plan_only = true;
+    convert_qwen4exp(&opts)
+        .err()
+        .unwrap_or_else(|| panic!("source invalide acceptée"))
+        .to_string()
+}
+
+fn first_tensor(header: &serde_json::Map<String, serde_json::Value>, dtype: &str) -> String {
+    header
+        .iter()
+        .find(|(k, v)| *k != "__metadata__" && v["dtype"] == dtype)
+        .map(|(k, _)| k.clone())
+        .expect("invariant: tenseur du dtype")
+}
+
+#[test]
+fn rejects_inconsistent_source_layouts() {
+    type Edit = fn(&mut serde_json::Map<String, serde_json::Value>);
+    let cases: [(&str, Edit); 3] = [
+        ("attendus", |h| {
+            let name = first_tensor(h, "BF16");
+            let shape = h[&name]["shape"]
+                .as_array()
+                .expect("invariant: forme")
+                .clone();
+            let mut shape: Vec<u64> = shape.iter().filter_map(|d| d.as_u64()).collect();
+            shape[0] -= 1;
+            h[&name]["shape"] = shape.into();
+        }),
+        ("chevauchent", |h| {
+            let name = first_tensor(h, "BF16");
+            let start = h[&name]["data_offsets"][0]
+                .as_u64()
+                .expect("invariant: offset");
+            let end = h[&name]["data_offsets"][1]
+                .as_u64()
+                .expect("invariant: offset");
+            let other = h
+                .iter()
+                .find(|(k, v)| {
+                    *k != "__metadata__"
+                        && *k != &name
+                        && v["data_offsets"][1].as_u64() > Some(start + 2)
+                        && v["data_offsets"][0].as_u64() >= Some(end)
+                })
+                .map(|(k, _)| k.clone())
+                .expect("invariant: voisin");
+            let o_start = h[&other]["data_offsets"][0]
+                .as_u64()
+                .expect("invariant: offset");
+            let o_end = h[&other]["data_offsets"][1]
+                .as_u64()
+                .expect("invariant: offset");
+            // Même longueur, décalé sur `name`.
+            let len = o_end - o_start;
+            h[&other]["data_offsets"] = vec![start, start + len].into();
+        }),
+        ("hors fichier", |h| {
+            let max = h
+                .values()
+                .filter_map(|v| v["data_offsets"][1].as_u64())
+                .max()
+                .expect("invariant: offsets");
+            h.insert(
+                "model.visual.extra.weight".to_string(),
+                serde_json::json!({"dtype": "BF16", "shape": [8], "data_offsets": [max, max + 16]}),
+            );
+        }),
+    ];
+    for (needle, edit) in cases {
+        let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+        write_source(src.path(), |_| {});
+        let shard = src.path().join("model-00001-of-00002.safetensors");
+        rewrite_header(&shard, edit);
+        if needle == "hors fichier" {
+            // Le nouvel en-tête doit figurer à l'index pour atteindre la validation.
+            let index_path = src.path().join("model.safetensors.index.json");
+            let mut index: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&index_path).expect("invariant: index"))
+                    .expect("invariant: json");
+            index["weight_map"]["model.visual.extra.weight"] =
+                "model-00001-of-00002.safetensors".into();
+            std::fs::write(&index_path, index.to_string()).expect("invariant: index");
+        }
+        let error = plan_error(src.path());
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+}
+
+#[test]
+fn rejects_non_finite_or_non_positive_ngram_scale() {
+    for bits in [0x7fc0_u16, 0x7f80, 0xff80, 0x0000, 0xbf80] {
+        let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+        write_source(src.path(), |t| {
+            if let Some(raw) = t.get_mut(
+                "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale",
+            ) {
+                raw.data = bits.to_le_bytes().to_vec();
+            }
+        });
+        let error = plan_error(src.path());
+        assert!(
+            error.contains("échelle n-gram invalide"),
+            "0x{bits:04x}: {error}"
+        );
+    }
+}
+
+#[test]
+fn degenerate_configs_are_errors_not_panics() {
+    for (key, value) in [
+        ("num_experts", 0),
+        ("split_ngram_parts", 0),
+        ("ngram_size", 0),
+        ("make_ngram_vocab_size_divisible_by", 0),
+        ("heads_per_ngram", 0),
+        ("num_hidden_layers", 0),
+    ] {
+        let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+        write_source(src.path(), |_| {});
+        let path = src.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("invariant: config"))
+                .expect("invariant: json");
+        config["text_config"][key] = value.into();
+        std::fs::write(&path, config.to_string()).expect("invariant: config");
+        let error = plan_error(src.path());
+        assert!(!error.is_empty(), "{key}");
+    }
+    let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+    write_source(src.path(), |t| {
+        t.insert("lm_head.weight".to_string(), bf16(&[VOCAB, 0], 0));
+    });
+    assert!(plan_error(src.path()).contains("matrice vide"));
+}

@@ -114,6 +114,11 @@ impl Source {
         let mut refs = Vec::with_capacity(weight_map.len());
         let mut seen = 0_usize;
         for (shard, header) in headers.iter().enumerate() {
+            let file_len = files[shard]
+                .metadata()
+                .map_err(|source| io_err(&header.path, source))?
+                .len();
+            validate_layout(header, file_len)?;
             for (name, entry) in &header.tensors {
                 let expected = weight_map.get(name).and_then(|value| value.as_str());
                 if expected != Some(shard_names[shard].as_str()) {
@@ -173,6 +178,66 @@ type ExpertSlot = (Option<TensorRef>, Option<TensorRef>);
 /// Plage `[début, fin)` de chaque tenseur dans les données d'un shard.
 pub(crate) type Offsets = HashMap<String, (u64, u64)>;
 
+/// Taille en octets d'un élément safetensors.
+fn dtype_size(dtype: Dtype) -> Option<usize> {
+    match dtype {
+        Dtype::BOOL | Dtype::U8 | Dtype::I8 | Dtype::F8_E4M3 | Dtype::F8_E5M2 => Some(1),
+        Dtype::F16 | Dtype::BF16 | Dtype::I16 | Dtype::U16 => Some(2),
+        Dtype::F32 | Dtype::I32 | Dtype::U32 => Some(4),
+        Dtype::F64 | Dtype::I64 | Dtype::U64 => Some(8),
+        _ => None,
+    }
+}
+
+/// Invariants physiques d'un shard source : longueur = produit(forme) ×
+/// taille(dtype), aucun chevauchement, toutes les plages dans le fichier
+/// (arithmétique vérifiée).
+fn validate_layout(header: &ShardHeader, file_len: u64) -> Result<()> {
+    let path = header.path.display();
+    let mut ranges = Vec::with_capacity(header.tensors.len());
+    for (name, entry) in &header.tensors {
+        let [start, end] = entry.data_offsets;
+        let size = dtype_size(entry.dtype).ok_or_else(|| InferError::UnsupportedDtype {
+            name: name.clone(),
+            dtype: entry.dtype,
+        })?;
+        let expected = entry
+            .shape
+            .iter()
+            .try_fold(size, |acc, dim| acc.checked_mul(*dim))
+            .ok_or_else(|| InferError::Shape(format!("{path}: {name}: forme trop grande")))?;
+        let len = end.checked_sub(start).ok_or_else(|| {
+            InferError::Shape(format!("{path}: {name}: plage inversée [{start}, {end})"))
+        })?;
+        if len != expected {
+            return Err(InferError::Shape(format!(
+                "{path}: {name}: {len} octets pour {:?} {:?} ({expected} attendus)",
+                entry.dtype, entry.shape
+            )));
+        }
+        let physical_end = header
+            .data_start
+            .checked_add(end as u64)
+            .ok_or_else(|| InferError::Shape(format!("{path}: {name}: offset trop grand")))?;
+        if physical_end > file_len {
+            return Err(InferError::Shape(format!(
+                "{path}: {name}: plage hors fichier ({physical_end} > {file_len})"
+            )));
+        }
+        ranges.push((start, end, name));
+    }
+    ranges.sort();
+    for pair in ranges.windows(2) {
+        let ((_, end, a), (start, _, b)) = (pair[0], pair[1]);
+        if start < end {
+            return Err(InferError::Shape(format!(
+                "{path}: {a} et {b} se chevauchent"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Source d'un expert : poids FP8 et échelle par blocs.
 #[derive(Clone, Debug)]
 pub(crate) struct ExpertSrc {
@@ -231,12 +296,15 @@ fn check_role_dtype(role: Role, tensor: &TensorRef) -> Result<()> {
             require(tensor.dtype == Dtype::BF16, || {
                 format!("{name}: dense attendu BF16, reçu {:?}", tensor.dtype)
             })?;
-            let [_, cols] = tensor.shape[..] else {
+            let [rows, cols] = tensor.shape[..] else {
                 return Err(InferError::Dimension(format!(
                     "{name}: dense attendu rang 2, reçu {:?}",
                     tensor.shape
                 )));
             };
+            require(rows > 0 && cols > 0, || {
+                format!("{name}: matrice vide {:?}", tensor.shape)
+            })?;
             require(cols % GROUP_SIZE == 0 && (cols * bits) % 32 == 0, || {
                 format!("{name}: {cols} colonnes incompatibles avec u{bits} gs{GROUP_SIZE}")
             })
@@ -386,9 +454,9 @@ impl Inventory {
                             scale.name, scale.shape
                         )
                     })?;
-                    require(cols % GROUP_SIZE == 0, || {
+                    require(rows > 0 && cols > 0 && cols % GROUP_SIZE == 0, || {
                         format!(
-                            "{}: {cols} colonnes non multiples de {GROUP_SIZE}",
+                            "{}: {rows}×{cols} incompatible avec gs{GROUP_SIZE}",
                             weight.name
                         )
                     })?;
