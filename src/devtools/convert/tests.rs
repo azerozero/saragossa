@@ -14,7 +14,8 @@ use crate::qwen_loader::read_shard_header;
 use crate::safetensor::f8_e4m3_to_f32;
 
 const H: usize = 128;
-const I: usize = 64;
+/// 256 lignes : les experts gate/up couvrent deux blocs d'échelle FP8 (128).
+const I: usize = 256;
 const E: usize = 2;
 const VOCAB: usize = 64;
 const PARTS: usize = 12;
@@ -176,13 +177,15 @@ fn write_source(dir: &Path, mutate: impl FnOnce(&mut BTreeMap<String, Raw>)) {
                 );
                 let scale = [shape[0].div_ceil(128), shape[1].div_ceil(128)];
                 let value = 0.001 * (1 + expert + group) as f32;
+                // Échelle distincte par bloc : un mauvais indexage des blocs se voit.
+                let block_scale = |block: usize| value * (1 + block) as f32;
                 tensors.insert(
                     format!("{base}.weight_scale_inv"),
                     Raw {
                         dtype: Dtype::BF16,
                         shape: scale.to_vec(),
                         data: (0..scale[0] * scale[1])
-                            .flat_map(|_| bf16_bits(value).to_le_bytes())
+                            .flat_map(|block| bf16_bits(block_scale(block)).to_le_bytes())
                             .collect(),
                     },
                 );
@@ -371,11 +374,13 @@ fn converts_synthetic_checkpoint_end_to_end() {
     let (_, biases) = read_tensor(&shard, &format!("{base}.biases"));
     let (packed, scales, biases) = (u32s(&packed), bf16s(&scales), bf16s(&biases));
     let source = e4m3_bytes(I * H, 1);
-    let src_scale = f32::from_bits(u32::from(bf16_bits(0.001 * 2.0)) << 16);
+    // Expert 1, couche 0 : échelles 0,002 × (1 + bloc de lignes), une colonne de blocs.
+    let src_scale =
+        |row: usize| f32::from_bits(u32::from(bf16_bits(0.002 * (1 + row / 128) as f32)) << 16);
     let words_per_expert = I * H / 8;
     let groups_per_expert = I * H / 64;
     for (idx, byte) in source.iter().enumerate() {
-        let w = f8_e4m3_to_f32(*byte).expect("invariant: octet fini") * src_scale;
+        let w = f8_e4m3_to_f32(*byte).expect("invariant: octet fini") * src_scale(idx / H);
         let word = packed[words_per_expert + idx / 8];
         let code = (word >> ((idx % 8) * 4)) & 0xf;
         let g = groups_per_expert + idx / 64;
@@ -509,12 +514,12 @@ fn rejects_corrupt_or_incomplete_sources() {
         ),
         (
             "échelle mal formée",
-            "échelle [2, 1]",
+            "échelle [3, 1]",
             Box::new(|t| {
                 t.insert(
                     "model.language_model.layers.1.mlp.experts.0.gate_proj.weight_scale_inv"
                         .to_string(),
-                    bf16(&[2, 1], 0),
+                    bf16(&[3, 1], 0),
                 );
             }),
         ),
@@ -881,4 +886,130 @@ fn degenerate_configs_are_errors_not_panics() {
         t.insert("lm_head.weight".to_string(), bf16(&[VOCAB, 0], 0));
     });
     assert!(plan_error(src.path()).contains("matrice vide"));
+}
+
+#[test]
+fn lm_head_u6_restores_source_values() {
+    let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    write_source(src.path(), |_| {});
+    convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: conversion");
+    let (_, source) = read_tensor(&find_shard(src.path(), "lm_head.weight"), "lm_head.weight");
+    let source = bf16s(&source);
+    let shard = find_shard(dst.path(), "language_model.lm_head.weight");
+    let (_, words) = read_tensor(&shard, "language_model.lm_head.weight");
+    let (_, scales) = read_tensor(&shard, "language_model.lm_head.scales");
+    let (_, biases) = read_tensor(&shard, "language_model.lm_head.biases");
+    let (words, scales, biases) = (u32s(&words), bf16s(&scales), bf16s(&biases));
+    let packed_cols = H * 6 / 32;
+    let groups = H / 64;
+    for row in [0, 17, VOCAB - 1] {
+        for col in 0..H {
+            // Décodage bitstream indépendant : bits lus un par un, LSB-first.
+            let code = (0..6).fold(0_u32, |acc, bit| {
+                let pos = col * 6 + bit;
+                acc | (((words[row * packed_cols + pos / 32] >> (pos % 32)) & 1) << bit)
+            });
+            let g = row * groups + col / 64;
+            let restored = code as f32 * scales[g] + biases[g];
+            let w = source[row * H + col];
+            assert!(
+                (w - restored).abs() <= scales[g] * 0.5 + 1.0e-7,
+                "ligne {row} col {col}: {w} vs {restored}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rejects_duplicate_tensor_across_shards() {
+    let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+    write_source(src.path(), |_| {});
+    let first = src.path().join("model-00001-of-00002.safetensors");
+    let second = src.path().join("model-00002-of-00002.safetensors");
+    let header = read_shard_header(&first).expect("invariant: en-tête");
+    let (name, entry) = header
+        .tensors
+        .iter()
+        .find(|(_, e)| e.dtype == Dtype::BF16)
+        .map(|(n, e)| (n.clone(), e.clone()))
+        .expect("invariant: tenseur bf16");
+    let len = entry.data_offsets[1] - entry.data_offsets[0];
+    // Ajoute une copie valide (plage libre en fin de données) dans l'autre shard.
+    let data_len = std::fs::read(&second).expect("invariant: shard").len()
+        - read_shard_header(&second)
+            .expect("invariant: en-tête")
+            .data_start as usize;
+    rewrite_header(&second, |h| {
+        h.insert(
+            name.clone(),
+            serde_json::json!({
+                "dtype": "BF16",
+                "shape": entry.shape,
+                "data_offsets": [data_len, data_len + len],
+            }),
+        );
+    });
+    let mut bytes = std::fs::read(&second).expect("invariant: shard");
+    bytes.extend(std::iter::repeat_n(0_u8, len));
+    std::fs::write(&second, bytes).expect("invariant: shard");
+    assert!(plan_error(src.path()).contains("incohérents"));
+}
+
+#[test]
+fn rejects_out_of_range_expert_f32_dense_and_non_finite_block_scale() {
+    let cases: Vec<(&str, &str, Mutation)> = vec![
+        (
+            "expert ≥ num_experts",
+            "hors configuration",
+            Box::new(|t| {
+                let weight = Raw {
+                    dtype: Dtype::F8_E4M3,
+                    shape: vec![I, H],
+                    data: e4m3_bytes(I * H, 0),
+                };
+                t.insert(
+                    format!("model.language_model.layers.0.mlp.experts.{E}.gate_proj.weight"),
+                    weight,
+                );
+            }),
+        ),
+        (
+            "dense F32",
+            "BF16",
+            Box::new(|t| {
+                let count = 64 * H;
+                t.insert(
+                    "model.language_model.layers.0.linear_attn.out_proj.weight".to_string(),
+                    Raw {
+                        dtype: Dtype::F32,
+                        shape: vec![64, H],
+                        data: (0..count)
+                            .flat_map(|i| (i as f32 * 1e-3).to_le_bytes())
+                            .collect(),
+                    },
+                );
+            }),
+        ),
+        (
+            "weight_scale_inv non finie",
+            "non finie",
+            Box::new(|t| {
+                if let Some(raw) = t.get_mut(
+                    "model.language_model.layers.0.mlp.experts.1.gate_proj.weight_scale_inv",
+                ) {
+                    raw.data[2..4].copy_from_slice(&0x7f80_u16.to_le_bytes());
+                }
+            }),
+        ),
+    ];
+    for (label, needle, mutate) in cases {
+        let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+        let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+        write_source(src.path(), |t| mutate(t));
+        let error = convert_qwen4exp(&options(src.path(), dst.path()))
+            .err()
+            .unwrap_or_else(|| panic!("{label} accepté"));
+        assert!(error.to_string().contains(needle), "{label}: {error}");
+    }
 }
