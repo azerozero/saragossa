@@ -5112,6 +5112,9 @@ fn greedy_identity_states_real_model() -> Result<()> {
     let mut tree_widths: std::collections::BTreeMap<&str, usize> = Default::default();
     let mut skip_coverage: std::collections::BTreeMap<&str, usize> = Default::default();
     let mut replay_coverage: std::collections::BTreeMap<&str, usize> = Default::default();
+    // Modes sélectionnés, enregistrés avant tout saut : un mode dont tous les
+    // prompts sont sautés échoue au lieu de passer sans couverture.
+    let mut selected: std::collections::BTreeSet<&str> = Default::default();
     let corpus = identity_corpus()?;
     if corpus.is_empty() {
         return Err(InferError::Config(
@@ -5196,6 +5199,7 @@ fn greedy_identity_states_real_model() -> Result<()> {
             modes.retain(|mode| wanted.iter().any(|m| m == mode));
         }
         for mode in modes {
+            selected.insert(mode);
             // NOTE: la boucle DFlash CPU de référence prend son propre prefill avec
             // captures, distinct de celui de l'AR au-delà de 16k : hors périmètre.
             if mode == "dflash-cpu" && prompt.len() > 16 * 1024 {
@@ -5365,7 +5369,15 @@ fn greedy_identity_states_real_model() -> Result<()> {
     eprintln!("identité : largeur d'arbre max {tree_widths:?}, vérifications Skip ≥ 5 lignes {skip_coverage:?}");
     // `dflash-défaut` : la largeur observée est celle du budget par défaut
     // (B = 3 en greedy strict, B = 8 sinon), pas une autre.
-    if let Some(&width) = tree_widths.get("dflash-défaut") {
+    for mode in &selected {
+        if !coverage.contains_key(mode) {
+            failures.push(format!(
+                "{mode}: tous ses prompts sautés, aucune vérification"
+            ));
+        }
+    }
+    if selected.contains("dflash-défaut") {
+        let width = tree_widths.get("dflash-défaut").copied().unwrap_or(0);
         let expected = crate::runtime_flags::dflash_tree_default_budget(true) + 1;
         if width != expected {
             failures.push(format!(
@@ -5377,12 +5389,11 @@ fn greedy_identity_states_real_model() -> Result<()> {
     // Couvertures obligatoires des modes de repli : `mtp-skip` a vérifié par la
     // tête `Skip` des lots de 5 lignes et plus (proposition lookup), `dflash-cpu`
     // a rejoué en lignes au moins 5 tokens acceptés après un rejet.
-    if skip_coverage.get("mtp-skip").is_some_and(|&rows| rows == 0) {
+    if selected.contains("mtp-skip") && skip_coverage.get("mtp-skip").copied().unwrap_or(0) == 0 {
         failures.push("mtp-skip : aucune vérification Skip de 5 lignes et plus".to_string());
     }
-    if replay_coverage
-        .get("dflash-cpu")
-        .is_some_and(|&rows| rows == 0)
+    if selected.contains("dflash-cpu")
+        && replay_coverage.get("dflash-cpu").copied().unwrap_or(0) == 0
     {
         failures.push("dflash-cpu : aucun rejeu de 5 lignes et plus".to_string());
     }
