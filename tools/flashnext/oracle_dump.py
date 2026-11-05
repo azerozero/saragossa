@@ -51,13 +51,15 @@ def sha256(path):
 
 
 def weight_files(qdir):
-    """Fichiers réellement lus par les oracles : config, shards indexés, MTP, n-gram."""
+    """Fichiers réellement lus par les oracles : shards indexés, MTP, `ngram/meta.json`
+    et la table qu'il désigne (pas un nom supposé)."""
     qdir = Path(qdir)
     index = json.loads((qdir / "model.safetensors.index.json").read_text())
     names = sorted(set(index["weight_map"].values()))
     if (qdir / "mtp.safetensors").exists():
         names.append("mtp.safetensors")
-    names.append("ngram/ngram_e4m3.bin")
+    meta = json.loads((qdir / "ngram" / "meta.json").read_text())
+    names += ["ngram/meta.json", f"ngram/{meta['file']}"]
     return names
 
 
@@ -71,68 +73,90 @@ def environment():
     }
 
 
-def provenance_entry(out, qdir, golden_file, run):
-    """Provenance propre à un golden : son empreinte, celles des fichiers de poids
-    **recalculées sur disque** (et confrontées au manifeste), la config, l'environnement."""
+COMPAT_KEYS = ("weights", "config_sha256", "transformers", "torch", "attn_implementation", "dtype")
+
+
+def source_entry(qdir):
+    """Origine d'un golden : empreintes des fichiers de poids **recalculées sur
+    disque** (confrontées au manifeste), config et environnement."""
     qdir = Path(qdir)
     manifest = {f["name"]: f["sha256"] for f in json.loads((qdir / "convert_manifest.json").read_text())["files"]}
     weights = {}
     for name in weight_files(qdir):
         weights[name] = sha256(qdir / name)
-        if manifest.get(name) != weights[name]:
-            raise SystemExit(f"{name}: sha disque {weights[name]} ≠ manifeste {manifest.get(name)}")
-    return {
-        "sha256": sha256(out / golden_file),
-        "weights_dir": str(qdir),
-        "weights": weights,
-        "config_sha256": sha256(qdir / "config.json"),
-        **environment(),
-        "run": run,
-    }
+        if name in manifest and manifest[name] != weights[name]:
+            raise SystemExit(f"{name}: sha disque {weights[name]} ≠ manifeste {manifest[name]}")
+    return {"weights_dir": str(qdir), "weights": weights, "config_sha256": sha256(qdir / "config.json"),
+            **environment()}
 
 
-def merge_provenance(path, golden_file, entry):
-    """Ajoute l'entrée d'un golden ; refuse de mélanger dans un même dossier des
-    goldens issus de poids, de config ou d'environnements différents."""
+def load_provenance(path):
     prov = json.loads(path.read_text()) if path.exists() else {"goldens": {}}
     if "goldens" not in prov:
         raise SystemExit(f"{path}: format de provenance inconnu, dossier à recréer")
-    keys = ("weights", "config_sha256", "transformers", "torch", "attn_implementation", "dtype")
-    for other, existing in prov["goldens"].items():
+    return prov
+
+
+def check_compatible(out, golden_file, source):
+    """Refuse, **avant toute écriture**, un golden d'une autre origine que ceux du dossier."""
+    for other, existing in load_provenance(out / "provenance.json")["goldens"].items():
         if other == golden_file:
             continue
-        for key in keys:
-            if existing.get(key) != entry.get(key):
-                raise SystemExit(f"{path}: {golden_file} et {other} diffèrent sur {key} ; dossier séparé requis")
-    prov["goldens"][golden_file] = entry
-    path.write_text(json.dumps(prov, indent=1, ensure_ascii=False))
+        for key in COMPAT_KEYS:
+            if existing.get(key) != source.get(key):
+                raise SystemExit(f"{out}: {golden_file} et {other} diffèrent sur {key} ; dossier séparé requis")
 
 
-def record(out, qdir, golden_file, run):
-    merge_provenance(out / "provenance.json", golden_file, provenance_entry(out, qdir, golden_file, run))
+def write_atomic(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def publish(out, golden_file, tmp, source, run):
+    """Publie un golden écrit dans `tmp` : compatibilité revérifiée, empreinte,
+    provenance puis golden renommés atomiquement."""
+    check_compatible(out, golden_file, source)
+    prov = load_provenance(out / "provenance.json")
+    prov["goldens"][golden_file] = {**source, "sha256": sha256(tmp), "run": run}
+    os.replace(tmp, out / golden_file)
+    write_atomic(out / "provenance.json", json.dumps(prov, indent=1, ensure_ascii=False).encode())
 
 
 def selftest():
-    """Vérifie le refus de mélange : deux goldens de poids différents dans un dossier."""
+    """Refus de mélange avant écriture : les fichiers existants restent intacts."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "provenance.json"
-        base = {"weights": {"a": "1"}, "config_sha256": "c", **environment()}
-        merge_provenance(path, "layers.safetensors", {**base, "sha256": "x"})
-        merge_provenance(path, "layers.safetensors", {**base, "sha256": "y"})  # remplacement
-        for key, value in (("weights", {"a": "2"}), ("config_sha256", "d"), ("torch", "0")):
+        out = Path(tmp)
+        a = {"weights": {"x": "1"}, "config_sha256": "c", **environment()}
+        for name, data in (("layers.safetensors", b"A-layers"), ("full.safetensors", b"A-full")):
+            staged = out / (name + ".new")
+            staged.write_bytes(data)
+            publish(out, name, staged, a, {})
+        before = {p.name: p.read_bytes() for p in out.iterdir()}
+        for key, value in (("weights", {"x": "2"}), ("config_sha256", "d"), ("torch", "0")):
+            b = {**a, key: value}
+            staged = out / "full.safetensors.new"
+            staged.write_bytes(b"B-full")
             try:
-                merge_provenance(path, "full.safetensors", {**base, key: value, "sha256": "z"})
+                publish(out, "full.safetensors", staged, b, {})
             except SystemExit:
-                continue
-            raise AssertionError(f"mélange accepté sur {key}")
-        merge_provenance(path, "full.safetensors", {**base, "sha256": "z"})
-        assert set(json.loads(path.read_text())["goldens"]) == {"layers.safetensors", "full.safetensors"}
+                staged.unlink()
+            else:
+                raise AssertionError(f"mélange accepté sur {key}")
+            after = {p.name: p.read_bytes() for p in out.iterdir()}
+            assert after == before, f"fichiers modifiés malgré le refus ({key})"
+        staged = out / "full.safetensors.new"
+        staged.write_bytes(b"A-full-2")
+        publish(out, "full.safetensors", staged, a, {})  # même origine : remplacement admis
+        assert (out / "full.safetensors").read_bytes() == b"A-full-2"
     print("selftest provenance : ok")
 
 
 def run_layers(qdir, tokenizer, text, out):
+    source = source_entry(qdir)
+    check_compatible(out, "layers.safetensors", source)
     tc = C.text_config(qdir)
     weights = C.QWeights(qdir)
     ids_list = Tokenizer.from_file(tokenizer).encode(Path(text).read_text()).ids[:8000]
@@ -170,11 +194,14 @@ def run_layers(qdir, tokenizer, text, out):
             tensors[f"qsa_offsets.{index}"] = ("I64", offsets.shape, offsets.tobytes())
         del layer
         print(f"couche {index}: {time.time() - started:.0f} s, pic RSS {C.footprint_gb():.1f} Go", flush=True)
-    C.write_safetensors(out / "layers.safetensors", tensors, {"tokens": n})
-    record(out, qdir, "layers.safetensors", {"tokens": n, "text": str(text), "text_sha256": sha256(text)})
+    tmp = out / "layers.safetensors.tmp"
+    C.write_safetensors(tmp, tensors, {"tokens": n})
+    publish(out, "layers.safetensors", tmp, source, {"tokens": n, "text": str(text), "text_sha256": sha256(text)})
 
 
 def run_full(qdir, tokenizer, out):
+    source = source_entry(qdir)
+    check_compatible(out, "full.safetensors", source)
     tc = C.text_config(qdir)
     weights = C.QWeights(qdir)
     tok = Tokenizer.from_file(tokenizer)
@@ -198,8 +225,9 @@ def run_full(qdir, tokenizer, out):
         logits = mixer(h)[0] @ head.T
         tensors[f"prompt.{i}.ids"] = ("I64", (t.shape[1],), t[0].numpy().astype(np.int64).tobytes())
         tensors[f"prompt.{i}.logits"] = ("F32", tuple(logits.shape), logits.float().numpy().tobytes())
-    C.write_safetensors(out / "full.safetensors", tensors, {"prompts": json.dumps(PROMPTS)})
-    record(out, qdir, "full.safetensors", {"prompts": PROMPTS})
+    tmp = out / "full.safetensors.tmp"
+    C.write_safetensors(tmp, tensors, {"prompts": json.dumps(PROMPTS)})
+    publish(out, "full.safetensors", tmp, source, {"prompts": PROMPTS})
 
 
 def main():
