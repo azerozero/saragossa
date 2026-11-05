@@ -870,6 +870,12 @@ fn degenerate_configs_are_errors_not_panics() {
         serde_json::json!([0]),
         serde_json::json!([3]),
         serde_json::json!([1, 2]),
+        serde_json::json!([2, -1]),
+        serde_json::json!([2, "invalide"]),
+        serde_json::json!(["2"]),
+        serde_json::json!([-1]),
+        serde_json::json!([1.5]),
+        serde_json::json!(2),
     ] {
         let src = tempfile::tempdir().expect("invariant: dossier temporaire");
         write_source(src.path(), |_| {});
@@ -1012,4 +1018,76 @@ fn rejects_out_of_range_expert_f32_dense_and_non_finite_block_scale() {
             .unwrap_or_else(|| panic!("{label} accepté"));
         assert!(error.to_string().contains(needle), "{label}: {error}");
     }
+}
+
+#[test]
+fn refuses_parent_component_behind_missing_directory() {
+    let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+    write_source(src.path(), |_| {});
+    let config = std::fs::read(src.path().join("config.json")).expect("invariant: config");
+    // `src/inexistant/..` : create_dir_all ramènerait la destination sur la source.
+    let sneaky = src.path().join("inexistant").join("..");
+    let error = convert_qwen4exp(&options(src.path(), &sneaky))
+        .err()
+        .unwrap_or_else(|| panic!("destination ambiguë acceptée"));
+    assert!(error.to_string().contains("ambiguë"), "{error}");
+    assert!(!src.path().join("inexistant").exists());
+    assert_eq!(
+        std::fs::read(src.path().join("config.json")).expect("invariant: config"),
+        config
+    );
+    // Un `..` dans la partie existante est résolu par le système et accepté.
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    std::fs::create_dir(dst.path().join("x")).expect("invariant: dossier");
+    let mut opts = options(src.path(), &dst.path().join("x").join("..").join("y"));
+    opts.plan_only = true;
+    assert!(convert_qwen4exp(&opts).is_ok());
+}
+
+#[test]
+fn corrupt_shard_header_is_invalidated_then_repaired() {
+    let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    write_source(src.path(), |_| {});
+    let first = convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: conversion");
+    let shard = dst.path().join("model-00002-of-00002.safetensors");
+    let mut bytes = std::fs::read(&shard).expect("invariant: lecture");
+    // En-tête JSON illisible, même taille de fichier.
+    bytes[8] = b'#';
+    std::fs::write(&shard, bytes).expect("invariant: écriture");
+    let error = convert_qwen4exp(&options(src.path(), dst.path()))
+        .err()
+        .unwrap_or_else(|| panic!("en-tête corrompu accepté"));
+    assert!(error.to_string().contains("invalidée"), "{error}");
+    let third = convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: réparation");
+    assert!(third
+        .units_written
+        .contains(&"model-00002-of-00002".to_string()));
+    assert_eq!(digests(&third.files), digests(&first.files));
+}
+
+#[test]
+fn verify_repairs_corrupt_shard_and_segment_in_one_run() {
+    let src = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    write_source(src.path(), |_| {});
+    let first = convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: conversion");
+    let shard = dst.path().join("model-00001-of-00002.safetensors");
+    let mut bytes = std::fs::read(&shard).expect("invariant: lecture");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&shard, bytes).expect("invariant: écriture");
+    let table = dst.path().join("ngram/ngram_e4m3.bin");
+    let mut bytes = std::fs::read(&table).expect("invariant: lecture");
+    bytes[0] ^= 0x01;
+    std::fs::write(&table, bytes).expect("invariant: écriture");
+    let mut verify = options(src.path(), dst.path());
+    verify.verify = true;
+    let second = convert_qwen4exp(&verify).expect("invariant: réparation --verify");
+    assert!(second
+        .units_written
+        .contains(&"model-00001-of-00002".to_string()));
+    assert!(second.units_written.contains(&"ngram-000".to_string()));
+    assert!(second.finalized);
+    assert_eq!(digests(&second.files), digests(&first.files));
 }

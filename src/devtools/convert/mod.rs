@@ -250,16 +250,24 @@ fn expected_from(config: &serde_json::Value) -> Result<(Expected, NgramConfig)> 
         }
     };
     // Une seule couche PLE est prise en charge ; `ple_layer_ids` est 1-indexé.
-    let ple_ids: Vec<u64> = text
+    let ple_raw = text
         .get("ple_layer_ids")
         .and_then(serde_json::Value::as_array)
-        .map(|ids| ids.iter().filter_map(serde_json::Value::as_u64).collect())
-        .unwrap_or_default();
-    let ple_layer = match ple_ids[..] {
-        [id] if id >= 1 && (id as usize) <= layers => id as usize - 1,
+        .ok_or_else(|| {
+            InferError::Config("config: ple_layer_ids absent ou non liste".to_string())
+        })?;
+    let ple_layer = match ple_raw[..] {
+        [ref id] => match id.as_u64() {
+            Some(id) if id >= 1 && id <= layers as u64 => id as usize - 1,
+            _ => {
+                return Err(InferError::Config(format!(
+                    "ple_layer_ids={ple_raw:?}: entier dans 1..={layers} attendu"
+                )))
+            }
+        },
         _ => {
             return Err(InferError::Config(format!(
-                "ple_layer_ids={ple_ids:?}: une couche PLE dans 1..={layers} attendue"
+                "ple_layer_ids={ple_raw:?}: exactement une couche PLE attendue"
             )))
         }
     };
@@ -397,8 +405,14 @@ fn segment_unit(part: usize) -> String {
 }
 
 /// Chemin résolu (liens symboliques compris) d'un dossier éventuellement
-/// inexistant : ancêtre existant canonisé, puis composants restants.
+/// inexistant.
+///
+/// Les composants sont parcourus un à un : tant qu'ils existent, le préfixe est
+/// canonisé par le système (liens et `..` résolus) ; au-delà, seuls des noms
+/// simples sont admis. Un `..` derrière un composant inexistant est refusé :
+/// `create_dir_all` le résoudrait plus tard vers un dossier non contrôlé.
 fn resolved(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -406,25 +420,36 @@ fn resolved(path: &Path) -> Result<PathBuf> {
             .map_err(|e| io_err(path, e))?
             .join(path)
     };
-    let mut existing = absolute.as_path();
-    let mut rest = Vec::new();
-    loop {
-        match existing.canonicalize() {
-            Ok(canonical) => {
-                return Ok(rest
-                    .iter()
-                    .rev()
-                    .fold(canonical, |acc, part| acc.join(part)));
+    let mut prefix = PathBuf::new();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => prefix.push(component),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Normal(_) if missing.is_empty() => {
+                match prefix.join(component).canonicalize() {
+                    Ok(canonical) => prefix = canonical,
+                    Err(_) => match component {
+                        Component::Normal(name) => missing.push(name.to_os_string()),
+                        _ => {
+                            return Err(InferError::Config(format!(
+                                "destination ambiguë: {}",
+                                path.display()
+                            )))
+                        }
+                    },
+                }
             }
-            Err(_) => {
-                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-                    return Ok(absolute);
-                };
-                rest.push(name.to_os_string());
-                existing = parent;
+            Component::Normal(name) => missing.push(name.to_os_string()),
+            Component::ParentDir => {
+                return Err(InferError::Config(format!(
+                    "destination ambiguë (`..` après un dossier inexistant): {}",
+                    path.display()
+                )))
             }
         }
     }
+    Ok(missing.iter().fold(prefix, |acc, part| acc.join(part)))
 }
 
 /// Refuse une conversion sur place : la finalisation écraserait l'index et la
@@ -743,6 +768,32 @@ struct Manifest<'a> {
     tensors: Vec<&'a TensorRecord>,
 }
 
+/// Contrôle final d'un shard : sha256 égal au journal, puis en-tête relu égal
+/// au plan.
+fn check_shard(path: &Path, plan: &ShardPlan, expected_sha: &str) -> Result<String> {
+    let sha256 = file_sha256(path)?;
+    if sha256 != expected_sha {
+        return Err(InferError::Config(format!(
+            "sha256 {sha256} ≠ journal {expected_sha}"
+        )));
+    }
+    let header = read_shard_header(path)?;
+    let (_, offsets) = build_header(plan)?;
+    let same = header.tensors.len() == offsets.len()
+        && offsets.iter().all(|(name, (start, end))| {
+            header
+                .tensors
+                .get(name)
+                .is_some_and(|entry| entry.data_offsets == [*start as usize, *end as usize])
+        });
+    if !same {
+        return Err(InferError::Config(
+            "en-tête relu différent du plan".to_string(),
+        ));
+    }
+    Ok(sha256)
+}
+
 /// sha256 du fichier n-gram en une passe, et segments dont l'empreinte
 /// diffère du journal.
 fn ngram_file_sha(path: &Path, segments: &[SegmentRecord]) -> Result<(String, Vec<usize>)> {
@@ -800,32 +851,22 @@ fn finalize(
             .get(&unit)
             .ok_or_else(|| InferError::Config(format!("unité {unit} non terminée")))?;
         let path = dst.join(&plan.file);
-        let header = read_shard_header(&path)?;
+        // sha d'abord, en-tête ensuite : toute divergence (contenu, en-tête
+        // illisible ou différent du plan) retire l'unité du journal, sinon une
+        // relance sans --verify la sauterait indéfiniment.
+        let checked = check_shard(&path, plan, &done.sha256);
+        let sha256 = match checked {
+            Ok(sha256) => sha256,
+            Err(error) => {
+                journal.shards.remove(&unit);
+                write_json(journal_path, journal)?;
+                return Err(InferError::Config(format!(
+                    "{}: {error} ; unité invalidée, relancer la conversion",
+                    plan.file
+                )));
+            }
+        };
         let (_, offsets) = build_header(plan)?;
-        if header.tensors.len() != offsets.len()
-            || offsets.iter().any(|(name, (start, end))| {
-                header
-                    .tensors
-                    .get(name)
-                    .is_none_or(|entry| entry.data_offsets != [*start as usize, *end as usize])
-            })
-        {
-            return Err(InferError::Config(format!(
-                "{}: en-tête relu différent du plan",
-                plan.file
-            )));
-        }
-        let sha256 = file_sha256(&path)?;
-        if sha256 != done.sha256 {
-            // L'unité corrompue sort du journal : une relance la réécrit.
-            let expected = done.sha256.clone();
-            journal.shards.remove(&unit);
-            write_json(journal_path, journal)?;
-            return Err(InferError::Config(format!(
-                "{}: sha256 {sha256} ≠ journal {expected} ; unité invalidée, relancer la conversion",
-                plan.file
-            )));
-        }
         if plan.file != "mtp.safetensors" {
             for name in offsets.keys() {
                 weight_map.insert(name.clone(), plan.file.clone().into());
