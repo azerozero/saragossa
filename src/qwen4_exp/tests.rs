@@ -3,8 +3,15 @@
 //! N1 : modèle synthétique (`tests/fixtures/qwen4exp_mini`), converti par
 //! `convert-qwen4exp` puis comparé aux sorties officielles transformers 5.20.2
 //! (f32, sdpa). Les poids sont exactement représentables en q4e8 : la
-//! conversion est sans perte, l'écart mesuré est celui du forward. Recette de
-//! régénération : `RECIPE.json` (script `make_mini_fixture.py`, hors dépôt).
+//! conversion est sans perte, l'écart mesuré est celui du forward.
+//! Régénération : `tools/flashnext/make_mini_fixture.py` (voir `RECIPE.json`).
+//!
+//! N2 (ignoré) : vrais poids q4e8 contre les couches officielles
+//! (`tools/flashnext/oracle_dump.py`).
+//!
+//! Quasi-égalités : un échange d'expert ou de bloc QSA n'est admis que s'il est
+//! justifié par les scores **de l'oracle** (écart au seuil ≤ 1e-5) ; les scores
+//! Rust de l'indexeur doivent en outre égaler ceux de torch.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -13,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::attention::{select_tokens, QsaDims, QsaWeights};
 use super::math::relative_error;
-use super::Qwen4ExpReference;
+use super::{QsaTrace, Qwen4ExpReference};
 use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
 use crate::qwen_loader::read_shard_header;
 use crate::Tensor;
@@ -22,28 +29,32 @@ use crate::Tensor;
 const FIXTURE_SHA256: &[(&str, &str)] = &[
     (
         "golden.safetensors",
-        "25ef31ca87be856418e292ec68ad9760df194a7847140c572dd107f7f431a94c",
+        "a759014da5315db43e28135f67f187e610e230a77a409dbc469670e060ad3f7c",
     ),
     (
         "source/model-00001-of-00001.safetensors",
-        "cb887bbbf576a34540a3e0e9d0d9a183f06a098a559ca1239757927d47073996",
+        "cce4f5b94dfaf1dc3465fd5f042fd4e141104651bcccc6e178700bd0f2e97d09",
     ),
     (
         "source/config.json",
-        "d7e9e183fc01c3959748e7458fd16c75e13fac7583d637efa9e279f187c0dc29",
+        "5b7ff4d9ec7c46c5bc6d8c6dfcb417308d308593cb5e9c85c9d66a838a6b56c2",
     ),
     (
         "source/model.safetensors.index.json",
-        "864262c3015b8ebbba55f7319557726f3dfeb60ea20338b90c6a6d5c10b370ab",
+        "69b7b126fbc4362a1b7ea4e1f8b7378187a566282914282e71473535e1bbbb60",
     ),
 ];
 
-/// Tolérance par couche (norme relative), cible initiale du plan.
+/// Tolérance par couche (norme relative), sur l'entrée torch de la couche précédente.
 const LAYER_TOL: f64 = 1.0e-4;
-/// Garde-fou de la dérive chaînée N2 (mesurée, non gatée : bascules de routage).
+/// Garde-fou des passes chaînées natives (dérive mesurée, non gatée).
 const CHAINED_GUARD: f64 = 1.0e-2;
 /// Porte KL(oracle‖rust) sur les logits, moyenne et maximum par token.
 const KL_TOL: f64 = 1.0e-3;
+/// Écart au seuil de l'oracle sous lequel un échange est une quasi-égalité.
+const TIE_TOL: f32 = 1.0e-5;
+/// Accord des scores Rust de l'indexeur avec ceux de torch.
+const SCORE_TOL: f32 = 1.0e-4;
 
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4exp_mini")
@@ -89,27 +100,50 @@ impl Golden {
             .collect()
     }
 
-    fn u8(&self, name: &str) -> (Vec<usize>, Vec<u8>) {
-        self.raw(name)
+    fn mask_selection(&self, name: &str) -> Vec<Vec<usize>> {
+        let (shape, mask) = self.raw(name);
+        let tokens = shape[0];
+        (0..tokens)
+            .map(|i| (0..tokens).filter(|&j| mask[i * tokens + j] != 0).collect())
+            .collect()
     }
-}
 
-/// Convertit la source de la fixture et ouvre la référence.
-#[cfg(feature = "devtools")]
-fn mini_reference(dst: &Path) -> Qwen4ExpReference {
-    use crate::devtools::convert::{convert_qwen4exp, ConvertOptions};
-    convert_qwen4exp(&ConvertOptions {
-        src: fixture().join("source"),
-        dst: dst.to_path_buf(),
-        source_revision: "fixture-qwen4exp-mini".to_string(),
-        source_repo: None,
-        converter_commit: None,
-        only: None,
-        verify: false,
-        plan_only: false,
-    })
-    .expect("invariant: conversion de la fixture");
-    Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(dst).expect("invariant: checkpoint q4e8"))
+    /// Scores torch de l'indexeur par requête (aplatis + offsets).
+    fn qsa_scores(&self, layer: usize) -> Vec<Vec<f32>> {
+        let flat = self.f32(&format!("qsa_scores.{layer}"));
+        let offsets = self.i64(&format!("qsa_offsets.{layer}"));
+        offsets
+            .windows(2)
+            .map(|w| flat.data()[w[0] as usize..w[1] as usize].to_vec())
+            .collect()
+    }
+
+    /// Sorties du routeur torch : (experts retenus triés, probabilités) par token.
+    fn routing(&self, layer: usize, k: usize) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
+        let ids = self.i64(&format!("routing.{layer}"));
+        let logits = self.f32(&format!("router_logits.{layer}"));
+        let experts = logits.as_matrix().expect("invariant: 2D").1;
+        let sets = ids
+            .chunks_exact(k)
+            .map(|row| {
+                let mut row: Vec<usize> = row.iter().map(|&e| e as usize).collect();
+                row.sort_unstable();
+                row
+            })
+            .collect();
+        let probs = logits
+            .data()
+            .chunks_exact(experts)
+            .map(|row| {
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let sum: f64 = row.iter().map(|v| (*v as f64 - max).exp()).sum();
+                row.iter()
+                    .map(|v| ((*v as f64 - max).exp() / sum) as f32)
+                    .collect()
+            })
+            .collect();
+        (sets, probs)
+    }
 }
 
 fn assert_close(label: &str, rust: &Tensor, oracle: &Tensor, tol: f64) {
@@ -142,55 +176,114 @@ fn kl_per_token(oracle: &Tensor, rust: &Tensor) -> (f64, f64) {
     (total / tokens as f64, worst)
 }
 
-/// Sélection torch de la couche : tokens retenus par requête (masque de l'indexeur).
-fn torch_selection(golden: &Golden, layer: usize) -> Vec<Vec<usize>> {
-    let (shape, mask) = golden.u8(&format!("qsa_mask.{layer}"));
-    let tokens = shape[0];
-    (0..tokens)
-        .map(|i| (0..tokens).filter(|&j| mask[i * tokens + j] != 0).collect())
-        .collect()
-}
-
-/// Compare la sélection Rust à celle de torch : identiques, ou différentes
-/// uniquement sur des blocs dont le score égale le seuil du top-k (écart
-/// ≤ 1e-5), cas des ReLU nulles. Renvoie le nombre de requêtes à ex æquo.
-fn check_selection_modulo_ties(
-    layer: usize,
-    trace: &super::QsaTrace,
-    torch: &[Vec<usize>],
-    keep: usize,
-) -> usize {
-    let blocks = |sel: &[usize]| -> BTreeSet<usize> { sel.iter().map(|j| j / 4).collect() };
-    let mut ties = 0;
-    for (i, (ours, theirs)) in trace.selected.iter().zip(torch).enumerate() {
-        if ours == theirs {
-            continue;
-        }
-        let scores = &trace.scores[i];
-        let mut sorted = scores.clone();
-        sorted.sort_by(|a, b| b.total_cmp(a));
-        let threshold = sorted[keep - 1];
-        let (a, b) = (blocks(ours), blocks(theirs));
-        for block in a.symmetric_difference(&b) {
-            let score = scores
-                .get(*block)
-                .unwrap_or_else(|| panic!("couche {layer} requête {i}: bloc {block} incomplet"));
-            assert!(
-                (score - threshold).abs() <= 1.0e-5,
-                "couche {layer} requête {i}: bloc {block} score {score} ≠ seuil {threshold}"
-            );
-        }
-        ties += 1;
-    }
-    ties
-}
-
 fn argmax(row: &[f32]) -> usize {
     row.iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| i)
         .unwrap_or(0)
+}
+
+/// k-ième plus grande valeur, `None` s'il y en a au plus `k` (pas de seuil).
+fn kth_largest(values: &[f32], k: usize) -> Option<f32> {
+    if values.len() <= k || k == 0 {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    Some(sorted[k - 1])
+}
+
+/// Justifie la sélection QSA Rust contre l'oracle :
+/// 1. scores Rust de l'indexeur ≈ scores torch (`SCORE_TOL`) pour toute requête ;
+/// 2. une sélection différente n'échange que des blocs dont le score **torch**
+///    est au seuil torch du top-k (`TIE_TOL`).
+///
+/// Renvoie le nombre de requêtes à ex æquo, ou la première violation.
+fn justify_qsa(
+    rust: &QsaTrace,
+    torch_selection: &[Vec<usize>],
+    torch_scores: &[Vec<f32>],
+    keep: usize,
+    compress: usize,
+) -> Result<usize, String> {
+    let blocks = |sel: &[usize]| -> BTreeSet<usize> { sel.iter().map(|j| j / compress).collect() };
+    let mut ties = 0;
+    for (i, ((ours, theirs), (rs, ts))) in rust
+        .selected
+        .iter()
+        .zip(torch_selection)
+        .zip(rust.scores.iter().zip(torch_scores))
+        .enumerate()
+    {
+        if rs.len() != ts.len() {
+            return Err(format!(
+                "requête {i}: {} scores Rust, {} torch",
+                rs.len(),
+                ts.len()
+            ));
+        }
+        for (b, (r, t)) in rs.iter().zip(ts).enumerate() {
+            if (r - t).abs() > SCORE_TOL * (1.0 + t.abs()) {
+                return Err(format!("requête {i} bloc {b}: score Rust {r} ≠ torch {t}"));
+            }
+        }
+        if ours == theirs {
+            continue;
+        }
+        let threshold = kth_largest(ts, keep).ok_or_else(|| {
+            format!(
+                "requête {i}: sélection différente sans top-k ({} blocs)",
+                ts.len()
+            )
+        })?;
+        let (a, b) = (blocks(ours), blocks(theirs));
+        for block in a.symmetric_difference(&b) {
+            let score = ts
+                .get(*block)
+                .ok_or_else(|| format!("requête {i}: bloc {block} hors blocs complets"))?;
+            if (score - threshold).abs() > TIE_TOL {
+                return Err(format!(
+                    "requête {i}: bloc {block} échangé, score torch {score} ≠ seuil {threshold}"
+                ));
+            }
+        }
+        ties += 1;
+    }
+    Ok(ties)
+}
+
+/// Justifie le routage Rust contre l'oracle : un expert échangé doit avoir une
+/// probabilité **torch** au seuil torch du top-k. Renvoie les échanges
+/// `(token, experts de la différence symétrique)`.
+fn justify_routing(
+    rust: &[Vec<usize>],
+    torch_sets: &[Vec<usize>],
+    torch_probs: &[Vec<f32>],
+    k: usize,
+) -> Result<Vec<(usize, Vec<usize>)>, String> {
+    let mut swaps = Vec::new();
+    for (t, (ours, theirs)) in rust.iter().zip(torch_sets).enumerate() {
+        if ours == theirs {
+            continue;
+        }
+        let probs = &torch_probs[t];
+        let threshold = kth_largest(probs, k)
+            .ok_or_else(|| format!("token {t}: routage différent sans seuil"))?;
+        let a: BTreeSet<usize> = ours.iter().copied().collect();
+        let b: BTreeSet<usize> = theirs.iter().copied().collect();
+        let swapped: Vec<usize> = a.symmetric_difference(&b).copied().collect();
+        for e in &swapped {
+            if (probs[*e] - threshold).abs() > TIE_TOL {
+                return Err(format!(
+                    "token {t}: expert {e} échangé, probabilité torch {} ≠ seuil {threshold}",
+                    probs[*e]
+                ));
+            }
+        }
+        swaps.push((t, swapped));
+    }
+    Ok(swaps)
 }
 
 #[test]
@@ -203,6 +296,24 @@ fn fixture_hashes_are_pinned() {
             .collect();
         assert_eq!(&got, expected, "{file}");
     }
+}
+
+/// Convertit la source de la fixture et ouvre la référence.
+#[cfg(feature = "devtools")]
+fn mini_reference(dst: &Path) -> Qwen4ExpReference {
+    use crate::devtools::convert::{convert_qwen4exp, ConvertOptions};
+    convert_qwen4exp(&ConvertOptions {
+        src: fixture().join("source"),
+        dst: dst.to_path_buf(),
+        source_revision: "fixture-qwen4exp-mini".to_string(),
+        source_repo: None,
+        converter_commit: None,
+        only: None,
+        verify: false,
+        plan_only: false,
+    })
+    .expect("invariant: conversion de la fixture");
+    Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(dst).expect("invariant: checkpoint q4e8"))
 }
 
 #[cfg(feature = "devtools")]
@@ -219,75 +330,83 @@ fn n1_mini_model_matches_transformers_layer_by_layer() {
         .map(|&t| t as usize)
         .collect();
     let layers = reference.checkpoint().config.layer_kinds.len();
+    let k = reference.checkpoint().config.top_k;
+    let (keep, compress) = (reference.budget_blocks(), reference.compress());
 
     // Embedding u8 exact : identique bit à bit à celui de torch.
     let embed = reference.embed(&ids).expect("invariant: embedding");
     let mut torch_input = embed.clone();
-    let mut chained = embed;
-    let mut tie_queries = 0;
+    let mut forced_chain = embed.clone();
+    let mut native_chain = embed;
     for layer in 0..layers {
-        // Ablation locale : chaque couche part de l'entrée torch de la précédente.
         let own = reference
             .layer(layer, &torch_input, &ids)
             .expect("invariant: couche");
-        let k = reference.checkpoint().config.top_k;
-        let torch_routing = golden.i64(&format!("routing.{layer}"));
-        for (t, picks) in own.routing.iter().enumerate() {
-            let mut expected: Vec<usize> = torch_routing[t * k..(t + 1) * k]
-                .iter()
-                .map(|&e| e as usize)
-                .collect();
-            expected.sort_unstable();
-            assert_eq!(picks, &expected, "routage couche {layer} token {t}");
-        }
+        let (torch_sets, torch_probs) = golden.routing(layer, k);
+        let swaps = justify_routing(&own.routing, &torch_sets, &torch_probs, k)
+            .unwrap_or_else(|e| panic!("routage couche {layer}: {e}"));
+        assert!(
+            swaps.is_empty(),
+            "N1 sans quasi-égalité de routage: {swaps:?}"
+        );
         let forced = own.qsa.as_ref().map(|trace| {
-            let torch = torch_selection(&golden, layer);
-            tie_queries +=
-                check_selection_modulo_ties(layer, trace, &torch, reference.budget_blocks());
+            let torch = golden.mask_selection(&format!("qsa_mask.{layer}"));
+            let ties = justify_qsa(trace, &torch, &golden.qsa_scores(layer), keep, compress)
+                .unwrap_or_else(|e| panic!("QSA couche {layer}: {e}"));
+            eprintln!("couche {layer}: {ties} requêtes QSA à ex æquo justifiées par l'oracle");
             torch
         });
-        // Sorties comparées avec la sélection torch imposée (identique hors ex æquo).
+        // Ablation : sorties comparées avec la sélection torch imposée.
         let local = match &forced {
             Some(sel) => reference
                 .layer_with_selection(layer, &torch_input, &ids, Some(sel))
                 .expect("invariant: couche imposée"),
             None => own,
         };
-        chained = reference
-            .layer_with_selection(layer, &chained, &ids, forced.as_deref())
-            .expect("invariant: couche chaînée")
+        let oracle = golden.f32(&format!("layer.{layer}"));
+        assert_close(
+            &format!("couche {layer} (locale)"),
+            &local.hidden,
+            &oracle,
+            LAYER_TOL,
+        );
+        forced_chain = reference
+            .layer_with_selection(layer, &forced_chain, &ids, forced.as_deref())
+            .expect("invariant: couche chaînée imposée")
             .hidden;
-        if layer + 1 < layers {
-            let oracle = golden.f32(&format!("layer.{layer}"));
-            assert_close(
-                &format!("couche {layer} (locale)"),
-                &local.hidden,
-                &oracle,
-                LAYER_TOL,
-            );
-            assert_close(
-                &format!("couche {layer} (chaînée)"),
-                &chained,
-                &oracle,
-                LAYER_TOL,
-            );
-            torch_input = oracle;
-        } else {
-            let final_local = reference
-                .final_mixer(&local.hidden)
-                .expect("invariant: mixer");
-            assert_close(
-                "mixer final (local)",
-                &final_local,
-                &golden.f32("final_mixer"),
-                LAYER_TOL,
-            );
+        assert_close(
+            &format!("couche {layer} (chaînée, sélection imposée)"),
+            &forced_chain,
+            &oracle,
+            LAYER_TOL,
+        );
+        // Passe chaînée native : sélection propre de l'indexeur, mesurée.
+        let native = reference
+            .layer(layer, &native_chain, &ids)
+            .expect("invariant: couche chaînée native");
+        if let (Some(trace), Some(torch)) = (&native.qsa, &forced) {
+            let differing = trace
+                .selected
+                .iter()
+                .zip(torch)
+                .filter(|(a, b)| a != b)
+                .count();
+            eprintln!("couche {layer}: passe native, {differing} sélections QSA ≠ torch");
         }
+        native_chain = native.hidden;
+        let (rel, _) = relative_error(native_chain.data(), oracle.data());
+        eprintln!("couche {layer} (chaînée native): rel={rel:.3e}");
+        assert!(
+            rel <= CHAINED_GUARD,
+            "passe native couche {layer}: {rel:.3e}"
+        );
+        torch_input = oracle;
     }
-    eprintln!("requêtes QSA à ex æquo (sélection torch imposée) : {tie_queries}");
-    let final_hidden = reference.final_mixer(&chained).expect("invariant: mixer");
+    let final_hidden = reference
+        .final_mixer(&forced_chain)
+        .expect("invariant: mixer");
     assert_close(
-        "mixer final (chaîné)",
+        "mixer final",
         &final_hidden,
         &golden.f32("final_mixer"),
         LAYER_TOL,
@@ -307,6 +426,81 @@ fn n1_mini_model_matches_transformers_layer_by_layer() {
             argmax(&oracle.data()[t * vocab..(t + 1) * vocab]),
             "top-1 token {t}"
         );
+    }
+    let native_logits = reference
+        .logits(
+            &reference
+                .final_mixer(&native_chain)
+                .expect("invariant: mixer"),
+        )
+        .expect("invariant: logits natifs");
+    let (mean, worst) = kl_per_token(&oracle, &native_logits);
+    eprintln!("logits (passe native): KL moyen {mean:.3e}, max {worst:.3e}");
+}
+
+#[cfg(feature = "devtools")]
+#[test]
+fn n1_qsa_with_clear_margin_matches_exactly() {
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let reference = mini_reference(dst.path());
+    let golden = Golden {
+        path: fixture().join("golden.safetensors"),
+    };
+    let last = reference.checkpoint().config.layer_kinds.len() - 1;
+    let x = golden.f32("qsa_clear.x");
+    let (out, trace) = reference
+        .attention_layer(last, &x, None)
+        .expect("invariant: attention");
+    // Marge nette (> 1e-3) au seuil : la sélection doit être identique, sans
+    // recours aux quasi-égalités.
+    assert_eq!(trace.selected, golden.mask_selection("qsa_clear.mask"));
+    assert_close(
+        "QSA à marge nette",
+        &out,
+        &golden.f32("qsa_clear.out"),
+        LAYER_TOL,
+    );
+}
+
+#[cfg(feature = "devtools")]
+#[test]
+fn qsa_justification_rejects_all_zero_rust_scores() {
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let reference = mini_reference(dst.path());
+    let golden = Golden {
+        path: fixture().join("golden.safetensors"),
+    };
+    let last = reference.checkpoint().config.layer_kinds.len() - 1;
+    let torch = golden.mask_selection(&format!("qsa_mask.{last}"));
+    let scores = golden.qsa_scores(last);
+    let (keep, compress) = (reference.budget_blocks(), reference.compress());
+    // Indexeur défaillant simulé : scores nuls, sélection « par indice ».
+    let zeros: Vec<Vec<f32>> = scores.iter().map(|row| vec![0.0; row.len()]).collect();
+    let selected = super::attention::select_from_scores(&zeros, selection_dims(keep, compress));
+    let broken = QsaTrace {
+        selected,
+        scores: zeros,
+    };
+    assert!(
+        justify_qsa(&broken, &torch, &scores, keep, compress).is_err(),
+        "des scores Rust tous nuls doivent être rejetés"
+    );
+}
+
+/// Dimensions QSA minimales pour `select_from_scores` (seuls budget et compress servent).
+#[cfg(feature = "devtools")]
+fn selection_dims(keep: usize, compress: usize) -> QsaDims {
+    QsaDims {
+        heads: 1,
+        kv_heads: 1,
+        head_dim: 2,
+        rotary_dim: 2,
+        rope_theta: 1.0,
+        index_heads: 1,
+        index_head_dim: 2,
+        budget: keep * compress,
+        compress,
+        eps: 1.0e-6,
     }
 }
 
@@ -354,18 +548,19 @@ fn qsa_selection_size_tail_and_excludable_current_block() {
     let (x, w, d) = qsa_fixture(tokens, budget);
     let freqs = super::math::inv_freq(d.rotary_dim, d.rope_theta);
     let selected = select_tokens(&x, &w, d, &freqs).expect("invariant: sélection");
+    let c = d.compress;
     let mut excluded_current = false;
     for (i, sel) in selected.iter().enumerate() {
         let visible = i + 1;
-        let expected = 4 * (visible / 4).min(budget / 4) + visible % 4;
+        let expected = c * (visible / c).min(budget / c) + visible % c;
         assert_eq!(sel.len(), expected, "taille requête {i}");
         // Queue incomplète toujours présente, tokens causaux et sans doublon.
-        for j in (visible / 4) * 4..visible {
+        for j in (visible / c) * c..visible {
             assert!(sel.contains(&j), "queue {j} absente pour {i}");
         }
         assert!(sel.iter().all(|&j| j <= i));
         assert_eq!(sel.iter().collect::<BTreeSet<_>>().len(), sel.len());
-        if visible % 4 == 0 && !sel.contains(&i) {
+        if visible % c == 0 && !sel.contains(&i) {
             excluded_current = true;
         }
     }
@@ -375,9 +570,7 @@ fn qsa_selection_size_tail_and_excludable_current_block() {
     );
 }
 
-/// N2 : référence Rust contre les couches officielles transformers sur les vrais
-/// poids q4e8 v2. Ignoré par défaut : `SARAGOSSA_QWEN4EXP_DIR` (sortie
-/// convertie) et `SARAGOSSA_QWEN4EXP_GOLDEN` (goldens de `oracle_dump.py`).
+/// N2 : chemins des poids convertis et des goldens d'`oracle_dump.py`.
 fn n2_paths() -> (PathBuf, PathBuf) {
     let dir = std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
         .map(PathBuf::from)
@@ -388,8 +581,54 @@ fn n2_paths() -> (PathBuf, PathBuf) {
     (dir, golden)
 }
 
+fn sha256_file(path: &Path) -> String {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).expect("invariant: fichier");
+    let mut sha = Sha256::new();
+    let mut buf = vec![0_u8; 1 << 24];
+    loop {
+        let n = file.read(&mut buf).expect("invariant: lecture");
+        if n == 0 {
+            break;
+        }
+        sha.update(&buf[..n]);
+    }
+    sha.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Provenance N2 vérifiée avant l'inférence : empreinte du golden contre
+/// `provenance.json`, poids annoncés par le golden contre le manifeste du
+/// checkpoint ouvert, versions et backend.
+fn check_provenance(dir: &Path, golden_dir: &Path, file: &str) {
+    let provenance: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(golden_dir.join("provenance.json")).expect("invariant: provenance.json"),
+    )
+    .expect("invariant: json");
+    assert_eq!(
+        provenance["files"][file].as_str(),
+        Some(sha256_file(&golden_dir.join(file)).as_str()),
+        "empreinte de {file}"
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("convert_manifest.json")).expect("invariant: manifeste"),
+    )
+    .expect("invariant: json");
+    for entry in manifest["files"].as_array().expect("invariant: fichiers") {
+        let name = entry["name"].as_str().expect("invariant: nom");
+        if name.ends_with(".safetensors") || name.starts_with("ngram/") {
+            assert_eq!(
+                provenance["weights"][name], entry["sha256"],
+                "poids {name} : golden produit sur d'autres poids"
+            );
+        }
+    }
+    assert_eq!(provenance["transformers"], "5.20.2");
+    assert_eq!(provenance["attn_implementation"], "sdpa");
+    assert_eq!(provenance["dtype"], "float32");
+}
+
 /// Erreur relative sur les `rows` premières lignes (préfixe causal), hors
-/// lignes `skip` (tokens à quasi-égalité de routage, listés à part).
+/// lignes `skip` (quasi-égalités justifiées par l'oracle).
 fn prefix_error(a: &Tensor, b: &Tensor, rows: usize, skip: &[usize]) -> f64 {
     let width = a.as_matrix().expect("invariant: 2D").1;
     let keep = |data: &[f32]| -> Vec<f32> {
@@ -405,6 +644,7 @@ fn prefix_error(a: &Tensor, b: &Tensor, rows: usize, skip: &[usize]) -> f64 {
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
     let (dir, golden_dir) = n2_paths();
+    check_provenance(&dir, &golden_dir, "layers.safetensors");
     let reference =
         Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
     let golden = Golden {
@@ -417,37 +657,30 @@ fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
         .collect();
     let tokens = ids.len();
     let k = reference.checkpoint().config.top_k;
+    let (keep, compress) = (reference.budget_blocks(), reference.compress());
     let embed = reference.embed(&ids).expect("invariant: embedding");
     let mut torch_input = embed.clone();
-    let mut chained = embed;
+    let mut native_chain = embed;
+    let mut prefixes: Vec<usize> = vec![64];
+    prefixes.extend(2047..=2052);
+    prefixes.extend([3000, tokens]);
     for layer in 0..4 {
         let started = std::time::Instant::now();
         let own = reference
             .layer(layer, &torch_input, &ids)
             .expect("invariant: couche");
-        let torch_routing = golden.i64(&format!("routing.{layer}"));
-        let mut near_ties = Vec::new();
-        for (t, picks) in own.routing.iter().enumerate() {
-            let mut expected: Vec<usize> = torch_routing[t * k..(t + 1) * k]
-                .iter()
-                .map(|&e| e as usize)
-                .collect();
-            expected.sort_unstable();
-            if picks != &expected {
-                assert!(
-                    own.routing_margins[t] < 1.0e-5,
-                    "routage couche {layer} token {t}: marge {}",
-                    own.routing_margins[t]
-                );
-                near_ties.push(t);
-            }
-        }
+        let (torch_sets, torch_probs) = golden.routing(layer, k);
+        let swaps = justify_routing(&own.routing, &torch_sets, &torch_probs, k)
+            .unwrap_or_else(|e| panic!("routage couche {layer}: {e}"));
+        let near_ties: Vec<usize> = swaps.iter().map(|(t, _)| *t).collect();
+        eprintln!("couche {layer}: échanges de routage justifiés {swaps:?}");
         let forced = own.qsa.as_ref().map(|trace| {
-            let torch = torch_selection(&golden, layer);
-            let ties = check_selection_modulo_ties(layer, trace, &torch, reference.budget_blocks());
+            let torch = golden.mask_selection(&format!("qsa_mask.{layer}"));
+            let ties = justify_qsa(trace, &torch, &golden.qsa_scores(layer), keep, compress)
+                .unwrap_or_else(|e| panic!("QSA couche {layer}: {e}"));
             for (i, sel) in trace.selected.iter().enumerate() {
                 let visible = i + 1;
-                let expected = 4 * (visible / 4).min(reference.budget_blocks()) + visible % 4;
+                let expected = compress * (visible / compress).min(keep) + visible % compress;
                 assert_eq!(sel.len(), expected, "taille QSA requête {i}");
             }
             for v in 2047..=2052 {
@@ -457,48 +690,44 @@ fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
                     trace.selected[v - 1] == torch[v - 1]
                 );
             }
-            eprintln!("couche {layer}: {ties} requêtes QSA à ex æquo");
+            eprintln!("couche {layer}: {ties} requêtes QSA à ex æquo justifiées par l'oracle");
             torch
         });
+        // Ablation : sélection torch imposée (identique à la sélection propre hors ex æquo).
         let local = match &forced {
             Some(sel) => reference
                 .layer_with_selection(layer, &torch_input, &ids, Some(sel))
                 .expect("invariant: couche imposée"),
             None => own,
         };
-        let chained_out = reference
-            .layer_with_selection(layer, &chained, &ids, forced.as_deref())
-            .expect("invariant: couche chaînée");
-        // Dérive cumulée : un écart d'entrée infime peut basculer un routage
-        // quasi égal ; ces tokens sont comptés et la dérive est mesurée, pas gatée.
-        let flipped: Vec<usize> = chained_out
+        // Passe chaînée native : sélection propre de l'indexeur, mesurée.
+        let native = reference
+            .layer(layer, &native_chain, &ids)
+            .expect("invariant: couche chaînée native");
+        let native_flips = native
             .routing
             .iter()
-            .enumerate()
-            .filter(|(t, picks)| {
-                let mut expected: Vec<usize> = torch_routing[t * k..(t + 1) * k]
-                    .iter()
-                    .map(|&e| e as usize)
-                    .collect();
-                expected.sort_unstable();
-                *picks != &expected
-            })
-            .map(|(t, _)| t)
-            .collect();
-        eprintln!(
-            "couche {layer}: chemin chaîné, {} tokens au routage basculé {:?}",
-            flipped.len(),
-            &flipped[..flipped.len().min(8)]
-        );
-        chained = chained_out.hidden;
+            .zip(&torch_sets)
+            .filter(|(a, b)| a != b)
+            .count();
+        let native_qsa = match (&native.qsa, &forced) {
+            (Some(trace), Some(torch)) => trace
+                .selected
+                .iter()
+                .zip(torch)
+                .filter(|(a, b)| a != b)
+                .count(),
+            _ => 0,
+        };
+        native_chain = native.hidden;
         let oracle = golden.f32(&format!("layer.{layer}"));
-        for rows in [64, 2047, 2052, 3000, tokens] {
+        for &rows in &prefixes {
             let local_err = prefix_error(&local.hidden, &oracle, rows, &near_ties);
             eprintln!(
                 "couche {layer} préfixe {rows}: locale {local_err:.3e} (hors quasi-égalités), \
-                 locale brute {:.3e}, chaînée {:.3e}",
+                 brute {:.3e}, chaînée native {:.3e}",
                 prefix_error(&local.hidden, &oracle, rows, &[]),
-                prefix_error(&chained, &oracle, rows, &[])
+                prefix_error(&native_chain, &oracle, rows, &[])
             );
             assert!(
                 local_err <= LAYER_TOL,
@@ -506,21 +735,13 @@ fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
             );
         }
         eprintln!(
-            "couche {layer}: routage quasi-égal {near_ties:?}, {:.0} s",
+            "couche {layer}: passe native, {native_flips} routages et {native_qsa} sélections QSA ≠ torch, {:.0} s",
             started.elapsed().as_secs_f64()
         );
-        assert_close(
-            &format!("couche {layer} (locale)"),
-            &local.hidden,
-            &oracle,
-            LAYER_TOL,
-        );
-        // Dérive chaînée : garde-fou large seulement (mesurée à part, cf. plan).
-        assert_close(
-            &format!("couche {layer} (chaînée)"),
-            &chained,
-            &oracle,
-            CHAINED_GUARD,
+        let (rel, _) = relative_error(native_chain.data(), oracle.data());
+        assert!(
+            rel <= CHAINED_GUARD,
+            "passe native couche {layer}: {rel:.3e}"
         );
         torch_input = oracle;
     }
@@ -530,6 +751,7 @@ fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_full_model_logits_match_transformers() {
     let (dir, golden_dir) = n2_paths();
+    check_provenance(&dir, &golden_dir, "full.safetensors");
     let reference =
         Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
     let golden = Golden {

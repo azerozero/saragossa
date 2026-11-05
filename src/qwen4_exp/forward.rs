@@ -60,6 +60,11 @@ impl Qwen4ExpReference {
         c.indexer_budget / c.indexer_compress
     }
 
+    /// Taille des blocs de l'indexeur QSA.
+    pub fn compress(&self) -> usize {
+        self.ckpt.config.indexer_compress
+    }
+
     /// Checkpoint sous-jacent.
     pub fn checkpoint(&self) -> &Qwen4ExpCheckpoint {
         &self.ckpt
@@ -142,6 +147,26 @@ impl Qwen4ExpReference {
             rms_eps: c.rms_eps,
         };
         LinearAttention::new(weights).forward_flash_next_cpu(config, x, c.sigmoid_output_gate)
+    }
+
+    /// Attention QSA seule de la couche `index` sur `x` `[T, hidden]` (oracle).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de lecture, de forme ou si la couche n'est pas QSA.
+    #[cfg(test)]
+    pub(crate) fn attention_layer(
+        &self,
+        index: usize,
+        x: &Tensor,
+        forced: Option<&[Vec<usize>]>,
+    ) -> Result<(Tensor, QsaTrace)> {
+        if self.ckpt.config.layer_kinds.get(index) != Some(&Qwen4ExpLayerKind::Full) {
+            return Err(InferError::Config(format!(
+                "couche {index}: pas d'attention QSA"
+            )));
+        }
+        self.attention(&Qwen4ExpCheckpoint::layer_prefix(index), x, forced)
     }
 
     fn attention(
