@@ -31,6 +31,17 @@ const ROWS_KERNELS_TEMPLATE: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup>
 using namespace metal;
+#ifdef TREE_ROWS
+// Position virtuelle `v` d'une ligne d'arbre → ligne stockée : le préfixe
+// `[0, root)` tel quel, puis le k-ième ancêtre du masque (ordre topologique,
+// donc par profondeur croissante).
+static inline uint tree_stored_row(uint v, uint root, uint mask) {
+    if (v < root) { return v; }
+    uint m = mask;
+    for (uint k = v - root; k > 0u; --k) { m &= m - 1u; }
+    return root + ctz(m);
+}
+#endif
 
 // Flash single-pass en lignes : threadgroup (q_head, ligne), len = dims.w + ligne.
 kernel void attention_decode_flash_rows_SUFFIX(
@@ -58,7 +69,15 @@ kernel void attention_decode_flash_rows_SUFFIX(
     const uint head_dim = dims.z;
     const uint q_head = tg.x;
     const uint row = tg.y;
+#ifdef TREE_ROWS
+    // Arbre : la ligne voit le préfixe puis son chemin (racine comprise),
+    // parcourus en positions virtuelles contiguës comme le pas AR du chemin :
+    // même affectation clé → simdgroup, donc mêmes bits.
+    const uint tree_mask = tree[2u + tree[1] + row];
+    const uint len = tree[0] + popcount(tree_mask);
+#else
     const uint len = dims.w + row;
+#endif
     if (q_head >= q_heads || len == 0u || head_dim == 0u) {
         return;
     }
@@ -90,13 +109,11 @@ kernel void attention_decode_flash_rows_SUFFIX(
     // Fenêtre glissante (`window` > 0) : la ligne n'attend que ses `window`
     // dernières positions, début propre à chaque ligne.
     const uint start = (window != 0u && len > window) ? (len - window) : 0u;
-    for (uint r = start + simd_gid; r < len; r += BN) {
+    for (uint v = start + simd_gid; v < len; v += BN) {
 #ifdef TREE_ROWS
-        // Clés de l'arbre hors des ancêtres de la ligne : sautées (uniforme sur
-        // le simdgroup, aucune divergence).
-        if (r >= tree[0] && ((tree[2u + tree[1] + row] >> (r - tree[0])) & 1u) == 0u) {
-            continue;
-        }
+        const uint r = tree_stored_row(v, tree[0], tree_mask);
+#else
+        const uint r = v;
 #endif
         const uint k_start = r * kv_dim + kv_head_start;
         float score = 0.0f;
@@ -238,6 +255,17 @@ const ROWS_HEAD_KERNELS_TEMPLATE: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup>
 using namespace metal;
+#ifdef TREE_ROWS
+// Position virtuelle `v` d'une ligne d'arbre → ligne stockée : le préfixe
+// `[0, root)` tel quel, puis le k-ième ancêtre du masque (ordre topologique,
+// donc par profondeur croissante).
+static inline uint tree_stored_row(uint v, uint root, uint mask) {
+    if (v < root) { return v; }
+    uint m = mask;
+    for (uint k = v - root; k > 0u; --k) { m &= m - 1u; }
+    return root + ctz(m);
+}
+#endif
 
 kernel void attention_decode_flash_rows_dDHEAD_SUFFIX(
     device const float* q [[buffer(0)]],
@@ -264,7 +292,15 @@ kernel void attention_decode_flash_rows_dDHEAD_SUFFIX(
     const uint kv_heads = dims.y;
     const uint q_head = tg.x;
     const uint row = tg.y;
+#ifdef TREE_ROWS
+    // Arbre : la ligne voit le préfixe puis son chemin (racine comprise),
+    // parcourus en positions virtuelles contiguës comme le pas AR du chemin :
+    // même affectation clé → simdgroup, donc mêmes bits.
+    const uint tree_mask = tree[2u + tree[1] + row];
+    const uint len = tree[0] + popcount(tree_mask);
+#else
     const uint len = dims.w + row;
+#endif
     if (q_head >= q_heads || len == 0u) {
         return;
     }
@@ -289,13 +325,11 @@ kernel void attention_decode_flash_rows_dDHEAD_SUFFIX(
     // Fenêtre glissante (`window` > 0) : la ligne n'attend que ses `window`
     // dernières positions, début propre à chaque ligne.
     const uint start = (window != 0u && len > window) ? (len - window) : 0u;
-    for (uint r = start + simd_gid; r < len; r += BN) {
+    for (uint v = start + simd_gid; v < len; v += BN) {
 #ifdef TREE_ROWS
-        // Clés de l'arbre hors des ancêtres de la ligne : sautées (uniforme sur
-        // le simdgroup, aucune divergence).
-        if (r >= tree[0] && ((tree[2u + tree[1] + row] >> (r - tree[0])) & 1u) == 0u) {
-            continue;
-        }
+        const uint r = tree_stored_row(v, tree[0], tree_mask);
+#else
+        const uint r = v;
 #endif
         const uint k_start = r * kv_dim + kv_head_start;
         float score = 0.0f;
@@ -375,7 +409,12 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
     const uint block_idx = tid.y;
     const uint q_in_group = tidtg.y;
     const uint row = tidtg.z;
+#ifdef TREE_ROWS
+    const uint tree_mask = tree[2u + tree[1] + row];
+    const uint len = tree[0] + popcount(tree_mask);
+#else
     const uint len = dims.z + row;
+#endif
     const uint q_head = kv_head * gqa + q_in_group;
     if (q_head >= q_heads || block_idx >= blocks) { return; }
     const uint slot = row * q_heads + q_head;
@@ -401,9 +440,10 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
 
     for (uint i = first; i < len; i += blocks) {
 #ifdef TREE_ROWS
-        // Clé hors des ancêtres : bloc éventuellement vide (max −∞, somme 0),
-        // que la passe 2 pondère à zéro comme un bloc au-delà de `len`.
-        if (i < tree[0] || ((tree[2u + tree[1] + row] >> (i - tree[0])) & 1u) != 0u) {
+        // Position virtuelle `i` → ligne stockée (préfixe, puis chemin).
+        const uint stored = tree_stored_row(i, tree[0], tree_mask);
+        k_ = keys + stored * kv_dim + kv_head * D + simd_lid * QK;
+        v_ = values + stored * kv_dim + kv_head * D + simd_lid * QK;
 #endif
         float score = 0.0f;
         for (uint j = 0u; j < QK; ++j) { score += ql[j] * float(k_[j]); }
@@ -414,11 +454,11 @@ kernel void attention_decode_2pass_1_rows_dDHEAD_SUFFIX(
         max_score = new_max;
         sum_exp = sum_exp * factor + exp_score;
         for (uint j = 0u; j < QK; ++j) { o[j] = o[j] * factor + exp_score * float(v_[j]); }
-#ifdef TREE_ROWS
-        }
-#endif
+#ifndef TREE_ROWS
+        // Sous arbre, les pointeurs sont recalculés par position virtuelle.
         k_ += blocks * kv_dim;
         v_ += blocks * kv_dim;
+#endif
     }
 
     if (simd_lid == 0u) {
@@ -1013,7 +1053,7 @@ impl FullAttentionMetalState {
         window: Option<usize>,
     ) -> Result<()> {
         let (kernels, _) = kernels.select()?;
-        if crate::runtime_flags::verify_rows_nax_enabled() && self.rows_nax_eligible(rows, window) {
+        if crate::metal_backend::verify_rows_nax_allowed() && self.rows_nax_eligible(rows, window) {
             if let Some(nax) = kernels.nax(self.head_dim())? {
                 return self.encode_attention_rows_nax(encoder, nax, q_rows, out_rows, rows);
             }
@@ -1141,9 +1181,19 @@ impl FullAttentionMetalState {
         // flash/2-passes ou nombre de blocs split-K) : chunks d'une ligne, chacun
         // avec le choix et les blocs de SA longueur, pour rester bit-identique à la
         // boucle par ligne.
-        let boundary = two_pass_for(len0) != two_pass_for(len)
-            || (two_pass_for(len)
-                && sdpa_2pass_blocks(effective(len0)) != sdpa_2pass_blocks(effective(len)));
+        // Sous un arbre, une ligne lit le préfixe puis son chemin : sa longueur
+        // est `préfixe + profondeur + 1`, celle du pas AR de ce chemin (kernel et
+        // blocs choisis dessus), pas sa position stockée.
+        let row_len = |row: usize| match &tree {
+            Some(tree) => len - rows + tree.depths()[row] as usize + 1,
+            None => len0 + row,
+        };
+        let last_len =
+            |first: usize, count: usize| (first..first + count).map(row_len).max().unwrap_or(len0);
+        let max_len = last_len(0, rows);
+        let boundary = two_pass_for(len0) != two_pass_for(max_len)
+            || (two_pass_for(max_len)
+                && sdpa_2pass_blocks(effective(len0)) != sdpa_2pass_blocks(effective(max_len)));
         let threads_per_row = 32 * gqa;
         let group_limit = usize::try_from(pass1.max_total_threads_per_threadgroup())
             .unwrap_or(threads_per_row)
@@ -1162,7 +1212,7 @@ impl FullAttentionMetalState {
             let chunk = rows_per_group.min(rows - start);
             let chunk_len0 = len0 + start;
             let row_offset = byte_offset(start * q_dim, GpuElement::F32, "attention rows offset")?;
-            if !two_pass_for(chunk_len0 + chunk - 1) {
+            if !two_pass_for(last_len(start, chunk)) {
                 let flash = flash.ok_or_else(|| {
                     InferError::Metal("attention rows: flash sur KV quantifié".to_string())
                 })?;
@@ -1191,7 +1241,7 @@ impl FullAttentionMetalState {
                 start += chunk;
                 continue;
             }
-            let blocks = sdpa_2pass_blocks(effective(chunk_len0 + chunk - 1));
+            let blocks = sdpa_2pass_blocks(effective(last_len(start, chunk)));
             let blocks_u32 = to_u32(blocks, "attention rows blocks")?;
             let reduce_cells = q_heads
                 .checked_mul(chunk)

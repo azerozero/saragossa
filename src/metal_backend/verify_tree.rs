@@ -123,3 +123,54 @@ pub(crate) fn install_verify_tree_scope(tree: Rc<VerifyTree>) -> VerifyTreeScope
 pub(crate) fn verify_tree() -> Option<Rc<VerifyTree>> {
     VERIFY_TREE.with(|slot| slot.borrow().clone())
 }
+
+thread_local! {
+    // Vrai pendant l'encodage d'une vérification greedy (argmax) : la politique
+    // d'exactitude de la requête, lue par le choix du préfixe NAX en lignes.
+    static VERIFY_GREEDY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Rétablit la politique précédente à la sortie du scope, panique comprise.
+pub(crate) struct VerifyGreedyScope(bool);
+
+impl Drop for VerifyGreedyScope {
+    fn drop(&mut self) {
+        VERIFY_GREEDY.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Marque les encodages en lignes de ce thread comme greedy (`true`) ou
+/// échantillonnés (`false`) jusqu'au drop du guard.
+pub(crate) fn install_verify_greedy_scope(greedy: bool) -> VerifyGreedyScope {
+    VerifyGreedyScope(VERIFY_GREEDY.with(|slot| slot.replace(greedy)))
+}
+
+/// Préfixe NAX en lignes autorisé pour l'encodage en cours : flag global, et
+/// pour une vérification greedy, `SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY`.
+pub(crate) fn verify_rows_nax_allowed() -> bool {
+    crate::runtime_flags::verify_rows_nax_enabled()
+        && (!VERIFY_GREEDY.with(std::cell::Cell::get)
+            || crate::runtime_flags::verify_rows_nax_greedy_enabled())
+}
+
+#[cfg(test)]
+mod greedy_scope_tests {
+    use super::*;
+
+    /// La portée greedy s'empile et se rétablit au drop.
+    #[test]
+    fn verify_greedy_scope_nests_and_restores() {
+        let greedy = || VERIFY_GREEDY.with(std::cell::Cell::get);
+        assert!(!greedy());
+        {
+            let _outer = install_verify_greedy_scope(true);
+            assert!(greedy());
+            {
+                let _inner = install_verify_greedy_scope(false);
+                assert!(!greedy());
+            }
+            assert!(greedy());
+        }
+        assert!(!greedy());
+    }
+}

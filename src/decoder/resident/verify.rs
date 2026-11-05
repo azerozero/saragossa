@@ -3,6 +3,53 @@ use super::types::*;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::decoder::ResidentVerifyHead;
 
+/// Vérification enregistrée par l'oracle O2 (tests seulement) : position de la
+/// première ligne, tokens d'entrée, parents de l'arbre éventuel, états finaux
+/// normés `[lignes, hidden]` et chemin réellement exécuté (`batched` : kernels
+/// en lignes ; faux pour le repli séquentiel, un pas mono par token).
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[derive(Clone, Debug)]
+pub(in crate::decoder) struct VerifyRecord {
+    pub(in crate::decoder) base_position: usize,
+    pub(in crate::decoder) tokens: Vec<usize>,
+    pub(in crate::decoder) parents: Option<Vec<u32>>,
+    pub(in crate::decoder) states: Vec<f32>,
+    pub(in crate::decoder) batched: bool,
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+thread_local! {
+    /// Enregistreur des vérifications résidentes : `Some` pendant un oracle O2.
+    pub(in crate::decoder) static VERIFY_RECORDER: std::cell::RefCell<Option<Vec<VerifyRecord>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(super) fn verify_recorder_active() -> bool {
+    VERIFY_RECORDER.with(|slot| slot.borrow().is_some())
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(super) fn record_verify(
+    base_position: usize,
+    tokens: &[usize],
+    tree: Option<&crate::metal_backend::VerifyTree>,
+    states: &[f32],
+    batched: bool,
+) {
+    VERIFY_RECORDER.with(|slot| {
+        if let Some(records) = slot.borrow_mut().as_mut() {
+            records.push(VerifyRecord {
+                base_position,
+                tokens: tokens.to_vec(),
+                parents: tree.map(|tree| tree.parents().to_vec()),
+                states: states.to_vec(),
+                batched,
+            });
+        }
+    });
+}
+
 impl CausalDecoder {
     /// Vérification MoE en lignes : la valeur explicite de
     /// `SARAGOSSA_RUST_MOE_VERIFY_ROWS`, sinon active dès qu'une tête MTP MoE est
@@ -212,6 +259,12 @@ impl CausalDecoder {
             let _tree_guard = tree
                 .clone()
                 .map(crate::metal_backend::install_verify_tree_scope);
+            // Politique d'exactitude de la requête : seule la tête argmax est greedy
+            // (logits et tirage GPU servent l'échantillonné).
+            let _greedy_guard = crate::metal_backend::install_verify_greedy_scope(matches!(
+                head,
+                ResidentVerifyHead::Argmax
+            ));
             let encoder = new_resident_compute_encoder(command_buffer);
             let mut owned: Vec<metal::Buffer> = Vec::new();
             let mut current = batch_a.tensor().buffer();
@@ -479,6 +532,8 @@ impl CausalDecoder {
                     Tensor::from_vec(vec![batch, target_capture_cols], values)
                 })
                 .transpose()?;
+            #[cfg(test)]
+            record_verify(base_position, token_ids, tree.as_deref(), &output, true);
             return Ok(Some(ResidentVerifyOutput {
                 states: Tensor::from_vec(vec![batch, hidden], output)?,
                 tokens,
@@ -680,11 +735,15 @@ impl CausalDecoder {
         };
         encoder.end_encoding();
         crate::metal_backend::commit_and_wait(command_buffer)?;
+        #[cfg(test)]
+        let base_position = *cache_position;
         *cache_position += token_ids.len();
         let output = crate::metal_backend::read_f32_buffer(
             final_states.tensor().buffer(),
             token_ids.len() * hidden,
         )?;
+        #[cfg(test)]
+        record_verify(base_position, token_ids, None, &output, false);
         let tokens = final_indices
             .as_ref()
             .map(|indices| {

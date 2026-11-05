@@ -113,6 +113,16 @@ pub(super) fn bf16_round_to_f32(value: f32) -> f32 {
     f32::from_bits(u32::from(f32_to_bf16_bits(value)) << 16)
 }
 
+/// Égalité de bits (zéros signés et NaN compris), longueurs vérifiées.
+fn assert_bits_rows(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len(), "longueurs");
+    let bad = actual
+        .iter()
+        .zip(expected)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    assert!(bad.is_none(), "bits divergents à l'index {bad:?}");
+}
+
 fn assert_close_eps(actual: &[f32], expected: &[f32], eps: f32) {
     assert_eq!(actual.len(), expected.len(), "longueurs différentes");
     let mut max_abs = 0.0_f32;
@@ -2763,9 +2773,9 @@ fn run_rows_fused_case(
     head_dim: usize,
     format: KvFormat,
     max_rows_per_group: Option<usize>,
+    rows: usize,
 ) -> Result<()> {
     use super::gpu_position::rope_dims_param;
-    const ROWS: usize = 3;
     let (eps, theta) = (1.0e-6_f32, 1.0e7_f32);
     let q_dim = POS_Q * head_dim;
     let kv_dim = POS_KV * head_dim;
@@ -2798,19 +2808,19 @@ fn run_rows_fused_case(
     )?;
     let q_raw = lease_with(
         state,
-        &(0..ROWS * q_dim)
+        &(0..rows * q_dim)
             .map(|i| pseudo(2000 + i))
             .collect::<Vec<_>>(),
     )?;
     let k_raw = lease_with(
         state,
-        &(0..ROWS * kv_dim)
+        &(0..rows * kv_dim)
             .map(|i| pseudo(2007 + i))
             .collect::<Vec<_>>(),
     )?;
     let v_raw = lease_with(
         state,
-        &(0..ROWS * kv_dim)
+        &(0..rows * kv_dim)
             .map(|i| pseudo(2013 + i))
             .collect::<Vec<_>>(),
     )?;
@@ -2820,7 +2830,7 @@ fn run_rows_fused_case(
     let k_roped = state.scratch().lease(kv_dim, GpuElement::F32)?;
     let scores = state.scratch().lease(POS_Q * capacity, GpuElement::F32)?;
     let mut ctx_loop = Vec::new();
-    for _ in 0..ROWS {
+    for _ in 0..rows {
         ctx_loop.push(state.scratch().lease(q_dim, GpuElement::F32)?);
     }
     let command_buffer = state.queue().new_command_buffer();
@@ -2870,9 +2880,9 @@ fn run_rows_fused_case(
 
     // Chemin en lignes : un dispatch par étape.
     let kernels = state.rows_kernels()?;
-    let q_rows = state.scratch().lease(ROWS * q_dim, GpuElement::F32)?;
-    let k_rows = state.scratch().lease(ROWS * kv_dim, GpuElement::F32)?;
-    let ctx_rows = state.scratch().lease(ROWS * q_dim, GpuElement::F32)?;
+    let q_rows = state.scratch().lease(rows * q_dim, GpuElement::F32)?;
+    let k_rows = state.scratch().lease(rows * kv_dim, GpuElement::F32)?;
+    let ctx_rows = state.scratch().lease(rows * q_dim, GpuElement::F32)?;
     let command_buffer = state.queue().new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     state.encode_rms_norm_rope_decode_rows(
@@ -2889,7 +2899,7 @@ fn run_rows_fused_case(
         POS_ROPE,
         POS_ROPE,
         prefix,
-        ROWS,
+        rows,
         eps,
         theta,
     )?;
@@ -2907,7 +2917,7 @@ fn run_rows_fused_case(
         POS_ROPE,
         POS_ROPE,
         prefix,
-        ROWS,
+        rows,
         eps,
         theta,
     )?;
@@ -2920,28 +2930,27 @@ fn run_rows_fused_case(
         v_raw.tensor().buffer(),
         0,
         kv_dim,
-        ROWS,
+        rows,
     )?;
     kv_fused.encode_attention_decode_rows_chunked(
         encoder,
         kernels,
         q_rows.tensor().buffer(),
         ctx_rows.tensor().buffer(),
-        ROWS,
+        rows,
         None,
         max_rows_per_group,
     )?;
     encoder.end_encoding();
     commit_and_wait(command_buffer)?;
 
-    assert_eq!(kv_fused.len(), prefix + ROWS, "len après append en lignes");
-    assert_eq!(kv_loop.len(), prefix + ROWS);
+    assert_eq!(kv_fused.len(), prefix + rows, "len après append en lignes");
+    assert_eq!(kv_loop.len(), prefix + rows);
     let fused_ctx = read_f32(ctx_rows.tensor());
     for (row, expected) in ctx_loop.iter().enumerate() {
-        assert_close_eps(
+        assert_bits_rows(
             &fused_ctx[row * q_dim..(row + 1) * q_dim],
             &read_f32(expected.tensor()),
-            0.0,
         );
     }
     if format.is_quantized() {
@@ -2951,7 +2960,7 @@ fn run_rows_fused_case(
         );
         return Ok(());
     }
-    let cells = (prefix + ROWS) * kv_dim;
+    let cells = (prefix + rows) * kv_dim;
     let read_kv = |tensor: &GpuTensor| {
         if format == KvFormat::Bf16 {
             read_bf16_as_f32(tensor)
@@ -2961,8 +2970,210 @@ fn run_rows_fused_case(
     };
     let (keys_fused, keys_loop) = (read_kv(kv_fused.keys()), read_kv(kv_loop.keys()));
     let (values_fused, values_loop) = (read_kv(kv_fused.values()), read_kv(kv_loop.values()));
-    assert_close_eps(&keys_fused[..cells], &keys_loop[..cells], 0.0);
-    assert_close_eps(&values_fused[..cells], &values_loop[..cells], 0.0);
+    assert_bits_rows(&keys_fused[..cells], &keys_loop[..cells]);
+    assert_bits_rows(&values_fused[..cells], &values_loop[..cells]);
+    Ok(())
+}
+
+/// Oracle O1 de l'attention full en lignes (RoPE q/k, append KV, flash ou
+/// 2-passes, hors préfixe NAX) : bits de la boucle par ligne pour R = 1..9,
+/// KV f32, bf16 et quantifiés, de part et d'autre du seuil 2-passes.
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn full_attn_rows_fused_matches_row_loop_all_rows() -> Result<()> {
+    full_attn_rows_fused_matches_row_loop_all_rows_body()
+}
+
+/// Poids affine u4 gs64 synthétique `[out_dim, in_dim]`, résolu sur `executor`.
+fn dense_layer_u4(
+    executor: &MetalExecutor,
+    out_dim: usize,
+    in_dim: usize,
+    seed: usize,
+    label: &'static str,
+) -> Result<crate::metal_backend::MetalLinearWeightBuffers> {
+    let groups = in_dim / 64;
+    let packed = (0..out_dim * in_dim / 8)
+        .map(|word| {
+            (0..8).fold(0_u32, |acc, lane| {
+                let q = ((word * 8 + lane).wrapping_mul(2_654_435_761) ^ seed) % 16;
+                acc | ((q as u32) << (lane * 4))
+            })
+        })
+        .collect();
+    let scales: Vec<f32> = (0..out_dim * groups)
+        .map(|i| bf16_round_to_f32(0.002 + 0.0001 * ((i + seed) % 17) as f32))
+        .collect();
+    let biases: Vec<f32> = scales.iter().map(|s| bf16_round_to_f32(-s * 7.5)).collect();
+    let weight = crate::AffineQuantizedTensor::new(
+        &[out_dim, in_dim / 8],
+        packed,
+        crate::Tensor::from_vec(vec![out_dim, groups], scales)?,
+        crate::Tensor::from_vec(vec![out_dim, groups], biases)?,
+        64,
+        4,
+    )?;
+    executor.resolve_linear_weight_buffers(&crate::LinearWeight::AffineQuantized(weight), label)
+}
+
+/// Oracle O1 d'une couche full-attn dense (27B : hidden 5120, 24/4 têtes de
+/// 256, gate de sortie, QKV concaténé) : la ligne `r` de
+/// `encode_full_attn_dense_layer_rows` (norme d'entrée, QKV, RoPE, append,
+/// attention, o_proj, queue dense) contre `encode_full_attn_dense_layer` pas
+/// par pas, en bits, R = 1..9, skinny coupé. Couvre la condition de miroir de
+/// la norme fusionnée au QKV dans `encode_full_attn_dense_layer_rows_impl`.
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn full_attn_dense_layer_rows_matches_mono_bits() -> Result<()> {
+    let state = try_state()?.ok_or_else(|| {
+        InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
+    })?;
+    let executor = MetalExecutor::new()?;
+    let (hidden, q_heads, kv_heads, head_dim, inter) =
+        (5120usize, 24usize, 4usize, 256usize, 1024usize);
+    let (q_dim, kv_dim) = (q_heads * head_dim, kv_heads * head_dim);
+    let qkv = dense_layer_u4(&executor, 2 * q_dim + 2 * kv_dim, hidden, 11, "dl_qkv")?;
+    assert!(
+        executor.full_attn_qkv_split_rms_applies(&qkv, hidden),
+        "le mono doit fusionner la norme au QKV pour que l'oracle couvre le miroir"
+    );
+    let o_proj = dense_layer_u4(&executor, hidden, q_dim, 12, "dl_o")?;
+    let gate_proj = dense_layer_u4(&executor, inter, hidden, 13, "dl_gate")?;
+    let up_proj = dense_layer_u4(&executor, inter, hidden, 14, "dl_up")?;
+    let down_proj = dense_layer_u4(&executor, hidden, inter, 15, "dl_down")?;
+    let norm = |seed: usize, len: usize| -> Vec<f32> {
+        (0..len).map(|i| 1.0 + 0.1 * pseudo(seed + i)).collect()
+    };
+    let (input_norm_data, post_norm_data) = (norm(100, hidden), norm(200, hidden));
+    let (q_norm_data, k_norm_data) = (norm(300, head_dim), norm(400, head_dim));
+    let input_norm = executor.cached_buffer_from_f32(&input_norm_data, "dl_input_norm")?;
+    let post_norm = executor.cached_buffer_from_f32(&post_norm_data, "dl_post_norm")?;
+    let q_norm = executor.cached_buffer_from_f32(&q_norm_data, "dl_q_norm")?;
+    let k_norm = executor.cached_buffer_from_f32(&k_norm_data, "dl_k_norm")?;
+    let tail_score_data = [1.0_f32];
+    let tail_score = executor.cached_buffer_from_f32(&tail_score_data, "dl_tail_score")?;
+    let weights = || FullAttnDenseLayerWeights {
+        input_norm: &input_norm,
+        qkv_proj: Some(&qkv),
+        qkv_proj_without_gate: false,
+        value_norm: false,
+        // Projections séparées inutilisées : le QKV concaténé les remplace.
+        q_proj: &qkv,
+        k_proj: &qkv,
+        v_proj: &qkv,
+        o_proj: &o_proj,
+        q_norm: &q_norm,
+        k_norm: &k_norm,
+        post_norm: &post_norm,
+        pre_feedforward_norm: None,
+        post_feedforward_norm: None,
+        layer_scalar: None,
+        gate_proj: &gate_proj,
+        up_proj: &up_proj,
+        down_proj: &down_proj,
+        tail_score: &tail_score,
+        parallel_moe: None,
+        sigmoid_moe: None,
+    };
+    let dims = |position: usize| FullAttnLayerDims {
+        hidden,
+        q_heads,
+        kv_heads,
+        head_dim,
+        attn_scalar: head_dim as f32,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        position,
+        window_start: 0,
+        eps: 1.0e-6,
+        theta: 1.0e7,
+        attn_output_gate: true,
+    };
+    let prefix = 40usize;
+    let keys: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 3)).collect();
+    let values: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 11)).collect();
+    let input: Vec<f32> = (0..9 * hidden).map(|i| 4.0 * pseudo(5000 + i)).collect();
+    crate::metal_backend::with_qmm_skinny_min_batch_override(usize::MAX, || -> Result<()> {
+        for rows in 1..=9 {
+            let mut kv_mono =
+                state.full_attention_f32_for_test(prefix + 16, q_heads, kv_heads, head_dim)?;
+            kv_mono.seed(&keys, &values, prefix)?;
+            let mut kv_rows =
+                state.full_attention_f32_for_test(prefix + 16, q_heads, kv_heads, head_dim)?;
+            kv_rows.seed(&keys, &values, prefix)?;
+            let mut mono = Vec::new();
+            for r in 0..rows {
+                let layer_in = lease_with(&state, &input[r * hidden..(r + 1) * hidden])?;
+                let layer_out = state.scratch().lease(hidden, GpuElement::F32)?;
+                let command_buffer = state.queue().new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                state.encode_full_attn_dense_layer(
+                    &executor,
+                    encoder,
+                    &mut Vec::new(),
+                    &mut kv_mono,
+                    weights(),
+                    dims(prefix + r),
+                    layer_in.tensor().buffer(),
+                    layer_out.tensor().buffer(),
+                )?;
+                encoder.end_encoding();
+                commit_and_wait(command_buffer)?;
+                mono.extend(read_f32(layer_out.tensor()));
+            }
+            let layer_in = lease_with(&state, &input[..rows * hidden])?;
+            let layer_out = state.scratch().lease(rows * hidden, GpuElement::F32)?;
+            let command_buffer = state.queue().new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            state.encode_full_attn_dense_layer_rows(
+                &executor,
+                encoder,
+                &mut Vec::new(),
+                &mut kv_rows,
+                weights(),
+                dims(prefix),
+                rows,
+                layer_in.tensor().buffer(),
+                layer_out.tensor().buffer(),
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command_buffer)?;
+            let got = read_f32(layer_out.tensor());
+            for r in 0..rows {
+                let bad = got[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(&mono[r * hidden..(r + 1) * hidden])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    bad, 0,
+                    "couche dense R={rows} ligne {r}: {bad}/{hidden} sorties ≠ mono"
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
+fn full_attn_rows_fused_matches_row_loop_all_rows_body() -> Result<()> {
+    let state = try_state()?.ok_or_else(|| {
+        InferError::Metal("aucun device Metal : test GPU non exécuté".to_string())
+    })?;
+    for rows in 1..=9 {
+        for head_dim in [128, 256] {
+            for format in [KvFormat::F32, KvFormat::Bf16, KvFormat::Q8] {
+                run_rows_fused_case(&state, 5, 16, head_dim, format, None, rows)?;
+                run_rows_fused_case(&state, 2050, 2064, head_dim, format, None, rows)?;
+            }
+        }
+        run_rows_fused_case(&state, 4221, 4232, 256, KvFormat::F32, None, rows)?;
+    }
+    // Contextes longs du greedy à KV bf16 (≥ 16k), hors préfixe NAX.
+    for rows in 2..=4 {
+        for prefix in [16390, 32819] {
+            run_rows_fused_case(&state, prefix, prefix + 8, 256, KvFormat::Bf16, None, rows)?;
+        }
+    }
     Ok(())
 }
 
@@ -2983,17 +3194,17 @@ fn full_attn_rows_fused_matches_row_loop() -> Result<()> {
         for format in formats {
             // Flash en lignes (len courte, 2-passes si quantifié), puis 2-passes en
             // lignes (len ≥ 2048) en un chunk et en chunks d'une ligne.
-            run_rows_fused_case(&state, 5, 16, head_dim, format, None)?;
-            run_rows_fused_case(&state, 2050, 2060, head_dim, format, None)?;
-            run_rows_fused_case(&state, 2050, 2060, head_dim, format, Some(1))?;
+            run_rows_fused_case(&state, 5, 16, head_dim, format, None, 3)?;
+            run_rows_fused_case(&state, 2050, 2060, head_dim, format, None, 3)?;
+            run_rows_fused_case(&state, 2050, 2060, head_dim, format, Some(1), 3)?;
         }
     }
     // Frontières de partition chevauchées par les 3 lignes : seuil flash/2-passes
     // (lignes 2047, 2048, 2049) et nombre de blocs split-K (4222 → 32, 4224 → 64).
-    run_rows_fused_case(&state, 2046, 2052, 128, KvFormat::F32, None)?;
-    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::F32, None)?;
-    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::Q4, None)?;
-    run_rows_fused_case(&state, 4221, 4226, 128, KvFormat::K8V4, None)?;
+    run_rows_fused_case(&state, 2046, 2052, 128, KvFormat::F32, None, 3)?;
+    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::F32, None, 3)?;
+    run_rows_fused_case(&state, 4221, 4226, 256, KvFormat::Q4, None, 3)?;
+    run_rows_fused_case(&state, 4221, 4226, 128, KvFormat::K8V4, None, 3)?;
     // Capacité insuffisante : erreur AVANT tout encodage, `len` inchangé.
     let kernels = state.rows_kernels()?;
     let mut kv = state.full_attention_f32_for_test(4, POS_Q, POS_KV, 128)?;

@@ -2839,15 +2839,35 @@ impl MetalExecutor {
             Some((norm_weight, eps)) => {
                 let normed_len = checked_len(rows, in_dim, "linear-attn rows normed")?;
                 let normed = self.private_f32_buffer(normed_len, "linear_attn_rows_normed")?;
-                self.encode_rms_norm_rows(
-                    encoder,
-                    input_buffer,
-                    norm_weight,
-                    &normed,
-                    rows,
-                    in_dim,
-                    eps,
-                )?;
+                // Le mono à projection concaténée fusionne la norme au prologue
+                // du matmul (réduction de `rms_norm_simd`, autre arbre que
+                // `rms_norm_rows`) : on normalise comme lui pour garder ses bits.
+                match weights
+                    .full
+                    .as_ref()
+                    .filter(|_| linear_full_concat_enabled())
+                {
+                    Some(full) => self.encode_rms_norm_rows_matching_solo(
+                        encoder,
+                        input_buffer,
+                        norm_weight,
+                        &normed,
+                        rows,
+                        in_dim,
+                        eps,
+                        &full.in_proj,
+                        false,
+                    )?,
+                    None => self.encode_rms_norm_rows(
+                        encoder,
+                        input_buffer,
+                        norm_weight,
+                        &normed,
+                        rows,
+                        in_dim,
+                        eps,
+                    )?,
+                }
                 Some(normed)
             }
             None => None,

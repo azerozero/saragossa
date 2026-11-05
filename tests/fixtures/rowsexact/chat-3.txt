@@ -1,0 +1,3 @@
+Request id: 0000000000000000
+
+Write a Python script that parses web server access logs and reports hourly statistics per status code, then explain it line by line.

@@ -291,7 +291,31 @@ pub(super) fn qmm_skinny_kernel() -> SkinnyKernel {
         .unwrap_or(SKINNY_PRECISE_DEFAULT)
 }
 
+#[cfg(test)]
+thread_local! {
+    static QMM_SKINNY_MIN_BATCH_TEST_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Force le seuil du skinny sur ce thread le temps de `run` (oracles : même lot
+/// en qmv répliqué, comparé en bits).
+#[cfg(test)]
+pub(crate) fn with_qmm_skinny_min_batch_override<R>(min: usize, run: impl FnOnce() -> R) -> R {
+    /// Rétablit le réglage précédent, panique comprise.
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QMM_SKINNY_MIN_BATCH_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(QMM_SKINNY_MIN_BATCH_TEST_OVERRIDE.with(|cell| cell.replace(Some(min))));
+    run()
+}
+
 pub(super) fn qmm_skinny_min_batch() -> usize {
+    #[cfg(test)]
+    if let Some(min) = QMM_SKINNY_MIN_BATCH_TEST_OVERRIDE.with(Cell::get) {
+        return min;
+    }
     static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| {
         crate::runtime_flags::env_var("SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH")

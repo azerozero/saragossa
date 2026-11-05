@@ -4915,3 +4915,361 @@ fn dflash_sampled_stops_match_ar_real_model() -> Result<()> {
     }
     Ok(())
 }
+
+/// Prompts du corpus figé (`tests/fixtures/rowsexact`) : liste de noms sans
+/// extension (`SARAGOSSA_RUST_IDENTITY_PROMPTS`, virgules), sinon les prompts
+/// courts (chat et code 4k ; le cas prose32k-1 se demande explicitement).
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn identity_corpus() -> Result<Vec<(String, String)>> {
+    let names =
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_IDENTITY_PROMPTS").unwrap_or_else(|| {
+            "chat-1,chat-2,chat-3,chat-4,chat-5,chat-6,code4k-1,code4k-2,code4k-3".to_string()
+        });
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rowsexact");
+    let manifest = std::fs::read_to_string(fixtures.join("MANIFEST.tsv"))
+        .map_err(|error| InferError::Config(format!("manifeste du corpus: {error}")))?;
+    let external =
+        crate::runtime_flags::env_var_os("SARAGOSSA_RUST_IDENTITY_EXTERNAL_DIR").map(PathBuf::from);
+    let mut corpus = Vec::new();
+    for name in names.split(',').map(str::trim) {
+        let file = format!("{name}.txt");
+        let expected = manifest
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split('\t');
+                (fields.next() == Some(file.as_str())).then(|| fields.nth(1))?
+            })
+            .ok_or_else(|| InferError::Config(format!("{file} absent du manifeste")))?;
+        // Versionné dans le dépôt, sinon (texte sous licence tierce) dossier externe.
+        let candidates = [
+            Some(fixtures.join(&file)),
+            external.as_ref().map(|dir| dir.join(&file)),
+        ];
+        let Some(path) = crate::test_support::require_real_model(
+            candidates.into_iter().flatten().find(|path| path.is_file()),
+            &format!("{file} (SARAGOSSA_RUST_IDENTITY_EXTERNAL_DIR)"),
+        ) else {
+            eprintln!(
+                "skip corpus {file}: hors dépôt, SARAGOSSA_RUST_IDENTITY_EXTERNAL_DIR absent"
+            );
+            continue;
+        };
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| InferError::Config(format!("corpus {}: {error}", path.display())))?;
+        let digest: String = <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if digest != expected {
+            return Err(InferError::Config(format!(
+                "{file}: sha256 {digest} ≠ manifeste {expected}"
+            )));
+        }
+        corpus.push((name.to_string(), text));
+    }
+    Ok(corpus)
+}
+
+/// Bilan d'un mode spéculatif contre l'AR sur un prompt.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[derive(Default, Debug)]
+struct IdentityTally {
+    /// Lignes vérifiées dont le chemin d'entrée est celui de l'AR.
+    compared_rows: usize,
+    /// Parmi elles, lignes d'un lot d'au moins deux lignes passé par les
+    /// kernels en lignes (le repli séquentiel, enregistré comme tel, est exclu).
+    multi_row_compared: usize,
+    /// Vérifications en arbre réellement branché (au moins un frère).
+    branched_records: usize,
+    /// Parmi elles, lignes dont l'état final diffère de l'AR en bits.
+    state_mismatches: usize,
+    /// Premier écart (position absolue, valeurs différentes, lignes du lot, ligne).
+    first_mismatch: Option<(usize, usize, usize, usize)>,
+    /// Premier token généré différent de l'AR.
+    first_token_divergence: Option<usize>,
+}
+
+/// Compare les vérifications enregistrées (`VERIFY_RECORDER`) aux états AR :
+/// une ligne n'est comparée que si toute sa chaîne d'ancêtres (chaîne ou
+/// arbre) porte les tokens de l'AR aux mêmes positions.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn identity_compare_records(
+    records: &[super::resident::VerifyRecord],
+    sequence: &[usize],
+    prompt_len: usize,
+    ar_states: &[Vec<f32>],
+    hidden: usize,
+    tally: &mut IdentityTally,
+) {
+    for record in records {
+        let rows = record.tokens.len();
+        let branched = record.parents.as_ref().is_some_and(|parents| {
+            parents
+                .iter()
+                .enumerate()
+                .skip(1)
+                .any(|(row, &p)| p as usize + 1 != row)
+        });
+        tally.branched_records += usize::from(branched);
+        let parent = |row: usize| -> Option<usize> {
+            if row == 0 {
+                return None;
+            }
+            Some(record.parents.as_ref().map_or(row - 1, |p| p[row] as usize))
+        };
+        let mut depths = vec![0usize; rows];
+        for row in 1..rows {
+            depths[row] = parent(row).map_or(0, |p| depths[p] + 1);
+        }
+        for row in 0..rows {
+            let mut node = Some(row);
+            let mut on_path = true;
+            while let Some(current) = node {
+                let position = record.base_position + depths[current];
+                if sequence.get(position) != Some(&record.tokens[current]) {
+                    on_path = false;
+                    break;
+                }
+                node = parent(current);
+            }
+            let position = record.base_position + depths[row];
+            let Some(reference) = position
+                .checked_sub(prompt_len)
+                .and_then(|i| ar_states.get(i))
+            else {
+                continue;
+            };
+            if !on_path {
+                continue;
+            }
+            let state = &record.states[row * hidden..(row + 1) * hidden];
+            let differing = state
+                .iter()
+                .zip(reference)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            tally.compared_rows += 1;
+            tally.multi_row_compared += usize::from(record.batched && rows >= 2);
+            if differing > 0 {
+                tally.state_mismatches += 1;
+                if tally.first_mismatch.is_none() {
+                    tally.first_mismatch = Some((position, differing, rows, row));
+                }
+            }
+        }
+    }
+}
+
+/// Oracles O2 et O3 de l'identité greedy sur modèle réel
+/// (`SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`), corpus figé du dépôt :
+/// - O3 : tokens de chaque mode spéculatif disponible (MTP si sidecar,
+///   lookup, DFlash chaîne et arbre B = 8 si `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`)
+///   identiques à l'AR, avec le compteur des quasi-égalités traversées (marge
+///   top-1/top-2 de la tête AR de production < 1e-2 et < 1e-3) ;
+/// - O2 : l'état final de chaque ligne vérifiée dont le chemin d'entrée est
+///   celui de l'AR égale en bits l'état AR à la même position, relevé depuis
+///   les entrées de production (captures linéaires comprises).
+///
+/// Budget : `SARAGOSSA_RUST_IDENTITY_TOKENS` (128 par défaut, au moins 200
+/// pour `prose32k-1`, dont l'écart historique tombe au token 182). Échoue si
+/// un mode n'est pas identique, si un mode n'a comparé aucune ligne issue d'un
+/// lot de plusieurs lignes sur tout le corpus, si l'arbre DFlash n'a jamais
+/// été branché, ou si tout le corpus est sauté. La promesse ne vaut que pour la
+/// configuration (flags, GPU) du lancement ; commandes et résultats attendus
+/// dans docs/perf/greedy-identity.md.
+#[test]
+#[ignore = "modèle réel requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn greedy_identity_states_real_model() -> Result<()> {
+    use crate::decoder::resident::dflash::DFlashTreeMode;
+    use crate::decoder::resident::VERIFY_RECORDER;
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    let max_new = crate::runtime_flags::env_var("SARAGOSSA_RUST_IDENTITY_TOKENS")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(128);
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    let has_mtp = match assets.mtp.path.as_ref() {
+        Some(path) => {
+            model = model.with_mtp_sidecar(path)?;
+            true
+        }
+        None => false,
+    };
+    let draft = if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_some() {
+        model = model.with_dflash_draft_from_env(&assets.config)?;
+        model.dflash_draft().cloned()
+    } else {
+        None
+    };
+    let options = mtp_verifier_options(Vec::new());
+    let hidden = model.final_norm.data().len();
+    let (mut ties_2, mut ties_3, mut tokens_seen) = (0usize, 0usize, 0usize);
+    let mut failures = Vec::new();
+    let mut coverage: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    let corpus = identity_corpus()?;
+    if corpus.is_empty() {
+        return Err(InferError::Config(
+            "corpus d'identité entièrement sauté".into(),
+        ));
+    }
+    for (name, text) in corpus {
+        let prompt = mtp_verifier_prompt_ids(&assets, &text)?;
+        let max_new = if name == "prose32k-1" {
+            max_new.max(200)
+        } else {
+            max_new
+        };
+        let ar = model.generate_greedy_cached_with_options(&prompt, max_new, &options)?;
+        let kv_bf16 = CausalDecoder::resident_kv_bf16(false, prompt.len());
+        // Marges de la tête de production : logits du decode résident forcé.
+        let logits = model.resident_forced_logits_for_test(&prompt, &ar, kv_bf16)?;
+        let mut min_margin = (f32::INFINITY, 0usize);
+        for (i, row) in logits.iter().enumerate().take(ar.len().saturating_sub(1)) {
+            let (top, margin) = top2(row);
+            assert_eq!(
+                top,
+                ar[i + 1],
+                "{name}: tête forcée ≠ AR au token {}",
+                i + 1
+            );
+            tokens_seen += 1;
+            ties_2 += usize::from(margin < 1e-2);
+            ties_3 += usize::from(margin < 1e-3);
+            if margin < min_margin.0 {
+                min_margin = (margin, i + 1);
+            }
+        }
+        // États AR : pas mono-ligne de production après le même prefill.
+        let mut cache = model.prefill_cache_state(&prompt)?.0;
+        if !model.setup_resident_full_decode(&mut cache, max_new + 16, 16, kv_bf16)? {
+            return Err(InferError::Config("setup résident refusé".to_string()));
+        }
+        let mut ar_states = Vec::with_capacity(ar.len());
+        for &token in &ar[..ar.len().saturating_sub(1)] {
+            let out = model
+                .next_final_states_resident_verify(
+                    &mut cache,
+                    &[token],
+                    ResidentVerifyHead::Argmax,
+                    false,
+                    None,
+                    None,
+                )?
+                .ok_or_else(|| InferError::Config("pas mono indisponible".into()))?;
+            ar_states.push(out.states.data().to_vec());
+        }
+        drop(cache);
+        let mut sequence = prompt.clone();
+        sequence.extend_from_slice(&ar);
+        let mut modes: Vec<&str> = vec!["lookup"];
+        if has_mtp {
+            modes.push("mtp");
+        }
+        if draft.is_some() {
+            modes.extend(["dflash-chaîne", "dflash-arbre"]);
+        }
+        // Sélection explicite (`SARAGOSSA_RUST_IDENTITY_MODES`, virgules) : un mode
+        // demandé mais indisponible (sidecar ou drafter absent) fait échouer.
+        if let Some(wanted) = crate::runtime_flags::env_var("SARAGOSSA_RUST_IDENTITY_MODES") {
+            let wanted: Vec<String> = wanted.split(',').map(|m| m.trim().to_string()).collect();
+            if let Some(missing) = wanted.iter().find(|m| !modes.contains(&m.as_str())) {
+                return Err(InferError::Config(format!(
+                    "mode d'identité {missing} indisponible"
+                )));
+            }
+            modes.retain(|mode| wanted.iter().any(|m| m == mode));
+        }
+        for mode in modes {
+            VERIFY_RECORDER.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+            let tokens = match mode {
+                "lookup" => crate::runtime_flags::with_lookup_greedy_override(8, || {
+                    model.generate_greedy_timed_with_options(&prompt, max_new, &options)
+                })
+                .map(|output| output.tokens),
+                "mtp" => model
+                    .generate_greedy_mtp_streaming_with_options(
+                        &prompt,
+                        max_new,
+                        &options,
+                        2,
+                        |_| true,
+                    )
+                    .map(|output| output.tokens),
+                _ => {
+                    let draft = draft
+                        .as_ref()
+                        .ok_or_else(|| InferError::Config("drafter".into()))?;
+                    let tree = if mode == "dflash-arbre" {
+                        DFlashTreeMode::BestFirst(8)
+                    } else {
+                        DFlashTreeMode::Off
+                    };
+                    model
+                        .generate_greedy_dflash_resident_tree(
+                            &prompt,
+                            max_new,
+                            &options,
+                            draft,
+                            draft.info.block_size,
+                            (tree, true),
+                            |_| true,
+                        )
+                        .map(|output| output.tokens)
+                }
+            };
+            let records = VERIFY_RECORDER
+                .with(|slot| slot.borrow_mut().take())
+                .unwrap_or_default();
+            let tokens = tokens?;
+            let mut tally = IdentityTally {
+                first_token_divergence: tokens
+                    .iter()
+                    .zip(&ar)
+                    .position(|(a, b)| a != b)
+                    .or((tokens.len() != ar.len()).then(|| tokens.len().min(ar.len()))),
+                ..IdentityTally::default()
+            };
+            identity_compare_records(
+                &records,
+                &sequence,
+                prompt.len(),
+                &ar_states,
+                hidden,
+                &mut tally,
+            );
+            eprintln!(
+                "identité {name} {mode}: {} vérifications, {tally:?}, marge AR min {:.6} au token {}",
+                records.len(),
+                min_margin.0,
+                min_margin.1
+            );
+            let seen = coverage.entry(mode).or_default();
+            seen.0 += tally.multi_row_compared;
+            seen.1 += tally.branched_records;
+            if tally.first_token_divergence.is_some() || tally.state_mismatches > 0 {
+                failures.push(format!("{name} {mode}: {tally:?}"));
+            }
+        }
+    }
+    eprintln!(
+        "identité : {tokens_seen} tokens AR, quasi-égalités traversées < 1e-2 : {ties_2}, < 1e-3 : {ties_3}, couverture {coverage:?}"
+    );
+    for (mode, (multi, branched)) in &coverage {
+        if *multi == 0 {
+            failures.push(format!(
+                "{mode}: aucune ligne d'un lot de plusieurs lignes comparée"
+            ));
+        }
+        if *mode == "dflash-arbre" && *branched == 0 {
+            failures.push(format!("{mode}: aucun arbre branché vérifié"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "identité greedy rompue : {failures:#?}"
+    );
+    Ok(())
+}

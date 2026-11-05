@@ -3234,6 +3234,10 @@ kernel void linear_attn_gated_delta_f32(
     uint lane [[thread_index_in_threadgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
@@ -3288,6 +3292,10 @@ kernel void linear_attn_gated_delta_dk128_tg4_f32(
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
@@ -3364,6 +3372,10 @@ kernel void linear_attn_gated_delta_seq_dk128_tg4_f32(
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
@@ -3481,6 +3493,10 @@ kernel void linear_attn_gated_delta_seq_capture_dk128_tg4_f32(
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
@@ -3634,6 +3650,10 @@ kernel void linear_attn_gated_delta_tree_journal_dk128_tg4_f32(
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
@@ -3760,6 +3780,10 @@ kernel void linear_attn_gated_delta_replay_dk128_tg4_f32(
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
@@ -3817,6 +3841,10 @@ kernel void linear_attn_gated_delta_seq_dk128_bf16_tg4_f32(
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
@@ -3915,6 +3943,10 @@ kernel void linear_attn_gated_delta_dk128_bf16_tg4_f32(
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
@@ -3990,6 +4022,10 @@ kernel void linear_attn_gated_delta_inv_dk128_tg4_f32(
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint key_head_dim = dims.z;
@@ -4075,6 +4111,10 @@ kernel void linear_attn_rms_gate_f32(
     uint lane [[thread_index_in_threadgroup]],
     uint value_head [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     if (value_head >= value_heads) {
@@ -4106,6 +4146,10 @@ kernel void linear_attn_rms_gate_dv128_f32(
     uint lane [[thread_index_in_threadgroup]],
     uint value_head [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     if (value_head >= value_heads || value_head_dim != 128u) {
@@ -4153,6 +4197,10 @@ kernel void linear_attn_rms_gate_batch_dv128_f32(
     uint lane [[thread_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]]
 ) {
+    // NOTE: contraction FMA coupée : mono et variantes en lignes ou en arbre
+    // rendent les mêmes bits (rows_exact.rs). En fast-math, le compilateur
+    // contracte différemment le même source selon le kernel.
+    #pragma METAL fp contract(off)
     const uint value_heads = dims.x;
     const uint value_head_dim = dims.y;
     const uint batch = dims.z;

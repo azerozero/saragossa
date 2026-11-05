@@ -84,6 +84,8 @@ pub(crate) use self::nax_rows::{NaxRowsAttention, NaxRowsBuffers, NaxRowsDispatc
 mod pipelines;
 mod prefill;
 #[cfg(test)]
+pub(crate) use self::eligibility::with_qmm_skinny_min_batch_override;
+#[cfg(test)]
 pub(crate) use self::flags::qmm_na_u4_x3_dispatches_for_test;
 #[cfg(test)]
 pub(crate) use self::flags::with_flint_moe_coop_override;
@@ -152,7 +154,10 @@ pub use self::profiling::{
 };
 pub(crate) use self::profiling::{profile_dispatch, profile_dispatch_shape, trace_dispatch_path};
 pub(crate) use self::scratch::install_scratch_namespace;
-pub(crate) use self::verify_tree::{install_verify_tree_scope, verify_tree, VerifyTree};
+pub(crate) use self::verify_tree::{
+    install_verify_greedy_scope, install_verify_tree_scope, verify_rows_nax_allowed, verify_tree,
+    VerifyTree,
+};
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,

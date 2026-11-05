@@ -1069,6 +1069,20 @@ pub(crate) fn verify_rows_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_ROWS_NAX", true))
 }
 
+/// Préfixe NAX en lignes pour les vérifications **greedy**
+/// (`SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY`, défaut ON, comportement
+/// inchangé). Coupé, une vérification greedy (tête argmax, cycles MTP
+/// fusionnés) garde le 2-passes en lignes, bit-identique au pas mono-ligne,
+/// tandis que l'échantillonné garde le NAX. La politique est posée par
+/// requête (portée `install_verify_greedy_scope` à l'encodage), pas par
+/// variable d'environnement. Coût attendu d'après les mesures du 1er nov.
+/// ci-dessus : DFlash greedy −18 à −36 % à partir de 32k, MTP −1 à −7 %.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn verify_rows_nax_greedy_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY", true))
+}
+
 /// Contexte minimal du préfixe NAX en lignes
 /// (`SARAGOSSA_RUST_VERIFY_ROWS_NAX_MIN_LEN`, défaut 16384, le seuil greedy
 /// bf16) : MTP échantillonné à 4k (KV bf16 dès le prompt court, même binaire,
