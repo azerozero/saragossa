@@ -23,6 +23,8 @@ pub struct LayerOutput {
     pub hidden: Tensor,
     /// Experts routés par token (ensembles triés).
     pub routing: Vec<Vec<usize>>,
+    /// Écart de probabilité au seuil du top-k du routeur, par token.
+    pub routing_margins: Vec<f32>,
     /// Trace QSA (couches d'attention seulement).
     pub qsa: Option<QsaTrace>,
 }
@@ -220,7 +222,7 @@ impl Qwen4ExpReference {
         ple(h, &embeddings, &w, c.hc_count, c.hidden, c.rms_eps)
     }
 
-    fn moe_block(&self, prefix: &str, x: &Tensor) -> Result<(Tensor, Vec<Vec<usize>>)> {
+    fn moe_block(&self, prefix: &str, x: &Tensor) -> Result<super::moe::MoeOutput> {
         let c = &self.ckpt.config;
         let m = format!("{prefix}mlp.");
         let w = MoeWeights {
@@ -247,7 +249,7 @@ impl Qwen4ExpReference {
                 self.ckpt.expert(&format!("{m}switch_mlp.down_proj"), e)?,
             ))
         })?;
-        Ok((out.output, out.routing))
+        Ok(out)
     }
 
     /// Une couche complète sur `h` (`[T, hc·hidden]`), poids lus puis libérés.
@@ -297,13 +299,14 @@ impl Qwen4ExpReference {
         let h = combine(&h, &branch, &inject, c.hc_count)?;
         let mlp_hc = self.residual(&format!("{prefix}mlp_hyper_connection."), true)?;
         let mixed = mlp_hc.mix(&h, c.hc_count, c.hidden, c.rms_eps)?;
-        let (branch, routing) = self.moe_block(&prefix, &mixed.input)?;
+        let moe_out = self.moe_block(&prefix, &mixed.input)?;
         let inject = mixed
             .inject
             .ok_or_else(|| InferError::Config("hyper-connection sans injection".to_string()))?;
         Ok(LayerOutput {
-            hidden: combine(&h, &branch, &inject, c.hc_count)?,
-            routing,
+            hidden: combine(&h, &moe_out.output, &inject, c.hc_count)?,
+            routing: moe_out.routing,
+            routing_margins: moe_out.margins,
             qsa: selected,
         })
     }
@@ -317,6 +320,20 @@ impl Qwen4ExpReference {
         let c = &self.ckpt.config;
         let mixer = self.residual(&Qwen4ExpCheckpoint::trunk("hyper_connection_mixer."), false)?;
         Ok(mixer.mix(h, c.hc_count, c.hidden, c.rms_eps)?.input)
+    }
+
+    /// Forward complet sans cache : embedding, couches, mixer final, logits.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de lecture ou de forme.
+    pub fn forward_logits(&self, ids: &[usize]) -> Result<Tensor> {
+        let mut h = self.embed(ids)?;
+        for index in 0..self.ckpt.config.layer_kinds.len() {
+            h = self.layer(index, &h, ids)?.hidden;
+        }
+        let final_hidden = self.final_mixer(&h)?;
+        self.logits(&final_hidden)
     }
 
     /// Logits `[T, vocab]`, lm_head déquantifié par blocs de lignes.

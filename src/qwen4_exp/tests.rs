@@ -40,6 +40,8 @@ const FIXTURE_SHA256: &[(&str, &str)] = &[
 
 /// Tolérance par couche (norme relative), cible initiale du plan.
 const LAYER_TOL: f64 = 1.0e-4;
+/// Garde-fou de la dérive chaînée N2 (mesurée, non gatée : bascules de routage).
+const CHAINED_GUARD: f64 = 1.0e-2;
 /// Porte KL(oracle‖rust) sur les logits, moyenne et maximum par token.
 const KL_TOL: f64 = 1.0e-3;
 
@@ -58,10 +60,16 @@ impl Golden {
             .tensors
             .get(name)
             .unwrap_or_else(|| panic!("golden sans {name}"));
-        let bytes = std::fs::read(&self.path).expect("invariant: golden");
-        let start = header.data_start as usize + entry.data_offsets[0];
-        let end = header.data_start as usize + entry.data_offsets[1];
-        (entry.shape.clone(), bytes[start..end].to_vec())
+        // Lecture de la seule plage du tenseur (goldens N2 de plusieurs Go).
+        let file = std::fs::File::open(&self.path).expect("invariant: golden");
+        let mut bytes = vec![0_u8; entry.data_offsets[1] - entry.data_offsets[0]];
+        std::os::unix::fs::FileExt::read_exact_at(
+            &file,
+            &mut bytes,
+            header.data_start + entry.data_offsets[0] as u64,
+        )
+        .expect("invariant: lecture golden");
+        (entry.shape.clone(), bytes)
     }
 
     fn f32(&self, name: &str) -> Tensor {
@@ -365,4 +373,193 @@ fn qsa_selection_size_tail_and_excludable_current_block() {
         excluded_current,
         "le bloc complet courant doit pouvoir être exclu sur cette fixture"
     );
+}
+
+/// N2 : référence Rust contre les couches officielles transformers sur les vrais
+/// poids q4e8 v2. Ignoré par défaut : `SARAGOSSA_QWEN4EXP_DIR` (sortie
+/// convertie) et `SARAGOSSA_QWEN4EXP_GOLDEN` (goldens de `oracle_dump.py`).
+fn n2_paths() -> (PathBuf, PathBuf) {
+    let dir = std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("SARAGOSSA_QWEN4EXP_DIR requis"));
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("SARAGOSSA_QWEN4EXP_GOLDEN requis"));
+    (dir, golden)
+}
+
+/// Erreur relative sur les `rows` premières lignes (préfixe causal), hors
+/// lignes `skip` (tokens à quasi-égalité de routage, listés à part).
+fn prefix_error(a: &Tensor, b: &Tensor, rows: usize, skip: &[usize]) -> f64 {
+    let width = a.as_matrix().expect("invariant: 2D").1;
+    let keep = |data: &[f32]| -> Vec<f32> {
+        (0..rows)
+            .filter(|t| !skip.contains(t))
+            .flat_map(|t| data[t * width..(t + 1) * width].iter().copied())
+            .collect()
+    };
+    relative_error(&keep(a.data()), &keep(b.data())).0
+}
+
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
+    let (dir, golden_dir) = n2_paths();
+    let reference =
+        Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
+    let golden = Golden {
+        path: golden_dir.join("layers.safetensors"),
+    };
+    let ids: Vec<usize> = golden
+        .i64("input_ids")
+        .iter()
+        .map(|&t| t as usize)
+        .collect();
+    let tokens = ids.len();
+    let k = reference.checkpoint().config.top_k;
+    let embed = reference.embed(&ids).expect("invariant: embedding");
+    let mut torch_input = embed.clone();
+    let mut chained = embed;
+    for layer in 0..4 {
+        let started = std::time::Instant::now();
+        let own = reference
+            .layer(layer, &torch_input, &ids)
+            .expect("invariant: couche");
+        let torch_routing = golden.i64(&format!("routing.{layer}"));
+        let mut near_ties = Vec::new();
+        for (t, picks) in own.routing.iter().enumerate() {
+            let mut expected: Vec<usize> = torch_routing[t * k..(t + 1) * k]
+                .iter()
+                .map(|&e| e as usize)
+                .collect();
+            expected.sort_unstable();
+            if picks != &expected {
+                assert!(
+                    own.routing_margins[t] < 1.0e-5,
+                    "routage couche {layer} token {t}: marge {}",
+                    own.routing_margins[t]
+                );
+                near_ties.push(t);
+            }
+        }
+        let forced = own.qsa.as_ref().map(|trace| {
+            let torch = torch_selection(&golden, layer);
+            let ties = check_selection_modulo_ties(layer, trace, &torch, reference.budget_blocks());
+            for (i, sel) in trace.selected.iter().enumerate() {
+                let visible = i + 1;
+                let expected = 4 * (visible / 4).min(reference.budget_blocks()) + visible % 4;
+                assert_eq!(sel.len(), expected, "taille QSA requête {i}");
+            }
+            for v in 2047..=2052 {
+                eprintln!(
+                    "frontière V={v}: {} tokens retenus, identique à torch: {}",
+                    trace.selected[v - 1].len(),
+                    trace.selected[v - 1] == torch[v - 1]
+                );
+            }
+            eprintln!("couche {layer}: {ties} requêtes QSA à ex æquo");
+            torch
+        });
+        let local = match &forced {
+            Some(sel) => reference
+                .layer_with_selection(layer, &torch_input, &ids, Some(sel))
+                .expect("invariant: couche imposée"),
+            None => own,
+        };
+        let chained_out = reference
+            .layer_with_selection(layer, &chained, &ids, forced.as_deref())
+            .expect("invariant: couche chaînée");
+        // Dérive cumulée : un écart d'entrée infime peut basculer un routage
+        // quasi égal ; ces tokens sont comptés et la dérive est mesurée, pas gatée.
+        let flipped: Vec<usize> = chained_out
+            .routing
+            .iter()
+            .enumerate()
+            .filter(|(t, picks)| {
+                let mut expected: Vec<usize> = torch_routing[t * k..(t + 1) * k]
+                    .iter()
+                    .map(|&e| e as usize)
+                    .collect();
+                expected.sort_unstable();
+                *picks != &expected
+            })
+            .map(|(t, _)| t)
+            .collect();
+        eprintln!(
+            "couche {layer}: chemin chaîné, {} tokens au routage basculé {:?}",
+            flipped.len(),
+            &flipped[..flipped.len().min(8)]
+        );
+        chained = chained_out.hidden;
+        let oracle = golden.f32(&format!("layer.{layer}"));
+        for rows in [64, 2047, 2052, 3000, tokens] {
+            let local_err = prefix_error(&local.hidden, &oracle, rows, &near_ties);
+            eprintln!(
+                "couche {layer} préfixe {rows}: locale {local_err:.3e} (hors quasi-égalités), \
+                 locale brute {:.3e}, chaînée {:.3e}",
+                prefix_error(&local.hidden, &oracle, rows, &[]),
+                prefix_error(&chained, &oracle, rows, &[])
+            );
+            assert!(
+                local_err <= LAYER_TOL,
+                "couche {layer} préfixe {rows}: {local_err:.3e} > {LAYER_TOL:.0e}"
+            );
+        }
+        eprintln!(
+            "couche {layer}: routage quasi-égal {near_ties:?}, {:.0} s",
+            started.elapsed().as_secs_f64()
+        );
+        assert_close(
+            &format!("couche {layer} (locale)"),
+            &local.hidden,
+            &oracle,
+            LAYER_TOL,
+        );
+        // Dérive chaînée : garde-fou large seulement (mesurée à part, cf. plan).
+        assert_close(
+            &format!("couche {layer} (chaînée)"),
+            &chained,
+            &oracle,
+            CHAINED_GUARD,
+        );
+        torch_input = oracle;
+    }
+}
+
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn n2_full_model_logits_match_transformers() {
+    let (dir, golden_dir) = n2_paths();
+    let reference =
+        Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
+    let golden = Golden {
+        path: golden_dir.join("full.safetensors"),
+    };
+    for prompt in 0..4 {
+        let ids: Vec<usize> = golden
+            .i64(&format!("prompt.{prompt}.ids"))
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+        let logits = reference.forward_logits(&ids).expect("invariant: forward");
+        let oracle = golden.f32(&format!("prompt.{prompt}.logits"));
+        let (mean, worst) = kl_per_token(&oracle, &logits);
+        let (rel, _) = relative_error(logits.data(), oracle.data());
+        eprintln!(
+            "prompt {prompt} ({} tokens): KL moyen {mean:.3e}, max {worst:.3e}, rel {rel:.3e}",
+            ids.len()
+        );
+        assert!(
+            mean <= KL_TOL && worst <= KL_TOL,
+            "prompt {prompt}: KL {mean:.3e}/{worst:.3e}"
+        );
+        let vocab = logits.as_matrix().expect("invariant: 2D").1;
+        for t in 0..ids.len() {
+            assert_eq!(
+                argmax(&logits.data()[t * vocab..(t + 1) * vocab]),
+                argmax(&oracle.data()[t * vocab..(t + 1) * vocab]),
+                "prompt {prompt} top-1 token {t}"
+            );
+        }
+    }
 }
