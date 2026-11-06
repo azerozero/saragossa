@@ -913,6 +913,38 @@ impl FullAttentionMetalState {
     ///
     /// Renvoie une erreur si `len` dépasse la capacité allouée ou descend
     /// sous le préfixe adopté ou la base.
+    /// Buffers K/V f32 dense sans base (gather de la QSA creuse Flash-Next) :
+    /// la ligne `r` commence à l'élément `r · kv_heads · head_dim`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le KV n'est pas f32, a une base, ou est segmenté.
+    pub(super) fn dense_f32_buffers(&self) -> Result<(&BufferRef, &BufferRef)> {
+        if self.format != KvFormat::F32 || self.base != 0 || self.adopted.is_some() {
+            return Err(InferError::Config(
+                "KV attendu f32 dense sans base pour le gather".to_string(),
+            ));
+        }
+        Ok((self.keys.buffer(), self.values.buffer()))
+    }
+
+    /// Fixe la longueur valide d'un KV f32 rempli hors `append` (lignes copiées
+    /// par un gather dans le même command buffer).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `len` dépasse la capacité ou si le KV n'est pas f32.
+    pub(super) fn set_gathered_len(&mut self, len: usize) -> Result<()> {
+        if self.format != KvFormat::F32 || self.base != 0 || len > self.capacity {
+            return Err(InferError::Dimension(format!(
+                "KV de gather : longueur {len} sur {} lignes",
+                self.capacity
+            )));
+        }
+        self.len = len;
+        Ok(())
+    }
+
     pub(crate) fn truncate(&mut self, len: usize) -> Result<()> {
         let stored = self.stored_row(len, "truncate KV")?;
         if stored > self.capacity || stored < self.floor {

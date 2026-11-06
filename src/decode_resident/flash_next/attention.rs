@@ -1,8 +1,15 @@
-//! Attention QSA résidente de Flash-Next, régime dense (V ≤ 2051).
+//! Attention QSA résidente de Flash-Next.
 //!
 //! Jusqu'à `budget + compress − 1 = 2051` tokens visibles, l'indexeur retient
-//! tous les blocs complets plus la queue : la sélection QSA est l'attention
-//! causale dense. Au-delà, la session refuse le decode (spike QSA séparé).
+//! tous les blocs complets plus la queue : la sélection est l'attention causale
+//! dense sur le KV. Au-delà (régime creux), l'indexeur score les blocs complets,
+//! retient les `budget / compress` meilleurs (top-512, radix exact) et les lignes
+//! K/V retenues sont copiées dans un KV compact (≤ 2051 lignes, 8 Mo) sur lequel
+//! tourne l'attention existante : en decode, une seule requête, la copie est
+//! bornée (la matérialisation par requête n'explose qu'au prefill).
+//!
+//! Le cache de clés poolées de l'indexeur est alimenté dès le régime dense : un
+//! bloc est poolé au token qui le complète, avant les scores de ce token.
 //!
 //! Primitives réutilisées sans l'orchestrateur Qwen : pas d'`input_norm`
 //! (l'entrée sort déjà de l'hyper-connection), normes q/k chargées avec leur
@@ -11,6 +18,10 @@
 
 use metal::{Buffer, BufferRef, ComputeCommandEncoderRef};
 
+use metal::MTLSize;
+
+use super::kernels::FlashNextKernels;
+use super::set_value;
 use crate::decode_resident::{DecodeResidentState, FullAttentionMetalState};
 use crate::metal_backend::{post_dispatch_barrier, MetalExecutor, MetalLinearWeightBuffers};
 use crate::{InferError, Result};
@@ -31,6 +42,56 @@ pub(crate) struct QsaLayerWeights {
     /// Gains `1 + w` de `q_norm` / `k_norm` (`[head_dim]`).
     pub(crate) q_norm: Buffer,
     pub(crate) k_norm: Buffer,
+    /// Indexeur (absent des oracles du seul régime dense).
+    pub(crate) indexer: Option<IndexerWeights>,
+}
+
+/// Poids GPU de l'indexeur d'une couche QSA.
+pub(crate) struct IndexerWeights {
+    /// `[(têtes + 1)·d_idx, hidden]` : requêtes puis clé brute.
+    pub(crate) qk_proj: MetalLinearWeightBuffers,
+    /// Gains `1 + w` de `q_layernorm` / `k_layernorm` (`[d_idx]`).
+    pub(crate) q_norm: Buffer,
+    pub(crate) k_norm: Buffer,
+    /// Fréquences inverses de la RoPE partielle (`[rotary_dim / 2]`), calculées
+    /// comme la référence CPU.
+    pub(crate) freqs: Buffer,
+}
+
+/// Dimensions de l'indexeur.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IndexerDims {
+    pub(crate) heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) compress: usize,
+    /// Blocs retenus en régime creux (`budget / compress` = 512).
+    pub(crate) keep: usize,
+}
+
+/// État de l'indexeur d'une couche : clés poolées des blocs complets et clés
+/// brutes du bloc en cours (ligne `position mod compress`).
+pub(crate) struct IndexerState {
+    pub(crate) pooled: Buffer,
+    pub(crate) raw: Buffer,
+}
+
+/// Intermédiaires de l'indexeur, partagés entre couches.
+pub(crate) struct IndexerScratch {
+    pub(crate) qk: Buffer,
+    pub(crate) q: Buffer,
+    pub(crate) scores: Buffer,
+    /// `[keep]` u32, blocs retenus triés.
+    pub(crate) selected: Buffer,
+}
+
+/// Régime creux d'une couche : indexeur et KV compact du gather.
+pub(crate) struct QsaSparse<'a> {
+    pub(crate) kernels: &'a FlashNextKernels,
+    pub(crate) weights: &'a IndexerWeights,
+    pub(crate) state: &'a IndexerState,
+    pub(crate) scratch: &'a IndexerScratch,
+    pub(crate) gathered: &'a mut FullAttentionMetalState,
+    pub(crate) dims: IndexerDims,
 }
 
 /// Dimensions de l'attention.
@@ -69,12 +130,12 @@ pub(crate) struct QsaScratch {
 }
 
 /// Encode l'attention du token à `position` : `x [hidden]` → `out [hidden]`,
-/// en ajoutant son K/V au cache.
+/// en ajoutant son K/V au cache. Sans `sparse`, seul le régime dense est admis.
 #[expect(
     clippy::too_many_arguments,
     reason = "encodage Metal : arène, exécuteur, cache, poids, scratch et buffers explicites"
 )]
-pub(crate) fn encode_qsa_dense(
+pub(crate) fn encode_qsa(
     arena: &DecodeResidentState,
     executor: &MetalExecutor,
     encoder: &ComputeCommandEncoderRef,
@@ -82,14 +143,15 @@ pub(crate) fn encode_qsa_dense(
     weights: &QsaLayerWeights,
     scratch: &QsaScratch,
     dims: QsaDecodeDims,
+    sparse: Option<QsaSparse<'_>>,
     position: usize,
     x: &BufferRef,
     out: &BufferRef,
 ) -> Result<()> {
-    if position >= dims.dense_max {
+    if sparse.is_none() && position >= dims.dense_max {
         return Err(InferError::Config(format!(
             "Flash-Next résident : position {position}, sélection QSA creuse au-delà de \
-             {} tokens visibles (non prise en charge)",
+             {} tokens visibles sans indexeur",
             dims.dense_max
         )));
     }
@@ -99,6 +161,17 @@ pub(crate) fn encode_qsa_dense(
         (&weights.v_proj, &scratch.v),
     ] {
         executor.encode_matmul_weight_buffers(encoder, x, 1, dims.hidden, weight, target, true)?;
+    }
+    if let Some(sparse) = &sparse {
+        executor.encode_matmul_weight_buffers(
+            encoder,
+            x,
+            1,
+            dims.hidden,
+            &sparse.weights.qk_proj,
+            &sparse.scratch.qk,
+            true,
+        )?;
     }
     post_dispatch_barrier(encoder);
     arena.encode_split_q_gate(
@@ -138,13 +211,26 @@ pub(crate) fn encode_qsa_dense(
         )?;
     }
     kv.encode_append_kv(encoder, &scratch.k_roped, &scratch.v)?;
-    kv.encode_attention_decode_windowed(
-        encoder,
-        &scratch.q_roped,
-        &scratch.scores,
-        &scratch.ctx,
-        0,
-    )?;
+    let attended = match sparse {
+        Some(sparse) => encode_indexer(arena, executor, encoder, kv, sparse, dims, position)?,
+        None => None,
+    };
+    match attended {
+        Some(gathered) => gathered.encode_attention_decode_windowed(
+            encoder,
+            &scratch.q_roped,
+            &scratch.scores,
+            &scratch.ctx,
+            0,
+        )?,
+        None => kv.encode_attention_decode_windowed(
+            encoder,
+            &scratch.q_roped,
+            &scratch.scores,
+            &scratch.ctx,
+            0,
+        )?,
+    }
     arena.encode_attn_gate(
         encoder,
         &scratch.ctx,
@@ -163,4 +249,131 @@ pub(crate) fn encode_qsa_dense(
     )?;
     post_dispatch_barrier(encoder);
     Ok(())
+}
+
+/// Indexeur du token à `position` : range sa clé brute, poole le bloc qu'il
+/// complète, puis, en régime creux, score les blocs complets, retient les
+/// `keep` meilleurs et copie les lignes K/V retenues dans le KV compact, qu'il
+/// renvoie. `None` en régime dense (attention sur tout le KV).
+fn encode_indexer<'a>(
+    arena: &DecodeResidentState,
+    executor: &MetalExecutor,
+    encoder: &ComputeCommandEncoderRef,
+    kv: &FullAttentionMetalState,
+    sparse: QsaSparse<'a>,
+    dims: QsaDecodeDims,
+    position: usize,
+) -> Result<Option<&'a mut FullAttentionMetalState>> {
+    let QsaSparse {
+        kernels,
+        weights,
+        state,
+        scratch,
+        gathered,
+        dims: idx,
+    } = sparse;
+    let d = idx.head_dim;
+    let f32_size = std::mem::size_of::<f32>() as u64;
+    // Clé brute → ligne `position mod compress` du bloc en cours.
+    executor.encode_copy_with_offsets(
+        encoder,
+        &scratch.qk,
+        (idx.heads * d) as u64 * f32_size,
+        &state.raw,
+        ((position % idx.compress) * d) as u64 * f32_size,
+        d,
+    )?;
+    post_dispatch_barrier(encoder);
+    if position % idx.compress == idx.compress - 1 {
+        let block = position / idx.compress;
+        encoder.set_compute_pipeline_state(&kernels.index_pool);
+        encoder.set_buffer(0, Some(&state.raw), 0);
+        encoder.set_buffer(1, Some(&weights.k_norm), 0);
+        encoder.set_buffer(2, Some(&weights.freqs), 0);
+        encoder.set_buffer(3, Some(&state.pooled), 0);
+        set_value(
+            encoder,
+            4,
+            &[
+                d as u32,
+                idx.compress as u32,
+                block as u32,
+                (dims.rotary_dim / 2) as u32,
+            ],
+        );
+        set_value(encoder, 5, &dims.eps);
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(d as u64, 1, 1));
+        post_dispatch_barrier(encoder);
+    }
+    let visible = position + 1;
+    let complete = visible / idx.compress;
+    if complete <= idx.keep {
+        return Ok(None);
+    }
+    // Requêtes de l'indexeur : `q_layernorm` puis RoPE à la position du token.
+    arena.encode_rms_norm_rope_decode(
+        encoder,
+        &scratch.qk,
+        &weights.q_norm,
+        &scratch.q,
+        idx.heads,
+        d,
+        dims.rotary_dim,
+        dims.rotary_dim,
+        position,
+        dims.eps,
+        dims.theta,
+    )?;
+    encoder.set_compute_pipeline_state(&kernels.index_scores);
+    encoder.set_buffer(0, Some(&scratch.q), 0);
+    encoder.set_buffer(1, Some(&state.pooled), 0);
+    encoder.set_buffer(2, Some(&scratch.scores), 0);
+    set_value(
+        encoder,
+        3,
+        &[idx.heads as u32, d as u32, complete as u32, 0],
+    );
+    crate::metal_backend::profile_dispatch();
+    encoder.dispatch_thread_groups(
+        MTLSize::new(complete.div_ceil(8) as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    post_dispatch_barrier(encoder);
+    encoder.set_compute_pipeline_state(&kernels.index_topk);
+    encoder.set_buffer(0, Some(&scratch.scores), 0);
+    encoder.set_buffer(1, Some(&scratch.selected), 0);
+    set_value(encoder, 2, &[complete as u32, idx.keep as u32]);
+    crate::metal_backend::profile_dispatch();
+    encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
+    post_dispatch_barrier(encoder);
+    let count = idx.keep * idx.compress + (visible - complete * idx.compress);
+    let kv_dim = dims.kv_heads * dims.head_dim;
+    let (keys, values) = kv.dense_f32_buffers()?;
+    let (gathered_keys, gathered_values) = gathered.dense_f32_buffers()?;
+    encoder.set_compute_pipeline_state(&kernels.gather_kv);
+    encoder.set_buffer(0, Some(keys), 0);
+    encoder.set_buffer(1, Some(values), 0);
+    encoder.set_buffer(2, Some(&scratch.selected), 0);
+    encoder.set_buffer(3, Some(gathered_keys), 0);
+    encoder.set_buffer(4, Some(gathered_values), 0);
+    set_value(
+        encoder,
+        5,
+        &[
+            kv_dim as u32,
+            idx.keep as u32,
+            complete as u32,
+            visible as u32,
+        ],
+    );
+    set_value(encoder, 6, &(idx.compress as u32));
+    crate::metal_backend::profile_dispatch();
+    encoder.dispatch_threads(
+        MTLSize::new(kv_dim as u64, count as u64, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    post_dispatch_barrier(encoder);
+    gathered.set_gathered_len(count)?;
+    Ok(Some(gathered))
 }

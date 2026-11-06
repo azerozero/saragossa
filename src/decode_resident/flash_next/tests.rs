@@ -2,9 +2,7 @@
 
 use metal::{Buffer, MTLResourceOptions};
 
-use super::attention::{
-    dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaLayerWeights, QsaScratch,
-};
+use super::attention::{dense_max_visible, encode_qsa, QsaDecodeDims, QsaLayerWeights, QsaScratch};
 use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch, HcWeights};
 use super::kernels::FlashNextKernels;
 use super::ple::{encode_ple, PleScratch, PleState, PleWeights};
@@ -369,6 +367,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         o_proj: o_gpu,
         q_norm: buffer(&executor, &one_plus(&q_norm)),
         k_norm: buffer(&executor, &one_plus(&k_norm)),
+        indexer: None,
     };
     let capacity = tokens.max(64);
     let scratch = QsaScratch {
@@ -390,8 +389,8 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         let out = zeros(&executor, dims.hidden);
         let command_buffer = queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        encode_qsa_dense(
-            &arena, &executor, encoder, &mut kv, &weights, &scratch, dims, t, &x_buf, &out,
+        encode_qsa(
+            &arena, &executor, encoder, &mut kv, &weights, &scratch, dims, None, t, &x_buf, &out,
         )?;
         encoder.end_encoding();
         commit_and_wait(command_buffer)?;
@@ -403,7 +402,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     let x_buf = zeros(&executor, dims.hidden);
-    let refused = encode_qsa_dense(
+    let refused = encode_qsa(
         &arena,
         &executor,
         encoder,
@@ -411,6 +410,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         &weights,
         &scratch,
         dims,
+        None,
         dims.dense_max,
         &x_buf,
         &x_buf,
@@ -1475,5 +1475,281 @@ fn hc_inject_partials_cover_widths_not_divisible_by_chunks() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Top-512 de l'indexeur (radix exact) : à scores identiques, mêmes blocs que
+/// `select_for_query`, égalités comprises — aléatoire, tous nuls, −0,0 et +0,0
+/// mêlés, égalités massives au seuil, 511 / 512 / 513 / 8192 / 65 536 blocs.
+#[test]
+fn flash_next_index_topk_matches_cpu_selection() -> Result<()> {
+    use crate::qwen4_exp::attention::{select_for_query, QsaDims};
+    let Some(executor) = executor()? else {
+        return Ok(());
+    };
+    let kernels = FlashNextKernels::new(executor.device())?;
+    let d = QsaDims {
+        heads: 24,
+        kv_heads: 2,
+        head_dim: 256,
+        rotary_dim: 64,
+        rope_theta: 1.0e7,
+        index_heads: 4,
+        index_head_dim: 128,
+        budget: 2048,
+        compress: 4,
+        eps: 1.0e-6,
+    };
+    let keep = 512;
+    let mut rng = DeterministicF32::new(0x70_9512);
+    let mut cases: Vec<Vec<f32>> = Vec::new();
+    for count in [513_usize, 8192, 65_536] {
+        cases.push(rng.fill(count, 0.0, 3.0));
+    }
+    cases.push(vec![0.0; 2000]);
+    cases.push(
+        (0..2000)
+            .map(|i| if i % 3 == 0 { -0.0 } else { 0.0 })
+            .collect(),
+    );
+    let mut ties = rng.fill(4000, 0.0, 1.0);
+    for i in (0..4000).step_by(5) {
+        ties[i] = 0.75;
+    }
+    cases.push(ties);
+    let mut quantized: Vec<f32> = rng
+        .fill(6000, 0.0, 1.0)
+        .iter()
+        .map(|v| (v * 8.0).floor() / 8.0)
+        .collect();
+    quantized[17] = 0.0;
+    cases.push(quantized);
+    let queue = executor.device().new_command_queue();
+    for (case, scores) in cases.iter().enumerate() {
+        let count = scores.len();
+        let selected = executor.device().new_buffer(
+            (keep * 4) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&kernels.index_topk);
+        encoder.set_buffer(0, Some(&buffer(&executor, scores)), 0);
+        encoder.set_buffer(1, Some(&selected), 0);
+        super::set_value(encoder, 2, &[count as u32, keep as u32]);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(1, 1, 1),
+            metal::MTLSize::new(1024, 1, 1),
+        );
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        let got: Vec<usize> = crate::metal_backend::read_u32_buffer(&selected, keep)?
+            .into_iter()
+            .map(|b| b as usize)
+            .collect();
+        // Blocs retenus par le CPU (tokens triés → blocs), avec `+ 0.0` comme `query_block_scores`.
+        let normalized: Vec<f32> = scores.iter().map(|s| s + 0.0).collect();
+        let tokens = select_for_query(&normalized, count * 4, d);
+        let want: Vec<usize> = tokens.chunks_exact(4).map(|c| c[0] / 4).collect();
+        assert_eq!(got, want, "cas {case} ({count} blocs)");
+    }
+    Ok(())
+}
+
+/// Couche QSA résidente en régime creux, pas à pas contre `qsa` CPU sur 200
+/// tokens avec un budget réduit (16 blocs de 4 : creux dès 68 tokens visibles)
+/// et un indexeur aux formes réelles (4 têtes × 128, RoPE 64). Sorties à 1e-5 ;
+/// une sélection GPU différente n'est admise que si chaque bloc échangé a un
+/// score CPU à 1e-5 près du score du dernier bloc retenu (quasi-égalité).
+#[test]
+fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
+    use super::attention::{IndexerDims, IndexerScratch, IndexerState, IndexerWeights, QsaSparse};
+    use crate::decode_resident::{DecodeResidentState, KvFormat};
+    use crate::qwen4_exp::attention::{
+        block_scores, qsa, select_from_scores, QsaDims, QsaWeights as CpuQsa,
+    };
+    use crate::qwen4_exp::math::inv_freq;
+    let Some(executor) = executor()? else {
+        return Ok(());
+    };
+    let arena = DecodeResidentState::new(executor.device().clone())?;
+    let kernels = FlashNextKernels::new(executor.device())?;
+    let (budget, compress, tokens) = (64_usize, 4_usize, oracle_steps(200));
+    let dims = QsaDecodeDims {
+        hidden: 512,
+        heads: 4,
+        kv_heads: 2,
+        head_dim: 128,
+        rotary_dim: 64,
+        theta: 1.0e7,
+        eps: 1.0e-6,
+        dense_max: dense_max_visible(budget, compress),
+    };
+    let (q_dim, kv_dim, ihd, iheads) = (4 * 128, 2 * 128, 128, 4);
+    let mut rng = DeterministicF32::new(0x5a_9e5e);
+    let (q_gpu, q_w) = u8_weight(&executor, &mut rng, 2 * q_dim, dims.hidden, 0.06)?;
+    let (k_gpu, k_w) = u8_weight(&executor, &mut rng, kv_dim, dims.hidden, 0.06)?;
+    let (v_gpu, v_w) = u8_weight(&executor, &mut rng, kv_dim, dims.hidden, 0.06)?;
+    let (o_gpu, o_w) = u8_weight(&executor, &mut rng, dims.hidden, q_dim, 0.04)?;
+    let (iqk_gpu, iqk_w) = u8_weight(&executor, &mut rng, (iheads + 1) * ihd, dims.hidden, 0.06)?;
+    let norms: Vec<Vec<f32>> = (0..4).map(|_| rng.fill(128, -0.3, 0.3)).collect();
+    let x = rng.fill(tokens * dims.hidden, -1.0, 1.0);
+    let cpu_w = CpuQsa {
+        q_proj: q_w,
+        k_proj: k_w,
+        v_proj: v_w,
+        o_proj: o_w,
+        q_norm: norms[0].clone(),
+        k_norm: norms[1].clone(),
+        index_qk: iqk_w,
+        index_q_norm: norms[2].clone(),
+        index_k_norm: norms[3].clone(),
+    };
+    let cpu_dims = QsaDims {
+        heads: 4,
+        kv_heads: 2,
+        head_dim: 128,
+        rotary_dim: 64,
+        rope_theta: 1.0e7,
+        index_heads: iheads,
+        index_head_dim: ihd,
+        budget,
+        compress,
+        eps: 1.0e-6,
+    };
+    let input = Tensor::from_vec(vec![tokens, dims.hidden], x.clone())?;
+    let expected = qsa(&input, &cpu_w, cpu_dims, None)?.output;
+    let freqs = inv_freq(64, 1.0e7);
+    let cpu_scores = block_scores(&input, &cpu_w, cpu_dims, &freqs)?;
+    let cpu_selected = select_from_scores(&cpu_scores, cpu_dims);
+
+    let one_plus = |w: &[f32]| -> Vec<f32> { w.iter().map(|v| 1.0 + v).collect() };
+    let weights = QsaLayerWeights {
+        q_proj: q_gpu,
+        k_proj: k_gpu,
+        v_proj: v_gpu,
+        o_proj: o_gpu,
+        q_norm: buffer(&executor, &one_plus(&norms[0])),
+        k_norm: buffer(&executor, &one_plus(&norms[1])),
+        indexer: Some(IndexerWeights {
+            qk_proj: iqk_gpu,
+            q_norm: buffer(&executor, &one_plus(&norms[2])),
+            k_norm: buffer(&executor, &one_plus(&norms[3])),
+            freqs: buffer(&executor, &freqs),
+        }),
+    };
+    let scratch = QsaScratch {
+        q_gate: zeros(&executor, 2 * q_dim),
+        q_raw: zeros(&executor, q_dim),
+        gate: zeros(&executor, q_dim),
+        q_roped: zeros(&executor, q_dim),
+        k_raw: zeros(&executor, kv_dim),
+        k_roped: zeros(&executor, kv_dim),
+        v: zeros(&executor, kv_dim),
+        scores: zeros(&executor, 4 * tokens),
+        ctx: zeros(&executor, q_dim),
+        gated: zeros(&executor, q_dim),
+    };
+    let state = IndexerState {
+        pooled: zeros(&executor, (tokens / compress + 1) * ihd),
+        raw: zeros(&executor, compress * ihd),
+    };
+    let keep = budget / compress;
+    let indexer_scratch = IndexerScratch {
+        qk: zeros(&executor, (iheads + 1) * ihd),
+        q: zeros(&executor, iheads * ihd),
+        scores: zeros(&executor, tokens / compress + 1),
+        selected: executor.device().new_buffer(
+            (keep * 4) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        ),
+    };
+    let mut kv = arena.full_attention_with_format(tokens, 4, 2, 128, KvFormat::F32, None)?;
+    let mut gathered =
+        arena.full_attention_with_format(dims.dense_max, 4, 2, 128, KvFormat::F32, None)?;
+    let queue = executor.device().new_command_queue();
+    let (mut sparse_steps, mut justified) = (0, 0);
+    for t in 0..tokens {
+        let x_buf = buffer(&executor, &x[t * dims.hidden..(t + 1) * dims.hidden]);
+        let out = zeros(&executor, dims.hidden);
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_qsa(
+            &arena,
+            &executor,
+            encoder,
+            &mut kv,
+            &weights,
+            &scratch,
+            dims,
+            Some(QsaSparse {
+                kernels: &kernels,
+                weights: weights.indexer.as_ref().expect("invariant: indexeur"),
+                state: &state,
+                scratch: &indexer_scratch,
+                gathered: &mut gathered,
+                dims: IndexerDims {
+                    heads: iheads,
+                    head_dim: ihd,
+                    compress,
+                    keep,
+                },
+            }),
+            t,
+            &x_buf,
+            &out,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        let complete = (t + 1) / compress;
+        if complete > keep {
+            sparse_steps += 1;
+            let got: Vec<usize> =
+                crate::metal_backend::read_u32_buffer(&indexer_scratch.selected, keep)?
+                    .into_iter()
+                    .map(|b| b as usize)
+                    .collect();
+            let want: Vec<usize> = cpu_selected[t][..keep * compress]
+                .chunks_exact(compress)
+                .map(|c| c[0] / compress)
+                .collect();
+            // Scores GPU de l'indexeur contre le CPU (mêmes entrées à 1e-5 près).
+            let gpu_scores = read_f32_buffer(&indexer_scratch.scores, complete)?;
+            let (score_err, _) = relative_error(&gpu_scores, &cpu_scores[t]);
+            assert!(score_err <= 1.0e-5, "scores pas {t} : {score_err}");
+            if got != want {
+                let row = &cpu_scores[t];
+                let threshold = want.iter().map(|&b| row[b]).fold(f32::INFINITY, f32::min);
+                for b in got
+                    .iter()
+                    .filter(|b| !want.contains(b))
+                    .chain(want.iter().filter(|b| !got.contains(b)))
+                {
+                    assert!(
+                        (row[*b] - threshold).abs() <= 1.0e-5 * threshold.abs().max(1.0),
+                        "pas {t} : bloc {b} échangé hors quasi-égalité ({} contre {threshold})",
+                        row[*b]
+                    );
+                }
+                justified += 1;
+                continue;
+            }
+        }
+        let got = read_f32_buffer(&out, dims.hidden)?;
+        let want = &expected.data()[t * dims.hidden..(t + 1) * dims.hidden];
+        let (err, max) = relative_error(&got, want);
+        assert!(err <= 1.0e-5, "QSA pas {t} : {err} (max {max})");
+    }
+    eprintln!(
+        "régime creux : {sparse_steps} pas, {justified} sélections justifiées par quasi-égalité"
+    );
+    assert!(
+        sparse_steps > 100,
+        "régime creux trop court : {sparse_steps}"
+    );
+    assert!(
+        justified * 10 <= sparse_steps,
+        "trop de quasi-égalités : {justified}"
+    );
     Ok(())
 }

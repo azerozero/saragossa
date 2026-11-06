@@ -12,11 +12,15 @@ empreintes des fichiers ouverts avant l'inférence.
   --layers : une séquence de 8000 tokens (couches 0-3) ; ses préfixes couvrent
              les longueurs 64, 2047-2052 et 3000 (tout est causal).
   --full   : logits du modèle complet sur quatre prompts courts.
+  --long   : modèle complet sur 4096 tokens (QSA creuse au-delà de 2051) :
+             routages, scores et masques de l'indexeur, logits à une position sur 16
+             et aux 64 dernières.
 
 Usage :
   python -I tools/flashnext/oracle_dump.py --selftest
   python -I tools/flashnext/oracle_dump.py --layers <q4e8> <tokenizer.json> <texte> <sortie>
   python -I tools/flashnext/oracle_dump.py --full   <q4e8> <tokenizer.json> <sortie>
+  python -I tools/flashnext/oracle_dump.py --long   <q4e8> <tokenizer.json> <texte> <sortie>
 """
 
 import hashlib
@@ -293,6 +297,72 @@ def run_full(qdir, tokenizer, out):
     publish(out, "full.safetensors", tmp, source, {"prompts": PROMPTS})
 
 
+# Positions dont `--long` fige les logits : une sur 16, plus les 64 dernières (les
+# logits complets pèseraient 4 Go à 4096 tokens).
+LONG_TOKENS = 4096
+
+
+def long_positions(n):
+    return sorted(set(range(0, n, 16)) | set(range(max(0, n - 64), n)))
+
+
+def run_long(qdir, tokenizer, text, out):
+    """Modèle complet sur les 4096 premiers tokens du texte : routages et logits de
+    routeur de chaque couche, masque et scores de l'indexeur des couches QSA
+    (sélection creuse au-delà de 2051 tokens), logits finaux aux positions de
+    `long_positions`."""
+    source = source_entry(qdir)
+    check_compatible(out, "long.safetensors", source)
+    tc = C.text_config(qdir)
+    weights = C.QWeights(qdir)
+    ids_list = Tokenizer.from_file(tokenizer).encode(Path(text).read_text()).ids[:LONG_TOKENS]
+    assert len(ids_list) == LONG_TOKENS, len(ids_list)
+    ids = torch.tensor([ids_list])
+    n = ids.shape[1]
+    pos, mask = C.rope(tc, n), C.causal_mask(n)
+    h = C.embed(tc, weights, ids)
+    tensors = {"input_ids": ("I64", (n,), np.array(ids_list, dtype=np.int64).tobytes())}
+    started = time.time()
+    for index in range(tc.num_hidden_layers):
+        layer = C.build_layer(tc, index, weights)
+        cap = {}
+        layer.mlp.gate.register_forward_hook(
+            lambda _m, _i, o: cap.update(logits=o[0].clone(), ids=o[2].clone()))
+        if layer.layer_type != "linear_attention":
+            layer.self_attn.indexer.register_forward_hook(lambda _m, _i, o: cap.update(mask=o.clone()))
+        with C.TopkCapture() as topk:
+            h = layer(h, position_embeddings=pos, attention_mask=mask, conv_mask=None,
+                      past_key_values=None, ple_input_ids=ids)
+        r = cap["ids"].to(torch.int64)
+        tensors[f"routing.{index}"] = ("I64", tuple(r.shape), r.numpy().tobytes())
+        lg = cap["logits"].float()
+        tensors[f"router_logits.{index}"] = ("F32", tuple(lg.shape), lg.numpy().tobytes())
+        if "mask" in cap:
+            m = cap["mask"][0, 0].to(torch.uint8)
+            tensors[f"qsa_mask.{index}"] = ("U8", tuple(m.shape), m.numpy().tobytes())
+            compress = tc.indexer_compress_ratio
+            it = iter(topk.indexer)
+            rows = [next(it) if (i + 1) // compress > 0 else torch.zeros(0) for i in range(n)]
+            assert next(it, None) is None, "scores d'indexeur en surnombre"
+            flat, offsets = C.flatten_scores(rows)
+            tensors[f"qsa_scores.{index}"] = ("F32", flat.shape, flat.tobytes())
+            tensors[f"qsa_offsets.{index}"] = ("I64", offsets.shape, offsets.tobytes())
+        del layer
+        print(f"couche {index}: {time.time() - started:.0f} s, pic RSS {C.footprint_gb():.1f} Go", flush=True)
+    mixer = C.M.Qwen4ExpTextGatedResidual(tc, use_combine=False)
+    mixer.load_state_dict({k: weights.dense(f"model.language_model.hyper_connection_mixer.{k}")
+                           for k in mixer.state_dict()})
+    head = weights.dense("lm_head.weight")
+    keep = torch.tensor(long_positions(n))
+    logits = mixer(h)[0][keep] @ head.T
+    tensors["logit_positions"] = ("I64", tuple(keep.shape), keep.numpy().astype(np.int64).tobytes())
+    tensors["logits"] = ("F32", tuple(logits.shape), logits.float().numpy().tobytes())
+    tmp = out / "long.safetensors.tmp"
+    C.write_safetensors(tmp, tensors, {"tokens": n})
+    publish(out, "long.safetensors", tmp, source,
+            {"tokens": n, "text": str(text), "text_sha256": sha256(text), "logit_positions": "16k + 64 dernières"})
+
+
 def main():
     torch.set_num_threads(os.cpu_count() or 8)
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -304,6 +374,11 @@ def main():
         out = Path(out)
         out.mkdir(parents=True, exist_ok=True)
         run_layers(qdir, tokenizer, text, out)
+    elif mode == "--long":
+        _, _, qdir, tokenizer, text, out = sys.argv
+        out = Path(out)
+        out.mkdir(parents=True, exist_ok=True)
+        run_long(qdir, tokenizer, text, out)
     elif mode == "--full":
         _, _, qdir, tokenizer, out = sys.argv
         out = Path(out)

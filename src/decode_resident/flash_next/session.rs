@@ -9,7 +9,10 @@
 
 use metal::{Buffer, CommandQueue, MTLResourceOptions};
 
-use super::attention::{dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaScratch};
+use super::attention::{
+    dense_max_visible, encode_qsa, IndexerDims, IndexerScratch, IndexerState, QsaDecodeDims,
+    QsaScratch, QsaSparse,
+};
 use super::encoders::{Brick, Encoders};
 use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch};
 use super::kernels::FlashNextKernels;
@@ -27,8 +30,12 @@ use crate::{InferError, MemoryGuard, Result};
 /// État récurrent ou cache KV d'une couche.
 enum LayerState {
     Linear(LinearAttentionMetalState),
-    Full(Box<FullAttentionMetalState>),
+    /// KV de la couche QSA et état de son indexeur.
+    Full(Box<(FullAttentionMetalState, IndexerState)>),
 }
+
+/// Capacité maximale d'une session : 256k tokens (contexte cible, plan §8.1).
+pub(crate) const MAX_CAPACITY: usize = 262_144;
 
 /// Sorties d'un pas.
 #[cfg_attr(
@@ -80,6 +87,10 @@ pub(crate) struct FlashNextSession {
     hc_scratch: HcScratch,
     ple_scratch: PleScratch,
     qsa_scratch: QsaScratch,
+    /// KV compact du gather (régime creux), partagé entre couches QSA.
+    gathered: FullAttentionMetalState,
+    indexer_scratch: IndexerScratch,
+    indexer_dims: IndexerDims,
     hc_dims: HcDims,
     qsa_dims: QsaDecodeDims,
     linear_spec: LinearAttentionStepSpec,
@@ -135,6 +146,7 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
         .count();
     let linear = c.layer_kinds.len() - full;
     let kv = full * capacity * 2 * c.kv_heads * c.head_dim;
+    let dense = dense_max_visible(c.indexer_budget, c.indexer_compress);
     let conv_dim =
         2 * c.linear_key_heads * c.linear_key_dim + c.linear_value_heads * c.linear_value_dim;
     let value_dim = c.linear_value_heads * c.linear_value_dim;
@@ -151,12 +163,20 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
         + c.layer_kinds.len() * width // capture des résiduels
         + 2 * width + c.hc_lowrank * (1 + super::hc::DOWN_CHUNKS) + c.hc_count * super::hc::INJECT_CHUNKS // scratch hc
         + c.ple_dim + 5 * width + c.hidden // scratch PLE
-        + 6 * q_dim + 3 * kv_dim + c.heads * capacity; // scratch QSA
+        + 6 * q_dim + 3 * kv_dim + c.heads * dense; // scratch QSA
+                                                    // Indexeur : clés poolées et bloc en cours par couche QSA, KV compact du
+                                                    // gather (`dense` lignes), scratch (qk, q, scores, sélection).
+    let blocks = capacity / c.indexer_compress + 1;
+    let indexer = full * (blocks + c.indexer_compress) * c.indexer_head_dim
+        + 2 * dense * kv_dim
+        + (2 * c.indexer_heads + 1) * c.indexer_head_dim
+        + blocks
+        + c.indexer_budget / c.indexer_compress;
     let executor = 4 * conv_dim + 6 * value_dim + 4 * c.linear_value_heads // DeltaNet
         + 2 * c.experts + 2 * c.top_k * (3 * c.moe_inter + c.hidden) // MoE routé
         + 3 * c.shared_inter + 2 * c.hidden // expert partagé
         + c.vocab; // argmax du lm_head
-    ((kv + deltanet + ple + session + executor) * f32_bytes) as u64
+    ((kv + deltanet + ple + session + executor + indexer) * f32_bytes) as u64
 }
 
 /// Refuse, avant toute allocation, les variantes que le chemin résident ne
@@ -234,9 +254,9 @@ impl FlashNextSession {
         guard: Option<&MemoryGuard>,
     ) -> Result<Self> {
         let dense_max = validate_resident_config(&ckpt.config)?;
-        if capacity == 0 || capacity > dense_max {
+        if capacity == 0 || capacity > MAX_CAPACITY {
             return Err(InferError::Config(format!(
-                "Flash-Next résident : capacité {capacity} hors ]0, {dense_max}]"
+                "Flash-Next résident : capacité {capacity} hors ]0, {MAX_CAPACITY}]"
             )));
         }
         let executor = MetalExecutor::new()?;
@@ -284,6 +304,15 @@ impl FlashNextSession {
         };
         let width = hc_dims.width();
         let (q_dim, kv_dim) = (c.heads * c.head_dim, c.kv_heads * c.head_dim);
+        // KV compact du régime creux : `keep·compress` lignes retenues + la queue.
+        let gathered = arena.full_attention_with_format(
+            dense_max,
+            c.heads,
+            c.kv_heads,
+            c.head_dim,
+            crate::decode_resident::KvFormat::F32,
+            None,
+        )?;
         let mut session = Self {
             arena,
             kernels,
@@ -330,9 +359,25 @@ impl FlashNextSession {
                 k_raw: zeros(&executor, kv_dim),
                 k_roped: zeros(&executor, kv_dim),
                 v: zeros(&executor, kv_dim),
-                scores: zeros(&executor, c.heads * capacity),
+                scores: zeros(&executor, c.heads * dense_max),
                 ctx: zeros(&executor, q_dim),
                 gated: zeros(&executor, q_dim),
+            },
+            gathered,
+            indexer_scratch: IndexerScratch {
+                qk: zeros(&executor, (c.indexer_heads + 1) * c.indexer_head_dim),
+                q: zeros(&executor, c.indexer_heads * c.indexer_head_dim),
+                scores: zeros(&executor, capacity / c.indexer_compress + 1),
+                selected: executor.device().new_buffer(
+                    ((c.indexer_budget / c.indexer_compress) * std::mem::size_of::<u32>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+            },
+            indexer_dims: IndexerDims {
+                heads: c.indexer_heads,
+                head_dim: c.indexer_head_dim,
+                compress: c.indexer_compress,
+                keep: c.indexer_budget / c.indexer_compress,
             },
             hc_dims,
             qsa_dims,
@@ -413,7 +458,14 @@ impl FlashNextSession {
                         crate::decode_resident::KvFormat::F32,
                         None,
                     )?;
-                    Ok(LayerState::Full(Box::new(kv)))
+                    let indexer = IndexerState {
+                        pooled: zeros(
+                            &self.executor,
+                            (capacity / c.indexer_compress + 1) * c.indexer_head_dim,
+                        ),
+                        raw: zeros(&self.executor, c.indexer_compress * c.indexer_head_dim),
+                    };
+                    Ok(LayerState::Full(Box::new((kv, indexer))))
                 }
             })
             .collect()
@@ -456,6 +508,10 @@ impl FlashNextSession {
             &self.qsa_scratch.gated,
             &self.ple_state.bytes,
             &self.ple_state.ring,
+            &self.indexer_scratch.qk,
+            &self.indexer_scratch.q,
+            &self.indexer_scratch.scores,
+            &self.indexer_scratch.selected,
         ]
         .iter()
         .map(|b| b.length())
@@ -465,9 +521,11 @@ impl FlashNextSession {
             .iter()
             .map(|state| match state {
                 LayerState::Linear(state) => MetalExecutor::linear_attn_state_bytes(state),
-                LayerState::Full(kv) => {
-                    (kv.capacity() * 2 * c.kv_heads * c.head_dim * std::mem::size_of::<f32>())
+                LayerState::Full(full) => {
+                    (full.0.capacity() * 2 * c.kv_heads * c.head_dim * std::mem::size_of::<f32>())
                         as u64
+                        + full.1.pooled.length()
+                        + full.1.raw.length()
                 }
             })
             .sum();
@@ -477,7 +535,10 @@ impl FlashNextSession {
             .flatten()
             .map(MetalExecutor::linear_attn_state_bytes)
             .sum();
-        own + states + snapshots
+        let gathered =
+            (self.gathered.capacity() * 2 * c.kv_heads * c.head_dim * std::mem::size_of::<f32>())
+                as u64;
+        own + states + snapshots + gathered
     }
 
     /// Octets alloués sur le device Metal de la session (oracles).
@@ -529,7 +590,7 @@ impl FlashNextSession {
                 (LayerState::Linear(state), Some(initial)) => {
                     self.executor.restore_linear_attn_state(state, initial)?;
                 }
-                (LayerState::Full(kv), None) => kv.truncate(0)?,
+                (LayerState::Full(full), None) => full.0.truncate(0)?,
                 _ => {
                     return Err(InferError::Config(
                         "reset Flash-Next : états et instantanés désalignés".to_string(),
@@ -605,7 +666,7 @@ impl FlashNextSession {
             .states
             .iter()
             .map(|state| match state {
-                LayerState::Full(kv) => Some(kv.len()),
+                LayerState::Full(full) => Some(full.0.len()),
                 LayerState::Linear(_) => None,
             })
             .collect();
@@ -638,7 +699,7 @@ impl FlashNextSession {
             self.ple_state.step = ple_step;
             for (state, len) in self.states.iter_mut().zip(kv_lens) {
                 if let (LayerState::Full(kv), Some(len)) = (state, len) {
-                    if kv.truncate(len).is_err() {
+                    if kv.0.truncate(len).is_err() {
                         self.poisoned = true;
                     }
                 }
@@ -756,9 +817,13 @@ impl FlashNextSession {
                         self.linear_dims,
                     )?;
                 }
-                (MixerWeights::Full(w), LayerState::Full(kv)) => {
+                (MixerWeights::Full(w), LayerState::Full(full)) => {
                     let encoder = encoders.at(Brick::Qsa)?;
-                    encode_qsa_dense(
+                    let (kv, indexer_state) = &mut **full;
+                    let indexer = w.indexer.as_ref().ok_or_else(|| {
+                        InferError::Config(format!("couche {index} : indexeur QSA absent"))
+                    })?;
+                    encode_qsa(
                         &self.arena,
                         &self.executor,
                         encoder,
@@ -766,6 +831,14 @@ impl FlashNextSession {
                         w,
                         &self.qsa_scratch,
                         self.qsa_dims,
+                        Some(QsaSparse {
+                            kernels: &self.kernels,
+                            weights: indexer,
+                            state: indexer_state,
+                            scratch: &self.indexer_scratch,
+                            gathered: &mut self.gathered,
+                            dims: self.indexer_dims,
+                        }),
                         self.position,
                         &self.x,
                         &self.branch,
