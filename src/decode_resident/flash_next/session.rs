@@ -17,7 +17,7 @@ use super::encoders::{Brick, Encoders};
 use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch};
 use super::kernels::FlashNextKernels;
 use super::ple::{encode_ple, PleScratch, PleState};
-use super::weights::{FlashNextWeights, LoadStage, MixerWeights};
+use super::weights::{FlashNextWeights, LayerWeights, LoadStage, MixerWeights};
 use crate::decode_resident::{DecodeResidentState, FullAttentionMetalState};
 use crate::metal_backend::{
     commit_and_wait, read_f32_buffer, read_u32_buffer, write_f32_buffer, LinearAttentionMetalState,
@@ -1056,6 +1056,23 @@ impl FlashNextSession {
         let mut owned = Vec::new();
         let width = self.hc_dims.width();
         let mut cur = 0_usize;
+        let ctx = LayerEncoder {
+            kernels: &self.kernels,
+            executor: &self.executor,
+            arena: &self.arena,
+            hc_scratch: &self.hc_scratch,
+            hc_dims: self.hc_dims,
+            qsa_scratch: &self.qsa_scratch,
+            qsa_dims: self.qsa_dims,
+            indexer_scratch: &self.indexer_scratch,
+            indexer_dims: self.indexer_dims,
+            linear_spec: self.linear_spec,
+            linear_dims: self.linear_dims,
+            x: &self.x,
+            branch: &self.branch,
+            hidden: c.hidden,
+            top_k: c.top_k,
+        };
         for (index, (layer, state)) in self
             .weights
             .layers
@@ -1078,155 +1095,32 @@ impl FlashNextSession {
                 )?;
                 cur = 1 - cur;
             }
-            let encoder = encoders.at(Brick::Hc)?;
-            encode_hc_mix(
-                &self.kernels,
-                &self.executor,
-                encoder,
-                &layer.attn_hc,
-                &self.hc_scratch,
-                self.hc_dims,
-                &self.h[cur],
-                &self.x,
-            )?;
-            match (&layer.mixer, state) {
-                (MixerWeights::Linear(w), LayerState::Linear(state)) => {
-                    let encoder = encoders.at(Brick::DeltaNet)?;
-                    self.executor.encode_linear_attn_resident_dense_buffers(
-                        encoder,
-                        &self.x,
-                        None,
-                        &self.branch,
-                        w,
-                        state,
-                        self.linear_spec,
-                        self.linear_dims,
-                    )?;
-                }
-                (MixerWeights::Full(w), LayerState::Full(full)) => {
-                    let encoder = encoders.at(Brick::Qsa)?;
-                    let (kv, indexer_state) = &mut **full;
-                    let indexer = w.indexer.as_ref().ok_or_else(|| {
-                        InferError::Config(format!("couche {index} : indexeur QSA absent"))
-                    })?;
-                    encode_qsa(
-                        &self.arena,
-                        &self.kernels,
-                        &self.executor,
-                        encoder,
-                        kv,
-                        w,
-                        &self.qsa_scratch,
-                        self.qsa_dims,
-                        Some(QsaSparse {
-                            weights: indexer,
-                            state: indexer_state,
-                            scratch: &self.indexer_scratch,
-                            gathered: &mut self.gathered,
-                            dims: self.indexer_dims,
-                            #[cfg(test)]
-                            forced: self.forced_selection.get_mut(index).and_then(Option::take),
-                        }),
-                        self.position,
-                        &self.x,
-                        &self.branch,
-                    )?;
-                    #[cfg(test)]
-                    {
-                        let complete = (self.position + 1) / self.indexer_dims.compress;
-                        if layers && complete > self.indexer_dims.keep {
-                            let keep = self.indexer_dims.keep;
-                            encoder.set_compute_pipeline_state(&self.kernels.copy_u32);
-                            encoder.set_buffer(0, Some(&self.indexer_scratch.selected), 0);
-                            encoder.set_buffer(1, Some(&self.selection_capture), 0);
-                            super::set_value(encoder, 2, &[keep as u32, (index * keep) as u32]);
-                            super::dispatch_1d(encoder, keep);
-                            let stride = self.capacity / self.indexer_dims.compress + 1;
-                            self.executor.encode_copy_with_offsets(
-                                encoder,
-                                &self.indexer_scratch.scores,
-                                0,
-                                &self.score_capture,
-                                (index * stride * std::mem::size_of::<f32>()) as u64,
-                                complete,
-                            )?;
-                            crate::metal_backend::post_dispatch_barrier(encoder);
-                        }
-                    }
-                }
-                _ => {
-                    return Err(InferError::Config(format!(
-                        "couche {index} : poids et état de types différents"
-                    )))
-                }
-            }
-            let encoder = encoders.at(Brick::Hc)?;
-            crate::metal_backend::post_dispatch_barrier(encoder);
-            encode_hc_combine(
-                &self.kernels,
-                encoder,
-                &self.hc_scratch,
-                self.hc_dims,
-                &self.h[cur],
-                &self.branch,
-                &self.h[1 - cur],
-            );
-            cur = 1 - cur;
-            encode_hc_mix(
-                &self.kernels,
-                &self.executor,
-                encoder,
-                &layer.mlp_hc,
-                &self.hc_scratch,
-                self.hc_dims,
-                &self.h[cur],
-                &self.x,
-            )?;
             #[cfg(test)]
-            if let Some(experts) = self.forced_routing.get_mut(index).and_then(Option::take) {
-                crate::metal_backend::force_next_topk(experts);
-            }
-            let encoder = encoders.at(Brick::Moe)?;
-            self.executor.encode_moe_shared_buffers(
-                encoder,
+            let hooks = LayerHooks {
+                forced_selection: self.forced_selection.get_mut(index).and_then(Option::take),
+                forced_routing: self.forced_routing.get_mut(index).and_then(Option::take),
+                capture: layers.then_some(CaptureSlot {
+                    slot: index,
+                    selection: &self.selection_capture,
+                    scores: &self.score_capture,
+                    routing: &self.routing_capture,
+                    stride: self.capacity / self.indexer_dims.compress + 1,
+                }),
+            };
+            ctx.encode(
+                encoders,
                 &mut owned,
-                &self.x,
-                None,
-                &self.branch,
-                c.hidden,
-                &layer.moe,
-                c.top_k,
+                &mut self.gathered,
+                layer,
+                state,
+                &self.h,
+                &mut cur,
+                self.position,
+                index,
+                #[cfg(test)]
+                hooks,
             )?;
-            #[cfg(test)]
-            if crate::metal_backend::forced_topk_pending() {
-                return Err(InferError::Metal(format!(
-                    "couche {index} : routage imposé non consommé par le MoE"
-                )));
-            }
-            #[cfg(test)]
-            if layers {
-                let indices = crate::metal_backend::take_last_topk_indices().ok_or_else(|| {
-                    InferError::Metal(format!("couche {index} : routage GPU non capturé"))
-                })?;
-                encoder.set_compute_pipeline_state(&self.kernels.copy_u32);
-                encoder.set_buffer(0, Some(&indices), 0);
-                encoder.set_buffer(1, Some(&self.routing_capture), 0);
-                super::set_value(encoder, 2, &[c.top_k as u32, (index * c.top_k) as u32]);
-                super::dispatch_1d(encoder, c.top_k);
-                crate::metal_backend::post_dispatch_barrier(encoder);
-            }
             let encoder = encoders.at(Brick::Hc)?;
-            crate::metal_backend::post_dispatch_barrier(encoder);
-            encode_hc_combine(
-                &self.kernels,
-                encoder,
-                &self.hc_scratch,
-                self.hc_dims,
-                &self.h[cur],
-                &self.branch,
-                &self.h[1 - cur],
-            );
-            cur = 1 - cur;
             #[cfg(test)]
             if self
                 .fail_encode_after_layer
@@ -1282,6 +1176,230 @@ impl FlashNextSession {
             &self.index,
             c.hidden,
         )?;
+        Ok(())
+    }
+}
+
+/// Ressources d'encodage partagées par les couches, tronc et MTP : kernels,
+/// scratch et dimensions. Les couches s'encodent l'une après l'autre dans un
+/// même ordre de commandes ; le scratch n'est jamais partagé par deux couches
+/// en vol.
+struct LayerEncoder<'s> {
+    kernels: &'s FlashNextKernels,
+    executor: &'s MetalExecutor,
+    arena: &'s DecodeResidentState,
+    hc_scratch: &'s HcScratch,
+    hc_dims: HcDims,
+    qsa_scratch: &'s QsaScratch,
+    qsa_dims: QsaDecodeDims,
+    indexer_scratch: &'s IndexerScratch,
+    indexer_dims: IndexerDims,
+    linear_spec: LinearAttentionStepSpec,
+    linear_dims: LinearAttnResidentDims,
+    x: &'s Buffer,
+    branch: &'s Buffer,
+    hidden: usize,
+    top_k: usize,
+}
+
+/// Case de capture d'une couche dans les tampons d'oracles.
+#[cfg(test)]
+struct CaptureSlot<'s> {
+    slot: usize,
+    selection: &'s Buffer,
+    scores: &'s Buffer,
+    routing: &'s Buffer,
+    /// Pas des scores par case (`capacité / compress + 1`).
+    stride: usize,
+}
+
+/// Oracles d'une couche : impositions consommées et captures.
+#[cfg(test)]
+struct LayerHooks<'s> {
+    forced_selection: Option<Vec<u32>>,
+    forced_routing: Option<Vec<u32>>,
+    capture: Option<CaptureSlot<'s>>,
+}
+
+impl LayerEncoder<'_> {
+    /// Encode une couche (hc d'attention, DeltaNet ou QSA, hc du MLP, MoE) à
+    /// `position` : entrée `h[cur]`, intermédiaire `h[1 − cur]`, sortie de
+    /// nouveau dans `h[cur]` après les deux combine (`cur` inchangé au total).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal : état, KV compact, résiduels et oracles explicites"
+    )]
+    fn encode(
+        &self,
+        encoders: &mut Encoders<'_>,
+        owned: &mut Vec<Buffer>,
+        gathered: &mut FullAttentionMetalState,
+        layer: &LayerWeights,
+        state: &mut LayerState,
+        h: &[Buffer; 2],
+        cur: &mut usize,
+        position: usize,
+        index: usize,
+        #[cfg(test)] hooks: LayerHooks<'_>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        let LayerHooks {
+            forced_selection,
+            forced_routing,
+            capture,
+        } = hooks;
+        let encoder = encoders.at(Brick::Hc)?;
+        encode_hc_mix(
+            self.kernels,
+            self.executor,
+            encoder,
+            &layer.attn_hc,
+            self.hc_scratch,
+            self.hc_dims,
+            &h[*cur],
+            self.x,
+        )?;
+        match (&layer.mixer, state) {
+            (MixerWeights::Linear(w), LayerState::Linear(state)) => {
+                let encoder = encoders.at(Brick::DeltaNet)?;
+                self.executor.encode_linear_attn_resident_dense_buffers(
+                    encoder,
+                    self.x,
+                    None,
+                    self.branch,
+                    w,
+                    state,
+                    self.linear_spec,
+                    self.linear_dims,
+                )?;
+            }
+            (MixerWeights::Full(w), LayerState::Full(full)) => {
+                let encoder = encoders.at(Brick::Qsa)?;
+                let (kv, indexer_state) = &mut **full;
+                let indexer = w.indexer.as_ref().ok_or_else(|| {
+                    InferError::Config(format!("couche {index} : indexeur QSA absent"))
+                })?;
+                encode_qsa(
+                    self.arena,
+                    self.kernels,
+                    self.executor,
+                    encoder,
+                    kv,
+                    w,
+                    self.qsa_scratch,
+                    self.qsa_dims,
+                    Some(QsaSparse {
+                        weights: indexer,
+                        state: indexer_state,
+                        scratch: self.indexer_scratch,
+                        gathered,
+                        dims: self.indexer_dims,
+                        #[cfg(test)]
+                        forced: forced_selection,
+                    }),
+                    position,
+                    self.x,
+                    self.branch,
+                )?;
+                #[cfg(test)]
+                if let Some(capture) = &capture {
+                    let complete = (position + 1) / self.indexer_dims.compress;
+                    if complete > self.indexer_dims.keep {
+                        let keep = self.indexer_dims.keep;
+                        encoder.set_compute_pipeline_state(&self.kernels.copy_u32);
+                        encoder.set_buffer(0, Some(&self.indexer_scratch.selected), 0);
+                        encoder.set_buffer(1, Some(capture.selection), 0);
+                        super::set_value(encoder, 2, &[keep as u32, (capture.slot * keep) as u32]);
+                        super::dispatch_1d(encoder, keep);
+                        self.executor.encode_copy_with_offsets(
+                            encoder,
+                            &self.indexer_scratch.scores,
+                            0,
+                            capture.scores,
+                            (capture.slot * capture.stride * std::mem::size_of::<f32>()) as u64,
+                            complete,
+                        )?;
+                        crate::metal_backend::post_dispatch_barrier(encoder);
+                    }
+                }
+            }
+            _ => {
+                return Err(InferError::Config(format!(
+                    "couche {index} : poids et état de types différents"
+                )))
+            }
+        }
+        let encoder = encoders.at(Brick::Hc)?;
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        encode_hc_combine(
+            self.kernels,
+            encoder,
+            self.hc_scratch,
+            self.hc_dims,
+            &h[*cur],
+            self.branch,
+            &h[1 - *cur],
+        );
+        *cur = 1 - *cur;
+        encode_hc_mix(
+            self.kernels,
+            self.executor,
+            encoder,
+            &layer.mlp_hc,
+            self.hc_scratch,
+            self.hc_dims,
+            &h[*cur],
+            self.x,
+        )?;
+        #[cfg(test)]
+        if let Some(experts) = forced_routing {
+            crate::metal_backend::force_next_topk(experts);
+        }
+        let encoder = encoders.at(Brick::Moe)?;
+        self.executor.encode_moe_shared_buffers(
+            encoder,
+            owned,
+            self.x,
+            None,
+            self.branch,
+            self.hidden,
+            &layer.moe,
+            self.top_k,
+        )?;
+        #[cfg(test)]
+        if crate::metal_backend::forced_topk_pending() {
+            return Err(InferError::Metal(format!(
+                "couche {index} : routage imposé non consommé par le MoE"
+            )));
+        }
+        #[cfg(test)]
+        if let Some(capture) = &capture {
+            let indices = crate::metal_backend::take_last_topk_indices().ok_or_else(|| {
+                InferError::Metal(format!("couche {index} : routage GPU non capturé"))
+            })?;
+            encoder.set_compute_pipeline_state(&self.kernels.copy_u32);
+            encoder.set_buffer(0, Some(&indices), 0);
+            encoder.set_buffer(1, Some(capture.routing), 0);
+            super::set_value(
+                encoder,
+                2,
+                &[self.top_k as u32, (capture.slot * self.top_k) as u32],
+            );
+            super::dispatch_1d(encoder, self.top_k);
+            crate::metal_backend::post_dispatch_barrier(encoder);
+        }
+        let encoder = encoders.at(Brick::Hc)?;
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        encode_hc_combine(
+            self.kernels,
+            encoder,
+            self.hc_scratch,
+            self.hc_dims,
+            &h[*cur],
+            self.branch,
+            &h[1 - *cur],
+        );
+        *cur = 1 - *cur;
         Ok(())
     }
 }
