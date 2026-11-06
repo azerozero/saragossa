@@ -68,6 +68,19 @@ pub(crate) fn force_next_topk(experts: Vec<u32>) {
     FORCED_TOPK.with(|slot| *slot.borrow_mut() = Some(experts));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Buffer d'indices du dernier top-k encodé sur ce thread (oracles : relecture
+    /// du routage GPU par couche).
+    static LAST_TOPK_INDICES: std::cell::RefCell<Option<metal::Buffer>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Prend le buffer d'indices du dernier top-k encodé sur ce thread.
+#[cfg(test)]
+pub(crate) fn take_last_topk_indices() -> Option<metal::Buffer> {
+    LAST_TOPK_INDICES.with(|slot| slot.borrow_mut().take())
+}
+
 /// Vrai si une imposition attend encore d'être consommée.
 #[cfg(test)]
 pub(crate) fn forced_topk_pending() -> bool {
@@ -1087,6 +1100,8 @@ impl MetalExecutor {
         topk: usize,
     ) -> Result<()> {
         ensure_valid_top_k(topk, count)?;
+        #[cfg(test)]
+        LAST_TOPK_INDICES.with(|slot| *slot.borrow_mut() = Some(indices_buffer.to_owned()));
         #[cfg(test)]
         if let Some(forced) = FORCED_TOPK.with(|slot| slot.borrow_mut().take()) {
             if forced.len() != topk || forced.iter().any(|&e| e as usize >= count) {

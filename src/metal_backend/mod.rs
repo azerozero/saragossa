@@ -70,7 +70,7 @@ mod matmul_weight;
 mod moe;
 mod moe_encode;
 #[cfg(test)]
-pub(crate) use self::moe_encode::{force_next_topk, forced_topk_pending};
+pub(crate) use self::moe_encode::{force_next_topk, forced_topk_pending, take_last_topk_indices};
 mod moe_na;
 mod moe_shared;
 pub(crate) mod mtp_control;

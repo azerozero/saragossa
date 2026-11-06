@@ -463,34 +463,68 @@ fn kl_logits(p: &[f32], q: &[f32]) -> f64 {
 /// Mode d'une passe N2 résidente.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RoutingMode {
-    /// Routage propre du GPU (témoin, sans porte dure).
+    /// Routage propre du GPU.
     Native,
-    /// Experts du CPU imposés aux quasi-égalités (marge ≤ 1e-5).
-    Forced,
-    /// Comme `Forced`, plus un mauvais expert imposé à `(token, couche)` de
-    /// marge nette : la porte doit passer au rouge.
-    Mutation(usize, usize),
+    /// Experts du CPU imposés aux points de marge de probabilité ≤ seuil.
+    Forced(f32),
+    /// Comme `Forced(seuil)`, plus un mauvais expert imposé à `(token, couche)`.
+    Mutation(usize, usize, f32),
 }
 
-/// Mesures d'un token : écart relatif par couche, KL des logits, argmax.
+/// Mesures d'un token.
 struct TokenReport {
+    /// Écart relatif par couche (NaN si une sortie n'est pas finie).
     layer_errors: Vec<f64>,
     kl: f64,
+    /// `(argmax CPU, argmax GPU, écart de probabilité oracle)` s'ils diffèrent.
     swap: Option<(usize, usize, f64)>,
+    /// Experts routés par le GPU `[couche]`, triés.
+    routing: Vec<Vec<usize>>,
+    /// Points `(couche)` imposés à ce token.
+    imposed: Vec<usize>,
 }
 
-/// Référence CPU d'une séquence : résiduels, logits, routage et marges.
+/// Référence CPU d'une séquence.
 struct CpuChain {
     layers: Vec<crate::Tensor>,
     logits: crate::Tensor,
+    /// Experts routés `[couche][token]`, triés.
     routing: Vec<Vec<Vec<usize>>>,
+    /// Marge de probabilité au seuil du top-k `[couche][token]`.
     margins: Vec<Vec<f32>>,
+    /// `(k-ième, (k+1)-ième)` experts `[couche][token]`.
+    boundary: Vec<Vec<(usize, usize)>>,
     width: usize,
     vocab: usize,
 }
 
-/// Marge de quasi-égalité du routeur (règle de l'étape 1).
-const ROUTING_TIE: f32 = 1.0e-5;
+/// Seuils de marge de probabilité essayés, du plus strict au plus large.
+const TIE_THRESHOLDS: [f32; 3] = [1.0e-7, 1.0e-6, 1.0e-5];
+/// Marge maximale admise pour la première bascule native.
+const NATIVE_FIRST_TIE: f32 = 1.0e-6;
+
+/// Écart relatif, NaN si l'une des entrées n'est pas finie.
+fn finite_relative_error(got: &[f32], want: &[f32]) -> f64 {
+    if got.len() != want.len() || got.iter().chain(want).any(|v| !v.is_finite()) {
+        return f64::NAN;
+    }
+    relative_error(got, want).0
+}
+
+/// Vrai si `value` est finie et ≤ `limit` (NaN et infinis refusés).
+fn within<T: Into<f64>>(value: T, limit: f64) -> bool {
+    let value = value.into();
+    value.is_finite() && value <= limit
+}
+
+/// Maximum qui propage NaN (`f64::max` l'ignorerait).
+fn nan_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
+}
 
 fn run_resident_pass(
     dir: &std::path::Path,
@@ -498,7 +532,7 @@ fn run_resident_pass(
     cpu: &CpuChain,
     mode: RoutingMode,
     steps: usize,
-) -> (Vec<TokenReport>, usize) {
+) -> Vec<TokenReport> {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let guard = crate::MemoryGuard::process();
     let mut session = FlashNextSession::open(
@@ -509,34 +543,33 @@ fn run_resident_pass(
     .expect("invariant: session résidente");
     let layers = cpu.layers.len();
     let (width, vocab) = (cpu.width, cpu.vocab);
-    let mut imposed = 0;
     let mut reports = Vec::with_capacity(steps);
     for (t, &token) in ids.iter().enumerate().take(steps) {
-        if mode != RoutingMode::Native {
-            session.forced_routing = (0..layers)
-                .map(|layer| {
-                    let set = &cpu.routing[layer][t];
-                    if mode == RoutingMode::Mutation(t, layer) {
-                        // Un expert retenu remplacé par le premier expert non retenu.
-                        let outsider = (0..)
-                            .find(|e| !set.contains(e))
-                            .expect("invariant: expert libre");
-                        let mut wrong: Vec<u32> = set.iter().map(|&e| e as u32).collect();
-                        wrong[0] = outsider as u32;
-                        Some(wrong)
-                    } else if cpu.margins[layer][t] <= ROUTING_TIE {
-                        Some(set.iter().map(|&e| e as u32).collect())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            imposed += session
-                .forced_routing
-                .iter()
-                .filter(|f| f.is_some())
-                .count();
-        }
+        let threshold = match mode {
+            RoutingMode::Native => None,
+            RoutingMode::Forced(th) | RoutingMode::Mutation(_, _, th) => Some(th),
+        };
+        session.forced_routing = (0..layers)
+            .map(|layer| {
+                let set = &cpu.routing[layer][t];
+                if matches!(mode, RoutingMode::Mutation(mt, ml, _) if (mt, ml) == (t, layer)) {
+                    // Un expert retenu remplacé par le premier expert non retenu.
+                    let outsider = (0..)
+                        .find(|e| !set.contains(e))
+                        .expect("invariant: expert libre");
+                    let mut wrong: Vec<u32> = set.iter().map(|&e| e as u32).collect();
+                    wrong[0] = outsider as u32;
+                    Some(wrong)
+                } else if threshold.is_some_and(|th| cpu.margins[layer][t] <= th) {
+                    Some(set.iter().map(|&e| e as u32).collect())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let imposed = (0..layers)
+            .filter(|&l| session.forced_routing[l].is_some())
+            .collect();
         let out = session
             .step(token, true, true)
             .expect("invariant: pas résident");
@@ -545,11 +578,16 @@ fn run_resident_pass(
             .iter()
             .enumerate()
             .map(|(index, got)| {
-                relative_error(got, &cpu.layers[index].data()[t * width..(t + 1) * width]).0
+                finite_relative_error(got, &cpu.layers[index].data()[t * width..(t + 1) * width])
             })
             .collect();
         let got = out.logits.expect("invariant: logits");
         let want = &cpu.logits.data()[t * vocab..(t + 1) * vocab];
+        let kl = if got.iter().all(|v| v.is_finite()) {
+            kl_logits(want, &got)
+        } else {
+            f64::NAN
+        };
         let cpu_top = want
             .iter()
             .enumerate()
@@ -566,34 +604,48 @@ fn run_resident_pass(
                 (1.0 - f64::from(want[gpu_top] - max).exp()) / sum,
             )
         });
+        let routing = out
+            .routing
+            .expect("invariant: routage GPU")
+            .into_iter()
+            .map(|set| {
+                let mut set: Vec<usize> = set.into_iter().map(|e| e as usize).collect();
+                set.sort_unstable();
+                set
+            })
+            .collect();
         reports.push(TokenReport {
             layer_errors,
-            kl: kl_logits(want, &got),
+            kl,
             swap,
+            routing,
+            imposed,
         });
     }
-    (reports, imposed)
+    reports
 }
 
 /// Synthèse d'une passe sur un préfixe.
 struct Summary {
+    /// NaN si une valeur n'est pas finie.
     worst: f64,
     kl: f64,
     /// `(token, argmax CPU, argmax GPU, écart de probabilité)`.
     swaps: Vec<(usize, usize, usize, f64)>,
     bad: usize,
     first: Option<(usize, usize, f64)>,
+    /// Points non imposés où le GPU route autrement que le CPU.
+    routing_mismatches: usize,
 }
 
-/// Synthèse d'une passe sur le préfixe `[0, prefix)` : écart max par couche,
-/// KL max, argmax différents, tokens au-delà de 1e-3 (premier compris).
-fn summarize(reports: &[TokenReport], prefix: usize) -> Summary {
+/// Synthèse d'une passe sur le préfixe `[0, prefix)`.
+fn summarize(reports: &[TokenReport], cpu: &CpuChain, prefix: usize) -> Summary {
     let reports = &reports[..prefix.min(reports.len())];
     let worst = reports
         .iter()
         .flat_map(|r| r.layer_errors.iter().copied())
-        .fold(0.0_f64, f64::max);
-    let kl = reports.iter().map(|r| r.kl).fold(0.0_f64, f64::max);
+        .fold(0.0_f64, nan_max);
+    let kl = reports.iter().map(|r| r.kl).fold(0.0_f64, nan_max);
     let swaps = reports
         .iter()
         .enumerate()
@@ -605,30 +657,167 @@ fn summarize(reports: &[TokenReport], prefix: usize) -> Summary {
         .filter_map(|(t, r)| {
             r.layer_errors
                 .iter()
-                .position(|&e| e > 1.0e-3)
+                .position(|&e| !within(e, 1.0e-3))
                 .map(|layer| (t, layer, r.layer_errors[layer]))
         })
         .collect();
+    let routing_mismatches = reports
+        .iter()
+        .enumerate()
+        .map(|(t, r)| {
+            (0..r.routing.len())
+                .filter(|&l| !r.imposed.contains(&l) && r.routing[l] != cpu.routing[l][t])
+                .count()
+        })
+        .sum();
     Summary {
         worst,
         kl,
         swaps,
         bad: bad.len(),
         first: bad.first().copied(),
+        routing_mismatches,
     }
 }
 
+/// Porte d'une passe imposée : écart ≤ 1e-3, KL ≤ 1e-3, valeurs finies,
+/// argmax identique sauf quasi-égalité (≤ 1e-5), routage identique aux points
+/// non imposés.
+fn forced_gate_green(summary: &Summary) -> bool {
+    within(summary.worst, 1.0e-3)
+        && within(summary.kl, 1.0e-3)
+        && summary.swaps.iter().all(|s| within(s.3, 1.0e-5))
+        && summary.routing_mismatches == 0
+}
+
+/// Contrôle de la passe native : jusqu'à la première bascule de routage
+/// `(t₀, l₀)`, écart ≤ 1e-3 (fini) et argmax identique ; la bascule tombe sur
+/// une marge de probabilité ≤ [`NATIVE_FIRST_TIE`] et n'échange que la paire
+/// au seuil (k-ième ↔ (k+1)-ième expert du CPU). Renvoie `(t₀, l₀, marge)`.
+fn native_check(
+    reports: &[TokenReport],
+    cpu: &CpuChain,
+) -> std::result::Result<Option<(usize, usize, f32)>, String> {
+    let first = reports.iter().enumerate().find_map(|(t, r)| {
+        (0..r.routing.len())
+            .find(|&l| r.routing[l] != cpu.routing[l][t])
+            .map(|l| (t, l))
+    });
+    let (end_token, end_layer) = first.unwrap_or((reports.len(), 0));
+    for (t, r) in reports.iter().enumerate().take(end_token + 1) {
+        let layers = if t == end_token {
+            end_layer
+        } else {
+            r.layer_errors.len()
+        };
+        if let Some(l) = (0..layers).find(|&l| !within(r.layer_errors[l], 1.0e-3)) {
+            return Err(format!(
+                "écart {:.2e} au token {t}, couche {l}, avant la première bascule",
+                r.layer_errors[l]
+            ));
+        }
+        if t < end_token && r.swap.is_some() {
+            return Err(format!(
+                "argmax différent au token {t}, avant la première bascule"
+            ));
+        }
+    }
+    let Some((t, l)) = first else {
+        return Ok(None);
+    };
+    let margin = cpu.margins[l][t];
+    if !within(margin, f64::from(NATIVE_FIRST_TIE)) {
+        return Err(format!(
+            "première bascule (token {t}, couche {l}) à marge {margin:.2e}"
+        ));
+    }
+    let (kth, next) = cpu.boundary[l][t];
+    let mut expected: Vec<usize> = cpu.routing[l][t]
+        .iter()
+        .map(|&e| if e == kth { next } else { e })
+        .collect();
+    expected.sort_unstable();
+    if reports[t].routing[l] != expected {
+        return Err(format!(
+            "bascule (token {t}, couche {l}) hors de la paire au seuil : GPU {:?}, CPU {:?}",
+            reports[t].routing[l], cpu.routing[l][t]
+        ));
+    }
+    Ok(Some((t, l, margin)))
+}
+
+/// Toutes les bascules de routage d'une passe : `(token, couche, paire au
+/// seuil ?, marge CPU)`.
+fn routing_swaps(reports: &[TokenReport], cpu: &CpuChain) -> Vec<(usize, usize, bool, f32)> {
+    let mut out = Vec::new();
+    for (t, r) in reports.iter().enumerate() {
+        for l in 0..r.routing.len() {
+            if r.routing[l] != cpu.routing[l][t] {
+                let (kth, next) = cpu.boundary[l][t];
+                let mut pair: Vec<usize> = cpu.routing[l][t]
+                    .iter()
+                    .map(|&e| if e == kth { next } else { e })
+                    .collect();
+                pair.sort_unstable();
+                out.push((t, l, r.routing[l] == pair, cpu.margins[l][t]));
+            }
+        }
+    }
+    out
+}
+
+/// La porte refuse les NaN et un écart tardif, que `f64::max` aurait masqués.
+#[test]
+fn n2_gate_refuses_late_nan_and_native_check_refuses_early_drift() {
+    let cpu = CpuChain {
+        layers: vec![crate::Tensor::from_vec(vec![1], vec![0.0]).expect("invariant: tenseur")],
+        logits: crate::Tensor::from_vec(vec![1], vec![0.0]).expect("invariant: tenseur"),
+        routing: vec![vec![vec![1, 2]; 4]],
+        margins: vec![vec![1.0; 4]],
+        boundary: vec![vec![(2, 3); 4]],
+        width: 1,
+        vocab: 1,
+    };
+    let report = |err: f64, kl: f64| TokenReport {
+        layer_errors: vec![err],
+        kl,
+        swap: None,
+        routing: vec![vec![1, 2]],
+        imposed: Vec::new(),
+    };
+    let clean: Vec<TokenReport> = (0..4).map(|_| report(1.0e-6, 1.0e-9)).collect();
+    assert!(forced_gate_green(&summarize(&clean, &cpu, 4)));
+    let mut late_nan: Vec<TokenReport> = (0..3).map(|_| report(1.0e-6, 1.0e-9)).collect();
+    late_nan.push(report(f64::NAN, 1.0e-9));
+    assert!(
+        !forced_gate_green(&summarize(&late_nan, &cpu, 4)),
+        "NaN d'écart accepté"
+    );
+    let mut late_kl: Vec<TokenReport> = (0..3).map(|_| report(1.0e-6, 1.0e-9)).collect();
+    late_kl.push(report(1.0e-6, f64::NAN));
+    assert!(
+        !forced_gate_green(&summarize(&late_kl, &cpu, 4)),
+        "NaN de KL accepté"
+    );
+    assert!(native_check(&late_nan, &cpu).is_err(), "NaN natif accepté");
+    let mut wrong = (0..4).map(|_| report(1.0e-6, 1.0e-9)).collect::<Vec<_>>();
+    wrong[2].routing[0] = vec![1, 9];
+    assert!(
+        native_check(&wrong, &cpu).is_err(),
+        "bascule à marge nette acceptée"
+    );
+}
+
 /// N2 résident : decode GPU token par token (teacher forcing sur le texte du
-/// golden) contre la référence CPU f32 sans cache, chaîne native des deux côtés.
-/// Longueur : `SARAGOSSA_QWEN4EXP_TOKENS` (2051 par défaut).
+/// golden) contre la référence CPU f32 sans cache. Longueur :
+/// `SARAGOSSA_QWEN4EXP_TOKENS` (2051 par défaut).
 ///
-/// Une quasi-égalité du routeur (marge ≤ 1e-5) fait basculer un expert ; la
-/// divergence passe ensuite aux tokens suivants par l'état récurrent et le KV.
-/// La porte porte donc sur la **passe à routage imposé** (experts du CPU aux
-/// quasi-égalités), à 64, 256 et 2051 tokens : écart relatif ≤ 1e-3 par couche
-/// et par token, KL max ≤ 1e-3, argmax identique sauf quasi-égalité (écart de
-/// probabilité ≤ 1e-5). La passe native est mesurée comme témoin. Une
-/// mutation (mauvais expert imposé à marge nette) doit faire échouer la porte.
+/// - Passe native contrôlée jusqu'à la première bascule ([`native_check`]),
+///   témoin publié au-delà.
+/// - Passe imposée : experts du CPU aux points de marge de probabilité ≤ seuil,
+///   seuil le plus strict de [`TIE_THRESHOLDS`] qui garde la porte verte
+///   ([`forced_gate_green`]) à 64, 256 et 2051 tokens.
+/// - Mutation : un mauvais expert imposé à marge nette fait échouer la porte.
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_resident_decode_matches_cpu_reference() {
@@ -650,7 +839,8 @@ fn n2_resident_decode_matches_cpu_reference() {
         Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
     let config = &reference.checkpoint().config;
     let mut h = reference.embed(&ids).expect("invariant: embedding");
-    let (mut layers, mut routing, mut margins) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut layers, mut routing, mut margins, mut boundary) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for index in 0..config.layer_kinds.len() {
         let out = reference
             .layer(index, &h, &ids)
@@ -659,6 +849,7 @@ fn n2_resident_decode_matches_cpu_reference() {
         layers.push(h.clone());
         routing.push(out.routing);
         margins.push(out.routing_margins);
+        boundary.push(out.routing_boundary);
     }
     let cpu = CpuChain {
         logits: reference
@@ -669,89 +860,101 @@ fn n2_resident_decode_matches_cpu_reference() {
         layers,
         routing,
         margins,
+        boundary,
     };
+    assert!(
+        cpu.logits.data().iter().all(|v| v.is_finite()),
+        "logits CPU non finis"
+    );
     eprintln!(
         "référence CPU : {tokens} tokens en {:.0} s",
         started.elapsed().as_secs_f64()
     );
-    let ties: usize = cpu
-        .margins
-        .iter()
-        .flatten()
-        .filter(|&&m| m <= ROUTING_TIE)
-        .count();
-    eprintln!("quasi-égalités du routeur CPU (marge ≤ 1e-5) : {ties}");
+    for th in TIE_THRESHOLDS {
+        let n = cpu.margins.iter().flatten().filter(|&&m| m <= th).count();
+        eprintln!(
+            "points de marge de probabilité ≤ {th:.0e} : {n} sur {}",
+            tokens * cpu.layers.len()
+        );
+    }
 
     let mut prefixes: Vec<usize> = [64, 256, tokens]
         .into_iter()
         .filter(|&p| p <= tokens)
         .collect();
     prefixes.dedup();
-    let (native, _) = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Native, tokens);
+    let native = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Native, tokens);
+    let native_first = native_check(&native, &cpu);
+    let swaps = routing_swaps(&native, &cpu);
+    eprintln!(
+        "native : première bascule {native_first:?} ; bascules {} (paire au seuil : {}), 10 premières {:?}",
+        swaps.len(),
+        swaps.iter().filter(|s| s.2).count(),
+        &swaps[..swaps.len().min(10)]
+    );
     for &prefix in &prefixes {
-        let Summary {
-            worst,
-            kl,
-            swaps,
-            bad,
-            first,
-        } = summarize(&native, prefix);
+        let s = summarize(&native, &cpu, prefix);
         eprintln!(
-            "native  {prefix:4} : écart max {worst:.2e}, KL max {kl:.2e}, argmax ≠ {}, \
-             tokens > 1e-3 : {bad}, premier (token, couche, écart) {first:?}",
-            swaps.len()
+            "native  {prefix:4} : écart max {:.2e}, KL max {:.2e}, argmax ≠ {}, tokens > 1e-3 : {}, premier {:?}",
+            s.worst, s.kl, s.swaps.len(), s.bad, s.first
         );
     }
     drop(native);
-    let (forced, imposed) = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Forced, tokens);
-    eprintln!("impositions (token × couche) : {imposed}");
-    let mut red = Vec::new();
-    for &prefix in &prefixes {
-        let Summary {
-            worst,
-            kl,
-            swaps,
-            bad,
-            first,
-        } = summarize(&forced, prefix);
+
+    let mut chosen = None;
+    for th in TIE_THRESHOLDS {
+        let forced = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Forced(th), tokens);
+        let mut green = true;
+        for &prefix in &prefixes {
+            let s = summarize(&forced, &cpu, prefix);
+            eprintln!(
+                "imposée ≤ {th:.0e}, {prefix:4} : écart max {:.2e}, KL max {:.2e}, argmax ≠ {:?}, \
+                 tokens > 1e-3 : {}, premier {:?}, routage ≠ hors imposition : {}",
+                s.worst, s.kl, s.swaps, s.bad, s.first, s.routing_mismatches
+            );
+            green &= forced_gate_green(&s);
+        }
+        let by_layer: Vec<String> = (0..cpu.layers.len())
+            .map(|l| {
+                format!(
+                    "{:.1e}",
+                    forced.iter().map(|r| r.layer_errors[l]).fold(0.0, nan_max)
+                )
+            })
+            .collect();
         eprintln!(
-            "imposée {prefix:4} : écart max {worst:.2e}, KL max {kl:.2e}, argmax ≠ {swaps:?}, \
-             tokens > 1e-3 : {bad}, premier {first:?}"
+            "imposée ≤ {th:.0e}, écart max par couche : {}",
+            by_layer.join(" ")
         );
-        if worst > 1.0e-3 || kl > 1.0e-3 || swaps.iter().any(|s| s.3 > 1.0e-5) {
-            red.push(prefix);
+        if green {
+            chosen = Some(th);
+            break;
         }
     }
-    let worst_by_layer: Vec<String> = (0..cpu.layers.len())
-        .map(|layer| {
-            let e = forced
-                .iter()
-                .map(|r| r.layer_errors[layer])
-                .fold(0.0_f64, f64::max);
-            format!("{e:.1e}")
-        })
-        .collect();
-    eprintln!(
-        "imposée, écart max par couche : {}",
-        worst_by_layer.join(" ")
-    );
-    drop(forced);
+    let threshold = chosen.unwrap_or(TIE_THRESHOLDS[TIE_THRESHOLDS.len() - 1]);
+    eprintln!("seuil retenu : {chosen:?}");
 
     // Mutation : (token ≥ 8, couche) de plus grande marge CPU parmi les 64 premiers.
     let (token, layer) = (8..tokens.min(64))
         .flat_map(|t| (0..cpu.margins.len()).map(move |l| (t, l)))
         .max_by(|a, b| cpu.margins[a.1][a.0].total_cmp(&cpu.margins[b.1][b.0]))
         .expect("invariant: au moins 9 tokens");
-    eprintln!("mutation : marge CPU {:.2e}", cpu.margins[layer][token]);
     let steps = (token + 8).min(tokens);
-    let (mutated, _) =
-        run_resident_pass(&dir, &ids, &cpu, RoutingMode::Mutation(token, layer), steps);
-    let Summary {
-        worst, kl, first, ..
-    } = summarize(&mutated, steps);
-    eprintln!("mutation (token {token}, couche {layer}) : écart max {worst:.2e}, KL max {kl:.2e}, premier {first:?}");
-    assert!(worst > 1.0e-3, "mutation non détectée par la porte");
-    assert!(red.is_empty(), "passe imposée rouge aux préfixes {red:?}");
+    let mutated = run_resident_pass(
+        &dir,
+        &ids,
+        &cpu,
+        RoutingMode::Mutation(token, layer, threshold),
+        steps,
+    );
+    let s = summarize(&mutated, &cpu, steps);
+    eprintln!(
+        "mutation (token {token}, couche {layer}, marge {:.2e}) : écart max {:.2e}, KL max {:.2e}, premier {:?}",
+        cpu.margins[layer][token], s.worst, s.kl, s.first
+    );
+    assert!(!forced_gate_green(&s), "mutation non détectée par la porte");
+    assert!(chosen.is_some(), "passe imposée rouge à tous les seuils");
+    native_first.unwrap_or_else(|e| panic!("passe native : {e}"));
 }
 
 /// Débit AR résident : contexte de 1024 tokens (texte du golden), puis decode

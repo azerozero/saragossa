@@ -23,6 +23,8 @@ pub(crate) struct MoeOutput {
     pub(crate) routing: Vec<Vec<usize>>,
     /// Écart de probabilité entre le k-ième et le (k+1)-ième expert, par token.
     pub(crate) margins: Vec<f32>,
+    /// `(k-ième, (k+1)-ième)` experts au seuil du top-k, par token.
+    pub(crate) boundary: Vec<(usize, usize)>,
 }
 
 fn gated_mlp(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Result<Tensor> {
@@ -49,12 +51,17 @@ pub(crate) fn moe(
     let experts = logits.as_matrix()?.1;
     let mut chosen: Vec<Vec<(usize, f32)>> = Vec::with_capacity(tokens);
     let mut margins = Vec::with_capacity(tokens);
+    let mut boundary = Vec::with_capacity(tokens);
     for row in logits.data().chunks_exact(experts) {
         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let exp: Vec<f32> = row.iter().map(|v| (v - max).exp()).collect();
         let sum: f32 = exp.iter().sum();
         let mut probs: Vec<(usize, f32)> = exp.iter().map(|e| e / sum).enumerate().collect();
         probs.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        boundary.push(match (probs.get(w.top_k - 1), probs.get(w.top_k)) {
+            (Some(kth), Some(next)) => (kth.0, next.0),
+            _ => (usize::MAX, usize::MAX),
+        });
         margins.push(match (probs.get(w.top_k - 1), probs.get(w.top_k)) {
             (Some(kth), Some(next)) => kth.1 - next.1,
             _ => f32::INFINITY,
@@ -119,5 +126,6 @@ pub(crate) fn moe(
         output: Tensor::from_vec(vec![tokens, hidden], out)?,
         routing,
         margins,
+        boundary,
     })
 }

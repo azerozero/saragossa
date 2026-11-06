@@ -187,6 +187,25 @@ kernel void flash_next_ple_conv_add_f32(
 }
 "#;
 
+/// Kernels des oracles seulement.
+#[cfg(test)]
+const TEST_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// `dst[offset + i] = src[i]`, bit à bit (indices d'experts).
+kernel void flash_next_copy_u32(
+    device const uint* src [[buffer(0)]],
+    device uint* dst [[buffer(1)]],
+    constant uint2& dims [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < dims.x) {
+        dst[dims.y + i] = src[i];
+    }
+}
+"#;
+
 /// Pipelines des kernels Flash-Next.
 pub(crate) struct FlashNextKernels {
     pub(super) rms_norm_1p_groups: ComputePipelineState,
@@ -196,6 +215,9 @@ pub(crate) struct FlashNextKernels {
     pub(super) ple_gather: ComputePipelineState,
     pub(super) ple_gate: ComputePipelineState,
     pub(super) ple_conv_add: ComputePipelineState,
+    /// Oracles : copie d'indices u32 (routage GPU par couche).
+    #[cfg(test)]
+    pub(super) copy_u32: ComputePipelineState,
 }
 
 impl FlashNextKernels {
@@ -233,6 +255,10 @@ impl FlashNextKernels {
             ple_gather: next()?,
             ple_gate: next()?,
             ple_conv_add: next()?,
+            #[cfg(test)]
+            copy_u32: compile_kernels(device, TEST_SOURCE, &["flash_next_copy_u32"], false)?
+                .pop()
+                .ok_or_else(|| crate::InferError::Metal("pipeline copy_u32 absent".to_string()))?,
         })
     }
 }

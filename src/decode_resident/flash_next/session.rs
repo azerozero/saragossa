@@ -43,6 +43,10 @@ pub(crate) struct StepOutput {
     pub(crate) logits: Option<Vec<f32>>,
     /// Résiduel élargi `[hc·hidden]` après chaque couche, si demandé.
     pub(crate) layers: Option<Vec<Vec<f32>>>,
+    /// Experts routés par le GPU `[couche][slot]`, si les résiduels sont demandés
+    /// (oracles seulement).
+    #[cfg(test)]
+    pub(crate) routing: Option<Vec<Vec<u32>>>,
     /// Préparation CPU avant le commit (embedding, hachage, lectures PLE).
     pub(crate) host: std::time::Duration,
 }
@@ -81,6 +85,9 @@ pub(crate) struct FlashNextSession {
     capacity: usize,
     /// Vrai après une erreur d'exécution GPU : états incertains, pas refusés.
     poisoned: bool,
+    /// Oracles : experts routés par couche du dernier pas `[couches × top_k]`.
+    #[cfg(test)]
+    routing_capture: Buffer,
     /// Oracles : prochaine lecture n-gram en échec.
     #[cfg(test)]
     pub(crate) fail_next_ngram_read: bool,
@@ -306,6 +313,11 @@ impl FlashNextSession {
             capacity,
             poisoned: false,
             #[cfg(test)]
+            routing_capture: executor.device().new_buffer(
+                (c.layer_kinds.len() * c.top_k * std::mem::size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
+            #[cfg(test)]
             fail_next_ngram_read: false,
             #[cfg(test)]
             fail_encode_after_layer: None,
@@ -471,6 +483,17 @@ impl FlashNextSession {
                         .map(|all| all.chunks_exact(width).map(<[f32]>::to_vec).collect())
                 })
                 .transpose()?,
+            #[cfg(test)]
+            routing: layers
+                .then(|| {
+                    read_u32_buffer(&self.routing_capture, layer_count * self.ckpt.config.top_k)
+                        .map(|all| {
+                            all.chunks_exact(self.ckpt.config.top_k)
+                                .map(<[u32]>::to_vec)
+                                .collect()
+                        })
+                })
+                .transpose()?,
             host,
         })
     }
@@ -590,6 +613,18 @@ impl FlashNextSession {
                 return Err(InferError::Metal(format!(
                     "couche {index} : routage imposé non consommé par le MoE"
                 )));
+            }
+            #[cfg(test)]
+            if layers {
+                let indices = crate::metal_backend::take_last_topk_indices().ok_or_else(|| {
+                    InferError::Metal(format!("couche {index} : routage GPU non capturé"))
+                })?;
+                encoder.set_compute_pipeline_state(&self.kernels.copy_u32);
+                encoder.set_buffer(0, Some(&indices), 0);
+                encoder.set_buffer(1, Some(&self.routing_capture), 0);
+                super::set_value(encoder, 2, &[c.top_k as u32, (index * c.top_k) as u32]);
+                super::dispatch_1d(encoder, c.top_k);
+                crate::metal_backend::post_dispatch_barrier(encoder);
             }
             crate::metal_backend::post_dispatch_barrier(encoder);
             encode_hc_combine(
