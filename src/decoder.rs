@@ -808,6 +808,7 @@ enum ResidentLayerBuffers {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Debug)]
 struct ResidentFullMoeBuffers {
+    rope_frequencies: metal::Buffer,
     input_norm: metal::Buffer,
     qkv_proj: Option<MetalLinearWeightBuffers>,
     q_proj: MetalLinearWeightBuffers,
@@ -827,6 +828,7 @@ struct ResidentFullMoeBuffers {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Debug)]
 struct ResidentFullRoutedBuffers {
+    rope_frequencies: metal::Buffer,
     input_norm: metal::Buffer,
     qkv_proj: MetalLinearWeightBuffers,
     o_proj: MetalLinearWeightBuffers,
@@ -853,6 +855,7 @@ struct ResidentLinearMoeBuffers {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Debug)]
 struct ResidentFullDenseBuffers {
+    rope_frequencies: metal::Buffer,
     input_norm: metal::Buffer,
     qkv_proj: Option<MetalLinearWeightBuffers>,
     value_norm: bool,

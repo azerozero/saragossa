@@ -1,5 +1,6 @@
 use super::utils::write_f32_at;
 use super::*;
+use crate::metal_backend::rope::create_rope_frequencies;
 
 // Kernels minimaux pour la chaîne synthétique : `scale` (out = in*s) et
 // `add` (out = a+b). Suffisent à exercer ping-pong + scratch + accumulateur
@@ -2082,7 +2083,8 @@ fn rope_append_kv_matches_rope_then_append_bitwise() -> Result<()> {
         let k_in = state.persistent(kv_dim, GpuElement::F32)?;
         let v_in = state.persistent(kv_dim, GpuElement::F32)?;
         let k_roped = state.persistent(kv_dim, GpuElement::F32)?;
-        let frequencies = state.rope_frequencies(dims.theta, dims.rope_frequency_dim)?;
+        let frequencies =
+            create_rope_frequencies(state.device(), dims.theta, dims.rope_frequency_dim)?;
         let weight = state.persistent(head_dim, GpuElement::F32)?;
         let norm: Vec<f32> = (0..head_dim)
             .map(|i| 0.5 + i as f32 / head_dim as f32)
@@ -2147,10 +2149,9 @@ fn rope_append_kv_matches_rope_then_append_bitwise() -> Result<()> {
                     kv_heads,
                     head_dim,
                     rope_dims,
-                    dims.rope_frequency_dim,
+                    &frequencies,
                     dims.position,
                     dims.eps,
-                    dims.theta,
                 )?;
                 split.encode_append_kv(encoder, k_roped.buffer(), v_in.buffer())?;
                 encoder.end_encoding();
@@ -2512,6 +2513,7 @@ fn encode_position_cycle(
 ) -> Result<()> {
     use super::gpu_position::rope_dims_param;
     let (eps, theta) = (1.0e-6_f32, 1.0e7_f32);
+    let frequencies = create_rope_frequencies(state.device(), theta, POS_ROPE)?;
     for row in 0..POS_ROWS {
         let q_off = (row * POS_Q * POS_HD * 4) as u64;
         let kv_off = (row * POS_KV * POS_HD * 4) as u64;
@@ -2530,9 +2532,8 @@ fn encode_position_cycle(
             b.q_roped.tensor().buffer(),
             POS_Q,
             rope_q,
-            POS_ROPE,
+            &frequencies,
             eps,
-            theta,
         )?;
         state.encode_rms_norm_rope_decode_param(
             encoder,
@@ -2542,9 +2543,8 @@ fn encode_position_cycle(
             b.k_roped.tensor().buffer(),
             POS_KV,
             rope_k,
-            POS_ROPE,
+            &frequencies,
             eps,
-            theta,
         )?;
         let (k, v) = (b.k_roped.tensor().buffer(), b.v_raw.tensor().buffer());
         let (q, scores, ctx) = (
@@ -2761,6 +2761,7 @@ fn run_rows_fused_case(
 ) -> Result<()> {
     use super::gpu_position::rope_dims_param;
     let (eps, theta) = (1.0e-6_f32, 1.0e7_f32);
+    let frequencies = create_rope_frequencies(state.device(), theta, POS_ROPE)?;
     let q_dim = POS_Q * head_dim;
     let kv_dim = POS_KV * head_dim;
     let keys: Vec<f32> = (0..prefix * kv_dim).map(|i| pseudo(i + 3)).collect();
@@ -2828,9 +2829,8 @@ fn run_rows_fused_case(
             q_roped.tensor().buffer(),
             POS_Q,
             rope_dims_param(POS_Q, head_dim, POS_ROPE, prefix + row)?,
-            POS_ROPE,
+            &frequencies,
             eps,
-            theta,
         )?;
         state.encode_rms_norm_rope_decode_param(
             encoder,
@@ -2840,9 +2840,8 @@ fn run_rows_fused_case(
             k_roped.tensor().buffer(),
             POS_KV,
             rope_dims_param(POS_KV, head_dim, POS_ROPE, prefix + row)?,
-            POS_ROPE,
+            &frequencies,
             eps,
-            theta,
         )?;
         kv_loop.encode_append_kv_with_offsets(
             encoder,
@@ -2881,11 +2880,10 @@ fn run_rows_fused_case(
         POS_Q,
         head_dim,
         POS_ROPE,
-        POS_ROPE,
+        &frequencies,
         prefix,
         rows,
         eps,
-        theta,
     )?;
     state.encode_rms_norm_rope_decode_rows(
         encoder,
@@ -2899,11 +2897,10 @@ fn run_rows_fused_case(
         POS_KV,
         head_dim,
         POS_ROPE,
-        POS_ROPE,
+        &frequencies,
         prefix,
         rows,
         eps,
-        theta,
     )?;
     kv_fused.encode_append_kv_rows(
         encoder,
@@ -3048,7 +3045,9 @@ fn dense_layer_rows_vs_mono(strict: bool) -> Result<()> {
     let k_norm = executor.cached_buffer_from_f32(&k_norm_data, "dl_k_norm")?;
     let tail_score_data = [1.0_f32];
     let tail_score = executor.cached_buffer_from_f32(&tail_score_data, "dl_tail_score")?;
+    let frequencies = create_rope_frequencies(state.device(), 1.0e7, 64)?;
     let weights = || FullAttnDenseLayerWeights {
+        rope_frequencies: &frequencies,
         input_norm: &input_norm,
         qkv_proj: Some(&qkv),
         qkv_proj_without_gate: false,

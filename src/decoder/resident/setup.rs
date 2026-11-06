@@ -175,6 +175,14 @@ impl CausalDecoder {
         q_norm: &Tensor,
         k_norm: &Tensor,
     ) -> Result<ResidentMtpLayer> {
+        let theta = self.config.rope_theta.ok_or_else(|| {
+            InferError::Config("rope_theta absent (setup MTP résident)".to_string())
+        })?;
+        let head_dim = self.config.head_dim.ok_or_else(|| {
+            InferError::Config("head_dim absent (setup MTP résident)".to_string())
+        })?;
+        let rope_frequencies =
+            metal.rope_frequencies(theta, self.config.rope_dims.unwrap_or(head_dim))?;
         let input_norm = metal
             .cached_buffer_from_f32(head.layer.input_norm.data(), "resident_mtp_input_norm")?;
         let q_proj = metal.resolve_linear_weight_buffers(
@@ -200,6 +208,7 @@ impl CausalDecoder {
             FeedForward::Dense(mlp) => {
                 let (gate_proj, up_proj, down_proj) = mlp.projections();
                 Ok(ResidentMtpLayer::Dense(ResidentFullDenseBuffers {
+                    rope_frequencies,
                     sigmoid_moe: None,
                     input_norm,
                     qkv_proj,
@@ -243,6 +252,7 @@ impl CausalDecoder {
                     ));
                 }
                 Ok(ResidentMtpLayer::Moe(ResidentFullMoeBuffers {
+                    rope_frequencies,
                     input_norm,
                     qkv_proj,
                     q_proj,
@@ -576,6 +586,15 @@ impl CausalDecoder {
                 else {
                     return Ok(false);
                 };
+                // Même géométrie que le decode, résolue une seule fois par couche.
+                let theta = self.config.rope_theta.ok_or_else(|| {
+                    InferError::Config("rope_theta absent (setup résident)".to_string())
+                })?;
+                let rope = self
+                    .config
+                    .resident_full_attn_layer_dims(index, 0, 0, 0.0, theta)?;
+                let rope_frequencies =
+                    metal.rope_frequencies(rope.theta, rope.rope_frequency_dim)?;
                 let v_proj = attention.resident_v_proj();
                 let Some(post_norm) = layer.post_attention_norm.as_ref() else {
                     return Ok(false);
@@ -625,6 +644,7 @@ impl CausalDecoder {
                         {
                             layer_buffers.push(ResidentLayerBuffers::FullMoe(
                                 ResidentFullMoeBuffers {
+                                    rope_frequencies,
                                     input_norm,
                                     qkv_proj,
                                     q_proj: metal.resolve_linear_weight_buffers(
@@ -661,6 +681,7 @@ impl CausalDecoder {
                             };
                             layer_buffers.push(ResidentLayerBuffers::FullRouted(
                                 ResidentFullRoutedBuffers {
+                                    rope_frequencies,
                                     input_norm,
                                     qkv_proj,
                                     o_proj,
@@ -733,6 +754,7 @@ impl CausalDecoder {
                             };
                         layer_buffers.push(ResidentLayerBuffers::FullDense(
                             ResidentFullDenseBuffers {
+                                rope_frequencies,
                                 input_norm: metal.cached_buffer_from_f32(
                                     layer.input_norm.data(),
                                     "resident_dense_full_input_norm",
@@ -879,20 +901,6 @@ impl CausalDecoder {
         }
         let t_arena_new = trace_setup.then(std::time::Instant::now);
         let mut arena = DecodeResidentState::new(metal.device().clone())?;
-        if let Some(theta) = self.config.rope_theta {
-            for index in 0..self.layers.len() {
-                if self.config.is_resident_full_attention_layer(index) {
-                    let head_dim = self.config.layer_head_dim(index)?;
-                    let fd = self.config.layer_rope_frequency_dim(index, head_dim);
-                    let theta = self
-                        .config
-                        .layer_rope_theta_override(index)
-                        .unwrap_or(theta);
-                    arena.rope_frequencies(theta, fd)?;
-                    metal.rope_frequencies(theta, fd)?;
-                }
-            }
-        }
         if let Some(t) = t_arena_new {
             eprintln!("mtp_setup arena_new_kernels_us={}", t.elapsed().as_micros());
         }

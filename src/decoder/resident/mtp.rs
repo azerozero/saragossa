@@ -35,6 +35,7 @@ impl ResidentMtpLayer {
         match self {
             Self::Dense(layer) => {
                 let weights = FullAttnDenseLayerWeights {
+                    rope_frequencies: &layer.rope_frequencies,
                     input_norm: &layer.input_norm,
                     qkv_proj: layer.qkv_proj.as_ref(),
                     qkv_proj_without_gate: false,
@@ -62,6 +63,7 @@ impl ResidentMtpLayer {
             }
             Self::Moe(layer) => {
                 let weights = FullAttnLayerWeights {
+                    rope_frequencies: &layer.rope_frequencies,
                     input_norm: &layer.input_norm,
                     qkv_proj: layer.qkv_proj.as_ref(),
                     q_proj: &layer.q_proj,

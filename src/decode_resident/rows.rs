@@ -860,7 +860,7 @@ impl DecodeResidentState {
     /// Renvoie une erreur si une dimension déborde `u32` ou si les kernels ne compilent pas.
     #[expect(
         clippy::too_many_arguments,
-        reason = "mirror des paramètres rms_norm+RoPE (dims + position + theta) et strides"
+        reason = "mirror des paramètres rms_norm+RoPE (dims + position + fréquences) et strides"
     )]
     pub(super) fn encode_rms_norm_rope_decode_rows(
         &self,
@@ -875,11 +875,10 @@ impl DecodeResidentState {
         num_heads: usize,
         head_dim: usize,
         rope_dims: usize,
-        rope_frequency_dim: usize,
+        frequencies: &BufferRef,
         position: usize,
         rows: usize,
         eps: f32,
-        base_theta: f32,
     ) -> Result<()> {
         let dims = [
             to_u32(num_heads, "rope rows num_heads")?,
@@ -887,8 +886,7 @@ impl DecodeResidentState {
             to_u32(rope_dims, "rope rows rope_dims")?,
             to_u32(position, "rope rows position")?,
         ];
-        let params: [f32; 2] = [eps, base_theta];
-        let frequencies = self.rope_frequencies(base_theta, rope_frequency_dim)?;
+        let params: [f32; 2] = [eps, 0.0];
         let strides = [
             to_u32(input_stride, "rope rows input_stride")?,
             to_u32(output_stride, "rope rows output_stride")?,
@@ -904,7 +902,7 @@ impl DecodeResidentState {
         encoder.set_buffer(2, Some(output), 0);
         set_bytes(encoder, 3, &dims);
         set_bytes(encoder, 4, &params);
-        encoder.set_buffer(5, Some(&frequencies), 0);
+        encoder.set_buffer(5, Some(frequencies), 0);
         set_bytes(encoder, 6, &strides);
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(

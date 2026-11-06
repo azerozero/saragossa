@@ -381,7 +381,6 @@ impl DecodeResidentState {
             copy_at_bf16_to_f32_kernel,
             rope_append_kv_kernels,
             gpu_position_kernels: OnceLock::new(),
-            rope_frequencies: crate::metal_backend::rope::RopeFrequencyCache::default(),
             rows_kernels: OnceLock::new(),
             kv_quant_kernels: OnceLock::new(),
             sink_kernels: OnceLock::new(),

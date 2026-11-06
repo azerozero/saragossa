@@ -107,7 +107,6 @@ pub(crate) use self::utils::{kv_bf16_dense, kv_bf16_dense_by_default, kv_element
 /// clonable** : un état résident GPU est lié à une session.
 #[derive(Debug)]
 pub(crate) struct DecodeResidentState {
-    rope_frequencies: crate::metal_backend::rope::RopeFrequencyCache,
     device: Device,
     queue: CommandQueue,
     options: MTLResourceOptions,

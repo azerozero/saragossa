@@ -5,6 +5,7 @@ use super::tests::{
     encode_legacy_rope, lease_with, read_bf16_as_f32, read_f32, LEGACY_ROPE_DECODE_KERNEL,
 };
 use super::*;
+use crate::metal_backend::rope::create_rope_frequencies;
 use crate::metal_backend::{install_verify_tree_scope, PrefillAttentionSpec, VerifyTree};
 use std::rc::Rc;
 
@@ -164,6 +165,7 @@ fn check_path(path: Path) -> Result<()> {
     )?;
     let mut legacy_long_error = 0.0_f32;
     for (head_dim, rope_dims, fd, theta) in geometries() {
+        let frequencies = create_rope_frequencies(state.device(), theta, fd)?;
         let rows = if matches!(path, Path::Rows | Path::Tree | Path::Prefill) {
             ROWS
         } else {
@@ -180,13 +182,6 @@ fn check_path(path: Path) -> Result<()> {
             // afin de tester l’addition de l’offset et les profondeurs d’arbre.
             let base = position - usize::from(rows > 1);
             let dims = dims(head_dim, rope_dims, fd, theta, base);
-            let frequencies = state.rope_frequencies(theta, fd)?;
-            let cached = state.rope_frequencies(theta, fd)?;
-            assert_eq!(
-                frequencies.contents(),
-                cached.contents(),
-                "tampon réutilisé"
-            );
             assert_eq!(frequencies.length(), (fd / 2).max(1) as u64 * 4);
             let mut kv = state.full_attention(1, HEADS, HEADS, head_dim, false)?;
             let command = state.queue().new_command_buffer();
@@ -200,10 +195,9 @@ fn check_path(path: Path) -> Result<()> {
                     HEADS,
                     head_dim,
                     rope_dims,
-                    fd,
+                    &frequencies,
                     base,
                     dims.eps,
-                    theta,
                 )?,
                 Path::Append => {
                     let hit = crate::runtime_flags::with_rope_append_kv_override(true, || {
@@ -243,11 +237,10 @@ fn check_path(path: Path) -> Result<()> {
                         HEADS,
                         head_dim,
                         rope_dims,
-                        fd,
+                        &frequencies,
                         base,
                         rows,
                         dims.eps,
-                        theta,
                     )?;
                 }
                 Path::Prefill => executor
@@ -355,6 +348,7 @@ fn rope_prefill_and_decode_keys_are_bit_identical() -> Result<()> {
     let state = gpu_state()?;
     let executor = MetalExecutor::new()?;
     for (head_dim, rope_dims, fd, theta) in geometries() {
+        let frequencies = create_rope_frequencies(state.device(), theta, fd)?;
         let width = HEADS * head_dim;
         let (input, weight) = data(head_dim, ROWS);
         let input_gpu = lease_with(&state, &input)?;
@@ -395,10 +389,9 @@ fn rope_prefill_and_decode_keys_are_bit_identical() -> Result<()> {
                     HEADS,
                     head_dim,
                     rope_dims,
-                    fd,
+                    &frequencies,
                     base + row,
                     dims.eps,
-                    theta,
                 )?;
                 prefill_kv.encode_append_kv_with_offsets(
                     encoder,
