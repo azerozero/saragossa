@@ -1323,8 +1323,15 @@ fn rope_rotations_use_scaled_positions_times_common_frequencies() -> Result<()> 
                         assert_eq!(rotations.len(), rope_dims / 2);
                         for ((cos, sin), frequency) in rotations.iter().zip(&inv) {
                             let angle = (position as f32 * position_scale) * frequency;
-                            assert_eq!(cos.to_bits(), angle.cos().to_bits());
-                            assert_eq!(sin.to_bits(), angle.sin().to_bits());
+                            // `cosf`/`sinf` peuvent différer d'un ulp entre debug
+                            // et release (optimisations de libm) : 2 ulp admis.
+                            // L'ancienne forme `/powf` décale l'angle d'environ
+                            // un ulp d'angle, soit bien plus de 2 ulp de cos/sin
+                            // aux positions longues.
+                            let ulps =
+                                |a: f32, b: f32| (a.to_bits() as i64 - b.to_bits() as i64).abs();
+                            assert!(ulps(*cos, angle.cos()) <= 2, "cos à {position}");
+                            assert!(ulps(*sin, angle.sin()) <= 2, "sin à {position}");
                         }
                     }
                 }

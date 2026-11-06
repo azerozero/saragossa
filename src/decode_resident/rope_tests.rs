@@ -314,26 +314,26 @@ fn check_path(path: Path) -> Result<()> {
 }
 
 #[test]
-#[ignore = "phase GPU dédiée après le bench"]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn rope_decode_matches_common_cpu_at_long_positions() -> Result<()> {
     check_path(Path::Decode)
 }
 
 #[test]
-#[ignore = "phase GPU dédiée après le bench"]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn rope_append_matches_common_cpu_at_long_positions() -> Result<()> {
     check_path(Path::Append)
 }
 
 #[test]
-#[ignore = "phase GPU dédiée après le bench"]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn rope_rows_matches_common_cpu_at_long_positions() -> Result<()> {
     check_path(Path::Rows)?;
     check_path(Path::Tree)
 }
 
 #[test]
-#[ignore = "phase GPU dédiée après le bench"]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn rope_prefill_matches_common_cpu_at_long_positions() -> Result<()> {
     check_path(Path::Prefill)
 }
@@ -343,7 +343,7 @@ fn rope_prefill_matches_common_cpu_at_long_positions() -> Result<()> {
 /// prefill et la conversion entière du decode sont exactes : K doit être
 /// identique en f32, puis après la conversion GPU en bf16.
 #[test]
-#[ignore = "phase GPU dédiée après le bench"]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn rope_prefill_and_decode_keys_are_bit_identical() -> Result<()> {
     let state = gpu_state()?;
     let executor = MetalExecutor::new()?;
