@@ -957,10 +957,12 @@ fn n2_resident_decode_matches_cpu_reference() {
     native_first.unwrap_or_else(|e| panic!("passe native : {e}"));
 }
 
-/// Débit AR résident : contexte de 1024 tokens (texte du golden), puis decode
-/// glouton chronométré token par token (temps mural, argmax relu). Affiche
-/// médiane, p10/p90 et le temps CPU de préparation (embedding + PLE). À lancer
-/// seulement machine libre.
+/// Débit AR résident : `SARAGOSSA_FLASH_NEXT_BENCH_RUNS` répétitions (3 par
+/// défaut) d'un contexte de 1024 tokens (texte du golden, reset entre les
+/// répétitions) puis de 256 pas gloutons chronométrés. Publie, par
+/// répétition, le débit mural `tokens / durée totale` (porte des 45 tok/s,
+/// évaluée sur la plus lente), la médiane, p10/p90 et le maximum par pas, et le
+/// temps CPU de préparation (embedding + PLE). À lancer seulement machine libre.
 #[test]
 #[ignore = "débit : poids réels, machine libre"]
 fn bench_resident_decode_after_1k_context() {
@@ -970,6 +972,9 @@ fn bench_resident_decode_after_1k_context() {
     );
     let golden =
         std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let runs: usize = crate::runtime_flags::env_var("SARAGOSSA_FLASH_NEXT_BENCH_RUNS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let (context, generated) = (1024, 256);
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let mut session = FlashNextSession::open(
@@ -978,36 +983,46 @@ fn bench_resident_decode_after_1k_context() {
         Some(&crate::MemoryGuard::process()),
     )
     .expect("invariant: session");
-    let mut next = 0;
-    for &token in &ids[..context] {
-        next = session
-            .step(token, false, false)
-            .expect("invariant: contexte")
-            .argmax as usize;
-    }
-    let mut walls = Vec::with_capacity(generated);
-    let mut hosts = Vec::with_capacity(generated);
-    for _ in 0..generated {
-        let started = std::time::Instant::now();
-        let out = session.step(next, false, false).expect("invariant: decode");
-        walls.push(started.elapsed().as_secs_f64() * 1e3);
-        hosts.push(out.host.as_secs_f64() * 1e3);
-        next = out.argmax as usize;
-    }
-    let pct = |v: &mut Vec<f64>, q: f64| {
+    let pct = |v: &[f64], q: f64| {
+        let mut v = v.to_vec();
         v.sort_by(f64::total_cmp);
         v[((v.len() - 1) as f64 * q).round() as usize]
     };
-    let (p10, p50, p90) = (
-        pct(&mut walls, 0.1),
-        pct(&mut walls, 0.5),
-        pct(&mut walls, 0.9),
-    );
-    let host = pct(&mut hosts, 0.5);
+    let mut slowest = f64::INFINITY;
+    for run in 0..runs {
+        session.reset().expect("invariant: reset");
+        let mut next = 0;
+        for &token in &ids[..context] {
+            next = session
+                .step(token, false, false)
+                .expect("invariant: contexte")
+                .argmax as usize;
+        }
+        let mut walls = Vec::with_capacity(generated);
+        let mut hosts = Vec::with_capacity(generated);
+        let started = std::time::Instant::now();
+        for _ in 0..generated {
+            let step = std::time::Instant::now();
+            let out = session.step(next, false, false).expect("invariant: decode");
+            walls.push(step.elapsed().as_secs_f64() * 1e3);
+            hosts.push(out.host.as_secs_f64() * 1e3);
+            next = out.argmax as usize;
+        }
+        let throughput = generated as f64 / started.elapsed().as_secs_f64();
+        slowest = slowest.min(throughput);
+        eprintln!(
+            "répétition {run} : {throughput:.1} tok/s ({generated} tokens / durée totale) ; \
+             par pas médiane {:.2} ms, p10 {:.2}, p90 {:.2}, max {:.2} ; préparation CPU médiane {:.3} ms",
+            pct(&walls, 0.5),
+            pct(&walls, 0.1),
+            pct(&walls, 0.9),
+            pct(&walls, 1.0),
+            pct(&hosts, 0.5)
+        );
+    }
     eprintln!(
-        "decode après {context} tokens, {generated} pas : médiane {p50:.2} ms ({:.1} tok/s), \
-         p10 {p10:.2}, p90 {p90:.2} ; préparation CPU médiane {host:.3} ms",
-        1e3 / p50
+        "porte 45 tok/s à 1k (répétition la plus lente, {slowest:.1} tok/s) : {}",
+        if slowest >= 45.0 { "verte" } else { "rouge" }
     );
 }
 
@@ -1052,7 +1067,8 @@ fn resident_config_validation_accepts_flash_next_and_refuses_variants() -> Resul
 
 /// Reprise après échec : au token 6, une lecture n-gram puis un encodage
 /// (après la couche 20) échouent ; la session garde sa position, restaure KV
-/// et PLE, puis redonne au bit près les logits d'une session sans échec.
+/// et PLE, puis redonne au bit près les logits d'une session sans échec. Un
+/// reset rejoue ensuite le début de la séquence à l'identique.
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn resident_session_recovers_after_ple_and_encode_failures() {
@@ -1102,10 +1118,20 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
         let got = session
             .step(token, true, false)
             .expect("invariant: pas repris");
-        assert_eq!(
-            got.logits.expect("invariant: logits"),
-            expected[t],
+        assert!(
+            got.logits.expect("invariant: logits") == expected[t],
             "token {t}"
+        );
+    }
+    // Reset : la séquence rejouée depuis le début redonne les mêmes logits.
+    session.reset().expect("invariant: reset");
+    for (t, &token) in ids.iter().enumerate().take(4) {
+        let got = session
+            .step(token, true, false)
+            .expect("invariant: pas après reset");
+        assert!(
+            got.logits.expect("invariant: logits") == expected[t],
+            "token {t} après reset"
         );
     }
 }

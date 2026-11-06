@@ -83,6 +83,8 @@ pub(crate) struct FlashNextSession {
     linear_dims: LinearAttnResidentDims,
     position: usize,
     capacity: usize,
+    /// États DeltaNet initiaux (nuls), pour [`Self::reset`].
+    initial_linear: Vec<Option<LinearAttentionMetalState>>,
     /// Vrai après une erreur d'exécution GPU : états incertains, pas refusés.
     poisoned: bool,
     /// Oracles : experts routés par couche du dernier pas `[couches × top_k]`.
@@ -311,6 +313,7 @@ impl FlashNextSession {
             linear_dims,
             position: 0,
             capacity,
+            initial_linear: Vec::new(),
             poisoned: false,
             #[cfg(test)]
             routing_capture: executor.device().new_buffer(
@@ -327,6 +330,16 @@ impl FlashNextSession {
             ckpt,
         };
         session.states = session.fresh_states(capacity)?;
+        session.initial_linear = session
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Linear(state) => {
+                    session.executor.snapshot_linear_attn_state(state).map(Some)
+                }
+                LayerState::Full(_) => Ok(None),
+            })
+            .collect::<Result<_>>()?;
         Ok(session)
     }
 
@@ -375,6 +388,34 @@ impl FlashNextSession {
     #[cfg(test)]
     pub(crate) fn position(&self) -> usize {
         self.position
+    }
+
+    /// Remet la session au début d'une séquence : états DeltaNet initiaux, KV
+    /// vide, PLE remis à zéro. Lève l'invalidation d'une erreur GPU antérieure,
+    /// tout l'état étant réécrit.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de copie Metal ou de troncature du KV.
+    pub(crate) fn reset(&mut self) -> Result<()> {
+        for (state, initial) in self.states.iter_mut().zip(&self.initial_linear) {
+            match (state, initial) {
+                (LayerState::Linear(state), Some(initial)) => {
+                    self.executor.restore_linear_attn_state(state, initial)?;
+                }
+                (LayerState::Full(kv), None) => kv.truncate(0)?,
+                _ => {
+                    return Err(InferError::Config(
+                        "reset Flash-Next : états et instantanés désalignés".to_string(),
+                    ))
+                }
+            }
+        }
+        let c = &self.ckpt.config;
+        self.ple_state.reset(c.ngram_size, c.eos);
+        self.position = 0;
+        self.poisoned = false;
+        Ok(())
     }
 
     /// Décode `token` à la position courante. `logits` et `layers` demandent la
