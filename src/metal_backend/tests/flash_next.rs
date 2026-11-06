@@ -185,3 +185,111 @@ fn flash_next_resident_qmv_real_shapes_route_and_match_cpu() -> Result<()> {
     }
     Ok(())
 }
+
+/// Experts u4 distincts à faible coût : packed commun, échelles et biais
+/// propres à chaque expert (bf16-représentables).
+fn flash_next_expert_u4(base: &AffineQuantizedTensor, expert: usize) -> Result<Linear> {
+    let factor = 1.0 + expert as f32 / 300.0;
+    let scales: Vec<f32> = base.scales_f32().iter().map(|s| bf16_round(s * factor)).collect();
+    let biases: Vec<f32> = base.biases_f32().iter().map(|b| bf16_round(b * factor)).collect();
+    let shape = base.scales_shape().to_vec();
+    Linear::from_weight(
+        LinearWeight::AffineQuantized(AffineQuantizedTensor::new(
+            base.packed_shape(),
+            base.packed_data().to_vec(),
+            Tensor::from_vec(shape.clone(), scales)?,
+            Tensor::from_vec(shape, biases)?,
+            64,
+            4,
+        )?),
+        None,
+    )
+}
+
+/// MoE résident Flash-Next : 512 experts, top-10, intermédiaire 640 (queue du
+/// down hors alignement 512), routeur et gate partagée denses (copies bf16),
+/// expert partagé, résiduel. Oracle CPU : softmax f32 sur les 512 logits, top-10
+/// renormalisé (`norm_topk_prob`), experts déquantifiés, `σ(gate)·partagé`.
+#[test]
+fn flash_next_moe_512_top10_inter640_matches_cpu() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (hidden, inter, experts_n, top_k) = (1024_usize, 640_usize, 512_usize, 10_usize);
+    let bases = [
+        test_affine_random_u4(inter, hidden, 31)?,
+        test_affine_random_u4(inter, hidden, 32)?,
+        test_affine_random_u4(hidden, inter, 33)?,
+    ];
+    let experts: Vec<GatedMlp> = (0..experts_n)
+        .map(|e| {
+            Ok(GatedMlp::new(
+                flash_next_expert_u4(&bases[0], e)?,
+                flash_next_expert_u4(&bases[1], e)?,
+                flash_next_expert_u4(&bases[2], e)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let shared = GatedMlp::new(
+        flash_next_expert_u4(&test_affine_random_u4(inter, hidden, 41)?, 0)?,
+        flash_next_expert_u4(&test_affine_random_u4(inter, hidden, 42)?, 0)?,
+        flash_next_expert_u4(&test_affine_random_u4(hidden, inter, 43)?, 0)?,
+    );
+    let mut rng = crate::linear_attention::tests::DeterministicF32::new(0x0512_0010);
+    let router_w: Vec<f32> = rng
+        .fill(experts_n * hidden, -0.05, 0.05)
+        .into_iter()
+        .map(bf16_round)
+        .collect();
+    let router = Linear::from_weight(
+        LinearWeight::Dense(Tensor::from_vec(vec![experts_n, hidden], router_w.clone())?),
+        None,
+    )?;
+    let gate_w: Vec<f32> = varied_row(hidden, 977).iter().map(|v| bf16_round(v * 0.02)).collect();
+    let shared_gate = Linear::from_weight(
+        LinearWeight::Dense(Tensor::from_vec(vec![1, hidden], gate_w.clone())?),
+        None,
+    )?;
+    let weights = executor.resolve_moe_shared_weights(&router, &experts, &shared, &shared_gate)?;
+    let x = rng.fill(hidden, -1.0, 1.0);
+    let residual = varied_row(hidden, 733);
+
+    // Oracle CPU.
+    let dot = |w: &[f32], v: &[f32]| w.iter().zip(v).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>();
+    let logits: Vec<f32> = router_w.chunks_exact(hidden).map(|w| dot(w, &x) as f32).collect();
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let probs: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+    let mut order: Vec<usize> = (0..experts_n).collect();
+    order.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]).then(a.cmp(&b)));
+    let margin = probs[order[top_k - 1]] - probs[order[top_k]];
+    assert!(margin > 1.0e-4 * probs[order[0]], "fixture à quasi-égalité au seuil : {margin}");
+    let chosen = &order[..top_k];
+    let total: f32 = chosen.iter().map(|&e| probs[e]).sum();
+    let row = Tensor::from_vec(vec![1, hidden], x.clone())?;
+    let mlp = |m: &GatedMlp| -> Result<Vec<f32>> { Ok(m.forward(&row)?.data().to_vec()) };
+    let mut expected = residual.clone();
+    for &e in chosen {
+        let y = mlp(&experts[e])?;
+        let p = probs[e] / total;
+        expected.iter_mut().zip(&y).for_each(|(o, v)| *o += p * v);
+    }
+    let s = 1.0 / (1.0 + (-(dot(&gate_w, &x) as f32)).exp());
+    let y = mlp(&shared)?;
+    expected.iter_mut().zip(&y).for_each(|(o, v)| *o += s * v);
+
+    let input = executor.buffer_from_slice(&x, "flash_next_moe_in")?;
+    let res = executor.buffer_from_slice(&residual, "flash_next_moe_res")?;
+    let out = executor.uncached_f32_buffer(hidden, "flash_next_moe_out")?;
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let mut owned = Vec::new();
+    executor.encode_moe_shared_buffers(
+        encoder, &mut owned, &input, Some(&res), &out, hidden, &weights, top_k,
+    )?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    let gpu = read_f32_buffer(&out, hidden)?;
+    let (err, max_abs) = crate::qwen4_exp::math::relative_error(&gpu, &expected);
+    assert!(err <= 1.0e-5, "MoE 512/top-10 : erreur relative {err} (max {max_abs})");
+    Ok(())
+}
