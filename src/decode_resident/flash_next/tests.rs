@@ -491,6 +491,57 @@ struct TokenReport {
     routing: Vec<Vec<usize>>,
     /// Points `(couche)` imposés à ce token.
     imposed: Vec<usize>,
+    /// Blocs QSA retenus par le GPU et scores de son indexeur `[couche]`
+    /// (régime creux seulement).
+    qsa: Vec<Option<(Vec<usize>, Vec<f32>)>>,
+    /// Couches QSA dont la sélection a été imposée à ce token.
+    qsa_imposed: Vec<usize>,
+}
+
+/// Blocs retenus par le CPU au token `t` d'une couche QSA en régime creux.
+fn cpu_blocks(cpu: &CpuChain, layer: usize, t: usize) -> Option<Vec<usize>> {
+    let trace = cpu.qsa[layer].as_ref()?;
+    let complete = trace.scores[t].len();
+    (complete > cpu.keep).then(|| {
+        trace.selected[t][..cpu.keep * cpu.compress]
+            .chunks_exact(cpu.compress)
+            .map(|c| c[0] / cpu.compress)
+            .collect()
+    })
+}
+
+/// Score CPU du dernier bloc retenu (seuil du top-k QSA) et marge relative au
+/// premier bloc écarté : `(s_keep − s_keep+1) / max(|s_keep|, 1)`.
+fn qsa_threshold(cpu: &CpuChain, layer: usize, t: usize) -> Option<(f32, f32)> {
+    let trace = cpu.qsa[layer].as_ref()?;
+    let row = &trace.scores[t];
+    if row.len() <= cpu.keep {
+        return None;
+    }
+    let mut sorted = row.clone();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    let threshold = sorted[cpu.keep - 1];
+    Some((
+        threshold,
+        (threshold - sorted[cpu.keep]) / threshold.abs().max(1.0),
+    ))
+}
+
+/// Vrai si l'échange entre les blocs GPU et CPU ne porte que sur des blocs dont
+/// le score CPU est à `tie` (relatif) du seuil.
+fn qsa_swap_justified(cpu: &CpuChain, layer: usize, t: usize, gpu: &[usize], tie: f32) -> bool {
+    let (Some(want), Some((threshold, _)), Some(trace)) = (
+        cpu_blocks(cpu, layer, t),
+        qsa_threshold(cpu, layer, t),
+        cpu.qsa[layer].as_ref(),
+    ) else {
+        return false;
+    };
+    let row = &trace.scores[t];
+    gpu.iter()
+        .filter(|b| !want.contains(b))
+        .chain(want.iter().filter(|b| !gpu.contains(b)))
+        .all(|&b| b < row.len() && (row[b] - threshold).abs() <= tie * threshold.abs().max(1.0))
 }
 
 /// Référence CPU d'une séquence.
@@ -503,6 +554,11 @@ struct CpuChain {
     margins: Vec<Vec<f32>>,
     /// `(k-ième, (k+1)-ième)` experts `[couche][token]`.
     boundary: Vec<Vec<(usize, usize)>>,
+    /// Trace QSA (tokens retenus, scores de blocs) des couches QSA.
+    qsa: Vec<Option<crate::qwen4_exp::QsaTrace>>,
+    /// Blocs retenus en régime creux (`budget / compress`).
+    keep: usize,
+    compress: usize,
     width: usize,
     vocab: usize,
 }
@@ -579,6 +635,22 @@ fn run_resident_pass(
         let imposed = (0..layers)
             .filter(|&l| session.forced_routing[l].is_some())
             .collect();
+        session.forced_selection = (0..layers)
+            .map(|layer| {
+                let th = threshold?;
+                let (_, margin) = qsa_threshold(cpu, layer, t)?;
+                (margin <= th).then(|| {
+                    cpu_blocks(cpu, layer, t)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|b| b as u32)
+                        .collect()
+                })
+            })
+            .collect();
+        let qsa_imposed = (0..layers)
+            .filter(|&l| session.forced_selection[l].is_some())
+            .collect();
         let out = session
             .step(token, true, true)
             .expect("invariant: pas résident");
@@ -623,12 +695,26 @@ fn run_resident_pass(
                 set
             })
             .collect();
+        let qsa = out
+            .qsa
+            .expect("invariant: QSA GPU")
+            .into_iter()
+            .map(|entry| {
+                entry.map(|(blocks, scores)| {
+                    let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b as usize).collect();
+                    blocks.sort_unstable();
+                    (blocks, scores)
+                })
+            })
+            .collect();
         reports.push(TokenReport {
             layer_errors,
             kl,
             swap,
             routing,
             imposed,
+            qsa,
+            qsa_imposed,
         });
     }
     reports
@@ -645,6 +731,8 @@ struct Summary {
     first: Option<(usize, usize, f64)>,
     /// Points non imposés où le GPU route autrement que le CPU.
     routing_mismatches: usize,
+    /// Points QSA non imposés où le GPU retient d'autres blocs que le CPU.
+    qsa_mismatches: usize,
 }
 
 /// Synthèse d'une passe sur le préfixe `[0, prefix)`.
@@ -679,6 +767,18 @@ fn summarize(reports: &[TokenReport], cpu: &CpuChain, prefix: usize) -> Summary 
                 .count()
         })
         .sum();
+    let qsa_mismatches = reports
+        .iter()
+        .enumerate()
+        .map(|(t, r)| {
+            (0..r.qsa.len())
+                .filter(|&l| {
+                    !r.qsa_imposed.contains(&l)
+                        && r.qsa[l].as_ref().map(|(b, _)| b) != cpu_blocks(cpu, l, t).as_ref()
+                })
+                .count()
+        })
+        .sum();
     Summary {
         worst,
         kl,
@@ -686,6 +786,7 @@ fn summarize(reports: &[TokenReport], cpu: &CpuChain, prefix: usize) -> Summary 
         bad: bad.len(),
         first: bad.first().copied(),
         routing_mismatches,
+        qsa_mismatches,
     }
 }
 
@@ -697,6 +798,7 @@ fn forced_gate_green(summary: &Summary) -> bool {
         && within(summary.kl, 1.0e-3)
         && summary.swaps.iter().all(|s| within(s.3, 1.0e-5))
         && summary.routing_mismatches == 0
+        && summary.qsa_mismatches == 0
 }
 
 /// Contrôle de la passe native : jusqu'à la première bascule de routage
@@ -707,9 +809,14 @@ fn native_check(
     reports: &[TokenReport],
     cpu: &CpuChain,
 ) -> std::result::Result<Option<(usize, usize, f32)>, String> {
+    // Première divergence : sélection QSA (calculée avant le MoE de la couche)
+    // ou routage, dans l'ordre (token, couche).
+    let qsa_diff = |t: usize, r: &TokenReport, l: usize| {
+        r.qsa[l].as_ref().map(|(b, _)| b) != cpu_blocks(cpu, l, t).as_ref()
+    };
     let first = reports.iter().enumerate().find_map(|(t, r)| {
         (0..r.routing.len())
-            .find(|&l| r.routing[l] != cpu.routing[l][t])
+            .find(|&l| qsa_diff(t, r, l) || r.routing[l] != cpu.routing[l][t])
             .map(|l| (t, l))
     });
     let (end_token, end_layer) = first.unwrap_or((reports.len(), 0));
@@ -734,6 +841,19 @@ fn native_check(
     let Some((t, l)) = first else {
         return Ok(None);
     };
+    if qsa_diff(t, &reports[t], l) {
+        let gpu = reports[t].qsa[l]
+            .as_ref()
+            .map(|(b, _)| b.clone())
+            .unwrap_or_default();
+        if !qsa_swap_justified(cpu, l, t, &gpu, NATIVE_FIRST_TIE) {
+            return Err(format!(
+                "première divergence QSA (token {t}, couche {l}) hors quasi-égalité"
+            ));
+        }
+        let (_, margin) = qsa_threshold(cpu, l, t).unwrap_or((0.0, f32::NAN));
+        return Ok(Some((t, l, margin)));
+    }
     let margin = cpu.margins[l][t];
     if !within(margin, f64::from(NATIVE_FIRST_TIE)) {
         return Err(format!(
@@ -791,6 +911,9 @@ fn n2_gate_refuses_late_nan_and_native_check_refuses_early_drift() {
         routing: vec![vec![vec![1, 2]; 4]],
         margins: vec![vec![1.0; 4]],
         boundary: vec![vec![(2, 3); 4]],
+        qsa: vec![None],
+        keep: 512,
+        compress: 4,
         width: 1,
         vocab: 1,
     };
@@ -800,6 +923,8 @@ fn n2_gate_refuses_late_nan_and_native_check_refuses_early_drift() {
         swap: None,
         routing: vec![vec![1, 2]],
         imposed: Vec::new(),
+        qsa: vec![None],
+        qsa_imposed: Vec::new(),
     };
     let clean: Vec<TokenReport> = (0..4).map(|_| report(1.0e-6, 1.0e-9)).collect();
     assert!(forced_gate_green(&summarize(&clean, &cpu, 4)));
@@ -856,8 +981,8 @@ fn n2_resident_decode_matches_cpu_reference() {
         Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
     let config = &reference.checkpoint().config;
     let mut h = reference.embed(&ids).expect("invariant: embedding");
-    let (mut layers, mut routing, mut margins, mut boundary) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut layers, mut routing, mut margins, mut boundary, mut qsa) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for index in 0..config.layer_kinds.len() {
         let out = reference
             .layer(index, &h, &ids)
@@ -867,6 +992,7 @@ fn n2_resident_decode_matches_cpu_reference() {
         routing.push(out.routing);
         margins.push(out.routing_margins);
         boundary.push(out.routing_boundary);
+        qsa.push(out.qsa);
     }
     let cpu = CpuChain {
         logits: reference
@@ -878,6 +1004,9 @@ fn n2_resident_decode_matches_cpu_reference() {
         routing,
         margins,
         boundary,
+        qsa,
+        keep: config.indexer_budget / config.indexer_compress,
+        compress: config.indexer_compress,
     };
     assert!(
         cpu.logits.data().iter().all(|v| v.is_finite()),
@@ -902,6 +1031,29 @@ fn n2_resident_decode_matches_cpu_reference() {
     prefixes.dedup();
     let native = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Native, tokens);
     let native_first = native_check(&native, &cpu);
+    // Erreur des scores GPU de l'indexeur avant la première divergence (calibre
+    // la règle de quasi-égalité QSA) et points QSA par seuil.
+    let horizon = native_first
+        .as_ref()
+        .ok()
+        .and_then(|f| f.map(|(t, _, _)| t))
+        .unwrap_or(tokens);
+    let mut score_error = 0.0_f64;
+    for (t, r) in native[..horizon].iter().enumerate() {
+        for (l, entry) in r.qsa.iter().enumerate() {
+            if let (Some((_, gpu)), Some(trace)) = (entry, cpu.qsa[l].as_ref()) {
+                score_error = nan_max(score_error, relative_error(gpu, &trace.scores[t]).0);
+            }
+        }
+    }
+    eprintln!("scores de l'indexeur GPU/CPU avant la première divergence : écart relatif max {score_error:.2e}");
+    for th in TIE_THRESHOLDS {
+        let n = (0..tokens)
+            .flat_map(|t| (0..cpu.layers.len()).map(move |l| (t, l)))
+            .filter(|&(t, l)| qsa_threshold(&cpu, l, t).is_some_and(|(_, m)| m <= th))
+            .count();
+        eprintln!("points QSA de marge relative ≤ {th:.0e} : {n}");
+    }
     // Toute la séquence native : sorties et métriques finies.
     let native_finite = all_finite(&native);
     let swaps = routing_swaps(&native, &cpu);
@@ -1663,6 +1815,7 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
             (keep * 4) as u64,
             metal::MTLResourceOptions::StorageModeShared,
         ),
+        forced_keepalive: std::cell::RefCell::new(None),
     };
     let mut kv = arena.full_attention_with_format(tokens, 4, 2, 128, KvFormat::F32, None)?;
     let mut gathered =
@@ -1694,6 +1847,7 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
                     compress,
                     keep,
                 },
+                forced: None,
             }),
             t,
             &x_buf,

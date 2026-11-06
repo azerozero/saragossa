@@ -44,6 +44,7 @@ fn gated_mlp(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Result<Te
 pub(crate) fn moe(
     x: &Tensor,
     w: &MoeWeights,
+    forced: Option<&[Option<Vec<usize>>]>,
     mut expert: impl FnMut(usize) -> Result<(Tensor, Tensor, Tensor)>,
 ) -> Result<MoeOutput> {
     let (tokens, hidden) = x.as_matrix()?;
@@ -67,6 +68,15 @@ pub(crate) fn moe(
             _ => f32::INFINITY,
         });
         probs.truncate(w.top_k);
+        // Oracles : experts imposés (quasi-égalité de l'oracle), poids des
+        // probabilités propres renormalisées sur l'ensemble imposé.
+        if let Some(set) = forced
+            .and_then(|f| f.get(chosen.len()))
+            .and_then(Option::as_ref)
+        {
+            let all: Vec<f32> = exp.iter().map(|e| e / sum).collect();
+            probs = set.iter().map(|&e| (e, all[e])).collect();
+        }
         if w.norm_topk_prob {
             let total: f32 = probs.iter().map(|p| p.1).sum();
             probs.iter_mut().for_each(|p| p.1 /= total);

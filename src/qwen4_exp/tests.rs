@@ -83,6 +83,13 @@ impl Golden {
         (entry.shape.clone(), bytes)
     }
 
+    fn has(&self, name: &str) -> bool {
+        read_shard_header(&self.path)
+            .expect("invariant: golden lisible")
+            .tensors
+            .contains_key(name)
+    }
+
     fn f32(&self, name: &str) -> Tensor {
         let (shape, bytes) = self.raw(name);
         let data = bytes
@@ -911,4 +918,111 @@ fn n2_full_model_logits_match_transformers() {
             );
         }
     }
+}
+
+/// N2 long : référence CPU sur 4096 tokens (QSA creuse au-delà de 2051) contre
+/// le golden `long.safetensors` de transformers, chaîne complète des 48 couches.
+///
+/// Pour suivre la trajectoire torch malgré les quasi-égalités, les experts
+/// torch sont imposés aux tokens dont la marge de probabilité torch au seuil du
+/// top-k est ≤ `TIE_TOL`, et la sélection QSA torch est imposée (ablation de
+/// l'étape 1). Ailleurs, routage et sélection propres doivent égaler torch ou
+/// être justifiés par l'oracle (`justify_routing`, `justify_qsa`, scores Rust à
+/// `SCORE_TOL`). Portes : KL ≤ 1e-3 et top-1 identique aux positions figées.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn n2_long_cpu_chain_matches_transformers_on_4k_tokens() {
+    let (dir, golden_dir) = n2_paths();
+    check_provenance(&dir, &golden_dir, "long.safetensors")
+        .unwrap_or_else(|e| panic!("provenance N2 long : {e}"));
+    let reference =
+        Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
+    let golden = Golden {
+        path: golden_dir.join("long.safetensors"),
+    };
+    let ids: Vec<usize> = golden
+        .i64("input_ids")
+        .iter()
+        .map(|&t| t as usize)
+        .collect();
+    let k = reference.checkpoint().config.top_k;
+    let (keep, compress) = (reference.budget_blocks(), reference.compress());
+    let started = std::time::Instant::now();
+    let mut h = reference.embed(&ids).expect("invariant: embedding");
+    let (mut forced_total, mut swaps_total, mut ties_total) = (0, 0, 0);
+    for layer in 0..reference.checkpoint().config.layer_kinds.len() {
+        let (torch_sets, torch_probs) = golden.routing(layer, k);
+        let forced_routing: Vec<Option<Vec<usize>>> = torch_probs
+            .iter()
+            .zip(&torch_sets)
+            .map(|(probs, set)| {
+                let margin = kth_largest(probs, k)
+                    .zip(kth_largest(probs, k + 1))
+                    .map_or(f32::INFINITY, |(a, b)| a - b);
+                (margin <= TIE_TOL).then(|| set.clone())
+            })
+            .collect();
+        forced_total += forced_routing.iter().filter(|f| f.is_some()).count();
+        let torch_selection = golden
+            .has(&format!("qsa_mask.{layer}"))
+            .then(|| golden.mask_selection(&format!("qsa_mask.{layer}")));
+        let out = reference
+            .layer_forced(
+                layer,
+                &h,
+                &ids,
+                torch_selection.as_deref(),
+                Some(&forced_routing),
+            )
+            .expect("invariant: couche CPU");
+        let swaps = justify_routing(&out.routing, &torch_sets, &torch_probs, k)
+            .unwrap_or_else(|e| panic!("routage couche {layer} : {e}"));
+        swaps_total += swaps.len();
+        if let (Some(trace), Some(torch)) = (out.qsa.as_ref(), torch_selection.as_ref()) {
+            let ties = justify_qsa(trace, torch, &golden.qsa_scores(layer), keep, compress)
+                .unwrap_or_else(|e| panic!("QSA couche {layer} : {e}"));
+            ties_total += ties;
+            let sparse = trace.scores.iter().filter(|row| row.len() > keep).count();
+            eprintln!(
+                "couche {layer} : {sparse} requêtes en régime creux, {ties} ex æquo justifiés"
+            );
+        }
+        h = out.hidden;
+    }
+    let positions: Vec<usize> = golden
+        .i64("logit_positions")
+        .iter()
+        .map(|&p| p as usize)
+        .collect();
+    let width = h.as_matrix().expect("invariant: 2D").1;
+    let rows: Vec<f32> = positions
+        .iter()
+        .flat_map(|&p| h.data()[p * width..(p + 1) * width].iter().copied())
+        .collect();
+    let picked = Tensor::from_vec(vec![positions.len(), width], rows).expect("invariant: lignes");
+    let logits = reference
+        .logits(&reference.final_mixer(&picked).expect("invariant: mixer"))
+        .expect("invariant: logits");
+    let oracle = golden.f32("logits");
+    let (mean, worst) = kl_per_token(&oracle, &logits);
+    let vocab = logits.as_matrix().expect("invariant: 2D").1;
+    let top1 = (0..positions.len())
+        .filter(|&i| {
+            argmax(&logits.data()[i * vocab..(i + 1) * vocab])
+                != argmax(&oracle.data()[i * vocab..(i + 1) * vocab])
+        })
+        .count();
+    eprintln!(
+        "N2 long : {} tokens en {:.0} s ; experts imposés {forced_total}, échanges justifiés \
+         {swaps_total}, ex æquo QSA {ties_total} ; KL moyen {mean:.2e}, max {worst:.2e}, \
+         top-1 différents {top1} sur {}",
+        ids.len(),
+        started.elapsed().as_secs_f64(),
+        positions.len()
+    );
+    assert!(
+        mean <= KL_TOL && worst <= KL_TOL,
+        "KL {mean:.2e} / {worst:.2e}"
+    );
+    assert_eq!(top1, 0, "top-1 différent");
 }

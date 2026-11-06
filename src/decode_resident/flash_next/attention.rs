@@ -82,6 +82,9 @@ pub(crate) struct IndexerScratch {
     pub(crate) scores: Buffer,
     /// `[keep]` u32, blocs retenus triés.
     pub(crate) selected: Buffer,
+    /// Oracles : buffer de sélection imposée, gardé vivant jusqu'au pas suivant.
+    #[cfg(test)]
+    pub(crate) forced_keepalive: std::cell::RefCell<Option<Buffer>>,
 }
 
 /// Régime creux d'une couche : indexeur et KV compact du gather.
@@ -92,6 +95,9 @@ pub(crate) struct QsaSparse<'a> {
     pub(crate) scratch: &'a IndexerScratch,
     pub(crate) gathered: &'a mut FullAttentionMetalState,
     pub(crate) dims: IndexerDims,
+    /// Oracles : blocs imposés à la place du top-k (quasi-égalités CPU).
+    #[cfg(test)]
+    pub(crate) forced: Option<Vec<u32>>,
 }
 
 /// Dimensions de l'attention.
@@ -271,6 +277,8 @@ fn encode_indexer<'a>(
         scratch,
         gathered,
         dims: idx,
+        #[cfg(test)]
+        forced,
     } = sparse;
     let d = idx.head_dim;
     let f32_size = std::mem::size_of::<f32>() as u64;
@@ -340,13 +348,44 @@ fn encode_indexer<'a>(
         MTLSize::new(256, 1, 1),
     );
     post_dispatch_barrier(encoder);
-    encoder.set_compute_pipeline_state(&kernels.index_topk);
-    encoder.set_buffer(0, Some(&scratch.scores), 0);
-    encoder.set_buffer(1, Some(&scratch.selected), 0);
-    set_value(encoder, 2, &[complete as u32, idx.keep as u32]);
-    crate::metal_backend::profile_dispatch();
-    encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
-    post_dispatch_barrier(encoder);
+    #[cfg(test)]
+    let imposed = match forced {
+        Some(blocks) => {
+            if blocks.len() != idx.keep || blocks.iter().any(|&b| b as usize >= complete) {
+                return Err(InferError::Dimension(format!(
+                    "sélection QSA imposée invalide ({} blocs sur {complete})",
+                    blocks.len()
+                )));
+            }
+            let forced_buffer = executor.device().new_buffer_with_data(
+                blocks.as_ptr().cast(),
+                (blocks.len() * std::mem::size_of::<u32>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            encoder.set_compute_pipeline_state(&kernels.copy_u32);
+            encoder.set_buffer(0, Some(&forced_buffer), 0);
+            encoder.set_buffer(1, Some(&scratch.selected), 0);
+            set_value(encoder, 2, &[idx.keep as u32, 0]);
+            super::dispatch_1d(encoder, idx.keep);
+            post_dispatch_barrier(encoder);
+            // Le buffer doit survivre au command buffer : on le retient jusqu'au
+            // prochain pas (le pas attend sa fin).
+            *scratch.forced_keepalive.borrow_mut() = Some(forced_buffer);
+            true
+        }
+        None => false,
+    };
+    #[cfg(not(test))]
+    let imposed = false;
+    if !imposed {
+        encoder.set_compute_pipeline_state(&kernels.index_topk);
+        encoder.set_buffer(0, Some(&scratch.scores), 0);
+        encoder.set_buffer(1, Some(&scratch.selected), 0);
+        set_value(encoder, 2, &[complete as u32, idx.keep as u32]);
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
+        post_dispatch_barrier(encoder);
+    }
     let count = idx.keep * idx.compress + (visible - complete * idx.compress);
     let kv_dim = dims.kv_heads * dims.head_dim;
     let (keys, values) = kv.dense_f32_buffers()?;

@@ -37,6 +37,10 @@ enum LayerState {
 /// Capacité maximale d'une session : 256k tokens (contexte cible, plan §8.1).
 pub(crate) const MAX_CAPACITY: usize = 262_144;
 
+/// Blocs QSA retenus et scores de l'indexeur d'une couche (oracles).
+#[cfg(test)]
+pub(crate) type QsaCapture = (Vec<u32>, Vec<f32>);
+
 /// Sorties d'un pas.
 #[cfg_attr(
     not(test),
@@ -55,6 +59,10 @@ pub(crate) struct StepOutput {
     /// (oracles seulement).
     #[cfg(test)]
     pub(crate) routing: Option<Vec<Vec<u32>>>,
+    /// Blocs QSA retenus et scores de l'indexeur par couche (QSA en régime
+    /// creux seulement), si les résiduels sont demandés (oracles).
+    #[cfg(test)]
+    pub(crate) qsa: Option<Vec<Option<QsaCapture>>>,
     /// Préparation CPU avant le commit (embedding, hachage, lectures PLE).
     pub(crate) host: std::time::Duration,
     /// Encodage CPU du command buffer (GPU inactif pendant ce temps).
@@ -119,6 +127,15 @@ pub(crate) struct FlashNextSession {
     /// Oracles : experts imposés au prochain pas, par couche (consommés).
     #[cfg(test)]
     pub(crate) forced_routing: Vec<Option<Vec<u32>>>,
+    /// Oracles : blocs QSA imposés au prochain pas, par couche (consommés).
+    #[cfg(test)]
+    pub(crate) forced_selection: Vec<Option<Vec<u32>>>,
+    /// Oracles : sélection et scores de l'indexeur par couche du dernier pas
+    /// (`[couches, keep]` u32, `[couches, blocs max]` f32).
+    #[cfg(test)]
+    selection_capture: Buffer,
+    #[cfg(test)]
+    score_capture: Buffer,
 }
 
 fn zeros(executor: &MetalExecutor, len: usize) -> Buffer {
@@ -372,6 +389,8 @@ impl FlashNextSession {
                     ((c.indexer_budget / c.indexer_compress) * std::mem::size_of::<u32>()) as u64,
                     MTLResourceOptions::StorageModeShared,
                 ),
+                #[cfg(test)]
+                forced_keepalive: std::cell::RefCell::new(None),
             },
             indexer_dims: IndexerDims {
                 heads: c.indexer_heads,
@@ -406,6 +425,18 @@ impl FlashNextSession {
             fail_encode_after_layer: None,
             #[cfg(test)]
             forced_routing: Vec::new(),
+            #[cfg(test)]
+            forced_selection: Vec::new(),
+            #[cfg(test)]
+            selection_capture: executor.device().new_buffer(
+                (c.layer_kinds.len() * (c.indexer_budget / c.indexer_compress) * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
+            #[cfg(test)]
+            score_capture: zeros(
+                &executor,
+                c.layer_kinds.len() * (capacity / c.indexer_compress + 1),
+            ),
             executor,
             ckpt,
         };
@@ -551,6 +582,31 @@ impl FlashNextSession {
     #[cfg(feature = "devtools")]
     pub(crate) fn profiler_mut(&mut self) -> Option<&mut super::profile::StepProfiler> {
         self.profiler.as_mut()
+    }
+
+    /// Relit la sélection et les scores QSA du dernier pas (oracles). La
+    /// position a déjà avancé : le pas relu est `position − 1`.
+    #[cfg(test)]
+    fn read_qsa_capture(&self) -> Result<Vec<Option<QsaCapture>>> {
+        let c = &self.ckpt.config;
+        let keep = self.indexer_dims.keep;
+        let complete = self.position / self.indexer_dims.compress;
+        let stride = self.capacity / self.indexer_dims.compress + 1;
+        let selections = read_u32_buffer(&self.selection_capture, c.layer_kinds.len() * keep)?;
+        let scores = read_f32_buffer(&self.score_capture, c.layer_kinds.len() * stride)?;
+        Ok(c.layer_kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                (*kind == crate::qwen_loader::qwen4_exp::Qwen4ExpLayerKind::Full && complete > keep)
+                    .then(|| {
+                        (
+                            selections[index * keep..(index + 1) * keep].to_vec(),
+                            scores[index * stride..index * stride + complete].to_vec(),
+                        )
+                    })
+            })
+            .collect())
     }
 
     /// Position du prochain token (oracles).
@@ -744,6 +800,8 @@ impl FlashNextSession {
                 })
                 .transpose()?,
             #[cfg(test)]
+            qsa: layers.then(|| self.read_qsa_capture()).transpose()?,
+            #[cfg(test)]
             routing: layers
                 .then(|| {
                     read_u32_buffer(&self.routing_capture, layer_count * self.ckpt.config.top_k)
@@ -838,11 +896,35 @@ impl FlashNextSession {
                             scratch: &self.indexer_scratch,
                             gathered: &mut self.gathered,
                             dims: self.indexer_dims,
+                            #[cfg(test)]
+                            forced: self.forced_selection.get_mut(index).and_then(Option::take),
                         }),
                         self.position,
                         &self.x,
                         &self.branch,
                     )?;
+                    #[cfg(test)]
+                    {
+                        let complete = (self.position + 1) / self.indexer_dims.compress;
+                        if layers && complete > self.indexer_dims.keep {
+                            let keep = self.indexer_dims.keep;
+                            encoder.set_compute_pipeline_state(&self.kernels.copy_u32);
+                            encoder.set_buffer(0, Some(&self.indexer_scratch.selected), 0);
+                            encoder.set_buffer(1, Some(&self.selection_capture), 0);
+                            super::set_value(encoder, 2, &[keep as u32, (index * keep) as u32]);
+                            super::dispatch_1d(encoder, keep);
+                            let stride = self.capacity / self.indexer_dims.compress + 1;
+                            self.executor.encode_copy_with_offsets(
+                                encoder,
+                                &self.indexer_scratch.scores,
+                                0,
+                                &self.score_capture,
+                                (index * stride * std::mem::size_of::<f32>()) as u64,
+                                complete,
+                            )?;
+                            crate::metal_backend::post_dispatch_barrier(encoder);
+                        }
+                    }
                 }
                 _ => {
                     return Err(InferError::Config(format!(
