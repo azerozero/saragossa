@@ -643,6 +643,14 @@ pub(super) fn moe_shared_route_overlap_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_SHARED_ROUTE_OVERLAP", true))
 }
 
+/// Top-k large (un thread par logit) au-delà de 256 experts ; repli sur le
+/// kernel parallèle avec `SARAGOSSA_RUST_TOPK_WIDE=0`. Il prime sur
+/// `SARAGOSSA_RUST_TOPK_PARALLEL=0` : même résultat, bit à bit, que le kernel parallèle.
+pub(super) fn topk_wide_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TOPK_WIDE", true))
+}
+
 pub(super) fn topk_parallel_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TOPK_PARALLEL", true))

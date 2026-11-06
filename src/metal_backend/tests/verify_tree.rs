@@ -43,6 +43,7 @@ fn linear_attn_tree_kernels_match_chain_per_path() -> Result<()> {
         value_head_dim: 128,
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
     };
     // Entrées pour 16 lignes (journal plein, B = 15) ; chaque arbre en prend
     // ses premières lignes.

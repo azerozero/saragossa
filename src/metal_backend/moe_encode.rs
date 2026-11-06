@@ -3,6 +3,91 @@
 use super::*;
 
 const TOPK_SOFTMAX_TG_WIDTH: u64 = 32;
+/// Experts maximaux du top-k large (un thread par logit).
+const TOPK_WIDE_MAX_COUNT: usize = 1024;
+
+/// Kernel de top-k imposé, compilé seulement pour les tests (absent de la
+/// bibliothèque Metal de production).
+#[cfg(test)]
+pub(super) const TOPK_FORCED_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline bool topk_better(float value, uint index, float best_value, uint best_index) {
+    return (value > best_value) || ((value == best_value) && (index < best_index));
+}
+
+// Top-k IMPOSÉ des oracles. Les `topk` experts donnés sont triés comme `topk_softmax_f32` (logit décroissant, indice
+// croissant) puis pondérés par le même softmax restreint.
+kernel void topk_softmax_forced_f32(
+    device const float* logits [[buffer(0)]],
+    device const uint* forced [[buffer(1)]],
+    device uint* indices [[buffer(2)]],
+    device float* scores [[buffer(3)]],
+    constant uint& topk [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (tid != 0u || topk > 16u) {
+        return;
+    }
+    float values[16];
+    uint chosen[16];
+    for (uint slot = 0u; slot < topk; ++slot) {
+        const uint index = forced[slot];
+        const float value = logits[index];
+        uint pos = slot;
+        while (pos > 0u && topk_better(value, index, values[pos - 1u], chosen[pos - 1u])) {
+            values[pos] = values[pos - 1u];
+            chosen[pos] = chosen[pos - 1u];
+            --pos;
+        }
+        values[pos] = value;
+        chosen[pos] = index;
+    }
+    const float max_value = values[0];
+    float denom = 0.0f;
+    for (uint slot = 0u; slot < topk; ++slot) {
+        denom += exp(values[slot] - max_value);
+    }
+    denom = max(denom, 1.0e-20f);
+    for (uint slot = 0u; slot < topk; ++slot) {
+        indices[slot] = chosen[slot];
+        scores[slot] = exp(values[slot] - max_value) / denom;
+    }
+}
+"#;
+
+#[cfg(test)]
+thread_local! {
+    /// Experts imposés au PROCHAIN `encode_topk_softmax` de ce thread (oracles :
+    /// routage CPU aux quasi-égalités). Consommés une seule fois.
+    static FORCED_TOPK: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Impose les experts du prochain top-k softmax encodé sur ce thread.
+#[cfg(test)]
+pub(crate) fn force_next_topk(experts: Vec<u32>) {
+    FORCED_TOPK.with(|slot| *slot.borrow_mut() = Some(experts));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Buffer d'indices du dernier top-k encodé sur ce thread (oracles : relecture
+    /// du routage GPU par couche).
+    static LAST_TOPK_INDICES: std::cell::RefCell<Option<metal::Buffer>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Prend le buffer d'indices du dernier top-k encodé sur ce thread.
+#[cfg(test)]
+pub(crate) fn take_last_topk_indices() -> Option<metal::Buffer> {
+    LAST_TOPK_INDICES.with(|slot| slot.borrow_mut().take())
+}
+
+/// Vrai si une imposition attend encore d'être consommée.
+#[cfg(test)]
+pub(crate) fn forced_topk_pending() -> bool {
+    FORCED_TOPK.with(|slot| slot.borrow().is_some())
+}
 
 #[expect(
     clippy::too_many_arguments,
@@ -1017,12 +1102,58 @@ impl MetalExecutor {
         topk: usize,
     ) -> Result<()> {
         ensure_valid_top_k(topk, count)?;
+        #[cfg(test)]
+        LAST_TOPK_INDICES.with(|slot| *slot.borrow_mut() = Some(indices_buffer.to_owned()));
+        #[cfg(test)]
+        if let Some(forced) = FORCED_TOPK.with(|slot| slot.borrow_mut().take()) {
+            if forced.len() != topk || forced.iter().any(|&e| e as usize >= count) {
+                return Err(InferError::Dimension(format!(
+                    "top-k imposé {forced:?} incompatible (k={topk}, experts={count})"
+                )));
+            }
+            let forced_buffer = self.buffer_from_slice(&forced, "topk_forced")?;
+            encoder.set_compute_pipeline_state(&self.topk_softmax_forced_f32);
+            encoder.set_buffer(0, Some(logits_buffer), 0);
+            encoder.set_buffer(1, Some(&forced_buffer), 0);
+            encoder.set_buffer(2, Some(indices_buffer), 0);
+            encoder.set_buffer(3, Some(scores_buffer), 0);
+            set_u32_bytes(encoder, 4, &[checked_u32(topk, "topk")?], "topk_forced")?;
+            encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            _owned_buffers.push(forced_buffer);
+            post_dispatch_barrier(encoder);
+            return Ok(());
+        }
         let dims = [
             checked_u32(count, "topk count")?,
             checked_u32(topk, "topk")?,
         ];
         let parallel = topk_parallel_enabled();
         let fast_topk8 = topk8_fast_enabled() && count == 256 && topk == 8;
+        // Au-delà de 256 experts, un thread par logit : le kernel parallèle à 32
+        // threads balaie les logits en série (47 µs à 512 / top-10).
+        let wide = topk_wide_enabled()
+            && count > 256
+            && count <= TOPK_WIDE_MAX_COUNT
+            && topk <= 16
+            && self
+                .topk_softmax_wide_f32
+                .max_total_threads_per_threadgroup()
+                >= TOPK_WIDE_MAX_COUNT as u64;
+        if wide {
+            encoder.set_compute_pipeline_state(&self.topk_softmax_wide_f32);
+            encoder.set_buffer(0, Some(logits_buffer), 0);
+            encoder.set_buffer(1, Some(indices_buffer), 0);
+            encoder.set_buffer(2, Some(scores_buffer), 0);
+            set_u32_bytes(encoder, 3, &dims, "topk_dims")?;
+            trace_dispatch_path("topk_softmax_wide_f32", 1, topk, count);
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(1, 1, 1),
+                MTLSize::new(TOPK_WIDE_MAX_COUNT as u64, 1, 1),
+            );
+            post_dispatch_barrier(encoder);
+            return Ok(());
+        }
         let (pipeline, kernel_name) = if fast_topk8 {
             (&self.topk8_softmax_256_f32, "topk8_softmax_256_f32")
         } else if parallel {

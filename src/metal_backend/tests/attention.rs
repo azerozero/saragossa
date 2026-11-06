@@ -985,6 +985,7 @@ fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
                     value_head_dim: config.value_head_dim,
                     conv_kernel_dim: config.conv_kernel_dim,
                     rms_eps: config.rms_eps,
+                    l2_qk_sigmoid_gate: false,
                 },
             );
             encoder.end_encoding();
@@ -1100,6 +1101,7 @@ fn chunk_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
             value_head_dim: config.value_head_dim,
             conv_kernel_dim: config.conv_kernel_dim,
             rms_eps: config.rms_eps,
+            l2_qk_sigmoid_gate: false,
         },
     );
     encoder.end_encoding();
@@ -1687,6 +1689,7 @@ fn gated_delta_nax_matches_naive_oracle() -> Result<()> {
                 value_head_dim: config.value_head_dim,
                 conv_kernel_dim: config.conv_kernel_dim,
                 rms_eps: config.rms_eps,
+                l2_qk_sigmoid_gate: false,
             },
         );
         encoder.end_encoding();

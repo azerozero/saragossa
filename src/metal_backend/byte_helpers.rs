@@ -114,6 +114,11 @@ pub(crate) fn write_f32_buffer_at(buffer: &BufferRef, offset: usize, data: &[f32
     write_pod_buffer(buffer, offset, data)
 }
 
+/// Écrit des octets bruts (lignes E4M3 du PLE Flash-Next).
+pub(crate) fn write_u8_buffer(buffer: &BufferRef, data: &[u8]) -> Result<()> {
+    write_pod_buffer(buffer, 0, data)
+}
+
 /// Écrit des bits bf16 à partir de l'élément `offset`.
 pub(crate) fn write_u16_buffer_at(buffer: &BufferRef, offset: usize, data: &[u16]) -> Result<()> {
     write_pod_buffer(buffer, offset, data)

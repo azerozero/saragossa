@@ -488,6 +488,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "linear_attn_norm_gates_dk128_f32")?;
         let linear_attn_norm_gates_inv_dk128_f32 =
             pipeline(&library, &device, "linear_attn_norm_gates_inv_dk128_f32")?;
+        let linear_attn_norm_gates_l2_dk128_f32 =
+            pipeline(&library, &device, "linear_attn_norm_gates_l2_dk128_f32")?;
         let linear_attn_conv_norm_gates_k4_dk128_f32 = pipeline(
             &library,
             &device,
@@ -549,6 +551,8 @@ impl MetalExecutor {
         let linear_attn_rms_gate_f32 = pipeline(&library, &device, "linear_attn_rms_gate_f32")?;
         let linear_attn_rms_gate_dv128_f32 =
             pipeline(&library, &device, "linear_attn_rms_gate_dv128_f32")?;
+        let linear_attn_rms_gate_sigmoid_dv128_f32 =
+            pipeline(&library, &device, "linear_attn_rms_gate_sigmoid_dv128_f32")?;
         let linear_attn_rms_gate_batch_dv128_f32 =
             pipeline(&library, &device, "linear_attn_rms_gate_batch_dv128_f32")?;
         let affine_gather_matmul_rhs_t_u32_f32 =
@@ -748,6 +752,15 @@ impl MetalExecutor {
             compile_steel_attention(&device, sources.steel_attention.as_ref());
         let add_rms_norm_row_f32 = pipeline(&library, &device, "add_rms_norm_row_f32")?;
         let topk_softmax_f32 = pipeline(&library, &device, "topk_softmax_f32")?;
+        let topk_softmax_wide_f32 = pipeline(&library, &device, "topk_softmax_wide_f32")?;
+        #[cfg(test)]
+        let topk_softmax_forced_f32 = {
+            let options = metal::CompileOptions::new();
+            let forced = device
+                .new_library_with_source(super::moe_encode::TOPK_FORCED_SOURCE, &options)
+                .map_err(|message| InferError::Metal(format!("kernel top-k imposé : {message}")))?;
+            pipeline(&forced, &device, "topk_softmax_forced_f32")?
+        };
         let topk_sigmoid_f32 = pipeline(&library, &device, "topk_sigmoid_f32")?;
         let topk_sigmoid_rows_f32 = pipeline(&library, &device, "topk_sigmoid_rows_f32")?;
         let topk_softmax_serial_f32 = pipeline(&library, &device, "topk_softmax_serial_f32")?;
@@ -865,6 +878,7 @@ impl MetalExecutor {
             linear_attn_norm_gates_f32,
             linear_attn_norm_gates_dk128_f32,
             linear_attn_norm_gates_inv_dk128_f32,
+            linear_attn_norm_gates_l2_dk128_f32,
             linear_attn_conv_norm_gates_k4_dk128_f32,
             linear_attn_conv_norm_gates_k4_dk128_batch_f32,
             linear_attn_conv_state_shift_f32,
@@ -881,6 +895,7 @@ impl MetalExecutor {
             linear_attn_gated_delta_inv_dk128_tg4_f32,
             linear_attn_rms_gate_f32,
             linear_attn_rms_gate_dv128_f32,
+            linear_attn_rms_gate_sigmoid_dv128_f32,
             linear_attn_rms_gate_batch_dv128_f32,
             affine_gather_matmul_rhs_t_u32_f32,
             affine_gather_qmv_fast_u3_gs64_f32,
@@ -962,6 +977,9 @@ impl MetalExecutor {
             steel_attention_f32_bq32_bk32_bd64,
             add_rms_norm_row_f32,
             topk_softmax_f32,
+            topk_softmax_wide_f32,
+            #[cfg(test)]
+            topk_softmax_forced_f32,
             topk_sigmoid_f32,
             topk_sigmoid_rows_f32,
             topk_softmax_serial_f32,

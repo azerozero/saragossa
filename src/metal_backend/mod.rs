@@ -69,6 +69,8 @@ mod matmul_select;
 mod matmul_weight;
 mod moe;
 mod moe_encode;
+#[cfg(test)]
+pub(crate) use self::moe_encode::{force_next_topk, forced_topk_pending, take_last_topk_indices};
 mod moe_na;
 mod moe_shared;
 pub(crate) mod mtp_control;
@@ -130,7 +132,7 @@ pub(crate) use self::barriers::{
 #[cfg(any(test, feature = "devtools"))]
 pub(crate) use self::byte_helpers::read_u16_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
-pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at};
+pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at, write_u8_buffer};
 use self::core::*;
 pub(crate) use self::eligibility::install_qmm_skinny_bf16_scope;
 pub(crate) use self::flags::resident_concurrent_enabled;
@@ -261,6 +263,8 @@ pub struct MetalExecutor {
     linear_attn_norm_gates_f32: ComputePipelineState,
     linear_attn_norm_gates_dk128_f32: ComputePipelineState,
     linear_attn_norm_gates_inv_dk128_f32: ComputePipelineState,
+    /// Flash-Next : normes l2 de q/k (ε non mis à l'échelle).
+    linear_attn_norm_gates_l2_dk128_f32: ComputePipelineState,
     linear_attn_conv_norm_gates_k4_dk128_f32: ComputePipelineState,
     linear_attn_conv_norm_gates_k4_dk128_batch_f32: ComputePipelineState,
     linear_attn_conv_state_shift_f32: ComputePipelineState,
@@ -279,6 +283,8 @@ pub struct MetalExecutor {
     linear_attn_gated_delta_inv_dk128_tg4_f32: ComputePipelineState,
     linear_attn_rms_gate_f32: ComputePipelineState,
     linear_attn_rms_gate_dv128_f32: ComputePipelineState,
+    /// Flash-Next : gate de sortie σ(z) au lieu de SiLU(z).
+    linear_attn_rms_gate_sigmoid_dv128_f32: ComputePipelineState,
     linear_attn_rms_gate_batch_dv128_f32: ComputePipelineState,
     affine_gather_matmul_rhs_t_u32_f32: ComputePipelineState,
     affine_gather_qmv_fast_u3_gs64_f32: ComputePipelineState,
@@ -380,6 +386,11 @@ pub struct MetalExecutor {
     steel_attention_f32_bq32_bk32_bd64: Option<ComputePipelineState>,
     add_rms_norm_row_f32: ComputePipelineState,
     topk_softmax_f32: ComputePipelineState,
+    /// Top-k softmax 256 < experts ≤ 1024, un thread par logit.
+    topk_softmax_wide_f32: ComputePipelineState,
+    /// Top-k imposé des oracles, compilé seulement pour les tests.
+    #[cfg(test)]
+    topk_softmax_forced_f32: ComputePipelineState,
     topk_sigmoid_f32: ComputePipelineState,
     topk_sigmoid_rows_f32: ComputePipelineState,
     topk_softmax_serial_f32: ComputePipelineState,
@@ -675,6 +686,10 @@ pub(crate) struct LinearAttentionStepSpec {
     pub value_head_dim: usize,
     pub conv_kernel_dim: usize,
     pub rms_eps: f32,
+    /// Variante Flash-Next (`qwen4_exp`) : q/k normés en l2 (`x/√(Σx²+ε)`) et
+    /// gate de sortie σ(z). Seuls les chemins dk128/dv128 unitaires la prennent
+    /// en charge ; les autres la refusent par une erreur.
+    pub l2_qk_sigmoid_gate: bool,
 }
 
 /// Poids d'un pas linear-attn résident (références ; partagés per-op ↔ 1c).

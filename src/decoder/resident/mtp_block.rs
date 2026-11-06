@@ -262,6 +262,7 @@ impl CausalDecoder {
                     value_head_dim: cfg.value_head_dim,
                     conv_kernel_dim: cfg.conv_kernel_dim,
                     rms_eps: cfg.rms_eps,
+                    l2_qk_sigmoid_gate: false,
                 },
                 LinearAttnResidentDims {
                     in_dim: hidden,

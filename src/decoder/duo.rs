@@ -96,6 +96,7 @@ impl CausalDecoder {
                 value_head_dim: la_config.value_head_dim,
                 conv_kernel_dim: la_config.conv_kernel_dim,
                 rms_eps: la_config.rms_eps,
+                l2_qk_sigmoid_gate: false,
             };
             let key_dim = la_config.key_dim()?;
             let value_dim = la_config.value_dim()?;

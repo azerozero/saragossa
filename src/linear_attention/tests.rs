@@ -290,6 +290,7 @@ fn linear_attention_batch_resident_dk128_matches_cpu_cached_sequence() -> Result
             value_head_dim: config.value_head_dim,
             conv_kernel_dim: config.conv_kernel_dim,
             rms_eps: config.rms_eps,
+            l2_qk_sigmoid_gate: false,
         },
     )?;
     assert_close(cpu.data(), metal.data(), 5.0e-4);
@@ -586,7 +587,7 @@ fn flash_next_l2_norm_keeps_epsilon_unscaled_on_low_norm_heads() {
     clippy::too_many_arguments,
     reason = "oracle de référence : poids et dimensions restent explicites"
 )]
-fn naive_flash_next(
+pub(crate) fn naive_flash_next(
     x: &[f32],
     seq: usize,
     hidden: usize,
@@ -597,7 +598,7 @@ fn naive_flash_next(
     norm: &[f32],
     config: LinearAttentionConfig,
     sigmoid_gate: bool,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<f32>) {
     let matmul = |w: &[f32], rows: usize| -> Vec<f32> {
         let mut out = vec![0.0_f32; seq * rows];
         for t in 0..seq {
@@ -685,7 +686,7 @@ fn naive_flash_next(
                 .sum();
         }
     }
-    out
+    (out, state)
 }
 
 #[test]
@@ -741,7 +742,7 @@ fn flash_next_forward_matches_naive_reference_for_both_gates() {
         let got = layer
             .forward_flash_next_cpu(config, &input, sigmoid_gate)
             .expect("invariant: forward Flash-Next");
-        let expected = naive_flash_next(
+        let (expected, _) = naive_flash_next(
             &x,
             seq,
             hidden,

@@ -25,6 +25,8 @@ pub struct LayerOutput {
     pub routing: Vec<Vec<usize>>,
     /// Écart de probabilité au seuil du top-k du routeur, par token.
     pub routing_margins: Vec<f32>,
+    /// `(k-ième, (k+1)-ième)` experts au seuil du top-k, par token.
+    pub routing_boundary: Vec<(usize, usize)>,
     /// Trace QSA (couches d'attention seulement).
     pub qsa: Option<QsaTrace>,
 }
@@ -327,6 +329,7 @@ impl Qwen4ExpReference {
             hidden: combine(&h, &moe_out.output, &inject, c.hc_count)?,
             routing: moe_out.routing,
             routing_margins: moe_out.margins,
+            routing_boundary: moe_out.boundary,
             qsa: selected,
         })
     }

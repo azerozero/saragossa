@@ -223,13 +223,21 @@ impl MetalExecutor {
             checked_u32(spec.value_head_dim, "linear-attn value head dim")?,
         ];
         let inv = (spec.key_head_dim as f32).powf(-0.5);
-        let scales = [inv * inv, inv];
         let groups = spec.num_key_heads.max(spec.num_value_heads);
         let use_dk128 = linear_norm_dk128_enabled() && spec.key_head_dim == 128;
-        let pipeline = if use_dk128 {
-            &self.linear_attn_norm_gates_dk128_f32
+        let (pipeline, scales) = if spec.l2_qk_sigmoid_gate {
+            // Flash-Next : q = l2(q)·d^-½, k = l2(k) (`key_scale(…, false)`).
+            if spec.key_head_dim != 128 {
+                return Err(InferError::Metal(format!(
+                    "linear-attn l2 : key_head_dim {} non pris en charge (128 requis)",
+                    spec.key_head_dim
+                )));
+            }
+            (&self.linear_attn_norm_gates_l2_dk128_f32, [inv, 1.0])
+        } else if use_dk128 {
+            (&self.linear_attn_norm_gates_dk128_f32, [inv * inv, inv])
         } else {
-            &self.linear_attn_norm_gates_f32
+            (&self.linear_attn_norm_gates_f32, [inv * inv, inv])
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(conv_out_buffer), conv_out_offset);
@@ -804,6 +812,12 @@ impl MetalExecutor {
         let inv = (spec.key_head_dim as f32).powf(-0.5);
         let scales = [inv * inv, inv];
         let groups = spec.num_key_heads.max(spec.num_value_heads);
+        if spec.l2_qk_sigmoid_gate {
+            return Err(InferError::Metal(
+                "linear-attn : variante l2/σ (Flash-Next) non prise en charge par ce kernel"
+                    .to_string(),
+            ));
+        }
         encoder.set_compute_pipeline_state(&self.linear_attn_conv_norm_gates_k4_dk128_f32);
         encoder.set_buffer(0, Some(qkv_buffer), qkv_offset);
         encoder.set_buffer(1, Some(beta_input_buffer), beta_input_offset);
@@ -887,6 +901,12 @@ impl MetalExecutor {
             "lin batch value_dim",
         )?;
         let conv_dim = 2 * key_dim + value_dim;
+        if spec.l2_qk_sigmoid_gate {
+            return Err(InferError::Metal(
+                "linear-attn : variante l2/σ (Flash-Next) non prise en charge par ce kernel"
+                    .to_string(),
+            ));
+        }
         let batch_u32 = checked_u32(batch, "linear-attn batch")?;
         encoder.set_compute_pipeline_state(if tree.is_some() {
             &self.linear_attn_conv_norm_gates_k4_dk128_tree_f32
@@ -1068,6 +1088,12 @@ impl MetalExecutor {
         let inv = (spec.key_head_dim as f32).powf(-0.5);
         let scales = [inv * inv, inv];
         let groups = spec.num_key_heads.max(spec.num_value_heads);
+        if spec.l2_qk_sigmoid_gate {
+            return Err(InferError::Metal(
+                "linear-attn : variante l2/σ (Flash-Next) non prise en charge par ce kernel"
+                    .to_string(),
+            ));
+        }
         encoder.set_compute_pipeline_state(&self.linear_attn_norm_gates_inv_dk128_f32);
         encoder.set_buffer(0, Some(conv_out_buffer), 0);
         encoder.set_buffer(1, Some(beta_input_buffer), beta_input_offset);
@@ -1326,7 +1352,15 @@ impl MetalExecutor {
             checked_u32(spec.value_head_dim, "linear-attn value head dim")?,
         ];
         let use_dv128 = linear_rms_dv128_enabled() && spec.value_head_dim == 128;
-        let pipeline = if use_dv128 {
+        let pipeline = if spec.l2_qk_sigmoid_gate {
+            if spec.value_head_dim != 128 {
+                return Err(InferError::Metal(format!(
+                    "linear-attn gate σ : value_head_dim {} non pris en charge (128 requis)",
+                    spec.value_head_dim
+                )));
+            }
+            &self.linear_attn_rms_gate_sigmoid_dv128_f32
+        } else if use_dv128 {
             &self.linear_attn_rms_gate_dv128_f32
         } else {
             &self.linear_attn_rms_gate_f32
@@ -1370,6 +1404,12 @@ impl MetalExecutor {
             checked_u32(spec.value_head_dim, "linear-attn value head dim")?,
             checked_u32(batch, "linear-attn rms batch")?,
         ];
+        if spec.l2_qk_sigmoid_gate {
+            return Err(InferError::Metal(
+                "linear-attn : variante l2/σ (Flash-Next) non prise en charge par ce kernel"
+                    .to_string(),
+            ));
+        }
         encoder.set_compute_pipeline_state(&self.linear_attn_rms_gate_batch_dv128_f32);
         encoder.set_buffer(0, Some(y_buffer), 0);
         encoder.set_buffer(1, Some(z_buffer), z_offset);

@@ -57,6 +57,7 @@ mod dense_tail;
 #[cfg(feature = "devtools")]
 pub(crate) mod dflash;
 mod duo;
+mod flash_next;
 mod gpu_position;
 mod kernels;
 mod kv_quant;

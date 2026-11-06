@@ -18,7 +18,7 @@ use safetensors::Dtype;
 use super::{read_shard_header, ShardHeader, ShardTensorEntry};
 use crate::qwen4_exp::ngram::{head_vocab_sizes, layer_multipliers, NGRAM_SEED};
 use crate::safetensor::{bytes_to_dense_f32, f8_e4m3_to_f32};
-use crate::{dequantize_affine_u32, InferError, Result, Tensor};
+use crate::{dequantize_affine_u32, AffineQuantizedTensor, InferError, Result, Tensor};
 
 const TRUNK: &str = "language_model.model.";
 /// Borne des dimensions de config (2^20) : les produits restent représentables.
@@ -967,6 +967,61 @@ impl Qwen4ExpCheckpoint {
         dequantize_affine_u32(&[n, packed], &words, &s, &b, self.group_size, bits)
     }
 
+    /// Triplet affine brut (packed, échelles et biais bf16), sans
+    /// déquantification : un expert de pile `switch_mlp` si `stack` est donné.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le tenseur manque, si l'expert sort de la pile,
+    /// ou sur lecture.
+    pub fn quantized(&self, base: &str, stack: Option<usize>) -> Result<AffineQuantizedTensor> {
+        let (_, weight) = self.entry(&format!("{base}.weight"))?;
+        let (_, scales) = self.entry(&format!("{base}.scales"))?;
+        let rank = weight.shape.len();
+        let stacked = rank == 3;
+        if stacked != stack.is_some() || stack.is_some_and(|e| e >= weight.shape[0]) {
+            return Err(InferError::Shape(format!(
+                "{base}: expert {stack:?} hors pile"
+            )));
+        }
+        let (rows, packed) = (weight.shape[rank - 2], weight.shape[rank - 1]);
+        let groups = scales.shape[rank - 1];
+        let row0 = stack.unwrap_or(0) * rows;
+        let words: Vec<u32> = self
+            .read(
+                &format!("{base}.weight"),
+                row0 * packed * 4,
+                rows * packed * 4,
+            )?
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let s = self.read(
+            &format!("{base}.scales"),
+            row0 * groups * 2,
+            rows * groups * 2,
+        )?;
+        let b = self.read(
+            &format!("{base}.biases"),
+            row0 * groups * 2,
+            rows * groups * 2,
+        )?;
+        AffineQuantizedTensor::new(
+            &[rows, packed],
+            words,
+            Tensor::from_vec(
+                vec![rows, groups],
+                bytes_to_dense_f32(&s, Dtype::BF16, base)?,
+            )?,
+            Tensor::from_vec(
+                vec![rows, groups],
+                bytes_to_dense_f32(&b, Dtype::BF16, base)?,
+            )?,
+            self.group_size,
+            self.bits_of(base),
+        )
+    }
+
     /// Affine complet déquantifié en f32 `[rows, cols]`.
     ///
     /// # Errors
@@ -1018,6 +1073,74 @@ impl Qwen4ExpCheckpoint {
             }
         }
         Ok(out)
+    }
+
+    /// Octets stockés des tenseurs dont le nom commence par `prefix`, par
+    /// nature : `(packed, échelles et biais, flottants copiés)`.
+    pub fn tensor_bytes_by_kind(&self, prefix: &str) -> (u64, u64, u64) {
+        let mut sizes = (0_u64, 0_u64, 0_u64);
+        for (name, (_, entry)) in self
+            .index
+            .iter()
+            .filter(|(name, _)| name.starts_with(prefix))
+        {
+            let bytes = (entry.data_offsets[1] - entry.data_offsets[0]) as u64;
+            if name.ends_with(".scales") || name.ends_with(".biases") {
+                sizes.1 += bytes;
+            } else if entry.dtype == Dtype::U32 {
+                sizes.0 += bytes;
+            } else {
+                sizes.2 += bytes;
+            }
+        }
+        sizes
+    }
+
+    /// Largeur d'une ligne n-gram (octets E4M3).
+    pub fn ngram_width(&self) -> usize {
+        self.ngram.width
+    }
+
+    /// Valeurs des 256 octets E4M3 multipliées par l'échelle per-tensor ; NaN
+    /// pour les deux codes NaN (refusés à la lecture).
+    pub fn ngram_lut(&self) -> Vec<f32> {
+        (0..=255_u8)
+            .map(|byte| f8_e4m3_to_f32(byte).map_or(f32::NAN, |v| v * self.ngram.scale))
+            .collect()
+    }
+
+    /// Lit les lignes `ids` brutes (E4M3) dans `out` (`ids.len()·largeur`
+    /// octets), une lecture positionnelle par ligne, en parallèle. Refuse une
+    /// ligne hors table ou contenant un NaN, comme [`Self::ngram_rows`].
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de lecture, de taille, d'index ou de NaN.
+    pub fn ngram_rows_raw(&self, ids: &[u64], out: &mut [u8]) -> Result<()> {
+        use rayon::prelude::*;
+        let width = self.ngram.width;
+        if ids.len().checked_mul(width) != Some(out.len()) {
+            return Err(InferError::Shape(format!(
+                "lignes n-gram : {} octets pour {} lignes de {width}",
+                out.len(),
+                ids.len()
+            )));
+        }
+        out.par_chunks_mut(width)
+            .zip(ids.par_iter())
+            .try_for_each(|(slot, &id)| {
+                if id >= self.ngram.rows {
+                    return Err(InferError::Shape(format!("ligne n-gram {id} hors table")));
+                }
+                self.ngram
+                    .file
+                    .read_exact_at(slot, id * width as u64)
+                    .map_err(|e| io(&self.ngram.path, e))?;
+                if slot.iter().any(|b| b & 0x7f == 0x7f) {
+                    return Err(cfg_err(format!("ligne n-gram {id}: NaN")));
+                }
+                Ok(())
+            })
     }
 
     /// Préfixe d'une couche du tronc en sortie.
@@ -1078,6 +1201,46 @@ mod tests {
         let silu = with_text(|t| t["output_gate_type"] = "silu".into()).expect("invariant: silu");
         assert!(!silu.sigmoid_output_gate);
         assert!(with_text(|t| t["output_gate_type"] = "relu".into()).is_err());
+    }
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn ngram_raw_rows_with_lut_match_dequantized_rows() {
+        let dst = converted_fixture();
+        let ckpt = Qwen4ExpCheckpoint::open(dst.path()).expect("invariant: fixture ouverte");
+        let width = ckpt.ngram_width();
+        let ids = [0_u64, 5, 3, 0, 17];
+        let mut raw = vec![0_u8; ids.len() * width];
+        ckpt.ngram_rows_raw(&ids, &mut raw)
+            .expect("invariant: lecture brute");
+        let lut = ckpt.ngram_lut();
+        let decoded: Vec<f32> = raw.iter().map(|&b| lut[usize::from(b)]).collect();
+        assert_eq!(decoded, ckpt.ngram_rows(&ids).expect("invariant: lignes"));
+        let mut one = vec![0_u8; width];
+        assert!(ckpt.ngram_rows_raw(&[u64::MAX], &mut one).is_err());
+        assert!(ckpt.ngram_rows_raw(&ids, &mut one).is_err());
+    }
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn raw_quantized_triplets_dequantize_like_affine_reads() {
+        let dst = converted_fixture();
+        let ckpt = Qwen4ExpCheckpoint::open(dst.path()).expect("invariant: fixture ouverte");
+        let dense = Qwen4ExpCheckpoint::layer_prefix(0) + "mlp.shared_expert.down_proj";
+        let raw = ckpt.quantized(&dense, None).expect("invariant: triplet");
+        assert_eq!(
+            raw.dequantize().expect("invariant: déquant").data(),
+            ckpt.affine(&dense).expect("invariant: affine").data()
+        );
+        let stack = Qwen4ExpCheckpoint::layer_prefix(0) + "mlp.switch_mlp.down_proj";
+        let raw = ckpt.quantized(&stack, Some(3)).expect("invariant: expert");
+        assert_eq!(
+            raw.dequantize().expect("invariant: déquant").data(),
+            ckpt.expert(&stack, 3).expect("invariant: expert").data()
+        );
+        assert!(ckpt.quantized(&stack, None).is_err());
+        assert!(ckpt.quantized(&stack, Some(ckpt.config.experts)).is_err());
+        assert!(ckpt.quantized(&dense, Some(0)).is_err());
     }
 
     /// Convertit la fixture N1 dans un dossier temporaire.

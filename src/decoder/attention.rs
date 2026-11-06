@@ -469,6 +469,7 @@ impl DecoderLayer {
                             value_head_dim: la_config.value_head_dim,
                             conv_kernel_dim: la_config.conv_kernel_dim,
                             rms_eps: la_config.rms_eps,
+                            l2_qk_sigmoid_gate: false,
                         },
                         dims: crate::metal_backend::LinearAttnResidentDims {
                             in_dim: self.input_norm.len(),
