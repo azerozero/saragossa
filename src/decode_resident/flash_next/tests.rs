@@ -456,12 +456,14 @@ fn n2_resident_decode_matches_cpu_reference() {
     let layers = reference.checkpoint().config.layer_kinds.len();
     let mut h = reference.embed(&ids).expect("invariant: embedding");
     let mut cpu_layers = Vec::with_capacity(layers);
+    let mut cpu_margins = Vec::with_capacity(layers);
     for index in 0..layers {
-        h = reference
+        let out = reference
             .layer(index, &h, &ids)
-            .expect("invariant: couche CPU")
-            .hidden;
+            .expect("invariant: couche CPU");
+        h = out.hidden;
         cpu_layers.push(h.clone());
+        cpu_margins.push(out.routing_margins);
     }
     let cpu_logits = reference
         .logits(&reference.final_mixer(&h).expect("invariant: mixer"))
@@ -485,15 +487,26 @@ fn n2_resident_decode_matches_cpu_reference() {
     let width = cpu_layers[0].as_matrix().expect("invariant: 2D").1;
     let mut worst_layer = vec![0.0_f64; layers];
     let (mut worst_kl, mut swaps) = (0.0_f64, Vec::new());
+    // (token, première couche > 1e-3, écart, marge de routage CPU à ce point)
+    let mut events: Vec<(usize, usize, f64, f32)> = Vec::new();
     for (t, &token) in ids.iter().enumerate() {
         let out = session
             .step(token, true, true)
             .expect("invariant: pas résident");
         let got_layers = out.layers.expect("invariant: résiduels");
+        let mut first_bad = None;
         for (index, got) in got_layers.iter().enumerate() {
             let want = &cpu_layers[index].data()[t * width..(t + 1) * width];
             let (err, _) = relative_error(got, want);
             worst_layer[index] = worst_layer[index].max(err);
+            if err > 1.0e-3 && first_bad.is_none() {
+                first_bad = Some((index, err));
+            }
+        }
+        if let Some((index, err)) = first_bad {
+            if events.len() < 40 {
+                events.push((t, index, err, cpu_margins[index][t]));
+            }
         }
         let got = out.logits.expect("invariant: logits");
         let want = &cpu_logits.data()[t * vocab..(t + 1) * vocab];
@@ -516,6 +529,7 @@ fn n2_resident_decode_matches_cpu_reference() {
         eprintln!("couche {index:2} : écart relatif max {err:.2e}");
     }
     eprintln!("KL max {worst_kl:.2e} ; argmax différents : {swaps:?}");
+    eprintln!("tokens au-delà de 1e-3 (token, couche, écart, marge CPU) : {events:?}");
     assert!(
         worst_layer.iter().all(|&e| e <= 1.0e-3),
         "écart par couche au-delà de 1e-3"
