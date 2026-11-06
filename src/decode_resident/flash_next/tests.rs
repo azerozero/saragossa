@@ -1272,3 +1272,160 @@ fn load_plan_guard_refuses_transient_peak_above_final_resident() -> Result<()> {
     );
     simulate(peak)
 }
+
+/// Profil GPU par brique après un contexte de 1024 tokens (128 pas gloutons).
+/// À lancer avec `SARAGOSSA_FLASH_NEXT_PROFILE=1` (temps par brique) et
+/// `SARAGOSSA_RUST_DECODE_PROFILE=1` (dispatches par pas), machine libre.
+#[cfg(feature = "devtools")]
+#[test]
+#[ignore = "profil : poids réels, machine libre"]
+fn profile_resident_decode_after_1k_context() {
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let (context, generated) = (1024, 128);
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        context + generated,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    let mut next = 0;
+    for &token in &ids[..context] {
+        next = session
+            .step(token, false, false)
+            .expect("invariant: contexte")
+            .argmax as usize;
+    }
+    session
+        .profiler_mut()
+        .expect("SARAGOSSA_FLASH_NEXT_PROFILE=1 requis")
+        .clear();
+    let started = std::time::Instant::now();
+    for _ in 0..generated {
+        next = session
+            .step(next, false, false)
+            .expect("invariant: decode")
+            .argmax as usize;
+    }
+    let wall = started.elapsed().as_secs_f64() * 1e3 / generated as f64;
+    let (rows, dispatches) = session.profiler_mut().expect("invariant: profil").report();
+    let gpu: f64 = rows.iter().map(|r| r.ms_per_step).sum();
+    eprintln!("profil après {context} tokens, {generated} pas : {wall:.2} ms/pas mural (profilé), GPU {gpu:.2} ms, {dispatches:.0} dispatches/pas");
+    for row in rows {
+        eprintln!(
+            "  {:24} {:7.3} ms/pas  {:5.1} %  {:5.1} encodeurs/pas",
+            row.brick.label(),
+            row.ms_per_step,
+            100.0 * row.ms_per_step / gpu,
+            row.encoders_per_step
+        );
+    }
+}
+
+/// Micro-bench des morceaux d'une hyper-connection aux formes réelles
+/// (4 × 2560, rang 320) : chaque morceau encodé 200 fois dans un command
+/// buffer, temps mural par appel. Diagnostic du profil, machine libre.
+#[test]
+#[ignore = "diagnostic de débit, machine libre"]
+fn bench_hc_pieces_at_real_dims() -> Result<()> {
+    let Some(executor) = executor()? else {
+        return Ok(());
+    };
+    let kernels = FlashNextKernels::new(executor.device())?;
+    let dims = HcDims {
+        hidden: 2560,
+        hc: 4,
+        lowrank: 320,
+        eps: 1.0e-6,
+    };
+    let width = dims.width();
+    let mut rng = DeterministicF32::new(7);
+    let (down, _) = u8_weight(&executor, &mut rng, dims.lowrank, width, 0.05)?;
+    let (up, _) = u8_weight(&executor, &mut rng, width, dims.lowrank, 0.2)?;
+    let inject = executor.resolve_linear_weight_buffers(
+        &LinearWeight::Dense(Tensor::from_vec(
+            vec![4, width],
+            rng.fill(4 * width, -0.02, 0.02),
+        )?),
+        "bench_inject",
+    )?;
+    let norm = buffer(&executor, &rng.fill(width, -0.3, 0.3));
+    let h = buffer(&executor, &rng.fill(width, -2.0, 2.0));
+    let scratch = HcScratch {
+        normed: zeros(&executor, width),
+        low: zeros(&executor, dims.lowrank),
+        up: zeros(&executor, width),
+        inject: zeros(&executor, 4),
+    };
+    let x = zeros(&executor, dims.hidden);
+    let out = zeros(&executor, width);
+    let queue = executor.device().new_command_queue();
+    let reps = 200;
+    let time = |label: &str,
+                encode: &dyn Fn(&metal::ComputeCommandEncoderRef) -> Result<()>|
+     -> Result<()> {
+        for warm in [true, false] {
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            for _ in 0..reps {
+                encode(encoder)?;
+            }
+            encoder.end_encoding();
+            let started = std::time::Instant::now();
+            commit_and_wait(command_buffer)?;
+            if !warm {
+                eprintln!(
+                    "{label:28} {:8.2} µs/appel",
+                    started.elapsed().as_secs_f64() * 1e6 / reps as f64
+                );
+            }
+        }
+        Ok(())
+    };
+    time("norme groupée (1+w)", &|e| {
+        super::ple::encode_rms_norm_1p(&kernels, e, &h, &norm, &scratch.normed, dims);
+        Ok(())
+    })?;
+    time("Down u8 [320, 10240]", &|e| {
+        executor
+            .encode_matmul_weight_buffers(e, &scratch.normed, 1, width, &down, &scratch.low, true)
+            .map(|_| ())
+    })?;
+    time("injection f32 [4, 10240]", &|e| {
+        executor
+            .encode_matmul_weight_buffers(
+                e,
+                &scratch.normed,
+                1,
+                width,
+                &inject,
+                &scratch.inject,
+                true,
+            )
+            .map(|_| ())
+    })?;
+    time("Up u8 [10240, 320]", &|e| {
+        executor
+            .encode_matmul_weight_buffers(e, &scratch.low, 1, dims.lowrank, &up, &scratch.up, true)
+            .map(|_| ())
+    })?;
+    let weights = HcWeights {
+        norm: norm.clone(),
+        down: down.clone(),
+        up: up.clone(),
+        inject: Some(inject.clone()),
+    };
+    time("mix complet (6 dispatches)", &|e| {
+        encode_hc_mix(&kernels, &executor, e, &weights, &scratch, dims, &h, &x)
+    })?;
+    time("combine", &|e| {
+        encode_hc_combine(&kernels, e, &scratch, dims, &h, &x, &out);
+        Ok(())
+    })?;
+    Ok(())
+}

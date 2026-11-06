@@ -7,17 +7,18 @@
 //! token : les buffers partagés (embedding, octets PLE) ne sont réécrits
 //! qu'après la fin du command buffer précédent.
 
-use metal::{Buffer, CommandQueue, ComputeCommandEncoderRef, MTLResourceOptions};
+use metal::{Buffer, CommandQueue, MTLResourceOptions};
 
 use super::attention::{dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaScratch};
+use super::encoders::{Brick, Encoders};
 use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch};
 use super::kernels::FlashNextKernels;
 use super::ple::{encode_ple, PleScratch, PleState};
 use super::weights::{FlashNextWeights, LoadStage, MixerWeights};
 use crate::decode_resident::{DecodeResidentState, FullAttentionMetalState};
 use crate::metal_backend::{
-    commit_and_wait, read_f32_buffer, read_u32_buffer, write_f32_buffer, EncoderEndGuard,
-    LinearAttentionMetalState, LinearAttentionStepSpec, LinearAttnResidentDims, MetalExecutor,
+    commit_and_wait, read_f32_buffer, read_u32_buffer, write_f32_buffer, LinearAttentionMetalState,
+    LinearAttentionStepSpec, LinearAttnResidentDims, MetalExecutor,
 };
 use crate::qwen4_exp::ngram::NgramContext;
 use crate::qwen_loader::qwen4_exp::{Qwen4ExpCheckpoint, Qwen4ExpConfig};
@@ -85,6 +86,9 @@ pub(crate) struct FlashNextSession {
     capacity: usize,
     /// États DeltaNet initiaux (nuls), pour [`Self::reset`].
     initial_linear: Vec<Option<LinearAttentionMetalState>>,
+    /// Profil GPU par brique (`SARAGOSSA_FLASH_NEXT_PROFILE=1`).
+    #[cfg(feature = "devtools")]
+    profiler: Option<super::profile::StepProfiler>,
     /// Vrai après une erreur d'exécution GPU : états incertains, pas refusés.
     poisoned: bool,
     /// Oracles : experts routés par couche du dernier pas `[couches × top_k]`.
@@ -334,6 +338,12 @@ impl FlashNextSession {
             position: 0,
             capacity,
             initial_linear: Vec::new(),
+            #[cfg(feature = "devtools")]
+            profiler: if super::profile::profile_requested() {
+                Some(super::profile::StepProfiler::new(executor.device())?)
+            } else {
+                None
+            },
             poisoned: false,
             #[cfg(test)]
             routing_capture: executor.device().new_buffer(
@@ -472,6 +482,12 @@ impl FlashNextSession {
         self.executor.device().current_allocated_size()
     }
 
+    /// Profil GPU accumulé, s'il est actif.
+    #[cfg(feature = "devtools")]
+    pub(crate) fn profiler_mut(&mut self) -> Option<&mut super::profile::StepProfiler> {
+        self.profiler.as_mut()
+    }
+
     /// Position du prochain token (oracles).
     #[cfg(test)]
     pub(crate) fn position(&self) -> usize {
@@ -592,10 +608,28 @@ impl FlashNextSession {
         let ple_step = self.ple_state.step;
         let queue = self.queue.clone();
         let command_buffer = queue.new_command_buffer();
-        let guard = EncoderEndGuard::new(command_buffer.new_compute_command_encoder());
-        let encoded = self.encode_token(guard.encoder(), logits, layers);
+        #[cfg(feature = "devtools")]
+        let mut profiler = self.profiler.take();
+        #[cfg(feature = "devtools")]
+        let mut encoders = match profiler.as_mut() {
+            Some(profiler) => {
+                profiler.begin_step();
+                Encoders::profiled(command_buffer, profiler)
+            }
+            None => Encoders::single(command_buffer),
+        };
+        #[cfg(not(feature = "devtools"))]
+        let mut encoders = Encoders::single(command_buffer);
+        let encoded = self.encode_token(&mut encoders, logits, layers);
         if let Err(error) = encoded {
-            drop(guard);
+            drop(encoders);
+            #[cfg(feature = "devtools")]
+            {
+                if let Some(profiler) = profiler.as_mut() {
+                    profiler.abort_step();
+                }
+                self.profiler = profiler;
+            }
             self.ple_state.step = ple_step;
             for (state, len) in self.states.iter_mut().zip(kv_lens) {
                 if let (LayerState::Full(kv), Some(len)) = (state, len) {
@@ -606,11 +640,22 @@ impl FlashNextSession {
             }
             return Err(error);
         }
-        guard.end();
+        encoders.end();
+        #[cfg(feature = "devtools")]
+        if let Some(profiler) = profiler.as_ref() {
+            profiler.encode_resolve(command_buffer);
+        }
         if let Err(error) = commit_and_wait(command_buffer) {
             // Exécution GPU partielle possible : états récurrents et KV incertains.
             self.poisoned = true;
             return Err(error);
+        }
+        #[cfg(feature = "devtools")]
+        {
+            if let Some(profiler) = profiler.as_mut() {
+                profiler.end_step()?;
+            }
+            self.profiler = profiler;
         }
         self.ple_state.context = context;
         self.position += 1;
@@ -649,7 +694,7 @@ impl FlashNextSession {
     /// Encode les couches, le mixer final et le lm_head du token courant.
     fn encode_token(
         &mut self,
-        encoder: &ComputeCommandEncoderRef,
+        encoders: &mut Encoders<'_>,
         logits: bool,
         layers: bool,
     ) -> Result<()> {
@@ -665,6 +710,7 @@ impl FlashNextSession {
             .enumerate()
         {
             if index == c.ple_layer {
+                let encoder = encoders.at(Brick::Ple)?;
                 encode_ple(
                     &self.kernels,
                     &self.executor,
@@ -678,6 +724,7 @@ impl FlashNextSession {
                 )?;
                 cur = 1 - cur;
             }
+            let encoder = encoders.at(Brick::Hc)?;
             encode_hc_mix(
                 &self.kernels,
                 &self.executor,
@@ -690,6 +737,7 @@ impl FlashNextSession {
             )?;
             match (&layer.mixer, state) {
                 (MixerWeights::Linear(w), LayerState::Linear(state)) => {
+                    let encoder = encoders.at(Brick::DeltaNet)?;
                     self.executor.encode_linear_attn_resident_dense_buffers(
                         encoder,
                         &self.x,
@@ -702,6 +750,7 @@ impl FlashNextSession {
                     )?;
                 }
                 (MixerWeights::Full(w), LayerState::Full(kv)) => {
+                    let encoder = encoders.at(Brick::Qsa)?;
                     encode_qsa_dense(
                         &self.arena,
                         &self.executor,
@@ -721,6 +770,7 @@ impl FlashNextSession {
                     )))
                 }
             }
+            let encoder = encoders.at(Brick::Hc)?;
             crate::metal_backend::post_dispatch_barrier(encoder);
             encode_hc_combine(
                 &self.kernels,
@@ -746,6 +796,7 @@ impl FlashNextSession {
             if let Some(experts) = self.forced_routing.get_mut(index).and_then(Option::take) {
                 crate::metal_backend::force_next_topk(experts);
             }
+            let encoder = encoders.at(Brick::Moe)?;
             self.executor.encode_moe_shared_buffers(
                 encoder,
                 &mut owned,
@@ -774,6 +825,7 @@ impl FlashNextSession {
                 super::dispatch_1d(encoder, c.top_k);
                 crate::metal_backend::post_dispatch_barrier(encoder);
             }
+            let encoder = encoders.at(Brick::Hc)?;
             crate::metal_backend::post_dispatch_barrier(encoder);
             encode_hc_combine(
                 &self.kernels,
@@ -806,6 +858,7 @@ impl FlashNextSession {
                 )?;
             }
         }
+        let encoder = encoders.at(Brick::Mixer)?;
         encode_hc_mix(
             &self.kernels,
             &self.executor,
@@ -816,6 +869,7 @@ impl FlashNextSession {
             &self.h[cur],
             &self.x,
         )?;
+        let encoder = encoders.at(Brick::LmHead)?;
         if logits {
             self.executor.encode_matmul_weight_buffers(
                 encoder,

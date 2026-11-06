@@ -10,9 +10,12 @@
 #![warn(dead_code)]
 
 mod attention;
+mod encoders;
 mod hc;
 mod kernels;
 mod ple;
+#[cfg(feature = "devtools")]
+mod profile;
 mod session;
 mod weights;
 
@@ -32,8 +35,15 @@ fn set_value<T>(encoder: &ComputeCommandEncoderRef, index: u64, value: &T) {
 
 /// Dispatch 1D d'un thread par élément, threadgroups de 256.
 fn dispatch_1d(encoder: &ComputeCommandEncoderRef, n: usize) {
+    crate::metal_backend::profile_dispatch();
     encoder.dispatch_thread_groups(
         MTLSize::new(n.div_ceil(256) as u64, 1, 1),
         MTLSize::new(256, 1, 1),
     );
+}
+
+/// Dispatch de `groups` threadgroups de 256 (normes, réductions par flux).
+fn dispatch_groups(encoder: &ComputeCommandEncoderRef, groups: usize) {
+    crate::metal_backend::profile_dispatch();
+    encoder.dispatch_thread_groups(MTLSize::new(groups as u64, 1, 1), MTLSize::new(256, 1, 1));
 }

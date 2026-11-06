@@ -9,11 +9,11 @@
 //! État résident : contexte n-gram (2 tokens précédents, CPU) et anneau des
 //! `span = (k−1)·dilation` dernières colonnes `normed` (GPU), indexé par le pas.
 
-use metal::{Buffer, BufferRef, ComputeCommandEncoderRef, MTLSize};
+use metal::{Buffer, BufferRef, ComputeCommandEncoderRef};
 
 use super::hc::HcDims;
 use super::kernels::FlashNextKernels;
-use super::{dispatch_1d, set_value};
+use super::{dispatch_1d, dispatch_groups, set_value};
 use crate::metal_backend::{
     post_dispatch_barrier, write_u8_buffer, MetalExecutor, MetalLinearWeightBuffers,
 };
@@ -145,7 +145,7 @@ pub(crate) fn encode_ple(
     encoder.set_buffer(2, Some(&scratch.value), 0);
     encoder.set_buffer(3, Some(&scratch.gated), 0);
     set_value(encoder, 4, &(dims.hidden as u32));
-    encoder.dispatch_thread_groups(MTLSize::new(dims.hc as u64, 1, 1), MTLSize::new(256, 1, 1));
+    dispatch_groups(encoder, dims.hc);
     post_dispatch_barrier(encoder);
 
     encode_rms_norm_1p(
@@ -198,5 +198,5 @@ pub(crate) fn encode_rms_norm_1p(
     encoder.set_buffer(2, Some(out), 0);
     set_value(encoder, 3, &(dims.hidden as u32));
     set_value(encoder, 4, &dims.eps);
-    encoder.dispatch_thread_groups(MTLSize::new(dims.hc as u64, 1, 1), MTLSize::new(256, 1, 1));
+    dispatch_groups(encoder, dims.hc);
 }
