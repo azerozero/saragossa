@@ -69,6 +69,8 @@ mod matmul_select;
 mod matmul_weight;
 mod moe;
 mod moe_encode;
+#[cfg(test)]
+pub(crate) use self::moe_encode::{force_next_topk, forced_topk_pending};
 mod moe_na;
 mod moe_shared;
 pub(crate) mod mtp_control;
@@ -384,6 +386,12 @@ pub struct MetalExecutor {
     steel_attention_f32_bq32_bk32_bd64: Option<ComputePipelineState>,
     add_rms_norm_row_f32: ComputePipelineState,
     topk_softmax_f32: ComputePipelineState,
+    /// Top-k imposé des oracles (`cfg(test)`).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "utilisé par les oracles seulement")
+    )]
+    topk_softmax_forced_f32: ComputePipelineState,
     topk_sigmoid_f32: ComputePipelineState,
     topk_sigmoid_rows_f32: ComputePipelineState,
     topk_softmax_serial_f32: ComputePipelineState,

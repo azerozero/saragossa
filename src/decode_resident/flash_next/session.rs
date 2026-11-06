@@ -64,6 +64,9 @@ pub(crate) struct FlashNextSession {
     linear_spec: LinearAttentionStepSpec,
     linear_dims: LinearAttnResidentDims,
     position: usize,
+    /// Oracles : experts imposés au prochain pas, par couche (consommés).
+    #[cfg(test)]
+    pub(crate) forced_routing: Vec<Option<Vec<u32>>>,
 }
 
 fn zeros(executor: &MetalExecutor, len: usize) -> Buffer {
@@ -184,6 +187,8 @@ impl FlashNextSession {
             linear_spec,
             linear_dims,
             position: 0,
+            #[cfg(test)]
+            forced_routing: Vec::new(),
             executor,
             ckpt,
         };
@@ -361,6 +366,10 @@ impl FlashNextSession {
                 &self.h[cur],
                 &self.x,
             )?;
+            #[cfg(test)]
+            if let Some(experts) = self.forced_routing.get_mut(index).and_then(Option::take) {
+                crate::metal_backend::force_next_topk(experts);
+            }
             self.executor.encode_moe_shared_buffers(
                 encoder,
                 &mut owned,
@@ -371,6 +380,12 @@ impl FlashNextSession {
                 &layer.moe,
                 c.top_k,
             )?;
+            #[cfg(test)]
+            if crate::metal_backend::forced_topk_pending() {
+                return Err(InferError::Metal(format!(
+                    "couche {index} : routage imposé non consommé par le MoE"
+                )));
+            }
             crate::metal_backend::post_dispatch_barrier(encoder);
             encode_hc_combine(
                 &self.kernels,

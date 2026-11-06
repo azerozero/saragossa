@@ -291,5 +291,39 @@ fn flash_next_moe_512_top10_inter640_matches_cpu() -> Result<()> {
     let gpu = read_f32_buffer(&out, hidden)?;
     let (err, max_abs) = crate::qwen4_exp::math::relative_error(&gpu, &expected);
     assert!(err <= 1.0e-5, "MoE 512/top-10 : erreur relative {err} (max {max_abs})");
+
+    // Routage imposé (oracles) : le top-10 naturel, donné dans le désordre,
+    // redonne la même sortie ; un autre ensemble suit le CPU sur cet ensemble.
+    let run_forced = |experts: Vec<u32>| -> Result<Vec<f32>> {
+        crate::metal_backend::force_next_topk(experts);
+        let command_buffer = executor.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let mut owned = Vec::new();
+        executor.encode_moe_shared_buffers(
+            encoder, &mut owned, &input, Some(&res), &out, hidden, &weights, top_k,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        assert!(!crate::metal_backend::forced_topk_pending(), "imposition non consommée");
+        read_f32_buffer(&out, hidden)
+    };
+    let mut natural: Vec<u32> = chosen.iter().map(|&e| e as u32).collect();
+    natural.reverse();
+    assert_eq!(run_forced(natural)?, gpu, "top-10 naturel imposé");
+    let other: Vec<usize> = order[..top_k - 1].iter().chain([&order[top_k + 5]]).copied().collect();
+    let other_total: f32 = other.iter().map(|&e| probs[e]).sum();
+    let mut expected_other = residual.clone();
+    for &e in &other {
+        let y = mlp(&experts[e])?;
+        let p = probs[e] / other_total;
+        expected_other.iter_mut().zip(&y).for_each(|(o, v)| *o += p * v);
+    }
+    let y = mlp(&shared)?;
+    expected_other.iter_mut().zip(&y).for_each(|(o, v)| *o += s * v);
+    let forced = run_forced(other.iter().map(|&e| e as u32).collect())?;
+    let (err, _) = crate::qwen4_exp::math::relative_error(&forced, &expected_other);
+    assert!(err <= 1.0e-5, "routage imposé : erreur relative {err}");
+    let (gap, _) = crate::qwen4_exp::math::relative_error(&forced, &gpu);
+    assert!(gap > 1.0e-4, "l'imposition n'a pas changé la sortie : {gap}");
     Ok(())
 }

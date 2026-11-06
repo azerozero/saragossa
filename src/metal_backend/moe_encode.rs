@@ -4,6 +4,25 @@ use super::*;
 
 const TOPK_SOFTMAX_TG_WIDTH: u64 = 32;
 
+#[cfg(test)]
+thread_local! {
+    /// Experts imposés au PROCHAIN `encode_topk_softmax` de ce thread (oracles :
+    /// routage CPU aux quasi-égalités). Consommés une seule fois.
+    static FORCED_TOPK: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Impose les experts du prochain top-k softmax encodé sur ce thread.
+#[cfg(test)]
+pub(crate) fn force_next_topk(experts: Vec<u32>) {
+    FORCED_TOPK.with(|slot| *slot.borrow_mut() = Some(experts));
+}
+
+/// Vrai si une imposition attend encore d'être consommée.
+#[cfg(test)]
+pub(crate) fn forced_topk_pending() -> bool {
+    FORCED_TOPK.with(|slot| slot.borrow().is_some())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "wrappers d'encodage Metal: buffers, dimensions et offsets restent explicites"
@@ -1017,6 +1036,25 @@ impl MetalExecutor {
         topk: usize,
     ) -> Result<()> {
         ensure_valid_top_k(topk, count)?;
+        #[cfg(test)]
+        if let Some(forced) = FORCED_TOPK.with(|slot| slot.borrow_mut().take()) {
+            if forced.len() != topk || forced.iter().any(|&e| e as usize >= count) {
+                return Err(InferError::Dimension(format!(
+                    "top-k imposé {forced:?} incompatible (k={topk}, experts={count})"
+                )));
+            }
+            let forced_buffer = self.buffer_from_slice(&forced, "topk_forced")?;
+            encoder.set_compute_pipeline_state(&self.topk_softmax_forced_f32);
+            encoder.set_buffer(0, Some(logits_buffer), 0);
+            encoder.set_buffer(1, Some(&forced_buffer), 0);
+            encoder.set_buffer(2, Some(indices_buffer), 0);
+            encoder.set_buffer(3, Some(scores_buffer), 0);
+            set_u32_bytes(encoder, 4, &[checked_u32(topk, "topk")?], "topk_forced")?;
+            encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            _owned_buffers.push(forced_buffer);
+            post_dispatch_barrier(encoder);
+            return Ok(());
+        }
         let dims = [
             checked_u32(count, "topk count")?,
             checked_u32(topk, "topk")?,

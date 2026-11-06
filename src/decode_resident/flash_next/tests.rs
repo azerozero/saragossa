@@ -427,13 +427,175 @@ fn kl_logits(p: &[f32], q: &[f32]) -> f64 {
     lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum()
 }
 
+/// Mode d'une passe N2 résidente.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RoutingMode {
+    /// Routage propre du GPU (témoin, sans porte dure).
+    Native,
+    /// Experts du CPU imposés aux quasi-égalités (marge ≤ 1e-5).
+    Forced,
+    /// Comme `Forced`, plus un mauvais expert imposé à `(token, couche)` de
+    /// marge nette : la porte doit passer au rouge.
+    Mutation(usize, usize),
+}
+
+/// Mesures d'un token : écart relatif par couche, KL des logits, argmax.
+struct TokenReport {
+    layer_errors: Vec<f64>,
+    kl: f64,
+    swap: Option<(usize, usize, f64)>,
+}
+
+/// Référence CPU d'une séquence : résiduels, logits, routage et marges.
+struct CpuChain {
+    layers: Vec<crate::Tensor>,
+    logits: crate::Tensor,
+    routing: Vec<Vec<Vec<usize>>>,
+    margins: Vec<Vec<f32>>,
+    width: usize,
+    vocab: usize,
+}
+
+/// Marge de quasi-égalité du routeur (règle de l'étape 1).
+const ROUTING_TIE: f32 = 1.0e-5;
+
+fn run_resident_pass(
+    dir: &std::path::Path,
+    ids: &[usize],
+    cpu: &CpuChain,
+    mode: RoutingMode,
+    steps: usize,
+) -> (Vec<TokenReport>, usize) {
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let guard = crate::MemoryGuard::process();
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(dir).expect("invariant: checkpoint"),
+        ids.len(),
+        Some(&guard),
+    )
+    .expect("invariant: session résidente");
+    let layers = cpu.layers.len();
+    let (width, vocab) = (cpu.width, cpu.vocab);
+    let mut imposed = 0;
+    let mut reports = Vec::with_capacity(steps);
+    for (t, &token) in ids.iter().enumerate().take(steps) {
+        if mode != RoutingMode::Native {
+            session.forced_routing = (0..layers)
+                .map(|layer| {
+                    let set = &cpu.routing[layer][t];
+                    if mode == RoutingMode::Mutation(t, layer) {
+                        // Un expert retenu remplacé par le premier expert non retenu.
+                        let outsider = (0..)
+                            .find(|e| !set.contains(e))
+                            .expect("invariant: expert libre");
+                        let mut wrong: Vec<u32> = set.iter().map(|&e| e as u32).collect();
+                        wrong[0] = outsider as u32;
+                        Some(wrong)
+                    } else if cpu.margins[layer][t] <= ROUTING_TIE {
+                        Some(set.iter().map(|&e| e as u32).collect())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            imposed += session
+                .forced_routing
+                .iter()
+                .filter(|f| f.is_some())
+                .count();
+        }
+        let out = session
+            .step(token, true, true)
+            .expect("invariant: pas résident");
+        let got_layers = out.layers.expect("invariant: résiduels");
+        let layer_errors = got_layers
+            .iter()
+            .enumerate()
+            .map(|(index, got)| {
+                relative_error(got, &cpu.layers[index].data()[t * width..(t + 1) * width]).0
+            })
+            .collect();
+        let got = out.logits.expect("invariant: logits");
+        let want = &cpu.logits.data()[t * vocab..(t + 1) * vocab];
+        let cpu_top = want
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+            .map(|(i, _)| i)
+            .expect("invariant: vocabulaire non vide");
+        let gpu_top = out.argmax as usize;
+        let swap = (gpu_top != cpu_top).then(|| {
+            let max = want[cpu_top];
+            let sum: f64 = want.iter().map(|&v| f64::from(v - max).exp()).sum();
+            (
+                cpu_top,
+                gpu_top,
+                (1.0 - f64::from(want[gpu_top] - max).exp()) / sum,
+            )
+        });
+        reports.push(TokenReport {
+            layer_errors,
+            kl: kl_logits(want, &got),
+            swap,
+        });
+    }
+    (reports, imposed)
+}
+
+/// Synthèse d'une passe sur un préfixe.
+struct Summary {
+    worst: f64,
+    kl: f64,
+    /// `(token, argmax CPU, argmax GPU, écart de probabilité)`.
+    swaps: Vec<(usize, usize, usize, f64)>,
+    bad: usize,
+    first: Option<(usize, usize, f64)>,
+}
+
+/// Synthèse d'une passe sur le préfixe `[0, prefix)` : écart max par couche,
+/// KL max, argmax différents, tokens au-delà de 1e-3 (premier compris).
+fn summarize(reports: &[TokenReport], prefix: usize) -> Summary {
+    let reports = &reports[..prefix.min(reports.len())];
+    let worst = reports
+        .iter()
+        .flat_map(|r| r.layer_errors.iter().copied())
+        .fold(0.0_f64, f64::max);
+    let kl = reports.iter().map(|r| r.kl).fold(0.0_f64, f64::max);
+    let swaps = reports
+        .iter()
+        .enumerate()
+        .filter_map(|(t, r)| r.swap.map(|(a, b, gap)| (t, a, b, gap)))
+        .collect();
+    let bad: Vec<(usize, usize, f64)> = reports
+        .iter()
+        .enumerate()
+        .filter_map(|(t, r)| {
+            r.layer_errors
+                .iter()
+                .position(|&e| e > 1.0e-3)
+                .map(|layer| (t, layer, r.layer_errors[layer]))
+        })
+        .collect();
+    Summary {
+        worst,
+        kl,
+        swaps,
+        bad: bad.len(),
+        first: bad.first().copied(),
+    }
+}
+
 /// N2 résident : decode GPU token par token (teacher forcing sur le texte du
-/// golden) contre la référence CPU f32 sans cache, couche par couche (chaîne
-/// native des deux côtés) et sur les logits. Longueur : `SARAGOSSA_QWEN4EXP_TOKENS`
-/// (64 par défaut, au plus 2051).
+/// golden) contre la référence CPU f32 sans cache, chaîne native des deux côtés.
+/// Longueur : `SARAGOSSA_QWEN4EXP_TOKENS` (2051 par défaut).
 ///
-/// Portes : écart relatif ≤ 1e-3 par couche et par token, KL max ≤ 1e-3,
-/// argmax identique sauf quasi-égalité (écart de probabilité oracle ≤ 1e-5).
+/// Une quasi-égalité du routeur (marge ≤ 1e-5) fait basculer un expert ; la
+/// divergence passe ensuite aux tokens suivants par l'état récurrent et le KV.
+/// La porte porte donc sur la **passe à routage imposé** (experts du CPU aux
+/// quasi-égalités), à 64, 256 et 2051 tokens : écart relatif ≤ 1e-3 par couche
+/// et par token, KL max ≤ 1e-3, argmax identique sauf quasi-égalité (écart de
+/// probabilité ≤ 1e-5). La passe native est mesurée comme témoin. Une
+/// mutation (mauvais expert imposé à marge nette) doit faire échouer la porte.
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_resident_decode_matches_cpu_reference() {
@@ -447,98 +609,117 @@ fn n2_resident_decode_matches_cpu_reference() {
     let tokens: usize = std::env::var("SARAGOSSA_QWEN4EXP_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(64);
+        .unwrap_or(DENSE_MAX_VISIBLE);
     let ids: Vec<usize> = n2_input_ids(std::path::Path::new(&golden))[..tokens].to_vec();
 
     let started = std::time::Instant::now();
     let reference =
         Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
-    let layers = reference.checkpoint().config.layer_kinds.len();
+    let config = &reference.checkpoint().config;
     let mut h = reference.embed(&ids).expect("invariant: embedding");
-    let mut cpu_layers = Vec::with_capacity(layers);
-    let mut cpu_margins = Vec::with_capacity(layers);
-    for index in 0..layers {
+    let (mut layers, mut routing, mut margins) = (Vec::new(), Vec::new(), Vec::new());
+    for index in 0..config.layer_kinds.len() {
         let out = reference
             .layer(index, &h, &ids)
             .expect("invariant: couche CPU");
         h = out.hidden;
-        cpu_layers.push(h.clone());
-        cpu_margins.push(out.routing_margins);
+        layers.push(h.clone());
+        routing.push(out.routing);
+        margins.push(out.routing_margins);
     }
-    let cpu_logits = reference
-        .logits(&reference.final_mixer(&h).expect("invariant: mixer"))
-        .expect("invariant: logits CPU");
+    let cpu = CpuChain {
+        logits: reference
+            .logits(&reference.final_mixer(&h).expect("invariant: mixer"))
+            .expect("invariant: logits CPU"),
+        width: config.hc_width(),
+        vocab: config.vocab,
+        layers,
+        routing,
+        margins,
+    };
     eprintln!(
         "référence CPU : {tokens} tokens en {:.0} s",
         started.elapsed().as_secs_f64()
     );
+    let ties: usize = cpu
+        .margins
+        .iter()
+        .flatten()
+        .filter(|&&m| m <= ROUTING_TIE)
+        .count();
+    eprintln!("quasi-égalités du routeur CPU (marge ≤ 1e-5) : {ties}");
 
-    let started = std::time::Instant::now();
-    let guard = crate::MemoryGuard::process();
-    let mut session = FlashNextSession::open(
-        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
-        tokens,
-        Some(&guard),
-    )
-    .expect("invariant: session résidente");
-    eprintln!("chargement GPU : {:.0} s", started.elapsed().as_secs_f64());
-
-    let vocab = reference.checkpoint().config.vocab;
-    let width = cpu_layers[0].as_matrix().expect("invariant: 2D").1;
-    let mut worst_layer = vec![0.0_f64; layers];
-    let (mut worst_kl, mut swaps) = (0.0_f64, Vec::new());
-    // (token, première couche > 1e-3, écart, marge de routage CPU à ce point)
-    let mut events: Vec<(usize, usize, f64, f32)> = Vec::new();
-    for (t, &token) in ids.iter().enumerate() {
-        let out = session
-            .step(token, true, true)
-            .expect("invariant: pas résident");
-        let got_layers = out.layers.expect("invariant: résiduels");
-        let mut first_bad = None;
-        for (index, got) in got_layers.iter().enumerate() {
-            let want = &cpu_layers[index].data()[t * width..(t + 1) * width];
-            let (err, _) = relative_error(got, want);
-            worst_layer[index] = worst_layer[index].max(err);
-            if err > 1.0e-3 && first_bad.is_none() {
-                first_bad = Some((index, err));
-            }
-        }
-        if let Some((index, err)) = first_bad {
-            if events.len() < 40 {
-                events.push((t, index, err, cpu_margins[index][t]));
-            }
-        }
-        let got = out.logits.expect("invariant: logits");
-        let want = &cpu_logits.data()[t * vocab..(t + 1) * vocab];
-        worst_kl = worst_kl.max(kl_logits(want, &got));
-        let cpu_top = want
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
-            .map(|(i, _)| i)
-            .expect("invariant: vocabulaire non vide");
-        let gpu_top = out.argmax as usize;
-        if gpu_top != cpu_top {
-            let max = want[cpu_top];
-            let sum: f64 = want.iter().map(|&v| f64::from(v - max).exp()).sum();
-            let gap = (1.0 - f64::from(want[gpu_top] - max).exp()) / sum;
-            swaps.push((t, cpu_top, gpu_top, gap));
+    let prefixes: Vec<usize> = [64, 256, tokens]
+        .into_iter()
+        .filter(|&p| p <= tokens)
+        .collect();
+    let (native, _) = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Native, tokens);
+    for &prefix in &prefixes {
+        let Summary {
+            worst,
+            kl,
+            swaps,
+            bad,
+            first,
+        } = summarize(&native, prefix);
+        eprintln!(
+            "native  {prefix:4} : écart max {worst:.2e}, KL max {kl:.2e}, argmax ≠ {}, \
+             tokens > 1e-3 : {bad}, premier (token, couche, écart) {first:?}",
+            swaps.len()
+        );
+    }
+    drop(native);
+    let (forced, imposed) = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Forced, tokens);
+    eprintln!("impositions (token × couche) : {imposed}");
+    let mut red = Vec::new();
+    for &prefix in &prefixes {
+        let Summary {
+            worst,
+            kl,
+            swaps,
+            bad,
+            first,
+        } = summarize(&forced, prefix);
+        eprintln!(
+            "imposée {prefix:4} : écart max {worst:.2e}, KL max {kl:.2e}, argmax ≠ {swaps:?}, \
+             tokens > 1e-3 : {bad}, premier {first:?}"
+        );
+        if worst > 1.0e-3 || kl > 1.0e-3 || swaps.iter().any(|s| s.3 > 1.0e-5) {
+            red.push(prefix);
         }
     }
-    for (index, err) in worst_layer.iter().enumerate() {
-        eprintln!("couche {index:2} : écart relatif max {err:.2e}");
-    }
-    eprintln!("KL max {worst_kl:.2e} ; argmax différents : {swaps:?}");
-    eprintln!("tokens au-delà de 1e-3 (token, couche, écart, marge CPU) : {events:?}");
-    assert!(
-        worst_layer.iter().all(|&e| e <= 1.0e-3),
-        "écart par couche au-delà de 1e-3"
+    let worst_by_layer: Vec<String> = (0..cpu.layers.len())
+        .map(|layer| {
+            let e = forced
+                .iter()
+                .map(|r| r.layer_errors[layer])
+                .fold(0.0_f64, f64::max);
+            format!("{e:.1e}")
+        })
+        .collect();
+    eprintln!(
+        "imposée, écart max par couche : {}",
+        worst_by_layer.join(" ")
     );
-    assert!(worst_kl <= 1.0e-3, "KL max {worst_kl}");
-    assert!(
-        swaps.iter().all(|s| s.3 <= 1.0e-5),
-        "argmax différent hors quasi-égalité : {swaps:?}"
-    );
+    drop(forced);
+
+    // Mutation : premier (token ≥ 8, couche) à marge nette (> 1e-2).
+    let (token, layer) = (8..tokens.min(64))
+        .find_map(|t| {
+            (0..cpu.margins.len())
+                .find(|&l| cpu.margins[l][t] > 1.0e-2)
+                .map(|l| (t, l))
+        })
+        .expect("invariant: une marge nette existe");
+    let steps = (token + 8).min(tokens);
+    let (mutated, _) =
+        run_resident_pass(&dir, &ids, &cpu, RoutingMode::Mutation(token, layer), steps);
+    let Summary {
+        worst, kl, first, ..
+    } = summarize(&mutated, steps);
+    eprintln!("mutation (token {token}, couche {layer}) : écart max {worst:.2e}, KL max {kl:.2e}, premier {first:?}");
+    assert!(worst > 1.0e-3, "mutation non détectée par la porte");
+    assert!(red.is_empty(), "passe imposée rouge aux préfixes {red:?}");
 }
 
 /// Débit AR résident : contexte de 1024 tokens (texte du golden), puis decode
