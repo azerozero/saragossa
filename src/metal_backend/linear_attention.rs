@@ -3505,7 +3505,7 @@ impl MetalExecutor {
         Ok(())
     }
 
-    pub(super) fn ensure_linear_attention_metal_state(
+    pub(crate) fn ensure_linear_attention_metal_state(
         &self,
         state: &mut Option<LinearAttentionMetalState>,
         conv_seed: &[f32],
