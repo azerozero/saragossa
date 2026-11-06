@@ -16,7 +16,7 @@ use super::attention::{
 use super::encoders::{Brick, Encoders};
 use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch};
 use super::kernels::FlashNextKernels;
-use super::ple::{encode_ple, PleScratch, PleState};
+use super::ple::{encode_ple, encode_rms_norm_1p, PleScratch, PleState};
 use super::weights::{FlashNextWeights, LayerWeights, LoadStage, MixerWeights};
 use crate::decode_resident::{DecodeResidentState, FullAttentionMetalState};
 use crate::metal_backend::{
@@ -32,6 +32,37 @@ enum LayerState {
     Linear(LinearAttentionMetalState),
     /// KV de la couche QSA et état de son indexeur.
     Full(Box<(FullAttentionMetalState, IndexerState)>),
+}
+
+/// Tampons propres à la tête MTP : résiduels ping-pong (jamais ceux du tronc,
+/// dont le résiduel avant mixer reste intact), entrée fc et sortie hc.
+struct MtpBuffers {
+    h: [Buffer; 2],
+    embed: Buffer,
+    e_normed: Buffer,
+    fe: Buffer,
+    h_normed: Buffer,
+    fh: Buffer,
+    /// Résiduel hc de sortie : `h` du draft suivant.
+    out: Buffer,
+}
+
+/// Sortie d'un pas MTP.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
+)]
+pub(crate) struct MtpOutput {
+    /// Draft : argmax du lm_head partagé sur le mixer de tête.
+    pub(crate) argmax: u32,
+    pub(crate) logits: Option<Vec<f32>>,
+    /// Résiduel hc de sortie (`[hc·hidden]`), relu sur demande.
+    pub(crate) hidden: Option<Vec<f32>>,
+    /// Oracles : sélection QSA (régime creux) et experts routés de la couche.
+    #[cfg(test)]
+    pub(crate) qsa: Option<QsaCapture>,
+    #[cfg(test)]
+    pub(crate) routing: Option<Vec<u32>>,
 }
 
 /// Capacité maximale d'une session : 256k tokens (contexte cible, plan §8.1).
@@ -109,7 +140,12 @@ pub(crate) struct FlashNextSession {
     kernels: FlashNextKernels,
     queue: CommandQueue,
     weights: FlashNextWeights,
+    /// États des couches du tronc, puis, en dernier, celui de la couche MTP si
+    /// la tête est chargée : `reset`, points de reprise et budgets le couvrent
+    /// ainsi d'office, l'encodage du tronc s'arrêtant aux couches.
     states: Vec<LayerState>,
+    /// Tampons de la tête MTP (absents sans tête).
+    mtp: Option<MtpBuffers>,
     ple_state: PleState,
     h: [Buffer; 2],
     x: Buffer,
@@ -162,6 +198,11 @@ pub(crate) struct FlashNextSession {
     /// Oracles : blocs QSA imposés au prochain pas, par couche (consommés).
     #[cfg(test)]
     pub(crate) forced_selection: Vec<Option<Vec<u32>>>,
+    /// Oracles : blocs et experts imposés au prochain pas MTP (consommés).
+    #[cfg(test)]
+    pub(crate) mtp_forced_selection: Option<Vec<u32>>,
+    #[cfg(test)]
+    pub(crate) mtp_forced_routing: Option<Vec<u32>>,
     /// Oracles : sélection et scores de l'indexeur par couche du dernier pas
     /// (`[couches, keep]` u32, `[couches, blocs max]` f32).
     #[cfg(test)]
@@ -225,7 +266,16 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
         + 2 * c.experts + 2 * c.top_k * (3 * c.moe_inter + c.hidden) // MoE routé
         + 3 * c.shared_inter + 2 * c.hidden // expert partagé
         + c.vocab; // argmax du lm_head
-    ((kv + deltanet + ple + session + executor + indexer) * f32_bytes) as u64
+                   // Tête MTP : KV et indexeur d'une couche QSA, résiduels et entrée fc.
+    let mtp = if c.mtp_layers == 1 {
+        capacity * 2 * kv_dim
+            + (blocks + c.indexer_compress) * c.indexer_head_dim
+            + 5 * width // résiduels ping-pong, h normé, fc_hidden, sortie
+            + 3 * c.hidden // embedding, e normé, fc_embedding
+    } else {
+        0
+    };
+    ((kv + deltanet + ple + session + executor + indexer + mtp) * f32_bytes) as u64
 }
 
 /// Refuse, avant toute allocation, les variantes que le chemin résident ne
@@ -384,8 +434,17 @@ impl FlashNextSession {
             arena,
             kernels,
             queue: executor.device().new_command_queue(),
+            mtp: weights.mtp.as_ref().map(|_| MtpBuffers {
+                h: [zeros(&executor, width), zeros(&executor, width)],
+                embed: zeros(&executor, c.hidden),
+                e_normed: zeros(&executor, c.hidden),
+                fe: zeros(&executor, c.hidden),
+                h_normed: zeros(&executor, width),
+                fh: zeros(&executor, width),
+                out: zeros(&executor, width),
+            }),
             weights,
-            states: Vec::with_capacity(c.layer_kinds.len()),
+            states: Vec::with_capacity(c.layer_kinds.len() + 1),
             ple_state: PleState {
                 bytes: executor
                     .device()
@@ -465,7 +524,7 @@ impl FlashNextSession {
             poisoned: false,
             #[cfg(test)]
             routing_capture: executor.device().new_buffer(
-                (c.layer_kinds.len() * c.top_k * std::mem::size_of::<u32>()) as u64,
+                ((c.layer_kinds.len() + 1) * c.top_k * std::mem::size_of::<u32>()) as u64,
                 MTLResourceOptions::StorageModeShared,
             ),
             #[cfg(test)]
@@ -479,14 +538,18 @@ impl FlashNextSession {
             #[cfg(test)]
             forced_selection: Vec::new(),
             #[cfg(test)]
+            mtp_forced_selection: None,
+            #[cfg(test)]
+            mtp_forced_routing: None,
+            #[cfg(test)]
             selection_capture: executor.device().new_buffer(
-                (c.layer_kinds.len() * (c.indexer_budget / c.indexer_compress) * 4) as u64,
+                ((c.layer_kinds.len() + 1) * (c.indexer_budget / c.indexer_compress) * 4) as u64,
                 MTLResourceOptions::StorageModeShared,
             ),
             #[cfg(test)]
             score_capture: zeros(
                 &executor,
-                c.layer_kinds.len() * (capacity / c.indexer_compress + 1),
+                (c.layer_kinds.len() + 1) * (capacity / c.indexer_compress + 1),
             ),
             executor,
             ckpt,
@@ -511,8 +574,14 @@ impl FlashNextSession {
         let dims = self.linear_dims;
         let conv_len = (spec.conv_kernel_dim - 1) * dims.conv_dim;
         let ssm_len = spec.num_value_heads * spec.value_head_dim * spec.key_head_dim;
+        let mtp = self
+            .weights
+            .mtp
+            .as_ref()
+            .map(|_| crate::qwen_loader::qwen4_exp::Qwen4ExpLayerKind::Full);
         c.layer_kinds
             .iter()
+            .chain(mtp.iter())
             .map(|kind| match kind {
                 crate::qwen_loader::qwen4_exp::Qwen4ExpLayerKind::Linear => {
                     let mut state = None;
@@ -597,7 +666,22 @@ impl FlashNextSession {
         ]
         .iter()
         .map(|b| b.length())
-        .sum::<u64>();
+        .sum::<u64>()
+            + self.mtp.as_ref().map_or(0, |m| {
+                [
+                    &m.h[0],
+                    &m.h[1],
+                    &m.embed,
+                    &m.e_normed,
+                    &m.fe,
+                    &m.h_normed,
+                    &m.fh,
+                    &m.out,
+                ]
+                .iter()
+                .map(|b| b.length())
+                .sum::<u64>()
+            });
         let states: u64 = self
             .states
             .iter()
@@ -1042,6 +1126,311 @@ impl FlashNextSession {
             host,
             encode,
         })
+    }
+
+    /// Oracles : gains bruts des normes d'entrée MTP (embedding, flux), pour les
+    /// mutations de gain.
+    #[cfg(test)]
+    pub(crate) fn mtp_norm_buffers(&self) -> Option<(&Buffer, &Buffer)> {
+        self.weights
+            .mtp
+            .as_ref()
+            .map(|w| (&w.norm_embedding, &w.norm_hidden))
+    }
+
+    /// Oracles : tronque l'historique MTP à `rows` lignes (mutation « historique
+    /// figé »).
+    #[cfg(test)]
+    pub(crate) fn mtp_truncate(&mut self, rows: usize) -> Result<()> {
+        match self.states.last_mut() {
+            Some(LayerState::Full(full)) if self.mtp.is_some() => full.0.truncate(rows),
+            _ => Err(InferError::Config(
+                "Flash-Next : tête MTP absente".to_string(),
+            )),
+        }
+    }
+
+    /// Lignes de l'historique MTP (longueur du KV de la tête) ; `None` sans tête.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
+    )]
+    pub(crate) fn mtp_rows(&self) -> Option<usize> {
+        self.mtp.as_ref()?;
+        match self.states.last() {
+            Some(LayerState::Full(full)) => Some(full.0.len()),
+            _ => None,
+        }
+    }
+
+    /// Pas MTP sur la paire `(h, token)` : `h` est un résiduel hc du tronc avant
+    /// le mixer final (ou la sortie d'un pas MTP précédent), `token` le token
+    /// suivant. Ajoute la ligne `rows` à l'historique de la tête (position RoPE
+    /// et blocs d'indexeur en indices de ligne) et renvoie le draft.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sans tête MTP, sur forme ou token invalides, capacité
+    /// atteinte, ou sur encodage et exécution Metal (session invalidée dans ce
+    /// dernier cas, comme [`Self::step`]).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
+    )]
+    pub(crate) fn mtp_step(
+        &mut self,
+        h: &[f32],
+        token: usize,
+        logits: bool,
+        hidden: bool,
+    ) -> Result<MtpOutput> {
+        if self.poisoned {
+            return Err(InferError::Metal(
+                "Flash-Next résident : session invalidée (erreur GPU ou reset incomplet)"
+                    .to_string(),
+            ));
+        }
+        let c = &self.ckpt.config;
+        let width = self.hc_dims.width();
+        let rows = self
+            .mtp_rows()
+            .ok_or_else(|| InferError::Config("Flash-Next : tête MTP absente".to_string()))?;
+        if h.len() != width || token >= c.vocab {
+            return Err(InferError::Shape(format!(
+                "MTP : h de {} valeurs (largeur {width}), token {token} (vocabulaire {})",
+                h.len(),
+                c.vocab
+            )));
+        }
+        if rows >= self.capacity {
+            return Err(InferError::Config(format!(
+                "Flash-Next MTP : capacité de {} lignes atteinte",
+                self.capacity
+            )));
+        }
+        let row = self.ckpt.affine_rows(
+            &Qwen4ExpCheckpoint::trunk("embed_tokens"),
+            None,
+            token..token + 1,
+        )?;
+        let buffers = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| InferError::Config("Flash-Next : tête MTP absente".to_string()))?;
+        write_f32_buffer(&buffers.h[0], h)?;
+        write_f32_buffer(&buffers.embed, row.data())?;
+        let queue = self.queue.clone();
+        let command_buffer = queue.new_command_buffer();
+        let mut encoders = Encoders::single(command_buffer);
+        let encoded = self.encode_mtp(&mut encoders, rows, logits);
+        if let Err(error) = encoded {
+            drop(encoders);
+            // Rien n'est soumis : seule la longueur du KV a avancé.
+            if let Some(LayerState::Full(full)) = self.states.last_mut() {
+                if full.0.truncate(rows).is_err() {
+                    self.poisoned = true;
+                }
+            }
+            return Err(error);
+        }
+        encoders.end();
+        if let Err(error) = commit_and_wait(command_buffer) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        let argmax = read_u32_buffer(&self.index, 1)?
+            .first()
+            .copied()
+            .ok_or_else(|| InferError::Metal("argmax MTP absent".to_string()))?;
+        let c = &self.ckpt.config;
+        #[cfg(test)]
+        let slot = c.layer_kinds.len();
+        Ok(MtpOutput {
+            argmax,
+            logits: logits
+                .then(|| read_f32_buffer(&self.logits, c.vocab))
+                .transpose()?,
+            hidden: hidden
+                .then(|| {
+                    self.mtp
+                        .as_ref()
+                        .map(|m| read_f32_buffer(&m.out, width))
+                        .transpose()
+                })
+                .transpose()?
+                .flatten(),
+            #[cfg(test)]
+            qsa: {
+                let complete = (rows + 1) / self.indexer_dims.compress;
+                let keep = self.indexer_dims.keep;
+                if complete > keep {
+                    let stride = self.capacity / self.indexer_dims.compress + 1;
+                    let selection = read_u32_buffer(&self.selection_capture, (slot + 1) * keep)?;
+                    let scores = read_f32_buffer(&self.score_capture, (slot + 1) * stride)?;
+                    Some((
+                        selection[slot * keep..(slot + 1) * keep].to_vec(),
+                        scores[slot * stride..slot * stride + complete].to_vec(),
+                    ))
+                } else {
+                    None
+                }
+            },
+            #[cfg(test)]
+            routing: Some(
+                read_u32_buffer(&self.routing_capture, (slot + 1) * c.top_k)?
+                    [slot * c.top_k..(slot + 1) * c.top_k]
+                    .to_vec(),
+            ),
+        })
+    }
+
+    /// Encode un pas MTP à la ligne `rows` : entrée fc par flux, couche QSA +
+    /// MoE ([`LayerEncoder::encode`]), copie du résiduel de sortie, mixer de
+    /// tête et lm_head (argmax, logits sur demande). Ne soumet rien.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
+    )]
+    fn encode_mtp(&mut self, encoders: &mut Encoders<'_>, rows: usize, logits: bool) -> Result<()> {
+        let c = &self.ckpt.config;
+        let width = self.hc_dims.width();
+        let missing = || InferError::Config("Flash-Next : tête MTP absente".to_string());
+        let weights = self.weights.mtp.as_ref().ok_or_else(missing)?;
+        let buffers = self.mtp.as_ref().ok_or_else(missing)?;
+        let state = self.states.last_mut().ok_or_else(missing)?;
+        let encoder = encoders.at(Brick::Hc)?;
+        // Normes : `e` en un groupe de `hidden`, `h` flux par flux.
+        encode_rms_norm_1p(
+            &self.kernels,
+            encoder,
+            &buffers.embed,
+            &weights.norm_embedding,
+            &buffers.e_normed,
+            HcDims {
+                hc: 1,
+                ..self.hc_dims
+            },
+        );
+        encode_rms_norm_1p(
+            &self.kernels,
+            encoder,
+            &buffers.h[0],
+            &weights.norm_hidden,
+            &buffers.h_normed,
+            self.hc_dims,
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        self.executor.encode_matmul_weight_buffers(
+            encoder,
+            &buffers.e_normed,
+            1,
+            c.hidden,
+            &weights.fc_embedding,
+            &buffers.fe,
+            true,
+        )?;
+        // `fc_hidden` partagé par les flux : une ligne de `hidden` par flux.
+        self.executor.encode_matmul_weight_buffers(
+            encoder,
+            &buffers.h_normed,
+            c.hc_count,
+            c.hidden,
+            &weights.fc_hidden,
+            &buffers.fh,
+            true,
+        )?;
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        encoder.set_compute_pipeline_state(&self.kernels.mtp_add_streams);
+        encoder.set_buffer(0, Some(&buffers.fh), 0);
+        encoder.set_buffer(1, Some(&buffers.fe), 0);
+        encoder.set_buffer(2, Some(&buffers.h[1]), 0);
+        super::set_value(encoder, 3, &[width as u32, c.hidden as u32]);
+        super::dispatch_1d(encoder, width);
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        let ctx = LayerEncoder {
+            kernels: &self.kernels,
+            executor: &self.executor,
+            arena: &self.arena,
+            hc_scratch: &self.hc_scratch,
+            hc_dims: self.hc_dims,
+            qsa_scratch: &self.qsa_scratch,
+            qsa_dims: self.qsa_dims,
+            indexer_scratch: &self.indexer_scratch,
+            indexer_dims: self.indexer_dims,
+            linear_spec: self.linear_spec,
+            linear_dims: self.linear_dims,
+            x: &self.x,
+            branch: &self.branch,
+            hidden: c.hidden,
+            top_k: c.top_k,
+        };
+        let mut cur = 1;
+        let mut owned = Vec::new();
+        #[cfg(test)]
+        let hooks = LayerHooks {
+            forced_selection: self.mtp_forced_selection.take(),
+            forced_routing: self.mtp_forced_routing.take(),
+            capture: Some(CaptureSlot {
+                slot: c.layer_kinds.len(),
+                selection: &self.selection_capture,
+                scores: &self.score_capture,
+                routing: &self.routing_capture,
+                stride: self.capacity / self.indexer_dims.compress + 1,
+            }),
+        };
+        ctx.encode(
+            encoders,
+            &mut owned,
+            &mut self.gathered,
+            &weights.layer,
+            state,
+            &buffers.h,
+            &mut cur,
+            rows,
+            c.layer_kinds.len(),
+            #[cfg(test)]
+            hooks,
+        )?;
+        let encoder = encoders.at(Brick::Mixer)?;
+        self.executor.encode_copy_with_offsets(
+            encoder,
+            &buffers.h[cur],
+            0,
+            &buffers.out,
+            0,
+            width,
+        )?;
+        encode_hc_mix(
+            &self.kernels,
+            &self.executor,
+            encoder,
+            &weights.mixer,
+            &self.hc_scratch,
+            self.hc_dims,
+            &buffers.h[cur],
+            &self.x,
+        )?;
+        let encoder = encoders.at(Brick::LmHead)?;
+        if logits {
+            self.executor.encode_matmul_weight_buffers(
+                encoder,
+                &self.x,
+                1,
+                c.hidden,
+                &self.weights.lm_head,
+                &self.logits,
+                true,
+            )?;
+        }
+        self.executor.encode_lm_head_argmax_buffers(
+            encoder,
+            &mut owned,
+            &self.x,
+            &self.weights.lm_head,
+            &self.index,
+            c.hidden,
+        )?;
+        Ok(())
     }
 
     /// Encode les couches, le mixer final et le lm_head du token courant.

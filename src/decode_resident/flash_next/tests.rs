@@ -2686,3 +2686,274 @@ fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
     );
     Ok(())
 }
+
+/// Tenseur d'un golden safetensors : `(forme, octets)`.
+fn golden_tensor(path: &std::path::Path, name: &str) -> (Vec<usize>, Vec<u8>) {
+    use std::os::unix::fs::FileExt;
+    let header = crate::qwen_loader::read_shard_header(path).expect("invariant: golden lisible");
+    let entry = header
+        .tensors
+        .get(name)
+        .unwrap_or_else(|| panic!("golden sans {name}"));
+    let mut bytes = vec![0_u8; entry.data_offsets[1] - entry.data_offsets[0]];
+    std::fs::File::open(path)
+        .expect("invariant: golden")
+        .read_exact_at(&mut bytes, header.data_start + entry.data_offsets[0] as u64)
+        .expect("invariant: lecture golden");
+    (entry.shape.clone(), bytes)
+}
+
+fn golden_f32(path: &std::path::Path, name: &str) -> Vec<f32> {
+    golden_tensor(path, name)
+        .1
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn golden_i64(path: &std::path::Path, name: &str) -> Vec<usize> {
+    golden_tensor(path, name)
+        .1
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().expect("invariant: 8 octets")) as usize)
+        .collect()
+}
+
+/// N2 de la tête MTP résidente contre la tête CPU (`qwen4_exp/mtp.rs`), sur
+/// les 4095 paires `(h_t, tok_{t+1})` de `mtp_golden.safetensors` (dont 2044
+/// en régime QSA creux). Chaque ligne GPU part du même `h` que le CPU : la
+/// couche est ré-ancrée par construction. Portes de l'étape 5 (scores ≤ 1e-5,
+/// échanges de sélection justifiés à 2e-5, routage à la paire au seuil de
+/// marge ≤ 1e-5, sortie hc ≤ 1e-4, valeurs finies) ; logits aux positions
+/// figées : KL ≤ 1e-3 par ligne, argmax identique sauf quasi-égalité ≤ 1e-5.
+/// Triangulation : sortie hc GPU contre `mtp_output` de transformers (1e-4).
+/// Mutations : expert, bloc, gain doublé et absent, historique figé.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn n2_resident_mtp_head_matches_cpu() {
+    use crate::qwen4_exp::Qwen4ExpReference;
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden_dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis"),
+    );
+    let golden = golden_dir.join("mtp_golden.safetensors");
+    let next = golden_i64(&golden, "mtp_next_ids");
+    let positions = golden_i64(&golden, "mtp_positions");
+    let h = golden_f32(&golden, "mtp_h");
+    let rows = next.len();
+    let reference =
+        Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
+    let config = reference.checkpoint().config.clone();
+    let (width, vocab, keep, compress) = (
+        config.hc_width(),
+        config.vocab,
+        reference.budget_blocks(),
+        reference.compress(),
+    );
+    let started = std::time::Instant::now();
+    let h_tensor = Tensor::from_vec(vec![rows, width], h.clone()).expect("invariant: forme");
+    let x = reference
+        .mtp_input(&h_tensor, &next)
+        .expect("invariant: entrée MTP CPU");
+    let cpu = reference
+        .mtp_layer(&x, None, None)
+        .expect("invariant: couche MTP CPU");
+    let trace = cpu.qsa.as_ref().expect("invariant: trace QSA");
+    let pick = |t: &[f32]| -> Vec<f32> {
+        positions
+            .iter()
+            .flat_map(|&p| t[p * width..(p + 1) * width].iter().copied())
+            .collect()
+    };
+    let picked = Tensor::from_vec(vec![positions.len(), width], pick(cpu.hidden.data()))
+        .expect("invariant: lignes");
+    let cpu_logits = reference
+        .logits(&reference.mtp_head(&picked).expect("invariant: mixer MTP"))
+        .expect("invariant: logits MTP CPU");
+    eprintln!(
+        "référence CPU MTP : {rows} paires en {:.0} s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let open = |capacity: usize| {
+        FlashNextSession::open(
+            Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+            capacity,
+            Some(&crate::MemoryGuard::process()),
+        )
+        .expect("invariant: session")
+    };
+    // Passe native : une ligne d'historique par paire, logits aux positions.
+    let mut session = open(rows);
+    let (mut out_error, mut score_err, mut kl_max) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let (mut sel_swaps, mut sel_bad, mut route_swaps, mut route_bad, mut argmax_bad) =
+        (0, 0, 0, 0, 0);
+    let mut gpu_out = Vec::with_capacity(positions.len() * width);
+    let mut drafts = Vec::with_capacity(positions.len());
+    for j in 0..rows {
+        let at = positions.iter().position(|&p| p == j);
+        let step = session
+            .mtp_step(&h[j * width..(j + 1) * width], next[j], at.is_some(), true)
+            .expect("invariant: pas MTP");
+        let hidden = step.hidden.expect("invariant: sortie hc");
+        out_error = nan_max(
+            out_error,
+            finite_relative_error(&hidden, &cpu.hidden.data()[j * width..(j + 1) * width]),
+        );
+        let mut routing: Vec<usize> = step
+            .routing
+            .expect("invariant: routage")
+            .into_iter()
+            .map(|e| e as usize)
+            .collect();
+        routing.sort_unstable();
+        if routing != cpu.routing[j] {
+            route_swaps += 1;
+            let (kth, next_e) = cpu.routing_boundary[j];
+            let pair = routing
+                .iter()
+                .filter(|e| !cpu.routing[j].contains(e))
+                .eq([&next_e])
+                && cpu.routing[j]
+                    .iter()
+                    .filter(|e| !routing.contains(e))
+                    .eq([&kth]);
+            if !(pair && cpu.routing_margins[j] <= ANCHORED_TIE) {
+                route_bad += 1;
+            }
+        }
+        if let Some((blocks, scores)) = step.qsa {
+            score_err = nan_max(score_err, score_error(&scores, &trace.scores[j], keep));
+            let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b as usize).collect();
+            blocks.sort_unstable();
+            let want = trace_blocks(trace, j, keep, compress).unwrap_or_default();
+            if blocks != want {
+                sel_swaps += 1;
+                if !swap_justified(&trace.scores[j], &want, &blocks, keep, ANCHORED_SWAP_TIE) {
+                    sel_bad += 1;
+                }
+            }
+        } else if trace.scores[j].len() > keep {
+            sel_bad += 1;
+        }
+        if let Some(i) = at {
+            let got = step.logits.expect("invariant: logits");
+            let want = &cpu_logits.data()[i * vocab..(i + 1) * vocab];
+            let kl = if got.iter().all(|v| v.is_finite()) {
+                kl_logits(want, &got)
+            } else {
+                f64::NAN
+            };
+            kl_max = nan_max(kl_max, kl);
+            let top = want
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+                .map(|(t, _)| t)
+                .expect("invariant: vocabulaire");
+            let gpu_top = step.argmax as usize;
+            if gpu_top != top {
+                let max = want[top];
+                let sum: f64 = want.iter().map(|&v| f64::from(v - max).exp()).sum();
+                let gap = (1.0 - f64::from(want[gpu_top] - max).exp()) / sum;
+                if !within(gap, 1.0e-5) {
+                    argmax_bad += 1;
+                }
+            }
+            gpu_out.extend_from_slice(&hidden);
+            drafts.push(gpu_top);
+        }
+    }
+    let (torch_err, _) = relative_error(&gpu_out, &golden_f32(&golden, "mtp_output"));
+    eprintln!(
+        "MTP résidente : sortie {out_error:.2e}, scores {score_err:.2e}, sélections ≠ \
+         {sel_swaps} (injustifiées {sel_bad}), routages ≠ {route_swaps} (injustifiés \
+         {route_bad}), KL max {kl_max:.2e}, argmax injustifiés {argmax_bad} ; contre \
+         transformers : {torch_err:.2e}"
+    );
+    let green = within(out_error, ANCHORED_OUTPUT_TOL)
+        && within(score_err, f64::from(ANCHORED_TIE))
+        && within(kl_max, 1.0e-3)
+        && within(torch_err, ANCHORED_OUTPUT_TOL)
+        && sel_bad == 0
+        && route_bad == 0
+        && argmax_bad == 0;
+
+    // Mutations : `hook(session, j)` avant chaque pas, sortie comparée au CPU
+    // sur les lignes `0..steps`.
+    let mutated = |label: &str, steps: usize, hook: &dyn Fn(&mut FlashNextSession, usize)| {
+        let mut session = open(steps);
+        let mut worst = 0.0_f64;
+        for j in 0..steps {
+            hook(&mut session, j);
+            let step = session
+                .mtp_step(&h[j * width..(j + 1) * width], next[j], false, true)
+                .expect("invariant: pas muté");
+            let hidden = step.hidden.expect("invariant: sortie hc");
+            worst = nan_max(
+                worst,
+                finite_relative_error(&hidden, &cpu.hidden.data()[j * width..(j + 1) * width]),
+            );
+        }
+        eprintln!("mutation {label} : écart de sortie {worst:.2e}");
+        assert!(
+            !within(worst, ANCHORED_OUTPUT_TOL),
+            "mutation {label} non détectée"
+        );
+    };
+    let scale_gain = |session: &mut FlashNextSession, map: fn(f32) -> f32| {
+        let (_, hidden_norm) = session.mtp_norm_buffers().expect("invariant: tête MTP");
+        let w = read_f32_buffer(hidden_norm, width).expect("invariant: gains");
+        let mutated: Vec<f32> = w.into_iter().map(map).collect();
+        crate::metal_backend::write_f32_buffer(hidden_norm, &mutated).expect("invariant: écriture");
+    };
+    let probe = 64;
+    // Gain doublé : 1 + w' = 2(1 + w) ; gain absent : 1 + w' = 1.
+    mutated("gain doublé", probe, &|s, j| {
+        if j == 0 {
+            scale_gain(s, |w| 2.0 * w + 1.0);
+        }
+    });
+    mutated("gain absent", probe, &|s, j| {
+        if j == 0 {
+            scale_gain(s, |_| 0.0);
+        }
+    });
+    mutated("historique figé", probe, &|s, j| {
+        if j > 0 {
+            s.mtp_truncate(0).expect("invariant: troncature");
+        }
+    });
+    // Mauvais expert à la ligne 8 : un expert retenu remplacé par un absent.
+    let e_row = 8;
+    mutated("mauvais expert", e_row + 1, &|s, j| {
+        if j == e_row {
+            let set = &cpu.routing[e_row];
+            let outsider = (0..)
+                .find(|e| !set.contains(e))
+                .expect("invariant: expert libre");
+            let mut wrong: Vec<u32> = set.iter().map(|&e| e as u32).collect();
+            wrong[0] = outsider as u32;
+            s.mtp_forced_routing = Some(wrong);
+        }
+    });
+    // Mauvais bloc en régime creux : un bloc retenu remplacé par un écarté.
+    let b_row = dense_max_visible(keep * compress, compress) + 4;
+    mutated("mauvais bloc", b_row + 1, &|s, j| {
+        if j == b_row {
+            let blocks =
+                trace_blocks(trace, b_row, keep, compress).expect("invariant: régime creux");
+            let outsider = (0..)
+                .find(|b| !blocks.contains(b))
+                .expect("invariant: bloc libre");
+            let mut wrong: Vec<u32> = blocks.iter().map(|&b| b as u32).collect();
+            wrong[0] = outsider as u32;
+            wrong.sort_unstable();
+            s.mtp_forced_selection = Some(wrong);
+        }
+    });
+    assert!(green, "N2 MTP résidente rouge");
+}

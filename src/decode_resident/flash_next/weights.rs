@@ -33,9 +33,24 @@ pub(crate) struct LayerWeights {
     pub(crate) moe: MetalMoeSharedWeights,
 }
 
-/// Poids GPU du tronc (sans MTP) et sources CPU maintenues en vie.
+/// Poids GPU de la tête MTP : entrée fc par flux, une couche QSA + MoE à
+/// hyper-connections (même loader que le tronc, préfixe `mtp.layers.0.`) et
+/// mixer de tête vers le lm_head partagé.
+pub(crate) struct MtpWeights {
+    pub(crate) fc_embedding: MetalLinearWeightBuffers,
+    pub(crate) fc_hidden: MetalLinearWeightBuffers,
+    /// Gains **bruts** `w` : la norme groupée applique `1 + w` (kernels.rs).
+    pub(crate) norm_embedding: Buffer,
+    pub(crate) norm_hidden: Buffer,
+    pub(crate) layer: LayerWeights,
+    pub(crate) mixer: HcWeights,
+}
+
+/// Poids GPU du tronc, tête MTP éventuelle, et sources CPU maintenues en vie.
 pub(crate) struct FlashNextWeights {
     pub(crate) layers: Vec<LayerWeights>,
+    /// Présente si le checkpoint déclare une couche MTP (sidecar validé).
+    pub(crate) mtp: Option<MtpWeights>,
     pub(crate) mixer: HcWeights,
     pub(crate) lm_head: MetalLinearWeightBuffers,
     pub(crate) ple: PleWeights,
@@ -114,8 +129,9 @@ impl LoadStage {
     }
 }
 
-/// Étapes du chargement du tronc, dans l'ordre de [`FlashNextWeights::load`] :
-/// mixer final, lm_head, PLE, puis une étape par couche.
+/// Étapes du chargement, dans l'ordre de [`FlashNextWeights::load`] : mixer
+/// final, lm_head, PLE, une étape par couche, puis la tête MTP (`mtp.`) si le
+/// checkpoint en déclare une.
 pub(crate) fn load_plan(ckpt: &Qwen4ExpCheckpoint) -> Vec<LoadStage> {
     let c = &ckpt.config;
     let mut stages = vec![
@@ -131,6 +147,9 @@ pub(crate) fn load_plan(ckpt: &Qwen4ExpCheckpoint) -> Vec<LoadStage> {
             ckpt,
             &Qwen4ExpCheckpoint::layer_prefix(index),
         ));
+    }
+    if c.mtp_layers == 1 {
+        stages.push(LoadStage::from_checkpoint(ckpt, "mtp."));
     }
     stages
 }
@@ -173,6 +192,7 @@ impl FlashNextWeights {
         let ple = Self::ple(executor, ckpt)?;
         let mut weights = Self {
             layers: Vec::with_capacity(c.layer_kinds.len()),
+            mtp: None,
             mixer,
             lm_head,
             ple,
@@ -189,6 +209,27 @@ impl FlashNextWeights {
                 *kind,
             )?;
             weights.layers.push(layer);
+        }
+        if c.mtp_layers == 1 {
+            next(&mut stages)?;
+            let resolve = |base: &str| -> Result<MetalLinearWeightBuffers> {
+                executor.resolve_linear_weight_buffers(
+                    &LinearWeight::AffineQuantized(ckpt.quantized(base, None)?),
+                    "flash_next_mtp",
+                )
+            };
+            let layer = weights.layer(executor, ckpt, "mtp.layers.0.", Qwen4ExpLayerKind::Full)?;
+            weights.mtp = Some(MtpWeights {
+                fc_embedding: resolve("mtp.fc_embedding")?,
+                fc_hidden: resolve("mtp.fc_hidden")?,
+                norm_embedding: f32_buffer(
+                    executor,
+                    &ckpt.floats("mtp.pre_fc_norm_embedding.weight")?,
+                ),
+                norm_hidden: f32_buffer(executor, &ckpt.floats("mtp.pre_fc_norm_hidden.weight")?),
+                layer,
+                mixer: Self::hc(executor, ckpt, "mtp.hyper_connection_mixer.", false)?,
+            });
         }
         if stages.next().is_some() {
             return Err(InferError::Config(
