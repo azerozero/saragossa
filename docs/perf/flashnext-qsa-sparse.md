@@ -183,6 +183,33 @@ torch y est imposée pour suivre la même trajectoire (ablation de l'étape 1).
      (4,3e-3) dépasserait le plafond de 1e-4, et imposerait 91 % des points
      creux.
 
+### Résultats du N2 résident (4096 tokens, 196 608 points token × couche)
+
+Le test est vert en 2438 s, avec un pic mémoire de 93,5 Go.
+
+- **Passe native.** Première bascule au token 313, couche 2, sur une marge de
+  3,4e-8, avec un échange limité à la paire au seuil. Avant cette bascule,
+  l'écart reste ≤ 6,8e-5 et le KL de 7,6e-9.
+- **Oracle ré-ancré** : vert sur les 12 couches (tableau ci-dessus).
+- **Mutations de l'oracle ré-ancré**, toutes deux rouges comme attendu :
+  - sélection mutée (couche 3, dernier token) : 1 échange non justifié, et
+    les autres portes restent vertes ;
+  - autotest de sortie : écart 2,0e-4, au-dessus de 1e-4, sélections
+    intactes.
+- **Bout en bout**, sélection QSA propre du GPU :
+
+  | routage imposé ≤ | régime dense | argmax ≠ (4096) | KL max | écart max | routage imposé | sélections QSA ≠ | dérive des scores |
+  |---|---|---|---|---|---|---|---|
+  | 1e-7 | rouge | 1 | 4,0e-3 | 1,6e-1 | 0,03 % | 1040 | 8,8e-2 |
+  | 1e-6 | **vert** | **0** | 1,3e-3 | 9,7e-2 | 0,29 % | 178 | 6,0e-2 |
+  | 1e-5 | vert | 0 | 4,0e-6 | 4,4e-3 | 3,0 % | 75 | 3,7e-3 |
+
+  - Seuil retenu pour le régime dense : 1e-6, comme à l'étape 4.
+  - Les sélections QSA différentes tombent toutes après 2051, avec des marges
+    CPU de 6e-7 à 8e-4. Elles sont publiées, sans porte.
+- **Mutations de routage** (tokens 38 et 316, en régime dense) : rouges,
+  comme attendu.
+
 ## Mémoire jusqu'à 256k
 
 `resident_session_allocates_max_capacity` ouvre une session de 262 144
