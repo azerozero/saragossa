@@ -746,6 +746,13 @@ fn native_check(
     Ok(Some((t, l, margin)))
 }
 
+/// Vrai si toutes les sorties et métriques d'une passe sont finies.
+fn all_finite(reports: &[TokenReport]) -> bool {
+    reports
+        .iter()
+        .all(|r| r.kl.is_finite() && r.layer_errors.iter().all(|e| e.is_finite()))
+}
+
 /// Toutes les bascules de routage d'une passe : `(token, couche, paire au
 /// seuil ?, marge CPU)`.
 fn routing_swaps(reports: &[TokenReport], cpu: &CpuChain) -> Vec<(usize, usize, bool, f32)> {
@@ -800,6 +807,7 @@ fn n2_gate_refuses_late_nan_and_native_check_refuses_early_drift() {
         "NaN de KL accepté"
     );
     assert!(native_check(&late_nan, &cpu).is_err(), "NaN natif accepté");
+    assert!(all_finite(&clean) && !all_finite(&late_nan) && !all_finite(&late_kl));
     let mut wrong = (0..4).map(|_| report(1.0e-6, 1.0e-9)).collect::<Vec<_>>();
     wrong[2].routing[0] = vec![1, 9];
     assert!(
@@ -885,6 +893,8 @@ fn n2_resident_decode_matches_cpu_reference() {
     prefixes.dedup();
     let native = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Native, tokens);
     let native_first = native_check(&native, &cpu);
+    // Toute la séquence native : sorties et métriques finies.
+    let native_finite = all_finite(&native);
     let swaps = routing_swaps(&native, &cpu);
     eprintln!(
         "native : première bascule {native_first:?} ; bascules {} (paire au seuil : {}), 10 premières {:?}",
@@ -934,27 +944,42 @@ fn n2_resident_decode_matches_cpu_reference() {
     let threshold = chosen.unwrap_or(TIE_THRESHOLDS[TIE_THRESHOLDS.len() - 1]);
     eprintln!("seuil retenu : {chosen:?}");
 
-    // Mutation : (token ≥ 8, couche) de plus grande marge CPU parmi les 64 premiers.
-    let (token, layer) = (8..tokens.min(64))
-        .flat_map(|t| (0..cpu.margins.len()).map(move |l| (t, l)))
-        .max_by(|a, b| cpu.margins[a.1][a.0].total_cmp(&cpu.margins[b.1][b.0]))
-        .expect("invariant: au moins 9 tokens");
-    let steps = (token + 8).min(tokens);
-    let mutated = run_resident_pass(
-        &dir,
-        &ids,
-        &cpu,
-        RoutingMode::Mutation(token, layer, threshold),
-        steps,
-    );
-    let s = summarize(&mutated, &cpu, steps);
-    eprintln!(
-        "mutation (token {token}, couche {layer}, marge {:.2e}) : écart max {:.2e}, KL max {:.2e}, premier {:?}",
-        cpu.margins[layer][token], s.worst, s.kl, s.first
-    );
-    assert!(!forced_gate_green(&s), "mutation non détectée par la porte");
+    // Mutations : un mauvais expert imposé au point de plus grande marge CPU,
+    // tôt (tokens 8 à 63) puis tard (64 tokens après la première bascule
+    // native), dans la passe imposée au seuil retenu.
+    let after = native_first
+        .as_ref()
+        .ok()
+        .and_then(|f| f.map(|(t, _, _)| t + 1))
+        .unwrap_or(8);
+    for range in [8..tokens.min(64), after..tokens.min(after + 64)] {
+        let Some((token, layer)) = range
+            .flat_map(|t| (0..cpu.margins.len()).map(move |l| (t, l)))
+            .max_by(|a, b| cpu.margins[a.1][a.0].total_cmp(&cpu.margins[b.1][b.0]))
+        else {
+            continue;
+        };
+        let steps = (token + 8).min(tokens);
+        let mutated = run_resident_pass(
+            &dir,
+            &ids,
+            &cpu,
+            RoutingMode::Mutation(token, layer, threshold),
+            steps,
+        );
+        let s = summarize(&mutated, &cpu, steps);
+        eprintln!(
+            "mutation (token {token}, couche {layer}, marge {:.2e}) : écart max {:.2e}, KL max {:.2e}, premier {:?}",
+            cpu.margins[layer][token], s.worst, s.kl, s.first
+        );
+        assert!(
+            !forced_gate_green(&s),
+            "mutation au token {token} non détectée par la porte"
+        );
+    }
     assert!(chosen.is_some(), "passe imposée rouge à tous les seuils");
     native_first.unwrap_or_else(|e| panic!("passe native : {e}"));
+    assert!(native_finite, "passe native : valeur non finie");
 }
 
 /// Débit AR résident : `SARAGOSSA_FLASH_NEXT_BENCH_RUNS` répétitions (3 par
@@ -1020,9 +1045,10 @@ fn bench_resident_decode_after_1k_context() {
             pct(&hosts, 0.5)
         );
     }
-    eprintln!(
-        "porte 45 tok/s à 1k (répétition la plus lente, {slowest:.1} tok/s) : {}",
-        if slowest >= 45.0 { "verte" } else { "rouge" }
+    eprintln!("porte 45 tok/s à 1k : répétition la plus lente à {slowest:.1} tok/s");
+    assert!(
+        slowest >= 45.0,
+        "porte de débit rouge : {slowest:.1} tok/s < 45"
     );
 }
 
@@ -1089,6 +1115,27 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
     };
     let expected: Vec<Vec<f32>> = {
         let mut session = open();
+        // Budget de session : allocations propres, plus le scratch interne de
+        // l'exécuteur alloué au premier pas, sous `session_state_bytes`.
+        let before = session.device_allocated_bytes();
+        let first = session
+            .step(ids[0], true, false)
+            .expect("invariant: premier pas");
+        let lazy = session.device_allocated_bytes().saturating_sub(before);
+        let budget = super::session::session_state_bytes(
+            &Qwen4ExpCheckpoint::open(&dir)
+                .expect("invariant: checkpoint")
+                .config,
+            ids.len(),
+        );
+        let used = session.owned_state_bytes() + lazy;
+        eprintln!("session : {used} octets alloués (dont {lazy} au premier pas), budget {budget}");
+        assert!(
+            used <= budget,
+            "allocations de session {used} > budget {budget}"
+        );
+        session.reset().expect("invariant: reset");
+        drop(first);
         ids.iter()
             .map(|&t| {
                 session
@@ -1123,6 +1170,14 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
             "token {t}"
         );
     }
+    // Reset en échec après quelques couches : session invalidée, pas refusé ;
+    // un reset complet la réhabilite.
+    session.fail_reset_after_layer = Some(3);
+    assert!(session.reset().is_err(), "échec de reset ignoré");
+    assert!(
+        session.step(ids[0], true, false).is_err(),
+        "pas accepté après un reset partiel"
+    );
     // Reset : la séquence rejouée depuis le début redonne les mêmes logits.
     session.reset().expect("invariant: reset");
     for (t, &token) in ids.iter().enumerate().take(4) {

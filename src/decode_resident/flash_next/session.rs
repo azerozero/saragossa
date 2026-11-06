@@ -93,6 +93,9 @@ pub(crate) struct FlashNextSession {
     /// Oracles : prochaine lecture n-gram en échec.
     #[cfg(test)]
     pub(crate) fail_next_ngram_read: bool,
+    /// Oracles : échec de `reset` injecté après la restauration de la couche donnée.
+    #[cfg(test)]
+    pub(crate) fail_reset_after_layer: Option<usize>,
     /// Oracles : échec d'encodage injecté après la couche donnée.
     #[cfg(test)]
     pub(crate) fail_encode_after_layer: Option<usize>,
@@ -109,8 +112,13 @@ fn zeros(executor: &MetalExecutor, len: usize) -> Buffer {
 }
 
 /// Octets des états et intermédiaires d'une session de `capacity` tokens :
-/// KV f32 des couches QSA, états conv/SSM du DeltaNet, anneau PLE, logits,
-/// capture des résiduels et scratch.
+/// - KV f32 des couches QSA ;
+/// - états conv/SSM du DeltaNet, **deux fois** (états vivants et instantanés
+///   initiaux du `reset`) ;
+/// - anneau et octets PLE, buffers de la session (résiduels, logits, capture,
+///   scratch hc/PLE/QSA) ;
+/// - scratch interne de l'exécuteur, alloué au premier pas (DeltaNet, MoE,
+///   argmax), majoré.
 pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
     let f32_bytes = std::mem::size_of::<f32>();
     let width = c.hc_width();
@@ -123,14 +131,26 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
     let kv = full * capacity * 2 * c.kv_heads * c.head_dim;
     let conv_dim =
         2 * c.linear_key_heads * c.linear_key_dim + c.linear_value_heads * c.linear_value_dim;
-    let deltanet = linear
+    let value_dim = c.linear_value_heads * c.linear_value_dim;
+    let deltanet = 2
+        * linear
         * ((c.conv_kernel - 1) * conv_dim
             + c.linear_value_heads * c.linear_value_dim * c.linear_key_dim);
-    let ple_ring = (c.ple_conv_kernel - 1) * c.ngram_size * width;
+    let ple = (c.ple_conv_kernel - 1) * c.ngram_size * width + c.ple_dim;
     let q_dim = c.heads * c.head_dim;
-    let scratch =
-        8 * width + 8 * q_dim + c.heads * capacity + c.vocab + c.layer_kinds.len() * width;
-    ((kv + deltanet + ple_ring + scratch) * f32_bytes) as u64
+    let kv_dim = c.kv_heads * c.head_dim;
+    let session = 2 * width // résiduels ping-pong
+        + 2 * c.hidden // entrée de branche et sortie de mélangeur
+        + c.vocab + 1 // logits et argmax
+        + c.layer_kinds.len() * width // capture des résiduels
+        + 2 * width + c.hc_lowrank + c.hc_count // scratch hc
+        + c.ple_dim + 5 * width + c.hidden // scratch PLE
+        + 6 * q_dim + 3 * kv_dim + c.heads * capacity; // scratch QSA
+    let executor = 4 * conv_dim + 6 * value_dim + 4 * c.linear_value_heads // DeltaNet
+        + 2 * c.experts + 2 * c.top_k * (3 * c.moe_inter + c.hidden) // MoE routé
+        + 3 * c.shared_inter + 2 * c.hidden // expert partagé
+        + c.vocab; // argmax du lm_head
+    ((kv + deltanet + ple + session + executor) * f32_bytes) as u64
 }
 
 /// Refuse, avant toute allocation, les variantes que le chemin résident ne
@@ -323,6 +343,8 @@ impl FlashNextSession {
             #[cfg(test)]
             fail_next_ngram_read: false,
             #[cfg(test)]
+            fail_reset_after_layer: None,
+            #[cfg(test)]
             fail_encode_after_layer: None,
             #[cfg(test)]
             forced_routing: Vec::new(),
@@ -384,6 +406,72 @@ impl FlashNextSession {
             .collect()
     }
 
+    /// Octets alloués par la session hors poids (oracles) : buffers propres,
+    /// états DeltaNet et instantanés, KV f32.
+    #[cfg(test)]
+    pub(crate) fn owned_state_bytes(&self) -> u64 {
+        let c = &self.ckpt.config;
+        let own = [
+            &self.h[0],
+            &self.h[1],
+            &self.x,
+            &self.branch,
+            &self.logits,
+            &self.index,
+            &self.capture,
+            &self.hc_scratch.normed,
+            &self.hc_scratch.low,
+            &self.hc_scratch.up,
+            &self.hc_scratch.inject,
+            &self.ple_scratch.emb,
+            &self.ple_scratch.key,
+            &self.ple_scratch.key_normed,
+            &self.ple_scratch.value,
+            &self.ple_scratch.query,
+            &self.ple_scratch.gated,
+            &self.ple_scratch.normed,
+            &self.qsa_scratch.q_gate,
+            &self.qsa_scratch.q_raw,
+            &self.qsa_scratch.gate,
+            &self.qsa_scratch.q_roped,
+            &self.qsa_scratch.k_raw,
+            &self.qsa_scratch.k_roped,
+            &self.qsa_scratch.v,
+            &self.qsa_scratch.scores,
+            &self.qsa_scratch.ctx,
+            &self.qsa_scratch.gated,
+            &self.ple_state.bytes,
+            &self.ple_state.ring,
+        ]
+        .iter()
+        .map(|b| b.length())
+        .sum::<u64>();
+        let states: u64 = self
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Linear(state) => MetalExecutor::linear_attn_state_bytes(state),
+                LayerState::Full(kv) => {
+                    (kv.capacity() * 2 * c.kv_heads * c.head_dim * std::mem::size_of::<f32>())
+                        as u64
+                }
+            })
+            .sum();
+        let snapshots: u64 = self
+            .initial_linear
+            .iter()
+            .flatten()
+            .map(MetalExecutor::linear_attn_state_bytes)
+            .sum();
+        own + states + snapshots
+    }
+
+    /// Octets alloués sur le device Metal de la session (oracles).
+    #[cfg(test)]
+    pub(crate) fn device_allocated_bytes(&self) -> u64 {
+        self.executor.device().current_allocated_size()
+    }
+
     /// Position du prochain token (oracles).
     #[cfg(test)]
     pub(crate) fn position(&self) -> usize {
@@ -391,14 +479,32 @@ impl FlashNextSession {
     }
 
     /// Remet la session au début d'une séquence : états DeltaNet initiaux, KV
-    /// vide, PLE remis à zéro. Lève l'invalidation d'une erreur GPU antérieure,
-    /// tout l'état étant réécrit.
+    /// vide, PLE remis à zéro. La session est invalidée pendant la
+    /// restauration et ne redevient utilisable qu'après un succès complet, ce
+    /// qui lève aussi l'invalidation d'une erreur GPU antérieure.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur de copie Metal ou de troncature du KV.
     pub(crate) fn reset(&mut self) -> Result<()> {
-        for (state, initial) in self.states.iter_mut().zip(&self.initial_linear) {
+        // Invalide pendant la restauration : un échec partiel laisse des états
+        // mêlés, que seul un `reset` complet réhabilite.
+        self.poisoned = true;
+        for (index, (state, initial)) in
+            self.states.iter_mut().zip(&self.initial_linear).enumerate()
+        {
+            #[cfg(not(test))]
+            let _ = index;
+            #[cfg(test)]
+            if self
+                .fail_reset_after_layer
+                .take_if(|after| *after < index)
+                .is_some()
+            {
+                return Err(InferError::Metal(format!(
+                    "reset en échec à la couche {index} (injecté)"
+                )));
+            }
             match (state, initial) {
                 (LayerState::Linear(state), Some(initial)) => {
                     self.executor.restore_linear_attn_state(state, initial)?;
