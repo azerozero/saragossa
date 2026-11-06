@@ -5,7 +5,7 @@
 //! decode incrémental, le prefill découpé et les chemins Metal viendront avec
 //! le chemin résident ; cette référence sert d'oracle.
 
-mod attention;
+pub(crate) mod attention;
 mod forward;
 pub(crate) mod math;
 mod moe;

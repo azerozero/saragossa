@@ -273,3 +273,125 @@ fn flash_next_ple_steps_match_cpu_sequence_and_reset() -> Result<()> {
     }
     Ok(())
 }
+
+/// Attention QSA résidente en régime dense (24 têtes, 2 KV, d256, RoPE 64,
+/// θ = 1e7, `q_proj` entrelacé) pas à pas contre `qsa` CPU sans cache sur
+/// 40 tokens ; puis refus explicite d'une position ≥ 2051.
+#[test]
+fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
+    use crate::decode_resident::DecodeResidentState;
+    use crate::qwen4_exp::attention::{qsa, QsaDims, QsaWeights as CpuQsa};
+    let Some(executor) = executor()? else {
+        return Ok(());
+    };
+    let arena = DecodeResidentState::new(executor.device().clone())?;
+    let dims = QsaDecodeDims {
+        hidden: 2560,
+        heads: 24,
+        kv_heads: 2,
+        head_dim: 256,
+        rotary_dim: 64,
+        theta: 1.0e7,
+        eps: 1.0e-6,
+    };
+    let (tokens, q_dim, kv_dim) = (40, 24 * 256, 2 * 256);
+    let mut rng = DeterministicF32::new(0x05a0_0024);
+    let (q_gpu, q_w) = u8_weight(&executor, &mut rng, 2 * q_dim, dims.hidden, 0.04)?;
+    let (k_gpu, k_w) = u8_weight(&executor, &mut rng, kv_dim, dims.hidden, 0.04)?;
+    let (v_gpu, v_w) = u8_weight(&executor, &mut rng, kv_dim, dims.hidden, 0.04)?;
+    let (o_gpu, o_w) = u8_weight(&executor, &mut rng, dims.hidden, q_dim, 0.02)?;
+    let q_norm = rng.fill(256, -0.3, 0.3);
+    let k_norm = rng.fill(256, -0.3, 0.3);
+    let x = rng.fill(tokens * dims.hidden, -1.0, 1.0);
+    let cpu_w = CpuQsa {
+        q_proj: q_w,
+        k_proj: k_w,
+        v_proj: v_w,
+        o_proj: o_w,
+        q_norm: q_norm.clone(),
+        k_norm: k_norm.clone(),
+        index_qk: Tensor::from_vec(
+            vec![5 * 128, dims.hidden],
+            rng.fill(5 * 128 * 2560, -0.02, 0.02),
+        )?,
+        index_q_norm: vec![0.0; 128],
+        index_k_norm: vec![0.0; 128],
+    };
+    let cpu_dims = QsaDims {
+        heads: 24,
+        kv_heads: 2,
+        head_dim: 256,
+        rotary_dim: 64,
+        rope_theta: 1.0e7,
+        index_heads: 4,
+        index_head_dim: 128,
+        budget: 2048,
+        compress: 4,
+        eps: 1.0e-6,
+    };
+    let expected = qsa(
+        &Tensor::from_vec(vec![tokens, dims.hidden], x.clone())?,
+        &cpu_w,
+        cpu_dims,
+        None,
+    )?
+    .output;
+
+    let one_plus = |w: &[f32]| -> Vec<f32> { w.iter().map(|v| 1.0 + v).collect() };
+    let weights = QsaLayerWeights {
+        q_proj: q_gpu,
+        k_proj: k_gpu,
+        v_proj: v_gpu,
+        o_proj: o_gpu,
+        q_norm: buffer(&executor, &one_plus(&q_norm)),
+        k_norm: buffer(&executor, &one_plus(&k_norm)),
+    };
+    let capacity = 64;
+    let scratch = QsaScratch {
+        q_gate: zeros(&executor, 2 * q_dim),
+        q_raw: zeros(&executor, q_dim),
+        gate: zeros(&executor, q_dim),
+        q_roped: zeros(&executor, q_dim),
+        k_raw: zeros(&executor, kv_dim),
+        k_roped: zeros(&executor, kv_dim),
+        v: zeros(&executor, kv_dim),
+        scores: zeros(&executor, 24 * capacity),
+        ctx: zeros(&executor, q_dim),
+        gated: zeros(&executor, q_dim),
+    };
+    let mut kv = arena.full_attention_dense(capacity, 24, 2, 256, false)?;
+    let queue = executor.device().new_command_queue();
+    for t in 0..tokens {
+        let x_buf = buffer(&executor, &x[t * dims.hidden..(t + 1) * dims.hidden]);
+        let out = zeros(&executor, dims.hidden);
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_qsa_dense(
+            &arena, &executor, encoder, &mut kv, &weights, &scratch, dims, t, &x_buf, &out,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        let got = read_f32_buffer(&out, dims.hidden)?;
+        let want = &expected.data()[t * dims.hidden..(t + 1) * dims.hidden];
+        let (err, max) = relative_error(&got, want);
+        assert!(err <= 1.0e-5, "QSA dense pas {t} : {err} (max {max})");
+    }
+    let command_buffer = queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let x_buf = zeros(&executor, dims.hidden);
+    let refused = encode_qsa_dense(
+        &arena,
+        &executor,
+        encoder,
+        &mut kv,
+        &weights,
+        &scratch,
+        dims,
+        DENSE_MAX_VISIBLE,
+        &x_buf,
+        &x_buf,
+    );
+    encoder.end_encoding();
+    assert!(refused.is_err(), "position 2051 acceptée");
+    Ok(())
+}

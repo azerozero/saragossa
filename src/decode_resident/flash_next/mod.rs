@@ -10,6 +10,7 @@
     reason = "briques du decode Flash-Next, câblées couche par couche (étape 4)"
 )]
 
+mod attention;
 mod hc;
 mod kernels;
 mod ple;
@@ -17,6 +18,9 @@ mod ple;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use attention::{
+    encode_qsa_dense, QsaDecodeDims, QsaLayerWeights, QsaScratch, DENSE_MAX_VISIBLE,
+};
 pub(crate) use hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch, HcWeights};
 pub(crate) use kernels::FlashNextKernels;
 pub(crate) use ple::{encode_ple, PleScratch, PleState, PleWeights};
