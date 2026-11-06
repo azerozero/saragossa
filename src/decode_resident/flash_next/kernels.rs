@@ -84,18 +84,69 @@ kernel void flash_next_hc_inject_partial_f32(
     }
 }
 
-// `low = SiLU(low / hc)` en place (`hc` puissance de deux : division exacte).
+// `low[i] = SiLU((Σ_c partial[i, c]) / hc)` : réduit les `chunks` sommes
+// partielles du Down (1 tranche : `partial` peut être `low`, en place).
 kernel void flash_next_hc_silu_scale_f32(
-    device float* low [[buffer(0)]],
-    constant uint& n [[buffer(1)]],
-    constant float& hc [[buffer(2)]],
+    device const float* partial [[buffer(0)]],
+    device float* low [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant float& hc [[buffer(3)]],
+    constant uint& chunks [[buffer(4)]],
     uint i [[thread_position_in_grid]]
 ) {
     if (i >= n) {
         return;
     }
-    const float v = low[i] / hc;
+    float sum = 0.0f;
+    for (uint c = 0u; c < chunks; ++c) {
+        sum += partial[i * chunks + c];
+    }
+    const float v = sum / hc;
     low[i] = v * (1.0f / (1.0f + exp(-v)));
+}
+
+// qmv u8 gs64 en split-K (Down des hyper-connections, peu de lignes, entrée
+// longue) : un simdgroup par (ligne, tranche de mots), 8 lignes par
+// threadgroup ; `partial[row, c]`. Déquantification de
+// `affine_qmv_fast_aligned_u8_gs64_f32` : `float(q)·scale + bias`.
+// dims = (out_dim, in_dim, packed_cols, groups), `chunks` divise `packed_cols`.
+kernel void flash_next_qmv_u8_gs64_splitk_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* partial [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    constant uint& chunks [[buffer(6)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint row = tile.y * 8u + simd_gid;
+    if (row >= out_dim) {
+        return;
+    }
+    const uint words = packed_cols / chunks;
+    const uint first = tile.x * words;
+    float acc = 0.0f;
+    for (uint w = first + lane; w < first + words; w += 32u) {
+        const uint word = packed[row * packed_cols + w];
+        const uint col = w * 4u;
+        const uint affine_index = row * groups + min(col / 64u, groups - 1u);
+        const float scale = scales[affine_index];
+        const float bias = biases[affine_index];
+        for (uint k = 0u; k < 4u; ++k) {
+            const float q = float((word >> (8u * k)) & 0xffu);
+            acc += lhs[col + k] * ((q * scale) + bias);
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) {
+        partial[row * chunks + tile.x] = acc;
+    }
 }
 
 // Entrée de branche `x[d] = (Σ_s σ(up[s,d])·n[s,d]) / hc`.
@@ -256,6 +307,7 @@ pub(crate) struct FlashNextKernels {
     pub(super) hc_mix: ComputePipelineState,
     pub(super) hc_combine: ComputePipelineState,
     pub(super) hc_inject_partial: ComputePipelineState,
+    pub(super) qmv_u8_splitk: ComputePipelineState,
     pub(super) ple_gather: ComputePipelineState,
     pub(super) ple_gate: ComputePipelineState,
     pub(super) ple_conv_add: ComputePipelineState,
@@ -280,6 +332,7 @@ impl FlashNextKernels {
                 "flash_next_hc_mix_f32",
                 "flash_next_hc_combine_f32",
                 "flash_next_hc_inject_partial_f32",
+                "flash_next_qmv_u8_gs64_splitk_f32",
                 "flash_next_ple_gather_f32",
                 "flash_next_ple_gate_f32",
                 "flash_next_ple_conv_add_f32",
@@ -306,6 +359,7 @@ impl FlashNextKernels {
             hc_mix: next()?,
             hc_combine: next()?,
             hc_inject_partial: next()?,
+            qmv_u8_splitk: next()?,
             ple_gather: next()?,
             ple_gate: next()?,
             ple_conv_add: next()?,

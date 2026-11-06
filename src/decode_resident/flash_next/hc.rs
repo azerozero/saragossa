@@ -29,7 +29,12 @@ pub(crate) struct HcScratch {
     pub(crate) up: Buffer,
     /// Sommes partielles de l'injection `[hc, INJECT_CHUNKS]`.
     pub(crate) inject: Buffer,
+    /// Sommes partielles du Down `[lowrank, DOWN_CHUNKS]`.
+    pub(crate) down_partial: Buffer,
 }
+
+/// Tranches du Down en split-K (8 × 1280 colonnes à largeur 10240).
+pub(crate) const DOWN_CHUNKS: usize = 8;
 
 /// Tranches de la réduction de l'injection (16 × 640 à largeur 10240).
 pub(crate) const INJECT_CHUNKS: usize = 16;
@@ -69,15 +74,60 @@ pub(crate) fn encode_hc_mix(
     encode_rms_norm_1p(kernels, encoder, h, &weights.norm, &scratch.normed, dims);
     post_dispatch_barrier(encoder);
 
-    executor.encode_matmul_weight_buffers(
-        encoder,
-        &scratch.normed,
-        1,
-        width,
-        &weights.down,
-        &scratch.low,
-        true,
-    )?;
+    // Down : split-K si u8 gs64 aligné (320 lignes, 10240 colonnes : le qmv
+    // standard n'occupe que 40 threadgroups), sinon qmv standard.
+    let down_chunks = match &weights.down {
+        MetalLinearWeightBuffers::AffineQuantized {
+            packed,
+            packed_offset,
+            scales,
+            scales_offset,
+            biases,
+            biases_offset,
+            out_dim,
+            in_dim,
+            packed_cols,
+            group_size: 64,
+            bits: 8,
+            groups,
+        } if *in_dim == width && *packed_cols % DOWN_CHUNKS == 0 && *packed_cols * 4 == *in_dim => {
+            encoder.set_compute_pipeline_state(&kernels.qmv_u8_splitk);
+            encoder.set_buffer(0, Some(&scratch.normed), 0);
+            encoder.set_buffer(1, Some(packed), *packed_offset);
+            encoder.set_buffer(2, Some(scales), *scales_offset);
+            encoder.set_buffer(3, Some(biases), *biases_offset);
+            encoder.set_buffer(4, Some(&scratch.down_partial), 0);
+            set_value(
+                encoder,
+                5,
+                &[
+                    *out_dim as u32,
+                    *in_dim as u32,
+                    *packed_cols as u32,
+                    *groups as u32,
+                ],
+            );
+            set_value(encoder, 6, &(DOWN_CHUNKS as u32));
+            crate::metal_backend::profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(DOWN_CHUNKS as u64, out_dim.div_ceil(8) as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            DOWN_CHUNKS
+        }
+        _ => {
+            executor.encode_matmul_weight_buffers(
+                encoder,
+                &scratch.normed,
+                1,
+                width,
+                &weights.down,
+                &scratch.low,
+                true,
+            )?;
+            1
+        }
+    };
     post_dispatch_barrier(encoder);
     if let Some(inject) = &weights.inject {
         // Injection : 4 lignes trop courtes pour un GEMV ; tranches en parallèle,
@@ -94,9 +144,16 @@ pub(crate) fn encode_hc_mix(
         );
     }
     encoder.set_compute_pipeline_state(&kernels.hc_silu_scale);
-    encoder.set_buffer(0, Some(&scratch.low), 0);
-    set_value(encoder, 1, &(dims.lowrank as u32));
-    set_value(encoder, 2, &(dims.hc as f32));
+    let partial = if down_chunks == 1 {
+        &scratch.low
+    } else {
+        &scratch.down_partial
+    };
+    encoder.set_buffer(0, Some(partial), 0);
+    encoder.set_buffer(1, Some(&scratch.low), 0);
+    set_value(encoder, 2, &(dims.lowrank as u32));
+    set_value(encoder, 3, &(dims.hc as f32));
+    set_value(encoder, 4, &(down_chunks as u32));
     dispatch_1d(encoder, dims.lowrank);
     post_dispatch_barrier(encoder);
 

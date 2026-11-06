@@ -50,6 +50,8 @@ pub(crate) struct StepOutput {
     pub(crate) routing: Option<Vec<Vec<u32>>>,
     /// Préparation CPU avant le commit (embedding, hachage, lectures PLE).
     pub(crate) host: std::time::Duration,
+    /// Encodage CPU du command buffer (GPU inactif pendant ce temps).
+    pub(crate) encode: std::time::Duration,
 }
 
 /// Decode résident Flash-Next d'une séquence (≤ 2051 tokens).
@@ -147,7 +149,7 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
         + 2 * c.hidden // entrée de branche et sortie de mélangeur
         + c.vocab + 1 // logits et argmax
         + c.layer_kinds.len() * width // capture des résiduels
-        + 2 * width + c.hc_lowrank + c.hc_count * super::hc::INJECT_CHUNKS // scratch hc
+        + 2 * width + c.hc_lowrank * (1 + super::hc::DOWN_CHUNKS) + c.hc_count * super::hc::INJECT_CHUNKS // scratch hc
         + c.ple_dim + 5 * width + c.hidden // scratch PLE
         + 6 * q_dim + 3 * kv_dim + c.heads * capacity; // scratch QSA
     let executor = 4 * conv_dim + 6 * value_dim + 4 * c.linear_value_heads // DeltaNet
@@ -309,6 +311,7 @@ impl FlashNextSession {
                 low: zeros(&executor, c.hc_lowrank),
                 up: zeros(&executor, width),
                 inject: zeros(&executor, c.hc_count * super::hc::INJECT_CHUNKS),
+                down_partial: zeros(&executor, c.hc_lowrank * super::hc::DOWN_CHUNKS),
             },
             ple_scratch: PleScratch {
                 emb: zeros(&executor, c.ple_dim),
@@ -433,6 +436,7 @@ impl FlashNextSession {
             &self.hc_scratch.low,
             &self.hc_scratch.up,
             &self.hc_scratch.inject,
+            &self.hc_scratch.down_partial,
             &self.ple_scratch.emb,
             &self.ple_scratch.key,
             &self.ple_scratch.key_normed,
@@ -606,6 +610,7 @@ impl FlashNextSession {
             })
             .collect();
         let ple_step = self.ple_state.step;
+        let encode_started = std::time::Instant::now();
         let queue = self.queue.clone();
         let command_buffer = queue.new_command_buffer();
         #[cfg(feature = "devtools")]
@@ -641,6 +646,7 @@ impl FlashNextSession {
             return Err(error);
         }
         encoders.end();
+        let encode = encode_started.elapsed();
         #[cfg(feature = "devtools")]
         if let Some(profiler) = profiler.as_ref() {
             profiler.encode_resolve(command_buffer);
@@ -688,6 +694,7 @@ impl FlashNextSession {
                 })
                 .transpose()?,
             host,
+            encode,
         })
     }
 

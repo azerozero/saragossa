@@ -107,6 +107,7 @@ fn flash_next_hc_mix_and_combine_match_cpu_at_real_dims() -> Result<()> {
         low: zeros(&executor, dims.lowrank),
         up: zeros(&executor, width),
         inject: zeros(&executor, dims.hc * super::hc::INJECT_CHUNKS),
+        down_partial: zeros(&executor, dims.lowrank * super::hc::DOWN_CHUNKS),
     };
     for with_inject in [true, false] {
         let cpu = GatedResidual {
@@ -1028,24 +1029,27 @@ fn bench_resident_decode_after_1k_context() {
         }
         let mut walls = Vec::with_capacity(generated);
         let mut hosts = Vec::with_capacity(generated);
+        let mut encodes = Vec::with_capacity(generated);
         let started = std::time::Instant::now();
         for _ in 0..generated {
             let step = std::time::Instant::now();
             let out = session.step(next, false, false).expect("invariant: decode");
             walls.push(step.elapsed().as_secs_f64() * 1e3);
             hosts.push(out.host.as_secs_f64() * 1e3);
+            encodes.push(out.encode.as_secs_f64() * 1e3);
             next = out.argmax as usize;
         }
         let throughput = generated as f64 / started.elapsed().as_secs_f64();
         slowest = slowest.min(throughput);
         eprintln!(
             "répétition {run} : {throughput:.1} tok/s ({generated} tokens / durée totale) ; \
-             par pas médiane {:.2} ms, p10 {:.2}, p90 {:.2}, max {:.2} ; préparation CPU médiane {:.3} ms",
+             par pas médiane {:.2} ms, p10 {:.2}, p90 {:.2}, max {:.2} ; préparation CPU médiane {:.3} ms, encodage médian {:.3} ms",
             pct(&walls, 0.5),
             pct(&walls, 0.1),
             pct(&walls, 0.9),
             pct(&walls, 1.0),
-            pct(&hosts, 0.5)
+            pct(&hosts, 0.5),
+            pct(&encodes, 0.5)
         );
     }
     eprintln!("porte 45 tok/s à 1k : répétition la plus lente à {slowest:.1} tok/s");
@@ -1354,6 +1358,7 @@ fn bench_hc_pieces_at_real_dims() -> Result<()> {
         low: zeros(&executor, dims.lowrank),
         up: zeros(&executor, width),
         inject: zeros(&executor, 4 * super::hc::INJECT_CHUNKS),
+        down_partial: zeros(&executor, dims.lowrank * super::hc::DOWN_CHUNKS),
     };
     let x = zeros(&executor, dims.hidden);
     let out = zeros(&executor, width);
