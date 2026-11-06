@@ -1128,6 +1128,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
         value_head_dim: 128,
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
     };
     let dims = LinearAttnResidentDims {
         in_dim: HIDDEN,

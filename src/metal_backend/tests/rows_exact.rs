@@ -396,6 +396,7 @@ impl RowsExactLinear {
             value_head_dim: 128,
             conv_kernel_dim: 4,
             rms_eps: 1e-6,
+            l2_qk_sigmoid_gate: false,
         };
         let key_dim = 16 * 128;
         let value_dim = value_heads * 128;

@@ -1697,11 +1697,13 @@ impl MetalExecutor {
         let decay_buffer = self.private_f32_buffer(spec.num_value_heads, "linear_attn_decay")?;
         let y_buffer = self.private_f32_buffer(value_dim, "linear_attn_y")?;
         let use_inv_delta = full_kernels
+            && !spec.l2_qk_sigmoid_gate
             && linear_inv_delta_enabled()
             && spec.key_head_dim == 128
             && spec.value_head_dim == 128
             && linear_delta_dk128_enabled();
         if full_kernels
+            && !spec.l2_qk_sigmoid_gate
             && linear_conv_norm_fused_enabled()
             && !use_inv_delta
             && spec.conv_kernel_dim == 4

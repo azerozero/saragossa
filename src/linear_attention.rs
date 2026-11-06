@@ -463,6 +463,7 @@ impl LinearAttention {
                     value_head_dim: config.value_head_dim,
                     conv_kernel_dim: config.conv_kernel_dim,
                     rms_eps: config.rms_eps,
+                    l2_qk_sigmoid_gate: false,
                 },
             ) {
                 Ok(output) => return Ok(output),
@@ -717,6 +718,7 @@ impl LinearAttention {
                 value_head_dim: config.value_head_dim,
                 conv_kernel_dim: config.conv_kernel_dim,
                 rms_eps: config.rms_eps,
+                l2_qk_sigmoid_gate: false,
             },
         )
     }

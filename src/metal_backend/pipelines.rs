@@ -488,6 +488,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "linear_attn_norm_gates_dk128_f32")?;
         let linear_attn_norm_gates_inv_dk128_f32 =
             pipeline(&library, &device, "linear_attn_norm_gates_inv_dk128_f32")?;
+        let linear_attn_norm_gates_l2_dk128_f32 =
+            pipeline(&library, &device, "linear_attn_norm_gates_l2_dk128_f32")?;
         let linear_attn_conv_norm_gates_k4_dk128_f32 = pipeline(
             &library,
             &device,
@@ -549,6 +551,8 @@ impl MetalExecutor {
         let linear_attn_rms_gate_f32 = pipeline(&library, &device, "linear_attn_rms_gate_f32")?;
         let linear_attn_rms_gate_dv128_f32 =
             pipeline(&library, &device, "linear_attn_rms_gate_dv128_f32")?;
+        let linear_attn_rms_gate_sigmoid_dv128_f32 =
+            pipeline(&library, &device, "linear_attn_rms_gate_sigmoid_dv128_f32")?;
         let linear_attn_rms_gate_batch_dv128_f32 =
             pipeline(&library, &device, "linear_attn_rms_gate_batch_dv128_f32")?;
         let affine_gather_matmul_rhs_t_u32_f32 =
@@ -865,6 +869,7 @@ impl MetalExecutor {
             linear_attn_norm_gates_f32,
             linear_attn_norm_gates_dk128_f32,
             linear_attn_norm_gates_inv_dk128_f32,
+            linear_attn_norm_gates_l2_dk128_f32,
             linear_attn_conv_norm_gates_k4_dk128_f32,
             linear_attn_conv_norm_gates_k4_dk128_batch_f32,
             linear_attn_conv_state_shift_f32,
@@ -881,6 +886,7 @@ impl MetalExecutor {
             linear_attn_gated_delta_inv_dk128_tg4_f32,
             linear_attn_rms_gate_f32,
             linear_attn_rms_gate_dv128_f32,
+            linear_attn_rms_gate_sigmoid_dv128_f32,
             linear_attn_rms_gate_batch_dv128_f32,
             affine_gather_matmul_rhs_t_u32_f32,
             affine_gather_qmv_fast_u3_gs64_f32,

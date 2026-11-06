@@ -20,6 +20,7 @@ fn linear_attn_state_snapshot_restore_roundtrip() -> Result<()> {
         value_head_dim: 8,
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
     };
     let conv_dim = 64;
     let conv_len = (spec.conv_kernel_dim - 1) * conv_dim;
@@ -58,6 +59,7 @@ fn linear_attn_gated_delta_dk128_tg4_matches_scalar_threadgroups() -> Result<()>
         value_head_dim: 128,
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
     };
     let repeat = spec.num_value_heads / spec.num_key_heads;
     let key_dim = spec.num_key_heads * spec.key_head_dim;
@@ -214,6 +216,7 @@ fn linear_attn_gated_delta_seq_dk128_matches_step_loop() -> Result<()> {
         value_head_dim: 128,
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
     };
     let steps = 5_usize;
     let repeat = spec.num_value_heads / spec.num_key_heads;
@@ -416,6 +419,7 @@ fn linear_attn_gated_delta_seq_capture_dk128_matches_step_loop_states() -> Resul
         value_head_dim: 128,
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
     };
     // Neuf lignes (vérification à 8 drafts) : huit captures, le maximum du kernel.
     let steps = 9_usize;

@@ -352,6 +352,7 @@ fn gated_delta_seq_real_perf() -> Result<()> {
         value_head_dim: 128,
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
     };
     let steps = 8192usize;
     let key_dim = spec.num_key_heads * spec.key_head_dim;
@@ -431,6 +432,7 @@ fn conv_norm_gates_batch_real_perf() -> Result<()> {
         value_head_dim: 128,
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
     };
     let batch = 8192usize;
     let key_dim = spec.num_key_heads * spec.key_head_dim;

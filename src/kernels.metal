@@ -2765,6 +2765,58 @@ kernel void linear_attn_norm_gates_dk128_f32(
     }
 }
 
+// Flash-Next (`qwen4_exp`) : normalisation l2 des têtes q/k, `x/√(Σx²+ε)`, ε non
+// mis à l'échelle (transformers `l2norm`), au lieu de l'unité RMS `x/√(Σx²/d+ε)`.
+// q reçoit ensuite `scales.x = d^-½`, k `scales.y = 1`. Gates β/decay inchangées.
+kernel void linear_attn_norm_gates_l2_dk128_f32(
+    device const float* conv_out [[buffer(0)]],
+    device const float* beta_input [[buffer(1)]],
+    device const float* gate_input [[buffer(2)]],
+    device const float* a_log [[buffer(3)]],
+    device const float* dt_bias [[buffer(4)]],
+    device float* q_norm [[buffer(5)]],
+    device float* k_norm [[buffer(6)]],
+    device float* beta [[buffer(7)]],
+    device float* decay [[buffer(8)]],
+    constant uint4& dims [[buffer(9)]],
+    constant float2& scales [[buffer(10)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint item [[threadgroup_position_in_grid]]
+) {
+    const uint key_heads = dims.x;
+    const uint value_heads = dims.y;
+    if (dims.z != 128u) {
+        return;
+    }
+    const uint key_dim = key_heads * 128u;
+    if (item < key_heads) {
+        const uint base = item * 128u;
+        float q[4];
+        float k[4];
+        float q_ss = 0.0f;
+        float k_ss = 0.0f;
+        for (uint i = 0u; i < 4u; ++i) {
+            q[i] = conv_out[base + lane + 32u * i];
+            k[i] = conv_out[key_dim + base + lane + 32u * i];
+            q_ss += q[i] * q[i];
+            k_ss += k[i] * k[i];
+        }
+        const float q_inv = rsqrt(simd_sum(q_ss) + 1.0e-6f) * scales.x;
+        const float k_inv = rsqrt(simd_sum(k_ss) + 1.0e-6f) * scales.y;
+        for (uint i = 0u; i < 4u; ++i) {
+            q_norm[base + lane + 32u * i] = q[i] * q_inv;
+            k_norm[base + lane + 32u * i] = k[i] * k_inv;
+        }
+    }
+    if (item < value_heads && lane == 0u) {
+        const float b = beta_input[item];
+        beta[item] = 1.0f / (1.0f + exp(-b));
+        const float dt_arg = gate_input[item] + dt_bias[item];
+        const float dt = (dt_arg > 20.0f) ? dt_arg : log(1.0f + exp(dt_arg));
+        decay[item] = exp(-exp(a_log[item]) * dt);
+    }
+}
+
 kernel void linear_attn_norm_gates_inv_dk128_f32(
     device const float* conv_out [[buffer(0)]],
     device const float* beta_input [[buffer(1)]],
@@ -4157,6 +4209,37 @@ kernel void linear_attn_rms_gate_f32(
         const uint idx = base + col;
         const float zg = z[idx];
         gated[idx] = y[idx] * inv * norm_weight[col] * (zg / (1.0f + exp(-zg)));
+    }
+}
+
+// Flash-Next (`output_gate_type = sigmoid`) : `y·rsqrt(mean(y²)+ε)·w·σ(z)`, gain `w`
+// direct comme la variante SiLU.
+kernel void linear_attn_rms_gate_sigmoid_dv128_f32(
+    device const float* y [[buffer(0)]],
+    device const float* z [[buffer(1)]],
+    device const float* norm_weight [[buffer(2)]],
+    device float* gated [[buffer(3)]],
+    constant uint2& dims [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint value_head [[threadgroup_position_in_grid]]
+) {
+    #pragma METAL fp contract(off)
+    if (value_head >= dims.x || dims.y != 128u) {
+        return;
+    }
+    const uint base = value_head * 128u;
+    float v[4];
+    float ss = 0.0f;
+    for (uint i = 0u; i < 4u; ++i) {
+        v[i] = y[base + lane + 32u * i];
+        ss += v[i] * v[i];
+    }
+    const float inv = rsqrt(simd_sum(ss) / 128.0f + eps);
+    for (uint i = 0u; i < 4u; ++i) {
+        const uint col = lane + 32u * i;
+        const float zg = z[base + col];
+        gated[base + col] = v[i] * inv * norm_weight[col] * (1.0f / (1.0f + exp(-zg)));
     }
 }
 
