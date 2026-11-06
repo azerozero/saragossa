@@ -109,7 +109,12 @@ fn flash_next_hc_mix_and_combine_match_cpu_at_real_dims() -> Result<()> {
         inject: zeros(&executor, dims.hc * super::hc::INJECT_CHUNKS),
         down_partial: zeros(&executor, dims.lowrank * super::hc::DOWN_CHUNKS),
     };
-    for with_inject in [true, false] {
+    // Down dense f32 : repli sur le qmv standard (une seule tranche, SiLU en place).
+    let down_dense_gpu = executor.resolve_linear_weight_buffers(
+        &LinearWeight::Dense(down.clone()),
+        "flash_next_down_dense",
+    )?;
+    for (with_inject, dense_down) in [(true, false), (false, false), (true, true)] {
         let cpu = GatedResidual {
             norm: norm.clone(),
             down: down.clone(),
@@ -119,7 +124,11 @@ fn flash_next_hc_mix_and_combine_match_cpu_at_real_dims() -> Result<()> {
         let mixed = cpu.mix(&h, dims.hc, dims.hidden, dims.eps)?;
         let gpu_weights = HcWeights {
             norm: buffer(&executor, &norm),
-            down: down_gpu.clone(),
+            down: if dense_down {
+                down_dense_gpu.clone()
+            } else {
+                down_gpu.clone()
+            },
             up: up_gpu.clone(),
             inject: with_inject.then(|| inject_gpu.clone()),
         };
@@ -150,7 +159,7 @@ fn flash_next_hc_mix_and_combine_match_cpu_at_real_dims() -> Result<()> {
         let (err, max) = relative_error(&x, mixed.input.data());
         assert!(
             err <= 1.0e-5,
-            "entrée de branche (injection {with_inject}) : {err} (max {max})"
+            "entrée de branche (injection {with_inject}, Down dense {dense_down}) : {err} (max {max})"
         );
         if let Some(inject) = mixed.inject {
             let expected = combine(&h, &f, &inject, dims.hc)?;
@@ -1389,7 +1398,7 @@ fn bench_hc_pieces_at_real_dims() -> Result<()> {
         super::ple::encode_rms_norm_1p(&kernels, e, &h, &norm, &scratch.normed, dims);
         Ok(())
     })?;
-    time("Down u8 [320, 10240]", &|e| {
+    time("Down u8 qmv standard (repli)", &|e| {
         executor
             .encode_matmul_weight_buffers(e, &scratch.normed, 1, width, &down, &scratch.low, true)
             .map(|_| ())

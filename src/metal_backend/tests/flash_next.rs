@@ -478,6 +478,10 @@ fn topk_softmax_wide_matches_parallel_bitwise() -> Result<()> {
         commit_and_wait(command_buffer)?;
         Ok((read_u32_buffer(&indices, topk)?, read_f32_buffer(&scores, topk)?))
     };
+    if executor.topk_softmax_wide_f32.max_total_threads_per_threadgroup() < 1024 {
+        eprintln!("skip: pipeline top-k large sous 1024 threads");
+        return Ok(());
+    }
     let mut rng = crate::linear_attention::tests::DeterministicF32::new(0x70b5);
     let mut cases: Vec<(Vec<f32>, usize)> = Vec::new();
     for (count, topk) in [(512, 10), (257, 1), (1024, 16), (700, 8), (512, 16)] {
@@ -507,5 +511,21 @@ fn topk_softmax_wide_matches_parallel_bitwise() -> Result<()> {
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&wide.1), bits(&reference.1), "scores, cas {case}");
     }
+    // Routage : `encode_topk_softmax` à 512 / top-10 prend le chemin large et
+    // rend le même résultat que le kernel de référence.
+    let logits = &cases[0].0;
+    let input = executor.buffer_from_slice(logits, "topk_route_in")?;
+    let indices = executor.uncached_f32_buffer(16, "topk_route_idx")?;
+    let scores = executor.uncached_f32_buffer(16, "topk_route_scores")?;
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    executor.encode_topk_softmax(encoder, &mut Vec::new(), &input, &indices, &scores, 512, 10)?;
+    encoder.end_encoding();
+    commit_and_wait(command_buffer)?;
+    let reference = run(&executor.topk_softmax_f32, 32, logits, 10)?;
+    assert_eq!(read_u32_buffer(&indices, 10)?, reference.0, "routage : indices");
+    let routed: Vec<u32> = read_f32_buffer(&scores, 10)?.iter().map(|x| x.to_bits()).collect();
+    let expected: Vec<u32> = reference.1.iter().map(|x| x.to_bits()).collect();
+    assert_eq!(routed, expected, "routage : scores");
     Ok(())
 }

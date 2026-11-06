@@ -10164,6 +10164,8 @@ kernel void topk_sigmoid_f32(
 // threadgroup. Même sélection, même ordre (logit décroissant, indice
 // croissant) et même softmax restreint que `topk_softmax_f32` : sorties
 // identiques bit à bit (test `topk_softmax_wide_matches_parallel_bitwise`).
+// NOTE: suppose 1024 threads par threadgroup et des simdgroups de 32 lanes
+// (`tg_values[32]`) ; l'encodeur vérifie la capacité du pipeline avant dispatch.
 static inline void topk_wide_pick(thread float& value, thread uint& index, float other_value, uint other_index) {
     if (topk_better(other_value, other_index, value, index)) {
         value = other_value;
