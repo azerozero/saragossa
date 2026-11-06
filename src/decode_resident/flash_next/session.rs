@@ -39,10 +39,11 @@ pub(crate) const MAX_CAPACITY: usize = 262_144;
 
 /// Blocs QSA retenus et scores de l'indexeur d'une couche (oracles).
 #[cfg(test)]
-pub(crate) type QsaCapture = (Vec<u32>, Vec<f32>);
+pub(crate) type QsaCapture = (Vec<u32>, Vec<f32>, Vec<u32>);
 
 /// Point de reprise d'une session ([`FlashNextSession::checkpoint`]).
 pub(crate) struct SessionCheckpoint {
+    id: u64,
     position: usize,
     epoch: u64,
     linear: Vec<Option<LinearAttentionMetalState>>,
@@ -129,8 +130,13 @@ pub(crate) struct FlashNextSession {
     linear_dims: LinearAttnResidentDims,
     position: usize,
     capacity: usize,
-    /// Incrémenté à chaque `reset` : invalide les points de reprise antérieurs.
+    /// Branche courante de l'historique : incrémentée à chaque `reset` et à
+    /// chaque reprise, elle invalide les points pris sur une autre branche.
     epoch: u64,
+    /// Point de reprise d'où part la branche courante (réutilisable).
+    base_checkpoint: Option<u64>,
+    /// Compteur d'identifiants des points de reprise.
+    next_checkpoint: std::cell::Cell<u64>,
     /// États DeltaNet initiaux (nuls), pour [`Self::reset`].
     initial_linear: Vec<Option<LinearAttentionMetalState>>,
     /// Profil GPU par brique (`SARAGOSSA_FLASH_NEXT_PROFILE=1`).
@@ -162,6 +168,9 @@ pub(crate) struct FlashNextSession {
     selection_capture: Buffer,
     #[cfg(test)]
     score_capture: Buffer,
+    /// Oracles : sélection native de l'indexeur (avant imposition) par couche.
+    #[cfg(test)]
+    native_capture: Buffer,
 }
 
 fn zeros(executor: &MetalExecutor, len: usize) -> Buffer {
@@ -259,6 +268,19 @@ pub(crate) fn validate_resident_config(c: &Qwen4ExpConfig) -> Result<usize> {
         return refuse(format!(
             "attention {} têtes / {} KV, RoPE {} sur {}",
             c.heads, c.kv_heads, c.rotary_dim, c.head_dim
+        ));
+    }
+    // Pooling (un threadgroup de d threads, `values[256]`, `partial[8]`) et
+    // RoPE de l'indexeur (dimensions tournées ≤ d).
+    if c.indexer_head_dim == 0
+        || c.indexer_head_dim > 256
+        || c.indexer_head_dim % 32 != 0
+        || c.rotary_dim > c.indexer_head_dim
+        || c.indexer_heads == 0
+    {
+        return refuse(format!(
+            "indexeur {} têtes de {} (RoPE {})",
+            c.indexer_heads, c.indexer_head_dim, c.rotary_dim
         ));
     }
     if c.indexer_compress == 0 || c.indexer_budget % c.indexer_compress != 0 {
@@ -429,6 +451,8 @@ impl FlashNextSession {
             position: 0,
             capacity,
             epoch: 0,
+            base_checkpoint: None,
+            next_checkpoint: std::cell::Cell::new(0),
             initial_linear: Vec::new(),
             #[cfg(feature = "devtools")]
             profiler: if super::profile::profile_requested() {
@@ -454,6 +478,11 @@ impl FlashNextSession {
             forced_selection: Vec::new(),
             #[cfg(test)]
             selection_capture: executor.device().new_buffer(
+                (c.layer_kinds.len() * (c.indexer_budget / c.indexer_compress) * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
+            #[cfg(test)]
+            native_capture: executor.device().new_buffer(
                 (c.layer_kinds.len() * (c.indexer_budget / c.indexer_compress) * 4) as u64,
                 MTLResourceOptions::StorageModeShared,
             ),
@@ -618,6 +647,7 @@ impl FlashNextSession {
         let complete = self.position / self.indexer_dims.compress;
         let stride = self.capacity / self.indexer_dims.compress + 1;
         let selections = read_u32_buffer(&self.selection_capture, c.layer_kinds.len() * keep)?;
+        let natives = read_u32_buffer(&self.native_capture, c.layer_kinds.len() * keep)?;
         let scores = read_f32_buffer(&self.score_capture, c.layer_kinds.len() * stride)?;
         Ok(c.layer_kinds
             .iter()
@@ -628,6 +658,7 @@ impl FlashNextSession {
                         (
                             selections[index * keep..(index + 1) * keep].to_vec(),
                             scores[index * stride..index * stride + complete].to_vec(),
+                            natives[index * keep..(index + 1) * keep].to_vec(),
                         )
                     })
             })
@@ -700,6 +731,7 @@ impl FlashNextSession {
         self.ple_state.reset(c.ngram_size, c.eos);
         self.position = 0;
         self.epoch += 1;
+        self.base_checkpoint = None;
         self.poisoned = false;
         Ok(())
     }
@@ -713,7 +745,21 @@ impl FlashNextSession {
     /// # Errors
     ///
     /// Renvoie une erreur de copie Metal.
-    pub(crate) fn checkpoint(&self) -> Result<SessionCheckpoint> {
+    pub(crate) fn checkpoint(&self, guard: Option<&MemoryGuard>) -> Result<SessionCheckpoint> {
+        if let Some(guard) = guard {
+            let bytes: u64 = self
+                .states
+                .iter()
+                .map(|state| match state {
+                    LayerState::Linear(state) => MetalExecutor::linear_attn_state_bytes(state),
+                    LayerState::Full(full) => full.1.raw.length(),
+                })
+                .sum::<u64>()
+                + self.ple_state.ring.length();
+            guard
+                .check_allocation(bytes)
+                .map_err(InferError::MemoryGuard)?;
+        }
         let linear = self
             .states
             .iter()
@@ -747,7 +793,10 @@ impl FlashNextSession {
                 LayerState::Linear(_) => Ok(None),
             })
             .collect::<Result<_>>()?;
+        let id = self.next_checkpoint.get();
+        self.next_checkpoint.set(id + 1);
         Ok(SessionCheckpoint {
+            id,
             position: self.position,
             epoch: self.epoch,
             linear,
@@ -766,9 +815,12 @@ impl FlashNextSession {
     ///
     /// Renvoie une erreur de copie Metal, de troncature, ou un point périmé.
     pub(crate) fn restore(&mut self, checkpoint: &SessionCheckpoint) -> Result<()> {
-        if checkpoint.epoch != self.epoch || checkpoint.position > self.position {
+        // Valide si pris sur la branche courante, ou s'il est la base de cette
+        // branche (reprises répétées depuis un même point).
+        let same_branch = checkpoint.epoch == self.epoch && checkpoint.position <= self.position;
+        if !same_branch && self.base_checkpoint != Some(checkpoint.id) {
             return Err(InferError::Config(
-                "point de reprise Flash-Next périmé (reset ou position future)".to_string(),
+                "point de reprise Flash-Next périmé (autre branche de l'historique)".to_string(),
             ));
         }
         self.poisoned = true;
@@ -801,6 +853,8 @@ impl FlashNextSession {
         self.ple_state.context = checkpoint.ple_context.clone();
         self.ple_state.step = checkpoint.ple_step;
         self.position = checkpoint.position;
+        self.epoch += 1;
+        self.base_checkpoint = Some(checkpoint.id);
         self.poisoned = false;
         Ok(())
     }
@@ -1077,6 +1131,9 @@ impl FlashNextSession {
                             dims: self.indexer_dims,
                             #[cfg(test)]
                             forced: self.forced_selection.get_mut(index).and_then(Option::take),
+                            #[cfg(test)]
+                            native_capture: layers
+                                .then_some((&self.native_capture, index * self.indexer_dims.keep)),
                         }),
                         self.position,
                         &self.x,

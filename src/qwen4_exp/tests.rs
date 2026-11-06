@@ -249,7 +249,8 @@ fn justify_qsa(
             let score = ts
                 .get(*block)
                 .ok_or_else(|| format!("requête {i}: bloc {block} hors blocs complets"))?;
-            if (score - threshold).abs() > TIE_TOL {
+            // Même règle que le N2 résident : écart au seuil relatif à max(|seuil|, 1).
+            if (score - threshold).abs() > TIE_TOL * threshold.abs().max(1.0) {
                 return Err(format!(
                     "requête {i}: bloc {block} échangé, score torch {score} ≠ seuil {threshold}"
                 ));

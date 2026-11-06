@@ -482,6 +482,9 @@ enum RoutingMode {
     QsaMutation(usize, usize, f32),
 }
 
+/// Sélection QSA GPU d'une couche : blocs retenus, scores, blocs natifs.
+type GpuQsa = (Vec<usize>, Vec<f32>, Vec<usize>);
+
 /// Mesures d'un token.
 struct TokenReport {
     /// Écart relatif par couche (NaN si une sortie n'est pas finie).
@@ -495,7 +498,10 @@ struct TokenReport {
     imposed: Vec<usize>,
     /// Blocs QSA retenus par le GPU et scores de son indexeur `[couche]`
     /// (régime creux seulement).
-    qsa: Vec<Option<(Vec<usize>, Vec<f32>)>>,
+    /// `(blocs retenus, scores, blocs natifs avant imposition)`.
+    qsa: Vec<Option<GpuQsa>>,
+    /// Points QSA imposés dont la sélection native n'est pas une quasi-égalité.
+    qsa_native_unjustified: usize,
     /// Couches QSA dont la sélection a été imposée à ce token.
     qsa_imposed: Vec<usize>,
 }
@@ -661,9 +667,10 @@ fn run_resident_pass(
                 })
             })
             .collect();
-        let qsa_imposed = (0..layers)
+        let qsa_imposed: Vec<usize> = (0..layers)
             .filter(|&l| session.forced_selection[l].is_some())
             .collect();
+        let qsa_imposed_now = qsa_imposed.clone();
         let out = session
             .step(token, true, true)
             .expect("invariant: pas résident");
@@ -713,13 +720,31 @@ fn run_resident_pass(
             .expect("invariant: QSA GPU")
             .into_iter()
             .map(|entry| {
-                entry.map(|(blocks, scores)| {
-                    let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b as usize).collect();
-                    blocks.sort_unstable();
-                    (blocks, scores)
+                entry.map(|(blocks, scores, native)| {
+                    let sorted = |v: Vec<u32>| {
+                        let mut v: Vec<usize> = v.into_iter().map(|b| b as usize).collect();
+                        v.sort_unstable();
+                        v
+                    };
+                    (sorted(blocks), scores, sorted(native))
                 })
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // Aux points imposés, la sélection native du GPU doit être une
+        // quasi-égalité du CPU (sinon l'imposition masquerait un défaut).
+        let qsa_native_unjustified = qsa
+            .iter()
+            .enumerate()
+            .filter(|(l, entry)| {
+                threshold.is_some_and(|th| {
+                    session.forced_selection.len() == layers
+                        && entry.as_ref().is_some_and(|(_, _, native)| {
+                            qsa_imposed_now.contains(l)
+                                && !qsa_swap_justified(cpu, *l, t, native, th.max(1.0e-5))
+                        })
+                })
+            })
+            .count();
         reports.push(TokenReport {
             layer_errors,
             kl,
@@ -728,6 +753,7 @@ fn run_resident_pass(
             imposed,
             qsa,
             qsa_imposed,
+            qsa_native_unjustified,
         });
     }
     reports
@@ -746,6 +772,8 @@ struct Summary {
     routing_mismatches: usize,
     /// Points QSA non imposés où le GPU retient d'autres blocs que le CPU.
     qsa_mismatches: usize,
+    /// Points QSA imposés dont la sélection native n'est pas justifiée.
+    qsa_native_unjustified: usize,
 }
 
 /// Synthèse d'une passe sur le préfixe `[0, prefix)`.
@@ -787,11 +815,12 @@ fn summarize(reports: &[TokenReport], cpu: &CpuChain, prefix: usize) -> Summary 
             (0..r.qsa.len())
                 .filter(|&l| {
                     !r.qsa_imposed.contains(&l)
-                        && r.qsa[l].as_ref().map(|(b, _)| b) != cpu_blocks(cpu, l, t).as_ref()
+                        && r.qsa[l].as_ref().map(|(b, _, _)| b) != cpu_blocks(cpu, l, t).as_ref()
                 })
                 .count()
         })
         .sum();
+    let qsa_native_unjustified = reports.iter().map(|r| r.qsa_native_unjustified).sum();
     Summary {
         worst,
         kl,
@@ -800,6 +829,7 @@ fn summarize(reports: &[TokenReport], cpu: &CpuChain, prefix: usize) -> Summary 
         first: bad.first().copied(),
         routing_mismatches,
         qsa_mismatches,
+        qsa_native_unjustified,
     }
 }
 
@@ -812,6 +842,7 @@ fn forced_gate_green(summary: &Summary) -> bool {
         && summary.swaps.iter().all(|s| within(s.3, 1.0e-5))
         && summary.routing_mismatches == 0
         && summary.qsa_mismatches == 0
+        && summary.qsa_native_unjustified == 0
 }
 
 /// Contrôle de la passe native : jusqu'à la première bascule de routage
@@ -825,7 +856,7 @@ fn native_check(
     // Première divergence : sélection QSA (calculée avant le MoE de la couche)
     // ou routage, dans l'ordre (token, couche).
     let qsa_diff = |t: usize, r: &TokenReport, l: usize| {
-        r.qsa[l].as_ref().map(|(b, _)| b) != cpu_blocks(cpu, l, t).as_ref()
+        r.qsa[l].as_ref().map(|(b, _, _)| b) != cpu_blocks(cpu, l, t).as_ref()
     };
     let first = reports.iter().enumerate().find_map(|(t, r)| {
         (0..r.routing.len())
@@ -857,7 +888,7 @@ fn native_check(
     if qsa_diff(t, &reports[t], l) {
         let gpu = reports[t].qsa[l]
             .as_ref()
-            .map(|(b, _)| b.clone())
+            .map(|(b, _, _)| b.clone())
             .unwrap_or_default();
         if !qsa_swap_justified(cpu, l, t, &gpu, NATIVE_FIRST_TIE) {
             return Err(format!(
@@ -938,6 +969,7 @@ fn n2_gate_refuses_late_nan_and_native_check_refuses_early_drift() {
         imposed: Vec::new(),
         qsa: vec![None],
         qsa_imposed: Vec::new(),
+        qsa_native_unjustified: 0,
     };
     let clean: Vec<TokenReport> = (0..4).map(|_| report(1.0e-6, 1.0e-9)).collect();
     assert!(forced_gate_green(&summarize(&clean, &cpu, 4)));
@@ -1054,7 +1086,7 @@ fn n2_resident_decode_matches_cpu_reference() {
     let mut score_error = 0.0_f64;
     for (t, r) in native[..horizon].iter().enumerate() {
         for (l, entry) in r.qsa.iter().enumerate() {
-            if let (Some((_, gpu)), Some(trace)) = (entry, cpu.qsa[l].as_ref()) {
+            if let (Some((_, gpu, _)), Some(trace)) = (entry, cpu.qsa[l].as_ref()) {
                 score_error = nan_max(score_error, relative_error(gpu, &trace.scores[t]).0);
             }
         }
@@ -1093,11 +1125,37 @@ fn n2_resident_decode_matches_cpu_reference() {
             let s = summarize(&forced, &cpu, prefix);
             eprintln!(
                 "imposée ≤ {th:.0e}, {prefix:4} : écart max {:.2e}, KL max {:.2e}, argmax ≠ {:?}, \
-                 tokens > 1e-3 : {}, premier {:?}, routage ≠ hors imposition : {}",
-                s.worst, s.kl, s.swaps, s.bad, s.first, s.routing_mismatches
+                 tokens > 1e-3 : {}, premier {:?}, routage ≠ hors imposition : {}, \
+                 sélection QSA ≠ hors imposition : {}, natives injustifiées : {}",
+                s.worst,
+                s.kl,
+                s.swaps,
+                s.bad,
+                s.first,
+                s.routing_mismatches,
+                s.qsa_mismatches,
+                s.qsa_native_unjustified
             );
             green &= forced_gate_green(&s);
         }
+        // Scores de l'indexeur GPU contre CPU sur toute la passe imposée (régime
+        // creux compris ; les entrées suivent le CPU à la dérive près).
+        let mut forced_score_error = 0.0_f64;
+        let mut qsa_imposed_points = 0;
+        for (t, r) in forced.iter().enumerate() {
+            qsa_imposed_points += r.qsa_imposed.len();
+            for (l, entry) in r.qsa.iter().enumerate() {
+                if let (Some((_, gpu, _)), Some(trace)) = (entry, cpu.qsa[l].as_ref()) {
+                    forced_score_error =
+                        nan_max(forced_score_error, relative_error(gpu, &trace.scores[t]).0);
+                }
+            }
+        }
+        eprintln!(
+            "imposée ≤ {th:.0e} : scores de l'indexeur GPU/CPU écart relatif max \
+             {forced_score_error:.2e}, {qsa_imposed_points} sélections QSA imposées"
+        );
+        green &= within(forced_score_error, 1.0e-3);
         let by_layer: Vec<String> = (0..cpu.layers.len())
             .map(|l| {
                 format!(
@@ -1151,11 +1209,15 @@ fn n2_resident_decode_matches_cpu_reference() {
             "mutation au token {token} non détectée par la porte"
         );
     }
-    // Mutation QSA : un mauvais bloc imposé au point de plus grande marge QSA
-    // relative, dans les 64 premiers tokens du régime creux.
+    // Mutations QSA : un mauvais bloc imposé au point de plus grande marge QSA
+    // relative, au début du régime creux puis sur les 128 derniers tokens.
     let sparse_start = dense_max_visible(cpu.keep * cpu.compress, cpu.compress);
-    if tokens > sparse_start {
-        let (token, layer) = (sparse_start..tokens.min(sparse_start + 64))
+    let late = tokens.saturating_sub(128).max(sparse_start + 64);
+    for range in [sparse_start..tokens.min(sparse_start + 64), late..tokens] {
+        if range.is_empty() {
+            continue;
+        }
+        let (token, layer) = range
             .flat_map(|t| (0..cpu.layers.len()).map(move |l| (t, l)))
             .filter_map(|(t, l)| qsa_threshold(&cpu, l, t).map(|(_, m)| (t, l, m)))
             .max_by(|a, b| a.2.total_cmp(&b.2))
@@ -1399,7 +1461,9 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
     // est refusé.
     session.reset().expect("invariant: reset");
     session.replay(ids[0]).expect("invariant: rejeu");
-    let point = session.checkpoint().expect("invariant: point de reprise");
+    let point = session
+        .checkpoint(None)
+        .expect("invariant: point de reprise");
     let after: Vec<Vec<f32>> = (1..4)
         .map(|t| {
             session
@@ -1422,6 +1486,50 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
             .expect("invariant: logits");
         assert!(again == after[i], "token {t} après reprise");
     }
+    // Reprise à une position non alignée (1) après avoir franchi un bloc :
+    // les clés brutes du bloc 0 sont restaurées, la clé poolée recalculée
+    // est identique (couche QSA 3, sans effet sur les logits en régime dense).
+    let qsa_layer = 3;
+    session.restore(&point).expect("invariant: reprise");
+    for &token in &ids[1..6] {
+        session.step(token, false, false).expect("invariant: pas");
+    }
+    let pooled_first = session
+        .indexer_probe(qsa_layer, 1)
+        .expect("invariant: sonde")
+        .pooled;
+    session
+        .restore(&point)
+        .expect("invariant: reprise après un bloc");
+    for &token in &ids[1..4] {
+        session.step(token, false, false).expect("invariant: pas");
+    }
+    let pooled_again = session
+        .indexer_probe(qsa_layer, 1)
+        .expect("invariant: sonde")
+        .pooled;
+    assert!(
+        pooled_again == pooled_first,
+        "clé poolée du bloc 0 après reprise non alignée"
+    );
+    // Filiation : un point pris sur une branche abandonnée est refusé ; la base
+    // de la branche courante reste réutilisable.
+    let later = session
+        .checkpoint(None)
+        .expect("invariant: point ultérieur");
+    session
+        .restore(&point)
+        .expect("invariant: reprise à la base");
+    session
+        .step(ids[5], false, false)
+        .expect("invariant: autre branche");
+    assert!(
+        session.restore(&later).is_err(),
+        "point d'une branche abandonnée accepté"
+    );
+    session
+        .restore(&point)
+        .expect("invariant: base réutilisable");
     session.reset().expect("invariant: reset");
     assert!(
         session.restore(&point).is_err(),
@@ -1931,6 +2039,7 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
                     keep,
                 },
                 forced: None,
+                native_capture: None,
             }),
             t,
             &x_buf,
@@ -2081,7 +2190,7 @@ fn bench_resident_decode_after_32k_context() {
         let out = session
             .step(token, false, true)
             .expect("invariant: pas sondé");
-        let (blocks, scores) = out.qsa.expect("invariant: QSA")[probe_layer]
+        let (blocks, scores, _) = out.qsa.expect("invariant: QSA")[probe_layer]
             .clone()
             .expect("invariant: régime creux");
         let complete = (t + 1) / d.compress;
@@ -2141,7 +2250,9 @@ fn bench_resident_decode_after_32k_context() {
          (écart max des requêtes après RoPE {worst_q:.2e})",
         started.elapsed().as_secs_f64()
     );
-    let point = session.checkpoint().expect("invariant: point de reprise");
+    let point = session
+        .checkpoint(Some(&crate::MemoryGuard::process()))
+        .expect("invariant: point de reprise");
     let first = next;
     let pct = |v: &[f64], q: f64| {
         let mut v = v.to_vec();
