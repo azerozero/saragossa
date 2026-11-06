@@ -221,11 +221,17 @@ impl FlashNextSession {
                         .ok_or_else(|| InferError::Metal("état DeltaNet non alloué".to_string()))
                 }
                 crate::qwen_loader::qwen4_exp::Qwen4ExpLayerKind::Full => {
-                    Ok(LayerState::Full(Box::new(
-                        self.arena.full_attention_dense(
-                            capacity, c.heads, c.kv_heads, c.head_dim, false,
-                        )?,
-                    )))
+                    // KV épinglé en f32 : ni `SARAGOSSA_RUST_KV_BF16` ni le KV
+                    // quantifié ne s'appliquent (l'oracle N2 compare à 1e-5).
+                    let kv = self.arena.full_attention_with_format(
+                        capacity,
+                        c.heads,
+                        c.kv_heads,
+                        c.head_dim,
+                        crate::decode_resident::KvFormat::F32,
+                        None,
+                    )?;
+                    Ok(LayerState::Full(Box::new(kv)))
                 }
             })
             .collect()

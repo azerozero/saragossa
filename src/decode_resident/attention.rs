@@ -199,7 +199,7 @@ impl DecodeResidentState {
         Ok(Some(state))
     }
 
-    fn full_attention_with_format(
+    pub(super) fn full_attention_with_format(
         &self,
         capacity: usize,
         q_heads: usize,

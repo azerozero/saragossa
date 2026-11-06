@@ -404,6 +404,24 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
     Ok(())
 }
 
+/// Le KV Flash-Next reste f32 sous un override de format (bf16 ou quantifié).
+#[cfg(feature = "devtools")]
+#[test]
+fn flash_next_kv_format_is_pinned_to_f32() -> Result<()> {
+    use crate::decode_resident::{with_kv_format_override, DecodeResidentState, KvFormat};
+    let Some(executor) = executor()? else {
+        return Ok(());
+    };
+    let arena = DecodeResidentState::new(executor.device().clone())?;
+    for format in [KvFormat::Bf16, KvFormat::Q8] {
+        let kv = with_kv_format_override(format, || {
+            arena.full_attention_with_format(16, 24, 2, 256, KvFormat::F32, None)
+        })?;
+        assert_eq!(kv.format(), KvFormat::F32, "override {format:?}");
+    }
+    Ok(())
+}
+
 /// Identifiants `input_ids` du golden N2 `layers.safetensors` (texte réel).
 fn n2_input_ids(golden: &std::path::Path) -> Vec<usize> {
     let path = golden.join("layers.safetensors");
