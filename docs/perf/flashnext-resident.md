@@ -179,13 +179,50 @@ Chargement GPU : 33 à 43 s.
 
 ## Débit
 
-Le harnais `bench_resident_decode_after_1k_context` est prêt. Il fait
-3 répétitions séparées par un `reset`, chacune avec un contexte de 1024
-tokens puis 256 pas gloutons. Il publie :
-- le débit mural `tokens / durée totale` par répétition ;
-- la médiane, p10/p90 et le maximum par pas ;
-- le temps CPU de préparation (embedding et PLE).
+Porte : au moins 45 tok/s en AR après un contexte de 1024 tokens, mesurés sur
+la plus lente de 3 répétitions (256 pas gloutons, débit = 256 / durée totale,
+`bench_resident_decode_after_1k_context`, M5 Max). Le test échoue sous ce
+seuil. Mesures sur la machine seule, une mesure GPU à la fois, en ABBA.
 
-La porte des 45 tok/s porte sur la répétition la plus lente et fait échouer
-le test en dessous. La mesure n'est pas encore lancée : elle attend une
-machine libre.
+| état | médiane par pas | débit (plus lente) |
+|---|---|---|
+| première version (f984c7a) | 33,7 ms | 29,2 tok/s (porte rouge) |
+| hyper-connections : norme large, injection en tranches (6921e21) | 25,1 ms | 39,3 tok/s |
+| top-k softmax large, bit à bit (3df6dd6) | 24,7 ms | ≈ 40,5 tok/s |
+| Down des hyper-connections en split-K (501e922) | 21,4 ms | **46,3 tok/s (porte verte)** |
+
+Porte officielle sur 501e922 : 46,3 / 46,8 / 46,8 tok/s, soit 21,6 ms par token
+pour la plus lente. Préparation CPU (embedding, PLE) 0,2–0,3 ms et encodage
+0,46 ms par pas. Pic mémoire du bench : 76,2 Go.
+
+### Profil par brique
+
+`profile_resident_decode_after_1k_context` (devtools) :
+- `SARAGOSSA_FLASH_NEXT_PROFILE=1` donne un encodeur par brique, avec des
+  timestamps aux frontières d'étape (seul mode du M5 Max) ;
+- `SARAGOSSA_RUST_DECODE_PROFILE=1` compte les dispatches (1600 par pas).
+
+Les frontières d'encodeur gonflent les petites briques : la répartition sert
+à prioriser, le temps mural se lit sur la porte.
+
+| brique (pas profilés) | f984c7a | 501e922 |
+|---|---|---|
+| hyper-connections | 13,80 ms | 3,45 ms |
+| MoE (routeur compris) | 9,34 ms | 7,22 ms |
+| DeltaNet | 4,98 ms | 5,05 ms |
+| lm_head | 2,72 ms | 2,75 ms |
+| QSA | 1,93 ms | 1,95 ms |
+| total GPU | 32,9 ms | 20,6 ms |
+
+### Effet sur la numérique
+
+Le split-K de Down rapproche le GPU du CPU. La bascule native du token 89
+disparaît, et la première bascule tombe au token 313, couche 2, sur une marge
+de 3,4e-8.
+
+N2 complet sur 2051 tokens après ces optimisations :
+- seuil 1e-6 retenu ; 1e-7 est rouge à cause d'un point au token 1722, de marge
+  comprise entre 1e-7 et 1e-6 ;
+- passe imposée : écart max 9,4e-4, KL 7,6e-9, argmax identique, routage
+  identique hors imposition ;
+- mutations précoce et tardive détectées.
