@@ -47,9 +47,22 @@ pub(crate) struct SessionCheckpoint {
     epoch: u64,
     linear: Vec<Option<LinearAttentionMetalState>>,
     kv_lens: Vec<Option<usize>>,
+    /// Clés brutes du bloc en cours de chaque couche QSA (position non alignée).
+    indexer_raw: Vec<Option<Buffer>>,
     ple_ring: Buffer,
     ple_context: NgramContext,
     ple_step: usize,
+}
+
+/// Tenseurs de l'indexeur relus après un pas (oracles).
+#[cfg(test)]
+pub(crate) struct IndexerProbe {
+    /// Projection brute `[(têtes + 1)·d]` (requêtes puis clé).
+    pub(crate) qk: Vec<f32>,
+    /// Requêtes normées et tournées `[têtes·d]`.
+    pub(crate) q: Vec<f32>,
+    pub(crate) pooled: Vec<f32>,
+    pub(crate) raw: Vec<f32>,
 }
 
 /// Sorties d'un pas.
@@ -402,8 +415,6 @@ impl FlashNextSession {
                     ((c.indexer_budget / c.indexer_compress) * std::mem::size_of::<u32>()) as u64,
                     MTLResourceOptions::StorageModeShared,
                 ),
-                #[cfg(test)]
-                forced_keepalive: std::cell::RefCell::new(None),
             },
             indexer_dims: IndexerDims {
                 heads: c.indexer_heads,
@@ -627,20 +638,17 @@ impl FlashNextSession {
     /// requêtes de l'indexeur (valables pour la dernière couche QSA du pas),
     /// clés poolées des `blocks` premiers blocs et clés brutes du bloc en cours.
     #[cfg(test)]
-    pub(crate) fn indexer_probe(
-        &self,
-        layer: usize,
-        blocks: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    pub(crate) fn indexer_probe(&self, layer: usize, blocks: usize) -> Result<IndexerProbe> {
         let d = self.indexer_dims.head_dim;
         let LayerState::Full(full) = &self.states[layer] else {
             return Err(InferError::Config(format!("couche {layer} sans indexeur")));
         };
-        Ok((
-            read_f32_buffer(&self.indexer_scratch.q, self.indexer_dims.heads * d)?,
-            read_f32_buffer(&full.1.pooled, blocks * d)?,
-            read_f32_buffer(&full.1.raw, self.indexer_dims.compress * d)?,
-        ))
+        Ok(IndexerProbe {
+            qk: read_f32_buffer(&self.indexer_scratch.qk, (self.indexer_dims.heads + 1) * d)?,
+            q: read_f32_buffer(&self.indexer_scratch.q, self.indexer_dims.heads * d)?,
+            pooled: read_f32_buffer(&full.1.pooled, blocks * d)?,
+            raw: read_f32_buffer(&full.1.raw, self.indexer_dims.compress * d)?,
+        })
     }
 
     /// Position du prochain token (oracles).
@@ -727,11 +735,24 @@ impl FlashNextSession {
         let ring_len = (self.ple_state.ring.length() / 4) as usize;
         let ple_ring = zeros(&self.executor, ring_len);
         self.copy_f32(&self.ple_state.ring, &ple_ring, ring_len)?;
+        let indexer_raw = self
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Full(full) => {
+                    let len = (full.1.raw.length() / 4) as usize;
+                    let copy = zeros(&self.executor, len);
+                    self.copy_f32(&full.1.raw, &copy, len).map(|()| Some(copy))
+                }
+                LayerState::Linear(_) => Ok(None),
+            })
+            .collect::<Result<_>>()?;
         Ok(SessionCheckpoint {
             position: self.position,
             epoch: self.epoch,
             linear,
             kv_lens,
+            indexer_raw,
             ple_ring,
             ple_context: self.ple_state.context.clone(),
             ple_step: self.ple_state.step,
@@ -767,6 +788,12 @@ impl FlashNextSession {
                         "point de reprise Flash-Next désaligné".to_string(),
                     ))
                 }
+            }
+        }
+        for (state, raw) in self.states.iter().zip(&checkpoint.indexer_raw) {
+            if let (LayerState::Full(full), Some(raw)) = (state, raw) {
+                let len = (raw.length() / 4) as usize;
+                self.copy_f32(raw, &full.1.raw, len)?;
             }
         }
         let ring_len = (checkpoint.ple_ring.length() / 4) as usize;

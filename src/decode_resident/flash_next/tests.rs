@@ -478,6 +478,8 @@ enum RoutingMode {
     Forced(f32),
     /// Comme `Forced(seuil)`, plus un mauvais expert imposé à `(token, couche)`.
     Mutation(usize, usize, f32),
+    /// Comme `Forced(seuil)`, plus un mauvais bloc QSA imposé à `(token, couche)`.
+    QsaMutation(usize, usize, f32),
 }
 
 /// Mesures d'un token.
@@ -612,7 +614,9 @@ fn run_resident_pass(
     for (t, &token) in ids.iter().enumerate().take(steps) {
         let threshold = match mode {
             RoutingMode::Native => None,
-            RoutingMode::Forced(th) | RoutingMode::Mutation(_, _, th) => Some(th),
+            RoutingMode::Forced(th)
+            | RoutingMode::Mutation(_, _, th)
+            | RoutingMode::QsaMutation(_, _, th) => Some(th),
         };
         session.forced_routing = (0..layers)
             .map(|layer| {
@@ -637,6 +641,15 @@ fn run_resident_pass(
             .collect();
         session.forced_selection = (0..layers)
             .map(|layer| {
+                if matches!(mode, RoutingMode::QsaMutation(mt, ml, _) if (mt, ml) == (t, layer)) {
+                    // Un bloc retenu remplacé par le premier bloc complet écarté.
+                    let blocks = cpu_blocks(cpu, layer, t)?;
+                    let outsider = (0..).find(|b| !blocks.contains(b))?;
+                    let mut wrong: Vec<u32> = blocks.iter().map(|&b| b as u32).collect();
+                    wrong[0] = outsider as u32;
+                    wrong.sort_unstable();
+                    return Some(wrong);
+                }
                 let th = threshold?;
                 let (_, margin) = qsa_threshold(cpu, layer, t)?;
                 (margin <= th).then(|| {
@@ -973,7 +986,7 @@ fn n2_resident_decode_matches_cpu_reference() {
     let tokens: usize = std::env::var("SARAGOSSA_QWEN4EXP_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(dense_max_visible(2048, 4));
+        .unwrap_or(4096);
     let ids: Vec<usize> = n2_input_ids(std::path::Path::new(&golden))[..tokens].to_vec();
 
     let started = std::time::Instant::now();
@@ -1136,6 +1149,37 @@ fn n2_resident_decode_matches_cpu_reference() {
         assert!(
             !forced_gate_green(&s),
             "mutation au token {token} non détectée par la porte"
+        );
+    }
+    // Mutation QSA : un mauvais bloc imposé au point de plus grande marge QSA
+    // relative, dans les 64 premiers tokens du régime creux.
+    let sparse_start = dense_max_visible(cpu.keep * cpu.compress, cpu.compress);
+    if tokens > sparse_start {
+        let (token, layer) = (sparse_start..tokens.min(sparse_start + 64))
+            .flat_map(|t| (0..cpu.layers.len()).map(move |l| (t, l)))
+            .filter_map(|(t, l)| qsa_threshold(&cpu, l, t).map(|(_, m)| (t, l, m)))
+            .max_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(t, l, _)| (t, l))
+            .expect("invariant: une couche QSA en régime creux");
+        let steps = (token + 8).min(tokens);
+        let mutated = run_resident_pass(
+            &dir,
+            &ids,
+            &cpu,
+            RoutingMode::QsaMutation(token, layer, threshold),
+            steps,
+        );
+        let s = summarize(&mutated, &cpu, steps);
+        eprintln!(
+            "mutation QSA (token {token}, couche {layer}, marge {:.2e}) : écart max {:.2e}, KL max {:.2e}, premier {:?}",
+            qsa_threshold(&cpu, layer, token).map_or(f32::NAN, |(_, m)| m),
+            s.worst,
+            s.kl,
+            s.first
+        );
+        assert!(
+            !forced_gate_green(&s),
+            "mutation QSA au token {token} non détectée"
         );
     }
     assert!(chosen.is_some(), "passe imposée rouge à tous les seuils");
@@ -1855,7 +1899,6 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
             (keep * 4) as u64,
             metal::MTLResourceOptions::StorageModeShared,
         ),
-        forced_keepalive: std::cell::RefCell::new(None),
     };
     let mut kv = arena.full_attention_with_format(tokens, 4, 2, 128, KvFormat::F32, None)?;
     let mut gathered =
@@ -2013,6 +2056,12 @@ fn bench_resident_decode_after_32k_context() {
             Qwen4ExpCheckpoint::layer_prefix(probe_layer)
         ))
         .expect("invariant: k_layernorm");
+    let q_norm = ckpt
+        .floats(&format!(
+            "{}self_attn.indexer.q_layernorm.weight",
+            Qwen4ExpCheckpoint::layer_prefix(probe_layer)
+        ))
+        .expect("invariant: q_layernorm");
     let mut session = FlashNextSession::open(
         ckpt,
         context + generated,
@@ -2021,6 +2070,7 @@ fn bench_resident_decode_after_32k_context() {
     .expect("invariant: session");
     let started = std::time::Instant::now();
     let mut probes = 0;
+    let mut worst_q = 0.0_f64;
     for (t, &token) in ids[..context - 1].iter().enumerate() {
         let probe = t > 2051 && (t + 1) % 4096 == 0;
         if !probe {
@@ -2035,10 +2085,29 @@ fn bench_resident_decode_after_32k_context() {
             .clone()
             .expect("invariant: régime creux");
         let complete = (t + 1) / d.compress;
-        let (q, pooled, raw) = session
+        let probe_data = session
             .indexer_probe(probe_layer, complete)
             .expect("invariant: sonde");
-        let cpu_scores = query_block_scores(&q, &pooled, complete, d);
+        let (q, pooled, raw) = (&probe_data.q, &probe_data.pooled, &probe_data.raw);
+        // Requêtes de l'indexeur : q_layernorm (1+w) puis RoPE à la position t, sur CPU.
+        let ihd = d.index_head_dim;
+        let mut cpu_q = crate::qwen4_exp::math::rms_norm_1p(
+            &probe_data.qk[..d.index_heads * ihd],
+            ihd,
+            ihd,
+            &q_norm,
+            d.eps,
+        );
+        for head in cpu_q.chunks_exact_mut(ihd) {
+            crate::qwen4_exp::math::rope_in_place(head, &freqs, t);
+        }
+        let (q_err, _) = relative_error(q, &cpu_q);
+        worst_q = worst_q.max(q_err);
+        assert!(
+            q_err <= 1.0e-5,
+            "token {t} : requêtes de l'indexeur (RoPE) {q_err}"
+        );
+        let cpu_scores = query_block_scores(q, pooled, complete, d);
         let (err, _) = relative_error(&scores, &cpu_scores);
         assert!(err <= 1.0e-5, "token {t} : scores de l'indexeur {err}");
         let tokens = select_for_query(&scores, t + 1, d);
@@ -2053,7 +2122,7 @@ fn bench_resident_decode_after_32k_context() {
         // Bloc complété : moyenne, k_layernorm et RoPE à la position 4·b recalculées.
         let block = complete - 1;
         let mut raw_seq = vec![0.0_f32; complete * d.compress * d.index_head_dim];
-        raw_seq[block * d.compress * d.index_head_dim..].copy_from_slice(&raw);
+        raw_seq[block * d.compress * d.index_head_dim..].copy_from_slice(raw);
         let cpu_pooled = pooled_block_keys(&raw_seq, complete, &k_norm, d, &freqs);
         let range = block * d.index_head_dim..complete * d.index_head_dim;
         let (err, _) = relative_error(&pooled[range.clone()], &cpu_pooled[range]);
@@ -2068,7 +2137,8 @@ fn bench_resident_decode_after_32k_context() {
         .expect("invariant: dernier token du contexte")
         .argmax as usize;
     eprintln!(
-        "rejeu de {context} tokens en {:.0} s, {probes} sondes de l'indexeur conformes",
+        "rejeu de {context} tokens en {:.0} s, {probes} sondes de l'indexeur conformes \
+         (écart max des requêtes après RoPE {worst_q:.2e})",
         started.elapsed().as_secs_f64()
     );
     let point = session.checkpoint().expect("invariant: point de reprise");
@@ -2147,4 +2217,58 @@ fn resident_session_allocates_max_capacity() {
         budget as f64 / 1e9
     );
     assert!(used <= budget, "allocations {used} > budget {budget}");
+}
+
+/// Norme + RoPE résidentes (kernel d'arène, utilisé pour q/k de l'attention et
+/// les requêtes de l'indexeur) contre `rms_norm_1p` + `rope_in_place` CPU aux
+/// positions longues : l'angle `position·θ^(−2i/d)` doit rester exact à 1e-5
+/// jusqu'à 262 143.
+#[test]
+fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
+    use crate::decode_resident::DecodeResidentState;
+    use crate::qwen4_exp::math::{inv_freq, rms_norm_1p, rope_in_place};
+    let Some(executor) = executor()? else {
+        return Ok(());
+    };
+    let arena = DecodeResidentState::new(executor.device().clone())?;
+    let (heads, d, rotary, theta) = (4_usize, 128_usize, 64_usize, 1.0e7_f32);
+    let mut rng = DeterministicF32::new(0x20e);
+    let x = rng.fill(heads * d, -1.0, 1.0);
+    let w = rng.fill(d, -0.3, 0.3);
+    let gains: Vec<f32> = w.iter().map(|v| 1.0 + v).collect();
+    let freqs = inv_freq(rotary, f64::from(theta));
+    let queue = executor.device().new_command_queue();
+    let mut report = Vec::new();
+    for position in [5_usize, 2051, 32_767, 131_071, 262_143] {
+        let out = zeros(&executor, heads * d);
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        arena.encode_rms_norm_rope_decode(
+            encoder,
+            &buffer(&executor, &x),
+            &buffer(&executor, &gains),
+            &out,
+            heads,
+            d,
+            rotary,
+            rotary,
+            position,
+            1.0e-6,
+            theta,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        let got = read_f32_buffer(&out, heads * d)?;
+        let mut want = rms_norm_1p(&x, d, d, &w, 1.0e-6);
+        for head in want.chunks_exact_mut(d) {
+            rope_in_place(head, &freqs, position);
+        }
+        let (err, max) = relative_error(&got, &want);
+        report.push((position, err, max));
+    }
+    eprintln!("RoPE résidente contre CPU (position, écart relatif, max absolu) : {report:?}");
+    for (position, err, _) in report {
+        assert!(err <= 1.0e-5, "position {position} : {err}");
+    }
+    Ok(())
 }

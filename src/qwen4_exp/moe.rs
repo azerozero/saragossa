@@ -75,7 +75,14 @@ pub(crate) fn moe(
             .and_then(Option::as_ref)
         {
             let all: Vec<f32> = exp.iter().map(|e| e / sum).collect();
-            probs = set.iter().map(|&e| (e, all[e])).collect();
+            probs = set
+                .iter()
+                .map(|&e| {
+                    all.get(e).map(|&p| (e, p)).ok_or_else(|| {
+                        crate::InferError::Shape(format!("expert imposé {e} hors des {experts}"))
+                    })
+                })
+                .collect::<Result<_>>()?;
         }
         if w.norm_topk_prob {
             let total: f32 = probs.iter().map(|p| p.1).sum();

@@ -571,7 +571,7 @@ impl FlashNextKernels {
                 rms_norm_1p_groups.max_total_threads_per_threadgroup()
             )));
         }
-        Ok(Self {
+        let kernels = Self {
             rms_norm_1p_groups,
             hc_silu_scale: next()?,
             hc_mix: next()?,
@@ -589,6 +589,14 @@ impl FlashNextKernels {
             copy_u32: compile_kernels(device, TEST_SOURCE, &["flash_next_copy_u32"], false)?
                 .pop()
                 .ok_or_else(|| crate::InferError::Metal("pipeline copy_u32 absent".to_string()))?,
-        })
+        };
+        // Le top-k de l'indexeur suppose 1024 threads (32 simdgroups, pas de 1024).
+        if kernels.index_topk.max_total_threads_per_threadgroup() < 1024 {
+            return Err(crate::InferError::Metal(format!(
+                "top-k de l'indexeur Flash-Next : {} threads par threadgroup, 1024 requis",
+                kernels.index_topk.max_total_threads_per_threadgroup()
+            )));
+        }
+        Ok(kernels)
     }
 }

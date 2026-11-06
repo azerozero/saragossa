@@ -82,9 +82,6 @@ pub(crate) struct IndexerScratch {
     pub(crate) scores: Buffer,
     /// `[keep]` u32, blocs retenus triés.
     pub(crate) selected: Buffer,
-    /// Oracles : buffer de sélection imposée, gardé vivant jusqu'au pas suivant.
-    #[cfg(test)]
-    pub(crate) forced_keepalive: std::cell::RefCell<Option<Buffer>>,
 }
 
 /// Régime creux d'une couche : indexeur et KV compact du gather.
@@ -368,9 +365,8 @@ fn encode_indexer<'a>(
             set_value(encoder, 2, &[idx.keep as u32, 0]);
             super::dispatch_1d(encoder, idx.keep);
             post_dispatch_barrier(encoder);
-            // Le buffer doit survivre au command buffer : on le retient jusqu'au
-            // prochain pas (le pas attend sa fin).
-            *scratch.forced_keepalive.borrow_mut() = Some(forced_buffer);
+            // NOTE: le command buffer retient les buffers liés à l'encodeur
+            // (références retenues par défaut) jusqu'à la fin de son exécution.
             true
         }
         None => false,
