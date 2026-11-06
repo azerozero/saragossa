@@ -1176,6 +1176,18 @@ fn n2_mtp_head_matches_transformers_blocks() {
     let (dir, golden_dir) = n2_paths();
     check_provenance(&dir, &golden_dir, "mtp_golden.safetensors")
         .unwrap_or_else(|e| panic!("provenance MTP : {e}"));
+    check_provenance(&dir, &golden_dir, "long.safetensors")
+        .unwrap_or_else(|e| panic!("provenance N2 long : {e}"));
+    // Le golden MTP dérive du golden long : même empreinte que celle consommée.
+    let provenance: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(golden_dir.join("provenance.json")).expect("invariant: provenance"),
+    )
+    .expect("invariant: json");
+    assert_eq!(
+        provenance["goldens"]["mtp_golden.safetensors"]["run"]["long_sha256"].as_str(),
+        Some(sha256_file(&golden_dir.join("long.safetensors")).as_str()),
+        "golden MTP calculé sur un autre golden long"
+    );
     let reference =
         Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
     let golden = Golden {
@@ -1208,6 +1220,26 @@ fn n2_mtp_head_matches_transformers_blocks() {
         .mtp_input(&h, &next)
         .expect("invariant: entrée MTP");
     assert_close("entrée MTP", &pick(&x), &golden.f32("mtp_input"), LAYER_TOL);
+    // Mutations de l'entrée : paires décalées `(h_{t−1}, tok_{t+1})` et flux
+    // permutés doivent sortir de la tolérance.
+    let hidden = width / reference.checkpoint().config.hc_count;
+    let mut shifted = h.data().to_vec();
+    shifted.copy_within(..(next.len() - 1) * width, width);
+    let mut permuted = h.data().to_vec();
+    for row in permuted.chunks_exact_mut(width) {
+        row.rotate_left(hidden);
+    }
+    for (label, data) in [("paires décalées", shifted), ("flux permutés", permuted)] {
+        let mutated = reference
+            .mtp_input(
+                &Tensor::from_vec(vec![next.len(), width], data).expect("invariant: forme"),
+                &next,
+            )
+            .expect("invariant: entrée mutée");
+        let (rel, _) = relative_error(pick(&mutated).data(), golden.f32("mtp_input").data());
+        eprintln!("mutation {label} : écart de l'entrée {rel:.2e}");
+        assert!(rel > LAYER_TOL, "mutation {label} non détectée ({rel:.2e})");
+    }
     let k = reference.checkpoint().config.top_k;
     let (keep, compress) = (reference.budget_blocks(), reference.compress());
     let (torch_sets, torch_probs) = golden.routing(0, k);
@@ -1274,4 +1306,10 @@ fn n2_mtp_head_matches_transformers_blocks() {
         "KL {mean:.2e} / {worst:.2e}"
     );
     assert_eq!(top1, 0, "top-1 MTP différent de transformers");
+    // Seul contrôle hors transcription partagée (entrée, appariement, mixer) :
+    // un brouillon mal assemblé effondre l'accord avec le tronc (mesuré 49/64).
+    assert!(
+        2 * with_trunk >= trunk_rows,
+        "accord du brouillon avec le tronc {with_trunk}/{trunk_rows} sous 1/2"
+    );
 }

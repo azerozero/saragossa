@@ -1395,7 +1395,15 @@ mod tests {
         let mtp = dst.path().join("mtp.safetensors");
         let expected = expected_mtp_tensors(&parsed);
         write_inventory(&mtp, &expected, 64, "");
-        Qwen4ExpCheckpoint::open(dst.path()).expect("invariant: MTP complet accepté");
+        let checkpoint =
+            Qwen4ExpCheckpoint::open(dst.path()).expect("invariant: MTP complet accepté");
+        // Rattaché : les tenseurs `mtp.*` se lisent, et seulement sous leur préfixe.
+        let norm = checkpoint
+            .floats("mtp.pre_fc_norm_hidden.weight")
+            .expect("invariant: norme MTP lisible");
+        assert_eq!(norm.len(), parsed.hc_width());
+        let (packed, _, _) = checkpoint.tensor_bytes_by_kind("mtp.");
+        assert!(packed > 0, "octets MTP absents du rattachement");
 
         write_inventory(&mtp, &expected, 64, "mtp.layers.0.self_attn.o_proj.scales");
         let error = Qwen4ExpCheckpoint::open(dst.path())

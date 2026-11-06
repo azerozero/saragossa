@@ -392,8 +392,13 @@ impl Qwen4ExpReference {
     ///
     /// Renvoie une erreur de lecture ou de forme.
     pub fn final_mixer(&self, h: &Tensor) -> Result<Tensor> {
+        self.head_mixer(&Qwen4ExpCheckpoint::trunk("hyper_connection_mixer."), h)
+    }
+
+    /// Mixer de tête `prefix` (sans injection) sur `h` : `[T, hidden]`.
+    pub(super) fn head_mixer(&self, prefix: &str, h: &Tensor) -> Result<Tensor> {
         let c = &self.ckpt.config;
-        let mixer = self.residual(&Qwen4ExpCheckpoint::trunk("hyper_connection_mixer."), false)?;
+        let mixer = self.residual(prefix, false)?;
         Ok(mixer.mix(h, c.hc_count, c.hidden, c.rms_eps)?.input)
     }
 

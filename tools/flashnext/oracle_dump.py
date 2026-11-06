@@ -391,6 +391,13 @@ def run_mtp(qdir, out):
     tc = C.text_config(qdir)
     weights = C.QWeights(qdir)
     last = tc.num_hidden_layers - 1
+    # La couche MTP est construite comme la couche `last` : QSA, sans PLE.
+    assert tc.layer_types[last] == "full_attention" and last + 1 not in tc.ple_layer_ids, \
+        "la couche de référence de la MTP doit être QSA et sans PLE"
+    recorded = load_provenance(out / "provenance.json")["goldens"].get("long.safetensors", {})
+    long_sha = sha256(out / "long.safetensors")
+    if recorded.get("sha256") != long_sha:
+        raise SystemExit(f"{out}/long.safetensors : empreinte {long_sha} ≠ provenance")
     with safe_open(out / "long.safetensors", framework="np") as golden:
         ids_list = golden.get_tensor("input_ids").tolist()
         x = torch.from_numpy(golden.get_tensor(f"qsa_input.{last}")).float()[None]
@@ -453,7 +460,7 @@ def run_mtp(qdir, out):
     tmp = out / "mtp_golden.safetensors.tmp"
     C.write_safetensors(tmp, tensors, {"pairs": m})
     publish(out, "mtp_golden.safetensors", tmp, source,
-            {"pairs": m, "long_sha256": sha256(out / "long.safetensors"),
+            {"pairs": m, "long_sha256": long_sha,
              "positions": "ligne t à la position RoPE t ; logits 16k + 64 dernières"})
 
 

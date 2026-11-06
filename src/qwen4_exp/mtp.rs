@@ -12,10 +12,14 @@
 //! - sortie hc (le `h` du draft suivant) puis mixer de tête et lm_head partagé.
 //!
 //! Le convertisseur plie chaque gain en `1 + w` (`qwen4exp.cpp:361`) ; nos
-//! poids gardent `w`, et `rms_norm_1p` ajoute 1 une seule fois. Les lignes de
-//! l'historique portent la position RoPE de leur indice : la RoPE étant
-//! relative, un décalage constant de position ne change l'attention et les
-//! scores de l'indexeur qu'à l'arrondi près.
+//! poids gardent `w`, et `rms_norm_1p` ajoute 1 une seule fois.
+//!
+//! Convention de position : la ligne `j` de l'historique MTP porte la position
+//! RoPE `j`, et ses blocs d'indexeur sont `[4b, 4b + 4)` en indices de ligne.
+//! La RoPE étant relative, un décalage constant appliqué ensemble aux requêtes
+//! et aux clés (poolées comprises) ne change les produits scalaires qu'à
+//! l'arrondi près ; il déplacerait en revanche les frontières de blocs si on le
+//! leur appliquait. Le chemin résident suivra la même convention.
 
 use super::forward::{LayerOutput, Qwen4ExpReference};
 use super::math::{linear, rms_norm_1p};
@@ -105,8 +109,6 @@ impl Qwen4ExpReference {
     ///
     /// Renvoie une erreur de lecture ou de forme.
     pub(crate) fn mtp_head(&self, h: &Tensor) -> Result<Tensor> {
-        let c = &self.checkpoint().config;
-        let mixer = self.residual("mtp.hyper_connection_mixer.", false)?;
-        Ok(mixer.mix(h, c.hc_count, c.hidden, c.rms_eps)?.input)
+        self.head_mixer("mtp.hyper_connection_mixer.", h)
     }
 }
