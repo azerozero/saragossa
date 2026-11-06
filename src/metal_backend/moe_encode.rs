@@ -4,6 +4,57 @@ use super::*;
 
 const TOPK_SOFTMAX_TG_WIDTH: u64 = 32;
 
+/// Kernel de top-k imposé, compilé seulement pour les tests (absent de la
+/// bibliothèque Metal de production).
+#[cfg(test)]
+pub(super) const TOPK_FORCED_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline bool topk_better(float value, uint index, float best_value, uint best_index) {
+    return (value > best_value) || ((value == best_value) && (index < best_index));
+}
+
+// Top-k IMPOSÉ des oracles. Les `topk` experts donnés sont triés comme `topk_softmax_f32` (logit décroissant, indice
+// croissant) puis pondérés par le même softmax restreint.
+kernel void topk_softmax_forced_f32(
+    device const float* logits [[buffer(0)]],
+    device const uint* forced [[buffer(1)]],
+    device uint* indices [[buffer(2)]],
+    device float* scores [[buffer(3)]],
+    constant uint& topk [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (tid != 0u || topk > 16u) {
+        return;
+    }
+    float values[16];
+    uint chosen[16];
+    for (uint slot = 0u; slot < topk; ++slot) {
+        const uint index = forced[slot];
+        const float value = logits[index];
+        uint pos = slot;
+        while (pos > 0u && topk_better(value, index, values[pos - 1u], chosen[pos - 1u])) {
+            values[pos] = values[pos - 1u];
+            chosen[pos] = chosen[pos - 1u];
+            --pos;
+        }
+        values[pos] = value;
+        chosen[pos] = index;
+    }
+    const float max_value = values[0];
+    float denom = 0.0f;
+    for (uint slot = 0u; slot < topk; ++slot) {
+        denom += exp(values[slot] - max_value);
+    }
+    denom = max(denom, 1.0e-20f);
+    for (uint slot = 0u; slot < topk; ++slot) {
+        indices[slot] = chosen[slot];
+        scores[slot] = exp(values[slot] - max_value) / denom;
+    }
+}
+"#;
+
 #[cfg(test)]
 thread_local! {
     /// Experts imposés au PROCHAIN `encode_topk_softmax` de ce thread (oracles :

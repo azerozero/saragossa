@@ -752,7 +752,14 @@ impl MetalExecutor {
             compile_steel_attention(&device, sources.steel_attention.as_ref());
         let add_rms_norm_row_f32 = pipeline(&library, &device, "add_rms_norm_row_f32")?;
         let topk_softmax_f32 = pipeline(&library, &device, "topk_softmax_f32")?;
-        let topk_softmax_forced_f32 = pipeline(&library, &device, "topk_softmax_forced_f32")?;
+        #[cfg(test)]
+        let topk_softmax_forced_f32 = {
+            let options = metal::CompileOptions::new();
+            let forced = device
+                .new_library_with_source(super::moe_encode::TOPK_FORCED_SOURCE, &options)
+                .map_err(|message| InferError::Metal(format!("kernel top-k imposé : {message}")))?;
+            pipeline(&forced, &device, "topk_softmax_forced_f32")?
+        };
         let topk_sigmoid_f32 = pipeline(&library, &device, "topk_sigmoid_f32")?;
         let topk_sigmoid_rows_f32 = pipeline(&library, &device, "topk_sigmoid_rows_f32")?;
         let topk_softmax_serial_f32 = pipeline(&library, &device, "topk_softmax_serial_f32")?;
@@ -969,6 +976,7 @@ impl MetalExecutor {
             steel_attention_f32_bq32_bk32_bd64,
             add_rms_norm_row_f32,
             topk_softmax_f32,
+            #[cfg(test)]
             topk_softmax_forced_f32,
             topk_sigmoid_f32,
             topk_sigmoid_rows_f32,
