@@ -107,6 +107,13 @@ pub(crate) struct QsaDecodeDims {
     pub(crate) eps: f32,
     /// Visibilité maximale du régime dense ([`dense_max_visible`]).
     pub(crate) dense_max: usize,
+    /// Oracles : décalage de position des seules requêtes de l'attention
+    /// (mutation, les clés gardent la position du token).
+    #[cfg(test)]
+    pub(crate) query_offset: usize,
+    /// Oracles : décalage des seules requêtes de l'indexeur (mutation).
+    #[cfg(test)]
+    pub(crate) index_query_offset: usize,
 }
 
 impl QsaDecodeDims {
@@ -184,18 +191,24 @@ pub(crate) fn encode_qsa(
         dims.heads,
         dims.head_dim,
     )?;
-    for (input, norm, target, heads) in [
+    #[cfg(test)]
+    let q_position = position + dims.query_offset;
+    #[cfg(not(test))]
+    let q_position = position;
+    for (input, norm, target, heads, position) in [
         (
             &scratch.q_raw,
             &weights.q_norm,
             &scratch.q_roped,
             dims.heads,
+            q_position,
         ),
         (
             &scratch.k_raw,
             &weights.k_norm,
             &scratch.k_roped,
             dims.kv_heads,
+            position,
         ),
     ] {
         encode_norm_rope(
@@ -370,6 +383,10 @@ fn encode_indexer<'a>(
         return Ok(None);
     }
     // Requêtes de l'indexeur : `q_layernorm` puis RoPE à la position du token.
+    #[cfg(test)]
+    let index_q_position = position + dims.index_query_offset;
+    #[cfg(not(test))]
+    let index_q_position = position;
     encode_norm_rope(
         kernels,
         encoder,
@@ -380,7 +397,7 @@ fn encode_indexer<'a>(
         idx.heads,
         d,
         dims.rotary_dim,
-        position,
+        index_q_position,
         dims.eps,
     )?;
     encoder.set_compute_pipeline_state(&kernels.index_scores);

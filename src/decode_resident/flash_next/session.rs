@@ -47,6 +47,17 @@ struct MtpBuffers {
     out: Buffer,
 }
 
+/// Résiduel d'entrée d'un pas MTP : copié depuis l'hôte, ou depuis un buffer
+/// résident (sortie d'un pas MTP précédent, sans aller-retour hôte).
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
+)]
+pub(crate) enum MtpInput<'a> {
+    Host(&'a [f32]),
+    Resident(&'a metal::BufferRef),
+}
+
 /// Sortie d'un pas MTP.
 #[cfg_attr(
     not(test),
@@ -58,7 +69,10 @@ pub(crate) struct MtpOutput {
     pub(crate) logits: Option<Vec<f32>>,
     /// Résiduel hc de sortie (`[hc·hidden]`), relu sur demande.
     pub(crate) hidden: Option<Vec<f32>>,
-    /// Oracles : sélection QSA (régime creux) et experts routés de la couche.
+    /// Oracles : entrée fc de la couche (`[hc·hidden]`), sélection QSA (régime
+    /// creux) et experts routés.
+    #[cfg(test)]
+    pub(crate) input: Vec<f32>,
     #[cfg(test)]
     pub(crate) qsa: Option<QsaCapture>,
     #[cfg(test)]
@@ -203,6 +217,9 @@ pub(crate) struct FlashNextSession {
     pub(crate) mtp_forced_selection: Option<Vec<u32>>,
     #[cfg(test)]
     pub(crate) mtp_forced_routing: Option<Vec<u32>>,
+    /// Oracles : entrée fc du dernier pas MTP.
+    #[cfg(test)]
+    mtp_input_capture: Buffer,
     /// Oracles : sélection et scores de l'indexeur par couche du dernier pas
     /// (`[couches, keep]` u32, `[couches, blocs max]` f32).
     #[cfg(test)]
@@ -401,6 +418,10 @@ impl FlashNextSession {
             rotary_dim: c.rotary_dim,
             eps: c.rms_eps,
             dense_max,
+            #[cfg(test)]
+            query_offset: 0,
+            #[cfg(test)]
+            index_query_offset: 0,
         };
         let linear_spec = LinearAttentionStepSpec {
             num_key_heads: c.linear_key_heads,
@@ -541,6 +562,8 @@ impl FlashNextSession {
             mtp_forced_selection: None,
             #[cfg(test)]
             mtp_forced_routing: None,
+            #[cfg(test)]
+            mtp_input_capture: zeros(&executor, width),
             #[cfg(test)]
             selection_capture: executor.device().new_buffer(
                 ((c.layer_kinds.len() + 1) * (c.indexer_budget / c.indexer_compress) * 4) as u64,
@@ -1150,6 +1173,22 @@ impl FlashNextSession {
         }
     }
 
+    /// Résiduel de sortie du dernier pas MTP, résident (entrée du draft suivant).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
+    )]
+    pub(crate) fn mtp_hidden_buffer(&self) -> Option<&Buffer> {
+        self.mtp.as_ref().map(|m| &m.out)
+    }
+
+    /// Oracles : décalages des seules requêtes, attention et indexeur.
+    #[cfg(test)]
+    pub(crate) fn set_query_offsets(&mut self, attention: usize, indexer: usize) {
+        self.qsa_dims.query_offset = attention;
+        self.qsa_dims.index_query_offset = indexer;
+    }
+
     /// Lignes de l'historique MTP (longueur du KV de la tête) ; `None` sans tête.
     #[cfg_attr(
         not(test),
@@ -1179,7 +1218,7 @@ impl FlashNextSession {
     )]
     pub(crate) fn mtp_step(
         &mut self,
-        h: &[f32],
+        h: MtpInput<'_>,
         token: usize,
         logits: bool,
         hidden: bool,
@@ -1195,10 +1234,13 @@ impl FlashNextSession {
         let rows = self
             .mtp_rows()
             .ok_or_else(|| InferError::Config("Flash-Next : tête MTP absente".to_string()))?;
-        if h.len() != width || token >= c.vocab {
+        let len = match h {
+            MtpInput::Host(h) => h.len(),
+            MtpInput::Resident(buffer) => (buffer.length() / 4) as usize,
+        };
+        if len != width || token >= c.vocab {
             return Err(InferError::Shape(format!(
-                "MTP : h de {} valeurs (largeur {width}), token {token} (vocabulaire {})",
-                h.len(),
+                "MTP : h de {len} valeurs (largeur {width}), token {token} (vocabulaire {})",
                 c.vocab
             )));
         }
@@ -1217,12 +1259,26 @@ impl FlashNextSession {
             .mtp
             .as_ref()
             .ok_or_else(|| InferError::Config("Flash-Next : tête MTP absente".to_string()))?;
-        write_f32_buffer(&buffers.h[0], h)?;
         write_f32_buffer(&buffers.embed, row.data())?;
         let queue = self.queue.clone();
         let command_buffer = queue.new_command_buffer();
         let mut encoders = Encoders::single(command_buffer);
-        let encoded = self.encode_mtp(&mut encoders, rows, logits);
+        let encoded = match h {
+            MtpInput::Host(h) => write_f32_buffer(&buffers.h[0], h),
+            MtpInput::Resident(source) => encoders.at(Brick::Hc).and_then(|encoder| {
+                self.executor.encode_copy_with_offsets(
+                    encoder,
+                    source,
+                    0,
+                    &buffers.h[0],
+                    0,
+                    width,
+                )?;
+                crate::metal_backend::post_dispatch_barrier(encoder);
+                Ok(())
+            }),
+        }
+        .and_then(|()| self.encode_mtp(&mut encoders, rows, logits));
         if let Err(error) = encoded {
             drop(encoders);
             // Rien n'est soumis : seule la longueur du KV a avancé.
@@ -1238,6 +1294,26 @@ impl FlashNextSession {
             self.poisoned = true;
             return Err(error);
         }
+        // Le pas est engagé (ligne `rows` ajoutée) : une relecture en échec le
+        // signale explicitement, pour qu'aucune reprise ne rejoue la paire.
+        let engaged = |error: InferError| {
+            InferError::Metal(format!(
+                "pas MTP engagé (ligne {rows} ajoutée), relecture en échec : {error}"
+            ))
+        };
+        self.mtp_post_commit(rows, logits, hidden).map_err(engaged)
+    }
+
+    /// Relectures d'un pas MTP soumis et terminé.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
+    )]
+    fn mtp_post_commit(&self, rows: usize, logits: bool, hidden: bool) -> Result<MtpOutput> {
+        // `rows` ne sert qu'aux captures d'oracles.
+        #[cfg(not(test))]
+        let _ = rows;
+        let width = self.hc_dims.width();
         let argmax = read_u32_buffer(&self.index, 1)?
             .first()
             .copied()
@@ -1250,15 +1326,12 @@ impl FlashNextSession {
             logits: logits
                 .then(|| read_f32_buffer(&self.logits, c.vocab))
                 .transpose()?,
-            hidden: hidden
-                .then(|| {
-                    self.mtp
-                        .as_ref()
-                        .map(|m| read_f32_buffer(&m.out, width))
-                        .transpose()
-                })
-                .transpose()?
-                .flatten(),
+            hidden: match (hidden, &self.mtp) {
+                (true, Some(m)) => Some(read_f32_buffer(&m.out, width)?),
+                _ => None,
+            },
+            #[cfg(test)]
+            input: read_f32_buffer(&self.mtp_input_capture, width)?,
             #[cfg(test)]
             qsa: {
                 let complete = (rows + 1) / self.indexer_dims.compress;
@@ -1347,6 +1420,18 @@ impl FlashNextSession {
         super::set_value(encoder, 3, &[width as u32, c.hidden as u32]);
         super::dispatch_1d(encoder, width);
         crate::metal_backend::post_dispatch_barrier(encoder);
+        #[cfg(test)]
+        {
+            self.executor.encode_copy_with_offsets(
+                encoder,
+                &buffers.h[1],
+                0,
+                &self.mtp_input_capture,
+                0,
+                width,
+            )?;
+            crate::metal_backend::post_dispatch_barrier(encoder);
+        }
         let ctx = LayerEncoder {
             kernels: &self.kernels,
             executor: &self.executor,
@@ -1368,8 +1453,8 @@ impl FlashNextSession {
         let mut owned = Vec::new();
         #[cfg(test)]
         let hooks = LayerHooks {
-            forced_selection: self.mtp_forced_selection.take(),
-            forced_routing: self.mtp_forced_routing.take(),
+            forced_selection: Some(&mut self.mtp_forced_selection),
+            forced_routing: Some(&mut self.mtp_forced_routing),
             capture: Some(CaptureSlot {
                 slot: c.layer_kinds.len(),
                 selection: &self.selection_capture,
@@ -1486,8 +1571,8 @@ impl FlashNextSession {
             }
             #[cfg(test)]
             let hooks = LayerHooks {
-                forced_selection: self.forced_selection.get_mut(index).and_then(Option::take),
-                forced_routing: self.forced_routing.get_mut(index).and_then(Option::take),
+                forced_selection: self.forced_selection.get_mut(index),
+                forced_routing: self.forced_routing.get_mut(index),
                 capture: layers.then_some(CaptureSlot {
                     slot: index,
                     selection: &self.selection_capture,
@@ -1602,11 +1687,13 @@ struct CaptureSlot<'s> {
     stride: usize,
 }
 
-/// Oracles d'une couche : impositions consommées et captures.
+/// Oracles d'une couche : impositions (consommées aux mêmes points qu'avant
+/// la factorisation : sélection dans la branche QSA, experts juste avant le
+/// MoE) et captures.
 #[cfg(test)]
 struct LayerHooks<'s> {
-    forced_selection: Option<Vec<u32>>,
-    forced_routing: Option<Vec<u32>>,
+    forced_selection: Option<&'s mut Option<Vec<u32>>>,
+    forced_routing: Option<&'s mut Option<Vec<u32>>>,
     capture: Option<CaptureSlot<'s>>,
 }
 
@@ -1684,7 +1771,7 @@ impl LayerEncoder<'_> {
                         gathered,
                         dims: self.indexer_dims,
                         #[cfg(test)]
-                        forced: forced_selection,
+                        forced: forced_selection.and_then(Option::take),
                     }),
                     position,
                     self.x,
@@ -1741,7 +1828,7 @@ impl LayerEncoder<'_> {
             self.x,
         )?;
         #[cfg(test)]
-        if let Some(experts) = forced_routing {
+        if let Some(experts) = forced_routing.and_then(Option::take) {
             crate::metal_backend::force_next_topk(experts);
         }
         let encoder = encoders.at(Brick::Moe)?;
