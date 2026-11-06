@@ -24,9 +24,12 @@ l'orchestrateur des couches Qwen.
   n'est soumis, donc les états GPU restent intacts.
 - **Erreur d'exécution GPU.** La session est invalidée jusqu'au prochain
   `reset`.
+- **`reset`.** La session est invalidée pendant la restauration et ne
+  redevient utilisable qu'après un succès complet. Un échec en cours de route
+  (testé) laisse la session refuser le pas suivant.
 - **Encodeur.** `EncoderEndGuard` ferme l'encodeur sur tous les chemins.
-- **`reset`.** Restaure les états DeltaNet initiaux, vide le KV et remet le PLE
-  à zéro.
+- **Contenu du `reset`.** Restaure les états DeltaNet initiaux (instantanés
+  pris à l'ouverture), vide le KV et remet le PLE à zéro.
 - **Garde mémoire au pic de chaque étape.** Les étapes sont, dans l'ordre :
   mixer, lm_head, PLE, chaque couche, puis états et scratch. Chaque budget
   compte :
@@ -34,8 +37,16 @@ l'orchestrateur des couches Qwen.
   - le transitoire : copies CPU des triplets affines, avec échelles et biais
     élargis en f32, et tampon d'empilement des experts.
 
+  Le budget des états et du scratch compte les états DeltaNet deux fois
+  (états vivants et instantanés du `reset`), ainsi que le scratch interne de
+  l'exécuteur alloué au premier pas.
+
   Un test sur la fixture N1 vérifie qu'un plafond égal au résident final est
-  refusé, et qu'un plafond égal au pic est accepté.
+  refusé, et qu'un plafond égal au pic est accepté. Le test de reprise, sur
+  les vrais poids, compare les allocations réelles de la session au budget :
+  buffers propres, états, instantanés et KV, plus la croissance du device au
+  premier pas. Mesure : 241,6 Mo alloués, dont 1,5 Mo au premier pas, pour un
+  budget de 241,7 Mo à 16 tokens de capacité.
 
 ## Briques et oracles CPU (tests ordinaires)
 
@@ -77,6 +88,15 @@ Une seule quasi-égalité du routeur suffit à faire diverger la suite de la
 séquence en chaîne native. La porte est donc double.
 
 1. **Passe native, contrôlée jusqu'à la première bascule de routage.**
+   - Pourquoi la porte s'arrête à cette bascule : sur un MoE, une
+     quasi-égalité du routeur fait choisir un autre expert. L'écart passe
+     ensuite par l'état récurrent et le KV à tous les tokens suivants. Au-delà
+     de la première bascule, la chaîne native compare donc deux trajectoires
+     différentes, et une porte sur toute la séquence y serait physiquement
+     intenable. L'exactitude du reste de la séquence est portée par la passe
+     imposée, gatée de bout en bout.
+   - Sur toute la séquence native : sorties et métriques finies (NaN et
+     infinis refusés).
    - Avant la bascule : écart ≤ 1e-3 et argmax identique.
    - La bascule tombe sur un point dont la **marge de probabilité** du
      routeur CPU, au seuil du top-10, vaut au plus 1e-6.
@@ -94,8 +114,10 @@ séquence en chaîne native. La porte est donc double.
      - argmax identique, sauf quasi-égalité (écart de probabilité ≤ 1e-5) ;
      - routage GPU identique au CPU sur tous les points non imposés.
 
-Une **mutation**, qui impose un mauvais expert sur un token à marge nette,
-doit faire passer la porte au rouge.
+Deux **mutations** imposent un mauvais expert, au point de plus grande marge
+CPU, dans la passe imposée au seuil retenu. L'une tombe tôt (tokens 8 à 63),
+l'autre tard (dans les 64 tokens qui suivent la première bascule native).
+Chacune doit faire passer la porte au rouge.
 
 ### Résultats (2051 tokens, 98 448 points token × couche)
 
@@ -114,7 +136,8 @@ Points de marge de probabilité :
 | native (témoin) | 64 | 1,4e-5 | 1,0e-8 | 0 | 0 | — |
 | native (témoin) | 256 | 2,1e-1 | 1,35e-1 | 1 | 167 | — |
 | native (témoin) | 2051 | 1,25 | 1,35e-1 | 26 | 1962 | — |
-| mutation (token 38, couche 18, marge 8,6e-3) | 46 | 9,4e-2 | 4,2e-3 | — | — | rouge, comme attendu |
+| mutation précoce (token 38, couche 18, marge 8,6e-3) | 46 | 9,4e-2 | 4,2e-3 | — | — | rouge, comme attendu |
+| mutation tardive (token 132, couche 22, marge 8,9e-3) | 140 | 1,48e-1 | 1,22e-1 | — | — | rouge, comme attendu |
 
 - **Seuil retenu : 1e-6.** À 1e-7, le point du token 89 (marge 2,1e-7) n'est
   pas imposé. Il bascule, et la chaîne diverge comme en natif.
@@ -145,7 +168,8 @@ fait échouer ce test.
 ## Mémoire
 
 Pic `peak memory footprint` du binaire de test N2 sur 2051 tokens :
-**84,5 Go**, sur les trois passes, la mutation et les essais de seuil. Il
+**84,5 Go**, sur les passes native et imposées, les deux mutations et les
+essais de seuil. Il
 comprend :
 - les poids GPU (~73 Go) ;
 - la référence CPU, une couche déquantifiée à la fois ;
@@ -162,5 +186,6 @@ tokens puis 256 pas gloutons. Il publie :
 - la médiane, p10/p90 et le maximum par pas ;
 - le temps CPU de préparation (embedding et PLE).
 
-La porte des 45 tok/s est évaluée sur la répétition la plus lente. La mesure
-n'est pas encore lancée : elle attend une machine libre.
+La porte des 45 tok/s porte sur la répétition la plus lente et fait échouer
+le test en dessous. La mesure n'est pas encore lancée : elle attend une
+machine libre.
