@@ -94,10 +94,6 @@ pub(crate) struct QsaSparse<'a> {
     /// Oracles : blocs imposés à la place du top-k (quasi-égalités CPU).
     #[cfg(test)]
     pub(crate) forced: Option<Vec<u32>>,
-    /// Oracles : copie de la sélection native (avant imposition), `(buffer,
-    /// élément de départ)`.
-    #[cfg(test)]
-    pub(crate) native_capture: Option<(&'a Buffer, usize)>,
 }
 
 /// Dimensions de l'attention.
@@ -333,8 +329,6 @@ fn encode_indexer<'a>(
         dims: idx,
         #[cfg(test)]
         forced,
-        #[cfg(test)]
-        native_capture,
     } = sparse;
     let d = idx.head_dim;
     let f32_size = std::mem::size_of::<f32>() as u64;
@@ -411,18 +405,9 @@ fn encode_indexer<'a>(
     crate::metal_backend::profile_dispatch();
     encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
     post_dispatch_barrier(encoder);
-    // Oracles : la sélection native est capturée, puis remplacée par la
-    // sélection imposée (quasi-égalités) ; le test justifie chaque échange.
+    // Oracles : sélection imposée à la place du top-k (mutation).
     #[cfg(test)]
     {
-        if let Some((capture, start)) = native_capture {
-            encoder.set_compute_pipeline_state(&kernels.copy_u32);
-            encoder.set_buffer(0, Some(&scratch.selected), 0);
-            encoder.set_buffer(1, Some(capture), 0);
-            set_value(encoder, 2, &[idx.keep as u32, start as u32]);
-            super::dispatch_1d(encoder, idx.keep);
-            post_dispatch_barrier(encoder);
-        }
         if let Some(blocks) = forced {
             if blocks.len() != idx.keep || blocks.iter().any(|&b| b as usize >= complete) {
                 return Err(InferError::Dimension(format!(

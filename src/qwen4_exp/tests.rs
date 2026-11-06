@@ -292,7 +292,8 @@ fn justify_routing(
         let b: BTreeSet<usize> = theirs.iter().copied().collect();
         let swapped: Vec<usize> = a.symmetric_difference(&b).copied().collect();
         for e in &swapped {
-            if (probs[*e] - threshold).abs() > TIE_TOL {
+            let near = (probs[*e] - threshold).abs() <= TIE_TOL;
+            if !near || !probs[*e].is_finite() {
                 return Err(format!(
                     "token {t}: expert {e} échangé, probabilité torch {} ≠ seuil {threshold}",
                     probs[*e]

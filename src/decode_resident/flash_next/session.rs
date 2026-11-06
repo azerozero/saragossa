@@ -39,7 +39,7 @@ pub(crate) const MAX_CAPACITY: usize = 262_144;
 
 /// Blocs QSA retenus et scores de l'indexeur d'une couche (oracles).
 #[cfg(test)]
-pub(crate) type QsaCapture = (Vec<u32>, Vec<f32>, Vec<u32>);
+pub(crate) type QsaCapture = (Vec<u32>, Vec<f32>);
 
 /// Point de reprise d'une session ([`FlashNextSession::checkpoint`]).
 pub(crate) struct SessionCheckpoint {
@@ -168,9 +168,6 @@ pub(crate) struct FlashNextSession {
     selection_capture: Buffer,
     #[cfg(test)]
     score_capture: Buffer,
-    /// Oracles : sélection native de l'indexeur (avant imposition) par couche.
-    #[cfg(test)]
-    native_capture: Buffer,
 }
 
 fn zeros(executor: &MetalExecutor, len: usize) -> Buffer {
@@ -487,11 +484,6 @@ impl FlashNextSession {
                 MTLResourceOptions::StorageModeShared,
             ),
             #[cfg(test)]
-            native_capture: executor.device().new_buffer(
-                (c.layer_kinds.len() * (c.indexer_budget / c.indexer_compress) * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            ),
-            #[cfg(test)]
             score_capture: zeros(
                 &executor,
                 c.layer_kinds.len() * (capacity / c.indexer_compress + 1),
@@ -652,7 +644,6 @@ impl FlashNextSession {
         let complete = self.position / self.indexer_dims.compress;
         let stride = self.capacity / self.indexer_dims.compress + 1;
         let selections = read_u32_buffer(&self.selection_capture, c.layer_kinds.len() * keep)?;
-        let natives = read_u32_buffer(&self.native_capture, c.layer_kinds.len() * keep)?;
         let scores = read_f32_buffer(&self.score_capture, c.layer_kinds.len() * stride)?;
         Ok(c.layer_kinds
             .iter()
@@ -663,7 +654,6 @@ impl FlashNextSession {
                         (
                             selections[index * keep..(index + 1) * keep].to_vec(),
                             scores[index * stride..index * stride + complete].to_vec(),
-                            natives[index * keep..(index + 1) * keep].to_vec(),
                         )
                     })
             })
@@ -1136,9 +1126,6 @@ impl FlashNextSession {
                             dims: self.indexer_dims,
                             #[cfg(test)]
                             forced: self.forced_selection.get_mut(index).and_then(Option::take),
-                            #[cfg(test)]
-                            native_capture: layers
-                                .then_some((&self.native_capture, index * self.indexer_dims.keep)),
                         }),
                         self.position,
                         &self.x,

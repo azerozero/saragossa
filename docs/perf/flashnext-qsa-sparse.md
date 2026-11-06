@@ -123,13 +123,18 @@ imposés aux quasi-égalités torch, sélection torch imposée pour la sortie.
 
 | porte | tolérance | résultat (12 couches) |
 |---|---|---|
-| routage propre | égal, ou paire au seuil à 1e-5 | 1 échange justifié |
-| scores de l'indexeur | 1e-4 relatif à `1 + |torch|` | vert |
+| routage propre | égal, ou experts échangés à 1e-5 du seuil torch (règle de l'étape 1) | 1 échange justifié |
+| scores de l'indexeur | 1e-4 relatif à `1 + |torch|` (tolérance de l'étape 1, maintenue par l'arbitrage) | vert |
 | sélection propre | égale, ou justifiée à 1e-5 | 4 ex æquo justifiés |
 | sortie de couche | 1e-4 | 4e-7 à 3,2e-6 |
 
+Côté torch, les seuils restent ceux de l'étape 1. Les seuils GPU plus fins
+(scores à 1e-5, échanges à 2e-5) valent pour l'oracle GPU ré-ancré, où les
+deux côtés partagent les mêmes entrées.
+
 `n2_long_cpu_chain_matches_transformers_on_4k_tokens` reste en contrôle de
-dérive : la chaîne Rust des 48 couches n'est jamais ré-ancrée.
+dérive : la chaîne Rust des 48 couches n'est jamais ré-ancrée. La sélection
+torch y est imposée pour suivre la même trajectoire (ablation de l'étape 1).
 - Portes : KL ≤ 1e-3 et top-1 identique. Mesuré : KL moyen 2,8e-10, max
   3,4e-8, aucun top-1 différent sur 316 positions.
 - Les scores QSA y dérivent jusqu'à 2,9e-3 (couche 47), et sont relevés sans
