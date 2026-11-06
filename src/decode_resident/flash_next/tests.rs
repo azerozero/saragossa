@@ -846,3 +846,63 @@ fn resident_config_validation_accepts_flash_next_and_refuses_variants() -> Resul
     }
     Ok(())
 }
+
+/// Reprise après échec : au token 6, une lecture n-gram puis un encodage
+/// (après la couche 20) échouent ; la session garde sa position, restaure KV
+/// et PLE, puis redonne au bit près les logits d'une session sans échec.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn resident_session_recovers_after_ple_and_encode_failures() {
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let ids: Vec<usize> = n2_input_ids(std::path::Path::new(&golden))[..16].to_vec();
+    let open = || {
+        FlashNextSession::open(
+            Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+            ids.len(),
+            Some(&crate::MemoryGuard::process()),
+        )
+        .expect("invariant: session")
+    };
+    let expected: Vec<Vec<f32>> = {
+        let mut session = open();
+        ids.iter()
+            .map(|&t| {
+                session
+                    .step(t, true, false)
+                    .expect("invariant: pas")
+                    .logits
+                    .expect("invariant: logits")
+            })
+            .collect()
+    };
+    let mut session = open();
+    for (t, &token) in ids.iter().enumerate() {
+        if t == 6 {
+            session.fail_next_ngram_read = true;
+            assert!(
+                session.step(token, true, false).is_err(),
+                "échec PLE ignoré"
+            );
+            assert_eq!(session.position(), 6);
+            session.fail_encode_after_layer = Some(20);
+            assert!(
+                session.step(token, true, false).is_err(),
+                "échec d'encodage ignoré"
+            );
+            assert_eq!(session.position(), 6);
+        }
+        let got = session
+            .step(token, true, false)
+            .expect("invariant: pas repris");
+        assert_eq!(
+            got.logits.expect("invariant: logits"),
+            expected[t],
+            "token {t}"
+        );
+    }
+}

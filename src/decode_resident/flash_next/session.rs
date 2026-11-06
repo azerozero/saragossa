@@ -7,7 +7,7 @@
 //! token : les buffers partagés (embedding, octets PLE) ne sont réécrits
 //! qu'après la fin du command buffer précédent.
 
-use metal::{Buffer, CommandQueue, MTLResourceOptions};
+use metal::{Buffer, CommandQueue, ComputeCommandEncoderRef, MTLResourceOptions};
 
 use super::attention::{dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaScratch};
 use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch};
@@ -16,8 +16,8 @@ use super::ple::{encode_ple, PleScratch, PleState};
 use super::weights::{FlashNextWeights, MixerWeights};
 use crate::decode_resident::{DecodeResidentState, FullAttentionMetalState};
 use crate::metal_backend::{
-    commit_and_wait, read_f32_buffer, read_u32_buffer, write_f32_buffer, LinearAttentionMetalState,
-    LinearAttentionStepSpec, LinearAttnResidentDims, MetalExecutor,
+    commit_and_wait, read_f32_buffer, read_u32_buffer, write_f32_buffer, EncoderEndGuard,
+    LinearAttentionMetalState, LinearAttentionStepSpec, LinearAttnResidentDims, MetalExecutor,
 };
 use crate::qwen4_exp::ngram::NgramContext;
 use crate::qwen_loader::qwen4_exp::{Qwen4ExpCheckpoint, Qwen4ExpConfig};
@@ -79,6 +79,14 @@ pub(crate) struct FlashNextSession {
     linear_dims: LinearAttnResidentDims,
     position: usize,
     capacity: usize,
+    /// Vrai après une erreur d'exécution GPU : états incertains, pas refusés.
+    poisoned: bool,
+    /// Oracles : prochaine lecture n-gram en échec.
+    #[cfg(test)]
+    pub(crate) fail_next_ngram_read: bool,
+    /// Oracles : échec d'encodage injecté après la couche donnée.
+    #[cfg(test)]
+    pub(crate) fail_encode_after_layer: Option<usize>,
     /// Oracles : experts imposés au prochain pas, par couche (consommés).
     #[cfg(test)]
     pub(crate) forced_routing: Vec<Option<Vec<u32>>>,
@@ -266,6 +274,11 @@ impl FlashNextSession {
             linear_dims,
             position: 0,
             capacity,
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_ngram_read: false,
+            #[cfg(test)]
+            fail_encode_after_layer: None,
             #[cfg(test)]
             forced_routing: Vec::new(),
             executor,
@@ -316,6 +329,12 @@ impl FlashNextSession {
             .collect()
     }
 
+    /// Position du prochain token (oracles).
+    #[cfg(test)]
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
     /// Décode `token` à la position courante. `logits` et `layers` demandent la
     /// relecture des logits et des résiduels par couche (oracles).
     ///
@@ -324,6 +343,11 @@ impl FlashNextSession {
     /// Renvoie une erreur si la capacité est atteinte, sur lecture n-gram ou
     /// sur encodage et exécution Metal.
     pub(crate) fn step(&mut self, token: usize, logits: bool, layers: bool) -> Result<StepOutput> {
+        if self.poisoned {
+            return Err(InferError::Metal(
+                "Flash-Next résident : session invalidée par une erreur GPU antérieure".to_string(),
+            ));
+        }
         let c = &self.ckpt.config;
         if self.position >= self.capacity {
             return Err(InferError::Config(format!(
@@ -343,9 +367,11 @@ impl FlashNextSession {
             streams.extend_from_slice(row.data());
         }
         write_f32_buffer(&self.h[0], &streams)?;
-        // PLE : hachage et lectures n-gram terminés avant le commit.
+        // PLE : hachage sur un clone du contexte (engagé seulement si le pas
+        // aboutit) et lectures n-gram terminées avant le commit.
         let p = &self.ckpt.ngram_params;
-        let ids = self.ple_state.context.step(
+        let mut context = self.ple_state.context.clone();
+        let ids = context.step(
             token as u64,
             c.heads_per_ngram,
             &p.multipliers,
@@ -353,12 +379,80 @@ impl FlashNextSession {
             &p.offsets,
         );
         let mut bytes = vec![0_u8; c.ple_dim];
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_ngram_read) {
+            return Err(InferError::Config(
+                "lecture n-gram en échec (injectée)".to_string(),
+            ));
+        }
         self.ckpt.ngram_rows_raw(&ids, &mut bytes)?;
         self.ple_state.stage_bytes(&bytes)?;
         let host = host_started.elapsed();
 
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
+        // Métadonnées avancées pendant l'encodage, restaurées si celui-ci échoue :
+        // rien n'est soumis, le GPU n'a donc rien modifié.
+        let kv_lens: Vec<Option<usize>> = self
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Full(kv) => Some(kv.len()),
+                LayerState::Linear(_) => None,
+            })
+            .collect();
+        let ple_step = self.ple_state.step;
+        let queue = self.queue.clone();
+        let command_buffer = queue.new_command_buffer();
+        let guard = EncoderEndGuard::new(command_buffer.new_compute_command_encoder());
+        let encoded = self.encode_token(guard.encoder(), logits, layers);
+        if let Err(error) = encoded {
+            drop(guard);
+            self.ple_state.step = ple_step;
+            for (state, len) in self.states.iter_mut().zip(kv_lens) {
+                if let (LayerState::Full(kv), Some(len)) = (state, len) {
+                    if kv.truncate(len).is_err() {
+                        self.poisoned = true;
+                    }
+                }
+            }
+            return Err(error);
+        }
+        guard.end();
+        if let Err(error) = commit_and_wait(command_buffer) {
+            // Exécution GPU partielle possible : états récurrents et KV incertains.
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.ple_state.context = context;
+        self.position += 1;
+        let width = self.hc_dims.width();
+        let (vocab, layer_count) = (self.ckpt.config.vocab, self.ckpt.config.layer_kinds.len());
+        let argmax = read_u32_buffer(&self.index, 1)?
+            .first()
+            .copied()
+            .ok_or_else(|| InferError::Metal("argmax résident absent".to_string()))?;
+        Ok(StepOutput {
+            argmax,
+            logits: logits
+                .then(|| read_f32_buffer(&self.logits, vocab))
+                .transpose()?,
+            layers: layers
+                .then(|| {
+                    read_f32_buffer(&self.capture, layer_count * width)
+                        .map(|all| all.chunks_exact(width).map(<[f32]>::to_vec).collect())
+                })
+                .transpose()?,
+            host,
+        })
+    }
+
+    /// Encode les couches, le mixer final et le lm_head du token courant.
+    fn encode_token(
+        &mut self,
+        encoder: &ComputeCommandEncoderRef,
+        logits: bool,
+        layers: bool,
+    ) -> Result<()> {
+        let c = &self.ckpt.config;
         let mut owned = Vec::new();
         let width = self.hc_dims.width();
         let mut cur = 0_usize;
@@ -478,6 +572,16 @@ impl FlashNextSession {
                 &self.h[1 - cur],
             );
             cur = 1 - cur;
+            #[cfg(test)]
+            if self
+                .fail_encode_after_layer
+                .take_if(|after| *after == index)
+                .is_some()
+            {
+                return Err(InferError::Metal(format!(
+                    "encodage en échec après la couche {index} (injecté)"
+                )));
+            }
             if layers {
                 self.executor.encode_copy_with_offsets(
                     encoder,
@@ -518,25 +622,6 @@ impl FlashNextSession {
             &self.index,
             c.hidden,
         )?;
-        encoder.end_encoding();
-        commit_and_wait(command_buffer)?;
-        self.position += 1;
-        let argmax = read_u32_buffer(&self.index, 1)?
-            .first()
-            .copied()
-            .ok_or_else(|| InferError::Metal("argmax résident absent".to_string()))?;
-        Ok(StepOutput {
-            argmax,
-            logits: logits
-                .then(|| read_f32_buffer(&self.logits, c.vocab))
-                .transpose()?,
-            layers: layers
-                .then(|| {
-                    read_f32_buffer(&self.capture, c.layer_kinds.len() * width)
-                        .map(|all| all.chunks_exact(width).map(<[f32]>::to_vec).collect())
-                })
-                .transpose()?,
-            host,
-        })
+        Ok(())
     }
 }
