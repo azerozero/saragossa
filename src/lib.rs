@@ -36,6 +36,7 @@ pub mod norm;
 pub mod quantization;
 pub mod qwen4_exp;
 pub mod qwen_loader;
+pub(crate) mod rope;
 pub mod runtime;
 pub mod runtime_flags;
 pub mod runtime_preset;

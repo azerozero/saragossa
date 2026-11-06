@@ -879,6 +879,20 @@ impl CausalDecoder {
         }
         let t_arena_new = trace_setup.then(std::time::Instant::now);
         let mut arena = DecodeResidentState::new(metal.device().clone())?;
+        if let Some(theta) = self.config.rope_theta {
+            for index in 0..self.layers.len() {
+                if self.config.is_resident_full_attention_layer(index) {
+                    let head_dim = self.config.layer_head_dim(index)?;
+                    let fd = self.config.layer_rope_frequency_dim(index, head_dim);
+                    let theta = self
+                        .config
+                        .layer_rope_theta_override(index)
+                        .unwrap_or(theta);
+                    arena.rope_frequencies(theta, fd)?;
+                    metal.rope_frequencies(theta, fd)?;
+                }
+            }
+        }
         if let Some(t) = t_arena_new {
             eprintln!("mtp_setup arena_new_kernels_us={}", t.elapsed().as_micros());
         }

@@ -824,6 +824,7 @@ impl MetalExecutor {
         let moe_g_perm = compile_na("moe_g_perm");
 
         Ok(Self {
+            rope_frequencies: super::rope::RopeFrequencyCache::default(),
             device,
             queue,
             dense_matmul_rhs_t_f32,

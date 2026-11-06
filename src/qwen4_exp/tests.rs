@@ -565,7 +565,7 @@ fn qsa_selection_size_tail_and_excludable_current_block() {
     let budget = 8;
     let tokens = 40;
     let (x, w, d) = qsa_fixture(tokens, budget);
-    let freqs = super::math::inv_freq(d.rotary_dim, d.rope_theta);
+    let freqs = crate::rope::inv_freq(d.rotary_dim, d.rope_theta as f32);
     let selected = select_tokens(&x, &w, d, &freqs).expect("invariant: sélection");
     let c = d.compress;
     let mut excluded_current = false;

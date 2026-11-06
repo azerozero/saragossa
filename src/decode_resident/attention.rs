@@ -489,6 +489,12 @@ impl DecodeResidentState {
         Ok(())
     }
 
+    /// Résout le tampon partagé par decode, append et vérification en lignes.
+    pub(crate) fn rope_frequencies(&self, theta: f32, frequency_dim: usize) -> Result<Buffer> {
+        self.rope_frequencies
+            .get(&self.device, theta, frequency_dim)
+    }
+
     /// Encode rms_norm par tête + RoPE à la `position` du token courant (single-query)
     /// dans un encoder PARTAGÉ : `input [heads·head_dim]` → `output [heads·head_dim]`.
     /// `weight` = norme par tête `[head_dim]`. Reproduit `rms_norm_rope_heads_at`
@@ -595,13 +601,8 @@ impl DecodeResidentState {
             std::mem::size_of::<[f32; 2]>() as u64,
             params.as_ptr().cast::<c_void>(),
         );
-        let rope_frequency_dim = u32::try_from(rope_frequency_dim)
-            .map_err(|_| InferError::Dimension("rope frequency_dim hors u32".to_string()))?;
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            std::ptr::from_ref(&rope_frequency_dim).cast::<c_void>(),
-        );
+        let frequencies = self.rope_frequencies(base_theta, rope_frequency_dim)?;
+        encoder.set_buffer(5, Some(&frequencies), 0);
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(u64::from(to_u32(num_heads, "rope num_heads")?), 1, 1),
@@ -2164,6 +2165,7 @@ impl FullAttentionMetalState {
         v_buf: &BufferRef,
         v_offset: u64,
         rope: &FullAttnLayerDims,
+        frequencies: &BufferRef,
     ) -> Result<bool> {
         let pipeline = match self.format {
             KvFormat::F32 => &self.rope_append_kv[0],
@@ -2183,8 +2185,6 @@ impl FullAttentionMetalState {
         let offset = byte_offset(self.len * self.kv_dim(), element, "rope append KV offset")?;
         let dims = rope_dims_param(self.kv_heads, self.head_dim, rope.rope_dims, rope.position)?;
         let params: [f32; 2] = [rope.eps, rope.theta];
-        let frequency_dim = u32::try_from(rope.rope_frequency_dim)
-            .map_err(|_| InferError::Dimension("rope frequency_dim hors u32".to_string()))?;
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(k_raw), k_offset);
         encoder.set_buffer(1, Some(k_norm), 0);
@@ -2195,11 +2195,7 @@ impl FullAttentionMetalState {
             std::mem::size_of::<[f32; 2]>() as u64,
             params.as_ptr().cast::<c_void>(),
         );
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            std::ptr::from_ref(&frequency_dim).cast::<c_void>(),
-        );
+        encoder.set_buffer(5, Some(frequencies), 0);
         encoder.set_buffer(6, Some(v_buf), v_offset);
         encoder.set_buffer(7, Some(self.values.buffer()), offset);
         crate::metal_backend::profile_dispatch();

@@ -8700,6 +8700,7 @@ kernel void rms_norm_rope_heads_f32(
     device float* out [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
     constant float4& params [[buffer(4)]],
+    device const float* inv_freq [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
@@ -8708,8 +8709,6 @@ kernel void rms_norm_rope_heads_f32(
     const uint head_dim = dims.z;
     const uint rope_dims = dims.w;
     const float eps = params.x;
-    const float base_theta = params.y;
-    const float frequency_dim = params.z;
     const uint head = tile.x;
     const uint pos = tile.y;
     if (head >= heads || pos >= seq) {
@@ -8739,16 +8738,17 @@ kernel void rms_norm_rope_heads_f32(
     for (uint col = tid; col < head_dim; col += 256u) {
         float value = input[start + col] * inv_rms * weight[col];
         if (col < rope_dims) {
-            // Rotate-half : la paire (pair, pair+pairs) tourne a la frequence
-            // d'exposant 2*pair/frequency_dim (miroir CPU rms_norm_rope_heads_at).
+            // Les fréquences hôte partagent les arrondis f32 de la référence CPU.
             const uint pair = (col < pairs) ? col : (col - pairs);
-            const float exponent = float(2u * pair) / frequency_dim;
             // params.w : position absolue de la première ligne (prefill par morceaux).
-            const float angle = (float(pos) + params.w) / pow(base_theta, exponent);
-            const float c = cos(angle);
-            const float s = sin(angle);
+            // pos + offset < 2^24 conserve l’identité des positions f32 avec le decode.
+            const float angle = (float(pos) + params.w) * inv_freq[pair];
+            const float c = precise::cos(angle);
+            const float s = precise::sin(angle);
             const float first = input[start + pair] * inv_rms * weight[pair];
             const float second = input[start + pair + pairs] * inv_rms * weight[pair + pairs];
+            // Fast-math peut contracter first*c - second*s en FMA ;
+            // cet écart est admis sous la porte CPU de 1e-5.
             value = (col < pairs) ? (first * c - second * s) : (first * s + second * c);
         }
         out[start + col] = value;

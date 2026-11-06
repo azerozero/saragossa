@@ -191,7 +191,7 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
     device float* out [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
     constant float2& params [[buffer(4)]],
-    constant uint& frequency_dim [[buffer(5)]],
+    device const float* inv_freq [[buffer(5)]],
     constant uint2& strides [[buffer(6)]],
 #ifdef TREE_ROWS
     // Arbre : la ligne tourne à `dims.w + profondeur` (frères à la même position).
@@ -211,7 +211,6 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
     const uint position = dims.w + row;
 #endif
     const float eps = params.x;
-    const float base_theta = params.y;
     if (head >= heads) { return; }
     input += row * strides.x;
     out += row * strides.y;
@@ -235,12 +234,13 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
         float value = input[start + col] * inv_rms * weight[col];
         if (col < rope_dims) {
             const uint pair = (col < pairs) ? col : (col - pairs);
-            const float exponent = float(2u * pair) / float(frequency_dim);
-            const float angle = float(position) / pow(base_theta, exponent);
-            const float c = cos(angle);
-            const float s = sin(angle);
+            const float angle = float(position) * inv_freq[pair];
+            const float c = precise::cos(angle);
+            const float s = precise::sin(angle);
             const float first = input[start + pair] * inv_rms * weight[pair];
             const float second = input[start + pair + pairs] * inv_rms * weight[pair + pairs];
+            // Fast-math peut contracter first*c - second*s en FMA ;
+            // cet écart est admis sous la porte CPU de 1e-5.
             value = (col < pairs) ? (first * c - second * s) : (first * s + second * c);
         }
         out[start + col] = value;
@@ -888,7 +888,7 @@ impl DecodeResidentState {
             to_u32(position, "rope rows position")?,
         ];
         let params: [f32; 2] = [eps, base_theta];
-        let frequency_dim = to_u32(rope_frequency_dim, "rope rows frequency_dim")?;
+        let frequencies = self.rope_frequencies(base_theta, rope_frequency_dim)?;
         let strides = [
             to_u32(input_stride, "rope rows input_stride")?,
             to_u32(output_stride, "rope rows output_stride")?,
@@ -904,7 +904,7 @@ impl DecodeResidentState {
         encoder.set_buffer(2, Some(output), 0);
         set_bytes(encoder, 3, &dims);
         set_bytes(encoder, 4, &params);
-        set_bytes(encoder, 5, &[frequency_dim]);
+        encoder.set_buffer(5, Some(&frequencies), 0);
         set_bytes(encoder, 6, &strides);
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(

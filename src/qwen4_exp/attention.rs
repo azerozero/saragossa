@@ -15,7 +15,9 @@
 
 use rayon::prelude::*;
 
-use super::math::{inv_freq, linear, rms_norm_1p, rope_in_place, sigmoid};
+use crate::rope::inv_freq;
+
+use super::math::{linear, rms_norm_1p, rope_in_place, sigmoid};
 use crate::{InferError, Result, Tensor};
 
 /// Poids d'une couche QSA (déquantifiés en f32).
@@ -231,7 +233,7 @@ pub(crate) fn qsa(
             "qsa: dimensions incohérentes".to_string(),
         ));
     }
-    let freqs = inv_freq(d.rotary_dim, d.rope_theta);
+    let freqs = inv_freq(d.rotary_dim, d.rope_theta as f32);
     let scores = block_scores(x, w, d, &freqs)?;
     let selected = select_from_scores(&scores, d);
     let used = match forced {

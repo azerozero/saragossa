@@ -960,8 +960,9 @@ impl DecodeResidentState {
         // TODO: élargir l'append fusionné à Qwen et Gemma (value_norm, V séparé,
         // K=V) après un A/B intégré aux dimensions réelles ; seul flint (sinks)
         // est prouvé sur poids réels.
-        let fused = kv.has_sinks()
-            && kv.encode_rope_append_kv(
+        let fused = if kv.has_sinks() {
+            let frequencies = self.rope_frequencies(dims.theta, dims.rope_frequency_dim)?;
+            kv.encode_rope_append_kv(
                 encoder,
                 k_source,
                 k_offset,
@@ -969,7 +970,11 @@ impl DecodeResidentState {
                 v_source,
                 v_offset,
                 &dims,
-            )?;
+                &frequencies,
+            )?
+        } else {
+            false
+        };
         if !fused {
             self.encode_rms_norm_rope_decode_with_offset(
                 encoder,
