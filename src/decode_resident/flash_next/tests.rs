@@ -306,13 +306,13 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         return Ok(());
     };
     let arena = DecodeResidentState::new(executor.device().clone())?;
+    let kernels = FlashNextKernels::new(executor.device())?;
     let dims = QsaDecodeDims {
         hidden: 2560,
         heads: 24,
         kv_heads: 2,
         head_dim: 256,
         rotary_dim: 64,
-        theta: 1.0e7,
         eps: 1.0e-6,
         dense_max: dense_max_visible(2048, 4),
     };
@@ -367,6 +367,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         o_proj: o_gpu,
         q_norm: buffer(&executor, &one_plus(&q_norm)),
         k_norm: buffer(&executor, &one_plus(&k_norm)),
+        freqs: buffer(&executor, &crate::qwen4_exp::math::inv_freq(64, 1.0e7)),
         indexer: None,
     };
     let capacity = tokens.max(64);
@@ -390,7 +391,8 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         let command_buffer = queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         encode_qsa(
-            &arena, &executor, encoder, &mut kv, &weights, &scratch, dims, None, t, &x_buf, &out,
+            &arena, &kernels, &executor, encoder, &mut kv, &weights, &scratch, dims, None, t,
+            &x_buf, &out,
         )?;
         encoder.end_encoding();
         commit_and_wait(command_buffer)?;
@@ -404,6 +406,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
     let x_buf = zeros(&executor, dims.hidden);
     let refused = encode_qsa(
         &arena,
+        &kernels,
         &executor,
         encoder,
         &mut kv,
@@ -469,17 +472,27 @@ fn kl_logits(p: &[f32], q: &[f32]) -> f64 {
     lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum()
 }
 
+/// Seuils d'imposition : marge de probabilité du routage, marge relative QSA.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Ties {
+    routing: f32,
+    qsa: f32,
+}
+
 /// Mode d'une passe N2 résidente.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RoutingMode {
-    /// Routage propre du GPU.
+    /// Routage et sélection propres du GPU.
     Native,
-    /// Experts du CPU imposés aux points de marge de probabilité ≤ seuil.
-    Forced(f32),
-    /// Comme `Forced(seuil)`, plus un mauvais expert imposé à `(token, couche)`.
-    Mutation(usize, usize, f32),
-    /// Comme `Forced(seuil)`, plus un mauvais bloc QSA imposé à `(token, couche)`.
-    QsaMutation(usize, usize, f32),
+    /// Comme `Native`, plus un mauvais bloc QSA imposé à `(token, couche)`
+    /// (puissance de l'oracle ré-ancré).
+    NativeQsaMutation(usize, usize),
+    /// Choix du CPU imposés aux points de marge ≤ seuils.
+    Forced(Ties),
+    /// Comme `Forced`, plus un mauvais expert imposé à `(token, couche)`.
+    Mutation(usize, usize, Ties),
+    /// Comme `Forced`, plus un mauvais bloc QSA imposé à `(token, couche)`.
+    QsaMutation(usize, usize, Ties),
 }
 
 /// Sélection QSA GPU d'une couche : blocs retenus, scores, blocs natifs.
@@ -504,52 +517,94 @@ struct TokenReport {
     qsa_native_unjustified: usize,
     /// Couches QSA dont la sélection a été imposée à ce token.
     qsa_imposed: Vec<usize>,
+    /// Passes natives : `(couche QSA, entrée GPU, sortie GPU)`.
+    anchors: Vec<(usize, Vec<f32>, Vec<f32>)>,
 }
 
-/// Blocs retenus par le CPU au token `t` d'une couche QSA en régime creux.
-fn cpu_blocks(cpu: &CpuChain, layer: usize, t: usize) -> Option<Vec<usize>> {
-    let trace = cpu.qsa[layer].as_ref()?;
-    let complete = trace.scores[t].len();
-    (complete > cpu.keep).then(|| {
-        trace.selected[t][..cpu.keep * cpu.compress]
-            .chunks_exact(cpu.compress)
-            .map(|c| c[0] / cpu.compress)
+/// Blocs retenus au token `t` d'une trace QSA en régime creux.
+fn trace_blocks(
+    trace: &crate::qwen4_exp::QsaTrace,
+    t: usize,
+    keep: usize,
+    compress: usize,
+) -> Option<Vec<usize>> {
+    (trace.scores[t].len() > keep).then(|| {
+        trace.selected[t][..keep * compress]
+            .chunks_exact(compress)
+            .map(|c| c[0] / compress)
             .collect()
     })
 }
 
-/// Score CPU du dernier bloc retenu (seuil du top-k QSA) et marge relative au
+/// Score du dernier bloc retenu (seuil du top-k QSA) et marge relative au
 /// premier bloc écarté : `(s_keep − s_keep+1) / max(|s_keep|, 1)`.
-fn qsa_threshold(cpu: &CpuChain, layer: usize, t: usize) -> Option<(f32, f32)> {
-    let trace = cpu.qsa[layer].as_ref()?;
-    let row = &trace.scores[t];
-    if row.len() <= cpu.keep {
+fn row_threshold(row: &[f32], keep: usize) -> Option<(f32, f32)> {
+    if row.len() <= keep {
         return None;
     }
-    let mut sorted = row.clone();
+    let mut sorted = row.to_vec();
     sorted.sort_by(|a, b| b.total_cmp(a));
-    let threshold = sorted[cpu.keep - 1];
+    let threshold = sorted[keep - 1];
     Some((
         threshold,
-        (threshold - sorted[cpu.keep]) / threshold.abs().max(1.0),
+        (threshold - sorted[keep]) / threshold.abs().max(1.0),
     ))
 }
 
-/// Vrai si l'échange entre les blocs GPU et CPU ne porte que sur des blocs dont
-/// le score CPU est à `tie` (relatif) du seuil.
-fn qsa_swap_justified(cpu: &CpuChain, layer: usize, t: usize, gpu: &[usize], tie: f32) -> bool {
-    let (Some(want), Some((threshold, _)), Some(trace)) = (
-        cpu_blocks(cpu, layer, t),
-        qsa_threshold(cpu, layer, t),
-        cpu.qsa[layer].as_ref(),
-    ) else {
+/// Vrai si `gpu` ne diffère de `want` que par des blocs dont le score `row`
+/// est à `tie` (relatif à `max(|seuil|, 1)`) du seuil.
+fn swap_justified(row: &[f32], want: &[usize], gpu: &[usize], keep: usize, tie: f32) -> bool {
+    let Some((threshold, _)) = row_threshold(row, keep) else {
         return false;
     };
-    let row = &trace.scores[t];
+    // Sélection GPU bien formée : `keep` blocs distincts, triés, complets.
+    // Sinon un doublon (`[0, 0]` contre `[0, 1]` à scores nuls) passerait.
+    if gpu.len() != keep
+        || gpu.windows(2).any(|w| w[0] >= w[1])
+        || gpu.last().is_some_and(|&b| b >= row.len())
+    {
+        return false;
+    }
     gpu.iter()
         .filter(|b| !want.contains(b))
         .chain(want.iter().filter(|b| !gpu.contains(b)))
         .all(|&b| b < row.len() && (row[b] - threshold).abs() <= tie * threshold.abs().max(1.0))
+}
+
+/// Écart max des scores GPU aux scores `want`, dans l'unité des marges QSA :
+/// `max_b |g_b − w_b| / max(|seuil|, 1)` (NaN si longueurs ou valeurs
+/// incohérentes).
+fn score_error(gpu: &[f32], want: &[f32], keep: usize) -> f64 {
+    let Some((threshold, _)) = row_threshold(want, keep) else {
+        // CPU dense : le GPU ne doit pas avoir de scores creux.
+        return if gpu.is_empty() { 0.0 } else { f64::NAN };
+    };
+    if gpu.len() != want.len() {
+        return f64::NAN;
+    }
+    let scale = f64::from(threshold.abs().max(1.0));
+    gpu.iter()
+        .zip(want)
+        .map(|(g, w)| f64::from((g - w).abs()) / scale)
+        .fold(0.0, nan_max)
+}
+
+/// Blocs retenus par le CPU au token `t` d'une couche QSA en régime creux.
+fn cpu_blocks(cpu: &CpuChain, layer: usize, t: usize) -> Option<Vec<usize>> {
+    trace_blocks(cpu.qsa[layer].as_ref()?, t, cpu.keep, cpu.compress)
+}
+
+/// Seuil et marge relative QSA du CPU au token `t` ([`row_threshold`]).
+fn qsa_threshold(cpu: &CpuChain, layer: usize, t: usize) -> Option<(f32, f32)> {
+    row_threshold(&cpu.qsa[layer].as_ref()?.scores[t], cpu.keep)
+}
+
+/// [`swap_justified`] sur la chaîne CPU.
+fn qsa_swap_justified(cpu: &CpuChain, layer: usize, t: usize, gpu: &[usize], tie: f32) -> bool {
+    let (Some(want), Some(trace)) = (cpu_blocks(cpu, layer, t), cpu.qsa[layer].as_ref()) else {
+        return false;
+    };
+    swap_justified(&trace.scores[t], &want, gpu, cpu.keep, tie)
 }
 
 /// Référence CPU d'une séquence.
@@ -618,12 +673,13 @@ fn run_resident_pass(
     let (width, vocab) = (cpu.width, cpu.vocab);
     let mut reports = Vec::with_capacity(steps);
     for (t, &token) in ids.iter().enumerate().take(steps) {
-        let threshold = match mode {
-            RoutingMode::Native => None,
-            RoutingMode::Forced(th)
-            | RoutingMode::Mutation(_, _, th)
-            | RoutingMode::QsaMutation(_, _, th) => Some(th),
+        let ties = match mode {
+            RoutingMode::Native | RoutingMode::NativeQsaMutation(..) => None,
+            RoutingMode::Forced(ties)
+            | RoutingMode::Mutation(_, _, ties)
+            | RoutingMode::QsaMutation(_, _, ties) => Some(ties),
         };
+        let (threshold, qsa_tie) = (ties.map(|t| t.routing), ties.map(|t| t.qsa));
         session.forced_routing = (0..layers)
             .map(|layer| {
                 let set = &cpu.routing[layer][t];
@@ -647,7 +703,11 @@ fn run_resident_pass(
             .collect();
         session.forced_selection = (0..layers)
             .map(|layer| {
-                if matches!(mode, RoutingMode::QsaMutation(mt, ml, _) if (mt, ml) == (t, layer)) {
+                if matches!(
+                    mode,
+                    RoutingMode::QsaMutation(mt, ml, _) | RoutingMode::NativeQsaMutation(mt, ml)
+                        if (mt, ml) == (t, layer)
+                ) {
                     // Un bloc retenu remplacé par le premier bloc complet écarté.
                     let blocks = cpu_blocks(cpu, layer, t)?;
                     let outsider = (0..).find(|b| !blocks.contains(b))?;
@@ -656,7 +716,7 @@ fn run_resident_pass(
                     wrong.sort_unstable();
                     return Some(wrong);
                 }
-                let th = threshold?;
+                let th = qsa_tie?;
                 let (_, margin) = qsa_threshold(cpu, layer, t)?;
                 (margin <= th).then(|| {
                     cpu_blocks(cpu, layer, t)
@@ -675,6 +735,18 @@ fn run_resident_pass(
             .step(token, true, true)
             .expect("invariant: pas résident");
         let got_layers = out.layers.expect("invariant: résiduels");
+        // Passes natives : entrée (sortie GPU de la couche précédente) et
+        // sortie de chaque couche QSA, pour l'oracle ré-ancré.
+        // La couche 0 n'est pas QSA (vérifié par l'appelant) : son entrée
+        // serait l'embedding. En mutation, seule la couche mutée est gardée.
+        let anchors = match mode {
+            RoutingMode::Native | RoutingMode::NativeQsaMutation(..) => (1..layers)
+                .filter(|&l| cpu.qsa[l].is_some())
+                .filter(|&l| !matches!(mode, RoutingMode::NativeQsaMutation(_, ml) if ml != l))
+                .map(|l| (l, got_layers[l - 1].clone(), got_layers[l].clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
         let layer_errors = got_layers
             .iter()
             .enumerate()
@@ -736,7 +808,7 @@ fn run_resident_pass(
             .iter()
             .enumerate()
             .filter(|(l, entry)| {
-                threshold.is_some_and(|th| {
+                qsa_tie.is_some_and(|th| {
                     session.forced_selection.len() == layers
                         && entry.as_ref().is_some_and(|(_, _, native)| {
                             qsa_imposed_now.contains(l)
@@ -754,9 +826,170 @@ fn run_resident_pass(
             qsa,
             qsa_imposed,
             qsa_native_unjustified,
+            anchors,
         });
     }
     reports
+}
+
+/// Seuil de l'oracle ré-ancré : quasi-égalités (routage, sélection QSA) et
+/// écart des scores de l'indexeur, dans l'unité des marges.
+const ANCHORED_TIE: f32 = 1.0e-5;
+/// Écart relatif admis sur la sortie d'une couche QSA ré-ancrée. La couche 0,
+/// aux entrées identiques, s'écarte déjà de 1,1e-5 (N2 de l'étape 4) : 1e-5
+/// serait sous le bruit des kernels, 1e-4 reste dix fois sous la porte de
+/// bout en bout (1e-3). Une mutation numérique de 2e-4 doit la faire rougir.
+const ANCHORED_OUTPUT_TOL: f64 = 1.0e-4;
+
+/// Bilan de l'oracle ré-ancré sur une couche QSA.
+#[derive(Debug)]
+struct AnchoredLayer {
+    layer: usize,
+    /// Écart max des scores GPU/CPU ([`score_error`]).
+    score_error: f64,
+    /// Sélections différentes, dont non justifiées à [`ANCHORED_TIE`].
+    selection_swaps: usize,
+    selection_unjustified: usize,
+    /// Routages différents, dont non justifiés (marge > seuil ou autre
+    /// échange que la paire au seuil).
+    routing_swaps: usize,
+    routing_unjustified: usize,
+    /// Écart relatif max de la sortie (NaN si non finie).
+    output_error: f64,
+}
+
+impl AnchoredLayer {
+    fn green(&self) -> bool {
+        // Scores à la moitié du seuil : une erreur ε par score ne peut alors
+        // échanger que des blocs à 2ε ≤ ANCHORED_TIE du seuil, que la
+        // justification couvre.
+        within(self.score_error, f64::from(ANCHORED_TIE) / 2.0)
+            && self.selection_unjustified == 0
+            && self.routing_unjustified == 0
+            && within(self.output_error, ANCHORED_OUTPUT_TOL)
+    }
+}
+
+/// Oracle local ré-ancré : chaque couche QSA CPU repart, sur toute la
+/// séquence, des entrées GPU de la passe native (`anchors`), sélection et
+/// routage GPU imposés. Les choix propres du CPU (trace et routage naturels)
+/// justifient ceux du GPU ; la sortie compare les kernels seuls, sans dérive
+/// accumulée.
+fn anchored_qsa_layers(
+    reference: &crate::qwen4_exp::Qwen4ExpReference,
+    ids: &[usize],
+    reports: &[TokenReport],
+    keep: usize,
+    compress: usize,
+    only: Option<usize>,
+) -> Vec<AnchoredLayer> {
+    let tokens = reports.len();
+    let Some(first) = reports.first() else {
+        return Vec::new();
+    };
+    let layers: Vec<usize> = first
+        .anchors
+        .iter()
+        .map(|a| a.0)
+        .filter(|&l| only.is_none_or(|o| o == l))
+        .collect();
+    let mut summary = Vec::new();
+    for &layer in &layers {
+        let slot = first
+            .anchors
+            .iter()
+            .position(|a| a.0 == layer)
+            .expect("invariant: ancre de la couche");
+        let width = first.anchors[slot].1.len();
+        let input: Vec<f32> = reports
+            .iter()
+            .flat_map(|r| r.anchors[slot].1.iter().copied())
+            .collect();
+        let input = crate::Tensor::from_vec(vec![tokens, width], input)
+            .expect("invariant: entrées ré-ancrées");
+        // Sélection GPU effectivement utilisée : blocs retenus puis queue en
+        // régime creux, tous les tokens visibles en régime dense.
+        let selection: Vec<Vec<usize>> = reports
+            .iter()
+            .enumerate()
+            .map(|(t, r)| match &r.qsa[layer] {
+                Some((blocks, _, _)) => {
+                    let complete = (t + 1) / compress;
+                    blocks
+                        .iter()
+                        .flat_map(|&b| b * compress..(b + 1) * compress)
+                        .chain(complete * compress..=t)
+                        .collect()
+                }
+                None => (0..=t).collect(),
+            })
+            .collect();
+        let routing: Vec<Option<Vec<usize>>> = reports
+            .iter()
+            .map(|r| Some(r.routing[layer].clone()))
+            .collect();
+        let out = reference
+            .layer_forced(
+                layer,
+                &input,
+                &ids[..tokens],
+                Some(&selection),
+                Some(&routing),
+            )
+            .expect("invariant: couche CPU ré-ancrée");
+        let trace = out.qsa.as_ref().expect("invariant: trace QSA");
+        let mut entry = AnchoredLayer {
+            layer,
+            score_error: 0.0,
+            selection_swaps: 0,
+            selection_unjustified: 0,
+            routing_swaps: 0,
+            routing_unjustified: 0,
+            output_error: 0.0,
+        };
+        for (t, r) in reports.iter().enumerate() {
+            let gpu_routing = &r.routing[layer];
+            if *gpu_routing != out.routing[t] {
+                entry.routing_swaps += 1;
+                let (kth, next) = out.routing_boundary[t];
+                let pair_only = gpu_routing
+                    .iter()
+                    .filter(|e| !out.routing[t].contains(e))
+                    .eq([&next])
+                    && out.routing[t]
+                        .iter()
+                        .filter(|e| !gpu_routing.contains(e))
+                        .eq([&kth]);
+                if !(pair_only && out.routing_margins[t] <= ANCHORED_TIE) {
+                    entry.routing_unjustified += 1;
+                }
+            }
+            if let Some((blocks, scores, _)) = &r.qsa[layer] {
+                entry.score_error = nan_max(
+                    entry.score_error,
+                    score_error(scores, &trace.scores[t], keep),
+                );
+                let want = trace_blocks(trace, t, keep, compress).unwrap_or_default();
+                if *blocks != want {
+                    entry.selection_swaps += 1;
+                    if !swap_justified(&trace.scores[t], &want, blocks, keep, ANCHORED_TIE) {
+                        entry.selection_unjustified += 1;
+                    }
+                }
+            } else if trace.scores[t].len() > keep {
+                // Régime creux côté CPU sans capture GPU : incohérence.
+                entry.selection_unjustified += 1;
+            }
+            let row = &out.hidden.data()[t * width..(t + 1) * width];
+            entry.output_error = nan_max(
+                entry.output_error,
+                finite_relative_error(&r.anchors[slot].2, row),
+            );
+        }
+        eprintln!("ré-ancrée, couche {} : {entry:?}", entry.layer);
+        summary.push(entry);
+    }
+    summary
 }
 
 /// Synthèse d'une passe sur un préfixe.
@@ -774,6 +1007,23 @@ struct Summary {
     qsa_mismatches: usize,
     /// Points QSA imposés dont la sélection native n'est pas justifiée.
     qsa_native_unjustified: usize,
+}
+
+/// Points QSA non imposés où le GPU retient d'autres blocs que le CPU :
+/// `(token, couche, marge CPU au seuil)`.
+fn qsa_mismatch_points(reports: &[TokenReport], cpu: &CpuChain) -> Vec<(usize, usize, f32)> {
+    reports
+        .iter()
+        .enumerate()
+        .flat_map(|(t, r)| {
+            (0..r.qsa.len())
+                .filter(move |&l| {
+                    !r.qsa_imposed.contains(&l)
+                        && r.qsa[l].as_ref().map(|(b, _, _)| b) != cpu_blocks(cpu, l, t).as_ref()
+                })
+                .map(move |l| (t, l, qsa_threshold(cpu, l, t).map_or(f32::NAN, |(_, m)| m)))
+        })
+        .collect()
 }
 
 /// Synthèse d'une passe sur le préfixe `[0, prefix)`.
@@ -970,6 +1220,7 @@ fn n2_gate_refuses_late_nan_and_native_check_refuses_early_drift() {
         qsa: vec![None],
         qsa_imposed: Vec::new(),
         qsa_native_unjustified: 0,
+        anchors: Vec::new(),
     };
     let clean: Vec<TokenReport> = (0..4).map(|_| report(1.0e-6, 1.0e-9)).collect();
     assert!(forced_gate_green(&summarize(&clean, &cpu, 4)));
@@ -1074,6 +1325,7 @@ fn n2_resident_decode_matches_cpu_reference() {
         .filter(|&p| p <= tokens)
         .collect();
     prefixes.dedup();
+    assert!(cpu.qsa[0].is_none(), "couche 0 QSA : entrée non ancrable");
     let native = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Native, tokens);
     let native_first = native_check(&native, &cpu);
     // Erreur des scores GPU de l'indexeur avant la première divergence (calibre
@@ -1083,15 +1335,15 @@ fn n2_resident_decode_matches_cpu_reference() {
         .ok()
         .and_then(|f| f.map(|(t, _, _)| t))
         .unwrap_or(tokens);
-    let mut score_error = 0.0_f64;
+    let mut early_error = 0.0_f64;
     for (t, r) in native[..horizon].iter().enumerate() {
         for (l, entry) in r.qsa.iter().enumerate() {
             if let (Some((_, gpu, _)), Some(trace)) = (entry, cpu.qsa[l].as_ref()) {
-                score_error = nan_max(score_error, relative_error(gpu, &trace.scores[t]).0);
+                early_error = nan_max(early_error, relative_error(gpu, &trace.scores[t]).0);
             }
         }
     }
-    eprintln!("scores de l'indexeur GPU/CPU avant la première divergence : écart relatif max {score_error:.2e}");
+    eprintln!("scores de l'indexeur GPU/CPU avant la première divergence : écart relatif max {early_error:.2e}");
     for th in TIE_THRESHOLDS {
         let n = (0..tokens)
             .flat_map(|t| (0..cpu.layers.len()).map(move |l| (t, l)))
@@ -1115,11 +1367,55 @@ fn n2_resident_decode_matches_cpu_reference() {
             s.worst, s.kl, s.swaps.len(), s.bad, s.first
         );
     }
+    // Oracle local ré-ancré (porte stricte) : chaque couche QSA CPU repart des
+    // entrées GPU de la passe native, sans dérive accumulée.
+    let anchored = anchored_qsa_layers(&reference, &ids, &native, cpu.keep, cpu.compress, None);
+    let anchored_green = !anchored.is_empty() && anchored.iter().all(AnchoredLayer::green);
     drop(native);
+
+    // Contrôle de dérive de bout en bout. Le seuil QSA est fixé avant la
+    // validation : 4 × l'écart max des scores GPU/CPU sur la première moitié
+    // du régime creux (passe de calibration, routage et QSA imposés au seuil
+    // le plus large), puis validé sur toute la séquence sans réglage.
+    let widest = TIE_THRESHOLDS[TIE_THRESHOLDS.len() - 1];
+    let sparse_start = dense_max_visible(cpu.keep * cpu.compress, cpu.compress).min(tokens);
+    let mid = sparse_start + (tokens - sparse_start) / 2;
+    let calibration = run_resident_pass(
+        &dir,
+        &ids,
+        &cpu,
+        RoutingMode::Forced(Ties {
+            routing: widest,
+            qsa: widest,
+        }),
+        mid,
+    );
+    let mut calibration_error = 0.0_f64;
+    for (t, r) in calibration.iter().enumerate().skip(sparse_start) {
+        for (l, entry) in r.qsa.iter().enumerate() {
+            if let (Some((_, gpu, _)), Some(trace)) = (entry, cpu.qsa[l].as_ref()) {
+                calibration_error = nan_max(
+                    calibration_error,
+                    score_error(gpu, &trace.scores[t], cpu.keep),
+                );
+            }
+        }
+    }
+    drop(calibration);
+    let qsa_tie = (4.0 * calibration_error) as f32;
+    eprintln!(
+        "calibration QSA (tokens {sparse_start}..{mid}) : écart max des scores {calibration_error:.2e}, \
+         seuil QSA {qsa_tie:.2e}"
+    );
+    assert!(qsa_tie.is_finite(), "calibration QSA non finie");
 
     let mut chosen = None;
     for th in TIE_THRESHOLDS {
-        let forced = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Forced(th), tokens);
+        let ties = Ties {
+            routing: th,
+            qsa: qsa_tie,
+        };
+        let forced = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Forced(ties), tokens);
         let mut green = true;
         for &prefix in &prefixes {
             let s = summarize(&forced, &cpu, prefix);
@@ -1151,9 +1447,16 @@ fn n2_resident_decode_matches_cpu_reference() {
                 }
             }
         }
+        let sparse_points = forced
+            .iter()
+            .map(|r| r.qsa.iter().filter(|e| e.is_some()).count())
+            .sum::<usize>()
+            .max(1);
         eprintln!(
             "imposée ≤ {th:.0e} : scores de l'indexeur GPU/CPU écart relatif max \
-             {forced_score_error:.2e}, {qsa_imposed_points} sélections QSA imposées"
+             {forced_score_error:.2e}, {qsa_imposed_points} sélections QSA imposées sur \
+             {sparse_points} points creux ({:.2} %)",
+            100.0 * qsa_imposed_points as f64 / sparse_points as f64
         );
         green &= within(forced_score_error, 1.0e-3);
         let by_layer: Vec<String> = (0..cpu.layers.len())
@@ -1168,13 +1471,21 @@ fn n2_resident_decode_matches_cpu_reference() {
             "imposée ≤ {th:.0e}, écart max par couche : {}",
             by_layer.join(" ")
         );
+        let mismatches = qsa_mismatch_points(&forced, &cpu);
+        eprintln!(
+            "imposée ≤ {th:.0e} : sélections QSA ≠ hors imposition (token, couche, marge) {:?}",
+            &mismatches[..mismatches.len().min(40)]
+        );
         if green {
             chosen = Some(th);
             break;
         }
     }
-    let threshold = chosen.unwrap_or(TIE_THRESHOLDS[TIE_THRESHOLDS.len() - 1]);
-    eprintln!("seuil retenu : {chosen:?}");
+    let ties = Ties {
+        routing: chosen.unwrap_or(widest),
+        qsa: qsa_tie,
+    };
+    eprintln!("seuil de routage retenu : {chosen:?}");
 
     // Mutations : un mauvais expert imposé au point de plus grande marge CPU,
     // tôt (tokens 8 à 63) puis tard (64 tokens après la première bascule
@@ -1196,7 +1507,7 @@ fn n2_resident_decode_matches_cpu_reference() {
             &dir,
             &ids,
             &cpu,
-            RoutingMode::Mutation(token, layer, threshold),
+            RoutingMode::Mutation(token, layer, ties),
             steps,
         );
         let s = summarize(&mutated, &cpu, steps);
@@ -1211,7 +1522,6 @@ fn n2_resident_decode_matches_cpu_reference() {
     }
     // Mutations QSA : un mauvais bloc imposé au point de plus grande marge QSA
     // relative, au début du régime creux puis sur les 128 derniers tokens.
-    let sparse_start = dense_max_visible(cpu.keep * cpu.compress, cpu.compress);
     let late = tokens.saturating_sub(128).max(sparse_start + 64);
     for range in [sparse_start..tokens.min(sparse_start + 64), late..tokens] {
         if range.is_empty() {
@@ -1228,7 +1538,7 @@ fn n2_resident_decode_matches_cpu_reference() {
             &dir,
             &ids,
             &cpu,
-            RoutingMode::QsaMutation(token, layer, threshold),
+            RoutingMode::QsaMutation(token, layer, ties),
             steps,
         );
         let s = summarize(&mutated, &cpu, steps);
@@ -1244,6 +1554,64 @@ fn n2_resident_decode_matches_cpu_reference() {
             "mutation QSA au token {token} non détectée"
         );
     }
+    // Puissance de l'oracle ré-ancré : un mauvais bloc imposé en passe native,
+    // au dernier token et sur la couche QSA de plus grande marge, doit le
+    // faire rougir.
+    if tokens > sparse_start {
+        let token = tokens - 1;
+        let layer = (0..cpu.layers.len())
+            .filter_map(|l| qsa_threshold(&cpu, l, token).map(|(_, m)| (l, m)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(l, _)| l)
+            .expect("invariant: une couche QSA en régime creux");
+        let mut mutated = run_resident_pass(
+            &dir,
+            &ids,
+            &cpu,
+            RoutingMode::NativeQsaMutation(token, layer),
+            tokens,
+        );
+        let check = anchored_qsa_layers(
+            &reference,
+            &ids,
+            &mutated,
+            cpu.keep,
+            cpu.compress,
+            Some(layer),
+        );
+        // Mutation numérique : la sortie GPU du token précédent, sur cette
+        // couche, est mise à l'échelle de 1 + 2e-4 (sélections intactes avant
+        // `token`) ; seule la porte de sortie doit rougir.
+        let mut scaled: Vec<TokenReport> = mutated.drain(..token).collect();
+        for v in &mut scaled[token - 1].anchors[0].2 {
+            *v *= 1.0 + 2.0e-4;
+        }
+        let numeric = anchored_qsa_layers(
+            &reference,
+            &ids,
+            &scaled,
+            cpu.keep,
+            cpu.compress,
+            Some(layer),
+        );
+        assert!(
+            numeric
+                .iter()
+                .any(|c| !within(c.output_error, ANCHORED_OUTPUT_TOL)
+                    && c.selection_unjustified == 0
+                    && c.routing_unjustified == 0),
+            "mutation numérique non détectée par l'oracle ré-ancré : {numeric:?}"
+        );
+        // Rouge par la branche sélection, le reste vert : c'est bien la
+        // mutation qui est vue, pas une panne du harnais.
+        assert!(
+            check.iter().any(|c| c.selection_unjustified > 0
+                && within(c.score_error, f64::from(ANCHORED_TIE) / 2.0)
+                && within(c.output_error, ANCHORED_OUTPUT_TOL)),
+            "mutation QSA (token {token}, couche {layer}) non détectée par l'oracle ré-ancré : {check:?}"
+        );
+    }
+    assert!(anchored_green, "oracle ré-ancré rouge : {anchored:?}");
     assert!(chosen.is_some(), "passe imposée rouge à tous les seuils");
     native_first.unwrap_or_else(|e| panic!("passe native : {e}"));
     assert!(native_finite, "passe native : valeur non finie");
@@ -1344,16 +1712,19 @@ fn resident_config_validation_accepts_flash_next_and_refuses_variants() -> Resul
     (base.linear_key_dim, base.linear_value_dim, base.conv_kernel) = (128, 128, 4);
     (base.linear_key_heads, base.linear_value_heads) = (16, 48);
     (base.indexer_budget, base.indexer_compress) = (2048, 4);
+    (base.head_dim, base.rotary_dim, base.indexer_head_dim) = (256, 64, 128);
     base.top_k = base.top_k.min(base.experts);
     assert_eq!(validate_resident_config(&base)?, 2051);
     type Edit = fn(&mut Qwen4ExpConfig);
-    let variants: [(&str, Edit); 6] = [
+    let variants: [(&str, Edit); 8] = [
         ("norm_topk_prob", |c| c.norm_topk_prob = false),
         ("gate SiLU", |c| c.sigmoid_output_gate = false),
         ("d_k 64", |c| c.linear_key_dim = 64),
         ("têtes V", |c| c.linear_value_heads = 47),
         ("top-k 17", |c| (c.top_k, c.experts) = (17, 512)),
         ("budget", |c| c.indexer_budget = 2047),
+        ("attention d 320", |c| c.head_dim = 320),
+        ("indexeur d 48", |c| c.indexer_head_dim = 48),
     ];
     for (label, edit) in variants {
         let mut config = base.clone();
@@ -1925,7 +2296,6 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
         kv_heads: 2,
         head_dim: 128,
         rotary_dim: 64,
-        theta: 1.0e7,
         eps: 1.0e-6,
         dense_max: dense_max_visible(budget, compress),
     };
@@ -1975,11 +2345,11 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
         o_proj: o_gpu,
         q_norm: buffer(&executor, &one_plus(&norms[0])),
         k_norm: buffer(&executor, &one_plus(&norms[1])),
+        freqs: buffer(&executor, &freqs),
         indexer: Some(IndexerWeights {
             qk_proj: iqk_gpu,
             q_norm: buffer(&executor, &one_plus(&norms[2])),
             k_norm: buffer(&executor, &one_plus(&norms[3])),
-            freqs: buffer(&executor, &freqs),
         }),
     };
     let scratch = QsaScratch {
@@ -2020,6 +2390,7 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
         let encoder = command_buffer.new_compute_command_encoder();
         encode_qsa(
             &arena,
+            &kernels,
             &executor,
             encoder,
             &mut kv,
@@ -2027,7 +2398,6 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
             &scratch,
             dims,
             Some(QsaSparse {
-                kernels: &kernels,
                 weights: weights.indexer.as_ref().expect("invariant: indexeur"),
                 state: &state,
                 scratch: &indexer_scratch,
@@ -2330,56 +2700,69 @@ fn resident_session_allocates_max_capacity() {
     assert!(used <= budget, "allocations {used} > budget {budget}");
 }
 
-/// Norme + RoPE résidentes (kernel d'arène, utilisé pour q/k de l'attention et
-/// les requêtes de l'indexeur) contre `rms_norm_1p` + `rope_in_place` CPU aux
-/// positions longues : l'angle `position·θ^(−2i/d)` doit rester exact à 1e-5
-/// jusqu'à 262 143.
+/// RoPE résidente de Flash-Next (`encode_norm_rope` : q/k de l'attention et
+/// requêtes de l'indexeur) contre `rms_norm_1p` + `rope_in_place` CPU aux
+/// positions longues : l'angle `position·inv_freq` doit rester exact à 1e-5
+/// jusqu'à 262 143. Le kernel générique de l'arène (fast-math, `pow`) sert de
+/// témoin : il dépasse 1e-4 dès 32k.
 #[test]
 fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
+    use super::attention::encode_norm_rope;
     use crate::decode_resident::DecodeResidentState;
     use crate::qwen4_exp::math::{inv_freq, rms_norm_1p, rope_in_place};
     let Some(executor) = executor()? else {
         return Ok(());
     };
     let arena = DecodeResidentState::new(executor.device().clone())?;
-    let (heads, d, rotary, theta) = (4_usize, 128_usize, 64_usize, 1.0e7_f32);
-    let mut rng = DeterministicF32::new(0x20e);
-    let x = rng.fill(heads * d, -1.0, 1.0);
-    let w = rng.fill(d, -0.3, 0.3);
-    let gains: Vec<f32> = w.iter().map(|v| 1.0 + v).collect();
-    let freqs = inv_freq(rotary, f64::from(theta));
+    let kernels = FlashNextKernels::new(executor.device())?;
     let queue = executor.device().new_command_queue();
     let mut report = Vec::new();
-    for position in [5_usize, 2051, 32_767, 131_071, 262_143] {
-        let out = zeros(&executor, heads * d);
-        let command_buffer = queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        arena.encode_rms_norm_rope_decode(
-            encoder,
-            &buffer(&executor, &x),
-            &buffer(&executor, &gains),
-            &out,
-            heads,
-            d,
-            rotary,
-            rotary,
-            position,
-            1.0e-6,
-            theta,
-        )?;
-        encoder.end_encoding();
-        commit_and_wait(command_buffer)?;
-        let got = read_f32_buffer(&out, heads * d)?;
-        let mut want = rms_norm_1p(&x, d, d, &w, 1.0e-6);
-        for head in want.chunks_exact_mut(d) {
-            rope_in_place(head, &freqs, position);
+    // Indexeur (4 × 128) puis attention (24 × 256), RoPE sur 64 dimensions.
+    for (heads, d) in [(4_usize, 128_usize), (24, 256)] {
+        let (rotary, theta) = (64_usize, 1.0e7_f32);
+        let mut rng = DeterministicF32::new(0x20e);
+        let x = rng.fill(heads * d, -1.0, 1.0);
+        let w = rng.fill(d, -0.3, 0.3);
+        let gains: Vec<f32> = w.iter().map(|v| 1.0 + v).collect();
+        let freqs = inv_freq(rotary, f64::from(theta));
+        let (x_buf, gains_buf, freqs_buf) = (
+            buffer(&executor, &x),
+            buffer(&executor, &gains),
+            buffer(&executor, &freqs),
+        );
+        for position in [5_usize, 2051, 32_767, 131_071, 262_143] {
+            let (out, witness) = (zeros(&executor, heads * d), zeros(&executor, heads * d));
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encode_norm_rope(
+                &kernels, encoder, &x_buf, &gains_buf, &freqs_buf, &out, heads, d, rotary,
+                position, 1.0e-6,
+            )?;
+            arena.encode_rms_norm_rope_decode(
+                encoder, &x_buf, &gains_buf, &witness, heads, d, rotary, rotary, position, 1.0e-6,
+                theta,
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command_buffer)?;
+            let mut want = rms_norm_1p(&x, d, d, &w, 1.0e-6);
+            for head in want.chunks_exact_mut(d) {
+                rope_in_place(head, &freqs, position);
+            }
+            let (err, _) = relative_error(&read_f32_buffer(&out, heads * d)?, &want);
+            let (arena_err, _) = relative_error(&read_f32_buffer(&witness, heads * d)?, &want);
+            report.push((d, position, err, arena_err));
         }
-        let (err, max) = relative_error(&got, &want);
-        report.push((position, err, max));
     }
-    eprintln!("RoPE résidente contre CPU (position, écart relatif, max absolu) : {report:?}");
-    for (position, err, _) in report {
-        assert!(err <= 1.0e-5, "position {position} : {err}");
+    eprintln!(
+        "RoPE résidente contre CPU (d, position, écart Flash-Next, écart arène) : {report:?}"
+    );
+    for (d, position, err, _) in &report {
+        assert!(*err <= 1.0e-5, "d {d}, position {position} : {err}");
     }
+    // Le témoin montre que le test discrimine l'angle imprécis.
+    assert!(
+        report.iter().any(|r| r.3 > 1.0e-4),
+        "le kernel de l'arène ne s'écarte plus aux positions longues"
+    );
     Ok(())
 }

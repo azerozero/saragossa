@@ -42,6 +42,9 @@ pub(crate) struct QsaLayerWeights {
     /// Gains `1 + w` de `q_norm` / `k_norm` (`[head_dim]`).
     pub(crate) q_norm: Buffer,
     pub(crate) k_norm: Buffer,
+    /// Fréquences inverses de la RoPE partielle (`[rotary_dim / 2]`), calculées
+    /// comme la référence CPU ; partagées par l'attention et l'indexeur.
+    pub(crate) freqs: Buffer,
     /// Indexeur (absent des oracles du seul régime dense).
     pub(crate) indexer: Option<IndexerWeights>,
 }
@@ -53,9 +56,6 @@ pub(crate) struct IndexerWeights {
     /// Gains `1 + w` de `q_layernorm` / `k_layernorm` (`[d_idx]`).
     pub(crate) q_norm: Buffer,
     pub(crate) k_norm: Buffer,
-    /// Fréquences inverses de la RoPE partielle (`[rotary_dim / 2]`), calculées
-    /// comme la référence CPU.
-    pub(crate) freqs: Buffer,
 }
 
 /// Dimensions de l'indexeur.
@@ -86,7 +86,6 @@ pub(crate) struct IndexerScratch {
 
 /// Régime creux d'une couche : indexeur et KV compact du gather.
 pub(crate) struct QsaSparse<'a> {
-    pub(crate) kernels: &'a FlashNextKernels,
     pub(crate) weights: &'a IndexerWeights,
     pub(crate) state: &'a IndexerState,
     pub(crate) scratch: &'a IndexerScratch,
@@ -109,7 +108,6 @@ pub(crate) struct QsaDecodeDims {
     pub(crate) kv_heads: usize,
     pub(crate) head_dim: usize,
     pub(crate) rotary_dim: usize,
-    pub(crate) theta: f32,
     pub(crate) eps: f32,
     /// Visibilité maximale du régime dense ([`dense_max_visible`]).
     pub(crate) dense_max: usize,
@@ -144,6 +142,7 @@ pub(crate) struct QsaScratch {
 )]
 pub(crate) fn encode_qsa(
     arena: &DecodeResidentState,
+    kernels: &FlashNextKernels,
     executor: &MetalExecutor,
     encoder: &ComputeCommandEncoderRef,
     kv: &mut FullAttentionMetalState,
@@ -203,23 +202,32 @@ pub(crate) fn encode_qsa(
             dims.kv_heads,
         ),
     ] {
-        arena.encode_rms_norm_rope_decode(
+        encode_norm_rope(
+            kernels,
             encoder,
             input,
             norm,
+            &weights.freqs,
             target,
             heads,
             dims.head_dim,
             dims.rotary_dim,
-            dims.rotary_dim,
             position,
             dims.eps,
-            dims.theta,
         )?;
     }
     kv.encode_append_kv(encoder, &scratch.k_roped, &scratch.v)?;
     let attended = match sparse {
-        Some(sparse) => encode_indexer(arena, executor, encoder, kv, sparse, dims, position)?,
+        Some(sparse) => encode_indexer(
+            kernels,
+            executor,
+            encoder,
+            kv,
+            &weights.freqs,
+            sparse,
+            dims,
+            position,
+        )?,
         None => None,
     };
     match attended {
@@ -258,21 +266,66 @@ pub(crate) fn encode_qsa(
     Ok(())
 }
 
+/// Norme RMS par tête (gains `1 + w`) puis RoPE partielle à `position`, angle
+/// `position·inv_freq` comme la référence CPU (`flash_next_rms_norm_rope_f32`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "encodage Metal : buffers et dimensions explicites"
+)]
+pub(crate) fn encode_norm_rope(
+    kernels: &FlashNextKernels,
+    encoder: &ComputeCommandEncoderRef,
+    input: &BufferRef,
+    gains: &BufferRef,
+    freqs: &BufferRef,
+    out: &BufferRef,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    position: usize,
+    eps: f32,
+) -> Result<()> {
+    let position = u32::try_from(position)
+        .map_err(|_| InferError::Dimension("position RoPE hors u32".to_string()))?;
+    encoder.set_compute_pipeline_state(&kernels.norm_rope);
+    encoder.set_buffer(0, Some(input), 0);
+    encoder.set_buffer(1, Some(gains), 0);
+    encoder.set_buffer(2, Some(freqs), 0);
+    encoder.set_buffer(3, Some(out), 0);
+    set_value(
+        encoder,
+        4,
+        &[head_dim as u32, (rotary_dim / 2) as u32, position, 0],
+    );
+    set_value(encoder, 5, &eps);
+    crate::metal_backend::profile_dispatch();
+    encoder.dispatch_thread_groups(
+        MTLSize::new(heads as u64, 1, 1),
+        MTLSize::new(head_dim as u64, 1, 1),
+    );
+    post_dispatch_barrier(encoder);
+    Ok(())
+}
+
 /// Indexeur du token à `position` : range sa clé brute, poole le bloc qu'il
 /// complète, puis, en régime creux, score les blocs complets, retient les
 /// `keep` meilleurs et copie les lignes K/V retenues dans le KV compact, qu'il
 /// renvoie. `None` en régime dense (attention sur tout le KV).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "encodage Metal : kernels, exécuteur, caches et fréquences explicites"
+)]
 fn encode_indexer<'a>(
-    arena: &DecodeResidentState,
+    kernels: &FlashNextKernels,
     executor: &MetalExecutor,
     encoder: &ComputeCommandEncoderRef,
     kv: &FullAttentionMetalState,
+    freqs: &BufferRef,
     sparse: QsaSparse<'a>,
     dims: QsaDecodeDims,
     position: usize,
 ) -> Result<Option<&'a mut FullAttentionMetalState>> {
     let QsaSparse {
-        kernels,
         weights,
         state,
         scratch,
@@ -300,7 +353,7 @@ fn encode_indexer<'a>(
         encoder.set_compute_pipeline_state(&kernels.index_pool);
         encoder.set_buffer(0, Some(&state.raw), 0);
         encoder.set_buffer(1, Some(&weights.k_norm), 0);
-        encoder.set_buffer(2, Some(&weights.freqs), 0);
+        encoder.set_buffer(2, Some(freqs), 0);
         encoder.set_buffer(3, Some(&state.pooled), 0);
         set_value(
             encoder,
@@ -323,18 +376,18 @@ fn encode_indexer<'a>(
         return Ok(None);
     }
     // Requêtes de l'indexeur : `q_layernorm` puis RoPE à la position du token.
-    arena.encode_rms_norm_rope_decode(
+    encode_norm_rope(
+        kernels,
         encoder,
         &scratch.qk,
         &weights.q_norm,
+        freqs,
         &scratch.q,
         idx.heads,
         d,
         dims.rotary_dim,
-        dims.rotary_dim,
         position,
         dims.eps,
-        dims.theta,
     )?;
     encoder.set_compute_pipeline_state(&kernels.index_scores);
     encoder.set_buffer(0, Some(&scratch.q), 0);

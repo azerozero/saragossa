@@ -264,7 +264,13 @@ pub(crate) fn validate_resident_config(c: &Qwen4ExpConfig) -> Result<usize> {
             c.linear_value_heads, c.linear_key_heads
         ));
     }
-    if c.kv_heads == 0 || c.heads % c.kv_heads != 0 || c.rotary_dim > c.head_dim {
+    // Norme + RoPE par tête : un threadgroup de d threads (≤ 256, multiple de 32).
+    if c.kv_heads == 0
+        || c.heads % c.kv_heads != 0
+        || c.rotary_dim > c.head_dim
+        || c.head_dim > 256
+        || c.head_dim % 32 != 0
+    {
         return refuse(format!(
             "attention {} têtes / {} KV, RoPE {} sur {}",
             c.heads, c.kv_heads, c.rotary_dim, c.head_dim
@@ -346,7 +352,6 @@ impl FlashNextSession {
             kv_heads: c.kv_heads,
             head_dim: c.head_dim,
             rotary_dim: c.rotary_dim,
-            theta: c.rope_theta as f32,
             eps: c.rms_eps,
             dense_max,
         };
@@ -1116,6 +1121,7 @@ impl FlashNextSession {
                     })?;
                     encode_qsa(
                         &self.arena,
+                        &self.kernels,
                         &self.executor,
                         encoder,
                         kv,
@@ -1123,7 +1129,6 @@ impl FlashNextSession {
                         &self.qsa_scratch,
                         self.qsa_dims,
                         Some(QsaSparse {
-                            kernels: &self.kernels,
                             weights: indexer,
                             state: indexer_state,
                             scratch: &self.indexer_scratch,

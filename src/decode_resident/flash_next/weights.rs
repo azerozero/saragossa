@@ -305,6 +305,11 @@ impl FlashNextWeights {
                         executor,
                         &one_plus(ckpt.floats(&format!("{a}k_norm.weight"))?),
                     ),
+                    // Mêmes fréquences que la référence CPU (`inv_freq` en f32).
+                    freqs: f32_buffer(
+                        executor,
+                        &crate::qwen4_exp::math::inv_freq(c.rotary_dim, c.rope_theta),
+                    ),
                     indexer: Some(IndexerWeights {
                         qk_proj: resolve("indexer.index_qk_proj")?,
                         q_norm: f32_buffer(
@@ -314,11 +319,6 @@ impl FlashNextWeights {
                         k_norm: f32_buffer(
                             executor,
                             &one_plus(ckpt.floats(&format!("{a}indexer.k_layernorm.weight"))?),
-                        ),
-                        // Mêmes fréquences que la référence CPU (`inv_freq` en f32).
-                        freqs: f32_buffer(
-                            executor,
-                            &crate::qwen4_exp::math::inv_freq(c.rotary_dim, c.rope_theta),
                         ),
                     }),
                 }))

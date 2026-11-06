@@ -322,12 +322,61 @@ kernel void flash_next_index_pool_f32(
     const float position = float(block * compress);
     if (tid < half_rot) {
         const float angle = position * freqs[tid];
-        out = values[tid] * cos(angle) - values[tid + half_rot] * sin(angle);
+        out = values[tid] * precise::cos(angle) - values[tid + half_rot] * precise::sin(angle);
     } else if (tid < 2u * half_rot) {
         const float angle = position * freqs[tid - half_rot];
-        out = values[tid] * cos(angle) + values[tid - half_rot] * sin(angle);
+        out = values[tid] * precise::cos(angle) + values[tid - half_rot] * precise::sin(angle);
     }
     pooled[block * d + tid] = out;
+}
+
+// Norme RMS par tête (gains `1 + w`) puis RoPE partielle rotate-half à la
+// position du token, pour q/k de l'attention et les requêtes de l'indexeur.
+// L'angle suit la référence CPU (`rope_in_place`, comme transformers) :
+// `position·inv_freq` en f32, puis sin/cos précis. Le kernel générique de
+// l'arène calcule `position / pow(θ, e)` en fast-math, et son erreur croît
+// avec la position (1e-4 relatif à 32k). Un threadgroup de d threads par tête
+// (d ≤ 256, multiple de 32). dims = (d, rotary/2, position, 0).
+kernel void flash_next_rms_norm_rope_f32(
+    device const float* input [[buffer(0)]],
+    device const float* norm [[buffer(1)]],
+    device const float* freqs [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    const uint d = dims.x;
+    const uint half_rot = dims.y;
+    const float position = float(dims.z);
+    threadgroup float values[256];
+    threadgroup float partial[8];
+    const uint start = head * d;
+    const float v = input[start + tid];
+    const float ss = simd_sum(v * v);
+    if (lane == 0u) {
+        partial[simd] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint k = 0u; k < d / 32u; ++k) {
+        total += partial[k];
+    }
+    const float inv = 1.0f / sqrt(total / float(d) + eps);
+    values[tid] = (v * inv) * norm[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float result = values[tid];
+    if (tid < half_rot) {
+        const float angle = position * freqs[tid];
+        result = values[tid] * precise::cos(angle) - values[tid + half_rot] * precise::sin(angle);
+    } else if (tid < 2u * half_rot) {
+        const float angle = position * freqs[tid - half_rot];
+        result = values[tid] * precise::cos(angle) + values[tid - half_rot] * precise::sin(angle);
+    }
+    out[start + tid] = result;
 }
 
 // QSA creuse — scores des blocs complets : `s_b = Σ_h ReLU(q_h·k̄_b)/√d + 0`
@@ -519,6 +568,7 @@ pub(crate) struct FlashNextKernels {
     pub(super) hc_inject_partial: ComputePipelineState,
     pub(super) qmv_u8_splitk: ComputePipelineState,
     pub(super) index_pool: ComputePipelineState,
+    pub(super) norm_rope: ComputePipelineState,
     pub(super) index_scores: ComputePipelineState,
     pub(super) index_topk: ComputePipelineState,
     pub(super) gather_kv: ComputePipelineState,
@@ -548,6 +598,7 @@ impl FlashNextKernels {
                 "flash_next_hc_inject_partial_f32",
                 "flash_next_qmv_u8_gs64_splitk_f32",
                 "flash_next_index_pool_f32",
+                "flash_next_rms_norm_rope_f32",
                 "flash_next_index_scores_f32",
                 "flash_next_index_topk_f32",
                 "flash_next_gather_kv_f32",
@@ -579,6 +630,7 @@ impl FlashNextKernels {
             hc_inject_partial: next()?,
             qmv_u8_splitk: next()?,
             index_pool: next()?,
+            norm_rope: next()?,
             index_scores: next()?,
             index_topk: next()?,
             gather_kv: next()?,
