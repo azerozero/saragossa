@@ -1,0 +1,11 @@
+{
+ "script": "tools/flashnext/make_mini_fixture.py",
+ "command": "python -I tools/flashnext/make_mini_fixture.py tests/fixtures/qwen4exp_mini",
+ "seed": 20261110,
+ "torch": "2.14.1",
+ "transformers": "5.20.2",
+ "attn_implementation": "sdpa",
+ "dtype": "float32",
+ "tokens": 40,
+ "eos_position": 17
+}

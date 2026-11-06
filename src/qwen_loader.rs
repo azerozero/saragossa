@@ -132,6 +132,7 @@ impl DecoderLoadContext<'_> {
 }
 
 mod quantized;
+pub mod qwen4_exp;
 mod shape_validation;
 
 #[cfg(test)]

@@ -558,3 +558,223 @@ fn assert_close(left: &[f32], right: &[f32], tolerance: f32) {
         );
     }
 }
+
+#[test]
+fn flash_next_l2_norm_keeps_epsilon_unscaled_on_low_norm_heads() {
+    // Tête de très faible norme : l'ε de transformers (1e-6) n'est pas multiplié
+    // par d (≠ unité RMS des autres familles, ×128 à d=128).
+    let d = 128;
+    let x = Tensor::from_vec(vec![1, d], vec![1.0e-4; d]).expect("invariant: forme");
+    let l2 = super::l2_norm_heads(&x, 1, d, 1.0e-6).expect("invariant: norme");
+    let sum: f32 = 1.0e-8 * d as f32;
+    let expected = 1.0e-4 / (sum + 1.0e-6).sqrt();
+    assert!((l2.data()[0] - expected).abs() <= expected * 1.0e-6);
+    let rms = super::rms_norm_heads_unit(&x, 1, d, 1.0e-6).expect("invariant: norme");
+    let rms_as_l2 = rms.data()[0] / (d as f32).sqrt();
+    assert!(
+        (rms_as_l2 - expected).abs() > expected * 0.1,
+        "les deux ε doivent différer"
+    );
+}
+
+/// Référence naïve du forward Flash-Next (`forward_flash_next_cpu`), écrite
+/// indépendamment : projections denses, conv causale à remplissage nul, SiLU,
+/// norme l2 `x/√(Σx²+ε)` par tête (q·d_k^(−1/2)), β = σ(b),
+/// g = exp(−exp(A_log)·softplus(a + dt_bias)), récurrence naïve, RMSNorm par tête
+/// à gain w, gate `σ(z)` ou `SiLU(z)`, projection de sortie.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "oracle de référence : poids et dimensions restent explicites"
+)]
+fn naive_flash_next(
+    x: &[f32],
+    seq: usize,
+    hidden: usize,
+    w: &[Vec<f32>; 5],
+    conv: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    norm: &[f32],
+    config: LinearAttentionConfig,
+    sigmoid_gate: bool,
+) -> Vec<f32> {
+    let matmul = |w: &[f32], rows: usize| -> Vec<f32> {
+        let mut out = vec![0.0_f32; seq * rows];
+        for t in 0..seq {
+            for r in 0..rows {
+                out[t * rows + r] = (0..hidden)
+                    .map(|c| w[r * hidden + c] * x[t * hidden + c])
+                    .sum();
+            }
+        }
+        out
+    };
+    let (hk, hv, dk, dv, kk) = (
+        config.num_key_heads,
+        config.num_value_heads,
+        config.key_head_dim,
+        config.value_head_dim,
+        config.conv_kernel_dim,
+    );
+    let (key_dim, value_dim) = (hk * dk, hv * dv);
+    let conv_dim = 2 * key_dim + value_dim;
+    let qkv = matmul(&w[0], conv_dim);
+    let z = matmul(&w[1], value_dim);
+    let b = matmul(&w[2], hv);
+    let a = matmul(&w[3], hv);
+    let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
+    let mut conv_out = vec![0.0_f32; seq * conv_dim];
+    for t in 0..seq {
+        for c in 0..conv_dim {
+            let mut acc = 0.0_f32;
+            for j in 0..kk {
+                // Entrée à t − (K−1) + j, nulle avant le début.
+                if let Some(src) = (t + j).checked_sub(kk - 1) {
+                    acc += conv[c * kk + j] * qkv[src * conv_dim + c];
+                }
+            }
+            conv_out[t * conv_dim + c] = acc * sig(acc);
+        }
+    }
+    let l2 = |part: &mut [f32], scale: f32| {
+        for head in part.chunks_exact_mut(dk) {
+            let inv = 1.0 / (head.iter().map(|v| v * v).sum::<f32>() + 1.0e-6).sqrt();
+            head.iter_mut().for_each(|v| *v *= inv * scale);
+        }
+    };
+    let (mut q, mut k, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    for t in 0..seq {
+        let row = &conv_out[t * conv_dim..(t + 1) * conv_dim];
+        let mut qt = row[..key_dim].to_vec();
+        let mut kt = row[key_dim..2 * key_dim].to_vec();
+        l2(&mut qt, (dk as f32).powf(-0.5));
+        l2(&mut kt, 1.0);
+        q.extend(qt);
+        k.extend(kt);
+        v.extend_from_slice(&row[2 * key_dim..]);
+    }
+    let beta: Vec<f32> = b.iter().map(|&v| sig(v)).collect();
+    let g: Vec<f32> = (0..seq * hv)
+        .map(|i| {
+            let h = i % hv;
+            let softplus = (1.0 + (a[i] + dt_bias[h]).exp()).ln();
+            (-(a_log[h].exp()) * softplus).exp()
+        })
+        .collect();
+    let mut state = vec![0.0_f32; hv * dv * dk];
+    let y = naive_gdn_reference(&q, &k, &v, &g, &beta, seq, config, &mut state);
+    let mut gated = vec![0.0_f32; seq * value_dim];
+    for t in 0..seq {
+        for h in 0..hv {
+            let start = t * value_dim + h * dv;
+            let head = &y[start..start + dv];
+            let inv =
+                1.0 / (head.iter().map(|v| v * v).sum::<f32>() / dv as f32 + config.rms_eps).sqrt();
+            for d in 0..dv {
+                let zt = z[start + d];
+                let gate = if sigmoid_gate { sig(zt) } else { zt * sig(zt) };
+                gated[start + d] = head[d] * inv * norm[d] * gate;
+            }
+        }
+    }
+    let mut out = vec![0.0_f32; seq * hidden];
+    for t in 0..seq {
+        for r in 0..hidden {
+            out[t * hidden + r] = (0..value_dim)
+                .map(|c| w[4][r * value_dim + c] * gated[t * value_dim + c])
+                .sum();
+        }
+    }
+    out
+}
+
+#[test]
+fn flash_next_forward_matches_naive_reference_for_both_gates() {
+    let config = LinearAttentionConfig {
+        num_key_heads: 1,
+        num_value_heads: 2,
+        key_head_dim: 4,
+        value_head_dim: 4,
+        conv_kernel_dim: 3,
+        rms_eps: 1.0e-6,
+    };
+    let (hidden, seq) = (3, 7);
+    let (key_dim, value_dim) = (4, 8);
+    let conv_dim = 2 * key_dim + value_dim;
+    let mut rng = DeterministicF32::new(0x5157_454e);
+    // Projections q/k de faible amplitude : Σx² ~ 1e-7, comparable à ε, ce qui
+    // distingue x/√(Σx²+ε) de l'unité RMS x/√(Σx²+d·ε).
+    let mut w_qkv = rng.fill(conv_dim * hidden, -0.5, 0.5);
+    for value in &mut w_qkv[..2 * key_dim * hidden] {
+        *value *= 2.0e-3;
+    }
+    let w = [
+        w_qkv,
+        rng.fill(value_dim * hidden, -1.5, 1.5),
+        rng.fill(2 * hidden, -0.8, 0.8),
+        rng.fill(2 * hidden, -0.8, 0.8),
+        rng.fill(hidden * value_dim, -0.6, 0.6),
+    ];
+    let conv = rng.fill(conv_dim * 3, -0.7, 0.7);
+    let a_log = rng.fill(2, -0.5, 0.5);
+    let dt_bias = rng.fill(2, -0.3, 0.3);
+    let norm = rng.fill(4, 0.8, 1.2);
+    let x = rng.fill(seq * hidden, -1.0, 1.0);
+    let dense = |data: &[f32], rows: usize, cols: usize| {
+        linear(Tensor::from_vec(vec![rows, cols], data.to_vec()))
+    };
+    let layer = LinearAttention::new(LinearAttentionWeights {
+        in_proj_qkv: dense(&w[0], conv_dim, hidden),
+        in_proj_z: dense(&w[1], value_dim, hidden),
+        in_proj_b: dense(&w[2], 2, hidden),
+        in_proj_a: dense(&w[3], 2, hidden),
+        out_proj: dense(&w[4], hidden, value_dim),
+        conv1d_weight: Tensor::from_vec(vec![conv_dim, 1, 3], conv.clone())
+            .expect("invariant: conv"),
+        a_log: Tensor::from_vec(vec![2], a_log.clone()).expect("invariant: A_log"),
+        dt_bias: Tensor::from_vec(vec![2], dt_bias.clone()).expect("invariant: dt_bias"),
+        norm_weight: Tensor::from_vec(vec![4], norm.clone()).expect("invariant: norm"),
+    });
+    let input = Tensor::from_vec(vec![seq, hidden], x.clone()).expect("invariant: entrée");
+    let mut outputs = Vec::new();
+    for sigmoid_gate in [true, false] {
+        let got = layer
+            .forward_flash_next_cpu(config, &input, sigmoid_gate)
+            .expect("invariant: forward Flash-Next");
+        let expected = naive_flash_next(
+            &x,
+            seq,
+            hidden,
+            &w,
+            &conv,
+            &a_log,
+            &dt_bias,
+            &norm,
+            config,
+            sigmoid_gate,
+        );
+        assert_close(got.data(), &expected, 1.0e-5);
+        outputs.push(got.data().to_vec());
+    }
+    // La gate n'est pas ignorée : σ(z) et SiLU(z) donnent des sorties distinctes.
+    let diff: f32 = outputs[0]
+        .iter()
+        .zip(&outputs[1])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(diff > 1.0e-2, "gates σ et SiLU indiscernables ({diff})");
+    // La norme l2 Flash-Next diffère de l'unité RMS des autres familles ici.
+    let legacy = layer
+        .forward(config, &input)
+        .expect("invariant: forward legacy");
+    let legacy_diff: f32 = legacy
+        .data()
+        .iter()
+        .zip(&outputs[1])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(
+        legacy_diff > 1.0e-3,
+        "norme l2 indiscernable de l'unité RMS ({legacy_diff})"
+    );
+}

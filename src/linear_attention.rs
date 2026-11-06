@@ -579,6 +579,73 @@ impl LinearAttention {
         self.out_proj.forward_with_runtime(&gated, runtime)
     }
 
+    /// Variante Flash-Next (`qwen4_exp`), CPU seul, sans cache : normalisation l2
+    /// des têtes q/k `x/√(Σx²+ε)` (ε = 1e-6, q multiplié ensuite par `d_k^(−1/2)`)
+    /// au lieu de l'unité RMS `x/√(Σx²+d·ε)` des autres familles, et gate de
+    /// sortie `σ(z)` si `sigmoid_gate` (`output_gate_type = sigmoid`), `SiLU(z)` sinon.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les shapes de `x`, des poids ou de `config` divergent.
+    pub(crate) fn forward_flash_next_cpu(
+        &self,
+        config: LinearAttentionConfig,
+        x: &Tensor,
+        sigmoid_gate: bool,
+    ) -> Result<Tensor> {
+        config.validate()?;
+        validate_weights(self, config)?;
+        let mut cache = LinearAttentionCache::default();
+        let (qkv, z, beta_input, gate_input) = self.input_projections(x, ForwardRuntime::cpu())?;
+        let conv_out = silu(&depthwise_causal_conv(
+            &qkv,
+            &self.conv1d_weight,
+            config,
+            &mut cache,
+        )?);
+        let key_dim = config.key_dim()?;
+        let value_dim = config.value_dim()?;
+        // Équations (transformers `l2norm`) : q = q̃/√(Σq̃²+ε)·d_k^(−1/2), k = k̃/√(Σk̃²+ε).
+        let q = l2_norm_heads(
+            &slice_columns(&conv_out, 0, key_dim)?,
+            config.num_key_heads,
+            config.key_head_dim,
+            1.0e-6,
+        )?
+        .map(|value| value * key_scale(config.key_head_dim, false));
+        let k = l2_norm_heads(
+            &slice_columns(&conv_out, key_dim, key_dim)?,
+            config.num_key_heads,
+            config.key_head_dim,
+            1.0e-6,
+        )?;
+        let v = slice_columns(&conv_out, key_dim * 2, value_dim)?;
+        let beta = beta_input.map(sigmoid);
+        let g = compute_decay(
+            &gate_input,
+            &self.a_log,
+            &self.dt_bias,
+            config.num_value_heads,
+        )?;
+        let y = gated_delta(&q, &k, &v, &g, &beta, config, &mut cache)?;
+        let y = rms_norm_heads(
+            &y,
+            config.num_value_heads,
+            config.value_head_dim,
+            &self.norm_weight,
+            config.rms_eps,
+        )?;
+        // Équation : out_t = W_out·(y'_t ⊙ σ(z_t)), ou SiLU(z_t) (`output_gate_type`).
+        let gate = if sigmoid_gate {
+            z.map(sigmoid)
+        } else {
+            silu(&z)
+        };
+        let gated = y.mul_elementwise(&gate)?;
+        self.out_proj
+            .forward_with_runtime(&gated, ForwardRuntime::cpu())
+    }
+
     /// Calcule les quatre projections biasless `(W_qkv·x, W_z·x, W_b·x, W_a·x)`.
     fn input_projections(
         &self,
@@ -1044,6 +1111,23 @@ fn ensure_ssm_cache(config: LinearAttentionConfig, cache: &mut LinearAttentionCa
         )));
     }
     Ok(())
+}
+
+/// Normalise chaque tête en norme l2 : `x/√(Σx²+ε)` (transformers `l2norm`).
+fn l2_norm_heads(x: &Tensor, heads: usize, head_dim: usize, eps: f32) -> Result<Tensor> {
+    let (seq, dim) = x.as_matrix()?;
+    if heads == 0 || head_dim == 0 || dim != heads * head_dim {
+        return Err(InferError::Dimension(format!(
+            "l2 norm heads invalide: x={:?}, heads={heads}, head_dim={head_dim}",
+            x.shape()
+        )));
+    }
+    let mut out = x.data().to_vec();
+    for row in out.chunks_exact_mut(head_dim).take(seq * heads) {
+        let inv = 1.0 / (row.iter().map(|value| value * value).sum::<f32>() + eps).sqrt();
+        row.iter_mut().for_each(|value| *value *= inv);
+    }
+    Tensor::from_vec(vec![seq, dim], out)
 }
 
 /// Normalise chaque tête à RMS unitaire (sans poids appris) : `x/√(E[x²]+ε)`.

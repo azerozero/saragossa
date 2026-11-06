@@ -26,6 +26,7 @@ de référence et de repli mesurable.
 | `src/decode_resident/` | arène GPU, attention, tails dense/MoE et kernels de decode |
 | `src/metal_backend/` | buffers, pipelines, matmuls, MoE, prefill et barrières Metal |
 | `src/qwen_loader/` | chargement et validation des familles de modèles |
+| `src/qwen4_exp/` | référence CPU f32 sans cache de Qwen3.8-Flash-Next (`qwen4_exp`) |
 | `src/whisper/` | STT Whisper |
 | `src/tts*.rs` | talker, codec, Mimi et voix Qwen3-TTS |
 | `src/text_embedder/` | embeddings texte CPU |
