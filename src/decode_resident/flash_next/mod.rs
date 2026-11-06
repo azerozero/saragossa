@@ -42,8 +42,8 @@ fn dispatch_1d(encoder: &ComputeCommandEncoderRef, n: usize) {
     );
 }
 
-/// Dispatch de `groups` threadgroups de 256 (normes, réductions par flux).
-fn dispatch_groups(encoder: &ComputeCommandEncoderRef, groups: usize) {
+/// Dispatch de `groups` threadgroups de `width` threads (normes, réductions par flux).
+fn dispatch_groups(encoder: &ComputeCommandEncoderRef, groups: usize, width: u64) {
     crate::metal_backend::profile_dispatch();
-    encoder.dispatch_thread_groups(MTLSize::new(groups as u64, 1, 1), MTLSize::new(256, 1, 1));
+    encoder.dispatch_thread_groups(MTLSize::new(groups as u64, 1, 1), MTLSize::new(width, 1, 1));
 }

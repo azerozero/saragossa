@@ -147,7 +147,7 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
         + 2 * c.hidden // entrée de branche et sortie de mélangeur
         + c.vocab + 1 // logits et argmax
         + c.layer_kinds.len() * width // capture des résiduels
-        + 2 * width + c.hc_lowrank + c.hc_count // scratch hc
+        + 2 * width + c.hc_lowrank + c.hc_count * super::hc::INJECT_CHUNKS // scratch hc
         + c.ple_dim + 5 * width + c.hidden // scratch PLE
         + 6 * q_dim + 3 * kv_dim + c.heads * capacity; // scratch QSA
     let executor = 4 * conv_dim + 6 * value_dim + 4 * c.linear_value_heads // DeltaNet
@@ -308,7 +308,7 @@ impl FlashNextSession {
                 normed: zeros(&executor, width),
                 low: zeros(&executor, c.hc_lowrank),
                 up: zeros(&executor, width),
-                inject: zeros(&executor, c.hc_count),
+                inject: zeros(&executor, c.hc_count * super::hc::INJECT_CHUNKS),
             },
             ple_scratch: PleScratch {
                 emb: zeros(&executor, c.ple_dim),

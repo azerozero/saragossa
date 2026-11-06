@@ -330,3 +330,55 @@ fn flash_next_moe_512_top10_inter640_matches_cpu() -> Result<()> {
     assert!(gap > 1.0e-4, "l'imposition n'a pas changé la sortie : {gap}");
     Ok(())
 }
+
+/// Segments du MoE Flash-Next aux formes réelles (512 experts u4, hidden 2560,
+/// intermédiaire 640, expert partagé u8, routeur f32 dense) : route, gate/up,
+/// down, combinaisons. Diagnostic de débit, machine libre.
+#[test]
+#[ignore = "diagnostic de débit, machine libre"]
+fn bench_flash_next_moe_segments_at_real_dims() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (hidden, inter, experts_n) = (2560_usize, 640_usize, 512_usize);
+    let bases = [
+        test_affine_random_u4(inter, hidden, 51)?,
+        test_affine_random_u4(inter, hidden, 52)?,
+        test_affine_random_u4(hidden, inter, 53)?,
+    ];
+    let experts: Vec<GatedMlp> = (0..experts_n)
+        .map(|e| {
+            Ok(GatedMlp::new(
+                flash_next_expert_u4(&bases[0], e)?,
+                flash_next_expert_u4(&bases[1], e)?,
+                flash_next_expert_u4(&bases[2], e)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let u8_linear = |rows, cols| -> Result<Linear> {
+        Linear::from_weight(LinearWeight::AffineQuantized(test_affine_varied_u8(rows, cols)?), None)
+    };
+    let shared = GatedMlp::new(u8_linear(inter, hidden)?, u8_linear(inter, hidden)?, u8_linear(hidden, inter)?);
+    let mut rng = crate::linear_attention::tests::DeterministicF32::new(0x0b0e);
+    let router = Linear::from_weight(
+        LinearWeight::Dense(Tensor::from_vec(vec![experts_n, hidden], rng.fill(experts_n * hidden, -0.05, 0.05))?),
+        None,
+    )?;
+    let shared_gate = Linear::from_weight(
+        LinearWeight::Dense(Tensor::from_vec(vec![1, hidden], rng.fill(hidden, -0.02, 0.02))?),
+        None,
+    )?;
+    let input = Tensor::from_vec(vec![1, hidden], rng.fill(hidden, -1.0, 1.0))?;
+    let empty = || -> Result<()> { commit_and_wait(executor.queue.new_command_buffer()) };
+    for _ in 0..8 {
+        empty()?;
+    }
+    let started = std::time::Instant::now();
+    for _ in 0..64 {
+        empty()?;
+    }
+    let overhead_ms = started.elapsed().as_secs_f64() * 1e3 / 64.0;
+    let report = executor.profile_moe_shared_segments(&input, &router, &experts, 10, &shared, &shared_gate, overhead_ms)?;
+    eprintln!("{report}");
+    Ok(())
+}

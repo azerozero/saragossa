@@ -145,7 +145,7 @@ pub(crate) fn encode_ple(
     encoder.set_buffer(2, Some(&scratch.value), 0);
     encoder.set_buffer(3, Some(&scratch.gated), 0);
     set_value(encoder, 4, &(dims.hidden as u32));
-    dispatch_groups(encoder, dims.hc);
+    dispatch_groups(encoder, dims.hc, 256);
     post_dispatch_barrier(encoder);
 
     encode_rms_norm_1p(
@@ -198,5 +198,5 @@ pub(crate) fn encode_rms_norm_1p(
     encoder.set_buffer(2, Some(out), 0);
     set_value(encoder, 3, &(dims.hidden as u32));
     set_value(encoder, 4, &dims.eps);
-    dispatch_groups(encoder, dims.hc);
+    dispatch_groups(encoder, dims.hc, 1024);
 }

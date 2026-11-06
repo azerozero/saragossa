@@ -212,14 +212,15 @@ impl FlashNextWeights {
             )
         };
         let inject = if inject {
-            // Buffer propre (bf16 → f32) : pas de cache par adresse.
+            // Buffer propre (bf16 → f32), lu par le kernel d'injection dédié.
             let data = ckpt.floats(&format!("{prefix}block_inject_weight.weight"))?;
-            Some(MetalLinearWeightBuffers::Dense {
-                rhs: f32_buffer(executor, &data),
-                rhs_bf16: None,
-                out_dim: c.hc_count,
-                in_dim: c.hc_width(),
-            })
+            if data.len() != c.hc_count * c.hc_width() {
+                return Err(InferError::Shape(format!(
+                    "{prefix}block_inject_weight : {} valeurs",
+                    data.len()
+                )));
+            }
+            Some(f32_buffer(executor, &data))
         } else {
             None
         };

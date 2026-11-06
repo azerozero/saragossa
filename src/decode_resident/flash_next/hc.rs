@@ -4,7 +4,7 @@
 //! `x = mean_s(a ⊙ n)`, injection `2σ(W_inject·n/hc)` sur le résiduel non
 //! normalisé : `H′_s = H_s + inj_s·F(x)`. Le mixer final n'a pas d'injection.
 
-use metal::{Buffer, BufferRef, ComputeCommandEncoderRef};
+use metal::{Buffer, BufferRef, ComputeCommandEncoderRef, MTLSize};
 
 use super::kernels::FlashNextKernels;
 use super::ple::encode_rms_norm_1p;
@@ -18,8 +18,8 @@ pub(crate) struct HcWeights {
     pub(crate) norm: Buffer,
     pub(crate) down: MetalLinearWeightBuffers,
     pub(crate) up: MetalLinearWeightBuffers,
-    /// `[hc, hc·hidden]` ; `None` pour le mixer final.
-    pub(crate) inject: Option<MetalLinearWeightBuffers>,
+    /// `[hc, hc·hidden]` en f32 ; `None` pour le mixer final.
+    pub(crate) inject: Option<Buffer>,
 }
 
 /// Intermédiaires réutilisés d'une couche à l'autre (encodage séquentiel).
@@ -27,8 +27,12 @@ pub(crate) struct HcScratch {
     pub(crate) normed: Buffer,
     pub(crate) low: Buffer,
     pub(crate) up: Buffer,
+    /// Sommes partielles de l'injection `[hc, INJECT_CHUNKS]`.
     pub(crate) inject: Buffer,
 }
+
+/// Tranches de la réduction de l'injection (16 × 640 à largeur 10240).
+pub(crate) const INJECT_CHUNKS: usize = 16;
 
 /// Dimensions d'une hyper-connection.
 #[derive(Clone, Copy, Debug)]
@@ -76,15 +80,18 @@ pub(crate) fn encode_hc_mix(
     )?;
     post_dispatch_barrier(encoder);
     if let Some(inject) = &weights.inject {
-        executor.encode_matmul_weight_buffers(
-            encoder,
-            &scratch.normed,
-            1,
-            width,
-            inject,
-            &scratch.inject,
-            true,
-        )?;
+        // Injection : 4 lignes trop courtes pour un GEMV ; tranches en parallèle,
+        // sommes partielles réduites dans `encode_hc_combine`.
+        encoder.set_compute_pipeline_state(&kernels.hc_inject_partial);
+        encoder.set_buffer(0, Some(&scratch.normed), 0);
+        encoder.set_buffer(1, Some(inject), 0);
+        encoder.set_buffer(2, Some(&scratch.inject), 0);
+        set_value(encoder, 3, &[width as u32, INJECT_CHUNKS as u32]);
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(INJECT_CHUNKS as u64, dims.hc as u64, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
     encoder.set_compute_pipeline_state(&kernels.hc_silu_scale);
     encoder.set_buffer(0, Some(&scratch.low), 0);
@@ -130,7 +137,11 @@ pub(crate) fn encode_hc_combine(
     encoder.set_buffer(1, Some(&scratch.inject), 0);
     encoder.set_buffer(2, Some(f), 0);
     encoder.set_buffer(3, Some(out), 0);
-    set_value(encoder, 4, &[dims.hidden as u32, dims.hc as u32]);
+    set_value(
+        encoder,
+        4,
+        &[dims.hidden as u32, dims.hc as u32, INJECT_CHUNKS as u32],
+    );
     dispatch_1d(encoder, dims.width());
     post_dispatch_barrier(encoder);
 }

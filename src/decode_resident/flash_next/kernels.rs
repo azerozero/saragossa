@@ -15,7 +15,7 @@ const SOURCE: &str = r#"
 using namespace metal;
 
 // Norme RMS par groupe de `group` valeurs, gain `1 + w` (w de la largeur
-// totale) : un threadgroup de 256 par groupe.
+// totale) : un threadgroup de 1024 par groupe, réduction simd.
 kernel void flash_next_rms_norm_1p_groups_f32(
     device const float* x [[buffer(0)]],
     device const float* w [[buffer(1)]],
@@ -23,27 +23,63 @@ kernel void flash_next_rms_norm_1p_groups_f32(
     constant uint& group [[buffer(3)]],
     constant float& eps [[buffer(4)]],
     uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
     uint g [[threadgroup_position_in_grid]]
 ) {
-    threadgroup float partial[256];
+    threadgroup float partial[32];
     const uint base = g * group;
     float ss = 0.0f;
-    for (uint col = tid; col < group; col += 256u) {
+    for (uint col = tid; col < group; col += 1024u) {
         const float v = x[base + col];
         ss += v * v;
     }
-    partial[tid] = ss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    ss = simd_sum(ss);
+    if (lane == 0u) {
+        partial[simd] = ss;
     }
-    const float inv = 1.0f / sqrt(partial[0] / float(group) + eps);
-    for (uint col = tid; col < group; col += 256u) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = simd_sum(lane < 32u ? partial[lane] : 0.0f);
+    const float inv = 1.0f / sqrt(total / float(group) + eps);
+    for (uint col = tid; col < group; col += 1024u) {
         const uint i = base + col;
         out[i] = (x[i] * inv) * (1.0f + w[i]);
+    }
+}
+
+// Injection, sommes partielles : `partial[s, c] = Σ_{d ∈ tranche c} W[s, d]·n[d]`,
+// une tranche contiguë de `width / chunks` valeurs par threadgroup (256).
+kernel void flash_next_hc_inject_partial_f32(
+    device const float* normed [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    device float* partial [[buffer(2)]],
+    constant uint2& dims [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    threadgroup float shared[8];
+    const uint width = dims.x;
+    const uint chunks = dims.y;
+    const uint len = width / chunks;
+    const uint start = tg.x * len;
+    const uint row = tg.y * width;
+    float acc = 0.0f;
+    for (uint d = start + tid; d < start + len; d += 256u) {
+        acc += w[row + d] * normed[d];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) {
+        shared[simd] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float total = 0.0f;
+        for (uint k = 0u; k < 8u; ++k) {
+            total += shared[k];
+        }
+        partial[tg.y * chunks + tg.x] = total;
     }
 }
 
@@ -82,22 +118,28 @@ kernel void flash_next_hc_mix_f32(
     x[d] = acc / float(hc);
 }
 
-// `out[s,d] = h[s,d] + 2σ(inj[s]/hc)·f[d]`.
+// `out[s,d] = h[s,d] + 2σ(inj[s]/hc)·f[d]`, `inj[s]` réduit ici des
+// `chunks` sommes partielles de l'injection. dims = (hidden, hc, chunks).
 kernel void flash_next_hc_combine_f32(
     device const float* h [[buffer(0)]],
-    device const float* inject [[buffer(1)]],
+    device const float* partial [[buffer(1)]],
     device const float* f [[buffer(2)]],
     device float* out [[buffer(3)]],
-    constant uint2& dims [[buffer(4)]],
+    constant uint3& dims [[buffer(4)]],
     uint i [[thread_position_in_grid]]
 ) {
     const uint hidden = dims.x;
     const uint hc = dims.y;
+    const uint chunks = dims.z;
     if (i >= hidden * hc) {
         return;
     }
     const uint s = i / hidden;
-    const float w = 2.0f * (1.0f / (1.0f + exp(-(inject[s] / float(hc)))));
+    float inj = 0.0f;
+    for (uint c = 0u; c < chunks; ++c) {
+        inj += partial[s * chunks + c];
+    }
+    const float w = 2.0f * (1.0f / (1.0f + exp(-(inj / float(hc)))));
     out[i] = h[i] + w * f[i % hidden];
 }
 
@@ -212,6 +254,7 @@ pub(crate) struct FlashNextKernels {
     pub(super) hc_silu_scale: ComputePipelineState,
     pub(super) hc_mix: ComputePipelineState,
     pub(super) hc_combine: ComputePipelineState,
+    pub(super) hc_inject_partial: ComputePipelineState,
     pub(super) ple_gather: ComputePipelineState,
     pub(super) ple_gate: ComputePipelineState,
     pub(super) ple_conv_add: ComputePipelineState,
@@ -235,6 +278,7 @@ impl FlashNextKernels {
                 "flash_next_hc_silu_scale_f32",
                 "flash_next_hc_mix_f32",
                 "flash_next_hc_combine_f32",
+                "flash_next_hc_inject_partial_f32",
                 "flash_next_ple_gather_f32",
                 "flash_next_ple_gate_f32",
                 "flash_next_ple_conv_add_f32",
@@ -252,6 +296,7 @@ impl FlashNextKernels {
             hc_silu_scale: next()?,
             hc_mix: next()?,
             hc_combine: next()?,
+            hc_inject_partial: next()?,
             ple_gather: next()?,
             ple_gate: next()?,
             ple_conv_add: next()?,

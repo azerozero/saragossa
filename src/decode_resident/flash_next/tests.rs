@@ -96,8 +96,7 @@ fn flash_next_hc_mix_and_combine_match_cpu_at_real_dims() -> Result<()> {
     let (down_gpu, down) = u8_weight(&executor, &mut rng, dims.lowrank, width, 0.05)?;
     let (up_gpu, up) = u8_weight(&executor, &mut rng, width, dims.lowrank, 0.2)?;
     let inject_w = Tensor::from_vec(vec![dims.hc, width], rng.fill(dims.hc * width, -0.02, 0.02))?;
-    let inject_gpu = executor
-        .resolve_linear_weight_buffers(&LinearWeight::Dense(inject_w.clone()), "flash_next_inj")?;
+    let inject_gpu = buffer(&executor, inject_w.data());
     let h_data = rng.fill(width, -2.0, 2.0);
     let f_data = rng.fill(dims.hidden, -1.0, 1.0);
     let h = Tensor::from_vec(vec![1, width], h_data.clone())?;
@@ -107,7 +106,7 @@ fn flash_next_hc_mix_and_combine_match_cpu_at_real_dims() -> Result<()> {
         normed: zeros(&executor, width),
         low: zeros(&executor, dims.lowrank),
         up: zeros(&executor, width),
-        inject: zeros(&executor, dims.hc),
+        inject: zeros(&executor, dims.hc * super::hc::INJECT_CHUNKS),
     };
     for with_inject in [true, false] {
         let cpu = GatedResidual {
@@ -1347,20 +1346,14 @@ fn bench_hc_pieces_at_real_dims() -> Result<()> {
     let mut rng = DeterministicF32::new(7);
     let (down, _) = u8_weight(&executor, &mut rng, dims.lowrank, width, 0.05)?;
     let (up, _) = u8_weight(&executor, &mut rng, width, dims.lowrank, 0.2)?;
-    let inject = executor.resolve_linear_weight_buffers(
-        &LinearWeight::Dense(Tensor::from_vec(
-            vec![4, width],
-            rng.fill(4 * width, -0.02, 0.02),
-        )?),
-        "bench_inject",
-    )?;
+    let inject = buffer(&executor, &rng.fill(4 * width, -0.02, 0.02));
     let norm = buffer(&executor, &rng.fill(width, -0.3, 0.3));
     let h = buffer(&executor, &rng.fill(width, -2.0, 2.0));
     let scratch = HcScratch {
         normed: zeros(&executor, width),
         low: zeros(&executor, dims.lowrank),
         up: zeros(&executor, width),
-        inject: zeros(&executor, 4),
+        inject: zeros(&executor, 4 * super::hc::INJECT_CHUNKS),
     };
     let x = zeros(&executor, dims.hidden);
     let out = zeros(&executor, width);
@@ -1396,19 +1389,6 @@ fn bench_hc_pieces_at_real_dims() -> Result<()> {
             .encode_matmul_weight_buffers(e, &scratch.normed, 1, width, &down, &scratch.low, true)
             .map(|_| ())
     })?;
-    time("injection f32 [4, 10240]", &|e| {
-        executor
-            .encode_matmul_weight_buffers(
-                e,
-                &scratch.normed,
-                1,
-                width,
-                &inject,
-                &scratch.inject,
-                true,
-            )
-            .map(|_| ())
-    })?;
     time("Up u8 [10240, 320]", &|e| {
         executor
             .encode_matmul_weight_buffers(e, &scratch.low, 1, dims.lowrank, &up, &scratch.up, true)
@@ -1420,6 +1400,15 @@ fn bench_hc_pieces_at_real_dims() -> Result<()> {
         up: up.clone(),
         inject: Some(inject.clone()),
     };
+    let no_inject = HcWeights {
+        norm: norm.clone(),
+        down: down.clone(),
+        up: up.clone(),
+        inject: None,
+    };
+    time("mix sans injection", &|e| {
+        encode_hc_mix(&kernels, &executor, e, &no_inject, &scratch, dims, &h, &x)
+    })?;
     time("mix complet (6 dispatches)", &|e| {
         encode_hc_mix(&kernels, &executor, e, &weights, &scratch, dims, &h, &x)
     })?;
