@@ -534,7 +534,8 @@ impl FlashNextSession {
     pub(crate) fn step(&mut self, token: usize, logits: bool, layers: bool) -> Result<StepOutput> {
         if self.poisoned {
             return Err(InferError::Metal(
-                "Flash-Next résident : session invalidée par une erreur GPU antérieure".to_string(),
+                "Flash-Next résident : session invalidée (erreur GPU ou reset incomplet)"
+                    .to_string(),
             ));
         }
         let c = &self.ckpt.config;

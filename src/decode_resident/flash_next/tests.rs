@@ -1000,6 +1000,10 @@ fn bench_resident_decode_after_1k_context() {
     let runs: usize = crate::runtime_flags::env_var("SARAGOSSA_FLASH_NEXT_BENCH_RUNS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
+    assert!(
+        runs > 0,
+        "SARAGOSSA_FLASH_NEXT_BENCH_RUNS doit valoir au moins 1"
+    );
     let (context, generated) = (1024, 256);
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let mut session = FlashNextSession::open(
@@ -1046,6 +1050,7 @@ fn bench_resident_decode_after_1k_context() {
         );
     }
     eprintln!("porte 45 tok/s à 1k : répétition la plus lente à {slowest:.1} tok/s");
+    assert!(slowest.is_finite(), "débit non mesuré : {slowest}");
     assert!(
         slowest >= 45.0,
         "porte de débit rouge : {slowest:.1} tok/s < 45"
@@ -1170,14 +1175,6 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
             "token {t}"
         );
     }
-    // Reset en échec après quelques couches : session invalidée, pas refusé ;
-    // un reset complet la réhabilite.
-    session.fail_reset_after_layer = Some(3);
-    assert!(session.reset().is_err(), "échec de reset ignoré");
-    assert!(
-        session.step(ids[0], true, false).is_err(),
-        "pas accepté après un reset partiel"
-    );
     // Reset : la séquence rejouée depuis le début redonne les mêmes logits.
     session.reset().expect("invariant: reset");
     for (t, &token) in ids.iter().enumerate().take(4) {
@@ -1187,6 +1184,29 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
         assert!(
             got.logits.expect("invariant: logits") == expected[t],
             "token {t} après reset"
+        );
+    }
+    // Reset en échec après quelques couches, capacité non saturée (4 / 16) :
+    // le pas suivant est refusé par l'invalidation, pas par la capacité ; un
+    // reset complet réhabilite la session.
+    session.fail_reset_after_layer = Some(3);
+    assert!(session.reset().is_err(), "échec de reset ignoré");
+    let refused = session
+        .step(ids[4], true, false)
+        .err()
+        .expect("pas accepté après un reset partiel");
+    assert!(
+        refused.to_string().contains("session invalidée"),
+        "refus inattendu : {refused}"
+    );
+    session.reset().expect("invariant: reset complet");
+    for (t, &token) in ids.iter().enumerate().take(2) {
+        let got = session
+            .step(token, true, false)
+            .expect("invariant: pas après reset complet");
+        assert!(
+            got.logits.expect("invariant: logits") == expected[t],
+            "token {t} après reset complet"
         );
     }
 }
