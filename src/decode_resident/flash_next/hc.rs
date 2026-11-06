@@ -140,7 +140,7 @@ pub(crate) fn encode_hc_combine(
     set_value(
         encoder,
         4,
-        &[dims.hidden as u32, dims.hc as u32, INJECT_CHUNKS as u32],
+        &[dims.hidden as u32, dims.hc as u32, INJECT_CHUNKS as u32, 0],
     );
     dispatch_1d(encoder, dims.width());
     post_dispatch_barrier(encoder);

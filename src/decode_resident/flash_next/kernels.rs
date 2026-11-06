@@ -48,7 +48,7 @@ kernel void flash_next_rms_norm_1p_groups_f32(
 }
 
 // Injection, sommes partielles : `partial[s, c] = Σ_{d ∈ tranche c} W[s, d]·n[d]`,
-// une tranche contiguë de `width / chunks` valeurs par threadgroup (256).
+// une tranche contiguë d'environ `width / chunks` valeurs par threadgroup (256).
 kernel void flash_next_hc_inject_partial_f32(
     device const float* normed [[buffer(0)]],
     device const float* w [[buffer(1)]],
@@ -62,11 +62,12 @@ kernel void flash_next_hc_inject_partial_f32(
     threadgroup float shared[8];
     const uint width = dims.x;
     const uint chunks = dims.y;
-    const uint len = width / chunks;
-    const uint start = tg.x * len;
+    // Tranches [c·width/chunks, (c+1)·width/chunks) : couvrent toute la ligne.
+    const uint start = tg.x * width / chunks;
+    const uint end = (tg.x + 1u) * width / chunks;
     const uint row = tg.y * width;
     float acc = 0.0f;
-    for (uint d = start + tid; d < start + len; d += 256u) {
+    for (uint d = start + tid; d < end; d += 256u) {
         acc += w[row + d] * normed[d];
     }
     acc = simd_sum(acc);
@@ -119,13 +120,13 @@ kernel void flash_next_hc_mix_f32(
 }
 
 // `out[s,d] = h[s,d] + 2σ(inj[s]/hc)·f[d]`, `inj[s]` réduit ici des
-// `chunks` sommes partielles de l'injection. dims = (hidden, hc, chunks).
+// `chunks` sommes partielles de l'injection. dims = (hidden, hc, chunks, 0).
 kernel void flash_next_hc_combine_f32(
     device const float* h [[buffer(0)]],
     device const float* partial [[buffer(1)]],
     device const float* f [[buffer(2)]],
     device float* out [[buffer(3)]],
-    constant uint3& dims [[buffer(4)]],
+    constant uint4& dims [[buffer(4)]],
     uint i [[thread_position_in_grid]]
 ) {
     const uint hidden = dims.x;
@@ -291,8 +292,16 @@ impl FlashNextKernels {
                 .next()
                 .ok_or_else(|| crate::InferError::Metal("pipeline Flash-Next absent".to_string()))
         };
+        let rms_norm_1p_groups = next()?;
+        // La norme groupée suppose 1024 threads (32 simdgroups, `partial[32]`).
+        if rms_norm_1p_groups.max_total_threads_per_threadgroup() < 1024 {
+            return Err(crate::InferError::Metal(format!(
+                "norme groupée Flash-Next : {} threads par threadgroup, 1024 requis",
+                rms_norm_1p_groups.max_total_threads_per_threadgroup()
+            )));
+        }
         Ok(Self {
-            rms_norm_1p_groups: next()?,
+            rms_norm_1p_groups,
             hc_silu_scale: next()?,
             hc_mix: next()?,
             hc_combine: next()?,

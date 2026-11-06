@@ -1418,3 +1418,48 @@ fn bench_hc_pieces_at_real_dims() -> Result<()> {
     })?;
     Ok(())
 }
+
+/// Injection en tranches : la somme des partiels couvre toute la ligne, y
+/// compris quand la largeur n'est pas divisible par le nombre de tranches.
+#[test]
+fn hc_inject_partials_cover_widths_not_divisible_by_chunks() -> Result<()> {
+    use super::hc::INJECT_CHUNKS;
+    let Some(executor) = executor()? else {
+        return Ok(());
+    };
+    let kernels = FlashNextKernels::new(executor.device())?;
+    let mut rng = DeterministicF32::new(0x1c);
+    for width in [10_240_usize, 10_248, 1_000, 37] {
+        let normed = rng.fill(width, -1.0, 1.0);
+        let w = rng.fill(4 * width, -0.5, 0.5);
+        let partial = zeros(&executor, 4 * INJECT_CHUNKS);
+        let queue = executor.device().new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&kernels.hc_inject_partial);
+        encoder.set_buffer(0, Some(&buffer(&executor, &normed)), 0);
+        encoder.set_buffer(1, Some(&buffer(&executor, &w)), 0);
+        encoder.set_buffer(2, Some(&partial), 0);
+        super::set_value(encoder, 3, &[width as u32, INJECT_CHUNKS as u32]);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(INJECT_CHUNKS as u64, 4, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        let got = read_f32_buffer(&partial, 4 * INJECT_CHUNKS)?;
+        for row in 0..4 {
+            let sum: f32 = got[row * INJECT_CHUNKS..(row + 1) * INJECT_CHUNKS]
+                .iter()
+                .sum();
+            let want: f64 = (0..width)
+                .map(|d| f64::from(w[row * width + d]) * f64::from(normed[d]))
+                .sum();
+            assert!(
+                (f64::from(sum) - want).abs() <= 1.0e-4 * want.abs().max(1.0),
+                "largeur {width}, ligne {row} : {sum} contre {want}"
+            );
+        }
+    }
+    Ok(())
+}
