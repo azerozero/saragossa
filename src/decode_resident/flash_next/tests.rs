@@ -2813,6 +2813,35 @@ fn n2_resident_mtp_head_matches_cpu() {
     assert_eq!(rows, 4095, "paires MTP");
     assert_eq!(h.len(), rows * width, "h MTP");
     assert!(!positions.is_empty() && positions.iter().all(|&p| p < rows));
+    let shape = |name: &str| golden_tensor(&golden, name).0;
+    assert_eq!(shape("mtp_h"), vec![rows, width], "forme mtp_h");
+    assert_eq!(
+        shape("mtp_input"),
+        vec![positions.len(), width],
+        "forme mtp_input"
+    );
+    assert_eq!(
+        shape("mtp_output"),
+        vec![positions.len(), width],
+        "forme mtp_output"
+    );
+    assert_eq!(
+        shape("routing.0"),
+        vec![rows, config.top_k],
+        "forme du routage"
+    );
+    assert_eq!(
+        shape("router_logits.0"),
+        vec![rows, config.experts],
+        "forme des logits du routeur"
+    );
+    // Frontière du régime creux parmi les positions figées des logits.
+    assert!(
+        positions
+            .iter()
+            .any(|&p| p + 1 >= dense_max_visible(keep * compress, compress) && p < rows),
+        "aucune position figée en régime creux"
+    );
     assert!(rows > sparse_start + 4, "régime creux non couvert");
     let started = std::time::Instant::now();
     let h_tensor = Tensor::from_vec(vec![rows, width], h.clone()).expect("invariant: forme");
@@ -2857,8 +2886,8 @@ fn n2_resident_mtp_head_matches_cpu() {
     let (mut in_err, mut out_err, mut score_err, mut kl_max) = (0.0_f64, 0.0, 0.0, 0.0_f64);
     let (mut sel_swaps, mut sel_bad, mut route_swaps, mut route_bad, mut argmax_bad) =
         (0, 0, 0, 0, 0);
-    let (mut gpu_out, mut gpu_routing, mut gpu_qsa, mut drafts) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut gpu_out, mut gpu_in, mut gpu_routing, mut gpu_qsa, mut drafts) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for j in 0..rows {
         let at = positions.iter().position(|&p| p == j);
         let step = session
@@ -2941,6 +2970,7 @@ fn n2_resident_mtp_head_matches_cpu() {
                 }
             }
             gpu_out.extend_from_slice(&hidden);
+            gpu_in.extend_from_slice(&step.input);
             gpu_routing.push(routing);
             gpu_qsa.push(qsa);
             drafts.push(gpu_top);
@@ -2949,6 +2979,7 @@ fn n2_resident_mtp_head_matches_cpu() {
 
     // Triangulation avec transformers aux positions figées.
     let torch_err = golden_error(&gpu_out, &golden_f32(&golden, "mtp_output"));
+    let torch_in_err = golden_error(&gpu_in, &golden_f32(&golden, "mtp_input"));
     let torch_ids = golden_i64(&golden, "routing.0");
     let torch_logits = golden_f32(&golden, "router_logits.0");
     let experts = config.experts;
@@ -2969,12 +3000,21 @@ fn n2_resident_mtp_head_matches_cpu() {
         let max = logits_p.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let exp: Vec<f32> = logits_p.iter().map(|v| (v - max).exp()).collect();
         let sum: f32 = exp.iter().sum();
-        let mut probs: Vec<f32> = exp.iter().map(|v| v / sum).collect();
+        let probs: Vec<f32> = exp.iter().map(|v| v / sum).collect();
         let mut torch_set: Vec<usize> = torch_ids[p * top_k..(p + 1) * top_k].to_vec();
         torch_set.sort_unstable();
         if gpu_routing[i] != torch_set {
-            probs.sort_by(|a, b| b.total_cmp(a));
-            if !within(probs[top_k - 1] - probs[top_k], 1.0e-5) {
+            // Chaque expert échangé doit être au seuil torch du top-k.
+            let mut sorted = probs.clone();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let threshold = sorted[top_k - 1];
+            let swapped = gpu_routing[i]
+                .iter()
+                .filter(|e| !torch_set.contains(e))
+                .chain(torch_set.iter().filter(|e| !gpu_routing[i].contains(e)));
+            if !swapped.into_iter().all(|&e| {
+                within(probs[e] - threshold, 1.0e-5) && within(threshold - probs[e], 1.0e-5)
+            }) {
                 torch_route_bad += 1;
             }
         }
@@ -3018,7 +3058,7 @@ fn n2_resident_mtp_head_matches_cpu() {
         "MTP résidente : entrée {in_err:.2e}, sortie {out_err:.2e}, scores {score_err:.2e}, \
          sélections ≠ {sel_swaps} (injustifiées {sel_bad}), routages ≠ {route_swaps} \
          (injustifiés {route_bad}), KL max {kl_max:.2e}, argmax injustifiés {argmax_bad} ; \
-         transformers : sortie {torch_err:.2e}, scores {torch_score_err:.2e}, routages \
+         transformers : entrée {torch_in_err:.2e}, sortie {torch_err:.2e}, scores {torch_score_err:.2e}, routages \
          injustifiés {torch_route_bad}, sélections injustifiées {torch_sel_bad} ; accord avec \
          le tronc {agree}/{denominator}"
     );
@@ -3027,6 +3067,7 @@ fn n2_resident_mtp_head_matches_cpu() {
         && within(score_err, f64::from(ANCHORED_TIE))
         && within(kl_max, 1.0e-3)
         && within(torch_err, ANCHORED_OUTPUT_TOL)
+        && within(torch_in_err, ANCHORED_OUTPUT_TOL)
         && within(torch_score_err, 1.0e-4)
         && sel_bad == 0
         && route_bad == 0
@@ -3209,7 +3250,7 @@ fn n2_resident_mtp_head_matches_cpu() {
     // bloc (`cp + 2` termine le bloc `(cp + 2) / 4`), restauration, puis
     // continuation exacte jusqu'à `cp + 8`.
     session.reset().expect("invariant: reset");
-    let cp = sparse_start - 1;
+    let cp = sparse_start - 2;
     assert_eq!(
         (cp + 2) % compress,
         compress - 1,
@@ -3254,11 +3295,22 @@ fn n2_resident_mtp_head_matches_cpu() {
     }
     // Draft enchaîné : entrée résidente (sortie du pas précédent) contre la
     // même entrée relue sur l'hôte, au bit près.
-    let chained = session
-        .mtp_hidden_buffer()
-        .cloned()
-        .expect("invariant: sortie résidente");
-    let host_copy = read_f32_buffer(&chained, width).expect("invariant: relecture");
+    // Copie réelle : le buffer de sortie de la session est réécrit par le pas
+    // hôte, un alias fausserait la comparaison.
+    let host_copy = read_f32_buffer(
+        session
+            .mtp_hidden_buffer()
+            .expect("invariant: sortie résidente"),
+        width,
+    )
+    .expect("invariant: relecture");
+    let chained = metal::Device::system_default()
+        .expect("invariant: device Metal")
+        .new_buffer_with_data(
+            host_copy.as_ptr().cast(),
+            std::mem::size_of_val(host_copy.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
     let before = session
         .checkpoint(None)
         .expect("invariant: point de reprise");

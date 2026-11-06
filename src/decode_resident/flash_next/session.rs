@@ -646,7 +646,9 @@ impl FlashNextSession {
     }
 
     /// Octets alloués par la session hors poids (oracles) : buffers propres,
-    /// états DeltaNet et instantanés, KV f32.
+    /// états DeltaNet et instantanés, KV f32. Les buffers de capture des
+    /// oracles (`#[cfg(test)]`) sont exclus de la mesure comme du budget de
+    /// production.
     #[cfg(test)]
     pub(crate) fn owned_state_bytes(&self) -> u64 {
         let c = &self.ckpt.config;
