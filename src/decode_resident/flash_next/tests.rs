@@ -526,3 +526,57 @@ fn n2_resident_decode_matches_cpu_reference() {
         "argmax différent hors quasi-égalité : {swaps:?}"
     );
 }
+
+/// Débit AR résident : contexte de 1024 tokens (texte du golden), puis decode
+/// glouton chronométré token par token (temps mural, argmax relu). Affiche
+/// médiane, p10/p90 et le temps CPU de préparation (embedding + PLE). À lancer
+/// seulement machine libre.
+#[test]
+#[ignore = "débit : poids réels, machine libre"]
+fn bench_resident_decode_after_1k_context() {
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let (context, generated) = (1024, 256);
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        context + generated,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    let mut next = 0;
+    for &token in &ids[..context] {
+        next = session
+            .step(token, false, false)
+            .expect("invariant: contexte")
+            .argmax as usize;
+    }
+    let mut walls = Vec::with_capacity(generated);
+    let mut hosts = Vec::with_capacity(generated);
+    for _ in 0..generated {
+        let started = std::time::Instant::now();
+        let out = session.step(next, false, false).expect("invariant: decode");
+        walls.push(started.elapsed().as_secs_f64() * 1e3);
+        hosts.push(out.host.as_secs_f64() * 1e3);
+        next = out.argmax as usize;
+    }
+    let pct = |v: &mut Vec<f64>, q: f64| {
+        v.sort_by(f64::total_cmp);
+        v[((v.len() - 1) as f64 * q).round() as usize]
+    };
+    let (p10, p50, p90) = (
+        pct(&mut walls, 0.1),
+        pct(&mut walls, 0.5),
+        pct(&mut walls, 0.9),
+    );
+    let host = pct(&mut hosts, 0.5);
+    eprintln!(
+        "decode après {context} tokens, {generated} pas : médiane {p50:.2} ms ({:.1} tok/s), \
+         p10 {p10:.2}, p90 {p90:.2} ; préparation CPU médiane {host:.3} ms",
+        1e3 / p50
+    );
+}

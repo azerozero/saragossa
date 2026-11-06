@@ -36,6 +36,8 @@ pub(crate) struct StepOutput {
     pub(crate) logits: Option<Vec<f32>>,
     /// Résiduel élargi `[hc·hidden]` après chaque couche, si demandé.
     pub(crate) layers: Option<Vec<Vec<f32>>>,
+    /// Préparation CPU avant le commit (embedding, hachage, lectures PLE).
+    pub(crate) host: std::time::Duration,
 }
 
 /// Decode résident Flash-Next d'une séquence (≤ 2051 tokens).
@@ -243,6 +245,7 @@ impl FlashNextSession {
                 "Flash-Next résident : {DENSE_MAX_VISIBLE} tokens atteints (régime dense)"
             )));
         }
+        let host_started = std::time::Instant::now();
         // Embedding : ligne u8 déquantifiée, répétée sur les `hc` flux.
         let row = self.ckpt.affine_rows(
             &Qwen4ExpCheckpoint::trunk("embed_tokens"),
@@ -266,6 +269,7 @@ impl FlashNextSession {
         let mut bytes = vec![0_u8; c.ple_dim];
         self.ckpt.ngram_rows_raw(&ids, &mut bytes)?;
         self.ple_state.stage_bytes(&bytes)?;
+        let host = host_started.elapsed();
 
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -436,6 +440,7 @@ impl FlashNextSession {
                         .map(|all| all.chunks_exact(width).map(<[f32]>::to_vec).collect())
                 })
                 .transpose()?,
+            host,
         })
     }
 }
