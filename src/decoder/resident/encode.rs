@@ -52,6 +52,7 @@ impl CausalDecoder {
                 })? {
                     ResidentLayerBuffers::FullMoe(resolved) => {
                         let weights = FullAttnLayerWeights {
+                            rope_frequencies: &resolved.rope_frequencies,
                             input_norm: &resolved.input_norm,
                             qkv_proj: resolved.qkv_proj.as_ref(),
                             q_proj: &resolved.q_proj,
@@ -73,6 +74,7 @@ impl CausalDecoder {
                     }
                     ResidentLayerBuffers::FullRouted(resolved) => {
                         let weights = FullAttnRoutedLayerWeights {
+                            rope_frequencies: &resolved.rope_frequencies,
                             input_norm: &resolved.input_norm,
                             qkv_proj: &resolved.qkv_proj,
                             o_proj: &resolved.o_proj,
@@ -105,6 +107,7 @@ impl CausalDecoder {
                     )));
                 };
                 let weights = FullAttnDenseLayerWeights {
+                    rope_frequencies: &resolved.rope_frequencies,
                     input_norm: &resolved.input_norm,
                     qkv_proj: resolved.qkv_proj.as_ref(),
                     qkv_proj_without_gate: attention.v_proj.is_none()
@@ -377,6 +380,7 @@ impl CausalDecoder {
             )));
         };
         let weights = FullAttnLayerWeights {
+            rope_frequencies: &resolved.rope_frequencies,
             input_norm: &resolved.input_norm,
             qkv_proj: resolved.qkv_proj.as_ref(),
             q_proj: &resolved.q_proj,
@@ -530,6 +534,7 @@ impl CausalDecoder {
             )));
         };
         let weights = FullAttnDenseLayerWeights {
+            rope_frequencies: &resolved.rope_frequencies,
             input_norm: &resolved.input_norm,
             qkv_proj: resolved.qkv_proj.as_ref(),
             qkv_proj_without_gate: attention.v_proj.is_none() || self.config.attention_sinks,

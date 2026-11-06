@@ -321,6 +321,8 @@ fn full_attn_rows_tree_nax_matches_cpu() -> Result<()> {
 #[ignore = "GPU Metal requis : échoue explicitement sans device"]
 fn rope_rows_tree_rotates_at_depth() -> Result<()> {
     let state = gpu_state()?;
+    let frequencies =
+        crate::metal_backend::rope::create_rope_frequencies(state.device(), 1.0e7, 64)?;
     let (heads, head_dim, max_rows, base) = (4usize, 256usize, 16usize, 4093usize);
     let width = heads * head_dim;
     let input: Vec<f32> = (0..max_rows * width).map(|i| pseudo(300 + i)).collect();
@@ -351,11 +353,10 @@ fn rope_rows_tree_rotates_at_depth() -> Result<()> {
                 heads,
                 head_dim,
                 64,
-                64,
+                &frequencies,
                 base,
                 rows,
                 1.0e-6,
-                1.0e7,
             )?;
         }
         for (row, &depth) in depths.iter().enumerate() {
@@ -374,11 +375,10 @@ fn rope_rows_tree_rotates_at_depth() -> Result<()> {
                 heads,
                 head_dim,
                 64,
-                64,
+                &frequencies,
                 base + depth as usize,
                 1,
                 1.0e-6,
-                1.0e7,
             )?;
             executor.encode_copy_with_offsets(
                 encoder,

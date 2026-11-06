@@ -183,6 +183,7 @@ impl CausalDecoder {
                     .as_mut()
                     .ok_or_else(|| InferError::Metal("KV full-attn B absent (duo)".to_string()))?;
                 let weights = FullAttnLayerWeights {
+                    rope_frequencies: &resolved.rope_frequencies,
                     input_norm: &resolved.input_norm,
                     qkv_proj: resolved.qkv_proj.as_ref(),
                     q_proj: &resolved.q_proj,

@@ -69,6 +69,8 @@ mod types;
 mod utils;
 
 #[cfg(test)]
+mod rope_tests;
+#[cfg(test)]
 mod rows_nax_tests;
 #[cfg(test)]
 mod rows_tree_tests;

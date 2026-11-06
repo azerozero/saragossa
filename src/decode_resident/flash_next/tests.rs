@@ -367,7 +367,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         o_proj: o_gpu,
         q_norm: buffer(&executor, &one_plus(&q_norm)),
         k_norm: buffer(&executor, &one_plus(&k_norm)),
-        freqs: buffer(&executor, &crate::qwen4_exp::math::inv_freq(64, 1.0e7)),
+        freqs: buffer(&executor, &crate::rope::inv_freq(64, 1.0e7)),
         indexer: None,
     };
     let capacity = tokens.max(64);
@@ -2142,7 +2142,7 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
     use crate::qwen4_exp::attention::{
         block_scores, qsa, select_from_scores, QsaDims, QsaWeights as CpuQsa,
     };
-    use crate::qwen4_exp::math::inv_freq;
+    use crate::rope::inv_freq;
     let Some(executor) = executor()? else {
         return Ok(());
     };
@@ -2344,8 +2344,8 @@ fn bench_resident_decode_after_32k_context() {
     use crate::qwen4_exp::attention::{
         pooled_block_keys, query_block_scores, select_for_query, QsaDims,
     };
-    use crate::qwen4_exp::math::inv_freq;
     use crate::qwen_loader::qwen4_exp::{Qwen4ExpCheckpoint, Qwen4ExpLayerKind};
+    use crate::rope::inv_freq;
     let dir = std::path::PathBuf::from(
         std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
     );
@@ -2386,7 +2386,7 @@ fn bench_resident_decode_after_32k_context() {
         compress: c.indexer_compress,
         eps: c.rms_eps,
     };
-    let freqs = inv_freq(c.rotary_dim, c.rope_theta);
+    let freqs = inv_freq(c.rotary_dim, c.rope_theta as f32);
     let k_norm = ckpt
         .floats(&format!(
             "{}self_attn.indexer.k_layernorm.weight",
@@ -2561,17 +2561,21 @@ fn resident_session_allocates_max_capacity() {
 /// RoPE résidente de Flash-Next (`encode_norm_rope` : q/k de l'attention et
 /// requêtes de l'indexeur) contre `rms_norm_1p` + `rope_in_place` CPU aux
 /// positions longues : l'angle `position·inv_freq` doit rester exact à 1e-5
-/// jusqu'à 262 143. Le kernel générique de l'arène (fast-math, `pow`) sert de
-/// témoin : il dépasse 1e-4 dès 32k.
+/// jusqu'à 262 143. La copie figée de l'ancien kernel d'arène (fast-math,
+/// `position / pow`) sert de témoin : elle dépasse 1e-4 dès 32k.
 #[test]
 fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
     use super::attention::encode_norm_rope;
-    use crate::decode_resident::DecodeResidentState;
-    use crate::qwen4_exp::math::{inv_freq, rms_norm_1p, rope_in_place};
+    use crate::qwen4_exp::math::{rms_norm_1p, rope_in_place};
+    use crate::rope::inv_freq;
     let Some(executor) = executor()? else {
         return Ok(());
     };
-    let arena = DecodeResidentState::new(executor.device().clone())?;
+    let legacy = crate::decode_resident::kernels::compile_kernel(
+        executor.device(),
+        crate::decode_resident::tests::LEGACY_ROPE_DECODE_KERNEL,
+        "rms_norm_rope_heads_decode_f32",
+    )?;
     let kernels = FlashNextKernels::new(executor.device())?;
     let queue = executor.device().new_command_queue();
     let mut report = Vec::new();
@@ -2582,7 +2586,7 @@ fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
         let x = rng.fill(heads * d, -1.0, 1.0);
         let w = rng.fill(d, -0.3, 0.3);
         let gains: Vec<f32> = w.iter().map(|v| 1.0 + v).collect();
-        let freqs = inv_freq(rotary, f64::from(theta));
+        let freqs = inv_freq(rotary, theta);
         let (x_buf, gains_buf, freqs_buf) = (
             buffer(&executor, &x),
             buffer(&executor, &gains),
@@ -2596,10 +2600,22 @@ fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
                 &kernels, encoder, &x_buf, &gains_buf, &freqs_buf, &out, heads, d, rotary,
                 position, 1.0e-6,
             )?;
-            arena.encode_rms_norm_rope_decode(
-                encoder, &x_buf, &gains_buf, &witness, heads, d, rotary, rotary, position, 1.0e-6,
-                theta,
-            )?;
+            // Témoin : ancien kernel, `frequency_dim` passé en octets (slot 5).
+            encoder.set_compute_pipeline_state(&legacy);
+            encoder.set_buffer(0, Some(&x_buf), 0);
+            encoder.set_buffer(1, Some(&gains_buf), 0);
+            encoder.set_buffer(2, Some(&witness), 0);
+            super::set_value(
+                encoder,
+                3,
+                &[heads as u32, d as u32, rotary as u32, position as u32],
+            );
+            super::set_value(encoder, 4, &[1.0e-6_f32, theta]);
+            super::set_value(encoder, 5, &(rotary as u32));
+            encoder.dispatch_thread_groups(
+                metal::MTLSize::new(heads as u64, 1, 1),
+                metal::MTLSize::new(256, 1, 1),
+            );
             encoder.end_encoding();
             commit_and_wait(command_buffer)?;
             let mut want = rms_norm_1p(&x, d, d, &w, 1.0e-6);
@@ -2612,7 +2628,7 @@ fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
         }
     }
     eprintln!(
-        "RoPE résidente contre CPU (d, position, écart Flash-Next, écart arène) : {report:?}"
+        "RoPE résidente contre CPU (d, position, écart Flash-Next, écart du témoin figé) : {report:?}"
     );
     for (d, position, err, _) in &report {
         assert!(*err <= 1.0e-5, "d {d}, position {position} : {err}");
@@ -2620,7 +2636,7 @@ fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
     // Le témoin montre que le test discrimine l'angle imprécis.
     assert!(
         report.iter().any(|r| r.3 > 1.0e-4),
-        "le kernel de l'arène ne s'écarte plus aux positions longues"
+        "le témoin figé ne s'écarte plus aux positions longues"
     );
     Ok(())
 }

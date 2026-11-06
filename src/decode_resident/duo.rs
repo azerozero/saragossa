@@ -145,10 +145,9 @@ impl DecodeResidentState {
                 dims.q_heads,
                 dims.head_dim,
                 dims.rope_dims,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 positions[stream],
                 dims.eps,
-                dims.theta,
             )?;
             self.encode_rms_norm_rope_decode_with_offset(
                 encoder,
@@ -159,10 +158,9 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 positions[stream],
                 dims.eps,
-                dims.theta,
             )?;
             kv_state.encode_append_kv_with_offsets(
                 encoder,

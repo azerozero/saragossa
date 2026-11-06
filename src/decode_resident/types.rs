@@ -6,6 +6,8 @@ use super::*;
 /// au setup de génération, sans lookup de cache dans le chemin par token.
 #[derive(Clone, Copy)]
 pub(crate) struct FullAttnLayerWeights<'a> {
+    /// Table résolue au setup pour éviter tout verrou pendant l'encodage.
+    pub rope_frequencies: &'a BufferRef,
     pub input_norm: &'a Buffer,
     pub qkv_proj: Option<&'a MetalLinearWeightBuffers>,
     pub q_proj: &'a MetalLinearWeightBuffers,
@@ -25,6 +27,8 @@ pub(crate) struct FullAttnLayerWeights<'a> {
 /// Poids d'UNE couche full-attn MoE routed-only résidente.
 #[derive(Clone, Copy)]
 pub(crate) struct FullAttnRoutedLayerWeights<'a> {
+    /// Table résolue au setup pour éviter tout verrou pendant l'encodage.
+    pub rope_frequencies: &'a BufferRef,
     pub input_norm: &'a Buffer,
     /// Le chemin routed-only résident est construit uniquement quand le QKV
     /// concaténé est disponible. Sinon le setup refuse le decode résident avant
@@ -45,6 +49,8 @@ pub(crate) struct FullAttnRoutedLayerWeights<'a> {
 /// du chemin MoE pour garder les préconditions et les poids MoE inchangés.
 #[derive(Clone, Copy)]
 pub(crate) struct FullAttnDenseLayerWeights<'a> {
+    /// Table résolue au setup pour éviter tout verrou pendant l'encodage.
+    pub rope_frequencies: &'a BufferRef,
     pub input_norm: &'a Buffer,
     pub qkv_proj: Option<&'a MetalLinearWeightBuffers>,
     /// Emploie `qkv_proj` (si présent) hors porte de sortie : layout K=V

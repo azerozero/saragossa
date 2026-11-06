@@ -1278,13 +1278,13 @@ fn rope_position_scale_one_is_bit_identical_to_raw_positions() {
             style,
         )
         .expect("invariant: rope valide");
-        // Référence indépendante : rotations recalculées à la main sans échelle.
+        // Même fréquence commune, mais positions brutes sans multiplication par l’échelle.
         let mut expected = x.data().to_vec();
+        let inv = crate::rope::inv_freq(4, 1_000_000.0);
         for pos in 0..2 {
             let position = (7 + pos) as f32;
-            for pair in 0..2 {
-                let exponent = (2 * pair) as f32 / 4.0;
-                let angle = position / 1_000_000.0_f32.powf(exponent);
+            for (pair, frequency) in inv.iter().enumerate() {
+                let angle = position * frequency;
                 let (cos, sin) = (angle.cos(), angle.sin());
                 let (first_index, second_index) = match style {
                     RopeStyle::Interleaved => (pos * 4 + 2 * pair, pos * 4 + 2 * pair + 1),
@@ -1298,6 +1298,47 @@ fn rope_position_scale_one_is_bit_identical_to_raw_positions() {
         }
         assert_eq!(raw.data(), expected.as_slice(), "style={style:?}");
     }
+}
+
+/// Verrouille l’ordre des opérations aux longues positions et la clé du cache,
+/// y compris la dimension fréquentielle globale distincte de la largeur rotée.
+#[test]
+fn rope_rotations_use_scaled_positions_times_common_frequencies() -> Result<()> {
+    for frequency_dim in [128, 256] {
+        for theta in [10_000.0, 1_000_000.0] {
+            let inv = crate::rope::inv_freq(frequency_dim, theta);
+            for rope_dims in [frequency_dim, frequency_dim / 2] {
+                for position_scale in [1.0, 0.125] {
+                    let rope = RopeParams {
+                        theta,
+                        frequency_dim,
+                        position_scale,
+                    };
+                    for position in [5, 2051, 32_767, 131_071, 262_143] {
+                        let rotations =
+                            super::attention_ops::rope_rotations(position, rope_dims, rope)?;
+                        let cached =
+                            super::attention_ops::rope_rotations(position, rope_dims, rope)?;
+                        assert!(std::sync::Arc::ptr_eq(&rotations, &cached));
+                        assert_eq!(rotations.len(), rope_dims / 2);
+                        for ((cos, sin), frequency) in rotations.iter().zip(&inv) {
+                            let angle = (position as f32 * position_scale) * frequency;
+                            // `cosf`/`sinf` peuvent différer d'un ulp entre debug
+                            // et release (optimisations de libm) : 2 ulp admis.
+                            // L'ancienne forme `/powf` décale l'angle d'environ
+                            // un ulp d'angle, soit bien plus de 2 ulp de cos/sin
+                            // aux positions longues.
+                            let ulps =
+                                |a: f32, b: f32| (a.to_bits() as i64 - b.to_bits() as i64).abs();
+                            assert!(ulps(*cos, angle.cos()) <= 2, "cos à {position}");
+                            assert!(ulps(*sin, angle.sin()) <= 2, "sin à {position}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]

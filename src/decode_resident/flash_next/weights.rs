@@ -308,7 +308,7 @@ impl FlashNextWeights {
                     // Mêmes fréquences que la référence CPU (`inv_freq` en f32).
                     freqs: f32_buffer(
                         executor,
-                        &crate::qwen4_exp::math::inv_freq(c.rotary_dim, c.rope_theta),
+                        &crate::rope::inv_freq(c.rotary_dim, c.rope_theta as f32),
                     ),
                     indexer: Some(IndexerWeights {
                         qk_proj: resolve("indexer.index_qk_proj")?,

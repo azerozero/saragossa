@@ -43,16 +43,6 @@ pub(crate) fn rms_norm_1p(
     out
 }
 
-/// Fréquences inverses de la RoPE partielle : `θ^(−2i/rotary_dim)`, `i < rotary_dim/2`.
-///
-/// Calculées en f32 comme `1.0 / (base ** (arange(0, dim, 2) / dim))` amont.
-pub(crate) fn inv_freq(rotary_dim: usize, theta: f64) -> Vec<f32> {
-    let base = theta as f32;
-    (0..rotary_dim / 2)
-        .map(|i| 1.0 / base.powf((2 * i) as f32 / rotary_dim as f32))
-        .collect()
-}
-
 /// RoPE partielle `rotate_half` sur les `2·freqs.len()` premières dimensions de
 /// chaque tête de `x` (`[heads, head_dim]` aplati), à la position `position`.
 ///

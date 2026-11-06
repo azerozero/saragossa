@@ -114,6 +114,7 @@ struct DFlashResidentConv {
 }
 
 struct DFlashResidentLayer {
+    rope_frequencies: Buffer,
     input_norm: Buffer,
     post_norm: Buffer,
     q_norm: Buffer,
@@ -231,6 +232,7 @@ impl DFlashResident {
                 .then_some(info.sliding_window)
                 .flatten();
             layers.push(DFlashResidentLayer {
+                rope_frequencies: executor.rope_frequencies(dims.theta, dims.head_dim)?,
                 input_norm: executor
                     .cached_buffer_from_f32(layer.input_norm.data(), "dflash_input_norm")?,
                 post_norm: executor
@@ -462,11 +464,10 @@ impl DFlashResident {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.head_dim,
-                    dims.head_dim,
+                    &layer.rope_frequencies,
                     position,
                     chunk,
                     dims.eps,
-                    dims.theta,
                 )?;
                 layer.kv.encode_append_kv_rows(
                     encoder,
@@ -921,11 +922,10 @@ fn encode_block_attention(
             heads,
             dims.head_dim,
             dims.head_dim,
-            dims.head_dim,
+            &layer.rope_frequencies,
             context_len,
             block,
             dims.eps,
-            dims.theta,
         )?;
     }
     let window = layer.sliding_window;

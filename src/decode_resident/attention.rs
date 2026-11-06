@@ -499,7 +499,7 @@ impl DecodeResidentState {
     /// Renvoie une erreur si une dimension déborde `u32`.
     #[expect(
         clippy::too_many_arguments,
-        reason = "mirror des paramètres rms_norm+RoPE (dims + position + theta)"
+        reason = "mirror des paramètres rms_norm+RoPE (dims + position + fréquences)"
     )]
     pub(crate) fn encode_rms_norm_rope_decode(
         &self,
@@ -510,10 +510,9 @@ impl DecodeResidentState {
         num_heads: usize,
         head_dim: usize,
         rope_dims: usize,
-        rope_frequency_dim: usize,
+        frequencies: &BufferRef,
         position: usize,
         eps: f32,
-        base_theta: f32,
     ) -> Result<()> {
         self.encode_rms_norm_rope_decode_with_offset(
             encoder,
@@ -524,16 +523,15 @@ impl DecodeResidentState {
             num_heads,
             head_dim,
             rope_dims,
-            rope_frequency_dim,
+            frequencies,
             position,
             eps,
-            base_theta,
         )
     }
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "mirror des paramètres rms_norm+RoPE (dims + position + theta)"
+        reason = "mirror des paramètres rms_norm+RoPE (dims + position + fréquences)"
     )]
     pub(super) fn encode_rms_norm_rope_decode_with_offset(
         &self,
@@ -545,10 +543,9 @@ impl DecodeResidentState {
         num_heads: usize,
         head_dim: usize,
         rope_dims: usize,
-        rope_frequency_dim: usize,
+        frequencies: &BufferRef,
         position: usize,
         eps: f32,
-        base_theta: f32,
     ) -> Result<()> {
         let dims = rope_dims_param(num_heads, head_dim, rope_dims, position)?;
         self.encode_rms_norm_rope_decode_param(
@@ -559,9 +556,8 @@ impl DecodeResidentState {
             output,
             num_heads,
             dims,
-            rope_frequency_dim,
+            frequencies,
             eps,
-            base_theta,
         )
     }
 
@@ -569,7 +565,7 @@ impl DecodeResidentState {
     /// octets hôte (chemin historique) ou par buffer GPU (position GPU).
     #[expect(
         clippy::too_many_arguments,
-        reason = "mirror des paramètres rms_norm+RoPE (dims liés + theta)"
+        reason = "mirror des paramètres rms_norm+RoPE (dims liés + fréquences)"
     )]
     pub(super) fn encode_rms_norm_rope_decode_param(
         &self,
@@ -580,11 +576,11 @@ impl DecodeResidentState {
         output: &BufferRef,
         num_heads: usize,
         dims: U32x4Param<'_>,
-        rope_frequency_dim: usize,
+        frequencies: &BufferRef,
         eps: f32,
-        base_theta: f32,
     ) -> Result<()> {
-        let params: [f32; 2] = [eps, base_theta];
+        // Le second scalaire reste réservé dans l’ABI ; le kernel lit le slot 5.
+        let params: [f32; 2] = [eps, 0.0];
         encoder.set_compute_pipeline_state(&self.rope_decode_kernel);
         encoder.set_buffer(0, Some(input), input_offset);
         encoder.set_buffer(1, Some(weight), 0);
@@ -595,13 +591,7 @@ impl DecodeResidentState {
             std::mem::size_of::<[f32; 2]>() as u64,
             params.as_ptr().cast::<c_void>(),
         );
-        let rope_frequency_dim = u32::try_from(rope_frequency_dim)
-            .map_err(|_| InferError::Dimension("rope frequency_dim hors u32".to_string()))?;
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            std::ptr::from_ref(&rope_frequency_dim).cast::<c_void>(),
-        );
+        encoder.set_buffer(5, Some(frequencies), 0);
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(u64::from(to_u32(num_heads, "rope num_heads")?), 1, 1),
@@ -648,6 +638,11 @@ impl DecodeResidentState {
         let weight_lease = self.scratch.lease(head_dim, GpuElement::F32)?;
         write_f32_at(weight_lease.tensor(), 0, weight)?;
         let out_lease = self.scratch.lease(dim, GpuElement::F32)?;
+        let frequencies = crate::metal_backend::rope::create_rope_frequencies(
+            &self.device,
+            base_theta,
+            rope_dims,
+        )?;
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
@@ -659,10 +654,9 @@ impl DecodeResidentState {
             num_heads,
             head_dim,
             rope_dims,
-            rope_dims,
+            &frequencies,
             position,
             eps,
-            base_theta,
         )?;
         encoder_guard.end();
         commit_and_wait(command_buffer)?;
@@ -2164,6 +2158,7 @@ impl FullAttentionMetalState {
         v_buf: &BufferRef,
         v_offset: u64,
         rope: &FullAttnLayerDims,
+        frequencies: &BufferRef,
     ) -> Result<bool> {
         let pipeline = match self.format {
             KvFormat::F32 => &self.rope_append_kv[0],
@@ -2183,8 +2178,6 @@ impl FullAttentionMetalState {
         let offset = byte_offset(self.len * self.kv_dim(), element, "rope append KV offset")?;
         let dims = rope_dims_param(self.kv_heads, self.head_dim, rope.rope_dims, rope.position)?;
         let params: [f32; 2] = [rope.eps, rope.theta];
-        let frequency_dim = u32::try_from(rope.rope_frequency_dim)
-            .map_err(|_| InferError::Dimension("rope frequency_dim hors u32".to_string()))?;
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(k_raw), k_offset);
         encoder.set_buffer(1, Some(k_norm), 0);
@@ -2195,11 +2188,7 @@ impl FullAttentionMetalState {
             std::mem::size_of::<[f32; 2]>() as u64,
             params.as_ptr().cast::<c_void>(),
         );
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            std::ptr::from_ref(&frequency_dim).cast::<c_void>(),
-        );
+        encoder.set_buffer(5, Some(frequencies), 0);
         encoder.set_buffer(6, Some(v_buf), v_offset);
         encoder.set_buffer(7, Some(self.values.buffer()), offset);
         crate::metal_backend::profile_dispatch();

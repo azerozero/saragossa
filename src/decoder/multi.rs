@@ -200,6 +200,7 @@ impl CausalDecoder {
                         )));
                     };
                     let weights = FullAttnDenseLayerWeights {
+                        rope_frequencies: &resolved.rope_frequencies,
                         input_norm: &resolved.input_norm,
                         qkv_proj: resolved.qkv_proj.as_ref(),
                         qkv_proj_without_gate: attention.v_proj.is_none()

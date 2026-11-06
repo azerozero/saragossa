@@ -214,10 +214,9 @@ impl DecodeResidentState {
                 dims.q_heads,
                 dims.head_dim,
                 dims.rope_dims,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 dims.position,
                 dims.eps,
-                dims.theta,
             )?;
             Self::encode_query_attention_scale(
                 executor,
@@ -237,10 +236,9 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 dims.position,
                 dims.eps,
-                dims.theta,
             )?;
             let v_offset = row_offset(row, v_source.1, v_source.2, "multi v row")?;
             if weights.value_norm {

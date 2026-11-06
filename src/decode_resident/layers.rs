@@ -229,10 +229,9 @@ impl DecodeResidentState {
             dims.q_heads,
             dims.head_dim,
             dims.rope_dims,
-            dims.rope_frequency_dim,
+            weights.rope_frequencies,
             dims.position,
             dims.eps,
-            dims.theta,
         )?;
         Self::encode_query_attention_scale(
             executor,
@@ -260,10 +259,9 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 dims.position,
                 dims.eps,
-                dims.theta,
             )?;
             kv.encode_append_kv_with_offsets(
                 encoder,
@@ -281,10 +279,9 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 dims.position,
                 dims.eps,
-                dims.theta,
             )?;
             kv.encode_append_kv(encoder, k_roped.tensor().buffer(), v_raw.tensor().buffer())?;
         }
@@ -547,10 +544,9 @@ impl DecodeResidentState {
             dims.q_heads,
             dims.head_dim,
             dims.rope_dims,
-            dims.rope_frequency_dim,
+            weights.rope_frequencies,
             dims.position,
             dims.eps,
-            dims.theta,
         )?;
         Self::encode_query_attention_scale(
             executor,
@@ -570,10 +566,9 @@ impl DecodeResidentState {
             dims.kv_heads,
             dims.head_dim,
             dims.rope_dims,
-            dims.rope_frequency_dim,
+            weights.rope_frequencies,
             dims.position,
             dims.eps,
-            dims.theta,
         )?;
         kv.encode_append_kv_with_offsets(
             encoder,
@@ -901,10 +896,9 @@ impl DecodeResidentState {
             dims.q_heads,
             dims.head_dim,
             dims.rope_dims,
-            dims.rope_frequency_dim,
+            weights.rope_frequencies,
             dims.position,
             dims.eps,
-            dims.theta,
         )?;
         Self::encode_query_attention_scale(
             executor,
@@ -960,8 +954,8 @@ impl DecodeResidentState {
         // TODO: élargir l'append fusionné à Qwen et Gemma (value_norm, V séparé,
         // K=V) après un A/B intégré aux dimensions réelles ; seul flint (sinks)
         // est prouvé sur poids réels.
-        let fused = kv.has_sinks()
-            && kv.encode_rope_append_kv(
+        let fused = if kv.has_sinks() {
+            kv.encode_rope_append_kv(
                 encoder,
                 k_source,
                 k_offset,
@@ -969,7 +963,11 @@ impl DecodeResidentState {
                 v_source,
                 v_offset,
                 &dims,
-            )?;
+                weights.rope_frequencies,
+            )?
+        } else {
+            false
+        };
         if !fused {
             self.encode_rms_norm_rope_decode_with_offset(
                 encoder,
@@ -980,10 +978,9 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 dims.position,
                 dims.eps,
-                dims.theta,
             )?;
             kv.encode_append_kv_with_offsets(
                 encoder,
@@ -1219,6 +1216,7 @@ impl DecodeResidentState {
         // la queue dense, que `shared_moe` remplace : `o_proj` et `input_norm`
         // tiennent leur place sans jamais être lus à ce titre.
         let attention = FullAttnDenseLayerWeights {
+            rope_frequencies: weights.rope_frequencies,
             input_norm: weights.input_norm,
             qkv_proj: weights.qkv_proj,
             qkv_proj_without_gate: false,
@@ -1561,11 +1559,10 @@ impl DecodeResidentState {
                 dims.q_heads,
                 dims.head_dim,
                 dims.rope_dims,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 dims.position,
                 rows,
                 dims.eps,
-                dims.theta,
             )?;
             Self::encode_query_attention_scale(
                 executor,
@@ -1598,11 +1595,10 @@ impl DecodeResidentState {
                 dims.kv_heads,
                 dims.head_dim,
                 dims.rope_dims,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 dims.position,
                 rows,
                 dims.eps,
-                dims.theta,
             )?;
             let v_source = if weights.qkv_proj.is_some() {
                 kv_source
@@ -1652,9 +1648,8 @@ impl DecodeResidentState {
                 q_roped.tensor().buffer(),
                 dims.q_heads,
                 rope_q,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 dims.eps,
-                dims.theta,
             )?;
             Self::encode_query_attention_scale(
                 executor,
@@ -1702,9 +1697,8 @@ impl DecodeResidentState {
                 k_roped.tensor().buffer(),
                 dims.kv_heads,
                 rope_k,
-                dims.rope_frequency_dim,
+                weights.rope_frequencies,
                 dims.eps,
-                dims.theta,
             )?;
             let v_offset = if weights.qkv_proj.is_some() {
                 let qkv_row = row.checked_mul(qkv_proj_dim).ok_or_else(|| {

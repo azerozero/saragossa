@@ -955,6 +955,12 @@ pub(super) fn rope_rotations(
     rope_dims: usize,
     rope: RopeParams,
 ) -> Result<RopeRotations> {
+    if rope.frequency_dim < rope_dims || rope.frequency_dim % 2 != 0 {
+        return Err(InferError::Dimension(format!(
+            "RoPE frequency_dim {} invalide pour rope_dims {rope_dims}",
+            rope.frequency_dim
+        )));
+    }
     static CACHE: OnceLock<RopeRotationCache> = OnceLock::new();
     let key = RopeRotationKey {
         position,
@@ -972,15 +978,28 @@ pub(super) fn rope_rotations(
             return Ok(rotations.clone());
         }
     }
+    // Les fréquences ne dépendent pas de la position : chaque base/dimension
+    // est calculée une fois, même lorsque le cache de rotations s'enrichit.
+    type Frequencies = Mutex<HashMap<(u32, usize), Arc<Vec<f32>>>>;
+    static FREQUENCIES: OnceLock<Frequencies> = OnceLock::new();
+    let inv = {
+        let mut cache = FREQUENCIES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| InferError::Config("cache fréquences RoPE empoisonné".to_string()))?;
+        cache
+            .entry((rope.theta.to_bits(), rope.frequency_dim))
+            .or_insert_with(|| Arc::new(crate::rope::inv_freq(rope.frequency_dim, rope.theta)))
+            .clone()
+    };
     let pairs = rope_dims / 2;
     let mut rotations = Vec::with_capacity(pairs);
     // Échelle linéaire des positions (rope_scaling Gemma 3) appliquée AVANT la
     // fréquence, comme `mx.fast.rope(scale=1/factor)` ; `pos × 1.0` reste
     // bit-identique à `pos` (byte-identité des modèles non scalés).
     let scaled_position = position as f32 * rope.position_scale;
-    for pair in 0..pairs {
-        let exponent = (2 * pair) as f32 / rope.frequency_dim as f32;
-        let angle = scaled_position / rope.theta.powf(exponent);
+    for &frequency in inv.iter().take(pairs) {
+        let angle = scaled_position * frequency;
         rotations.push((angle.cos(), angle.sin()));
     }
     let rotations = Arc::new(rotations);

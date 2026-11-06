@@ -1197,14 +1197,14 @@ fn apply_rope_heads(
         )));
     }
     let half = head_dim / 2;
+    let inv = crate::rope::inv_freq(head_dim, theta);
     let mut out = x.data().to_vec();
     for row in 0..rows {
         let pos = (position_offset + row) as f32;
         for head in 0..heads {
             let base = row * cols + head * head_dim;
-            for dim in 0..half {
-                let exponent = (2 * dim) as f32 / head_dim as f32;
-                let angle = pos / theta.powf(exponent);
+            for (dim, frequency) in inv.iter().enumerate() {
+                let angle = pos * frequency;
                 let (sin, cos) = angle.sin_cos();
                 let left = x.data()[base + dim];
                 let right = x.data()[base + half + dim];

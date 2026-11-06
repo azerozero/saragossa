@@ -107,6 +107,7 @@ pub(crate) use self::prefill::with_prefill_kv_reserve;
 #[cfg(test)]
 pub(crate) use self::prefill::{with_router_capture, RouterCapture};
 mod profiling;
+pub(crate) mod rope;
 mod scratch;
 // Fondation du K/V sparse : seuls ses tests l'utilisent avant A2.
 #[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
@@ -206,6 +207,7 @@ fn affine_biases_offset(weight: &AffineQuantizedTensor) -> Result<NSUInteger> {
 /// Exécute les premiers kernels Metal du backend Rust expérimental.
 #[derive(Debug)]
 pub struct MetalExecutor {
+    rope_frequencies: rope::RopeFrequencyCache,
     device: Device,
     queue: CommandQueue,
     dense_matmul_rhs_t_f32: ComputePipelineState,

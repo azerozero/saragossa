@@ -1151,7 +1151,7 @@ impl MetalExecutor {
         Ok(Some(*out_dim))
     }
 
-    pub(super) fn encode_rms_norm_rope_heads(
+    pub(crate) fn encode_rms_norm_rope_heads(
         &self,
         encoder: &ComputeCommandEncoderRef,
         input_buffer: &BufferRef,
@@ -1167,7 +1167,9 @@ impl MetalExecutor {
             checked_u32(spec.head_dim, "rope head_dim")?,
             checked_u32(spec.rope_dims, "rope dims")?,
         ];
+        let frequencies = self.rope_frequencies(spec.rope_theta, spec.rope_frequency_dim)?;
         encoder.set_compute_pipeline_state(&self.rms_norm_rope_heads_f32);
+        encoder.set_buffer(5, Some(&frequencies), 0);
         encoder.set_buffer(0, Some(input_buffer), 0);
         encoder.set_buffer(1, Some(weight_buffer), 0);
         encoder.set_buffer(2, Some(output_buffer), 0);
