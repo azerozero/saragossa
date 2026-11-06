@@ -12,6 +12,14 @@ use crate::qwen4_exp::math::relative_error;
 use crate::qwen4_exp::residual::{combine, GatedResidual};
 use crate::{AffineQuantizedTensor, InferError, LinearWeight, Result, Tensor};
 
+/// Longueur d'un oracle de brique : `default`, ou `SARAGOSSA_FLASH_NEXT_STEPS`
+/// pour la bisection longue (jusqu'à 2051 positions).
+fn oracle_steps(default: usize) -> usize {
+    crate::runtime_flags::env_var("SARAGOSSA_FLASH_NEXT_STEPS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 fn executor() -> Result<Option<MetalExecutor>> {
     match MetalExecutor::new() {
         Ok(executor) => Ok(Some(executor)),
@@ -294,7 +302,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         theta: 1.0e7,
         eps: 1.0e-6,
     };
-    let (tokens, q_dim, kv_dim) = (40, 24 * 256, 2 * 256);
+    let (tokens, q_dim, kv_dim) = (oracle_steps(40), 24 * 256, 2 * 256);
     let mut rng = DeterministicF32::new(0x05a0_0024);
     let (q_gpu, q_w) = u8_weight(&executor, &mut rng, 2 * q_dim, dims.hidden, 0.04)?;
     let (k_gpu, k_w) = u8_weight(&executor, &mut rng, kv_dim, dims.hidden, 0.04)?;
@@ -346,7 +354,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         q_norm: buffer(&executor, &one_plus(&q_norm)),
         k_norm: buffer(&executor, &one_plus(&k_norm)),
     };
-    let capacity = 64;
+    let capacity = tokens.max(64);
     let scratch = QsaScratch {
         q_gate: zeros(&executor, 2 * q_dim),
         q_raw: zeros(&executor, q_dim),

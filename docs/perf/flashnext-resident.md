@@ -20,47 +20,75 @@ l'orchestrateur des couches Qwen.
 ## N2 résident sur les vrais poids (test ignoré)
 
 `n2_resident_decode_matches_cpu_reference` : le GPU avance token par token
-(teacher forcing sur le texte du golden N2) contre la référence CPU f32 sans
-cache. Les deux chaînes sont natives et l'écart relatif est mesuré par couche
-et par token.
+(teacher forcing sur les 2051 premiers tokens du texte du golden N2) contre la
+référence CPU f32 sans cache. L'écart relatif est mesuré par couche et par
+token, la KL et l'argmax par token. Les préfixes de 64, 256 et 2051 tokens sont
+tirés d'un même passage : tout est causal.
 
-| tokens | écart max par couche | KL max | argmax ≠ | verdict |
-|---|---|---|---|---|
-| 64 | 1,4e-5 | 1,0e-8 | 0 | vert |
-| 256 | 2,1e-1 (dès la couche 15) | 1,35e-1 | 1 (token 201) | **rouge** |
-| 2051 | 1,25 (dès la couche 2) | 1,35e-1 | 26 | **rouge** |
+### Redéfinition de la porte
 
-### Diagnostic de la porte rouge
+Sur la chaîne native, une seule quasi-égalité du routeur suffit à faire
+diverger la suite de la séquence (diagnostic ci-dessous). La porte porte donc
+sur une **passe à routage imposé**, même logique que la justification par
+l'oracle de l'étape 1 :
 
-Sur 256 tokens, tout reste sous 1e-3 jusqu'au token 88. Le premier écart
-apparaît au **token 89, couche 15** (5,5e-2). En ce point, la marge du
-routeur CPU au seuil du top-10 vaut **2,1e-7** : c'est une quasi-égalité
-d'experts, justifiable par la règle des 1e-5.
+- aux points `(token, couche)` où la marge du routeur CPU au seuil du top-10
+  vaut au plus 1e-5, le MoE GPU reçoit les experts choisis par le CPU ;
+- l'imposition passe par `force_next_topk` (`cfg(test)` seulement, jamais en
+  production) : un kernel de top-k imposé recalcule les poids softmax sur les
+  experts imposés, comme le kernel normal ; la session vérifie que chaque
+  imposition a été consommée ;
+- le mécanisme est validé sur le MoE synthétique : le top-10 naturel imposé
+  redonne la sortie au bit près, et un autre ensemble suit le CPU à 1e-5.
 
-Une fois l'expert basculé, la sortie de ce token diffère de quelques
-pourcents. L'écart passe aux tokens suivants par l'état récurrent DeltaNet et
-le KV des couches suivantes : tous les tokens à partir de 90 dépassent 1e-3
-dès les couches 16 et 17. Le token 110 rebascule (marge 1,7e-5, mesurée sur
-une entrée déjà contaminée). La dérive s'amplifie ensuite en profondeur. Sur
-2051 tokens, la première bascule survient dès la couche 2.
+Porte, sur la passe imposée, à 64, 256 et 2051 tokens : écart ≤ 1e-3 par
+couche et par token, KL max ≤ 1e-3, argmax identique sauf quasi-égalité
+(écart de probabilité ≤ 1e-5). La chaîne native reste mesurée comme témoin,
+sans porte dure. Un test de mutation impose un mauvais expert sur un token à
+marge nette et exige que la porte passe au rouge.
 
-La porte « 1e-3 sur la chaîne native », sans dérogation, ne peut donc pas
-tenir sur les vrais poids au-delà de quelques dizaines de tokens. C'est une
-propriété de la chaîne et non une preuve de bug : une bascule quasi ex æquo
-contamine tout le reste de la séquence. Rien ne prouve pour autant l'absence
-de bug au-delà de 88 tokens.
+### Résultats (2051 tokens, 2871 impositions sur 2051 × 48 points)
 
-**Prochaine mesure proposée** (à décider) : une passe **à routage imposé**.
-Le MoE GPU reçoit les experts choisis par le CPU aux tokens où la marge est
-≤ 1e-5, et les sélections QSA restent denses. Si le moteur est exact, la
-chaîne doit rester au niveau de 1e-5 sur 2051 tokens. Il faut pour cela un
-buffer d'indices imposé dans le chemin MoE résident. Variante : ablation
-locale par couche, avec une entrée commune et un état CPU injecté.
+| passe | préfixe | écart max | KL max | argmax ≠ | tokens > 1e-3 |
+|---|---|---|---|---|---|
+| imposée | 64 | 1,4e-5 | 1,0e-8 | 0 | 0 |
+| imposée | 256 | 7,0e-5 | 1,0e-8 | 0 | 0 |
+| imposée | 2051 | 9,1e-4 | 1,0e-8 | 0 | 0 |
+| native (témoin) | 64 | 1,4e-5 | 1,0e-8 | 0 | 0 |
+| native (témoin) | 256 | 2,1e-1 | 1,35e-1 | 1 | 167 |
+| native (témoin) | 2051 | 1,25 | 1,35e-1 | 26 | 1962 |
+| mutation (token 38, couche 18, marge 8,6e-3) | 46 | 9,4e-2 | 2,15e-3 | — | rouge, comme attendu |
+
+**Porte verte** sur la passe imposée. Écart max par couche sur 2051 tokens :
+≈ 1e-5 jusqu'à la couche 13, puis une montée progressive avec des sauts aux
+couches QSA 27 et 31, jusqu'à 9,1e-4 (couche 32), avant de redescendre à
+3,5e-4 en sortie.
+
+**Bisection de cette montée.** Les oracles de brique, à entrée commune,
+tournent aussi sur 2051 positions (`SARAGOSSA_FLASH_NEXT_STEPS=2051`) :
+
+- attention QSA dense : ≤ 1e-5 à chaque pas ;
+- DeltaNet : sorties et état final ≤ 1e-5 ;
+- MoE et hyper-connections ne dépendent pas de la position.
+
+Aucune primitive ne dérive donc avec la longueur. Les 9e-4 viennent de
+l'amplification, le long des 48 couches, d'écarts d'arrondi de 1e-5 (ordre
+des sommes GPU et CPU), surtout dans l'attention à long contexte. La KL de
+1e-8 et l'argmax identique sur 2051 tokens le confirment.
+
+### Témoin natif : diagnostic
+
+Tout reste sous 1e-3 jusqu'au token 88. Le premier écart apparaît au
+**token 89, couche 15** (5,5e-2), où la marge du routeur CPU vaut **2,1e-7** :
+un expert bascule sur une quasi-égalité. L'écart passe ensuite aux tokens
+suivants par l'état récurrent DeltaNet et le KV des couches suivantes, puis
+s'amplifie en profondeur. Le même phénomène existe entre deux implémentations
+f32 quelconques ; il ne signale pas de défaut.
 
 ## Mémoire
 
 Pic `peak memory footprint` du binaire de test N2 sur 2051 tokens :
-**83,1 Go**. Ce pic inclut les poids GPU (~73 Go), la référence CPU (une
+**84,3 Go** (passes native, imposée et mutation). Ce pic inclut les poids GPU (~73 Go), la référence CPU (une
 couche déquantifiée à la fois) et ses résiduels conservés
 (48 × 2051 × 10240 f32, soit 4 Go). Chargement GPU : 33 à 43 s.
 

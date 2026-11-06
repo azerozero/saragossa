@@ -19,7 +19,10 @@ fn flash_next_linear_attn_resident_steps_match_naive_oracle_at_real_heads() -> R
         conv_kernel_dim: 4,
         rms_eps: 1.0e-6,
     };
-    let (hidden, seq) = (64, 6);
+    let seq = crate::runtime_flags::env_var("SARAGOSSA_FLASH_NEXT_STEPS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
+    let hidden = 64;
     let (key_dim, value_dim) = (16 * 128, 48 * 128);
     let conv_dim = 2 * key_dim + value_dim;
     let mut rng = DeterministicF32::new(0xf1a5_4e57);
