@@ -90,11 +90,7 @@ impl FlashNextWeights {
         guard: Option<&MemoryGuard>,
     ) -> Result<Self> {
         let c = &ckpt.config;
-        if !c.sigmoid_output_gate {
-            return Err(InferError::Config(
-                "Flash-Next résident : seule la gate σ du DeltaNet est prise en charge".to_string(),
-            ));
-        }
+        super::session::validate_resident_config(c)?;
         let mut weights = Self {
             layers: Vec::with_capacity(c.layer_kinds.len()),
             mixer: Self::hc(

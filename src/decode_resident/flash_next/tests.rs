@@ -301,6 +301,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         rotary_dim: 64,
         theta: 1.0e7,
         eps: 1.0e-6,
+        dense_max: dense_max_visible(2048, 4),
     };
     let (tokens, q_dim, kv_dim) = (oracle_steps(40), 24 * 256, 2 * 256);
     let mut rng = DeterministicF32::new(0x05a0_0024);
@@ -395,7 +396,7 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         &weights,
         &scratch,
         dims,
-        DENSE_MAX_VISIBLE,
+        dims.dense_max,
         &x_buf,
         &x_buf,
     );
@@ -635,7 +636,7 @@ fn n2_resident_decode_matches_cpu_reference() {
     let tokens: usize = std::env::var("SARAGOSSA_QWEN4EXP_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DENSE_MAX_VISIBLE);
+        .unwrap_or(dense_max_visible(2048, 4));
     let ids: Vec<usize> = n2_input_ids(std::path::Path::new(&golden))[..tokens].to_vec();
 
     let started = std::time::Instant::now();
@@ -799,4 +800,43 @@ fn bench_resident_decode_after_1k_context() {
          p10 {p10:.2}, p90 {p90:.2} ; préparation CPU médiane {host:.3} ms",
         1e3 / p50
     );
+}
+
+/// Validation à l'ouverture : la configuration de Flash-Next est acceptée
+/// (borne dense 2051, calculée depuis budget et compression) ; chaque variante
+/// non portée est refusée avant toute allocation.
+#[test]
+fn resident_config_validation_accepts_flash_next_and_refuses_variants() -> Result<()> {
+    use super::session::validate_resident_config;
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpConfig;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qwen4exp_mini/source/config.json");
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("invariant: config de la fixture"))
+            .map_err(|e| InferError::Config(e.to_string()))?;
+    let mut base = Qwen4ExpConfig::from_json(&json)?;
+    // Géométrie résidente de Flash-Next sur la fixture.
+    (base.linear_key_dim, base.linear_value_dim, base.conv_kernel) = (128, 128, 4);
+    (base.linear_key_heads, base.linear_value_heads) = (16, 48);
+    (base.indexer_budget, base.indexer_compress) = (2048, 4);
+    base.top_k = base.top_k.min(base.experts);
+    assert_eq!(validate_resident_config(&base)?, 2051);
+    type Edit = fn(&mut Qwen4ExpConfig);
+    let variants: [(&str, Edit); 6] = [
+        ("norm_topk_prob", |c| c.norm_topk_prob = false),
+        ("gate SiLU", |c| c.sigmoid_output_gate = false),
+        ("d_k 64", |c| c.linear_key_dim = 64),
+        ("têtes V", |c| c.linear_value_heads = 47),
+        ("top-k 17", |c| (c.top_k, c.experts) = (17, 512)),
+        ("budget", |c| c.indexer_budget = 2047),
+    ];
+    for (label, edit) in variants {
+        let mut config = base.clone();
+        edit(&mut config);
+        assert!(
+            validate_resident_config(&config).is_err(),
+            "{label} accepté"
+        );
+    }
+    Ok(())
 }

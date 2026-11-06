@@ -21,7 +21,7 @@ mod weights;
 mod tests;
 
 pub(crate) use attention::{
-    encode_qsa_dense, QsaDecodeDims, QsaLayerWeights, QsaScratch, DENSE_MAX_VISIBLE,
+    dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaLayerWeights, QsaScratch,
 };
 pub(crate) use hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch, HcWeights};
 pub(crate) use kernels::FlashNextKernels;

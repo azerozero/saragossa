@@ -15,8 +15,11 @@ use crate::decode_resident::{DecodeResidentState, FullAttentionMetalState};
 use crate::metal_backend::{post_dispatch_barrier, MetalExecutor, MetalLinearWeightBuffers};
 use crate::{InferError, Result};
 
-/// Visibilité maximale du régime dense : `budget + compress − 1`.
-pub(crate) const DENSE_MAX_VISIBLE: usize = 2051;
+/// Visibilité maximale du régime dense : `budget + compress − 1` (2051 pour
+/// Flash-Next). Au-delà, l'indexeur écarte des blocs.
+pub(crate) fn dense_max_visible(budget: usize, compress: usize) -> usize {
+    budget + compress.saturating_sub(1)
+}
 
 /// Poids GPU d'une couche QSA (indexeur hors régime dense).
 pub(crate) struct QsaLayerWeights {
@@ -40,6 +43,8 @@ pub(crate) struct QsaDecodeDims {
     pub(crate) rotary_dim: usize,
     pub(crate) theta: f32,
     pub(crate) eps: f32,
+    /// Visibilité maximale du régime dense ([`dense_max_visible`]).
+    pub(crate) dense_max: usize,
 }
 
 impl QsaDecodeDims {
@@ -81,10 +86,11 @@ pub(crate) fn encode_qsa_dense(
     x: &BufferRef,
     out: &BufferRef,
 ) -> Result<()> {
-    if position >= DENSE_MAX_VISIBLE {
+    if position >= dims.dense_max {
         return Err(InferError::Config(format!(
             "Flash-Next résident : position {position}, sélection QSA creuse au-delà de \
-             {DENSE_MAX_VISIBLE} tokens visibles (non prise en charge)"
+             {} tokens visibles (non prise en charge)",
+            dims.dense_max
         )));
     }
     for (weight, target) in [

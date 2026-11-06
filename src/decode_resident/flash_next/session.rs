@@ -9,7 +9,7 @@
 
 use metal::{Buffer, CommandQueue, MTLResourceOptions};
 
-use super::attention::{encode_qsa_dense, QsaDecodeDims, QsaScratch, DENSE_MAX_VISIBLE};
+use super::attention::{dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaScratch};
 use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch};
 use super::kernels::FlashNextKernels;
 use super::ple::{encode_ple, PleScratch, PleState};
@@ -20,7 +20,7 @@ use crate::metal_backend::{
     LinearAttentionStepSpec, LinearAttnResidentDims, MetalExecutor,
 };
 use crate::qwen4_exp::ngram::NgramContext;
-use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+use crate::qwen_loader::qwen4_exp::{Qwen4ExpCheckpoint, Qwen4ExpConfig};
 use crate::{InferError, MemoryGuard, Result};
 
 /// État récurrent ou cache KV d'une couche.
@@ -64,6 +64,7 @@ pub(crate) struct FlashNextSession {
     linear_spec: LinearAttentionStepSpec,
     linear_dims: LinearAttnResidentDims,
     position: usize,
+    capacity: usize,
     /// Oracles : experts imposés au prochain pas, par couche (consommés).
     #[cfg(test)]
     pub(crate) forced_routing: Vec<Option<Vec<u32>>>,
@@ -74,6 +75,60 @@ fn zeros(executor: &MetalExecutor, len: usize) -> Buffer {
         (len.max(1) * std::mem::size_of::<f32>()) as u64,
         MTLResourceOptions::StorageModeShared,
     )
+}
+
+/// Refuse, avant toute allocation, les variantes que le chemin résident ne
+/// porte pas, et renvoie la visibilité maximale du régime dense.
+///
+/// # Errors
+///
+/// Renvoie [`InferError::Config`] pour une variante non prise en charge.
+pub(crate) fn validate_resident_config(c: &Qwen4ExpConfig) -> Result<usize> {
+    let refuse = |what: String| -> Result<usize> {
+        Err(InferError::Config(format!(
+            "Flash-Next résident : {what} non pris en charge"
+        )))
+    };
+    if !c.norm_topk_prob {
+        return refuse("norm_topk_prob = false".to_string());
+    }
+    if !c.sigmoid_output_gate {
+        return refuse("gate DeltaNet SiLU".to_string());
+    }
+    if c.top_k == 0 || c.top_k > 16 || c.top_k > c.experts {
+        return refuse(format!("top-k {} sur {} experts", c.top_k, c.experts));
+    }
+    if c.linear_key_dim != 128 || c.linear_value_dim != 128 || c.conv_kernel != 4 {
+        return refuse(format!(
+            "DeltaNet d_k {} / d_v {} / noyau {}",
+            c.linear_key_dim, c.linear_value_dim, c.conv_kernel
+        ));
+    }
+    if c.linear_key_heads == 0 || c.linear_value_heads % c.linear_key_heads != 0 {
+        return refuse(format!(
+            "DeltaNet {} têtes V pour {} têtes K",
+            c.linear_value_heads, c.linear_key_heads
+        ));
+    }
+    if c.kv_heads == 0 || c.heads % c.kv_heads != 0 || c.rotary_dim > c.head_dim {
+        return refuse(format!(
+            "attention {} têtes / {} KV, RoPE {} sur {}",
+            c.heads, c.kv_heads, c.rotary_dim, c.head_dim
+        ));
+    }
+    if c.indexer_compress == 0 || c.indexer_budget % c.indexer_compress != 0 {
+        return refuse(format!(
+            "budget QSA {} par blocs de {}",
+            c.indexer_budget, c.indexer_compress
+        ));
+    }
+    if c.ple_conv_kernel == 0 || c.ple_layer >= c.layer_kinds.len() {
+        return refuse(format!(
+            "PLE couche {} noyau {}",
+            c.ple_layer, c.ple_conv_kernel
+        ));
+    }
+    Ok(dense_max_visible(c.indexer_budget, c.indexer_compress))
 }
 
 impl FlashNextSession {
@@ -89,9 +144,10 @@ impl FlashNextSession {
         capacity: usize,
         guard: Option<&MemoryGuard>,
     ) -> Result<Self> {
-        if capacity == 0 || capacity > DENSE_MAX_VISIBLE {
+        let dense_max = validate_resident_config(&ckpt.config)?;
+        if capacity == 0 || capacity > dense_max {
             return Err(InferError::Config(format!(
-                "Flash-Next résident : capacité {capacity} hors ]0, {DENSE_MAX_VISIBLE}]"
+                "Flash-Next résident : capacité {capacity} hors ]0, {dense_max}]"
             )));
         }
         let executor = MetalExecutor::new()?;
@@ -113,6 +169,7 @@ impl FlashNextSession {
             rotary_dim: c.rotary_dim,
             theta: c.rope_theta as f32,
             eps: c.rms_eps,
+            dense_max,
         };
         let linear_spec = LinearAttentionStepSpec {
             num_key_heads: c.linear_key_heads,
@@ -187,6 +244,7 @@ impl FlashNextSession {
             linear_spec,
             linear_dims,
             position: 0,
+            capacity,
             #[cfg(test)]
             forced_routing: Vec::new(),
             executor,
@@ -251,9 +309,10 @@ impl FlashNextSession {
     /// sur encodage et exécution Metal.
     pub(crate) fn step(&mut self, token: usize, logits: bool, layers: bool) -> Result<StepOutput> {
         let c = &self.ckpt.config;
-        if self.position >= DENSE_MAX_VISIBLE {
+        if self.position >= self.capacity {
             return Err(InferError::Config(format!(
-                "Flash-Next résident : {DENSE_MAX_VISIBLE} tokens atteints (régime dense)"
+                "Flash-Next résident : capacité de {} tokens atteinte",
+                self.capacity
             )));
         }
         let host_started = std::time::Instant::now();
