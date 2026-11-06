@@ -11,7 +11,7 @@ pub(crate) mod math;
 mod moe;
 pub(crate) mod ngram;
 mod ple;
-mod residual;
+pub(crate) mod residual;
 
 #[cfg(test)]
 mod tests;
