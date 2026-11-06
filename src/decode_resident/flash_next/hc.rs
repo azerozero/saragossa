@@ -4,9 +4,10 @@
 //! `x = mean_s(a ⊙ n)`, injection `2σ(W_inject·n/hc)` sur le résiduel non
 //! normalisé : `H′_s = H_s + inj_s·F(x)`. Le mixer final n'a pas d'injection.
 
-use metal::{Buffer, BufferRef, ComputeCommandEncoderRef, MTLSize};
+use metal::{Buffer, BufferRef, ComputeCommandEncoderRef};
 
 use super::kernels::FlashNextKernels;
+use super::ple::encode_rms_norm_1p;
 use super::{dispatch_1d, set_value};
 use crate::metal_backend::{post_dispatch_barrier, MetalExecutor, MetalLinearWeightBuffers};
 use crate::Result;
@@ -61,13 +62,7 @@ pub(crate) fn encode_hc_mix(
     x: &BufferRef,
 ) -> Result<()> {
     let width = dims.width();
-    encoder.set_compute_pipeline_state(&kernels.rms_norm_1p_groups);
-    encoder.set_buffer(0, Some(h), 0);
-    encoder.set_buffer(1, Some(&weights.norm), 0);
-    encoder.set_buffer(2, Some(&scratch.normed), 0);
-    set_value(encoder, 3, &(dims.hidden as u32));
-    set_value(encoder, 4, &dims.eps);
-    encoder.dispatch_thread_groups(MTLSize::new(dims.hc as u64, 1, 1), MTLSize::new(256, 1, 1));
+    encode_rms_norm_1p(kernels, encoder, h, &weights.norm, &scratch.normed, dims);
     post_dispatch_barrier(encoder);
 
     executor.encode_matmul_weight_buffers(

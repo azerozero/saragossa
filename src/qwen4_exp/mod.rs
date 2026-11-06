@@ -10,7 +10,7 @@ mod forward;
 pub(crate) mod math;
 mod moe;
 pub(crate) mod ngram;
-mod ple;
+pub(crate) mod ple;
 pub(crate) mod residual;
 
 #[cfg(test)]

@@ -130,7 +130,7 @@ pub(crate) use self::barriers::{
 #[cfg(any(test, feature = "devtools"))]
 pub(crate) use self::byte_helpers::read_u16_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
-pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at};
+pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at, write_u8_buffer};
 use self::core::*;
 pub(crate) use self::eligibility::install_qmm_skinny_bf16_scope;
 pub(crate) use self::flags::resident_concurrent_enabled;

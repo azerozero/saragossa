@@ -1020,6 +1020,53 @@ impl Qwen4ExpCheckpoint {
         Ok(out)
     }
 
+    /// Largeur d'une ligne n-gram (octets E4M3).
+    pub fn ngram_width(&self) -> usize {
+        self.ngram.width
+    }
+
+    /// Valeurs des 256 octets E4M3 multipliées par l'échelle per-tensor ; NaN
+    /// pour les deux codes NaN (refusés à la lecture).
+    pub fn ngram_lut(&self) -> Vec<f32> {
+        (0..=255_u8)
+            .map(|byte| f8_e4m3_to_f32(byte).map_or(f32::NAN, |v| v * self.ngram.scale))
+            .collect()
+    }
+
+    /// Lit les lignes `ids` brutes (E4M3) dans `out` (`ids.len()·largeur`
+    /// octets), une lecture positionnelle par ligne, en parallèle. Refuse une
+    /// ligne hors table ou contenant un NaN, comme [`Self::ngram_rows`].
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de lecture, de taille, d'index ou de NaN.
+    pub fn ngram_rows_raw(&self, ids: &[u64], out: &mut [u8]) -> Result<()> {
+        use rayon::prelude::*;
+        let width = self.ngram.width;
+        if ids.len().checked_mul(width) != Some(out.len()) {
+            return Err(InferError::Shape(format!(
+                "lignes n-gram : {} octets pour {} lignes de {width}",
+                out.len(),
+                ids.len()
+            )));
+        }
+        out.par_chunks_mut(width)
+            .zip(ids.par_iter())
+            .try_for_each(|(slot, &id)| {
+                if id >= self.ngram.rows {
+                    return Err(InferError::Shape(format!("ligne n-gram {id} hors table")));
+                }
+                self.ngram
+                    .file
+                    .read_exact_at(slot, id * width as u64)
+                    .map_err(|e| io(&self.ngram.path, e))?;
+                if slot.iter().any(|b| b & 0x7f == 0x7f) {
+                    return Err(cfg_err(format!("ligne n-gram {id}: NaN")));
+                }
+                Ok(())
+            })
+    }
+
     /// Préfixe d'une couche du tronc en sortie.
     pub fn layer_prefix(layer: usize) -> String {
         format!("{TRUNK}layers.{layer}.")
@@ -1078,6 +1125,24 @@ mod tests {
         let silu = with_text(|t| t["output_gate_type"] = "silu".into()).expect("invariant: silu");
         assert!(!silu.sigmoid_output_gate);
         assert!(with_text(|t| t["output_gate_type"] = "relu".into()).is_err());
+    }
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn ngram_raw_rows_with_lut_match_dequantized_rows() {
+        let dst = converted_fixture();
+        let ckpt = Qwen4ExpCheckpoint::open(dst.path()).expect("invariant: fixture ouverte");
+        let width = ckpt.ngram_width();
+        let ids = [0_u64, 5, 3, 0, 17];
+        let mut raw = vec![0_u8; ids.len() * width];
+        ckpt.ngram_rows_raw(&ids, &mut raw)
+            .expect("invariant: lecture brute");
+        let lut = ckpt.ngram_lut();
+        let decoded: Vec<f32> = raw.iter().map(|&b| lut[usize::from(b)]).collect();
+        assert_eq!(decoded, ckpt.ngram_rows(&ids).expect("invariant: lignes"));
+        let mut one = vec![0_u8; width];
+        assert!(ckpt.ngram_rows_raw(&[u64::MAX], &mut one).is_err());
+        assert!(ckpt.ngram_rows_raw(&ids, &mut one).is_err());
     }
 
     /// Convertit la fixture N1 dans un dossier temporaire.

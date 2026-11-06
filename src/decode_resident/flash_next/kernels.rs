@@ -1,7 +1,7 @@
-//! Kernels Metal propres à Flash-Next (`qwen4_exp`) : hyper-connections.
+//! Kernels Metal propres à Flash-Next (`qwen4_exp`) : hyper-connections et PLE.
 //!
 //! Chaque kernel transcrit l'ordre des opérations f32 de la référence CPU
-//! (`src/qwen4_exp/residual.rs`) pour que l'écart reste au niveau de
+//! (`src/qwen4_exp/residual.rs`, `src/qwen4_exp/ple.rs`) pour que l'écart reste au niveau de
 //! l'accumulation.
 
 use metal::{ComputePipelineState, Device};
@@ -100,6 +100,91 @@ kernel void flash_next_hc_combine_f32(
     const float w = 2.0f * (1.0f / (1.0f + exp(-(inject[s] / float(hc)))));
     out[i] = h[i] + w * f[i % hidden];
 }
+
+// PLE : `emb[i] = lut[octet[i]]`, avec `lut` = E4M3 × échelle per-tensor
+// (les NaN sont refusés côté CPU à la lecture).
+kernel void flash_next_ple_gather_f32(
+    device const uchar* bytes [[buffer(0)]],
+    device const float* lut [[buffer(1)]],
+    device float* emb [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) {
+        emb[i] = lut[bytes[i]];
+    }
+}
+
+// PLE : par flux `s`, `d = ⟨k̂_s, q̂_s⟩/√hidden`,
+// `g = σ(sign(d)·√max(|d|, 1e-6))`, `gated_s = g·value`.
+kernel void flash_next_ple_gate_f32(
+    device const float* key [[buffer(0)]],
+    device const float* query [[buffer(1)]],
+    device const float* value [[buffer(2)]],
+    device float* gated [[buffer(3)]],
+    constant uint& hidden [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint s [[threadgroup_position_in_grid]]
+) {
+    threadgroup float partial[256];
+    const uint base = s * hidden;
+    float acc = 0.0f;
+    for (uint d = tid; d < hidden; d += 256u) {
+        acc += key[base + d] * query[base + d];
+    }
+    partial[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float dot = partial[0] / sqrt(float(hidden));
+    const float sign = dot > 0.0f ? 1.0f : (dot < 0.0f ? -1.0f : 0.0f);
+    const float g = 1.0f / (1.0f + exp(-(sqrt(max(fabs(dot), 1.0e-6f)) * sign)));
+    for (uint d = tid; d < hidden; d += 256u) {
+        gated[base + d] = g * value[d];
+    }
+}
+
+// PLE : conv depthwise dilatée sur l'historique de `normed`, puis
+// `out = h + (gated + SiLU(acc))`. `ring` garde les `span = (k−1)·dilation`
+// dernières colonnes ; le slot du pas courant est relu (t − span) avant
+// d'être réécrit. dims = (largeur, noyau, dilation, pas).
+kernel void flash_next_ple_conv_add_f32(
+    device const float* h [[buffer(0)]],
+    device const float* gated [[buffer(1)]],
+    device const float* normed [[buffer(2)]],
+    device float* ring [[buffer(3)]],
+    device const float* conv [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant uint4& dims [[buffer(6)]],
+    uint c [[thread_position_in_grid]]
+) {
+    const uint width = dims.x;
+    const uint k = dims.y;
+    const uint dilation = dims.z;
+    const uint step = dims.w;
+    if (c >= width) {
+        return;
+    }
+    const uint span = (k - 1u) * dilation;
+    float acc = 0.0f;
+    for (uint j = 0u; j < k; ++j) {
+        const uint back = span - j * dilation;
+        if (back == 0u) {
+            acc += conv[c * k + j] * normed[c];
+        } else if (step >= back) {
+            acc += conv[c * k + j] * ring[((step - back) % span) * width + c];
+        }
+    }
+    const float ple = gated[c] + acc * (1.0f / (1.0f + exp(-acc)));
+    out[c] = h[c] + ple;
+    if (span > 0u) {
+        ring[(step % span) * width + c] = normed[c];
+    }
+}
 "#;
 
 /// Pipelines des kernels Flash-Next.
@@ -108,6 +193,9 @@ pub(crate) struct FlashNextKernels {
     pub(super) hc_silu_scale: ComputePipelineState,
     pub(super) hc_mix: ComputePipelineState,
     pub(super) hc_combine: ComputePipelineState,
+    pub(super) ple_gather: ComputePipelineState,
+    pub(super) ple_gate: ComputePipelineState,
+    pub(super) ple_conv_add: ComputePipelineState,
 }
 
 impl FlashNextKernels {
@@ -125,6 +213,9 @@ impl FlashNextKernels {
                 "flash_next_hc_silu_scale_f32",
                 "flash_next_hc_mix_f32",
                 "flash_next_hc_combine_f32",
+                "flash_next_ple_gather_f32",
+                "flash_next_ple_gate_f32",
+                "flash_next_ple_conv_add_f32",
             ],
             false,
         )?
@@ -139,6 +230,9 @@ impl FlashNextKernels {
             hc_silu_scale: next()?,
             hc_mix: next()?,
             hc_combine: next()?,
+            ple_gather: next()?,
+            ple_gate: next()?,
+            ple_conv_add: next()?,
         })
     }
 }

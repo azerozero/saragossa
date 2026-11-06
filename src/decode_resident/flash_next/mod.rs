@@ -12,12 +12,14 @@
 
 mod hc;
 mod kernels;
+mod ple;
 
 #[cfg(test)]
 mod tests;
 
 pub(crate) use hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch, HcWeights};
 pub(crate) use kernels::FlashNextKernels;
+pub(crate) use ple::{encode_ple, PleScratch, PleState, PleWeights};
 
 use metal::{ComputeCommandEncoderRef, MTLSize};
 

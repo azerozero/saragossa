@@ -147,3 +147,129 @@ fn flash_next_hc_mix_and_combine_match_cpu_at_real_dims() -> Result<()> {
     }
     Ok(())
 }
+
+/// PLE résident pas à pas (4 flux × 2560, table de 2560 octets, conv k4
+/// dilatée 3) contre `ple` CPU sans cache sur 14 tokens : l'anneau de 9
+/// colonnes fait le tour. Un reset rejoue ensuite les premiers pas à l'identique.
+#[test]
+fn flash_next_ple_steps_match_cpu_sequence_and_reset() -> Result<()> {
+    use crate::qwen4_exp::ngram::NgramContext;
+    use crate::qwen4_exp::ple::{ple, PleWeights as CpuPle};
+    use crate::safetensor::f8_e4m3_to_f32;
+    let Some(executor) = executor()? else {
+        return Ok(());
+    };
+    let kernels = FlashNextKernels::new(executor.device())?;
+    let dims = HcDims {
+        hidden: 2560,
+        hc: 4,
+        lowrank: 320,
+        eps: 1.0e-6,
+    };
+    let (width, ple_dim, tokens, scale) = (dims.width(), 2560, 14, 3.0e-3_f32);
+    let mut rng = DeterministicF32::new(0x0091_e000);
+    let (key_gpu, key) = u8_weight(&executor, &mut rng, width, ple_dim, 0.05)?;
+    let (value_gpu, value) = u8_weight(&executor, &mut rng, dims.hidden, ple_dim, 0.05)?;
+    let norm_key = rng.fill(width, -0.2, 0.2);
+    let norm_query = rng.fill(width, -0.2, 0.2);
+    let norm_conv = rng.fill(width, -0.2, 0.2);
+    let conv = rng.fill(width * 4, -0.5, 0.5);
+    let lut: Vec<f32> = (0..=255_u8)
+        .map(|b| f8_e4m3_to_f32(b).map_or(f32::NAN, |v| v * scale))
+        .collect();
+    // Octets sans NaN (0x7F, 0xFF), dont des zéros signés.
+    let bytes: Vec<u8> = (0..tokens * ple_dim)
+        .map(|i| {
+            let b = (rng.next_in(0.0, 254.0) as u8).wrapping_add(i as u8 % 3);
+            if b & 0x7f == 0x7f {
+                0x80
+            } else {
+                b
+            }
+        })
+        .collect();
+    let emb: Vec<f32> = bytes.iter().map(|&b| lut[usize::from(b)]).collect();
+    let h_all = rng.fill(tokens * width, -2.0, 2.0);
+    let cpu_w = CpuPle {
+        key_proj: key,
+        value_proj: value,
+        norm_key: norm_key.clone(),
+        norm_query: norm_query.clone(),
+        norm_conv: norm_conv.clone(),
+        conv: conv.clone(),
+        kernel: 4,
+        dilation: 3,
+    };
+    let expected = ple(
+        &Tensor::from_vec(vec![tokens, width], h_all.clone())?,
+        &Tensor::from_vec(vec![tokens, ple_dim], emb)?,
+        &cpu_w,
+        dims.hc,
+        dims.hidden,
+        dims.eps,
+    )?;
+
+    let weights = PleWeights {
+        key_proj: key_gpu,
+        value_proj: value_gpu,
+        norm_key: buffer(&executor, &norm_key),
+        norm_query: buffer(&executor, &norm_query),
+        norm_conv: buffer(&executor, &norm_conv),
+        conv: buffer(&executor, &conv),
+        lut: buffer(&executor, &lut),
+        kernel: 4,
+        dilation: 3,
+        ple_dim,
+    };
+    let scratch = PleScratch {
+        emb: zeros(&executor, ple_dim),
+        key: zeros(&executor, width),
+        key_normed: zeros(&executor, width),
+        value: zeros(&executor, dims.hidden),
+        query: zeros(&executor, width),
+        gated: zeros(&executor, width),
+        normed: zeros(&executor, width),
+    };
+    let mut state = PleState {
+        bytes: executor
+            .device()
+            .new_buffer(ple_dim as u64, MTLResourceOptions::StorageModeShared),
+        ring: zeros(&executor, 9 * width),
+        context: NgramContext::new(3, 0),
+        step: 0,
+    };
+    let queue = executor.device().new_command_queue();
+    let run = |state: &mut PleState, t: usize| -> Result<Vec<f32>> {
+        state.stage_bytes(&bytes[t * ple_dim..(t + 1) * ple_dim])?;
+        let h = buffer(&executor, &h_all[t * width..(t + 1) * width]);
+        let out = zeros(&executor, width);
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_ple(
+            &kernels, &executor, encoder, &weights, state, &scratch, dims, &h, &out,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        read_f32_buffer(&out, width)
+    };
+    let mut first = Vec::new();
+    for t in 0..tokens {
+        let got = run(&mut state, t)?;
+        let want = &expected.data()[t * width..(t + 1) * width];
+        let reference: Vec<f32> = want
+            .iter()
+            .zip(&h_all[t * width..(t + 1) * width])
+            .map(|(p, h)| h + p)
+            .collect();
+        let (err, max) = relative_error(&got, &reference);
+        assert!(err <= 1.0e-5, "PLE pas {t} : {err} (max {max})");
+        if t < 3 {
+            first.push(got);
+        }
+    }
+    state.reset(3, 0);
+    for (t, before) in first.iter().enumerate() {
+        assert_eq!(&run(&mut state, t)?, before, "pas {t} après reset");
+    }
+    Ok(())
+}

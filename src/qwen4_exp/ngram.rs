@@ -132,6 +132,61 @@ pub(crate) fn ngram_ids(
     ids
 }
 
+/// Contexte incrémental du hachage : les `ngram_size − 1` tokens précédents du
+/// segment courant, le plus récent d'abord, EOS au-delà du début de segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "câblé par la session résidente Flash-Next (étape 4)"
+)]
+pub(crate) struct NgramContext {
+    recent: Vec<u64>,
+    eos: u64,
+}
+
+#[allow(
+    dead_code,
+    reason = "câblé par la session résidente Flash-Next (étape 4)"
+)]
+impl NgramContext {
+    /// Contexte initial (début de séquence) : rempli d'EOS, comme `ngram_ids`.
+    pub(crate) fn new(ngram_size: usize, eos: u64) -> Self {
+        Self {
+            recent: vec![eos; ngram_size.saturating_sub(1)],
+            eos,
+        }
+    }
+
+    /// Identifiants des `(ngram_size − 1)·heads_per_ngram` têtes pour `token`,
+    /// puis avance le contexte. Un EOS garde son propre historique, mais le
+    /// token suivant repart d'un segment vide (`_shift_right_ignore_eos`).
+    pub(crate) fn step(
+        &mut self,
+        token: u64,
+        heads_per_ngram: usize,
+        multipliers: &[i64],
+        vocab_sizes: &[i64],
+        offsets: &[i64],
+    ) -> Vec<u64> {
+        let mut ids = Vec::with_capacity(self.recent.len() * heads_per_ngram);
+        let mut mixed = token.wrapping_mul(multipliers[0] as u64);
+        for (j, &previous) in self.recent.iter().enumerate() {
+            mixed ^= previous.wrapping_mul(multipliers[j + 1] as u64);
+            let first = j * heads_per_ngram;
+            for head in first..first + heads_per_ngram {
+                ids.push(mixed % vocab_sizes[head] as u64 + offsets[head] as u64);
+            }
+        }
+        if token == self.eos {
+            self.recent.iter_mut().for_each(|t| *t = self.eos);
+        } else if !self.recent.is_empty() {
+            self.recent.rotate_right(1);
+            self.recent[0] = token;
+        }
+        ids
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +213,22 @@ mod tests {
         assert_eq!(one, vec![eos, eos, eos, 7, 8, eos]);
         let two = shifted(&history, eos, 2);
         assert_eq!(two, vec![eos, eos, eos, eos, 7, eos]);
+    }
+
+    #[test]
+    fn incremental_context_matches_full_sequence_hash_with_eos() {
+        let (eos, ngram_size, per) = (3_u64, 4_usize, 2_usize);
+        let mult = [5_i64, 11, 17, 23];
+        let sizes = [97_i64, 101, 103, 107, 109, 113];
+        let offsets = [0_i64, 97, 198, 301, 408, 517];
+        let tokens = [9_u64, 3, 3, 12, 40, 7, 3, 8, 8, 21, 3, 5, 6, 77, 1, 2];
+        let full = ngram_ids(&tokens, eos, ngram_size, per, &mult, &sizes, &offsets);
+        let mut context = NgramContext::new(ngram_size, eos);
+        let heads = (ngram_size - 1) * per;
+        for (t, &token) in tokens.iter().enumerate() {
+            let ids = context.step(token, per, &mult, &sizes, &offsets);
+            assert_eq!(ids, full[t * heads..(t + 1) * heads], "position {t}");
+        }
     }
 
     #[test]
