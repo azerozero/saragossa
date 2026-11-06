@@ -48,7 +48,7 @@ SPEC_PAIRS = {
 }
 # Comparaisons de textes entre moteurs, à titre informatif (formats différents).
 CROSS_PAIRS = {"mlx-ar": "sar-ar", "llq40-ar": "sar-ar", "llkm-ar": "sar-ar", "llmd-ar": "sar-ar"}
-REQUIRED = ("usage", "prompt_tokens", "ids", "no_reuse")
+REQUIRED = ("usage", "output", "prompt_tokens", "ids", "no_reuse")
 
 
 def tokenizer():
@@ -139,6 +139,11 @@ def proofs(line, expected, cache_probe):
     exp = expected.get(f"{line['prompt']}|{line['nonce']}")
     checks = {"usage": bool(usage.get("completion_tokens") is not None
                             and usage.get("prompt_tokens") is not None) or None}
+    # Réponse vide (aucun token annoncé ou aucun texte reçu) : échec, jamais
+    # admissible. La nuit 2 a compté un llmd-ar vide comme mesure valide.
+    texts = any(e.get("content_chars", 0) + e.get("reasoning_chars", 0) > 0
+                for e in line.get("events") or [])
+    checks["output"] = bool(texts and (usage.get("completion_tokens") or 0) > 0)
     checks["prompt_tokens"] = (None if not exp or usage.get("prompt_tokens") is None
                                else usage["prompt_tokens"] == exp["prompt_tokens"])
     if not exp:
@@ -766,9 +771,14 @@ def _self_check():
     assert first_divergence("abc", "abd") == 2 and first_divergence("ab", "ab") is None
     row = {"prompt": "p", "nonce": "n", "engine": "llama", "usage": {
         "completion_tokens": 3, "prompt_tokens": 10}, "timings": {"cache_n": 4},
-        "ingest": {"prompt_fnv1a64": "aa"}}
+        "ingest": {"prompt_fnv1a64": "aa"}, "events": [{"content_chars": 2}]}
     checks = proofs(row, {"p|n": {"prompt_tokens": 10, "fnv1a64": "aa"}}, {})
-    assert checks == {"usage": True, "prompt_tokens": True, "ids": True, "no_reuse": False}
+    assert checks == {"usage": True, "output": True, "prompt_tokens": True, "ids": True,
+                      "no_reuse": False}
+    # Réponse vide : échec, que le moteur annonce zéro token ou aucun texte.
+    assert proofs(dict(row, events=[]), {}, {})["output"] is False
+    assert proofs(dict(row, usage={"completion_tokens": 0, "prompt_tokens": 10}),
+                  {}, {})["output"] is False
     row = {"prompt": "p", "nonce": "n", "engine": "llmd", "usage": {
         "completion_tokens": 3, "prompt_tokens": 10}, "ingest": {"kind": "offline"}}
     exp = {"p|n": {"prompt_tokens": 10, "fnv1a64": "aa", "llmd_offline_fnv1a64": "aa"}}
