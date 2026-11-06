@@ -59,7 +59,7 @@ def weight_files(qdir):
     if (qdir / "mtp.safetensors").exists():
         names.append("mtp.safetensors")
     meta = json.loads((qdir / "ngram" / "meta.json").read_text())
-    names += ["ngram/meta.json", f"ngram/{meta['file']}"]
+    names += ["ngram/meta.json", C.ngram_table(meta)]
     return names
 
 
@@ -84,8 +84,11 @@ def source_entry(qdir):
     weights = {}
     for name in weight_files(qdir):
         weights[name] = sha256(qdir / name)
-        if name in manifest and manifest[name] != weights[name]:
-            raise SystemExit(f"{name}: sha disque {weights[name]} ≠ manifeste {manifest[name]}")
+        # `ngram/meta.json` est absent du manifeste du convertisseur ; tout autre poids y figure.
+        if name == "ngram/meta.json":
+            continue
+        if manifest.get(name) != weights[name]:
+            raise SystemExit(f"{name}: sha disque {weights[name]} ≠ manifeste {manifest.get(name)}")
     return {"weights_dir": str(qdir), "weights": weights, "config_sha256": sha256(qdir / "config.json"),
             **environment()}
 
@@ -107,50 +110,110 @@ def check_compatible(out, golden_file, source):
                 raise SystemExit(f"{out}: {golden_file} et {other} diffèrent sur {key} ; dossier séparé requis")
 
 
-def write_atomic(path, data):
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
-
-
 def publish(out, golden_file, tmp, source, run):
-    """Publie un golden écrit dans `tmp` : compatibilité revérifiée, empreinte,
-    provenance puis golden renommés atomiquement."""
-    check_compatible(out, golden_file, source)
-    prov = load_provenance(out / "provenance.json")
-    prov["goldens"][golden_file] = {**source, "sha256": sha256(tmp), "run": run}
-    os.replace(tmp, out / golden_file)
-    write_atomic(out / "provenance.json", json.dumps(prov, indent=1, ensure_ascii=False).encode())
+    """Publie un golden écrit dans `tmp`. Golden et provenance sont préparés en
+    `.tmp` et vérifiés ; l'ancien golden est mis de côté puis le nouveau et la
+    provenance sont renommés, la provenance en dernier. Sur échec, l'ancien état
+    est restauré : un golden publié a toujours une provenance cohérente."""
+    prov_path, golden = out / "provenance.json", out / golden_file
+    prov_tmp, old = out / "provenance.json.tmp", out / (golden_file + ".old")
+    try:
+        check_compatible(out, golden_file, source)
+        prov = load_provenance(prov_path)
+        prov["goldens"][golden_file] = {**source, "sha256": sha256(tmp), "run": run}
+        prov_tmp.write_bytes(json.dumps(prov, indent=1, ensure_ascii=False).encode())
+        if json.loads(prov_tmp.read_text())["goldens"][golden_file]["sha256"] != sha256(tmp):
+            raise SystemExit(f"{prov_tmp}: provenance relue incohérente")
+        if golden.exists():
+            os.replace(golden, old)
+        try:
+            os.replace(tmp, golden)
+            os.replace(prov_tmp, prov_path)
+        except BaseException:
+            if old.exists():
+                os.replace(old, golden)
+            else:
+                golden.unlink(missing_ok=True)
+            raise
+        old.unlink(missing_ok=True)
+    finally:
+        prov_tmp.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
 
 
 def selftest():
-    """Refus de mélange avant écriture : les fichiers existants restent intacts."""
+    """Refus de mélange avant écriture, échec de publication sans golden orphelin,
+    chemins n-gram hors de `ngram/` refusés."""
     import tempfile
+    from unittest import mock
+
+    for bad in ("/external/table.bin", "../table.bin", "a/../../t.bin", ""):
+        try:
+            C.ngram_table({"file": bad})
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"chemin n-gram {bad!r} accepté")
+    assert C.ngram_table({"file": "ngram_e4m3.bin"}) == "ngram/ngram_e4m3.bin"
 
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         a = {"weights": {"x": "1"}, "config_sha256": "c", **environment()}
-        for name, data in (("layers.safetensors", b"A-layers"), ("full.safetensors", b"A-full")):
+
+        def stage(name, data):
             staged = out / (name + ".new")
             staged.write_bytes(data)
-            publish(out, name, staged, a, {})
+            return staged
+
+        for name, data in (("layers.safetensors", b"A-layers"), ("full.safetensors", b"A-full")):
+            publish(out, name, stage(name, data), a, {})
         before = {p.name: p.read_bytes() for p in out.iterdir()}
         for key, value in (("weights", {"x": "2"}), ("config_sha256", "d"), ("torch", "0")):
             b = {**a, key: value}
-            staged = out / "full.safetensors.new"
-            staged.write_bytes(b"B-full")
             try:
-                publish(out, "full.safetensors", staged, b, {})
+                publish(out, "full.safetensors", stage("full.safetensors", b"B-full"), b, {})
             except SystemExit:
-                staged.unlink()
+                pass
             else:
                 raise AssertionError(f"mélange accepté sur {key}")
             after = {p.name: p.read_bytes() for p in out.iterdir()}
             assert after == before, f"fichiers modifiés malgré le refus ({key})"
-        staged = out / "full.safetensors.new"
-        staged.write_bytes(b"A-full-2")
-        publish(out, "full.safetensors", staged, a, {})  # même origine : remplacement admis
+
+        # Échec à chaque étape d'écriture : l'état publié reste l'ancien, sans résidu.
+        real_replace = os.replace
+        for fail_at in range(3):
+            calls = []
+
+            def flaky(src, dst, fail_at=fail_at, calls=calls):
+                calls.append(dst)
+                if len(calls) == fail_at + 1:
+                    raise OSError("échec simulé")
+                real_replace(src, dst)
+
+            with mock.patch.object(os, "replace", flaky):
+                try:
+                    publish(out, "full.safetensors", stage("full.safetensors", b"A-full-x"), a, {})
+                except OSError:
+                    pass
+                else:
+                    raise AssertionError(f"échec simulé {fail_at} ignoré")
+            after = {p.name: p.read_bytes() for p in out.iterdir()}
+            assert after == before, f"état modifié après l'échec {fail_at}"
+        staged = stage("full.safetensors", b"A-full-y")
+        with mock.patch.object(Path, "write_bytes", side_effect=OSError("disque plein")):
+            try:
+                publish(out, "full.safetensors", staged, a, {})
+            except OSError:
+                pass
+            else:
+                raise AssertionError("échec d'écriture de la provenance ignoré")
+        assert {p.name: p.read_bytes() for p in out.iterdir()} == before
+
+        publish(out, "full.safetensors", stage("full.safetensors", b"A-full-2"), a, {})  # même origine : admis
         assert (out / "full.safetensors").read_bytes() == b"A-full-2"
+        prov = json.loads((out / "provenance.json").read_text())
+        assert prov["goldens"]["full.safetensors"]["sha256"] == sha256(out / "full.safetensors")
+        assert sorted(p.name for p in out.iterdir()) == ["full.safetensors", "layers.safetensors", "provenance.json"]
     print("selftest provenance : ok")
 
 

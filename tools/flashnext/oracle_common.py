@@ -25,6 +25,15 @@ E4M3 = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float().nu
 E4M3[[0x7F, 0xFF]] = np.nan
 
 
+def ngram_table(meta):
+    """Chemin de la table n-gram relatif à `ngram/`, même règle que le loader
+    Rust : ni absolu ni `..`, sans quoi la provenance hacherait un autre fichier."""
+    name = meta["file"]
+    if not isinstance(name, str) or name.startswith("/") or any(p in ("", ".", "..") for p in name.split("/")):
+        raise SystemExit(f"ngram/meta.json: file {name!r} hors de ngram/")
+    return f"ngram/{name}"
+
+
 def footprint_gb():
     """Pic RSS du processus (octets sous macOS)."""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9
@@ -167,7 +176,7 @@ class MmapNgram(torch.nn.Module):
         super().__init__()
         meta = json.loads((Path(qdir) / "ngram" / "meta.json").read_text())
         rows, width = meta["shape"]
-        self.table = np.memmap(Path(qdir) / "ngram" / meta["file"], dtype=np.uint8, mode="r", shape=(rows, width))
+        self.table = np.memmap(Path(qdir) / ngram_table(meta), dtype=np.uint8, mode="r", shape=(rows, width))
         self.scale = scale
         self.register_buffer("weight", torch.empty(0), persistent=False)
 
