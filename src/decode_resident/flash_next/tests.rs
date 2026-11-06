@@ -1350,6 +1350,46 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
             "token {t} après reset"
         );
     }
+    // Rejeu sans tête puis point de reprise : après la reprise, les mêmes
+    // tokens redonnent les mêmes logits au bit près ; un point d'avant un reset
+    // est refusé.
+    session.reset().expect("invariant: reset");
+    session.replay(ids[0]).expect("invariant: rejeu");
+    let point = session.checkpoint().expect("invariant: point de reprise");
+    let after: Vec<Vec<f32>> = (1..4)
+        .map(|t| {
+            session
+                .step(ids[t], true, false)
+                .expect("invariant: pas")
+                .logits
+                .expect("invariant: logits")
+        })
+        .collect();
+    assert!(
+        after[0] == expected[1],
+        "rejeu sans tête : logits du token 1"
+    );
+    session.restore(&point).expect("invariant: reprise");
+    for (i, t) in (1..4).enumerate() {
+        let again = session
+            .step(ids[t], true, false)
+            .expect("invariant: pas repris")
+            .logits
+            .expect("invariant: logits");
+        assert!(again == after[i], "token {t} après reprise");
+    }
+    session.reset().expect("invariant: reset");
+    assert!(
+        session.restore(&point).is_err(),
+        "point d'avant un reset accepté"
+    );
+    for (t, &token) in ids.iter().enumerate().take(4) {
+        let got = session.step(token, true, false).expect("invariant: pas");
+        assert!(
+            got.logits.expect("invariant: logits") == expected[t],
+            "token {t} après reset"
+        );
+    }
     // Reset en échec après quelques couches, capacité non saturée (4 / 16) :
     // le pas suivant est refusé par l'invalidation, pas par la capacité ; un
     // reset complet réhabilite la session.
@@ -1906,4 +1946,167 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
         "trop de quasi-égalités : {justified}"
     );
     Ok(())
+}
+
+/// Débit AR résident après 32 768 tokens de contexte (corpus figé
+/// `SARAGOSSA_FLASH_NEXT_CORPUS` : `ids.u32` et `provenance.json`), QSA
+/// creuse : un seul rejeu du contexte (sans lm_head), point de reprise, puis
+/// `SARAGOSSA_FLASH_NEXT_BENCH_RUNS` répétitions (3) de 256 pas gloutons
+/// restaurées depuis ce point. Pendant le rejeu, tous les 4096 tokens, la
+/// dernière couche QSA est sondée : scores de l'indexeur recalculés sur CPU
+/// depuis ses requêtes et clés poolées GPU (1e-5), sélection identique à
+/// `select_for_query` sur ces scores, et clés poolées du bloc qui vient de se
+/// compléter recalculées depuis ses clés brutes (1e-5). Porte : ≥ 40 tok/s sur
+/// la plus lente (256 / durée totale). Machine libre.
+#[test]
+#[ignore = "débit : poids réels, machine libre"]
+fn bench_resident_decode_after_32k_context() {
+    use crate::qwen4_exp::attention::{
+        pooled_block_keys, query_block_scores, select_for_query, QsaDims,
+    };
+    use crate::qwen4_exp::math::inv_freq;
+    use crate::qwen_loader::qwen4_exp::{Qwen4ExpCheckpoint, Qwen4ExpLayerKind};
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let corpus = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
+            .expect("SARAGOSSA_FLASH_NEXT_CORPUS requis"),
+    );
+    let runs: usize = crate::runtime_flags::env_var("SARAGOSSA_FLASH_NEXT_BENCH_RUNS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    assert!(
+        runs > 0,
+        "SARAGOSSA_FLASH_NEXT_BENCH_RUNS doit valoir au moins 1"
+    );
+    let ids: Vec<usize> = std::fs::read(corpus.join("ids.u32"))
+        .expect("invariant: corpus")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("invariant: 4 octets")) as usize)
+        .collect();
+    let (context, generated) = (32_768, 256);
+    assert!(ids.len() >= context, "corpus de {} tokens", ids.len());
+    let ckpt = Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint");
+    let c = ckpt.config.clone();
+    let probe_layer = c
+        .layer_kinds
+        .iter()
+        .rposition(|k| *k == Qwen4ExpLayerKind::Full)
+        .expect("invariant: une couche QSA");
+    let d = QsaDims {
+        heads: c.heads,
+        kv_heads: c.kv_heads,
+        head_dim: c.head_dim,
+        rotary_dim: c.rotary_dim,
+        rope_theta: c.rope_theta,
+        index_heads: c.indexer_heads,
+        index_head_dim: c.indexer_head_dim,
+        budget: c.indexer_budget,
+        compress: c.indexer_compress,
+        eps: c.rms_eps,
+    };
+    let freqs = inv_freq(c.rotary_dim, c.rope_theta);
+    let k_norm = ckpt
+        .floats(&format!(
+            "{}self_attn.indexer.k_layernorm.weight",
+            Qwen4ExpCheckpoint::layer_prefix(probe_layer)
+        ))
+        .expect("invariant: k_layernorm");
+    let mut session = FlashNextSession::open(
+        ckpt,
+        context + generated,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    let started = std::time::Instant::now();
+    let mut probes = 0;
+    for (t, &token) in ids[..context - 1].iter().enumerate() {
+        let probe = t > 2051 && (t + 1) % 4096 == 0;
+        if !probe {
+            session.replay(token).expect("invariant: rejeu");
+            continue;
+        }
+        // Pas sondé : t ≡ 3 (mod 4), le bloc t/4 vient de se compléter.
+        let out = session
+            .step(token, false, true)
+            .expect("invariant: pas sondé");
+        let (blocks, scores) = out.qsa.expect("invariant: QSA")[probe_layer]
+            .clone()
+            .expect("invariant: régime creux");
+        let complete = (t + 1) / d.compress;
+        let (q, pooled, raw) = session
+            .indexer_probe(probe_layer, complete)
+            .expect("invariant: sonde");
+        let cpu_scores = query_block_scores(&q, &pooled, complete, d);
+        let (err, _) = relative_error(&scores, &cpu_scores);
+        assert!(err <= 1.0e-5, "token {t} : scores de l'indexeur {err}");
+        let tokens = select_for_query(&scores, t + 1, d);
+        let mut want: Vec<u32> = tokens[..d.budget]
+            .chunks_exact(d.compress)
+            .map(|c| (c[0] / d.compress) as u32)
+            .collect();
+        want.sort_unstable();
+        let mut got = blocks.clone();
+        got.sort_unstable();
+        assert_eq!(got, want, "token {t} : sélection");
+        // Bloc complété : moyenne, k_layernorm et RoPE à la position 4·b recalculées.
+        let block = complete - 1;
+        let mut raw_seq = vec![0.0_f32; complete * d.compress * d.index_head_dim];
+        raw_seq[block * d.compress * d.index_head_dim..].copy_from_slice(&raw);
+        let cpu_pooled = pooled_block_keys(&raw_seq, complete, &k_norm, d, &freqs);
+        let range = block * d.index_head_dim..complete * d.index_head_dim;
+        let (err, _) = relative_error(&pooled[range.clone()], &cpu_pooled[range]);
+        assert!(
+            err <= 1.0e-5,
+            "token {t} : clé poolée du bloc {block} {err}"
+        );
+        probes += 1;
+    }
+    let mut next = session
+        .step(ids[context - 1], false, false)
+        .expect("invariant: dernier token du contexte")
+        .argmax as usize;
+    eprintln!(
+        "rejeu de {context} tokens en {:.0} s, {probes} sondes de l'indexeur conformes",
+        started.elapsed().as_secs_f64()
+    );
+    let point = session.checkpoint().expect("invariant: point de reprise");
+    let first = next;
+    let pct = |v: &[f64], q: f64| {
+        let mut v = v.to_vec();
+        v.sort_by(f64::total_cmp);
+        v[((v.len() - 1) as f64 * q).round() as usize]
+    };
+    let mut slowest = f64::INFINITY;
+    for run in 0..runs {
+        session.restore(&point).expect("invariant: reprise");
+        next = first;
+        let mut walls = Vec::with_capacity(generated);
+        let started = std::time::Instant::now();
+        for _ in 0..generated {
+            let step = std::time::Instant::now();
+            next = session
+                .step(next, false, false)
+                .expect("invariant: decode")
+                .argmax as usize;
+            walls.push(step.elapsed().as_secs_f64() * 1e3);
+        }
+        let throughput = generated as f64 / started.elapsed().as_secs_f64();
+        slowest = slowest.min(throughput);
+        eprintln!(
+            "répétition {run} : {throughput:.1} tok/s ({generated} tokens / durée totale) ; \
+             par pas médiane {:.2} ms, p10 {:.2}, p90 {:.2}, max {:.2}",
+            pct(&walls, 0.5),
+            pct(&walls, 0.1),
+            pct(&walls, 0.9),
+            pct(&walls, 1.0)
+        );
+    }
+    eprintln!("porte 40 tok/s à 32k : répétition la plus lente à {slowest:.1} tok/s");
+    assert!(slowest.is_finite(), "débit non mesuré : {slowest}");
+    assert!(
+        slowest >= 40.0,
+        "porte de débit rouge : {slowest:.1} tok/s < 40"
+    );
 }

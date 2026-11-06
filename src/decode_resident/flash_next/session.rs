@@ -41,6 +41,17 @@ pub(crate) const MAX_CAPACITY: usize = 262_144;
 #[cfg(test)]
 pub(crate) type QsaCapture = (Vec<u32>, Vec<f32>);
 
+/// Point de reprise d'une session ([`FlashNextSession::checkpoint`]).
+pub(crate) struct SessionCheckpoint {
+    position: usize,
+    epoch: u64,
+    linear: Vec<Option<LinearAttentionMetalState>>,
+    kv_lens: Vec<Option<usize>>,
+    ple_ring: Buffer,
+    ple_context: NgramContext,
+    ple_step: usize,
+}
+
 /// Sorties d'un pas.
 #[cfg_attr(
     not(test),
@@ -105,6 +116,8 @@ pub(crate) struct FlashNextSession {
     linear_dims: LinearAttnResidentDims,
     position: usize,
     capacity: usize,
+    /// Incrémenté à chaque `reset` : invalide les points de reprise antérieurs.
+    epoch: u64,
     /// États DeltaNet initiaux (nuls), pour [`Self::reset`].
     initial_linear: Vec<Option<LinearAttentionMetalState>>,
     /// Profil GPU par brique (`SARAGOSSA_FLASH_NEXT_PROFILE=1`).
@@ -404,6 +417,7 @@ impl FlashNextSession {
             linear_dims,
             position: 0,
             capacity,
+            epoch: 0,
             initial_linear: Vec::new(),
             #[cfg(feature = "devtools")]
             profiler: if super::profile::profile_requested() {
@@ -609,6 +623,26 @@ impl FlashNextSession {
             .collect())
     }
 
+    /// Sonde de l'indexeur de la couche `layer` après un pas (oracles) :
+    /// requêtes de l'indexeur (valables pour la dernière couche QSA du pas),
+    /// clés poolées des `blocks` premiers blocs et clés brutes du bloc en cours.
+    #[cfg(test)]
+    pub(crate) fn indexer_probe(
+        &self,
+        layer: usize,
+        blocks: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let d = self.indexer_dims.head_dim;
+        let LayerState::Full(full) = &self.states[layer] else {
+            return Err(InferError::Config(format!("couche {layer} sans indexeur")));
+        };
+        Ok((
+            read_f32_buffer(&self.indexer_scratch.q, self.indexer_dims.heads * d)?,
+            read_f32_buffer(&full.1.pooled, blocks * d)?,
+            read_f32_buffer(&full.1.raw, self.indexer_dims.compress * d)?,
+        ))
+    }
+
     /// Position du prochain token (oracles).
     #[cfg(test)]
     pub(crate) fn position(&self) -> usize {
@@ -657,8 +691,101 @@ impl FlashNextSession {
         let c = &self.ckpt.config;
         self.ple_state.reset(c.ngram_size, c.eos);
         self.position = 0;
+        self.epoch += 1;
         self.poisoned = false;
         Ok(())
+    }
+
+    /// Point de reprise à la position courante : états DeltaNet, longueurs KV,
+    /// anneau et contexte PLE. Le KV et les clés poolées des positions
+    /// antérieures ne sont pas copiés : la reprise est valide tant que la
+    /// session n'est pas remise à zéro (seules des positions ≥ point sont
+    /// réécrites ensuite).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de copie Metal.
+    pub(crate) fn checkpoint(&self) -> Result<SessionCheckpoint> {
+        let linear = self
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Linear(state) => {
+                    self.executor.snapshot_linear_attn_state(state).map(Some)
+                }
+                LayerState::Full(_) => Ok(None),
+            })
+            .collect::<Result<_>>()?;
+        let kv_lens = self
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Full(full) => Some(full.0.len()),
+                LayerState::Linear(_) => None,
+            })
+            .collect();
+        let ring_len = (self.ple_state.ring.length() / 4) as usize;
+        let ple_ring = zeros(&self.executor, ring_len);
+        self.copy_f32(&self.ple_state.ring, &ple_ring, ring_len)?;
+        Ok(SessionCheckpoint {
+            position: self.position,
+            epoch: self.epoch,
+            linear,
+            kv_lens,
+            ple_ring,
+            ple_context: self.ple_state.context.clone(),
+            ple_step: self.ple_state.step,
+        })
+    }
+
+    /// Reprend au point `checkpoint`. La session est invalidée pendant la
+    /// restauration et refuse un point d'une époque antérieure à un `reset`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de copie Metal, de troncature, ou un point périmé.
+    pub(crate) fn restore(&mut self, checkpoint: &SessionCheckpoint) -> Result<()> {
+        if checkpoint.epoch != self.epoch || checkpoint.position > self.position {
+            return Err(InferError::Config(
+                "point de reprise Flash-Next périmé (reset ou position future)".to_string(),
+            ));
+        }
+        self.poisoned = true;
+        for ((state, linear), len) in self
+            .states
+            .iter_mut()
+            .zip(&checkpoint.linear)
+            .zip(&checkpoint.kv_lens)
+        {
+            match (state, linear, len) {
+                (LayerState::Linear(state), Some(snapshot), None) => {
+                    self.executor.restore_linear_attn_state(state, snapshot)?;
+                }
+                (LayerState::Full(full), None, Some(len)) => full.0.truncate(*len)?,
+                _ => {
+                    return Err(InferError::Config(
+                        "point de reprise Flash-Next désaligné".to_string(),
+                    ))
+                }
+            }
+        }
+        let ring_len = (checkpoint.ple_ring.length() / 4) as usize;
+        self.copy_f32(&checkpoint.ple_ring, &self.ple_state.ring, ring_len)?;
+        self.ple_state.context = checkpoint.ple_context.clone();
+        self.ple_state.step = checkpoint.ple_step;
+        self.position = checkpoint.position;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    /// Copie `len` f32 de `src` vers `dst` (command buffer attendu).
+    fn copy_f32(&self, src: &Buffer, dst: &Buffer, len: usize) -> Result<()> {
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.executor
+            .encode_copy_with_offsets(encoder, src, 0, dst, 0, len)?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)
     }
 
     /// Décode `token` à la position courante. `logits` et `layers` demandent la
@@ -669,6 +796,26 @@ impl FlashNextSession {
     /// Renvoie une erreur si la capacité est atteinte, sur lecture n-gram ou
     /// sur encodage et exécution Metal.
     pub(crate) fn step(&mut self, token: usize, logits: bool, layers: bool) -> Result<StepOutput> {
+        self.step_with(token, logits, layers, true)
+    }
+
+    /// Rejoue `token` (contexte) sans mixer final ni lm_head : états, KV et
+    /// indexeur avancent, aucun argmax n'est produit.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que [`Self::step`].
+    pub(crate) fn replay(&mut self, token: usize) -> Result<()> {
+        self.step_with(token, false, false, false).map(|_| ())
+    }
+
+    fn step_with(
+        &mut self,
+        token: usize,
+        logits: bool,
+        layers: bool,
+        head: bool,
+    ) -> Result<StepOutput> {
         if self.poisoned {
             return Err(InferError::Metal(
                 "Flash-Next résident : session invalidée (erreur GPU ou reset incomplet)"
@@ -742,7 +889,7 @@ impl FlashNextSession {
         };
         #[cfg(not(feature = "devtools"))]
         let mut encoders = Encoders::single(command_buffer);
-        let encoded = self.encode_token(&mut encoders, logits, layers);
+        let encoded = self.encode_token(&mut encoders, logits, layers, head);
         if let Err(error) = encoded {
             drop(encoders);
             #[cfg(feature = "devtools")]
@@ -784,10 +931,14 @@ impl FlashNextSession {
         self.position += 1;
         let width = self.hc_dims.width();
         let (vocab, layer_count) = (self.ckpt.config.vocab, self.ckpt.config.layer_kinds.len());
-        let argmax = read_u32_buffer(&self.index, 1)?
-            .first()
-            .copied()
-            .ok_or_else(|| InferError::Metal("argmax résident absent".to_string()))?;
+        let argmax = if head {
+            read_u32_buffer(&self.index, 1)?
+                .first()
+                .copied()
+                .ok_or_else(|| InferError::Metal("argmax résident absent".to_string()))?
+        } else {
+            u32::MAX
+        };
         Ok(StepOutput {
             argmax,
             logits: logits
@@ -823,6 +974,7 @@ impl FlashNextSession {
         encoders: &mut Encoders<'_>,
         logits: bool,
         layers: bool,
+        head: bool,
     ) -> Result<()> {
         let c = &self.ckpt.config;
         let mut owned = Vec::new();
@@ -1019,6 +1171,9 @@ impl FlashNextSession {
                     width,
                 )?;
             }
+        }
+        if !head {
+            return Ok(());
         }
         let encoder = encoders.at(Brick::Mixer)?;
         encode_hc_mix(
