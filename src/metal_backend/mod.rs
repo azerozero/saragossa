@@ -859,6 +859,14 @@ pub(crate) struct PrefillMoeLayer<'a> {
     pub tail: PrefillMoeTail<'a>,
 }
 
+/// Captures résidentes bornées, dans l'ordre des couches demandé par l'appelant.
+pub(crate) struct PrefillCaptures {
+    /// Position absolue de la première ligne conservée, préfixe compris.
+    pub from: usize,
+    /// `[kept, couches * hidden]`, directement utilisable par le drafter.
+    pub hidden: Tensor,
+}
+
 /// Entrée d'un prefill résident.
 #[derive(Clone, Copy)]
 pub(crate) enum PrefillInput<'a> {

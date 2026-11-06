@@ -610,6 +610,127 @@ fn prefix_cache_dflash_hit_requires_capture_coverage() -> Result<()> {
 }
 
 #[test]
+fn prefix_captures_tail_preserves_absolute_range_cpu() -> Result<()> {
+    // Une queue déjà bornée garde sa position absolue et son allocation.
+    let hidden = Tensor::from_vec(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0])?;
+    let ptr = hidden.data().as_ptr();
+    let captures = PrefixCaptures::tail(&[1, 0], 17, hidden, 2)?;
+    assert_eq!(captures.from, 17);
+    assert_eq!(captures.layer_ids, [1, 0]);
+    assert_eq!(captures.hidden.data().as_ptr(), ptr);
+    let captures = PrefixCaptures::tail(&[1, 0], captures.from, captures.hidden, 1)?;
+    assert_eq!(captures.from, 18);
+    assert_eq!(captures.hidden.data(), &[3.0, 4.0]);
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "devtools")]
+fn prefix_captures_stitch_tail_boundaries_cpu() -> Result<()> {
+    // Deux colonnes distinguent les couches, chaque valeur encode sa position.
+    let captures = |from: usize, to: usize| -> Result<PrefixCaptures> {
+        let data = (from..to)
+            .flat_map(|row| [row as f32, 100.0 + row as f32])
+            .collect();
+        Ok(PrefixCaptures::new(
+            &[1, 0],
+            from,
+            Tensor::from_vec(vec![to - from, 2], data)?,
+        ))
+    };
+    for (prefix_from, cached_len, prompt_len, keep, suffix_from) in [
+        (0, 6, 8, 4, 6),  // suffix.len() < keep, suffix_from == cached_len.
+        (0, 6, 10, 4, 6), // suffix.len() == keep, frontière sans troncature.
+        (0, 6, 13, 4, 9), // suffix.len() > keep, suffixe résident tronqué.
+        (0, 6, 13, 4, 6), // Même suffixe entier, repli per-op.
+        (3, 6, 8, 4, 6),  // Anciennes captures déjà bornées, encore nécessaires.
+        (3, 6, 13, 4, 9), // Anciennes captures bornées devenues inutiles.
+    ] {
+        let result = generation::stitch_captures(
+            captures(prefix_from, cached_len)?,
+            captures(suffix_from, prompt_len)?,
+            cached_len,
+            prompt_len,
+            keep,
+        )?;
+        assert_eq!(result.from, prompt_len - keep);
+        assert_eq!(result.from + result.hidden.as_matrix()?.0, prompt_len);
+        assert_eq!(result.layer_ids, [1, 0]);
+        assert_eq!(
+            result.hidden,
+            captures(prompt_len - keep, prompt_len)?.hidden
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "devtools")]
+fn prefix_captures_stitch_rejects_shifted_from_cpu() -> Result<()> {
+    // L'invariant du préfixe est exigé même quand seul le suffixe est conservé.
+    for (prompt_len, suffix_from) in [(8, 6), (13, 9)] {
+        for shifted_from in [2, 4] {
+            let prefix = PrefixCaptures::new(&[0], shifted_from, Tensor::zeros(vec![3, 1])?);
+            let suffix = PrefixCaptures::new(
+                &[0],
+                suffix_from,
+                Tensor::zeros(vec![prompt_len - suffix_from, 1])?,
+            );
+            assert!(matches!(
+                generation::stitch_captures(prefix, suffix, 6, prompt_len, 4),
+                Err(InferError::Dimension(_))
+            ));
+        }
+    }
+    // Un suffixe décalé, ou tronqué au-delà de la fenêtre, est également refusé.
+    for (suffix_from, rows) in [(5, 2), (7, 2), (7, 1)] {
+        let prefix = PrefixCaptures::new(&[0], 3, Tensor::zeros(vec![3, 1])?);
+        let suffix = PrefixCaptures::new(&[0], suffix_from, Tensor::zeros(vec![rows, 1])?);
+        assert!(matches!(
+            generation::stitch_captures(prefix, suffix, 6, 8, 4),
+            Err(InferError::Dimension(_))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "devtools")]
+fn prefix_cache_dflash_exact_hit_bounds_unlimited_captures_cpu() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let prompt = [1usize, 2, 3, 4, 5, 6];
+    let state = (model.empty_cache(), Tensor::row(vec![0.0])?);
+    let captures = PrefixCaptures::tail(
+        &[0],
+        0,
+        Tensor::from_vec(vec![6, 1], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?,
+        usize::MAX,
+    )?;
+    model.prefix_cache_put(&prompt, &state, None, Some(&captures))?;
+    for keep in [2, 1, 6, usize::MAX] {
+        let hit = model
+            .prefix_cache_get_with_captures(&prompt, &[0], keep)?
+            .ok_or_else(|| InferError::Config("hit exact attendu".to_string()))?;
+        let from = prompt.len().saturating_sub(keep);
+        assert_eq!(hit.3, from);
+        assert_eq!(hit.2.shape(), &[prompt.len() - from, 1]);
+        assert_eq!(hit.2.data(), &captures.hidden.data()[from..]);
+    }
+    // La copie bornée ne réduit pas la couverture de l'entrée conservée.
+    let cache = model
+        .prefix_cache
+        .lock()
+        .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+    let stored = cache.entries[0]
+        .captures
+        .as_ref()
+        .ok_or_else(|| InferError::Config("captures attendues".to_string()))?;
+    assert_eq!(stored.from, 0);
+    assert_eq!(stored.hidden, captures.hidden);
+    Ok(())
+}
+
+#[test]
 fn prefix_cache_extends_append_suffix_with_batched_prefill() {
     let config = hybrid_config(4);
     let weights = hybrid_weights(4, 2);

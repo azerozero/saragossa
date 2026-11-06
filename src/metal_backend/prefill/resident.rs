@@ -256,6 +256,21 @@ enum ResidentPrefillSource {
     },
 }
 
+/// Queue absolue conservée et intersection avec un morceau, en lignes.
+/// Les offsets sont relatifs au morceau source et au buffer de captures.
+fn resident_capture_range(
+    start: usize,
+    seq: usize,
+    keep_rows: usize,
+    chunk: std::ops::Range<usize>,
+) -> (std::ops::Range<usize>, Option<(usize, usize, usize)>) {
+    let kept = start.max(seq.saturating_sub(keep_rows))..seq;
+    let from = chunk.start.max(kept.start);
+    let to = chunk.end.min(kept.end);
+    let copy = (from < to).then(|| (from - chunk.start, from - kept.start, to - from));
+    (kept, copy)
+}
+
 fn f32_byte_offset(len: usize) -> Result<u64> {
     len.checked_mul(std::mem::size_of::<f32>())
         .and_then(|bytes| u64::try_from(bytes).ok())
@@ -279,6 +294,7 @@ impl MetalExecutor {
             layers,
             spec,
             &[],
+            usize::MAX,
             0,
             false,
         )?;
@@ -291,18 +307,20 @@ impl MetalExecutor {
         layers: &[PrefillMoeLayer<'_>],
         spec: PrefillAttentionSpec,
         capture_layer_ids: &[usize],
+        keep_rows: usize,
         chunk_tokens: usize,
         last_row_only: bool,
     ) -> Result<(
         PrefillKvRows,
         Vec<PrefillResidentLayerCache>,
-        Option<Tensor>,
+        Option<PrefillCaptures>,
     )> {
         self.qwen_moe_prefill_resident_from(
             input,
             layers,
             spec,
             capture_layer_ids,
+            keep_rows,
             chunk_tokens,
             None,
             last_row_only,
@@ -326,9 +344,9 @@ impl MetalExecutor {
     }
 
     /// Prefill résident avec capture du flux résiduel en sortie des couches
-    /// `capture_layer_ids` (toutes les positions). Les captures sont copiées sur
-    /// le GPU pendant l'encodage, relues une fois à la fin et rendues en
-    /// `[seq, n * hidden]`, la disposition attendue par le drafter DFlash.
+    /// `capture_layer_ids`, bornée aux `keep_rows` dernières positions. Les
+    /// captures sont copiées sur le GPU pendant l'encodage, relues à la fin en
+    /// `(from, [kept, n * hidden])`, avec `from` absolu pour le drafter DFlash.
     /// `None` quand aucune couche n'est demandée. `chunk_tokens` borne la
     /// taille d'un morceau (0 : un seul morceau), cf.
     /// `prefill_resident_chunk_tokens`. Avec `prefix`, `input` ne porte que les
@@ -344,13 +362,14 @@ impl MetalExecutor {
         layers: &[PrefillMoeLayer<'_>],
         spec: PrefillAttentionSpec,
         capture_layer_ids: &[usize],
+        keep_rows: usize,
         chunk_tokens: usize,
         prefix: Option<&PrefillResidentPrefix<'_>>,
         last_row_only: bool,
     ) -> Result<(
         PrefillKvRows,
         Vec<PrefillResidentLayerCache>,
-        Option<Tensor>,
+        Option<PrefillCaptures>,
     )> {
         let profile_sections = prefill_profile_sections_enabled();
         if profile_sections {
@@ -430,12 +449,18 @@ impl MetalExecutor {
                 layers.len()
             )));
         }
-        let capture_buffer = if capture_layer_ids.is_empty() {
+        let capture_range = start.max(spec.seq.saturating_sub(keep_rows))..spec.seq;
+        let capture_hidden_len = checked_len(
+            capture_range.len(),
+            hidden_dim,
+            "prefill résident queue capturée",
+        )?;
+        let capture_buffer = if capture_layer_ids.is_empty() || capture_range.is_empty() {
             None
         } else {
             let len = checked_len(
                 capture_layer_ids.len(),
-                hidden_len,
+                capture_hidden_len,
                 "prefill résident captures",
             )?;
             Some(self.uncached_f32_buffer(len, "resident_captures")?)
@@ -977,21 +1002,25 @@ impl MetalExecutor {
                         layer_index,
                     )?;
                     current_buffer = output_buffer;
-                    if let Some(capture_buffer) = capture_buffer.as_ref() {
+                    let (_, capture_copy) = resident_capture_range(
+                        start,
+                        spec.seq,
+                        keep_rows,
+                        chunk.start..chunk.start + chunk.rows,
+                    );
+                    if let (Some(capture_buffer), Some((src_row, dst_row, copy_rows))) =
+                        (capture_buffer.as_ref(), capture_copy)
+                    {
                         for slot in capture_layer_ids
                             .iter()
                             .enumerate()
                             .filter_map(|(slot, &id)| (id == layer_index).then_some(slot))
                         {
-                            let offset = f32_byte_offset(
-                                checked_len(slot, hidden_len, "prefill résident capture offset")?
-                                    .checked_add((chunk.start - start) * hidden_dim)
-                                    .ok_or_else(|| {
-                                        InferError::Shape(
-                                            "prefill résident capture offset déborde".to_string(),
-                                        )
-                                    })?,
-                            )?;
+                            // Ces produits tiennent dans la taille validée du buffer ;
+                            // aucune copie n'est encodée pour un morceau hors fenêtre.
+                            let offset =
+                                f32_byte_offset(slot * capture_hidden_len + dst_row * hidden_dim)?;
+                            let source_offset = f32_byte_offset(src_row * hidden_dim)?;
                             self.run_resident_prefill_section(
                                 &mut encode_context,
                                 "capture_copy",
@@ -999,10 +1028,10 @@ impl MetalExecutor {
                                     self.encode_copy_with_offsets(
                                         encoder,
                                         &current_buffer,
-                                        0,
+                                        source_offset,
                                         capture_buffer,
                                         offset,
-                                        chunk_hidden_len,
+                                        copy_rows * hidden_dim,
                                     )
                                 },
                             )?;
@@ -1131,22 +1160,37 @@ impl MetalExecutor {
         } else {
             PrefillKvRows::Owned(read_f32_buffer(&final_read_buffer, hidden_len)?)
         };
-        let captures = capture_buffer
-            .map(|buffer| -> Result<Tensor> {
-                let count = capture_layer_ids.len();
-                let raw = read_f32_buffer(&buffer, count * hidden_len)?;
-                // [n, seq, hidden] sur le GPU -> [seq, n * hidden] attendu par le drafter.
-                let mut out = vec![0.0_f32; count * hidden_len];
+        let captures = if capture_layer_ids.is_empty() {
+            None
+        } else {
+            let count = capture_layer_ids.len();
+            let cols = checked_len(count, hidden_dim, "prefill résident colonnes capturées")?;
+            let len = checked_len(
+                count,
+                capture_hidden_len,
+                "prefill résident captures rendues",
+            )?;
+            let mut out = vec![0.0_f32; len];
+            if let Some(buffer) = capture_buffer {
+                // Une seule couche relue à la fois : le réordonnancement
+                // [n, kept, hidden] -> [kept, n * hidden] évite la copie complète
+                // intermédiaire et une allocation par ligne.
                 for slot in 0..count {
-                    for row in 0..rows {
-                        let src = slot * hidden_len + row * hidden_dim;
-                        let dst = (row * count + slot) * hidden_dim;
-                        out[dst..dst + hidden_dim].copy_from_slice(&raw[src..src + hidden_dim]);
+                    let slot_rows =
+                        read_f32_buffer_at(&buffer, slot * capture_hidden_len, capture_hidden_len)?;
+                    for row in 0..capture_range.len() {
+                        let src = row * hidden_dim;
+                        let dst = row * cols + slot * hidden_dim;
+                        out[dst..dst + hidden_dim]
+                            .copy_from_slice(&slot_rows[src..src + hidden_dim]);
                     }
                 }
-                Tensor::from_vec(vec![rows, count * hidden_dim], out)
+            }
+            Some(PrefillCaptures {
+                from: capture_range.start,
+                hidden: Tensor::from_vec(vec![capture_range.len(), cols], out)?,
             })
-            .transpose()?;
+        };
         let mut layer_caches = Vec::with_capacity(layer_cache_buffers.len());
         for (cache_buffer, tail) in layer_cache_buffers.into_iter().zip(window_tails) {
             match cache_buffer {
@@ -2052,5 +2096,34 @@ fn shared_kv_rows(
                 PrefillKvRows::Shared(SharedF32Rows::new(value, 0, kv_len)?),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn resident_capture_tail_ranges_cpu() {
+        // Le dernier morceau peut être court ; tous les offsets restent locaux.
+        for (start, seq, keep, chunk, kept, copy) in [
+            (0, 19, 30, 0..7, 0..19, Some((0, 0, 7))),
+            (0, 19, 19, 14..19, 0..19, Some((0, 14, 5))),
+            (0, 19, 2, 14..19, 17..19, Some((3, 0, 2))),
+            (0, 19, 8, 0..7, 11..19, None),
+            (0, 19, 8, 7..14, 11..19, Some((4, 0, 3))),
+            (0, 19, 8, 14..19, 11..19, Some((0, 3, 5))),
+            (0, 19, usize::MAX, 7..14, 0..19, Some((0, 7, 7))),
+            (3, 19, 9, 3..11, 10..19, Some((7, 0, 1))),
+            (3, 19, 9, 11..19, 10..19, Some((0, 1, 8))),
+            (15, 19, 8, 15..19, 15..19, Some((0, 0, 4))),
+            (15, 19, usize::MAX, 15..19, 15..19, Some((0, 0, 4))),
+            (0, 19, 0, 14..19, 19..19, None),
+        ] {
+            assert_eq!(
+                resident_capture_range(start, seq, keep, chunk),
+                (kept, copy)
+            );
+        }
     }
 }

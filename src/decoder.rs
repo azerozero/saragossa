@@ -1520,6 +1520,25 @@ pub(crate) struct PrefixCaptures {
 }
 
 impl PrefixCaptures {
+    fn new(layer_ids: &[usize], from: usize, hidden: Tensor) -> Self {
+        Self {
+            layer_ids: layer_ids.to_vec(),
+            from,
+            hidden,
+        }
+    }
+
+    /// Copie seulement la queue demandée, sans cloner le tenseur complet du cache.
+    fn clone_tail(&self, keep_rows: usize) -> Result<Self> {
+        let (rows, cols) = self.hidden.as_matrix()?;
+        let drop = rows.saturating_sub(keep_rows.max(1));
+        let hidden = Tensor::from_vec(
+            vec![rows - drop, cols],
+            self.hidden.data()[drop * cols..].to_vec(),
+        )?;
+        Ok(Self::new(&self.layer_ids, self.from + drop, hidden))
+    }
+
     /// Garde au plus les `keep_rows` dernières lignes de `hidden` (positions
     /// `from..`), en avançant `from` d'autant.
     pub(crate) fn tail(
@@ -1538,11 +1557,7 @@ impl PrefixCaptures {
                 hidden.data()[drop * cols..].to_vec(),
             )?
         };
-        Ok(Self {
-            layer_ids: layer_ids.to_vec(),
-            from: from + drop,
-            hidden,
-        })
+        Ok(Self::new(layer_ids, from + drop, hidden))
     }
 }
 
