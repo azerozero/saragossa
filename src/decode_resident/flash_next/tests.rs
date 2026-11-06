@@ -649,10 +649,11 @@ fn n2_resident_decode_matches_cpu_reference() {
         .count();
     eprintln!("quasi-égalités du routeur CPU (marge ≤ 1e-5) : {ties}");
 
-    let prefixes: Vec<usize> = [64, 256, tokens]
+    let mut prefixes: Vec<usize> = [64, 256, tokens]
         .into_iter()
         .filter(|&p| p <= tokens)
         .collect();
+    prefixes.dedup();
     let (native, _) = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Native, tokens);
     for &prefix in &prefixes {
         let Summary {
@@ -703,14 +704,12 @@ fn n2_resident_decode_matches_cpu_reference() {
     );
     drop(forced);
 
-    // Mutation : premier (token ≥ 8, couche) à marge nette (> 1e-2).
+    // Mutation : (token ≥ 8, couche) de plus grande marge CPU parmi les 64 premiers.
     let (token, layer) = (8..tokens.min(64))
-        .find_map(|t| {
-            (0..cpu.margins.len())
-                .find(|&l| cpu.margins[l][t] > 1.0e-2)
-                .map(|l| (t, l))
-        })
-        .expect("invariant: une marge nette existe");
+        .flat_map(|t| (0..cpu.margins.len()).map(move |l| (t, l)))
+        .max_by(|a, b| cpu.margins[a.1][a.0].total_cmp(&cpu.margins[b.1][b.0]))
+        .expect("invariant: au moins 9 tokens");
+    eprintln!("mutation : marge CPU {:.2e}", cpu.margins[layer][token]);
     let steps = (token + 8).min(tokens);
     let (mutated, _) =
         run_resident_pass(&dir, &ids, &cpu, RoutingMode::Mutation(token, layer), steps);
