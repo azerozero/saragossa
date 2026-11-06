@@ -79,21 +79,35 @@ impl Qwen4ExpReference {
     /// Renvoie une erreur si un token sort du vocabulaire ou sur lecture.
     pub fn embed(&self, ids: &[usize]) -> Result<Tensor> {
         let c = &self.ckpt.config;
-        let base = Qwen4ExpCheckpoint::trunk("embed_tokens");
+        let rows = self.embed_rows(ids)?;
         let mut out = Vec::with_capacity(ids.len() * c.hc_width());
-        for &id in ids {
-            if id >= c.vocab {
-                return Err(InferError::Shape(format!("token {id} hors vocabulaire")));
-            }
-            let row = self.ckpt.affine_rows(&base, None, id..id + 1)?;
+        for row in rows.data().chunks_exact(c.hidden) {
             for _ in 0..c.hc_count {
-                out.extend_from_slice(row.data());
+                out.extend_from_slice(row);
             }
         }
         tensor(ids.len(), c.hc_width(), out)
     }
 
-    fn residual(&self, prefix: &str, inject: bool) -> Result<GatedResidual> {
+    /// Lignes d'embedding `[T, hidden]` (un seul flux).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si un token sort du vocabulaire ou sur lecture.
+    pub(crate) fn embed_rows(&self, ids: &[usize]) -> Result<Tensor> {
+        let c = &self.ckpt.config;
+        let base = Qwen4ExpCheckpoint::trunk("embed_tokens");
+        let mut out = Vec::with_capacity(ids.len() * c.hidden);
+        for &id in ids {
+            if id >= c.vocab {
+                return Err(InferError::Shape(format!("token {id} hors vocabulaire")));
+            }
+            out.extend_from_slice(self.ckpt.affine_rows(&base, None, id..id + 1)?.data());
+        }
+        tensor(ids.len(), c.hidden, out)
+    }
+
+    pub(super) fn residual(&self, prefix: &str, inject: bool) -> Result<GatedResidual> {
         let c = &self.ckpt.config;
         Ok(GatedResidual {
             norm: self.ckpt.floats(&format!("{prefix}hc_norm.weight"))?,
@@ -323,17 +337,33 @@ impl Qwen4ExpReference {
             .get(index)
             .ok_or_else(|| InferError::Shape(format!("couche {index} hors modèle")))?;
         let prefix = Qwen4ExpCheckpoint::layer_prefix(index);
+        let ple = (index == c.ple_layer).then_some(ids);
+        self.layer_at(&prefix, kind, ple, h, forced, forced_routing)
+    }
+
+    /// Couche `prefix` (tronc ou MTP) sur `h`, PLE ajouté si `ple` porte les
+    /// tokens de la séquence.
+    pub(super) fn layer_at(
+        &self,
+        prefix: &str,
+        kind: Qwen4ExpLayerKind,
+        ple: Option<&[usize]>,
+        h: &Tensor,
+        forced: Option<&[Vec<usize>]>,
+        forced_routing: Option<&[Option<Vec<usize>>]>,
+    ) -> Result<LayerOutput> {
+        let c = &self.ckpt.config;
         let mut h = h.clone();
-        if index == c.ple_layer {
+        if let Some(ids) = ple {
             // PLE ajouté aux flux AVANT l'hyper-connection d'attention.
-            h = h.add(&self.ple_contribution(&prefix, &h, ids)?)?;
+            h = h.add(&self.ple_contribution(prefix, &h, ids)?)?;
         }
         let attn_hc = self.residual(&format!("{prefix}attn_hyper_connection."), true)?;
         let mixed = attn_hc.mix(&h, c.hc_count, c.hidden, c.rms_eps)?;
         let (branch, selected) = match kind {
-            Qwen4ExpLayerKind::Linear => (self.deltanet(&prefix, &mixed.input)?, None),
+            Qwen4ExpLayerKind::Linear => (self.deltanet(prefix, &mixed.input)?, None),
             Qwen4ExpLayerKind::Full => {
-                let (out, trace) = self.attention(&prefix, &mixed.input, forced)?;
+                let (out, trace) = self.attention(prefix, &mixed.input, forced)?;
                 (out, Some(trace))
             }
         };
@@ -343,7 +373,7 @@ impl Qwen4ExpReference {
         let h = combine(&h, &branch, &inject, c.hc_count)?;
         let mlp_hc = self.residual(&format!("{prefix}mlp_hyper_connection."), true)?;
         let mixed = mlp_hc.mix(&h, c.hc_count, c.hidden, c.rms_eps)?;
-        let moe_out = self.moe_block(&prefix, &mixed.input, forced_routing)?;
+        let moe_out = self.moe_block(prefix, &mixed.input, forced_routing)?;
         let inject = mixed
             .inject
             .ok_or_else(|| InferError::Config("hyper-connection sans injection".to_string()))?;

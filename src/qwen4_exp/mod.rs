@@ -9,6 +9,14 @@ pub(crate) mod attention;
 mod forward;
 pub(crate) mod math;
 mod moe;
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "tête MTP : oracle des tests, chemin résident à l'étape 6 B"
+    )
+)]
+mod mtp;
 pub(crate) mod ngram;
 pub(crate) mod ple;
 pub(crate) mod residual;

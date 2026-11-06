@@ -1157,3 +1157,121 @@ fn n2_long_cpu_chain_matches_transformers_on_4k_tokens() {
     eprintln!("couches QSA hors tolérance par dérive : {drifted:?}");
     assert_eq!(top1, 0, "top-1 différent");
 }
+
+/// Tête MTP CPU (transcription de `graph_mtp`) contre `mtp_golden.safetensors`
+/// (`oracle_dump.py --mtp`) : couche QSA + MoE et mixer de tête officiels de
+/// transformers sur les poids `mtp.*`, entrée fc transcrite ; paires
+/// `(h_t, tok_{t+1})` des 4096 tokens du golden long, `h_t` partagé.
+///
+/// Portes : entrée fc et sortie de couche à `LAYER_TOL` aux positions figées ;
+/// routage justifié et experts torch imposés aux quasi-égalités torch ;
+/// scores de l'indexeur à `SCORE_TOL`, sélection justifiée à `TIE_TOL`
+/// (sélection torch imposée pour la sortie) ; logits de tête KL ≤ 1e-3 et
+/// top-1 identique. L'accord du brouillon avec l'argmax du tronc (golden long)
+/// est publié : seul contrôle indépendant de l'entrée et de la tête, la
+/// couche venant de transformers.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn n2_mtp_head_matches_transformers_blocks() {
+    let (dir, golden_dir) = n2_paths();
+    check_provenance(&dir, &golden_dir, "mtp_golden.safetensors")
+        .unwrap_or_else(|e| panic!("provenance MTP : {e}"));
+    let reference =
+        Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
+    let golden = Golden {
+        path: golden_dir.join("mtp_golden.safetensors"),
+    };
+    let long = Golden {
+        path: golden_dir.join("long.safetensors"),
+    };
+    let h = golden.f32("mtp_h");
+    let next: Vec<usize> = golden
+        .i64("mtp_next_ids")
+        .iter()
+        .map(|&t| t as usize)
+        .collect();
+    let positions: Vec<usize> = golden
+        .i64("mtp_positions")
+        .iter()
+        .map(|&p| p as usize)
+        .collect();
+    let width = h.as_matrix().expect("invariant: 2D").1;
+    let pick = |t: &Tensor| -> Tensor {
+        let rows: Vec<f32> = positions
+            .iter()
+            .flat_map(|&p| t.data()[p * width..(p + 1) * width].iter().copied())
+            .collect();
+        Tensor::from_vec(vec![positions.len(), width], rows).expect("invariant: lignes")
+    };
+    let started = std::time::Instant::now();
+    let x = reference
+        .mtp_input(&h, &next)
+        .expect("invariant: entrée MTP");
+    assert_close("entrée MTP", &pick(&x), &golden.f32("mtp_input"), LAYER_TOL);
+    let k = reference.checkpoint().config.top_k;
+    let (keep, compress) = (reference.budget_blocks(), reference.compress());
+    let (torch_sets, torch_probs) = golden.routing(0, k);
+    let forced_routing = forced_torch_routing(&torch_sets, &torch_probs, k);
+    let torch_selection = golden.mask_selection("qsa_mask.0");
+    let out = reference
+        .mtp_layer(&x, Some(&torch_selection), Some(&forced_routing))
+        .expect("invariant: couche MTP");
+    let swaps = justify_routing(&out.routing, &torch_sets, &torch_probs, k)
+        .unwrap_or_else(|e| panic!("routage MTP : {e}"));
+    let trace = out.qsa.as_ref().expect("invariant: trace QSA");
+    let ties = justify_qsa(
+        trace,
+        &torch_selection,
+        &golden.qsa_scores(0),
+        keep,
+        compress,
+    )
+    .unwrap_or_else(|e| panic!("QSA MTP : {e}"));
+    let picked = pick(&out.hidden);
+    assert_close("sortie MTP", &picked, &golden.f32("mtp_output"), LAYER_TOL);
+    let logits = reference
+        .logits(&reference.mtp_head(&picked).expect("invariant: mixer MTP"))
+        .expect("invariant: logits MTP");
+    let oracle = golden.f32("logits");
+    let (mean, worst) = kl_per_token(&oracle, &logits);
+    let vocab = logits.as_matrix().expect("invariant: 2D").1;
+    let row = |t: &Tensor, i: usize| argmax(&t.data()[i * vocab..(i + 1) * vocab]);
+    let top1 = (0..positions.len())
+        .filter(|&i| row(&logits, i) != row(&oracle, i))
+        .count();
+    // Accord du brouillon (ligne t, prédit tok_{t+2}) avec le tronc : argmax du
+    // golden long à la position t+1, et texte réel tok_{t+2}.
+    let trunk_positions: Vec<usize> = long
+        .i64("logit_positions")
+        .iter()
+        .map(|&p| p as usize)
+        .collect();
+    let trunk = long.f32("logits");
+    let (mut with_trunk, mut trunk_rows, mut with_text, mut text_rows) = (0, 0, 0, 0);
+    for (i, &t) in positions.iter().enumerate() {
+        let draft = row(&logits, i);
+        if let Some(j) = trunk_positions.iter().position(|&p| p == t + 1) {
+            trunk_rows += 1;
+            with_trunk += usize::from(draft == row(&trunk, j));
+        }
+        if t + 1 < next.len() {
+            text_rows += 1;
+            with_text += usize::from(draft == next[t + 1]);
+        }
+    }
+    eprintln!(
+        "MTP : {} paires en {:.0} s ; {} échanges de routage justifiés, {ties} ex æquo QSA ; \
+         KL moyen {mean:.2e}, max {worst:.2e}, top-1 différents {top1} sur {} ; accord du \
+         brouillon avec l'argmax du tronc {with_trunk}/{trunk_rows}, avec le texte \
+         {with_text}/{text_rows}",
+        next.len(),
+        started.elapsed().as_secs_f64(),
+        swaps.len(),
+        positions.len()
+    );
+    assert!(
+        mean <= KL_TOL && worst <= KL_TOL,
+        "KL {mean:.2e} / {worst:.2e}"
+    );
+    assert_eq!(top1, 0, "top-1 MTP différent de transformers");
+}

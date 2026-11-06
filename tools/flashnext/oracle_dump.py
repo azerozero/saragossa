@@ -15,12 +15,18 @@ empreintes des fichiers ouverts avant l'inférence.
   --long   : modèle complet sur 4096 tokens (QSA creuse au-delà de 2051) :
              routages, scores et masques de l'indexeur, logits à une position sur 16
              et aux 64 dernières.
+  --mtp    : couche MTP (absente de transformers) sur les paires (h_t, tok_{t+1})
+             du golden long : h_t recalculé par la couche 47 officielle depuis
+             `qsa_input.47`, entrée fc transcrite de `graph_mtp` (llama.cpp),
+             normes et couche QSA + MoE officielles (poids `mtp.*`), mixer de tête
+             officiel, logits aux positions de `long_positions`.
 
 Usage :
   python -I tools/flashnext/oracle_dump.py --selftest
   python -I tools/flashnext/oracle_dump.py --layers <q4e8> <tokenizer.json> <texte> <sortie>
   python -I tools/flashnext/oracle_dump.py --full   <q4e8> <tokenizer.json> <sortie>
   python -I tools/flashnext/oracle_dump.py --long   <q4e8> <tokenizer.json> <texte> <sortie>
+  python -I tools/flashnext/oracle_dump.py --mtp    <q4e8> <sortie contenant long.safetensors>
 """
 
 import hashlib
@@ -372,6 +378,85 @@ def run_long(qdir, tokenizer, text, out):
              "qsa_anchors": "qsa_input complet, qsa_output aux logit_positions"})
 
 
+def run_mtp(qdir, out):
+    """Couche MTP sur les 4095 paires `(h_t, tok_{t+1})` du golden long. Ligne `t`
+    de l'historique MTP à la position RoPE `t` (RoPE relative : un décalage
+    constant ne change l'attention qu'à l'arrondi près). Sont figés : `h` et les
+    tokens d'entrée, l'entrée fc et la sortie hc aux positions, routages, masque
+    et scores de l'indexeur, logits de tête aux positions."""
+    from safetensors import safe_open
+
+    source = source_entry(qdir)
+    check_compatible(out, "mtp_golden.safetensors", source)
+    tc = C.text_config(qdir)
+    weights = C.QWeights(qdir)
+    last = tc.num_hidden_layers - 1
+    with safe_open(out / "long.safetensors", framework="np") as golden:
+        ids_list = golden.get_tensor("input_ids").tolist()
+        x = torch.from_numpy(golden.get_tensor(f"qsa_input.{last}")).float()[None]
+    n = len(ids_list)
+    ids = torch.tensor([ids_list])
+    started = time.time()
+    layer = C.build_layer(tc, last, weights)
+    with C.TopkCapture():
+        h = layer(x, position_embeddings=C.rope(tc, n), attention_mask=C.causal_mask(n),
+                  conv_mask=None, past_key_values=None, ple_input_ids=ids)[0]
+    del layer
+    print(f"couche {last} recalculée : {time.time() - started:.0f} s", flush=True)
+    m = n - 1
+    h_in, next_ids = h[:m], ids[0, 1:]
+    hidden, hc = tc.hidden_size, tc.hc_count
+    e_norm = C.M.Qwen4ExpTextRMSNorm(hidden, eps=tc.rms_norm_eps)
+    e_norm.weight.data = weights.dense("mtp.pre_fc_norm_embedding.weight").float()
+    h_norm = C.M.Qwen4ExpTextRMSNorm(hc * hidden, group_size=hidden, eps=tc.rms_norm_eps)
+    h_norm.weight.data = weights.dense("mtp.pre_fc_norm_hidden.weight").float()
+    fc_e, fc_h = weights.dense("mtp.fc_embedding.weight"), weights.dense("mtp.fc_hidden.weight")
+    e = e_norm(weights.rows("model.language_model.embed_tokens.weight", next_ids.numpy())) @ fc_e.T
+    hs = h_norm(h_in).reshape(m, hc, hidden) @ fc_h.T
+    res = (hs + e[:, None, :]).reshape(1, m, hc * hidden)
+    # Couche de type QSA sans PLE : l'indice `last` fixe le type, `prefix` les poids.
+    layer = C.build_layer(tc, last, weights, prefix="mtp.layers.0.")
+    cap = {}
+    layer.mlp.gate.register_forward_hook(
+        lambda _m, _i, o: cap.update(logits=o[0].clone(), ids=o[2].clone()))
+    layer.self_attn.indexer.register_forward_hook(lambda _m, _i, o: cap.update(mask=o.clone()))
+    with C.TopkCapture() as topk:
+        y = layer(res, position_embeddings=C.rope(tc, m), attention_mask=C.causal_mask(m),
+                  conv_mask=None, past_key_values=None, ple_input_ids=None)
+    del layer
+    print(f"couche MTP : {time.time() - started:.0f} s, pic RSS {C.footprint_gb():.1f} Go", flush=True)
+    keep = torch.tensor(long_positions(m))
+    tensors = {
+        "mtp_h": ("F32", tuple(h_in.shape), h_in.contiguous().numpy().tobytes()),
+        "mtp_next_ids": ("I64", (m,), next_ids.numpy().astype(np.int64).tobytes()),
+        "mtp_positions": ("I64", tuple(keep.shape), keep.numpy().astype(np.int64).tobytes()),
+    }
+    xin, yout = res[0][keep], y[0][keep]
+    tensors["mtp_input"] = ("F32", tuple(xin.shape), xin.contiguous().numpy().tobytes())
+    tensors["mtp_output"] = ("F32", tuple(yout.shape), yout.contiguous().numpy().tobytes())
+    r = cap["ids"].to(torch.int64)
+    tensors["routing.0"] = ("I64", tuple(r.shape), r.numpy().tobytes())
+    lg = cap["logits"].float()
+    tensors["router_logits.0"] = ("F32", tuple(lg.shape), lg.numpy().tobytes())
+    mask = cap["mask"][0, 0].to(torch.uint8)
+    tensors["qsa_mask.0"] = ("U8", tuple(mask.shape), mask.numpy().tobytes())
+    it = iter(topk.indexer)
+    rows = [next(it) if (i + 1) // tc.indexer_compress_ratio > 0 else torch.zeros(0) for i in range(m)]
+    assert next(it, None) is None, "scores d'indexeur en surnombre"
+    flat, offsets = C.flatten_scores(rows)
+    tensors["qsa_scores.0"] = ("F32", flat.shape, flat.tobytes())
+    tensors["qsa_offsets.0"] = ("I64", offsets.shape, offsets.tobytes())
+    mixer = C.M.Qwen4ExpTextGatedResidual(tc, use_combine=False)
+    mixer.load_state_dict({k: weights.dense(f"mtp.hyper_connection_mixer.{k}") for k in mixer.state_dict()})
+    logits = mixer(y)[0][keep] @ weights.dense("lm_head.weight").T
+    tensors["logits"] = ("F32", tuple(logits.shape), logits.float().numpy().tobytes())
+    tmp = out / "mtp_golden.safetensors.tmp"
+    C.write_safetensors(tmp, tensors, {"pairs": m})
+    publish(out, "mtp_golden.safetensors", tmp, source,
+            {"pairs": m, "long_sha256": sha256(out / "long.safetensors"),
+             "positions": "ligne t à la position RoPE t ; logits 16k + 64 dernières"})
+
+
 def main():
     torch.set_num_threads(os.cpu_count() or 8)
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -388,6 +473,9 @@ def main():
         out = Path(out)
         out.mkdir(parents=True, exist_ok=True)
         run_long(qdir, tokenizer, text, out)
+    elif mode == "--mtp":
+        _, _, qdir, out = sys.argv
+        run_mtp(qdir, Path(out))
     elif mode == "--full":
         _, _, qdir, tokenizer, out = sys.argv
         out = Path(out)
