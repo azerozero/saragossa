@@ -47,8 +47,8 @@ Les q/k de l'attention QSA et les requêtes de l'indexeur passent par
 `flash_next_rms_norm_rope_f32`.
 - L'angle vaut `position·inv_freq` en f32, avec sin et cos précis, comme
   `rope_in_place` du CPU et transformers.
-- Écart au CPU : 1e-7 à toutes les positions jusqu'à 262 143, en d128 comme
-  en d256.
+- Écart au CPU : porte à 1e-5, mesuré ≤ 1,2e-7 à toutes les positions
+  jusqu'à 262 143, en d128 comme en d256.
 
 Le kernel générique de l'arène (`rms_norm_rope_heads_decode_f32`) calcule
 `position / pow(θ, e)` en fast-math. Son erreur croît avec la position :
@@ -94,8 +94,8 @@ comme témoin.
 | brique | oracle | écart |
 |---|---|---|
 | top-512 radix, cas d'égalités massives | `select_for_query` | identique |
-| couche QSA creuse, budget 64, 200 tokens (133 pas creux) | `qsa` CPU | ≤ 1e-5 ; une mutation de RoPE poolée est détectée |
-| RoPE à 5, 2051, 32k, 131k, 262k, d128 et d256 | `rms_norm_1p` + `rope_in_place` | ≤ 1,2e-7 |
+| couche QSA creuse, budget 64, 200 tokens (133 pas creux) | `qsa` CPU | ≤ 1e-5 ; un pas à sélection justifiée par quasi-égalité saute la comparaison de sortie (aucun sur ce test) |
+| RoPE à 5, 2051, 32k, 131k, 262k, d128 et d256 | `rms_norm_1p` + `rope_in_place` | porte 1e-5, mesuré ≤ 1,2e-7 ; le kernel de l'arène, témoin, dépasse 1e-4 |
 
 ### Règle des quasi-égalités QSA
 
@@ -138,9 +138,9 @@ dérive : la chaîne Rust des 48 couches n'est jamais ré-ancrée.
 
 ### N2 résident (GPU contre CPU, 4096 tokens)
 
-1. **Passe native, contrôlée jusqu'à la première bascule.** Elle est verte :
-   les scores de l'indexeur GPU et CPU sont identiques (écart 0) jusqu'au
-   token 313, où le routage de la couche 2 bascule sur une marge de 3,4e-8.
+1. **Passe native, contrôlée jusqu'à la première bascule.** Elle est verte
+   jusqu'au token 313, encore en régime dense, où le routage de la couche 2
+   bascule sur une marge de 3,4e-8 (paire au seuil).
 2. **Oracle ré-ancré, porte stricte.** Chaque couche QSA CPU repart, sur toute
    la séquence, des entrées GPU de la passe native. La sélection et le
    routage GPU lui sont imposés, et ses choix naturels doivent les justifier.
@@ -162,9 +162,10 @@ dérive : la chaîne Rust des 48 couches n'est jamais ré-ancrée.
      kernels. Les couches QSA ré-ancrées mesurent au plus 8,6e-6, soit au
      moins 11 fois sous le seuil de 1e-4, lui-même dix fois sous la porte de
      bout en bout (1e-3).
-   - **Puissance.** Une mauvaise sélection imposée en passe native doit faire
-     rougir la seule porte de sélection. Une sortie GPU mise à l'échelle de
-     1 + 2e-4 doit faire rougir la seule porte de sortie.
+   - **Puissance.** Une mauvaise sélection imposée au GPU en passe native doit
+     faire rougir la seule porte de sélection. Autotest du seuil de sortie :
+     la sortie capturée dans le rapport, mise à l'échelle de 1 + 2e-4, doit
+     faire rougir la seule porte de sortie.
 3. **Bout en bout, contrôle de dérive.** Les experts du CPU sont imposés aux
    quasi-égalités ; la sélection QSA reste celle du GPU.
    - Portes :

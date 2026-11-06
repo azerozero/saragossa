@@ -505,8 +505,6 @@ struct TokenReport {
     /// (régime creux seulement).
     /// `(blocs retenus, scores, blocs natifs avant imposition)`.
     qsa: Vec<Option<GpuQsa>>,
-    /// Couches QSA dont la sélection a été imposée à ce token.
-    qsa_imposed: Vec<usize>,
     /// Passes natives : `(couche QSA, entrée GPU, sortie GPU)`.
     anchors: Vec<(usize, Vec<f32>, Vec<f32>)>,
 }
@@ -703,9 +701,6 @@ fn run_resident_pass(
                 Some(wrong)
             })
             .collect();
-        let qsa_imposed: Vec<usize> = (0..layers)
-            .filter(|&l| session.forced_selection[l].is_some())
-            .collect();
         let out = session
             .step(token, true, true)
             .expect("invariant: pas résident");
@@ -784,7 +779,6 @@ fn run_resident_pass(
             routing,
             imposed,
             qsa,
-            qsa_imposed,
             anchors,
         });
     }
@@ -968,7 +962,7 @@ struct Summary {
     qsa_mismatches: usize,
 }
 
-/// Points QSA non imposés où le GPU retient d'autres blocs que le CPU :
+/// Points QSA où le GPU retient d'autres blocs que le CPU :
 /// `(token, couche, marge CPU au seuil)`.
 fn qsa_mismatch_points(reports: &[TokenReport], cpu: &CpuChain) -> Vec<(usize, usize, f32)> {
     reports
@@ -977,8 +971,7 @@ fn qsa_mismatch_points(reports: &[TokenReport], cpu: &CpuChain) -> Vec<(usize, u
         .flat_map(|(t, r)| {
             (0..r.qsa.len())
                 .filter(move |&l| {
-                    !r.qsa_imposed.contains(&l)
-                        && r.qsa[l].as_ref().map(|(b, _, _)| b) != cpu_blocks(cpu, l, t).as_ref()
+                    r.qsa[l].as_ref().map(|(b, _, _)| b) != cpu_blocks(cpu, l, t).as_ref()
                 })
                 .map(move |l| (t, l, qsa_threshold(cpu, l, t).map_or(f32::NAN, |(_, m)| m)))
         })
@@ -1017,18 +1010,7 @@ fn summarize(reports: &[TokenReport], cpu: &CpuChain, prefix: usize) -> Summary 
                 .count()
         })
         .sum();
-    let qsa_mismatches = reports
-        .iter()
-        .enumerate()
-        .map(|(t, r)| {
-            (0..r.qsa.len())
-                .filter(|&l| {
-                    !r.qsa_imposed.contains(&l)
-                        && r.qsa[l].as_ref().map(|(b, _, _)| b) != cpu_blocks(cpu, l, t).as_ref()
-                })
-                .count()
-        })
-        .sum();
+    let qsa_mismatches = qsa_mismatch_points(reports, cpu).len();
     Summary {
         worst,
         kl,
@@ -1042,7 +1024,8 @@ fn summarize(reports: &[TokenReport], cpu: &CpuChain, prefix: usize) -> Summary 
 
 /// Porte d'une passe imposée : écart ≤ 1e-3, KL ≤ 1e-3, valeurs finies,
 /// argmax identique sauf quasi-égalité (≤ 1e-5), routage identique aux points
-/// non imposés.
+/// non imposés. Évaluée sur le régime dense, où la clause QSA est vraie par
+/// construction : elle garde la porte honnête si un préfixe creux y entrait.
 fn forced_gate_green(summary: &Summary) -> bool {
     within(summary.worst, 1.0e-3)
         && within(summary.kl, 1.0e-3)
@@ -1174,7 +1157,6 @@ fn n2_gate_refuses_late_nan_and_native_check_refuses_early_drift() {
         routing: vec![vec![1, 2]],
         imposed: Vec::new(),
         qsa: vec![None],
-        qsa_imposed: Vec::new(),
         anchors: Vec::new(),
     };
     let clean: Vec<TokenReport> = (0..4).map(|_| report(1.0e-6, 1.0e-9)).collect();
@@ -1288,22 +1270,7 @@ fn n2_resident_decode_matches_cpu_reference() {
     assert!(cpu.qsa[0].is_none(), "couche 0 QSA : entrée non ancrable");
     let native = run_resident_pass(&dir, &ids, &cpu, RoutingMode::Native, tokens);
     let native_first = native_check(&native, &cpu);
-    // Erreur des scores GPU de l'indexeur avant la première divergence (calibre
-    // la règle de quasi-égalité QSA) et points QSA par seuil.
-    let horizon = native_first
-        .as_ref()
-        .ok()
-        .and_then(|f| f.map(|(t, _, _)| t))
-        .unwrap_or(tokens);
-    let mut early_error = 0.0_f64;
-    for (t, r) in native[..horizon].iter().enumerate() {
-        for (l, entry) in r.qsa.iter().enumerate() {
-            if let (Some((_, gpu, _)), Some(trace)) = (entry, cpu.qsa[l].as_ref()) {
-                early_error = nan_max(early_error, relative_error(gpu, &trace.scores[t]).0);
-            }
-        }
-    }
-    eprintln!("scores de l'indexeur GPU/CPU avant la première divergence : écart relatif max {early_error:.2e}");
+    // Points QSA par marge relative au seuil du top-512.
     for th in TIE_THRESHOLDS {
         let n = (0..tokens)
             .flat_map(|t| (0..cpu.layers.len()).map(move |l| (t, l)))
@@ -1407,11 +1374,15 @@ fn n2_resident_decode_matches_cpu_reference() {
         .ok()
         .and_then(|f| f.map(|(t, _, _)| t + 1))
         .unwrap_or(8);
-    for range in [8..tokens.min(64), after..sparse_start.min(after + 64)] {
+    for (label, range) in [
+        ("précoce", 8..tokens.min(64)),
+        ("tardive", after..sparse_start.min(after + 64)),
+    ] {
         let Some((token, layer)) = range
             .flat_map(|t| (0..cpu.margins.len()).map(move |l| (t, l)))
             .max_by(|a, b| cpu.margins[a.1][a.0].total_cmp(&cpu.margins[b.1][b.0]))
         else {
+            eprintln!("mutation {label} non exécutée : plage vide en régime dense");
             continue;
         };
         let steps = (token + 8).min(sparse_start);
