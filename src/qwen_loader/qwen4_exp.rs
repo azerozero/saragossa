@@ -1075,13 +1075,25 @@ impl Qwen4ExpCheckpoint {
         Ok(out)
     }
 
-    /// Octets stockés des tenseurs dont le nom commence par `prefix`.
-    pub fn tensor_bytes_with_prefix(&self, prefix: &str) -> u64 {
-        self.index
+    /// Octets stockés des tenseurs dont le nom commence par `prefix`, par
+    /// nature : `(packed, échelles et biais, flottants copiés)`.
+    pub fn tensor_bytes_by_kind(&self, prefix: &str) -> (u64, u64, u64) {
+        let mut sizes = (0_u64, 0_u64, 0_u64);
+        for (name, (_, entry)) in self
+            .index
             .iter()
             .filter(|(name, _)| name.starts_with(prefix))
-            .map(|(_, (_, entry))| (entry.data_offsets[1] - entry.data_offsets[0]) as u64)
-            .sum()
+        {
+            let bytes = (entry.data_offsets[1] - entry.data_offsets[0]) as u64;
+            if name.ends_with(".scales") || name.ends_with(".biases") {
+                sizes.1 += bytes;
+            } else if entry.dtype == Dtype::U32 {
+                sizes.0 += bytes;
+            } else {
+                sizes.2 += bytes;
+            }
+        }
+        sizes
     }
 
     /// Largeur d'une ligne n-gram (octets E4M3).

@@ -906,3 +906,65 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
         );
     }
 }
+
+/// Garde mémoire du chargement : un plafond égal à l'état résident final est
+/// refusé, car une étape a un pic transitoire (copies CPU des triplets,
+/// empilement des experts) ; un plafond égal au pic est accepté. La simulation
+/// suit l'ordre du chargement réel, sur la fixture N1 convertie.
+#[cfg(feature = "devtools")]
+#[test]
+fn load_plan_guard_refuses_transient_peak_above_final_resident() -> Result<()> {
+    use super::weights::load_plan;
+    use crate::devtools::convert::{convert_qwen4exp, ConvertOptions};
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    use crate::{MemoryGuard, MemoryLimits};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    let dst = tempfile::tempdir().expect("invariant: dossier temporaire");
+    convert_qwen4exp(&ConvertOptions {
+        src: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qwen4exp_mini/source"),
+        dst: dst.path().to_path_buf(),
+        source_revision: "fixture".to_string(),
+        source_repo: None,
+        converter_commit: None,
+        only: None,
+        verify: false,
+        plan_only: false,
+    })?;
+    let ckpt = Qwen4ExpCheckpoint::open(dst.path())?;
+    let plan = load_plan(&ckpt);
+    assert_eq!(plan.len(), 3 + ckpt.config.layer_kinds.len());
+    let total: u64 = plan.iter().map(|s| s.resident).sum();
+    let mut before = 0;
+    let mut peak = 0;
+    for stage in &plan {
+        peak = peak.max(before + stage.resident + stage.transient);
+        before += stage.resident;
+    }
+    assert!(peak > total, "aucun pic transitoire : {peak} ≤ {total}");
+    let simulate = |cap: u64| -> Result<()> {
+        let current = Arc::new(AtomicU64::new(0));
+        let probe = Arc::clone(&current);
+        let guard = MemoryGuard::from_limits(
+            true,
+            MemoryLimits {
+                static_cap: Some(cap),
+                host_memory: None,
+                headroom_bytes: 0,
+                metal_cap: None,
+            },
+            Arc::new(move || Some(probe.load(Ordering::Relaxed))),
+        );
+        for stage in &plan {
+            stage.check(Some(&guard))?;
+            current.fetch_add(stage.resident, Ordering::Relaxed);
+        }
+        Ok(())
+    };
+    assert!(
+        matches!(simulate(total), Err(InferError::MemoryGuard(_))),
+        "plafond au résident final accepté malgré le pic"
+    );
+    simulate(peak)
+}

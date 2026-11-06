@@ -71,10 +71,68 @@ fn one_plus(values: Vec<f32>) -> Vec<f32> {
     values.into_iter().map(|w| 1.0 + w).collect()
 }
 
-/// Octets d'un checkpoint attendus en mémoire GPU pour une couche : somme des
-/// tenseurs du préfixe (garde mémoire, au chargement).
-fn layer_bytes(ckpt: &Qwen4ExpCheckpoint, prefix: &str) -> u64 {
-    ckpt.tensor_bytes_with_prefix(prefix)
+/// Étape du chargement et son budget mémoire.
+#[derive(Clone, Debug)]
+pub(crate) struct LoadStage {
+    /// Octets qui restent alloués après l'étape (GPU, et sources CPU gardées).
+    pub(crate) resident: u64,
+    /// Octets vivants seulement pendant l'étape.
+    pub(crate) transient: u64,
+}
+
+impl LoadStage {
+    /// Budget d'une étape lue dans le checkpoint sous `prefix`.
+    ///
+    /// Pendant l'étape coexistent :
+    /// - les copies CPU des triplets affines (packed, échelles et biais
+    ///   élargis en f32, soit 2× leurs octets bf16), experts compris ;
+    /// - le tampon d'empilement des experts, borné par la même quantité ;
+    /// - les buffers GPU (packed, échelles et biais bf16) et les flottants
+    ///   copiés convertis en f32, dont les sources CPU restent vivantes.
+    fn from_checkpoint(ckpt: &Qwen4ExpCheckpoint, prefix: &str) -> Self {
+        let (packed, affine_meta, floats) = ckpt.tensor_bytes_by_kind(prefix);
+        let cpu_affine = packed + 2 * affine_meta;
+        Self {
+            // GPU (packed + méta bf16 + flottants en f32) + sources CPU en f32.
+            resident: packed + affine_meta + 2 * floats + 2 * floats,
+            transient: 2 * cpu_affine,
+        }
+    }
+
+    /// Refuse l'étape si son pic (résident + transitoire) dépasserait le plafond.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie [`InferError::MemoryGuard`] si le plafond serait dépassé.
+    pub(crate) fn check(&self, guard: Option<&MemoryGuard>) -> Result<()> {
+        match guard {
+            Some(guard) => guard
+                .check_allocation(self.resident + self.transient)
+                .map_err(InferError::MemoryGuard),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Étapes du chargement du tronc, dans l'ordre de [`FlashNextWeights::load`] :
+/// mixer final, lm_head, PLE, puis une étape par couche.
+pub(crate) fn load_plan(ckpt: &Qwen4ExpCheckpoint) -> Vec<LoadStage> {
+    let c = &ckpt.config;
+    let mut stages = vec![
+        LoadStage::from_checkpoint(ckpt, &Qwen4ExpCheckpoint::trunk("hyper_connection_mixer.")),
+        LoadStage::from_checkpoint(ckpt, &format!("{}.", Qwen4ExpCheckpoint::lm_head())),
+        LoadStage::from_checkpoint(
+            ckpt,
+            &format!("{}ple.", Qwen4ExpCheckpoint::layer_prefix(c.ple_layer)),
+        ),
+    ];
+    for index in 0..c.layer_kinds.len() {
+        stages.push(LoadStage::from_checkpoint(
+            ckpt,
+            &Qwen4ExpCheckpoint::layer_prefix(index),
+        ));
+    }
+    stages
 }
 
 impl FlashNextWeights {
@@ -91,34 +149,51 @@ impl FlashNextWeights {
     ) -> Result<Self> {
         let c = &ckpt.config;
         super::session::validate_resident_config(c)?;
+        let plan = load_plan(ckpt);
+        let mut stages = plan.iter();
+        let next = |stages: &mut std::slice::Iter<'_, LoadStage>| -> Result<()> {
+            stages
+                .next()
+                .ok_or_else(|| InferError::Config("plan de chargement incomplet".to_string()))?
+                .check(guard)
+        };
+        next(&mut stages)?;
+        let mixer = Self::hc(
+            executor,
+            ckpt,
+            &Qwen4ExpCheckpoint::trunk("hyper_connection_mixer."),
+            false,
+        )?;
+        next(&mut stages)?;
+        let lm_head = executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(ckpt.quantized(Qwen4ExpCheckpoint::lm_head(), None)?),
+            "flash_next_lm_head",
+        )?;
+        next(&mut stages)?;
+        let ple = Self::ple(executor, ckpt)?;
         let mut weights = Self {
             layers: Vec::with_capacity(c.layer_kinds.len()),
-            mixer: Self::hc(
-                executor,
-                ckpt,
-                &Qwen4ExpCheckpoint::trunk("hyper_connection_mixer."),
-                false,
-            )?,
-            lm_head: executor.resolve_linear_weight_buffers(
-                &LinearWeight::AffineQuantized(
-                    ckpt.quantized(Qwen4ExpCheckpoint::lm_head(), None)?,
-                ),
-                "flash_next_lm_head",
-            )?,
-            ple: Self::ple(executor, ckpt)?,
+            mixer,
+            lm_head,
+            ple,
             keepalive: Vec::new(),
             keepalive_tensors: Vec::new(),
             keepalive_vectors: Vec::new(),
         };
         for (index, kind) in c.layer_kinds.iter().enumerate() {
-            let prefix = Qwen4ExpCheckpoint::layer_prefix(index);
-            if let Some(guard) = guard {
-                guard
-                    .check_allocation(layer_bytes(ckpt, &prefix))
-                    .map_err(InferError::MemoryGuard)?;
-            }
-            let layer = weights.layer(executor, ckpt, &prefix, *kind)?;
+            next(&mut stages)?;
+            let layer = weights.layer(
+                executor,
+                ckpt,
+                &Qwen4ExpCheckpoint::layer_prefix(index),
+                *kind,
+            )?;
             weights.layers.push(layer);
+        }
+        if stages.next().is_some() {
+            return Err(InferError::Config(
+                "plan de chargement non épuisé".to_string(),
+            ));
         }
         Ok(weights)
     }

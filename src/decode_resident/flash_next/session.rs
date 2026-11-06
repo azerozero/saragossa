@@ -13,7 +13,7 @@ use super::attention::{dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaSc
 use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch};
 use super::kernels::FlashNextKernels;
 use super::ple::{encode_ple, PleScratch, PleState};
-use super::weights::{FlashNextWeights, MixerWeights};
+use super::weights::{FlashNextWeights, LoadStage, MixerWeights};
 use crate::decode_resident::{DecodeResidentState, FullAttentionMetalState};
 use crate::metal_backend::{
     commit_and_wait, read_f32_buffer, read_u32_buffer, write_f32_buffer, EncoderEndGuard,
@@ -97,6 +97,31 @@ fn zeros(executor: &MetalExecutor, len: usize) -> Buffer {
         (len.max(1) * std::mem::size_of::<f32>()) as u64,
         MTLResourceOptions::StorageModeShared,
     )
+}
+
+/// Octets des états et intermédiaires d'une session de `capacity` tokens :
+/// KV f32 des couches QSA, états conv/SSM du DeltaNet, anneau PLE, logits,
+/// capture des résiduels et scratch.
+pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
+    let f32_bytes = std::mem::size_of::<f32>();
+    let width = c.hc_width();
+    let full = c
+        .layer_kinds
+        .iter()
+        .filter(|k| **k == crate::qwen_loader::qwen4_exp::Qwen4ExpLayerKind::Full)
+        .count();
+    let linear = c.layer_kinds.len() - full;
+    let kv = full * capacity * 2 * c.kv_heads * c.head_dim;
+    let conv_dim =
+        2 * c.linear_key_heads * c.linear_key_dim + c.linear_value_heads * c.linear_value_dim;
+    let deltanet = linear
+        * ((c.conv_kernel - 1) * conv_dim
+            + c.linear_value_heads * c.linear_value_dim * c.linear_key_dim);
+    let ple_ring = (c.ple_conv_kernel - 1) * c.ngram_size * width;
+    let q_dim = c.heads * c.head_dim;
+    let scratch =
+        8 * width + 8 * q_dim + c.heads * capacity + c.vocab + c.layer_kinds.len() * width;
+    ((kv + deltanet + ple_ring + scratch) * f32_bytes) as u64
 }
 
 /// Refuse, avant toute allocation, les variantes que le chemin résident ne
@@ -184,6 +209,11 @@ impl FlashNextSession {
         let kernels = FlashNextKernels::new(executor.device())?;
         let weights = FlashNextWeights::load(&executor, &ckpt, guard)?;
         let c = &ckpt.config;
+        LoadStage {
+            resident: session_state_bytes(c, capacity),
+            transient: 0,
+        }
+        .check(guard)?;
         let hc_dims = HcDims {
             hidden: c.hidden,
             hc: c.hc_count,
