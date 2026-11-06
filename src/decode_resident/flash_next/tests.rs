@@ -2110,3 +2110,41 @@ fn bench_resident_decode_after_32k_context() {
         "porte de débit rouge : {slowest:.1} tok/s < 40"
     );
 }
+
+/// Capacité maximale (262 144 tokens) : la session s'ouvre sous la garde
+/// mémoire, ses allocations (états, KV f32, clés poolées, KV compact, scratch,
+/// plus le scratch du premier pas) restent sous `session_state_bytes`, et un
+/// pas s'exécute. Le pic mémoire se lit avec `/usr/bin/time -l`. Le remplissage
+/// à 256k exige le prefill résident (étape suivante).
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR"]
+fn resident_session_allocates_max_capacity() {
+    use super::session::{session_state_bytes, MAX_CAPACITY};
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let config = Qwen4ExpCheckpoint::open(&dir)
+        .expect("invariant: checkpoint")
+        .config;
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        MAX_CAPACITY,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session à 256k");
+    let before = session.device_allocated_bytes();
+    session
+        .step(0, false, false)
+        .expect("invariant: premier pas");
+    let lazy = session.device_allocated_bytes().saturating_sub(before);
+    let used = session.owned_state_bytes() + lazy;
+    let budget = session_state_bytes(&config, MAX_CAPACITY);
+    eprintln!(
+        "session {MAX_CAPACITY} tokens : {:.2} Go alloués hors poids (dont {:.1} Mo au premier pas), budget {:.2} Go",
+        used as f64 / 1e9,
+        lazy as f64 / 1e6,
+        budget as f64 / 1e9
+    );
+    assert!(used <= budget, "allocations {used} > budget {budget}");
+}
