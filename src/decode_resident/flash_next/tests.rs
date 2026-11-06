@@ -628,6 +628,8 @@ struct CpuChain {
 
 /// Seuils de marge de probabilité essayés, du plus strict au plus large.
 const TIE_THRESHOLDS: [f32; 3] = [1.0e-7, 1.0e-6, 1.0e-5];
+/// Plafond du seuil QSA calibré du contrôle de bout en bout.
+const QSA_TIE_CAP: f32 = 1.0e-4;
 /// Marge maximale admise pour la première bascule native.
 const NATIVE_FIRST_TIE: f32 = 1.0e-6;
 
@@ -1408,6 +1410,8 @@ fn n2_resident_decode_matches_cpu_reference() {
          seuil QSA {qsa_tie:.2e}"
     );
     assert!(qsa_tie.is_finite(), "calibration QSA non finie");
+    // Plafond : au-delà, la porte est rouge plutôt qu'élargie.
+    let tie_capped = qsa_tie <= QSA_TIE_CAP;
 
     let mut chosen = None;
     for th in TIE_THRESHOLDS {
@@ -1612,6 +1616,10 @@ fn n2_resident_decode_matches_cpu_reference() {
         );
     }
     assert!(anchored_green, "oracle ré-ancré rouge : {anchored:?}");
+    assert!(
+        tie_capped,
+        "seuil QSA calibré {qsa_tie:.2e} au-delà du plafond {QSA_TIE_CAP:.0e}"
+    );
     assert!(chosen.is_some(), "passe imposée rouge à tous les seuils");
     native_first.unwrap_or_else(|e| panic!("passe native : {e}"));
     assert!(native_finite, "passe native : valeur non finie");
