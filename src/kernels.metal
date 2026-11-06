@@ -10159,6 +10159,85 @@ kernel void topk_sigmoid_f32(
     }
 }
 
+// Top-k softmax pour 256 < experts ≤ 1024 et top-k ≤ 16 (Flash-Next : 512 /
+// top-10) : un thread par logit, `topk` tours d'argmax par réductions simd puis
+// threadgroup. Même sélection, même ordre (logit décroissant, indice
+// croissant) et même softmax restreint que `topk_softmax_f32` : sorties
+// identiques bit à bit (test `topk_softmax_wide_matches_parallel_bitwise`).
+static inline void topk_wide_pick(thread float& value, thread uint& index, float other_value, uint other_index) {
+    if (topk_better(other_value, other_index, value, index)) {
+        value = other_value;
+        index = other_index;
+    }
+}
+
+kernel void topk_softmax_wide_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* indices [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint2& dims [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]
+) {
+    const uint count = dims.x;
+    const uint topk = dims.y;
+    threadgroup float tg_values[32];
+    threadgroup uint tg_indices[32];
+    threadgroup float chosen_values[16];
+    threadgroup uint chosen_indices[16];
+    // Sentinelle de `topk_softmax_f32` : un logit qui ne la bat pas n'est jamais retenu.
+    float mine = -3.402823466e38f;
+    uint mine_index = 0xffffffffu;
+    if (tid < count) {
+        const float value = logits[tid];
+        if (topk_better(value, tid, mine, mine_index)) {
+            mine = value;
+            mine_index = tid;
+        }
+    }
+    for (uint slot = 0u; slot < topk; ++slot) {
+        float best = mine;
+        uint best_index = mine_index;
+        for (uint offset = 16u; offset > 0u; offset >>= 1u) {
+            topk_wide_pick(best, best_index, simd_shuffle_down(best, offset), simd_shuffle_down(best_index, offset));
+        }
+        if (lane == 0u) {
+            tg_values[simd] = best;
+            tg_indices[simd] = best_index;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0u) {
+            float v = tg_values[lane];
+            uint i = tg_indices[lane];
+            for (uint offset = 16u; offset > 0u; offset >>= 1u) {
+                topk_wide_pick(v, i, simd_shuffle_down(v, offset), simd_shuffle_down(i, offset));
+            }
+            if (lane == 0u) {
+                chosen_values[slot] = v;
+                chosen_indices[slot] = i;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (mine_index != 0xffffffffu && mine_index == chosen_indices[slot]) {
+            mine = -3.402823466e38f;
+            mine_index = 0xffffffffu;
+        }
+    }
+    if (tid == 0u) {
+        const float max_value = chosen_values[0];
+        float denom = 0.0f;
+        for (uint slot = 0u; slot < topk; ++slot) {
+            denom += exp(chosen_values[slot] - max_value);
+        }
+        denom = max(denom, 1.0e-20f);
+        for (uint slot = 0u; slot < topk; ++slot) {
+            indices[slot] = chosen_indices[slot];
+            scores[slot] = exp(chosen_values[slot] - max_value) / denom;
+        }
+    }
+}
+
 kernel void topk8_softmax_256_f32(
     device const float* logits [[buffer(0)]],
     device uint* indices [[buffer(1)]],

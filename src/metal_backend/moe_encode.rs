@@ -3,6 +3,8 @@
 use super::*;
 
 const TOPK_SOFTMAX_TG_WIDTH: u64 = 32;
+/// Experts maximaux du top-k large (un thread par logit).
+const TOPK_WIDE_MAX_COUNT: usize = 1024;
 
 /// Kernel de top-k imposé, compilé seulement pour les tests (absent de la
 /// bibliothèque Metal de production).
@@ -1127,6 +1129,31 @@ impl MetalExecutor {
         ];
         let parallel = topk_parallel_enabled();
         let fast_topk8 = topk8_fast_enabled() && count == 256 && topk == 8;
+        // Au-delà de 256 experts, un thread par logit : le kernel parallèle à 32
+        // threads balaie les logits en série (47 µs à 512 / top-10).
+        let wide = topk_wide_enabled()
+            && count > 256
+            && count <= TOPK_WIDE_MAX_COUNT
+            && topk <= 16
+            && self
+                .topk_softmax_wide_f32
+                .max_total_threads_per_threadgroup()
+                >= TOPK_WIDE_MAX_COUNT as u64;
+        if wide {
+            encoder.set_compute_pipeline_state(&self.topk_softmax_wide_f32);
+            encoder.set_buffer(0, Some(logits_buffer), 0);
+            encoder.set_buffer(1, Some(indices_buffer), 0);
+            encoder.set_buffer(2, Some(scores_buffer), 0);
+            set_u32_bytes(encoder, 3, &dims, "topk_dims")?;
+            trace_dispatch_path("topk_softmax_wide_f32", 1, topk, count);
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(1, 1, 1),
+                MTLSize::new(TOPK_WIDE_MAX_COUNT as u64, 1, 1),
+            );
+            post_dispatch_barrier(encoder);
+            return Ok(());
+        }
         let (pipeline, kernel_name) = if fast_topk8 {
             (&self.topk8_softmax_256_f32, "topk8_softmax_256_f32")
         } else if parallel {

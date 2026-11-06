@@ -386,6 +386,8 @@ pub struct MetalExecutor {
     steel_attention_f32_bq32_bk32_bd64: Option<ComputePipelineState>,
     add_rms_norm_row_f32: ComputePipelineState,
     topk_softmax_f32: ComputePipelineState,
+    /// Top-k softmax 256 < experts ≤ 1024, un thread par logit.
+    topk_softmax_wide_f32: ComputePipelineState,
     /// Top-k imposé des oracles, compilé seulement pour les tests.
     #[cfg(test)]
     topk_softmax_forced_f32: ComputePipelineState,

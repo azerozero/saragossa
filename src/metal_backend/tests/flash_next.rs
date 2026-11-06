@@ -382,3 +382,130 @@ fn bench_flash_next_moe_segments_at_real_dims() -> Result<()> {
     eprintln!("{report}");
     Ok(())
 }
+
+/// Morceaux du MoE Flash-Next, 200 appels par command buffer (temps mural par
+/// appel) : routeur f32 dense `[512, 2560]`, top-10 softmax, MoE complet.
+#[test]
+#[ignore = "diagnostic de débit, machine libre"]
+fn bench_flash_next_moe_pieces_in_one_command_buffer() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (hidden, inter, experts_n) = (2560_usize, 640_usize, 512_usize);
+    let bases = [
+        test_affine_random_u4(inter, hidden, 61)?,
+        test_affine_random_u4(inter, hidden, 62)?,
+        test_affine_random_u4(hidden, inter, 63)?,
+    ];
+    let experts: Vec<GatedMlp> = (0..experts_n)
+        .map(|e| {
+            Ok(GatedMlp::new(
+                flash_next_expert_u4(&bases[0], e)?,
+                flash_next_expert_u4(&bases[1], e)?,
+                flash_next_expert_u4(&bases[2], e)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let u8_linear = |rows, cols| -> Result<Linear> {
+        Linear::from_weight(LinearWeight::AffineQuantized(test_affine_varied_u8(rows, cols)?), None)
+    };
+    let shared = GatedMlp::new(u8_linear(inter, hidden)?, u8_linear(inter, hidden)?, u8_linear(hidden, inter)?);
+    let mut rng = crate::linear_attention::tests::DeterministicF32::new(0x0b0f);
+    let router_w = Tensor::from_vec(vec![experts_n, hidden], rng.fill(experts_n * hidden, -0.05, 0.05))?;
+    let router = Linear::from_weight(LinearWeight::Dense(router_w), None)?;
+    let shared_gate = Linear::from_weight(
+        LinearWeight::Dense(Tensor::from_vec(vec![1, hidden], rng.fill(hidden, -0.02, 0.02))?),
+        None,
+    )?;
+    let weights = executor.resolve_moe_shared_weights(&router, &experts, &shared, &shared_gate)?;
+    let router_buffers = executor.resolve_linear_weight_buffers(router.weight(), "bench_router")?;
+    let input = executor.buffer_from_slice(&rng.fill(hidden, -1.0, 1.0), "bench_moe_in")?;
+    let logits = executor.uncached_f32_buffer(experts_n, "bench_moe_logits")?;
+    let indices = executor.uncached_f32_buffer(16, "bench_moe_idx")?;
+    let scores = executor.uncached_f32_buffer(16, "bench_moe_scores")?;
+    let out = executor.uncached_f32_buffer(hidden, "bench_moe_out")?;
+    let reps = 200;
+    let time = |label: &str, encode: &dyn Fn(&metal::ComputeCommandEncoderRef, &mut Vec<metal::Buffer>) -> Result<()>| -> Result<()> {
+        for warm in [true, false] {
+            let command_buffer = executor.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            let mut owned = Vec::new();
+            for _ in 0..reps {
+                encode(encoder, &mut owned)?;
+            }
+            encoder.end_encoding();
+            let started = std::time::Instant::now();
+            commit_and_wait(command_buffer)?;
+            if !warm {
+                eprintln!("{label:28} {:8.2} µs/appel", started.elapsed().as_secs_f64() * 1e6 / reps as f64);
+            }
+        }
+        Ok(())
+    };
+    time("routeur f32 [512, 2560]", &|e, _| {
+        executor.encode_matmul_weight_buffers(e, &input, 1, hidden, &router_buffers, &logits, false).map(|_| ())
+    })?;
+    time("top-10 softmax (512)", &|e, owned| {
+        executor.encode_topk_softmax(e, owned, &logits, &indices, &scores, experts_n, 10)
+    })?;
+    time("MoE complet", &|e, owned| {
+        executor.encode_moe_shared_buffers(e, owned, &input, None, &out, hidden, &weights, 10)
+    })?;
+    Ok(())
+}
+
+/// Le top-k large rend les mêmes indices et scores, bit à bit, que le kernel
+/// parallèle de référence : logits aléatoires, égalités massives (ordre par
+/// indice), valeurs non finies, effectifs 257 à 1024 et top-k 1 à 16.
+#[test]
+fn topk_softmax_wide_matches_parallel_bitwise() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let run = |pipeline: &metal::ComputePipelineState, width: u64, logits: &[f32], topk: usize| -> Result<(Vec<u32>, Vec<f32>)> {
+        let input = executor.buffer_from_slice(logits, "topk_wide_in")?;
+        let indices = executor.uncached_f32_buffer(16, "topk_wide_idx")?;
+        let scores = executor.uncached_f32_buffer(16, "topk_wide_scores")?;
+        let command_buffer = executor.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(&input), 0);
+        encoder.set_buffer(1, Some(&indices), 0);
+        encoder.set_buffer(2, Some(&scores), 0);
+        set_u32_bytes(encoder, 3, &[logits.len() as u32, topk as u32], "topk_dims")?;
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(width, 1, 1));
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        Ok((read_u32_buffer(&indices, topk)?, read_f32_buffer(&scores, topk)?))
+    };
+    let mut rng = crate::linear_attention::tests::DeterministicF32::new(0x70b5);
+    let mut cases: Vec<(Vec<f32>, usize)> = Vec::new();
+    for (count, topk) in [(512, 10), (257, 1), (1024, 16), (700, 8), (512, 16)] {
+        cases.push((rng.fill(count, -4.0, 4.0), topk));
+    }
+    // Égalités massives au seuil : 40 logits identiques.
+    let mut ties = rng.fill(512, -4.0, 0.0);
+    for i in (3..512).step_by(12) {
+        ties[i] = 1.5;
+    }
+    cases.push((ties, 10));
+    // Valeurs non finies : NaN et −∞ jamais retenus, +∞ en tête.
+    let mut odd = rng.fill(512, -1.0, 1.0);
+    odd[7] = f32::NAN;
+    odd[100] = f32::NEG_INFINITY;
+    odd[300] = f32::INFINITY;
+    cases.push((odd, 10));
+    // Moins de candidats que de places : sentinelles identiques.
+    let mut sparse = vec![f32::NEG_INFINITY; 300];
+    sparse[5] = 0.5;
+    sparse[250] = 0.25;
+    cases.push((sparse, 4));
+    for (case, (logits, topk)) in cases.iter().enumerate() {
+        let reference = run(&executor.topk_softmax_f32, 32, logits, *topk)?;
+        let wide = run(&executor.topk_softmax_wide_f32, 1024, logits, *topk)?;
+        assert_eq!(wide.0, reference.0, "indices, cas {case}");
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&wide.1), bits(&reference.1), "scores, cas {case}");
+    }
+    Ok(())
+}
