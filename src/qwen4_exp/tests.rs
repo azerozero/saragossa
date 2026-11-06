@@ -215,6 +215,15 @@ fn justify_qsa(
     compress: usize,
 ) -> Result<usize, String> {
     let blocks = |sel: &[usize]| -> BTreeSet<usize> { sel.iter().map(|j| j / compress).collect() };
+    let lengths = [
+        rust.selected.len(),
+        rust.scores.len(),
+        torch_selection.len(),
+        torch_scores.len(),
+    ];
+    if lengths.iter().any(|&n| n != lengths[0]) {
+        return Err(format!("traces de longueurs différentes {lengths:?}"));
+    }
     let mut ties = 0;
     for (i, ((ours, theirs), (rs, ts))) in rust
         .selected
@@ -231,7 +240,8 @@ fn justify_qsa(
             ));
         }
         for (b, (r, t)) in rs.iter().zip(ts).enumerate() {
-            if (r - t).abs() > SCORE_TOL * (1.0 + t.abs()) {
+            let within = (r - t).abs() <= SCORE_TOL * (1.0 + t.abs());
+            if !within || !r.is_finite() || !t.is_finite() {
                 return Err(format!("requête {i} bloc {b}: score Rust {r} ≠ torch {t}"));
             }
         }
@@ -921,15 +931,120 @@ fn n2_full_model_logits_match_transformers() {
     }
 }
 
+/// Experts torch imposés aux tokens dont la marge de probabilité torch au
+/// seuil du top-k est ≤ `TIE_TOL`.
+fn forced_torch_routing(
+    sets: &[Vec<usize>],
+    probs: &[Vec<f32>],
+    k: usize,
+) -> Vec<Option<Vec<usize>>> {
+    probs
+        .iter()
+        .zip(sets)
+        .map(|(probs, set)| {
+            let margin = kth_largest(probs, k)
+                .zip(kth_largest(probs, k + 1))
+                .map_or(f32::INFINITY, |(a, b)| a - b);
+            (margin <= TIE_TOL).then(|| set.clone())
+        })
+        .collect()
+}
+
+/// N2 long ré-ancré : chaque couche QSA Rust repart du résiduel d'entrée torch
+/// (`qsa_input.{couche}`, 4096 tokens), sans dérive accumulée. Experts torch
+/// imposés aux quasi-égalités torch, sélection QSA torch imposée. Portes par
+/// couche : routage propre égal à torch ou justifié (`justify_routing`), scores
+/// de l'indexeur à `SCORE_TOL` de torch et sélection propre justifiée à
+/// `TIE_TOL` (`justify_qsa`), sortie à `LAYER_TOL` aux positions figées
+/// (`qsa_output.{couche}`).
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn n2_long_qsa_layers_anchored_on_transformers() {
+    let (dir, golden_dir) = n2_paths();
+    check_provenance(&dir, &golden_dir, "long.safetensors")
+        .unwrap_or_else(|e| panic!("provenance N2 long : {e}"));
+    let reference =
+        Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
+    let golden = Golden {
+        path: golden_dir.join("long.safetensors"),
+    };
+    let ids: Vec<usize> = golden
+        .i64("input_ids")
+        .iter()
+        .map(|&t| t as usize)
+        .collect();
+    let positions: Vec<usize> = golden
+        .i64("logit_positions")
+        .iter()
+        .map(|&p| p as usize)
+        .collect();
+    let config = &reference.checkpoint().config;
+    let k = config.top_k;
+    let (keep, compress) = (reference.budget_blocks(), reference.compress());
+    let full_layers: Vec<usize> = (0..config.layer_kinds.len())
+        .filter(|&l| golden.has(&format!("qsa_mask.{l}")))
+        .collect();
+    assert!(!full_layers.is_empty(), "golden long sans couche QSA");
+    for &layer in &full_layers {
+        let input = golden.f32(&format!("qsa_input.{layer}"));
+        let (torch_sets, torch_probs) = golden.routing(layer, k);
+        let forced_routing = forced_torch_routing(&torch_sets, &torch_probs, k);
+        let torch_selection = golden.mask_selection(&format!("qsa_mask.{layer}"));
+        let out = reference
+            .layer_forced(
+                layer,
+                &input,
+                &ids,
+                Some(&torch_selection),
+                Some(&forced_routing),
+            )
+            .expect("invariant: couche ré-ancrée");
+        let swaps = justify_routing(&out.routing, &torch_sets, &torch_probs, k)
+            .unwrap_or_else(|e| panic!("routage couche {layer} : {e}"));
+        let trace = out.qsa.as_ref().expect("invariant: trace QSA");
+        let ties = justify_qsa(
+            trace,
+            &torch_selection,
+            &golden.qsa_scores(layer),
+            keep,
+            compress,
+        )
+        .unwrap_or_else(|e| panic!("QSA couche {layer} : {e}"));
+        let width = out.hidden.as_matrix().expect("invariant: 2D").1;
+        let rows: Vec<f32> = positions
+            .iter()
+            .flat_map(|&p| {
+                out.hidden.data()[p * width..(p + 1) * width]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let picked =
+            Tensor::from_vec(vec![positions.len(), width], rows).expect("invariant: lignes");
+        eprintln!(
+            "couche {layer} ré-ancrée : {} échanges de routage justifiés, {ties} ex æquo QSA justifiés",
+            swaps.len()
+        );
+        assert_close(
+            &format!("couche {layer} ré-ancrée"),
+            &picked,
+            &golden.f32(&format!("qsa_output.{layer}")),
+            LAYER_TOL,
+        );
+    }
+}
+
 /// N2 long : référence CPU sur 4096 tokens (QSA creuse au-delà de 2051) contre
 /// le golden `long.safetensors` de transformers, chaîne complète des 48 couches.
 ///
-/// Pour suivre la trajectoire torch malgré les quasi-égalités, les experts
-/// torch sont imposés aux tokens dont la marge de probabilité torch au seuil du
-/// top-k est ≤ `TIE_TOL`, et la sélection QSA torch est imposée (ablation de
-/// l'étape 1). Ailleurs, routage et sélection propres doivent égaler torch ou
-/// être justifiés par l'oracle (`justify_routing`, `justify_qsa`, scores Rust à
-/// `SCORE_TOL`). Portes : KL ≤ 1e-3 et top-1 identique aux positions figées.
+/// Contrôle de dérive : la chaîne Rust n'est jamais ré-ancrée, l'écart s'y
+/// accumule sur 48 couches × 4096 tokens. Experts torch imposés aux
+/// quasi-égalités torch (`TIE_TOL`), sélection QSA torch imposée (ablation de
+/// l'étape 1). Le routage propre doit égaler torch ou être justifié
+/// (`justify_routing`). Les scores et sélections QSA sont relevés sans porte :
+/// la porte stricte est l'oracle ré-ancré
+/// ([`n2_long_qsa_layers_anchored_on_transformers`]). Portes : KL ≤ 1e-3 et
+/// top-1 identique aux positions figées.
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_long_cpu_chain_matches_transformers_on_4k_tokens() {
@@ -951,18 +1066,11 @@ fn n2_long_cpu_chain_matches_transformers_on_4k_tokens() {
     let started = std::time::Instant::now();
     let mut h = reference.embed(&ids).expect("invariant: embedding");
     let (mut forced_total, mut swaps_total, mut ties_total) = (0, 0, 0);
+    // Couches QSA sorties des tolérances par dérive (relevé, sans porte).
+    let mut drifted = Vec::new();
     for layer in 0..reference.checkpoint().config.layer_kinds.len() {
         let (torch_sets, torch_probs) = golden.routing(layer, k);
-        let forced_routing: Vec<Option<Vec<usize>>> = torch_probs
-            .iter()
-            .zip(&torch_sets)
-            .map(|(probs, set)| {
-                let margin = kth_largest(probs, k)
-                    .zip(kth_largest(probs, k + 1))
-                    .map_or(f32::INFINITY, |(a, b)| a - b);
-                (margin <= TIE_TOL).then(|| set.clone())
-            })
-            .collect();
+        let forced_routing = forced_torch_routing(&torch_sets, &torch_probs, k);
         forced_total += forced_routing.iter().filter(|f| f.is_some()).count();
         let torch_selection = golden
             .has(&format!("qsa_mask.{layer}"))
@@ -980,13 +1088,33 @@ fn n2_long_cpu_chain_matches_transformers_on_4k_tokens() {
             .unwrap_or_else(|e| panic!("routage couche {layer} : {e}"));
         swaps_total += swaps.len();
         if let (Some(trace), Some(torch)) = (out.qsa.as_ref(), torch_selection.as_ref()) {
-            let ties = justify_qsa(trace, torch, &golden.qsa_scores(layer), keep, compress)
-                .unwrap_or_else(|e| panic!("QSA couche {layer} : {e}"));
-            ties_total += ties;
+            let torch_scores = golden.qsa_scores(layer);
+            // Dérive des scores Rust/torch, relative à 1 + |torch| comme SCORE_TOL.
+            let drift = trace
+                .scores
+                .iter()
+                .zip(&torch_scores)
+                .flat_map(|(rs, ts)| {
+                    rs.iter()
+                        .zip(ts)
+                        .map(|(r, t)| (r - t).abs() / (1.0 + t.abs()))
+                })
+                .fold(0.0_f32, f32::max);
             let sparse = trace.scores.iter().filter(|row| row.len() > keep).count();
-            eprintln!(
-                "couche {layer} : {sparse} requêtes en régime creux, {ties} ex æquo justifiés"
-            );
+            // Toutes les couches sont relevées avant l'échec, pour situer la dérive.
+            match justify_qsa(trace, torch, &torch_scores, keep, compress) {
+                Ok(ties) => {
+                    ties_total += ties;
+                    eprintln!(
+                        "couche {layer} : {sparse} requêtes en régime creux, {ties} ex æquo \
+                         justifiés, dérive des scores {drift:.2e}"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("couche {layer} : dérive des scores {drift:.2e}, {e}");
+                    drifted.push(layer);
+                }
+            }
         }
         h = out.hidden;
     }
@@ -1025,5 +1153,6 @@ fn n2_long_cpu_chain_matches_transformers_on_4k_tokens() {
         mean <= KL_TOL && worst <= KL_TOL,
         "KL {mean:.2e} / {worst:.2e}"
     );
+    eprintln!("couches QSA hors tolérance par dérive : {drifted:?}");
     assert_eq!(top1, 0, "top-1 différent");
 }

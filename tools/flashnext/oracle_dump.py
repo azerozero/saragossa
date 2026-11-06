@@ -310,7 +310,9 @@ def run_long(qdir, tokenizer, text, out):
     """Modèle complet sur les 4096 premiers tokens du texte : routages et logits de
     routeur de chaque couche, masque et scores de l'indexeur des couches QSA
     (sélection creuse au-delà de 2051 tokens), logits finaux aux positions de
-    `long_positions`."""
+    `long_positions`. Aux couches QSA, résiduel d'entrée complet et sortie aux
+    positions de `long_positions` : l'oracle Rust ré-ancre chaque couche QSA sur
+    l'entrée torch, sans dérive accumulée."""
     source = source_entry(qdir)
     check_compatible(out, "long.safetensors", source)
     tc = C.text_config(qdir)
@@ -322,17 +324,24 @@ def run_long(qdir, tokenizer, text, out):
     pos, mask = C.rope(tc, n), C.causal_mask(n)
     h = C.embed(tc, weights, ids)
     tensors = {"input_ids": ("I64", (n,), np.array(ids_list, dtype=np.int64).tobytes())}
+    keep = torch.tensor(long_positions(n))
     started = time.time()
     for index in range(tc.num_hidden_layers):
         layer = C.build_layer(tc, index, weights)
         cap = {}
         layer.mlp.gate.register_forward_hook(
             lambda _m, _i, o: cap.update(logits=o[0].clone(), ids=o[2].clone()))
-        if layer.layer_type != "linear_attention":
+        qsa = layer.layer_type != "linear_attention"
+        if qsa:
             layer.self_attn.indexer.register_forward_hook(lambda _m, _i, o: cap.update(mask=o.clone()))
+            x = h[0].float()
+            tensors[f"qsa_input.{index}"] = ("F32", tuple(x.shape), x.numpy().tobytes())
         with C.TopkCapture() as topk:
             h = layer(h, position_embeddings=pos, attention_mask=mask, conv_mask=None,
                       past_key_values=None, ple_input_ids=ids)
+        if qsa:
+            y = h[0][keep].float()
+            tensors[f"qsa_output.{index}"] = ("F32", tuple(y.shape), y.numpy().tobytes())
         r = cap["ids"].to(torch.int64)
         tensors[f"routing.{index}"] = ("I64", tuple(r.shape), r.numpy().tobytes())
         lg = cap["logits"].float()
@@ -353,14 +362,14 @@ def run_long(qdir, tokenizer, text, out):
     mixer.load_state_dict({k: weights.dense(f"model.language_model.hyper_connection_mixer.{k}")
                            for k in mixer.state_dict()})
     head = weights.dense("lm_head.weight")
-    keep = torch.tensor(long_positions(n))
     logits = mixer(h)[0][keep] @ head.T
     tensors["logit_positions"] = ("I64", tuple(keep.shape), keep.numpy().astype(np.int64).tobytes())
     tensors["logits"] = ("F32", tuple(logits.shape), logits.float().numpy().tobytes())
     tmp = out / "long.safetensors.tmp"
     C.write_safetensors(tmp, tensors, {"tokens": n})
     publish(out, "long.safetensors", tmp, source,
-            {"tokens": n, "text": str(text), "text_sha256": sha256(text), "logit_positions": "16k + 64 dernières"})
+            {"tokens": n, "text": str(text), "text_sha256": sha256(text), "logit_positions": "16k + 64 dernières",
+             "qsa_anchors": "qsa_input complet, qsa_output aux logit_positions"})
 
 
 def main():
