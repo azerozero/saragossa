@@ -74,6 +74,22 @@ pub struct Qwen4ExpConfig {
     pub mtp_layers: usize,
 }
 
+/// Chemin de la table n-gram désignée par `ngram/meta.json` : relatif et sous
+/// `ngram/`. Un chemin absolu ou contenant `..` échapperait à la provenance.
+pub(crate) fn ngram_table_path(dir: &Path, file: &str) -> Result<PathBuf> {
+    let relative = Path::new(file);
+    let contained = relative.components().next().is_some()
+        && relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !contained {
+        return Err(cfg_err(format!(
+            "ngram/meta.json: file {file:?} hors de ngram/"
+        )));
+    }
+    Ok(dir.join("ngram").join(relative))
+}
+
 fn cfg_err(message: impl Into<String>) -> InferError {
     InferError::Config(format!("qwen4_exp: {}", message.into()))
 }
@@ -712,7 +728,7 @@ impl Qwen4ExpCheckpoint {
             .0
             .checked_mul(shape.1)
             .ok_or_else(|| cfg_err("ngram/meta.json: forme trop grande"))?;
-        let path = dir.join("ngram").join(file_name);
+        let path = ngram_table_path(dir, file_name)?;
         let file = File::open(&path).map_err(|e| io(&path, e))?;
         let len = file.metadata().map_err(|e| io(&path, e))?.len();
         if len != expected_len {
@@ -1111,10 +1127,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("{needle}: config hostile acceptée"));
             assert!(error.to_string().contains(needle), "{error}");
         }
-        let meta_cases: [Edit; 3] = [
+        let meta_cases: [Edit; 6] = [
             |m| m["shape"] = serde_json::json!([u64::MAX, u64::MAX]),
             |m| m["shape"] = serde_json::json!([4, u64::MAX]),
             |m| m["shape"][1] = 17.into(),
+            |m| m["file"] = "/etc/hosts".into(),
+            |m| m["file"] = "../config.json".into(),
+            |m| m["file"] = "".into(),
         ];
         for edit in meta_cases {
             let dst = converted_fixture();

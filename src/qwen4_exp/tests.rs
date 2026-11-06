@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use super::attention::{select_tokens, QsaDims, QsaWeights};
 use super::math::relative_error;
 use super::{QsaTrace, Qwen4ExpReference};
-use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+use crate::qwen_loader::qwen4_exp::{ngram_table_path, Qwen4ExpCheckpoint};
 use crate::qwen_loader::read_shard_header;
 use crate::Tensor;
 
@@ -598,7 +598,7 @@ fn sha256_file(path: &Path) -> String {
 
 /// Fichiers de poids réellement ouverts : shards indexés, MTP, `ngram/meta.json`
 /// et la table qu'il désigne (celle qu'ouvre le loader, pas un nom supposé).
-fn opened_weight_files(dir: &Path) -> Vec<String> {
+fn opened_weight_files(dir: &Path) -> Result<Vec<String>, String> {
     let index: serde_json::Value = serde_json::from_slice(
         &std::fs::read(dir.join("model.safetensors.index.json")).expect("invariant: index"),
     )
@@ -616,12 +616,14 @@ fn opened_weight_files(dir: &Path) -> Vec<String> {
         &std::fs::read(dir.join("ngram/meta.json")).expect("invariant: ngram/meta.json"),
     )
     .expect("invariant: json");
+    let file = meta["file"]
+        .as_str()
+        .ok_or_else(|| "ngram/meta.json sans file".to_string())?;
+    // Même règle que le loader : la table hachée est celle réellement ouverte.
+    ngram_table_path(dir, file).map_err(|e| e.to_string())?;
     names.insert("ngram/meta.json".to_string());
-    names.insert(format!(
-        "ngram/{}",
-        meta["file"].as_str().expect("invariant: meta.file")
-    ));
-    names.into_iter().collect()
+    names.insert(format!("ngram/{file}"));
+    Ok(names.into_iter().collect())
 }
 
 /// Provenance N2 vérifiée avant l'inférence, **sur les fichiers réels** :
@@ -645,7 +647,7 @@ fn check_provenance(dir: &Path, golden_dir: &Path, file: &str) -> Result<(), Str
     if entry["config_sha256"].as_str() != Some(config_sha.as_str()) {
         return Err(format!("config.json {config_sha} ≠ config du golden"));
     }
-    let names = opened_weight_files(dir);
+    let names = opened_weight_files(dir)?;
     let recorded = entry["weights"]
         .as_object()
         .ok_or_else(|| "provenance sans poids".to_string())?;
@@ -682,6 +684,7 @@ fn provenance_check_rejects_modified_weights_config_or_golden() {
     let golden = tempfile::tempdir().expect("invariant: dossier temporaire");
     std::fs::write(golden.path().join("layers.safetensors"), b"golden").expect("invariant: golden");
     let weights: serde_json::Map<String, serde_json::Value> = opened_weight_files(dst.path())
+        .expect("invariant: fichiers ouverts")
         .into_iter()
         .map(|name| {
             let sha = sha256_file(&dst.path().join(&name));
@@ -740,6 +743,13 @@ fn provenance_check_rejects_modified_weights_config_or_golden() {
         check_provenance(dst.path(), golden.path(), "layers.safetensors").is_err(),
         "meta.json redirigé accepté"
     );
+
+    // Chemin absolu vers la même table : refusé avant tout hachage.
+    meta["file"] = other.to_str().expect("invariant: chemin utf-8").into();
+    std::fs::write(&meta_path, meta.to_string()).expect("invariant: meta absolu");
+    let error = check_provenance(dst.path(), golden.path(), "layers.safetensors")
+        .expect_err("meta.json absolu accepté");
+    assert!(error.contains("hors de ngram/"), "{error}");
 }
 
 /// Erreur relative sur les `rows` premières lignes (préfixe causal), hors
