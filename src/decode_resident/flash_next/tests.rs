@@ -1476,6 +1476,52 @@ fn n2_resident_decode_matches_cpu_reference() {
     assert!(native_finite, "passe native : valeur non finie");
 }
 
+/// Empreinte au bit près du decode résident, pour prouver qu'un refactor ne
+/// change aucun bit : rejoue 2048 tokens du golden N2 sans tête, puis écrit, pour
+/// 8 pas (dont les derniers en régime QSA creux), l'argmax, les logits et les
+/// résiduels hc de chaque couche dans `SARAGOSSA_FLASH_NEXT_BITS_OUT`. Deux
+/// binaires (avant / après) doivent produire des fichiers identiques.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR, SARAGOSSA_QWEN4EXP_GOLDEN, SARAGOSSA_FLASH_NEXT_BITS_OUT"]
+fn flash_next_step_bits_dump() {
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    use std::io::Write;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let out = std::env::var_os("SARAGOSSA_FLASH_NEXT_BITS_OUT")
+        .expect("SARAGOSSA_FLASH_NEXT_BITS_OUT requis");
+    let (context, steps) = (2048, 8);
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        context + steps,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    for &token in &ids[..context] {
+        session.replay(token).expect("invariant: rejeu");
+    }
+    let mut file = std::fs::File::create(&out).expect("invariant: fichier de sortie");
+    for &token in &ids[context..context + steps] {
+        let step = session.step(token, true, true).expect("invariant: pas");
+        file.write_all(&step.argmax.to_le_bytes())
+            .expect("invariant: écriture");
+        let values = step
+            .logits
+            .into_iter()
+            .flatten()
+            .chain(step.layers.into_iter().flatten().flatten());
+        for v in values {
+            file.write_all(&v.to_le_bytes())
+                .expect("invariant: écriture");
+        }
+    }
+    eprintln!("empreinte écrite : {} pas après {context} tokens", steps);
+}
+
 /// Débit AR résident : `SARAGOSSA_FLASH_NEXT_BENCH_RUNS` répétitions (3 par
 /// défaut) d'un contexte de 1024 tokens (texte du golden, reset entre les
 /// répétitions) puis de 256 pas gloutons chronométrés. Publie, par
