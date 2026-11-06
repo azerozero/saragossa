@@ -4,3 +4,4 @@
 
 # Recette d'environnement du sandbox agent (chemins machine locaux).
 /orca.yaml
+__pycache__/

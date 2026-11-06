@@ -9,7 +9,7 @@
 
 use metal::{Buffer, MTLResourceOptions};
 
-use super::attention::QsaLayerWeights;
+use super::attention::{IndexerWeights, QsaLayerWeights};
 use super::hc::HcWeights;
 use super::ple::PleWeights;
 use crate::metal_backend::{
@@ -305,6 +305,22 @@ impl FlashNextWeights {
                         executor,
                         &one_plus(ckpt.floats(&format!("{a}k_norm.weight"))?),
                     ),
+                    // Mêmes fréquences que la référence CPU (`inv_freq` en f32).
+                    freqs: f32_buffer(
+                        executor,
+                        &crate::qwen4_exp::math::inv_freq(c.rotary_dim, c.rope_theta),
+                    ),
+                    indexer: Some(IndexerWeights {
+                        qk_proj: resolve("indexer.index_qk_proj")?,
+                        q_norm: f32_buffer(
+                            executor,
+                            &one_plus(ckpt.floats(&format!("{a}indexer.q_layernorm.weight"))?),
+                        ),
+                        k_norm: f32_buffer(
+                            executor,
+                            &one_plus(ckpt.floats(&format!("{a}indexer.k_layernorm.weight"))?),
+                        ),
+                    }),
                 }))
             }
         };

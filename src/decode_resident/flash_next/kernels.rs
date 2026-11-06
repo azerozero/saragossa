@@ -279,6 +279,265 @@ kernel void flash_next_ple_conv_add_f32(
         ring[(step % span) * width + c] = normed[c];
     }
 }
+
+// QSA creuse — pooling d'un bloc de l'indexeur : moyenne des 4 clés brutes
+// (`raw[k, d]`), `k_layernorm` à gain `1 + w`, RoPE (`freqs`, 2·|freqs|
+// premières dimensions, `rotate_half`) à la position `start` du bloc ; écrit
+// `pooled[block, :]`. Un threadgroup de `d` threads (d = 128).
+kernel void flash_next_index_pool_f32(
+    device const float* raw [[buffer(0)]],
+    device const float* norm [[buffer(1)]],
+    device const float* freqs [[buffer(2)]],
+    device float* pooled [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]
+) {
+    const uint d = dims.x;
+    const uint compress = dims.y;
+    const uint block = dims.z;
+    const uint half_rot = dims.w;
+    threadgroup float values[256];
+    threadgroup float partial[8];
+    float v = 0.0f;
+    for (uint t = 0u; t < compress; ++t) {
+        v += raw[t * d + tid];
+    }
+    v = v / float(compress);
+    const float ss = simd_sum(v * v);
+    if (lane == 0u) {
+        partial[simd] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint k = 0u; k < d / 32u; ++k) {
+        total += partial[k];
+    }
+    const float inv = 1.0f / sqrt(total / float(d) + eps);
+    values[tid] = (v * inv) * norm[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float out = values[tid];
+    const float position = float(block * compress);
+    if (tid < half_rot) {
+        const float angle = position * freqs[tid];
+        out = values[tid] * precise::cos(angle) - values[tid + half_rot] * precise::sin(angle);
+    } else if (tid < 2u * half_rot) {
+        const float angle = position * freqs[tid - half_rot];
+        out = values[tid] * precise::cos(angle) + values[tid - half_rot] * precise::sin(angle);
+    }
+    pooled[block * d + tid] = out;
+}
+
+// Norme RMS par tête (gains `1 + w`) puis RoPE partielle rotate-half à la
+// position du token, pour q/k de l'attention et les requêtes de l'indexeur.
+// L'angle suit la référence CPU (`rope_in_place`, comme transformers) :
+// `position·inv_freq` en f32, puis sin/cos précis. Le kernel générique de
+// l'arène calcule `position / pow(θ, e)` en fast-math, et son erreur croît
+// avec la position (1e-4 relatif à 32k). Un threadgroup de d threads par tête
+// (d ≤ 256, multiple de 32). dims = (d, rotary/2, position, 0).
+kernel void flash_next_rms_norm_rope_f32(
+    device const float* input [[buffer(0)]],
+    device const float* norm [[buffer(1)]],
+    device const float* freqs [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    const uint d = dims.x;
+    const uint half_rot = dims.y;
+    const float position = float(dims.z);
+    threadgroup float values[256];
+    threadgroup float partial[8];
+    const uint start = head * d;
+    const float v = input[start + tid];
+    const float ss = simd_sum(v * v);
+    if (lane == 0u) {
+        partial[simd] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint k = 0u; k < d / 32u; ++k) {
+        total += partial[k];
+    }
+    const float inv = 1.0f / sqrt(total / float(d) + eps);
+    values[tid] = (v * inv) * norm[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float result = values[tid];
+    if (tid < half_rot) {
+        const float angle = position * freqs[tid];
+        result = values[tid] * precise::cos(angle) - values[tid + half_rot] * precise::sin(angle);
+    } else if (tid < 2u * half_rot) {
+        const float angle = position * freqs[tid - half_rot];
+        result = values[tid] * precise::cos(angle) + values[tid - half_rot] * precise::sin(angle);
+    }
+    out[start + tid] = result;
+}
+
+// QSA creuse — scores des blocs complets : `s_b = Σ_h ReLU(q_h·k̄_b)/√d + 0`
+// (zéros signés normalisés). Un simdgroup par bloc, 8 blocs par threadgroup.
+// dims = (têtes, d, blocs complets, 0).
+kernel void flash_next_index_scores_f32(
+    device const float* q [[buffer(0)]],
+    device const float* pooled [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint tg [[threadgroup_position_in_grid]]
+) {
+    const uint heads = dims.x;
+    const uint d = dims.y;
+    const uint blocks = dims.z;
+    const uint b = tg * 8u + simd;
+    if (b >= blocks) {
+        return;
+    }
+    float s = 0.0f;
+    for (uint h = 0u; h < heads; ++h) {
+        float acc = 0.0f;
+        for (uint i = lane; i < d; i += 32u) {
+            acc += q[h * d + i] * pooled[b * d + i];
+        }
+        s += max(simd_sum(acc), 0.0f);
+    }
+    if (lane == 0u) {
+        scores[b] = s / sqrt(float(d)) + 0.0f;
+    }
+}
+
+// QSA creuse — top-`keep` blocs par radix exact sur les bits f32 (scores ≥ 0,
+// ordre des bits = ordre des valeurs) : 4 passes de 8 bits du poids fort au
+// poids faible donnent la valeur seuil T et le nombre `r` d'ex æquo à T à
+// retenir ; la compaction en ordre d'indice garde les scores > T et les `r`
+// premiers égaux à T (plus petits indices, comme `select_for_query`), triés.
+// Un threadgroup de 1024 threads.
+kernel void flash_next_index_topk_f32(
+    device const float* scores [[buffer(0)]],
+    device uint* selected [[buffer(1)]],
+    constant uint2& dims [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]
+) {
+    const uint count = dims.x;
+    const uint keep = dims.y;
+    threadgroup atomic_uint hist[256];
+    threadgroup uint shared_state[2];
+    threadgroup uint scan_a[32];
+    threadgroup uint scan_b[32];
+    uint prefix = 0u;
+    uint prefix_mask = 0u;
+    uint remaining = keep;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (tid < 256u) {
+            atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < count; i += 1024u) {
+            const uint bits = as_type<uint>(scores[i] + 0.0f);
+            if ((bits & prefix_mask) == prefix) {
+                atomic_fetch_add_explicit(&hist[(bits >> uint(shift)) & 255u], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            uint above = 0u;
+            for (int bin = 255; bin >= 0; --bin) {
+                const uint c = atomic_load_explicit(&hist[bin], memory_order_relaxed);
+                if (above + c >= remaining) {
+                    shared_state[0] = prefix | (uint(bin) << uint(shift));
+                    shared_state[1] = remaining - above;
+                    break;
+                }
+                above += c;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = shared_state[0];
+        remaining = shared_state[1];
+        prefix_mask |= 255u << uint(shift);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint threshold = prefix;
+    uint out_base = 0u;
+    uint eq_taken = 0u;
+    for (uint start = 0u; start < count; start += 1024u) {
+        const uint i = start + tid;
+        const uint bits = i < count ? as_type<uint>(scores[i] + 0.0f) : 0u;
+        const uint gt = (i < count && bits > threshold) ? 1u : 0u;
+        const uint eq = (i < count && bits == threshold) ? 1u : 0u;
+        // Rang des égaux dans le morceau (préfixe exclusif simd puis threadgroup).
+        const uint eq_simd = simd_prefix_exclusive_sum(eq);
+        const uint eq_total_simd = simd_sum(eq);
+        if (lane == 0u) {
+            scan_a[simd] = eq_total_simd;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint eq_before = 0u;
+        uint eq_chunk = 0u;
+        for (uint k = 0u; k < 32u; ++k) {
+            eq_before += k < simd ? scan_a[k] : 0u;
+            eq_chunk += scan_a[k];
+        }
+        const uint take_eq = (eq == 1u && eq_taken + eq_before + eq_simd < remaining) ? 1u : 0u;
+        const uint sel = gt | take_eq;
+        const uint sel_simd = simd_prefix_exclusive_sum(sel);
+        const uint sel_total_simd = simd_sum(sel);
+        if (lane == 0u) {
+            scan_b[simd] = sel_total_simd;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint sel_before = 0u;
+        uint sel_chunk = 0u;
+        for (uint k = 0u; k < 32u; ++k) {
+            sel_before += k < simd ? scan_b[k] : 0u;
+            sel_chunk += scan_b[k];
+        }
+        if (sel == 1u) {
+            selected[out_base + sel_before + sel_simd] = i;
+        }
+        out_base += sel_chunk;
+        eq_taken = min(remaining, eq_taken + eq_chunk);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// QSA creuse — copie des lignes K/V retenues (blocs × compress, puis la queue
+// `[compress·complets, visible)`) dans un KV compact, dans l'ordre du CPU.
+// dims = (kv_dim, keep, complets, visible) ; `compress` en buffer 6.
+kernel void flash_next_gather_kv_f32(
+    device const float* keys [[buffer(0)]],
+    device const float* values [[buffer(1)]],
+    device const uint* selected [[buffer(2)]],
+    device float* gathered_keys [[buffer(3)]],
+    device float* gathered_values [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    constant uint& compress [[buffer(6)]],
+    uint2 g [[thread_position_in_grid]]
+) {
+    const uint kv_dim = dims.x;
+    const uint keep = dims.y;
+    const uint complete = dims.z;
+    const uint visible = dims.w;
+    const uint picked = keep * compress;
+    const uint count = picked + (visible - complete * compress);
+    const uint row = g.y;
+    const uint col = g.x;
+    if (row >= count || col >= kv_dim) {
+        return;
+    }
+    const uint token = row < picked
+        ? selected[row / compress] * compress + row % compress
+        : complete * compress + (row - picked);
+    gathered_keys[row * kv_dim + col] = keys[token * kv_dim + col];
+    gathered_values[row * kv_dim + col] = values[token * kv_dim + col];
+}
 "#;
 
 /// Kernels des oracles seulement.
@@ -308,6 +567,11 @@ pub(crate) struct FlashNextKernels {
     pub(super) hc_combine: ComputePipelineState,
     pub(super) hc_inject_partial: ComputePipelineState,
     pub(super) qmv_u8_splitk: ComputePipelineState,
+    pub(super) index_pool: ComputePipelineState,
+    pub(super) norm_rope: ComputePipelineState,
+    pub(super) index_scores: ComputePipelineState,
+    pub(super) index_topk: ComputePipelineState,
+    pub(super) gather_kv: ComputePipelineState,
     pub(super) ple_gather: ComputePipelineState,
     pub(super) ple_gate: ComputePipelineState,
     pub(super) ple_conv_add: ComputePipelineState,
@@ -333,6 +597,11 @@ impl FlashNextKernels {
                 "flash_next_hc_combine_f32",
                 "flash_next_hc_inject_partial_f32",
                 "flash_next_qmv_u8_gs64_splitk_f32",
+                "flash_next_index_pool_f32",
+                "flash_next_rms_norm_rope_f32",
+                "flash_next_index_scores_f32",
+                "flash_next_index_topk_f32",
+                "flash_next_gather_kv_f32",
                 "flash_next_ple_gather_f32",
                 "flash_next_ple_gate_f32",
                 "flash_next_ple_conv_add_f32",
@@ -353,13 +622,18 @@ impl FlashNextKernels {
                 rms_norm_1p_groups.max_total_threads_per_threadgroup()
             )));
         }
-        Ok(Self {
+        let kernels = Self {
             rms_norm_1p_groups,
             hc_silu_scale: next()?,
             hc_mix: next()?,
             hc_combine: next()?,
             hc_inject_partial: next()?,
             qmv_u8_splitk: next()?,
+            index_pool: next()?,
+            norm_rope: next()?,
+            index_scores: next()?,
+            index_topk: next()?,
+            gather_kv: next()?,
             ple_gather: next()?,
             ple_gate: next()?,
             ple_conv_add: next()?,
@@ -367,6 +641,14 @@ impl FlashNextKernels {
             copy_u32: compile_kernels(device, TEST_SOURCE, &["flash_next_copy_u32"], false)?
                 .pop()
                 .ok_or_else(|| crate::InferError::Metal("pipeline copy_u32 absent".to_string()))?,
-        })
+        };
+        // Le top-k de l'indexeur suppose 1024 threads (32 simdgroups, pas de 1024).
+        if kernels.index_topk.max_total_threads_per_threadgroup() < 1024 {
+            return Err(crate::InferError::Metal(format!(
+                "top-k de l'indexeur Flash-Next : {} threads par threadgroup, 1024 requis",
+                kernels.index_topk.max_total_threads_per_threadgroup()
+            )));
+        }
+        Ok(kernels)
     }
 }

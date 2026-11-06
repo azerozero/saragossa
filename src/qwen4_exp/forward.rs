@@ -244,7 +244,12 @@ impl Qwen4ExpReference {
         ple(h, &embeddings, &w, c.hc_count, c.hidden, c.rms_eps)
     }
 
-    fn moe_block(&self, prefix: &str, x: &Tensor) -> Result<super::moe::MoeOutput> {
+    fn moe_block(
+        &self,
+        prefix: &str,
+        x: &Tensor,
+        forced: Option<&[Option<Vec<usize>>]>,
+    ) -> Result<super::moe::MoeOutput> {
         let c = &self.ckpt.config;
         let m = format!("{prefix}mlp.");
         let w = MoeWeights {
@@ -264,7 +269,7 @@ impl Qwen4ExpReference {
             top_k: c.top_k,
             norm_topk_prob: c.norm_topk_prob,
         };
-        let out = moe(x, &w, |e| {
+        let out = moe(x, &w, forced, |e| {
             Ok((
                 self.ckpt.expert(&format!("{m}switch_mlp.gate_proj"), e)?,
                 self.ckpt.expert(&format!("{m}switch_mlp.up_proj"), e)?,
@@ -295,6 +300,23 @@ impl Qwen4ExpReference {
         ids: &[usize],
         forced: Option<&[Vec<usize>]>,
     ) -> Result<LayerOutput> {
+        self.layer_forced(index, h, ids, forced, None)
+    }
+
+    /// Comme [`Self::layer_with_selection`], avec en plus des experts imposés
+    /// par token (`Some(ensemble)` aux quasi-égalités de l'oracle).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de lecture, de forme ou si la sélection n'est pas causale.
+    pub(crate) fn layer_forced(
+        &self,
+        index: usize,
+        h: &Tensor,
+        ids: &[usize],
+        forced: Option<&[Vec<usize>]>,
+        forced_routing: Option<&[Option<Vec<usize>>]>,
+    ) -> Result<LayerOutput> {
         let c = &self.ckpt.config;
         let kind = *c
             .layer_kinds
@@ -321,7 +343,7 @@ impl Qwen4ExpReference {
         let h = combine(&h, &branch, &inject, c.hc_count)?;
         let mlp_hc = self.residual(&format!("{prefix}mlp_hyper_connection."), true)?;
         let mixed = mlp_hc.mix(&h, c.hc_count, c.hidden, c.rms_eps)?;
-        let moe_out = self.moe_block(&prefix, &mixed.input)?;
+        let moe_out = self.moe_block(&prefix, &mixed.input, forced_routing)?;
         let inject = mixed
             .inject
             .ok_or_else(|| InferError::Config("hyper-connection sans injection".to_string()))?;

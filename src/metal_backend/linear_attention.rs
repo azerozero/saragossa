@@ -3506,7 +3506,6 @@ impl MetalExecutor {
     }
 
     /// Octets alloués par un état DeltaNet résident (conv + SSM).
-    #[cfg(test)]
     pub(crate) fn linear_attn_state_bytes(state: &LinearAttentionMetalState) -> u64 {
         state.conv.length() + state.ssm.length()
     }

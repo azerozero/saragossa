@@ -99,7 +99,32 @@ pub(crate) fn block_scores(
         freqs,
     );
     // Clés de bloc : identiques pour toute requête qui voit le bloc entier.
-    let blocks = tokens / d.compress;
+    let block_keys = pooled_block_keys(&k_raw, tokens / d.compress, &w.index_k_norm, d, freqs);
+    let heads = d.index_heads * ihd;
+    Ok((0..tokens)
+        .into_par_iter()
+        .map(|i| {
+            query_block_scores(
+                &q[i * heads..(i + 1) * heads],
+                &block_keys,
+                (i + 1) / d.compress,
+                d,
+            )
+        })
+        .collect())
+}
+
+/// Clés poolées des `blocks` premiers blocs complets : moyenne des clés brutes
+/// de l'indexeur (`[tokens, d_idx]`), `k_layernorm` (1+w), puis RoPE à la
+/// position du premier token du bloc. `[blocks, d_idx]`.
+pub(crate) fn pooled_block_keys(
+    k_raw: &[f32],
+    blocks: usize,
+    k_norm: &[f32],
+    d: QsaDims,
+    freqs: &[f32],
+) -> Vec<f32> {
+    let ihd = d.index_head_dim;
     let mut block_keys = vec![0.0_f32; blocks * ihd];
     for b in 0..blocks {
         let key = &mut block_keys[b * ihd..(b + 1) * ihd];
@@ -110,62 +135,73 @@ pub(crate) fn block_scores(
         }
         key.iter_mut().for_each(|k| *k /= d.compress as f32);
     }
-    let mut block_keys = rms_norm_1p(&block_keys, ihd, ihd, &w.index_k_norm, d.eps);
+    let mut block_keys = rms_norm_1p(&block_keys, ihd, ihd, k_norm, d.eps);
     for (b, key) in block_keys.chunks_exact_mut(ihd).enumerate() {
         rope_in_place(key, freqs, b * d.compress);
     }
+    block_keys
+}
+
+/// Scores `Σ_têtes ReLU(q·k̄_b)/√d_idx` d'une requête (`[têtes, d_idx]`, normée
+/// et tournée) sur ses `complete` premiers blocs.
+pub(crate) fn query_block_scores(
+    q: &[f32],
+    block_keys: &[f32],
+    complete: usize,
+    d: QsaDims,
+) -> Vec<f32> {
+    let ihd = d.index_head_dim;
     let scale = (ihd as f32).sqrt();
-    Ok((0..tokens)
-        .into_par_iter()
-        .map(|i| {
-            let qi = &q[i * d.index_heads * ihd..(i + 1) * d.index_heads * ihd];
-            (0..(i + 1) / d.compress)
-                .map(|b| {
-                    let key = &block_keys[b * ihd..(b + 1) * ihd];
-                    let s: f32 = qi
-                        .chunks_exact(ihd)
-                        .map(|qh| qh.iter().zip(key).map(|(a, k)| a * k).sum::<f32>().max(0.0))
-                        .sum();
-                    s / scale
-                })
-                .collect()
+    (0..complete)
+        .map(|b| {
+            let key = &block_keys[b * ihd..(b + 1) * ihd];
+            let s: f32 = q
+                .chunks_exact(ihd)
+                .map(|qh| qh.iter().zip(key).map(|(a, k)| a * k).sum::<f32>().max(0.0))
+                .sum();
+            // `+ 0.0` normalise −0.0 : le départage des ex æquo (et le radix GPU)
+            // ne distingue pas les zéros signés, comme `torch.topk`.
+            s / scale + 0.0
         })
-        .collect())
+        .collect()
+}
+
+/// Tokens retenus (triés) par une requête de visibilité `visible` à partir de
+/// ses scores de blocs complets (`⌊visible/compress⌋` valeurs).
+pub(crate) fn select_for_query(row: &[f32], visible: usize, d: QsaDims) -> Vec<usize> {
+    let keep = d.budget / d.compress;
+    let complete = row.len();
+    let mut chosen: Vec<usize> = if complete <= keep {
+        (0..complete).collect()
+    } else {
+        let mut scored: Vec<(f32, usize)> = row
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(b, s)| (s, b))
+            .collect();
+        // Ex æquo départagés par l'indice de bloc : torch.topk ne fixe pas
+        // cet ordre, les comparaisons d'oracle les traitent à part.
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.truncate(keep);
+        scored.into_iter().map(|(_, b)| b).collect()
+    };
+    chosen.sort_unstable();
+    let mut selected: Vec<usize> = chosen
+        .iter()
+        .flat_map(|b| b * d.compress..(b + 1) * d.compress)
+        .collect();
+    selected.extend(complete * d.compress..visible);
+    selected
 }
 
 /// Tokens retenus (triés) à partir des scores de blocs : top-`budget/compress`
 /// blocs complets plus la queue incomplète.
 pub(crate) fn select_from_scores(scores: &[Vec<f32>], d: QsaDims) -> Vec<Vec<usize>> {
-    let keep = d.budget / d.compress;
     scores
         .iter()
         .enumerate()
-        .map(|(i, row)| {
-            let visible = i + 1;
-            let complete = row.len();
-            let mut chosen: Vec<usize> = if complete <= keep {
-                (0..complete).collect()
-            } else {
-                let mut scored: Vec<(f32, usize)> = row
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(b, s)| (s, b))
-                    .collect();
-                // Ex æquo départagés par l'indice de bloc : torch.topk ne fixe pas
-                // cet ordre, les comparaisons d'oracle les traitent à part.
-                scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-                scored.truncate(keep);
-                scored.into_iter().map(|(_, b)| b).collect()
-            };
-            chosen.sort_unstable();
-            let mut selected: Vec<usize> = chosen
-                .iter()
-                .flat_map(|b| b * d.compress..(b + 1) * d.compress)
-                .collect();
-            selected.extend(complete * d.compress..visible);
-            selected
-        })
+        .map(|(i, row)| select_for_query(row, i + 1, d))
         .collect()
 }
 

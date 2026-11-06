@@ -3,9 +3,10 @@
 Chemin Metal « un token = un command buffer » de `qwen4_exp`
 (`src/decode_resident/flash_next/`), en régime QSA dense. Tant que la
 visibilité reste sous `budget + compress − 1` (2051 tokens, valeur calculée
-depuis la config), l'indexeur retient tous les blocs. La session refuse
-d'aller au-delà. Les primitives existantes sont réutilisées sans
-l'orchestrateur des couches Qwen.
+depuis la config), l'indexeur retient tous les blocs. Le régime creux, au-delà,
+est décrit dans [flashnext-qsa-sparse.md](flashnext-qsa-sparse.md) (étape 5).
+Les primitives existantes sont réutilisées sans l'orchestrateur des couches
+Qwen.
 
 ## Contrat de la session
 

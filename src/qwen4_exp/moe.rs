@@ -44,6 +44,7 @@ fn gated_mlp(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Result<Te
 pub(crate) fn moe(
     x: &Tensor,
     w: &MoeWeights,
+    forced: Option<&[Option<Vec<usize>>]>,
     mut expert: impl FnMut(usize) -> Result<(Tensor, Tensor, Tensor)>,
 ) -> Result<MoeOutput> {
     let (tokens, hidden) = x.as_matrix()?;
@@ -52,6 +53,8 @@ pub(crate) fn moe(
     let mut chosen: Vec<Vec<(usize, f32)>> = Vec::with_capacity(tokens);
     let mut margins = Vec::with_capacity(tokens);
     let mut boundary = Vec::with_capacity(tokens);
+    // Sélection propre du routeur, conservée même quand une sélection est imposée.
+    let mut natural: Vec<Vec<usize>> = Vec::with_capacity(tokens);
     for row in logits.data().chunks_exact(experts) {
         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let exp: Vec<f32> = row.iter().map(|v| (v - max).exp()).collect();
@@ -67,6 +70,25 @@ pub(crate) fn moe(
             _ => f32::INFINITY,
         });
         probs.truncate(w.top_k);
+        let mut own: Vec<usize> = probs.iter().map(|p| p.0).collect();
+        own.sort_unstable();
+        natural.push(own);
+        // Oracles : experts imposés (quasi-égalité de l'oracle), poids des
+        // probabilités propres renormalisées sur l'ensemble imposé.
+        if let Some(set) = forced
+            .and_then(|f| f.get(chosen.len()))
+            .and_then(Option::as_ref)
+        {
+            let all: Vec<f32> = exp.iter().map(|e| e / sum).collect();
+            probs = set
+                .iter()
+                .map(|&e| {
+                    all.get(e).map(|&p| (e, p)).ok_or_else(|| {
+                        crate::InferError::Shape(format!("expert imposé {e} hors des {experts}"))
+                    })
+                })
+                .collect::<Result<_>>()?;
+        }
         if w.norm_topk_prob {
             let total: f32 = probs.iter().map(|p| p.1).sum();
             probs.iter_mut().for_each(|p| p.1 /= total);
@@ -114,14 +136,9 @@ pub(crate) fn moe(
             *o += g * s;
         }
     }
-    let routing = chosen
-        .into_iter()
-        .map(|picks| {
-            let mut ids: Vec<usize> = picks.into_iter().map(|p| p.0).collect();
-            ids.sort_unstable();
-            ids
-        })
-        .collect();
+    // Routage propre (avant imposition) : les oracles comparent le choix du
+    // routeur, pas l'ensemble imposé.
+    let routing = natural;
     Ok(MoeOutput {
         output: Tensor::from_vec(vec![tokens, hidden], out)?,
         routing,

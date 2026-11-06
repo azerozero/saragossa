@@ -9,7 +9,10 @@
 
 use metal::{Buffer, CommandQueue, MTLResourceOptions};
 
-use super::attention::{dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaScratch};
+use super::attention::{
+    dense_max_visible, encode_qsa, IndexerDims, IndexerScratch, IndexerState, QsaDecodeDims,
+    QsaScratch, QsaSparse,
+};
 use super::encoders::{Brick, Encoders};
 use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch};
 use super::kernels::FlashNextKernels;
@@ -27,7 +30,40 @@ use crate::{InferError, MemoryGuard, Result};
 /// État récurrent ou cache KV d'une couche.
 enum LayerState {
     Linear(LinearAttentionMetalState),
-    Full(Box<FullAttentionMetalState>),
+    /// KV de la couche QSA et état de son indexeur.
+    Full(Box<(FullAttentionMetalState, IndexerState)>),
+}
+
+/// Capacité maximale d'une session : 256k tokens (contexte cible, plan §8.1).
+pub(crate) const MAX_CAPACITY: usize = 262_144;
+
+/// Blocs QSA retenus et scores de l'indexeur d'une couche (oracles).
+#[cfg(test)]
+pub(crate) type QsaCapture = (Vec<u32>, Vec<f32>);
+
+/// Point de reprise d'une session ([`FlashNextSession::checkpoint`]).
+pub(crate) struct SessionCheckpoint {
+    id: u64,
+    position: usize,
+    epoch: u64,
+    linear: Vec<Option<LinearAttentionMetalState>>,
+    kv_lens: Vec<Option<usize>>,
+    /// Clés brutes du bloc en cours de chaque couche QSA (position non alignée).
+    indexer_raw: Vec<Option<Buffer>>,
+    ple_ring: Buffer,
+    ple_context: NgramContext,
+    ple_step: usize,
+}
+
+/// Tenseurs de l'indexeur relus après un pas (oracles).
+#[cfg(test)]
+pub(crate) struct IndexerProbe {
+    /// Projection brute `[(têtes + 1)·d]` (requêtes puis clé).
+    pub(crate) qk: Vec<f32>,
+    /// Requêtes normées et tournées `[têtes·d]`.
+    pub(crate) q: Vec<f32>,
+    pub(crate) pooled: Vec<f32>,
+    pub(crate) raw: Vec<f32>,
 }
 
 /// Sorties d'un pas.
@@ -48,6 +84,10 @@ pub(crate) struct StepOutput {
     /// (oracles seulement).
     #[cfg(test)]
     pub(crate) routing: Option<Vec<Vec<u32>>>,
+    /// Blocs QSA retenus et scores de l'indexeur par couche (QSA en régime
+    /// creux seulement), si les résiduels sont demandés (oracles).
+    #[cfg(test)]
+    pub(crate) qsa: Option<Vec<Option<QsaCapture>>>,
     /// Préparation CPU avant le commit (embedding, hachage, lectures PLE).
     pub(crate) host: std::time::Duration,
     /// Encodage CPU du command buffer (GPU inactif pendant ce temps).
@@ -80,12 +120,23 @@ pub(crate) struct FlashNextSession {
     hc_scratch: HcScratch,
     ple_scratch: PleScratch,
     qsa_scratch: QsaScratch,
+    /// KV compact du gather (régime creux), partagé entre couches QSA.
+    gathered: FullAttentionMetalState,
+    indexer_scratch: IndexerScratch,
+    indexer_dims: IndexerDims,
     hc_dims: HcDims,
     qsa_dims: QsaDecodeDims,
     linear_spec: LinearAttentionStepSpec,
     linear_dims: LinearAttnResidentDims,
     position: usize,
     capacity: usize,
+    /// Branche courante de l'historique : incrémentée à chaque `reset` et à
+    /// chaque reprise, elle invalide les points pris sur une autre branche.
+    epoch: u64,
+    /// Point de reprise d'où part la branche courante (réutilisable).
+    base_checkpoint: Option<u64>,
+    /// Compteur d'identifiants des points de reprise.
+    next_checkpoint: std::cell::Cell<u64>,
     /// États DeltaNet initiaux (nuls), pour [`Self::reset`].
     initial_linear: Vec<Option<LinearAttentionMetalState>>,
     /// Profil GPU par brique (`SARAGOSSA_FLASH_NEXT_PROFILE=1`).
@@ -108,6 +159,15 @@ pub(crate) struct FlashNextSession {
     /// Oracles : experts imposés au prochain pas, par couche (consommés).
     #[cfg(test)]
     pub(crate) forced_routing: Vec<Option<Vec<u32>>>,
+    /// Oracles : blocs QSA imposés au prochain pas, par couche (consommés).
+    #[cfg(test)]
+    pub(crate) forced_selection: Vec<Option<Vec<u32>>>,
+    /// Oracles : sélection et scores de l'indexeur par couche du dernier pas
+    /// (`[couches, keep]` u32, `[couches, blocs max]` f32).
+    #[cfg(test)]
+    selection_capture: Buffer,
+    #[cfg(test)]
+    score_capture: Buffer,
 }
 
 fn zeros(executor: &MetalExecutor, len: usize) -> Buffer {
@@ -135,6 +195,7 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
         .count();
     let linear = c.layer_kinds.len() - full;
     let kv = full * capacity * 2 * c.kv_heads * c.head_dim;
+    let dense = dense_max_visible(c.indexer_budget, c.indexer_compress);
     let conv_dim =
         2 * c.linear_key_heads * c.linear_key_dim + c.linear_value_heads * c.linear_value_dim;
     let value_dim = c.linear_value_heads * c.linear_value_dim;
@@ -151,12 +212,20 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
         + c.layer_kinds.len() * width // capture des résiduels
         + 2 * width + c.hc_lowrank * (1 + super::hc::DOWN_CHUNKS) + c.hc_count * super::hc::INJECT_CHUNKS // scratch hc
         + c.ple_dim + 5 * width + c.hidden // scratch PLE
-        + 6 * q_dim + 3 * kv_dim + c.heads * capacity; // scratch QSA
+        + 6 * q_dim + 3 * kv_dim + c.heads * dense; // scratch QSA
+                                                    // Indexeur : clés poolées et bloc en cours par couche QSA, KV compact du
+                                                    // gather (`dense` lignes), scratch (qk, q, scores, sélection).
+    let blocks = capacity / c.indexer_compress + 1;
+    let indexer = full * (blocks + c.indexer_compress) * c.indexer_head_dim
+        + 2 * dense * kv_dim
+        + (2 * c.indexer_heads + 1) * c.indexer_head_dim
+        + blocks
+        + c.indexer_budget / c.indexer_compress;
     let executor = 4 * conv_dim + 6 * value_dim + 4 * c.linear_value_heads // DeltaNet
         + 2 * c.experts + 2 * c.top_k * (3 * c.moe_inter + c.hidden) // MoE routé
         + 3 * c.shared_inter + 2 * c.hidden // expert partagé
         + c.vocab; // argmax du lm_head
-    ((kv + deltanet + ple + session + executor) * f32_bytes) as u64
+    ((kv + deltanet + ple + session + executor + indexer) * f32_bytes) as u64
 }
 
 /// Refuse, avant toute allocation, les variantes que le chemin résident ne
@@ -192,10 +261,29 @@ pub(crate) fn validate_resident_config(c: &Qwen4ExpConfig) -> Result<usize> {
             c.linear_value_heads, c.linear_key_heads
         ));
     }
-    if c.kv_heads == 0 || c.heads % c.kv_heads != 0 || c.rotary_dim > c.head_dim {
+    // Norme + RoPE par tête : un threadgroup de d threads (≤ 256, multiple de 32).
+    if c.kv_heads == 0
+        || c.heads % c.kv_heads != 0
+        || c.rotary_dim > c.head_dim
+        || c.head_dim > 256
+        || c.head_dim % 32 != 0
+    {
         return refuse(format!(
             "attention {} têtes / {} KV, RoPE {} sur {}",
             c.heads, c.kv_heads, c.rotary_dim, c.head_dim
+        ));
+    }
+    // Pooling (un threadgroup de d threads, `values[256]`, `partial[8]`) et
+    // RoPE de l'indexeur (dimensions tournées ≤ d).
+    if c.indexer_head_dim == 0
+        || c.indexer_head_dim > 256
+        || c.indexer_head_dim % 32 != 0
+        || c.rotary_dim > c.indexer_head_dim
+        || c.indexer_heads == 0
+    {
+        return refuse(format!(
+            "indexeur {} têtes de {} (RoPE {})",
+            c.indexer_heads, c.indexer_head_dim, c.rotary_dim
         ));
     }
     if c.indexer_compress == 0 || c.indexer_budget % c.indexer_compress != 0 {
@@ -234,9 +322,9 @@ impl FlashNextSession {
         guard: Option<&MemoryGuard>,
     ) -> Result<Self> {
         let dense_max = validate_resident_config(&ckpt.config)?;
-        if capacity == 0 || capacity > dense_max {
+        if capacity == 0 || capacity > MAX_CAPACITY {
             return Err(InferError::Config(format!(
-                "Flash-Next résident : capacité {capacity} hors ]0, {dense_max}]"
+                "Flash-Next résident : capacité {capacity} hors ]0, {MAX_CAPACITY}]"
             )));
         }
         let executor = MetalExecutor::new()?;
@@ -261,7 +349,6 @@ impl FlashNextSession {
             kv_heads: c.kv_heads,
             head_dim: c.head_dim,
             rotary_dim: c.rotary_dim,
-            theta: c.rope_theta as f32,
             eps: c.rms_eps,
             dense_max,
         };
@@ -284,6 +371,15 @@ impl FlashNextSession {
         };
         let width = hc_dims.width();
         let (q_dim, kv_dim) = (c.heads * c.head_dim, c.kv_heads * c.head_dim);
+        // KV compact du régime creux : `keep·compress` lignes retenues + la queue.
+        let gathered = arena.full_attention_with_format(
+            dense_max,
+            c.heads,
+            c.kv_heads,
+            c.head_dim,
+            crate::decode_resident::KvFormat::F32,
+            None,
+        )?;
         let mut session = Self {
             arena,
             kernels,
@@ -330,9 +426,25 @@ impl FlashNextSession {
                 k_raw: zeros(&executor, kv_dim),
                 k_roped: zeros(&executor, kv_dim),
                 v: zeros(&executor, kv_dim),
-                scores: zeros(&executor, c.heads * capacity),
+                scores: zeros(&executor, c.heads * dense_max),
                 ctx: zeros(&executor, q_dim),
                 gated: zeros(&executor, q_dim),
+            },
+            gathered,
+            indexer_scratch: IndexerScratch {
+                qk: zeros(&executor, (c.indexer_heads + 1) * c.indexer_head_dim),
+                q: zeros(&executor, c.indexer_heads * c.indexer_head_dim),
+                scores: zeros(&executor, capacity / c.indexer_compress + 1),
+                selected: executor.device().new_buffer(
+                    ((c.indexer_budget / c.indexer_compress) * std::mem::size_of::<u32>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+            },
+            indexer_dims: IndexerDims {
+                heads: c.indexer_heads,
+                head_dim: c.indexer_head_dim,
+                compress: c.indexer_compress,
+                keep: c.indexer_budget / c.indexer_compress,
             },
             hc_dims,
             qsa_dims,
@@ -340,6 +452,9 @@ impl FlashNextSession {
             linear_dims,
             position: 0,
             capacity,
+            epoch: 0,
+            base_checkpoint: None,
+            next_checkpoint: std::cell::Cell::new(0),
             initial_linear: Vec::new(),
             #[cfg(feature = "devtools")]
             profiler: if super::profile::profile_requested() {
@@ -361,6 +476,18 @@ impl FlashNextSession {
             fail_encode_after_layer: None,
             #[cfg(test)]
             forced_routing: Vec::new(),
+            #[cfg(test)]
+            forced_selection: Vec::new(),
+            #[cfg(test)]
+            selection_capture: executor.device().new_buffer(
+                (c.layer_kinds.len() * (c.indexer_budget / c.indexer_compress) * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
+            #[cfg(test)]
+            score_capture: zeros(
+                &executor,
+                c.layer_kinds.len() * (capacity / c.indexer_compress + 1),
+            ),
             executor,
             ckpt,
         };
@@ -413,7 +540,14 @@ impl FlashNextSession {
                         crate::decode_resident::KvFormat::F32,
                         None,
                     )?;
-                    Ok(LayerState::Full(Box::new(kv)))
+                    let indexer = IndexerState {
+                        pooled: zeros(
+                            &self.executor,
+                            (capacity / c.indexer_compress + 1) * c.indexer_head_dim,
+                        ),
+                        raw: zeros(&self.executor, c.indexer_compress * c.indexer_head_dim),
+                    };
+                    Ok(LayerState::Full(Box::new((kv, indexer))))
                 }
             })
             .collect()
@@ -456,6 +590,10 @@ impl FlashNextSession {
             &self.qsa_scratch.gated,
             &self.ple_state.bytes,
             &self.ple_state.ring,
+            &self.indexer_scratch.qk,
+            &self.indexer_scratch.q,
+            &self.indexer_scratch.scores,
+            &self.indexer_scratch.selected,
         ]
         .iter()
         .map(|b| b.length())
@@ -465,9 +603,11 @@ impl FlashNextSession {
             .iter()
             .map(|state| match state {
                 LayerState::Linear(state) => MetalExecutor::linear_attn_state_bytes(state),
-                LayerState::Full(kv) => {
-                    (kv.capacity() * 2 * c.kv_heads * c.head_dim * std::mem::size_of::<f32>())
+                LayerState::Full(full) => {
+                    (full.0.capacity() * 2 * c.kv_heads * c.head_dim * std::mem::size_of::<f32>())
                         as u64
+                        + full.1.pooled.length()
+                        + full.1.raw.length()
                 }
             })
             .sum();
@@ -477,7 +617,10 @@ impl FlashNextSession {
             .flatten()
             .map(MetalExecutor::linear_attn_state_bytes)
             .sum();
-        own + states + snapshots
+        let gathered =
+            (self.gathered.capacity() * 2 * c.kv_heads * c.head_dim * std::mem::size_of::<f32>())
+                as u64;
+        own + states + snapshots + gathered
     }
 
     /// Octets alloués sur le device Metal de la session (oracles).
@@ -490,6 +633,48 @@ impl FlashNextSession {
     #[cfg(feature = "devtools")]
     pub(crate) fn profiler_mut(&mut self) -> Option<&mut super::profile::StepProfiler> {
         self.profiler.as_mut()
+    }
+
+    /// Relit la sélection et les scores QSA du dernier pas (oracles). La
+    /// position a déjà avancé : le pas relu est `position − 1`.
+    #[cfg(test)]
+    fn read_qsa_capture(&self) -> Result<Vec<Option<QsaCapture>>> {
+        let c = &self.ckpt.config;
+        let keep = self.indexer_dims.keep;
+        let complete = self.position / self.indexer_dims.compress;
+        let stride = self.capacity / self.indexer_dims.compress + 1;
+        let selections = read_u32_buffer(&self.selection_capture, c.layer_kinds.len() * keep)?;
+        let scores = read_f32_buffer(&self.score_capture, c.layer_kinds.len() * stride)?;
+        Ok(c.layer_kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                (*kind == crate::qwen_loader::qwen4_exp::Qwen4ExpLayerKind::Full && complete > keep)
+                    .then(|| {
+                        (
+                            selections[index * keep..(index + 1) * keep].to_vec(),
+                            scores[index * stride..index * stride + complete].to_vec(),
+                        )
+                    })
+            })
+            .collect())
+    }
+
+    /// Sonde de l'indexeur de la couche `layer` après un pas (oracles) :
+    /// requêtes de l'indexeur (valables pour la dernière couche QSA du pas),
+    /// clés poolées des `blocks` premiers blocs et clés brutes du bloc en cours.
+    #[cfg(test)]
+    pub(crate) fn indexer_probe(&self, layer: usize, blocks: usize) -> Result<IndexerProbe> {
+        let d = self.indexer_dims.head_dim;
+        let LayerState::Full(full) = &self.states[layer] else {
+            return Err(InferError::Config(format!("couche {layer} sans indexeur")));
+        };
+        Ok(IndexerProbe {
+            qk: read_f32_buffer(&self.indexer_scratch.qk, (self.indexer_dims.heads + 1) * d)?,
+            q: read_f32_buffer(&self.indexer_scratch.q, self.indexer_dims.heads * d)?,
+            pooled: read_f32_buffer(&full.1.pooled, blocks * d)?,
+            raw: read_f32_buffer(&full.1.raw, self.indexer_dims.compress * d)?,
+        })
     }
 
     /// Position du prochain token (oracles).
@@ -529,7 +714,7 @@ impl FlashNextSession {
                 (LayerState::Linear(state), Some(initial)) => {
                     self.executor.restore_linear_attn_state(state, initial)?;
                 }
-                (LayerState::Full(kv), None) => kv.truncate(0)?,
+                (LayerState::Full(full), None) => full.0.truncate(0)?,
                 _ => {
                     return Err(InferError::Config(
                         "reset Flash-Next : états et instantanés désalignés".to_string(),
@@ -540,8 +725,143 @@ impl FlashNextSession {
         let c = &self.ckpt.config;
         self.ple_state.reset(c.ngram_size, c.eos);
         self.position = 0;
+        self.epoch += 1;
+        self.base_checkpoint = None;
         self.poisoned = false;
         Ok(())
+    }
+
+    /// Point de reprise à la position courante : états DeltaNet, longueurs KV,
+    /// anneau et contexte PLE. Le KV et les clés poolées des positions
+    /// antérieures ne sont pas copiés : la reprise est valide tant que la
+    /// session n'est pas remise à zéro (seules des positions ≥ point sont
+    /// réécrites ensuite).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de copie Metal.
+    pub(crate) fn checkpoint(&self, guard: Option<&MemoryGuard>) -> Result<SessionCheckpoint> {
+        if let Some(guard) = guard {
+            let bytes: u64 = self
+                .states
+                .iter()
+                .map(|state| match state {
+                    LayerState::Linear(state) => MetalExecutor::linear_attn_state_bytes(state),
+                    LayerState::Full(full) => full.1.raw.length(),
+                })
+                .sum::<u64>()
+                + self.ple_state.ring.length();
+            guard
+                .check_allocation(bytes)
+                .map_err(InferError::MemoryGuard)?;
+        }
+        let linear = self
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Linear(state) => {
+                    self.executor.snapshot_linear_attn_state(state).map(Some)
+                }
+                LayerState::Full(_) => Ok(None),
+            })
+            .collect::<Result<_>>()?;
+        let kv_lens = self
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Full(full) => Some(full.0.len()),
+                LayerState::Linear(_) => None,
+            })
+            .collect();
+        let ring_len = (self.ple_state.ring.length() / 4) as usize;
+        let ple_ring = zeros(&self.executor, ring_len);
+        self.copy_f32(&self.ple_state.ring, &ple_ring, ring_len)?;
+        let indexer_raw = self
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Full(full) => {
+                    let len = (full.1.raw.length() / 4) as usize;
+                    let copy = zeros(&self.executor, len);
+                    self.copy_f32(&full.1.raw, &copy, len).map(|()| Some(copy))
+                }
+                LayerState::Linear(_) => Ok(None),
+            })
+            .collect::<Result<_>>()?;
+        let id = self.next_checkpoint.get();
+        self.next_checkpoint.set(id + 1);
+        Ok(SessionCheckpoint {
+            id,
+            position: self.position,
+            epoch: self.epoch,
+            linear,
+            kv_lens,
+            indexer_raw,
+            ple_ring,
+            ple_context: self.ple_state.context.clone(),
+            ple_step: self.ple_state.step,
+        })
+    }
+
+    /// Reprend au point `checkpoint`. La session est invalidée pendant la
+    /// restauration et refuse un point d'une époque antérieure à un `reset`.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur de copie Metal, de troncature, ou un point périmé.
+    pub(crate) fn restore(&mut self, checkpoint: &SessionCheckpoint) -> Result<()> {
+        // Valide si pris sur la branche courante, ou s'il est la base de cette
+        // branche (reprises répétées depuis un même point).
+        let same_branch = checkpoint.epoch == self.epoch && checkpoint.position <= self.position;
+        if !same_branch && self.base_checkpoint != Some(checkpoint.id) {
+            return Err(InferError::Config(
+                "point de reprise Flash-Next périmé (autre branche de l'historique)".to_string(),
+            ));
+        }
+        self.poisoned = true;
+        for ((state, linear), len) in self
+            .states
+            .iter_mut()
+            .zip(&checkpoint.linear)
+            .zip(&checkpoint.kv_lens)
+        {
+            match (state, linear, len) {
+                (LayerState::Linear(state), Some(snapshot), None) => {
+                    self.executor.restore_linear_attn_state(state, snapshot)?;
+                }
+                (LayerState::Full(full), None, Some(len)) => full.0.truncate(*len)?,
+                _ => {
+                    return Err(InferError::Config(
+                        "point de reprise Flash-Next désaligné".to_string(),
+                    ))
+                }
+            }
+        }
+        for (state, raw) in self.states.iter().zip(&checkpoint.indexer_raw) {
+            if let (LayerState::Full(full), Some(raw)) = (state, raw) {
+                let len = (raw.length() / 4) as usize;
+                self.copy_f32(raw, &full.1.raw, len)?;
+            }
+        }
+        let ring_len = (checkpoint.ple_ring.length() / 4) as usize;
+        self.copy_f32(&checkpoint.ple_ring, &self.ple_state.ring, ring_len)?;
+        self.ple_state.context = checkpoint.ple_context.clone();
+        self.ple_state.step = checkpoint.ple_step;
+        self.position = checkpoint.position;
+        self.epoch += 1;
+        self.base_checkpoint = Some(checkpoint.id);
+        self.poisoned = false;
+        Ok(())
+    }
+
+    /// Copie `len` f32 de `src` vers `dst` (command buffer attendu).
+    fn copy_f32(&self, src: &Buffer, dst: &Buffer, len: usize) -> Result<()> {
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.executor
+            .encode_copy_with_offsets(encoder, src, 0, dst, 0, len)?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)
     }
 
     /// Décode `token` à la position courante. `logits` et `layers` demandent la
@@ -552,6 +872,26 @@ impl FlashNextSession {
     /// Renvoie une erreur si la capacité est atteinte, sur lecture n-gram ou
     /// sur encodage et exécution Metal.
     pub(crate) fn step(&mut self, token: usize, logits: bool, layers: bool) -> Result<StepOutput> {
+        self.step_with(token, logits, layers, true)
+    }
+
+    /// Rejoue `token` (contexte) sans mixer final ni lm_head : états, KV et
+    /// indexeur avancent, aucun argmax n'est produit.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que [`Self::step`].
+    pub(crate) fn replay(&mut self, token: usize) -> Result<()> {
+        self.step_with(token, false, false, false).map(|_| ())
+    }
+
+    fn step_with(
+        &mut self,
+        token: usize,
+        logits: bool,
+        layers: bool,
+        head: bool,
+    ) -> Result<StepOutput> {
         if self.poisoned {
             return Err(InferError::Metal(
                 "Flash-Next résident : session invalidée (erreur GPU ou reset incomplet)"
@@ -605,7 +945,7 @@ impl FlashNextSession {
             .states
             .iter()
             .map(|state| match state {
-                LayerState::Full(kv) => Some(kv.len()),
+                LayerState::Full(full) => Some(full.0.len()),
                 LayerState::Linear(_) => None,
             })
             .collect();
@@ -625,7 +965,7 @@ impl FlashNextSession {
         };
         #[cfg(not(feature = "devtools"))]
         let mut encoders = Encoders::single(command_buffer);
-        let encoded = self.encode_token(&mut encoders, logits, layers);
+        let encoded = self.encode_token(&mut encoders, logits, layers, head);
         if let Err(error) = encoded {
             drop(encoders);
             #[cfg(feature = "devtools")]
@@ -638,7 +978,7 @@ impl FlashNextSession {
             self.ple_state.step = ple_step;
             for (state, len) in self.states.iter_mut().zip(kv_lens) {
                 if let (LayerState::Full(kv), Some(len)) = (state, len) {
-                    if kv.truncate(len).is_err() {
+                    if kv.0.truncate(len).is_err() {
                         self.poisoned = true;
                     }
                 }
@@ -667,10 +1007,14 @@ impl FlashNextSession {
         self.position += 1;
         let width = self.hc_dims.width();
         let (vocab, layer_count) = (self.ckpt.config.vocab, self.ckpt.config.layer_kinds.len());
-        let argmax = read_u32_buffer(&self.index, 1)?
-            .first()
-            .copied()
-            .ok_or_else(|| InferError::Metal("argmax résident absent".to_string()))?;
+        let argmax = if head {
+            read_u32_buffer(&self.index, 1)?
+                .first()
+                .copied()
+                .ok_or_else(|| InferError::Metal("argmax résident absent".to_string()))?
+        } else {
+            u32::MAX
+        };
         Ok(StepOutput {
             argmax,
             logits: logits
@@ -682,6 +1026,8 @@ impl FlashNextSession {
                         .map(|all| all.chunks_exact(width).map(<[f32]>::to_vec).collect())
                 })
                 .transpose()?,
+            #[cfg(test)]
+            qsa: layers.then(|| self.read_qsa_capture()).transpose()?,
             #[cfg(test)]
             routing: layers
                 .then(|| {
@@ -704,6 +1050,7 @@ impl FlashNextSession {
         encoders: &mut Encoders<'_>,
         logits: bool,
         layers: bool,
+        head: bool,
     ) -> Result<()> {
         let c = &self.ckpt.config;
         let mut owned = Vec::new();
@@ -756,20 +1103,56 @@ impl FlashNextSession {
                         self.linear_dims,
                     )?;
                 }
-                (MixerWeights::Full(w), LayerState::Full(kv)) => {
+                (MixerWeights::Full(w), LayerState::Full(full)) => {
                     let encoder = encoders.at(Brick::Qsa)?;
-                    encode_qsa_dense(
+                    let (kv, indexer_state) = &mut **full;
+                    let indexer = w.indexer.as_ref().ok_or_else(|| {
+                        InferError::Config(format!("couche {index} : indexeur QSA absent"))
+                    })?;
+                    encode_qsa(
                         &self.arena,
+                        &self.kernels,
                         &self.executor,
                         encoder,
                         kv,
                         w,
                         &self.qsa_scratch,
                         self.qsa_dims,
+                        Some(QsaSparse {
+                            weights: indexer,
+                            state: indexer_state,
+                            scratch: &self.indexer_scratch,
+                            gathered: &mut self.gathered,
+                            dims: self.indexer_dims,
+                            #[cfg(test)]
+                            forced: self.forced_selection.get_mut(index).and_then(Option::take),
+                        }),
                         self.position,
                         &self.x,
                         &self.branch,
                     )?;
+                    #[cfg(test)]
+                    {
+                        let complete = (self.position + 1) / self.indexer_dims.compress;
+                        if layers && complete > self.indexer_dims.keep {
+                            let keep = self.indexer_dims.keep;
+                            encoder.set_compute_pipeline_state(&self.kernels.copy_u32);
+                            encoder.set_buffer(0, Some(&self.indexer_scratch.selected), 0);
+                            encoder.set_buffer(1, Some(&self.selection_capture), 0);
+                            super::set_value(encoder, 2, &[keep as u32, (index * keep) as u32]);
+                            super::dispatch_1d(encoder, keep);
+                            let stride = self.capacity / self.indexer_dims.compress + 1;
+                            self.executor.encode_copy_with_offsets(
+                                encoder,
+                                &self.indexer_scratch.scores,
+                                0,
+                                &self.score_capture,
+                                (index * stride * std::mem::size_of::<f32>()) as u64,
+                                complete,
+                            )?;
+                            crate::metal_backend::post_dispatch_barrier(encoder);
+                        }
+                    }
                 }
                 _ => {
                     return Err(InferError::Config(format!(
@@ -864,6 +1247,9 @@ impl FlashNextSession {
                     width,
                 )?;
             }
+        }
+        if !head {
+            return Ok(());
         }
         let encoder = encoders.at(Brick::Mixer)?;
         encode_hc_mix(
