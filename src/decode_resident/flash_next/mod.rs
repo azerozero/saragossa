@@ -4,11 +4,10 @@
 //! sans l'orchestrateur des couches Qwen : Flash-Next n'a pas d'`input_norm`
 //! ni de `post_attention_norm`, mais des hyper-connections à 4 flux.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    reason = "briques du decode Flash-Next, câblées couche par couche (étape 4)"
-)]
+// NOTE: le parent `decode_resident` tolère le code mort ; ce module le
+// signale de nouveau, et seules les entrées sans appelant de production
+// portent un `allow` ciblé.
+#![warn(dead_code)]
 
 mod attention;
 mod hc;
@@ -19,14 +18,6 @@ mod weights;
 
 #[cfg(test)]
 mod tests;
-
-pub(crate) use attention::{
-    dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaLayerWeights, QsaScratch,
-};
-pub(crate) use hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch, HcWeights};
-pub(crate) use kernels::FlashNextKernels;
-pub(crate) use ple::{encode_ple, PleScratch, PleState, PleWeights};
-pub(crate) use session::{FlashNextSession, StepOutput};
 
 use metal::{ComputeCommandEncoderRef, MTLSize};
 

@@ -2,7 +2,13 @@
 
 use metal::{Buffer, MTLResourceOptions};
 
-use super::*;
+use super::attention::{
+    dense_max_visible, encode_qsa_dense, QsaDecodeDims, QsaLayerWeights, QsaScratch,
+};
+use super::hc::{encode_hc_combine, encode_hc_mix, HcDims, HcScratch, HcWeights};
+use super::kernels::FlashNextKernels;
+use super::ple::{encode_ple, PleScratch, PleState, PleWeights};
+use super::session::FlashNextSession;
 use crate::decode_resident::utils::bf16_round_f32;
 use crate::linear_attention::tests::DeterministicF32;
 use crate::metal_backend::{

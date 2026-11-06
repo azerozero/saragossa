@@ -65,6 +65,10 @@ pub(crate) struct PleState {
 impl PleState {
     /// Remet la séquence à zéro : contexte EOS et historique de conv vide (le
     /// kernel ignore les colonnes antérieures au pas 0).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reset de requête, exercé par les oracles")
+    )]
     pub(crate) fn reset(&mut self, ngram_size: usize, eos: u64) {
         self.context = NgramContext::new(ngram_size, eos);
         self.step = 0;

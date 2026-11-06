@@ -30,6 +30,13 @@ enum LayerState {
 }
 
 /// Sorties d'un pas.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "pas encore d'entrée de production (serve, étape 9) : exercé par les oracles"
+    )
+)]
 pub(crate) struct StepOutput {
     pub(crate) argmax: u32,
     /// Logits `[vocab]` si demandés.
@@ -41,6 +48,13 @@ pub(crate) struct StepOutput {
 }
 
 /// Decode résident Flash-Next d'une séquence (≤ 2051 tokens).
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "pas encore d'entrée de production (serve, étape 9) : exercé par les oracles"
+    )
+)]
 pub(crate) struct FlashNextSession {
     ckpt: Qwen4ExpCheckpoint,
     executor: MetalExecutor,
@@ -131,6 +145,13 @@ pub(crate) fn validate_resident_config(c: &Qwen4ExpConfig) -> Result<usize> {
     Ok(dense_max_visible(c.indexer_budget, c.indexer_compress))
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "pas encore d'entrée de production (serve, étape 9) : exercé par les oracles"
+    )
+)]
 impl FlashNextSession {
     /// Ouvre le checkpoint, charge le tronc sur GPU et alloue les états pour
     /// `capacity` tokens (au plus 2051, régime QSA dense).
@@ -293,11 +314,6 @@ impl FlashNextSession {
                 }
             })
             .collect()
-    }
-
-    /// Position du prochain token.
-    pub(crate) fn position(&self) -> usize {
-        self.position
     }
 
     /// Décode `token` à la position courante. `logits` et `layers` demandent la

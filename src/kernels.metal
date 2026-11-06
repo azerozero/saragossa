@@ -2768,6 +2768,8 @@ kernel void linear_attn_norm_gates_dk128_f32(
 // Flash-Next (`qwen4_exp`) : normalisation l2 des têtes q/k, `x/√(Σx²+ε)`, ε non
 // mis à l'échelle (transformers `l2norm`), au lieu de l'unité RMS `x/√(Σx²/d+ε)`.
 // q reçoit ensuite `scales.x = d^-½`, k `scales.y = 1`. Gates β/decay inchangées.
+// NOTE: ε vaut 1e-6 en dur, comme `l2norm` de transformers, et non `rms_eps`
+// de la config : le transmettre changerait la valeur de référence.
 kernel void linear_attn_norm_gates_l2_dk128_f32(
     device const float* conv_out [[buffer(0)]],
     device const float* beta_input [[buffer(1)]],
