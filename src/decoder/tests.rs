@@ -3496,7 +3496,8 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
 // --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
 
 /// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
-/// l'AR, même acceptance ; la variante streamée émet exactement ces tokens et
+/// l'AR, même acceptance que la boucle CPU pour la chaîne résidente (tolérance
+/// de deux) ; la variante streamée émet exactement ces tokens et
 /// s'arrête sur le callback ; le greedy MTP route vers DFlash quand le drafter
 /// est chargé. Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` et
 /// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` (quantification via
@@ -3507,9 +3508,9 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
 fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
     use crate::decoder::resident::dflash::DFlashTreeMode;
     // NOTE: les points d'entrée publics lisent `SARAGOSSA_RUST_DFLASH_TREE` ; sans
-    // la variable, le résident comparé ici est l'arbre B = 8 par défaut. La chaîne
-    // résidente reste couverte explicitement par
-    // `dflash_tree_resident_matches_chain_and_ar_real_model` (mode `Off`).
+    // la variable, l'identité des tokens porte sur l'arbre par défaut (B = 8, ou
+    // B = 3 en greedy strict). L'acceptance comparée à la boucle CPU porte, quelle
+    // que soit la variable, sur la chaîne résidente explicite (mode `Off`).
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
     };
@@ -3562,13 +3563,37 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
     );
     assert_eq!(resident.tokens, ar, "boucle résidente divergente de l'AR");
     assert_eq!(cpu.tokens, ar, "boucle CPU divergente de l'AR");
+    // Plancher du chemin par défaut : un arbre qui n'accepte rien garderait les
+    // tokens de l'AR par construction.
+    assert!(
+        resident.stats.accepted > 0,
+        "arbre résident par défaut : aucun draft accepté"
+    );
+    // L'acceptance se compare à structure égale : la boucle CPU est une chaîne,
+    // alors que le résident par défaut est un arbre dont le budget plafonne les
+    // acceptés par tour (B = 3 en greedy strict, d'où 23 contre 26 sur ce
+    // prompt). Le résident est donc forcé en chaîne pour cette comparaison.
+    let chain = model.generate_greedy_dflash_resident_tree(
+        &prompt,
+        max_new_tokens,
+        &options,
+        &draft,
+        draft.info.block_size,
+        (DFlashTreeMode::Off, true),
+        |_| true,
+    )?;
+    eprintln!(
+        "DFlash résident en chaîne: {} acceptés / {} proposés",
+        chain.stats.accepted, chain.stats.proposed
+    );
+    assert_eq!(chain.tokens, ar, "chaîne résidente divergente de l'AR");
     // Le drafter résident tourne sur le kernel skinny bf16 : ses propositions
     // peuvent différer de la boucle CPU f32, pas les tokens. Tolérance de deux
     // acceptations sur 32 tokens.
     assert!(
-        resident.stats.accepted + 2 >= cpu.stats.accepted,
+        chain.stats.accepted + 2 >= cpu.stats.accepted,
         "drafter résident moins accepté : {} contre {}",
-        resident.stats.accepted,
+        chain.stats.accepted,
         cpu.stats.accepted
     );
     // Au-delà du seuil greedy, l'arène du vérifieur passe en bf16
@@ -3669,7 +3694,8 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         options.stop_sequences = sequences;
         options
     };
-    // Point d'entrée public (arbre B = 8 par défaut) et chaîne explicite.
+    // Point d'entrée public (selon l'environnement ; sinon arbre B = 8, ou B = 3 en
+    // greedy strict) et chaîne explicite.
     let resident_modes = [
         ("défaut", None),
         ("chaîne", Some((DFlashTreeMode::Off, true))),
