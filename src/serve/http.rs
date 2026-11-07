@@ -242,8 +242,7 @@ fn handle_chat<S: Write>(
     state: &mut ServeState,
     request: &HttpRequest,
 ) -> ServeResult<()> {
-    let chat: ChatCompletionRequest = serde_json::from_slice(&request.body)
-        .map_err(|e| ServeError::json("désérialisation chat/completions", e))?;
+    let chat = ChatCompletionRequest::parse(&request.body)?;
     chat.validate(state.max_tokens_cap())?;
     let session_key = chat.session_key(request.header(SESSION_HEADER));
     // NOTE: `tools` et `tool_choice` ne servent qu'à flint ; les autres
