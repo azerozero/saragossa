@@ -1,6 +1,6 @@
 """Contrôle de qualité des formats : perplexité MLX au protocole de llama-perplexity.
 
-  models/mlxenv/bin/python -I bench/competitors/quality.py mlx-ppl CORPUS
+  models/mlxenv/bin/python -I bench/competitors/quality.py mlx-ppl CORPUS [CHECKPOINT]
   models/mlxenv/bin/python -I bench/competitors/quality.py llama-ids CORPUS PORT
 
 Protocole commun (identique à `llama-perplexity -c 512 --chunks 32`) :
@@ -46,12 +46,12 @@ def corpus_ids(corpus):
     return tok.encode(corpus_text(corpus), add_special_tokens=False).ids
 
 
-def mlx_ppl(corpus):
+def mlx_ppl(corpus, checkpoint=CHECKPOINT):
     import mlx.core as mx
     from mlx_lm import load
 
     ids = corpus_ids(corpus)
-    model, _ = load(str(CHECKPOINT))
+    model, _ = load(str(checkpoint))
     nll, count, per_chunk = 0.0, 0, []
     for chunk in range(N_CHUNKS):
         window = ids[chunk * N_CTX:(chunk + 1) * N_CTX]
@@ -63,7 +63,8 @@ def mlx_ppl(corpus):
         nll += chunk_nll
         count += N_CTX - FIRST - 1
         per_chunk.append(math.exp(nll / count))
-    print(json.dumps({"tool": "mlx-lm forward", "ppl": math.exp(nll / count),
+    print(json.dumps({"tool": "mlx-lm forward", "checkpoint": pathlib.Path(checkpoint).name,
+                      "ppl": math.exp(nll / count),
                       "scored_tokens": count, "running_ppl": per_chunk,
                       "corpus_ids_fnv1a64": fnv1a64(ids[:N_CTX * N_CHUNKS])}, indent=1))
 
@@ -91,8 +92,8 @@ def llama_ids(corpus, port):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "mlx-ppl":
-        mlx_ppl(sys.argv[2])
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "mlx-ppl":
+        mlx_ppl(*sys.argv[2:])
     elif len(sys.argv) == 4 and sys.argv[1] == "llama-ids":
         llama_ids(sys.argv[2], sys.argv[3])
     else:
