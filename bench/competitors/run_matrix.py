@@ -419,11 +419,13 @@ def run_request(camp, eng, entry, request, kind, meta):
                             client.STREAM_ERROR) and not eng.alive():
         record["status"] = eng.failure_status()
     if record["status"] == client.HTTP_ERROR and record.get("http_status") == 503:
-        body = record.get("error_body", "").lower()
-        if any(m in body for m in ADMISSION_MARKERS):
+        error_body = record.get("error_body", "")
+        error_text = (error_body if isinstance(error_body, str)
+                      else json.dumps(error_body, ensure_ascii=False)).lower()
+        if any(m in error_text for m in ADMISSION_MARKERS):
             # Refus d'admission (octets en vol, file pleine) : pas un manque de mémoire.
             record["status"] = REFUSED_BUSY
-        elif any(m in body for m in OOM_MARKERS):
+        elif any(m in error_text for m in OOM_MARKERS):
             record["status"] = OOM
     t0 = record["t0_ns"]
     line = {
@@ -786,6 +788,7 @@ def environment(run_dir, name):
 
 
 def _self_check():
+    _request_failure_check()
     a = nonce(1, "a", 0, "p", None, 0)
     assert a == nonce(1, "a", 0, "p", None, 0) and a != nonce(1, "a", 0, "p", None, 1)
     assert a != nonce(1, "a", 0, "p", 11, 0) and len(a) == 16 and a.isdigit()
@@ -819,6 +822,40 @@ def _self_check():
         busy.bind(("127.0.0.1", 0))
         busy.listen()
         assert not port_free(busy.getsockname()[1])
+
+
+def _request_failure_check():
+    """Un refus HTTP conserve le corps de requête et reste enregistrable."""
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    body = {"model": "m", "messages": [], "seed": 7}
+    lines = []
+    camp = SimpleNamespace(matrix={"engines": {"saragossa": {}}, "memory_period_s": 1,
+                                   "deadline_s": 1}, prompts={}, write=lines.append)
+    eng = SimpleNamespace(engine="saragossa", proc=SimpleNamespace(pid=0), port=0)
+    request = {"prompt": "p", "nonce": "n", "seed": 7}
+    cases = [(503, "file d'inférence pleine", REFUSED_BUSY),
+             (503, {"error": "out of memory"}, OOM),
+             (503, None, client.HTTP_ERROR), (503, [], client.HTTP_ERROR),
+             (500, "plain text", client.HTTP_ERROR)]
+    for status, error_body, expected in cases:
+        record = {"status": client.HTTP_ERROR, "http_status": status,
+                  "error_body": error_body, "t0_ns": 0, "t_end_ns": 0}
+        with (patch(__name__ + ".content_for", return_value="x"),
+              patch(__name__ + ".request_body", return_value=body),
+              patch.object(memwatch, "rusage", return_value={}),
+              patch.object(memwatch, "Sampler", return_value=contextlib.nullcontext(
+                  SimpleNamespace(samples=[]))),
+              patch.object(client, "chat_stream", return_value=record),
+              contextlib.redirect_stdout(io.StringIO())):
+            assert run_request(camp, eng, {"sampling": "greedy"}, request, "measure", {}) == expected
+        assert lines[-1]["body_params"] == {"model": "m", "seed": 7}
+        assert lines[-1]["body_sha256"] == hashlib.sha256(
+            json.dumps(body, sort_keys=True).encode()).hexdigest()
+        assert lines[-1]["error_body"] == error_body
 
 
 def _freeze_check():
