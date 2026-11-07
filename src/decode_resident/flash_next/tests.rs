@@ -4346,9 +4346,11 @@ fn speculative_greedy_matches_ar_bitwise() {
     // restauration, un bloc est poolé avec la clé d'une ligne retirée.
     let mtp_state =
         |session: &mut FlashNextSession| session.mtp_state_digest().expect("invariant: état MTP");
-    for index in [1, 3] {
+    // Prompt creux : 64 jetons, pour que la mutation NoTruncate (lignes de
+    // drafts jamais retirées) tienne dans la capacité de la session.
+    for (index, budget) in [(1, generated), (3, 64)] {
         let (label, prompt) = &prompts[index];
-        let spec = generate_speculative(&mut session, prompt, generated, 3, &[], &none)
+        let spec = generate_speculative(&mut session, prompt, budget, 3, &[], &none)
             .expect("invariant: spéculatif");
         let state = mtp_state(&mut session);
         let mut sequence = prompt.clone();
@@ -4367,7 +4369,7 @@ fn speculative_greedy_matches_ar_bitwise() {
                 mutation: Some(mutation),
                 ..SpecOptions::default()
             };
-            generate_speculative(&mut session, prompt, generated, 3, &[], &options)
+            generate_speculative(&mut session, prompt, budget, 3, &[], &options)
                 .expect("invariant: spéculatif muté");
             assert!(
                 mtp_state(&mut session) != reference,
