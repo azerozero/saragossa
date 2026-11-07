@@ -12,9 +12,9 @@ Bilan :
   profondeurs, retour arrière contrôlé par oracle d'état ;
 - il est **plus lent que l'AR** (×0,53 à ×0,84), puisque la vérification de R
   lignes coûte R pas ;
-- le profil de D chiffre le gain d'une vérification en lignes. La règle fixée
-  avant la mesure : si aucune option ne dépasse ×1,2 en code à profondeur 3
-  dans l'hypothèse réaliste, D s'arrête.
+- le profil de D chiffre le gain d'une vérification en lignes : ×0,88 au mieux
+  en code à profondeur 3 dans l'hypothèse réaliste, sous le seuil de ×1,2 fixé
+  avant la mesure. **D s'arrête.**
 
 Le spéculatif reste **désactivé par défaut** sur Flash-Next. C sert de base
 exacte : retour arrière, historique MTP et identité.
@@ -92,8 +92,19 @@ Un cycle, à profondeur d :
 4. l'historique MTP est tronqué à `p + 1`, puis reçoit les paires vérifiées ;
    le jeton en attente devient `a_k`.
 
-Le moindre échec en cours de cycle ramène l'historique MTP à son dernier état
-propre. La convention d'arrêt est celle de l'AR.
+Les drafts enchaînés écrivent dans l'anneau des clés brutes de l'indexeur
+MTP : un instantané, pris après le premier pas MTP du cycle, est restauré par
+la troncature.
+
+En cas d'échec en cours de cycle, y compris pendant la reconstruction après
+`accept`, l'historique MTP revient aux `p + 1` paires vérifiées, clés brutes
+comprises. Le tronc garde ce qu'il a engagé, et toute reprise passe par un
+`reset`.
+
+Conventions alignées sur l'AR :
+- **arrêt** : comme en AR ;
+- **dernier jeton émis** : jamais consommé par le tronc. Un cycle émet au plus
+  le budget restant moins un jeton.
 
 ### Identité (porte dure)
 
@@ -142,11 +153,17 @@ Test `bench_speculative_mono_vs_ar`, M3 Ultra, 256 jetons, 2 répétitions.
 | prose (golden 512) | 45,8–46,5 tok/s | ×0,80 | ×0,66 | ×0,53–0,54 |
 | code (code4k-1) | 45,2–46,2 tok/s | ×0,83–0,84 | ×0,73 | ×0,66–0,67 |
 
-- Pas AR : 21,49 ms. Pas MTP : 3,60 ms. `T_mtp/T_ar = 0,168`. Le `lm_head`
-  pèse environ 2,8 ms du pas MTP.
-- Modèle d'un cycle : `gain = n / [ρ(R) + (n+2)·T_mtp/T_ar + h]`, avec n les
-  jetons par cycle et h le coût hôte. En pas mono, ρ(R) = R. Il reproduit C
-  avec h ≈ 0 : code d3, 0,66 prédit et 0,665 mesuré.
+- Pas AR : 21,49 ms. Pas MTP : 3,60 ms. `T_mtp/T_ar = 0,168`, mesuré sur un
+  historique MTP court (64 lignes), où l'attention de la tête est négligeable.
+  L'argmax du `lm_head` pèse 2,93 ms de ce pas.
+- Modèle d'un cycle : `gain = n / [ρ(R) + m·T_mtp/T_ar + h]`, où :
+  - n : jetons par cycle ;
+  - m = d + n − 1 : pas MTP du cycle (d drafts, puis n − 1 paires
+    reconstruites), soit n + 2 à profondeur 3 ;
+  - h : coût hôte, sans dimension.
+
+  En pas mono, ρ(R) = R. Le modèle reproduit C avec h ≈ 0 : en code à
+  profondeur 3, ×0,66 prédit pour ×0,665 mesuré.
 
 ## D. Vérification en lignes : profil avant code
 
@@ -180,7 +197,7 @@ kernels existants.
 
 Les relectures ont montré que la première mesure lisait un seul buffer GPU
 pour toutes les « copies » (cache indexé par `weight_id`). Les chiffres des
-sections suivantes sont donc à remplacer. Les définitions ci-dessous ont été
+sections suivantes viennent de la re-mesure (c96e469) et des mesures in situ (994d9aa). Les définitions ci-dessous ont été
 écrites et commitées **avant** la re-mesure, pour ne pas être ajustées après
 coup. La règle de décision, fixée par avance, ne change pas : D s'arrête si
 aucune option ne dépasse ×1,2 en code à profondeur 3 dans l'hypothèse
@@ -297,137 +314,154 @@ après une chauffe, au minimum de 3.
 meilleure option passe ×1,2 en code mais reste sous ×1 en prose, D ne sera
 activable que par opt-in, jamais par défaut.
 
-### Matmuls à poids
+### Matmuls à poids (re-mesure, commit c96e469)
 
-> Chiffres de la première mesure (poids aliasés), à remplacer.
+Mode strict, poids synthétiques aux formes réelles. Copies distinctes, adresses
+GPU vérifiées, lues depuis la DRAM ; minimum de 3 après chauffe. Toutes les
+lignes sont exactes au bit près.
 
-Dernier passage (commit 267728a). Mono à ~550 Go/s. Toutes les lignes sont exactes au bit près, en normal comme
-en strict.
+| matmul | forme, bits | ×/pas | mono | Go/s | ρ(2) | ρ(3) | ρ(4) |
+|---|---|---|---|---|---|---|---|
+| q_proj (q + gate) | 12288×2560 u8 | 12 | 73,0 µs | 458 | 1,01 | 1,26 | 1,46 |
+| k/v_proj | 512×2560 u8 | 24 | 8,8 µs | 159 | 0,98 | 1,01 | 1,05 |
+| o_proj | 2560×6144 u8 | 12 | 38,5 µs | 434 | 1,00 | 1,36 | 1,63 |
+| DeltaNet in_proj_qkv | 10240×2560 u8 | 36 | 63,2 µs | 440 | 1,01 | 1,20 | 1,46 |
+| DeltaNet in_proj_z | 6144×2560 u8 | 36 | 40,0 µs | 418 | 0,99 | 1,21 | 1,43 |
+| DeltaNet out_proj | 2560×6144 u8 | 36 | 38,8 µs | 431 | 1,01 | 1,37 | 1,66 |
+| DeltaNet in_proj_a/b (f32) | 48×2560 | 72 | 7,2 µs | 68 | 1,01 | 1,02 | 1,03 |
+| hc Up | 10240×320 u8 | 96 | 12,2 µs | 285 | 1,25 | 1,51 | 1,82 |
+| hc Down, matmul générique | 320×10240 u8 | 96 | 25,9 µs | 134 | 0,97 | 0,98 | 1,00 |
+| hc Down, split-K de production | 320×10240 u8 | 96 | 16,6 µs | 210 | — | — | — |
+| expert gate/up | 640×2560 u4 | 960 | 5,4 µs | 170 | 1,85 | 1,70 | 1,77 |
+| expert down | 2560×640 u4 | 480 | 5,7 µs | 162 | 1,08 | 1,28 | 1,51 |
+| partagé gate/up | 640×2560 u8 | 96 | 9,1 µs | 191 | 0,97 | 1,03 | 1,07 |
+| partagé down | 2560×640 u8 | 48 | 7,1 µs | 247 | 1,07 | 1,25 | 1,36 |
+| `index_qk_proj` | 640×2560 u8 | 12 | 9,1 µs | 192 | 0,97 | 1,03 | 1,07 |
+| routeur (f32) | 512×2560 | 48 | 13,0 µs | 403 | 1,08 | 1,13 | 1,32 |
 
-Mode strict :
+Les ρ des experts portent sur un même expert lu pour 2, 3 ou 4 lignes : ce
+sont les `ρ_expert(m)` du facteur des experts.
 
-| matmul | forme, bits | ×/pas | mono | ρ(2) | ρ(3) | ρ(4) |
-|---|---|---|---|---|---|---|
-| q_proj (q + gate) | 12288×2560 u8 | 12 | 55,1 µs | 1,09 | 1,72 | 2,26 |
-| k/v_proj | 512×2560 u8 | 24 | 5,1 µs | 1,20 | 1,16 | 1,24 |
-| o_proj | 2560×6144 u8 | 12 | 23,3 µs | 1,03 | 1,53 | 1,92 |
-| DeltaNet in_proj_qkv | 10240×2560 u8 | 36 | 42,1 µs | 1,06 | 1,31 | 1,68 |
-| DeltaNet in_proj_z | 6144×2560 u8 | 36 | 24,8 µs | 1,06 | 1,40 | 1,76 |
-| DeltaNet out_proj | 2560×6144 u8 | 36 | 24,7 µs | 1,07 | 1,48 | 1,81 |
-| hc Up | 10240×320 u8 | 96 | 6,6 µs | 1,56 | 2,09 | 2,67 |
-| expert gate/up | 640×2560 u4 | 960 | 4,2 µs | 1,56 | 1,83 | 1,96 |
-| expert down | 2560×640 u4 | 480 | 3,6 µs | 1,33 | 1,67 | 1,96 |
-| partagé gate/up | 640×2560 u8 | 96 | 5,3 µs | 1,19 | 1,22 | 1,28 |
+**Chevauchement des experts** (`tools/flashnext/expert_overlap.py`, golden long,
+48 couches × 4096 positions). Experts distincts parmi les top-10 de R jetons
+consécutifs :
+- R = 2 : 16,84 sur 20 ;
+- R = 3 : 22,67 sur 30 ;
+- R = 4 : 27,93 sur 40, de multiplicité N_1 = 19,54, N_2 = 5,55, N_3 = 2,00,
+  N_4 = 0,84.
 
-Les ρ des experts portent sur **un même** expert lu pour R lignes. En
-vérification, chaque ligne a ses propres experts.
-
-**Chevauchement des experts** : 16,8 experts distincts sur 20 à R = 2, 22,7
-sur 30 à R = 3, 27,9 sur 40 à R = 4. Même avec union, le coût des experts reste
-×2,8 à R = 4.
-
-Trois formes s'ajoutent à la table (mode strict) :
-
-| matmul | forme | ×/pas | mono | ρ(4) |
-|---|---|---|---|---|
-| partagé down | 2560×640 u8 | 48 | 3,9 µs | 1,99 |
-| hc Down | 320×10240 u8 | 97 | 15,1 µs | 1,08 |
-| `index_qk_proj` | 640×2560 u8 | 12 | 5,3 µs | 1,30 |
-
-Les linéaires bf16 sont mesurés en f32, soit deux fois leurs octets :
-
-| matmul | forme | ×/pas | mono | ρ(4) |
-|---|---|---|---|---|
-| routeur | 512×2560 | 48 | 7,0 µs | 1,81 |
-| `in_proj_a/b` | 48×2560 | 72 | 4,5 µs | 1,05 |
+Facteur des experts à R = 4 :
+- gate/up 3,47, down 2,94, pondéré 3,29 ;
+- union seule (Σ N_m / 10) : 2,79.
 
 ### Reste du pas
 
-Profil par brique après 1k, sur 128 pas : 20,63 ms GPU et 1627 dispatches par
-pas. Le temps mural profilé est de 23,34 ms, contre 21,49 ms hors profil. Le
-« reste » d'une brique est son temps moins celui de ses matmuls à poids, au
-temps mono de la table ci-dessus. Les dispatches du reste sont ceux de la
-brique, moins ceux de ses matmuls.
+Profil par brique après 1k, sur 128 pas : 20,65 ms GPU, 1627 dispatches par
+pas. Un dispatch suivi de sa barrière coûte 0,97 µs (copie de 10 240 mots ;
+0,92 µs pour 1 mot, 1,16 µs pour 40 960 mots). Argmax de tête en lignes sur le
+vrai `lm_head` u6 : 2,93 ms en mono, ρ = 1,94, 2,88 et 3,86 pour R = 2, 3 et
+4, avec les mêmes indices. Il n'y a pas de qmv-T u6 : le kernel relit les poids
+par ligne.
 
-| brique | mono | matmuls | dispatches du reste | latence | travail |
-|---|---|---|---|---|---|
-| hyper-connections | 3,40 | 2,10 | 480 | 0,47 | 0,84 |
-| DeltaNet | 5,06 | 3,62 | 72 | 0,07 | 1,37 |
-| QSA (dense, 1k) | 2,09 | 1,13 | 99 | 0,10 | 0,86 |
-| MoE, routeur compris | 7,20 | 6,79 | 240 | 0,23 | 0,18 |
-| `lm_head` (argmax) | 2,75 | — | 3 | — | — |
-| PLE et mixer final | 0,12 | — | — | — | — |
+| brique | mono (ms) | matmuls (micro-bench) | reste | dont latence |
+|---|---|---|---|---|
+| hyper-connections | 3,41 | 2,77 | 0,65 | 0,47 (480 dispatches) |
+| QSA (dense, 1k) | 2,09 | 1,66 | 0,43 | 0,10 (99 dispatches) |
+| DeltaNet | 5,07 | 5,63 | **négatif** | — |
+| MoE, routeur compris | 7,22 | 9,76 | **négatif** | — |
+| `lm_head` (argmax) | 2,75 | — | — | — |
+| PLE et mixer final | 0,12 | — | — | — |
 
-Temps en ms par pas.
+Pour DeltaNet et le MoE, les matmuls isolés lus depuis la DRAM coûtent plus
+que la brique entière dans le pas : les experts isolés coûtent plus que le
+kernel MoE fusionné, et les dispatches isolés plus que les dispatches
+enchaînés. La soustraction ne donne donc pas de reste. D'où les mesures in
+situ.
 
-- **Latence de dispatch.** Un dispatch suivi de sa barrière coûte 0,93 µs.
-  Une copie de 10 240 mots coûte 0,97 µs, une de 40 960 mots 1,16 µs : le
-  travail élémentaire d'un kernel en lignes croît peu à cette taille.
-- **Argmax de tête en lignes**, sur le vrai `lm_head` u6 : 2,93 ms en mono,
-  ρ = 1,93, 2,88 et 3,85 pour R = 2, 3 et 4. Les indices sont égaux à ceux des
-  argmax mono. Le kernel en lignes existant relit les poids par ligne : il
-  n'y a pas de qmv-T u6.
+### Mesures in situ (commit 994d9aa)
 
-### Modèle à R = 4 (profondeur 3)
+Vrais poids de la session après 1k, toutes les couches dans un command buffer,
+vérification greedy stricte.
 
-Les hypothèses suivent la règle fixée avant la mesure.
+- **DeltaNet, 36 couches.**
+  - Couche entière : 5,499 ms.
+  - Matmuls de ces couches : 4,609 ms, d'où un **reste in situ de 0,890 ms**
+    (scan, conv, normes, portes).
+  - Matmuls en lignes : 4,735 ms (ρ = 1,03) à R = 2, 5,913 ms (ρ = 1,28) à
+    R = 3, 7,059 ms (ρ = 1,53) à R = 4.
+  - Lignes exactes.
+- **MoE, 48 couches.**
+  - Mono : 6,834 ms.
+  - Kernel de vérification en lignes existant : 20,649 ms (ρ = 3,02) à R = 2,
+    23,373 ms (ρ = 3,42) à R = 3, 26,223 ms (ρ = 3,84) à R = 4.
+  - Lignes exactes au bit sur les 48 couches.
+  - Ce kernel route chaque ligne sans union : dès deux lignes, il coûte plus
+    que deux MoE mono.
 
-**Hypothèse réaliste :**
-- matmuls aux ρ(4) stricts mesurés ;
-- experts à 2,79 fois leur temps mono, soit des experts distincts lus une fois
-  (union, qui n'existe pas encore) ;
-- argmax de tête au ρ mesuré (3,85) ;
-- reste : latence partagée une fois, travail × R ;
-- PLE séquentiel, × R.
+### Acceptation d'un draft sur sous-vocabulaire (commit 994d9aa)
 
-**Hypothèse optimiste :** comme la réaliste, à trois différences près :
-- travail du reste × 1,2, comme la copie mesurée ;
-- argmax de tête par un qmv-T u6 exact, à écrire, au ρ(4) du `q_proj`
-  (2,26) ;
-- mixer partagé.
+Le corpus distinct (41 464 jetons) ne contient que **5 623 jetons distincts**,
+EOS compris : V_sub est donc l'ensemble des jetons vus, pas 32 000. La sortie
+AR évaluée est couverte à 196/256 en code et à 134/256 en prose.
 
-| brique | mono | R = 4 réaliste | R = 4 optimiste |
-|---|---|---|---|
-| hyper-connections | 3,40 | 7,09 | 4,74 |
-| DeltaNet | 5,06 | 11,61 | 7,78 |
-| QSA | 2,09 | 5,82 | 3,40 |
-| MoE | 7,20 | 18,65 | 18,15 |
-| `lm_head` | 2,75 | 10,59 | 6,22 |
-| PLE et mixer | 0,12 | 0,49 | 0,41 |
-| **total** | **20,63** | **54,25 (ρ = 2,63)** | **40,70 (ρ = 1,97)** |
-
-Supposer que le scan DeltaNet ne lit son état qu'une fois pour R lignes
-(0,41 ms partagés) ne baisse le ρ réaliste qu'à 2,57.
-
-**Draft sur sous-vocabulaire.** Le `lm_head` coûte ~2,8 ms des 3,60 ms d'un pas
-MTP. Avec 32k jetons de vocabulaire de draft, le pas MTP tomberait à ~1,16 ms,
-soit `T_mtp/T_ar ≈ 0,054`. L'acceptation est supposée inchangée, ce qui est
-favorable à cette option.
-
-**Gain modélisé**, en code à profondeur 3 (n = 3,2) :
-
-| option | réaliste | optimiste |
+| | drafts pleins | drafts restreints |
 |---|---|---|
-| C actuel (pas mono), pour référence | ×0,66 (mesuré ×0,665) | — |
-| D complet | ×0,91 | ×1,13 |
-| draft sous-vocabulaire seul | ×0,75 | ×0,75 |
-| les deux | ×1,10 | ×1,42 |
+| code (`code4k-1`), profondeur 3 | 3,19 jetons par cycle | **2,41** |
+| prose (golden 512), profondeur 3 | 2,55 | 1,71 |
 
-En prose (n = 2,55), les deux options combinées donnent ×0,88 en réaliste.
+Les sorties restent identiques à l'AR. Le pas MTP restreint est estimé à
+`T_mtp_sub = 3,60 − 2,93 × (1 − 5 623 / 248 320) = 0,74 ms`, soit
+`T_mtp_sub/T_ar = 0,034`.
+
+### Modèle à R = 4, combinaison e5ef5b6 appliquée telle quelle
+
+| brique | mono (ms) | R = 4 réaliste (ms) | source |
+|---|---|---|---|
+| PLE | 0,09 | 0,37 | × R |
+| hyper-connections | 3,41 | 4,91 | Up × 1,82, Down split-K × 1,00, latence une fois, travail × 4 |
+| DeltaNet | 5,07 | 9,78 | × (7,059 + 4 × 0,890) / 5,499 = × 1,93 |
+| QSA | 2,09 | 3,80 | matmuls aux ρ stricts, latence une fois, travail × 4 |
+| MoE | 7,22 | 27,69 | × 26,223 / 6,834 = × 3,84 (lignes exactes) |
+| mixer final | 0,03 | 0,04 | matmuls aux ρ stricts |
+| `lm_head` (argmax) | 2,75 | 10,61 | × 3,86 |
+| **total** | **20,65** | **57,20** | **ρ(4) = 2,77** |
+
+**Gain modélisé**, réaliste. `T_mtp/T_ar = 0,168` et m = d + n − 1 pas MTP par
+cycle.
+
+| option | code d3 | prose d3 |
+|---|---|---|
+| D complet (n = 3,20 / 2,55) | **×0,88** | ×0,72 |
+| draft sur sous-vocabulaire seul (n_sub = 2,41 / 1,71) | **×0,58** | ×0,41 |
+| les deux | **×0,83** | ×0,59 |
+| pour mémoire : C actuel, mesuré | ×0,665 | ×0,53 |
+
+À titre indicatif, hors règle :
+- une variante favorable (travail du reste × 1,2, qmv-T u6 pour la tête,
+  union des experts au facteur 3,29 sur toute la brique MoE) donne ρ(4) =
+  2,08, soit ×1,09 pour D complet et ×1,08 pour les deux en code ;
+- même avec une acceptation inchangée sous sous-vocabulaire (n = 3,20), les
+  deux options combinées donnent ×1,09 en réaliste et ×1,42 dans cette
+  variante.
 
 ### Décision
 
-Aucune option ne dépasse ×1,2 dans l'hypothèse réaliste : **D s'arrête**.
+Aucune option ne dépasse ×1,2 en code à profondeur 3 dans l'hypothèse
+réaliste : **D s'arrête**, selon la règle fixée avant la mesure. La mention
+« opt-in seulement » ne s'applique pas, aucune option ne passant en code.
 
-- Pour atteindre ×1,2 avec les deux options, il faudrait un ρ(4) ≤ 2,39. Cela
-  suppose d'écrire l'union MoE en lignes, un argmax de tête qmv-T u6 exact, le
-  scan l2/σ en lignes, et la QSA et les hyper-connections en lignes. Même
-  ainsi, le modèle s'arrête à ×1,18–1,21 en code et reste sous ×1 en prose.
-- Le MoE domine : 512 experts top-10, avec seulement 30 % de chevauchement
-  entre jetons consécutifs. Une vérification de R lignes y relit presque
-  R fois les experts.
+- Le MoE domine : en lignes, il coûte ×3,84 à R = 4 avec le kernel exact
+  existant, et l'union des experts ne ramènerait que vers ×3,3, car seuls
+  30 % des experts sont partagés entre jetons consécutifs.
+- L'argmax de tête relit le `lm_head` par ligne (×3,86).
+- Le reste DeltaNet in situ, 0,89 ms par pas, est séquentiel.
+- Le draft sur sous-vocabulaire perd plus en acceptation (3,19 → 2,41 jetons
+  par cycle en code) qu'il ne gagne sur le pas MTP. Le corpus distinct n'a
+  fourni que 5 623 jetons ; un corpus plus large réduirait cette perte sans
+  dépasser le cas d'une acceptation inchangée (×1,09).
 - C reste en place comme base exacte. Le spéculatif reste désactivé par défaut
-  sur Flash-Next.
+  sur Flash-Next et n'est atteint par aucun point d'entrée (`serve`, `run`,
+  CLI).
 
 ## Reproduire
 
@@ -442,9 +476,12 @@ cargo test --release --features metal,devtools --lib -- --ignored --nocapture \
   $T::bench_speculative_mono_vs_ar
 cargo test --release --features metal,devtools --lib -- --ignored --nocapture \
   $T::profile_rows_matmuls_flash_next_shapes
+cargo test --release --features metal,devtools --lib -- --ignored --nocapture \
+  $T::measure_subvocab_draft_acceptance
+python -I tools/flashnext/expert_overlap.py …/n2_golden_v3/long.safetensors
 SARAGOSSA_FLASH_NEXT_PROFILE=1 SARAGOSSA_RUST_DECODE_PROFILE=1 \
   cargo test --release --features metal,devtools --lib -- --ignored --nocapture \
-  $T::profile_resident_decode_after_1k_context
+  $T::profile_resident_decode_after_1k_context   # briques, reste, in situ
 ```
 
 Les tests GPU tournent seuls sur la machine ; aucune mesure de débit n'est
