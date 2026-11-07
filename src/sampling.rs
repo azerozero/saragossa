@@ -223,7 +223,7 @@ pub fn token_distribution_top_k_top_p(
 
     // Ordre total (probabilité décroissante, puis indice) : les `top_k` premiers
     // sont uniques, donc la sélection partielle puis le tri des seuls élus rend
-    // exactement le tri complet tronqué, en O(V) au lieu de O(V log V) sur 248k.
+    // exactement le tri complet tronqué, en O(V + k log k) au lieu de O(V log V).
     let by_rank = |(left_idx, left): &(usize, f32), (right_idx, right): &(usize, f32)| {
         right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
     };
@@ -539,6 +539,9 @@ mod tests {
             });
             indexed.truncate(top_k);
             let top_sum = indexed.iter().map(|(_, prob)| *prob).sum::<f32>();
+            if top_sum <= f32::EPSILON {
+                return vec![(argmax(logits).expect("invariant: logits non vides"), 1.0)];
+            }
             let mut nucleus = Vec::new();
             let mut cumulative = 0.0_f32;
             for (rank, item) in indexed.into_iter().enumerate() {
@@ -552,26 +555,36 @@ mod tests {
             normalize_distribution(nucleus, logits).expect("invariant: nucleus non vide")
         }
         let mut sampler = DeterministicSampler::new(11);
-        for case in 0..40 {
-            let len = [3, 20, 21, 257, 4096][case % 5];
-            // Ex aequo fréquents (logits quantifiés) pour exercer le départage par indice.
-            let logits: Vec<f32> = (0..len)
-                .map(|_| (sampler.next_unit_f32() * 16.0).floor() - 8.0)
-                .collect();
-            for &(top_k, top_p) in &[
-                (1, 1.0),
-                (20, 1.0),
-                (20, 0.8),
-                (len - 1, 0.95),
-                (len.min(64), 0.5),
-            ] {
-                // top_k ≥ V prend le chemin sans troncature, hors du champ de ce test.
-                if top_k >= len {
-                    continue;
-                }
-                let fast = token_distribution_top_k_top_p(&logits, 0.7, top_p, top_k)
+        let mut cases: Vec<Vec<f32>> = (0..40)
+            .map(|case| {
+                let len = [3, 20, 21, 257, 4096][case % 5];
+                // Ex aequo fréquents (logits quantifiés) pour exercer le départage par indice.
+                (0..len)
+                    .map(|_| (sampler.next_unit_f32() * 16.0).floor() - 8.0)
+                    .collect()
+            })
+            .collect();
+        // Égalité totale, `-inf` partiels et masse concentrée sur un token. Le
+        // repli `top_sum <= EPSILON` reste inatteignable (top_sum ≥ 1/V) ; la
+        // référence le recopie pour rester fidèle à l'ancien chemin.
+        cases.push(vec![0.0; 21]);
+        cases.push(vec![1.0, f32::NEG_INFINITY, 1.0, f32::NEG_INFINITY, 0.5]);
+        let mut crushed = vec![0.0_f32; 300];
+        crushed[299] = 200.0;
+        cases.push(crushed);
+        for logits in &cases {
+            let len = logits.len();
+            // Tous les k sur les petits vocabulaires, une grille sinon ; top_k ≥ V
+            // prend le chemin sans troncature, hors du champ de ce test.
+            let ks: Vec<usize> = if len <= 21 {
+                (1..len).collect()
+            } else {
+                vec![1, 20, len.min(64), len - 1]
+            };
+            for (top_k, top_p) in ks.into_iter().flat_map(|k| [(k, 1.0), (k, 0.8), (k, 0.5)]) {
+                let fast = token_distribution_top_k_top_p(logits, 0.7, top_p, top_k)
                     .expect("invariant: logits valides");
-                let full = reference(&logits, 0.7, top_p, top_k);
+                let full = reference(logits, 0.7, top_p, top_k);
                 assert_eq!(fast.len(), full.len());
                 for (a, b) in fast.iter().zip(&full) {
                     assert_eq!(a.0, b.0);
