@@ -28,6 +28,8 @@ pub(crate) struct Generation {
     pub(crate) residuals: Vec<Vec<f32>>,
     /// Drafts acceptés par cycle (vide en AR).
     pub(crate) accepted: Vec<usize>,
+    /// Durée de la génération après le prompt (débit publié).
+    pub(crate) decode: std::time::Duration,
 }
 
 /// Remplacement de drafts (oracles) : `(cycle, rang du draft, draft) → draft`.
@@ -63,7 +65,11 @@ pub(crate) fn generate_ar(
         tokens: Vec::new(),
         residuals: Vec::new(),
         accepted: Vec::new(),
+        decode: std::time::Duration::ZERO,
     };
+    // Le pas du dernier jeton du prompt produit le premier jeton : il compte
+    // dans la génération, comme le premier cycle du spéculatif.
+    let started = std::time::Instant::now();
     let mut current = *last;
     while out.tokens.len() < max_tokens {
         let step = session.step(current, false, true)?;
@@ -79,6 +85,7 @@ pub(crate) fn generate_ar(
         }
         current = next;
     }
+    out.decode = started.elapsed();
     Ok(out)
 }
 
@@ -119,8 +126,13 @@ pub(crate) fn generate_speculative(
         tokens: Vec::new(),
         residuals: Vec::new(),
         accepted: Vec::new(),
+        decode: std::time::Duration::ZERO,
     };
+    let mut started = std::time::Instant::now();
     for (j, &token) in prompt.iter().enumerate() {
+        if j + 1 == prompt.len() {
+            started = std::time::Instant::now();
+        }
         if let Some(h) = &h_prev {
             session.mtp_step(MtpInput::Host(h), token, false, false)?;
         }
@@ -207,5 +219,6 @@ pub(crate) fn generate_speculative(
         cycle += 1;
     }
     out.tokens.truncate(max_tokens);
+    out.decode = started.elapsed();
     Ok(out)
 }

@@ -3789,3 +3789,63 @@ fn speculative_greedy_matches_ar_bitwise() {
         started.elapsed().as_secs_f64()
     );
 }
+
+/// Débit du décodage spéculatif en pas mono (étape 6 C), publié sans porte :
+/// sans lignes, une vérification de R lignes coûte R pas du tronc, d'où un
+/// débit attendu sous l'AR. AR et spéculatif (profondeurs 1 à 3) alternés,
+/// 2 répétitions, 256 jetons après un prompt de prose (golden 512) puis de
+/// code (code4k-1, 1024 tokens) ; débit = jetons / durée après le prompt.
+#[test]
+#[ignore = "débit : poids réels, machine libre"]
+fn bench_speculative_mono_vs_ar() {
+    use super::speculative::{generate_ar, generate_speculative};
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("invariant: tokenizer");
+    let code_text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rowsexact/code4k-1.txt"),
+    )
+    .expect("invariant: fixture");
+    let code: Vec<usize> = tokenizer
+        .encode(code_text, false)
+        .expect("invariant: tokenisation")
+        .get_ids()
+        .iter()
+        .take(1024)
+        .map(|&t| t as usize)
+        .collect();
+    let generated = 256;
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        1024 + generated + 4,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    for (label, prompt) in [("prose", ids[..512].to_vec()), ("code", code)] {
+        for repeat in 0..2 {
+            let ar = generate_ar(&mut session, &prompt, generated, &[]).expect("invariant: AR");
+            let ar_rate = ar.tokens.len() as f64 / ar.decode.as_secs_f64();
+            let mut line = format!("{label}, répétition {repeat} : AR {ar_rate:.1} tok/s");
+            for depth in 1..=3 {
+                let spec = generate_speculative(&mut session, &prompt, generated, depth, &[], None)
+                    .expect("invariant: spéculatif");
+                assert_eq!(spec.tokens, ar.tokens, "{label} : jetons");
+                let rate = spec.tokens.len() as f64 / spec.decode.as_secs_f64();
+                let per_cycle = spec.accepted.iter().map(|k| k + 1).sum::<usize>() as f64
+                    / spec.accepted.len().max(1) as f64;
+                line += &format!(
+                    " ; d{depth} {rate:.1} tok/s ({per_cycle:.2} jetons/cycle, ×{:.2})",
+                    rate / ar_rate
+                );
+            }
+            eprintln!("{line}");
+        }
+    }
+}
