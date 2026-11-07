@@ -3288,7 +3288,7 @@ impl CausalDecoder {
             return Ok((cache, final_states, target_hidden));
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        let _ = keep_rows;
+        let _ = (keep_rows, all_rows);
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
         let mut hidden = self.embed_scaled(prompt)?;
