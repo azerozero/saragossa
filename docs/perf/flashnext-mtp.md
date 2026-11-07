@@ -176,7 +176,74 @@ kernels existants.
 - **Chevauchement des experts** entre jetons consécutifs : routage du golden
   long, 48 couches × 4096 positions.
 
+### Hypothèses du modèle, fixées avant la re-mesure
+
+Les relectures ont montré que la première mesure lisait un seul buffer GPU
+pour toutes les « copies » (cache indexé par `weight_id`). Les chiffres des
+sections suivantes sont donc à remplacer. Les définitions ci-dessous ont été
+écrites et commitées **avant** la re-mesure, pour ne pas être ajustées après
+coup. La règle de décision, fixée par avance, ne change pas : D s'arrête si
+aucune option ne dépasse ×1,2 en code à profondeur 3 dans l'hypothèse
+réaliste.
+
+**Formule.** `gain = n / [ρ(R) + m·T_mtp/T_ar + h]`, avec :
+- n les jetons par cycle mesurés en C ;
+- m = d + n − 1 pas MTP par cycle (d drafts, puis n − 1 paires reconstruites),
+  soit n + 2 à profondeur 3 ;
+- h = 0, calé sur C (code d3 : prédit ×0,66, mesuré ×0,665) ;
+- `T_mtp/T_ar` mesuré en temps mural ;
+- ρ(R) = temps GPU des R lignes / temps GPU d'un pas mono, sommés sur les
+  briques du profil.
+
+Décision sur le code à profondeur 3 : n = 3,20, R = 4.
+
+**Hypothèse réaliste** (chaque facteur est mesuré, sauf le travail du reste, qui
+est sans amortissement faute de kernel en lignes) :
+- **matmuls à poids** : ρ(R) strict mesuré par forme, sur des poids distincts
+  lus depuis la DRAM ;
+- **hc Down** : temps mono du split-K de production, multiplié par le ρ(R) du
+  matmul générique de même forme (témoin : il n'existe pas de split-K en
+  lignes) ;
+- **experts routés** : union des experts distincts, chacun lu une fois.
+  Facteur = `Σ_m N_m · ρ_expert(m) / 10`, où :
+  - N_m est la multiplicité mesurée sur le golden long
+    (`tools/flashnext/expert_overlap.py`) : nombre moyen d'experts distincts
+    servant exactement m des R lignes ;
+  - ρ_expert(m) est le ρ strict mesuré d'un même expert lu pour m lignes ;
+  - gate/up et down sont pondérés par leur temps mono ;
+- **argmax de tête** : ρ(R) mesuré du kernel en lignes existant, sur le vrai
+  `lm_head` u6 ;
+- **reste de chaque brique** (hors matmuls à poids) :
+  - la latence d'un dispatch suivi de sa barrière, mesurée sur la copie de
+    10 240 mots, est comptée une fois pour R lignes ;
+  - le travail restant est multiplié par R ;
+- **PLE** : × R, séquentiel.
+
+**Hypothèse optimiste** : comme la réaliste, avec deux exceptions supposées et
+non mesurées :
+- travail du reste × 1,2 ;
+- argmax de tête par un qmv-T u6 exact, à écrire, au ρ(R) du `q_proj`.
+
+**Borne basse** (kernels en lignes idéaux partout) :
+- tout ce qui n'est pas un expert routé est à ρ = 1 : lecture unique et calcul
+  gratuit ;
+- experts routés à `Σ_m N_m / 10`, soit les experts distincts lus une fois.
+
+**Variante** publiée à part, sans entrer dans la décision : le scan DeltaNet
+lit son état une seule fois pour R lignes. L'état fait 36 couches × 48 têtes ×
+128 × 128 × 4 octets = 113 Mo, lus et écrits ; c'est le temps soustrait au
+travail × R.
+
+**Options :**
+- D complet ;
+- draft sur sous-vocabulaire seul : 32k jetons de vocabulaire de draft, le
+  `lm_head` du pas MTP mis à l'échelle 32 000 / 248 320, acceptation supposée
+  inchangée ;
+- les deux.
+
 ### Matmuls à poids
+
+> Chiffres de la première mesure (poids aliasés), à remplacer.
 
 Dernier passage (commit 267728a). Mono à ~550 Go/s. Toutes les lignes sont exactes au bit près, en normal comme
 en strict.
