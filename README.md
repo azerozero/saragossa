@@ -229,7 +229,9 @@ and `max_tokens` / `max_completion_tokens`. Unseeded sampling stays reproducible
   Flint and Gemma 3 have no switch and refuse any explicit value. Any other
   key is refused rather than silently ignored.
 - `stream_options: {"include_usage": true}`: like the OpenAI API, a final
-  chunk with `"choices": []` and `usage` precedes `data: [DONE]`.
+  chunk with `"choices": []` and `usage` precedes `data: [DONE]`; all preceding
+  chunks carry `"usage": null`. Null or empty options are tolerated, including
+  `include_usage: null`; options are ignored for non-streaming requests.
 - `min_p`, `presence_penalty`, `frequency_penalty` and `repetition_penalty`
   are not implemented: only their neutral value (`0`, `0`, `0`, `1`) is
   accepted, anything else returns 501.

@@ -416,6 +416,7 @@ fn flint_finish_reason(finish_reason: &'static str, has_tool_calls: bool) -> &'s
 fn write_flint_events<S: Write>(
     stream: &mut S,
     id: &str,
+    include_usage: bool,
     model: &str,
     events: Vec<FlintEvent>,
 ) -> ServeResult<()> {
@@ -425,7 +426,7 @@ fn write_flint_events<S: Write>(
             FlintEvent::Content(text) => ChatCompletionChunk::content(model, text),
             FlintEvent::ToolCall(call) => ChatCompletionChunk::tool_call(model, call),
         };
-        write_sse_event(stream, &chunk.with_id(id))?;
+        write_sse_event(stream, &chunk.with_id(id).with_usage_option(include_usage))?;
     }
     Ok(())
 }
@@ -489,7 +490,9 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
                 )?;
                 write_sse_event(
                     self.stream,
-                    &ChatCompletionChunk::role(&start.model).with_id(&self.id),
+                    &ChatCompletionChunk::role(&start.model)
+                        .with_id(&self.id)
+                        .with_usage_option(self.include_usage),
                 )?;
             }
             CompletionStreamEvent::Delta(delta) => {
@@ -498,12 +501,19 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
                 }
                 match self.flint.as_mut() {
                     Some(parser) => {
-                        write_flint_events(self.stream, &self.id, &self.model, parser.push(delta))?;
+                        write_flint_events(
+                            self.stream,
+                            &self.id,
+                            self.include_usage,
+                            &self.model,
+                            parser.push(delta),
+                        )?;
                     }
                     None => write_sse_event(
                         self.stream,
                         &ChatCompletionChunk::content(&self.model, delta.to_string())
-                            .with_id(&self.id),
+                            .with_id(&self.id)
+                            .with_usage_option(self.include_usage),
                     )?,
                 }
             }
@@ -528,12 +538,20 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
         };
         let mut finish_reason = completion.finish_reason;
         if let Some(parser) = self.flint.as_mut() {
-            write_flint_events(self.stream, &self.id, &completion.model, parser.finish())?;
+            write_flint_events(
+                self.stream,
+                &self.id,
+                self.include_usage,
+                &completion.model,
+                parser.finish(),
+            )?;
             finish_reason = flint_finish_reason(finish_reason, parser.has_tool_calls());
         }
         write_sse_event(
             self.stream,
-            &ChatCompletionChunk::done(&completion.model, finish_reason).with_id(&self.id),
+            &ChatCompletionChunk::done(&completion.model, finish_reason)
+                .with_id(&self.id)
+                .with_usage_option(self.include_usage),
         )?;
         if self.include_usage {
             write_sse_event(
@@ -1290,11 +1308,26 @@ mod tests {
         };
         let frames = |include_usage: bool| -> Vec<serde_json::Value> {
             let mut bytes = Vec::new();
-            OpenAiSse::new(&mut bytes, None, include_usage)
-                .finish(Ok(completion()))
+            let mut sink = OpenAiSse::new(&mut bytes, None, include_usage);
+            let start = super::super::streaming::StreamingCompletionStart {
+                model: "m".into(),
+                prompt_tokens: 7,
+                reused_prefix_tokens: 0,
+                prefill: Duration::ZERO,
+            };
+            sink.event(CompletionStreamEvent::Start(&start))
+                .expect("invariant: début HTTP en mémoire");
+            sink.event(CompletionStreamEvent::Delta("ok"))
+                .expect("invariant: delta en mémoire");
+            sink.finish(Ok(completion()))
                 .expect("invariant: écriture en mémoire");
-            String::from_utf8(bytes)
-                .expect("invariant: SSE UTF-8")
+            let response = String::from_utf8(bytes).expect("invariant: SSE UTF-8");
+            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(response.ends_with("data: [DONE]\n\n"));
+            response
+                .split_once("\r\n\r\n")
+                .expect("invariant: corps HTTP")
+                .1
                 .split("\n\n")
                 .filter_map(|frame| frame.strip_prefix("data: "))
                 .filter(|data| *data != "[DONE]")
@@ -1303,13 +1336,55 @@ mod tests {
         };
 
         let with_usage = frames(true);
-        assert_eq!(with_usage.len(), 2);
-        assert_eq!(with_usage[0]["choices"][0]["finish_reason"], "stop");
-        assert!(with_usage[0].get("usage").is_none());
-        assert_eq!(with_usage[1]["choices"], serde_json::json!([]));
-        assert_eq!(with_usage[1]["usage"]["prompt_tokens"], 7);
-        assert_eq!(with_usage[1]["usage"]["completion_tokens"], 3);
-        assert_eq!(with_usage[0]["id"], with_usage[1]["id"]);
-        assert_eq!(frames(false).len(), 1);
+        assert_eq!(with_usage.len(), 4);
+        assert_eq!(with_usage[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(with_usage[1]["choices"][0]["delta"]["content"], "ok");
+        assert_eq!(with_usage[2]["choices"][0]["finish_reason"], "stop");
+        for chunk in &with_usage[..3] {
+            assert_eq!(chunk.get("usage"), Some(&serde_json::Value::Null));
+            assert_eq!(chunk["id"], with_usage[3]["id"]);
+        }
+        assert_eq!(with_usage[3]["choices"], serde_json::json!([]));
+        assert_eq!(with_usage[3]["usage"]["prompt_tokens"], 7);
+        assert_eq!(with_usage[3]["usage"]["completion_tokens"], 3);
+        assert_eq!(frames(false).len(), 3);
+        for chunk in [
+            ChatCompletionChunk::role("m"),
+            ChatCompletionChunk::content("m", "ok".into()),
+            ChatCompletionChunk::reasoning("m", "r".into()),
+        ] {
+            let value = serde_json::to_value(chunk.with_usage_option(true))
+                .expect("invariant: chunk sérialisable");
+            assert_eq!(value.get("usage"), Some(&serde_json::Value::Null));
+        }
+        let non_stream: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[],"stream_options":{"include_usage":"ignored"}}"#,
+        )
+        .expect("invariant: options non streamées ignorées");
+        assert!(non_stream.validate(1024).is_ok());
+        assert!(!non_stream.include_usage());
+        for (options, expected) in [
+            ("", false),
+            (r#", "stream_options": null"#, false),
+            (r#", "stream_options": {}"#, false),
+            (r#", "stream_options": {"include_usage": null}"#, false),
+            (r#", "stream_options": {"include_usage": true}"#, true),
+            (r#", "stream_options": {"include_usage": false}"#, false),
+        ] {
+            for stream in [false, true] {
+                let http = post(
+                    "/v1/chat/completions",
+                    &format!(r#"{{"model":"m","messages":[],"stream":{stream}{options}}}"#),
+                );
+                let request = ChatCompletionRequest::parse(&http.body)
+                    .expect("invariant: options tolérées sur HTTP");
+                assert!(request.validate(1024).is_ok());
+                let chunks = frames(request.include_usage());
+                assert_eq!(chunks.len(), if stream && expected { 4 } else { 3 });
+                for chunk in &chunks[..3] {
+                    assert_eq!(chunk.get("usage").is_some(), stream && expected);
+                }
+            }
+        }
     }
 }

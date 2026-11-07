@@ -63,7 +63,7 @@ pub(super) struct ChatCompletionRequest {
     pub(super) chat_template_kwargs: Option<serde_json::Map<String, Value>>,
     /// Options du flux SSE (`stream_options` OpenAI).
     #[serde(default)]
-    pub(super) stream_options: Option<StreamOptions>,
+    pub(super) stream_options: Option<Value>,
     /// Filtre min-p : non implémenté, seule la valeur neutre 0 est admise.
     #[serde(default)]
     pub(super) min_p: Option<f32>,
@@ -77,14 +77,6 @@ pub(super) struct ChatCompletionRequest {
     /// seulement.
     #[serde(default)]
     pub(super) repetition_penalty: Option<f32>,
-}
-
-/// `stream_options` OpenAI.
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-pub(super) struct StreamOptions {
-    /// Ajoute avant `[DONE]` un chunk `choices: []` qui porte l'usage.
-    #[serde(default)]
-    pub(super) include_usage: bool,
 }
 
 /// Outil déclaré par la requête, lu une seule fois.
@@ -147,6 +139,21 @@ impl ChatCompletionRequest {
         self.response_format_mode()?;
         self.enable_thinking()?;
         self.reject_unsupported_sampling()?;
+        if self.stream {
+            if let Some(options) = &self.stream_options {
+                if !options.is_object() {
+                    return Err(ServeError::Http("stream_options doit être un objet".into()));
+                }
+                if options
+                    .get("include_usage")
+                    .is_some_and(|v| !v.is_null() && !v.is_boolean())
+                {
+                    return Err(ServeError::Http(
+                        "stream_options.include_usage doit être un booléen ou null".into(),
+                    ));
+                }
+            }
+        }
         // Un tableau de chaînes vides pèse ~12× son JSON une fois désérialisé :
         // bornées, les stops ne peuvent plus amplifier la mémoire des requêtes.
         let stops = self.stop_texts();
@@ -247,8 +254,13 @@ impl ChatCompletionRequest {
 
     /// Le flux SSE se termine-t-il par un chunk d'usage ?
     pub(super) fn include_usage(&self) -> bool {
-        self.stream_options
-            .is_some_and(|options| options.include_usage)
+        self.stream
+            && self
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.get("include_usage"))
+                .and_then(Value::as_bool)
+                == Some(true)
     }
 
     /// Appels d'outils multiples autorisés ?
@@ -601,7 +613,7 @@ pub(super) struct ChatCompletionChunk {
     model: String,
     choices: Vec<ChatChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<Usage>,
+    usage: Option<Option<Usage>>,
 }
 
 impl ChatCompletionChunk {
@@ -616,6 +628,14 @@ impl ChatCompletionChunk {
         self
     }
 
+    /// Inclut `usage: null` sur les chunks intermédiaires lorsque demandé.
+    pub(super) fn with_usage_option(mut self, include_usage: bool) -> Self {
+        if include_usage && self.usage.is_none() {
+            self.usage = Some(None);
+        }
+        self
+    }
+
     /// Construit le chunk d'usage final (`stream_options.include_usage`).
     pub(super) fn usage(model: &str, usage: Usage) -> Self {
         Self {
@@ -624,7 +644,7 @@ impl ChatCompletionChunk {
             created: created_now(),
             model: model.to_string(),
             choices: Vec::new(),
-            usage: Some(usage),
+            usage: Some(Some(usage)),
         }
     }
 
