@@ -1400,6 +1400,24 @@ impl FlashNextSession {
         self.position
     }
 
+    /// Exécuteur, kernels, lm_head et largeur cachée (profil en lignes).
+    #[cfg(all(test, feature = "devtools"))]
+    pub(crate) fn head_parts(
+        &self,
+    ) -> (
+        &MetalExecutor,
+        &FlashNextKernels,
+        &crate::metal_backend::MetalLinearWeightBuffers,
+        usize,
+    ) {
+        (
+            &self.executor,
+            &self.kernels,
+            &self.weights.lm_head,
+            self.ckpt.config.hidden,
+        )
+    }
+
     /// Largeur du résiduel hc (oracles).
     #[cfg(test)]
     pub(crate) fn hc_width(&self) -> usize {

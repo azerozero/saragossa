@@ -1984,13 +1984,135 @@ fn profile_resident_decode_after_1k_context() {
     eprintln!("profil après {context} tokens, {generated} pas : {wall:.2} ms/pas mural (profilé), GPU {gpu:.2} ms, {dispatches:.0} dispatches/pas");
     for row in rows {
         eprintln!(
-            "  {:24} {:7.3} ms/pas  {:5.1} %  {:5.1} encodeurs/pas",
+            "  {:24} {:7.3} ms/pas  {:5.1} %  {:5.1} encodeurs/pas  {:6.0} dispatches/pas",
             row.brick.label(),
             row.ms_per_step,
             100.0 * row.ms_per_step / gpu,
-            row.encoders_per_step
+            row.encoders_per_step,
+            row.dispatches_per_step
         );
     }
+    profile_rows_rest(&session).expect("invariant: profil du reste");
+}
+
+/// Étape 6 D, reste du pas hors matmuls : latence d'un dispatch suivi d'une
+/// barrière (part amortie par un kernel en lignes, qui garde un dispatch pour
+/// R lignes), et argmax de tête en lignes sur le vrai lm_head u6, contre R
+/// argmax mono (ρ et égalité des indices). Chaque mesure : chauffe, puis
+/// minimum de 3 command buffers.
+#[cfg(feature = "devtools")]
+fn profile_rows_rest(session: &FlashNextSession) -> Result<()> {
+    let (executor, kernels, lm_head, hidden) = session.head_parts();
+    let queue = executor.device().new_command_queue();
+    let best_of = |encode: &dyn Fn(&metal::ComputeCommandEncoderRef) -> Result<()>| -> Result<f64> {
+        let mut best = f64::INFINITY;
+        for round in 0..4 {
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encode(encoder)?;
+            encoder.end_encoding();
+            let started = std::time::Instant::now();
+            commit_and_wait(command_buffer)?;
+            if round > 0 {
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+        }
+        Ok(best)
+    };
+    // Latence d'un petit dispatch (copie de 1 à 10 240 mots) et de sa barrière.
+    let source = zeros(executor, 4 * 10_240);
+    let target = zeros(executor, 4 * 10_240);
+    let count = 2000;
+    for len in [1_usize, 10_240, 4 * 10_240] {
+        let elapsed = best_of(&|encoder| {
+            for _ in 0..count {
+                encoder.set_compute_pipeline_state(&kernels.copy_u32);
+                encoder.set_buffer(0, Some(&source), 0);
+                encoder.set_buffer(1, Some(&target), 0);
+                super::set_value(encoder, 2, &[len as u32, 0]);
+                super::dispatch_1d(encoder, len);
+                crate::metal_backend::post_dispatch_barrier(encoder);
+            }
+            Ok(())
+        })?;
+        eprintln!(
+            "dispatch + barrière, copie de {len} mots : {:.2} µs",
+            elapsed * 1e6 / count as f64
+        );
+    }
+    // Argmax de tête : R mono contre une passe en lignes.
+    let mut rng = DeterministicF32::new(0x6e);
+    let input = buffer(executor, &rng.fill(4 * hidden, -1.0, 1.0));
+    let rows_in: Vec<_> = (0..4)
+        .map(|r| -> Result<Buffer> {
+            let row = zeros(executor, hidden);
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            executor.encode_copy_with_offsets(
+                encoder,
+                &input,
+                (r * hidden * 4) as u64,
+                &row,
+                0,
+                hidden,
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command_buffer)?;
+            Ok(row)
+        })
+        .collect::<Result<_>>()?;
+    let indices = zeros(executor, 4);
+    let singles: Vec<_> = (0..4).map(|_| zeros(executor, 1)).collect();
+    let mono = best_of(&|encoder| {
+        let mut owned = Vec::new();
+        executor.encode_lm_head_argmax_buffers(
+            encoder,
+            &mut owned,
+            &rows_in[0],
+            lm_head,
+            &singles[0],
+            hidden,
+        )
+    })?;
+    let mut line = format!("argmax de tête (u6 réel) : mono {:.2} ms", mono * 1e3);
+    for rows in 2..=4 {
+        let batched = best_of(&|encoder| {
+            executor.encode_lm_head_argmax_rows_buffers(
+                encoder, &input, lm_head, &indices, 0, 0, rows, hidden,
+            )
+        })?;
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let mut owned = Vec::new();
+        for r in 0..rows {
+            executor.encode_lm_head_argmax_buffers(
+                encoder,
+                &mut owned,
+                &rows_in[r],
+                lm_head,
+                &singles[r],
+                hidden,
+            )?;
+        }
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        let all = crate::metal_backend::read_u32_buffer(&indices, rows)?;
+        let mut same = true;
+        for (r, single) in singles.iter().take(rows).enumerate() {
+            same &= crate::metal_backend::read_u32_buffer(single, 1)?[0] == all[r];
+        }
+        line += &format!(
+            " ; R{rows} ρ {:.2}{}",
+            batched / mono,
+            if same {
+                " mêmes indices"
+            } else {
+                " indices DIFFÉRENTS"
+            }
+        );
+    }
+    eprintln!("{line}");
+    Ok(())
 }
 
 /// Micro-bench des morceaux d'une hyper-connection aux formes réelles
@@ -4071,7 +4193,8 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
     };
     let queue = executor.device().new_command_queue();
     // (nom, sorties, entrées, bits, nombre par pas de tronc)
-    let shapes: [(&str, usize, usize, usize, usize); 10] = [
+    // bits 32 : poids dense f32, témoin (2× les octets) des linéaires bf16.
+    let shapes: [(&str, usize, usize, usize, usize); 15] = [
         ("attention q_proj (q + gate)", 12288, 2560, 8, 12),
         ("attention k/v_proj", 512, 2560, 8, 24),
         ("attention o_proj", 2560, 6144, 8, 12),
@@ -4082,6 +4205,11 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
         ("expert gate/up (u4)", 640, 2560, 4, 960),
         ("expert down (u4)", 2560, 640, 4, 480),
         ("expert partagé gate/up", 640, 2560, 8, 96),
+        ("expert partagé down", 2560, 640, 8, 48),
+        ("hc Down (split-K en mono)", 320, 10240, 8, 97),
+        ("indexeur index_qk_proj", 640, 2560, 8, 12),
+        ("routeur MoE (bf16)", 512, 2560, 32, 48),
+        ("DeltaNet in_proj_a/b (bf16)", 48, 2560, 32, 72),
     ];
     let run = |copies: usize,
                encode: &dyn Fn(&metal::ComputeCommandEncoderRef, usize) -> Result<()>|
@@ -4098,16 +4226,18 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
     };
     for (name, out_dim, in_dim, bits, per_step) in shapes {
         let mut rng = DeterministicF32::new(0x6d + out_dim as u64);
-        let quantized = affine_quantized(&mut rng, out_dim, in_dim, 0.05, bits)?;
+        let linear = if bits == 32 {
+            LinearWeight::Dense(Tensor::from_vec(
+                vec![out_dim, in_dim],
+                rng.fill(out_dim * in_dim, -0.05, 0.05),
+            )?)
+        } else {
+            LinearWeight::AffineQuantized(affine_quantized(&mut rng, out_dim, in_dim, 0.05, bits)?)
+        };
         let bytes = out_dim * in_dim * bits / 8;
         let copies = (512_usize << 20).div_ceil(bytes).clamp(4, 512);
         let weights = (0..copies)
-            .map(|_| {
-                executor.resolve_linear_weight_buffers(
-                    &LinearWeight::AffineQuantized(quantized.clone()),
-                    "flash_next_profile",
-                )
-            })
+            .map(|_| executor.resolve_linear_weight_buffers(&linear, "flash_next_profile"))
             .collect::<Result<Vec<_>>>()?;
         let weight = &weights[0];
         let x = rng.fill(4 * in_dim, -1.0, 1.0);
