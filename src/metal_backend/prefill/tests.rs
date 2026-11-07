@@ -865,10 +865,15 @@ fn prefill_resident_uses_layer_specific_attention_dimensions() -> Result<()> {
         &layers,
         base,
         &[0, 1],
+        usize::MAX,
         0,
         false,
     )?;
-    let captures = captures.ok_or_else(|| InferError::Config("captures absentes".to_string()))?;
+    let PrefillCaptures {
+        from,
+        hidden: captures,
+    } = captures.ok_or_else(|| InferError::Config("captures absentes".to_string()))?;
+    assert_eq!(from, 0);
     assert_eq!(captures.shape(), &[SEQ, 2 * HIDDEN]);
     for row in 0..SEQ {
         let line = captures.row_slice(row)?;
@@ -1262,6 +1267,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     &layers,
                     spec,
                     &[0],
+                    usize::MAX,
                     chunk_tokens,
                     last_row_only,
                 )?;
@@ -1271,6 +1277,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     &layers,
                     spec,
                     &[0],
+                    usize::MAX,
                     chunk_tokens,
                     last_row_only,
                 )?;
@@ -1283,7 +1290,12 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             let (Some(actual), Some(expected)) = (actual_captures, expected_captures) else {
                 panic!("captures manquantes en entrée par jetons");
             };
-            assert_bit_exact(&actual, &expected, "entrée par jetons captures");
+            assert_eq!(actual.from, expected.from);
+            assert_bit_exact(
+                &actual.hidden,
+                &expected.hidden,
+                "entrée par jetons captures",
+            );
         }
         const PREFIX_ROWS: usize = 700;
         let prefix_spec = PrefillAttentionSpec {
@@ -1329,6 +1341,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 &layers,
                 spec,
                 &[],
+                usize::MAX,
                 // Suffixe de 400 lignes en quatre morceaux décalés.
                 128,
                 Some(&prefix),
@@ -1352,6 +1365,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             &layers,
             spec,
             &[0],
+            usize::MAX,
             0,
             false,
         )?;
@@ -1362,6 +1376,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             &layers,
             spec,
             &[0],
+            usize::MAX,
             512,
             false,
         )?;
@@ -1372,6 +1387,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
         &layers,
         spec,
         &[0],
+        usize::MAX,
         512,
         true,
     )?;
@@ -1388,6 +1404,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 &layers,
                 spec,
                 &[0],
+                usize::MAX,
                 512,
                 false,
             )?;
@@ -1397,6 +1414,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 &layers,
                 spec,
                 &[0],
+                usize::MAX,
                 512,
                 true,
             )?;
@@ -1412,7 +1430,8 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             "miroir bf16 dernière ligne",
         );
         if let (Some(a), Some(b)) = (mirrored_captures.as_ref(), chunked_captures.as_ref()) {
-            assert_bit_exact(a, b, "miroir bf16 capture");
+            assert_eq!(a.from, b.from);
+            assert_bit_exact(&a.hidden, &b.hidden, "miroir bf16 capture");
         }
         assert_full_kv_bit_exact(&mirrored_caches, &chunked_caches, "miroir bf16 K/V")?;
         assert_full_kv_bit_exact(
@@ -1431,6 +1450,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     &layers,
                     spec,
                     &[0],
+                    usize::MAX,
                     512,
                     last_row_only,
                 )?;
@@ -1440,7 +1460,8 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 "K/V bf16 stocké sortie",
             );
             if let (Some(a), Some(b)) = (stored_captures.as_ref(), chunked_captures.as_ref()) {
-                assert_bit_exact(a, b, "K/V bf16 stocké capture");
+                assert_eq!(a.from, b.from);
+                assert_bit_exact(&a.hidden, &b.hidden, "K/V bf16 stocké capture");
             }
             assert_full_kv_bf16_of(&stored_caches, expected_caches, "K/V bf16 stocké")?;
         }
@@ -1468,6 +1489,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                         &layers,
                         spec,
                         &[],
+                        usize::MAX,
                         512,
                         false,
                     )
@@ -1489,6 +1511,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             &layers,
             spec,
             &[0],
+            usize::MAX,
             512,
             false,
         )?;
@@ -1535,8 +1558,8 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
         return Err(InferError::Config("captures absentes".to_string()));
     };
     assert_close(
-        &chunked_captures,
-        &single_captures,
+        &chunked_captures.hidden,
+        &single_captures.hidden,
         1.0e-4,
         "prefill par morceaux capture",
     );
@@ -1623,6 +1646,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 &make_layers(prefix_spec),
                 prefix_spec,
                 &[],
+                usize::MAX,
                 512,
                 None,
                 false,
@@ -1673,6 +1697,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 &layers,
                 spec,
                 &[],
+                usize::MAX,
                 512,
                 Some(&prefix),
                 false,
@@ -2027,6 +2052,7 @@ fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
                 &layers_of(seq),
                 spec_of(seq),
                 &[],
+                usize::MAX,
                 512,
                 None,
                 false,
@@ -2065,6 +2091,7 @@ fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
             &layers_of(to),
             spec_of(to),
             &[],
+            usize::MAX,
             512,
             Some(&prefix),
             false,
@@ -2211,5 +2238,154 @@ fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
     assert_eq!(placement, PrefillKvPlacement::Appended, "préfixe f32");
     assert!(matches!(crossed.0, PrefillKvRows::OwnedBf16(_)));
     executor.prefill_kv_bf16_store_min_rows = None;
+    Ok(())
+}
+
+/// Même trajectoire GPU et mêmes morceaux : seule la plage des copies change.
+#[test]
+#[ignore = "GPU Metal requis"]
+fn prefill_resident_capture_tail_matches_full() -> Result<()> {
+    // Les timestamps forcent un seul morceau, ce qui invaliderait cet oracle.
+    if crate::runtime_flags::gpu_timestamps_enabled() {
+        eprintln!("prefill_resident_capture_tail_matches_full ignoré : timestamps GPU actifs");
+        return Ok(());
+    }
+    let executor = MetalExecutor::new()?;
+    const SEQ: usize = 19;
+    const HIDDEN: usize = 32;
+    const HEAD: usize = 128;
+    const KEEP: usize = 8;
+    const CHUNK: usize = 8;
+    let input = deterministic_tensor(SEQ, HIDDEN, 601, 0.5)?;
+    let input_norm = deterministic_norm(HIDDEN, 607)?;
+    let post_norm = deterministic_norm(HIDDEN, 613)?;
+    let q_norm = deterministic_norm(HEAD, 617)?;
+    let k_norm = deterministic_norm(HEAD, 619)?;
+    let q = Linear::new(deterministic_tensor(2 * HEAD, HIDDEN, 631, 0.08)?, None)?;
+    let k = Linear::new(deterministic_tensor(HEAD, HIDDEN, 641, 0.07)?, None)?;
+    let v = Linear::new(deterministic_tensor(HEAD, HIDDEN, 643, 0.06)?, None)?;
+    let o = Linear::new(deterministic_tensor(HIDDEN, 2 * HEAD, 647, 0.05)?, None)?;
+    let gate = Linear::new(deterministic_tensor(16, HIDDEN, 653, 0.1)?, None)?;
+    let up = Linear::new(deterministic_tensor(16, HIDDEN, 659, 0.1)?, None)?;
+    let down = Linear::new(deterministic_tensor(HIDDEN, 16, 661, 0.1)?, None)?;
+    let spec = PrefillAttentionSpec {
+        seq: SEQ,
+        hidden_dim: HIDDEN,
+        q_heads: 2,
+        kv_heads: 1,
+        head_dim: HEAD,
+        rope_dims: HEAD,
+        rope_frequency_dim: HEAD,
+        rope_theta: 10_000.0,
+        attn_scalar: HEAD as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    // Les sinks garantissent une attention décalée même sans Steel/NAX.
+    let sinks = Tensor::from_vec(vec![2], vec![0.0_f32, 0.5])?;
+    let make_layers = |spec| {
+        std::array::from_fn::<_, 2, _>(|_| PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Full {
+                q_proj: &q,
+                k_proj: &k,
+                v_proj: &v,
+                o_proj: &o,
+                q_norm: &q_norm,
+                k_norm: &k_norm,
+                gated: false,
+                sinks: Some(&sinks),
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail: PrefillMoeTail::Dense {
+                gate_proj: &gate,
+                up_proj: &up,
+                down_proj: &down,
+            },
+        })
+    };
+    let layers = make_layers(spec);
+    assert!(executor.prefill_resident_extend_supported(&layers));
+    // À froid : 7/7/5 lignes, queue [11, 19), premier morceau hors plage.
+    // Après préfixe de 3 : 8/8 lignes, queue [11, 19) ; KEEP=9 chevauche les deux.
+    for start in [0, 3] {
+        let prefix_input =
+            Tensor::from_vec(vec![start, HIDDEN], input.data()[..start * HIDDEN].to_vec())?;
+        let prefix_spec = PrefillAttentionSpec { seq: start, ..spec };
+        let prefix_caches = if start == 0 {
+            Vec::new()
+        } else {
+            executor
+                .qwen_moe_prefill_resident_with_captures(
+                    PrefillInput::Hidden(&prefix_input),
+                    &make_layers(prefix_spec),
+                    prefix_spec,
+                    &[],
+                    usize::MAX,
+                    CHUNK,
+                    false,
+                )?
+                .1
+        };
+        let prefix = PrefillResidentPrefix {
+            rows: start,
+            layers: prefix_caches
+                .iter()
+                .map(|cache| match cache {
+                    PrefillResidentLayerCache::Full {
+                        key, value, base, ..
+                    } => PrefillResidentPrefixLayer::Full {
+                        key: vec![key.segment()],
+                        value: vec![value.segment()],
+                        base: *base,
+                        in_place: None,
+                    },
+                    PrefillResidentLayerCache::Linear { state } => {
+                        PrefillResidentPrefixLayer::Linear { state }
+                    }
+                })
+                .collect(),
+        };
+        let suffix = Tensor::from_vec(
+            vec![SEQ - start, HIDDEN],
+            input.data()[start * HIDDEN..].to_vec(),
+        )?;
+        let run = |keep| -> Result<PrefillCaptures> {
+            let (_, _, captures) = executor.qwen_moe_prefill_resident_from(
+                PrefillInput::Hidden(&suffix),
+                &layers,
+                spec,
+                &[1, 0],
+                keep,
+                CHUNK,
+                (start > 0).then_some(&prefix),
+                false,
+            )?;
+            captures.ok_or_else(|| InferError::Config("captures absentes".to_string()))
+        };
+        let PrefillCaptures {
+            from: full_from,
+            hidden: full,
+        } = run(usize::MAX)?;
+        assert_eq!(full_from, start);
+        for keep in [KEEP, KEEP + 1, 1, SEQ, usize::MAX] {
+            let PrefillCaptures {
+                from,
+                hidden: bounded,
+            } = run(keep)?;
+            let kept = keep.min(SEQ - start);
+            assert_eq!(from, SEQ - kept);
+            assert_eq!(bounded.shape(), &[kept, 2 * HIDDEN]);
+            let expected = Tensor::from_vec(
+                vec![kept, 2 * HIDDEN],
+                full.data()[(from - full_from) * 2 * HIDDEN..].to_vec(),
+            )?;
+            assert_bit_exact(&bounded, &expected, "queue des captures résidentes");
+        }
+    }
     Ok(())
 }
