@@ -106,6 +106,33 @@ struct VerifyBuffers {
     ring: Vec<Buffer>,
 }
 
+/// Oracles : mutation de la vérification ou de l'acceptation (puissance des
+/// tests de retour arrière).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum VerifyMutation {
+    /// Restaure la capture de la ligne suivante.
+    CaptureNext,
+    /// Oublie la troncature des KV.
+    NoTruncate,
+    /// Garde le contexte n-gram de la ligne précédente.
+    StaleContext,
+    /// Pas PLE engagé décalé d'un cran.
+    PleStepOff,
+    /// Toutes les lignes lisent l'embedding et les octets PLE de la ligne 0.
+    AliasFirstRow,
+    /// Résiduel relu dans le mauvais tampon ping-pong.
+    WrongResidual,
+}
+
+/// Oracles : état observable du tronc (préfixes valides seulement).
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct StateDigest {
+    pub(crate) bits: Vec<u32>,
+    pub(crate) context: NgramContext,
+}
+
 /// Vérification soumise, en attente de [`FlashNextSession::accept`].
 #[cfg_attr(
     not(test),
@@ -275,6 +302,12 @@ pub(crate) struct FlashNextSession {
     /// Oracles : entrée fc du dernier pas MTP.
     #[cfg(test)]
     mtp_input_capture: Buffer,
+    /// Oracles : mutation de vérification active.
+    #[cfg(test)]
+    pub(crate) verify_mutation: Option<VerifyMutation>,
+    /// Oracles : échec d'encodage injecté à la ligne donnée d'une vérification.
+    #[cfg(test)]
+    pub(crate) fail_verify_row: Option<usize>,
     /// Oracles : sélection et scores de l'indexeur par couche du dernier pas
     /// (`[couches, keep]` u32, `[couches, blocs max]` f32).
     #[cfg(test)]
@@ -349,9 +382,13 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
     };
     // Vérification : entrées et sorties par ligne, captures DeltaNet, clés
     // brutes et anneau PLE après chaque ligne sauf la dernière.
-    let verify = VERIFY_ROWS * (2 * width + c.ple_dim.div_ceil(f32_bytes) + 1)
-        + (VERIFY_ROWS - 1)
-            * (deltanet / 2 + full * c.indexer_compress * c.indexer_head_dim + ple - c.ple_dim);
+    let verify = if c.mtp_layers == 1 {
+        VERIFY_ROWS * (2 * width + c.ple_dim.div_ceil(f32_bytes) + 1)
+            + (VERIFY_ROWS - 1)
+                * (deltanet / 2 + full * c.indexer_compress * c.indexer_head_dim + ple - c.ple_dim)
+    } else {
+        0
+    };
     ((kv + deltanet + ple + session + executor + indexer + mtp + verify) * f32_bytes) as u64
 }
 
@@ -627,6 +664,10 @@ impl FlashNextSession {
             #[cfg(test)]
             mtp_input_capture: zeros(&executor, width),
             #[cfg(test)]
+            verify_mutation: None,
+            #[cfg(test)]
+            fail_verify_row: None,
+            #[cfg(test)]
             selection_capture: executor.device().new_buffer(
                 ((c.layer_kinds.len() + 1) * (c.indexer_budget / c.indexer_compress) * 4) as u64,
                 MTLResourceOptions::StorageModeShared,
@@ -650,7 +691,10 @@ impl FlashNextSession {
                 LayerState::Full(_) => Ok(None),
             })
             .collect::<Result<_>>()?;
-        session.verify = Some(session.verify_buffers()?);
+        // Les vérifications ne servent qu'à la spéculation MTP.
+        if session.weights.mtp.is_some() {
+            session.verify = Some(session.verify_buffers()?);
+        }
         Ok(session)
     }
 
@@ -665,16 +709,20 @@ impl FlashNextSession {
         let mut raw = Vec::with_capacity(captures);
         let mut ring = Vec::with_capacity(captures);
         for _ in 0..captures {
+            // Une soumission par ligne de capture (copie groupée des couches).
+            let live: Vec<Option<&LinearAttentionMetalState>> = trunk
+                .iter()
+                .filter_map(|state| match state {
+                    LayerState::Linear(state) => Some(Some(state)),
+                    LayerState::Full(_) => None,
+                })
+                .collect();
             linear.push(
-                trunk
-                    .iter()
-                    .filter_map(|state| match state {
-                        LayerState::Linear(state) => {
-                            Some(self.executor.snapshot_linear_attn_state(state))
-                        }
-                        LayerState::Full(_) => None,
-                    })
-                    .collect::<Result<Vec<_>>>()?,
+                self.executor
+                    .snapshot_linear_attn_states(&live)?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
             );
             raw.push(
                 trunk
@@ -767,25 +815,37 @@ impl FlashNextSession {
         let result = self.verify_with(&buffers, tokens);
         self.verify = Some(buffers);
         let pending = result?;
-        let buffers = self
+        // Les lignes sont engagées sur GPU : une relecture en échec invalide la
+        // session plutôt que de laisser une transaction sans sorties.
+        let out = self
             .verify
             .as_ref()
-            .ok_or_else(|| InferError::Config("tampons de vérification absents".to_string()))?;
-        let out = (0..rows)
-            .map(|r| {
-                Ok(VerifyRow {
-                    argmax: read_u32_buffer(&buffers.index[r], 1)?
-                        .first()
-                        .copied()
-                        .ok_or_else(|| {
-                            InferError::Metal("argmax de vérification absent".to_string())
-                        })?,
-                    residual: read_f32_buffer(&buffers.residual[r], width)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>();
-        self.pending = Some(pending);
-        out
+            .ok_or_else(|| InferError::Config("tampons de vérification absents".to_string()))
+            .and_then(|buffers| {
+                (0..rows)
+                    .map(|r| {
+                        Ok(VerifyRow {
+                            argmax: read_u32_buffer(&buffers.index[r], 1)?
+                                .first()
+                                .copied()
+                                .ok_or_else(|| {
+                                    InferError::Metal("argmax de vérification absent".to_string())
+                                })?,
+                            residual: read_f32_buffer(&buffers.residual[r], width)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            });
+        match out {
+            Ok(rows) => {
+                self.pending = Some(pending);
+                Ok(rows)
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     #[cfg_attr(
@@ -885,10 +945,24 @@ impl FlashNextSession {
         capture: bool,
     ) -> Result<()> {
         let width = self.hc_dims.width();
+        #[cfg(test)]
+        if self.fail_verify_row == Some(r) {
+            return Err(InferError::Metal(format!(
+                "vérification : échec d'encodage injecté à la ligne {r}"
+            )));
+        }
+        #[cfg(test)]
+        let input = if self.verify_mutation == Some(VerifyMutation::AliasFirstRow) {
+            0
+        } else {
+            r
+        };
+        #[cfg(not(test))]
+        let input = r;
         let encoder = encoders.at(Brick::Hc)?;
         self.executor.encode_copy_with_offsets(
             encoder,
-            &buffers.embed[r],
+            &buffers.embed[input],
             0,
             &self.h[0],
             0,
@@ -896,7 +970,7 @@ impl FlashNextSession {
         )?;
         crate::metal_backend::post_dispatch_barrier(encoder);
         let io = TokenIo {
-            ple_bytes: buffers.ple_bytes[r].clone(),
+            ple_bytes: buffers.ple_bytes[input].clone(),
             index: buffers.index[r].clone(),
             residual: Some(buffers.residual[r].clone()),
         };
@@ -959,19 +1033,36 @@ impl FlashNextSession {
         allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
     )]
     pub(crate) fn accept(&mut self, k: usize) -> Result<()> {
+        let rows = self
+            .pending
+            .as_ref()
+            .map(|pending| pending.rows)
+            .ok_or_else(|| InferError::Config("aucune vérification en attente".to_string()))?;
+        if k >= rows {
+            return Err(InferError::Config(format!(
+                "acceptation jusqu'à la ligne {k} sur {rows} vérifiées"
+            )));
+        }
+        if self.verify.is_none() {
+            return Err(InferError::Config(
+                "tampons de vérification absents".to_string(),
+            ));
+        }
         let pending = self
             .pending
             .take()
             .ok_or_else(|| InferError::Config("aucune vérification en attente".to_string()))?;
-        if k >= pending.rows {
-            let rows = pending.rows;
-            self.pending = Some(pending);
-            return Err(InferError::Config(format!(
-                "acceptation de {} lignes sur {rows} vérifiées",
-                k + 1
-            )));
-        }
         let c = &self.ckpt.config;
+        #[cfg(test)]
+        let mutation = self.verify_mutation;
+        #[cfg(test)]
+        let capture = if mutation == Some(VerifyMutation::CaptureNext) && k + 2 < rows {
+            k + 1
+        } else {
+            k
+        };
+        #[cfg(not(test))]
+        let capture = k;
         if k + 1 < pending.rows {
             let buffers = self
                 .verify
@@ -987,7 +1078,7 @@ impl FlashNextSession {
                         linear += 1;
                         self.executor.encode_capture_linear_attn_states(
                             encoder,
-                            &[(&buffers.linear[k][linear - 1], state)],
+                            &[(&buffers.linear[capture][linear - 1], state)],
                         )
                     }
                     LayerState::Full(kv) => {
@@ -995,7 +1086,7 @@ impl FlashNextSession {
                         let len = (kv.1.raw.length() / 4) as usize;
                         self.executor.encode_copy_with_offsets(
                             encoder,
-                            &buffers.raw[k][full - 1],
+                            &buffers.raw[capture][full - 1],
                             0,
                             &kv.1.raw,
                             0,
@@ -1011,7 +1102,7 @@ impl FlashNextSession {
                 let ring = (self.ple_state.ring.length() / 4) as usize;
                 restored = self.executor.encode_copy_with_offsets(
                     encoder,
-                    &buffers.ring[k],
+                    &buffers.ring[capture],
                     0,
                     &self.ple_state.ring,
                     0,
@@ -1025,7 +1116,14 @@ impl FlashNextSession {
                 return Err(error);
             }
             let engaged = pending.position + k + 1;
-            for state in self.states[..c.layer_kinds.len()].iter_mut() {
+            #[cfg(test)]
+            let truncate = mutation != Some(VerifyMutation::NoTruncate);
+            #[cfg(not(test))]
+            let truncate = true;
+            for state in self.states[..c.layer_kinds.len()]
+                .iter_mut()
+                .filter(|_| truncate)
+            {
                 if let LayerState::Full(full) = state {
                     if let Err(error) = full.0.truncate(engaged) {
                         self.poisoned = true;
@@ -1037,7 +1135,49 @@ impl FlashNextSession {
         self.position = pending.position + k + 1;
         self.ple_state.step = pending.ple_step + k + 1;
         self.ple_state.context = pending.contexts[k].clone();
+        #[cfg(test)]
+        match mutation {
+            Some(VerifyMutation::PleStepOff) => self.ple_state.step -= 1,
+            Some(VerifyMutation::StaleContext) if k > 0 => {
+                self.ple_state.context = pending.contexts[k - 1].clone();
+            }
+            _ => {}
+        }
         Ok(())
+    }
+
+    /// Oracles : état observable du tronc, préfixes valides seulement (positions
+    /// engagées) : états DeltaNet, lignes KV `[0, len)`, blocs poolés complets,
+    /// clés brutes du bloc en cours, anneau, pas et contexte PLE.
+    #[cfg(test)]
+    pub(crate) fn state_digest(&self) -> Result<StateDigest> {
+        let c = &self.ckpt.config;
+        let compress = self.indexer_dims.compress;
+        let d = self.indexer_dims.head_dim;
+        let kv_dim = c.kv_heads * c.head_dim;
+        let mut bits = vec![self.position as u32, self.ple_state.step as u32];
+        for state in &self.states[..c.layer_kinds.len()] {
+            match state {
+                LayerState::Linear(state) => bits.extend(state.state_bits()?),
+                LayerState::Full(full) => {
+                    let len = full.0.len();
+                    let (keys, values) = full.0.dense_f32_buffers()?;
+                    bits.push(len as u32);
+                    bits.extend(read_u32_buffer(keys, len * kv_dim)?);
+                    bits.extend(read_u32_buffer(values, len * kv_dim)?);
+                    bits.extend(read_u32_buffer(&full.1.pooled, (len / compress) * d)?);
+                    bits.extend(read_u32_buffer(&full.1.raw, (len % compress) * d)?);
+                }
+            }
+        }
+        bits.extend(read_u32_buffer(
+            &self.ple_state.ring,
+            (self.ple_state.ring.length() / 4) as usize,
+        )?);
+        Ok(StateDigest {
+            bits,
+            context: self.ple_state.context.clone(),
+        })
     }
 
     fn fresh_states(&self, capacity: usize) -> Result<Vec<LayerState>> {
@@ -2117,9 +2257,23 @@ impl FlashNextSession {
             }
         }
         if let Some(residual) = &io.residual {
+            #[cfg(test)]
+            let source = if self.verify_mutation == Some(VerifyMutation::WrongResidual) {
+                1 - cur
+            } else {
+                cur
+            };
+            #[cfg(not(test))]
+            let source = cur;
             let encoder = encoders.at(Brick::Hc)?;
-            self.executor
-                .encode_copy_with_offsets(encoder, &self.h[cur], 0, residual, 0, width)?;
+            self.executor.encode_copy_with_offsets(
+                encoder,
+                &self.h[source],
+                0,
+                residual,
+                0,
+                width,
+            )?;
         }
         if !head {
             return Ok(());

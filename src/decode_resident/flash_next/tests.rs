@@ -3512,12 +3512,17 @@ fn resident_verify_rows_and_accept_match_ar_bitwise() {
                     .step(token, false, false)
                     .expect("invariant: pas AR");
             }
+            let digest = session.state_digest().expect("invariant: état AR");
             let step = session
                 .step(divergent, false, true)
                 .expect("invariant: continuation AR");
-            continuations.push((step.argmax, step.layers.expect("invariant: résiduels")));
+            continuations.push((
+                step.argmax,
+                step.layers.expect("invariant: résiduels"),
+                digest,
+            ));
         }
-        for (k, (argmax, reference)) in continuations.iter().enumerate() {
+        for (k, (argmax, reference, digest)) in continuations.iter().enumerate() {
             session.restore(&base).expect("invariant: reprise");
             let got = session.verify(tokens).expect("invariant: vérification");
             assert!(
@@ -3539,6 +3544,12 @@ fn resident_verify_rows_and_accept_match_ar_bitwise() {
             assert!(session.accept(rows).is_err(), "acceptation hors bornes");
             session.accept(k).expect("invariant: acceptation");
             assert_eq!(session.position(), context + k + 1);
+            // Oracle d'état direct : DeltaNet, préfixes KV et blocs poolés valides,
+            // clés brutes du bloc en cours, anneau, pas et contexte PLE.
+            assert!(
+                session.state_digest().expect("invariant: état") == *digest,
+                "P {context}, k {k} : état après acceptation ≠ AR"
+            );
             let after = session
                 .step(divergent, false, true)
                 .expect("invariant: continuation");
@@ -3549,6 +3560,105 @@ fn resident_verify_rows_and_accept_match_ar_bitwise() {
             }
         }
         eprintln!("vérification P {context} : 4 lignes et k = 0..3 identiques à l'AR");
+        if context != 2047 {
+            continue;
+        }
+        // Mutations (k = 1, P = 2047) : chacune doit écarter l'état ou les
+        // sorties de l'AR.
+        use super::session::VerifyMutation;
+        for mutation in [
+            VerifyMutation::CaptureNext,
+            VerifyMutation::NoTruncate,
+            VerifyMutation::StaleContext,
+            VerifyMutation::PleStepOff,
+            VerifyMutation::AliasFirstRow,
+            VerifyMutation::WrongResidual,
+        ] {
+            session.restore(&base).expect("invariant: reprise");
+            session.verify_mutation = Some(mutation);
+            let got = session
+                .verify(tokens)
+                .expect("invariant: vérification mutée");
+            session.accept(1).expect("invariant: acceptation mutée");
+            session.verify_mutation = None;
+            let rows_differ = got.iter().zip(&want).any(|(row, (argmax, residual))| {
+                row.argmax != *argmax || bits(&row.residual) != bits(residual)
+            });
+            let state_differs =
+                session.state_digest().expect("invariant: état") != continuations[1].2;
+            eprintln!("mutation {mutation:?} : sorties ≠ {rows_differ}, état ≠ {state_differs}");
+            assert!(
+                rows_differ || state_differs,
+                "mutation {mutation:?} non détectée"
+            );
+        }
+        // Échec d'encodage injecté sur la dernière ligne : rien n'est engagé.
+        session.restore(&base).expect("invariant: reprise");
+        let before = session.state_digest().expect("invariant: état");
+        session.fail_verify_row = Some(rows - 1);
+        assert!(session.verify(tokens).is_err(), "échec injecté ignoré");
+        session.fail_verify_row = None;
+        assert!(
+            session.state_digest().expect("invariant: état") == before,
+            "état modifié par une vérification non soumise"
+        );
+        // Refus : pas d'acceptation sans vérification ; pendant une transaction,
+        // ni rejeu, ni pas MTP, ni point de reprise, ni reprise.
+        assert!(session.accept(0).is_err(), "acceptation sans vérification");
+        assert!(
+            session.accept(usize::MAX).is_err(),
+            "acceptation hors bornes"
+        );
+        assert!(session.verify(&[]).is_err(), "vérification vide");
+        assert!(
+            session.verify(&[usize::MAX]).is_err(),
+            "token hors vocabulaire"
+        );
+        assert!(session.verify(&ids[..rows + 1]).is_err(), "trop de lignes");
+        session
+            .verify(&tokens[..2])
+            .expect("invariant: deux lignes");
+        assert!(session.replay(tokens[0]).is_err(), "rejeu en attente");
+        assert!(
+            session.checkpoint(None).is_err(),
+            "point de reprise en attente"
+        );
+        assert!(session.restore(&base).is_err(), "reprise en attente");
+        if session.mtp_rows().is_some() {
+            assert!(
+                session
+                    .mtp_step(
+                        super::session::MtpInput::Host(&want[0].1),
+                        tokens[0],
+                        false,
+                        false
+                    )
+                    .is_err(),
+                "pas MTP en attente"
+            );
+        }
+        session
+            .accept(0)
+            .expect("invariant: acceptation d'une ligne");
+        assert!(
+            session.state_digest().expect("invariant: état") == continuations[0].2,
+            "deux lignes, k = 0 : état ≠ AR"
+        );
+        // Une seule ligne : pas de capture ni de restauration.
+        session.restore(&base).expect("invariant: reprise");
+        let one = session.verify(&tokens[..1]).expect("invariant: une ligne");
+        assert_eq!(one[0].argmax, want[0].0, "une ligne : argmax");
+        session.accept(0).expect("invariant: acceptation");
+        assert!(
+            session.state_digest().expect("invariant: état") == continuations[0].2,
+            "une ligne : état ≠ AR"
+        );
+        // `reset` pendant une transaction la lève et rend la session utilisable.
+        session.verify(tokens).expect("invariant: vérification");
+        session.reset().expect("invariant: reset en attente");
+        session
+            .step(ids[0], false, false)
+            .expect("invariant: pas après reset");
     }
 }
 

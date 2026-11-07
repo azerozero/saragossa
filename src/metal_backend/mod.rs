@@ -741,6 +741,24 @@ pub(crate) struct LinearAttentionMetalState {
     tree: bool,
 }
 
+#[cfg(test)]
+impl LinearAttentionMetalState {
+    /// Oracles : bits de l'état, fenêtre conv puis SSM (bf16 élargi en `u32`).
+    pub(crate) fn state_bits(&self) -> Result<Vec<u32>> {
+        let mut bits = read_u32_buffer(&self.conv, self.conv_len)?;
+        if self.ssm_bf16 {
+            bits.extend(
+                read_u16_buffer(&self.ssm, self.ssm_len)?
+                    .into_iter()
+                    .map(u32::from),
+            );
+        } else {
+            bits.extend(read_u32_buffer(&self.ssm, self.ssm_len)?);
+        }
+        Ok(bits)
+    }
+}
+
 impl LinearAttentionMetalState {
     pub(crate) fn estimated_bytes(&self) -> usize {
         let conv = self.conv_len.saturating_mul(std::mem::size_of::<f32>());
