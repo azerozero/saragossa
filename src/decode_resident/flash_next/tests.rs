@@ -4268,11 +4268,16 @@ fn speculative_greedy_matches_ar_bitwise() {
     let first_drafts = |session: &mut FlashNextSession,
                         prompt: &[usize],
                         mutation: Option<SpecMutation>|
-     -> (Generation, Vec<usize>) {
+     -> (Generation, Vec<Option<usize>>) {
+        // D_1 par cycle : un cycle de fin de budget peut n'avoir aucun draft.
         let seen = std::cell::RefCell::new(Vec::new());
-        let record = |_: usize, _: usize, rank: usize, draft: usize| {
+        let record = |cycle: usize, _: usize, rank: usize, draft: usize| {
             if rank == 0 {
-                seen.borrow_mut().push(draft);
+                let mut seen = seen.borrow_mut();
+                if seen.len() <= cycle {
+                    seen.resize(cycle + 1, None);
+                }
+                seen[cycle] = Some(draft);
             }
             draft
         };
@@ -4295,7 +4300,13 @@ fn speculative_greedy_matches_ar_bitwise() {
         let mut p = prompt.len() - 1;
         let mut mismatches = 0;
         for (c, &k) in spec.accepted.iter().enumerate() {
-            mismatches += usize::from(drafts[c] != reference[p]);
+            mismatches += usize::from(
+                drafts
+                    .get(c)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|draft| draft != reference[p]),
+            );
             p += 1 + k;
         }
         eprintln!(
@@ -4312,7 +4323,13 @@ fn speculative_greedy_matches_ar_bitwise() {
             let mut p = prompt.len() - 1;
             let mut mismatches = 0;
             for (c, &k) in mutated.accepted.iter().enumerate() {
-                mismatches += usize::from(drafts[c] != reference[p]);
+                mismatches += usize::from(
+                    drafts
+                        .get(c)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|draft| draft != reference[p]),
+                );
                 p += 1 + k;
             }
             eprintln!("{label}, mutation {mutation:?} : {mismatches} écarts de D_1");
@@ -4407,8 +4424,11 @@ fn speculative_greedy_matches_ar_bitwise() {
     let mut accepted_stop = None;
     for (c, &k) in spec.accepted.iter().enumerate() {
         let index = emitted + 1;
-        if k >= 1 && spec.tokens.iter().position(|&t| t == drafts[c]) == Some(index) {
-            accepted_stop = Some(drafts[c]);
+        let draft = drafts.get(c).copied().flatten();
+        if let Some(draft) =
+            draft.filter(|&d| k >= 1 && spec.tokens.iter().position(|&t| t == d) == Some(index))
+        {
+            accepted_stop = Some(draft);
             break;
         }
         emitted += 1 + k;
