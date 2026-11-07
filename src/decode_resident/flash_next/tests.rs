@@ -3673,8 +3673,12 @@ fn resident_verify_rows_and_accept_match_ar_bitwise() {
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR, SARAGOSSA_QWEN4EXP_GOLDEN, SARAGOSSA_FLASH_NEXT_CORPUS"]
 fn speculative_greedy_matches_ar_bitwise() {
-    use super::speculative::{generate_ar, generate_speculative, Generation};
+    use super::session::MtpInput;
+    use super::speculative::{
+        generate_ar, generate_speculative, Generation, SpecMutation, SpecOptions,
+    };
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let none = SpecOptions::default();
     let dir = std::path::PathBuf::from(
         std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
     );
@@ -3729,13 +3733,11 @@ fn speculative_greedy_matches_ar_bitwise() {
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
     let same = |label: &str, ar: &Generation, spec: &Generation| {
         assert_eq!(spec.tokens, ar.tokens, "{label} : jetons");
-        // L'AR ne pousse pas le dernier jeton émis ; le spéculatif peut l'avoir
-        // engagé en fin de cycle : au moins autant de résiduels.
-        assert!(
-            spec.residuals.len() >= ar.residuals.len(),
-            "{label} : {} résiduels pour {} en AR",
+        // `residuals[i]` : résiduel de la position qui produit `tokens[i]`.
+        assert_eq!(
             spec.residuals.len(),
-            ar.residuals.len()
+            ar.residuals.len(),
+            "{label} : résiduels"
         );
         for (i, (a, b)) in ar.residuals.iter().zip(&spec.residuals).enumerate() {
             assert_eq!(bits(a), bits(b), "{label} : résiduel {i}");
@@ -3745,7 +3747,7 @@ fn speculative_greedy_matches_ar_bitwise() {
     for (label, prompt) in &prompts {
         let ar = generate_ar(&mut session, prompt, generated, &[]).expect("invariant: AR");
         for depth in 1..=3 {
-            let spec = generate_speculative(&mut session, prompt, generated, depth, &[], None)
+            let spec = generate_speculative(&mut session, prompt, generated, depth, &[], &none)
                 .expect("invariant: spéculatif");
             same(&format!("{label}, profondeur {depth}"), &ar, &spec);
             let cycles = spec.accepted.len().max(1);
@@ -3760,7 +3762,11 @@ fn speculative_greedy_matches_ar_bitwise() {
     let (_, prompt) = &prompts[1];
     let ar = generate_ar(&mut session, prompt, 64, &[]).expect("invariant: AR");
     let wrong = |_: usize, _: usize, draft: usize| (draft + 1) % 1000;
-    let spec = generate_speculative(&mut session, prompt, 64, 3, &[], Some(&wrong))
+    let forced = SpecOptions {
+        overrides: Some(&wrong),
+        ..SpecOptions::default()
+    };
+    let spec = generate_speculative(&mut session, prompt, 64, 3, &[], &forced)
         .expect("invariant: spéculatif forcé");
     same("rejet total", &ar, &spec);
     // Un draft forcé peut retomber par hasard sur la cible : compte publié.
@@ -3773,7 +3779,7 @@ fn speculative_greedy_matches_ar_bitwise() {
     let full = generate_ar(&mut session, prompt, 96, &[]).expect("invariant: AR");
     let stop = [full.tokens[40]];
     let ar = generate_ar(&mut session, prompt, 96, &stop).expect("invariant: AR");
-    let spec = generate_speculative(&mut session, prompt, 96, 3, &stop, None)
+    let spec = generate_speculative(&mut session, prompt, 96, 3, &stop, &none)
         .expect("invariant: spéculatif");
     same("arrêt", &ar, &spec);
     assert!(stop.contains(ar.tokens.last().expect("invariant: jetons")));
@@ -3781,9 +3787,158 @@ fn speculative_greedy_matches_ar_bitwise() {
     let (_, prompt) = &prompts[3];
     let budget = capacity - prompt.len();
     let ar = generate_ar(&mut session, prompt, budget, &[]).expect("invariant: AR");
-    let spec = generate_speculative(&mut session, prompt, budget, 3, &[], None)
+    let spec = generate_speculative(&mut session, prompt, budget, 3, &[], &none)
         .expect("invariant: spéculatif");
     same("capacité", &ar, &spec);
+    assert_eq!(
+        session.mtp_rows(),
+        Some(session.position() - 1),
+        "historique MTP en fin de génération"
+    );
+
+    // Oracle de l'historique MTP : le D_1 de chaque cycle (position p) doit
+    // égaler le draft d'un rejeu séquentiel des paires AR vérifiées
+    // (h_j, x_{j+1}). Une troncature oubliée ou des paires bâties sur un mauvais
+    // résiduel laissent les jetons identiques (le tronc vérifie toujours) mais
+    // changent les drafts.
+    let reference_drafts = |session: &mut FlashNextSession, sequence: &[usize]| -> Vec<usize> {
+        session.reset().expect("invariant: reset");
+        let mut drafts = Vec::with_capacity(sequence.len());
+        for j in 0..sequence.len() - 1 {
+            let row = session
+                .verify(&sequence[j..=j])
+                .expect("invariant: pas de référence");
+            session.accept(0).expect("invariant: acceptation");
+            let step = session
+                .mtp_step(
+                    MtpInput::Host(&row[0].residual),
+                    sequence[j + 1],
+                    false,
+                    false,
+                )
+                .expect("invariant: pas MTP de référence");
+            drafts.push(step.argmax as usize);
+        }
+        drafts
+    };
+    let first_drafts = |session: &mut FlashNextSession,
+                        prompt: &[usize],
+                        mutation: Option<SpecMutation>|
+     -> (Generation, Vec<usize>) {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let record = |_: usize, rank: usize, draft: usize| {
+            if rank == 0 {
+                seen.borrow_mut().push(draft);
+            }
+            draft
+        };
+        let options = SpecOptions {
+            overrides: Some(&record),
+            mutation,
+            ..SpecOptions::default()
+        };
+        let out = generate_speculative(session, prompt, generated, 3, &[], &options)
+            .expect("invariant: spéculatif");
+        (out, seen.into_inner())
+    };
+    for index in [1, 6] {
+        let (label, prompt) = &prompts[index];
+        let (spec, drafts) = first_drafts(&mut session, prompt, None);
+        let mut sequence = prompt.clone();
+        sequence.extend_from_slice(&spec.tokens);
+        let reference = reference_drafts(&mut session, &sequence);
+        // Position p du cycle c : p_0 = |prompt| − 1, p_{c+1} = p_c + 1 + k_c.
+        let mut p = prompt.len() - 1;
+        let mut mismatches = 0;
+        for (c, &k) in spec.accepted.iter().enumerate() {
+            mismatches += usize::from(drafts[c] != reference[p]);
+            p += 1 + k;
+        }
+        eprintln!(
+            "{label} : D_1 de {} cycles contre le rejeu des paires AR, {mismatches} écarts",
+            spec.accepted.len()
+        );
+        assert_eq!(mismatches, 0, "{label} : drafts ≠ historique AR");
+        for mutation in [SpecMutation::NoTruncate, SpecMutation::StaleHistory] {
+            let (mutated, drafts) = first_drafts(&mut session, prompt, Some(mutation));
+            assert_eq!(
+                mutated.tokens, spec.tokens,
+                "{label} : jetons sous {mutation:?}"
+            );
+            let mut p = prompt.len() - 1;
+            let mut mismatches = 0;
+            for (c, &k) in mutated.accepted.iter().enumerate() {
+                mismatches += usize::from(drafts[c] != reference[p]);
+                p += 1 + k;
+            }
+            eprintln!("{label}, mutation {mutation:?} : {mismatches} écarts de D_1");
+            assert!(
+                mismatches > 0,
+                "{label} : mutation {mutation:?} non détectée"
+            );
+        }
+    }
+
+    // Échec d'encodage de la vérification au 3ᵉ cycle, après les drafts :
+    // l'historique MTP revient à ses lignes vérifiées.
+    let (_, prompt) = &prompts[1];
+    let failing = SpecOptions {
+        fail_verify_cycle: Some(3),
+        ..SpecOptions::default()
+    };
+    assert!(generate_speculative(&mut session, prompt, 64, 3, &[], &failing).is_err());
+    assert_eq!(
+        session.mtp_rows(),
+        Some(session.position()),
+        "historique MTP après un échec de vérification"
+    );
+
+    // Draft d'arrêt accepté : jeton d'arrêt = un D_1 accepté dont c'est la
+    // première occurrence dans la sortie.
+    let (spec, drafts) = first_drafts(&mut session, prompt, None);
+    let mut emitted = 0;
+    let mut accepted_stop = None;
+    for (c, &k) in spec.accepted.iter().enumerate() {
+        let index = emitted + 1;
+        if k >= 1 && spec.tokens.iter().position(|&t| t == drafts[c]) == Some(index) {
+            accepted_stop = Some(drafts[c]);
+            break;
+        }
+        emitted += 1 + k;
+    }
+    let stop = [accepted_stop.expect("invariant: un draft accepté en première occurrence")];
+    let ar = generate_ar(&mut session, prompt, generated, &stop).expect("invariant: AR");
+    let spec = generate_speculative(&mut session, prompt, generated, 3, &stop, &none)
+        .expect("invariant: spéculatif");
+    same("draft d'arrêt accepté", &ar, &spec);
+    // Draft d'arrêt rejeté : un jeton jamais émis, imposé comme draft.
+    let full = generate_ar(&mut session, prompt, 64, &[]).expect("invariant: AR");
+    let never = (0..)
+        .find(|t| !full.tokens.contains(t))
+        .expect("invariant: jeton libre");
+    let stop = [never];
+    let reject = |cycle: usize, rank: usize, draft: usize| {
+        if cycle == 2 && rank == 0 {
+            never
+        } else {
+            draft
+        }
+    };
+    let options = SpecOptions {
+        overrides: Some(&reject),
+        ..SpecOptions::default()
+    };
+    let spec = generate_speculative(&mut session, prompt, 64, 3, &stop, &options)
+        .expect("invariant: spéculatif");
+    same("draft d'arrêt rejeté", &full, &spec);
+    // Profondeur nulle (AR pur) et budgets de 0 et 1 jeton.
+    for (depth, budget) in [(0, 32), (3, 0), (3, 1)] {
+        let ar = generate_ar(&mut session, prompt, budget, &[]).expect("invariant: AR");
+        let spec = generate_speculative(&mut session, prompt, budget, depth, &[], &none)
+            .expect("invariant: spéculatif");
+        same(&format!("profondeur {depth}, budget {budget}"), &ar, &spec);
+    }
+    assert!(generate_speculative(&mut session, prompt, 8, usize::MAX, &[], &none).is_err());
     eprintln!(
         "identité spéculative : tout vert en {:.0} s",
         started.elapsed().as_secs_f64()
@@ -3834,8 +3989,15 @@ fn bench_speculative_mono_vs_ar() {
             let ar_rate = ar.tokens.len() as f64 / ar.decode.as_secs_f64();
             let mut line = format!("{label}, répétition {repeat} : AR {ar_rate:.1} tok/s");
             for depth in 1..=3 {
-                let spec = generate_speculative(&mut session, &prompt, generated, depth, &[], None)
-                    .expect("invariant: spéculatif");
+                let spec = generate_speculative(
+                    &mut session,
+                    &prompt,
+                    generated,
+                    depth,
+                    &[],
+                    &super::speculative::SpecOptions::default(),
+                )
+                .expect("invariant: spéculatif");
                 assert_eq!(spec.tokens, ar.tokens, "{label} : jetons");
                 let rate = spec.tokens.len() as f64 / spec.decode.as_secs_f64();
                 let per_cycle = spec.accepted.iter().map(|k| k + 1).sum::<usize>() as f64

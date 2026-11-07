@@ -39,6 +39,33 @@ pub(crate) struct Generation {
 )]
 pub(crate) type DraftOverride<'a> = &'a dyn Fn(usize, usize, usize) -> usize;
 
+/// Oracles : mutation de l'historique MTP (puissance de l'oracle des drafts).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SpecMutation {
+    /// Les lignes des drafts enchaînés ne sont pas retirées.
+    NoTruncate,
+    /// Les paires ajoutées portent le résiduel d'avant le cycle au lieu des
+    /// résiduels vérifiés.
+    StaleHistory,
+}
+
+/// Options d'une génération spéculative.
+#[derive(Default)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "spéculation MTP : serve à venir")
+)]
+pub(crate) struct SpecOptions<'a> {
+    /// Remplacement de drafts (oracles, cas limites).
+    pub(crate) overrides: Option<DraftOverride<'a>>,
+    #[cfg(test)]
+    pub(crate) mutation: Option<SpecMutation>,
+    /// Oracles : échec d'encodage de la vérification injecté au cycle donné.
+    #[cfg(test)]
+    pub(crate) fail_verify_cycle: Option<usize>,
+}
+
 /// AR glouton de référence : `max_tokens` jetons après `prompt`.
 ///
 /// # Errors
@@ -76,8 +103,12 @@ pub(crate) fn generate_ar(
         let layers = step
             .layers
             .ok_or_else(|| InferError::Metal("résiduels AR absents".to_string()))?;
-        out.residuals
-            .push(layers.last().cloned().unwrap_or_default());
+        out.residuals.push(
+            layers
+                .last()
+                .cloned()
+                .ok_or_else(|| InferError::Metal("résiduel AR absent".to_string()))?,
+        );
         let next = step.argmax as usize;
         out.tokens.push(next);
         if stop.contains(&next) {
@@ -106,16 +137,23 @@ pub(crate) fn generate_speculative(
     max_tokens: usize,
     depth: usize,
     stop: &[usize],
-    overrides: Option<DraftOverride<'_>>,
+    options: &SpecOptions<'_>,
 ) -> Result<Generation> {
     if prompt.is_empty() {
         return Err(InferError::Config("prompt vide".to_string()));
     }
-    if depth + 1 > super::session::VERIFY_ROWS {
+    if depth >= super::session::VERIFY_ROWS {
         return Err(InferError::Config(format!(
             "profondeur {depth} au-delà de {} drafts",
             super::session::VERIFY_ROWS - 1
         )));
+    }
+    // Profondeur nulle : AR pur, sans tête MTP.
+    if depth == 0 {
+        return generate_ar(session, prompt, max_tokens, stop);
+    }
+    if session.mtp_rows().is_none() {
+        return Err(InferError::Config("tête MTP absente".to_string()));
     }
     session.reset()?;
     // Prompt : un pas par jeton (vérification d'une ligne : résiduel relu),
@@ -166,28 +204,56 @@ pub(crate) fn generate_speculative(
         let base_rows = session
             .mtp_rows()
             .ok_or_else(|| InferError::Config("tête MTP absente".to_string()))?;
-        // Drafts : D_1 sur la paire vérifiée (h_p, y), puis enchaînés.
+        // Toute erreur après le premier pas MTP du cycle remet l'historique à
+        // ses lignes vérifiées (`clean`) avant de remonter.
+        let mut clean = base_rows;
+        let fail = |session: &mut FlashNextSession, clean: usize, error: InferError| {
+            // La troncature est refusée si la session est invalidée : l'erreur
+            // d'origine prime.
+            let _ = session.mtp_truncate(clean);
+            error
+        };
+        // Drafts : D_1 sur la paire vérifiée (h_p, y), puis enchaînés. Sans
+        // draft possible (capacité, budget), la paire (h_p, y) est ajoutée seule.
         let mut drafts = Vec::with_capacity(d);
-        for i in 0..d {
+        for i in 0..d.max(1) {
             let step = if i == 0 {
-                session.mtp_step(MtpInput::Host(&h), y, false, false)?
+                session.mtp_step(MtpInput::Host(&h), y, false, false)
             } else {
-                let previous = session
-                    .mtp_hidden_buffer()
-                    .cloned()
-                    .ok_or_else(|| InferError::Config("tête MTP absente".to_string()))?;
-                session.mtp_step(MtpInput::Resident(&previous), drafts[i - 1], false, false)?
+                match session.mtp_hidden_buffer().cloned() {
+                    Some(previous) => {
+                        session.mtp_step(MtpInput::Resident(&previous), drafts[i - 1], false, false)
+                    }
+                    None => Err(InferError::Config("tête MTP absente".to_string())),
+                }
             };
-            let draft = step.argmax as usize;
-            drafts.push(overrides.map_or(draft, |f| f(cycle, i, draft)));
-        }
-        if d == 0 {
-            // Pas de draft possible : historique (h_p, y) puis un pas mono.
-            session.mtp_step(MtpInput::Host(&h), y, false, false)?;
+            let step = match step {
+                Ok(step) => step,
+                Err(error) => return Err(fail(session, clean, error)),
+            };
+            if i == 0 {
+                clean = base_rows + 1;
+            }
+            if i < d {
+                let draft = step.argmax as usize;
+                drafts.push(options.overrides.map_or(draft, |f| f(cycle, i, draft)));
+            }
         }
         let mut rows = vec![y];
         rows.extend_from_slice(&drafts);
-        let verified = session.verify(&rows)?;
+        #[cfg(test)]
+        if options.fail_verify_cycle == Some(cycle) {
+            session.fail_verify_row = Some(rows.len() - 1);
+        }
+        let verified = session.verify(&rows);
+        #[cfg(test)]
+        {
+            session.fail_verify_row = None;
+        }
+        let verified = match verified {
+            Ok(verified) => verified,
+            Err(error) => return Err(fail(session, clean, error)),
+        };
         let mut k = 0;
         while k < d && drafts[k] == verified[k].argmax as usize {
             k += 1;
@@ -199,14 +265,23 @@ pub(crate) fn generate_speculative(
         session.accept(k)?;
         // Historique : ligne p (vérifiée) conservée, lignes enchaînées retirées,
         // paires vérifiées (h_{p+1+i}, D_{i+1}) ajoutées.
-        session.mtp_truncate(base_rows + 1)?;
+        #[cfg(test)]
+        let truncate = options.mutation != Some(SpecMutation::NoTruncate);
+        #[cfg(not(test))]
+        let truncate = true;
+        if truncate {
+            session.mtp_truncate(base_rows + 1)?;
+        }
         for i in 0..k {
-            session.mtp_step(
-                MtpInput::Host(&verified[i].residual),
-                drafts[i],
-                false,
-                false,
-            )?;
+            #[cfg(test)]
+            let source = if options.mutation == Some(SpecMutation::StaleHistory) {
+                &h
+            } else {
+                &verified[i].residual
+            };
+            #[cfg(not(test))]
+            let source = &verified[i].residual;
+            session.mtp_step(MtpInput::Host(source), drafts[i], false, false)?;
         }
         out.tokens.push(y);
         out.tokens.extend_from_slice(&drafts[..k]);
@@ -218,7 +293,9 @@ pub(crate) fn generate_speculative(
         h = verified[k].residual.clone();
         cycle += 1;
     }
-    out.tokens.truncate(max_tokens);
+    // Le résiduel d'un jeton en attente jamais émis (fin de budget) est retiré :
+    // `residuals[i]` est celui de la position qui produit `tokens[i]`.
+    out.residuals.truncate(out.tokens.len());
     out.decode = started.elapsed();
     Ok(out)
 }
