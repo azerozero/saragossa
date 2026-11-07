@@ -3551,3 +3551,125 @@ fn resident_verify_rows_and_accept_match_ar_bitwise() {
         eprintln!("vérification P {context} : 4 lignes et k = 0..3 identiques à l'AR");
     }
 }
+
+/// Identité stricte du décodage spéculatif MTP (pas mono) contre l'AR glouton :
+/// 8 prompts réels (golden N2 de 64, 512, 2040 et 3000 tokens, wikitext figé de
+/// 1024 et 2600 tokens, deux fichiers de code tokenisés) × 256 jetons, aux
+/// profondeurs 1, 2 et 3 : mêmes jetons, et mêmes résiduels avant mixer au bit
+/// près sur les positions engagées communes. Le prompt de 2040 tokens traverse
+/// 2047-2052 pendant la génération. Cas limites : drafts forcés faux (rejet
+/// total), jeton d'arrêt rencontré en cours de route, capacité atteinte en fin
+/// de génération. L'acceptation (jetons par cycle) est publiée.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR, SARAGOSSA_QWEN4EXP_GOLDEN, SARAGOSSA_FLASH_NEXT_CORPUS"]
+fn speculative_greedy_matches_ar_bitwise() {
+    use super::speculative::{generate_ar, generate_speculative, Generation};
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let corpus = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
+            .expect("SARAGOSSA_FLASH_NEXT_CORPUS requis"),
+    );
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let wiki: Vec<usize> = std::fs::read(corpus.join("ids.u32"))
+        .expect("invariant: corpus")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+        .collect();
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("invariant: tokenizer");
+    let code = |name: &str, len: usize| -> Vec<usize> {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rowsexact")
+                .join(name),
+        )
+        .expect("invariant: fixture de code");
+        let ids: Vec<usize> = tokenizer
+            .encode(text, false)
+            .expect("invariant: tokenisation")
+            .get_ids()
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+        ids[..len.min(ids.len())].to_vec()
+    };
+    let prompts: Vec<(&str, Vec<usize>)> = vec![
+        ("golden 64", ids[..64].to_vec()),
+        ("golden 512", ids[..512].to_vec()),
+        ("golden 2040", ids[..2040].to_vec()),
+        ("golden 3000", ids[..3000].to_vec()),
+        ("wikitext 1024", wiki[..1024].to_vec()),
+        ("wikitext 2600", wiki[4096..4096 + 2600].to_vec()),
+        ("code4k-1", code("code4k-1.txt", 1024)),
+        ("code4k-2", code("code4k-2.txt", 1500)),
+    ];
+    let generated = 256;
+    let capacity = 3000 + generated + 4;
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        capacity,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let same = |label: &str, ar: &Generation, spec: &Generation| {
+        assert_eq!(spec.tokens, ar.tokens, "{label} : jetons");
+        assert!(
+            spec.residuals.len() >= ar.residuals.len().min(spec.residuals.len()),
+            "{label} : résiduels"
+        );
+        for (i, (a, b)) in ar.residuals.iter().zip(&spec.residuals).enumerate() {
+            assert_eq!(bits(a), bits(b), "{label} : résiduel {i}");
+        }
+    };
+    let started = std::time::Instant::now();
+    for (label, prompt) in &prompts {
+        let ar = generate_ar(&mut session, prompt, generated, &[]).expect("invariant: AR");
+        for depth in 1..=3 {
+            let spec = generate_speculative(&mut session, prompt, generated, depth, &[], None)
+                .expect("invariant: spéculatif");
+            same(&format!("{label}, profondeur {depth}"), &ar, &spec);
+            let cycles = spec.accepted.len().max(1);
+            let per_cycle =
+                spec.accepted.iter().map(|k| k + 1).sum::<usize>() as f64 / cycles as f64;
+            eprintln!(
+                "{label}, profondeur {depth} : identique ; {per_cycle:.2} jetons par cycle sur {cycles} cycles"
+            );
+        }
+    }
+    // Rejet total : chaque draft forcé faux.
+    let (_, prompt) = &prompts[1];
+    let ar = generate_ar(&mut session, prompt, 64, &[]).expect("invariant: AR");
+    let wrong = |_: usize, _: usize, draft: usize| (draft + 1) % 1000;
+    let spec = generate_speculative(&mut session, prompt, 64, 3, &[], Some(&wrong))
+        .expect("invariant: spéculatif forcé");
+    same("rejet total", &ar, &spec);
+    assert!(
+        spec.accepted.iter().all(|&k| k == 0),
+        "rejet total : drafts acceptés"
+    );
+    // Arrêt : jeton d'arrêt pris au milieu de la génération AR.
+    let full = generate_ar(&mut session, prompt, 96, &[]).expect("invariant: AR");
+    let stop = [full.tokens[40]];
+    let ar = generate_ar(&mut session, prompt, 96, &stop).expect("invariant: AR");
+    let spec = generate_speculative(&mut session, prompt, 96, 3, &stop, None)
+        .expect("invariant: spéculatif");
+    same("arrêt", &ar, &spec);
+    assert!(stop.contains(ar.tokens.last().expect("invariant: jetons")));
+    // Capacité : génération jusqu'à la dernière position.
+    let (_, prompt) = &prompts[3];
+    let budget = capacity - prompt.len();
+    let ar = generate_ar(&mut session, prompt, budget, &[]).expect("invariant: AR");
+    let spec = generate_speculative(&mut session, prompt, budget, 3, &[], None)
+        .expect("invariant: spéculatif");
+    same("capacité", &ar, &spec);
+    eprintln!(
+        "identité spéculative : tout vert en {:.0} s",
+        started.elapsed().as_secs_f64()
+    );
+}

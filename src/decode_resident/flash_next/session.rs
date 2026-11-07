@@ -1251,10 +1251,22 @@ impl FlashNextSession {
         })
     }
 
-    /// Position du prochain token (oracles).
-    #[cfg(test)]
+    /// Position du prochain token.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+    )]
     pub(crate) fn position(&self) -> usize {
         self.position
+    }
+
+    /// Capacité de la session (tokens).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+    )]
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Remet la session au début d'une séquence : états DeltaNet initiaux, KV
@@ -1637,10 +1649,19 @@ impl FlashNextSession {
             .map(|w| (&w.norm_embedding, &w.norm_hidden))
     }
 
-    /// Oracles : tronque l'historique MTP à `rows` lignes (mutation « historique
-    /// figé »).
-    #[cfg(test)]
+    /// Tronque l'historique MTP à `rows` lignes : retire les lignes des drafts
+    /// enchaînés, construites sur des résiduels spéculatifs. Les blocs et clés
+    /// brutes de ces lignes sont réécrits avant d'être lus.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sans tête MTP, ou si `rows` dépasse l'historique.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+    )]
     pub(crate) fn mtp_truncate(&mut self, rows: usize) -> Result<()> {
+        self.refuse_pending()?;
         match self.states.last_mut() {
             Some(LayerState::Full(full)) if self.mtp.is_some() => full.0.truncate(rows),
             _ => Err(InferError::Config(
