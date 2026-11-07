@@ -366,9 +366,6 @@ impl DFlashResident {
                 self.context_len
             )));
         }
-        for layer in &self.layers {
-            layer.kv.check_dflash_window(len, layer.sliding_window)?;
-        }
         for layer in &mut self.layers {
             layer.kv.truncate(len)?;
         }
@@ -946,9 +943,6 @@ fn encode_block_attention(
     ctx: &BufferRef,
     block: usize,
 ) -> Result<()> {
-    layer
-        .kv
-        .check_dflash_window(context_len, layer.sliding_window)?;
     let q_dim = dims.q_heads * dims.head_dim;
     let kv_dim = dims.kv_heads * dims.head_dim;
     let q_roped = state.scratch().lease(block * q_dim, GpuElement::F32)?;
@@ -978,8 +972,7 @@ fn encode_block_attention(
     let window = layer.sliding_window;
     let windowed = window.is_some_and(|window| context_len + block > window);
     if (!windowed || crate::runtime_flags::dflash_windowed_rows())
-        && (layer.kv.rows_fused_supported()
-            || layer.kv.dflash_rows_supported(context_len, window)?)
+        && (layer.kv.rows_fused_supported() || layer.kv.dflash_rows_supported(window))
     {
         layer.kv.encode_append_kv_rows(
             encoder,

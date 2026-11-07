@@ -12,21 +12,14 @@ use crate::decode_resident::GpuTensor;
 use crate::metal_backend::{commit_and_wait, read_f32_buffer, read_u32_buffer, MetalExecutor};
 use crate::DFlashDraft;
 
-/// Décision unique, prise avant le prefill : des métadonnées partielles ne
-/// permettent ni de borner les captures ni de déplacer la base du drafter.
-fn drafter_window(
-    types: &[String],
-    layers: usize,
-    declared: usize,
-    window: Option<usize>,
-) -> Option<usize> {
-    (types.len() == layers
-        && declared == layers
-        && layers > 0
-        && types.iter().all(|kind| kind == "sliding_attention"))
-    .then_some(window)
-    .flatten()
-    .filter(|&window| window > 0)
+/// Le loader valide les types et le nombre de couches avant cette décision.
+fn drafter_window(types: &[String], window: Option<usize>) -> Option<usize> {
+    types
+        .iter()
+        .all(|kind| kind == "sliding_attention")
+        .then_some(window)
+        .flatten()
+        .filter(|&window| window > 0)
 }
 
 /// Valide la couverture avant l'allocation et calcule la réserve physique.
@@ -43,8 +36,8 @@ fn drafter_layout(
     let skip = required_from.max(captured_from);
     let covered = captured_from
         .checked_add(captured_rows)
-        .is_some_and(|end| captured_from <= skip && end >= prompt);
-    if skip > required_from || skip > prompt || !covered {
+        .is_some_and(|end| end >= prompt);
+    if skip > required_from || !covered {
         return Err(InferError::Dimension(format!(
             "DFlash captures insuffisantes: origine={captured_from}, lignes={captured_rows}, suffixe requis={required_from}..{prompt}"
         )));
@@ -364,12 +357,7 @@ impl CausalDecoder {
         // Toutes les couches fenêtrées : seules les `window` dernières positions du
         // prompt sont attendues, les précédentes ne sont jamais lues (ni gardées
         // dans le cache de préfixe).
-        let window = drafter_window(
-            &draft.info.layer_types,
-            draft.layers.len(),
-            draft.info.num_hidden_layers,
-            draft.info.sliding_window,
-        );
+        let window = drafter_window(&draft.info.layer_types, draft.info.sliding_window);
         let fixed_base = window.is_some() && crate::runtime_flags::dflash_drafter_base();
         let keep_rows = window.unwrap_or(usize::MAX);
         let (mut cache, final_state, target_hidden, captured_from) =
@@ -1397,22 +1385,12 @@ mod tests {
     #[test]
     fn drafter_base_eligibility_cpu() {
         let sliding = vec!["sliding_attention".to_string(); 2];
-        assert_eq!(drafter_window(&sliding, 2, 2, Some(64)), Some(64));
-        for (layers, declared, window) in [
-            (3, 3, Some(64)),
-            (1, 1, Some(64)),
-            (2, 3, Some(64)),
-            (2, 2, None),
-            (2, 2, Some(0)),
-        ] {
-            assert_eq!(drafter_window(&sliding, layers, declared, window), None);
-        }
-        assert_eq!(drafter_window(&[], 0, 0, Some(64)), None);
+        assert_eq!(drafter_window(&sliding, Some(64)), Some(64));
         let mixed = vec![
             "sliding_attention".to_string(),
             "full_attention".to_string(),
         ];
-        assert_eq!(drafter_window(&mixed, 2, 2, Some(64)), None);
+        assert_eq!(drafter_window(&mixed, Some(64)), None);
     }
 
     #[test]

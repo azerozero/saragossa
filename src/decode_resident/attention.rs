@@ -1725,6 +1725,14 @@ impl FullAttentionMetalState {
                 0,
             );
         }
+        // NOTE: hors DFlash, le prefill ne produit une base non nulle que
+        // pour les couches fenêtrées à sinks (`window_keep` dans
+        // metal_backend/prefill/resident.rs). `resident_full_attention_state`
+        // reprend cette base et le setup installe les sinks : ces couches
+        // sortent plus haut par encode_attention_decode_sink. Le decode per-op
+        // exclut aussi les sinks de son chemin résident (attention_ops.rs).
+        // Aucun chemin de production hors DFlash n'atteint donc ici un KV
+        // rebasé sans sinks.
         // Bascule 2-passes split-K pour les longs KV (dédup GQA + tuiles L1) :
         // head_dim 128/256, GQA réel (>1 q/kv), len ≥ seuil. Cf. encode_attention_decode_2pass.
         let gqa = self.q_heads / self.kv_heads.max(1);
