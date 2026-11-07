@@ -20,6 +20,10 @@ bench/competitors/night.sh 2 "$RUN"          # qualité, échantillonné, 256k
 
 Relancer une nuit interrompue la reprend : les plans déjà tirés sont
 réutilisés, les entrées terminées sautées, un gel écrit n'est pas refait.
+La reprise et l'analyse ignorent avec avertissement une unique dernière ligne
+JSON tronquée de `results.jsonl`, sans fin de ligne. Toute corruption au milieu
+du fichier reste fatale. La reprise retire ce fragment avant d'ajouter des
+résultats ; l'analyse laisse le journal intact.
 
 Avant la nuit 1, l'essai de validation fixe `usage_counts_eos` de chaque
 moteur dans `matrix.json` : sans cette convention, aucun débit n'est exact
@@ -42,6 +46,6 @@ admissible, ou un débit approximatif arrête le gel ; ce n'est pas une divergen
 | `analyze.py` | admissibilité, comptage par événement, T1/T2/T3, bootstrap apparié |
 | `quality.py`, `quality_llama.sh` | ids du corpus, perplexité au protocole `llama-perplexity`, KL, `llama-bench` |
 
-Auto-tests : `client.py`, `run_matrix.py`, `analyze.py`, `memwatch.py` et
+Auto-tests : `client.py`, `run_matrix.py`, `analyze.py`, `results.py`, `memwatch.py` et
 `weights_report.py` lancés sans argument (`python3 -I -B …`) ; `prompts.py`
 vérifie ses vecteurs à chaque lancement.

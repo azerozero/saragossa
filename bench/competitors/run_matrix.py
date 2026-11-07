@@ -39,6 +39,7 @@ import client  # noqa: E402
 import memwatch  # noqa: E402
 from config import path as config_path, paths as config_paths, sanitize  # noqa: E402
 from prompts import fnv1a64  # noqa: E402  (stdlib seule au niveau module)
+from results import read_results  # noqa: E402
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -610,8 +611,7 @@ def run(run_dir):
     done, seen, run_seq = set(), {}, 1
     phases = set(plan_data["phases"])
     if results.exists():
-        for raw in results.read_text().splitlines():
-            line = json.loads(raw)
+        for line in read_results(results, repair_tail=True):
             if line.get("kind") == "run_start":
                 run_seq = max(run_seq, line["run_seq"] + 1)
                 overlap = phases & set(line.get("phases", []))

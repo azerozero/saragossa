@@ -33,6 +33,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from prompts import CHECKPOINT  # noqa: E402
+from results import read_results  # noqa: E402
 
 HERE = pathlib.Path(__file__).resolve().parent
 BOOTSTRAP = 5000
@@ -246,7 +247,7 @@ def load(run_dir):
     manifest = json.loads((run_dir / "prompts" / "prompts.json").read_text())
     kinds = {p["id"]: p["kind"] for p in manifest["prompts"]}
     tok = tokenizer()
-    lines = [json.loads(raw) for raw in (run_dir / "results.jsonl").read_text().splitlines()]
+    lines = read_results(run_dir / "results.jsonl")
     superseded = {(l["entry_key"], l["superseded_run_seq"]) for l in lines
                   if l.get("kind") == "superseded"}
     throttled = {(l["entry_key"], l["run_seq"], l.get("attempt")) for l in lines
