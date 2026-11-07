@@ -1,5 +1,7 @@
 //! Types JSON OpenAI compatibles pour `/v1`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use saragossa::ChatTemplateMessage;
@@ -665,7 +667,8 @@ pub(super) struct ChatCompletionChunk {
 }
 
 impl ChatCompletionChunk {
-    /// Identifiant neuf d'un flux, partagé par tous ses chunks (comme OpenAI).
+    /// Identifiant distinct par flux dans ce processus (compteur atomique),
+    /// partagé par tous ses chunks, même pour des flux ouverts simultanément.
     pub(super) fn stream_id() -> String {
         response_id("chatcmpl")
     }
@@ -829,12 +832,40 @@ fn created_now() -> u64 {
 }
 
 fn response_id(prefix: &str) -> String {
-    format!("{prefix}-{}", created_now())
+    static EPOCH: OnceLock<u128> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // Une seule lecture d'horloge pour le préfixe du processus ; le compteur
+    // garantit l'unicité même si l'horloge recule entre deux requêtes.
+    let epoch = EPOCH.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    });
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{epoch}-{sequence}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_ids_are_unique_across_threads() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..128)
+                        .map(|_| ChatCompletionChunk::stream_id())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let ids: std::collections::HashSet<_> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("invariant: génération sans échec"))
+            .collect();
+        assert_eq!(ids.len(), 1024);
+    }
 
     #[test]
     fn validation_errors_hide_values_and_escape_keys() {
