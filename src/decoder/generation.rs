@@ -3240,14 +3240,16 @@ impl CausalDecoder {
         layer_ids: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor, Tensor)> {
         let (cache, final_states, captures) =
-            self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids, usize::MAX)?;
+            self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids, usize::MAX, false)?;
         let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
         Ok((cache, final_state, captures.hidden))
     }
 
     /// Comme [`Self::prefill_cache_state_with_layer_capture`], mais rend les
-    /// états finaux normés de TOUTES les positions (`[seq, hidden]`), nécessaires
-    /// pour semer l'historique MTP committed à côté des captures DFlash.
+    /// états finaux normés de toutes les positions (`[seq, hidden]`) quand
+    /// `all_rows` est vrai, nécessaires pour semer l'historique MTP committed à
+    /// côté des captures DFlash ; sinon le prefill résident ne rend que la
+    /// dernière (le repli CPU rend toujours toutes les lignes).
     /// Les captures rendent `(from, hidden)` : `keep_rows` borne leur queue
     /// résidente. Le repli CPU du prefill complet ignore cette borne et rend
     /// encore toutes les lignes avec `from = 0` ; l'appelant tronque ensuite.
@@ -3257,6 +3259,7 @@ impl CausalDecoder {
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
+        all_rows: bool,
     ) -> Result<(CausalDecoderCache, Tensor, PrefixCaptures)> {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
@@ -3271,7 +3274,9 @@ impl CausalDecoder {
                 prompt,
                 layer_ids,
                 keep_rows,
-                false,
+                // Sans historique MTP à semer, seul l'état de la dernière position
+                // sert : relire les `seq` lignes coûtait 3 × 5,4 Go à 256k.
+                !all_rows,
                 crate::runtime_flags::prefill_resident_chunk_tokens(),
             )?
         {
@@ -4396,8 +4401,13 @@ impl CausalDecoder {
                 return Ok(hit);
             }
         }
-        let (cache, final_states, PrefixCaptures { from, hidden, .. }) =
-            self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids, keep_rows.max(1))?;
+        let (cache, final_states, PrefixCaptures { from, hidden, .. }) = self
+            .prefill_cache_state_with_layer_capture_all(
+                prompt,
+                layer_ids,
+                keep_rows.max(1),
+                self.dflash_switch_needs_history(),
+            )?;
         let captures = PrefixCaptures::tail(layer_ids, from, hidden, keep_rows)?;
         let mtp_history = self.dflash_switch_mtp_history(prompt, &final_states)?;
         let state = (cache, Tensor::row(final_states.last_row()?.to_vec())?);
@@ -4468,6 +4478,15 @@ impl CausalDecoder {
         self.seed_mtp_history_batched(&states, suffix, history)
     }
 
+    /// Vrai si la bascule DFlash → MTP est armée : son historique MTP committed
+    /// se sème depuis les états finaux de toutes les positions du prompt.
+    #[cfg(feature = "devtools")]
+    fn dflash_switch_needs_history(&self) -> bool {
+        self.mtp.is_some()
+            && dflash_switch_min() > 0.0
+            && mtp_history_policy() == MtpHistoryPolicy::Committed
+    }
+
     /// Historique MTP committed semé par le prefill DFlash quand la bascule
     /// (`SARAGOSSA_RUST_DFLASH_SWITCH_MIN`) est active : le repli MTP après
     /// bascule retrouve alors l'entrée du cache de préfixe au lieu de re-préremplir
@@ -4483,10 +4502,7 @@ impl CausalDecoder {
         prompt: &[usize],
         final_states: &Tensor,
     ) -> Result<Option<LayerKvCache>> {
-        if self.mtp.is_none()
-            || dflash_switch_min() <= 0.0
-            || mtp_history_policy() != MtpHistoryPolicy::Committed
-        {
+        if !self.dflash_switch_needs_history() {
             return Ok(None);
         }
         let hidden = self.final_norm.data().len();
