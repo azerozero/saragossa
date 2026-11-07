@@ -3097,6 +3097,9 @@ fn n2_resident_mtp_head_matches_cpu() {
         output: f64,
         scores: f64,
         selection_bad: usize,
+        /// Sélections malformées (doublons, hors bornes, taille ≠ keep) ou
+        /// scores non finis : une bascule n'est pas prouvée par celles-ci.
+        malformed: usize,
         sparse_rows: usize,
         torch: f64,
     }
@@ -3112,6 +3115,7 @@ fn n2_resident_mtp_head_matches_cpu() {
             output: 0.0,
             scores: 0.0,
             selection_bad: 0,
+            malformed: 0,
             sparse_rows: 0,
             torch: 0.0,
         };
@@ -3129,8 +3133,16 @@ fn n2_resident_mtp_head_matches_cpu() {
                 m.scores = nan_max(m.scores, score_error(&scores, &trace.scores[j], keep));
                 let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b as usize).collect();
                 blocks.sort_unstable();
+                let well_formed = blocks.len() == keep
+                    && blocks.windows(2).all(|w| w[0] < w[1])
+                    && blocks.last().is_some_and(|&b| b < scores.len())
+                    && scores.iter().all(|v| v.is_finite());
+                if !well_formed {
+                    m.malformed += 1;
+                }
                 let want = trace_blocks(trace, j, keep, compress).unwrap_or_default();
-                if blocks != want
+                if well_formed
+                    && blocks != want
                     && !swap_justified(&trace.scores[j], &want, &blocks, keep, ANCHORED_SWAP_TIE)
                 {
                     m.selection_bad += 1;
@@ -3145,13 +3157,17 @@ fn n2_resident_mtp_head_matches_cpu() {
         m.torch = golden_error(&torch, &golden_f32(&golden, "mtp_output")[..n * width]);
         eprintln!(
             "mutation {label} : sortie {:.2e}, scores {:.2e} (natif {score_err:.2e}), \
-             sélections injustifiées {} sur {} lignes creuses",
-            m.output, m.scores, m.selection_bad, m.sparse_rows
+             sélections injustifiées {} (malformées {}) sur {} lignes creuses",
+            m.output, m.scores, m.selection_bad, m.malformed, m.sparse_rows
         );
         let detected = match watch {
             Watch::Output => !within(m.output, ANCHORED_OUTPUT_TOL),
-            Watch::Scores => m.sparse_rows > 0 && !within(m.scores, 2.0 * f64::from(ANCHORED_TIE)),
-            Watch::Selection => m.selection_bad > 0,
+            Watch::Scores => {
+                m.sparse_rows > 0
+                    && m.scores.is_finite()
+                    && m.scores >= 2.0 * f64::from(ANCHORED_TIE)
+            }
+            Watch::Selection => m.selection_bad > 0 && m.malformed == 0,
         };
         assert!(detected, "mutation {label} non détectée");
         m
