@@ -241,6 +241,62 @@ travail × R.
   inchangée ;
 - les deux.
 
+### Mesures complémentaires, combinaison fixée avant la mesure
+
+La re-mesure sur poids distincts tombe au seuil (×1,19 à ×1,23 selon le
+traitement du scan). Ce paragraphe a été écrit et commité **avant** les deux
+mesures qui suivent ; il dit comment elles remplacent les postes concernés du
+réaliste.
+
+**(1) DeltaNet et MoE in situ.** Vrais poids de la session après 1k de
+contexte : 36 et 48 couches distinctes, donc lues depuis la DRAM comme en
+decode. Chaque mesure est faite sur toutes les couches dans un command buffer,
+après une chauffe, au minimum de 3.
+- **DeltaNet.**
+  - `T_dn(1)` : les 36 couches résidentes
+    (`encode_linear_attn_resident_dense_buffers`), sur leurs vrais états.
+  - `M_dn(R)` : les matmuls de ces couches (`in_proj_qkv`, `in_proj_z`,
+    `out_proj`, `in_proj_a/b`) sur R lignes, en vérification greedy stricte,
+    avec l'exactitude au bit contre le mono.
+  - Reste in situ = `T_dn(1) − M_dn(1)` : scan, conv, normes, portes. Un reste
+    négatif invalide la mesure et est publié comme tel.
+  - `DeltaNet(R) = M_dn(R) + R × reste` : pas de kernel en lignes pour l2/σ, scan
+    séquentiel.
+- **MoE.**
+  - `T_moe(R)` : les 48 couches MoE (routeur, top-k, experts, expert partagé) en
+    R lignes par le kernel existant (`encode_moe_shared_buffers_verify_rows`,
+    routage par ligne, sans union), en vérification greedy stricte, avec
+    l'exactitude au bit de chaque ligne contre le MoE mono.
+  - Si les lignes sont exactes : `MoE(R) = T_moe(R)`.
+  - Sinon : `MoE(R) = T_moe(1) × F_union(R)`, où `F_union` est le facteur des
+    experts défini plus haut (`Σ_m N_m · ρ_expert(m) / 10`, pondéré). L'écart
+    d'exactitude est publié.
+- **Combinaison.** Chaque brique garde son temps mono du profil par brique et
+  prend le rapport mesuré : DeltaNet × `DeltaNet(R) / T_dn(1)`, MoE ×
+  `MoE(R) / T_moe(1)`. Hyper-connections, QSA, tête et PLE gardent les postes
+  réalistes de la re-mesure (commit c96e469).
+
+**(2) Acceptation d'un draft sur sous-vocabulaire.**
+- **Sous-vocabulaire.** V_sub = les 32 000 jetons les plus fréquents, ou tous
+  les jetons vus s'il y en a moins, plus EOS. Corpus : wikitext `corpus32k`,
+  `code4k-2`, `code4k-3` et `chat-1` à `chat-6` (fixtures `rowsexact`), tous
+  distincts des prompts d'évaluation.
+- **Évaluation.** C à profondeur 3, 256 jetons :
+  - prose : golden 512 ;
+  - code : `code4k-1`, 1024 jetons.
+
+  Les drafts sont l'argmax des logits MTP restreint à V_sub. L'identité à l'AR
+  reste vérifiée.
+- **Modèle.**
+  - `n_sub` (jetons par cycle mesurés) remplace n dans les options à
+    sous-vocabulaire, avec m = d + n_sub − 1.
+  - `T_mtp_sub = T_mtp − T_tête × (1 − |V_sub| / V)`, où `T_tête` = 2,93 ms
+    (argmax mono mesuré).
+
+**Décision.** Réaliste, code à profondeur 3, seuil ×1,2, inchangé. Si la
+meilleure option passe ×1,2 en code mais reste sous ×1 en prose, D ne sera
+activable que par opt-in, jamais par défaut.
+
 ### Matmuls à poids
 
 > Chiffres de la première mesure (poids aliasés), à remplacer.
