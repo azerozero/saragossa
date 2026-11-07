@@ -598,7 +598,7 @@ pub(super) fn send_error<S: Write>(stream: &mut S, status: u16, message: &str) -
     let body = serde_json::json!({
         "error": {
             "message": message,
-            "type": "saragossa_error"
+            "type": if status == 400 { "invalid_request_error" } else { "saragossa_error" }
         }
     });
     send_json(stream, status, &body, Vec::new())
@@ -1288,6 +1288,40 @@ mod tests {
         assert!(value["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("max_tokens")));
+    }
+
+    #[test]
+    fn unsupported_sampling_returns_permanent_400() {
+        for (field, value) in [
+            ("min_p", 0.1),
+            ("presence_penalty", 0.5),
+            ("frequency_penalty", -1.0),
+            ("repetition_penalty", 1.1),
+        ] {
+            let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+            let mut state = ServeState::new(&args);
+            let body = serde_json::json!({"model":"m", "messages":[], "max_tokens":1,
+                field: value})
+            .to_string();
+            let raw = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let mut stream = Cursor::new(raw.into_bytes());
+            let error = handle_connection(&mut stream, &mut state, None, far_deadline())
+                .expect_err("invariant: paramètre non implémenté");
+            assert!(error.to_string().contains(field));
+            let response = String::from_utf8(stream.into_inner()).expect("invariant: UTF-8");
+            let start = response
+                .rfind("HTTP/1.1 400 Bad Request")
+                .expect("invariant: erreur permanente 400");
+            let (_, body) = response[start..]
+                .split_once("\r\n\r\n")
+                .expect("invariant: corps HTTP");
+            let value: serde_json::Value = serde_json::from_str(body).expect("invariant: JSON");
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+        }
     }
 
     /// `stream_options.include_usage` : chunk d'usage entre le chunk de fin

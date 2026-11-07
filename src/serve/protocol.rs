@@ -267,7 +267,7 @@ impl ChatCompletionRequest {
         for (name, value, neutral) in fields {
             // NaN est refusé aussi : `!=` est vrai pour lui.
             if value.is_some_and(|value| value != neutral) {
-                return Err(ServeError::not_implemented(format!(
+                return Err(ServeError::Http(format!(
                     "{name}: type JSON number, valeur non supportée"
                 )));
             }
@@ -969,7 +969,7 @@ mod tests {
             r#","repetition_penalty":0"#,
         ] {
             assert!(
-                matches!(validate(refused), Err(ServeError::NotImplemented(_))),
+                matches!(validate(refused), Err(ServeError::Http(_))),
                 "{refused}"
             );
         }

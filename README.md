@@ -234,7 +234,8 @@ and `max_tokens` / `max_completion_tokens`. Unseeded sampling stays reproducible
   `include_usage: null`; options are ignored for non-streaming requests.
 - `min_p`, `presence_penalty`, `frequency_penalty` and `repetition_penalty`
   are not implemented: only their neutral value (`0`, `0`, `0`, `1`) is
-  accepted, anything else returns 501.
+  accepted, anything else returns HTTP 400 `invalid_request_error` (permanent
+  request error).
 - Each completion logs `prompt_tokens=…` and `prompt_fnv1a64=…` (FNV-1a 64 of
   the prompt ids as little-endian `u32`) on stderr, so a client can check that
   the ingested ids are the ones it tokenized.
