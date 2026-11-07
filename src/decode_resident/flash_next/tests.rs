@@ -315,6 +315,8 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         rotary_dim: 64,
         eps: 1.0e-6,
         dense_max: dense_max_visible(2048, 4),
+        query_offset: 0,
+        index_query_offset: 0,
     };
     let (tokens, q_dim, kv_dim) = (oracle_steps(40), 24 * 256, 2 * 256);
     let mut rng = DeterministicF32::new(0x05a0_0024);
@@ -1476,6 +1478,52 @@ fn n2_resident_decode_matches_cpu_reference() {
     assert!(native_finite, "passe native : valeur non finie");
 }
 
+/// Empreinte au bit près du decode résident, pour prouver qu'un refactor ne
+/// change aucun bit : rejoue 2048 tokens du golden N2 sans tête, puis écrit, pour
+/// 8 pas (dont les derniers en régime QSA creux), l'argmax, les logits et les
+/// résiduels hc de chaque couche dans `SARAGOSSA_FLASH_NEXT_BITS_OUT`. Deux
+/// binaires (avant / après) doivent produire des fichiers identiques.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR, SARAGOSSA_QWEN4EXP_GOLDEN, SARAGOSSA_FLASH_NEXT_BITS_OUT"]
+fn flash_next_step_bits_dump() {
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    use std::io::Write;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let out = std::env::var_os("SARAGOSSA_FLASH_NEXT_BITS_OUT")
+        .expect("SARAGOSSA_FLASH_NEXT_BITS_OUT requis");
+    let (context, steps) = (2048, 8);
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        context + steps,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    for &token in &ids[..context] {
+        session.replay(token).expect("invariant: rejeu");
+    }
+    let mut file = std::fs::File::create(&out).expect("invariant: fichier de sortie");
+    for &token in &ids[context..context + steps] {
+        let step = session.step(token, true, true).expect("invariant: pas");
+        file.write_all(&step.argmax.to_le_bytes())
+            .expect("invariant: écriture");
+        let values = step
+            .logits
+            .into_iter()
+            .flatten()
+            .chain(step.layers.into_iter().flatten().flatten());
+        for v in values {
+            file.write_all(&v.to_le_bytes())
+                .expect("invariant: écriture");
+        }
+    }
+    eprintln!("empreinte écrite : {} pas après {context} tokens", steps);
+}
+
 /// Débit AR résident : `SARAGOSSA_FLASH_NEXT_BENCH_RUNS` répétitions (3 par
 /// défaut) d'un contexte de 1024 tokens (texte du golden, reset entre les
 /// répétitions) puis de 256 pas gloutons chronométrés. Publie, par
@@ -2157,6 +2205,8 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
         rotary_dim: 64,
         eps: 1.0e-6,
         dense_max: dense_max_visible(budget, compress),
+        query_offset: 0,
+        index_query_offset: 0,
     };
     let (q_dim, kv_dim, ihd, iheads) = (4 * 128, 2 * 128, 128, 4);
     let mut rng = DeterministicF32::new(0x5a_9e5e);
@@ -2546,9 +2596,39 @@ fn resident_session_allocates_max_capacity() {
     session
         .step(0, false, false)
         .expect("invariant: premier pas");
+    // Tête MTP : un pas (scratch paresseux de la couche et du lm_head).
+    if session.mtp_rows().is_some() {
+        session
+            .mtp_step(
+                super::session::MtpInput::Host(&vec![0.0; config.hc_width()]),
+                0,
+                false,
+                false,
+            )
+            .expect("invariant: premier pas MTP");
+    }
     let lazy = session.device_allocated_bytes().saturating_sub(before);
     let used = session.owned_state_bytes() + lazy;
     let budget = session_state_bytes(&config, MAX_CAPACITY);
+    // Point de reprise (MTP comprise) : accepté sous la garde du process,
+    // refusé sous un plafond inférieur à ses copies.
+    session
+        .checkpoint(Some(&crate::MemoryGuard::process()))
+        .expect("invariant: point de reprise sous la garde");
+    let tiny = crate::MemoryGuard::from_limits(
+        true,
+        crate::memory_guard::MemoryLimits {
+            static_cap: Some(1),
+            host_memory: None,
+            headroom_bytes: 0,
+            metal_cap: None,
+        },
+        std::sync::Arc::new(|| Some(0)),
+    );
+    assert!(
+        session.checkpoint(Some(&tiny)).is_err(),
+        "point de reprise accepté sous un plafond de 1 octet"
+    );
     eprintln!(
         "session {MAX_CAPACITY} tokens : {:.2} Go alloués hors poids (dont {:.1} Mo au premier pas), budget {:.2} Go",
         used as f64 / 1e9,
@@ -2639,4 +2719,727 @@ fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
         "le témoin figé ne s'écarte plus aux positions longues"
     );
     Ok(())
+}
+
+/// Tenseur d'un golden safetensors : `(forme, octets)`.
+fn golden_tensor(path: &std::path::Path, name: &str) -> (Vec<usize>, Vec<u8>) {
+    use std::os::unix::fs::FileExt;
+    let header = crate::qwen_loader::read_shard_header(path).expect("invariant: golden lisible");
+    let entry = header
+        .tensors
+        .get(name)
+        .unwrap_or_else(|| panic!("golden sans {name}"));
+    let mut bytes = vec![0_u8; entry.data_offsets[1] - entry.data_offsets[0]];
+    std::fs::File::open(path)
+        .expect("invariant: golden")
+        .read_exact_at(&mut bytes, header.data_start + entry.data_offsets[0] as u64)
+        .expect("invariant: lecture golden");
+    (entry.shape.clone(), bytes)
+}
+
+fn golden_f32(path: &std::path::Path, name: &str) -> Vec<f32> {
+    golden_tensor(path, name)
+        .1
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn golden_i64(path: &std::path::Path, name: &str) -> Vec<usize> {
+    golden_tensor(path, name)
+        .1
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().expect("invariant: 8 octets")) as usize)
+        .collect()
+}
+
+/// Comparaison à un golden : longueurs égales et valeurs finies exigées
+/// ([`finite_relative_error`]), NaN sinon.
+fn golden_error(got: &[f32], want: &[f32]) -> f64 {
+    if got.len() != want.len() {
+        return f64::NAN;
+    }
+    finite_relative_error(got, want)
+}
+
+/// N2 de la tête MTP résidente contre la tête CPU (`qwen4_exp/mtp.rs`), sur
+/// les 4095 paires `(h_t, tok_{t+1})` de `mtp_golden.safetensors` (dont 2044
+/// en régime QSA creux, frontières 2047-2052 comprises). Chaque ligne GPU part
+/// du même `h` que le CPU : la couche est ré-ancrée par construction.
+///
+/// - Portes contre le CPU, à chaque ligne : entrée fc et sortie hc ≤ 1e-4,
+///   scores ≤ 1e-5, échanges de sélection justifiés à 2e-5, routage à la
+///   paire au seuil (marge ≤ 1e-5), valeurs finies ; logits aux positions
+///   figées : KL ≤ 1e-3, argmax renvoyé identique sauf quasi-égalité ≤ 1e-5.
+/// - Triangulation avec transformers aux positions figées : sortie hc
+///   (1e-4), scores (1e-4 relatif à `1 + |torch|`), sélection et routage
+///   justifiés par les marges torch (1e-5).
+/// - Accord du brouillon avec l'argmax du tronc (golden long) ≥ ½.
+/// - Mutations (rouges) : gains d'entrée doublés ou absents, paires
+///   décalées, flux permutés, requêtes seules décalées (attention, indexeur),
+///   historique figé, expert, bloc ; gain doublé aussi contre transformers
+///   (une erreur commune au CPU et au GPU y reste visible).
+/// - Reprise : point de reprise, drafts parasites à travers une frontière de
+///   bloc, restauration, puis continuation exacte.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn n2_resident_mtp_head_matches_cpu() {
+    use super::session::MtpInput;
+    use crate::qwen4_exp::Qwen4ExpReference;
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden_dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis"),
+    );
+    let golden = golden_dir.join("mtp_golden.safetensors");
+    let next = golden_i64(&golden, "mtp_next_ids");
+    let positions = golden_i64(&golden, "mtp_positions");
+    let h = golden_f32(&golden, "mtp_h");
+    let rows = next.len();
+    let reference =
+        Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
+    let config = reference.checkpoint().config.clone();
+    let (width, vocab, keep, compress, top_k) = (
+        config.hc_width(),
+        config.vocab,
+        reference.budget_blocks(),
+        reference.compress(),
+        config.top_k,
+    );
+    let sparse_start = dense_max_visible(keep * compress, compress);
+    // Formes : 4095 paires, positions dans l'historique, frontières couvertes.
+    assert_eq!(rows, 4095, "paires MTP");
+    assert_eq!(h.len(), rows * width, "h MTP");
+    assert!(!positions.is_empty() && positions.iter().all(|&p| p < rows));
+    let shape = |name: &str| golden_tensor(&golden, name).0;
+    assert_eq!(shape("mtp_h"), vec![rows, width], "forme mtp_h");
+    assert_eq!(
+        shape("mtp_input"),
+        vec![positions.len(), width],
+        "forme mtp_input"
+    );
+    assert_eq!(
+        shape("mtp_output"),
+        vec![positions.len(), width],
+        "forme mtp_output"
+    );
+    assert_eq!(
+        shape("routing.0"),
+        vec![rows, config.top_k],
+        "forme du routage"
+    );
+    assert_eq!(
+        shape("router_logits.0"),
+        vec![rows, config.experts],
+        "forme des logits du routeur"
+    );
+    // Frontière du régime creux parmi les positions figées des logits.
+    assert!(
+        positions
+            .iter()
+            .any(|&p| p + 1 >= dense_max_visible(keep * compress, compress) && p < rows),
+        "aucune position figée en régime creux"
+    );
+    assert!(rows > sparse_start + 4, "régime creux non couvert");
+    let started = std::time::Instant::now();
+    let h_tensor = Tensor::from_vec(vec![rows, width], h.clone()).expect("invariant: forme");
+    let x = reference
+        .mtp_input(&h_tensor, &next)
+        .expect("invariant: entrée MTP CPU");
+    let cpu = reference
+        .mtp_layer(&x, None, None)
+        .expect("invariant: couche MTP CPU");
+    let trace = cpu.qsa.as_ref().expect("invariant: trace QSA");
+    let picked: Vec<f32> = positions
+        .iter()
+        .flat_map(|&p| {
+            cpu.hidden.data()[p * width..(p + 1) * width]
+                .iter()
+                .copied()
+        })
+        .collect();
+    let cpu_logits = reference
+        .logits(
+            &reference
+                .mtp_head(
+                    &Tensor::from_vec(vec![positions.len(), width], picked)
+                        .expect("invariant: lignes"),
+                )
+                .expect("invariant: mixer MTP"),
+        )
+        .expect("invariant: logits MTP CPU");
+    eprintln!(
+        "référence CPU MTP : {rows} paires en {:.0} s",
+        started.elapsed().as_secs_f64()
+    );
+    let cpu_row = |j: usize| &cpu.hidden.data()[j * width..(j + 1) * width];
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        rows,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+
+    // Passe native, une ligne d'historique par paire.
+    let (mut in_err, mut out_err, mut score_err, mut kl_max) = (0.0_f64, 0.0, 0.0, 0.0_f64);
+    let (mut sel_swaps, mut sel_bad, mut route_swaps, mut route_bad, mut argmax_bad) =
+        (0, 0, 0, 0, 0);
+    let (mut gpu_out, mut gpu_in, mut gpu_routing, mut gpu_qsa, mut drafts) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for j in 0..rows {
+        let at = positions.iter().position(|&p| p == j);
+        let step = session
+            .mtp_step(
+                MtpInput::Host(&h[j * width..(j + 1) * width]),
+                next[j],
+                at.is_some(),
+                true,
+            )
+            .expect("invariant: pas MTP");
+        in_err = nan_max(
+            in_err,
+            golden_error(&step.input, &x.data()[j * width..(j + 1) * width]),
+        );
+        let hidden = step.hidden.expect("invariant: sortie hc");
+        out_err = nan_max(out_err, golden_error(&hidden, cpu_row(j)));
+        let mut routing: Vec<usize> = step
+            .routing
+            .expect("invariant: routage")
+            .into_iter()
+            .map(|e| e as usize)
+            .collect();
+        routing.sort_unstable();
+        if routing != cpu.routing[j] {
+            route_swaps += 1;
+            let (kth, next_e) = cpu.routing_boundary[j];
+            let pair = routing
+                .iter()
+                .filter(|e| !cpu.routing[j].contains(e))
+                .eq([&next_e])
+                && cpu.routing[j]
+                    .iter()
+                    .filter(|e| !routing.contains(e))
+                    .eq([&kth]);
+            if !(pair && cpu.routing_margins[j] <= ANCHORED_TIE) {
+                route_bad += 1;
+            }
+        }
+        let qsa = step.qsa.map(|(blocks, scores)| {
+            let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b as usize).collect();
+            blocks.sort_unstable();
+            (blocks, scores)
+        });
+        match &qsa {
+            Some((blocks, scores)) => {
+                score_err = nan_max(score_err, score_error(scores, &trace.scores[j], keep));
+                let want = trace_blocks(trace, j, keep, compress).unwrap_or_default();
+                if *blocks != want {
+                    sel_swaps += 1;
+                    if !swap_justified(&trace.scores[j], &want, blocks, keep, ANCHORED_SWAP_TIE) {
+                        sel_bad += 1;
+                    }
+                }
+            }
+            None if trace.scores[j].len() > keep => sel_bad += 1,
+            None => {}
+        }
+        if let Some(i) = at {
+            let got = step.logits.expect("invariant: logits");
+            let want = &cpu_logits.data()[i * vocab..(i + 1) * vocab];
+            let kl = if got.len() == vocab && got.iter().all(|v| v.is_finite()) {
+                kl_logits(want, &got)
+            } else {
+                f64::NAN
+            };
+            kl_max = nan_max(kl_max, kl);
+            let top = want
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+                .map(|(t, _)| t)
+                .expect("invariant: vocabulaire");
+            let gpu_top = step.argmax as usize;
+            if gpu_top != top {
+                let max = want[top];
+                let sum: f64 = want.iter().map(|&v| f64::from(v - max).exp()).sum();
+                let gap = (1.0 - f64::from(want[gpu_top] - max).exp()) / sum;
+                if !within(gap, 1.0e-5) {
+                    argmax_bad += 1;
+                }
+            }
+            gpu_out.extend_from_slice(&hidden);
+            gpu_in.extend_from_slice(&step.input);
+            gpu_routing.push(routing);
+            gpu_qsa.push(qsa);
+            drafts.push(gpu_top);
+        }
+    }
+
+    // Triangulation avec transformers aux positions figées.
+    let torch_err = golden_error(&gpu_out, &golden_f32(&golden, "mtp_output"));
+    let torch_in_err = golden_error(&gpu_in, &golden_f32(&golden, "mtp_input"));
+    let torch_ids = golden_i64(&golden, "routing.0");
+    let torch_logits = golden_f32(&golden, "router_logits.0");
+    let experts = config.experts;
+    let torch_scores = {
+        let flat = golden_f32(&golden, "qsa_scores.0");
+        let offsets = golden_i64(&golden, "qsa_offsets.0");
+        offsets
+            .windows(2)
+            .map(|w| flat[w[0]..w[1]].to_vec())
+            .collect::<Vec<_>>()
+    };
+    let (mask_shape, mask) = golden_tensor(&golden, "qsa_mask.0");
+    assert_eq!(mask_shape, vec![rows, rows], "masque torch");
+    let (mut torch_route_bad, mut torch_sel_bad, mut torch_score_err) = (0, 0, 0.0_f64);
+    for (i, &p) in positions.iter().enumerate() {
+        // Routage : écart justifié par la marge de probabilité torch au seuil.
+        let logits_p = &torch_logits[p * experts..(p + 1) * experts];
+        let max = logits_p.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp: Vec<f32> = logits_p.iter().map(|v| (v - max).exp()).collect();
+        let sum: f32 = exp.iter().sum();
+        let probs: Vec<f32> = exp.iter().map(|v| v / sum).collect();
+        let mut torch_set: Vec<usize> = torch_ids[p * top_k..(p + 1) * top_k].to_vec();
+        torch_set.sort_unstable();
+        if gpu_routing[i] != torch_set {
+            // Chaque expert échangé doit être au seuil torch du top-k.
+            let mut sorted = probs.clone();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let threshold = sorted[top_k - 1];
+            let swapped = gpu_routing[i]
+                .iter()
+                .filter(|e| !torch_set.contains(e))
+                .chain(torch_set.iter().filter(|e| !gpu_routing[i].contains(e)));
+            if !swapped.into_iter().all(|&e| {
+                within(probs[e] - threshold, 1.0e-5) && within(threshold - probs[e], 1.0e-5)
+            }) {
+                torch_route_bad += 1;
+            }
+        }
+        // Scores et sélection de l'indexeur contre torch.
+        if let Some((blocks, scores)) = &gpu_qsa[i] {
+            let ts = &torch_scores[p];
+            if ts.len() != scores.len() {
+                torch_score_err = f64::NAN;
+            }
+            for (g, t) in scores.iter().zip(ts) {
+                torch_score_err =
+                    nan_max(torch_score_err, f64::from((g - t).abs() / (1.0 + t.abs())));
+            }
+            let torch_blocks: Vec<usize> = (0..ts.len())
+                .filter(|&b| mask[p * rows + b * compress] != 0)
+                .collect();
+            if *blocks != torch_blocks && !swap_justified(ts, &torch_blocks, blocks, keep, 1.0e-5) {
+                torch_sel_bad += 1;
+            }
+        }
+    }
+    // Accord du brouillon (ligne p, prédit tok_{p+2}) avec l'argmax du tronc.
+    let long = golden_dir.join("long.safetensors");
+    let trunk_positions = golden_i64(&long, "logit_positions");
+    let trunk = golden_f32(&long, "logits");
+    let (mut agree, mut denominator) = (0, 0);
+    for (i, &p) in positions.iter().enumerate() {
+        if let Some(k) = trunk_positions.iter().position(|&t| t == p + 1) {
+            denominator += 1;
+            let row = &trunk[k * vocab..(k + 1) * vocab];
+            let top = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+                .map(|(t, _)| t)
+                .expect("invariant: vocabulaire");
+            agree += usize::from(drafts[i] == top);
+        }
+    }
+    eprintln!(
+        "MTP résidente : entrée {in_err:.2e}, sortie {out_err:.2e}, scores {score_err:.2e}, \
+         sélections ≠ {sel_swaps} (injustifiées {sel_bad}), routages ≠ {route_swaps} \
+         (injustifiés {route_bad}), KL max {kl_max:.2e}, argmax injustifiés {argmax_bad} ; \
+         transformers : entrée {torch_in_err:.2e}, sortie {torch_err:.2e}, scores {torch_score_err:.2e}, routages \
+         injustifiés {torch_route_bad}, sélections injustifiées {torch_sel_bad} ; accord avec \
+         le tronc {agree}/{denominator}"
+    );
+    let green = within(in_err, ANCHORED_OUTPUT_TOL)
+        && within(out_err, ANCHORED_OUTPUT_TOL)
+        && within(score_err, f64::from(ANCHORED_TIE))
+        && within(kl_max, 1.0e-3)
+        && within(torch_err, ANCHORED_OUTPUT_TOL)
+        && within(torch_in_err, ANCHORED_OUTPUT_TOL)
+        && within(torch_score_err, 1.0e-4)
+        && sel_bad == 0
+        && route_bad == 0
+        && argmax_bad == 0
+        && torch_route_bad == 0
+        && torch_sel_bad == 0
+        && denominator > 0
+        && 2 * agree >= denominator;
+
+    // Mutations, sur la même session remise à zéro : `hook(session, j)` avant
+    // chaque pas, entrée `(h_j, tok)` éventuellement altérée par `pair(j)`.
+    type Hook<'a> = &'a dyn Fn(&mut FlashNextSession, usize);
+    type Pair<'a> = &'a dyn Fn(usize) -> (Vec<f32>, usize);
+    let plain = |j: usize| (h[j * width..(j + 1) * width].to_vec(), next[j]);
+    // Chaque mutation est jugée par la porte de l'observable qu'elle touche :
+    // `Watch::Output` (sortie hc, 1e-4), `Watch::Scores` (scores de l'indexeur
+    // contre le CPU, 1e-5, avec un écart muté d'au moins 2 × la porte) ou
+    // `Watch::Selection` (top-512 basculé hors quasi-égalité). Les trois
+    // mesures sont publiées pour chaque mutation.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Watch {
+        Output,
+        Scores,
+        Selection,
+    }
+    struct Mutated {
+        output: f64,
+        scores: f64,
+        selection_bad: usize,
+        /// Sélections malformées (doublons, hors bornes, taille ≠ keep) ou
+        /// scores non finis : une bascule n'est pas prouvée par celles-ci.
+        malformed: usize,
+        sparse_rows: usize,
+        torch: f64,
+    }
+    let run = |session: &mut FlashNextSession,
+               label: &str,
+               steps: usize,
+               watch: Watch,
+               hook: Hook<'_>,
+               pair: Pair<'_>|
+     -> Mutated {
+        session.reset().expect("invariant: reset");
+        let mut m = Mutated {
+            output: 0.0,
+            scores: 0.0,
+            selection_bad: 0,
+            malformed: 0,
+            sparse_rows: 0,
+            torch: 0.0,
+        };
+        let mut torch = Vec::new();
+        for j in 0..steps {
+            hook(session, j);
+            let (hj, tok) = pair(j);
+            let step = session
+                .mtp_step(MtpInput::Host(&hj), tok, false, true)
+                .expect("invariant: pas muté");
+            let hidden = step.hidden.expect("invariant: sortie hc");
+            m.output = nan_max(m.output, golden_error(&hidden, cpu_row(j)));
+            if let Some((blocks, scores)) = step.qsa {
+                m.sparse_rows += 1;
+                m.scores = nan_max(m.scores, score_error(&scores, &trace.scores[j], keep));
+                let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b as usize).collect();
+                blocks.sort_unstable();
+                let well_formed = blocks.len() == keep
+                    && blocks.windows(2).all(|w| w[0] < w[1])
+                    && blocks.last().is_some_and(|&b| b < scores.len())
+                    && scores.iter().all(|v| v.is_finite());
+                if !well_formed {
+                    m.malformed += 1;
+                }
+                let want = trace_blocks(trace, j, keep, compress).unwrap_or_default();
+                if well_formed
+                    && blocks != want
+                    && !swap_justified(&trace.scores[j], &want, &blocks, keep, ANCHORED_SWAP_TIE)
+                {
+                    m.selection_bad += 1;
+                }
+            }
+            if positions.contains(&j) {
+                torch.extend_from_slice(&hidden);
+            }
+        }
+        session.set_query_offsets(0, 0);
+        let n = torch.len() / width;
+        m.torch = golden_error(&torch, &golden_f32(&golden, "mtp_output")[..n * width]);
+        eprintln!(
+            "mutation {label} : sortie {:.2e}, scores {:.2e} (natif {score_err:.2e}), \
+             sélections injustifiées {} (malformées {}) sur {} lignes creuses",
+            m.output, m.scores, m.selection_bad, m.malformed, m.sparse_rows
+        );
+        let detected = match watch {
+            Watch::Output => !within(m.output, ANCHORED_OUTPUT_TOL),
+            Watch::Scores => {
+                m.sparse_rows > 0
+                    && m.scores.is_finite()
+                    && m.scores >= 2.0 * f64::from(ANCHORED_TIE)
+            }
+            Watch::Selection => m.selection_bad > 0 && m.malformed == 0,
+        };
+        assert!(detected, "mutation {label} non détectée");
+        m
+    };
+    let gains = |session: &FlashNextSession| {
+        let (e, hd) = session.mtp_norm_buffers().expect("invariant: tête MTP");
+        (
+            read_f32_buffer(e, config.hidden).expect("invariant: gains"),
+            read_f32_buffer(hd, width).expect("invariant: gains"),
+        )
+    };
+    let (gain_e, gain_h) = gains(&session);
+    let set_gains = |session: &FlashNextSession, e: &[f32], hd: &[f32]| {
+        let (eb, hb) = session.mtp_norm_buffers().expect("invariant: tête MTP");
+        crate::metal_backend::write_f32_buffer(eb, e).expect("invariant: écriture");
+        crate::metal_backend::write_f32_buffer(hb, hd).expect("invariant: écriture");
+    };
+    let doubled = |w: &[f32]| w.iter().map(|v| 2.0 * v + 1.0).collect::<Vec<_>>();
+    let probe = 64;
+    let none: Hook<'_> = &|_, _| {};
+    let torch_doubled = run(
+        &mut session,
+        "gain doublé (flux)",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j == 0 {
+                set_gains(s, &gain_e, &doubled(&gain_h));
+            }
+        },
+        &plain,
+    );
+    assert!(
+        !within(torch_doubled.torch, ANCHORED_OUTPUT_TOL),
+        "gain doublé invisible contre transformers ({:.2e})",
+        torch_doubled.torch
+    );
+    run(
+        &mut session,
+        "gain absent (flux)",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j == 0 {
+                set_gains(s, &gain_e, &vec![0.0; width]);
+            }
+        },
+        &plain,
+    );
+    run(
+        &mut session,
+        "gain doublé (embedding)",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j == 0 {
+                set_gains(s, &doubled(&gain_e), &gain_h);
+            }
+        },
+        &plain,
+    );
+    set_gains(&session, &gain_e, &gain_h);
+    run(
+        &mut session,
+        "paires décalées",
+        probe,
+        Watch::Output,
+        none,
+        &|j| (h[j * width..(j + 1) * width].to_vec(), next[j + 1]),
+    );
+    run(
+        &mut session,
+        "flux permutés",
+        probe,
+        Watch::Output,
+        none,
+        &|j| {
+            let mut hj = h[j * width..(j + 1) * width].to_vec();
+            hj.rotate_left(config.hidden);
+            (hj, next[j])
+        },
+    );
+    run(
+        &mut session,
+        "requêtes d'attention décalées",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j == 0 {
+                s.set_query_offsets(1, 0);
+            }
+        },
+        &plain,
+    );
+    let b_row = sparse_start + 4;
+    // Requêtes de l'indexeur seules décalées, sur 256 lignes creuses : d'une
+    // position (scores, porte 1e-5 inchangée), puis de 1024 positions (le
+    // top-512 bascule, porte de sélection).
+    let index_rows = sparse_start + 256;
+    let shifted = run(
+        &mut session,
+        "requêtes d'indexeur décalées d'une position",
+        index_rows,
+        Watch::Scores,
+        &|s, j| {
+            if j == 0 {
+                s.set_query_offsets(0, 1);
+            }
+        },
+        &plain,
+    );
+    assert!(
+        shifted.sparse_rows >= 200,
+        "lignes creuses sondées : {}",
+        shifted.sparse_rows
+    );
+    run(
+        &mut session,
+        "requêtes d'indexeur décalées de 1024 positions",
+        index_rows,
+        Watch::Selection,
+        &|s, j| {
+            if j == 0 {
+                s.set_query_offsets(0, 1024);
+            }
+        },
+        &plain,
+    );
+    run(
+        &mut session,
+        "historique figé",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j > 0 {
+                s.mtp_truncate(0).expect("invariant: troncature");
+            }
+        },
+        &plain,
+    );
+    let e_row = 8;
+    run(
+        &mut session,
+        "mauvais expert",
+        e_row + 1,
+        Watch::Output,
+        &|s, j| {
+            if j == e_row {
+                let set = &cpu.routing[e_row];
+                let outsider = (0..)
+                    .find(|e| !set.contains(e))
+                    .expect("invariant: expert libre");
+                let mut wrong: Vec<u32> = set.iter().map(|&e| e as u32).collect();
+                wrong[0] = outsider as u32;
+                s.mtp_forced_routing = Some(wrong);
+            }
+        },
+        &plain,
+    );
+    run(
+        &mut session,
+        "mauvais bloc",
+        b_row + 1,
+        Watch::Output,
+        &|s, j| {
+            if j == b_row {
+                let blocks =
+                    trace_blocks(trace, b_row, keep, compress).expect("invariant: régime creux");
+                let outsider = (0..)
+                    .find(|b| !blocks.contains(b))
+                    .expect("invariant: bloc libre");
+                let mut wrong: Vec<u32> = blocks.iter().map(|&b| b as u32).collect();
+                wrong[0] = outsider as u32;
+                wrong.sort_unstable();
+                s.mtp_forced_selection = Some(wrong);
+            }
+        },
+        &plain,
+    );
+
+    // Reprise : point à `cp` lignes, trois drafts parasites qui complètent un
+    // bloc (`cp + 2` termine le bloc `(cp + 2) / 4`), restauration, puis
+    // continuation exacte jusqu'à `cp + 8`.
+    session.reset().expect("invariant: reset");
+    let cp = sparse_start - 2;
+    assert_eq!(
+        (cp + 2) % compress,
+        compress - 1,
+        "le bloc doit se compléter"
+    );
+    for j in 0..cp {
+        session
+            .mtp_step(
+                MtpInput::Host(&h[j * width..(j + 1) * width]),
+                next[j],
+                false,
+                false,
+            )
+            .expect("invariant: historique");
+    }
+    let checkpoint = session
+        .checkpoint(None)
+        .expect("invariant: point de reprise");
+    for j in cp..cp + 3 {
+        let parasite = &h[(rows - 1 - j) * width..(rows - j) * width];
+        session
+            .mtp_step(MtpInput::Host(parasite), next[rows - 1 - j], false, false)
+            .expect("invariant: draft parasite");
+    }
+    session
+        .restore(&checkpoint)
+        .expect("invariant: restauration");
+    let mut resumed = 0.0_f64;
+    for j in cp..cp + 8 {
+        let step = session
+            .mtp_step(
+                MtpInput::Host(&h[j * width..(j + 1) * width]),
+                next[j],
+                false,
+                true,
+            )
+            .expect("invariant: continuation");
+        resumed = nan_max(
+            resumed,
+            golden_error(&step.hidden.expect("invariant: sortie"), cpu_row(j)),
+        );
+    }
+    // Draft enchaîné : entrée résidente (sortie du pas précédent) contre la
+    // même entrée relue sur l'hôte, au bit près.
+    // Copie réelle : le buffer de sortie de la session est réécrit par le pas
+    // hôte, un alias fausserait la comparaison.
+    let host_copy = read_f32_buffer(
+        session
+            .mtp_hidden_buffer()
+            .expect("invariant: sortie résidente"),
+        width,
+    )
+    .expect("invariant: relecture");
+    let chained = metal::Device::system_default()
+        .expect("invariant: device Metal")
+        .new_buffer_with_data(
+            host_copy.as_ptr().cast(),
+            std::mem::size_of_val(host_copy.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+    let before = session
+        .checkpoint(None)
+        .expect("invariant: point de reprise");
+    let token = next[cp + 8];
+    let from_host = session
+        .mtp_step(MtpInput::Host(&host_copy), token, false, true)
+        .expect("invariant: draft hôte");
+    session.restore(&before).expect("invariant: restauration");
+    let from_buffer = session
+        .mtp_step(MtpInput::Resident(&chained), token, false, true)
+        .expect("invariant: draft résident");
+    assert_eq!(from_host.argmax, from_buffer.argmax, "draft enchaîné");
+    let bits = |v: Option<Vec<f32>>| -> Vec<u32> {
+        v.expect("invariant: sortie")
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    };
+    assert_eq!(
+        bits(from_host.hidden),
+        bits(from_buffer.hidden),
+        "entrée résidente ≠ entrée hôte"
+    );
+    eprintln!("reprise après drafts parasites : écart de sortie {resumed:.2e}");
+    assert!(
+        within(resumed, ANCHORED_OUTPUT_TOL),
+        "continuation après reprise : {resumed:.2e}"
+    );
+    assert!(green, "N2 MTP résidente rouge");
 }
