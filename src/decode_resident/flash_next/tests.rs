@@ -3481,70 +3481,70 @@ fn resident_verify_rows_and_accept_match_ar_bitwise() {
         .expect("invariant: session")
     };
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
-    let mut ar = open();
-    let mut spec = open();
+    // Une seule session (deux copies des poids dépasseraient le plafond) : les
+    // références AR et les vérifications repartent du même point de reprise.
+    let mut session = open();
     // Token divergent : différent de tous les tokens vérifiés.
     let divergent = 13;
     for context in 2046..2050 {
         let tokens = &ids[context..context + rows];
         assert!(!tokens.contains(&divergent));
-        ar.reset().expect("invariant: reset");
-        spec.reset().expect("invariant: reset");
+        session.reset().expect("invariant: reset");
         for &token in &ids[..context] {
-            ar.replay(token).expect("invariant: rejeu AR");
-            spec.replay(token).expect("invariant: rejeu");
+            session.replay(token).expect("invariant: rejeu");
         }
-        let ar_base = ar.checkpoint(None).expect("invariant: point AR");
-        let spec_base = spec.checkpoint(None).expect("invariant: point");
-        // Référence AR : pas t_0..t_3, résiduel avant mixer = sortie de la
-        // dernière couche.
+        let base = session
+            .checkpoint(None)
+            .expect("invariant: point de reprise");
+        // Références AR : pas t_0..t_3 (résiduel avant mixer = sortie de la
+        // dernière couche), puis pour chaque k, t_0..t_k et le token divergent.
         let mut want = Vec::new();
         for &token in tokens {
-            let step = ar.step(token, false, true).expect("invariant: pas AR");
+            let step = session.step(token, false, true).expect("invariant: pas AR");
             let layers = step.layers.expect("invariant: résiduels");
             want.push((step.argmax, layers[layers.len() - 1].clone()));
         }
+        let mut continuations = Vec::new();
         for k in 0..rows {
-            spec.restore(&spec_base).expect("invariant: reprise");
-            let got = spec.verify(tokens).expect("invariant: vérification");
+            session.restore(&base).expect("invariant: reprise");
+            for &token in &tokens[..=k] {
+                session
+                    .step(token, false, false)
+                    .expect("invariant: pas AR");
+            }
+            let step = session
+                .step(divergent, false, true)
+                .expect("invariant: continuation AR");
+            continuations.push((step.argmax, step.layers.expect("invariant: résiduels")));
+        }
+        for (k, (argmax, reference)) in continuations.iter().enumerate() {
+            session.restore(&base).expect("invariant: reprise");
+            let got = session.verify(tokens).expect("invariant: vérification");
             assert!(
-                spec.verify(tokens).is_err(),
+                session.verify(tokens).is_err(),
                 "seconde vérification acceptée"
             );
             assert!(
-                spec.step(tokens[0], false, false).is_err(),
+                session.step(tokens[0], false, false).is_err(),
                 "pas accepté en attente"
             );
-            for (r, (row, (argmax, residual))) in got.iter().zip(&want).enumerate() {
-                assert_eq!(row.argmax, *argmax, "P {context}, ligne {r} : argmax");
+            for (r, (row, (want_argmax, residual))) in got.iter().zip(&want).enumerate() {
+                assert_eq!(row.argmax, *want_argmax, "P {context}, ligne {r} : argmax");
                 assert_eq!(
                     bits(&row.residual),
                     bits(residual),
                     "P {context}, ligne {r} : résiduel"
                 );
             }
-            assert!(spec.accept(rows).is_err(), "acceptation hors bornes");
-            spec.accept(k).expect("invariant: acceptation");
-            assert_eq!(spec.position(), context + k + 1);
-            let after = spec
+            assert!(session.accept(rows).is_err(), "acceptation hors bornes");
+            session.accept(k).expect("invariant: acceptation");
+            assert_eq!(session.position(), context + k + 1);
+            let after = session
                 .step(divergent, false, true)
                 .expect("invariant: continuation");
-            ar.restore(&ar_base).expect("invariant: reprise AR");
-            for &token in &tokens[..=k] {
-                ar.step(token, false, false).expect("invariant: pas AR");
-            }
-            let reference = ar
-                .step(divergent, false, true)
-                .expect("invariant: continuation AR");
-            assert_eq!(
-                after.argmax, reference.argmax,
-                "P {context}, k {k} : argmax"
-            );
-            let (a, b) = (
-                after.layers.expect("invariant: résiduels"),
-                reference.layers.expect("invariant: résiduels"),
-            );
-            for (layer, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(after.argmax, *argmax, "P {context}, k {k} : argmax");
+            let layers = after.layers.expect("invariant: résiduels");
+            for (layer, (x, y)) in layers.iter().zip(reference).enumerate() {
                 assert_eq!(bits(x), bits(y), "P {context}, k {k}, couche {layer}");
             }
         }
