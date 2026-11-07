@@ -4317,10 +4317,12 @@ fn bench_speculative_mono_vs_ar() {
 /// (R = 1..4) contre R pas mono, en mode normal puis en vérification greedy
 /// stricte. Publie l'exactitude au bit près de chaque ligne et
 /// ρ_brique(R) = durée du lot / durée d'un pas mono. Chaque command buffer lit
-/// des copies distinctes du poids (≥ 512 Mo, une lecture par copie) pour
-/// mesurer depuis la DRAM comme le decode, et non depuis le SLC ; chauffe puis
-/// minimum de 3. Le lm_head u6 (kernel argmax en lignes à part) est hors
-/// profil. Sert à décider entre un qmv-T u8, R = 2, ou l'arrêt.
+/// des copies distinctes du poids (≥ 512 Mio, buffers GPU vérifiés distincts,
+/// une lecture par copie) pour mesurer depuis la DRAM comme le decode, et non
+/// depuis le SLC ; chauffe puis minimum de 3 ; débit mono publié en Go/s. Le
+/// hc Down de production (qmv split-K) est mesuré en mono à part. Le lm_head
+/// u6 (kernel argmax en lignes à part) est hors profil. Les experts sont
+/// mesurés isolément, témoins du kernel MoE fusionné du decode.
 #[test]
 #[ignore = "profil GPU : machine libre"]
 fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
@@ -4371,11 +4373,14 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
         } else {
             LinearWeight::AffineQuantized(affine_quantized(&mut rng, out_dim, in_dim, 0.05, bits)?)
         };
-        let bytes = out_dim * in_dim * bits / 8;
-        let copies = (512_usize << 20).div_ceil(bytes).clamp(4, 512);
-        let weights = (0..copies)
-            .map(|_| executor.resolve_linear_weight_buffers(&linear, "flash_next_profile"))
-            .collect::<Result<Vec<_>>>()?;
+        // Octets lus par pas : codes, plus échelles et biais bf16 par groupe.
+        let bytes = if bits == 32 {
+            out_dim * in_dim * 4
+        } else {
+            out_dim * in_dim * bits / 8 + out_dim * (in_dim / 64) * 4
+        };
+        let copies = (512_usize << 20).div_ceil(bytes).clamp(4, 4096);
+        let (_linears, weights) = distinct_weights(&executor, &linear, copies)?;
         let weight = &weights[0];
         let x = rng.fill(4 * in_dim, -1.0, 1.0);
         let input = buffer(&executor, &x);
@@ -4419,9 +4424,10 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
                 }
                 let mono = best[1];
                 let mut line = format!(
-                    "{name} [{out_dim}×{in_dim}, u{bits}, ×{per_step}/pas] {} : mono {:.1} µs",
+                    "{name} [{out_dim}×{in_dim}, u{bits}, ×{per_step}/pas] {} : mono {:.1} µs ({:.0} Go/s, {copies} copies)",
                     if strict { "strict" } else { "normal" },
-                    mono * 1e6
+                    mono * 1e6,
+                    bytes as f64 / mono / 1e9
                 );
                 for (rows, &batched) in best.iter().enumerate().skip(2) {
                     let out = zeros(&executor, rows * out_dim);
@@ -4465,7 +4471,117 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
             })?;
         }
     }
+    // hc Down de production : qmv u8 split-K de `encode_hc_mix` (même
+    // dispatch), mono ; la réduction des partiels reste dans le reste du pas.
+    let kernels = FlashNextKernels::new(executor.device())?;
+    let (out_dim, in_dim) = (320, 10_240);
+    let mut rng = DeterministicF32::new(0x6e);
+    let linear =
+        LinearWeight::AffineQuantized(affine_quantized(&mut rng, out_dim, in_dim, 0.05, 8)?);
+    let bytes = out_dim * in_dim + out_dim * (in_dim / 64) * 4;
+    let copies = (512_usize << 20).div_ceil(bytes);
+    let (_linears, weights) = distinct_weights(&executor, &linear, copies)?;
+    let normed = buffer(&executor, &rng.fill(in_dim, -1.0, 1.0));
+    let partial = zeros(&executor, out_dim * super::hc::DOWN_CHUNKS);
+    let encode = |encoder: &metal::ComputeCommandEncoderRef, copy: usize| -> Result<()> {
+        let MetalLinearWeightBuffers::AffineQuantized {
+            packed,
+            packed_offset,
+            scales,
+            scales_offset,
+            biases,
+            biases_offset,
+            packed_cols,
+            groups,
+            ..
+        } = &weights[copy]
+        else {
+            return Err(InferError::Config(
+                "hc Down : poids non quantifié".to_string(),
+            ));
+        };
+        encoder.set_compute_pipeline_state(&kernels.qmv_u8_splitk);
+        encoder.set_buffer(0, Some(&normed), 0);
+        encoder.set_buffer(1, Some(packed), *packed_offset);
+        encoder.set_buffer(2, Some(scales), *scales_offset);
+        encoder.set_buffer(3, Some(biases), *biases_offset);
+        encoder.set_buffer(4, Some(&partial), 0);
+        super::set_value(
+            encoder,
+            5,
+            &[
+                out_dim as u32,
+                in_dim as u32,
+                *packed_cols as u32,
+                *groups as u32,
+            ],
+        );
+        super::set_value(encoder, 6, &(super::hc::DOWN_CHUNKS as u32));
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(super::hc::DOWN_CHUNKS as u64, out_dim.div_ceil(8) as u64, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        Ok(())
+    };
+    run(copies, &encode)?;
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        best = best.min(run(copies, &encode)?);
+    }
+    eprintln!(
+        "hc Down de production (split-K) [{out_dim}×{in_dim}, u8, ×97/pas] : mono {:.1} µs ({:.0} Go/s, {copies} copies)",
+        best * 1e6,
+        bytes as f64 / best / 1e9
+    );
     Ok(())
+}
+
+/// `copies` poids GPU distincts de même contenu que `linear`. Le cache de
+/// buffers est indexé par `weight_id` (affine, conservé par `clone`) et par
+/// adresse (dense) : chaque copie est un tenseur neuf, rendu avec ses buffers
+/// pour rester vivant pendant la mesure. Les adresses GPU sont vérifiées
+/// distinctes.
+fn distinct_weights(
+    executor: &MetalExecutor,
+    linear: &LinearWeight,
+    copies: usize,
+) -> Result<(Vec<LinearWeight>, Vec<MetalLinearWeightBuffers>)> {
+    let linears = (0..copies)
+        .map(|_| -> Result<LinearWeight> {
+            Ok(match linear {
+                LinearWeight::Dense(t) => {
+                    LinearWeight::Dense(Tensor::from_vec(t.shape().to_vec(), t.data().to_vec())?)
+                }
+                LinearWeight::AffineQuantized(q) => {
+                    LinearWeight::AffineQuantized(AffineQuantizedTensor::new(
+                        q.packed_shape(),
+                        q.packed_data().to_vec(),
+                        Tensor::from_vec(q.scales_shape().to_vec(), q.scales_f32().to_vec())?,
+                        Tensor::from_vec(q.biases_shape().to_vec(), q.biases_f32().to_vec())?,
+                        q.group_size(),
+                        q.bits(),
+                    )?)
+                }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let weights = linears
+        .iter()
+        .map(|l| executor.resolve_linear_weight_buffers(l, "flash_next_profile"))
+        .collect::<Result<Vec<_>>>()?;
+    let address = |w: &MetalLinearWeightBuffers| match w {
+        MetalLinearWeightBuffers::Dense { rhs, .. } => rhs.gpu_address(),
+        MetalLinearWeightBuffers::AffineQuantized { packed, .. } => packed.gpu_address(),
+    };
+    let distinct: std::collections::HashSet<u64> = weights.iter().map(address).collect();
+    if distinct.len() != copies {
+        return Err(InferError::Metal(format!(
+            "profil : {} buffers distincts pour {copies} copies",
+            distinct.len()
+        )));
+    }
+    Ok((linears, weights))
 }
 
 /// Largeur hc d'une session (oracles).

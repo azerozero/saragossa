@@ -33,8 +33,11 @@ pub(crate) struct StepProfiler {
     steps: u64,
     dispatches: u64,
     step_dispatch_start: u64,
-    /// Dispatches cumulés par brique, attribués à chaque changement d'encodeur.
+    /// Dispatches cumulés par brique sur les pas terminés.
     brick_dispatches: [u64; 7],
+    /// Dispatches du pas en cours, attribués à chaque changement d'encodeur :
+    /// reportés à `end_step`, oubliés par `abort_step`.
+    step_brick_dispatches: [u64; 7],
     open_brick: Option<(usize, u64)>,
 }
 
@@ -84,6 +87,7 @@ impl StepProfiler {
             dispatches: 0,
             step_dispatch_start: 0,
             brick_dispatches: [0; 7],
+            step_brick_dispatches: [0; 7],
             open_brick: None,
         })
     }
@@ -118,7 +122,7 @@ impl StepProfiler {
     /// Attribue à la brique ouverte les dispatches encodés depuis son ouverture.
     fn close_brick(&mut self) {
         if let Some((slot, since)) = self.open_brick.take() {
-            self.brick_dispatches[slot] += crate::metal_backend::decode_profile_snapshot()
+            self.step_brick_dispatches[slot] += crate::metal_backend::decode_profile_snapshot()
                 .3
                 .saturating_sub(since);
         }
@@ -132,6 +136,7 @@ impl StepProfiler {
     /// Abandonne un pas non soumis.
     pub(crate) fn abort_step(&mut self) {
         self.open_brick = None;
+        self.step_brick_dispatches = [0; 7];
         self.pairs.clear();
         self.next = 0;
     }
@@ -156,6 +161,13 @@ impl StepProfiler {
     pub(crate) fn end_step(&mut self) -> Result<()> {
         self.close_brick();
         let words = read_u32_buffer(&self.resolved, 2 * self.next)?;
+        for (total, step) in self
+            .brick_dispatches
+            .iter_mut()
+            .zip(std::mem::take(&mut self.step_brick_dispatches))
+        {
+            *total += step;
+        }
         let at = |i: usize| u64::from(words[2 * i]) | (u64::from(words[2 * i + 1]) << 32);
         for &(brick, start) in &self.pairs {
             let (begin, end) = (at(start), at(start + 1));
