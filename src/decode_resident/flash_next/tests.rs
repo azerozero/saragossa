@@ -3082,14 +3082,39 @@ fn n2_resident_mtp_head_matches_cpu() {
     type Hook<'a> = &'a dyn Fn(&mut FlashNextSession, usize);
     type Pair<'a> = &'a dyn Fn(usize) -> (Vec<f32>, usize);
     let plain = |j: usize| (h[j * width..(j + 1) * width].to_vec(), next[j]);
+    // Chaque mutation est jugée par la porte de l'observable qu'elle touche :
+    // `Watch::Output` (sortie hc, 1e-4), `Watch::Scores` (scores de l'indexeur
+    // contre le CPU, 1e-5, avec un écart muté d'au moins 2 × la porte) ou
+    // `Watch::Selection` (top-512 basculé hors quasi-égalité). Les trois
+    // mesures sont publiées pour chaque mutation.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Watch {
+        Output,
+        Scores,
+        Selection,
+    }
+    struct Mutated {
+        output: f64,
+        scores: f64,
+        selection_bad: usize,
+        sparse_rows: usize,
+        torch: f64,
+    }
     let run = |session: &mut FlashNextSession,
                label: &str,
                steps: usize,
+               watch: Watch,
                hook: Hook<'_>,
                pair: Pair<'_>|
-     -> f64 {
+     -> Mutated {
         session.reset().expect("invariant: reset");
-        let mut worst = 0.0_f64;
+        let mut m = Mutated {
+            output: 0.0,
+            scores: 0.0,
+            selection_bad: 0,
+            sparse_rows: 0,
+            torch: 0.0,
+        };
         let mut torch = Vec::new();
         for j in 0..steps {
             hook(session, j);
@@ -3098,19 +3123,38 @@ fn n2_resident_mtp_head_matches_cpu() {
                 .mtp_step(MtpInput::Host(&hj), tok, false, true)
                 .expect("invariant: pas muté");
             let hidden = step.hidden.expect("invariant: sortie hc");
-            worst = nan_max(worst, golden_error(&hidden, cpu_row(j)));
+            m.output = nan_max(m.output, golden_error(&hidden, cpu_row(j)));
+            if let Some((blocks, scores)) = step.qsa {
+                m.sparse_rows += 1;
+                m.scores = nan_max(m.scores, score_error(&scores, &trace.scores[j], keep));
+                let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b as usize).collect();
+                blocks.sort_unstable();
+                let want = trace_blocks(trace, j, keep, compress).unwrap_or_default();
+                if blocks != want
+                    && !swap_justified(&trace.scores[j], &want, &blocks, keep, ANCHORED_SWAP_TIE)
+                {
+                    m.selection_bad += 1;
+                }
+            }
             if positions.contains(&j) {
                 torch.extend_from_slice(&hidden);
             }
         }
         session.set_query_offsets(0, 0);
-        eprintln!("mutation {label} : écart de sortie {worst:.2e}");
-        assert!(
-            !within(worst, ANCHORED_OUTPUT_TOL),
-            "mutation {label} non détectée"
-        );
         let n = torch.len() / width;
-        golden_error(&torch, &golden_f32(&golden, "mtp_output")[..n * width])
+        m.torch = golden_error(&torch, &golden_f32(&golden, "mtp_output")[..n * width]);
+        eprintln!(
+            "mutation {label} : sortie {:.2e}, scores {:.2e} (natif {score_err:.2e}), \
+             sélections injustifiées {} sur {} lignes creuses",
+            m.output, m.scores, m.selection_bad, m.sparse_rows
+        );
+        let detected = match watch {
+            Watch::Output => !within(m.output, ANCHORED_OUTPUT_TOL),
+            Watch::Scores => m.sparse_rows > 0 && !within(m.scores, 2.0 * f64::from(ANCHORED_TIE)),
+            Watch::Selection => m.selection_bad > 0,
+        };
+        assert!(detected, "mutation {label} non détectée");
+        m
     };
     let gains = |session: &FlashNextSession| {
         let (e, hd) = session.mtp_norm_buffers().expect("invariant: tête MTP");
@@ -3132,6 +3176,7 @@ fn n2_resident_mtp_head_matches_cpu() {
         &mut session,
         "gain doublé (flux)",
         probe,
+        Watch::Output,
         &|s, j| {
             if j == 0 {
                 set_gains(s, &gain_e, &doubled(&gain_h));
@@ -3140,13 +3185,15 @@ fn n2_resident_mtp_head_matches_cpu() {
         &plain,
     );
     assert!(
-        !within(torch_doubled, ANCHORED_OUTPUT_TOL),
-        "gain doublé invisible contre transformers ({torch_doubled:.2e})"
+        !within(torch_doubled.torch, ANCHORED_OUTPUT_TOL),
+        "gain doublé invisible contre transformers ({:.2e})",
+        torch_doubled.torch
     );
     run(
         &mut session,
         "gain absent (flux)",
         probe,
+        Watch::Output,
         &|s, j| {
             if j == 0 {
                 set_gains(s, &gain_e, &vec![0.0; width]);
@@ -3158,6 +3205,7 @@ fn n2_resident_mtp_head_matches_cpu() {
         &mut session,
         "gain doublé (embedding)",
         probe,
+        Watch::Output,
         &|s, j| {
             if j == 0 {
                 set_gains(s, &doubled(&gain_e), &gain_h);
@@ -3166,18 +3214,31 @@ fn n2_resident_mtp_head_matches_cpu() {
         &plain,
     );
     set_gains(&session, &gain_e, &gain_h);
-    run(&mut session, "paires décalées", probe, none, &|j| {
-        (h[j * width..(j + 1) * width].to_vec(), next[j + 1])
-    });
-    run(&mut session, "flux permutés", probe, none, &|j| {
-        let mut hj = h[j * width..(j + 1) * width].to_vec();
-        hj.rotate_left(config.hidden);
-        (hj, next[j])
-    });
+    run(
+        &mut session,
+        "paires décalées",
+        probe,
+        Watch::Output,
+        none,
+        &|j| (h[j * width..(j + 1) * width].to_vec(), next[j + 1]),
+    );
+    run(
+        &mut session,
+        "flux permutés",
+        probe,
+        Watch::Output,
+        none,
+        &|j| {
+            let mut hj = h[j * width..(j + 1) * width].to_vec();
+            hj.rotate_left(config.hidden);
+            (hj, next[j])
+        },
+    );
     run(
         &mut session,
         "requêtes d'attention décalées",
         probe,
+        Watch::Output,
         &|s, j| {
             if j == 0 {
                 s.set_query_offsets(1, 0);
@@ -3186,13 +3247,35 @@ fn n2_resident_mtp_head_matches_cpu() {
         &plain,
     );
     let b_row = sparse_start + 4;
-    run(
+    // Requêtes de l'indexeur seules décalées, sur 256 lignes creuses : d'une
+    // position (scores, porte 1e-5 inchangée), puis de 1024 positions (le
+    // top-512 bascule, porte de sélection).
+    let index_rows = sparse_start + 256;
+    let shifted = run(
         &mut session,
-        "requêtes d'indexeur décalées",
-        b_row + 1,
+        "requêtes d'indexeur décalées d'une position",
+        index_rows,
+        Watch::Scores,
         &|s, j| {
             if j == 0 {
                 s.set_query_offsets(0, 1);
+            }
+        },
+        &plain,
+    );
+    assert!(
+        shifted.sparse_rows >= 200,
+        "lignes creuses sondées : {}",
+        shifted.sparse_rows
+    );
+    run(
+        &mut session,
+        "requêtes d'indexeur décalées de 1024 positions",
+        index_rows,
+        Watch::Selection,
+        &|s, j| {
+            if j == 0 {
+                s.set_query_offsets(0, 1024);
             }
         },
         &plain,
@@ -3201,6 +3284,7 @@ fn n2_resident_mtp_head_matches_cpu() {
         &mut session,
         "historique figé",
         probe,
+        Watch::Output,
         &|s, j| {
             if j > 0 {
                 s.mtp_truncate(0).expect("invariant: troncature");
@@ -3213,6 +3297,7 @@ fn n2_resident_mtp_head_matches_cpu() {
         &mut session,
         "mauvais expert",
         e_row + 1,
+        Watch::Output,
         &|s, j| {
             if j == e_row {
                 let set = &cpu.routing[e_row];
@@ -3230,6 +3315,7 @@ fn n2_resident_mtp_head_matches_cpu() {
         &mut session,
         "mauvais bloc",
         b_row + 1,
+        Watch::Output,
         &|s, j| {
             if j == b_row {
                 let blocks =
