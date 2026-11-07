@@ -1400,6 +1400,12 @@ impl FlashNextSession {
         self.position
     }
 
+    /// Largeur du résiduel hc (oracles).
+    #[cfg(test)]
+    pub(crate) fn hc_width(&self) -> usize {
+        self.hc_dims.width()
+    }
+
     /// Capacité de la session (tokens).
     #[cfg_attr(
         not(test),
