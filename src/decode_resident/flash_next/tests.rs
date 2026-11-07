@@ -2031,11 +2031,36 @@ fn profile_rows_deltanet_moe(session: &FlashNextSession) -> Result<()> {
         }
         Ok(best)
     };
-    let same_bits = |a: &[f32], b: &[f32]| {
-        a.iter()
-            .zip(b)
-            .all(|(x, y)| x.to_bits() == y.to_bits() || (*x == 0.0 && *y == 0.0))
-    };
+    // Comparaison publiée en trois classes : identique au bit, identique au
+    // signe des zéros près, différente.
+    #[derive(Default)]
+    struct Exactness {
+        bits: usize,
+        signed_zero: usize,
+        different: usize,
+    }
+    impl Exactness {
+        fn add(&mut self, a: &[f32], b: &[f32]) {
+            let same = |zero: bool| {
+                a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.to_bits() == y.to_bits() || (zero && *x == 0.0 && *y == 0.0))
+            };
+            if same(false) {
+                self.bits += 1;
+            } else if same(true) {
+                self.signed_zero += 1;
+            } else {
+                self.different += 1;
+            }
+        }
+        fn report(&self) -> String {
+            format!(
+                "{} identiques au bit, {} au signe des zéros près, {} différentes",
+                self.bits, self.signed_zero, self.different
+            )
+        }
+    }
     let value_dim = parts.dims.value_dim;
     let mut rng = DeterministicF32::new(0x6f);
     let x_host = rng.fill(4 * hidden, -1.0, 1.0);
@@ -2110,39 +2135,43 @@ fn profile_rows_deltanet_moe(session: &FlashNextSession) -> Result<()> {
                 line += &format!(" ; matmuls R{rows} {:.3} ms (ρ {:.2})", t * 1e3, t / mono);
             }
         }
-        // Exactitude des projections de la première couche, R = 4.
-        let mut exact = true;
-        if let Some((weights, _)) = parts.linear.first() {
+        // Exactitude des projections de toutes les couches, R = 2..4 : chaque
+        // ligne contre son matmul mono.
+        let mut exact = Exactness::default();
+        for (weights, _) in &parts.linear {
             for (weight, on_x) in projections(weights) {
                 let (input, rows_in, in_dim) = if on_x {
                     (&x, &x_rows, hidden)
                 } else {
                     (&v, &v_rows, value_dim)
                 };
-                let command_buffer = queue.new_command_buffer();
-                let encoder = command_buffer.new_compute_command_encoder();
-                let out_dim = executor
-                    .encode_matmul_weight_buffers(encoder, input, 4, in_dim, weight, &out, true)?;
-                let singles: Vec<_> = (0..4).map(|_| zeros(executor, out_dim)).collect();
-                for (row, single) in rows_in.iter().zip(&singles) {
-                    executor.encode_matmul_weight_buffers(
-                        encoder, row, 1, in_dim, weight, single, true,
+                for rows in 2..=4 {
+                    let command_buffer = queue.new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    let out_dim = executor.encode_matmul_weight_buffers(
+                        encoder, input, rows, in_dim, weight, &out, true,
                     )?;
-                }
-                encoder.end_encoding();
-                commit_and_wait(command_buffer)?;
-                let all = read_f32_buffer(&out, 4 * out_dim)?;
-                for (r, single) in singles.iter().enumerate() {
-                    exact &= same_bits(
-                        &read_f32_buffer(single, out_dim)?,
-                        &all[r * out_dim..(r + 1) * out_dim],
-                    );
+                    let singles: Vec<_> = (0..rows).map(|_| zeros(executor, out_dim)).collect();
+                    for (row, single) in rows_in.iter().zip(&singles) {
+                        executor.encode_matmul_weight_buffers(
+                            encoder, row, 1, in_dim, weight, single, true,
+                        )?;
+                    }
+                    encoder.end_encoding();
+                    commit_and_wait(command_buffer)?;
+                    let all = read_f32_buffer(&out, rows * out_dim)?;
+                    for (r, single) in singles.iter().enumerate() {
+                        exact.add(
+                            &read_f32_buffer(single, out_dim)?,
+                            &all[r * out_dim..(r + 1) * out_dim],
+                        );
+                    }
                 }
             }
         }
         eprintln!(
-            "{line} ; lignes {}",
-            if exact { "exactes" } else { "NON exactes" }
+            "{line} ; lignes (toutes couches, R = 2..4) : {}",
+            exact.report()
         );
 
         // MoE : mono (chemin du pas) puis lignes (kernel de vérification).
@@ -2187,51 +2216,53 @@ fn profile_rows_deltanet_moe(session: &FlashNextSession) -> Result<()> {
             })?;
             line += &format!(" ; R{rows} {:.3} ms (ρ {:.2})", t * 1e3, t / t_moe);
         }
-        // Exactitude, R = 4, couche par couche : chaque ligne contre son MoE mono.
-        let mut exact_layers = 0;
+        // Exactitude, R = 2..4, couche par couche : chaque ligne contre le MoE
+        // mono du pas (sans résiduel, comme en decode).
+        let mut exact = Exactness::default();
         for weights in &parts.moe {
-            let mut owned = Vec::new();
-            let singles: Vec<_> = (0..4).map(|_| zeros(executor, hidden)).collect();
-            let command_buffer = queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            executor.encode_moe_shared_buffers_verify_rows(
-                encoder,
-                &mut owned,
-                &x,
-                &residual,
-                &moe_out,
-                4,
-                hidden,
-                weights,
-                parts.top_k,
-            )?;
-            for (row, single) in x_rows.iter().zip(&singles) {
-                executor.encode_moe_shared_buffers(
+            for rows in 2..=4 {
+                let mut owned = Vec::new();
+                let singles: Vec<_> = (0..rows).map(|_| zeros(executor, hidden)).collect();
+                let command_buffer = queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                executor.encode_moe_shared_buffers_verify_rows(
                     encoder,
                     &mut owned,
-                    row,
-                    None,
-                    single,
+                    &x,
+                    &residual,
+                    &moe_out,
+                    rows,
                     hidden,
                     weights,
                     parts.top_k,
                 )?;
+                for (row, single) in x_rows.iter().zip(&singles) {
+                    executor.encode_moe_shared_buffers(
+                        encoder,
+                        &mut owned,
+                        row,
+                        None,
+                        single,
+                        hidden,
+                        weights,
+                        parts.top_k,
+                    )?;
+                }
+                encoder.end_encoding();
+                commit_and_wait(command_buffer)?;
+                let all = read_f32_buffer(&moe_out, rows * hidden)?;
+                for (r, single) in singles.iter().enumerate() {
+                    exact.add(
+                        &read_f32_buffer(single, hidden)?,
+                        &all[r * hidden..(r + 1) * hidden],
+                    );
+                }
             }
-            encoder.end_encoding();
-            commit_and_wait(command_buffer)?;
-            let all = read_f32_buffer(&moe_out, 4 * hidden)?;
-            let mut layer_exact = true;
-            for (r, single) in singles.iter().enumerate() {
-                layer_exact &= same_bits(
-                    &read_f32_buffer(single, hidden)?,
-                    &all[r * hidden..(r + 1) * hidden],
-                );
-            }
-            exact_layers += usize::from(layer_exact);
         }
         eprintln!(
-            "{line} ; lignes exactes sur {exact_layers}/{} couches",
-            parts.moe.len()
+            "{line} ; lignes ({} couches, R = 2..4) : {}",
+            parts.moe.len(),
+            exact.report()
         );
         Ok(())
     })
@@ -4194,12 +4225,11 @@ fn speculative_greedy_matches_ar_bitwise() {
     // Acceptation complète forcée (drafts = jetons AR) : chaque cycle se
     // termine sur un draft accepté, y compris en fin de budget.
     let reference = generate_ar(&mut session, prompt, 64, &[]).expect("invariant: AR");
-    let oracle = |_: usize, emitted: usize, rank: usize, draft: usize| {
-        reference
+    let oracle = |_: usize, emitted: usize, rank: usize, _: usize| {
+        *reference
             .tokens
             .get(emitted + 1 + rank)
-            .copied()
-            .unwrap_or(draft)
+            .expect("invariant: draft d'oracle dans la sortie AR")
     };
     let all = SpecOptions {
         overrides: Some(&oracle),
@@ -4215,11 +4245,16 @@ fn speculative_greedy_matches_ar_bitwise() {
             &[],
             &all,
         );
-        assert_eq!(
-            spec.accepted.iter().sum::<usize>() + spec.accepted.len() + 1,
-            budget,
-            "budget {budget} : un jeton par cycle hors drafts, plus le dernier"
-        );
+        // Cycles attendus : 3 drafts acceptés tant que le budget le permet,
+        // le dernier cycle réduit à `restant − 2`, le dernier jeton émis seul.
+        let mut expected = Vec::new();
+        let mut left = budget;
+        while left >= 2 {
+            let k = (left - 2).min(3);
+            expected.push(k);
+            left -= k + 1;
+        }
+        assert_eq!(spec.accepted, expected, "budget {budget} : acceptations");
     }
     // Capacité : génération jusqu'à l'avant-dernière puis la dernière position.
     let (_, prompt) = &prompts[3];
@@ -4392,32 +4427,53 @@ fn speculative_greedy_matches_ar_bitwise() {
         Some(session.position()),
         "historique MTP après un échec de vérification"
     );
-    // Échec de la reconstruction de l'historique après une acceptation
-    // complète (cycle 2, 2ᵉ paire) : l'historique revient aux `p + 1` paires
-    // vérifiées, clés brutes comprises, égal au rejeu de ces paires.
-    let reference = generate_ar(&mut session, prompt, 64, &[]).expect("invariant: AR");
-    let oracle = |_: usize, emitted: usize, rank: usize, draft: usize| {
-        reference
-            .tokens
-            .get(emitted + 1 + rank)
-            .copied()
-            .unwrap_or(draft)
-    };
-    let failing = SpecOptions {
-        overrides: Some(&oracle),
-        fail_rebuild: Some((2, 1)),
-        ..SpecOptions::default()
-    };
-    assert!(generate_speculative(&mut session, prompt, 64, 3, &[], &failing).is_err());
-    let rows = session.mtp_rows().expect("invariant: tête MTP");
-    let state = mtp_state(&mut session);
-    let mut sequence = prompt.clone();
-    sequence.extend_from_slice(&reference.tokens);
-    reference_drafts(&mut session, &sequence[..=rows]);
-    assert!(
-        mtp_state(&mut session) == state,
-        "historique MTP après un échec de reconstruction"
-    );
+    // Échec de la reconstruction de l'historique après deux cycles d'acceptation
+    // complète : au cycle 2, l'historique propre a `|prompt| + 8` lignes et le
+    // tronc est à `|prompt| + 12`. Échec à la 2ᵉ paire sur un préfixe aligné
+    // (512), puis à la 3ᵉ sur un préfixe congru à 3 modulo 4 (515) : la
+    // reconstruction complète le bloc en cours et écrit une clé brute du bloc
+    // suivant avant d'échouer ; l'anneau doit être restauré.
+    for (length, pair) in [(512, 1), (515, 2)] {
+        let prompt = &ids[..length];
+        let reference = generate_ar(&mut session, prompt, 64, &[]).expect("invariant: AR");
+        let oracle = |_: usize, emitted: usize, rank: usize, _: usize| {
+            *reference
+                .tokens
+                .get(emitted + 1 + rank)
+                .expect("invariant: draft d'oracle dans la sortie AR")
+        };
+        let failing = SpecOptions {
+            overrides: Some(&oracle),
+            fail_rebuild: Some((2, pair)),
+            ..SpecOptions::default()
+        };
+        let error = generate_speculative(&mut session, prompt, 64, 3, &[], &failing)
+            .err()
+            .expect("invariant: échec injecté");
+        assert!(
+            error.to_string().contains("injecté"),
+            "{length} : erreur inattendue {error}"
+        );
+        assert_eq!(
+            session.mtp_rows(),
+            Some(length + 8),
+            "{length} : lignes MTP"
+        );
+        assert_eq!(
+            session.position(),
+            length + 12,
+            "{length} : position du tronc"
+        );
+        let state = mtp_state(&mut session);
+        let mut sequence = prompt.to_vec();
+        sequence.extend_from_slice(&reference.tokens);
+        reference_drafts(&mut session, &sequence[..=length + 8]);
+        assert!(
+            mtp_state(&mut session) == state,
+            "{length} : historique MTP après un échec de reconstruction"
+        );
+    }
+    let (_, prompt) = &prompts[1];
 
     // Draft d'arrêt accepté : jeton d'arrêt = un D_1 accepté dont c'est la
     // première occurrence dans la sortie.

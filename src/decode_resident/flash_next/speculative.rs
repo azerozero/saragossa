@@ -235,8 +235,8 @@ pub(crate) fn generate_speculative(
         // enchaînés écrivent ensuite dans l'anneau de l'indexeur MTP.
         let mut clean = base_rows;
         let fail = |session: &mut FlashNextSession, clean: usize, error: InferError| {
-            // La troncature est refusée si la session est invalidée : l'erreur
-            // d'origine prime.
+            // La troncature est refusée sur une session invalidée ou en
+            // attente de vérification ; l'erreur d'origine prime.
             let _ = session.mtp_truncate(clean);
             error
         };

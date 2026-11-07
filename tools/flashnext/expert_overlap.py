@@ -30,7 +30,7 @@ def main(path: str, top_k: int = 10) -> None:
             tokens = top.shape[0]
             for rows, means in per_rows.items():
                 distinct = []
-                for t in range(0, tokens - rows, rows):
+                for t in range(0, tokens - rows + 1, rows):
                     counts = {}
                     for row in top[t : t + rows].tolist():
                         for expert in row:

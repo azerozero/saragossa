@@ -787,6 +787,18 @@ impl FlashNextSession {
         })
     }
 
+    /// Erreur sur une session invalidée (erreur GPU, reset incomplet ou
+    /// restauration MTP manquée) : seul un `reset` réussi la réhabilite.
+    fn refuse_poisoned(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(InferError::Metal(
+                "Flash-Next résident : session invalidée (erreur GPU ou reset incomplet)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Erreur si une vérification attend son [`Self::accept`].
     fn refuse_pending(&self) -> Result<()> {
         if self.pending.is_some() {
@@ -1362,6 +1374,7 @@ impl FlashNextSession {
                     &m.h_normed,
                     &m.fh,
                     &m.out,
+                    &m.raw_snapshot,
                 ]
                 .iter()
                 .map(|b| b.length())
@@ -1897,20 +1910,29 @@ impl FlashNextSession {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur sans tête MTP, si `rows` dépasse l'historique, ou si
-    /// le bloc en cours n'est pas vide sans instantané pris à `rows` lignes.
+    /// Renvoie une erreur sur une session invalidée, sans tête MTP, si `rows`
+    /// dépasse l'historique, ou si le bloc en cours n'est pas vide sans
+    /// instantané pris à `rows` lignes. Un échec de la copie de restauration
+    /// invalide la session.
     #[cfg_attr(
         not(test),
         allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
     )]
     pub(crate) fn mtp_truncate(&mut self, rows: usize) -> Result<()> {
+        self.refuse_poisoned()?;
         self.refuse_pending()?;
         let (Some(mtp), Some(LayerState::Full(full))) = (&self.mtp, self.states.last_mut()) else {
             return Err(InferError::Config(
                 "Flash-Next : tête MTP absente".to_string(),
             ));
         };
-        if full.0.len() == rows {
+        let len = full.0.len();
+        if rows > len {
+            return Err(InferError::Config(format!(
+                "troncature MTP à {rows} lignes au-delà de l'historique ({len})"
+            )));
+        }
+        if len == rows {
             return Ok(());
         }
         // Les lignes retirées ont écrit `raw[ligne % compress]` : sans
@@ -1928,9 +1950,15 @@ impl FlashNextSession {
         if !restore {
             return Ok(());
         }
-        let len = (mtp.raw_snapshot.length() / 4) as usize;
+        let words = (mtp.raw_snapshot.length() / 4) as usize;
         let (snapshot, raw) = (mtp.raw_snapshot.clone(), full.1.raw.clone());
-        self.copy_f32(&snapshot, &raw, len)
+        // Longueur déjà réduite : une restauration manquée laisserait des clés
+        // brutes retirées sous un historique d'apparence valide.
+        let restored = self.copy_f32(&snapshot, &raw, words);
+        if restored.is_err() {
+            self.poisoned = true;
+        }
+        restored
     }
 
     /// Instantané de l'anneau des clés brutes de l'indexeur MTP aux lignes
@@ -1942,6 +1970,7 @@ impl FlashNextSession {
     /// Renvoie une erreur si une vérification est en attente, sans tête MTP ou
     /// sur copie Metal.
     pub(crate) fn mtp_snapshot_raw(&mut self) -> Result<()> {
+        self.refuse_poisoned()?;
         self.refuse_pending()?;
         self.mtp_raw_rows = None;
         let (Some(mtp), Some(LayerState::Full(full))) = (&self.mtp, self.states.last()) else {
