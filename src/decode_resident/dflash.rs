@@ -300,6 +300,32 @@ impl DFlashResident {
         self.context_len
     }
 
+    #[cfg(test)]
+    pub(super) fn context_kv_for_test(&self) -> impl Iterator<Item = &FullAttentionMetalState> {
+        self.layers.iter().map(|layer| &layer.kv)
+    }
+
+    /// Fixe l'origine du suffixe avant tout append. Prévalide toutes les couches
+    /// pour respecter le contrat d'arène vide de `FullAttentionMetalState::rebase`.
+    pub(crate) fn rebase(&mut self, base: usize) -> Result<()> {
+        if self.context_len != 0
+            || self.layers.iter().any(|layer| {
+                !layer.sliding_window.is_some_and(|w| w > 0)
+                    || !layer.kv.dflash_dense_unadopted()
+                    || layer.kv.len() != 0
+            })
+        {
+            return Err(InferError::Dimension(
+                "DFlash rebase exige des arènes denses vides et fenêtrées".to_string(),
+            ));
+        }
+        for layer in &mut self.layers {
+            layer.kv.rebase(base)?;
+        }
+        self.context_len = base;
+        Ok(())
+    }
+
     /// Déclare `rows` positions de contexte jamais projetées (début du prompt hors
     /// fenêtre) : le KV avance sans écriture, les positions restent absolues.
     ///
@@ -521,6 +547,21 @@ impl DFlashResident {
             return Err(InferError::Dimension(
                 "drafter résident: bloc vide".to_string(),
             ));
+        }
+        for layer in &self.layers {
+            layer
+                .kv
+                .check_dflash_window(self.context_len, layer.sliding_window)?;
+            if layer
+                .kv
+                .stored_len()
+                .checked_add(block)
+                .is_none_or(|len| len > layer.kv.capacity())
+            {
+                return Err(InferError::Dimension(
+                    "DFlash bloc dépasse la capacité KV".to_string(),
+                ));
+            }
         }
         let dims = self.dims;
         let elements = block * dims.hidden;
@@ -931,7 +972,7 @@ fn encode_block_attention(
     let window = layer.sliding_window;
     let windowed = window.is_some_and(|window| context_len + block > window);
     if (!windowed || crate::runtime_flags::dflash_windowed_rows())
-        && layer.kv.rows_fused_supported()
+        && (layer.kv.rows_fused_supported() || layer.kv.dflash_rows_supported(window))
     {
         layer.kv.encode_append_kv_rows(
             encoder,

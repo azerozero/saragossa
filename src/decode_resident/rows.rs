@@ -939,6 +939,17 @@ impl FullAttentionMetalState {
             && self.head_dim() % 32 == 0
     }
 
+    /// Exception réservée au drafter : la translation conserve pour chaque
+    /// ligne min(N, W), donc les mêmes SIMD, partitions split-K et chunks.
+    /// Le prédicat partagé avec la cible reste inchangé.
+    pub(super) fn dflash_rows_supported(&self, window: Option<usize>) -> bool {
+        window.is_some_and(|w| w > 0)
+            && self.dflash_dense_unadopted()
+            && flash_sdpa_enabled()
+            && self.head_dim() <= 256
+            && self.head_dim() % 32 == 0
+    }
+
     /// Append des `rows` K puis V (lignes contiguës à partir de `len`) en deux
     /// dispatches ; `k_buf`/`v_buf` sont lus à `offset + row·stride` (éléments).
     ///
@@ -1089,6 +1100,16 @@ impl FullAttentionMetalState {
             return Err(InferError::Dimension(format!(
                 "attention rows: rows={rows} hors [1, len={len}]"
             )));
+        }
+        // Longueurs locales pour les adresses, fenêtre inchangée : si la base
+        // dépasse N-W, min(longueur locale, W) ne serait plus celle du KV plein.
+        if self.len() != len {
+            self.check_dflash_window(self.len() - rows, window)?;
+            if !self.dflash_rows_supported(window) {
+                return Err(InferError::Config(
+                    "attention rows: base hors périmètre drafter".to_string(),
+                ));
+            }
         }
         let (kernels, tree) = kernels.select()?;
         if let Some(tree) = &tree {

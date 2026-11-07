@@ -305,6 +305,11 @@ Chantier mesuré machine libre (`dflash_resident.sh` dans le scratchpad : `oracl
   génération écrase le fichier, y compris sous `serve`).
   Au-delà de la fenêtre, l'attention du bloc passe en lignes (un dispatch par
   couche) ; `SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS=0` rétablit la boucle naïve.
+  `SARAGOSSA_RUST_DFLASH_DRAFTER_BASE=1` (défaut) fixe la base du KV au début
+  du suffixe utile du prompt : capacité `P − skip + max_new + B + 1`, où B
+  inclut l'ancre. Réservé aux drafters dont la liste complète des couches est
+  fenêtrée ; sinon, repli intégral sur la capacité pleine. `=0` conserve le
+  KV plein pour comparaison. Aucun compactage ; mémoire résiduelle O(max_new).
 
 Oracle modèle réel (32 tokens) : résident == CPU == AR en dense et en u4, mêmes
 acceptations (26 / 30). Acceptance CPU sur 64 tokens, acceptés / proposés :

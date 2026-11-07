@@ -12,6 +12,53 @@ use crate::decode_resident::GpuTensor;
 use crate::metal_backend::{commit_and_wait, read_f32_buffer, read_u32_buffer, MetalExecutor};
 use crate::DFlashDraft;
 
+/// Le loader valide les types et le nombre de couches avant cette décision.
+fn drafter_window(types: &[String], window: Option<usize>) -> Option<usize> {
+    types
+        .iter()
+        .all(|kind| kind == "sliding_attention")
+        .then_some(window)
+        .flatten()
+        .filter(|&window| window > 0)
+}
+
+/// Valide la couverture avant l'allocation et calcule la réserve physique.
+fn drafter_layout(
+    prompt: usize,
+    max_new: usize,
+    block: usize,
+    window: Option<usize>,
+    captured_from: usize,
+    captured_rows: usize,
+    fixed_base: bool,
+) -> Result<(usize, usize)> {
+    let required_from = prompt.saturating_sub(window.unwrap_or(usize::MAX));
+    let skip = required_from.max(captured_from);
+    let covered = captured_from
+        .checked_add(captured_rows)
+        .is_some_and(|end| end >= prompt);
+    if skip > required_from || !covered {
+        return Err(InferError::Dimension(format!(
+            "DFlash captures insuffisantes: origine={captured_from}, lignes={captured_rows}, suffixe requis={required_from}..{prompt}"
+        )));
+    }
+    let base = if fixed_base && window.is_some() {
+        skip
+    } else {
+        0
+    };
+    // NOTE: la base fixe supprime le coût du préfixe, mais la mémoire résiduelle
+    // reste O(max_new). Ajouter un compactage seulement si un cas serve à très
+    // grand max_new l'exige ; aucun déplacement KV dans cette version.
+    let capacity = prompt
+        .checked_sub(base)
+        .and_then(|n| n.checked_add(max_new))
+        .and_then(|n| n.checked_add(block))
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| InferError::Shape("DFlash capacité déborde".to_string()))?;
+    Ok((skip, capacity))
+}
+
 /// Forme des drafts vérifiés à chaque tour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::decoder) enum DFlashTreeMode {
@@ -266,7 +313,9 @@ impl CausalDecoder {
         let draft_limit = max_draft_tokens
             .min(draft.info.block_size)
             .min(max_new_tokens);
-        let block = draft_limit + 1;
+        let block = draft_limit
+            .checked_add(1)
+            .ok_or_else(|| InferError::Shape("DFlash bloc déborde".to_string()))?;
         if let DFlashTreeMode::BestFirst(budget) = tree_mode {
             // Arbre du sélecteur DFlash 2, au plus `B + 1` lignes dans le journal
             // linéaire (16, vérifié couche par couche plus bas).
@@ -308,19 +357,26 @@ impl CausalDecoder {
         // Toutes les couches fenêtrées : seules les `window` dernières positions du
         // prompt sont attendues, les précédentes ne sont jamais lues (ni gardées
         // dans le cache de préfixe).
-        let all_sliding = !draft.info.layer_types.is_empty()
-            && draft
-                .info
-                .layer_types
-                .iter()
-                .all(|kind| kind == "sliding_attention");
-        let keep_rows = draft
-            .info
-            .sliding_window
-            .filter(|_| all_sliding)
-            .unwrap_or(usize::MAX);
+        let window = drafter_window(&draft.info.layer_types, draft.info.sliding_window);
+        let fixed_base = window.is_some() && crate::runtime_flags::dflash_drafter_base();
+        let keep_rows = window.unwrap_or(usize::MAX);
         let (mut cache, final_state, target_hidden, captured_from) =
             self.prefill_cache_state_with_layer_capture_cached(prompt, layer_ids, keep_rows)?;
+        let (captured_rows, captured_cols) = target_hidden.as_matrix()?;
+        if captured_cols != context_cols {
+            return Err(InferError::Dimension(
+                "DFlash captures: largeur invalide".to_string(),
+            ));
+        }
+        let (skip, capacity) = drafter_layout(
+            prompt.len(),
+            max_new_tokens,
+            block,
+            window,
+            captured_from,
+            captured_rows,
+            fixed_base,
+        )?;
         // Même règle KV que la vérification MTP (`resident_kv_bf16`) : bf16 au-delà du
         // seuil greedy, où la lecture du KV domine la vérification en lignes. Le
         // drafter garde son propre KV dense ; la boucle CPU de référence reste f32.
@@ -360,11 +416,6 @@ impl CausalDecoder {
         }
         let top_k = draft.selector.as_ref().map_or(1, |selector| selector.top_k);
         let rank = draft.selector.as_ref().map_or(0, |selector| selector.rank);
-        let capacity = prompt
-            .len()
-            .checked_add(max_new_tokens)
-            .and_then(|value| value.checked_add(block + 1))
-            .ok_or_else(|| InferError::Shape("DFlash capacité déborde".to_string()))?;
         let (mut drafter, buffers) = {
             let arena = cache.resident.as_mut().ok_or_else(|| {
                 InferError::Config("decode DFlash résident: arène absente".to_string())
@@ -394,8 +445,11 @@ impl CausalDecoder {
         };
         // Les captures ne couvrent que `captured_from..prompt.len()` : le contexte
         // du drafter commence au plus tôt là.
-        let skip = prompt.len().saturating_sub(keep_rows).max(captured_from);
-        drafter.skip_context(skip)?;
+        if fixed_base {
+            drafter.rebase(skip)?;
+        } else {
+            drafter.skip_context(skip)?;
+        }
         self.dflash_resident_append_context(
             &mut cache,
             metal,
@@ -1257,6 +1311,87 @@ mod sampled_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drafter_base_layout_cpu() -> Result<()> {
+        let (window, max_new, block) = (64, 128, 9);
+        for prompt in [3usize, 63, 64, 65, 4096] {
+            let skip = prompt.saturating_sub(window);
+            for captured_from in [0, skip] {
+                assert_eq!(
+                    drafter_layout(
+                        prompt,
+                        max_new,
+                        block,
+                        Some(window),
+                        captured_from,
+                        prompt - captured_from,
+                        true
+                    )?,
+                    (skip, prompt - skip + max_new + block + 1)
+                );
+                assert_eq!(
+                    drafter_layout(
+                        prompt,
+                        max_new,
+                        block,
+                        Some(window),
+                        captured_from,
+                        prompt - captured_from,
+                        false
+                    )?,
+                    (skip, prompt + max_new + block + 1)
+                );
+            }
+            assert_eq!(
+                drafter_layout(prompt, max_new, block, None, 0, prompt, true)?,
+                (0, prompt + max_new + block + 1)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn drafter_base_refusals_cpu() {
+        for (prompt, from, rows) in [(100, 37, 63), (100, 36, 63), (100, 101, 0), (3, 1, 2)] {
+            for enabled in [false, true] {
+                assert!(matches!(
+                    drafter_layout(prompt, 8, 4, Some(64), from, rows, enabled),
+                    Err(InferError::Dimension(_))
+                ));
+            }
+        }
+        assert!(matches!(
+            drafter_layout(100, 8, 4, None, 1, 99, true),
+            Err(InferError::Dimension(_))
+        ));
+        assert!(matches!(
+            drafter_layout(100, 8, 4, Some(64), 36, usize::MAX, true),
+            Err(InferError::Dimension(_))
+        ));
+        for (prompt, max_new, block) in [
+            (usize::MAX, usize::MAX, 0),
+            (1, usize::MAX, 1),
+            (1, 0, usize::MAX),
+            (1, 0, usize::MAX - 1),
+        ] {
+            assert!(matches!(
+                drafter_layout(prompt, max_new, block, Some(64), 0, prompt, true),
+                Err(InferError::Shape(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn drafter_base_eligibility_cpu() {
+        let sliding = vec!["sliding_attention".to_string(); 2];
+        assert_eq!(drafter_window(&sliding, Some(64)), Some(64));
+        let mixed = vec![
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+        ];
+        assert_eq!(drafter_window(&mixed, Some(64)), None);
+    }
 
     #[test]
     fn verify_rows_follow_the_tree_budget() {
