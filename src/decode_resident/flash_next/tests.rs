@@ -1993,6 +1993,248 @@ fn profile_resident_decode_after_1k_context() {
         );
     }
     profile_rows_rest(&session).expect("invariant: profil du reste");
+    profile_rows_deltanet_moe(&session).expect("invariant: profil DeltaNet et MoE");
+}
+
+/// Étape 6 D, mesures in situ sur les vrais poids (toutes les couches, donc
+/// lues depuis la DRAM), en vérification greedy stricte : couche DeltaNet
+/// entière contre ses matmuls en R lignes (reste in situ = scan, conv, normes,
+/// portes), et MoE entier en R lignes par le kernel existant contre le MoE
+/// mono, avec l'exactitude au bit de chaque ligne. Chauffe, puis minimum de 3.
+/// Les états DeltaNet avancent : la session n'est plus utilisable ensuite.
+#[cfg(feature = "devtools")]
+fn profile_rows_deltanet_moe(session: &FlashNextSession) -> Result<()> {
+    use crate::metal_backend::{
+        install_verify_greedy_scope, with_verify_strict_override,
+        MetalLinearAttnResidentPairWeights,
+    };
+    let (executor, _, _, hidden) = session.head_parts();
+    let parts = session.deltanet_and_moe();
+    let queue = executor.device().new_command_queue();
+    let best_of = |encode: &dyn Fn(
+        &metal::ComputeCommandEncoderRef,
+        &mut Vec<Buffer>,
+    ) -> Result<()>|
+     -> Result<f64> {
+        let mut best = f64::INFINITY;
+        for round in 0..4 {
+            let mut owned = Vec::new();
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encode(encoder, &mut owned)?;
+            encoder.end_encoding();
+            let started = std::time::Instant::now();
+            commit_and_wait(command_buffer)?;
+            if round > 0 {
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+        }
+        Ok(best)
+    };
+    let same_bits = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .all(|(x, y)| x.to_bits() == y.to_bits() || (*x == 0.0 && *y == 0.0))
+    };
+    let value_dim = parts.dims.value_dim;
+    let mut rng = DeterministicF32::new(0x6f);
+    let x_host = rng.fill(4 * hidden, -1.0, 1.0);
+    let v_host = rng.fill(4 * value_dim, -1.0, 1.0);
+    let x = buffer(executor, &x_host);
+    let v = buffer(executor, &v_host);
+    let x_rows: Vec<_> = (0..4)
+        .map(|r| buffer(executor, &x_host[r * hidden..(r + 1) * hidden]))
+        .collect();
+    let v_rows: Vec<_> = (0..4)
+        .map(|r| buffer(executor, &v_host[r * value_dim..(r + 1) * value_dim]))
+        .collect();
+    // Matmuls d'une couche DeltaNet par leurs poids séparés : (poids, entrée en
+    // lignes, entrées par ligne, dimension d'entrée).
+    fn projections(
+        w: &crate::metal_backend::MetalLinearAttnResidentDenseWeights,
+    ) -> Vec<(&MetalLinearWeightBuffers, bool)> {
+        let mut list = Vec::new();
+        for pair in [&w.qkv_z, &w.beta_gate] {
+            match pair {
+                MetalLinearAttnResidentPairWeights::Concat(weight) => list.push((weight, true)),
+                MetalLinearAttnResidentPairWeights::Split { first, second } => {
+                    list.push((first, true));
+                    list.push((second, true));
+                }
+            }
+        }
+        list.push((&w.out_proj, false));
+        list
+    }
+    let max_out = 4 * (parts.dims.conv_dim + 2 * value_dim + hidden);
+    let out = zeros(executor, max_out);
+    let _greedy = install_verify_greedy_scope(true);
+    with_verify_strict_override(true, || -> Result<()> {
+        let layer_out = zeros(executor, hidden);
+        let t_dn = best_of(&|encoder, _| {
+            for (weights, state) in &parts.linear {
+                executor.encode_linear_attn_resident_dense_buffers(
+                    encoder, &x_rows[0], None, &layer_out, weights, state, parts.spec, parts.dims,
+                )?;
+            }
+            Ok(())
+        })?;
+        let mut line = format!(
+            "DeltaNet in situ ({} couches) : couche entière {:.3} ms",
+            parts.linear.len(),
+            t_dn * 1e3
+        );
+        let mut mono = 0.0;
+        for rows in 1..=4 {
+            let t = best_of(&|encoder, _| {
+                for (weights, _) in &parts.linear {
+                    for (weight, on_x) in projections(weights) {
+                        let (input, in_dim) = if on_x { (&x, hidden) } else { (&v, value_dim) };
+                        executor
+                            .encode_matmul_weight_buffers(
+                                encoder, input, rows, in_dim, weight, &out, true,
+                            )
+                            .map(|_| ())?;
+                    }
+                }
+                Ok(())
+            })?;
+            if rows == 1 {
+                mono = t;
+                line += &format!(
+                    " ; matmuls R1 {:.3} ms, reste in situ {:.3} ms",
+                    t * 1e3,
+                    (t_dn - t) * 1e3
+                );
+            } else {
+                line += &format!(" ; matmuls R{rows} {:.3} ms (ρ {:.2})", t * 1e3, t / mono);
+            }
+        }
+        // Exactitude des projections de la première couche, R = 4.
+        let mut exact = true;
+        if let Some((weights, _)) = parts.linear.first() {
+            for (weight, on_x) in projections(weights) {
+                let (input, rows_in, in_dim) = if on_x {
+                    (&x, &x_rows, hidden)
+                } else {
+                    (&v, &v_rows, value_dim)
+                };
+                let command_buffer = queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                let out_dim = executor
+                    .encode_matmul_weight_buffers(encoder, input, 4, in_dim, weight, &out, true)?;
+                let singles: Vec<_> = (0..4).map(|_| zeros(executor, out_dim)).collect();
+                for (row, single) in rows_in.iter().zip(&singles) {
+                    executor.encode_matmul_weight_buffers(
+                        encoder, row, 1, in_dim, weight, single, true,
+                    )?;
+                }
+                encoder.end_encoding();
+                commit_and_wait(command_buffer)?;
+                let all = read_f32_buffer(&out, 4 * out_dim)?;
+                for (r, single) in singles.iter().enumerate() {
+                    exact &= same_bits(
+                        &read_f32_buffer(single, out_dim)?,
+                        &all[r * out_dim..(r + 1) * out_dim],
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "{line} ; lignes {}",
+            if exact { "exactes" } else { "NON exactes" }
+        );
+
+        // MoE : mono (chemin du pas) puis lignes (kernel de vérification).
+        let moe_out = zeros(executor, 4 * hidden);
+        let residual = zeros(executor, 4 * hidden);
+        let t_moe = best_of(&|encoder, owned| {
+            for weights in &parts.moe {
+                executor.encode_moe_shared_buffers(
+                    encoder,
+                    owned,
+                    &x_rows[0],
+                    None,
+                    &moe_out,
+                    hidden,
+                    weights,
+                    parts.top_k,
+                )?;
+            }
+            Ok(())
+        })?;
+        let mut line = format!(
+            "MoE in situ ({} couches) : mono {:.3} ms",
+            parts.moe.len(),
+            t_moe * 1e3
+        );
+        for rows in 2..=4 {
+            let t = best_of(&|encoder, owned| {
+                for weights in &parts.moe {
+                    executor.encode_moe_shared_buffers_verify_rows(
+                        encoder,
+                        owned,
+                        &x,
+                        &residual,
+                        &moe_out,
+                        rows,
+                        hidden,
+                        weights,
+                        parts.top_k,
+                    )?;
+                }
+                Ok(())
+            })?;
+            line += &format!(" ; R{rows} {:.3} ms (ρ {:.2})", t * 1e3, t / t_moe);
+        }
+        // Exactitude, R = 4, couche par couche : chaque ligne contre son MoE mono.
+        let mut exact_layers = 0;
+        for weights in &parts.moe {
+            let mut owned = Vec::new();
+            let singles: Vec<_> = (0..4).map(|_| zeros(executor, hidden)).collect();
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            executor.encode_moe_shared_buffers_verify_rows(
+                encoder,
+                &mut owned,
+                &x,
+                &residual,
+                &moe_out,
+                4,
+                hidden,
+                weights,
+                parts.top_k,
+            )?;
+            for (row, single) in x_rows.iter().zip(&singles) {
+                executor.encode_moe_shared_buffers(
+                    encoder,
+                    &mut owned,
+                    row,
+                    None,
+                    single,
+                    hidden,
+                    weights,
+                    parts.top_k,
+                )?;
+            }
+            encoder.end_encoding();
+            commit_and_wait(command_buffer)?;
+            let all = read_f32_buffer(&moe_out, 4 * hidden)?;
+            let mut layer_exact = true;
+            for (r, single) in singles.iter().enumerate() {
+                layer_exact &= same_bits(
+                    &read_f32_buffer(single, hidden)?,
+                    &all[r * hidden..(r + 1) * hidden],
+                );
+            }
+            exact_layers += usize::from(layer_exact);
+        }
+        eprintln!(
+            "{line} ; lignes exactes sur {exact_layers}/{} couches",
+            parts.moe.len()
+        );
+        Ok(())
+    })
 }
 
 /// Étape 6 D, reste du pas hors matmuls : latence d'un dispatch suivi d'une
@@ -4225,6 +4467,124 @@ fn speculative_greedy_matches_ar_bitwise() {
         "identité spéculative : tout vert en {:.0} s",
         started.elapsed().as_secs_f64()
     );
+}
+
+/// Étape 6 D, mesure (2) : acceptation d'un draft restreint à un
+/// sous-vocabulaire, sur C à profondeur 3. Le sous-vocabulaire (les 32 000
+/// jetons les plus fréquents, ou tous les jetons vus, plus EOS) est choisi sur
+/// un corpus distinct des prompts d'évaluation : wikitext `corpus32k`,
+/// `code4k-2`, `code4k-3`, `chat-1` à `chat-6`. Évaluation : golden 512
+/// (prose) et `code4k-1` (code, 1024 jetons), 256 jetons, drafts pleins puis
+/// restreints ; identité à l'AR vérifiée. Publié sans porte.
+#[test]
+#[ignore = "mesure : poids réels, machine libre"]
+fn measure_subvocab_draft_acceptance() {
+    use super::speculative::{generate_ar, generate_speculative, Generation, SpecOptions};
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let corpus = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
+            .expect("SARAGOSSA_FLASH_NEXT_CORPUS requis"),
+    );
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("invariant: tokenizer");
+    let fixture = |name: &str| -> Vec<usize> {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rowsexact")
+                .join(name),
+        )
+        .expect("invariant: fixture");
+        tokenizer
+            .encode(text, false)
+            .expect("invariant: tokenisation")
+            .get_ids()
+            .iter()
+            .map(|&t| t as usize)
+            .collect()
+    };
+    let ckpt = Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint");
+    let (vocab, eos) = (ckpt.config.vocab, ckpt.config.eos as usize);
+    // Fréquences sur le corpus distinct des prompts d'évaluation.
+    let mut counts = vec![0usize; vocab];
+    let mut seen_tokens = 0usize;
+    let wiki: Vec<usize> = std::fs::read(corpus.join("ids.u32"))
+        .expect("invariant: corpus")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+        .collect();
+    let mut sources = vec![wiki];
+    for name in ["code4k-2.txt", "code4k-3.txt"]
+        .into_iter()
+        .map(String::from)
+        .chain((1..=6).map(|i| format!("chat-{i}.txt")))
+    {
+        sources.push(fixture(&name));
+    }
+    for &token in sources.iter().flatten() {
+        if let Some(count) = counts.get_mut(token) {
+            *count += 1;
+            seen_tokens += 1;
+        }
+    }
+    let mut ranked: Vec<usize> = (0..vocab).filter(|&t| counts[t] > 0).collect();
+    ranked.sort_by(|a, b| counts[*b].cmp(&counts[*a]).then(a.cmp(b)));
+    ranked.truncate(32_000);
+    let mut mask = vec![false; vocab];
+    for &token in &ranked {
+        mask[token] = true;
+    }
+    mask[eos] = true;
+    let size = mask.iter().filter(|&&keep| keep).count();
+    eprintln!("sous-vocabulaire : {size} jetons ({seen_tokens} jetons de corpus)");
+
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let code = fixture("code4k-1.txt");
+    let prompts = [
+        ("prose (golden 512)", ids[..512].to_vec()),
+        ("code (code4k-1)", code[..1024.min(code.len())].to_vec()),
+    ];
+    let generated = 256;
+    let mut session = FlashNextSession::open(
+        ckpt,
+        1024 + generated + 4,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    let per_cycle = |g: &Generation| {
+        g.accepted.iter().map(|k| k + 1).sum::<usize>() as f64 / g.accepted.len().max(1) as f64
+    };
+    let restricted = SpecOptions {
+        draft_vocab: Some(&mask),
+        ..SpecOptions::default()
+    };
+    for (label, prompt) in &prompts {
+        let ar = generate_ar(&mut session, prompt, generated, &[]).expect("invariant: AR");
+        let covered = ar.tokens.iter().filter(|&&t| mask[t]).count();
+        let full = generate_speculative(
+            &mut session,
+            prompt,
+            generated,
+            3,
+            &[],
+            &SpecOptions::default(),
+        )
+        .expect("invariant: spéculatif");
+        let sub = generate_speculative(&mut session, prompt, generated, 3, &[], &restricted)
+            .expect("invariant: spéculatif restreint");
+        assert_eq!(full.tokens, ar.tokens, "{label} : drafts pleins ≠ AR");
+        assert_eq!(sub.tokens, ar.tokens, "{label} : drafts restreints ≠ AR");
+        eprintln!(
+            "{label} : sortie AR couverte {covered}/{} ; profondeur 3 : {:.2} jetons par cycle (pleins), {:.2} (restreints)",
+            ar.tokens.len(),
+            per_cycle(&full),
+            per_cycle(&sub)
+        );
+    }
 }
 
 /// Débit du décodage spéculatif en pas mono (étape 6 C), publié sans porte :

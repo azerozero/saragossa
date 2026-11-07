@@ -79,6 +79,10 @@ pub(crate) struct SpecOptions<'a> {
     /// l'historique MTP, après l'acceptation.
     #[cfg(test)]
     pub(crate) fail_rebuild: Option<(usize, usize)>,
+    /// Mesure (étape 6 D) : drafts restreints à un sous-vocabulaire (masque
+    /// par jeton), argmax des logits MTP pris sur l'hôte.
+    #[cfg(test)]
+    pub(crate) draft_vocab: Option<&'a [bool]>,
 }
 
 /// AR glouton de référence : `max_tokens` jetons après `prompt`.
@@ -239,14 +243,21 @@ pub(crate) fn generate_speculative(
         // Drafts : D_1 sur la paire vérifiée (h_p, y), puis enchaînés. Sans
         // draft possible (capacité, budget), la paire (h_p, y) est ajoutée seule.
         let mut drafts = Vec::with_capacity(d);
+        #[cfg(test)]
+        let logits = options.draft_vocab.is_some();
+        #[cfg(not(test))]
+        let logits = false;
         for i in 0..d.max(1) {
             let step = if i == 0 {
-                session.mtp_step(MtpInput::Host(&h), y, false, false)
+                session.mtp_step(MtpInput::Host(&h), y, logits, false)
             } else {
                 match session.mtp_hidden_buffer().cloned() {
-                    Some(previous) => {
-                        session.mtp_step(MtpInput::Resident(&previous), drafts[i - 1], false, false)
-                    }
+                    Some(previous) => session.mtp_step(
+                        MtpInput::Resident(&previous),
+                        drafts[i - 1],
+                        logits,
+                        false,
+                    ),
                     None => Err(InferError::Config("tête MTP absente".to_string())),
                 }
             };
@@ -261,6 +272,12 @@ pub(crate) fn generate_speculative(
                 clean = base_rows + 1;
             }
             if i < d {
+                #[cfg(test)]
+                let draft = match (options.draft_vocab, &step.logits) {
+                    (Some(vocab), Some(logits)) => restricted_argmax(logits, vocab)?,
+                    _ => step.argmax as usize,
+                };
+                #[cfg(not(test))]
                 let draft = step.argmax as usize;
                 let emitted = out.tokens.len();
                 drafts.push(
@@ -354,4 +371,24 @@ pub(crate) fn generate_speculative(
     out.residuals.truncate(out.tokens.len());
     out.decode = started.elapsed();
     Ok(out)
+}
+
+/// Argmax des logits restreint aux jetons du masque (premier indice en cas
+/// d'égalité, comme l'argmax GPU).
+#[cfg(test)]
+fn restricted_argmax(logits: &[f32], vocab: &[bool]) -> Result<usize> {
+    logits
+        .iter()
+        .zip(vocab)
+        .enumerate()
+        .filter(|(_, (_, &keep))| keep)
+        .fold(
+            None,
+            |best: Option<(usize, f32)>, (i, (&value, _))| match best {
+                Some((_, top)) if top >= value => best,
+                _ => Some((i, value)),
+            },
+        )
+        .map(|(i, _)| i)
+        .ok_or_else(|| InferError::Config("sous-vocabulaire de draft vide".to_string()))
 }

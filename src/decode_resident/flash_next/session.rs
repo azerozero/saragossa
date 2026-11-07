@@ -136,6 +136,19 @@ pub(crate) struct StateDigest {
     pub(crate) context: NgramContext,
 }
 
+/// Profil en lignes : couches DeltaNet (poids, état) et MoE du tronc.
+#[cfg(all(test, feature = "devtools"))]
+pub(crate) struct DeltaNetAndMoe<'a> {
+    pub(crate) linear: Vec<(
+        &'a crate::metal_backend::MetalLinearAttnResidentDenseWeights,
+        &'a LinearAttentionMetalState,
+    )>,
+    pub(crate) moe: Vec<&'a crate::metal_backend::MetalMoeSharedWeights>,
+    pub(crate) spec: LinearAttentionStepSpec,
+    pub(crate) dims: LinearAttnResidentDims,
+    pub(crate) top_k: usize,
+}
+
 /// Vérification soumise, en attente de [`FlashNextSession::accept`].
 #[cfg_attr(
     not(test),
@@ -1458,6 +1471,25 @@ impl FlashNextSession {
             &self.weights.lm_head,
             self.ckpt.config.hidden,
         )
+    }
+
+    /// Couches DeltaNet (poids, état) et MoE de toutes les couches, avec leurs
+    /// dimensions (profil en lignes de l'étape 6 D).
+    #[cfg(all(test, feature = "devtools"))]
+    pub(crate) fn deltanet_and_moe(&self) -> DeltaNetAndMoe<'_> {
+        let mut linear = Vec::new();
+        for (layer, state) in self.weights.layers.iter().zip(&self.states) {
+            if let (MixerWeights::Linear(w), LayerState::Linear(state)) = (&layer.mixer, state) {
+                linear.push((&**w, state));
+            }
+        }
+        DeltaNetAndMoe {
+            linear,
+            moe: self.weights.layers.iter().map(|layer| &layer.moe).collect(),
+            spec: self.linear_spec,
+            dims: self.linear_dims,
+            top_k: self.ckpt.config.top_k,
+        }
     }
 
     /// Largeur du résiduel hc (oracles).
