@@ -267,7 +267,16 @@ fn flash_next_ple_steps_match_cpu_sequence_and_reset() -> Result<()> {
         let command_buffer = queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         encode_ple(
-            &kernels, &executor, encoder, &weights, state, &scratch, dims, &h, &out,
+            &kernels,
+            &executor,
+            encoder,
+            &weights,
+            state,
+            &state.bytes.clone(),
+            &scratch,
+            dims,
+            &h,
+            &out,
         )?;
         encoder.end_encoding();
         commit_and_wait(command_buffer)?;
@@ -3442,4 +3451,103 @@ fn n2_resident_mtp_head_matches_cpu() {
         "continuation après reprise : {resumed:.2e}"
     );
     assert!(green, "N2 MTP résidente rouge");
+}
+
+/// Vérification en pas mono contre l'AR, au bit près : après un contexte de
+/// `P` tokens du golden N2 (`P` = 2046..2049, les quatre alignements modulo 4
+/// autour de l'entrée du régime creux), `verify(t_0..t_3)` doit rendre pour
+/// chaque ligne l'argmax et le résiduel hc avant mixer de l'AR (mêmes bits).
+/// Puis, pour chaque `k` de 0 à 3 : `accept(k)` suivi d'un pas sur un token
+/// divergent doit égaler l'AR `t_0..t_k` puis ce token (argmax et résiduels de
+/// toutes les couches) : le retour arrière (DeltaNet, KV, clés brutes, PLE)
+/// est exact. Une seconde vérification, ou un pas, avant `accept` est refusé.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn resident_verify_rows_and_accept_match_ar_bitwise() {
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let rows = super::session::VERIFY_ROWS;
+    let open = || {
+        FlashNextSession::open(
+            Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+            2049 + rows + 2,
+            Some(&crate::MemoryGuard::process()),
+        )
+        .expect("invariant: session")
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let mut ar = open();
+    let mut spec = open();
+    // Token divergent : différent de tous les tokens vérifiés.
+    let divergent = 13;
+    for context in 2046..2050 {
+        let tokens = &ids[context..context + rows];
+        assert!(!tokens.contains(&divergent));
+        ar.reset().expect("invariant: reset");
+        spec.reset().expect("invariant: reset");
+        for &token in &ids[..context] {
+            ar.replay(token).expect("invariant: rejeu AR");
+            spec.replay(token).expect("invariant: rejeu");
+        }
+        let ar_base = ar.checkpoint(None).expect("invariant: point AR");
+        let spec_base = spec.checkpoint(None).expect("invariant: point");
+        // Référence AR : pas t_0..t_3, résiduel avant mixer = sortie de la
+        // dernière couche.
+        let mut want = Vec::new();
+        for &token in tokens {
+            let step = ar.step(token, false, true).expect("invariant: pas AR");
+            let layers = step.layers.expect("invariant: résiduels");
+            want.push((step.argmax, layers[layers.len() - 1].clone()));
+        }
+        for k in 0..rows {
+            spec.restore(&spec_base).expect("invariant: reprise");
+            let got = spec.verify(tokens).expect("invariant: vérification");
+            assert!(
+                spec.verify(tokens).is_err(),
+                "seconde vérification acceptée"
+            );
+            assert!(
+                spec.step(tokens[0], false, false).is_err(),
+                "pas accepté en attente"
+            );
+            for (r, (row, (argmax, residual))) in got.iter().zip(&want).enumerate() {
+                assert_eq!(row.argmax, *argmax, "P {context}, ligne {r} : argmax");
+                assert_eq!(
+                    bits(&row.residual),
+                    bits(residual),
+                    "P {context}, ligne {r} : résiduel"
+                );
+            }
+            assert!(spec.accept(rows).is_err(), "acceptation hors bornes");
+            spec.accept(k).expect("invariant: acceptation");
+            assert_eq!(spec.position(), context + k + 1);
+            let after = spec
+                .step(divergent, false, true)
+                .expect("invariant: continuation");
+            ar.restore(&ar_base).expect("invariant: reprise AR");
+            for &token in &tokens[..=k] {
+                ar.step(token, false, false).expect("invariant: pas AR");
+            }
+            let reference = ar
+                .step(divergent, false, true)
+                .expect("invariant: continuation AR");
+            assert_eq!(
+                after.argmax, reference.argmax,
+                "P {context}, k {k} : argmax"
+            );
+            let (a, b) = (
+                after.layers.expect("invariant: résiduels"),
+                reference.layers.expect("invariant: résiduels"),
+            );
+            for (layer, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(bits(x), bits(y), "P {context}, k {k}, couche {layer}");
+            }
+        }
+        eprintln!("vérification P {context} : 4 lignes et k = 0..3 identiques à l'AR");
+    }
 }

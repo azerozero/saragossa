@@ -79,6 +79,57 @@ pub(crate) struct MtpOutput {
     pub(crate) routing: Option<Vec<u32>>,
 }
 
+/// Lignes maximales d'une vérification : jeton en attente et 3 drafts.
+pub(crate) const VERIFY_ROWS: usize = 4;
+
+/// Tampons préalloués d'une vérification : entrées et sorties propres à chaque
+/// ligne (aucune réécriture hôte d'un tampon encodé), et captures de l'état du
+/// tronc après chaque ligne `r < VERIFY_ROWS − 1`, pour le retour arrière.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+)]
+struct VerifyBuffers {
+    /// `[ligne]` : embedding répété sur les flux (`[hc·hidden]`).
+    embed: Vec<Buffer>,
+    /// `[ligne]` : octets E4M3 PLE (`[ple_dim]`).
+    ple_bytes: Vec<Buffer>,
+    /// `[ligne]` : argmax du lm_head.
+    index: Vec<Buffer>,
+    /// `[ligne]` : résiduel hc avant le mixer final.
+    residual: Vec<Buffer>,
+    /// `[ligne][couche DeltaNet]` : états SSM et fenêtres conv.
+    linear: Vec<Vec<LinearAttentionMetalState>>,
+    /// `[ligne][couche QSA du tronc]` : clés brutes de l'indexeur.
+    raw: Vec<Vec<Buffer>>,
+    /// `[ligne]` : anneau PLE.
+    ring: Vec<Buffer>,
+}
+
+/// Vérification soumise, en attente de [`FlashNextSession::accept`].
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+)]
+struct PendingVerify {
+    position: usize,
+    ple_step: usize,
+    /// Contexte n-gram après chaque ligne.
+    contexts: Vec<NgramContext>,
+    rows: usize,
+}
+
+/// Sortie d'une ligne de vérification.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+)]
+pub(crate) struct VerifyRow {
+    pub(crate) argmax: u32,
+    /// Résiduel hc avant le mixer final (`h` de la MTP pour le cycle suivant).
+    pub(crate) residual: Vec<f32>,
+}
+
 /// Capacité maximale d'une session : 256k tokens (contexte cible, plan §8.1).
 pub(crate) const MAX_CAPACITY: usize = 262_144;
 
@@ -160,6 +211,10 @@ pub(crate) struct FlashNextSession {
     states: Vec<LayerState>,
     /// Tampons de la tête MTP (absents sans tête).
     mtp: Option<MtpBuffers>,
+    /// Tampons et captures des vérifications (sortis pendant une vérification).
+    verify: Option<VerifyBuffers>,
+    /// Vérification soumise non encore acceptée : tout autre pas est refusé.
+    pending: Option<PendingVerify>,
     ple_state: PleState,
     h: [Buffer; 2],
     x: Buffer,
@@ -292,7 +347,12 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
     } else {
         0
     };
-    ((kv + deltanet + ple + session + executor + indexer + mtp) * f32_bytes) as u64
+    // Vérification : entrées et sorties par ligne, captures DeltaNet, clés
+    // brutes et anneau PLE après chaque ligne sauf la dernière.
+    let verify = VERIFY_ROWS * (2 * width + c.ple_dim.div_ceil(f32_bytes) + 1)
+        + (VERIFY_ROWS - 1)
+            * (deltanet / 2 + full * c.indexer_compress * c.indexer_head_dim + ple - c.ple_dim);
+    ((kv + deltanet + ple + session + executor + indexer + mtp + verify) * f32_bytes) as u64
 }
 
 /// Refuse, avant toute allocation, les variantes que le chemin résident ne
@@ -465,6 +525,8 @@ impl FlashNextSession {
                 out: zeros(&executor, width),
             }),
             weights,
+            verify: None,
+            pending: None,
             states: Vec::with_capacity(c.layer_kinds.len() + 1),
             ple_state: PleState {
                 bytes: executor
@@ -588,7 +650,394 @@ impl FlashNextSession {
                 LayerState::Full(_) => Ok(None),
             })
             .collect::<Result<_>>()?;
+        session.verify = Some(session.verify_buffers()?);
         Ok(session)
+    }
+
+    /// Alloue les tampons et captures des vérifications (`VERIFY_ROWS` lignes).
+    fn verify_buffers(&self) -> Result<VerifyBuffers> {
+        let c = &self.ckpt.config;
+        let width = self.hc_dims.width();
+        let device = self.executor.device();
+        let trunk = &self.states[..c.layer_kinds.len()];
+        let captures = VERIFY_ROWS - 1;
+        let mut linear = Vec::with_capacity(captures);
+        let mut raw = Vec::with_capacity(captures);
+        let mut ring = Vec::with_capacity(captures);
+        for _ in 0..captures {
+            linear.push(
+                trunk
+                    .iter()
+                    .filter_map(|state| match state {
+                        LayerState::Linear(state) => {
+                            Some(self.executor.snapshot_linear_attn_state(state))
+                        }
+                        LayerState::Full(_) => None,
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            raw.push(
+                trunk
+                    .iter()
+                    .filter_map(|state| match state {
+                        LayerState::Full(full) => {
+                            Some(zeros(&self.executor, (full.1.raw.length() / 4) as usize))
+                        }
+                        LayerState::Linear(_) => None,
+                    })
+                    .collect(),
+            );
+            ring.push(zeros(
+                &self.executor,
+                (self.ple_state.ring.length() / 4) as usize,
+            ));
+        }
+        let rows = |len: usize| {
+            (0..VERIFY_ROWS)
+                .map(|_| zeros(&self.executor, len))
+                .collect()
+        };
+        Ok(VerifyBuffers {
+            embed: rows(width),
+            ple_bytes: (0..VERIFY_ROWS)
+                .map(|_| device.new_buffer(c.ple_dim as u64, MTLResourceOptions::StorageModeShared))
+                .collect(),
+            index: (0..VERIFY_ROWS)
+                .map(|_| device.new_buffer(4, MTLResourceOptions::StorageModeShared))
+                .collect(),
+            residual: rows(width),
+            linear,
+            raw,
+            ring,
+        })
+    }
+
+    /// Erreur si une vérification attend son [`Self::accept`].
+    fn refuse_pending(&self) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(InferError::Config(
+                "Flash-Next : vérification en attente d'acceptation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Vérifie `tokens` (jeton en attente puis drafts) aux positions suivantes :
+    /// une suite de pas mono du tronc dans **un** command buffer, mêmes kernels
+    /// et mêmes entrées que [`Self::step`] (mêmes bits que l'AR). Chaque ligne a
+    /// ses entrées et sorties ; l'état après chaque ligne `r < R − 1` est capturé.
+    /// La session attend ensuite [`Self::accept`].
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une vérification est déjà en attente, sur nombre de
+    /// lignes, token ou capacité invalides, lecture n-gram, ou encodage et
+    /// exécution Metal (rien n'est engagé si l'encodage échoue ; une erreur GPU
+    /// invalide la session).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+    )]
+    pub(crate) fn verify(&mut self, tokens: &[usize]) -> Result<Vec<VerifyRow>> {
+        if self.poisoned {
+            return Err(InferError::Metal(
+                "Flash-Next résident : session invalidée (erreur GPU ou reset incomplet)"
+                    .to_string(),
+            ));
+        }
+        self.refuse_pending()?;
+        let c = &self.ckpt.config;
+        let rows = tokens.len();
+        if rows == 0 || rows > VERIFY_ROWS || tokens.iter().any(|&t| t >= c.vocab) {
+            return Err(InferError::Shape(format!(
+                "vérification : {rows} lignes (1 à {VERIFY_ROWS}), tokens {tokens:?}"
+            )));
+        }
+        if self.position + rows > self.capacity {
+            return Err(InferError::Config(format!(
+                "Flash-Next : vérification de {rows} lignes au-delà de la capacité {}",
+                self.capacity
+            )));
+        }
+        let width = self.hc_dims.width();
+        let buffers = self
+            .verify
+            .take()
+            .ok_or_else(|| InferError::Config("tampons de vérification absents".to_string()))?;
+        let result = self.verify_with(&buffers, tokens);
+        self.verify = Some(buffers);
+        let pending = result?;
+        let buffers = self
+            .verify
+            .as_ref()
+            .ok_or_else(|| InferError::Config("tampons de vérification absents".to_string()))?;
+        let out = (0..rows)
+            .map(|r| {
+                Ok(VerifyRow {
+                    argmax: read_u32_buffer(&buffers.index[r], 1)?
+                        .first()
+                        .copied()
+                        .ok_or_else(|| {
+                            InferError::Metal("argmax de vérification absent".to_string())
+                        })?,
+                    residual: read_f32_buffer(&buffers.residual[r], width)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>();
+        self.pending = Some(pending);
+        out
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+    )]
+    fn verify_with(&mut self, buffers: &VerifyBuffers, tokens: &[usize]) -> Result<PendingVerify> {
+        let c = &self.ckpt.config;
+        let rows = tokens.len();
+        let width = self.hc_dims.width();
+        // Entrées hôte de toutes les lignes, préparées avant l'encodage.
+        let p = &self.ckpt.ngram_params;
+        let mut context = self.ple_state.context.clone();
+        let mut contexts = Vec::with_capacity(rows);
+        for (r, &token) in tokens.iter().enumerate() {
+            let row = self.ckpt.affine_rows(
+                &Qwen4ExpCheckpoint::trunk("embed_tokens"),
+                None,
+                token..token + 1,
+            )?;
+            let mut streams = Vec::with_capacity(width);
+            for _ in 0..c.hc_count {
+                streams.extend_from_slice(row.data());
+            }
+            write_f32_buffer(&buffers.embed[r], &streams)?;
+            let ids = context.step(
+                token as u64,
+                c.heads_per_ngram,
+                &p.multipliers,
+                &p.vocab_sizes,
+                &p.offsets,
+            );
+            let mut bytes = vec![0_u8; c.ple_dim];
+            self.ckpt.ngram_rows_raw(&ids, &mut bytes)?;
+            crate::metal_backend::write_u8_buffer(&buffers.ple_bytes[r], &bytes)?;
+            contexts.push(context.clone());
+        }
+        let base = (self.position, self.ple_state.step);
+        let kv_lens: Vec<Option<usize>> = self
+            .states
+            .iter()
+            .map(|state| match state {
+                LayerState::Full(full) => Some(full.0.len()),
+                LayerState::Linear(_) => None,
+            })
+            .collect();
+        let queue = self.queue.clone();
+        let command_buffer = queue.new_command_buffer();
+        let mut encoders = Encoders::single(command_buffer);
+        let mut encoded = Ok(());
+        for r in 0..rows {
+            self.position = base.0 + r;
+            encoded = self.encode_verify_row(&mut encoders, buffers, r, r + 1 < rows);
+            if encoded.is_err() {
+                break;
+            }
+        }
+        if let Err(error) = encoded {
+            drop(encoders);
+            self.position = base.0;
+            self.ple_state.step = base.1;
+            for (state, len) in self.states.iter_mut().zip(kv_lens) {
+                if let (LayerState::Full(kv), Some(len)) = (state, len) {
+                    if kv.0.truncate(len).is_err() {
+                        self.poisoned = true;
+                    }
+                }
+            }
+            return Err(error);
+        }
+        encoders.end();
+        if let Err(error) = commit_and_wait(command_buffer) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.position = base.0 + rows;
+        Ok(PendingVerify {
+            position: base.0,
+            ple_step: base.1,
+            contexts,
+            rows,
+        })
+    }
+
+    /// Ligne `r` d'une vérification : embedding de la ligne vers `h[0]`, pas du
+    /// tronc (PLE, couches, mixer, argmax), copie du résiduel, puis captures de
+    /// l'état si une ligne suit.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+    )]
+    fn encode_verify_row(
+        &mut self,
+        encoders: &mut Encoders<'_>,
+        buffers: &VerifyBuffers,
+        r: usize,
+        capture: bool,
+    ) -> Result<()> {
+        let width = self.hc_dims.width();
+        let encoder = encoders.at(Brick::Hc)?;
+        self.executor.encode_copy_with_offsets(
+            encoder,
+            &buffers.embed[r],
+            0,
+            &self.h[0],
+            0,
+            width,
+        )?;
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        let io = TokenIo {
+            ple_bytes: buffers.ple_bytes[r].clone(),
+            index: buffers.index[r].clone(),
+            residual: Some(buffers.residual[r].clone()),
+        };
+        self.encode_token(encoders, false, false, true, &io)?;
+        if !capture {
+            return Ok(());
+        }
+        let encoder = encoders.at(Brick::Hc)?;
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        let c = &self.ckpt.config;
+        let (mut linear, mut full) = (0, 0);
+        for state in &self.states[..c.layer_kinds.len()] {
+            match state {
+                LayerState::Linear(state) => {
+                    self.executor.encode_capture_linear_attn_states(
+                        encoder,
+                        &[(state, &buffers.linear[r][linear])],
+                    )?;
+                    linear += 1;
+                }
+                LayerState::Full(kv) => {
+                    let len = (kv.1.raw.length() / 4) as usize;
+                    self.executor.encode_copy_with_offsets(
+                        encoder,
+                        &kv.1.raw,
+                        0,
+                        &buffers.raw[r][full],
+                        0,
+                        len,
+                    )?;
+                    full += 1;
+                }
+            }
+        }
+        let ring = (self.ple_state.ring.length() / 4) as usize;
+        self.executor.encode_copy_with_offsets(
+            encoder,
+            &self.ple_state.ring,
+            0,
+            &buffers.ring[r],
+            0,
+            ring,
+        )?;
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Engage les `k + 1` premières lignes de la vérification en attente
+    /// (jeton en attente et `k` drafts acceptés) : restaure l'état capturé après
+    /// la ligne `k` (en un command buffer), tronque les KV, et reprend le
+    /// contexte et le pas PLE de cette ligne. Les blocs poolés et les clés
+    /// d'indexeur des lignes rejetées sont réécrits avant d'être lus.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sans vérification en attente, si `k` sort des lignes
+    /// vérifiées, ou sur exécution Metal (session invalidée).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
+    )]
+    pub(crate) fn accept(&mut self, k: usize) -> Result<()> {
+        let pending = self
+            .pending
+            .take()
+            .ok_or_else(|| InferError::Config("aucune vérification en attente".to_string()))?;
+        if k >= pending.rows {
+            let rows = pending.rows;
+            self.pending = Some(pending);
+            return Err(InferError::Config(format!(
+                "acceptation de {} lignes sur {rows} vérifiées",
+                k + 1
+            )));
+        }
+        let c = &self.ckpt.config;
+        if k + 1 < pending.rows {
+            let buffers = self
+                .verify
+                .as_ref()
+                .ok_or_else(|| InferError::Config("tampons de vérification absents".to_string()))?;
+            let command_buffer = self.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            let (mut linear, mut full) = (0, 0);
+            let mut restored = Ok(());
+            for state in &self.states[..c.layer_kinds.len()] {
+                restored = match state {
+                    LayerState::Linear(state) => {
+                        linear += 1;
+                        self.executor.encode_capture_linear_attn_states(
+                            encoder,
+                            &[(&buffers.linear[k][linear - 1], state)],
+                        )
+                    }
+                    LayerState::Full(kv) => {
+                        full += 1;
+                        let len = (kv.1.raw.length() / 4) as usize;
+                        self.executor.encode_copy_with_offsets(
+                            encoder,
+                            &buffers.raw[k][full - 1],
+                            0,
+                            &kv.1.raw,
+                            0,
+                            len,
+                        )
+                    }
+                };
+                if restored.is_err() {
+                    break;
+                }
+            }
+            if restored.is_ok() {
+                let ring = (self.ple_state.ring.length() / 4) as usize;
+                restored = self.executor.encode_copy_with_offsets(
+                    encoder,
+                    &buffers.ring[k],
+                    0,
+                    &self.ple_state.ring,
+                    0,
+                    ring,
+                );
+            }
+            encoder.end_encoding();
+            // Une restauration partielle laisserait des états mêlés.
+            if let Err(error) = restored.and_then(|()| commit_and_wait(command_buffer)) {
+                self.poisoned = true;
+                return Err(error);
+            }
+            let engaged = pending.position + k + 1;
+            for state in self.states[..c.layer_kinds.len()].iter_mut() {
+                if let LayerState::Full(full) = state {
+                    if let Err(error) = full.0.truncate(engaged) {
+                        self.poisoned = true;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.position = pending.position + k + 1;
+        self.ple_state.step = pending.ple_step + k + 1;
+        self.ple_state.context = pending.contexts[k].clone();
+        Ok(())
     }
 
     fn fresh_states(&self, capacity: usize) -> Result<Vec<LayerState>> {
@@ -692,6 +1141,22 @@ impl FlashNextSession {
         .iter()
         .map(|b| b.length())
         .sum::<u64>()
+            + self.verify.as_ref().map_or(0, |v| {
+                v.embed
+                    .iter()
+                    .chain(&v.ple_bytes)
+                    .chain(&v.index)
+                    .chain(&v.residual)
+                    .chain(v.raw.iter().flatten())
+                    .chain(&v.ring)
+                    .map(|b| b.length())
+                    .sum::<u64>()
+                    + v.linear
+                        .iter()
+                        .flatten()
+                        .map(MetalExecutor::linear_attn_state_bytes)
+                        .sum::<u64>()
+            })
             + self.mtp.as_ref().map_or(0, |m| {
                 [
                     &m.h[0],
@@ -804,6 +1269,7 @@ impl FlashNextSession {
         // Invalide pendant la restauration : un échec partiel laisse des états
         // mêlés, que seul un `reset` complet réhabilite.
         self.poisoned = true;
+        self.pending = None;
         for (index, (state, initial)) in
             self.states.iter_mut().zip(&self.initial_linear).enumerate()
         {
@@ -850,6 +1316,7 @@ impl FlashNextSession {
     ///
     /// Renvoie une erreur de copie Metal.
     pub(crate) fn checkpoint(&self, guard: Option<&MemoryGuard>) -> Result<SessionCheckpoint> {
+        self.refuse_pending()?;
         if let Some(guard) = guard {
             let bytes: u64 = self
                 .states
@@ -919,6 +1386,7 @@ impl FlashNextSession {
     ///
     /// Renvoie une erreur de copie Metal, de troncature, ou un point périmé.
     pub(crate) fn restore(&mut self, checkpoint: &SessionCheckpoint) -> Result<()> {
+        self.refuse_pending()?;
         // Valide si pris sur la branche courante, ou s'il est la base de cette
         // branche (reprises répétées depuis un même point).
         let same_branch = checkpoint.epoch == self.epoch && checkpoint.position <= self.position;
@@ -1007,6 +1475,7 @@ impl FlashNextSession {
                     .to_string(),
             ));
         }
+        self.refuse_pending()?;
         let c = &self.ckpt.config;
         if self.position >= self.capacity {
             return Err(InferError::Config(format!(
@@ -1074,7 +1543,12 @@ impl FlashNextSession {
         };
         #[cfg(not(feature = "devtools"))]
         let mut encoders = Encoders::single(command_buffer);
-        let encoded = self.encode_token(&mut encoders, logits, layers, head);
+        let io = TokenIo {
+            ple_bytes: self.ple_state.bytes.clone(),
+            index: self.index.clone(),
+            residual: None,
+        };
+        let encoded = self.encode_token(&mut encoders, logits, layers, head, &io);
         if let Err(error) = encoded {
             drop(encoders);
             #[cfg(feature = "devtools")]
@@ -1231,6 +1705,7 @@ impl FlashNextSession {
                     .to_string(),
             ));
         }
+        self.refuse_pending()?;
         let c = &self.ckpt.config;
         let width = self.hc_dims.width();
         let rows = self
@@ -1527,6 +2002,7 @@ impl FlashNextSession {
         logits: bool,
         layers: bool,
         head: bool,
+        io: &TokenIo,
     ) -> Result<()> {
         let c = &self.ckpt.config;
         let mut owned = Vec::new();
@@ -1564,6 +2040,7 @@ impl FlashNextSession {
                     encoder,
                     &self.weights.ple,
                     &mut self.ple_state,
+                    &io.ple_bytes,
                     &self.ple_scratch,
                     self.hc_dims,
                     &self.h[cur],
@@ -1618,6 +2095,11 @@ impl FlashNextSession {
                 )?;
             }
         }
+        if let Some(residual) = &io.residual {
+            let encoder = encoders.at(Brick::Hc)?;
+            self.executor
+                .encode_copy_with_offsets(encoder, &self.h[cur], 0, residual, 0, width)?;
+        }
         if !head {
             return Ok(());
         }
@@ -1649,11 +2131,21 @@ impl FlashNextSession {
             &mut owned,
             &self.x,
             &self.weights.lm_head,
-            &self.index,
+            &io.index,
             c.hidden,
         )?;
         Ok(())
     }
+}
+
+/// Entrées et sorties d'un pas de tronc : octets PLE du token, argmax et, pour
+/// une ligne de vérification, copie du résiduel hc avant le mixer final. Les
+/// lignes d'une même vérification ont chacune les leurs : aucun buffer hôte
+/// n'est réécrit après son encodage.
+struct TokenIo {
+    ple_bytes: Buffer,
+    index: Buffer,
+    residual: Option<Buffer>,
 }
 
 /// Ressources d'encodage partagées par les couches, tronc et MTP : kernels,
