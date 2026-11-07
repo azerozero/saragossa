@@ -17,6 +17,7 @@ shift 3
 # Les deux caches de préfixe sont coupés : celui de serve (AR) et celui du
 # décodeur (MTP, DFlash).
 export SARAGOSSA_SERVE_PREFIX_CACHE=0
+export SARAGOSSA_SERVE_LOG_PROMPT_FINGERPRINT=1
 export SARAGOSSA_RUST_PREFIX_CACHE=0
 export SARAGOSSA_API_KEY="${SARAGOSSA_API_KEY:-bench}"
 

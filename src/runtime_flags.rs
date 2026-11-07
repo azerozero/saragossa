@@ -1836,9 +1836,18 @@ pub fn dflash_sampled_enabled() -> bool {
 }
 
 /// Active le prefix-cache par blocs de `saragossa serve`.
+///
+/// Voir aussi le flag indépendant de journalisation de l'empreinte du prompt.
 pub fn serve_prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SERVE_PREFIX_CACHE", true))
+}
+
+/// Journalise l'empreinte des ids du prompt, uniquement sur activation explicite.
+/// Cette empreinte permet d'identifier un prompt connu ; défaut désactivé.
+pub fn serve_log_prompt_fingerprint_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SERVE_LOG_PROMPT_FINGERPRINT", false))
 }
 
 /// Active le pool LRU de modèles de `saragossa serve`.

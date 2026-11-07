@@ -921,7 +921,7 @@ impl LoadedModel {
         };
         let content = strip_text_stops(decoded, &prepared.stop_texts);
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{} footprint_bytes={} prefix_cache_bytes={} prompt_fnv1a64={:016x}",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{} footprint_bytes={} prefix_cache_bytes={}{}",
             self.id,
             prompt_tokens,
             output.tokens.len(),
@@ -934,7 +934,7 @@ impl LoadedModel {
             if path.streaming { " streaming=true" } else { "" },
             process_footprint_bytes().unwrap_or(0),
             self.prefix_cache_bytes(),
-            prompt_fingerprint(&prepared.tokens)
+            prompt_fingerprint_log(&prepared.tokens, saragossa::runtime_flags::serve_log_prompt_fingerprint_enabled())
         );
         Ok(ServedCompletion {
             model: self.id.clone(),
@@ -1570,6 +1570,14 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 /// Empreinte FNV-1a 64 bits des ids du prompt, chacun en u32 little-endian.
 /// Publiée dans le journal de complétion, elle prouve à un client que les ids
 /// réellement ingérés sont ceux qu'il a calculés de son côté.
+fn prompt_fingerprint_log(tokens: &[usize], enabled: bool) -> String {
+    if enabled {
+        format!(" prompt_fnv1a64={:016x}", prompt_fingerprint(tokens))
+    } else {
+        String::new()
+    }
+}
+
 fn prompt_fingerprint(tokens: &[usize]) -> u64 {
     tokens
         .iter()
@@ -1629,6 +1637,11 @@ mod tests {
     /// Vecteurs recalculés indépendamment (FNV-1a 64 de référence).
     #[test]
     fn prompt_fingerprint_matches_reference_fnv1a() {
+        assert!(prompt_fingerprint_log(&[248_045, 872, 198], false).is_empty());
+        assert_eq!(
+            prompt_fingerprint_log(&[], true),
+            " prompt_fnv1a64=cbf29ce484222325"
+        );
         assert_eq!(prompt_fingerprint(&[]), 0xcbf2_9ce4_8422_2325);
         assert_eq!(
             prompt_fingerprint(&[248_045, 872, 198]),
