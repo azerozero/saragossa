@@ -25,6 +25,12 @@ Avant la nuit 1, l'essai de validation fixe `usage_counts_eos` de chaque
 moteur dans `matrix.json` : sans cette convention, aucun débit n'est exact
 et le gel s'arrête.
 
+Le gel ne conserve le défaut sans réglage que si toutes les répétitions de
+tous les candidats divergent **de façon prouvée** de leur référence AR
+admissible (`greedy_identity == false`), avec les autres preuves vraies et un
+débit exact disponible. Une identité absente, une référence absente ou non
+admissible, ou un débit approximatif arrête le gel ; ce n'est pas une divergence.
+
 | Fichier | Rôle |
 |---|---|
 | `client.py` | une requête SSE chronométrée, HTTP/1.1 sur socket brut, fragments bruts conservés |

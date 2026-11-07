@@ -662,15 +662,25 @@ def freeze(run_dir):
         for request in entry["requests"]:
             key = (entry["config"], request["prompt"])
             expected_reps[key] = expected_reps.get(key, 0) + 1
-    rows = [r for r in analyze.load(run_dir)[0]
-            if r.get("phase") == "tune" and r["config"].startswith("tune:")]
+    tune_rows = [r for r in analyze.load(run_dir)[0] if r.get("phase") == "tune"]
+    references = {(r["config"],) + analyze.request_key(r): r for r in tune_rows
+                  if r["config"].startswith("tune-ref:")}
+    rows = [r for r in tune_rows if r["config"].startswith("tune:")]
     values, admissible, only_identity = {}, {}, {}
     for row in rows:
         # Requête exclue par sa seule identité greedy (statut ok, toutes les
         # autres preuves vraies) : vraie divergence avec l'AR, pas un défaut.
-        others_ok = all(v is True for k, v in (row.get("proofs") or {}).items()
-                        if k != "greedy_identity")
-        if row.get("status") == client.OK and others_ok:
+        family = row["config"].split(":")[1]
+        spec = matrix["tuning"][family]
+        checks = row.get("proofs") or {}
+        others_ok = all(checks.get(k) is True for k in
+                        ("usage", "output", "prompt_tokens", "ids", "no_reuse"))
+        m = row.get("m") or {}
+        ref = references.get((f"tune-ref:{spec.get('reference')}",) + analyze.request_key(row))
+        if (row.get("status") == client.OK and others_ok
+                and checks.get("greedy_identity") is False
+                and m.get("exact") is True and m.get("delivery_tok_s") is not None
+                and ref is not None and ref.get("admissibility") == "admissible"):
             only_identity[row["config"]] = only_identity.get(row["config"], 0) + 1
         if row.get("admissibility") != "admissible":
             continue
@@ -930,6 +940,15 @@ def _freeze_check():
 
 
 def _freeze_divergent_check():
+    _freeze_identity_check("divergent")
+
+
+def _freeze_missing_proof_check():
+    for missing in ("reference", "reference_unverified", "identity", "exact_rate"):
+        _freeze_identity_check(missing)
+
+
+def _freeze_identity_check(case):
     """Une famille dont tous les candidats, mesurés en entier, divergent de l'AR
     garde le défaut sans arrêter le gel ; les autres familles restent soumises
     à la règle (ici, données absentes : arrêt)."""
@@ -965,10 +984,20 @@ def _freeze_divergent_check():
         config = f"tune:{family}:{index}"
         entries.append({"config": config, "requests": [{"prompt": p, "repeat": r}
                                                        for p in spec["prompts"] for r in range(2)]})
-        rows += [row(config, p, r, "xyz" if r == 0 else "xyw") for p in spec["prompts"]
+        rows += [row(config, p, r, "xyw") for p in spec["prompts"]
                  for r in range(2)]
     rows += [row(f"tune-ref:{spec['reference']}", p, r, "xyz") for p in spec["prompts"]
              for r in range(2)]
+    if case == "reference":
+        rows = [r for r in rows if not r["config"].startswith("tune-ref:")]
+    elif case == "reference_unverified":
+        for r in rows:
+            if r["config"].startswith("tune-ref:"):
+                r["ingest"] = {}
+    elif case == "exact_rate":
+        for r in rows:
+            if r["config"].startswith("tune:"):
+                r["usage"]["completion_tokens"] += 1
     expected = {f"{p}|{r:016d}": {"prompt_tokens": 5, "fnv1a64": "f"}
                 for p in spec["prompts"] for r in range(2)}
     original = (analyze.tokenizer, analyze.load_matrix)
@@ -977,6 +1006,15 @@ def _freeze_divergent_check():
     eos_matrix["engines"]["llama"].pop("injected_content_prefix", None)
     analyze.tokenizer = Tok
     analyze.load_matrix = lambda _run_dir: eos_matrix
+    original_identity = analyze.apply_identity
+    if case == "identity":
+        def missing_identity(measures, pair_of):
+            original_identity(measures, pair_of)
+            for measure in measures:
+                if measure["config"].startswith("tune:"):
+                    measure["proofs"].pop("greedy_identity", None)
+                    measure["admissibility"] = "unverified"
+        analyze.apply_identity = missing_identity
     try:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -990,16 +1028,21 @@ def _freeze_divergent_check():
                 try:
                     freeze(tmp)
                 except SystemExit as error:
-                    assert family not in str(error), error
+                    assert (family not in str(error)) == (case == "divergent"), error
             report = json.loads((root / "freeze.json").read_text())
     finally:
         analyze.tokenizer, analyze.load_matrix = original
-    assert report[family]["winner"] == 0 and "reason" in report[family]
+        analyze.apply_identity = original_identity
+    if case == "divergent":
+        assert report[family]["winner"] == 0 and "reason" in report[family]
+    else:
+        assert report[family]["winner"] is None and "reason" not in report[family]
 
 
 if __name__ == "__main__":
     _self_check()
     _freeze_check()
+    _freeze_missing_proof_check()
     if len(sys.argv) >= 3 and sys.argv[1] == "plan":
         plan(sys.argv[2], sys.argv[3:])
     elif len(sys.argv) == 3 and sys.argv[1] == "run":
