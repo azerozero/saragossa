@@ -221,10 +221,15 @@ pub fn token_distribution_top_k_top_p(
         return normalize_distribution(nucleus, logits);
     }
 
-    indexed_probs.sort_by(|(left_idx, left), (right_idx, right)| {
+    // Ordre total (probabilité décroissante, puis indice) : les `top_k` premiers
+    // sont uniques, donc la sélection partielle puis le tri des seuls élus rend
+    // exactement le tri complet tronqué, en O(V + k log k) au lieu de O(V log V).
+    let by_rank = |(left_idx, left): &(usize, f32), (right_idx, right): &(usize, f32)| {
         right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
-    });
+    };
+    indexed_probs.select_nth_unstable_by(top_k - 1, by_rank);
     indexed_probs.truncate(top_k);
+    indexed_probs.sort_by(by_rank);
 
     let top_sum = indexed_probs.iter().map(|(_, prob)| *prob).sum::<f32>();
     if top_sum <= f32::EPSILON {
@@ -515,6 +520,79 @@ fn residual_distribution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_k_partial_selection_matches_full_sort() {
+        // Référence : tri complet puis troncature, l'ancien chemin.
+        fn reference(
+            logits: &[f32],
+            temperature: f32,
+            top_p: f32,
+            top_k: usize,
+        ) -> TokenDistribution {
+            let mut indexed: TokenDistribution = softmax(logits, temperature)
+                .into_iter()
+                .enumerate()
+                .collect();
+            indexed.sort_by(|(left_idx, left), (right_idx, right)| {
+                right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
+            });
+            indexed.truncate(top_k);
+            let top_sum = indexed.iter().map(|(_, prob)| *prob).sum::<f32>();
+            if top_sum <= f32::EPSILON {
+                return vec![(argmax(logits).expect("invariant: logits non vides"), 1.0)];
+            }
+            let mut nucleus = Vec::new();
+            let mut cumulative = 0.0_f32;
+            for (rank, item) in indexed.into_iter().enumerate() {
+                cumulative += item.1 / top_sum;
+                nucleus.push(item);
+                if rank == 0 || cumulative < top_p {
+                    continue;
+                }
+                break;
+            }
+            normalize_distribution(nucleus, logits).expect("invariant: nucleus non vide")
+        }
+        let mut sampler = DeterministicSampler::new(11);
+        let mut cases: Vec<Vec<f32>> = (0..40)
+            .map(|case| {
+                let len = [3, 20, 21, 257, 4096][case % 5];
+                // Ex aequo fréquents (logits quantifiés) pour exercer le départage par indice.
+                (0..len)
+                    .map(|_| (sampler.next_unit_f32() * 16.0).floor() - 8.0)
+                    .collect()
+            })
+            .collect();
+        // Égalité totale, `-inf` partiels et masse concentrée sur un token. Le
+        // repli `top_sum <= EPSILON` reste inatteignable (top_sum ≥ 1/V) ; la
+        // référence le recopie pour rester fidèle à l'ancien chemin.
+        cases.push(vec![0.0; 21]);
+        cases.push(vec![1.0, f32::NEG_INFINITY, 1.0, f32::NEG_INFINITY, 0.5]);
+        let mut crushed = vec![0.0_f32; 300];
+        crushed[299] = 200.0;
+        cases.push(crushed);
+        for logits in &cases {
+            let len = logits.len();
+            // Tous les k sur les petits vocabulaires, une grille sinon ; top_k ≥ V
+            // prend le chemin sans troncature, hors du champ de ce test.
+            let ks: Vec<usize> = if len <= 21 {
+                (1..len).collect()
+            } else {
+                vec![1, 20, len.min(64), len - 1]
+            };
+            for (top_k, top_p) in ks.into_iter().flat_map(|k| [(k, 1.0), (k, 0.8), (k, 0.5)]) {
+                let fast = token_distribution_top_k_top_p(logits, 0.7, top_p, top_k)
+                    .expect("invariant: logits valides");
+                let full = reference(logits, 0.7, top_p, top_k);
+                assert_eq!(fast.len(), full.len());
+                for (a, b) in fast.iter().zip(&full) {
+                    assert_eq!(a.0, b.0);
+                    assert_eq!(a.1.to_bits(), b.1.to_bits());
+                }
+            }
+        }
+    }
 
     #[test]
     fn sampling_skips_zero_probability_entries() {
