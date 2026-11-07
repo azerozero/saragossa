@@ -219,13 +219,14 @@ normal `[DONE]`.
 
 `POST /v1/chat/completions` honours `temperature`, `top_p`, `top_k` (temperature
 first, then top-k, then top-p on the scaled distribution), `seed` (signed i64,
-reinterpreted as u64 in two's complement; absent or null defaults to `0`), `stop`
-and `max_tokens` / `max_completion_tokens`. Unseeded sampling stays reproducible.
+reinterpreted as u64 in two's complement; absent or null defaults to `0`),
+`stop` and `max_tokens` / `max_completion_tokens`. Unseeded sampling stays
+reproducible.
 
-- `chat_template_kwargs`: only `{"enable_thinking": false}` is accepted, by Qwen
-  ChatML and Gemma 4, whose native rendering keeps thinking **off** (the empty
-  `<think>` block is injected). `true` is refused (HTTP 400): the native
-  rendering does not reproduce the checkpoint template with thinking on.
+- `chat_template_kwargs`: only `{"enable_thinking": false}` is accepted, by
+  Qwen ChatML and Gemma 4. Native rendering disables thinking; Qwen inserts an
+  empty `<think>` block. `true` is refused (HTTP 400): native rendering does not
+  reproduce the checkpoint template with thinking on.
   Flint and Gemma 3 have no switch and refuse any explicit value. Any other
   key is refused rather than silently ignored.
 - `stream_options: {"include_usage": true}`: like the OpenAI API, a final
