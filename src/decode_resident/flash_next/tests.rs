@@ -65,24 +65,35 @@ fn affine_weight(
     scale: f32,
     bits: usize,
 ) -> Result<(MetalLinearWeightBuffers, Tensor)> {
-    let dense = Tensor::from_vec(vec![rows, cols], rng.fill(rows * cols, -scale, scale))?;
-    let raw = AffineQuantizedTensor::quantize(&dense, 64, bits)?;
-    // Échelles et biais bf16, comme dans le checkpoint : le GPU les lit en bf16.
-    let bf16 = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| bf16_round_f32(*x)).collect() };
-    let quantized = AffineQuantizedTensor::new(
-        raw.packed_shape(),
-        raw.packed_data().to_vec(),
-        Tensor::from_vec(raw.scales_shape().to_vec(), bf16(&raw.scales_f32()))?,
-        Tensor::from_vec(raw.biases_shape().to_vec(), bf16(&raw.biases_f32()))?,
-        64,
-        bits,
-    )?;
+    let quantized = affine_quantized(rng, rows, cols, scale, bits)?;
     let reference = quantized.dequantize()?;
     let gpu = executor.resolve_linear_weight_buffers(
         &LinearWeight::AffineQuantized(quantized),
         "flash_next_hc_test",
     )?;
     Ok((gpu, reference))
+}
+
+/// Poids affine gs64 aléatoire, échelles et biais arrondis en bf16.
+fn affine_quantized(
+    rng: &mut DeterministicF32,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+    bits: usize,
+) -> Result<AffineQuantizedTensor> {
+    let dense = Tensor::from_vec(vec![rows, cols], rng.fill(rows * cols, -scale, scale))?;
+    let raw = AffineQuantizedTensor::quantize(&dense, 64, bits)?;
+    // Échelles et biais bf16, comme dans le checkpoint : le GPU les lit en bf16.
+    let bf16 = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| bf16_round_f32(*x)).collect() };
+    AffineQuantizedTensor::new(
+        raw.packed_shape(),
+        raw.packed_data().to_vec(),
+        Tensor::from_vec(raw.scales_shape().to_vec(), bf16(&raw.scales_f32()))?,
+        Tensor::from_vec(raw.biases_shape().to_vec(), bf16(&raw.biases_f32()))?,
+        64,
+        bits,
+    )
 }
 
 /// Hyper-connection aux dimensions réelles (4 flux × 2560, rang 320) : entrée
@@ -4046,8 +4057,11 @@ fn bench_speculative_mono_vs_ar() {
 /// du tronc Flash-Next à ses formes et bits réels, un lot de R lignes
 /// (R = 1..4) contre R pas mono, en mode normal puis en vérification greedy
 /// stricte. Publie l'exactitude au bit près de chaque ligne et
-/// ρ_brique(R) = durée du lot / durée d'un pas mono (20 répétitions dans un
-/// command buffer). Sert à décider entre un qmv-T u8, R = 2, ou l'arrêt.
+/// ρ_brique(R) = durée du lot / durée d'un pas mono. Chaque command buffer lit
+/// des copies distinctes du poids (≥ 512 Mo, une lecture par copie) pour
+/// mesurer depuis la DRAM comme le decode, et non depuis le SLC ; chauffe puis
+/// minimum de 3. Le lm_head u6 (kernel argmax en lignes à part) est hors
+/// profil. Sert à décider entre un qmv-T u8, R = 2, ou l'arrêt.
 #[test]
 #[ignore = "profil GPU : machine libre"]
 fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
@@ -4057,7 +4071,7 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
     };
     let queue = executor.device().new_command_queue();
     // (nom, sorties, entrées, bits, nombre par pas de tronc)
-    let shapes: [(&str, usize, usize, usize, usize); 11] = [
+    let shapes: [(&str, usize, usize, usize, usize); 10] = [
         ("attention q_proj (q + gate)", 12288, 2560, 8, 12),
         ("attention k/v_proj", 512, 2560, 8, 24),
         ("attention o_proj", 2560, 6144, 8, 12),
@@ -4068,23 +4082,34 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
         ("expert gate/up (u4)", 640, 2560, 4, 960),
         ("expert down (u4)", 2560, 640, 4, 480),
         ("expert partagé gate/up", 640, 2560, 8, 96),
-        ("lm_head (u6)", 248_320, 2560, 6, 1),
     ];
-    let reps = 20;
-    let time = |encode: &dyn Fn(&metal::ComputeCommandEncoderRef) -> Result<()>| -> Result<f64> {
+    let run = |copies: usize,
+               encode: &dyn Fn(&metal::ComputeCommandEncoderRef, usize) -> Result<()>|
+     -> Result<f64> {
         let command_buffer = queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        for _ in 0..reps {
-            encode(encoder)?;
+        for copy in 0..copies {
+            encode(encoder, copy)?;
         }
         encoder.end_encoding();
         let started = std::time::Instant::now();
         commit_and_wait(command_buffer)?;
-        Ok(started.elapsed().as_secs_f64() / reps as f64)
+        Ok(started.elapsed().as_secs_f64() / copies as f64)
     };
     for (name, out_dim, in_dim, bits, per_step) in shapes {
         let mut rng = DeterministicF32::new(0x6d + out_dim as u64);
-        let (weight, _) = affine_weight(&executor, &mut rng, out_dim, in_dim, 0.05, bits)?;
+        let quantized = affine_quantized(&mut rng, out_dim, in_dim, 0.05, bits)?;
+        let bytes = out_dim * in_dim * bits / 8;
+        let copies = (512_usize << 20).div_ceil(bytes).clamp(4, 512);
+        let weights = (0..copies)
+            .map(|_| {
+                executor.resolve_linear_weight_buffers(
+                    &LinearWeight::AffineQuantized(quantized.clone()),
+                    "flash_next_profile",
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let weight = &weights[0];
         let x = rng.fill(4 * in_dim, -1.0, 1.0);
         let input = buffer(&executor, &x);
         let mono_in: Vec<_> = (0..4)
@@ -4094,33 +4119,45 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
             let _greedy = install_verify_greedy_scope(strict);
             with_verify_strict_override(strict, || -> Result<()> {
                 let mono_out = zeros(&executor, out_dim);
-                let mono = time(&|encoder| {
-                    executor
-                        .encode_matmul_weight_buffers(
-                            encoder,
-                            &mono_in[0],
-                            1,
-                            in_dim,
-                            &weight,
-                            &mono_out,
-                            true,
-                        )
-                        .map(|_| ())
-                })?;
+                let batched_out = zeros(&executor, 4 * out_dim);
+                let timed = |rows: usize| -> Result<f64> {
+                    let (src, dst) = if rows == 1 {
+                        (&mono_in[0], &mono_out)
+                    } else {
+                        (&input, &batched_out)
+                    };
+                    run(copies, &|encoder, copy| {
+                        executor
+                            .encode_matmul_weight_buffers(
+                                encoder,
+                                src,
+                                rows,
+                                in_dim,
+                                &weights[copy],
+                                dst,
+                                true,
+                            )
+                            .map(|_| ())
+                    })
+                };
+                // Chauffe, puis minimum de 3 tours alternés mono / lots.
+                for rows in 1..=4 {
+                    timed(rows)?;
+                }
+                let mut best = [f64::INFINITY; 5];
+                for _ in 0..3 {
+                    for (rows, best) in best.iter_mut().enumerate().skip(1) {
+                        *best = best.min(timed(rows)?);
+                    }
+                }
+                let mono = best[1];
                 let mut line = format!(
                     "{name} [{out_dim}×{in_dim}, u{bits}, ×{per_step}/pas] {} : mono {:.1} µs",
                     if strict { "strict" } else { "normal" },
                     mono * 1e6
                 );
-                for rows in 2..=4 {
+                for (rows, &batched) in best.iter().enumerate().skip(2) {
                     let out = zeros(&executor, rows * out_dim);
-                    let batched = time(&|encoder| {
-                        executor
-                            .encode_matmul_weight_buffers(
-                                encoder, &input, rows, in_dim, &weight, &out, true,
-                            )
-                            .map(|_| ())
-                    })?;
                     // Exactitude : chaque ligne contre son pas mono.
                     let command_buffer = queue.new_command_buffer();
                     let encoder = command_buffer.new_compute_command_encoder();
@@ -4131,13 +4168,13 @@ fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
                             &mono_in[r],
                             1,
                             in_dim,
-                            &weight,
+                            weight,
                             &singles[r],
                             true,
                         )?;
                     }
                     executor.encode_matmul_weight_buffers(
-                        encoder, &input, rows, in_dim, &weight, &out, true,
+                        encoder, &input, rows, in_dim, weight, &out, true,
                     )?;
                     encoder.end_encoding();
                     commit_and_wait(command_buffer)?;
