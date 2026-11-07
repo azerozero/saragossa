@@ -1,5 +1,7 @@
 //! Types JSON OpenAI compatibles pour `/v1`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use saragossa::ChatTemplateMessage;
@@ -53,6 +55,30 @@ pub(super) struct ChatCompletionRequest {
     /// Appels d'outils multiples autorisés (défaut vrai).
     #[serde(default)]
     pub(super) parallel_tool_calls: Option<bool>,
+    /// Graine signée OpenAI ; absente ou null, la graine historique 0.
+    #[serde(default)]
+    pub(super) seed: Option<i64>,
+    /// Arguments du template de chat (extension vLLM / llama.cpp) : seul
+    /// `enable_thinking` est reconnu (et seulement à `false`, cf. `validate`),
+    /// toute autre clé est refusée.
+    #[serde(default)]
+    pub(super) chat_template_kwargs: Option<serde_json::Map<String, Value>>,
+    /// Options du flux SSE (`stream_options` OpenAI).
+    #[serde(default)]
+    pub(super) stream_options: Option<Value>,
+    /// Filtre min-p : non implémenté, seule la valeur neutre 0 est admise.
+    #[serde(default)]
+    pub(super) min_p: Option<f32>,
+    /// Pénalité de présence OpenAI : non implémentée, neutre 0 seulement.
+    #[serde(default)]
+    pub(super) presence_penalty: Option<f32>,
+    /// Pénalité de fréquence OpenAI : non implémentée, neutre 0 seulement.
+    #[serde(default)]
+    pub(super) frequency_penalty: Option<f32>,
+    /// Pénalité de répétition (vLLM, llama.cpp) : non implémentée, neutre 1
+    /// seulement.
+    #[serde(default)]
+    pub(super) repetition_penalty: Option<f32>,
 }
 
 /// Outil déclaré par la requête, lu une seule fois.
@@ -83,6 +109,38 @@ const MAX_STOP_SEQUENCES: usize = 16;
 const MAX_STOP_BYTES: usize = 1024;
 
 impl ChatCompletionRequest {
+    /// Désérialise sans exposer le diagnostic serde, qui peut citer une valeur.
+    /// Le JSON brut reste utilisé sur le chemin valide (ordre des outils).
+    pub(super) fn parse(body: &[u8]) -> ServeResult<Self> {
+        serde_json::from_slice(body).map_err(|_| {
+            let fields = match serde_json::from_slice::<Value>(body) {
+                Ok(Value::Object(fields)) => fields,
+                Ok(value) => return invalid_field("requête", &value),
+                Err(_) => return ServeError::Http("requête: syntaxe JSON invalide".into()),
+            };
+            for required in ["model", "messages"] {
+                if !fields.contains_key(required) {
+                    return ServeError::Http(format!("{required}: champ absent"));
+                }
+            }
+            // Isole le champ fautif sans conserver ni afficher sa valeur.
+            for (name, value) in fields {
+                let mut probe = serde_json::json!({"model":"", "messages":[]});
+                probe[&name] = value.clone();
+                if serde_json::from_value::<Self>(probe).is_err() {
+                    return invalid_field(&name, &value);
+                }
+            }
+            ServeError::Http("requête: structure JSON invalide".into())
+        })
+    }
+
+    /// Réinterprète la graine signée en u64 en complément à deux : -1 devient
+    /// u64::MAX. La conversion modulo 2^64 est déterministe.
+    pub(super) fn sampler_seed(&self) -> u64 {
+        self.seed.unwrap_or(0) as u64
+    }
+
     /// Renvoie le budget effectif.
     pub(super) fn max_tokens(&self) -> usize {
         self.max_tokens
@@ -95,7 +153,7 @@ impl ChatCompletionRequest {
         let requested = self.max_tokens();
         if requested > cap {
             return Err(ServeError::Http(format!(
-                "max_tokens {requested} dépasse le plafond serveur {cap}"
+                "max_tokens: type JSON number, dépasse le plafond serveur {cap}"
             )));
         }
         Ok(requested)
@@ -107,6 +165,25 @@ impl ChatCompletionRequest {
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
         let max_tokens = self.max_tokens_capped(max_tokens_cap)?;
         self.response_format_mode()?;
+        if self.enable_thinking()? == Some(true) {
+            return Err(ServeError::Http(
+                "chat_template_kwargs.enable_thinking: type JSON boolean non supporté (thinking désactivé)".into(),
+            ));
+        }
+        self.reject_unsupported_sampling()?;
+        if self.stream {
+            if let Some(options) = &self.stream_options {
+                if !options.is_object() {
+                    return Err(invalid_field("stream_options", options));
+                }
+                if let Some(value) = options
+                    .get("include_usage")
+                    .filter(|v| !v.is_null() && !v.is_boolean())
+                {
+                    return Err(invalid_field("stream_options.include_usage", value));
+                }
+            }
+        }
         // Un tableau de chaînes vides pèse ~12× son JSON une fois désérialisé :
         // bornées, les stops ne peuvent plus amplifier la mémoire des requêtes.
         let stops = self.stop_texts();
@@ -154,8 +231,65 @@ impl ChatCompletionRequest {
                 "tool_choice nommé n'est pas supporté (génération non contrainte) ; utiliser \"auto\""
                     .to_string(),
             )),
-            Some(other) => Err(ServeError::Http(format!("tool_choice invalide: {other}"))),
+            Some(other) => Err(invalid_field("tool_choice", other)),
         }
+    }
+
+    /// `chat_template_kwargs.enable_thinking` demandé, `None` s'il est absent.
+    /// Une autre clé ou une valeur non booléenne est refusée : un argument de
+    /// template ignoré en silence changerait le prompt sans le dire.
+    pub(super) fn enable_thinking(&self) -> ServeResult<Option<bool>> {
+        let Some(kwargs) = &self.chat_template_kwargs else {
+            return Ok(None);
+        };
+        let mut thinking = None;
+        for (key, value) in kwargs {
+            match (key.as_str(), value) {
+                ("enable_thinking", Value::Bool(flag)) => thinking = Some(*flag),
+                ("enable_thinking", other) => {
+                    return Err(invalid_field("chat_template_kwargs.enable_thinking", other))
+                }
+                (other, value) => {
+                    return Err(invalid_field(
+                        &format!("chat_template_kwargs.{other}"),
+                        value,
+                    ))
+                }
+            }
+        }
+        Ok(thinking)
+    }
+
+    /// Refuse un filtre ou une pénalité que le sampler n'applique pas : une
+    /// valeur non neutre acceptée en silence changerait la distribution
+    /// annoncée au client. La valeur neutre, ou l'absence, reste admise.
+    fn reject_unsupported_sampling(&self) -> ServeResult<()> {
+        let fields = [
+            ("min_p", self.min_p, 0.0),
+            ("presence_penalty", self.presence_penalty, 0.0),
+            ("frequency_penalty", self.frequency_penalty, 0.0),
+            ("repetition_penalty", self.repetition_penalty, 1.0),
+        ];
+        for (name, value, neutral) in fields {
+            // NaN est refusé aussi : `!=` est vrai pour lui.
+            if value.is_some_and(|value| value != neutral) {
+                return Err(ServeError::Http(format!(
+                    "{name}: type JSON number, valeur non supportée"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Le flux SSE se termine-t-il par un chunk d'usage ?
+    pub(super) fn include_usage(&self) -> bool {
+        self.stream
+            && self
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.get("include_usage"))
+                .and_then(Value::as_bool)
+                == Some(true)
     }
 
     /// Appels d'outils multiples autorisés ?
@@ -184,9 +318,7 @@ impl ChatCompletionRequest {
             "json_schema" => Err(ServeError::not_implemented(
                 "response_format json_schema n'est pas encore supporté (v1: json_object, extension saragossa json_lines)",
             )),
-            other => Err(ServeError::Http(format!(
-                "response_format type inconnu: {other}"
-            ))),
+            _ => Err(ServeError::Http("response_format.type: type JSON string invalide".into())),
         }
     }
 
@@ -209,6 +341,29 @@ impl ChatCompletionRequest {
             .or_else(|| self.user.as_deref().and_then(normalize_session_key))
             .map(ToString::to_string)
     }
+}
+
+/// Le nom est borné puis échappé pour empêcher l'injection dans le journal.
+fn invalid_field(name: &str, value: &Value) -> ServeError {
+    let mut field: String = name
+        .chars()
+        .take(80)
+        .flat_map(char::escape_default)
+        .collect();
+    if name.chars().count() > 80 {
+        field.push_str("...");
+    }
+    let kind = match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    ServeError::Http(format!(
+        "{field}: type JSON {kind} invalide ou non supporté"
+    ))
 }
 
 fn raw_texts(values: Option<&[Box<RawValue>]>) -> Vec<String> {
@@ -507,9 +662,43 @@ pub(super) struct ChatCompletionChunk {
     created: u64,
     model: String,
     choices: Vec<ChatChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Option<Usage>>,
 }
 
 impl ChatCompletionChunk {
+    /// Identifiant distinct par flux dans ce processus (compteur atomique),
+    /// partagé par tous ses chunks, même pour des flux ouverts simultanément.
+    pub(super) fn stream_id() -> String {
+        response_id("chatcmpl")
+    }
+
+    /// Remplace l'identifiant du chunk par celui de son flux.
+    pub(super) fn with_id(mut self, id: &str) -> Self {
+        id.clone_into(&mut self.id);
+        self
+    }
+
+    /// Inclut `usage: null` sur les chunks intermédiaires lorsque demandé.
+    pub(super) fn with_usage_option(mut self, include_usage: bool) -> Self {
+        if include_usage && self.usage.is_none() {
+            self.usage = Some(None);
+        }
+        self
+    }
+
+    /// Construit le chunk d'usage final (`stream_options.include_usage`).
+    pub(super) fn usage(model: &str, usage: Usage) -> Self {
+        Self {
+            id: response_id("chatcmpl"),
+            object: "chat.completion.chunk",
+            created: created_now(),
+            model: model.to_string(),
+            choices: Vec::new(),
+            usage: Some(Some(usage)),
+        }
+    }
+
     /// Construit le chunk de rôle initial.
     pub(super) fn role(model: &str) -> Self {
         Self::chunk(
@@ -571,6 +760,7 @@ impl ChatCompletionChunk {
                 delta: Some(DeltaMessage::default()),
                 finish_reason: Some(finish_reason.to_string()),
             }],
+            usage: None,
         }
     }
 
@@ -586,6 +776,7 @@ impl ChatCompletionChunk {
                 delta: Some(delta),
                 finish_reason,
             }],
+            usage: None,
         }
     }
 }
@@ -641,12 +832,67 @@ fn created_now() -> u64 {
 }
 
 fn response_id(prefix: &str) -> String {
-    format!("{prefix}-{}", created_now())
+    static EPOCH: OnceLock<u128> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // Une seule lecture d'horloge pour le préfixe du processus ; le compteur
+    // garantit l'unicité même si l'horloge recule entre deux requêtes.
+    let epoch = EPOCH.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    });
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{epoch}-{sequence}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_ids_are_unique_across_threads() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..128)
+                        .map(|_| ChatCompletionChunk::stream_id())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let ids: std::collections::HashSet<_> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("invariant: génération sans échec"))
+            .collect();
+        assert_eq!(ids.len(), 1024);
+    }
+
+    #[test]
+    fn validation_errors_hide_values_and_escape_keys() {
+        for field in ["seed", "temperature", "model", "messages"] {
+            let mut input = serde_json::json!({"model":"m", "messages":[]});
+            input[field] = serde_json::json!({"private":"SECRET"});
+            let err = ChatCompletionRequest::parse(input.to_string().as_bytes())
+                .expect_err("invariant: type invalide")
+                .to_string();
+            assert!(err.contains(field) && err.contains("object"));
+            assert!(!err.contains("SECRET") && !err.contains("private"));
+        }
+        for field in [
+            "enable_thinking".to_string(),
+            format!("bad\n{}", "x".repeat(200)),
+        ] {
+            let input = serde_json::json!({"model":"m", "messages":[],
+                "chat_template_kwargs": {field: "SECRET"}});
+            let err = ChatCompletionRequest::parse(input.to_string().as_bytes())
+                .expect("invariant: JSON valide")
+                .validate(1024)
+                .expect_err("invariant: argument refusé")
+                .to_string();
+            assert!(!err.contains("SECRET") && !err.contains('\n'));
+            assert!(err.len() < 200 && err.contains("string"));
+        }
+    }
 
     #[test]
     fn validate_bounds_stop_sequences() {
@@ -680,6 +926,93 @@ mod tests {
                 .expect("invariant: max_tokens sous plafond"),
             4
         );
+    }
+
+    #[test]
+    fn request_reads_seed() {
+        let parse = |json: &str| -> ChatCompletionRequest {
+            serde_json::from_str(json).expect("invariant: JSON valide")
+        };
+
+        assert_eq!(
+            parse(r#"{"model":"m","messages":[],"seed":42}"#).seed,
+            Some(42)
+        );
+        assert_eq!(parse(r#"{"model":"m","messages":[]}"#).seed, None);
+        for (seed, expected) in [
+            ("-1", u64::MAX),
+            ("0", 0),
+            ("9223372036854775807", i64::MAX as u64),
+            ("null", 0),
+        ] {
+            let req = parse(&format!(r#"{{"model":"m","messages":[],"seed":{seed}}}"#));
+            assert_eq!(req.sampler_seed(), expected);
+        }
+        assert_eq!(parse(r#"{"model":"m","messages":[]}"#).sampler_seed(), 0);
+        assert!(serde_json::from_str::<ChatCompletionRequest>(
+            r#"{"model":"m","messages":[],"seed":1.5}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chat_template_kwargs_validates_only_disabled_thinking() {
+        let parse = |kwargs: &str| -> ChatCompletionRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model":"m","messages":[],"chat_template_kwargs":{kwargs}}}"#
+            ))
+            .expect("invariant: JSON valide")
+        };
+
+        assert_eq!(
+            parse(r#"{"enable_thinking":false}"#).enable_thinking().ok(),
+            Some(Some(false))
+        );
+        assert_eq!(
+            parse(r#"{"enable_thinking":true}"#).enable_thinking().ok(),
+            Some(Some(true))
+        );
+        assert!(parse(r#"{"enable_thinking":false}"#).validate(1024).is_ok());
+        assert!(matches!(
+            parse(r#"{"enable_thinking":true}"#).validate(1024),
+            Err(ServeError::Http(_))
+        ));
+        assert_eq!(parse("{}").enable_thinking().ok(), Some(None));
+        for refused in [
+            r#"{"enable_thinking":"no"}"#,
+            r#"{"reasoning_effort":"low"}"#,
+        ] {
+            assert!(parse(refused).validate(1024).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn unsupported_sampling_accepts_only_neutral_values() {
+        let validate = |fields: &str| {
+            serde_json::from_str::<ChatCompletionRequest>(&format!(
+                r#"{{"model":"m","messages":[]{fields}}}"#
+            ))
+            .expect("invariant: JSON valide")
+            .validate(1024)
+        };
+
+        assert!(validate("").is_ok());
+        assert!(validate(
+            r#","min_p":0,"presence_penalty":0.0,"frequency_penalty":0,"repetition_penalty":1"#
+        )
+        .is_ok());
+        for refused in [
+            r#","min_p":0.05"#,
+            r#","presence_penalty":0.5"#,
+            r#","frequency_penalty":-1"#,
+            r#","repetition_penalty":1.1"#,
+            r#","repetition_penalty":0"#,
+        ] {
+            assert!(
+                matches!(validate(refused), Err(ServeError::Http(_))),
+                "{refused}"
+            );
+        }
     }
 
     #[test]

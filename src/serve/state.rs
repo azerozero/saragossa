@@ -921,7 +921,7 @@ impl LoadedModel {
         };
         let content = strip_text_stops(decoded, &prepared.stop_texts);
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{} footprint_bytes={} prefix_cache_bytes={}",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{} footprint_bytes={} prefix_cache_bytes={}{}",
             self.id,
             prompt_tokens,
             output.tokens.len(),
@@ -933,7 +933,8 @@ impl LoadedModel {
             path.decode_path,
             if path.streaming { " streaming=true" } else { "" },
             process_footprint_bytes().unwrap_or(0),
-            self.prefix_cache_bytes()
+            self.prefix_cache_bytes(),
+            prompt_fingerprint_log(&prepared.tokens, saragossa::runtime_flags::serve_log_prompt_fingerprint_enabled())
         );
         Ok(ServedCompletion {
             model: self.id.clone(),
@@ -1195,7 +1196,9 @@ impl LoadedModel {
         if !self.assets.config.is_gemma() && !self.assets.config.is_flint() {
             normalize_qwen_assistant_history(&mut messages);
         }
+        let thinking = request.enable_thinking()?;
         let rendered = if self.assets.config.is_flint() {
+            check_thinking(thinking, false)?;
             let tools: Vec<String> = request
                 .active_tools()?
                 .iter()
@@ -1203,10 +1206,13 @@ impl LoadedModel {
                 .collect();
             render_flint_chat(&messages, &tools, true)
         } else if self.assets.config.is_gemma4() {
+            check_thinking(thinking, true)?;
             render_gemma4_chat(&messages, true, false)
         } else if self.assets.config.is_gemma() {
+            check_thinking(thinking, false)?;
             render_gemma_chat(&messages, true)
         } else {
+            check_thinking(thinking, true)?;
             render_qwen_chatml(&messages, true, false)
         };
         let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
@@ -1405,7 +1411,7 @@ impl LoadedModel {
             temperature,
             top_p,
             top_k,
-            seed: 0,
+            seed: request.sampler_seed(),
             token_constraint,
         })
     }
@@ -1561,6 +1567,41 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+/// Empreinte FNV-1a 64 bits des ids du prompt, chacun en u32 little-endian.
+/// Publiée dans le journal de complétion, elle prouve à un client que les ids
+/// réellement ingérés sont ceux qu'il a calculés de son côté.
+fn prompt_fingerprint_log(tokens: &[usize], enabled: bool) -> String {
+    if enabled {
+        format!(" prompt_fnv1a64={:016x}", prompt_fingerprint(tokens))
+    } else {
+        String::new()
+    }
+}
+
+fn prompt_fingerprint(tokens: &[usize]) -> u64 {
+    tokens
+        .iter()
+        .flat_map(|&token| u32::try_from(token).unwrap_or(u32::MAX).to_le_bytes())
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+}
+
+/// Thinking demandé par `chat_template_kwargs` : seul `false` (le rendu
+/// historique) est admis, et seulement par un rendu qui désactive le thinking
+/// (`renders_off` : Qwen ChatML, Gemma 4). Flint et Gemma 3, sans
+/// interrupteur, refusent toute valeur explicite plutôt que de l'ignorer.
+///
+/// NOTE: `validate()` a déjà refusé `enable_thinking=true`, avant chargement.
+fn check_thinking(requested: Option<bool>, renders_off: bool) -> ServeResult<()> {
+    match requested {
+        Some(false) if !renders_off => Err(ServeError::Http(
+            "chat_template_kwargs.enable_thinking n'est pas supporté pour ce modèle".to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod json_tests;
 
@@ -1591,6 +1632,29 @@ mod tests {
         assert_eq!(prefix_blocks_usable(false, false), enabled);
         assert_eq!(prefix_blocks_usable(true, true), enabled);
         assert!(!prefix_blocks_usable(true, false));
+    }
+
+    /// Vecteurs recalculés indépendamment (FNV-1a 64 de référence).
+    #[test]
+    fn prompt_fingerprint_matches_reference_fnv1a() {
+        assert!(prompt_fingerprint_log(&[248_045, 872, 198], false).is_empty());
+        assert_eq!(
+            prompt_fingerprint_log(&[], true),
+            " prompt_fnv1a64=cbf29ce484222325"
+        );
+        assert_eq!(prompt_fingerprint(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(
+            prompt_fingerprint(&[248_045, 872, 198]),
+            0xa5c9_7340_54dc_81d8
+        );
+    }
+
+    #[test]
+    fn check_thinking_admits_only_disabled_thinking() {
+        assert!(check_thinking(None, true).is_ok());
+        assert!(check_thinking(Some(false), true).is_ok());
+        assert!(check_thinking(None, false).is_ok());
+        assert!(check_thinking(Some(false), false).is_err());
     }
 
     #[test]

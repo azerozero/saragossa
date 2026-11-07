@@ -215,6 +215,34 @@ returning truncated JSON; in SSE, the deltas stay a valid JSON prefix and an
 unclosed object ends with an `error` event of type `incomplete_json`, without the
 normal `[DONE]`.
 
+### Sampling and request fields
+
+`POST /v1/chat/completions` honours `temperature`, `top_p`, `top_k` (temperature
+first, then top-k, then top-p on the scaled distribution), `seed` (signed i64,
+reinterpreted as u64 in two's complement; absent or null defaults to `0`),
+`stop` and `max_tokens` / `max_completion_tokens`. Unseeded sampling stays
+reproducible.
+
+- `chat_template_kwargs`: only `{"enable_thinking": false}` is accepted, by
+  Qwen ChatML and Gemma 4. Native rendering disables thinking; Qwen inserts an
+  empty `<think>` block. `true` is refused (HTTP 400): native rendering does not
+  reproduce the checkpoint template with thinking on.
+  Flint and Gemma 3 have no switch and refuse any explicit value. Any other
+  key is refused rather than silently ignored.
+- `stream_options: {"include_usage": true}`: like the OpenAI API, a final
+  chunk with `"choices": []` and `usage` precedes `data: [DONE]`; all preceding
+  chunks carry `"usage": null`. Null or empty options are tolerated, including
+  `include_usage: null`; options are ignored for non-streaming requests.
+- `min_p`, `presence_penalty`, `frequency_penalty` and `repetition_penalty`
+  are not implemented: only their neutral value (`0`, `0`, `0`, `1`) is
+  accepted, anything else returns HTTP 400 `invalid_request_error` (permanent
+  request error).
+- Each completion logs `prompt_tokens=…` on stderr. Setting
+  `SARAGOSSA_SERVE_LOG_PROMPT_FINGERPRINT=1` also logs `prompt_fnv1a64=…`
+  (FNV-1a 64 of the prompt ids as little-endian `u32`) to verify ingested ids.
+  This is **off by default**: the fingerprint can identify a known prompt.
+  The competitor benchmark launcher enables it explicitly.
+
 ### Warm cache (block-wise prefix cache)
 
 Prompts are split into 256-token blocks, hashed as a chain (SHA-256 of
