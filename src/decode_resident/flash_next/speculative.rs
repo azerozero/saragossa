@@ -10,7 +10,14 @@
 //!
 //! Convention d'arrêt, comme l'AR : un jeton d'arrêt est émis, puis la
 //! génération s'arrête ; un draft d'arrêt accepté coupe le cycle juste avant
-//! lui et devient le jeton en attente, émis seul au tour suivant.
+//! lui et devient le jeton en attente, émis seul au tour suivant. Comme en AR,
+//! le dernier jeton émis n'est jamais consommé par le tronc : un cycle émet
+//! au plus `budget restant − 1` jetons.
+//!
+//! Échec en cours de cycle : l'historique MTP revient au préfixe propre des
+//! `p + 1` paires vérifiées (clés brutes de l'indexeur restaurées), le tronc
+//! garde ce qu'il a engagé. Toute reprise passe par un `reset` (chaque
+//! génération en commence un).
 
 use super::session::{FlashNextSession, MtpInput};
 use crate::{InferError, Result};
@@ -32,12 +39,14 @@ pub(crate) struct Generation {
     pub(crate) decode: std::time::Duration,
 }
 
-/// Remplacement de drafts (oracles) : `(cycle, rang du draft, draft) → draft`.
+/// Remplacement de drafts (oracles) : `(cycle, jetons déjà émis, rang du
+/// draft, draft) → draft`. Le draft de rang `i` prédit le jeton d'indice
+/// `émis + 1 + i` de la sortie.
 #[cfg_attr(
     not(test),
     allow(dead_code, reason = "spéculation MTP : serve à venir")
 )]
-pub(crate) type DraftOverride<'a> = &'a dyn Fn(usize, usize, usize) -> usize;
+pub(crate) type DraftOverride<'a> = &'a dyn Fn(usize, usize, usize, usize) -> usize;
 
 /// Oracles : mutation de l'historique MTP (puissance de l'oracle des drafts).
 #[cfg(test)]
@@ -48,6 +57,8 @@ pub(crate) enum SpecMutation {
     /// Les paires ajoutées portent le résiduel d'avant le cycle au lieu des
     /// résiduels vérifiés.
     StaleHistory,
+    /// La troncature ne restaure pas les clés brutes de l'indexeur MTP.
+    NoRawRestore,
 }
 
 /// Options d'une génération spéculative.
@@ -64,6 +75,10 @@ pub(crate) struct SpecOptions<'a> {
     /// Oracles : échec d'encodage de la vérification injecté au cycle donné.
     #[cfg(test)]
     pub(crate) fail_verify_cycle: Option<usize>,
+    /// Oracles : échec injecté au pas de reconstruction `(cycle, paire)` de
+    /// l'historique MTP, après l'acceptation.
+    #[cfg(test)]
+    pub(crate) fail_rebuild: Option<(usize, usize)>,
 }
 
 /// AR glouton de référence : `max_tokens` jetons après `prompt`.
@@ -148,8 +163,9 @@ pub(crate) fn generate_speculative(
             super::session::VERIFY_ROWS - 1
         )));
     }
-    // Profondeur nulle : AR pur, sans tête MTP.
-    if depth == 0 {
+    // Profondeur nulle : AR pur, sans tête MTP. Budget nul : rien à émettre,
+    // l'AR laisse le dernier jeton du prompt non consommé.
+    if depth == 0 || max_tokens == 0 {
         return generate_ar(session, prompt, max_tokens, stop);
     }
     if session.mtp_rows().is_none() {
@@ -168,11 +184,12 @@ pub(crate) fn generate_speculative(
     };
     let mut started = std::time::Instant::now();
     for (j, &token) in prompt.iter().enumerate() {
-        if j + 1 == prompt.len() {
-            started = std::time::Instant::now();
-        }
         if let Some(h) = &h_prev {
             session.mtp_step(MtpInput::Host(h), token, false, false)?;
+        }
+        // Chrono au pas du tronc du dernier jeton, comme l'AR.
+        if j + 1 == prompt.len() {
+            started = std::time::Instant::now();
         }
         let row = session.verify(&[token])?;
         session.accept(0)?;
@@ -199,13 +216,19 @@ pub(crate) fn generate_speculative(
         if room == 0 {
             return Err(InferError::Config("capacité atteinte".to_string()));
         }
-        // Profondeur réduite par le budget de jetons et par la capacité.
-        let d = depth.min(max_tokens - out.tokens.len() - 1).min(room - 1);
+        // Profondeur réduite par la capacité et par le budget : le cycle émet
+        // `y` et jusqu'à `d` drafts, tous consommés ; le dernier jeton émis de
+        // la génération ne doit pas l'être (≥ 2 jetons restants ici).
+        let d = depth
+            .min((max_tokens - out.tokens.len()).saturating_sub(2))
+            .min(room - 1);
         let base_rows = session
             .mtp_rows()
             .ok_or_else(|| InferError::Config("tête MTP absente".to_string()))?;
         // Toute erreur après le premier pas MTP du cycle remet l'historique à
-        // ses lignes vérifiées (`clean`) avant de remonter.
+        // ses lignes vérifiées (`clean`) avant de remonter. L'instantané des
+        // clés brutes est pris juste après ce premier pas : les drafts
+        // enchaînés écrivent ensuite dans l'anneau de l'indexeur MTP.
         let mut clean = base_rows;
         let fail = |session: &mut FlashNextSession, clean: usize, error: InferError| {
             // La troncature est refusée si la session est invalidée : l'erreur
@@ -232,11 +255,19 @@ pub(crate) fn generate_speculative(
                 Err(error) => return Err(fail(session, clean, error)),
             };
             if i == 0 {
+                if let Err(error) = session.mtp_snapshot_raw() {
+                    return Err(fail(session, clean, error));
+                }
                 clean = base_rows + 1;
             }
             if i < d {
                 let draft = step.argmax as usize;
-                drafts.push(options.overrides.map_or(draft, |f| f(cycle, i, draft)));
+                let emitted = out.tokens.len();
+                drafts.push(
+                    options
+                        .overrides
+                        .map_or(draft, |f| f(cycle, emitted, i, draft)),
+                );
             }
         }
         let mut rows = vec![y];
@@ -262,15 +293,26 @@ pub(crate) fn generate_speculative(
         if let Some(i) = drafts[..k].iter().position(|t| stop.contains(t)) {
             k = i;
         }
-        session.accept(k)?;
+        if let Err(error) = session.accept(k) {
+            return Err(fail(session, clean, error));
+        }
         // Historique : ligne p (vérifiée) conservée, lignes enchaînées retirées,
         // paires vérifiées (h_{p+1+i}, D_{i+1}) ajoutées.
         #[cfg(test)]
         let truncate = options.mutation != Some(SpecMutation::NoTruncate);
         #[cfg(not(test))]
         let truncate = true;
+        #[cfg(test)]
+        {
+            session.skip_mtp_raw_restore = options.mutation == Some(SpecMutation::NoRawRestore);
+        }
         if truncate {
-            session.mtp_truncate(base_rows + 1)?;
+            let truncated = session.mtp_truncate(clean);
+            #[cfg(test)]
+            {
+                session.skip_mtp_raw_restore = false;
+            }
+            truncated?;
         }
         for i in 0..k {
             #[cfg(test)]
@@ -281,7 +323,21 @@ pub(crate) fn generate_speculative(
             };
             #[cfg(not(test))]
             let source = &verified[i].residual;
-            session.mtp_step(MtpInput::Host(source), drafts[i], false, false)?;
+            #[cfg(test)]
+            let step = if options.fail_rebuild == Some((cycle, i)) {
+                Err(InferError::Metal(
+                    "reconstruction de l'historique MTP en échec (injecté)".to_string(),
+                ))
+            } else {
+                session.mtp_step(MtpInput::Host(source), drafts[i], false, false)
+            };
+            #[cfg(not(test))]
+            let step = session.mtp_step(MtpInput::Host(source), drafts[i], false, false);
+            // Les paires déjà ajoutées sont vérifiées, mais l'historique doit
+            // rester un préfixe sans trou : retour aux `p + 1` lignes propres.
+            if let Err(error) = step {
+                return Err(fail(session, clean, error));
+            }
         }
         out.tokens.push(y);
         out.tokens.extend_from_slice(&drafts[..k]);

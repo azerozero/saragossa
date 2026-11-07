@@ -45,6 +45,9 @@ struct MtpBuffers {
     fh: Buffer,
     /// Résiduel hc de sortie : `h` du draft suivant.
     out: Buffer,
+    /// Instantané de l'anneau des clés brutes de l'indexeur MTP
+    /// (`[compress, head_dim]`), pris par [`FlashNextSession::mtp_snapshot_raw`].
+    raw_snapshot: Buffer,
 }
 
 /// Résiduel d'entrée d'un pas MTP : copié depuis l'hôte, ou depuis un buffer
@@ -242,6 +245,9 @@ pub(crate) struct FlashNextSession {
     verify: Option<VerifyBuffers>,
     /// Vérification soumise non encore acceptée : tout autre pas est refusé.
     pending: Option<PendingVerify>,
+    /// Lignes de l'historique MTP au moment de l'instantané des clés brutes
+    /// (`None` : pas d'instantané valide).
+    mtp_raw_rows: Option<usize>,
     ple_state: PleState,
     h: [Buffer; 2],
     x: Buffer,
@@ -308,6 +314,9 @@ pub(crate) struct FlashNextSession {
     /// Oracles : échec d'encodage injecté à la ligne donnée d'une vérification.
     #[cfg(test)]
     pub(crate) fail_verify_row: Option<usize>,
+    /// Oracles : troncature MTP sans restauration des clés brutes.
+    #[cfg(test)]
+    pub(crate) skip_mtp_raw_restore: bool,
     /// Oracles : sélection et scores de l'indexeur par couche du dernier pas
     /// (`[couches, keep]` u32, `[couches, blocs max]` f32).
     #[cfg(test)]
@@ -377,6 +386,7 @@ pub(crate) fn session_state_bytes(c: &Qwen4ExpConfig, capacity: usize) -> u64 {
             + (blocks + c.indexer_compress) * c.indexer_head_dim
             + 5 * width // résiduels ping-pong, h normé, fc_hidden, sortie
             + 3 * c.hidden // embedding, e normé, fc_embedding
+            + c.indexer_compress * c.indexer_head_dim // instantané des clés brutes
     } else {
         0
     };
@@ -560,10 +570,12 @@ impl FlashNextSession {
                 h_normed: zeros(&executor, width),
                 fh: zeros(&executor, width),
                 out: zeros(&executor, width),
+                raw_snapshot: zeros(&executor, c.indexer_compress * c.indexer_head_dim),
             }),
             weights,
             verify: None,
             pending: None,
+            mtp_raw_rows: None,
             states: Vec::with_capacity(c.layer_kinds.len() + 1),
             ple_state: PleState {
                 bytes: executor
@@ -667,6 +679,8 @@ impl FlashNextSession {
             verify_mutation: None,
             #[cfg(test)]
             fail_verify_row: None,
+            #[cfg(test)]
+            skip_mtp_raw_restore: false,
             #[cfg(test)]
             selection_capture: executor.device().new_buffer(
                 ((c.layer_kinds.len() + 1) * (c.indexer_budget / c.indexer_compress) * 4) as u64,
@@ -1152,22 +1166,11 @@ impl FlashNextSession {
     #[cfg(test)]
     pub(crate) fn state_digest(&self) -> Result<StateDigest> {
         let c = &self.ckpt.config;
-        let compress = self.indexer_dims.compress;
-        let d = self.indexer_dims.head_dim;
-        let kv_dim = c.kv_heads * c.head_dim;
         let mut bits = vec![self.position as u32, self.ple_state.step as u32];
         for state in &self.states[..c.layer_kinds.len()] {
             match state {
                 LayerState::Linear(state) => bits.extend(state.state_bits()?),
-                LayerState::Full(full) => {
-                    let len = full.0.len();
-                    let (keys, values) = full.0.dense_f32_buffers()?;
-                    bits.push(len as u32);
-                    bits.extend(read_u32_buffer(keys, len * kv_dim)?);
-                    bits.extend(read_u32_buffer(values, len * kv_dim)?);
-                    bits.extend(read_u32_buffer(&full.1.pooled, (len / compress) * d)?);
-                    bits.extend(read_u32_buffer(&full.1.raw, (len % compress) * d)?);
-                }
+                LayerState::Full(full) => self.full_bits(&full.0, &full.1, &mut bits)?,
             }
         }
         bits.extend(read_u32_buffer(
@@ -1178,6 +1181,45 @@ impl FlashNextSession {
             bits,
             context: self.ple_state.context.clone(),
         })
+    }
+
+    /// Oracles : empreinte de l'historique MTP (KV, clés poolées des blocs
+    /// complets, clés brutes du bloc en cours).
+    #[cfg(test)]
+    pub(crate) fn mtp_state_digest(&self) -> Result<Vec<u32>> {
+        match self.states.get(self.ckpt.config.layer_kinds.len()) {
+            Some(LayerState::Full(full)) => {
+                let mut bits = Vec::new();
+                self.full_bits(&full.0, &full.1, &mut bits)?;
+                Ok(bits)
+            }
+            _ => Err(InferError::Config(
+                "Flash-Next : tête MTP absente".to_string(),
+            )),
+        }
+    }
+
+    /// Oracles : bits observables d'une couche QSA (KV, clés poolées des blocs
+    /// complets, clés brutes du bloc en cours).
+    #[cfg(test)]
+    fn full_bits(
+        &self,
+        kv: &FullAttentionMetalState,
+        indexer: &IndexerState,
+        bits: &mut Vec<u32>,
+    ) -> Result<()> {
+        let c = &self.ckpt.config;
+        let compress = self.indexer_dims.compress;
+        let d = self.indexer_dims.head_dim;
+        let kv_dim = c.kv_heads * c.head_dim;
+        let len = kv.len();
+        let (keys, values) = kv.dense_f32_buffers()?;
+        bits.push(len as u32);
+        bits.extend(read_u32_buffer(keys, len * kv_dim)?);
+        bits.extend(read_u32_buffer(values, len * kv_dim)?);
+        bits.extend(read_u32_buffer(&indexer.pooled, (len / compress) * d)?);
+        bits.extend(read_u32_buffer(&indexer.raw, (len % compress) * d)?);
+        Ok(())
     }
 
     fn fresh_states(&self, capacity: usize) -> Result<Vec<LayerState>> {
@@ -1476,6 +1518,7 @@ impl FlashNextSession {
         let c = &self.ckpt.config;
         self.ple_state.reset(c.ngram_size, c.eos);
         self.position = 0;
+        self.mtp_raw_rows = None;
         self.epoch += 1;
         self.base_checkpoint = None;
         self.poisoned = false;
@@ -1601,6 +1644,7 @@ impl FlashNextSession {
         self.ple_state.context = checkpoint.ple_context.clone();
         self.ple_state.step = checkpoint.ple_step;
         self.position = checkpoint.position;
+        self.mtp_raw_rows = None;
         self.epoch += 1;
         self.base_checkpoint = Some(checkpoint.id);
         self.poisoned = false;
@@ -1814,24 +1858,69 @@ impl FlashNextSession {
     }
 
     /// Tronque l'historique MTP à `rows` lignes : retire les lignes des drafts
-    /// enchaînés, construites sur des résiduels spéculatifs. Les blocs et clés
-    /// brutes de ces lignes sont réécrits avant d'être lus.
+    /// enchaînés, construites sur des résiduels spéculatifs, et restaure
+    /// l'anneau des clés brutes depuis l'instantané pris à `rows` lignes
+    /// ([`Self::mtp_snapshot_raw`]). Les blocs poolés de ces lignes sont
+    /// réécrits avant d'être lus.
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur sans tête MTP, ou si `rows` dépasse l'historique.
+    /// Renvoie une erreur sans tête MTP, si `rows` dépasse l'historique, ou si
+    /// le bloc en cours n'est pas vide sans instantané pris à `rows` lignes.
     #[cfg_attr(
         not(test),
         allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
     )]
     pub(crate) fn mtp_truncate(&mut self, rows: usize) -> Result<()> {
         self.refuse_pending()?;
-        match self.states.last_mut() {
-            Some(LayerState::Full(full)) if self.mtp.is_some() => full.0.truncate(rows),
-            _ => Err(InferError::Config(
+        let (Some(mtp), Some(LayerState::Full(full))) = (&self.mtp, self.states.last_mut()) else {
+            return Err(InferError::Config(
                 "Flash-Next : tête MTP absente".to_string(),
-            )),
+            ));
+        };
+        if full.0.len() == rows {
+            return Ok(());
         }
+        // Les lignes retirées ont écrit `raw[ligne % compress]` : sans
+        // instantané pris à `rows` lignes, le bloc en cours serait poolé avec
+        // la clé d'une ligne retirée. Un bloc en cours vide n'en lit aucune.
+        let restore = rows % self.indexer_dims.compress != 0;
+        if restore && self.mtp_raw_rows != Some(rows) {
+            return Err(InferError::Config(format!(
+                "troncature MTP à {rows} lignes sans instantané des clés brutes"
+            )));
+        }
+        full.0.truncate(rows)?;
+        #[cfg(test)]
+        let restore = restore && !self.skip_mtp_raw_restore;
+        if !restore {
+            return Ok(());
+        }
+        let len = (mtp.raw_snapshot.length() / 4) as usize;
+        let (snapshot, raw) = (mtp.raw_snapshot.clone(), full.1.raw.clone());
+        self.copy_f32(&snapshot, &raw, len)
+    }
+
+    /// Instantané de l'anneau des clés brutes de l'indexeur MTP aux lignes
+    /// courantes : les drafts enchaînés qui suivent écrivent dans cet anneau,
+    /// et [`Self::mtp_truncate`] le restaure en revenant à ces lignes.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une vérification est en attente, sans tête MTP ou
+    /// sur copie Metal.
+    pub(crate) fn mtp_snapshot_raw(&mut self) -> Result<()> {
+        self.refuse_pending()?;
+        self.mtp_raw_rows = None;
+        let (Some(mtp), Some(LayerState::Full(full))) = (&self.mtp, self.states.last()) else {
+            return Err(InferError::Config(
+                "Flash-Next : tête MTP absente".to_string(),
+            ));
+        };
+        let len = (mtp.raw_snapshot.length() / 4) as usize;
+        self.copy_f32(&full.1.raw, &mtp.raw_snapshot, len)?;
+        self.mtp_raw_rows = Some(full.0.len());
+        Ok(())
     }
 
     /// Résiduel de sortie du dernier pas MTP, résident (entrée du draft suivant).
