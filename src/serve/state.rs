@@ -1411,7 +1411,7 @@ impl LoadedModel {
             temperature,
             top_p,
             top_k,
-            seed: request.seed.unwrap_or(0),
+            seed: request.sampler_seed(),
             token_constraint,
         })
     }

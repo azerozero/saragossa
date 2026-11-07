@@ -218,8 +218,9 @@ normal `[DONE]`.
 ### Sampling and request fields
 
 `POST /v1/chat/completions` honours `temperature`, `top_p`, `top_k` (temperature
-first, then top-k, then top-p on the scaled distribution), `seed` (unsigned; defaults to `0`, so an unseeded sampled
-request stays reproducible), `stop` and `max_tokens` / `max_completion_tokens`.
+first, then top-k, then top-p on the scaled distribution), `seed` (signed i64,
+reinterpreted as u64 in two's complement; absent or null defaults to `0`), `stop`
+and `max_tokens` / `max_completion_tokens`. Unseeded sampling stays reproducible.
 
 - `chat_template_kwargs`: only `{"enable_thinking": false}` is accepted, by Qwen
   ChatML and Gemma 4, whose native rendering keeps thinking **off** (the empty

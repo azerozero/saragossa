@@ -53,9 +53,9 @@ pub(super) struct ChatCompletionRequest {
     /// Appels d'outils multiples autorisés (défaut vrai).
     #[serde(default)]
     pub(super) parallel_tool_calls: Option<bool>,
-    /// Graine du sampler (`seed` OpenAI) ; absente, la graine historique 0.
+    /// Graine signée OpenAI ; absente ou null, la graine historique 0.
     #[serde(default)]
-    pub(super) seed: Option<u64>,
+    pub(super) seed: Option<i64>,
     /// Arguments du template de chat (extension vLLM / llama.cpp) : seul
     /// `enable_thinking` est reconnu (et seulement à `false`, cf. `check_thinking`),
     /// toute autre clé est refusée.
@@ -115,6 +115,12 @@ const MAX_STOP_SEQUENCES: usize = 16;
 const MAX_STOP_BYTES: usize = 1024;
 
 impl ChatCompletionRequest {
+    /// Réinterprète la graine signée en u64 en complément à deux : -1 devient
+    /// u64::MAX. La conversion modulo 2^64 est déterministe.
+    pub(super) fn sampler_seed(&self) -> u64 {
+        self.seed.unwrap_or(0) as u64
+    }
+
     /// Renvoie le budget effectif.
     pub(super) fn max_tokens(&self) -> usize {
         self.max_tokens
@@ -807,8 +813,18 @@ mod tests {
             Some(42)
         );
         assert_eq!(parse(r#"{"model":"m","messages":[]}"#).seed, None);
+        for (seed, expected) in [
+            ("-1", u64::MAX),
+            ("0", 0),
+            ("9223372036854775807", i64::MAX as u64),
+            ("null", 0),
+        ] {
+            let req = parse(&format!(r#"{{"model":"m","messages":[],"seed":{seed}}}"#));
+            assert_eq!(req.sampler_seed(), expected);
+        }
+        assert_eq!(parse(r#"{"model":"m","messages":[]}"#).sampler_seed(), 0);
         assert!(serde_json::from_str::<ChatCompletionRequest>(
-            r#"{"model":"m","messages":[],"seed":-1}"#
+            r#"{"model":"m","messages":[],"seed":1.5}"#
         )
         .is_err());
     }
