@@ -1584,16 +1584,9 @@ fn prompt_fingerprint(tokens: &[usize]) -> u64 {
 /// (`renders_off` : Qwen ChatML, Gemma 4). Flint et Gemma 3, sans
 /// interrupteur, refusent toute valeur explicite plutôt que de l'ignorer.
 ///
-/// NOTE: `enable_thinking=true` est refusé partout : le rendu natif ne pose
-/// pas le préfixe `<think>\n` du template Qwen et normalise l'historique
-/// assistant en thinking désactivé. Le router demande un rendu qualifié contre
-/// le template de référence, sur plusieurs tours.
+/// NOTE: `validate()` a déjà refusé `enable_thinking=true`, avant chargement.
 fn check_thinking(requested: Option<bool>, renders_off: bool) -> ServeResult<()> {
     match requested {
-        Some(true) => Err(ServeError::Http(
-            "chat_template_kwargs.enable_thinking=true n'est pas supporté (thinking désactivé)"
-                .to_string(),
-        )),
         Some(false) if !renders_off => Err(ServeError::Http(
             "chat_template_kwargs.enable_thinking n'est pas supporté pour ce modèle".to_string(),
         )),
@@ -1648,9 +1641,7 @@ mod tests {
         assert!(check_thinking(None, true).is_ok());
         assert!(check_thinking(Some(false), true).is_ok());
         assert!(check_thinking(None, false).is_ok());
-        assert!(check_thinking(Some(true), true).is_err());
         assert!(check_thinking(Some(false), false).is_err());
-        assert!(check_thinking(Some(true), false).is_err());
     }
 
     #[test]

@@ -57,7 +57,7 @@ pub(super) struct ChatCompletionRequest {
     #[serde(default)]
     pub(super) seed: Option<i64>,
     /// Arguments du template de chat (extension vLLM / llama.cpp) : seul
-    /// `enable_thinking` est reconnu (et seulement à `false`, cf. `check_thinking`),
+    /// `enable_thinking` est reconnu (et seulement à `false`, cf. `validate`),
     /// toute autre clé est refusée.
     #[serde(default)]
     pub(super) chat_template_kwargs: Option<serde_json::Map<String, Value>>,
@@ -163,7 +163,11 @@ impl ChatCompletionRequest {
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
         let max_tokens = self.max_tokens_capped(max_tokens_cap)?;
         self.response_format_mode()?;
-        self.enable_thinking()?;
+        if self.enable_thinking()? == Some(true) {
+            return Err(ServeError::Http(
+                "chat_template_kwargs.enable_thinking: type JSON boolean non supporté (thinking désactivé)".into(),
+            ));
+        }
         self.reject_unsupported_sampling()?;
         if self.stream {
             if let Some(options) = &self.stream_options {
@@ -921,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_template_kwargs_accepts_only_boolean_thinking() {
+    fn chat_template_kwargs_validates_only_disabled_thinking() {
         let parse = |kwargs: &str| -> ChatCompletionRequest {
             serde_json::from_str(&format!(
                 r#"{{"model":"m","messages":[],"chat_template_kwargs":{kwargs}}}"#
@@ -937,6 +941,11 @@ mod tests {
             parse(r#"{"enable_thinking":true}"#).enable_thinking().ok(),
             Some(Some(true))
         );
+        assert!(parse(r#"{"enable_thinking":false}"#).validate(1024).is_ok());
+        assert!(matches!(
+            parse(r#"{"enable_thinking":true}"#).validate(1024),
+            Err(ServeError::Http(_))
+        ));
         assert_eq!(parse("{}").enable_thinking().ok(), Some(None));
         for refused in [
             r#"{"enable_thinking":"no"}"#,
