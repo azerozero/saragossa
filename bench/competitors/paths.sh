@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Chemins du bench concurrents, seule source pour les scripts et Python
 # (`config.py` lit ce fichier). Les valeurs locales viennent de `local.env`
 # (non versionné, voir `local.env.example`) ou de l'environnement.
@@ -32,7 +33,8 @@ WIKITEXT_TEST="${WIKITEXT_TEST:-${CORPUS_DIR}/wikitext-2-raw/wiki.test.raw}"
 
 SARAGOSSA_BIN="${SARAGOSSA_BIN:-${REPO}/target/release/saragossa}"
 
-# Clés exportées vers Python (config.py).
+# Clés exportées vers Python (config.py), lues par le script qui source ce fichier.
+# shellcheck disable=SC2034
 BENCH_PATH_KEYS=(REPO MODELS AI_MODEL RUST_SRC CORPUS_DIR MLX_CKPT MLX_VENV NVFP4_CKPT
   DFLASH_DIR GGUF_SRC_DIR GGUF_DIR GGUF_BF16 GGUF_MTP_BF16 GGUF_Q4_0 GGUF_Q4_K_M GGUF_MTP
   GGUF_DFLASH WIKITEXT_TRAIN WIKITEXT_TEST SARAGOSSA_BIN)
