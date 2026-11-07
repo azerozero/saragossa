@@ -4401,15 +4401,22 @@ impl CausalDecoder {
                 return Ok(hit);
             }
         }
+        // Lu une seule fois : `dflash_switch_min` relit l'environnement à chaque
+        // appel, le semis doit voir la même décision que le prefill.
+        let needs_history = self.dflash_switch_needs_history();
         let (cache, final_states, PrefixCaptures { from, hidden, .. }) = self
             .prefill_cache_state_with_layer_capture_all(
                 prompt,
                 layer_ids,
                 keep_rows.max(1),
-                self.dflash_switch_needs_history(),
+                needs_history,
             )?;
         let captures = PrefixCaptures::tail(layer_ids, from, hidden, keep_rows)?;
-        let mtp_history = self.dflash_switch_mtp_history(prompt, &final_states)?;
+        let mtp_history = if needs_history {
+            Some(self.dflash_switch_mtp_history(prompt, &final_states)?)
+        } else {
+            None
+        };
         let state = (cache, Tensor::row(final_states.last_row()?.to_vec())?);
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, mtp_history.as_ref(), Some(&captures))?;
@@ -4490,8 +4497,8 @@ impl CausalDecoder {
     /// Historique MTP committed semé par le prefill DFlash quand la bascule
     /// (`SARAGOSSA_RUST_DFLASH_SWITCH_MIN`) est active : le repli MTP après
     /// bascule retrouve alors l'entrée du cache de préfixe au lieu de re-préremplir
-    /// prompt + généré. `None` sans bascule, sans sidecar MTP ou hors politique
-    /// committed.
+    /// prompt + généré. Appelé seulement quand
+    /// [`Self::dflash_switch_needs_history`] est vrai.
     ///
     /// NOTE: semé aussi pour une requête avec stop sequences, pour laquelle la
     /// boucle résidente coupe pourtant la bascule ; le prefill ne voit pas les
@@ -4501,19 +4508,23 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
         final_states: &Tensor,
-    ) -> Result<Option<LayerKvCache>> {
-        if !self.dflash_switch_needs_history() {
-            return Ok(None);
-        }
+    ) -> Result<LayerKvCache> {
         let hidden = self.final_norm.data().len();
         let seeded = prompt.len().saturating_sub(1);
+        if final_states.data().len() < seeded * hidden {
+            return Err(InferError::Dimension(format!(
+                "historique MTP de bascule : {} valeurs d'états finaux, {} attendues",
+                final_states.data().len(),
+                seeded * hidden
+            )));
+        }
         let mut history = LayerKvCache::default();
         self.seed_mtp_history_batched(
             &final_states.data()[..seeded * hidden],
             &prompt[1..],
             &mut history,
         )?;
-        Ok(Some(history))
+        Ok(history)
     }
 
     /// Plus longue entrée du prefix cache couvrant un préfixe de `prompt`, état
