@@ -3555,18 +3555,22 @@ mod dflash_resident {
     }
 
     fn draft(window: Option<usize>) -> DFlashDraft {
+        draft_with_head_dim(window, HEAD_DIM)
+    }
+
+    fn draft_with_head_dim(window: Option<usize>, head_dim: usize) -> DFlashDraft {
         let layers = (0..LAYERS)
             .map(|layer| {
                 let seed = 10_000 * (layer + 1);
                 DFlashDraftLayer {
                     input_norm: norm(HIDDEN, seed + 1),
                     attention: DFlashAttentionWeights {
-                        q_proj: linear(Q_HEADS * HEAD_DIM, HIDDEN, seed + 2),
-                        k_proj: linear(KV_HEADS * HEAD_DIM, HIDDEN, seed + 3),
-                        v_proj: linear(KV_HEADS * HEAD_DIM, HIDDEN, seed + 4),
-                        o_proj: linear(HIDDEN, Q_HEADS * HEAD_DIM, seed + 5),
-                        q_norm: norm(HEAD_DIM, seed + 6),
-                        k_norm: norm(HEAD_DIM, seed + 7),
+                        q_proj: linear(Q_HEADS * head_dim, HIDDEN, seed + 2),
+                        k_proj: linear(KV_HEADS * head_dim, HIDDEN, seed + 3),
+                        v_proj: linear(KV_HEADS * head_dim, HIDDEN, seed + 4),
+                        o_proj: linear(HIDDEN, Q_HEADS * head_dim, seed + 5),
+                        q_norm: norm(head_dim, seed + 6),
+                        k_norm: norm(head_dim, seed + 7),
                     },
                     post_attention_norm: norm(HIDDEN, seed + 8),
                     mlp: GatedMlp::new(
@@ -3592,7 +3596,7 @@ mod dflash_resident {
                 intermediate_size: INTER,
                 num_attention_heads: Q_HEADS,
                 num_key_value_heads: KV_HEADS,
-                head_dim: HEAD_DIM,
+                head_dim,
                 rms_norm_eps: 1.0e-6,
                 rope_theta: 10_000.0,
                 layer_types: vec![
@@ -3752,6 +3756,314 @@ mod dflash_resident {
         run_case(None)?;
         // Fenêtre plus courte que contexte + bloc : chemin ligne par ligne fenêtré.
         run_case(Some(3))
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Même semis, mêmes formes de matmul, mêmes blocs et mêmes commits : seule
+    /// l'origine physique diffère. Un GPU absent fait échouer cet oracle explicite.
+    fn fixed_base_case(window: usize, prompt: usize, head_dim: usize) -> Result<()> {
+        let mut state = try_state()?.ok_or_else(|| InferError::Metal("GPU Metal requis".into()))?;
+        let executor = MetalExecutor::new()?;
+        let draft = draft_with_head_dim(Some(window), head_dim);
+        let selector = draft.selector.as_ref().expect("invariant: sélecteur");
+        let skip = prompt.saturating_sub(window);
+        let retained = prompt - skip;
+        let max_new = 8;
+        let capacity = retained + max_new + BLOCK + 1;
+        let mut full =
+            DFlashResident::new(&state, &executor, &draft, prompt + max_new + BLOCK + 1)?;
+        let mut fixed = DFlashResident::new(&state, &executor, &draft, capacity)?;
+        full.skip_context(skip)?;
+        fixed.rebase(skip)?;
+        let hidden = tensor(&[retained, TARGET_LAYERS * HIDDEN], 23 + skip, 8.0);
+        let hidden_buf = state.persistent(retained * TARGET_LAYERS * HIDDEN, GpuElement::F32)?;
+        write_f32_at(&hidden_buf, 0, hidden.data())?;
+        let noise_buf = state.persistent(BLOCK * HIDDEN, GpuElement::F32)?;
+        let out_states = state.persistent(BLOCK * HIDDEN, GpuElement::F32)?;
+        let out_index = state.persistent((BLOCK - 1) * TOP_K, GpuElement::U32)?;
+        let out_value = state.persistent((BLOCK - 1) * TOP_K, GpuElement::F32)?;
+        let out_projected = state.persistent(BLOCK * RANK, GpuElement::F32)?;
+        let lm_head = executor.resolve_linear_weight_buffers(
+            &LinearWeight::Dense(tensor(&[VOCAB, HIDDEN], 19, 4.0)),
+            "test_lm_head",
+        )?;
+        for resident in [&mut full, &mut fixed] {
+            let cb = state.queue().new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            let mut owned = Vec::new();
+            resident.encode_context_append(
+                &state,
+                &executor,
+                encoder,
+                &mut owned,
+                hidden_buf.buffer(),
+                retained,
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(cb)?;
+            assert_eq!(resident.context_len(), prompt);
+        }
+        // Rebase après semis et recul hors rétention : refus sans mutation.
+        assert!(matches!(fixed.rebase(skip), Err(InferError::Dimension(_))));
+        if skip > 0 {
+            assert!(matches!(
+                fixed.truncate_context(prompt - 1),
+                Err(InferError::Dimension(_))
+            ));
+            assert_eq!(fixed.context_len(), prompt);
+        }
+        // Rejets (0), acceptation partielle (1), puis bloc complet (BLOCK).
+        // Les deux premiers blocs identiques sont reproposés sans aucun commit.
+        for (turn, committed) in [0, 0, 1, BLOCK, 0].into_iter().enumerate() {
+            let noise = tensor(&[BLOCK, HIDDEN], if turn < 2 { 29 } else { 29 + turn }, 8.0);
+            write_f32_at(&noise_buf, 0, noise.data())?;
+            let context = full.context_len();
+            let useful_from = context.saturating_sub(window);
+            let mut reference = None;
+            for resident in [&mut full, &mut fixed] {
+                let before = resident
+                    .context_kv_for_test()
+                    .map(|kv| kv.read_rows(useful_from, context - useful_from))
+                    .collect::<Result<Vec<_>>>()?;
+                let cb = state.queue().new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                let mut owned = Vec::new();
+                resident.encode_block(
+                    &state,
+                    &executor,
+                    encoder,
+                    &mut owned,
+                    noise_buf.buffer(),
+                    BLOCK,
+                    out_states.buffer(),
+                )?;
+                resident.encode_block_candidates(
+                    &state,
+                    &executor,
+                    encoder,
+                    &mut owned,
+                    out_states.buffer(),
+                    BLOCK,
+                    &lm_head,
+                    TOP_K,
+                    out_index.buffer(),
+                    out_value.buffer(),
+                    Some(out_projected.buffer()),
+                )?;
+                encoder.end_encoding();
+                commit_and_wait(cb)?;
+                let indices =
+                    crate::metal_backend::read_u32_buffer(out_index.buffer(), (BLOCK - 1) * TOP_K)?;
+                let values = read_f32(&out_value);
+                let projected = read_f32(&out_projected);
+                let candidates: Vec<Vec<(usize, f32)>> = indices
+                    .chunks_exact(TOP_K)
+                    .zip(values.chunks_exact(TOP_K))
+                    .map(|(ids, scores)| {
+                        ids.iter()
+                            .zip(scores)
+                            .map(|(&id, &score)| (id as usize, score))
+                            .collect()
+                    })
+                    .collect();
+                let path = selector.select_projected(&projected[RANK..], &candidates, 7)?;
+                let after = resident
+                    .context_kv_for_test()
+                    .map(|kv| kv.read_rows(useful_from, context - useful_from))
+                    .collect::<Result<Vec<_>>>()?;
+                let kv_bits = |rows: &Vec<(Vec<f32>, Vec<f32>)>| {
+                    rows.iter()
+                        .map(|(k, v)| (bits(k), bits(v)))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    kv_bits(&before),
+                    kv_bits(&after),
+                    "bloc temporaire: KV commis altéré"
+                );
+                assert_eq!(resident.context_len(), context);
+                let result = (
+                    bits(&read_f32(&out_states)),
+                    indices,
+                    bits(&values),
+                    bits(&projected),
+                    path,
+                    kv_bits(&after),
+                );
+                if let Some(reference) = &reference {
+                    assert_eq!(
+                        &result, reference,
+                        "base fixe: W={window}, P={prompt}, tour={turn}"
+                    );
+                } else {
+                    reference = Some(result);
+                }
+            }
+            for kv in fixed.context_kv_for_test() {
+                assert_eq!(kv.capacity(), capacity);
+                assert_eq!(kv.len(), context);
+                assert_eq!(kv.stored_len(), context - skip);
+                assert_eq!(
+                    kv.rows_fused_supported(),
+                    skip == 0 && super::super::utils::flash_sdpa_enabled()
+                );
+                assert_eq!(
+                    kv.dflash_rows_supported(context, Some(window))?,
+                    super::super::utils::flash_sdpa_enabled()
+                );
+            }
+            if committed > 0 {
+                let accepted = tensor(&[committed, TARGET_LAYERS * HIDDEN], 500 + turn, 8.0);
+                // Buffer distinct, assez grand même pour les prompts très courts.
+                let accepted_buf =
+                    state.persistent(committed * TARGET_LAYERS * HIDDEN, GpuElement::F32)?;
+                write_f32_at(&accepted_buf, 0, accepted.data())?;
+                for resident in [&mut full, &mut fixed] {
+                    let cb = state.queue().new_command_buffer();
+                    let encoder = cb.new_compute_command_encoder();
+                    let mut owned = Vec::new();
+                    resident.encode_context_append(
+                        &state,
+                        &executor,
+                        encoder,
+                        &mut owned,
+                        accepted_buf.buffer(),
+                        committed,
+                    )?;
+                    encoder.end_encoding();
+                    commit_and_wait(cb)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Lancer dans deux processus : DFLASH_WINDOWED_ROWS=1 puis =0 (OnceLock).
+    /// W=2048 couvre le split-K ; W=64 couvre le flash et les chunks de semis.
+    #[test]
+    #[ignore = "GPU Metal requis"]
+    fn dflash_fixed_base_matches_full_bits() -> Result<()> {
+        for head_dim in [128, 256] {
+            for window in [64, 2048] {
+                for prompt in [3, window - 1, window, window + 1, window * 16 + 1] {
+                    fixed_base_case(window, prompt, head_dim)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Début absolu non nul devenu zéro local : doit garder le kernel naïf
+    /// du KV plein, même au seuil split-K et dans les deux formats denses.
+    #[test]
+    #[ignore = "GPU Metal requis"]
+    fn dflash_fixed_base_window_start_bits() -> Result<()> {
+        let state = try_state()?.ok_or_else(|| InferError::Metal("GPU Metal requis".into()))?;
+        for bf16 in [false, true] {
+            for window in [64, 2048] {
+                let base = 65;
+                let make = |capacity| {
+                    if bf16 {
+                        state.full_attention_bf16_for_test(capacity, Q_HEADS, KV_HEADS, HEAD_DIM)
+                    } else {
+                        state.full_attention_f32_for_test(capacity, Q_HEADS, KV_HEADS, HEAD_DIM)
+                    }
+                };
+                let mut full = make(base + window)?;
+                let mut fixed = make(window)?;
+                fixed.rebase(base)?;
+                let keys = tensor(&[base + window, KV_HEADS * HEAD_DIM], 53, 1.0);
+                let values = tensor(&[base + window, KV_HEADS * HEAD_DIM], 71, 2.0);
+                full.seed(keys.data(), values.data(), base + window)?;
+                fixed.seed(
+                    &keys.data()[base * KV_HEADS * HEAD_DIM..],
+                    &values.data()[base * KV_HEADS * HEAD_DIM..],
+                    base + window,
+                )?;
+                let q = tensor(&[Q_HEADS * HEAD_DIM], 97, 1.0);
+                let reference = bits(&full.attention_decode_windowed(q.data(), base)?);
+                assert_eq!(
+                    reference,
+                    bits(&fixed.attention_decode_windowed(q.data(), base)?)
+                );
+                // Mutation d'une ligne vers le passé, mêmes octets physiques :
+                // la garde de rétention seule ne suffit pas, l'oracle doit rougir.
+                let mut shifted = make(window)?;
+                shifted.rebase(base - 1)?;
+                shifted.seed(
+                    &keys.data()[base * KV_HEADS * HEAD_DIM..],
+                    &values.data()[base * KV_HEADS * HEAD_DIM..],
+                    base - 1 + window,
+                )?;
+                assert_ne!(
+                    reference,
+                    bits(&shifted.attention_decode_windowed(q.data(), base)?),
+                    "l'oracle doit détecter une base décalée d'une ligne"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Contrôle négatif : une mutation base = P-W+1 perd une ligne requise.
+    /// L'oracle doit refuser la proposition, avant toute écriture temporaire.
+    #[test]
+    #[ignore = "GPU Metal requis"]
+    fn dflash_fixed_base_rejects_shifted_base() -> Result<()> {
+        let mut state = try_state()?.ok_or_else(|| InferError::Metal("GPU Metal requis".into()))?;
+        let executor = MetalExecutor::new()?;
+        let (window, prompt) = (64, 1024);
+        let mut resident =
+            DFlashResident::new(&state, &executor, &draft(Some(window)), window + BLOCK + 1)?;
+        resident.rebase(prompt - window + 1)?;
+        let hidden = tensor(&[window - 1, TARGET_LAYERS * HIDDEN], 23, 8.0);
+        let hidden_buf =
+            state.persistent((window - 1) * TARGET_LAYERS * HIDDEN, GpuElement::F32)?;
+        write_f32_at(&hidden_buf, 0, hidden.data())?;
+        let noise = state.persistent(BLOCK * HIDDEN, GpuElement::F32)?;
+        write_f32_at(&noise, 0, tensor(&[BLOCK, HIDDEN], 29, 8.0).data())?;
+        let out = state.persistent(BLOCK * HIDDEN, GpuElement::F32)?;
+        let cb = state.queue().new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        let mut owned = Vec::new();
+        resident.encode_context_append(
+            &state,
+            &executor,
+            encoder,
+            &mut owned,
+            hidden_buf.buffer(),
+            window - 1,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(cb)?;
+        assert_eq!(resident.context_len(), prompt);
+        let cb = state.queue().new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        let result = resident.encode_block(
+            &state,
+            &executor,
+            encoder,
+            &mut owned,
+            noise.buffer(),
+            BLOCK,
+            out.buffer(),
+        );
+        encoder.end_encoding();
+        assert!(
+            matches!(result, Err(InferError::Dimension(_))),
+            "la mutation d'une ligne doit être refusée"
+        );
+        for kv in resident.context_kv_for_test() {
+            assert!(matches!(
+                kv.dflash_rows_supported(prompt, Some(window)),
+                Err(InferError::Dimension(_))
+            ));
+            assert_eq!(kv.len(), prompt);
+        }
+        Ok(())
     }
 }
 

@@ -872,6 +872,23 @@ impl FullAttentionMetalState {
         self.len
     }
 
+    /// Périmètre dense propre au drafter, sans préfixe partagé ni sinks.
+    pub(super) fn dflash_dense_unadopted(&self) -> bool {
+        self.quant.is_none() && self.sinks.is_none() && self.adopted.is_none() && self.floor == 0
+    }
+
+    /// La prochaine proposition doit encore voir toute sa fenêtre commise.
+    pub(super) fn check_dflash_window(&self, context: usize, window: Option<usize>) -> Result<()> {
+        let earliest = window.map_or(0, |w| context.saturating_sub(w));
+        if self.base > earliest {
+            return Err(InferError::Dimension(format!(
+                "DFlash base {} > début de fenêtre {earliest} (contexte {context})",
+                self.base
+            )));
+        }
+        Ok(())
+    }
+
     /// Déclare `base` lignes absolues absentes devant la ligne 0 d'une arène
     /// encore vide : le semis suivant porte les lignes `[base, n)` (couche
     /// glissante bornée à sa fenêtre). Les kernels lisent le buffer comme
@@ -1712,6 +1729,7 @@ impl FullAttentionMetalState {
         // head_dim 128/256, GQA réel (>1 q/kv), len ≥ seuil. Cf. encode_attention_decode_2pass.
         let gqa = self.q_heads / self.kv_heads.max(1);
         if window_start == 0
+            && self.base == 0
             && sdpa_2pass_enabled()
             && flash_sdpa_enabled()
             && matches!(self.head_dim, 128 | 256)
@@ -1732,7 +1750,10 @@ impl FullAttentionMetalState {
         // Le chemin fenêtré privilégie d'abord la correction : le kernel naïf
         // exclut réellement les lignes antérieures. Les variantes flash/2-pass
         // historiques restent strictement inchangées pour `window_start == 0`.
+        // NOTE: un début absolu non nul traduit en zéro local doit conserver
+        // le naïf de l'oracle KV plein, et donc son ordre de réduction.
         let use_flash = window_start == 0
+            && self.base == 0
             && flash_sdpa_enabled()
             && self.head_dim <= 256
             && self.head_dim % 32 == 0;

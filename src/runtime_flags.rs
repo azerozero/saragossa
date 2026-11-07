@@ -1672,6 +1672,14 @@ pub(crate) fn dflash_windowed_rows() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS", true))
 }
 
+/// KV du drafter DFlash à base fixe (défaut ON), seulement si toutes les couches
+/// sont fenêtrées et leurs types complets. `SARAGOSSA_RUST_DFLASH_DRAFTER_BASE=0`
+/// conserve la capacité pleine et `skip_context`. Lu à chaque génération pour
+/// les comparaisons plein/base fixe dans les harnais d'identité.
+pub(crate) fn dflash_drafter_base() -> bool {
+    env_flag("SARAGOSSA_RUST_DFLASH_DRAFTER_BASE", true)
+}
+
 /// Vérification en arbre DFlash 2 (`SARAGOSSA_RUST_DFLASH_TREE=B`) : `B` nœuds
 /// best-first sur le treillis du sélecteur au lieu de la chaîne gloutonne,
 /// vérifiés en `B + 1` lignes ; `0` = chaîne historique. `None` (variable
