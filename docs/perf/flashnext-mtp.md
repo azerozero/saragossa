@@ -76,7 +76,7 @@ Onze mutations rougissent toutes, dont :
   (≥ 2 × 1e-5 sur 256 lignes creuses) et en variante de 1024 sur la sélection ;
 - historique figé.
 
-Mémoire : la session à 256k alloue 14,64 Go d'état, égal au budget calculé.
+Mémoire : la session à 256k alloue 14,64 Go d'état, égal au budget calculé (vérifié de nouveau après l'ajout de l'instantané de 2 Kio des clés brutes MTP).
 Tronc inchangé : ABBA à 1k, −0,13 % [−0,52 ; +0,25].
 
 ## C. Spéculatif exact en pas mono
@@ -108,36 +108,55 @@ Conventions alignées sur l'AR :
 
 ### Identité (porte dure)
 
-Test `speculative_greedy_matches_ar_bitwise`, commit 69eeb81 : 1977 s, pic
-78,6 Go.
+Test `speculative_greedy_matches_ar_bitwise`, commit 4035bc5 : 2914 s, pic
+79,1 Go.
 
 | prompt | d1 | d2 | d3 (jetons par cycle) |
 |---|---|---|---|
-| golden 64 | 1,92 | 2,63 | 3,28 |
+| golden 64 | 1,92 | 2,63 | 3,27 |
 | golden 512 | 1,81 | 2,34 | 2,55 |
-| golden 2040 | 1,98 | 2,88 | 3,82 |
+| golden 2040 | 1,98 | 2,87 | 3,81 |
 | golden 3000 (creux) | 1,77 | 2,36 | 2,71 |
-| wikitext 1024 | 1,86 | 2,53 | 3,11 |
+| wikitext 1024 | 1,86 | 2,52 | 3,11 |
 | wikitext 2600 (creux) | 1,59 | 1,82 | 1,93 |
-| code4k-1 | 1,89 | 2,60 | 3,20 |
-| code4k-2 | 1,85 | 2,53 | 2,94 |
+| code4k-1 | 1,89 | 2,60 | 3,19 |
+| code4k-2 | 1,85 | 2,52 | 2,93 |
 
-Les 24 sorties sont identiques à l'AR. Cas limites couverts :
-- rejet forcé : 0 draft accepté sur 63 cycles, sortie identique ;
+Les 24 sorties sont identiques à l'AR, jetons et résiduels compris. L'état
+final du tronc l'est aussi : position, KV, états DeltaNet, indexeur et PLE.
+Cette empreinte d'état est contrôlée sur chacun des cas limites suivants :
+- rejet forcé : 0 draft accepté sur 63 cycles ;
 - arrêt sur un draft accepté et sur un draft rejeté ;
-- capacité limite ;
+- acceptation complète forcée (drafts = jetons AR), budgets 2 à 8 : les
+  acceptations par cycle sont vérifiées une à une ([0], [1], [2], [3], [3, 0],
+  [3, 1], [3, 2]) ;
+- capacité limite, puis capacité + 1 (dernière position) ;
 - profondeur 0 (délégation à l'AR) ;
-- budgets 0 et 1 ; `usize::MAX` refusé ;
-- échec injecté au cycle 3, suivi d'un historique MTP propre.
+- budgets 0 à 3 ;
+- `usize::MAX` refusé.
 
-Le draft `D_1` est contrôlé contre un rejeu séquentiel des paires AR : 0 écart
-sur 100 cycles (golden 512) et 80 cycles (code4k-1). Deux mutations rougissent
-ce contrôle :
+**Oracles de l'historique MTP.**
+- **`D_1`.** Le draft `D_1` de chaque cycle est contrôlé contre un rejeu
+  séquentiel des paires AR. Aucun écart sur 100 cycles (golden 512) ni sur 80
+  cycles (code4k-1). Cet oracle a ses limites :
+  - l'indexeur est sans effet en régime dense, d'où l'oracle d'état qui suit ;
+  - le rejeu suit la même convention d'historique que le code testé ; c'est
+    l'acceptation et la partie A qui valident cette convention.
+- **État.** L'historique MTP (KV, clés poolées, clés brutes du bloc en cours)
+  est égal au rejeu séquentiel des paires AR, en régime dense (golden 512,
+  256 jetons) et creux (golden 3000, 64 jetons).
+- **Échec de reconstruction.** Un échec est injecté à la 2ᵉ paire sur un
+  préfixe aligné (512), puis à la 3ᵉ sur un préfixe congru à 3 modulo 4 (515).
+  Dans les deux cas, l'historique revient aux `|prompt| + 8` lignes propres et
+  le tronc s'arrête à `|prompt| + 12`. L'état MTP est alors égal au rejeu.
+- **Échec de vérification.** Un échec d'encodage est injecté au cycle 3 :
+  l'historique MTP revient à ses lignes vérifiées.
 
-| mutation | golden 512 | code4k-1 |
-|---|---|---|
-| troncature oubliée | 3 écarts | 2 écarts |
-| historique construit sur des `h` spéculatifs | 4 écarts | 6 écarts |
+| mutation | `D_1`, golden 512 | `D_1`, code4k-1 | état MTP, 512 et 3000 |
+|---|---|---|---|
+| troncature oubliée | 3 écarts | 2 écarts | détectée |
+| historique construit sur des `h` spéculatifs | 4 écarts | 6 écarts | détectée |
+| clés brutes non restaurées | — | — | détectée |
 
 `resident_verify_rows_and_accept_match_ar_bitwise` vérifie de son côté que
 `verify` puis `accept(k)` laissent, pour k = 0 à R−1, un état égal au bit près
@@ -397,6 +416,19 @@ vérification greedy stricte.
   - Lignes exactes au bit sur les 48 couches.
   - Ce kernel route chaque ligne sans union : dès deux lignes, il coûte plus
     que deux MoE mono.
+- **Second passage (commit 4035bc5).**
+  - L'exactitude est publiée en trois classes, sans tolérance sur le signe des
+    zéros, pour toutes les couches et R = 2..4 :
+    - DeltaNet : 972 lignes de projection identiques au bit, 0 au signe des
+      zéros près, 0 différente ;
+    - MoE : 432 lignes identiques au bit, 0 au signe des zéros près,
+      0 différente.
+
+    Le critère « lignes exactes » de e5ef5b6 est donc rempli strictement.
+  - Mesures refaites : reste DeltaNet 0,975 ms, MoE ρ = 2,99 / 3,40 / 3,78.
+    Avec elles, ρ(4) = 2,76 : D complet ×0,88, les deux ×0,83 en code. La
+    décision reste calculée sur le premier passage, comme convenu ; le second
+    ne la change pas.
 
 ### Acceptation d'un draft sur sous-vocabulaire (commit 994d9aa)
 
@@ -436,13 +468,59 @@ cycle.
 | les deux | **×0,83** | ×0,59 |
 | pour mémoire : C actuel, mesuré | ×0,665 | ×0,53 |
 
-À titre indicatif, hors règle :
-- une variante favorable (travail du reste × 1,2, qmv-T u6 pour la tête,
-  union des experts au facteur 3,29 sur toute la brique MoE) donne ρ(4) =
-  2,08, soit ×1,09 pour D complet et ×1,08 pour les deux en code ;
-- même avec une acceptation inchangée sous sous-vocabulaire (n = 3,20), les
-  deux options combinées donnent ×1,09 en réaliste et ×1,42 dans cette
-  variante.
+**Changement de poste entre db5635c et e5ef5b6, à déclarer.**
+- En db5635c, le MoE réaliste était l'union des experts, au facteur mesuré de
+  3,29. En e5ef5b6, il est devenu le kernel en lignes existant, mesuré (s'il
+  est exact), soit ×3,84.
+- Ce changement a été écrit après le modèle intermédiaire de la re-mesure,
+  au point d'étape du 7 nov. Ce modèle portait sur les seules données de
+  c96e469, avec une acceptation supposée inchangée sous sous-vocabulaire, et
+  donnait ×1,23 avec un reste DeltaNet nul et ×1,19 avec l'état du scan × R.
+- Ce changement a donc été écrit avant les mesures in situ, mais après un
+  résultat intermédiaire au seuil.
+- La décision ne dépend pas de ce poste : sous la définition db5635c, D complet
+  donne ×0,93 et les deux options ×0,88 (tableau ci-dessous). Ce qui fait
+  tomber l'option combinée, c'est l'acceptation mesurée sous sous-vocabulaire
+  (2,41 jetons par cycle au lieu des 3,20 supposés).
+
+**Hypothèses de db5635c, publiées comme annoncé**, avec les mesures in situ et
+l'acceptation mesurée. La décision ne porte que sur la première ligne.
+
+| hypothèse | ρ(4) | D complet, code | les deux, code | D complet, prose | les deux, prose |
+|---|---|---|---|---|---|
+| réaliste e5ef5b6 (décision) | 2,77 | ×0,88 | ×0,83 | ×0,72 | ×0,59 |
+| réaliste db5635c (union MoE × 3,29) | 2,58 | ×0,93 | ×0,88 | ×0,76 | ×0,63 |
+| optimiste db5635c (travail × 1,2, qmv-T u6, union) | 2,08 | ×1,09 | ×1,08 | ×0,90 | ×0,78 |
+| borne basse db5635c (tout à ρ = 1 sauf les experts, Σ N_m / 10) | 1,51 | ×1,34 | ×1,45 | ×1,12 | ×1,05 |
+| variante : état du scan lu une fois | 2,70 | ×0,90 | ×0,85 | ×0,74 | ×0,60 |
+| reste DeltaNet in situ nul (borne de son biais) | 2,61 | ×0,92 | ×0,87 | ×0,76 | ×0,62 |
+
+- Seule la borne basse dépasse ×1,2 en code. Elle suppose des kernels en
+  lignes idéaux partout : lecture unique et calcul gratuit, y compris pour
+  l'argmax de tête, le scan, l'attention et les hyper-connections.
+- Scénario d'une acceptation inchangée sous sous-vocabulaire (n = 3,20) : les
+  deux options donnent ×1,09 en réaliste. Ce n'est pas une borne. Un masque
+  plus large peut réintroduire un mauvais candidat mieux classé, et un masque
+  qui exclut un argmax incorrect peut au contraire améliorer l'acceptation.
+
+**Limites des mesures in situ.**
+- **DeltaNet.** Le reste (0,89 ms) est une estimation par soustraction, sur des
+  entrées synthétiques ; les états avancent entre les répétitions.
+  - Les matmuls soustraits sont ceux des poids séparés (`qkv_z`, `beta_gate`,
+    `out_proj`) : mêmes octets, mais pas forcément les mêmes dispatches que la
+    couche, qui peut passer par les concaténations fusionnées.
+  - Le micro-bench des mêmes formes (5,63 ms) dépasse la mesure in situ
+    (4,61 ms) : les dispatches enchaînés d'un même command buffer coûtent
+    moins que les dispatches isolés.
+  - Un reste nul borne ce biais (ligne ci-dessus) : ×0,92.
+- **MoE.** Les quatre entrées aléatoires servent à toutes les couches. Ce n'est
+  pas un rejeu des activations et des routages de quatre jetons consécutifs
+  réels. Le kernel en lignes dépend de `SARAGOSSA_RUST_MOE_VERIFY_TAIL`
+  (défaut 2).
+- **Temps de tête.** `T_tête` = 2,93 ms est l'argmax mono mesuré isolément (pour
+  `T_mtp_sub`) ; la brique `lm_head` du profil vaut 2,75 ms dans le pas.
+- **Prompt de prose.** Le golden 512 est le début de `docs/perf/mtp-pairwise.md`
+  (provenance du golden), distinct du wikitext `corpus32k`.
 
 ### Décision
 
@@ -457,8 +535,8 @@ réaliste : **D s'arrête**, selon la règle fixée avant la mesure. La mention
 - Le reste DeltaNet in situ, 0,89 ms par pas, est séquentiel.
 - Le draft sur sous-vocabulaire perd plus en acceptation (3,19 → 2,41 jetons
   par cycle en code) qu'il ne gagne sur le pas MTP. Le corpus distinct n'a
-  fourni que 5 623 jetons ; un corpus plus large réduirait cette perte sans
-  dépasser le cas d'une acceptation inchangée (×1,09).
+  fourni que 5 623 jetons. Même avec une acceptation inchangée, les deux
+  options resteraient à ×1,09.
 - C reste en place comme base exacte. Le spéculatif reste désactivé par défaut
   sur Flash-Next et n'est atteint par aucun point d'entrée (`serve`, `run`,
   CLI).
