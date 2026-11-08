@@ -37,7 +37,14 @@ if [[ "${night}" == partial ]]; then
   "${sys_py[@]}" "${here}/night_checks.py" partial-freeze "${run}"
 fi
 
-if [[ -n "${GPU_LOCK:-}" ]]; then
+GPU_LOCK="${GPU_LOCK:-${HOME}/.cache/saragossa/gpu.lock}"
+mkdir -p "$(dirname "${GPU_LOCK}")"
+if [[ -d "${GPU_LOCK}" ]]; then
+  GPU_LOCK="$(cd -P "${GPU_LOCK}" && pwd -P)"
+else
+  GPU_LOCK="$(cd -P "$(dirname "${GPU_LOCK}")" && pwd -P)/$(basename "${GPU_LOCK}")"
+fi
+if [[ "${GPU_LOCK_HELD:-}" != "${GPU_LOCK}" ]]; then
   until mkdir "${GPU_LOCK}" 2>/dev/null; do sleep 60; done
   echo "bench-competitors" > "${GPU_LOCK}/owner"
   trap 'rm -rf "${GPU_LOCK}"' EXIT

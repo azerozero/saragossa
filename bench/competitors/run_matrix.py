@@ -42,6 +42,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import client  # noqa: E402
 import memwatch  # noqa: E402
 import sensors  # noqa: E402
+from sensors import pmset, power_state, validate_power  # noqa: E402
 from config import path as config_path, paths as config_paths, sanitize  # noqa: E402
 from prompts import fnv1a64, is_4k  # noqa: E402  (stdlib seule au niveau module)
 from results import read_results  # noqa: E402
@@ -274,39 +275,11 @@ def soc_sensors():
         return empty
 
 
-def pmset(*args):
-    """Lecture bornée ; les erreurs sont des informations, jamais une panne du run."""
-    try:
-        return subprocess.run(["pmset", "-g", *args], capture_output=True, text=True,
-                              check=True, timeout=3).stdout, None
-    except (OSError, subprocess.SubprocessError) as error:
-        return "", str(error)
-
-
-def power_state():
-    batt, batt_error = pmset("batt")
-    mode, mode_error = pmset()
-    modes = [line.split() for line in mode.splitlines()
-             if line.split() and line.split()[0] in ("powermode", "lowpowermode")]
-    values = [parts[-1] for parts in modes if len(parts) >= 2]
-    return {"on_ac": (True if "AC Power" in batt else
-                       False if "Battery Power" in batt else None),
-            "low_power": any(v == "1" for v in values) if values else None,
-            "source_raw": batt.strip(), "mode_raw": [" ".join(p) for p in modes],
-            "errors": [e for e in (batt_error, mode_error) if e]}
-
-
 def require_power(camp, **meta):
     state = power_state()
     camp.write({"kind": "power", "time": time.time(), **meta, **state})
     validate_power(state)
     return state
-
-
-def validate_power(state):
-    if state["on_ac"] is False or state["low_power"] is True:
-        raise SystemExit("alimentation : secteur requis et mode basse consommation désactivé ; "
-                         "campagne arrêtée, reprise possible")
 
 
 def thermal(sampler=None):
@@ -1215,7 +1188,7 @@ def _operations_check():
         for source, value, blocked in (("AC Power", "0", False), ("Battery Power", "0", True),
                                        ("AC Power", "1", True), ("AC Power", "2", False)):
             lines = []
-            with patch(__name__ + ".pmset", side_effect=[(source, None), (f" {mode} {value}", None)]):
+            with patch.object(sensors, "pmset", side_effect=[(source, None), (f" {mode} {value}", None)]):
                 try:
                     state = require_power(SimpleNamespace(write=lines.append))
                 except SystemExit as error:
