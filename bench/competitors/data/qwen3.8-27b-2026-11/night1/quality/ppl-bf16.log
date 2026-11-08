@@ -1,0 +1,11 @@
+0.07.188.046 I cmn          init: llama threadpool init, n_threads = 6
+0.07.306.022 I 
+0.07.306.038 I system_info: n_threads = 6 (n_threads_batch = 6) / 18 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | SME = 1 | ACCELERATE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.07.306.122 I perplexity: saving all logits to scratchpad/night/compet/night1/quality/bf16.kld
+0.07.306.127 I perplexity: tokenizing the input ..
+0.07.523.224 I perplexity: tokenization took 217.091 ms
+0.07.523.281 I perplexity: calculating perplexity over 32 chunks, n_ctx=512, batch_size=512, n_seq=1
+0.08.221.735 I perplexity: 0.69 seconds per pass - ETA 0.37 minutes
+[1]4.2912,[2]6.0629,[3]5.8391,[4]5.7897,[5]5.7846,[6]6.0119,[7]6.1549,[8]6.6147,[9]6.9948,[10]7.3494,[11]7.2315,[12]7.2844,[13]7.6133,[14]7.2315,[15]7.2016,[16]7.3871,[17]6.9752,[18]7.0617,[19]6.9924,[20]6.9326,[21]6.6896,[22]6.6002,[23]6.3734,[24]6.0815,[25]5.9675,[26]5.8320,[27]5.7355,[28]5.6550,[29]5.6510,[30]5.6256,[31]5.5770,[32]5.5871,
+0.31.647.582 I Final estimate: PPL = 5.5871 +/- 0.14677
+

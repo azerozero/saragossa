@@ -1,0 +1,41 @@
+bench-env: SARAGOSSA_BIN=~/workspace/saragossa-oss/.claude/worktrees/agent-a3f925100ec26dd39/target/release/saragossa
+bench-env: SARAGOSSA_RUST_MTP_DECODE=1
+bench-env: SARAGOSSA_RUST_MTP_MAX_DRAFT=2
+bench-env: SARAGOSSA_RUST_PREFIX_CACHE=0
+bench-env: SARAGOSSA_SERVE_PREFIX_CACHE=0
+bench-launch: ~/workspace/saragossa-oss/.claude/worktrees/agent-a3f925100ec26dd39/target/release/saragossa serve --port 18080 --model qwen38=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit --preload
+saragossa serve model enregistré alias=qwen38 path=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit source=local
+saragossa serve loading model=qwen38 path=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit
+saragossa serve MTP actif model=qwen38 sidecar=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit/mtp.safetensors max_draft=2
+cpu_weights_released mode=incremental bytes=0 payloads=506 unique_weights=506
+saragossa serve warmup model=qwen38 passes=2 prompt_tokens=2 elapsed_ms=101
+mtp_adaptive_depth steps=3 deep_steps=2 avg_depth=1.6667 ema_deep=0.4900 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve warmup MTP model=qwen38 tokens=4 elapsed_ms=192
+saragossa serve TCP listening on http://127.0.0.1:18080/v1
+saragossa serve TCP bearer auth enabled
+mtp_adaptive_depth steps=185 deep_steps=72 avg_depth=1.3946 ema_deep=0.7771 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=4695 decode_ms=8293 total_ms=12989 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22179331720 prefix_cache_bytes=0 prompt_fnv1a64=74595d718f6318a7
+mtp_adaptive_depth steps=191 deep_steps=83 avg_depth=1.4450 ema_deep=0.4990 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=4997 decode_ms=8933 total_ms=13930 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21134491152 prefix_cache_bytes=0 prompt_fnv1a64=52a95c4fe11bcba1
+mtp_adaptive_depth steps=227 deep_steps=42 avg_depth=1.1850 ema_deep=0.3945 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=59 completion_tokens=400 prefill_ms=163 decode_ms=9716 total_ms=9879 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21267512944 prefix_cache_bytes=0 prompt_fnv1a64=1c5b0e2db4f3aa6b
+mtp_adaptive_depth steps=171 deep_steps=108 avg_depth=1.6316 ema_deep=0.6328 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5191 decode_ms=8459 total_ms=13651 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21512142688 prefix_cache_bytes=0 prompt_fnv1a64=09ed2a697b993d0d
+mtp_adaptive_depth steps=210 deep_steps=49 avg_depth=1.2333 ema_deep=0.5847 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5468 decode_ms=9460 total_ms=14928 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21177056856 prefix_cache_bytes=0 prompt_fnv1a64=b6fee9ddb1abe7bc
+mtp_adaptive_depth steps=191 deep_steps=82 avg_depth=1.4346 ema_deep=0.4101 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5574 decode_ms=9043 total_ms=14618 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22155689704 prefix_cache_bytes=0 prompt_fnv1a64=f369f2b042290320
+mtp_adaptive_depth steps=242 deep_steps=40 avg_depth=1.1653 ema_deep=0.3042 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=58 completion_tokens=400 prefill_ms=166 decode_ms=10021 total_ms=10187 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21229600392 prefix_cache_bytes=0 prompt_fnv1a64=c725b0db3b2e499c
+mtp_adaptive_depth steps=160 deep_steps=124 avg_depth=1.7750 ema_deep=0.8236 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=58 completion_tokens=400 prefill_ms=166 decode_ms=8165 total_ms=8331 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21266153144 prefix_cache_bytes=0 prompt_fnv1a64=75799cbb95b2b01c
+mtp_adaptive_depth steps=188 deep_steps=75 avg_depth=1.4043 ema_deep=0.2268 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5507 decode_ms=8577 total_ms=14084 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22256058112 prefix_cache_bytes=0 prompt_fnv1a64=451549e2ac2ed947
+mtp_adaptive_depth steps=202 deep_steps=54 avg_depth=1.2723 ema_deep=0.3161 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5244 decode_ms=8780 total_ms=14024 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21231025776 prefix_cache_bytes=0 prompt_fnv1a64=26c67509fec4c359
+mtp_adaptive_depth steps=212 deep_steps=56 avg_depth=1.2642 ema_deep=0.2649 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=59 completion_tokens=400 prefill_ms=159 decode_ms=9315 total_ms=9474 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21275279032 prefix_cache_bytes=0 prompt_fnv1a64=f5c3fe20d6b11064
+mtp_adaptive_depth steps=214 deep_steps=39 avg_depth=1.1822 ema_deep=0.8104 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=50 completion_tokens=400 prefill_ms=162 decode_ms=9362 total_ms=9525 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21272379112 prefix_cache_bytes=0 prompt_fnv1a64=5f529787fbd37056
+mtp_adaptive_depth steps=211 deep_steps=63 avg_depth=1.2986 ema_deep=0.6953 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=61 completion_tokens=400 prefill_ms=171 decode_ms=9482 total_ms=9654 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=21275328232 prefix_cache_bytes=0 prompt_fnv1a64=33b30a3d0f121cee

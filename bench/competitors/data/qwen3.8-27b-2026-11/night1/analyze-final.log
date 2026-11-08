@@ -1,0 +1,1001 @@
+{
+ "admissibility": {
+  "tune:sar-mtp:0": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-ubatch:2": {
+   "total": 4,
+   "by_status": {
+    "admissible": 4
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-sampler:0": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llmd-batching:0": {
+   "total": 4,
+   "by_status": {
+    "admissible": 4
+   },
+   "failed_proofs": {},
+   "approx": 4,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-ctxcp:0": {
+   "total": 4,
+   "by_status": {
+    "admissible": 4
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-mtp:2": {
+   "total": 6,
+   "by_status": {
+    "admissible": 3,
+    "validation_failed": 3
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "tune-prose4k-1",
+     "tune-chat-1",
+     "tune-chat-1"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:sar-mtp:1": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-dflash:0": {
+   "total": 6,
+   "by_status": {
+    "validation_failed": 3,
+    "admissible": 3
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "tune-chat-1",
+     "tune-chat-1",
+     "tune-prose4k-1"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-mtp:1": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-dflash:1": {
+   "total": 6,
+   "by_status": {
+    "validation_failed": 3,
+    "admissible": 3
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "tune-prose4k-1",
+     "tune-chat-1",
+     "tune-chat-1"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-ctxcp:1": {
+   "total": 4,
+   "by_status": {
+    "admissible": 4
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-mtp:0": {
+   "total": 6,
+   "by_status": {
+    "validation_failed": 3,
+    "admissible": 3
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "tune-prose4k-1",
+     "tune-chat-1",
+     "tune-chat-1"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:mlx-prefill:0": {
+   "total": 4,
+   "by_status": {
+    "admissible": 4
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-dflash:2": {
+   "total": 6,
+   "by_status": {
+    "admissible": 3,
+    "validation_failed": 3
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "tune-prose4k-1",
+     "tune-chat-1",
+     "tune-chat-1"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-ubatch:0": {
+   "total": 4,
+   "by_status": {
+    "admissible": 4
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:mlx-prefill:1": {
+   "total": 4,
+   "by_status": {
+    "admissible": 4
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:sar-dflash:0": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:sar-dflash:1": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-sampler:1": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:sar-dflash:2": {
+   "total": 6,
+   "by_status": {
+    "failed:skipped_after_failure": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llama-ubatch:1": {
+   "total": 4,
+   "by_status": {
+    "admissible": 4
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:sar-mtp:2": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune-ref:llkm-ar": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune-ref:sar-ar": {
+   "total": 6,
+   "by_status": {
+    "admissible": 6
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "tune:llmd-batching:1": {
+   "total": 4,
+   "by_status": {
+    "admissible": 4
+   },
+   "failed_proofs": {},
+   "approx": 4,
+   "throttled": 0,
+   "short": 0
+  },
+  "llkm-mtp": {
+   "total": 66,
+   "by_status": {
+    "admissible": 65,
+    "validation_failed": 1
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "code4k-2"
+    ]
+   },
+   "approx": 2,
+   "throttled": 0,
+   "short": 0
+  },
+  "llkm-ar": {
+   "total": 66,
+   "by_status": {
+    "admissible": 66
+   },
+   "failed_proofs": {},
+   "approx": 2,
+   "throttled": 0,
+   "short": 0
+  },
+  "sar-mtp": {
+   "total": 66,
+   "by_status": {
+    "admissible": 65,
+    "validation_failed": 1
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "prose32k-1"
+    ]
+   },
+   "approx": 5,
+   "throttled": 0,
+   "short": 0
+  },
+  "llq40-dflash": {
+   "total": 66,
+   "by_status": {
+    "admissible": 65,
+    "validation_failed": 1
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "chat-5"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "sar-ar": {
+   "total": 66,
+   "by_status": {
+    "admissible": 66
+   },
+   "failed_proofs": {},
+   "approx": 5,
+   "throttled": 0,
+   "short": 0
+  },
+  "sar-dflash": {
+   "total": 66,
+   "by_status": {
+    "admissible": 65,
+    "validation_failed": 1
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "prose32k-1"
+    ]
+   },
+   "approx": 5,
+   "throttled": 0,
+   "short": 0
+  },
+  "llmd-native": {
+   "total": 66,
+   "by_status": {
+    "failed:unsupported": 66
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "mlx-dflash": {
+   "total": 60,
+   "by_status": {
+    "failed:unsupported": 60
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llkm-dflash": {
+   "total": 66,
+   "by_status": {
+    "validation_failed": 45,
+    "admissible": 21
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "code4k-3",
+     "chat-5",
+     "chat-6",
+     "chat-2",
+     "prose4k-1",
+     "chat-4",
+     "chat-1",
+     "prose4k-3",
+     "chat-4",
+     "code4k-3",
+     "chat-2",
+     "code4k-1",
+     "chat-3",
+     "chat-5",
+     "prose4k-1",
+     "prose4k-3",
+     "chat-5",
+     "code4k-1",
+     "chat-2",
+     "chat-1",
+     "code4k-3",
+     "chat-3",
+     "chat-4",
+     "chat-5",
+     "code4k-3",
+     "code4k-1",
+     "prose4k-2",
+     "chat-2",
+     "prose4k-3",
+     "chat-4",
+     "chat-3",
+     "code4k-1",
+     "prose4k-1",
+     "chat-4",
+     "code4k-2",
+     "chat-3",
+     "chat-1",
+     "code4k-3",
+     "chat-2",
+     "prose4k-3",
+     "chat-5",
+     "prose32k-1",
+     "code32k-1",
+     "prose32k-1",
+     "code32k-1"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "mlx-mtp": {
+   "total": 60,
+   "by_status": {
+    "failed:unsupported": 60
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "mlx-ar": {
+   "total": 66,
+   "by_status": {
+    "admissible": 66
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llmd-ar": {
+   "total": 66,
+   "by_status": {
+    "admissible": 66
+   },
+   "failed_proofs": {},
+   "approx": 17,
+   "throttled": 0,
+   "short": 0
+  },
+  "llq40-mtp": {
+   "total": 66,
+   "by_status": {
+    "admissible": 65,
+    "validation_failed": 1
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "chat-5"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llq40-ar": {
+   "total": 66,
+   "by_status": {
+    "admissible": 66
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  }
+ },
+ "nonce_probes": [
+  {
+   "entry_key": "tune|0|tune:llmd-batching:0",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.0,
+   "passed": true
+  },
+  {
+   "entry_key": "tune|0|tune:llmd-batching:1",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.0,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|0|llmd-ar",
+   "run_seq": 3,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.001,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|1|llmd-ar",
+   "run_seq": 3,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.004,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|2|llmd-ar",
+   "run_seq": 3,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.007,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|3|llmd-ar",
+   "run_seq": 3,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.001,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|4|llmd-ar",
+   "run_seq": 3,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.008,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-M|0|llmd-ar",
+   "run_seq": 3,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 0.999,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-M|1|llmd-ar",
+   "run_seq": 3,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 0.999,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-M|2|llmd-ar",
+   "run_seq": 3,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.0,
+   "passed": true
+  }
+ ],
+ "eos": {
+  "saragossa": {
+   "length": {
+    "0": 234
+   }
+  },
+  "llama": {
+   "length": {
+    "0": 466,
+    "1": 4
+   }
+  },
+  "llmd": {
+   "length": {
+    "0": 74
+   }
+  },
+  "mlx": {
+   "length": {
+    "0": 74
+   }
+  }
+ },
+ "integrity": {
+  "tune:sar-mtp:0": {
+   "against": "tune-ref:sar-ar",
+   "pairs": 6,
+   "identical": 6,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "tune:llama-mtp:2": {
+   "against": "tune-ref:llkm-ar",
+   "pairs": 6,
+   "identical": 3,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "tune-prose4k-1",
+     "char": 471
+    },
+    {
+     "prompt": "tune-chat-1",
+     "char": 288
+    },
+    {
+     "prompt": "tune-chat-1",
+     "char": 43
+    }
+   ]
+  },
+  "tune:sar-mtp:1": {
+   "against": "tune-ref:sar-ar",
+   "pairs": 6,
+   "identical": 6,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "tune:llama-dflash:0": {
+   "against": "tune-ref:llkm-ar",
+   "pairs": 6,
+   "identical": 3,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "tune-chat-1",
+     "char": 288
+    },
+    {
+     "prompt": "tune-chat-1",
+     "char": 43
+    },
+    {
+     "prompt": "tune-prose4k-1",
+     "char": 471
+    }
+   ]
+  },
+  "tune:llama-mtp:1": {
+   "against": "tune-ref:llkm-ar",
+   "pairs": 6,
+   "identical": 6,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "tune:llama-dflash:1": {
+   "against": "tune-ref:llkm-ar",
+   "pairs": 6,
+   "identical": 3,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "tune-prose4k-1",
+     "char": 471
+    },
+    {
+     "prompt": "tune-chat-1",
+     "char": 288
+    },
+    {
+     "prompt": "tune-chat-1",
+     "char": 43
+    }
+   ]
+  },
+  "tune:llama-mtp:0": {
+   "against": "tune-ref:llkm-ar",
+   "pairs": 6,
+   "identical": 3,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "tune-prose4k-1",
+     "char": 471
+    },
+    {
+     "prompt": "tune-chat-1",
+     "char": 288
+    },
+    {
+     "prompt": "tune-chat-1",
+     "char": 43
+    }
+   ]
+  },
+  "tune:llama-dflash:2": {
+   "against": "tune-ref:llkm-ar",
+   "pairs": 6,
+   "identical": 3,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "tune-prose4k-1",
+     "char": 471
+    },
+    {
+     "prompt": "tune-chat-1",
+     "char": 288
+    },
+    {
+     "prompt": "tune-chat-1",
+     "char": 43
+    }
+   ]
+  },
+  "tune:sar-dflash:0": {
+   "against": "tune-ref:sar-ar",
+   "pairs": 6,
+   "identical": 6,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "tune:sar-dflash:1": {
+   "against": "tune-ref:sar-ar",
+   "pairs": 6,
+   "identical": 6,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "tune:sar-mtp:2": {
+   "against": "tune-ref:sar-ar",
+   "pairs": 6,
+   "identical": 6,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "llkm-mtp": {
+   "against": "llkm-ar",
+   "pairs": 66,
+   "identical": 65,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "code4k-2",
+     "char": 531
+    }
+   ]
+  },
+  "sar-mtp": {
+   "against": "sar-ar",
+   "pairs": 66,
+   "identical": 65,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "prose32k-1",
+     "char": 779
+    }
+   ]
+  },
+  "llq40-dflash": {
+   "against": "llq40-ar",
+   "pairs": 66,
+   "identical": 65,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "chat-5",
+     "char": 1133
+    }
+   ]
+  },
+  "sar-dflash": {
+   "against": "sar-ar",
+   "pairs": 66,
+   "identical": 65,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "prose32k-1",
+     "char": 779
+    }
+   ]
+  },
+  "llkm-dflash": {
+   "against": "llkm-ar",
+   "pairs": 66,
+   "identical": 21,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "chat-5",
+     "char": 362
+    },
+    {
+     "prompt": "chat-6",
+     "char": 731
+    },
+    {
+     "prompt": "chat-2",
+     "char": 408
+    },
+    {
+     "prompt": "prose4k-1",
+     "char": 1067
+    },
+    {
+     "prompt": "chat-4",
+     "char": 637
+    },
+    {
+     "prompt": "chat-1",
+     "char": 1358
+    },
+    {
+     "prompt": "prose4k-3",
+     "char": 435
+    },
+    {
+     "prompt": "chat-4",
+     "char": 833
+    },
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "chat-2",
+     "char": 779
+    },
+    {
+     "prompt": "code4k-1",
+     "char": 207
+    },
+    {
+     "prompt": "chat-3",
+     "char": 177
+    },
+    {
+     "prompt": "chat-5",
+     "char": 1418
+    },
+    {
+     "prompt": "prose4k-1",
+     "char": 1067
+    },
+    {
+     "prompt": "prose4k-3",
+     "char": 435
+    },
+    {
+     "prompt": "chat-5",
+     "char": 362
+    },
+    {
+     "prompt": "code4k-1",
+     "char": 1185
+    },
+    {
+     "prompt": "chat-2",
+     "char": 508
+    },
+    {
+     "prompt": "chat-1",
+     "char": 1358
+    },
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "chat-3",
+     "char": 177
+    },
+    {
+     "prompt": "chat-4",
+     "char": 1092
+    },
+    {
+     "prompt": "chat-5",
+     "char": 1731
+    },
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "code4k-1",
+     "char": 1185
+    },
+    {
+     "prompt": "prose4k-2",
+     "char": 66
+    },
+    {
+     "prompt": "chat-2",
+     "char": 408
+    },
+    {
+     "prompt": "prose4k-3",
+     "char": 435
+    },
+    {
+     "prompt": "chat-4",
+     "char": 456
+    },
+    {
+     "prompt": "chat-3",
+     "char": 177
+    },
+    {
+     "prompt": "code4k-1",
+     "char": 1185
+    },
+    {
+     "prompt": "prose4k-1",
+     "char": 1067
+    },
+    {
+     "prompt": "chat-4",
+     "char": 833
+    },
+    {
+     "prompt": "code4k-2",
+     "char": 531
+    },
+    {
+     "prompt": "chat-3",
+     "char": 177
+    },
+    {
+     "prompt": "chat-1",
+     "char": 1358
+    },
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "chat-2",
+     "char": 351
+    },
+    {
+     "prompt": "prose4k-3",
+     "char": 435
+    },
+    {
+     "prompt": "chat-5",
+     "char": 362
+    },
+    {
+     "prompt": "prose32k-1",
+     "char": 1391
+    },
+    {
+     "prompt": "code32k-1",
+     "char": 240
+    },
+    {
+     "prompt": "prose32k-1",
+     "char": 650
+    },
+    {
+     "prompt": "code32k-1",
+     "char": 125
+    }
+   ]
+  },
+  "llq40-mtp": {
+   "against": "llq40-ar",
+   "pairs": 66,
+   "identical": 65,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "chat-5",
+     "char": 1133
+    }
+   ]
+  }
+ },
+ "repeatability": {}
+}

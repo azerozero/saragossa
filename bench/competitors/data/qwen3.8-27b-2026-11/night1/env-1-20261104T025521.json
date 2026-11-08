@@ -1,0 +1,113 @@
+{
+ "time": 1793757321.616025,
+ "hw_model": "Mac17,6",
+ "cpu": "Apple M5 Max",
+ "memsize": "137438953472",
+ "sw_vers": "ProductName:\t\tmacOS\nProductVersion:\t\t26.5.1\nBuildVersion:\t\t25F80",
+ "power_source": [
+  "Now drawing from 'AC Power'"
+ ],
+ "power_mode": [
+  "powermode            2"
+ ],
+ "thermal": {
+  "raw": "Note: No thermal warning level has been recorded | Note: No performance warning level has been recorded | Note: No CPU power status has been recorded",
+  "throttled": false
+ },
+ "llama_server": "version: 0.8.0 (build 11960, commit 8642541b2)\nbuilt with AppleClang 21.0.0.21000334 for Darwin arm64",
+ "brew": "llama.cpp 0.8.0\nllmd 20261029.0",
+ "binaries": {
+  "llama-server": {
+   "path": "/opt/homebrew/Cellar/llama.cpp/0.8.0/bin/llama-server",
+   "sha256": "90473e90218576ad809124dddeda6726e0bc5cd2be294151c3782640a1c7d288"
+  },
+  "llmd": {
+   "path": "/opt/homebrew/Cellar/llmd/20261029.0/bin/llmd",
+   "sha256": "b450ef9538f487c8e9d156a44585f2da3effc67abe1baee32c507aebdaab0dd1"
+  },
+  "saragossa": {
+   "path": "~/workspace/saragossa-oss/.claude/worktrees/agent-a3f925100ec26dd39/target/release/saragossa",
+   "sha256": "7a12d6d8d207d3448524c7c8616215fd8a9c911cf4a3e6b0361dee06ce1d77d6"
+  },
+  "mlx_python": {
+   "path": "~/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/bin/python3.12",
+   "sha256": "042454a41d6c32f2be126c4bbae2a4b8a54488c66f4b07379cd24dee75f93abb"
+  }
+ },
+ "mlx_venv_packages": [
+  "annotated_doc-0.0.5",
+  "anyio-4.15.1",
+  "click-8.5.0",
+  "filelock-4.2.4",
+  "fsspec-2026.9.0",
+  "h11-0.16.0",
+  "hf_xet-1.7.0",
+  "httpcore2-2.16.0",
+  "httpx2-2.16.0",
+  "huggingface_hub-2.2.0",
+  "idna-3.20",
+  "jinja2-3.1.6",
+  "markdown_it_py-4.2.0",
+  "markupsafe-3.0.4",
+  "mdurl-0.1.2",
+  "mlx-0.32.4",
+  "mlx_lm-0.32.2",
+  "mlx_metal-0.32.4",
+  "numpy-2.5.4",
+  "packaging-26.3",
+  "protobuf-7.36.2",
+  "pygments-2.21.0",
+  "pyyaml-6.0.3",
+  "regex-2026.9.29",
+  "rich-15.0.0",
+  "safetensors-0.8.0",
+  "sentencepiece-0.2.2",
+  "shellingham-1.5.4",
+  "tokenizers-0.23.3",
+  "tqdm-4.70.1",
+  "transformers-5.20.2",
+  "truststore-0.10.5",
+  "typer-0.27.3",
+  "typing_extensions-4.16.0"
+ ],
+ "saragossa_commit": "845b06cec10842c8997e92a83d7e88775d02c8e8",
+ "saragossa_dirty": "",
+ "rustc": "rustc 1.98.1 (48a229cea 2026-09-01) (Homebrew)",
+ "engine_env_keys": [
+  "AI_MODEL",
+  "BENCH_ENV",
+  "CORPUS_DIR",
+  "DFLASH_DIR",
+  "GGUF_BF16",
+  "GGUF_DFLASH",
+  "GGUF_DIR",
+  "GGUF_MTP",
+  "GGUF_MTP_BF16",
+  "GGUF_Q4_0",
+  "GGUF_Q4_K_M",
+  "GGUF_SRC_DIR",
+  "HF_HUB_OFFLINE",
+  "HOME",
+  "LANG",
+  "MLX_CKPT",
+  "MLX_VENV",
+  "MODELS",
+  "NVFP4_CKPT",
+  "PATH",
+  "REPO",
+  "RUST_SRC",
+  "SARAGOSSA_BIN",
+  "TMPDIR",
+  "TRANSFORMERS_OFFLINE",
+  "USER",
+  "WIKITEXT_TEST",
+  "WIKITEXT_TRAIN"
+ ],
+ "system_memory": {
+  "compressed_bytes": 998047744,
+  "free_bytes": 77312196608,
+  "swapouts_bytes": 10670276608,
+  "swapusage": "total = 1024.00M  used = 418.31M  free = 605.69M  (encrypted)",
+  "pressure_level": "1"
+ }
+}

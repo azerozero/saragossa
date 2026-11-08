@@ -1,0 +1,128 @@
+{
+ "llama-ubatch": {
+  "metric": "ttft_s",
+  "scores": {
+   "0": 18.961282327519744,
+   "1": 18.456167879701898,
+   "2": 20.060797376257874
+  },
+  "winner": 0,
+  "value": {
+   "args": [
+    "-b",
+    "2048",
+    "-ub",
+    "512"
+   ]
+  },
+  "default_admissible": true
+ },
+ "llama-ctxcp": {
+  "metric": "ttft_s",
+  "scores": {
+   "0": 18.295858704556007,
+   "1": 18.903816550819453
+  },
+  "winner": 0,
+  "value": {
+   "args": []
+  },
+  "default_admissible": true
+ },
+ "llama-sampler": {
+  "metric": "delivery_tok_s",
+  "scores": {
+   "0": 27.735749734974583,
+   "1": 27.633005033662396
+  },
+  "winner": 0,
+  "value": {
+   "args": []
+  },
+  "default_admissible": true
+ },
+ "llama-mtp": {
+  "metric": "delivery_tok_s",
+  "scores": {
+   "1": 37.92358559134033
+  },
+  "winner": 1,
+  "value": {
+   "args": [
+    "--spec-draft-n-max",
+    "1"
+   ]
+  },
+  "default_admissible": false
+ },
+ "llama-dflash": {
+  "metric": "delivery_tok_s",
+  "scores": {},
+  "winner": 0,
+  "value": {
+   "args": [
+    "--spec-draft-n-max",
+    "3"
+   ]
+  },
+  "default_admissible": false,
+  "reason": "aucun candidat identique \u00e0 l'AR : d\u00e9faut du moteur conserv\u00e9 sans r\u00e9glage"
+ },
+ "sar-mtp": {
+  "metric": "delivery_tok_s",
+  "scores": {
+   "0": 45.04325742852941,
+   "1": 42.33609582295723,
+   "2": 43.17605446749792
+  },
+  "winner": 0,
+  "value": {
+   "env": {
+    "SARAGOSSA_RUST_MTP_MAX_DRAFT": "2"
+   }
+  },
+  "default_admissible": true
+ },
+ "sar-dflash": {
+  "metric": "delivery_tok_s",
+  "scores": {
+   "0": 56.576229467266884,
+   "1": 48.725926087777744
+  },
+  "winner": 0,
+  "value": {
+   "env": {}
+  },
+  "default_admissible": true
+ },
+ "llmd-batching": {
+  "metric": "ttft_s",
+  "scores": {
+   "0": 49.95075569694016,
+   "1": 46.85173660208849
+  },
+  "winner": 1,
+  "value": {
+   "args": [
+    "--token-batch-size=2048",
+    "--prefill-chunk-size=2048"
+   ]
+  },
+  "default_admissible": true
+ },
+ "mlx-prefill": {
+  "metric": "ttft_s",
+  "scores": {
+   "0": 14.118177226348804,
+   "1": 14.35083565613158
+  },
+  "winner": 0,
+  "value": {
+   "args": [
+    "--prefill-step-size",
+    "2048"
+   ]
+  },
+  "default_admissible": true
+ }
+}

@@ -1,0 +1,29 @@
+bench-env: SARAGOSSA_BIN=~/workspace/saragossa-oss/.claude/worktrees/main-a/target/release/saragossa
+bench-env: SARAGOSSA_RUST_DFLASH_DRAFT_DIR=~/workspace/saragossa-oss/models/Qwen3.8-27B-DFlash2
+bench-env: SARAGOSSA_RUST_MTP_DECODE=1
+bench-env: SARAGOSSA_RUST_PREFIX_CACHE=0
+bench-env: SARAGOSSA_SERVE_LOG_PROMPT_FINGERPRINT=1
+bench-env: SARAGOSSA_SERVE_PREFIX_CACHE=0
+bench-launch: ~/workspace/saragossa-oss/.claude/worktrees/main-a/target/release/saragossa serve --port 18080 --model qwen38=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit --preload
+saragossa serve model enregistré alias=qwen38 path=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit source=local
+saragossa serve loading model=qwen38 path=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit
+saragossa serve MTP actif model=qwen38 sidecar=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit/mtp.safetensors max_draft=2
+saragossa serve drafter DFlash actif model=qwen38 block_size=8 quant_bits=Some(4)
+cpu_weights_released mode=incremental bytes=0 payloads=506 unique_weights=506
+saragossa serve warmup model=qwen38 passes=2 prompt_tokens=2 elapsed_ms=95
+saragossa serve warmup MTP model=qwen38 tokens=4 elapsed_ms=298
+saragossa serve TCP listening on http://127.0.0.1:18080/v1
+saragossa serve TCP bearer auth enabled
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=4735 decode_ms=7188 total_ms=11923 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=27919323464 prefix_cache_bytes=0 prompt_fnv1a64=69d05cda6a03be53
+saragossa serve completion model=qwen38 prompt_tokens=61 completion_tokens=400 prefill_ms=172 decode_ms=6108 total_ms=6281 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=27549290368 prefix_cache_bytes=0 prompt_fnv1a64=dbed3379bb58adde
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=4982 decode_ms=9565 total_ms=14548 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=27898302792 prefix_cache_bytes=0 prompt_fnv1a64=1760f135d3d78107
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5108 decode_ms=7925 total_ms=13034 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22734963656 prefix_cache_bytes=0 prompt_fnv1a64=fb7e648c3670d393
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5475 decode_ms=8273 total_ms=13749 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22722085664 prefix_cache_bytes=0 prompt_fnv1a64=622bb81eb8a97e92
+saragossa serve completion model=qwen38 prompt_tokens=59 completion_tokens=400 prefill_ms=177 decode_ms=8239 total_ms=8416 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22376825344 prefix_cache_bytes=0 prompt_fnv1a64=2fc335e0c5110a97
+saragossa serve completion model=qwen38 prompt_tokens=58 completion_tokens=400 prefill_ms=177 decode_ms=9957 total_ms=10134 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22362751512 prefix_cache_bytes=0 prompt_fnv1a64=28e0611565fe3734
+saragossa serve completion model=qwen38 prompt_tokens=50 completion_tokens=400 prefill_ms=172 decode_ms=7057 total_ms=7229 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22355149336 prefix_cache_bytes=0 prompt_fnv1a64=6852874e0dab091b
+saragossa serve completion model=qwen38 prompt_tokens=58 completion_tokens=400 prefill_ms=171 decode_ms=6139 total_ms=6311 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22365094424 prefix_cache_bytes=0 prompt_fnv1a64=c50842d7b456eb84
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5623 decode_ms=7900 total_ms=13524 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22703915832 prefix_cache_bytes=0 prompt_fnv1a64=bb3371ca8c457be0
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5632 decode_ms=7642 total_ms=13275 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22761849728 prefix_cache_bytes=0 prompt_fnv1a64=6125ab05868dac89
+saragossa serve completion model=qwen38 prompt_tokens=59 completion_tokens=400 prefill_ms=169 decode_ms=6903 total_ms=7073 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22385738312 prefix_cache_bytes=0 prompt_fnv1a64=9741d32bfc2dc4dc
+saragossa serve completion model=qwen38 prompt_tokens=4096 completion_tokens=400 prefill_ms=5162 decode_ms=7336 total_ms=12498 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22748808040 prefix_cache_bytes=0 prompt_fnv1a64=187c29b8ad8a0612

@@ -1,0 +1,525 @@
+{
+ "admissibility": {
+  "llkm-mtp": {
+   "total": 84,
+   "by_status": {
+    "admissible": 83,
+    "validation_failed": 1
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "code4k-2"
+    ]
+   },
+   "approx": 4,
+   "throttled": 0,
+   "short": 0
+  },
+  "llkm-ar": {
+   "total": 84,
+   "by_status": {
+    "admissible": 84
+   },
+   "failed_proofs": {},
+   "approx": 4,
+   "throttled": 0,
+   "short": 0
+  },
+  "sar-mtp": {
+   "total": 84,
+   "by_status": {
+    "admissible": 84
+   },
+   "failed_proofs": {},
+   "approx": 6,
+   "throttled": 0,
+   "short": 0
+  },
+  "llq40-dflash": {
+   "total": 60,
+   "by_status": {
+    "admissible": 59,
+    "validation_failed": 1
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "chat-5"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "sar-ar": {
+   "total": 84,
+   "by_status": {
+    "admissible": 84
+   },
+   "failed_proofs": {},
+   "approx": 7,
+   "throttled": 0,
+   "short": 0
+  },
+  "sar-dflash": {
+   "total": 84,
+   "by_status": {
+    "admissible": 84
+   },
+   "failed_proofs": {},
+   "approx": 7,
+   "throttled": 0,
+   "short": 0
+  },
+  "llmd-native": {
+   "total": 60,
+   "by_status": {
+    "failed:unsupported": 60
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "mlx-dflash": {
+   "total": 60,
+   "by_status": {
+    "failed:unsupported": 60
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llkm-dflash": {
+   "total": 84,
+   "by_status": {
+    "validation_failed": 41,
+    "admissible": 43
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "code4k-3",
+     "chat-5",
+     "chat-6",
+     "chat-2",
+     "prose4k-1",
+     "chat-4",
+     "chat-1",
+     "prose4k-3",
+     "chat-4",
+     "code4k-3",
+     "chat-2",
+     "code4k-1",
+     "chat-3",
+     "chat-5",
+     "prose4k-1",
+     "prose4k-3",
+     "chat-5",
+     "code4k-1",
+     "chat-2",
+     "chat-1",
+     "code4k-3",
+     "chat-3",
+     "chat-4",
+     "chat-5",
+     "code4k-3",
+     "code4k-1",
+     "prose4k-2",
+     "chat-2",
+     "prose4k-3",
+     "chat-4",
+     "chat-3",
+     "code4k-1",
+     "prose4k-1",
+     "chat-4",
+     "code4k-2",
+     "chat-3",
+     "chat-1",
+     "code4k-3",
+     "chat-2",
+     "prose4k-3",
+     "chat-5"
+    ]
+   },
+   "approx": 4,
+   "throttled": 0,
+   "short": 0
+  },
+  "mlx-mtp": {
+   "total": 60,
+   "by_status": {
+    "failed:unsupported": 60
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "mlx-ar": {
+   "total": 84,
+   "by_status": {
+    "admissible": 84
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llmd-ar": {
+   "total": 60,
+   "by_status": {
+    "admissible": 60
+   },
+   "failed_proofs": {},
+   "approx": 14,
+   "throttled": 0,
+   "short": 0
+  },
+  "llq40-mtp": {
+   "total": 60,
+   "by_status": {
+    "admissible": 59,
+    "validation_failed": 1
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "chat-5"
+    ]
+   },
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llq40-ar": {
+   "total": 60,
+   "by_status": {
+    "admissible": 60
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llmd-ar-s": {
+   "total": 24,
+   "by_status": {
+    "admissible": 24
+   },
+   "failed_proofs": {},
+   "approx": 6,
+   "throttled": 0,
+   "short": 0
+  },
+  "llmd-native-s": {
+   "total": 24,
+   "by_status": {
+    "failed:unsupported": 24
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  }
+ },
+ "nonce_probes": [
+  {
+   "entry_key": "eval-S|0|llmd-ar",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.001,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|1|llmd-ar",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.006,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|2|llmd-ar",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.01,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|3|llmd-ar",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.003,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|4|llmd-ar",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.011,
+   "passed": true
+  },
+  {
+   "entry_key": "sampled-S|0|llmd-ar-s",
+   "run_seq": 2,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.011,
+   "passed": true
+  }
+ ],
+ "eos": {
+  "llama": {
+   "length": {
+    "0": 426,
+    "1": 4,
+    "-1": 1,
+    "2": 1
+   }
+  },
+  "saragossa": {
+   "length": {
+    "0": 250,
+    "1": 2
+   }
+  },
+  "mlx": {
+   "length": {
+    "0": 84
+   }
+  },
+  "llmd": {
+   "length": {
+    "0": 84
+   }
+  }
+ },
+ "integrity": {
+  "llkm-mtp": {
+   "against": "llkm-ar",
+   "pairs": 60,
+   "identical": 59,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "code4k-2",
+     "char": 531
+    }
+   ]
+  },
+  "sar-mtp": {
+   "against": "sar-ar",
+   "pairs": 60,
+   "identical": 60,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "llq40-dflash": {
+   "against": "llq40-ar",
+   "pairs": 60,
+   "identical": 59,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "chat-5",
+     "char": 1133
+    }
+   ]
+  },
+  "sar-dflash": {
+   "against": "sar-ar",
+   "pairs": 60,
+   "identical": 60,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "llkm-dflash": {
+   "against": "llkm-ar",
+   "pairs": 60,
+   "identical": 19,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "chat-5",
+     "char": 362
+    },
+    {
+     "prompt": "chat-6",
+     "char": 731
+    },
+    {
+     "prompt": "chat-2",
+     "char": 408
+    },
+    {
+     "prompt": "prose4k-1",
+     "char": 1067
+    },
+    {
+     "prompt": "chat-4",
+     "char": 637
+    },
+    {
+     "prompt": "chat-1",
+     "char": 1358
+    },
+    {
+     "prompt": "prose4k-3",
+     "char": 435
+    },
+    {
+     "prompt": "chat-4",
+     "char": 833
+    },
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "chat-2",
+     "char": 779
+    },
+    {
+     "prompt": "code4k-1",
+     "char": 207
+    },
+    {
+     "prompt": "chat-3",
+     "char": 177
+    },
+    {
+     "prompt": "chat-5",
+     "char": 1418
+    },
+    {
+     "prompt": "prose4k-1",
+     "char": 1067
+    },
+    {
+     "prompt": "prose4k-3",
+     "char": 435
+    },
+    {
+     "prompt": "chat-5",
+     "char": 362
+    },
+    {
+     "prompt": "code4k-1",
+     "char": 1185
+    },
+    {
+     "prompt": "chat-2",
+     "char": 508
+    },
+    {
+     "prompt": "chat-1",
+     "char": 1358
+    },
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "chat-3",
+     "char": 177
+    },
+    {
+     "prompt": "chat-4",
+     "char": 1092
+    },
+    {
+     "prompt": "chat-5",
+     "char": 1731
+    },
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "code4k-1",
+     "char": 1185
+    },
+    {
+     "prompt": "prose4k-2",
+     "char": 66
+    },
+    {
+     "prompt": "chat-2",
+     "char": 408
+    },
+    {
+     "prompt": "prose4k-3",
+     "char": 435
+    },
+    {
+     "prompt": "chat-4",
+     "char": 456
+    },
+    {
+     "prompt": "chat-3",
+     "char": 177
+    },
+    {
+     "prompt": "code4k-1",
+     "char": 1185
+    },
+    {
+     "prompt": "prose4k-1",
+     "char": 1067
+    },
+    {
+     "prompt": "chat-4",
+     "char": 833
+    },
+    {
+     "prompt": "code4k-2",
+     "char": 531
+    },
+    {
+     "prompt": "chat-3",
+     "char": 177
+    },
+    {
+     "prompt": "chat-1",
+     "char": 1358
+    },
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "chat-2",
+     "char": 351
+    },
+    {
+     "prompt": "prose4k-3",
+     "char": 435
+    },
+    {
+     "prompt": "chat-5",
+     "char": 362
+    }
+   ]
+  },
+  "llq40-mtp": {
+   "against": "llq40-ar",
+   "pairs": 60,
+   "identical": 59,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "chat-5",
+     "char": 1133
+    }
+   ]
+  }
+ },
+ "repeatability": {}
+}
