@@ -330,6 +330,9 @@ pub(crate) struct FlashNextSession {
     /// Oracles : troncature MTP sans restauration des clés brutes.
     #[cfg(test)]
     pub(crate) skip_mtp_raw_restore: bool,
+    /// Oracles : copie de restauration des clés brutes MTP en échec.
+    #[cfg(test)]
+    pub(crate) fail_mtp_raw_restore: bool,
     /// Oracles : sélection et scores de l'indexeur par couche du dernier pas
     /// (`[couches, keep]` u32, `[couches, blocs max]` f32).
     #[cfg(test)]
@@ -695,6 +698,8 @@ impl FlashNextSession {
             #[cfg(test)]
             skip_mtp_raw_restore: false,
             #[cfg(test)]
+            fail_mtp_raw_restore: false,
+            #[cfg(test)]
             selection_capture: executor.device().new_buffer(
                 ((c.layer_kinds.len() + 1) * (c.indexer_budget / c.indexer_compress) * 4) as u64,
                 MTLResourceOptions::StorageModeShared,
@@ -788,7 +793,8 @@ impl FlashNextSession {
     }
 
     /// Erreur sur une session invalidée (erreur GPU, reset incomplet ou
-    /// restauration MTP manquée) : seul un `reset` réussi la réhabilite.
+    /// restauration MTP manquée) : seuls un `reset` ou une reprise réussis la
+    /// réhabilitent.
     fn refuse_poisoned(&self) -> Result<()> {
         if self.poisoned {
             return Err(InferError::Metal(
@@ -826,12 +832,7 @@ impl FlashNextSession {
         allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
     )]
     pub(crate) fn verify(&mut self, tokens: &[usize]) -> Result<Vec<VerifyRow>> {
-        if self.poisoned {
-            return Err(InferError::Metal(
-                "Flash-Next résident : session invalidée (erreur GPU ou reset incomplet)"
-                    .to_string(),
-            ));
-        }
+        self.refuse_poisoned()?;
         self.refuse_pending()?;
         let c = &self.ckpt.config;
         let rows = tokens.len();
@@ -1734,12 +1735,7 @@ impl FlashNextSession {
         layers: bool,
         head: bool,
     ) -> Result<StepOutput> {
-        if self.poisoned {
-            return Err(InferError::Metal(
-                "Flash-Next résident : session invalidée (erreur GPU ou reset incomplet)"
-                    .to_string(),
-            ));
-        }
+        self.refuse_poisoned()?;
         self.refuse_pending()?;
         let c = &self.ckpt.config;
         if self.position >= self.capacity {
@@ -1954,6 +1950,15 @@ impl FlashNextSession {
         let (snapshot, raw) = (mtp.raw_snapshot.clone(), full.1.raw.clone());
         // Longueur déjà réduite : une restauration manquée laisserait des clés
         // brutes retirées sous un historique d'apparence valide.
+        #[cfg(test)]
+        let restored = if self.fail_mtp_raw_restore {
+            Err(InferError::Metal(
+                "restauration des clés brutes MTP en échec (injecté)".to_string(),
+            ))
+        } else {
+            self.copy_f32(&snapshot, &raw, words)
+        };
+        #[cfg(not(test))]
         let restored = self.copy_f32(&snapshot, &raw, words);
         if restored.is_err() {
             self.poisoned = true;
@@ -1967,8 +1972,8 @@ impl FlashNextSession {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si une vérification est en attente, sans tête MTP ou
-    /// sur copie Metal.
+    /// Renvoie une erreur sur une session invalidée, si une vérification est
+    /// en attente, sans tête MTP, ou sur copie Metal (qui invalide la session).
     pub(crate) fn mtp_snapshot_raw(&mut self) -> Result<()> {
         self.refuse_poisoned()?;
         self.refuse_pending()?;
@@ -1979,8 +1984,13 @@ impl FlashNextSession {
             ));
         };
         let len = (mtp.raw_snapshot.length() / 4) as usize;
-        self.copy_f32(&full.1.raw, &mtp.raw_snapshot, len)?;
-        self.mtp_raw_rows = Some(full.0.len());
+        let rows = full.0.len();
+        // Une copie en échec relève du GPU : session invalidée, comme ailleurs.
+        if let Err(error) = self.copy_f32(&full.1.raw, &mtp.raw_snapshot, len) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.mtp_raw_rows = Some(rows);
         Ok(())
     }
 
@@ -2034,12 +2044,7 @@ impl FlashNextSession {
         logits: bool,
         hidden: bool,
     ) -> Result<MtpOutput> {
-        if self.poisoned {
-            return Err(InferError::Metal(
-                "Flash-Next résident : session invalidée (erreur GPU ou reset incomplet)"
-                    .to_string(),
-            ));
-        }
+        self.refuse_poisoned()?;
         self.refuse_pending()?;
         let c = &self.ckpt.config;
         let width = self.hc_dims.width();

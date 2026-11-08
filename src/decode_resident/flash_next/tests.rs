@@ -2997,6 +2997,68 @@ fn bench_resident_decode_after_32k_context() {
     );
 }
 
+/// Troncature de l'historique MTP : un dépassement d'historique est signalé
+/// avant l'absence d'instantané ; une copie de restauration des clés brutes en
+/// échec invalide la session (longueur déjà réduite) : troncature, même à
+/// longueur inchangée, instantané, pas MTP et pas du tronc sont refusés jusqu'à
+/// un `reset`, qui la réhabilite.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR"]
+fn mtp_failed_raw_restore_poisons_session() {
+    use super::session::MtpInput;
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        64,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    let h = vec![0.0; session.hc_width()];
+    let append = |session: &mut FlashNextSession, count: usize| {
+        for token in 0..count {
+            session
+                .mtp_step(MtpInput::Host(&h), token + 1, false, false)
+                .expect("invariant: pas MTP");
+        }
+    };
+    append(&mut session, 6);
+    session.mtp_snapshot_raw().expect("invariant: instantané");
+    append(&mut session, 2);
+    let overflow = session.mtp_truncate(9).expect_err("invariant: dépassement");
+    assert!(overflow.to_string().contains("au-delà"), "{overflow}");
+    session.fail_mtp_raw_restore = true;
+    let failed = session
+        .mtp_truncate(6)
+        .expect_err("invariant: échec injecté");
+    session.fail_mtp_raw_restore = false;
+    assert!(failed.to_string().contains("injecté"), "{failed}");
+    assert_eq!(
+        session.mtp_rows(),
+        Some(6),
+        "longueur réduite avant la copie"
+    );
+    assert!(
+        session.mtp_truncate(6).is_err(),
+        "troncature à longueur inchangée"
+    );
+    assert!(session.mtp_snapshot_raw().is_err(), "instantané");
+    assert!(
+        session
+            .mtp_step(MtpInput::Host(&h), 1, false, false)
+            .is_err(),
+        "pas MTP"
+    );
+    assert!(session.step(1, false, false).is_err(), "pas du tronc");
+    session.reset().expect("invariant: reset");
+    session
+        .step(1, false, false)
+        .expect("invariant: pas après reset");
+    assert_eq!(session.mtp_rows(), Some(0), "historique MTP remis à zéro");
+}
+
 /// Capacité maximale (262 144 tokens) : la session s'ouvre sous la garde
 /// mémoire, ses allocations (états, KV f32, clés poolées, KV compact, scratch,
 /// plus le scratch du premier pas) restent sous `session_state_bytes`, et un
