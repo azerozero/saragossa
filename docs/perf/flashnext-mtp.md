@@ -76,7 +76,10 @@ Onze mutations rougissent toutes, dont :
   (≥ 2 × 1e-5 sur 256 lignes creuses) et en variante de 1024 sur la sélection ;
 - historique figé.
 
-Mémoire : la session à 256k alloue 14,64 Go d'état, égal au budget calculé (vérifié de nouveau après l'ajout de l'instantané de 2 Kio des clés brutes MTP).
+Mémoire : la session à 256k alloue 14,64 Go d'état. Le test vérifie que
+l'allocation reste sous le budget calculé ; elle l'égale au centième de Go
+près. Il a été relancé après l'ajout de l'instantané de 2 Kio des clés brutes
+MTP.
 Tronc inchangé : ABBA à 1k, −0,13 % [−0,52 ; +0,25].
 
 ## C. Spéculatif exact en pas mono
@@ -96,10 +99,14 @@ Les drafts enchaînés écrivent dans l'anneau des clés brutes de l'indexeur
 MTP : un instantané, pris après le premier pas MTP du cycle, est restauré par
 la troncature.
 
-En cas d'échec en cours de cycle, y compris pendant la reconstruction après
-`accept`, l'historique MTP revient aux `p + 1` paires vérifiées, clés brutes
-comprises. Le tronc garde ce qu'il a engagé, et toute reprise passe par un
-`reset`.
+En cas d'échec récupérable en cours de cycle (erreur d'encodage, y compris
+pendant la reconstruction après `accept`), l'historique MTP revient aux `p + 1`
+paires vérifiées, clés brutes comprises. Le tronc garde ce qu'il a engagé, et
+toute reprise passe par un `reset`.
+
+Une erreur GPU, ou une copie de restauration ou d'instantané en échec,
+invalide au contraire la session : tout pas et toute troncature sont refusés
+jusqu'à un `reset` ou une reprise réussis. L'erreur d'origine est remontée.
 
 Conventions alignées sur l'AR :
 - **arrêt** : comme en AR ;
@@ -108,8 +115,10 @@ Conventions alignées sur l'AR :
 
 ### Identité (porte dure)
 
-Test `speculative_greedy_matches_ar_bitwise`, commit 4035bc5 : 2914 s, pic
-79,1 Go.
+Test `speculative_greedy_matches_ar_bitwise`, commit 3f44595 : 2907 s, pic
+79,1 Go. Il était déjà vert à 4035bc5 (2914 s). Sur le même binaire,
+`mtp_failed_raw_restore_poisons_session` vérifie l'invalidation sur échec de
+restauration et la réhabilitation par `reset`.
 
 | prompt | d1 | d2 | d3 (jetons par cycle) |
 |---|---|---|---|
@@ -132,8 +141,13 @@ Cette empreinte d'état est contrôlée sur chacun des cas limites suivants :
   [3, 1], [3, 2]) ;
 - capacité limite, puis capacité + 1 (dernière position) ;
 - profondeur 0 (délégation à l'AR) ;
-- budgets 0 à 3 ;
-- `usize::MAX` refusé.
+- budgets 0 à 3.
+
+Une profondeur `usize::MAX` est refusée.
+
+Les jetons par cycle diffèrent parfois d'un centième de la version précédente.
+Le dernier cycle est désormais réduit à `restant − 2` drafts, pour que le
+dernier jeton émis ne soit pas consommé.
 
 **Oracles de l'historique MTP.**
 - **`D_1`.** Le draft `D_1` de chaque cycle est contrôlé contre un rejeu
@@ -425,10 +439,20 @@ vérification greedy stricte.
       0 différente.
 
     Le critère « lignes exactes » de e5ef5b6 est donc rempli strictement.
-  - Mesures refaites : reste DeltaNet 0,975 ms, MoE ρ = 2,99 / 3,40 / 3,78.
-    Avec elles, ρ(4) = 2,76 : D complet ×0,88, les deux ×0,83 en code. La
-    décision reste calculée sur le premier passage, comme convenu ; le second
-    ne la change pas.
+  - Mesures refaites.
+    - DeltaNet : couche entière 5,542 ms, matmuls 4,567 ms en R1 et 7,027 ms
+      en R4, d'où un reste de 0,975 ms.
+    - MoE : 6,905 ms en mono, puis ρ = 2,99, 3,40 et 3,78 (26,132 ms) pour
+      R = 2, 3 et 4.
+
+    Avec ces mesures :
+    - DeltaNet ×(7,027 + 4 × 0,975) / 5,542 = ×1,972, soit 9,99 ms ;
+    - MoE ×3,785, soit 27,31 ms ;
+    - les autres postes sont inchangés.
+
+    Le total donne 57,03 ms, soit ρ(4) = 2,76 : D complet ×0,88, les deux ×0,83
+    en code. La décision reste calculée sur le premier passage, comme convenu ;
+    le second ne la change pas.
 
 ### Acceptation d'un draft sur sous-vocabulaire (commit 994d9aa)
 
@@ -490,10 +514,19 @@ l'acceptation mesurée. La décision ne porte que sur la première ligne.
 |---|---|---|---|---|---|
 | réaliste e5ef5b6 (décision) | 2,77 | ×0,88 | ×0,83 | ×0,72 | ×0,59 |
 | réaliste db5635c (union MoE × 3,29) | 2,58 | ×0,93 | ×0,88 | ×0,76 | ×0,63 |
-| optimiste db5635c (travail × 1,2, qmv-T u6, union) | 2,08 | ×1,09 | ×1,08 | ×0,90 | ×0,78 |
+| optimiste db5635c (travail × 1,2, qmv-T u6, union) | 2,077 | ×1,09 | ×1,08 | ×0,90 | ×0,78 |
 | borne basse db5635c (tout à ρ = 1 sauf les experts, Σ N_m / 10) | 1,51 | ×1,34 | ×1,45 | ×1,12 | ×1,05 |
 | variante : état du scan lu une fois | 2,70 | ×0,90 | ×0,85 | ×0,74 | ×0,60 |
 | reste DeltaNet in situ nul (borne de son biais) | 2,61 | ×0,92 | ×0,87 | ×0,76 | ×0,62 |
+
+Construction des lignes du tableau :
+- **Borne basse** : les experts routés sont pris à 7,92 / 9,76 de la brique MoE,
+  leur part dans les micro-bench. Ils sont comptés à Σ N_m / 10 = 2,79, le
+  reste de la brique à ρ = 1.
+- **Variante scan** : l'état DeltaNet (226 Mo lus et écrits par pas) coûte
+  0,527 ms à 430 Go/s, débit des projections DeltaNet mesuré. Lu une seule fois
+  pour R lignes, il économise 3 × 0,527 ms sur le reste × 4.
+- **Optimiste** : ρ = 2,077, soit ×1,085 pour D complet, arrondi à ×1,09.
 
 - Seule la borne basse dépasse ×1,2 en code. Elle suppose des kernels en
   lignes idéaux partout : lecture unique et calcul gratuit, y compris pour
