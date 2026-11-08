@@ -1,0 +1,116 @@
+name: GPU synthétique
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/gpu-synthetic.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Le test des captures prefill retourne sans calcul si les timestamps sont actifs.
+  SARAGOSSA_RUST_GPU_TIMESTAMPS: '0'
+
+jobs:
+  gpu-synthetic:
+    name: Tests GPU à poids synthétiques
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Vérifier la sélection et mesurer les tests GPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Liste fermée : aucun modèle externe, sidecar, cache HF ou bench manuel.
+          # Les trois cas DFlash ci-dessous construisent leurs données en mémoire.
+          # Chaque test propage une erreur si aucun device Metal n'est disponible.
+          tests=(
+            decode_resident::rope_tests::rope_decode_matches_common_cpu_at_long_positions
+            decode_resident::rope_tests::rope_append_matches_common_cpu_at_long_positions
+            decode_resident::rope_tests::rope_rows_matches_common_cpu_at_long_positions
+            decode_resident::rope_tests::rope_prefill_matches_common_cpu_at_long_positions
+            decode_resident::rope_tests::rope_prefill_and_decode_keys_are_bit_identical
+            decode_resident::rows_tree_tests::full_attn_rows_tree_matches_cpu
+            decode_resident::rows_tree_tests::full_attn_rows_tree_nax_matches_cpu
+            decode_resident::rows_tree_tests::rope_rows_tree_rotates_at_depth
+            decode_resident::rows_tree_tests::compact_tree_rows_matches_cpu_and_refuses_invalid_paths
+            decode_resident::rows_tree_tests::full_attn_rows_tree_node_matches_path_chain_bits
+            decode_resident::rows_nax_tests::verify_rows_nax_matches_cpu_oracle
+            decode_resident::tests::full_attn_rows_fused_matches_row_loop_all_rows
+            decode_resident::tests::full_attn_dense_layer_rows_matches_mono_bits
+            decode_resident::tests::full_attn_dense_layer_rows_strict_qmvt_matches_mono_bits
+            decode_resident::tests::full_attn_rows_fused_matches_row_loop
+            decode_resident::tests::full_attn_rows_windowed_matches_naive_and_cpu
+            decode_resident::tests::gpu_position_two_cycles_one_command_buffer_matches_host_positions
+            decode_resident::tests::dflash_resident::dflash_fixed_base_window_start_bits
+            decode_resident::tests::dflash_resident::dflash_fixed_base_capacity_boundary
+            decode_resident::tests::dflash_resident::dflash_fixed_base_rejects_shifted_base
+            metal_backend::tests::rows_exact_matmul_formats
+            metal_backend::tests::rows_exact_norms_and_prologue
+            metal_backend::tests::rows_exact_linear_block
+            metal_backend::tests::rows_exact_linear_stages
+            metal_backend::tests::rows_exact_moe_tail
+            metal_backend::tests::rows_exact_dense_tail
+            metal_backend::tests::rows_exact_argmax_ties
+            metal_backend::tests::rows_exact_full_attn_qkv_prologue
+            metal_backend::tests::rows_exact_qmv_contract_cpu_oracle
+            metal_backend::tests::rows_exact_rms_prologue_u8
+            metal_backend::tests::rows_exact_qmvt_engaged_in_strict_mode
+            metal_backend::tests::rows_exact_qmvt_chained_in_one_encoder
+            metal_backend::tests::qmv_u4_residual_matches_two_step_and_cpu
+            metal_backend::tests::qmv_u4_residual_falls_back_without_mutation
+            metal_backend::prefill::tests::prefill_resident_capture_tail_matches_full
+            decoder::tests::mtp_d1_resident_state_lease_survives_pool_reuse
+          )
+
+          SECONDS=0
+          gpu_start=''
+          summarize() {
+            status=$?
+            total=$SECONDS
+            {
+              printf '## Tests GPU synthétiques\n\n'
+              printf -- '- Runner : macos-15\n'
+              printf -- '- Tests sélectionnés : %s, un seul thread\n' "${#tests[@]}"
+              printf -- '- Code de sortie : %s\n' "$status"
+              printf -- '- Durée totale (compilation, contrôle et tests) : %s s\n' "$total"
+              if [[ -n "$gpu_start" ]]; then
+                printf -- '- Compilation et contrôle de la liste : %s s\n' "$gpu_start"
+                printf -- '- Exécution des tests : %s s\n' "$((total - gpu_start))"
+              else
+                printf -- '- Exécution des tests : non démarrée\n'
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap summarize EXIT
+
+          # --list compile sans exécuter les tests. Un nom absent ou devenu non
+          # ignoré doit faire échouer le job, même si libtest accepte zéro test.
+          cargo test --features metal,devtools -- --ignored --exact "${tests[@]}" --list \
+            > "$RUNNER_TEMP/gpu-synthetic-list.txt"
+          printf '%s\n' "${tests[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/gpu-synthetic-expected.txt"
+          sed -n 's/: test$//p' "$RUNNER_TEMP/gpu-synthetic-list.txt" | LC_ALL=C sort \
+            > "$RUNNER_TEMP/gpu-synthetic-actual.txt"
+          diff -u "$RUNNER_TEMP/gpu-synthetic-expected.txt" "$RUNNER_TEMP/gpu-synthetic-actual.txt"
+
+          gpu_start=$SECONDS
+          cargo test --features metal,devtools -- --ignored --exact "${tests[@]}" --test-threads=1
