@@ -42,24 +42,22 @@ jobs:
           set -euo pipefail
           # Liste fermée : aucun modèle externe, sidecar, cache HF ou bench manuel.
           # Les trois cas DFlash ci-dessous construisent leurs données en mémoire.
+          # Les deux oracles NAX restent locaux au M5 ; les deux tests lourds suivent.
           # Chaque test propage une erreur si aucun device Metal n'est disponible.
+          # Conserver les #[ignore] jusqu’à trois passages CI stables.
           tests=(
             decode_resident::rope_tests::rope_decode_matches_common_cpu_at_long_positions
             decode_resident::rope_tests::rope_append_matches_common_cpu_at_long_positions
             decode_resident::rope_tests::rope_rows_matches_common_cpu_at_long_positions
             decode_resident::rope_tests::rope_prefill_matches_common_cpu_at_long_positions
             decode_resident::rope_tests::rope_prefill_and_decode_keys_are_bit_identical
-            decode_resident::rows_tree_tests::full_attn_rows_tree_matches_cpu
-            decode_resident::rows_tree_tests::full_attn_rows_tree_nax_matches_cpu
             decode_resident::rows_tree_tests::rope_rows_tree_rotates_at_depth
             decode_resident::rows_tree_tests::compact_tree_rows_matches_cpu_and_refuses_invalid_paths
             decode_resident::rows_tree_tests::full_attn_rows_tree_node_matches_path_chain_bits
-            decode_resident::rows_nax_tests::verify_rows_nax_matches_cpu_oracle
             decode_resident::tests::full_attn_rows_fused_matches_row_loop_all_rows
             decode_resident::tests::full_attn_dense_layer_rows_matches_mono_bits
             decode_resident::tests::full_attn_dense_layer_rows_strict_qmvt_matches_mono_bits
             decode_resident::tests::full_attn_rows_fused_matches_row_loop
-            decode_resident::tests::full_attn_rows_windowed_matches_naive_and_cpu
             decode_resident::tests::gpu_position_two_cycles_one_command_buffer_matches_host_positions
             decode_resident::tests::dflash_resident::dflash_fixed_base_window_start_bits
             decode_resident::tests::dflash_resident::dflash_fixed_base_capacity_boundary
@@ -111,6 +109,48 @@ jobs:
           sed -n 's/: test$//p' "$RUNNER_TEMP/gpu-synthetic-list.txt" | LC_ALL=C sort \
             > "$RUNNER_TEMP/gpu-synthetic-actual.txt"
           diff -u "$RUNNER_TEMP/gpu-synthetic-expected.txt" "$RUNNER_TEMP/gpu-synthetic-actual.txt"
+
+          gpu_start=$SECONDS
+          cargo test --features metal,devtools -- --ignored --exact "${tests[@]}" --test-threads=1
+      - name: Vérifier et mesurer les deux tests GPU lourds
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Oracles longs isolés pour rendre leur durée visible dans le job.
+          tests=(
+            decode_resident::tests::full_attn_rows_windowed_matches_naive_and_cpu
+            decode_resident::rows_tree_tests::full_attn_rows_tree_matches_cpu
+          )
+
+          SECONDS=0
+          gpu_start=''
+          summarize() {
+            status=$?
+            total=$SECONDS
+            {
+              printf '## Tests GPU synthétiques lourds\n\n'
+              printf -- '- Runner : macos-15\n'
+              printf -- '- Tests sélectionnés : %s, un seul thread\n' "${#tests[@]}"
+              printf -- '- Code de sortie : %s\n' "$status"
+              printf -- '- Durée totale (compilation, contrôle et tests) : %s s\n' "$total"
+              if [[ -n "$gpu_start" ]]; then
+                printf -- '- Compilation et contrôle de la liste : %s s\n' "$gpu_start"
+                printf -- '- Exécution des tests : %s s\n' "$((total - gpu_start))"
+              else
+                printf -- '- Exécution des tests : non démarrée\n'
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap summarize EXIT
+
+          # --list compile sans exécuter les tests. Un nom absent ou devenu non
+          # ignoré doit faire échouer le job, même si libtest accepte zéro test.
+          cargo test --features metal,devtools -- --ignored --exact "${tests[@]}" --list \
+            > "$RUNNER_TEMP/gpu-synthetic-heavy-list.txt"
+          printf '%s\n' "${tests[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/gpu-synthetic-heavy-expected.txt"
+          sed -n 's/: test$//p' "$RUNNER_TEMP/gpu-synthetic-heavy-list.txt" | LC_ALL=C sort \
+            > "$RUNNER_TEMP/gpu-synthetic-heavy-actual.txt"
+          diff -u "$RUNNER_TEMP/gpu-synthetic-heavy-expected.txt" "$RUNNER_TEMP/gpu-synthetic-heavy-actual.txt"
 
           gpu_start=$SECONDS
           cargo test --features metal,devtools -- --ignored --exact "${tests[@]}" --test-threads=1
