@@ -1,0 +1,832 @@
+{
+ "seed": 20261104,
+ "port": 18080,
+ "max_tokens": 400,
+ "deadline_s": 3600,
+ "load_timeout_s": 1800,
+ "cooldown_min_s": 60,
+ "cooldown_max_s": 600,
+ "memory_period_s": 0.2,
+ "tie_margin": 0.03,
+ "sampling": {
+  "greedy": {
+   "temperature": 0.0,
+   "top_p": 1.0,
+   "top_k": 0,
+   "min_p": 0.0
+  },
+  "sampled": {
+   "temperature": 0.7,
+   "top_p": 1.0,
+   "top_k": 20,
+   "min_p": 0.0
+  }
+ },
+ "engines": {
+  "saragossa": {
+   "model": "qwen38",
+   "health": "/health",
+   "ingest": "log",
+   "headers": {
+    "Authorization": "Bearer bench"
+   },
+   "send": [
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p"
+   ],
+   "extra": {
+    "repetition_penalty": 1.0,
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "usage_counts_eos": false
+  },
+  "llama": {
+   "model": "qwen38",
+   "health": "/health",
+   "ingest": "server_reconstruction",
+   "send": [
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p"
+   ],
+   "extra": {
+    "repeat_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "usage_counts_eos": true,
+   "injected_content_prefix": "<think>\n\n</think>\n\n"
+  },
+  "mlx": {
+   "model": "default_model",
+   "health": "/v1/models",
+   "ingest": "offline",
+   "seed": false,
+   "send": [
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p"
+   ],
+   "extra": {
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "usage_counts_eos": true
+  },
+  "llmd": {
+   "model": "qwen38",
+   "health": [
+    "/v1/models",
+    "/health"
+   ],
+   "ingest": "offline",
+   "seed": false,
+   "send": [
+    "temperature",
+    "top_p"
+   ],
+   "extra": {},
+   "usage_counts_eos": false,
+   "nonce_probe": true,
+   "class_args": {
+    "V": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ],
+    "T": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ],
+    "S": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ],
+    "M": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ],
+    "L": [
+     "--gpu-memory-fraction=0.5",
+     "--cache-memory-fraction=0.5"
+    ]
+   }
+  }
+ },
+ "configs": {
+  "sar-ar": {
+   "engine": "saragossa",
+   "launch": [
+    "launch_saragossa.sh",
+    "ar"
+   ]
+  },
+  "sar-mtp": {
+   "engine": "saragossa",
+   "launch": [
+    "launch_saragossa.sh",
+    "mtp"
+   ],
+   "slots": {
+    "sar-mtp": {
+     "env": {
+      "SARAGOSSA_RUST_MTP_MAX_DRAFT": "2"
+     }
+    }
+   }
+  },
+  "sar-dflash": {
+   "engine": "saragossa",
+   "launch": [
+    "launch_saragossa.sh",
+    "dflash"
+   ],
+   "slots": {
+    "sar-dflash": {
+     "env": {}
+    }
+   }
+  },
+  "llq40-ar": {
+   "engine": "llama",
+   "launch": [
+    "launch_llama.sh",
+    "q4_0",
+    "ar"
+   ],
+   "slots": {
+    "llama-ubatch": {
+     "args": [
+      "-b",
+      "2048",
+      "-ub",
+      "512"
+     ]
+    },
+    "llama-ctxcp": {
+     "args": []
+    },
+    "llama-sampler": {
+     "args": []
+    }
+   }
+  },
+  "llq40-mtp": {
+   "engine": "llama",
+   "launch": [
+    "launch_llama.sh",
+    "q4_0",
+    "mtp"
+   ],
+   "slots": {
+    "llama-ubatch": {
+     "args": [
+      "-b",
+      "2048",
+      "-ub",
+      "512"
+     ]
+    },
+    "llama-ctxcp": {
+     "args": []
+    },
+    "llama-sampler": {
+     "args": []
+    },
+    "llama-mtp": {
+     "args": [
+      "--spec-draft-n-max",
+      "1"
+     ]
+    }
+   }
+  },
+  "llq40-dflash": {
+   "engine": "llama",
+   "launch": [
+    "launch_llama.sh",
+    "q4_0",
+    "dflash"
+   ],
+   "slots": {
+    "llama-ubatch": {
+     "args": [
+      "-b",
+      "2048",
+      "-ub",
+      "512"
+     ]
+    },
+    "llama-ctxcp": {
+     "args": []
+    },
+    "llama-sampler": {
+     "args": []
+    },
+    "llama-dflash": {
+     "args": [
+      "--spec-draft-n-max",
+      "3"
+     ]
+    }
+   }
+  },
+  "llkm-ar": {
+   "engine": "llama",
+   "launch": [
+    "launch_llama.sh",
+    "q4_k_m",
+    "ar"
+   ],
+   "slots": {
+    "llama-ubatch": {
+     "args": [
+      "-b",
+      "2048",
+      "-ub",
+      "512"
+     ]
+    },
+    "llama-ctxcp": {
+     "args": []
+    },
+    "llama-sampler": {
+     "args": []
+    }
+   }
+  },
+  "llkm-mtp": {
+   "engine": "llama",
+   "launch": [
+    "launch_llama.sh",
+    "q4_k_m",
+    "mtp"
+   ],
+   "slots": {
+    "llama-ubatch": {
+     "args": [
+      "-b",
+      "2048",
+      "-ub",
+      "512"
+     ]
+    },
+    "llama-ctxcp": {
+     "args": []
+    },
+    "llama-sampler": {
+     "args": []
+    },
+    "llama-mtp": {
+     "args": [
+      "--spec-draft-n-max",
+      "1"
+     ]
+    }
+   }
+  },
+  "llkm-dflash": {
+   "engine": "llama",
+   "launch": [
+    "launch_llama.sh",
+    "q4_k_m",
+    "dflash"
+   ],
+   "slots": {
+    "llama-ubatch": {
+     "args": [
+      "-b",
+      "2048",
+      "-ub",
+      "512"
+     ]
+    },
+    "llama-ctxcp": {
+     "args": []
+    },
+    "llama-sampler": {
+     "args": []
+    },
+    "llama-dflash": {
+     "args": [
+      "--spec-draft-n-max",
+      "3"
+     ]
+    }
+   }
+  },
+  "llmd-ar": {
+   "engine": "llmd",
+   "launch": [
+    "launch_llmd.sh",
+    "ar"
+   ],
+   "args": [
+    "--model-name=qwen38",
+    "--topk=1"
+   ],
+   "slots": {
+    "llmd-batching": {
+     "args": [
+      "--token-batch-size=2048",
+      "--prefill-chunk-size=2048"
+     ]
+    }
+   }
+  },
+  "llmd-native": {
+   "engine": "llmd",
+   "launch": [
+    "launch_llmd.sh",
+    "native"
+   ],
+   "args": [
+    "--model-name=qwen38",
+    "--topk=1"
+   ],
+   "slots": {
+    "llmd-batching": {
+     "args": [
+      "--token-batch-size=2048",
+      "--prefill-chunk-size=2048"
+     ]
+    }
+   },
+   "unsupported": "llmd 20261029 : --speculative-drafter-model=native s'arr\u00eate au chargement (\"Resolving speculative drafter model repo\" puis \"error: FileNotFound\"), essai de validation du 4 nov. 2026"
+  },
+  "llmd-ar-s": {
+   "engine": "llmd",
+   "launch": [
+    "launch_llmd.sh",
+    "ar"
+   ],
+   "args": [
+    "--model-name=qwen38",
+    "--topk=20"
+   ],
+   "slots": {
+    "llmd-batching": {
+     "args": [
+      "--token-batch-size=2048",
+      "--prefill-chunk-size=2048"
+     ]
+    }
+   }
+  },
+  "llmd-native-s": {
+   "engine": "llmd",
+   "launch": [
+    "launch_llmd.sh",
+    "native"
+   ],
+   "args": [
+    "--model-name=qwen38",
+    "--topk=20"
+   ],
+   "slots": {
+    "llmd-batching": {
+     "args": [
+      "--token-batch-size=2048",
+      "--prefill-chunk-size=2048"
+     ]
+    }
+   },
+   "unsupported": "llmd 20261029 : --speculative-drafter-model=native s'arr\u00eate au chargement (\"Resolving speculative drafter model repo\" puis \"error: FileNotFound\"), essai de validation du 4 nov. 2026"
+  },
+  "mlx-ar": {
+   "engine": "mlx",
+   "launch": [
+    "launch_mlx.sh",
+    "ar"
+   ],
+   "slots": {
+    "mlx-prefill": {
+     "args": [
+      "--prefill-step-size",
+      "2048"
+     ]
+    }
+   }
+  },
+  "mlx-mtp": {
+   "engine": "mlx",
+   "launch": [
+    "launch_mlx.sh",
+    "mtp"
+   ],
+   "unsupported": "mlx-lm 0.32.2 jette mtp.* au chargement (models/qwen3_5.py:354)"
+  },
+  "mlx-dflash": {
+   "engine": "mlx",
+   "launch": [
+    "launch_mlx.sh",
+    "dflash"
+   ],
+   "unsupported": "mlx-lm 0.32.2 n'a pas de drafter DFlash2"
+  }
+ },
+ "tuning": {
+  "llama-ubatch": {
+   "probe": "llkm-ar",
+   "metric": "ttft_s",
+   "prompts": [
+    "tune-code32k-1",
+    "tune-code4k-1"
+   ],
+   "candidates": [
+    {
+     "args": [
+      "-b",
+      "2048",
+      "-ub",
+      "512"
+     ]
+    },
+    {
+     "args": [
+      "-b",
+      "2048",
+      "-ub",
+      "1024"
+     ]
+    },
+    {
+     "args": [
+      "-b",
+      "2048",
+      "-ub",
+      "2048"
+     ]
+    }
+   ]
+  },
+  "llama-ctxcp": {
+   "probe": "llkm-ar",
+   "metric": "ttft_s",
+   "prompts": [
+    "tune-code32k-1",
+    "tune-code4k-1"
+   ],
+   "candidates": [
+    {
+     "args": []
+    },
+    {
+     "args": [
+      "-ctxcp",
+      "0"
+     ]
+    }
+   ]
+  },
+  "llama-sampler": {
+   "probe": "llkm-ar",
+   "metric": "delivery_tok_s",
+   "prompts": [
+    "tune-chat-1",
+    "tune-code4k-1",
+    "tune-prose4k-1"
+   ],
+   "candidates": [
+    {
+     "args": []
+    },
+    {
+     "args": [
+      "-bs"
+     ]
+    }
+   ]
+  },
+  "llama-mtp": {
+   "probe": "llkm-mtp",
+   "metric": "delivery_tok_s",
+   "prompts": [
+    "tune-chat-1",
+    "tune-code4k-1",
+    "tune-prose4k-1"
+   ],
+   "candidates": [
+    {
+     "args": [
+      "--spec-draft-n-max",
+      "3"
+     ]
+    },
+    {
+     "args": [
+      "--spec-draft-n-max",
+      "1"
+     ]
+    },
+    {
+     "args": [
+      "--spec-draft-n-max",
+      "2"
+     ]
+    }
+   ],
+   "reference": "llkm-ar"
+  },
+  "llama-dflash": {
+   "probe": "llkm-dflash",
+   "metric": "delivery_tok_s",
+   "prompts": [
+    "tune-chat-1",
+    "tune-code4k-1",
+    "tune-prose4k-1"
+   ],
+   "candidates": [
+    {
+     "args": [
+      "--spec-draft-n-max",
+      "3"
+     ]
+    },
+    {
+     "args": [
+      "--spec-draft-n-max",
+      "5"
+     ]
+    },
+    {
+     "args": [
+      "--spec-draft-n-max",
+      "7"
+     ]
+    }
+   ],
+   "reference": "llkm-ar"
+  },
+  "sar-mtp": {
+   "probe": "sar-mtp",
+   "metric": "delivery_tok_s",
+   "prompts": [
+    "tune-chat-1",
+    "tune-code4k-1",
+    "tune-prose4k-1"
+   ],
+   "candidates": [
+    {
+     "env": {
+      "SARAGOSSA_RUST_MTP_MAX_DRAFT": "2"
+     }
+    },
+    {
+     "env": {
+      "SARAGOSSA_RUST_MTP_MAX_DRAFT": "1"
+     }
+    },
+    {
+     "env": {
+      "SARAGOSSA_RUST_MTP_MAX_DRAFT": "3"
+     }
+    }
+   ],
+   "reference": "sar-ar"
+  },
+  "sar-dflash": {
+   "probe": "sar-dflash",
+   "metric": "delivery_tok_s",
+   "prompts": [
+    "tune-chat-1",
+    "tune-code4k-1",
+    "tune-prose4k-1"
+   ],
+   "candidates": [
+    {
+     "env": {}
+    },
+    {
+     "env": {
+      "SARAGOSSA_RUST_DFLASH_TREE": "4"
+     }
+    },
+    {
+     "env": {
+      "SARAGOSSA_RUST_DFLASH_TREE": "16"
+     }
+    }
+   ],
+   "reference": "sar-ar"
+  },
+  "llmd-batching": {
+   "probe": "llmd-ar",
+   "metric": "ttft_s",
+   "prompts": [
+    "tune-code32k-1",
+    "tune-code4k-1"
+   ],
+   "candidates": [
+    {
+     "args": []
+    },
+    {
+     "args": [
+      "--token-batch-size=2048",
+      "--prefill-chunk-size=2048"
+     ]
+    }
+   ]
+  },
+  "mlx-prefill": {
+   "probe": "mlx-ar",
+   "metric": "ttft_s",
+   "prompts": [
+    "tune-code32k-1",
+    "tune-code4k-1"
+   ],
+   "candidates": [
+    {
+     "args": [
+      "--prefill-step-size",
+      "2048"
+     ]
+    },
+    {
+     "args": [
+      "--prefill-step-size",
+      "4096"
+     ]
+    }
+   ]
+  }
+ },
+ "classes": {
+  "V": {
+   "ctx": 8192,
+   "warmup": "tune-prose4k-1",
+   "prompts": [
+    "tune-code4k-1",
+    "tune-prose4k-1",
+    "eos-short-1",
+    "eos-short-2"
+   ]
+  },
+  "T": {
+   "ctx": 36864,
+   "warmup": "tune-code32k-1",
+   "prompts": [
+    "tune-chat-1",
+    "tune-code4k-1",
+    "tune-prose4k-1",
+    "tune-code32k-1"
+   ]
+  },
+  "S": {
+   "ctx": 8192,
+   "warmup": "tune-code4k-1",
+   "prompts": [
+    "chat-1",
+    "chat-2",
+    "chat-3",
+    "chat-4",
+    "chat-5",
+    "chat-6",
+    "code4k-1",
+    "code4k-2",
+    "code4k-3",
+    "prose4k-1",
+    "prose4k-2",
+    "prose4k-3"
+   ]
+  },
+  "M": {
+   "ctx": 36864,
+   "warmup": "tune-code32k-1",
+   "prompts": [
+    "code32k-1",
+    "prose32k-1"
+   ]
+  },
+  "L": {
+   "ctx": 262144,
+   "warmup": "tune-code32k-1",
+   "prompts": [
+    "code256k-1"
+   ]
+  }
+ },
+ "phases": {
+  "validate": {
+   "class": "V",
+   "sampling": "greedy",
+   "blocks": 1,
+   "seeds": [
+    1,
+    2
+   ],
+   "configs": [
+    "sar-ar",
+    "sar-mtp",
+    "sar-dflash",
+    "llq40-ar",
+    "llq40-mtp",
+    "llq40-dflash",
+    "llkm-ar",
+    "llkm-mtp",
+    "llkm-dflash",
+    "llmd-ar",
+    "llmd-native",
+    "mlx-ar",
+    "mlx-mtp",
+    "mlx-dflash"
+   ],
+   "identical_repeats": true
+  },
+  "tune": {
+   "class": "T",
+   "sampling": "greedy",
+   "blocks": 1,
+   "repeats": 2,
+   "configs": "tuning"
+  },
+  "eval-S": {
+   "class": "S",
+   "sampling": "greedy",
+   "blocks": 5,
+   "configs": [
+    "sar-ar",
+    "sar-mtp",
+    "sar-dflash",
+    "llq40-ar",
+    "llq40-mtp",
+    "llq40-dflash",
+    "llkm-ar",
+    "llkm-mtp",
+    "llkm-dflash",
+    "llmd-ar",
+    "llmd-native",
+    "mlx-ar",
+    "mlx-mtp",
+    "mlx-dflash"
+   ]
+  },
+  "eval-M": {
+   "class": "M",
+   "sampling": "greedy",
+   "blocks": 3,
+   "configs": [
+    "sar-ar",
+    "sar-mtp",
+    "sar-dflash",
+    "llq40-ar",
+    "llq40-mtp",
+    "llq40-dflash",
+    "llkm-ar",
+    "llkm-mtp",
+    "llkm-dflash",
+    "llmd-ar",
+    "llmd-native",
+    "mlx-ar"
+   ]
+  },
+  "eval-L": {
+   "class": "L",
+   "sampling": "greedy",
+   "blocks": 1,
+   "configs": [
+    "sar-ar",
+    "sar-mtp",
+    "sar-dflash",
+    "llq40-ar",
+    "llkm-ar",
+    "llkm-mtp",
+    "llkm-dflash",
+    "llmd-ar",
+    "llmd-native",
+    "mlx-ar"
+   ]
+  },
+  "sampled-S": {
+   "class": "S",
+   "sampling": "sampled",
+   "blocks": 1,
+   "seeds": [
+    11,
+    22
+   ],
+   "configs": [
+    "sar-ar",
+    "sar-mtp",
+    "sar-dflash",
+    "llkm-ar",
+    "llkm-mtp",
+    "llkm-dflash",
+    "llmd-ar-s",
+    "llmd-native-s",
+    "mlx-ar"
+   ]
+  }
+ }
+}

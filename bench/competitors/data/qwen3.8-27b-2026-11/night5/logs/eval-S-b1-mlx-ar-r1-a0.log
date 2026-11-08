@@ -1,0 +1,116 @@
+bench-launch: ~/workspace/saragossa-oss/models/mlxenv/bin/python -I -m mlx_lm.server --model ~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit --host 127.0.0.1 --port 18080 --decode-concurrency 1 --prompt-concurrency 1 --prompt-cache-size 0 --temp 0 --top-p 1 --top-k 0 --min-p 0 --chat-template-args \{\"enable_thinking\":false\} --prefill-step-size 2048
+~/workspace/saragossa-oss/models/mlxenv/lib/python3.12/site-packages/mlx_lm/server.py:1894: UserWarning: mlx_lm.server is not recommended for production as it only implements basic security checks.
+  warnings.warn(
+2026-11-08 03:27:32,243 - INFO - Starting httpd at 127.0.0.1 on port 18080...
+127.0.0.1 - - [08/Nov/2026 03:27:32] "GET /v1/models HTTP/1.1" 200 -
+2026-11-08 03:27:33,170 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:27:33,170 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:27:33,170 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:27:33,170 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:27:33] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:27:35,248 - INFO - Prompt processing progress: 2048/4096
+2026-11-08 03:27:37,386 - INFO - Prompt processing progress: 4092/4096
+2026-11-08 03:27:37,429 - INFO - Prompt processing progress: 4095/4096
+2026-11-08 03:27:37,467 - INFO - Prompt processing progress: 4096/4096
+2026-11-08 03:27:50,876 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:27:50,876 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:27:50,876 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:27:50,876 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:27:50] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:27:52,966 - INFO - Prompt processing progress: 2048/4096
+2026-11-08 03:27:55,132 - INFO - Prompt processing progress: 4092/4096
+2026-11-08 03:27:55,177 - INFO - Prompt processing progress: 4095/4096
+2026-11-08 03:27:55,213 - INFO - Prompt processing progress: 4096/4096
+2026-11-08 03:28:08,597 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:28:08,597 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:28:08,597 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:28:08,597 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:28:08] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:28:10,867 - INFO - Prompt processing progress: 2048/4096
+2026-11-08 03:28:13,314 - INFO - Prompt processing progress: 4092/4096
+2026-11-08 03:28:13,360 - INFO - Prompt processing progress: 4095/4096
+2026-11-08 03:28:13,396 - INFO - Prompt processing progress: 4096/4096
+2026-11-08 03:28:26,867 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:28:26,867 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:28:26,867 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:28:26,867 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:28:26] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:28:27,004 - INFO - Prompt processing progress: 57/61
+2026-11-08 03:28:27,040 - INFO - Prompt processing progress: 60/61
+2026-11-08 03:28:27,073 - INFO - Prompt processing progress: 61/61
+2026-11-08 03:28:40,250 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:28:40,250 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:28:40,250 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:28:40,250 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:28:40] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:28:43,182 - INFO - Prompt processing progress: 2048/4096
+2026-11-08 03:28:45,807 - INFO - Prompt processing progress: 4092/4096
+2026-11-08 03:28:45,851 - INFO - Prompt processing progress: 4095/4096
+2026-11-08 03:28:45,888 - INFO - Prompt processing progress: 4096/4096
+2026-11-08 03:28:59,368 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:28:59,368 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:28:59,368 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:28:59,368 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:28:59] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:29:01,958 - INFO - Prompt processing progress: 2048/4096
+2026-11-08 03:29:04,543 - INFO - Prompt processing progress: 4092/4096
+2026-11-08 03:29:04,589 - INFO - Prompt processing progress: 4095/4096
+2026-11-08 03:29:04,626 - INFO - Prompt processing progress: 4096/4096
+2026-11-08 03:29:17,990 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:29:17,990 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:29:17,991 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:29:17,991 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:29:17] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:29:18,125 - INFO - Prompt processing progress: 54/58
+2026-11-08 03:29:18,160 - INFO - Prompt processing progress: 57/58
+2026-11-08 03:29:18,194 - INFO - Prompt processing progress: 58/58
+2026-11-08 03:29:31,299 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:29:31,299 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:29:31,299 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:29:31,299 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:29:31] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:29:31,434 - INFO - Prompt processing progress: 54/58
+2026-11-08 03:29:31,468 - INFO - Prompt processing progress: 57/58
+2026-11-08 03:29:31,501 - INFO - Prompt processing progress: 58/58
+2026-11-08 03:29:44,614 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:29:44,614 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:29:44,614 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:29:44,614 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:29:44] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:29:44,745 - INFO - Prompt processing progress: 46/50
+2026-11-08 03:29:44,780 - INFO - Prompt processing progress: 49/50
+2026-11-08 03:29:44,812 - INFO - Prompt processing progress: 50/50
+2026-11-08 03:29:57,927 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:29:57,927 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:29:57,927 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:29:57,927 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:29:57] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:29:58,062 - INFO - Prompt processing progress: 55/59
+2026-11-08 03:29:58,096 - INFO - Prompt processing progress: 58/59
+2026-11-08 03:29:58,130 - INFO - Prompt processing progress: 59/59
+2026-11-08 03:30:11,245 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:30:11,245 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:30:11,245 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:30:11,245 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:30:11] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:30:11,380 - INFO - Prompt processing progress: 55/59
+2026-11-08 03:30:11,414 - INFO - Prompt processing progress: 58/59
+2026-11-08 03:30:11,448 - INFO - Prompt processing progress: 59/59
+2026-11-08 03:30:24,565 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:30:24,565 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:30:24,565 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:30:24,565 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:30:24] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:30:26,659 - INFO - Prompt processing progress: 2048/4096
+2026-11-08 03:30:28,897 - INFO - Prompt processing progress: 4092/4096
+2026-11-08 03:30:28,942 - INFO - Prompt processing progress: 4095/4096
+2026-11-08 03:30:28,978 - INFO - Prompt processing progress: 4096/4096
+2026-11-08 03:30:42,407 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-08 03:30:42,407 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-08 03:30:42,407 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-08 03:30:42,407 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [08/Nov/2026 03:30:42] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-08 03:30:44,521 - INFO - Prompt processing progress: 2048/4096
+2026-11-08 03:30:46,788 - INFO - Prompt processing progress: 4092/4096
+2026-11-08 03:30:46,834 - INFO - Prompt processing progress: 4095/4096
+2026-11-08 03:30:46,869 - INFO - Prompt processing progress: 4096/4096

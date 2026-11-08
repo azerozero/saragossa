@@ -1,0 +1,60 @@
+{
+ "admissibility": {
+  "sar-dflash": {
+   "total": 91,
+   "by_status": {
+    "admissible": 91
+   },
+   "failed_proofs": {},
+   "approx": 7,
+   "throttled": 0,
+   "short": 0
+  },
+  "sar-mtp": {
+   "total": 91,
+   "by_status": {
+    "admissible": 91
+   },
+   "failed_proofs": {},
+   "approx": 6,
+   "throttled": 0,
+   "short": 0
+  },
+  "sar-ar": {
+   "total": 91,
+   "by_status": {
+    "admissible": 91
+   },
+   "failed_proofs": {},
+   "approx": 7,
+   "throttled": 0,
+   "short": 0
+  }
+ },
+ "nonce_probes": [],
+ "eos": {
+  "saragossa": {
+   "length": {
+    "0": 271,
+    "1": 2
+   }
+  }
+ },
+ "integrity": {
+  "sar-dflash": {
+   "against": "sar-ar",
+   "pairs": 67,
+   "identical": 67,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "sar-mtp": {
+   "against": "sar-ar",
+   "pairs": 67,
+   "identical": 67,
+   "missing_pair": 0,
+   "first_divergences": []
+  }
+ },
+ "repeatability": {}
+}

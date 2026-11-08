@@ -1,0 +1,163 @@
+bench-launch: ~/workspace/saragossa-oss/models/mlxenv/bin/python -I -m mlx_lm.server --model ~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit --host 127.0.0.1 --port 18080 --decode-concurrency 1 --prompt-concurrency 1 --prompt-cache-size 0 --temp 0 --top-p 1 --top-k 0 --min-p 0 --chat-template-args \{\"enable_thinking\":false\} --prefill-step-size 2048
+~/workspace/saragossa-oss/models/mlxenv/lib/python3.12/site-packages/mlx_lm/server.py:1894: UserWarning: mlx_lm.server is not recommended for production as it only implements basic security checks.
+  warnings.warn(
+2026-11-06 16:40:02,731 - INFO - Starting httpd at 127.0.0.1 on port 18080...
+127.0.0.1 - - [06/Nov/2026 16:40:03] "GET /v1/models HTTP/1.1" 200 -
+2026-11-06 16:40:03,742 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-06 16:40:03,742 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-06 16:40:03,742 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-06 16:40:03,743 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [06/Nov/2026 16:40:03] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-06 16:40:05,820 - INFO - Prompt processing progress: 2048/32768
+2026-11-06 16:40:07,928 - INFO - Prompt processing progress: 4096/32768
+2026-11-06 16:40:10,108 - INFO - Prompt processing progress: 6144/32768
+2026-11-06 16:40:12,473 - INFO - Prompt processing progress: 8192/32768
+2026-11-06 16:40:14,920 - INFO - Prompt processing progress: 10240/32768
+2026-11-06 16:40:17,398 - INFO - Prompt processing progress: 12288/32768
+2026-11-06 16:40:19,939 - INFO - Prompt processing progress: 14336/32768
+2026-11-06 16:40:22,534 - INFO - Prompt processing progress: 16384/32768
+2026-11-06 16:40:25,193 - INFO - Prompt processing progress: 18432/32768
+2026-11-06 16:40:27,906 - INFO - Prompt processing progress: 20480/32768
+2026-11-06 16:40:30,667 - INFO - Prompt processing progress: 22528/32768
+2026-11-06 16:40:33,492 - INFO - Prompt processing progress: 24576/32768
+2026-11-06 16:40:36,371 - INFO - Prompt processing progress: 26624/32768
+2026-11-06 16:40:39,304 - INFO - Prompt processing progress: 28672/32768
+2026-11-06 16:40:42,287 - INFO - Prompt processing progress: 30720/32768
+2026-11-06 16:40:45,424 - INFO - Prompt processing progress: 32764/32768
+2026-11-06 16:40:45,491 - INFO - Prompt processing progress: 32767/32768
+2026-11-06 16:40:45,543 - INFO - Prompt processing progress: 32768/32768
+2026-11-06 16:41:00,899 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-06 16:41:00,899 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-06 16:41:00,899 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-06 16:41:00,899 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [06/Nov/2026 16:41:00] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-06 16:41:03,152 - INFO - Prompt processing progress: 2048/260999
+2026-11-06 16:41:05,459 - INFO - Prompt processing progress: 4096/260999
+2026-11-06 16:41:07,847 - INFO - Prompt processing progress: 6144/260999
+2026-11-06 16:41:10,310 - INFO - Prompt processing progress: 8192/260999
+2026-11-06 16:41:12,839 - INFO - Prompt processing progress: 10240/260999
+2026-11-06 16:41:15,418 - INFO - Prompt processing progress: 12288/260999
+2026-11-06 16:41:18,167 - INFO - Prompt processing progress: 14336/260999
+2026-11-06 16:41:21,083 - INFO - Prompt processing progress: 16384/260999
+2026-11-06 16:41:24,009 - INFO - Prompt processing progress: 18432/260999
+2026-11-06 16:41:26,964 - INFO - Prompt processing progress: 20480/260999
+2026-11-06 16:41:29,933 - INFO - Prompt processing progress: 22528/260999
+2026-11-06 16:41:32,929 - INFO - Prompt processing progress: 24576/260999
+2026-11-06 16:41:35,954 - INFO - Prompt processing progress: 26624/260999
+2026-11-06 16:41:38,991 - INFO - Prompt processing progress: 28672/260999
+2026-11-06 16:41:41,984 - INFO - Prompt processing progress: 30720/260999
+2026-11-06 16:41:44,893 - INFO - Prompt processing progress: 32768/260999
+2026-11-06 16:41:47,961 - INFO - Prompt processing progress: 34816/260999
+2026-11-06 16:41:51,196 - INFO - Prompt processing progress: 36864/260999
+2026-11-06 16:41:54,502 - INFO - Prompt processing progress: 38912/260999
+2026-11-06 16:41:57,657 - INFO - Prompt processing progress: 40960/260999
+2026-11-06 16:42:00,824 - INFO - Prompt processing progress: 43008/260999
+2026-11-06 16:42:04,192 - INFO - Prompt processing progress: 45056/260999
+2026-11-06 16:42:07,600 - INFO - Prompt processing progress: 47104/260999
+2026-11-06 16:42:11,061 - INFO - Prompt processing progress: 49152/260999
+2026-11-06 16:42:14,572 - INFO - Prompt processing progress: 51200/260999
+2026-11-06 16:42:18,129 - INFO - Prompt processing progress: 53248/260999
+2026-11-06 16:42:21,726 - INFO - Prompt processing progress: 55296/260999
+2026-11-06 16:42:25,375 - INFO - Prompt processing progress: 57344/260999
+2026-11-06 16:42:29,078 - INFO - Prompt processing progress: 59392/260999
+2026-11-06 16:42:32,838 - INFO - Prompt processing progress: 61440/260999
+2026-11-06 16:42:36,637 - INFO - Prompt processing progress: 63488/260999
+2026-11-06 16:42:40,484 - INFO - Prompt processing progress: 65536/260999
+2026-11-06 16:42:44,382 - INFO - Prompt processing progress: 67584/260999
+2026-11-06 16:42:48,334 - INFO - Prompt processing progress: 69632/260999
+2026-11-06 16:42:52,340 - INFO - Prompt processing progress: 71680/260999
+2026-11-06 16:42:56,414 - INFO - Prompt processing progress: 73728/260999
+2026-11-06 16:43:00,526 - INFO - Prompt processing progress: 75776/260999
+2026-11-06 16:43:04,726 - INFO - Prompt processing progress: 77824/260999
+2026-11-06 16:43:08,956 - INFO - Prompt processing progress: 79872/260999
+2026-11-06 16:43:13,277 - INFO - Prompt processing progress: 81920/260999
+2026-11-06 16:43:17,643 - INFO - Prompt processing progress: 83968/260999
+2026-11-06 16:43:22,066 - INFO - Prompt processing progress: 86016/260999
+2026-11-06 16:43:26,524 - INFO - Prompt processing progress: 88064/260999
+2026-11-06 16:43:31,053 - INFO - Prompt processing progress: 90112/260999
+2026-11-06 16:43:35,639 - INFO - Prompt processing progress: 92160/260999
+2026-11-06 16:43:40,297 - INFO - Prompt processing progress: 94208/260999
+2026-11-06 16:43:44,984 - INFO - Prompt processing progress: 96256/260999
+2026-11-06 16:43:49,694 - INFO - Prompt processing progress: 98304/260999
+2026-11-06 16:43:54,484 - INFO - Prompt processing progress: 100352/260999
+2026-11-06 16:43:59,318 - INFO - Prompt processing progress: 102400/260999
+2026-11-06 16:44:04,249 - INFO - Prompt processing progress: 104448/260999
+2026-11-06 16:44:09,155 - INFO - Prompt processing progress: 106496/260999
+2026-11-06 16:44:14,171 - INFO - Prompt processing progress: 108544/260999
+2026-11-06 16:44:19,210 - INFO - Prompt processing progress: 110592/260999
+2026-11-06 16:44:24,316 - INFO - Prompt processing progress: 112640/260999
+2026-11-06 16:44:29,485 - INFO - Prompt processing progress: 114688/260999
+2026-11-06 16:44:34,734 - INFO - Prompt processing progress: 116736/260999
+2026-11-06 16:44:39,950 - INFO - Prompt processing progress: 118784/260999
+2026-11-06 16:44:45,255 - INFO - Prompt processing progress: 120832/260999
+2026-11-06 16:44:50,646 - INFO - Prompt processing progress: 122880/260999
+2026-11-06 16:44:56,048 - INFO - Prompt processing progress: 124928/260999
+2026-11-06 16:45:01,511 - INFO - Prompt processing progress: 126976/260999
+2026-11-06 16:45:07,068 - INFO - Prompt processing progress: 129024/260999
+2026-11-06 16:45:12,653 - INFO - Prompt processing progress: 131072/260999
+2026-11-06 16:45:18,313 - INFO - Prompt processing progress: 133120/260999
+2026-11-06 16:45:24,036 - INFO - Prompt processing progress: 135168/260999
+2026-11-06 16:45:29,815 - INFO - Prompt processing progress: 137216/260999
+2026-11-06 16:45:35,599 - INFO - Prompt processing progress: 139264/260999
+2026-11-06 16:45:41,489 - INFO - Prompt processing progress: 141312/260999
+2026-11-06 16:45:47,389 - INFO - Prompt processing progress: 143360/260999
+2026-11-06 16:45:53,363 - INFO - Prompt processing progress: 145408/260999
+2026-11-06 16:45:59,372 - INFO - Prompt processing progress: 147456/260999
+2026-11-06 16:46:05,468 - INFO - Prompt processing progress: 149504/260999
+2026-11-06 16:46:11,568 - INFO - Prompt processing progress: 151552/260999
+2026-11-06 16:46:17,741 - INFO - Prompt processing progress: 153600/260999
+2026-11-06 16:46:23,966 - INFO - Prompt processing progress: 155648/260999
+2026-11-06 16:46:30,255 - INFO - Prompt processing progress: 157696/260999
+2026-11-06 16:46:36,590 - INFO - Prompt processing progress: 159744/260999
+2026-11-06 16:46:42,946 - INFO - Prompt processing progress: 161792/260999
+2026-11-06 16:46:49,364 - INFO - Prompt processing progress: 163840/260999
+2026-11-06 16:46:55,836 - INFO - Prompt processing progress: 165888/260999
+2026-11-06 16:47:02,409 - INFO - Prompt processing progress: 167936/260999
+2026-11-06 16:47:09,011 - INFO - Prompt processing progress: 169984/260999
+2026-11-06 16:47:15,650 - INFO - Prompt processing progress: 172032/260999
+2026-11-06 16:47:22,315 - INFO - Prompt processing progress: 174080/260999
+2026-11-06 16:47:29,070 - INFO - Prompt processing progress: 176128/260999
+2026-11-06 16:47:35,856 - INFO - Prompt processing progress: 178176/260999
+2026-11-06 16:47:42,763 - INFO - Prompt processing progress: 180224/260999
+2026-11-06 16:47:49,684 - INFO - Prompt processing progress: 182272/260999
+2026-11-06 16:47:56,653 - INFO - Prompt processing progress: 184320/260999
+2026-11-06 16:48:03,741 - INFO - Prompt processing progress: 186368/260999
+2026-11-06 16:48:10,835 - INFO - Prompt processing progress: 188416/260999
+2026-11-06 16:48:17,997 - INFO - Prompt processing progress: 190464/260999
+2026-11-06 16:48:25,227 - INFO - Prompt processing progress: 192512/260999
+2026-11-06 16:48:32,502 - INFO - Prompt processing progress: 194560/260999
+2026-11-06 16:48:39,838 - INFO - Prompt processing progress: 196608/260999
+2026-11-06 16:48:47,179 - INFO - Prompt processing progress: 198656/260999
+2026-11-06 16:48:54,646 - INFO - Prompt processing progress: 200704/260999
+2026-11-06 16:49:02,212 - INFO - Prompt processing progress: 202752/260999
+2026-11-06 16:49:09,808 - INFO - Prompt processing progress: 204800/260999
+2026-11-06 16:49:17,392 - INFO - Prompt processing progress: 206848/260999
+2026-11-06 16:49:25,065 - INFO - Prompt processing progress: 208896/260999
+2026-11-06 16:49:32,828 - INFO - Prompt processing progress: 210944/260999
+2026-11-06 16:49:40,632 - INFO - Prompt processing progress: 212992/260999
+2026-11-06 16:49:48,505 - INFO - Prompt processing progress: 215040/260999
+2026-11-06 16:49:56,410 - INFO - Prompt processing progress: 217088/260999
+2026-11-06 16:50:04,507 - INFO - Prompt processing progress: 219136/260999
+2026-11-06 16:50:12,546 - INFO - Prompt processing progress: 221184/260999
+2026-11-06 16:50:20,634 - INFO - Prompt processing progress: 223232/260999
+2026-11-06 16:50:28,788 - INFO - Prompt processing progress: 225280/260999
+2026-11-06 16:50:36,962 - INFO - Prompt processing progress: 227328/260999
+2026-11-06 16:50:45,242 - INFO - Prompt processing progress: 229376/260999
+2026-11-06 16:50:53,556 - INFO - Prompt processing progress: 231424/260999
+2026-11-06 16:51:01,938 - INFO - Prompt processing progress: 233472/260999
+2026-11-06 16:51:10,409 - INFO - Prompt processing progress: 235520/260999
+2026-11-06 16:51:18,881 - INFO - Prompt processing progress: 237568/260999
+2026-11-06 16:51:27,492 - INFO - Prompt processing progress: 239616/260999
+2026-11-06 16:51:36,078 - INFO - Prompt processing progress: 241664/260999
+2026-11-06 16:51:44,756 - INFO - Prompt processing progress: 243712/260999
+2026-11-06 16:51:53,614 - INFO - Prompt processing progress: 245760/260999
+2026-11-06 16:52:02,478 - INFO - Prompt processing progress: 247808/260999
+2026-11-06 16:52:11,323 - INFO - Prompt processing progress: 249856/260999
+2026-11-06 16:52:20,188 - INFO - Prompt processing progress: 251904/260999
+2026-11-06 16:52:29,152 - INFO - Prompt processing progress: 253952/260999
+2026-11-06 16:52:38,168 - INFO - Prompt processing progress: 256000/260999
+2026-11-06 16:52:47,281 - INFO - Prompt processing progress: 258048/260999
+2026-11-06 16:52:56,482 - INFO - Prompt processing progress: 260096/260999
+2026-11-06 16:53:02,110 - INFO - Prompt processing progress: 260995/260999
+2026-11-06 16:53:02,531 - INFO - Prompt processing progress: 260998/260999
+2026-11-06 16:53:02,744 - INFO - Prompt processing progress: 260999/260999

@@ -1,0 +1,14 @@
+bench-env: SARAGOSSA_BIN=~/workspace/saragossa-oss/.claude/worktrees/agent-a3f925100ec26dd39/target/release/saragossa
+bench-env: SARAGOSSA_RUST_MTP_DECODE=0
+bench-env: SARAGOSSA_RUST_PREFIX_CACHE=0
+bench-env: SARAGOSSA_SERVE_PREFIX_CACHE=0
+bench-launch: ~/workspace/saragossa-oss/.claude/worktrees/agent-a3f925100ec26dd39/target/release/saragossa serve --port 18080 --model qwen38=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit --preload
+saragossa serve model enregistré alias=qwen38 path=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit source=local
+saragossa serve loading model=qwen38 path=~/workspace/saragossa-oss/models/Qwen3.8-27B-4bit
+cpu_weights_released mode=incremental bytes=0 payloads=498 unique_weights=498
+saragossa serve warmup model=qwen38 passes=2 prompt_tokens=2 elapsed_ms=102
+saragossa serve TCP listening on http://127.0.0.1:18080/v1
+saragossa serve TCP bearer auth enabled
+saragossa serve completion model=qwen38 prompt_tokens=32768 completion_tokens=400 prefill_ms=44355 decode_ms=14482 total_ms=58878 reused_prefix_tokens=0 prefix_cache=block-snapshots decode_path=ar streaming=true footprint_bytes=22440099008 prefix_cache_bytes=0 prompt_fnv1a64=83d09b256c97972a
+saragossa serve completion model=qwen38 prompt_tokens=32768 completion_tokens=400 prefill_ms=47832 decode_ms=14297 total_ms=62171 reused_prefix_tokens=0 prefix_cache=block-snapshots decode_path=ar streaming=true footprint_bytes=22596451544 prefix_cache_bytes=0 prompt_fnv1a64=11e4c20834a21fc7
+saragossa serve completion model=qwen38 prompt_tokens=32768 completion_tokens=400 prefill_ms=44607 decode_ms=14261 total_ms=58917 reused_prefix_tokens=0 prefix_cache=block-snapshots decode_path=ar streaming=true footprint_bytes=22121561304 prefix_cache_bytes=0 prompt_fnv1a64=89e0b3db7f8e7272

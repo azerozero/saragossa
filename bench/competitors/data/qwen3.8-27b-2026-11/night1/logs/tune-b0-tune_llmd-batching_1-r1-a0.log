@@ -1,0 +1,29 @@
+
+
+                    ██╗
+         ███╗   ███╗██║              ██╗    ██╗     ██╗     ███╗   ███╗██████╗
+ ███████╗████╗ ████║██║             ██╔╝    ██║     █�warning(zml/vfs/s3): S3 initialized without full credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY). Access will be unauthenticated. Using default endpoint: https://s3.amazonaws.com (set AWS_ENDPOINT_URL or AWS_ENDPOINT_URL_S3). Using default region: us-east-1 (set AWS_REGION or AWS_DEFAULT_REGION).
+info(llmd): Resolving model repo
+info(llmd): Loading model config
+info(llmd): Loaded model config [2.456ms]
+info(llmd): Loading tokenizer
+info(pjrt): Loading: libzml_metal.dylib...
+info(pjrt): Loaded: libzml_metal.dylib
+info(llmd): Devices:
+info(llmd): 	- Apple M5 Max (metal:0)
+warning(llmd): Failed to pin threads to NUMA node 0: error.Unsupported
+info(llmd): Loaded tokenizer [445.875ms]
+info(qwen3_5): Compiled all models [13.201s]
+info(models): Loaded weights [18.77GiB, 1.947s, 9.64GiB/s]
+info(llmd): Loaded a model of type qwen3_5
+info(llmd): Listening on 127.0.0.1:18080
+info(httpd): GET /v1/models
+info(httpd): POST /v1/chat/completions
+info(httpd): POST /v1/chat/completions
+info(httpd): POST /v1/chat/completions
+info(httpd): POST /v1/chat/completions
+info(httpd): POST /v1/chat/completions
+info(httpd): POST /v1/chat/completions
+info(httpd): POST /v1/chat/completions
+info(httpd): Shutting down HTTP server...
+info(llmd/openai_service): Shutting down OpenAIService...
