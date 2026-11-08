@@ -113,8 +113,11 @@ class Sampler:
 
 def file_backed(pid):
     """Résident adossé à des fichiers selon `vmmap -summary` (lent : hors mesure de débit)."""
-    out = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True, text=True,
-                         check=False).stdout
+    try:
+        out = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True, text=True,
+                             check=False, timeout=120).stdout
+    except subprocess.TimeoutExpired as error:
+        return {"error": f"{type(error).__name__}: {error}"}
     result = {"raw_lines": []}
     for line in out.splitlines():
         if line.startswith(("mapped file", "TOTAL", "IOAccelerator", "Physical footprint")):
@@ -152,12 +155,22 @@ def collector_overhead(pid, n=1000):
     return (time.perf_counter_ns() - start) / n / 1000
 
 
+def _file_backed_check():
+    from unittest.mock import patch
+
+    with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("vmmap", 120)) as call:
+        assert "TimeoutExpired" in file_backed(0)["error"]
+    assert call.call_args.kwargs["timeout"] == 120
+
+
 if __name__ == "__main__":
     import os
 
+    _file_backed_check()
     me = rusage(os.getpid())
     assert me is not None and me["phys_footprint"] > 0
     # PID inexistant (au-delà de kern.maxproc) : disparition, pas refus.
     assert rusage(99_999_999) is None
     assert me["lifetime_max_phys_footprint"] >= me["phys_footprint"]
     print(me, f"{collector_overhead(os.getpid()):.1f} µs/appel", system_memory())
+    print("memwatch: auto-test ok")

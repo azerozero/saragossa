@@ -260,7 +260,7 @@
    "slots": {
     "llmd-batching": {}
    },
-   "unsupported": "llmd 20261029 : --speculative-drafter-model=native s'arrête au chargement (\"Resolving speculative drafter model repo\" puis \"error: FileNotFound\"), essai de validation du 4 nov. 2026"
+   "unsupported": "llmd 20261029 : --speculative-drafter-model=native s'arr\u00eate au chargement (\"Resolving speculative drafter model repo\" puis \"error: FileNotFound\"), essai de validation du 4 nov. 2026"
   },
   "llmd-ar-s": {
    "engine": "llmd",
@@ -289,7 +289,7 @@
    "slots": {
     "llmd-batching": {}
    },
-   "unsupported": "llmd 20261029 : --speculative-drafter-model=native s'arrête au chargement (\"Resolving speculative drafter model repo\" puis \"error: FileNotFound\"), essai de validation du 4 nov. 2026"
+   "unsupported": "llmd 20261029 : --speculative-drafter-model=native s'arr\u00eate au chargement (\"Resolving speculative drafter model repo\" puis \"error: FileNotFound\"), essai de validation du 4 nov. 2026"
   },
   "mlx-ar": {
    "engine": "mlx",
@@ -637,7 +637,7 @@
   "eval-S": {
    "class": "S",
    "sampling": "greedy",
-   "blocks": 5,
+   "blocks": 3,
    "configs": [
     "sar-ar",
     "sar-mtp",
@@ -653,7 +653,62 @@
     "mlx-ar",
     "mlx-mtp",
     "mlx-dflash"
-   ]
+   ],
+   "prompt_sets": [
+    [
+     "chat-1",
+     "chat-2",
+     "chat-3",
+     "chat-4",
+     "chat-5",
+     "chat-6",
+     "code4k-1",
+     "code4k-2",
+     "code4k-3",
+     "prose4k-1",
+     "prose4k-2",
+     "prose4k-3"
+    ],
+    [
+     "chat-7",
+     "chat-8",
+     "chat-9",
+     "chat-10",
+     "chat-11",
+     "chat-12",
+     "code4k-4",
+     "code4k-5",
+     "code4k-6",
+     "prose4k-4",
+     "prose4k-5",
+     "prose4k-6"
+    ],
+    [
+     "chat-13",
+     "chat-14",
+     "chat-15",
+     "chat-16",
+     "chat-17",
+     "chat-18",
+     "code4k-7",
+     "code4k-8",
+     "code4k-9",
+     "prose4k-7",
+     "prose4k-8",
+     "prose4k-9"
+    ]
+   ],
+   "ttft_repeats": {
+    "configs": [
+     "sar-ar",
+     "llq40-ar",
+     "llkm-ar",
+     "mlx-ar",
+     "llmd-ar"
+    ],
+    "n": 2,
+    "max_tokens": 8
+   }
   },
   "eval-M": {
    "class": "M",
@@ -710,6 +765,21 @@
     "llmd-native-s",
     "mlx-ar"
    ]
+  },
+  "eval-L-mlx": {
+   "class": "L",
+   "sampling": "greedy",
+   "blocks": 1,
+   "configs": [
+    "sar-ar",
+    "sar-mtp",
+    "sar-dflash",
+    "mlx-ar"
+   ]
   }
- }
+ },
+ "cooldown_mode": "fixed",
+ "cooldown_target_gpu_c": 45,
+ "busy_wait_max_s": 300,
+ "busy_gpu_ratio": 0.2
 }
