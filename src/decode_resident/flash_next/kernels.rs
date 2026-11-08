@@ -379,6 +379,20 @@ kernel void flash_next_rms_norm_rope_f32(
     out[start + tid] = result;
 }
 
+// Entrée MTP : `out[s, d] = fh[s, d] + fe[d]`, `fc_embedding·e` diffusé sur
+// les flux. dims = (largeur hc, hidden).
+kernel void flash_next_mtp_add_streams_f32(
+    device const float* fh [[buffer(0)]],
+    device const float* fe [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint2& dims [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < dims.x) {
+        out[i] = fh[i] + fe[i % dims.y];
+    }
+}
+
 // QSA creuse — scores des blocs complets : `s_b = Σ_h ReLU(q_h·k̄_b)/√d + 0`
 // (zéros signés normalisés). Un simdgroup par bloc, 8 blocs par threadgroup.
 // dims = (têtes, d, blocs complets, 0).
@@ -575,6 +589,7 @@ pub(crate) struct FlashNextKernels {
     pub(super) ple_gather: ComputePipelineState,
     pub(super) ple_gate: ComputePipelineState,
     pub(super) ple_conv_add: ComputePipelineState,
+    pub(super) mtp_add_streams: ComputePipelineState,
     /// Oracles : copie d'indices u32 (routage GPU par couche).
     #[cfg(test)]
     pub(super) copy_u32: ComputePipelineState,
@@ -605,6 +620,7 @@ impl FlashNextKernels {
                 "flash_next_ple_gather_f32",
                 "flash_next_ple_gate_f32",
                 "flash_next_ple_conv_add_f32",
+                "flash_next_mtp_add_streams_f32",
             ],
             false,
         )?
@@ -637,6 +653,7 @@ impl FlashNextKernels {
             ple_gather: next()?,
             ple_gate: next()?,
             ple_conv_add: next()?,
+            mtp_add_streams: next()?,
             #[cfg(test)]
             copy_u32: compile_kernels(device, TEST_SOURCE, &["flash_next_copy_u32"], false)?
                 .pop()

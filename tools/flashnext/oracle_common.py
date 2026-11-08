@@ -194,16 +194,18 @@ def text_config(qdir):
     return tc
 
 
-def build_layer(tc, index, weights, with_experts=True):
+def build_layer(tc, index, weights, with_experts=True, prefix=None):
     """Couche officielle `Qwen4ExpTextDecoderLayer` sur les poids q4e8, experts f32
-    dans le module officiel `Qwen4ExpTextExperts` (MoE non réimplémenté)."""
+    dans le module officiel `Qwen4ExpTextExperts` (MoE non réimplémenté). `index`
+    fixe le type de couche ; `prefix` choisit les poids (tronc par défaut, ou
+    `mtp.layers.0.` pour la couche MTP)."""
     with torch.device("meta"):
         layer = M.Qwen4ExpTextDecoderLayer(tc, index)
     layer.mlp.experts = torch.nn.Identity()
     if layer.ple is not None:
         layer.ple.ple_embedding.ngram_embedding = torch.nn.Identity()
     layer = layer.to_empty(device="cpu")
-    prefix = f"model.language_model.layers.{index}."
+    prefix = prefix or f"model.language_model.layers.{index}."
     state = {}
     for key, param in layer.state_dict().items():
         if key.split(".")[-1] in ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets"):

@@ -17,6 +17,7 @@ mod ple;
 #[cfg(feature = "devtools")]
 mod profile;
 mod session;
+mod speculative;
 mod weights;
 
 #[cfg(test)]

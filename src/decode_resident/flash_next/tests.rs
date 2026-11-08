@@ -53,24 +53,47 @@ fn u8_weight(
     cols: usize,
     scale: f32,
 ) -> Result<(MetalLinearWeightBuffers, Tensor)> {
-    let dense = Tensor::from_vec(vec![rows, cols], rng.fill(rows * cols, -scale, scale))?;
-    let raw = AffineQuantizedTensor::quantize(&dense, 64, 8)?;
-    // Échelles et biais bf16, comme dans le checkpoint : le GPU les lit en bf16.
-    let bf16 = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| bf16_round_f32(*x)).collect() };
-    let quantized = AffineQuantizedTensor::new(
-        raw.packed_shape(),
-        raw.packed_data().to_vec(),
-        Tensor::from_vec(raw.scales_shape().to_vec(), bf16(&raw.scales_f32()))?,
-        Tensor::from_vec(raw.biases_shape().to_vec(), bf16(&raw.biases_f32()))?,
-        64,
-        8,
-    )?;
+    affine_weight(executor, rng, rows, cols, scale, 8)
+}
+
+/// Poids affine gs64 de `bits` bits, échelles et biais arrondis en bf16.
+fn affine_weight(
+    executor: &MetalExecutor,
+    rng: &mut DeterministicF32,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+    bits: usize,
+) -> Result<(MetalLinearWeightBuffers, Tensor)> {
+    let quantized = affine_quantized(rng, rows, cols, scale, bits)?;
     let reference = quantized.dequantize()?;
     let gpu = executor.resolve_linear_weight_buffers(
         &LinearWeight::AffineQuantized(quantized),
         "flash_next_hc_test",
     )?;
     Ok((gpu, reference))
+}
+
+/// Poids affine gs64 aléatoire, échelles et biais arrondis en bf16.
+fn affine_quantized(
+    rng: &mut DeterministicF32,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+    bits: usize,
+) -> Result<AffineQuantizedTensor> {
+    let dense = Tensor::from_vec(vec![rows, cols], rng.fill(rows * cols, -scale, scale))?;
+    let raw = AffineQuantizedTensor::quantize(&dense, 64, bits)?;
+    // Échelles et biais bf16, comme dans le checkpoint : le GPU les lit en bf16.
+    let bf16 = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| bf16_round_f32(*x)).collect() };
+    AffineQuantizedTensor::new(
+        raw.packed_shape(),
+        raw.packed_data().to_vec(),
+        Tensor::from_vec(raw.scales_shape().to_vec(), bf16(&raw.scales_f32()))?,
+        Tensor::from_vec(raw.biases_shape().to_vec(), bf16(&raw.biases_f32()))?,
+        64,
+        bits,
+    )
 }
 
 /// Hyper-connection aux dimensions réelles (4 flux × 2560, rang 320) : entrée
@@ -267,7 +290,16 @@ fn flash_next_ple_steps_match_cpu_sequence_and_reset() -> Result<()> {
         let command_buffer = queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         encode_ple(
-            &kernels, &executor, encoder, &weights, state, &scratch, dims, &h, &out,
+            &kernels,
+            &executor,
+            encoder,
+            &weights,
+            state,
+            &state.bytes.clone(),
+            &scratch,
+            dims,
+            &h,
+            &out,
         )?;
         encoder.end_encoding();
         commit_and_wait(command_buffer)?;
@@ -315,6 +347,8 @@ fn flash_next_qsa_dense_steps_match_cpu_sequence() -> Result<()> {
         rotary_dim: 64,
         eps: 1.0e-6,
         dense_max: dense_max_visible(2048, 4),
+        query_offset: 0,
+        index_query_offset: 0,
     };
     let (tokens, q_dim, kv_dim) = (oracle_steps(40), 24 * 256, 2 * 256);
     let mut rng = DeterministicF32::new(0x05a0_0024);
@@ -1476,6 +1510,52 @@ fn n2_resident_decode_matches_cpu_reference() {
     assert!(native_finite, "passe native : valeur non finie");
 }
 
+/// Empreinte au bit près du decode résident, pour prouver qu'un refactor ne
+/// change aucun bit : rejoue 2048 tokens du golden N2 sans tête, puis écrit, pour
+/// 8 pas (dont les derniers en régime QSA creux), l'argmax, les logits et les
+/// résiduels hc de chaque couche dans `SARAGOSSA_FLASH_NEXT_BITS_OUT`. Deux
+/// binaires (avant / après) doivent produire des fichiers identiques.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR, SARAGOSSA_QWEN4EXP_GOLDEN, SARAGOSSA_FLASH_NEXT_BITS_OUT"]
+fn flash_next_step_bits_dump() {
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    use std::io::Write;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let out = std::env::var_os("SARAGOSSA_FLASH_NEXT_BITS_OUT")
+        .expect("SARAGOSSA_FLASH_NEXT_BITS_OUT requis");
+    let (context, steps) = (2048, 8);
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        context + steps,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    for &token in &ids[..context] {
+        session.replay(token).expect("invariant: rejeu");
+    }
+    let mut file = std::fs::File::create(&out).expect("invariant: fichier de sortie");
+    for &token in &ids[context..context + steps] {
+        let step = session.step(token, true, true).expect("invariant: pas");
+        file.write_all(&step.argmax.to_le_bytes())
+            .expect("invariant: écriture");
+        let values = step
+            .logits
+            .into_iter()
+            .flatten()
+            .chain(step.layers.into_iter().flatten().flatten());
+        for v in values {
+            file.write_all(&v.to_le_bytes())
+                .expect("invariant: écriture");
+        }
+    }
+    eprintln!("empreinte écrite : {} pas après {context} tokens", steps);
+}
+
 /// Débit AR résident : `SARAGOSSA_FLASH_NEXT_BENCH_RUNS` répétitions (3 par
 /// défaut) d'un contexte de 1024 tokens (texte du golden, reset entre les
 /// répétitions) puis de 256 pas gloutons chronométrés. Publie, par
@@ -1904,13 +1984,408 @@ fn profile_resident_decode_after_1k_context() {
     eprintln!("profil après {context} tokens, {generated} pas : {wall:.2} ms/pas mural (profilé), GPU {gpu:.2} ms, {dispatches:.0} dispatches/pas");
     for row in rows {
         eprintln!(
-            "  {:24} {:7.3} ms/pas  {:5.1} %  {:5.1} encodeurs/pas",
+            "  {:24} {:7.3} ms/pas  {:5.1} %  {:5.1} encodeurs/pas  {:6.0} dispatches/pas",
             row.brick.label(),
             row.ms_per_step,
             100.0 * row.ms_per_step / gpu,
-            row.encoders_per_step
+            row.encoders_per_step,
+            row.dispatches_per_step
         );
     }
+    profile_rows_rest(&session).expect("invariant: profil du reste");
+    profile_rows_deltanet_moe(&session).expect("invariant: profil DeltaNet et MoE");
+}
+
+/// Étape 6 D, mesures in situ sur les vrais poids (toutes les couches, donc
+/// lues depuis la DRAM), en vérification greedy stricte : couche DeltaNet
+/// entière contre ses matmuls en R lignes (reste in situ = scan, conv, normes,
+/// portes), et MoE entier en R lignes par le kernel existant contre le MoE
+/// mono, avec l'exactitude au bit de chaque ligne. Chauffe, puis minimum de 3.
+/// Les états DeltaNet avancent : la session n'est plus utilisable ensuite.
+#[cfg(feature = "devtools")]
+fn profile_rows_deltanet_moe(session: &FlashNextSession) -> Result<()> {
+    use crate::metal_backend::{
+        install_verify_greedy_scope, with_verify_strict_override,
+        MetalLinearAttnResidentPairWeights,
+    };
+    let (executor, _, _, hidden) = session.head_parts();
+    let parts = session.deltanet_and_moe();
+    let queue = executor.device().new_command_queue();
+    let best_of = |encode: &dyn Fn(
+        &metal::ComputeCommandEncoderRef,
+        &mut Vec<Buffer>,
+    ) -> Result<()>|
+     -> Result<f64> {
+        let mut best = f64::INFINITY;
+        for round in 0..4 {
+            let mut owned = Vec::new();
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encode(encoder, &mut owned)?;
+            encoder.end_encoding();
+            let started = std::time::Instant::now();
+            commit_and_wait(command_buffer)?;
+            if round > 0 {
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+        }
+        Ok(best)
+    };
+    // Comparaison publiée en trois classes : identique au bit, identique au
+    // signe des zéros près, différente.
+    #[derive(Default)]
+    struct Exactness {
+        bits: usize,
+        signed_zero: usize,
+        different: usize,
+    }
+    impl Exactness {
+        fn add(&mut self, a: &[f32], b: &[f32]) {
+            let same = |zero: bool| {
+                a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.to_bits() == y.to_bits() || (zero && *x == 0.0 && *y == 0.0))
+            };
+            if same(false) {
+                self.bits += 1;
+            } else if same(true) {
+                self.signed_zero += 1;
+            } else {
+                self.different += 1;
+            }
+        }
+        fn report(&self) -> String {
+            format!(
+                "{} identiques au bit, {} au signe des zéros près, {} différentes",
+                self.bits, self.signed_zero, self.different
+            )
+        }
+    }
+    let value_dim = parts.dims.value_dim;
+    let mut rng = DeterministicF32::new(0x6f);
+    let x_host = rng.fill(4 * hidden, -1.0, 1.0);
+    let v_host = rng.fill(4 * value_dim, -1.0, 1.0);
+    let x = buffer(executor, &x_host);
+    let v = buffer(executor, &v_host);
+    let x_rows: Vec<_> = (0..4)
+        .map(|r| buffer(executor, &x_host[r * hidden..(r + 1) * hidden]))
+        .collect();
+    let v_rows: Vec<_> = (0..4)
+        .map(|r| buffer(executor, &v_host[r * value_dim..(r + 1) * value_dim]))
+        .collect();
+    // Matmuls d'une couche DeltaNet par leurs poids séparés : (poids, entrée en
+    // lignes, entrées par ligne, dimension d'entrée).
+    fn projections(
+        w: &crate::metal_backend::MetalLinearAttnResidentDenseWeights,
+    ) -> Vec<(&MetalLinearWeightBuffers, bool)> {
+        let mut list = Vec::new();
+        for pair in [&w.qkv_z, &w.beta_gate] {
+            match pair {
+                MetalLinearAttnResidentPairWeights::Concat(weight) => list.push((weight, true)),
+                MetalLinearAttnResidentPairWeights::Split { first, second } => {
+                    list.push((first, true));
+                    list.push((second, true));
+                }
+            }
+        }
+        list.push((&w.out_proj, false));
+        list
+    }
+    let max_out = 4 * (parts.dims.conv_dim + 2 * value_dim + hidden);
+    let out = zeros(executor, max_out);
+    let _greedy = install_verify_greedy_scope(true);
+    with_verify_strict_override(true, || -> Result<()> {
+        let layer_out = zeros(executor, hidden);
+        let t_dn = best_of(&|encoder, _| {
+            for (weights, state) in &parts.linear {
+                executor.encode_linear_attn_resident_dense_buffers(
+                    encoder, &x_rows[0], None, &layer_out, weights, state, parts.spec, parts.dims,
+                )?;
+            }
+            Ok(())
+        })?;
+        let mut line = format!(
+            "DeltaNet in situ ({} couches) : couche entière {:.3} ms",
+            parts.linear.len(),
+            t_dn * 1e3
+        );
+        let mut mono = 0.0;
+        for rows in 1..=4 {
+            let t = best_of(&|encoder, _| {
+                for (weights, _) in &parts.linear {
+                    for (weight, on_x) in projections(weights) {
+                        let (input, in_dim) = if on_x { (&x, hidden) } else { (&v, value_dim) };
+                        executor
+                            .encode_matmul_weight_buffers(
+                                encoder, input, rows, in_dim, weight, &out, true,
+                            )
+                            .map(|_| ())?;
+                    }
+                }
+                Ok(())
+            })?;
+            if rows == 1 {
+                mono = t;
+                line += &format!(
+                    " ; matmuls R1 {:.3} ms, reste in situ {:.3} ms",
+                    t * 1e3,
+                    (t_dn - t) * 1e3
+                );
+            } else {
+                line += &format!(" ; matmuls R{rows} {:.3} ms (ρ {:.2})", t * 1e3, t / mono);
+            }
+        }
+        // Exactitude des projections de toutes les couches, R = 2..4 : chaque
+        // ligne contre son matmul mono.
+        let mut exact = Exactness::default();
+        for (weights, _) in &parts.linear {
+            for (weight, on_x) in projections(weights) {
+                let (input, rows_in, in_dim) = if on_x {
+                    (&x, &x_rows, hidden)
+                } else {
+                    (&v, &v_rows, value_dim)
+                };
+                for rows in 2..=4 {
+                    let command_buffer = queue.new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    let out_dim = executor.encode_matmul_weight_buffers(
+                        encoder, input, rows, in_dim, weight, &out, true,
+                    )?;
+                    let singles: Vec<_> = (0..rows).map(|_| zeros(executor, out_dim)).collect();
+                    for (row, single) in rows_in.iter().zip(&singles) {
+                        executor.encode_matmul_weight_buffers(
+                            encoder, row, 1, in_dim, weight, single, true,
+                        )?;
+                    }
+                    encoder.end_encoding();
+                    commit_and_wait(command_buffer)?;
+                    let all = read_f32_buffer(&out, rows * out_dim)?;
+                    for (r, single) in singles.iter().enumerate() {
+                        exact.add(
+                            &read_f32_buffer(single, out_dim)?,
+                            &all[r * out_dim..(r + 1) * out_dim],
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{line} ; lignes (toutes couches, R = 2..4) : {}",
+            exact.report()
+        );
+
+        // MoE : mono (chemin du pas) puis lignes (kernel de vérification).
+        let moe_out = zeros(executor, 4 * hidden);
+        let residual = zeros(executor, 4 * hidden);
+        let t_moe = best_of(&|encoder, owned| {
+            for weights in &parts.moe {
+                executor.encode_moe_shared_buffers(
+                    encoder,
+                    owned,
+                    &x_rows[0],
+                    None,
+                    &moe_out,
+                    hidden,
+                    weights,
+                    parts.top_k,
+                )?;
+            }
+            Ok(())
+        })?;
+        let mut line = format!(
+            "MoE in situ ({} couches) : mono {:.3} ms",
+            parts.moe.len(),
+            t_moe * 1e3
+        );
+        for rows in 2..=4 {
+            let t = best_of(&|encoder, owned| {
+                for weights in &parts.moe {
+                    executor.encode_moe_shared_buffers_verify_rows(
+                        encoder,
+                        owned,
+                        &x,
+                        &residual,
+                        &moe_out,
+                        rows,
+                        hidden,
+                        weights,
+                        parts.top_k,
+                    )?;
+                }
+                Ok(())
+            })?;
+            line += &format!(" ; R{rows} {:.3} ms (ρ {:.2})", t * 1e3, t / t_moe);
+        }
+        // Exactitude, R = 2..4, couche par couche : chaque ligne contre le MoE
+        // mono du pas (sans résiduel, comme en decode).
+        let mut exact = Exactness::default();
+        for weights in &parts.moe {
+            for rows in 2..=4 {
+                let mut owned = Vec::new();
+                let singles: Vec<_> = (0..rows).map(|_| zeros(executor, hidden)).collect();
+                let command_buffer = queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                executor.encode_moe_shared_buffers_verify_rows(
+                    encoder,
+                    &mut owned,
+                    &x,
+                    &residual,
+                    &moe_out,
+                    rows,
+                    hidden,
+                    weights,
+                    parts.top_k,
+                )?;
+                for (row, single) in x_rows.iter().zip(&singles) {
+                    executor.encode_moe_shared_buffers(
+                        encoder,
+                        &mut owned,
+                        row,
+                        None,
+                        single,
+                        hidden,
+                        weights,
+                        parts.top_k,
+                    )?;
+                }
+                encoder.end_encoding();
+                commit_and_wait(command_buffer)?;
+                let all = read_f32_buffer(&moe_out, rows * hidden)?;
+                for (r, single) in singles.iter().enumerate() {
+                    exact.add(
+                        &read_f32_buffer(single, hidden)?,
+                        &all[r * hidden..(r + 1) * hidden],
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "{line} ; lignes ({} couches, R = 2..4) : {}",
+            parts.moe.len(),
+            exact.report()
+        );
+        Ok(())
+    })
+}
+
+/// Étape 6 D, reste du pas hors matmuls : latence d'un dispatch suivi d'une
+/// barrière (part amortie par un kernel en lignes, qui garde un dispatch pour
+/// R lignes), et argmax de tête en lignes sur le vrai lm_head u6, contre R
+/// argmax mono (ρ et égalité des indices). Chaque mesure : chauffe, puis
+/// minimum de 3 command buffers.
+#[cfg(feature = "devtools")]
+fn profile_rows_rest(session: &FlashNextSession) -> Result<()> {
+    let (executor, kernels, lm_head, hidden) = session.head_parts();
+    let queue = executor.device().new_command_queue();
+    let best_of = |encode: &dyn Fn(&metal::ComputeCommandEncoderRef) -> Result<()>| -> Result<f64> {
+        let mut best = f64::INFINITY;
+        for round in 0..4 {
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encode(encoder)?;
+            encoder.end_encoding();
+            let started = std::time::Instant::now();
+            commit_and_wait(command_buffer)?;
+            if round > 0 {
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+        }
+        Ok(best)
+    };
+    // Latence d'un petit dispatch (copie de 1 à 10 240 mots) et de sa barrière.
+    let source = zeros(executor, 4 * 10_240);
+    let target = zeros(executor, 4 * 10_240);
+    let count = 2000;
+    for len in [1_usize, 10_240, 4 * 10_240] {
+        let elapsed = best_of(&|encoder| {
+            for _ in 0..count {
+                encoder.set_compute_pipeline_state(&kernels.copy_u32);
+                encoder.set_buffer(0, Some(&source), 0);
+                encoder.set_buffer(1, Some(&target), 0);
+                super::set_value(encoder, 2, &[len as u32, 0]);
+                super::dispatch_1d(encoder, len);
+                crate::metal_backend::post_dispatch_barrier(encoder);
+            }
+            Ok(())
+        })?;
+        eprintln!(
+            "dispatch + barrière, copie de {len} mots : {:.2} µs",
+            elapsed * 1e6 / count as f64
+        );
+    }
+    // Argmax de tête : R mono contre une passe en lignes.
+    let mut rng = DeterministicF32::new(0x6e);
+    let input = buffer(executor, &rng.fill(4 * hidden, -1.0, 1.0));
+    let rows_in: Vec<_> = (0..4)
+        .map(|r| -> Result<Buffer> {
+            let row = zeros(executor, hidden);
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            executor.encode_copy_with_offsets(
+                encoder,
+                &input,
+                (r * hidden * 4) as u64,
+                &row,
+                0,
+                hidden,
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command_buffer)?;
+            Ok(row)
+        })
+        .collect::<Result<_>>()?;
+    let indices = zeros(executor, 4);
+    let singles: Vec<_> = (0..4).map(|_| zeros(executor, 1)).collect();
+    let mono = best_of(&|encoder| {
+        let mut owned = Vec::new();
+        executor.encode_lm_head_argmax_buffers(
+            encoder,
+            &mut owned,
+            &rows_in[0],
+            lm_head,
+            &singles[0],
+            hidden,
+        )
+    })?;
+    let mut line = format!("argmax de tête (u6 réel) : mono {:.2} ms", mono * 1e3);
+    for rows in 2..=4 {
+        let batched = best_of(&|encoder| {
+            executor.encode_lm_head_argmax_rows_buffers(
+                encoder, &input, lm_head, &indices, 0, 0, rows, hidden,
+            )
+        })?;
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let mut owned = Vec::new();
+        for r in 0..rows {
+            executor.encode_lm_head_argmax_buffers(
+                encoder,
+                &mut owned,
+                &rows_in[r],
+                lm_head,
+                &singles[r],
+                hidden,
+            )?;
+        }
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        let all = crate::metal_backend::read_u32_buffer(&indices, rows)?;
+        let mut same = true;
+        for (r, single) in singles.iter().take(rows).enumerate() {
+            same &= crate::metal_backend::read_u32_buffer(single, 1)?[0] == all[r];
+        }
+        line += &format!(
+            " ; R{rows} ρ {:.2}{}",
+            batched / mono,
+            if same {
+                " mêmes indices"
+            } else {
+                " indices DIFFÉRENTS"
+            }
+        );
+    }
+    eprintln!("{line}");
+    Ok(())
 }
 
 /// Micro-bench des morceaux d'une hyper-connection aux formes réelles
@@ -2157,6 +2632,8 @@ fn flash_next_qsa_sparse_steps_match_cpu_sequence() -> Result<()> {
         rotary_dim: 64,
         eps: 1.0e-6,
         dense_max: dense_max_visible(budget, compress),
+        query_offset: 0,
+        index_query_offset: 0,
     };
     let (q_dim, kv_dim, ihd, iheads) = (4 * 128, 2 * 128, 128, 4);
     let mut rng = DeterministicF32::new(0x5a_9e5e);
@@ -2520,6 +2997,70 @@ fn bench_resident_decode_after_32k_context() {
     );
 }
 
+/// Troncature de l'historique MTP : un dépassement d'historique est signalé
+/// avant l'absence d'instantané ; une copie de restauration des clés brutes en
+/// échec invalide la session (longueur déjà réduite) : troncature, même à
+/// longueur inchangée, instantané, pas MTP et pas du tronc sont refusés jusqu'à
+/// un `reset`, qui la réhabilite.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR"]
+fn mtp_failed_raw_restore_poisons_session() {
+    use super::session::MtpInput;
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        64,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    let h = vec![0.0; session.hc_width()];
+    let append = |session: &mut FlashNextSession, count: usize| {
+        for token in 0..count {
+            session
+                .mtp_step(MtpInput::Host(&h), token + 1, false, false)
+                .expect("invariant: pas MTP");
+        }
+    };
+    // 6 lignes : bloc en cours non vide (compress = 4), la troncature à 6
+    // exige donc la restauration, où l'échec est injecté.
+    append(&mut session, 6);
+    session.mtp_snapshot_raw().expect("invariant: instantané");
+    append(&mut session, 2);
+    let overflow = session.mtp_truncate(9).expect_err("invariant: dépassement");
+    assert!(overflow.to_string().contains("au-delà"), "{overflow}");
+    session.fail_mtp_raw_restore = true;
+    let failed = session
+        .mtp_truncate(6)
+        .expect_err("invariant: échec injecté");
+    session.fail_mtp_raw_restore = false;
+    assert!(failed.to_string().contains("injecté"), "{failed}");
+    assert_eq!(
+        session.mtp_rows(),
+        Some(6),
+        "longueur réduite avant la copie"
+    );
+    assert!(
+        session.mtp_truncate(6).is_err(),
+        "troncature à longueur inchangée"
+    );
+    assert!(session.mtp_snapshot_raw().is_err(), "instantané");
+    assert!(
+        session
+            .mtp_step(MtpInput::Host(&h), 1, false, false)
+            .is_err(),
+        "pas MTP"
+    );
+    assert!(session.step(1, false, false).is_err(), "pas du tronc");
+    session.reset().expect("invariant: reset");
+    session
+        .step(1, false, false)
+        .expect("invariant: pas après reset");
+    assert_eq!(session.mtp_rows(), Some(0), "historique MTP remis à zéro");
+}
+
 /// Capacité maximale (262 144 tokens) : la session s'ouvre sous la garde
 /// mémoire, ses allocations (états, KV f32, clés poolées, KV compact, scratch,
 /// plus le scratch du premier pas) restent sous `session_state_bytes`, et un
@@ -2546,9 +3087,39 @@ fn resident_session_allocates_max_capacity() {
     session
         .step(0, false, false)
         .expect("invariant: premier pas");
+    // Tête MTP : un pas (scratch paresseux de la couche et du lm_head).
+    if session.mtp_rows().is_some() {
+        session
+            .mtp_step(
+                super::session::MtpInput::Host(&vec![0.0; config.hc_width()]),
+                0,
+                false,
+                false,
+            )
+            .expect("invariant: premier pas MTP");
+    }
     let lazy = session.device_allocated_bytes().saturating_sub(before);
     let used = session.owned_state_bytes() + lazy;
     let budget = session_state_bytes(&config, MAX_CAPACITY);
+    // Point de reprise (MTP comprise) : accepté sous la garde du process,
+    // refusé sous un plafond inférieur à ses copies.
+    session
+        .checkpoint(Some(&crate::MemoryGuard::process()))
+        .expect("invariant: point de reprise sous la garde");
+    let tiny = crate::MemoryGuard::from_limits(
+        true,
+        crate::memory_guard::MemoryLimits {
+            static_cap: Some(1),
+            host_memory: None,
+            headroom_bytes: 0,
+            metal_cap: None,
+        },
+        std::sync::Arc::new(|| Some(0)),
+    );
+    assert!(
+        session.checkpoint(Some(&tiny)).is_err(),
+        "point de reprise accepté sous un plafond de 1 octet"
+    );
     eprintln!(
         "session {MAX_CAPACITY} tokens : {:.2} Go alloués hors poids (dont {:.1} Mo au premier pas), budget {:.2} Go",
         used as f64 / 1e9,
@@ -2639,4 +3210,1883 @@ fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
         "le témoin figé ne s'écarte plus aux positions longues"
     );
     Ok(())
+}
+
+/// Tenseur d'un golden safetensors : `(forme, octets)`.
+fn golden_tensor(path: &std::path::Path, name: &str) -> (Vec<usize>, Vec<u8>) {
+    use std::os::unix::fs::FileExt;
+    let header = crate::qwen_loader::read_shard_header(path).expect("invariant: golden lisible");
+    let entry = header
+        .tensors
+        .get(name)
+        .unwrap_or_else(|| panic!("golden sans {name}"));
+    let mut bytes = vec![0_u8; entry.data_offsets[1] - entry.data_offsets[0]];
+    std::fs::File::open(path)
+        .expect("invariant: golden")
+        .read_exact_at(&mut bytes, header.data_start + entry.data_offsets[0] as u64)
+        .expect("invariant: lecture golden");
+    (entry.shape.clone(), bytes)
+}
+
+fn golden_f32(path: &std::path::Path, name: &str) -> Vec<f32> {
+    golden_tensor(path, name)
+        .1
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn golden_i64(path: &std::path::Path, name: &str) -> Vec<usize> {
+    golden_tensor(path, name)
+        .1
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().expect("invariant: 8 octets")) as usize)
+        .collect()
+}
+
+/// Comparaison à un golden : longueurs égales et valeurs finies exigées
+/// ([`finite_relative_error`]), NaN sinon.
+fn golden_error(got: &[f32], want: &[f32]) -> f64 {
+    if got.len() != want.len() {
+        return f64::NAN;
+    }
+    finite_relative_error(got, want)
+}
+
+/// N2 de la tête MTP résidente contre la tête CPU (`qwen4_exp/mtp.rs`), sur
+/// les 4095 paires `(h_t, tok_{t+1})` de `mtp_golden.safetensors` (dont 2044
+/// en régime QSA creux, frontières 2047-2052 comprises). Chaque ligne GPU part
+/// du même `h` que le CPU : la couche est ré-ancrée par construction.
+///
+/// - Portes contre le CPU, à chaque ligne : entrée fc et sortie hc ≤ 1e-4,
+///   scores ≤ 1e-5, échanges de sélection justifiés à 2e-5, routage à la
+///   paire au seuil (marge ≤ 1e-5), valeurs finies ; logits aux positions
+///   figées : KL ≤ 1e-3, argmax renvoyé identique sauf quasi-égalité ≤ 1e-5.
+/// - Triangulation avec transformers aux positions figées : sortie hc
+///   (1e-4), scores (1e-4 relatif à `1 + |torch|`), sélection et routage
+///   justifiés par les marges torch (1e-5).
+/// - Accord du brouillon avec l'argmax du tronc (golden long) ≥ ½.
+/// - Mutations (rouges) : gains d'entrée doublés ou absents, paires
+///   décalées, flux permutés, requêtes seules décalées (attention, indexeur),
+///   historique figé, expert, bloc ; gain doublé aussi contre transformers
+///   (une erreur commune au CPU et au GPU y reste visible).
+/// - Reprise : point de reprise, drafts parasites à travers une frontière de
+///   bloc, restauration, puis continuation exacte.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn n2_resident_mtp_head_matches_cpu() {
+    use super::session::MtpInput;
+    use crate::qwen4_exp::Qwen4ExpReference;
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden_dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis"),
+    );
+    let golden = golden_dir.join("mtp_golden.safetensors");
+    let next = golden_i64(&golden, "mtp_next_ids");
+    let positions = golden_i64(&golden, "mtp_positions");
+    let h = golden_f32(&golden, "mtp_h");
+    let rows = next.len();
+    let reference =
+        Qwen4ExpReference::new(Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"));
+    let config = reference.checkpoint().config.clone();
+    let (width, vocab, keep, compress, top_k) = (
+        config.hc_width(),
+        config.vocab,
+        reference.budget_blocks(),
+        reference.compress(),
+        config.top_k,
+    );
+    let sparse_start = dense_max_visible(keep * compress, compress);
+    // Formes : 4095 paires, positions dans l'historique, frontières couvertes.
+    assert_eq!(rows, 4095, "paires MTP");
+    assert_eq!(h.len(), rows * width, "h MTP");
+    assert!(!positions.is_empty() && positions.iter().all(|&p| p < rows));
+    let shape = |name: &str| golden_tensor(&golden, name).0;
+    assert_eq!(shape("mtp_h"), vec![rows, width], "forme mtp_h");
+    assert_eq!(
+        shape("mtp_input"),
+        vec![positions.len(), width],
+        "forme mtp_input"
+    );
+    assert_eq!(
+        shape("mtp_output"),
+        vec![positions.len(), width],
+        "forme mtp_output"
+    );
+    assert_eq!(
+        shape("routing.0"),
+        vec![rows, config.top_k],
+        "forme du routage"
+    );
+    assert_eq!(
+        shape("router_logits.0"),
+        vec![rows, config.experts],
+        "forme des logits du routeur"
+    );
+    // Frontière du régime creux parmi les positions figées des logits.
+    assert!(
+        positions
+            .iter()
+            .any(|&p| p + 1 >= dense_max_visible(keep * compress, compress) && p < rows),
+        "aucune position figée en régime creux"
+    );
+    assert!(rows > sparse_start + 4, "régime creux non couvert");
+    let started = std::time::Instant::now();
+    let h_tensor = Tensor::from_vec(vec![rows, width], h.clone()).expect("invariant: forme");
+    let x = reference
+        .mtp_input(&h_tensor, &next)
+        .expect("invariant: entrée MTP CPU");
+    let cpu = reference
+        .mtp_layer(&x, None, None)
+        .expect("invariant: couche MTP CPU");
+    let trace = cpu.qsa.as_ref().expect("invariant: trace QSA");
+    let picked: Vec<f32> = positions
+        .iter()
+        .flat_map(|&p| {
+            cpu.hidden.data()[p * width..(p + 1) * width]
+                .iter()
+                .copied()
+        })
+        .collect();
+    let cpu_logits = reference
+        .logits(
+            &reference
+                .mtp_head(
+                    &Tensor::from_vec(vec![positions.len(), width], picked)
+                        .expect("invariant: lignes"),
+                )
+                .expect("invariant: mixer MTP"),
+        )
+        .expect("invariant: logits MTP CPU");
+    eprintln!(
+        "référence CPU MTP : {rows} paires en {:.0} s",
+        started.elapsed().as_secs_f64()
+    );
+    let cpu_row = |j: usize| &cpu.hidden.data()[j * width..(j + 1) * width];
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        rows,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+
+    // Passe native, une ligne d'historique par paire.
+    let (mut in_err, mut out_err, mut score_err, mut kl_max) = (0.0_f64, 0.0, 0.0, 0.0_f64);
+    let (mut sel_swaps, mut sel_bad, mut route_swaps, mut route_bad, mut argmax_bad) =
+        (0, 0, 0, 0, 0);
+    let (mut gpu_out, mut gpu_in, mut gpu_routing, mut gpu_qsa, mut drafts) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for j in 0..rows {
+        let at = positions.iter().position(|&p| p == j);
+        let step = session
+            .mtp_step(
+                MtpInput::Host(&h[j * width..(j + 1) * width]),
+                next[j],
+                at.is_some(),
+                true,
+            )
+            .expect("invariant: pas MTP");
+        in_err = nan_max(
+            in_err,
+            golden_error(&step.input, &x.data()[j * width..(j + 1) * width]),
+        );
+        let hidden = step.hidden.expect("invariant: sortie hc");
+        out_err = nan_max(out_err, golden_error(&hidden, cpu_row(j)));
+        let mut routing: Vec<usize> = step
+            .routing
+            .expect("invariant: routage")
+            .into_iter()
+            .map(|e| e as usize)
+            .collect();
+        routing.sort_unstable();
+        if routing != cpu.routing[j] {
+            route_swaps += 1;
+            let (kth, next_e) = cpu.routing_boundary[j];
+            let pair = routing
+                .iter()
+                .filter(|e| !cpu.routing[j].contains(e))
+                .eq([&next_e])
+                && cpu.routing[j]
+                    .iter()
+                    .filter(|e| !routing.contains(e))
+                    .eq([&kth]);
+            if !(pair && cpu.routing_margins[j] <= ANCHORED_TIE) {
+                route_bad += 1;
+            }
+        }
+        let qsa = step.qsa.map(|(blocks, scores)| {
+            let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b as usize).collect();
+            blocks.sort_unstable();
+            (blocks, scores)
+        });
+        match &qsa {
+            Some((blocks, scores)) => {
+                score_err = nan_max(score_err, score_error(scores, &trace.scores[j], keep));
+                let want = trace_blocks(trace, j, keep, compress).unwrap_or_default();
+                if *blocks != want {
+                    sel_swaps += 1;
+                    if !swap_justified(&trace.scores[j], &want, blocks, keep, ANCHORED_SWAP_TIE) {
+                        sel_bad += 1;
+                    }
+                }
+            }
+            None if trace.scores[j].len() > keep => sel_bad += 1,
+            None => {}
+        }
+        if let Some(i) = at {
+            let got = step.logits.expect("invariant: logits");
+            let want = &cpu_logits.data()[i * vocab..(i + 1) * vocab];
+            let kl = if got.len() == vocab && got.iter().all(|v| v.is_finite()) {
+                kl_logits(want, &got)
+            } else {
+                f64::NAN
+            };
+            kl_max = nan_max(kl_max, kl);
+            let top = want
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+                .map(|(t, _)| t)
+                .expect("invariant: vocabulaire");
+            let gpu_top = step.argmax as usize;
+            if gpu_top != top {
+                let max = want[top];
+                let sum: f64 = want.iter().map(|&v| f64::from(v - max).exp()).sum();
+                let gap = (1.0 - f64::from(want[gpu_top] - max).exp()) / sum;
+                if !within(gap, 1.0e-5) {
+                    argmax_bad += 1;
+                }
+            }
+            gpu_out.extend_from_slice(&hidden);
+            gpu_in.extend_from_slice(&step.input);
+            gpu_routing.push(routing);
+            gpu_qsa.push(qsa);
+            drafts.push(gpu_top);
+        }
+    }
+
+    // Triangulation avec transformers aux positions figées.
+    let torch_err = golden_error(&gpu_out, &golden_f32(&golden, "mtp_output"));
+    let torch_in_err = golden_error(&gpu_in, &golden_f32(&golden, "mtp_input"));
+    let torch_ids = golden_i64(&golden, "routing.0");
+    let torch_logits = golden_f32(&golden, "router_logits.0");
+    let experts = config.experts;
+    let torch_scores = {
+        let flat = golden_f32(&golden, "qsa_scores.0");
+        let offsets = golden_i64(&golden, "qsa_offsets.0");
+        offsets
+            .windows(2)
+            .map(|w| flat[w[0]..w[1]].to_vec())
+            .collect::<Vec<_>>()
+    };
+    let (mask_shape, mask) = golden_tensor(&golden, "qsa_mask.0");
+    assert_eq!(mask_shape, vec![rows, rows], "masque torch");
+    let (mut torch_route_bad, mut torch_sel_bad, mut torch_score_err) = (0, 0, 0.0_f64);
+    for (i, &p) in positions.iter().enumerate() {
+        // Routage : écart justifié par la marge de probabilité torch au seuil.
+        let logits_p = &torch_logits[p * experts..(p + 1) * experts];
+        let max = logits_p.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp: Vec<f32> = logits_p.iter().map(|v| (v - max).exp()).collect();
+        let sum: f32 = exp.iter().sum();
+        let probs: Vec<f32> = exp.iter().map(|v| v / sum).collect();
+        let mut torch_set: Vec<usize> = torch_ids[p * top_k..(p + 1) * top_k].to_vec();
+        torch_set.sort_unstable();
+        if gpu_routing[i] != torch_set {
+            // Chaque expert échangé doit être au seuil torch du top-k.
+            let mut sorted = probs.clone();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let threshold = sorted[top_k - 1];
+            let swapped = gpu_routing[i]
+                .iter()
+                .filter(|e| !torch_set.contains(e))
+                .chain(torch_set.iter().filter(|e| !gpu_routing[i].contains(e)));
+            if !swapped.into_iter().all(|&e| {
+                within(probs[e] - threshold, 1.0e-5) && within(threshold - probs[e], 1.0e-5)
+            }) {
+                torch_route_bad += 1;
+            }
+        }
+        // Scores et sélection de l'indexeur contre torch.
+        if let Some((blocks, scores)) = &gpu_qsa[i] {
+            let ts = &torch_scores[p];
+            if ts.len() != scores.len() {
+                torch_score_err = f64::NAN;
+            }
+            for (g, t) in scores.iter().zip(ts) {
+                torch_score_err =
+                    nan_max(torch_score_err, f64::from((g - t).abs() / (1.0 + t.abs())));
+            }
+            let torch_blocks: Vec<usize> = (0..ts.len())
+                .filter(|&b| mask[p * rows + b * compress] != 0)
+                .collect();
+            if *blocks != torch_blocks && !swap_justified(ts, &torch_blocks, blocks, keep, 1.0e-5) {
+                torch_sel_bad += 1;
+            }
+        }
+    }
+    // Accord du brouillon (ligne p, prédit tok_{p+2}) avec l'argmax du tronc.
+    let long = golden_dir.join("long.safetensors");
+    let trunk_positions = golden_i64(&long, "logit_positions");
+    let trunk = golden_f32(&long, "logits");
+    let (mut agree, mut denominator) = (0, 0);
+    for (i, &p) in positions.iter().enumerate() {
+        if let Some(k) = trunk_positions.iter().position(|&t| t == p + 1) {
+            denominator += 1;
+            let row = &trunk[k * vocab..(k + 1) * vocab];
+            let top = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+                .map(|(t, _)| t)
+                .expect("invariant: vocabulaire");
+            agree += usize::from(drafts[i] == top);
+        }
+    }
+    eprintln!(
+        "MTP résidente : entrée {in_err:.2e}, sortie {out_err:.2e}, scores {score_err:.2e}, \
+         sélections ≠ {sel_swaps} (injustifiées {sel_bad}), routages ≠ {route_swaps} \
+         (injustifiés {route_bad}), KL max {kl_max:.2e}, argmax injustifiés {argmax_bad} ; \
+         transformers : entrée {torch_in_err:.2e}, sortie {torch_err:.2e}, scores {torch_score_err:.2e}, routages \
+         injustifiés {torch_route_bad}, sélections injustifiées {torch_sel_bad} ; accord avec \
+         le tronc {agree}/{denominator}"
+    );
+    let green = within(in_err, ANCHORED_OUTPUT_TOL)
+        && within(out_err, ANCHORED_OUTPUT_TOL)
+        && within(score_err, f64::from(ANCHORED_TIE))
+        && within(kl_max, 1.0e-3)
+        && within(torch_err, ANCHORED_OUTPUT_TOL)
+        && within(torch_in_err, ANCHORED_OUTPUT_TOL)
+        && within(torch_score_err, 1.0e-4)
+        && sel_bad == 0
+        && route_bad == 0
+        && argmax_bad == 0
+        && torch_route_bad == 0
+        && torch_sel_bad == 0
+        && denominator > 0
+        && 2 * agree >= denominator;
+
+    // Mutations, sur la même session remise à zéro : `hook(session, j)` avant
+    // chaque pas, entrée `(h_j, tok)` éventuellement altérée par `pair(j)`.
+    type Hook<'a> = &'a dyn Fn(&mut FlashNextSession, usize);
+    type Pair<'a> = &'a dyn Fn(usize) -> (Vec<f32>, usize);
+    let plain = |j: usize| (h[j * width..(j + 1) * width].to_vec(), next[j]);
+    // Chaque mutation est jugée par la porte de l'observable qu'elle touche :
+    // `Watch::Output` (sortie hc, 1e-4), `Watch::Scores` (scores de l'indexeur
+    // contre le CPU, 1e-5, avec un écart muté d'au moins 2 × la porte) ou
+    // `Watch::Selection` (top-512 basculé hors quasi-égalité). Les trois
+    // mesures sont publiées pour chaque mutation.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Watch {
+        Output,
+        Scores,
+        Selection,
+    }
+    struct Mutated {
+        output: f64,
+        scores: f64,
+        selection_bad: usize,
+        /// Sélections malformées (doublons, hors bornes, taille ≠ keep) ou
+        /// scores non finis : une bascule n'est pas prouvée par celles-ci.
+        malformed: usize,
+        sparse_rows: usize,
+        torch: f64,
+    }
+    let run = |session: &mut FlashNextSession,
+               label: &str,
+               steps: usize,
+               watch: Watch,
+               hook: Hook<'_>,
+               pair: Pair<'_>|
+     -> Mutated {
+        session.reset().expect("invariant: reset");
+        let mut m = Mutated {
+            output: 0.0,
+            scores: 0.0,
+            selection_bad: 0,
+            malformed: 0,
+            sparse_rows: 0,
+            torch: 0.0,
+        };
+        let mut torch = Vec::new();
+        for j in 0..steps {
+            hook(session, j);
+            let (hj, tok) = pair(j);
+            let step = session
+                .mtp_step(MtpInput::Host(&hj), tok, false, true)
+                .expect("invariant: pas muté");
+            let hidden = step.hidden.expect("invariant: sortie hc");
+            m.output = nan_max(m.output, golden_error(&hidden, cpu_row(j)));
+            if let Some((blocks, scores)) = step.qsa {
+                m.sparse_rows += 1;
+                m.scores = nan_max(m.scores, score_error(&scores, &trace.scores[j], keep));
+                let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b as usize).collect();
+                blocks.sort_unstable();
+                let well_formed = blocks.len() == keep
+                    && blocks.windows(2).all(|w| w[0] < w[1])
+                    && blocks.last().is_some_and(|&b| b < scores.len())
+                    && scores.iter().all(|v| v.is_finite());
+                if !well_formed {
+                    m.malformed += 1;
+                }
+                let want = trace_blocks(trace, j, keep, compress).unwrap_or_default();
+                if well_formed
+                    && blocks != want
+                    && !swap_justified(&trace.scores[j], &want, &blocks, keep, ANCHORED_SWAP_TIE)
+                {
+                    m.selection_bad += 1;
+                }
+            }
+            if positions.contains(&j) {
+                torch.extend_from_slice(&hidden);
+            }
+        }
+        session.set_query_offsets(0, 0);
+        let n = torch.len() / width;
+        m.torch = golden_error(&torch, &golden_f32(&golden, "mtp_output")[..n * width]);
+        eprintln!(
+            "mutation {label} : sortie {:.2e}, scores {:.2e} (natif {score_err:.2e}), \
+             sélections injustifiées {} (malformées {}) sur {} lignes creuses",
+            m.output, m.scores, m.selection_bad, m.malformed, m.sparse_rows
+        );
+        let detected = match watch {
+            Watch::Output => !within(m.output, ANCHORED_OUTPUT_TOL),
+            Watch::Scores => {
+                m.sparse_rows > 0
+                    && m.scores.is_finite()
+                    && m.scores >= 2.0 * f64::from(ANCHORED_TIE)
+            }
+            Watch::Selection => m.selection_bad > 0 && m.malformed == 0,
+        };
+        assert!(detected, "mutation {label} non détectée");
+        m
+    };
+    let gains = |session: &FlashNextSession| {
+        let (e, hd) = session.mtp_norm_buffers().expect("invariant: tête MTP");
+        (
+            read_f32_buffer(e, config.hidden).expect("invariant: gains"),
+            read_f32_buffer(hd, width).expect("invariant: gains"),
+        )
+    };
+    let (gain_e, gain_h) = gains(&session);
+    let set_gains = |session: &FlashNextSession, e: &[f32], hd: &[f32]| {
+        let (eb, hb) = session.mtp_norm_buffers().expect("invariant: tête MTP");
+        crate::metal_backend::write_f32_buffer(eb, e).expect("invariant: écriture");
+        crate::metal_backend::write_f32_buffer(hb, hd).expect("invariant: écriture");
+    };
+    let doubled = |w: &[f32]| w.iter().map(|v| 2.0 * v + 1.0).collect::<Vec<_>>();
+    let probe = 64;
+    let none: Hook<'_> = &|_, _| {};
+    let torch_doubled = run(
+        &mut session,
+        "gain doublé (flux)",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j == 0 {
+                set_gains(s, &gain_e, &doubled(&gain_h));
+            }
+        },
+        &plain,
+    );
+    assert!(
+        !within(torch_doubled.torch, ANCHORED_OUTPUT_TOL),
+        "gain doublé invisible contre transformers ({:.2e})",
+        torch_doubled.torch
+    );
+    run(
+        &mut session,
+        "gain absent (flux)",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j == 0 {
+                set_gains(s, &gain_e, &vec![0.0; width]);
+            }
+        },
+        &plain,
+    );
+    run(
+        &mut session,
+        "gain doublé (embedding)",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j == 0 {
+                set_gains(s, &doubled(&gain_e), &gain_h);
+            }
+        },
+        &plain,
+    );
+    set_gains(&session, &gain_e, &gain_h);
+    run(
+        &mut session,
+        "paires décalées",
+        probe,
+        Watch::Output,
+        none,
+        &|j| (h[j * width..(j + 1) * width].to_vec(), next[j + 1]),
+    );
+    run(
+        &mut session,
+        "flux permutés",
+        probe,
+        Watch::Output,
+        none,
+        &|j| {
+            let mut hj = h[j * width..(j + 1) * width].to_vec();
+            hj.rotate_left(config.hidden);
+            (hj, next[j])
+        },
+    );
+    run(
+        &mut session,
+        "requêtes d'attention décalées",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j == 0 {
+                s.set_query_offsets(1, 0);
+            }
+        },
+        &plain,
+    );
+    let b_row = sparse_start + 4;
+    // Requêtes de l'indexeur seules décalées, sur 256 lignes creuses : d'une
+    // position (scores, porte 1e-5 inchangée), puis de 1024 positions (le
+    // top-512 bascule, porte de sélection).
+    let index_rows = sparse_start + 256;
+    let shifted = run(
+        &mut session,
+        "requêtes d'indexeur décalées d'une position",
+        index_rows,
+        Watch::Scores,
+        &|s, j| {
+            if j == 0 {
+                s.set_query_offsets(0, 1);
+            }
+        },
+        &plain,
+    );
+    assert!(
+        shifted.sparse_rows >= 200,
+        "lignes creuses sondées : {}",
+        shifted.sparse_rows
+    );
+    run(
+        &mut session,
+        "requêtes d'indexeur décalées de 1024 positions",
+        index_rows,
+        Watch::Selection,
+        &|s, j| {
+            if j == 0 {
+                s.set_query_offsets(0, 1024);
+            }
+        },
+        &plain,
+    );
+    run(
+        &mut session,
+        "historique figé",
+        probe,
+        Watch::Output,
+        &|s, j| {
+            if j > 0 {
+                s.mtp_truncate(0).expect("invariant: troncature");
+            }
+        },
+        &plain,
+    );
+    let e_row = 8;
+    run(
+        &mut session,
+        "mauvais expert",
+        e_row + 1,
+        Watch::Output,
+        &|s, j| {
+            if j == e_row {
+                let set = &cpu.routing[e_row];
+                let outsider = (0..)
+                    .find(|e| !set.contains(e))
+                    .expect("invariant: expert libre");
+                let mut wrong: Vec<u32> = set.iter().map(|&e| e as u32).collect();
+                wrong[0] = outsider as u32;
+                s.mtp_forced_routing = Some(wrong);
+            }
+        },
+        &plain,
+    );
+    run(
+        &mut session,
+        "mauvais bloc",
+        b_row + 1,
+        Watch::Output,
+        &|s, j| {
+            if j == b_row {
+                let blocks =
+                    trace_blocks(trace, b_row, keep, compress).expect("invariant: régime creux");
+                let outsider = (0..)
+                    .find(|b| !blocks.contains(b))
+                    .expect("invariant: bloc libre");
+                let mut wrong: Vec<u32> = blocks.iter().map(|&b| b as u32).collect();
+                wrong[0] = outsider as u32;
+                wrong.sort_unstable();
+                s.mtp_forced_selection = Some(wrong);
+            }
+        },
+        &plain,
+    );
+
+    // Reprise : point à `cp` lignes, trois drafts parasites qui complètent un
+    // bloc (`cp + 2` termine le bloc `(cp + 2) / 4`), restauration, puis
+    // continuation exacte jusqu'à `cp + 8`.
+    session.reset().expect("invariant: reset");
+    let cp = sparse_start - 2;
+    assert_eq!(
+        (cp + 2) % compress,
+        compress - 1,
+        "le bloc doit se compléter"
+    );
+    for j in 0..cp {
+        session
+            .mtp_step(
+                MtpInput::Host(&h[j * width..(j + 1) * width]),
+                next[j],
+                false,
+                false,
+            )
+            .expect("invariant: historique");
+    }
+    let checkpoint = session
+        .checkpoint(None)
+        .expect("invariant: point de reprise");
+    for j in cp..cp + 3 {
+        let parasite = &h[(rows - 1 - j) * width..(rows - j) * width];
+        session
+            .mtp_step(MtpInput::Host(parasite), next[rows - 1 - j], false, false)
+            .expect("invariant: draft parasite");
+    }
+    session
+        .restore(&checkpoint)
+        .expect("invariant: restauration");
+    let mut resumed = 0.0_f64;
+    for j in cp..cp + 8 {
+        let step = session
+            .mtp_step(
+                MtpInput::Host(&h[j * width..(j + 1) * width]),
+                next[j],
+                false,
+                true,
+            )
+            .expect("invariant: continuation");
+        resumed = nan_max(
+            resumed,
+            golden_error(&step.hidden.expect("invariant: sortie"), cpu_row(j)),
+        );
+    }
+    // Draft enchaîné : entrée résidente (sortie du pas précédent) contre la
+    // même entrée relue sur l'hôte, au bit près.
+    // Copie réelle : le buffer de sortie de la session est réécrit par le pas
+    // hôte, un alias fausserait la comparaison.
+    let host_copy = read_f32_buffer(
+        session
+            .mtp_hidden_buffer()
+            .expect("invariant: sortie résidente"),
+        width,
+    )
+    .expect("invariant: relecture");
+    let chained = metal::Device::system_default()
+        .expect("invariant: device Metal")
+        .new_buffer_with_data(
+            host_copy.as_ptr().cast(),
+            std::mem::size_of_val(host_copy.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+    let before = session
+        .checkpoint(None)
+        .expect("invariant: point de reprise");
+    let token = next[cp + 8];
+    let from_host = session
+        .mtp_step(MtpInput::Host(&host_copy), token, false, true)
+        .expect("invariant: draft hôte");
+    session.restore(&before).expect("invariant: restauration");
+    let from_buffer = session
+        .mtp_step(MtpInput::Resident(&chained), token, false, true)
+        .expect("invariant: draft résident");
+    assert_eq!(from_host.argmax, from_buffer.argmax, "draft enchaîné");
+    let bits = |v: Option<Vec<f32>>| -> Vec<u32> {
+        v.expect("invariant: sortie")
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    };
+    assert_eq!(
+        bits(from_host.hidden),
+        bits(from_buffer.hidden),
+        "entrée résidente ≠ entrée hôte"
+    );
+    eprintln!("reprise après drafts parasites : écart de sortie {resumed:.2e}");
+    assert!(
+        within(resumed, ANCHORED_OUTPUT_TOL),
+        "continuation après reprise : {resumed:.2e}"
+    );
+    assert!(green, "N2 MTP résidente rouge");
+}
+
+/// Vérification en pas mono contre l'AR, au bit près : après un contexte de
+/// `P` tokens du golden N2 (`P` = 2046..2049, les quatre alignements modulo 4
+/// autour de l'entrée du régime creux), `verify(t_0..t_3)` doit rendre pour
+/// chaque ligne l'argmax et le résiduel hc avant mixer de l'AR (mêmes bits).
+/// Puis, pour chaque `k` de 0 à 3 : `accept(k)` suivi d'un pas sur un token
+/// divergent doit égaler l'AR `t_0..t_k` puis ce token (argmax et résiduels de
+/// toutes les couches) : le retour arrière (DeltaNet, KV, clés brutes, PLE)
+/// est exact. Une seconde vérification, ou un pas, avant `accept` est refusé.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
+fn resident_verify_rows_and_accept_match_ar_bitwise() {
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let rows = super::session::VERIFY_ROWS;
+    let open = || {
+        FlashNextSession::open(
+            Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+            2049 + rows + 2,
+            Some(&crate::MemoryGuard::process()),
+        )
+        .expect("invariant: session")
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    // Une seule session (deux copies des poids dépasseraient le plafond) : les
+    // références AR et les vérifications repartent du même point de reprise.
+    let mut session = open();
+    // Token divergent : différent de tous les tokens vérifiés.
+    let divergent = 13;
+    for context in 2046..2050 {
+        let tokens = &ids[context..context + rows];
+        assert!(!tokens.contains(&divergent));
+        session.reset().expect("invariant: reset");
+        for &token in &ids[..context] {
+            session.replay(token).expect("invariant: rejeu");
+        }
+        let base = session
+            .checkpoint(None)
+            .expect("invariant: point de reprise");
+        // Références AR : pas t_0..t_3 (résiduel avant mixer = sortie de la
+        // dernière couche), puis pour chaque k, t_0..t_k et le token divergent.
+        let mut want = Vec::new();
+        for &token in tokens {
+            let step = session.step(token, false, true).expect("invariant: pas AR");
+            let layers = step.layers.expect("invariant: résiduels");
+            want.push((step.argmax, layers[layers.len() - 1].clone()));
+        }
+        let mut continuations = Vec::new();
+        for k in 0..rows {
+            session.restore(&base).expect("invariant: reprise");
+            for &token in &tokens[..=k] {
+                session
+                    .step(token, false, false)
+                    .expect("invariant: pas AR");
+            }
+            let digest = session.state_digest().expect("invariant: état AR");
+            let step = session
+                .step(divergent, false, true)
+                .expect("invariant: continuation AR");
+            continuations.push((
+                step.argmax,
+                step.layers.expect("invariant: résiduels"),
+                digest,
+            ));
+        }
+        for (k, (argmax, reference, digest)) in continuations.iter().enumerate() {
+            session.restore(&base).expect("invariant: reprise");
+            let got = session.verify(tokens).expect("invariant: vérification");
+            assert!(
+                session.verify(tokens).is_err(),
+                "seconde vérification acceptée"
+            );
+            assert!(
+                session.step(tokens[0], false, false).is_err(),
+                "pas accepté en attente"
+            );
+            for (r, (row, (want_argmax, residual))) in got.iter().zip(&want).enumerate() {
+                assert_eq!(row.argmax, *want_argmax, "P {context}, ligne {r} : argmax");
+                assert_eq!(
+                    bits(&row.residual),
+                    bits(residual),
+                    "P {context}, ligne {r} : résiduel"
+                );
+            }
+            assert!(session.accept(rows).is_err(), "acceptation hors bornes");
+            session.accept(k).expect("invariant: acceptation");
+            assert_eq!(session.position(), context + k + 1);
+            // Oracle d'état direct : DeltaNet, préfixes KV et blocs poolés valides,
+            // clés brutes du bloc en cours, anneau, pas et contexte PLE.
+            assert!(
+                session.state_digest().expect("invariant: état") == *digest,
+                "P {context}, k {k} : état après acceptation ≠ AR"
+            );
+            let after = session
+                .step(divergent, false, true)
+                .expect("invariant: continuation");
+            assert_eq!(after.argmax, *argmax, "P {context}, k {k} : argmax");
+            let layers = after.layers.expect("invariant: résiduels");
+            for (layer, (x, y)) in layers.iter().zip(reference).enumerate() {
+                assert_eq!(bits(x), bits(y), "P {context}, k {k}, couche {layer}");
+            }
+        }
+        eprintln!("vérification P {context} : 4 lignes et k = 0..3 identiques à l'AR");
+        if context != 2047 {
+            continue;
+        }
+        // Mutations (k = 1, P = 2047) : chacune doit écarter l'état ou les
+        // sorties de l'AR.
+        use super::session::VerifyMutation;
+        for mutation in [
+            VerifyMutation::CaptureNext,
+            VerifyMutation::NoTruncate,
+            VerifyMutation::StaleContext,
+            VerifyMutation::PleStepOff,
+            VerifyMutation::AliasFirstRow,
+            VerifyMutation::WrongResidual,
+        ] {
+            session.restore(&base).expect("invariant: reprise");
+            session.verify_mutation = Some(mutation);
+            let got = session
+                .verify(tokens)
+                .expect("invariant: vérification mutée");
+            session.accept(1).expect("invariant: acceptation mutée");
+            session.verify_mutation = None;
+            let rows_differ = got.iter().zip(&want).any(|(row, (argmax, residual))| {
+                row.argmax != *argmax || bits(&row.residual) != bits(residual)
+            });
+            let state_differs =
+                session.state_digest().expect("invariant: état") != continuations[1].2;
+            eprintln!("mutation {mutation:?} : sorties ≠ {rows_differ}, état ≠ {state_differs}");
+            assert!(
+                rows_differ || state_differs,
+                "mutation {mutation:?} non détectée"
+            );
+        }
+        // Échec d'encodage injecté sur la dernière ligne : rien n'est engagé.
+        session.restore(&base).expect("invariant: reprise");
+        let before = session.state_digest().expect("invariant: état");
+        session.fail_verify_row = Some(rows - 1);
+        assert!(session.verify(tokens).is_err(), "échec injecté ignoré");
+        session.fail_verify_row = None;
+        assert!(
+            session.state_digest().expect("invariant: état") == before,
+            "état modifié par une vérification non soumise"
+        );
+        // Refus : pas d'acceptation sans vérification ; pendant une transaction,
+        // ni rejeu, ni pas MTP, ni point de reprise, ni reprise.
+        assert!(session.accept(0).is_err(), "acceptation sans vérification");
+        assert!(
+            session.accept(usize::MAX).is_err(),
+            "acceptation hors bornes"
+        );
+        assert!(session.verify(&[]).is_err(), "vérification vide");
+        assert!(
+            session.verify(&[usize::MAX]).is_err(),
+            "token hors vocabulaire"
+        );
+        assert!(session.verify(&ids[..rows + 1]).is_err(), "trop de lignes");
+        session
+            .verify(&tokens[..2])
+            .expect("invariant: deux lignes");
+        assert!(session.replay(tokens[0]).is_err(), "rejeu en attente");
+        assert!(
+            session.checkpoint(None).is_err(),
+            "point de reprise en attente"
+        );
+        assert!(session.restore(&base).is_err(), "reprise en attente");
+        if session.mtp_rows().is_some() {
+            assert!(
+                session
+                    .mtp_step(
+                        super::session::MtpInput::Host(&want[0].1),
+                        tokens[0],
+                        false,
+                        false
+                    )
+                    .is_err(),
+                "pas MTP en attente"
+            );
+        }
+        session
+            .accept(0)
+            .expect("invariant: acceptation d'une ligne");
+        assert!(
+            session.state_digest().expect("invariant: état") == continuations[0].2,
+            "deux lignes, k = 0 : état ≠ AR"
+        );
+        // Une seule ligne : pas de capture ni de restauration.
+        session.restore(&base).expect("invariant: reprise");
+        let one = session.verify(&tokens[..1]).expect("invariant: une ligne");
+        assert_eq!(one[0].argmax, want[0].0, "une ligne : argmax");
+        session.accept(0).expect("invariant: acceptation");
+        assert!(
+            session.state_digest().expect("invariant: état") == continuations[0].2,
+            "une ligne : état ≠ AR"
+        );
+        // `reset` pendant une transaction la lève et rend la session utilisable.
+        session.verify(tokens).expect("invariant: vérification");
+        session.reset().expect("invariant: reset en attente");
+        session
+            .step(ids[0], false, false)
+            .expect("invariant: pas après reset");
+    }
+}
+
+/// Identité stricte du décodage spéculatif MTP (pas mono) contre l'AR glouton :
+/// 8 prompts réels (golden N2 de 64, 512, 2040 et 3000 tokens, wikitext figé de
+/// 1024 et 2600 tokens, deux fichiers de code tokenisés) × 256 jetons, aux
+/// profondeurs 1, 2 et 3 : mêmes jetons, et mêmes résiduels avant mixer au bit
+/// près sur les positions engagées communes. Le prompt de 2040 tokens traverse
+/// 2047-2052 pendant la génération. Cas limites : drafts forcés faux (rejet
+/// total), jeton d'arrêt rencontré en cours de route, capacité atteinte en fin
+/// de génération. L'acceptation (jetons par cycle) est publiée.
+#[test]
+#[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR, SARAGOSSA_QWEN4EXP_GOLDEN, SARAGOSSA_FLASH_NEXT_CORPUS"]
+fn speculative_greedy_matches_ar_bitwise() {
+    use super::session::MtpInput;
+    use super::speculative::{
+        generate_ar, generate_speculative, Generation, SpecMutation, SpecOptions,
+    };
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let none = SpecOptions::default();
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let corpus = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
+            .expect("SARAGOSSA_FLASH_NEXT_CORPUS requis"),
+    );
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let wiki: Vec<usize> = std::fs::read(corpus.join("ids.u32"))
+        .expect("invariant: corpus")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+        .collect();
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("invariant: tokenizer");
+    let code = |name: &str, len: usize| -> Vec<usize> {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rowsexact")
+                .join(name),
+        )
+        .expect("invariant: fixture de code");
+        let ids: Vec<usize> = tokenizer
+            .encode(text, false)
+            .expect("invariant: tokenisation")
+            .get_ids()
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+        ids[..len.min(ids.len())].to_vec()
+    };
+    let prompts: Vec<(&str, Vec<usize>)> = vec![
+        ("golden 64", ids[..64].to_vec()),
+        ("golden 512", ids[..512].to_vec()),
+        ("golden 2040", ids[..2040].to_vec()),
+        ("golden 3000", ids[..3000].to_vec()),
+        ("wikitext 1024", wiki[..1024].to_vec()),
+        ("wikitext 2600", wiki[4096..4096 + 2600].to_vec()),
+        ("code4k-1", code("code4k-1.txt", 1024)),
+        ("code4k-2", code("code4k-2.txt", 1500)),
+    ];
+    let generated = 256;
+    let capacity = 3000 + generated + 4;
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        capacity,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let same = |label: &str, ar: &Generation, spec: &Generation| {
+        assert_eq!(spec.tokens, ar.tokens, "{label} : jetons");
+        // `residuals[i]` : résiduel de la position qui produit `tokens[i]`.
+        assert_eq!(
+            spec.residuals.len(),
+            ar.residuals.len(),
+            "{label} : résiduels"
+        );
+        for (i, (a, b)) in ar.residuals.iter().zip(&spec.residuals).enumerate() {
+            assert_eq!(bits(a), bits(b), "{label} : résiduel {i}");
+        }
+    };
+    // Jetons, résiduels et état final du tronc (position, KV, DeltaNet, PLE)
+    // égaux à l'AR : le dernier jeton émis n'est consommé ni par l'un ni par
+    // l'autre.
+    let check = |session: &mut FlashNextSession,
+                 label: &str,
+                 prompt: &[usize],
+                 budget: usize,
+                 depth: usize,
+                 stop: &[usize],
+                 options: &SpecOptions<'_>|
+     -> Generation {
+        let ar = generate_ar(session, prompt, budget, stop).expect("invariant: AR");
+        let ar_state = session.state_digest().expect("invariant: état AR");
+        let spec = generate_speculative(session, prompt, budget, depth, stop, options)
+            .expect("invariant: spéculatif");
+        same(label, &ar, &spec);
+        assert!(
+            session.state_digest().expect("invariant: état") == ar_state,
+            "{label} : état final du tronc"
+        );
+        spec
+    };
+    let started = std::time::Instant::now();
+    for (label, prompt) in &prompts {
+        let ar = generate_ar(&mut session, prompt, generated, &[]).expect("invariant: AR");
+        let ar_state = session.state_digest().expect("invariant: état AR");
+        for depth in 1..=3 {
+            let spec = generate_speculative(&mut session, prompt, generated, depth, &[], &none)
+                .expect("invariant: spéculatif");
+            same(&format!("{label}, profondeur {depth}"), &ar, &spec);
+            assert!(
+                session.state_digest().expect("invariant: état") == ar_state,
+                "{label}, profondeur {depth} : état final du tronc"
+            );
+            let cycles = spec.accepted.len().max(1);
+            let per_cycle =
+                spec.accepted.iter().map(|k| k + 1).sum::<usize>() as f64 / cycles as f64;
+            eprintln!(
+                "{label}, profondeur {depth} : identique ; {per_cycle:.2} jetons par cycle sur {cycles} cycles"
+            );
+        }
+    }
+    // Rejet total : chaque draft forcé faux.
+    let (_, prompt) = &prompts[1];
+    let wrong = |_: usize, _: usize, _: usize, draft: usize| (draft + 1) % 1000;
+    let forced = SpecOptions {
+        overrides: Some(&wrong),
+        ..SpecOptions::default()
+    };
+    let spec = check(&mut session, "rejet total", prompt, 64, 3, &[], &forced);
+    // Un draft forcé peut retomber par hasard sur la cible : compte publié.
+    eprintln!(
+        "rejet forcé : {} drafts acceptés sur {} cycles",
+        spec.accepted.iter().sum::<usize>(),
+        spec.accepted.len()
+    );
+    // Arrêt : jeton d'arrêt pris au milieu de la génération AR.
+    let full = generate_ar(&mut session, prompt, 96, &[]).expect("invariant: AR");
+    let stop = [full.tokens[40]];
+    let spec = check(&mut session, "arrêt", prompt, 96, 3, &stop, &none);
+    assert!(stop.contains(spec.tokens.last().expect("invariant: jetons")));
+    // Acceptation complète forcée (drafts = jetons AR) : chaque cycle se
+    // termine sur un draft accepté, y compris en fin de budget.
+    let reference = generate_ar(&mut session, prompt, 64, &[]).expect("invariant: AR");
+    let oracle = |_: usize, emitted: usize, rank: usize, _: usize| {
+        *reference
+            .tokens
+            .get(emitted + 1 + rank)
+            .expect("invariant: draft d'oracle dans la sortie AR")
+    };
+    let all = SpecOptions {
+        overrides: Some(&oracle),
+        ..SpecOptions::default()
+    };
+    for budget in 2..=8 {
+        let spec = check(
+            &mut session,
+            &format!("acceptation complète, budget {budget}"),
+            prompt,
+            budget,
+            3,
+            &[],
+            &all,
+        );
+        // Cycles attendus : 3 drafts acceptés tant que le budget le permet,
+        // le dernier cycle réduit à `restant − 2`, le dernier jeton émis seul.
+        let mut expected = Vec::new();
+        let mut left = budget;
+        while left >= 2 {
+            let k = (left - 2).min(3);
+            expected.push(k);
+            left -= k + 1;
+        }
+        assert_eq!(spec.accepted, expected, "budget {budget} : acceptations");
+    }
+    // Capacité : génération jusqu'à l'avant-dernière puis la dernière position.
+    let (_, prompt) = &prompts[3];
+    for budget in [capacity - prompt.len(), capacity - prompt.len() + 1] {
+        check(
+            &mut session,
+            &format!("capacité, budget {budget}"),
+            prompt,
+            budget,
+            3,
+            &[],
+            &none,
+        );
+        assert_eq!(
+            session.mtp_rows(),
+            Some(session.position() - 1),
+            "historique MTP en fin de génération"
+        );
+    }
+
+    // Oracle de l'historique MTP : le D_1 de chaque cycle (position p) doit
+    // égaler le draft d'un rejeu séquentiel des paires AR vérifiées
+    // (h_j, x_{j+1}). Une troncature oubliée ou des paires bâties sur un mauvais
+    // résiduel laissent les jetons identiques (le tronc vérifie toujours) mais
+    // changent les drafts.
+    let reference_drafts = |session: &mut FlashNextSession, sequence: &[usize]| -> Vec<usize> {
+        session.reset().expect("invariant: reset");
+        let mut drafts = Vec::with_capacity(sequence.len());
+        for j in 0..sequence.len() - 1 {
+            let row = session
+                .verify(&sequence[j..=j])
+                .expect("invariant: pas de référence");
+            session.accept(0).expect("invariant: acceptation");
+            let step = session
+                .mtp_step(
+                    MtpInput::Host(&row[0].residual),
+                    sequence[j + 1],
+                    false,
+                    false,
+                )
+                .expect("invariant: pas MTP de référence");
+            drafts.push(step.argmax as usize);
+        }
+        drafts
+    };
+    let first_drafts = |session: &mut FlashNextSession,
+                        prompt: &[usize],
+                        mutation: Option<SpecMutation>|
+     -> (Generation, Vec<Option<usize>>) {
+        // D_1 par cycle : un cycle de fin de budget peut n'avoir aucun draft.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let record = |cycle: usize, _: usize, rank: usize, draft: usize| {
+            if rank == 0 {
+                let mut seen = seen.borrow_mut();
+                if seen.len() <= cycle {
+                    seen.resize(cycle + 1, None);
+                }
+                seen[cycle] = Some(draft);
+            }
+            draft
+        };
+        let options = SpecOptions {
+            overrides: Some(&record),
+            mutation,
+            ..SpecOptions::default()
+        };
+        let out = generate_speculative(session, prompt, generated, 3, &[], &options)
+            .expect("invariant: spéculatif");
+        (out, seen.into_inner())
+    };
+    for index in [1, 6] {
+        let (label, prompt) = &prompts[index];
+        let (spec, drafts) = first_drafts(&mut session, prompt, None);
+        let mut sequence = prompt.clone();
+        sequence.extend_from_slice(&spec.tokens);
+        let reference = reference_drafts(&mut session, &sequence);
+        // Position p du cycle c : p_0 = |prompt| − 1, p_{c+1} = p_c + 1 + k_c.
+        let mut p = prompt.len() - 1;
+        let mut mismatches = 0;
+        for (c, &k) in spec.accepted.iter().enumerate() {
+            mismatches += usize::from(
+                drafts
+                    .get(c)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|draft| draft != reference[p]),
+            );
+            p += 1 + k;
+        }
+        eprintln!(
+            "{label} : D_1 de {} cycles contre le rejeu des paires AR, {mismatches} écarts",
+            spec.accepted.len()
+        );
+        assert_eq!(mismatches, 0, "{label} : drafts ≠ historique AR");
+        for mutation in [SpecMutation::NoTruncate, SpecMutation::StaleHistory] {
+            let (mutated, drafts) = first_drafts(&mut session, prompt, Some(mutation));
+            assert_eq!(
+                mutated.tokens, spec.tokens,
+                "{label} : jetons sous {mutation:?}"
+            );
+            let mut p = prompt.len() - 1;
+            let mut mismatches = 0;
+            for (c, &k) in mutated.accepted.iter().enumerate() {
+                mismatches += usize::from(
+                    drafts
+                        .get(c)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|draft| draft != reference[p]),
+                );
+                p += 1 + k;
+            }
+            eprintln!("{label}, mutation {mutation:?} : {mismatches} écarts de D_1");
+            assert!(
+                mismatches > 0,
+                "{label} : mutation {mutation:?} non détectée"
+            );
+        }
+    }
+
+    // Oracle d'état de l'historique MTP (KV, clés poolées et brutes) contre le
+    // rejeu séquentiel des paires AR, en régime dense (512) et creux (3000).
+    // Les drafts enchaînés écrivent l'anneau des clés brutes : sans
+    // restauration, un bloc est poolé avec la clé d'une ligne retirée.
+    let mtp_state =
+        |session: &mut FlashNextSession| session.mtp_state_digest().expect("invariant: état MTP");
+    // Prompt creux : 64 jetons, pour que la mutation NoTruncate (lignes de
+    // drafts jamais retirées) tienne dans la capacité de la session.
+    for (index, budget) in [(1, generated), (3, 64)] {
+        let (label, prompt) = &prompts[index];
+        let spec = generate_speculative(&mut session, prompt, budget, 3, &[], &none)
+            .expect("invariant: spéculatif");
+        let state = mtp_state(&mut session);
+        let mut sequence = prompt.clone();
+        sequence.extend_from_slice(&spec.tokens);
+        // Le dernier jeton émis n'est pas consommé : l'historique s'arrête à
+        // la paire de l'avant-dernier.
+        reference_drafts(&mut session, &sequence[..sequence.len() - 1]);
+        let reference = mtp_state(&mut session);
+        assert!(state == reference, "{label} : état MTP ≠ rejeu séquentiel");
+        for mutation in [
+            SpecMutation::NoRawRestore,
+            SpecMutation::NoTruncate,
+            SpecMutation::StaleHistory,
+        ] {
+            let options = SpecOptions {
+                mutation: Some(mutation),
+                ..SpecOptions::default()
+            };
+            generate_speculative(&mut session, prompt, budget, 3, &[], &options)
+                .expect("invariant: spéculatif muté");
+            assert!(
+                mtp_state(&mut session) != reference,
+                "{label} : mutation {mutation:?} non détectée par l'état MTP"
+            );
+        }
+        eprintln!("{label} : état MTP égal au rejeu séquentiel, 3 mutations détectées");
+    }
+
+    // Échec d'encodage de la vérification au 3ᵉ cycle, après les drafts :
+    // l'historique MTP revient à ses lignes vérifiées.
+    let (_, prompt) = &prompts[1];
+    let failing = SpecOptions {
+        fail_verify_cycle: Some(3),
+        ..SpecOptions::default()
+    };
+    assert!(generate_speculative(&mut session, prompt, 64, 3, &[], &failing).is_err());
+    assert_eq!(
+        session.mtp_rows(),
+        Some(session.position()),
+        "historique MTP après un échec de vérification"
+    );
+    // Échec de la reconstruction de l'historique après deux cycles d'acceptation
+    // complète : au cycle 2, l'historique propre a `|prompt| + 8` lignes et le
+    // tronc est à `|prompt| + 12`. Échec à la 2ᵉ paire sur un préfixe aligné
+    // (512), puis à la 3ᵉ sur un préfixe congru à 3 modulo 4 (515) : la
+    // reconstruction complète le bloc en cours et écrit une clé brute du bloc
+    // suivant avant d'échouer ; l'anneau doit être restauré.
+    for (length, pair) in [(512, 1), (515, 2)] {
+        let prompt = &ids[..length];
+        let reference = generate_ar(&mut session, prompt, 64, &[]).expect("invariant: AR");
+        let oracle = |_: usize, emitted: usize, rank: usize, _: usize| {
+            *reference
+                .tokens
+                .get(emitted + 1 + rank)
+                .expect("invariant: draft d'oracle dans la sortie AR")
+        };
+        let failing = SpecOptions {
+            overrides: Some(&oracle),
+            fail_rebuild: Some((2, pair)),
+            ..SpecOptions::default()
+        };
+        let error = generate_speculative(&mut session, prompt, 64, 3, &[], &failing)
+            .err()
+            .expect("invariant: échec injecté");
+        assert!(
+            error.to_string().contains("injecté"),
+            "{length} : erreur inattendue {error}"
+        );
+        assert_eq!(
+            session.mtp_rows(),
+            Some(length + 8),
+            "{length} : lignes MTP"
+        );
+        assert_eq!(
+            session.position(),
+            length + 12,
+            "{length} : position du tronc"
+        );
+        let state = mtp_state(&mut session);
+        let mut sequence = prompt.to_vec();
+        sequence.extend_from_slice(&reference.tokens);
+        reference_drafts(&mut session, &sequence[..=length + 8]);
+        assert!(
+            mtp_state(&mut session) == state,
+            "{length} : historique MTP après un échec de reconstruction"
+        );
+    }
+    let (_, prompt) = &prompts[1];
+
+    // Draft d'arrêt accepté : jeton d'arrêt = un D_1 accepté dont c'est la
+    // première occurrence dans la sortie.
+    let (spec, drafts) = first_drafts(&mut session, prompt, None);
+    let mut emitted = 0;
+    let mut accepted_stop = None;
+    for (c, &k) in spec.accepted.iter().enumerate() {
+        let index = emitted + 1;
+        let draft = drafts.get(c).copied().flatten();
+        if let Some(draft) =
+            draft.filter(|&d| k >= 1 && spec.tokens.iter().position(|&t| t == d) == Some(index))
+        {
+            accepted_stop = Some(draft);
+            break;
+        }
+        emitted += 1 + k;
+    }
+    let stop = [accepted_stop.expect("invariant: un draft accepté en première occurrence")];
+    check(
+        &mut session,
+        "draft d'arrêt accepté",
+        prompt,
+        generated,
+        3,
+        &stop,
+        &none,
+    );
+    // Draft d'arrêt rejeté : un jeton jamais émis, imposé comme draft.
+    let full = generate_ar(&mut session, prompt, 64, &[]).expect("invariant: AR");
+    let never = (0..)
+        .find(|t| !full.tokens.contains(t))
+        .expect("invariant: jeton libre");
+    let stop = [never];
+    let reject = |cycle: usize, _: usize, rank: usize, draft: usize| {
+        if cycle == 2 && rank == 0 {
+            never
+        } else {
+            draft
+        }
+    };
+    let options = SpecOptions {
+        overrides: Some(&reject),
+        ..SpecOptions::default()
+    };
+    let spec = check(
+        &mut session,
+        "draft d'arrêt rejeté",
+        prompt,
+        64,
+        3,
+        &stop,
+        &options,
+    );
+    same("draft d'arrêt rejeté (sans arrêt)", &full, &spec);
+    // Profondeur nulle (AR pur) et budgets de 0 à 3 jetons.
+    for (depth, budget) in [(0, 32), (3, 0), (3, 1), (3, 2), (3, 3)] {
+        check(
+            &mut session,
+            &format!("profondeur {depth}, budget {budget}"),
+            prompt,
+            budget,
+            depth,
+            &[],
+            &none,
+        );
+    }
+    assert!(generate_speculative(&mut session, prompt, 8, usize::MAX, &[], &none).is_err());
+    eprintln!(
+        "identité spéculative : tout vert en {:.0} s",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+/// Étape 6 D, mesure (2) : acceptation d'un draft restreint à un
+/// sous-vocabulaire, sur C à profondeur 3. Le sous-vocabulaire (les 32 000
+/// jetons les plus fréquents, ou tous les jetons vus, plus EOS) est choisi sur
+/// un corpus distinct des prompts d'évaluation : wikitext `corpus32k`,
+/// `code4k-2`, `code4k-3`, `chat-1` à `chat-6`. Évaluation : golden 512
+/// (prose) et `code4k-1` (code, 1024 jetons), 256 jetons, drafts pleins puis
+/// restreints ; identité à l'AR vérifiée. Publié sans porte.
+#[test]
+#[ignore = "mesure : poids réels, machine libre"]
+fn measure_subvocab_draft_acceptance() {
+    use super::speculative::{generate_ar, generate_speculative, Generation, SpecOptions};
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let corpus = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
+            .expect("SARAGOSSA_FLASH_NEXT_CORPUS requis"),
+    );
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("invariant: tokenizer");
+    let fixture = |name: &str| -> Vec<usize> {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rowsexact")
+                .join(name),
+        )
+        .expect("invariant: fixture");
+        tokenizer
+            .encode(text, false)
+            .expect("invariant: tokenisation")
+            .get_ids()
+            .iter()
+            .map(|&t| t as usize)
+            .collect()
+    };
+    let ckpt = Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint");
+    let (vocab, eos) = (ckpt.config.vocab, ckpt.config.eos as usize);
+    // Fréquences sur le corpus distinct des prompts d'évaluation.
+    let mut counts = vec![0usize; vocab];
+    let mut seen_tokens = 0usize;
+    let wiki: Vec<usize> = std::fs::read(corpus.join("ids.u32"))
+        .expect("invariant: corpus")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+        .collect();
+    let mut sources = vec![wiki];
+    for name in ["code4k-2.txt", "code4k-3.txt"]
+        .into_iter()
+        .map(String::from)
+        .chain((1..=6).map(|i| format!("chat-{i}.txt")))
+    {
+        sources.push(fixture(&name));
+    }
+    for &token in sources.iter().flatten() {
+        if let Some(count) = counts.get_mut(token) {
+            *count += 1;
+            seen_tokens += 1;
+        }
+    }
+    let mut ranked: Vec<usize> = (0..vocab).filter(|&t| counts[t] > 0).collect();
+    ranked.sort_by(|a, b| counts[*b].cmp(&counts[*a]).then(a.cmp(b)));
+    ranked.truncate(32_000);
+    let mut mask = vec![false; vocab];
+    for &token in &ranked {
+        mask[token] = true;
+    }
+    mask[eos] = true;
+    let size = mask.iter().filter(|&&keep| keep).count();
+    eprintln!("sous-vocabulaire : {size} jetons ({seen_tokens} jetons de corpus)");
+
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let code = fixture("code4k-1.txt");
+    let prompts = [
+        ("prose (golden 512)", ids[..512].to_vec()),
+        ("code (code4k-1)", code[..1024.min(code.len())].to_vec()),
+    ];
+    let generated = 256;
+    let mut session = FlashNextSession::open(
+        ckpt,
+        1024 + generated + 4,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    let per_cycle = |g: &Generation| {
+        g.accepted.iter().map(|k| k + 1).sum::<usize>() as f64 / g.accepted.len().max(1) as f64
+    };
+    let restricted = SpecOptions {
+        draft_vocab: Some(&mask),
+        ..SpecOptions::default()
+    };
+    for (label, prompt) in &prompts {
+        let ar = generate_ar(&mut session, prompt, generated, &[]).expect("invariant: AR");
+        let covered = ar.tokens.iter().filter(|&&t| mask[t]).count();
+        let full = generate_speculative(
+            &mut session,
+            prompt,
+            generated,
+            3,
+            &[],
+            &SpecOptions::default(),
+        )
+        .expect("invariant: spéculatif");
+        let sub = generate_speculative(&mut session, prompt, generated, 3, &[], &restricted)
+            .expect("invariant: spéculatif restreint");
+        assert_eq!(full.tokens, ar.tokens, "{label} : drafts pleins ≠ AR");
+        assert_eq!(sub.tokens, ar.tokens, "{label} : drafts restreints ≠ AR");
+        eprintln!(
+            "{label} : sortie AR couverte {covered}/{} ; profondeur 3 : {:.2} jetons par cycle (pleins), {:.2} (restreints)",
+            ar.tokens.len(),
+            per_cycle(&full),
+            per_cycle(&sub)
+        );
+    }
+}
+
+/// Débit du décodage spéculatif en pas mono (étape 6 C), publié sans porte :
+/// sans lignes, une vérification de R lignes coûte R pas du tronc, d'où un
+/// débit attendu sous l'AR. AR et spéculatif (profondeurs 1 à 3) alternés,
+/// 2 répétitions, 256 jetons après un prompt de prose (golden 512) puis de
+/// code (code4k-1, 1024 tokens) ; débit = jetons / durée après le prompt.
+#[test]
+#[ignore = "débit : poids réels, machine libre"]
+fn bench_speculative_mono_vs_ar() {
+    use super::speculative::{generate_ar, generate_speculative};
+    use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+    );
+    let golden =
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let ids = n2_input_ids(std::path::Path::new(&golden));
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("invariant: tokenizer");
+    let code_text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rowsexact/code4k-1.txt"),
+    )
+    .expect("invariant: fixture");
+    let code: Vec<usize> = tokenizer
+        .encode(code_text, false)
+        .expect("invariant: tokenisation")
+        .get_ids()
+        .iter()
+        .take(1024)
+        .map(|&t| t as usize)
+        .collect();
+    let generated = 256;
+    let mut session = FlashNextSession::open(
+        Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
+        1024 + generated + 4,
+        Some(&crate::MemoryGuard::process()),
+    )
+    .expect("invariant: session");
+    for (label, prompt) in [("prose", ids[..512].to_vec()), ("code", code)] {
+        for repeat in 0..2 {
+            let ar = generate_ar(&mut session, &prompt, generated, &[]).expect("invariant: AR");
+            let ar_rate = ar.tokens.len() as f64 / ar.decode.as_secs_f64();
+            let mut line = format!("{label}, répétition {repeat} : AR {ar_rate:.1} tok/s");
+            for depth in 1..=3 {
+                let spec = generate_speculative(
+                    &mut session,
+                    &prompt,
+                    generated,
+                    depth,
+                    &[],
+                    &super::speculative::SpecOptions::default(),
+                )
+                .expect("invariant: spéculatif");
+                assert_eq!(spec.tokens, ar.tokens, "{label} : jetons");
+                let rate = spec.tokens.len() as f64 / spec.decode.as_secs_f64();
+                let per_cycle = spec.accepted.iter().map(|k| k + 1).sum::<usize>() as f64
+                    / spec.accepted.len().max(1) as f64;
+                line += &format!(
+                    " ; d{depth} {rate:.1} tok/s ({per_cycle:.2} jetons/cycle, ×{:.2})",
+                    rate / ar_rate
+                );
+            }
+            eprintln!("{line}");
+        }
+    }
+    // Coût d'un pas MTP rapporté au pas AR (modèle de gain de l'étape 6 D).
+    let ar = generate_ar(&mut session, &ids[..512], 64, &[]).expect("invariant: AR");
+    let t_ar = ar.decode.as_secs_f64() / ar.tokens.len() as f64;
+    let h = vec![0.0_f32; session_width(&session)];
+    let started = std::time::Instant::now();
+    let steps = 64;
+    for &token in &ids[..steps] {
+        session
+            .mtp_step(super::session::MtpInput::Host(&h), token, false, false)
+            .expect("invariant: pas MTP");
+    }
+    let t_mtp = started.elapsed().as_secs_f64() / steps as f64;
+    eprintln!(
+        "pas AR {:.2} ms, pas MTP {:.2} ms : T_mtp/T_ar = {:.3}",
+        t_ar * 1e3,
+        t_mtp * 1e3,
+        t_mtp / t_ar
+    );
+}
+
+/// Profil de l'étape 6 D (sans porte, poids synthétiques) : pour chaque matmul
+/// du tronc Flash-Next à ses formes et bits réels, un lot de R lignes
+/// (R = 1..4) contre R pas mono, en mode normal puis en vérification greedy
+/// stricte. Publie l'exactitude au bit près de chaque ligne et
+/// ρ_brique(R) = durée du lot / durée d'un pas mono. Chaque command buffer lit
+/// des copies distinctes du poids (≥ 512 Mio, buffers GPU vérifiés distincts,
+/// une lecture par copie) pour mesurer depuis la DRAM comme le decode, et non
+/// depuis le SLC ; chauffe puis minimum de 3 ; débit mono publié en Go/s. Le
+/// hc Down de production (qmv split-K) est mesuré en mono à part. Le lm_head
+/// u6 (kernel argmax en lignes à part) est hors profil. Les experts sont
+/// mesurés isolément, témoins du kernel MoE fusionné du decode.
+#[test]
+#[ignore = "profil GPU : machine libre"]
+fn profile_rows_matmuls_flash_next_shapes() -> Result<()> {
+    use crate::metal_backend::{install_verify_greedy_scope, with_verify_strict_override};
+    let Some(executor) = executor()? else {
+        return Ok(());
+    };
+    let queue = executor.device().new_command_queue();
+    // (nom, sorties, entrées, bits, nombre par pas de tronc)
+    // bits 32 : poids dense f32, témoin (2× les octets) des linéaires bf16.
+    let shapes: [(&str, usize, usize, usize, usize); 15] = [
+        ("attention q_proj (q + gate)", 12288, 2560, 8, 12),
+        ("attention k/v_proj", 512, 2560, 8, 24),
+        ("attention o_proj", 2560, 6144, 8, 12),
+        ("DeltaNet in_proj_qkv", 10240, 2560, 8, 36),
+        ("DeltaNet in_proj_z", 6144, 2560, 8, 36),
+        ("DeltaNet out_proj", 2560, 6144, 8, 36),
+        ("hc Up", 10240, 320, 8, 96),
+        ("expert gate/up (u4)", 640, 2560, 4, 960),
+        ("expert down (u4)", 2560, 640, 4, 480),
+        ("expert partagé gate/up", 640, 2560, 8, 96),
+        ("expert partagé down", 2560, 640, 8, 48),
+        ("hc Down (split-K en mono)", 320, 10240, 8, 97),
+        ("indexeur index_qk_proj", 640, 2560, 8, 12),
+        ("routeur MoE (bf16)", 512, 2560, 32, 48),
+        ("DeltaNet in_proj_a/b (bf16)", 48, 2560, 32, 72),
+    ];
+    let run = |copies: usize,
+               encode: &dyn Fn(&metal::ComputeCommandEncoderRef, usize) -> Result<()>|
+     -> Result<f64> {
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        for copy in 0..copies {
+            encode(encoder, copy)?;
+        }
+        encoder.end_encoding();
+        let started = std::time::Instant::now();
+        commit_and_wait(command_buffer)?;
+        Ok(started.elapsed().as_secs_f64() / copies as f64)
+    };
+    for (name, out_dim, in_dim, bits, per_step) in shapes {
+        let mut rng = DeterministicF32::new(0x6d + out_dim as u64);
+        let linear = if bits == 32 {
+            LinearWeight::Dense(Tensor::from_vec(
+                vec![out_dim, in_dim],
+                rng.fill(out_dim * in_dim, -0.05, 0.05),
+            )?)
+        } else {
+            LinearWeight::AffineQuantized(affine_quantized(&mut rng, out_dim, in_dim, 0.05, bits)?)
+        };
+        // Octets lus par pas : codes, plus échelles et biais bf16 par groupe.
+        let bytes = if bits == 32 {
+            out_dim * in_dim * 4
+        } else {
+            out_dim * in_dim * bits / 8 + out_dim * (in_dim / 64) * 4
+        };
+        let copies = (512_usize << 20).div_ceil(bytes).clamp(4, 4096);
+        let (_linears, weights) = distinct_weights(&executor, &linear, copies)?;
+        let weight = &weights[0];
+        let x = rng.fill(4 * in_dim, -1.0, 1.0);
+        let input = buffer(&executor, &x);
+        let mono_in: Vec<_> = (0..4)
+            .map(|r| buffer(&executor, &x[r * in_dim..(r + 1) * in_dim]))
+            .collect();
+        for strict in [false, true] {
+            let _greedy = install_verify_greedy_scope(strict);
+            with_verify_strict_override(strict, || -> Result<()> {
+                let mono_out = zeros(&executor, out_dim);
+                let batched_out = zeros(&executor, 4 * out_dim);
+                let timed = |rows: usize| -> Result<f64> {
+                    let (src, dst) = if rows == 1 {
+                        (&mono_in[0], &mono_out)
+                    } else {
+                        (&input, &batched_out)
+                    };
+                    run(copies, &|encoder, copy| {
+                        executor
+                            .encode_matmul_weight_buffers(
+                                encoder,
+                                src,
+                                rows,
+                                in_dim,
+                                &weights[copy],
+                                dst,
+                                true,
+                            )
+                            .map(|_| ())
+                    })
+                };
+                // Chauffe, puis minimum de 3 tours alternés mono / lots.
+                for rows in 1..=4 {
+                    timed(rows)?;
+                }
+                let mut best = [f64::INFINITY; 5];
+                for _ in 0..3 {
+                    for (rows, best) in best.iter_mut().enumerate().skip(1) {
+                        *best = best.min(timed(rows)?);
+                    }
+                }
+                let mono = best[1];
+                let mut line = format!(
+                    "{name} [{out_dim}×{in_dim}, u{bits}, ×{per_step}/pas] {} : mono {:.1} µs ({:.0} Go/s, {copies} copies)",
+                    if strict { "strict" } else { "normal" },
+                    mono * 1e6,
+                    bytes as f64 / mono / 1e9
+                );
+                for (rows, &batched) in best.iter().enumerate().skip(2) {
+                    let out = zeros(&executor, rows * out_dim);
+                    // Exactitude : chaque ligne contre son pas mono.
+                    let command_buffer = queue.new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    let singles: Vec<_> = (0..rows).map(|_| zeros(&executor, out_dim)).collect();
+                    for r in 0..rows {
+                        executor.encode_matmul_weight_buffers(
+                            encoder,
+                            &mono_in[r],
+                            1,
+                            in_dim,
+                            weight,
+                            &singles[r],
+                            true,
+                        )?;
+                    }
+                    executor.encode_matmul_weight_buffers(
+                        encoder, &input, rows, in_dim, weight, &out, true,
+                    )?;
+                    encoder.end_encoding();
+                    commit_and_wait(command_buffer)?;
+                    let all = read_f32_buffer(&out, rows * out_dim)?;
+                    let mut exact = true;
+                    for (r, single) in singles.iter().enumerate() {
+                        let mono = read_f32_buffer(single, out_dim)?;
+                        exact &= mono
+                            .iter()
+                            .zip(&all[r * out_dim..(r + 1) * out_dim])
+                            .all(|(a, b)| a.to_bits() == b.to_bits());
+                    }
+                    line += &format!(
+                        " ; R{rows} ρ {:.2}{}",
+                        batched / mono,
+                        if exact { " exact" } else { " NON exact" }
+                    );
+                }
+                eprintln!("{line}");
+                Ok(())
+            })?;
+        }
+    }
+    // hc Down de production : qmv u8 split-K de `encode_hc_mix` (même
+    // dispatch), mono ; la réduction des partiels reste dans le reste du pas.
+    let kernels = FlashNextKernels::new(executor.device())?;
+    let (out_dim, in_dim) = (320, 10_240);
+    let mut rng = DeterministicF32::new(0x6e);
+    let linear =
+        LinearWeight::AffineQuantized(affine_quantized(&mut rng, out_dim, in_dim, 0.05, 8)?);
+    let bytes = out_dim * in_dim + out_dim * (in_dim / 64) * 4;
+    let copies = (512_usize << 20).div_ceil(bytes);
+    let (_linears, weights) = distinct_weights(&executor, &linear, copies)?;
+    let normed = buffer(&executor, &rng.fill(in_dim, -1.0, 1.0));
+    let partial = zeros(&executor, out_dim * super::hc::DOWN_CHUNKS);
+    let encode = |encoder: &metal::ComputeCommandEncoderRef, copy: usize| -> Result<()> {
+        let MetalLinearWeightBuffers::AffineQuantized {
+            packed,
+            packed_offset,
+            scales,
+            scales_offset,
+            biases,
+            biases_offset,
+            packed_cols,
+            groups,
+            ..
+        } = &weights[copy]
+        else {
+            return Err(InferError::Config(
+                "hc Down : poids non quantifié".to_string(),
+            ));
+        };
+        encoder.set_compute_pipeline_state(&kernels.qmv_u8_splitk);
+        encoder.set_buffer(0, Some(&normed), 0);
+        encoder.set_buffer(1, Some(packed), *packed_offset);
+        encoder.set_buffer(2, Some(scales), *scales_offset);
+        encoder.set_buffer(3, Some(biases), *biases_offset);
+        encoder.set_buffer(4, Some(&partial), 0);
+        super::set_value(
+            encoder,
+            5,
+            &[
+                out_dim as u32,
+                in_dim as u32,
+                *packed_cols as u32,
+                *groups as u32,
+            ],
+        );
+        super::set_value(encoder, 6, &(super::hc::DOWN_CHUNKS as u32));
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(super::hc::DOWN_CHUNKS as u64, out_dim.div_ceil(8) as u64, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        Ok(())
+    };
+    run(copies, &encode)?;
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        best = best.min(run(copies, &encode)?);
+    }
+    eprintln!(
+        "hc Down de production (split-K) [{out_dim}×{in_dim}, u8, ×97/pas] : mono {:.1} µs ({:.0} Go/s, {copies} copies)",
+        best * 1e6,
+        bytes as f64 / best / 1e9
+    );
+    Ok(())
+}
+
+/// `copies` poids GPU distincts de même contenu que `linear`. Le cache de
+/// buffers est indexé par `weight_id` (affine, conservé par `clone`) et par
+/// adresse (dense) : chaque copie est un tenseur neuf, rendu avec ses buffers
+/// pour rester vivant pendant la mesure. Les adresses GPU sont vérifiées
+/// distinctes.
+fn distinct_weights(
+    executor: &MetalExecutor,
+    linear: &LinearWeight,
+    copies: usize,
+) -> Result<(Vec<LinearWeight>, Vec<MetalLinearWeightBuffers>)> {
+    let linears = (0..copies)
+        .map(|_| -> Result<LinearWeight> {
+            Ok(match linear {
+                LinearWeight::Dense(t) => {
+                    LinearWeight::Dense(Tensor::from_vec(t.shape().to_vec(), t.data().to_vec())?)
+                }
+                LinearWeight::AffineQuantized(q) => {
+                    LinearWeight::AffineQuantized(AffineQuantizedTensor::new(
+                        q.packed_shape(),
+                        q.packed_data().to_vec(),
+                        Tensor::from_vec(q.scales_shape().to_vec(), q.scales_f32().to_vec())?,
+                        Tensor::from_vec(q.biases_shape().to_vec(), q.biases_f32().to_vec())?,
+                        q.group_size(),
+                        q.bits(),
+                    )?)
+                }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let weights = linears
+        .iter()
+        .map(|l| executor.resolve_linear_weight_buffers(l, "flash_next_profile"))
+        .collect::<Result<Vec<_>>>()?;
+    let address = |w: &MetalLinearWeightBuffers| match w {
+        MetalLinearWeightBuffers::Dense { rhs, .. } => rhs.gpu_address(),
+        MetalLinearWeightBuffers::AffineQuantized { packed, .. } => packed.gpu_address(),
+    };
+    let distinct: std::collections::HashSet<u64> = weights.iter().map(address).collect();
+    if distinct.len() != copies {
+        return Err(InferError::Metal(format!(
+            "profil : {} buffers distincts pour {copies} copies",
+            distinct.len()
+        )));
+    }
+    Ok((linears, weights))
+}
+
+/// Largeur hc d'une session (oracles).
+fn session_width(session: &FlashNextSession) -> usize {
+    session.hc_width()
 }

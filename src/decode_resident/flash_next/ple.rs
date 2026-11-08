@@ -91,7 +91,8 @@ impl PleState {
 }
 
 /// Ajoute la contribution PLE du token courant : `out = h + PLE(h, lignes)`.
-/// Les octets du token doivent avoir été déposés par [`PleState::stage_bytes`].
+/// `bytes` porte les octets E4M3 du token (`state.bytes` déposé par
+/// [`PleState::stage_bytes`], ou le tampon propre d'une ligne de vérification).
 #[expect(
     clippy::too_many_arguments,
     reason = "encodage Metal : pipelines, poids, état, scratch et buffers explicites"
@@ -102,6 +103,7 @@ pub(crate) fn encode_ple(
     encoder: &ComputeCommandEncoderRef,
     weights: &PleWeights,
     state: &mut PleState,
+    bytes: &BufferRef,
     scratch: &PleScratch,
     dims: HcDims,
     h: &BufferRef,
@@ -109,7 +111,7 @@ pub(crate) fn encode_ple(
 ) -> Result<()> {
     let width = dims.width();
     encoder.set_compute_pipeline_state(&kernels.ple_gather);
-    encoder.set_buffer(0, Some(&state.bytes), 0);
+    encoder.set_buffer(0, Some(bytes), 0);
     encoder.set_buffer(1, Some(&weights.lut), 0);
     encoder.set_buffer(2, Some(&scratch.emb), 0);
     set_value(encoder, 3, &(weights.ple_dim as u32));

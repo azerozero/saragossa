@@ -692,7 +692,7 @@ impl Qwen4ExpCheckpoint {
         checkpoint.validate_inventory()?;
         checkpoint.ngram_params = checkpoint.verify_ngram_params()?;
         if checkpoint.config.mtp_layers == 1 {
-            checkpoint.validate_mtp_metadata()?;
+            checkpoint.attach_mtp_sidecar()?;
         }
         Ok(checkpoint)
     }
@@ -861,16 +861,26 @@ impl Qwen4ExpCheckpoint {
         })
     }
 
-    /// Inventaire complet du sidecar MTP sur métadonnées seules (formes,
-    /// dtypes, triplets, plages physiques), sans lire les valeurs.
-    fn validate_mtp_metadata(&self) -> Result<()> {
+    /// Valide l'inventaire complet du sidecar MTP sur métadonnées seules
+    /// (formes, dtypes, triplets, plages physiques), puis l'ajoute comme shard
+    /// supplémentaire : ses tenseurs `mtp.*` se lisent comme ceux du tronc.
+    fn attach_mtp_sidecar(&mut self) -> Result<()> {
         let path = self.dir.join("mtp.safetensors");
         let header = read_shard_header(&path)?;
-        let len = std::fs::metadata(&path).map_err(|e| io(&path, e))?.len();
+        let file = File::open(&path).map_err(|e| io(&path, e))?;
+        let len = file.metadata().map_err(|e| io(&path, e))?.len();
+        let shard = self.shards.len();
         let mut index = HashMap::new();
-        index_shard(&header, len, 0, &mut index)?;
+        index_shard(&header, len, shard, &mut index)?;
         self.validate_entries(&index, &expected_mtp_tensors(&self.config))
-            .map_err(|e| cfg_err(format!("MTP: {e}")))
+            .map_err(|e| cfg_err(format!("MTP: {e}")))?;
+        if let Some(name) = index.keys().find(|name| self.index.contains_key(*name)) {
+            return Err(cfg_err(format!("MTP: {name} déjà présent dans le tronc")));
+        }
+        self.index.extend(index);
+        self.shards.push(header);
+        self.files.push(file);
+        Ok(())
     }
 
     fn entry(&self, name: &str) -> Result<(usize, &ShardTensorEntry)> {
@@ -1385,7 +1395,15 @@ mod tests {
         let mtp = dst.path().join("mtp.safetensors");
         let expected = expected_mtp_tensors(&parsed);
         write_inventory(&mtp, &expected, 64, "");
-        Qwen4ExpCheckpoint::open(dst.path()).expect("invariant: MTP complet accepté");
+        let checkpoint =
+            Qwen4ExpCheckpoint::open(dst.path()).expect("invariant: MTP complet accepté");
+        // Rattaché : les tenseurs `mtp.*` se lisent, et seulement sous leur préfixe.
+        let norm = checkpoint
+            .floats("mtp.pre_fc_norm_hidden.weight")
+            .expect("invariant: norme MTP lisible");
+        assert_eq!(norm.len(), parsed.hc_width());
+        let (packed, _, _) = checkpoint.tensor_bytes_by_kind("mtp.");
+        assert!(packed > 0, "octets MTP absents du rattachement");
 
         write_inventory(&mtp, &expected, 64, "mtp.layers.0.self_attn.o_proj.scales");
         let error = Qwen4ExpCheckpoint::open(dst.path())
