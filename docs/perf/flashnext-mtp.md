@@ -445,7 +445,8 @@ vérification greedy stricte.
     - MoE : 6,905 ms en mono, puis ρ = 2,99, 3,40 et 3,78 (26,132 ms) pour
       R = 2, 3 et 4.
 
-    Avec ces mesures :
+    Avec ces mesures, appliquées aux temps mono non arrondis du profil
+    (DeltaNet 5,065 ms, MoE 7,215 ms) :
     - DeltaNet ×(7,027 + 4 × 0,975) / 5,542 = ×1,972, soit 9,99 ms ;
     - MoE ×3,785, soit 27,31 ms ;
     - les autres postes sont inchangés.
@@ -525,8 +526,11 @@ Construction des lignes du tableau :
   reste de la brique à ρ = 1.
 - **Variante scan** : l'état DeltaNet (226 Mo lus et écrits par pas) coûte
   0,527 ms à 430 Go/s, débit des projections DeltaNet mesuré. Lu une seule fois
-  pour R lignes, il économise 3 × 0,527 ms sur le reste × 4.
-- **Optimiste** : ρ = 2,077, soit ×1,085 pour D complet, arrondi à ×1,09.
+  pour R lignes, il économise 3 × 0,527 ms sur `R × reste` ; l'économie passe
+  par le rapport de la brique (× 5,065 / 5,499), comme le reste.
+- **Optimiste** : ρ = 2,077, soit ×1,085 pour D complet avec `T_mtp/T_ar` non
+  arrondi (3,60 / 21,49), ×1,084 avec 0,168. Les gains de ce tableau sont tous
+  calculés avec le rapport non arrondi.
 
 - Seule la borne basse dépasse ×1,2 en code. Elle suppose des kernels en
   lignes idéaux partout : lecture unique et calcul gratuit, y compris pour

@@ -3024,6 +3024,8 @@ fn mtp_failed_raw_restore_poisons_session() {
                 .expect("invariant: pas MTP");
         }
     };
+    // 6 lignes : bloc en cours non vide (compress = 4), la troncature à 6
+    // exige donc la restauration, où l'échec est injecté.
     append(&mut session, 6);
     session.mtp_snapshot_raw().expect("invariant: instantané");
     append(&mut session, 2);

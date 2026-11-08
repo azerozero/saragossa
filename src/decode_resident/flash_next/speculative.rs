@@ -14,10 +14,12 @@
 //! le dernier jeton émis n'est jamais consommé par le tronc : un cycle émet
 //! au plus `budget restant − 1` jetons.
 //!
-//! Échec en cours de cycle : l'historique MTP revient au préfixe propre des
-//! `p + 1` paires vérifiées (clés brutes de l'indexeur restaurées), le tronc
-//! garde ce qu'il a engagé. Toute reprise passe par un `reset` (chaque
-//! génération en commence un).
+//! Échec récupérable en cours de cycle (erreur d'encodage) : l'historique MTP
+//! revient au préfixe propre des `p + 1` paires vérifiées (clés brutes de
+//! l'indexeur restaurées), le tronc garde ce qu'il a engagé. Une erreur GPU ou
+//! une copie de restauration ou d'instantané en échec invalide la session :
+//! l'erreur d'origine remonte, la restauration n'est pas garantie. Toute
+//! reprise passe par un `reset` (chaque génération en commence un).
 
 use super::session::{FlashNextSession, MtpInput};
 use crate::{InferError, Result};
