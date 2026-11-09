@@ -1,45 +1,24 @@
 //! Conversions de tailles et transferts de buffers Metal.
 
 use super::profiling::DECODE_PROFILE_READ_NS;
+use super::shared_rows::{SharedElement, SharedRows};
 use super::*;
 
 #[allow(
     unsafe_code,
     reason = "lecture d'un MTLBuffer partagé après wait_until_completed"
 )]
-fn read_pod_buffer<T: bytemuck::Pod + Default>(
+fn read_pod_buffer<T: SharedElement + Default>(
     buffer: &BufferRef,
     offset: usize,
     len: usize,
 ) -> Result<Vec<T>> {
     let read_started = decode_profile_enabled().then(std::time::Instant::now);
-    let ptr = buffer.contents().cast::<T>();
-    if ptr.is_null() {
-        return Err(InferError::Metal(
-            "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
-        ));
-    }
-    if offset
-        .checked_add(len)
-        .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
-        .is_none_or(|end| end as u64 > buffer.length())
-    {
-        return Err(InferError::Metal(format!(
-            "lecture MTLBuffer [{offset}, +{len}) hors des {} octets",
-            buffer.length()
-        )));
-    }
-    // SAFETY: `[offset, offset + len)` est dans le buffer (vérifié ci-dessus).
-    let ptr = unsafe { ptr.add(offset) };
-    // `out` est zéro-initialisé (aucune fenêtre non-initialisée → lint
-    // `uninit_vec` évité) ; ses `len` éléments sont ensuite ÉCRASÉS par la copie.
+    // SAFETY: les écritures GPU sont terminées et la plage reste figée pendant
+    // la copie ; SharedRows vérifie taille et alignement des éléments Pod.
+    let source = unsafe { SharedRows::<T>::borrow(buffer, offset, len)? };
     let mut out = vec![T::default(); len];
-    // SAFETY: `buffer` est en StorageModeShared et son command buffer a terminé ;
-    // on copie exactement `len` valeurs POD depuis son pointeur CPU vers `out` (même
-    // longueur, déjà allouée), sans chevauchement.
-    unsafe {
-        std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len);
-    }
+    out.copy_from_slice(source);
     #[cfg(feature = "devtools")]
     crate::runtime_flags::pairwise::record_io(false, std::mem::size_of_val(out.as_slice()));
     if let Some(started) = read_started {
@@ -77,28 +56,13 @@ pub(crate) fn read_u16_buffer(buffer: &BufferRef, len: usize) -> Result<Vec<u16>
     unsafe_code,
     reason = "écriture d'un MTLBuffer partagé avant commit du command buffer"
 )]
-fn write_pod_buffer<T: bytemuck::Pod>(buffer: &BufferRef, offset: usize, data: &[T]) -> Result<()> {
-    let ptr = buffer.contents().cast::<T>();
-    if ptr.is_null() {
-        return Err(InferError::Metal(
-            "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
-        ));
-    }
-    if offset
-        .checked_add(data.len())
-        .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
-        .is_none_or(|end| end as u64 > buffer.length())
-    {
-        return Err(InferError::Metal(format!(
-            "écriture MTLBuffer [{offset}, +{}) hors des {} octets",
-            data.len(),
-            buffer.length()
-        )));
-    }
-    // SAFETY: `buffer` est en StorageModeShared et `[offset, offset + len)` y
-    // tient (vérifié ci-dessus) ; `data` est une tranche CPU distincte.
+fn write_pod_buffer<T: SharedElement>(buffer: &BufferRef, offset: usize, data: &[T]) -> Result<()> {
+    // SAFETY: plage partagée initialisée, sans accès concurrent avant commit ;
+    // `data` est distinct. SharedRows vérifie taille et alignement des Pod.
     unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
+        SharedRows::<T>::with_mut_slice(buffer, offset, data.len(), |out| {
+            out.copy_from_slice(data);
+        })?;
     }
     #[cfg(feature = "devtools")]
     crate::runtime_flags::pairwise::record_io(true, std::mem::size_of_val(data));
@@ -213,4 +177,34 @@ pub(super) fn checked_u32(value: usize, label: &'static str) -> Result<u32> {
 pub(super) fn checked_nsuint(value: usize, label: &'static str) -> Result<NSUInteger> {
     NSUInteger::try_from(value)
         .map_err(|_| InferError::Metal(format!("{label} hors plage NSUInteger: {value}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "nécessite un device Metal"]
+    fn shared_rows_transfers_preserve_bits_and_bounds() -> Result<()> {
+        let device = Device::system_default()
+            .ok_or_else(|| InferError::Metal("device Metal absent".to_string()))?;
+        let buffer = device.new_buffer(32, MTLResourceOptions::StorageModeShared);
+        let bits = [0, 0x8000_0000, 0x7fc0_0123, 0x7f80_0000, 0x3f80_0000];
+        let values = bits.map(f32::from_bits);
+        write_f32_buffer_at(&buffer, 1, &values)?;
+        let read = read_f32_buffer_at(&buffer, 1, values.len())?;
+        assert_eq!(read.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
+        assert_eq!(read_u32_buffer(&buffer, 6)?[1..], bits);
+        let bf16 = [0, 0x8000, 0x7fc1, 0xffff];
+        write_u16_buffer_at(&buffer, 2, &bf16)?;
+        assert_eq!(read_u16_buffer_at(&buffer, 2, bf16.len())?, bf16);
+        write_u8_buffer(&buffer, &[0, 127, 255])?;
+        assert_eq!(read_pod_buffer::<u8>(&buffer, 0, 3)?, [0, 127, 255]);
+        assert!(read_f32_buffer_at(&buffer, 8, 1).is_err());
+        assert!(write_f32_buffer_at(&buffer, 8, &[1.0]).is_err());
+        assert!(read_f32_buffer_at(&buffer, usize::MAX, 1).is_err());
+        assert!(read_f32_buffer_at(&buffer, 8, 0)?.is_empty());
+        write_f32_buffer_at(&buffer, 8, &[])?;
+        Ok(())
+    }
 }
