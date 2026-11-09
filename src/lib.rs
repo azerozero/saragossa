@@ -106,6 +106,8 @@ pub use qwen_loader::{
 };
 pub use runtime::ForwardRuntime;
 pub use runtime_flags::{decode_max_tokens_per_s, set_decode_max_tokens_per_s};
+#[allow(deprecated)]
+pub use runtime_preset::apply_runtime_preset_for_model_dir;
 pub use runtime_preset::{
     initialize_kernel_environment, runtime_preset_for_model_dir, KernelProfile, RuntimePreset,
 };
