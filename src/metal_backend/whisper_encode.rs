@@ -504,12 +504,13 @@ impl MetalExecutor {
             checked_u32(m, "na m")?,
             checked_u32(n, "na n")?,
             checked_u32(k, "na k")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(lhs_bf16), 0);
         encoder.set_buffer(1, Some(rhs_t_bf16), 0);
         encoder.set_buffer(2, Some(out), 0);
-        encoder.set_bytes(3, 12, mnk.as_ptr().cast::<c_void>());
+        encoder.set_bytes(3, 16, mnk.as_ptr().cast::<c_void>());
         let width = pso.thread_execution_width().max(1);
         trace_dispatch_path(
             if tile_n == 128 {
