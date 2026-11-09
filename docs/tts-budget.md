@@ -50,6 +50,25 @@ des dimensions du checkpoint et reste à mesurer. Le test ignoré
 `tts::tests::codec::codec_at_server_frame_cap` force le codec à 800 trames pour
 cette vérification ; il échoue si le snapshot ou le codec Metal manque.
 
+Ce test isolé ne mesure pas le pire cas du serveur. Restent à relever, pour
+chaque checkpoint et machine ciblés :
+
+- le pic RSS/empreinte du processus et les allocations Metal au chargement,
+  pendant le préfill/talker, au décodage codec et pendant l'encodage/envoi WAV,
+  avec poids, KV, pool, temporaires et PCM/WAV simultanément vivants ; en mémoire
+  unifiée, ne pas additionner RSS et Metal comme des consommations disjointes ;
+- les mêmes pics à froid puis après plusieurs requêtes de tailles différentes,
+  aux budgets 160 et 800, avec les chemins résidents puis leurs replis existants,
+  pour inclure les buffers conservés par les pools ;
+- une synthèse complète atteignant réellement 800 trames (un arrêt EOS précoce
+  ne valide pas ce cas), ainsi que le plus long préfixe texte accepté par la
+  route. La limite de trames seule ne donne pas de borne mémoire globale.
+
+Consigner le checkpoint, ses dimensions, la longueur tokenisée du préfixe,
+le nombre de trames obtenu, les flags actifs, la RAM et les pics par phase.
+Le test ci-dessous ne couvre ni le talker/KV ni la coexistence PCM/WAV du
+serveur ; sa réussite ne suffit pas à déclarer le plafond sûr en mémoire.
+
 ```sh
 CARGO_NET_OFFLINE=true SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --lib tts::tests::codec::codec_at_server_frame_cap -- --ignored --exact --nocapture
 ```
