@@ -13,6 +13,34 @@ import threading
 import time
 
 
+def pmset(*args):
+    """Lecture bornée ; les erreurs sont des informations, jamais une panne du run."""
+    try:
+        return subprocess.run(["pmset", "-g", *args], capture_output=True, text=True,
+                              check=True, timeout=3).stdout, None
+    except (OSError, subprocess.SubprocessError) as error:
+        return "", str(error)
+
+
+def power_state():
+    batt, batt_error = pmset("batt")
+    mode, mode_error = pmset()
+    modes = [line.split() for line in mode.splitlines()
+             if line.split() and line.split()[0] in ("powermode", "lowpowermode")]
+    values = [parts[-1] for parts in modes if len(parts) >= 2]
+    return {"on_ac": (True if "AC Power" in batt else
+                       False if "Battery Power" in batt else None),
+            "low_power": any(v == "1" for v in values) if values else None,
+            "source_raw": batt.strip(), "mode_raw": [" ".join(p) for p in modes],
+            "errors": [e for e in (batt_error, mode_error) if e]}
+
+
+def validate_power(state):
+    if state["on_ac"] is False or state["low_power"] is True:
+        raise SystemExit("alimentation : secteur requis et mode basse consommation désactivé ; "
+                         "campagne arrêtée, reprise possible")
+
+
 def positive(value):
     return (value if type(value) in (int, float) and math.isfinite(value)
             and value > 0 else None)
