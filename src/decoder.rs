@@ -35,6 +35,7 @@ mod attention;
 mod attention_cache;
 mod attention_ops;
 mod kv_rows;
+mod tts_prefill;
 #[cfg(test)]
 pub(crate) use attention_ops::{
     attention_probs_in_place, gemma_global_attention_prefill_oracle, GemmaGlobalAttentionOracleSpec,

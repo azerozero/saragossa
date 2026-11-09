@@ -285,7 +285,6 @@ impl KvRows {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn to_vec(&self) -> Vec<f32> {
         self.f32_segments()
             .iter()
