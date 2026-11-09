@@ -288,10 +288,12 @@ impl MetalExecutor {
         let lhs_len = checked_len(batch, in_dim, "qmm na fused-tiled lhs")?;
         let lhs_bf16 = self.private_bf16_buffer(lhs_len, "qmm_na_fused_tiled_lhs_bf16")?;
         self.encode_f32_to_bf16(encoder, lhs_buffer, &lhs_bf16, lhs_len)?;
+        // `uint3` occupe 16 octets en MSL : la validation Metal refuse 12.
         let mnk = [
             checked_u32(batch, "qmm na fused-tiled batch")?,
             checked_u32(out_dim, "qmm na fused-tiled out_dim")?,
             checked_u32(in_dim, "qmm na fused-tiled in_dim")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(&lhs_bf16), 0);
@@ -299,7 +301,7 @@ impl MetalExecutor {
         encoder.set_buffer(2, Some(scales_buffer), scales_offset);
         encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
-        encoder.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        encoder.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
             profile_label,
             batch,
@@ -552,6 +554,7 @@ impl MetalExecutor {
             checked_u32(batch, "MLP fusionné batch")?,
             checked_u32(inter_dim, "MLP fusionné inter_dim")?,
             checked_u32(in_dim, "MLP fusionné in_dim")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(&lhs_bf16), 0);
@@ -562,7 +565,7 @@ impl MetalExecutor {
         encoder.set_buffer(5, Some(us), uso);
         encoder.set_buffer(6, Some(ub), ubo);
         encoder.set_buffer(7, Some(&hidden_bf16), 0);
-        encoder.set_bytes(8, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        encoder.set_bytes(8, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
             "qmm_na_fused_tiled_u4_gate_up_swiglu_gs64",
             batch,
@@ -677,6 +680,7 @@ impl MetalExecutor {
             checked_u32(batch, "qmm na fused-tiled u4 batch")?,
             checked_u32(out_dim, "qmm na fused-tiled u4 out_dim")?,
             checked_u32(in_dim, "qmm na fused-tiled u4 in_dim")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(lhs_bf16), 0);
@@ -684,7 +688,7 @@ impl MetalExecutor {
         encoder.set_buffer(2, Some(scales_buffer), scales_offset);
         encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
-        encoder.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        encoder.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
             profile_label,
             batch,
@@ -753,6 +757,7 @@ impl MetalExecutor {
             checked_u32(batch, "qmm na qb batch")?,
             checked_u32(out_dim, "qmm na qb out_dim")?,
             checked_u32(in_dim, "qmm na qb in_dim")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(&lhs_bf16), 0);
@@ -760,7 +765,7 @@ impl MetalExecutor {
         encoder.set_buffer(2, Some(scales_buffer), scales_offset);
         encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
-        encoder.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        encoder.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
             if group_size == QMM_NA_GS128_GROUP_SIZE {
                 "qmm_na_qb_u8_gs128"
