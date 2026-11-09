@@ -1,0 +1,20 @@
+bench-env: SARAGOSSA_BIN=~/workspace/saragossa-oss/.claude/worktrees/ab/target/release/saragossa
+bench-env: SARAGOSSA_RUST_MTP_DECODE=1
+bench-env: SARAGOSSA_RUST_MTP_MAX_DRAFT=2
+bench-env: SARAGOSSA_RUST_PREFIX_CACHE=0
+bench-env: SARAGOSSA_SERVE_LOG_PROMPT_FINGERPRINT=1
+bench-env: SARAGOSSA_SERVE_PREFIX_CACHE=0
+bench-launch: ~/workspace/saragossa-oss/.claude/worktrees/ab/target/release/saragossa serve --port 18080 --model qwen38=~/workspace/ai_model/Qwen3.8-27B-u4ls --preload
+saragossa serve model enregistré alias=qwen38 path=~/workspace/ai_model/Qwen3.8-27B-u4ls source=local
+saragossa serve loading model=qwen38 path=~/workspace/ai_model/Qwen3.8-27B-u4ls
+saragossa serve MTP actif model=qwen38 sidecar=~/workspace/ai_model/Qwen3.8-27B-u4ls/mtp.safetensors max_draft=2
+cpu_weights_released mode=incremental bytes=0 payloads=506 unique_weights=506
+saragossa serve warmup model=qwen38 passes=2 prompt_tokens=2 elapsed_ms=99
+mtp_adaptive_depth steps=3 deep_steps=2 avg_depth=1.6667 ema_deep=0.4900 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve warmup MTP model=qwen38 tokens=4 elapsed_ms=192
+saragossa serve TCP listening on http://127.0.0.1:18080/v1
+saragossa serve TCP bearer auth enabled
+mtp_adaptive_depth steps=184 deep_steps=77 avg_depth=1.4293 ema_deep=0.8744 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=32768 completion_tokens=400 prefill_ms=44802 decode_ms=9696 total_ms=54498 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=22160751448 prefix_cache_bytes=0 prompt_fnv1a64=c703e2d36e8c25dc
+mtp_adaptive_depth steps=177 deep_steps=92 avg_depth=1.5311 ema_deep=0.4373 cap=2 threshold=0.500 alpha=0.300 probe=8
+saragossa serve completion model=qwen38 prompt_tokens=260999 completion_tokens=400 prefill_ms=763168 decode_ms=17269 total_ms=780437 reused_prefix_tokens=0 prefix_cache=decoder-longest-prefix decode_path=mtp streaming=true footprint_bytes=33277623968 prefix_cache_bytes=0 prompt_fnv1a64=ae1987378a52ed71
