@@ -61,6 +61,19 @@ struct TtsSlot {
     model: Option<TtsModel>,
 }
 
+// Seule la synthèse est substituable : les tests conservent le choix WAV/PCM
+// du gestionnaire de production, sans charger de poids ni initialiser Metal.
+pub(super) trait SpeechSynthesis {
+    fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput>;
+    fn stream_sample_rate(&mut self) -> ServeResult<u32>;
+    fn synthesize_streaming(
+        &mut self,
+        text: &str,
+        max_frames: usize,
+        on_audio: &mut dyn FnMut(&[f32]) -> saragossa::Result<()>,
+    ) -> ServeResult<TtsSynthesisOutput>;
+}
+
 impl AudioState {
     /// Construit l'état audio depuis les chemins CLI, sans charger les poids.
     pub(super) fn new(args: &ServeArgs) -> Self {
@@ -94,26 +107,6 @@ impl AudioState {
             .ok_or_else(|| ServeError::args("modèle STT absent après chargement"))?;
         let (text, _lang) = model.transcribe(samples, lang, runtime)?;
         Ok(text)
-    }
-
-    /// Synthétise du texte en audio avec le backend Qwen3-TTS.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si le modèle TTS n'est pas configuré ou si la synthèse échoue.
-    pub(super) fn synthesize(
-        &mut self,
-        text: &str,
-        max_frames: usize,
-    ) -> ServeResult<TtsSynthesisOutput> {
-        self.ensure_tts_loaded()?;
-        let model = self
-            .tts
-            .model
-            .as_ref()
-            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
-        let output = model.synthesize_default(text, max_frames)?;
-        Ok(output)
     }
 
     fn ensure_stt_loaded(&mut self) -> ServeResult<()> {
@@ -168,6 +161,42 @@ impl AudioState {
         let model = TtsModel::load_local(&path)?;
         self.tts.model = Some(model);
         Ok(())
+    }
+}
+
+impl SpeechSynthesis for AudioState {
+    fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput> {
+        self.ensure_tts_loaded()?;
+        let model = self
+            .tts
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
+        Ok(model.synthesize_default(text, max_frames)?)
+    }
+
+    fn stream_sample_rate(&mut self) -> ServeResult<u32> {
+        self.ensure_tts_loaded()?;
+        let model = self
+            .tts
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
+        Ok(model.sample_rate())
+    }
+
+    fn synthesize_streaming(
+        &mut self,
+        text: &str,
+        max_frames: usize,
+        on_audio: &mut dyn FnMut(&[f32]) -> saragossa::Result<()>,
+    ) -> ServeResult<TtsSynthesisOutput> {
+        let model = self
+            .tts
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
+        Ok(model.synthesize_default_streaming(text, max_frames, on_audio)?)
     }
 }
 
@@ -232,7 +261,7 @@ pub(super) fn handle_transcription<S: Write>(
 /// Sert `POST /v1/audio/speech`.
 pub(super) fn handle_speech<S: Write>(
     stream: &mut S,
-    audio: &mut AudioState,
+    audio: &mut impl SpeechSynthesis,
     body: &[u8],
 ) -> ServeResult<()> {
     handle_speech_with(
@@ -244,14 +273,9 @@ pub(super) fn handle_speech<S: Write>(
                 return send_speech(stream, &audio.synthesize(text, max_frames)?);
             }
             // Le chargement peut encore produire une erreur HTTP avant les en-têtes.
-            audio.ensure_tts_loaded()?;
-            let model = audio
-                .tts
-                .model
-                .as_ref()
-                .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
-            send_speech_stream(stream, model.sample_rate(), |on_audio| {
-                Ok(model.synthesize_default_streaming(text, max_frames, on_audio)?)
+            let sample_rate = audio.stream_sample_rate()?;
+            send_speech_stream(stream, sample_rate, |on_audio| {
+                audio.synthesize_streaming(text, max_frames, on_audio)
             })
         },
     )

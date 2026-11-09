@@ -60,6 +60,83 @@ fn pcm_chunks_are_s16le_with_hex_lengths_and_no_empty_chunk() -> io::Result<()> 
 }
 
 #[test]
+fn speech_route_selects_pcm_stream_or_complete_wav() -> ServeResult<()> {
+    struct Synthesis {
+        flushes: Rc<Cell<usize>>,
+        batch_calls: usize,
+        stream_calls: usize,
+    }
+
+    impl SpeechSynthesis for Synthesis {
+        fn synthesize(&mut self, text: &str, _: usize) -> ServeResult<TtsSynthesisOutput> {
+            assert_eq!(text, "Bonjour.");
+            assert_eq!(self.flushes.get(), 0);
+            self.batch_calls += 1;
+            Ok(output(vec![1.0], true))
+        }
+
+        fn stream_sample_rate(&mut self) -> ServeResult<u32> {
+            assert_eq!(self.flushes.get(), 0);
+            Ok(24_000)
+        }
+
+        fn synthesize_streaming(
+            &mut self,
+            text: &str,
+            _: usize,
+            on_audio: &mut dyn FnMut(&[f32]) -> saragossa::Result<()>,
+        ) -> ServeResult<TtsSynthesisOutput> {
+            assert_eq!(text, "Bonjour.");
+            self.stream_calls += 1;
+            assert_eq!(self.flushes.get(), 1);
+            on_audio(&[0.25])?;
+            assert_eq!(self.flushes.get(), 2);
+            on_audio(&[-0.25])?;
+            assert_eq!(self.flushes.get(), 3);
+            // Des samples finaux distincts détectent leur réémission à la place
+            // des chunks déjà transmis pendant la synthèse.
+            Ok(output(vec![1.0], true))
+        }
+    }
+
+    for mode in [None, Some(false), Some(true)] {
+        let mut writer = Writer::default();
+        let mut synthesis = Synthesis {
+            flushes: Rc::clone(&writer.flushes),
+            batch_calls: 0,
+            stream_calls: 0,
+        };
+        let mut request = json!({"input": " Bonjour. "});
+        if let Some(streaming) = mode {
+            request["stream"] = json!(streaming);
+        }
+        handle_speech(&mut writer, &mut synthesis, request.to_string().as_bytes())?;
+        let split = find_sub(&writer.bytes, b"\r\n\r\n").expect("invariant: en-têtes écrits") + 4;
+        let headers = String::from_utf8_lossy(&writer.bytes[..split]);
+        let body = &writer.bytes[split..];
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        if mode == Some(true) {
+            assert!(headers.contains("Content-Type: audio/pcm\r\n"));
+            assert!(headers.contains("Transfer-Encoding: chunked\r\n"));
+            assert!(headers.contains("X-Saragossa-Audio-Sample-Rate: 24000\r\n"));
+            assert!(headers.contains("Trailer: X-Saragossa-TTS-Frame-Limit-Reached\r\n"));
+            assert!(!headers.contains("Content-Length:"));
+            assert_eq!(
+                body,
+                b"2\r\n\xff\x1f\r\n2\r\n\x01\xe0\r\n0\r\nX-Saragossa-TTS-Frame-Limit-Reached: true\r\n\r\n"
+            );
+            assert_eq!((synthesis.batch_calls, synthesis.stream_calls), (0, 1));
+        } else {
+            assert!(headers.contains("Content-Type: audio/wav\r\n"));
+            assert!(headers.contains(&format!("Content-Length: {}\r\n", body.len())));
+            assert_eq!(body, mono_f32_to_wav(&[1.0], 24_000)?);
+            assert_eq!((synthesis.batch_calls, synthesis.stream_calls), (1, 0));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn speech_stream_is_flushed_during_synthesis_and_matches_batch_wav() -> ServeResult<()> {
     for reached in [false, true] {
         for samples in [vec![], vec![0.0, 0.25, -0.25, 1.0, -1.0, 2.0, -2.0]] {
