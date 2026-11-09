@@ -2660,11 +2660,9 @@ impl CausalDecoder {
             return Ok(self);
         };
         self.ensure_metal_supported()?;
-        if self.runtime.metal.is_none() {
-            return Err(InferError::Config(
-                "drafter DFlash : runtime Metal requis".to_string(),
-            ));
-        }
+        let metal = self.runtime.metal.as_deref().ok_or_else(|| {
+            InferError::Config("drafter DFlash : runtime Metal requis".to_string())
+        })?;
         let quant = if crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_QUANT_BITS").is_none() {
             Some(crate::DFlashQuant {
                 group_size: 64,
@@ -2673,11 +2671,14 @@ impl CausalDecoder {
         } else {
             crate::DFlashQuant::from_env()?
         };
-        self.dflash = Some(crate::load_dflash_draft_weights_quantized(
-            target,
-            std::path::PathBuf::from(dir),
-            quant,
-        )?);
+        self.dflash = Some(
+            crate::devtools::dflash::load_dflash_draft_weights_with_runtime(
+                target,
+                std::path::PathBuf::from(dir),
+                quant,
+                ForwardRuntime::metal(metal),
+            )?,
+        );
         Ok(self)
     }
 

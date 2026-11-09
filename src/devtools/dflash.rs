@@ -1,13 +1,14 @@
 //! Validation et chargement des checkpoints draft DFlash.
 
 use crate::{
-    catalog::read_safetensors_keys, rms_norm, safetensor::bytes_to_dense_f32,
-    AffineQuantizedTensor, ForwardRuntime, GatedMlp, InferError, Linear, ModelConfig, Result,
-    Tensor,
+    catalog::read_safetensors_keys, rms_norm, ForwardRuntime, GatedMlp, InferError, Linear,
+    ModelConfig, Result, Tensor,
 };
-use safetensors::{tensor::TensorView, SafeTensors};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+mod weights;
+use weights::DraftWeights;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DFlashDraftInfo {
@@ -925,15 +926,17 @@ pub fn load_dflash_draft_weights_quantized(
     draft_dir: impl AsRef<Path>,
     quant: Option<DFlashQuant>,
 ) -> Result<DFlashDraft> {
+    load_dflash_draft_weights_with_runtime(target, draft_dir, quant, ForwardRuntime::cpu())
+}
+
+pub(crate) fn load_dflash_draft_weights_with_runtime(
+    target: &ModelConfig,
+    draft_dir: impl AsRef<Path>,
+    quant: Option<DFlashQuant>,
+    runtime: ForwardRuntime<'_>,
+) -> Result<DFlashDraft> {
     let info = load_dflash_draft_for_target(target, draft_dir)?;
-    let bytes = std::fs::read(&info.weight_path).map_err(|source| InferError::Io {
-        path: info.weight_path.clone(),
-        source,
-    })?;
-    let st = SafeTensors::deserialize(&bytes).map_err(|source| InferError::Safetensors {
-        path: info.weight_path.clone(),
-        source,
-    })?;
+    let st = DraftWeights::open(&info.weight_path, runtime)?;
     let hidden = info.hidden_size;
     let fc_in = info
         .target_layer_ids
@@ -950,41 +953,17 @@ pub fn load_dflash_draft_weights_quantized(
         .ok_or_else(|| InferError::Shape("draft DFlash kv_dim deborde".to_string()))?;
 
     let hidden_norm = load_dflash_norm(&st, "hidden_norm.weight", hidden)?;
-    let fc = load_dflash_linear(&st, "fc", hidden, fc_in, quant)?;
+    let fc = st.linear("fc", hidden, fc_in, quant)?;
     let mut layers = Vec::with_capacity(info.num_hidden_layers);
     for layer_idx in 0..info.num_hidden_layers {
         let prefix = format!("layers.{layer_idx}");
         let attention_prefix = format!("{prefix}.self_attn");
         let mlp_prefix = format!("{prefix}.mlp");
         let attention = DFlashAttentionWeights {
-            q_proj: load_dflash_linear(
-                &st,
-                &format!("{attention_prefix}.q_proj"),
-                q_dim,
-                hidden,
-                quant,
-            )?,
-            k_proj: load_dflash_linear(
-                &st,
-                &format!("{attention_prefix}.k_proj"),
-                kv_dim,
-                hidden,
-                quant,
-            )?,
-            v_proj: load_dflash_linear(
-                &st,
-                &format!("{attention_prefix}.v_proj"),
-                kv_dim,
-                hidden,
-                quant,
-            )?,
-            o_proj: load_dflash_linear(
-                &st,
-                &format!("{attention_prefix}.o_proj"),
-                hidden,
-                q_dim,
-                quant,
-            )?,
+            q_proj: st.linear(&format!("{attention_prefix}.q_proj"), q_dim, hidden, quant)?,
+            k_proj: st.linear(&format!("{attention_prefix}.k_proj"), kv_dim, hidden, quant)?,
+            v_proj: st.linear(&format!("{attention_prefix}.v_proj"), kv_dim, hidden, quant)?,
+            o_proj: st.linear(&format!("{attention_prefix}.o_proj"), hidden, q_dim, quant)?,
             q_norm: load_dflash_norm(
                 &st,
                 &format!("{attention_prefix}.q_norm.weight"),
@@ -997,22 +976,19 @@ pub fn load_dflash_draft_weights_quantized(
             )?,
         };
         let mlp = GatedMlp::new(
-            load_dflash_linear(
-                &st,
+            st.linear(
                 &format!("{mlp_prefix}.gate_proj"),
                 info.intermediate_size,
                 hidden,
                 quant,
             )?,
-            load_dflash_linear(
-                &st,
+            st.linear(
                 &format!("{mlp_prefix}.up_proj"),
                 info.intermediate_size,
                 hidden,
                 quant,
             )?,
-            load_dflash_linear(
-                &st,
+            st.linear(
                 &format!("{mlp_prefix}.down_proj"),
                 hidden,
                 info.intermediate_size,
@@ -1032,8 +1008,7 @@ pub fn load_dflash_draft_weights_quantized(
             )?;
             Ok(Some(DFlashConv {
                 base_kernel,
-                kernel_projection: load_dflash_linear(
-                    &st,
+                kernel_projection: st.linear(
                     &format!("{prefix}.{name}.kernel_projection"),
                     2 * info.conv_kernel_size * groups,
                     hidden,
@@ -1066,8 +1041,7 @@ pub fn load_dflash_draft_weights_quantized(
             Ok(tensor)
         };
         Some(DFlashSelector {
-            hidden_projection: load_dflash_linear(
-                &st,
+            hidden_projection: st.linear(
                 "candidate_selector.hidden_projection",
                 info.selector_rank,
                 hidden,
@@ -1092,42 +1066,14 @@ pub fn load_dflash_draft_weights_quantized(
     })
 }
 
-fn load_dflash_linear(
-    st: &SafeTensors,
-    prefix: &str,
-    expected_rows: usize,
-    expected_cols: usize,
-    quant: Option<DFlashQuant>,
-) -> Result<Linear> {
-    let key = format!("{prefix}.weight");
-    let tensor = load_dflash_tensor(st, &key)?;
-    expect_shape(tensor.shape(), &[expected_rows, expected_cols], &key)?;
-    match quant {
-        Some(DFlashQuant { group_size, bits }) => Linear::new_quantized(
-            AffineQuantizedTensor::quantize(&tensor, group_size, bits)?,
-            None,
-        ),
-        None => Linear::new(tensor, None),
-    }
-}
-
-fn load_dflash_norm(st: &SafeTensors, key: &str, expected_dim: usize) -> Result<Tensor> {
+fn load_dflash_norm(st: &DraftWeights<'_>, key: &str, expected_dim: usize) -> Result<Tensor> {
     let tensor = load_dflash_tensor(st, key)?;
     expect_shape(tensor.shape(), &[expected_dim], key)?;
     Ok(tensor)
 }
 
-fn load_dflash_tensor(st: &SafeTensors, key: &str) -> Result<Tensor> {
-    let view = st_tensor(st, key)?;
-    Tensor::from_vec(
-        view.shape().to_vec(),
-        bytes_to_dense_f32(view.data(), view.dtype(), key)?,
-    )
-}
-
-fn st_tensor<'a>(st: &'a SafeTensors, key: &str) -> Result<TensorView<'a>> {
+fn load_dflash_tensor(st: &DraftWeights<'_>, key: &str) -> Result<Tensor> {
     st.tensor(key)
-        .map_err(|_| InferError::MissingWeight(format!("dflash {key}")))
 }
 
 fn expect_shape(actual: &[usize], expected: &[usize], key: &str) -> Result<()> {
