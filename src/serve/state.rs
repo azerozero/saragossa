@@ -521,7 +521,6 @@ impl ModelSlot {
                 self.id,
                 self.path.display()
             );
-            let _ = saragossa::apply_runtime_preset_for_model_dir(&self.path);
             let preset = saragossa::runtime_preset_for_model_dir(&self.path);
             let assets = ModelAssets::load_local(&self.path)?;
             let mut decoder = load_decoder_with_runtime(&assets, self.backend)?;
@@ -1450,7 +1449,9 @@ fn load_decoder_with_runtime(
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn load_decoder_metal(assets: &ModelAssets) -> ServeResult<CausalDecoder> {
-    let executor = saragossa::MetalExecutor::new()?;
+    let executor = saragossa::MetalExecutor::new_with_kernel_profile(
+        saragossa::KernelProfile::for_model_dir(&assets.model_dir),
+    )?;
     Ok(saragossa::load_causal_decoder_for_metal(assets, &executor)?
         .with_metal_executor(executor)?)
 }

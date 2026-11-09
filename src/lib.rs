@@ -107,7 +107,7 @@ pub use qwen_loader::{
 pub use runtime::ForwardRuntime;
 pub use runtime_flags::{decode_max_tokens_per_s, set_decode_max_tokens_per_s};
 pub use runtime_preset::{
-    apply_runtime_preset_for_model_dir, runtime_preset_for_model_dir, RuntimePreset,
+    initialize_kernel_environment, runtime_preset_for_model_dir, KernelProfile, RuntimePreset,
 };
 pub use safetensor::{load_f32_tensor, load_f32_tensors, load_float_tensor, load_float_tensors};
 pub use sampling::{argmax, sample_token, sample_token_top_k_top_p, softmax, DeterministicSampler};

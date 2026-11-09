@@ -2,6 +2,9 @@
 
 use std::path::Path;
 
+mod kernel_profile;
+pub use kernel_profile::{initialize_kernel_environment, KernelProfile};
+
 /// Preset runtime connu pour un checkpoint local.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RuntimePreset {
@@ -28,23 +31,6 @@ pub fn runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
     let key = model_dir.to_string_lossy().to_ascii_lowercase();
     if key.contains("qwen3.6-35b-a3b-oq8") || key.contains("qwen3_6-35b-a3b-oq8") {
         return Some(QWEN36_OQ8);
-    }
-    None
-}
-
-/// Applique le preset kernel modele si aucun override explicite n'existe.
-///
-/// PROMOTED infra (decision tangle 2026-07-05) : le modele oQ8 pose
-/// `SARAGOSSA_RUST_OPT_PROFILE=qwen36-oq8`, mais l'env explicite reste prioritaire.
-///
-/// Renvoie le preset applique, ou `None` si le modele est inconnu ou si
-/// l'utilisateur a deja pose `SARAGOSSA_RUST_OPT_PROFILE`.
-#[must_use]
-pub fn apply_runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
-    let preset = runtime_preset_for_model_dir(model_dir)?;
-    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_OPT_PROFILE").is_none() {
-        std::env::set_var("SARAGOSSA_RUST_OPT_PROFILE", preset.opt_profile);
-        return Some(preset);
     }
     None
 }

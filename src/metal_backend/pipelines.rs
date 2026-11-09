@@ -354,6 +354,14 @@ impl MetalExecutor {
     ///
     /// Renvoie une erreur si Metal est indisponible ou si la compilation échoue.
     pub fn new() -> Result<Self> {
+        Self::new_with_kernel_profile(crate::KernelProfile::for_model_dir(Path::new("")))
+    }
+
+    /// Construit un executor dont les choix de kernels restent propres au modèle.
+    ///
+    /// # Errors
+    /// Renvoie une erreur si le device ou les pipelines Metal sont indisponibles.
+    pub fn new_with_kernel_profile(kernel_profile: crate::KernelProfile) -> Result<Self> {
         let device = Device::system_default()
             .ok_or_else(|| InferError::Metal("aucun device Metal disponible".to_string()))?;
         let queue = device.new_command_queue();
@@ -824,6 +832,7 @@ impl MetalExecutor {
         let moe_g_perm = compile_na("moe_g_perm");
 
         Ok(Self {
+            kernel_profile,
             rope_frequencies: super::rope::RopeFrequencyCache::default(),
             device,
             queue,
