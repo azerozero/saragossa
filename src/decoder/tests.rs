@@ -5787,3 +5787,64 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
     );
     Ok(())
 }
+
+/// Le préfixe retient les buffers MTP figés ; prolonger ou tronquer la copie
+/// de travail ne réécrit aucune ligne publiée et ne matérialise pas de Vec.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_seed_shared_prefix_keeps_allocations() -> Result<()> {
+    use crate::metal_backend::{MetalExecutor, PrefillKvRows};
+    let metal = MetalExecutor::new()?;
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let k = metal.shared_f32_rows_for_test(&[1.0, 2.0, 3.0, 4.0])?;
+    let v = metal.shared_f32_rows_for_test(&[5.0, 6.0, 7.0, 8.0])?;
+    let mut history = LayerKvCache::default();
+    let layout = AttentionLayout {
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: 2,
+        rope_dims: 2,
+        attn_scalar: 2.0,
+        sliding_window: None,
+    };
+    history.append_prefill(
+        PrefillKvRows::Shared(k.clone()),
+        PrefillKvRows::Shared(v.clone()),
+        2,
+        0,
+        &layout,
+    )?;
+    let state = (model.empty_cache(), Tensor::row(vec![0.0])?);
+    model.prefix_cache_put(&[0, 1, 2], &state, Some(&history), None)?;
+    // Un remplacement exact sans historique doit garder les mêmes segments.
+    model.prefix_cache_put(&[0, 1, 2], &state, None, None)?;
+    history.append(
+        &Tensor::row(vec![9.0, 10.0])?,
+        &Tensor::row(vec![11.0, 12.0])?,
+        &layout,
+    )?;
+    history.truncate(1)?;
+    let cache = model
+        .prefix_cache
+        .lock()
+        .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+    let saved = cache
+        .entries
+        .first()
+        .and_then(|entry| entry.mtp_history.as_ref())
+        .ok_or_else(|| InferError::Config("historique MTP absent du préfixe".to_string()))?;
+    assert_eq!(saved.len(), 2);
+    for (rows, source) in [(&saved.keys, &k), (&saved.values, &v)] {
+        let segments = rows.segments();
+        let [crate::decode_resident::KvSegment::Shared(shared)] = segments.as_slice() else {
+            return Err(InferError::Dimension(
+                "segment MTP recopié sur CPU".to_string(),
+            ));
+        };
+        assert_eq!(shared.allocation_id(), source.allocation_id());
+        assert_eq!(shared.as_slice().as_ptr(), source.as_slice().as_ptr());
+        assert_eq!(rows.to_vec(), source.as_slice());
+    }
+    Ok(())
+}

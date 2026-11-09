@@ -2389,3 +2389,302 @@ fn prefill_resident_capture_tail_matches_full() -> Result<()> {
     }
     Ok(())
 }
+
+/// Le hidden complet de l'ancien chemin est l'oracle ; le semis intégré doit
+/// garder ses bits, les états du tronc et les allocations des snapshots.
+fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
+    let executor = MetalExecutor::new()?;
+    const HIDDEN: usize = 64;
+    const Q_HEADS: usize = 2;
+    const KV_HEADS: usize = 1;
+    const HEAD_DIM: usize = 128;
+    const INTER: usize = 32;
+    // Chemin de production 27B : dk128/dv128, noyau conv 4.
+    let linear_spec = LinearAttentionStepSpec {
+        num_key_heads: 1,
+        num_value_heads: 2,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel_dim: 4,
+        rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
+    };
+    let dims = LinearAttnResidentDims {
+        in_dim: HIDDEN,
+        conv_dim: 512,
+        value_dim: 256,
+        key_dim: 128,
+    };
+
+    let input = deterministic_tensor(seq, HIDDEN, 601, 0.5)?;
+    let input_norm = deterministic_norm(HIDDEN, 607)?;
+    let post_norm = deterministic_norm(HIDDEN, 613)?;
+    let gate = Linear::new(deterministic_tensor(INTER, HIDDEN, 617, 0.1)?, None)?;
+    let up = Linear::new(deterministic_tensor(INTER, HIDDEN, 619, 0.1)?, None)?;
+    let down = Linear::new(deterministic_tensor(HIDDEN, INTER, 631, 0.1)?, None)?;
+    let in_proj_qkv = Linear::new(deterministic_tensor(512, HIDDEN, 641, 0.08)?, None)?;
+    let in_proj_z = Linear::new(deterministic_tensor(256, HIDDEN, 643, 0.08)?, None)?;
+    let in_proj_b = Linear::new(deterministic_tensor(2, HIDDEN, 647, 0.08)?, None)?;
+    let in_proj_a = Linear::new(deterministic_tensor(2, HIDDEN, 653, 0.08)?, None)?;
+    let out_proj = Linear::new(deterministic_tensor(HIDDEN, 256, 659, 0.05)?, None)?;
+    let conv_weight = Tensor::from_vec(
+        vec![512, 4, 1],
+        deterministic_tensor(512, 4, 661, 0.3)?.data().to_vec(),
+    )?;
+    let a_log = [0.1_f32, -0.2];
+    let dt_bias = [0.05_f32, 0.15];
+    let norm_weight = deterministic_norm(128, 673)?;
+    let q_norm = deterministic_norm(HEAD_DIM, 677)?;
+    let k_norm = deterministic_norm(HEAD_DIM, 683)?;
+    let q_proj = Linear::new(
+        deterministic_tensor(2 * Q_HEADS * HEAD_DIM, HIDDEN, 691, 0.06)?,
+        None,
+    )?;
+    let k_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 701, 0.06)?,
+        None,
+    )?;
+    let v_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 709, 0.06)?,
+        None,
+    )?;
+    let o_proj = Linear::new(
+        deterministic_tensor(HIDDEN, Q_HEADS * HEAD_DIM, 719, 0.02)?,
+        None,
+    )?;
+    let spec = PrefillAttentionSpec {
+        seq,
+        hidden_dim: HIDDEN,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        rope_theta: 10_000_000.0,
+        attn_scalar: HEAD_DIM as f32,
+        window: Some(128),
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let tail = PrefillMoeTail::Dense {
+        gate_proj: &gate,
+        up_proj: &up,
+        down_proj: &down,
+    };
+    let sinks = Tensor::zeros(vec![Q_HEADS])?;
+    let make_layers = |spec: PrefillAttentionSpec| {
+        [
+            PrefillMoeLayer {
+                input_norm: &input_norm,
+                attention: PrefillAttentionLayer::Linear {
+                    weights: LinearAttnResidentWeights {
+                        in_proj_qkv: &in_proj_qkv,
+                        in_proj_z: &in_proj_z,
+                        in_proj_b: &in_proj_b,
+                        in_proj_a: &in_proj_a,
+                        out_proj: &out_proj,
+                        conv_weight: &conv_weight,
+                        a_log: &a_log,
+                        dt_bias: &dt_bias,
+                        norm_weight: norm_weight.data(),
+                    },
+                    spec: linear_spec,
+                    dims,
+                },
+                attention_spec: spec,
+                post_norm: &post_norm,
+                post_norm_before_residual: false,
+                tail,
+            },
+            PrefillMoeLayer {
+                input_norm: &input_norm,
+                attention: PrefillAttentionLayer::Full {
+                    q_proj: &q_proj,
+                    k_proj: &k_proj,
+                    v_proj: &v_proj,
+                    o_proj: &o_proj,
+                    q_norm: &q_norm,
+                    k_norm: &k_norm,
+                    gated: true,
+                    sinks: Some(&sinks),
+                },
+                attention_spec: spec,
+                post_norm: &post_norm,
+                post_norm_before_residual: false,
+                tail,
+            },
+        ]
+    };
+    let layers = make_layers(spec);
+    let embedding = EmbeddingWeight::Dense(deterministic_tensor(97, HIDDEN, 727, 0.5)?);
+    let tokens: Vec<usize> = (0..seq).map(|i| (i * 31 + 7) % 97).collect();
+    let final_norm = deterministic_norm(HIDDEN, 731)?;
+    let fc = Linear::new(deterministic_tensor(HIDDEN, 2 * HIDDEN, 739, 0.1)?, None)?;
+    let weights = MtpSeedWeights {
+        embed_tokens: &embedding,
+        embed_scale: 1.0,
+        embed_recast_bf16: false,
+        pre_fc_norm_embedding: &input_norm,
+        pre_fc_norm_hidden: &post_norm,
+        fc: &fc,
+        input_norm: &input_norm,
+        k_proj: &k_proj,
+        v_proj: &v_proj,
+        k_norm: &k_norm,
+    };
+    let seed_spec = PrefillAttentionSpec {
+        window: None,
+        ..spec
+    };
+    let (expected, expected_caches, _) = executor.qwen_moe_prefill_resident_with_captures(
+        PrefillInput::Hidden(&input),
+        &layers,
+        spec,
+        &[],
+        usize::MAX,
+        chunk_rows,
+        false,
+    )?;
+    let expected = expected.into_tensor(HIDDEN)?;
+    let raw = executor.shared_f32_rows_for_test(expected.data())?;
+    let mut expected_k = Vec::new();
+    let mut expected_v = Vec::new();
+    for (index, tokens) in tokens[1..].chunks(1024).enumerate() {
+        let (k, v) = executor.mtp_seed_kv_rows(
+            tokens,
+            MtpSeedStates::Raw {
+                rows: &raw,
+                first_row: index * 1024,
+                final_norm: &final_norm,
+            },
+            weights,
+            PrefillAttentionSpec {
+                seq: tokens.len(),
+                ..seed_spec
+            },
+            index * 1024,
+        )?;
+        expected_k.extend_from_slice(k.data());
+        expected_v.extend_from_slice(v.data());
+    }
+    let mut seed = MtpPrefillSeed::new(
+        &executor,
+        weights,
+        seed_spec,
+        &final_norm,
+        &tokens[1..],
+        1024,
+    )?;
+    let (actual, actual_caches, _) = executor.qwen_moe_prefill_resident_with_mtp(
+        PrefillInput::Hidden(&input),
+        &layers,
+        spec,
+        &[],
+        usize::MAX,
+        chunk_rows,
+        None,
+        true,
+        Some(&mut seed),
+    )?;
+    // Même avec scratch privé, seule une ligne de sortie peut être allouée.
+    assert!(super::resident::FINAL_OUTPUT_FLOATS.with(Cell::get) <= HIDDEN);
+    assert_eq!(actual.len(), HIDDEN);
+    assert_bit_exact(
+        &actual.into_tensor(HIDDEN)?,
+        &Tensor::row(expected.last_row()?.to_vec())?,
+        "dernier hidden MTP",
+    );
+    assert_full_kv_bit_exact(&actual_caches, &expected_caches, "K/V du tronc MTP")?;
+    for (actual, expected) in actual_caches.iter().zip(&expected_caches) {
+        if let (
+            PrefillResidentLayerCache::Linear { state: a },
+            PrefillResidentLayerCache::Linear { state: b },
+        ) = (actual, expected)
+        {
+            assert_eq!(a.ssm_bf16, b.ssm_bf16);
+            for (a, b, len, bf16) in [
+                (&a.conv, &b.conv, a.conv_len, false),
+                (&a.ssm, &b.ssm, a.ssm_len, a.ssm_bf16),
+            ] {
+                if bf16 {
+                    assert_eq!(read_u16_buffer(a, len)?, read_u16_buffer(b, len)?);
+                } else {
+                    assert_eq!(
+                        read_f32_buffer(a, len)?
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect::<Vec<_>>(),
+                        read_f32_buffer(b, len)?
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+        }
+    }
+    let (k, v) = seed.into_rows()?;
+    let (PrefillKvRows::Shared(k), PrefillKvRows::Shared(v)) = (k, v) else {
+        return Err(InferError::Dimension(
+            "historique MTP non partagé".to_string(),
+        ));
+    };
+    for (rows, expected) in [(&k, &expected_k), (&v, &expected_v)] {
+        assert_eq!(rows.len(), (seq - 1) * KV_HEADS * HEAD_DIM);
+        assert_eq!(
+            rows.as_slice()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        let snapshot = rows.clone();
+        assert_eq!(snapshot.allocation_id(), rows.allocation_id());
+        assert_eq!(snapshot.as_slice().as_ptr(), rows.as_slice().as_ptr());
+    }
+    // L'arène reçoit les segments GPU par son chemin existant, sans Vec CPU.
+    let state = crate::decode_resident::DecodeResidentState::new(executor.device().to_owned())?;
+    for create in [
+        crate::decode_resident::DecodeResidentState::full_attention_f32_for_test,
+        crate::decode_resident::DecodeResidentState::full_attention_bf16_for_test,
+    ] {
+        let mut actual = create(&state, seq, Q_HEADS, KV_HEADS, HEAD_DIM)?;
+        let mut expected = create(&state, seq, Q_HEADS, KV_HEADS, HEAD_DIM)?;
+        use crate::decode_resident::KvSegment;
+        actual.seed_segments(&[KvSegment::Shared(&k)], &[KvSegment::Shared(&v)], seq - 1)?;
+        expected.seed_segments(
+            &[KvSegment::Cpu(&expected_k)],
+            &[KvSegment::Cpu(&expected_v)],
+            seq - 1,
+        )?;
+        let (ak, av) = actual.read_rows(0, seq - 1)?;
+        let (ek, ev) = expected.read_rows(0, seq - 1)?;
+        for (a, b) in [(ak, ek), (av, ev)] {
+            assert_eq!(
+                a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                b.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_seed_streamed_4097_bit_exact() -> Result<()> {
+    check_mtp_seed_streamed(4097, 4096)
+}
+
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_seed_streamed_8297_bit_exact() -> Result<()> {
+    // Découpage non aligné sur les blocs du semis, avec une queue de 104 lignes.
+    check_mtp_seed_streamed(8297, 1500)
+}
+
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_seed_streamed_32768_bit_exact() -> Result<()> {
+    check_mtp_seed_streamed(32768, 4096)
+}
