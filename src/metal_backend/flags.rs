@@ -665,8 +665,30 @@ pub(super) fn scratch_resource_options() -> MTLResourceOptions {
 }
 
 pub(super) fn private_scratch_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = PRIVATE_SCRATCH_OVERRIDE.with(Cell::get) {
+        return enabled;
+    }
     static PRIVATE: OnceLock<bool> = OnceLock::new();
     *PRIVATE.get_or_init(|| env_flag("SARAGOSSA_RUST_PRIVATE_SCRATCH", false))
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRIVATE_SCRATCH_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Isole le mode de stockage du test sans modifier l'environnement ni son OnceLock.
+#[cfg(test)]
+pub(super) fn with_private_scratch_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PRIVATE_SCRATCH_OVERRIDE.with(|value| value.set(self.0));
+        }
+    }
+    let _restore = Restore(PRIVATE_SCRATCH_OVERRIDE.with(|value| value.replace(Some(enabled))));
+    run()
 }
 
 pub(super) fn fast_gather_qmv_enabled(weight: &StackedAffineBuffers) -> bool {

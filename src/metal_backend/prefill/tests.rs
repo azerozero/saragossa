@@ -2394,6 +2394,14 @@ fn prefill_resident_capture_tail_matches_full() -> Result<()> {
 /// garder ses bits, les états du tronc et les allocations des snapshots.
 fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
     let executor = MetalExecutor::new()?;
+    if private_scratch_enabled() {
+        assert_eq!(
+            executor
+                .private_f32_buffer(1, "mtp_seed_scratch_probe")?
+                .storage_mode(),
+            metal::MTLStorageMode::Private,
+        );
+    }
     const HIDDEN: usize = 64;
     const Q_HEADS: usize = 2;
     const KV_HEADS: usize = 1;
@@ -2588,7 +2596,12 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
         Some(&mut seed),
     )?;
     // Même avec scratch privé, seule une ligne de sortie peut être allouée.
-    assert!(super::resident::FINAL_OUTPUT_FLOATS.with(Cell::get) <= HIDDEN);
+    let output_floats = super::resident::FINAL_OUTPUT_FLOATS.with(Cell::get);
+    if private_scratch_enabled() {
+        assert_eq!(output_floats, HIDDEN);
+    } else {
+        assert!(output_floats <= HIDDEN);
+    }
     assert_eq!(actual.len(), HIDDEN);
     assert_bit_exact(
         &actual.into_tensor(HIDDEN)?,
@@ -2687,4 +2700,15 @@ fn mtp_seed_streamed_8297_bit_exact() -> Result<()> {
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_32768_bit_exact() -> Result<()> {
     check_mtp_seed_streamed(32768, 4096)
+}
+
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_seed_streamed_private_scratch_bit_exact() -> Result<()> {
+    crate::metal_backend::flags::with_private_scratch_override(true, || {
+        assert!(private_scratch_enabled());
+        // Le blit final doit rester borné, avec et sans frontière de morceau.
+        check_mtp_seed_streamed(129, 4096)?;
+        check_mtp_seed_streamed(4097, 4096)
+    })
 }
