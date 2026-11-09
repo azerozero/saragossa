@@ -423,10 +423,14 @@ fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
                 .samples::<i16>()
                 .map(|sample| sample.map(|value| f32::from(value) / f32::from(i16::MAX)))
                 .collect::<Result<Vec<_>, _>>(),
-            24 | 32 => reader
-                .samples::<i32>()
-                .map(|sample| sample.map(|value| value as f32 / i32::MAX as f32))
-                .collect(),
+            bits @ (24 | 32) => {
+                // hound rend la valeur 24 bits telle quelle dans un i32, sans la décaler.
+                let full_scale = ((1_u64 << (bits - 1)) - 1) as f32;
+                reader
+                    .samples::<i32>()
+                    .map(|sample| sample.map(|value| value as f32 / full_scale))
+                    .collect()
+            }
             other => {
                 return Err(ServeError::Http(format!(
                     "profondeur WAV non supportée: {other} bits"
@@ -790,11 +794,7 @@ mod tests {
             let mut wav = pcm_wav(16_000, 1, bits, 1);
             wav[44..].fill(0xff);
             wav[44 + usize::from(bits / 8) - 1] = 0x7f;
-            let expected = match bits {
-                24 => 8_388_607_f32 / i32::MAX as f32,
-                _ => 1.0,
-            };
-            assert_eq!(wav_to_mono_16k(&wav)?, [expected]);
+            assert_eq!(wav_to_mono_16k(&wav)?, [1.0]);
         }
         let mut wav = pcm_wav(16_000, 1, 32, 1);
         wav[20..22].copy_from_slice(&3_u16.to_le_bytes());
