@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AffineMatmulKernel {
     Qmm2,
     QmvT,
@@ -22,6 +22,36 @@ pub(super) enum AffineMatmulKernel {
     FastQmvU8,
     FastQmvU8Align64,
     Fallback,
+}
+
+impl AffineMatmulKernel {
+    /// Les offsets Metal sont en octets. Seul le chargeur NA tuilé u4
+    /// (`load_b_tile_quant_u4_gs64_split`, x3 et align64 compris) caste packed
+    /// en uint4 : 16 octets. Les autres lisent des uint/ushort et les affines
+    /// des bfloat scalaires : contrats des arguments uint* (4) et bfloat* (2).
+    /// « align64 » décrit K % 64, pas une adresse alignée sur 64 octets.
+    pub(super) fn supports_offsets(self, packed: u64, scales: u64, biases: u64) -> bool {
+        let packed_alignment = match self {
+            Self::QmmNaFusedTiledU4 | Self::QmmNaFusedTiledU4Align64 => 16,
+            _ => 4,
+        };
+        packed % packed_alignment == 0 && scales % 2 == 0 && biases % 2 == 0
+    }
+
+    pub(super) fn with_offsets(self, packed: u64, scales: u64, biases: u64) -> Self {
+        if self.supports_offsets(packed, scales, biases) {
+            self
+        } else {
+            Self::Fallback
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Exerce chaque encodeur même si le matériel ou les flags privilégient
+    // un autre chemin. Le contrôle d'alignement de production reste appliqué.
+    pub(super) static OFFSET_TEST_KERNEL: Cell<Option<AffineMatmulKernel>> = const { Cell::new(None) };
 }
 
 impl MetalExecutor {
@@ -99,6 +129,10 @@ impl MetalExecutor {
         bits: usize,
         prefer_fast_affine: bool,
     ) -> AffineMatmulKernel {
+        #[cfg(test)]
+        if let Some(kernel) = OFFSET_TEST_KERNEL.with(Cell::get) {
+            return kernel;
+        }
         // Vérification greedy stricte : seuls les chemins exacts en lignes (qmm2,
         // qmv-T, qmv répliqué) ; les GEMM NA (MMA bf16) sont exclus à toute largeur.
         let strict = super::verify_strict_active();
@@ -183,6 +217,10 @@ impl MetalExecutor {
         weight: &AffineQuantizedTensor,
         prefer_fast_affine: bool,
     ) -> AffineMatmulKernel {
+        #[cfg(test)]
+        if let Some(kernel) = OFFSET_TEST_KERNEL.with(Cell::get) {
+            return kernel;
+        }
         // Vérification greedy stricte : seuls les chemins exacts en lignes (qmm2,
         // qmv-T, qmv répliqué) ; les GEMM NA (MMA bf16) sont exclus à toute largeur.
         let strict = super::verify_strict_active();

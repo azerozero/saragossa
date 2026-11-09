@@ -220,33 +220,17 @@ impl MetalExecutor {
             checked_u32(groups, "groups")?,
             0,
         ];
-        if packed_offset != 0 || scales_offset != 0 || biases_offset != 0 {
-            self.encode_resident_affine_fallback(
-                encoder,
-                lhs_buffer,
-                packed,
-                packed_offset,
-                scales,
-                scales_offset,
-                biases,
-                biases_offset,
-                output_buffer,
+        match self
+            .select_resident_affine_matmul_kernel(
                 batch,
                 in_dim,
                 out_dim,
-                &dims,
-                &quant,
-            )?;
-            return Ok(out_dim);
-        }
-        match self.select_resident_affine_matmul_kernel(
-            batch,
-            in_dim,
-            out_dim,
-            group_size,
-            bits,
-            prefer_fast_affine,
-        ) {
+                group_size,
+                bits,
+                prefer_fast_affine,
+            )
+            .with_offsets(packed_offset, scales_offset, biases_offset)
+        {
             AffineMatmulKernel::Qmm2 => self.encode_resident_affine_qmm2(
                 encoder,
                 lhs_buffer,
@@ -320,8 +304,11 @@ impl MetalExecutor {
                     encoder,
                     lhs_buffer,
                     packed,
+                    packed_offset,
                     scales,
+                    scales_offset,
                     biases,
+                    biases_offset,
                     output_buffer,
                     batch,
                     in_dim,
@@ -333,8 +320,11 @@ impl MetalExecutor {
                     encoder,
                     lhs_buffer,
                     packed,
+                    packed_offset,
                     scales,
+                    scales_offset,
                     biases,
+                    biases_offset,
                     output_buffer,
                     batch,
                     in_dim,
@@ -345,8 +335,11 @@ impl MetalExecutor {
                 encoder,
                 lhs_buffer,
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -360,8 +353,11 @@ impl MetalExecutor {
                 encoder,
                 lhs_buffer,
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -374,8 +370,11 @@ impl MetalExecutor {
                 encoder,
                 lhs_buffer,
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -387,8 +386,11 @@ impl MetalExecutor {
                 encoder,
                 lhs_buffer,
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -400,8 +402,11 @@ impl MetalExecutor {
                 encoder,
                 lhs_buffer,
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -413,8 +418,11 @@ impl MetalExecutor {
                 encoder,
                 lhs_buffer,
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -426,8 +434,11 @@ impl MetalExecutor {
                     encoder,
                     lhs_buffer,
                     packed,
+                    packed_offset,
                     scales,
+                    scales_offset,
                     biases,
+                    biases_offset,
                     output_buffer,
                     batch,
                     in_dim,
@@ -439,8 +450,11 @@ impl MetalExecutor {
                 encoder,
                 lhs_buffer,
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -451,8 +465,11 @@ impl MetalExecutor {
                 encoder,
                 lhs_buffer,
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -466,8 +483,11 @@ impl MetalExecutor {
                 encoder,
                 lhs_buffer,
                 packed,
+                packed_offset,
                 scales,
+                scales_offset,
                 biases,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -644,7 +664,7 @@ impl MetalExecutor {
     }
 
     /// Encode `out = residual + W·x` (batch 1, u4/gs64, `in_dim % 512 == 0`,
-    /// `out_dim % 8 == 0`, offsets nuls) via le qmv u4 aligné résiduel (pairwise p2).
+    /// `out_dim % 8 == 0`, offsets alignés) via le qmv u4 aligné résiduel (pairwise p2).
     /// `Ok(false)` sans rien encoder si désactivé ou non éligible : l'appelant garde
     /// qmv + `weighted_sum_add_topk`. Égalité exacte seulement avec un score 1.0.
     pub(crate) fn encode_qmv_u4_residual_buffers(
@@ -688,9 +708,11 @@ impl MetalExecutor {
             && in_dim % 512 == 0
             && out_dim > 0
             && out_dim % 8 == 0
-            && *packed_offset == 0
-            && *scales_offset == 0
-            && *biases_offset == 0
+            && AffineMatmulKernel::FastQmvU4.supports_offsets(
+                *packed_offset,
+                *scales_offset,
+                *biases_offset,
+            )
             && fits(lhs_buffer, in_dim)
             && fits(residual_buffer, out_dim)
             && fits(output_buffer, out_dim);
@@ -706,9 +728,9 @@ impl MetalExecutor {
         let out_groups = checked_nsuint(out_dim.div_ceil(8), "residual out groups")?;
         encoder.set_compute_pipeline_state(&self.affine_qmv_fast_aligned_u4_gs64_residual_f32);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed), 0);
-        encoder.set_buffer(2, Some(scales), 0);
-        encoder.set_buffer(3, Some(biases), 0);
+        encoder.set_buffer(1, Some(packed), *packed_offset);
+        encoder.set_buffer(2, Some(scales), *scales_offset);
+        encoder.set_buffer(3, Some(biases), *biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &dims, "residual_dims")?;
         encoder.set_buffer(6, Some(residual_buffer), 0);
@@ -740,8 +762,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed: &BufferRef,
+        packed_offset: NSUInteger,
         scales: &BufferRef,
+        scales_offset: NSUInteger,
         biases: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -770,9 +795,9 @@ impl MetalExecutor {
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed), 0);
-        encoder.set_buffer(2, Some(scales), 0);
-        encoder.set_buffer(3, Some(biases), 0);
+        encoder.set_buffer(1, Some(packed), packed_offset);
+        encoder.set_buffer(2, Some(scales), scales_offset);
+        encoder.set_buffer(3, Some(biases), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &fast_dims, "fast_dims")?;
         profile_dispatch_shape(DispatchProfileShape::matmul(
@@ -807,8 +832,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed: &BufferRef,
+        packed_offset: NSUInteger,
         scales: &BufferRef,
+        scales_offset: NSUInteger,
         biases: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -890,9 +918,9 @@ impl MetalExecutor {
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed), 0);
-        encoder.set_buffer(2, Some(scales), 0);
-        encoder.set_buffer(3, Some(biases), 0);
+        encoder.set_buffer(1, Some(packed), packed_offset);
+        encoder.set_buffer(2, Some(scales), scales_offset);
+        encoder.set_buffer(3, Some(biases), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &fast_dims, "fast_u8_dims")?;
         profile_dispatch_shape(DispatchProfileShape::matmul(

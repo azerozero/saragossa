@@ -1825,6 +1825,11 @@ kernel void affine_qmv_fast_aligned_u8_gs64_tg128_f32(
     }
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
+    // N est multiple de 8, mais une tuile TG128/TG256 couvre 16/32 lignes.
+    // Ne pas lire les blocs voisins quand le poids est une vue d'un concat.
+    if (row_base >= out_dim) {
+        return;
+    }
 
     const device uint* ws = packed + row_base * packed_cols + simd_lid;
     const device bfloat* scale_base = scales + row_base * groups;
@@ -1901,6 +1906,11 @@ kernel void affine_qmv_fast_aligned_u8_gs128_tg128_f32(
     }
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
+    // N est multiple de 8, mais une tuile TG128/TG256 couvre 16/32 lignes.
+    // Ne pas lire les blocs voisins quand le poids est une vue d'un concat.
+    if (row_base >= out_dim) {
+        return;
+    }
 
     const device uint* ws = packed + row_base * packed_cols + simd_lid;
     const device bfloat* scale_base = scales + row_base * groups;
@@ -1977,6 +1987,11 @@ kernel void affine_qmv_fast_aligned_u8_gs64_tg256_f32(
     }
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
+    // N est multiple de 8, mais une tuile TG128/TG256 couvre 16/32 lignes.
+    // Ne pas lire les blocs voisins quand le poids est une vue d'un concat.
+    if (row_base >= out_dim) {
+        return;
+    }
 
     const device uint* ws = packed + row_base * packed_cols + simd_lid;
     const device bfloat* scale_base = scales + row_base * groups;
@@ -2053,6 +2068,11 @@ kernel void affine_qmv_fast_aligned_u8_gs128_tg256_f32(
     }
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
+    // N est multiple de 8, mais une tuile TG128/TG256 couvre 16/32 lignes.
+    // Ne pas lire les blocs voisins quand le poids est une vue d'un concat.
+    if (row_base >= out_dim) {
+        return;
+    }
 
     const device uint* ws = packed + row_base * packed_cols + simd_lid;
     const device bfloat* scale_base = scales + row_base * groups;

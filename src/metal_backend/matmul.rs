@@ -1,5 +1,6 @@
 //! Matmuls Metal et résolution des poids linéaires.
 
+use super::matmul_select::AffineMatmulKernel;
 use super::*;
 
 // Instrumentation Phase 2 (byte-id, hors chemin prod) : cumul du temps passé à
@@ -428,7 +429,11 @@ impl MetalExecutor {
         let scales_offset = affine_scales_offset(weight)?;
         let biases_buffer = self.cached_affine_biases(weight, "biases")?;
         let biases_offset = affine_biases_offset(weight)?;
-        let has_weight_offsets = packed_offset != 0 || scales_offset != 0 || biases_offset != 0;
+        let aligned_weights = AffineMatmulKernel::FastQmvU4.supports_offsets(
+            packed_offset,
+            scales_offset,
+            biases_offset,
+        );
         let output_len = checked_len(batch, *out_dim, "sortie matmul Metal quantifiée")?;
         let output_buffer = self.device.new_buffer(
             byte_len::<f32>(output_len)?,
@@ -453,11 +458,12 @@ impl MetalExecutor {
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encoder_guard = EncoderEndGuard::new(encoder);
-        if !has_weight_offsets
+        if aligned_weights
             && (can_use_fast_affine_qmm2(batch, in_dim, weight)
                 || can_use_fast_affine_qmm2_u3(batch, in_dim, weight)
                 || can_use_fast_affine_qmm2_u8(batch, in_dim, weight))
         {
+            trace_dispatch_path("standalone_qmm2", batch, *out_dim, in_dim);
             let fast_dims = [
                 checked_u32(*out_dim, "qmm2 out_dim")?,
                 checked_u32(in_dim, "qmm2 in_dim")?,
@@ -478,8 +484,8 @@ impl MetalExecutor {
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&lhs_buffer), 0);
             encoder.set_buffer(1, Some(&packed_buffer), packed_offset);
-            encoder.set_buffer(2, Some(&scales_buffer), 0);
-            encoder.set_buffer(3, Some(&biases_buffer), 0);
+            encoder.set_buffer(2, Some(&scales_buffer), scales_offset);
+            encoder.set_buffer(3, Some(&biases_buffer), biases_offset);
             encoder.set_buffer(4, Some(&output_buffer), 0);
             encoder.set_buffer(5, Some(&fast_dims_buffer), 0);
             profile_dispatch();
@@ -492,7 +498,8 @@ impl MetalExecutor {
                 MTLSize::new(64, 1, 1),
             );
             post_dispatch_barrier(encoder);
-        } else if !has_weight_offsets && can_use_fast_affine_qmv(batch, in_dim, weight) {
+        } else if aligned_weights && can_use_fast_affine_qmv(batch, in_dim, weight) {
+            trace_dispatch_path("standalone_qmv_u4", batch, *out_dim, in_dim);
             let fast_dims = [
                 checked_u32(*out_dim, "fast out_dim")?,
                 checked_u32(in_dim, "fast in_dim")?,
@@ -509,8 +516,8 @@ impl MetalExecutor {
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&lhs_buffer), 0);
             encoder.set_buffer(1, Some(&packed_buffer), packed_offset);
-            encoder.set_buffer(2, Some(&scales_buffer), 0);
-            encoder.set_buffer(3, Some(&biases_buffer), 0);
+            encoder.set_buffer(2, Some(&scales_buffer), scales_offset);
+            encoder.set_buffer(3, Some(&biases_buffer), biases_offset);
             encoder.set_buffer(4, Some(&output_buffer), 0);
             encoder.set_buffer(5, Some(&fast_dims_buffer), 0);
             profile_dispatch();
@@ -523,13 +530,16 @@ impl MetalExecutor {
                 MTLSize::new(64, 1, 1),
             );
             post_dispatch_barrier(encoder);
-        } else if !has_weight_offsets && can_use_fast_affine_qmv_u2(batch, in_dim, weight) {
+        } else if aligned_weights && can_use_fast_affine_qmv_u2(batch, in_dim, weight) {
             self.encode_affine_qmv_u2_buffers(
                 encoder,
                 &lhs_buffer,
                 &packed_buffer,
+                packed_offset,
                 &scales_buffer,
+                scales_offset,
                 &biases_buffer,
+                biases_offset,
                 &output_buffer,
                 batch,
                 in_dim,
@@ -537,13 +547,16 @@ impl MetalExecutor {
                 *packed_cols,
                 groups,
             )?;
-        } else if !has_weight_offsets && can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
+        } else if aligned_weights && can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
             self.encode_affine_qmv_u3_buffers(
                 encoder,
                 &lhs_buffer,
                 &packed_buffer,
+                packed_offset,
                 &scales_buffer,
+                scales_offset,
                 &biases_buffer,
+                biases_offset,
                 &output_buffer,
                 batch,
                 in_dim,
@@ -551,7 +564,8 @@ impl MetalExecutor {
                 *packed_cols,
                 groups,
             )?;
-        } else if !has_weight_offsets && can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
+        } else if aligned_weights && can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
+            trace_dispatch_path("standalone_qmv_u6", batch, *out_dim, in_dim);
             let fast_dims = [
                 checked_u32(*out_dim, "fast u6 out_dim")?,
                 checked_u32(in_dim, "fast u6 in_dim")?,
@@ -568,8 +582,8 @@ impl MetalExecutor {
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&lhs_buffer), 0);
             encoder.set_buffer(1, Some(&packed_buffer), packed_offset);
-            encoder.set_buffer(2, Some(&scales_buffer), 0);
-            encoder.set_buffer(3, Some(&biases_buffer), 0);
+            encoder.set_buffer(2, Some(&scales_buffer), scales_offset);
+            encoder.set_buffer(3, Some(&biases_buffer), biases_offset);
             encoder.set_buffer(4, Some(&output_buffer), 0);
             encoder.set_buffer(5, Some(&fast_dims_buffer), 0);
             profile_dispatch();
@@ -582,7 +596,8 @@ impl MetalExecutor {
                 MTLSize::new(64, 1, 1),
             );
             post_dispatch_barrier(encoder);
-        } else if !has_weight_offsets && can_use_fast_affine_qmv_u8(batch, in_dim, weight) {
+        } else if aligned_weights && can_use_fast_affine_qmv_u8(batch, in_dim, weight) {
+            trace_dispatch_path("standalone_qmv_u8", batch, *out_dim, in_dim);
             let fast_dims = [
                 checked_u32(*out_dim, "fast u8 out_dim")?,
                 checked_u32(in_dim, "fast u8 in_dim")?,
@@ -613,6 +628,7 @@ impl MetalExecutor {
             );
             post_dispatch_barrier(encoder);
         } else {
+            trace_dispatch_path("affine_matmul_rhs_t_u32_f32", batch, *out_dim, in_dim);
             encoder.set_compute_pipeline_state(&self.affine_matmul_rhs_t_u32_f32);
             encoder.set_buffer(0, Some(&lhs_buffer), 0);
             encoder.set_buffer(1, Some(&packed_buffer), packed_offset);
@@ -892,27 +908,31 @@ impl MetalExecutor {
         result
     }
 
-    /// Réutilise uniquement le préfixe QKV d'un concat complet déjà retenu.
+    /// Réutilise les blocs QKV et z d'un concat complet déjà retenu.
     /// Les vues existantes gardent le même dispatch ; convertir un poids CPU
     /// ici changerait la sélection concat/split et l'arrondi de ses affines.
-    pub(crate) fn retained_linear_attn_qkv_alias(
+    pub(crate) fn retained_linear_attn_qkv_z_aliases(
         &self,
         weights: LinearAttnResidentWeights<'_>,
-    ) -> Result<Option<AffineQuantizedTensor>> {
+    ) -> Result<Option<(AffineQuantizedTensor, AffineQuantizedTensor)>> {
         if !linear_full_concat_enabled() {
             return Ok(None);
         }
         let Some(qkv) = weights.in_proj_qkv.weight().affine_quantized() else {
             return Ok(None);
         };
-        if [
-            qkv.packed_metal_view(),
-            qkv.scales_metal_view(),
-            qkv.biases_metal_view(),
-        ]
-        .iter()
-        .any(|view| !matches!(view, Some((_, 0))))
-        {
+        let Some(z) = weights.in_proj_z.weight().affine_quantized() else {
+            return Ok(None);
+        };
+        if [qkv, z].iter().any(|weight| {
+            [
+                weight.packed_metal_view(),
+                weight.scales_metal_view(),
+                weight.biases_metal_view(),
+            ]
+            .iter()
+            .any(|view| !matches!(view, Some((_, 0))))
+        }) {
             return Ok(None);
         }
         let sources = [
@@ -939,18 +959,40 @@ impl MetalExecutor {
         else {
             return Ok(None);
         };
-        // QKV est le premier bloc : l'offset zéro conserve les kernels rapides.
-        // Le clone transactionnel garde weight_id et valide les trois vues avant
-        // de remplacer les propriétaires, sans copier ni modifier les octets.
+        // Les offsets des vues sont en éléments (u32 / bf16), ceux de Metal
+        // en octets. Les tailles du préfixe évitent toute hypothèse de group_size.
+        let packed_start = qkv.packed_len();
+        let scales_start = qkv.scales_len();
+        let biases_start = qkv.biases_len();
+        if !AffineMatmulKernel::QmmNaFusedTiledU4.supports_offsets(
+            byte_len::<u32>(packed_start)?,
+            byte_len::<u16>(scales_start)?,
+            byte_len::<u16>(biases_start)?,
+        ) {
+            return Ok(None);
+        }
+        // Les vues conservent les longueurs propres à QKV/z. Les kernels bornent
+        // leurs lectures par N/K (tuiles u4 : K % 64, lecture uint4 de 32 poids),
+        // jamais par la longueur du buffer concat qui inclut aussi b/a.
+        // Valider les six vues sur des clones avant de toucher aux caches ou aux
+        // propriétaires : une erreur laisse QKV et z intacts, identités comprises.
         let mut alias = qkv.clone();
         alias.set_packed_metal_view(packed.clone(), 0)?;
         alias.set_affine_metal_views(scales.clone(), 0, biases.clone(), 0)?;
+        let mut z_alias = z.clone();
+        z_alias.set_packed_metal_view(packed.clone(), packed_start)?;
+        z_alias.set_affine_metal_views(
+            scales.clone(),
+            scales_start,
+            biases.clone(),
+            biases_start,
+        )?;
         let mut cached = self.weight_buffers.lock().map_err(|_| {
             InferError::Metal("cache poids Metal empoisonné: alias QKV".to_string())
         })?;
         for (key, buffer) in cached.iter_mut() {
             if let MetalBufferSource::Affine { weight_id, part } = key.source {
-                if weight_id == qkv.weight_id() {
+                if weight_id == qkv.weight_id() || weight_id == z.weight_id() {
                     *buffer = match part {
                         AffineWeightPart::Packed => packed.clone(),
                         AffineWeightPart::Scales => scales.clone(),
@@ -959,7 +1001,7 @@ impl MetalExecutor {
                 }
             }
         }
-        Ok(Some(alias))
+        Ok(Some((alias, z_alias)))
     }
 
     /// Vrai si le concat de `weights` sert sans reconstruction à chaque appel :

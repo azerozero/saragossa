@@ -263,15 +263,20 @@ impl LinearAttention {
         }
         let resolved = metal.resolve_linear_attn_resident_dense_weights(weights)?;
         let alias = if resolved.full.is_some() {
-            metal.retained_linear_attn_qkv_alias(weights)?
+            metal.retained_linear_attn_qkv_z_aliases(weights)?
         } else {
             None
         };
-        // Les paires split possèdent encore des clones de l'ancien QKV.
+        // Les paires split possèdent encore des clones des anciens QKV et z.
         // Les sessions résidentes seront résolues depuis les nouvelles vues.
         drop(resolved);
-        if let (Some(alias), Some(qkv)) = (alias, self.in_proj_qkv.affine_quantized_mut()) {
-            *qkv = alias;
+        if let (Some((qkv_alias, z_alias)), Some(qkv), Some(z)) = (
+            alias,
+            self.in_proj_qkv.affine_quantized_mut(),
+            self.in_proj_z.affine_quantized_mut(),
+        ) {
+            *qkv = qkv_alias;
+            *z = z_alias;
         }
         Ok(())
     }
