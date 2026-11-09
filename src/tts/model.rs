@@ -47,6 +47,9 @@ pub struct TtsSynthesisOutput {
     pub codes: Vec<Vec<i32>>,
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+    /// Le budget effectif a été consommé sans observer EOS. Le PCM reste utile,
+    /// mais peut être incomplet. `false` n'exclut pas l'arrêt anti-répétition.
+    pub frame_limit_reached: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

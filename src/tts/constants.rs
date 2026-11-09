@@ -1,5 +1,6 @@
 pub const DEFAULT_INSTRUCT: &str = "Voix féminine française Réti-01 : claire, posée et professionnelle, articulation nette, ton neutre et rassurant, débit efficace.";
-pub(super) const CLONE_GENERATION_HARD_CAP: usize = 800;
+/// Borne historique du clone, également appliquée au budget du serveur audio.
+pub const CLONE_GENERATION_HARD_CAP: usize = 800;
 pub(super) const CLONE_DEFAULT_MIN_FRAMES: usize = 75;
 pub(super) const CLONE_DEFAULT_FRAMES_PER_TOKEN: usize = 6;
 pub(super) const CLONE_SAMPLE_TEMPERATURE: f32 = 0.9;
