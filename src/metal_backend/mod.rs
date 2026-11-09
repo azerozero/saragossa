@@ -78,7 +78,7 @@ mod mtp_seed;
 mod shared_rows;
 pub(crate) use self::mtp_seed::{MtpSeedStates, MtpSeedWeights};
 pub(crate) use self::shared_rows::{
-    allocation_identity, InPlaceClaim, PrefillKvRows, SharedBf16Rows, SharedF32Rows,
+    allocation_identity, InPlaceClaim, PrefillKvRows, SharedBf16Rows, SharedF32Rows, SharedRows,
 };
 mod na_gemm;
 mod nax_rows;
