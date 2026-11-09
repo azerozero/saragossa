@@ -8,6 +8,7 @@ batch 1, sur secteur. L'analyse et ses réserves sont dans [`rapport.md`](rappor
 | `night1/` | 4 et 6 nov. | nuit 1 (eval-S, eval-M, sampled-S) puis nuit 2 (256k, run 2), qualité (PPL, KL, `llama-bench`) |
 | `night4/` | 7 nov. | saragossa seul, binaire `main`, 256k compris |
 | `night5/` | 8 nov. | tous les moteurs dans la même session, eval-S et sampled-S ; `pairs_sar.txt` donne les rapports appariés |
+| `night6/` | 9 nov. | saragossa et mlx-lm sur le checkpoint u4ls (`tools/quant/convert_ls.py`), concurrents GGUF inchangés ; 36 prompts disjoints en 3 blocs, 256k de saragossa et mlx-lm ; `sensors.jsonl.gz` donne les capteurs à 1 Hz |
 
 Par dossier :
 

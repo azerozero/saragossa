@@ -1,0 +1,213 @@
+{
+ "seed": 20261104,
+ "phases": [
+  "eval-L-mlx"
+ ],
+ "matrix": "matrix.frozen.json",
+ "matrix_sha256": "8b258d1c7fb131483526bf4a28f3c04b44f29eae5b2d9906a29b0cc82bad8f11",
+ "entries": [
+  {
+   "phase": "eval-L-mlx",
+   "block": 0,
+   "position": 0,
+   "config": "sar-ar",
+   "config_spec": {
+    "engine": "saragossa",
+    "launch": [
+     "launch_saragossa.sh",
+     "ar"
+    ],
+    "args": [],
+    "env": {},
+    "unsupported": null
+   },
+   "class": "L",
+   "ctx": 262144,
+   "sampling": "greedy",
+   "warmup": {
+    "prompt": "tune-code32k-1",
+    "seed": null,
+    "repeat": 0,
+    "nonce": "1084918071265817",
+    "request_id": "eval-L-mlx|b0|sar-ar|warmup|sNone|r0"
+   },
+   "requests": [
+    {
+     "prompt": "code256k-1",
+     "seed": null,
+     "repeat": 0,
+     "nonce": "4733422063789462",
+     "request_id": "eval-L-mlx|b0|sar-ar|code256k-1|sNone|r0"
+    }
+   ]
+  },
+  {
+   "phase": "eval-L-mlx",
+   "block": 0,
+   "position": 1,
+   "config": "mlx-ar",
+   "config_spec": {
+    "engine": "mlx",
+    "launch": [
+     "launch_mlx.sh",
+     "ar"
+    ],
+    "args": [
+     "--prefill-step-size",
+     "2048"
+    ],
+    "env": {},
+    "unsupported": null
+   },
+   "class": "L",
+   "ctx": 262144,
+   "sampling": "greedy",
+   "warmup": {
+    "prompt": "tune-code32k-1",
+    "seed": null,
+    "repeat": 0,
+    "nonce": "9617420765787399",
+    "request_id": "eval-L-mlx|b0|mlx-ar|warmup|sNone|r0"
+   },
+   "requests": [
+    {
+     "prompt": "code256k-1",
+     "seed": null,
+     "repeat": 0,
+     "nonce": "4733422063789462",
+     "request_id": "eval-L-mlx|b0|mlx-ar|code256k-1|sNone|r0"
+    }
+   ]
+  },
+  {
+   "phase": "eval-L-mlx",
+   "block": 0,
+   "position": 2,
+   "config": "sar-mtp",
+   "config_spec": {
+    "engine": "saragossa",
+    "launch": [
+     "launch_saragossa.sh",
+     "mtp"
+    ],
+    "args": [],
+    "env": {
+     "SARAGOSSA_RUST_MTP_MAX_DRAFT": "2"
+    },
+    "unsupported": null
+   },
+   "class": "L",
+   "ctx": 262144,
+   "sampling": "greedy",
+   "warmup": {
+    "prompt": "tune-code32k-1",
+    "seed": null,
+    "repeat": 0,
+    "nonce": "9543273813719734",
+    "request_id": "eval-L-mlx|b0|sar-mtp|warmup|sNone|r0"
+   },
+   "requests": [
+    {
+     "prompt": "code256k-1",
+     "seed": null,
+     "repeat": 0,
+     "nonce": "4733422063789462",
+     "request_id": "eval-L-mlx|b0|sar-mtp|code256k-1|sNone|r0"
+    }
+   ]
+  },
+  {
+   "phase": "eval-L-mlx",
+   "block": 0,
+   "position": 3,
+   "config": "sar-dflash",
+   "config_spec": {
+    "engine": "saragossa",
+    "launch": [
+     "launch_saragossa.sh",
+     "dflash"
+    ],
+    "args": [],
+    "env": {},
+    "unsupported": null
+   },
+   "class": "L",
+   "ctx": 262144,
+   "sampling": "greedy",
+   "warmup": {
+    "prompt": "tune-code32k-1",
+    "seed": null,
+    "repeat": 0,
+    "nonce": "4606642674495693",
+    "request_id": "eval-L-mlx|b0|sar-dflash|warmup|sNone|r0"
+   },
+   "requests": [
+    {
+     "prompt": "code256k-1",
+     "seed": null,
+     "repeat": 0,
+     "nonce": "4733422063789462",
+     "request_id": "eval-L-mlx|b0|sar-dflash|code256k-1|sNone|r0"
+    }
+   ]
+  }
+ ],
+ "requests": [
+  {
+   "prompt": "tune-code32k-1",
+   "seed": null,
+   "repeat": 0,
+   "nonce": "1084918071265817",
+   "request_id": "eval-L-mlx|b0|sar-ar|warmup|sNone|r0"
+  },
+  {
+   "prompt": "code256k-1",
+   "seed": null,
+   "repeat": 0,
+   "nonce": "4733422063789462",
+   "request_id": "eval-L-mlx|b0|sar-ar|code256k-1|sNone|r0"
+  },
+  {
+   "prompt": "tune-code32k-1",
+   "seed": null,
+   "repeat": 0,
+   "nonce": "9617420765787399",
+   "request_id": "eval-L-mlx|b0|mlx-ar|warmup|sNone|r0"
+  },
+  {
+   "prompt": "code256k-1",
+   "seed": null,
+   "repeat": 0,
+   "nonce": "4733422063789462",
+   "request_id": "eval-L-mlx|b0|mlx-ar|code256k-1|sNone|r0"
+  },
+  {
+   "prompt": "tune-code32k-1",
+   "seed": null,
+   "repeat": 0,
+   "nonce": "9543273813719734",
+   "request_id": "eval-L-mlx|b0|sar-mtp|warmup|sNone|r0"
+  },
+  {
+   "prompt": "code256k-1",
+   "seed": null,
+   "repeat": 0,
+   "nonce": "4733422063789462",
+   "request_id": "eval-L-mlx|b0|sar-mtp|code256k-1|sNone|r0"
+  },
+  {
+   "prompt": "tune-code32k-1",
+   "seed": null,
+   "repeat": 0,
+   "nonce": "4606642674495693",
+   "request_id": "eval-L-mlx|b0|sar-dflash|warmup|sNone|r0"
+  },
+  {
+   "prompt": "code256k-1",
+   "seed": null,
+   "repeat": 0,
+   "nonce": "4733422063789462",
+   "request_id": "eval-L-mlx|b0|sar-dflash|code256k-1|sNone|r0"
+  }
+ ]
+}
