@@ -2483,6 +2483,9 @@ fn affine_embedding_u3_fallback_dequantizes_like_cpu_bit_exact() -> Result<()> {
 #[test]
 #[ignore = "GPU Metal : comparaison qmm/qmv u6 strictement bit à bit"]
 fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
+    use super::flags::with_qmm_u6_override;
+    use super::profiling::take_dispatch_shapes_for_test;
+
     // Un lancement explicite doit échouer sans device, pas réussir sans calcul.
     let executor = MetalExecutor::new()?;
     let assert_exact = |actual: &[f32], expected: &[f32], context: &str| {
@@ -2501,38 +2504,32 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
         (2048, 2048),
     ] {
         let weight = test_affine_varied_u6(out_dim, in_dim)?;
+        let owned_weight = LinearWeight::AffineQuantized(weight.clone());
         let packed = executor.buffer_from_slice(weight.packed_data(), "qmm_u6_packed")?;
         let scales =
             executor.buffer_from_f32_as_bf16(weight.scales_f32().as_ref(), "qmm_u6_scales")?;
         let biases =
             executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), "qmm_u6_biases")?;
-        let buffers = executor.resolve_linear_weight_buffers(
-            &LinearWeight::AffineQuantized(weight.clone()),
-            "qmm_u6_weight",
-        )?;
+        let buffers = executor.resolve_linear_weight_buffers(&owned_weight, "qmm_u6_weight")?;
         // Toutes les queues de tuile, plusieurs tuiles et des sorties impaires.
         for batch in [1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 31, 32, 33] {
             assert!(can_use_fast_affine_qmv_u6_buffers(
                 batch, in_dim, out_dim, 64, 6
             ));
-            let batched = batch > 1 && qmm_u6_enabled();
-            for selected in [
-                executor.select_owned_affine_matmul_kernel(batch, in_dim, &weight, false),
-                executor.select_resident_affine_matmul_kernel(batch, in_dim, out_dim, 64, 6, false),
-            ] {
-                if batched {
-                    assert!(matches!(selected, AffineMatmulKernel::QmmBatchedU6));
-                } else {
-                    assert!(matches!(selected, AffineMatmulKernel::FastQmvU6));
-                }
-            }
             let lhs: Vec<f32> = (0..batch)
                 .flat_map(|row| varied_row(in_dim, 53 + row))
                 .collect();
             let expected =
                 fast_qmv_u6_reference(&executor, &weight, &lhs, batch, "qmm_u6_qmv_ref")?;
+            // Chaque ligne doit détecter un encodeur qui laisse sa sortie à zéro.
+            assert!(expected
+                .chunks_exact(out_dim)
+                .all(|row| row.iter().any(|&value| value != 0.0)));
             let lhs_buf = executor.upload_f32_buffer(&lhs, "qmm_u6_lhs")?;
             let output = executor.uncached_f32_buffer(batch * out_dim, "qmm_u6_out")?;
+            let zeros = vec![0.0; batch * out_dim];
+            write_f32_buffer(&output, &zeros)?;
+            take_dispatch_shapes_for_test();
             let command_buffer = executor.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             // Dispatch direct même avec le kill-switch : l'oracle ne dépend pas du routage.
@@ -2557,26 +2554,76 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                 &expected,
                 &context,
             );
+            assert_eq!(
+                take_dispatch_shapes_for_test(),
+                [DispatchProfileShape::matmul(
+                    "affine_qmm_batched_u6_gs64", batch, in_dim, out_dim, 64, 6,
+                )],
+                "{context}, kernel direct"
+            );
 
             let input = Tensor::from_vec(vec![batch, in_dim], lhs)?;
-            let owned = executor.matmul_rhs_t_affine(&input, &weight)?;
-            assert_exact(owned.data(), &expected, &format!("{context}, owned"));
+            for enabled in [true, false] {
+                with_qmm_u6_override(enabled, || -> Result<()> {
+                    assert_eq!(qmm_u6_enabled(), enabled);
+                    let kind = if enabled && batch > 1 {
+                        "affine_qmm_batched_u6_gs64"
+                    } else if out_dim % 2 == 0 {
+                        "affine_qmv_u6_aligned_gs64"
+                    } else {
+                        "affine_qmv_u6_tail_gs64"
+                    };
+                    let dispatch = DispatchProfileShape::matmul(kind, batch, in_dim, out_dim, 64, 6);
+                    for resident in [false, true] {
+                        let context = format!("{context}, flag={enabled}, resident={resident}");
+                        // Le chemin précédent masquerait sinon une absence d'écriture.
+                        write_f32_buffer(&output, &zeros)?;
+                        take_dispatch_shapes_for_test();
+                        let mut owned_buffers = Vec::new();
+                        let command_buffer = executor.queue.new_command_buffer();
+                        let encoder = command_buffer.new_compute_command_encoder();
+                        let actual_out = if resident {
+                            executor.encode_matmul_weight_buffers(
+                                encoder, &lhs_buf, batch, in_dim, &buffers, &output, false,
+                            )?
+                        } else {
+                            executor.encode_matmul_weight(
+                                encoder,
+                                &mut owned_buffers,
+                                &lhs_buf,
+                                batch,
+                                in_dim,
+                                &owned_weight,
+                                &output,
+                            )?
+                        };
+                        assert_eq!(actual_out, out_dim, "{context}");
+                        encoder.end_encoding();
+                        commit_and_wait(command_buffer)?;
+                        assert_eq!(take_dispatch_shapes_for_test(), [dispatch], "{context}");
+                        assert_exact(
+                            &read_f32_buffer(&output, batch * out_dim)?,
+                            &expected,
+                            &context,
+                        );
+                    }
 
-            let command_buffer = executor.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            assert_eq!(
-                executor.encode_matmul_weight_buffers(
-                    encoder, &lhs_buf, batch, in_dim, &buffers, &output, false,
-                )?,
-                out_dim
-            );
-            encoder.end_encoding();
-            commit_and_wait(command_buffer)?;
-            assert_exact(
-                &read_f32_buffer(&output, batch * out_dim)?,
-                &expected,
-                &format!("{context}, resident"),
-            );
+                    // L'API Tensor alloue sa propre sortie neuve à chaque appel.
+                    take_dispatch_shapes_for_test();
+                    let direct = executor.matmul_rhs_t_affine(&input, &weight)?;
+                    assert_eq!(
+                        take_dispatch_shapes_for_test(),
+                        [dispatch],
+                        "{context}, API Tensor, flag={enabled}"
+                    );
+                    assert_exact(
+                        direct.data(),
+                        &expected,
+                        &format!("{context}, API Tensor, flag={enabled}"),
+                    );
+                    Ok(())
+                })?;
+            }
         }
     }
     Ok(())
