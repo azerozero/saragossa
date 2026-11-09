@@ -61,6 +61,8 @@ pub(crate) fn with_prefill_kv_reserve<R>(rows: usize, run: impl FnOnce() -> R) -
 
 #[cfg(test)]
 thread_local! {
+    /// Prouve que le semis MTP ne réserve pas un hidden pleine longueur.
+    pub(super) static FINAL_OUTPUT_FLOATS: Cell<usize> = const { Cell::new(0) };
     /// Morceaux et seuil du stockage bf16 imposés par un test du décodeur,
     /// cf. [`with_prefill_kv_layout_override`].
     static PREFILL_KV_LAYOUT_OVERRIDE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
@@ -301,6 +303,7 @@ impl MetalExecutor {
         Ok((output.into_tensor(spec.hidden_dim)?, caches))
     }
 
+    #[cfg(test)]
     pub(crate) fn qwen_moe_prefill_resident_with_captures(
         &self,
         input: PrefillInput<'_>,
@@ -371,6 +374,35 @@ impl MetalExecutor {
         Vec<PrefillResidentLayerCache>,
         Option<PrefillCaptures>,
     )> {
+        self.qwen_moe_prefill_resident_with_mtp(
+            input,
+            layers,
+            spec,
+            capture_layer_ids,
+            keep_rows,
+            chunk_tokens,
+            prefix,
+            last_row_only,
+            None,
+        )
+    }
+
+    pub(crate) fn qwen_moe_prefill_resident_with_mtp(
+        &self,
+        input: PrefillInput<'_>,
+        layers: &[PrefillMoeLayer<'_>],
+        spec: PrefillAttentionSpec,
+        capture_layer_ids: &[usize],
+        keep_rows: usize,
+        chunk_tokens: usize,
+        prefix: Option<&PrefillResidentPrefix<'_>>,
+        last_row_only: bool,
+        mut mtp_seed: Option<&mut MtpPrefillSeed<'_>>,
+    ) -> Result<(
+        PrefillKvRows,
+        Vec<PrefillResidentLayerCache>,
+        Option<PrefillCaptures>,
+    )> {
         let profile_sections = prefill_profile_sections_enabled();
         if profile_sections {
             reset_prefill_f32_to_bf16_shapes();
@@ -406,6 +438,13 @@ impl MetalExecutor {
         let chunk_tokens = layout_override.map_or(chunk_tokens, |(chunk, _)| chunk);
         let chunk_rows = self.resident_prefill_chunk_rows(layers, rows, chunk_tokens);
         let chunk_count = rows.div_ceil(chunk_rows);
+        // Sans sortie partagée dans l'ancien chemin, la norme finale était
+        // CPU. Garder ce repli évite de changer ses bits sur un prefill monobloc.
+        if mtp_seed.is_some() && chunk_count == 1 && !private_scratch_enabled() {
+            return Err(InferError::Config(
+                "semis MTP monobloc avec norme CPU".to_string(),
+            ));
+        }
         let mut kernel_timing = if profile_sections {
             None
         } else {
@@ -466,10 +505,21 @@ impl MetalExecutor {
             Some(self.uncached_f32_buffer(len, "resident_captures")?)
         };
         let final_output = if (chunk_count > 1 && !last_row_only) || private_scratch_enabled() {
-            Some(self.uncached_f32_buffer(hidden_len, "resident_final_output")?)
+            let len = if last_row_only {
+                hidden_dim
+            } else {
+                hidden_len
+            };
+            Some(self.uncached_f32_buffer(len, "resident_final_output")?)
         } else {
             None
         };
+        #[cfg(test)]
+        FINAL_OUTPUT_FLOATS.with(|len| {
+            len.set(final_output.as_ref().map_or(0, |buffer| {
+                buffer.length() as usize / std::mem::size_of::<f32>()
+            }))
+        });
         // NOTE: seuls le KV pleine longueur et l'état linéaire survivent aux
         // morceaux ; tout le reste est un scratch dimensionné sur un morceau.
         // Le miroir ne sert qu'à l'attention par morceaux (plusieurs morceaux
@@ -920,6 +970,7 @@ impl MetalExecutor {
                     let (q_dim, kv_dim, layer_shape) =
                         self.resident_prefill_layer_shape(layer, layer_index, spec, hidden_dim)?;
                     let kv_only = last_row_only
+                        && mtp_seed.is_none()
                         && layer_index + 1 == layers.len()
                         && chunk.start + chunk.rows < spec.seq
                         && matches!(layer.attention, PrefillAttentionLayer::Full { .. })
@@ -1038,7 +1089,25 @@ impl MetalExecutor {
                         }
                     }
                 }
-                if let Some(final_output) = final_output.as_ref() {
+                if let Some(seed) = mtp_seed.as_deref_mut() {
+                    self.run_resident_prefill_section(
+                        &mut encode_context,
+                        "mtp_seed",
+                        |encoder, _owned| {
+                            seed.encode_chunk(
+                                self,
+                                encoder,
+                                &current_buffer,
+                                chunk.start,
+                                chunk.rows,
+                            )
+                        },
+                    )?;
+                }
+                if let Some(final_output) = final_output
+                    .as_ref()
+                    .filter(|_| !last_row_only || chunk.start + chunk.rows == spec.seq)
+                {
                     self.run_resident_prefill_section(
                         &mut encode_context,
                         "final_copy",
@@ -1046,10 +1115,18 @@ impl MetalExecutor {
                             self.encode_copy_with_offsets(
                                 encoder,
                                 &current_buffer,
-                                0,
+                                if last_row_only {
+                                    f32_byte_offset((chunk.rows - 1) * hidden_dim)?
+                                } else {
+                                    0
+                                },
                                 final_output,
-                                chunk_offset_bytes,
-                                chunk_hidden_len,
+                                if last_row_only { 0 } else { chunk_offset_bytes },
+                                if last_row_only {
+                                    hidden_dim
+                                } else {
+                                    chunk_hidden_len
+                                },
                             )
                         },
                     )?;
@@ -1132,6 +1209,10 @@ impl MetalExecutor {
             wait_started.map(|started| started.elapsed())
         };
 
+        if let Some(seed) = mtp_seed {
+            seed.complete();
+        }
+
         let read_started = trace.then(std::time::Instant::now);
         let profile_read_started = profile_sections.then(std::time::Instant::now);
         let output = if !last_row_only
@@ -1145,10 +1226,10 @@ impl MetalExecutor {
             let rows = unsafe { SharedF32Rows::new(final_read_buffer, 0, hidden_len)? };
             PrefillKvRows::Shared(rows)
         } else if last_row_only {
-            // Dernière ligne du morceau final, ou de la sortie pleine longueur
-            // quand le scratch privé l'impose.
+            // Le scratch privé publie seulement la dernière ligne ; le semis
+            // MTP éventuel a déjà consommé les autres lignes.
             let last_row = if final_output_used {
-                rows - 1
+                0
             } else {
                 (rows - 1) % chunk_rows
             };
