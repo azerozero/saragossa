@@ -459,6 +459,9 @@ impl CausalDecoder {
             skip - captured_from,
             prompt.len() - captured_from,
         )?;
+        // L'append attend la fin des commandes Metal : le KV du drafter suffit
+        // désormais, sans garder les captures du prompt pendant le decode.
+        drop(target_hidden);
 
         let mut sampler = DeterministicSampler::new(options.seed);
         let mut pending = self.sample_token_from_state(&final_state, options, &mut sampler)?;
