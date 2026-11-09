@@ -101,17 +101,18 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle TTS n'est pas configuré ou si la synthèse échoue.
-    pub(super) fn synthesize(&mut self, text: &str) -> ServeResult<TtsSynthesisOutput> {
+    pub(super) fn synthesize(
+        &mut self,
+        text: &str,
+        max_frames: usize,
+    ) -> ServeResult<TtsSynthesisOutput> {
         self.ensure_tts_loaded()?;
         let model = self
             .tts
             .model
             .as_ref()
             .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
-        let output = model.synthesize_default(
-            text,
-            tts_max_frames(text, std::env::var(TTS_MAX_FRAMES_ENV).ok().as_deref()),
-        )?;
+        let output = model.synthesize_default(text, max_frames)?;
         Ok(output)
     }
 
@@ -234,6 +235,22 @@ pub(super) fn handle_speech<S: Write>(
     audio: &mut AudioState,
     body: &[u8],
 ) -> ServeResult<()> {
+    handle_speech_with(
+        stream,
+        body,
+        std::env::var(TTS_MAX_FRAMES_ENV).ok().as_deref(),
+        |text, max_frames| audio.synthesize(text, max_frames),
+    )
+}
+
+// L'injection permet de vérifier les arguments transmis par la route sans
+// charger de poids ni initialiser Metal.
+fn handle_speech_with<S: Write>(
+    stream: &mut S,
+    body: &[u8],
+    override_value: Option<&str>,
+    synthesize: impl FnOnce(&str, usize) -> ServeResult<TtsSynthesisOutput>,
+) -> ServeResult<()> {
     let request: SpeechRequest = serde_json::from_slice(body)
         .map_err(|e| ServeError::json("désérialisation audio/speech", e))?;
     let input = request.input.trim();
@@ -242,7 +259,7 @@ pub(super) fn handle_speech<S: Write>(
             "champ 'input' requis pour audio/speech".to_string(),
         ));
     }
-    let output = audio.synthesize(input)?;
+    let output = synthesize(input, tts_max_frames(input, override_value))?;
     send_speech(stream, &output)
 }
 
@@ -587,6 +604,42 @@ mod tests {
             tts_max_frames("Bonjour.", Some(&usize::MAX.to_string())),
             800
         );
+    }
+
+    #[test]
+    fn speech_passes_cleaned_text_and_budget_to_synthesis() -> ServeResult<()> {
+        for (text, override_value, expected_frames) in [
+            ("Bonjour.".to_string(), None, 160),
+            ("é".repeat(200), None, 400),
+            ("a".repeat(500), None, 800),
+            ("é".repeat(200), Some("160"), 160),
+            ("é".repeat(200), Some("12"), 12),
+            ("é".repeat(200), Some("2000"), 800),
+            ("é".repeat(200), Some("0"), 400),
+        ] {
+            let body = json!({ "input": format!("  {text}\n") }).to_string();
+            let mut response = Vec::new();
+            let mut called = false;
+            handle_speech_with(
+                &mut response,
+                body.as_bytes(),
+                override_value,
+                |input, max_frames| {
+                    called = true;
+                    assert_eq!(input, text);
+                    assert_eq!(max_frames, expected_frames);
+                    Ok(TtsSynthesisOutput {
+                        codes: Vec::new(),
+                        samples: vec![0.0],
+                        sample_rate: 24_000,
+                        frame_limit_reached: false,
+                    })
+                },
+            )?;
+            assert!(called);
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        }
+        Ok(())
     }
 
     #[test]
