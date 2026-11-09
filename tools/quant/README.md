@@ -9,6 +9,8 @@ fabriquer des poids, pas à les exécuter.
 | `mixed_quant.py` | Alloue deux largeurs de bits par couche selon la sensibilité, écrit un modèle MLX |
 | `kl_eval.py` | Mesure KL(bf16 ‖ quantifié) et l'accord top-1, en teacher forcing |
 | `test_allocation.py` | Tests de la logique d'allocation, sans dépendance à MLX |
+| `convert_ls.py` | Re-quantifie en u4 gs64 par moindres carrés depuis les poids BF16, sans changer le format (+1,7 % de perplexité contre +2,9 % en min-max sur le 27B, sans données de calibration) |
+| `opt_quant.py` | Ajustement d'échelle et de biais par groupe utilisé par `convert_ls.py` |
 
 ## Méthode
 
