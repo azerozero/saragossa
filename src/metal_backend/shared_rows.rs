@@ -474,7 +474,7 @@ mod identity_tests {
         short.truncate(2);
         assert!(!short.is_whole(), "vue plus longue vivante");
 
-        let claim = InPlaceClaim::try_after([&k, &v]).expect("réserve libre");
+        let claim = InPlaceClaim::try_after([&k, &v]).expect("invariant: réserve libre");
         assert!(
             InPlaceClaim::try_after([&k, &v]).is_none(),
             "claim exclusif"

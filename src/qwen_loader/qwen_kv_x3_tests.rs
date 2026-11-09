@@ -105,7 +105,7 @@ fn qwen27b_kv_nax_x3_greedy_matches_qmv() {
                 let hidden = model
                     .prefill_hidden_for_test(&prompt, Some(target))
                     .expect("invariant: prefill résident")
-                    .expect("prefill résident Metal attendu pour Qwen 27B");
+                    .expect("invariant: prefill résident Metal attendu pour Qwen 27B");
                 rows = model
                     .logits_of_hidden_rows_for_test(&hidden, &[len - 1])
                     .expect("invariant: logits du prefill");
@@ -149,7 +149,7 @@ fn qwen27b_kv_nax_x3_greedy_matches_qmv() {
             let hidden = model
                 .prefill_hidden_for_test(&prompt, Some(half))
                 .expect("invariant: prefill résident")
-                .expect("prefill résident Metal attendu pour Qwen 27B");
+                .expect("invariant: prefill résident Metal attendu pour Qwen 27B");
             qmv_half = model
                 .logits_of_hidden_rows_for_test(&hidden, &[len - 1])
                 .expect("invariant: logits du prefill")

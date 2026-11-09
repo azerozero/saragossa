@@ -4259,7 +4259,7 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         // (tour 2), le prolongement recopie sans toucher aux lignes publiées.
         let turn2_kv = kv(&turn2);
         let (branched, _) = model.prefill_cache_state(&branch)?;
-        let (copy, _) = sole_view(&branched).expect("vue entière d'un buffer neuf");
+        let (copy, _) = sole_view(&branched).expect("invariant: vue entière d'un buffer neuf");
         assert_ne!(copy, home, "branche recopiée");
         assert_eq!(kv(&branched), cold(&branch)?, "branche : K/V vs froid");
         assert_eq!(kv(&turn2), turn2_kv, "lignes publiées intactes");
