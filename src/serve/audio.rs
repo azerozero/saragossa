@@ -5,7 +5,7 @@
 //!   (`file` = WAV, plus `model`/`language`/`response_format` optionnels), réponse
 //!   JSON `{"text": ...}` (ou texte brut si `response_format=text`).
 //! - `POST /v1/audio/speech` : TTS Qwen3, requête JSON `{"model", "input", "voice"?}`,
-//!   réponse bytes WAV (`Content-Type: audio/wav`).
+//!   réponse WAV par défaut, ou PCM s16le mono chunked avec `stream: true`.
 //!
 //! Les modèles sont opt-in (`--stt-model`, `--tts-model`) et chargés paresseusement
 //! au premier appel : sans configuration, la route renvoie une erreur 400 claire.
@@ -239,7 +239,21 @@ pub(super) fn handle_speech<S: Write>(
         stream,
         body,
         std::env::var(TTS_MAX_FRAMES_ENV).ok().as_deref(),
-        |text, max_frames| audio.synthesize(text, max_frames),
+        |stream, text, max_frames, streaming| {
+            if !streaming {
+                return send_speech(stream, &audio.synthesize(text, max_frames)?);
+            }
+            // Le chargement peut encore produire une erreur HTTP avant les en-têtes.
+            audio.ensure_tts_loaded()?;
+            let model = audio
+                .tts
+                .model
+                .as_ref()
+                .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
+            send_speech_stream(stream, model.sample_rate(), |on_audio| {
+                Ok(model.synthesize_default_streaming(text, max_frames, on_audio)?)
+            })
+        },
     )
 }
 
@@ -249,7 +263,7 @@ fn handle_speech_with<S: Write>(
     stream: &mut S,
     body: &[u8],
     override_value: Option<&str>,
-    synthesize: impl FnOnce(&str, usize) -> ServeResult<TtsSynthesisOutput>,
+    synthesize: impl FnOnce(&mut S, &str, usize, bool) -> ServeResult<()>,
 ) -> ServeResult<()> {
     let request: SpeechRequest = serde_json::from_slice(body)
         .map_err(|e| ServeError::json("désérialisation audio/speech", e))?;
@@ -259,8 +273,12 @@ fn handle_speech_with<S: Write>(
             "champ 'input' requis pour audio/speech".to_string(),
         ));
     }
-    let output = synthesize(input, tts_max_frames(input, override_value))?;
-    send_speech(stream, &output)
+    synthesize(
+        stream,
+        input,
+        tts_max_frames(input, override_value),
+        request.stream,
+    )
 }
 
 fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeResult<()> {
@@ -278,12 +296,81 @@ fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeRe
         .map_err(|e| ServeError::io("flush réponse WAV", e))
 }
 
-/// Requête `/v1/audio/speech`. Seul `input` est consommé : le backend expose une
-/// voix VoiceDesign unique, donc `model`/`voice` (ignorés) sont acceptés sans effet.
+// L'écriture reste synchrone sur le thread moteur : pas de producteur détaché
+// ni de file audio non bornée. Les sockets ont déjà un timeout d'écriture.
+fn send_speech_stream<S: Write>(
+    stream: &mut S,
+    sample_rate: u32,
+    synthesize: impl FnOnce(
+        &mut dyn FnMut(&[f32]) -> saragossa::Result<()>,
+    ) -> ServeResult<TtsSynthesisOutput>,
+) -> ServeResult<()> {
+    let result = (|| {
+        write_headers(
+            stream,
+            200,
+            "OK",
+            "audio/pcm",
+            None,
+            vec![
+                ("Transfer-Encoding", "chunked".into()),
+                ("X-Saragossa-Audio-Sample-Rate", sample_rate.to_string()),
+                ("Trailer", "X-Saragossa-TTS-Frame-Limit-Reached".into()),
+            ],
+        )?;
+        stream
+            .flush()
+            .map_err(|e| ServeError::io("flush en-têtes PCM", e))?;
+        let output = synthesize(&mut |samples| {
+            write_pcm_chunk(stream, samples).map_err(|source| saragossa::InferError::Io {
+                path: PathBuf::from("/v1/audio/speech"),
+                source,
+            })
+        })?;
+        // Le budget atteint n'est connu qu'après la génération : trailer HTTP.
+        write!(
+            stream,
+            "0\r\nX-Saragossa-TTS-Frame-Limit-Reached: {}\r\n\r\n",
+            output.frame_limit_reached
+        )
+        .and_then(|()| stream.flush())
+        .map_err(|e| ServeError::io("fin réponse PCM", e))
+    })();
+    if let Err(error) = result {
+        // Une réponse a pu commencer, même si l'écriture des en-têtes a échoué.
+        // Fermer sans chunk terminal signale la troncature ; pas de second HTTP.
+        eprintln!("saragossa serve audio stream interrompu: {error}");
+    }
+    Ok(())
+}
+
+fn write_pcm_chunk<S: Write>(stream: &mut S, samples: &[f32]) -> std::io::Result<()> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let pcm: Vec<u8> = samples
+        .iter()
+        .flat_map(|&sample| pcm_i16(sample).to_le_bytes())
+        .collect();
+    write!(stream, "{:x}\r\n", pcm.len())?;
+    stream.write_all(&pcm)?;
+    stream.write_all(b"\r\n")?;
+    stream.flush()
+}
+
+fn pcm_i16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
+}
+
+/// Requête `/v1/audio/speech`. Le backend expose une voix VoiceDesign unique,
+/// donc `model`/`voice` (ignorés) sont acceptés sans effet.
 #[derive(Debug, Deserialize)]
 struct SpeechRequest {
     /// Texte à synthétiser.
     input: String,
+    /// Extension explicite : PCM s16le mono chunked au lieu du WAV complet.
+    #[serde(default)]
+    stream: bool,
 }
 
 fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
@@ -508,7 +595,7 @@ fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
         let mut writer = WavWriter::new(&mut cursor, spec)
             .map_err(|e| ServeError::Http(format!("initialisation WAV: {e}")))?;
         for &sample in samples {
-            let value = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+            let value = pcm_i16(sample);
             writer
                 .write_sample(value)
                 .map_err(|e| ServeError::Http(format!("écriture sample WAV: {e}")))?;
@@ -624,16 +711,20 @@ mod tests {
                 &mut response,
                 body.as_bytes(),
                 override_value,
-                |input, max_frames| {
+                |stream, input, max_frames, streaming| {
                     called = true;
+                    assert!(!streaming);
                     assert_eq!(input, text);
                     assert_eq!(max_frames, expected_frames);
-                    Ok(TtsSynthesisOutput {
-                        codes: Vec::new(),
-                        samples: vec![0.0],
-                        sample_rate: 24_000,
-                        frame_limit_reached: false,
-                    })
+                    send_speech(
+                        stream,
+                        &TtsSynthesisOutput {
+                            codes: Vec::new(),
+                            samples: vec![0.0],
+                            sample_rate: 24_000,
+                            frame_limit_reached: false,
+                        },
+                    )
                 },
             )?;
             assert!(called);
@@ -943,12 +1034,13 @@ mod tests {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut audio = AudioState::new(&args);
         let mut stream = Cursor::new(Vec::new());
-        let body = br#"{"model":"reti-tts","input":"Bonjour"}"#;
-
-        let error = handle_speech(&mut stream, &mut audio, body)
-            .expect_err("invariant: TTS non configuré refusé");
-
-        assert!(error.to_string().contains("TTS non configuré"));
+        for streaming in [false, true] {
+            let body = json!({"input": "Bonjour", "stream": streaming}).to_string();
+            let error = handle_speech(&mut stream, &mut audio, body.as_bytes())
+                .expect_err("invariant: TTS non configuré refusé");
+            assert!(error.to_string().contains("TTS non configuré"));
+            assert!(stream.get_ref().is_empty());
+        }
     }
 
     #[test]
@@ -964,3 +1056,6 @@ mod tests {
         assert!(error.to_string().contains("'input' requis"));
     }
 }
+
+#[cfg(test)]
+mod stream_tests;

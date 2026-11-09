@@ -44,8 +44,36 @@ the **single-user latency × Apple Silicon** quadrant:
 | `POST /v1/chat/completions` | OpenAI-compatible chat (SSE or not), `response_format: {"type":"json_object"}` |
 | `POST /v1/messages` | Anthropic Messages shim + `tool_use` (drivable by Claude Code) |
 | `POST /v1/audio/transcriptions` | Whisper STT (multipart WAV, opt-in `--stt-model`) |
-| `POST /v1/audio/speech` | Qwen3 TTS (JSON → WAV, opt-in `--tts-model`) |
+| `POST /v1/audio/speech` | Qwen3 TTS (JSON → WAV ou PCM chunked avec `stream: true`, opt-in `--tts-model`) |
 | `POST /v1/embeddings` | e5-small embeddings (opt-in `--embed-model`) |
+
+### Streaming audio HTTP
+
+`POST /v1/audio/speech` conserve le WAV complet par défaut (`stream` absent ou
+`false`). L'extension explicite `{"input":"Bonjour.","stream":true}` émet chaque
+lot dès son décodage, en HTTP/1.1 `Transfer-Encoding: chunked`, sans
+`Content-Length`. Le corps déchunké est du **PCM brut signé 16 bits little-endian,
+mono, sans en-tête WAV** (`Content-Type: audio/pcm`). Le taux natif du codec est
+indiqué par `X-Saragossa-Audio-Sample-Rate` (habituellement 24000 Hz) ; chaque
+échantillon utilise la même conversion que le WAV. `model` et `voice` restent
+acceptés sans effet. `stream: true` sélectionne ce format PCM à lui seul.
+
+Le plafond audio existant et `SARAGOSSA_TTS_MAX_FRAMES` s'appliquent aux deux
+modes. En streaming, `X-Saragossa-TTS-Frame-Limit-Reached` est un **trailer HTTP**
+annoncé par `Trailer`, transmis après le chunk zéro ; en WAV, il reste un en-tête.
+Un client qui ignore les trailers ne reçoit pas cette indication. Une erreur
+après le début de la réponse ferme le flux sans chunk terminal : le client doit
+traiter ce corps comme incomplet. Une déconnexion arrête la synthèse dès l'échec
+d'écriture suivant. Le moteur reste sériel, avec la contre-pression et le timeout
+d'écriture des sockets existants ; aucun producteur audio détaché n'est créé.
+
+Le streaming du codec utilise des lots fixes de **4 trames** (environ 320 ms),
+réglables par `SARAGOSSA_TTS_STREAM_LOT`, uniquement quand ses contextes CPU et
+GPU sont réellement incrémentaux (VoiceDesign et clone x-vector). Le repli CPU,
+y compris `SARAGOSSA_TTS_CODEC_GPU=0`, et le clone ICL redécodent le préfixe :
+leurs seuils restent doublés après le premier lot. Les lots fixes évitent de
+doubler l'attente de génération entre émissions ; ils ne garantissent ni un
+coût constant de l'attention sur son historique ni un RTF inférieur à 1.
 
 ## Design principles
 
