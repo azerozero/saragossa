@@ -1,5 +1,6 @@
 //! Matmuls Metal et résolution des poids linéaires.
 
+use super::matmul_select::{select_u6_matmul_kernel, AffineMatmulKernel};
 use super::*;
 
 // Instrumentation Phase 2 (byte-id, hors chemin prod) : cumul du temps passé à
@@ -552,36 +553,28 @@ impl MetalExecutor {
                 groups,
             )?;
         } else if !has_weight_offsets && can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
-            let fast_dims = [
-                checked_u32(*out_dim, "fast u6 out_dim")?,
-                checked_u32(in_dim, "fast u6 in_dim")?,
-                checked_u32(*packed_cols, "fast u6 packed_cols")?,
-                checked_u32(groups, "fast u6 groups")?,
-            ];
-            let fast_dims_buffer = self.buffer_from_u32(&fast_dims, "fast_u6_dims")?;
-            owned_buffers.push(fast_dims_buffer.clone());
-            let pipeline = if *out_dim % 2 == 0 {
-                &self.affine_qmv_fast_aligned_u6_gs64_f32
+            let encode = if matches!(
+                select_u6_matmul_kernel(batch, qmm_u6_enabled()),
+                AffineMatmulKernel::QmmBatchedU6
+            ) {
+                Self::encode_affine_qmm_batched_u6_buffers
             } else {
-                &self.affine_qmv_fast_u6_gs64_f32
+                Self::encode_affine_qmv_u6_buffers
             };
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&lhs_buffer), 0);
-            encoder.set_buffer(1, Some(&packed_buffer), packed_offset);
-            encoder.set_buffer(2, Some(&scales_buffer), 0);
-            encoder.set_buffer(3, Some(&biases_buffer), 0);
-            encoder.set_buffer(4, Some(&output_buffer), 0);
-            encoder.set_buffer(5, Some(&fast_dims_buffer), 0);
-            profile_dispatch();
-            encoder.dispatch_thread_groups(
-                MTLSize::new(
-                    checked_nsuint(batch, "batch")?,
-                    checked_nsuint(out_dim.div_ceil(2), "fast u6 out groups")?,
-                    1,
-                ),
-                MTLSize::new(64, 1, 1),
-            );
-            post_dispatch_barrier(encoder);
+            encode(
+                self,
+                encoder,
+                &lhs_buffer,
+                &packed_buffer,
+                &scales_buffer,
+                &biases_buffer,
+                &output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                groups,
+            )?;
         } else if !has_weight_offsets && can_use_fast_affine_qmv_u8(batch, in_dim, weight) {
             let fast_dims = [
                 checked_u32(*out_dim, "fast u8 out_dim")?,

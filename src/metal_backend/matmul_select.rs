@@ -27,7 +27,7 @@ pub(super) enum AffineMatmulKernel {
 
 // Appelé après le prédicat qmv u6 : ses contraintes et kill-switches restent
 // communs aux deux kernels, et le decode garde son chemin à une seule ligne.
-fn select_u6_matmul_kernel(batch: usize, batched: bool) -> AffineMatmulKernel {
+pub(super) fn select_u6_matmul_kernel(batch: usize, batched: bool) -> AffineMatmulKernel {
     if batch > 1 && batched {
         AffineMatmulKernel::QmmBatchedU6
     } else {
