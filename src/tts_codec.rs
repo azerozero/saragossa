@@ -27,6 +27,20 @@ pub(crate) struct TtsCodecStreamState {
     gpu: Option<crate::tts_codec_gpu::CodecGpuStream>,
 }
 
+impl TtsCodecStreamState {
+    /// Le repli CPU redécode tout le préfixe malgré le nom de cet état.
+    pub(crate) fn is_incremental(&self) -> bool {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            self.gpu.is_some()
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct TtsCodecPrefixStreamState {
     pre_conv: CpuConvStreamState,

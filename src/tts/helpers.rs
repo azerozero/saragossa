@@ -22,14 +22,16 @@ pub(super) fn tts_internal_profile_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Taille (en frames) du PREMIER lot de décodage streaming : petit = TTFA basse.
-/// Les lots suivants croissent (×2) → coût total O(N). Réglable via
-/// `SARAGOSSA_TTS_STREAM_LOT` (défaut 4 frames ≈ 320 ms d'audio). Borné ≥ 1.
+/// Quatre trames représentent environ 320 ms d'audio à 12,5 Hz.
+const DEFAULT_STREAM_LOT: usize = 4;
+
+/// Taille fixe du lot incrémental, ou premier seuil du repli par préfixes.
+/// Réglable via `SARAGOSSA_TTS_STREAM_LOT`, borné ≥ 1.
 pub(super) fn tts_stream_first_lot() -> usize {
     crate::runtime_flags::env_var("SARAGOSSA_TTS_STREAM_LOT")
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4)
+        .unwrap_or(DEFAULT_STREAM_LOT)
 }
 
 /// Arrêt anti-boucle du talker TTS : une frame codec complète identique répétée
