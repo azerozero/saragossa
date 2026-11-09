@@ -892,6 +892,76 @@ impl MetalExecutor {
         result
     }
 
+    /// Réutilise uniquement le préfixe QKV d'un concat complet déjà retenu.
+    /// Les vues existantes gardent le même dispatch ; convertir un poids CPU
+    /// ici changerait la sélection concat/split et l'arrondi de ses affines.
+    pub(crate) fn retained_linear_attn_qkv_alias(
+        &self,
+        weights: LinearAttnResidentWeights<'_>,
+    ) -> Result<Option<AffineQuantizedTensor>> {
+        if !linear_full_concat_enabled() {
+            return Ok(None);
+        }
+        let Some(qkv) = weights.in_proj_qkv.weight().affine_quantized() else {
+            return Ok(None);
+        };
+        if [
+            qkv.packed_metal_view(),
+            qkv.scales_metal_view(),
+            qkv.biases_metal_view(),
+        ]
+        .iter()
+        .any(|view| !matches!(view, Some((_, 0))))
+        {
+            return Ok(None);
+        }
+        let sources = [
+            weights.in_proj_qkv.weight(),
+            weights.in_proj_z.weight(),
+            weights.in_proj_b.weight(),
+            weights.in_proj_a.weight(),
+        ];
+        let Some(key) = concat_weight_key(&sources) else {
+            return Ok(None);
+        };
+        let concats = self.concat_buffers.lock().map_err(|_| {
+            InferError::Metal("cache concat Metal empoisonné: alias QKV".to_string())
+        })?;
+        let Some(ConcatCacheEntry::Buffers(MetalLinearWeightBuffers::AffineQuantized {
+            packed,
+            packed_offset: 0,
+            scales,
+            scales_offset: 0,
+            biases,
+            biases_offset: 0,
+            ..
+        })) = concats.get(&key)
+        else {
+            return Ok(None);
+        };
+        // QKV est le premier bloc : l'offset zéro conserve les kernels rapides.
+        // Le clone transactionnel garde weight_id et valide les trois vues avant
+        // de remplacer les propriétaires, sans copier ni modifier les octets.
+        let mut alias = qkv.clone();
+        alias.set_packed_metal_view(packed.clone(), 0)?;
+        alias.set_affine_metal_views(scales.clone(), 0, biases.clone(), 0)?;
+        let mut cached = self.weight_buffers.lock().map_err(|_| {
+            InferError::Metal("cache poids Metal empoisonné: alias QKV".to_string())
+        })?;
+        for (key, buffer) in cached.iter_mut() {
+            if let MetalBufferSource::Affine { weight_id, part } = key.source {
+                if weight_id == qkv.weight_id() {
+                    *buffer = match part {
+                        AffineWeightPart::Packed => packed.clone(),
+                        AffineWeightPart::Scales => scales.clone(),
+                        AffineWeightPart::Biases => biases.clone(),
+                    };
+                }
+            }
+        }
+        Ok(Some(alias))
+    }
+
     /// Vrai si le concat de `weights` sert sans reconstruction à chaque appel :
     /// déjà mémoïsé, ou bâtissable depuis des données CPU encore présentes et
     /// retenu ensuite. Après libération des poids CPU, un concat absent du cache
