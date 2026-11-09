@@ -181,8 +181,7 @@ impl SttSlot {
 
 fn tts_max_frames() -> usize {
     // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
-    std::env::var(TTS_MAX_FRAMES_ENV)
-        .ok()
+    saragossa::runtime_flags::env_var_exact(TTS_MAX_FRAMES_ENV)
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_TTS_MAX_FRAMES)
