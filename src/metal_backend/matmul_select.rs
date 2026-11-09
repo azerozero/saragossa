@@ -15,6 +15,7 @@ pub(super) enum AffineMatmulKernel {
     FastQmvU2,
     FastQmvU3,
     FastQmvU6,
+    QmmBatchedU6,
     FastQmvOneU8,
     QmmNaFusedTiledU8,
     QmmNaU8Gs128,
@@ -22,6 +23,32 @@ pub(super) enum AffineMatmulKernel {
     FastQmvU8,
     FastQmvU8Align64,
     Fallback,
+}
+
+// Appelé après le prédicat qmv u6 : ses contraintes et kill-switches restent
+// communs aux deux kernels, et le decode garde son chemin à une seule ligne.
+fn select_u6_matmul_kernel(batch: usize, batched: bool) -> AffineMatmulKernel {
+    if batch > 1 && batched {
+        AffineMatmulKernel::QmmBatchedU6
+    } else {
+        AffineMatmulKernel::FastQmvU6
+    }
+}
+
+#[test]
+fn qmm_u6_selection_preserves_decode_and_fallback() {
+    for batch in [1, 2, 7, 8, 9, 16, 17, 33] {
+        assert!(matches!(
+            select_u6_matmul_kernel(batch, false),
+            AffineMatmulKernel::FastQmvU6
+        ));
+        let selected = select_u6_matmul_kernel(batch, true);
+        if batch == 1 {
+            assert!(matches!(selected, AffineMatmulKernel::FastQmvU6));
+        } else {
+            assert!(matches!(selected, AffineMatmulKernel::QmmBatchedU6));
+        }
+    }
 }
 
 impl MetalExecutor {
@@ -100,7 +127,7 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> AffineMatmulKernel {
         // Vérification greedy stricte : seuls les chemins exacts en lignes (qmm2,
-        // qmv-T, qmv répliqué) ; les GEMM NA (MMA bf16) sont exclus à toute largeur.
+        // qmm u6, qmv-T, qmv répliqué) ; les GEMM NA (MMA bf16) sont exclus.
         let strict = super::verify_strict_active();
         if can_use_fast_affine_qmm2_buffers(batch, in_dim, out_dim, group_size, bits)
             || can_use_fast_affine_qmm2_u3_buffers(batch, in_dim, out_dim, group_size, bits)
@@ -147,7 +174,7 @@ impl MetalExecutor {
         } else if can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::FastQmvU3
         } else if can_use_fast_affine_qmv_u6_buffers(batch, in_dim, out_dim, group_size, bits) {
-            AffineMatmulKernel::FastQmvU6
+            select_u6_matmul_kernel(batch, qmm_u6_enabled())
         } else if can_use_fast_affine_qmv_one_u8_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::FastQmvOneU8
         } else if !strict
@@ -184,7 +211,7 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> AffineMatmulKernel {
         // Vérification greedy stricte : seuls les chemins exacts en lignes (qmm2,
-        // qmv-T, qmv répliqué) ; les GEMM NA (MMA bf16) sont exclus à toute largeur.
+        // qmm u6, qmv-T, qmv répliqué) ; les GEMM NA (MMA bf16) sont exclus.
         let strict = super::verify_strict_active();
         if can_use_fast_affine_qmm2(batch, in_dim, weight)
             || can_use_fast_affine_qmm2_u3(batch, in_dim, weight)
@@ -221,7 +248,7 @@ impl MetalExecutor {
         } else if can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvU3
         } else if can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
-            AffineMatmulKernel::FastQmvU6
+            select_u6_matmul_kernel(batch, qmm_u6_enabled())
         } else if can_use_fast_affine_qmv_one_u8(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvOneU8
         } else if !strict

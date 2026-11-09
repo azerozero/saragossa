@@ -373,6 +373,13 @@ pub(super) fn qmv_one_u8_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMV_ONE_U8", true))
 }
 
+/// Opt-in tant que l'égalité bit à bit portée de reti n'est pas validée ici.
+/// `SARAGOSSA_RUST_QMM_U6=0` conserve le qmv répliqué pour le prefill.
+pub(super) fn qmm_u6_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMM_U6", false))
+}
+
 pub(super) fn qmv_u6_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMV_U6", true))
