@@ -21,6 +21,16 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> Result<usize> {
         match weight {
+            LinearWeight::DenseBf16(weight) => self.encode_dense_bf16_weight(
+                encoder,
+                lhs_buffer,
+                weight.buffer(),
+                output_buffer,
+                batch,
+                in_dim,
+                weight.shape()[0],
+                weight.shape()[1],
+            ),
             LinearWeight::Dense(weight) => self.encode_owned_dense_matmul(
                 encoder,
                 lhs_buffer,

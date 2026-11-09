@@ -253,6 +253,7 @@ pub struct MetalExecutor {
     affine_qmv_gated_input_fast_u4_gs64_f32: ComputePipelineState,
     affine_qmv_gated_input_fast_u8_gs64_f32: ComputePipelineState,
     embed_gather_dense_from_u32_f32: ComputePipelineState,
+    embed_gather_bf16_from_u32_f32: ComputePipelineState,
     embed_gather_affine_from_u32_f32: ComputePipelineState,
     swiglu_f32: ComputePipelineState,
     geglu_tanh_f32: ComputePipelineState,
@@ -522,6 +523,11 @@ pub(crate) struct StackedAffineBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalLinearWeightBuffers {
+    DenseBf16 {
+        rhs: Buffer,
+        out_dim: usize,
+        in_dim: usize,
+    },
     Dense {
         rhs: Buffer,
         rhs_bf16: Option<Buffer>,
@@ -546,6 +552,11 @@ pub(crate) enum MetalLinearWeightBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalEmbeddingWeightBuffers {
+    DenseBf16 {
+        table: Buffer,
+        vocab: usize,
+        dim: usize,
+    },
     Dense {
         table: Buffer,
         vocab: usize,

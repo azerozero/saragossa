@@ -288,6 +288,89 @@ fn bf16_to_f32(value: u16) -> f32 {
     f32::from_bits(u32::from(value) << 16)
 }
 
+/// Matrice dense bf16 immuable, sans miroir f32, en mémoire Metal partagée.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DenseBf16Tensor(AffineStorage);
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl DenseBf16Tensor {
+    pub(crate) fn new(shape: &[usize], buffer: metal::Buffer) -> Result<Self> {
+        if !matches!(shape, [rows, cols] if *rows > 0 && *cols > 0) {
+            return Err(InferError::Shape(format!(
+                "matrice bf16 invalide: {shape:?}"
+            )));
+        }
+        if buffer.storage_mode() != metal::MTLStorageMode::Shared {
+            return Err(InferError::Metal("poids bf16 non partagé".to_string()));
+        }
+        let len = checked_element_count(shape, "poids dense bf16")?;
+        Ok(Self(AffineStorage::from_metal_shared_bf16(
+            shape, buffer, 0, len,
+        )?))
+    }
+
+    pub(crate) fn shape(&self) -> &[usize] {
+        self.0.shape()
+    }
+
+    pub(crate) fn buffer(&self) -> &metal::Buffer {
+        self.0
+            .metal_view()
+            .expect("invariant: poids dense bf16 toujours partagé")
+            .0
+    }
+
+    pub(crate) fn data(&self) -> &[u16] {
+        metal_shared_u16_slice(self.buffer(), 0, self.0.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn to_tensor(&self) -> Result<Tensor> {
+        Tensor::from_vec(self.shape().to_vec(), self.0.f32_data().into_owned())
+    }
+
+    pub(crate) fn row(&self, row: usize) -> Result<Vec<f32>> {
+        let cols = self.shape()[1];
+        if row >= self.shape()[0] {
+            return Err(InferError::Dimension(format!(
+                "ligne bf16 hors matrice: {row}"
+            )));
+        }
+        Ok(self.data()[row * cols..(row + 1) * cols]
+            .iter()
+            .copied()
+            .map(bf16_to_f32)
+            .collect())
+    }
+
+    pub(crate) fn matmul_rhs_t(&self, input: &Tensor) -> Result<Tensor> {
+        let (batch, in_dim) = input.as_matrix()?;
+        let out_dim = self.shape()[0];
+        if in_dim != self.shape()[1] {
+            return Err(InferError::Dimension(format!(
+                "matmul bf16 entrée {in_dim}, poids {:?}",
+                self.shape()
+            )));
+        }
+        let len = batch
+            .checked_mul(out_dim)
+            .ok_or_else(|| InferError::Shape("sortie bf16 trop grande".to_string()))?;
+        let mut out = vec![0.0; len];
+        // Le repli lit la mémoire unifiée et convertit chaque scalaire à la volée,
+        // pour ne pas matérialiser une seconde matrice de poids en f32.
+        out.par_chunks_mut(out_dim)
+            .enumerate()
+            .for_each(|(b, row)| {
+                let lhs = &input.data()[b * in_dim..(b + 1) * in_dim];
+                for (value, rhs) in row.iter_mut().zip(self.data().chunks_exact(in_dim)) {
+                    *value = lhs.iter().zip(rhs).map(|(x, w)| x * bf16_to_f32(*w)).sum();
+                }
+            });
+        Tensor::from_vec(vec![batch, out_dim], out)
+    }
+}
+
 /// Poids affine packé en `u32`, conservé compact en mémoire.
 #[derive(Clone, Debug)]
 pub struct AffineQuantizedTensor {

@@ -247,6 +247,7 @@ fn rows_exact_matmul_formats_body() -> Result<()> {
         let in_dim = match weight {
             LinearWeight::AffineQuantized(w) => w.shape()[1],
             LinearWeight::Dense(t) => t.shape()[1],
+            LinearWeight::DenseBf16(t) => t.shape()[1],
         };
         let buffers = executor.resolve_linear_weight_buffers(weight, "rexact_mm")?;
         let out_dim = executor.linear_weight_out_dim(&buffers);
