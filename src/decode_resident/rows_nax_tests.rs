@@ -215,7 +215,7 @@ fn run_nax_case(
 /// multiple exact des blocs (pas de reste), préfixe plus court qu'un bloc
 /// (aucun bloc plein), lignes 1 à 16 (diagonale), d128 (2 tuiles Q) et d256.
 #[test]
-#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+#[ignore = "NAX requis : exécution locale sur M5 avec --ignored"]
 fn verify_rows_nax_matches_cpu_oracle() -> Result<()> {
     let state = gpu_state()?;
     // Tolérance à entrées égales (K/V du KV bf16, Q du préfixe arrondi en bf16

@@ -263,7 +263,7 @@ fn full_attn_rows_tree_matches_cpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+#[ignore = "NAX requis : exécution locale sur M5 avec --ignored"]
 fn full_attn_rows_tree_nax_matches_cpu() -> Result<()> {
     let state = gpu_state()?;
     // Préfixe en Q bf16 (comme `verify_rows_nax_matches_cpu_oracle`), diagonale
