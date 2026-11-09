@@ -135,7 +135,8 @@ impl WhisperDecoder {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si les dimensions ou les projections échouent.
+    /// Renvoie une erreur si les dimensions ou les projections échouent, ou si
+    /// le budget de tokens/positions est épuisé sans token de fin (EOT).
     pub fn generate_greedy(
         &self,
         audio_features: &Tensor,
@@ -233,7 +234,7 @@ impl WhisperDecoder {
                 }
             };
             if next == eot_token {
-                break;
+                return Ok(generated);
             }
             generated.push(next);
             let position = ctx_len;
@@ -247,7 +248,12 @@ impl WhisperDecoder {
                 DecodeStep::Logits(value) => logits = Some(value),
             }
         }
-        Ok(generated)
+        // Sans timestamps, reprendre le décodage au bon instant n'est pas sûr :
+        // mieux vaut refuser le résultat partiel que perdre des mots en silence.
+        Err(InferError::Dimension(format!(
+            "transcription Whisper incomplète: limite atteinte sans EOT (positions={}, budget_tokens={budget})",
+            self.config.max_target_positions
+        )))
     }
 
     /// Précalcule le KV cross-attn de chaque couche depuis les features encodeur
@@ -541,12 +547,33 @@ impl WhisperModel {
         })
     }
 
-    /// Transcrit une utterance PCM f32 mono 16 kHz.
+    /// Transcrit tout le PCM f32 mono 16 kHz, par segments d'au plus 30 secondes
+    /// coupés au minimum d'énergie local. Chaque segment garde `notimestamps`.
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si l'encodage, le décodage ou le tokenizer échoue.
+    /// Renvoie une erreur si l'encodage, le décodage ou le tokenizer échoue,
+    /// notamment si un segment épuise les positions du décodeur sans EOT.
     pub fn transcribe(
+        &self,
+        samples: &[f32],
+        lang: &str,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<(String, String)> {
+        if samples.len() <= super::N_SAMPLES {
+            return self.transcribe_segment(samples, lang, runtime);
+        }
+        let mut texts = Vec::new();
+        for range in super::segments::audio_segments(samples) {
+            let (text, _) = self.transcribe_segment(&samples[range], lang, runtime)?;
+            if !text.is_empty() {
+                texts.push(text);
+            }
+        }
+        Ok((texts.join(" "), lang.to_string()))
+    }
+
+    fn transcribe_segment(
         &self,
         samples: &[f32],
         lang: &str,
@@ -754,6 +781,55 @@ mod tests {
             .generate_greedy(&audio, &[], 1, 0, ForwardRuntime::cpu())
             .expect_err("invariant: préfixe vide rejeté");
         assert!(matches!(err, InferError::Config(_)));
+    }
+
+    #[test]
+    fn generate_greedy_reports_token_and_position_limits_without_eot() -> Result<()> {
+        let mut decoder = tiny_decoder_without_layers();
+        decoder.config.max_target_positions = 448;
+        decoder.positions = Tensor::zeros(vec![448, 2])?;
+        decoder.token_embeddings = Tensor::zeros(vec![3, 2])?;
+        let audio = Tensor::zeros(vec![1, 2])?;
+        for budget in [0, 1, 448] {
+            let err = decoder
+                .generate_greedy(&audio, &[0, 0, 0, 0], budget, 2, ForwardRuntime::cpu())
+                .expect_err("invariant: sans EOT le résultat est incomplet");
+            assert!(err.to_string().contains("limite atteinte sans EOT"));
+        }
+        assert!(decoder
+            .generate_greedy(&audio, &[0], 448, 0, ForwardRuntime::cpu())?
+            .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "inférence: snapshot Whisper local et Metal requis"]
+    fn long_audio_matches_concatenated_segments() -> Result<()> {
+        let model_dir = local_whisper_tiny_dir()
+            .ok_or_else(|| InferError::Config("snapshot Whisper local requis".to_string()))?;
+        let (_, samples) = crate::golden::read_f32("whisper_samples16k")?;
+        assert!(samples.len() <= super::super::N_SAMPLES);
+        let model = WhisperModel::from_model_dir(model_dir)?;
+        let runtime = live_runtime();
+        let mut long = vec![0.0; super::super::N_SAMPLES];
+        long[..samples.len()].copy_from_slice(&samples);
+        assert_eq!(
+            model.transcribe(&long, "fr", runtime)?,
+            model.transcribe_segment(&long, "fr", runtime)?
+        );
+        long.extend_from_slice(&samples);
+        let mut expected = Vec::new();
+        for range in super::super::segments::audio_segments(&long) {
+            let (text, _) = model.transcribe_segment(&long[range], "fr", runtime)?;
+            if !text.is_empty() {
+                expected.push(text);
+            }
+        }
+        assert_eq!(
+            model.transcribe(&long, "fr", runtime)?.0,
+            expected.join(" ")
+        );
+        Ok(())
     }
 
     /// Transcription metal-rs ≡ golden mlx-rs figé (sans mlx-rs ; charge whisper-tiny
