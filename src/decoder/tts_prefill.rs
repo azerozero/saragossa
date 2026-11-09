@@ -3,6 +3,19 @@
 use super::attention_ops::{causal_attention_suffix, full_attention_prepare_rows, sigmoid_scalar};
 use super::*;
 
+impl CausalDecoderCache {
+    /// Un préfixe mémorisé ne grandit plus : sa copie ne doit pas immobiliser
+    /// la réserve d'ajout de chaque couche. Clone écarte les états résidents.
+    pub(crate) fn compact_tts_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        for layer in &mut snapshot.layers {
+            layer.keys = layer.keys.compact_snapshot();
+            layer.values = layer.values.compact_snapshot();
+        }
+        snapshot
+    }
+}
+
 impl CausalDecoder {
     pub(crate) fn extend_tts_prefill(
         &self,

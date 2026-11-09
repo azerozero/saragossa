@@ -3,7 +3,13 @@ use super::*;
 use crate::InferError;
 use crate::{CausalDecoder, CausalDecoderConfig};
 
-fn decoder() -> Result<CausalDecoder> {
+// Locaux au thread pour observer le chemin réel sans coupler les tests parallèles.
+thread_local! {
+    pub(super) static FULL_PREFILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static MEMO_REUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn decoder(layers: usize) -> Result<CausalDecoder> {
     let mut weights = std::collections::HashMap::new();
     for name in ["embed_tokens.weight", "lm_head.weight"] {
         weights.insert(
@@ -12,7 +18,7 @@ fn decoder() -> Result<CausalDecoder> {
         );
     }
     weights.insert("norm.weight".into(), Tensor::row(vec![1.0; 2])?);
-    for layer in 0..3 {
+    for layer in 0..layers {
         for norm in ["input_layernorm", "post_attention_layernorm"] {
             weights.insert(
                 format!("layers.{layer}.{norm}.weight"),
@@ -44,7 +50,7 @@ fn decoder() -> Result<CausalDecoder> {
     CausalDecoder::from_tensors(
         weights,
         CausalDecoderConfig {
-            num_hidden_layers: 3,
+            num_hidden_layers: layers,
             head_dim: Some(2),
             rope_theta: Some(10_000.0),
             ..CausalDecoderConfig::default()
@@ -58,7 +64,7 @@ fn bits(tensor: &Tensor) -> Vec<u32> {
 
 #[test]
 fn tts_prefill_extension_matches_full_and_preserves_snapshot() -> Result<()> {
-    let decoder = decoder()?;
+    let decoder = decoder(3)?;
     for voice in [0.1, -0.7, 1.3] {
         let prefix = Tensor::from_vec(vec![3, 2], vec![voice, 0.2, 0.3, -0.4, 0.9, 0.7])?;
         let (snapshot, prefix_state) = decoder.prefill_cache_from_embeddings(&prefix)?;
@@ -93,7 +99,7 @@ fn tts_prefill_extension_matches_full_and_preserves_snapshot() -> Result<()> {
 
 #[test]
 fn tts_prefill_memo_keys_lru_and_model_lifetime() -> Result<()> {
-    let decoder = decoder()?;
+    let decoder = decoder(3)?;
     let prefix = Tensor::row(vec![0.0, 0.2])?;
     let (cache, state) = decoder.prefill_cache_from_embeddings(&prefix)?;
     let mut memo = TtsPrefillMemo::default();
@@ -129,7 +135,7 @@ fn tts_prefill_memo_keys_lru_and_model_lifetime() -> Result<()> {
 
 #[test]
 fn tts_prefill_memo_bounds_bytes_and_rejects_oversized_entry() -> Result<()> {
-    let decoder = decoder()?;
+    let decoder = decoder(3)?;
     let prefix = Tensor::row(vec![0.0, 0.2])?;
     let (cache, _) = decoder.prefill_cache_from_embeddings(&prefix)?;
     let mut memo = TtsPrefillMemo::default();
@@ -153,6 +159,21 @@ fn tts_prefill_memo_bounds_bytes_and_rejects_oversized_entry() -> Result<()> {
     );
     assert_eq!(memo.bytes, before);
     assert_eq!(memo.entries.len(), 1);
+    // Une petite longueur ne doit pas masquer la réserve réellement retenue.
+    for reserve_prefix in [false, true] {
+        let mut reserved = Vec::with_capacity(MAX_BYTES / size_of::<f32>());
+        reserved.extend_from_slice(&[42.0, 0.2]);
+        let small = Tensor::row(vec![42.0, 0.2])?;
+        let large = Tensor::row(reserved)?;
+        let cache = decoder.empty_cache();
+        if reserve_prefix {
+            memo.insert(large, cache, small);
+        } else {
+            memo.insert(small, cache, large);
+        }
+        assert_eq!(memo.bytes, before);
+        assert_eq!(memo.entries.len(), 1);
+    }
     Ok(())
 }
 
@@ -168,7 +189,7 @@ fn tts_prefill_flag_override_is_scoped() {
 
 #[test]
 fn tts_prefill_extension_rejects_invalid_shape_or_empty_cache() -> Result<()> {
-    let decoder = decoder()?;
+    let decoder = decoder(3)?;
     let row = Tensor::row(vec![0.1, 0.2])?;
     assert!(decoder
         .extend_tts_prefill(&mut decoder.empty_cache(), &row)
@@ -178,6 +199,47 @@ fn tts_prefill_extension_rejects_invalid_shape_or_empty_cache() -> Result<()> {
         .extend_tts_prefill(&mut cache, &Tensor::row(vec![0.1])?)
         .is_err());
     assert_eq!(cache.position(), 1);
+    Ok(())
+}
+
+#[test]
+fn tts_prefill_memo_retains_compact_prefix_with_many_layers() -> Result<()> {
+    for layers in [16, 24] {
+        let decoder = decoder(layers)?;
+        let prefix = Tensor::from_vec(vec![3, 2], vec![0.1, 0.2, 0.3, -0.4, 0.9, 0.7])?;
+        let (original, state) = decoder.prefill_cache_from_embeddings(&prefix)?;
+        // La réserve de decode dépasse à elle seule le budget du mémo.
+        assert!(original.estimated_cpu_bytes() >= MAX_BYTES);
+        let mut memo = TtsPrefillMemo::default();
+        memo.insert(prefix.clone(), original.clone(), state.clone());
+        assert_eq!(memo.entries.len(), 1, "préfixe refusé à {layers} couches");
+        let retained = layers * 2 * prefix.len() * size_of::<f32>();
+        assert_eq!(memo.entries[0].cache.estimated_cpu_bytes(), retained);
+        assert_eq!(
+            memo.bytes,
+            retained + (prefix.len() + state.len()) * size_of::<f32>()
+        );
+        let (mut cached, _) = memo.get(&prefix).expect("invariant: préfixe conservé");
+        let last = Tensor::row(vec![0.7, -0.4])?;
+        let mut rows = prefix.data().to_vec();
+        rows.extend_from_slice(last.data());
+        let (full, expected) =
+            decoder.prefill_cache_from_embeddings(&Tensor::from_vec(vec![4, 2], rows)?)?;
+        let actual = decoder.extend_tts_prefill(&mut cached, &last)?;
+        assert_eq!(bits(&actual), bits(&expected));
+        for layer in 0..layers {
+            assert_eq!(
+                cached.layer_kv_for_test(layer),
+                full.layer_kv_for_test(layer)
+            );
+            assert_eq!(
+                memo.entries[0].cache.layer_kv_for_test(layer),
+                original.layer_kv_for_test(layer)
+            );
+        }
+        assert_eq!(memo.entries[0].cache.position(), 3);
+        assert_eq!(memo.entries[0].cache.estimated_cpu_bytes(), retained);
+    }
     Ok(())
 }
 
@@ -243,8 +305,14 @@ fn tts_prefill_memo_metal_codes_identical_multiple_voices() -> Result<()> {
             }
             let full =
                 with_tts_prefill_cache_for_test(false, || model.generate_codes_greedy(text, 24))?;
+            FULL_PREFILLS.with(|count| count.set(0));
+            MEMO_REUSES.with(|count| count.set(0));
             let cached =
                 with_tts_prefill_cache_for_test(true, || model.generate_codes_greedy(text, 24))?;
+            // L'égalité des codes seule laisserait passer un repli systématique
+            // ou un appel direct au prefill complet depuis la génération.
+            assert_eq!(FULL_PREFILLS.with(|count| count.get()), 0);
+            assert_eq!(MEMO_REUSES.with(|count| count.get()), 1);
             assert!(!full.is_empty(), "oracle vide : voix={voice}, texte={text}");
             assert_eq!(cached, full, "voix={voice}, texte={text}");
         }
