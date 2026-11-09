@@ -280,12 +280,13 @@ fn affine_offsets_natural_selection_and_standalone() -> Result<()> {
     let weight = test_affine_varied(2048, 5120)?;
     let shifted = offset_weight(&metal, &weight, [64, 128, 192], 0xdead)?;
     for resident in [false, true] {
-        let reference = offset_dispatch(&metal, &weight, 17, resident)?;
+        // Le sélecteur réserve le GEMM NA aux lots d'au moins une tuile.
+        let reference = offset_dispatch(&metal, &weight, 128, resident)?;
         assert!(reference
             .1
             .iter()
             .any(|t| t.starts_with("gemm_nax_coop_qb_tiled_u4 ")));
-        assert_eq!(offset_dispatch(&metal, &shifted, 17, resident)?, reference);
+        assert_eq!(offset_dispatch(&metal, &shifted, 128, resident)?, reference);
     }
     Ok(())
 }
