@@ -16,6 +16,7 @@ port="${2:-18081}"
 mkdir -p "${out}"
 venv=("${MLX_VENV}/bin/python" -I -B)
 
+python3 -I -B "${here}/night_checks.py" power
 llama-server -m "${GGUF_Q4_0}" --host 127.0.0.1 --port "${port}" -np 1 -c 4096 \
   > "${out}/llama-ids-server.log" 2>&1 &
 server=$!
@@ -44,20 +45,24 @@ until curl -sf "http://127.0.0.1:${port}/health" > /dev/null; do
   fi
   sleep 1
 done
+python3 -I -B "${here}/night_checks.py" power
 "${venv[@]}" "${here}/quality.py" llama-ids "${WIKITEXT_TEST}" "${port}" | tee "${out}/llama-ids.json"
 stop_server
 trap - EXIT
 
 common=(-f "${WIKITEXT_TEST}" -c 512 --chunks 32 -ngl all -fa on -b 512 -ub 512)
+python3 -I -B "${here}/night_checks.py" power
 llama-perplexity -m "${GGUF_BF16}" \
   "${common[@]}" --kl-divergence-base "${out}/bf16.kld" 2>&1 | tee "${out}/ppl-bf16.log"
 for name in Q4_0-pure Q4_K_M; do
+  python3 -I -B "${here}/night_checks.py" power
   llama-perplexity -m "${GGUF_DIR}/Qwen3.8-27B-${name}.gguf" "${common[@]}" \
     --kl-divergence-base "${out}/bf16.kld" --kl-divergence 2>&1 | tee "${out}/ppl-${name}.log"
 done
 
 # Référence habituelle de la communauté, à côté du tableau client (hors T1).
 for name in Q4_0-pure Q4_K_M; do
+  python3 -I -B "${here}/night_checks.py" power
   llama-bench -m "${GGUF_DIR}/Qwen3.8-27B-${name}.gguf" -p 4096 -n 400 -fa 1 -ngl 99 -r 3 \
     -o json 2>&1 | tee "${out}/llama-bench-${name}.json"
 done

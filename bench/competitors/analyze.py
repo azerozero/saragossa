@@ -22,6 +22,15 @@ Règles (protocole v5, décisions post-nuit 1) :
 - Unité statistique : le prompt. Les observations sont appariées par clé
   (bloc, graine, répétition), donc par nonce ; IC 95 % par bootstrap
   hiérarchique : blocs (chargements), puis prompts, puis clés du bloc.
+  En plan imbriqué, chaque prompt appartient à un seul bloc : les prompts
+  sont tirés dans chaque bloc tiré. Le plan (`prompt_sets` de la phase) choisit
+  le tirage ; le tirage croisé historique est inchangé. Un prompt présent dans
+  plusieurs blocs d'un plan imbriqué est une erreur explicite.
+- `ttft_only` : répétitions AR courtes des documents 4k, mêlées aux requêtes
+  normales, avec leurs propres nonces. Elles alimentent uniquement le TTFT ;
+  aucun débit, latence à L, identité greedy ou gel. Les preuves d'entrée,
+  d'absence de cache et de sortie non vide restent exigées ; le budget de
+  sortie est celui de la sonde, jamais les 400 tokens des requêtes normales.
 """
 
 import json
@@ -32,7 +41,7 @@ import statistics
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from prompts import CHECKPOINT  # noqa: E402
+from prompts import CHECKPOINT, is_4k  # noqa: E402
 from results import read_results  # noqa: E402
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -85,6 +94,11 @@ def derive(line, tok, eos_counted):
         return m
     t_first, t_last = out_events[0]["t_ns"], out_events[-1]["t_ns"]
     m["ttft_s"] = t_first / 1e9
+    if line.get("ttft_only"):
+        # Le comptage exact des événements sert au débit et à L, pas au TTFT.
+        # Les preuves de sortie et du budget court sont vérifiées séparément.
+        m.pop("exact")
+        return m
     m["total_s"] = t_last / 1e9
     gaps = [(b["t_ns"] - a["t_ns"]) / 1e6 for a, b in zip(out_events, out_events[1:])]
     m["gap_p50_ms"] = percentile(gaps, 0.5)
@@ -145,6 +159,14 @@ def proofs(line, expected, cache_probe):
     texts = any(e.get("content_chars", 0) + e.get("reasoning_chars", 0) > 0
                 for e in line.get("events") or [])
     checks["output"] = bool(texts and (usage.get("completion_tokens") or 0) > 0)
+    if line.get("ttft_only"):
+        budget = line.get("max_tokens")
+        sent = (line.get("body_params") or {}).get("max_tokens")
+        # Une sonde à 8 tokens n'a pas à produire 400 tokens. Contrôler son
+        # propre budget ne change aucune preuve des requêtes normales.
+        checks["ttft_budget"] = (is_4k(line["prompt"]) and type(budget) is int
+                                  and budget > 0 and sent == budget
+                                  and 0 < (usage.get("completion_tokens") or 0) <= budget)
     checks["prompt_tokens"] = (None if not exp or usage.get("prompt_tokens") is None
                                else usage["prompt_tokens"] == exp["prompt_tokens"])
     if not exp:
@@ -278,6 +300,8 @@ def load(run_dir):
             continue
         row["proofs"] = proofs(row, expected, nonce_probes)
         values = [row["proofs"][name] for name in REQUIRED]
+        if row.get("ttft_only"):
+            values.append(row["proofs"]["ttft_budget"])
         row["admissibility"] = ("validation_failed" if False in values
                                 else "unverified" if None in values else "admissible")
     # Identité greedy obligatoire pour tout spéculatif, réglage compris : la
@@ -327,6 +351,7 @@ def identity_checks(rows, pair_of):
     """(ligne, verdict) des spéculatifs greedy : vrai si texte identique à une
     référence AR admissible, faux si différent, None si la référence manque ou
     n'est pas admissible."""
+    rows = [row for row in rows if not row.get("ttft_only")]
     refs = {(row["config"],) + request_key(row): row for row in rows
             if row.get("status") == "ok" and row["sampling"] == "greedy"}
     for row in rows:
@@ -350,6 +375,7 @@ def apply_identity(rows, pair_of):
 
 def text_identity_report(rows, pair_of):
     """Taux d'identité, paires manquantes et premiers écarts, par configuration."""
+    rows = [row for row in rows if not row.get("ttft_only")]
     refs = {(row["config"],) + request_key(row): row for row in rows
             if row.get("status") == "ok" and row["sampling"] == "greedy"}
     report = {}
@@ -376,6 +402,8 @@ def repeatability(rows):
     """Greedy, validation : requêtes identiques (graines 1 et 2) → même texte."""
     groups = {}
     for row in rows:
+        if row.get("ttft_only"):
+            continue
         if row.get("status") == "ok" and row["sampling"] == "greedy" and row["phase"] == "validate":
             groups.setdefault((row["config"], row["prompt"], row["nonce"]), []).append(row)
     result = {}
@@ -396,6 +424,8 @@ def eos_table(rows):
     """Par moteur, N_usage − |retok(texte)| des requêtes arrêtées et tronquées."""
     table = {}
     for row in rows:
+        if row.get("ttft_only"):
+            continue
         m = row.get("m") or {}
         if m.get("n_usage") is None or m.get("n_retok") is None:
             continue
@@ -414,6 +444,8 @@ def observations(rows, metric):
     """{config: {prompt: {clé d'observation: valeur}}} des lignes admissibles."""
     table = {}
     for row in rows:
+        if row.get("ttft_only") and (metric != "ttft_s" or not is_4k(row["prompt"])):
+            continue
         value = (row.get("m") or {}).get(metric)
         if row.get("admissibility") != "admissible" or value is None:
             continue
@@ -421,7 +453,7 @@ def observations(rows, metric):
     return table
 
 
-def paired_bootstrap(a, b, rng):
+def paired_bootstrap(a, b, rng, nested=False, planned=None):
     """Rapport apparié par prompt (médianes sur les clés communes), moyenne géométrique.
 
     IC 95 % : tirage des blocs (chargements), puis des prompts, puis des clés de
@@ -430,7 +462,9 @@ def paired_bootstrap(a, b, rng):
     pairs = {p: {k: (a[p][k], b[p][k]) for k in set(a[p]) & set(b[p])}
              for p in set(a) & set(b)}
     pairs = {p: v for p, v in pairs.items() if v}
-    missing = sum(len(set(a.get(p, {})) ^ set(b.get(p, {}))) for p in set(a) | set(b))
+    missing_keys = {(p, k) for p in set(a) | set(b)
+                    for k in set(a.get(p, {})) ^ set(b.get(p, {}))}
+    missing = len(missing_keys if planned is None else missing_keys & planned)
     if not pairs:
         return None
 
@@ -443,9 +477,32 @@ def paired_bootstrap(a, b, rng):
                                       for p in prompts))
     result = {"ratio": point, "ci": None, "n_prompts": len(prompts),
               "n_pairs": sum(len(v) for v in pairs.values()), "n_missing": missing}
+    prompt_blocks = {p: {k[0] for k in pairs[p]} for p in prompts}
+    # Le plan décide du tirage : dans un plan croisé, des paires perdues peuvent
+    # laisser un prompt dans un seul bloc sans le rendre imbriqué.
+    if nested and any(len(v) != 1 for v in prompt_blocks.values()):
+        raise ValueError("bootstrap : mélange de prompts imbriqués et croisés")
+    if nested:
+        result["nested_blocks"] = len({k[0] for v in pairs.values() for k in v})
     if len(prompts) < 3:
         return result
     blocks = sorted({k[0] for v in pairs.values() for k in v})
+    if nested and len(blocks) > 1:
+        by_block = {block: [p for p in prompts if block in prompt_blocks[p]] for block in blocks}
+        draws = []
+        for _ in range(BOOTSTRAP):
+            drawn_blocks = [rng.choice(blocks) for _ in blocks]
+            logs = []
+            for block in drawn_blocks:
+                pool = by_block[block]
+                for p in (rng.choice(pool) for _ in pool):
+                    keys = list(pairs[p])
+                    selection = [pairs[p][rng.choice(keys)] for _ in keys]
+                    logs.append(math.log(ratio(selection)))
+            draws.append(math.exp(statistics.fmean(logs)))
+        result["ci"] = (percentile(draws, 0.025), percentile(draws, 0.975))
+        return result
+    # Chemin croisé historique : aucun tirage ajouté, même ordre et même graine.
     draws = []
     for _ in range(BOOTSTRAP):
         drawn_blocks = [rng.choice(blocks) for _ in blocks]
@@ -469,7 +526,7 @@ def verdict(stat, higher_is_better=True):
     if stat["ci"] is None:
         return "indicatif (moins de 3 prompts)"
     low, high = stat["ci"]
-    if low <= 1 <= high:
+    if low <= 1 <= high or (stat.get("nested_blocks") and abs(stat["ratio"] - 1) < PRACTICAL):
         return "indistinct"
     better = (low > 1) == higher_is_better
     notable = abs(stat["ratio"] - 1) >= PRACTICAL
@@ -481,6 +538,8 @@ def fmt(stat, approx=False):
         return "n/d"
     ci = stat["ci"]
     ci_text = f" [{ci[0]:.2f}–{ci[1]:.2f}]" if ci else ""
+    if stat.get("nested_blocks") == 3 and ci:
+        ci_text += " IC approximatif (3 blocs)"
     mark = "≈" if approx else ""
     return f"{mark}{stat['ratio']:.2f}×{ci_text} ({stat['n_pairs']} paires, {stat['n_missing']} manquantes)"
 
@@ -494,6 +553,7 @@ METRICS = [("delivery_tok_s", True, "débit de livraison (tok/s)", True),
 
 def add_common_length(rows):
     """L = plus courte sortie exacte du prompt dans le groupe ; heure du L-ième token."""
+    rows = [row for row in rows if not row.get("ttft_only")]
     lengths = {}
     for row in rows:
         m = row.get("m") or {}
@@ -513,10 +573,22 @@ def add_common_length(rows):
 
 def approx_configs(rows):
     return {row["config"] for row in rows if row.get("admissibility") == "admissible"
+            and not row.get("ttft_only")
             and not (row.get("m") or {}).get("exact")}
 
 
-def tables(rows, reference):
+def planned_keys(run_dir):
+    """Clés prévues, sondes comprises ; seules les contreparties sont comparables."""
+    keys = {}
+    for path in sorted(pathlib.Path(run_dir).glob("plan*.json")):
+        for entry in json.loads(path.read_text())["entries"]:
+            for request in entry["requests"]:
+                keys.setdefault((entry["phase"], entry["config"]), set()).add(
+                    (request["prompt"], obs_key(dict(request, block=entry["block"]))))
+    return keys
+
+
+def tables(rows, reference, nested_phases=frozenset(), planned=None):
     rng = random.Random(BOOTSTRAP_SEED)
     add_common_length(rows)
     lines = []
@@ -526,6 +598,16 @@ def tables(rows, reference):
         approx = approx_configs(grows)
         configs = sorted({r["config"] for r in grows})
         label = f"{group[0]} / {group[1]}"
+
+        def common_keys(a, b):
+            if planned is not None:
+                return planned.get((group[0], a), set()) & planned.get((group[0], b), set())
+            # Les journaux seuls savent aussi distinguer les sondes unilatérales.
+            if any(r.get("ttft_only") for r in grows):
+                return ({(r["prompt"], obs_key(r)) for r in grows if r["config"] == a}
+                        & {(r["prompt"], obs_key(r)) for r in grows if r["config"] == b})
+            return None
+
         for metric, higher, title, compared in METRICS:
             table = observations(grows, metric)
             lines.append(f"\n### {label} — {title}\n")
@@ -550,7 +632,9 @@ def tables(rows, reference):
                 is_approx = metric == "delivery_tok_s" and (config in approx or reference in approx)
                 stat = None
                 if config != reference and reference in table:
-                    stat = paired_bootstrap(table[config], table[reference], rng)
+                    stat = paired_bootstrap(table[config], table[reference], rng,
+                                            nested=group[0] in nested_phases,
+                                            planned=common_keys(config, reference))
                 mark = "≈" if is_approx else ""
                 lines.append(f"| {config} | {mark}{statistics.median(values):.2f} | "
                              f"{fmt(stat, is_approx) if stat else '—'} | "
@@ -568,13 +652,15 @@ def tables(rows, reference):
                     is_approx = metric == "delivery_tok_s" and (
                         config in approx or SPEC_PAIRS[config] in approx)
                     cells.append(fmt(paired_bootstrap(table.get(config, {}),
-                                                      table.get(SPEC_PAIRS[config], {}), rng),
+                                                      table.get(SPEC_PAIRS[config], {}), rng,
+                                                      nested=group[0] in nested_phases,
+                                                      planned=common_keys(config, SPEC_PAIRS[config])),
                                      is_approx))
                 lines.append(f"| {config} | {SPEC_PAIRS[config]} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
-def drift(rows):
+def drift(rows, nested_phases=frozenset()):
     """Dérive de log(débit) selon le rang dans le bloc et selon l'heure, par config.
 
     Seules des observations de même charge se comparent : chaque groupe (config,
@@ -584,12 +670,35 @@ def drift(rows):
     """
     groups = {}
     for r in rows:
+        if r.get("ttft_only"):
+            continue
         if r.get("admissibility") == "admissible" and (r.get("m") or {}).get("delivery_tok_s"):
             key = (r["config"], r["phase"], r["prompt"], r["sampling"])
             groups.setdefault(key, []).append(
                 (r["position"], r["t0_wall"] / 3600, math.log(r["m"]["delivery_tok_s"])))
     result = {}
     for config in sorted({key[0] for key in groups}):
+        if not any(len(points) >= 2 for key, points in groups.items() if key[0] == config):
+            result[config] = {"status": "non calculable",
+                              "reason": "aucune répétition d'un même prompt à charge comparable"}
+            positions = {}
+            for row in rows:
+                if (row["config"] != config or row["phase"] not in nested_phases
+                        or row.get("ttft_only") or not row.get("sensors")):
+                    continue
+                sensor = row["sensors"]
+                values = positions.setdefault(row["position"], {"temp": [], "freq": []})
+                for source, target in (("gpu_temp_c_mean", "temp"),
+                                       ("gpu_freq_mhz_median", "freq")):
+                    if sensor.get(source) is not None:
+                        values[target].append(sensor[source])
+            summary = {str(position): {
+                "gpu_temp_c_mean": statistics.fmean(v["temp"]) if v["temp"] else None,
+                "gpu_freq_mhz_median": statistics.median(v["freq"]) if v["freq"] else None}
+                for position, v in sorted(positions.items()) if v["temp"] or v["freq"]}
+            if summary:
+                result[config]["sensors_by_position"] = summary
+            continue
         entry = {}
         for name, index in (("rank", 0), ("hour", 1)):
             sxy = sxx = 0.0
@@ -624,7 +733,7 @@ def gap_histogram(rows):
     """
     hist = {}
     for row in rows:
-        if row.get("status") != "ok":
+        if row.get("status") != "ok" or row.get("ttft_only"):
             continue
         times = [e["t_ns"] for e in row["events"]
                  if e.get("content_chars", 0) + e.get("reasoning_chars", 0) > 0]
@@ -674,7 +783,7 @@ def memory_summary(rows):
     summary = {}
     for row in rows:
         m = row.get("m") or {}
-        if row.get("admissibility") != "admissible":
+        if row.get("admissibility") != "admissible" or row.get("ttft_only"):
             continue
         entry = summary.setdefault(row["config"], {"prefill": [], "decode": [], "lifetime": []})
         for key, name in (("mem_prefill_max", "prefill"), ("mem_decode_max", "decode"),
@@ -696,7 +805,9 @@ def admissibility_summary(rows):
             if value is not True:
                 entry["failed_proofs"].setdefault(f"{name}={value}", []).append(row["prompt"])
         m = row.get("m") or {}
-        if row.get("status") == "ok":
+        if row.get("ttft_only"):
+            entry["ttft_only"] = entry.get("ttft_only", 0) + 1
+        elif row.get("status") == "ok":
             entry["approx"] += not m.get("exact")
             entry["short"] += (m.get("n_usage") or 0) < 300
         entry["throttled"] += row.get("throttled", False)
@@ -761,13 +872,14 @@ def _self_check():
     assert not derive(line(["x", "y"], 2), tok, None)["exact"]
     # Fusion « a » + « b » en un token : le comptage cumulé le voit (0 au 2e).
     assert not derive(line(["a", "b", "c"], 2), tok, False)["exact"]
-    a = {"p1": {(0, None, 0): 2.0, (1, None, 0): 2.0}, "p2": {(0, None, 0): 4.0},
-         "p3": {(0, None, 0): 1.0}}
-    b = {"p1": {(0, None, 0): 1.0, (1, None, 0): 1.0}, "p2": {(0, None, 0): 2.0},
-         "p3": {(0, None, 0): 0.5, (1, None, 0): 0.5}}
+    a = {"p1": {(0, None, 0): 2.0, (1, None, 0): 2.0},
+         "p2": {(0, None, 0): 4.0, (1, None, 0): 4.0},
+         "p3": {(0, None, 0): 1.0, (1, None, 0): 1.0}}
+    b = {p: {k: v / 2 for k, v in values.items()} for p, values in a.items()}
+    b["p3"][(1, None, 1)] = 0.5
     stat = paired_bootstrap(a, b, random.Random(1))
     assert abs(stat["ratio"] - 2.0) < 1e-9 and stat["ci"] == (2.0, 2.0)
-    assert stat["n_pairs"] == 4 and stat["n_missing"] == 1
+    assert stat["n_pairs"] == 6 and stat["n_missing"] == 1
     assert verdict(stat) == "meilleur (notable)"
     assert first_divergence("abc", "abd") == 2 and first_divergence("ab", "ab") is None
     row = {"prompt": "p", "nonce": "n", "engine": "llama", "usage": {
@@ -829,6 +941,129 @@ def _self_check():
                            "t0_wall": position * 3600, "m": {"delivery_tok_s": rate}})
     assert all(not v["flag"] and abs(v["change_over_span"]) < 1e-9
                for v in drift(drift_rows)["c"].values())
+    # Plan imbriqué sans répétition : l'absence d'estimation n'est pas une pente nulle.
+    nested = [dict(r, prompt=f"p{i}") for i, r in enumerate(drift_rows)]
+    assert drift(nested)["c"] == {
+        "status": "non calculable",
+        "reason": "aucune répétition d'un même prompt à charge comparable"}
+    _bootstrap_check()
+    _ttft_check()
+
+
+def _bootstrap_check():
+    """Référence croisée avant modification, effet imbriqué et mélange refusé."""
+    a = {f"p{p}": {(b, 11, r): (p + 1) * (b + 2) + r
+                   for b in range(3) for r in range(2)} for p in range(4)}
+    b = {p: {k: v / (1.2 + k[0] / 10 + int(p[1:]) / 20) for k, v in vals.items()}
+         for p, vals in a.items()}
+    rng = random.Random(17)
+    assert paired_bootstrap(a, b, rng) == {
+        "ratio": 1.3756205489812807, "ci": (1.236812780528175, 1.5119264488002242),
+        "n_prompts": 4, "n_pairs": 24, "n_missing": 0}
+    assert rng.random() == 0.015817104630740264
+    # Chaque bloc porte son propre effet : 1, 2, 4. Avec trois blocs tirés,
+    # les queues à 2,5 % sont les tirages trois fois 1 ou trois fois 4.
+    b = {f"p{block}-{p}": {(block, 11, r): 3.0 + p + r for r in range(2)}
+         for block in range(3) for p in range(3)}
+    a = {p: {k: v * 2**k[0] for k, v in vals.items()} for p, vals in b.items()}
+    stat = paired_bootstrap(a, b, random.Random(17), nested=True)
+    assert abs(stat["ratio"] - 2.0) < 1e-9 and stat["ci"] == (1.0, 4.0)
+    assert stat["n_prompts"] == 9 and stat["n_pairs"] == 18 and stat["n_missing"] == 0
+    assert stat["nested_blocks"] == 3 and "IC approximatif (3 blocs)" in fmt(stat)
+    small = dict(stat, ratio=1.02, ci=(1.01, 1.03))
+    assert verdict(small) == "indistinct"
+    assert verdict(dict(small, nested_blocks=0)) == "meilleur (< 5 %)"
+    assert verdict(dict(small, ratio=1.08, ci=(1.06, 1.1))) == "meilleur (notable)"
+    assert verdict(dict(small, ratio=0.92, ci=(0.90, 0.94))) == "moins bon (notable)"
+    assert verdict(dict(small, ratio=1.08, ci=(0.99, 1.1))) == "indistinct"
+    assert "IC approximatif" not in fmt(dict(small, nested_blocks=0))
+    # Refus même sous le seuil de trois prompts et avant tout tirage.
+    for count in (2, 3):
+        mixed = {p: dict(a[p]) for p in list(a)[:count]}
+        mixed[next(iter(mixed))][(1, 11, 0)] = 3.0
+        rng = random.Random(17)
+        state = rng.getstate()
+        try:
+            paired_bootstrap(mixed, mixed, rng, nested=True)
+            raise AssertionError("bootstrap mixte accepté")
+        except ValueError as error:
+            assert "mélange" in str(error)
+        assert rng.getstate() == state
+    # Plan croisé avec paires perdues (cas réel de la nuit 5) : accepté.
+    lost = {"p0": {(0, 11, 0): 2.0}, "p1": {(0, 11, 0): 3.0, (1, 11, 0): 3.0},
+            "p2": {(1, 11, 0): 4.0, (2, 11, 0): 4.0}}
+    assert paired_bootstrap(lost, lost, random.Random(17))["ci"] == (1.0, 1.0)
+
+
+def _ttft_check():
+    """Sondes à 8 tokens : mêmes preuves, TTFT seul et aucun effet sur L."""
+    import copy
+    import tempfile
+    from unittest.mock import patch
+
+    short = {"kind": "measure", "phase": "eval-S", "block": 0, "config": "sar-ar",
+             "prompt": "code4k-1", "nonce": "n", "seed": None, "repeat": 1,
+             "status": "ok", "sampling": "greedy", "engine": "saragossa",
+             "ttft_only": True, "max_tokens": 8, "body_params": {"max_tokens": 8},
+             "events": [{"t_ns": (i + 1) * 10**9, "text": "x", "content_chars": 1}
+                        for i in range(8)],
+             "usage": {"completion_tokens": 8, "prompt_tokens": 4096},
+             "content": "x" * 8, "finish_reason": "length",
+             "ingest": {"prompt_fnv1a64": "f", "reused_prefix_tokens": "0"}}
+    expected = {"code4k-1|n": {"prompt_tokens": 4096, "fnv1a64": "f"}}
+    assert all(proofs(short, expected, {}).values())
+    assert not proofs(dict(short, body_params={"max_tokens": 400}), expected, {})["ttft_budget"]
+    assert not proofs(dict(short, events=[]), expected, {})["output"]
+    matrix = {"engines": {"saragossa": {"usage_counts_eos": False}}, "tuning": {}}
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / "prompts").mkdir()
+        (root / "prompts/prompts.json").write_text(json.dumps({"prompts": [
+            {"id": "code4k-1", "kind": "code"}]}))
+        (root / "prompts/expected.json").write_text(json.dumps(expected))
+        bad = copy.deepcopy(short)
+        bad["ingest"]["reused_prefix_tokens"] = "1"
+        (root / "results.jsonl").write_text("\n".join(json.dumps(r) for r in (short, bad)))
+        with (patch(__name__ + ".tokenizer", return_value=None),
+              patch(__name__ + ".load_matrix", return_value=matrix)):
+            rows, _, _ = load(root)
+    assert [r["admissibility"] for r in rows] == ["admissible", "validation_failed"]
+    short = rows[0]
+    assert short["m"]["ttft_s"] == 1.0
+    assert not {"delivery_tok_s", "t_at_token_s", "total_s", "latency_L_s"} & short["m"].keys()
+    assert observations([short], "ttft_s") == {"sar-ar": {"code4k-1": {(0, None, 1): 1.0}}}
+    # Même une ancienne ligne enrichie de métriques ne peut contaminer les agrégats.
+    short["m"].update(delivery_tok_s=10000, total_s=8, t_at_token_s=list(range(1, 9)))
+    for metric in ("delivery_tok_s", "latency_L_s", "total_s", "n_usage"):
+        assert observations([short], metric) == {}
+    long = dict(short, ttft_only=False, repeat=0,
+                m={"exact": True, "t_at_token_s": list(range(1, 401))})
+    add_common_length([long, short])
+    assert long["m"]["common_length"] == 400 and "latency_L_s" not in short["m"]
+    assert approx_configs([long, short]) == set()
+    other = dict(short, config="mlx-ar", content="autre sortie")
+    assert text_identity_report([long, short, other], CROSS_PAIRS.get) == {}
+    speculative = dict(short, config="sar-mtp")
+    assert list(identity_checks([short, speculative], SPEC_PAIRS.get)) == []
+    assert drift([short]) == memory_summary([short]) == gap_histogram([short]) == {}
+    a = {"code4k-1": {(0, None, 0): 1, (0, None, 1): 2, (0, None, 2): 3}}
+    b = {"code4k-1": {(0, None, 0): 1}}
+    expected_pairs = {("code4k-1", (0, None, 0))}
+    assert paired_bootstrap(a, b, random.Random(1), planned=expected_pairs)["n_missing"] == 0
+    expected_pairs.add(("code4k-1", (0, None, 1)))
+    assert paired_bootstrap(a, b, random.Random(1), planned=expected_pairs)["n_missing"] == 1
+    measured = [dict(long, prompt=f"p{i}", position=i % 2, t0_wall=i,
+                     sensors={"gpu_temp_c_mean": 40 + i, "gpu_freq_mhz_median": 800 + 100*i},
+                     m={"delivery_tok_s": 30}) for i in range(3)]
+    diagnostic = drift(measured, {"eval-S"})["sar-ar"]["sensors_by_position"]
+    assert diagnostic == {"0": {"gpu_temp_c_mean": 41, "gpu_freq_mhz_median": 900},
+                          "1": {"gpu_temp_c_mean": 41, "gpu_freq_mhz_median": 900}}
+    assert "sensors_by_position" not in drift(measured)["sar-ar"]
+    for row in measured:
+        row.pop("sensors")
+    assert drift(measured, {"eval-S"}) == drift(measured)
+    summary = admissibility_summary([short])["sar-ar"]
+    assert summary["ttft_only"] == 1 and summary["short"] == summary["approx"] == 0
 
 
 if __name__ == "__main__":
@@ -839,6 +1074,8 @@ if __name__ == "__main__":
     run_dir = pathlib.Path(sys.argv[1])
     reference = sys.argv[2] if len(sys.argv) > 2 else "llkm-ar"
     rows, others, probes = load(run_dir)
+    nested_phases = {phase for phase, spec in load_matrix(run_dir)["phases"].items()
+                     if spec.get("prompt_sets")}
     loads = [o for o in others if o.get("kind") == "load"]
     report = {
         "admissibility": admissibility_summary(rows),
@@ -847,7 +1084,7 @@ if __name__ == "__main__":
         "integrity": text_identity_report(rows, pair_function(load_matrix(run_dir))),
         "cross_engine_text_identity_informative": text_identity_report(rows, CROSS_PAIRS.get),
         "repeatability": repeatability(rows),
-        "drift": drift(rows),
+        "drift": drift(rows, nested_phases),
         "gap_histogram": gap_histogram(rows),
         "ids_nature": IDS_NATURE,
         "slots_qualification": slots_qualification(
@@ -861,10 +1098,12 @@ if __name__ == "__main__":
     (run_dir / "analysis.json").write_text(json.dumps(report, indent=1, ensure_ascii=False,
                                                       default=str))
     # Tableaux d'abord : ils calculent latency_L_s, publiée ensuite par requête.
-    (run_dir / "tables.md").write_text(tables(rows, reference))
+    (run_dir / "tables.md").write_text(tables(rows, reference, nested_phases, planned_keys(run_dir)))
     keep = ("phase", "block", "config", "prompt", "prompt_kind", "seed", "repeat", "status",
             "admissibility", "throttled", "proofs", "request_id")
     per_request = [{k: r.get(k) for k in keep}
+                   | ({"ttft_only": True, "max_tokens": r["max_tokens"]}
+                      if r.get("ttft_only") else {})
                    | {k: v for k, v in (r.get("m") or {}).items() if k != "t_at_token_s"}
                    for r in rows]
     (run_dir / "per_request.jsonl").write_text(

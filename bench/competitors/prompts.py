@@ -69,6 +69,30 @@ CHAT = {
               "the French Revolution.",
     "chat-6": "Give a comprehensive guide to brewing coffee with a French press: "
               "beans, grind, water, timing, and the most common mistakes.",
+    "chat-7": "Write a detailed tutorial on building a small SQL query engine in "
+              "Python, from parsing to joins, with code and worked examples.",
+    "chat-8": "Explain how a city can redesign its public transport network. "
+              "Discuss frequency, transfers, accessibility and funding in at least 600 words.",
+    "chat-9": "Write a story of at least 800 words about a botanist who discovers "
+              "a garden growing inside an abandoned railway station.",
+    "chat-10": "Explain plate tectonics in depth, tracing the evidence from ocean "
+               "floors, earthquakes and fossils, with examples from several continents.",
+    "chat-11": "Write a comprehensive guide to making sourdough bread, explaining "
+               "fermentation, hydration, kneading, proofing and how to diagnose failures.",
+    "chat-12": "Write a detailed essay on the history of printing and its effects "
+               "on science, education and politics, with concrete historical examples.",
+    "chat-13": "Explain how to implement a durable write-ahead log in Rust, with "
+               "code, crash recovery examples and a discussion of filesystem guarantees.",
+    "chat-14": "Write a detailed guide to designing a controlled scientific "
+               "experiment, covering randomization, confounders and statistical interpretation.",
+    "chat-15": "Write a story of at least 800 words about two siblings restoring "
+               "an old radio and hearing a broadcast from their childhood.",
+    "chat-16": "Explain how an orchestra prepares a symphony for performance, "
+               "from score study to rehearsals, with detailed examples of musical decisions.",
+    "chat-17": "Write a comprehensive guide to restoring a wetland ecosystem, "
+               "covering hydrology, native species, monitoring and community involvement.",
+    "chat-18": "Write a detailed essay comparing navigation by stars, marine "
+               "chronometers and satellites, explaining the mathematics with worked examples.",
     "tune-chat-1": "Explain in depth how a garbage collector based on generational "
                    "copying works, with diagrams described in text and pseudo-code.",
     # Sondes EOS de la validation : arrêt naturel attendu bien avant 400 tokens.
@@ -82,9 +106,21 @@ DOCS = [
     ("code4k-1", "eval", 4096, ("rust", "alloc/src/collections/binary_heap/mod.rs")),
     ("code4k-2", "eval", 4096, ("rust", "core/src/str/pattern.rs")),
     ("code4k-3", "eval", 4096, ("rust", "std/src/io/stdio.rs")),
+    ("code4k-4", "eval", 4096, ("rust", "alloc/src/collections/btree/map.rs")),
+    ("code4k-5", "eval", 4096, ("rust", "alloc/src/collections/btree/set.rs")),
+    ("code4k-6", "eval", 4096, ("rust", "alloc/src/string.rs")),
+    ("code4k-7", "eval", 4096, ("rust", "alloc/src/sync.rs")),
+    ("code4k-8", "eval", 4096, ("rust", "alloc/src/vec/mod.rs")),
+    ("code4k-9", "eval", 4096, ("rust", "std/src/fs.rs")),
     ("prose4k-1", "eval", 4096, ("wiki", 0)),
     ("prose4k-2", "eval", 4096, ("wiki", 1)),
     ("prose4k-3", "eval", 4096, ("wiki", 2)),
+    ("prose4k-4", "eval", 4096, ("wiki", 4)),
+    ("prose4k-5", "eval", 4096, ("wiki", 5)),
+    ("prose4k-6", "eval", 4096, ("wiki", 6)),
+    ("prose4k-7", "eval", 4096, ("wiki", 7)),
+    ("prose4k-8", "eval", 4096, ("wiki", 8)),
+    ("prose4k-9", "eval", 4096, ("wiki", 9)),
     ("code32k-1", "eval", 32768, ("rust", "alloc/src/collections/vec_deque/mod.rs")),
     ("prose32k-1", "eval", 32768, ("wikicat", 10)),
     ("code256k-1", "eval", 261000, ("rustcat", "core/src")),
@@ -96,6 +132,12 @@ DOCS = [
 
 def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def is_4k(prompt_id):
+    """Documents 4k d'évaluation, seuls concernés par les répétitions TTFT."""
+    return any(p == prompt_id and split == "eval" and target == 4096
+               for p, split, target, _ in DOCS)
 
 
 def fnv1a64(ids):
@@ -275,6 +317,8 @@ def build(out_dir):
         instruction = {"code": CODE_INSTRUCTION, "prose": PROSE_INSTRUCTION}[kind]
         if source[0] == "rustcat":
             instruction = LONG_CODE_INSTRUCTION
+        if source[0] == "rust" and len(renderer.encode(doc)) < target:
+            raise SystemExit(f"{prompt_id}: source trop courte pour {target} tokens")
         content, actual = fit(renderer, doc, instruction, target)
         prompts.append({
             "id": prompt_id, "kind": kind, "split": split, "target_tokens": target,
@@ -354,6 +398,19 @@ def expect(out_dir, plan_path):
 
 
 def _self_check():
+    # Les rangs wiki sont ceux de la même liste admissible. Réserver toute la
+    # suite de wikicat évite un chevauchement quelle que soit sa longueur.
+    wiki = [source[1] for _, _, _, source in DOCS if source[0] == "wiki"]
+    starts = [source[1] for _, _, _, source in DOCS if source[0] == "wikicat"]
+    assert len(wiki) == len(set(wiki)) and all(rank < min(starts) for rank in wiki)
+    rust = [source[1] for _, _, _, source in DOCS if source[0] == "rust"]
+    assert len(rust) == len(set(rust))
+    roots = [source[1] for _, _, _, source in DOCS if source[0] == "rustcat"]
+    for p, _, _, source in DOCS:
+        if p in {f"code4k-{i}" for i in range(4, 10)}:
+            assert all(not source[1].startswith(root + "/") for root in roots)
+    assert all(is_4k(f"{kind}4k-{i}") for kind in ("code", "prose") for i in range(1, 10))
+    assert not is_4k("tune-code4k-1") and not is_4k("code32k-1")
     # Vecteur partagé avec le test Rust `prompt_fingerprint_matches_reference_fnv1a`.
     assert fnv1a64([]) == "cbf29ce484222325"
     assert fnv1a64([248045, 872, 198]) == "a5c9734054dc81d8"
@@ -370,5 +427,7 @@ if __name__ == "__main__":
         build(sys.argv[2])
     elif len(sys.argv) >= 4 and sys.argv[1] == "expect":
         expect(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 1:
+        print("prompts: auto-test ok")
     else:
         raise SystemExit(__doc__)

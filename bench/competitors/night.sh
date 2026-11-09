@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Enchaîne une nuit de campagne (protocole v5, §12). Machine libre, secteur.
 #
-# Usage : night.sh validate|1|2 RUN_DIR
+# Usage : night.sh validate|1|2|partial RUN_DIR
 #   validate : essai de validation (prompts de réglage 4k et sondes EOS)
 #   1        : réglage, gel des réglages (freeze), puis eval-S et eval-M
 #   2        : qualité (ids du corpus, PPL, KL, llama-bench), échantillonné
 #              exploratoire, 256k
+#   partial  : qualité, eval-S, sampled-S, eval-L-mlx, à partir d’un gel existant
 # RUN_DIR doit contenir prompts/prompts.json (prompts.py build).
 #
 # Reprise : relancer la même nuit reprend l'étape interrompue. Un plan déjà tiré
@@ -25,9 +26,16 @@ run="$2"
 clean=(env -i PATH="${PATH}" HOME="${HOME}" TMPDIR="${TMPDIR:-/tmp}" USER="${USER:-}"
   LANG=en_US.UTF-8 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
   MODELS="${MODELS}" AI_MODEL="${AI_MODEL}" RUST_SRC="${RUST_SRC}" CORPUS_DIR="${CORPUS_DIR}"
+  MLX_CKPT="${MLX_CKPT}" BENCH_MLX_CKPT="${BENCH_MLX_CKPT:-}"
   BENCH_ENV="${BENCH_ENV:-${here}/local.env}")
 sys_py=("${clean[@]}" python3 -I -B)
 venv=("${clean[@]}" "${MLX_VENV}/bin/python" -I -B)
+
+"${sys_py[@]}" "${here}/run_matrix.py"
+"${sys_py[@]}" "${here}/analyze.py"
+if [[ "${night}" == partial ]]; then
+  "${sys_py[@]}" "${here}/night_checks.py" partial-freeze "${run}"
+fi
 
 if [[ -n "${GPU_LOCK:-}" ]]; then
   until mkdir "${GPU_LOCK}" 2>/dev/null; do sleep 60; done
@@ -60,8 +68,19 @@ case "${night}" in
     fi
     phase_run eval-S eval-M
     ;;
-  2)
+  partial)
+    "${sys_py[@]}" "${here}/night_checks.py" power
     "${clean[@]}" "${here}/quality_llama.sh" "${run}/quality"
+    "${sys_py[@]}" "${here}/night_checks.py" power
+    "${venv[@]}" "${here}/quality.py" mlx-ppl "${WIKITEXT_TEST}" > "${run}/quality/ppl-mlx.json"
+    phase_run eval-S
+    phase_run sampled-S
+    phase_run eval-L-mlx
+    ;;
+  2)
+    "${sys_py[@]}" "${here}/night_checks.py" power
+    "${clean[@]}" "${here}/quality_llama.sh" "${run}/quality"
+    "${sys_py[@]}" "${here}/night_checks.py" power
     "${venv[@]}" "${here}/quality.py" mlx-ppl "${WIKITEXT_TEST}" > "${run}/quality/ppl-mlx.json"
     phase_run sampled-S eval-L
     ;;
