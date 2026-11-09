@@ -4,6 +4,17 @@ Harnais du bench saragossa / llama.cpp / mlx-lm / llmd. Le protocole (v4) fixe
 les règles ; ce dossier les exécute. Python stdlib, plus le venv MLX
 (`tokenizers`, `jinja2`, `transformers`) pour les prompts, le gel et l'analyse.
 
+Pour comparer directement deux binaires saragossa ou deux jeux de variables,
+`python3 -I -B bench/ab.py run OUT --a BIN --b BIN --model-dir DIR
+--prompt-tokens 4096 --max-tokens 256` propose des blocs ABBA, les options
+répétables `--env-a K=V` / `--env-b K=V` et une reprise des blocs interrompus.
+Ce comparateur stdlib ne dépend pas de `local.env`. Le lancer sous
+`tools/gpulock.py run` (exemple dans son docstring). `report OUT [--json]`
+relit les résultats sans moteur ; sans argument, seuls des exécutables
+factices sont testés. Les codes 0/1/2/3 signifient gain/perte/indistinct/invalide
+sur `--primary`, par défaut `decode_tok_s`. Les IC exigent quatre blocs ;
+la conclusion porte sur les prompts fournis, sans preuve d'équivalence.
+
 ```sh
 cp bench/competitors/local.env.example bench/competitors/local.env   # puis renseigner
 VENV=models/mlxenv/bin/python

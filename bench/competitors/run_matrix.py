@@ -22,11 +22,9 @@ Le GPU est exclusif : le lanceur de la campagne prend le verrou GPU avant
 `run` et le rend après ; ce script ne lance qu'un moteur à la fois.
 """
 
-import ctypes
 import hashlib
 import http.client
 import json
-import math
 import os
 import pathlib
 import random
@@ -42,7 +40,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import client  # noqa: E402
 import memwatch  # noqa: E402
 import sensors  # noqa: E402
-from sensors import pmset, power_state, validate_power  # noqa: E402
+from sensors import pmset, power_state, validate_power, thermal, wait_idle  # noqa: E402
 from config import path as config_path, paths as config_paths, sanitize  # noqa: E402
 from prompts import fnv1a64, is_4k  # noqa: E402  (stdlib seule au niveau module)
 from results import read_results  # noqa: E402
@@ -236,68 +234,10 @@ def content_for(prompts, prompt_id, nonce_value):
     return prompts["nonce_line"].format(nonce=nonce_value) + content[len(placeholder):]
 
 
-def thermal_pressure():
-    """Niveau `OSThermalPressureLevel` par notify(3), nul si illisible."""
-    try:
-        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-        token, level = ctypes.c_int(), ctypes.c_uint64()
-        if lib.notify_register_check(b"com.apple.system.thermalpressurelevel",
-                                     ctypes.byref(token)) != 0:
-            return None
-        try:
-            status = lib.notify_get_state(token.value, ctypes.byref(level))
-            return None if status != 0 else level.value
-        finally:
-            lib.notify_cancel(token.value)
-    except (OSError, AttributeError):
-        return None
-
-
-def soc_sensors():
-    """Capteurs macmon informatifs ; zéro reste une mesure pour les ventilateurs."""
-    empty = {"cpu_temp_c": None, "gpu_temp_c": None, "fan_rpm": None,
-             "sys_power_w": None}
-
-    def value(number):
-        return (number if type(number) in (int, float)
-                and math.isfinite(number) and number > 0 else None)
-
-    try:
-        out = subprocess.run(["macmon", "pipe", "-s", "1", "-i", "200"],
-                             capture_output=True, text=True, timeout=2, check=True).stdout
-        sample = json.loads(out)
-        temp = sample.get("temp") or {}
-        return {"cpu_temp_c": value(temp.get("cpu_temp_avg")),
-                "gpu_temp_c": value(temp.get("gpu_temp_avg")),
-                "fan_rpm": [fan.get("rpm") for fan in sample.get("fans", [])] or None,
-                "sys_power_w": value(sample.get("sys_power"))}
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
-        return empty
-
-
 def require_power(camp, **meta):
     state = power_state()
     camp.write({"kind": "power", "time": time.time(), **meta, **state})
     validate_power(state)
-    return state
-
-
-def thermal(sampler=None):
-    """État de `pmset -g therm` : bridé si un niveau d'alerte est enregistré
-    ou si une limite de vitesse CPU inférieure à 100 est annoncée."""
-    out, error = pmset("therm")
-    lines = [line.strip() for line in out.splitlines() if line.strip()]
-    throttled = False
-    for line in lines:
-        if "warning level" in line.lower() and not line.startswith("Note: No"):
-            throttled = True
-        if line.startswith("CPU_Speed_Limit") and not line.rstrip().endswith("100"):
-            throttled = True
-    state = {"raw": " | ".join(lines), "throttled": throttled,
-             "pressure": thermal_pressure(),
-             **(sampler.latest()[1] if sampler is not None else soc_sensors())}
-    if error:
-        state["error"] = error
     return state
 
 
@@ -324,28 +264,6 @@ def cooldown(matrix, sampler=None):
         state = thermal(sampler) if sampler is not None else thermal()
     state["waited_s"] = round(time.monotonic() - start, 1)
     return state
-
-
-def wait_idle(matrix, sampler):
-    """Trois lectures distinctes sous le seuil ; capteur absent : pas d'attente."""
-    start = time.monotonic()
-    deadline = start + matrix.get("busy_wait_max_s", 300)
-    consecutive, previous = 0, None
-    while sampler is not None:
-        stamp, sample = sampler.latest()
-        ratio = sample.get("gpu_active_ratio")
-        if ratio is None:
-            break
-        if stamp != previous:
-            consecutive = consecutive + 1 if ratio < matrix.get("busy_gpu_ratio", 0.2) else 0
-            previous = stamp
-        if consecutive >= 3:
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return {"busy_wait_s": round(time.monotonic() - start, 1), "machine_busy": True}
-        time.sleep(min(1, remaining))
-    return {"busy_wait_s": round(time.monotonic() - start, 1), "machine_busy": False}
 
 
 def port_free(port):
@@ -1107,52 +1025,8 @@ def _thermal_check():
     from types import SimpleNamespace
     from unittest.mock import Mock, patch
 
-    lib = Mock()
-    lib.notify_register_check.return_value = 0
-
-    def read_level(token, level):
-        level._obj.value = 3
-        return 0
-
-    lib.notify_get_state.side_effect = read_level
-    with patch.object(ctypes, "CDLL", return_value=lib):
-        assert thermal_pressure() == 3
-        lib.notify_cancel.assert_called_once()
-        lib.notify_register_check.return_value = 1
-        assert thermal_pressure() is None
-        assert lib.notify_cancel.call_count == 1
-        lib.notify_register_check.return_value = 0
-        lib.notify_get_state.side_effect = None
-        lib.notify_get_state.return_value = 1
-        assert thermal_pressure() is None
-        assert lib.notify_cancel.call_count == 2
-    with patch.object(ctypes, "CDLL", side_effect=OSError("absent")):
-        assert thermal_pressure() is None
-    sample = {"temp": {"cpu_temp_avg": 62.5, "gpu_temp_avg": 51.0},
-              "fans": [{"rpm": 1200}, {"rpm": 0.0}, {}], "sys_power": 42.0}
-    sensors = {"cpu_temp_c": 62.5, "gpu_temp_c": 51.0, "fan_rpm": [1200, 0.0, None],
-               "sys_power_w": 42.0}
-    with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout=json.dumps(sample))) as call:
-        assert soc_sensors() == sensors
-    assert call.call_args.args[0] == ["macmon", "pipe", "-s", "1", "-i", "200"]
-    assert call.call_args.kwargs["timeout"] == 2 and call.call_args.kwargs["check"]
-    empty = dict.fromkeys(sensors)
-    for sample in ({}, {"temp": {"cpu_temp_avg": 0.0, "gpu_temp_avg": 0.0}},
-                   None, [], {"temp": []}, {"fans": None}):
-        with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout=json.dumps(sample))):
-            assert soc_sensors() == empty
-    for error in (FileNotFoundError("macmon"), subprocess.TimeoutExpired("macmon", 2),
-                  subprocess.CalledProcessError(1, "macmon"), ValueError("JSON")):
-        with patch.object(subprocess, "run", side_effect=error):
-            assert soc_sensors() == empty
-    for raw, throttled in (("Note: No thermal warning level has been recorded", False),
-                           ("CPU_Speed_Limit = 100", False),
-                           ("CPU_Speed_Limit = 80", True), ("Thermal warning level: 1", True)):
-        with (patch.object(subprocess, "run", return_value=SimpleNamespace(stdout=raw)),
-              patch(__name__ + ".thermal_pressure", return_value=4),
-              patch(__name__ + ".soc_sensors", return_value=sensors)):
-            state = thermal()
-        assert state == {"raw": raw, "throttled": throttled, "pressure": 4, **sensors}
+    sensors._thermal_check()
+    sensors._idle_check()
     clock = [0.0]
 
     def sleep(seconds):
@@ -1199,8 +1073,8 @@ def _operations_check():
     for error in (FileNotFoundError("pmset"), subprocess.TimeoutExpired("pmset", 3),
                   subprocess.CalledProcessError(1, "pmset")):
         with (patch.object(subprocess, "run", side_effect=error),
-              patch(__name__ + ".soc_sensors", return_value={}),
-              patch(__name__ + ".thermal_pressure", return_value=None)):
+              patch.object(sensors, "soc_sensors", return_value={}),
+              patch.object(sensors, "thermal_pressure", return_value=None)):
             assert thermal()["error"] and not thermal()["throttled"]
             state = require_power(SimpleNamespace(write=lambda row: None))
             assert state["on_ac"] is None and state["low_power"] is None and len(state["errors"]) == 2
@@ -1233,17 +1107,6 @@ def _operations_check():
             assert cooldown(matrix)["waited_s"] == 5
         with patch(__name__ + ".thermal", return_value={"throttled": False, "gpu_temp_c": None}):
             assert cooldown(matrix)["waited_s"] == 2
-        sensor = Mock()
-        sensor.latest.side_effect = [(i, {"gpu_active_ratio": r}) for i, r in enumerate((0.1, 0.3, 0.1, 0.1, 0.1))]
-        assert wait_idle({}, sensor) == {"busy_wait_s": 4, "machine_busy": False}
-        sensor.latest.side_effect = None
-        sensor.latest.return_value = (1, {"gpu_active_ratio": 0.1})
-        assert wait_idle({"busy_wait_max_s": 3}, sensor) == {"busy_wait_s": 3, "machine_busy": True}
-        sensor.latest.side_effect = [(i, {"gpu_active_ratio": 0.3}) for i in range(3)]
-        assert wait_idle({"busy_gpu_ratio": 0.4}, sensor) == {"busy_wait_s": 2, "machine_busy": False}
-        sensor.latest.side_effect = None
-        sensor.latest.return_value = (None, {})
-        assert wait_idle({}, sensor) == {"busy_wait_s": 0, "machine_busy": False}
     for error in (SystemExit("arrêt"), SurvivingEngine("survivant"), RuntimeError("panne")):
         manager = Mock(__enter__=Mock(return_value=None), __exit__=Mock(return_value=False))
         with patch.object(sensors, "Sampler", return_value=manager), patch(__name__ + "._run", side_effect=error):
