@@ -183,6 +183,9 @@ impl MetalExecutor {
                 Err(error) => return Err(error),
             }
         };
+        // Le chemin complet précède tous les replis ; seul le kill-switch
+        // rend z+beta+gate utile lorsqu'il a pu être construit.
+        let needs_z_beta_gate = full.is_none() || !linear_full_concat_enabled();
         Ok(MetalLinearAttnResidentDenseWeights {
             full,
             qkv_z: self.resolve_linear_attn_pair_weights(
@@ -205,7 +208,7 @@ impl MetalExecutor {
                     weights.in_proj_b.weight(),
                     weights.in_proj_a.weight(),
                 ];
-                if self.concat_duplication_worth_avoiding(&sources) {
+                if !needs_z_beta_gate || self.concat_duplication_worth_avoiding(&sources) {
                     None
                 } else {
                     match self.resolve_concat_linear_weight_buffers(
