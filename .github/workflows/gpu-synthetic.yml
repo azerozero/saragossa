@@ -2,9 +2,16 @@ name: GPU synthétique
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
   pull_request:
     paths:
       - .github/workflows/gpu-synthetic.yml
+      - "src/**"
+      - "assets/**"
+      - build.rs
+      - Cargo.lock
+      - Cargo.toml
 
 permissions:
   contents: read
@@ -113,6 +120,8 @@ jobs:
           gpu_start=$SECONDS
           cargo test --features metal,devtools -- --ignored --exact "${tests[@]}" --test-threads=1
       - name: Vérifier et mesurer les deux tests GPU lourds
+        # Environ 7 min à eux deux : hors des PR, ils tournent la nuit.
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
