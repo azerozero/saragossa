@@ -1,0 +1,418 @@
+{
+ "admissibility": {
+  "llkm-mtp": {
+   "total": 60,
+   "by_status": {
+    "admissible": 60
+   },
+   "failed_proofs": {},
+   "approx": 2,
+   "throttled": 0,
+   "short": 0
+  },
+  "llkm-ar": {
+   "total": 96,
+   "by_status": {
+    "admissible": 96
+   },
+   "failed_proofs": {},
+   "approx": 2,
+   "throttled": 0,
+   "short": 0,
+   "ttft_only": 36
+  },
+  "sar-mtp": {
+   "total": 61,
+   "by_status": {
+    "admissible": 61
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llq40-dflash": {
+   "total": 36,
+   "by_status": {
+    "admissible": 36
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "sar-ar": {
+   "total": 97,
+   "by_status": {
+    "admissible": 97
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0,
+   "ttft_only": 36
+  },
+  "sar-dflash": {
+   "total": 61,
+   "by_status": {
+    "admissible": 61
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llmd-native": {
+   "total": 36,
+   "by_status": {
+    "failed:unsupported": 36
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "mlx-dflash": {
+   "total": 36,
+   "by_status": {
+    "failed:unsupported": 36
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llkm-dflash": {
+   "total": 60,
+   "by_status": {
+    "validation_failed": 28,
+    "admissible": 32
+   },
+   "failed_proofs": {
+    "greedy_identity=False": [
+     "chat-2",
+     "code4k-3",
+     "prose4k-1",
+     "chat-5",
+     "chat-1",
+     "chat-4",
+     "chat-6",
+     "prose4k-3",
+     "code4k-6",
+     "chat-8",
+     "chat-11",
+     "code4k-4",
+     "code4k-5",
+     "chat-12",
+     "chat-10",
+     "prose4k-5",
+     "chat-9",
+     "prose4k-8",
+     "prose4k-9",
+     "chat-17",
+     "code4k-9",
+     "chat-16",
+     "chat-14",
+     "chat-18",
+     "code4k-8",
+     "chat-13",
+     "prose4k-7",
+     "chat-15"
+    ]
+   },
+   "approx": 5,
+   "throttled": 0,
+   "short": 0
+  },
+  "mlx-mtp": {
+   "total": 36,
+   "by_status": {
+    "failed:unsupported": 36
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "mlx-ar": {
+   "total": 97,
+   "by_status": {
+    "admissible": 97
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0,
+   "ttft_only": 36
+  },
+  "llmd-ar": {
+   "total": 72,
+   "by_status": {
+    "admissible": 72
+   },
+   "failed_proofs": {},
+   "approx": 7,
+   "throttled": 0,
+   "short": 0,
+   "ttft_only": 36
+  },
+  "llq40-mtp": {
+   "total": 36,
+   "by_status": {
+    "admissible": 36
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  },
+  "llq40-ar": {
+   "total": 72,
+   "by_status": {
+    "admissible": 72
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0,
+   "ttft_only": 36
+  },
+  "llmd-ar-s": {
+   "total": 24,
+   "by_status": {
+    "admissible": 24
+   },
+   "failed_proofs": {},
+   "approx": 6,
+   "throttled": 0,
+   "short": 0
+  },
+  "llmd-native-s": {
+   "total": 24,
+   "by_status": {
+    "failed:unsupported": 24
+   },
+   "failed_proofs": {},
+   "approx": 0,
+   "throttled": 0,
+   "short": 0
+  }
+ },
+ "nonce_probes": [
+  {
+   "entry_key": "eval-S|0|llmd-ar",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.0,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|1|llmd-ar",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.0,
+   "passed": true
+  },
+  {
+   "entry_key": "eval-S|2|llmd-ar",
+   "run_seq": 1,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.0,
+   "passed": true
+  },
+  {
+   "entry_key": "sampled-S|0|llmd-ar-s",
+   "run_seq": 2,
+   "attempt": 0,
+   "doc": "tune-prose4k-1",
+   "ratio": 1.0,
+   "passed": true
+  }
+ ],
+ "eos": {
+  "llama": {
+   "length": {
+    "0": 285,
+    "1": 1,
+    "-1": 1,
+    "2": 1
+   }
+  },
+  "saragossa": {
+   "length": {
+    "0": 183
+   }
+  },
+  "mlx": {
+   "length": {
+    "0": 61
+   }
+  },
+  "llmd": {
+   "length": {
+    "0": 60
+   }
+  }
+ },
+ "integrity": {
+  "llkm-mtp": {
+   "against": "llkm-ar",
+   "pairs": 36,
+   "identical": 36,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "sar-mtp": {
+   "against": "sar-ar",
+   "pairs": 37,
+   "identical": 37,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "llq40-dflash": {
+   "against": "llq40-ar",
+   "pairs": 36,
+   "identical": 36,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "sar-dflash": {
+   "against": "sar-ar",
+   "pairs": 37,
+   "identical": 37,
+   "missing_pair": 0,
+   "first_divergences": []
+  },
+  "llkm-dflash": {
+   "against": "llkm-ar",
+   "pairs": 36,
+   "identical": 8,
+   "missing_pair": 0,
+   "first_divergences": [
+    {
+     "prompt": "chat-2",
+     "char": 408
+    },
+    {
+     "prompt": "code4k-3",
+     "char": 375
+    },
+    {
+     "prompt": "prose4k-1",
+     "char": 1067
+    },
+    {
+     "prompt": "chat-5",
+     "char": 362
+    },
+    {
+     "prompt": "chat-1",
+     "char": 1358
+    },
+    {
+     "prompt": "chat-4",
+     "char": 637
+    },
+    {
+     "prompt": "chat-6",
+     "char": 731
+    },
+    {
+     "prompt": "prose4k-3",
+     "char": 435
+    },
+    {
+     "prompt": "code4k-6",
+     "char": 616
+    },
+    {
+     "prompt": "chat-8",
+     "char": 1213
+    },
+    {
+     "prompt": "chat-11",
+     "char": 505
+    },
+    {
+     "prompt": "code4k-4",
+     "char": 1131
+    },
+    {
+     "prompt": "code4k-5",
+     "char": 909
+    },
+    {
+     "prompt": "chat-12",
+     "char": 279
+    },
+    {
+     "prompt": "chat-10",
+     "char": 1166
+    },
+    {
+     "prompt": "prose4k-5",
+     "char": 140
+    },
+    {
+     "prompt": "chat-9",
+     "char": 871
+    },
+    {
+     "prompt": "prose4k-8",
+     "char": 737
+    },
+    {
+     "prompt": "prose4k-9",
+     "char": 736
+    },
+    {
+     "prompt": "chat-17",
+     "char": 1284
+    },
+    {
+     "prompt": "code4k-9",
+     "char": 390
+    },
+    {
+     "prompt": "chat-16",
+     "char": 172
+    },
+    {
+     "prompt": "chat-14",
+     "char": 1420
+    },
+    {
+     "prompt": "chat-18",
+     "char": 942
+    },
+    {
+     "prompt": "code4k-8",
+     "char": 413
+    },
+    {
+     "prompt": "chat-13",
+     "char": 819
+    },
+    {
+     "prompt": "prose4k-7",
+     "char": 919
+    },
+    {
+     "prompt": "chat-15",
+     "char": 555
+    }
+   ]
+  },
+  "llq40-mtp": {
+   "against": "llq40-ar",
+   "pairs": 36,
+   "identical": 36,
+   "missing_pair": 0,
+   "first_divergences": []
+  }
+ },
+ "repeatability": {}
+}

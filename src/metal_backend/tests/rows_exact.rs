@@ -12,7 +12,9 @@
 /// et tout bloc qui en contient un hérite de l'écart. Bornes : 1e-5 pour un
 /// matmul (mesuré 2,4 à 4,6e-6, x2 et x3) et 5e-5 pour un bloc qui en enchaîne
 /// plusieurs (mesuré ≤ 1,7e-5). En mode strict (skinny coupé, mêmes lots),
-/// aucune exception ne s'applique.
+/// aucune exception ne s'applique. Il en va de même sans pipeline skinny de la
+/// variante choisie : `qmm_skinny_available()` est la garde matérielle utilisée
+/// par `select_resident_affine_matmul_kernel` (repli qmv sans NAX).
 const ROWS_EXACT_EXCEPTIONS: &[(&str, usize, f32)] = &[
     ("matmul u4", 5, 1.0e-5),
     ("attn QKV u4", 5, 1.0e-5),
@@ -70,6 +72,7 @@ fn rows_exact_ndiff(mono: &[f32], rows: &[f32], label: &str) -> usize {
 /// Vérifie le lot de `rows` lignes contre les lignes mono de largeur `width`,
 /// selon la liste d'exceptions.
 fn rows_exact_check(
+    executor: &MetalExecutor,
     kernel: &str,
     case: &str,
     rows: usize,
@@ -77,13 +80,18 @@ fn rows_exact_check(
     mono: &[f32],
     batch: &[f32],
 ) {
-    rows_exact_check_lot(kernel, case, rows, rows, width, mono, batch);
+    rows_exact_check_lot(executor, kernel, case, rows, rows, width, mono, batch);
 }
 
 /// Comme [`rows_exact_check`], `lot` (taille du lot vérifié, pour la liste
 /// d'exceptions) distinct du nombre de tranches comparées (`slices`) : état
 /// final d'un lot comparé d'un seul tenant.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "oracle : capacité du device, cas, dimensions et sorties comparées explicites"
+)]
 fn rows_exact_check_lot(
+    executor: &MetalExecutor,
     kernel: &str,
     case: &str,
     lot: usize,
@@ -106,9 +114,12 @@ fn rows_exact_check_lot(
         .collect();
     let full = format!("{kernel} {case}");
     let strict = ROWS_EXACT_STRICT.with(std::cell::Cell::get);
+    let skinny_available = executor.qmm_skinny_available();
     let bound = ROWS_EXACT_EXCEPTIONS
         .iter()
-        .filter(|(key, from, _)| !strict && full.starts_with(key) && rows >= *from)
+        .filter(|(key, from, _)| {
+            skinny_available && !strict && full.starts_with(key) && rows >= *from
+        })
         .map(|(_, _, bound)| *bound)
         .reduce(f32::max);
     if let Some(bound) = bound {
@@ -260,6 +271,7 @@ fn rows_exact_matmul_formats_body() -> Result<()> {
             for rows in 1..=9 {
                 let batch = run(rows, &lhs[..rows * in_dim])?;
                 rows_exact_check(
+                    &executor,
                     kernel,
                     &format!("{case} graine {variant}"),
                     rows,
@@ -343,6 +355,7 @@ fn rows_exact_norms_and_prologue() -> Result<()> {
             {
                 let mono_k: Vec<f32> = mono[..rows].iter().flat_map(|m| m[k].clone()).collect();
                 rows_exact_check(
+                    &executor,
                     "normes",
                     &format!("{name} h{hidden}"),
                     rows,
@@ -365,6 +378,7 @@ fn rows_exact_norms_and_prologue() -> Result<()> {
                         .map(|_| ())
                 })?;
                 rows_exact_check(
+                    &executor,
                     "normes",
                     &format!("prologue en miroir h{hidden}"),
                     rows,
@@ -517,6 +531,7 @@ fn rows_exact_linear_block_body() -> Result<()> {
                 )
             })?;
             rows_exact_check(
+                &executor,
                 "linear bloc",
                 &format!("{model} sorties"),
                 rows,
@@ -526,6 +541,7 @@ fn rows_exact_linear_block_body() -> Result<()> {
             );
             let (conv_len, ssm_len) = (layer.conv_seed.len(), layer.ssm_seed.len());
             rows_exact_check_lot(
+                &executor,
                 "linear bloc",
                 &format!("{model} état conv+SSM"),
                 rows,
@@ -640,6 +656,7 @@ fn rows_exact_linear_stages_body() -> Result<()> {
                     .map(|_| ())
             })?;
             rows_exact_check(
+                &executor,
                 "linear S1 projection",
                 model,
                 rows,
@@ -729,6 +746,7 @@ fn rows_exact_linear_stages_body() -> Result<()> {
                 .flat_map(|r| b_conv[r * conv_dim + 2 * key_dim..(r + 1) * conv_dim].to_vec())
                 .collect();
             rows_exact_check(
+                &executor,
                 "linear S2",
                 &format!("{model} conv v"),
                 rows,
@@ -737,6 +755,7 @@ fn rows_exact_linear_stages_body() -> Result<()> {
                 &b_v,
             );
             rows_exact_check(
+                &executor,
                 "linear S2",
                 &format!("{model} q"),
                 rows,
@@ -745,6 +764,7 @@ fn rows_exact_linear_stages_body() -> Result<()> {
                 &read_f32_buffer(&q, rows * key_dim)?,
             );
             rows_exact_check(
+                &executor,
                 "linear S2",
                 &format!("{model} k"),
                 rows,
@@ -753,6 +773,7 @@ fn rows_exact_linear_stages_body() -> Result<()> {
                 &read_f32_buffer(&k, rows * key_dim)?,
             );
             rows_exact_check(
+                &executor,
                 "linear S2",
                 &format!("{model} beta"),
                 rows,
@@ -761,6 +782,7 @@ fn rows_exact_linear_stages_body() -> Result<()> {
                 &read_f32_buffer(&be, rows * vh)?,
             );
             rows_exact_check(
+                &executor,
                 "linear S2",
                 &format!("{model} decay"),
                 rows,
@@ -822,6 +844,7 @@ fn rows_exact_linear_stages_body() -> Result<()> {
                 )
             })?;
             rows_exact_check(
+                &executor,
                 "linear S3",
                 &format!("{model} y"),
                 rows,
@@ -831,6 +854,7 @@ fn rows_exact_linear_stages_body() -> Result<()> {
             );
             let ssm_len = layer.ssm_seed.len();
             rows_exact_check_lot(
+                &executor,
                 "linear S3",
                 &format!("{model} état SSM"),
                 rows,
@@ -873,6 +897,7 @@ fn rows_exact_linear_stages_body() -> Result<()> {
                 )
             })?;
             rows_exact_check(
+                &executor,
                 "linear S4",
                 &format!("{model} rms-gate"),
                 rows,
@@ -991,6 +1016,7 @@ fn rows_exact_moe_tail_body() -> Result<()> {
             )
         })?;
         rows_exact_check(
+            &executor,
             "queue MoE",
             "35B",
             rows,
@@ -1067,6 +1093,7 @@ fn rows_exact_dense_tail_body() -> Result<()> {
             executor.encode_add_scaled(enc, &mut owned, &sb, &d, &o, 1.0, rows * hidden)
         })?;
         rows_exact_check(
+            &executor,
             "queue dense",
             "27B",
             rows,
@@ -1255,6 +1282,7 @@ fn rows_exact_full_attn_qkv_prologue_body() -> Result<()> {
                     .map(|_| ())
             })?;
             rows_exact_check(
+                &executor,
                 kernel,
                 &format!("h{hidden} fusionné={applies}"),
                 rows,
@@ -1545,6 +1573,7 @@ fn rows_exact_rms_prologue_u8_body() -> Result<()> {
                     .map(|_| ())
             })?;
             rows_exact_check(
+                &executor,
                 "prologue rms u8",
                 case,
                 rows,

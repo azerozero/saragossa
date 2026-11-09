@@ -4,7 +4,7 @@
  "max_tokens": 400,
  "deadline_s": 3600,
  "load_timeout_s": 1800,
- "cooldown_min_s": 60,
+ "cooldown_min_s": 20,
  "cooldown_max_s": 600,
  "memory_period_s": 0.2,
  "tie_margin": 0.03,
