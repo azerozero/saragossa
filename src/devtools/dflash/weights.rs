@@ -89,6 +89,42 @@ impl<'a> DraftWeights<'a> {
         )
     }
 
+    pub(super) fn codebook(&self, key: &str) -> Result<super::DFlashCodebook> {
+        self.codebook_with_storage(
+            key,
+            crate::runtime_flags::env_flag("RETI_RUST_SINGLE_COPY_WEIGHTS", true),
+        )
+    }
+
+    fn codebook_with_storage(&self, key: &str, compact: bool) -> Result<super::DFlashCodebook> {
+        if !compact {
+            return self.tensor(key).map(Into::into);
+        }
+        let info = self.info(key)?;
+        let [rows, cols] = info.shape.as_slice() else {
+            return Err(InferError::Dimension(format!(
+                "codebook DFlash {key} attendu rang 2"
+            )));
+        };
+        let (start, end) = info.data_offsets;
+        let mut values = Vec::with_capacity(rows * cols);
+        // Blocs alignés sur tous les dtypes denses : aucun codebook f32 complet
+        // n'est matérialisé si les valeurs sont exactement représentables.
+        for offset in (start..end).step_by(16 * 1024) {
+            let bytes = self.read(self.data_start + offset, (end - offset).min(16 * 1024))?;
+            for value in bytes_to_dense_f32(&bytes, info.dtype, key)? {
+                if value.to_bits() & 0xffff != 0 {
+                    // Même un bit perdu (y compris NaN et zéro signé) interdit
+                    // la conversion : les scores du sélecteur doivent rester exacts.
+                    drop(values);
+                    return self.tensor(key).map(Into::into);
+                }
+                values.push((value.to_bits() >> 16) as u16);
+            }
+        }
+        Ok(super::DFlashCodebook::bf16(info.shape.clone(), values))
+    }
+
     pub(super) fn linear(
         &self,
         prefix: &str,
@@ -305,6 +341,93 @@ mod tests {
                 assert_eq!(cpu.biases_f32(), reference.biases_f32());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn codebook_bytes_are_lossless_or_remain_f32() -> Result<()> {
+        for (dtype, inexact) in [
+            (Dtype::BF16, false),
+            (Dtype::F32, false),
+            (Dtype::F32, true),
+        ] {
+            // Tous les motifs bf16, y compris ±0, subnormaux, infinis et NaN.
+            let bytes: Vec<u8> = (0..=u16::MAX)
+                .flat_map(|bits| {
+                    if dtype == Dtype::BF16 {
+                        bits.to_le_bytes().to_vec()
+                    } else {
+                        let low = u32::from(inexact && bits == u16::MAX);
+                        ((u32::from(bits) << 16) | low).to_le_bytes().to_vec()
+                    }
+                })
+                .collect();
+            let view =
+                TensorView::new(dtype, vec![256, 256], &bytes).expect("invariant: codebook valide");
+            let serialized = serialize([("book", view)], None).expect("invariant: sérialisation");
+            let mut file = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+            std::io::Write::write_all(&mut file, &serialized).expect("invariant: écriture fixture");
+            let source = DraftWeights::open(file.path(), ForwardRuntime::cpu())?;
+            let legacy = crate::safetensor::load_float_tensor(file.path(), "book")?;
+            for compact in [false, true] {
+                let book = source.codebook_with_storage("book", compact)?;
+                assert_eq!(book.is_bf16(), compact && !inexact);
+                assert_eq!(book.shape(), legacy.shape());
+                for row in 0..256 {
+                    assert_eq!(
+                        bytemuck::cast_slice::<_, u8>(book.row_slice(row)?.as_ref()),
+                        bytemuck::cast_slice::<_, u8>(legacy.row_slice(row)?)
+                    );
+                }
+                assert!(book.row_slice(256).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_codebooks_keep_selector_scores_and_drafts() -> Result<()> {
+        let file = fixture(Dtype::BF16);
+        let source = DraftWeights::open(file.path(), ForwardRuntime::cpu())?;
+        let selector = |compact| -> Result<super::super::DFlashSelector> {
+            Ok(super::super::DFlashSelector {
+                hidden_projection: Linear::new(Tensor::zeros(vec![COLS, 1])?, None)?,
+                predecessor_codebook: source.codebook_with_storage("fc.weight", compact)?,
+                successor_codebook: source.codebook_with_storage("fc.weight", compact)?,
+                rank: COLS,
+                top_k: 3,
+            })
+        };
+        let (old, new) = (selector(false)?, selector(true)?);
+        let projected: Vec<_> = (0..COLS * 2).map(|i| i as f32 / 257.0 - 0.5).collect();
+        let candidates = vec![vec![(0, 0.5), (16, -0.25), (32, 1.0)]; 2];
+        let bytes = |scores: Vec<Vec<f32>>| {
+            scores
+                .into_iter()
+                .flatten()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bytes(old.transition_scores(&projected, &candidates, 2)?),
+            bytes(new.transition_scores(&projected, &candidates, 2)?)
+        );
+        assert_eq!(
+            old.select_projected(&projected, &candidates, 2)?,
+            new.select_projected(&projected, &candidates, 2)?
+        );
+        assert_eq!(
+            bytes(vec![old.edge_scores_from(
+                &projected[..COLS],
+                16,
+                &candidates[0]
+            )?]),
+            bytes(vec![new.edge_scores_from(
+                &projected[..COLS],
+                16,
+                &candidates[0]
+            )?])
+        );
         Ok(())
     }
 

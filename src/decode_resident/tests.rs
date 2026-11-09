@@ -3622,8 +3622,8 @@ mod dflash_resident {
             norm: norm(HIDDEN, 7),
             selector: Some(DFlashSelector {
                 hidden_projection: linear(RANK, HIDDEN, 11),
-                predecessor_codebook: tensor(&[VOCAB, RANK], 13, 1.0),
-                successor_codebook: tensor(&[VOCAB, RANK], 17, 1.0),
+                predecessor_codebook: tensor(&[VOCAB, RANK], 13, 1.0).into(),
+                successor_codebook: tensor(&[VOCAB, RANK], 17, 1.0).into(),
                 rank: RANK,
                 top_k: TOP_K,
             }),

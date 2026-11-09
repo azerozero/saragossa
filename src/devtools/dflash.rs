@@ -7,7 +7,9 @@ use crate::{
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+mod codebook;
 mod weights;
+pub use codebook::DFlashCodebook;
 use weights::DraftWeights;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,7 +60,7 @@ pub struct DFlashDraftInfo {
 
 /// Quantification affine appliquée aux projections du draft au chargement
 /// (fc, q/k/v/o, gate/up/down, noyaux dynamiques). Normes, noyaux statiques,
-/// sélecteur et codebooks restent en f32.
+/// sélecteur restent en f32 ; les codebooks passent en bf16 si exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DFlashQuant {
     pub group_size: usize,
@@ -127,9 +129,9 @@ pub struct DFlashSelector {
     /// `[rank, hidden]`.
     pub hidden_projection: Linear,
     /// `[vocab, rank]`.
-    pub predecessor_codebook: Tensor,
+    pub predecessor_codebook: DFlashCodebook,
     /// `[vocab, rank]`.
-    pub successor_codebook: Tensor,
+    pub successor_codebook: DFlashCodebook,
     pub rank: usize,
     pub top_k: usize,
 }
@@ -462,7 +464,11 @@ impl DFlashSelector {
         Ok(())
     }
 
-    fn codebook_row<'a>(&self, codebook: &'a Tensor, token: usize) -> Result<&'a [f32]> {
+    fn codebook_row<'a>(
+        &self,
+        codebook: &'a DFlashCodebook,
+        token: usize,
+    ) -> Result<std::borrow::Cow<'a, [f32]>> {
         let vocab = self.predecessor_codebook.shape()[0];
         if token >= vocab {
             return Err(InferError::Dimension(format!(
@@ -480,7 +486,7 @@ impl DFlashSelector {
     }
 
     fn edge_score(&self, gate: &[f32], token: usize, unary: f32) -> Result<f32> {
-        Ok(unary + dot(gate, self.codebook_row(&self.successor_codebook, token)?))
+        Ok(unary + dot(gate, &self.codebook_row(&self.successor_codebook, token)?))
     }
 }
 
@@ -1035,8 +1041,8 @@ pub(crate) fn load_dflash_draft_weights_with_runtime(
     }
     let norm = load_dflash_norm(&st, "norm.weight", hidden)?;
     let selector = if info.selector_rank > 0 {
-        let codebook = |key: &str| -> Result<Tensor> {
-            let tensor = load_dflash_tensor(&st, key)?;
+        let codebook = |key: &str| -> Result<DFlashCodebook> {
+            let tensor = st.codebook(key)?;
             expect_shape(tensor.shape(), &[info.vocab_size, info.selector_rank], key)?;
             Ok(tensor)
         };
@@ -1509,8 +1515,12 @@ mod dflash2_tests {
         let selector = DFlashSelector {
             hidden_projection: Linear::new(Tensor::from_vec(vec![1, 1], vec![1.0]).unwrap(), None)
                 .unwrap(),
-            predecessor_codebook: Tensor::from_vec(vec![3, 1], vec![1.0, 2.0, 3.0]).unwrap(),
-            successor_codebook: Tensor::from_vec(vec![3, 1], vec![1.0, 0.0, -1.0]).unwrap(),
+            predecessor_codebook: Tensor::from_vec(vec![3, 1], vec![1.0, 2.0, 3.0])
+                .unwrap()
+                .into(),
+            successor_codebook: Tensor::from_vec(vec![3, 1], vec![1.0, 0.0, -1.0])
+                .unwrap()
+                .into(),
             rank: 1,
             top_k: 2,
         };
