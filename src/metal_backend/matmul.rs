@@ -428,7 +428,8 @@ impl MetalExecutor {
         let scales_offset = affine_scales_offset(weight)?;
         let biases_buffer = self.cached_affine_biases(weight, "biases")?;
         let biases_offset = affine_biases_offset(weight)?;
-        let has_weight_offsets = packed_offset != 0 || scales_offset != 0 || biases_offset != 0;
+        let has_weight_offsets = !weight.relocated_u4
+            && (packed_offset != 0 || scales_offset != 0 || biases_offset != 0);
         let output_len = checked_len(batch, *out_dim, "sortie matmul Metal quantifiée")?;
         let output_buffer = self.device.new_buffer(
             byte_len::<f32>(output_len)?,
@@ -478,8 +479,8 @@ impl MetalExecutor {
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&lhs_buffer), 0);
             encoder.set_buffer(1, Some(&packed_buffer), packed_offset);
-            encoder.set_buffer(2, Some(&scales_buffer), 0);
-            encoder.set_buffer(3, Some(&biases_buffer), 0);
+            encoder.set_buffer(2, Some(&scales_buffer), scales_offset);
+            encoder.set_buffer(3, Some(&biases_buffer), biases_offset);
             encoder.set_buffer(4, Some(&output_buffer), 0);
             encoder.set_buffer(5, Some(&fast_dims_buffer), 0);
             profile_dispatch();
@@ -509,8 +510,8 @@ impl MetalExecutor {
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&lhs_buffer), 0);
             encoder.set_buffer(1, Some(&packed_buffer), packed_offset);
-            encoder.set_buffer(2, Some(&scales_buffer), 0);
-            encoder.set_buffer(3, Some(&biases_buffer), 0);
+            encoder.set_buffer(2, Some(&scales_buffer), scales_offset);
+            encoder.set_buffer(3, Some(&biases_buffer), biases_offset);
             encoder.set_buffer(4, Some(&output_buffer), 0);
             encoder.set_buffer(5, Some(&fast_dims_buffer), 0);
             profile_dispatch();
@@ -568,8 +569,8 @@ impl MetalExecutor {
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&lhs_buffer), 0);
             encoder.set_buffer(1, Some(&packed_buffer), packed_offset);
-            encoder.set_buffer(2, Some(&scales_buffer), 0);
-            encoder.set_buffer(3, Some(&biases_buffer), 0);
+            encoder.set_buffer(2, Some(&scales_buffer), scales_offset);
+            encoder.set_buffer(3, Some(&biases_buffer), biases_offset);
             encoder.set_buffer(4, Some(&output_buffer), 0);
             encoder.set_buffer(5, Some(&fast_dims_buffer), 0);
             profile_dispatch();
@@ -773,6 +774,7 @@ impl MetalExecutor {
                     .checked_div(weight.group_size())
                     .ok_or_else(|| InferError::Metal("group_size quantifié nul".to_string()))?;
                 Ok(MetalLinearWeightBuffers::AffineQuantized {
+                    relocated_u4: weight.relocated_u4,
                     packed: self.cached_affine_packed(weight, label)?,
                     packed_offset: affine_packed_offset(weight)?,
                     scales: self.cached_affine_scales(weight, label)?,
@@ -830,6 +832,10 @@ impl MetalExecutor {
         weights: &[&LinearWeight],
         label: &'static str,
     ) -> Result<MetalLinearWeightBuffers> {
+        // Ces vues appartiennent aux poids sources, même sans cache de concat.
+        if let Some(view) = super::linear_projection_storage::shared_projection_concat(weights) {
+            return Ok(view);
+        }
         // Coupe-circuit : le rebuild par génération reste accessible pour l'A/B
         // et le repli prod. Le comportement est byte-identique (cache ⇒ mêmes
         // octets ; verdict `Incompatible` ⇒ même repli split).
@@ -1071,6 +1077,7 @@ impl MetalExecutor {
                     biases.extend_from_slice(weight.biases_f32().as_ref());
                 }
                 Ok(MetalLinearWeightBuffers::AffineQuantized {
+                    relocated_u4: false,
                     packed: self.buffer_from_slice(&packed, label)?,
                     packed_offset: 0,
                     scales: self.buffer_from_f32_as_bf16(&scales, label)?,

@@ -210,6 +210,7 @@ fn qmm_na_tiled_u4_align64_reference(
         batch,
         *in_dim,
         *out_dim,
+        [0; 3],
     )?;
     encoder.end_encoding();
     commit_and_wait(command_buffer)?;

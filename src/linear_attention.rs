@@ -264,7 +264,16 @@ impl LinearAttention {
         self.in_proj_z.move_packed_to_metal_shared(metal)?;
         self.in_proj_b.move_packed_to_metal_shared(metal)?;
         self.in_proj_a.move_packed_to_metal_shared(metal)?;
-        self.out_proj.move_packed_to_metal_shared(metal)
+        self.out_proj.move_packed_to_metal_shared(metal)?;
+        if crate::runtime_flags::la_shared_projections_enabled() {
+            metal.share_linear_attn_projections([
+                &mut self.in_proj_qkv,
+                &mut self.in_proj_z,
+                &mut self.in_proj_b,
+                &mut self.in_proj_a,
+            ])?;
+        }
+        Ok(())
     }
 
     /// Applique la couche sur CPU sans cache persistant (tests uniquement).

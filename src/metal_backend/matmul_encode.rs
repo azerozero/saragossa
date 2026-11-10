@@ -331,6 +331,7 @@ impl MetalExecutor {
         batch: usize,
         in_dim: usize,
         out_dim: usize,
+        weight_offsets: [NSUInteger; 3],
     ) -> Result<()> {
         // Sous le plancher par défaut (formes que seuls flint et les poids k/v
         // d'un Qwen dense ouvrent), le bf16×3 lit le lhs f32 directement : pas
@@ -359,6 +360,7 @@ impl MetalExecutor {
                 out_dim,
                 "gemm_nax_coop_qb_tiled_u4_x3",
                 "qmm_na_fused_tiled_u4_x3_gs64",
+                weight_offsets,
             );
         }
         self.encode_affine_qmm_na_fused_tiled_u4_pipeline(
@@ -374,6 +376,7 @@ impl MetalExecutor {
             self.na_gemm_coop_qb_tiled_u4.as_ref(),
             "gemm_nax_coop_qb_tiled_u4",
             "qmm_na_fused_tiled_u4_gs64",
+            weight_offsets,
         )
     }
 
@@ -388,6 +391,7 @@ impl MetalExecutor {
         batch: usize,
         in_dim: usize,
         out_dim: usize,
+        weight_offsets: [NSUInteger; 3],
     ) -> Result<()> {
         self.encode_affine_qmm_na_fused_tiled_u4_pipeline(
             encoder,
@@ -402,6 +406,7 @@ impl MetalExecutor {
             self.na_gemm_coop_qb_tiled_u4_align64.as_ref(),
             "gemm_nax_coop_qb_tiled_u4_align64",
             "qmm_na_fused_tiled_u4_align64_gs64",
+            weight_offsets,
         )
     }
 
@@ -583,6 +588,7 @@ impl MetalExecutor {
             in_dim,
             "gemm_nax_coop_qb_tiled_u4",
             "qmm_na_fused_tiled_u4_gs64",
+            [0; 3],
         )
     }
 
@@ -600,6 +606,7 @@ impl MetalExecutor {
         pipeline: Option<&ComputePipelineState>,
         label: &'static str,
         profile_label: &'static str,
+        weight_offsets: [NSUInteger; 3],
     ) -> Result<()> {
         if out_dim % 64 != 0 {
             return Err(InferError::Dimension(format!(
@@ -624,6 +631,7 @@ impl MetalExecutor {
             out_dim,
             label,
             profile_label,
+            weight_offsets,
         )
     }
 
@@ -642,6 +650,7 @@ impl MetalExecutor {
         out_dim: usize,
         label: &'static str,
         profile_label: &'static str,
+        weight_offsets: [NSUInteger; 3],
     ) -> Result<()> {
         let mnk = [
             checked_u32(batch, "qmm na fused-tiled u4 batch")?,
@@ -650,9 +659,9 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(lhs_bf16), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), weight_offsets[0]);
+        encoder.set_buffer(2, Some(scales_buffer), weight_offsets[1]);
+        encoder.set_buffer(3, Some(biases_buffer), weight_offsets[2]);
         encoder.set_buffer(4, Some(output_buffer), 0);
         encoder.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
@@ -1181,6 +1190,7 @@ impl MetalExecutor {
             return Ok(None);
         }
         let MetalLinearWeightBuffers::AffineQuantized {
+            relocated_u4: _,
             packed,
             packed_offset,
             scales,

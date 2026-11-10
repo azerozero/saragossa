@@ -396,6 +396,7 @@ impl MetalExecutor {
         }
         let (
             MetalLinearWeightBuffers::AffineQuantized {
+                relocated_u4: _,
                 packed: gate_packed,
                 packed_offset: gate_packed_offset,
                 scales: gate_scales,
@@ -504,6 +505,7 @@ impl MetalExecutor {
     ) -> Result<bool> {
         let (
             MetalLinearWeightBuffers::AffineQuantized {
+                relocated_u4: _,
                 packed,
                 packed_offset,
                 scales,
@@ -518,6 +520,7 @@ impl MetalExecutor {
                 groups,
             },
             MetalLinearWeightBuffers::AffineQuantized {
+                relocated_u4: _,
                 packed: shared_gate_packed,
                 packed_offset: shared_gate_packed_offset,
                 scales: shared_gate_scales,
@@ -605,6 +608,7 @@ impl MetalExecutor {
     ) -> Result<bool> {
         let (
             MetalLinearWeightBuffers::AffineQuantized {
+                relocated_u4: _,
                 packed: gate_packed,
                 packed_offset: gate_packed_offset,
                 scales: gate_scales,
@@ -633,6 +637,7 @@ impl MetalExecutor {
                 ..
             },
             MetalLinearWeightBuffers::AffineQuantized {
+                relocated_u4: _,
                 packed: shared_gate_packed,
                 packed_offset: shared_gate_packed_offset,
                 scales: shared_gate_scales,

@@ -838,6 +838,7 @@ impl MetalExecutor {
             return Ok(None);
         }
         let MetalLinearWeightBuffers::AffineQuantized {
+            relocated_u4: _,
             packed,
             packed_offset,
             scales,
@@ -1086,6 +1087,7 @@ impl MetalExecutor {
             return Ok(None);
         }
         let MetalLinearWeightBuffers::AffineQuantized {
+            relocated_u4: _,
             packed,
             packed_offset,
             scales,

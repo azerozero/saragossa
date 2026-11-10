@@ -10,6 +10,7 @@ include!("tests/quant_qmv_sampling.rs");
 include!("tests/qmv_align64.rs");
 include!("tests/moe_duo.rs");
 include!("tests/linear_attention.rs");
+include!("tests/linear_projection_storage.rs");
 include!("tests/attention.rs");
 include!("tests/mtp_seed.rs");
 include!("tests/verify_tree.rs");

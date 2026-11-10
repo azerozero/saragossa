@@ -141,6 +141,32 @@ pub(crate) fn single_copy_weights_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_SINGLE_COPY_WEIGHTS", true))
 }
 
+/// Regroupe les projections linear-attention u4 gs64 en trois buffers partagés
+/// (packed, scales, biases). Les originaux et les concats en sont des vues.
+/// Défaut ON ; `SARAGOSSA_RUST_LA_SHARED_PROJECTIONS=0` restaure les allocations
+/// historiques. S'applique au rattachement du runtime, avant toute résolution.
+/// Les formats mixtes, offsets sources non nuls et frontières non alignées sur
+/// 256 octets conservent leur stockage historique. Single-copy reste requis.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn la_shared_projections_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = LA_SHARED_TEST_OVERRIDE.with(Cell::get) {
+        return forced;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LA_SHARED_PROJECTIONS", true))
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+thread_local! {
+    static LA_SHARED_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn with_la_shared_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    with_test_override(&LA_SHARED_TEST_OVERRIDE, enabled, run)
+}
+
 /// Active la trace des résolutions de stacks MoE autour du drop CPU.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn moe_drop_trace_enabled() -> bool {

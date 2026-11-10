@@ -59,6 +59,7 @@ mod lightbatch_duo;
 mod lightbatch_multi;
 mod linear_attention;
 mod linear_attention_encode;
+mod linear_projection_storage;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
 mod matmul;
@@ -529,6 +530,8 @@ pub(crate) enum MetalLinearWeightBuffers {
         in_dim: usize,
     },
     AffineQuantized {
+        /// Vues u4 gs64 relocalisées : garder les noyaux des sources à offset nul.
+        relocated_u4: bool,
         packed: Buffer,
         packed_offset: NSUInteger,
         scales: Buffer,

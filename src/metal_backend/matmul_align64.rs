@@ -23,6 +23,7 @@ impl MetalExecutor {
         packed_cols: usize,
         groups: usize,
         bits: usize,
+        weight_offsets: [NSUInteger; 3],
     ) -> Result<()> {
         let (pipeline, profile_label, kernel_name) = match bits {
             FAST_QMV_BITS => (
@@ -49,9 +50,9 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), weight_offsets[0]);
+        encoder.set_buffer(2, Some(scales_buffer), weight_offsets[1]);
+        encoder.set_buffer(3, Some(biases_buffer), weight_offsets[2]);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &fast_dims, "qmv_align64_dims")?;
         profile_dispatch_shape(DispatchProfileShape::matmul(

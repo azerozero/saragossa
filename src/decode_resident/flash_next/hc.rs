@@ -78,6 +78,7 @@ pub(crate) fn encode_hc_mix(
     // standard n'occupe que 40 threadgroups), sinon qmv standard.
     let down_chunks = match &weights.down {
         MetalLinearWeightBuffers::AffineQuantized {
+            relocated_u4: _,
             packed,
             packed_offset,
             scales,

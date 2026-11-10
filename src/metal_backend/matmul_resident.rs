@@ -37,6 +37,7 @@ impl MetalExecutor {
                 *rhs_in_dim,
             ),
             MetalLinearWeightBuffers::AffineQuantized {
+                relocated_u4,
                 packed,
                 packed_offset,
                 scales,
@@ -68,6 +69,7 @@ impl MetalExecutor {
                 *bits,
                 *groups,
                 prefer_fast_affine,
+                *relocated_u4,
             ),
         }
     }
@@ -202,6 +204,7 @@ impl MetalExecutor {
         bits: usize,
         groups: usize,
         prefer_fast_affine: bool,
+        relocated_u4: bool,
     ) -> Result<usize> {
         if in_dim != weight_in_dim {
             return Err(InferError::Dimension(format!(
@@ -220,7 +223,7 @@ impl MetalExecutor {
             checked_u32(groups, "groups")?,
             0,
         ];
-        if packed_offset != 0 || scales_offset != 0 || biases_offset != 0 {
+        if !relocated_u4 && (packed_offset != 0 || scales_offset != 0 || biases_offset != 0) {
             self.encode_resident_affine_fallback(
                 encoder,
                 lhs_buffer,
@@ -326,6 +329,7 @@ impl MetalExecutor {
                     batch,
                     in_dim,
                     out_dim,
+                    [packed_offset, scales_offset, biases_offset],
                 )?;
             }
             AffineMatmulKernel::QmmNaFusedTiledU4Align64 => {
@@ -339,6 +343,7 @@ impl MetalExecutor {
                     batch,
                     in_dim,
                     out_dim,
+                    [packed_offset, scales_offset, biases_offset],
                 )?;
             }
             AffineMatmulKernel::FastQmvU4 => self.encode_resident_affine_qmv_u4(
@@ -355,6 +360,7 @@ impl MetalExecutor {
                 group_size,
                 bits,
                 groups,
+                [packed_offset, scales_offset, biases_offset],
             )?,
             AffineMatmulKernel::FastQmvU4Align64 => self.encode_affine_qmv_align64_buffers(
                 encoder,
@@ -369,6 +375,7 @@ impl MetalExecutor {
                 packed_cols,
                 groups,
                 FAST_QMV_BITS,
+                [packed_offset, scales_offset, biases_offset],
             )?,
             AffineMatmulKernel::FastQmvU2 => self.encode_affine_qmv_u2_buffers(
                 encoder,
@@ -475,6 +482,7 @@ impl MetalExecutor {
                 packed_cols,
                 groups,
                 8,
+                [packed_offset, scales_offset, biases_offset],
             )?,
             AffineMatmulKernel::Fallback | AffineMatmulKernel::QmmNaU8 => self
                 .encode_resident_affine_fallback(
@@ -658,6 +666,7 @@ impl MetalExecutor {
         out_dim: usize,
     ) -> Result<bool> {
         let MetalLinearWeightBuffers::AffineQuantized {
+            relocated_u4: _,
             packed,
             packed_offset,
             scales,
@@ -750,6 +759,7 @@ impl MetalExecutor {
         group_size: usize,
         bits: usize,
         groups: usize,
+        weight_offsets: [NSUInteger; 3],
     ) -> Result<()> {
         let fast_dims = [
             checked_u32(out_dim, "fast out_dim")?,
@@ -770,9 +780,9 @@ impl MetalExecutor {
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed), 0);
-        encoder.set_buffer(2, Some(scales), 0);
-        encoder.set_buffer(3, Some(biases), 0);
+        encoder.set_buffer(1, Some(packed), weight_offsets[0]);
+        encoder.set_buffer(2, Some(scales), weight_offsets[1]);
+        encoder.set_buffer(3, Some(biases), weight_offsets[2]);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &fast_dims, "fast_dims")?;
         profile_dispatch_shape(DispatchProfileShape::matmul(

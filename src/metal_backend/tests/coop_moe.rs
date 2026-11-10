@@ -1519,6 +1519,7 @@ fn fused_dense_mlp_supported_rejects_offsets_dense_and_shape() -> Result<()> {
     // Le prédicat ne lit que les métadonnées : des buffers d'un mot suffisent.
     let word = executor.buffer_from_slice(&[0_u32], "fused_pred_word")?;
     let u4 = |out_dim: usize, in_dim: usize, offset: u64| MetalLinearWeightBuffers::AffineQuantized {
+        relocated_u4: false,
         packed: word.clone(),
         packed_offset: offset,
         scales: word.clone(),

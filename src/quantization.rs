@@ -292,6 +292,9 @@ fn bf16_to_f32(value: u16) -> f32 {
 #[derive(Clone, Debug)]
 pub struct AffineQuantizedTensor {
     weight_id: u64,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    // Une relocalisation u4 gs64 garde le dispatch des sources à offset nul.
+    pub(crate) relocated_u4: bool,
     shape: Vec<usize>,
     packed_shape: Vec<usize>,
     packed: PackedStorage,
@@ -324,6 +327,8 @@ impl AffineQuantizedTensor {
             bits,
         )?;
         Ok(Self {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            relocated_u4: false,
             weight_id: next_weight_id()?,
             shape: vec![params.rows, params.cols],
             packed_shape: packed_shape.to_vec(),
@@ -394,6 +399,8 @@ impl AffineQuantizedTensor {
             bits,
         )?;
         Ok(Self {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            relocated_u4: false,
             weight_id: next_weight_id()?,
             shape: vec![params.rows, params.cols],
             packed_shape: packed_shape.to_vec(),
@@ -435,6 +442,8 @@ impl AffineQuantizedTensor {
             bits,
         )?;
         Ok(Self {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            relocated_u4: false,
             weight_id: next_weight_id()?,
             shape: vec![params.rows, params.cols],
             packed_shape: packed_shape.to_vec(),
