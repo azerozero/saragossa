@@ -1293,6 +1293,7 @@ mod tests {
             intermediate_size: 0,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000_000.0,
+            max_position_embeddings: None,
             vocab_size: 248_320,
             eos_token_ids: Vec::new(),
             tie_word_embeddings: false,

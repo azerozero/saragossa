@@ -3757,6 +3757,7 @@ impl CausalDecoder {
             self.prefill_input(suffix, hidden.as_ref()),
             &layers,
             spec,
+            self.config.max_position_embeddings,
             capture_layer_ids,
             keep_rows,
             crate::runtime_flags::prefill_resident_chunk_tokens(),
@@ -5301,6 +5302,7 @@ impl CausalDecoder {
             self.prefill_input(prompt, hidden.as_ref()),
             &layers,
             spec,
+            self.config.max_position_embeddings,
             capture_layer_ids,
             keep_rows,
             chunk_tokens,
@@ -5393,7 +5395,7 @@ impl CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn flint_prefill_max_tokens(&self) -> Option<usize> {
         const MIN_TOKENS: usize = 4096;
-        // `max_position_embeddings` de flint, absent de la config résolue.
+        // Plafond historique du garde mémoire flint, indépendant de la réserve K/V.
         const MAX_TOKENS: usize = 262_144;
         const SCRATCH_RESERVE_BYTES: u64 = 2 << 30;
         // K/V f32 du prefill plus arène de decode bf16.
