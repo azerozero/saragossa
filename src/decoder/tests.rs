@@ -5841,7 +5841,7 @@ fn mtp_generation_publishes_shared_seed_history() -> Result<()> {
         norm: model.final_norm.clone(),
     });
     let model = model.with_metal_runtime()?;
-    let prompt: Vec<usize> = (0..65).map(|i| (i * 31 + 7) % VOCAB).collect();
+    let prompt: Vec<usize> = (0..1025).map(|i| (i * 31 + 7) % VOCAB).collect();
     let history = || -> Result<LayerKvCache> {
         let cache = model
             .prefix_cache
@@ -5854,8 +5854,10 @@ fn mtp_generation_publishes_shared_seed_history() -> Result<()> {
             .and_then(|entry| entry.mtp_history.clone())
             .ok_or_else(|| InferError::Config("historique MTP absent du préfixe".into()))
     };
-    // Trois morceaux suffisent à ouvrir le semis intégré sans poids externes.
-    crate::metal_backend::with_prefill_kv_layout_override(32, usize::MAX, || -> Result<()> {
+    // Respecter la cible minimale du runtime (512) : les trois morceaux
+    // ouvrent Steel/NAX dès le premier bloc (342 > 256). Une cible
+    // artificielle de 32 force un repli per-op avant même le semis MTP.
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
         let mut emitted = Vec::new();
         let first = model.generate_greedy_mtp_streaming_with_options(
             &prompt,

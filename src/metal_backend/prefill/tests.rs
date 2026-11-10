@@ -2403,9 +2403,10 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
         );
     }
     const HIDDEN: usize = 64;
-    const Q_HEADS: usize = 2;
-    const KV_HEADS: usize = 1;
-    const HEAD_DIM: usize = 128;
+    // Attention globale du 27B : d256, GQA 6, porte de sortie sans sinks.
+    const Q_HEADS: usize = 24;
+    const KV_HEADS: usize = 4;
+    const HEAD_DIM: usize = 256;
     const INTER: usize = 32;
     // Chemin de production 27B : dk128/dv128, noyau conv 4.
     let linear_spec = LinearAttentionStepSpec {
@@ -2470,7 +2471,7 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
         rope_frequency_dim: 64,
         rope_theta: 10_000_000.0,
         attn_scalar: HEAD_DIM as f32,
-        window: Some(128),
+        window: None,
         k_eq_v: false,
         value_norm: false,
         eps: 1.0e-6,
@@ -2480,7 +2481,6 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
         up_proj: &up,
         down_proj: &down,
     };
-    let sinks = Tensor::zeros(vec![Q_HEADS])?;
     let make_layers = |spec: PrefillAttentionSpec| {
         [
             PrefillMoeLayer {
@@ -2515,7 +2515,7 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
                     q_norm: &q_norm,
                     k_norm: &k_norm,
                     gated: true,
-                    sinks: Some(&sinks),
+                    sinks: None,
                 },
                 attention_spec: spec,
                 post_norm: &post_norm,
@@ -2525,6 +2525,7 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
         ]
     };
     let layers = make_layers(spec);
+    assert!(executor.prefill_resident_extend_supported(&layers));
     let embedding = EmbeddingWeight::Dense(deterministic_tensor(97, HIDDEN, 727, 0.5)?);
     let tokens: Vec<usize> = (0..seq).map(|i| (i * 31 + 7) % 97).collect();
     let final_norm = deterministic_norm(HIDDEN, 731)?;
