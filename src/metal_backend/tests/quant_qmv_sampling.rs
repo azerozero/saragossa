@@ -4486,3 +4486,69 @@ fn sample_rows_with_states_match_isolated_and_cpu() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "exige un device Metal ; sans poids de modèle"]
+#[allow(deprecated)]
+fn legacy_public_preset_api_applies_to_executor(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    const CHILD: &str = "SARAGOSSA_TEST_LEGACY_PRESET_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Chaque cas démarre avec un état de processus vierge, sans modifier
+        // l'environnement du processus de test ni les autres tests Metal.
+        for override_name in [
+            None,
+            Some("SARAGOSSA_RUST_OPT_PROFILE"),
+            Some("RETI_RUST_OPT_PROFILE"),
+            Some("SARAGOSSA_RUST_LINEAR_SSM_BF16"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .args([
+                    "metal_backend::tests::legacy_public_preset_api_applies_to_executor",
+                    "--exact",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            for (key, _) in std::env::vars_os() {
+                let name = key.to_string_lossy();
+                if name.starts_with("SARAGOSSA_RUST_") || name.starts_with("RETI_RUST_") {
+                    child.env_remove(key);
+                }
+            }
+            if let Some(name) = override_name {
+                child.env(name, "0");
+            }
+            assert!(child.status()?.success(), "surcharge {override_name:?}");
+        }
+        return Ok(());
+    }
+
+    let model = std::path::Path::new("models/Qwen3.6-35B-A3B-oQ8");
+    let other = std::path::Path::new("models/Qwen3.6-35B-A3B-4bit");
+    let before: Vec<_> = std::env::vars_os().collect();
+    let initial = MetalExecutor::new()?;
+    // L'application doit aussi être visible depuis un autre thread.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = crate::apply_runtime_preset_for_model_dir(model);
+        });
+    });
+    let legacy = MetalExecutor::new()?;
+    let expected = crate::KernelProfile::for_model_dir(model);
+    assert_eq!(legacy.kernel_profile, expected);
+    if !crate::runtime_flags::env_present("SARAGOSSA_RUST_OPT_PROFILE") {
+        assert!(legacy.kernel_profile.qmv_u8_tg128);
+        assert!(legacy.kernel_profile.fused_moe_down_weighted_u8);
+    }
+    let explicit =
+        MetalExecutor::new_with_kernel_profile(crate::KernelProfile::for_model_dir(other))?;
+    assert_eq!(
+        explicit.kernel_profile,
+        crate::KernelProfile::for_model_dir(other)
+    );
+    assert_eq!(initial.kernel_profile, explicit.kernel_profile);
+    assert_eq!(before, std::env::vars_os().collect::<Vec<_>>());
+    Ok(())
+}

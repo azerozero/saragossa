@@ -47,6 +47,11 @@ impl KernelProfile {
         environment().for_model_dir(model_dir)
     }
 
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn for_legacy_executor() -> Self {
+        environment().for_preset(super::LEGACY_PRESET.get().copied())
+    }
+
     #[cfg(test)]
     pub(crate) fn without_overrides(model_dir: &Path) -> Self {
         KernelEnvironment::capture(|_| None, false).for_model_dir(model_dir)
@@ -144,11 +149,14 @@ impl KernelEnvironment {
     }
 
     fn for_model_dir(&self, model_dir: &Path) -> KernelProfile {
+        self.for_preset(super::runtime_preset_for_model_dir(model_dir))
+    }
+
+    fn for_preset(&self, preset: Option<super::RuntimePreset>) -> KernelProfile {
         let profile = self.explicit.unwrap_or_else(|| {
-            super::runtime_preset_for_model_dir(model_dir)
-                .map_or(KernelOptProfile::Default, |preset| {
-                    KernelOptProfile::parse(preset.opt_profile)
-                })
+            preset.map_or(KernelOptProfile::Default, |preset| {
+                KernelOptProfile::parse(preset.opt_profile)
+            })
         });
         self.profiles[profile as usize]
     }

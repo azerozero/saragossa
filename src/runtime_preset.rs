@@ -1,6 +1,7 @@
 //! Presets runtime derives depuis le modele charge.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 mod kernel_profile;
 pub use kernel_profile::{initialize_kernel_environment, KernelProfile};
@@ -25,6 +26,10 @@ const QWEN36_OQ8: RuntimePreset = RuntimePreset {
     sampling_top_k: 20,
 };
 
+// Le premier preset reconnu reste le défaut des anciens consommateurs.
+// Les profils résolus par modèle ne consultent jamais cet état.
+static LEGACY_PRESET: OnceLock<RuntimePreset> = OnceLock::new();
+
 /// Detecte le preset runtime depuis le chemin du modele.
 #[must_use]
 pub fn runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
@@ -35,65 +40,28 @@ pub fn runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
     None
 }
 
-/// Compatibilité source : renvoie le preset si aucun profil explicite n'existe.
+/// Applique le premier preset reconnu aux futurs appels à `MetalExecutor::new`.
 ///
-/// Cette fonction ne modifie plus l'environnement ni les executors : l'ancien
-/// effet global contaminait les autres modèles et était dangereux avec des threads.
-/// Pour appliquer les kernels, passer [`KernelProfile::for_model_dir`] à
-/// `MetalExecutor::new_with_kernel_profile`. Pour les recommandations de sampling,
-/// utiliser [`runtime_preset_for_model_dir`].
+/// L'état de compatibilité est partagé entre threads, sans modifier l'environnement
+/// ni les executors existants. Les surcharges explicites restent prioritaires.
+/// Les profils issus de [`KernelProfile::for_model_dir`] restent indépendants de
+/// cet état : les préférer pour charger plusieurs modèles dans le même processus.
 #[deprecated(
-    note = "ne modifie plus l'environnement ; utiliser KernelProfile::for_model_dir avec MetalExecutor::new_with_kernel_profile"
+    note = "utiliser KernelProfile::for_model_dir avec MetalExecutor::new_with_kernel_profile pour isoler les modèles"
 )]
 #[must_use]
 pub fn apply_runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
     if crate::runtime_flags::env_present("SARAGOSSA_RUST_OPT_PROFILE") {
         return None;
     }
-    runtime_preset_for_model_dir(model_dir)
+    let preset = runtime_preset_for_model_dir(model_dir)?;
+    let _ = LEGACY_PRESET.get_or_init(|| preset);
+    Some(preset)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[allow(deprecated)]
-    fn legacy_public_preset_api_does_not_mutate_environment() {
-        let before = [
-            std::env::var_os("SARAGOSSA_RUST_OPT_PROFILE"),
-            std::env::var_os("RETI_RUST_OPT_PROFILE"),
-        ];
-        let expected = if crate::runtime_flags::env_present("SARAGOSSA_RUST_OPT_PROFILE") {
-            None
-        } else {
-            Some(QWEN36_OQ8)
-        };
-        // L'appel public reste utilisable depuis un worker sans contaminer le suivant.
-        std::thread::scope(|scope| {
-            for _ in 0..2 {
-                scope.spawn(|| {
-                    assert_eq!(
-                        crate::apply_runtime_preset_for_model_dir(Path::new(
-                            "models/Qwen3.6-35B-A3B-oQ8"
-                        )),
-                        expected
-                    );
-                    assert!(crate::apply_runtime_preset_for_model_dir(Path::new(
-                        "models/Qwen3.6-35B-A3B-4bit"
-                    ))
-                    .is_none());
-                });
-            }
-        });
-        assert_eq!(
-            before,
-            [
-                std::env::var_os("SARAGOSSA_RUST_OPT_PROFILE"),
-                std::env::var_os("RETI_RUST_OPT_PROFILE"),
-            ]
-        );
-    }
 
     #[test]
     fn detects_qwen36_oq8_local_model_dir() {

@@ -349,12 +349,13 @@ fn set_metal_bool_constant(
 
 impl MetalExecutor {
     /// Crée le device Metal et compile les kernels embarqués.
+    /// Utilise le preset de compatibilité, avec priorité aux surcharges du démarrage.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si Metal est indisponible ou si la compilation échoue.
     pub fn new() -> Result<Self> {
-        Self::new_with_kernel_profile(crate::KernelProfile::for_model_dir(Path::new("")))
+        Self::new_with_kernel_profile(crate::KernelProfile::for_legacy_executor())
     }
 
     /// Construit un executor dont les choix de kernels restent propres au modèle.
