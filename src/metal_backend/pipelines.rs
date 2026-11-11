@@ -481,6 +481,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_qmv_gated_input_fast_u4_gs64_f32")?;
         let affine_qmv_gated_input_fast_u8_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_gated_input_fast_u8_gs64_f32")?;
+        let embed_gather_bf16_from_u32_f32 =
+            pipeline(&library, &device, "embed_gather_bf16_from_u32_f32")?;
         let embed_gather_dense_from_u32_f32 =
             pipeline(&library, &device, "embed_gather_dense_from_u32_f32")?;
         let embed_gather_affine_from_u32_f32 =
@@ -880,6 +882,7 @@ impl MetalExecutor {
             affine_qmv_gated_input_fast_u4_gs64_f32,
             affine_qmv_gated_input_fast_u8_gs64_f32,
             embed_gather_dense_from_u32_f32,
+            embed_gather_bf16_from_u32_f32,
             embed_gather_affine_from_u32_f32,
             swiglu_f32,
             geglu_tanh_f32,

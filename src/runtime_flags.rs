@@ -130,10 +130,10 @@ pub(crate) fn free_cpu_weights_moe_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_FREE_CPU_WEIGHTS_MOE", false))
 }
 
-/// Active le stockage single-copy des poids quantifiés en mémoire unifiée.
+/// Active le stockage single-copy des poids quantifiés et denses bf16 en mémoire unifiée.
 ///
 /// **Défaut ON** : les MTLBuffer partagés stockent les codes `u32` et les
-/// paramètres affines bf16 natifs. `RETI_RUST_SINGLE_COPY_WEIGHTS=0` restaure
+/// paramètres affines et matrices denses bf16 natifs. `RETI_RUST_SINGLE_COPY_WEIGHTS=0` restaure
 /// strictement le chemin historique f32 CPU puis copies Metal (kill-switch).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn single_copy_weights_enabled() -> bool {

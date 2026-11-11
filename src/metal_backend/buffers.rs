@@ -20,6 +20,11 @@ impl MetalExecutor {
         embedding: &EmbeddingWeight,
     ) -> Result<MetalEmbeddingWeightBuffers> {
         match embedding {
+            EmbeddingWeight::DenseBf16(table) => Ok(MetalEmbeddingWeightBuffers::DenseBf16 {
+                table: table.buffer().clone(),
+                vocab: table.shape()[0],
+                dim: table.shape()[1],
+            }),
             EmbeddingWeight::Dense(table) => {
                 let (vocab, dim) = table.as_matrix()?;
                 Ok(MetalEmbeddingWeightBuffers::Dense {
@@ -388,14 +393,16 @@ impl MetalExecutor {
 
     pub(crate) fn linear_weight_out_dim(&self, weight: &MetalLinearWeightBuffers) -> usize {
         match weight {
-            MetalLinearWeightBuffers::Dense { out_dim, .. }
+            MetalLinearWeightBuffers::DenseBf16 { out_dim, .. }
+            | MetalLinearWeightBuffers::Dense { out_dim, .. }
             | MetalLinearWeightBuffers::AffineQuantized { out_dim, .. } => *out_dim,
         }
     }
 
     pub(crate) fn linear_weight_in_dim(&self, weight: &MetalLinearWeightBuffers) -> usize {
         match weight {
-            MetalLinearWeightBuffers::Dense { in_dim, .. }
+            MetalLinearWeightBuffers::DenseBf16 { in_dim, .. }
+            | MetalLinearWeightBuffers::Dense { in_dim, .. }
             | MetalLinearWeightBuffers::AffineQuantized { in_dim, .. } => *in_dim,
         }
     }
@@ -1094,6 +1101,9 @@ fn describe_stacked_affine_buffers(weight: &StackedAffineBuffers) -> String {
 
 fn describe_linear_weight_buffers(weight: &MetalLinearWeightBuffers) -> String {
     match weight {
+        MetalLinearWeightBuffers::DenseBf16 {
+            out_dim, in_dim, ..
+        } => format!("dense bf16 out={out_dim} in={in_dim}"),
         MetalLinearWeightBuffers::Dense {
             out_dim, in_dim, ..
         } => format!("dense out={out_dim} in={in_dim}"),

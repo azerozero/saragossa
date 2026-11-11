@@ -392,6 +392,26 @@ kernel void embed_gather_dense_from_u32_f32(
         recast_bf16 != 0u ? float(bfloat(value)) : value;
 }
 
+kernel void embed_gather_bf16_from_u32_f32(
+    device const bfloat* table [[buffer(0)]],
+    device const uint* token_index [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint2& dims [[buffer(3)]],
+    constant float& embedding_scale [[buffer(4)]],
+    constant uint& recast_bf16 [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint vocab = dims.x;
+    const uint dim = dims.y;
+    const uint token = token_index[gid.y];
+    if (token >= vocab || gid.x >= dim) {
+        return;
+    }
+    const float value = float(table[token * dim + gid.x]) * embedding_scale;
+    out[gid.y * dim + gid.x] =
+        recast_bf16 != 0u ? float(bfloat(value)) : value;
+}
+
 kernel void embed_gather_affine_from_u32_f32(
     device const uint* packed [[buffer(0)]],
     device const bfloat* scales [[buffer(1)]],

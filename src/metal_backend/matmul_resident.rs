@@ -21,6 +21,20 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> Result<usize> {
         match weight {
+            MetalLinearWeightBuffers::DenseBf16 {
+                rhs,
+                out_dim,
+                in_dim: rhs_in_dim,
+            } => self.encode_dense_bf16_weight(
+                encoder,
+                lhs_buffer,
+                rhs,
+                output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *rhs_in_dim,
+            ),
             MetalLinearWeightBuffers::Dense {
                 rhs,
                 out_dim,

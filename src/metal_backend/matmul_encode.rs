@@ -499,7 +499,8 @@ impl MetalExecutor {
                     biases,
                     *biases_offset,
                 )),
-                MetalLinearWeightBuffers::Dense { .. } => Err(InferError::Config(format!(
+                MetalLinearWeightBuffers::Dense { .. }
+                | MetalLinearWeightBuffers::DenseBf16 { .. } => Err(InferError::Config(format!(
                     "MLP fusionné : {name} n'est pas quantifié"
                 ))),
             }
@@ -1134,7 +1135,8 @@ impl MetalExecutor {
             ));
         }
         match embedding {
-            MetalEmbeddingWeightBuffers::Dense { table, vocab, dim } => {
+            MetalEmbeddingWeightBuffers::Dense { table, vocab, dim }
+            | MetalEmbeddingWeightBuffers::DenseBf16 { table, vocab, dim } => {
                 if *dim != expected_dim {
                     return Err(InferError::Dimension(format!(
                         "embedding dense dim={dim}, attendu {expected_dim}"
@@ -1144,7 +1146,13 @@ impl MetalExecutor {
                     checked_u32(*vocab, "embedding vocab")?,
                     checked_u32(*dim, "embedding dim")?,
                 ];
-                encoder.set_compute_pipeline_state(&self.embed_gather_dense_from_u32_f32);
+                let pipeline = if matches!(embedding, MetalEmbeddingWeightBuffers::DenseBf16 { .. })
+                {
+                    &self.embed_gather_bf16_from_u32_f32
+                } else {
+                    &self.embed_gather_dense_from_u32_f32
+                };
+                encoder.set_compute_pipeline_state(pipeline);
                 encoder.set_buffer(0, Some(table), 0);
                 encoder.set_buffer(1, Some(index_buffer), index_offset);
                 encoder.set_buffer(2, Some(output_buffer), 0);

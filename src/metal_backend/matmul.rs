@@ -31,6 +31,7 @@ pub(crate) fn take_concat_profile() -> (u64, u64) {
 fn linear_weight_id(weight: &LinearWeight) -> LinearWeightId {
     match weight {
         LinearWeight::Dense(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
+        LinearWeight::DenseBf16(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
         LinearWeight::AffineQuantized(weight) => LinearWeightId::Affine(weight.weight_id()),
     }
 }
@@ -42,6 +43,7 @@ fn concat_copy_bytes(weights: &[&LinearWeight]) -> Option<u64> {
     weights.iter().try_fold(0_u64, |total, weight| {
         let bytes = match weight {
             LinearWeight::Dense(weight) => weight.len().checked_mul(4)?,
+            LinearWeight::DenseBf16(weight) => weight.data().len().checked_mul(2)?,
             LinearWeight::AffineQuantized(weight) => {
                 if !weight.cpu_data_available() {
                     return None;
@@ -238,7 +240,55 @@ impl MetalExecutor {
         Ok(())
     }
 
-    /// QMV dense batch=1 avec poids bf16 row-major `[out_dim,in_dim]`.
+    pub(crate) fn matmul_rhs_t_dense_bf16(
+        &self,
+        input: &Tensor,
+        weight: &crate::DenseBf16Tensor,
+    ) -> Result<Tensor> {
+        let (batch, in_dim) = input.as_matrix()?;
+        let out_dim = weight.shape()[0];
+        let lhs = self.buffer_from_f32(input.data(), "dense_bf16_input")?;
+        let len = checked_len(batch, out_dim, "dense bf16 output")?;
+        let out = self.uncached_f32_buffer(len, "dense_bf16_output")?;
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoder_guard = EncoderEndGuard::new(encoder);
+        self.encode_dense_bf16_weight(
+            encoder,
+            &lhs,
+            weight.buffer(),
+            &out,
+            batch,
+            in_dim,
+            out_dim,
+            weight.shape()[1],
+        )?;
+        encoder_guard.end();
+        commit_and_wait(command_buffer)?;
+        Tensor::from_vec(vec![batch, out_dim], read_f32_buffer(&out, len)?)
+    }
+
+    pub(super) fn encode_dense_bf16_weight(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        rhs: &BufferRef,
+        out: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        rhs_in_dim: usize,
+    ) -> Result<usize> {
+        if in_dim != rhs_in_dim || batch == 0 || in_dim == 0 || out_dim == 0 {
+            return Err(InferError::Dimension(format!(
+                "matmul bf16 x=[{batch},{in_dim}] rhs=[{out_dim},{rhs_in_dim}]"
+            )));
+        }
+        self.encode_dense_qmv_rhs_bf16(encoder, lhs, rhs, out, batch, out_dim, in_dim)?;
+        Ok(out_dim)
+    }
+
+    /// QMV dense batch>=1 avec poids bf16 row-major `[out_dim,in_dim]`.
     ///
     /// # Errors
     ///
@@ -735,6 +785,11 @@ impl MetalExecutor {
         label: &'static str,
     ) -> Result<MetalLinearWeightBuffers> {
         match weight {
+            LinearWeight::DenseBf16(weight) => Ok(MetalLinearWeightBuffers::DenseBf16 {
+                rhs: weight.buffer().clone(),
+                out_dim: weight.shape()[0],
+                in_dim: weight.shape()[1],
+            }),
             LinearWeight::Dense(weight) => {
                 let (out_dim, in_dim) = weight.as_matrix()?;
                 Ok(MetalLinearWeightBuffers::Dense {
@@ -783,7 +838,6 @@ impl MetalExecutor {
         }
     }
 
-    /// Indique qu'un concat créerait une seconde copie des paramètres bf16 natifs.
     /// Vrai si une concaténation copierait des poids déjà adossés au stockage
     /// single-copy (check STRUCTUREL pur). Utilisé tel quel pour les PETITES
     /// paires (in_proj_a/b : la fusion vaut <1 % de decode, le split sur vues
@@ -791,9 +845,10 @@ impl MetalExecutor {
     pub(crate) fn concat_would_duplicate_affine_storage(&self, weights: &[&LinearWeight]) -> bool {
         weights.len() > 1
             && weights.iter().any(|weight| {
-                weight.affine_quantized().is_some_and(|weight| {
-                    weight.scales_metal_view().is_some() && weight.biases_metal_view().is_some()
-                })
+                matches!(weight, LinearWeight::DenseBf16(_))
+                    || weight.affine_quantized().is_some_and(|weight| {
+                        weight.scales_metal_view().is_some() && weight.biases_metal_view().is_some()
+                    })
             })
     }
 
@@ -802,9 +857,13 @@ impl MetalExecutor {
     /// GPU (~+1 Go dense) mais vaut ~10 % de decode (mesuré 35,5 → 32,0 en
     /// split forcé). Grosse RAM → concat (vitesse) ; budget VRAM tendu → split
     /// sur les vues storage (mémoire) — byte-identique dans les deux cas.
+    /// Les matrices denses bf16 gardent les vues dès que le site permet le split.
     pub(crate) fn concat_duplication_worth_avoiding(&self, weights: &[&LinearWeight]) -> bool {
-        self.concat_would_duplicate_affine_storage(weights)
-            && !(self.preserving_weight_caches() || self.concat_cache_within_vram_budget())
+        weights
+            .iter()
+            .any(|w| matches!(w, LinearWeight::DenseBf16(_)))
+            || self.concat_would_duplicate_affine_storage(weights)
+                && !(self.preserving_weight_caches() || self.concat_cache_within_vram_budget())
     }
 
     /// Résout (et mémoïse) la concaténation de poids linéaires en un buffer Metal.
@@ -970,6 +1029,34 @@ impl MetalExecutor {
             )));
         };
         match first {
+            LinearWeight::DenseBf16(first_weight) => {
+                // Certains sites exigent encore une concat : la copie reste bf16
+                // et le vecteur temporaire disparaît après l'upload partagé.
+                let in_dim = first_weight.shape()[1];
+                let mut out_dim = 0usize;
+                let mut data = Vec::new();
+                for weight in weights {
+                    let LinearWeight::DenseBf16(weight) = weight else {
+                        return Err(InferError::Dimension(format!(
+                            "{label}: mélange de stockages"
+                        )));
+                    };
+                    if weight.shape()[1] != in_dim {
+                        return Err(InferError::Dimension(format!(
+                            "{label}: in_dim incompatible"
+                        )));
+                    }
+                    out_dim = out_dim.checked_add(weight.shape()[0]).ok_or_else(|| {
+                        InferError::Dimension(format!("{label}: out_dim concat déborde"))
+                    })?;
+                    data.extend_from_slice(weight.data());
+                }
+                Ok(MetalLinearWeightBuffers::DenseBf16 {
+                    rhs: self.buffer_from_slice(&data, label)?,
+                    out_dim,
+                    in_dim,
+                })
+            }
             LinearWeight::Dense(first_weight) => {
                 let (_, in_dim) = first_weight.as_matrix()?;
                 let mut out_dim = 0usize;
