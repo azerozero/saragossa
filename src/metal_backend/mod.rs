@@ -1039,3 +1039,6 @@ enum MetalBufferElement {
     U32,
     Bf16,
 }
+
+#[cfg(test)]
+pub(crate) mod weight_file_tests;

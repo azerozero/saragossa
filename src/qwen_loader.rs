@@ -3,7 +3,6 @@
 use crate::{
     decoder::DecoderTensor,
     memory_guard::{estimate_paths_bytes, MemoryGuard},
-    quantization::bytes_to_u32,
     safetensor::{bytes_to_dense_f32, tensor_from_safetensor_parts},
     AffineQuantizedTensor, CausalDecoder, InferError, LinearWeight, ModelAssets, ModelConfig,
     QuantConfig, Result, Tensor, WeightCatalog,
@@ -750,6 +749,31 @@ pub(crate) struct ShardTensorEntry {
     pub(crate) data_offsets: [usize; 2],
 }
 
+impl ShardTensorEntry {
+    /// Vérifie la taille sérialisée avant toute allocation ou lecture du payload.
+    pub(crate) fn payload_len(&self, name: &str) -> Result<usize> {
+        if self.dtype.bitsize() % 8 != 0 {
+            return Err(InferError::UnsupportedDtype {
+                name: name.to_string(),
+                dtype: self.dtype,
+            });
+        }
+        let expected = self
+            .shape
+            .iter()
+            .try_fold(self.dtype.bitsize() / 8, |n, dim| n.checked_mul(*dim))
+            .ok_or_else(|| InferError::Shape(format!("taille trop grande pour {name}")))?;
+        let actual = self.data_offsets[1].checked_sub(self.data_offsets[0]);
+        if actual != Some(expected) {
+            return Err(InferError::Shape(format!(
+                "tensor {name} {:?} shape={:?} attend {expected} octets, offsets={:?}",
+                self.dtype, self.shape, self.data_offsets
+            )));
+        }
+        Ok(expected)
+    }
+}
+
 fn load_decoder_tensors(
     config: &ModelConfig,
     shards: &[PathBuf],
@@ -1139,3 +1163,6 @@ mod qwen_kv_x3_tests;
 mod test_fixtures;
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod direct_file_tests;

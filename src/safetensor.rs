@@ -146,6 +146,66 @@ pub(crate) fn tensor_from_safetensor_parts(
     Tensor::from_vec(shape.to_vec(), bytes_to_dense_f32(data, dtype, name)?)
 }
 
+/// Conversion bornée vers le stockage CPU final, sans payload brut de la
+/// taille du tenseur. Les offsets et tailles proviennent d'un header validé.
+pub(crate) fn read_dense_f32_at(
+    file: &std::fs::File,
+    offset: u64,
+    len_bytes: usize,
+    dtype: Dtype,
+    name: &str,
+) -> Result<Vec<f32>> {
+    use std::os::unix::fs::FileExt;
+    if !is_dense_float_dtype(dtype) {
+        return Err(InferError::UnsupportedDtype {
+            name: name.to_string(),
+            dtype,
+        });
+    }
+    let width = dtype.bitsize() / 8;
+    if len_bytes % width != 0 {
+        return Err(InferError::Shape(format!(
+            "taille de payload invalide pour {name}"
+        )));
+    }
+    let mut values = Vec::with_capacity(len_bytes / width);
+    let mut scratch = [0_u8; 64 * 1024];
+    let mut consumed = 0;
+    while consumed < len_bytes {
+        let len = scratch.len().min(len_bytes - consumed);
+        let at = offset
+            .checked_add(consumed as u64)
+            .ok_or_else(|| InferError::Shape(format!("offset trop grand pour {name}")))?;
+        file.read_exact_at(&mut scratch[..len], at)
+            .map_err(|source| InferError::Config(format!("lecture {name}: {source}")))?;
+        values.extend(bytes_to_dense_f32(&scratch[..len], dtype, name)?);
+        consumed += len;
+    }
+    Ok(values)
+}
+
+/// Lit les codes dans leur Vec final lorsque le stockage CPU est demandé.
+pub(crate) fn read_u32_at(
+    file: &std::fs::File,
+    offset: u64,
+    len_bytes: usize,
+    name: &str,
+) -> Result<Vec<u32>> {
+    use std::os::unix::fs::FileExt;
+    if len_bytes % 4 != 0 {
+        return Err(InferError::Shape(format!(
+            "taille u32 invalide pour {name}"
+        )));
+    }
+    let mut values = vec![0_u32; len_bytes / 4];
+    file.read_exact_at(bytemuck::cast_slice_mut(&mut values), offset)
+        .map_err(|source| InferError::Config(format!("lecture {name}: {source}")))?;
+    for value in &mut values {
+        *value = u32::from_le(*value);
+    }
+    Ok(values)
+}
+
 pub(crate) fn bytes_to_dense_f32(bytes: &[u8], dtype: Dtype, name: &str) -> Result<Vec<f32>> {
     match dtype {
         Dtype::F32 => bytes_to_f32(bytes, name),
@@ -441,6 +501,42 @@ mod tests {
     use super::*;
     use safetensors::{serialize, View};
     use std::borrow::Cow;
+
+    #[test]
+    fn bounded_file_reads_match_byte_conversions_across_chunks() -> Result<()> {
+        let file = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+        // Dépasse le scratch de 64 Kio et finit sur un fragment incomplet.
+        // Les formats FP8 refusent les NaN/inf : le motif reste fini dans
+        // tous les dtypes testés, tout en variant à travers la frontière.
+        let bytes: Vec<u8> = (0..65_540).map(|i| (i * 37 % 120) as u8).collect();
+        let mut payload = vec![0; 11];
+        payload.extend_from_slice(&bytes);
+        std::fs::write(file.path(), payload).expect("invariant: fixture écrite");
+        for dtype in [
+            Dtype::F32,
+            Dtype::BF16,
+            Dtype::F16,
+            Dtype::F8_E4M3,
+            Dtype::F8_E5M2,
+        ] {
+            let expected = bytes_to_dense_f32(&bytes, dtype, "fixture")?;
+            let actual = read_dense_f32_at(file.as_file(), 11, bytes.len(), dtype, "fixture")?;
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            read_u32_at(file.as_file(), 11, bytes.len(), "fixture")?,
+            crate::quantization::bytes_to_u32(&bytes, "fixture")?
+        );
+        assert!(read_dense_f32_at(file.as_file(), 11, 3, Dtype::F32, "fixture").is_err());
+        assert!(
+            read_dense_f32_at(file.as_file(), 11, bytes.len() + 4, Dtype::F32, "fixture").is_err()
+        );
+        assert!(read_u32_at(file.as_file(), 11, bytes.len() + 4, "fixture").is_err());
+        Ok(())
+    }
 
     struct F32View {
         shape: Vec<usize>,
