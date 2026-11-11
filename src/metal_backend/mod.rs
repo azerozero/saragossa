@@ -118,7 +118,7 @@ mod scratch;
 #[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
 mod sparse;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
 mod transfer;
 // Arbre de vérification DFlash : construit par la boucle DFlash (devtools).
