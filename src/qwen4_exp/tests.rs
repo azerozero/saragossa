@@ -153,14 +153,20 @@ impl Golden {
     }
 }
 
+#[test]
+fn legacy_qwen_comparison_shape_diagnostic() -> crate::Result<()> {
+    let rust = Tensor::from_vec(vec![1, 2], vec![f32::NAN, 0.0])?;
+    let oracle = Tensor::from_vec(vec![2], vec![0.0, 0.0])?;
+    crate::oracle::assert_panics_with(
+        "assertion `left == right` failed: qwen: formes\n  left: [1, 2]\n right: [2]",
+        || assert_close("qwen", &rust, &oracle, 0.1),
+    );
+    Ok(())
+}
+
 fn assert_close(label: &str, rust: &Tensor, oracle: &Tensor, tol: f64) {
     assert_eq!(rust.shape(), oracle.shape(), "{label}: formes");
-    let (rel, max) = relative_error(rust.data(), oracle.data());
-    eprintln!("{label}: rel={rel:.3e} max_abs={max:.3e}");
-    assert!(
-        rel <= tol,
-        "{label}: erreur relative {rel:.3e} > {tol:.0e} (max {max:.3e})"
-    );
+    crate::oracle::assert_close_l2(label, rust.data(), oracle.data(), tol);
 }
 
 /// KL(oracle‖rust) par token via log-softmax stable : (moyenne, maximum).

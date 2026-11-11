@@ -1,3 +1,5 @@
+pub(crate) mod oracle;
+
 use super::matmul_select::AffineMatmulKernel;
 use super::*;
 
