@@ -3,11 +3,80 @@
 mod storage;
 #[cfg(test)]
 mod tests;
+mod validation;
 use super::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use storage::{invalid, io, Blob, Source, Writer};
+
+/// Métadonnées figées avant la lecture des poids, uniquement en mode diagnostic.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SnapshotSources(Option<std::result::Result<Vec<Source>, String>>);
+
+impl SnapshotSources {
+    pub(crate) fn capture<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Self {
+        if crate::runtime_flags::state_snapshot_dir().is_none() {
+            return Self::default();
+        }
+        Self(Some(
+            (|| -> Result<Vec<Source>> {
+                let mut sources = Vec::new();
+                for path in paths {
+                    sources.push(Source::read(path)?);
+                    if let Some(parent) = path.parent() {
+                        for name in ["model.safetensors.index.json", "config.json"] {
+                            let auxiliary = parent.join(name);
+                            if auxiliary.is_file() {
+                                let source = Source::read(&auxiliary)?;
+                                if !sources.contains(&source) {
+                                    sources.push(source);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(sources)
+            })()
+            .map_err(|e| e.to_string()),
+        ))
+    }
+
+    fn verified(&self) -> Result<&[Source]> {
+        let sources = self
+            .0
+            .as_ref()
+            .ok_or_else(|| invalid("identité des poids absente au chargement"))?
+            .as_ref()
+            .map_err(invalid)?;
+        if sources.is_empty() {
+            return Err(invalid("poids sans chemin source"));
+        }
+        for source in sources {
+            source.verify()?;
+        }
+        Ok(sources)
+    }
+
+    pub(crate) fn finish_loading(mut self) -> Self {
+        if self.0.is_some() {
+            if let Err(error) = self.verified() {
+                self.0 = Some(Err(error.to_string()));
+            }
+        }
+        self
+    }
+
+    pub(crate) fn append(&mut self, other: Self) {
+        if let Some(Ok(sources)) = &mut self.0 {
+            match other.finish_loading().0 {
+                Some(Ok(extra)) => sources.extend(extra),
+                Some(Err(error)) => self.0 = Some(Err(error)),
+                None => self.0 = Some(Err("identité du sidecar absente".into())),
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! { static HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
@@ -219,8 +288,8 @@ struct Manifest {
 }
 
 impl CausalDecoder {
-    pub(crate) fn with_snapshot_sources(mut self, paths: &[PathBuf]) -> Self {
-        self.snapshot_sources = (!paths.is_empty()).then(|| paths.to_vec());
+    pub(crate) fn with_snapshot_sources(mut self, sources: SnapshotSources) -> Self {
+        self.snapshot_sources = sources.finish_loading();
         self
     }
 
@@ -228,33 +297,16 @@ impl CausalDecoder {
         let Some(root) = crate::runtime_flags::state_snapshot_dir() else {
             return Ok(None);
         };
-        let Some(sources) = &self.snapshot_sources else {
-            return Err(invalid(
-                "poids sans chemin source : instantané indisponible",
-            ));
+        let sources = match self.snapshot_sources.verified() {
+            Ok(sources) => sources,
+            Err(error) => {
+                eprintln!("state_snapshot refusé : {error}; prefill normal, sans écriture");
+                return Ok(None);
+            }
         };
         let mut hash = Sha256::new();
         for &token in prompt {
             hash.update((token as u64).to_le_bytes());
-        }
-        let mut paths = sources.clone();
-        // L'index et la config complètent l'identité des shards réellement chargés.
-        if let Some(parent) = paths
-            .first()
-            .and_then(|p| p.parent())
-            .map(Path::to_path_buf)
-        {
-            for name in ["model.safetensors.index.json", "config.json"] {
-                let path = parent.join(name);
-                if path.is_file() {
-                    paths.push(path);
-                }
-            }
-        }
-        #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-        if let Some(draft) = &self.dflash {
-            paths.push(draft.info.weight_path.clone());
-            paths.push(draft.info.draft_dir.join("config.json"));
         }
         let exe = io(Path::new("current_exe"), std::env::current_exe())?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -266,6 +318,13 @@ impl CausalDecoder {
         );
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let kv_dtype = "f32".to_string();
+        let mut settings = crate::runtime_flags::state_snapshot_settings();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = self.forward_runtime().metal_executor() {
+            settings.push(("kernel_profile", metal.snapshot_kernel_settings()));
+        }
+        // Permet aussi la compilation CPU, sans modification conditionnelle.
+        settings.sort_by_key(|(name, _)| *name);
         let prompt_sha256 = format!("{:x}", hash.finalize());
         // Une bascule DFlash vers MTP préremplit un autre prompt : son écriture
         // ne doit pas remplacer l'instantané du prompt initial à accélérer.
@@ -273,13 +332,10 @@ impl CausalDecoder {
         Ok(Some(Request {
             root: root.join(format!("entry-{entry}")),
             key: Key {
-                version: 1,
+                version: 2,
                 prompt_sha256,
                 tokens: prompt.len(),
-                sources: paths
-                    .iter()
-                    .map(|p| Source::read(p))
-                    .collect::<Result<_>>()?,
+                sources: sources.to_vec(),
                 binary_sha256: storage::hash_file(&exe)?,
                 mode: mode.into(),
                 config: format!(
@@ -289,8 +345,7 @@ impl CausalDecoder {
                 ),
                 kv_dtype,
                 runtime_sha256: storage::digest(
-                    &serde_json::to_vec(&crate::runtime_flags::state_snapshot_environment())
-                        .map_err(|e| invalid(e.to_string()))?,
+                    &serde_json::to_vec(&settings).map_err(|e| invalid(e.to_string()))?,
                 ),
                 little_endian: cfg!(target_endian = "little"),
             },
@@ -313,15 +368,21 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
         mode: &str,
-        drafter: Option<&Path>,
+        drafter: Option<&crate::DFlashDraft>,
     ) -> Result<Option<Request>> {
         let mut request = self.snapshot_request(prompt, mode)?;
-        if let (Some(request), Some(path)) = (&mut request, drafter) {
-            request.key.sources.push(Source::read(path)?);
-            if let Some(parent) = path.parent() {
-                let config = parent.join("config.json");
-                if config.is_file() {
-                    request.key.sources.push(Source::read(&config)?);
+        if let (Some(request), Some(draft)) = (&mut request, drafter) {
+            match draft.snapshot_sources.verified() {
+                Ok(sources) => {
+                    request.key.sources.extend_from_slice(sources);
+                    request
+                        .key
+                        .config
+                        .push_str(&format!(";draft={:?};quant={:?}", draft.info, draft.quant));
+                }
+                Err(error) => {
+                    eprintln!("state_snapshot refusé : {error}; prefill normal, sans écriture");
+                    return Ok(None);
                 }
             }
         }
@@ -348,13 +409,17 @@ impl CausalDecoder {
     }
 
     fn snapshot_read(&self, request: &Request) -> Result<State> {
+        for source in &request.key.sources {
+            source.verify()?;
+        }
         let path = request.root.join("manifest.json");
         let file = io(&path, std::fs::File::open(&path))?;
         if io(&path, file.metadata())?.len() > 16 * 1024 * 1024 {
             return Err(invalid("manifeste trop grand"));
         }
         let manifest: Manifest =
-            serde_json::from_reader(file).map_err(|source| InferError::Json { path, source })?;
+            serde_json::from_reader(std::io::Read::take(file, 16 * 1024 * 1024 + 1))
+                .map_err(|source| InferError::Json { path, source })?;
         if manifest.key.binary_sha256 != request.key.binary_sha256 {
             return Err(invalid("binaire différent (sha256), autre build refusé"));
         }
@@ -366,6 +431,7 @@ impl CausalDecoder {
         if manifest.position != request.key.tokens || manifest.layers.len() != self.layers.len() {
             return Err(invalid("position ou nombre de couches incorrect"));
         }
+        manifest.validate(self, request.key.tokens)?;
         let root = &request.root;
         let mut cache = self.empty_cache();
         cache.layers = manifest
@@ -404,75 +470,6 @@ impl CausalDecoder {
                 Ok(PrefixCaptures::new(&c.layer_ids, c.from, hidden))
             })
             .transpose()?;
-        for ((layer, stored), definition) in
-            cache.layers.iter().zip(&manifest.layers).zip(&self.layers)
-        {
-            match &definition.attention {
-                AttentionBlock::Full(attention) => {
-                    if layer.len() != cache.position
-                        || layer.kv_dim != attention.k_proj.weight().shape().first().copied()
-                    {
-                        return Err(invalid("longueur ou largeur KV différente du modèle"));
-                    }
-                }
-                AttentionBlock::Linear(_) => {
-                    let config = self.config.linear_attention_config()?;
-                    let expected = config
-                        .num_value_heads
-                        .checked_mul(config.value_head_dim)
-                        .and_then(|n| n.checked_mul(config.key_head_dim))
-                        .ok_or_else(|| invalid("dimensions linéaires trop grandes"))?;
-                    #[cfg(all(target_os = "macos", feature = "metal"))]
-                    let gpu = stored.metal.as_ref();
-                    #[cfg(all(target_os = "macos", feature = "metal"))]
-                    if let Some(gpu) = gpu {
-                        if !gpu.layout.matches_config(config) {
-                            return Err(invalid("géométrie linéaire différente du modèle"));
-                        }
-                    }
-                    #[cfg(all(target_os = "macos", feature = "metal"))]
-                    let has_gpu = gpu.is_some();
-                    #[cfg(not(all(target_os = "macos", feature = "metal")))]
-                    let has_gpu = {
-                        let _ = stored;
-                        false
-                    };
-                    if (!has_gpu || !layer.linear.ssm.is_empty())
-                        && layer.linear.ssm.len() != expected
-                    {
-                        return Err(invalid("état récurrent absent ou incomplet"));
-                    }
-                    if !has_gpu {
-                        let conv_dim = config
-                            .key_dim()?
-                            .checked_mul(2)
-                            .and_then(|n| config.value_dim().ok().and_then(|v| n.checked_add(v)))
-                            .ok_or_else(|| invalid("dimension conv trop grande"))?;
-                        let conv_len = config
-                            .conv_kernel_dim
-                            .checked_sub(1)
-                            .and_then(|n| n.checked_mul(conv_dim));
-                        if layer.linear.conv_dim != Some(conv_dim)
-                            || conv_len != Some(layer.linear.conv.len())
-                            || layer.linear.ssm_shape
-                                != Some((
-                                    config.num_value_heads,
-                                    config.value_head_dim,
-                                    config.key_head_dim,
-                                ))
-                        {
-                            return Err(invalid("géométrie récurrente CPU incohérente"));
-                        }
-                    }
-                }
-            }
-        }
-        if history
-            .as_ref()
-            .is_some_and(|h| h.len() != cache.position.saturating_sub(1))
-        {
-            return Err(invalid("historique MTP incomplet"));
-        }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let linear = manifest
@@ -483,6 +480,9 @@ impl CausalDecoder {
             if linear.iter().any(Option::is_some) {
                 self.restore_prefix_cache_linear_metal(&mut cache, linear)?;
             }
+        }
+        for source in &request.key.sources {
+            source.verify()?;
         }
         Ok(State {
             cache,
@@ -503,6 +503,10 @@ impl CausalDecoder {
         let Some(request) = request else {
             return Ok(());
         };
+        if let Err(error) = request.key.sources.iter().try_for_each(Source::verify) {
+            eprintln!("state_snapshot refusé : {error}; sans écriture");
+            return Ok(());
+        }
         let mut writer = Writer::new(&request.root)?;
         let layers = cache
             .layers
@@ -530,6 +534,10 @@ impl CausalDecoder {
             history,
             captures,
         };
+        if let Err(error) = request.key.sources.iter().try_for_each(Source::verify) {
+            eprintln!("state_snapshot refusé : {error}; sans publication");
+            return Ok(());
+        }
         writer.publish(&manifest)?;
         eprintln!(
             "state_snapshot écrit mode={} tokens={}",

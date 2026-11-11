@@ -3584,6 +3584,7 @@ mod dflash_resident {
             })
             .collect();
         DFlashDraft {
+            snapshot_sources: Default::default(),
             info: DFlashDraftInfo {
                 draft_dir: std::path::PathBuf::new(),
                 weight_path: std::path::PathBuf::new(),

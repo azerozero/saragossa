@@ -1310,7 +1310,6 @@ pub(crate) fn flint_window_kv_enabled() -> bool {
 /// sans lui, le chemin partagé actuel reste utilisé. Déclaré pour A2 : aucun
 /// chemin ne le lit encore.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-#[expect(dead_code, reason = "lu par le branchement du K/V sparse (A2)")]
 pub(crate) fn kv_sparse_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_SPARSE", false))
@@ -2083,30 +2082,171 @@ pub(super) fn print_layer_profile(
     );
 }
 
-/// Répertoire diagnostic de l'état post-prefill ; relu pour isoler les essais.
-pub(crate) fn state_snapshot_dir() -> Option<std::path::PathBuf> {
-    env_var_os("SARAGOSSA_RUST_STATE_SNAPSHOT")
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
+/// Répertoire fixé au premier accès ; l'absence ne crée même pas l'alias historique.
+pub(crate) fn state_snapshot_dir() -> Option<&'static std::path::Path> {
+    static ROOT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        std::env::var_os("SARAGOSSA_RUST_STATE_SNAPSHOT")
+            .or_else(|| std::env::var_os("RETI_RUST_STATE_SNAPSHOT"))
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .as_deref()
 }
 
-/// Les réglages numériques font partie de la clé : changer un kernel ou un
-/// dtype dans le même binaire ne doit pas réutiliser un ancien prefill.
-pub(crate) fn state_snapshot_environment() -> Vec<(String, String)> {
-    let mut flags: Vec<_> = std::env::vars_os()
-        .filter_map(|(name, value)| {
-            Some((
-                name.into_string().ok()?,
-                value.to_string_lossy().into_owned(),
-            ))
-        })
-        .filter(|(name, _)| {
-            (name.starts_with("SARAGOSSA_") || name.starts_with("RETI_"))
-                && !name.ends_with("STATE_SNAPSHOT")
-        })
-        .collect();
-    flags.sort();
-    flags
+/// Lire les mêmes accesseurs que le calcul résout leurs OnceLock : une mutation
+/// ultérieure de l'environnement ne peut pas décrire un autre chemin numérique.
+pub(crate) fn state_snapshot_settings() -> Vec<(&'static str, String)> {
+    let mut settings = Vec::new();
+    macro_rules! record {
+        ($getter:ident) => {
+            settings.push((stringify!($getter), format!("{:?}", $getter())));
+        };
+    }
+    record!(qwen_embed_bf16_enabled);
+    record!(mtp_history_policy);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(mtp_fresh_cache_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(mtp_fresh_max_prompt_tokens);
+    record!(gpu_argmax_enabled);
+    record!(gpu_sampler_enabled);
+    record!(prefill_batched_enabled);
+    record!(prefill_chunk_size);
+    record!(prefix_cache_enabled);
+    record!(prefix_cache_capacity);
+    record!(prefix_cache_max_bytes);
+    record!(mtp_sampled_enabled);
+    record!(dflash_sampled_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(free_cpu_weights_moe_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(single_copy_weights_enabled);
+    record!(mtp_resident_hidden_enabled);
+    record!(mtp_gpu_embedding_enabled);
+    record!(mtp_overlap_stream_enabled);
+    record!(mtp_gpu_block_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(decode_resident_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(decode_resident_full_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(decode_resident_full_linear_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(decode_resident_full_qkv_concat_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(decode_resident_rope_append_kv_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(decode_pipeline_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(lightbatch_qmm2_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(lightbatch_multi_dense_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(lightbatch_moe2_enabled);
+    record!(prefill_linear_batched_enabled);
+    record!(prefill_moe_rows_enabled);
+    record!(moe_verify_rows_override);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(moe_verify_tail_level);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(moe_verify_shared_fused_max_rows);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_attn_batch_long_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_attn_batch_mid_30b_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_attn_steel_d256_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_attn_nax_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_attn_nax_sinks_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_attn_nax_window_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(verify_rows_nax_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(verify_rows_nax_greedy_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(verify_strict_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(verify_rows_nax_min_len);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(verify_rows_nax_blocks);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_attn_nax_head_major);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_attn_nax_variant);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_kv_bf16_mirror_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_kv_bf16_store_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(flint_prefill_kv_bf16_store_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(flint_small_nax_gemm_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(qwen_kv_nax_x3_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(flint_window_kv_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(kv_sparse_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefix_extend_resident_min_tokens);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_linear_nax_enabled);
+    record!(mtp_early_first_token_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(mtp_seed_gpu_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_kv_shared_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_resident_chunk_tokens);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(flint_prefill_max_tokens_override);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(flint_prefill_steel_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_resident_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_resident_gemma4_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(prefill_dense_resident_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(moe_micro_split_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(linear_micro_split_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(resident_concat_cache_enabled);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(mtp_prefill_resident_enabled);
+    record!(attention_parallel_threshold);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(qmv_fast_mode);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(gather_fast_mode);
+    record!(prefix_extend_resident_enabled);
+    record!(prefix_extend_rows);
+    record!(kv_bf16_greedy_min_tokens);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    record!(kv_quant_format);
+    record!(dflash_windowed_rows);
+    record!(dflash_drafter_base);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        settings.push((
+            "linear_attn_resident_step_enabled",
+            format!(
+                "{:?}",
+                crate::linear_attention::linear_attn_resident_step_enabled()
+            ),
+        ));
+        settings.push((
+            "resident_attention",
+            crate::decode_resident::snapshot_attention_settings(),
+        ));
+    }
+    settings
 }
 
 #[cfg(test)]

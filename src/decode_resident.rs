@@ -67,6 +67,7 @@ mod multi;
 mod rows;
 mod types;
 mod utils;
+pub(crate) use utils::snapshot_attention_settings;
 
 #[cfg(test)]
 mod rope_tests;

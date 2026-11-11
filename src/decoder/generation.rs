@@ -3240,11 +3240,7 @@ impl CausalDecoder {
         draft: &DFlashDraft,
     ) -> Result<(CausalDecoderCache, Tensor, Tensor)> {
         let layer_ids = &draft.info.target_layer_ids;
-        let snapshot = self.snapshot_request_dflash(
-            prompt,
-            "dflash-reference",
-            Some(&draft.info.weight_path),
-        )?;
+        let snapshot = self.snapshot_request_dflash(prompt, "dflash-reference", Some(draft))?;
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(captures) = state.captures {
                 if captures.layer_ids == *layer_ids && captures.from == 0 {
@@ -4441,13 +4437,17 @@ impl CausalDecoder {
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
-        drafter_path: Option<&std::path::Path>,
+        drafter: Option<&DFlashDraft>,
     ) -> Result<(CausalDecoderCache, Tensor, Tensor, usize)> {
-        let snapshot = self.snapshot_request_dflash(
-            prompt,
-            &format!("dflash:{layer_ids:?}:{keep_rows}"),
-            drafter_path,
-        )?;
+        let snapshot = if crate::runtime_flags::state_snapshot_dir().is_some() {
+            self.snapshot_request_dflash(
+                prompt,
+                &format!("dflash:{layer_ids:?}:{keep_rows}"),
+                drafter,
+            )?
+        } else {
+            None
+        };
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(captures) = state.captures {
                 if captures.layer_ids == layer_ids

@@ -621,3 +621,23 @@ mod shared_rows_tests {
         }
     }
 }
+
+/// Valeurs actives des kernels d'attention, y compris les surcharges locales.
+pub(crate) fn snapshot_attention_settings() -> String {
+    format!(
+        "{:?}",
+        (
+            flash_sdpa_enabled(),
+            kv_bf16_env_override(),
+            kv_format_for(false),
+            kv_format_for(true),
+            kv_bf16_sim_konly(),
+            kv_bf16_sim_vonly(),
+            full_rows_fused_enabled(),
+            sdpa_2pass_enabled(),
+            sdpa_2pass_min_len(),
+            sdpa_2pass_keys_per_block(),
+            super::rows::rows_group_override(),
+        )
+    )
+}

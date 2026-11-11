@@ -1334,7 +1334,7 @@ fn softplus(value: f32) -> f32 {
 
 /// Indique si le pas résident Metal (états conservés GPU) est activé (défaut oui).
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn linear_attn_resident_step_enabled() -> bool {
+pub(crate) fn linear_attn_resident_step_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         // Défaut **ON** (phase 1a full-rust : +43 % decode mesuré, sortie greedy

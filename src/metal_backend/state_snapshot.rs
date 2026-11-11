@@ -3,7 +3,7 @@ use super::*;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LinearSnapshotLayout {
-    conv_len: usize,
+    pub(crate) conv_len: usize,
     conv_dim: usize,
     conv_kernel_dim: usize,
     num_value_heads: usize,
@@ -65,6 +65,61 @@ impl LinearAttentionMetalState {
 }
 
 impl MetalExecutor {
+    pub(crate) fn snapshot_kernel_settings(&self) -> String {
+        let mut settings = vec![("kernel_profile", format!("{:?}", self.kernel_profile))];
+        macro_rules! record {
+            ($module:ident, $getter:ident) => {
+                settings.push((
+                    stringify!($getter),
+                    format!("{:?}", super::$module::$getter()),
+                ));
+            };
+        }
+        record!(flags, resident_concurrent_enabled);
+        record!(flags, prefill_fused_mlp_enabled);
+        record!(flags, linear_chunked_enabled);
+        record!(flags, moe_coop_enabled);
+        record!(flags, moe_coop_fused_swiglu_enabled);
+        record!(flags, moe_coop_u4_enabled);
+        record!(flags, moe_routed_coop_prefill_enabled);
+        record!(flags, flint_moe_coop_enabled);
+        record!(flags, flint_moe_coop_tiled_enabled);
+        record!(flags, qmm_na_enabled);
+        record!(flags, qmm_na_gs128_enabled);
+        record!(flags, qmm_na_fused_tiled_enabled);
+        record!(flags, qmm_na_fused_tiled_u4_enabled);
+        record!(flags, fast_argmax_qmv_enabled);
+        record!(flags, qmv_one_u8_enabled);
+        record!(flags, qmm_u6_enabled);
+        record!(flags, qmv_u6_enabled);
+        record!(flags, linear_z_beta_gate_enabled);
+        record!(flags, linear_full_concat_enabled);
+        record!(flags, fused_attn_epilogue_enabled);
+        record!(flags, fused_rms_prologue_enabled);
+        record!(flags, qmv_u4_residual_enabled);
+        record!(flags, dense_qmv_fast_enabled);
+        record!(flags, topk8_fast_enabled);
+        record!(flags, linear_delta_dk128_enabled);
+        record!(flags, linear_capture_journal_enabled);
+        record!(flags, linear_rows_seq_delta_enabled);
+        record!(flags, linear_rows_batched_enabled);
+        record!(flags, linear_rms_dv128_enabled);
+        record!(flags, linear_conv_k4_enabled);
+        record!(flags, linear_norm_dk128_enabled);
+        record!(flags, fused_gate_up_enabled);
+        record!(flags, fused_shared_gate_up_enabled);
+        record!(flags, moe_shared_route_overlap_enabled);
+        record!(flags, topk_wide_enabled);
+        record!(flags, topk_parallel_enabled);
+        record!(flags, private_scratch_enabled);
+        record!(eligibility, qmm_skinny_enabled);
+        record!(eligibility, qmm_skinny_kernel);
+        record!(eligibility, qmm_skinny_min_batch);
+        record!(eligibility, qmm8_enabled);
+        record!(eligibility, qmm_na_min_batch);
+        format!("{settings:?}")
+    }
+
     pub(crate) fn linear_state_from_disk(
         &self,
         layout: &LinearSnapshotLayout,

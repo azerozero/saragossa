@@ -9,17 +9,35 @@ export SARAGOSSA_RUST_STATE_SNAPSHOT=/tmp/saragossa-state
 ```
 
 Le premier passage crée une entrée `entry-*` par empreinte du prompt et mode,
-avec `manifest.json` et un répertoire `state-*` de blobs bruts. Le suivant journalise `state_snapshot hit ... (prefill sauté)` et
-restaure l'état avant le semis du decode résident. Enlever le flag désactive
-entièrement la lecture et l'écriture. Une API construite depuis des tenseurs
-sans chemins de poids refuse ce mode diagnostic.
+avec `manifest.json` et un répertoire `state-*` de blobs bruts. Le suivant
+journalise `state_snapshot hit ... (prefill sauté)` et restaure l'état avant le
+semis du decode résident. Le flag est figé au premier accès (OnceLock) : le
+définir avant le chargement,
+puis redémarrer le processus pour le changer. Sans flag au démarrage, le chemin
+instantané ne clone aucun chemin et n'alloue rien, même pour l'alias historique.
+Une API construite depuis des tenseurs sans chemins de poids refuse ce mode
+diagnostic.
 
-La clé comprend SHA-256 des ids (u64 little-endian), chemins canoniques,
-tailles et mtimes des shards chargés, de l'index et de la configuration s'ils
-existent, ainsi que les sidecars MTP et le drafter DFlash. Elle inclut le mode
-AR/MTP/DFlash, la configuration, le dtype KV et une empreinte des réglages runtime,
+La clé comprend SHA-256 des ids (u64 little-endian), chemins des sources,
+tailles, mtimes et, sous Unix, inode/device des shards chargés, de l'index et de
+la configuration s'ils existent, ainsi que les sidecars MTP et le drafter DFlash.
+Ces identités sont figées avant la lecture des poids et revérifiées après leur
+chargement, à la relecture et avant toute écriture/publication. Un changement
+refuse le snapshot avec diagnostic, garde le prefill normal et interdit son
+écriture. Les poids ne sont pas hachés intégralement : une modification en
+place préservant taille, mtime et inode/device reste indétectable ; ces métadonnées
+ne constituent pas une preuve cryptographique du contenu.
+
+La clé inclut aussi le mode
+AR/MTP/DFlash, la configuration, le dtype KV et une empreinte des réglages effectifs
+(accesseurs OnceLock résolus et profil immuable de l'executor Metal),
 l'endianness et SHA-256 du binaire courant. Chaque blob porte aussi son
-SHA-256 et sa taille. Un autre build est explicitement refusé. Une clé
+SHA-256 et sa taille. Avant toute allocation de blob, la géométrie complète
+(KV, conv/SSM CPU et Metal, dernière ligne, historique MTP et captures DFlash)
+est contrôlée contre le modèle et le nombre de tokens, avec arithmétique vérifiée
+et budget cumulé. Chaque segment KV contient des lignes entières. Les lectures
+ont une longueur fixe : un fichier qui grossit ne peut pas augmenter l'allocation.
+Un autre build est explicitement refusé. Une clé
 incompatible, un manifeste incomplet ou un blob corrompu déclenche un prefill
 normal avec diagnostic. Une erreur d'écriture est propagée.
 
@@ -48,8 +66,10 @@ Le temps de « prefill » inclut l'I/O et les checksums ; la relecture alloue de
 buffers CPU et GPU différents d'un prefill normal. Les poids restent chargés
 normalement. Le cache n'est pas un checkpoint de génération : il ne conserve
 ni sampler en cours, ni tokens déjà décodés, ni arène spéculative en cours.
-Changer un réglage runtime invalide volontairement la clé, même si ce réglage
-n'affecte que le decode. Aucun résultat d'identité avec poids n'est présumé.
+Changer une valeur runtime effective invalide volontairement la clé, même si ce
+réglage n'affecte que le decode. Modifier l'environnement après résolution d'un
+OnceLock ne change ni sa valeur active ni son empreinte. Aucun résultat
+d'identité avec poids n'est présumé.
 
 Le KV coûte `2 × tokens × somme(kv_heads × head_dim) × octets_par_valeur`.
 Pour le Qwen3.8-27B à 262 144 tokens, 16 couches full-attention, 4 têtes KV
@@ -63,7 +83,10 @@ avec `du -sh "$SARAGOSSA_RUST_STATE_SNAPSHOT"`.
 ## Vérification
 
 Sans poids : aller-retour f32/bf16 et états récurrents CPU, captures/historique,
-rejet d'un autre build, corruption, et publication interrompue.
+rejet d'un autre build, corruption et publication interrompue. Les régressions
+couvrent aussi le remplacement des poids à taille/mtime identiques, le refus
+d'écriture après modification, le court-circuit sans flag, les réglages figés,
+les blobs creux surdimensionnés et le repli après des segments KV mal alignés.
 
 ```sh
 cargo test --lib decoder::state_snapshot::tests
@@ -73,7 +96,7 @@ Les deux tests d'identité suivants sont **ignorés**, à lancer manuellement
 sous le verrou GPU habituel. Ils chargent uniquement le modèle local indiqué
 (un petit modèle avec tête MTP peut remplacer le 27B), sans téléchargement.
 Chaque mode compare 24 ids greedy entre run complet, écriture et relecture,
-avec un nouveau décodeur pour chaque phase et assertion du hit disque.
+avec un processus neuf pour chaque phase et assertion du hit disque.
 
 ```sh
 SARAGOSSA_TEST_MODEL=/chemin/vers/modele \

@@ -38,10 +38,23 @@ pub(super) struct Source {
     path: PathBuf,
     bytes: u64,
     modified_ns: u128,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 impl Source {
+    pub(super) fn verify(&self) -> Result<()> {
+        if Self::read(&self.path)? != *self {
+            return Err(invalid("source modifiée depuis le chargement"));
+        }
+        Ok(())
+    }
     pub(super) fn read(path: &Path) -> Result<Self> {
-        let path = io(path, fs::canonicalize(path))?;
+        // Conserver le chemin demandé permet aussi de détecter une cible de lien changée.
+        let path = path.to_owned();
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
         let metadata = io(&path, fs::metadata(&path))?;
         let modified_ns = io(&path, metadata.modified())?
             .duration_since(std::time::UNIX_EPOCH)
@@ -51,6 +64,10 @@ impl Source {
             path,
             bytes: metadata.len(),
             modified_ns,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
         })
     }
 }
@@ -59,10 +76,24 @@ impl Source {
 pub(super) struct Blob {
     pub(super) file: PathBuf,
     pub(super) dtype: String,
-    bytes: usize,
+    pub(super) bytes: usize,
     sha256: String,
 }
 impl Blob {
+    pub(super) fn validate(&self, dtype: &str, elements: usize) -> Result<()> {
+        let width = match dtype {
+            "f32" => 4,
+            "bf16" => 2,
+            _ => return Err(invalid("dtype inconnu")),
+        };
+        if self.dtype != dtype || elements.checked_mul(width) != Some(self.bytes) {
+            return Err(invalid(
+                "taille ou dtype de blob différent des dimensions attendues",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn read(&self, root: &Path) -> Result<Vec<u8>> {
         // Le manifeste reste un fichier externe : ne jamais suivre ses chemins arbitraires.
         if self.file.components().count() != 2
@@ -87,7 +118,14 @@ impl Blob {
         bytes
             .try_reserve_exact(self.bytes)
             .map_err(|_| invalid("blob trop grand"))?;
-        io(&path, file.read_to_end(&mut bytes))?;
+        // La géométrie de tous les blobs est validée avant cet appel. Une
+        // croissance concurrente du fichier ne peut pas agrandir cette lecture.
+        bytes.resize(self.bytes, 0);
+        io(&path, file.read_exact(&mut bytes))?;
+        let mut extra = [0];
+        if io(&path, file.read(&mut extra))? != 0 {
+            return Err(invalid("blob agrandi pendant la lecture"));
+        }
         if bytes.len() != self.bytes || digest(&bytes) != self.sha256 {
             return Err(invalid("checksum de blob incorrect"));
         }

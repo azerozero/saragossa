@@ -370,7 +370,7 @@ impl CausalDecoder {
                     prompt,
                     layer_ids,
                     keep_rows,
-                    Some(&draft.info.weight_path),
+                    Some(draft),
                 )
             })?;
         let (captured_rows, captured_cols) = target_hidden.as_matrix()?;

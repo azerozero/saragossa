@@ -36,6 +36,7 @@ mod attention_cache;
 mod attention_ops;
 mod kv_rows;
 mod state_snapshot;
+pub(crate) use state_snapshot::SnapshotSources;
 mod tts_prefill;
 #[cfg(test)]
 pub(crate) use attention_ops::{
@@ -1489,7 +1490,7 @@ pub struct CausalDecoder {
     /// passe par la boucle DFlash (`generate_greedy_mtp_inner`).
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     dflash: Option<crate::DFlashDraft>,
-    snapshot_sources: Option<Vec<std::path::PathBuf>>,
+    snapshot_sources: SnapshotSources,
     prefix_cache: Arc<Mutex<PrefixCache>>,
     memory_guard: Option<MemoryGuard>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2023,8 +2024,8 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si le chargement ou la construction échoue.
     pub fn from_safetensors(path: impl AsRef<Path>, config: CausalDecoderConfig) -> Result<Self> {
-        Ok(Self::from_tensors(load_f32_tensors(&path)?, config)?
-            .with_snapshot_sources(&[path.as_ref().to_path_buf()]))
+        let sources = SnapshotSources::capture([path.as_ref()]);
+        Ok(Self::from_tensors(load_f32_tensors(&path)?, config)?.with_snapshot_sources(sources))
     }
 
     /// Construit un décodeur depuis des tenseurs denses.
@@ -2083,7 +2084,7 @@ impl CausalDecoder {
             mtp_draft_lm_head: None,
             #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
             dflash: None,
-            snapshot_sources: None,
+            snapshot_sources: SnapshotSources::default(),
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
             memory_guard: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2625,6 +2626,7 @@ impl CausalDecoder {
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
     pub fn with_mtp_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
         self.ensure_metal_supported()?;
+        let sources = SnapshotSources::capture([path.as_ref()]);
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let context = self
             .runtime
@@ -2650,9 +2652,7 @@ impl CausalDecoder {
                 head.move_packed_to_metal_shared(metal)?;
             }
         }
-        if let Some(sources) = &mut self.snapshot_sources {
-            sources.push(path.as_ref().to_path_buf());
-        }
+        self.snapshot_sources.append(sources);
         self.mtp = Some(head);
         Ok(self)
     }
@@ -2691,6 +2691,11 @@ impl CausalDecoder {
                 ForwardRuntime::metal(metal),
             )?,
         );
+        if crate::runtime_flags::state_snapshot_dir().is_some() {
+            if let Some(draft) = &self.dflash {
+                self.snapshot_sources.append(draft.snapshot_sources.clone());
+            }
+        }
         Ok(self)
     }
 
@@ -2707,6 +2712,7 @@ impl CausalDecoder {
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
     pub fn with_mtp_draft_lm_head_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
         self.ensure_metal_supported()?;
+        let sources = SnapshotSources::capture([path.as_ref()]);
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let context = self
             .runtime
@@ -2715,14 +2721,12 @@ impl CausalDecoder {
             .map_or_else(mtp::MtpLoadContext::cpu, mtp::MtpLoadContext::metal);
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let context = mtp::MtpLoadContext::cpu();
-        if let Some(sources) = &mut self.snapshot_sources {
-            sources.push(path.as_ref().to_path_buf());
-        }
         self.mtp_draft_lm_head = Some(mtp::load_mtp_draft_lm_head(
             &path,
             self.final_norm.data().len(),
             &context,
         )?);
+        self.snapshot_sources.append(sources);
         Ok(self)
     }
 
