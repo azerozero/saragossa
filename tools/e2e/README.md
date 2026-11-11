@@ -20,6 +20,7 @@ tools/e2e/
 ├── matrix.py            # cas SDK et capacités explicites
 ├── run.py               # CLI, sélection et rapports JSON/Markdown
 ├── test_contracts.py    # unittest, fixtures en mémoire, aucun serveur
+├── test_sdk.py          # signatures installées et transport SDK en mémoire
 └── transport.py         # SDK officiels et sondes HTTP/SSE stdlib
 ```
 
@@ -32,6 +33,16 @@ pip install openai==3.49.0 anthropic==2.8.0
 Le runner ne lance jamais `pip`. Il refuse une autre version des SDK, désactive
 leurs retries et les proxies hérités pour les connexions locales. `unittest`
 fournit le runner minimal stdlib ; pytest n'est pas requis.
+
+Les signatures réelles de ces versions sont vérifiées par `inspect.signature`
+dans `test_sdk.py`, y compris les variantes `with_raw_response` et
+`with_streaming_response` : models.list, chat.completions.create,
+messages.create, embeddings.create, audio.speech.create et
+audio.transcriptions.create. Anthropic 2.8.0 n'accepte plus `temperature` comme
+argument Python de `messages.create`. Le harnais le transmet dans
+`extra_body={"temperature": 0}` pour conserver la même requête JSON que la sonde
+HTTP brute, sans modifier le corps d'origine. Cela couvre les réponses simples,
+les outils, les erreurs de modèle inconnu et le streaming.
 
 Le serveur exige `Authorization: Bearer` pour les deux API. Le client Anthropic
 est donc construit avec `auth_token`, option officielle du SDK, plutôt qu'avec
@@ -61,6 +72,15 @@ Les noms de cibles sont des profils de campagne ; ils ne prouvent ni la taille
 ni la quantification des poids fournis. L'opérateur sélectionne les checkpoints.
 Seul `config.json` du LLM est lu par le runner pour détecter `model_type=flint`,
 condition actuelle du support des outils OpenAI.
+
+**Blocage serveur actuel des profils sans LLM :** les options exactes sont
+`--embed-model DIR`, `--stt-model DIR` et `--tts-model DIR`
+(`src/serve/args.rs:112`, `:115`, `:118`). Le parsing les accepte sans `--model`,
+mais le sélecteur appelé ensuite exige encore un LLM : voir les écarts confirmés
+ci-dessous. Ces profils restent lancés avec leurs seules options dédiées et
+échouent explicitement avec diagnostic ; aucun LLM factice ni chargement
+supplémentaire ne masque ce défaut. Ne pas interpréter cet échec de démarrage
+comme un résultat sur la qualité des embeddings ou de l'audio.
 
 ```sh
 python -I tools/e2e/run.py --binary "$SARAGOSSA_BIN" --target qwen38 --report-dir tools/e2e/reports/qwen38
@@ -202,13 +222,37 @@ PR modifie une capacité. Elles ne sont jamais inférées d'une exception résea
 - [audio.rs](../../src/serve/audio.rs) : WAV en synthèse, JSON/text en
   transcription. `response_format` TTS est ignoré. Le PCM existe seulement via
   l'extension locale `stream=true`, hors du contrat de format SDK testé ici.
-- `n` n'est actuellement pas désérialisé dans la requête chat. Le cas
-  `n_rejected` expose cette lacune par un échec si le serveur accepte la requête.
-  Ce refus fait partie du contrat explicitement exigé par la campagne.
-- Le refus précoce d'un corps excessif passe actuellement par `read_or_reject`
-  et une enveloppe OpenAI, même pour `/v1/messages`. Le test Anthropic doit exposer
-  cet écart ; il n'est pas converti en skip. Les timestamps des chunks doivent
-  aussi rester stables même quand la génération traverse plusieurs secondes.
+
+### Premier passage réel : harnais et serveur
+
+Les références fichier:ligne ci-dessous correspondent au code serveur de la
+révision `228a335`. Les corrections du harnais ne modifient aucun fichier Rust.
+
+**Défauts du harnais corrigés :** le `TypeError` sur `temperature` survenait avant
+l'envoi de la requête Anthropic ; ce n'était pas un refus du serveur. La perte du
+journal temporaire rendait aussi les arrêts avant `/health` inexploitables.
+`server_diagnostics` conserve maintenant les dernières lignes des deux sorties.
+
+**Défauts serveur confirmés par le code et cohérents avec les rapports :**
+
+| Cas | Défaut et preuve locale | Contrôle conservé |
+|---|---|---|
+| `/v1/messages`, `body_excessive` | `src/serve/http.rs:761` refuse le corps dans `read_head`. `src/serve/dispatch.rs:362` passe par `read_or_reject` (`src/serve/http.rs:137`), qui appelle `send_error` (`src/serve/http.rs:597`) sans information de route. L'enveloppe ne possède pas le champ racine `type: "error"` exigé par Anthropic. | `champ absent: type` reste un ÉCHEC. |
+| Chat SSE, `stream` / `stream_usage` | `src/serve/protocol.rs:695`, `:755`, `:771` recalculent `created_now()` pour les chunks d'usage, de fin et de contenu/rôle. `with_id` (`:677`) stabilise seulement l'identifiant. Un flux qui traverse une seconde peut donc changer de `created`, contrairement au contrat OpenAI. | Identifiant et timestamp restent contrôlés séparément ; le diagnostic précise désormais lequel varie. Le rapport Gemma3 seul ne distinguait pas les deux. |
+| Chat, `n_rejected` | `src/serve/protocol.rs:16` ne désérialise pas `n`, et la réponse construit une seule choice (`:568`). `n=2` est accepté silencieusement avec une seule sortie. | ÉCHEC si le refus HTTP 400 explicite exigé par la campagne n'a pas lieu. |
+| `e5`, `whisper`, `qwen3_tts`, `audio` seuls | `src/main.rs:109` délègue à `serve`; `src/serve/mod.rs:62` appelle systématiquement `select_if_missing`. `src/serve/model_selection.rs:14` ne teste que `args.models`, ignore les modèles auxiliaires puis refuse stdin non-TTY (`:18`). | ÉCHEC de cycle de vie ; commande, code de sortie et fin de journal dans les deux rapports. |
+
+Le premier passage n'a pas conservé le stderr des quatre démarrages auxiliaires :
+le code prouve ce blocage, mais la prochaine campagne devra confirmer le message
+effectif du binaire utilisé. Les assertions d'enveloppe et de stabilité SSE sont
+couvertes par des fixtures négatives locales et ne sont pas assouplies.
+
+L'échec Gemma3 `json_object` (« objet JSON/contenu attendu ») ne prouve pas un bug
+du protocole : `json.loads` a réussi avant cette assertion. Le test vérifie aussi
+`greeting == "Bonjour"`, alors que `json_object` impose une forme JSON, pas ce
+contenu (`src/serve/state.rs:1389`). La réponse n'étant pas enregistrée, cet échec
+reste un échec de contenu à examiner lors de la relance, sans classement comme
+défaut serveur confirmé.
 
 ## Rapports et codes de sortie
 
@@ -216,6 +260,13 @@ Chaque répertoire de sortie reçoit `report.json` et `report.md`, réécrits ap
 chaque cas et à la fermeture. Le JSON versionné contient révision Git, versions
 SDK exigées et vérifiées, dates, sélection, résultats et durées. Chaque ligne
 indique endpoint × option × modèle × mode, statut, `executed` et détail.
+Le champ additionnel `server_diagnostics` contient, pour chaque mode lancé,
+`command` (liste d'arguments expurgée), `ready` (health et accès authentifié
+confirmés), `returncode` (après nettoyage, donc éventuellement le signal TERM
+envoyé par le harnais) et `log_tail` (stdout/stderr fusionnés, au plus 40 lignes
+issues des derniers 8 Kio). Il est rempli avant suppression du journal, même
+après sortie précoce, timeout, erreur de lancement ou interruption, puis rendu
+aussi dans le Markdown.
 
 - **OK** : assertions exécutées et satisfaites.
 - **ÉCHEC** : assertion, SDK, transport, timeout, configuration ou processus en
@@ -226,14 +277,17 @@ indique endpoint × option × modèle × mode, statut, `executed` et détail.
 
 Sortie 0 si aucun échec, 1 si au moins un échec/interruption, 2 pour une CLI
 invalide. Un résultat vert avec des lignes non supportées ne signifie pas une
-compatibilité complète. Les rapports ne contiennent ni chemins des poids, ni clé
-API, ni texte généré. Le journal serveur temporaire, utilisé pour vérifier les
-modes, est supprimé à la fermeture. Ne pas publier de diagnostics locaux bruts.
+compatibilité complète. Les résultats des cas n'enregistrent pas le texte généré.
+Les diagnostics masquent la clé de test, les chemins configurés et les chemins
+absolus des caches locaux découverts par le sélecteur. Le journal serveur
+temporaire est supprimé à la fermeture ; seule sa fin expurgée persiste dans les
+rapports locaux. Ne pas publier de diagnostics locaux bruts.
 
 ## Validation sans inférence et CI légère
 
 ```sh
 python -I tools/e2e/test_contracts.py
+python -I tools/e2e/test_sdk.py
 python -I tools/e2e/run.py --target qwen38 --suite smoke --list
 ```
 
@@ -241,9 +295,14 @@ Les tests stdlib injectent des réponses en mémoire, y compris des flux tronqu�
 des usages faux, des erreurs de type, des arguments outils invalides et des
 événements désordonnés. Ils vérifient aussi le classement des résultats, la
 suppression des flags hérités, l'arrêt forcé et la détection d'un repli de mode.
+Ils couvrent les options de chaque profil auxiliaire et la conservation des
+diagnostics de sortie précoce, timeout et échec de création du processus.
 Si les SDK sont installés, leurs classes officielles décodent les fixtures et
-leurs clients sont construits/fermés sans réseau. Sinon ce seul contrôle SDK est
-signalé comme ignoré. Ces tests sont utilisables dans une CI CPU sans installer
+leurs clients sont construits/fermés sans réseau. `test_sdk.py` lie les paramètres
+aux signatures des méthodes installées et utilise le transport en mémoire
+`httpx2.MockTransport`, déjà fourni par les dépendances de ces SDK, pour vérifier
+le JSON Anthropic émis et son itérateur SSE. Sinon les contrôles SDK sont
+signalés comme ignorés. Ces tests sont utilisables dans une CI CPU sans installer
 de dépendance ; ils ne constituent pas une preuve de conformité du serveur.
 
 `--suite smoke` sélectionne les mêmes objets de cas que la matrice complète :

@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import contracts as c
-from launcher import configuration, server, stop, verify_mode
+from launcher import configuration, diagnostic_text, log_tail, server, stop, verify_mode
 from matrix import CHAT, MESSAGES, Case, Matrix
 from run import FAIL, OK, UNSUPPORTED, execute_case, write_report
 from transport import Clients
@@ -273,6 +273,73 @@ class Runner(unittest.TestCase):
         kill.assert_called_once()
         process.wait.assert_called_once()
         self.assertFalse(log.exists())
+
+    def test_auxiliary_profiles_use_exact_cli_flags_without_dummy_llm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            env = {name: temporary for name in (
+                "E2E_E5_MODEL", "E2E_WHISPER_MODEL", "E2E_QWEN3_TTS_MODEL")}
+            for target, flags in (("e5", ["--embed-model"]), ("whisper", ["--stt-model"]),
+                                  ("qwen3_tts", ["--tts-model"]),
+                                  ("audio", ["--tts-model", "--stt-model"])):
+                with self.subTest(target=target), patch.dict(os.environ, env):
+                    _, _, args, _, _ = configuration(target, "ar")
+                    self.assertEqual(args[::2], flags)
+                    self.assertEqual(args[1::2], [str(Path(temporary).resolve())] * len(flags))
+
+    def test_startup_diagnostics_survive_cleanup_and_reach_both_reports(self):
+        for failure in ("exit", "timeout", "spawn"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as output:
+                diagnostic = {"mode": "ar"}
+                process = Mock(pid=123, poll=Mock(return_value=7 if failure == "exit" else None))
+                def launch(command, **kwargs):
+                    self.assertIs(kwargs["stdout"], kwargs["stderr"])
+                    kwargs["stdout"].write(("stdout marker\nstderr marker\nkey=" +
+                        command[command.index("--api-key") + 1] +
+                        "\nmodel=/private/weights/model\n" +
+                        "cached=/Users/another/cache/model\n").encode())
+                    if failure == "spawn":
+                        raise OSError("synthetic spawn failure")
+                    return process
+                opener = Mock()
+                opener.open.side_effect = OSError("not ready")
+                reservation = Mock()
+                reservation.getsockname.return_value = ("127.0.0.1", 12345)
+                with patch("launcher.subprocess.Popen", side_effect=launch), \
+                     patch("launcher.socket.socket") as sock, \
+                     patch("launcher.urllib.request.build_opener", return_value=opener), \
+                     patch("launcher.time.monotonic", side_effect=[0, 2]), \
+                     patch("launcher.stop") as stopped:
+                    sock.return_value.__enter__.return_value = reservation
+                    with self.assertRaises((AssertionError, OSError)):
+                        with server(Path("unused"), ["--embed-model", "/private/weights/model"],
+                                    {}, 1, diagnostic, ["/private/weights/model"]):
+                            self.fail("failed server must not be yielded")
+                self.assertEqual(stopped.call_count, int(failure != "spawn"))
+                self.assertFalse(diagnostic["ready"])
+                self.assertEqual(diagnostic["returncode"], 7 if failure == "exit" else None)
+                self.assertIn("stdout marker", diagnostic["log_tail"])
+                self.assertIn("stderr marker", diagnostic["log_tail"])
+                self.assertNotIn("e2e-", diagnostic["log_tail"])
+                self.assertNotIn("/private/", json.dumps(diagnostic))
+                self.assertNotIn("/Users/", json.dumps(diagnostic))
+                report = {"revision": "test", "suite": "full", "results": [],
+                          "server_diagnostics": [diagnostic]}
+                write_report(Path(output), report)
+                for name in ("report.json", "report.md"):
+                    saved = (Path(output) / name).read_text()
+                    self.assertIn("stderr marker", saved)
+                    self.assertNotIn("/private/", saved)
+
+    def test_log_tail_is_bounded_and_redacts_discovered_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "log"
+            path.write_text("old line\n" * 2000 + "last line\n")
+            tail = log_tail(path)
+            self.assertLessEqual(len(tail.splitlines()), 40)
+            self.assertLessEqual(len(tail.encode()), 8192)
+            self.assertTrue(tail.endswith("last line"))
+        self.assertEqual(diagnostic_text('path="/Users/person/model with spaces"', []),
+                         "path=<local>")
 
     def test_mode_cannot_silently_fall_back(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -181,7 +181,8 @@ def openai_stream(chunks, model, budget, include_usage=False, tools=False):
         stamp = number(chunk, "created")
         if identifier is None:
             identifier, created = cid, stamp
-        require(cid == identifier and stamp == created, "id/created instable dans le flux")
+        require(cid == identifier, "id instable dans le flux")
+        require(stamp == created, "created instable dans le flux")
         require(text(chunk, "object") == "chat.completion.chunk", "chunk.object")
         require(text(chunk, "model") == model, "chunk.model")
         choices = field(chunk, "choices", list)

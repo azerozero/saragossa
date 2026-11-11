@@ -66,6 +66,14 @@ def markdown(report):
         values += ["oui" if row["executed"] else "non", row["detail"]]
         lines.append("| " + " | ".join(str(value).replace("|", "\\|").replace("\n", " ") for value in values) + " |")
     lines += ["", ", ".join(f"{key}: {value}" for key, value in report["counts"].items()), ""]
+    for diagnostic in report.get("server_diagnostics", []):
+        lines += [f"## Diagnostic serveur — {diagnostic['mode']}", "",
+                  f"Prêt : {diagnostic.get('ready', False)}. Code de sortie après arrêt : "
+                  f"{diagnostic.get('returncode')}. Commande (arguments JSON) :", "",
+                  "    " + json.dumps(diagnostic.get("command", []), ensure_ascii=False), "",
+                  "Dernières lignes stdout/stderr (40 lignes, 8 Kio maximum, chemins masqués) :", ""]
+        lines += ["    " + line for line in diagnostic.get("log_tail", "").splitlines()] or ["    (journal vide)"]
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -122,7 +130,7 @@ def main(argv=None):
     report = {"schema_version": 1, "revision": revision(), "suite": args.suite,
               "sdk_versions_required": VERSIONS, "sdk_versions_verified": False,
               "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "results": []}
+              "results": [], "server_diagnostics": []}
     signal.signal(signal.SIGTERM, interrupted)
     secrets = [str(Path.home()), str(Path.cwd()), str(args.binary.resolve())]
     secrets.extend(str(Path(value).expanduser().resolve()) for key, value in os.environ.items()
@@ -145,7 +153,10 @@ def main(argv=None):
             try:
                 family, flint, server_args, env, paths = configuration(args.target, mode)
                 secrets.extend(str(path) for path in paths.values())
-                with server(args.binary.resolve(), server_args, env, args.startup_timeout) as (base, key, log, process):
+                diagnostics = {"mode": mode}
+                report["server_diagnostics"].append(diagnostics)
+                with server(args.binary.resolve(), server_args, env, args.startup_timeout,
+                            diagnostics, secrets) as (base, key, log, process):
                     secrets.append(key)
                     clients = Clients(base, key, args.request_timeout)
                     report["sdk_versions_verified"] = True

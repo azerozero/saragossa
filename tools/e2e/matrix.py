@@ -28,6 +28,14 @@ TOOL_PROMPT = "Call get_weather for Paris. Use the tool before answering; do not
 AUDIO_TEXT = "Bonjour, le petit chat regarde par la fenêtre."
 
 
+def sdk_body(body, anthropic=False):
+    """Keep the wire payload intact despite Anthropic 2.8's narrower signature."""
+    kwargs = dict(body)
+    if anthropic and "temperature" in kwargs:
+        kwargs["extra_body"] = dict(kwargs.get("extra_body", {}), temperature=kwargs.pop("temperature"))
+    return kwargs
+
+
 @dataclass
 class Case:
     endpoint: str
@@ -54,7 +62,7 @@ class Matrix:
 
     def complete(self, body, anthropic=False, tools=False, allow_empty=False):
         resource = self.clients.anthropic.messages if anthropic else self.clients.openai.chat.completions
-        value = decoded(resource.with_raw_response.create(**body))
+        value = decoded(resource.with_raw_response.create(**sdk_body(body, anthropic)))
         check = c.anthropic if anthropic else c.chat
         check(value, self.model, body["max_tokens"], tools, allow_empty)
         return value
@@ -131,7 +139,7 @@ class Matrix:
             kwargs["include_usage"] = include_usage
         check(wire, self.model, BUDGET, **kwargs)
         resource = self.clients.anthropic.messages if anthropic else self.clients.openai.chat.completions
-        stream = resource.create(**body, stream=True)
+        stream = resource.create(**sdk_body(body, anthropic), stream=True)
         try:
             events = [event.model_dump(exclude_unset=True) for event in stream]
         finally:
@@ -272,7 +280,7 @@ class Matrix:
         body = self.chat_body()
         body["model"] = "e2e-unknown-model"
         resource = self.clients.anthropic.messages if anthropic else self.clients.openai.chat.completions
-        rejected(lambda: resource.create(**body), 404, anthropic, "modèle inconnu")
+        rejected(lambda: resource.create(**sdk_body(body, anthropic)), 404, anthropic, "modèle inconnu")
 
     def unloaded(self, endpoint):
         if endpoint == EMBED:

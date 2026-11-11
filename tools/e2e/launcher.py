@@ -83,8 +83,27 @@ def stop(process):
             process.wait(timeout=10)
 
 
+def log_tail(path, max_bytes=8192, max_lines=40):
+    """Read a bounded tail even when inference has produced a large log."""
+    with path.open("rb") as source:
+        size = source.seek(0, os.SEEK_END)
+        source.seek(max(0, size - max_bytes))
+        tail = source.read(max_bytes)
+    if size > max_bytes:
+        tail = tail.partition(b"\n")[2]
+    return "\n".join(tail.decode("utf-8", errors="replace").splitlines()[-max_lines:])
+
+
+def diagnostic_text(text, secrets):
+    for secret in sorted((str(value) for value in secrets if value), key=len, reverse=True):
+        text = text.replace(secret, "<local>")
+    # The picker can list other cached models, absent from E2E_* variables.
+    text = re.sub(r'''(["'])(/(?:Users|home|private|tmp|var|Volumes|opt)/.*?)\1''', "<local>", text)
+    return re.sub(r"/(?:Users|home|private|tmp|var|Volumes|opt)/[^\s\"']+", "<local>", text)
+
+
 @contextmanager
-def server(binary, args, env, startup_timeout):
+def server(binary, args, env, startup_timeout, diagnostics=None, secrets=()):
     # Unique socket + stdin=DEVNULL avoid the interactive model picker.
     with tempfile.TemporaryDirectory(prefix="saragossa-e2e-") as temporary:
         log_path = Path(temporary) / "serve.log"
@@ -96,14 +115,20 @@ def server(binary, args, env, startup_timeout):
         command = [str(binary), "serve", "--host", "127.0.0.1", "--port", str(port),
                    "--socket", str(Path(temporary) / "serve.sock"), "--api-key", key,
                    "--max-tokens-cap", "1024", *args]
+        private = [*secrets, key, temporary, str(binary)]
+        if diagnostics is not None:
+            diagnostics.update(command=[diagnostic_text(arg, private) for arg in command],
+                               ready=False, returncode=None, log_tail="")
         with log_path.open("wb") as log:
-            process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
-                                       stdout=log, stderr=log, start_new_session=True)
+            process = None
             try:
+                process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                                           stdout=log, stderr=log, start_new_session=True)
                 deadline = time.monotonic() + startup_timeout
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                 while True:
-                    require(process.poll() is None, "serve arrêté avant /health")
+                    code = process.poll()
+                    require(code is None, f"serve arrêté avant /health (code {code})")
                     try:
                         with opener.open(base + "/health", timeout=1) as response:
                             ready = response.status == 200 and json.load(response) == {"status": "ok"}
@@ -113,6 +138,8 @@ def server(binary, args, env, startup_timeout):
                         with opener.open(request, timeout=1) as response:
                             ready = ready and response.status == 200
                         if ready:
+                            if diagnostics is not None:
+                                diagnostics["ready"] = True
                             break
                     except (OSError, urllib.error.URLError, ValueError):
                         pass
@@ -120,7 +147,14 @@ def server(binary, args, env, startup_timeout):
                     time.sleep(0.1)
                 yield base, key, log_path, process
             finally:
-                stop(process)
+                try:
+                    if process is not None:
+                        stop(process)
+                finally:
+                    if diagnostics is not None:
+                        log.flush()
+                        diagnostics.update(returncode=process.poll() if process is not None else None,
+                                           log_tail=diagnostic_text(log_tail(log_path), private))
 
 
 def verify_mode(mode, log_path, model):
