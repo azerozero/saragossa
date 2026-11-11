@@ -177,5 +177,14 @@ celui du chemin serve passent. Les oracles ignorés restent volontairement
 stricts et échouent sur les écarts de parité décrits ci-dessus.
 La suite `cargo test --lib` a aussi signalé un échec du test existant
 `metal_backend::sparse::tests::missing_or_late_proof_never_recycles`, hors des
-fichiers modifiés. Son rejeu isolé passe (1/1) ; l'échec collectif ne doit pas
-être présenté comme une validation complète de la suite.
+fichiers modifiés. Son rejeu isolé passe (1/1) ; le passage debug n'est donc
+pas validé.
+Ce passage debug a été interrompu après près d'une heure d'exécution des
+tests : les trois oracles CPU d'attention sink préexistants calculaient
+encore leurs références. Les comparaisons des nouvelles fixtures étaient
+toutes terminées.
+
+La suite complète `cargo test --release --lib`, exécutée ensuite sans
+changement de test ni de seuil, passe : **759 réussis, 184 ignorés, 0 échec**.
+Les 184 tests ignorés incluent les oracles réels lancés séparément ci-dessus.
+Les trois oracles d'attention sink et le test sparse passent dans ce profil.
