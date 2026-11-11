@@ -153,7 +153,7 @@ impl DecoderLayer {
     /// avant résiduel, puis double norme pre/post feed-forward) — sélectionné par
     /// la présence de `pre_feedforward_norm`. Le câblage standard reste identique
     /// (byte-identique pour les modèles non-Gemma).
-    fn combine_attention_and_mlp(
+    pub(super) fn combine_attention_and_mlp(
         &self,
         config: &CausalDecoderConfig,
         x: &Tensor,

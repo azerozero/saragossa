@@ -123,6 +123,30 @@ pub(super) fn rows_from<'a>(
 }
 
 impl KvRows {
+    /// Copie les seules lignes vivantes, sans retenir la réserve de decode ni
+    /// le reste d'un buffer partagé. Le bf16 reste en bf16, sans réarrondi.
+    pub(super) fn compact_snapshot(&self) -> Self {
+        let segments = self
+            .segments
+            .iter()
+            .map(|segment| {
+                Arc::new(match segment.as_ref() {
+                    Segment::Owned(data) => Segment::Owned(data.to_vec()),
+                    Segment::OwnedBf16(data) => Segment::OwnedBf16(data.to_vec()),
+                    #[cfg(all(target_os = "macos", feature = "metal"))]
+                    Segment::Shared(rows) => Segment::Owned(rows.as_slice().to_vec()),
+                    #[cfg(all(target_os = "macos", feature = "metal"))]
+                    Segment::SharedBf16(rows) => Segment::OwnedBf16(rows.as_slice().to_vec()),
+                })
+            })
+            .collect();
+        Self {
+            segments,
+            len: self.len,
+            base: self.base,
+        }
+    }
+
     /// Nombre de f32 logiques, `base` compris.
     pub(super) fn len(&self) -> usize {
         self.len
@@ -285,7 +309,6 @@ impl KvRows {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn to_vec(&self) -> Vec<f32> {
         self.f32_segments()
             .iter()
@@ -305,6 +328,36 @@ impl KvRows {
 #[cfg(test)]
 mod tests {
     use super::{rows_from, KvRows};
+
+    #[test]
+    fn compact_snapshot_preserves_mixed_rows_and_base_without_reserve() {
+        let mut rows = KvRows::default();
+        assert!(rows.set_base(4));
+        let mut bf16 = Vec::with_capacity(64);
+        bf16.extend_from_slice(&[0x3f80, 0x8000]);
+        rows.push_owned_bf16(bf16);
+        rows.extend_from_slice(&[1.000_001, -0.0, 3.0]);
+        rows.truncate(8);
+        let snapshot = rows.compact_snapshot();
+        assert_eq!(snapshot.base(), 4);
+        assert_eq!(snapshot.len(), 8);
+        let bits = |rows: &KvRows| {
+            rows.to_vec()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&snapshot), bits(&rows));
+        assert_eq!(
+            snapshot.capacity_bytes_unseen(&mut std::collections::HashSet::new()),
+            2 * size_of::<u16>() + 2 * size_of::<f32>()
+        );
+        let mut replay = snapshot.clone();
+        replay.extend_from_slice(&[9.0]);
+        rows.extend_from_slice(&[10.0]);
+        assert_eq!(snapshot.to_vec(), vec![1.0, -0.0, 1.000_001, -0.0]);
+        assert!(replay.shares_segments_with(&snapshot));
+    }
 
     #[test]
     fn snapshot_shares_prefix_and_truncate_copies_only_split_segment() {
