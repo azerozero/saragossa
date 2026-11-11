@@ -9,6 +9,7 @@
 //! arrondi : les lecteurs f32 (attention CPU de repli) l'élargissent à la
 //! volée et voient les valeurs arrondies, pas le f32 d'origine.
 
+use super::state_snapshot::BlobDtype;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -148,16 +149,18 @@ impl KvRows {
     }
 
     /// Vues des seuls octets vivants ; préserver le dtype évite un second arrondi.
-    pub(super) fn snapshot_segments(&self) -> Vec<(&'static str, &[u8])> {
+    pub(super) fn snapshot_segments(&self) -> Vec<(BlobDtype, &[u8])> {
         self.segments
             .iter()
             .map(|segment| match segment.as_ref() {
-                Segment::Owned(data) => ("f32", bytemuck::cast_slice(data)),
-                Segment::OwnedBf16(data) => ("bf16", bytemuck::cast_slice(data)),
+                Segment::Owned(data) => (BlobDtype::F32, bytemuck::cast_slice(data)),
+                Segment::OwnedBf16(data) => (BlobDtype::Bf16, bytemuck::cast_slice(data)),
                 #[cfg(all(target_os = "macos", feature = "metal"))]
-                Segment::Shared(rows) => ("f32", bytemuck::cast_slice(rows.as_slice())),
+                Segment::Shared(rows) => (BlobDtype::F32, bytemuck::cast_slice(rows.as_slice())),
                 #[cfg(all(target_os = "macos", feature = "metal"))]
-                Segment::SharedBf16(rows) => ("bf16", bytemuck::cast_slice(rows.as_slice())),
+                Segment::SharedBf16(rows) => {
+                    (BlobDtype::Bf16, bytemuck::cast_slice(rows.as_slice()))
+                }
             })
             .collect()
     }

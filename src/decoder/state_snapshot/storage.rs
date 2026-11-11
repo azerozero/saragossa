@@ -1,4 +1,5 @@
 //! Publication du manifeste en dernier : un lecteur ne voit jamais un état partiel.
+use super::BlobDtype;
 use crate::{InferError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,32 +23,34 @@ pub(super) fn digest(data: &[u8]) -> String {
 pub(super) fn hash_file(path: &Path) -> Result<String> {
     let mut file = io(path, File::open(path))?;
     let mut hash = Sha256::new();
-    let mut buffer = vec![0; 1024 * 1024];
-    loop {
-        let count = io(path, file.read(&mut buffer))?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
+    io(path, std::io::copy(&mut file, &mut hash))?;
     Ok(format!("{:x}", hash.finalize()))
+}
+
+pub(super) fn binary_sha256() -> Result<&'static str> {
+    static HASH: std::sync::OnceLock<std::result::Result<String, String>> =
+        std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        let hash = || {
+            let exe = io(Path::new("current_exe"), std::env::current_exe())?;
+            hash_file(&exe)
+        };
+        hash().map_err(|error| error.to_string())
+    })
+    .as_deref()
+    .map_err(invalid)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Blob {
     pub(super) file: PathBuf,
-    pub(super) dtype: String,
+    pub(super) dtype: BlobDtype,
     pub(super) bytes: usize,
     sha256: String,
 }
 impl Blob {
-    pub(super) fn validate(&self, dtype: &str, elements: usize) -> Result<()> {
-        let width = match dtype {
-            "f32" => 4,
-            "bf16" => 2,
-            _ => return Err(invalid("dtype inconnu")),
-        };
-        if self.dtype != dtype || elements.checked_mul(width) != Some(self.bytes) {
+    pub(super) fn validate(&self, dtype: BlobDtype, elements: usize) -> Result<()> {
+        if self.dtype != dtype || elements.checked_mul(dtype.width()) != Some(self.bytes) {
             return Err(invalid(
                 "taille ou dtype de blob différent des dimensions attendues",
             ));
@@ -93,29 +96,23 @@ impl Blob {
         Ok(bytes)
     }
     pub(super) fn f32(&self, root: &Path) -> Result<Vec<f32>> {
-        if self.dtype != "f32" {
+        if self.dtype != BlobDtype::F32 {
             return Err(invalid("tenseur f32 attendu"));
         }
         f32_values(&self.read(root)?)
     }
 }
 pub(super) fn f32_values(bytes: &[u8]) -> Result<Vec<f32>> {
-    if bytes.len() % 4 != 0 {
+    if bytes.len() % BlobDtype::F32.width() != 0 {
         return Err(invalid("taille f32 invalide"));
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|v| f32::from_ne_bytes([v[0], v[1], v[2], v[3]]))
-        .collect())
+    Ok(bytemuck::pod_collect_to_vec(bytes))
 }
 pub(super) fn bf16_values(bytes: &[u8]) -> Result<Vec<u16>> {
-    if bytes.len() % 2 != 0 {
+    if bytes.len() % BlobDtype::Bf16.width() != 0 {
         return Err(invalid("taille bf16 invalide"));
     }
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|v| u16::from_ne_bytes([v[0], v[1]]))
-        .collect())
+    Ok(bytemuck::pod_collect_to_vec(bytes))
 }
 
 pub(super) struct Writer {
@@ -146,7 +143,7 @@ impl Writer {
             published: false,
         })
     }
-    pub(super) fn blob(&mut self, dtype: &str, bytes: &[u8]) -> Result<Blob> {
+    pub(super) fn blob(&mut self, dtype: BlobDtype, bytes: &[u8]) -> Result<Blob> {
         let relative = PathBuf::from(&self.generation).join(format!("{}.bin", self.next));
         self.next += 1;
         let path = self.root.join(&relative);
@@ -160,13 +157,13 @@ impl Writer {
         io(&path, fs::rename(&temp, &path))?;
         Ok(Blob {
             file: relative,
-            dtype: dtype.into(),
+            dtype,
             bytes: bytes.len(),
             sha256: digest(bytes),
         })
     }
     pub(super) fn f32(&mut self, values: &[f32]) -> Result<Blob> {
-        self.blob("f32", bytemuck::cast_slice(values))
+        self.blob(BlobDtype::F32, bytemuck::cast_slice(values))
     }
     pub(super) fn publish(&mut self, manifest: &impl Serialize) -> Result<()> {
         let path = self.root.join(format!("{}.json.tmp", self.generation));

@@ -75,6 +75,7 @@ fn claim_legacy_warning(legacy: &str) -> bool {
 /// le point de passage unique pour que le contrat public du crate cesse de
 /// dépendre du nom de son consommateur (cf. ADR 0011, dette « namespace »).
 pub fn env_var(name: &str) -> Option<String> {
+    environment_sha256();
     if let Ok(value) = std::env::var(name) {
         record_snapshot_ablation(name, &value);
         return Some(value);
@@ -90,32 +91,29 @@ pub fn env_var(name: &str) -> Option<String> {
 // Mémoriser dès la lecture du flag, même sans demande d'instantané en cours.
 static SNAPSHOT_ABLATION: OnceLock<&'static str> = OnceLock::new();
 
+/// Les trois premiers flags agissent par présence, les suivants par booléen.
+pub(crate) const SNAPSHOT_ABLATION_FLAGS: [&str; 5] = [
+    "SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM",
+    "SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED",
+    "SARAGOSSA_RUST_VERIFY_SKIP",
+    "SARAGOSSA_RUST_KV_BF16_SIM_KONLY",
+    "SARAGOSSA_RUST_KV_BF16_SIM_VONLY",
+];
+
 fn record_snapshot_ablation(name: &str, value: &str) {
-    let flag = match name {
-        "SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM" | "RETI_RUST_MOE_COOP_SKIP_GEMM" => {
-            "SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM"
+    if let Some(index) = SNAPSHOT_ABLATION_FLAGS
+        .iter()
+        .position(|&flag| flag == name)
+    {
+        if index < 3 || env_flag_value(value) == Some(true) {
+            let _ = SNAPSHOT_ABLATION.set(SNAPSHOT_ABLATION_FLAGS[index]);
         }
-        "SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED" | "RETI_RUST_MOE_COOP_SKIP_SHARED" => {
-            "SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED"
-        }
-        "SARAGOSSA_RUST_VERIFY_SKIP" | "RETI_RUST_VERIFY_SKIP" => "SARAGOSSA_RUST_VERIFY_SKIP",
-        "SARAGOSSA_RUST_KV_BF16_SIM_KONLY" | "RETI_RUST_KV_BF16_SIM_KONLY"
-            if env_flag_value(value) == Some(true) =>
-        {
-            "SARAGOSSA_RUST_KV_BF16_SIM_KONLY"
-        }
-        "SARAGOSSA_RUST_KV_BF16_SIM_VONLY" | "RETI_RUST_KV_BF16_SIM_VONLY"
-            if env_flag_value(value) == Some(true) =>
-        {
-            "SARAGOSSA_RUST_KV_BF16_SIM_VONLY"
-        }
-        _ => return,
-    };
-    let _ = SNAPSHOT_ABLATION.set(flag);
+    }
 }
 
 /// Variante `OsString` de [`env_var`], pour les flags qui portent un chemin.
 pub fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
+    environment_sha256();
     if let Some(value) = std::env::var_os(name) {
         record_snapshot_ablation(name, value.to_str().unwrap_or_default());
         return Some(value);
@@ -898,7 +896,7 @@ pub(crate) fn verify_skip(part: &str) -> bool {
     VERIFY_SKIP_SCOPE.with(std::cell::Cell::get)
         && PARTS
             .get_or_init(|| {
-                let parts: Vec<String> = env_var("SARAGOSSA_RUST_VERIFY_SKIP")
+                let parts: Vec<String> = env_var(SNAPSHOT_ABLATION_FLAGS[2])
                     .map(|list| {
                         list.split(',')
                             .map(|item| item.trim().to_string())
@@ -1333,18 +1331,6 @@ pub(crate) fn qwen_kv_nax_x3_enabled() -> bool {
 pub(crate) fn flint_window_kv_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_WINDOW_KV", true))
-}
-
-/// K/V full-attention en buffers « placement sparse » Metal 4
-/// (`SARAGOSSA_RUST_KV_SPARSE=1`, opt-in) : un buffer privé virtuel au
-/// contexte maximal dont seules les tuiles écrites occupent de la RAM
-/// (`metal_backend::sparse`). Exige `supportsPlacementSparse` (macOS 26.4) ;
-/// sans lui, le chemin partagé actuel reste utilisé. Déclaré pour A2 : aucun
-/// chemin ne le lit encore.
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub(crate) fn kv_sparse_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_SPARSE", false))
 }
 
 /// Suffixe minimal (tokens) pour prolonger un préfixe en cache par le prefill
@@ -2119,17 +2105,19 @@ pub(super) fn print_layer_profile(
 /// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_KONLY=1`, défaut OFF. À utiliser avec
 /// `SARAGOSSA_RUST_KV_BF16=0` (buffers f32). N'arrondit que le seed, pas les lignes
 /// appendées en decode (négligeables devant le prompt).
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn kv_bf16_sim_konly() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_BF16_SIM_KONLY", false))
+    *ENABLED.get_or_init(|| env_flag(SNAPSHOT_ABLATION_FLAGS[3], false))
 }
 
 /// Diagnostic C1B (hors prod) : arrondit **seulement V** au seed prefill (K reste
 /// f32 exact), pour isoler l'effet de la précision des valeurs (→ sortie) sur la
 /// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_VONLY=1`, défaut OFF.
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn kv_bf16_sim_vonly() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_BF16_SIM_VONLY", false))
+    *ENABLED.get_or_init(|| env_flag(SNAPSHOT_ABLATION_FLAGS[4], false))
 }
 
 /// Refus conservateur des diagnostics qui retirent un calcul ou altèrent le seed.
@@ -2137,40 +2125,12 @@ pub(crate) fn kv_bf16_sim_vonly() -> bool {
 /// exactement comme dans moe_na. VERIFY_SKIP est refusé même hors de sa portée
 /// de bench, pour ne jamais mêler cette expérience à un instantané complet.
 pub(crate) fn state_snapshot_ablation() -> Option<&'static str> {
-    if let Some(flag) = SNAPSHOT_ABLATION.get() {
-        return Some(flag);
-    }
-    for flag in [
-        "SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM",
-        "SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED",
-        "SARAGOSSA_RUST_VERIFY_SKIP",
-    ] {
-        if env_var(flag).is_some() {
-            return Some(flag);
+    if SNAPSHOT_ABLATION.get().is_none() {
+        for flag in SNAPSHOT_ABLATION_FLAGS {
+            env_var(flag);
         }
     }
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-    if [
-        "moe_full",
-        "moe_linear",
-        "linear_attn",
-        "full_layer",
-        "head",
-    ]
-    .iter()
-    .any(|part| verify_skip(part))
-    {
-        return Some("SARAGOSSA_RUST_VERIFY_SKIP");
-    }
-    // Ces accesseurs sont aussi ceux du calcul : retirer une variable après
-    // résolution du OnceLock ne doit pas faire disparaître le refus.
-    if kv_bf16_sim_konly() {
-        return Some("SARAGOSSA_RUST_KV_BF16_SIM_KONLY");
-    }
-    if kv_bf16_sim_vonly() {
-        return Some("SARAGOSSA_RUST_KV_BF16_SIM_VONLY");
-    }
-    None
+    SNAPSHOT_ABLATION.get().copied()
 }
 
 thread_local! {
@@ -2208,6 +2168,7 @@ pub(crate) fn state_snapshot_warmup() -> bool {
 
 /// Répertoire fixé au premier accès ; l'absence ne crée même pas l'alias historique.
 pub(crate) fn state_snapshot_dir() -> Option<&'static std::path::Path> {
+    environment_sha256();
     static ROOT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     ROOT.get_or_init(|| {
         std::env::var_os("SARAGOSSA_RUST_STATE_SNAPSHOT")
@@ -2218,159 +2179,25 @@ pub(crate) fn state_snapshot_dir() -> Option<&'static std::path::Path> {
     .as_deref()
 }
 
-/// Lire les mêmes accesseurs que le calcul résout leurs OnceLock : une mutation
-/// ultérieure de l'environnement ne peut pas décrire un autre chemin numérique.
-pub(crate) fn state_snapshot_settings() -> Vec<(&'static str, String)> {
-    let mut settings = Vec::new();
-    macro_rules! record {
-        ($getter:ident) => {
-            settings.push((stringify!($getter), format!("{:?}", $getter())));
-        };
-    }
-    record!(qwen_embed_bf16_enabled);
-    record!(mtp_history_policy);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(mtp_fresh_cache_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(mtp_fresh_max_prompt_tokens);
-    record!(gpu_argmax_enabled);
-    record!(gpu_sampler_enabled);
-    record!(prefill_batched_enabled);
-    record!(prefill_chunk_size);
-    record!(prefix_cache_enabled);
-    record!(prefix_cache_capacity);
-    record!(prefix_cache_max_bytes);
-    record!(mtp_sampled_enabled);
-    record!(dflash_sampled_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(free_cpu_weights_moe_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(single_copy_weights_enabled);
-    record!(mtp_resident_hidden_enabled);
-    record!(mtp_gpu_embedding_enabled);
-    record!(mtp_overlap_stream_enabled);
-    record!(mtp_gpu_block_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(decode_resident_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(decode_resident_full_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(decode_resident_full_linear_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(decode_resident_full_qkv_concat_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(decode_resident_rope_append_kv_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(decode_pipeline_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(lightbatch_qmm2_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(lightbatch_multi_dense_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(lightbatch_moe2_enabled);
-    record!(prefill_linear_batched_enabled);
-    record!(prefill_moe_rows_enabled);
-    record!(moe_verify_rows_override);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(moe_verify_tail_level);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(moe_verify_shared_fused_max_rows);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_attn_batch_long_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_attn_batch_mid_30b_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_attn_steel_d256_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_attn_nax_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_attn_nax_sinks_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_attn_nax_window_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(verify_rows_nax_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(verify_rows_nax_greedy_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(verify_strict_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(verify_rows_nax_min_len);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(verify_rows_nax_blocks);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_attn_nax_head_major);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_attn_nax_variant);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_kv_bf16_mirror_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_kv_bf16_store_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(flint_prefill_kv_bf16_store_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(flint_small_nax_gemm_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(qwen_kv_nax_x3_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(flint_window_kv_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(kv_sparse_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefix_extend_resident_min_tokens);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_linear_nax_enabled);
-    record!(mtp_early_first_token_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(mtp_seed_gpu_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_kv_shared_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_resident_chunk_tokens);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(flint_prefill_max_tokens_override);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(flint_prefill_steel_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_resident_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_resident_gemma4_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(prefill_dense_resident_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(moe_micro_split_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(linear_micro_split_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(resident_concat_cache_enabled);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(mtp_prefill_resident_enabled);
-    record!(attention_parallel_threshold);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(qmv_fast_mode);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(gather_fast_mode);
-    record!(prefix_extend_resident_enabled);
-    record!(prefix_extend_rows);
-    record!(kv_bf16_greedy_min_tokens);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    record!(kv_quant_format);
-    record!(dflash_windowed_rows);
-    record!(dflash_drafter_base);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    {
-        settings.push((
-            "linear_attn_resident_step_enabled",
-            format!(
-                "{:?}",
-                crate::linear_attention::linear_attn_resident_step_enabled()
-            ),
-        ));
-        settings.push((
-            "resident_attention",
-            crate::decode_resident::snapshot_attention_settings(),
-        ));
-    }
-    settings
+/// Empreinte de tout l'environnement moteur au premier accès runtime.
+/// Les longueurs séparent les noms/valeurs sans ambiguïté ; le binaire couvre les défauts.
+pub(crate) fn environment_sha256() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let mut variables: Vec<_> = std::env::vars()
+            .filter(|(name, _)| name.starts_with(ENV_PREFIX) || name.starts_with(LEGACY_ENV_PREFIX))
+            .collect();
+        variables.sort_unstable();
+        let mut hash = Sha256::new();
+        for (name, value) in variables {
+            for field in [name, value] {
+                hash.update((field.len() as u64).to_le_bytes());
+                hash.update(field.as_bytes());
+            }
+        }
+        format!("{:x}", hash.finalize())
+    })
 }
 
 #[cfg(test)]

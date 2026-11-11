@@ -1,4 +1,6 @@
+use super::SnapshotMode::Ar;
 use super::*;
+use crate::runtime_flags::SNAPSHOT_ABLATION_FLAGS;
 
 fn fixture(root: &Path) -> (CausalDecoder, Option<Request>) {
     let model = CausalDecoder::from_tensors(
@@ -9,12 +11,12 @@ fn fixture(root: &Path) -> (CausalDecoder, Option<Request>) {
     let request = Request {
         root: root.to_owned(),
         key: Key {
-            version: 3,
+            version: FORMAT_VERSION,
             prompt_sha256: "test".into(),
             tokens: 2,
             sources: Vec::new(),
             binary_sha256: "build-a".into(),
-            mode: "ar".into(),
+            mode: Ar,
             config: "test".into(),
             kv_dtype: "mixed".into(),
             runtime_sha256: "test".into(),
@@ -70,7 +72,10 @@ fn roundtrip_and_reject_corruption_without_weights() -> Result<()> {
     let request = request.unwrap();
     let loaded = model.snapshot_read(&request)?;
     assert_eq!(loaded.cache.position, 2);
-    assert_eq!(loaded.cache.layers[0].keys.snapshot_segments()[0].0, "bf16");
+    assert_eq!(
+        loaded.cache.layers[0].keys.snapshot_segments()[0].0,
+        BlobDtype::Bf16
+    );
     assert_eq!(
         loaded.cache.layers[0].keys.snapshot_segments()[0].1,
         cache.layers[0].keys.snapshot_segments()[0].1
@@ -100,6 +105,20 @@ fn roundtrip_and_reject_corruption_without_weights() -> Result<()> {
     let blob = dir.path().join(&manifest.layers[0].keys.segments[0].file);
     std::fs::write(blob, [0u8; 1]).unwrap();
     assert!(model.snapshot_read(&request).is_err());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("manifest.json"))
+        .unwrap()
+        .set_len(MAX_MANIFEST_BYTES + 1)
+        .unwrap();
+    assert!(model
+        .snapshot_read(&request)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("manifeste trop grand"));
+    assert!(storage::f32_values(&[0; 3]).is_err());
+    assert!(storage::bf16_values(&[0]).is_err());
     Ok(())
 }
 
@@ -107,7 +126,7 @@ fn roundtrip_and_reject_corruption_without_weights() -> Result<()> {
 fn publication_incomplete_keeps_previous_manifest() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = Writer::new(dir.path())?;
-    let blob = writer.blob("bf16", &[0, 128, 128, 63])?;
+    let blob = writer.blob(BlobDtype::Bf16, &[0, 128, 128, 63])?;
     writer.publish(&vec![&blob])?;
     let previous = std::fs::read(dir.path().join("manifest.json")).unwrap();
     {
@@ -126,7 +145,7 @@ fn publication_incomplete_keeps_previous_manifest() -> Result<()> {
 fn identity_with_weights(mtp: bool) -> Result<()> {
     // Le flag est immuable : baseline, écriture et hit vivent dans trois
     // processus distincts, chacun recharge ses poids et ses OnceLock.
-    let phase = std::env::var("SARAGOSSA_SNAPSHOT_ORACLE_PHASE").ok();
+    let phase = std::env::var("SNAPSHOT_ORACLE_PHASE").ok();
     let Some(phase) = phase else {
         let root = tempfile::tempdir().unwrap();
         let name = if mtp {
@@ -145,8 +164,8 @@ fn identity_with_weights(mtp: bool) -> Result<()> {
                     "--ignored",
                     "--nocapture",
                 ])
-                .env("SARAGOSSA_SNAPSHOT_ORACLE_PHASE", phase)
-                .env("SARAGOSSA_SNAPSHOT_ORACLE_OUTPUT", &output_path)
+                .env("SNAPSHOT_ORACLE_PHASE", phase)
+                .env("SNAPSHOT_ORACLE_OUTPUT", &output_path)
                 .env_remove("SARAGOSSA_RUST_STATE_SNAPSHOT")
                 .env_remove("RETI_RUST_STATE_SNAPSHOT");
             if phase != "baseline" {
@@ -188,7 +207,7 @@ fn identity_with_weights(mtp: bool) -> Result<()> {
             .tokens
     };
     assert_eq!(HITS.get(), usize::from(phase == "warm"));
-    let output = std::env::var_os("SARAGOSSA_SNAPSHOT_ORACLE_OUTPUT").unwrap();
+    let output = std::env::var_os("SNAPSHOT_ORACLE_OUTPUT").unwrap();
     std::fs::write(output, serde_json::to_vec(&tokens).unwrap()).unwrap();
     Ok(())
 }
@@ -302,7 +321,7 @@ fn sources_frozen_at_load_reject_replacement_and_skip_writes() {
             std::fs::write(&path, &bytes).unwrap();
             let model =
                 CausalDecoder::from_safetensors(&path, CausalDecoderConfig::default()).unwrap();
-            let request = model.snapshot_request(&[0, 1], "ar").unwrap();
+            let request = model.snapshot_request(&[0, 1], Ar).unwrap();
             let (cache, final_state) = model.prefill_cache_state(&[0, 1]).unwrap();
             assert!(model.snapshot_load(&request).is_some());
             // Même taille et mtime : seul le remplacement inode/dev révèle B.
@@ -317,7 +336,7 @@ fn sources_frozen_at_load_reject_replacement_and_skip_writes() {
             std::fs::rename(replacement, &path).unwrap();
             #[cfg(unix)]
             {
-                assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
+                assert!(model.snapshot_request(&[0, 1], Ar).unwrap().is_none());
                 assert!(model.snapshot_load(&request).is_none());
                 let manifest = request.as_ref().unwrap().root.join("manifest.json");
                 let previous = std::fs::read(&manifest).unwrap();
@@ -326,7 +345,7 @@ fn sources_frozen_at_load_reject_replacement_and_skip_writes() {
                 let fresh =
                     CausalDecoder::from_safetensors(&path, CausalDecoderConfig::default()).unwrap();
                 assert!(fresh
-                    .snapshot_load(&fresh.snapshot_request(&[0, 1], "ar").unwrap())
+                    .snapshot_load(&fresh.snapshot_request(&[0, 1], Ar).unwrap())
                     .is_none());
                 assert_eq!(
                     model.prefill_cache_state(&[0, 1]).unwrap().1.data(),
@@ -335,7 +354,7 @@ fn sources_frozen_at_load_reject_replacement_and_skip_writes() {
             }
             // Une modification de taille est détectée sur toutes les plateformes.
             std::fs::write(&path, b"changed").unwrap();
-            assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
+            assert!(model.snapshot_request(&[0, 1], Ar).unwrap().is_none());
         },
     );
 }
@@ -353,10 +372,10 @@ fn disabled_flag_skips_sources_and_stays_frozen() {
             }));
             assert!(sources.0.is_none());
             let (model, _) = fixture(root);
-            assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
+            assert!(model.snapshot_request(&[0, 1], Ar).unwrap().is_none());
             #[cfg(feature = "devtools")]
             assert!(model
-                .snapshot_request_dflash(&[0, 1], "dflash", None)
+                .snapshot_request_dflash(&[0, 1], SnapshotMode::DflashReference, None)
                 .unwrap()
                 .is_none());
             assert!(std::fs::read_dir(root).unwrap().next().is_none());
@@ -371,27 +390,41 @@ fn snapshot_key_uses_effective_chunk_after_environment_change() {
         "snapshot_key_uses_effective_chunk_after_environment_change",
         true,
         |root| {
+            // Le premier flag capture aussi les variables inconnues et les alias.
+            std::env::set_var("SARAGOSSA_FUTURE_SETTING", "initial");
+            std::env::set_var("RETI_FUTURE_SETTING", "legacy");
+            let mut initial: Vec<_> = std::env::vars()
+                .filter(|(key, _)| key.starts_with("SARAGOSSA_") || key.starts_with("RETI_"))
+                .collect();
+            initial.sort_unstable();
+            let mut hash = Sha256::new();
+            for (key, value) in initial {
+                for field in [key, value] {
+                    hash.update((field.len() as u64).to_le_bytes());
+                    hash.update(field.as_bytes());
+                }
+            }
+            let environment = format!("{:x}", hash.finalize());
             assert_eq!(crate::runtime_flags::prefill_resident_chunk_tokens(), 4096);
+            // Aucune demande de clé avant la mutation : c'est le premier flag
+            // qui doit avoir capturé l'environnement initial entier.
+            std::env::set_var("SARAGOSSA_FUTURE_SETTING", "changed");
+            std::env::remove_var("RETI_FUTURE_SETTING");
+            std::env::set_var("SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK", "512");
             let path = root.join("weights");
             std::fs::write(&path, b"synthetic").unwrap();
             let (model, _) = fixture(root);
             let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
-            let before = model.snapshot_request(&[0, 1], "ar").unwrap().unwrap().key;
-            std::env::set_var("SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK", "512");
-            let after = model.snapshot_request(&[0, 1], "ar").unwrap().unwrap().key;
+            let before = model.snapshot_request(&[0, 1], Ar).unwrap().unwrap().key;
+            std::env::set_var("SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK", "1024");
+            let after = model.snapshot_request(&[0, 1], Ar).unwrap().unwrap().key;
             assert_eq!(before, after);
-            let mut settings = crate::runtime_flags::state_snapshot_settings();
-            let chunk = settings
-                .iter_mut()
-                .find(|(name, _)| *name == "prefill_resident_chunk_tokens")
-                .unwrap();
-            assert_eq!(chunk.1, "4096");
-            chunk.1 = "512".into();
-            settings.sort_by_key(|(name, _)| *name);
-            assert_ne!(
+            assert_eq!(
                 after.runtime_sha256,
-                storage::digest(&serde_json::to_vec(&settings).unwrap())
+                storage::digest(format!("{environment}:None").as_bytes())
             );
+            assert_eq!(crate::runtime_flags::prefill_resident_chunk_tokens(), 4096);
+            assert_eq!(environment, crate::runtime_flags::environment_sha256());
         },
     );
 }
@@ -435,7 +468,7 @@ fn split_kv_rows_with_valid_checksums_fall_back_to_prefill() {
             std::fs::write(&path, b"synthetic").unwrap();
             let (model, _) = fixture(root);
             let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
-            let request = model.snapshot_request(&[0, 1], "ar").unwrap();
+            let request = model.snapshot_request(&[0, 1], Ar).unwrap();
             let (cache, final_state) = model.prefill_cache_state(&[0, 1]).unwrap();
             for bf16 in [false, true] {
                 for keys in [true, false] {
@@ -555,7 +588,7 @@ fn content_identity_covers_shards_auxiliaries_and_sidecars() {
                     assert_eq!(metadata.dev(), after.dev());
                     // Le contrôle post-chargement refuse aussi une course à mtime restauré.
                     assert!(original.clone().finish_loading().verified().is_err());
-                    assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
+                    assert!(model.snapshot_request(&[0, 1], Ar).unwrap().is_none());
                     assert!(model.snapshot_load(&request).is_none());
                     model.snapshot_save(&request, &cache, &state, None, None);
                     assert_eq!(previous, std::fs::read(&manifest).unwrap());
@@ -587,20 +620,21 @@ fn content_identity_covers_shards_auxiliaries_and_sidecars() {
 
 #[test]
 fn diagnostic_ablations_disable_reads_writes_and_hashing() {
-    let flags = [
-        ("SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM", "0"),
-        ("SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED", ""),
-        ("RETI_RUST_MOE_COOP_SKIP_GEMM", "1"),
-        ("RETI_RUST_MOE_COOP_SKIP_SHARED", "0"),
-        ("SARAGOSSA_RUST_VERIFY_SKIP", "full_layer"),
-        ("SARAGOSSA_RUST_KV_BF16_SIM_KONLY", "1"),
-        ("SARAGOSSA_RUST_KV_BF16_SIM_VONLY", "true"),
-    ];
+    let flags: Vec<_> = SNAPSHOT_ABLATION_FLAGS
+        .iter()
+        .zip(["0", "", "full_layer", "1", "true"])
+        .flat_map(|(flag, value)| {
+            [
+                (flag.to_string(), value),
+                (flag.replacen("SARAGOSSA_", "RETI_", 1), value),
+            ]
+        })
+        .collect();
     let Some(root) = std::env::var_os("SARAGOSSA_SNAPSHOT_TEST_CHILD") else {
-        for (flag, value) in flags {
+        for (flag, value) in &flags {
             let dir = tempfile::tempdir().unwrap();
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            for (name, _) in flags {
+            for (name, _) in &flags {
                 command.env_remove(name);
             }
             let output = command.args([
@@ -640,10 +674,10 @@ fn diagnostic_ablations_disable_reads_writes_and_hashing() {
     }));
     assert!(sources.0.unwrap().is_err());
     let (model, request) = fixture(&root.join("snapshots"));
-    assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
+    assert!(model.snapshot_request(&[0, 1], Ar).unwrap().is_none());
     #[cfg(feature = "devtools")]
     assert!(model
-        .snapshot_request_dflash(&[0, 1], "dflash", None)
+        .snapshot_request_dflash(&[0, 1], SnapshotMode::DflashReference, None)
         .unwrap()
         .is_none());
     assert!(model.snapshot_load(&request).is_none());
@@ -662,16 +696,16 @@ fn late_moe_ablation_refuses_an_existing_snapshot() {
             std::fs::write(&path, b"synthetic").unwrap();
             let (model, _) = fixture(root);
             let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
-            let request = model.snapshot_request(&[0, 1], "ar").unwrap();
+            let request = model.snapshot_request(&[0, 1], Ar).unwrap();
             let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
             assert!(model.snapshot_load(&request).is_some());
             let manifest = request.as_ref().unwrap().root.join("manifest.json");
             let previous = std::fs::read(&manifest).unwrap();
-            std::env::set_var("SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM", "1");
+            std::env::set_var(SNAPSHOT_ABLATION_FLAGS[0], "1");
             assert!(model.snapshot_load(&request).is_none());
-            std::env::remove_var("SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM");
+            std::env::remove_var(SNAPSHOT_ABLATION_FLAGS[0]);
             assert!(model.snapshot_load(&request).is_none());
-            assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
+            assert!(model.snapshot_request(&[0, 1], Ar).unwrap().is_none());
             model.snapshot_save(&request, &cache, &state, None, None);
             assert_eq!(std::fs::read(&manifest).unwrap(), previous);
             // Le préfixe peuplé avant l'ablation est réutilisable en mémoire,
@@ -723,13 +757,13 @@ fn warmup_skips_snapshots_and_restores_scope_after_error() {
             let (model, _) = fixture(root);
             let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
             let prompt = vec![0; 32];
-            let request = model.snapshot_request(&prompt, "ar").unwrap();
+            let request = model.snapshot_request(&prompt, Ar).unwrap();
             let entry = &request.as_ref().unwrap().root;
             let warmup = || -> Result<()> {
                 let _outer = StateSnapshotWarmup::enter();
                 {
                     let _inner = StateSnapshotWarmup::enter();
-                    assert!(model.snapshot_request(&prompt, "ar")?.is_none());
+                    assert!(model.snapshot_request(&prompt, Ar)?.is_none());
                 }
                 assert!(state_snapshot_warmup());
                 let (cache, state) = model.prefill_cache_state(&prompt)?;
@@ -776,7 +810,7 @@ fn unwritable_snapshot_keeps_generation_without_manifest() {
                 let _warmup = crate::runtime_flags::StateSnapshotWarmup::enter();
                 generate().unwrap().tokens
             };
-            let request = model.snapshot_request(&[0, 1], "ar").unwrap().unwrap();
+            let request = model.snapshot_request(&[0, 1], Ar).unwrap().unwrap();
             std::fs::create_dir_all(&request.root).unwrap();
             let permissions = std::fs::metadata(&request.root).unwrap().permissions();
             std::fs::set_permissions(&request.root, std::fs::Permissions::from_mode(0o555))

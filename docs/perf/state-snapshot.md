@@ -14,7 +14,7 @@ journalise `state_snapshot hit ... (prefill sauté)` et restaure l'état avant l
 semis du decode résident. Le flag est figé au premier accès (OnceLock) : le
 définir avant le chargement,
 puis redémarrer le processus pour le changer. Sans flag au démarrage, le chemin
-instantané ne clone aucun chemin et n'alloue rien, même pour l'alias historique.
+instantané ne lit aucun poids ; seule l’empreinte de l’environnement est capturée.
 Une API construite depuis des tenseurs sans chemins de poids refuse ce mode
 diagnostic.
 
@@ -35,7 +35,7 @@ permet aussi de refuser une écriture concurrente qui restaure le mtime. Un
 changement refuse l'instantané avec diagnostic, garde le prefill normal et
 interdit son écriture. Les sources doivent rester immuables pendant leur
 utilisation ; sur les plateformes sans ctime Unix, la garde de course reste
-limitée aux changements de métadonnées observables. Le format passe en version 3 :
+limitée aux changements de métadonnées observables. Le format courant est identifié par `FORMAT_VERSION` :
 les anciens manifestes sont refusés puis remplacés après un prefill complet.
 
 Les diagnostics qui retirent des calculs désactivent toute lecture et écriture
@@ -46,12 +46,12 @@ d'instantané, avec le nom du flag dans le diagnostic :
 - `SARAGOSSA_RUST_VERIFY_SKIP` est refusé par présence, même hors de la portée
   du bench où il altère effectivement les calculs ;
 - `SARAGOSSA_RUST_KV_BF16_SIM_KONLY` et `SARAGOSSA_RUST_KV_BF16_SIM_VONLY`
-  sont refusés quand leur valeur effective est vraie : ils altèrent le seed KV.
+  sont refusés dès qu'une valeur vraie est observée : ils altèrent le seed KV.
 
 Les alias historiques `RETI_*` suivent les mêmes règles. Les contrôles sont
 répétés à la demande, à la lecture et à l'écriture : activer tardivement un flag
 MoE ne permet pas de réutiliser ou publier un instantané. Les simulations KV
-partagent les mêmes accesseurs OnceLock que le calcul.
+sont surveillées dès la lecture du flag, même par un accesseur OnceLock.
 Le premier diagnostic observé actif rend ce refus définitif pour le processus,
 même après retrait du flag et pour les états issus du cache de préfixe mémoire.
 
@@ -60,9 +60,11 @@ d'instantané. Une entrée absente au premier run journalise
 `state_snapshot absent mode=… tokens=…` ; les entrées invalides restent refusées.
 
 La clé inclut aussi le mode
-AR/MTP/DFlash, la configuration, le dtype KV et une empreinte des réglages effectifs
-(accesseurs OnceLock résolus et profil immuable de l'executor Metal),
-l'endianness et SHA-256 du binaire courant. Chaque blob porte aussi son
+AR/MTP/DFlash, la configuration, le dtype KV et une empreinte de toutes les
+variables `SARAGOSSA_*` et `RETI_*`, triées et capturées une seule fois au
+premier accès à un flag runtime. Le profil de l'executor Metal est ajouté
+séparément. L'endianness et le SHA-256 du binaire courant complètent la clé ;
+ce dernier est mémorisé par processus et couvre aussi les valeurs par défaut. Chaque blob porte aussi son
 SHA-256 et sa taille. Avant toute allocation de blob, la géométrie complète
 (KV, conv/SSM CPU et Metal, dernière ligne, historique MTP et captures DFlash)
 est contrôlée contre le modèle et le nombre de tokens, avec arithmétique vérifiée
@@ -102,9 +104,10 @@ Le temps de « prefill » inclut l'I/O et les checksums ; la relecture alloue de
 buffers CPU et GPU différents d'un prefill normal. Les poids restent chargés
 normalement. Le cache n'est pas un checkpoint de génération : il ne conserve
 ni sampler en cours, ni tokens déjà décodés, ni arène spéculative en cours.
-Changer une valeur runtime effective invalide volontairement la clé, même si ce
-réglage n'affecte que le decode. Modifier l'environnement après résolution d'un
-OnceLock ne change ni sa valeur active ni son empreinte. Aucun résultat
+Changer une variable moteur au démarrage invalide volontairement la clé, même
+si ce réglage n'affecte que le decode. L'empreinte conserve l'environnement du
+premier accès runtime : définir tous les réglages avant ce premier accès et
+redémarrer pour les changer. Les diagnostics tardifs restent surveillés. Aucun résultat
 d'identité avec poids n'est présumé.
 
 Le hachage ajoute une lecture complète des sources à chaque chargement, y
@@ -135,7 +138,8 @@ identiques (shards, index, config, sidecars et drafter), le hachage déterminist
 avec plusieurs nombres de threads, les courses de métadonnées, le refus des
 ablations (y compris alias, valeurs vides et `0`), le refus
 d'écriture après modification, le court-circuit sans flag, les réglages figés,
-les blobs creux surdimensionnés et le repli après des segments KV mal alignés.
+les blobs creux surdimensionnés, le repli après des segments KV mal alignés et
+la génération dans un répertoire d'instantanés non inscriptible.
 
 ```sh
 cargo test --lib decoder::state_snapshot

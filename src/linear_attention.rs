@@ -94,6 +94,25 @@ pub(crate) struct LinearAttentionConfig {
     pub rms_eps: f32,
 }
 
+/// Longueurs conv K-1/K et SSM, vérifiées avant toute allocation d'instantané.
+pub(crate) fn snapshot_geometry(
+    conv_dim: usize,
+    kernel: usize,
+    ssm_shape: (usize, usize, usize),
+) -> Result<(usize, usize, usize)> {
+    let lengths = || {
+        Some((
+            kernel.checked_sub(1)?.checked_mul(conv_dim)?,
+            kernel.checked_mul(conv_dim)?,
+            ssm_shape
+                .0
+                .checked_mul(ssm_shape.1)?
+                .checked_mul(ssm_shape.2)?,
+        ))
+    };
+    lengths().ok_or_else(|| InferError::Dimension("géométrie conv/SSM invalide".into()))
+}
+
 impl LinearAttentionConfig {
     /// Renvoie la largeur totale clé/query `H_k × d_k`.
     ///
@@ -118,7 +137,7 @@ impl LinearAttentionConfig {
     }
 
     /// Renvoie la largeur de la conv causale : `2×key_dim + value_dim` (q̃‖k̃‖ṽ).
-    fn conv_dim(self) -> Result<usize> {
+    pub(crate) fn conv_dim(self) -> Result<usize> {
         let key_dim = self.key_dim()?;
         let value_dim = self.value_dim()?;
         key_dim

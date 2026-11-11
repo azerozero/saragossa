@@ -12,6 +12,47 @@ use sources::Source;
 use std::path::{Path, PathBuf};
 use storage::{invalid, io, Blob, Writer};
 
+const FORMAT_VERSION: u32 = 4;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum SnapshotMode {
+    Ar,
+    MtpFresh,
+    MtpCommitted,
+    DflashReference,
+    Dflash(String),
+}
+
+impl std::fmt::Display for SnapshotMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ar => "ar",
+            Self::MtpFresh => "mtp-fresh",
+            Self::MtpCommitted => "mtp-committed",
+            Self::DflashReference => "dflash-reference",
+            Self::Dflash(drafter) => return write!(f, "dflash:{drafter}"),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum BlobDtype {
+    F32,
+    Bf16,
+}
+
+impl BlobDtype {
+    fn width(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::Bf16 => 2,
+        }
+    }
+}
+
 /// Contenu et métadonnées figés avant la lecture des poids, uniquement en mode diagnostic.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SnapshotSources(Option<std::result::Result<Vec<Source>, String>>);
@@ -103,7 +144,7 @@ struct Key {
     tokens: usize,
     sources: Vec<Source>,
     binary_sha256: String,
-    mode: String,
+    mode: SnapshotMode,
     config: String,
     kv_dtype: String,
     runtime_sha256: String,
@@ -148,10 +189,9 @@ impl Rows {
         rows.set_base(self.base);
         for blob in &self.segments {
             let bytes = blob.read(root)?;
-            match blob.dtype.as_str() {
-                "f32" => rows.push_owned(storage::f32_values(&bytes)?),
-                "bf16" => rows.push_owned_bf16(storage::bf16_values(&bytes)?),
-                _ => return Err(invalid("dtype KV inconnu")),
+            match blob.dtype {
+                BlobDtype::F32 => rows.push_owned(storage::f32_values(&bytes)?),
+                BlobDtype::Bf16 => rows.push_owned_bf16(storage::bf16_values(&bytes)?),
             }
             if rows.len() > self.len {
                 return Err(invalid("segments KV trop longs"));
@@ -210,7 +250,11 @@ impl Layer {
                 .metal_executor()
                 .ok_or_else(|| invalid("executor absent"))?;
             let (layout, conv, ssm) = state.disk_parts(executor)?;
-            let dtype = if layout.ssm_bf16 { "bf16" } else { "f32" };
+            let dtype = if layout.ssm_bf16 {
+                BlobDtype::Bf16
+            } else {
+                BlobDtype::F32
+            };
             Some(MetalLinear {
                 layout,
                 conv: writer.f32(&conv)?,
@@ -269,7 +313,11 @@ impl Layer {
         self.metal
             .as_ref()
             .map(|state| {
-                let expected = if state.layout.ssm_bf16 { "bf16" } else { "f32" };
+                let expected = if state.layout.ssm_bf16 {
+                    BlobDtype::Bf16
+                } else {
+                    BlobDtype::F32
+                };
                 if state.ssm.dtype != expected {
                     return Err(invalid("dtype SSM incohérent"));
                 }
@@ -308,7 +356,11 @@ impl CausalDecoder {
         self
     }
 
-    pub(super) fn snapshot_request(&self, prompt: &[usize], mode: &str) -> Result<Option<Request>> {
+    pub(super) fn snapshot_request(
+        &self,
+        prompt: &[usize],
+        mode: SnapshotMode,
+    ) -> Result<Option<Request>> {
         if crate::runtime_flags::state_snapshot_warmup() {
             return Ok(None);
         }
@@ -326,7 +378,6 @@ impl CausalDecoder {
         for &token in prompt {
             hash.update((token as u64).to_le_bytes());
         }
-        let exe = io(Path::new("current_exe"), std::env::current_exe())?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let kv_dtype = format!(
             "resident_bf16={} quant={:?} prefill_bf16={}",
@@ -336,13 +387,14 @@ impl CausalDecoder {
         );
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let kv_dtype = "f32".to_string();
-        let mut settings = crate::runtime_flags::state_snapshot_settings();
+        let environment = crate::runtime_flags::environment_sha256();
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(metal) = self.forward_runtime().metal_executor() {
-            settings.push(("kernel_profile", metal.snapshot_kernel_settings()));
-        }
-        // Permet aussi la compilation CPU, sans modification conditionnelle.
-        settings.sort_by_key(|(name, _)| *name);
+        let kernel_profile = self
+            .forward_runtime()
+            .metal_executor()
+            .map(|metal| metal.snapshot_kernel_profile());
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let kernel_profile: Option<String> = None;
         let prompt_sha256 = format!("{:x}", hash.finalize());
         // Une bascule DFlash vers MTP préremplit un autre prompt : son écriture
         // ne doit pas remplacer l'instantané du prompt initial à accélérer.
@@ -350,12 +402,12 @@ impl CausalDecoder {
         Ok(Some(Request {
             root: root.join(format!("entry-{entry}")),
             key: Key {
-                version: 3,
+                version: FORMAT_VERSION,
                 prompt_sha256,
                 tokens: prompt.len(),
                 sources: sources.to_vec(),
-                binary_sha256: storage::hash_file(&exe)?,
-                mode: mode.into(),
+                binary_sha256: storage::binary_sha256()?.to_owned(),
+                mode,
                 config: format!(
                     "{:?};metal={}",
                     self.config,
@@ -363,7 +415,7 @@ impl CausalDecoder {
                 ),
                 kv_dtype,
                 runtime_sha256: storage::digest(
-                    &serde_json::to_vec(&settings).map_err(|e| invalid(e.to_string()))?,
+                    format!("{environment}:{kernel_profile:?}").as_bytes(),
                 ),
                 little_endian: cfg!(target_endian = "little"),
             },
@@ -385,7 +437,7 @@ impl CausalDecoder {
     pub(super) fn snapshot_request_dflash(
         &self,
         prompt: &[usize],
-        mode: &str,
+        mode: SnapshotMode,
         drafter: Option<&crate::DFlashDraft>,
     ) -> Result<Option<Request>> {
         let mut request = self.snapshot_request(prompt, mode)?;
@@ -446,11 +498,11 @@ impl CausalDecoder {
         }
         let path = request.root.join("manifest.json");
         let file = io(&path, std::fs::File::open(&path))?;
-        if io(&path, file.metadata())?.len() > 16 * 1024 * 1024 {
+        if io(&path, file.metadata())?.len() > MAX_MANIFEST_BYTES {
             return Err(invalid("manifeste trop grand"));
         }
         let manifest: Manifest =
-            serde_json::from_reader(std::io::Read::take(file, 16 * 1024 * 1024 + 1))
+            serde_json::from_reader(std::io::Read::take(file, MAX_MANIFEST_BYTES + 1))
                 .map_err(|source| InferError::Json { path, source })?;
         if manifest.key.binary_sha256 != request.key.binary_sha256 {
             return Err(invalid("binaire différent (sha256), autre build refusé"));
@@ -481,10 +533,14 @@ impl CausalDecoder {
             .as_ref()
             .map(|layer| layer.read(root))
             .transpose()?;
-        if request.key.mode == "mtp-committed" && history.is_none() {
+        if request.key.mode == SnapshotMode::MtpCommitted && history.is_none() {
             return Err(invalid("historique MTP absent"));
         }
-        if request.key.mode.starts_with("dflash") && manifest.captures.is_none() {
+        if matches!(
+            request.key.mode,
+            SnapshotMode::DflashReference | SnapshotMode::Dflash(_)
+        ) && manifest.captures.is_none()
+        {
             return Err(invalid("captures DFlash absentes"));
         }
         let captures = manifest

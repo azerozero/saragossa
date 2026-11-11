@@ -21,7 +21,7 @@ impl Budget {
             .ok_or_else(|| invalid("budget cumulé trop grand"))?;
         Ok(())
     }
-    fn blob(&mut self, blob: &Blob, dtype: &str, elements: usize) -> Result<()> {
+    fn blob(&mut self, blob: &Blob, dtype: BlobDtype, elements: usize) -> Result<()> {
         blob.validate(dtype, elements)?;
         self.used = self
             .used
@@ -43,11 +43,7 @@ impl Rows {
         budget.allow(expected)?;
         let mut remaining = expected - self.base;
         for blob in &self.segments {
-            let width = match blob.dtype.as_str() {
-                "f32" => 4,
-                "bf16" => 2,
-                _ => return Err(invalid("dtype KV inconnu")),
-            };
+            let width = blob.dtype.width();
             let row_bytes = product(&[dim, width])?;
             if blob.bytes == 0 || blob.bytes % row_bytes != 0 {
                 return Err(invalid("segment KV sans lignes entières"));
@@ -56,7 +52,7 @@ impl Rows {
             remaining = remaining
                 .checked_sub(elements)
                 .ok_or_else(|| invalid("segment KV dépasse les dimensions attendues"))?;
-            budget.blob(blob, &blob.dtype, elements)?;
+            budget.blob(blob, blob.dtype, elements)?;
         }
         if remaining != 0 {
             return Err(invalid("segments KV incomplets"));
@@ -72,7 +68,7 @@ impl Dense {
         }
         let elements = product(shape)?;
         budget.allow(elements)?;
-        budget.blob(&self.data, "f32", elements)
+        budget.blob(&self.data, BlobDtype::F32, elements)
     }
 }
 
@@ -87,8 +83,8 @@ impl Layer {
         {
             return Err(invalid("état full-attention incohérent"));
         }
-        budget.blob(&self.conv, "f32", 0)?;
-        budget.blob(&self.ssm, "f32", 0)?;
+        budget.blob(&self.conv, BlobDtype::F32, 0)?;
+        budget.blob(&self.ssm, BlobDtype::F32, 0)?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if self.metal.is_some() {
             return Err(invalid("état linéaire sur full-attention"));
@@ -102,36 +98,34 @@ impl Layer {
         if self.kv_dim.is_some() {
             return Err(invalid("KV sur couche linéaire"));
         }
-        let conv_dim = product(&[config.num_key_heads, config.key_head_dim, 2])?
-            .checked_add(product(&[config.num_value_heads, config.value_head_dim])?)
-            .ok_or_else(|| invalid("dimension conv trop grande"))?;
-        let short = product(&[
-            config
-                .conv_kernel_dim
-                .checked_sub(1)
-                .ok_or_else(|| invalid("noyau conv vide"))?,
-            conv_dim,
-        ])?;
+        let conv_dim = config.conv_dim()?;
         let ssm_shape = (
             config.num_value_heads,
             config.value_head_dim,
             config.key_head_dim,
         );
-        let ssm = product(&[ssm_shape.0, ssm_shape.1, ssm_shape.2])?;
+        let (short, _full, ssm) = crate::linear_attention::snapshot_geometry(
+            conv_dim,
+            config.conv_kernel_dim,
+            ssm_shape,
+        )?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let has_gpu = if let Some(gpu) = &self.metal {
-            let full = product(&[config.conv_kernel_dim, conv_dim])?;
             if !gpu.layout.matches_config(config)
-                || (gpu.layout.conv_len != short && gpu.layout.conv_len != full)
+                || (gpu.layout.conv_len != short && gpu.layout.conv_len != _full)
             {
                 return Err(invalid("géométrie linéaire Metal différente du modèle"));
             }
-            budget.allow(full)?;
+            budget.allow(_full)?;
             budget.allow(ssm)?;
-            budget.blob(&gpu.conv, "f32", gpu.layout.conv_len)?;
+            budget.blob(&gpu.conv, BlobDtype::F32, gpu.layout.conv_len)?;
             budget.blob(
                 &gpu.ssm,
-                if gpu.layout.ssm_bf16 { "bf16" } else { "f32" },
+                if gpu.layout.ssm_bf16 {
+                    BlobDtype::Bf16
+                } else {
+                    BlobDtype::F32
+                },
                 ssm,
             )?;
             true
@@ -143,14 +137,14 @@ impl Layer {
         budget.allow(short)?;
         budget.allow(ssm)?;
         if has_gpu && self.conv.bytes == 0 && self.ssm.bytes == 0 {
-            budget.blob(&self.conv, "f32", 0)?;
-            budget.blob(&self.ssm, "f32", 0)?;
+            budget.blob(&self.conv, BlobDtype::F32, 0)?;
+            budget.blob(&self.ssm, BlobDtype::F32, 0)?;
         } else {
             if self.conv_dim != Some(conv_dim) || self.ssm_shape != Some(ssm_shape) {
                 return Err(invalid("géométrie récurrente CPU incohérente"));
             }
-            budget.blob(&self.conv, "f32", short)?;
-            budget.blob(&self.ssm, "f32", ssm)?;
+            budget.blob(&self.conv, BlobDtype::F32, short)?;
+            budget.blob(&self.ssm, BlobDtype::F32, ssm)?;
         }
         Ok(())
     }

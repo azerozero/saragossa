@@ -14,6 +14,7 @@ use super::attention_ops::{full_attention_append_kv_rows, full_attention_context
 use super::lookup::NgramLookup;
 use super::mtp::{concat_row_pair, concat_rows};
 use super::mtp_adaptive::AdaptiveDepthController;
+use super::state_snapshot::SnapshotMode;
 use super::*;
 
 fn emit_mtp_committed(
@@ -1466,7 +1467,7 @@ impl CausalDecoder {
                 (cache, final_state, Some(mtp_history), reused)
             } else {
                 let (cache, final_state, reused) = with_prefill_kv_reserve(decode_reserve, || {
-                    self.prefill_cache_state_snapshot_mode(prompt, "mtp-fresh")
+                    self.prefill_cache_state_snapshot_mode(prompt, SnapshotMode::MtpFresh)
                 })?;
                 (cache, final_state, None, reused)
             };
@@ -3240,7 +3241,8 @@ impl CausalDecoder {
         draft: &DFlashDraft,
     ) -> Result<(CausalDecoderCache, Tensor, Tensor)> {
         let layer_ids = &draft.info.target_layer_ids;
-        let snapshot = self.snapshot_request_dflash(prompt, "dflash-reference", Some(draft))?;
+        let snapshot =
+            self.snapshot_request_dflash(prompt, SnapshotMode::DflashReference, Some(draft))?;
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(captures) = state.captures {
                 if captures.layer_ids == *layer_ids && captures.from == 0 {
@@ -3901,13 +3903,13 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor, usize)> {
-        self.prefill_cache_state_snapshot_mode(prompt, "ar")
+        self.prefill_cache_state_snapshot_mode(prompt, SnapshotMode::Ar)
     }
 
     fn prefill_cache_state_snapshot_mode(
         &self,
         prompt: &[usize],
-        mode: &str,
+        mode: SnapshotMode,
     ) -> Result<(CausalDecoderCache, Tensor, usize)> {
         let snapshot = self.snapshot_request(prompt, mode)?;
         if let Some(state) = self.snapshot_load(&snapshot) {
@@ -3942,7 +3944,7 @@ impl CausalDecoder {
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
-        let snapshot = self.snapshot_request(prompt, "ar")?;
+        let snapshot = self.snapshot_request(prompt, SnapshotMode::Ar)?;
         if let Some(state) = self.snapshot_load(&snapshot) {
             return Ok((state.cache, state.final_state));
         }
@@ -3975,7 +3977,7 @@ impl CausalDecoder {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
-        let snapshot = self.snapshot_request(prompt, "mtp-committed")?;
+        let snapshot = self.snapshot_request(prompt, SnapshotMode::MtpCommitted)?;
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(history) = state.history {
                 let keep = on_final_state(&state.final_state)?;
@@ -4442,7 +4444,7 @@ impl CausalDecoder {
         let snapshot = if crate::runtime_flags::state_snapshot_dir().is_some() {
             self.snapshot_request_dflash(
                 prompt,
-                &format!("dflash:{layer_ids:?}:{keep_rows}"),
+                SnapshotMode::Dflash(format!("{layer_ids:?}:{keep_rows}")),
                 drafter,
             )?
         } else {
@@ -4471,6 +4473,10 @@ impl CausalDecoder {
         }
         let profile = crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_PROFILE", false);
         let started = Instant::now();
+        // NOTE: la lecture du cache de préfixe rend les captures mais pas son
+        // historique MTP : un prefill complet garantit une publication DFlash
+        // complète. Après un hit disque, réinsérer aussi cet historique permet
+        // les extensions de préfixe et la bascule vers MTP hors mode instantané.
         if snapshot.is_none() && prefix_cache_enabled() {
             if let Some(hit) = self.prefix_cache_get_with_captures(prompt, layer_ids, keep_rows)? {
                 if profile {
