@@ -64,6 +64,14 @@ pub fn render_qwen_chatml(
     render_qwen_chatml_with_tools(messages, &[], add_generation_prompt, enable_thinking)
 }
 
+/// Erreur de validation avant encodage d'un historique de chat.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TemplateError {
+    /// Gemma 3 exige l'alternance user/assistant après le système optionnel.
+    #[error("Conversation roles must alternate user/assistant/user/assistant/...")]
+    RoleAlternation,
+}
+
 /// Rend des messages au format chat Gemma (`<start_of_turn>…<end_of_turn>`).
 ///
 /// Suit le chat_template officiel Gemma 3 : un message `system` en tête est
@@ -73,7 +81,10 @@ pub fn render_qwen_chatml(
 /// PAS rendu ici : il vient du post-processor du tokenizer
 /// ([`crate::ModelAssets::encode_prompt_with_special`]), là où mlx_lm
 /// l'insère via `{{ bos_token }}` puis encode sans tokens spéciaux.
-pub fn render_gemma_chat(messages: &[ChatTemplateMessage], add_generation_prompt: bool) -> String {
+pub fn render_gemma_chat(
+    messages: &[ChatTemplateMessage],
+    add_generation_prompt: bool,
+) -> Result<String, TemplateError> {
     let (first_user_prefix, turns) = match messages.split_first() {
         Some((first, rest)) if first.role == "system" => {
             let prefix = format!("{}\n\n", first.content.as_deref().unwrap_or(""));
@@ -81,6 +92,12 @@ pub fn render_gemma_chat(messages: &[ChatTemplateMessage], add_generation_prompt
         }
         _ => (String::new(), messages),
     };
+    for (index, message) in turns.iter().enumerate() {
+        let expected = if index % 2 == 0 { "user" } else { "assistant" };
+        if message.role != expected {
+            return Err(TemplateError::RoleAlternation);
+        }
+    }
     let mut out = String::new();
     for (index, message) in turns.iter().enumerate() {
         let role = if message.role == "assistant" {
@@ -102,7 +119,7 @@ pub fn render_gemma_chat(messages: &[ChatTemplateMessage], add_generation_prompt
         out.push_str(GEMMA_START_OF_TURN);
         out.push_str("model\n");
     }
-    out
+    Ok(out)
 }
 
 /// Rend des messages au format chat Gemma 4.
@@ -364,7 +381,7 @@ mod tests {
     fn gemma_renders_user_turn_with_generation_prompt() {
         let messages = vec![ChatTemplateMessage::new("user", "Bonjour")];
 
-        let prompt = render_gemma_chat(&messages, true);
+        let prompt = render_gemma_chat(&messages, true).expect("valid roles");
 
         assert_eq!(
             prompt,
@@ -379,7 +396,7 @@ mod tests {
             ChatTemplateMessage::new("user", "Bonjour"),
         ];
 
-        let prompt = render_gemma_chat(&messages, true);
+        let prompt = render_gemma_chat(&messages, true).expect("valid roles");
 
         assert_eq!(
             prompt,
@@ -396,7 +413,7 @@ mod tests {
             ChatTemplateMessage::new("user", "Ça va ?"),
         ];
 
-        let prompt = render_gemma_chat(&messages, true);
+        let prompt = render_gemma_chat(&messages, true).expect("valid roles");
 
         assert_eq!(
             prompt,
@@ -411,7 +428,7 @@ mod tests {
     fn gemma_without_generation_prompt_closes_last_turn() {
         let messages = vec![ChatTemplateMessage::new("user", "Bonjour")];
 
-        let prompt = render_gemma_chat(&messages, false);
+        let prompt = render_gemma_chat(&messages, false).expect("valid roles");
 
         assert_eq!(prompt, "<start_of_turn>user\nBonjour<end_of_turn>\n");
     }
@@ -539,5 +556,28 @@ mod tests {
         let content = qwen_assistant_history_content("Réponse", false);
 
         assert_eq!(content, "<think>\n\n</think>\n\nRéponse");
+    }
+}
+
+#[cfg(test)]
+mod gemma_validation {
+    use super::*;
+    #[test]
+    fn rejects_tools_and_non_alternating_roles() {
+        for roles in [
+            &["user", "assistant", "tool"][..],
+            &["assistant"],
+            &["user", "user"],
+            &["user", "system"],
+        ] {
+            let messages: Vec<_> = roles
+                .iter()
+                .map(|role| ChatTemplateMessage::new(*role, ""))
+                .collect();
+            assert_eq!(
+                render_gemma_chat(&messages, true),
+                Err(TemplateError::RoleAlternation)
+            );
+        }
     }
 }

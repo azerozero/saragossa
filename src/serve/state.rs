@@ -1204,7 +1204,7 @@ impl LoadedModel {
             render_gemma4_chat(&messages, true, false)
         } else if self.assets.config.is_gemma() {
             check_thinking(thinking, false)?;
-            render_gemma_chat(&messages, true)
+            render_gemma_chat(&messages, true).map_err(|e| ServeError::Http(e.to_string()))?
         } else {
             check_thinking(thinking, true)?;
             saragossa::chat_template::render_qwen_chatml_profile(
