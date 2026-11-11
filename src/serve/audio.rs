@@ -28,6 +28,10 @@ use crate::RuntimeKind;
 
 /// Fréquence d'échantillonnage attendue par l'encodeur Whisper.
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
+/// De la téléphonie à la prise de son haute résolution ; borne l'amplification à ×2.
+const WAV_SAMPLE_RATE_RANGE: std::ops::RangeInclusive<u32> = 8_000..=192_000;
+/// Valeurs entrelacées, tous canaux confondus : au plus 32 Mo décodés en f32.
+const MAX_WAV_SAMPLES: u64 = 8_000_000;
 /// Cap par défaut du nombre de frames codec générées par la TTS.
 const DEFAULT_TTS_MAX_FRAMES: usize = 160;
 /// Surcharge du cap de frames TTS pour les entrées longues.
@@ -386,32 +390,75 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Décode un WAV en échantillons mono f32 @ 16 kHz (format Whisper).
 fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
-    let mut reader = WavReader::new(Cursor::new(bytes))
-        .map_err(|e| ServeError::Http(format!("WAV invalide: {e}")))?;
+    let invalid_wav = |e| ServeError::Http(format!("WAV invalide: {e}"));
+    let mut cursor = Cursor::new(bytes);
+    let file_len = hound::read_wave_header(&mut cursor).map_err(invalid_wav)?;
+    if file_len > bytes.len() as u64 {
+        return Err(ServeError::Http(
+            "WAV tronqué: taille RIFF supérieure au corps".into(),
+        ));
+    }
+    let reader = WavReader::new(Cursor::new(bytes)).map_err(invalid_wav)?;
     let spec = reader.spec();
+    let samples_len = u64::from(reader.len());
+    let data_start = reader.into_inner().position() as usize;
+    // Le curseur de Hound suit immédiatement la taille du bloc data.
+    let size_bytes = bytes
+        .get(data_start.saturating_sub(4)..data_start)
+        .and_then(|raw| raw.try_into().ok())
+        .ok_or_else(|| ServeError::Http("WAV sans taille data".into()))?;
+    let data_len = u32::from_le_bytes(size_bytes);
+    // Hound déduit la longueur de l'itérateur de l'en-tête, sans vérifier le corps.
+    // Vérifier les octets stockés (y compris le padding des samples) avant collect.
+    if data_start as u64 + u64::from(data_len) > file_len {
+        return Err(ServeError::Http(
+            "WAV tronqué: bloc data supérieur au corps RIFF".into(),
+        ));
+    }
+    validate_wav_limits(spec.sample_rate, spec.channels, samples_len)?;
+    let mut reader = WavReader::new(Cursor::new(bytes)).map_err(invalid_wav)?;
     let samples: Vec<f32> = match spec.sample_format {
         SampleFormat::Int => match spec.bits_per_sample {
             16 => reader
                 .samples::<i16>()
-                .map(|sample| f32::from(sample.unwrap_or(0)) / f32::from(i16::MAX))
-                .collect(),
-            24 | 32 => reader
-                .samples::<i32>()
-                .map(|sample| sample.unwrap_or(0) as f32 / i32::MAX as f32)
-                .collect(),
+                .map(|sample| sample.map(|value| f32::from(value) / f32::from(i16::MAX)))
+                .collect::<Result<Vec<_>, _>>(),
+            bits @ (24 | 32) => {
+                // hound rend la valeur 24 bits telle quelle dans un i32, sans la décaler.
+                let full_scale = ((1_u64 << (bits - 1)) - 1) as f32;
+                reader
+                    .samples::<i32>()
+                    .map(|sample| sample.map(|value| value as f32 / full_scale))
+                    .collect()
+            }
             other => {
                 return Err(ServeError::Http(format!(
                     "profondeur WAV non supportée: {other} bits"
                 )))
             }
         },
-        SampleFormat::Float => reader
-            .samples::<f32>()
-            .map(|sample| sample.unwrap_or(0.0))
-            .collect(),
-    };
+        SampleFormat::Float => reader.samples::<f32>().collect(),
+    }
+    .map_err(invalid_wav)?;
     let mono = to_mono(&samples, spec.channels as usize);
-    Ok(downsample(&mono, spec.sample_rate, WHISPER_SAMPLE_RATE))
+    downsample(&mono, spec.sample_rate, WHISPER_SAMPLE_RATE)
+}
+
+fn validate_wav_limits(sample_rate: u32, channels: u16, samples: u64) -> ServeResult<()> {
+    if !WAV_SAMPLE_RATE_RANGE.contains(&sample_rate) {
+        return Err(ServeError::Http(format!(
+            "taux WAV hors plage 8000–192000 Hz: {sample_rate}"
+        )));
+    }
+    if channels == 0 {
+        return Err(ServeError::Http("WAV sans canal".into()));
+    }
+    if samples > MAX_WAV_SAMPLES {
+        return Err(ServeError::Http(format!(
+            "WAV dépasse {MAX_WAV_SAMPLES} échantillons"
+        )));
+    }
+    Ok(())
 }
 
 /// Encode des échantillons mono f32 en WAV PCM i16 en mémoire.
@@ -451,19 +498,23 @@ fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
 }
 
 /// Rééchantillonne linéairement vers `target_rate` (sur/sous-échantillonnage).
-fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> Vec<f32> {
+fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult<Vec<f32>> {
+    validate_wav_limits(input_rate, 1, samples.len() as u64)?;
+    validate_wav_limits(target_rate, 1, 0)?;
     if input_rate == target_rate || samples.is_empty() {
-        return samples.to_vec();
+        return Ok(samples.to_vec());
     }
     if input_rate < target_rate {
         let ratio = f64::from(target_rate) / f64::from(input_rate);
         let out_len = (samples.len() as f64 * ratio) as usize;
-        return (0..out_len)
+        validate_wav_limits(target_rate, 1, out_len as u64)?;
+        return Ok((0..out_len)
             .map(|i| samples[((i as f64 / ratio) as usize).min(samples.len() - 1)])
-            .collect();
+            .collect());
     }
     let ratio = f64::from(input_rate) / f64::from(target_rate);
     let out_len = (samples.len() as f64 / ratio) as usize;
+    validate_wav_limits(target_rate, 1, out_len as u64)?;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let start = (i as f64 * ratio) as usize;
@@ -473,7 +524,7 @@ fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> Vec<f32> {
             out.push(slice.iter().sum::<f32>() / slice.len() as f32);
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -590,6 +641,166 @@ mod tests {
         // 800 frames @ 8 kHz → 1600 échantillons @ 16 kHz, moyenne L/R ≈ 0.
         assert_eq!(decoded.len(), 1600);
         assert!(decoded.iter().all(|sample| sample.abs() < 1e-3));
+    }
+
+    fn pcm_wav(rate: u32, channels: u16, bits: u16, samples: u32) -> Vec<u8> {
+        let block_align = channels * (bits / 8);
+        let data_len = samples * u32::from(bits / 8);
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0");
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * u32::from(block_align)).to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(44 + data_len as usize, 0);
+        wav
+    }
+
+    fn assert_wav_rejected(wav: &[u8], expected: &str) {
+        let error = wav_to_mono_16k(wav).expect_err("invariant: WAV hostile refusé");
+        assert!(
+            matches!(&error, ServeError::Http(message) if message.contains(expected)),
+            "{error}"
+        );
+
+        // Exerce l'appelant du thread moteur : l'erreur doit précéder le STT,
+        // puis devenir une réponse 400, sans device ni interception de panique.
+        let body = multipart_body("BND", wav, None);
+        let mut raw = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=BND\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        ).into_bytes();
+        raw.extend_from_slice(&body);
+        let request = super::super::http::read_request(
+            &mut Cursor::new(raw),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .expect("invariant: requête HTTP valide")
+        .expect("invariant: requête présente");
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = super::super::state::ServeState::new(&args);
+        let mut response = Vec::new();
+        let error = super::super::http::handle_job(&mut response, &mut state, &request)
+            .expect_err("invariant: WAV refusé avant inférence");
+        assert!(matches!(error, ServeError::Http(_)));
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        assert!(state.audio_mut().stt.model.is_none());
+    }
+
+    #[test]
+    fn wav_rejects_invalid_rates() {
+        for rate in [0, 1, 7_999, 192_001] {
+            assert_wav_rejected(&pcm_wav(rate, 1, 16, 8), "taux WAV");
+        }
+        assert_wav_rejected(&pcm_wav(1, 1, 16, 512_000), "taux WAV");
+    }
+
+    #[test]
+    fn wav_rejects_zero_channels() {
+        assert_wav_rejected(&pcm_wav(16_000, 0, 16, 8), "zero channels");
+    }
+
+    #[test]
+    fn wav_rejects_lying_headers_and_truncation() {
+        let wav = pcm_wav(16_000, 1, 16, 8);
+        let mut lying = wav.clone();
+        lying[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_wav_rejected(&lying, "taille RIFF");
+        lying = wav.clone();
+        lying[40..44].copy_from_slice(&(u32::MAX - 1).to_le_bytes());
+        assert_wav_rejected(&lying, "bloc data");
+        assert_wav_rejected(&wav[..wav.len() - 1], "tronqué");
+        // La taille totale suffit ici ; seul le contrôle depuis le début de
+        // data détecte le sample manquant, même si RIFF a été réajusté.
+        lying = wav[..wav.len() - 1].to_vec();
+        let riff_len = (lying.len() - 8) as u32;
+        lying[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        assert_wav_rejected(&lying, "bloc data");
+    }
+
+    #[test]
+    fn wav_rejects_unreadable_samples_in_every_format() {
+        for (format, bits, storage_bits) in [(1_u16, 16_u16, 24), (1, 24, 40), (3, 32, 40)] {
+            let mut wav = pcm_wav(16_000, 1, storage_bits, 2);
+            wav[20..22].copy_from_slice(&format.to_le_bytes());
+            wav[34..36].copy_from_slice(&bits.to_le_bytes());
+            assert_wav_rejected(&wav, "sample has more bits");
+        }
+    }
+
+    #[test]
+    fn wav_rejects_unsupported_8_bit_pcm() {
+        assert_wav_rejected(&pcm_wav(16_000, 1, 8, 8), "non supportée: 8 bits");
+    }
+
+    #[test]
+    fn wav_sample_limit_is_inclusive() {
+        let limit = MAX_WAV_SAMPLES as u32;
+        let decoded = wav_to_mono_16k(&pcm_wav(32_000, 2, 16, limit))
+            .expect("invariant: plafond exact accepté");
+        assert_eq!(decoded.len(), limit as usize / 4);
+        assert!(decoded.iter().all(|&sample| sample == 0.0));
+        assert_wav_rejected(&pcm_wav(32_000, 1, 16, limit + 1), "échantillons");
+    }
+
+    #[test]
+    fn downsample_checks_limits_before_copy_or_resampling() {
+        for rate in [0, 1, 7_999, 192_001] {
+            for samples in [&[][..], &[1.0][..]] {
+                assert!(matches!(
+                    downsample(samples, rate, 16_000),
+                    Err(ServeError::Http(_))
+                ));
+                assert!(matches!(
+                    downsample(samples, 16_000, rate),
+                    Err(ServeError::Http(_))
+                ));
+            }
+        }
+        let too_long = vec![0.0; (MAX_WAV_SAMPLES + 1) as usize];
+        assert!(matches!(
+            downsample(&too_long, 8_000, 8_000),
+            Err(ServeError::Http(_))
+        ));
+        assert!(matches!(
+            downsample(&too_long[..400_000], 8_000, 192_000),
+            Err(ServeError::Http(_))
+        ));
+    }
+
+    #[test]
+    fn downsample_preserves_valid_samples() -> ServeResult<()> {
+        assert_eq!(
+            downsample(&[1.0, -1.0], 8_000, 16_000)?,
+            [1.0, 1.0, -1.0, -1.0]
+        );
+        assert_eq!(
+            downsample(&[1.0, -1.0, 0.5, 0.5], 32_000, 16_000)?,
+            [0.0, 0.5]
+        );
+        assert_eq!(downsample(&[1.0, -1.0], 16_000, 16_000)?, [1.0, -1.0]);
+        let decoded = wav_to_mono_16k(&pcm_wav(192_000, 1, 16, 12))?;
+        assert_eq!(decoded, [0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn wav_preserves_supported_sample_formats() -> ServeResult<()> {
+        for bits in [16, 24, 32] {
+            let mut wav = pcm_wav(16_000, 1, bits, 1);
+            wav[44..].fill(0xff);
+            wav[44 + usize::from(bits / 8) - 1] = 0x7f;
+            assert_eq!(wav_to_mono_16k(&wav)?, [1.0]);
+        }
+        let mut wav = pcm_wav(16_000, 1, 32, 1);
+        wav[20..22].copy_from_slice(&3_u16.to_le_bytes());
+        wav[44..].copy_from_slice(&0.5_f32.to_le_bytes());
+        assert_eq!(wav_to_mono_16k(&wav)?, [0.5]);
+        Ok(())
     }
 
     #[test]
