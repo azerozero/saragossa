@@ -210,6 +210,8 @@ impl ChatCompletionRequest {
                 content: Some(message.content_text()),
                 reasoning_content: message.reasoning_content.clone(),
                 tool_calls: raw_texts(message.tool_calls.as_deref()),
+                name: message.name.clone(),
+                tool_call_id: message.tool_call_id.clone(),
             })
             .collect()
     }
@@ -405,6 +407,12 @@ pub(super) struct ResponseFormat {
 /// Message OpenAI minimal.
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct WireMessage {
+    /// Nom de l'outil qui a produit ce résultat.
+    #[serde(default)]
+    pub(super) name: Option<String>,
+    /// Identifiant stable de l'appel associé.
+    #[serde(default)]
+    pub(super) tool_call_id: Option<String>,
     /// Rôle du message.
     pub(super) role: String,
     /// Contenu OpenAI: string ou segments.

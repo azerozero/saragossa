@@ -14,7 +14,7 @@ use saragossa::runtime_flags::{
     serve_lru_enabled, serve_model_pool_size, serve_prefix_cache_enabled,
 };
 use saragossa::{
-    render_flint_chat, render_gemma4_chat, render_gemma_chat, CausalDecoder,
+    render_flint_chat, render_gemma_chat, CausalDecoder,
     CausalDecoderPromptState, ChatTemplateMessage, GenerationOptions, JsonTokenCatalog,
     JsonTokenConstraint, ModelAssets, RuntimePreset, TokenConstraint,
 };
@@ -1201,7 +1201,7 @@ impl LoadedModel {
             render_flint_chat(&messages, &tools, true)
         } else if self.assets.config.is_gemma4() {
             check_thinking(thinking, true)?;
-            render_gemma4_chat(&messages, true, false)
+            saragossa::chat_template::render_gemma4_chat_with_tools(&messages, &request.active_tools()?.iter().map(|t| t.json.clone()).collect::<Vec<_>>(), true, false)
         } else if self.assets.config.is_gemma() {
             check_thinking(thinking, false)?;
             render_gemma_chat(&messages, true).map_err(|e| ServeError::Http(e.to_string()))?

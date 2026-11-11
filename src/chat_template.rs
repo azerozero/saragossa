@@ -1,6 +1,8 @@
 //! Rendu des templates de chat (ChatML Qwen, tours Gemma, flint) du backend Rust pur.
 
+mod gemma4;
 mod python_json;
+pub use gemma4::render_gemma4_chat_with_tools;
 mod qwen;
 pub use qwen::{render_qwen_chatml_profile, render_qwen_chatml_with_tools, QwenProfile};
 
@@ -35,12 +37,14 @@ pub struct ChatTemplateMessage {
     /// Contenu textuel du message.
     pub content: Option<String>,
     /// Raisonnement d'un tour assistant passé (`reasoning_content` OpenAI).
-    /// Seul le rendu flint l'utilise.
     pub reasoning_content: Option<String>,
     /// Appels d'outils OpenAI d'un tour assistant passé (`tool_calls`), un
-    /// texte JSON brut par appel pour garder l'ordre des clés. Seul le rendu
-    /// flint les utilise.
+    /// texte JSON brut par appel pour garder l'ordre des clés.
     pub tool_calls: Vec<String>,
+    /// Nom de l'outil associé à un résultat.
+    pub name: Option<String>,
+    /// Identifiant de l'appel auquel répond ce résultat.
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatTemplateMessage {
@@ -51,6 +55,8 @@ impl ChatTemplateMessage {
             content: Some(content.into()),
             reasoning_content: None,
             tool_calls: Vec::new(),
+            name: None,
+            tool_call_id: None,
         }
     }
 }
@@ -132,28 +138,7 @@ pub fn render_gemma4_chat(
     add_generation_prompt: bool,
     enable_thinking: bool,
 ) -> String {
-    let mut out = String::from("<bos>");
-    for message in messages {
-        let role = if message.role == "assistant" {
-            "model"
-        } else {
-            message.role.as_str()
-        };
-        out.push_str(GEMMA4_START_OF_TURN);
-        out.push_str(role);
-        out.push('\n');
-        out.push_str(message.content.as_deref().unwrap_or("").trim());
-        out.push_str(GEMMA4_END_OF_TURN);
-        out.push('\n');
-    }
-    if add_generation_prompt {
-        out.push_str(GEMMA4_START_OF_TURN);
-        out.push_str("model\n");
-        if !enable_thinking {
-            out.push_str("<|channel>thought\n<channel|>");
-        }
-    }
-    out
+    render_gemma4_chat_with_tools(messages, &[], add_generation_prompt, enable_thinking)
 }
 
 /// Rend des messages au format chat flint (`chat_template.jinja` du modèle).

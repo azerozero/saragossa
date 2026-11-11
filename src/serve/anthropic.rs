@@ -393,6 +393,8 @@ fn wire_message(role: &str, content: String) -> WireMessage {
         content: Some(Value::String(content)),
         reasoning_content: None,
         tool_calls: None,
+        name: None,
+        tool_call_id: None,
     }
 }
 
