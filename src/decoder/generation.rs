@@ -3251,7 +3251,7 @@ impl CausalDecoder {
         let (cache, final_states, captures) =
             self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids, usize::MAX, false)?;
         let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
-        self.snapshot_save(&snapshot, &cache, &final_state, None, Some(&captures))?;
+        self.snapshot_save(&snapshot, &cache, &final_state, None, Some(&captures));
         Ok((cache, final_state, captures.hidden))
     }
 
@@ -3922,7 +3922,7 @@ impl CausalDecoder {
         }
         if prefix_cache_enabled() {
             if let Some(((cache, final_state), reused)) = self.prefix_cache_get(prompt)? {
-                self.snapshot_save(&snapshot, &cache, &final_state, None, None)?;
+                self.snapshot_save(&snapshot, &cache, &final_state, None, None);
                 return Ok((cache, final_state, reused));
             }
         }
@@ -3930,7 +3930,7 @@ impl CausalDecoder {
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, None, None)?;
         }
-        self.snapshot_save(&snapshot, &state.0, &state.1, None, None)?;
+        self.snapshot_save(&snapshot, &state.0, &state.1, None, None);
         Ok((state.0, state.1, 0))
     }
 
@@ -3947,7 +3947,7 @@ impl CausalDecoder {
             return Ok((state.cache, state.final_state));
         }
         let state = self.prefill_cache_state_uncached_inner(prompt)?;
-        self.snapshot_save(&snapshot, &state.0, &state.1, None, None)?;
+        self.snapshot_save(&snapshot, &state.0, &state.1, None, None);
         Ok(state)
     }
 
@@ -3995,7 +3995,7 @@ impl CausalDecoder {
         if prefix_cache_enabled() {
             if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt, on_final_state)? {
                 if hit.2.len() == prompt.len().saturating_sub(1) {
-                    self.snapshot_save(&snapshot, &hit.0, &hit.1, Some(&hit.2), None)?;
+                    self.snapshot_save(&snapshot, &hit.0, &hit.1, Some(&hit.2), None);
                 }
                 return Ok(hit);
             }
@@ -4112,7 +4112,7 @@ impl CausalDecoder {
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, Some(&mtp_history), None)?;
         }
-        self.snapshot_save(&snapshot, &state.0, &state.1, Some(&mtp_history), None)?;
+        self.snapshot_save(&snapshot, &state.0, &state.1, Some(&mtp_history), None);
         Ok((state.0, state.1, mtp_history, 0))
     }
 
@@ -4518,7 +4518,7 @@ impl CausalDecoder {
             &state.1,
             mtp_history.as_ref(),
             Some(&captures),
-        )?;
+        );
         Ok((state.0, state.1, captures.hidden, captures.from))
     }
 

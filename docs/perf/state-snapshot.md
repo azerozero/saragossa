@@ -70,7 +70,8 @@ et budget cumulé. Chaque segment KV contient des lignes entières. Les lectures
 ont une longueur fixe : un fichier qui grossit ne peut pas augmenter l'allocation.
 Un autre build est explicitement refusé. Une clé
 incompatible, un manifeste incomplet ou un blob corrompu déclenche un prefill
-normal avec diagnostic. Une erreur d'écriture est propagée.
+normal avec diagnostic. Toute erreur d'écriture journalise
+`state_snapshot refusé : …; sans écriture` et laisse la génération continuer.
 
 Les KV gardent leurs bits f32/bf16, leurs segments et leur base absolue pour
 les fenêtres glissantes. Seules les lignes vivantes sont écrites, jamais la

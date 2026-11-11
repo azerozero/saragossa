@@ -531,57 +531,54 @@ impl CausalDecoder {
         final_state: &Tensor,
         history: Option<&LayerKvCache>,
         captures: Option<&PrefixCaptures>,
-    ) -> Result<()> {
+    ) {
         if crate::runtime_flags::state_snapshot_warmup() {
-            return Ok(());
+            return;
         }
         let Some(request) = request else {
-            return Ok(());
+            return;
         };
-        if let Err(error) = snapshot_calculations_complete()
-            .and_then(|()| request.key.sources.iter().try_for_each(Source::verify))
-        {
-            eprintln!("state_snapshot refusé : {error}; sans écriture");
-            return Ok(());
-        }
-        let mut writer = Writer::new(&request.root)?;
-        let layers = cache
-            .layers
-            .iter()
-            .map(|layer| Layer::write(layer, &mut writer, self))
-            .collect::<Result<_>>()?;
-        let history = history
-            .map(|layer| Layer::write(layer, &mut writer, self))
-            .transpose()?;
-        let captures = captures
-            .map(|c| -> Result<_> {
-                Ok(Captures {
-                    layer_ids: c.layer_ids.clone(),
-                    from: c.from,
-                    hidden: Dense::write(&c.hidden, &mut writer)?,
+        let result = (|| -> Result<()> {
+            snapshot_calculations_complete()?;
+            request.key.sources.iter().try_for_each(Source::verify)?;
+            let mut writer = Writer::new(&request.root)?;
+            let layers = cache
+                .layers
+                .iter()
+                .map(|layer| Layer::write(layer, &mut writer, self))
+                .collect::<Result<_>>()?;
+            let history = history
+                .map(|layer| Layer::write(layer, &mut writer, self))
+                .transpose()?;
+            let captures = captures
+                .map(|c| -> Result<_> {
+                    Ok(Captures {
+                        layer_ids: c.layer_ids.clone(),
+                        from: c.from,
+                        hidden: Dense::write(&c.hidden, &mut writer)?,
+                    })
                 })
-            })
-            .transpose()?;
-        let key = request.key.clone();
-        let manifest = Manifest {
-            key,
-            position: cache.position,
-            layers,
-            final_state: Dense::write(final_state, &mut writer)?,
-            history,
-            captures,
-        };
-        if let Err(error) = snapshot_calculations_complete()
-            .and_then(|()| request.key.sources.iter().try_for_each(Source::verify))
-        {
-            eprintln!("state_snapshot refusé : {error}; sans publication");
-            return Ok(());
+                .transpose()?;
+            let key = request.key.clone();
+            let manifest = Manifest {
+                key,
+                position: cache.position,
+                layers,
+                final_state: Dense::write(final_state, &mut writer)?,
+                history,
+                captures,
+            };
+            snapshot_calculations_complete()?;
+            request.key.sources.iter().try_for_each(Source::verify)?;
+            writer.publish(&manifest)?;
+            eprintln!(
+                "state_snapshot écrit mode={} tokens={}",
+                request.key.mode, cache.position
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("state_snapshot refusé : {error}; sans écriture");
         }
-        writer.publish(&manifest)?;
-        eprintln!(
-            "state_snapshot écrit mode={} tokens={}",
-            request.key.mode, cache.position
-        );
-        Ok(())
     }
 }

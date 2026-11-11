@@ -66,7 +66,7 @@ fn roundtrip_and_reject_corruption_without_weights() -> Result<()> {
         &final_state,
         Some(&history),
         Some(&captures),
-    )?;
+    );
     let request = request.unwrap();
     let loaded = model.snapshot_read(&request)?;
     assert_eq!(loaded.cache.position, 2);
@@ -212,7 +212,7 @@ fn restored_cpu_decode_matches_complete_run() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let (model, request) = fixture(dir.path());
     let (cache, final_state) = model.prefill_cache_state(&[0, 1])?;
-    model.snapshot_save(&request, &cache, &final_state, None, None)?;
+    model.snapshot_save(&request, &cache, &final_state, None, None);
     let mut restored = model.snapshot_read(request.as_ref().unwrap())?.cache;
     let mut baseline = cache;
     for token in [2, 0, 1, 2] {
@@ -321,9 +321,7 @@ fn sources_frozen_at_load_reject_replacement_and_skip_writes() {
                 assert!(model.snapshot_load(&request).is_none());
                 let manifest = request.as_ref().unwrap().root.join("manifest.json");
                 let previous = std::fs::read(&manifest).unwrap();
-                model
-                    .snapshot_save(&request, &cache, &final_state, None, None)
-                    .unwrap();
+                model.snapshot_save(&request, &cache, &final_state, None, None);
                 assert_eq!(std::fs::read(&manifest).unwrap(), previous);
                 let fresh =
                     CausalDecoder::from_safetensors(&path, CausalDecoderConfig::default()).unwrap();
@@ -403,7 +401,7 @@ fn oversized_sparse_blob_rejected_before_any_blob_read() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let (model, request) = fixture(dir.path());
     let (cache, final_state) = model.prefill_cache_state(&[0, 1])?;
-    model.snapshot_save(&request, &cache, &final_state, None, None)?;
+    model.snapshot_save(&request, &cache, &final_state, None, None);
     let mut manifest = read_manifest(dir.path());
     // La première donnée manque : le diagnostic doit viser la géométrie de la
     // dernière, prouvant que toutes les tailles sont contrôlées avant les I/O.
@@ -456,9 +454,7 @@ fn split_kv_rows_with_valid_checksums_fall_back_to_prefill() {
                         rows.push_owned(vec![1.0]);
                         rows.push_owned(vec![2.0, 3.0, 4.0]);
                     }
-                    model
-                        .snapshot_save(&request, &broken, &final_state, None, None)
-                        .unwrap();
+                    model.snapshot_save(&request, &broken, &final_state, None, None);
                     let error = model
                         .snapshot_read(request.as_ref().unwrap())
                         .err()
@@ -489,7 +485,7 @@ fn recurrent_cpu_geometry_roundtrip_and_oversized_ssm_rejected() -> Result<()> {
         super::super::tests::hybrid_config(2),
     )?;
     let (cache, final_state) = model.prefill_cache_state(&[0, 1])?;
-    model.snapshot_save(&request, &cache, &final_state, None, None)?;
+    model.snapshot_save(&request, &cache, &final_state, None, None);
     let restored = model.snapshot_read(request.as_ref().unwrap())?;
     assert_eq!(
         cache.layers[0].linear.conv,
@@ -540,9 +536,7 @@ fn content_identity_covers_shards_auxiliaries_and_sidecars() {
                 let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
                 request.as_mut().unwrap().key.sources = original.verified().unwrap().to_vec();
                 let model = model.with_snapshot_sources(original.clone());
-                model
-                    .snapshot_save(&request, &cache, &state, None, None)
-                    .unwrap();
+                model.snapshot_save(&request, &cache, &state, None, None);
                 assert!(model.snapshot_load(&request).is_some());
                 let manifest = request.as_ref().unwrap().root.join("manifest.json");
                 let previous = std::fs::read(&manifest).unwrap();
@@ -563,9 +557,7 @@ fn content_identity_covers_shards_auxiliaries_and_sidecars() {
                     assert!(original.clone().finish_loading().verified().is_err());
                     assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
                     assert!(model.snapshot_load(&request).is_none());
-                    model
-                        .snapshot_save(&request, &cache, &state, None, None)
-                        .unwrap();
+                    model.snapshot_save(&request, &cache, &state, None, None);
                     assert_eq!(previous, std::fs::read(&manifest).unwrap());
                 }
                 let changed = capture();
@@ -656,9 +648,7 @@ fn diagnostic_ablations_disable_reads_writes_and_hashing() {
         .is_none());
     assert!(model.snapshot_load(&request).is_none());
     let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
-    model
-        .snapshot_save(&request, &cache, &state, None, None)
-        .unwrap();
+    model.snapshot_save(&request, &cache, &state, None, None);
     assert!(!root.join("snapshots").exists());
 }
 
@@ -682,9 +672,7 @@ fn late_moe_ablation_refuses_an_existing_snapshot() {
             std::env::remove_var("SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM");
             assert!(model.snapshot_load(&request).is_none());
             assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
-            model
-                .snapshot_save(&request, &cache, &state, None, None)
-                .unwrap();
+            model.snapshot_save(&request, &cache, &state, None, None);
             assert_eq!(std::fs::read(&manifest).unwrap(), previous);
             // Le préfixe peuplé avant l'ablation est réutilisable en mémoire,
             // mais ne doit plus pouvoir être publié après retrait du flag.
@@ -705,9 +693,7 @@ fn missing_entry_is_absent_but_missing_blob_is_refused() {
             let (model, request) = fixture(&root.join("snapshots"));
             assert!(model.snapshot_load(&request).is_none());
             let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
-            model
-                .snapshot_save(&request, &cache, &state, None, None)
-                .unwrap();
+            model.snapshot_save(&request, &cache, &state, None, None);
             let manifest = read_manifest(&root.join("snapshots"));
             std::fs::remove_file(root.join("snapshots").join(&manifest.final_state.data.file))
                 .unwrap();
@@ -747,7 +733,7 @@ fn warmup_skips_snapshots_and_restores_scope_after_error() {
                 }
                 assert!(state_snapshot_warmup());
                 let (cache, state) = model.prefill_cache_state(&prompt)?;
-                model.snapshot_save(&request, &cache, &state, None, None)?;
+                model.snapshot_save(&request, &cache, &state, None, None);
                 assert!(!entry.exists());
                 // L'erreur doit aussi restaurer la portée du vrai prompt.
                 Err(invalid("fin de chauffe synthétique"))
@@ -769,4 +755,44 @@ fn warmup_skips_snapshots_and_restores_scope_after_error() {
             assert!(model.snapshot_load(&request).is_some());
         },
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn unwritable_snapshot_keeps_generation_without_manifest() {
+    let log = isolated(
+        "unwritable_snapshot_keeps_generation_without_manifest",
+        true,
+        |root| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = root.join("weights");
+            std::fs::write(&path, b"synthetic").unwrap();
+            let (model, _) = fixture(root);
+            let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
+            let generate = || {
+                model.generate_greedy_timed_with_options(&[0, 1], 4, &GenerationOptions::default())
+            };
+            let baseline = {
+                let _warmup = crate::runtime_flags::StateSnapshotWarmup::enter();
+                generate().unwrap().tokens
+            };
+            let request = model.snapshot_request(&[0, 1], "ar").unwrap().unwrap();
+            std::fs::create_dir_all(&request.root).unwrap();
+            let permissions = std::fs::metadata(&request.root).unwrap().permissions();
+            std::fs::set_permissions(&request.root, std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            let generated = generate();
+            std::fs::set_permissions(&request.root, permissions).unwrap();
+            assert_eq!(generated.unwrap().tokens, baseline);
+            assert!(!request.root.join("manifest.json").exists());
+            assert_eq!(std::fs::read_dir(&request.root).unwrap().count(), 0);
+            // Échec tardif du renommage, après écriture des blobs : même garantie.
+            std::fs::create_dir(request.root.join("manifest.json")).unwrap();
+            assert_eq!(generate().unwrap().tokens, baseline);
+            assert_eq!(std::fs::read_dir(&request.root).unwrap().count(), 1);
+        },
+    );
+    if std::env::var_os("SARAGOSSA_SNAPSHOT_TEST_CHILD").is_none() {
+        assert_eq!(log.matches("; sans écriture").count(), 2, "{log}");
+    }
 }
