@@ -50,7 +50,7 @@ jobs:
           # Liste fermée : aucun modèle externe, sidecar, cache HF ou bench manuel.
           # Les trois cas DFlash ci-dessous construisent leurs données en mémoire.
           # Les deux oracles NAX restent locaux au M5 ; les deux tests lourds suivent.
-          # Chaque test propage une erreur si aucun device Metal n'est disponible.
+          # L'absence de device Metal fait échouer le job via les tests obligatoires.
           # Conserver les #[ignore] jusqu’à trois passages CI stables.
           tests=(
             decode_resident::rope_tests::rope_decode_matches_common_cpu_at_long_positions
@@ -69,6 +69,14 @@ jobs:
             decode_resident::tests::dflash_resident::dflash_fixed_base_window_start_bits
             decode_resident::tests::dflash_resident::dflash_fixed_base_capacity_boundary
             decode_resident::tests::dflash_resident::dflash_fixed_base_rejects_shifted_base
+            decode_resident::utils::shared_rows_tests::resident_accesses_preserve_values_and_logical_bounds
+            metal_backend::shared_rows::identity_tests::views_share_identity_and_allocations_do_not
+            metal_backend::shared_rows::identity_tests::private_buffers_have_distinct_identities_and_exclusive_claims
+            metal_backend::shared_rows::identity_tests::liveness_registry_gates_writes_beyond_live_views
+            metal_backend::byte_helpers::tests::shared_rows_transfers_preserve_bits_and_bounds
+            metal_backend::transfer::tests::shared_rows_staging_preserves_bytes_across_chunks
+            metal_backend::tests::native_bf16_file_load_writes_directly_into_storage
+            metal_backend::tests::shared_rows_affine_fill_preserves_values_and_errors
             metal_backend::tests::rows_exact_matmul_formats
             metal_backend::tests::rows_exact_norms_and_prologue
             metal_backend::tests::rows_exact_linear_block

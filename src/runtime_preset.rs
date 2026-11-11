@@ -1,6 +1,10 @@
 //! Presets runtime derives depuis le modele charge.
 
 use std::path::Path;
+use std::sync::OnceLock;
+
+mod kernel_profile;
+pub use kernel_profile::{initialize_kernel_environment, KernelProfile};
 
 /// Preset runtime connu pour un checkpoint local.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -22,6 +26,10 @@ const QWEN36_OQ8: RuntimePreset = RuntimePreset {
     sampling_top_k: 20,
 };
 
+// Le premier preset reconnu reste le défaut des anciens consommateurs.
+// Les profils résolus par modèle ne consultent jamais cet état.
+static LEGACY_PRESET: OnceLock<RuntimePreset> = OnceLock::new();
+
 /// Detecte le preset runtime depuis le chemin du modele.
 #[must_use]
 pub fn runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
@@ -32,21 +40,23 @@ pub fn runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
     None
 }
 
-/// Applique le preset kernel modele si aucun override explicite n'existe.
+/// Applique le premier preset reconnu aux futurs appels à `MetalExecutor::new`.
 ///
-/// PROMOTED infra (decision tangle 2026-07-05) : le modele oQ8 pose
-/// `SARAGOSSA_RUST_OPT_PROFILE=qwen36-oq8`, mais l'env explicite reste prioritaire.
-///
-/// Renvoie le preset applique, ou `None` si le modele est inconnu ou si
-/// l'utilisateur a deja pose `SARAGOSSA_RUST_OPT_PROFILE`.
+/// L'état de compatibilité est partagé entre threads, sans modifier l'environnement
+/// ni les executors existants. Les surcharges explicites restent prioritaires.
+/// Les profils issus de [`KernelProfile::for_model_dir`] restent indépendants de
+/// cet état : les préférer pour charger plusieurs modèles dans le même processus.
+#[deprecated(
+    note = "utiliser KernelProfile::for_model_dir avec MetalExecutor::new_with_kernel_profile pour isoler les modèles"
+)]
 #[must_use]
 pub fn apply_runtime_preset_for_model_dir(model_dir: &Path) -> Option<RuntimePreset> {
-    let preset = runtime_preset_for_model_dir(model_dir)?;
-    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_OPT_PROFILE").is_none() {
-        std::env::set_var("SARAGOSSA_RUST_OPT_PROFILE", preset.opt_profile);
-        return Some(preset);
+    if crate::runtime_flags::env_present("SARAGOSSA_RUST_OPT_PROFILE") {
+        return None;
     }
-    None
+    let preset = runtime_preset_for_model_dir(model_dir)?;
+    let _ = LEGACY_PRESET.get_or_init(|| preset);
+    Some(preset)
 }
 
 #[cfg(test)]

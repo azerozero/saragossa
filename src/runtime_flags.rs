@@ -137,10 +137,10 @@ pub(crate) fn free_cpu_weights_moe_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_FREE_CPU_WEIGHTS_MOE", false))
 }
 
-/// Active le stockage single-copy des poids quantifiés en mémoire unifiée.
+/// Active le stockage single-copy des poids quantifiés et denses bf16 en mémoire unifiée.
 ///
 /// **Défaut ON** : les MTLBuffer partagés stockent les codes `u32` et les
-/// paramètres affines bf16 natifs. `RETI_RUST_SINGLE_COPY_WEIGHTS=0` restaure
+/// paramètres affines et matrices denses bf16 natifs. `RETI_RUST_SINGLE_COPY_WEIGHTS=0` restaure
 /// strictement le chemin historique f32 CPU puis copies Metal (kill-switch).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn single_copy_weights_enabled() -> bool {
@@ -1640,6 +1640,36 @@ pub(crate) fn gather_fast_mode() -> Option<&'static str> {
 pub(super) fn prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
+}
+
+/// Mémoïsation du préfixe VoiceDesign. Opt-in jusqu'à validation de l'oracle
+/// Metal ; `SARAGOSSA_TTS_PREFILL_CACHE=0` conserve le prefill complet.
+pub(crate) fn tts_prefill_cache_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TTS_PREFILL_CACHE_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_PREFILL_CACHE", false))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TTS_PREFILL_CACHE_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_tts_prefill_cache_for_test<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TTS_PREFILL_CACHE_OVERRIDE.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(TTS_PREFILL_CACHE_OVERRIDE.with(|flag| flag.replace(Some(enabled))));
+    run()
 }
 
 /// Extension d'un préfixe caché par le chemin résident en lignes (arène

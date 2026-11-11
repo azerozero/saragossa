@@ -32,6 +32,21 @@ const PREFILL_KV_RESERVE_ROWS: usize = 256;
 /// tous les `seq / 8` tokens prolongés au plus (≈14k à 115k).
 const PREFILL_KV_RESERVE_GROWTH_DIVISOR: usize = 8;
 
+pub(super) fn prefill_kv_fresh_reserve(
+    seq: usize,
+    hint: usize,
+    max_position_embeddings: Option<usize>,
+) -> usize {
+    let reserve = hint.max(PREFILL_KV_RESERVE_ROWS);
+    let growth = seq / PREFILL_KV_RESERVE_GROWTH_DIVISOR;
+    // NOTE: Seule la marge de conversation devient inutile au-delà du contexte ;
+    // le decode et la spéculation doivent garder toute la réserve de l'appelant.
+    let growth = max_position_embeddings.map_or(growth, |ctx| {
+        growth.min(ctx.saturating_sub(seq.saturating_add(reserve)))
+    });
+    reserve.saturating_add(growth)
+}
+
 thread_local! {
     /// Réserve demandée par l'appelant du prefill en cours sur ce thread, cf.
     /// [`with_prefill_kv_reserve`].
@@ -293,6 +308,7 @@ impl MetalExecutor {
             PrefillInput::Hidden(input),
             layers,
             spec,
+            None,
             &[],
             usize::MAX,
             0,
@@ -306,6 +322,7 @@ impl MetalExecutor {
         input: PrefillInput<'_>,
         layers: &[PrefillMoeLayer<'_>],
         spec: PrefillAttentionSpec,
+        max_position_embeddings: Option<usize>,
         capture_layer_ids: &[usize],
         keep_rows: usize,
         chunk_tokens: usize,
@@ -319,6 +336,7 @@ impl MetalExecutor {
             input,
             layers,
             spec,
+            max_position_embeddings,
             capture_layer_ids,
             keep_rows,
             chunk_tokens,
@@ -361,6 +379,7 @@ impl MetalExecutor {
         input: PrefillInput<'_>,
         layers: &[PrefillMoeLayer<'_>],
         spec: PrefillAttentionSpec,
+        max_position_embeddings: Option<usize>,
         capture_layer_ids: &[usize],
         keep_rows: usize,
         chunk_tokens: usize,
@@ -516,7 +535,8 @@ impl MetalExecutor {
             && bf16_min_rows.is_some_and(|min_rows| spec.seq >= min_rows);
         // Réserve d'un K/V écrit dans un buffer neuf (prefill à froid, préfixe
         // recopié) : la demande de l'appelant pour un K/V bf16, adoptable par
-        // l'arène, plus un huitième du prompt. Un tour de conversation ajoute
+        // l'arène, plus un huitième du prompt dans la limite du contexte.
+        // Un tour de conversation ajoute
         // des milliers de lignes, bien au-delà de `max_tokens` : sans cette
         // marge géométrique (comme un `Vec`), chaque tour recopiait tout le
         // K/V, la conversation existant deux fois au pic (+8 Go à 115k sur le
@@ -526,10 +546,11 @@ impl MetalExecutor {
         // lisent `buffer.length()`. Jamais adopté en f32, il garde la réserve
         // minimale.
         let fresh_reserve = if bf16_store {
-            PREFILL_KV_RESERVE_HINT
-                .with(Cell::get)
-                .max(PREFILL_KV_RESERVE_ROWS)
-                .saturating_add(spec.seq / PREFILL_KV_RESERVE_GROWTH_DIVISOR)
+            prefill_kv_fresh_reserve(
+                spec.seq,
+                PREFILL_KV_RESERVE_HINT.with(Cell::get),
+                max_position_embeddings,
+            )
         } else {
             PREFILL_KV_RESERVE_ROWS
         };

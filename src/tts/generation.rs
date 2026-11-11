@@ -105,8 +105,7 @@ impl TtsModel {
             );
         }
         let prefill_started = Instant::now();
-        let (mut talker_cache, mut final_state) =
-            self.talker.prefill_cache_from_embeddings(&prepared.input)?;
+        let (mut talker_cache, mut final_state) = self.prefill_talker(&prepared.input)?;
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: prefill done elapsed_ms={}",
@@ -351,11 +350,7 @@ impl TtsModel {
             .clone_ctx
             .as_ref()
             .map_or("voicedesign", |ctx| ctx.mode.label());
-        let effective_max_frames = if self.clone_ctx.is_some() {
-            max_frames.min(CLONE_GENERATION_HARD_CAP)
-        } else {
-            max_frames
-        };
+        let effective_max_frames = self.greedy_frame_cap(max_frames);
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: start mode={mode} requested_max_frames={max_frames} effective_max_frames={effective_max_frames} hard_cap={CLONE_GENERATION_HARD_CAP}"
@@ -395,8 +390,7 @@ impl TtsModel {
             );
         }
         let prefill_started = Instant::now();
-        let (mut talker_cache, mut final_state) =
-            self.talker.prefill_cache_from_embeddings(&prepared.input)?;
+        let (mut talker_cache, mut final_state) = self.prefill_talker(&prepared.input)?;
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: prefill done elapsed_ms={}",

@@ -75,8 +75,8 @@ pub use decoder::{ResidentLinearXrayLayerDiff, ResidentLinearXrayReport};
 #[cfg(feature = "devtools")]
 pub use devtools::{
     load_dflash_draft_for_target, load_dflash_draft_weights_for_target,
-    load_dflash_draft_weights_quantized, DFlashAttentionWeights, DFlashConv, DFlashDraft,
-    DFlashDraftInfo, DFlashDraftLayer, DFlashQuant, DFlashSelector,
+    load_dflash_draft_weights_quantized, DFlashAttentionWeights, DFlashCodebook, DFlashConv,
+    DFlashDraft, DFlashDraftInfo, DFlashDraftLayer, DFlashQuant, DFlashSelector,
 };
 pub use embedding::{embed_tokens, embed_weight_tokens, EmbeddingWeight};
 pub use error::{InferError, Result};
@@ -91,6 +91,8 @@ pub use memory_guard::{
 pub use metal_backend::MetalExecutor;
 pub use mlp::{Activation, FeedForward, GatedMlp, MoeMlp, RouterScore};
 pub use norm::{layer_norm, rms_norm};
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub use quantization::DenseBf16Tensor;
 pub use quantization::{dequantize_affine_u32, AffineQuantizedTensor};
 pub use qwen_loader::{
     load_causal_decoder, load_causal_decoder_from_shards, load_qwen_causal_decoder,
@@ -105,8 +107,10 @@ pub use qwen_loader::{
 };
 pub use runtime::ForwardRuntime;
 pub use runtime_flags::{decode_max_tokens_per_s, set_decode_max_tokens_per_s};
+#[allow(deprecated)]
+pub use runtime_preset::apply_runtime_preset_for_model_dir;
 pub use runtime_preset::{
-    apply_runtime_preset_for_model_dir, runtime_preset_for_model_dir, RuntimePreset,
+    initialize_kernel_environment, runtime_preset_for_model_dir, KernelProfile, RuntimePreset,
 };
 pub use safetensor::{load_f32_tensor, load_f32_tensors, load_float_tensor, load_float_tensors};
 pub use sampling::{argmax, sample_token, sample_token_top_k_top_p, softmax, DeterministicSampler};

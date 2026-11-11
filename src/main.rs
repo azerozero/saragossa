@@ -79,6 +79,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> CliResult<()> {
+    saragossa::initialize_kernel_environment();
     let raw_args: Vec<String> = env::args().skip(1).collect();
     if let Some(command) = raw_args.first() {
         match command.as_str() {
@@ -106,7 +107,6 @@ fn run() -> CliResult<()> {
     let mut args = CliArgs::parse(raw_args)?;
     if let Some(preset) = saragossa::runtime_preset_for_model_dir(&args.model_dir) {
         args.apply_generation_preset(preset);
-        let _ = saragossa::apply_runtime_preset_for_model_dir(&args.model_dir);
     }
     let assets = ModelAssets::load_local(&args.model_dir)?;
     if args.check_only {
@@ -850,7 +850,9 @@ fn load_decoder_with_runtime(
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn load_decoder_metal(assets: &ModelAssets) -> CliResult<CausalDecoder> {
-    let executor = saragossa::MetalExecutor::new()?;
+    let executor = saragossa::MetalExecutor::new_with_kernel_profile(
+        saragossa::KernelProfile::for_model_dir(&assets.model_dir),
+    )?;
     Ok(saragossa::load_causal_decoder_for_metal(assets, &executor)?
         .with_metal_executor(executor)?)
 }

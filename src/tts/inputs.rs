@@ -1,10 +1,14 @@
-use super::{
-    add_into, gather_rows_i32, push_rows, PreparedVoiceDesign, TtsCloneContext, TtsModel,
-    DEFAULT_INSTRUCT,
-};
+use super::{add_into, gather_rows_i32, push_rows, PreparedVoiceDesign, TtsCloneContext, TtsModel};
 use crate::{InferError, Result, Tensor};
 
 impl TtsModel {
+    /// Choisit l'instruction de voix VoiceDesign ; sans effet sur le clonage ICL.
+    #[must_use]
+    pub fn with_voice_design_instruction(mut self, instruction: impl Into<String>) -> Self {
+        self.voice_design_instruction = instruction.into();
+        self
+    }
+
     pub(super) fn prepare_inputs(&self, text: &str) -> Result<PreparedVoiceDesign> {
         match self.clone_ctx.as_ref() {
             Some(ctx) => self.prepare_icl_inputs(text, ctx),
@@ -189,7 +193,7 @@ impl TtsModel {
             ));
         }
 
-        let instruct = DEFAULT_INSTRUCT;
+        let instruct = &self.voice_design_instruction;
         let instruct_chat = format!("<|im_start|>user\n{instruct}<|im_end|>\n");
         let instruct_ids = self.encode_ids(&instruct_chat)?;
         let instruct_embed = self.text_embed(&instruct_ids)?;

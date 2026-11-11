@@ -439,6 +439,7 @@ fn native_bf16_pair_resolves_as_storage_backed_split() -> Result<()> {
 }
 
 #[test]
+#[ignore = "nécessite un device Metal"]
 fn native_bf16_file_load_writes_directly_into_storage() -> Result<()> {
     use std::io::Write;
 
@@ -457,5 +458,35 @@ fn native_bf16_file_load_writes_directly_into_storage() -> Result<()> {
     let buffer = executor.weight_buffer_from_bf16_file(file.path(), 2, 4)?;
 
     assert_eq!(read_u16_buffer(&buffer, 2)?, vec![0x3f00, 0x3f80]);
+    assert!(executor.weight_buffer_from_bf16_file(file.path(), 0, 0).is_err());
+    assert!(executor.weight_buffer_from_bf16_file(file.path(), 0, 3).is_err());
+    assert!(executor.weight_buffer_from_bf16_file(file.path(), 4, 4).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "nécessite un device Metal"]
+fn shared_rows_affine_fill_preserves_values_and_errors() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (packed, scales, biases) = executor.weight_buffers_affine_with(3, 2, |p, s, b| {
+        p.copy_from_slice(&[0, u32::MAX, 0x1234_5678]);
+        s.copy_from_slice(&[0x3f80, 0x7fc1]);
+        b.copy_from_slice(&[0x8000, 0xffff]);
+        Ok(())
+    })?;
+    assert_eq!(read_u32_buffer(&packed, 3)?, [0, u32::MAX, 0x1234_5678]);
+    assert_eq!(read_u16_buffer(&scales, 2)?, [0x3f80, 0x7fc1]);
+    assert_eq!(read_u16_buffer(&biases, 2)?, [0x8000, 0xffff]);
+    for (packed_len, affine_len) in [(0, 2), (3, 0), (usize::MAX, 2), (3, usize::MAX)] {
+        assert!(executor.weight_buffers_affine_with(packed_len, affine_len, |_, _, _| {
+            unreachable!("tailles invalides refusées avant fill")
+        }).is_err());
+    }
+    let error = executor.weight_buffers_affine_with(3, 2, |_, _, _| {
+        Err(InferError::Dimension("échec fill attendu".to_string()))
+    });
+    assert!(matches!(error, Err(InferError::Dimension(message)) if message == "échec fill attendu"));
     Ok(())
 }

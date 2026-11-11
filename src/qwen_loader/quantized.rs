@@ -295,6 +295,23 @@ pub(super) fn tensor_from_entry(
             config, spec, &packed, shard, headers, entries, context,
         );
     }
+    // Les normes et convolutions sont consommées comme Tensor f32 ; seules
+    // les matrices de projection/embedding acceptent le stockage partagé.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if entry.dtype == Dtype::BF16
+        && entry.shape.len() == 2
+        && spec.target.ends_with(".weight")
+        && !spec.target.ends_with("conv1d.weight")
+        && !spec.target.ends_with("norm.weight")
+        && crate::runtime_flags::single_copy_weights_enabled()
+    {
+        if let Some(metal) = context.metal {
+            let view = bf16_entry_to_metal(headers, entry_ref, &spec.source, metal)?;
+            return Ok(DecoderTensor::LinearWeight(LinearWeight::DenseBf16(
+                crate::DenseBf16Tensor::new(&view.shape, view.buffer)?,
+            )));
+        }
+    }
     let bytes = read_entry_bytes(shard, entry)?;
     let mut tensor = tensor_from_safetensor_parts(&spec.source, entry.dtype, &entry.shape, &bytes)?;
     if is_fp8_weight(entry.dtype, &spec.source) {

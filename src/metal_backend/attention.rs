@@ -865,7 +865,7 @@ impl MetalExecutor {
             && in_dim % 512 == 0;
         let can_use_u3 =
             can_use_fast_affine_qmv_u3_buffers(1, in_dim, *out_dim, *group_size, *bits);
-        let can_use_u8 = full_qkv_split_rms_u8_enabled()
+        let can_use_u8 = self.kernel_profile.full_qkv_split_rms_u8
             && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
             && *group_size == FAST_QMV_GROUP_SIZE;
         if !can_use_u4 && !can_use_u3 && !can_use_u8 {
@@ -955,7 +955,7 @@ impl MetalExecutor {
             Some(4)
         } else if can_use_fast_affine_qmv_u3_buffers(1, in_dim, *out_dim, *group_size, *bits) {
             Some(3)
-        } else if full_qkv_split_rms_u8_enabled()
+        } else if self.kernel_profile.full_qkv_split_rms_u8
             && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
             && *group_size == FAST_QMV_GROUP_SIZE
         {
@@ -1111,7 +1111,7 @@ impl MetalExecutor {
             && *bits == FAST_QMV_BITS
             && *group_size == FAST_QMV_GROUP_SIZE
             && in_dim % 512 == 0;
-        let can_use_u8 = full_o_proj_gated_u8_enabled()
+        let can_use_u8 = self.kernel_profile.full_o_proj_gated_u8
             && can_use_fast_affine_qmv_u8_buffers(1, in_dim, *out_dim, *group_size, *bits)
             && *group_size == FAST_QMV_GROUP_SIZE;
         if !can_use_u4 && !can_use_u8 {

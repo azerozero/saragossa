@@ -35,6 +35,7 @@ mod attention;
 mod attention_cache;
 mod attention_ops;
 mod kv_rows;
+mod tts_prefill;
 #[cfg(test)]
 pub(crate) use attention_ops::{
     attention_probs_in_place, gemma_global_attention_prefill_oracle, GemmaGlobalAttentionOracleSpec,
@@ -124,6 +125,8 @@ pub struct CausalDecoderConfig {
     pub rms_eps: f32,
     /// Définit la base RoPE optionnelle.
     pub rope_theta: Option<f32>,
+    /// Borne la croissance opportuniste du K/V, sans réduire la réserve demandée.
+    pub max_position_embeddings: Option<usize>,
     /// Définit le nombre de couches du décodeur.
     pub num_hidden_layers: usize,
     /// Définit le nombre de têtes d'attention requête.
@@ -1137,6 +1140,7 @@ impl Default for CausalDecoderConfig {
         Self {
             rms_eps: 1.0e-6,
             rope_theta: Some(10_000.0),
+            max_position_embeddings: None,
             num_hidden_layers: 1,
             num_attention_heads: 1,
             num_key_value_heads: 1,
@@ -1188,6 +1192,7 @@ impl From<&ModelConfig> for CausalDecoderConfig {
         Self {
             rms_eps: config.rms_norm_eps,
             rope_theta: Some(config.rope_theta),
+            max_position_embeddings: config.max_position_embeddings,
             num_hidden_layers: config.num_hidden_layers,
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads,
@@ -2660,11 +2665,9 @@ impl CausalDecoder {
             return Ok(self);
         };
         self.ensure_metal_supported()?;
-        if self.runtime.metal.is_none() {
-            return Err(InferError::Config(
-                "drafter DFlash : runtime Metal requis".to_string(),
-            ));
-        }
+        let metal = self.runtime.metal.as_deref().ok_or_else(|| {
+            InferError::Config("drafter DFlash : runtime Metal requis".to_string())
+        })?;
         let quant = if crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_QUANT_BITS").is_none() {
             Some(crate::DFlashQuant {
                 group_size: 64,
@@ -2673,11 +2676,14 @@ impl CausalDecoder {
         } else {
             crate::DFlashQuant::from_env()?
         };
-        self.dflash = Some(crate::load_dflash_draft_weights_quantized(
-            target,
-            std::path::PathBuf::from(dir),
-            quant,
-        )?);
+        self.dflash = Some(
+            crate::devtools::dflash::load_dflash_draft_weights_with_runtime(
+                target,
+                std::path::PathBuf::from(dir),
+                quant,
+                ForwardRuntime::metal(metal),
+            )?,
+        );
         Ok(self)
     }
 
