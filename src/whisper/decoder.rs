@@ -759,6 +759,16 @@ fn token_id(tokenizer: &RustTokenizer, token: &str) -> Result<u32> {
 }
 
 #[cfg(test)]
+mod golden_tests {
+    #[test]
+    fn whisper() -> crate::tokenizer::golden_tests::TestResult {
+        // Same RustTokenizer loading and decode(..., true) as transcribe().
+        // No WhisperModel construction: this gate never reads weights.
+        crate::tokenizer::golden_tests::check_rust("whisper")
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
