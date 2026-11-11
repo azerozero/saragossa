@@ -41,16 +41,16 @@ impl MetalExecutor {
         // 3, kill-switch `SARAGOSSA_RUST_FUSED_SHARED_GATE_UP=0`) — attaque le poste dispatch-bound
         // du MoE (6 micro-QMV série du shared-expert). Sinon le chemin 2 QMV + swiglu
         // (résultat identique ; le fusé est ==CPU/tolérance, cf. test colocalisé).
-        let fused_shared =
-            can_fuse_shared_gate_up_weights(shape.shared_gate_proj, shape.shared_up_proj)
-                && self.encode_gate_up_swiglu_fast(
-                    encoder,
-                    input_buffer,
-                    shape.shared_gate_proj,
-                    shape.shared_up_proj,
-                    &scratch.shared_hidden,
-                    in_dim,
-                )?;
+        let fused_shared = self
+            .can_fuse_shared_gate_up_weights(shape.shared_gate_proj, shape.shared_up_proj)
+            && self.encode_gate_up_swiglu_fast(
+                encoder,
+                input_buffer,
+                shape.shared_gate_proj,
+                shape.shared_up_proj,
+                &scratch.shared_hidden,
+                in_dim,
+            )?;
         if !fused_shared {
             let projected_shared_gate_dim = self.encode_matmul_weight(
                 encoder,
@@ -240,7 +240,7 @@ impl MetalExecutor {
         // scalaire, puis gate+up+SwiGLU+gate, puis gate+up+SwiGLU seul —
         // chaque étage supprime des micro-dispatches série du shared-expert ;
         // à défaut, dépliage exact en QMV séparés.
-        let shared_gate_qmv_fused = fused_shared_gate_qmv_u8_enabled()
+        let shared_gate_qmv_fused = self.kernel_profile.fused_shared_gate_qmv_u8
             && self.encode_qmv_plus_shared_gate_fast_buffers(
                 context.encoder,
                 context.input_buffer,
@@ -251,7 +251,7 @@ impl MetalExecutor {
                 context.in_dim,
             )?;
         let fused_shared_with_gate = !shared_gate_qmv_fused
-            && fused_shared_gate_scalar_u8_enabled()
+            && self.kernel_profile.fused_shared_gate_scalar_u8
             && self.encode_gate_up_swiglu_shared_gate_fast_buffers(
                 context.encoder,
                 context.input_buffer,
@@ -280,7 +280,7 @@ impl MetalExecutor {
         }
         let fused_shared = !shared_gate_qmv_fused
             && (fused_shared_with_gate
-                || (can_fuse_shared_gate_up_buffers(
+                || (self.can_fuse_shared_gate_up_buffers(
                     &context.weights.shared_gate_proj,
                     &context.weights.shared_up_proj,
                 ) && self.encode_gate_up_swiglu_fast_buffers(
@@ -343,7 +343,7 @@ impl MetalExecutor {
         // shared DOIT être encodé (et barré) avant — d'où l'inversion
         // shared-down-avant-routed-down et le early-return si le kernel accepte.
         let mut shared_down_done = false;
-        if context.residual.is_some() && fused_moe_down_weighted_u8_enabled() {
+        if context.residual.is_some() && self.kernel_profile.fused_moe_down_weighted_u8 {
             self.encode_moe_shared_down_phase(context)?;
             shared_down_done = true;
             memory_barrier_buffers(context.encoder);

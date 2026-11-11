@@ -855,53 +855,57 @@ pub(super) fn valid_gather_lhs_rows(lhs_rows: usize, topk: usize) -> bool {
     lhs_rows > 0 && (lhs_rows == 1 || lhs_rows == topk || topk % lhs_rows == 0)
 }
 
-pub(super) fn can_use_fast_gather_pair_qmv(
-    lhs_rows: usize,
-    gate: &StackedAffineBuffers,
-    up: &StackedAffineBuffers,
-) -> bool {
-    fused_gate_up_enabled()
-        && (gate.bits != 8 || fused_gate_up_u8_enabled())
-        && can_use_fast_gather_qmv(lhs_rows, gate)
-        && can_use_fast_gather_qmv(lhs_rows, up)
-        && gate.experts == up.experts
-        && gate.out_dim == up.out_dim
-        && gate.in_dim == up.in_dim
-        && gate.packed_cols == up.packed_cols
-        && gate.group_size == up.group_size
-        && gate.bits == up.bits
-        && gate.groups == up.groups
-}
-
-pub(super) fn can_fuse_shared_gate_up_weights(gate: &Linear, up: &Linear) -> bool {
-    if !fused_shared_gate_up_enabled() {
-        return false;
+impl MetalExecutor {
+    pub(super) fn can_use_fast_gather_pair_qmv(
+        &self,
+        lhs_rows: usize,
+        gate: &StackedAffineBuffers,
+        up: &StackedAffineBuffers,
+    ) -> bool {
+        fused_gate_up_enabled()
+            && (gate.bits != 8 || self.kernel_profile.fused_gate_up_u8)
+            && can_use_fast_gather_qmv(lhs_rows, gate)
+            && can_use_fast_gather_qmv(lhs_rows, up)
+            && gate.experts == up.experts
+            && gate.out_dim == up.out_dim
+            && gate.in_dim == up.in_dim
+            && gate.packed_cols == up.packed_cols
+            && gate.group_size == up.group_size
+            && gate.bits == up.bits
+            && gate.groups == up.groups
     }
-    match (gate.weight(), up.weight()) {
-        (LinearWeight::AffineQuantized(gate), LinearWeight::AffineQuantized(up))
-            if gate.bits() == 8 || up.bits() == 8 =>
-        {
-            fused_shared_gate_up_u8_enabled()
+
+    pub(super) fn can_fuse_shared_gate_up_weights(&self, gate: &Linear, up: &Linear) -> bool {
+        if !fused_shared_gate_up_enabled() {
+            return false;
         }
-        _ => true,
+        match (gate.weight(), up.weight()) {
+            (LinearWeight::AffineQuantized(gate), LinearWeight::AffineQuantized(up))
+                if gate.bits() == 8 || up.bits() == 8 =>
+            {
+                self.kernel_profile.fused_shared_gate_up_u8
+            }
+            _ => true,
+        }
     }
-}
 
-pub(super) fn can_fuse_shared_gate_up_buffers(
-    gate: &MetalLinearWeightBuffers,
-    up: &MetalLinearWeightBuffers,
-) -> bool {
-    if !fused_shared_gate_up_enabled() {
-        return false;
-    }
-    match (gate, up) {
-        (
-            MetalLinearWeightBuffers::AffineQuantized {
-                bits: gate_bits, ..
-            },
-            MetalLinearWeightBuffers::AffineQuantized { bits: up_bits, .. },
-        ) if *gate_bits == 8 || *up_bits == 8 => fused_shared_gate_up_u8_enabled(),
-        _ => true,
+    pub(super) fn can_fuse_shared_gate_up_buffers(
+        &self,
+        gate: &MetalLinearWeightBuffers,
+        up: &MetalLinearWeightBuffers,
+    ) -> bool {
+        if !fused_shared_gate_up_enabled() {
+            return false;
+        }
+        match (gate, up) {
+            (
+                MetalLinearWeightBuffers::AffineQuantized {
+                    bits: gate_bits, ..
+                },
+                MetalLinearWeightBuffers::AffineQuantized { bits: up_bits, .. },
+            ) if *gate_bits == 8 || *up_bits == 8 => self.kernel_profile.fused_shared_gate_up_u8,
+            _ => true,
+        }
     }
 }
 

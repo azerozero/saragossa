@@ -96,6 +96,7 @@ fn affine_offsets_alignment_without_device() {
         FastQmvU2,
         FastQmvU3,
         FastQmvU6,
+        QmmBatchedU6,
         FastQmvOneU8,
         QmmNaFusedTiledU8,
         QmmNaU8Gs128,
@@ -152,6 +153,11 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
         (FastQmvU3, 3, 64, 1, 16, 768),
         (FastQmvU6, 6, 64, 1, 13, 512),
         (FastQmvU6, 6, 64, 1, 64, 512),
+        (QmmBatchedU6, 6, 64, 2, 13, 512),
+        (QmmBatchedU6, 6, 64, 7, 64, 512),
+        (QmmBatchedU6, 6, 64, 8, 64, 512),
+        (QmmBatchedU6, 6, 64, 9, 13, 512),
+        (QmmBatchedU6, 6, 64, 17, 64, 512),
         (FastQmvOneU8, 8, 64, 1, 1, 512),
         (FastQmvU8, 8, 64, 1, 64, 512),
         (FastQmvU8, 8, 128, 1, 64, 512),
@@ -212,6 +218,11 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
                         snapshot
                     );
                 }
+            }
+            if kernel == QmmBatchedU6 {
+                // Alignement minimal uint/bfloat, sans alignement vectoriel.
+                let shifted = offset_weight(&metal, &weight, [4, 2, 6], 0xdead)?;
+                assert_eq!(offset_dispatch(&metal, &shifted, m, resident)?, reference);
             }
             if matches!(kernel, QmmNaFusedTiledU4 | QmmNaFusedTiledU4Align64) {
                 // 4 est valide pour le repli uint*, mais pas pour le uint4 NA.

@@ -424,7 +424,7 @@ type PreparedAttentionRows = (Tensor, Option<Tensor>, Tensor, Tensor, AttentionL
 /// Projette q/k/v, applique les normes de tête et le RoPE à partir de
 /// `position_offset`, et renvoie `(q, gate, k, v, layout)`. Sans `with_q`, Q
 /// n'est pas projeté et reste vide (`[0, q]`) : seuls K et V sont calculés.
-fn full_attention_prepare_rows(
+pub(super) fn full_attention_prepare_rows(
     config: &CausalDecoderConfig,
     normed: &Tensor,
     position_offset: usize,
@@ -1238,14 +1238,27 @@ pub(super) fn causal_attention(
     layout: &AttentionLayout,
     sinks: Option<&[f32]>,
 ) -> Result<Tensor> {
+    causal_attention_suffix(q, k, v, layout, sinks, 0)
+}
+
+/// Même ordre des opérations que le prefill complet, y compris la division
+/// des scores : le decode utilise un inverse et n'est pas un oracle bit-à-bit.
+pub(super) fn causal_attention_suffix(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    layout: &AttentionLayout,
+    sinks: Option<&[f32]>,
+    position_offset: usize,
+) -> Result<Tensor> {
     validate_sinks(sinks, layout)?;
     let (seq, dim) = q.as_matrix()?;
     let (k_seq, k_dim) = k.as_matrix()?;
     let (v_seq, v_dim) = v.as_matrix()?;
     let expected_q_dim = layout.num_attention_heads * layout.head_dim;
     let expected_kv_dim = layout.num_key_value_heads * layout.head_dim;
-    if seq != k_seq
-        || seq != v_seq
+    if seq.checked_add(position_offset) != Some(k_seq)
+        || k_seq != v_seq
         || dim != expected_q_dim
         || k_dim != expected_kv_dim
         || v_dim != expected_kv_dim
@@ -1263,17 +1276,18 @@ pub(super) fn causal_attention(
     let mut out = vec![0.0_f32; seq * expected_q_dim];
     for pos in 0..seq {
         let q_row = q.row_slice(pos)?;
+        let absolute_pos = position_offset + pos;
         // Fenêtre sliding Gemma 3 : la position `pos` ne voit que les `window`
         // dernières positions causales ; `None` → masque causal plein.
         let window_start = layout
             .sliding_window
-            .map_or(0, |window| (pos + 1).saturating_sub(window));
+            .map_or(0, |window| (absolute_pos + 1).saturating_sub(window));
         for q_head in 0..layout.num_attention_heads {
             let kv_head = q_head / kv_group;
             let q_start = q_head * layout.head_dim;
             let q_slice = &q_row[q_start..q_start + layout.head_dim];
-            let mut scores = Vec::with_capacity(pos + 1 - window_start);
-            for row in window_start..=pos {
+            let mut scores = Vec::with_capacity(absolute_pos + 1 - window_start);
+            for row in window_start..=absolute_pos {
                 let key = k.row_slice(row)?;
                 let k_start = kv_head * layout.head_dim;
                 let k_slice = &key[k_start..k_start + layout.head_dim];

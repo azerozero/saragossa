@@ -19,6 +19,9 @@ pub struct TtsModel {
     pub(super) codec: TtsCodec,
     pub(super) codec_payload: TtsPayloadSummary,
     pub(super) clone_ctx: Option<TtsCloneContext>,
+    pub(super) voice_design_instruction: String,
+    // Le cache appartient aux poids chargés : aucun état ne survit au modèle.
+    pub(super) prefill_memo: std::sync::Mutex<super::prefill::TtsPrefillMemo>,
 }
 
 pub(super) enum TtsStreamDecodeState {
@@ -47,6 +50,9 @@ pub struct TtsSynthesisOutput {
     pub codes: Vec<Vec<i32>>,
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+    /// Le budget effectif a été consommé sans observer EOS. Le PCM reste utile,
+    /// mais peut être incomplet. `false` n'exclut pas l'arrêt anti-répétition.
+    pub frame_limit_reached: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

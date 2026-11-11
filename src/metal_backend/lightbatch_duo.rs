@@ -64,7 +64,9 @@ impl MetalExecutor {
     /// duo (jamais de repli silencieux vers le matmul générique).
     pub(crate) fn qmm2_eligible_weight(&self, weight: &MetalLinearWeightBuffers) -> bool {
         match weight {
-            MetalLinearWeightBuffers::Dense { .. } => false,
+            MetalLinearWeightBuffers::Dense { .. } | MetalLinearWeightBuffers::DenseBf16 { .. } => {
+                false
+            }
             MetalLinearWeightBuffers::AffineQuantized {
                 out_dim,
                 in_dim,
@@ -81,7 +83,10 @@ impl MetalExecutor {
 
     fn qmm2_eligible_weight_report(&self, name: &str, weight: &MetalLinearWeightBuffers) -> String {
         match weight {
-            MetalLinearWeightBuffers::Dense {
+            MetalLinearWeightBuffers::DenseBf16 {
+                out_dim, in_dim, ..
+            }
+            | MetalLinearWeightBuffers::Dense {
                 out_dim, in_dim, ..
             } => format!(
                 "{name}=dense[{out_dim},{in_dim}] batch2={}",
@@ -102,7 +107,9 @@ impl MetalExecutor {
 
     fn moe_router_duo_eligible(&self, weight: &MetalLinearWeightBuffers) -> bool {
         match weight {
-            MetalLinearWeightBuffers::Dense { .. } => true,
+            MetalLinearWeightBuffers::Dense { .. } | MetalLinearWeightBuffers::DenseBf16 { .. } => {
+                true
+            }
             MetalLinearWeightBuffers::AffineQuantized { .. } => self.qmm2_eligible_weight(weight),
         }
     }
@@ -124,7 +131,9 @@ impl MetalExecutor {
             return false;
         }
         match weight {
-            MetalLinearWeightBuffers::Dense { .. } => false,
+            MetalLinearWeightBuffers::Dense { .. } | MetalLinearWeightBuffers::DenseBf16 { .. } => {
+                false
+            }
             MetalLinearWeightBuffers::AffineQuantized {
                 out_dim,
                 in_dim: weight_in_dim,

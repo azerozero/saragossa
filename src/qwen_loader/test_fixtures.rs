@@ -17,6 +17,7 @@ pub(super) fn test_config() -> ModelConfig {
         intermediate_size: 4,
         rms_norm_eps: 1.0e-6,
         rope_theta: 10_000.0,
+        max_position_embeddings: None,
         vocab_size: 3,
         eos_token_ids: Vec::new(),
         tie_word_embeddings: false,

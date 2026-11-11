@@ -1,6 +1,47 @@
 use super::*;
 use crate::tts::payload::{fnv1a64_update, FNV1A64_OFFSET_BASIS};
 
+#[test]
+#[ignore = "mémoire: codec à 800 trames, snapshot local et Metal requis"]
+fn codec_at_server_frame_cap() -> Result<()> {
+    let codec = load_voicedesign_codec()
+        .ok_or_else(|| InferError::Config("snapshot codec local requis".to_string()))?;
+    assert!(codec.gpu_active(), "le test exige le codec Metal");
+    let samples = codec.decode_codes(&synthetic_codes(TTS_GENERATION_HARD_CAP, 16))?;
+    assert_eq!(samples.len(), TTS_GENERATION_HARD_CAP * 1920);
+    assert!(samples.iter().all(|x| x.is_finite()));
+    eprintln!(
+        "PCM maximal: {} octets",
+        std::mem::size_of_val(samples.as_slice())
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "inférence: snapshot VoiceDesign local et Metal requis"]
+fn synthesis_reports_frame_limit_with_audio() -> Result<()> {
+    let path = local_tts_snapshot(
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
+        "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
+    )
+    .ok_or_else(|| InferError::Config("snapshot VoiceDesign local requis".to_string()))?;
+    let model = TtsModel::load_local(path)?;
+    let text = "Bonjour, ceci est une phrase plus longue qu'une seule trame audio.";
+    let batch = model.synthesize_default(text, 1)?;
+    let mut pcm = Vec::new();
+    let streamed = model.synthesize_default_streaming(text, 1, |chunk| {
+        pcm.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    assert!(batch.frame_limit_reached);
+    assert!(streamed.frame_limit_reached);
+    assert_eq!(batch.codes.len(), 1);
+    assert_eq!(batch.codes, streamed.codes);
+    assert!(!batch.samples.is_empty());
+    assert_eq!(pcm, streamed.samples);
+    Ok(())
+}
+
 /// Parité audio codec **GPU vs CPU** sur codes synthétiques (160 + 256 frames).
 ///
 /// Gate = tolérance audio (max_abs ≤ 0,50, rms ≤ 0,10), PAS l'octet-à-octet :
@@ -125,7 +166,7 @@ fn codec_streaming_incremental_matches_full_prefix_on_representative_reply() -> 
             .decode_codes_streaming(&mut state, &codes[..target])?;
         streamed.extend_from_slice(&chunk);
         end = target;
-        next = next.saturating_mul(2).max(end + 1);
+        next = next.saturating_add(4);
     }
 
     assert_eq!(streamed.len(), full.len(), "longueur streaming != batch");

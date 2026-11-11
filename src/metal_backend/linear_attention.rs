@@ -803,7 +803,7 @@ impl MetalExecutor {
                         pos * spec.num_value_heads,
                         "linear-attn decay batch offset",
                     )?;
-                    if linear_conv_norm_fused_enabled()
+                    if self.linear_conv_norm_fused_enabled()
                         && spec.conv_kernel_dim == 4
                         && spec.value_head_dim == 128
                     {
@@ -1293,7 +1293,7 @@ impl MetalExecutor {
                         pos * spec.num_value_heads,
                         "linear-attn decay batch offset",
                     )?;
-                    if linear_conv_norm_fused_enabled()
+                    if self.linear_conv_norm_fused_enabled()
                         && spec.conv_kernel_dim == 4
                         && spec.value_head_dim == 128
                     {
@@ -1698,13 +1698,13 @@ impl MetalExecutor {
         let y_buffer = self.private_f32_buffer(value_dim, "linear_attn_y")?;
         let use_inv_delta = full_kernels
             && !spec.l2_qk_sigmoid_gate
-            && linear_inv_delta_enabled()
+            && self.kernel_profile.linear_inv_delta
             && spec.key_head_dim == 128
             && spec.value_head_dim == 128
             && linear_delta_dk128_enabled();
         if full_kernels
             && !spec.l2_qk_sigmoid_gate
-            && linear_conv_norm_fused_enabled()
+            && self.linear_conv_norm_fused_enabled()
             && !use_inv_delta
             && spec.conv_kernel_dim == 4
             && spec.key_head_dim == 128
@@ -2000,7 +2000,7 @@ impl MetalExecutor {
             let qkv_buffer = self.private_f32_buffer(conv_dim, "linear_attn_qkv")?;
             let z_beta_gate_buffer =
                 self.private_f32_buffer(z_beta_gate_concat_len, "linear_attn_z_beta_gate")?;
-            let (qkv_dim, z_beta_gate_dim) = if linear_pair_barrier_coalesce_enabled() {
+            let (qkv_dim, z_beta_gate_dim) = if self.kernel_profile.linear_pair_barrier_coalesce {
                 let barrier_guard = suspend_dispatch_barrier_scope();
                 let qkv_dim = self.encode_matmul_weight_buffers(
                     encoder,
@@ -2088,7 +2088,7 @@ impl MetalExecutor {
             return Ok(());
         }
 
-        let coalesce_pair_barriers = linear_pair_barrier_coalesce_enabled();
+        let coalesce_pair_barriers = self.kernel_profile.linear_pair_barrier_coalesce;
         let barrier_guard = if coalesce_pair_barriers {
             Some(suspend_dispatch_barrier_scope())
         } else {
@@ -3520,9 +3520,9 @@ impl MetalExecutor {
         ssm_len: usize,
         spec: LinearAttentionStepSpec,
     ) -> Result<()> {
-        let ssm_bf16 = linear_ssm_bf16_enabled()
+        let ssm_bf16 = self.kernel_profile.linear_ssm_bf16
             && linear_delta_dk128_enabled()
-            && !linear_inv_delta_enabled()
+            && !self.kernel_profile.linear_inv_delta
             && spec.key_head_dim == 128
             && spec.value_head_dim % 4 == 0;
         let valid = state.as_ref().is_some_and(|state| {
