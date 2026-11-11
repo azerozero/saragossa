@@ -906,6 +906,61 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Variante batchée du qmv u6 : un seul dispatch traite jusqu'à
+    /// `U6_QMM_BATCH_TILE` lignes d'entrée, en déquantifiant chaque poids une
+    /// fois pour toutes. Réservé au prefill (batch > 1) ; le qmv reste meilleur
+    /// pour le decode, où il n'y a qu'une ligne.
+    pub(super) fn encode_affine_qmm_batched_u6_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed_buffer: &BufferRef,
+        scales_buffer: &BufferRef,
+        biases_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        packed_cols: usize,
+        groups: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(out_dim, "qmm u6 out_dim")?,
+            checked_u32(in_dim, "qmm u6 in_dim")?,
+            checked_u32(packed_cols, "qmm u6 packed_cols")?,
+            checked_u32(groups, "qmm u6 groups")?,
+        ];
+        let batch_u32 = [checked_u32(batch, "qmm u6 batch")?];
+        encoder.set_compute_pipeline_state(&self.affine_qmm_batched_u6_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), 0);
+        encoder.set_buffer(2, Some(scales_buffer), 0);
+        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, &dims, "qmm_u6_dims")?;
+        set_u32_bytes(encoder, 6, &batch_u32, "qmm_u6_batch")?;
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            "affine_qmm_batched_u6_gs64",
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_U6_BITS,
+        ));
+        trace_dispatch_path("affine_qmm_batched_u6_gs64_f32", batch, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch.div_ceil(U6_QMM_BATCH_TILE), "qmm u6 batch tiles")?,
+                checked_nsuint(out_dim.div_ceil(2), "qmm u6 out groups")?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
+    }
+
     pub(super) fn encode_affine_qmv_u6_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
