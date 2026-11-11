@@ -50,6 +50,103 @@ pub(in crate::metal_backend) const PHASE_GATE: &str = "resident_phase_gate_y";
 pub(in crate::metal_backend) const PHASE_OUTPUT: &str = "resident_phase_output_down";
 pub(in crate::metal_backend) const PHASE_NORM: &str = "resident_phase_norm";
 
+/// Oracle d'allocation uniquement : les phases, kernels et dispatchs restent ceux
+/// du prefill résident. Aucun branchement ni état supplémentaire en production.
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+    use crate::metal_backend::*;
+    use std::cell::RefCell;
+
+    pub(crate) struct PhaseAllocation {
+        pub label: &'static str,
+        pub requested: usize,
+        // Conserver les buffers interdit la réutilisation d'une adresse dans
+        // l'oracle distinct et permet d'inspecter le mode de stockage réel.
+        pub buffer: Buffer,
+    }
+
+    struct Trace {
+        distinct: bool,
+        allocations: Vec<PhaseAllocation>,
+    }
+
+    thread_local! {
+        static TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn with_phase_allocations<R>(
+        distinct: bool,
+        run: impl FnOnce() -> R,
+    ) -> (R, Vec<PhaseAllocation>) {
+        struct Restore(Option<Trace>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TRACE.with(|trace| trace.replace(self.0.take()));
+            }
+        }
+        let _restore = Restore(TRACE.with(|trace| {
+            trace.replace(Some(Trace {
+                distinct,
+                allocations: Vec::new(),
+            }))
+        }));
+        let result = run();
+        let allocations = TRACE.with(|trace| {
+            std::mem::take(
+                &mut trace
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("invariant: trace active dans sa portée")
+                    .allocations,
+            )
+        });
+        (result, allocations)
+    }
+
+    pub(in crate::metal_backend) fn allocate_phase_scratch_for_test(
+        executor: &MetalExecutor,
+        len: usize,
+        label: &'static str,
+    ) -> Option<Result<Buffer>> {
+        if ![
+            PHASE_Q_CONTEXT,
+            PHASE_ROPE_GATED,
+            PHASE_GATE,
+            PHASE_OUTPUT,
+            PHASE_NORM,
+        ]
+        .contains(&label)
+        {
+            return None;
+        }
+        TRACE.with(|trace| {
+            let mut trace = trace.borrow_mut();
+            let trace = trace.as_mut()?;
+            Some((|| {
+                let buffer = if trace.distinct {
+                    executor
+                        .device
+                        .new_buffer(byte_len::<f32>(len)?, scratch_resource_options())
+                } else {
+                    executor.scratch_buffer_with_options(
+                        len,
+                        MetalBufferElement::F32,
+                        label,
+                        scratch_resource_options(),
+                    )?
+                };
+                trace.allocations.push(PhaseAllocation {
+                    label,
+                    requested: len,
+                    buffer: buffer.clone(),
+                });
+                Ok(buffer)
+            })())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +170,13 @@ mod tests {
     /// Compare les bits à des RMS exécutés dans des buffers tous distincts.
     #[test]
     fn prefill_phase_reuse_is_bit_exact_without_weights() -> Result<()> {
+        for private in [false, true] {
+            with_private_scratch_override(private, check_phase_reuse)?;
+        }
+        Ok(())
+    }
+
+    fn check_phase_reuse() -> Result<()> {
         let executor = match MetalExecutor::new() {
             Ok(executor) => executor,
             Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
