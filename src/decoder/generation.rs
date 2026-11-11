@@ -3240,7 +3240,7 @@ impl CausalDecoder {
         let (cache, final_states, captures) =
             self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids, usize::MAX, false)?;
         let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
-        Ok((cache, final_state, captures.hidden))
+        Ok((cache, final_state, Arc::unwrap_or_clone(captures.hidden)))
     }
 
     /// Comme [`Self::prefill_cache_state_with_layer_capture`], mais rend les
@@ -3311,7 +3311,7 @@ impl CausalDecoder {
             PrefixCaptures {
                 layer_ids: layer_ids.to_vec(),
                 from: 0,
-                hidden: target_hidden,
+                hidden: target_hidden.into(),
             },
         ))
     }
@@ -4408,14 +4408,18 @@ impl CausalDecoder {
     /// les captures de `layer_ids` et prolonge état et captures sur le suffixe
     /// par le prefill résident borné par défaut, avec le forward per-op en repli.
     /// Rend `(cache, état final, captures, from)` avec les captures bornées aux
-    /// `keep_rows` dernières positions, y compris avant copie d'un hit exact.
+    /// `keep_rows` dernières positions, partagées pour un hit exact sans troncature.
     #[cfg(feature = "devtools")]
+    #[expect(
+        clippy::type_complexity,
+        reason = "état du cache, état final, captures partagées et position absolue"
+    )]
     pub(super) fn prefix_cache_get_with_captures(
         &self,
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
-    ) -> Result<Option<(CausalDecoderCache, Tensor, Tensor, usize)>> {
+    ) -> Result<Option<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)>> {
         let Some((mut output, cached_len, history, Some(captures))) =
             self.prefix_cache_hit(prompt, false, keep_rows)?
         else {
@@ -4479,7 +4483,7 @@ impl CausalDecoder {
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
-    ) -> Result<(CausalDecoderCache, Tensor, Tensor, usize)> {
+    ) -> Result<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)> {
         let profile = crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_PROFILE", false);
         let started = Instant::now();
         if prefix_cache_enabled() {
@@ -5180,7 +5184,9 @@ impl CausalDecoder {
                 false,
                 chunk_tokens,
             )?
-            .and_then(|(_, _, captures)| captures.map(|captures| captures.hidden)))
+            .and_then(|(_, _, captures)| {
+                captures.map(|captures| Arc::unwrap_or_clone(captures.hidden))
+            }))
     }
 
     /// Oracle de test : logits des lignes `rows` d'un hidden non normé
@@ -5853,12 +5859,17 @@ pub(super) fn stitch_captures(
             "captures préfixe/suffixe: couches ou colonnes incompatibles".to_string(),
         ));
     }
-    // Un suffixe déjà tronqué ne doit pas être recollé au préfixe : les
-    // positions intermédiaires manquent. La couverture est vérifiée ci-dessous.
-    let (from, hidden) = if suffix.from > cached_len {
+    // Un suffixe qui couvre la fenêtre suffit : adopter ses captures au lieu
+    // d'empiler le préfixe pour le jeter aussitôt. Un suffixe déjà tronqué ne
+    // doit pas être recollé : les positions intermédiaires manquent. La
+    // couverture reste vérifiée ci-dessous.
+    let (from, hidden) = if suffix_rows >= keep_rows.max(1) || suffix.from > cached_len {
         (suffix.from, suffix.hidden)
     } else {
-        (prefix.from, stack_rows(&prefix.hidden, &suffix.hidden)?)
+        (
+            prefix.from,
+            stack_rows(&prefix.hidden, &suffix.hidden)?.into(),
+        )
     };
     let captures = PrefixCaptures::tail(&prefix.layer_ids, from, hidden, keep_rows)?;
     let (rows, _) = captures.hidden.as_matrix()?;

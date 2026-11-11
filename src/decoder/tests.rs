@@ -715,6 +715,84 @@ fn prefix_cache_put_exact_replacement_keeps_metadata() -> Result<()> {
     Ok(())
 }
 
+/// Insertion, hits et remplacement sans captures partagent les mêmes octets ;
+/// une éviction laisse le consommateur vivant sans réécrire ses données.
+#[test]
+#[cfg(feature = "devtools")]
+fn prefix_cache_dflash_shares_captures_until_eviction() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let prompt = [1usize, 2, 3, 4];
+    let state = (model.empty_cache(), Tensor::row(vec![0.0])?);
+    let bits = [0x8000_0000, 0x7fc0_0123, 0x0000_0001, 0x3f80_0000];
+    let captures = PrefixCaptures::new(
+        &[0],
+        0,
+        Tensor::from_vec(vec![4, 1], bits.map(f32::from_bits).to_vec())?,
+    );
+    model.prefix_cache_put(&prompt, &state, None, Some(&captures))?;
+    // Un chemin AR réinsère le même préfixe : conserver aussi le partage.
+    model.prefix_cache_put(&prompt, &state, None, None)?;
+    let (_, _, hidden, from) = model
+        .prefix_cache_get_with_captures(&prompt, &[0], 4)?
+        .ok_or_else(|| InferError::Config("hit attendu".to_string()))?;
+    assert_eq!(from, 0);
+    assert!(Arc::ptr_eq(&hidden, &captures.hidden));
+    {
+        let mut cache = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+        let stored = cache.entries[0]
+            .captures
+            .as_ref()
+            .ok_or_else(|| InferError::Config("captures attendues".to_string()))?;
+        assert!(Arc::ptr_eq(&hidden, &stored.hidden));
+        cache.evict_lru_entry();
+    }
+    drop(captures);
+    assert_eq!(Arc::strong_count(&hidden), 1);
+    assert_eq!(
+        hidden
+            .data()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>(),
+        bits
+    );
+    Ok(())
+}
+
+/// Le plafond et l'éviction ne comptent pas deux fois des captures partagées.
+#[test]
+fn prefix_cache_byte_cap_counts_shared_captures_once() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let captures = PrefixCaptures::new(&[0], 0, Tensor::zeros(vec![4, 8])?);
+    let entry = |captures: Option<PrefixCaptures>| -> Result<PrefixCacheEntry> {
+        Ok(PrefixCacheEntry {
+            tokens: vec![1, 2, 3, 4],
+            cache: model.empty_cache(),
+            final_state: Tensor::row(vec![0.0])?,
+            mtp_history: None,
+            captures,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            linear_metal: Vec::new(),
+        })
+    };
+    let base = entry(None)?.estimated_bytes_unseen(&mut Default::default());
+    let mut cache = PrefixCache {
+        entries: vec![
+            entry(Some(captures.clone()))?,
+            entry(Some(captures.clone()))?,
+        ],
+    };
+    let total = 2 * base + captures.hidden.capacity_bytes() as u64;
+    cache.enforce_byte_cap(total);
+    assert_eq!(cache.entries.len(), 2);
+    assert_eq!(cache.evict_lru_entry(), Some(base));
+    assert_eq!(cache.evict_lru_entry(), Some(total - base));
+    Ok(())
+}
+
 /// Un hit DFlash exige les mêmes couches et des captures couvrant la fenêtre
 /// demandée ; une entrée à fenêtre plus courte est ignorée (prefill complet).
 #[test]
@@ -782,14 +860,19 @@ fn prefix_captures_stitch_tail_boundaries_cpu() -> Result<()> {
         (3, 6, 8, 4, 6),  // Anciennes captures déjà bornées, encore nécessaires.
         (3, 6, 13, 4, 9), // Anciennes captures bornées devenues inutiles.
     ] {
-        let result = generation::stitch_captures(
-            captures(prefix_from, cached_len)?,
-            captures(suffix_from, prompt_len)?,
-            cached_len,
-            prompt_len,
-            keep,
-        )?;
+        let prefix = captures(prefix_from, cached_len)?;
+        let suffix = captures(suffix_from, prompt_len)?;
+        let prefix_snapshot = Arc::clone(&prefix.hidden);
+        let suffix_snapshot = Arc::clone(&suffix.hidden);
+        let result = generation::stitch_captures(prefix, suffix, cached_len, prompt_len, keep)?;
         assert_eq!(result.from, prompt_len - keep);
+        assert_eq!(
+            Arc::ptr_eq(&result.hidden, &suffix_snapshot),
+            prompt_len - suffix_from == keep,
+            "adopter le suffixe qui couvre exactement la fenêtre"
+        );
+        assert_eq!(prefix_snapshot, captures(prefix_from, cached_len)?.hidden);
+        assert_eq!(suffix_snapshot, captures(suffix_from, prompt_len)?.hidden);
         assert_eq!(result.from + result.hidden.as_matrix()?.0, prompt_len);
         assert_eq!(result.layer_ids, [1, 0]);
         assert_eq!(
@@ -851,8 +934,9 @@ fn prefix_cache_dflash_exact_hit_bounds_unlimited_captures_cpu() -> Result<()> {
         assert_eq!(hit.3, from);
         assert_eq!(hit.2.shape(), &[prompt.len() - from, 1]);
         assert_eq!(hit.2.data(), &captures.hidden.data()[from..]);
+        assert_eq!(Arc::ptr_eq(&hit.2, &captures.hidden), from == 0);
     }
-    // La copie bornée ne réduit pas la couverture de l'entrée conservée.
+    // La queue copiée et le hit partagé conservent la couverture de l'entrée.
     let cache = model
         .prefix_cache
         .lock()
