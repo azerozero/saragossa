@@ -9,7 +9,7 @@ fn fixture(root: &Path) -> (CausalDecoder, Option<Request>) {
     let request = Request {
         root: root.to_owned(),
         key: Key {
-            version: 2,
+            version: 3,
             prompt_sha256: "test".into(),
             tokens: 2,
             sources: Vec::new(),
@@ -503,4 +503,182 @@ fn recurrent_cpu_geometry_roundtrip_and_oversized_ssm_rejected() -> Result<()> {
     write_manifest(dir.path(), &manifest);
     assert!(model.snapshot_load(&request).is_none());
     Ok(())
+}
+
+#[test]
+fn content_identity_covers_shards_auxiliaries_and_sidecars() {
+    isolated(
+        "content_identity_covers_shards_auxiliaries_and_sidecars",
+        true,
+        |root| {
+            use std::io::{Seek, SeekFrom, Write};
+            let draft = root.join("draft");
+            std::fs::create_dir(&draft).unwrap();
+            let paths = [
+                root.join("shard-1.safetensors"),
+                root.join("shard-2.safetensors"),
+                root.join("model.safetensors.index.json"),
+                root.join("config.json"),
+                root.join("mtp.safetensors"),
+                draft.join("model.safetensors"),
+                draft.join("config.json"),
+            ];
+            for path in &paths {
+                std::fs::write(path, b"synthetic A").unwrap();
+            }
+            let capture = || {
+                let mut sources =
+                    SnapshotSources::capture([paths[0].as_path(), paths[1].as_path()]);
+                sources.append(SnapshotSources::capture([paths[4].as_path()]));
+                sources.append(SnapshotSources::capture([paths[5].as_path()]));
+                sources
+            };
+            for path in &paths {
+                let original = capture();
+                let (model, mut request) = fixture(&root.join("snapshots"));
+                let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
+                request.as_mut().unwrap().key.sources = original.verified().unwrap().to_vec();
+                let model = model.with_snapshot_sources(original.clone());
+                model
+                    .snapshot_save(&request, &cache, &state, None, None)
+                    .unwrap();
+                assert!(model.snapshot_load(&request).is_some());
+                let manifest = request.as_ref().unwrap().root.join("manifest.json");
+                let previous = std::fs::read(&manifest).unwrap();
+                let metadata = std::fs::metadata(path).unwrap();
+                let mut file = std::fs::File::options().write(true).open(path).unwrap();
+                file.seek(SeekFrom::End(-1)).unwrap();
+                file.write_all(b"B").unwrap();
+                file.set_modified(metadata.modified().unwrap()).unwrap();
+                let after = file.metadata().unwrap();
+                assert_eq!(metadata.len(), after.len());
+                assert_eq!(metadata.modified().unwrap(), after.modified().unwrap());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    assert_eq!(metadata.ino(), after.ino());
+                    assert_eq!(metadata.dev(), after.dev());
+                    // Le contrôle post-chargement refuse aussi une course à mtime restauré.
+                    assert!(original.clone().finish_loading().verified().is_err());
+                    assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
+                    assert!(model.snapshot_load(&request).is_none());
+                    model
+                        .snapshot_save(&request, &cache, &state, None, None)
+                        .unwrap();
+                    assert_eq!(previous, std::fs::read(&manifest).unwrap());
+                }
+                let changed = capture();
+                let old_sources = original.0.as_ref().unwrap().as_ref().unwrap();
+                let new_sources = changed.verified().unwrap();
+                // Vérifier le hash lui-même : le ctime ne doit pas masquer une
+                // régression vers une identité purement fondée sur les métadonnées.
+                let hashes = |sources: &[Source]| {
+                    sources
+                        .iter()
+                        .filter(|source| source.path() == path)
+                        .map(|source| {
+                            serde_json::to_value(source).unwrap()["content_sha256"].clone()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert!(!hashes(old_sources).is_empty());
+                assert_ne!(hashes(old_sources), hashes(new_sources));
+                let (fresh, mut fresh_request) = fixture(&root.join("snapshots"));
+                fresh_request.as_mut().unwrap().key.sources = new_sources.to_vec();
+                let fresh = fresh.with_snapshot_sources(changed);
+                assert!(fresh.snapshot_load(&fresh_request).is_none());
+            }
+        },
+    );
+}
+
+#[test]
+fn diagnostic_ablations_disable_reads_writes_and_hashing() {
+    let flags = [
+        ("SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM", "0"),
+        ("SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED", ""),
+        ("RETI_RUST_MOE_COOP_SKIP_GEMM", "1"),
+        ("RETI_RUST_MOE_COOP_SKIP_SHARED", "0"),
+        ("SARAGOSSA_RUST_VERIFY_SKIP", "full_layer"),
+        ("SARAGOSSA_RUST_KV_BF16_SIM_KONLY", "1"),
+        ("SARAGOSSA_RUST_KV_BF16_SIM_VONLY", "true"),
+    ];
+    let Some(root) = std::env::var_os("SARAGOSSA_SNAPSHOT_TEST_CHILD") else {
+        for (flag, value) in flags {
+            let dir = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            for (name, _) in flags {
+                command.env_remove(name);
+            }
+            let output = command.args([
+                "--exact", "decoder::state_snapshot::tests::diagnostic_ablations_disable_reads_writes_and_hashing",
+                "--nocapture",
+            ])
+                .env("SARAGOSSA_SNAPSHOT_TEST_CHILD", dir.path())
+                .env("SARAGOSSA_RUST_STATE_SNAPSHOT", dir.path().join("snapshots"))
+                .env(flag, value).output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{flag}: {}\n{stderr}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(stderr.contains("instantané désactivé"), "{stderr}");
+            assert!(!stderr.contains("state_snapshot hash_ms="), "{stderr}");
+        }
+        return;
+    };
+    let root = Path::new(&root);
+    let sources = SnapshotSources::capture(std::iter::from_fn(|| -> Option<&Path> {
+        panic!("aucune lecture source sous ablation");
+    }));
+    assert!(sources.0.unwrap().is_err());
+    let (model, request) = fixture(&root.join("snapshots"));
+    assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
+    #[cfg(feature = "devtools")]
+    assert!(model
+        .snapshot_request_dflash(&[0, 1], "dflash", None)
+        .unwrap()
+        .is_none());
+    assert!(model.snapshot_load(&request).is_none());
+    let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
+    model
+        .snapshot_save(&request, &cache, &state, None, None)
+        .unwrap();
+    assert!(!root.join("snapshots").exists());
+    // Une simulation déjà résolue reste active après retrait de l'env.
+    for flag in [
+        "SARAGOSSA_RUST_KV_BF16_SIM_KONLY",
+        "SARAGOSSA_RUST_KV_BF16_SIM_VONLY",
+    ] {
+        if std::env::var_os(flag).is_some() {
+            std::env::remove_var(flag);
+            assert_eq!(crate::runtime_flags::state_snapshot_ablation(), Some(flag));
+        }
+    }
+}
+
+#[test]
+fn late_moe_ablation_refuses_an_existing_snapshot() {
+    isolated(
+        "late_moe_ablation_refuses_an_existing_snapshot",
+        true,
+        |root| {
+            let path = root.join("weights");
+            std::fs::write(&path, b"synthetic").unwrap();
+            let (model, _) = fixture(root);
+            let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
+            let request = model.snapshot_request(&[0, 1], "ar").unwrap();
+            let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
+            assert!(model.snapshot_load(&request).is_some());
+            let manifest = request.as_ref().unwrap().root.join("manifest.json");
+            let previous = std::fs::read(&manifest).unwrap();
+            std::env::set_var("SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM", "1");
+            assert!(model.snapshot_load(&request).is_none());
+            model
+                .snapshot_save(&request, &cache, &state, None, None)
+                .unwrap();
+            assert_eq!(std::fs::read(&manifest).unwrap(), previous);
+        },
+    );
 }

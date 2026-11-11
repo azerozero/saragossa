@@ -33,45 +33,6 @@ pub(super) fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct Source {
-    path: PathBuf,
-    bytes: u64,
-    modified_ns: u128,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-}
-impl Source {
-    pub(super) fn verify(&self) -> Result<()> {
-        if Self::read(&self.path)? != *self {
-            return Err(invalid("source modifiée depuis le chargement"));
-        }
-        Ok(())
-    }
-    pub(super) fn read(path: &Path) -> Result<Self> {
-        // Conserver le chemin demandé permet aussi de détecter une cible de lien changée.
-        let path = path.to_owned();
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        let metadata = io(&path, fs::metadata(&path))?;
-        let modified_ns = io(&path, metadata.modified())?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| invalid("mtime antérieur à UNIX_EPOCH"))?
-            .as_nanos();
-        Ok(Self {
-            path,
-            bytes: metadata.len(),
-            modified_ns,
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-        })
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Blob {
     pub(super) file: PathBuf,

@@ -2082,6 +2082,62 @@ pub(super) fn print_layer_profile(
     );
 }
 
+/// Diagnostic C1B (hors prod) : arrondit **seulement K** au seed prefill (V reste
+/// f32 exact), pour isoler l'effet de la précision des clés (→ scores) sur la
+/// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_KONLY=1`, défaut OFF. À utiliser avec
+/// `SARAGOSSA_RUST_KV_BF16=0` (buffers f32). N'arrondit que le seed, pas les lignes
+/// appendées en decode (négligeables devant le prompt).
+pub(crate) fn kv_bf16_sim_konly() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_BF16_SIM_KONLY", false))
+}
+
+/// Diagnostic C1B (hors prod) : arrondit **seulement V** au seed prefill (K reste
+/// f32 exact), pour isoler l'effet de la précision des valeurs (→ sortie) sur la
+/// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_VONLY=1`, défaut OFF.
+pub(crate) fn kv_bf16_sim_vonly() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_BF16_SIM_VONLY", false))
+}
+
+/// Refus conservateur des diagnostics qui retirent un calcul ou altèrent le seed.
+/// Les flags MoE sont actifs par présence, y compris "0" ou une chaîne vide,
+/// exactement comme dans moe_na. VERIFY_SKIP est refusé même hors de sa portée
+/// de bench, pour ne jamais mêler cette expérience à un instantané complet.
+pub(crate) fn state_snapshot_ablation() -> Option<&'static str> {
+    for flag in [
+        "SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM",
+        "SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED",
+        "SARAGOSSA_RUST_VERIFY_SKIP",
+    ] {
+        if env_var(flag).is_some() {
+            return Some(flag);
+        }
+    }
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if [
+        "moe_full",
+        "moe_linear",
+        "linear_attn",
+        "full_layer",
+        "head",
+    ]
+    .iter()
+    .any(|part| verify_skip(part))
+    {
+        return Some("SARAGOSSA_RUST_VERIFY_SKIP");
+    }
+    // Ces accesseurs sont aussi ceux du calcul : retirer une variable après
+    // résolution du OnceLock ne doit pas faire disparaître le refus.
+    if kv_bf16_sim_konly() {
+        return Some("SARAGOSSA_RUST_KV_BF16_SIM_KONLY");
+    }
+    if kv_bf16_sim_vonly() {
+        return Some("SARAGOSSA_RUST_KV_BF16_SIM_VONLY");
+    }
+    None
+}
+
 /// Répertoire fixé au premier accès ; l'absence ne crée même pas l'alias historique.
 pub(crate) fn state_snapshot_dir() -> Option<&'static std::path::Path> {
     static ROOT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();

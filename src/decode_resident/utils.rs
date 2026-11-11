@@ -387,23 +387,7 @@ pub(super) fn bf16_round_f32(value: f32) -> f32 {
     f32::from_bits(u32::from(f32_to_bf16_bits(value)) << 16)
 }
 
-/// Diagnostic C1B (hors prod) : arrondit **seulement K** au seed prefill (V reste
-/// f32 exact), pour isoler l'effet de la précision des clés (→ scores) sur la
-/// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_KONLY=1`, défaut OFF. À utiliser avec
-/// `SARAGOSSA_RUST_KV_BF16=0` (buffers f32). N'arrondit que le seed, pas les lignes
-/// appendées en decode (négligeables devant le prompt).
-pub(super) fn kv_bf16_sim_konly() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_BF16_SIM_KONLY", false))
-}
-
-/// Diagnostic C1B (hors prod) : arrondit **seulement V** au seed prefill (K reste
-/// f32 exact), pour isoler l'effet de la précision des valeurs (→ sortie) sur la
-/// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_VONLY=1`, défaut OFF.
-pub(super) fn kv_bf16_sim_vonly() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_BF16_SIM_VONLY", false))
-}
+pub(super) use crate::runtime_flags::{kv_bf16_sim_konly, kv_bf16_sim_vonly};
 
 /// Active la SDPA decode **2-passes split-K** (dédup GQA + tuiles L1) au-delà de
 /// `sdpa_2pass_min_len()` rows de KV. Défaut ON ; kill-switch `SARAGOSSA_RUST_SDPA_2PASS=0`.

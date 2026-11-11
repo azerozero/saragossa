@@ -1,5 +1,6 @@
 //! Instantané diagnostic post-prefill. Le decode reprend le format du cache de
 //! préfixe ; seules les données persistantes traversent la frontière disque.
+mod sources;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -7,10 +8,11 @@ mod validation;
 use super::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sources::Source;
 use std::path::{Path, PathBuf};
-use storage::{invalid, io, Blob, Source, Writer};
+use storage::{invalid, io, Blob, Writer};
 
-/// Métadonnées figées avant la lecture des poids, uniquement en mode diagnostic.
+/// Contenu et métadonnées figés avant la lecture des poids, uniquement en mode diagnostic.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SnapshotSources(Option<std::result::Result<Vec<Source>, String>>);
 
@@ -21,17 +23,19 @@ impl SnapshotSources {
         }
         Self(Some(
             (|| -> Result<Vec<Source>> {
+                snapshot_calculations_complete()?;
                 let mut sources = Vec::new();
                 for path in paths {
-                    sources.push(Source::read(path)?);
+                    if !sources.iter().any(|source: &Source| source.path() == path) {
+                        sources.push(Source::read(path)?);
+                    }
                     if let Some(parent) = path.parent() {
                         for name in ["model.safetensors.index.json", "config.json"] {
                             let auxiliary = parent.join(name);
-                            if auxiliary.is_file() {
-                                let source = Source::read(&auxiliary)?;
-                                if !sources.contains(&source) {
-                                    sources.push(source);
-                                }
+                            if auxiliary.is_file()
+                                && !sources.iter().any(|source| source.path() == auxiliary)
+                            {
+                                sources.push(Source::read(&auxiliary)?);
                             }
                         }
                     }
@@ -43,6 +47,7 @@ impl SnapshotSources {
     }
 
     fn verified(&self) -> Result<&[Source]> {
+        snapshot_calculations_complete()?;
         let sources = self
             .0
             .as_ref()
@@ -76,6 +81,16 @@ impl SnapshotSources {
             }
         }
     }
+}
+
+/// Les ablations ne doivent ni relire un calcul complet ni publier un calcul tronqué.
+fn snapshot_calculations_complete() -> Result<()> {
+    if let Some(flag) = crate::runtime_flags::state_snapshot_ablation() {
+        return Err(invalid(format!(
+            "diagnostic {flag} actif, instantané désactivé"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -332,7 +347,7 @@ impl CausalDecoder {
         Ok(Some(Request {
             root: root.join(format!("entry-{entry}")),
             key: Key {
-                version: 2,
+                version: 3,
                 prompt_sha256,
                 tokens: prompt.len(),
                 sources: sources.to_vec(),
@@ -409,6 +424,7 @@ impl CausalDecoder {
     }
 
     fn snapshot_read(&self, request: &Request) -> Result<State> {
+        snapshot_calculations_complete()?;
         for source in &request.key.sources {
             source.verify()?;
         }
@@ -503,7 +519,9 @@ impl CausalDecoder {
         let Some(request) = request else {
             return Ok(());
         };
-        if let Err(error) = request.key.sources.iter().try_for_each(Source::verify) {
+        if let Err(error) = snapshot_calculations_complete()
+            .and_then(|()| request.key.sources.iter().try_for_each(Source::verify))
+        {
             eprintln!("state_snapshot refusé : {error}; sans écriture");
             return Ok(());
         }
@@ -534,7 +552,9 @@ impl CausalDecoder {
             history,
             captures,
         };
-        if let Err(error) = request.key.sources.iter().try_for_each(Source::verify) {
+        if let Err(error) = snapshot_calculations_complete()
+            .and_then(|()| request.key.sources.iter().try_for_each(Source::verify))
+        {
             eprintln!("state_snapshot refusé : {error}; sans publication");
             return Ok(());
         }
