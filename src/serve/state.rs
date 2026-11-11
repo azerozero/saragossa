@@ -1197,7 +1197,11 @@ impl LoadedModel {
     fn prompt_encoding(&self, request: &ChatCompletionRequest) -> ServeResult<PromptEncoding> {
         let rendered = render_chat_prompt(
             &self.assets.config,
-            self.assets.tokenizer.qwen_profile(),
+            if self.assets.config.model_type.starts_with("qwen") {
+                self.assets.tokenizer.qwen_profile()?
+            } else {
+                saragossa::chat_template::QwenProfile::Qwen36
+            },
             request,
         )?;
         let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
@@ -1596,7 +1600,7 @@ fn kv_allocations(state: &CausalDecoderPromptState) -> std::collections::HashSet
     seen
 }
 
-fn output_parser_for_config(
+pub(super) fn output_parser_for_config(
     config: &saragossa::ModelConfig,
     request: &ChatCompletionRequest,
 ) -> ServeResult<Option<super::tool_output::ToolOutputParser>> {

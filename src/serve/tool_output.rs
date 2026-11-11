@@ -1,8 +1,22 @@
 //! Adaptation commune des sorties d'outils vers les transports HTTP.
+//!
+//! Qwen/Gemma : les exemples Markdown et citations restent littéraux. Un bloc
+//! est limité à 64 Kio UTF-8, ses arguments JSON à 32 Kio, et une réponse à
+//! 64 appels (un seul sans parallélisme). Un dépassement de bloc désactive
+//! l'interprétation pour le reste de la réponse ; un appel incomplet, invalide
+//! ou aux arguments trop longs n'est jamais émis. Les curseurs avancent une
+//! seule fois sur chaque caractère, hors préfixes de marqueurs de taille fixe.
 use super::flint_output::{FlintEvent, FlintOutput, FlintOutputParser};
 use super::protocol::{ToolCall, ToolCallFunction};
 use serde_json::{Map, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod framing;
+use framing::{FrameScan, LiteralContext};
+
+const MAX_FRAME_BYTES: usize = 64 * 1024;
+const MAX_ARGUMENT_BYTES: usize = 32 * 1024;
+const MAX_CALLS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ToolFamily {
@@ -46,10 +60,13 @@ impl ToolOutputParser {
         Self::Framed(FramedParser {
             family,
             tools,
-            max_calls: if parallel { usize::MAX } else { 1 },
+            max_calls: if parallel { MAX_CALLS } else { 1 },
             pending: String::new(),
             calls: 0,
             in_reasoning: false,
+            frame: FrameScan::default(),
+            literal: LiteralContext::default(),
+            passthrough: false,
             id: format!(
                 "call_{:x}",
                 SystemTime::now()
@@ -62,15 +79,28 @@ impl ToolOutputParser {
         match self {
             Self::Flint(p) => p.push(delta),
             Self::Framed(p) => {
-                p.pending.push_str(delta);
-                p.drain(false)
+                let mut events = Vec::new();
+                // Borner aussi un delta unique, indépendamment du budget de génération.
+                for ch in delta.chars() {
+                    if p.pending.len() + ch.len_utf8() > MAX_FRAME_BYTES {
+                        p.passthrough = true;
+                        content_event(&mut events, std::mem::take(&mut p.pending));
+                    }
+                    p.pending.push(ch);
+                    p.drain(false, &mut events);
+                }
+                events
             }
         }
     }
     pub(super) fn finish(&mut self) -> Vec<FlintEvent> {
         match self {
             Self::Flint(p) => p.finish(),
-            Self::Framed(p) => p.drain(true),
+            Self::Framed(p) => {
+                let mut events = Vec::new();
+                p.drain(true, &mut events);
+                events
+            }
         }
     }
     pub(super) fn has_tool_calls(&self) -> bool {
@@ -79,9 +109,13 @@ impl ToolOutputParser {
             Self::Framed(p) => p.calls > 0,
         }
     }
-    pub(super) fn parse(mut self, text: &str) -> FlintOutput {
+    pub(super) fn parse_events(mut self, text: &str) -> Vec<FlintEvent> {
         let mut events = self.push(text);
         events.extend(self.finish());
+        events
+    }
+    pub(super) fn parse(self, text: &str) -> FlintOutput {
+        let events = self.parse_events(text);
         let mut output = FlintOutput::default();
         for event in events {
             match event {
@@ -108,44 +142,63 @@ pub(super) struct FramedParser {
     calls: usize,
     id: String,
     in_reasoning: bool,
+    frame: FrameScan,
+    literal: LiteralContext,
+    passthrough: bool,
+}
+
+fn content_event(events: &mut Vec<FlintEvent>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(FlintEvent::Content(previous)) = events.last_mut() {
+        previous.push_str(&text);
+    } else {
+        events.push(FlintEvent::Content(text));
+    }
 }
 
 impl FramedParser {
-    fn drain(&mut self, done: bool) -> Vec<FlintEvent> {
-        let (open, close) = if self.family == ToolFamily::Qwen {
-            ("<tool_call>", "</tool_call>")
+    fn drain(&mut self, done: bool, events: &mut Vec<FlintEvent>) {
+        let (open, close, think, end_think) = if self.family == ToolFamily::Qwen {
+            ("<tool_call>", "</tool_call>", "<think>", "</think>")
         } else {
-            ("<|tool_call>", "<tool_call|>")
+            (
+                "<|tool_call>",
+                "<tool_call|>",
+                "<|channel>thought\n",
+                "<channel|>",
+            )
         };
-        let (think, end_think) = if self.family == ToolFamily::Qwen {
-            ("<think>", "</think>")
-        } else {
-            ("<|channel>thought\n", "<channel|>")
-        };
-        let mut events = Vec::new();
         while !self.pending.is_empty() {
-            if self.in_reasoning {
-                if let Some(end) = self.pending.find(end_think) {
-                    let text = self.pending[..end].to_string();
-                    if !text.is_empty() {
-                        events.push(FlintEvent::Reasoning(text));
-                    }
-                    self.pending.drain(..end + end_think.len());
-                    self.in_reasoning = false;
-                    continue;
-                }
-                if done {
-                    self.pending.clear();
-                }
+            if self.passthrough {
+                content_event(events, std::mem::take(&mut self.pending));
                 break;
             }
-            if self.pending.starts_with(think) {
+            if self.in_reasoning {
+                if self.pending.starts_with(end_think) {
+                    self.pending.drain(..end_think.len());
+                    self.in_reasoning = false;
+                } else if !done && end_think.starts_with(&self.pending) {
+                    break;
+                } else {
+                    let ch = self.pending.remove(0);
+                    if let Some(FlintEvent::Reasoning(text)) = events.last_mut() {
+                        text.push(ch);
+                    } else {
+                        events.push(FlintEvent::Reasoning(ch.to_string()));
+                    }
+                }
+                continue;
+            }
+            let literal = self.literal.is_literal_before(&self.pending);
+            if !literal && self.pending.starts_with(think) {
                 self.pending.drain(..think.len());
                 self.in_reasoning = true;
                 continue;
             }
-            if !self.tools.is_empty() && self.pending.starts_with(open) {
-                let Some(end) = frame_end(&self.pending, self.family, close) else {
+            if !literal && !self.tools.is_empty() && self.pending.starts_with(open) {
+                let Some(end) = self.frame.end(&self.pending, self.family, close) else {
                     if done {
                         self.pending.clear();
                     }
@@ -158,73 +211,36 @@ impl FramedParser {
                     parse_gemma(body)
                 };
                 if let Some((name, arguments)) = parsed {
-                    if self.calls < self.max_calls && declared(&self.tools, &name).is_some() {
+                    let arguments = arguments.to_string();
+                    if self.calls < self.max_calls
+                        && arguments.len() <= MAX_ARGUMENT_BYTES
+                        && declared(&self.tools, &name).is_some()
+                    {
                         events.push(FlintEvent::ToolCall(ToolCall {
                             index: Some(self.calls),
                             id: format!("{}_{}", self.id, self.calls),
                             kind: "function",
-                            function: ToolCallFunction {
-                                name,
-                                arguments: arguments.to_string(),
-                            },
+                            function: ToolCallFunction { name, arguments },
                         }));
                         self.calls += 1;
                     }
                 }
                 self.pending.drain(..end + close.len());
+                self.frame = FrameScan::default();
                 continue;
             }
-            // Retenir un préfixe de marqueur coupé entre deux tokens, sur une frontière UTF-8.
-            let mut markers = vec![think];
-            if !self.tools.is_empty() {
-                markers.push(open);
-            }
-            let end = markers
-                .iter()
-                .filter_map(|m| self.pending.find(m))
-                .min()
-                .unwrap_or(self.pending.len());
-            let safe = if end < self.pending.len() || done {
-                end
-            } else {
-                self.pending
-                    .char_indices()
-                    .find_map(|(i, _)| {
-                        markers
-                            .iter()
-                            .any(|m| m.starts_with(&self.pending[i..]))
-                            .then_some(i)
-                    })
-                    .unwrap_or(end)
-            };
-            if safe == 0 {
+            if !literal
+                && !done
+                && (think.starts_with(&self.pending)
+                    || (!self.tools.is_empty() && open.starts_with(&self.pending)))
+            {
                 break;
             }
-            events.push(FlintEvent::Content(self.pending.drain(..safe).collect()));
-        }
-        events
-    }
-}
-
-/// Les marqueurs écrits dans une valeur restent du texte de cette valeur.
-fn frame_end(text: &str, family: ToolFamily, close: &str) -> Option<usize> {
-    let mut cursor = 0;
-    while cursor < text.len() {
-        let rest = &text[cursor..];
-        if rest.starts_with(close) {
-            return Some(cursor);
-        }
-        if family == ToolFamily::Gemma4 && rest.starts_with("<|\"|>") {
-            cursor += "<|\"|>".len();
-            cursor += text[cursor..].find("<|\"|>")? + "<|\"|>".len();
-        } else if family == ToolFamily::Qwen && rest.starts_with("<parameter=") {
-            cursor += rest.find('>')? + 1;
-            cursor += text[cursor..].find("</parameter>")? + "</parameter>".len();
-        } else {
-            cursor += rest.chars().next()?.len_utf8();
+            let ch = self.pending.remove(0);
+            self.literal.push(ch);
+            content_event(events, ch.to_string());
         }
     }
-    None
 }
 
 fn declared<'a>(tools: &'a [Value], name: &str) -> Option<&'a Value> {
@@ -264,7 +280,7 @@ fn parse_qwen(body: &str, tools: &[Value]) -> Option<(String, Value)> {
             if string {
                 Value::String(raw.to_string())
             } else {
-                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+                serde_json::from_str(raw).ok()?
             },
         );
         rest = tail;

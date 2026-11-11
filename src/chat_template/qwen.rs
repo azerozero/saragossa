@@ -13,11 +13,16 @@ pub enum QwenProfile {
 
 impl QwenProfile {
     /// Identifie le profil à partir du template fourni avec le tokenizer.
-    pub fn from_template(template: &str) -> Self {
-        if template.contains("Reasoning effort is set to") {
-            Self::Qwen38
+    pub fn from_template(template: &str) -> Option<Self> {
+        if template.contains("<|im_start|>") && template.contains("Reasoning effort is set to") {
+            Some(Self::Qwen38)
+        } else if template.contains("<|im_start|>")
+            && template.contains("enable_thinking")
+            && template.contains("last_query_index")
+        {
+            Some(Self::Qwen36)
         } else {
-            Self::Qwen36
+            None
         }
     }
 }

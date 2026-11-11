@@ -92,3 +92,27 @@ fn unsupported_tools_fail_and_none_removes_declarations() {
         Some(serde_json::from_value(serde_json::json!({"enable_thinking":true})).expect("kwargs"));
     assert!(request.validate(1024).is_err());
 }
+
+#[test]
+fn no_active_tools_never_selects_a_framed_parser() {
+    for family in ["qwen3_5", "qwen3_6", "qwen3_8", "gemma4", "gemma3", "llama"] {
+        for (tools, choice) in [
+            (serde_json::json!([]), "auto"),
+            (
+                serde_json::json!([{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]),
+                "none",
+            ),
+        ] {
+            let request = serde_json::json!({"model":"test","messages":[{"role":"user","content":"test"}],"tools":tools,"tool_choice":choice});
+            let request =
+                ChatCompletionRequest::parse(&serde_json::to_vec(&request).expect("request"))
+                    .expect("parse");
+            assert!(
+                output_parser_for_config(&config(family), &request)
+                    .expect("inactive tools")
+                    .is_none(),
+                "{family}/{choice}"
+            );
+        }
+    }
+}

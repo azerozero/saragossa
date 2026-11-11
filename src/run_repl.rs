@@ -342,7 +342,11 @@ fn encode_chat_prompt(
             &[],
             true,
             false,
-            assets.tokenizer.qwen_profile(),
+            if assets.config.model_type.starts_with("qwen") {
+                assets.tokenizer.qwen_profile()?
+            } else {
+                saragossa::chat_template::QwenProfile::Qwen36
+            },
         )
     };
     let ids = if assets.config.is_gemma() && !assets.config.is_gemma4() {

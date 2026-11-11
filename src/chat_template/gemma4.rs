@@ -37,20 +37,18 @@ pub fn render_gemma4_chat_with_tools(
         out.push_str("<turn|>\n");
     }
     let last_user = turns.iter().rposition(|m| m.role == "user");
-    let mut previous_role = "";
-    let mut pending_tool = false;
+    let mut model_turn_open = false;
     for (index, message) in turns.iter().enumerate() {
         if message.role == "tool" {
             continue;
         }
-        pending_tool = false;
         let assistant = message.role == "assistant";
-        if !(assistant && previous_role == "assistant") {
+        if !(assistant && model_turn_open) {
             out.push_str("<|turn>");
             out.push_str(if assistant { "model" } else { &message.role });
             out.push('\n');
         }
-        previous_role = &message.role;
+        model_turn_open = assistant;
         if assistant && !message.tool_calls.is_empty() && last_user.is_none_or(|last| index > last)
         {
             if let Some(reasoning) = message
@@ -63,6 +61,13 @@ pub fn render_gemma4_chat_with_tools(
                 out.push_str("\n<channel|>");
             }
         }
+        let content = message.content.as_deref().unwrap_or("");
+        let content = if assistant {
+            strip_thinking(content)
+        } else {
+            content.trim().to_string()
+        };
+        out.push_str(&content);
         let mut names = HashMap::new();
         for raw in &message.tool_calls {
             if let Ok(call) = serde_json::from_str::<Value>(raw) {
@@ -101,26 +106,14 @@ pub fn render_gemma4_chat_with_tools(
                 responses = true;
             }
         }
-        let content = message.content.as_deref().unwrap_or("");
-        let content = if assistant {
-            strip_thinking(content)
-        } else {
-            content.trim().to_string()
-        };
-        out.push_str(&content);
         if !message.tool_calls.is_empty() && !responses {
             out.push_str("<|tool_response>");
-            pending_tool = true;
-        } else if responses {
-            pending_tool = true;
-            if !content.is_empty() {
-                out.push_str("<turn|>\n");
-            }
-        } else {
+        } else if !responses {
             out.push_str("<turn|>\n");
+            model_turn_open = false;
         }
     }
-    if add_generation_prompt && !pending_tool {
+    if add_generation_prompt && !model_turn_open {
         out.push_str("<|turn>model\n");
         if !enable_thinking {
             out.push_str("<|channel>thought\n<channel|>");
@@ -333,6 +326,37 @@ mod tests {
 #[cfg(test)]
 mod tool_turn_tests {
     use super::*;
+    #[test]
+    fn text_call_result_and_assistant_preserve_order_and_open_turn() {
+        let mut call = ChatTemplateMessage::new("assistant", "Je vérifie.");
+        call.tool_calls
+            .push(r#"{"id":"c","function":{"name":"f","arguments":{}}}"#.into());
+        let mut result = ChatTemplateMessage::new("tool", "ok");
+        result.tool_call_id = Some("c".into());
+        let mut messages = vec![ChatTemplateMessage::new("user", "Vérifie"), call, result];
+        let open = "<bos><|turn>user\nVérifie<turn|>\n<|turn>model\nJe vérifie.<|tool_call>call:f{}<tool_call|><|tool_response>response:f{value:<|\"|>ok<|\"|>}<tool_response|>";
+        for generation in [false, true] {
+            assert_eq!(
+                render_gemma4_chat_with_tools(&messages, &[], generation, false),
+                open
+            );
+        }
+        messages.push(ChatTemplateMessage::new("assistant", "Terminé."));
+        assert_eq!(
+            render_gemma4_chat_with_tools(&messages, &[], false, false),
+            format!("{open}Terminé.<turn|>\n")
+        );
+        assert_eq!(
+            render_gemma4_chat_with_tools(&messages, &[], true, false),
+            format!("{open}Terminé.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
+        );
+        messages.push(ChatTemplateMessage::new("assistant", "Autre tour."));
+        assert_eq!(
+            render_gemma4_chat_with_tools(&messages, &[], false, false),
+            format!("{open}Terminé.<turn|>\n<|turn>model\nAutre tour.<turn|>\n")
+        );
+    }
+
     #[test]
     fn final_tool_result_continues_without_generation_prefix() {
         let mut call = ChatTemplateMessage::new("assistant", "");

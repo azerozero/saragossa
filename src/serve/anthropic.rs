@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::error::{ServeError, ServeResult};
-use super::flint_output::{FlintEvent, FlintOutput};
+use super::flint_output::FlintEvent;
 use super::http::{send_json, write_headers};
 use super::protocol::{
     json_bytes, normalize_session_key, ChatCompletionRequest, StopSpec, Usage, WireMessage,
@@ -225,8 +225,8 @@ impl AnthropicMessageResponse {
 
     fn with_parser(completion: &ServedCompletion, parser: Option<ToolOutputParser>) -> Self {
         let output = match parser {
-            Some(parser) => AssistantOutput::from_common(parser.parse(&completion.content)),
-            None => AssistantOutput::parse(&completion.content),
+            Some(parser) => AssistantOutput::from_events(parser.parse_events(&completion.content)),
+            None => AssistantOutput::literal(&completion.content),
         };
         Self {
             id: response_id(),
@@ -276,126 +276,47 @@ impl AnthropicUsage {
 }
 
 impl AssistantOutput {
-    fn from_common(output: FlintOutput) -> Self {
-        let has_tool_use = !output.tool_calls.is_empty();
-        let mut blocks = Vec::new();
-        if !output.content.is_empty() || !has_tool_use {
-            blocks.push(AnthropicContentBlock::Text {
-                text: output.content,
-            });
-        }
-        blocks.extend(
-            output
-                .tool_calls
-                .into_iter()
-                .map(|call| AnthropicContentBlock::ToolUse {
-                    id: call.id,
-                    name: call.function.name,
-                    input: serde_json::from_str(&call.function.arguments)
-                        .unwrap_or_else(|_| json!({})),
-                }),
-        );
+    fn literal(raw: &str) -> Self {
         Self {
-            blocks,
-            has_tool_use,
+            blocks: vec![AnthropicContentBlock::Text {
+                text: raw.to_owned(),
+            }],
+            has_tool_use: false,
         }
     }
 
-    fn parse(raw: &str) -> Self {
+    fn from_events(events: Vec<FlintEvent>) -> Self {
         let mut blocks = Vec::new();
-        let mut rest = strip_think_blocks(raw);
-        let mut index = 0_usize;
-        loop {
-            let Some(start) = rest.find("<tool_call") else {
-                push_text_block(&mut blocks, rest.trim());
-                break;
-            };
-            push_text_block(&mut blocks, rest[..start].trim());
-            let after_tag = &rest[start..];
-            let Some(tag_end) = after_tag.find('>') else {
-                push_text_block(&mut blocks, after_tag.trim());
-                break;
-            };
-            let after_open = &after_tag[tag_end + 1..];
-            let (inner, after_close) = match after_open.find("</tool_call>") {
-                Some(end) => (
-                    &after_open[..end],
-                    &after_open[end + "</tool_call>".len()..],
-                ),
-                None => (after_open, ""),
-            };
-            match parse_tool_call_block(inner, index) {
-                Some(block) => {
-                    blocks.push(block);
-                    index += 1;
+        let mut has_tool_use = false;
+        for event in events {
+            match event {
+                FlintEvent::Content(text) if !text.is_empty() => {
+                    if let Some(AnthropicContentBlock::Text { text: previous }) = blocks.last_mut()
+                    {
+                        previous.push_str(&text);
+                    } else {
+                        blocks.push(AnthropicContentBlock::Text { text });
+                    }
                 }
-                None => push_text_block(&mut blocks, after_tag.trim()),
+                FlintEvent::ToolCall(call) => {
+                    has_tool_use = true;
+                    blocks.push(AnthropicContentBlock::ToolUse {
+                        id: call.id,
+                        name: call.function.name,
+                        input: serde_json::from_str(&call.function.arguments)
+                            .unwrap_or_else(|_| json!({})),
+                    });
+                }
+                _ => {}
             }
-            if after_close.is_empty() {
-                break;
-            }
-            rest = after_close.to_string();
         }
         if blocks.is_empty() {
-            blocks.push(AnthropicContentBlock::Text {
-                text: String::new(),
-            });
+            return Self::literal("");
         }
-        let has_tool_use = blocks
-            .iter()
-            .any(|block| matches!(block, AnthropicContentBlock::ToolUse { .. }));
         Self {
             blocks,
             has_tool_use,
         }
-    }
-}
-
-fn push_text_block(blocks: &mut Vec<AnthropicContentBlock>, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    blocks.push(AnthropicContentBlock::Text {
-        text: text.to_string(),
-    });
-}
-
-fn parse_tool_call_block(inner: &str, index: usize) -> Option<AnthropicContentBlock> {
-    let value: Value = serde_json::from_str(inner.trim()).ok()?;
-    let function = value.get("function").unwrap_or(&value);
-    let name = function.get("name")?.as_str()?.trim();
-    if name.is_empty() {
-        return None;
-    }
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .map_or_else(|| format!("toolu_saragossa_{index}"), ToString::to_string);
-    let input = tool_input_from_call(function);
-    Some(AnthropicContentBlock::ToolUse {
-        id,
-        name: name.to_string(),
-        input,
-    })
-}
-
-fn tool_input_from_call(function: &Value) -> Value {
-    for key in ["input", "arguments"] {
-        if let Some(input) = function.get(key).and_then(tool_input_object) {
-            return input;
-        }
-    }
-    json!({})
-}
-
-fn tool_input_object(value: &Value) -> Option<Value> {
-    match value {
-        Value::Object(_) => Some(value.clone()),
-        Value::String(text) => serde_json::from_str::<Value>(text)
-            .ok()
-            .filter(Value::is_object),
-        _ => None,
     }
 }
 
@@ -619,21 +540,6 @@ fn anthropic_tool_choice(choice: Option<&Value>) -> ServeResult<Option<Value>> {
     }
 }
 
-fn strip_think_blocks(raw: &str) -> String {
-    const OPEN: &str = "<think>";
-    const CLOSE: &str = "</think>";
-    let Some(start) = raw.find(OPEN) else {
-        return raw.to_string();
-    };
-    let Some(end_rel) = raw[start..].find(CLOSE) else {
-        return raw.to_string();
-    };
-    let mut out = String::with_capacity(raw.len());
-    out.push_str(&raw[..start]);
-    out.push_str(&raw[start + end_rel + CLOSE.len()..]);
-    out
-}
-
 fn send_anthropic_sse_streaming<S: Write>(
     stream: &mut S,
     state: &mut ServeState,
@@ -749,7 +655,7 @@ impl<S: Write> CompletionSink for AnthropicSse<'_, S> {
             for event in parser.finish() {
                 self.live_blocks.common_event(self.stream, event)?;
             }
-            self.live_blocks.close_text_block(self.stream)?;
+            self.live_blocks.finish(self.stream, &completion)?;
             parser.has_tool_calls()
         } else {
             self.live_blocks.finish(self.stream, &completion)?
