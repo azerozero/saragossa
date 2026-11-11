@@ -1439,10 +1439,9 @@ impl CausalDecoder {
         let t_prefill = trace_setup.then(Instant::now);
         let use_committed_mtp_history = mtp_history_policy() == MtpHistoryPolicy::Committed;
         let mut sampler = DeterministicSampler::new(options.seed);
-        // Premier token tiré et émis dès le dernier état du prefill, avant le
-        // semis de l'historique MTP et la mise en place des arènes : ceux-ci ne
-        // conditionnent que les drafts suivants (~1,4 s de TTFT à 32k). Le bloc
-        // GPU (devtools) gère sa propre émission.
+        // Premier token émis dès le retour du prefill, avant les arènes.
+        // Le semis MTP intégré a déjà consommé les morceaux ; le chemin de
+        // repli le fait après cette émission. Le bloc GPU gère sa propre émission.
         let mut first_token = None;
         let mut early_emitted = false;
         let mut early_stop = false;
@@ -1524,8 +1523,7 @@ impl CausalDecoder {
             }
         }
         if early_stop {
-            // L'appelant a refusé la suite dès le premier token, déjà émis : ni
-            // semis (abandonné en route) ni arène à préparer.
+            // L'appelant a refusé la suite dès le premier token, déjà émis.
             return Ok(SpeculativeOutput {
                 tokens: first_token.into_iter().collect(),
                 stats: SpeculativeStats {
@@ -4003,6 +4001,19 @@ impl CausalDecoder {
             }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some((cache, final_state, history)) =
+            self.prefill_resident_with_mtp_history(prompt)?
+        {
+            if !on_final_state(&final_state)? {
+                return Ok((cache, final_state, LayerKvCache::default(), 0));
+            }
+            let state = (cache, final_state);
+            if prefix_cache_enabled() {
+                self.prefix_cache_put(prompt, &state, Some(&history), None)?;
+            }
+            return Ok((state.0, state.1, history, 0));
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         let trace_setup = mtp_setup_trace_enabled();
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let trace_setup = false;
@@ -4249,13 +4260,39 @@ impl CausalDecoder {
         tokens: &[usize],
         history: &mut LayerKvCache,
     ) -> Result<bool> {
+        let Some((weights, spec)) = self.mtp_seed_parameters(head, tokens.len())? else {
+            return Ok(false);
+        };
+        let attention = &head.layer.attention;
+        let (empty_q, _) = super::attention_ops::split_attention_gate(
+            &self.config,
+            &super::attention_ops::empty_q(attention)?,
+        )?;
+        let (k, v) = metal.mtp_seed_kv_rows(tokens, states, weights, spec, history.len())?;
+        let layout =
+            super::attention_ops::attention_layout(&self.config, attention, &empty_q, &k, &v)?;
+        history.append_batch_owned(k, v, &layout)?;
+        Ok(true)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn mtp_seed_parameters<'a>(
+        &'a self,
+        head: &'a MtpHead,
+        seq: usize,
+    ) -> Result<
+        Option<(
+            crate::metal_backend::MtpSeedWeights<'a>,
+            crate::metal_backend::PrefillAttentionSpec,
+        )>,
+    > {
         let attention = &head.layer.attention;
         let (Some(v_proj), Some(k_norm), Some(rope)) = (
             attention.v_proj.as_ref(),
             attention.k_norm.as_ref(),
             super::attention_ops::rope_params(&self.config, attention),
         ) else {
-            return Ok(false);
+            return Ok(None);
         };
         if self.config.rope_style != RopeStyle::Halves
             || rope.position_scale != 1.0
@@ -4264,13 +4301,9 @@ impl CausalDecoder {
                 .iter()
                 .any(|linear| linear.bias().is_some())
         {
-            return Ok(false);
+            return Ok(None);
         }
         let hidden = self.final_norm.data().len();
-        let (empty_q, _) = super::attention_ops::split_attention_gate(
-            &self.config,
-            &super::attention_ops::empty_q(attention)?,
-        )?;
         let kv_heads = attention
             .num_key_value_heads
             .unwrap_or(self.config.num_key_value_heads);
@@ -4283,7 +4316,7 @@ impl CausalDecoder {
             .or(self.config.rope_dims)
             .unwrap_or(head_dim);
         let spec = crate::metal_backend::PrefillAttentionSpec {
-            seq: tokens.len(),
+            seq,
             hidden_dim: hidden,
             q_heads: self.config.num_attention_heads,
             kv_heads,
@@ -4297,9 +4330,7 @@ impl CausalDecoder {
             value_norm: attention.value_norm,
             eps: self.config.rms_eps,
         };
-        let (k, v) = metal.mtp_seed_kv_rows(
-            tokens,
-            states,
+        Ok(Some((
             crate::metal_backend::MtpSeedWeights {
                 embed_tokens: &self.embed_tokens,
                 embed_scale: self.config.embed_scale.unwrap_or(1.0),
@@ -4313,12 +4344,74 @@ impl CausalDecoder {
                 k_norm,
             },
             spec,
-            history.len(),
+        )))
+    }
+
+    /// Le semis consomme chaque hidden avant réutilisation du scratch. Les
+    /// snapshots de préfixe partagent le K/V figé, comme celui du tronc.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn prefill_resident_with_mtp_history(
+        &self,
+        prompt: &[usize],
+    ) -> Result<Option<(CausalDecoderCache, Tensor, LayerKvCache)>> {
+        if prompt.len() < 2
+            || !prefill_resident_enabled()
+            || !mtp_prefill_resident_enabled()
+            || !crate::runtime_flags::mtp_seed_gpu_enabled()
+            || !crate::runtime_flags::prefill_kv_shared_enabled()
+        {
+            return Ok(None);
+        }
+        let (Some(head), Some(metal)) =
+            (self.mtp.as_ref(), self.forward_runtime().metal_executor())
+        else {
+            return Ok(None);
+        };
+        let Some((weights, spec)) = self.mtp_seed_parameters(head, prompt.len() - 1)? else {
+            return Ok(None);
+        };
+        let mut seed = crate::metal_backend::MtpPrefillSeed::new(
+            metal,
+            weights,
+            spec,
+            &self.final_norm,
+            &prompt[1..],
+            SEED_CHUNK,
         )?;
-        let layout =
-            super::attention_ops::attention_layout(&self.config, attention, &empty_q, &k, &v)?;
-        history.append_batch_owned(k, v, &layout)?;
-        Ok(true)
+        let Some((cache, hidden, _)) = self.prefill_resident_cache_hidden_captures_and_mtp(
+            prompt,
+            &[],
+            usize::MAX,
+            true,
+            crate::runtime_flags::prefill_resident_chunk_tokens(),
+            Some(&mut seed),
+        )?
+        else {
+            return Ok(None);
+        };
+        let (k, v) = seed.into_rows()?;
+        let attention = &head.layer.attention;
+        let (q, _) = super::attention_ops::split_attention_gate(
+            &self.config,
+            &super::attention_ops::empty_q(attention)?,
+        )?;
+        let kv_dim = spec.kv_heads * spec.head_dim;
+        let empty_kv = Tensor::from_vec(vec![0, kv_dim], Vec::new())?;
+        let layout = super::attention_ops::attention_layout(
+            &self.config,
+            attention,
+            &q,
+            &empty_kv,
+            &empty_kv,
+        )?;
+        let mut history = LayerKvCache::default();
+        history.append_prefill(k, v, kv_dim, 0, &layout)?;
+        let state = rms_norm(
+            &hidden.into_tensor(spec.hidden_dim)?,
+            &self.final_norm,
+            self.config.rms_eps,
+        )?;
+        Ok(Some((cache, state, history)))
     }
 
     /// FC de la tête sur un bloc du semis. Côté Metal, la projection batchée
@@ -5365,6 +5458,32 @@ impl CausalDecoder {
             Option<PrefixCaptures>,
         )>,
     > {
+        self.prefill_resident_cache_hidden_captures_and_mtp(
+            prompt,
+            capture_layer_ids,
+            keep_rows,
+            last_row_only,
+            chunk_tokens,
+            None,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn prefill_resident_cache_hidden_captures_and_mtp(
+        &self,
+        prompt: &[usize],
+        capture_layer_ids: &[usize],
+        keep_rows: usize,
+        last_row_only: bool,
+        chunk_tokens: usize,
+        mtp_seed: Option<&mut crate::metal_backend::MtpPrefillSeed<'_>>,
+    ) -> Result<
+        Option<(
+            CausalDecoderCache,
+            crate::metal_backend::PrefillKvRows,
+            Option<PrefixCaptures>,
+        )>,
+    > {
         // `resident_metal` et non `forward_runtime` : flint (sinks, NoPE, MoE
         // sigmoïde) a ses kernels de prefill résident, pas de per-op Metal.
         // `prefill_moe_layer` refuse chaque couche hors de ce contrat.
@@ -5393,7 +5512,7 @@ impl CausalDecoder {
             };
             layers.push(prefill_layer);
         }
-        match metal.qwen_moe_prefill_resident_with_captures(
+        match metal.qwen_moe_prefill_resident_with_mtp(
             self.prefill_input(prompt, hidden.as_ref()),
             &layers,
             spec,
@@ -5401,7 +5520,9 @@ impl CausalDecoder {
             capture_layer_ids,
             keep_rows,
             chunk_tokens,
+            None,
             last_row_only,
+            mtp_seed,
         ) {
             Ok((final_hidden, layer_states, captures)) => {
                 let captures = captures.map(|captures| {

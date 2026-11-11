@@ -1,10 +1,9 @@
-//! Moteur d'inférence Rust pur de reti (kernels metal-rs) : LLM, STT Whisper,
-//! TTS Qwen3 — backend prod `--backends rust-metal`, repli CPU `--backends rust`.
+//! Moteur d'inférence Rust pur pour Apple Silicon : LLM, STT Whisper et TTS Qwen3.
+//! Kernels Metal via metal-rs, avec chemins de référence et de repli CPU.
 
 #![deny(unsafe_code)]
-// R2 (docs/rust-guidelines.md) : aucun `unwrap()` sur le chemin de prod du
-// moteur (mesuré 0 le 2026-08-04). Un panic ici tue la boucle vocale entière,
-// donc la règle est verrouillée par le compilateur plutôt que par la revue.
+// Un panic dans le moteur interrompt son appelant : le compilateur interdit
+// donc `unwrap()` en production pour imposer la propagation des erreurs.
 // Les tests conservent `unwrap()`, exemptés par `cfg_attr(test, …)`.
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 

@@ -8,6 +8,7 @@
 
 use super::*;
 use std::ffi::c_void;
+use std::sync::PoisonError;
 
 impl MetalExecutor {
     /// Encode une LayerNorm ligne par ligne : `out = (x-µ)/σ · weight + bias`.
@@ -373,6 +374,7 @@ impl MetalExecutor {
             checked_u32(m, "na m")?,
             checked_u32(n, "na n")?,
             checked_u32(k, "na k")?,
+            0,
         ];
 
         let command_buffer = self.queue.new_command_buffer();
@@ -384,7 +386,7 @@ impl MetalExecutor {
         encoder.set_buffer(0, Some(&a_bf16), 0);
         encoder.set_buffer(1, Some(&b_bf16), 0);
         encoder.set_buffer(2, Some(&out), 0);
-        encoder.set_bytes(3, 12, mnk.as_ptr().cast::<c_void>());
+        encoder.set_bytes(3, 16, mnk.as_ptr().cast::<c_void>());
         let width = pso.thread_execution_width().max(1);
         profile_dispatch();
         encoder.dispatch_thread_groups(
@@ -433,10 +435,12 @@ impl MetalExecutor {
                 data.len()
             )));
         }
+        // Le cache ne reçoit que des buffers entièrement construits, sans
+        // mutation de leur contenu sous verrou : l'empoisonnement les laisse valides.
         if let Some(buf) = self
             .bf16_rhs_t_cache
             .lock()
-            .expect("invariant: bf16_rhs_t_cache lock")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&key)
         {
             return Ok(buf.clone());
@@ -457,7 +461,7 @@ impl MetalExecutor {
         );
         self.bf16_rhs_t_cache
             .lock()
-            .expect("invariant: bf16_rhs_t_cache lock")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(key, buffer.clone());
         Ok(buffer)
     }
@@ -504,12 +508,13 @@ impl MetalExecutor {
             checked_u32(m, "na m")?,
             checked_u32(n, "na n")?,
             checked_u32(k, "na k")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(lhs_bf16), 0);
         encoder.set_buffer(1, Some(rhs_t_bf16), 0);
         encoder.set_buffer(2, Some(out), 0);
-        encoder.set_bytes(3, 12, mnk.as_ptr().cast::<c_void>());
+        encoder.set_bytes(3, 16, mnk.as_ptr().cast::<c_void>());
         let width = pso.thread_execution_width().max(1);
         trace_dispatch_path(
             if tile_n == 128 {

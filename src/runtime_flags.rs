@@ -111,6 +111,13 @@ fn record_snapshot_ablation(name: &str, value: &str) {
     }
 }
 
+/// Lit uniquement le nom demandé, sans alias ni avertissement.
+///
+/// Préserve le contrat des réglages qui n'ont jamais accepté de préfixe hérité.
+pub fn env_var_exact(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 /// Variante `OsString` de [`env_var`], pour les flags qui portent un chemin.
 pub fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
     environment_sha256();
@@ -1363,16 +1370,17 @@ pub(crate) fn prefill_linear_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_LINEAR_NAX", true))
 }
 
-/// Émet le premier token MTP avant le semis de l'historique et la mise en place
-/// des arènes (`SARAGOSSA_RUST_MTP_EARLY_FIRST_TOKEN=0` pour l'émettre après le
-/// premier cycle). Le TTFT baisse d'autant (−2,1 s en serve à 32k), le temps
-/// total est inchangé : le débit mesuré depuis le premier token baisse.
+/// Émet le premier token MTP au retour du prefill, avant la mise en place des
+/// arènes (`SARAGOSSA_RUST_MTP_EARLY_FIRST_TOKEN=0` pour l'émettre après le
+/// premier cycle). Le semis intégré au prefill est déjà terminé ; sur le
+/// chemin de repli, l'émission précède aussi le semis de l'historique.
 pub(crate) fn mtp_early_first_token_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_EARLY_FIRST_TOKEN", true))
 }
 
-/// Sème l'historique MTP committed sur GPU, un command buffer par bloc
+/// Sème l'historique MTP committed sur GPU, dans le prefill par morceaux ou
+/// dans un command buffer par bloc sur le chemin de repli
 /// (`SARAGOSSA_RUST_MTP_SEED_GPU=0` pour le chemin CPU, qui reste l'oracle).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn mtp_seed_gpu_enabled() -> bool {
@@ -2338,10 +2346,32 @@ mod tests {
         assert_eq!(legacy_alias("RETI_RUST_TRUC"), None);
     }
 
-    // Les trois tests d'env ci-dessous partagent le même processus : un mutex
+    // Les tests d'env ci-dessous partagent le même processus : un mutex
     // les sérialise, sans quoi les `set_var`/`remove_var` fuient d'un test à
     // l'autre sous le harness multi-thread de Cargo.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_var_exact_preserves_values_without_legacy_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let name = "SARAGOSSA_TEST_EXACT";
+        let legacy = "RETI_TEST_EXACT";
+        std::env::remove_var(name);
+        std::env::set_var(legacy, "herite");
+        assert_eq!(env_var_exact(name), None);
+        for value in ["", "  canonique  "] {
+            std::env::set_var(name, value);
+            assert_eq!(env_var_exact(name).as_deref(), Some(value));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::env::set_var(name, std::ffi::OsStr::from_bytes(&[0xff]));
+            assert_eq!(env_var_exact(name), None);
+        }
+        std::env::remove_var(name);
+        std::env::remove_var(legacy);
+    }
 
     #[test]
     fn env_var_prefers_canonical_over_legacy() {

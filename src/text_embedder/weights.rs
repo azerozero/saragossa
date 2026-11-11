@@ -264,8 +264,9 @@ mod tests {
         // safetensors minimal : un seul tenseur, donc tout le layout BertModel manque.
         let bytes = le_bytes(&[0f32; 4]);
         let view = safetensors::tensor::TensorView::new(Dtype::F32, vec![2, 2], &bytes)
-            .expect("view valide");
-        let buf = safetensors::serialize([("autre.poids", view)], None).expect("serialize");
+            .expect("invariant: view valide");
+        let buf =
+            safetensors::serialize([("autre.poids", view)], None).expect("invariant: serialize");
         let err = match BertWeights::from_safetensors_bytes(&buf, 2, 1, 1) {
             Ok(_) => panic!("layout BertModel absent: le chargement aurait dû échouer"),
             Err(e) => e,

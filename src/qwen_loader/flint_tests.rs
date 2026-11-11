@@ -523,7 +523,7 @@ fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
         )
     })
     .expect("invariant: prefill résident flint")
-    .expect("prefill résident flint attendu");
+    .expect("invariant: prefill résident flint attendu");
     assert_eq!(per_op.shape(), resident.shape());
     let gap = per_op
         .data()
@@ -676,7 +676,7 @@ fn traced_coop_prefill(gpu: &CausalDecoder, coop: bool) -> (Tensor, (usize, usiz
                 Some(crate::runtime_flags::prefill_resident_chunk_tokens()),
             )
             .expect("invariant: prefill résident flint")
-            .expect("prefill résident flint attendu");
+            .expect("invariant: prefill résident flint attendu");
         let (ran_after, fallback_after) = crate::metal_backend::routed_coop_trace_for_test();
         (hidden, (ran_after - ran, fallback_after - fallback))
     })
@@ -705,7 +705,7 @@ fn synthetic_flint_chunked_prefill_matches_single_chunk() {
     let hidden = |chunk_tokens| {
         gpu.prefill_hidden_for_test(&prompt, Some(chunk_tokens))
             .expect("invariant: prefill résident flint")
-            .expect("prefill résident flint attendu")
+            .expect("invariant: prefill résident flint attendu")
     };
     let single = hidden(0);
     for chunk_tokens in [1, 2, 3, 5] {
@@ -792,7 +792,7 @@ fn synthetic_flint_prefill_kv_bf16_store_drift() {
         let hidden = |gpu: &CausalDecoder| {
             gpu.prefill_hidden_for_test(&prompt, Some(chunk_tokens))
                 .expect("invariant: prefill résident flint")
-                .expect("prefill résident flint attendu")
+                .expect("invariant: prefill résident flint attendu")
         };
         let reference = hidden(&f32_store);
         assert_eq!(
@@ -966,7 +966,7 @@ fn synthetic_flint_window_kv_matches_full_kv_bit_for_bit() {
             let hidden = |gpu: &CausalDecoder| {
                 gpu.prefill_hidden_for_test(&prompt, Some(chunk))
                     .expect("invariant: prefill résident flint")
-                    .expect("prefill résident flint attendu")
+                    .expect("invariant: prefill résident flint attendu")
             };
             assert_eq!(
                 bits(&hidden(&bounded)),
@@ -1311,7 +1311,7 @@ fn synthetic_flint_refuses_prompt_beyond_prefill_cap() {
         .expect("invariant: plafond flint sous Metal");
     assert!((4096..=262_144).contains(&cap), "plafond {cap}");
     gpu.ensure_prompt_within_prefill_cap(cap)
-        .expect("prompt au plafond accepté");
+        .expect("invariant: prompt au plafond accepté");
     let prompt = vec![1; cap + 1];
     let refused = |err: crate::InferError| {
         assert!(
@@ -1648,7 +1648,7 @@ fn flint_int4_metal_matches_mlx_oracle() {
     let (_, qmv_router) = resident_with_router(false);
     let coop_hidden = coop_hidden
         .expect("invariant: prefill résident coop")
-        .expect("prefill résident Metal attendu pour flint");
+        .expect("invariant: prefill résident Metal attendu pour flint");
     let coop_rows = model
         .logits_of_hidden_rows_for_test(&coop_hidden, &all_rows)
         .expect("invariant: logits du prefill coop");
@@ -1877,11 +1877,11 @@ fn flint_int4_prefill_capture_dump() {
     let captures = model
         .prefill_captures_for_test(&prompt, &[0, 1, 5, 48], chunk_tokens)
         .expect("invariant: prefill résident flint")
-        .expect("captures attendues");
+        .expect("invariant: captures attendues");
     let hidden = model
         .prefill_hidden_for_test(&prompt, Some(chunk_tokens))
         .expect("invariant: prefill résident flint")
-        .expect("hidden attendu");
+        .expect("invariant: hidden attendu");
     let logits = model
         .logits_of_hidden_rows_for_test(&hidden, &[prompt.len() - 1])
         .expect("invariant: logits");
@@ -2010,7 +2010,7 @@ fn flint_int4_prefill_kv_bf16_store_drift() {
         let (cache, _) = model
             .prefill_cache_state_metal_resident_for_test(&prompt)
             .expect("invariant: prefill résident")
-            .expect("prefill résident Metal attendu pour flint");
+            .expect("invariant: prefill résident Metal attendu pour flint");
         let (bf16_layers, layers) = cache.bf16_kv_layers_for_test();
         drop(cache);
         println!("K/V {label}: {bf16_layers}/{layers} couches stockées en bf16");
@@ -2024,7 +2024,7 @@ fn flint_int4_prefill_kv_bf16_store_drift() {
         let hidden = model
             .prefill_hidden_for_test(&prompt, Some(target))
             .expect("invariant: prefill résident")
-            .expect("prefill résident Metal attendu pour flint");
+            .expect("invariant: prefill résident Metal attendu pour flint");
         println!(
             "K/V {label}: prefill {len} tokens en {:.1?}",
             started.elapsed()
@@ -2123,7 +2123,7 @@ fn flint_int4_prefill_nax_window_drift() {
         let hidden = model
             .prefill_hidden_for_test(&prompt, Some(target))
             .expect("invariant: prefill résident")
-            .expect("prefill résident Metal attendu pour flint");
+            .expect("invariant: prefill résident Metal attendu pour flint");
         println!(
             "NAX fenêtré={nax}: prefill {len} tokens en {:.1?}",
             started.elapsed()
@@ -2211,7 +2211,7 @@ fn flint_int4_moe_coop_matches_qmv() {
             let hidden = model
                 .prefill_hidden_for_test(&prompt, Some(target))
                 .expect("invariant: prefill résident")
-                .expect("prefill résident Metal attendu pour flint");
+                .expect("invariant: prefill résident Metal attendu pour flint");
             println!(
                 "MoE coop={coop}: prefill {len} tokens en {:.1?}",
                 started.elapsed()
@@ -2290,7 +2290,7 @@ fn flint_int4_moe_coop_tiled_matches_16x32() {
             let hidden = model
                 .prefill_hidden_for_test(&prompt, Some(target))
                 .expect("invariant: prefill résident")
-                .expect("prefill résident Metal attendu pour flint");
+                .expect("invariant: prefill résident Metal attendu pour flint");
             let calls = crate::metal_backend::moe_coop_tiled_trace_for_test() - before;
             println!(
                 "MoE coop tuilé={tiled}: prefill {len} tokens en {:.1?}, {calls} appels tuilés",
@@ -2404,7 +2404,7 @@ fn flint_int4_small_nax_gemm_greedy_matches_qmv() {
             let hidden = model
                 .prefill_hidden_for_test(&prompt, Some(target))
                 .expect("invariant: prefill résident")
-                .expect("prefill résident Metal attendu pour flint");
+                .expect("invariant: prefill résident Metal attendu pour flint");
             let mut rows = model
                 .logits_of_hidden_rows_for_test(&hidden, &[len - 1])
                 .expect("invariant: logits du prefill");
@@ -2455,7 +2455,7 @@ fn flint_int4_small_nax_gemm_greedy_matches_qmv() {
         let hidden = model
             .prefill_hidden_for_test(&prompt, Some((target / 2).max(512)))
             .expect("invariant: prefill résident")
-            .expect("prefill résident Metal attendu pour flint");
+            .expect("invariant: prefill résident Metal attendu pour flint");
         model
             .logits_of_hidden_rows_for_test(&hidden, &[len - 1])
             .expect("invariant: logits du prefill")
@@ -2522,7 +2522,7 @@ fn timed_prefills(
         )
         .expect("invariant: prefill résident");
     let metal_time = started.elapsed();
-    let metal = metal.expect("prefill résident Metal attendu pour flint");
+    let metal = metal.expect("invariant: prefill résident Metal attendu pour flint");
     (
         cpu.expect("invariant: hidden per-op"),
         metal,
@@ -2609,7 +2609,7 @@ fn flint_int4_window_kv_matches_full_kv() {
         let hidden = model
             .prefill_hidden_for_test(&prompt, Some(chunk))
             .expect("invariant: prefill résident")
-            .expect("prefill résident Metal attendu pour flint");
+            .expect("invariant: prefill résident Metal attendu pour flint");
         let hidden = hidden
             .data()
             .iter()

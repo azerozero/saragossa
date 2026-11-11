@@ -96,8 +96,8 @@ fn nearest_code_exact_match_gives_zero_residual() -> Result<()> {
 fn nearest_code_tie_breaks_to_lowest_index() {
     // Deux bins strictement équidistants de la requête (dist=0.5 chacun) :
     // le code documente la conservation du premier trouvé (comparaison `<`).
-    let embed = Tensor::from_vec(vec![2, 1], vec![-1.0, 1.0]).expect("shape valide");
-    let (bins, dim) = matrix_shape(&embed).expect("rang 2");
+    let embed = Tensor::from_vec(vec![2, 1], vec![-1.0, 1.0]).expect("invariant: shape valide");
+    let (bins, dim) = matrix_shape(&embed).expect("invariant: rang 2");
     let c2 = codebook_half_norms(&embed, bins, dim);
     let row = [0.0_f32];
 

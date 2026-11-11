@@ -776,7 +776,10 @@ mod tests {
         assert!(unpacked_cols(64, 32, 0).is_err());
         assert!(unpacked_cols(64, 0, 4).is_err());
         // Cas nominal : 64 packed_cols × 32 / 4 bits = 512 cols, divisible par 32.
-        assert_eq!(unpacked_cols(64, 32, 4).expect("config quant valide"), 512);
+        assert_eq!(
+            unpacked_cols(64, 32, 4).expect("invariant: config quant valide"),
+            512
+        );
     }
 
     #[test]

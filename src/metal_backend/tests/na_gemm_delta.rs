@@ -72,14 +72,15 @@ fn na_gemm_microbench() -> Result<()> {
             g.end();
             commit_and_wait(cb)?;
         }
-        let mnk = [m as u32, n as u32, k as u32];
+        // `uint3` occupe 16 octets en MSL, y compris son padding.
+        let mnk = [m as u32, n as u32, k as u32, 0];
         let width = pso.thread_execution_width().max(1);
         let na_med = time_dispatch(&|enc| {
             enc.set_compute_pipeline_state(&pso);
             enc.set_buffer(0, Some(&a_bf16), 0);
             enc.set_buffer(1, Some(&b_bf16), 0);
             enc.set_buffer(2, Some(&out_na), 0);
-            enc.set_bytes(3, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+            enc.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
             enc.dispatch_thread_groups(
                 MTLSize::new(m.div_ceil(64) as u64, n.div_ceil(32) as u64, 1),
                 MTLSize::new(width * 4, 1, 1),
@@ -93,7 +94,7 @@ fn na_gemm_microbench() -> Result<()> {
                 enc.set_buffer(0, Some(&a_bf16), 0);
                 enc.set_buffer(1, Some(&b_bf16), 0);
                 enc.set_buffer(2, Some(&out_na_bn128), 0);
-                enc.set_bytes(3, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+                enc.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
                 enc.dispatch_thread_groups(
                     MTLSize::new(m.div_ceil(64) as u64, n.div_ceil(128) as u64, 1),
                     MTLSize::new(width * 8, 1, 1),
@@ -207,6 +208,32 @@ fn qmv_m1_bf16_microbench() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requiert un device Metal pour le cache de buffers BF16"]
+fn bf16_rhs_cache_recovers_after_poisoning() -> Result<()> {
+    let executor = MetalExecutor::new()?;
+    let data = [1.0_f32, 2.0, 3.0, 4.0];
+    let first = executor.cached_rhs_t_bf16_matrix(&data, 2, 2, 1)?;
+    // Simule un appelant interrompu après l'insertion d'un buffer valide.
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = executor
+            .bf16_rhs_t_cache
+            .lock()
+            .expect("invariant: cache neuf non empoisonné");
+        panic!("empoisonnement volontaire du cache de test");
+    }));
+    assert!(poisoned.is_err());
+    assert!(executor.bf16_rhs_t_cache.is_poisoned());
+    let cached = executor.cached_rhs_t_bf16_matrix(&data, 2, 2, 1)?;
+    assert_eq!(first.contents(), cached.contents());
+    let second = executor.cached_rhs_t_bf16_matrix(&data, 2, 2, 2)?;
+    assert_ne!(first.contents(), second.contents());
+    let cached_second = executor.cached_rhs_t_bf16_matrix(&data, 2, 2, 2)?;
+    assert_eq!(second.contents(), cached_second.contents());
+    assert_eq!(second.length(), 8);
+    Ok(())
+}
+
+#[test]
 fn na_gemm_matches_bf16_cpu() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
@@ -255,7 +282,8 @@ fn na_gemm_matches_bf16_cpu() -> Result<()> {
         let out = executor
             .device
             .new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
-        let mnk = [m as u32, n as u32, k as u32];
+        // `uint3` occupe 16 octets en MSL, y compris son padding.
+        let mnk = [m as u32, n as u32, k as u32, 0];
         let width = pso.thread_execution_width().max(1);
         let cb = executor.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
@@ -266,7 +294,7 @@ fn na_gemm_matches_bf16_cpu() -> Result<()> {
         enc.set_buffer(0, Some(&a_bf16), 0);
         enc.set_buffer(1, Some(&b_bf16), 0);
         enc.set_buffer(2, Some(&out), 0);
-        enc.set_bytes(3, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        enc.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         enc.dispatch_thread_groups(
             MTLSize::new(m.div_ceil(64) as u64, n.div_ceil(128) as u64, 1),
             MTLSize::new(width * 8, 1, 1),

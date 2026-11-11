@@ -328,7 +328,9 @@ mod tests {
         assert!(assets.mtp.is_available());
         assert_eq!(assets.mtp.tensor_count, 1);
         assert_eq!(
-            assets.encode_prompt("bonjour reti").expect("encode"),
+            assets
+                .encode_prompt("bonjour reti")
+                .expect("invariant: encode"),
             vec![1, 2]
         );
         assert_eq!(assets.stop_token_ids(), vec![2]);

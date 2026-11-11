@@ -1,7 +1,9 @@
 //! Semis batché de l'historique MTP : normes, FC, projections K/V, norme et
-//! RoPE de K de la tête en un command buffer par bloc, sans relecture
-//! intermédiaire. Le chemin CPU de `seed_mtp_history_chunk` reste l'oracle.
+//! RoPE de K de la tête, sans relecture intermédiaire. Les blocs s'encodent
+//! dans le prefill ou dans leur propre command buffer sur le chemin de repli.
+//! Le chemin CPU de `seed_mtp_history_chunk` reste l'oracle.
 
+use super::buffers::embedding_indices;
 use super::*;
 
 /// Poids de la tête MTP lus par le semis.
@@ -24,6 +26,11 @@ pub(crate) struct MtpSeedWeights<'a> {
 pub(crate) enum MtpSeedStates<'a> {
     /// `[seq, hidden]` déjà normés, téléversés.
     Normed(&'a [f32]),
+    /// Scratch du prefill, consommé avant sa prochaine écriture GPU.
+    Buffer {
+        buffer: &'a BufferRef,
+        final_norm: &'a Tensor,
+    },
     /// Lignes `first_row..first_row + seq` du hidden final non normé, lues en
     /// place dans le buffer du prefill ; la norme finale passe sur le GPU au
     /// lieu d'une relecture et d'une norme CPU de tout le prompt.
@@ -32,6 +39,143 @@ pub(crate) enum MtpSeedStates<'a> {
         first_row: usize,
         final_norm: &'a Tensor,
     },
+}
+
+/// Semis en blocs identiques à l'ancien chemin, indépendants du découpage du
+/// prefill. Seul un bloc de hidden reste vivant entre deux morceaux.
+pub(crate) struct MtpPrefillSeed<'a> {
+    weights: MtpSeedWeights<'a>,
+    spec: PrefillAttentionSpec,
+    final_norm: &'a Tensor,
+    tokens: &'a [usize],
+    block_rows: usize,
+    pending: Buffer,
+    filled: usize,
+    seeded: usize,
+    completed: bool,
+    output: [Buffer; 2],
+}
+
+impl<'a> MtpPrefillSeed<'a> {
+    pub(crate) fn new(
+        metal: &MetalExecutor,
+        weights: MtpSeedWeights<'a>,
+        spec: PrefillAttentionSpec,
+        final_norm: &'a Tensor,
+        tokens: &'a [usize],
+        block_rows: usize,
+    ) -> Result<Self> {
+        if tokens.is_empty() || block_rows == 0 {
+            return Err(InferError::Dimension("semis MTP vide".to_string()));
+        }
+        let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "semis MTP kv_dim")?;
+        let len = checked_len(tokens.len(), kv_dim, "semis MTP historique")?;
+        Ok(Self {
+            weights,
+            spec,
+            final_norm,
+            tokens,
+            block_rows,
+            pending: metal.private_f32_buffer(
+                checked_len(block_rows, spec.hidden_dim, "semis MTP bloc")?,
+                "mtp_seed_pending",
+            )?,
+            filled: 0,
+            seeded: 0,
+            completed: false,
+            output: [
+                metal.uncached_f32_buffer(len, "mtp_history_k")?,
+                metal.uncached_f32_buffer(len, "mtp_history_v")?,
+            ],
+        })
+    }
+
+    pub(super) fn encode_chunk(
+        &mut self,
+        metal: &MetalExecutor,
+        encoder: &ComputeCommandEncoderRef,
+        hidden: &BufferRef,
+        start: usize,
+        rows: usize,
+    ) -> Result<()> {
+        self.completed = false;
+        if start != self.seeded + self.filled {
+            return Err(InferError::Dimension("semis MTP non contigu".to_string()));
+        }
+        let mut from = 0;
+        let rows = rows.min(self.tokens.len().saturating_sub(start));
+        let dim = self.spec.hidden_dim;
+        let kv_dim = checked_len(self.spec.kv_heads, self.spec.head_dim, "semis MTP kv_dim")?;
+        while from < rows {
+            let count = (self.block_rows - self.filled).min(rows - from);
+            metal.encode_copy_with_offsets(
+                encoder,
+                hidden,
+                byte_len::<f32>(from * dim)?,
+                &self.pending,
+                byte_len::<f32>(self.filled * dim)?,
+                count * dim,
+            )?;
+            from += count;
+            self.filled += count;
+            if self.filled == self.block_rows || self.seeded + self.filled == self.tokens.len() {
+                let (k, v) = metal.encode_mtp_seed_kv_rows(
+                    encoder,
+                    &self.tokens[self.seeded..self.seeded + self.filled],
+                    MtpSeedStates::Buffer {
+                        buffer: &self.pending,
+                        final_norm: self.final_norm,
+                    },
+                    self.weights,
+                    PrefillAttentionSpec {
+                        seq: self.filled,
+                        ..self.spec
+                    },
+                    self.seeded,
+                )?;
+                for (source, target) in [(&k, &self.output[0]), (&v, &self.output[1])] {
+                    metal.encode_copy_with_offsets(
+                        encoder,
+                        source,
+                        0,
+                        target,
+                        byte_len::<f32>(self.seeded * kv_dim)?,
+                        self.filled * kv_dim,
+                    )?;
+                }
+                self.seeded += self.filled;
+                self.filled = 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// Le prefill publie cette barrière après l'attente du command buffer.
+    pub(super) fn complete(&mut self) {
+        self.completed = true;
+    }
+
+    /// Refuse de publier une vue tant que le GPU peut encore l'écrire.
+    pub(crate) fn into_rows(self) -> Result<(PrefillKvRows, PrefillKvRows)> {
+        if !self.completed || self.seeded != self.tokens.len() || self.filled != 0 {
+            return Err(InferError::Dimension("semis MTP incomplet".to_string()));
+        }
+        let len = checked_len(
+            self.seeded,
+            self.spec.kv_heads * self.spec.head_dim,
+            "semis MTP historique",
+        )?;
+        let [k, v] = self.output;
+        // SAFETY: buffers f32 partagés propres au semis, taille validée à
+        // l'allocation, GPU terminé par le prefill ; plus aucun écrivain.
+        #[expect(unsafe_code, reason = "publication de l'historique MTP figé")]
+        unsafe {
+            Ok((
+                PrefillKvRows::Shared(SharedF32Rows::new(k, 0, len)?),
+                PrefillKvRows::Shared(SharedF32Rows::new(v, 0, len)?),
+            ))
+        }
+    }
 }
 
 impl MetalExecutor {
@@ -51,11 +195,38 @@ impl MetalExecutor {
         spec: PrefillAttentionSpec,
         position_offset: usize,
     ) -> Result<(Tensor, Tensor)> {
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let guard = EncoderEndGuard::new(encoder);
+        let (k, v) =
+            self.encode_mtp_seed_kv_rows(encoder, tokens, states, weights, spec, position_offset)?;
+        guard.end();
+        commit_and_wait(command_buffer)?;
+        let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "semis MTP kv_dim")?;
+        let len = checked_len(spec.seq, kv_dim, "semis MTP kv")?;
+        Ok((
+            Tensor::from_vec(vec![spec.seq, kv_dim], read_f32_buffer(&k, len)?)?,
+            Tensor::from_vec(vec![spec.seq, kv_dim], read_f32_buffer(&v, len)?)?,
+        ))
+    }
+
+    fn encode_mtp_seed_kv_rows(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        tokens: &[usize],
+        states: MtpSeedStates<'_>,
+        weights: MtpSeedWeights<'_>,
+        spec: PrefillAttentionSpec,
+        position_offset: usize,
+    ) -> Result<(Buffer, Buffer)> {
         let rows = spec.seq;
         let hidden = spec.hidden_dim;
         let rows_hidden = checked_len(rows, hidden, "semis MTP états")?;
         let states_len = match states {
             MtpSeedStates::Normed(states) => states.len(),
+            MtpSeedStates::Buffer { buffer, .. } => {
+                (buffer.length() as usize / std::mem::size_of::<f32>()).min(rows_hidden)
+            }
             MtpSeedStates::Raw {
                 rows: raw,
                 first_row,
@@ -77,7 +248,9 @@ impl MetalExecutor {
         // `kv_dim` : une forme divergente lirait hors du buffer ou mélangerait
         // K et V, là où l'oracle CPU refuse le sidecar.
         let final_norm = match states {
-            MtpSeedStates::Raw { final_norm, .. } => Some(final_norm),
+            MtpSeedStates::Raw { final_norm, .. } | MtpSeedStates::Buffer { final_norm, .. } => {
+                Some(final_norm)
+            }
             MtpSeedStates::Normed(_) => None,
         };
         for (norm, dim, label) in final_norm
@@ -123,6 +296,11 @@ impl MetalExecutor {
         }
         let kv_len = checked_len(rows, kv_dim, "semis MTP kv")?;
         let state_input = match states {
+            MtpSeedStates::Buffer { buffer, final_norm } => (
+                buffer.to_owned(),
+                0,
+                Some(self.cached_buffer_from_f32(final_norm.data(), "mtp_seed_final_norm")?),
+            ),
             MtpSeedStates::Normed(states) => {
                 (self.upload_f32_buffer(states, "mtp_seed_states")?, 0, None)
             }
@@ -168,21 +346,35 @@ impl MetalExecutor {
         let k_norm = self.cached_buffer_from_f32(weights.k_norm.data(), "mtp_seed_k_norm")?;
 
         let mut owned_buffers = Vec::new();
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        let encoder_guard = EncoderEndGuard::new(encoder);
-        let (embed_buffer, embed_dim) = self.encode_embed_weight_tokens(
-            encoder,
-            weights.embed_tokens,
-            tokens,
-            weights.embed_scale,
-            weights.embed_recast_bf16,
+        // Les indices restent propres au bloc : un upload dans le scratch
+        // réécrirait les tokens des dispatchs précédents avant le commit.
+        let indices = self.buffer_from_slice(
+            &embedding_indices(weights.embed_tokens, tokens)?,
+            "mtp_seed_indices",
         )?;
+        let embed_weights = self.resolve_embedding_weight_buffers(weights.embed_tokens)?;
+        let [_, embed_dim] = weights.embed_tokens.shape() else {
+            return Err(InferError::Dimension(
+                "semis MTP : embedding attendu rang 2".to_string(),
+            ));
+        };
+        let embed_dim = *embed_dim;
         if embed_dim != hidden {
             return Err(InferError::Dimension(format!(
                 "semis MTP : embedding {embed_dim}, attendu {hidden}"
             )));
         }
+        let embed_buffer = self.new_f32_buffer(rows_hidden, "mtp_seed_embedding")?;
+        self.encode_embeddings_from_indices_scaled(
+            encoder,
+            &embed_weights,
+            &indices,
+            &embed_buffer,
+            embed_dim,
+            rows,
+            weights.embed_scale,
+            weights.embed_recast_bf16,
+        )?;
         if let (raw, offset, Some(final_norm)) = &state_input {
             self.encode_rms_norm_rows_strided(
                 encoder,
@@ -325,12 +517,7 @@ impl MetalExecutor {
             spec.kv_heads,
             position_offset,
         )?;
-        encoder_guard.end();
-        commit_and_wait(command_buffer)?;
-        Ok((
-            Tensor::from_vec(vec![rows, kv_dim], read_f32_buffer(&k_rope, kv_len)?)?,
-            Tensor::from_vec(vec![rows, kv_dim], read_f32_buffer(&v, kv_len)?)?,
-        ))
+        Ok((k_rope, v))
     }
 
     #[expect(

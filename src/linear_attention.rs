@@ -266,6 +266,41 @@ impl LinearAttention {
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn materialize_metal_weight_buffers(
+        &mut self,
+        metal: &crate::MetalExecutor,
+    ) -> Result<()> {
+        let weights = self.resident_weights();
+        for (weight, label) in [
+            (weights.in_proj_qkv.weight(), "cpu_release_linear_qkv"),
+            (weights.in_proj_z.weight(), "cpu_release_linear_z"),
+            (weights.in_proj_b.weight(), "cpu_release_linear_b"),
+            (weights.in_proj_a.weight(), "cpu_release_linear_a"),
+            (weights.out_proj.weight(), "cpu_release_linear_out"),
+        ] {
+            let _ = metal.resolve_linear_weight_buffers(weight, label)?;
+        }
+        let resolved = metal.resolve_linear_attn_resident_dense_weights(weights)?;
+        let alias = if resolved.full.is_some() {
+            metal.retained_linear_attn_qkv_z_aliases(weights)?
+        } else {
+            None
+        };
+        // Les paires split possèdent encore des clones des anciens QKV et z.
+        // Les sessions résidentes seront résolues depuis les nouvelles vues.
+        drop(resolved);
+        if let (Some((qkv_alias, z_alias)), Some(qkv), Some(z)) = (
+            alias,
+            self.in_proj_qkv.affine_quantized_mut(),
+            self.in_proj_z.affine_quantized_mut(),
+        ) {
+            *qkv = qkv_alias;
+            *z = z_alias;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         self.in_proj_qkv.release_affine_cpu_data(released);
         self.in_proj_z.release_affine_cpu_data(released);

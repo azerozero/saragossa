@@ -1898,26 +1898,16 @@ impl FullAttention {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 impl DecoderLayer {
     fn materialize_metal_weight_buffers(
-        &self,
+        &mut self,
         metal: &crate::MetalExecutor,
         layer_index: Option<usize>,
     ) -> Result<()> {
-        match &self.attention {
+        match &mut self.attention {
             AttentionBlock::Full(attention) => {
                 attention.materialize_metal_weight_buffers(metal)?;
             }
             AttentionBlock::Linear(attention) => {
-                let weights = attention.resident_weights();
-                for (weight, label) in [
-                    (weights.in_proj_qkv.weight(), "cpu_release_linear_qkv"),
-                    (weights.in_proj_z.weight(), "cpu_release_linear_z"),
-                    (weights.in_proj_b.weight(), "cpu_release_linear_b"),
-                    (weights.in_proj_a.weight(), "cpu_release_linear_a"),
-                    (weights.out_proj.weight(), "cpu_release_linear_out"),
-                ] {
-                    let _ = metal.resolve_linear_weight_buffers(weight, label)?;
-                }
-                let _ = metal.resolve_linear_attn_resident_dense_weights(weights)?;
+                attention.materialize_metal_weight_buffers(metal)?;
             }
         }
         if let Some(mlp) = &self.mlp {

@@ -3,6 +3,8 @@ use super::*;
 
 include!("tests/util.rs");
 include!("tests/buffers_core.rs");
+include!("tests/gdn_weight_storage.rs");
+include!("tests/affine_offsets.rs");
 mod dense_bf16;
 include!("tests/na_gemm_delta.rs");
 include!("tests/small_m_qmm.rs");

@@ -204,7 +204,18 @@ pub(crate) fn take_prefill_f32_to_bf16_shapes() -> Vec<(usize, u64)> {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static OFFSET_TEST_DISPATCHES: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn trace_dispatch_path(kernel: &str, batch: usize, out_dim: usize, in_dim: usize) {
+    #[cfg(test)]
+    OFFSET_TEST_DISPATCHES.with(|trace| {
+        if let Some(trace) = trace.borrow_mut().as_mut() {
+            trace.push(format!("{kernel} M={batch} N={out_dim} K={in_dim}"));
+        }
+    });
     if crate::runtime_flags::trace_dispatch_path_enabled() {
         eprintln!("[dispatch_path] {kernel} M={batch} N={out_dim} K={in_dim}");
     }

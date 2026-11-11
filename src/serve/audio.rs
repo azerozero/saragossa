@@ -218,7 +218,6 @@ impl SttSlot {
 }
 
 fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
-    // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
     override_value
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -267,7 +266,8 @@ pub(super) fn handle_speech<S: Write>(
     handle_speech_with(
         stream,
         body,
-        std::env::var(TTS_MAX_FRAMES_ENV).ok().as_deref(),
+        // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
+        saragossa::runtime_flags::env_var_exact(TTS_MAX_FRAMES_ENV).as_deref(),
         |stream, text, max_frames, streaming| {
             if !streaming {
                 return send_speech(stream, &audio.synthesize(text, max_frames)?);
