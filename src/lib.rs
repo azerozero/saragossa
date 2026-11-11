@@ -76,8 +76,8 @@ pub use decoder::{ResidentLinearXrayLayerDiff, ResidentLinearXrayReport};
 #[cfg(feature = "devtools")]
 pub use devtools::{
     load_dflash_draft_for_target, load_dflash_draft_weights_for_target,
-    load_dflash_draft_weights_quantized, DFlashAttentionWeights, DFlashConv, DFlashDraft,
-    DFlashDraftInfo, DFlashDraftLayer, DFlashQuant, DFlashSelector,
+    load_dflash_draft_weights_quantized, DFlashAttentionWeights, DFlashCodebook, DFlashConv,
+    DFlashDraft, DFlashDraftInfo, DFlashDraftLayer, DFlashQuant, DFlashSelector,
 };
 pub use embedding::{embed_tokens, embed_weight_tokens, EmbeddingWeight};
 pub use error::{InferError, Result};
