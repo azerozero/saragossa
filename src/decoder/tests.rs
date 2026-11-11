@@ -4,6 +4,7 @@ use super::attention_ops::{
     rms_norm_heads, rms_norm_rope_heads_at, AttentionLayout, RopeParams,
 };
 use super::*;
+use crate::oracle::assert_close_abs as assert_close;
 use safetensors::{serialize, Dtype, View};
 use std::borrow::Cow;
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
@@ -2111,16 +2112,6 @@ fn identity4() -> Result<Tensor> {
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ],
     )
-}
-
-fn assert_close(left: &[f32], right: &[f32], tolerance: f32) {
-    assert_eq!(left.len(), right.len());
-    for (idx, (a, b)) in left.iter().zip(right.iter()).enumerate() {
-        assert!(
-            (a - b).abs() <= tolerance,
-            "index={idx} left={a} right={b} tolerance={tolerance}"
-        );
-    }
 }
 
 struct F32View {

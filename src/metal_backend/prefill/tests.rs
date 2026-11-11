@@ -218,12 +218,7 @@ fn assert_close(actual: &Tensor, expected: &Tensor, tolerance: f32, label: &str)
         expected.shape(),
         "{label}: formes différentes"
     );
-    for (index, (&actual, &expected)) in actual.data().iter().zip(expected.data()).enumerate() {
-        assert!(
-            (actual - expected).abs() <= tolerance,
-            "{label}[{index}] actual={actual} expected={expected} tolérance={tolerance}"
-        );
-    }
+    crate::oracle::assert_close_abs(actual.data(), expected.data(), tolerance);
 }
 
 /// Le tail dense Gemma batché résident reproduit sa référence CPU ligne par ligne.

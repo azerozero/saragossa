@@ -126,11 +126,10 @@ fn assert_bits_rows(actual: &[f32], expected: &[f32]) {
 
 fn assert_close_eps(actual: &[f32], expected: &[f32], eps: f32) {
     assert_eq!(actual.len(), expected.len(), "longueurs différentes");
-    let mut max_abs = 0.0_f32;
+    let max_abs = crate::oracle::max_abs_diff(actual, expected);
     let mut mean_abs = 0.0_f32;
     for (&actual, &expected) in actual.iter().zip(expected.iter()) {
         let delta = (actual - expected).abs();
-        max_abs = max_abs.max(delta);
         mean_abs += delta;
     }
     mean_abs /= actual.len().max(1) as f32;
@@ -3630,15 +3629,7 @@ mod dflash_resident {
         }
     }
 
-    fn assert_close(label: &str, gpu: &[f32], cpu: &[f32], tolerance: f32) {
-        assert_eq!(gpu.len(), cpu.len(), "{label}: longueurs");
-        for (i, (g, c)) in gpu.iter().zip(cpu).enumerate() {
-            assert!(
-                (g - c).abs() <= tolerance * (1.0 + c.abs()),
-                "{label}[{i}] gpu={g} cpu={c}"
-            );
-        }
-    }
+    use crate::oracle::assert_close_rel as assert_close;
 
     fn run_case(window: Option<usize>) -> Result<()> {
         let Some(mut state) = try_state()? else {

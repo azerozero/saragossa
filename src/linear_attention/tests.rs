@@ -2,6 +2,7 @@
 //! référence (`naive_gdn_reference`) partagé avec `metal_backend/tests.rs`.
 
 use super::*;
+use crate::oracle::assert_close_abs as assert_close;
 use crate::LinearWeight;
 use proptest::prelude::*;
 
@@ -548,16 +549,6 @@ fn linear(weight: Result<Tensor>) -> Linear {
 
 fn identity2() -> Result<Tensor> {
     Tensor::from_vec(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0])
-}
-
-fn assert_close(left: &[f32], right: &[f32], tolerance: f32) {
-    assert_eq!(left.len(), right.len());
-    for (idx, (l, r)) in left.iter().zip(right.iter()).enumerate() {
-        assert!(
-            (l - r).abs() <= tolerance,
-            "idx={idx}, left={l}, right={r}, tolerance={tolerance}"
-        );
-    }
 }
 
 #[test]

@@ -155,12 +155,7 @@ impl Golden {
 
 fn assert_close(label: &str, rust: &Tensor, oracle: &Tensor, tol: f64) {
     assert_eq!(rust.shape(), oracle.shape(), "{label}: formes");
-    let (rel, max) = relative_error(rust.data(), oracle.data());
-    eprintln!("{label}: rel={rel:.3e} max_abs={max:.3e}");
-    assert!(
-        rel <= tol,
-        "{label}: erreur relative {rel:.3e} > {tol:.0e} (max {max:.3e})"
-    );
+    crate::oracle::assert_close_l2(label, rust.data(), oracle.data(), tol);
 }
 
 /// KL(oracle‖rust) par token via log-softmax stable : (moyenne, maximum).

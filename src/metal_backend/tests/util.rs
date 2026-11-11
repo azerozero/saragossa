@@ -1,3 +1,5 @@
+use crate::oracle::assert_close_abs as assert_close_eps;
+
 fn test_executor() -> Result<Option<MetalExecutor>> {
     match MetalExecutor::new() {
         Ok(executor) => Ok(Some(executor)),
@@ -53,13 +55,6 @@ fn bf16_round(v: f32) -> f32 {
 
 fn assert_close(left: &[f32], right: &[f32]) {
     assert_close_eps(left, right, 1.0e-5);
-}
-
-fn assert_close_eps(left: &[f32], right: &[f32], eps: f32) {
-    assert_eq!(left.len(), right.len());
-    for (idx, (a, b)) in left.iter().zip(right.iter()).enumerate() {
-        assert!((a - b).abs() <= eps, "index={idx} left={a} right={b}");
-    }
 }
 
 /// Vrai si le GPU local est la référence byte-identité des kernels (famille

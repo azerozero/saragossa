@@ -1598,10 +1598,7 @@ mod tests {
     }
 
     fn assert_close(left: &[f32], right: &[f32]) {
-        assert_eq!(left.len(), right.len());
-        for (idx, (a, b)) in left.iter().zip(right.iter()).enumerate() {
-            assert!((a - b).abs() <= 1.0e-6, "index={idx} left={a} right={b}");
-        }
+        crate::oracle::assert_close_abs(left, right, 1.0e-6);
     }
 }
 
