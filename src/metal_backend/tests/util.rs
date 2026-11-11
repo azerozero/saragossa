@@ -1,5 +1,3 @@
-use crate::oracle::assert_close_abs as assert_close_eps;
-
 fn test_executor() -> Result<Option<MetalExecutor>> {
     match MetalExecutor::new() {
         Ok(executor) => Ok(Some(executor)),
@@ -55,6 +53,32 @@ fn bf16_round(v: f32) -> f32 {
 
 fn assert_close(left: &[f32], right: &[f32]) {
     assert_close_eps(left, right, 1.0e-5);
+}
+
+#[test]
+fn legacy_util_comparison_diagnostics() {
+    use crate::oracle::assert_panics_with;
+    assert_close(&[], &[]);
+    assert_close_eps(&[f32::INFINITY], &[1.0], f32::INFINITY);
+    for value in [2.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_panics_with(&format!("index=1 left={value} right=0"), || {
+            assert_close(&[0.0, value], &[0.0, 0.0]);
+        });
+        assert_panics_with(&format!("index=1 left=0 right={value}"), || {
+            assert_close_eps(&[0.0, 0.0], &[0.0, value], 0.1);
+        });
+    }
+    assert_panics_with(
+        "assertion `left == right` failed\n  left: 1\n right: 0",
+        || assert_close_eps(&[f32::NAN], &[], 0.1),
+    );
+}
+
+fn assert_close_eps(left: &[f32], right: &[f32], eps: f32) {
+    assert_eq!(left.len(), right.len());
+    for (idx, (a, b)) in left.iter().zip(right.iter()).enumerate() {
+        assert!((a - b).abs() <= eps, "index={idx} left={a} right={b}");
+    }
 }
 
 /// Vrai si le GPU local est la référence byte-identité des kernels (famille

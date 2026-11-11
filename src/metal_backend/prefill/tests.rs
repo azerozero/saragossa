@@ -212,13 +212,47 @@ fn assert_bit_exact(actual: &Tensor, expected: &Tensor, label: &str) {
     }
 }
 
+#[test]
+fn legacy_prefill_comparison_diagnostics() -> Result<()> {
+    use crate::oracle::assert_panics_with;
+    let expected = Tensor::from_vec(vec![2], vec![0.0, 0.0])?;
+    for value in [2.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let actual = Tensor::from_vec(vec![2], vec![0.0, value])?;
+        assert_panics_with(
+            &format!("prefill[1] actual={value} expected=0 tolérance=0.1"),
+            || {
+                assert_close(&actual, &expected, 0.1, "prefill");
+            },
+        );
+        assert_panics_with(
+            &format!("prefill[1] actual=0 expected={value} tolérance=0.1"),
+            || {
+                assert_close(&expected, &actual, 0.1, "prefill");
+            },
+        );
+    }
+    let actual = Tensor::from_vec(vec![1, 2], vec![f32::NAN, 0.0])?;
+    assert_panics_with(
+        "assertion `left == right` failed: prefill: formes différentes\n  left: [1, 2]\n right: [2]",
+        || assert_close(&actual, &expected, 0.1, "prefill"),
+    );
+    let actual = Tensor::from_vec(vec![2], vec![0.0, f32::INFINITY])?;
+    assert_close(&actual, &expected, f32::INFINITY, "prefill");
+    Ok(())
+}
+
 fn assert_close(actual: &Tensor, expected: &Tensor, tolerance: f32, label: &str) {
     assert_eq!(
         actual.shape(),
         expected.shape(),
         "{label}: formes différentes"
     );
-    crate::oracle::assert_close_abs(actual.data(), expected.data(), tolerance);
+    for (index, (&actual, &expected)) in actual.data().iter().zip(expected.data()).enumerate() {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label}[{index}] actual={actual} expected={expected} tolérance={tolerance}"
+        );
+    }
 }
 
 /// Le tail dense Gemma batché résident reproduit sa référence CPU ligne par ligne.

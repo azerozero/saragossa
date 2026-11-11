@@ -153,6 +153,17 @@ impl Golden {
     }
 }
 
+#[test]
+fn legacy_qwen_comparison_shape_diagnostic() -> crate::Result<()> {
+    let rust = Tensor::from_vec(vec![1, 2], vec![f32::NAN, 0.0])?;
+    let oracle = Tensor::from_vec(vec![2], vec![0.0, 0.0])?;
+    crate::oracle::assert_panics_with(
+        "assertion `left == right` failed: qwen: formes\n  left: [1, 2]\n right: [2]",
+        || assert_close("qwen", &rust, &oracle, 0.1),
+    );
+    Ok(())
+}
+
 fn assert_close(label: &str, rust: &Tensor, oracle: &Tensor, tol: f64) {
     assert_eq!(rust.shape(), oracle.shape(), "{label}: formes");
     crate::oracle::assert_close_l2(label, rust.data(), oracle.data(), tol);

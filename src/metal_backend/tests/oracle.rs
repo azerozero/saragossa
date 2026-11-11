@@ -35,7 +35,7 @@ pub(crate) fn assert_nmse(label: &str, gpu: &[f32], cpu: &[f32], max: f64) {
 
 /// Tolérance historique du decode résident : tol × (1 + |cpu[i]|).
 pub(crate) fn assert_close_rel(label: &str, gpu: &[f32], cpu: &[f32], tol: f32) {
-    check_finite(gpu, cpu);
+    assert_eq!(gpu.len(), cpu.len(), "{label}: longueurs");
     for (i, (g, c)) in gpu.iter().zip(cpu).enumerate() {
         assert!(
             (g - c).abs() <= tol * (1.0 + c.abs()),
@@ -65,9 +65,10 @@ pub(crate) fn time_gpu<T>(label: &str, iters: usize, mut f: impl FnMut() -> T) -
     result
 }
 
-// Les anciens oracles gardent leur métrique et leurs seuils, sans passage en NMSE.
+// Les oracles historiques conservent aussi leurs diagnostics et le comportement
+// IEEE des comparaisons : ne pas leur appliquer check_finite.
 pub(crate) fn assert_close_abs(left: &[f32], right: &[f32], tolerance: f32) {
-    check_finite(left, right);
+    assert_eq!(left.len(), right.len());
     for (idx, (a, b)) in left.iter().zip(right).enumerate() {
         assert!(
             (a - b).abs() <= tolerance,
@@ -76,16 +77,21 @@ pub(crate) fn assert_close_abs(left: &[f32], right: &[f32], tolerance: f32) {
     }
 }
 
+/// Le comparateur sink rejetait déjà les non-finis.
 pub(crate) fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    check_finite(a, b);
+    assert_eq!(a.len(), b.len());
+    assert!(
+        a.iter().chain(b).all(|value| value.is_finite()),
+        "sortie non finie"
+    );
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
         .fold(0.0, f32::max)
 }
 
+/// Le produit scalaire utilise zip, les normes portent sur les tranches entières.
 pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    check_finite(a, b);
     let dot = a
         .iter()
         .zip(b)
@@ -97,7 +103,6 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 pub(crate) fn assert_close_l2(label: &str, gpu: &[f32], cpu: &[f32], tol: f64) {
-    check_finite(gpu, cpu);
     let (rel, max) = crate::qwen4_exp::math::relative_error(gpu, cpu);
     eprintln!("{label}: rel={rel:.3e} max_abs={max:.3e}");
     assert!(
@@ -139,15 +144,10 @@ fn injected_corruption_detected() {
 }
 
 #[test]
-fn non_finite_comparisons_rejected() {
+fn nmse_non_finite_comparisons_rejected() {
     for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         for (a, b) in [([invalid], [1.0]), ([1.0], [invalid])] {
             assert!(std::panic::catch_unwind(|| nmse(&a, &b)).is_err());
-            assert!(std::panic::catch_unwind(|| assert_close_rel("fini", &a, &b, 0.1)).is_err());
-            assert!(std::panic::catch_unwind(|| assert_close_abs(&a, &b, 0.1)).is_err());
-            assert!(std::panic::catch_unwind(|| max_abs_diff(&a, &b)).is_err());
-            assert!(std::panic::catch_unwind(|| cosine(&a, &b)).is_err());
-            assert!(std::panic::catch_unwind(|| assert_close_l2("fini", &a, &b, 0.1)).is_err());
         }
     }
 }
@@ -176,4 +176,142 @@ fn legacy_metrics_and_timing() {
     };
     assert_eq!(calls, expected);
     assert_eq!(result, calls);
+}
+
+/// Compare le diagnostic complet, y compris les détails produits par assert_eq!.
+pub(crate) fn assert_panics_with(expected: &str, f: impl FnOnce() + std::panic::UnwindSafe) {
+    let payload = std::panic::catch_unwind(f).expect_err("le comparateur devait échouer");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied());
+    assert_eq!(message, Some(expected));
+}
+
+#[test]
+fn nmse_rejects_different_lengths() {
+    for (a, b) in [(&[1.0][..], &[][..]), (&[][..], &[1.0][..])] {
+        assert_panics_with(
+            &format!(
+                "assertion `left == right` failed: longueurs différentes\n  left: {}\n right: {}",
+                a.len(),
+                b.len()
+            ),
+            || assert_nmse("longueurs", a, b, 1.0),
+        );
+    }
+}
+
+#[test]
+fn legacy_relative_edges_and_diagnostics() {
+    assert_close_rel("vide", &[], &[], f32::NAN);
+    assert_close_rel("infini", &[1.0], &[f32::INFINITY], 0.1);
+    assert_close_rel("infini", &[1.0], &[f32::NEG_INFINITY], 0.1);
+    assert_close_rel("tolérance", &[f32::INFINITY], &[1.0], f32::INFINITY);
+    for (g, c) in [
+        (f32::NAN, 0.0),
+        (0.0, f32::NAN),
+        (f32::INFINITY, f32::INFINITY),
+        (f32::INFINITY, 1.0),
+    ] {
+        assert_panics_with(&format!("relatif[1] gpu={g} cpu={c}"), || {
+            assert_close_rel("relatif", &[0.0, g], &[0.0, c], 0.1);
+        });
+    }
+    assert_panics_with("relatif[0] gpu=0 cpu=0", || {
+        assert_close_rel("relatif", &[0.0], &[0.0], f32::NAN);
+    });
+    assert_panics_with(
+        "assertion `left == right` failed: relatif: longueurs\n  left: 1\n right: 0",
+        || assert_close_rel("relatif", &[f32::NAN], &[], 0.1),
+    );
+}
+
+#[test]
+fn legacy_absolute_edges_and_diagnostics() {
+    assert_close_abs(&[], &[], f32::NAN);
+    assert_close_abs(&[-0.0], &[0.0], 0.0);
+    assert_close_abs(&[f32::INFINITY], &[1.0], f32::INFINITY);
+    assert_close_abs(&[1.0], &[f32::NEG_INFINITY], f32::INFINITY);
+    for (a, b) in [
+        (f32::NAN, 0.0),
+        (0.0, f32::NAN),
+        (f32::INFINITY, f32::INFINITY),
+        (1.0, f32::NEG_INFINITY),
+        (2.0, 0.0),
+    ] {
+        assert_panics_with(&format!("index=1 left={a} right={b} tolerance=0.1"), || {
+            assert_close_abs(&[0.0, a], &[0.0, b], 0.1);
+        });
+    }
+    assert_panics_with("index=0 left=0 right=0 tolerance=NaN", || {
+        assert_close_abs(&[0.0], &[0.0], f32::NAN);
+    });
+    assert_panics_with(
+        "assertion `left == right` failed\n  left: 1\n right: 0",
+        || assert_close_abs(&[f32::NAN], &[], 0.1),
+    );
+}
+
+#[test]
+fn legacy_sink_edges_and_diagnostics() {
+    assert_eq!(max_abs_diff(&[], &[]), 0.0);
+    assert_eq!(max_abs_diff(&[f32::MAX], &[-f32::MAX]), f32::INFINITY);
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for (a, b) in [([invalid], [0.0]), ([0.0], [invalid])] {
+            assert_panics_with("sortie non finie", || {
+                max_abs_diff(&a, &b);
+            });
+        }
+    }
+    assert_panics_with(
+        "assertion `left == right` failed\n  left: 1\n right: 0",
+        || {
+            max_abs_diff(&[f32::NAN], &[]);
+        },
+    );
+}
+
+#[test]
+fn legacy_cosine_keeps_zip_and_non_finite_results() {
+    assert_eq!(cosine(&[], &[]), 0.0);
+    assert_eq!(cosine(&[], &[1.0]), 0.0);
+    assert_eq!(cosine(&[1.0], &[]), 0.0);
+    // Les éléments sans partenaire comptent dans la norme, pas dans le produit.
+    assert_eq!(cosine(&[3.0], &[3.0, 4.0]), 0.6);
+    assert_eq!(cosine(&[3.0, 4.0], &[3.0]), 0.6);
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert!(cosine(&[invalid], &[1.0]).is_nan());
+        assert!(cosine(&[1.0], &[invalid]).is_nan());
+    }
+    assert_eq!(cosine(&[1.0], &[1.0, f32::INFINITY]), 0.0);
+    assert_eq!(cosine(&[1.0], &[1.0, f32::NAN]), f32::INFINITY);
+}
+
+#[test]
+fn legacy_l2_keeps_zip_and_diagnostics() {
+    assert_close_l2("vide", &[], &[], 0.0);
+    assert_close_l2("zip", &[1.0, f32::NAN], &[1.0], 0.0);
+    assert_close_l2("zip", &[1.0], &[1.0, f32::INFINITY], 0.0);
+    assert_close_l2("zip", &[], &[f32::NAN], 0.0);
+    assert_close_l2("infini", &[f32::INFINITY], &[1.0], f64::INFINITY);
+    for (a, b, max) in [
+        (f32::NAN, 1.0, "0.000e0"),
+        (1.0, f32::NAN, "0.000e0"),
+        (1.0, f32::INFINITY, "inf"),
+        (f32::INFINITY, f32::INFINITY, "0.000e0"),
+    ] {
+        assert_panics_with(
+            &format!("norme: erreur relative NaN > 1e-1 (max {max})"),
+            || {
+                assert_close_l2("norme", &[a], &[b], 0.1);
+            },
+        );
+    }
+    assert_panics_with(
+        "norme: erreur relative 1.000e0 > 1e-1 (max 1.000e0)",
+        || {
+            assert_close_l2("norme", &[2.0], &[1.0], 0.1);
+        },
+    );
 }

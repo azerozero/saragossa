@@ -1597,8 +1597,29 @@ mod tests {
         out
     }
 
+    #[test]
+    fn legacy_quantization_comparison_diagnostics() {
+        use crate::oracle::assert_panics_with;
+        assert_close(&[], &[]);
+        for value in [2.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_panics_with(&format!("index=1 left={value} right=0"), || {
+                assert_close(&[0.0, value], &[0.0, 0.0]);
+            });
+            assert_panics_with(&format!("index=1 left=0 right={value}"), || {
+                assert_close(&[0.0, 0.0], &[0.0, value]);
+            });
+        }
+        assert_panics_with(
+            "assertion `left == right` failed\n  left: 1\n right: 0",
+            || assert_close(&[f32::NAN], &[]),
+        );
+    }
+
     fn assert_close(left: &[f32], right: &[f32]) {
-        crate::oracle::assert_close_abs(left, right, 1.0e-6);
+        assert_eq!(left.len(), right.len());
+        for (idx, (a, b)) in left.iter().zip(right.iter()).enumerate() {
+            assert!((a - b).abs() <= 1.0e-6, "index={idx} left={a} right={b}");
+        }
     }
 }
 
