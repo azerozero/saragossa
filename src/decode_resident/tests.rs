@@ -43,8 +43,7 @@ pub(super) fn try_state() -> Result<Option<DecodeResidentState>> {
 }
 
 fn build_pipeline(device: &Device, name: &str) -> ComputePipelineState {
-    let options = CompileOptions::new();
-    options.set_fast_math_enabled(true);
+    let options = crate::metal_backend::compile_options(true);
     let library = device
         .new_library_with_source(RESIDENT_TEST_KERNELS, &options)
         .expect("invariant: kernels de test compilent");
@@ -3609,6 +3608,7 @@ mod dflash_resident {
             })
             .collect();
         DFlashDraft {
+            snapshot_sources: Default::default(),
             info: DFlashDraftInfo {
                 draft_dir: std::path::PathBuf::new(),
                 weight_path: std::path::PathBuf::new(),

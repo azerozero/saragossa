@@ -330,11 +330,12 @@ pub fn load_causal_decoder_from_shards(
     shards: &[PathBuf],
     catalog: &WeightCatalog,
 ) -> Result<CausalDecoder> {
+    let sources = crate::decoder::SnapshotSources::capture(shards.iter().map(PathBuf::as_path));
     validate_supported_config(config, catalog)?;
     let prefixes = QwenPrefixes::detect(catalog);
     let tensors = load_decoder_tensors(config, shards, catalog, &prefixes)?;
     validate_decoder_shapes(config, &tensors)?;
-    CausalDecoder::from_decoder_tensors(tensors, config.into())
+    Ok(CausalDecoder::from_decoder_tensors(tensors, config.into())?.with_snapshot_sources(sources))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -344,6 +345,7 @@ fn load_causal_decoder_from_shards_for_metal(
     catalog: &WeightCatalog,
     executor: &crate::MetalExecutor,
 ) -> Result<CausalDecoder> {
+    let sources = crate::decoder::SnapshotSources::capture(shards.iter().map(PathBuf::as_path));
     validate_supported_config(config, catalog)?;
     // NOTE: Un modèle hors chemins per-op (flint, cf.
     // `CausalDecoderConfig::metal_unsupported_reason`) se charge quand même :
@@ -352,7 +354,7 @@ fn load_causal_decoder_from_shards_for_metal(
     let context = DecoderLoadContext::metal(executor);
     let tensors = load_decoder_tensors_with_context(config, shards, catalog, &prefixes, &context)?;
     validate_decoder_shapes(config, &tensors)?;
-    CausalDecoder::from_decoder_tensors(tensors, config.into())
+    Ok(CausalDecoder::from_decoder_tensors(tensors, config.into())?.with_snapshot_sources(sources))
 }
 
 /// Charge un décodeur causal depuis des shards sous garde mémoire.
