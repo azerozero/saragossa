@@ -10,7 +10,7 @@ TTS digest = SHA256(vocab.json bytes followed by merges.txt bytes), in that orde
 
 Rust tests accept SARAGOSSA_TOKENIZER_QWEN3, _GEMMA3, _GEMMA4, _WHISPER
 and _QWEN3_TTS with the same path convention, or search the local HF cache.
-An absent local fixture skips with a message; an explicit override takes priority.
+Automatic discovery skips if absent; an invalid explicit override fails the test.
 """
 
 import argparse

@@ -56,8 +56,8 @@ fn local_path(family: &str, source: &str) -> Option<PathBuf> {
         family.replace('-', "_").to_uppercase()
     );
     if let Some(path) = std::env::var_os(&variable) {
-        let path = PathBuf::from(path);
-        return path.exists().then_some(path);
+        // An explicit override must reach file/SHA validation, even if missing.
+        return Some(PathBuf::from(path));
     }
     let hub = crate::hf_resolve::hf_cache_dir_from_env()?;
     let dir = if let Some(name) = source.strip_prefix("local:") {
@@ -204,6 +204,37 @@ fn gemma3() -> TestResult {
 #[test]
 fn gemma4() -> TestResult {
     check_rust("gemma4")
+}
+
+#[test]
+fn explicit_missing_override_fails_but_automatic_absence_skips() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let missing = temp.path().join("missing");
+    let executable = std::env::current_exe()?;
+    for (family, test) in [
+        ("QWEN3", "tokenizer::golden_tests::qwen3"),
+        ("GEMMA3", "tokenizer::golden_tests::gemma3"),
+        ("GEMMA4", "tokenizer::golden_tests::gemma4"),
+        ("WHISPER", "whisper::decoder::golden_tests::whisper"),
+        ("QWEN3_TTS", "tts::tokenizer::golden_tests::qwen3_tts"),
+    ] {
+        let variable = format!("SARAGOSSA_TOKENIZER_{family}");
+        // Child processes isolate overrides from concurrent tests.
+        let mut command = std::process::Command::new(&executable);
+        command
+            .args([test, "--exact", "--nocapture"])
+            .env("HF_HUB_CACHE", &missing)
+            .env_remove(&variable);
+        let skipped = command.output()?;
+        assert!(skipped.status.success(), "{test}: {skipped:?}");
+        assert!(String::from_utf8_lossy(&skipped.stderr).contains("SKIP tokenizer"));
+
+        let failed = command.env(&variable, &missing).output()?;
+        assert!(!failed.status.success(), "{variable}: {failed:?}");
+        assert!(String::from_utf8_lossy(&failed.stdout).contains("1 failed"));
+        assert!(!String::from_utf8_lossy(&failed.stderr).contains("SKIP tokenizer"));
+    }
+    Ok(())
 }
 
 #[test]
