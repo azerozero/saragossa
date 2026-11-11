@@ -159,8 +159,23 @@ renvoie `[0, 41, 1294, 12, 2]` pour les deux chaînes. Cette divergence de
 tokenisation est vérifiée sur les fichiers locaux ; les 19 cas non vides
 isolent une parité numérique bien plus serrée que le seuil initial.
 
+Whisper-small : texte et **34 tokens identiques** entre le décodeur Rust CPU
+et transformers. Texte obtenu par les deux implémentations :
+« Elle voyait l'avenir non pas avec terreur, suit était un sentiment vise,
+mais avec un dégoût bien rare à son âge. » La formulation est conservée telle
+que transcrite ; il ne s'agit pas d'une correction humaine de l'audio.
+Whisper-tiny : texte et **35 tokens identiques** également. Texte obtenu :
+« Elle voyait l'avenir non pas avec terreur, suité t'es un sentiment visse,
+mais avec un découpe bien rare à son âge. » Les deux oracles CPU passent
+(2/2) ; aucun écart texte/tokens n'est observé sur cet extrait. Les horodatages
+restent une référence externe sans équivalent retourné par l'API Rust.
+
 Vérifications effectuées avec `taskpolicy -b` : `cargo fmt --all -- --check`,
 `cargo clippy --all-targets --all-features -- -D warnings` et `cargo build`
 passent. Les cinq tests actifs de lecture/métriques de la bibliothèque et
 celui du chemin serve passent. Les oracles ignorés restent volontairement
 stricts et échouent sur les écarts de parité décrits ci-dessus.
+La suite `cargo test --lib` a aussi signalé un échec du test existant
+`metal_backend::sparse::tests::missing_or_late_proof_never_recycles`, hors des
+fichiers modifiés. Son rejeu isolé passe (1/1) ; l'échec collectif ne doit pas
+être présenté comme une validation complète de la suite.
