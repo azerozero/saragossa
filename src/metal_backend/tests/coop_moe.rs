@@ -135,7 +135,7 @@ fn run_coop_qb_tiled_matches_cpu(
         .device
         .new_buffer((m * k * 2) as u64, MTLResourceOptions::StorageModeShared);
     let out = executor.uncached_f32_buffer(m * n, "qb_tiled_out")?;
-    let mnk = [m as u32, n as u32, k as u32];
+    let mnk = [m as u32, n as u32, k as u32, 0];
     let cb = executor.queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     let guard = EncoderEndGuard::new(enc);
@@ -146,7 +146,7 @@ fn run_coop_qb_tiled_matches_cpu(
     enc.set_buffer(2, Some(&scales), 0);
     enc.set_buffer(3, Some(&biases), 0);
     enc.set_buffer(4, Some(&out), 0);
-    enc.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+    enc.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
     let width = pso.thread_execution_width().max(1);
     enc.dispatch_thread_groups(
         MTLSize::new(m.div_ceil(64) as u64, (n / 64) as u64, 1),
@@ -204,7 +204,7 @@ fn run_coop_qb_matches_cpu(
     let out = executor
         .device
         .new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
-    let mnk = [m as u32, n as u32, k as u32];
+    let mnk = [m as u32, n as u32, k as u32, 0];
     let cb = executor.queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     let guard = EncoderEndGuard::new(enc);
@@ -217,7 +217,7 @@ fn run_coop_qb_matches_cpu(
     enc.set_buffer(2, Some(&s_bf16), 0);
     enc.set_buffer(3, Some(&bi_bf16), 0);
     enc.set_buffer(4, Some(&out), 0);
-    enc.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+    enc.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
     enc.dispatch_thread_groups(
         MTLSize::new(m.div_ceil(16) as u64, (n / 32) as u64, 1),
         MTLSize::new(32, 1, 1),
@@ -304,7 +304,7 @@ fn coop_qb_perf() -> Result<()> {
         guard.end();
         commit_and_wait(cb)?;
     }
-    let mnk = [m as u32, n as u32, k as u32];
+    let mnk = [m as u32, n as u32, k as u32, 0];
     let iters = 200u32;
     let cb = executor.queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -315,7 +315,7 @@ fn coop_qb_perf() -> Result<()> {
     enc.set_buffer(2, Some(&s_bf16), 0);
     enc.set_buffer(3, Some(&bi_bf16), 0);
     enc.set_buffer(4, Some(&out), 0);
-    enc.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+    enc.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
     for _ in 0..iters {
         enc.dispatch_thread_groups(
             MTLSize::new((m / 16) as u64, (n / 32) as u64, 1),
@@ -399,7 +399,7 @@ fn coop_qb_grouped_matches_cpu() -> Result<()> {
         (m_pad * n * 4) as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    let mnk = [m_pad as u32, n as u32, k as u32];
+    let mnk = [m_pad as u32, n as u32, k as u32, 0];
     let cb = executor.queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     let guard = EncoderEndGuard::new(enc);
@@ -413,7 +413,7 @@ fn coop_qb_grouped_matches_cpu() -> Result<()> {
     enc.set_buffer(3, Some(&bi_bf16), 0);
     enc.set_buffer(4, Some(&out), 0);
     enc.set_buffer(5, Some(&te_buf), 0);
-    enc.set_bytes(6, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+    enc.set_bytes(6, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
     enc.dispatch_thread_groups(
         MTLSize::new((m_pad / 16) as u64, (n / 32) as u64, 1),
         MTLSize::new(32, 1, 1),
@@ -519,7 +519,7 @@ fn coop_qb_grouped_u4_gate_up_swiglu_scatter_matches_cpu() -> Result<()> {
     let out_buf = executor.uncached_f32_buffer(max_m * hidden, "coop_u4_out")?;
 
     let gate_dims = [max_m as u32, inter as u32, hidden as u32, top_k as u32];
-    let down_dims = [max_m as u32, hidden as u32, inter as u32];
+    let down_dims = [max_m as u32, hidden as u32, inter as u32, 0];
     let cb = executor.queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     let guard = EncoderEndGuard::new(enc);
@@ -547,7 +547,7 @@ fn coop_qb_grouped_u4_gate_up_swiglu_scatter_matches_cpu() -> Result<()> {
     enc.set_buffer(4, Some(&out_buf), 0);
     enc.set_buffer(5, Some(&tile_buf), 0);
     enc.set_buffer(6, Some(&perm_buf), 0);
-    enc.set_bytes(7, 12, down_dims.as_ptr().cast::<std::ffi::c_void>());
+    enc.set_bytes(7, 16, down_dims.as_ptr().cast::<std::ffi::c_void>());
     enc.dispatch_thread_groups(
         MTLSize::new((max_m / 16) as u64, hidden.div_ceil(32) as u64, 1),
         MTLSize::new(32, 1, 1),
@@ -680,7 +680,7 @@ fn coop_qb_grouped_u4_gate_up_swiglu_scatter_matches_cpu_30b_scale() -> Result<(
     let out_buf = executor.uncached_f32_buffer(max_m * hidden, "coop_u4_30b_out")?;
 
     let gate_dims = [max_m as u32, inter as u32, hidden as u32, top_k as u32];
-    let down_dims = [max_m as u32, hidden as u32, inter as u32];
+    let down_dims = [max_m as u32, hidden as u32, inter as u32, 0];
     let cb = executor.queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     let guard = EncoderEndGuard::new(enc);
@@ -708,7 +708,7 @@ fn coop_qb_grouped_u4_gate_up_swiglu_scatter_matches_cpu_30b_scale() -> Result<(
     enc.set_buffer(4, Some(&out_buf), 0);
     enc.set_buffer(5, Some(&tile_buf), 0);
     enc.set_buffer(6, Some(&perm_buf), 0);
-    enc.set_bytes(7, 12, down_dims.as_ptr().cast::<std::ffi::c_void>());
+    enc.set_bytes(7, 16, down_dims.as_ptr().cast::<std::ffi::c_void>());
     enc.dispatch_thread_groups(
         MTLSize::new((max_m / 16) as u64, hidden.div_ceil(32) as u64, 1),
         MTLSize::new(32, 1, 1),
@@ -1232,7 +1232,7 @@ fn coop_qb_grouped_u4_bit_identical_to_u8_same_weights() -> Result<()> {
     let perm_buf = executor.upload_u32_buffer(&perm, "coop_bid_perm")?;
 
     let gate_dims = [max_m as u32, inter as u32, hidden as u32, top_k as u32];
-    let down_dims = [max_m as u32, hidden as u32, inter as u32];
+    let down_dims = [max_m as u32, hidden as u32, inter as u32, 0];
 
     // Un chemin (gate_up_swiglu -> scatter) paramétré par les PSOs et le packing.
     let run_chain = |gate_packed: &[u32],
@@ -1274,7 +1274,7 @@ fn coop_qb_grouped_u4_bit_identical_to_u8_same_weights() -> Result<()> {
         enc.set_buffer(4, Some(&out_buf), 0);
         enc.set_buffer(5, Some(&tile_buf), 0);
         enc.set_buffer(6, Some(&perm_buf), 0);
-        enc.set_bytes(7, 12, down_dims.as_ptr().cast::<std::ffi::c_void>());
+        enc.set_bytes(7, 16, down_dims.as_ptr().cast::<std::ffi::c_void>());
         enc.dispatch_thread_groups(
             MTLSize::new((max_m / 16) as u64, hidden.div_ceil(32) as u64, 1),
             MTLSize::new(32, 1, 1),
@@ -1359,7 +1359,7 @@ fn coop_qb_tiled_u4_gate_up_swiglu_bit_identical_to_separate_passes() -> Result<
     let (up, us, ub) = weight(11)?;
     let a_f32 = executor.upload_f32_buffer(&lhs, "fused_bid_a")?;
     let a_bf16 = executor.private_bf16_buffer(m * k, "fused_bid_a_bf16")?;
-    let mnk = [m as u32, n as u32, k as u32];
+    let mnk = [m as u32, n as u32, k as u32, 0];
     let width = pso_tiled.thread_execution_width().max(1);
     let grid = MTLSize::new(m.div_ceil(64) as u64, (n / 64) as u64, 1);
     let tg = MTLSize::new(width * 4, 1, 1);
@@ -1384,7 +1384,7 @@ fn coop_qb_tiled_u4_gate_up_swiglu_bit_identical_to_separate_passes() -> Result<
         enc.set_buffer(2, Some(scales), 0);
         enc.set_buffer(3, Some(biases), 0);
         enc.set_buffer(4, Some(out), 0);
-        enc.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        enc.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         enc.dispatch_thread_groups(grid, tg);
         post_dispatch_barrier_buffer(enc, out);
     }
@@ -1401,7 +1401,7 @@ fn coop_qb_tiled_u4_gate_up_swiglu_bit_identical_to_separate_passes() -> Result<
     enc.set_buffer(5, Some(&us), 0);
     enc.set_buffer(6, Some(&ub), 0);
     enc.set_buffer(7, Some(&fused_bf16), 0);
-    enc.set_bytes(8, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+    enc.set_bytes(8, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
     enc.dispatch_thread_groups(grid, tg);
     post_dispatch_barrier_buffer(enc, &fused_bf16);
     guard.end();
@@ -1460,7 +1460,7 @@ fn coop_qb_tiled_u4_bit_identical_to_u8_same_weights() -> Result<()> {
     let scale_buf = executor.buffer_from_f32_as_bf16(&scales, "tiled_bid_s")?;
     let bias_buf = executor.buffer_from_f32_as_bf16(&biases, "tiled_bid_b")?;
     let a_bf16 = executor.private_bf16_buffer(m * k, "tiled_bid_a_bf16")?;
-    let mnk = [m as u32, n as u32, k as u32];
+    let mnk = [m as u32, n as u32, k as u32, 0];
     let run = |packed: &[u32],
                pso: &metal::ComputePipelineState,
                tag: &'static str|
@@ -1477,7 +1477,7 @@ fn coop_qb_tiled_u4_bit_identical_to_u8_same_weights() -> Result<()> {
         enc.set_buffer(2, Some(&scale_buf), 0);
         enc.set_buffer(3, Some(&bias_buf), 0);
         enc.set_buffer(4, Some(&out), 0);
-        enc.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        enc.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         let width = pso.thread_execution_width().max(1);
         enc.dispatch_thread_groups(
             MTLSize::new(m.div_ceil(64) as u64, (n / 64) as u64, 1),

@@ -72,14 +72,15 @@ fn na_gemm_microbench() -> Result<()> {
             g.end();
             commit_and_wait(cb)?;
         }
-        let mnk = [m as u32, n as u32, k as u32];
+        // `uint3` occupe 16 octets en MSL, y compris son padding.
+        let mnk = [m as u32, n as u32, k as u32, 0];
         let width = pso.thread_execution_width().max(1);
         let na_med = time_dispatch(&|enc| {
             enc.set_compute_pipeline_state(&pso);
             enc.set_buffer(0, Some(&a_bf16), 0);
             enc.set_buffer(1, Some(&b_bf16), 0);
             enc.set_buffer(2, Some(&out_na), 0);
-            enc.set_bytes(3, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+            enc.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
             enc.dispatch_thread_groups(
                 MTLSize::new(m.div_ceil(64) as u64, n.div_ceil(32) as u64, 1),
                 MTLSize::new(width * 4, 1, 1),
@@ -93,7 +94,7 @@ fn na_gemm_microbench() -> Result<()> {
                 enc.set_buffer(0, Some(&a_bf16), 0);
                 enc.set_buffer(1, Some(&b_bf16), 0);
                 enc.set_buffer(2, Some(&out_na_bn128), 0);
-                enc.set_bytes(3, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+                enc.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
                 enc.dispatch_thread_groups(
                     MTLSize::new(m.div_ceil(64) as u64, n.div_ceil(128) as u64, 1),
                     MTLSize::new(width * 8, 1, 1),
@@ -281,7 +282,8 @@ fn na_gemm_matches_bf16_cpu() -> Result<()> {
         let out = executor
             .device
             .new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
-        let mnk = [m as u32, n as u32, k as u32];
+        // `uint3` occupe 16 octets en MSL, y compris son padding.
+        let mnk = [m as u32, n as u32, k as u32, 0];
         let width = pso.thread_execution_width().max(1);
         let cb = executor.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
@@ -292,7 +294,7 @@ fn na_gemm_matches_bf16_cpu() -> Result<()> {
         enc.set_buffer(0, Some(&a_bf16), 0);
         enc.set_buffer(1, Some(&b_bf16), 0);
         enc.set_buffer(2, Some(&out), 0);
-        enc.set_bytes(3, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        enc.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         enc.dispatch_thread_groups(
             MTLSize::new(m.div_ceil(64) as u64, n.div_ceil(128) as u64, 1),
             MTLSize::new(width * 8, 1, 1),

@@ -88,6 +88,7 @@ impl MetalExecutor {
             checked_u32(m_padded, "coop g m")?,
             checked_u32(n, "coop g n")?,
             checked_u32(k, "coop g k")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(a_bf16), 0);
@@ -96,7 +97,7 @@ impl MetalExecutor {
         encoder.set_buffer(3, Some(&weight.biases), weight.biases_offset);
         encoder.set_buffer(4, Some(out), 0);
         encoder.set_buffer(5, Some(tile_expert), 0);
-        encoder.set_bytes(6, 12, mnk.as_ptr().cast::<c_void>());
+        encoder.set_bytes(6, 16, mnk.as_ptr().cast::<c_void>());
         trace_dispatch_path("gemm_nax_coop_qb_grouped", m_padded, n, k);
         profile_dispatch();
         encoder.dispatch_thread_groups(
@@ -298,6 +299,7 @@ impl MetalExecutor {
             checked_u32(max_m, "s m")?,
             checked_u32(n, "s n")?,
             checked_u32(k, "s k")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(a_bf16), 0);
@@ -307,7 +309,7 @@ impl MetalExecutor {
         encoder.set_buffer(4, Some(scratch_down), 0);
         encoder.set_buffer(5, Some(tile_expert), 0);
         encoder.set_buffer(6, Some(perm), 0);
-        encoder.set_bytes(7, 12, mnk.as_ptr().cast::<c_void>());
+        encoder.set_bytes(7, 16, mnk.as_ptr().cast::<c_void>());
         trace_dispatch_path(kernel_name, max_m, n, k);
         profile_dispatch();
         encoder.dispatch_thread_groups(coop_grid(max_m, n, tiled), coop_threads(tiled));

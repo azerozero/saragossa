@@ -251,8 +251,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -285,18 +288,20 @@ impl MetalExecutor {
         let lhs_len = checked_len(batch, in_dim, "qmm na fused-tiled lhs")?;
         let lhs_bf16 = self.private_bf16_buffer(lhs_len, "qmm_na_fused_tiled_lhs_bf16")?;
         self.encode_f32_to_bf16(encoder, lhs_buffer, &lhs_bf16, lhs_len)?;
+        // `uint3` occupe 16 octets en MSL : la validation Metal refuse 12.
         let mnk = [
             checked_u32(batch, "qmm na fused-tiled batch")?,
             checked_u32(out_dim, "qmm na fused-tiled out_dim")?,
             checked_u32(in_dim, "qmm na fused-tiled in_dim")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(&lhs_bf16), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
-        encoder.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        encoder.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
             profile_label,
             batch,
@@ -325,8 +330,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -351,8 +359,11 @@ impl MetalExecutor {
                 pso,
                 lhs_buffer,
                 packed_buffer,
+                packed_offset,
                 scales_buffer,
+                scales_offset,
                 biases_buffer,
+                biases_offset,
                 output_buffer,
                 batch,
                 in_dim,
@@ -365,8 +376,11 @@ impl MetalExecutor {
             encoder,
             lhs_buffer,
             packed_buffer,
+            packed_offset,
             scales_buffer,
+            scales_offset,
             biases_buffer,
+            biases_offset,
             output_buffer,
             batch,
             in_dim,
@@ -382,8 +396,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -393,8 +410,11 @@ impl MetalExecutor {
             encoder,
             lhs_buffer,
             packed_buffer,
+            packed_offset,
             scales_buffer,
+            scales_offset,
             biases_buffer,
+            biases_offset,
             output_buffer,
             batch,
             in_dim,
@@ -419,8 +439,8 @@ impl MetalExecutor {
         down: &MetalLinearWeightBuffers,
         inter_dim: usize,
     ) -> bool {
-        // Offsets nuls exigés, comme le chemin résident qui renvoie tout offset
-        // non nul vers le repli : des poids poolés liraient sinon un autre tenseur.
+        // Ce chemin MLP ne sert pas les projections GDN ; le dispatch down
+        // ci-dessous reste lié à zéro, donc les vues décalées en sont exclues.
         let u4_gs64 = |weight: &MetalLinearWeightBuffers, expect_in: usize, expect_out: usize| {
             matches!(
                 weight,
@@ -535,6 +555,7 @@ impl MetalExecutor {
             checked_u32(batch, "MLP fusionné batch")?,
             checked_u32(inter_dim, "MLP fusionné inter_dim")?,
             checked_u32(in_dim, "MLP fusionné in_dim")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(&lhs_bf16), 0);
@@ -545,7 +566,7 @@ impl MetalExecutor {
         encoder.set_buffer(5, Some(us), uso);
         encoder.set_buffer(6, Some(ub), ubo);
         encoder.set_buffer(7, Some(&hidden_bf16), 0);
-        encoder.set_bytes(8, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        encoder.set_bytes(8, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
             "qmm_na_fused_tiled_u4_gate_up_swiglu_gs64",
             batch,
@@ -576,8 +597,11 @@ impl MetalExecutor {
             down_pso,
             &hidden_bf16,
             dp,
+            0,
             ds,
+            0,
             db,
+            0,
             output_buffer,
             batch,
             inter_dim,
@@ -592,8 +616,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -617,8 +644,11 @@ impl MetalExecutor {
             pso,
             &lhs_bf16,
             packed_buffer,
+            packed_offset,
             scales_buffer,
+            scales_offset,
             biases_buffer,
+            biases_offset,
             output_buffer,
             batch,
             in_dim,
@@ -635,8 +665,11 @@ impl MetalExecutor {
         pso: &ComputePipelineState,
         lhs_bf16: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -648,14 +681,15 @@ impl MetalExecutor {
             checked_u32(batch, "qmm na fused-tiled u4 batch")?,
             checked_u32(out_dim, "qmm na fused-tiled u4 out_dim")?,
             checked_u32(in_dim, "qmm na fused-tiled u4 in_dim")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(lhs_bf16), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
-        encoder.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        encoder.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
             profile_label,
             batch,
@@ -688,8 +722,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -721,14 +758,15 @@ impl MetalExecutor {
             checked_u32(batch, "qmm na qb batch")?,
             checked_u32(out_dim, "qmm na qb out_dim")?,
             checked_u32(in_dim, "qmm na qb in_dim")?,
+            0,
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(&lhs_bf16), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
-        encoder.set_bytes(5, 12, mnk.as_ptr().cast::<std::ffi::c_void>());
+        encoder.set_bytes(5, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         profile_dispatch_shape(DispatchProfileShape::matmul(
             if group_size == QMM_NA_GS128_GROUP_SIZE {
                 "qmm_na_qb_u8_gs128"
@@ -760,8 +798,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -776,9 +817,9 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(&self.affine_qmv_one_fast_u8_gs64_f32);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &dims, "qmv_one_u8_dims")?;
         profile_dispatch_shape(DispatchProfileShape::matmul(
@@ -804,8 +845,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -821,9 +865,9 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(&self.affine_qmv_fast_aligned_u2_gs64_f32);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &dims, "qmv_u2_dims")?;
         profile_dispatch_shape(DispatchProfileShape::matmul(
@@ -858,8 +902,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -875,9 +922,9 @@ impl MetalExecutor {
         ];
         encoder.set_compute_pipeline_state(&self.affine_qmv_fast_aligned_u3_gs64_f32);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &dims, "qmv_u3_dims")?;
         profile_dispatch_shape(DispatchProfileShape::matmul(
@@ -911,13 +958,18 @@ impl MetalExecutor {
     /// `U6_QMM_BATCH_TILE` lignes d'entrée, en déquantifiant chaque poids une
     /// fois pour toutes. Réservé au prefill (batch > 1) ; le qmv reste meilleur
     /// pour le decode, où il n'y a qu'une ligne.
+    /// Offsets en octets : packed est lu en uint (alignement 4), scales et
+    /// biases en bfloat scalaires (alignement 2), sans chargement vectoriel.
     pub(super) fn encode_affine_qmm_batched_u6_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -934,9 +986,9 @@ impl MetalExecutor {
         let batch_u32 = [checked_u32(batch, "qmm u6 batch")?];
         encoder.set_compute_pipeline_state(&self.affine_qmm_batched_u6_gs64_f32);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &dims, "qmm_u6_dims")?;
         set_u32_bytes(encoder, 6, &batch_u32, "qmm_u6_batch")?;
@@ -967,8 +1019,11 @@ impl MetalExecutor {
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
         packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
         scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
         biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
         output_buffer: &BufferRef,
         batch: usize,
         in_dim: usize,
@@ -997,9 +1052,9 @@ impl MetalExecutor {
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
-        encoder.set_buffer(1, Some(packed_buffer), 0);
-        encoder.set_buffer(2, Some(scales_buffer), 0);
-        encoder.set_buffer(3, Some(biases_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &dims, "qmv_u6_dims")?;
         profile_dispatch_shape(DispatchProfileShape::matmul(
@@ -1330,8 +1385,11 @@ impl MetalExecutor {
         &self,
         encoder: &ComputeCommandEncoderRef,
         packed: &BufferRef,
+        packed_offset: NSUInteger,
         scales: &BufferRef,
+        scales_offset: NSUInteger,
         biases: &BufferRef,
+        biases_offset: NSUInteger,
         wt: &BufferRef,
         out_dim: usize,
         in_dim: usize,
@@ -1345,9 +1403,9 @@ impl MetalExecutor {
             0,
         ];
         encoder.set_compute_pipeline_state(&self.dequant_u8_to_bf16_t_gs64);
-        encoder.set_buffer(0, Some(packed), 0);
-        encoder.set_buffer(1, Some(scales), 0);
-        encoder.set_buffer(2, Some(biases), 0);
+        encoder.set_buffer(0, Some(packed), packed_offset);
+        encoder.set_buffer(1, Some(scales), scales_offset);
+        encoder.set_buffer(2, Some(biases), biases_offset);
         encoder.set_buffer(3, Some(wt), 0);
         set_u32_bytes(encoder, 4, &dims, "dequant_na_dims")?;
         trace_dispatch_path("dequant_u8_to_bf16_t_gs64", out_dim, in_dim, packed_cols);
