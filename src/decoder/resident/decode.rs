@@ -86,14 +86,26 @@ impl CausalDecoder {
             .map_err(|_| InferError::Metal(format!("token résident hors usize: {raw}")))
     }
 
-    /// Oracle de test : prefill (CPU pour flint) de `prompt`, puis decode résident
-    /// complet des tokens `forced` ; renvoie les logits GPU bruts de chaque pas,
-    /// relus depuis le lm_head résident. Erreur si l'arène ne s'établit pas,
-    /// pour qu'un repli per-op silencieux ne passe pas pour un succès.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si le decode résident est indisponible ou échoue.
+    /// Teacher forcing : prefill de `prompt`, puis logits GPU bruts après
+    /// chaque token de `forced`. Aucun repli du decode résident n'est admis.
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal",
+        any(test, feature = "devtools")
+    ))]
+    pub(crate) fn resident_forced_logits(
+        &self,
+        prompt: &[usize],
+        forced: &[usize],
+        kv_bf16: bool,
+    ) -> Result<Vec<Vec<f32>>> {
+        let (mut cache, _) = self.resident_reference_start(prompt, forced.len(), kv_bf16)?;
+        forced
+            .iter()
+            .map(|&token| self.resident_reference_step(&mut cache, token))
+            .collect()
+    }
+
     #[cfg(all(test, target_os = "macos", feature = "metal"))]
     pub(crate) fn resident_forced_logits_for_test(
         &self,
@@ -101,40 +113,63 @@ impl CausalDecoder {
         forced: &[usize],
         kv_bf16: bool,
     ) -> Result<Vec<Vec<f32>>> {
-        let (mut cache, _) = self.prefill_cache_state(prompt)?;
-        if !self.supports_resident_full_decode()
-            || !self.setup_resident_full_decode(&mut cache, forced.len(), 0, kv_bf16)?
-        {
+        self.resident_forced_logits(prompt, forced, kv_bf16)
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal",
+        any(test, feature = "devtools")
+    ))]
+    pub(crate) fn resident_reference_start(
+        &self,
+        prompt: &[usize],
+        steps: usize,
+        kv_bf16: bool,
+    ) -> Result<(CausalDecoderCache, Tensor)> {
+        if !self.supports_resident_full_decode() {
             return Err(InferError::Config(
-                "decode résident complet indisponible".to_string(),
+                "decode résident complet indisponible".into(),
             ));
         }
-        let mut rows = Vec::with_capacity(forced.len());
-        for &token in forced {
-            let spec = ResidentSampleSpec {
-                temperature: 1.0,
-                top_p: 1.0,
-                top_k: 0,
-                rng_state: 0,
-                mode: ResidentSampleMode::Readback,
-            };
-            let inflight = self.enqueue_decode_token_resident(
-                &mut cache,
-                ResidentDecodeInput::CpuToken(token),
-                None,
-                None,
-                Some(spec),
-            )?;
-            crate::metal_backend::wait_for_completion(&inflight.command_buffer)?;
-            let readback = inflight
-                .logits_readback
-                .ok_or_else(|| InferError::Metal("logits résidents absents".to_string()))?;
-            rows.push(crate::metal_backend::read_f32_buffer(
-                &readback.buffer,
-                readback.len,
-            )?);
+        let (mut cache, state) = self.prefill_cache_state(prompt)?;
+        if !self.setup_resident_full_decode(&mut cache, steps, 0, kv_bf16)? {
+            return Err(InferError::Config(
+                "decode résident complet indisponible".into(),
+            ));
         }
-        Ok(rows)
+        Ok((cache, state))
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal",
+        any(test, feature = "devtools")
+    ))]
+    pub(crate) fn resident_reference_step(
+        &self,
+        cache: &mut CausalDecoderCache,
+        token: usize,
+    ) -> Result<Vec<f32>> {
+        let spec = ResidentSampleSpec {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            rng_state: 0,
+            mode: ResidentSampleMode::Readback,
+        };
+        let inflight = self.enqueue_decode_token_resident(
+            cache,
+            ResidentDecodeInput::CpuToken(token),
+            None,
+            None,
+            Some(spec),
+        )?;
+        crate::metal_backend::wait_for_completion(&inflight.command_buffer)?;
+        let readback = inflight
+            .logits_readback
+            .ok_or_else(|| InferError::Metal("logits résidents absents".into()))?;
+        crate::metal_backend::read_f32_buffer(&readback.buffer, readback.len)
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]

@@ -538,7 +538,7 @@ impl CausalDecoder {
         self.finalize_logits(&logits)
     }
 
-    pub(super) fn finalize_logits(&self, logits: &Tensor) -> Result<Tensor> {
+    pub(crate) fn finalize_logits(&self, logits: &Tensor) -> Result<Tensor> {
         let mut row = logits.last_row()?.to_vec();
         if let Some(softcap) = self.config.final_logit_softcapping {
             if softcap > 0.0 {

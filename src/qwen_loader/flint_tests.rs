@@ -2708,3 +2708,44 @@ fn flint_int4_arena_adopts_prefill_kv_bf16() {
     );
     assert_eq!(tokens, copied, "greedy adopté != semis par copie");
 }
+
+/// Référence plein vocabulaire sans poids externes, via le vrai decode résident.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[test]
+#[ignore = "requiert un device Metal ; exécuté par gpu-synthetic.yml"]
+fn synthetic_flint_kl_reference_roundtrip() {
+    let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
+    let dir = tempfile::tempdir().expect("invariant: répertoire temporaire");
+    assert!(crate::devtools::kl_ref::record(&cpu, &[1, 2, 3], 4, &dir.path().join("cpu")).is_err());
+    assert!(!dir.path().join("cpu").exists());
+    let gpu = cpu.with_metal_runtime().expect("invariant: Metal requis");
+    for (i, (prompt, n)) in [(&[1][..], 1), (&[1][..], 4), (&[1, 2, 3][..], 4)]
+        .iter()
+        .enumerate()
+    {
+        let path = dir.path().join(format!("reference-{i}"));
+        let steps = resident_decode_steps();
+        crate::devtools::kl_ref::record(&gpu, prompt, *n, &path)
+            .expect("invariant: record résident");
+        assert_eq!(resident_decode_steps() - steps, n - 1);
+        let result =
+            crate::devtools::kl_ref::compare(&gpu, &path).expect("invariant: compare résident");
+        assert_eq!(resident_decode_steps() - steps, 2 * (n - 1));
+        assert_eq!(result.n, *n);
+        assert_eq!(result.vocab, VOCAB);
+        assert_eq!(result.kl_mean, 0.0);
+        assert_eq!(result.kl_max, 0.0);
+        assert_eq!(result.top1_agreement, 1.0);
+        assert_eq!(result.forced_delta_p_mean, 0.0);
+        assert_eq!(result.forced_abs_delta_p_mean, 0.0);
+        assert_eq!(result.mean_abs_delta_p, 0.0);
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path.join("ref.json")).expect("invariant: métadonnées écrites"),
+        )
+        .expect("invariant: JSON de référence");
+        let greedy = gpu
+            .generate_greedy(prompt, *n)
+            .expect("invariant: greedy moteur");
+        assert_eq!(meta["forced_ids"], serde_json::json!(greedy));
+    }
+}
