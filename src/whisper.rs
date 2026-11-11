@@ -4,8 +4,18 @@
 //! self-attention non causale et FFN GELU. Les couches linéaires passent par
 //! [`Linear::forward_with_runtime`], donc les matmuls denses réutilisent le
 //! backend Metal existant quand un [`ForwardRuntime::metal`] est fourni.
+//!
+//! [`WhisperModel::transcribe`] couvre le fichier entier par segments contigus
+//! d'au plus 30 s. La coupe minimise l'énergie sur 20 ms, évaluée tous les 10 ms
+//! entre 29 et 30 s ; les textes `notimestamps` sont joints par un espace.
+//! Jusqu'à 30 s incluses, le chemin d'encodage/décodage est inchangé. Si un
+//! segment épuise le budget du décodeur (448 positions sur les modèles usuels)
+//! sans EOT, toute la transcription échoue explicitement : sans timestamps,
+//! une reprise sur le texte partiel ne permettrait pas de garantir l'absence
+//! de mots perdus. Le frontend log-mel seul conserve sa fenêtre fixe de 30 s.
 
 mod decoder;
+mod segments;
 
 pub use decoder::{WhisperDecoder, WhisperModel};
 

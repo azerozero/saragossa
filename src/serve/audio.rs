@@ -17,6 +17,7 @@ use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use serde::Deserialize;
 use serde_json::json;
 
+use saragossa::tts::TTS_GENERATION_HARD_CAP;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use saragossa::MetalExecutor;
 use saragossa::{ForwardRuntime, TtsModel, TtsSynthesisOutput, WhisperModel};
@@ -32,8 +33,8 @@ const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const WAV_SAMPLE_RATE_RANGE: std::ops::RangeInclusive<u32> = 8_000..=192_000;
 /// Valeurs entrelacées, tous canaux confondus : au plus 32 Mo décodés en f32.
 const MAX_WAV_SAMPLES: u64 = 8_000_000;
-/// Cap par défaut du nombre de frames codec générées par la TTS.
-const DEFAULT_TTS_MAX_FRAMES: usize = 160;
+/// Budget minimal conservé pour les clauses courtes.
+const MIN_TTS_MAX_FRAMES: usize = 160;
 /// Surcharge du cap de frames TTS pour les entrées longues.
 const TTS_MAX_FRAMES_ENV: &str = "SARAGOSSA_TTS_MAX_FRAMES";
 const STT_NOT_CONFIGURED: &str =
@@ -100,14 +101,18 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle TTS n'est pas configuré ou si la synthèse échoue.
-    pub(super) fn synthesize(&mut self, text: &str) -> ServeResult<TtsSynthesisOutput> {
+    pub(super) fn synthesize(
+        &mut self,
+        text: &str,
+        max_frames: usize,
+    ) -> ServeResult<TtsSynthesisOutput> {
         self.ensure_tts_loaded()?;
         let model = self
             .tts
             .model
             .as_ref()
             .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
-        let output = model.synthesize_default(text, tts_max_frames())?;
+        let output = model.synthesize_default(text, max_frames)?;
         Ok(output)
     }
 
@@ -183,13 +188,18 @@ impl SttSlot {
     }
 }
 
-fn tts_max_frames() -> usize {
+fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
     // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
-    std::env::var(TTS_MAX_FRAMES_ENV)
-        .ok()
+    override_value
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_TTS_MAX_FRAMES)
+        .unwrap_or_else(|| {
+            text.chars()
+                .count()
+                .saturating_mul(2)
+                .max(MIN_TTS_MAX_FRAMES)
+        })
+        .min(TTS_GENERATION_HARD_CAP)
 }
 
 /// Sert `POST /v1/audio/transcriptions`.
@@ -225,6 +235,22 @@ pub(super) fn handle_speech<S: Write>(
     audio: &mut AudioState,
     body: &[u8],
 ) -> ServeResult<()> {
+    handle_speech_with(
+        stream,
+        body,
+        std::env::var(TTS_MAX_FRAMES_ENV).ok().as_deref(),
+        |text, max_frames| audio.synthesize(text, max_frames),
+    )
+}
+
+// L'injection permet de vérifier les arguments transmis par la route sans
+// charger de poids ni initialiser Metal.
+fn handle_speech_with<S: Write>(
+    stream: &mut S,
+    body: &[u8],
+    override_value: Option<&str>,
+    synthesize: impl FnOnce(&str, usize) -> ServeResult<TtsSynthesisOutput>,
+) -> ServeResult<()> {
     let request: SpeechRequest = serde_json::from_slice(body)
         .map_err(|e| ServeError::json("désérialisation audio/speech", e))?;
     let input = request.input.trim();
@@ -233,9 +259,17 @@ pub(super) fn handle_speech<S: Write>(
             "champ 'input' requis pour audio/speech".to_string(),
         ));
     }
-    let output = audio.synthesize(input)?;
+    let output = synthesize(input, tts_max_frames(input, override_value))?;
+    send_speech(stream, &output)
+}
+
+fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeResult<()> {
     let wav = mono_f32_to_wav(&output.samples, output.sample_rate)?;
-    write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), Vec::new())?;
+    let headers = vec![(
+        "X-Saragossa-TTS-Frame-Limit-Reached",
+        output.frame_limit_reached.to_string(),
+    )];
+    write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), headers)?;
     stream
         .write_all(&wav)
         .map_err(|e| ServeError::io("écriture réponse WAV", e))?;
@@ -551,6 +585,88 @@ mod tests {
         }
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
         body
+    }
+
+    #[test]
+    fn tts_budget_tracks_unicode_text_and_respects_bounded_override() {
+        assert_eq!(tts_max_frames("", None), 160);
+        assert_eq!(tts_max_frames("Bonjour.", None), 160);
+        assert_eq!(tts_max_frames(&"é".repeat(200), None), 400);
+        assert_eq!(tts_max_frames(&"a".repeat(320), None), 640);
+        assert_eq!(tts_max_frames(&"a".repeat(10_000), None), 800);
+        for invalid in ["", "0", "-1", "bad", "99999999999999999999999999999"] {
+            assert_eq!(tts_max_frames(&"a".repeat(200), Some(invalid)), 400);
+        }
+        assert_eq!(tts_max_frames(&"a".repeat(200), Some(" 12 ")), 12);
+        assert_eq!(tts_max_frames("Bonjour.", Some("640")), 640);
+        assert_eq!(tts_max_frames("Bonjour.", Some("2000")), 800);
+        assert_eq!(
+            tts_max_frames("Bonjour.", Some(&usize::MAX.to_string())),
+            800
+        );
+    }
+
+    #[test]
+    fn speech_passes_cleaned_text_and_budget_to_synthesis() -> ServeResult<()> {
+        for (text, override_value, expected_frames) in [
+            ("Bonjour.".to_string(), None, 160),
+            ("é".repeat(200), None, 400),
+            ("a".repeat(500), None, 800),
+            ("é".repeat(200), Some("160"), 160),
+            ("é".repeat(200), Some("12"), 12),
+            ("é".repeat(200), Some("2000"), 800),
+            ("é".repeat(200), Some("0"), 400),
+        ] {
+            let body = json!({ "input": format!("  {text}\n") }).to_string();
+            let mut response = Vec::new();
+            let mut called = false;
+            handle_speech_with(
+                &mut response,
+                body.as_bytes(),
+                override_value,
+                |input, max_frames| {
+                    called = true;
+                    assert_eq!(input, text);
+                    assert_eq!(max_frames, expected_frames);
+                    Ok(TtsSynthesisOutput {
+                        codes: Vec::new(),
+                        samples: vec![0.0],
+                        sample_rate: 24_000,
+                        frame_limit_reached: false,
+                    })
+                },
+            )?;
+            assert!(called);
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn speech_returns_wav_and_explicit_limit_header() -> ServeResult<()> {
+        for reached in [false, true] {
+            let output = TtsSynthesisOutput {
+                codes: vec![vec![1; 16]],
+                samples: vec![0.0, 0.25, -0.25],
+                sample_rate: 24_000,
+                frame_limit_reached: reached,
+            };
+            let mut response = Vec::new();
+            send_speech(&mut response, &output)?;
+            let split = response
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("invariant: réponse HTTP avec en-têtes");
+            let headers = String::from_utf8_lossy(&response[..split]);
+            assert!(headers.starts_with("HTTP/1.1 200 OK"));
+            assert!(headers.contains("Content-Type: audio/wav"));
+            assert!(headers.contains(&format!("X-Saragossa-TTS-Frame-Limit-Reached: {reached}")));
+            assert_eq!(
+                &response[split + 4..],
+                mono_f32_to_wav(&output.samples, 24_000)?
+            );
+        }
+        Ok(())
     }
 
     #[test]
