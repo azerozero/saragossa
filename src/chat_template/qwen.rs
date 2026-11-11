@@ -48,8 +48,18 @@ pub fn render_qwen_chatml_profile(
 ) -> String {
     let mut out = String::new();
     let mut turns = messages;
+    let reasoning_preamble = profile == QwenProfile::Qwen38 && enable_thinking;
+    if reasoning_preamble {
+        out.push_str("<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.");
+        if !tools.is_empty() || messages.first().is_some_and(|m| m.role == "system") {
+            out.push_str("\n\n");
+        }
+    }
     if !tools.is_empty() {
-        out.push_str("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n");
+        if !reasoning_preamble {
+            out.push_str("<|im_start|>system\n");
+        }
+        out.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>\n");
         for tool in tools {
             match serde_json::from_str::<JsonValue>(tool) {
                 Ok(value) => out.push_str(&value.to_python_json()),
@@ -60,6 +70,13 @@ pub fn render_qwen_chatml_profile(
         out.push_str(include_str!("qwen_tool_instructions.txt").trim_end());
         if let Some((first, rest)) = messages.split_first().filter(|(m, _)| m.role == "system") {
             out.push_str("\n\n");
+            out.push_str(first.content.as_deref().unwrap_or("").trim());
+            turns = rest;
+        }
+        out.push_str("<|im_end|>\n");
+    }
+    if reasoning_preamble && tools.is_empty() {
+        if let Some((first, rest)) = messages.split_first().filter(|(m, _)| m.role == "system") {
             out.push_str(first.content.as_deref().unwrap_or("").trim());
             turns = rest;
         }
@@ -139,6 +156,8 @@ pub fn render_qwen_chatml_profile(
         out.push_str("<|im_start|>assistant\n");
         if !enable_thinking {
             out.push_str(QWEN_EMPTY_THINK_BLOCK);
+        } else {
+            out.push_str("<think>\n");
         }
     }
     out
@@ -197,12 +216,18 @@ mod tests {
 
     #[test]
     fn qwen36_tools_match_reference_without_thinking() {
-        check_reference(include_bytes!("../../tests/fixtures/goldens/chat_templates/qwen36_moe.bin"), QwenProfile::Qwen36);
+        check_reference(
+            include_bytes!("../../tests/fixtures/goldens/chat_templates/qwen36_moe.bin"),
+            QwenProfile::Qwen36,
+        );
     }
 
     #[test]
     fn qwen38_history_matches_reference_without_thinking() {
-        check_reference(include_bytes!("../../tests/fixtures/goldens/chat_templates/qwen38.bin"), QwenProfile::Qwen38);
+        check_reference(
+            include_bytes!("../../tests/fixtures/goldens/chat_templates/qwen38.bin"),
+            QwenProfile::Qwen38,
+        );
     }
 
     fn check_reference(bytes: &[u8], profile: QwenProfile) {
@@ -240,7 +265,13 @@ mod tests {
                 .collect();
             let tools: Vec<_> = case.tools.iter().map(|v| v.get().to_string()).collect();
             assert_eq!(
-                render_qwen_chatml_profile(&messages, &tools, case.add_generation_prompt, false, profile),
+                render_qwen_chatml_profile(
+                    &messages,
+                    &tools,
+                    case.add_generation_prompt,
+                    false,
+                    profile
+                ),
                 case.rendered
             );
         }

@@ -15,8 +15,11 @@ pub fn render_gemma4_chat_with_tools(
     let system = messages
         .first()
         .filter(|m| matches!(m.role.as_str(), "system" | "developer"));
-    if system.is_some() || !tools.is_empty() {
+    if system.is_some() || !tools.is_empty() || enable_thinking {
         out.push_str("<|turn>system\n");
+        if enable_thinking {
+            out.push_str("<|think|>\n");
+        }
         if let Some(system) = system {
             out.push_str(system.content.as_deref().unwrap_or("").trim());
             turns = &messages[1..];

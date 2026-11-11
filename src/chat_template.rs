@@ -326,7 +326,7 @@ mod tests {
             prompt,
             "<|im_start|>system\nRéponds en français.<|im_end|>\n\
              <|im_start|>user\nBonjour<|im_end|>\n\
-             <|im_start|>assistant\n"
+             <|im_start|>assistant\n<think>\n"
         );
     }
 
@@ -345,8 +345,8 @@ mod tests {
 
         let prompt = render_qwen_chatml(&messages, true, true);
 
-        assert!(prompt.ends_with("<|im_start|>assistant\n"));
-        assert!(!prompt.contains("<think>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n"));
+        assert!(!prompt.contains("</think>"));
     }
 
     #[test]
