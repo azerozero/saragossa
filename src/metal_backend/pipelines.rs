@@ -1081,13 +1081,23 @@ mod compile_options_tests {
             });
             assert!(failed.is_err());
             assert!(compile_options(true).is_fast_math_enabled());
-            std::thread::spawn(|| {
+            // Le parent vérifie pendant que l'override de l'enfant est actif :
+            // un stockage global, et non local au thread, ferait échouer ce test.
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let child_barrier = std::sync::Arc::clone(&barrier);
+            let child = std::thread::spawn(move || {
                 with_metal_fast_math_override(false, || {
-                    assert!(!compile_options(true).is_fast_math_enabled());
+                    let child_fast = compile_options(true).is_fast_math_enabled();
+                    child_barrier.wait();
+                    child_barrier.wait();
+                    assert!(!child_fast);
                 });
-            })
-            .join()
-            .expect("invariant: thread de test terminé");
+            });
+            barrier.wait();
+            let parent_fast = compile_options(true).is_fast_math_enabled();
+            barrier.wait();
+            child.join().expect("invariant: thread de test terminé");
+            assert!(parent_fast);
             assert!(compile_options(true).is_fast_math_enabled());
         });
     }
