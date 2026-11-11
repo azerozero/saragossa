@@ -433,7 +433,6 @@ impl LoaderLayerPlan {
             .unwrap_or_else(|| self.hidden_size / self.num_attention_heads)
     }
 
-    #[cfg(test)]
     pub(crate) fn rope_dims(&self) -> usize {
         let head_dim = self.head_dim();
         self.rope_factor

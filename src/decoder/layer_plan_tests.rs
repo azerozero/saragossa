@@ -94,6 +94,24 @@ fn historical_layer_decisions() {
         for index in 0..=config.num_hidden_layers {
             snapshot.push_str(&format!("{:?}\n", planned(&config, index)));
             let loader = layer_plan::LoaderLayerPlan::build(&model, index);
+            // Les façades publiques doivent aussi respecter l'oracle historique.
+            assert_eq!(
+                (
+                    model.is_gemma4_full_layer(index),
+                    model.is_gemma4_sliding_layer(index),
+                    model.layer_head_dim(index),
+                    model.layer_num_key_value_heads(index),
+                    model.layer_rope_dims(index),
+                ),
+                (
+                    loader.gemma_full,
+                    loader.gemma_sliding,
+                    loader.head_dim(),
+                    loader.kv_heads,
+                    loader.rope_dims(),
+                ),
+                "{family}, couche {index}",
+            );
             snapshot.push_str(&format!(
                 "loader {:?}\n",
                 (
@@ -121,6 +139,38 @@ fn historical_layer_decisions() {
         }
     }
     assert_eq!(snapshot, include_str!("layer_plan_snapshots/decisions.txt"));
+}
+
+#[test]
+fn historical_loader_v_shared_with_k() {
+    // Valeurs du prédicat historique du chargeur, sans les recalculer depuis
+    // le plan ni les façades. La dernière entrée est hors des couches déclarées.
+    for (family, model) in fixtures() {
+        let expected: &[bool] = match family {
+            "qwen_dense" | "qwen_moe" => &[false, false],
+            "qwen_hybrid" | "qwen_hybrid_moe" => &[false, false, false],
+            "gemma3" => &[false; 8],
+            "gemma4_dense" | "gemma4_moe" | "gemma4_partial_options" | "qwen_labels_divergent" => {
+                &[false, true, false]
+            }
+            "flint" => &[false; 4],
+            _ => panic!("fixture sans oracle K=V"),
+        };
+        assert_eq!(expected.len(), model.num_hidden_layers + 1, "{family}");
+        for (index, &v_shared) in expected.iter().enumerate() {
+            let loader = layer_plan::LoaderLayerPlan::build(&model, index);
+            assert_eq!(loader.v_shared_with_k, v_shared, "{family}, couche {index}");
+        }
+        if family == "qwen_labels_divergent" {
+            let loader = layer_plan::LoaderLayerPlan::build(&model, 1);
+            let decoder = LayerPlan::build(&CausalDecoderConfig::from(&model), 1);
+            // Le chargeur n'a jamais eu la garde familiale du décodeur.
+            assert_eq!(
+                (loader.v_shared_with_k, decoder.resident.v_shared_with_k),
+                (true, false),
+            );
+        }
+    }
 }
 
 #[test]
