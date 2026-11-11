@@ -125,6 +125,8 @@ pub struct CausalDecoderConfig {
     pub rms_eps: f32,
     /// Définit la base RoPE optionnelle.
     pub rope_theta: Option<f32>,
+    /// Borne la croissance opportuniste du K/V, sans réduire la réserve demandée.
+    pub max_position_embeddings: Option<usize>,
     /// Définit le nombre de couches du décodeur.
     pub num_hidden_layers: usize,
     /// Définit le nombre de têtes d'attention requête.
@@ -1138,6 +1140,7 @@ impl Default for CausalDecoderConfig {
         Self {
             rms_eps: 1.0e-6,
             rope_theta: Some(10_000.0),
+            max_position_embeddings: None,
             num_hidden_layers: 1,
             num_attention_heads: 1,
             num_key_value_heads: 1,
@@ -1189,6 +1192,7 @@ impl From<&ModelConfig> for CausalDecoderConfig {
         Self {
             rms_eps: config.rms_norm_eps,
             rope_theta: Some(config.rope_theta),
+            max_position_embeddings: config.max_position_embeddings,
             num_hidden_layers: config.num_hidden_layers,
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads,

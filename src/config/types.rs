@@ -31,6 +31,9 @@ pub struct ModelConfig {
     pub rms_norm_eps: f32,
     /// Définit la base angulaire RoPE.
     pub rope_theta: f32,
+    /// Borne déclarée du contexte, absente si le modèle ne la précise pas.
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
     /// Définit la taille du vocabulaire.
     pub vocab_size: usize,
     /// Liste les tokens de fin de séquence.

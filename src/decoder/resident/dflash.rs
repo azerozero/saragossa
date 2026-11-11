@@ -360,8 +360,14 @@ impl CausalDecoder {
         let window = drafter_window(&draft.info.layer_types, draft.info.sliding_window);
         let fixed_base = window.is_some() && crate::runtime_flags::dflash_drafter_base();
         let keep_rows = window.unwrap_or(usize::MAX);
+        // Réserve du decode demandée dès le prefill : sans elle, la croissance
+        // bornée au contexte du modèle peut laisser le K/V trop court pour être
+        // adopté, d'où une recopie complète près de la fenêtre.
+        let decode_reserve = max_new_tokens + draft_limit.max(tree_budget) + 1;
         let (mut cache, final_state, target_hidden, captured_from) =
-            self.prefill_cache_state_with_layer_capture_cached(prompt, layer_ids, keep_rows)?;
+            crate::metal_backend::with_prefill_kv_reserve(decode_reserve, || {
+                self.prefill_cache_state_with_layer_capture_cached(prompt, layer_ids, keep_rows)
+            })?;
         let (captured_rows, captured_cols) = target_hidden.as_matrix()?;
         if captured_cols != context_cols {
             return Err(InferError::Dimension(
@@ -383,12 +389,7 @@ impl CausalDecoder {
         let kv_bf16 = Self::resident_kv_bf16(options.temperature > f32::EPSILON, cache.position);
         if self.config.metal_unsupported_reason().is_some()
             || !self.supports_resident_full_decode()
-            || !self.setup_resident_full_decode(
-                &mut cache,
-                max_new_tokens + draft_limit.max(tree_budget) + 1,
-                0,
-                kv_bf16,
-            )?
+            || !self.setup_resident_full_decode(&mut cache, decode_reserve, 0, kv_bf16)?
         {
             return Err(InferError::Config(
                 "decode DFlash résident: decode résident complet indisponible".to_string(),
