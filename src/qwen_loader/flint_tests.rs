@@ -417,6 +417,17 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
     );
 }
 
+/// Même oracle synthétique, toutes les compilations du runtime sans fast-math.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "GPU synthétique : exécuté par gpu-synthetic.yml"]
+fn synthetic_flint_resident_decode_without_fast_math_matches_cpu_oracle() {
+    crate::metal_backend::with_metal_fast_math_override(false, || {
+        assert!(!crate::metal_backend::compile_options(true).is_fast_math_enabled());
+        synthetic_flint_resident_decode_matches_cpu_oracle();
+    });
+}
+
 /// Light-batch flint : time-slicing (le pas duo ne connaît pas flint), deux
 /// flux, chacun identique au flux seul, et chaque pas par le decode résident.
 /// Le flux de 600 tokens dépasse de loin la fenêtre synthétique de 2 ; il

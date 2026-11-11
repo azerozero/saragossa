@@ -53,6 +53,7 @@ jobs:
           # L'absence de device Metal fait échouer le job via les tests obligatoires.
           # Conserver les #[ignore] jusqu’à trois passages CI stables.
           tests=(
+            qwen_loader::flint_tests::synthetic_flint_resident_decode_without_fast_math_matches_cpu_oracle
             decode_resident::rope_tests::rope_decode_matches_common_cpu_at_long_positions
             decode_resident::rope_tests::rope_append_matches_common_cpu_at_long_positions
             decode_resident::rope_tests::rope_rows_matches_common_cpu_at_long_positions

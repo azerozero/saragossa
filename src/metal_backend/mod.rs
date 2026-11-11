@@ -6,8 +6,6 @@ use crate::{
 };
 use metal::foreign_types::ForeignTypeRef;
 use metal::objc::runtime::{sel_registerName, Object, Sel};
-#[cfg(test)]
-use metal::CompileOptions;
 use metal::{
     Buffer, BufferRef, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
     MTLCommandBufferStatus, MTLPurgeableState, MTLResourceOptions, MTLSize, NSUInteger,
@@ -86,6 +84,9 @@ mod na_gemm;
 mod nax_rows;
 pub(crate) use self::nax_rows::{NaxRowsAttention, NaxRowsBuffers, NaxRowsDispatch};
 mod pipelines;
+#[cfg(test)]
+pub(crate) use self::flags::with_metal_fast_math_override;
+pub use self::pipelines::compile_options;
 mod prefill;
 #[cfg(test)]
 pub(crate) use self::eligibility::with_qmm_skinny_min_batch_override;
