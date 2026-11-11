@@ -48,22 +48,18 @@ fn request_translates_blocks_system_and_stop_sequences() {
     assert_eq!(messages[1].role, "user");
     assert_eq!(messages[1].content.as_deref(), Some("run"));
     assert_eq!(messages[2].role, "tool");
-    assert_eq!(
-        messages[2].content.as_deref(),
-        Some(r#"{"content":"ok","tool_use_id":"toolu_1"}"#)
-    );
+    assert_eq!(messages[2].content.as_deref(), Some("ok"));
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("toolu_1"));
     assert_eq!(messages[3].role, "assistant");
-    let assistant = messages[3]
-        .content
-        .as_deref()
-        .expect("invariant: contenu assistant");
-    assert!(assistant.starts_with("done\n\n<tool_call>"));
-    assert!(assistant.contains(r#""name":"Bash""#));
-    assert!(assistant.contains(r#""command":"pwd""#));
+    assert_eq!(messages[3].content.as_deref(), Some("done"));
+    let call: Value = serde_json::from_str(&messages[3].tool_calls[0]).expect("call");
+    assert_eq!(call["id"], "toolu_2");
+    assert_eq!(call["function"]["name"], "Bash");
+    assert_eq!(call["function"]["arguments"], json!({"command":"pwd"}));
 }
 
 #[test]
-fn request_injects_tools_and_tool_stop_sequence() {
+fn request_preserves_tools_without_injecting_a_generic_prompt_or_stop() {
     let request: AnthropicMessagesRequest = serde_json::from_str(
         r#"{
             "model":"reti-35b",
@@ -86,15 +82,21 @@ fn request_injects_tools_and_tool_stop_sequence() {
         .expect("invariant: requête traduisible");
     let messages = chat.template_messages();
 
-    assert_eq!(messages[0].role, "system");
-    let system = messages[0]
-        .content
-        .as_deref()
-        .expect("invariant: system injecté");
-    assert!(system.contains("<tools>"));
-    assert!(system.contains(r#""name":"Bash""#));
-    assert!(system.contains("<tool_call>"));
-    assert!(chat.stop_texts().contains(&"</tool_call>".to_string()));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content.as_deref(), Some("liste"));
+    let tools = chat.active_tools().expect("tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].value["function"]["name"], "Bash");
+    assert_eq!(
+        tools[0].value["function"]["description"],
+        "Run a shell command"
+    );
+    assert_eq!(
+        tools[0].value["function"]["parameters"]["properties"]["command"]["type"],
+        "string"
+    );
+    assert!(chat.stop_texts().is_empty());
 }
 
 #[test]
@@ -603,4 +605,53 @@ fn sse_events(body: &str) -> Vec<(String, Value)> {
             (event, value)
         })
         .collect()
+}
+
+#[test]
+fn common_qwen_and_gemma_parser_produce_anthropic_blocks_and_sse() {
+    use super::super::tool_output::ToolFamily;
+    for (family, text) in [
+        (ToolFamily::Qwen, "Texte<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>"),
+        (ToolFamily::Gemma4, "Texte<|tool_call>call:weather{city:<|\"|>Paris<|\"|>}<tool_call|>"),
+    ] {
+        let tools = vec![json!({"type":"function","function":{"name":"weather","parameters":{"properties":{"city":{"type":"string"}}}}})];
+        let completion = fake_completion("test", text, "stop", None, 3, 4);
+        let response = AnthropicMessageResponse::with_parser(&completion, Some(ToolOutputParser::new(family, tools.clone(), true)));
+        let value = serde_json::to_value(response).expect("response");
+        assert_eq!(value["stop_reason"], "tool_use");
+        assert_eq!(value["content"][0]["text"], "Texte");
+        assert_eq!(value["content"][1]["input"], json!({"city":"Paris"}));
+        let mut bytes = Vec::new();
+        let mut sink = AnthropicSse::with_parser(&mut bytes, Some(ToolOutputParser::new(family, tools, true)));
+        for ch in text.chars() { sink.event(CompletionStreamEvent::Delta(&ch.to_string())).expect("delta"); }
+        sink.finish(Ok(completion)).expect("finish");
+        let events = sse_events(std::str::from_utf8(&bytes).expect("utf8"));
+        let tool = events.iter().find(|(_, v)| v["content_block"]["type"] == "tool_use").expect("tool block");
+        let id = tool.1["content_block"]["id"].as_str().expect("id");
+        assert!(!id.is_empty());
+        assert_eq!(tool.1["content_block"]["name"], "weather");
+        assert!(events.iter().any(|(_, v)| v["delta"]["partial_json"] == r#"{"city":"Paris"}"#));
+        assert!(events.iter().any(|(_, v)| v["delta"]["stop_reason"] == "tool_use"));
+        // L'identifiant émis se retrouve intact dans l'historique du tour suivant.
+        let request = json!({"model":"test","max_tokens":5,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":id,"name":"weather","input":{"city":"Paris"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"18"}]}]});
+        let (chat, _, _) = anthropic_chat(&serde_json::to_vec(&request).expect("wire"), None).expect("convert");
+        assert_eq!(chat.messages[1].tool_call_id.as_deref(), Some(id));
+        let call: Value = serde_json::from_str(chat.messages[0].tool_calls.as_ref().expect("calls")[0].get()).expect("call");
+        assert_eq!(call["id"], id);
+    }
+}
+
+#[test]
+fn anthropic_tool_choices_are_explicit() {
+    assert_eq!(
+        anthropic_tool_choice(Some(&json!({"type":"none"}))).expect("none"),
+        Some(json!("none"))
+    );
+    assert!(anthropic_tool_choice(Some(&json!({"type":"any"}))).is_err());
+    assert!(anthropic_tool_choice(Some(&json!({"type":"tool","name":"weather"}))).is_err());
+    assert!(assistant_message(Some(&AnthropicContent::Blocks(vec![
+        json!({"type":"tool_use","name":"x","input":{}})
+    ])))
+    .is_err());
+    assert!(tool_result_text(&json!({"type":"tool_result","content":"18"})).is_err());
 }

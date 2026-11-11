@@ -363,7 +363,7 @@ pub(super) fn handle_batch<S: Write>(state: &mut ServeState, jobs: &mut [(&mut S
             }
         };
         if batch.anthropic {
-            sinks.push(Box::new(AnthropicSse::new(stream)));
+            sinks.push(Box::new(AnthropicSse::with_parser(stream, parser)));
         } else {
             sinks.push(Box::new(OpenAiSse::new(
                 stream,

@@ -84,7 +84,7 @@ pub(super) struct ChatCompletionRequest {
 /// Outil déclaré par la requête, lu une seule fois.
 #[derive(Clone, Debug)]
 pub(super) struct DeclaredTool {
-    /// Texte JSON brut, que le template flint rend dans l'ordre du client
+    /// Texte JSON brut, que les templates rendent dans l'ordre du client
     /// (`Value` trierait les clés).
     pub(super) json: String,
     /// Même outil en `Value`, pour lire son schéma.
@@ -103,7 +103,7 @@ impl<'de> Deserialize<'de> for DeclaredTool {
 }
 
 /// Plafond du nombre de stop sequences (OpenAI en accepte 4 ; Anthropic peut
-/// en déclarer davantage, plus `</tool_call>` ajouté pour les outils).
+/// en déclarer davantage).
 const MAX_STOP_SEQUENCES: usize = 16;
 /// Plafond de taille d'une stop sequence.
 const MAX_STOP_BYTES: usize = 1024;
