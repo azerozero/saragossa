@@ -192,7 +192,7 @@ fn flint_tensors(packed_u8: bool) -> Vec<(String, Fixture)> {
     out
 }
 
-fn flint_config() -> ModelConfig {
+pub(crate) fn flint_config() -> ModelConfig {
     let raw = serde_json::json!({
         "model_type": "flint",
         "hidden_size": HIDDEN,

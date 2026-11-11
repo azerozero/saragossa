@@ -16,7 +16,7 @@ pub(super) const EMBED_VALUES: [f32; 12] = [
     0.11, -0.23, 0.37, 0.41, -0.17, 0.29, 0.53, -0.31, 0.47, 0.13, -0.59, 0.19,
 ];
 
-pub(super) fn gemma4_moe_config() -> ModelConfig {
+pub(crate) fn gemma4_moe_config() -> ModelConfig {
     let mut config = gemma4_dense_config("gemma4");
     config.enable_moe_block = true;
     config.num_experts = Some(EXPERTS);
@@ -36,7 +36,7 @@ pub(super) fn gemma4_moe_config() -> ModelConfig {
     config
 }
 
-pub(super) fn gemma4_unified_dense_config() -> ModelConfig {
+pub(crate) fn gemma4_unified_dense_config() -> ModelConfig {
     gemma4_dense_config("gemma4_unified")
 }
 

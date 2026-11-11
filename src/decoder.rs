@@ -67,6 +67,8 @@ mod flint_oracle_tests;
 pub(crate) fn resident_decode_steps_for_test() -> usize {
     resident::RESIDENT_DECODE_STEPS.with(std::cell::Cell::get)
 }
+#[cfg(test)]
+mod layer_plan_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod mtp_moe_oracles;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
