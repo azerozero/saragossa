@@ -280,8 +280,17 @@ impl Tensor {
     ///
     /// Renvoie une erreur si les dimensions matricielles sont incompatibles.
     pub fn matmul_rhs_t(&self, rhs_out_in: &Self) -> Result<Self> {
-        let (batch, in_dim) = self.as_matrix()?;
         let (out_dim, rhs_in_dim) = rhs_out_in.as_matrix()?;
+        self.matmul_rhs_t_data(rhs_out_in.data(), out_dim, rhs_in_dim)
+    }
+
+    pub(crate) fn matmul_rhs_t_data(
+        &self,
+        rhs: &[f32],
+        out_dim: usize,
+        rhs_in_dim: usize,
+    ) -> Result<Self> {
+        let (batch, in_dim) = self.as_matrix()?;
         if in_dim != rhs_in_dim {
             return Err(InferError::Dimension(format!(
                 "matmul x=[{batch},{in_dim}] rhs_t_source=[{out_dim},{rhs_in_dim}]"
@@ -294,14 +303,14 @@ impl Tensor {
                 let b = idx / out_dim;
                 let o = idx % out_dim;
                 let lhs = &self.data[b * in_dim..(b + 1) * in_dim];
-                let rhs = &rhs_out_in.data[o * in_dim..(o + 1) * in_dim];
+                let rhs = &rhs[o * in_dim..(o + 1) * in_dim];
                 *value = dot(lhs, rhs);
             });
         } else {
             for b in 0..batch {
                 for o in 0..out_dim {
                     let lhs = &self.data[b * in_dim..(b + 1) * in_dim];
-                    let rhs = &rhs_out_in.data[o * in_dim..(o + 1) * in_dim];
+                    let rhs = &rhs[o * in_dim..(o + 1) * in_dim];
                     out[b * out_dim + o] = dot(lhs, rhs);
                 }
             }

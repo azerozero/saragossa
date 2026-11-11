@@ -128,6 +128,26 @@ jobs:
 
           gpu_start=$SECONDS
           cargo test --features metal,devtools -- --ignored --exact "${tests[@]}" --test-threads=1
+      - name: Vérifier le chargement direct sur Metal
+        shell: bash
+        env:
+          SARAGOSSA_REQUIRE_METAL: '1'
+        run: |
+          set -euo pipefail
+          tests=(
+            metal_backend::weight_file_tests::direct_file_buffers_match_copies_and_reject_short_reads
+            metal_backend::weight_file_tests::direct_file_shared_f32_preserves_dense_dispatch_bits
+            qwen_loader::direct_file_tests::direct_file_dense_and_moe_match_old_buffers
+            decoder::mtp::tests::moe_head::metal::direct_file_mtp_and_draft_match_old_buffers
+            decoder::mtp::tests::moe_head::metal::direct_file_mtp_dense_and_quantized_linears_match_old_storage
+          )
+          cargo test --lib --features metal -- --exact "${tests[@]}" --list > "$RUNNER_TEMP/direct-list.txt"
+          printf '%s\n' "${tests[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/direct-expected.txt"
+          sed -n 's/: test$//p' "$RUNNER_TEMP/direct-list.txt" | LC_ALL=C sort > "$RUNNER_TEMP/direct-actual.txt"
+          diff -u "$RUNNER_TEMP/direct-expected.txt" "$RUNNER_TEMP/direct-actual.txt"
+          for single_copy in 0 1; do
+            RETI_RUST_SINGLE_COPY_WEIGHTS="$single_copy" cargo test --lib --features metal -- --exact "${tests[@]}" --test-threads=1
+          done
       - name: Vérifier et mesurer les deux tests GPU lourds
         # Environ 7 min à eux deux : hors des PR, ils tournent la nuit.
         if: github.event_name != 'pull_request'

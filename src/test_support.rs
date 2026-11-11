@@ -1,3 +1,20 @@
+/// Les tests ordinaires sautent uniquement l'absence de device. La suite GPU
+/// explicite exige son exécution et conserve toutes les autres erreurs.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn metal_executor() -> crate::Result<Option<crate::MetalExecutor>> {
+    match crate::MetalExecutor::new() {
+        Ok(executor) => Ok(Some(executor)),
+        Err(crate::InferError::Metal(message))
+            if message.contains("aucun device")
+                && crate::runtime_flags::env_var("SARAGOSSA_REQUIRE_METAL").as_deref()
+                    != Some("1") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 use std::path::PathBuf;
 
 /// Résout une fixture voix de référence (`reti-fr.wav`, `reti-fr.txt`).

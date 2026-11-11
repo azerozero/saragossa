@@ -21,7 +21,9 @@ fn affine_weights(tensor: DecoderTensor) -> Vec<AffineQuantizedTensor> {
 
 #[test]
 fn direct_file_dense_and_moe_match_old_buffers() -> Result<()> {
-    let metal = crate::MetalExecutor::new()?;
+    let Some(metal) = crate::test_support::metal_executor()? else {
+        return Ok(());
+    };
     let single_copy = crate::runtime_flags::single_copy_weights_enabled();
     for experts in [1, 3] {
         for dtype in [Dtype::BF16, Dtype::F32] {

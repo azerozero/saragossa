@@ -916,6 +916,7 @@ pub(crate) fn read_shard_header(path: &Path) -> Result<ShardHeader> {
             path: path.to_path_buf(),
             message: format!("taille header non représentable: {header_len}"),
         })?;
+    crate::safetensor::check_file_range(&file, 8, header_len_usize, "header safetensors")?;
     let mut header = vec![0_u8; header_len_usize];
     file.read_exact(&mut header)
         .map_err(|source| InferError::Io {

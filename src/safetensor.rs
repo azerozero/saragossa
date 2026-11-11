@@ -146,6 +146,30 @@ pub(crate) fn tensor_from_safetensor_parts(
     Tensor::from_vec(shape.to_vec(), bytes_to_dense_f32(data, dtype, name)?)
 }
 
+/// Vérifie la plage sur le descripteur qui sera lu, avant toute allocation.
+/// La lecture exacte reste nécessaire en cas de troncature concurrente.
+pub(crate) fn check_file_range(
+    file: &std::fs::File,
+    offset: u64,
+    len_bytes: usize,
+    name: &str,
+) -> Result<()> {
+    let end = u64::try_from(len_bytes)
+        .ok()
+        .and_then(|len| offset.checked_add(len))
+        .ok_or_else(|| InferError::Shape(format!("plage de fichier trop grande pour {name}")))?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| InferError::Config(format!("taille du fichier {name}: {source}")))?
+        .len();
+    if end > file_len {
+        return Err(InferError::Shape(format!(
+            "plage de fichier {name} [{offset}..{end}] hors fichier de {file_len} octets"
+        )));
+    }
+    Ok(())
+}
+
 /// Conversion bornée vers le stockage CPU final, sans payload brut de la
 /// taille du tenseur. Les offsets et tailles proviennent d'un header validé.
 pub(crate) fn read_dense_f32_at(
@@ -168,6 +192,7 @@ pub(crate) fn read_dense_f32_at(
             "taille de payload invalide pour {name}"
         )));
     }
+    check_file_range(file, offset, len_bytes, name)?;
     let mut values = Vec::with_capacity(len_bytes / width);
     let mut scratch = [0_u8; 64 * 1024];
     let mut consumed = 0;
@@ -197,6 +222,7 @@ pub(crate) fn read_u32_at(
             "taille u32 invalide pour {name}"
         )));
     }
+    check_file_range(file, offset, len_bytes, name)?;
     let mut values = vec![0_u32; len_bytes / 4];
     file.read_exact_at(bytemuck::cast_slice_mut(&mut values), offset)
         .map_err(|source| InferError::Config(format!("lecture {name}: {source}")))?;
@@ -220,7 +246,7 @@ pub(crate) fn bytes_to_dense_f32(bytes: &[u8], dtype: Dtype, name: &str) -> Resu
     }
 }
 
-fn is_dense_float_dtype(dtype: Dtype) -> bool {
+pub(crate) fn is_dense_float_dtype(dtype: Dtype) -> bool {
     matches!(
         dtype,
         Dtype::F32 | Dtype::BF16 | Dtype::F16 | Dtype::F8_E4M3 | Dtype::F8_E5M2
@@ -535,6 +561,31 @@ mod tests {
             read_dense_f32_at(file.as_file(), 11, bytes.len() + 4, Dtype::F32, "fixture").is_err()
         );
         assert!(read_u32_at(file.as_file(), 11, bytes.len() + 4, "fixture").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn file_ranges_reject_hostile_lengths_and_post_validation_truncation() -> Result<()> {
+        let file = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+        std::fs::write(file.path(), [0_u8; 16]).expect("invariant: fixture écrite");
+        check_file_range(file.as_file(), 8, 8, "fixture")?;
+        for (offset, len) in [(0, usize::MAX - 3), (u64::MAX, 4), (17, 0)] {
+            assert!(matches!(
+                check_file_range(file.as_file(), offset, len, "fixture"),
+                Err(InferError::Shape(_))
+            ));
+            assert!(matches!(
+                read_dense_f32_at(file.as_file(), offset, len, Dtype::F32, "fixture"),
+                Err(InferError::Shape(_))
+            ));
+            assert!(matches!(
+                read_u32_at(file.as_file(), offset, len, "fixture"),
+                Err(InferError::Shape(_))
+            ));
+        }
+        file.as_file().set_len(4).expect("invariant: troncature");
+        assert!(read_dense_f32_at(file.as_file(), 8, 8, Dtype::BF16, "fixture").is_err());
+        assert!(read_u32_at(file.as_file(), 8, 8, "fixture").is_err());
         Ok(())
     }
 

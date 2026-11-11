@@ -57,6 +57,7 @@ fn dense_of(weight: &LinearWeight) -> Result<Tensor> {
     match weight {
         LinearWeight::Dense(tensor) => Ok(tensor.clone()),
         LinearWeight::DenseBf16(tensor) => tensor.to_tensor(),
+        LinearWeight::DenseShared(tensor) => tensor.to_tensor(),
         LinearWeight::AffineQuantized(tensor) => tensor.dequantize(),
     }
 }

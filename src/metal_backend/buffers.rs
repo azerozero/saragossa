@@ -493,14 +493,15 @@ impl MetalExecutor {
         if len_bytes == 0 {
             return Err(InferError::Shape("payload single-copy vide".to_string()));
         }
-        let buffer = self.device.new_buffer(
-            checked_nsuint(len_bytes, "single_copy_weight_affine_file")?,
-            MTLResourceOptions::StorageModeShared,
-        );
         let file = std::fs::File::open(path).map_err(|source| InferError::Io {
             path: path.to_path_buf(),
             source,
         })?;
+        crate::safetensor::check_file_range(&file, offset, len_bytes, "poids Metal")?;
+        let buffer = self.device.new_buffer(
+            checked_nsuint(len_bytes, "single_copy_weight_affine_file")?,
+            MTLResourceOptions::StorageModeShared,
+        );
         // SAFETY: buffer partagé neuf, initialisé par Metal, exclusivement
         // détenu ici et sans commande GPU ; SharedRows borne la vue u8 Pod.
         unsafe {
@@ -512,6 +513,61 @@ impl MetalExecutor {
             path: path.to_path_buf(),
             source,
         })?;
+        Ok(buffer)
+    }
+
+    /// Convertit par blocs vers le stockage f32 final sans miroir CPU complet.
+    pub(crate) fn weight_buffer_dense_f32_file(
+        &self,
+        file: &std::fs::File,
+        offset: u64,
+        len_bytes: usize,
+        dtype: safetensors::Dtype,
+        name: &str,
+    ) -> Result<metal::Buffer> {
+        if !crate::safetensor::is_dense_float_dtype(dtype) {
+            return Err(InferError::UnsupportedDtype {
+                name: name.to_string(),
+                dtype,
+            });
+        }
+        crate::safetensor::check_file_range(file, offset, len_bytes, name)?;
+        let width = dtype.bitsize() / 8;
+        if width == 0 || len_bytes == 0 || len_bytes % width != 0 {
+            return Err(InferError::Shape(format!(
+                "payload dense invalide pour {name}"
+            )));
+        }
+        let len = len_bytes / width;
+        self.weight_buffer_f32_with(len, |destination| {
+            for (chunk, out) in destination.chunks_mut(16 * 1024).enumerate() {
+                let at = offset + (chunk * 16 * 1024 * width) as u64;
+                let values =
+                    crate::safetensor::read_dense_f32_at(file, at, out.len() * width, dtype, name)?;
+                out.copy_from_slice(&values);
+            }
+            Ok(())
+        })
+    }
+
+    /// Initialise exclusivement le stockage f32 final d'un poids ou d'une concat.
+    #[expect(unsafe_code, reason = "initialisation exclusive du buffer f32 partagé")]
+    pub(crate) fn weight_buffer_f32_with(
+        &self,
+        len: usize,
+        fill: impl FnOnce(&mut [f32]) -> Result<()>,
+    ) -> Result<metal::Buffer> {
+        if len == 0 {
+            return Err(InferError::Shape("poids f32 partagé vide".into()));
+        }
+        let buffer = self
+            .device
+            .new_buffer(byte_len::<f32>(len)?, MTLResourceOptions::StorageModeShared);
+        // SAFETY: buffer neuf partagé, sans alias ni accès GPU ; SharedRows
+        // vérifie la taille et l'alignement f32 avant l'initialisation exclusive.
+        unsafe {
+            SharedRows::<f32>::with_mut_slice(&buffer, 0, len, fill)??;
+        }
         Ok(buffer)
     }
 

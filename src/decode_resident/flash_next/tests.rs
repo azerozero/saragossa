@@ -5070,6 +5070,7 @@ fn distinct_weights(
                     LinearWeight::Dense(Tensor::from_vec(t.shape().to_vec(), t.data().to_vec())?)
                 }
                 LinearWeight::DenseBf16(t) => LinearWeight::Dense(t.to_tensor()?),
+                LinearWeight::DenseShared(t) => LinearWeight::Dense(t.to_tensor()?),
                 LinearWeight::AffineQuantized(q) => {
                     LinearWeight::AffineQuantized(AffineQuantizedTensor::new(
                         q.packed_shape(),

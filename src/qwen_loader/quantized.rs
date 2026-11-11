@@ -264,6 +264,7 @@ fn read_entry_bytes(shard: &ShardHeader, entry: &ShardTensorEntry) -> Result<Vec
         path: shard.path.clone(),
         source,
     })?;
+    crate::safetensor::check_file_range(&file, offset, len, "poids")?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|source| InferError::Io {
             path: shard.path.clone(),
@@ -812,6 +813,23 @@ fn replace_weight_suffix(source: &str, suffix: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::quantization::bytes_to_u32;
+
+    #[test]
+    fn tiny_shard_rejects_large_payload_before_allocation() -> Result<()> {
+        let file = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+        let len = usize::MAX - 3;
+        let header = serde_json::json!({"x.weight": {
+            "dtype": "F32", "shape": [1, len / 4], "data_offsets": [0, len]
+        }})
+        .to_string();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        std::fs::write(file.path(), bytes).expect("invariant: fixture écrite");
+        let shard = super::super::read_shard_header(file.path())?;
+        let error = read_entry_bytes(&shard, &shard.tensors["x.weight"]);
+        assert!(matches!(error, Err(InferError::Shape(_))));
+        Ok(())
+    }
 
     #[test]
     fn unpacked_cols_rejects_zero_bits_or_group_size() {
