@@ -1809,7 +1809,7 @@ fn gemma4_global_attention_aliases_k_as_resident_v_projection() -> Result<()> {
     Ok(())
 }
 
-fn test_weights() -> HashMap<String, Tensor> {
+pub(super) fn test_weights() -> HashMap<String, Tensor> {
     let mut tensors = HashMap::new();
     tensors.insert(
         "embed_tokens.weight".to_string(),
@@ -1846,6 +1846,7 @@ fn test_weights() -> HashMap<String, Tensor> {
 #[cfg(feature = "devtools")]
 fn tiny_dflash_draft() -> crate::DFlashDraft {
     crate::DFlashDraft {
+        snapshot_sources: Default::default(),
         info: crate::DFlashDraftInfo {
             draft_dir: std::path::PathBuf::new(),
             weight_path: std::path::PathBuf::new(),
@@ -1907,7 +1908,10 @@ fn tiny_dflash_draft() -> crate::DFlashDraft {
     }
 }
 
-fn hybrid_weights(layer_count: usize, full_attention_interval: usize) -> HashMap<String, Tensor> {
+pub(super) fn hybrid_weights(
+    layer_count: usize,
+    full_attention_interval: usize,
+) -> HashMap<String, Tensor> {
     let mut tensors = HashMap::new();
     tensors.insert(
         "embed_tokens.weight".to_string(),
@@ -1933,7 +1937,7 @@ fn hybrid_weights(layer_count: usize, full_attention_interval: usize) -> HashMap
     tensors
 }
 
-fn hybrid_config(layer_count: usize) -> CausalDecoderConfig {
+pub(super) fn hybrid_config(layer_count: usize) -> CausalDecoderConfig {
     CausalDecoderConfig {
         num_hidden_layers: layer_count,
         full_attention_interval: Some(2),
@@ -2123,7 +2127,7 @@ fn assert_close(left: &[f32], right: &[f32], tolerance: f32) {
     }
 }
 
-struct F32View {
+pub(super) struct F32View {
     shape: Vec<usize>,
     data: Vec<u8>,
 }
@@ -2146,7 +2150,7 @@ impl View for F32View {
     }
 }
 
-fn tensor_views(tensors: HashMap<String, Tensor>) -> Vec<(String, F32View)> {
+pub(super) fn tensor_views(tensors: HashMap<String, Tensor>) -> Vec<(String, F32View)> {
     tensors
         .into_iter()
         .map(|(name, tensor)| {
@@ -4562,7 +4566,7 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
         model.prefill_cache_state(&prompt)?.0
     } else {
         model
-            .prefill_cache_state_with_layer_capture_cached(&prompt, &layer_ids, usize::MAX)?
+            .prefill_cache_state_with_layer_capture_cached(&prompt, &layer_ids, usize::MAX, None)?
             .0
     };
     let kv_bf16 = CausalDecoder::resident_kv_bf16(false, cache.position);

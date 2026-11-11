@@ -208,6 +208,7 @@ fn run() -> CliResult<()> {
     // démarrage ; en prod résident (voice loop/serve) tous les tours en profitent.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     let warmup_elapsed = if mtp_active && warmup_enabled() {
+        let _warmup = saragossa::runtime_flags::StateSnapshotWarmup::enter();
         let started = Instant::now();
         let warmup_len = prompt_ids.len().min(warmup_prompt_tokens()).max(1);
         let options = generation_options(&args, &assets, args.top_p)?;
@@ -650,6 +651,7 @@ fn warmup_decoder(
     prompt_ids: &[usize],
     backend: RuntimeKind,
 ) -> CliResult<Duration> {
+    let _warmup = saragossa::runtime_flags::StateSnapshotWarmup::enter();
     if backend != RuntimeKind::Metal || !warmup_enabled() {
         return Ok(Duration::ZERO);
     }
