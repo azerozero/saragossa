@@ -254,10 +254,10 @@ fn write_manifest(root: &Path, manifest: &Manifest) {
 
 // Chaque test d'environnement tourne dans son propre processus : aucun OnceLock
 // ni réglage numérique d'un autre test du harness ne peut le contaminer.
-fn isolated(name: &str, enabled: bool, run: impl FnOnce(&Path)) {
+fn isolated(name: &str, enabled: bool, run: impl FnOnce(&Path)) -> String {
     if let Some(root) = std::env::var_os("SARAGOSSA_SNAPSHOT_TEST_CHILD") {
         run(Path::new(&root));
-        return;
+        return String::new();
     }
     let dir = tempfile::tempdir().unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -284,6 +284,7 @@ fn isolated(name: &str, enabled: bool, run: impl FnOnce(&Path)) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8(output.stderr).unwrap()
 }
 
 #[test]
@@ -629,6 +630,19 @@ fn diagnostic_ablations_disable_reads_writes_and_hashing() {
         return;
     };
     let root = Path::new(&root);
+    // Le calcul lit le flag avant toute demande d'instantané. Son retrait ne
+    // doit pas blanchir un état qui survivrait dans le cache de préfixe mémoire.
+    let (active, _) = flags
+        .iter()
+        .find(|(flag, _)| std::env::var_os(flag).is_some())
+        .unwrap();
+    let canonical = active.replacen("RETI_", "SARAGOSSA_", 1);
+    assert!(crate::runtime_flags::env_var(&canonical).is_some());
+    std::env::remove_var(active);
+    assert_eq!(
+        crate::runtime_flags::state_snapshot_ablation(),
+        Some(canonical.as_str())
+    );
     let sources = SnapshotSources::capture(std::iter::from_fn(|| -> Option<&Path> {
         panic!("aucune lecture source sous ablation");
     }));
@@ -646,16 +660,6 @@ fn diagnostic_ablations_disable_reads_writes_and_hashing() {
         .snapshot_save(&request, &cache, &state, None, None)
         .unwrap();
     assert!(!root.join("snapshots").exists());
-    // Une simulation déjà résolue reste active après retrait de l'env.
-    for flag in [
-        "SARAGOSSA_RUST_KV_BF16_SIM_KONLY",
-        "SARAGOSSA_RUST_KV_BF16_SIM_VONLY",
-    ] {
-        if std::env::var_os(flag).is_some() {
-            std::env::remove_var(flag);
-            assert_eq!(crate::runtime_flags::state_snapshot_ablation(), Some(flag));
-        }
-    }
 }
 
 #[test]
@@ -675,10 +679,94 @@ fn late_moe_ablation_refuses_an_existing_snapshot() {
             let previous = std::fs::read(&manifest).unwrap();
             std::env::set_var("SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM", "1");
             assert!(model.snapshot_load(&request).is_none());
+            std::env::remove_var("SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM");
+            assert!(model.snapshot_load(&request).is_none());
+            assert!(model.snapshot_request(&[0, 1], "ar").unwrap().is_none());
             model
                 .snapshot_save(&request, &cache, &state, None, None)
                 .unwrap();
             assert_eq!(std::fs::read(&manifest).unwrap(), previous);
+            // Le préfixe peuplé avant l'ablation est réutilisable en mémoire,
+            // mais ne doit plus pouvoir être publié après retrait du flag.
+            assert!(!model.prefix_cache.lock().unwrap().entries.is_empty());
+            std::fs::remove_dir_all(request.as_ref().unwrap().root.clone()).unwrap();
+            model.prefill_cache_state(&[0, 1]).unwrap();
+            assert!(!manifest.exists());
+        },
+    );
+}
+
+#[test]
+fn missing_entry_is_absent_but_missing_blob_is_refused() {
+    let log = isolated(
+        "missing_entry_is_absent_but_missing_blob_is_refused",
+        true,
+        |root| {
+            let (model, request) = fixture(&root.join("snapshots"));
+            assert!(model.snapshot_load(&request).is_none());
+            let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
+            model
+                .snapshot_save(&request, &cache, &state, None, None)
+                .unwrap();
+            let manifest = read_manifest(&root.join("snapshots"));
+            std::fs::remove_file(root.join("snapshots").join(&manifest.final_state.data.file))
+                .unwrap();
+            assert!(model.snapshot_load(&request).is_none());
+        },
+    );
+    if std::env::var_os("SARAGOSSA_SNAPSHOT_TEST_CHILD").is_none() {
+        assert_eq!(
+            log.matches("state_snapshot absent mode=ar tokens=2")
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("state_snapshot refusé : I/O"), "{log}");
+    }
+}
+
+#[test]
+fn warmup_skips_snapshots_and_restores_scope_after_error() {
+    isolated(
+        "warmup_skips_snapshots_and_restores_scope_after_error",
+        true,
+        |root| {
+            use crate::runtime_flags::{state_snapshot_warmup, StateSnapshotWarmup};
+            let path = root.join("weights");
+            std::fs::write(&path, b"synthetic").unwrap();
+            let (model, _) = fixture(root);
+            let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
+            let prompt = vec![0; 32];
+            let request = model.snapshot_request(&prompt, "ar").unwrap();
+            let entry = &request.as_ref().unwrap().root;
+            let warmup = || -> Result<()> {
+                let _outer = StateSnapshotWarmup::enter();
+                {
+                    let _inner = StateSnapshotWarmup::enter();
+                    assert!(model.snapshot_request(&prompt, "ar")?.is_none());
+                }
+                assert!(state_snapshot_warmup());
+                let (cache, state) = model.prefill_cache_state(&prompt)?;
+                model.snapshot_save(&request, &cache, &state, None, None)?;
+                assert!(!entry.exists());
+                // L'erreur doit aussi restaurer la portée du vrai prompt.
+                Err(invalid("fin de chauffe synthétique"))
+            };
+            assert!(warmup().is_err());
+            assert!(!state_snapshot_warmup());
+            model.prefill_cache_state(&prompt).unwrap();
+            assert!(model.snapshot_load(&request).is_some());
+            let manifest = entry.join("manifest.json");
+            let previous = std::fs::read(&manifest).unwrap();
+            {
+                let _warmup = StateSnapshotWarmup::enter();
+                HITS.set(0);
+                assert!(model.snapshot_load(&request).is_none());
+                model.prefill_cache_uncached(&prompt).unwrap();
+                assert_eq!(HITS.get(), 0);
+                assert_eq!(std::fs::read(&manifest).unwrap(), previous);
+            }
+            assert!(model.snapshot_load(&request).is_some());
         },
     );
 }

@@ -76,22 +76,54 @@ fn claim_legacy_warning(legacy: &str) -> bool {
 /// dépendre du nom de son consommateur (cf. ADR 0011, dette « namespace »).
 pub fn env_var(name: &str) -> Option<String> {
     if let Ok(value) = std::env::var(name) {
+        record_snapshot_ablation(name, &value);
         return Some(value);
     }
     let legacy = legacy_alias(name)?;
     let value = std::env::var(&legacy).ok()?;
     warn_legacy_env_once(&legacy, name);
+    record_snapshot_ablation(name, &value);
     Some(value)
+}
+
+// Un état de préfixe peut survivre au retrait du diagnostic qui l'a produit.
+// Mémoriser dès la lecture du flag, même sans demande d'instantané en cours.
+static SNAPSHOT_ABLATION: OnceLock<&'static str> = OnceLock::new();
+
+fn record_snapshot_ablation(name: &str, value: &str) {
+    let flag = match name {
+        "SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM" | "RETI_RUST_MOE_COOP_SKIP_GEMM" => {
+            "SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM"
+        }
+        "SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED" | "RETI_RUST_MOE_COOP_SKIP_SHARED" => {
+            "SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED"
+        }
+        "SARAGOSSA_RUST_VERIFY_SKIP" | "RETI_RUST_VERIFY_SKIP" => "SARAGOSSA_RUST_VERIFY_SKIP",
+        "SARAGOSSA_RUST_KV_BF16_SIM_KONLY" | "RETI_RUST_KV_BF16_SIM_KONLY"
+            if env_flag_value(value) == Some(true) =>
+        {
+            "SARAGOSSA_RUST_KV_BF16_SIM_KONLY"
+        }
+        "SARAGOSSA_RUST_KV_BF16_SIM_VONLY" | "RETI_RUST_KV_BF16_SIM_VONLY"
+            if env_flag_value(value) == Some(true) =>
+        {
+            "SARAGOSSA_RUST_KV_BF16_SIM_VONLY"
+        }
+        _ => return,
+    };
+    let _ = SNAPSHOT_ABLATION.set(flag);
 }
 
 /// Variante `OsString` de [`env_var`], pour les flags qui portent un chemin.
 pub fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
     if let Some(value) = std::env::var_os(name) {
+        record_snapshot_ablation(name, value.to_str().unwrap_or_default());
         return Some(value);
     }
     let legacy = legacy_alias(name)?;
     let value = std::env::var_os(&legacy)?;
     warn_legacy_env_once(&legacy, name);
+    record_snapshot_ablation(name, value.to_str().unwrap_or_default());
     Some(value)
 }
 
@@ -2105,6 +2137,9 @@ pub(crate) fn kv_bf16_sim_vonly() -> bool {
 /// exactement comme dans moe_na. VERIFY_SKIP est refusé même hors de sa portée
 /// de bench, pour ne jamais mêler cette expérience à un instantané complet.
 pub(crate) fn state_snapshot_ablation() -> Option<&'static str> {
+    if let Some(flag) = SNAPSHOT_ABLATION.get() {
+        return Some(flag);
+    }
     for flag in [
         "SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM",
         "SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED",
@@ -2136,6 +2171,39 @@ pub(crate) fn state_snapshot_ablation() -> Option<&'static str> {
         return Some("SARAGOSSA_RUST_KV_BF16_SIM_VONLY");
     }
     None
+}
+
+thread_local! {
+    static SNAPSHOT_WARMUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Exclut les prompts de chauffe des instantanés sur le thread courant.
+/// Les portées imbriquées restaurent l'état précédent, y compris sur erreur.
+#[must_use]
+pub struct StateSnapshotWarmup {
+    previous: bool,
+    // La restauration doit avoir lieu sur le thread qui a ouvert la portée.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl StateSnapshotWarmup {
+    /// Ouvre une portée de chauffe sans lecture ni écriture d'instantané.
+    pub fn enter() -> Self {
+        Self {
+            previous: SNAPSHOT_WARMUP.replace(true),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for StateSnapshotWarmup {
+    fn drop(&mut self) {
+        SNAPSHOT_WARMUP.set(self.previous);
+    }
+}
+
+pub(crate) fn state_snapshot_warmup() -> bool {
+    SNAPSHOT_WARMUP.get()
 }
 
 /// Répertoire fixé au premier accès ; l'absence ne crée même pas l'alias historique.

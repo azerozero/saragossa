@@ -52,6 +52,12 @@ Les alias historiques `RETI_*` suivent les mêmes règles. Les contrôles sont
 répétés à la demande, à la lecture et à l'écriture : activer tardivement un flag
 MoE ne permet pas de réutiliser ou publier un instantané. Les simulations KV
 partagent les mêmes accesseurs OnceLock que le calcul.
+Le premier diagnostic observé actif rend ce refus définitif pour le processus,
+même après retrait du flag et pour les états issus du cache de préfixe mémoire.
+
+Les prompts de warmup CLI et serveur (AR et MTP) ne lisent ni n'écrivent
+d'instantané. Une entrée absente au premier run journalise
+`state_snapshot absent mode=… tokens=…` ; les entrées invalides restent refusées.
 
 La clé inclut aussi le mode
 AR/MTP/DFlash, la configuration, le dtype KV et une empreinte des réglages effectifs
@@ -85,6 +91,10 @@ chemin local n'est ajouté au dépôt. Les instantanés contiennent des états
 dérivés du prompt et restent des artefacts locaux.
 
 ## Limites et coût
+
+Un lien symbolique échangé A→B→A pendant le chargement n'est pas détecté :
+cet outil de développement local ne doit pas pointer vers des chemins modifiés
+en cours d'exécution.
 
 Ne pas utiliser ce mode pour mesurer le prefill, le TTFT ou le pic mémoire.
 Le temps de « prefill » inclut l'I/O et les checksums ; la relecture alloue des

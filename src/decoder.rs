@@ -2493,6 +2493,7 @@ impl CausalDecoder {
     /// Renvoie une erreur si Metal est absent ou si le warmup échoue.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn warmup_and_release_cpu_weights(&mut self, prompt: &[usize]) -> Result<usize> {
+        let _warmup = crate::runtime_flags::StateSnapshotWarmup::enter();
         if self.runtime.cpu_weights_released {
             return Ok(0);
         }

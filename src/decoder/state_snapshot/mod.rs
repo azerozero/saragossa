@@ -87,7 +87,7 @@ impl SnapshotSources {
 fn snapshot_calculations_complete() -> Result<()> {
     if let Some(flag) = crate::runtime_flags::state_snapshot_ablation() {
         return Err(invalid(format!(
-            "diagnostic {flag} actif, instantané désactivé"
+            "diagnostic {flag} observé actif, instantané désactivé jusqu'à la fin du processus"
         )));
     }
     Ok(())
@@ -309,6 +309,9 @@ impl CausalDecoder {
     }
 
     pub(super) fn snapshot_request(&self, prompt: &[usize], mode: &str) -> Result<Option<Request>> {
+        if crate::runtime_flags::state_snapshot_warmup() {
+            return Ok(None);
+        }
         let Some(root) = crate::runtime_flags::state_snapshot_dir() else {
             return Ok(None);
         };
@@ -405,6 +408,9 @@ impl CausalDecoder {
     }
 
     pub(super) fn snapshot_load(&self, request: &Option<Request>) -> Option<State> {
+        if crate::runtime_flags::state_snapshot_warmup() {
+            return None;
+        }
         let request = request.as_ref()?;
         match self.snapshot_read(request) {
             Ok(state) => {
@@ -415,6 +421,16 @@ impl CausalDecoder {
                     request.key.mode, request.key.tokens
                 );
                 Some(state)
+            }
+            Err(InferError::Io { path, source })
+                if path == request.root.join("manifest.json")
+                    && source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                eprintln!(
+                    "state_snapshot absent mode={} tokens={}",
+                    request.key.mode, request.key.tokens
+                );
+                None
             }
             Err(error) => {
                 eprintln!("state_snapshot refusé : {error}; prefill normal");
@@ -516,6 +532,9 @@ impl CausalDecoder {
         history: Option<&LayerKvCache>,
         captures: Option<&PrefixCaptures>,
     ) -> Result<()> {
+        if crate::runtime_flags::state_snapshot_warmup() {
+            return Ok(());
+        }
         let Some(request) = request else {
             return Ok(());
         };
