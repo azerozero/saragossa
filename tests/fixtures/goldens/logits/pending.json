@@ -1,5 +1,0 @@
-{
-  "status": "pending_gpu_capture",
-  "reason": "Capture mlx-lm réservée à une exécution explicite sous verrou GPU.",
-  "models": ["qwen38", "qwen36_moe", "gemma3", "gemma4"]
-}

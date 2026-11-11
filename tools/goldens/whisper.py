@@ -1,5 +1,5 @@
 """CPU reference: transformers 5.22.2, torch 2.15.0.
-pip install transformers==5.22.2 torch==2.15.0
+Pinned environment: transformers==5.22.2 torch==2.15.0
 
 The local snapshots lack preprocessor/generation configs. Use Whisper's default
 80-bin, 16 kHz frontend; explicit French/task IDs come from the local tokenizer.
@@ -13,10 +13,11 @@ import struct
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import ROOT, local_model, provenance, sha, write_json
+from common import WHISPER_PACKAGES, require_versions, ROOT, local_model, provenance, sha, write_json
 
 
 def main():
+    require_versions(WHISPER_PACKAGES)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=["whisper_tiny", "whisper_small"], required=True)
     args = parser.parse_args()
@@ -69,7 +70,7 @@ def main():
                              tokens=ids, text=tokenizer.decode(ids, skip_special_tokens=True).strip()))
     if not segments:
         raise RuntimeError("timestamp reference returned no segments")
-    source = provenance(args.model, path, ["transformers", "torch"])
+    source = provenance(args.model, path, WHISPER_PACKAGES)
     source["audio"] = dict(path="tests/golden/whisper_samples16k.bin", sha256=sha(audio_path),
                            sample_rate=16000, samples=len(samples))
     write_json("whisper", args.model, dict(language="fr", prefix=prefix, tokens=tokens,

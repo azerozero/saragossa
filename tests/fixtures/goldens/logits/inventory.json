@@ -1,0 +1,8 @@
+{
+  "captures": {
+    "qwen38": "captured",
+    "qwen36_moe": "captured",
+    "gemma3": "captured",
+    "gemma4": "captured"
+  }
+}

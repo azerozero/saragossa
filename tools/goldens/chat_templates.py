@@ -1,14 +1,15 @@
-"""CPU reference: transformers 5.22.2. pip install transformers==5.22.2
+"""CPU reference: transformers 5.22.2. Pinned environment: transformers==5.22.2
 
 Local tokenizers only; no weights, network or accelerator. Run with python -I.
 """
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import local_model, provenance, write_json
+from common import TEMPLATE_PACKAGES, require_versions, local_model, provenance, write_json
 
 
 def main():
+    require_versions(TEMPLATE_PACKAGES)
     from transformers import AutoTokenizer
     multi = [dict(role="system", content="Réponds brièvement."),
              dict(role="user", content="Bonjour !"),
@@ -29,7 +30,7 @@ def main():
         if not template:
             # TTS has a speech-specific prompt, not an apply_chat_template contract.
             write_json("chat_templates", name, dict(model=name, cases=[], unavailable="no chat template"),
-                       provenance(name, path, ["transformers"]), "exact UTF-8")
+                       provenance(name, path, TEMPLATE_PACKAGES), "exact UTF-8")
             continue
         cases = []
         thinking_modes = [False, True] if "enable_thinking" in str(template) else [None]
@@ -50,7 +51,7 @@ def main():
                         case["error"] = f"{type(error).__name__}: {error}"
                     cases.append(case)
         write_json("chat_templates", name, dict(model=name, cases=cases),
-                   provenance(name, path, ["transformers"]), "exact UTF-8; Gemma3 BOS supplied by tokenizer")
+                   provenance(name, path, TEMPLATE_PACKAGES), "exact UTF-8; Gemma3 BOS supplied by tokenizer")
 
 
 if __name__ == "__main__":

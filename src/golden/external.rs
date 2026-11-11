@@ -79,18 +79,32 @@ pub fn check_model(name: &str, path: &Path) -> TestResult {
     Ok(())
 }
 
-pub fn local(env: &str) -> Option<PathBuf> {
-    let path = std::env::var_os(env).map(PathBuf::from);
-    if path.is_none() {
-        assert_ne!(
-            std::env::var("SARAGOSSA_REQUIRE_REAL_MODELS").as_deref(),
-            Ok("1"),
-            "{env} requis"
-        );
-        eprintln!("skip: {env} absent (aucun téléchargement)");
+/// Les comparaisons dédiées ne peuvent jamais réussir sans assets locaux.
+pub fn local(env: &str) -> TestResult<PathBuf> {
+    let path = std::env::var_os(env)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{env} requis (aucun téléchargement)"))?;
+    if !path.is_dir() {
+        return Err(format!("{env}: répertoire local absent").into());
     }
-    path
+    Ok(path)
 }
+
+/// Contrôle les identifiants exacts, y compris la disparition d'un écart.
+pub fn assert_known_differences(actual: &[String], expected: &[&str]) {
+    let mut actual = actual.to_vec();
+    actual.sort();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "écarts modifiés : examiner puis mettre à jour le suivi, jamais les références"
+    );
+}
+
+pub const ROLE_ALTERNATION_ERROR: &str =
+    "TemplateError: Conversation roles must alternate user/assistant/user/assistant/...";
 
 #[derive(Deserialize)]
 pub struct ChatFixture {

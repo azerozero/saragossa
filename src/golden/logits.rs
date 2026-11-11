@@ -70,22 +70,16 @@ fn metrics(logits: &[f32], step: &Step) -> (f64, f64) {
 }
 
 #[test]
-fn external_logits_files_parse_when_captured() -> TestResult {
-    // Le générateur GPU n'est volontairement pas exécuté pendant l'ajout des tests.
+fn external_logits_inventory_is_complete() -> TestResult {
     let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root().join("logits/pending.json"))?)?;
-    assert_eq!(
-        manifest["models"]
-            .as_array()
-            .ok_or("modèles absents")?
-            .len(),
-        4
-    );
+        serde_json::from_slice(&std::fs::read(root().join("logits/inventory.json"))?)?;
+    let expected: Vec<_> = CHAT_MODELS.iter().map(|(name, _)| *name).collect();
+    let captures = manifest["captures"]
+        .as_object()
+        .ok_or("inventaire absent")?;
+    assert_eq!(captures.len(), expected.len());
     for (name, _) in CHAT_MODELS {
-        if !root().join(format!("logits/{name}.json")).exists() {
-            eprintln!("pending: capture GPU logits/{name}, non exécutée par conception");
-            continue;
-        }
+        assert_eq!(captures[name], "captured");
         let fixture: Fixture = json(&format!("logits/{name}"))?;
         assert_eq!(fixture.model, name);
         validate(&fixture);
@@ -111,9 +105,7 @@ fn external_logits_metrics_detect_tail_and_top_errors() {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compare(name: &str, env: &str) -> TestResult {
-    let Some(path) = local(env) else {
-        return Ok(());
-    };
+    let path = local(env)?;
     let stem = format!("logits/{name}");
     check_model(&stem, &path)?;
     let fixture: Fixture = json(&stem)?;

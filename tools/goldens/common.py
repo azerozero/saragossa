@@ -14,6 +14,35 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Contrat de capture : vérifier les distributions avant tout import de moteur.
+PINS = {
+    "transformers": "5.22.2",
+    "tokenizers": "0.23.3",
+    "jinja2": "3.1.6",
+    "mlx": "0.32.4",
+    "mlx-lm": "0.32.2",
+    "torch": "2.15.0",
+    "sentence-transformers": "6.3.0",
+}
+TEMPLATE_PACKAGES = ("transformers", "tokenizers", "jinja2")
+LOGITS_PACKAGES = (*TEMPLATE_PACKAGES, "mlx", "mlx-lm")
+EMBEDDER_PACKAGES = (*TEMPLATE_PACKAGES, "torch", "sentence-transformers")
+WHISPER_PACKAGES = (*TEMPLATE_PACKAGES, "torch")
+
+
+def require_versions(packages):
+    errors = []
+    for package in packages:
+        try:
+            actual = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            actual = "absent"
+        if actual != PINS[package]:
+            errors.append(f"{package}=={PINS[package]} requis, trouvé {actual}")
+    if errors:
+        raise RuntimeError("Versions de capture incompatibles: " + "; ".join(errors))
+
+
 MODELS = {
     "qwen38": ("SARAGOSSA_QWEN38_DIR", "Qwen3.8-27B-u4ls", None),
     "qwen36_moe": ("SARAGOSSA_QWEN36_MOE_DIR", "Qwen3.6-35B-A3B-4bit", None),

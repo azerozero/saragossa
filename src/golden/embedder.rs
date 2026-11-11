@@ -20,12 +20,8 @@ fn external_embedder_fixture_parse() -> TestResult {
     Ok(())
 }
 
-#[test]
-#[ignore = "CPU réel: SARAGOSSA_EMBEDDER_DIR (intfloat/multilingual-e5-small)"]
-fn external_embedder_matches_sentence_transformers() -> TestResult {
-    let Some(path) = local("SARAGOSSA_EMBEDDER_DIR") else {
-        return Ok(());
-    };
+fn compare() -> TestResult<Vec<String>> {
+    let path = local("SARAGOSSA_EMBEDDER_DIR")?;
     check_model("embedder/e5", &path)?;
     let model = TextEmbedder::load_local(path)?;
     let header: serde_json::Value =
@@ -41,6 +37,11 @@ fn external_embedder_matches_sentence_transformers() -> TestResult {
         } else {
             model.embed_passage(text)?
         };
+        assert_eq!(actual.len(), 384);
+        assert!(
+            actual.iter().all(|value| value.is_finite()),
+            "{index}: vecteur non fini"
+        );
         let reference = &expected[index * 384..(index + 1) * 384];
         let dot = actual
             .iter()
@@ -62,9 +63,25 @@ fn external_embedder_matches_sentence_transformers() -> TestResult {
             .fold(0.0_f32, f32::max);
         eprintln!("embedder[{index}]: cosine={cosine:.9} max_abs={max_abs:.9}");
         if !cosine.is_finite() || cosine < 0.9999 || !max_abs.is_finite() || max_abs > 0.001 {
-            failures.push(format!("{index}: cosine={cosine} max_abs={max_abs}"));
+            failures.push(format!(
+                "{index}/{}",
+                case["kind"].as_str().ok_or("type absent")?
+            ));
         }
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(failures)
+}
+
+#[test]
+#[ignore = "CPU réel: SARAGOSSA_EMBEDDER_DIR; écart connu 8/query (requête vide); tools/goldens/README.md#suivi-des-ecarts"]
+fn external_embedder_known_differences_are_stable() -> TestResult {
+    assert_known_differences(&compare()?, &["8/query"]);
+    Ok(())
+}
+
+#[test]
+#[ignore = "parité stricte CPU: SARAGOSSA_EMBEDDER_DIR; requête vide divergente; tools/goldens/README.md#suivi-des-ecarts"]
+fn external_embedder_strict_parity_matches_sentence_transformers() -> TestResult {
+    assert_known_differences(&compare()?, &[]);
     Ok(())
 }

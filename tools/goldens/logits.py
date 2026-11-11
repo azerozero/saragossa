@@ -1,5 +1,5 @@
-"""GPU reference: mlx-lm 0.32.2, transformers 5.22.2.
-pip install mlx-lm==0.32.2 transformers==5.22.2
+"""GPU reference: mlx==0.32.4, mlx-lm==0.32.2, transformers==5.22.2.
+tokenizers==0.23.3, jinja2==3.1.6; versions checked before model loading.
 
 Run explicitly under the operator's GPU lock; never downloads models.
 """
@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import local_model, provenance, write_json
+from common import LOGITS_PACKAGES, require_versions, local_model, provenance, write_json
 
 PROMPTS = ["Bonjour, je m'appelle", "The capital of France is", "2 + 2 =",
            "def square(x):\n    return", "Translate to English: le chat dort.",
@@ -15,6 +15,7 @@ PROMPTS = ["Bonjour, je m'appelle", "The capital of France is", "2 + 2 =",
 
 
 def main():
+    require_versions(LOGITS_PACKAGES)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=["qwen38", "qwen36_moe", "gemma3", "gemma4"], required=True)
     args = parser.parse_args()
@@ -50,7 +51,7 @@ def main():
             inputs = mx.array([[generated]])
         cases.append(dict(prompt=prompt, rendered=rendered, chat=chat, prompt_ids=ids, steps=steps))
     write_json("logits", args.model, dict(model=args.model, cases=cases),
-               provenance(args.model, path, ["mlx-lm", "mlx", "transformers"]),
+               provenance(args.model, path, LOGITS_PACKAGES),
                "greedy exact; near-tie logprob margin <= 0.01; top20+other KL <= 0.02; max delta-p <= 0.02",
                decoding="16 steps including EOS; no sampling or logits processors; reference-prefix teacher forcing")
 

@@ -31,6 +31,39 @@ fn check_audio(stem: &str) -> TestResult {
     Ok(())
 }
 
+/// Preuve de filiation du PCM historique, sans recapture ni modèle.
+#[test]
+fn external_whisper_audio_matches_attributed_voice() -> TestResult {
+    let wav = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/voices/reti-fr.wav"),
+    )?;
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&wav)),
+        "266b428653f25d78dd5dc06d89afdaa26cb377ecd761c27b1e4e9da6639e46d5"
+    );
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(wav))?;
+    assert_eq!(reader.spec().channels, 1);
+    assert_eq!(reader.spec().sample_rate, 32_000);
+    assert_eq!(reader.spec().bits_per_sample, 16);
+    let samples = reader
+        .samples::<i16>()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Le PCM capturé utilise un échantillon sur deux, sans filtre polyphase.
+    let pcm: Vec<u8> = samples
+        .iter()
+        .step_by(2)
+        .flat_map(|sample| (f32::from(*sample) / 32768.0).to_le_bytes())
+        .collect();
+    let original = std::fs::read(crate::golden::dir().join("whisper_samples16k.bin"))?;
+    assert_eq!(pcm.len(), 138_880 * 4);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&original)),
+        "1722dd7a13d6814fcd919d628c567f440929590393c49333d1b30842a7e0566e"
+    );
+    assert_eq!(pcm, original, "le PCM doit provenir de la voix attribuée");
+    Ok(())
+}
+
 #[test]
 fn external_whisper_fixtures_parse() -> TestResult {
     for name in ["whisper_tiny", "whisper_small"] {
@@ -57,9 +90,7 @@ fn external_whisper_fixtures_parse() -> TestResult {
 }
 
 fn compare(name: &str, env: &str) -> TestResult {
-    let Some(path) = local(env) else {
-        return Ok(());
-    };
+    let path = local(env)?;
     let stem = format!("whisper/{name}");
     check_model(&stem, &path)?;
     check_audio(&stem)?;

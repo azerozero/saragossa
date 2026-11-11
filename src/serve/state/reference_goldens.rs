@@ -70,14 +70,10 @@ fn external_serve_template_fixtures_parse() -> TestResult {
     Ok(())
 }
 
-#[test]
-#[ignore = "CPU sans poids: SARAGOSSA_QWEN38_DIR, SARAGOSSA_QWEN36_MOE_DIR, SARAGOSSA_GEMMA3_DIR, SARAGOSSA_GEMMA4_DIR"]
-fn external_serve_templates_match_transformers() -> TestResult {
+fn compare() -> TestResult<Vec<String>> {
     let mut failures = Vec::new();
     for (name, env) in CHAT_MODELS {
-        let Some(path) = local(env) else {
-            continue;
-        };
+        let path = local(env)?;
         let stem = format!("chat_templates/{name}");
         check_model(&stem, &path)?;
         let loaded = template_model(&path)?;
@@ -93,32 +89,80 @@ fn external_serve_templates_match_transformers() -> TestResult {
             }
             let request: ChatCompletionRequest = serde_json::from_value(wire)?;
             let label = format!("{name}/{}", case.name);
-            match (loaded.prompt_encoding(&request), case.token_ids) {
+            let mismatch = match (loaded.prompt_encoding(&request), case.token_ids) {
                 (Ok(actual), Some(expected)) => {
                     let expected: Vec<usize> = expected.into_iter().map(|v| v as usize).collect();
-                    if actual.tokens != expected {
-                        failures.push(format!(
+                    (actual.tokens != expected).then(|| {
+                        format!(
                             "{label}: Rust tokens={:?}; référence={expected:?}",
                             actual.tokens
-                        ));
-                    }
+                        )
+                    })
                 }
-                (Err(_), None) => {}
-                (Ok(_), None) => failures.push(format!(
+                (Err(error), None) if is_role_rejection(&error, case.error.as_deref()) => None,
+                (Err(error), None) => {
+                    // Une panne de tokenizer/IO ou un autre HTTP 400 n'est pas un rejet de rôle.
+                    return Err(format!("{label}: catégorie de rejet inattendue: {error}").into());
+                }
+                (Ok(_), None) => Some(format!(
                     "{label}: Rust accepte, référence rejette {:?}",
                     case.error
                 )),
                 (Err(error), Some(_)) => {
-                    failures.push(format!("{label}: Rust rejette {error}, référence accepte"))
+                    return Err(format!("{label}: Rust rejette {error}, référence accepte").into());
                 }
+            };
+            if let Some(detail) = mismatch {
+                eprintln!("{detail}");
+                failures.push(label);
             }
         }
     }
-    assert!(
-        failures.is_empty(),
-        "{} écarts serve:\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
+    Ok(failures)
+}
+
+fn is_role_rejection(error: &ServeError, expected: Option<&str>) -> bool {
+    expected == Some(ROLE_ALTERNATION_ERROR)
+        && matches!(error, ServeError::Http(message)
+            if message == "Conversation roles must alternate user/assistant/user/assistant/...")
+}
+
+#[test]
+fn external_serve_rejection_requires_role_category() {
+    let message = "Conversation roles must alternate user/assistant/user/assistant/...";
+    assert!(is_role_rejection(
+        &ServeError::Http(message.into()),
+        Some(ROLE_ALTERNATION_ERROR)
+    ));
+    assert!(!is_role_rejection(
+        &ServeError::Args(message.into()),
+        Some(ROLE_ALTERNATION_ERROR)
+    ));
+    assert!(!is_role_rejection(
+        &ServeError::Http("tokenizer absent".into()),
+        Some(ROLE_ALTERNATION_ERROR)
+    ));
+    assert!(!is_role_rejection(&ServeError::Http(message.into()), None));
+}
+
+const KNOWN_DIFFERENCES: &[&str] = &[
+    "qwen38/tools/generation=True/thinking=False",
+    "qwen36_moe/multi/generation=True/thinking=False",
+    "qwen36_moe/tools/generation=True/thinking=False",
+    "gemma3/tools/generation=True/thinking=None",
+    "gemma4/tools/generation=True/thinking=False",
+];
+
+#[test]
+#[ignore = "tokenizers locaux requis; 5/8 écarts serve connus; tools/goldens/README.md#suivi-des-ecarts"]
+fn external_serve_templates_known_differences_are_stable() -> TestResult {
+    assert_known_differences(&compare()?, KNOWN_DIFFERENCES);
+    Ok(())
+}
+
+#[test]
+#[ignore = "parité stricte, tokenizers locaux requis; 5/8 écarts serve connus; tools/goldens/README.md#suivi-des-ecarts"]
+fn external_serve_templates_strict_parity_matches_transformers() -> TestResult {
+    assert_known_differences(&compare()?, &[]);
     Ok(())
 }
