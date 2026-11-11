@@ -62,8 +62,10 @@ d'instantané. Une entrée absente au premier run journalise
 La clé inclut aussi le mode
 AR/MTP/DFlash, la configuration, le dtype KV et une empreinte de toutes les
 variables `SARAGOSSA_*` et `RETI_*`, triées et capturées une seule fois au
-premier accès à un flag runtime. Le profil de l'executor Metal est ajouté
-séparément. L'endianness et le SHA-256 du binaire courant complètent la clé ;
+premier accès à un flag runtime, en conservant sans perte les noms et valeurs
+non Unicode. Le profil de l'executor Metal, le cas pairwise complet et le
+forçage résident linear-attn hors environnement sont ajoutés à chaque demande.
+L'endianness et le SHA-256 du binaire courant complètent la clé ;
 ce dernier est mémorisé par processus et couvre aussi les valeurs par défaut. Chaque blob porte aussi son
 SHA-256 et sa taille. Avant toute allocation de blob, la géométrie complète
 (KV, conv/SSM CPU et Metal, dernière ligne, historique MTP et captures DFlash)

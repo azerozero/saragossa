@@ -388,6 +388,7 @@ impl CausalDecoder {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let kv_dtype = "f32".to_string();
         let environment = crate::runtime_flags::environment_sha256();
+        let overrides = crate::runtime_flags::state_snapshot_overrides();
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let kernel_profile = self
             .forward_runtime()
@@ -415,7 +416,7 @@ impl CausalDecoder {
                 ),
                 kv_dtype,
                 runtime_sha256: storage::digest(
-                    format!("{environment}:{kernel_profile:?}").as_bytes(),
+                    format!("{environment}:{kernel_profile:?}:{overrides}").as_bytes(),
                 ),
                 little_endian: cfg!(target_endian = "little"),
             },

@@ -2179,30 +2179,128 @@ pub(crate) fn state_snapshot_dir() -> Option<&'static std::path::Path> {
     .as_deref()
 }
 
+/// Surcharges hors environnement, relues uniquement à la demande d'instantané.
+pub(crate) fn state_snapshot_overrides() -> String {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let force_resident_full_linear = FORCE_RESIDENT_FULL_LINEAR.load(Ordering::Relaxed);
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let force_resident_full_linear = false;
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    let pairwise = pairwise::current();
+    #[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+    let pairwise: Option<()> = None;
+    format!("force_resident_full_linear={force_resident_full_linear};pairwise={pairwise:?}")
+}
+
 /// Empreinte de tout l'environnement moteur au premier accès runtime.
 /// Les longueurs séparent les noms/valeurs sans ambiguïté ; le binaire couvre les défauts.
 pub(crate) fn environment_sha256() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();
-    HASH.get_or_init(|| {
-        use sha2::{Digest, Sha256};
-        let mut variables: Vec<_> = std::env::vars()
-            .filter(|(name, _)| name.starts_with(ENV_PREFIX) || name.starts_with(LEGACY_ENV_PREFIX))
-            .collect();
-        variables.sort_unstable();
-        let mut hash = Sha256::new();
-        for (name, value) in variables {
-            for field in [name, value] {
-                hash.update((field.len() as u64).to_le_bytes());
-                hash.update(field.as_bytes());
-            }
+    HASH.get_or_init(|| hash_environment(std::env::vars_os()))
+}
+
+fn hash_environment(
+    variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut variables: Vec<_> = variables
+        .into_iter()
+        .filter(|(name, _)| {
+            let name = name.as_encoded_bytes();
+            name.starts_with(ENV_PREFIX.as_bytes())
+                || name.starts_with(LEGACY_ENV_PREFIX.as_bytes())
+        })
+        .collect();
+    variables.sort_unstable();
+    let mut hash = Sha256::new();
+    for (name, value) in variables {
+        for field in [name, value] {
+            // Encodage sans perte, stable sur la plateforme du binaire qui fait
+            // aussi partie de la clé ; aucune conversion Unicode, même au filtre.
+            let bytes = field.as_encoded_bytes();
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
         }
-        format!("{:x}", hash.finalize())
-    })
+    }
+    format!("{:x}", hash.finalize())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_hash_preserves_non_unicode_and_field_boundaries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let entry = |name: &[u8], value: &[u8]| {
+            (
+                OsString::from_vec(name.to_vec()),
+                OsString::from_vec(value.to_vec()),
+            )
+        };
+        let initial = vec![
+            entry(b"SARAGOSSA_SETTING", b"\xff"),
+            entry(b"RETI_SETTING\xfe", b"legacy"),
+        ];
+        let expected = hash_environment(initial.clone());
+        let mut reversed = initial.clone();
+        reversed.reverse();
+        reversed.push(entry(b"UNRELATED\xff", b"\xfe"));
+        assert_eq!(expected, hash_environment(reversed));
+        for (name, value) in [
+            (b"SARAGOSSA_SETTING".as_slice(), b"\xfe".as_slice()),
+            (b"SARAGOSSA_SETTING", "\u{fffd}".as_bytes()),
+            (b"SARAGOSSA_SETTING\xff", b""),
+        ] {
+            let mut changed = initial.clone();
+            changed[0] = entry(name, value);
+            assert_ne!(expected, hash_environment(changed));
+        }
+        let mut changed = initial.clone();
+        changed[1] = entry(b"RETI_SETTING\xff", b"legacy");
+        assert_ne!(expected, hash_environment(changed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_runtime_access_accepts_non_unicode_environment_without_snapshots() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        const CHILD: &str = "SNAPSHOT_NON_UNICODE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(env_var("SARAGOSSA_TEST_UNICODE").as_deref(), Some("ok"));
+            assert!(state_snapshot_dir().is_none());
+            assert_eq!(environment_sha256(), &hash_environment(std::env::vars_os()));
+            let before = environment_sha256().to_owned();
+            std::env::set_var("SARAGOSSA_TEST_RAW", "changed");
+            assert_eq!(environment_sha256(), before);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime_flags::tests::first_runtime_access_accepts_non_unicode_environment_without_snapshots",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("SARAGOSSA_RUST_STATE_SNAPSHOT")
+            .env_remove("RETI_RUST_STATE_SNAPSHOT")
+            .env("UNRELATED_RAW", OsString::from_vec(vec![0xff]))
+            .env(OsString::from_vec(b"UNRELATED_\xff".to_vec()), "value")
+            .env("SARAGOSSA_TEST_UNICODE", "ok")
+            .env("SARAGOSSA_TEST_RAW", OsString::from_vec(vec![0xfe]))
+            .env(OsString::from_vec(b"RETI_TEST_\xff".to_vec()), "value")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn decode_interval_nanos_for_rate_converts_tok_s_to_interval() {

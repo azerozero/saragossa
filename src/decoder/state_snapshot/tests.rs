@@ -393,15 +393,19 @@ fn snapshot_key_uses_effective_chunk_after_environment_change() {
             // Le premier flag capture aussi les variables inconnues et les alias.
             std::env::set_var("SARAGOSSA_FUTURE_SETTING", "initial");
             std::env::set_var("RETI_FUTURE_SETTING", "legacy");
-            let mut initial: Vec<_> = std::env::vars()
-                .filter(|(key, _)| key.starts_with("SARAGOSSA_") || key.starts_with("RETI_"))
+            let mut initial: Vec<_> = std::env::vars_os()
+                .filter(|(key, _)| {
+                    let key = key.as_encoded_bytes();
+                    key.starts_with(b"SARAGOSSA_") || key.starts_with(b"RETI_")
+                })
                 .collect();
             initial.sort_unstable();
             let mut hash = Sha256::new();
             for (key, value) in initial {
                 for field in [key, value] {
+                    let field = field.as_encoded_bytes();
                     hash.update((field.len() as u64).to_le_bytes());
-                    hash.update(field.as_bytes());
+                    hash.update(field);
                 }
             }
             let environment = format!("{:x}", hash.finalize());
@@ -421,12 +425,111 @@ fn snapshot_key_uses_effective_chunk_after_environment_change() {
             assert_eq!(before, after);
             assert_eq!(
                 after.runtime_sha256,
-                storage::digest(format!("{environment}:None").as_bytes())
+                storage::digest(
+                    format!(
+                        "{environment}:None:{}",
+                        crate::runtime_flags::state_snapshot_overrides()
+                    )
+                    .as_bytes()
+                )
             );
             assert_eq!(crate::runtime_flags::prefill_resident_chunk_tokens(), 4096);
             assert_eq!(environment, crate::runtime_flags::environment_sha256());
         },
     );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn snapshot_key_tracks_pairwise_overrides_without_environment_changes() {
+    isolated(
+        "snapshot_key_tracks_pairwise_overrides_without_environment_changes",
+        true,
+        |root| {
+            use crate::runtime_flags::pairwise::{Case, Guard};
+            let path = root.join("weights");
+            std::fs::write(&path, b"synthetic").unwrap();
+            let (model, _) = fixture(root);
+            let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
+            let request = || model.snapshot_request(&[0, 1], Ar).unwrap();
+            let baseline = request();
+            let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
+            model.snapshot_save(&baseline, &cache, &state, None, None);
+            let environment = crate::runtime_flags::environment_sha256();
+            {
+                let case = Case::default();
+                let _guard = Guard::set(case, false).unwrap();
+                let active = request();
+                assert_ne!(baseline.as_ref().unwrap().key, active.as_ref().unwrap().key);
+                model.snapshot_save(&active, &cache, &state, None, None);
+                assert!(model.snapshot_load(&active).is_some());
+                // Même mode, même prompt, même environnement : chaque surcharge
+                // doit refuser l'état du cas précédent, notamment les fusions p1.
+                for variant in [
+                    Case {
+                        p1: !case.p1,
+                        ..case
+                    },
+                    Case {
+                        p2: !case.p2,
+                        ..case
+                    },
+                    Case {
+                        p3: !case.p3,
+                        ..case
+                    },
+                    Case {
+                        hidden: !case.hidden,
+                        ..case
+                    },
+                    Case {
+                        embedding: !case.embedding,
+                        ..case
+                    },
+                    Case {
+                        overlap: !case.overlap,
+                        ..case
+                    },
+                    Case { lookup: 1, ..case },
+                    Case { cap: 2, ..case },
+                ] {
+                    let _variant = Guard::set(variant, false).unwrap();
+                    let changed = request();
+                    assert_ne!(active.as_ref().unwrap().key, changed.as_ref().unwrap().key);
+                    assert!(model.snapshot_load(&changed).is_none());
+                    assert_eq!(environment, crate::runtime_flags::environment_sha256());
+                }
+                assert_eq!(active.as_ref().unwrap().key, request().unwrap().key);
+                assert!(model.snapshot_load(&active).is_some());
+            }
+            assert_eq!(baseline.as_ref().unwrap().key, request().unwrap().key);
+            assert!(model.snapshot_load(&baseline).is_none());
+        },
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn snapshot_key_tracks_forced_resident_linear() {
+    isolated("snapshot_key_tracks_forced_resident_linear", true, |root| {
+        std::env::set_var("SARAGOSSA_RUST_DECODE_RESIDENT_FULL_LINEAR", "0");
+        assert!(!crate::runtime_flags::decode_resident_full_linear_enabled());
+        let path = root.join("weights");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let (model, _) = fixture(root);
+        let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
+        let before = model.snapshot_request(&[0, 1], Ar).unwrap();
+        let (cache, state) = model.prefill_cache_state(&[0, 1]).unwrap();
+        model.snapshot_save(&before, &cache, &state, None, None);
+        assert!(model.snapshot_load(&before).is_some());
+        let environment = crate::runtime_flags::environment_sha256();
+        crate::runtime_flags::force_resident_full_linear_decode();
+        assert!(crate::runtime_flags::decode_resident_full_linear_enabled());
+        let after = model.snapshot_request(&[0, 1], Ar).unwrap();
+        assert_ne!(before.as_ref().unwrap().key, after.as_ref().unwrap().key);
+        assert!(model.snapshot_load(&after).is_none());
+        assert_eq!(environment, crate::runtime_flags::environment_sha256());
+    });
 }
 
 #[test]
