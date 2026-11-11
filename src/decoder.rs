@@ -35,6 +35,9 @@ mod attention;
 mod attention_cache;
 mod attention_ops;
 mod kv_rows;
+#[allow(dead_code)]
+pub(crate) mod layer_plan;
+use layer_plan::ModelPlan;
 mod tts_prefill;
 #[cfg(test)]
 pub(crate) use attention_ops::{
@@ -1480,6 +1483,8 @@ impl CausalDecoderConfig {
 /// Exécute un modèle causal Qwen en CPU ou Metal.
 pub struct CausalDecoder {
     config: CausalDecoderConfig,
+    #[allow(dead_code)]
+    plan: Arc<ModelPlan>,
     embed_tokens: EmbeddingWeight,
     layers: Vec<DecoderLayer>,
     final_norm: Tensor,
@@ -2042,6 +2047,7 @@ impl CausalDecoder {
                 "décodeur sans couche cachée".to_string(),
             ));
         }
+        let plan = Arc::new(ModelPlan::build(&config));
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_index in 0..config.num_hidden_layers {
             layers.push(DecoderLayer::from_tensors(
@@ -2064,6 +2070,7 @@ impl CausalDecoder {
         }
         Ok(Self {
             config,
+            plan,
             embed_tokens,
             layers,
             final_norm,

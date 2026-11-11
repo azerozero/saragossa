@@ -237,3 +237,104 @@ fn historical_resident_dimensions() {
     }
     assert_eq!(snapshot, include_str!("layer_plan_snapshots/resident.txt"));
 }
+
+fn planned(config: &CausalDecoderConfig, index: usize) -> Decisions {
+    let layer = layer_plan::LayerPlan::build(config, index);
+    let full = &layer.resident;
+    Decisions {
+        index: layer.index,
+        kind: config.layer_types.get(index).cloned(),
+        gemma_full: full.gemma_full,
+        gemma_sliding: full.gemma_sliding,
+        full: layer.is_full(),
+        resident_full: layer.resident_full,
+        local: full.local_sliding,
+        head_dim: full.head_dim().map_err(|e| e.to_string()),
+        kv_heads: full.kv_heads,
+        rope_dims: [0, 2, 128].map(|h| full.rope_dims(h)),
+        rope_frequency_dim: [0, 2, 128].map(|h| full.rope_frequency_dim(h)),
+        theta_bits: full.rope_theta_override.map(f32::to_bits),
+        scale_bits: full.rope_position_scale.map(f32::to_bits),
+        window: full.sliding_window,
+        no_rope: full.no_rope,
+        v_shared: full.v_shared_with_k,
+        dense_mlp: layer.dense_mlp_expected,
+        sinks: config.attention_sinks,
+    }
+}
+
+#[test]
+fn plan_matches_every_legacy_decision() {
+    let mut configs: Vec<_> = fixtures()
+        .into_iter()
+        .map(|(_, c)| CausalDecoderConfig::from(&c))
+        .collect();
+    for interval in [None, Some(0), Some(1), Some(3)] {
+        configs.push(CausalDecoderConfig {
+            num_hidden_layers: 4,
+            full_attention_interval: interval,
+            sliding_window_pattern: interval,
+            rope_position_scale: Some(-0.0),
+            no_rope_layers: vec![0, 3],
+            ..CausalDecoderConfig::default()
+        });
+    }
+    let mut contradictory = configs[5].clone();
+    contradictory.full_attention_interval = Some(2);
+    configs.push(contradictory);
+    configs.push(CausalDecoderConfig {
+        head_dim: Some(usize::MAX),
+        num_key_value_heads: 2,
+        ..CausalDecoderConfig::default()
+    });
+    for config in configs {
+        let plan = ModelPlan::build(&config);
+        assert_eq!(plan.layers.len(), config.num_hidden_layers);
+        assert_eq!(
+            plan.fingerprint,
+            format!("{:x}", md5::compute(format!("{plan:?}")))
+        );
+        for index in 0..=config.num_hidden_layers {
+            assert_eq!(legacy(&config, index), planned(&config, index));
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                let layer = layer_plan::LayerPlan::build(&config, index);
+                let full = &layer.resident;
+                assert_eq!(
+                    config
+                        .resident_full_attention_kv_dim(index)
+                        .map_err(|e| e.to_string()),
+                    full.kv_dim().map_err(|e| e.to_string())
+                );
+                fn dims(d: FullAttnLayerDims) -> String {
+                    format!(
+                        "{:?}",
+                        (
+                            d.hidden,
+                            d.q_heads,
+                            d.kv_heads,
+                            d.head_dim,
+                            d.attn_scalar.to_bits(),
+                            d.rope_dims,
+                            d.rope_frequency_dim,
+                            d.position,
+                            d.window_start,
+                            d.eps.to_bits(),
+                            d.theta.to_bits(),
+                            d.attn_output_gate
+                        )
+                    )
+                }
+                assert_eq!(
+                    config
+                        .resident_full_attn_layer_dims(index, 64, 7, 1e-6, 123.0)
+                        .map(dims)
+                        .map_err(|e| e.to_string()),
+                    full.resident_full_attn_layer_dims(64, 7, 1e-6, 123.0)
+                        .map(dims)
+                        .map_err(|e| e.to_string())
+                );
+            }
+        }
+    }
+}
