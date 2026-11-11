@@ -320,3 +320,75 @@ impl LayerResolver<'_> {
             .filter(|_| !self.is_local_sliding_layer(layer_index))
     }
 }
+
+/// Vue du chargeur : les anciennes étiquettes Gemma n'avaient pas de garde
+/// familiale. Elle reste distincte de la vue du décodeur, y compris pour les
+/// replis de dimensions et de facteur RoPE.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LoaderLayerPlan {
+    pub(crate) full: bool,
+    pub(crate) gemma_full: bool,
+    pub(crate) gemma_sliding: bool,
+    pub(crate) v_shared_with_k: bool,
+    pub(crate) kv_heads: usize,
+    head_dim: Option<usize>,
+    hidden_size: usize,
+    num_attention_heads: usize,
+    rope_factor: Option<f32>,
+}
+
+impl LoaderLayerPlan {
+    pub(crate) fn build(config: &ModelConfig, index: usize) -> Self {
+        let gemma_full = config
+            .layer_types
+            .get(index)
+            .is_some_and(|kind| kind == "full_attention");
+        let gemma_sliding = config
+            .layer_types
+            .get(index)
+            .is_some_and(|kind| kind == "sliding_attention");
+        Self {
+            full: config.is_full_attention_layer(index),
+            gemma_full,
+            gemma_sliding,
+            v_shared_with_k: config.attention_k_eq_v && gemma_full,
+            head_dim: if gemma_full {
+                config.global_head_dim.or(config.head_dim)
+            } else {
+                config.head_dim
+            },
+            hidden_size: config.hidden_size,
+            num_attention_heads: config.num_attention_heads,
+            kv_heads: if gemma_full {
+                config
+                    .num_global_key_value_heads
+                    .unwrap_or(config.num_key_value_heads)
+            } else {
+                config.num_key_value_heads
+            },
+            rope_factor: if gemma_full {
+                config
+                    .rope_full_partial_rotary_factor
+                    .or(config.partial_rotary_factor)
+            } else if gemma_sliding {
+                config
+                    .rope_sliding_partial_rotary_factor
+                    .or(config.partial_rotary_factor)
+            } else {
+                config.partial_rotary_factor
+            },
+        }
+    }
+
+    pub(crate) fn head_dim(&self) -> usize {
+        // Conserve le repli au point d'usage : decoder_specs ne le demandait pas.
+        self.head_dim
+            .unwrap_or_else(|| self.hidden_size / self.num_attention_heads)
+    }
+
+    pub(crate) fn rope_dims(&self) -> usize {
+        let head_dim = self.head_dim();
+        self.rope_factor
+            .map_or(head_dim, |value| (head_dim as f32 * value) as usize)
+    }
+}

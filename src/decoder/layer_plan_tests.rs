@@ -349,3 +349,22 @@ fn plan_matches_every_legacy_decision() {
         }
     }
 }
+
+#[test]
+fn loader_plan_matches_legacy_accessors() {
+    for (_, config) in fixtures() {
+        for index in 0..=config.num_hidden_layers {
+            let plan = layer_plan::LoaderLayerPlan::build(&config, index);
+            assert_eq!(plan.full, config.is_full_attention_layer(index));
+            assert_eq!(plan.gemma_full, config.is_gemma4_full_layer(index));
+            assert_eq!(plan.gemma_sliding, config.is_gemma4_sliding_layer(index));
+            assert_eq!(plan.head_dim(), config.layer_head_dim(index));
+            assert_eq!(plan.kv_heads, config.layer_num_key_value_heads(index));
+            assert_eq!(plan.rope_dims(), config.layer_rope_dims(index));
+            assert_eq!(
+                plan.v_shared_with_k,
+                config.attention_k_eq_v && config.is_gemma4_full_layer(index)
+            );
+        }
+    }
+}
