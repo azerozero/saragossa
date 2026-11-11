@@ -2433,7 +2433,10 @@ fn prefill_resident_capture_tail_matches_full() -> Result<()> {
 /// Le hidden complet de l'ancien chemin est l'oracle ; le semis intégré doit
 /// garder ses bits, les états du tronc et les allocations des snapshots.
 fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
-    let executor = MetalExecutor::new()?;
+    let Some(executor) = test_executor()? else {
+        eprintln!("semis MTP synthétique non exécuté : aucun device Metal");
+        return Ok(());
+    };
     if private_scratch_enabled() {
         assert_eq!(
             executor
@@ -2600,23 +2603,28 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
     let raw = executor.shared_f32_rows_for_test(expected.data())?;
     let mut expected_k = Vec::new();
     let mut expected_v = Vec::new();
-    for (index, tokens) in tokens[1..].chunks(1024).enumerate() {
-        let (k, v) = executor.mtp_seed_kv_rows(
-            tokens,
-            MtpSeedStates::Raw {
-                rows: &raw,
-                first_row: index * 1024,
-                final_norm: &final_norm,
-            },
-            weights,
-            PrefillAttentionSpec {
-                seq: tokens.len(),
-                ..seed_spec
-            },
-            index * 1024,
-        )?;
-        expected_k.extend_from_slice(k.data());
-        expected_v.extend_from_slice(v.data());
+    {
+        // L'ancien chemin alloue la forme exacte du dernier bloc. Isoler
+        // son scratch pour ne pas masquer une allocation du chemin intégré.
+        let _reference_namespace = install_scratch_namespace(u64::MAX);
+        for (index, tokens) in tokens[1..].chunks(1024).enumerate() {
+            let (k, v) = executor.mtp_seed_kv_rows(
+                tokens,
+                MtpSeedStates::Raw {
+                    rows: &raw,
+                    first_row: index * 1024,
+                    final_norm: &final_norm,
+                },
+                weights,
+                PrefillAttentionSpec {
+                    seq: tokens.len(),
+                    ..seed_spec
+                },
+                index * 1024,
+            )?;
+            expected_k.extend_from_slice(k.data());
+            expected_v.extend_from_slice(v.data());
+        }
     }
     let mut seed = MtpPrefillSeed::new(
         &executor,
@@ -2638,6 +2646,27 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
         true,
         Some(&mut seed),
     )?;
+    if seq - 1 > 1024 {
+        let scratch = executor.scratch_buffers.lock().expect("scratch de test");
+        for (label, width) in [
+            ("mtp_seed_states_normed", HIDDEN),
+            ("mtp_seed_concat", 2 * HIDDEN),
+            ("mtp_seed_fc", HIDDEN),
+            ("mtp_seed_normed", HIDDEN),
+            ("mtp_seed_embedding", HIDDEN),
+            ("mtp_seed_k", KV_HEADS * HEAD_DIM),
+            ("mtp_seed_k_rope", KV_HEADS * HEAD_DIM),
+            ("mtp_seed_v", KV_HEADS * HEAD_DIM),
+        ] {
+            let lengths: Vec<_> = scratch
+                .entries
+                .keys()
+                .filter(|key| key.namespace == 0 && key.label == label)
+                .map(|key| key.len)
+                .collect();
+            assert_eq!(lengths, [1024 * width], "capacité réutilisée : {label}");
+        }
+    }
     // Même avec scratch privé, seule une ligne de sortie peut être allouée.
     let output_floats = super::resident::FINAL_OUTPUT_FLOATS.with(Cell::get);
     if private_scratch_enabled() {
@@ -2714,6 +2743,19 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
             &[KvSegment::Cpu(&expected_v)],
             seq - 1,
         )?;
+        if actual.format() == crate::decode_resident::KvFormat::Bf16 {
+            // Comparer les octets stockés, pas seulement des floats élargis.
+            for (a, b) in [
+                (actual.keys(), expected.keys()),
+                (actual.values(), expected.values()),
+            ] {
+                assert_eq!(
+                    read_u16_buffer(a.buffer(), (seq - 1) * KV_HEADS * HEAD_DIM)?,
+                    read_u16_buffer(b.buffer(), (seq - 1) * KV_HEADS * HEAD_DIM)?,
+                    "KV bf16 du semis avec capacités réutilisées",
+                );
+            }
+        }
         let (ak, av) = actual.read_rows(0, seq - 1)?;
         let (ek, ev) = expected.read_rows(0, seq - 1)?;
         for (a, b) in [(ak, ek), (av, ev)] {
@@ -2724,6 +2766,13 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[test]
+fn mtp_seed_partial_903_reuses_capacity_and_preserves_bf16_bytes() -> Result<()> {
+    // Même queue que T=261000 : 261000 - 1 = 254 * 1024 + 903.
+    // Petites matrices synthétiques, aucun fichier de poids.
+    check_mtp_seed_streamed(1024 + 903 + 1, 1500)
 }
 
 #[test]

@@ -287,14 +287,22 @@ impl CausalDecoder {
             mtp.kv.truncate(pending_start)?;
             #[cfg(feature = "devtools")]
             if crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false) {
-                Self::encode_copy_mtp_kv_prefix(
-                    metal,
-                    encoder,
-                    &mtp.kv,
-                    &mtp.append_oracle_kv,
-                    pending_start,
-                )?;
-                mtp.append_oracle_kv.truncate(pending_start)?;
+                // Le flag peut être activé après le setup ; ce cas diagnostic
+                // réserve alors le KV à sa première utilisation.
+                if mtp.append_oracle_kv.is_none() {
+                    mtp.append_oracle_kv = Some(state.full_attention_dense(
+                        mtp.kv.capacity(),
+                        dims.q_heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        mtp.kv.format() == crate::decode_resident::KvFormat::Bf16,
+                    )?);
+                }
+                let oracle = mtp.append_oracle_kv.as_mut().ok_or_else(|| {
+                    InferError::Config("KV oracle MTP absent après allocation".to_string())
+                })?;
+                Self::encode_copy_mtp_kv_prefix(metal, encoder, &mtp.kv, oracle, pending_start)?;
+                oracle.truncate(pending_start)?;
                 Self::encode_mtp_append_rows_serial_to_kv(
                     metal,
                     state,
@@ -306,7 +314,7 @@ impl CausalDecoder {
                     &mtp.layer,
                     &mtp.verify_hidden_rows,
                     &mtp.pending_append_indices,
-                    &mut mtp.append_oracle_kv,
+                    oracle,
                     encoder,
                     owned,
                     dims,
@@ -575,18 +583,11 @@ impl CausalDecoder {
         let cells = expected_len
             .checked_mul(mtp.kv.kv_dim())
             .ok_or_else(|| InferError::Dimension("MTP oracle compare déborde".to_string()))?;
-        Self::compare_mtp_kv_buffer_bits(
-            "keys",
-            mtp.kv.keys(),
-            mtp.append_oracle_kv.keys(),
-            cells,
-        )?;
-        Self::compare_mtp_kv_buffer_bits(
-            "values",
-            mtp.kv.values(),
-            mtp.append_oracle_kv.values(),
-            cells,
-        )?;
+        let oracle = mtp.append_oracle_kv.as_ref().ok_or_else(|| {
+            InferError::Config("KV oracle MTP absent pour la comparaison".to_string())
+        })?;
+        Self::compare_mtp_kv_buffer_bits("keys", mtp.kv.keys(), oracle.keys(), cells)?;
+        Self::compare_mtp_kv_buffer_bits("values", mtp.kv.values(), oracle.values(), cells)?;
         eprintln!(
             "mtp_append_kv_oracle bit_equal=true rows={} cells={}",
             expected_len, cells

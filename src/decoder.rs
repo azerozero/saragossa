@@ -585,7 +585,7 @@ struct ResidentMtpArena {
     draft_lm_head: MetalLinearWeightBuffers,
     kv: FullAttentionMetalState,
     #[cfg(feature = "devtools")]
-    append_oracle_kv: FullAttentionMetalState,
+    append_oracle_kv: Option<FullAttentionMetalState>,
     #[cfg(feature = "devtools")]
     append_oracle_len: usize,
     hidden_a: GpuTensor,

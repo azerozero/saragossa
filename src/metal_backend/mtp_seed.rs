@@ -53,6 +53,9 @@ pub(crate) struct MtpPrefillSeed<'a> {
     filled: usize,
     seeded: usize,
     completed: bool,
+    // Le setup résident vient après le prefill et peut refuser l'arène.
+    // Les replis CPU et les préfixes réutilisés doivent encore lire les f32
+    // d'origine : élargir du bf16 ne préserverait pas ces valeurs.
     output: [Buffer; 2],
 }
 
@@ -119,6 +122,10 @@ impl<'a> MtpPrefillSeed<'a> {
             from += count;
             self.filled += count;
             if self.filled == self.block_rows || self.seeded + self.filled == self.tokens.len() {
+                // Le semis a son propre découpage, indépendant du prefill.
+                // Reprendre les capacités du bloc plein jusque dans les
+                // scratch internes des GEMM, sans changer leurs dimensions.
+                let _scratch_rows = enter_scratch_row_capacity(self.filled, self.block_rows);
                 let (k, v) = metal.encode_mtp_seed_kv_rows(
                     encoder,
                     &self.tokens[self.seeded..self.seeded + self.filled],
