@@ -283,21 +283,25 @@ impl CausalDecoder {
                 "MTP pending append incohérent start={pending_start} count={pending_count} attendu_end={expected_history_len}"
             )));
         }
+        // Une activation tardive ne doit ni tronquer le KV ni modifier les
+        // lignes en attente si le budget refuse l'oracle supplémentaire.
+        #[cfg(feature = "devtools")]
+        let oracle_enabled =
+            crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false);
+        #[cfg(feature = "devtools")]
+        if oracle_enabled {
+            ensure_mtp_append_oracle(
+                &mut mtp.append_oracle_kv,
+                state,
+                &mtp.kv,
+                (dims.q_heads, dims.kv_heads, dims.head_dim),
+                self.memory_guard.as_ref(),
+            )?;
+        }
         {
             mtp.kv.truncate(pending_start)?;
             #[cfg(feature = "devtools")]
-            if crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false) {
-                // Le flag peut être activé après le setup ; ce cas diagnostic
-                // réserve alors le KV à sa première utilisation.
-                if mtp.append_oracle_kv.is_none() {
-                    mtp.append_oracle_kv = Some(state.full_attention_dense(
-                        mtp.kv.capacity(),
-                        dims.q_heads,
-                        dims.kv_heads,
-                        dims.head_dim,
-                        mtp.kv.format() == crate::decode_resident::KvFormat::Bf16,
-                    )?);
-                }
+            if oracle_enabled {
                 let oracle = mtp.append_oracle_kv.as_mut().ok_or_else(|| {
                     InferError::Config("KV oracle MTP absent après allocation".to_string())
                 })?;
@@ -325,7 +329,7 @@ impl CausalDecoder {
                 mtp.append_oracle_len = pending_end;
             }
             #[cfg(feature = "devtools")]
-            if !crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false) {
+            if !oracle_enabled {
                 mtp.append_oracle_len = 0;
             }
             Self::encode_mtp_append_rows_serial_to_kv(
@@ -2720,4 +2724,113 @@ fn cut_fused_segment<'q>(
     crate::metal_backend::commit_and_wait(command_buffer)?;
     *command_buffer = next;
     Ok(started.elapsed().as_nanos())
+}
+
+/// Réserve l'oracle une seule fois, après contrôle du budget courant. Le
+/// majorant f32 reste sûr même si le format runtime change depuis le setup.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn ensure_mtp_append_oracle(
+    oracle: &mut Option<FullAttentionMetalState>,
+    state: &DecodeResidentState,
+    kv: &FullAttentionMetalState,
+    (q_heads, kv_heads, head_dim): (usize, usize, usize),
+    budget: Option<&MemoryGuard>,
+) -> Result<()> {
+    if oracle.is_some() {
+        return Ok(());
+    }
+    if let Some(guard) = budget {
+        let bytes = kv
+            .capacity()
+            .checked_mul(kv.kv_dim())
+            .and_then(|cells| cells.checked_mul(2 * std::mem::size_of::<f32>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| InferError::Dimension("KV oracle MTP déborde".to_string()))?;
+        guard
+            .check_allocation(bytes)
+            .map_err(InferError::MemoryGuard)?;
+    }
+    *oracle = Some(state.full_attention_dense(
+        kv.capacity(),
+        q_heads,
+        kv_heads,
+        head_dim,
+        kv.format() == crate::decode_resident::KvFormat::Bf16,
+    )?);
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_append_oracle_checks_budget_before_allocation() -> Result<()> {
+        let Some(device) = metal::Device::system_default() else {
+            eprintln!("budget oracle MTP non exécuté : aucun device Metal");
+            return Ok(());
+        };
+        let state = DecodeResidentState::new(device)?;
+        let dims = (4, 2, 128);
+        let capacity = 16;
+        let bytes = (2 * capacity * dims.1 * dims.2 * 4) as u64;
+        let current = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let usage = current.clone();
+        let budget = MemoryGuard::from_limits(
+            true,
+            crate::memory_guard::MemoryLimits {
+                static_cap: Some(bytes),
+                host_memory: None,
+                headroom_bytes: 0,
+                metal_cap: None,
+            },
+            std::sync::Arc::new(move || Some(usage.load(std::sync::atomic::Ordering::Relaxed))),
+        );
+        // Le setup admet un KV f32 ; ensuite il ne reste plus de budget.
+        budget
+            .check_allocation(bytes)
+            .map_err(InferError::MemoryGuard)?;
+        let mut kv = state.full_attention_f32_for_test(capacity, dims.0, dims.1, dims.2)?;
+        kv.seed_segments(
+            &[crate::decode_resident::KvSegment::Cpu(&vec![
+                0.25;
+                dims.1 * dims.2
+            ])],
+            &[crate::decode_resident::KvSegment::Cpu(&vec![
+                0.5;
+                dims.1 * dims.2
+            ])],
+            1,
+        )?;
+        current.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        let mut oracle = None;
+        assert!(matches!(
+            ensure_mtp_append_oracle(&mut oracle, &state, &kv, dims, Some(&budget)),
+            Err(InferError::MemoryGuard(_))
+        ));
+        assert!(oracle.is_none());
+        assert_eq!(kv.len(), 1);
+        assert_eq!(kv.read_rows(0, 1)?.0, vec![0.25; dims.1 * dims.2]);
+        // Une nouvelle tentative avec le budget exact peut allouer.
+        current.store(0, std::sync::atomic::Ordering::Relaxed);
+        ensure_mtp_append_oracle(&mut oracle, &state, &kv, dims, Some(&budget))?;
+        let allocation = oracle
+            .as_ref()
+            .expect("invariant: oracle alloué")
+            .keys()
+            .buffer()
+            .contents();
+        current.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        ensure_mtp_append_oracle(&mut oracle, &state, &kv, dims, Some(&budget))?;
+        assert_eq!(
+            oracle
+                .as_ref()
+                .expect("invariant: oracle conservé")
+                .keys()
+                .buffer()
+                .contents(),
+            allocation
+        );
+        Ok(())
+    }
 }

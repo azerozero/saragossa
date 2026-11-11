@@ -2432,11 +2432,7 @@ fn prefill_resident_capture_tail_matches_full() -> Result<()> {
 
 /// Le hidden complet de l'ancien chemin est l'oracle ; le semis intégré doit
 /// garder ses bits, les états du tronc et les allocations des snapshots.
-fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
-    let Some(executor) = test_executor()? else {
-        eprintln!("semis MTP synthétique non exécuté : aucun device Metal");
-        return Ok(());
-    };
+fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usize) -> Result<()> {
     if private_scratch_enabled() {
         assert_eq!(
             executor
@@ -2627,7 +2623,7 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
         }
     }
     let mut seed = MtpPrefillSeed::new(
-        &executor,
+        executor,
         weights,
         seed_spec,
         &final_norm,
@@ -2772,26 +2768,30 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
 fn mtp_seed_partial_903_reuses_capacity_and_preserves_bf16_bytes() -> Result<()> {
     // Même queue que T=261000 : 261000 - 1 = 254 * 1024 + 903.
     // Petites matrices synthétiques, aucun fichier de poids.
-    check_mtp_seed_streamed(1024 + 903 + 1, 1500)
+    let Some(executor) = test_executor()? else {
+        eprintln!("semis MTP synthétique non exécuté : aucun device Metal");
+        return Ok(());
+    };
+    check_mtp_seed_streamed(&executor, 1024 + 903 + 1, 1500)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_4097_bit_exact() -> Result<()> {
-    check_mtp_seed_streamed(4097, 4096)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_8297_bit_exact() -> Result<()> {
     // Découpage non aligné sur les blocs du semis, avec une queue de 104 lignes.
-    check_mtp_seed_streamed(8297, 1500)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 8297, 1500)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_32768_bit_exact() -> Result<()> {
-    check_mtp_seed_streamed(32768, 4096)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 32768, 4096)
 }
 
 #[test]
@@ -2800,7 +2800,157 @@ fn mtp_seed_streamed_private_scratch_bit_exact() -> Result<()> {
     crate::metal_backend::flags::with_private_scratch_override(true, || {
         assert!(private_scratch_enabled());
         // Le blit final doit rester borné, avec et sans frontière de morceau.
-        check_mtp_seed_streamed(129, 4096)?;
-        check_mtp_seed_streamed(4097, 4096)
+        check_mtp_seed_streamed(&MetalExecutor::new()?, 129, 4096)?;
+        check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096)
     })
+}
+
+#[test]
+fn mtp_seed_quantized_nax_partial_903_bit_exact() -> Result<()> {
+    use super::super::matmul_select::{AffineMatmulKernel, OFFSET_TEST_KERNEL};
+    use super::super::profiling::OFFSET_TEST_DISPATCHES;
+
+    let Some(executor) = test_executor()? else {
+        eprintln!("semis MTP NAX non exécuté : aucun device Metal");
+        return Ok(());
+    };
+    if executor.na_gemm_coop_qb_tiled.is_none() || executor.na_gemm_coop_qb_tiled_gs128.is_none() {
+        eprintln!("semis MTP NAX non exécuté : pipelines NAX indisponibles");
+        return Ok(());
+    }
+    // Forcer seulement le sélecteur de test permet de couvrir les scratchs
+    // de conversion NAX avec des matrices minuscules. Les encodeurs et les
+    // kernels sont ceux de production, identiques pour les deux exécutions.
+    struct RestoreDispatch;
+    impl Drop for RestoreDispatch {
+        fn drop(&mut self) {
+            OFFSET_TEST_KERNEL.with(|slot| slot.set(None));
+            OFFSET_TEST_DISPATCHES.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    let _restore = RestoreDispatch;
+    OFFSET_TEST_KERNEL.with(|slot| slot.set(Some(AffineMatmulKernel::QmmNaFusedTiledU8)));
+    const HIDDEN: usize = 64;
+    const KV_DIM: usize = 128;
+    const ROWS: usize = 1024 + 903;
+    let input = deterministic_tensor(ROWS, HIDDEN, 743, 0.5)?;
+    let hidden = executor.upload_f32_buffer(input.data(), "mtp_nax_test_hidden")?;
+    let embedding = EmbeddingWeight::Dense(deterministic_tensor(97, HIDDEN, 751, 0.5)?);
+    let norm = deterministic_norm(HIDDEN, 757)?;
+    let fc = Linear::new_quantized(
+        deterministic_affine_weight(HIDDEN, 2 * HIDDEN, 761, 0.003)?,
+        None,
+    )?;
+    let k = Linear::new_quantized(
+        deterministic_affine_weight(KV_DIM, HIDDEN, 769, 0.004)?,
+        None,
+    )?;
+    let v = Linear::new_quantized(
+        deterministic_affine_weight(KV_DIM, HIDDEN, 773, 0.005)?,
+        None,
+    )?;
+    let weights = MtpSeedWeights {
+        embed_tokens: &embedding,
+        embed_scale: 1.0,
+        embed_recast_bf16: false,
+        pre_fc_norm_embedding: &norm,
+        pre_fc_norm_hidden: &norm,
+        fc: &fc,
+        input_norm: &norm,
+        k_proj: &k,
+        v_proj: &v,
+        k_norm: &norm,
+    };
+    let spec = PrefillAttentionSpec {
+        seq: ROWS,
+        hidden_dim: HIDDEN,
+        q_heads: 4,
+        kv_heads: 2,
+        head_dim: 64,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        rope_theta: 10_000.0,
+        attn_scalar: 64.0,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let tokens: Vec<_> = (0..ROWS).map(|i| (i * 31 + 7) % 97).collect();
+    for private in [false, true] {
+        crate::metal_backend::flags::with_private_scratch_override(private, || -> Result<()> {
+            let run = |reuse, namespace| -> Result<(Vec<Vec<u32>>, Vec<String>)> {
+                let _namespace = install_scratch_namespace(namespace);
+                let mut seed = MtpPrefillSeed::new(&executor, weights, spec, &norm, &tokens, 1024)?;
+                // Rejouer le semis intégré précédent : seule la garde de
+                // capacité est neutralisée, ni kernels ni découpage changés.
+                seed.reuse_scratch_capacity = reuse;
+                OFFSET_TEST_DISPATCHES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+                let cb = executor.queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                let guard = EncoderEndGuard::new(encoder);
+                seed.encode_chunk(&executor, encoder, &hidden, 0, ROWS)?;
+                guard.end();
+                commit_and_wait(cb)?;
+                seed.complete();
+                let trace = OFFSET_TEST_DISPATCHES
+                    .with(|slot| slot.borrow_mut().take())
+                    .expect("invariant: capture des dispatchs active");
+                let nax: Vec<_> = trace
+                    .into_iter()
+                    .filter(|line| line.starts_with("gemm_nax_"))
+                    .collect();
+                // FC (gs128), puis K|V concaténés (gs64), pour chaque bloc.
+                assert_eq!(
+                    nax,
+                    [
+                        "gemm_nax_coop_qb_tiled_gs128 M=1024 N=64 K=128",
+                        "gemm_nax_coop_qb_tiled M=1024 N=256 K=64",
+                        "gemm_nax_coop_qb_tiled_gs128 M=903 N=64 K=128",
+                        "gemm_nax_coop_qb_tiled M=903 N=256 K=64",
+                    ]
+                );
+                let scratch = executor
+                    .scratch_buffers
+                    .lock()
+                    .expect("invariant: scratch de test");
+                let mut lengths: Vec<_> = scratch
+                    .entries
+                    .keys()
+                    .filter(|key| {
+                        key.namespace == namespace && key.label == "qmm_na_fused_tiled_lhs_bf16"
+                    })
+                    .map(|key| key.len)
+                    .collect();
+                lengths.sort_unstable();
+                let mut expected = vec![1024 * HIDDEN, 1024 * 2 * HIDDEN];
+                if !reuse {
+                    expected.extend([903 * HIDDEN, 903 * 2 * HIDDEN]);
+                }
+                expected.sort_unstable();
+                assert_eq!(lengths, expected, "scratch NAX, réutilisation={reuse}");
+                drop(scratch);
+                let (k, v) = seed.into_rows()?;
+                let bits = [k, v]
+                    .iter()
+                    .map(|rows| {
+                        let values = rows.segment().as_f32().into_owned();
+                        assert_eq!(values.len(), ROWS * KV_DIM);
+                        assert!(values.iter().all(|x| x.is_finite()));
+                        assert!(values.iter().any(|x| *x != 0.0));
+                        values.iter().map(|x| x.to_bits()).collect()
+                    })
+                    .collect();
+                Ok((bits, nax))
+            };
+            // Namespaces distincts : le nouveau chemin ne peut emprunter
+            // aucun buffer, plein ou partiel, à l'ancien.
+            let base = if private { 104 } else { 102 };
+            let old = run(false, base)?;
+            let new = run(true, base + 1)?;
+            assert_eq!(old, new, "semis intégré NAX, scratch privé={private}");
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
