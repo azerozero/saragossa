@@ -1,22 +1,25 @@
-//! Lignes f32 ou bf16 lues en place dans un buffer partagé que le GPU a fini
-//! d'écrire.
+//! Accès CPU typés aux buffers partagés, après les écritures GPU.
 
 use super::*;
 use std::collections::BTreeMap;
 use std::sync::{Arc, MutexGuard, PoisonError};
 
-/// Élément d'une vue partagée : f32, ou bits bf16 (`u16`). Scellé : seuls des
-/// types sans invalide ni padding peuvent être lus depuis la mémoire GPU.
-pub(crate) trait SharedElement: Copy + sealed::Sealed {}
+/// Types non vides autorisés en mémoire GPU ; `Pod` exclut padding et
+/// représentations invalides, le scellement interdit les extensions implicites.
+pub(crate) trait SharedElement: bytemuck::Pod + sealed::Sealed {}
 
 mod sealed {
     pub trait Sealed {}
     impl Sealed for f32 {}
     impl Sealed for u16 {}
+    impl Sealed for u8 {}
+    impl Sealed for u32 {}
 }
 
 impl SharedElement for f32 {}
 impl SharedElement for u16 {}
+impl SharedElement for u8 {}
+impl SharedElement for u32 {}
 
 /// Vue CPU, sans copie, de `len` éléments d'un buffer `StorageModeShared` à
 /// partir de l'élément `offset`. Le K/V d'un prefill complet y reste : sa
@@ -29,7 +32,7 @@ impl SharedElement for u16 {}
 /// [`InPlaceClaim`] n'écrit qu'au-delà de la plus longue vue vivante : une
 /// plage publiée n'est jamais réécrite tant qu'une vue la couvre.
 #[derive(Debug)]
-pub(crate) struct SharedRows<T> {
+pub(crate) struct SharedRows<T: SharedElement> {
     buffer: metal::Buffer,
     offset: usize,
     len: usize,
@@ -79,31 +82,77 @@ pub(crate) type SharedF32Rows = SharedRows<f32>;
 /// Lignes bf16 stockées en bits `u16` (K/V d'un prefill stocké en bf16).
 pub(crate) type SharedBf16Rows = SharedRows<u16>;
 
-/// Vérifie qu'une vue de `offset + len` éléments `T` tient dans `buffer` et
-/// qu'il a un pointeur CPU.
-fn check_view<T>(buffer: &BufferRef, offset: usize, len: usize) -> Result<()> {
+/// Contrat commun aux vues durables et aux accès temporaires. Séparé de Metal
+/// pour éprouver les débordements et désalignements sans device.
+fn check_layout<T: SharedElement>(
+    address: usize,
+    bytes: u64,
+    offset: usize,
+    len: usize,
+) -> Result<()> {
     let end = offset
         .checked_add(len)
         .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
         .ok_or_else(|| InferError::Dimension("vue partagée déborde".to_string()))?;
-    if u64::try_from(end)
-        .ok()
-        .is_none_or(|end| end > buffer.length())
-    {
+    if end > isize::MAX as usize || u64::try_from(end).ok().is_none_or(|end| end > bytes) {
         return Err(InferError::Dimension(format!(
-            "vue partagée {offset}+{len} éléments hors du buffer de {} octets",
-            buffer.length()
+            "vue partagée {offset}+{len} éléments hors du buffer de {bytes} octets"
         )));
     }
-    if buffer.contents().is_null() {
+    if address == 0 {
         return Err(InferError::Metal(
             "vue partagée sur un buffer sans pointeur CPU".to_string(),
+        ));
+    }
+    if address % std::mem::align_of::<T>() != 0 || address.checked_add(end).is_none() {
+        return Err(InferError::Dimension(
+            "vue partagée désalignée ou adresse débordante".to_string(),
         ));
     }
     Ok(())
 }
 
+fn check_view<T: SharedElement>(buffer: &BufferRef, offset: usize, len: usize) -> Result<()> {
+    check_layout::<T>(buffer.contents().addr(), buffer.length(), offset, len)
+}
+
 impl<T: SharedElement> SharedRows<T> {
+    /// Emprunt temporaire sans registre, allocation ni synchronisation.
+    ///
+    /// # Safety
+    /// La plage est initialisée et accessible au CPU ; ses écritures GPU sont
+    /// terminées. Aucune écriture ni purge ne la vise pendant l'emprunt.
+    #[expect(unsafe_code, reason = "emprunt CPU borné par la vie du buffer")]
+    pub(crate) unsafe fn borrow(buffer: &BufferRef, offset: usize, len: usize) -> Result<&[T]> {
+        check_view::<T>(buffer, offset, len)?;
+        // SAFETY: taille <= isize::MAX, alignement et bornes vérifiés ; Pod
+        // garantit les représentations. L'appelant garantit initialisation,
+        // accessibilité et absence d'écriture pendant la vie de la tranche.
+        Ok(unsafe { std::slice::from_raw_parts(buffer.contents().cast::<T>().add(offset), len) })
+    }
+
+    /// Accès exclusif limité à `write`, sans créer de vue durable.
+    ///
+    /// # Safety
+    /// La plage est initialisée et accessible au CPU. Aucun autre accès CPU
+    /// ou GPU, aucune vue vivante ni purge ne la vise pendant `write`.
+    #[expect(unsafe_code, reason = "emprunt CPU exclusif limité au callback")]
+    pub(crate) unsafe fn with_mut_slice<R>(
+        buffer: &BufferRef,
+        offset: usize,
+        len: usize,
+        write: impl FnOnce(&mut [T]) -> R,
+    ) -> Result<R> {
+        check_view::<T>(buffer, offset, len)?;
+        // SAFETY: mêmes bornes, alignement et types Pod que `borrow` ; le
+        // contrat appelant garantit l'exclusivité et l'initialisation. Le
+        // callback ne peut pas rendre une référence à cette tranche.
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(buffer.contents().cast::<T>().add(offset), len)
+        };
+        Ok(write(slice))
+    }
+
     /// Première vue de `buffer[offset..offset + len]` (en éléments `T`) : crée
     /// le registre de vivacité de l'allocation.
     ///
@@ -124,7 +173,7 @@ impl<T: SharedElement> SharedRows<T> {
     /// # Errors
     ///
     /// Renvoie une erreur si la plage dépasse le buffer ou si le buffer n'a
-    /// pas de pointeur CPU (stockage privé).
+    /// pas de pointeur CPU (stockage privé), ou si l'alignement est invalide.
     #[expect(
         unsafe_code,
         reason = "contrat d'immuabilité du buffer reporté sur l'appelant"
@@ -183,9 +232,8 @@ impl<T: SharedElement> SharedRows<T> {
     )]
     pub(crate) fn as_slice(&self) -> &[T] {
         // SAFETY: `new` a vérifié que `offset + len` éléments tiennent dans le
-        // buffer partagé et que son pointeur CPU existe (aligné page, donc
-        // aligné pour `T`, f32 ou u16 scellés : toute suite d'octets est une
-        // valeur valide). Tant que `self` vit, sa fin compte dans le registre :
+        // buffer partagé, avec une taille <= isize::MAX et un pointeur non nul
+        // aligné pour `T` (Pod scellé). Tant que `self` vit, sa fin compte dans le registre :
         // aucun écrivain, revalidé sous claim, ne touche cette plage (contrat
         // `# Safety` de `new`), et les vues ne donnent qu'un accès en lecture.
         unsafe {
@@ -248,7 +296,7 @@ impl<T: SharedElement> SharedRows<T> {
     }
 }
 
-impl<T> Clone for SharedRows<T> {
+impl<T: SharedElement> Clone for SharedRows<T> {
     fn clone(&self) -> Self {
         self.live.add(self.offset + self.len);
         Self {
@@ -261,7 +309,7 @@ impl<T> Clone for SharedRows<T> {
     }
 }
 
-impl<T> Drop for SharedRows<T> {
+impl<T: SharedElement> Drop for SharedRows<T> {
     fn drop(&mut self) {
         self.live.remove(self.offset + self.len);
     }
@@ -405,6 +453,7 @@ mod identity_tests {
     use super::*;
 
     #[test]
+    #[ignore = "nécessite un device Metal"]
     #[expect(unsafe_code, reason = "buffers neufs propres au test")]
     fn views_share_identity_and_allocations_do_not() -> Result<()> {
         let Some(device) = metal::Device::system_default() else {
@@ -431,6 +480,7 @@ mod identity_tests {
     }
 
     #[test]
+    #[ignore = "nécessite un device Metal"]
     fn private_buffers_have_distinct_identities_and_exclusive_claims() {
         let Some(device) = metal::Device::system_default() else {
             return;
@@ -452,6 +502,7 @@ mod identity_tests {
     /// vue vivante plus longue interdit l'écriture au-delà d'une vue plus
     /// courte (revalidation sous claim), sa mort l'autorise de nouveau.
     #[test]
+    #[ignore = "nécessite un device Metal"]
     #[expect(unsafe_code, reason = "buffers neufs propres au test")]
     fn liveness_registry_gates_writes_beyond_live_views() -> Result<()> {
         let Some(device) = metal::Device::system_default() else {
@@ -502,6 +553,37 @@ mod identity_tests {
         // Rollback : la seule vue restante, tronquée, devient entière.
         drop((k, k2));
         assert!(short.is_whole());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_invalid_sizes_and_alignment() {
+        assert!(check_layout::<f32>(16, 16, 0, 5).is_err());
+        assert!(check_layout::<u16>(16, 3, 0, 2).is_err());
+        assert!(check_layout::<u32>(16, u64::MAX, usize::MAX, 1).is_err());
+        assert!(check_layout::<u32>(16, u64::MAX, 0, usize::MAX / 4 + 1).is_err());
+        assert!(check_layout::<u8>(16, u64::MAX, 0, isize::MAX as usize + 1).is_err());
+        assert!(check_layout::<u8>(usize::MAX, 1, 0, 1).is_err());
+        for address in [0, 1, 2, 3] {
+            assert!(check_layout::<f32>(address, 16, 0, 4).is_err());
+            assert!(check_layout::<u32>(address, 16, 0, 0).is_err());
+        }
+        assert!(check_layout::<u16>(1, 2, 0, 1).is_err());
+    }
+
+    #[test]
+    fn accepts_exact_bounds_offsets_and_empty_views() -> Result<()> {
+        check_layout::<f32>(16, 16, 1, 3)?;
+        check_layout::<u32>(16, 16, 4, 0)?;
+        check_layout::<u16>(2, 6, 1, 2)?;
+        check_layout::<u8>(1, 3, 1, 2)?;
+        check_layout::<f32>(16, 0, 0, 0)?;
+        assert!(check_layout::<f32>(16, 16, 5, 0).is_err());
         Ok(())
     }
 }

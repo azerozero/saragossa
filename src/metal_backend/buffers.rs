@@ -454,16 +454,6 @@ impl MetalExecutor {
             checked_nsuint(len_bytes, "single_copy_weight_affine_file")?,
             MTLResourceOptions::StorageModeShared,
         );
-        let destination = buffer.contents().cast::<u8>();
-        if destination.is_null() {
-            return Err(InferError::Metal(
-                "MTLBuffer affine StorageModeShared sans pointeur CPU".to_string(),
-            ));
-        }
-        // SAFETY: `buffer` vient d'être alloué en StorageModeShared avec exactement
-        // `len_bytes`; son pointeur CPU est non nul et reste valide pendant la
-        // lecture. Aucun command buffer GPU ne référence ce poids avant le retour.
-        let destination = unsafe { std::slice::from_raw_parts_mut(destination, len_bytes) };
         let mut file = std::fs::File::open(path).map_err(|source| InferError::Io {
             path: path.to_path_buf(),
             source,
@@ -473,11 +463,17 @@ impl MetalExecutor {
                 path: path.to_path_buf(),
                 source,
             })?;
-        file.read_exact(destination)
-            .map_err(|source| InferError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        // SAFETY: buffer partagé neuf, initialisé par Metal, exclusivement
+        // détenu ici et sans commande GPU ; SharedRows borne la vue u8 Pod.
+        unsafe {
+            SharedRows::<u8>::with_mut_slice(&buffer, 0, len_bytes, |destination| {
+                file.read_exact(destination)
+            })?
+        }
+        .map_err(|source| InferError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Ok(buffer)
     }
 
@@ -514,18 +510,18 @@ impl MetalExecutor {
         let packed = new(byte_len_usize::<u32>(packed_len)?)?;
         let scales = new(byte_len_usize::<u16>(affine_len)?)?;
         let biases = new(byte_len_usize::<u16>(affine_len)?)?;
-        // SAFETY: trois buffers distincts, alloués juste au-dessus en
-        // StorageModeShared avec exactement ces longueurs ; leurs pointeurs CPU
-        // sont non nuls et alignés sur la page. Aucun command buffer ne les
-        // référence avant le retour et les tranches ne survivent pas à `fill`.
-        let (packed_slice, scales_slice, biases_slice) = unsafe {
-            (
-                std::slice::from_raw_parts_mut(packed.contents().cast::<u32>(), packed_len),
-                std::slice::from_raw_parts_mut(scales.contents().cast::<u16>(), affine_len),
-                std::slice::from_raw_parts_mut(biases.contents().cast::<u16>(), affine_len),
-            )
-        };
-        fill(packed_slice, scales_slice, biases_slice)?;
+        // SAFETY: trois buffers partagés neufs, initialisés par Metal et
+        // distincts, sans accès GPU ni alias CPU. SharedRows vérifie les
+        // tailles et alignements Pod ; les vues expirent avant le retour.
+        unsafe {
+            SharedRows::<u32>::with_mut_slice(&packed, 0, packed_len, |packed_slice| {
+                SharedRows::<u16>::with_mut_slice(&scales, 0, affine_len, |scales_slice| {
+                    SharedRows::<u16>::with_mut_slice(&biases, 0, affine_len, |biases_slice| {
+                        fill(packed_slice, scales_slice, biases_slice)
+                    })?
+                })?
+            })??;
+        }
         Ok((packed, scales, biases))
     }
 
