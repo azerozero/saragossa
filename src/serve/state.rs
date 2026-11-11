@@ -15,9 +15,8 @@ use saragossa::runtime_flags::{
 };
 use saragossa::{
     qwen_assistant_history_content, render_flint_chat, render_gemma4_chat, render_gemma_chat,
-    render_qwen_chatml, CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage,
-    GenerationOptions, JsonTokenCatalog, JsonTokenConstraint, ModelAssets, RuntimePreset,
-    TokenConstraint,
+    CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage, GenerationOptions,
+    JsonTokenCatalog, JsonTokenConstraint, ModelAssets, RuntimePreset, TokenConstraint,
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
@@ -1212,7 +1211,16 @@ impl LoadedModel {
             render_gemma_chat(&messages, true)
         } else {
             check_thinking(thinking, true)?;
-            render_qwen_chatml(&messages, true, false)
+            saragossa::chat_template::render_qwen_chatml_with_tools(
+                &messages,
+                &request
+                    .active_tools()?
+                    .iter()
+                    .map(|t| t.json.clone())
+                    .collect::<Vec<_>>(),
+                true,
+                false,
+            )
         };
         let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
         Ok(PromptEncoding {

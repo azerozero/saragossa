@@ -1,6 +1,8 @@
 //! Rendu des templates de chat (ChatML Qwen, tours Gemma, flint) du backend Rust pur.
 
 mod python_json;
+mod qwen;
+pub use qwen::render_qwen_chatml_with_tools;
 
 use self::python_json::{JsonObject, JsonValue};
 
@@ -59,41 +61,7 @@ pub fn render_qwen_chatml(
     add_generation_prompt: bool,
     enable_thinking: bool,
 ) -> String {
-    let mut out = String::new();
-    for message in messages {
-        let (role, content) = if message.role == "tool" {
-            (
-                "user",
-                qwen_tool_response(message.content.as_deref().unwrap_or("")),
-            )
-        } else {
-            (
-                message.role.as_str(),
-                message.content.as_deref().unwrap_or("").to_string(),
-            )
-        };
-        out.push_str(QWEN_IM_START);
-        out.push_str(role);
-        out.push('\n');
-        out.push_str(&content);
-        out.push_str(QWEN_IM_END);
-        out.push('\n');
-    }
-    if add_generation_prompt {
-        out.push_str(QWEN_IM_START);
-        out.push_str("assistant\n");
-        if !enable_thinking {
-            out.push_str(QWEN_EMPTY_THINK_BLOCK);
-        }
-    }
-    out
-}
-
-fn qwen_tool_response(content: &str) -> String {
-    if content.contains("<tool_response>") {
-        return content.to_string();
-    }
-    format!("<tool_response>\n{}\n</tool_response>", content.trim())
+    render_qwen_chatml_with_tools(messages, &[], add_generation_prompt, enable_thinking)
 }
 
 /// Rend des messages au format chat Gemma (`<start_of_turn>…<end_of_turn>`).
