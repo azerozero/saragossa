@@ -113,25 +113,25 @@ impl MetalExecutor {
                         None
                     },
                     gate: if *gated {
-                        Some(self.private_f32_buffer(q_len, "resident_attn_gate")?)
+                        Some(self.private_f32_buffer(q_len, PHASE_GATE)?)
                     } else {
                         None
                     },
-                    q: self.private_f32_buffer(q_len, "resident_q")?,
+                    q: self.private_f32_buffer(q_len, PHASE_Q_CONTEXT)?,
                     // NOTE: k, v et k_rope sont dimensionnés sur le morceau et partagés
                     // entre couches ; le KV de chaque couche est recopié dans son
                     // cache pleine longueur (`allocate_prefill_resident_layer_cache`).
                     k: self.private_f32_buffer(kv_len, "resident_k")?,
                     v: self.private_f32_buffer(kv_len, "resident_v_chunk")?,
-                    q_rope: self.private_f32_buffer(q_len, "resident_q_rope")?,
+                    q_rope: self.private_f32_buffer(q_len, PHASE_ROPE_GATED)?,
                     k_rope: self.private_f32_buffer(kv_len, "resident_k_rope_chunk")?,
-                    context: self.private_f32_buffer(q_len, "resident_context")?,
+                    context: self.private_f32_buffer(q_len, PHASE_Q_CONTEXT)?,
                     gated_context: if *gated {
-                        Some(self.private_f32_buffer(q_len, "resident_gated_context")?)
+                        Some(self.private_f32_buffer(q_len, PHASE_ROPE_GATED)?)
                     } else {
                         None
                     },
-                    o: self.private_f32_buffer(hidden_len, "resident_o")?,
+                    o: self.private_f32_buffer(hidden_len, PHASE_OUTPUT)?,
                     sinks: sinks
                         .map(|sinks| self.cached_buffer_from_f32(sinks, "resident_attention_sinks"))
                         .transpose()?,
@@ -139,7 +139,7 @@ impl MetalExecutor {
             }
             PrefillResidentAttentionShape::Linear { .. } => {
                 PrefillResidentAttentionScratch::Linear(PrefillResidentLinearAttentionScratch {
-                    output: self.private_f32_buffer(hidden_len, "resident_linear_o")?,
+                    output: self.private_f32_buffer(hidden_len, PHASE_OUTPUT)?,
                 })
             }
         };
@@ -200,10 +200,10 @@ impl MetalExecutor {
         Ok(PrefillResidentLayerScratch {
             input_norm: self.cached_buffer_from_f32(shape.norm_weight, "resident_input_norm")?,
             post_norm: self.cached_buffer_from_f32(shape.post_norm_weight, "resident_post_norm")?,
-            normed: self.private_f32_buffer(hidden_len, "resident_normed")?,
+            normed: self.private_f32_buffer(hidden_len, PHASE_NORM)?,
             attention,
             attention_state: self.private_f32_buffer(hidden_len, "resident_attention_state")?,
-            post_normed: self.private_f32_buffer(hidden_len, "resident_post_normed")?,
+            post_normed: self.private_f32_buffer(hidden_len, PHASE_NORM)?,
             tail,
         })
     }
@@ -238,7 +238,7 @@ impl MetalExecutor {
             unfused,
             down: self.private_f32_buffer(
                 checked_len(seq, hidden_dim, "resident dense down")?,
-                "resident_dense_down",
+                PHASE_OUTPUT,
             )?,
         })
     }
