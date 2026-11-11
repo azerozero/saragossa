@@ -1138,6 +1138,76 @@ fn qmm2_route_matches_cpu_both_rows() -> Result<()> {
 }
 
 #[test]
+#[ignore = "exige un device Metal ; poids synthétiques sans modèle"]
+fn kernel_profiles_per_model_metal_parity() -> Result<()> {
+    let a = crate::KernelProfile::without_overrides(std::path::Path::new(
+        "models/Qwen3.6-35B-A3B-oQ8",
+    ));
+    let b = crate::KernelProfile::without_overrides(std::path::Path::new(
+        "models/Qwen3.6-35B-A3B-4bit",
+    ));
+    assert_ne!(a, b);
+    // Les deux executors restent vivants pour exercer l'alternance réelle des
+    // dispatches et du format SSM, sans recharger de poids ni modifier l'env.
+    for profiles in [[a, b], [b, a]] {
+        let executors = [
+            MetalExecutor::new_with_kernel_profile(profiles[0])?,
+            MetalExecutor::new_with_kernel_profile(profiles[1])?,
+        ];
+        for index in [0, 1, 0] {
+            let executor = &executors[index];
+            assert_eq!(executor.kernel_profile, profiles[index]);
+            let spec = LinearAttentionStepSpec {
+                num_key_heads: 1,
+                num_value_heads: 1,
+                key_head_dim: 128,
+                value_head_dim: 128,
+                conv_kernel_dim: 4,
+                rms_eps: 1.0e-6,
+                l2_qk_sigmoid_gate: false,
+            };
+            let mut state = None;
+            let conv_dim = 384;
+            let conv_seed = vec![0.0; 3 * conv_dim];
+            let ssm_seed = vec![0.5; 128 * 128];
+            executor.ensure_linear_attention_metal_state(
+                &mut state, &conv_seed, &ssm_seed, conv_dim,
+                conv_seed.len(), ssm_seed.len(), spec,
+            )?;
+            let state = state.expect("invariant: état SSM créé");
+            assert_eq!(state.ssm_bf16, profiles[index].linear_ssm_bf16 && linear_delta_dk128_enabled());
+            let bytes_per_value = if state.ssm_bf16 { 2 } else { 4 };
+            assert_eq!(state.ssm.length() as usize, ssm_seed.len() * bytes_per_value);
+            for group_size in [64, 128] {
+                let weight = test_affine_varied_u8_group(64, 512, group_size)?;
+                let input = Tensor::from_vec(vec![1, 512], varied_row(512, 41))?;
+                let reference = fast_qmv_u8_reference(
+                    executor, &weight, input.data(), 1, "profile_parity",
+                )?;
+                assert!(matches!(
+                    executor.select_owned_affine_matmul_kernel(1, 512, &weight, false),
+                    AffineMatmulKernel::FastQmvU8
+                ));
+                let lhs = executor.upload_f32_buffer(input.data(), "profile_lhs")?;
+                let output = executor.uncached_f32_buffer(64, "profile_output")?;
+                let command_buffer = executor.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                let mut owned = Vec::new();
+                executor.encode_matmul_weight(
+                    encoder, &mut owned, &lhs, 1, 512,
+                    &LinearWeight::AffineQuantized(weight), &output,
+                )?;
+                encoder.end_encoding();
+                commit_and_wait(command_buffer)?;
+                let actual = read_f32_buffer(&output, 64)?;
+                assert_bits_equal(&actual, &reference, "profil modèle contre qmv tg64");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn affine_u8_standalone_matches_fast_qmv_routes() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
@@ -2317,7 +2387,7 @@ fn affine_gather_gate_up_swiglu_fast_u3_gs64_matches_split_bit_exact() -> Result
             test_stacked_affine_varied_u3_group(&executor, experts, out_dim, in_dim, 17)?;
         let (up, _) =
             test_stacked_affine_varied_u3_group(&executor, experts, out_dim, in_dim, 29)?;
-        assert!(can_use_fast_gather_pair_qmv(topk, &gate, &up));
+        assert!(executor.can_use_fast_gather_pair_qmv(topk, &gate, &up));
         let mut lhs = varied_row(in_dim, 31);
         lhs.extend_from_slice(&varied_row(in_dim, 37));
         let lhs_buffer = executor.upload_f32_buffer(&lhs, "gather_gate_up_u3_lhs")?;
@@ -4414,5 +4484,71 @@ fn sample_rows_with_states_match_isolated_and_cpu() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "exige un device Metal ; sans poids de modèle"]
+#[allow(deprecated)]
+fn legacy_public_preset_api_applies_to_executor(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    const CHILD: &str = "SARAGOSSA_TEST_LEGACY_PRESET_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Chaque cas démarre avec un état de processus vierge, sans modifier
+        // l'environnement du processus de test ni les autres tests Metal.
+        for override_name in [
+            None,
+            Some("SARAGOSSA_RUST_OPT_PROFILE"),
+            Some("RETI_RUST_OPT_PROFILE"),
+            Some("SARAGOSSA_RUST_LINEAR_SSM_BF16"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .args([
+                    "metal_backend::tests::legacy_public_preset_api_applies_to_executor",
+                    "--exact",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            for (key, _) in std::env::vars_os() {
+                let name = key.to_string_lossy();
+                if name.starts_with("SARAGOSSA_RUST_") || name.starts_with("RETI_RUST_") {
+                    child.env_remove(key);
+                }
+            }
+            if let Some(name) = override_name {
+                child.env(name, "0");
+            }
+            assert!(child.status()?.success(), "surcharge {override_name:?}");
+        }
+        return Ok(());
+    }
+
+    let model = std::path::Path::new("models/Qwen3.6-35B-A3B-oQ8");
+    let other = std::path::Path::new("models/Qwen3.6-35B-A3B-4bit");
+    let before: Vec<_> = std::env::vars_os().collect();
+    let initial = MetalExecutor::new()?;
+    // L'application doit aussi être visible depuis un autre thread.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = crate::apply_runtime_preset_for_model_dir(model);
+        });
+    });
+    let legacy = MetalExecutor::new()?;
+    let expected = crate::KernelProfile::for_model_dir(model);
+    assert_eq!(legacy.kernel_profile, expected);
+    if !crate::runtime_flags::env_present("SARAGOSSA_RUST_OPT_PROFILE") {
+        assert!(legacy.kernel_profile.qmv_u8_tg128);
+        assert!(legacy.kernel_profile.fused_moe_down_weighted_u8);
+    }
+    let explicit =
+        MetalExecutor::new_with_kernel_profile(crate::KernelProfile::for_model_dir(other))?;
+    assert_eq!(
+        explicit.kernel_profile,
+        crate::KernelProfile::for_model_dir(other)
+    );
+    assert_eq!(initial.kernel_profile, explicit.kernel_profile);
+    assert_eq!(before, std::env::vars_os().collect::<Vec<_>>());
     Ok(())
 }

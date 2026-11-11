@@ -324,7 +324,10 @@ impl MetalExecutor {
         )?;
         profile_dispatch();
         let value_head_dim = checked_nsuint(spec.value_head_dim, "linear-attn seq value dim")?;
-        let tg_rows = linear_delta_tg_rows().min(value_head_dim);
+        let tg_rows = self
+            .kernel_profile
+            .linear_delta_tg_rows(false)
+            .min(value_head_dim);
         encoder.dispatch_threads(
             MTLSize::new(
                 LINEAR_ATTN_TG_WIDTH,
@@ -427,7 +430,10 @@ impl MetalExecutor {
         }
         profile_dispatch();
         let value_head_dim = checked_nsuint(spec.value_head_dim, "linear-attn seq value dim")?;
-        let tg_rows = linear_delta_tg_rows().min(value_head_dim);
+        let tg_rows = self
+            .kernel_profile
+            .linear_delta_tg_rows(false)
+            .min(value_head_dim);
         encoder.dispatch_threads(
             MTLSize::new(
                 LINEAR_ATTN_TG_WIDTH,
@@ -504,7 +510,10 @@ impl MetalExecutor {
         profile_dispatch();
         let value_head_dim =
             checked_nsuint(spec.value_head_dim, "linear-attn scan arbre value dim")?;
-        let tg_rows = linear_delta_tg_rows().min(value_head_dim);
+        let tg_rows = self
+            .kernel_profile
+            .linear_delta_tg_rows(false)
+            .min(value_head_dim);
         encoder.dispatch_threads(
             MTLSize::new(
                 LINEAR_ATTN_TG_WIDTH,
@@ -556,7 +565,10 @@ impl MetalExecutor {
         set_u32_bytes(encoder, 5, rows, "linear_attn_replay_rows")?;
         profile_dispatch();
         let value_head_dim = checked_nsuint(value_head_dim, "linear-attn replay value dim")?;
-        let tg_rows = linear_delta_tg_rows().min(value_head_dim);
+        let tg_rows = self
+            .kernel_profile
+            .linear_delta_tg_rows(false)
+            .min(value_head_dim);
         encoder.dispatch_threads(
             MTLSize::new(
                 LINEAR_ATTN_TG_WIDTH,
@@ -1210,7 +1222,10 @@ impl MetalExecutor {
         profile_dispatch();
         if use_dk128 {
             let value_head_dim = checked_nsuint(spec.value_head_dim, "linear-attn value dim")?;
-            let tg_rows = linear_delta_tg_rows_for_state(ssm_bf16).min(value_head_dim);
+            let tg_rows = self
+                .kernel_profile
+                .linear_delta_tg_rows(ssm_bf16)
+                .min(value_head_dim);
             encoder.dispatch_threads(
                 MTLSize::new(
                     LINEAR_ATTN_TG_WIDTH,
@@ -1261,7 +1276,10 @@ impl MetalExecutor {
             checked_u32(repeat, "linear-attn inv repeat")?,
         ];
         let value_head_dim = checked_nsuint(spec.value_head_dim, "linear-attn inv value dim")?;
-        let tg_rows = linear_delta_tg_rows().min(value_head_dim);
+        let tg_rows = self
+            .kernel_profile
+            .linear_delta_tg_rows(false)
+            .min(value_head_dim);
         encoder.set_compute_pipeline_state(&self.linear_attn_gated_delta_inv_dk128_tg4_f32);
         encoder.set_buffer(0, Some(conv_out_buffer), 0);
         encoder.set_buffer(1, Some(q_inv_buffer), 0);

@@ -729,9 +729,9 @@ impl MetalExecutor {
             checked_u32(packed_cols, "fast u8 packed_cols")?,
             checked_u32(groups, "fast u8 groups")?,
         ];
-        let use_dot4 = qmv_u8_dot4_enabled();
-        let use_tg256 = !use_dot4 && qmv_u8_tg256_enabled();
-        let use_tg128 = !use_dot4 && !use_tg256 && qmv_u8_tg128_enabled();
+        let use_dot4 = self.kernel_profile.qmv_u8_dot4;
+        let use_tg256 = !use_dot4 && self.kernel_profile.qmv_u8_tg256;
+        let use_tg128 = !use_dot4 && !use_tg256 && self.kernel_profile.qmv_u8_tg128;
         let rows_per_threadgroup = if use_tg256 {
             32
         } else if use_tg128 {
@@ -865,8 +865,9 @@ impl MetalExecutor {
             checked_u32(lhs_rows, "lhs_rows")?,
         ];
         if can_use_fast_gather_qmv(lhs_rows, weight) {
-            let use_u8_tg256 = weight.bits == 8 && qmv_u8_tg256_enabled();
-            let use_u8_tg128 = weight.bits == 8 && !use_u8_tg256 && qmv_u8_tg128_enabled();
+            let use_u8_tg256 = weight.bits == 8 && self.kernel_profile.qmv_u8_tg256;
+            let use_u8_tg128 =
+                weight.bits == 8 && !use_u8_tg256 && self.kernel_profile.qmv_u8_tg128;
             let rows_per_threadgroup = if use_u8_tg256 {
                 32
             } else if use_u8_tg128 {

@@ -521,7 +521,6 @@ impl ModelSlot {
                 self.id,
                 self.path.display()
             );
-            let _ = saragossa::apply_runtime_preset_for_model_dir(&self.path);
             let preset = saragossa::runtime_preset_for_model_dir(&self.path);
             let assets = ModelAssets::load_local(&self.path)?;
             let mut decoder = load_decoder_with_runtime(&assets, self.backend)?;
@@ -1450,7 +1449,9 @@ fn load_decoder_with_runtime(
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn load_decoder_metal(assets: &ModelAssets) -> ServeResult<CausalDecoder> {
-    let executor = saragossa::MetalExecutor::new()?;
+    let executor = saragossa::MetalExecutor::new_with_kernel_profile(
+        saragossa::KernelProfile::for_model_dir(&assets.model_dir),
+    )?;
     Ok(saragossa::load_causal_decoder_for_metal(assets, &executor)?
         .with_metal_executor(executor)?)
 }
@@ -1622,6 +1623,23 @@ fn kv_allocations(state: &CausalDecoderPromptState) -> std::collections::HashSet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metal_loader_passes_model_profile_to_executor() {
+        // Inspecter le chemin réel sans créer de device ni charger de poids en CI CPU.
+        let loader = include_str!("state.rs")
+            .split_once("fn load_decoder_metal(assets: &ModelAssets)")
+            .expect("invariant: constructeur Metal présent")
+            .1
+            .split_once("\n}")
+            .expect("invariant: fin du constructeur présente")
+            .0;
+        let compact: String = loader.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains(
+            "saragossa::MetalExecutor::new_with_kernel_profile(saragossa::KernelProfile::for_model_dir(&assets.model_dir)"
+        ));
+        assert!(!compact.contains("MetalExecutor::new()"));
+    }
 
     /// Blocs du cache de préfixe : toujours hors flint ; pour flint, seulement
     /// si le prolongement résident existe, sans quoi le reliquat passerait par

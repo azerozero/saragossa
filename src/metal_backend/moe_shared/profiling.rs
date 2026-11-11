@@ -141,7 +141,8 @@ impl MetalExecutor {
         })?;
 
         let shared_gate_up = profile_moe_segment(self, warmup, iters, |encoder, owned| {
-            if can_fuse_shared_gate_up_buffers(&weights.shared_gate_proj, &weights.shared_up_proj)
+            if self
+                .can_fuse_shared_gate_up_buffers(&weights.shared_gate_proj, &weights.shared_up_proj)
                 && self.encode_gate_up_swiglu_fast_buffers(
                     encoder,
                     &input_buffer,

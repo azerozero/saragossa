@@ -207,6 +207,7 @@ fn affine_biases_offset(weight: &AffineQuantizedTensor) -> Result<NSUInteger> {
 /// Exécute les premiers kernels Metal du backend Rust expérimental.
 #[derive(Debug)]
 pub struct MetalExecutor {
+    kernel_profile: crate::KernelProfile,
     rope_frequencies: rope::RopeFrequencyCache,
     device: Device,
     queue: CommandQueue,

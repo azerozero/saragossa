@@ -509,7 +509,10 @@ impl MetalExecutor {
             )));
         }
         let shared_fused = rows <= crate::runtime_flags::moe_verify_shared_fused_max_rows()
-            && can_fuse_shared_gate_up_buffers(&weights.shared_gate_proj, &weights.shared_up_proj)
+            && self.can_fuse_shared_gate_up_buffers(
+                &weights.shared_gate_proj,
+                &weights.shared_up_proj,
+            )
             && self.encode_gate_up_swiglu_fast_buffers_rows(
                 encoder,
                 input_buffer,

@@ -8,8 +8,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use saragossa::{
-    apply_runtime_preset_for_model_dir, load_causal_decoder_for_metal, GenerationOptions,
-    MetalExecutor, ModelAssets,
+    load_causal_decoder_for_metal, GenerationOptions, KernelProfile, MetalExecutor, ModelAssets,
 };
 
 fn synth_ids(len: usize) -> Vec<usize> {
@@ -55,11 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repeats = parse_positive(args.next(), 3, "repeats")?;
 
     eprintln!("chargement {model_dir} …");
-    if let Some(preset) = apply_runtime_preset_for_model_dir(Path::new(&model_dir)) {
-        eprintln!("preset runtime {} ({})", preset.name, preset.opt_profile);
-    }
+    let profile = KernelProfile::for_model_dir(Path::new(&model_dir));
     let assets = ModelAssets::load_local(&model_dir)?;
-    let executor = MetalExecutor::new()?;
+    let executor = MetalExecutor::new_with_kernel_profile(profile)?;
     let decoder =
         load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
     let options = GenerationOptions {
