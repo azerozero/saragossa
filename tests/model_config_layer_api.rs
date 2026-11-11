@@ -29,10 +29,12 @@ fn public_layer_accessors_keep_loader_semantics() {
     model.partial_rotary_factor = Some(0.5);
     model.rope_full_partial_rotary_factor = Some(0.25);
     model.rope_sliding_partial_rotary_factor = Some(0.75);
+    model.full_attention_interval = Some(2);
     for (index, expected) in [
         (0, (false, true, 4, 2, 3)),
         (1, (true, false, 8, 3, 2)),
         (2, (false, false, 4, 2, 2)),
+        (usize::MAX, (false, false, 4, 2, 2)),
     ] {
         assert_eq!(
             (

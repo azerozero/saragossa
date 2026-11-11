@@ -1,6 +1,6 @@
 use super::resolve::bf16_round;
 use super::types::{ModelConfig, RawModelConfig, RopeScalingConfig};
-use crate::decoder::layer_plan::LoaderLayerPlan;
+use crate::decoder::layer_plan::LoaderLayerFields;
 use crate::{InferError, Result};
 use std::path::Path;
 
@@ -152,7 +152,7 @@ impl ModelConfig {
     /// La classification historique du chargeur dépend de l'étiquette,
     /// sans garde sur la famille du modèle.
     pub fn is_gemma4_full_layer(&self, layer_index: usize) -> bool {
-        LoaderLayerPlan::build(self, layer_index).gemma_full
+        LoaderLayerFields::build(self, layer_index).gemma_full
     }
 
     #[must_use]
@@ -161,25 +161,25 @@ impl ModelConfig {
     /// La classification historique du chargeur dépend de l'étiquette,
     /// sans garde sur la famille du modèle.
     pub fn is_gemma4_sliding_layer(&self, layer_index: usize) -> bool {
-        LoaderLayerPlan::build(self, layer_index).gemma_sliding
+        LoaderLayerFields::build(self, layer_index).gemma_sliding
     }
 
     #[must_use]
     /// Renvoie la dimension de tête effective de la couche.
     pub fn layer_head_dim(&self, layer_index: usize) -> usize {
-        LoaderLayerPlan::build(self, layer_index).head_dim()
+        LoaderLayerFields::build(self, layer_index).head_dim()
     }
 
     #[must_use]
     /// Renvoie le nombre de têtes K/V effectif de la couche.
     pub fn layer_num_key_value_heads(&self, layer_index: usize) -> usize {
-        LoaderLayerPlan::build(self, layer_index).kv_heads
+        LoaderLayerFields::build(self, layer_index).kv_heads
     }
 
     #[must_use]
     /// Renvoie les dimensions RoPE tournées de la couche.
     pub fn layer_rope_dims(&self, layer_index: usize) -> usize {
-        LoaderLayerPlan::build(self, layer_index).rope_dims()
+        LoaderLayerFields::build(self, layer_index).rope_dims()
     }
 
     #[must_use]

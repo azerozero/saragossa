@@ -357,6 +357,14 @@ impl LayerResolver<'_> {
 #[derive(Clone, Copy)]
 pub(crate) struct LoaderLayerPlan {
     pub(crate) full: bool,
+    fields: LoaderLayerFields,
+}
+
+/// Champs communs aux façades publiques et au plan du chargeur.
+/// Leur construction ne calcule ni l'intervalle d'attention ni la division
+/// de repli, pour conserver les accès historiques même hors plage.
+#[derive(Clone, Copy)]
+pub(crate) struct LoaderLayerFields {
     pub(crate) gemma_full: bool,
     pub(crate) gemma_sliding: bool,
     pub(crate) v_shared_with_k: bool,
@@ -386,6 +394,23 @@ impl fmt::Debug for LoaderLayerPlan {
 
 impl LoaderLayerPlan {
     pub(crate) fn build(config: &ModelConfig, index: usize) -> Self {
+        Self {
+            full: config.is_full_attention_layer(index),
+            fields: LoaderLayerFields::build(config, index),
+        }
+    }
+}
+
+impl Deref for LoaderLayerPlan {
+    type Target = LoaderLayerFields;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl LoaderLayerFields {
+    pub(crate) fn build(config: &ModelConfig, index: usize) -> Self {
         let gemma_full = config
             .layer_types
             .get(index)
@@ -395,7 +420,6 @@ impl LoaderLayerPlan {
             .get(index)
             .is_some_and(|kind| kind == "sliding_attention");
         Self {
-            full: config.is_full_attention_layer(index),
             gemma_full,
             gemma_sliding,
             v_shared_with_k: config.attention_k_eq_v && gemma_full,
