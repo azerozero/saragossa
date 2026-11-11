@@ -279,6 +279,7 @@ fn run() -> CliResult<()> {
                 );
             }
         }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         saragossa::metal_backend::dump_commit_components();
         let row = logits.as_row()?;
         println!(
@@ -629,6 +630,7 @@ fn warmup_decoder(
     let warmup_prompt = &prompt_ids[..warmup_len];
     // Le drop doit précéder tout prefill : la première passe construirait sinon
     // les buffers Metal du modèle entier pendant que les payloads CPU résident.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _ = decoder.warmup_and_release_cpu_weights(warmup_prompt)?;
     for _ in 0..passes {
         let _ = decoder.prefill_cache_uncached(warmup_prompt)?;

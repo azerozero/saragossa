@@ -472,7 +472,7 @@ fn range_sha256(file: &File, path: &Path, offset: u64, len: u64) -> Result<Strin
     let mut at = 0_u64;
     while at < len {
         let take = (plan::IO_CHUNK as u64).min(len - at) as usize;
-        std::os::unix::fs::FileExt::read_exact_at(file, &mut buf[..take], offset + at)
+        crate::safetensor::pread_exact(file, &mut buf[..take], offset + at)
             .map_err(|e| io_err(path, e))?;
         sha.update(&buf[..take]);
         at += take as u64;
@@ -811,7 +811,7 @@ fn ngram_file_sha(path: &Path, segments: &[SegmentRecord]) -> Result<(String, Ve
         let mut at = 0_u64;
         while at < segment.len {
             let take = (plan::IO_CHUNK as u64).min(segment.len - at) as usize;
-            std::os::unix::fs::FileExt::read_exact_at(&file, &mut buf[..take], segment.offset + at)
+            crate::safetensor::pread_exact(&file, &mut buf[..take], segment.offset + at)
                 .map_err(|e| io_err(path, e))?;
             sha.update(&buf[..take]);
             whole.update(&buf[..take]);
