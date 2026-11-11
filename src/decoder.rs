@@ -1494,6 +1494,32 @@ pub struct CausalDecoder {
     runtime: DecoderRuntime,
 }
 
+#[cfg(feature = "devtools")]
+impl CausalDecoder {
+    /// Identité diagnostique bornée : config et échantillon de poids, sans chemin.
+    pub(crate) fn kl_reference_identity(&self) -> Result<(usize, String, String)> {
+        use sha2::{Digest, Sha256};
+        let vocab = self
+            .embed_tokens
+            .shape()
+            .first()
+            .copied()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| InferError::Config("vocabulaire KL vide".into()))?;
+        let config = format!(
+            "{:x}",
+            Sha256::digest(format!("{:?}", self.config).as_bytes())
+        );
+        let mut weights = Sha256::new();
+        // Le gather existant fonctionne aussi après libération des poids CPU.
+        let sample = self.embed_scaled(&[0, vocab / 2, vocab - 1])?;
+        for value in sample.data().iter().chain(self.final_norm.data()) {
+            weights.update(value.to_le_bytes());
+        }
+        Ok((vocab, config, format!("{:x}", weights.finalize())))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct PrefixCache {
     entries: Vec<PrefixCacheEntry>,

@@ -538,7 +538,7 @@ impl CausalDecoder {
         self.finalize_logits(&logits)
     }
 
-    pub(super) fn finalize_logits(&self, logits: &Tensor) -> Result<Tensor> {
+    pub(crate) fn finalize_logits(&self, logits: &Tensor) -> Result<Tensor> {
         let mut row = logits.last_row()?.to_vec();
         if let Some(softcap) = self.config.final_logit_softcapping {
             if softcap > 0.0 {
@@ -5349,7 +5349,7 @@ impl CausalDecoder {
     /// couches `capture_layer_ids` (`[kept, n * hidden]`, cf. le drafter DFlash),
     /// bornées à `keep_rows` et accompagnées de leur position absolue de départ.
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn prefill_resident_cache_hidden_and_captures(
+    pub(in crate::decoder) fn prefill_resident_cache_hidden_and_captures(
         &self,
         prompt: &[usize],
         capture_layer_ids: &[usize],
