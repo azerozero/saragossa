@@ -178,7 +178,6 @@ struct ReplModel {
 
 impl ReplModel {
     fn load(model_dir: &Path, args: &RunArgs) -> CliResult<Self> {
-        let _ = saragossa::apply_runtime_preset_for_model_dir(model_dir);
         let preset = saragossa::runtime_preset_for_model_dir(model_dir);
         let assets = ModelAssets::load_local(model_dir)?;
         let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;

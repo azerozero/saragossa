@@ -306,6 +306,10 @@ pub(in crate::decoder) fn take_embedding_weight(
         DecoderTensor::LinearWeight(LinearWeight::Dense(tensor)) => {
             Ok(EmbeddingWeight::Dense(tensor))
         }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        DecoderTensor::LinearWeight(LinearWeight::DenseBf16(tensor)) => {
+            Ok(EmbeddingWeight::DenseBf16(tensor))
+        }
         DecoderTensor::LinearWeight(LinearWeight::AffineQuantized(tensor)) => {
             Ok(EmbeddingWeight::AffineQuantized(tensor))
         }

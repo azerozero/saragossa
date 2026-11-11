@@ -19,6 +19,9 @@ pub struct TtsModel {
     pub(super) codec: TtsCodec,
     pub(super) codec_payload: TtsPayloadSummary,
     pub(super) clone_ctx: Option<TtsCloneContext>,
+    pub(super) voice_design_instruction: String,
+    // Le cache appartient aux poids chargés : aucun état ne survit au modèle.
+    pub(super) prefill_memo: std::sync::Mutex<super::prefill::TtsPrefillMemo>,
 }
 
 pub(super) enum TtsStreamDecodeState {

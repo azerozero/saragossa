@@ -17,7 +17,7 @@ impl TtsModel {
     /// forward échoue.
     pub fn forward_voicedesign_prefix(&self, text: &str) -> Result<TtsForwardOutput> {
         let prepared = self.prepare_voicedesign_inputs(text)?;
-        let (cache, final_state) = self.talker.prefill_cache_from_embeddings(&prepared.input)?;
+        let (cache, final_state) = self.prefill_talker(&prepared.input)?;
         let logits = self.talker.logits_from_final_state(&final_state)?;
         Ok(TtsForwardOutput {
             cache,

@@ -392,6 +392,26 @@ kernel void embed_gather_dense_from_u32_f32(
         recast_bf16 != 0u ? float(bfloat(value)) : value;
 }
 
+kernel void embed_gather_bf16_from_u32_f32(
+    device const bfloat* table [[buffer(0)]],
+    device const uint* token_index [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint2& dims [[buffer(3)]],
+    constant float& embedding_scale [[buffer(4)]],
+    constant uint& recast_bf16 [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint vocab = dims.x;
+    const uint dim = dims.y;
+    const uint token = token_index[gid.y];
+    if (token >= vocab || gid.x >= dim) {
+        return;
+    }
+    const float value = float(table[token * dim + gid.x]) * embedding_scale;
+    out[gid.y * dim + gid.x] =
+        recast_bf16 != 0u ? float(bfloat(value)) : value;
+}
+
 kernel void embed_gather_affine_from_u32_f32(
     device const uint* packed [[buffer(0)]],
     device const bfloat* scales [[buffer(1)]],
@@ -1077,6 +1097,98 @@ kernel void affine_qmv_fast_aligned_u6_gs64_f32(
     acc = simd_sum(acc);
     if (simd_lid == 0u) {
         out[b * out_dim + row] = acc;
+    }
+}
+
+// Porté depuis reti, crates/saragossa/src/kernels.metal (même auteur).
+// QMM u6 gs64 : variante BATCHÉE du qmv u6. Le qmv traite une ligne d'entrée par
+// dispatch, donc un prefill de N lignes relit N fois tous les poids — sur le
+// talker Qwen3-TTS (dense, u6), c'était le poste dominant. Ici chaque thread
+// déquantifie un poids UNE fois et l'applique à toutes les lignes du lot, ce qui
+// amortit la lecture mémoire, de loin le coût dominant.
+//
+// Le lot est plafonné à U6_QMM_MAX_BATCH lignes par dispatch ; l'hôte découpe
+// au-delà. L'ordre d'accumulation est identique au qmv (mêmes colonnes par
+// thread, même simd_sum), donc le résultat est bit-à-bit le même.
+#define U6_QMM_MAX_BATCH 8u
+
+kernel void affine_qmm_batched_u6_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    constant uint& batch [[buffer(6)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint row = tile.y * 2u + simd_gid;
+    if (row >= out_dim) {
+        return;
+    }
+    const uint batch_base = tile.x * U6_QMM_MAX_BATCH;
+    const uint batch_count = min(U6_QMM_MAX_BATCH, batch - batch_base);
+
+    const uint row_base = row * packed_cols;
+    // Accumulateurs en registres NOMMÉS : un tableau indexé dynamiquement partirait
+    // en mémoire locale et annulerait le gain.
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+    const device float* x = lhs + batch_base * in_dim;
+
+    // scale/bias ne changent que tous les 64 éléments ; comme `col` avance de 32,
+    // ils sont constants sur deux itérations. Les recharger à chaque tour ajoutait
+    // deux lectures par poids pour deux flops utiles.
+    const device bfloat* row_scales = scales + row * groups;
+    const device bfloat* row_biases = biases + row * groups;
+    uint cached_group = 0xffffffffu;
+    float scale = 0.0f;
+    float bias = 0.0f;
+
+    for (uint col = simd_lid; col < in_dim; col += 32u) {
+        const uint group = min(col >> 6u, groups - 1u);
+        if (group != cached_group) {
+            cached_group = group;
+            scale = float(row_scales[group]);
+            bias = float(row_biases[group]);
+        }
+        // Déquantification faite UNE fois, réutilisée par toutes les lignes du lot.
+        const uint q = unpack_u6_affine(packed, packed_cols, row_base, col);
+        const float w = (float(q) * scale) + bias;
+        a0 += x[col] * w;
+        if (batch_count > 1u) { a1 += x[in_dim + col] * w; }
+        if (batch_count > 2u) { a2 += x[2u * in_dim + col] * w; }
+        if (batch_count > 3u) { a3 += x[3u * in_dim + col] * w; }
+        if (batch_count > 4u) { a4 += x[4u * in_dim + col] * w; }
+        if (batch_count > 5u) { a5 += x[5u * in_dim + col] * w; }
+        if (batch_count > 6u) { a6 += x[6u * in_dim + col] * w; }
+        if (batch_count > 7u) { a7 += x[7u * in_dim + col] * w; }
+    }
+
+    const float s0 = simd_sum(a0);
+    const float s1 = simd_sum(a1);
+    const float s2 = simd_sum(a2);
+    const float s3 = simd_sum(a3);
+    const float s4 = simd_sum(a4);
+    const float s5 = simd_sum(a5);
+    const float s6 = simd_sum(a6);
+    const float s7 = simd_sum(a7);
+    if (simd_lid == 0u) {
+        device float* o = out + batch_base * out_dim + row;
+        o[0] = s0;
+        if (batch_count > 1u) { o[out_dim] = s1; }
+        if (batch_count > 2u) { o[2u * out_dim] = s2; }
+        if (batch_count > 3u) { o[3u * out_dim] = s3; }
+        if (batch_count > 4u) { o[4u * out_dim] = s4; }
+        if (batch_count > 5u) { o[5u * out_dim] = s5; }
+        if (batch_count > 6u) { o[6u * out_dim] = s6; }
+        if (batch_count > 7u) { o[7u * out_dim] = s7; }
     }
 }
 

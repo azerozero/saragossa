@@ -296,7 +296,7 @@ impl WhisperDecoder {
         let proj = |linear: &Linear| -> Result<WhisperResidentProj> {
             let tensor = match linear.weight() {
                 crate::LinearWeight::Dense(tensor) => tensor,
-                crate::LinearWeight::AffineQuantized(_) => {
+                crate::LinearWeight::AffineQuantized(_) | crate::LinearWeight::DenseBf16(_) => {
                     return Err(InferError::Config(
                         "décodeur résident: projection non dense".to_string(),
                     ));

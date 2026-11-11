@@ -105,8 +105,7 @@ impl TtsModel {
             );
         }
         let prefill_started = Instant::now();
-        let (mut talker_cache, mut final_state) =
-            self.talker.prefill_cache_from_embeddings(&prepared.input)?;
+        let (mut talker_cache, mut final_state) = self.prefill_talker(&prepared.input)?;
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: prefill done elapsed_ms={}",
@@ -391,8 +390,7 @@ impl TtsModel {
             );
         }
         let prefill_started = Instant::now();
-        let (mut talker_cache, mut final_state) =
-            self.talker.prefill_cache_from_embeddings(&prepared.input)?;
+        let (mut talker_cache, mut final_state) = self.prefill_talker(&prepared.input)?;
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: prefill done elapsed_ms={}",

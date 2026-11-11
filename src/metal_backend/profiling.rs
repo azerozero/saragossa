@@ -154,7 +154,21 @@ pub(crate) fn profile_dispatch() {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    // Observe les encodeurs appelés, sans activer le profilage global en test.
+    static TEST_DISPATCH_SHAPES: std::cell::RefCell<Vec<DispatchProfileShape>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(super) fn take_dispatch_shapes_for_test() -> Vec<DispatchProfileShape> {
+    TEST_DISPATCH_SHAPES.with(|shapes| std::mem::take(&mut *shapes.borrow_mut()))
+}
+
 pub(crate) fn profile_dispatch_shape(shape: DispatchProfileShape) {
+    #[cfg(test)]
+    TEST_DISPATCH_SHAPES.with(|shapes| shapes.borrow_mut().push(shape));
     if decode_profile_enabled() && decode_profile_sites_enabled() {
         let shapes = DECODE_PROFILE_DISPATCH_SHAPES.get_or_init(|| Mutex::new(HashMap::new()));
         if let Ok(mut shapes) = shapes.lock() {

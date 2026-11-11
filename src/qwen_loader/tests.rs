@@ -6,6 +6,38 @@ use safetensors::serialize;
 use std::collections::HashMap;
 
 #[test]
+fn prefill_context_limit_survives_decoder_config_resolution() -> Result<()> {
+    for nested in [false, true] {
+        for limit in [None, Some(262_144)] {
+            let mut text = serde_json::json!({
+                "hidden_size": 2,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 10000.0,
+                "vocab_size": 3
+            });
+            if let Some(limit) = limit {
+                text["max_position_embeddings"] = limit.into();
+            }
+            let raw = if nested {
+                serde_json::json!({"model_type": "qwen3_5", "text_config": text})
+            } else {
+                text
+            };
+            let raw: crate::RawModelConfig =
+                serde_json::from_value(raw).expect("invariant: config synthétique valide");
+            let model = raw.resolve()?;
+            let decoder = crate::CausalDecoderConfig::from(&model);
+            assert_eq!(model.max_position_embeddings, limit);
+            assert_eq!(decoder.max_position_embeddings, limit);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn accepts_affine_u2_quantization_config() {
     let quant = QuantConfig {
         group_size: Some(64),
