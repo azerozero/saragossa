@@ -166,7 +166,7 @@ fn codec_streaming_incremental_matches_full_prefix_on_representative_reply() -> 
             .decode_codes_streaming(&mut state, &codes[..target])?;
         streamed.extend_from_slice(&chunk);
         end = target;
-        next = next.saturating_mul(2).max(end + 1);
+        next = next.saturating_add(4);
     }
 
     assert_eq!(streamed.len(), full.len(), "longueur streaming != batch");
