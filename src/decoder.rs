@@ -1570,8 +1570,8 @@ impl PrefixCaptures {
 }
 
 impl PrefixCacheEntry {
-    /// Octets de l'entrée, sans les segments KV déjà dans `seen` (partagés avec
-    /// une autre entrée) ; ajoute les siens.
+    /// Occupation de l'entrée, sans les allocations déjà dans `seen` ; ajoute
+    /// les siennes, même si un consommateur externe les détient aussi.
     fn estimated_bytes_unseen(&self, seen: &mut std::collections::HashSet<usize>) -> u64 {
         let mut bytes = self
             .tokens
@@ -1611,13 +1611,21 @@ impl PrefixCacheEntry {
 }
 
 impl PrefixCache {
-    /// Évince l'entrée la moins récente ; rend les octets réellement libérés,
-    /// sans les segments KV qu'elle partage avec les entrées restantes.
+    /// Évince l'entrée la moins récente ; estime les octets libérables, sans
+    /// les segments KV partagés avec les entrées restantes ni les captures
+    /// encore détenues par une autre entrée ou un consommateur externe.
     fn evict_lru_entry(&mut self) -> Option<u64> {
         let entry = self.entries.pop()?;
         let mut seen = std::collections::HashSet::new();
         for kept in &self.entries {
             kept.estimated_bytes_unseen(&mut seen);
+        }
+        if let Some(captures) = &entry.captures {
+            // Le plafond compte l'allocation partagée, mais la purge ne peut
+            // la libérer tant qu'un autre propriétaire la détient.
+            if Arc::strong_count(&captures.hidden) > 1 {
+                seen.insert(Arc::as_ptr(&captures.hidden) as usize);
+            }
         }
         Some(entry.estimated_bytes_unseen(&mut seen))
     }

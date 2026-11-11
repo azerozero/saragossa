@@ -762,11 +762,11 @@ fn prefix_cache_dflash_shares_captures_until_eviction() -> Result<()> {
     Ok(())
 }
 
-/// Le plafond et l'éviction ne comptent pas deux fois des captures partagées.
+/// Le plafond compte les captures partagées une fois, même avec un consommateur
+/// externe ; l'éviction ne les libère qu'au départ du dernier propriétaire.
 #[test]
 fn prefix_cache_byte_cap_counts_shared_captures_once() -> Result<()> {
     let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
-    let captures = PrefixCaptures::new(&[0], 0, Tensor::zeros(vec![4, 8])?);
     let entry = |captures: Option<PrefixCaptures>| -> Result<PrefixCacheEntry> {
         Ok(PrefixCacheEntry {
             tokens: vec![1, 2, 3, 4],
@@ -779,17 +779,40 @@ fn prefix_cache_byte_cap_counts_shared_captures_once() -> Result<()> {
         })
     };
     let base = entry(None)?.estimated_bytes_unseen(&mut Default::default());
-    let mut cache = PrefixCache {
-        entries: vec![
-            entry(Some(captures.clone()))?,
-            entry(Some(captures.clone()))?,
-        ],
-    };
-    let total = 2 * base + captures.hidden.capacity_bytes() as u64;
-    cache.enforce_byte_cap(total);
-    assert_eq!(cache.entries.len(), 2);
-    assert_eq!(cache.evict_lru_entry(), Some(base));
-    assert_eq!(cache.evict_lru_entry(), Some(total - base));
+    for consumer_alive in [true, false] {
+        let captures = PrefixCaptures::new(&[0], 0, Tensor::zeros(vec![4, 8])?);
+        let allocation = Arc::downgrade(&captures.hidden);
+        let capture_bytes = captures.hidden.capacity_bytes() as u64;
+        let mut cache = PrefixCache {
+            entries: vec![
+                entry(Some(captures.clone()))?,
+                entry(Some(captures.clone()))?,
+            ],
+        };
+        let consumer = consumer_alive.then_some(captures);
+        let total = 2 * base + capture_bytes;
+        let mut seen = Default::default();
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.estimated_bytes_unseen(&mut seen))
+                .sum::<u64>(),
+            total
+        );
+        cache.enforce_byte_cap(total);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.evict_lru_entry(), Some(base));
+        assert!(allocation.upgrade().is_some());
+        assert_eq!(
+            cache.evict_lru_entry(),
+            Some(base + if consumer_alive { 0 } else { capture_bytes })
+        );
+        assert_eq!(allocation.upgrade().is_some(), consumer_alive);
+        assert_eq!(cache.evict_lru_entry(), None);
+        drop(consumer);
+        assert!(allocation.upgrade().is_none());
+    }
     Ok(())
 }
 
