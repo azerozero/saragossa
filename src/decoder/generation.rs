@@ -5349,7 +5349,7 @@ impl CausalDecoder {
     /// couches `capture_layer_ids` (`[kept, n * hidden]`, cf. le drafter DFlash),
     /// bornées à `keep_rows` et accompagnées de leur position absolue de départ.
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn prefill_resident_cache_hidden_and_captures(
+    pub(in crate::decoder) fn prefill_resident_cache_hidden_and_captures(
         &self,
         prompt: &[usize],
         capture_layer_ids: &[usize],

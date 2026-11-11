@@ -3,9 +3,11 @@ use super::types::*;
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 thread_local! {
-    /// Pas encodés par le decode résident complet : prouve en test qu'une
-    /// génération est passée par ce chemin, pas par un repli per-op.
-    /// Par thread : les tests parallèles ne se comptent pas entre eux.
+    // Par thread : les tests parallèles ne se comptent pas entre eux.
+    static REFERENCE_PREFILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFERENCE_INITIAL_PROJECTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Pas encodés par le decode résident complet, sans repli per-op.
     pub(crate) static RESIDENT_DECODE_STEPS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
@@ -87,19 +89,27 @@ impl CausalDecoder {
     }
 
     /// Teacher forcing : prefill de `prompt`, puis logits GPU bruts après
-    /// chaque token de `forced`. Aucun repli du decode résident n'est admis.
-    #[cfg(all(
-        target_os = "macos",
-        feature = "metal",
-        any(test, feature = "devtools")
-    ))]
+    /// chaque token de `forced`. Conserve le prefill historique des oracles ;
+    /// les modes KL utilisent exclusivement `resident_reference_start`.
+    /// Aucun repli du decode résident n'est admis.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
     pub(crate) fn resident_forced_logits(
         &self,
         prompt: &[usize],
         forced: &[usize],
         kv_bf16: bool,
     ) -> Result<Vec<Vec<f32>>> {
-        let (mut cache, _) = self.resident_reference_start(prompt, forced.len(), kv_bf16)?;
+        if !self.supports_resident_full_decode() {
+            return Err(InferError::Config(
+                "decode résident complet indisponible".into(),
+            ));
+        }
+        let (mut cache, _) = self.prefill_cache_state(prompt)?;
+        if !self.setup_resident_full_decode(&mut cache, forced.len(), 0, kv_bf16)? {
+            return Err(InferError::Config(
+                "decode résident complet indisponible".into(),
+            ));
+        }
         forced
             .iter()
             .map(|&token| self.resident_reference_step(&mut cache, token))
@@ -116,6 +126,7 @@ impl CausalDecoder {
         self.resident_forced_logits(prompt, forced, kv_bf16)
     }
 
+    /// Renvoie la dernière ligne du prefill AVANT la norme finale.
     #[cfg(all(
         target_os = "macos",
         feature = "metal",
@@ -132,13 +143,83 @@ impl CausalDecoder {
                 "decode résident complet indisponible".into(),
             ));
         }
-        let (mut cache, state) = self.prefill_cache_state(prompt)?;
+        // Ne consulte pas le cache de préfixe : son état peut provenir du per-op.
+        // `None` signifie ici un refus, jamais une autorisation de repli.
+        let (mut cache, hidden, _) = self
+            .prefill_resident_cache_hidden_and_captures(
+                prompt,
+                &[],
+                usize::MAX,
+                true,
+                crate::runtime_flags::prefill_resident_chunk_tokens(),
+            )?
+            .ok_or_else(|| InferError::Config("prefill résident indisponible pour KL".into()))?;
+        #[cfg(test)]
+        REFERENCE_PREFILLS.with(|count| count.set(count.get() + 1));
+        let state = hidden.into_tensor(self.final_norm.data().len())?;
         if !self.setup_resident_full_decode(&mut cache, steps, 0, kv_bf16)? {
             return Err(InferError::Config(
                 "decode résident complet indisponible".into(),
             ));
         }
         Ok((cache, state))
+    }
+
+    /// Projette la dernière ligne non normée du prefill avec les kernels du
+    /// decode résident, y compris pour Flint dont le runtime per-op est CPU.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    pub(crate) fn resident_reference_initial_logits(
+        &self,
+        cache: &CausalDecoderCache,
+        hidden_state: &Tensor,
+    ) -> Result<Vec<f32>> {
+        let metal = self.resident_metal().ok_or_else(|| {
+            InferError::Config("projection initiale KL sans executor Metal".into())
+        })?;
+        let arena = cache.resident.as_ref().ok_or_else(|| {
+            InferError::Config("projection initiale KL sans arène résidente".into())
+        })?;
+        let hidden = self.final_norm.data().len();
+        arena
+            .state
+            .upload(&arena.hidden_a, hidden_state.as_row()?)?;
+        let normed = arena.state.scratch().lease(hidden, GpuElement::F32)?;
+        let command_buffer = arena.state.queue().new_command_buffer();
+        let _barrier_guard = crate::metal_backend::resident_concurrent_enabled()
+            .then(crate::metal_backend::install_dispatch_barrier_scope);
+        let _namespace_guard =
+            crate::metal_backend::install_scratch_namespace(arena.state.scratch_namespace());
+        let encoder = new_resident_compute_encoder(command_buffer);
+        metal.encode_rms_norm_rows(
+            encoder,
+            arena.hidden_a.buffer(),
+            &arena.final_norm,
+            normed.tensor().buffer(),
+            1,
+            hidden,
+            self.config.rms_eps,
+        )?;
+        let (buffer, len) = metal.encode_lm_head_logits_readback_buffers(
+            encoder,
+            normed.tensor().buffer(),
+            &arena.lm_head,
+            hidden,
+        )?;
+        encoder.end_encoding();
+        crate::metal_backend::commit_nonblocking(command_buffer);
+        crate::metal_backend::wait_for_completion(command_buffer)?;
+        #[cfg(test)]
+        REFERENCE_INITIAL_PROJECTIONS.with(|count| count.set(count.get() + 1));
+        let raw = crate::metal_backend::read_f32_buffer(&buffer, len)?;
+        Ok(self.finalize_logits(&Tensor::row(raw)?)?.data().to_vec())
+    }
+
+    #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+    pub(crate) fn resident_reference_counts_for_test(&self) -> (usize, usize) {
+        (
+            REFERENCE_PREFILLS.with(std::cell::Cell::get),
+            REFERENCE_INITIAL_PROJECTIONS.with(std::cell::Cell::get),
+        )
     }
 
     #[cfg(all(

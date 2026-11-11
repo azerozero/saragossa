@@ -111,8 +111,8 @@ fn read_metadata(path: &Path, vocab: usize) -> Result<Metadata> {
 
 /// Enregistre exactement n tokens greedy (EOS compris) dans PATH/ref.{bin,json}.
 /// Les distributions prédisent forced_ids[i] après prompt + forced_ids[..i].
-/// Aucun sampling, aucun repli du decode résident, aucun logit de prefill
-/// conservé en dehors de sa dernière position.
+/// Aucun sampling ni repli du prefill, de la projection ou du decode résident.
+/// Aucun logit de prefill conservé en dehors de sa dernière position.
 pub fn record(
     model: &CausalDecoder,
     prompt_ids: &[usize],
@@ -172,7 +172,7 @@ pub fn compare(model: &CausalDecoder, path: &Path) -> Result<Metrics> {
         ..Metrics::default()
     };
     for ((reference, current), &token) in reference.iter().zip(&current).zip(&meta.forced_ids) {
-        metrics.add(reference, &log_softmax(current)?, token)?;
+        metrics.add(reference, current, token)?;
     }
     metrics.kl_mean /= meta.n as f64;
     metrics.top1_agreement /= meta.n as f64;
@@ -261,7 +261,10 @@ impl Metrics {
             return Err(invalid("distributions incompatibles"));
         }
         let p = normalize(reference)?;
-        let q = normalize(current)?;
+        // Le fichier conserve le token greedy de référence, avant tout arrondi.
+        // L'argmax candidat doit lui aussi précéder le log-softmax f32.
+        let current_top1 = top1(current);
+        let q = normalize(&log_softmax(current)?)?;
         let kl = p
             .iter()
             .zip(&q)
@@ -270,7 +273,7 @@ impl Metrics {
             .max(0.0);
         self.kl_mean += kl;
         self.kl_max = self.kl_max.max(kl);
-        self.top1_agreement += f64::from(top1(reference) == top1(current));
+        self.top1_agreement += f64::from(token == current_top1);
         let delta = q[token].exp() - p[token].exp();
         self.forced_delta_p_mean += delta;
         self.forced_abs_delta_p_mean += delta.abs();
@@ -291,7 +294,7 @@ fn record_rows(
     n: usize,
 ) -> Result<(Vec<usize>, Vec<Vec<f32>>)> {
     let (mut cache, state) = model.resident_reference_start(prompt, n, false)?;
-    let mut logits = model.logits_from_final_state(&state)?.data().to_vec();
+    let mut logits = model.resident_reference_initial_logits(&cache, &state)?;
     let mut ids = Vec::with_capacity(n);
     let mut rows = Vec::with_capacity(n);
     for step in 0..n {
@@ -314,16 +317,13 @@ fn record_rows(
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compare_rows(model: &CausalDecoder, meta: &Metadata) -> Result<Vec<Vec<f32>>> {
-    // La première distribution vient uniquement de la queue du prefill.
-    // Le helper teacher forcing refait le prefill pour posséder son propre cache.
-    let (_, state) = model.resident_reference_start(&meta.prompt_ids, meta.n, false)?;
-    let mut rows = vec![model.logits_from_final_state(&state)?.data().to_vec()];
-    let raw =
-        model.resident_forced_logits(&meta.prompt_ids, &meta.forced_ids[..meta.n - 1], false)?;
-    for row in raw {
+    let (mut cache, state) = model.resident_reference_start(&meta.prompt_ids, meta.n, false)?;
+    let mut rows = vec![model.resident_reference_initial_logits(&cache, &state)?];
+    for &token in &meta.forced_ids[..meta.n - 1] {
+        let raw = model.resident_reference_step(&mut cache, token)?;
         rows.push(
             model
-                .finalize_logits(&crate::Tensor::row(row)?)?
+                .finalize_logits(&crate::Tensor::row(raw)?)?
                 .data()
                 .to_vec(),
         );
@@ -365,6 +365,23 @@ mod tests {
         diff.add(&p, &q, 1).expect("invariant: écart opposé");
         assert!(diff.forced_delta_p_mean.abs() < 1e-7);
         assert!((diff.forced_abs_delta_p_mean / 2.0 - 0.5).abs() < 1e-7);
+    }
+
+    #[test]
+    fn metrics_top1_precedes_log_softmax_rounding() {
+        let reference = [0.0, 1e-8];
+        let current = [1e-8, 0.0];
+        let stored = log_softmax(&reference).expect("invariant: référence");
+        assert_eq!(stored, log_softmax(&current).expect("invariant: candidat"));
+        let mut different = Metrics::default();
+        different
+            .add(&stored, &current, top1(&reference))
+            .expect("invariant: métriques");
+        assert_eq!(different.top1_agreement, 0.0);
+        let mut same = Metrics::default();
+        same.add(&stored, &reference, top1(&reference))
+            .expect("invariant: métriques");
+        assert_eq!(same.top1_agreement, 1.0);
     }
 
     #[test]
