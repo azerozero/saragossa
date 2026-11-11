@@ -22,6 +22,34 @@ const PARTS: usize = 12;
 const NGRAM_WIDTH: usize = 32;
 const REVISION: &str = "0000000000000000000000000000000000000000";
 
+#[test]
+fn atomic_write_creates_and_replaces_metadata() {
+    let dir = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let path = dir.path().join("journal.json");
+    for bytes in [b"long initial content".as_slice(), b"{}".as_slice()] {
+        super::write_atomic(&path, bytes).expect("invariant: écriture atomique");
+        assert_eq!(
+            std::fs::read(&path).expect("invariant: journal lisible"),
+            bytes
+        );
+        assert!(!path.with_extension("tmp-write").exists());
+    }
+}
+
+#[test]
+fn atomic_write_reports_rename_failure() {
+    let dir = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let path = dir.path().join("occupied");
+    std::fs::create_dir(&path).expect("invariant: destination occupée");
+    let sentinel = path.join("sentinel");
+    std::fs::write(&sentinel, b"original").expect("invariant: sentinelle");
+    assert!(super::write_atomic(&path, b"replacement").is_err());
+    assert_eq!(
+        std::fs::read(sentinel).expect("invariant: sentinelle préservée"),
+        b"original"
+    );
+}
+
 /// Altération d'une source synthétique.
 type Mutation = Box<dyn Fn(&mut BTreeMap<String, Raw>)>;
 

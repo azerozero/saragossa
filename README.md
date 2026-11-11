@@ -39,6 +39,11 @@ with a warning because no process footprint probe is available. CPU BF16
 weights use the existing f32 fallback, which needs more memory than compact
 Metal storage.
 
+The checkpoint converter flushes output files before renaming them. On Unix,
+it also synchronizes the parent directory. On Windows, directory synchronization
+is unavailable through the standard library: file contents are flushed, but
+the rename is not guaranteed to survive a power loss.
+
 ## Where it fits
 
 Among inference backends (Ollama, llama.cpp, vLLM, SGLang…), saragossa occupies
