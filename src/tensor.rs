@@ -80,6 +80,11 @@ impl Tensor {
         self.data.len()
     }
 
+    /// Octets retenus par les données, y compris la capacité inutilisée.
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.data.capacity() * size_of::<f32>()
+    }
+
     #[must_use]
     /// Indique si le tenseur ne contient aucun élément.
     pub fn is_empty(&self) -> bool {

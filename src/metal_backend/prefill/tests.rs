@@ -1,5 +1,27 @@
 use super::*;
 
+#[test]
+fn prefill_kv_reserve_bounds_growth_without_trimming_hint() {
+    for (seq, hint, ctx, expected) in [
+        (261_200, 512, Some(262_144), 944),
+        (262_144, 512, Some(262_144), 512),
+        (270_000, 512, Some(262_144), 512),
+        (1024, 1000, Some(262_144), 1128),
+        (261_200, 4096, Some(262_144), 4096),
+        (262_144, 0, Some(262_144), 256),
+        (261_200, 512, None, 33_162),
+        (1024, 0, None, 384),
+        (usize::MAX, 512, Some(262_144), 512),
+        (1024, usize::MAX, None, usize::MAX),
+    ] {
+        assert_eq!(
+            resident::prefill_kv_fresh_reserve(seq, hint, ctx),
+            expected,
+            "seq={seq}, hint={hint}, ctx={ctx:?}"
+        );
+    }
+}
+
 fn test_executor() -> Result<Option<MetalExecutor>> {
     match MetalExecutor::new() {
         Ok(executor) => Ok(Some(executor)),
@@ -864,6 +886,7 @@ fn prefill_resident_uses_layer_specific_attention_dimensions() -> Result<()> {
         PrefillInput::Hidden(&input),
         &layers,
         base,
+        None,
         &[0, 1],
         usize::MAX,
         0,
@@ -1266,6 +1289,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     PrefillInput::Hidden(&embedded),
                     &layers,
                     spec,
+                    None,
                     &[0],
                     usize::MAX,
                     chunk_tokens,
@@ -1276,6 +1300,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     tokens(&ids),
                     &layers,
                     spec,
+                    None,
                     &[0],
                     usize::MAX,
                     chunk_tokens,
@@ -1340,6 +1365,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 input,
                 &layers,
                 spec,
+                None,
                 &[],
                 usize::MAX,
                 // Suffixe de 400 lignes en quatre morceaux décalés.
@@ -1364,6 +1390,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             PrefillInput::Hidden(&input),
             &layers,
             spec,
+            None,
             &[0],
             usize::MAX,
             0,
@@ -1375,6 +1402,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             PrefillInput::Hidden(&input),
             &layers,
             spec,
+            None,
             &[0],
             usize::MAX,
             512,
@@ -1386,6 +1414,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
         PrefillInput::Hidden(&input),
         &layers,
         spec,
+        None,
         &[0],
         usize::MAX,
         512,
@@ -1403,6 +1432,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 PrefillInput::Hidden(&input),
                 &layers,
                 spec,
+                None,
                 &[0],
                 usize::MAX,
                 512,
@@ -1413,6 +1443,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 PrefillInput::Hidden(&input),
                 &layers,
                 spec,
+                None,
                 &[0],
                 usize::MAX,
                 512,
@@ -1449,6 +1480,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                     PrefillInput::Hidden(&input),
                     &layers,
                     spec,
+                    None,
                     &[0],
                     usize::MAX,
                     512,
@@ -1488,6 +1520,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                         PrefillInput::Hidden(&input),
                         &layers,
                         spec,
+                        None,
                         &[],
                         usize::MAX,
                         512,
@@ -1510,6 +1543,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
             PrefillInput::Hidden(&input),
             &layers,
             spec,
+            None,
             &[0],
             usize::MAX,
             512,
@@ -1645,6 +1679,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 PrefillInput::Hidden(&rows_of(&input, 0, prefix_rows, HIDDEN)?),
                 &make_layers(prefix_spec),
                 prefix_spec,
+                None,
                 &[],
                 usize::MAX,
                 512,
@@ -1696,6 +1731,7 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
                 PrefillInput::Hidden(&rows_of(&input, prefix_rows, SEQ, HIDDEN)?),
                 &layers,
                 spec,
+                None,
                 &[],
                 usize::MAX,
                 512,
@@ -2051,6 +2087,7 @@ fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
                 PrefillInput::Hidden(&rows(&input, 0, seq)?),
                 &layers_of(seq),
                 spec_of(seq),
+                None,
                 &[],
                 usize::MAX,
                 512,
@@ -2090,6 +2127,7 @@ fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
             PrefillInput::Hidden(&rows(source, from, to)?),
             &layers_of(to),
             spec_of(to),
+            None,
             &[],
             usize::MAX,
             512,
@@ -2324,6 +2362,7 @@ fn prefill_resident_capture_tail_matches_full() -> Result<()> {
                     PrefillInput::Hidden(&prefix_input),
                     &make_layers(prefix_spec),
                     prefix_spec,
+                    None,
                     &[],
                     usize::MAX,
                     CHUNK,
@@ -2359,6 +2398,7 @@ fn prefill_resident_capture_tail_matches_full() -> Result<()> {
                 PrefillInput::Hidden(&suffix),
                 &layers,
                 spec,
+                None,
                 &[1, 0],
                 keep,
                 CHUNK,

@@ -92,6 +92,142 @@ fn dflash_acceptance_matches_autoregressive_greedy() {
 }
 
 #[test]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
+fn dflash_decoder_entry_point_preserves_shared_storage(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    const CHILD: &str = "SARAGOSSA_TEST_DFLASH_STORAGE_CHILD";
+    if let Ok(single_copy) = std::env::var(CHILD) {
+        let target: crate::ModelConfig = serde_json::from_str(&std::fs::read_to_string(
+            PathBuf::from(std::env::var("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")?).join("config.json"),
+        )?)?;
+        let weights = test_weights()
+            .into_iter()
+            .map(|(key, tensor)| {
+                let shape: Vec<_> = tensor
+                    .shape()
+                    .iter()
+                    .map(|&n| if n == 2 { 64 } else { n })
+                    .collect();
+                Ok((key, Tensor::zeros(shape)?))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        // Passer par l'entrée publique rend observable un retour au chargeur CPU,
+        // même si les tests unitaires de DraftWeights continuent à réussir.
+        let decoder = CausalDecoder::from_tensors(weights, CausalDecoderConfig::default())?
+            .with_metal_runtime()?
+            .with_dflash_draft_from_env(&target)?;
+        let draft = decoder
+            .dflash_draft()
+            .ok_or("drafter demandé par l'environnement absent")?;
+        assert_eq!(draft.layers.len(), 1);
+        let layer = &draft.layers[0];
+        let (gate, up, down) = layer.mlp.projections();
+        for linear in [
+            &draft.fc,
+            &layer.attention.q_proj,
+            &layer.attention.k_proj,
+            &layer.attention.v_proj,
+            &layer.attention.o_proj,
+            gate,
+            up,
+            down,
+        ] {
+            let LinearWeight::AffineQuantized(weight) = linear.weight() else {
+                return Err("la quantification par défaut doit rester u4 gs64".into());
+            };
+            assert_eq!(weight.bits(), 4);
+            assert_eq!(weight.group_size(), 64);
+            let clone = weight.clone();
+            for (view, cloned) in [
+                (weight.packed_metal_view(), clone.packed_metal_view()),
+                (weight.scales_metal_view(), clone.scales_metal_view()),
+                (weight.biases_metal_view(), clone.biases_metal_view()),
+            ] {
+                assert_eq!(view.is_some(), single_copy == "1");
+                if let Some((buffer, offset)) = view {
+                    assert_eq!(buffer.storage_mode(), metal::MTLStorageMode::Shared);
+                    assert_eq!(
+                        Some((buffer.contents(), offset)),
+                        cloned.map(|(b, o)| (b.contents(), o))
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{
+        "architectures":["DFlashDraftModel"],
+        "hidden_size":64, "num_hidden_layers":1, "num_target_layers":1,
+        "intermediate_size":64, "num_attention_heads":1, "num_key_value_heads":1,
+        "head_dim":64, "rms_norm_eps":0.000001, "rope_theta":10000.0, "vocab_size":3,
+        "dflash_config":{"block_size":2,"mask_token_id":2,"target_layer_ids":[0]}
+    }"#,
+    )?;
+    let mut tensors = HashMap::new();
+    for key in [
+        "hidden_norm",
+        "norm",
+        "layers.0.input_layernorm",
+        "layers.0.post_attention_layernorm",
+        "layers.0.self_attn.q_norm",
+        "layers.0.self_attn.k_norm",
+    ] {
+        tensors.insert(
+            format!("{key}.weight"),
+            Tensor::from_vec(vec![64], vec![1.0; 64])?,
+        );
+    }
+    for key in [
+        "fc",
+        "layers.0.self_attn.q_proj",
+        "layers.0.self_attn.k_proj",
+        "layers.0.self_attn.v_proj",
+        "layers.0.self_attn.o_proj",
+        "layers.0.mlp.gate_proj",
+        "layers.0.mlp.up_proj",
+        "layers.0.mlp.down_proj",
+    ] {
+        tensors.insert(
+            format!("{key}.weight"),
+            Tensor::from_vec(
+                vec![64, 64],
+                (0..4096)
+                    .map(|i| ((i * 73 % 257) as f32 - 128.0) / 64.0)
+                    .collect(),
+            )?,
+        );
+    }
+    std::fs::write(
+        dir.path().join("model.safetensors"),
+        serialize(tensor_views(tensors), None)?,
+    )?;
+    // Le flag single-copy est figé par OnceLock : chaque variante doit démarrer
+    // dans un processus neuf, sans modifier l'environnement des autres tests.
+    for single_copy in ["1", "0"] {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "decoder::tests::dflash_decoder_entry_point_preserves_shared_storage",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD, single_copy)
+            .env("RETI_RUST_SINGLE_COPY_WEIGHTS", single_copy)
+            .env("SARAGOSSA_RUST_DFLASH_DRAFT_DIR", dir.path())
+            .env_remove("SARAGOSSA_RUST_DFLASH_QUANT_BITS")
+            .env_remove("RETI_RUST_DFLASH_QUANT_BITS")
+            .status()?;
+        assert!(status.success(), "single-copy={single_copy}: {status}");
+    }
+    Ok(())
+}
+
+#[test]
 fn causal_decoder_supports_grouped_query_attention() {
     let config = CausalDecoderConfig {
         rope_theta: None,

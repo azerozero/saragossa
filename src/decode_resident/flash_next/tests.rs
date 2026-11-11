@@ -5055,6 +5055,7 @@ fn distinct_weights(
                 LinearWeight::Dense(t) => {
                     LinearWeight::Dense(Tensor::from_vec(t.shape().to_vec(), t.data().to_vec())?)
                 }
+                LinearWeight::DenseBf16(t) => LinearWeight::Dense(t.to_tensor()?),
                 LinearWeight::AffineQuantized(q) => {
                     LinearWeight::AffineQuantized(AffineQuantizedTensor::new(
                         q.packed_shape(),
@@ -5073,7 +5074,8 @@ fn distinct_weights(
         .map(|l| executor.resolve_linear_weight_buffers(l, "flash_next_profile"))
         .collect::<Result<Vec<_>>>()?;
     let address = |w: &MetalLinearWeightBuffers| match w {
-        MetalLinearWeightBuffers::Dense { rhs, .. } => rhs.gpu_address(),
+        MetalLinearWeightBuffers::DenseBf16 { rhs, .. }
+        | MetalLinearWeightBuffers::Dense { rhs, .. } => rhs.gpu_address(),
         MetalLinearWeightBuffers::AffineQuantized { packed, .. } => packed.gpu_address(),
     };
     let distinct: std::collections::HashSet<u64> = weights.iter().map(address).collect();

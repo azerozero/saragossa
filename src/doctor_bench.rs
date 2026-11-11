@@ -140,7 +140,6 @@ pub(crate) fn run_doctor(args: impl IntoIterator<Item = String>) -> CliResult<()
 pub(crate) fn run_bench(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     let args = BenchArgs::parse(args)?;
     if let Some(preset) = saragossa::runtime_preset_for_model_dir(&args.model_dir) {
-        let _ = saragossa::apply_runtime_preset_for_model_dir(&args.model_dir);
         if args.format == OutputFormat::Markdown {
             eprintln!(
                 "bench preset model={} sampling_top_k={} sampling_top_p={:.2}",

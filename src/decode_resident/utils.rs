@@ -1,6 +1,7 @@
 //! Helpers CPU pour les buffers résidents partagés.
 
 use super::*;
+use crate::metal_backend::SharedRows;
 use crate::runtime_flags::{env_flag, env_flag_value};
 use rayon::prelude::*;
 
@@ -40,18 +41,12 @@ pub(super) fn write_f32_at(tensor: &GpuTensor, offset: usize, data: &[f32]) -> R
     if data.is_empty() {
         return Ok(());
     }
-    let ptr = tensor.buffer().contents().cast::<f32>();
-    if ptr.is_null() {
-        return Err(InferError::Metal(
-            "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
-        ));
-    }
-    // SAFETY: buffer en StorageModeShared, écriture de `data.len()` f32 à partir
-    // de l'élément `offset` ; `offset + data.len() <= tensor.len()` vérifié →
-    // `ptr.add(offset)` est dans les bornes, copie sans chevauchement, avant tout
-    // commit du command buffer qui lira ce buffer.
+    // SAFETY: plage partagée initialisée, exclusive avant commit et distincte
+    // de `data` ; SharedRows vérifie taille et alignement des éléments Pod.
     unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
+        SharedRows::<f32>::with_mut_slice(tensor.buffer(), offset, data.len(), |out| {
+            out.copy_from_slice(data);
+        })?;
     }
     #[cfg(feature = "devtools")]
     crate::runtime_flags::pairwise::record_io(true, std::mem::size_of_val(data));
@@ -84,31 +79,19 @@ pub(super) fn read_f32_at(tensor: &GpuTensor, offset: usize, count: usize) -> Re
     if count == 0 {
         return Ok(Vec::new());
     }
-    let contents = tensor.buffer().contents();
-    if contents.is_null() {
-        return Err(InferError::Metal(
-            "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
-        ));
-    }
     let mut out = vec![0.0_f32; count];
     match tensor.element() {
         GpuElement::F32 => {
-            // SAFETY: buffer en StorageModeShared dont le command buffer a terminé ;
-            // `offset + count <= tensor.len()` vérifié → `ptr.add(offset)` est dans
-            // les bornes, copie de `count` f32 sans chevauchement vers `out`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    contents.cast::<f32>().add(offset),
-                    out.as_mut_ptr(),
-                    count,
-                );
-            }
+            // SAFETY: écritures GPU terminées, plage initialisée et figée
+            // pendant la copie ; SharedRows vérifie bornes et alignement Pod.
+            let source = unsafe { SharedRows::<f32>::borrow(tensor.buffer(), offset, count)? };
+            out.copy_from_slice(source);
         }
         GpuElement::Bf16 => {
-            let ptr = contents.cast::<u16>();
-            for (index, value) in out.iter_mut().enumerate() {
-                // SAFETY: mêmes bornes que ci-dessus, lecture d'un u16 par élément.
-                let bits = unsafe { ptr.add(offset + index).read() };
+            // SAFETY: mêmes garanties de durée de vie que le cas f32, avec
+            // des bits bf16 Pod dont SharedRows vérifie taille et alignement.
+            let source = unsafe { SharedRows::<u16>::borrow(tensor.buffer(), offset, count)? };
+            for (value, &bits) in out.iter_mut().zip(source) {
                 *value = f32::from_bits(u32::from(bits) << 16);
             }
         }
@@ -163,19 +146,21 @@ pub(super) fn write_f32_as_bf16_at(tensor: &GpuTensor, offset: usize, data: &[f3
     if data.is_empty() {
         return Ok(());
     }
-    let ptr = tensor.buffer().contents().cast::<u16>();
-    if ptr.is_null() {
-        return Err(InferError::Metal(
-            "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
-        ));
+    // SAFETY: plage bf16 partagée initialisée, exclusive avant commit ;
+    // SharedRows vérifie taille et alignement, le callback finit avant le GPU.
+    unsafe {
+        SharedRows::<u16>::with_mut_slice(tensor.buffer(), offset, data.len(), |out| {
+            write_bf16_bits(out, data);
+        })?;
     }
-    // SAFETY: buffer en StorageModeShared, tranche de `data.len()` u16 à partir
-    // de l'élément `offset` ; les bornes sont vérifiées plus haut, aucun autre
-    // accès CPU ne vise ce buffer pendant l'écriture, qui précède le command
-    // buffer lisant le KV résident.
-    let out = unsafe { std::slice::from_raw_parts_mut(ptr.add(offset), data.len()) };
-    // Conversion indépendante par élément : parallèle par blocs (semis du KV
-    // bf16 d'un prompt de 32k : 210 -> 162 ms).
+    #[cfg(feature = "devtools")]
+    crate::runtime_flags::pairwise::record_io(true, data.len() * 2);
+    Ok(())
+}
+
+// Conversion indépendante par élément : les blocs parallèles conservent le
+// débit du semis KV sans allouer de copie intermédiaire.
+fn write_bf16_bits(out: &mut [u16], data: &[f32]) {
     out.par_chunks_mut(PARALLEL_COPY_CHUNK)
         .zip(data.par_chunks(PARALLEL_COPY_CHUNK))
         .for_each(|(out, data)| {
@@ -183,9 +168,6 @@ pub(super) fn write_f32_as_bf16_at(tensor: &GpuTensor, offset: usize, data: &[f3
                 *out = f32_to_bf16_bits(*value);
             }
         });
-    #[cfg(feature = "devtools")]
-    crate::runtime_flags::pairwise::record_io(true, data.len() * 2);
-    Ok(())
 }
 
 /// Écrit `data` dans le buffer u32 `tensor` à partir de l'élément `offset`.
@@ -217,16 +199,12 @@ pub(super) fn write_u32_at(tensor: &GpuTensor, offset: usize, data: &[u32]) -> R
     if data.is_empty() {
         return Ok(());
     }
-    let ptr = tensor.buffer().contents().cast::<u32>();
-    if ptr.is_null() {
-        return Err(InferError::Metal(
-            "MTLBuffer StorageModeShared sans pointeur CPU".to_string(),
-        ));
-    }
-    // SAFETY: buffer en StorageModeShared, écriture de `data.len()` u32 à partir
-    // de l'élément `offset` ; `offset + data.len() <= tensor.len()` vérifié.
+    // SAFETY: plage partagée initialisée, exclusive avant commit et distincte
+    // de `data` ; SharedRows vérifie taille et alignement des éléments Pod.
     unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
+        SharedRows::<u32>::with_mut_slice(tensor.buffer(), offset, data.len(), |out| {
+            out.copy_from_slice(data);
+        })?;
     }
     #[cfg(feature = "devtools")]
     crate::runtime_flags::pairwise::record_io(true, std::mem::size_of_val(data));
@@ -561,5 +539,85 @@ mod kv_bf16_resolution_tests {
         assert!(kv_quant_refusal(16, 0, 128, true, true).is_some());
         assert!(kv_quant_refusal(16, 2, 256, false, true).is_some());
         assert!(kv_quant_refusal(16, 2, 256, true, false).is_some());
+    }
+}
+
+#[cfg(test)]
+mod shared_rows_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "nécessite un device Metal"]
+    fn resident_accesses_preserve_values_and_logical_bounds() -> Result<()> {
+        let device = Device::system_default()
+            .ok_or_else(|| InferError::Metal("device Metal absent".to_string()))?;
+        let tensor = |element| {
+            GpuTensor::adopt(
+                device.new_buffer(64, MTLResourceOptions::StorageModeShared),
+                8,
+                element,
+            )
+        };
+        let f32_tensor = tensor(GpuElement::F32)?;
+        let bits = [0x8000_0000, 0x7fc0_0123, 0x3f81_8000];
+        write_f32_at(&f32_tensor, 2, &bits.map(f32::from_bits))?;
+        assert_eq!(
+            read_f32_at(&f32_tensor, 2, 3)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            bits
+        );
+        let bf16_tensor = tensor(GpuElement::Bf16)?;
+        write_f32_as_bf16_at(&bf16_tensor, 1, &bits.map(f32::from_bits))?;
+        assert_eq!(
+            read_f32_at(&bf16_tensor, 1, 3)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            [0x8000_0000, 0x7fc0_0000, 0x3f82_0000]
+        );
+        let u32_tensor = tensor(GpuElement::U32)?;
+        write_u32_at(&u32_tensor, 2, &bits)?;
+        assert_eq!(
+            crate::metal_backend::read_u32_buffer(u32_tensor.buffer(), 5)?[2..],
+            bits
+        );
+        assert!(write_f32_at(&bf16_tensor, 0, &[1.0]).is_err());
+        assert!(write_f32_as_bf16_at(&f32_tensor, 0, &[1.0]).is_err());
+        assert!(write_u32_at(&f32_tensor, 0, &[1]).is_err());
+        assert!(read_f32_at(&u32_tensor, 0, 1).is_err());
+        assert!(read_f32_at(&tensor(GpuElement::U8)?, 0, 1).is_err());
+        assert!(write_f32_at(&f32_tensor, 8, &[1.0]).is_err());
+        assert!(write_f32_as_bf16_at(&bf16_tensor, 8, &[1.0]).is_err());
+        assert!(write_u32_at(&u32_tensor, 8, &[1]).is_err());
+        assert!(read_f32_at(&f32_tensor, 8, 1).is_err());
+        assert!(read_f32_at(&f32_tensor, usize::MAX, 1).is_err());
+        write_f32_at(&f32_tensor, 8, &[])?;
+        assert!(read_f32_at(&f32_tensor, 8, 0)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_conversion_preserves_exact_bits_across_chunks() {
+        // Zéros signés, égalités RNE paires/impaires, infinis et payload NaN.
+        let inputs = [
+            0,
+            0x8000_0000,
+            0x3f80_8000,
+            0x3f81_8000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_1234,
+        ];
+        let expected = [0, 0x8000, 0x3f80, 0x3f82, 0x7f80, 0xff80, 0x7fc0];
+        let data: Vec<f32> = (0..PARALLEL_COPY_CHUNK + 17)
+            .map(|i| f32::from_bits(inputs[i % inputs.len()]))
+            .collect();
+        let mut out = vec![0xffff; data.len()];
+        write_bf16_bits(&mut out, &data);
+        for (i, bits) in out.into_iter().enumerate() {
+            assert_eq!(bits, expected[i % expected.len()], "élément {i}");
+        }
     }
 }

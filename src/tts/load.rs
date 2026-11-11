@@ -350,6 +350,8 @@ impl TtsModel {
             codec,
             codec_payload,
             clone_ctx: None,
+            voice_design_instruction: super::DEFAULT_INSTRUCT.to_owned(),
+            prefill_memo: Default::default(),
         })
     }
 

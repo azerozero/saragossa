@@ -1,8 +1,8 @@
 //! Barrières, fins d'encodage et synchronisation des command buffers Metal.
 
-use super::flags::profile_env_flag;
 use super::profiling::{DECODE_PROFILE_CB, DECODE_PROFILE_WAIT_NS};
 use super::*;
+use crate::runtime_flags::env_flag;
 
 thread_local! {
     static DISPATCH_BARRIER_SCOPE: Cell<bool> = const { Cell::new(false) };
@@ -133,7 +133,7 @@ pub(crate) fn post_dispatch_barrier_buffers(
 
 pub(super) fn resource_barriers_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| profile_env_flag("SARAGOSSA_RUST_RESOURCE_BARRIERS", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_RESOURCE_BARRIERS", false))
 }
 
 pub(crate) struct EncoderEndGuard<'a> {
@@ -264,7 +264,7 @@ static COMMIT_COMPONENTS: std::sync::OnceLock<
 
 pub(crate) fn commit_components_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| profile_env_flag("SARAGOSSA_RUST_TRACE_COMPONENTS", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_COMPONENTS", false))
 }
 
 /// Fixe le label du prochain `commit_and_wait` (no-op si le traçage est désactivé).

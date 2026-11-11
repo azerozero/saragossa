@@ -45,6 +45,8 @@ const MOE_COOP_TILE_M: usize = 16;
 const FAST_QMV_U2_BITS: usize = 2;
 const FAST_QMV_U3_BITS: usize = 3;
 const FAST_QMV_U6_BITS: usize = 6;
+/// Synchronisé avec `U6_QMM_MAX_BATCH` pour découper les lots sans dépassement.
+const U6_QMM_BATCH_TILE: usize = 8;
 
 mod attention;
 mod attention_checks;
@@ -78,7 +80,7 @@ mod mtp_seed;
 mod shared_rows;
 pub(crate) use self::mtp_seed::{MtpPrefillSeed, MtpSeedStates, MtpSeedWeights};
 pub(crate) use self::shared_rows::{
-    allocation_identity, InPlaceClaim, PrefillKvRows, SharedBf16Rows, SharedF32Rows,
+    allocation_identity, InPlaceClaim, PrefillKvRows, SharedBf16Rows, SharedF32Rows, SharedRows,
 };
 mod na_gemm;
 mod nax_rows;
@@ -207,6 +209,7 @@ fn affine_biases_offset(weight: &AffineQuantizedTensor) -> Result<NSUInteger> {
 /// Exécute les premiers kernels Metal du backend Rust expérimental.
 #[derive(Debug)]
 pub struct MetalExecutor {
+    kernel_profile: crate::KernelProfile,
     rope_frequencies: rope::RopeFrequencyCache,
     device: Device,
     queue: CommandQueue,
@@ -223,6 +226,7 @@ pub struct MetalExecutor {
     affine_qmv_fast_u4_gs64_align64_f32: ComputePipelineState,
     affine_qmv_fast_u6_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u6_gs64_f32: ComputePipelineState,
+    affine_qmm_batched_u6_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u4_gs64_f32: ComputePipelineState,
     affine_qmm8_fast_aligned_u4_gs64_f32: ComputePipelineState,
     na_gemm_skinny_u4: Option<ComputePipelineState>,
@@ -253,6 +257,7 @@ pub struct MetalExecutor {
     affine_qmv_gated_input_fast_u4_gs64_f32: ComputePipelineState,
     affine_qmv_gated_input_fast_u8_gs64_f32: ComputePipelineState,
     embed_gather_dense_from_u32_f32: ComputePipelineState,
+    embed_gather_bf16_from_u32_f32: ComputePipelineState,
     embed_gather_affine_from_u32_f32: ComputePipelineState,
     swiglu_f32: ComputePipelineState,
     geglu_tanh_f32: ComputePipelineState,
@@ -522,6 +527,11 @@ pub(crate) struct StackedAffineBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalLinearWeightBuffers {
+    DenseBf16 {
+        rhs: Buffer,
+        out_dim: usize,
+        in_dim: usize,
+    },
     Dense {
         rhs: Buffer,
         rhs_bf16: Option<Buffer>,
@@ -546,6 +556,11 @@ pub(crate) enum MetalLinearWeightBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalEmbeddingWeightBuffers {
+    DenseBf16 {
+        table: Buffer,
+        vocab: usize,
+        dim: usize,
+    },
     Dense {
         table: Buffer,
         vocab: usize,

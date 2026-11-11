@@ -14,6 +14,7 @@ mod inputs;
 mod load;
 mod model;
 mod payload;
+mod prefill;
 mod sampling;
 mod synth;
 #[cfg(test)]
@@ -27,6 +28,7 @@ pub use config::{
     TtsCodePredictorConfig, TtsCodecConfig, TtsDecoderConfig, TtsEncoderConfig, TtsModelConfig,
     TtsModelKind, TtsQuantConfig, TtsRopeScaling, TtsSpeakerEncoderConfig, TtsTalkerConfig,
 };
+pub use constants::CLONE_GENERATION_HARD_CAP as TTS_GENERATION_HARD_CAP;
 pub use constants::DEFAULT_INSTRUCT;
 pub use model::{TtsForwardOutput, TtsModel, TtsPayloadSummary, TtsSynthesisOutput};
 pub(crate) use payload::SafetensorPayload;

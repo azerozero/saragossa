@@ -1126,6 +1126,8 @@ fn layer_target(layer: usize, suffix: &str) -> String {
 }
 
 #[cfg(test)]
+mod dense_bf16_tests;
+#[cfg(test)]
 mod flint_tests;
 #[cfg(test)]
 mod gemma4_test_fixtures;
