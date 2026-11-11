@@ -110,7 +110,7 @@ fn read_metadata(path: &Path, vocab: usize) -> Result<Metadata> {
 }
 
 /// Enregistre exactement n tokens greedy (EOS compris) dans PATH/ref.{bin,json}.
-/// Les distributions prédisent forced_ids[i] après prompt + forced_ids[..i].
+/// Les distributions prédisent `forced_ids[i]` après `prompt + forced_ids[..i]`.
 /// Aucun sampling ni repli du prefill, de la projection ou du decode résident.
 /// Aucun logit de prefill conservé en dehors de sa dernière position.
 pub fn record(
