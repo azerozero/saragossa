@@ -1374,6 +1374,8 @@ mod tests {
         fn first(weight: &LinearWeight) -> Option<f32> {
             match weight {
                 LinearWeight::Dense(tensor) => tensor.data().first().copied(),
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                LinearWeight::DenseBf16(tensor) => tensor.row(0).ok()?.first().copied(),
                 LinearWeight::AffineQuantized(_) => None,
             }
         }

@@ -1,8 +1,9 @@
 use super::{
     clone_effective_frame_cap, clone_sample_seed, tts_generation_trace_enabled,
     tts_internal_profile_enabled, tts_stream_first_lot, usize_from_i32, TtsForwardOutput, TtsModel,
-    TtsSampleParams, TtsStreamDecodeState, TtsSynthesisOutput, CLONE_SAMPLE_REPETITION_PENALTY,
-    CLONE_SAMPLE_TEMPERATURE, CLONE_SAMPLE_TOP_K, CLONE_SAMPLE_TOP_P,
+    TtsSampleParams, TtsStreamDecodeState, TtsSynthesisOutput, CLONE_GENERATION_HARD_CAP,
+    CLONE_SAMPLE_REPETITION_PENALTY, CLONE_SAMPLE_TEMPERATURE, CLONE_SAMPLE_TOP_K,
+    CLONE_SAMPLE_TOP_P,
 };
 use crate::{InferError, Result};
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ impl TtsModel {
     /// forward échoue.
     pub fn forward_voicedesign_prefix(&self, text: &str) -> Result<TtsForwardOutput> {
         let prepared = self.prepare_voicedesign_inputs(text)?;
-        let (cache, final_state) = self.talker.prefill_cache_from_embeddings(&prepared.input)?;
+        let (cache, final_state) = self.prefill_talker(&prepared.input)?;
         let logits = self.talker.logits_from_final_state(&final_state)?;
         Ok(TtsForwardOutput {
             cache,
@@ -41,6 +42,7 @@ impl TtsModel {
         let codes = self.generate_codes_greedy(text, max_frames)?;
         let samples = self.decode_codes_for_mode(&codes)?;
         Ok(TtsSynthesisOutput {
+            frame_limit_reached: codes.len() == self.greedy_frame_cap(max_frames),
             codes,
             samples,
             sample_rate: self.codec.sample_rate(),
@@ -53,6 +55,11 @@ impl TtsModel {
     ///
     /// Renvoie une erreur si la génération des codes ou le codec échoue.
     pub fn synthesize_default(&self, text: &str, max_frames: usize) -> Result<TtsSynthesisOutput> {
+        let effective_max_frames = if self.clone_ctx.is_some() {
+            clone_effective_frame_cap(max_frames, self.encode_ids(text)?.len())
+        } else {
+            max_frames
+        };
         let codes = if self.clone_ctx.is_some() {
             self.generate_codes_clone_sampled(text, max_frames)?
         } else {
@@ -60,6 +67,7 @@ impl TtsModel {
         };
         let samples = self.decode_codes_for_mode(&codes)?;
         Ok(TtsSynthesisOutput {
+            frame_limit_reached: codes.len() == effective_max_frames,
             codes,
             samples,
             sample_rate: self.codec.sample_rate(),
@@ -106,6 +114,7 @@ impl TtsModel {
                         on_frame,
                     )
                 },
+                effective_max_frames,
                 on_audio,
             );
         }
@@ -144,13 +153,23 @@ impl TtsModel {
                     on_frame,
                 )
             },
+            self.greedy_frame_cap(max_frames),
             on_audio,
         )
+    }
+
+    pub(super) fn greedy_frame_cap(&self, max_frames: usize) -> usize {
+        if self.clone_ctx.is_some() {
+            max_frames.min(CLONE_GENERATION_HARD_CAP)
+        } else {
+            max_frames
+        }
     }
 
     fn synthesize_streaming_from_frames<F, G>(
         &self,
         generate_codes: G,
+        effective_max_frames: usize,
         mut on_audio: F,
     ) -> Result<TtsSynthesisOutput>
     where
@@ -226,6 +245,7 @@ impl TtsModel {
             );
         }
         Ok(TtsSynthesisOutput {
+            frame_limit_reached: codes.len() == effective_max_frames,
             codes,
             samples: all_samples,
             sample_rate: self.codec.sample_rate(),

@@ -8,6 +8,9 @@ use rayon::prelude::*;
 pub enum EmbeddingWeight {
     /// Stocke une table dense f32.
     Dense(Tensor),
+    /// Stocke une table bf16 native en mémoire unifiée.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    DenseBf16(crate::DenseBf16Tensor),
     /// Stocke une table affine quantifiée.
     AffineQuantized(AffineQuantizedTensor),
 }
@@ -18,6 +21,8 @@ impl EmbeddingWeight {
     pub fn shape(&self) -> &[usize] {
         match self {
             Self::Dense(tensor) => tensor.shape(),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::DenseBf16(tensor) => tensor.shape(),
             Self::AffineQuantized(tensor) => tensor.shape(),
         }
     }
@@ -25,7 +30,7 @@ impl EmbeddingWeight {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn cpu_data_available(&self) -> bool {
         match self {
-            Self::Dense(_) => true,
+            Self::Dense(_) | Self::DenseBf16(_) => true,
             Self::AffineQuantized(weight) => weight.cpu_data_available(),
         }
     }
@@ -33,7 +38,7 @@ impl EmbeddingWeight {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn metal_release_byte_exact(&self) -> bool {
         match self {
-            Self::Dense(_) => true,
+            Self::Dense(_) | Self::DenseBf16(_) => true,
             Self::AffineQuantized(weight) => weight.metal_embedding_byte_exact(),
         }
     }
@@ -89,6 +94,17 @@ pub fn embed_tokens(table: &Tensor, token_ids: &[usize]) -> Result<Tensor> {
 pub fn embed_weight_tokens(table: &EmbeddingWeight, token_ids: &[usize]) -> Result<Tensor> {
     match table {
         EmbeddingWeight::Dense(table) => embed_tokens(table, token_ids),
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        EmbeddingWeight::DenseBf16(table) => {
+            if token_ids.is_empty() {
+                return Err(InferError::Dimension("séquence de tokens vide".to_string()));
+            }
+            let mut out = Vec::new();
+            for &token in token_ids {
+                out.extend(table.row(token)?);
+            }
+            Tensor::from_vec(vec![token_ids.len(), table.shape()[1]], out)
+        }
         EmbeddingWeight::AffineQuantized(table) => embed_quantized_tokens(table, token_ids),
     }
 }

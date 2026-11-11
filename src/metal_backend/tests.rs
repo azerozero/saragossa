@@ -3,6 +3,7 @@ use super::*;
 
 include!("tests/util.rs");
 include!("tests/buffers_core.rs");
+mod dense_bf16;
 include!("tests/na_gemm_delta.rs");
 include!("tests/small_m_qmm.rs");
 include!("tests/coop_moe.rs");

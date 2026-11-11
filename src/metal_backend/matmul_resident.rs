@@ -21,6 +21,20 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> Result<usize> {
         match weight {
+            MetalLinearWeightBuffers::DenseBf16 {
+                rhs,
+                out_dim,
+                in_dim: rhs_in_dim,
+            } => self.encode_dense_bf16_weight(
+                encoder,
+                lhs_buffer,
+                rhs,
+                output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *rhs_in_dim,
+            ),
             MetalLinearWeightBuffers::Dense {
                 rhs,
                 out_dim,
@@ -384,6 +398,19 @@ impl MetalExecutor {
                 groups,
             )?,
             AffineMatmulKernel::FastQmvU3 => self.encode_affine_qmv_u3_buffers(
+                encoder,
+                lhs_buffer,
+                packed,
+                scales,
+                biases,
+                output_buffer,
+                batch,
+                in_dim,
+                out_dim,
+                packed_cols,
+                groups,
+            )?,
+            AffineMatmulKernel::QmmBatchedU6 => self.encode_affine_qmm_batched_u6_buffers(
                 encoder,
                 lhs_buffer,
                 packed,
@@ -824,9 +851,9 @@ impl MetalExecutor {
             checked_u32(packed_cols, "fast u8 packed_cols")?,
             checked_u32(groups, "fast u8 groups")?,
         ];
-        let use_dot4 = qmv_u8_dot4_enabled();
-        let use_tg256 = !use_dot4 && qmv_u8_tg256_enabled();
-        let use_tg128 = !use_dot4 && !use_tg256 && qmv_u8_tg128_enabled();
+        let use_dot4 = self.kernel_profile.qmv_u8_dot4;
+        let use_tg256 = !use_dot4 && self.kernel_profile.qmv_u8_tg256;
+        let use_tg128 = !use_dot4 && !use_tg256 && self.kernel_profile.qmv_u8_tg128;
         let rows_per_threadgroup = if use_tg256 {
             32
         } else if use_tg128 {

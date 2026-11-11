@@ -164,7 +164,7 @@ impl MetalExecutor {
                 "gather gate/up lhs_rows={lhs_rows}, topk={topk}"
             )));
         }
-        if !can_use_fast_gather_pair_qmv(lhs_rows, gate, up)
+        if !self.can_use_fast_gather_pair_qmv(lhs_rows, gate, up)
             || (geglu && gate.bits != FAST_QMV_BITS)
         {
             return Ok(false);
@@ -985,7 +985,7 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         topk: usize,
     ) -> Result<bool> {
-        if !fused_moe_down_weighted_u8_enabled() {
+        if !self.kernel_profile.fused_moe_down_weighted_u8 {
             return Ok(false);
         }
         let eligible = weight.bits == 8
