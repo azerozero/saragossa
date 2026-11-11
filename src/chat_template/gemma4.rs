@@ -67,7 +67,12 @@ pub fn render_gemma4_chat_with_tools(
         } else {
             content.trim().to_string()
         };
-        out.push_str(&content);
+        if !assistant || !message.push_assistant_blocks(&mut out, push_call) {
+            out.push_str(&content);
+            for raw in &message.tool_calls {
+                push_call(&mut out, raw);
+            }
+        }
         let mut names = HashMap::new();
         for raw in &message.tool_calls {
             if let Ok(call) = serde_json::from_str::<Value>(raw) {
@@ -76,19 +81,14 @@ pub fn render_gemma4_chat_with_tools(
                 if let Some(id) = call["id"].as_str() {
                     names.insert(id.to_string(), name.to_string());
                 }
-                let arguments = match &function["arguments"] {
-                    Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
-                    value => value.clone(),
-                };
-                out.push_str("<|tool_call>call:");
-                out.push_str(name);
-                out.push_str(&format_value(&arguments, false));
-                out.push_str("<tool_call|>");
             }
         }
         let mut responses = false;
         if !message.tool_calls.is_empty() {
-            for result in turns[index + 1..].iter().take_while(|m| m.role == "tool") {
+            for result in super::tool_results_in_call_order(
+                &message.tool_calls,
+                turns[index + 1..].iter().take_while(|m| m.role == "tool"),
+            ) {
                 let name = result
                     .tool_call_id
                     .as_ref()
@@ -120,6 +120,21 @@ pub fn render_gemma4_chat_with_tools(
         }
     }
     out
+}
+
+fn push_call(out: &mut String, raw: &str) {
+    if let Ok(call) = serde_json::from_str::<Value>(raw) {
+        let function = call.get("function").unwrap_or(&call);
+        let name = function["name"].as_str().unwrap_or("");
+        let arguments = match &function["arguments"] {
+            Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
+            value => value.clone(),
+        };
+        out.push_str("<|tool_call>call:");
+        out.push_str(name);
+        out.push_str(&format_value(&arguments, false));
+        out.push_str("<tool_call|>");
+    }
 }
 
 fn strip_thinking(text: &str) -> String {

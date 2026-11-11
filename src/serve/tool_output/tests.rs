@@ -128,6 +128,9 @@ fn markdown_and_quotations_stay_literal_at_every_delta_boundary() {
             format!("```markdown\ntext ``` {call}\n```"),
             format!("````markdown\n```\n{call}\n```\n````"),
             format!("\\{call}"),
+            format!("~~~\n- ~~~\n{call}\n~~~"),
+            format!("~~~\n> ~~~\n{call}\n~~~"),
+            format!("> ~~~\n> > ~~~\n> {call}\n> ~~~"),
         ] {
             let output = ToolOutputParser::new(family, tools(), true).parse(&text);
             assert!(output.tool_calls.is_empty(), "{text}");
@@ -226,6 +229,79 @@ fn qwen_invalid_json_for_non_string_parameter_is_not_an_argument() {
         "<tool_call><function=weather><parameter=count>{broken</parameter></function></tool_call>";
     assert!(ToolOutputParser::new(ToolFamily::Qwen, tools(), true)
         .parse(text)
+        .tool_calls
+        .is_empty());
+}
+
+#[test]
+fn list_code_blocks_stay_literal_across_all_delta_boundaries() {
+    for (family, call) in native_calls() {
+        for fence in ["~~~", "```"] {
+            for (prefix, indent) in [
+                ("- ", "  "),
+                ("+ ", "  "),
+                ("* ", "  "),
+                ("1. ", "   "),
+                ("12) ", "    "),
+                ("- 1. ", "     "),
+                ("> - ", ">   "),
+                ("- parent\n  - ", "    "),
+            ] {
+                let literal = format!("{prefix}{fence}\n{indent}{call}\n{indent}{fence}\n");
+                // Un appel réel après le bloc vérifie aussi la sortie du contexte littéral.
+                let text = format!("{literal}{call}");
+                let parsed = ToolOutputParser::new(family, tools(), true).parse(&text);
+                assert_eq!(parsed.content, literal, "{text}");
+                assert_eq!(parsed.tool_calls.len(), 1, "{text}");
+                for split in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+                    let mut parser = ToolOutputParser::new(family, tools(), true);
+                    let mut events = parser.push(&text[..split]);
+                    events.extend(parser.push(&text[split..]));
+                    events.extend(parser.finish());
+                    let content: String = events
+                        .iter()
+                        .filter_map(|e| match e {
+                            FlintEvent::Content(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let calls: Vec<_> = events
+                        .iter()
+                        .filter_map(|e| match e {
+                            FlintEvent::ToolCall(c) => Some(c),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(content, literal, "split {split}: {text}");
+                    assert_eq!(calls.len(), 1, "split {split}: {text}");
+                    assert_eq!(calls[0].function, parsed.tool_calls[0].function);
+                }
+                let mut parser = ToolOutputParser::new(family, tools(), true);
+                for ch in literal.chars() {
+                    assert!(parser
+                        .push(&ch.to_string())
+                        .iter()
+                        .all(|e| matches!(e, FlintEvent::Content(_))));
+                }
+                assert!(!parser.has_tool_calls());
+            }
+        }
+    }
+}
+
+#[test]
+fn qwen_nullable_string_keeps_native_text_and_rejects_malformed_numbers() {
+    let mut declared = tools();
+    declared[0]["function"]["parameters"]["properties"]["city"]["type"] = json!(["string", "null"]);
+    let text = "<tool_call><function=weather><parameter=city>Paris</parameter><parameter=count>2</parameter></function></tool_call>";
+    let parsed = ToolOutputParser::new(ToolFamily::Qwen, declared.clone(), true).parse(text);
+    assert_eq!(parsed.tool_calls.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&parsed.tool_calls[0].function.arguments).expect("args"),
+        json!({"city":"Paris", "count":2})
+    );
+    assert!(ToolOutputParser::new(ToolFamily::Qwen, declared, true)
+        .parse(&text.replace("count>2", "count>{broken"))
         .tool_calls
         .is_empty());
 }

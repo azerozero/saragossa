@@ -43,7 +43,7 @@ impl ToolFamily {
 
 pub(super) enum ToolOutputParser {
     Flint(Box<FlintOutputParser>),
-    Framed(FramedParser),
+    Framed(Box<FramedParser>),
 }
 
 impl From<FlintOutputParser> for ToolOutputParser {
@@ -57,7 +57,7 @@ impl ToolOutputParser {
         if family == ToolFamily::Flint {
             return FlintOutputParser::new(tools, parallel).into();
         }
-        Self::Framed(FramedParser {
+        Self::Framed(Box::new(FramedParser {
             family,
             tools,
             max_calls: if parallel { MAX_CALLS } else { 1 },
@@ -73,7 +73,7 @@ impl ToolOutputParser {
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_nanos())
             ),
-        })
+        }))
     }
     pub(super) fn push(&mut self, delta: &str) -> Vec<FlintEvent> {
         match self {
@@ -273,8 +273,13 @@ fn parse_qwen(body: &str, tools: &[Value]) -> Option<(String, Value)> {
         let (raw, tail) = value.split_once("</parameter>")?;
         let raw = raw.strip_prefix('\n').unwrap_or(raw);
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
-        let string = declared(tools, name)
-            .is_some_and(|f| f["parameters"]["properties"][key]["type"] == "string");
+        let string = declared(tools, name).is_some_and(|f| {
+            let kind = &f["parameters"]["properties"][key]["type"];
+            kind == "string"
+                || kind
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|t| t == "string"))
+        });
         arguments.insert(
             key.to_string(),
             if string {

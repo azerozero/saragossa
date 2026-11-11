@@ -29,3 +29,11 @@ Les identifiants d'appels et les événements HTTP sont vérifiés séparément
 par les tests de `serve::tool_output`, `serve::http` et `serve::anthropic`.
 Aucune de ces vérifications ne démontre la qualité des décisions d'un modèle
 lors d'une génération réelle.
+
+Le rendu Gemma 4 diverge volontairement du Jinja de référence pour les tours
+mêlant texte et outils : le texte conserve sa place avant ou entre les appels,
+et les résultats prolongent le tour modèle jusqu'à sa réponse suivante. Le
+Jinja référencé déplace le texte après les résultats et ferme ce tour trop tôt.
+Les tests de reprise et d'ordre des blocs sont des régressions de contrat avec
+attentes locales, pas une preuve d'égalité avec cet oracle. Les 28 cas figés
+et les huit cas du serveur restent comparés sans modifier leurs fixtures.

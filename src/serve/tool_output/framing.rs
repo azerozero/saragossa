@@ -75,6 +75,19 @@ pub(super) struct LiteralContext {
     escaped: bool,
     previous_word: bool,
     closing_fence: bool,
+    list_prefix: ListPrefix,
+    container_indent: usize,
+    quote_depth: usize,
+    fence_quote_depth: usize,
+}
+
+// Reconnaissance incrémentale des conteneurs, sans tampon ni rescan.
+#[derive(Default)]
+enum ListPrefix {
+    #[default]
+    None,
+    Digits(usize),
+    Space,
 }
 
 impl LiteralContext {
@@ -98,6 +111,7 @@ impl LiteralContext {
                 }
                 None if ch == '`' || (count >= 3 && line_start) => {
                     self.code = Some((ch, count, count >= 3 && line_start));
+                    self.fence_quote_depth = self.quote_depth;
                 }
                 _ => {}
             }
@@ -127,12 +141,21 @@ impl LiteralContext {
             }
         }
         if ch == '\n' {
+            self.list_prefix = ListPrefix::None;
             self.line_content = false;
             self.indentation = 0;
             self.block_quote = false;
+            self.quote_depth = 0;
             self.previous_word = false;
             self.escaped = false;
             return;
+        }
+        if !self.line_content
+            && !ch.is_whitespace()
+            && ch != '>'
+            && self.indentation < self.container_indent
+        {
+            self.container_indent = self.indentation;
         }
         if self.escaped {
             self.escaped = false;
@@ -140,7 +163,12 @@ impl LiteralContext {
             self.escaped = true;
         } else if matches!(ch, '`' | '~') && self.quote.is_none() {
             let (count, line_start) = self.run.map_or(
-                (0, !self.line_content && self.indentation < 4),
+                (
+                    0,
+                    !self.line_content
+                        && self.indentation.saturating_sub(self.container_indent) < 4
+                        && (self.code.is_none() || self.quote_depth == self.fence_quote_depth),
+                ),
                 |(_, count, line_start)| (count, line_start),
             );
             self.run = Some((ch, count.saturating_add(1), line_start));
@@ -159,15 +187,47 @@ impl LiteralContext {
             }
         }
         if !self.line_content {
-            match ch {
-                ' ' => self.indentation = self.indentation.saturating_add(1),
-                '\t' => self.indentation = self.indentation.saturating_add(4),
-                '>' => {
-                    self.block_quote = true;
-                    self.line_content = true;
+            self.list_prefix = match (&self.list_prefix, ch) {
+                (ListPrefix::None, ' ') => {
+                    self.indentation = self.indentation.saturating_add(1);
+                    ListPrefix::None
                 }
-                _ => self.line_content = true,
-            }
+                (ListPrefix::None, '\t') => {
+                    self.indentation = self.indentation.saturating_add(4);
+                    ListPrefix::None
+                }
+                (ListPrefix::None, '>') => {
+                    self.block_quote = true;
+                    self.quote_depth += 1;
+                    self.indentation = 0;
+                    ListPrefix::None
+                }
+                (ListPrefix::None, '-' | '+' | '*') if self.code.is_none() => {
+                    self.indentation += 1;
+                    ListPrefix::Space
+                }
+                (ListPrefix::None, '0'..='9') if self.code.is_none() => {
+                    self.indentation += 1;
+                    ListPrefix::Digits(1)
+                }
+                (ListPrefix::Digits(n), '0'..='9') if *n < 9 => {
+                    self.indentation += 1;
+                    ListPrefix::Digits(n + 1)
+                }
+                (ListPrefix::Digits(_), '.' | ')') => {
+                    self.indentation += 1;
+                    ListPrefix::Space
+                }
+                (ListPrefix::Space, ' ' | '\t') => {
+                    self.indentation += if ch == '\t' { 4 } else { 1 };
+                    self.container_indent = self.indentation;
+                    ListPrefix::None
+                }
+                _ => {
+                    self.line_content = true;
+                    ListPrefix::None
+                }
+            };
         }
         self.previous_word = ch.is_alphanumeric();
     }

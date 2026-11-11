@@ -610,3 +610,83 @@ fn empty_visible_output_has_the_same_block_in_both_transports() {
         assert_eq!(stop, response["stop_reason"]);
     }
 }
+
+#[test]
+fn complete_anthropic_response_round_trips_interleaved_history() {
+    use super::super::tool_output::ToolFamily;
+    use saragossa::chat_template::{
+        render_flint_chat, render_gemma4_chat_with_tools, render_qwen_chatml_profile, QwenProfile,
+    };
+    for (family, call) in [
+        (
+            ToolFamily::Qwen,
+            "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>",
+        ),
+        (
+            ToolFamily::Gemma4,
+            "<|tool_call>call:weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+        ),
+    ] {
+        let tools = vec![
+            json!({"function":{"name":"weather","parameters":{"properties":{"city":{"type":"string"}}}}}),
+        ];
+        let text = format!("Avant {call} Entre {call} Après");
+        let response = serde_json::to_value(AnthropicMessageResponse::with_parser(
+            &fake_completion("test", &text, "stop", None, 1, 2),
+            Some(ToolOutputParser::new(family, tools, true)),
+        ))
+        .expect("response");
+        assert_eq!(response["content"].as_array().expect("blocks").len(), 5);
+        let request = json!({"model":"test", "max_tokens":10, "messages":[
+            {"role":"user","content":"Météo ?"},
+            response,
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":response["content"][3]["id"],"content":"18"},
+                {"type":"tool_result","tool_use_id":response["content"][1]["id"],"content":"12"}
+            ]}
+        ]});
+        let (chat, _, _) =
+            anthropic_chat(&serde_json::to_vec(&request).expect("wire"), None).expect("convert");
+        let messages = chat.template_messages();
+        let rendered = match family {
+            ToolFamily::Qwen => {
+                render_qwen_chatml_profile(&messages, &[], true, false, QwenProfile::Qwen36)
+            }
+            ToolFamily::Gemma4 => render_gemma4_chat_with_tools(&messages, &[], true, false),
+            ToolFamily::Flint => render_flint_chat(&messages, &[], true),
+        };
+        let open = if family == ToolFamily::Gemma4 {
+            "<|tool_call>"
+        } else {
+            "<tool_call>"
+        };
+        let flint = render_flint_chat(&messages, &[], false);
+        assert!(flint.find("Avant ").expect("before") < flint.find("<tool_call>").expect("call"));
+        assert!(flint.find("<tool_call>").expect("call") < flint.find(" Entre ").expect("between"));
+        assert!(
+            flint.find(" Entre ").expect("between") < flint.rfind("<tool_call>").expect("call")
+        );
+        assert!(flint.rfind("<tool_call>").expect("call") < flint.find(" Après").expect("after"));
+        let positions = [
+            rendered.find("Avant ").expect("before"),
+            rendered.find(open).expect("first call"),
+            rendered.find(" Entre ").expect("between"),
+            rendered.rfind(open).expect("second call"),
+            rendered.find(" Après").expect("after"),
+        ];
+        assert!(positions.windows(2).all(|p| p[0] < p[1]), "{rendered}");
+        assert_eq!(rendered.matches(open).count(), 2);
+        assert_eq!(
+            rendered
+                .matches(if family == ToolFamily::Qwen {
+                    "<|im_start|>assistant"
+                } else if family == ToolFamily::Gemma4 {
+                    "<|turn>model"
+                } else {
+                    "<|assistant|>"
+                })
+                .count(),
+            if family == ToolFamily::Gemma4 { 1 } else { 2 }
+        );
+    }
+}

@@ -212,6 +212,7 @@ impl ChatCompletionRequest {
                 tool_calls: raw_texts(message.tool_calls.as_deref()),
                 name: message.name.clone(),
                 tool_call_id: message.tool_call_id.clone(),
+                assistant_blocks: message.assistant_blocks.clone(),
             })
             .collect()
     }
@@ -407,6 +408,9 @@ pub(super) struct ResponseFormat {
 /// Message OpenAI minimal.
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct WireMessage {
+    /// Ordre natif Anthropic, renseigné seulement par la conversion interne.
+    #[serde(skip)]
+    pub(super) assistant_blocks: Option<Vec<saragossa::chat_template::AssistantBlock>>,
     /// Nom de l'outil qui a produit ce résultat.
     #[serde(default)]
     pub(super) name: Option<String>,

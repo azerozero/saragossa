@@ -29,6 +29,15 @@ pub const GEMMA4_END_OF_TURN: &str = "<turn|>";
 /// Bloc de raisonnement vide injecté quand le thinking Qwen est désactivé.
 pub const QWEN_EMPTY_THINK_BLOCK: &str = "<think>\n\n</think>\n\n";
 
+/// Séquence native des blocs assistant, quand le transport conserve leur ordre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssistantBlock {
+    /// Texte à sa position dans le tour.
+    Text(String),
+    /// Index dans `ChatTemplateMessage::tool_calls`.
+    ToolCall(usize),
+}
+
 /// Message minimal consommé par le rendu ChatML Qwen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatTemplateMessage {
@@ -41,6 +50,8 @@ pub struct ChatTemplateMessage {
     /// Appels d'outils OpenAI d'un tour assistant passé (`tool_calls`), un
     /// texte JSON brut par appel pour garder l'ordre des clés.
     pub tool_calls: Vec<String>,
+    /// Ordre des blocs assistant ; absent pour le format OpenAI texte puis appels.
+    pub assistant_blocks: Option<Vec<AssistantBlock>>,
     /// Nom de l'outil associé à un résultat.
     pub name: Option<String>,
     /// Identifiant de l'appel auquel répond ce résultat.
@@ -55,10 +66,57 @@ impl ChatTemplateMessage {
             content: Some(content.into()),
             reasoning_content: None,
             tool_calls: Vec::new(),
+            assistant_blocks: None,
             name: None,
             tool_call_id: None,
         }
     }
+
+    /// Rend la séquence native si elle existe, sans réagréger ses textes.
+    fn push_assistant_blocks(&self, out: &mut String, push_call: fn(&mut String, &str)) -> bool {
+        let Some(blocks) = &self.assistant_blocks else {
+            return false;
+        };
+        for block in blocks {
+            match block {
+                AssistantBlock::Text(text) => out.push_str(text),
+                AssistantBlock::ToolCall(index) => {
+                    if let Some(call) = self.tool_calls.get(*index) {
+                        push_call(out, call);
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Les formats sans ID de résultat s'appuient sur l'ordre des appels.
+/// Les résultats sans association connue gardent leur ordre relatif en fin de groupe.
+fn tool_results_in_call_order<'a>(
+    calls: &[String],
+    results: impl Iterator<Item = &'a ChatTemplateMessage>,
+) -> Vec<&'a ChatTemplateMessage> {
+    let ids: Vec<_> = calls
+        .iter()
+        .map(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|call| call["id"].as_str().map(str::to_owned))
+        })
+        .collect();
+    let mut results: Vec<_> = results.collect();
+    results.sort_by_cached_key(|result| {
+        result
+            .tool_call_id
+            .as_ref()
+            .and_then(|id| {
+                ids.iter()
+                    .position(|candidate| candidate.as_ref() == Some(id))
+            })
+            .unwrap_or(usize::MAX)
+    });
+    results
 }
 
 /// Rend des messages en ChatML Qwen.
@@ -188,9 +246,11 @@ pub fn render_flint_chat(
                         out.push_str("</think>");
                     }
                 }
-                out.push_str(content);
-                for call in &message.tool_calls {
-                    push_flint_tool_call(&mut out, call);
+                if !message.push_assistant_blocks(&mut out, push_flint_tool_call) {
+                    out.push_str(content);
+                    for call in &message.tool_calls {
+                        push_flint_tool_call(&mut out, call);
+                    }
                 }
             }
             "tool" => {
@@ -563,6 +623,50 @@ mod gemma_validation {
                 render_gemma_chat(&messages, true),
                 Err(TemplateError::RoleAlternation)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod result_order_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_results_for_same_tool_follow_call_ids() {
+        let mut assistant = ChatTemplateMessage::new("assistant", "");
+        assistant.tool_calls = [
+            r#"{"id":"A","function":{"name":"weather","arguments":{"city":"Paris"}}}"#,
+            r#"{"id":"B","function":{"name":"weather","arguments":{"city":"Lyon"}}}"#,
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut a = ChatTemplateMessage::new("tool", "12");
+        a.tool_call_id = Some("A".into());
+        let mut b = ChatTemplateMessage::new("tool", "18");
+        b.tool_call_id = Some("B".into());
+        let ordered = [assistant.clone(), a.clone(), b.clone()];
+        let reversed = [assistant.clone(), b.clone(), a.clone()];
+        a.tool_call_id = Some("B".into());
+        b.tool_call_id = Some("A".into());
+        let swapped = [assistant, b, a];
+        for family in 0..3 {
+            let render = |messages: &[ChatTemplateMessage]| match family {
+                0 => render_qwen_chatml_profile(messages, &[], true, false, QwenProfile::Qwen36),
+                1 => render_qwen_chatml_profile(messages, &[], true, false, QwenProfile::Qwen38),
+                _ => render_gemma4_chat_with_tools(messages, &[], true, false),
+            };
+            let expected = render(&ordered);
+            assert_eq!(render(&reversed), expected);
+            assert_ne!(render(&swapped), expected);
+            let (first, second) = if family < 2 {
+                ("<tool_response>\n12", "<tool_response>\n18")
+            } else {
+                (
+                    "response:weather{value:<|\"|>12",
+                    "response:weather{value:<|\"|>18",
+                )
+            };
+            assert!(expected.find(first).expect("A") < expected.find(second).expect("B"));
         }
     }
 }

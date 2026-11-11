@@ -356,6 +356,7 @@ fn user_content_to_wire_messages(
 
 fn wire_message(role: &str, content: String) -> WireMessage {
     WireMessage {
+        assistant_blocks: None,
         role: role.to_string(),
         content: Some(Value::String(content)),
         reasoning_content: None,
@@ -419,6 +420,8 @@ fn assistant_message(content: Option<&AnthropicContent>) -> ServeResult<WireMess
     let mut message = wire_message("assistant", String::new());
     let mut text = String::new();
     let mut calls = Vec::new();
+    let mut ordered = Vec::new();
+    use saragossa::chat_template::AssistantBlock;
     for block in blocks {
         if block["type"] == "tool_use" {
             let id = block["id"]
@@ -435,14 +438,18 @@ fn assistant_message(content: Option<&AnthropicContent>) -> ServeResult<WireMess
                 .ok_or_else(|| ServeError::Http("tool_use input doit être un objet".into()))?;
             let raw = json!({"id":id,"type":"function","function":{"name":name,"arguments":input}})
                 .to_string();
+            ordered.push(AssistantBlock::ToolCall(calls.len()));
             calls.push(
                 serde_json::value::RawValue::from_string(raw)
                     .map_err(|e| ServeError::json("tool_use", e))?,
             );
         } else {
-            push_text_part(&mut text, &block_to_text(block));
+            let part = block_to_text(block);
+            push_text_part(&mut text, &part);
+            ordered.push(AssistantBlock::Text(part));
         }
     }
+    message.assistant_blocks = Some(ordered);
     message.content = Some(Value::String(text));
     message.tool_calls = Some(calls);
     Ok(message)

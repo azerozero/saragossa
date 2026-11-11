@@ -52,6 +52,7 @@ fn templates_match_all_28_transformers_references() {
                 .messages
                 .into_iter()
                 .map(|m| ChatTemplateMessage {
+                    assistant_blocks: None,
                     role: m.role,
                     content: m.content,
                     reasoning_content: m.reasoning_content,

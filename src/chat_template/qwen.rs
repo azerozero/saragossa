@@ -103,12 +103,21 @@ pub fn render_qwen_chatml_profile(
         }
         if message.role == "tool" {
             if index == 0 || turns[index - 1].role != "tool" {
+                let calls = index
+                    .checked_sub(1)
+                    .and_then(|i| turns.get(i))
+                    .filter(|m| m.role == "assistant")
+                    .map_or(&[][..], |m| m.tool_calls.as_slice());
+                let results = super::tool_results_in_call_order(
+                    calls,
+                    turns[index..].iter().take_while(|m| m.role == "tool"),
+                );
                 out.push_str("<|im_start|>user");
-            }
-            out.push_str("\n<tool_response>\n");
-            out.push_str(content);
-            out.push_str("\n</tool_response>");
-            if turns.get(index + 1).is_none_or(|m| m.role != "tool") {
+                for result in results {
+                    out.push_str("\n<tool_response>\n");
+                    out.push_str(result.content.as_deref().unwrap_or("").trim());
+                    out.push_str("\n</tool_response>");
+                }
                 out.push_str("<|im_end|>\n");
             }
             continue;
@@ -144,15 +153,17 @@ pub fn render_qwen_chatml_profile(
         } else {
             content
         };
-        out.push_str(content);
-        if message.role == "assistant" {
-            for (index, call) in message.tool_calls.iter().enumerate() {
-                if index > 0 {
-                    out.push('\n');
-                } else if !content.is_empty() {
-                    out.push_str("\n\n");
+        if message.role != "assistant" || !message.push_assistant_blocks(&mut out, push_call) {
+            out.push_str(content);
+            if message.role == "assistant" {
+                for (index, call) in message.tool_calls.iter().enumerate() {
+                    if index > 0 {
+                        out.push('\n');
+                    } else if !content.is_empty() {
+                        out.push_str("\n\n");
+                    }
+                    push_call(&mut out, call);
                 }
-                push_call(&mut out, call);
             }
         }
         out.push_str("<|im_end|>\n");
