@@ -8,6 +8,7 @@ use tokenizers::Tokenizer;
 pub struct RustTokenizer {
     path: PathBuf,
     inner: Tokenizer,
+    qwen_profile: crate::chat_template::QwenProfile,
 }
 
 impl std::fmt::Debug for RustTokenizer {
@@ -26,10 +27,19 @@ impl RustTokenizer {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
+        let template = std::fs::read_to_string(path.with_file_name("chat_template.jinja"))
+            .or_else(|_| std::fs::read_to_string(path.with_file_name("tokenizer_config.json")))
+            .unwrap_or_default();
         Ok(Self {
             path: path.to_path_buf(),
+            qwen_profile: crate::chat_template::QwenProfile::from_template(&template),
             inner,
         })
+    }
+
+    /// Profil de rendu associé au template local, lu une seule fois au chargement.
+    pub fn qwen_profile(&self) -> crate::chat_template::QwenProfile {
+        self.qwen_profile
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {

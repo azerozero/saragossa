@@ -4,8 +4,8 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use saragossa::{
-    qwen_assistant_history_content, render_flint_chat, render_gemma4_chat, render_gemma_chat,
-    render_qwen_chatml, ChatTemplateMessage, GenerationOptions, ModelAssets,
+    render_flint_chat, render_gemma4_chat, render_gemma_chat, ChatTemplateMessage,
+    GenerationOptions, ModelAssets,
 };
 
 use crate::hf_resolve;
@@ -329,19 +329,21 @@ fn encode_chat_prompt(
     assets: &ModelAssets,
     history: &[ChatTemplateMessage],
 ) -> CliResult<Vec<usize>> {
-    let mut messages = history.to_vec();
-    // flint garde l'historique assistant tel quel : pas de bloc think vide.
-    if !assets.config.is_gemma() && !assets.config.is_flint() {
-        normalize_qwen_assistant_history(&mut messages);
-    }
+    let messages = history;
     let rendered = if assets.config.is_flint() {
-        render_flint_chat(&messages, &[], true)
+        render_flint_chat(messages, &[], true)
     } else if assets.config.is_gemma4() {
-        render_gemma4_chat(&messages, true, false)
+        render_gemma4_chat(messages, true, false)
     } else if assets.config.is_gemma() {
-        render_gemma_chat(&messages, true)
+        render_gemma_chat(messages, true)
     } else {
-        render_qwen_chatml(&messages, true, false)
+        saragossa::chat_template::render_qwen_chatml_profile(
+            messages,
+            &[],
+            true,
+            false,
+            assets.tokenizer.qwen_profile(),
+        )
     };
     let ids = if assets.config.is_gemma() && !assets.config.is_gemma4() {
         assets.encode_prompt_with_special(&rendered)?
@@ -351,16 +353,6 @@ fn encode_chat_prompt(
     ids.into_iter()
         .map(|id| usize::try_from(id).map_err(|_| cli_error(format!("token id hors plage: {id}"))))
         .collect()
-}
-
-fn normalize_qwen_assistant_history(messages: &mut [ChatTemplateMessage]) {
-    for message in messages {
-        if message.role != "assistant" {
-            continue;
-        }
-        let content = message.content.take().unwrap_or_default();
-        message.content = Some(qwen_assistant_history_content(&content, false));
-    }
 }
 
 fn strip_empty_think(text: String) -> String {

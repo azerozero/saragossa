@@ -14,9 +14,9 @@ use saragossa::runtime_flags::{
     serve_lru_enabled, serve_model_pool_size, serve_prefix_cache_enabled,
 };
 use saragossa::{
-    qwen_assistant_history_content, render_flint_chat, render_gemma4_chat, render_gemma_chat,
-    CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage, GenerationOptions,
-    JsonTokenCatalog, JsonTokenConstraint, ModelAssets, RuntimePreset, TokenConstraint,
+    render_flint_chat, render_gemma4_chat, render_gemma_chat, CausalDecoder,
+    CausalDecoderPromptState, ChatTemplateMessage, GenerationOptions, JsonTokenCatalog,
+    JsonTokenConstraint, ModelAssets, RuntimePreset, TokenConstraint,
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
@@ -1189,11 +1189,7 @@ impl LoadedModel {
     }
 
     fn prompt_encoding(&self, request: &ChatCompletionRequest) -> ServeResult<PromptEncoding> {
-        let mut messages = request.template_messages();
-        // flint garde l'historique assistant tel quel : pas de bloc think vide.
-        if !self.assets.config.is_gemma() && !self.assets.config.is_flint() {
-            normalize_qwen_assistant_history(&mut messages);
-        }
+        let messages = request.template_messages();
         let thinking = request.enable_thinking()?;
         let rendered = if self.assets.config.is_flint() {
             check_thinking(thinking, false)?;
@@ -1211,7 +1207,7 @@ impl LoadedModel {
             render_gemma_chat(&messages, true)
         } else {
             check_thinking(thinking, true)?;
-            saragossa::chat_template::render_qwen_chatml_with_tools(
+            saragossa::chat_template::render_qwen_chatml_profile(
                 &messages,
                 &request
                     .active_tools()?
@@ -1220,6 +1216,7 @@ impl LoadedModel {
                     .collect::<Vec<_>>(),
                 true,
                 false,
+                self.assets.tokenizer.qwen_profile(),
             )
         };
         let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
@@ -1515,16 +1512,6 @@ fn prefix_blocks_usable(flint: bool, resident_extend: bool) -> bool {
     serve_prefix_cache_enabled() && (!flint || resident_extend)
 }
 
-fn normalize_qwen_assistant_history(messages: &mut [ChatTemplateMessage]) {
-    for message in messages {
-        if message.role != "assistant" {
-            continue;
-        }
-        let content = message.content.take().unwrap_or_default();
-        message.content = Some(qwen_assistant_history_content(&content, false));
-    }
-}
-
 fn strip_empty_think(text: String) -> String {
     text.strip_prefix(saragossa::QWEN_EMPTY_THINK_BLOCK)
         .map_or(text.clone(), ToString::to_string)
@@ -1685,17 +1672,26 @@ mod tests {
 
     #[test]
     fn qwen_assistant_history_gets_empty_think_prefix() {
-        let mut messages = vec![
+        let messages = vec![
             ChatTemplateMessage::new("user", "Bonjour"),
             ChatTemplateMessage::new("assistant", "Salut"),
         ];
-
-        normalize_qwen_assistant_history(&mut messages);
-
-        assert_eq!(
-            messages[1].content.as_deref(),
-            Some("<think>\n\n</think>\n\nSalut")
+        let rendered = saragossa::chat_template::render_qwen_chatml_profile(
+            &messages,
+            &[],
+            false,
+            false,
+            saragossa::chat_template::QwenProfile::Qwen38,
         );
+        assert!(rendered.contains("assistant\n<think>\n\n</think>\n\nSalut"));
+        let rendered36 = saragossa::chat_template::render_qwen_chatml_profile(
+            &messages,
+            &[],
+            false,
+            false,
+            saragossa::chat_template::QwenProfile::Qwen36,
+        );
+        assert!(rendered36.contains("assistant\nSalut"));
     }
 
     #[test]

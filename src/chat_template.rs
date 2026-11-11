@@ -2,7 +2,7 @@
 
 mod python_json;
 mod qwen;
-pub use qwen::render_qwen_chatml_with_tools;
+pub use qwen::{render_qwen_chatml_profile, render_qwen_chatml_with_tools, QwenProfile};
 
 use self::python_json::{JsonObject, JsonValue};
 
