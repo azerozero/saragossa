@@ -60,6 +60,8 @@ mod kernel_timing;
 mod lightbatch_duo;
 mod lightbatch_multi;
 mod linear_attention;
+mod state_snapshot;
+pub(crate) use state_snapshot::LinearSnapshotLayout;
 mod linear_attention_encode;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
@@ -132,7 +134,6 @@ pub(crate) use self::barriers::{
     commit_and_wait, commit_and_wait_with, commit_nonblocking, install_dispatch_barrier_scope,
     post_dispatch_barrier, wait_for_completion, EncoderEndGuard,
 };
-#[cfg(any(test, feature = "devtools"))]
 pub(crate) use self::byte_helpers::read_u16_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
 pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at, write_u8_buffer};

@@ -1466,7 +1466,7 @@ impl CausalDecoder {
                 (cache, final_state, Some(mtp_history), reused)
             } else {
                 let (cache, final_state, reused) = with_prefill_kv_reserve(decode_reserve, || {
-                    self.prefill_cache_state_reused(prompt)
+                    self.prefill_cache_state_snapshot_mode(prompt, "mtp-fresh")
                 })?;
                 (cache, final_state, None, reused)
             };
@@ -2214,7 +2214,7 @@ impl CausalDecoder {
 
         let draft_limit = max_draft_tokens.min(draft.info.block_size);
         let (mut cache, mut final_state, target_hidden) =
-            self.prefill_cache_state_with_layer_capture(prompt, &draft.info.target_layer_ids)?;
+            self.prefill_cache_state_with_layer_capture(prompt, draft)?;
         // Réserve l'avance spéculative : un cycle propose jusqu'à `draft_limit` tokens au-delà du
         // dernier token retenu avant de tronquer les rejets ; sans cette marge le KV résident
         // déborde en fin de génération (capacité = prompt + max_new_tokens exactement).
@@ -2321,7 +2321,7 @@ impl CausalDecoder {
         }
 
         let (mut cache, final_state, _) =
-            self.prefill_cache_state_with_layer_capture(prompt, &draft.info.target_layer_ids)?;
+            self.prefill_cache_state_with_layer_capture(prompt, draft)?;
         self.setup_resident_decode_from_prefill(&mut cache, max_new_tokens)?;
         let mut sampler = DeterministicSampler::new(options.seed);
         let mut token = self.sample_token_from_state(&final_state, options, &mut sampler)?;
@@ -3237,11 +3237,25 @@ impl CausalDecoder {
     pub(in crate::decoder) fn prefill_cache_state_with_layer_capture(
         &self,
         prompt: &[usize],
-        layer_ids: &[usize],
+        draft: &DFlashDraft,
     ) -> Result<(CausalDecoderCache, Tensor, Tensor)> {
+        let layer_ids = &draft.info.target_layer_ids;
+        let snapshot = self.snapshot_request_dflash(
+            prompt,
+            "dflash-reference",
+            Some(&draft.info.weight_path),
+        )?;
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            if let Some(captures) = state.captures {
+                if captures.layer_ids == *layer_ids && captures.from == 0 {
+                    return Ok((state.cache, state.final_state, captures.hidden));
+                }
+            }
+        }
         let (cache, final_states, captures) =
             self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids, usize::MAX, false)?;
         let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
+        self.snapshot_save(&snapshot, &cache, &final_state, None, Some(&captures))?;
         Ok((cache, final_state, captures.hidden))
     }
 
@@ -3891,6 +3905,18 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor, usize)> {
+        self.prefill_cache_state_snapshot_mode(prompt, "ar")
+    }
+
+    fn prefill_cache_state_snapshot_mode(
+        &self,
+        prompt: &[usize],
+        mode: &str,
+    ) -> Result<(CausalDecoderCache, Tensor, usize)> {
+        let snapshot = self.snapshot_request(prompt, mode)?;
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            return Ok((state.cache, state.final_state, prompt.len()));
+        }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -3900,6 +3926,7 @@ impl CausalDecoder {
         }
         if prefix_cache_enabled() {
             if let Some(((cache, final_state), reused)) = self.prefix_cache_get(prompt)? {
+                self.snapshot_save(&snapshot, &cache, &final_state, None, None)?;
                 return Ok((cache, final_state, reused));
             }
         }
@@ -3907,6 +3934,7 @@ impl CausalDecoder {
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, None, None)?;
         }
+        self.snapshot_save(&snapshot, &state.0, &state.1, None, None)?;
         Ok((state.0, state.1, 0))
     }
 
@@ -3918,7 +3946,13 @@ impl CausalDecoder {
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
-        self.prefill_cache_state_uncached_inner(prompt)
+        let snapshot = self.snapshot_request(prompt, "ar")?;
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            return Ok((state.cache, state.final_state));
+        }
+        let state = self.prefill_cache_state_uncached_inner(prompt)?;
+        self.snapshot_save(&snapshot, &state.0, &state.1, None, None)?;
+        Ok(state)
     }
 
     fn prefill_cache_state_uncached_inner(
@@ -3945,8 +3979,28 @@ impl CausalDecoder {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
+        let snapshot = self.snapshot_request(prompt, "mtp-committed")?;
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            if let Some(history) = state.history {
+                let keep = on_final_state(&state.final_state)?;
+                return Ok((
+                    state.cache,
+                    state.final_state,
+                    if keep {
+                        history
+                    } else {
+                        LayerKvCache::default()
+                    },
+                    prompt.len(),
+                ));
+            }
+            eprintln!("state_snapshot refusé : historique MTP absent; prefill normal");
+        }
         if prefix_cache_enabled() {
             if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt, on_final_state)? {
+                if hit.2.len() == prompt.len().saturating_sub(1) {
+                    self.snapshot_save(&snapshot, &hit.0, &hit.1, Some(&hit.2), None)?;
+                }
                 return Ok(hit);
             }
         }
@@ -4062,6 +4116,7 @@ impl CausalDecoder {
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, Some(&mtp_history), None)?;
         }
+        self.snapshot_save(&snapshot, &state.0, &state.1, Some(&mtp_history), None)?;
         Ok((state.0, state.1, mtp_history, 0))
     }
 
@@ -4386,10 +4441,37 @@ impl CausalDecoder {
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
+        drafter_path: Option<&std::path::Path>,
     ) -> Result<(CausalDecoderCache, Tensor, Tensor, usize)> {
+        let snapshot = self.snapshot_request_dflash(
+            prompt,
+            &format!("dflash:{layer_ids:?}:{keep_rows}"),
+            drafter_path,
+        )?;
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            if let Some(captures) = state.captures {
+                if captures.layer_ids == layer_ids
+                    && (!self.dflash_switch_needs_history() || state.history.is_some())
+                {
+                    let pair = (state.cache, state.final_state);
+                    if prefix_cache_enabled() {
+                        self.prefix_cache_put(
+                            prompt,
+                            &pair,
+                            state.history.as_ref(),
+                            Some(&captures),
+                        )?;
+                    }
+                    return Ok((pair.0, pair.1, captures.hidden, captures.from));
+                }
+            }
+            eprintln!(
+                "state_snapshot refusé : captures ou historique DFlash absents; prefill normal"
+            );
+        }
         let profile = crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_PROFILE", false);
         let started = Instant::now();
-        if prefix_cache_enabled() {
+        if snapshot.is_none() && prefix_cache_enabled() {
             if let Some(hit) = self.prefix_cache_get_with_captures(prompt, layer_ids, keep_rows)? {
                 if profile {
                     eprintln!(
@@ -4430,6 +4512,13 @@ impl CausalDecoder {
                 started.elapsed().as_millis()
             );
         }
+        self.snapshot_save(
+            &snapshot,
+            &state.0,
+            &state.1,
+            mtp_history.as_ref(),
+            Some(&captures),
+        )?;
         Ok((state.0, state.1, captures.hidden, captures.from))
     }
 
@@ -4826,7 +4915,7 @@ impl CausalDecoder {
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn restore_prefix_cache_linear_metal(
+    pub(super) fn restore_prefix_cache_linear_metal(
         &self,
         cache: &mut CausalDecoderCache,
         snapshots: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,

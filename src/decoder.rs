@@ -35,6 +35,7 @@ mod attention;
 mod attention_cache;
 mod attention_ops;
 mod kv_rows;
+mod state_snapshot;
 mod tts_prefill;
 #[cfg(test)]
 pub(crate) use attention_ops::{
@@ -1488,6 +1489,7 @@ pub struct CausalDecoder {
     /// passe par la boucle DFlash (`generate_greedy_mtp_inner`).
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     dflash: Option<crate::DFlashDraft>,
+    snapshot_sources: Option<Vec<std::path::PathBuf>>,
     prefix_cache: Arc<Mutex<PrefixCache>>,
     memory_guard: Option<MemoryGuard>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2021,7 +2023,8 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si le chargement ou la construction échoue.
     pub fn from_safetensors(path: impl AsRef<Path>, config: CausalDecoderConfig) -> Result<Self> {
-        Self::from_tensors(load_f32_tensors(path)?, config)
+        Ok(Self::from_tensors(load_f32_tensors(&path)?, config)?
+            .with_snapshot_sources(&[path.as_ref().to_path_buf()]))
     }
 
     /// Construit un décodeur depuis des tenseurs denses.
@@ -2080,6 +2083,7 @@ impl CausalDecoder {
             mtp_draft_lm_head: None,
             #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
             dflash: None,
+            snapshot_sources: None,
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
             memory_guard: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2634,7 +2638,7 @@ impl CausalDecoder {
             expect(unused_mut, reason = "single-copy Metal seulement")
         )]
         let mut head =
-            MtpHead::from_sidecar(path, &self.config, self.final_norm.data().len(), &context)?;
+            MtpHead::from_sidecar(&path, &self.config, self.final_norm.data().len(), &context)?;
         // La tête arrive après `enable_single_copy_weights` du tronc : sans ce
         // passage, ses linéaires quantifiées à la charge (fc, attention, expert
         // partagé, routeur) gardaient une copie CPU à scales f32 en plus de la
@@ -2645,6 +2649,9 @@ impl CausalDecoder {
             if crate::runtime_flags::single_copy_weights_enabled() {
                 head.move_packed_to_metal_shared(metal)?;
             }
+        }
+        if let Some(sources) = &mut self.snapshot_sources {
+            sources.push(path.as_ref().to_path_buf());
         }
         self.mtp = Some(head);
         Ok(self)
@@ -2708,8 +2715,11 @@ impl CausalDecoder {
             .map_or_else(mtp::MtpLoadContext::cpu, mtp::MtpLoadContext::metal);
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let context = mtp::MtpLoadContext::cpu();
+        if let Some(sources) = &mut self.snapshot_sources {
+            sources.push(path.as_ref().to_path_buf());
+        }
         self.mtp_draft_lm_head = Some(mtp::load_mtp_draft_lm_head(
-            path,
+            &path,
             self.final_norm.data().len(),
             &context,
         )?);

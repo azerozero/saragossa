@@ -1809,7 +1809,7 @@ fn gemma4_global_attention_aliases_k_as_resident_v_projection() -> Result<()> {
     Ok(())
 }
 
-fn test_weights() -> HashMap<String, Tensor> {
+pub(super) fn test_weights() -> HashMap<String, Tensor> {
     let mut tensors = HashMap::new();
     tensors.insert(
         "embed_tokens.weight".to_string(),
@@ -4562,7 +4562,7 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
         model.prefill_cache_state(&prompt)?.0
     } else {
         model
-            .prefill_cache_state_with_layer_capture_cached(&prompt, &layer_ids, usize::MAX)?
+            .prefill_cache_state_with_layer_capture_cached(&prompt, &layer_ids, usize::MAX, None)?
             .0
     };
     let kv_bf16 = CausalDecoder::resident_kv_bf16(false, cache.position);

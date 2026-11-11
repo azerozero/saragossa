@@ -197,10 +197,10 @@ pub(crate) struct LinearAttentionWeights {
 /// `metal` est le miroir GPU-résident (non cloné : chaque flux reconstruit le sien).
 #[derive(Debug, Default)]
 pub(crate) struct LinearAttentionCache {
-    conv: Vec<f32>,
-    conv_dim: Option<usize>,
-    ssm: Vec<f32>,
-    ssm_shape: Option<(usize, usize, usize)>,
+    pub(crate) conv: Vec<f32>,
+    pub(crate) conv_dim: Option<usize>,
+    pub(crate) ssm: Vec<f32>,
+    pub(crate) ssm_shape: Option<(usize, usize, usize)>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     metal: Option<crate::metal_backend::LinearAttentionMetalState>,
 }

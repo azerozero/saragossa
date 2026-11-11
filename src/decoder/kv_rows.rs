@@ -147,6 +147,21 @@ impl KvRows {
         }
     }
 
+    /// Vues des seuls octets vivants ; préserver le dtype évite un second arrondi.
+    pub(super) fn snapshot_segments(&self) -> Vec<(&'static str, &[u8])> {
+        self.segments
+            .iter()
+            .map(|segment| match segment.as_ref() {
+                Segment::Owned(data) => ("f32", bytemuck::cast_slice(data)),
+                Segment::OwnedBf16(data) => ("bf16", bytemuck::cast_slice(data)),
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                Segment::Shared(rows) => ("f32", bytemuck::cast_slice(rows.as_slice())),
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                Segment::SharedBf16(rows) => ("bf16", bytemuck::cast_slice(rows.as_slice())),
+            })
+            .collect()
+    }
+
     /// Nombre de f32 logiques, `base` compris.
     pub(super) fn len(&self) -> usize {
         self.len

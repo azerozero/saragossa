@@ -334,7 +334,7 @@ pub fn load_causal_decoder_from_shards(
     let prefixes = QwenPrefixes::detect(catalog);
     let tensors = load_decoder_tensors(config, shards, catalog, &prefixes)?;
     validate_decoder_shapes(config, &tensors)?;
-    CausalDecoder::from_decoder_tensors(tensors, config.into())
+    Ok(CausalDecoder::from_decoder_tensors(tensors, config.into())?.with_snapshot_sources(shards))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -352,7 +352,7 @@ fn load_causal_decoder_from_shards_for_metal(
     let context = DecoderLoadContext::metal(executor);
     let tensors = load_decoder_tensors_with_context(config, shards, catalog, &prefixes, &context)?;
     validate_decoder_shapes(config, &tensors)?;
-    CausalDecoder::from_decoder_tensors(tensors, config.into())
+    Ok(CausalDecoder::from_decoder_tensors(tensors, config.into())?.with_snapshot_sources(shards))
 }
 
 /// Charge un décodeur causal depuis des shards sous garde mémoire.

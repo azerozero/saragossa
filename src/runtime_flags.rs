@@ -2083,6 +2083,32 @@ pub(super) fn print_layer_profile(
     );
 }
 
+/// Répertoire diagnostic de l'état post-prefill ; relu pour isoler les essais.
+pub(crate) fn state_snapshot_dir() -> Option<std::path::PathBuf> {
+    env_var_os("SARAGOSSA_RUST_STATE_SNAPSHOT")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Les réglages numériques font partie de la clé : changer un kernel ou un
+/// dtype dans le même binaire ne doit pas réutiliser un ancien prefill.
+pub(crate) fn state_snapshot_environment() -> Vec<(String, String)> {
+    let mut flags: Vec<_> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            Some((
+                name.into_string().ok()?,
+                value.to_string_lossy().into_owned(),
+            ))
+        })
+        .filter(|(name, _)| {
+            (name.starts_with("SARAGOSSA_") || name.starts_with("RETI_"))
+                && !name.ends_with("STATE_SNAPSHOT")
+        })
+        .collect();
+    flags.sort();
+    flags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
