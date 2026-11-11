@@ -1790,6 +1790,10 @@ mod tests {
                 model.config.attn_output_gate = true;
                 model.config.num_experts = experts;
                 model.config.num_experts_per_tok = 2;
+                // Cette fixture remplace la config après chargement pour la tête.
+                model.plan = std::sync::Arc::new(crate::decoder::layer_plan::ModelPlan::build(
+                    &model.config,
+                ));
                 match model.with_metal_runtime() {
                     Ok(model) => Ok(Some(model)),
                     Err(InferError::Metal(message)) if message.contains("aucun device") => Ok(None),

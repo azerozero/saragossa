@@ -38,6 +38,30 @@ impl ModelPlan {
         plan.fingerprint = format!("{:x}", md5::compute(format!("{plan:?}")));
         plan
     }
+
+    pub(super) fn log(&self) {
+        let full = self.layers.iter().filter(|layer| layer.is_full()).count();
+        let sliding = self
+            .layers
+            .iter()
+            .filter(|layer| layer.resident.sliding_window.is_some())
+            .count();
+        let nope = self
+            .layers
+            .iter()
+            .filter(|layer| layer.resident.no_rope)
+            .count();
+        eprintln!(
+            "model_plan layers={} full={} linear={} sliding={} nope={} sinks={} fingerprint={}",
+            self.layers.len(),
+            full,
+            self.layers.len() - full,
+            sliding,
+            nope,
+            self.attention_sinks,
+            self.fingerprint
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -57,7 +81,7 @@ pub(crate) enum MixerPlan {
     Linear,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) struct FullPlan {
     pub(crate) head_dim: Option<usize>,
     pub(crate) kv_heads: usize,
@@ -76,6 +100,30 @@ pub(crate) struct FullPlan {
     pub(crate) q_heads: usize,
     pub(crate) query_pre_attn_scalar: Option<f32>,
     pub(crate) attn_output_gate: bool,
+}
+
+// Ces champs descriptifs participent au Debug même sans lecture par un exécuteur.
+impl fmt::Debug for FullPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FullPlan")
+            .field("head_dim", &self.head_dim)
+            .field("kv_heads", &self.kv_heads)
+            .field("kv_dim", &self.kv_dim)
+            .field("rope_dims", &self.rope_dims)
+            .field("rope_frequency_dim", &self.rope_frequency_dim)
+            .field("rope_theta_override", &self.rope_theta_override)
+            .field("rope_position_scale", &self.rope_position_scale)
+            .field("sliding_window", &self.sliding_window)
+            .field("no_rope", &self.no_rope)
+            .field("v_shared_with_k", &self.v_shared_with_k)
+            .field("gemma_full", &self.gemma_full)
+            .field("gemma_sliding", &self.gemma_sliding)
+            .field("local_sliding", &self.local_sliding)
+            .field("q_heads", &self.q_heads)
+            .field("query_pre_attn_scalar", &self.query_pre_attn_scalar)
+            .field("attn_output_gate", &self.attn_output_gate)
+            .finish()
+    }
 }
 
 impl LayerPlan {
@@ -260,27 +308,9 @@ impl LayerResolver<'_> {
         }
     }
 
-    fn layer_rope_dims(&self, layer_index: usize, head_dim: usize) -> usize {
-        if self.is_gemma4_full_layer(layer_index) {
-            self.rope_full_dims.unwrap_or(head_dim)
-        } else if self.is_gemma4_sliding_layer(layer_index) {
-            self.rope_sliding_dims.unwrap_or(head_dim)
-        } else {
-            self.rope_dims.unwrap_or(head_dim)
-        }
-    }
-
     /// Indique si la couche saute le RoPE (NoPE) en gardant la QK-RMSNorm.
     fn is_no_rope_layer(&self, layer_index: usize) -> bool {
         self.no_rope_layers.contains(&layer_index)
-    }
-
-    fn layer_rope_frequency_dim(&self, layer_index: usize, head_dim: usize) -> usize {
-        if self.is_gemma4_full_layer(layer_index) {
-            head_dim
-        } else {
-            self.layer_rope_dims(layer_index, head_dim)
-        }
     }
 
     /// Renvoie la base RoPE locale d'une couche Gemma 3, ou `None` (base globale).
@@ -324,7 +354,7 @@ impl LayerResolver<'_> {
 /// Vue du chargeur : les anciennes étiquettes Gemma n'avaient pas de garde
 /// familiale. Elle reste distincte de la vue du décodeur, y compris pour les
 /// replis de dimensions et de facteur RoPE.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) struct LoaderLayerPlan {
     pub(crate) full: bool,
     pub(crate) gemma_full: bool,
@@ -335,6 +365,23 @@ pub(crate) struct LoaderLayerPlan {
     hidden_size: usize,
     num_attention_heads: usize,
     rope_factor: Option<f32>,
+}
+
+// Ces champs descriptifs participent au Debug même sans lecture par un exécuteur.
+impl fmt::Debug for LoaderLayerPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoaderLayerPlan")
+            .field("full", &self.full)
+            .field("gemma_full", &self.gemma_full)
+            .field("gemma_sliding", &self.gemma_sliding)
+            .field("v_shared_with_k", &self.v_shared_with_k)
+            .field("kv_heads", &self.kv_heads)
+            .field("head_dim", &self.head_dim)
+            .field("hidden_size", &self.hidden_size)
+            .field("num_attention_heads", &self.num_attention_heads)
+            .field("rope_factor", &self.rope_factor)
+            .finish()
+    }
 }
 
 impl LoaderLayerPlan {
@@ -386,6 +433,7 @@ impl LoaderLayerPlan {
             .unwrap_or_else(|| self.hidden_size / self.num_attention_heads)
     }
 
+    #[cfg(test)]
     pub(crate) fn rope_dims(&self) -> usize {
         let head_dim = self.head_dim();
         self.rope_factor

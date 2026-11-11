@@ -84,30 +84,6 @@ struct Decisions {
     sinks: bool,
 }
 
-fn legacy(config: &CausalDecoderConfig, index: usize) -> Decisions {
-    Decisions {
-        index,
-        kind: config.layer_kind(index).map(str::to_owned),
-        gemma_full: config.is_gemma4_full_layer(index),
-        gemma_sliding: config.is_gemma4_sliding_layer(index),
-        full: config.is_full_attention_layer(index),
-        resident_full: config.is_resident_full_attention_layer(index),
-        local: config.is_local_sliding_layer(index),
-        head_dim: config.layer_head_dim(index).map_err(|e| e.to_string()),
-        kv_heads: config.layer_num_key_value_heads(index),
-        rope_dims: [0, 2, 128].map(|h| config.layer_rope_dims(index, h)),
-        rope_frequency_dim: [0, 2, 128].map(|h| config.layer_rope_frequency_dim(index, h)),
-        theta_bits: config.layer_rope_theta_override(index).map(f32::to_bits),
-        scale_bits: config.layer_rope_position_scale(index).map(f32::to_bits),
-        window: config.layer_sliding_window(index),
-        no_rope: config.is_no_rope_layer(index),
-        v_shared: config.attention_k_eq_v && config.is_gemma4_full_layer(index),
-        dense_mlp: (!config.mlp_only_layers.is_empty())
-            .then(|| config.mlp_only_layers.contains(&index)),
-        sinks: config.attention_sinks,
-    }
-}
-
 #[test]
 fn historical_layer_decisions() {
     let mut snapshot = String::new();
@@ -116,16 +92,17 @@ fn historical_layer_decisions() {
         let config = CausalDecoderConfig::from(&model);
         // Inclut la première couche hors de la liste déclarée.
         for index in 0..=config.num_hidden_layers {
-            snapshot.push_str(&format!("{:?}\n", legacy(&config, index)));
+            snapshot.push_str(&format!("{:?}\n", planned(&config, index)));
+            let loader = layer_plan::LoaderLayerPlan::build(&model, index);
             snapshot.push_str(&format!(
                 "loader {:?}\n",
                 (
-                    model.is_gemma4_full_layer(index),
-                    model.is_gemma4_sliding_layer(index),
-                    model.layer_head_dim(index),
-                    model.layer_num_key_value_heads(index),
-                    model.layer_rope_dims(index),
-                    model.is_full_attention_layer(index),
+                    loader.gemma_full,
+                    loader.gemma_sliding,
+                    loader.head_dim(),
+                    loader.kv_heads,
+                    loader.rope_dims(),
+                    loader.full,
                 )
             ));
         }
@@ -140,7 +117,7 @@ fn historical_layer_decisions() {
         };
         snapshot.push_str(&format!("absent_options {interval:?}\n"));
         for index in [0, 1, 2, 3] {
-            snapshot.push_str(&format!("{:?}\n", legacy(&config, index)));
+            snapshot.push_str(&format!("{:?}\n", planned(&config, index)));
         }
     }
     assert_eq!(snapshot, include_str!("layer_plan_snapshots/decisions.txt"));
@@ -150,15 +127,20 @@ fn historical_layer_decisions() {
 fn historical_attention_errors_and_inferred_dimension() {
     use super::attention_ops::full_attention_from_tensors;
     let config = CausalDecoderConfig::default();
-    let mut tensors = HashMap::new();
-    for name in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-        tensors.insert(
-            format!("layers.0.self_attn.{name}.weight"),
-            DecoderTensor::Dense(Tensor::from_vec(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]).unwrap()),
-        );
-    }
+    let attention_tensors = || {
+        let mut tensors = HashMap::new();
+        for name in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            tensors.insert(
+                format!("layers.0.self_attn.{name}.weight"),
+                DecoderTensor::Dense(
+                    Tensor::from_vec(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]).unwrap(),
+                ),
+            );
+        }
+        tensors
+    };
     for norm in ["q_norm", "k_norm"] {
-        let mut partial = tensors.clone();
+        let mut partial = attention_tensors();
         partial.insert(
             format!("layers.0.self_attn.{norm}.weight"),
             DecoderTensor::Dense(Tensor::from_vec(vec![2], vec![1.0; 2]).unwrap()),
@@ -175,9 +157,27 @@ fn historical_attention_errors_and_inferred_dimension() {
             "config modèle invalide: q_norm/k_norm partiels pour layers.0.self_attn"
         );
     }
+    // Même avec une dimension configurée, l'inférence depuis Q reste évaluée
+    // avant le repli : déplacer sa validation changerait l'erreur observable.
+    let invalid = CausalDecoderConfig {
+        num_attention_heads: 0,
+        head_dim: Some(2),
+        ..config.clone()
+    };
+    let error = full_attention_from_tensors(
+        &invalid,
+        &mut attention_tensors(),
+        "layers.0",
+        &LayerPlan::build(&invalid, 0).resident,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "dimension incompatible: num_attention_heads nul pour inférer head_dim"
+    );
     let AttentionBlock::Full(attention) = full_attention_from_tensors(
         &config,
-        &mut tensors,
+        &mut attention_tensors(),
         "layers.0",
         &LayerPlan::build(&config, 0).resident,
     )
@@ -230,8 +230,9 @@ fn historical_resident_dimensions() {
         for index in 0..=config.num_hidden_layers {
             snapshot.push_str(&format!(
                 "kv {index}: {:?}\n",
-                config
-                    .resident_full_attention_kv_dim(index)
+                LayerPlan::build(&config, index)
+                    .resident
+                    .kv_dim()
                     .map_err(|e| e.to_string())
             ));
             for position in [0, 1, 511, 512, 513] {
@@ -275,96 +276,49 @@ fn planned(config: &CausalDecoderConfig, index: usize) -> Decisions {
 }
 
 #[test]
-fn plan_matches_every_legacy_decision() {
-    let mut configs: Vec<_> = fixtures()
-        .into_iter()
-        .map(|(_, c)| CausalDecoderConfig::from(&c))
-        .collect();
-    for interval in [None, Some(0), Some(1), Some(3)] {
-        configs.push(CausalDecoderConfig {
-            num_hidden_layers: 4,
-            full_attention_interval: interval,
-            sliding_window_pattern: interval,
-            rope_position_scale: Some(-0.0),
-            no_rope_layers: vec![0, 3],
-            ..CausalDecoderConfig::default()
-        });
-    }
-    let mut contradictory = configs[5].clone();
-    contradictory.full_attention_interval = Some(2);
-    configs.push(contradictory);
-    configs.push(CausalDecoderConfig {
-        head_dim: Some(usize::MAX),
-        num_key_value_heads: 2,
-        ..CausalDecoderConfig::default()
-    });
-    for config in configs {
+fn plan_keeps_distinct_assembly_and_resident_classification() {
+    let model = crate::qwen_loader::gemma4_test_fixtures::gemma4_unified_dense_config();
+    let mut config = CausalDecoderConfig::from(&model);
+    config.full_attention_interval = Some(2);
+    let plan = ModelPlan::build(&config);
+    assert!(!plan.layers[0].is_full());
+    assert!(plan.layers[0].resident_full);
+    assert_eq!(
+        plan.layers[0].resident.head_dim().unwrap(),
+        model.head_dim()
+    );
+    assert!(plan.layers[1].is_full());
+    assert!(plan.layers[1].resident_full);
+}
+
+#[test]
+fn model_plan_debug_snapshots() {
+    for (family, model) in fixtures() {
+        let config = CausalDecoderConfig::from(&model);
         let plan = ModelPlan::build(&config);
         assert_eq!(plan.layers.len(), config.num_hidden_layers);
         assert_eq!(
             plan.fingerprint,
             format!("{:x}", md5::compute(format!("{plan:?}")))
         );
-        for index in 0..=config.num_hidden_layers {
-            assert_eq!(legacy(&config, index), planned(&config, index));
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            {
-                let layer = layer_plan::LayerPlan::build(&config, index);
-                let full = &layer.resident;
-                assert_eq!(
-                    config
-                        .resident_full_attention_kv_dim(index)
-                        .map_err(|e| e.to_string()),
-                    full.kv_dim().map_err(|e| e.to_string())
-                );
-                fn dims(d: FullAttnLayerDims) -> String {
-                    format!(
-                        "{:?}",
-                        (
-                            d.hidden,
-                            d.q_heads,
-                            d.kv_heads,
-                            d.head_dim,
-                            d.attn_scalar.to_bits(),
-                            d.rope_dims,
-                            d.rope_frequency_dim,
-                            d.position,
-                            d.window_start,
-                            d.eps.to_bits(),
-                            d.theta.to_bits(),
-                            d.attn_output_gate
-                        )
-                    )
-                }
-                assert_eq!(
-                    config
-                        .resident_full_attn_layer_dims(index, 64, 7, 1e-6, 123.0)
-                        .map(dims)
-                        .map_err(|e| e.to_string()),
-                    full.resident_full_attn_layer_dims(64, 7, 1e-6, 123.0)
-                        .map(dims)
-                        .map_err(|e| e.to_string())
-                );
+        let actual = format!("{plan:#?}\n");
+        let expected = match family {
+            "qwen_dense" => include_str!("layer_plan_snapshots/qwen_dense.txt"),
+            "qwen_moe" => include_str!("layer_plan_snapshots/qwen_moe.txt"),
+            "qwen_hybrid" => include_str!("layer_plan_snapshots/qwen_hybrid.txt"),
+            "qwen_hybrid_moe" => include_str!("layer_plan_snapshots/qwen_hybrid_moe.txt"),
+            "gemma3" => include_str!("layer_plan_snapshots/gemma3.txt"),
+            "gemma4_dense" => include_str!("layer_plan_snapshots/gemma4_dense.txt"),
+            "gemma4_moe" => include_str!("layer_plan_snapshots/gemma4_moe.txt"),
+            "flint" => include_str!("layer_plan_snapshots/flint.txt"),
+            "qwen_labels_divergent" => {
+                include_str!("layer_plan_snapshots/qwen_labels_divergent.txt")
             }
-        }
-    }
-}
-
-#[test]
-fn loader_plan_matches_legacy_accessors() {
-    for (_, config) in fixtures() {
-        for index in 0..=config.num_hidden_layers {
-            let plan = layer_plan::LoaderLayerPlan::build(&config, index);
-            assert_eq!(plan.full, config.is_full_attention_layer(index));
-            assert_eq!(plan.gemma_full, config.is_gemma4_full_layer(index));
-            assert_eq!(plan.gemma_sliding, config.is_gemma4_sliding_layer(index));
-            assert_eq!(plan.head_dim(), config.layer_head_dim(index));
-            assert_eq!(plan.kv_heads, config.layer_num_key_value_heads(index));
-            assert_eq!(plan.rope_dims(), config.layer_rope_dims(index));
-            assert_eq!(
-                plan.v_shared_with_k,
-                config.attention_k_eq_v && config.is_gemma4_full_layer(index)
-            );
-        }
+            "gemma4_partial_options" => {
+                include_str!("layer_plan_snapshots/gemma4_partial_options.txt")
+            }
+            _ => panic!("fixture sans snapshot"),
+        };
+        assert_eq!(actual, expected, "{family}");
     }
 }

@@ -138,15 +138,21 @@ fn flint_config() -> CausalDecoderConfig {
 #[test]
 fn flint_layer_types_drive_window_and_nope() {
     let config = flint_config();
-    assert_eq!(config.layer_sliding_window(0), None);
-    assert_eq!(config.layer_sliding_window(1), Some(513));
-    assert!(config.is_no_rope_layer(0) && !config.is_no_rope_layer(1));
+    assert_eq!(LayerPlan::build(&config, 0).resident.sliding_window, None);
+    assert_eq!(
+        LayerPlan::build(&config, 1).resident.sliding_window,
+        Some(513)
+    );
+    assert!(
+        LayerPlan::build(&config, 0).resident.no_rope
+            && !LayerPlan::build(&config, 1).resident.no_rope
+    );
     // Gemma 3 garde son motif historique même avec des `layer_types`.
     let gemma3 = CausalDecoderConfig {
         sliding_from_layer_types: false,
         ..config.clone()
     };
-    assert_eq!(gemma3.layer_sliding_window(1), None);
+    assert_eq!(LayerPlan::build(&gemma3, 1).resident.sliding_window, None);
 }
 
 #[test]
@@ -187,7 +193,7 @@ fn nope_layer_normalizes_qk_without_rotation() {
         .expect("invariant: attention flint") else {
             panic!("invariant: attention full attendue");
         };
-        attention.no_rope = config.is_no_rope_layer(layer);
+        attention.no_rope = LayerPlan::build(&config, layer).resident.no_rope;
         attention
     };
     let normed =
