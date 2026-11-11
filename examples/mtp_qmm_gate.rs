@@ -14,7 +14,7 @@
 use std::time::Instant;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
+use metal::{Device, MTLResourceOptions, MTLSize};
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 const KERNELS: &str = include_str!("../src/kernels.metal");
@@ -45,8 +45,7 @@ fn f32_to_bf16(v: f32) -> u16 {
 fn main() {
     let device = Device::system_default().expect("device Metal");
     let queue = device.new_command_queue();
-    let opts = CompileOptions::new();
-    opts.set_fast_math_enabled(true);
+    let opts = saragossa::metal_backend::compile_options(true);
     let lib = device
         .new_library_with_source(KERNELS, &opts)
         .expect("compile kernels.metal");

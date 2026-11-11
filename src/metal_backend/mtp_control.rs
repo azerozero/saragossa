@@ -36,7 +36,6 @@
 //! supplémentaire.
 
 use super::*;
-use metal::CompileOptions;
 
 /// Position de la prochaine écriture KV (incrémentée de `1 + keep_bonus`).
 pub(crate) const MTP_CTRL_POSITION: usize = 0;
@@ -381,7 +380,10 @@ fn ensure_room(buffer: &BufferRef, offset: u64, bytes: usize, label: &'static st
 impl MtpD1Kernels {
     pub(crate) fn new(device: &Device) -> Result<Self> {
         let library = device
-            .new_library_with_source(&kernel_source(), &CompileOptions::new())
+            .new_library_with_source(
+                &kernel_source(),
+                &crate::metal_backend::compile_options(true),
+            )
             .map_err(|message| InferError::Metal(format!("library MTP D1: {message}")))?;
         let pipeline = |name: &str| -> Result<ComputePipelineState> {
             let function = library

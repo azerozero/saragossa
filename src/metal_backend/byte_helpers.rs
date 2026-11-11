@@ -47,7 +47,6 @@ pub(crate) fn read_u32_buffer(buffer: &BufferRef, len: usize) -> Result<Vec<u32>
     read_pod_buffer(buffer, 0, len)
 }
 
-#[cfg(any(test, feature = "devtools"))]
 pub(crate) fn read_u16_buffer(buffer: &BufferRef, len: usize) -> Result<Vec<u16>> {
     read_pod_buffer(buffer, 0, len)
 }

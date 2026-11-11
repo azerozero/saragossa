@@ -97,6 +97,7 @@ impl DFlashQuant {
 
 #[derive(Debug, Clone)]
 pub struct DFlashDraft {
+    pub(crate) snapshot_sources: crate::decoder::SnapshotSources,
     pub info: DFlashDraftInfo,
     /// Quantification appliquée aux projections (None : dense f32).
     pub quant: Option<DFlashQuant>,
@@ -941,6 +942,14 @@ pub(crate) fn load_dflash_draft_weights_with_runtime(
     quant: Option<DFlashQuant>,
     runtime: ForwardRuntime<'_>,
 ) -> Result<DFlashDraft> {
+    let sources = if crate::runtime_flags::state_snapshot_dir().is_some() {
+        crate::decoder::SnapshotSources::capture([draft_dir
+            .as_ref()
+            .join("model.safetensors")
+            .as_path()])
+    } else {
+        crate::decoder::SnapshotSources::default()
+    };
     let info = load_dflash_draft_for_target(target, draft_dir)?;
     let st = DraftWeights::open(&info.weight_path, runtime)?;
     let hidden = info.hidden_size;
@@ -1062,6 +1071,7 @@ pub(crate) fn load_dflash_draft_weights_with_runtime(
         None
     };
     Ok(DFlashDraft {
+        snapshot_sources: sources.finish_loading(),
         info,
         quant,
         hidden_norm,

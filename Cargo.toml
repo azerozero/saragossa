@@ -42,7 +42,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
 rayon = "1"
-bytemuck = "1"
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 rustfft = "6"
 hound = "3.5"
 md5 = "0.7"
