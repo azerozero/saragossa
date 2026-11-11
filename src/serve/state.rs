@@ -34,6 +34,10 @@ use super::streaming::{
 use super::warmup;
 use crate::RuntimeKind;
 
+#[cfg(test)]
+#[path = "state/reference_goldens.rs"]
+mod reference_goldens;
+
 /// Réponse d'inférence prête à sérialiser en OpenAI.
 #[derive(Debug)]
 pub(super) struct ServedCompletion {
