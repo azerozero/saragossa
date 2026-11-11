@@ -75,13 +75,40 @@ fn claim_legacy_warning(legacy: &str) -> bool {
 /// le point de passage unique pour que le contrat public du crate cesse de
 /// dépendre du nom de son consommateur (cf. ADR 0011, dette « namespace »).
 pub fn env_var(name: &str) -> Option<String> {
+    environment_sha256();
     if let Ok(value) = std::env::var(name) {
+        record_snapshot_ablation(name, &value);
         return Some(value);
     }
     let legacy = legacy_alias(name)?;
     let value = std::env::var(&legacy).ok()?;
     warn_legacy_env_once(&legacy, name);
+    record_snapshot_ablation(name, &value);
     Some(value)
+}
+
+// Un état de préfixe peut survivre au retrait du diagnostic qui l'a produit.
+// Mémoriser dès la lecture du flag, même sans demande d'instantané en cours.
+static SNAPSHOT_ABLATION: OnceLock<&'static str> = OnceLock::new();
+
+/// Les trois premiers flags agissent par présence, les suivants par booléen.
+pub(crate) const SNAPSHOT_ABLATION_FLAGS: [&str; 5] = [
+    "SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM",
+    "SARAGOSSA_RUST_MOE_COOP_SKIP_SHARED",
+    "SARAGOSSA_RUST_VERIFY_SKIP",
+    "SARAGOSSA_RUST_KV_BF16_SIM_KONLY",
+    "SARAGOSSA_RUST_KV_BF16_SIM_VONLY",
+];
+
+fn record_snapshot_ablation(name: &str, value: &str) {
+    if let Some(index) = SNAPSHOT_ABLATION_FLAGS
+        .iter()
+        .position(|&flag| flag == name)
+    {
+        if index < 3 || env_flag_value(value) == Some(true) {
+            let _ = SNAPSHOT_ABLATION.set(SNAPSHOT_ABLATION_FLAGS[index]);
+        }
+    }
 }
 
 /// Lit uniquement le nom demandé, sans alias ni avertissement.
@@ -93,12 +120,15 @@ pub fn env_var_exact(name: &str) -> Option<String> {
 
 /// Variante `OsString` de [`env_var`], pour les flags qui portent un chemin.
 pub fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
+    environment_sha256();
     if let Some(value) = std::env::var_os(name) {
+        record_snapshot_ablation(name, value.to_str().unwrap_or_default());
         return Some(value);
     }
     let legacy = legacy_alias(name)?;
     let value = std::env::var_os(&legacy)?;
     warn_legacy_env_once(&legacy, name);
+    record_snapshot_ablation(name, value.to_str().unwrap_or_default());
     Some(value)
 }
 
@@ -662,6 +692,7 @@ thread_local! {
     // Par thread : les tests comparent les chemins fusionné et historique en
     // parallèle (`OnceLock` non réglable dans le processus de test).
     static QKV_CONCAT_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    static PREFILL_RESIDENT_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
     static ROPE_APPEND_KV_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
@@ -873,7 +904,7 @@ pub(crate) fn verify_skip(part: &str) -> bool {
     VERIFY_SKIP_SCOPE.with(std::cell::Cell::get)
         && PARTS
             .get_or_init(|| {
-                let parts: Vec<String> = env_var("SARAGOSSA_RUST_VERIFY_SKIP")
+                let parts: Vec<String> = env_var(SNAPSHOT_ABLATION_FLAGS[2])
                     .map(|list| {
                         list.split(',')
                             .map(|item| item.trim().to_string())
@@ -1310,19 +1341,6 @@ pub(crate) fn flint_window_kv_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_WINDOW_KV", true))
 }
 
-/// K/V full-attention en buffers « placement sparse » Metal 4
-/// (`SARAGOSSA_RUST_KV_SPARSE=1`, opt-in) : un buffer privé virtuel au
-/// contexte maximal dont seules les tuiles écrites occupent de la RAM
-/// (`metal_backend::sparse`). Exige `supportsPlacementSparse` (macOS 26.4) ;
-/// sans lui, le chemin partagé actuel reste utilisé. Déclaré pour A2 : aucun
-/// chemin ne le lit encore.
-#[cfg(all(target_os = "macos", feature = "metal"))]
-#[expect(dead_code, reason = "lu par le branchement du K/V sparse (A2)")]
-pub(crate) fn kv_sparse_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_KV_SPARSE", false))
-}
-
 /// Suffixe minimal (tokens) pour prolonger un préfixe en cache par le prefill
 /// résident par morceaux plutôt que par l'extension en lignes. Mesuré le
 /// 2026-10-25 (serve AR, 27B 4 bits, préfixe ~10k) : égalité jusqu'à 16 tokens
@@ -1443,8 +1461,17 @@ pub(crate) fn flint_prefill_steel_enabled() -> bool {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = PREFILL_RESIDENT_TEST_OVERRIDE.with(Cell::get) {
+        return forced;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT", true))
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+pub(crate) fn with_prefill_resident_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    with_test_override(&PREFILL_RESIDENT_TEST_OVERRIDE, enabled, run)
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
@@ -2091,9 +2118,207 @@ pub(super) fn print_layer_profile(
     );
 }
 
+/// Diagnostic C1B (hors prod) : arrondit **seulement K** au seed prefill (V reste
+/// f32 exact), pour isoler l'effet de la précision des clés (→ scores) sur la
+/// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_KONLY=1`, défaut OFF. À utiliser avec
+/// `SARAGOSSA_RUST_KV_BF16=0` (buffers f32). N'arrondit que le seed, pas les lignes
+/// appendées en decode (négligeables devant le prompt).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn kv_bf16_sim_konly() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag(SNAPSHOT_ABLATION_FLAGS[3], false))
+}
+
+/// Diagnostic C1B (hors prod) : arrondit **seulement V** au seed prefill (K reste
+/// f32 exact), pour isoler l'effet de la précision des valeurs (→ sortie) sur la
+/// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_VONLY=1`, défaut OFF.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn kv_bf16_sim_vonly() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag(SNAPSHOT_ABLATION_FLAGS[4], false))
+}
+
+/// Refus conservateur des diagnostics qui retirent un calcul ou altèrent le seed.
+/// Les flags MoE sont actifs par présence, y compris "0" ou une chaîne vide,
+/// exactement comme dans moe_na. VERIFY_SKIP est refusé même hors de sa portée
+/// de bench, pour ne jamais mêler cette expérience à un instantané complet.
+pub(crate) fn state_snapshot_ablation() -> Option<&'static str> {
+    if SNAPSHOT_ABLATION.get().is_none() {
+        for flag in SNAPSHOT_ABLATION_FLAGS {
+            env_var(flag);
+        }
+    }
+    SNAPSHOT_ABLATION.get().copied()
+}
+
+thread_local! {
+    static SNAPSHOT_WARMUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Exclut les prompts de chauffe des instantanés sur le thread courant.
+/// Les portées imbriquées restaurent l'état précédent, y compris sur erreur.
+#[must_use]
+pub struct StateSnapshotWarmup {
+    previous: bool,
+    // La restauration doit avoir lieu sur le thread qui a ouvert la portée.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl StateSnapshotWarmup {
+    /// Ouvre une portée de chauffe sans lecture ni écriture d'instantané.
+    pub fn enter() -> Self {
+        Self {
+            previous: SNAPSHOT_WARMUP.replace(true),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for StateSnapshotWarmup {
+    fn drop(&mut self) {
+        SNAPSHOT_WARMUP.set(self.previous);
+    }
+}
+
+pub(crate) fn state_snapshot_warmup() -> bool {
+    SNAPSHOT_WARMUP.get()
+}
+
+/// Répertoire fixé au premier accès ; l'absence ne crée même pas l'alias historique.
+pub(crate) fn state_snapshot_dir() -> Option<&'static std::path::Path> {
+    environment_sha256();
+    static ROOT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        std::env::var_os("SARAGOSSA_RUST_STATE_SNAPSHOT")
+            .or_else(|| std::env::var_os("RETI_RUST_STATE_SNAPSHOT"))
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .as_deref()
+}
+
+/// Surcharges hors environnement, relues uniquement à la demande d'instantané.
+pub(crate) fn state_snapshot_overrides() -> String {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let force_resident_full_linear = FORCE_RESIDENT_FULL_LINEAR.load(Ordering::Relaxed);
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let force_resident_full_linear = false;
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    let pairwise = pairwise::current();
+    #[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+    let pairwise: Option<()> = None;
+    format!("force_resident_full_linear={force_resident_full_linear};pairwise={pairwise:?}")
+}
+
+/// Empreinte de tout l'environnement moteur au premier accès runtime.
+/// Les longueurs séparent les noms/valeurs sans ambiguïté ; le binaire couvre les défauts.
+pub(crate) fn environment_sha256() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| hash_environment(std::env::vars_os()))
+}
+
+fn hash_environment(
+    variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut variables: Vec<_> = variables
+        .into_iter()
+        .filter(|(name, _)| {
+            let name = name.as_encoded_bytes();
+            name.starts_with(ENV_PREFIX.as_bytes())
+                || name.starts_with(LEGACY_ENV_PREFIX.as_bytes())
+        })
+        .collect();
+    variables.sort_unstable();
+    let mut hash = Sha256::new();
+    for (name, value) in variables {
+        for field in [name, value] {
+            // Encodage sans perte, stable sur la plateforme du binaire qui fait
+            // aussi partie de la clé ; aucune conversion Unicode, même au filtre.
+            let bytes = field.as_encoded_bytes();
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+    }
+    format!("{:x}", hash.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_hash_preserves_non_unicode_and_field_boundaries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let entry = |name: &[u8], value: &[u8]| {
+            (
+                OsString::from_vec(name.to_vec()),
+                OsString::from_vec(value.to_vec()),
+            )
+        };
+        let initial = vec![
+            entry(b"SARAGOSSA_SETTING", b"\xff"),
+            entry(b"RETI_SETTING\xfe", b"legacy"),
+        ];
+        let expected = hash_environment(initial.clone());
+        let mut reversed = initial.clone();
+        reversed.reverse();
+        reversed.push(entry(b"UNRELATED\xff", b"\xfe"));
+        assert_eq!(expected, hash_environment(reversed));
+        for (name, value) in [
+            (b"SARAGOSSA_SETTING".as_slice(), b"\xfe".as_slice()),
+            (b"SARAGOSSA_SETTING", "\u{fffd}".as_bytes()),
+            (b"SARAGOSSA_SETTING\xff", b""),
+        ] {
+            let mut changed = initial.clone();
+            changed[0] = entry(name, value);
+            assert_ne!(expected, hash_environment(changed));
+        }
+        let mut changed = initial.clone();
+        changed[1] = entry(b"RETI_SETTING\xff", b"legacy");
+        assert_ne!(expected, hash_environment(changed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_runtime_access_accepts_non_unicode_environment_without_snapshots() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        const CHILD: &str = "SNAPSHOT_NON_UNICODE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(env_var("SARAGOSSA_TEST_UNICODE").as_deref(), Some("ok"));
+            assert!(state_snapshot_dir().is_none());
+            assert_eq!(environment_sha256(), &hash_environment(std::env::vars_os()));
+            let before = environment_sha256().to_owned();
+            std::env::set_var("SARAGOSSA_TEST_RAW", "changed");
+            assert_eq!(environment_sha256(), before);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime_flags::tests::first_runtime_access_accepts_non_unicode_environment_without_snapshots",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("SARAGOSSA_RUST_STATE_SNAPSHOT")
+            .env_remove("RETI_RUST_STATE_SNAPSHOT")
+            .env("UNRELATED_RAW", OsString::from_vec(vec![0xff]))
+            .env(OsString::from_vec(b"UNRELATED_\xff".to_vec()), "value")
+            .env("SARAGOSSA_TEST_UNICODE", "ok")
+            .env("SARAGOSSA_TEST_RAW", OsString::from_vec(vec![0xfe]))
+            .env(OsString::from_vec(b"RETI_TEST_\xff".to_vec()), "value")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn decode_interval_nanos_for_rate_converts_tok_s_to_interval() {

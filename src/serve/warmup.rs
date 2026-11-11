@@ -36,6 +36,7 @@ pub(super) fn decoder(
     backend: RuntimeKind,
     model_id: &str,
 ) -> ServeResult<()> {
+    let _warmup = saragossa::runtime_flags::StateSnapshotWarmup::enter();
     let Some(config) = config_from_env(backend) else {
         return Ok(());
     };
@@ -79,6 +80,7 @@ pub(super) fn mtp_decoder(
     backend: RuntimeKind,
     model_id: &str,
 ) -> ServeResult<()> {
+    let _warmup = saragossa::runtime_flags::StateSnapshotWarmup::enter();
     if backend != RuntimeKind::Metal {
         return Ok(());
     }
