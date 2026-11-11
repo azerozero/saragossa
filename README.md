@@ -10,6 +10,40 @@ no Python, no MLX, no CoreML. LLM, speech-to-text and text-to-speech in a single
 binary — usable as a library or behind the OpenAI-compatible HTTP server
 `saragossa serve`.
 
+## CPU builds on Linux and Windows
+
+Linux and Windows support the CPU reference backend (correctness first, slow
+for large models). No GPU backend is provided there. The default `metal`
+feature stays enabled for compatibility with macOS, but its dependency and
+implementation are compiled only on macOS. Existing Apple Silicon builds keep
+their Metal path.
+
+```sh
+cargo build
+cargo build --no-default-features                     # library only
+cargo build --no-default-features --features devtools # library and CLI
+cargo test --lib --no-default-features --features devtools
+```
+
+On Windows, use TCP explicitly; Unix sockets are unavailable. Start the server
+with `saragossa serve --backend cpu --port 8090 --api-key TOKEN --model ID=DIR`,
+where `DIR` is the local weights directory. For `bench-serve`, use
+`--url 127.0.0.1:8090 --api-key TOKEN`. TCP requires bearer authentication;
+there is no automatic unauthenticated fallback from a Unix socket.
+
+On Linux, the predictive memory guard reads total host RAM from
+`/proc/meminfo` and process RSS from `/proc/self/status`. It does not account
+for cgroup limits, swapped pages, or system-wide memory pressure; the pressure
+watcher remains macOS-only. On Windows, the system memory guard is disabled
+with a warning because no process footprint probe is available. CPU BF16
+weights use the existing f32 fallback, which needs more memory than compact
+Metal storage.
+
+The checkpoint converter flushes output files before renaming them. On Unix,
+it also synchronizes the parent directory. On Windows, directory synchronization
+is unavailable through the standard library: file contents are flushed, but
+the rename is not guaranteed to survive a power loss.
+
 ## Where it fits
 
 Among inference backends (Ollama, llama.cpp, vLLM, SGLang…), saragossa occupies

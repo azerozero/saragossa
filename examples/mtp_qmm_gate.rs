@@ -10,28 +10,38 @@
 //!
 //! cargo run --release -p saragossa --example mtp_qmm_gate --features metal
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use std::time::Instant;
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use metal::{Device, MTLResourceOptions, MTLSize};
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
 const KERNELS: &str = include_str!("../src/kernels.metal");
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
 const WARMUP: usize = 8;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 const CBS: usize = 60;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 const REPS: usize = 48;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 const ROTATE: usize = 8;
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
 struct Shape {
     name: &'static str,
     out_dim: usize,
     in_dim: usize,
 }
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn f32_to_bf16(v: f32) -> u16 {
     let b = v.to_bits();
     ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn main() {
     let device = Device::system_default().expect("device Metal");
     let queue = device.new_command_queue();
@@ -281,4 +291,9 @@ fn main() {
         );
     }
     println!("\nV_batch/D = t(M)/t(M=1). Cible ≤1.3 (gain spéculatif). Si ~M (≈2.0/≈4.0) ⇒ rhs_t relit les poids/ligne ⇒ qmm petit-M dédié requis.");
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    Err("cet exemple nécessite macOS et la feature metal".into())
 }

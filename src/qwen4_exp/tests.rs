@@ -74,7 +74,7 @@ impl Golden {
         // Lecture de la seule plage du tenseur (goldens N2 de plusieurs Go).
         let file = std::fs::File::open(&self.path).expect("invariant: golden");
         let mut bytes = vec![0_u8; entry.data_offsets[1] - entry.data_offsets[0]];
-        std::os::unix::fs::FileExt::read_exact_at(
+        crate::safetensor::pread_exact(
             &file,
             &mut bytes,
             header.data_start + entry.data_offsets[0] as u64,

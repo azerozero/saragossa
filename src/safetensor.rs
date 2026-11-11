@@ -267,6 +267,90 @@ pub(crate) fn apply_fp8_block_scales_in_place(
     Ok(())
 }
 
+/// Lit exactement une plage du fichier, sans dépendre du curseur partagé.
+/// Sous Windows, `seek_read` peut renvoyer une lecture partielle.
+pub(crate) fn pread_exact(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        read_exact_at_with(buf, offset, |buf, offset| file.seek_read(buf, offset))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn read_exact_at_with(
+    mut buf: &mut [u8],
+    mut offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    while !buf.is_empty() {
+        match read(buf, offset) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                if !buf.is_empty() {
+                    offset = offset.checked_add(n as u64).ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidInput, "offset de lecture hors plage")
+                    })?;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Écrit intégralement une plage, y compris après une écriture partielle.
+#[cfg(feature = "devtools")]
+pub(crate) fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        write_all_at_with(buf, offset, |buf, offset| file.seek_write(buf, offset))
+    }
+}
+
+#[cfg(all(feature = "devtools", any(windows, test)))]
+fn write_all_at_with(
+    mut buf: &[u8],
+    mut offset: u64,
+    mut write: impl FnMut(&[u8], u64) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    while !buf.is_empty() {
+        match write(buf, offset) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                buf = &buf[n..];
+                if !buf.is_empty() {
+                    offset = offset.checked_add(n as u64).ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidInput, "offset d'écriture hors plage")
+                    })?;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn read_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|source| InferError::Io {
         path: PathBuf::from(path),
@@ -439,6 +523,125 @@ fn f8_to_f32(byte: u8, exponent_bits: u8, mantissa_bits: u8, bias: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positioned_reads_cover_ranges_empty_buffers_and_eof() -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = tempfile::tempfile()?;
+        file.write_all(b"abcdef")?;
+        let mut bytes = [0; 3];
+        pread_exact(&file, &mut bytes, 2)?;
+        assert_eq!(&bytes, b"cde");
+        pread_exact(&file, &mut [], u64::MAX)?;
+        assert_eq!(
+            pread_exact(&file, &mut bytes, 4).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        // Les lecteurs parallèles partagent le fichier mais pas leur offset.
+        std::thread::scope(|scope| {
+            let file = &file;
+            let readers: Vec<_> = (0..6)
+                .map(|offset| {
+                    scope.spawn(move || {
+                        let mut byte = [0];
+                        pread_exact(file, &mut byte, offset).unwrap();
+                        assert_eq!(byte[0], b'a' + offset as u8);
+                    })
+                })
+                .collect();
+            for reader in readers {
+                reader.join().unwrap();
+            }
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn positioned_read_loop_retries_and_advances_after_short_reads() -> std::io::Result<()> {
+        use std::io::ErrorKind;
+        let mut bytes = [0; 3];
+        let mut calls = 0;
+        read_exact_at_with(&mut bytes, 5, |buf, offset| {
+            calls += 1;
+            if calls == 1 {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            buf[0] = offset as u8;
+            Ok(1)
+        })?;
+        assert_eq!(bytes, [5, 6, 7]);
+        assert_eq!(calls, 4);
+        assert_eq!(
+            read_exact_at_with(&mut bytes, 0, |_, _| Ok(0))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_exact_at_with(&mut bytes, u64::MAX, |_, _| Ok(1))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            read_exact_at_with(
+                &mut bytes,
+                0,
+                |_, _| Err(ErrorKind::PermissionDenied.into())
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::PermissionDenied
+        );
+        read_exact_at_with(&mut [], 0, |_, _| {
+            panic!("invariant: aucune lecture pour une plage vide")
+        })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn positioned_writes_handle_partial_writes_and_preserve_other_bytes() -> std::io::Result<()> {
+        use std::io::{ErrorKind, Write};
+        let mut file = tempfile::tempfile()?;
+        file.write_all(b"abcdef")?;
+        pwrite_all(&file, b"XY", 2)?;
+        let mut bytes = [0; 6];
+        pread_exact(&file, &mut bytes, 0)?;
+        assert_eq!(&bytes, b"abXYef");
+        let mut written = Vec::new();
+        let mut calls = 0;
+        write_all_at_with(b"abc", 7, |buf, offset| {
+            calls += 1;
+            if calls == 1 {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            written.push((offset, buf[0]));
+            Ok(1)
+        })?;
+        assert_eq!(written, [(7, b'a'), (8, b'b'), (9, b'c')]);
+        assert_eq!(
+            write_all_at_with(b"a", 0, |_, _| Ok(0)).unwrap_err().kind(),
+            ErrorKind::WriteZero
+        );
+        assert_eq!(
+            write_all_at_with(b"ab", u64::MAX, |_, _| Ok(1))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            write_all_at_with(b"a", 0, |_, _| Err(ErrorKind::PermissionDenied.into()))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        write_all_at_with(b"", 0, |_, _| {
+            panic!("invariant: aucune écriture pour une plage vide")
+        })?;
+        Ok(())
+    }
+
     use safetensors::{serialize, View};
     use std::borrow::Cow;
 

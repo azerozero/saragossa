@@ -1,5 +1,6 @@
 //! Génération, préfill et tête MTP du décodeur causal.
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::runtime_flags::mtp_sampled_enabled;
 use crate::sampling::{
     lossless_speculative_sample, lossless_speculative_sample_dense, sample_from_dense_distribution,

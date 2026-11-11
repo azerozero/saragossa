@@ -178,14 +178,24 @@ impl Writer {
         io(&path, file.write_all(&bytes))?;
         io(&path, file.sync_all())?;
         let dir = self.root.join(&self.generation);
-        io(&dir, File::open(&dir).and_then(|f| f.sync_all()))?;
+        io(&dir, sync_dir(&dir))?;
         io(&path, fs::rename(&path, self.root.join("manifest.json")))?;
         self.published = true;
-        io(
-            &self.root,
-            File::open(&self.root).and_then(|f| f.sync_all()),
-        )
+        io(&self.root, sync_dir(&self.root))
     }
+}
+
+/// Windows ne fournit pas de `fsync` de dossier via la bibliothèque standard :
+/// les fichiers sont synchronisés avant renommage, mais la persistance du
+/// renommage après une coupure de courant n'y est pas garantie.
+#[cfg(not(windows))]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir).and_then(|f| f.sync_all())
+}
+
+#[cfg(windows)]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 impl Drop for Writer {
     fn drop(&mut self) {
