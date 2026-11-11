@@ -270,7 +270,7 @@ fn resolve_model_dirs(args: &DoctorArgs) -> CliResult<Vec<PathBuf>> {
     }
     let mut roots = args.model_roots.clone();
     if roots.is_empty() {
-        if let Ok(value) = std::env::var("SARAGOSSA_MODEL_ROOTS") {
+        if let Some(value) = saragossa::runtime_flags::env_var_exact("SARAGOSSA_MODEL_ROOTS") {
             roots.extend(
                 value
                     .split(':')

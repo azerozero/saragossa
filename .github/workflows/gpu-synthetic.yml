@@ -91,6 +91,7 @@ jobs:
             metal_backend::tests::rows_exact_qmvt_chained_in_one_encoder
             metal_backend::tests::qmv_u4_residual_matches_two_step_and_cpu
             metal_backend::tests::qmv_u4_residual_falls_back_without_mutation
+            metal_backend::tests::bf16_rhs_cache_recovers_after_poisoning
             metal_backend::prefill::tests::prefill_resident_capture_tail_matches_full
             decoder::tests::mtp_d1_resident_state_lease_survives_pool_reuse
           )

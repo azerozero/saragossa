@@ -1238,10 +1238,11 @@ fn n2_resident_decode_matches_cpu_reference() {
     use crate::qwen4_exp::Qwen4ExpReference;
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
-    let golden =
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
     let tokens: usize = std::env::var("SARAGOSSA_QWEN4EXP_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1521,12 +1522,13 @@ fn flash_next_step_bits_dump() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     use std::io::Write;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
-    let golden =
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
     let out = std::env::var_os("SARAGOSSA_FLASH_NEXT_BITS_OUT")
-        .expect("SARAGOSSA_FLASH_NEXT_BITS_OUT requis");
+        .expect("invariant: SARAGOSSA_FLASH_NEXT_BITS_OUT requis");
     let (context, steps) = (2048, 8);
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let mut session = FlashNextSession::open(
@@ -1567,10 +1569,11 @@ fn flash_next_step_bits_dump() {
 fn bench_resident_decode_after_1k_context() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
-    let golden =
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
     let runs: usize = crate::runtime_flags::env_var("SARAGOSSA_FLASH_NEXT_BENCH_RUNS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
@@ -1685,10 +1688,11 @@ fn resident_config_validation_accepts_flash_next_and_refuses_variants() -> Resul
 fn resident_session_recovers_after_ple_and_encode_failures() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
-    let golden =
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
     let ids: Vec<usize> = n2_input_ids(std::path::Path::new(&golden))[..16].to_vec();
     let open = || {
         FlashNextSession::open(
@@ -1860,7 +1864,7 @@ fn resident_session_recovers_after_ple_and_encode_failures() {
     let refused = session
         .step(ids[4], true, false)
         .err()
-        .expect("pas accepté après un reset partiel");
+        .expect("invariant: pas accepté après un reset partiel");
     assert!(
         refused.to_string().contains("session invalidée"),
         "refus inattendu : {refused}"
@@ -1948,10 +1952,11 @@ fn load_plan_guard_refuses_transient_peak_above_final_resident() -> Result<()> {
 fn profile_resident_decode_after_1k_context() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
-    let golden =
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
     let (context, generated) = (1024, 128);
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let mut session = FlashNextSession::open(
@@ -1969,7 +1974,7 @@ fn profile_resident_decode_after_1k_context() {
     }
     session
         .profiler_mut()
-        .expect("SARAGOSSA_FLASH_NEXT_PROFILE=1 requis")
+        .expect("invariant: SARAGOSSA_FLASH_NEXT_PROFILE=1 requis")
         .clear();
     let started = std::time::Instant::now();
     for _ in 0..generated {
@@ -2824,11 +2829,12 @@ fn bench_resident_decode_after_32k_context() {
     use crate::qwen_loader::qwen4_exp::{Qwen4ExpCheckpoint, Qwen4ExpLayerKind};
     use crate::rope::inv_freq;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
     let corpus = std::path::PathBuf::from(
         std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
-            .expect("SARAGOSSA_FLASH_NEXT_CORPUS requis"),
+            .expect("invariant: SARAGOSSA_FLASH_NEXT_CORPUS requis"),
     );
     let runs: usize = crate::runtime_flags::env_var("SARAGOSSA_FLASH_NEXT_BENCH_RUNS")
         .and_then(|v| v.parse().ok())
@@ -3008,7 +3014,8 @@ fn mtp_failed_raw_restore_poisons_session() {
     use super::session::MtpInput;
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
     let mut session = FlashNextSession::open(
         Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
@@ -3072,7 +3079,8 @@ fn resident_session_allocates_max_capacity() {
     use super::session::{session_state_bytes, MAX_CAPACITY};
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
     let config = Qwen4ExpCheckpoint::open(&dir)
         .expect("invariant: checkpoint")
@@ -3279,10 +3287,12 @@ fn n2_resident_mtp_head_matches_cpu() {
     use crate::qwen4_exp::Qwen4ExpReference;
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
     let golden_dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis"),
     );
     let golden = golden_dir.join("mtp_golden.safetensors");
     let next = golden_i64(&golden, "mtp_next_ids");
@@ -3948,10 +3958,11 @@ fn n2_resident_mtp_head_matches_cpu() {
 fn resident_verify_rows_and_accept_match_ar_bitwise() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
-    let golden =
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let rows = super::session::VERIFY_ROWS;
     let open = || {
@@ -4162,13 +4173,14 @@ fn speculative_greedy_matches_ar_bitwise() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let none = SpecOptions::default();
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
-    let golden =
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
     let corpus = std::path::PathBuf::from(
         std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
-            .expect("SARAGOSSA_FLASH_NEXT_CORPUS requis"),
+            .expect("invariant: SARAGOSSA_FLASH_NEXT_CORPUS requis"),
     );
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let wiki: Vec<usize> = std::fs::read(corpus.join("ids.u32"))
@@ -4624,13 +4636,14 @@ fn measure_subvocab_draft_acceptance() {
     use super::speculative::{generate_ar, generate_speculative, Generation, SpecOptions};
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
-    let golden =
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
     let corpus = std::path::PathBuf::from(
         std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
-            .expect("SARAGOSSA_FLASH_NEXT_CORPUS requis"),
+            .expect("invariant: SARAGOSSA_FLASH_NEXT_CORPUS requis"),
     );
     let tokenizer =
         tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("invariant: tokenizer");
@@ -4740,10 +4753,11 @@ fn bench_speculative_mono_vs_ar() {
     use super::speculative::{generate_ar, generate_speculative};
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR").expect("SARAGOSSA_QWEN4EXP_DIR requis"),
+        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
+            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
     );
-    let golden =
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN").expect("SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
+        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let tokenizer =
         tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("invariant: tokenizer");

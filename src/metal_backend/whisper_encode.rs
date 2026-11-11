@@ -8,6 +8,7 @@
 
 use super::*;
 use std::ffi::c_void;
+use std::sync::PoisonError;
 
 impl MetalExecutor {
     /// Encode une LayerNorm ligne par ligne : `out = (x-µ)/σ · weight + bias`.
@@ -433,10 +434,12 @@ impl MetalExecutor {
                 data.len()
             )));
         }
+        // Le cache ne reçoit que des buffers entièrement construits, sans
+        // mutation de leur contenu sous verrou : l'empoisonnement les laisse valides.
         if let Some(buf) = self
             .bf16_rhs_t_cache
             .lock()
-            .expect("invariant: bf16_rhs_t_cache lock")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&key)
         {
             return Ok(buf.clone());
@@ -457,7 +460,7 @@ impl MetalExecutor {
         );
         self.bf16_rhs_t_cache
             .lock()
-            .expect("invariant: bf16_rhs_t_cache lock")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(key, buffer.clone());
         Ok(buffer)
     }

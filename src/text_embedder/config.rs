@@ -43,7 +43,7 @@ mod tests {
                 "vocab_size": 250037
             }"#,
         )
-        .expect("sous-ensemble valide");
+        .expect("invariant: sous-ensemble valide");
         assert_eq!(cfg.hidden_size, 384);
         assert_eq!(cfg.num_hidden_layers, 12);
         assert_eq!(cfg.num_attention_heads, 12);
@@ -56,7 +56,7 @@ mod tests {
         let cfg: BertConfig = serde_json::from_str(
             r#"{"hidden_size": 8, "num_hidden_layers": 1, "num_attention_heads": 2}"#,
         )
-        .expect("clés optionnelles absentes");
+        .expect("invariant: clés optionnelles absentes");
         assert_eq!(cfg.layer_norm_eps, 1e-12);
         assert_eq!(cfg.pad_token_id, 0);
     }

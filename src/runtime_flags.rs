@@ -84,6 +84,13 @@ pub fn env_var(name: &str) -> Option<String> {
     Some(value)
 }
 
+/// Lit uniquement le nom demandé, sans alias ni avertissement.
+///
+/// Préserve le contrat des réglages qui n'ont jamais accepté de préfixe hérité.
+pub fn env_var_exact(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 /// Variante `OsString` de [`env_var`], pour les flags qui portent un chemin.
 pub fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
     if let Some(value) = std::env::var_os(name) {
@@ -2123,10 +2130,32 @@ mod tests {
         assert_eq!(legacy_alias("RETI_RUST_TRUC"), None);
     }
 
-    // Les trois tests d'env ci-dessous partagent le même processus : un mutex
+    // Les tests d'env ci-dessous partagent le même processus : un mutex
     // les sérialise, sans quoi les `set_var`/`remove_var` fuient d'un test à
     // l'autre sous le harness multi-thread de Cargo.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_var_exact_preserves_values_without_legacy_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let name = "SARAGOSSA_TEST_EXACT";
+        let legacy = "RETI_TEST_EXACT";
+        std::env::remove_var(name);
+        std::env::set_var(legacy, "herite");
+        assert_eq!(env_var_exact(name), None);
+        for value in ["", "  canonique  "] {
+            std::env::set_var(name, value);
+            assert_eq!(env_var_exact(name).as_deref(), Some(value));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::env::set_var(name, std::ffi::OsStr::from_bytes(&[0xff]));
+            assert_eq!(env_var_exact(name), None);
+        }
+        std::env::remove_var(name);
+        std::env::remove_var(legacy);
+    }
 
     #[test]
     fn env_var_prefers_canonical_over_legacy() {

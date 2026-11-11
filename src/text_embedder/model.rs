@@ -361,12 +361,13 @@ mod tests {
             .map(|(n, d, s)| {
                 (
                     n.as_str(),
-                    TensorView::new(Dtype::F32, s.clone(), d).expect("view synthétique valide"),
+                    TensorView::new(Dtype::F32, s.clone(), d)
+                        .expect("invariant: view synthétique valide"),
                 )
             })
             .collect();
-        let buf = safetensors::serialize(views, None).expect("serialize mini-BERT");
-        BertWeights::from_safetensors_bytes(&buf, H, 1, 2).expect("chargement mini-BERT")
+        let buf = safetensors::serialize(views, None).expect("invariant: serialize mini-BERT");
+        BertWeights::from_safetensors_bytes(&buf, H, 1, 2).expect("invariant: chargement mini-BERT")
     }
 
     fn tiny_embedder() -> TextEmbedder {
@@ -374,7 +375,7 @@ mod tests {
         // WordLevel vide suffit à construire la struct.
         let model = tokenizers::models::wordlevel::WordLevel::builder()
             .build()
-            .expect("wordlevel vide");
+            .expect("invariant: wordlevel vide");
         TextEmbedder {
             w: tiny_bert(),
             cfg: BertConfig {

@@ -207,6 +207,32 @@ fn qmv_m1_bf16_microbench() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requiert un device Metal pour le cache de buffers BF16"]
+fn bf16_rhs_cache_recovers_after_poisoning() -> Result<()> {
+    let executor = MetalExecutor::new()?;
+    let data = [1.0_f32, 2.0, 3.0, 4.0];
+    let first = executor.cached_rhs_t_bf16_matrix(&data, 2, 2, 1)?;
+    // Simule un appelant interrompu après l'insertion d'un buffer valide.
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = executor
+            .bf16_rhs_t_cache
+            .lock()
+            .expect("invariant: cache neuf non empoisonné");
+        panic!("empoisonnement volontaire du cache de test");
+    }));
+    assert!(poisoned.is_err());
+    assert!(executor.bf16_rhs_t_cache.is_poisoned());
+    let cached = executor.cached_rhs_t_bf16_matrix(&data, 2, 2, 1)?;
+    assert_eq!(first.contents(), cached.contents());
+    let second = executor.cached_rhs_t_bf16_matrix(&data, 2, 2, 2)?;
+    assert_ne!(first.contents(), second.contents());
+    let cached_second = executor.cached_rhs_t_bf16_matrix(&data, 2, 2, 2)?;
+    assert_eq!(second.contents(), cached_second.contents());
+    assert_eq!(second.length(), 8);
+    Ok(())
+}
+
+#[test]
 fn na_gemm_matches_bf16_cpu() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());

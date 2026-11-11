@@ -1,3 +1,4 @@
+use crate::quantization::bytes_to_u32;
 use crate::safetensor::bytes_to_dense_f32;
 use crate::{InferError, Result, Tensor};
 use safetensors::Dtype;
@@ -224,21 +225,4 @@ fn parse_dtype(dtype: &str) -> Option<Dtype> {
         "F8_E5M2" => Some(Dtype::F8_E5M2),
         _ => None,
     }
-}
-
-fn bytes_to_u32(bytes: &[u8], name: &str) -> Result<Vec<u32>> {
-    let chunks = bytes.chunks_exact(4);
-    if !chunks.remainder().is_empty() {
-        return Err(InferError::Shape(format!(
-            "tensor {name} U32 avec {} octets non multiple de 4",
-            bytes.len()
-        )));
-    }
-    chunks
-        .map(|chunk| {
-            let arr = <[u8; 4]>::try_from(chunk)
-                .map_err(|_| InferError::Shape(format!("chunk U32 invalide pour {name}")))?;
-            Ok(u32::from_le_bytes(arr))
-        })
-        .collect()
 }

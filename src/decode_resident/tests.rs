@@ -4372,7 +4372,7 @@ fn kv_arena_adopts_prefill_bf16_buffers() -> Result<()> {
     let all_keys = [KvSegment::SharedBf16(&key_view), tail_segments[0]];
     let all_values = [KvSegment::SharedBf16(&value_view), tail_segments[0]];
 
-    let mut adopted = adopt(capacity)?.expect("adoption de buffers qui ont la place");
+    let mut adopted = adopt(capacity)?.expect("invariant: adoption de buffers qui ont la place");
     assert_eq!(adopted.keys().buffer().contents(), keys.contents());
     assert!(adopt(capacity)?.is_none(), "réserve déjà tenue");
     assert!(
@@ -4487,7 +4487,7 @@ fn kv_arena_adoption_revalidates_after_concurrent_extension() -> Result<()> {
         .iter()
         .all(|&bits| bits == marker));
     drop(longer);
-    let adopted = adopt()?.expect("plus aucune vue au-delà du préfixe");
+    let adopted = adopt()?.expect("invariant: plus aucune vue au-delà du préfixe");
     assert_eq!(adopted.len(), prefix);
     Ok(())
 }
