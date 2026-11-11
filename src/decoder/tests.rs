@@ -5923,3 +5923,185 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
     );
     Ok(())
 }
+
+/// Le branchement du prefill MTP doit être exercé par la génération : le repli
+/// calcule aussi les bons K/V, mais les matérialise sur CPU avant leur publication.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_generation_publishes_shared_seed_history() -> Result<()> {
+    use crate::decode_resident::KvSegment;
+
+    assert!(prefix_cache_enabled());
+    assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
+    const VOCAB: usize = 97;
+    const HIDDEN: usize = 64;
+    const KV_DIM: usize = 2 * 256;
+    let config = CausalDecoderConfig {
+        num_attention_heads: 16,
+        num_key_value_heads: 2,
+        head_dim: Some(256),
+        rope_theta: Some(10_000_000.0),
+        ..CausalDecoderConfig::default()
+    };
+    let mut model =
+        CausalDecoder::from_tensors(resident_bf16_qwen_weights(VOCAB, HIDDEN)?, config)?;
+    let layer = &model.layers[0];
+    let AttentionBlock::Full(attention) = &layer.attention else {
+        return Err(InferError::Config("fixture sans attention complète".into()));
+    };
+    model.mtp = Some(MtpHead {
+        pre_fc_norm_embedding: layer.input_norm.clone(),
+        pre_fc_norm_hidden: model.final_norm.clone(),
+        fc: Linear::new(
+            Tensor::from_vec(
+                vec![HIDDEN, 2 * HIDDEN],
+                (0..HIDDEN * 2 * HIDDEN)
+                    .map(|i| ((i * 37 % 257) as f32 - 128.0) / 1280.0)
+                    .collect(),
+            )?,
+            None,
+        )?,
+        layer: MtpLayer {
+            input_norm: layer.input_norm.clone(),
+            attention: attention.as_ref().clone(),
+            post_attention_norm: layer
+                .post_attention_norm
+                .clone()
+                .ok_or_else(|| InferError::Config("fixture sans norme MLP".into()))?,
+            mlp: layer
+                .mlp
+                .clone()
+                .ok_or_else(|| InferError::Config("fixture sans MLP".into()))?,
+        },
+        norm: model.final_norm.clone(),
+    });
+    let model = model.with_metal_runtime()?;
+    let prompt: Vec<usize> = (0..1025).map(|i| (i * 31 + 7) % VOCAB).collect();
+    let history = || -> Result<LayerKvCache> {
+        let cache = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".into()))?;
+        cache
+            .entries
+            .iter()
+            .find(|entry| entry.tokens == prompt)
+            .and_then(|entry| entry.mtp_history.clone())
+            .ok_or_else(|| InferError::Config("historique MTP absent du préfixe".into()))
+    };
+    // Respecter la cible minimale du runtime (512) : les trois morceaux
+    // ouvrent Steel/NAX dès le premier bloc (342 > 256). Une cible
+    // artificielle de 32 force un repli per-op avant même le semis MTP.
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
+        let mut emitted = Vec::new();
+        let first = model.generate_greedy_mtp_streaming_with_options(
+            &prompt,
+            1,
+            &GenerationOptions::default(),
+            1,
+            |token| {
+                emitted.push(token);
+                true
+            },
+        )?;
+        assert_eq!(first.tokens.len(), 1);
+        assert_eq!(emitted, first.tokens);
+        assert_eq!(first.stats.reused_prefix_tokens, 0);
+        let saved = history()?;
+        assert_eq!(saved.len(), prompt.len() - 1);
+        for rows in [&saved.keys, &saved.values] {
+            let segments = rows.segments();
+            let [KvSegment::Shared(shared)] = segments.as_slice() else {
+                return Err(InferError::Config(
+                    "semis intégré non emprunté : historique MTP sur CPU".into(),
+                ));
+            };
+            assert_eq!(shared.len(), (prompt.len() - 1) * KV_DIM);
+        }
+
+        let second = model.generate_greedy_mtp_streaming_with_options(
+            &prompt,
+            1,
+            &GenerationOptions::default(),
+            1,
+            |_| true,
+        )?;
+        assert_eq!(second.tokens, first.tokens);
+        assert_eq!(second.stats.reused_prefix_tokens, prompt.len());
+        let reused = history()?;
+        for (before, after) in [(&saved.keys, &reused.keys), (&saved.values, &reused.values)] {
+            let before = before.segments();
+            let after = after.segments();
+            let ([KvSegment::Shared(before)], [KvSegment::Shared(after)]) =
+                (before.as_slice(), after.as_slice())
+            else {
+                return Err(InferError::Config("historique MTP recopié sur CPU".into()));
+            };
+            assert_eq!(before.allocation_id(), after.allocation_id());
+            assert_eq!(before.as_slice().as_ptr(), after.as_slice().as_ptr());
+        }
+        Ok(())
+    })
+}
+
+/// Le préfixe retient les buffers MTP figés ; prolonger ou tronquer la copie
+/// de travail ne réécrit aucune ligne publiée et ne matérialise pas de Vec.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_seed_shared_prefix_keeps_allocations() -> Result<()> {
+    use crate::metal_backend::{MetalExecutor, PrefillKvRows};
+    let metal = MetalExecutor::new()?;
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let k = metal.shared_f32_rows_for_test(&[1.0, 2.0, 3.0, 4.0])?;
+    let v = metal.shared_f32_rows_for_test(&[5.0, 6.0, 7.0, 8.0])?;
+    let mut history = LayerKvCache::default();
+    let layout = AttentionLayout {
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: 2,
+        rope_dims: 2,
+        attn_scalar: 2.0,
+        sliding_window: None,
+    };
+    history.append_prefill(
+        PrefillKvRows::Shared(k.clone()),
+        PrefillKvRows::Shared(v.clone()),
+        2,
+        0,
+        &layout,
+    )?;
+    let state = (model.empty_cache(), Tensor::row(vec![0.0])?);
+    model.prefix_cache_put(&[0, 1, 2], &state, Some(&history), None)?;
+    // Un remplacement exact sans historique doit garder les mêmes segments.
+    model.prefix_cache_put(&[0, 1, 2], &state, None, None)?;
+    history.append(
+        &Tensor::row(vec![9.0, 10.0])?,
+        &Tensor::row(vec![11.0, 12.0])?,
+        &layout,
+    )?;
+    history.truncate(1)?;
+    let cache = model
+        .prefix_cache
+        .lock()
+        .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+    let saved = cache
+        .entries
+        .first()
+        .and_then(|entry| entry.mtp_history.as_ref())
+        .ok_or_else(|| InferError::Config("historique MTP absent du préfixe".to_string()))?;
+    assert_eq!(saved.len(), 2);
+    for (rows, source) in [(&saved.keys, &k), (&saved.values, &v)] {
+        let segments = rows.segments();
+        let [crate::decode_resident::KvSegment::Shared(shared)] = segments.as_slice() else {
+            return Err(InferError::Dimension(
+                "segment MTP recopié sur CPU".to_string(),
+            ));
+        };
+        assert_eq!(shared.allocation_id(), source.allocation_id());
+        assert_eq!(shared.as_slice().as_ptr(), source.as_slice().as_ptr());
+        assert_eq!(rows.to_vec(), source.as_slice());
+    }
+    Ok(())
+}
