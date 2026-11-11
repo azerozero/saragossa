@@ -309,13 +309,13 @@ impl CausalDecoder {
             return Some("num_attention_heads nul".to_string());
         }
         for index in 0..self.layers.len() {
-            if !self.config.is_resident_full_attention_layer(index) {
+            if !self.plan.layers[index].resident_full {
                 continue;
             }
-            let Ok(head_dim) = self.config.layer_head_dim(index) else {
+            let Ok(head_dim) = self.plan.layers[index].resident.head_dim() else {
                 return Some(format!("couche {index}: head_dim absent"));
             };
-            let kv_heads = self.config.layer_num_key_value_heads(index);
+            let kv_heads = self.plan.layers[index].resident.kv_heads;
             if head_dim == 0 || kv_heads == 0 || self.config.num_attention_heads % kv_heads != 0 {
                 return Some(format!(
                     "couche {index}: GQA invalide q_heads={} kv_heads={kv_heads} head_dim={head_dim}",
@@ -411,11 +411,11 @@ impl CausalDecoder {
         }
         let arena = DecodeResidentState::new(metal.device().clone())?;
         for (index, layer_cache) in cache.layers.iter_mut().enumerate() {
-            if !self.config.is_resident_full_attention_layer(index) {
+            if !self.plan.layers[index].resident_full {
                 continue;
             }
-            let head_dim = self.config.layer_head_dim(index)?;
-            let kv_heads = self.config.layer_num_key_value_heads(index);
+            let head_dim = self.plan.layers[index].resident.head_dim()?;
+            let kv_heads = self.plan.layers[index].resident.kv_heads;
             if head_dim == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
                 continue;
             }
@@ -436,7 +436,7 @@ impl CausalDecoder {
                 (q_heads, kv_heads, head_dim),
                 kv_bf16,
                 (
-                    self.config.layer_sliding_window(index).is_some(),
+                    self.plan.layers[index].resident.sliding_window.is_some(),
                     self.layer_kv_adoption_allowed(index),
                 ),
                 None,
@@ -514,9 +514,9 @@ impl CausalDecoder {
         // Validation AVANT toute mutation (tout-ou-rien) : KV full-attn seedable et
         // état conv/ssm linear-attn présent (peuplé par le prefill résident per-op).
         for (index, layer_cache) in cache.layers.iter().enumerate() {
-            if self.config.is_resident_full_attention_layer(index) {
-                let head_dim = self.config.layer_head_dim(index)?;
-                let kv_heads = self.config.layer_num_key_value_heads(index);
+            if self.plan.layers[index].resident_full {
+                let head_dim = self.plan.layers[index].resident.head_dim()?;
+                let kv_heads = self.plan.layers[index].resident.kv_heads;
                 if head_dim == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
                     return Ok(false);
                 }
@@ -577,7 +577,7 @@ impl CausalDecoder {
         let alloc_before = trace_setup.then(|| metal.device().current_allocated_size());
         let mut layer_buffers = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
-            if self.config.is_resident_full_attention_layer(index) {
+            if self.plan.layers[index].resident_full {
                 let AttentionBlock::Full(attention) = &layer.attention else {
                     return Ok(false);
                 };
@@ -590,9 +590,9 @@ impl CausalDecoder {
                 let theta = self.config.rope_theta.ok_or_else(|| {
                     InferError::Config("rope_theta absent (setup résident)".to_string())
                 })?;
-                let rope = self
-                    .config
-                    .resident_full_attn_layer_dims(index, 0, 0, 0.0, theta)?;
+                let rope = self.plan.layers[index]
+                    .resident
+                    .resident_full_attn_layer_dims(0, 0, 0.0, theta)?;
                 let rope_frequencies =
                     metal.rope_frequencies(rope.theta, rope.rope_frequency_dim)?;
                 let v_proj = attention.resident_v_proj();
@@ -910,11 +910,11 @@ impl CausalDecoder {
         }
         let t_kv_seed = trace_setup.then(std::time::Instant::now);
         for (index, layer_cache) in cache.layers.iter_mut().enumerate() {
-            if !self.config.is_resident_full_attention_layer(index) {
+            if !self.plan.layers[index].resident_full {
                 continue;
             }
-            let head_dim = self.config.layer_head_dim(index)?;
-            let kv_heads = self.config.layer_num_key_value_heads(index);
+            let head_dim = self.plan.layers[index].resident.head_dim()?;
+            let kv_heads = self.plan.layers[index].resident.kv_heads;
             let sinks = match &self.layers[index].attention {
                 AttentionBlock::Full(attention) => attention.sinks.as_ref(),
                 AttentionBlock::Linear(_) => None,
@@ -928,7 +928,7 @@ impl CausalDecoder {
                 // Les sinks n'ont pas de variante quantifiée : KV dense, comme
                 // une fenêtre glissante.
                 (
-                    self.config.layer_sliding_window(index).is_some() || sinks.is_some(),
+                    self.plan.layers[index].resident.sliding_window.is_some() || sinks.is_some(),
                     self.layer_kv_adoption_allowed(index),
                 ),
                 self.memory_guard.as_ref(),
@@ -1120,7 +1120,7 @@ impl CausalDecoder {
     /// copie ; aucun modèle synthétique ne prend encore ce chemin.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn layer_kv_adoption_allowed(&self, index: usize) -> bool {
-        self.config.layer_sliding_window(index).is_none()
+        self.plan.layers[index].resident.sliding_window.is_none()
             || matches!(
                 self.layers.get(index).map(|layer| &layer.attention),
                 Some(AttentionBlock::Full(attention)) if attention.sinks.is_some()
@@ -1149,10 +1149,10 @@ impl CausalDecoder {
         let element = crate::decode_resident::kv_element_bytes(kv_bf16);
         let mut kv_bytes = 0_u64;
         for (index, layer_cache) in cache.layers.iter().enumerate() {
-            if !self.config.is_resident_full_attention_layer(index) {
+            if !self.plan.layers[index].resident_full {
                 continue;
             }
-            let kv_dim = self.config.resident_full_attention_kv_dim(index)?;
+            let kv_dim = self.plan.layers[index].resident.kv_dim()?;
             if self.layer_kv_adoption_allowed(index)
                 && layer_cache.base_rows() == 0
                 && layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16)

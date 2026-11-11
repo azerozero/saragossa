@@ -37,7 +37,7 @@ mod attention_ops;
 mod kv_rows;
 #[allow(dead_code)]
 pub(crate) mod layer_plan;
-use layer_plan::ModelPlan;
+use layer_plan::{FullPlan, LayerPlan, MixerPlan, ModelPlan};
 mod tts_prefill;
 #[cfg(test)]
 pub(crate) use attention_ops::{
@@ -1069,7 +1069,7 @@ impl CausalDecoder {
     ) -> (Vec<usize>, Vec<usize>, Vec<bool>) {
         use crate::metal_backend::InPlaceClaim;
         let attention_layers = (0..self.layers.len())
-            .filter(|&index| self.config.is_resident_full_attention_layer(index))
+            .filter(|&index| self.plan.layers[index].resident_full)
             .count();
         let run = |hold_reserve: bool| {
             // Morceaux forcés : le stockage bf16 exige un prefill par morceaux.
@@ -1483,7 +1483,6 @@ impl CausalDecoderConfig {
 /// Exécute un modèle causal Qwen en CPU ou Metal.
 pub struct CausalDecoder {
     config: CausalDecoderConfig,
-    #[allow(dead_code)]
     plan: Arc<ModelPlan>,
     embed_tokens: EmbeddingWeight,
     layers: Vec<DecoderLayer>,
@@ -2052,8 +2051,8 @@ impl CausalDecoder {
         for layer_index in 0..config.num_hidden_layers {
             layers.push(DecoderLayer::from_tensors(
                 &mut tensors,
-                layer_index,
                 &config,
+                &plan.layers[layer_index],
             )?);
         }
         let final_norm = take_dense(&mut tensors, "norm.weight")?;

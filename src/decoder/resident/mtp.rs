@@ -1641,14 +1641,10 @@ impl CausalDecoder {
         let target_position = *cache_position;
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_cache = &mut layers[index];
-            if self.config.is_resident_full_attention_layer(index) {
-                let dims = self.config.resident_windowed_full_attn_layer_dims(
-                    index,
-                    hidden,
-                    target_position,
-                    eps,
-                    theta,
-                )?;
+            if self.plan.layers[index].resident_full {
+                let dims = self.plan.layers[index]
+                    .resident
+                    .resident_windowed_full_attn_layer_dims(hidden, target_position, eps, theta)?;
                 self.encode_resident_full_any_layer_rows(
                     metal,
                     arena,
@@ -2377,15 +2373,11 @@ impl CausalDecoder {
         let target_position = *cache_position;
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_cache = &mut layers[index];
-            let is_full = self.config.is_resident_full_attention_layer(index);
+            let is_full = self.plan.layers[index].resident_full;
             if is_full {
-                let dims = self.config.resident_windowed_full_attn_layer_dims(
-                    index,
-                    hidden,
-                    target_position,
-                    eps,
-                    theta,
-                )?;
+                let dims = self.plan.layers[index]
+                    .resident
+                    .resident_windowed_full_attn_layer_dims(hidden, target_position, eps, theta)?;
                 self.encode_resident_full_any_layer_rows(
                     metal,
                     arena,

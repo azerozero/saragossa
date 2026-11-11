@@ -1638,8 +1638,13 @@ fn attention_layout_wires_scale_and_window() {
         rope_dims: Some(2),
         ..CausalDecoderConfig::default()
     };
-    let attention = full_attention_from_tensors(&config, &mut tensors, "layers.0", 0)
-        .expect("invariant: attention valide");
+    let attention = full_attention_from_tensors(
+        &config,
+        &mut tensors,
+        "layers.0",
+        &LayerPlan::build(&config, 0).resident,
+    )
+    .expect("invariant: attention valide");
     let AttentionBlock::Full(mut attention) = attention else {
         panic!("invariant: attention full attendue");
     };
@@ -1736,8 +1741,12 @@ fn full_attention_append_kv_rows_matches_prefill_cache_bytes() -> Result<()> {
         head_dim: Some(2),
         ..CausalDecoderConfig::default()
     };
-    let AttentionBlock::Full(attention) =
-        full_attention_from_tensors(&config, &mut tensors, "layers.0", 0)?
+    let AttentionBlock::Full(attention) = full_attention_from_tensors(
+        &config,
+        &mut tensors,
+        "layers.0",
+        &LayerPlan::build(&config, 0).resident,
+    )?
     else {
         return Err(InferError::Config("attention full attendue".to_string()));
     };
@@ -1796,8 +1805,13 @@ fn gemma4_global_attention_aliases_k_as_resident_v_projection() -> Result<()> {
         layer_types: vec!["full_attention".to_string()],
         ..CausalDecoderConfig::default()
     };
-    let attention = full_attention_from_tensors(&config, &mut tensors, "layers.0", 0)
-        .expect("invariant: attention Gemma4 valide");
+    let attention = full_attention_from_tensors(
+        &config,
+        &mut tensors,
+        "layers.0",
+        &LayerPlan::build(&config, 0).resident,
+    )
+    .expect("invariant: attention Gemma4 valide");
     let AttentionBlock::Full(attention) = attention else {
         return Err(InferError::Config(
             "attention full Gemma4 attendue".to_string(),

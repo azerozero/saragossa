@@ -19,29 +19,29 @@ fn resident_projection_unsupported_bits(projection: &Linear) -> Option<usize> {
 impl DecoderLayer {
     pub(super) fn from_tensors(
         tensors: &mut HashMap<String, DecoderTensor>,
-        layer_index: usize,
         config: &CausalDecoderConfig,
+        plan: &LayerPlan,
     ) -> Result<Self> {
+        let layer_index = plan.index;
         let prefix = format!("layers.{layer_index}");
         let input_norm = take_dense(tensors, &format!("{prefix}.input_layernorm.weight"))?;
-        let mut attention = if config.is_full_attention_layer(layer_index) {
-            full_attention_from_tensors(config, tensors, &prefix, layer_index)?
+        let mut attention = if let MixerPlan::Full(full) = &plan.mixer {
+            full_attention_from_tensors(config, tensors, &prefix, full)?
         } else {
             linear_attention_from_tensors(tensors, &prefix)?
         };
         // Gemma 3 : base RoPE locale + fenêtre des couches locales + échelle
         // linéaire des positions des couches globales (rope_scaling ≥4B).
         if let AttentionBlock::Full(full) = &mut attention {
-            full.rope_theta = config.layer_rope_theta_override(layer_index);
-            full.rope_position_scale = config.layer_rope_position_scale(layer_index);
-            full.sliding_window = config.layer_sliding_window(layer_index);
-            full.no_rope = config.is_no_rope_layer(layer_index);
+            full.rope_theta = plan.resident.rope_theta_override;
+            full.rope_position_scale = plan.resident.rope_position_scale;
+            full.sliding_window = plan.resident.sliding_window;
+            full.no_rope = plan.resident.no_rope;
         }
         let (post_attention_norm, mlp) = optional_mlp_from(config, tensors, &prefix)?;
         // `mlp_only_layers` décide la nature du MLP couche par couche : un
         // checkpoint qui le contredit est refusé plutôt qu'assemblé de travers.
-        if !config.mlp_only_layers.is_empty() {
-            let dense_expected = config.mlp_only_layers.contains(&layer_index);
+        if let Some(dense_expected) = plan.dense_mlp_expected {
             let mismatch = match &mlp {
                 Some(FeedForward::Dense(_)) => !dense_expected,
                 Some(FeedForward::Moe(_)) => dense_expected,

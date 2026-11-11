@@ -178,10 +178,13 @@ fn nope_layer_normalizes_qk_without_rotation() {
                 Tensor::from_vec(vec![2], vec![0.0, 0.0]).expect("invariant: sinks"),
             ),
         );
-        let AttentionBlock::Full(mut attention) =
-            full_attention_from_tensors(&config, &mut tensors, &format!("layers.{layer}"), layer)
-                .expect("invariant: attention flint")
-        else {
+        let AttentionBlock::Full(mut attention) = full_attention_from_tensors(
+            &config,
+            &mut tensors,
+            &format!("layers.{layer}"),
+            &LayerPlan::build(&config, layer).resident,
+        )
+        .expect("invariant: attention flint") else {
             panic!("invariant: attention full attendue");
         };
         attention.no_rope = config.is_no_rope_layer(layer);

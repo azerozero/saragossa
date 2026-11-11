@@ -163,15 +163,25 @@ fn historical_attention_errors_and_inferred_dimension() {
             format!("layers.0.self_attn.{norm}.weight"),
             DecoderTensor::Dense(Tensor::from_vec(vec![2], vec![1.0; 2]).unwrap()),
         );
-        let error = full_attention_from_tensors(&config, &mut partial, "layers.0", 0).unwrap_err();
+        let error = full_attention_from_tensors(
+            &config,
+            &mut partial,
+            "layers.0",
+            &LayerPlan::build(&config, 0).resident,
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "config modèle invalide: q_norm/k_norm partiels pour layers.0.self_attn"
         );
     }
-    let AttentionBlock::Full(attention) =
-        full_attention_from_tensors(&config, &mut tensors, "layers.0", 0).unwrap()
-    else {
+    let AttentionBlock::Full(attention) = full_attention_from_tensors(
+        &config,
+        &mut tensors,
+        "layers.0",
+        &LayerPlan::build(&config, 0).resident,
+    )
+    .unwrap() else {
         panic!("full attendu")
     };
     assert_eq!(attention.head_dim, Some(2));
@@ -227,8 +237,9 @@ fn historical_resident_dimensions() {
             for position in [0, 1, 511, 512, 513] {
                 snapshot.push_str(&format!(
                     "dims {index}/{position}: {:?}\n",
-                    config
-                        .resident_windowed_full_attn_layer_dims(index, 64, position, 1e-6, 123.0)
+                    LayerPlan::build(&config, index)
+                        .resident
+                        .resident_windowed_full_attn_layer_dims(64, position, 1e-6, 123.0)
                         .map(resident_dims_debug)
                         .map_err(|e| e.to_string())
                 ));
