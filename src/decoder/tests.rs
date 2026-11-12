@@ -6626,6 +6626,11 @@ fn mtp_bf16_post_seed_refusal_rebuilds_f32_and_streams_once() -> Result<()> {
                     let observed = refusals.clone();
                     let emissions = Arc::new(AtomicUsize::new(0));
                     let before_setup = emissions.clone();
+                    // NOTE: l'extension du préfixe peut aussi tenter le résident
+                    // pendant le prefill, avant toute émission ; seul le dernier
+                    // refus est celui du setup MTP après le premier token.
+                    let contexts = Arc::new(Mutex::new(Vec::new()));
+                    let seen = contexts.clone();
                     model.memory_guard = Some(MemoryGuard::from_limits(
                         true,
                         crate::memory_guard::MemoryLimits {
@@ -6635,13 +6640,21 @@ fn mtp_bf16_post_seed_refusal_rebuilds_f32_and_streams_once() -> Result<()> {
                             metal_cap: None,
                         },
                         Arc::new(move || {
-                            assert_eq!(before_setup.load(Ordering::SeqCst), 1);
-                            assert!(prefixes.lock().expect("préfixe").entries.iter().any(
-                                |entry| entry
-                                    .mtp_history
-                                    .as_ref()
-                                    .is_some_and(|h| h.keys.has_bf16())
-                            ));
+                            let bf16 =
+                                prefixes
+                                    .lock()
+                                    .expect("préfixe")
+                                    .entries
+                                    .iter()
+                                    .any(|entry| {
+                                        entry
+                                            .mtp_history
+                                            .as_ref()
+                                            .is_some_and(|h| h.keys.has_bf16())
+                                    });
+                            seen.lock()
+                                .expect("contextes")
+                                .push((before_setup.load(Ordering::SeqCst), bf16));
                             observed.fetch_add(1, Ordering::SeqCst);
                             Some(0)
                         }),
@@ -6658,7 +6671,17 @@ fn mtp_bf16_post_seed_refusal_rebuilds_f32_and_streams_once() -> Result<()> {
                             true
                         },
                     )?;
-                    assert_eq!(refusals.load(Ordering::SeqCst), 2);
+                    let contexts = contexts.lock().expect("contextes").clone();
+                    assert_eq!(refusals.load(Ordering::SeqCst), 1 + contexts.len());
+                    assert!(
+                        contexts.iter().all(|&(emitted, _)| emitted <= 1),
+                        "{contexts:?}"
+                    );
+                    assert_eq!(
+                        contexts.last().copied(),
+                        Some((1, true)),
+                        "setup MTP refusé après le premier token, historique bf16 présent"
+                    );
                     assert_eq!(
                         output.stats.reused_prefix_tokens,
                         if warm { prompt.len() } else { 0 }
