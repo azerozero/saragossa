@@ -1021,14 +1021,21 @@ impl CausalDecoder {
                     base_head_dim,
                     kv_bf16,
                 )?;
+                // devtools est aussi actif par défaut en release. Garder le
+                // coût d'allocation au setup lorsque l'oracle est demandé.
                 #[cfg(feature = "devtools")]
-                let append_oracle_kv = arena.full_attention_dense(
-                    capacity,
-                    q_heads,
-                    base_kv_heads,
-                    base_head_dim,
-                    kv_bf16,
-                )?;
+                let append_oracle_kv =
+                    crate::decoder::flags::env_flag("SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE", false)
+                        .then(|| {
+                            arena.full_attention_dense(
+                                capacity,
+                                q_heads,
+                                base_kv_heads,
+                                base_head_dim,
+                                kv_bf16,
+                            )
+                        })
+                        .transpose()?;
                 let hidden_a = arena.persistent(hidden, GpuElement::F32)?;
                 let hidden_b = arena.persistent(hidden, GpuElement::F32)?;
                 let index = arena.persistent(1, GpuElement::U32)?;
@@ -1178,7 +1185,13 @@ impl CausalDecoder {
             "index résident",
         )?);
         let mtp_bytes = if self.mtp.is_some() {
-            let mtp_kv_states = if cfg!(feature = "devtools") { 2 } else { 1 };
+            let mtp_kv_states = 1 + usize::from(
+                cfg!(feature = "devtools")
+                    && crate::decoder::flags::env_flag(
+                        "SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE",
+                        false,
+                    ),
+            );
             let mtp_head_dim = self.config.head_dim.ok_or_else(|| {
                 InferError::Dimension("head_dim MTP résident manquant".to_string())
             })?;
