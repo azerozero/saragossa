@@ -35,6 +35,63 @@ pub(super) fn handle_anthropic_messages<S: Write>(
     }
 }
 
+/// Même conversion Messages et même encodage que la génération, sans budget de sortie.
+pub(super) fn handle_count_tokens<S: Write>(
+    stream: &mut S,
+    state: &ServeState,
+    body: &[u8],
+) -> ServeResult<()> {
+    validate_count_body(body)?;
+    let mut request = parse_anthropic_messages_request(body)?;
+    request.max_tokens = Some(0);
+    let chat = request.to_chat_request()?;
+    chat.validate(0)?;
+    let count = state.count_tokens(&chat)?;
+    send_json(stream, 200, &json!({"input_tokens": count}), Vec::new())
+}
+
+/// Le comptage ne doit pas transformer une modalité inconnue en texte JSON.
+fn validate_count_body(body: &[u8]) -> ServeResult<()> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|_| ServeError::Http("comptage Anthropic: JSON invalide".into()))?;
+    for key in ["thinking", "tool_choice", "output_config", "output_format"] {
+        if value.get(key).is_some_and(|v| !v.is_null()) {
+            return Err(ServeError::not_implemented(format!(
+                "comptage Anthropic: {key}"
+            )));
+        }
+    }
+    fn content(value: &Value, system: bool) -> ServeResult<()> {
+        if value.is_string() || value.is_null() {
+            return Ok(());
+        }
+        let blocks = value
+            .as_array()
+            .ok_or_else(|| ServeError::Http("contenu Anthropic invalide".into()))?;
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("text") if block["text"].is_string() => {}
+                Some("tool_use")
+                    if !system && block["name"].is_string() && block["input"].is_object() => {}
+                Some("tool_result") if !system => content(&block["content"], true)?,
+                _ => {
+                    return Err(ServeError::not_implemented(
+                        "comptage Anthropic: bloc non textuel ou invalide",
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+    content(&value["system"], true)?;
+    if let Some(messages) = value["messages"].as_array() {
+        for message in messages {
+            content(&message["content"], false)?;
+        }
+    }
+    Ok(())
+}
+
 /// Convertit un corps Messages en requête chat : (chat, clé de session,
 /// streaming demandé).
 pub(super) fn anthropic_chat(

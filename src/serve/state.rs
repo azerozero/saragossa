@@ -133,6 +133,34 @@ impl ServeState {
         &mut self.embeddings
     }
 
+    /// Compte avec le template de génération sans ouvrir les poids ni le décodeur.
+    pub(super) fn count_tokens(&self, request: &ChatCompletionRequest) -> ServeResult<usize> {
+        let slot = self
+            .models
+            .iter()
+            .find(|slot| slot.id == request.model)
+            .ok_or_else(|| ServeError::UnknownModel(request.model.clone()))?;
+        if let Some(loaded) = &slot.loaded {
+            return Ok(loaded.prompt_encoding(request)?.tokens.len());
+        }
+        let config = saragossa::ModelConfig::from_file(slot.path.join("config.json"))?;
+        let tokenizer = saragossa::RustTokenizer::from_file(slot.path.join("tokenizer.json"))?;
+        Ok(encode_chat_prompt(&config, &tokenizer, request)?.len())
+    }
+
+    /// Découvre le format des outils depuis la configuration seule.
+    pub(super) fn supports_response_tools(&self, model: &str) -> ServeResult<bool> {
+        let slot = self
+            .models
+            .iter()
+            .find(|slot| slot.id == model)
+            .ok_or_else(|| ServeError::UnknownModel(model.to_owned()))?;
+        if let Some(loaded) = &slot.loaded {
+            return Ok(loaded.assets.config.is_flint());
+        }
+        Ok(saragossa::ModelConfig::from_file(slot.path.join("config.json"))?.is_flint())
+    }
+
     /// Charge tous les modèles configurés.
     pub(super) fn preload(&mut self) -> ServeResult<()> {
         for index in 0..self.models.len() {
@@ -1190,33 +1218,8 @@ impl LoadedModel {
     }
 
     fn prompt_encoding(&self, request: &ChatCompletionRequest) -> ServeResult<PromptEncoding> {
-        let mut messages = request.template_messages();
-        // flint garde l'historique assistant tel quel : pas de bloc think vide.
-        if !self.assets.config.is_gemma() && !self.assets.config.is_flint() {
-            normalize_qwen_assistant_history(&mut messages);
-        }
-        let thinking = request.enable_thinking()?;
-        let rendered = if self.assets.config.is_flint() {
-            check_thinking(thinking, false)?;
-            let tools: Vec<String> = request
-                .active_tools()?
-                .iter()
-                .map(|tool| tool.json.clone())
-                .collect();
-            render_flint_chat(&messages, &tools, true)
-        } else if self.assets.config.is_gemma4() {
-            check_thinking(thinking, true)?;
-            render_gemma4_chat(&messages, true, false)
-        } else if self.assets.config.is_gemma() {
-            check_thinking(thinking, false)?;
-            render_gemma_chat(&messages, true)
-        } else {
-            check_thinking(thinking, true)?;
-            render_qwen_chatml(&messages, true, false)
-        };
-        let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
         Ok(PromptEncoding {
-            tokens: full_tokens,
+            tokens: encode_chat_prompt(&self.assets.config, &self.assets.tokenizer, request)?,
         })
     }
 
@@ -1426,15 +1429,44 @@ impl LoadedModel {
         }
         Ok(sequences)
     }
+}
 
-    fn encode_full_rendered_prompt(&self, text: &str) -> ServeResult<Vec<usize>> {
-        let ids = if self.assets.config.is_gemma() && !self.assets.config.is_gemma4() {
-            self.assets.encode_prompt_with_special(text)?
-        } else {
-            self.assets.encode_prompt(text)?
-        };
-        tokens_to_usize(&ids)
+/// Prétraitement partagé : aucune ressource du décodeur ni poids requis.
+pub(super) fn encode_chat_prompt(
+    config: &saragossa::ModelConfig,
+    tokenizer: &saragossa::RustTokenizer,
+    request: &ChatCompletionRequest,
+) -> ServeResult<Vec<usize>> {
+    let mut messages = request.template_messages();
+    // flint garde l'historique assistant tel quel : pas de bloc think vide.
+    if !config.is_gemma() && !config.is_flint() {
+        normalize_qwen_assistant_history(&mut messages);
     }
+    let thinking = request.enable_thinking()?;
+    let rendered = if config.is_flint() {
+        check_thinking(thinking, false)?;
+        let tools: Vec<String> = request
+            .active_tools()?
+            .iter()
+            .map(|tool| tool.json.clone())
+            .collect();
+        render_flint_chat(&messages, &tools, true)
+    } else if config.is_gemma4() {
+        check_thinking(thinking, true)?;
+        render_gemma4_chat(&messages, true, false)
+    } else if config.is_gemma() {
+        check_thinking(thinking, false)?;
+        render_gemma_chat(&messages, true)
+    } else {
+        check_thinking(thinking, true)?;
+        render_qwen_chatml(&messages, true, false)
+    };
+    let ids = if config.is_gemma() && !config.is_gemma4() {
+        tokenizer.encode_with_special_tokens(&rendered)?
+    } else {
+        tokenizer.encode(&rendered)?
+    };
+    tokens_to_usize(&ids)
 }
 
 fn load_decoder_with_runtime(
@@ -1602,6 +1634,9 @@ fn check_thinking(requested: Option<bool>, renders_off: bool) -> ServeResult<()>
         _ => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod count_tests;
 
 #[cfg(test)]
 mod json_tests;

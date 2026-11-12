@@ -145,6 +145,10 @@ pub(super) fn read_or_reject<S: Read + Write, T>(
     })
 }
 
+fn is_anthropic_route(path: &str) -> bool {
+    matches!(path, "/v1/messages" | "/v1/messages/count_tokens")
+}
+
 /// Erreur au format de la route : Anthropic pour `/v1/messages`, comme les
 /// autres erreurs de cette route.
 pub(super) fn send_route_error<S: Write>(
@@ -153,7 +157,7 @@ pub(super) fn send_route_error<S: Write>(
     status: u16,
     message: &str,
 ) -> ServeResult<()> {
-    if request.route() == "/v1/messages" {
+    if is_anthropic_route(request.route()) {
         send_anthropic_error(stream, status, message)
     } else {
         send_error(stream, status, message)
@@ -181,7 +185,7 @@ pub(super) fn route_front<S: Write>(
     }
     if let Some(expected) = front.api_key.as_deref() {
         if !is_authorized(request, expected) {
-            if path == "/v1/messages" {
+            if is_anthropic_route(path) {
                 return Some(send_anthropic_error(
                     stream,
                     401,
@@ -250,6 +254,13 @@ fn route_engine<S: Write>(
 ) -> ServeResult<()> {
     match (request.method.as_str(), request.route()) {
         ("POST", "/v1/chat/completions") => handle_chat(stream, state, request),
+        ("POST", "/v1/messages/count_tokens") => {
+            match super::anthropic::handle_count_tokens(stream, state, &request.body) {
+                Ok(()) => Ok(()),
+                Err(error) => send_failure(stream, &error, true),
+            }
+        }
+        ("POST", "/v1/responses") => super::responses::handle(stream, state, &request.body),
         ("POST", "/v1/messages") => match handle_anthropic_messages(
             stream,
             state,
@@ -426,7 +437,7 @@ pub(super) fn handle_batch<S: Write>(state: &mut ServeState, jobs: &mut [(&mut S
         if let Err(error) = outcome {
             let (stream, request) = &mut jobs[index];
             eprintln!("saragossa serve request error: {error}");
-            let _ = send_failure(*stream, &error, request.route() == "/v1/messages");
+            let _ = send_failure(*stream, &error, is_anthropic_route(request.route()));
         }
     }
     // NOTE: l'analyse est déterministe, ce cas ne survient pas ; le solo
@@ -741,6 +752,13 @@ fn reason_phrase(status: u16) -> &'static str {
 }
 
 fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
+    if is_anthropic_route(request.route()) {
+        if let Some(key) = request.header("x-api-key") {
+            if constant_time_eq(key.as_bytes(), expected.as_bytes()) {
+                return true;
+            }
+        }
+    }
     let Some(header) = request.header("authorization") else {
         return false;
     };
@@ -840,7 +858,7 @@ pub(super) fn read_head<S: Read>(
     let content_length = content_length(&headers)?;
     if content_length > MAX_BODY_BYTES {
         return Err(ServeError::BodyTooLarge {
-            anthropic: path.split('?').next() == Some("/v1/messages"),
+            anthropic: is_anthropic_route(path.split('?').next().unwrap_or_default()),
         });
     }
     let body = buffer[header_end + 4..].to_vec();
@@ -966,6 +984,91 @@ mod tests {
 
     fn far_deadline() -> Instant {
         Instant::now() + Duration::from_secs(30)
+    }
+
+    #[test]
+    fn new_endpoints_reject_before_loading_with_protocol_envelopes() {
+        let args = super::super::args::ServeArgs::parse([
+            "--model".to_owned(),
+            "fixture=/nonexistent/fixture".to_owned(),
+        ])
+        .expect("invariant: args");
+        let mut state = ServeState::new(&args);
+        for (route, body, status) in [
+            (
+                "/v1/messages/count_tokens",
+                r#"{"model":"absent","messages":[]}"#,
+                404,
+            ),
+            (
+                "/v1/messages/count_tokens",
+                r#"{"model":"fixture","messages":[{"role":"user","content":[{"type":"image","source":{}}]}]}"#,
+                501,
+            ),
+            ("/v1/messages/count_tokens", "{", 400),
+            (
+                "/v1/responses",
+                r#"{"model":"fixture","input":"x","store":true}"#,
+                501,
+            ),
+            (
+                "/v1/responses",
+                r#"{"model":"fixture","input":"x","include":[]}"#,
+                501,
+            ),
+            ("/v1/responses", r#"{"model":"absent","input":"x"}"#, 404),
+            ("/v1/responses", r#"{"model":"fixture","input":42}"#, 400),
+        ] {
+            let raw = format!(
+                "POST {route} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let request = read_request(
+                &mut std::io::Cursor::new(raw),
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .expect("invariant: lecture")
+            .expect("invariant: requête");
+            let mut wire = Vec::new();
+            let _ = handle_job(&mut wire, &mut state, &request);
+            let wire = String::from_utf8(wire).expect("invariant: UTF-8");
+            assert!(wire.starts_with(&format!("HTTP/1.1 {status} ")), "{wire}");
+            assert_eq!(wire.matches("HTTP/1.1").count(), 1);
+            let value: serde_json::Value =
+                serde_json::from_str(wire.split_once("\r\n\r\n").expect("invariant: HTTP").1)
+                    .expect("invariant: JSON");
+            assert_eq!(value.get("type").is_some(), is_anthropic_route(route));
+        }
+    }
+
+    #[test]
+    fn count_tokens_auth_and_oversized_body_keep_anthropic_envelope() {
+        let raw = "POST /v1/messages/count_tokens?x=1 HTTP/1.1\r\nx-api-key: secret\r\nContent-Length: 0\r\n\r\n";
+        let request = read_request(
+            &mut std::io::Cursor::new(raw),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect("invariant: lecture")
+        .expect("invariant: requête");
+        assert!(is_authorized(&request, "secret"));
+        let front = Front::new(Some("other".into()), vec![]);
+        let mut wire = Vec::new();
+        route_front(&mut wire, &front, &request)
+            .expect("invariant: refus")
+            .expect("invariant: écriture");
+        assert!(String::from_utf8(wire)
+            .expect("invariant: UTF-8")
+            .contains(r#""type":"authentication_error""#));
+        let raw = "POST /v1/messages/count_tokens HTTP/1.1\r\nContent-Length: 16777217\r\n\r\n";
+        let error = read_request(
+            &mut std::io::Cursor::new(raw),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect_err("invariant: trop grand");
+        assert!(matches!(
+            error,
+            ServeError::BodyTooLarge { anthropic: true }
+        ));
     }
 
     #[test]

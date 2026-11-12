@@ -38,6 +38,7 @@ mod http;
 mod model_selection;
 pub(crate) mod mtp;
 mod protocol;
+mod responses;
 mod state;
 pub(crate) mod streaming;
 mod warmup;
