@@ -43,7 +43,7 @@ impl CausalDecoder {
             .enumerate()
             .all(|(index, layer)| match layer {
                 ResidentLayerBuffers::FullMoe(resolved) => {
-                    self.config.is_resident_full_attention_layer(index)
+                    self.plan.layers[index].resident_full
                         && resolved
                             .qkv_proj
                             .as_ref()
@@ -164,7 +164,7 @@ impl CausalDecoder {
         for index in 0..self.layers.len() {
             let layer_cache_a = &mut layers_a[index];
             let layer_cache_b = &mut layers_b[index];
-            if self.config.is_resident_full_attention_layer(index) {
+            if self.plan.layers[index].resident_full {
                 let ResidentLayerBuffers::FullMoe(resolved) =
                     arena.layers.get(index).ok_or_else(|| {
                         InferError::Config(format!("poids résidents couche {index} absents"))
@@ -199,13 +199,9 @@ impl CausalDecoder {
                     moe: &resolved.moe,
                     top_k: resolved.top_k,
                 };
-                let dims = self.config.resident_full_attn_layer_dims(
-                    index,
-                    hidden,
-                    positions[0],
-                    eps,
-                    theta,
-                )?;
+                let dims = self.plan.layers[index]
+                    .resident
+                    .resident_full_attn_layer_dims(hidden, positions[0], eps, theta)?;
                 arena.state.encode_full_attn_moe_layer_duo(
                     metal,
                     encoder_guard.encoder(),

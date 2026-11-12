@@ -87,7 +87,7 @@ pub(super) struct ChatCompletionRequest {
 /// Outil déclaré par la requête, lu une seule fois.
 #[derive(Clone, Debug)]
 pub(super) struct DeclaredTool {
-    /// Texte JSON brut, que le template flint rend dans l'ordre du client
+    /// Texte JSON brut, que les templates rendent dans l'ordre du client
     /// (`Value` trierait les clés).
     pub(super) json: String,
     /// Même outil en `Value`, pour lire son schéma.
@@ -106,7 +106,7 @@ impl<'de> Deserialize<'de> for DeclaredTool {
 }
 
 /// Plafond du nombre de stop sequences (OpenAI en accepte 4 ; Anthropic peut
-/// en déclarer davantage, plus `</tool_call>` ajouté pour les outils).
+/// en déclarer davantage).
 const MAX_STOP_SEQUENCES: usize = 16;
 /// Plafond de taille d'une stop sequence.
 const MAX_STOP_BYTES: usize = 1024;
@@ -219,6 +219,9 @@ impl ChatCompletionRequest {
                 content: Some(message.content_text()),
                 reasoning_content: message.reasoning_content.clone(),
                 tool_calls: raw_texts(message.tool_calls.as_deref()),
+                name: message.name.clone(),
+                tool_call_id: message.tool_call_id.clone(),
+                assistant_blocks: message.assistant_blocks.clone(),
             })
             .collect()
     }
@@ -414,6 +417,15 @@ pub(super) struct ResponseFormat {
 /// Message OpenAI minimal.
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct WireMessage {
+    /// Ordre natif Anthropic, renseigné seulement par la conversion interne.
+    #[serde(skip)]
+    pub(super) assistant_blocks: Option<Vec<saragossa::chat_template::AssistantBlock>>,
+    /// Nom de l'outil qui a produit ce résultat.
+    #[serde(default)]
+    pub(super) name: Option<String>,
+    /// Identifiant stable de l'appel associé.
+    #[serde(default)]
+    pub(super) tool_call_id: Option<String>,
     /// Rôle du message.
     pub(super) role: String,
     /// Contenu OpenAI: string ou segments.

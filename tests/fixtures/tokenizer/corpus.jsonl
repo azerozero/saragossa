@@ -16,6 +16,6 @@
 {"text":"<|endoftext|>"}
 {"text":"avant<|im_start|>user\ntexte<|im_end|>après<start_of_turn>model<end_of_turn><|endoftext|>"}
 {"text":"<tool_call>x</tool_call><tool_response>ok</tool_response><think>oui</think><|audio_start|><tts_text_bos>voix<tts_text_eod><|audio_end|>"}
-{"text":"<|im_start|>system\nRéponds en français.<|im_end|>\n<|im_start|>user\n  Bonjour 👩‍💻  <|im_end|>\n<|im_start|>assistant\nSalut !\n<|im_end|>\n<|im_start|>user\nÉcris café en Python.\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"text":"<|im_start|>system\nRéponds en français.<|im_end|>\n<|im_start|>user\nBonjour 👩‍💻<|im_end|>\n<|im_start|>assistant\nSalut !<|im_end|>\n<|im_start|>user\nÉcris café en Python.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
 {"text":"<start_of_turn>user\nRéponds en français.\n\nBonjour 👩‍💻<end_of_turn>\n<start_of_turn>model\nSalut !<end_of_turn>\n<start_of_turn>user\nÉcris café en Python.<end_of_turn>\n<start_of_turn>model\n"}
 {"text":"<bos><|turn>system\nRéponds en français.<turn|>\n<|turn>user\nBonjour 👩‍💻<turn|>\n<|turn>model\nSalut !<turn|>\n<|turn>user\nÉcris café en Python.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"}

@@ -22,7 +22,7 @@ use super::audio::{handle_speech, handle_transcription};
 use super::dispatch::{self, Front};
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
-use super::flint_output::{FlintEvent, FlintOutputParser};
+use super::flint_output::FlintEvent;
 use super::protocol::{
     created_now, json_bytes, sse_done, sse_event, AssistantMessage, ChatCompletionChunk,
     ChatCompletionRequest, ChatCompletionResponse, HealthResponse, ModelInfo, ModelsResponse,
@@ -30,6 +30,7 @@ use super::protocol::{
 };
 use super::state::{ServeState, ServedCompletion};
 use super::streaming::{CompletionSink, CompletionStreamEvent};
+use super::tool_output::ToolOutputParser;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -281,26 +282,15 @@ fn handle_chat<S: Write>(
     let chat = ChatCompletionRequest::parse(&request.body)?;
     chat.validate(state.max_tokens_cap())?;
     let session_key = chat.session_key(request.header(SESSION_HEADER));
-    // NOTE: `tools` et `tool_choice` ne servent qu'à flint ; les autres
-    // familles les ignorent, comme avant.
-    let flint = if state.model_is_flint(&chat.model)? {
-        let tools = chat
-            .active_tools()?
-            .iter()
-            .map(|tool| tool.value.clone())
-            .collect();
-        Some(FlintOutputParser::new(tools, chat.parallel_tool_calls()))
-    } else {
-        None
-    };
+    let parser = state.output_parser(&chat)?;
     let stream_enabled = chat.stream;
     if stream_enabled {
-        send_sse_streaming(stream, state, chat, session_key, flint)
+        send_sse_streaming(stream, state, chat, session_key, parser)
     } else {
         let completion = state.complete(chat, session_key.as_deref())?;
         let headers = completion.metric_headers();
         let mut finish_reason = completion.finish_reason;
-        let message = if let Some(parser) = flint {
+        let message = if let Some(parser) = parser {
             let output = parser.parse(&completion.content);
             finish_reason = flint_finish_reason(finish_reason, !output.tool_calls.is_empty());
             let content = if output.content.is_empty() && !output.tool_calls.is_empty() {
@@ -388,9 +378,6 @@ pub(super) fn handle_batch<S: Write>(state: &mut ServeState, jobs: &mut [(&mut S
             None => solo.push(index),
         }
     }
-    let flint = batched
-        .first()
-        .is_some_and(|(_, chat)| state.model_is_flint(chat.model()).unwrap_or(false));
     let mut requests = Vec::with_capacity(batched.len());
     let mut sinks: Vec<Box<dyn CompletionSink + '_>> = Vec::with_capacity(batched.len());
     let mut slots = Vec::with_capacity(batched.len());
@@ -400,17 +387,20 @@ pub(super) fn handle_batch<S: Write>(state: &mut ServeState, jobs: &mut [(&mut S
             continue;
         };
         let stream: &mut S = stream;
+        let parser = match state.output_parser(&batch.chat) {
+            Ok(parser) => parser,
+            Err(error) => {
+                let _ = if batch.anthropic {
+                    send_anthropic_error(stream, error_status(&error), &error.to_string())
+                } else {
+                    send_error(stream, error_status(&error), &error.to_string())
+                };
+                continue;
+            }
+        };
         if batch.anthropic {
-            sinks.push(Box::new(AnthropicSse::new(stream)));
+            sinks.push(Box::new(AnthropicSse::with_parser(stream, parser)));
         } else {
-            let parser = flint.then(|| {
-                let tools = batch
-                    .chat
-                    .active_tools()
-                    .map(|tools| tools.iter().map(|tool| tool.value.clone()).collect())
-                    .unwrap_or_default();
-                FlintOutputParser::new(tools, batch.chat.parallel_tool_calls())
-            });
             sinks.push(Box::new(OpenAiSse::new(
                 stream,
                 parser,
@@ -477,7 +467,7 @@ fn send_sse_streaming<S: Write>(
     state: &mut ServeState,
     chat: ChatCompletionRequest,
     session_key: Option<String>,
-    flint: Option<FlintOutputParser>,
+    flint: Option<ToolOutputParser>,
 ) -> ServeResult<()> {
     let mut sink = OpenAiSse::new(stream, flint, chat.include_usage());
     let result = state.complete_streaming(chat, session_key.as_deref(), |event| sink.event(event));
@@ -487,7 +477,7 @@ fn send_sse_streaming<S: Write>(
 /// Réponse SSE OpenAI `chat.completion.chunk` d'un client.
 struct OpenAiSse<'a, S> {
     stream: &'a mut S,
-    flint: Option<FlintOutputParser>,
+    flint: Option<ToolOutputParser>,
     started: bool,
     model: String,
     /// `stream_options.include_usage` : chunk d'usage avant `[DONE]`.
@@ -499,7 +489,7 @@ struct OpenAiSse<'a, S> {
 }
 
 impl<'a, S: Write> OpenAiSse<'a, S> {
-    fn new(stream: &'a mut S, flint: Option<FlintOutputParser>, include_usage: bool) -> Self {
+    fn new(stream: &'a mut S, flint: Option<ToolOutputParser>, include_usage: bool) -> Self {
         Self {
             stream,
             flint,
@@ -1566,7 +1556,8 @@ mod tests {
         for flint in [false, true] {
             let mut bytes = Vec::new();
             let parser = flint.then(|| {
-                FlintOutputParser::new(
+                ToolOutputParser::new(
+                    super::super::tool_output::ToolFamily::Flint,
                     vec![serde_json::json!({
                         "type":"function", "function":{"name":"heure"}
                     })],
@@ -1625,6 +1616,36 @@ mod tests {
                     .any(|c| c["choices"][0]["delta"]["tool_calls"].is_array()));
             }
             assert_eq!(response.matches("data: [DONE]").count(), 1);
+        }
+    }
+
+    #[test]
+    fn openai_stream_converts_qwen_and_gemma_calls_without_leaking_markers() {
+        use super::super::tool_output::ToolFamily;
+        for (family, text) in [
+            (ToolFamily::Qwen, "Avant <tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>"),
+            (ToolFamily::Gemma4, "Avant <|tool_call>call:weather{city:<|\"|>Paris<|\"|>}<tool_call|>"),
+        ] {
+            let tools = vec![serde_json::json!({"type":"function","function":{"name":"weather","parameters":{"properties":{"city":{"type":"string"}}}}})];
+            let expected = ToolOutputParser::new(family, tools.clone(), true).parse(text);
+            let mut bytes = Vec::new();
+            let mut sink = OpenAiSse::new(&mut bytes, Some(ToolOutputParser::new(family, tools, true)), false);
+            let start = super::super::streaming::StreamingCompletionStart { model:"m".into(), prompt_tokens:7, reused_prefix_tokens:0, prefill:Duration::ZERO };
+            sink.event(CompletionStreamEvent::Start(&start)).expect("start");
+            for ch in text.chars() { sink.event(CompletionStreamEvent::Delta(&ch.to_string())).expect("delta"); }
+            sink.finish(Ok(ServedCompletion { model:"m".into(), content:text.into(), finish_reason:"stop", matched_stop:None, usage:super::super::protocol::Usage::new(7,3), prompt_tokens:7, reused_prefix_tokens:0, timings:saragossa::GenerationTimings::default(), total:Duration::ZERO })).expect("finish");
+            let response = String::from_utf8(bytes).expect("utf8");
+            let frames: Vec<serde_json::Value> = response.split_once("\r\n\r\n").expect("headers").1.split("\n\n").filter_map(|f| f.strip_prefix("data: ")).filter(|f| *f != "[DONE]").map(|f| serde_json::from_str(f).expect("frame")).collect();
+            let content: String = frames.iter().filter_map(|f| f["choices"][0]["delta"]["content"].as_str()).collect();
+            assert_eq!(content, expected.content);
+            let calls: Vec<_> = frames.iter().filter_map(|f| f["choices"][0]["delta"]["tool_calls"].as_array()).flatten().collect();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["function"]["arguments"], expected.tool_calls[0].function.arguments);
+            assert_eq!(calls[0]["function"]["name"], "weather");
+            assert_eq!(calls[0]["index"], 0);
+            assert!(calls[0]["id"].as_str().is_some_and(|s| !s.is_empty()));
+            assert_eq!(frames.last().expect("finish")["choices"][0]["finish_reason"], "tool_calls");
+            assert!(frames.iter().all(|f| f["id"] == frames[0]["id"]));
         }
     }
 

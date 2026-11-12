@@ -1,3 +1,5 @@
 # Les oracles comparent les octets bruts de ces fixtures par SHA-256.
 tests/fixtures/** text eol=lf
 tests/fixtures/**/*.safetensors -text
+# Les fichiers texte inclus par include_str! sont comparés octet par octet.
+src/**/*.txt text eol=lf
