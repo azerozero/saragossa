@@ -273,7 +273,7 @@ fn fixtures_match_corpus_and_rust_chat_templates() {
     ];
     let rendered = [
         render_qwen_chatml(&messages, true, false),
-        render_gemma_chat(&messages, true),
+        render_gemma_chat(&messages, true).expect("invariant: rôles Gemma 3 alternés"),
         render_gemma4_chat(&messages, true, false),
     ];
     assert!(corpus.len() >= rendered.len());
