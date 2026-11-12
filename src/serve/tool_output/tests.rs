@@ -115,6 +115,7 @@ fn markdown_and_quotations_stay_literal_at_every_delta_boundary() {
         for text in [
             format!("```xml\n{call}\n```"),
             format!("~~~\n{call}\n~~~"),
+            format!("~~~\n    ~~~\n{call}\n~~~"),
             format!("Exemple `{call}`."),
             format!("``{call}``"),
             format!("> {call}\n"),
@@ -241,22 +242,22 @@ fn qwen_invalid_json_for_non_string_parameter_is_not_an_argument() {
 fn list_code_blocks_stay_literal_across_all_delta_boundaries() {
     for (family, call) in native_calls() {
         for fence in ["~~~", "```"] {
-            for (prefix, indent) in [
-                ("- ", "  "),
-                ("+ ", "  "),
-                ("* ", "  "),
-                ("1. ", "   "),
-                ("12) ", "    "),
-                ("- 1. ", "     "),
-                ("> - ", ">   "),
-                ("- parent\n  - ", "    "),
-                ("- exemple\n  \t", "  "),
-                ("- exemple\n \t", "  "),
-                ("1. exemple\n   \t", "   "),
-                ("\t- \t1) > + ", "> \t"),
-                ("    ", "    "),
+            for (prefix, indent, close_indent) in [
+                ("- ", "  ", "  "),
+                ("+ ", "  ", "  "),
+                ("* ", "  ", "  "),
+                ("1. ", "   ", "   "),
+                ("12) ", "    ", ""),
+                ("- 1. ", "     ", ""),
+                ("> - ", ">   ", ">   "),
+                ("- parent\n  - ", "    ", ""),
+                ("- exemple\n  \t", "  ", "  "),
+                ("- exemple\n \t", "  ", "  "),
+                ("1. exemple\n   \t", "   ", "   "),
+                ("\t- \t1) > + ", "> \t", "> "),
+                ("    ", "    ", ""),
             ] {
-                let literal = format!("{prefix}{fence}\n{indent}{call}\n{indent}{fence}\n");
+                let literal = format!("{prefix}{fence}\n{indent}{call}\n{close_indent}{fence}\n");
                 // Un appel réel après le bloc vérifie aussi la sortie du contexte littéral.
                 let text = format!("{literal}{call}");
                 let parsed = ToolOutputParser::new(family, tools(), true).parse(&text);
@@ -302,8 +303,17 @@ fn list_code_blocks_stay_literal_across_all_delta_boundaries() {
 fn unicode_whitespace_cannot_close_code_blocks() {
     for (family, call) in native_calls() {
         for fence in ["```", "~~~"] {
-            for suffix in ["\u{a0}", " \u{a0}", "\t\u{2003}", "\u{202f}", "\u{3000}"] {
-                let literal = format!("{fence}\n{fence}{suffix}\n{call}\n{fence}\t \n");
+            for suffix in [
+                "\t",
+                " \t",
+                "\t ",
+                "\u{a0}",
+                " \u{a0}",
+                "\t\u{2003}",
+                "\u{202f}",
+                "\u{3000}",
+            ] {
+                let literal = format!("{fence}\n{fence}{suffix}\n{call}\n{fence}  \n");
                 let text = format!("{literal}{call}");
                 let parsed = ToolOutputParser::new(family, tools(), true).parse(&text);
                 assert_eq!(parsed.content, literal, "{text:?}");
@@ -330,6 +340,101 @@ fn unicode_whitespace_cannot_close_code_blocks() {
                     assert_eq!(content, literal, "split {split}: {text:?}");
                     assert_eq!(calls.len(), 1, "split {split}: {text:?}");
                     assert_eq!(calls[0].function, parsed.tool_calls[0].function);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn only_safe_fences_end_literal_blocks_in_complete_and_streaming_output() {
+    for (family, call) in [
+        (
+            ToolFamily::Qwen,
+            "<tool_call><function=weather></function></tool_call>",
+        ),
+        (ToolFamily::Gemma4, "<|tool_call>call:weather{}<tool_call|>"),
+    ] {
+        for fence in ["~~~", "```"] {
+            for (open_prefix, unsafe_prefix, safe_prefix) in [
+                ("", "    ", ""),
+                ("", "     ", "   "),
+                ("", "\t", " "),
+                ("", " \t", "  "),
+                ("", "\t   ", ""),
+                ("    ", "    ", ""),
+                ("\t", "\t", ""),
+                ("- ", "    ", "  "),
+                ("12) ", "    ", "   "),
+                ("- ", "  \t", ""),
+                ("- ", "- ", ""),
+                ("", "    - ", ""),
+                ("> ", "    > ", "> "),
+                ("> ", "\t> ", "> "),
+                ("> ", "> \t", "   > "),
+                ("> - ", "    > ", "  > "),
+                ("> - ", "> - ", "> "),
+                ("\t- \t1) > + ", "> \t", "> "),
+                ("> > ", "    > > ", "> > "),
+                ("> > ", "> \t> ", "   > > "),
+            ] {
+                let literal = format!(
+                    "{open_prefix}{fence}\n{unsafe_prefix}{fence}\n{call}\n{safe_prefix}{fence}"
+                );
+                // Le contre-exemple seul ne doit émettre aucun appel. Une clôture
+                // sûre terminée autorise ensuite exactement un nouvel appel.
+                for (text, expected_content, expected_calls) in [
+                    (literal.clone(), literal.clone(), 0),
+                    (format!("{literal}  \n{call}"), format!("{literal}  \n"), 1),
+                    (
+                        format!("{literal}{fence}\n{call}"),
+                        format!("{literal}{fence}\n"),
+                        1,
+                    ),
+                ] {
+                    let parsed = ToolOutputParser::new(family, tools(), true).parse(&text);
+                    assert_eq!(parsed.content, expected_content, "{text:?}");
+                    assert_eq!(parsed.tool_calls.len(), expected_calls, "{text:?}");
+                    let check_events = |events: Vec<FlintEvent>| {
+                        let content: String = events
+                            .iter()
+                            .filter_map(|event| match event {
+                                FlintEvent::Content(text) => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        let calls: Vec<_> = events
+                            .iter()
+                            .filter_map(|event| match event {
+                                FlintEvent::ToolCall(call) => Some(&call.function),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(content, expected_content, "{text:?}");
+                        assert_eq!(
+                            calls,
+                            parsed
+                                .tool_calls
+                                .iter()
+                                .map(|call| &call.function)
+                                .collect::<Vec<_>>(),
+                            "{text:?}"
+                        );
+                    };
+                    for split in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+                        let mut parser = ToolOutputParser::new(family, tools(), true);
+                        let mut events = parser.push(&text[..split]);
+                        events.extend(parser.push(&text[split..]));
+                        events.extend(parser.finish());
+                        check_events(events);
+                    }
+                    let mut parser = ToolOutputParser::new(family, tools(), true);
+                    let mut events = Vec::new();
+                    for ch in text.chars() {
+                        events.extend(parser.push(&ch.to_string()));
+                    }
+                    events.extend(parser.finish());
+                    check_events(events);
                 }
             }
         }

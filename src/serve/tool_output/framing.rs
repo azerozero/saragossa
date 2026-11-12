@@ -72,6 +72,9 @@ pub(super) struct LiteralContext {
     quote: Option<char>,
     line_content: bool,
     indented: bool,
+    raw_indent: usize,
+    container_prefix: bool,
+    indentation_tab: bool,
     block_quote: bool,
     escaped: bool,
     previous_word: bool,
@@ -101,9 +104,11 @@ impl LiteralContext {
                     if delimiter == ch
                         && count >= size
                         && line_start
+                        && self.raw_indent <= 3
+                        && !self.indentation_tab
                         && !self.list_marker
                         && self.quote_depth == self.fence_quote_depth
-                        && matches!(next, ' ' | '\t' | '\n') =>
+                        && matches!(next, ' ' | '\n') =>
                 {
                     // Un marqueur de liste ou une autre profondeur de citation
                     // peut être le contenu du bloc, pas sa clôture.
@@ -148,7 +153,7 @@ impl LiteralContext {
             if ch == '\n' {
                 self.code = None;
             }
-            if ch == '\n' || !matches!(ch, ' ' | '\t') {
+            if ch != ' ' {
                 self.closing_fence = false;
             }
         }
@@ -156,6 +161,9 @@ impl LiteralContext {
             self.list_prefix = ListPrefix::None;
             self.line_content = false;
             self.indented = false;
+            self.raw_indent = 0;
+            self.container_prefix = false;
+            self.indentation_tab = false;
             self.list_marker = false;
             self.block_quote = false;
             self.quote_depth = 0;
@@ -193,6 +201,17 @@ impl LiteralContext {
             }
         }
         if !self.line_content {
+            // Compter les espaces bruts avant tout conteneur, sans retirer
+            // son indentation. Une tabulation du préfixe interdit la clôture,
+            // mais ces contraintes ne doivent jamais empêcher l'ouverture.
+            match ch {
+                ' ' if !self.container_prefix => {
+                    self.raw_indent = self.raw_indent.saturating_add(1);
+                }
+                '\t' => self.indentation_tab = true,
+                ' ' => {}
+                _ => self.container_prefix = true,
+            }
             self.list_prefix = match (&self.list_prefix, ch) {
                 (ListPrefix::None, ' ' | '\t') => {
                     // Toute indentation est ambiguë : ne jamais promouvoir son contenu.
