@@ -1607,6 +1607,9 @@ fn check_thinking(requested: Option<bool>, renders_off: bool) -> ServeResult<()>
 mod json_tests;
 
 #[cfg(test)]
+mod gemma_json_tests;
+
+#[cfg(test)]
 mod batch_drive_tests;
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
