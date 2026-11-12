@@ -4,6 +4,9 @@ use crate::{InferError, Result};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
+#[cfg(test)]
+pub(crate) mod golden_tests;
+
 #[derive(Clone)]
 pub struct RustTokenizer {
     path: PathBuf,

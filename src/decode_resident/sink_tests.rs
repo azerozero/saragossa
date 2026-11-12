@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::decoder::attention_probs_in_place;
+use crate::oracle::max_abs_diff;
 
 /// Géométrie flint : 32 têtes Q, 4 têtes KV (GQA 8), d = 128.
 const Q_HEADS: usize = 32;
@@ -114,20 +115,6 @@ fn kv_state(
         kv.set_sinks(state, buffer)?;
     }
     Ok(kv)
-}
-
-/// Écart max entre deux sorties finies : `f32::max` ignore les NaN, une sortie
-/// entièrement NaN passerait sinon pour un écart nul.
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len());
-    assert!(
-        a.iter().chain(b).all(|value| value.is_finite()),
-        "sortie non finie"
-    );
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max)
 }
 
 /// Couvre le 2-passes d128 (fenêtre nulle, court et au-delà du seuil 2048) et

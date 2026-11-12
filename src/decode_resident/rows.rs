@@ -1492,7 +1492,7 @@ impl FullAttentionMetalState {
 
 /// Diagnostic : `SARAGOSSA_RUST_FULL_ROWS_GROUP=n` borne les lignes par threadgroup
 /// du 2-passes en lignes (1 = un dispatch par ligne, comme la boucle historique).
-fn rows_group_override() -> Option<usize> {
+pub(super) fn rows_group_override() -> Option<usize> {
     static VALUE: OnceLock<Option<usize>> = OnceLock::new();
     *VALUE.get_or_init(|| {
         crate::runtime_flags::env_var("SARAGOSSA_RUST_FULL_ROWS_GROUP")

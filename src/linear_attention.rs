@@ -94,6 +94,25 @@ pub(crate) struct LinearAttentionConfig {
     pub rms_eps: f32,
 }
 
+/// Longueurs conv K-1/K et SSM, vérifiées avant toute allocation d'instantané.
+pub(crate) fn snapshot_geometry(
+    conv_dim: usize,
+    kernel: usize,
+    ssm_shape: (usize, usize, usize),
+) -> Result<(usize, usize, usize)> {
+    let lengths = || {
+        Some((
+            kernel.checked_sub(1)?.checked_mul(conv_dim)?,
+            kernel.checked_mul(conv_dim)?,
+            ssm_shape
+                .0
+                .checked_mul(ssm_shape.1)?
+                .checked_mul(ssm_shape.2)?,
+        ))
+    };
+    lengths().ok_or_else(|| InferError::Dimension("géométrie conv/SSM invalide".into()))
+}
+
 impl LinearAttentionConfig {
     /// Renvoie la largeur totale clé/query `H_k × d_k`.
     ///
@@ -118,7 +137,7 @@ impl LinearAttentionConfig {
     }
 
     /// Renvoie la largeur de la conv causale : `2×key_dim + value_dim` (q̃‖k̃‖ṽ).
-    fn conv_dim(self) -> Result<usize> {
+    pub(crate) fn conv_dim(self) -> Result<usize> {
         let key_dim = self.key_dim()?;
         let value_dim = self.value_dim()?;
         key_dim
@@ -197,10 +216,10 @@ pub(crate) struct LinearAttentionWeights {
 /// `metal` est le miroir GPU-résident (non cloné : chaque flux reconstruit le sien).
 #[derive(Debug, Default)]
 pub(crate) struct LinearAttentionCache {
-    conv: Vec<f32>,
-    conv_dim: Option<usize>,
-    ssm: Vec<f32>,
-    ssm_shape: Option<(usize, usize, usize)>,
+    pub(crate) conv: Vec<f32>,
+    pub(crate) conv_dim: Option<usize>,
+    pub(crate) ssm: Vec<f32>,
+    pub(crate) ssm_shape: Option<(usize, usize, usize)>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     metal: Option<crate::metal_backend::LinearAttentionMetalState>,
 }
@@ -1369,7 +1388,7 @@ fn softplus(value: f32) -> f32 {
 
 /// Indique si le pas résident Metal (états conservés GPU) est activé (défaut oui).
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn linear_attn_resident_step_enabled() -> bool {
+pub(crate) fn linear_attn_resident_step_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         // Défaut **ON** (phase 1a full-rust : +43 % decode mesuré, sortie greedy

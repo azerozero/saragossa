@@ -1,4 +1,5 @@
 use super::super::*;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use super::types::*;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::MetalExecutor;
