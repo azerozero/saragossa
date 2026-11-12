@@ -126,27 +126,6 @@ impl CausalDecoder {
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub(in crate::decoder) fn seed_mtp_resident_history(
-        &self,
-        cache: &mut CausalDecoderCache,
-        history: &LayerKvCache,
-    ) -> Result<()> {
-        let Some(arena) = cache.resident.as_mut() else {
-            return Ok(());
-        };
-        let Some(mtp) = arena.mtp.as_mut() else {
-            return Ok(());
-        };
-        mtp.pending_append_count = 0;
-        Self::reset_mtp_append_oracle(mtp);
-        mtp.kv.seed_segments(
-            &history.keys.segments(),
-            &history.values.segments(),
-            history.len(),
-        )
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(in crate::decoder) fn truncate_mtp_resident_history(
         &self,
         cache: &mut CausalDecoderCache,

@@ -1439,6 +1439,22 @@ impl CausalDecoder {
         let trace_setup = false;
         let t_prefill = trace_setup.then(Instant::now);
         let use_committed_mtp_history = mtp_history_policy() == MtpHistoryPolicy::Committed;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let history_capacity = (decode_resident_full_enabled()
+            && (options.temperature <= f32::EPSILON || mtp_sampled_enabled())
+            && self.supports_resident_full_decode()
+            && self
+                .mtp
+                .as_ref()
+                .is_some_and(|head| self.resident_mtp_head_supported(head))
+            && crate::decode_resident::kv_element_bytes(Self::resident_kv_bf16(
+                options.temperature > f32::EPSILON,
+                prompt.len(),
+            )) == 2)
+            .then(|| prompt.len().checked_add(decode_reserve))
+            .flatten();
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let history_capacity = None;
         let mut sampler = DeterministicSampler::new(options.seed);
         // Premier token émis dès le retour du prefill, avant les arènes.
         // Le semis MTP intégré a déjà consommé les morceaux ; le chemin de
@@ -1456,13 +1472,17 @@ impl CausalDecoder {
                         && !crate::runtime_flags::mtp_gpu_block_enabled()
                     {
                         early_emitted = true;
-                        early_stop = !on_token(token);
+                        // Un callback peut lancer une autre requête (AR/DFlash) :
+                        // elle ne doit pas hériter du stockage MTP de celle-ci.
+                        early_stop = !super::mtp_history::with_storage(None, || on_token(token));
                     }
                     Ok(!early_stop)
                 };
                 let (cache, final_state, mtp_history, reused) =
                     with_prefill_kv_reserve(decode_reserve, || {
-                        self.prefill_cache_state_with_mtp_history(prompt, &mut on_final_state)
+                        super::mtp_history::with_storage(history_capacity, || {
+                            self.prefill_cache_state_with_mtp_history(prompt, &mut on_final_state)
+                        })
                     })?;
                 (cache, final_state, Some(mtp_history), reused)
             } else {
@@ -1493,11 +1513,12 @@ impl CausalDecoder {
                 && self.supports_resident_full_decode()
             {
                 let t_setup = trace_setup.then(Instant::now);
-                use_resident_full = self.setup_resident_full_decode(
+                use_resident_full = self.setup_resident_full_decode_with_mtp_history(
                     &mut cache,
                     max_new_tokens,
                     draft_headroom,
                     kv_bf16,
+                    mtp_history_cache.as_ref(),
                 )?;
                 if let Some(t) = t_setup {
                     eprintln!(
@@ -1506,21 +1527,26 @@ impl CausalDecoder {
                     );
                 }
             }
+            if !use_resident_full
+                && mtp_history_cache
+                    .as_ref()
+                    .is_some_and(|history| history.keys.has_bf16() || history.values.has_bf16())
+            {
+                // Le setup a décliné après le semis (budget, état linéaire).
+                // Les bits f32 perdus ne se reconstruisent pas par élargissement :
+                // rejouer le prefill avec le contrat f32, sans réémettre le token.
+                drop(cache);
+                let (rebuilt, _, history, _) = with_prefill_kv_reserve(decode_reserve, || {
+                    super::mtp_history::with_storage(None, || {
+                        self.prefill_cache_state_with_mtp_history(prompt, &mut |_| Ok(true))
+                    })
+                })?;
+                cache = rebuilt;
+                resident_mtp_history_len = history.len();
+                mtp_history_cache = Some(history);
+            }
             if decode_resident_enabled() && !use_resident_full {
                 self.setup_resident_decode(&mut cache, max_new_tokens, kv_bf16)?;
-            }
-            if use_resident_full {
-                if let Some(mtp_history) = mtp_history_cache.as_ref() {
-                    let t_seed = trace_setup.then(Instant::now);
-                    self.seed_mtp_resident_history(&mut cache, mtp_history)?;
-                    if let Some(t) = t_seed {
-                        eprintln!(
-                            "mtp_setup seed_mtp_history_us={} history_len={}",
-                            t.elapsed().as_micros(),
-                            mtp_history.len()
-                        );
-                    }
-                }
             }
         }
         if early_stop {
@@ -3968,7 +3994,7 @@ impl CausalDecoder {
     /// `on_final_state` reçoit l'état normé de la dernière position dès qu'il
     /// est connu, avant le semis de l'historique MTP ; s'il rend `false`, le
     /// semis est abandonné (historique vide, rien n'entre au cache de préfixe).
-    fn prefill_cache_state_with_mtp_history(
+    pub(super) fn prefill_cache_state_with_mtp_history(
         &self,
         prompt: &[usize],
         on_final_state: &mut dyn FnMut(&Tensor) -> Result<bool>,
@@ -3978,7 +4004,7 @@ impl CausalDecoder {
         }
         let snapshot = self.snapshot_request(prompt, SnapshotMode::MtpCommitted)?;
         if let Some(state) = self.snapshot_load(&snapshot) {
-            if let Some(history) = state.history {
+            if let Some(history) = state.history.filter(super::mtp_history::compatible) {
                 let keep = on_final_state(&state.final_state)?;
                 return Ok((
                     state.cache,
@@ -4269,10 +4295,24 @@ impl CausalDecoder {
             &self.config,
             &super::attention_ops::empty_q(attention)?,
         )?;
-        let (k, v) = metal.mtp_seed_kv_rows(tokens, states, weights, spec, history.len())?;
-        let layout =
-            super::attention_ops::attention_layout(&self.config, attention, &empty_q, &k, &v)?;
-        history.append_batch_owned(k, v, &layout)?;
+        if super::mtp_history::bf16_capacity().is_some() {
+            let kv_dim = spec.kv_heads * spec.head_dim;
+            let empty = Tensor::from_vec(vec![0, kv_dim], Vec::new())?;
+            let layout = super::attention_ops::attention_layout(
+                &self.config,
+                attention,
+                &empty_q,
+                &empty,
+                &empty,
+            )?;
+            let (k, v) = metal.mtp_seed_bf16_rows(tokens, states, weights, spec, history.len())?;
+            history.append_prefill(k, v, kv_dim, 0, &layout)?;
+        } else {
+            let (k, v) = metal.mtp_seed_kv_rows(tokens, states, weights, spec, history.len())?;
+            let layout =
+                super::attention_ops::attention_layout(&self.config, attention, &empty_q, &k, &v)?;
+            history.append_batch_owned(k, v, &layout)?;
+        }
         Ok(true)
     }
 
@@ -4378,6 +4418,7 @@ impl CausalDecoder {
             &self.final_norm,
             &prompt[1..],
             SEED_CHUNK,
+            super::mtp_history::bf16_capacity(),
         )?;
         let Some((cache, hidden, _)) = self.prefill_resident_cache_hidden_captures_and_mtp(
             prompt,
@@ -4723,7 +4764,7 @@ impl CausalDecoder {
     /// sans historique invisible. Les captures sont bornées à `capture_keep_rows`
     /// avant copie, même si l'entrée a été enregistrée sans borne.
     #[allow(clippy::type_complexity)]
-    fn prefix_cache_hit(
+    pub(super) fn prefix_cache_hit(
         &self,
         prompt: &[usize],
         with_mtp_history: bool,
@@ -4745,7 +4786,12 @@ impl CausalDecoder {
         let Some(index) = longest_prefix_entry_index(&cache.entries, prompt) else {
             return Ok(None);
         };
-        if with_mtp_history && cache.entries[index].mtp_history.is_none() {
+        if with_mtp_history
+            && !cache.entries[index]
+                .mtp_history
+                .as_ref()
+                .is_some_and(super::mtp_history::compatible)
+        {
             return Ok(None);
         }
         // ponytail: le suffixe coûte 31 ms par token en per-op et 5 à 9 ms en

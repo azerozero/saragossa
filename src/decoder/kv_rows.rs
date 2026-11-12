@@ -165,6 +165,16 @@ impl KvRows {
             .collect()
     }
 
+    /// Dtype de stockage, sans lecture ni élargissement des valeurs.
+    pub(super) fn has_bf16(&self) -> bool {
+        self.segments.iter().any(|segment| match segment.as_ref() {
+            Segment::OwnedBf16(_) => true,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Segment::SharedBf16(_) => true,
+            _ => false,
+        })
+    }
+
     /// Nombre de f32 logiques, `base` compris.
     pub(super) fn len(&self) -> usize {
         self.len

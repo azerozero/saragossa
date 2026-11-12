@@ -157,13 +157,53 @@ impl DecodeResidentState {
         kv_bf16: bool,
         prefix: [&crate::metal_backend::SharedBf16Rows; 2],
     ) -> Result<Option<FullAttentionMetalState>> {
+        self.full_attention_adopting_bf16(
+            capacity,
+            q_heads,
+            kv_heads,
+            head_dim,
+            kv_bf16_dense(kv_bf16),
+            prefix,
+        )
+    }
+
+    /// Adoption de la variante dense (MTP/sinks), qui ignore la quantification
+    /// comme `full_attention_dense`, tout en respectant le f32 forcé.
+    pub(crate) fn full_attention_dense_adopting(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        kv_bf16: bool,
+        prefix: [&crate::metal_backend::SharedBf16Rows; 2],
+    ) -> Result<Option<FullAttentionMetalState>> {
+        self.full_attention_adopting_bf16(
+            capacity,
+            q_heads,
+            kv_heads,
+            head_dim,
+            super::kv_element_bytes(kv_bf16) == GpuElement::Bf16.byte_size(),
+            prefix,
+        )
+    }
+
+    fn full_attention_adopting_bf16(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        bf16: bool,
+        prefix: [&crate::metal_backend::SharedBf16Rows; 2],
+    ) -> Result<Option<FullAttentionMetalState>> {
         let kv_dim = kv_heads * head_dim;
         let [key_len, value_len] = prefix.map(crate::metal_backend::SharedBf16Rows::len);
         if key_len != value_len || kv_dim == 0 || key_len % kv_dim != 0 {
             return Ok(None);
         }
         let floor = key_len / kv_dim;
-        if !kv_bf16_dense(kv_bf16) || floor > capacity {
+        if !bf16 || floor > capacity {
             return Ok(None);
         }
         let buffers = prefix.map(|view| view.buffer().to_owned());

@@ -50,6 +50,7 @@ mod loading;
 mod lookup;
 mod mtp;
 mod mtp_adaptive;
+mod mtp_history;
 mod multi;
 mod resident;
 

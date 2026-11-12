@@ -5929,50 +5929,8 @@ fn mtp_generation_publishes_shared_seed_history() -> Result<()> {
 
     assert!(prefix_cache_enabled());
     assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
-    const VOCAB: usize = 97;
-    const HIDDEN: usize = 64;
     const KV_DIM: usize = 2 * 256;
-    let config = CausalDecoderConfig {
-        num_attention_heads: 16,
-        num_key_value_heads: 2,
-        head_dim: Some(256),
-        rope_theta: Some(10_000_000.0),
-        ..CausalDecoderConfig::default()
-    };
-    let mut model =
-        CausalDecoder::from_tensors(resident_bf16_qwen_weights(VOCAB, HIDDEN)?, config)?;
-    let layer = &model.layers[0];
-    let AttentionBlock::Full(attention) = &layer.attention else {
-        return Err(InferError::Config("fixture sans attention complète".into()));
-    };
-    model.mtp = Some(MtpHead {
-        pre_fc_norm_embedding: layer.input_norm.clone(),
-        pre_fc_norm_hidden: model.final_norm.clone(),
-        fc: Linear::new(
-            Tensor::from_vec(
-                vec![HIDDEN, 2 * HIDDEN],
-                (0..HIDDEN * 2 * HIDDEN)
-                    .map(|i| ((i * 37 % 257) as f32 - 128.0) / 1280.0)
-                    .collect(),
-            )?,
-            None,
-        )?,
-        layer: MtpLayer {
-            input_norm: layer.input_norm.clone(),
-            attention: attention.as_ref().clone(),
-            post_attention_norm: layer
-                .post_attention_norm
-                .clone()
-                .ok_or_else(|| InferError::Config("fixture sans norme MLP".into()))?,
-            mlp: layer
-                .mlp
-                .clone()
-                .ok_or_else(|| InferError::Config("fixture sans MLP".into()))?,
-        },
-        norm: model.final_norm.clone(),
-    });
-    let model = model.with_metal_runtime()?;
-    let prompt: Vec<usize> = (0..1025).map(|i| (i * 31 + 7) % VOCAB).collect();
+    let (model, prompt) = mtp_seed_synthetic_model()?;
     let history = || -> Result<LayerKvCache> {
         let cache = model
             .prefix_cache
@@ -6097,6 +6055,312 @@ fn mtp_seed_shared_prefix_keeps_allocations() -> Result<()> {
         assert_eq!(shared.allocation_id(), source.allocation_id());
         assert_eq!(shared.as_slice().as_ptr(), source.as_slice().as_ptr());
         assert_eq!(rows.to_vec(), source.as_slice());
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
+    const VOCAB: usize = 97;
+    const HIDDEN: usize = 64;
+    let config = CausalDecoderConfig {
+        num_attention_heads: 16,
+        num_key_value_heads: 2,
+        head_dim: Some(256),
+        rope_theta: Some(10_000_000.0),
+        ..CausalDecoderConfig::default()
+    };
+    let mut model =
+        CausalDecoder::from_tensors(resident_bf16_qwen_weights(VOCAB, HIDDEN)?, config)?;
+    let layer = &model.layers[0];
+    let AttentionBlock::Full(attention) = &layer.attention else {
+        return Err(InferError::Config("fixture sans attention complète".into()));
+    };
+    model.mtp = Some(MtpHead {
+        pre_fc_norm_embedding: layer.input_norm.clone(),
+        pre_fc_norm_hidden: model.final_norm.clone(),
+        fc: Linear::new(
+            Tensor::from_vec(
+                vec![HIDDEN, 2 * HIDDEN],
+                (0..HIDDEN * 2 * HIDDEN)
+                    .map(|i| ((i * 37 % 257) as f32 - 128.0) / 1280.0)
+                    .collect(),
+            )?,
+            None,
+        )?,
+        layer: MtpLayer {
+            input_norm: layer.input_norm.clone(),
+            attention: attention.as_ref().clone(),
+            post_attention_norm: layer
+                .post_attention_norm
+                .clone()
+                .ok_or_else(|| InferError::Config("fixture sans norme MLP".into()))?,
+            mlp: layer
+                .mlp
+                .clone()
+                .ok_or_else(|| InferError::Config("fixture sans MLP".into()))?,
+        },
+        norm: model.final_norm.clone(),
+    });
+    let model = model.with_metal_runtime()?;
+    let prompt: Vec<usize> = (0..1025).map(|i| (i * 31 + 7) % VOCAB).collect();
+    Ok((model, prompt))
+}
+
+/// Couvre le branchement réel, l'adoption, la copie sous contention, les
+/// préfixes chauds/étendus et le retour au contrat f32 forcé.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_bf16_history_generation_adoption_and_f32_fallback() -> Result<()> {
+    use crate::decode_resident::{with_kv_format_override, KvFormat, KvSegment};
+    assert!(decode_resident_full_enabled());
+    assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
+    assert!(prefix_cache_enabled());
+    let (model, prompt) = mtp_seed_synthetic_model()?;
+    let capacity = prompt.len() + 16;
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
+        with_kv_format_override(KvFormat::Bf16, || -> Result<()> {
+            let (mut cache, _, history, _) =
+                super::mtp_history::with_storage(Some(capacity), || {
+                    model.prefill_cache_state_with_mtp_history(&prompt, &mut |_| Ok(true))
+                })?;
+            let mut concurrent = cache.clone();
+            assert!(model.setup_resident_full_decode_with_mtp_history(
+                &mut cache,
+                14,
+                2,
+                true,
+                Some(&history),
+            )?);
+            assert!(model.setup_resident_full_decode_with_mtp_history(
+                &mut concurrent,
+                14,
+                2,
+                true,
+                Some(&history),
+            )?);
+            let mtp = &cache
+                .resident
+                .as_ref()
+                .expect("arène")
+                .mtp
+                .as_ref()
+                .expect("MTP")
+                .kv;
+            let copy = &concurrent
+                .resident
+                .as_ref()
+                .expect("arène")
+                .mtp
+                .as_ref()
+                .expect("MTP")
+                .kv;
+            let mut seen = std::collections::HashSet::new();
+            for (rows, adopted, copied) in [
+                (&history.keys, mtp.keys(), copy.keys()),
+                (&history.values, mtp.values(), copy.values()),
+            ] {
+                let segments = rows.segments();
+                let [KvSegment::SharedBf16(view)] = segments.as_slice() else {
+                    return Err(InferError::Config("semis bf16 intégré non exercé".into()));
+                };
+                assert_eq!(view.buffer().contents(), adopted.buffer().contents());
+                assert_ne!(view.buffer().contents(), copied.buffer().contents());
+                assert_eq!(
+                    view.as_slice(),
+                    crate::metal_backend::read_u16_buffer(copied.buffer(), view.len())?
+                );
+                assert_eq!(rows.capacity_bytes_unseen(&mut seen), capacity * 512 * 2);
+            }
+            // Le cache de préfixe doit conserver ces mêmes allocations.
+            let prefixes = model.prefix_cache.lock().expect("préfixe");
+            let saved = prefixes.entries[0]
+                .mtp_history
+                .as_ref()
+                .expect("historique");
+            assert_eq!(saved.keys.capacity_bytes_unseen(&mut seen), 0);
+            assert_eq!(saved.values.capacity_bytes_unseen(&mut seen), 0);
+            drop(prefixes);
+            drop(cache);
+            drop(concurrent);
+            drop(history);
+
+            let options = GenerationOptions::default();
+            let mut extended = prompt.clone();
+            extended.extend_from_slice(&[3, 7, 11]);
+            for depth in [1, 2] {
+                model.clear_prefix_cache();
+                let ar = model.generate_greedy_cached_with_options(&prompt, 8, &options)?;
+                model.clear_prefix_cache();
+                for warm in [false, true] {
+                    let output = model
+                        .generate_greedy_mtp_batched_with_options(&prompt, 8, &options, depth)?;
+                    assert_eq!(output.tokens, ar, "D{depth}, chaud={warm}");
+                    assert_eq!(
+                        output.stats.reused_prefix_tokens,
+                        if warm { prompt.len() } else { 0 }
+                    );
+                }
+                let output = model
+                    .generate_greedy_mtp_batched_with_options(&extended, 8, &options, depth)?;
+                assert_eq!(output.stats.reused_prefix_tokens, prompt.len());
+                model.clear_prefix_cache();
+                let ar = model.generate_greedy_cached_with_options(&extended, 8, &options)?;
+                assert_eq!(output.tokens, ar, "D{depth}, extension");
+            }
+            // Remettre une entrée bf16, puis exiger une reconstruction f32.
+            model.clear_prefix_cache();
+            model.generate_greedy_mtp_batched_with_options(&prompt, 8, &options, 1)?;
+            with_kv_format_override(KvFormat::F32, || -> Result<()> {
+                let output =
+                    model.generate_greedy_mtp_batched_with_options(&prompt, 8, &options, 1)?;
+                assert_eq!(output.stats.reused_prefix_tokens, 0);
+                let prefixes = model.prefix_cache.lock().expect("préfixe");
+                let saved = prefixes.entries[0]
+                    .mtp_history
+                    .as_ref()
+                    .expect("historique");
+                assert!(!saved.keys.has_bf16() && !saved.values.has_bf16());
+                drop(prefixes);
+                model.clear_prefix_cache();
+                let cold =
+                    model.generate_greedy_mtp_batched_with_options(&prompt, 8, &options, 1)?;
+                assert_eq!(output.tokens, cold.tokens);
+                Ok(())
+            })
+        })
+    })
+}
+
+/// Une entrée compacte est un état résident, jamais un oracle f32 de draft.
+#[test]
+fn mtp_bf16_prefix_compatibility_and_shared_accounting_cpu() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let state = (model.empty_cache(), Tensor::row(vec![0.0])?);
+    let mut history = LayerKvCache::default();
+    history
+        .keys
+        .push_owned_bf16(vec![0x3f80, 0x8000, 0x7fc1, 0xc000]);
+    history
+        .values
+        .push_owned_bf16(vec![0x3f81, 0x0001, 0x7f80, 0x0000]);
+    model.prefix_cache_put(&[1, 2], &state, Some(&history), None)?;
+    assert!(model.prefix_cache_hit(&[1, 2], true, usize::MAX)?.is_none());
+    super::mtp_history::with_storage(Some(16), || -> Result<()> {
+        let (_, _, hit, _) = model
+            .prefix_cache_hit(&[1, 2], true, usize::MAX)?
+            .expect("préfixe bf16");
+        let hit = hit.expect("historique");
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(
+            history.keys.capacity_bytes_unseen(&mut seen)
+                + history.values.capacity_bytes_unseen(&mut seen),
+            16
+        );
+        assert_eq!(
+            hit.keys.capacity_bytes_unseen(&mut seen) + hit.values.capacity_bytes_unseen(&mut seen),
+            0
+        );
+        assert_eq!(
+            hit.keys.snapshot_segments(),
+            history.keys.snapshot_segments()
+        );
+        assert_eq!(
+            hit.values.snapshot_segments(),
+            history.values.snapshot_segments()
+        );
+        Ok(())
+    })?;
+    // Un historique f32 reste réutilisable dans les deux contrats.
+    history.keys = kv_rows::KvRows::default();
+    history.values = kv_rows::KvRows::default();
+    history.keys.push_owned(vec![1.000_001, -0.0]);
+    history.values.push_owned(vec![2.000_001, 0.0]);
+    model.prefix_cache_put(&[1, 2], &state, Some(&history), None)?;
+    let (_, _, hit, _) = model
+        .prefix_cache_hit(&[1, 2], true, usize::MAX)?
+        .expect("préfixe f32");
+    let hit = hit.expect("historique");
+    assert_eq!(
+        hit.keys.snapshot_segments(),
+        history.keys.snapshot_segments()
+    );
+    assert_eq!(
+        hit.values.snapshot_segments(),
+        history.values.snapshot_segments()
+    );
+    Ok(())
+}
+
+/// Validation explicite sur poids locaux : taille configurable pour 4k/32k/256k.
+/// Aucune recherche ni acquisition de modèle ; absence de paramètres = échec.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[test]
+#[ignore = "requiert Metal et un modèle MTP local explicitement fourni"]
+fn mtp_bf16_real_greedy_ids_and_memory() -> Result<()> {
+    assert!(decode_resident_full_enabled());
+    assert!(prefix_cache_enabled());
+    assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
+    assert_eq!(crate::decode_resident::kv_element_bytes(true), 2);
+    let dir = mtp_verifier_model_dir()
+        .ok_or_else(|| InferError::Config("modèle local MTP requis".into()))?;
+    let assets = crate::ModelAssets::load_local(&dir)?;
+    let sidecar = assets
+        .mtp
+        .path
+        .as_ref()
+        .ok_or_else(|| InferError::Config("sidecar MTP local requis".into()))?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(sidecar)?;
+    let number = |name: &str, default| -> Result<usize> {
+        std::env::var(name).ok().map_or(Ok(default), |s| {
+            s.parse()
+                .map_err(|_| InferError::Config(format!("{name} invalide")))
+        })
+    };
+    let count = number("SARAGOSSA_MTP_VALIDATION_TOKENS", 4096)?;
+    let generated = number("SARAGOSSA_MTP_VALIDATION_NEW_TOKENS", 64)?;
+    let depth = number("SARAGOSSA_MTP_VALIDATION_DEPTH", 1)?;
+    assert!(count >= 2 && generated > 1 && (1..=2).contains(&depth));
+    let text = match std::env::var_os("SARAGOSSA_MTP_VALIDATION_PROMPT") {
+        Some(path) => {
+            std::fs::read_to_string(path).map_err(|e| InferError::Config(e.to_string()))?
+        }
+        None => {
+            "Analyse ce module Rust de cache et explique ses invariants de concurrence. ".repeat(64)
+        }
+    };
+    let ids = mtp_verifier_prompt_ids(&assets, &text)?;
+    assert!(!ids.is_empty());
+    let prompt: Vec<_> = ids.into_iter().cycle().take(count).collect();
+    let options = mtp_verifier_options(Vec::new());
+    let ar = model.generate_greedy_cached_with_options(&prompt, generated, &options)?;
+    model.clear_prefix_cache();
+    for warm in [false, true] {
+        let output =
+            model.generate_greedy_mtp_batched_with_options(&prompt, generated, &options, depth)?;
+        assert_eq!(output.tokens, ar, "greedy AR ≠ MTP, D{depth}, chaud={warm}");
+        assert_eq!(
+            output.stats.reused_prefix_tokens,
+            if warm { count } else { 0 }
+        );
+        let prefixes = model.prefix_cache.lock().expect("préfixe");
+        let history = prefixes
+            .entries
+            .iter()
+            .find(|e| e.tokens == prompt)
+            .and_then(|e| e.mtp_history.as_ref())
+            .expect("historique committed publié");
+        assert!(history.keys.has_bf16() && history.values.has_bf16());
+        let mut seen = std::collections::HashSet::new();
+        let bytes = history.keys.capacity_bytes_unseen(&mut seen)
+            + history.values.capacity_bytes_unseen(&mut seen);
+        let kv_dim = history.kv_dim.expect("dimension KV");
+        let f32_bytes = (count - 1) * kv_dim * 2 * size_of::<f32>();
+        eprintln!("MTP prompt={count} D{depth} chaud={warm}: historique={bytes} octets, ancien f32={f32_bytes}, ids={:?}", output.tokens);
+        assert!(bytes < f32_bytes, "historique compact attendu");
     }
     Ok(())
 }
