@@ -120,6 +120,8 @@ fn markdown_and_quotations_stay_literal_at_every_delta_boundary() {
             format!("> {call}\n"),
             format!("    {call}\n"),
             format!("\t{call}\n"),
+            format!(" \t{call}\n"),
+            format!("  {call}\n"),
             format!("« {call} »"),
             format!("\"{call}\""),
             format!("'{call}'"),
@@ -131,6 +133,8 @@ fn markdown_and_quotations_stay_literal_at_every_delta_boundary() {
             format!("~~~\n- ~~~\n{call}\n~~~"),
             format!("~~~\n> ~~~\n{call}\n~~~"),
             format!("> ~~~\n> > ~~~\n> {call}\n> ~~~"),
+            format!("\"exemple\n~~~\n\"\n{call}\n~~~"),
+            format!("`exemple\n~~~\n`\n{call}\n~~~"),
         ] {
             let output = ToolOutputParser::new(family, tools(), true).parse(&text);
             assert!(output.tool_calls.is_empty(), "{text}");
@@ -246,6 +250,11 @@ fn list_code_blocks_stay_literal_across_all_delta_boundaries() {
                 ("- 1. ", "     "),
                 ("> - ", ">   "),
                 ("- parent\n  - ", "    "),
+                ("- exemple\n  \t", "  "),
+                ("- exemple\n \t", "  "),
+                ("1. exemple\n   \t", "   "),
+                ("\t- \t1) > + ", "> \t"),
+                ("    ", "    "),
             ] {
                 let literal = format!("{prefix}{fence}\n{indent}{call}\n{indent}{fence}\n");
                 // Un appel réel après le bloc vérifie aussi la sortie du contexte littéral.
@@ -284,6 +293,98 @@ fn list_code_blocks_stay_literal_across_all_delta_boundaries() {
                         .all(|e| matches!(e, FlintEvent::Content(_))));
                 }
                 assert!(!parser.has_tool_calls());
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_whitespace_cannot_close_code_blocks() {
+    for (family, call) in native_calls() {
+        for fence in ["```", "~~~"] {
+            for suffix in ["\u{a0}", " \u{a0}", "\t\u{2003}", "\u{202f}", "\u{3000}"] {
+                let literal = format!("{fence}\n{fence}{suffix}\n{call}\n{fence}\t \n");
+                let text = format!("{literal}{call}");
+                let parsed = ToolOutputParser::new(family, tools(), true).parse(&text);
+                assert_eq!(parsed.content, literal, "{text:?}");
+                assert_eq!(parsed.tool_calls.len(), 1, "{text:?}");
+                for split in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+                    let mut parser = ToolOutputParser::new(family, tools(), true);
+                    let mut events = parser.push(&text[..split]);
+                    events.extend(parser.push(&text[split..]));
+                    events.extend(parser.finish());
+                    let content: String = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            FlintEvent::Content(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let calls: Vec<_> = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            FlintEvent::ToolCall(call) => Some(call),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(content, literal, "split {split}: {text:?}");
+                    assert_eq!(calls.len(), 1, "split {split}: {text:?}");
+                    assert_eq!(calls[0].function, parsed.tool_calls[0].function);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn qwen_composed_nullable_types_match_type_arrays() {
+    for schema in [
+        json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+        json!({"oneOf":[{"type":"null"},{"type":"string"}]}),
+        json!({"anyOf":[{"type":"null"},{"oneOf":[{"type":"string"}]}]}),
+    ] {
+        let mut declared = tools();
+        declared[0]["function"]["parameters"]["properties"]["city"] = schema;
+        for value in ["Paris", "Évry", "null", "42", "", "{broken"] {
+            let text = format!("<tool_call><function=weather><parameter=city>{value}</parameter></function></tool_call>");
+            for split in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+                let mut parser = ToolOutputParser::new(ToolFamily::Qwen, declared.clone(), true);
+                let mut events = parser.push(&text[..split]);
+                events.extend(parser.push(&text[split..]));
+                events.extend(parser.finish());
+                assert_eq!(events.len(), 1, "split {split}: {text}");
+                let FlintEvent::ToolCall(call) = &events[0] else {
+                    panic!("expected tool call: {text}");
+                };
+                assert_eq!(
+                    serde_json::from_str::<Value>(&call.function.arguments).expect("args"),
+                    json!({"city":value})
+                );
+            }
+        }
+    }
+    for composition in ["anyOf", "oneOf"] {
+        let mut declared = tools();
+        declared[0]["function"]["parameters"]["properties"]["count"] =
+            json!({composition:[{"type":"integer"},{"type":"null"}]});
+        for (raw, expected) in [
+            ("2", Some(json!(2))),
+            ("null", Some(Value::Null)),
+            ("{broken", None),
+            ("Paris", None),
+        ] {
+            let text = format!("<tool_call><function=weather><parameter=count>{raw}</parameter></function></tool_call>");
+            let parsed =
+                ToolOutputParser::new(ToolFamily::Qwen, declared.clone(), true).parse(&text);
+            if let Some(expected) = expected {
+                assert_eq!(parsed.tool_calls.len(), 1);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&parsed.tool_calls[0].function.arguments)
+                        .expect("args"),
+                    json!({"count":expected})
+                );
+            } else {
+                assert!(parsed.tool_calls.is_empty());
             }
         }
     }

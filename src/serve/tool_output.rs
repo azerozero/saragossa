@@ -250,6 +250,19 @@ fn declared<'a>(tools: &'a [Value], name: &str) -> Option<&'a Value> {
         .find(|f| f["name"].as_str() == Some(name))
 }
 
+fn accepts_string(schema: &Value) -> bool {
+    let kind = &schema["type"];
+    kind == "string"
+        || kind
+            .as_array()
+            .is_some_and(|types| types.iter().any(|t| t == "string"))
+        || ["anyOf", "oneOf"].iter().any(|composition| {
+            schema[composition]
+                .as_array()
+                .is_some_and(|branches| branches.iter().any(accepts_string))
+        })
+}
+
 fn parse_qwen(body: &str, tools: &[Value]) -> Option<(String, Value)> {
     let body = body.trim().strip_prefix("<function=")?;
     let (name, mut rest) = body.split_once('>')?;
@@ -273,13 +286,8 @@ fn parse_qwen(body: &str, tools: &[Value]) -> Option<(String, Value)> {
         let (raw, tail) = value.split_once("</parameter>")?;
         let raw = raw.strip_prefix('\n').unwrap_or(raw);
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
-        let string = declared(tools, name).is_some_and(|f| {
-            let kind = &f["parameters"]["properties"][key]["type"];
-            kind == "string"
-                || kind
-                    .as_array()
-                    .is_some_and(|types| types.iter().any(|t| t == "string"))
-        });
+        let string = declared(tools, name)
+            .is_some_and(|f| accepts_string(&f["parameters"]["properties"][key]));
         arguments.insert(
             key.to_string(),
             if string {
