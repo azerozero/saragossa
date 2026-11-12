@@ -1021,12 +1021,28 @@ fn layer_overrides_follow_gemma3_sliding_pattern() {
     };
     // Couches locales : toutes sauf la 6e du motif (indices 5, 11, 17, 23…).
     for layer in [0_usize, 1, 4, 6, 10, 24] {
-        assert_eq!(config.layer_rope_theta_override(layer), Some(10_000.0));
-        assert_eq!(config.layer_sliding_window(layer), Some(512));
+        assert_eq!(
+            LayerPlan::build(&config, layer)
+                .resident
+                .rope_theta_override,
+            Some(10_000.0)
+        );
+        assert_eq!(
+            LayerPlan::build(&config, layer).resident.sliding_window,
+            Some(512)
+        );
     }
     for layer in [5_usize, 11, 17, 23] {
-        assert_eq!(config.layer_rope_theta_override(layer), None);
-        assert_eq!(config.layer_sliding_window(layer), None);
+        assert_eq!(
+            LayerPlan::build(&config, layer)
+                .resident
+                .rope_theta_override,
+            None
+        );
+        assert_eq!(
+            LayerPlan::build(&config, layer).resident.sliding_window,
+            None
+        );
     }
 }
 
@@ -1034,9 +1050,22 @@ fn layer_overrides_follow_gemma3_sliding_pattern() {
 fn layer_overrides_absent_without_sliding_pattern() {
     let config = CausalDecoderConfig::default();
     for layer in 0..8 {
-        assert_eq!(config.layer_rope_theta_override(layer), None);
-        assert_eq!(config.layer_sliding_window(layer), None);
-        assert_eq!(config.layer_rope_position_scale(layer), None);
+        assert_eq!(
+            LayerPlan::build(&config, layer)
+                .resident
+                .rope_theta_override,
+            None
+        );
+        assert_eq!(
+            LayerPlan::build(&config, layer).resident.sliding_window,
+            None
+        );
+        assert_eq!(
+            LayerPlan::build(&config, layer)
+                .resident
+                .rope_position_scale,
+            None
+        );
     }
 }
 
@@ -1054,12 +1083,32 @@ fn layer_rope_position_scale_targets_global_layers_only() {
         ..CausalDecoderConfig::default()
     };
     for layer in [0_usize, 1, 4, 6, 10, 24] {
-        assert_eq!(config.layer_rope_position_scale(layer), None);
-        assert_eq!(config.layer_rope_theta_override(layer), Some(10_000.0));
+        assert_eq!(
+            LayerPlan::build(&config, layer)
+                .resident
+                .rope_position_scale,
+            None
+        );
+        assert_eq!(
+            LayerPlan::build(&config, layer)
+                .resident
+                .rope_theta_override,
+            Some(10_000.0)
+        );
     }
     for layer in [5_usize, 11, 17, 23] {
-        assert_eq!(config.layer_rope_position_scale(layer), Some(0.125));
-        assert_eq!(config.layer_rope_theta_override(layer), None);
+        assert_eq!(
+            LayerPlan::build(&config, layer)
+                .resident
+                .rope_position_scale,
+            Some(0.125)
+        );
+        assert_eq!(
+            LayerPlan::build(&config, layer)
+                .resident
+                .rope_theta_override,
+            None
+        );
     }
     // Linear historique (Llama 2) : pas de motif sliding → toutes les couches.
     let uniform = CausalDecoderConfig {
@@ -1067,7 +1116,12 @@ fn layer_rope_position_scale_targets_global_layers_only() {
         ..CausalDecoderConfig::default()
     };
     for layer in 0..8 {
-        assert_eq!(uniform.layer_rope_position_scale(layer), Some(0.25));
+        assert_eq!(
+            LayerPlan::build(&uniform, layer)
+                .resident
+                .rope_position_scale,
+            Some(0.25)
+        );
     }
 }
 
@@ -1091,15 +1145,21 @@ fn resident_full_attention_uses_gemma4_layer_types() {
         ..CausalDecoderConfig::default()
     };
 
-    assert!(config.is_full_attention_layer(0));
-    assert!(config.is_resident_full_attention_layer(0));
-    assert!(config.is_resident_full_attention_layer(2));
-    let global_head_dim = config
-        .layer_head_dim(2)
+    assert!(LayerPlan::build(&config, 0).is_full());
+    assert!(LayerPlan::build(&config, 0).resident_full);
+    assert!(LayerPlan::build(&config, 2).resident_full);
+    let global_head_dim = LayerPlan::build(&config, 2)
+        .resident
+        .head_dim()
         .expect("invariant: global_head_dim Gemma4 présent");
     assert_eq!(global_head_dim, 512);
-    assert_eq!(config.layer_num_key_value_heads(2), 2);
-    assert_eq!(config.layer_rope_dims(2, global_head_dim), 128);
+    assert_eq!(LayerPlan::build(&config, 2).resident.kv_heads, 2);
+    assert_eq!(
+        LayerPlan::build(&config, 2)
+            .resident
+            .rope_dims(global_head_dim),
+        128
+    );
 }
 
 #[test]
@@ -1121,17 +1181,21 @@ fn resident_full_attention_keeps_qwen_interval_and_uniform_dims() {
         ..CausalDecoderConfig::default()
     };
 
-    assert!(!config.is_resident_full_attention_layer(0));
-    assert!(config.is_resident_full_attention_layer(4));
-    let head_dim = config
-        .layer_head_dim(4)
+    assert!(!LayerPlan::build(&config, 0).resident_full);
+    assert!(LayerPlan::build(&config, 4).resident_full);
+    let head_dim = LayerPlan::build(&config, 4)
+        .resident
+        .head_dim()
         .expect("invariant: head_dim Qwen présent");
     assert_eq!(head_dim, 128);
     assert_eq!(
-        config.layer_num_key_value_heads(4),
+        LayerPlan::build(&config, 4).resident.kv_heads,
         config.num_key_value_heads
     );
-    assert_eq!(config.layer_rope_dims(4, head_dim), 32);
+    assert_eq!(
+        LayerPlan::build(&config, 4).resident.rope_dims(head_dim),
+        32
+    );
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1178,7 +1242,7 @@ fn resident_linear_detection_uses_attention_block_variants() {
     )
     .expect("invariant: Gemma synthétique chargeable");
 
-    assert!(gemma.config.is_resident_full_attention_layer(0));
+    assert!(gemma.plan.layers[0].resident_full);
     assert!(matches!(
         &gemma.layers[0].attention,
         AttentionBlock::Full(attention) if attention.sliding_window == Some(4)
@@ -1639,8 +1703,13 @@ fn attention_layout_wires_scale_and_window() {
         rope_dims: Some(2),
         ..CausalDecoderConfig::default()
     };
-    let attention = full_attention_from_tensors(&config, &mut tensors, "layers.0", 0)
-        .expect("invariant: attention valide");
+    let attention = full_attention_from_tensors(
+        &config,
+        &mut tensors,
+        "layers.0",
+        &LayerPlan::build(&config, 0).resident,
+    )
+    .expect("invariant: attention valide");
     let AttentionBlock::Full(mut attention) = attention else {
         panic!("invariant: attention full attendue");
     };
@@ -1737,8 +1806,12 @@ fn full_attention_append_kv_rows_matches_prefill_cache_bytes() -> Result<()> {
         head_dim: Some(2),
         ..CausalDecoderConfig::default()
     };
-    let AttentionBlock::Full(attention) =
-        full_attention_from_tensors(&config, &mut tensors, "layers.0", 0)?
+    let AttentionBlock::Full(attention) = full_attention_from_tensors(
+        &config,
+        &mut tensors,
+        "layers.0",
+        &LayerPlan::build(&config, 0).resident,
+    )?
     else {
         return Err(InferError::Config("attention full attendue".to_string()));
     };
@@ -1797,8 +1870,13 @@ fn gemma4_global_attention_aliases_k_as_resident_v_projection() -> Result<()> {
         layer_types: vec!["full_attention".to_string()],
         ..CausalDecoderConfig::default()
     };
-    let attention = full_attention_from_tensors(&config, &mut tensors, "layers.0", 0)
-        .expect("invariant: attention Gemma4 valide");
+    let attention = full_attention_from_tensors(
+        &config,
+        &mut tensors,
+        "layers.0",
+        &LayerPlan::build(&config, 0).resident,
+    )
+    .expect("invariant: attention Gemma4 valide");
     let AttentionBlock::Full(attention) = attention else {
         return Err(InferError::Config(
             "attention full Gemma4 attendue".to_string(),

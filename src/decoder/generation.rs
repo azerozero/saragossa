@@ -2447,7 +2447,7 @@ impl CausalDecoder {
                 ))
             })?;
             let (max_abs, mean_abs) = diff_stats_same_len(reference_slice, resident_slice)?;
-            let attention_kind = if self.config.is_full_attention_layer(layer_index) {
+            let attention_kind = if self.plan.layers[layer_index].is_full() {
                 "full"
             } else {
                 "linear"
@@ -2515,7 +2515,7 @@ impl CausalDecoder {
         input_token: usize,
     ) -> Result<Option<ResidentLinearXrayProbe>> {
         let Some(layer_index) =
-            (0..self.layers.len()).find(|index| !self.config.is_full_attention_layer(*index))
+            (0..self.layers.len()).find(|index| !self.plan.layers[*index].is_full())
         else {
             return Ok(None);
         };
@@ -5647,13 +5647,13 @@ impl CausalDecoder {
                 && !crate::runtime_flags::gpu_timestamps_enabled();
             let (mut bytes_per_token, mut fixed_bytes) = (0_usize, 0_usize);
             for index in (0..self.layers.len())
-                .filter(|&index| self.config.is_resident_full_attention_layer(index))
+                .filter(|&index| self.plan.layers[index].resident_full)
             {
-                let Ok(kv_dim) = self.config.resident_full_attention_kv_dim(index) else {
+                let Ok(kv_dim) = self.plan.layers[index].resident.kv_dim() else {
                     continue;
                 };
                 let row_bytes = 2 * kv_dim * KV_BYTES_PER_VALUE;
-                let window = self.config.layer_sliding_window(index).filter(|_| {
+                let window = self.plan.layers[index].resident.sliding_window.filter(|_| {
                     chunked
                         && matches!(
                             self.layers.get(index).map(|layer| &layer.attention),

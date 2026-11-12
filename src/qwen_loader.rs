@@ -1,5 +1,6 @@
 //! Chargement des poids Qwen depuis safetensors et configuration.
 
+use crate::decoder::layer_plan::LoaderLayerPlan;
 use crate::{
     decoder::DecoderTensor,
     memory_guard::{estimate_paths_bytes, MemoryGuard},
@@ -996,18 +997,15 @@ fn decoder_specs(
         !config.tie_word_embeddings,
     ));
     for layer in 0..config.num_hidden_layers {
-        let required_weights = if config.is_full_attention_layer(layer) {
+        let plan = LoaderLayerPlan::build(config, layer);
+        let required_weights = if plan.full {
             FULL_ATTENTION_LAYER_WEIGHTS
         } else {
             LINEAR_ATTENTION_LAYER_WEIGHTS
         };
         let layer_required = required_weights
             .iter()
-            .filter(|suffix| {
-                !(config.attention_k_eq_v
-                    && config.is_gemma4_full_layer(layer)
-                    && **suffix == "self_attn.v_proj.weight")
-            })
+            .filter(|suffix| !(plan.v_shared_with_k && **suffix == "self_attn.v_proj.weight"))
             .map(|suffix| layer_target(layer, suffix))
             .collect::<Vec<_>>();
         specs.extend(specs_for(prefixes, layer_required, true));
@@ -1092,9 +1090,7 @@ fn decoder_specs(
 
         let layer_optional = OPTIONAL_LAYER_WEIGHTS
             .iter()
-            .filter(|suffix| {
-                config.is_full_attention_layer(layer) || !suffix.starts_with("self_attn.")
-            })
+            .filter(|suffix| plan.full || !suffix.starts_with("self_attn."))
             .filter(|suffix| {
                 !(config.has_attention_sinks() && FLINT_ATTENTION_LAYER_WEIGHTS.contains(suffix))
             })
@@ -1130,14 +1126,14 @@ fn layer_target(layer: usize, suffix: &str) -> String {
 #[cfg(test)]
 mod dense_bf16_tests;
 #[cfg(test)]
-mod flint_tests;
+pub(crate) mod flint_tests;
 #[cfg(test)]
-mod gemma4_test_fixtures;
+pub(crate) mod gemma4_test_fixtures;
 #[cfg(test)]
 mod gemma4_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod qwen_kv_x3_tests;
 #[cfg(test)]
-mod test_fixtures;
+pub(crate) mod test_fixtures;
 #[cfg(test)]
 mod tests;

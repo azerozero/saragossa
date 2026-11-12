@@ -1064,8 +1064,8 @@ impl CausalDecoder {
     /// glissantes, KV quantifié ou à sinks, chemin en lignes fusionné désactivé,
     /// états linéaires hors du journal arbre pour `rows` lignes.
     fn check_dflash_tree_supported(&self, cache: &CausalDecoderCache, rows: usize) -> Result<()> {
-        let sliding =
-            (0..self.layers.len()).any(|index| self.config.layer_sliding_window(index).is_some());
+        let sliding = (0..self.layers.len())
+            .any(|index| self.plan.layers[index].resident.sliding_window.is_some());
         let full = cache.layers.iter().filter_map(|layer| layer.full.as_ref());
         let refusal = dflash_tree_refusal(
             sliding,
