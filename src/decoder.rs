@@ -1386,28 +1386,29 @@ struct PrefixCacheEntry {
 pub(crate) struct PrefixCaptures {
     pub(crate) layer_ids: Vec<usize>,
     pub(crate) from: usize,
-    /// `[positions, layer_ids.len() * hidden]`.
-    pub(crate) hidden: Tensor,
+    /// `[positions, layer_ids.len() * hidden]`, immuable et partagé avec le
+    /// consommateur DFlash : insérer ou relire une entrée ne recopie pas les f32.
+    pub(crate) hidden: Arc<Tensor>,
 }
 
 impl PrefixCaptures {
-    fn new(layer_ids: &[usize], from: usize, hidden: Tensor) -> Self {
+    fn new(layer_ids: &[usize], from: usize, hidden: impl Into<Arc<Tensor>>) -> Self {
         Self {
             layer_ids: layer_ids.to_vec(),
             from,
-            hidden,
+            hidden: hidden.into(),
         }
     }
 
-    /// Copie seulement la queue demandée, sans cloner le tenseur complet du cache.
+    /// Partage les captures intactes ; une fenêtre plus courte copie uniquement
+    /// sa queue pour ne pas retenir l'allocation complète à travers cette vue.
     fn clone_tail(&self, keep_rows: usize) -> Result<Self> {
-        let (rows, cols) = self.hidden.as_matrix()?;
-        let drop = rows.saturating_sub(keep_rows.max(1));
-        let hidden = Tensor::from_vec(
-            vec![rows - drop, cols],
-            self.hidden.data()[drop * cols..].to_vec(),
-        )?;
-        Ok(Self::new(&self.layer_ids, self.from + drop, hidden))
+        Self::tail(
+            &self.layer_ids,
+            self.from,
+            Arc::clone(&self.hidden),
+            keep_rows,
+        )
     }
 
     /// Garde au plus les `keep_rows` dernières lignes de `hidden` (positions
@@ -1415,9 +1416,10 @@ impl PrefixCaptures {
     pub(crate) fn tail(
         layer_ids: &[usize],
         from: usize,
-        hidden: Tensor,
+        hidden: impl Into<Arc<Tensor>>,
         keep_rows: usize,
     ) -> Result<Self> {
+        let hidden = hidden.into();
         let (rows, cols) = hidden.as_matrix()?;
         let drop = rows.saturating_sub(keep_rows.max(1));
         let hidden = if drop == 0 {
@@ -1427,14 +1429,15 @@ impl PrefixCaptures {
                 vec![rows - drop, cols],
                 hidden.data()[drop * cols..].to_vec(),
             )?
+            .into()
         };
         Ok(Self::new(layer_ids, from + drop, hidden))
     }
 }
 
 impl PrefixCacheEntry {
-    /// Octets de l'entrée, sans les segments KV déjà dans `seen` (partagés avec
-    /// une autre entrée) ; ajoute les siens.
+    /// Occupation de l'entrée, sans les allocations déjà dans `seen` ; ajoute
+    /// les siennes, même si un consommateur externe les détient aussi.
     fn estimated_bytes_unseen(&self, seen: &mut std::collections::HashSet<usize>) -> u64 {
         let mut bytes = self
             .tokens
@@ -1453,10 +1456,11 @@ impl PrefixCacheEntry {
                     .saturating_add(history.values.capacity_bytes_unseen(seen))
             }))
             .saturating_add(self.captures.as_ref().map_or(0, |captures| {
-                captures
-                    .hidden
-                    .len()
-                    .saturating_mul(std::mem::size_of::<f32>())
+                if seen.insert(Arc::as_ptr(&captures.hidden) as usize) {
+                    captures.hidden.capacity_bytes()
+                } else {
+                    0
+                }
             }));
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
@@ -1473,13 +1477,21 @@ impl PrefixCacheEntry {
 }
 
 impl PrefixCache {
-    /// Évince l'entrée la moins récente ; rend les octets réellement libérés,
-    /// sans les segments KV qu'elle partage avec les entrées restantes.
+    /// Évince l'entrée la moins récente ; estime les octets libérables, sans
+    /// les segments KV partagés avec les entrées restantes ni les captures
+    /// encore détenues par une autre entrée ou un consommateur externe.
     fn evict_lru_entry(&mut self) -> Option<u64> {
         let entry = self.entries.pop()?;
         let mut seen = std::collections::HashSet::new();
         for kept in &self.entries {
             kept.estimated_bytes_unseen(&mut seen);
+        }
+        if let Some(captures) = &entry.captures {
+            // Le plafond compte l'allocation partagée, mais la purge ne peut
+            // la libérer tant qu'un autre propriétaire la détient.
+            if Arc::strong_count(&captures.hidden) > 1 {
+                seen.insert(Arc::as_ptr(&captures.hidden) as usize);
+            }
         }
         Some(entry.estimated_bytes_unseen(&mut seen))
     }

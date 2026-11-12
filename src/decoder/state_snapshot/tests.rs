@@ -352,6 +352,80 @@ fn isolated(name: &str, enabled: bool, run: impl FnOnce(&Path)) -> String {
 }
 
 #[test]
+#[cfg(feature = "devtools")]
+fn dflash_disk_hit_preserves_shared_captures_and_greedy_ids() {
+    isolated(
+        "dflash_disk_hit_preserves_shared_captures_and_greedy_ids",
+        true,
+        |root| {
+            let prompt = [0, 1];
+            let options = GenerationOptions::default();
+            let (model, _) = fixture(root);
+            let mut draft = super::super::tests::tiny_dflash_draft();
+            let baseline = model
+                .generate_greedy_cached_with_options(&prompt, 5, &options)
+                .unwrap();
+            let path = root.join("synthetic-source");
+            std::fs::write(&path, b"synthetic").unwrap();
+            let model = model.with_snapshot_sources(SnapshotSources::capture([path.as_path()]));
+            draft.snapshot_sources = SnapshotSources::capture([path.as_path()]);
+
+            // Les deux passages couvrent l'écriture puis la relecture de la
+            // référence DFlash, dont l'API rend encore un Tensor possédé.
+            for expected_hits in [0, 1] {
+                HITS.set(0);
+                let output = model
+                    .generate_greedy_dflash_batched_with_options(&prompt, 5, &options, &draft, 2)
+                    .unwrap();
+                assert_eq!(HITS.get(), expected_hits);
+                assert_eq!(output.tokens, baseline);
+            }
+
+            // L'entrée utilisée par DFlash résident conserve au contraire
+            // l'Arc du cache de préfixe, même après restauration depuis disque.
+            for keep_rows in [1, prompt.len()] {
+                let mut cold_bits = None;
+                for expected_hits in [0, 1] {
+                    HITS.set(0);
+                    let (mut cache, mut state, hidden, from) = model
+                        .prefill_cache_state_with_layer_capture_cached(
+                            &prompt,
+                            &[0],
+                            keep_rows,
+                            Some(&draft),
+                        )
+                        .unwrap();
+                    assert_eq!(HITS.get(), expected_hits);
+                    assert_eq!(from, prompt.len() - keep_rows);
+                    let bits: Vec<_> = hidden.data().iter().map(|x| x.to_bits()).collect();
+                    if let Some(cold_bits) = &cold_bits {
+                        assert_eq!(&bits, cold_bits);
+                    } else {
+                        cold_bits = Some(bits);
+                    }
+                    let hit = model
+                        .prefix_cache_get_with_captures(&prompt, &[0], keep_rows)
+                        .unwrap()
+                        .unwrap();
+                    assert!(Arc::ptr_eq(&hidden, &hit.2));
+                    assert_eq!(hit.3, from);
+                    let mut sampler = DeterministicSampler::new(options.seed);
+                    let mut tokens = Vec::new();
+                    for _ in 0..baseline.len() {
+                        let token = model
+                            .sample_token_from_state(&state, &options, &mut sampler)
+                            .unwrap();
+                        tokens.push(token);
+                        state = model.next_final_state_cached(&mut cache, token).unwrap();
+                    }
+                    assert_eq!(tokens, baseline);
+                }
+            }
+        },
+    );
+}
+
+#[test]
 fn sources_frozen_at_load_reject_replacement_and_skip_writes() {
     isolated(
         "sources_frozen_at_load_reject_replacement_and_skip_writes",
