@@ -8,6 +8,16 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
+/// Options communes aux compilations runtime et aux sondes de kernels Metal.
+/// `allow_fast_math = false` préserve les kernels qui exigent le mode précis ;
+/// sinon `SARAGOSSA_RUST_METAL_FAST_MATH` décide (défaut `1`). Les appels explicites
+/// `fast::` dans les sources restent inchangés, même avec le flag à `0`.
+pub fn compile_options(allow_fast_math: bool) -> CompileOptions {
+    let options = CompileOptions::new();
+    options.set_fast_math_enabled(allow_fast_math && flags::metal_fast_math_enabled());
+    options
+}
+
 pub(super) fn pipeline(
     library: &metal::Library,
     device: &Device,
@@ -106,8 +116,7 @@ fn read_runtime_kernel(root: &Path, names: &[&str]) -> Result<String> {
 /// Compile le GEMM NA dans une bibliothèque SÉPARÉE (MPP `#include`). `None` si la
 /// MetalPerformancePrimitives est absente (macOS < 26) → fallback f32.
 fn compile_na_gemm(device: &Device, source: &str) -> Option<ComputePipelineState> {
-    let options = CompileOptions::new();
-    options.set_fast_math_enabled(true);
+    let options = compile_options(true);
     let library = device.new_library_with_source(source, &options).ok()?;
     let function = library.get_function("gemm_nax", None).ok()?;
     device
@@ -120,8 +129,7 @@ fn compile_na_gemm_named(
     source: &str,
     name: &str,
 ) -> Option<ComputePipelineState> {
-    let options = CompileOptions::new();
-    options.set_fast_math_enabled(true);
+    let options = compile_options(true);
     let library = device.new_library_with_source(source, &options).ok()?;
     let function = library.get_function(name, None).ok()?;
     device
@@ -137,8 +145,7 @@ fn compile_steel_attention(device: &Device, source: &str) -> Option<ComputePipel
     ) {
         return None;
     }
-    let options = CompileOptions::new();
-    options.set_fast_math_enabled(true);
+    let options = compile_options(true);
     let library = device.new_library_with_source(source, &options).ok()?;
     let constants = FunctionConstantValues::new();
     set_metal_bool_constant(&constants, 200, false);
@@ -160,8 +167,7 @@ fn compile_steel_attention(device: &Device, source: &str) -> Option<ComputePipel
 /// `SARAGOSSA_RUST_TRACE_PREFILL`).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compile_steel_causal_attentions(device: &Device, source: &str) -> SteelCausalAttentions {
-    let options = CompileOptions::new();
-    options.set_fast_math_enabled(true);
+    let options = compile_options(true);
     let library = match device.new_library_with_source(source, &options) {
         Ok(library) => library,
         Err(message) => {
@@ -287,8 +293,7 @@ pub(super) fn compile_nax_function(
     name: &str,
     bool_constants: &[(u64, bool)],
 ) -> Option<ComputePipelineState> {
-    let options = CompileOptions::new();
-    options.set_fast_math_enabled(true);
+    let options = compile_options(true);
     let library = match device.new_library_with_source(source, &options) {
         Ok(library) => library,
         Err(message) => {
@@ -367,10 +372,9 @@ impl MetalExecutor {
             .ok_or_else(|| InferError::Metal("aucun device Metal disponible".to_string()))?;
         let queue = device.new_command_queue();
         let sources = KernelSources::load()?;
-        let compile_options = CompileOptions::new();
-        compile_options.set_fast_math_enabled(true);
+        let options = compile_options(true);
         let library = device
-            .new_library_with_source(sources.matmul.as_ref(), &compile_options)
+            .new_library_with_source(sources.matmul.as_ref(), &options)
             .map_err(|message| InferError::Metal(format!("compile kernels: {message}")))?;
         let dense_matmul_rhs_t_f32 = pipeline(&library, &device, "dense_matmul_rhs_t_f32")?;
         let dense_qmv_rhs_bf16_f32 = pipeline(&library, &device, "dense_qmv_rhs_bf16_f32")?;
@@ -768,7 +772,7 @@ impl MetalExecutor {
         let topk_softmax_wide_f32 = pipeline(&library, &device, "topk_softmax_wide_f32")?;
         #[cfg(test)]
         let topk_softmax_forced_f32 = {
-            let options = metal::CompileOptions::new();
+            let options = compile_options(true);
             let forced = device
                 .new_library_with_source(super::moe_encode::TOPK_FORCED_SOURCE, &options)
                 .map_err(|message| InferError::Metal(format!("kernel top-k imposé : {message}")))?;
@@ -1052,5 +1056,49 @@ impl MetalExecutor {
             #[cfg(test)]
             scratch_releases: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+}
+
+#[cfg(test)]
+mod compile_options_tests {
+    use super::compile_options;
+    use crate::metal_backend::with_metal_fast_math_override;
+
+    #[test]
+    fn fast_math_override_preserves_precise_kernels_and_restores() {
+        with_metal_fast_math_override(true, || {
+            assert!(compile_options(true).is_fast_math_enabled());
+            assert!(!compile_options(false).is_fast_math_enabled());
+            with_metal_fast_math_override(false, || {
+                assert!(!compile_options(true).is_fast_math_enabled());
+                assert!(!compile_options(false).is_fast_math_enabled());
+            });
+            assert!(compile_options(true).is_fast_math_enabled());
+            let failed = std::panic::catch_unwind(|| {
+                with_metal_fast_math_override(false, || {
+                    panic!("test de restauration après panique");
+                });
+            });
+            assert!(failed.is_err());
+            assert!(compile_options(true).is_fast_math_enabled());
+            // Le parent vérifie pendant que l'override de l'enfant est actif :
+            // un stockage global, et non local au thread, ferait échouer ce test.
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let child_barrier = std::sync::Arc::clone(&barrier);
+            let child = std::thread::spawn(move || {
+                with_metal_fast_math_override(false, || {
+                    let child_fast = compile_options(true).is_fast_math_enabled();
+                    child_barrier.wait();
+                    child_barrier.wait();
+                    assert!(!child_fast);
+                });
+            });
+            barrier.wait();
+            let parent_fast = compile_options(true).is_fast_math_enabled();
+            barrier.wait();
+            child.join().expect("invariant: thread de test terminé");
+            assert!(parent_fast);
+            assert!(compile_options(true).is_fast_math_enabled());
+        });
     }
 }

@@ -417,6 +417,17 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
     );
 }
 
+/// Même oracle synthétique, toutes les compilations du runtime sans fast-math.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "GPU synthétique : exécuté par gpu-synthetic.yml"]
+fn synthetic_flint_resident_decode_without_fast_math_matches_cpu_oracle() {
+    crate::metal_backend::with_metal_fast_math_override(false, || {
+        assert!(!crate::metal_backend::compile_options(true).is_fast_math_enabled());
+        synthetic_flint_resident_decode_matches_cpu_oracle();
+    });
+}
+
 /// Light-batch flint : time-slicing (le pas duo ne connaît pas flint), deux
 /// flux, chacun identique au flux seul, et chaque pas par le decode résident.
 /// Le flux de 600 tokens dépasse de loin la fenêtre synthétique de 2 ; il
@@ -2707,4 +2718,106 @@ fn flint_int4_arena_adopts_prefill_kv_bf16() {
         "arène sans adoption du K/V bf16 de flint-int4: {adopted:?}"
     );
     assert_eq!(tokens, copied, "greedy adopté != semis par copie");
+}
+
+/// Référence plein vocabulaire sans poids externes, via le vrai decode résident.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[test]
+#[ignore = "requiert un device Metal ; exécuté par gpu-synthetic.yml"]
+fn synthetic_flint_kl_reference_roundtrip() {
+    let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
+    let dir = tempfile::tempdir().expect("invariant: répertoire temporaire");
+    assert!(crate::devtools::kl_ref::record(&cpu, &[1, 2, 3], 4, &dir.path().join("cpu")).is_err());
+    assert!(!dir.path().join("cpu").exists());
+    let gpu = load(flint_tensors(true))
+        .expect("invariant: flint synthétique")
+        .with_metal_runtime()
+        .expect("invariant: Metal requis");
+    // Oracle indépendant de la première projection : même hidden résident,
+    // mais norme et lm_head calculés sur CPU avec les poids synthétiques.
+    let (cache, hidden) = gpu
+        .resident_reference_start(&[1], 1, false)
+        .expect("invariant: prefill résident");
+    let projected = gpu
+        .resident_reference_initial_logits(&cache, &hidden)
+        .expect("invariant: projection résidente");
+    let norm = crate::Tensor::row(vec![1.0; HIDDEN]).expect("invariant: norme synthétique");
+    let state =
+        crate::rms_norm(&hidden, &norm, flint_config().rms_norm_eps).expect("invariant: norme CPU");
+    let oracle = cpu
+        .logits_from_final_state(&state)
+        .expect("invariant: projection CPU");
+    assert_eq!(projected.len(), VOCAB);
+    for (&got, &want) in projected.iter().zip(oracle.data()) {
+        assert!(
+            (got - want).abs() < 1e-4,
+            "projection initiale: {got} != {want}"
+        );
+    }
+    let err = gpu
+        .resident_reference_initial_logits(&gpu.empty_cache(), &hidden)
+        .expect_err("invariant: arène résidente requise");
+    assert!(err.to_string().contains("sans arène résidente"), "{err}");
+    drop(cache);
+    for (i, (prompt, n)) in [(&[1][..], 1), (&[1][..], 4), (&[1, 2, 3][..], 4)]
+        .iter()
+        .enumerate()
+    {
+        let path = dir.path().join(format!("reference-{i}"));
+        let steps = resident_decode_steps();
+        let counts = gpu.resident_reference_counts_for_test();
+        crate::devtools::kl_ref::record(&gpu, prompt, *n, &path)
+            .expect("invariant: record résident");
+        assert_eq!(resident_decode_steps() - steps, n - 1);
+        assert_eq!(
+            gpu.resident_reference_counts_for_test(),
+            (counts.0 + 1, counts.1 + 1)
+        );
+        let result =
+            crate::devtools::kl_ref::compare(&gpu, &path).expect("invariant: compare résident");
+        assert_eq!(resident_decode_steps() - steps, 2 * (n - 1));
+        assert_eq!(
+            gpu.resident_reference_counts_for_test(),
+            (counts.0 + 2, counts.1 + 2)
+        );
+        assert_eq!(result.n, *n);
+        assert_eq!(result.vocab, VOCAB);
+        assert_eq!(result.kl_mean, 0.0);
+        assert_eq!(result.kl_max, 0.0);
+        assert_eq!(result.top1_agreement, 1.0);
+        assert_eq!(result.forced_delta_p_mean, 0.0);
+        assert_eq!(result.forced_abs_delta_p_mean, 0.0);
+        assert_eq!(result.mean_abs_delta_p, 0.0);
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path.join("ref.json")).expect("invariant: métadonnées écrites"),
+        )
+        .expect("invariant: JSON de référence");
+        let greedy = gpu
+            .generate_greedy(prompt, *n)
+            .expect("invariant: greedy moteur");
+        assert_eq!(meta["forced_ids"], serde_json::json!(greedy));
+
+        // Même après le greedy (qui peut remplir le cache de préfixe), les
+        // deux modes KL refusent le prefill non résident, y compris n=1.
+        let before = gpu.resident_reference_counts_for_test();
+        let refused = dir.path().join(format!("refused-{i}"));
+        crate::runtime_flags::with_prefill_resident_override(false, || {
+            let err = crate::devtools::kl_ref::record(&gpu, prompt, *n, &refused)
+                .expect_err("invariant: prefill résident requis à l'enregistrement");
+            assert!(
+                err.to_string()
+                    .contains("prefill résident indisponible pour KL"),
+                "{err}"
+            );
+            let err = crate::devtools::kl_ref::compare(&gpu, &path)
+                .expect_err("invariant: prefill résident requis à la comparaison");
+            assert!(
+                err.to_string()
+                    .contains("prefill résident indisponible pour KL"),
+                "{err}"
+            );
+        });
+        assert!(!refused.exists());
+        assert_eq!(gpu.resident_reference_counts_for_test(), before);
+    }
 }

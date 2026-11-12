@@ -37,6 +37,8 @@ struct CliArgs {
     seed: u64,
     check_only: bool,
     load_only: bool,
+    kl_record: Option<PathBuf>,
+    kl_compare: Option<PathBuf>,
     prefill_only: bool,
     prefill_repeat: Option<usize>,
     top_k: usize,
@@ -78,9 +80,24 @@ fn main() -> ExitCode {
     }
 }
 
+// Le diagnostic `run` réutilise le parseur direct et n'invoque pas le résolveur HF.
+fn kl_run_args(mut args: Vec<String>) -> Vec<String> {
+    if args.first().is_some_and(|arg| arg == "run")
+        && args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--kl-record" | "--kl-compare"))
+    {
+        args.remove(0);
+        if args.first().is_some_and(|arg| !arg.starts_with('-')) {
+            args.insert(0, "--model-dir".into());
+        }
+    }
+    args
+}
+
 fn run() -> CliResult<()> {
     saragossa::initialize_kernel_environment();
-    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let raw_args = kl_run_args(env::args().skip(1).collect());
     if let Some(command) = raw_args.first() {
         match command.as_str() {
             "doctor" => return doctor_bench::run_doctor(raw_args.into_iter().skip(1)),
@@ -126,6 +143,22 @@ fn run() -> CliResult<()> {
     }
     let load_started = Instant::now();
     let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
+    if let Some(path) = args.kl_compare.as_deref() {
+        saragossa::devtools::kl_ref::compare(&decoder, path)?;
+        return Ok(());
+    }
+    if let Some(path) = args.kl_record.as_deref() {
+        let prompt = match args.prompt_tokens {
+            Some(n) => generate_benchmark_prompt(&assets, n, args.raw)?,
+            None => args
+                .prompt
+                .clone()
+                .ok_or_else(|| cli_error("--prompt requis pour --kl-record"))?,
+        };
+        let ids = encode_prompt_ids(&assets, &prompt, args.raw)?;
+        saragossa::devtools::kl_ref::record(&decoder, &ids, args.max_tokens, path)?;
+        return Ok(());
+    }
     let mtp_active = serve::mtp::active_for(&assets, args.backend)
         && serve::mtp::supports_options(
             &generation_options(&args, &assets, args.top_p)?,
@@ -175,6 +208,7 @@ fn run() -> CliResult<()> {
     // démarrage ; en prod résident (voice loop/serve) tous les tours en profitent.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     let warmup_elapsed = if mtp_active && warmup_enabled() {
+        let _warmup = saragossa::runtime_flags::StateSnapshotWarmup::enter();
         let started = Instant::now();
         let warmup_len = prompt_ids.len().min(warmup_prompt_tokens()).max(1);
         let options = generation_options(&args, &assets, args.top_p)?;
@@ -279,6 +313,7 @@ fn run() -> CliResult<()> {
                 );
             }
         }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         saragossa::metal_backend::dump_commit_components();
         let row = logits.as_row()?;
         println!(
@@ -617,6 +652,7 @@ fn warmup_decoder(
     prompt_ids: &[usize],
     backend: RuntimeKind,
 ) -> CliResult<Duration> {
+    let _warmup = saragossa::runtime_flags::StateSnapshotWarmup::enter();
     if backend != RuntimeKind::Metal || !warmup_enabled() {
         return Ok(Duration::ZERO);
     }
@@ -629,6 +665,7 @@ fn warmup_decoder(
     let warmup_prompt = &prompt_ids[..warmup_len];
     // Le drop doit précéder tout prefill : la première passe construirait sinon
     // les buffers Metal du modèle entier pendant que les payloads CPU résident.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _ = decoder.warmup_and_release_cpu_weights(warmup_prompt)?;
     for _ in 0..passes {
         let _ = decoder.prefill_cache_uncached(warmup_prompt)?;
@@ -673,6 +710,8 @@ impl CliArgs {
         let mut seed = 0_u64;
         let mut check_only = false;
         let mut load_only = false;
+        let mut kl_record = None;
+        let mut kl_compare = None;
         let mut prefill_only = false;
         let mut prefill_repeat = None;
         let mut top_k = 0_usize;
@@ -702,6 +741,12 @@ impl CliArgs {
                 }
                 "--check" => check_only = true,
                 "--load-only" => load_only = true,
+                "--kl-record" => {
+                    kl_record = Some(PathBuf::from(next_value(&mut iter, "--kl-record")?))
+                }
+                "--kl-compare" => {
+                    kl_compare = Some(PathBuf::from(next_value(&mut iter, "--kl-compare")?))
+                }
                 "--prefill-only" => prefill_only = true,
                 "--prefill-repeat" => {
                     let repeat = next_value(&mut iter, "--prefill-repeat")?
@@ -741,19 +786,30 @@ impl CliArgs {
         }
 
         let model_dir = model_dir.ok_or_else(|| cli_error("--model-dir requis"))?;
-        let mode_count = [check_only, load_only, prefill_only]
-            .into_iter()
-            .filter(|enabled| *enabled)
-            .count();
+        let mode_count = [
+            check_only,
+            load_only,
+            prefill_only,
+            kl_record.is_some(),
+            kl_compare.is_some(),
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
         if mode_count > 1 {
             return Err(cli_error(
-                "--check, --load-only et --prefill-only sont exclusifs",
+                "--check, --load-only, --prefill-only, --kl-record et --kl-compare sont exclusifs",
             ));
         }
         if prefill_repeat.is_some() && !prefill_only {
             return Err(cli_error("--prefill-repeat requiert --prefill-only"));
         }
-        if !check_only && !load_only && prompt.is_none() && prompt_tokens.is_none() {
+        if !check_only
+            && !load_only
+            && kl_compare.is_none()
+            && prompt.is_none()
+            && prompt_tokens.is_none()
+        {
             return Err(cli_error(
                 "--prompt ou --prompt-tokens requis hors --check/--load-only",
             ));
@@ -774,6 +830,8 @@ impl CliArgs {
             seed,
             check_only,
             load_only,
+            kl_record,
+            kl_compare,
             prefill_only,
             prefill_repeat,
             top_k,
@@ -834,7 +892,7 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error> {
 
 fn print_help() {
     println!(
-        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve> [options]\n       saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--source-repo <org/nom>] [--converter-commit <sha>] [--only <unité,…>] [--verify] [--plan]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--stop TEXT]... [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N]\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
+        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve> [options]\n       saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--source-repo <org/nom>] [--converter-commit <sha>] [--only <unité,…>] [--verify] [--plan]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--stop TEXT]... [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N] [--kl-record PATH | --kl-compare PATH]\nKL : run <chemin local> accepte aussi ces deux modes ; --max-tokens fixe n, --kl-compare relit le prompt enregistré.\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
     );
 }
 
@@ -897,6 +955,45 @@ fn format_top_k(logits: &[f32], k: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_kl_modes_are_exclusive_and_compare_needs_no_prompt() {
+        let parse = |args: &[&str]| CliArgs::parse(args.iter().map(|s| (*s).to_string()));
+        let compare = parse(&["--model-dir", "fixture", "--kl-compare", "reference"])
+            .expect("invariant: comparaison sans prompt");
+        assert_eq!(compare.kl_compare, Some(PathBuf::from("reference")));
+        assert!(parse(&["--model-dir", "fixture", "--kl-record", "reference"]).is_err());
+        for mode in ["--check", "--load-only", "--prefill-only"] {
+            assert!(parse(&["--model-dir", "fixture", "--kl-compare", "reference", mode]).is_err());
+        }
+        assert!(parse(&[
+            "--model-dir",
+            "fixture",
+            "--kl-compare",
+            "reference",
+            "--kl-record",
+            "reference"
+        ])
+        .is_err());
+        let args = kl_run_args(
+            [
+                "run",
+                "fixture",
+                "--kl-record",
+                "reference",
+                "--prompt",
+                "bonjour",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        );
+        assert!(CliArgs::parse(args)
+            .expect("invariant: run KL local")
+            .kl_record
+            .is_some());
+        let repl = vec!["run".to_string(), "fixture".to_string()];
+        assert_eq!(kl_run_args(repl.clone()), repl);
+    }
 
     #[test]
     fn cli_args_parse_required_values_and_defaults() {

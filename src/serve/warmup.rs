@@ -36,6 +36,7 @@ pub(super) fn decoder(
     backend: RuntimeKind,
     model_id: &str,
 ) -> ServeResult<()> {
+    let _warmup = saragossa::runtime_flags::StateSnapshotWarmup::enter();
     let Some(config) = config_from_env(backend) else {
         return Ok(());
     };
@@ -51,9 +52,11 @@ pub(super) fn decoder(
         })
         .collect::<ServeResult<Vec<_>>>()?;
 
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let warmup_prompt = &prompt[..prompt.len().min(config.prompt_tokens)];
     // Construit et libère les poids couche par couche avant le premier prefill,
     // qui matérialiserait sinon tous les buffers Metal avec la copie CPU intacte.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _ = decoder.warmup_and_release_cpu_weights(warmup_prompt)?;
     let report = run(config, &prompt, |tokens| {
         let _ = decoder.prefill_cache_uncached(tokens)?;
@@ -79,6 +82,7 @@ pub(super) fn mtp_decoder(
     backend: RuntimeKind,
     model_id: &str,
 ) -> ServeResult<()> {
+    let _warmup = saragossa::runtime_flags::StateSnapshotWarmup::enter();
     if backend != RuntimeKind::Metal {
         return Ok(());
     }
