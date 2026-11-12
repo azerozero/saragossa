@@ -25,7 +25,7 @@ use super::error::{ServeError, ServeResult};
 use super::flint_output::{FlintEvent, FlintOutputParser};
 use super::protocol::{
     created_now, json_bytes, sse_done, sse_event, AssistantMessage, ChatCompletionChunk,
-    ChatCompletionRequest, ChatCompletionResponse, HealthResponse, ModelsResponse,
+    ChatCompletionRequest, ChatCompletionResponse, HealthResponse, ModelInfo, ModelsResponse,
     ResponseFormatMode, StreamErrorEvent,
 };
 use super::state::{ServeState, ServedCompletion};
@@ -194,6 +194,15 @@ pub(super) fn route_front<S: Write>(
     if request.method == "GET" && path == "/v1/models" {
         let models = ModelsResponse::from_ids(&front.model_ids);
         return Some(send_json(stream, 200, &models, Vec::new()));
+    }
+    if request.method == "GET" {
+        if let Some(id) = path.strip_prefix("/v1/models/") {
+            return Some(if front.model_ids.iter().any(|model| model == id) {
+                send_json(stream, 200, &ModelInfo::new(id), Vec::new())
+            } else {
+                send_failure(stream, &ServeError::UnknownModel(id.to_string()), false)
+            });
+        }
     }
     None
 }

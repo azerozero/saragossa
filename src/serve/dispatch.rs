@@ -680,6 +680,43 @@ mod tests {
     }
 
     #[test]
+    fn model_lookup_uses_registry_and_auth_without_engine() {
+        let (dispatcher, rx) = dispatcher_with(Some("test-key"), 2, usize::MAX, 1);
+        for (path, authorized, status) in [
+            ("/v1/models/alpha", false, 401),
+            ("/v1/models/missing", false, 401),
+            ("/v1/models/alpha", true, 200),
+            ("/v1/models/alpha?detail=1", true, 200),
+            ("/v1/models/missing", true, 404),
+            ("/v1/models/alpha/suffix", true, 404),
+            ("/v1/models/", true, 404),
+        ] {
+            let auth = if authorized {
+                "Authorization: Bearer test-key\r\n"
+            } else {
+                ""
+            };
+            let raw = format!("GET {path} HTTP/1.1\r\n{auth}\r\n");
+            let reply = response(connect(&dispatcher, raw.as_bytes()));
+            assert!(reply.starts_with(&format!("HTTP/1.1 {status} ")), "{reply}");
+            let body = json_body(&reply);
+            if status == 200 {
+                assert_eq!(body["id"], "alpha");
+                assert_eq!(body["object"], "model");
+                assert!(body["created"].is_u64());
+                assert!(body["owned_by"].as_str().is_some_and(|s| !s.is_empty()));
+            } else if status == 404 {
+                assert_eq!(body["error"]["code"], "model_not_found");
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+                assert_eq!(body["error"]["param"], "model");
+                assert!(body.get("type").is_none());
+            }
+        }
+        settle(&dispatcher);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn models_served_by_connection_thread() {
         let (dispatcher, _rx) = dispatcher(4, 1);
 
