@@ -15,6 +15,10 @@ const EOT_TOKEN: &str = "<|endoftext|>";
 const TRANSCRIBE_TOKEN: &str = "<|transcribe|>";
 const NO_TIMESTAMPS_TOKEN: &str = "<|notimestamps|>";
 
+#[cfg(test)]
+#[path = "reference_goldens.rs"]
+mod reference_goldens;
+
 #[derive(Clone, Debug)]
 struct WhisperDecoderLayer {
     self_attn_layer_norm: WhisperLayerNorm,

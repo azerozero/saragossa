@@ -8,3 +8,12 @@ useDefault = true
 id = "generic-api-key"
 [rules.allowlist]
 regexes = ['''(?i)(value_head_dim|key_head_dim|head_dim)\s*=\s*\d+''']
+
+# Empreintes publiques des tokenizers : seules ces lignes JSON de provenance
+# sont admises, pas les autres valeurs des fixtures ni les jetons d'accès.
+[[allowlists]]
+description = "SHA256 des tokenizers des références externes"
+condition = "AND"
+paths = ['''^tests/fixtures/goldens/(chat_templates|embedder|whisper|logits)/[^/]+\.json$''']
+regexTarget = "line"
+regexes = ['''^\s*"tokenizer(_config)?\.json": "[0-9a-f]{64}",?\s*$''']

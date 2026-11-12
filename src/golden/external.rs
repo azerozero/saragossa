@@ -79,18 +79,80 @@ pub fn check_model(name: &str, path: &Path) -> TestResult {
     Ok(())
 }
 
-pub fn local(env: &str) -> Option<PathBuf> {
-    let path = std::env::var_os(env).map(PathBuf::from);
-    if path.is_none() {
-        assert_ne!(
-            std::env::var("SARAGOSSA_REQUIRE_REAL_MODELS").as_deref(),
-            Ok("1"),
-            "{env} requis"
-        );
-        eprintln!("skip: {env} absent (aucun téléchargement)");
-    }
-    path
+/// Sans assets locaux, saute la comparaison sauf en mode réel obligatoire.
+pub fn local(env: &str) -> TestResult<Option<PathBuf>> {
+    local_path(
+        env,
+        std::env::var_os(env),
+        std::env::var("SARAGOSSA_REQUIRE_REAL_MODELS").as_deref() == Ok("1"),
+    )
 }
+
+fn local_path(
+    env: &str,
+    value: Option<std::ffi::OsString>,
+    required: bool,
+) -> TestResult<Option<PathBuf>> {
+    let path = value
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir());
+    if path.is_none() {
+        let reason =
+            format!("{env}: répertoire local absent, vide ou introuvable (aucun téléchargement)");
+        if required {
+            return Err(format!("SARAGOSSA_REQUIRE_REAL_MODELS=1: {reason}").into());
+        }
+        eprintln!("skip: {reason}");
+    }
+    Ok(path)
+}
+
+#[test]
+fn local_assets_skip_or_fail_explicitly() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let missing = directory.path().join("absent").into_os_string();
+    let file = directory.path().join("file");
+    std::fs::write(&file, [])?;
+    for value in [
+        None,
+        Some("".into()),
+        Some(missing),
+        Some(file.into_os_string()),
+    ] {
+        assert!(local_path("TEST_MODEL", value.clone(), false)?.is_none());
+        let error = local_path("TEST_MODEL", value, true).expect_err("assets absents");
+        assert!(error
+            .to_string()
+            .contains("SARAGOSSA_REQUIRE_REAL_MODELS=1"));
+    }
+    for required in [false, true] {
+        assert_eq!(
+            local_path(
+                "TEST_MODEL",
+                Some(directory.path().as_os_str().to_owned()),
+                required
+            )?,
+            Some(directory.path().to_path_buf())
+        );
+    }
+    Ok(())
+}
+
+/// Contrôle les identifiants exacts, y compris la disparition d'un écart.
+pub fn assert_known_differences(actual: &[String], expected: &[&str]) {
+    let mut actual = actual.to_vec();
+    actual.sort();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "écarts modifiés : examiner puis mettre à jour le suivi, jamais les références"
+    );
+}
+
+pub const ROLE_ALTERNATION_ERROR: &str =
+    "TemplateError: Conversation roles must alternate user/assistant/user/assistant/...";
 
 #[derive(Deserialize)]
 pub struct ChatFixture {

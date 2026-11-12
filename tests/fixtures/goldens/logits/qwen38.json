@@ -1,0 +1,28 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    50859
+  ],
+  "source": {
+    "model": "Qwen3.8-27B-u4ls",
+    "path": "${SARAGOSSA_QWEN38_DIR}",
+    "snapshot": null,
+    "sha256": {
+      "config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+      "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+      "tokenizer_config.json": "792fa3f0cb88b111e54ef3134c873531008c4df471d108da17903426e308aa7b",
+      "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+      "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+    },
+    "versions": {
+      "mlx-lm": "0.32.2",
+      "mlx": "0.32.4",
+      "transformers": "5.22.2"
+    }
+  },
+  "tolerance": "greedy exact; near-tie logprob margin <= 0.01; top20+other KL <= 0.02; max delta-p <= 0.02",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-11",
+  "payload_sha256": "9347f9bc9ab6361822dabfdba6154d1bb54f60d2a1778cbc85810205763522fa",
+  "decoding": "16 steps including EOS; no sampling or logits processors; reference-prefix teacher forcing"
+}

@@ -1549,9 +1549,10 @@ mod tests {
             let compact = AffineQuantizedTensor::quantize(&dense, 64, bits)
                 .expect("invariant: quantification");
             assert_eq!(compact.shape(), &[rows, cols]);
-            assert_eq!(compact.packed_shape(), &[rows, cols * bits / 32]);
-            let scales = compact.scales_f32();
-            let biases = compact.biases_f32();
+            // Ce test CPU reste compilable sans les accesseurs réservés à Metal.
+            assert_eq!(compact.packed_shape, [rows, cols * bits / 32]);
+            let scales = compact.scales.f32_data();
+            let biases = compact.biases.f32_data();
             for row in 0..rows {
                 for col in 0..cols {
                     let affine = row * 2 + col / 64;

@@ -1,0 +1,37 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    988
+  ],
+  "source": {
+    "model": "openai/whisper-small",
+    "path": "${SARAGOSSA_WHISPER_SMALL_DIR}",
+    "snapshot": "973afd24965f72e36ca33b3055d56a652f456b4d",
+    "sha256": {
+      "config.json": "e6a2b489da1b5aed65a8eb8d1e7466fa867ad5643a8bc138ba708bd56b2875c4",
+      "tokenizer.json": "27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec5374b4482d1a566"
+    },
+    "versions": {
+      "transformers": "5.22.2",
+      "torch": "2.15.0"
+    },
+    "audio": {
+      "path": "tests/golden/whisper_samples16k.bin",
+      "sha256": "1722dd7a13d6814fcd919d628c567f440929590393c49333d1b30842a7e0566e",
+      "sample_rate": 16000,
+      "samples": 138880
+    }
+  },
+  "tolerance": "text/tokens exact; timestamps +/- 0.02s (one Whisper tick); Rust timestamp API unavailable",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-11",
+  "payload_sha256": "d02783a50d798b29230b806cc90dcd5e4b3cf31bd06962433a9c371203b4f715",
+  "frontend": {
+    "feature_size": 80,
+    "sampling_rate": 16000,
+    "hop_length": 160,
+    "chunk_length": 30,
+    "n_fft": 400
+  },
+  "decoding": "float32 CPU eager; raw greedy without suppression; timestamps with config suppression; French forced"
+}

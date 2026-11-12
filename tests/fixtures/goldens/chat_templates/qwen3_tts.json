@@ -1,0 +1,23 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    65
+  ],
+  "source": {
+    "model": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
+    "path": "${SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR}",
+    "snapshot": "ffc6545dc9cb086950aa46c6cd3db490e6ece3e1",
+    "sha256": {
+      "config.json": "d4f2a4660fdc93e26dae802fadfaf7f5460304f9808715aa3fe2bb4823a6a7bf",
+      "tokenizer_config.json": "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670",
+      "generation_config.json": "f1b90b4513f3b34c62851049e2492d7b4c5940daf1276f89c82b8ef04127f3aa"
+    },
+    "versions": {
+      "transformers": "5.22.2"
+    }
+  },
+  "tolerance": "exact UTF-8",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-11",
+  "payload_sha256": "4a07293e34cbf998a6b5d7cfd3bd70acde9558e347f0ae1839f0f8538b23b1c4"
+}
