@@ -28,6 +28,15 @@ pub(crate) enum ServeError {
     /// Requête HTTP invalide.
     #[error("HTTP invalide: {0}")]
     Http(String),
+    /// Corps refusé avant lecture, avec le protocole de la route connue.
+    #[error("HTTP invalide: body trop grand")]
+    BodyTooLarge { anthropic: bool },
+    /// Paramètre reconnu dont la valeur n'est pas prise en charge.
+    #[error("{param}: {message}")]
+    InvalidParameter {
+        param: &'static str,
+        message: &'static str,
+    },
     /// Génération JSON guidée terminée avant fermeture de l'objet racine.
     #[error("{0}")]
     IncompleteJson(String),
@@ -35,7 +44,7 @@ pub(crate) enum ServeError {
     #[error("non implémenté: {0}")]
     NotImplemented(String),
     /// Modèle demandé absent.
-    #[error("modèle inconnu: {0}")]
+    #[error("modèle non chargé ou inconnu: {0}")]
     UnknownModel(String),
     /// Ressources mémoire insuffisantes.
     #[error("ressource mémoire: {0}")]
@@ -95,6 +104,10 @@ impl ServeError {
         match self {
             Self::Args(message) => Self::Args(message.clone()),
             Self::Http(message) => Self::Http(message.clone()),
+            Self::BodyTooLarge { anthropic } => Self::BodyTooLarge {
+                anthropic: *anthropic,
+            },
+            Self::InvalidParameter { param, message } => Self::InvalidParameter { param, message },
             Self::Json { .. } => Self::Http(self.to_string()),
             Self::IncompleteJson(message) => Self::IncompleteJson(message.clone()),
             Self::NotImplemented(message) => Self::NotImplemented(message.clone()),

@@ -69,6 +69,38 @@ fn text_stop_ends_decode_when_token_ids_differ() {
 }
 
 #[test]
+fn gemma3_json_object_masks_non_json_tokens_without_mtp() {
+    // Seule la préparation est testée : tokenizer et poids synthétiques CPU,
+    // aucun chargement ni inférence d'un modèle Gemma réel.
+    let mut loaded = tiny_loaded_model_with_vocab(r#"{"{}":0,"texte":1,"<eos>":2}"#, "texte");
+    loaded.assets.config.model_type = "gemma3_text".into();
+    loaded.mtp_active = true;
+    let request = ChatCompletionRequest::parse(
+        br#"{
+        "model":"tiny", "messages":[{"role":"user","content":"JSON"}],
+        "response_format":{"type":"json_object"}, "temperature":0
+    }"#,
+    )
+    .expect("invariant: requête JSON valide");
+    let prepared = loaded
+        .prepare(&request, 8)
+        .expect("invariant: préparation Gemma 3");
+    assert!(!loaded.routes_mtp(&request, &prepared));
+    let constraint = prepared
+        .options
+        .token_constraint
+        .as_ref()
+        .expect("invariant: contrainte JSON installée pour Gemma 3");
+    let mut logits = vec![0.0, 100.0, 100.0];
+    constraint
+        .mask_logits(&mut logits)
+        .expect("invariant: masque JSON calculable");
+    assert!(logits[0].is_finite());
+    assert_eq!(logits[1], f32::NEG_INFINITY);
+    assert_eq!(logits[2], f32::NEG_INFINITY);
+}
+
+#[test]
 fn json_object_completion_is_parseable_with_tiny_model() {
     let mut loaded = tiny_loaded_model();
     let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({

@@ -651,6 +651,35 @@ mod tests {
     }
 
     #[test]
+    fn oversized_body_is_rejected_before_reading_with_route_envelope() {
+        let (dispatcher, rx) = dispatcher(2, 1);
+        for route in [
+            "/v1/messages",
+            "/v1/messages?test=1",
+            "/v1/chat/completions",
+        ] {
+            let raw = format!("POST {route} HTTP/1.1\r\nContent-Length: 16777217\r\n\r\n");
+            let reply = response(connect(&dispatcher, raw.as_bytes()));
+            assert!(reply.starts_with("HTTP/1.1 400 Bad Request"));
+            let body = json_body(&reply);
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(body["error"]["message"]
+                .as_str()
+                .is_some_and(|s| s.contains("body trop grand")));
+            assert_eq!(
+                body.get("type").is_some(),
+                route.starts_with("/v1/messages")
+            );
+            if route.starts_with("/v1/messages") {
+                assert_eq!(body["type"], "error");
+            }
+        }
+        settle(&dispatcher);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(dispatcher.inflight_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn models_served_by_connection_thread() {
         let (dispatcher, _rx) = dispatcher(4, 1);
 

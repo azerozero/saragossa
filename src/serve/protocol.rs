@@ -21,6 +21,9 @@ pub(super) struct ChatCompletionRequest {
     /// Active le flux SSE.
     #[serde(default)]
     pub(super) stream: bool,
+    /// Nombre de réponses demandé ; seule une réponse est prise en charge.
+    #[serde(default)]
+    pub(super) n: Option<usize>,
     /// Budget de génération.
     #[serde(default)]
     pub(super) max_tokens: Option<usize>,
@@ -163,6 +166,12 @@ impl ChatCompletionRequest {
     /// budget plafonné, format de sortie et stop sequences bornées. Rend le
     /// budget effectif.
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
+        if self.n.is_some_and(|n| n != 1) {
+            return Err(ServeError::InvalidParameter {
+                param: "n",
+                message: "seule la valeur 1 est prise en charge",
+            });
+        }
         let max_tokens = self.max_tokens_capped(max_tokens_cap)?;
         self.response_format_mode()?;
         if self.enable_thinking()? == Some(true) {
@@ -673,9 +682,10 @@ impl ChatCompletionChunk {
         response_id("chatcmpl")
     }
 
-    /// Remplace l'identifiant du chunk par celui de son flux.
-    pub(super) fn with_id(mut self, id: &str) -> Self {
+    /// Applique les métadonnées communes du flux au chunk.
+    pub(super) fn with_identity(mut self, id: &str, created: u64) -> Self {
         id.clone_into(&mut self.id);
+        self.created = created;
         self
     }
 
@@ -824,7 +834,7 @@ pub(super) fn sse_done() -> Vec<u8> {
     b"data: [DONE]\n\n".to_vec()
 }
 
-fn created_now() -> u64 {
+pub(super) fn created_now() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs(),
         Err(_) => 0,
