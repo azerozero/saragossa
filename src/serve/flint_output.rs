@@ -190,6 +190,7 @@ impl FlintOutputParser {
     }
 
     /// Parse une sortie complète.
+    #[cfg(test)]
     pub(super) fn parse(mut self, text: &str) -> FlintOutput {
         let mut events = self.push(text);
         events.extend(self.finish());

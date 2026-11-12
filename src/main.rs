@@ -568,7 +568,7 @@ fn encode_prompt_ids(assets: &ModelAssets, prompt: &str, raw: bool) -> CliResult
             render_gemma4_chat(&[ChatTemplateMessage::new("user", prompt)], true, false);
         assets.encode_prompt(&templated)?
     } else if assets.config.is_gemma() {
-        let templated = render_gemma_chat(&[ChatTemplateMessage::new("user", prompt)], true);
+        let templated = render_gemma_chat(&[ChatTemplateMessage::new("user", prompt)], true)?;
         assets.encode_prompt_with_special(&templated)?
     } else {
         let templated =

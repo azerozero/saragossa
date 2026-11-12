@@ -1,0 +1,25 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    9978
+  ],
+  "source": {
+    "model": "mlx-community/gemma-4-26b-a4b-it-4bit",
+    "path": "${SARAGOSSA_GEMMA4_DIR}",
+    "snapshot": "efbeee6e582ebfd06abc9d65e90839c4b5d2116b",
+    "sha256": {
+      "config.json": "a64883e3afd8e8b76e7370ba1b288f6f2dc9a0e071337c9eddb420b747555209",
+      "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+      "tokenizer_config.json": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+      "chat_template.jinja": "36e3a42e5cf14cd0020e72d92e1fdd9970f59b82170e421f0cbe1bb42bead3f0",
+      "generation_config.json": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+    },
+    "versions": {
+      "transformers": "5.22.2"
+    }
+  },
+  "tolerance": "exact UTF-8; Gemma3 BOS supplied by tokenizer",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-11",
+  "payload_sha256": "fa4c3826ab269017c8e261c38c3305957c3aa1a3f96b7c84a177b83777adf526"
+}

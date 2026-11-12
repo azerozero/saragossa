@@ -1,6 +1,10 @@
 //! Rendu des templates de chat (ChatML Qwen, tours Gemma, flint) du backend Rust pur.
 
+mod gemma4;
 mod python_json;
+pub use gemma4::render_gemma4_chat_with_tools;
+mod qwen;
+pub use qwen::{render_qwen_chatml_profile, render_qwen_chatml_with_tools, QwenProfile};
 
 use self::python_json::{JsonObject, JsonValue};
 
@@ -25,6 +29,15 @@ pub const GEMMA4_END_OF_TURN: &str = "<turn|>";
 /// Bloc de raisonnement vide injecté quand le thinking Qwen est désactivé.
 pub const QWEN_EMPTY_THINK_BLOCK: &str = "<think>\n\n</think>\n\n";
 
+/// Séquence native des blocs assistant, quand le transport conserve leur ordre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssistantBlock {
+    /// Texte à sa position dans le tour.
+    Text(String),
+    /// Index dans `ChatTemplateMessage::tool_calls`.
+    ToolCall(usize),
+}
+
 /// Message minimal consommé par le rendu ChatML Qwen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatTemplateMessage {
@@ -33,12 +46,16 @@ pub struct ChatTemplateMessage {
     /// Contenu textuel du message.
     pub content: Option<String>,
     /// Raisonnement d'un tour assistant passé (`reasoning_content` OpenAI).
-    /// Seul le rendu flint l'utilise.
     pub reasoning_content: Option<String>,
     /// Appels d'outils OpenAI d'un tour assistant passé (`tool_calls`), un
-    /// texte JSON brut par appel pour garder l'ordre des clés. Seul le rendu
-    /// flint les utilise.
+    /// texte JSON brut par appel pour garder l'ordre des clés.
     pub tool_calls: Vec<String>,
+    /// Ordre des blocs assistant ; absent pour le format OpenAI texte puis appels.
+    pub assistant_blocks: Option<Vec<AssistantBlock>>,
+    /// Nom de l'outil associé à un résultat.
+    pub name: Option<String>,
+    /// Identifiant de l'appel auquel répond ce résultat.
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatTemplateMessage {
@@ -49,8 +66,57 @@ impl ChatTemplateMessage {
             content: Some(content.into()),
             reasoning_content: None,
             tool_calls: Vec::new(),
+            assistant_blocks: None,
+            name: None,
+            tool_call_id: None,
         }
     }
+
+    /// Rend la séquence native si elle existe, sans réagréger ses textes.
+    fn push_assistant_blocks(&self, out: &mut String, push_call: fn(&mut String, &str)) -> bool {
+        let Some(blocks) = &self.assistant_blocks else {
+            return false;
+        };
+        for block in blocks {
+            match block {
+                AssistantBlock::Text(text) => out.push_str(text),
+                AssistantBlock::ToolCall(index) => {
+                    if let Some(call) = self.tool_calls.get(*index) {
+                        push_call(out, call);
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Les formats sans ID de résultat s'appuient sur l'ordre des appels.
+/// Les résultats sans association connue gardent leur ordre relatif en fin de groupe.
+fn tool_results_in_call_order<'a>(
+    calls: &[String],
+    results: impl Iterator<Item = &'a ChatTemplateMessage>,
+) -> Vec<&'a ChatTemplateMessage> {
+    let ids: Vec<_> = calls
+        .iter()
+        .map(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|call| call["id"].as_str().map(str::to_owned))
+        })
+        .collect();
+    let mut results: Vec<_> = results.collect();
+    results.sort_by_cached_key(|result| {
+        result
+            .tool_call_id
+            .as_ref()
+            .and_then(|id| {
+                ids.iter()
+                    .position(|candidate| candidate.as_ref() == Some(id))
+            })
+            .unwrap_or(usize::MAX)
+    });
+    results
 }
 
 /// Rend des messages en ChatML Qwen.
@@ -59,41 +125,15 @@ pub fn render_qwen_chatml(
     add_generation_prompt: bool,
     enable_thinking: bool,
 ) -> String {
-    let mut out = String::new();
-    for message in messages {
-        let (role, content) = if message.role == "tool" {
-            (
-                "user",
-                qwen_tool_response(message.content.as_deref().unwrap_or("")),
-            )
-        } else {
-            (
-                message.role.as_str(),
-                message.content.as_deref().unwrap_or("").to_string(),
-            )
-        };
-        out.push_str(QWEN_IM_START);
-        out.push_str(role);
-        out.push('\n');
-        out.push_str(&content);
-        out.push_str(QWEN_IM_END);
-        out.push('\n');
-    }
-    if add_generation_prompt {
-        out.push_str(QWEN_IM_START);
-        out.push_str("assistant\n");
-        if !enable_thinking {
-            out.push_str(QWEN_EMPTY_THINK_BLOCK);
-        }
-    }
-    out
+    render_qwen_chatml_with_tools(messages, &[], add_generation_prompt, enable_thinking)
 }
 
-fn qwen_tool_response(content: &str) -> String {
-    if content.contains("<tool_response>") {
-        return content.to_string();
-    }
-    format!("<tool_response>\n{}\n</tool_response>", content.trim())
+/// Erreur de validation avant encodage d'un historique de chat.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TemplateError {
+    /// Gemma 3 exige l'alternance user/assistant après le système optionnel.
+    #[error("Conversation roles must alternate user/assistant/user/assistant/...")]
+    RoleAlternation,
 }
 
 /// Rend des messages au format chat Gemma (`<start_of_turn>…<end_of_turn>`).
@@ -105,7 +145,10 @@ fn qwen_tool_response(content: &str) -> String {
 /// PAS rendu ici : il vient du post-processor du tokenizer
 /// ([`crate::ModelAssets::encode_prompt_with_special`]), là où mlx_lm
 /// l'insère via `{{ bos_token }}` puis encode sans tokens spéciaux.
-pub fn render_gemma_chat(messages: &[ChatTemplateMessage], add_generation_prompt: bool) -> String {
+pub fn render_gemma_chat(
+    messages: &[ChatTemplateMessage],
+    add_generation_prompt: bool,
+) -> Result<String, TemplateError> {
     let (first_user_prefix, turns) = match messages.split_first() {
         Some((first, rest)) if first.role == "system" => {
             let prefix = format!("{}\n\n", first.content.as_deref().unwrap_or(""));
@@ -113,6 +156,12 @@ pub fn render_gemma_chat(messages: &[ChatTemplateMessage], add_generation_prompt
         }
         _ => (String::new(), messages),
     };
+    for (index, message) in turns.iter().enumerate() {
+        let expected = if index % 2 == 0 { "user" } else { "assistant" };
+        if message.role != expected {
+            return Err(TemplateError::RoleAlternation);
+        }
+    }
     let mut out = String::new();
     for (index, message) in turns.iter().enumerate() {
         let role = if message.role == "assistant" {
@@ -134,7 +183,7 @@ pub fn render_gemma_chat(messages: &[ChatTemplateMessage], add_generation_prompt
         out.push_str(GEMMA_START_OF_TURN);
         out.push_str("model\n");
     }
-    out
+    Ok(out)
 }
 
 /// Rend des messages au format chat Gemma 4.
@@ -147,28 +196,7 @@ pub fn render_gemma4_chat(
     add_generation_prompt: bool,
     enable_thinking: bool,
 ) -> String {
-    let mut out = String::from("<bos>");
-    for message in messages {
-        let role = if message.role == "assistant" {
-            "model"
-        } else {
-            message.role.as_str()
-        };
-        out.push_str(GEMMA4_START_OF_TURN);
-        out.push_str(role);
-        out.push('\n');
-        out.push_str(message.content.as_deref().unwrap_or("").trim());
-        out.push_str(GEMMA4_END_OF_TURN);
-        out.push('\n');
-    }
-    if add_generation_prompt {
-        out.push_str(GEMMA4_START_OF_TURN);
-        out.push_str("model\n");
-        if !enable_thinking {
-            out.push_str("<|channel>thought\n<channel|>");
-        }
-    }
-    out
+    render_gemma4_chat_with_tools(messages, &[], add_generation_prompt, enable_thinking)
 }
 
 /// Rend des messages au format chat flint (`chat_template.jinja` du modèle).
@@ -218,9 +246,11 @@ pub fn render_flint_chat(
                         out.push_str("</think>");
                     }
                 }
-                out.push_str(content);
-                for call in &message.tool_calls {
-                    push_flint_tool_call(&mut out, call);
+                if !message.push_assistant_blocks(&mut out, push_flint_tool_call) {
+                    out.push_str(content);
+                    for call in &message.tool_calls {
+                        push_flint_tool_call(&mut out, call);
+                    }
                 }
             }
             "tool" => {
@@ -356,7 +386,7 @@ mod tests {
             prompt,
             "<|im_start|>system\nRéponds en français.<|im_end|>\n\
              <|im_start|>user\nBonjour<|im_end|>\n\
-             <|im_start|>assistant\n"
+             <|im_start|>assistant\n<think>\n"
         );
     }
 
@@ -375,8 +405,8 @@ mod tests {
 
         let prompt = render_qwen_chatml(&messages, true, true);
 
-        assert!(prompt.ends_with("<|im_start|>assistant\n"));
-        assert!(!prompt.contains("<think>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n"));
+        assert!(!prompt.contains("</think>"));
     }
 
     #[test]
@@ -396,7 +426,7 @@ mod tests {
     fn gemma_renders_user_turn_with_generation_prompt() {
         let messages = vec![ChatTemplateMessage::new("user", "Bonjour")];
 
-        let prompt = render_gemma_chat(&messages, true);
+        let prompt = render_gemma_chat(&messages, true).expect("valid roles");
 
         assert_eq!(
             prompt,
@@ -411,7 +441,7 @@ mod tests {
             ChatTemplateMessage::new("user", "Bonjour"),
         ];
 
-        let prompt = render_gemma_chat(&messages, true);
+        let prompt = render_gemma_chat(&messages, true).expect("valid roles");
 
         assert_eq!(
             prompt,
@@ -428,7 +458,7 @@ mod tests {
             ChatTemplateMessage::new("user", "Ça va ?"),
         ];
 
-        let prompt = render_gemma_chat(&messages, true);
+        let prompt = render_gemma_chat(&messages, true).expect("valid roles");
 
         assert_eq!(
             prompt,
@@ -443,7 +473,7 @@ mod tests {
     fn gemma_without_generation_prompt_closes_last_turn() {
         let messages = vec![ChatTemplateMessage::new("user", "Bonjour")];
 
-        let prompt = render_gemma_chat(&messages, false);
+        let prompt = render_gemma_chat(&messages, false).expect("valid roles");
 
         assert_eq!(prompt, "<start_of_turn>user\nBonjour<end_of_turn>\n");
     }
@@ -571,5 +601,72 @@ mod tests {
         let content = qwen_assistant_history_content("Réponse", false);
 
         assert_eq!(content, "<think>\n\n</think>\n\nRéponse");
+    }
+}
+
+#[cfg(test)]
+mod gemma_validation {
+    use super::*;
+    #[test]
+    fn rejects_tools_and_non_alternating_roles() {
+        for roles in [
+            &["user", "assistant", "tool"][..],
+            &["assistant"],
+            &["user", "user"],
+            &["user", "system"],
+        ] {
+            let messages: Vec<_> = roles
+                .iter()
+                .map(|role| ChatTemplateMessage::new(*role, ""))
+                .collect();
+            assert_eq!(
+                render_gemma_chat(&messages, true),
+                Err(TemplateError::RoleAlternation)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod result_order_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_results_for_same_tool_follow_call_ids() {
+        let mut assistant = ChatTemplateMessage::new("assistant", "");
+        assistant.tool_calls = [
+            r#"{"id":"A","function":{"name":"weather","arguments":{"city":"Paris"}}}"#,
+            r#"{"id":"B","function":{"name":"weather","arguments":{"city":"Lyon"}}}"#,
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut a = ChatTemplateMessage::new("tool", "12");
+        a.tool_call_id = Some("A".into());
+        let mut b = ChatTemplateMessage::new("tool", "18");
+        b.tool_call_id = Some("B".into());
+        let ordered = [assistant.clone(), a.clone(), b.clone()];
+        let reversed = [assistant.clone(), b.clone(), a.clone()];
+        a.tool_call_id = Some("B".into());
+        b.tool_call_id = Some("A".into());
+        let swapped = [assistant, b, a];
+        for family in 0..3 {
+            let render = |messages: &[ChatTemplateMessage]| match family {
+                0 => render_qwen_chatml_profile(messages, &[], true, false, QwenProfile::Qwen36),
+                1 => render_qwen_chatml_profile(messages, &[], true, false, QwenProfile::Qwen38),
+                _ => render_gemma4_chat_with_tools(messages, &[], true, false),
+            };
+            let expected = render(&ordered);
+            assert_eq!(render(&reversed), expected);
+            assert_ne!(render(&swapped), expected);
+            let (first, second) = if family < 2 {
+                ("<tool_response>\n12", "<tool_response>\n18")
+            } else {
+                (
+                    "response:weather{value:<|\"|>12",
+                    "response:weather{value:<|\"|>18",
+                )
+            };
+            assert!(expected.find(first).expect("A") < expected.find(second).expect("B"));
+        }
     }
 }
