@@ -52,3 +52,10 @@ impl MetalExecutor {
             .get(&self.device, theta, frequency_dim)
     }
 }
+
+/// L'écart rotate-half est le nombre de fréquences de la table exacte créée
+/// ci-dessus : head_dim/2 pour Gemma proportional, rope_dims/2 pour Qwen.
+/// Le tampon factice NoPE n'est jamais lu (aucune paire active).
+pub(crate) fn rope_half_offset(frequencies: &BufferRef) -> f32 {
+    (frequencies.length() / std::mem::size_of::<f32>() as u64) as f32
+}

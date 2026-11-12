@@ -1131,6 +1131,7 @@ fn resident_full_attention_keeps_qwen_interval_and_uniform_dims() {
         config.num_key_value_heads
     );
     assert_eq!(config.layer_rope_dims(4, head_dim), 32);
+    assert_eq!(config.layer_rope_frequency_dim(4, head_dim), 32);
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -6107,5 +6108,109 @@ fn mtp_seed_shared_prefix_keeps_allocations() -> Result<()> {
         assert_eq!(shared.as_slice().as_ptr(), source.as_slice().as_ptr());
         assert_eq!(rows.to_vec(), source.as_slice());
     }
+    Ok(())
+}
+
+#[test]
+fn gemma4_proportional_cpu_paths_match_independent_oracle() -> Result<()> {
+    let head_dim = 512;
+    let heads = 2;
+    let rows = 3;
+    let mut input: Vec<f32> = (0..heads * rows * head_dim)
+        .map(|i| ((i * 17 + 3) % 97) as f32 / 32.0 - 1.5)
+        .collect();
+    input[..head_dim].fill(0.0);
+    input[0] = 1.0;
+    let x = Tensor::from_vec(vec![rows, heads * head_dim], input.clone())?;
+    let weight = Tensor::from_vec(vec![head_dim], vec![1.0; head_dim])?;
+    // Gemma global 0.25 et 0.5, sliding complet, Qwen partiel.
+    for (rotated_dims, rotation_dim, theta) in [
+        (128, 512, 1_000_000.0),
+        (256, 512, 1_000_000.0),
+        (512, 512, 10_000.0),
+        (128, 128, 10_000.0),
+    ] {
+        let rope = RopeParams {
+            theta,
+            frequency_dim: rotation_dim,
+            position_scale: 1.0,
+        };
+        let plain = apply_rope_heads_at(
+            &x,
+            heads,
+            head_dim,
+            rotated_dims,
+            rope,
+            1,
+            RopeStyle::Halves,
+        )?;
+        let fused = rms_norm_rope_heads_at(
+            &x,
+            heads,
+            head_dim,
+            rotated_dims,
+            &weight,
+            1.0e-6,
+            rope,
+            1,
+            RopeStyle::Halves,
+        )?;
+        for (index, head) in input.chunks_exact(head_dim).enumerate() {
+            let position = 1 + index / heads;
+            let expected = crate::rope::reference_rotate_half(
+                head,
+                rotated_dims,
+                rotation_dim,
+                theta,
+                position,
+            );
+            let start = index * head_dim;
+            assert_close(&plain.data()[start..start + head_dim], &expected, 1.0e-6);
+            let inv_rms =
+                1.0 / (head.iter().map(|x| x * x).sum::<f32>() / head_dim as f32 + 1.0e-6).sqrt();
+            let normed: Vec<_> = head.iter().map(|x| x * inv_rms).collect();
+            let expected = crate::rope::reference_rotate_half(
+                &normed,
+                rotated_dims,
+                rotation_dim,
+                theta,
+                position,
+            );
+            assert_close(&fused.data()[start..start + head_dim], &expected, 1.0e-6);
+        }
+        assert_eq!(plain.data()[0], 1.0_f32.cos());
+        assert_eq!(plain.data()[rotation_dim / 2], 1.0_f32.sin());
+        for col in 0..head_dim {
+            let active = col < rotated_dims / 2
+                || (col >= rotation_dim / 2 && col < rotation_dim / 2 + rotated_dims / 2);
+            if !active {
+                for (index, head) in input.chunks_exact(head_dim).enumerate() {
+                    assert_eq!(plain.data()[index * head_dim + col], head[col]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gemma4_explicit_rope_parameters_reach_decoder() -> Result<()> {
+    let raw: crate::RawModelConfig = serde_json::from_value(serde_json::json!({
+        "model_type": "gemma4_text",
+        "layer_types": ["sliding_attention", "full_attention"],
+        "rope_parameters": {
+            "full_attention": {"partial_rotary_factor": 0.5, "rope_theta": 500000.0},
+            "sliding_attention": {"rope_theta": 20000.0}
+        }
+    }))
+    .expect("invariant: JSON de test valide");
+    let resolved = raw.resolve()?;
+    let config = CausalDecoderConfig::from(&resolved);
+    assert_eq!(config.layer_rope_dims(1, 512), 256);
+    assert_eq!(config.layer_rope_frequency_dim(1, 512), 512);
+    assert_eq!(config.layer_rope_theta_override(1), Some(500_000.0));
+    assert_eq!(config.layer_rope_dims(0, 256), 256);
+    assert_eq!(config.layer_rope_frequency_dim(0, 256), 256);
+    assert_eq!(config.layer_rope_theta_override(0), Some(20_000.0));
     Ok(())
 }
