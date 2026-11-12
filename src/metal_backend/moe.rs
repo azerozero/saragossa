@@ -20,9 +20,12 @@ impl MoeProjection {
         ensure_biasless(linear, self.name())?;
         match linear.weight() {
             LinearWeight::AffineQuantized(weight) => Ok(weight),
-            LinearWeight::Dense(_) | LinearWeight::DenseBf16(_) => Err(InferError::Config(
-                format!("expert MoE {} non affine quantifié", self.name()),
-            )),
+            LinearWeight::Dense(_) | LinearWeight::DenseBf16(_) | LinearWeight::DenseShared(_) => {
+                Err(InferError::Config(format!(
+                    "expert MoE {} non affine quantifié",
+                    self.name()
+                )))
+            }
         }
     }
 

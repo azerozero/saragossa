@@ -244,6 +244,51 @@ fn restored_cpu_decode_matches_complete_run() -> Result<()> {
 }
 
 #[test]
+fn synthetic_greedy_ids_match_after_disk_reload() {
+    isolated(
+        "synthetic_greedy_ids_match_after_disk_reload",
+        true,
+        |root| {
+            let path = root.join("synthetic.safetensors");
+            let bytes = safetensors::serialize(
+                super::super::tests::tensor_views(super::super::tests::test_weights()),
+                None,
+            )
+            .expect("invariant: poids synthétiques sérialisables");
+            std::fs::write(&path, bytes).expect("invariant: fixture écrite");
+            let load = || {
+                CausalDecoder::from_safetensors(&path, CausalDecoderConfig::default())
+                    .expect("invariant: fixture valide")
+            };
+            let generate = |model: &CausalDecoder| {
+                model
+                    .generate_greedy_timed_with_options(&[0, 1], 8, &GenerationOptions::default())
+                    .expect("invariant: génération synthétique valide")
+                    .tokens
+            };
+            let model = load();
+            HITS.set(0);
+            let baseline = {
+                let _warmup = crate::runtime_flags::StateSnapshotWarmup::enter();
+                generate(&model)
+            };
+            assert_eq!(baseline.len(), 8);
+            assert_eq!(HITS.get(), 0);
+            assert_eq!(generate(&model), baseline);
+            assert_eq!(HITS.get(), 0, "le premier prefill écrit l'instantané");
+            let request = model
+                .snapshot_request(&[0, 1], Ar)
+                .expect("invariant: requête valide")
+                .expect("invariant: instantané activé");
+            assert!(request.root.join("manifest.json").is_file());
+            drop(model);
+            assert_eq!(generate(&load()), baseline);
+            assert_eq!(HITS.get(), 1, "le modèle rechargé lit l'instantané disque");
+        },
+    );
+}
+
+#[test]
 fn rows_preserve_sliding_base_and_mixed_dtypes() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let mut rows = kv_rows::KvRows::default();
