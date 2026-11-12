@@ -28,7 +28,7 @@ impl CausalDecoder {
             return false;
         }
         self.layers.iter().enumerate().all(|(index, _)| {
-            if self.config.is_resident_full_attention_layer(index) {
+            if self.plan.layers[index].resident_full {
                 matches!(
                     arena.layers.get(index),
                     Some(ResidentLayerBuffers::FullDense(resolved))
@@ -62,11 +62,11 @@ impl CausalDecoder {
             if !matches!(layer.mlp.as_ref(), Some(FeedForward::Dense(_))) {
                 return false;
             }
-            if self.config.is_resident_full_attention_layer(index) {
+            if self.plan.layers[index].resident_full {
                 // `v_proj` absent (k_eq_v) : le solo prend la disposition `[q|k|v]`
                 // sans porte, alors que le pas multi suppose `[q+gate|k|v]`.
                 matches!(&layer.attention, AttentionBlock::Full(attention) if attention.v_proj.is_some())
-                    && self.config.layer_sliding_window(index).is_none()
+                    && self.plan.layers[index].resident.sliding_window.is_none()
             } else {
                 matches!(&layer.attention, AttentionBlock::Linear(_))
             }
@@ -192,7 +192,7 @@ impl CausalDecoder {
             }
             match arena.layers.get(index) {
                 Some(ResidentLayerBuffers::FullDense(resolved))
-                    if self.config.is_resident_full_attention_layer(index) =>
+                    if self.plan.layers[index].resident_full =>
                 {
                     let AttentionBlock::Full(attention) = &layer.attention else {
                         return Err(InferError::Config(format!(
@@ -228,9 +228,11 @@ impl CausalDecoder {
                         let kv = layers[index].full.as_mut().ok_or_else(|| {
                             InferError::Metal("KV full-attn absent (multi)".to_string())
                         })?;
-                        let dims = self.config.resident_windowed_full_attn_layer_dims(
-                            index, hidden, **position, eps, theta,
-                        )?;
+                        let dims = self.plan.layers[index]
+                            .resident
+                            .resident_windowed_full_attn_layer_dims(
+                                hidden, **position, eps, theta,
+                            )?;
                         streams.push(MultiFullAttnStream {
                             kv,
                             dims,
@@ -248,7 +250,7 @@ impl CausalDecoder {
                     )?;
                 }
                 Some(ResidentLayerBuffers::LinearDense(resolved))
-                    if !self.config.is_resident_full_attention_layer(index) =>
+                    if !self.plan.layers[index].resident_full =>
                 {
                     let Some((la_spec, res_dims)) = linear_dims else {
                         return Err(InferError::Config(

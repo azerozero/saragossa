@@ -55,11 +55,11 @@ pub(super) fn full_attention_from_tensors(
     config: &CausalDecoderConfig,
     tensors: &mut HashMap<String, DecoderTensor>,
     prefix: &str,
-    layer_index: usize,
+    plan: &FullPlan,
 ) -> Result<AttentionBlock> {
     let q_proj = linear_from(tensors, &format!("{prefix}.self_attn.q_proj"))?;
     let k_proj = linear_from(tensors, &format!("{prefix}.self_attn.k_proj"))?;
-    let v_proj = if config.attention_k_eq_v && config.is_gemma4_full_layer(layer_index) {
+    let v_proj = if plan.v_shared_with_k {
         None
     } else {
         Some(linear_from(tensors, &format!("{prefix}.self_attn.v_proj"))?)
@@ -86,9 +86,7 @@ pub(super) fn full_attention_from_tensors(
         None
     };
     let inferred_head_dim = infer_attention_head_dim(config, &q_proj)?;
-    let head_dim = config
-        .layer_head_dim(layer_index)
-        .unwrap_or(inferred_head_dim);
+    let head_dim = plan.head_dim().unwrap_or(inferred_head_dim);
     Ok(AttentionBlock::Full(Box::new(FullAttention {
         q_proj,
         k_proj,
@@ -96,10 +94,10 @@ pub(super) fn full_attention_from_tensors(
         o_proj,
         q_norm,
         k_norm,
-        num_key_value_heads: Some(config.layer_num_key_value_heads(layer_index)),
+        num_key_value_heads: Some(plan.kv_heads),
         head_dim: Some(head_dim),
-        rope_dims: Some(config.layer_rope_dims(layer_index, head_dim)),
-        rope_frequency_dim: Some(config.layer_rope_frequency_dim(layer_index, head_dim)),
+        rope_dims: Some(plan.rope_dims(head_dim)),
+        rope_frequency_dim: Some(plan.rope_frequency_dim(head_dim)),
         value_norm: config.attention_value_norm,
         rope_theta: None,
         rope_position_scale: None,

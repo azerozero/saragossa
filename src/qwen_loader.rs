@@ -1,9 +1,9 @@
 //! Chargement des poids Qwen depuis safetensors et configuration.
 
+use crate::decoder::layer_plan::LoaderLayerPlan;
 use crate::{
     decoder::DecoderTensor,
     memory_guard::{estimate_paths_bytes, MemoryGuard},
-    quantization::bytes_to_u32,
     safetensor::{bytes_to_dense_f32, tensor_from_safetensor_parts},
     AffineQuantizedTensor, CausalDecoder, InferError, LinearWeight, ModelAssets, ModelConfig,
     QuantConfig, Result, Tensor, WeightCatalog,
@@ -752,6 +752,31 @@ pub(crate) struct ShardTensorEntry {
     pub(crate) data_offsets: [usize; 2],
 }
 
+impl ShardTensorEntry {
+    /// Vérifie la taille sérialisée avant toute allocation ou lecture du payload.
+    pub(crate) fn payload_len(&self, name: &str) -> Result<usize> {
+        if self.dtype.bitsize() % 8 != 0 {
+            return Err(InferError::UnsupportedDtype {
+                name: name.to_string(),
+                dtype: self.dtype,
+            });
+        }
+        let expected = self
+            .shape
+            .iter()
+            .try_fold(self.dtype.bitsize() / 8, |n, dim| n.checked_mul(*dim))
+            .ok_or_else(|| InferError::Shape(format!("taille trop grande pour {name}")))?;
+        let actual = self.data_offsets[1].checked_sub(self.data_offsets[0]);
+        if actual != Some(expected) {
+            return Err(InferError::Shape(format!(
+                "tensor {name} {:?} shape={:?} attend {expected} octets, offsets={:?}",
+                self.dtype, self.shape, self.data_offsets
+            )));
+        }
+        Ok(expected)
+    }
+}
+
 fn load_decoder_tensors(
     config: &ModelConfig,
     shards: &[PathBuf],
@@ -894,6 +919,7 @@ pub(crate) fn read_shard_header(path: &Path) -> Result<ShardHeader> {
             path: path.to_path_buf(),
             message: format!("taille header non représentable: {header_len}"),
         })?;
+    crate::safetensor::check_file_range(&file, 8, header_len_usize, "header safetensors")?;
     let mut header = vec![0_u8; header_len_usize];
     file.read_exact(&mut header)
         .map_err(|source| InferError::Io {
@@ -996,18 +1022,15 @@ fn decoder_specs(
         !config.tie_word_embeddings,
     ));
     for layer in 0..config.num_hidden_layers {
-        let required_weights = if config.is_full_attention_layer(layer) {
+        let plan = LoaderLayerPlan::build(config, layer);
+        let required_weights = if plan.full {
             FULL_ATTENTION_LAYER_WEIGHTS
         } else {
             LINEAR_ATTENTION_LAYER_WEIGHTS
         };
         let layer_required = required_weights
             .iter()
-            .filter(|suffix| {
-                !(config.attention_k_eq_v
-                    && config.is_gemma4_full_layer(layer)
-                    && **suffix == "self_attn.v_proj.weight")
-            })
+            .filter(|suffix| !(plan.v_shared_with_k && **suffix == "self_attn.v_proj.weight"))
             .map(|suffix| layer_target(layer, suffix))
             .collect::<Vec<_>>();
         specs.extend(specs_for(prefixes, layer_required, true));
@@ -1092,9 +1115,7 @@ fn decoder_specs(
 
         let layer_optional = OPTIONAL_LAYER_WEIGHTS
             .iter()
-            .filter(|suffix| {
-                config.is_full_attention_layer(layer) || !suffix.starts_with("self_attn.")
-            })
+            .filter(|suffix| plan.full || !suffix.starts_with("self_attn."))
             .filter(|suffix| {
                 !(config.has_attention_sinks() && FLINT_ATTENTION_LAYER_WEIGHTS.contains(suffix))
             })
@@ -1130,14 +1151,17 @@ fn layer_target(layer: usize, suffix: &str) -> String {
 #[cfg(test)]
 mod dense_bf16_tests;
 #[cfg(test)]
-mod flint_tests;
+pub(crate) mod flint_tests;
 #[cfg(test)]
-mod gemma4_test_fixtures;
+pub(crate) mod gemma4_test_fixtures;
 #[cfg(test)]
 mod gemma4_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod qwen_kv_x3_tests;
 #[cfg(test)]
-mod test_fixtures;
+pub(crate) mod test_fixtures;
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod direct_file_tests;

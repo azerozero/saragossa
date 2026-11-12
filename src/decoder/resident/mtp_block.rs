@@ -181,7 +181,7 @@ impl CausalDecoder {
             if !matches!(layer.mlp.as_ref(), Some(FeedForward::Dense(_))) {
                 return Ok(None);
             }
-            if self.config.is_resident_full_attention_layer(index) {
+            if self.plan.layers[index].resident_full {
                 let Some(kv) = layer_cache.full.as_ref() else {
                     return Ok(None);
                 };
@@ -357,14 +357,15 @@ impl CausalDecoder {
             let mut other = b.tensor().buffer();
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_cache = &mut layers[index];
-                if self.config.is_resident_full_attention_layer(index) {
-                    let dims = self.config.resident_windowed_full_attn_layer_dims(
-                        index,
-                        hidden,
-                        *cache_position,
-                        self.config.rms_eps,
-                        theta,
-                    )?;
+                if self.plan.layers[index].resident_full {
+                    let dims = self.plan.layers[index]
+                        .resident
+                        .resident_windowed_full_attn_layer_dims(
+                            hidden,
+                            *cache_position,
+                            self.config.rms_eps,
+                            theta,
+                        )?;
                     self.encode_resident_full_dense_layer_rows_gpu_position(
                         metal,
                         arena,

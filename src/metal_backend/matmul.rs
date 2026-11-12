@@ -31,6 +31,7 @@ pub(crate) fn take_concat_profile() -> (u64, u64) {
 fn linear_weight_id(weight: &LinearWeight) -> LinearWeightId {
     match weight {
         LinearWeight::Dense(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
+        LinearWeight::DenseShared(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
         LinearWeight::DenseBf16(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
         LinearWeight::AffineQuantized(weight) => LinearWeightId::Affine(weight.weight_id()),
     }
@@ -43,6 +44,7 @@ fn concat_copy_bytes(weights: &[&LinearWeight]) -> Option<u64> {
     weights.iter().try_fold(0_u64, |total, weight| {
         let bytes = match weight {
             LinearWeight::Dense(weight) => weight.len().checked_mul(4)?,
+            LinearWeight::DenseShared(weight) => weight.data().len().checked_mul(4)?,
             LinearWeight::DenseBf16(weight) => weight.data().len().checked_mul(2)?,
             LinearWeight::AffineQuantized(weight) => {
                 if !weight.cpu_data_available() {
@@ -238,6 +240,47 @@ impl MetalExecutor {
         );
         post_dispatch_barrier(encoder);
         Ok(())
+    }
+
+    /// Même qmv f32 (ou GEMM tuilé explicitement demandé) que le poids CPU.
+    pub(crate) fn matmul_rhs_t_shared_f32(
+        &self,
+        input: &Tensor,
+        weight: &crate::linear::DenseSharedTensor,
+        tiled: bool,
+    ) -> Result<Tensor> {
+        let (batch, in_dim) = input.as_matrix()?;
+        let out_dim = weight.shape()[0];
+        if batch == 0 || in_dim == 0 || in_dim != weight.shape()[1] {
+            return Err(InferError::Dimension(
+                "matmul f32 partagé incompatible".into(),
+            ));
+        }
+        let lhs = self.upload_f32_buffer(input.data(), "input")?;
+        let len = checked_len(batch, out_dim, "sortie matmul f32 partagé")?;
+        let out = self
+            .device
+            .new_buffer(byte_len::<f32>(len)?, MTLResourceOptions::StorageModeShared);
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let guard = EncoderEndGuard::new(encoder);
+        if tiled && batch > 1 {
+            self.encode_dense_gemm(encoder, &lhs, weight.buffer(), &out, batch, out_dim, in_dim)?;
+        } else {
+            self.encode_dense_qmv(
+                encoder,
+                &lhs,
+                weight.buffer(),
+                &out,
+                0,
+                batch,
+                out_dim,
+                in_dim,
+            )?;
+        }
+        guard.end();
+        commit_and_wait(command_buffer)?;
+        Tensor::from_vec(vec![batch, out_dim], read_f32_buffer(&out, len)?)
     }
 
     pub(crate) fn matmul_rhs_t_dense_bf16(
@@ -802,6 +845,12 @@ impl MetalExecutor {
         label: &'static str,
     ) -> Result<MetalLinearWeightBuffers> {
         match weight {
+            LinearWeight::DenseShared(weight) => Ok(MetalLinearWeightBuffers::Dense {
+                rhs: weight.buffer().clone(),
+                rhs_bf16: None,
+                out_dim: weight.shape()[0],
+                in_dim: weight.shape()[1],
+            }),
             LinearWeight::DenseBf16(weight) => Ok(MetalLinearWeightBuffers::DenseBf16 {
                 rhs: weight.buffer().clone(),
                 out_dim: weight.shape()[0],
@@ -1170,17 +1219,29 @@ impl MetalExecutor {
                     in_dim,
                 })
             }
-            LinearWeight::Dense(first_weight) => {
-                let (_, in_dim) = first_weight.as_matrix()?;
+            LinearWeight::Dense(_) | LinearWeight::DenseShared(_) => {
+                let &[_, in_dim] = first.shape() else {
+                    return Err(InferError::Dimension(format!(
+                        "{label}: matrice dense attendue"
+                    )));
+                };
                 let mut out_dim = 0usize;
-                let mut data = Vec::new();
+                let mut sources = Vec::with_capacity(weights.len());
                 for weight in weights {
-                    let LinearWeight::Dense(weight) = weight else {
+                    let (shape, values) = match weight {
+                        LinearWeight::Dense(weight) => (weight.shape(), weight.data()),
+                        LinearWeight::DenseShared(weight) => (weight.shape(), weight.data()),
+                        _ => {
+                            return Err(InferError::Dimension(format!(
+                                "{label}: mélange dense/quantifié non supporté"
+                            )))
+                        }
+                    };
+                    let &[rows, cols] = shape else {
                         return Err(InferError::Dimension(format!(
-                            "{label}: mélange dense/quantifié non supporté"
+                            "{label}: matrice dense attendue"
                         )));
                     };
-                    let (rows, cols) = weight.as_matrix()?;
                     if cols != in_dim {
                         return Err(InferError::Dimension(format!(
                             "{label}: in_dim incompatible {cols} != {in_dim}"
@@ -1189,10 +1250,24 @@ impl MetalExecutor {
                     out_dim = out_dim.checked_add(rows).ok_or_else(|| {
                         InferError::Dimension(format!("{label}: out_dim concat déborde"))
                     })?;
-                    data.extend_from_slice(weight.data());
+                    if checked_len(rows, cols, "concat dense")? != values.len() {
+                        return Err(InferError::Shape(format!(
+                            "{label}: données denses absentes"
+                        )));
+                    }
+                    sources.push(values);
                 }
+                let len = checked_len(out_dim, in_dim, "concat dense")?;
+                let rhs = self.weight_buffer_f32_with(len, |data| {
+                    let mut start = 0;
+                    for source in sources {
+                        data[start..start + source.len()].copy_from_slice(source);
+                        start += source.len();
+                    }
+                    Ok(())
+                })?;
                 Ok(MetalLinearWeightBuffers::Dense {
-                    rhs: self.buffer_from_slice(&data, label)?,
+                    rhs,
                     rhs_bf16: None,
                     out_dim,
                     in_dim,

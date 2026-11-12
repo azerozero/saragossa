@@ -11,6 +11,24 @@ use saragossa::{
 use super::*;
 
 #[test]
+fn missing_qwen_profile_fails_before_prompt_encoding() {
+    let mut loaded = tiny_loaded_model();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("tokenizer.json");
+    save_json_tokenizer(&path, r#"{"{}":0,"<pad>":1,"<eos>":2}"#, "<pad>");
+    loaded.assets.tokenizer = RustTokenizer::from_file(&path).expect("tokenizer without profile");
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model":"tiny", "messages":[{"role":"user","content":"test"}]
+    }))
+    .expect("request");
+    let error = loaded
+        .prompt_encoding(&request)
+        .err()
+        .expect("missing profile");
+    assert!(error.to_string().contains("profil Qwen inconnu"));
+}
+
+#[test]
 fn custom_stop_routes_to_mtp_when_active() {
     for streaming in [false, true] {
         let mut loaded = tiny_loaded_model();
@@ -288,6 +306,11 @@ pub(super) fn tiny_loaded_model_with_vocab(vocab_json: &str, unk_token: &str) ->
     )
     .expect("invariant: config test écrite");
     let tokenizer_path = tmp.path().join("tokenizer.json");
+    fs::write(
+        tmp.path().join("chat_template.jinja"),
+        "<|im_start|> enable_thinking last_query_index",
+    )
+    .expect("invariant: profil Qwen36 de la fixture synthétique");
     save_json_tokenizer(&tokenizer_path, vocab_json, unk_token);
     let catalog_path = tmp.path().join("empty.safetensors");
     write_empty_safetensors_header(&catalog_path);

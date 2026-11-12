@@ -328,14 +328,32 @@ fn resolves_gemma4_moe_text_config_with_layer_specific_defaults() {
     assert_eq!(cfg.rope_full_base_freq, Some(1_000_000.0));
     assert_eq!(cfg.rope_full_partial_rotary_factor, Some(0.25));
     assert_eq!(cfg.rope_sliding_partial_rotary_factor, Some(1.0));
-    assert!(cfg.is_gemma4_sliding_layer(0));
-    assert!(cfg.is_gemma4_full_layer(5));
-    assert_eq!(cfg.layer_head_dim(0), 256);
-    assert_eq!(cfg.layer_head_dim(5), 512);
-    assert_eq!(cfg.layer_num_key_value_heads(0), 8);
-    assert_eq!(cfg.layer_num_key_value_heads(5), 2);
-    assert_eq!(cfg.layer_rope_dims(0), 256);
-    assert_eq!(cfg.layer_rope_dims(5), 128);
+    assert!(crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 0).gemma_sliding);
+    assert!(crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 5).gemma_full);
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 0).head_dim(),
+        256
+    );
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 5).head_dim(),
+        512
+    );
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 0).kv_heads,
+        8
+    );
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 5).kv_heads,
+        2
+    );
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 0).rope_dims(),
+        256
+    );
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 5).rope_dims(),
+        128
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use super::resolve::bf16_round;
 use super::types::{ModelConfig, RawModelConfig, RopeScalingConfig};
+use crate::decoder::layer_plan::LoaderLayerFields;
 use crate::{InferError, Result};
 use std::path::Path;
 
@@ -147,55 +148,38 @@ impl ModelConfig {
 
     #[must_use]
     /// Indique si la couche déclarée est une couche Gemma 4 globale.
+    ///
+    /// La classification historique du chargeur dépend de l'étiquette,
+    /// sans garde sur la famille du modèle.
     pub fn is_gemma4_full_layer(&self, layer_index: usize) -> bool {
-        self.layer_types
-            .get(layer_index)
-            .is_some_and(|kind| kind == "full_attention")
+        LoaderLayerFields::build(self, layer_index).gemma_full
     }
 
     #[must_use]
     /// Indique si la couche déclarée est une couche Gemma 4 locale.
+    ///
+    /// La classification historique du chargeur dépend de l'étiquette,
+    /// sans garde sur la famille du modèle.
     pub fn is_gemma4_sliding_layer(&self, layer_index: usize) -> bool {
-        self.layer_types
-            .get(layer_index)
-            .is_some_and(|kind| kind == "sliding_attention")
+        LoaderLayerFields::build(self, layer_index).gemma_sliding
     }
 
     #[must_use]
     /// Renvoie la dimension de tête effective de la couche.
     pub fn layer_head_dim(&self, layer_index: usize) -> usize {
-        if self.is_gemma4_full_layer(layer_index) {
-            self.global_head_dim.unwrap_or_else(|| self.head_dim())
-        } else {
-            self.head_dim()
-        }
+        LoaderLayerFields::build(self, layer_index).head_dim()
     }
 
     #[must_use]
     /// Renvoie le nombre de têtes K/V effectif de la couche.
     pub fn layer_num_key_value_heads(&self, layer_index: usize) -> usize {
-        if self.is_gemma4_full_layer(layer_index) {
-            self.num_global_key_value_heads
-                .unwrap_or(self.num_key_value_heads)
-        } else {
-            self.num_key_value_heads
-        }
+        LoaderLayerFields::build(self, layer_index).kv_heads
     }
 
     #[must_use]
     /// Renvoie les dimensions RoPE tournées de la couche.
     pub fn layer_rope_dims(&self, layer_index: usize) -> usize {
-        let head_dim = self.layer_head_dim(layer_index);
-        let factor = if self.is_gemma4_full_layer(layer_index) {
-            self.rope_full_partial_rotary_factor
-                .or(self.partial_rotary_factor)
-        } else if self.is_gemma4_sliding_layer(layer_index) {
-            self.rope_sliding_partial_rotary_factor
-                .or(self.partial_rotary_factor)
-        } else {
-            self.partial_rotary_factor
-        };
-        factor.map_or(head_dim, |value| (head_dim as f32 * value) as usize)
+        LoaderLayerFields::build(self, layer_index).rope_dims()
     }
 
     #[must_use]

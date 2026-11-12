@@ -47,10 +47,22 @@ fn resolves_gemma4_unified_dense_text_config_with_gemma4_flags() {
     assert_eq!(cfg.num_experts_per_tok, None);
     assert!(cfg.tie_word_embeddings);
     assert_eq!(cfg.final_logit_softcapping, Some(30.0));
-    assert_eq!(cfg.layer_head_dim(0), 256);
-    assert_eq!(cfg.layer_head_dim(1), 512);
-    assert_eq!(cfg.layer_num_key_value_heads(1), 1);
-    assert_eq!(cfg.layer_rope_dims(1), 128);
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 0).head_dim(),
+        256
+    );
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 1).head_dim(),
+        512
+    );
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 1).kv_heads,
+        1
+    );
+    assert_eq!(
+        crate::decoder::layer_plan::LoaderLayerPlan::build(&cfg, 1).rope_dims(),
+        128
+    );
 
     let decoder = crate::CausalDecoderConfig::from(&cfg);
     assert!(decoder.is_gemma4);

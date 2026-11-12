@@ -2455,7 +2455,7 @@ impl CausalDecoder {
                 ))
             })?;
             let (max_abs, mean_abs) = diff_stats_same_len(reference_slice, resident_slice)?;
-            let attention_kind = if self.config.is_full_attention_layer(layer_index) {
+            let attention_kind = if self.plan.layers[layer_index].is_full() {
                 "full"
             } else {
                 "linear"
@@ -2523,7 +2523,7 @@ impl CausalDecoder {
         input_token: usize,
     ) -> Result<Option<ResidentLinearXrayProbe>> {
         let Some(layer_index) =
-            (0..self.layers.len()).find(|index| !self.config.is_full_attention_layer(*index))
+            (0..self.layers.len()).find(|index| !self.plan.layers[*index].is_full())
         else {
             return Ok(None);
         };
@@ -3253,7 +3253,11 @@ impl CausalDecoder {
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(captures) = state.captures {
                 if captures.layer_ids == *layer_ids && captures.from == 0 {
-                    return Ok((state.cache, state.final_state, captures.hidden));
+                    return Ok((
+                        state.cache,
+                        state.final_state,
+                        Arc::unwrap_or_clone(captures.hidden),
+                    ));
                 }
             }
         }
@@ -3261,7 +3265,7 @@ impl CausalDecoder {
             self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids, usize::MAX, false)?;
         let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
         self.snapshot_save(&snapshot, &cache, &final_state, None, Some(&captures));
-        Ok((cache, final_state, captures.hidden))
+        Ok((cache, final_state, Arc::unwrap_or_clone(captures.hidden)))
     }
 
     /// Comme [`Self::prefill_cache_state_with_layer_capture`], mais rend les
@@ -3332,7 +3336,7 @@ impl CausalDecoder {
             PrefixCaptures {
                 layer_ids: layer_ids.to_vec(),
                 from: 0,
-                hidden: target_hidden,
+                hidden: target_hidden.into(),
             },
         ))
     }
@@ -4515,14 +4519,18 @@ impl CausalDecoder {
     /// les captures de `layer_ids` et prolonge état et captures sur le suffixe
     /// par le prefill résident borné par défaut, avec le forward per-op en repli.
     /// Rend `(cache, état final, captures, from)` avec les captures bornées aux
-    /// `keep_rows` dernières positions, y compris avant copie d'un hit exact.
+    /// `keep_rows` dernières positions, partagées pour un hit exact sans troncature.
     #[cfg(feature = "devtools")]
+    #[expect(
+        clippy::type_complexity,
+        reason = "état du cache, état final, captures partagées et position absolue"
+    )]
     pub(super) fn prefix_cache_get_with_captures(
         &self,
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
-    ) -> Result<Option<(CausalDecoderCache, Tensor, Tensor, usize)>> {
+    ) -> Result<Option<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)>> {
         let Some((mut output, cached_len, history, Some(captures))) =
             self.prefix_cache_hit(prompt, false, keep_rows)?
         else {
@@ -4587,7 +4595,7 @@ impl CausalDecoder {
         layer_ids: &[usize],
         keep_rows: usize,
         drafter: Option<&DFlashDraft>,
-    ) -> Result<(CausalDecoderCache, Tensor, Tensor, usize)> {
+    ) -> Result<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)> {
         let snapshot = if crate::runtime_flags::state_snapshot_dir().is_some() {
             self.snapshot_request_dflash(
                 prompt,
@@ -5345,7 +5353,9 @@ impl CausalDecoder {
                 false,
                 chunk_tokens,
             )?
-            .and_then(|(_, _, captures)| captures.map(|captures| captures.hidden)))
+            .and_then(|(_, _, captures)| {
+                captures.map(|captures| Arc::unwrap_or_clone(captures.hidden))
+            }))
     }
 
     /// Oracle de test : logits des lignes `rows` d'un hidden non normé
@@ -5716,13 +5726,13 @@ impl CausalDecoder {
                 && !crate::runtime_flags::gpu_timestamps_enabled();
             let (mut bytes_per_token, mut fixed_bytes) = (0_usize, 0_usize);
             for index in (0..self.layers.len())
-                .filter(|&index| self.config.is_resident_full_attention_layer(index))
+                .filter(|&index| self.plan.layers[index].resident_full)
             {
-                let Ok(kv_dim) = self.config.resident_full_attention_kv_dim(index) else {
+                let Ok(kv_dim) = self.plan.layers[index].resident.kv_dim() else {
                     continue;
                 };
                 let row_bytes = 2 * kv_dim * KV_BYTES_PER_VALUE;
-                let window = self.config.layer_sliding_window(index).filter(|_| {
+                let window = self.plan.layers[index].resident.sliding_window.filter(|_| {
                     chunked
                         && matches!(
                             self.layers.get(index).map(|layer| &layer.attention),
@@ -6018,12 +6028,17 @@ pub(super) fn stitch_captures(
             "captures préfixe/suffixe: couches ou colonnes incompatibles".to_string(),
         ));
     }
-    // Un suffixe déjà tronqué ne doit pas être recollé au préfixe : les
-    // positions intermédiaires manquent. La couverture est vérifiée ci-dessous.
-    let (from, hidden) = if suffix.from > cached_len {
+    // Un suffixe qui couvre la fenêtre suffit : adopter ses captures au lieu
+    // d'empiler le préfixe pour le jeter aussitôt. Un suffixe déjà tronqué ne
+    // doit pas être recollé : les positions intermédiaires manquent. La
+    // couverture reste vérifiée ci-dessous.
+    let (from, hidden) = if suffix_rows >= keep_rows.max(1) || suffix.from > cached_len {
         (suffix.from, suffix.hidden)
     } else {
-        (prefix.from, stack_rows(&prefix.hidden, &suffix.hidden)?)
+        (
+            prefix.from,
+            stack_rows(&prefix.hidden, &suffix.hidden)?.into(),
+        )
     };
     let captures = PrefixCaptures::tail(&prefix.layer_ids, from, hidden, keep_rows)?;
     let (rows, _) = captures.hidden.as_matrix()?;

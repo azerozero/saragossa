@@ -1095,7 +1095,9 @@ mod tests {
     fn quantized_cpu_data_available(linear: &Linear) -> bool {
         match linear.weight() {
             crate::LinearWeight::AffineQuantized(weight) => weight.cpu_data_available(),
-            crate::LinearWeight::Dense(_) | crate::LinearWeight::DenseBf16(_) => false,
+            crate::LinearWeight::Dense(_)
+            | crate::LinearWeight::DenseBf16(_)
+            | crate::LinearWeight::DenseShared(_) => false,
         }
     }
 

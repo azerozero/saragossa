@@ -1,5 +1,10 @@
 //! Couches linéaires denses ou quantifiées et exécution runtime.
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+mod shared;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub use shared::DenseSharedTensor;
+
 use crate::{AffineQuantizedTensor, ForwardRuntime, InferError, Result, Tensor};
 
 #[derive(Clone, Debug)]
@@ -14,6 +19,9 @@ pub struct Linear {
 pub enum LinearWeight {
     /// Stocke les poids denses en f32.
     Dense(Tensor),
+    /// Stocke les poids f32 en mémoire partagée, avec le dispatch dense historique.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    DenseShared(DenseSharedTensor),
     /// Stocke les poids bf16 natifs en mémoire unifiée.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     DenseBf16(crate::DenseBf16Tensor),
@@ -27,6 +35,8 @@ impl LinearWeight {
             Self::Dense(weight) => weight.shape(),
             #[cfg(all(target_os = "macos", feature = "metal"))]
             Self::DenseBf16(weight) => weight.shape(),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::DenseShared(weight) => weight.shape(),
             Self::AffineQuantized(weight) => weight.shape(),
         }
     }
@@ -49,6 +59,7 @@ impl LinearWeight {
         if let Some(metal) = runtime.metal_executor() {
             return match self {
                 Self::Dense(weight) => metal.matmul_rhs_t_dense(input, weight),
+                Self::DenseShared(weight) => weight.forward_metal(input, metal, false),
                 Self::DenseBf16(weight) => metal.matmul_rhs_t_dense_bf16(input, weight),
                 Self::AffineQuantized(weight) => metal.matmul_rhs_t_affine(input, weight),
             };
@@ -59,6 +70,10 @@ impl LinearWeight {
             Self::Dense(weight) => input.matmul_rhs_t(weight),
             #[cfg(all(target_os = "macos", feature = "metal"))]
             Self::DenseBf16(weight) => weight.matmul_rhs_t(input),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::DenseShared(weight) => {
+                input.matmul_rhs_t_data(weight.data(), weight.shape()[0], weight.shape()[1])
+            }
             Self::AffineQuantized(weight) => weight.matmul_rhs_t(input),
         }
     }
@@ -82,6 +97,7 @@ impl LinearWeight {
                         metal.matmul_rhs_t_dense(input, weight)
                     }
                 }
+                Self::DenseShared(weight) => weight.forward_metal(input, metal, true),
                 Self::DenseBf16(weight) => metal.matmul_rhs_t_dense_bf16(input, weight),
                 Self::AffineQuantized(weight) => metal.matmul_rhs_t_affine(input, weight),
             };
@@ -92,6 +108,10 @@ impl LinearWeight {
             Self::Dense(weight) => input.matmul_rhs_t(weight),
             #[cfg(all(target_os = "macos", feature = "metal"))]
             Self::DenseBf16(weight) => weight.matmul_rhs_t(input),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Self::DenseShared(weight) => {
+                input.matmul_rhs_t_data(weight.data(), weight.shape()[0], weight.shape()[1])
+            }
             Self::AffineQuantized(weight) => weight.matmul_rhs_t(input),
         }
     }
@@ -120,7 +140,7 @@ impl LinearWeight {
     pub(crate) fn affine_quantized(&self) -> Option<&AffineQuantizedTensor> {
         match self {
             Self::Dense(_) => None,
-            Self::DenseBf16(_) => None,
+            Self::DenseBf16(_) | Self::DenseShared(_) => None,
             Self::AffineQuantized(weight) => Some(weight),
         }
     }
@@ -129,7 +149,7 @@ impl LinearWeight {
     pub(crate) fn affine_quantized_mut(&mut self) -> Option<&mut AffineQuantizedTensor> {
         match self {
             Self::Dense(_) => None,
-            Self::DenseBf16(_) => None,
+            Self::DenseBf16(_) | Self::DenseShared(_) => None,
             Self::AffineQuantized(weight) => Some(weight),
         }
     }
