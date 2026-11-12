@@ -47,9 +47,15 @@ class Case:
 
 
 class Matrix:
-    def __init__(self, clients, model, family, flint=False, similarity=0.6):
+    def __init__(self, clients, model, family, flint=False, similarity=0.6, model_type=None):
         self.clients, self.model, self.family = clients, model, family
         self.flint, self.similarity = flint, similarity
+        if model_type is None:
+            model_type = "flint" if flint else {"qwen38":"qwen3_8", "qwen36_moe":"qwen3_6_moe",
+                                               "gemma3":"gemma3", "gemma4":"gemma4"}.get(model, "")
+        self.supports_tools = family == "chat" and (model_type in {"flint", "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"}
+            or any(model_type == prefix or model_type.startswith(prefix + "_")
+                   for prefix in ("qwen3_5", "qwen3_6", "qwen3_8")))
         self.cases = []
         self.build()
 
@@ -251,7 +257,9 @@ class Matrix:
         if option == "auth_x_api_key_only":
             status, _, payload = self.clients.wire(endpoint, self.chat_body(), key=None,
                 headers={"x-api-key": self.clients.key, "anthropic-version": "2023-06-01"})
-            expected, contains = 401, None
+            c.require(status == 200, f"x-api-key refusé: HTTP {status}")
+            c.anthropic(json.loads(payload), self.model, BUDGET)
+            return
         elif option.startswith("auth_"):
             key = None if option == "auth_missing" else "e2e-invalid"
             status, _, payload = self.clients.wire(endpoint, self.chat_body(), key=key)
@@ -297,6 +305,8 @@ class Matrix:
         rejected(call, 400, contains="configur")
 
     def build(self):
+        from endpoints import add_cases
+        add_cases(self)
         chat_disabled = "Profil sans LLM; lancer un profil chat pour ce cas."
         self.add("/v1/models", "list", lambda: c.models(decoded(self.clients.openai.models.with_raw_response.list()),
                  [self.model] if self.family == "chat" else []), smoke=True)
@@ -321,11 +331,9 @@ class Matrix:
                  "src/serve/protocol.rs: json_schema refusé avec HTTP 501; contrôle du rejet.", smoke=True,
                  verify_rejection=True)
         self.add(MESSAGES, "auth_x_api_key_only", lambda: self.error_wire(MESSAGES, "auth_x_api_key_only"),
-                 "src/serve/http.rs is_authorized: Bearer requis; x-api-key seul refusé HTTP 401.",
-                 smoke=True, verify_rejection=True)
-        no_tools = "" if self.family == "chat" and self.flint else (
-            "src/serve/http.rs handle_chat_completions: outils OpenAI réservés à model_type=flint; "
-            "tools/tool_choice ignorés sur Qwen et Gemma.")
+                 "" if self.family == "chat" else chat_disabled, smoke=True)
+        no_tools = "" if self.supports_tools else (
+            "src/serve/tool_output.rs: outils réservés à flint, Qwen 3.5/3.6/3.8 et Gemma 4.")
         for option, action in (
             ("tools_auto", lambda: self.tool(choice="auto")),
             ("tools_none", lambda: self.tool(choice="none")),

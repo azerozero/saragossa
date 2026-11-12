@@ -132,6 +132,38 @@ impl ServeState {
         &mut self.embeddings
     }
 
+    /// Compte avec le template de génération sans ouvrir les poids ni le décodeur.
+    pub(super) fn count_tokens(&self, request: &ChatCompletionRequest) -> ServeResult<usize> {
+        let slot = self
+            .models
+            .iter()
+            .find(|slot| slot.id == request.model)
+            .ok_or_else(|| ServeError::UnknownModel(request.model.clone()))?;
+        if let Some(loaded) = &slot.loaded {
+            return Ok(loaded.prompt_encoding(request)?.tokens.len());
+        }
+        let config = saragossa::ModelConfig::from_file(slot.path.join("config.json"))?;
+        let tokenizer = saragossa::RustTokenizer::from_file(slot.path.join("tokenizer.json"))?;
+        Ok(encode_chat_prompt(&config, &tokenizer, request)?.len())
+    }
+
+    /// Choisit le même parseur que Chat sans charger les poids.
+    pub(super) fn response_output_parser(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> ServeResult<Option<super::tool_output::ToolOutputParser>> {
+        let slot = self
+            .models
+            .iter()
+            .find(|slot| slot.id == request.model)
+            .ok_or_else(|| ServeError::UnknownModel(request.model.clone()))?;
+        if let Some(loaded) = &slot.loaded {
+            return output_parser_for_config(&loaded.assets.config, request);
+        }
+        let config = saragossa::ModelConfig::from_file(slot.path.join("config.json"))?;
+        output_parser_for_config(&config, request)
+    }
+
     /// Charge tous les modèles configurés.
     pub(super) fn preload(&mut self) -> ServeResult<()> {
         for index in 0..self.models.len() {
@@ -1206,18 +1238,8 @@ impl LoadedModel {
     }
 
     fn prompt_encoding(&self, request: &ChatCompletionRequest) -> ServeResult<PromptEncoding> {
-        let rendered = render_chat_prompt(
-            &self.assets.config,
-            if self.assets.config.model_type.starts_with("qwen") {
-                self.assets.tokenizer.qwen_profile()?
-            } else {
-                saragossa::chat_template::QwenProfile::Qwen36
-            },
-            request,
-        )?;
-        let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
         Ok(PromptEncoding {
-            tokens: full_tokens,
+            tokens: encode_chat_prompt(&self.assets.config, &self.assets.tokenizer, request)?,
         })
     }
 
@@ -1427,15 +1449,34 @@ impl LoadedModel {
         }
         Ok(sequences)
     }
+}
 
-    fn encode_full_rendered_prompt(&self, text: &str) -> ServeResult<Vec<usize>> {
-        let ids = if self.assets.config.is_gemma() && !self.assets.config.is_gemma4() {
-            self.assets.encode_prompt_with_special(text)?
-        } else {
-            self.assets.encode_prompt(text)?
-        };
-        tokens_to_usize(&ids)
-    }
+/// Prétraitement partagé : aucune ressource du décodeur ni poids requis.
+pub(super) fn encode_chat_prompt(
+    config: &saragossa::ModelConfig,
+    tokenizer: &saragossa::RustTokenizer,
+    request: &ChatCompletionRequest,
+) -> ServeResult<Vec<usize>> {
+    let profile = if config.model_type.starts_with("qwen") {
+        tokenizer.qwen_profile()?
+    } else {
+        saragossa::chat_template::QwenProfile::Qwen36
+    };
+    let rendered = render_chat_prompt(config, profile, request)?;
+    encode_full_rendered_prompt(config, tokenizer, &rendered)
+}
+
+fn encode_full_rendered_prompt(
+    config: &saragossa::ModelConfig,
+    tokenizer: &saragossa::RustTokenizer,
+    rendered: &str,
+) -> ServeResult<Vec<usize>> {
+    let ids = if config.is_gemma() && !config.is_gemma4() {
+        tokenizer.encode_with_special_tokens(rendered)?
+    } else {
+        tokenizer.encode(rendered)?
+    };
+    tokens_to_usize(&ids)
 }
 
 fn load_decoder_with_runtime(
@@ -1593,6 +1634,9 @@ fn check_thinking(requested: Option<bool>, renders_off: bool) -> ServeResult<()>
         _ => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod count_tests;
 
 #[cfg(test)]
 mod json_tests;
