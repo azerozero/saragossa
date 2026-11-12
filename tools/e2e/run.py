@@ -161,7 +161,8 @@ def main(argv=None):
                     clients = Clients(base, key, args.request_timeout)
                     report["sdk_versions_verified"] = True
                     try:
-                        matrix = Matrix(clients, args.target, family, flint, args.word_similarity)
+                        model_type = json.loads((paths[TARGETS[args.target][0]] / "config.json").read_text()).get("model_type", "") if family == "chat" else ""
+                        matrix = Matrix(clients, args.target, family, flint, args.word_similarity, model_type=model_type)
                         selected = matrix.selected(args.suite)
                         if mode != "ar":
                             selected = [case for case in selected if case.endpoint in {CHAT, MESSAGES}
