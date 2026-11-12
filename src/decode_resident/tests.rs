@@ -123,6 +123,31 @@ fn assert_bits_rows(actual: &[f32], expected: &[f32]) {
     assert!(bad.is_none(), "bits divergents à l'index {bad:?}");
 }
 
+#[test]
+fn legacy_resident_maximum_edges_and_diagnostics() {
+    use crate::oracle::assert_panics_with;
+    assert_close_eps(&[], &[], 0.0);
+    // f32::max ignore NaN ; la moyenne NaN n'était pas une condition d'échec.
+    assert_close_eps(&[f32::NAN], &[0.0], 0.0);
+    assert_close_eps(&[0.0], &[f32::NAN], 0.0);
+    assert_close_eps(&[f32::INFINITY], &[f32::INFINITY], 0.0);
+    assert_close_eps(&[f32::NEG_INFINITY], &[f32::NEG_INFINITY], 0.0);
+    assert_close_eps(&[f32::INFINITY], &[0.0], f32::INFINITY);
+    assert_panics_with("écart max 2e0 > 1e0 (mean NaN)", || {
+        assert_close_eps(&[f32::NAN, 2.0], &[0.0, 0.0], 1.0);
+    });
+    assert_panics_with("écart max inf > 1e0 (mean inf)", || {
+        assert_close_eps(&[f32::INFINITY], &[0.0], 1.0);
+    });
+    assert_panics_with("écart max 0e0 > NaN (mean 0e0)", || {
+        assert_close_eps(&[], &[], f32::NAN);
+    });
+    assert_panics_with(
+        "assertion `left == right` failed: longueurs différentes\n  left: 1\n right: 0",
+        || assert_close_eps(&[f32::NAN], &[], 0.1),
+    );
+}
+
 fn assert_close_eps(actual: &[f32], expected: &[f32], eps: f32) {
     assert_eq!(actual.len(), expected.len(), "longueurs différentes");
     let mut max_abs = 0.0_f32;
@@ -3617,15 +3642,7 @@ mod dflash_resident {
         }
     }
 
-    fn assert_close(label: &str, gpu: &[f32], cpu: &[f32], tolerance: f32) {
-        assert_eq!(gpu.len(), cpu.len(), "{label}: longueurs");
-        for (i, (g, c)) in gpu.iter().zip(cpu).enumerate() {
-            assert!(
-                (g - c).abs() <= tolerance * (1.0 + c.abs()),
-                "{label}[{i}] gpu={g} cpu={c}"
-            );
-        }
-    }
+    use crate::oracle::assert_close_rel as assert_close;
 
     fn run_case(window: Option<usize>) -> Result<()> {
         let Some(mut state) = try_state()? else {

@@ -10,13 +10,13 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use safetensors::Dtype;
 
 use super::{read_shard_header, ShardHeader, ShardTensorEntry};
 use crate::qwen4_exp::ngram::{head_vocab_sizes, layer_multipliers, NGRAM_SEED};
+use crate::safetensor::pread_exact;
 use crate::safetensor::{bytes_to_dense_f32, f8_e4m3_to_f32};
 use crate::{dequantize_affine_u32, AffineQuantizedTensor, InferError, Result, Tensor};
 
@@ -898,8 +898,7 @@ impl Qwen4ExpCheckpoint {
         }
         let offset = self.shards[shard].data_start + (entry.data_offsets[0] + start) as u64;
         let mut buf = vec![0_u8; len];
-        self.files[shard]
-            .read_exact_at(&mut buf, offset)
+        pread_exact(&self.files[shard], &mut buf, offset)
             .map_err(|e| io(&self.shards[shard].path, e))?;
         Ok(buf)
     }
@@ -1072,9 +1071,7 @@ impl Qwen4ExpCheckpoint {
             if id >= self.ngram.rows {
                 return Err(InferError::Shape(format!("ligne n-gram {id} hors table")));
             }
-            self.ngram
-                .file
-                .read_exact_at(&mut row, id * width as u64)
+            pread_exact(&self.ngram.file, &mut row, id * width as u64)
                 .map_err(|e| io(&self.ngram.path, e))?;
             for (value, &byte) in slot.iter_mut().zip(&row) {
                 *value = f8_e4m3_to_f32(byte)
@@ -1142,9 +1139,7 @@ impl Qwen4ExpCheckpoint {
                 if id >= self.ngram.rows {
                     return Err(InferError::Shape(format!("ligne n-gram {id} hors table")));
                 }
-                self.ngram
-                    .file
-                    .read_exact_at(slot, id * width as u64)
+                pread_exact(&self.ngram.file, slot, id * width as u64)
                     .map_err(|e| io(&self.ngram.path, e))?;
                 if slot.iter().any(|b| b & 0x7f == 0x7f) {
                     return Err(cfg_err(format!("ligne n-gram {id}: NaN")));

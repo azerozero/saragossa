@@ -532,7 +532,10 @@ fn snapshot_key_tracks_forced_resident_linear() {
     });
 }
 
+// NOTE: NTFS ne crée pas de fichier creux par défaut : le blob géant y occupe
+// réellement le disque. Le contrôle de taille testé ici est indépendant de l'OS.
 #[test]
+#[cfg(unix)]
 fn oversized_sparse_blob_rejected_before_any_blob_read() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let (model, request) = fixture(dir.path());
