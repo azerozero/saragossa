@@ -302,7 +302,11 @@ mod tests {
 
     /// Pré-traitement clone metal-rs ≡ golden mlx-rs figé (sans mlx-rs, sans modèle :
     /// décode/mel pur sur reti-fr.wav). Mêmes tolérances que `live_clone_preprocess_*`.
+    // NOTE: golden capturé sur Apple Silicon (aarch64) ; sur x86 les arrondis de la FFT
+    // et de libm diffèrent (écart mesuré en CI Linux/Windows) : pas de tolérance
+    // élargie, le test reste limité à l'architecture de capture.
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn golden_clone_preprocess_matches_fixture() -> Result<()> {
         // La fixture est embarquée dans `assets/voices/`, donc présente aussi
         // dans le miroir public. Le skip ne couvre plus qu'un arbre tronqué.

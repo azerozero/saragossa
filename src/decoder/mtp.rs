@@ -8,13 +8,12 @@
 
 use super::*;
 use crate::quantization::bytes_to_u32;
-use crate::safetensor::bytes_to_dense_f32;
+use crate::safetensor::{bytes_to_dense_f32, pread_exact};
 use crate::AffineQuantizedTensor;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use safetensors::Dtype;
 use safetensors::{tensor::TensorView, SafeTensors};
 use std::collections::HashMap;
-use std::os::unix::fs::FileExt;
 
 pub(super) struct MtpLoadContext<'a> {
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -760,14 +759,13 @@ impl LazySidecar {
             .map_err(|_| InferError::Config("sidecar MTP trop grand".to_string()))?;
         let mut bytes = vec![0_u8; len];
         let mut len_bytes = [0_u8; 8];
-        file.read_exact_at(&mut len_bytes, 0).map_err(io)?;
+        pread_exact(&file, &mut len_bytes, 0).map_err(io)?;
         let data_start = usize::try_from(u64::from_le_bytes(len_bytes))
             .ok()
             .and_then(|header| header.checked_add(8))
             .filter(|&start| start <= len)
             .ok_or_else(|| InferError::Config("header sidecar MTP invalide".to_string()))?;
-        file.read_exact_at(&mut bytes[..data_start], 0)
-            .map_err(io)?;
+        pread_exact(&file, &mut bytes[..data_start], 0).map_err(io)?;
         let (_, metadata) = SafeTensors::read_metadata(&bytes)
             .map_err(|source| InferError::Config(format!("parse sidecar MTP: {source}")))?;
         let mut offsets = HashMap::new();
@@ -780,8 +778,7 @@ impl LazySidecar {
                 normalize_mtp_sidecar_key(&name).as_str(),
                 MTP_MOE_MARKER | MTP_MOE_DOWN
             ) {
-                file.read_exact_at(&mut bytes[start..end], start as u64)
-                    .map_err(io)?;
+                pread_exact(&file, &mut bytes[start..end], start as u64).map_err(io)?;
             }
             offsets.insert(name, start);
         }
@@ -803,8 +800,7 @@ impl LazySidecar {
 
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         let mut out = vec![0_u8; len];
-        self.file
-            .read_exact_at(&mut out, offset as u64)
+        pread_exact(&self.file, &mut out, offset as u64)
             .map_err(|source| InferError::Config(format!("lecture experts MTP: {source}")))?;
         Ok(out)
     }

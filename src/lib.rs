@@ -56,6 +56,12 @@ pub mod whisper;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) use metal_backend::tests::oracle;
+#[cfg(all(test, not(all(target_os = "macos", feature = "metal"))))]
+#[path = "metal_backend/tests/oracle.rs"]
+pub(crate) mod oracle;
+
 pub use activation::{gelu, gelu_tanh, silu};
 pub use assets::{ModelAssets, MtpWeightsInfo};
 pub use catalog::WeightCatalog;

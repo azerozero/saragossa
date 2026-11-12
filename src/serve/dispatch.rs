@@ -445,9 +445,9 @@ impl Drop for Reservation {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixStream;
+    use std::net::TcpListener;
 
     use super::super::args::ServeArgs;
     use super::*;
@@ -455,12 +455,30 @@ mod tests {
     const CHAT: &[u8] = b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
     const HEALTH: &[u8] = b"GET /health HTTP/1.1\r\n\r\n";
 
+    /// Boucle locale synthétique : mêmes scénarios TCP sur chaque plateforme.
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("invariant: listener TCP local");
+        let client = TcpStream::connect(listener.local_addr().expect("invariant: adresse locale"))
+            .expect("invariant: connexion TCP locale");
+        let (server, _) = listener.accept().expect("invariant: connexion acceptée");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("invariant: timeout client");
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("invariant: timeout client");
+        server
+            .configure(Duration::from_secs(5))
+            .expect("invariant: timeout serveur");
+        (client, server)
+    }
+
     /// Dispatcher de test ; la file n'est jamais vidée, comme un moteur
     /// occupé par une génération longue.
     fn dispatcher(
         max_connections: usize,
         queue: usize,
-    ) -> (Dispatcher<UnixStream>, Receiver<Job<UnixStream>>) {
+    ) -> (Dispatcher<TcpStream>, Receiver<Job<TcpStream>>) {
         dispatcher_with(None, max_connections, usize::MAX, queue)
     }
 
@@ -469,7 +487,7 @@ mod tests {
         max_connections: usize,
         max_inflight_bytes: usize,
         queue: usize,
-    ) -> (Dispatcher<UnixStream>, Receiver<Job<UnixStream>>) {
+    ) -> (Dispatcher<TcpStream>, Receiver<Job<TcpStream>>) {
         let (jobs, rx) = sync_channel(queue);
         let dispatcher = Dispatcher {
             front: Arc::new(Front::new(
@@ -491,8 +509,10 @@ mod tests {
     }
 
     /// Attend que tous les threads de connexion aient rendu la main.
-    fn settle(dispatcher: &Dispatcher<UnixStream>) {
+    fn settle(dispatcher: &Dispatcher<TcpStream>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
         while dispatcher.connections.load(Ordering::Acquire) > 0 {
+            assert!(Instant::now() < deadline, "threads de connexion bloqués");
             thread::yield_now();
         }
     }
@@ -505,8 +525,8 @@ mod tests {
     }
 
     /// Ouvre une connexion servie par `dispatcher`, envoie `raw` s'il y en a.
-    fn connect(dispatcher: &Dispatcher<UnixStream>, raw: &[u8]) -> UnixStream {
-        let (mut client, server) = UnixStream::pair().expect("invariant: paire Unix locale");
+    fn connect(dispatcher: &Dispatcher<TcpStream>, raw: &[u8]) -> TcpStream {
+        let (mut client, server) = tcp_pair();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("invariant: timeout client");
@@ -515,7 +535,7 @@ mod tests {
         client
     }
 
-    fn response(mut client: UnixStream) -> String {
+    fn response(mut client: TcpStream) -> String {
         let mut response = String::new();
         client
             .read_to_string(&mut response)
@@ -585,7 +605,7 @@ mod tests {
         .concat();
         let mut clients = Vec::new();
         for _ in 0..3 {
-            let (client, server) = UnixStream::pair().expect("invariant: paire Unix locale");
+            let (client, server) = tcp_pair();
             let mut cursor = std::io::Cursor::new(raw.clone());
             let request = super::super::http::read_request(
                 &mut cursor,
@@ -624,7 +644,9 @@ mod tests {
 
         assert!(health.starts_with("HTTP/1.1 200 OK"));
         assert!(health.contains(r#""status":"ok""#));
-        let job = rx.recv().expect("invariant: chat en file moteur");
+        let job = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("invariant: chat en file moteur");
         assert_eq!(job.request.route(), "/v1/chat/completions");
     }
 
@@ -697,6 +719,46 @@ mod tests {
     }
 
     #[test]
+    fn bearer_authorized_request_reaches_engine() {
+        let (dispatcher, rx) = dispatcher_with(Some("secret"), 4, usize::MAX, 1);
+        let client = connect(&dispatcher, b"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Length: 2\r\n\r\n{}");
+        let mut job = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("invariant: requête authentifiée en file");
+        assert_eq!(job.request.route(), "/v1/chat/completions");
+        send_error(&mut job.stream, 503, "moteur synthétique occupé")
+            .expect("invariant: réponse synthétique");
+        drop(job);
+        assert!(response(client).starts_with("HTTP/1.1 503"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_transport_still_dispatches_health() {
+        let (template, _) = dispatcher(4, 1);
+        let (jobs, _rx) = sync_channel(1);
+        let dispatcher = Dispatcher {
+            front: template.front,
+            jobs,
+            connections: template.connections,
+            inflight_bytes: template.inflight_bytes,
+            waiting: template.waiting,
+            limits: template.limits,
+        };
+        let (mut client, server) = UnixStream::pair().expect("invariant: paire Unix locale");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("invariant: timeout client");
+        client.write_all(HEALTH).expect("invariant: requête santé");
+        dispatcher.dispatch(server);
+        let mut answer = String::new();
+        client
+            .read_to_string(&mut answer)
+            .expect("invariant: réponse Unix");
+        assert!(answer.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
     fn inflight_bytes_budget_returns_503() {
         let (dispatcher, rx) = dispatcher_with(None, 4, 3, 4);
         let _first = connect(&dispatcher, CHAT);
@@ -744,7 +806,7 @@ mod tests {
         let args = ServeArgs::parse(["--model".to_string(), "alpha=/nonexistent/a".to_string()])
             .expect("invariant: args valides");
         let mut state = ServeState::new(&args);
-        let (mut client, server) = UnixStream::pair().expect("invariant: paire Unix locale");
+        let (mut client, server) = tcp_pair();
         // Le chargement du modèle échoue, mais passe d'abord par la garde.
         let body = br#"{"model":"alpha","messages":[]}"#;
         let raw = format!(

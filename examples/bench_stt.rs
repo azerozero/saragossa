@@ -53,11 +53,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = WhisperModel::from_model_dir(&model_dir)?;
     eprintln!("chargé en {} ms", t_load.elapsed().as_millis());
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let metal = saragossa::MetalExecutor::new()?;
-    #[cfg(feature = "metal")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let runtime = ForwardRuntime::metal(&metal);
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     let runtime = ForwardRuntime::cpu();
 
     // Warm-up jeté (compile pipelines, chauffe caches).

@@ -39,3 +39,20 @@ pub(super) fn load_qwen3_tts_tokenizer(dir: &Path) -> Result<Tokenizer> {
     tokenizer.add_special_tokens(&added);
     Ok(tokenizer)
 }
+
+#[cfg(test)]
+mod golden_tests {
+    use crate::tokenizer::golden_tests::{check_family, compare_rows, TestResult};
+
+    #[test]
+    fn qwen3_tts() -> TestResult {
+        check_family("qwen3-tts", |path, rows| {
+            let tokenizer = super::load_qwen3_tts_tokenizer(path)?;
+            compare_rows(
+                rows,
+                |text, special| Ok(tokenizer.encode(text, special)?.get_ids().to_vec()),
+                |ids| tokenizer.decode(ids, true),
+            )
+        })
+    }
+}

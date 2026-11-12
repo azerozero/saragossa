@@ -6,13 +6,13 @@
 //! `f32(e4m3) × weight_scale` avec une échelle **per-tensor** unique.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::plan::{hex, io_err, Source, TensorRef, IO_CHUNK};
+use crate::safetensor::pwrite_all;
 use crate::{InferError, Result};
 
 pub(crate) use crate::qwen4_exp::ngram::{head_vocab_sizes, layer_multipliers, NGRAM_SEED};
@@ -154,8 +154,7 @@ pub(crate) fn copy_segment(
                 start + len
             )));
         }
-        file.write_all_at(&bytes, offset + start as u64)
-            .map_err(|source| io_err(path, source))?;
+        pwrite_all(file, &bytes, offset + start as u64).map_err(|source| io_err(path, source))?;
         sha.update(&bytes);
         start += len;
     }
