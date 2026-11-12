@@ -43,6 +43,12 @@ pub(crate) enum ServeError {
     /// Fonctionnalité connue mais non livrée.
     #[error("non implémenté: {0}")]
     NotImplemented(String),
+    /// Paramètre identifié dont la fonctionnalité n'est pas implémentée.
+    #[error("non implémenté: {param}: {message}")]
+    NotImplementedParameter {
+        param: String,
+        message: &'static str,
+    },
     /// Modèle demandé absent.
     #[error("modèle non chargé ou inconnu: {0}")]
     UnknownModel(String),
@@ -111,6 +117,10 @@ impl ServeError {
             Self::Json { .. } => Self::Http(self.to_string()),
             Self::IncompleteJson(message) => Self::IncompleteJson(message.clone()),
             Self::NotImplemented(message) => Self::NotImplemented(message.clone()),
+            Self::NotImplementedParameter { param, message } => Self::NotImplementedParameter {
+                param: param.clone(),
+                message,
+            },
             Self::UnknownModel(model) => Self::UnknownModel(model.clone()),
             Self::Memory(message) => Self::Memory(message.clone()),
             Self::Batch(message) => Self::Batch(message.clone()),

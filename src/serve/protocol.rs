@@ -417,7 +417,7 @@ pub(super) struct ResponseFormat {
 /// Message OpenAI minimal.
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct WireMessage {
-    /// Ordre natif Anthropic, renseigné seulement par la conversion interne.
+    /// Ordre natif Anthropic/Responses, renseigné par la conversion interne.
     #[serde(skip)]
     pub(super) assistant_blocks: Option<Vec<saragossa::chat_template::AssistantBlock>>,
     /// Nom de l'outil qui a produit ce résultat.

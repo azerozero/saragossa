@@ -76,6 +76,7 @@ the **single-user latency × Apple Silicon** quadrant:
 |---|---|
 | `GET /v1/models` | Served models |
 | `POST /v1/chat/completions` | OpenAI-compatible chat (SSE or not), `response_format: {"type":"json_object"}` |
+| `POST /v1/responses` | Stateless text and function calls (JSON or SSE) |
 | `POST /v1/messages` | Anthropic Messages shim + `tool_use` (drivable by Claude Code) |
 | `POST /v1/audio/transcriptions` | Whisper STT (multipart WAV, opt-in `--stt-model`) |
 | `POST /v1/audio/speech` | Qwen3 TTS (JSON → WAV ou PCM chunked avec `stream: true`, opt-in `--tts-model`) |
@@ -257,6 +258,22 @@ SARAGOSSA_API_KEY=local-dev saragossa serve \
 # Claude Code talks to the local engine via /v1/messages.
 ANTHROPIC_BASE_URL=http://127.0.0.1:8081 ANTHROPIC_API_KEY=local-dev claude
 ```
+
+### Responses: text and function calls
+
+`POST /v1/responses` accepts client-provided history without server-side storage
+(`store: false`). JSON and SSE preserve the same text/function-call order. Replay
+all output items in `input`, then append `function_call_output` items associated
+by `call_id`; assistant text between calls and results is accepted.
+
+Tools run in non-strict mode when `strict` is omitted, `null`, or `false`.
+Every tool in the returned response explicitly includes `"strict": false`.
+`strict: true` returns HTTP 501 with `error.param: "tools[i].strict"` (the
+zero-based tool index): constrained argument generation is not implemented.
+The supplied schema guides the prompt and parser but is not a generation guarantee.
+
+At the output token limit, the response becomes `incomplete`. Closed items keep
+their status; only the text item still open at truncation becomes `incomplete`.
 
 ### Structured output (v1: `json_object`)
 

@@ -650,6 +650,7 @@ fn send_failure<S: Write>(stream: &mut S, error: &ServeError, anthropic: bool) -
     let (code, param) = match error {
         ServeError::UnknownModel(_) => (Some("model_not_found"), Some("model")),
         ServeError::InvalidParameter { param, .. } => (None, Some(*param)),
+        ServeError::NotImplementedParameter { param, .. } => (None, Some(param.as_str())),
         _ => {
             return if anthropic {
                 send_anthropic_error(stream, status, &error.to_string())
@@ -722,7 +723,7 @@ fn error_status(error: &ServeError) -> u16 {
         | ServeError::BodyTooLarge { .. }
         | ServeError::InvalidParameter { .. }
         | ServeError::IncompleteJson(_) => 400,
-        ServeError::NotImplemented(_) => 501,
+        ServeError::NotImplemented(_) | ServeError::NotImplementedParameter { .. } => 501,
         ServeError::Memory(_) => 503,
         ServeError::Io { .. } | ServeError::Inference(_) | ServeError::Batch(_) => 500,
     }

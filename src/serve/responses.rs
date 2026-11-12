@@ -32,7 +32,7 @@ pub(super) fn handle<S: Write>(
     } else {
         let completion = state.complete(request.chat, None)?;
         let mut response = response;
-        response.value["output"] = output(&completion.content, parser);
+        response.value["output"] = output(&completion.content, parser, completion.finish_reason);
         response.complete(&completion);
         send_json(stream, 200, &response.value, completion.metric_headers())
     }
@@ -56,17 +56,33 @@ fn function(call: ToolCall) -> Value {
         "call_id":call.id,"name":call.function.name,"arguments":call.function.arguments})
 }
 
-fn output(content: &str, parser: Option<ToolOutputParser>) -> Value {
+fn output(content: &str, parser: Option<ToolOutputParser>, finish_reason: &str) -> Value {
     let mut items = Vec::new();
+    let final_status = if finish_reason == "length" {
+        "incomplete"
+    } else {
+        "completed"
+    };
     match parser {
         Some(parser) => {
-            let parsed = parser.parse(content);
-            if !parsed.content.is_empty() {
-                items.push(message(&parsed.content, "completed"));
+            let mut text = None::<String>;
+            for event in parser.parse_events(content) {
+                match event {
+                    FlintEvent::Reasoning(_) => {}
+                    FlintEvent::Content(delta) => text.get_or_insert_default().push_str(&delta),
+                    FlintEvent::ToolCall(call) => {
+                        if let Some(text) = text.take() {
+                            items.push(message(&text, "completed"));
+                        }
+                        items.push(function(call));
+                    }
+                }
             }
-            items.extend(parsed.tool_calls.into_iter().map(function));
+            if let Some(text) = text {
+                items.push(message(&text, final_status));
+            }
         }
-        None => items.push(message(content, "completed")),
+        None => items.push(message(content, final_status)),
     }
     Value::Array(items)
 }
@@ -105,11 +121,6 @@ impl Response {
         });
         if incomplete {
             self.value["incomplete_details"] = json!({"reason":"max_output_tokens"});
-            if let Some(items) = self.value["output"].as_array_mut() {
-                for item in items.iter_mut().filter(|item| item["type"] == "message") {
-                    item["status"] = json!("incomplete");
-                }
-            }
         }
         let usage = completion.usage;
         self.value["usage"] = json!({

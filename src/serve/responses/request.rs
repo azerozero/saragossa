@@ -1,5 +1,6 @@
 //! Conversion du profil Responses sans stockage vers le chat du moteur.
 
+use saragossa::chat_template::AssistantBlock;
 use serde_json::{json, Value};
 
 use super::super::error::{ServeError, ServeResult};
@@ -45,7 +46,7 @@ fn text(value: &Value) -> ServeResult<String> {
 
 impl Request {
     pub fn parse(body: &[u8], cap: usize) -> ServeResult<Self> {
-        let value: Value = serde_json::from_slice(body).map_err(|_| invalid("JSON"))?;
+        let mut value: Value = serde_json::from_slice(body).map_err(|_| invalid("JSON"))?;
         let fields = value.as_object().ok_or_else(|| invalid("corps"))?;
         for (key, val) in fields {
             match key.as_str() {
@@ -99,10 +100,10 @@ impl Request {
                     };
                     match kind {
                         "message" => {
-                            if !pending.is_empty() {
+                            let role = string(item, "role")?;
+                            if !pending.is_empty() && role != "assistant" {
                                 return Err(invalid("function_call_output manquant"));
                             }
-                            let role = string(item, "role")?;
                             if !matches!(role, "user" | "assistant" | "system" | "developer") {
                                 return Err(invalid("role"));
                             }
@@ -170,8 +171,13 @@ impl Request {
             return Err(invalid("function_call_output manquant"));
         }
         let mut tools = Vec::new();
-        if let Some(declared) = value.get("tools") {
-            for tool in declared.as_array().ok_or_else(|| invalid("tools"))? {
+        if let Some(declared) = value.get_mut("tools") {
+            for (index, tool) in declared
+                .as_array_mut()
+                .ok_or_else(|| invalid("tools"))?
+                .iter_mut()
+                .enumerate()
+            {
                 if tool["type"] != "function" {
                     return Err(ServeError::not_implemented(
                         "Responses: seuls les outils function sont supportés",
@@ -194,12 +200,15 @@ impl Request {
                     return Err(invalid("tools.description"));
                 }
                 string(tool, "name")?;
-                if tool
-                    .get("strict")
-                    .is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
-                {
-                    return Err(ServeError::not_implemented("Responses: outils stricts"));
+                match tool.get("strict") {
+                    None | Some(Value::Null | Value::Bool(false)) => {}
+                    Some(Value::Bool(true)) => return Err(ServeError::NotImplementedParameter {
+                        param: format!("tools[{index}].strict"),
+                        message: "Responses: strict=true exige une génération contrainte des arguments, non disponible",
+                    }),
+                    Some(_) => return Err(invalid(&format!("tools[{index}].strict"))),
                 }
+                tool["strict"] = json!(false);
                 if tool
                     .get("parameters")
                     .is_some_and(|v| !v.is_null() && !v.is_object())
@@ -241,6 +250,44 @@ impl Request {
         let mut chat = ChatCompletionRequest::parse(
             &serde_json::to_vec(&chat).map_err(|e| ServeError::json("Responses chat", e))?,
         )?;
+        // Un tour assistant peut alterner texte et appels. Le regrouper avec
+        // ses blocs ordonnés garde les retours adjacents pour les templates
+        // positionnels, sans déplacer le texte devant les appels.
+        for mut message in std::mem::take(&mut chat.messages) {
+            if message.role != "assistant" {
+                chat.messages.push(message);
+                continue;
+            }
+            let mut blocks = Vec::new();
+            if let Some(Value::String(text)) = &message.content {
+                blocks.push(AssistantBlock::Text(text.clone()));
+            }
+            let calls = message.tool_calls.get_or_insert_default();
+            if let Some(previous) = chat.messages.last_mut().filter(|m| m.role == "assistant") {
+                let previous_calls = previous.tool_calls.get_or_insert_default();
+                blocks.extend(
+                    (previous_calls.len()..previous_calls.len() + calls.len())
+                        .map(AssistantBlock::ToolCall),
+                );
+                previous_calls.append(calls);
+                previous
+                    .assistant_blocks
+                    .get_or_insert_default()
+                    .extend(blocks);
+                if let Some(Value::String(text)) = message.content {
+                    let content = previous.content.get_or_insert_with(|| json!(""));
+                    if let Value::String(previous_text) = content {
+                        previous_text.push_str(&text);
+                    } else {
+                        *content = json!(text);
+                    }
+                }
+            } else {
+                blocks.extend((0..calls.len()).map(AssistantBlock::ToolCall));
+                message.assistant_blocks = Some(blocks);
+                chat.messages.push(message);
+            }
+        }
         // Les valeurs effectives exposées dans Response restent indépendantes
         // des presets locaux de sampling du modèle.
         chat.temperature.get_or_insert(0.0);
