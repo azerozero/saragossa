@@ -197,14 +197,39 @@ pub(super) fn route_front<S: Write>(
     }
     if request.method == "GET" {
         if let Some(id) = path.strip_prefix("/v1/models/") {
-            return Some(if front.model_ids.iter().any(|model| model == id) {
-                send_json(stream, 200, &ModelInfo::new(id), Vec::new())
+            let id = match decode_model_id(id) {
+                Ok(id) => id,
+                Err(error) => return Some(send_failure(stream, &error, false)),
+            };
+            return Some(if front.model_ids.iter().any(|model| model == &id) {
+                send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
             } else {
-                send_failure(stream, &ServeError::UnknownModel(id.to_string()), false)
+                send_failure(stream, &ServeError::UnknownModel(id), false)
             });
         }
     }
     None
+}
+
+/// Décode le suffixe après routage : `%2F` et `%3F` appartiennent à l'alias,
+/// `+` reste littéral et `%25` ne déclenche jamais un second décodage.
+fn decode_model_id(encoded: &str) -> ServeResult<String> {
+    let invalid = || ServeError::Http("encodage URL du modèle invalide".to_string());
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            let low = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            match (high, low) {
+                (Some(high), Some(low)) => decoded.push((high * 16 + low) as u8),
+                _ => return Err(invalid()),
+            }
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| invalid())
 }
 
 /// Traite sur le thread moteur une requête déjà authentifiée par
@@ -941,6 +966,47 @@ mod tests {
 
     fn far_deadline() -> Instant {
         Instant::now() + Duration::from_secs(30)
+    }
+
+    #[test]
+    fn model_lookup_decodes_path_once_and_rejects_invalid_encoding() {
+        let ids = ["mon modèle", "日本語", "a/b?c#d+e%f", "%20", "a+b"];
+        let front = Front::new(None, ids.iter().map(|id| (*id).to_string()).collect());
+        for (suffix, status, expected) in [
+            ("mon%20mod%C3%A8le", 200, "mon modèle"),
+            ("%E6%97%A5%E6%9C%AC%E8%AA%9E", 200, "日本語"),
+            ("a%2fb%3Fc%23d%2Be%25f?ignored=1", 200, "a/b?c#d+e%f"),
+            ("%2520", 200, "%20"),
+            ("a+b", 200, "a+b"),
+            ("mon%2520mod%C3%A8le", 404, ""),
+            ("%", 400, ""),
+            ("%2", 400, ""),
+            ("%GG", 400, ""),
+            ("%FF", 400, ""),
+            ("%C3%28", 400, ""),
+        ] {
+            let raw = format!("GET /v1/models/{suffix} HTTP/1.1\r\n\r\n");
+            let request = read_request(&mut Cursor::new(raw), far_deadline())
+                .expect("invariant: requête lisible")
+                .expect("invariant: requête présente");
+            let mut reply = Vec::new();
+            route_front(&mut reply, &front, &request)
+                .expect("invariant: route modèle traitée")
+                .expect("invariant: réponse écrite");
+            let reply = String::from_utf8(reply).expect("invariant: réponse UTF-8");
+            assert!(
+                reply.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{suffix}: {reply}"
+            );
+            let (_, body) = reply.split_once("\r\n\r\n").expect("invariant: corps HTTP");
+            let body: serde_json::Value =
+                serde_json::from_str(body).expect("invariant: corps JSON");
+            if status == 200 {
+                assert_eq!(body["id"], expected);
+            } else {
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+            }
+        }
     }
 
     /// Client au goutte-à-goutte : un octet utile toutes les 5 ms, jamais de
