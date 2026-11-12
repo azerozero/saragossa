@@ -3,6 +3,8 @@
     "qwen38": "captured",
     "qwen36_moe": "captured",
     "gemma3": "captured",
-    "gemma4": "captured"
+    "gemma4": "captured",
+    "qwen36_moe_f32": "pending_capture",
+    "gemma4_f32": "pending_capture"
   }
 }

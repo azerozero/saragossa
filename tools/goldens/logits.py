@@ -18,6 +18,8 @@ def main():
     require_versions(LOGITS_PACKAGES)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=["qwen38", "qwen36_moe", "gemma3", "gemma4"], required=True)
+    parser.add_argument("--float32", action="store_true",
+                        help="control: cast floating weights/scales to f32, keep packed quantized weights")
     args = parser.parse_args()
     path = local_model(args.model)
     import mlx.core as mx
@@ -25,6 +27,9 @@ def main():
     from mlx_lm.models.cache import make_prompt_cache
     mx.set_default_device(mx.gpu)
     model, tokenizer = load(path)
+    if args.float32:
+        model.set_dtype(mx.float32)
+        mx.eval(model.parameters())
     cases = []
     for index, prompt in enumerate(PROMPTS):
         chat = index == len(PROMPTS) - 1
@@ -50,8 +55,12 @@ def main():
                               logprobs=[p[1] for p in pairs]))
             inputs = mx.array([[generated]])
         cases.append(dict(prompt=prompt, rendered=rendered, chat=chat, prompt_ids=ids, steps=steps))
-    write_json("logits", args.model, dict(model=args.model, cases=cases),
-               provenance(args.model, path, LOGITS_PACKAGES),
+    source = provenance(args.model, path, LOGITS_PACKAGES)
+    stem = args.model
+    if args.float32:
+        source["float32_control"] = True
+        stem += "_f32"
+    write_json("logits", stem, dict(model=args.model, cases=cases), source,
                "greedy exact; near-tie logprob margin <= 0.01; top20+other KL <= 0.02; max delta-p <= 0.02",
                decoding="16 steps including EOS; no sampling or logits processors; reference-prefix teacher forcing")
 
