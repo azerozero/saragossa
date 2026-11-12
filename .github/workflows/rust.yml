@@ -45,6 +45,35 @@ jobs:
       - name: Tests
         run: cargo test --features metal,devtools
 
+  cpu:
+    name: CPU (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-cpu-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build CPU library
+        run: cargo build --locked --no-default-features
+      - name: Build CPU CLI
+        run: cargo build --locked --no-default-features --features devtools
+      - name: Build default features
+        run: cargo build --locked
+      - name: CPU library tests
+        run: cargo test --locked --lib --no-default-features
+      - name: CPU library and conversion tests
+        run: cargo test --locked --lib --no-default-features --features devtools
+      - name: CPU transport tests
+        run: cargo test --locked --bin saragossa --no-default-features --features devtools "serve::"
+
   msrv:
     name: MSRV 1.85
     runs-on: macos-15

@@ -429,7 +429,7 @@ fn open_unix_connection(path: &Path, timeout: Duration) -> BenchResult<Box<dyn B
 #[cfg(not(unix))]
 fn open_unix_connection(_path: &Path, _timeout: Duration) -> BenchResult<Box<dyn BenchStream>> {
     Err(BenchServeError::new(
-        "transport socket Unix indisponible sur cette plateforme",
+        "transport socket Unix indisponible; utilisez --url et --api-key pour TCP",
     ))
 }
 

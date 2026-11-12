@@ -24,7 +24,7 @@ use crate::metal_backend::{
 use crate::tts::TtsDecoderConfig;
 use crate::{InferError, Result, Tensor};
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
+    Buffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
     MTLResourceOptions, MTLSize,
 };
 use std::collections::HashMap;
@@ -1214,8 +1214,7 @@ impl CodecGpu {
 }
 
 fn compile(device: &Device, name: &str) -> Result<ComputePipelineState> {
-    let options = CompileOptions::new();
-    options.set_fast_math_enabled(true);
+    let options = crate::metal_backend::compile_options(true);
     let library = device
         .new_library_with_source(CODEC_KERNELS, &options)
         .map_err(|error| InferError::Metal(format!("compilation codec {name}: {error}")))?;

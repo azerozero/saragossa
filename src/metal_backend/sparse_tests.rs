@@ -145,7 +145,7 @@ fn mapped_rows_take_gpu_writes_and_read_back() -> Result<()> {
     let library = device
         .new_library_with_source(
             "kernel void fill(device uint* b [[buffer(0)]], uint i [[thread_position_in_grid]]) { b[i] = i * 3u + 1u; }",
-            &metal::CompileOptions::new(),
+            &crate::metal_backend::compile_options(true),
         )
         .map_err(InferError::Metal)?;
     let function = library
