@@ -30,6 +30,10 @@ required-features = ["devtools"]
 name = "mtp_qmm_gate"
 required-features = ["metal"]
 
+[[example]]
+name = "dump_layers"
+required-features = ["devtools"]
+
 [features]
 default = ["metal", "devtools"]
 metal = []

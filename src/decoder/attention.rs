@@ -135,6 +135,8 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         self.ensure_runtime_supported(runtime)?;
         let normed = rms_norm(x, &self.input_norm, config.rms_eps)?;
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("attention_input", &normed)?;
         let attn_out = match &self.attention {
             AttentionBlock::Full(attention) => {
                 full_attention_forward(config, &normed, attention, runtime)?
@@ -160,6 +162,8 @@ impl DecoderLayer {
         attn_out: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("attention_raw", attn_out)?;
         if let Some(pre_ffn) = &self.pre_feedforward_norm {
             let post_attn = self.post_attention_norm.as_ref().ok_or_else(|| {
                 InferError::Config("Gemma sans post_attention_layernorm".to_string())
@@ -172,7 +176,11 @@ impl DecoderLayer {
                 .as_ref()
                 .ok_or_else(|| InferError::Config("Gemma sans MLP".to_string()))?;
             let normed_attn = rms_norm(attn_out, post_attn, config.rms_eps)?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("attention_out", &normed_attn)?;
             let hidden = x.add(&normed_attn)?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("post_attention_residual", &hidden)?;
             let ffn_out = if let Some(parallel_moe) = &self.parallel_moe {
                 let post_ffn_1 = self.post_feedforward_norm_1.as_ref().ok_or_else(|| {
                     InferError::Config("Gemma4 sans post_feedforward_layernorm_1".to_string())
@@ -184,19 +192,37 @@ impl DecoderLayer {
                     InferError::Config("Gemma4 sans pre_feedforward_layernorm_2".to_string())
                 })?;
                 let dense_input = rms_norm(&hidden, pre_ffn, config.rms_eps)?;
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("dense_input", &dense_input)?;
                 let dense_out = mlp.forward_with_runtime(&dense_input, runtime)?;
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("dense_raw", &dense_out)?;
                 let dense_out = rms_norm(&dense_out, post_ffn_1, config.rms_eps)?;
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("dense_out", &dense_out)?;
                 let moe_input = rms_norm(&hidden, pre_ffn_2, config.rms_eps)?;
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("moe_input", &moe_input)?;
                 let moe_out =
                     parallel_moe.forward_with_router_source(&moe_input, &hidden, runtime)?;
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("moe_raw", &moe_out)?;
                 let moe_out = rms_norm(&moe_out, post_ffn_2, config.rms_eps)?;
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("moe_out", &moe_out)?;
                 dense_out.add(&moe_out)?
             } else {
                 let ffn_input = rms_norm(&hidden, pre_ffn, config.rms_eps)?;
                 mlp.forward_with_runtime(&ffn_input, runtime)?
             };
             let ffn_normed = rms_norm(&ffn_out, post_ffn, config.rms_eps)?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("ffn_sum", &ffn_out)?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("ffn_out", &ffn_normed)?;
             let mut output = hidden.add(&ffn_normed)?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("pre_scalar", &output)?;
             if let Some(layer_scalar) = &self.layer_scalar {
                 let scalar =
                     layer_scalar.data().first().copied().ok_or_else(|| {
@@ -701,6 +727,8 @@ impl DecoderLayer {
         }
         let norm_started = profile.then(Instant::now);
         let normed = rms_norm(x, &self.input_norm, config.rms_eps)?;
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("attention_input", &normed)?;
         let norm_elapsed = norm_started.map(|started| started.elapsed());
         let attention_started = profile.then(Instant::now);
         let attn_out = match &self.attention {
@@ -747,6 +775,8 @@ impl DecoderLayer {
         let total_started = profile.then(Instant::now);
         let norm_started = profile.then(Instant::now);
         let normed = rms_norm(x, &self.input_norm, config.rms_eps)?;
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("attention_input", &normed)?;
         let norm_elapsed = norm_started.map(|started| started.elapsed());
         let attention_started = profile.then(Instant::now);
         let attn_out = match &self.attention {
