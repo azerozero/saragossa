@@ -366,7 +366,12 @@ impl CausalDecoder {
         let decode_reserve = max_new_tokens + draft_limit.max(tree_budget) + 1;
         let (mut cache, final_state, target_hidden, captured_from) =
             crate::metal_backend::with_prefill_kv_reserve(decode_reserve, || {
-                self.prefill_cache_state_with_layer_capture_cached(prompt, layer_ids, keep_rows)
+                self.prefill_cache_state_with_layer_capture_cached(
+                    prompt,
+                    layer_ids,
+                    keep_rows,
+                    Some(draft),
+                )
             })?;
         let (captured_rows, captured_cols) = target_hidden.as_matrix()?;
         if captured_cols != context_cols {

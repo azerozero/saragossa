@@ -65,7 +65,11 @@ fn rejects_invalid_config_heads() {
 
 /// Frontend mel metal-rs ≡ golden mlx-rs figé (sans mlx-rs, sans modèle : DSP pur
 /// sur l'entrée PCM16k golden). Mêmes tolérances que `live_log_mel_*`.
+// NOTE: golden capturé sur Apple Silicon (aarch64) ; sur x86 les arrondis de la FFT
+// et de libm diffèrent (écart mesuré en CI Linux/Windows) : pas de tolérance
+// élargie, le test reste limité à l'architecture de capture.
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn golden_log_mel_matches_fixture() -> Result<()> {
     let (_, samples) = crate::golden::read_f32("whisper_samples16k")?;
     let (mel_shape, ref_mel) = crate::golden::read_f32("whisper_mel")?;

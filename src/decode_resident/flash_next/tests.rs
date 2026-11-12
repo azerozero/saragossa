@@ -484,11 +484,12 @@ fn n2_input_ids(golden: &std::path::Path) -> Vec<usize> {
         .get("input_ids")
         .expect("invariant: input_ids");
     let mut bytes = vec![0_u8; entry.data_offsets[1] - entry.data_offsets[0]];
-    use std::os::unix::fs::FileExt;
-    std::fs::File::open(&path)
-        .expect("invariant: golden")
-        .read_exact_at(&mut bytes, header.data_start + entry.data_offsets[0] as u64)
-        .expect("invariant: lecture input_ids");
+    crate::safetensor::pread_exact(
+        &std::fs::File::open(&path).expect("invariant: golden"),
+        &mut bytes,
+        header.data_start + entry.data_offsets[0] as u64,
+    )
+    .expect("invariant: lecture input_ids");
     bytes
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().expect("invariant: 8 octets")) as usize)
@@ -3222,17 +3223,18 @@ fn flash_next_rope_decode_matches_cpu_at_long_positions() -> Result<()> {
 
 /// Tenseur d'un golden safetensors : `(forme, octets)`.
 fn golden_tensor(path: &std::path::Path, name: &str) -> (Vec<usize>, Vec<u8>) {
-    use std::os::unix::fs::FileExt;
     let header = crate::qwen_loader::read_shard_header(path).expect("invariant: golden lisible");
     let entry = header
         .tensors
         .get(name)
         .unwrap_or_else(|| panic!("golden sans {name}"));
     let mut bytes = vec![0_u8; entry.data_offsets[1] - entry.data_offsets[0]];
-    std::fs::File::open(path)
-        .expect("invariant: golden")
-        .read_exact_at(&mut bytes, header.data_start + entry.data_offsets[0] as u64)
-        .expect("invariant: lecture golden");
+    crate::safetensor::pread_exact(
+        &std::fs::File::open(path).expect("invariant: golden"),
+        &mut bytes,
+        header.data_start + entry.data_offsets[0] as u64,
+    )
+    .expect("invariant: lecture golden");
     (entry.shape.clone(), bytes)
 }
 

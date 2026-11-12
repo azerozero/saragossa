@@ -1,3 +1,4 @@
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use super::super::*;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

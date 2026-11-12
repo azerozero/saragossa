@@ -266,7 +266,7 @@ pub(super) fn can_use_qmm_skinny(
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
-fn qmm_skinny_enabled() -> bool {
+pub(super) fn qmm_skinny_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMM_SKINNY", true))
 }
@@ -378,7 +378,7 @@ pub(super) fn qmm_skinny_min_batch() -> usize {
     })
 }
 
-fn qmm8_enabled() -> bool {
+pub(super) fn qmm8_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMM8", false))
 }

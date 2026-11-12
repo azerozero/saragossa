@@ -4,6 +4,54 @@ use crate::runtime_flags::{env_flag, gather_fast_mode, qmv_fast_mode};
 
 use super::*;
 
+/// Compilation Metal rapide, active par défaut (`SARAGOSSA_RUST_METAL_FAST_MATH=1`).
+/// `=0` désactive fast-math pour diagnostiquer les écarts numériques. Lu une fois
+/// au premier usage : régler avant de créer le runtime, puis relancer le processus.
+/// Les kernels déjà précis (quantification KV et FlashNext) le restent.
+///
+/// Limite : les appels explicites `fast::` restent rapides, même avec `=0`.
+/// Dans `src/kernels.metal`, les 22 appels sont tous des `fast::exp` :
+/// - `weighted_sum_add_grouped_topk_f32` (1) ;
+/// - `weighted_sum_add_shared_topk_f32` (1) ;
+/// - `affine_gather_down_weighted_shared_fast_u8_gs64_f32` (1) ;
+/// - `add_sigmoid_scaled_f32` (1) ;
+/// - `add_sigmoid_scaled_rows_f32` (1) ;
+/// - `whisper_attn_decode_vec64_f32` (3) ;
+/// - `causal_attention_prefill_batch_long_d128_f32` (2) ;
+/// - `attention_prefill_sink_body` (2) ;
+/// - `causal_attention_prefill_batch_long_d256_f32` (2) ;
+/// - `causal_attention_prefill_batch_gqa8x4_d256_f32` (8).
+///
+/// Les sources embarquées du decode résident et des assets peuvent aussi utiliser
+/// `fast::` : ce flag ne garantit donc pas une arithmétique précise partout.
+pub(super) fn metal_fast_math_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = METAL_FAST_MATH_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_METAL_FAST_MATH", true))
+}
+
+#[cfg(test)]
+thread_local! {
+    static METAL_FAST_MATH_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force les options des compilations sur ce thread le temps de `run`.
+#[cfg(test)]
+pub(crate) fn with_metal_fast_math_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            METAL_FAST_MATH_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(METAL_FAST_MATH_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
+}
+
 pub(crate) fn resident_concurrent_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_RESIDENT_CONCURRENT", false))
