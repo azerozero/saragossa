@@ -21,6 +21,16 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> Result<usize> {
         match weight {
+            LinearWeight::DenseShared(weight) => self.encode_dense_f32_weight(
+                encoder,
+                lhs_buffer,
+                weight.buffer(),
+                output_buffer,
+                batch,
+                in_dim,
+                weight.shape()[0],
+                weight.shape()[1],
+            ),
             LinearWeight::DenseBf16(weight) => self.encode_dense_bf16_weight(
                 encoder,
                 lhs_buffer,
@@ -69,11 +79,40 @@ impl MetalExecutor {
             )));
         }
         let rhs_buffer = self.cached_buffer_from_f32(weight.data(), "rhs")?;
+        self.encode_dense_f32_weight(
+            encoder,
+            lhs_buffer,
+            &rhs_buffer,
+            output_buffer,
+            batch,
+            in_dim,
+            out_dim,
+            rhs_in_dim,
+        )
+    }
+
+    #[inline]
+    fn encode_dense_f32_weight(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        rhs_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        rhs_in_dim: usize,
+    ) -> Result<usize> {
+        if in_dim != rhs_in_dim {
+            return Err(InferError::Dimension(format!(
+                "matmul Metal encodé x=[{batch},{in_dim}] rhs=[{out_dim},{rhs_in_dim}]"
+            )));
+        }
         if can_use_dense_qmv_fast(batch, in_dim, out_dim) {
             self.encode_owned_dense_qmv_fast(
                 encoder,
                 lhs_buffer,
-                &rhs_buffer,
+                rhs_buffer,
                 output_buffer,
                 batch,
                 in_dim,
@@ -83,7 +122,7 @@ impl MetalExecutor {
             self.encode_owned_dense_fallback(
                 encoder,
                 lhs_buffer,
-                &rhs_buffer,
+                rhs_buffer,
                 output_buffer,
                 batch,
                 in_dim,

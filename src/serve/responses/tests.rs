@@ -78,7 +78,6 @@ fn converts_function_history_and_checks_call_ids() {
         "input":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"weather","arguments":"{\"city\":\"Paris\"}"},
         {"type":"function_call_output","call_id":"call_1","output":"soleil"}]}),
     );
-    assert!(req.uses_tools);
     let messages = req.chat.template_messages();
     assert_eq!(messages[0].tool_calls.len(), 1);
     assert!(messages[0].tool_calls[0].contains("call_1"));
@@ -182,39 +181,38 @@ fn text_sse_order_identity_unicode_and_usage() {
 
 #[test]
 fn function_sse_buffers_fragmented_xml_and_preserves_call_identity() {
-    let tool = json!({"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}});
-    let parser = FlintOutputParser::new(vec![tool], true);
-    let mut bytes = Vec::new();
-    let mut sink = ResponsesSse::new(&mut bytes, Response::new(&request(json!({}))), Some(parser));
-    sink.event(CompletionStreamEvent::Start(&start()))
-        .expect("invariant: start");
-    for ch in "<tool_call>weather<arg_key>city</arg_key><arg_value>París 🌍</arg_value></tool_call>"
-        .chars()
-    {
-        sink.event(CompletionStreamEvent::Delta(&ch.to_string()))
-            .expect("invariant: delta");
+    use crate::serve::tool_output::ToolFamily;
+    for (family, text) in [
+        (ToolFamily::Flint, "<tool_call>weather<arg_key>city</arg_key><arg_value>París 🌍</arg_value></tool_call>"),
+        (ToolFamily::Qwen, "<tool_call><function=weather><parameter=city>París 🌍</parameter></function></tool_call>"),
+        (ToolFamily::Gemma4, "<|tool_call>call:weather{city:<|\"|>París 🌍<|\"|>}<tool_call|>"),
+    ] {
+        let tool = json!({"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}});
+        let parser = || ToolOutputParser::new(family, vec![tool.clone()], true);
+        let non_stream = output(text, Some(parser()));
+        assert_eq!(non_stream.as_array().expect("invariant: output").len(), 1);
+        assert_eq!(non_stream[0]["type"], "function_call");
+        assert_eq!(non_stream[0]["name"], "weather");
+        assert_eq!(non_stream[0]["arguments"], r#"{"city":"París 🌍"}"#);
+        let mut bytes = Vec::new();
+        let mut sink = ResponsesSse::new(&mut bytes, Response::new(&request(json!({}))), Some(parser()));
+        sink.event(CompletionStreamEvent::Start(&start())).expect("invariant: start");
+        for ch in text.chars() {
+            sink.event(CompletionStreamEvent::Delta(&ch.to_string())).expect("invariant: delta");
+        }
+        sink.finish(Ok(completion("stop"))).expect("invariant: fin");
+        let events = events(bytes);
+        assert_eq!(events.iter().map(|v| v["type"].as_str().expect("invariant: type")).collect::<Vec<_>>(), [
+            "response.created", "response.in_progress", "response.output_item.added",
+            "response.function_call_arguments.delta", "response.function_call_arguments.done",
+            "response.output_item.done", "response.completed"
+        ]);
+        assert_eq!(events[2]["item"]["arguments"], "");
+        assert_eq!(events[3]["delta"], non_stream[0]["arguments"]);
+        assert_eq!(events[3]["delta"], events[4]["arguments"]);
+        assert_eq!(events[2]["item"]["call_id"], events[5]["item"]["call_id"]);
+        assert_eq!(events[6]["response"]["output"][0], events[5]["item"]);
     }
-    sink.finish(Ok(completion("stop"))).expect("invariant: fin");
-    let events = events(bytes);
-    assert_eq!(
-        events
-            .iter()
-            .map(|v| v["type"].as_str().expect("invariant: type"))
-            .collect::<Vec<_>>(),
-        [
-            "response.created",
-            "response.in_progress",
-            "response.output_item.added",
-            "response.function_call_arguments.delta",
-            "response.function_call_arguments.done",
-            "response.output_item.done",
-            "response.completed"
-        ]
-    );
-    assert_eq!(events[2]["item"]["arguments"], "");
-    assert_eq!(events[3]["delta"], events[4]["arguments"]);
-    assert_eq!(events[2]["item"]["call_id"], events[5]["item"]["call_id"]);
-    assert_eq!(events[6]["response"]["output"][0], events[5]["item"]);
 }
 
 #[test]
@@ -268,6 +266,13 @@ fn reorders_parallel_results_by_call_id_for_positional_template() {
     ]}));
     let messages = req.chat.template_messages();
     assert_eq!(messages[0].tool_calls.len(), 2);
+    assert_eq!(messages[1].tool_call_id.as_deref(), Some("a"));
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("b"));
+    let rendered =
+        saragossa::chat_template::render_gemma4_chat_with_tools(&messages, &[], true, false);
+    assert!(rendered.contains("response:first{"));
+    assert!(rendered.contains("response:second{"));
+    assert!(!rendered.contains("response:unknown{"));
     assert_eq!(messages[1].content.as_deref(), Some("first result"));
     assert_eq!(messages[2].content.as_deref(), Some("second result"));
 }

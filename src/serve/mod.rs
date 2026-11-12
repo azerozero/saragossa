@@ -41,6 +41,7 @@ mod protocol;
 mod responses;
 mod state;
 pub(crate) mod streaming;
+mod tool_output;
 mod warmup;
 
 use std::error::Error;

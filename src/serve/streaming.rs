@@ -152,7 +152,7 @@ impl<'a> StreamingTextDetokenizer<'a> {
         let token = u32::try_from(token)
             .map_err(|_| ServeError::args(format!("token généré hors plage: {token}")))?;
         self.generated.push(token);
-        let decoded = self.assets.decode_tokens(&self.generated, true)?;
+        let decoded = decode_completion_tokens(self.assets, &self.generated)?;
         self.stopped = contains_stop(strip_empty_think_streaming(&decoded), self.stop_texts);
         let visible = streaming_visible_text(&decoded, self.stop_texts);
         self.emitter.emit_streaming(visible, on_event)
@@ -267,6 +267,35 @@ fn longest_stop_prefix_suffix_len(text: &str, stop_texts: &[String]) -> usize {
         }
     }
     hold
+}
+
+/// Conserve les seuls tokens de contrôle nécessaires au parseur Gemma 4.
+/// Les EOS et autres tokens spéciaux restent invisibles comme auparavant.
+pub(super) fn decode_completion_tokens(assets: &ModelAssets, ids: &[u32]) -> ServeResult<String> {
+    if !assets.config.is_gemma4() {
+        return Ok(assets.decode_tokens(ids, true)?);
+    }
+    let controls = [
+        "<|tool_call>",
+        "<tool_call|>",
+        "<|\"|>",
+        "<|channel>",
+        "<channel|>",
+    ];
+    let mut out = String::new();
+    let mut start = 0;
+    for (index, id) in ids.iter().enumerate() {
+        if let Some(marker) = controls
+            .iter()
+            .find(|marker| assets.tokenizer.token_to_id(marker) == Some(*id))
+        {
+            out.push_str(&assets.decode_tokens(&ids[start..index], true)?);
+            out.push_str(marker);
+            start = index + 1;
+        }
+    }
+    out.push_str(&assets.decode_tokens(&ids[start..], true)?);
+    Ok(out)
 }
 
 #[cfg(test)]

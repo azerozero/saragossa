@@ -8,7 +8,6 @@ use super::super::protocol::ChatCompletionRequest;
 pub(super) struct Request {
     pub chat: ChatCompletionRequest,
     pub options: Value,
-    pub uses_tools: bool,
 }
 
 fn invalid(field: &str) -> ServeError {
@@ -84,7 +83,6 @@ impl Request {
                 .ok_or_else(|| invalid("instructions"))?;
             messages.push(json!({"role":"system", "content":instructions}));
         }
-        let mut uses_tools = false;
         let mut calls = std::collections::HashSet::new();
         // Le template flint représente les retours par position. Les call_id
         // servent à les réordonner selon les appels, même s'ils arrivent à l'envers.
@@ -116,7 +114,6 @@ impl Request {
                             if !results.is_empty() {
                                 return Err(invalid("retours d'outils incomplets"));
                             }
-                            uses_tools = true;
                             let id = string(item, "call_id")?;
                             if !calls.insert(id.to_owned()) {
                                 return Err(invalid("call_id dupliqué"));
@@ -143,7 +140,6 @@ impl Request {
                             }
                         }
                         "function_call_output" => {
-                            uses_tools = true;
                             let id = string(item, "call_id")?;
                             if !pending.iter().any(|pending| pending == id)
                                 || results.contains_key(id)
@@ -156,7 +152,9 @@ impl Request {
                                     let content = results
                                         .remove(&id)
                                         .ok_or_else(|| invalid("call_id du retour"))?;
-                                    messages.push(json!({"role":"tool","content":content}));
+                                    messages.push(
+                                        json!({"role":"tool","tool_call_id":id,"content":content}),
+                                    );
                                 }
                             }
                         }
@@ -215,7 +213,6 @@ impl Request {
                 tools.push(json!({"type":"function", "function":function}));
             }
         }
-        uses_tools |= !tools.is_empty();
         let mut chat = json!({"model":value["model"],"messages":messages,"tools":tools});
         for key in [
             "temperature",
@@ -254,7 +251,6 @@ impl Request {
         Ok(Self {
             chat,
             options: value,
-            uses_tools,
         })
     }
 }

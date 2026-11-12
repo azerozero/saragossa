@@ -5,11 +5,12 @@ use std::io::Write;
 use serde_json::{json, Value};
 
 use super::error::{ServeError, ServeResult};
-use super::flint_output::{FlintEvent, FlintOutputParser};
+use super::flint_output::FlintEvent;
 use super::http::{send_json, write_headers};
 use super::protocol::{created_now, ChatCompletionChunk, ToolCall};
 use super::state::{ServeState, ServedCompletion};
 use super::streaming::{CompletionSink, CompletionStreamEvent};
+use super::tool_output::ToolOutputParser;
 
 mod request;
 #[cfg(test)]
@@ -22,19 +23,7 @@ pub(super) fn handle<S: Write>(
     body: &[u8],
 ) -> ServeResult<()> {
     let request = Request::parse(body, state.max_tokens_cap())?;
-    let flint = state.supports_response_tools(&request.chat.model)?;
-    if request.uses_tools && !flint {
-        return Err(ServeError::not_implemented(
-            "Responses: outils non supportés par ce modèle",
-        ));
-    }
-    let active_tools = request.chat.active_tools()?;
-    let parser = flint.then(|| {
-        FlintOutputParser::new(
-            active_tools.iter().map(|t| t.value.clone()).collect(),
-            request.chat.parallel_tool_calls(),
-        )
-    });
+    let parser = state.response_output_parser(&request.chat)?;
     let response = Response::new(&request);
     if request.chat.stream {
         let mut sink = ResponsesSse::new(stream, response, parser);
@@ -67,7 +56,7 @@ fn function(call: ToolCall) -> Value {
         "call_id":call.id,"name":call.function.name,"arguments":call.function.arguments})
 }
 
-fn output(content: &str, parser: Option<FlintOutputParser>) -> Value {
+fn output(content: &str, parser: Option<ToolOutputParser>) -> Value {
     let mut items = Vec::new();
     match parser {
         Some(parser) => {
@@ -133,12 +122,12 @@ impl Response {
     }
 }
 
-/// Les appels flint sont publiés après validation complète de leur XML : les
+/// Les appels sont publiés après validation complète par le parseur commun : les
 /// arguments arrivent en un delta JSON, sans exposer de fragment invalide.
 struct ResponsesSse<'a, S> {
     stream: &'a mut S,
     response: Response,
-    parser: Option<FlintOutputParser>,
+    parser: Option<ToolOutputParser>,
     started: bool,
     terminal: bool,
     sequence: u64,
@@ -147,7 +136,7 @@ struct ResponsesSse<'a, S> {
 }
 
 impl<'a, S: Write> ResponsesSse<'a, S> {
-    fn new(stream: &'a mut S, response: Response, parser: Option<FlintOutputParser>) -> Self {
+    fn new(stream: &'a mut S, response: Response, parser: Option<ToolOutputParser>) -> Self {
         Self {
             stream,
             response,
@@ -230,7 +219,7 @@ impl<'a, S: Write> ResponsesSse<'a, S> {
         )
     }
 
-    fn flint_events(&mut self, events: Vec<FlintEvent>) -> ServeResult<()> {
+    fn tool_events(&mut self, events: Vec<FlintEvent>) -> ServeResult<()> {
         for event in events {
             match event {
                 // Le profil ne fournit pas de sortie reasoning ni de reprise de celle-ci.
@@ -306,7 +295,7 @@ impl<S: Write> CompletionSink for ResponsesSse<'_, S> {
             CompletionStreamEvent::Delta(delta) => match self.parser.as_mut() {
                 Some(parser) => {
                     let events = parser.push(delta);
-                    self.flint_events(events)
+                    self.tool_events(events)
                 }
                 None => self.text(delta),
             },
@@ -325,7 +314,7 @@ impl<S: Write> CompletionSink for ResponsesSse<'_, S> {
         };
         if let Some(parser) = self.parser.as_mut() {
             let events = parser.finish();
-            self.flint_events(events)?;
+            self.tool_events(events)?;
         } else if self.items.is_empty() {
             self.text("")?;
         }
