@@ -3103,8 +3103,15 @@ fn mtp_seed_bf16_streamed_bit_exact_and_adopted() -> Result<()> {
     for private in [false, true] {
         crate::metal_backend::flags::with_private_scratch_override(private, || -> Result<()> {
             let executor = MetalExecutor::new()?;
-            for (seq, chunk) in [(129, 4096), (1928, 1500), (4097, 4096), (8297, 1500)] {
+            // En scratch partagé, le semis intégré exige plusieurs morceaux.
+            // 1025/512 donne trois morceaux (342, 342, 341), tous > 256
+            // pour ouvrir Steel/NAX dès le premier, et un seul bloc MTP.
+            for (seq, chunk) in [(1025, 512), (1928, 1500), (4097, 4096), (8297, 1500)] {
                 check_mtp_seed_streamed(&executor, seq, chunk, true)?;
+            }
+            // Le monobloc n'a une norme finale GPU qu'en scratch privé.
+            if private {
+                check_mtp_seed_streamed(&executor, 129, 4096, true)?;
             }
             Ok(())
         })?;

@@ -4222,8 +4222,13 @@ fn kv_quant_logit_drift_vs_bf16_real_model() -> Result<()> {
 /// (16 têtes Q, 2 K/V, QK-norm, MLP SwiGLU) : la forme qu'emprunte le
 /// prefill résident par morceaux avec K/V stocké en bf16 (NAX d256).
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn resident_bf16_qwen_weights(vocab: usize, hidden: usize) -> Result<HashMap<String, Tensor>> {
+fn resident_bf16_qwen_weights(
+    vocab: usize,
+    hidden: usize,
+    attn_output_gate: bool,
+) -> Result<HashMap<String, Tensor>> {
     let (q_heads, kv_heads, head_dim, inter) = (16, 2, 256, 32);
+    let q_proj_dim = q_heads * head_dim * if attn_output_gate { 2 } else { 1 };
     let tensor = |rows: usize, cols: usize, seed: usize, scale: f32| {
         let data = (0..rows * cols)
             .map(|i| ((i * 7919 + seed * 104_729) as f32 * 0.000_37).sin() * scale)
@@ -4248,7 +4253,7 @@ fn resident_bf16_qwen_weights(vocab: usize, hidden: usize) -> Result<HashMap<Str
         ("layers.0.input_layernorm.weight", norm(hidden, 2)?),
         (
             "layers.0.self_attn.q_proj.weight",
-            tensor(q_heads * head_dim, hidden, 3, 0.06)?,
+            tensor(q_proj_dim, hidden, 3, 0.06)?,
         ),
         (
             "layers.0.self_attn.k_proj.weight",
@@ -4312,14 +4317,16 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         rope_theta: Some(10_000_000.0),
         ..CausalDecoderConfig::default()
     };
-    let model =
-        match CausalDecoder::from_tensors(resident_bf16_qwen_weights(VOCAB, HIDDEN)?, config)?
-            .with_metal_runtime()
-        {
-            Ok(model) => model,
-            Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
-            Err(error) => return Err(error),
-        };
+    let model = match CausalDecoder::from_tensors(
+        resident_bf16_qwen_weights(VOCAB, HIDDEN, false)?,
+        config,
+    )?
+    .with_metal_runtime()
+    {
+        Ok(model) => model,
+        Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
+        Err(error) => return Err(error),
+    };
     let ids = |len: usize, step: usize, offset: usize| -> Vec<usize> {
         (0..len).map(|i| (i * step + offset) % VOCAB).collect()
     };
@@ -6068,10 +6075,13 @@ fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
         num_key_value_heads: 2,
         head_dim: Some(256),
         rope_theta: Some(10_000_000.0),
+        // Le vérificateur dense batché exige une porte de sortie ; la
+        // projection Q porte donc Q et gate, dans le tronc comme dans MTP.
+        attn_output_gate: true,
         ..CausalDecoderConfig::default()
     };
-    let mut model =
-        CausalDecoder::from_tensors(resident_bf16_qwen_weights(VOCAB, HIDDEN)?, config)?;
+    let weights = resident_bf16_qwen_weights(VOCAB, HIDDEN, config.attn_output_gate)?;
+    let mut model = CausalDecoder::from_tensors(weights, config)?;
     let layer = &model.layers[0];
     let AttentionBlock::Full(attention) = &layer.attention else {
         return Err(InferError::Config("fixture sans attention complète".into()));
