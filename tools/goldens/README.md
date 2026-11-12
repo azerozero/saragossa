@@ -195,8 +195,35 @@ Les oracles stricts (qwen38, gemma3 et les deux contrôles float32) exigent
 l'argmax exact et affichent sa marge log-p top1/top2 ; une marge
 ≤ 0,01 est signalée `near_tie`, sans masquer l'échec. La KL est calculée sur
 21 catégories (top-20 référence + masse restante), seuil 0,02 nat ; le maximum
-Δp sur cette partition doit être ≤ 0,02. Ce n'est pas la KL complète du vocabulaire.
-Ces seuils sont provisoires, non validés par une exécution GPU.
+Δp sur cette partition doit être ≤ 0,05. Ce n'est pas la KL complète du vocabulaire.
+Les seuils font foi dans `src/golden/logits.rs` (`MAX_KL21`, `MAX_DELTA_P`) ;
+le champ `tolerance` des captures antérieures au 13 nov. 2026 garde l'ancien
+texte provisoire (Δp ≤ 0,02).
+
+### Calibration des seuils KL et Δp
+
+Mesure du 13 nov. 2026. Le seuil Δp provisoire de 0,02 n'avait jamais été
+validé sur GPU. Le gate est par pas, sans échec toléré sur 96 : seul le
+maximum compte. La preuve directe vient des modèles denses conformes :
+
+| comparaison | mismatches | KL21 max | Δp max |
+|---|---|---|---|
+| saragossa / mlx bf16, qwen38 | 0/96 | 0,0017 | 0,028 |
+| saragossa / mlx bf16, gemma3 | 1/96 (near-tie) | 0,0033 | 0,039 |
+
+Ordre de grandeur attendu : avec tous les logits arrondis à ±½ ulp bf16
+(0,0625 pour |logit| ∈ [16, 32[), une probabilité bouge d'au plus δ/2 ≈ 0,031,
+et la comparaison cumule deux chemins bf16 (saragossa et mlx). Le seuil
+`MAX_DELTA_P = 0,05` garde environ 28 % de marge sur le pire mesuré.
+
+Repère indirect : la capture mlx bf16 de Qwen3.6 MoE s'écarte de sa propre
+capture float32 avec Δp p50 0,0045, p95 0,037, max 0,22 et KL21 p95 0,0077
+(82 pas à préfixe commun, `reference_noise.py qwen36_moe`). Ce modèle est un
+MoE à routage bruité. Le script borne par le haut la probabilité f32 des
+70 ids (sur 1 640) absents du top-20 f32, ce qui biaise sa KL vers le bas.
+Gemma 4 n'entre pas dans la calibration (p95 Δp 0,41, quasi-égalités de
+routage). La KL reste à 0,02 : les modèles conformes sont 6 à 12 fois en
+dessous. L'argmax exact reste exigé, near-tie compris.
 
 Les comparaisons bf16 de Gemma 4 et Qwen3.6 MoE deviennent des rapports
 d'écarts connus : chaque pas affiche `mismatch`, `near_tie`, `KL21` et

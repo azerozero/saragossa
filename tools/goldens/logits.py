@@ -61,7 +61,7 @@ def main():
         source["float32_control"] = True
         stem += "_f32"
     write_json("logits", stem, dict(model=args.model, cases=cases), source,
-               "greedy exact; near-tie logprob margin <= 0.01; top20+other KL <= 0.02; max delta-p <= 0.02",
+               "greedy exact; near-tie logprob margin <= 0.01; top20+other KL <= 0.02; max delta-p <= 0.05",
                decoding="16 steps including EOS; no sampling or logits processors; reference-prefix teacher forcing")
 
 
