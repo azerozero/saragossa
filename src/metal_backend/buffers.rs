@@ -908,6 +908,10 @@ impl MetalExecutor {
         if len == 0 {
             return Err(InferError::Metal(format!("buffer {label} vide")));
         }
+        #[cfg(test)]
+        if let Some(result) = super::prefill::allocate_phase_scratch_for_test(self, len, label) {
+            return result;
+        }
         self.scratch_buffer_with_options(
             len,
             MetalBufferElement::F32,

@@ -17,6 +17,12 @@ pub(crate) use self::resident::with_prefill_kv_reserve;
 #[cfg(test)]
 pub(crate) use self::resident::{with_router_capture, RouterCapture};
 mod scratch;
+mod scratch_phases;
+#[cfg(test)]
+pub(super) use scratch_phases::test_support::allocate_phase_scratch_for_test;
+pub(super) use scratch_phases::{
+    PHASE_GATE, PHASE_NORM, PHASE_OUTPUT, PHASE_Q_CONTEXT, PHASE_ROPE_GATED,
+};
 #[cfg(test)]
 mod sink_tests;
 #[cfg(test)]

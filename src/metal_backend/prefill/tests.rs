@@ -2834,6 +2834,281 @@ fn mtp_seed_streamed_private_scratch_bit_exact() -> Result<()> {
     })
 }
 
+/// Les mêmes phases résidentes, avec ou sans alias, doivent conserver les bits
+/// à travers GDN -> attention gatée -> MLP, y compris le morceau court.
+#[test]
+fn prefill_mixed_phase_aliases_match_distinct_storage_bit_exact() -> Result<()> {
+    for private in [false, true] {
+        with_private_scratch_override(private, check_mixed_phase_aliases)?;
+    }
+    Ok(())
+}
+
+fn check_mixed_phase_aliases() -> Result<()> {
+    use super::scratch_phases::test_support::with_phase_allocations;
+
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    const SEQ: usize = 513;
+    const CHUNK: usize = 257;
+    const HIDDEN: usize = 64;
+    const Q_HEADS: usize = 16;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 256;
+    const INTER: usize = 32;
+    const VALUE_DIM: usize = Q_HEADS * HEAD_DIM;
+    const VALUE_HEADS: usize = VALUE_DIM / 128;
+    const CONV_DIM: usize = 2 * 128 + VALUE_DIM;
+    // Les formes Steel/NAX autorisent le découpage dès 257 lignes.
+    // Chemin de production 27B : dk128/dv128, noyau conv 4.
+    let linear_spec = LinearAttentionStepSpec {
+        num_key_heads: 1,
+        num_value_heads: VALUE_HEADS,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel_dim: 4,
+        rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
+    };
+    let dims = LinearAttnResidentDims {
+        in_dim: HIDDEN,
+        conv_dim: CONV_DIM,
+        value_dim: VALUE_DIM,
+        key_dim: 128,
+    };
+
+    let input = deterministic_tensor(SEQ, HIDDEN, 601, 0.5)?;
+    let input_norm = deterministic_norm(HIDDEN, 607)?;
+    let post_norm = deterministic_norm(HIDDEN, 613)?;
+    let gate = Linear::new(deterministic_tensor(INTER, HIDDEN, 617, 0.1)?, None)?;
+    let up = Linear::new(deterministic_tensor(INTER, HIDDEN, 619, 0.1)?, None)?;
+    let down = Linear::new(deterministic_tensor(HIDDEN, INTER, 631, 0.1)?, None)?;
+    let in_proj_qkv = Linear::new(deterministic_tensor(CONV_DIM, HIDDEN, 641, 0.08)?, None)?;
+    let in_proj_z = Linear::new(deterministic_tensor(VALUE_DIM, HIDDEN, 643, 0.08)?, None)?;
+    let in_proj_b = Linear::new(deterministic_tensor(VALUE_HEADS, HIDDEN, 647, 0.08)?, None)?;
+    let in_proj_a = Linear::new(deterministic_tensor(VALUE_HEADS, HIDDEN, 653, 0.08)?, None)?;
+    let out_proj = Linear::new(deterministic_tensor(HIDDEN, VALUE_DIM, 659, 0.05)?, None)?;
+    let conv_weight = Tensor::from_vec(
+        vec![CONV_DIM, 4, 1],
+        deterministic_tensor(CONV_DIM, 4, 661, 0.3)?.data().to_vec(),
+    )?;
+    let a_log = (0..VALUE_HEADS)
+        .map(|i| deterministic_value(665, i, 0.2))
+        .collect::<Vec<_>>();
+    let dt_bias = (0..VALUE_HEADS)
+        .map(|i| deterministic_value(667, i, 0.15))
+        .collect::<Vec<_>>();
+    let norm_weight = deterministic_norm(128, 673)?;
+    let q_norm = deterministic_norm(HEAD_DIM, 677)?;
+    let k_norm = deterministic_norm(HEAD_DIM, 683)?;
+    let q_proj = Linear::new(
+        deterministic_tensor(2 * Q_HEADS * HEAD_DIM, HIDDEN, 691, 0.06)?,
+        None,
+    )?;
+    let k_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 701, 0.06)?,
+        None,
+    )?;
+    let v_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 709, 0.06)?,
+        None,
+    )?;
+    let o_proj = Linear::new(
+        deterministic_tensor(HIDDEN, Q_HEADS * HEAD_DIM, 719, 0.02)?,
+        None,
+    )?;
+    let spec = PrefillAttentionSpec {
+        seq: SEQ,
+        hidden_dim: HIDDEN,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        rope_theta: 10_000_000.0,
+        attn_scalar: HEAD_DIM as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let tail = PrefillMoeTail::Dense {
+        gate_proj: &gate,
+        up_proj: &up,
+        down_proj: &down,
+    };
+    let layers = [
+        PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Linear {
+                weights: LinearAttnResidentWeights {
+                    in_proj_qkv: &in_proj_qkv,
+                    in_proj_z: &in_proj_z,
+                    in_proj_b: &in_proj_b,
+                    in_proj_a: &in_proj_a,
+                    out_proj: &out_proj,
+                    conv_weight: &conv_weight,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    norm_weight: norm_weight.data(),
+                },
+                spec: linear_spec,
+                dims,
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail,
+        },
+        PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Full {
+                q_proj: &q_proj,
+                k_proj: &k_proj,
+                v_proj: &v_proj,
+                o_proj: &o_proj,
+                q_norm: &q_norm,
+                k_norm: &k_norm,
+                gated: true,
+                sinks: None,
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail,
+        },
+    ];
+    assert_eq!(dims.value_dim, Q_HEADS * HEAD_DIM);
+    assert!(executor.prefill_resident_extend_supported(&layers));
+    let run = || {
+        executor.qwen_moe_prefill_resident_with_captures(
+            PrefillInput::Hidden(&input),
+            &layers,
+            spec,
+            None,
+            &[0, 1],
+            usize::MAX,
+            CHUNK,
+            false,
+        )
+    };
+    let (expected, distinct) = with_phase_allocations(true, run);
+    let (expected, expected_caches, expected_captures) = expected?;
+    // Matérialiser avant le second run : aucun résultat ne sert d'oracle
+    // en restant une vue sur un scratch que ce run pourrait écraser.
+    let expected = expected.into_tensor(HIDDEN)?;
+    let (actual, shared) = with_phase_allocations(false, run);
+    let (actual, actual_caches, actual_captures) = actual?;
+    let actual = actual.into_tensor(HIDDEN)?;
+    assert!(actual.data().iter().all(|x| x.is_finite()));
+    assert!(actual.data().iter().any(|&x| x != 0.0));
+    assert_bit_exact(&actual, &expected, "phases mixtes sortie");
+    let (Some(actual_captures), Some(expected_captures)) = (actual_captures, expected_captures)
+    else {
+        return Err(InferError::Config(
+            "captures des deux couches absentes".into(),
+        ));
+    };
+    assert_eq!(actual_captures.from, 0);
+    assert_eq!(expected_captures.from, 0);
+    assert_eq!(actual_captures.hidden.shape(), &[SEQ, 2 * HIDDEN]);
+    assert_bit_exact(
+        &actual_captures.hidden,
+        &expected_captures.hidden,
+        "phases mixtes captures",
+    );
+    match (actual_caches.as_slice(), expected_caches.as_slice()) {
+        (
+            [PrefillResidentLayerCache::Linear { state: a }, PrefillResidentLayerCache::Full { .. }],
+            [PrefillResidentLayerCache::Linear { state: b }, PrefillResidentLayerCache::Full { .. }],
+        ) => {
+            assert_full_kv_bit_exact(&actual_caches, &expected_caches, "phases mixtes K/V")?;
+            assert_eq!(a.conv_len, b.conv_len);
+            assert_eq!(a.ssm_len, b.ssm_len);
+            assert_eq!(a.ssm_bf16, b.ssm_bf16);
+            for (a, b, len, bf16) in [
+                (&a.conv, &b.conv, a.conv_len, false),
+                (&a.ssm, &b.ssm, a.ssm_len, a.ssm_bf16),
+            ] {
+                if bf16 {
+                    assert_eq!(read_u16_buffer(a, len)?, read_u16_buffer(b, len)?);
+                } else {
+                    let bits = |buffer: &BufferRef| -> Result<Vec<u32>> {
+                        Ok(read_f32_buffer(buffer, len)?
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect())
+                    };
+                    assert_eq!(bits(a)?, bits(b)?, "phases mixtes état GDN");
+                }
+            }
+        }
+        _ => return Err(InferError::Config("caches GDN + full attendus".into())),
+    }
+    let mode = if private_scratch_enabled() {
+        metal::MTLStorageMode::Private
+    } else {
+        metal::MTLStorageMode::Shared
+    };
+    assert_eq!(shared.len(), distinct.len());
+    let mut distinct_addresses = std::collections::HashSet::new();
+    for (a, b) in shared.iter().zip(&distinct) {
+        assert_eq!((a.label, a.requested), (b.label, b.requested));
+        assert_eq!(a.buffer.storage_mode(), mode);
+        assert_eq!(b.buffer.storage_mode(), mode);
+        assert!(
+            distinct_addresses.insert(b.buffer.as_ptr() as usize),
+            "oracle sans alias"
+        );
+    }
+    // Chaque chunk alloue les deux couches réelles : Q/contexte/Z, RoPE/
+    // gated, gate/Y, O/down, input/postnorm. Le dernier GDN demande 256 lignes
+    // et reprend le stockage de 257 lignes de l'attention complète.
+    let mut shared_addresses = std::collections::HashSet::new();
+    for (label, width, per_chunk) in [
+        (PHASE_Q_CONTEXT, dims.value_dim, 3),
+        (PHASE_ROPE_GATED, dims.value_dim, 3),
+        (PHASE_GATE, dims.value_dim, 2),
+        (PHASE_OUTPUT, HIDDEN, 4),
+        (PHASE_NORM, HIDDEN, 4),
+    ] {
+        let allocations = shared
+            .iter()
+            .filter(|a| a.label == label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            allocations.len(),
+            2 * per_chunk,
+            "{label}: deux morceaux et deux couches"
+        );
+        let address = allocations[0].buffer.as_ptr();
+        assert!(
+            shared_addresses.insert(address as usize),
+            "phases indépendantes"
+        );
+        for a in &allocations {
+            assert_eq!(a.buffer.as_ptr(), address, "{label}: partage effectif");
+            assert_eq!(a.buffer.length(), (CHUNK * width * 4) as u64);
+        }
+        if width == dims.value_dim {
+            assert_eq!(
+                allocations
+                    .iter()
+                    .filter(|a| a.requested == (CHUNK - 1) * width)
+                    .count(),
+                1,
+                "{label}: dernier GDN court réellement exécuté"
+            );
+        }
+    }
+    eprintln!(
+        "phases mixtes {mode:?}: 257+256 lignes, {} demandes, {} buffers partagés, {} distincts; bits identiques",
+        shared.len(), shared_addresses.len(), distinct_addresses.len(),
+    );
+    Ok(())
+}
+
 #[test]
 fn mtp_seed_quantized_nax_partial_903_bit_exact() -> Result<()> {
     use super::super::matmul_select::{AffineMatmulKernel, OFFSET_TEST_KERNEL};
