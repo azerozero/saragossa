@@ -104,6 +104,51 @@ fn json_object_completion_is_parseable_with_tiny_model() {
     serde_json::from_str::<serde_json::Value>(&completion.content)
         .expect("invariant: sortie JSON parseable");
     assert_eq!(completion.content, "{}");
+    assert_eq!(completion.finish_reason, "stop");
+}
+
+#[test]
+fn json_object_stops_before_whitespace_with_or_without_remaining_budget() {
+    for streaming in [false, true] {
+        for budget in [1, 256] {
+            // Logits égaux : sans masque terminal, l'espace (id 1) gagne
+            // systématiquement face à EOS (id 2) après l'objet vide (id 0).
+            let mut loaded = tiny_loaded_model_with_vocab(r#"{"{}":0," ":1,"<eos>":2}"#, "{}");
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "tiny", "messages": [{"role": "user", "content": "JSON"}],
+                "temperature": 0, "max_tokens": budget, "stream": streaming,
+                "response_format": {"type": "json_object"}
+            }))
+            .expect("requête JSON");
+            let mut deltas = String::new();
+            let completion = if streaming {
+                loaded.complete_streaming(
+                    request,
+                    budget,
+                    None,
+                    &MemoryGuard::serve(),
+                    &mut |event| {
+                        if let CompletionStreamEvent::Delta(delta) = event {
+                            deltas.push_str(delta);
+                        }
+                        Ok(())
+                    },
+                )
+            } else {
+                loaded.complete(request, budget, None, &MemoryGuard::serve())
+            }
+            .expect("objet fermé");
+            assert_eq!(completion.content, "{}");
+            assert_eq!(completion.finish_reason, "stop");
+            assert_eq!(
+                serde_json::to_value(completion.usage).expect("usage")["completion_tokens"],
+                1
+            );
+            if streaming {
+                assert_eq!(deltas, "{}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -198,6 +243,7 @@ fn json_lines_streaming_multiple_objects_finishes_normally() {
     assert_eq!(deltas, completion.content);
     assert!(!saw_terminal_error);
     assert_eq!(completion.content.matches('\n').count(), 2);
+    assert_eq!(completion.finish_reason, "length");
     for line in completion.content.split('\n') {
         let value: serde_json::Value =
             serde_json::from_str(line).expect("invariant: ligne NDJSON parseable");
@@ -221,6 +267,7 @@ fn json_lines_completion_returns_full_ndjson_content() {
         .expect("invariant: NDJSON non-stream terminé sur une frontière");
 
     assert_eq!(completion.content.matches('\n').count(), 2);
+    assert_eq!(completion.finish_reason, "length");
     for line in completion.content.split('\n') {
         let value: serde_json::Value =
             serde_json::from_str(line).expect("invariant: ligne NDJSON parseable");

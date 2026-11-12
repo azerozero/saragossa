@@ -917,7 +917,18 @@ impl LoadedModel {
             &generated,
         )?);
         let matched_stop = matched_text_stop(&decoded, &prepared.stop_texts);
-        let finish_reason = if output.tokens.len() >= prepared.max_tokens && matched_stop.is_none()
+        // La fermeture racine termine json_object même lorsqu'elle consomme
+        // le dernier token du budget : aucun pas supplémentaire pour EOS
+        // n'est alors disponible. Une frontière NDJSON reste prolongeable.
+        let completed_json_object = prepared.response_format == ResponseFormatMode::JsonObject
+            && prepared
+                .options
+                .token_constraint
+                .as_ref()
+                .is_some_and(|constraint| constraint.is_finished());
+        let finish_reason = if output.tokens.len() >= prepared.max_tokens
+            && matched_stop.is_none()
+            && !completed_json_object
         {
             "length"
         } else {
@@ -1585,6 +1596,9 @@ fn check_thinking(requested: Option<bool>, renders_off: bool) -> ServeResult<()>
 
 #[cfg(test)]
 mod json_tests;
+
+#[cfg(test)]
+mod gemma_json_tests;
 
 #[cfg(test)]
 mod batch_drive_tests;

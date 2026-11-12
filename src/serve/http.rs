@@ -24,8 +24,9 @@ use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
 use super::flint_output::FlintEvent;
 use super::protocol::{
-    json_bytes, sse_done, sse_event, AssistantMessage, ChatCompletionChunk, ChatCompletionRequest,
-    ChatCompletionResponse, HealthResponse, ModelsResponse, ResponseFormatMode, StreamErrorEvent,
+    created_now, json_bytes, sse_done, sse_event, AssistantMessage, ChatCompletionChunk,
+    ChatCompletionRequest, ChatCompletionResponse, HealthResponse, ModelInfo, ModelsResponse,
+    ResponseFormatMode, StreamErrorEvent,
 };
 use super::state::{ServeState, ServedCompletion};
 use super::streaming::{CompletionSink, CompletionStreamEvent};
@@ -141,7 +142,7 @@ pub(super) fn read_or_reject<S: Read + Write, T>(
     read: impl FnOnce(&mut S) -> ServeResult<T>,
 ) -> ServeResult<T> {
     read(stream).inspect_err(|error| {
-        let _ = send_error(stream, error_status(error), &error.to_string());
+        let _ = send_failure(stream, error, false);
     })
 }
 
@@ -163,7 +164,7 @@ pub(super) fn send_route_error<S: Write>(
 /// Tente d'envoyer une réponse d'erreur avant de propager l'échec.
 pub(super) fn reply_on_error<S: Write>(stream: &mut S, result: ServeResult<()>) -> ServeResult<()> {
     result.inspect_err(|error| {
-        let _ = send_error(stream, error_status(error), &error.to_string());
+        let _ = send_failure(stream, error, false);
     })
 }
 
@@ -195,7 +196,41 @@ pub(super) fn route_front<S: Write>(
         let models = ModelsResponse::from_ids(&front.model_ids);
         return Some(send_json(stream, 200, &models, Vec::new()));
     }
+    if request.method == "GET" {
+        if let Some(id) = path.strip_prefix("/v1/models/") {
+            let id = match decode_model_id(id) {
+                Ok(id) => id,
+                Err(error) => return Some(send_failure(stream, &error, false)),
+            };
+            return Some(if front.model_ids.iter().any(|model| model == &id) {
+                send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
+            } else {
+                send_failure(stream, &ServeError::UnknownModel(id), false)
+            });
+        }
+    }
     None
+}
+
+/// Décode le suffixe après routage : `%2F` et `%3F` appartiennent à l'alias,
+/// `+` reste littéral et `%25` ne déclenche jamais un second décodage.
+fn decode_model_id(encoded: &str) -> ServeResult<String> {
+    let invalid = || ServeError::Http("encodage URL du modèle invalide".to_string());
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            let low = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            match (high, low) {
+                (Some(high), Some(low)) => decoded.push((high * 16 + low) as u8),
+                _ => return Err(invalid()),
+            }
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| invalid())
 }
 
 /// Traite sur le thread moteur une requête déjà authentifiée par
@@ -223,7 +258,7 @@ fn route_engine<S: Write>(
             &request.body,
         ) {
             Ok(()) => Ok(()),
-            Err(error) => send_anthropic_error(stream, error_status(&error), &error.to_string()),
+            Err(error) => send_failure(stream, &error, true),
         },
         ("POST", "/v1/audio/transcriptions") => handle_transcription(
             stream,
@@ -381,7 +416,7 @@ pub(super) fn handle_batch<S: Write>(state: &mut ServeState, jobs: &mut [(&mut S
         if let Err(error) = outcome {
             let (stream, request) = &mut jobs[index];
             eprintln!("saragossa serve request error: {error}");
-            let _ = send_route_error(*stream, request, error_status(&error), &error.to_string());
+            let _ = send_failure(*stream, &error, request.route() == "/v1/messages");
         }
     }
     // NOTE: l'analyse est déterministe, ce cas ne survient pas ; le solo
@@ -406,6 +441,7 @@ fn flint_finish_reason(finish_reason: &'static str, has_tool_calls: bool) -> &'s
 fn write_flint_events<S: Write>(
     stream: &mut S,
     id: &str,
+    created: u64,
     include_usage: bool,
     model: &str,
     events: Vec<FlintEvent>,
@@ -416,7 +452,12 @@ fn write_flint_events<S: Write>(
             FlintEvent::Content(text) => ChatCompletionChunk::content(model, text),
             FlintEvent::ToolCall(call) => ChatCompletionChunk::tool_call(model, call),
         };
-        write_sse_event(stream, &chunk.with_id(id).with_usage_option(include_usage))?;
+        write_sse_event(
+            stream,
+            &chunk
+                .with_identity(id, created)
+                .with_usage_option(include_usage),
+        )?;
     }
     Ok(())
 }
@@ -443,6 +484,8 @@ struct OpenAiSse<'a, S> {
     include_usage: bool,
     /// Identifiant commun à tous les chunks du flux.
     id: String,
+    /// Timestamp capturé une seule fois à l’ouverture du flux.
+    created: u64,
 }
 
 impl<'a, S: Write> OpenAiSse<'a, S> {
@@ -454,6 +497,7 @@ impl<'a, S: Write> OpenAiSse<'a, S> {
             model: String::new(),
             include_usage,
             id: ChatCompletionChunk::stream_id(),
+            created: created_now(),
         }
     }
 
@@ -481,7 +525,7 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
                 write_sse_event(
                     self.stream,
                     &ChatCompletionChunk::role(&start.model)
-                        .with_id(&self.id)
+                        .with_identity(&self.id, self.created)
                         .with_usage_option(self.include_usage),
                 )?;
             }
@@ -494,6 +538,7 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
                         write_flint_events(
                             self.stream,
                             &self.id,
+                            self.created,
                             self.include_usage,
                             &self.model,
                             parser.push(delta),
@@ -502,7 +547,7 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
                     None => write_sse_event(
                         self.stream,
                         &ChatCompletionChunk::content(&self.model, delta.to_string())
-                            .with_id(&self.id)
+                            .with_identity(&self.id, self.created)
                             .with_usage_option(self.include_usage),
                     )?,
                 }
@@ -531,6 +576,7 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
             write_flint_events(
                 self.stream,
                 &self.id,
+                self.created,
                 self.include_usage,
                 &completion.model,
                 parser.finish(),
@@ -540,13 +586,14 @@ impl<S: Write> CompletionSink for OpenAiSse<'_, S> {
         write_sse_event(
             self.stream,
             &ChatCompletionChunk::done(&completion.model, finish_reason)
-                .with_id(&self.id)
+                .with_identity(&self.id, self.created)
                 .with_usage_option(self.include_usage),
         )?;
         if self.include_usage {
             write_sse_event(
                 self.stream,
-                &ChatCompletionChunk::usage(&completion.model, completion.usage).with_id(&self.id),
+                &ChatCompletionChunk::usage(&completion.model, completion.usage)
+                    .with_identity(&self.id, self.created),
             )?;
         }
         self.stream
@@ -583,6 +630,36 @@ pub(super) fn send_json<S: Write, T: Serialize>(
     stream
         .flush()
         .map_err(|e| ServeError::io("flush réponse JSON", e))
+}
+
+/// Conserve les détails typés que les clients utilisent pour traiter l'erreur.
+fn send_failure<S: Write>(stream: &mut S, error: &ServeError, anthropic: bool) -> ServeResult<()> {
+    let status = error_status(error);
+    let anthropic = anthropic || matches!(error, ServeError::BodyTooLarge { anthropic: true });
+    let (code, param) = match error {
+        ServeError::UnknownModel(_) => (Some("model_not_found"), Some("model")),
+        ServeError::InvalidParameter { param, .. } => (None, Some(*param)),
+        _ => {
+            return if anthropic {
+                send_anthropic_error(stream, status, &error.to_string())
+            } else {
+                send_error(stream, status, &error.to_string())
+            };
+        }
+    };
+    let mut body = serde_json::json!({"error": {
+        "message": error.to_string(),
+        "type": if anthropic && status == 404 { "not_found_error" } else { "invalid_request_error" }
+    }});
+    if anthropic {
+        body["type"] = "error".into();
+    } else if let Some(param) = param {
+        body["error"]["param"] = param.into();
+    }
+    if let Some(code) = code {
+        body["error"]["code"] = code.into();
+    }
+    send_json(stream, status, &body, Vec::new())
 }
 
 pub(super) fn send_error<S: Write>(stream: &mut S, status: u16, message: &str) -> ServeResult<()> {
@@ -631,6 +708,8 @@ fn error_status(error: &ServeError) -> u16 {
         ServeError::Args(_)
         | ServeError::Json { .. }
         | ServeError::Http(_)
+        | ServeError::BodyTooLarge { .. }
+        | ServeError::InvalidParameter { .. }
         | ServeError::IncompleteJson(_) => 400,
         ServeError::NotImplemented(_) => 501,
         ServeError::Memory(_) => 503,
@@ -750,7 +829,9 @@ pub(super) fn read_head<S: Read>(
     let (method, path, headers) = parse_headers(header_text)?;
     let content_length = content_length(&headers)?;
     if content_length > MAX_BODY_BYTES {
-        return Err(ServeError::Http("body trop grand".to_string()));
+        return Err(ServeError::BodyTooLarge {
+            anthropic: path.split('?').next() == Some("/v1/messages"),
+        });
     }
     let body = buffer[header_end + 4..].to_vec();
     Ok(Some((
@@ -875,6 +956,47 @@ mod tests {
 
     fn far_deadline() -> Instant {
         Instant::now() + Duration::from_secs(30)
+    }
+
+    #[test]
+    fn model_lookup_decodes_path_once_and_rejects_invalid_encoding() {
+        let ids = ["mon modèle", "日本語", "a/b?c#d+e%f", "%20", "a+b"];
+        let front = Front::new(None, ids.iter().map(|id| (*id).to_string()).collect());
+        for (suffix, status, expected) in [
+            ("mon%20mod%C3%A8le", 200, "mon modèle"),
+            ("%E6%97%A5%E6%9C%AC%E8%AA%9E", 200, "日本語"),
+            ("a%2fb%3Fc%23d%2Be%25f?ignored=1", 200, "a/b?c#d+e%f"),
+            ("%2520", 200, "%20"),
+            ("a+b", 200, "a+b"),
+            ("mon%2520mod%C3%A8le", 404, ""),
+            ("%", 400, ""),
+            ("%2", 400, ""),
+            ("%GG", 400, ""),
+            ("%FF", 400, ""),
+            ("%C3%28", 400, ""),
+        ] {
+            let raw = format!("GET /v1/models/{suffix} HTTP/1.1\r\n\r\n");
+            let request = read_request(&mut Cursor::new(raw), far_deadline())
+                .expect("invariant: requête lisible")
+                .expect("invariant: requête présente");
+            let mut reply = Vec::new();
+            route_front(&mut reply, &front, &request)
+                .expect("invariant: route modèle traitée")
+                .expect("invariant: réponse écrite");
+            let reply = String::from_utf8(reply).expect("invariant: réponse UTF-8");
+            assert!(
+                reply.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{suffix}: {reply}"
+            );
+            let (_, body) = reply.split_once("\r\n\r\n").expect("invariant: corps HTTP");
+            let body: serde_json::Value =
+                serde_json::from_str(body).expect("invariant: corps JSON");
+            if status == 200 {
+                assert_eq!(body["id"], expected);
+            } else {
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+            }
+        }
     }
 
     /// Client au goutte-à-goutte : un octet utile toutes les 5 ms, jamais de
@@ -1132,6 +1254,120 @@ mod tests {
         drop(peer);
     }
 
+    fn response_json(bytes: Vec<u8>, status: u16) -> serde_json::Value {
+        let response = String::from_utf8(bytes).expect("invariant: réponse UTF-8");
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{response}"
+        );
+        serde_json::from_str(
+            response
+                .split_once("\r\n\r\n")
+                .expect("invariant: corps HTTP")
+                .1,
+        )
+        .expect("invariant: JSON réponse")
+    }
+
+    #[test]
+    fn chat_rejects_multiple_choices_but_accepts_one_or_absent() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        for n in [None, Some(1), Some(2), Some(0)] {
+            for streaming in [false, true] {
+                let mut body =
+                    serde_json::json!({"model":"missing", "messages":[], "stream":streaming});
+                if let Some(n) = n {
+                    body["n"] = n.into();
+                }
+                let request = post("/v1/chat/completions", &body.to_string());
+                let mut response = Vec::new();
+                handle_job(&mut response, &mut state, &request)
+                    .expect_err("invariant: pas de modèle chargé");
+                let rejected = n.is_some_and(|n| n != 1);
+                let value = response_json(response, if rejected { 400 } else { 404 });
+                if rejected {
+                    assert_eq!(value["error"]["type"], "invalid_request_error");
+                    assert_eq!(value["error"]["param"], "n");
+                    assert!(batch_chat(&request, 4096, |_| false).is_none());
+                } else {
+                    assert_eq!(value["error"]["code"], "model_not_found");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auxiliary_only_startup_keeps_llm_routes_explicitly_unavailable() {
+        for flags in [
+            vec!["--embed-model"],
+            vec!["--stt-model"],
+            vec!["--tts-model"],
+            vec!["--stt-model", "--tts-model", "--embed-model"],
+        ] {
+            let mut args = ServeArgs::parse(
+                flags
+                    .into_iter()
+                    .flat_map(|flag| [flag.to_string(), "unused".into()]),
+            )
+            .expect("invariant: options auxiliaires valides");
+            super::super::model_selection::select_if_missing(&mut args)
+                .expect("invariant: aucun sélecteur LLM pour les modèles auxiliaires");
+            super::super::model_selection::resolve_models(&mut args)
+                .expect("invariant: aucun modèle distant à résoudre");
+            let mut state = ServeState::new(&args);
+            state.preload().expect("invariant: aucun LLM à précharger");
+            assert!(state.model_ids().is_empty());
+            for route in ["/v1/chat/completions", "/v1/messages"] {
+                for streaming in [false, true] {
+                    let request = post(
+                        route,
+                        &serde_json::json!({"model":"missing", "messages":[],
+                        "max_tokens":1, "stream":streaming})
+                        .to_string(),
+                    );
+                    let mut response = Vec::new();
+                    let _ = handle_job(&mut response, &mut state, &request);
+                    let value = response_json(response, 404);
+                    assert!(value["error"]["message"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("modèle non chargé")));
+                    assert_eq!(value["error"]["code"], "model_not_found");
+                    assert_eq!(value.get("type").is_some(), route == "/v1/messages");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_model_has_code_in_both_envelopes_before_streaming() {
+        let args = ServeArgs::parse(["--model".into(), "known=unused".into()])
+            .expect("invariant: modèle déclaré sans chargement");
+        let mut state = ServeState::new(&args);
+        for route in ["/v1/chat/completions", "/v1/messages"] {
+            for streaming in [false, true] {
+                let request = post(
+                    route,
+                    &serde_json::json!({"model":"missing", "messages":[],
+                    "max_tokens":1, "stream":streaming})
+                    .to_string(),
+                );
+                let mut response = Vec::new();
+                let _ = handle_job(&mut response, &mut state, &request);
+                let value = response_json(response, 404);
+                assert_eq!(value["error"]["code"], "model_not_found");
+                if route == "/v1/messages" {
+                    assert_eq!(value["type"], "error");
+                    assert_eq!(value["error"]["type"], "not_found_error");
+                } else {
+                    assert_eq!(value["error"]["type"], "invalid_request_error");
+                    assert_eq!(value["error"]["param"], "model");
+                    assert!(value.get("type").is_none());
+                }
+            }
+        }
+    }
+
     #[test]
     fn chat_request_above_max_tokens_cap_returns_400() {
         let args = ServeArgs::parse(["--max-tokens-cap".to_string(), "4".to_string()])
@@ -1316,6 +1552,74 @@ mod tests {
     }
 
     #[test]
+    fn sse_identity_is_shared_by_text_reasoning_tools_finish_and_usage() {
+        for flint in [false, true] {
+            let mut bytes = Vec::new();
+            let parser = flint.then(|| {
+                ToolOutputParser::new(
+                    super::super::tool_output::ToolFamily::Flint,
+                    vec![serde_json::json!({
+                        "type":"function", "function":{"name":"heure"}
+                    })],
+                    true,
+                )
+            });
+            let mut sink = OpenAiSse::new(&mut bytes, parser, true);
+            // Une date indépendante de l'horloge révèle tout chunk qui
+            // recréerait ses métadonnées, sans attente dans le test.
+            sink.created = 42;
+            let start = super::super::streaming::StreamingCompletionStart {
+                model: "m".into(),
+                prompt_tokens: 1,
+                reused_prefix_tokens: 0,
+                prefill: Duration::ZERO,
+            };
+            sink.event(CompletionStreamEvent::Start(&start))
+                .expect("invariant: début SSE");
+            let delta = if flint {
+                "<think>raison</think>texte<tool_call>heure</tool_call>"
+            } else {
+                "texte"
+            };
+            sink.event(CompletionStreamEvent::Delta(delta))
+                .expect("invariant: delta SSE");
+            sink.finish(Ok(ServedCompletion {
+                model: "m".into(),
+                content: String::new(),
+                finish_reason: "stop",
+                matched_stop: None,
+                usage: super::super::protocol::Usage::new(1, 1),
+                prompt_tokens: 1,
+                reused_prefix_tokens: 0,
+                timings: saragossa::GenerationTimings::default(),
+                total: Duration::ZERO,
+            }))
+            .expect("invariant: fin SSE");
+            let response = String::from_utf8(bytes).expect("invariant: SSE UTF-8");
+            let frames: Vec<serde_json::Value> = response
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).expect("invariant: chunk JSON"))
+                .collect();
+            assert_eq!(frames.len(), if flint { 6 } else { 4 });
+            for chunk in &frames {
+                assert_eq!(chunk["id"], frames[0]["id"]);
+                assert_eq!(chunk["created"], 42);
+            }
+            if flint {
+                assert!(frames
+                    .iter()
+                    .any(|c| c["choices"][0]["delta"]["reasoning_content"].is_string()));
+                assert!(frames
+                    .iter()
+                    .any(|c| c["choices"][0]["delta"]["tool_calls"].is_array()));
+            }
+            assert_eq!(response.matches("data: [DONE]").count(), 1);
+        }
+    }
+
+    #[test]
     fn openai_stream_converts_qwen_and_gemma_calls_without_leaking_markers() {
         use super::super::tool_output::ToolFamily;
         for (family, text) in [
@@ -1363,6 +1667,7 @@ mod tests {
         let frames = |include_usage: bool| -> Vec<serde_json::Value> {
             let mut bytes = Vec::new();
             let mut sink = OpenAiSse::new(&mut bytes, None, include_usage);
+            sink.created = 42;
             let start = super::super::streaming::StreamingCompletionStart {
                 model: "m".into(),
                 prompt_tokens: 7,
@@ -1397,7 +1702,9 @@ mod tests {
         for chunk in &with_usage[..3] {
             assert_eq!(chunk.get("usage"), Some(&serde_json::Value::Null));
             assert_eq!(chunk["id"], with_usage[3]["id"]);
+            assert_eq!(chunk["created"], 42);
         }
+        assert_eq!(with_usage[3]["created"], 42);
         assert_eq!(with_usage[3]["choices"], serde_json::json!([]));
         assert_eq!(with_usage[3]["usage"]["prompt_tokens"], 7);
         assert_eq!(with_usage[3]["usage"]["completion_tokens"], 3);

@@ -651,6 +651,72 @@ mod tests {
     }
 
     #[test]
+    fn oversized_body_is_rejected_before_reading_with_route_envelope() {
+        let (dispatcher, rx) = dispatcher(2, 1);
+        for route in [
+            "/v1/messages",
+            "/v1/messages?test=1",
+            "/v1/chat/completions",
+        ] {
+            let raw = format!("POST {route} HTTP/1.1\r\nContent-Length: 16777217\r\n\r\n");
+            let reply = response(connect(&dispatcher, raw.as_bytes()));
+            assert!(reply.starts_with("HTTP/1.1 400 Bad Request"));
+            let body = json_body(&reply);
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(body["error"]["message"]
+                .as_str()
+                .is_some_and(|s| s.contains("body trop grand")));
+            assert_eq!(
+                body.get("type").is_some(),
+                route.starts_with("/v1/messages")
+            );
+            if route.starts_with("/v1/messages") {
+                assert_eq!(body["type"], "error");
+            }
+        }
+        settle(&dispatcher);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(dispatcher.inflight_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn model_lookup_uses_registry_and_auth_without_engine() {
+        let (dispatcher, rx) = dispatcher_with(Some("test-key"), 2, usize::MAX, 1);
+        for (path, authorized, status) in [
+            ("/v1/models/alpha", false, 401),
+            ("/v1/models/missing", false, 401),
+            ("/v1/models/alpha", true, 200),
+            ("/v1/models/alpha?detail=1", true, 200),
+            ("/v1/models/missing", true, 404),
+            ("/v1/models/alpha/suffix", true, 404),
+            ("/v1/models/", true, 404),
+        ] {
+            let auth = if authorized {
+                "Authorization: Bearer test-key\r\n"
+            } else {
+                ""
+            };
+            let raw = format!("GET {path} HTTP/1.1\r\n{auth}\r\n");
+            let reply = response(connect(&dispatcher, raw.as_bytes()));
+            assert!(reply.starts_with(&format!("HTTP/1.1 {status} ")), "{reply}");
+            let body = json_body(&reply);
+            if status == 200 {
+                assert_eq!(body["id"], "alpha");
+                assert_eq!(body["object"], "model");
+                assert!(body["created"].is_u64());
+                assert!(body["owned_by"].as_str().is_some_and(|s| !s.is_empty()));
+            } else if status == 404 {
+                assert_eq!(body["error"]["code"], "model_not_found");
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+                assert_eq!(body["error"]["param"], "model");
+                assert!(body.get("type").is_none());
+            }
+        }
+        settle(&dispatcher);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn models_served_by_connection_thread() {
         let (dispatcher, _rx) = dispatcher(4, 1);
 

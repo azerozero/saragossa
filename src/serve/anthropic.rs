@@ -144,6 +144,7 @@ impl AnthropicMessagesRequest {
             model: self.model.clone(),
             messages,
             stream: false,
+            n: None,
             max_tokens: Some(max_tokens),
             max_completion_tokens: None,
             temperature: self.temperature,
