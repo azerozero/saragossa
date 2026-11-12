@@ -4,10 +4,14 @@ use crate::{InferError, Result};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
+#[cfg(test)]
+pub(crate) mod golden_tests;
+
 #[derive(Clone)]
 pub struct RustTokenizer {
     path: PathBuf,
     inner: Tokenizer,
+    qwen_profile: Option<crate::chat_template::QwenProfile>,
 }
 
 impl std::fmt::Debug for RustTokenizer {
@@ -26,9 +30,33 @@ impl RustTokenizer {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
+        let template = std::fs::read_to_string(path.with_file_name("chat_template.jinja"))
+            .ok()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                let text =
+                    std::fs::read_to_string(path.with_file_name("tokenizer_config.json")).ok()?;
+                let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+                config["chat_template"].as_str().map(str::to_owned)
+            });
         Ok(Self {
             path: path.to_path_buf(),
+            qwen_profile: template
+                .as_deref()
+                .and_then(crate::chat_template::QwenProfile::from_template),
             inner,
+        })
+    }
+
+    /// Profil de rendu associé au template local, lu une seule fois au chargement.
+    ///
+    /// # Errors
+    ///
+    /// Refuse un profil absent, illisible ou non reconnu, sans repli Qwen 3.6.
+    pub fn qwen_profile(&self) -> Result<crate::chat_template::QwenProfile> {
+        self.qwen_profile.ok_or_else(|| InferError::Tokenizer {
+            path: self.path.clone(),
+            message: "profil Qwen inconnu : fournir chat_template.jinja ou tokenizer_config.json avec un chat_template reconnu".into(),
         })
     }
 
@@ -129,6 +157,48 @@ pub(crate) fn save_test_tokenizer(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_profile_requires_readable_recognized_metadata() {
+        use crate::chat_template::QwenProfile;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("tokenizer.json");
+        save_test_tokenizer(&path);
+        let load_profile = || {
+            RustTokenizer::from_file(&path)
+                .expect("tokenizer")
+                .qwen_profile()
+        };
+        assert!(load_profile()
+            .expect_err("missing profile")
+            .to_string()
+            .contains("profil Qwen inconnu"));
+        let template = tmp.path().join("chat_template.jinja");
+        std::fs::create_dir(&template).expect("unreadable template file");
+        assert!(load_profile().is_err());
+        std::fs::remove_dir(&template).expect("remove directory");
+        let config = tmp.path().join("tokenizer_config.json");
+        for invalid in [
+            "{",
+            "{}",
+            r#"{"chat_template":"unrecognized"}"#,
+            r#"{"description":"Reasoning effort is set to"}"#,
+        ] {
+            std::fs::write(&config, invalid).expect("write config");
+            assert!(load_profile().is_err(), "{invalid}");
+        }
+        std::fs::write(
+            &config,
+            r#"{"chat_template":"<|im_start|> Reasoning effort is set to"}"#,
+        )
+        .expect("write config");
+        assert_eq!(load_profile().expect("Qwen38"), QwenProfile::Qwen38);
+        std::fs::write(&template, "<|im_start|> enable_thinking last_query_index")
+            .expect("write template");
+        assert_eq!(load_profile().expect("Qwen36"), QwenProfile::Qwen36);
+        std::fs::write(&template, "unknown").expect("write template");
+        assert!(load_profile().is_err());
+    }
 
     #[test]
     fn loads_local_tokenizer_and_roundtrips_ids() {

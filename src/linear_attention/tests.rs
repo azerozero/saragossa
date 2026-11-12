@@ -550,6 +550,31 @@ fn identity2() -> Result<Tensor> {
     Tensor::from_vec(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0])
 }
 
+#[test]
+fn legacy_linear_comparison_diagnostics() {
+    use crate::oracle::assert_panics_with;
+    assert_close(&[], &[], f32::NAN);
+    assert_close(&[f32::INFINITY], &[1.0], f32::INFINITY);
+    for value in [2.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_panics_with(
+            &format!("idx=1, left={value}, right=0, tolerance=0.1"),
+            || {
+                assert_close(&[0.0, value], &[0.0, 0.0], 0.1);
+            },
+        );
+        assert_panics_with(
+            &format!("idx=1, left=0, right={value}, tolerance=0.1"),
+            || {
+                assert_close(&[0.0, 0.0], &[0.0, value], 0.1);
+            },
+        );
+    }
+    assert_panics_with(
+        "assertion `left == right` failed\n  left: 1\n right: 0",
+        || assert_close(&[f32::NAN], &[], 0.1),
+    );
+}
+
 fn assert_close(left: &[f32], right: &[f32], tolerance: f32) {
     assert_eq!(left.len(), right.len());
     for (idx, (l, r)) in left.iter().zip(right.iter()).enumerate() {

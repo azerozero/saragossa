@@ -79,16 +79,64 @@ pub fn check_model(name: &str, path: &Path) -> TestResult {
     Ok(())
 }
 
-/// Les comparaisons dédiées ne peuvent jamais réussir sans assets locaux.
-pub fn local(env: &str) -> TestResult<PathBuf> {
-    let path = std::env::var_os(env)
+/// Sans assets locaux, saute la comparaison sauf en mode réel obligatoire.
+pub fn local(env: &str) -> TestResult<Option<PathBuf>> {
+    local_path(
+        env,
+        std::env::var_os(env),
+        std::env::var("SARAGOSSA_REQUIRE_REAL_MODELS").as_deref() == Ok("1"),
+    )
+}
+
+fn local_path(
+    env: &str,
+    value: Option<std::ffi::OsString>,
+    required: bool,
+) -> TestResult<Option<PathBuf>> {
+    let path = value
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| format!("{env} requis (aucun téléchargement)"))?;
-    if !path.is_dir() {
-        return Err(format!("{env}: répertoire local absent").into());
+        .filter(|path| path.is_dir());
+    if path.is_none() {
+        let reason =
+            format!("{env}: répertoire local absent, vide ou introuvable (aucun téléchargement)");
+        if required {
+            return Err(format!("SARAGOSSA_REQUIRE_REAL_MODELS=1: {reason}").into());
+        }
+        eprintln!("skip: {reason}");
     }
     Ok(path)
+}
+
+#[test]
+fn local_assets_skip_or_fail_explicitly() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let missing = directory.path().join("absent").into_os_string();
+    let file = directory.path().join("file");
+    std::fs::write(&file, [])?;
+    for value in [
+        None,
+        Some("".into()),
+        Some(missing),
+        Some(file.into_os_string()),
+    ] {
+        assert!(local_path("TEST_MODEL", value.clone(), false)?.is_none());
+        let error = local_path("TEST_MODEL", value, true).expect_err("assets absents");
+        assert!(error
+            .to_string()
+            .contains("SARAGOSSA_REQUIRE_REAL_MODELS=1"));
+    }
+    for required in [false, true] {
+        assert_eq!(
+            local_path(
+                "TEST_MODEL",
+                Some(directory.path().as_os_str().to_owned()),
+                required
+            )?,
+            Some(directory.path().to_path_buf())
+        );
+    }
+    Ok(())
 }
 
 /// Contrôle les identifiants exacts, y compris la disparition d'un écart.
@@ -116,8 +164,8 @@ pub struct ChatFixture {
 #[derive(Deserialize)]
 pub struct ChatCase {
     pub name: String,
-    pub messages: serde_json::Value,
-    pub tools: serde_json::Value,
+    pub messages: Box<serde_json::value::RawValue>,
+    pub tools: Box<serde_json::value::RawValue>,
     pub add_generation_prompt: bool,
     pub enable_thinking: Option<bool>,
     pub rendered: Option<String>,

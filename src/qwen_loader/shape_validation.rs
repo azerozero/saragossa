@@ -41,16 +41,17 @@ fn validate_decoder_shape_map<T: TensorShapes>(config: &ModelConfig, tensors: &T
     let vocab = config.vocab_size;
     expect_shape(tensors, "embed_tokens.weight", &[vocab, hidden])?;
     for layer in 0..config.num_hidden_layers {
-        let head_dim = config.layer_head_dim(layer);
+        let plan = LoaderLayerPlan::build(config, layer);
+        let head_dim = plan.head_dim();
         let q_dim = config.num_attention_heads * head_dim;
-        let kv_dim = config.layer_num_key_value_heads(layer) * head_dim;
+        let kv_dim = plan.kv_heads * head_dim;
         expect_shape(
             tensors,
             &layer_target(layer, "input_layernorm.weight"),
             &[hidden],
         )?;
-        if config.is_full_attention_layer(layer) {
-            validate_full_attention_shapes(config, tensors, layer, q_dim, kv_dim, head_dim)?;
+        if plan.full {
+            validate_full_attention_shapes(config, tensors, layer, q_dim, kv_dim, head_dim, &plan)?;
         } else {
             validate_linear_attention_shapes(config, tensors, layer)?;
         }
@@ -86,6 +87,7 @@ fn validate_full_attention_shapes(
     q_dim: usize,
     kv_dim: usize,
     head_dim: usize,
+    plan: &LoaderLayerPlan,
 ) -> Result<()> {
     let hidden = config.hidden_size;
     let q_proj_dim = if config.attn_output_gate.unwrap_or(false) {
@@ -105,7 +107,7 @@ fn validate_full_attention_shapes(
         &layer_target(layer, "self_attn.k_proj.weight"),
         &[kv_dim, hidden],
     )?;
-    if !(config.attention_k_eq_v && config.is_gemma4_full_layer(layer)) {
+    if !plan.v_shared_with_k {
         expect_shape(
             tensors,
             &layer_target(layer, "self_attn.v_proj.weight"),

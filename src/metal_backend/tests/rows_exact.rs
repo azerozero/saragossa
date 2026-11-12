@@ -248,6 +248,7 @@ fn rows_exact_matmul_formats_body() -> Result<()> {
             LinearWeight::AffineQuantized(w) => w.shape()[1],
             LinearWeight::Dense(t) => t.shape()[1],
             LinearWeight::DenseBf16(t) => t.shape()[1],
+            LinearWeight::DenseShared(t) => t.shape()[1],
         };
         let buffers = executor.resolve_linear_weight_buffers(weight, "rexact_mm")?;
         let out_dim = executor.linear_weight_out_dim(&buffers);
@@ -1381,8 +1382,7 @@ fn rows_exact_qmv_contract_cpu_oracle() -> Result<()> {
         library_source.push_str(&instrumented);
     }
     let library = {
-        let options = metal::CompileOptions::new();
-        options.set_fast_math_enabled(true);
+        let options = crate::metal_backend::compile_options(true);
         executor
             .device
             .new_library_with_source(&library_source, &options)

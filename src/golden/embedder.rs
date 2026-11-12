@@ -20,8 +20,10 @@ fn external_embedder_fixture_parse() -> TestResult {
     Ok(())
 }
 
-fn compare() -> TestResult<Vec<String>> {
-    let path = local("SARAGOSSA_EMBEDDER_DIR")?;
+fn compare() -> TestResult<Option<Vec<String>>> {
+    let Some(path) = local("SARAGOSSA_EMBEDDER_DIR")? else {
+        return Ok(None);
+    };
     check_model("embedder/e5", &path)?;
     let model = TextEmbedder::load_local(path)?;
     let header: serde_json::Value =
@@ -69,19 +71,23 @@ fn compare() -> TestResult<Vec<String>> {
             ));
         }
     }
-    Ok(failures)
+    Ok(Some(failures))
 }
 
 #[test]
 #[ignore = "CPU réel: SARAGOSSA_EMBEDDER_DIR; écart connu 8/query (requête vide); tools/goldens/README.md#suivi-des-ecarts"]
 fn external_embedder_known_differences_are_stable() -> TestResult {
-    assert_known_differences(&compare()?, &["8/query"]);
+    if let Some(differences) = compare()? {
+        assert_known_differences(&differences, &["8/query"]);
+    }
     Ok(())
 }
 
 #[test]
 #[ignore = "parité stricte CPU: SARAGOSSA_EMBEDDER_DIR; requête vide divergente; tools/goldens/README.md#suivi-des-ecarts"]
 fn external_embedder_strict_parity_matches_sentence_transformers() -> TestResult {
-    assert_known_differences(&compare()?, &[]);
+    if let Some(differences) = compare()? {
+        assert_known_differences(&differences, &[]);
+    }
     Ok(())
 }

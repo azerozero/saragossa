@@ -187,7 +187,9 @@ fn external_logits_comparison_keeps_strict_gates_and_bounds_bf16() {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compare(name: &str, env: &str, comparison: Comparison) -> TestResult {
-    let path = local(env)?;
+    let Some(path) = local(env)? else {
+        return Ok(());
+    };
     let float32 = matches!(comparison, Comparison::Float32);
     let stem = format!("logits/{name}{}", if float32 { "_f32" } else { "" });
     check_model(&stem, &path)?;

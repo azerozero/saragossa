@@ -15,6 +15,7 @@ mod tests;
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -151,19 +152,32 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex(Sha256::digest(bytes))
 }
 
+#[cfg(not(windows))]
 fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir)
         .and_then(|file| file.sync_all())
         .map_err(|source| io_err(dir, source))
 }
 
-/// Écriture atomique : fichier temporaire, `fsync`, renommage, `fsync` du dossier.
+/// Windows ne fournit pas de `fsync` de dossier via la bibliothèque standard.
+/// Les fichiers sont synchronisés avant renommage, mais la persistance du
+/// renommage après une coupure de courant n'est pas garantie sur cette cible.
+#[cfg(windows)]
+fn sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Écriture atomique : temporaire synchronisé, renommage, puis synchronisation
+/// du dossier si disponible (voir `sync_dir` pour la limite Windows).
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp-write");
-    std::fs::write(&tmp, bytes).map_err(|source| io_err(&tmp, source))?;
-    File::open(&tmp)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| io_err(&tmp, source))?;
+    {
+        // FlushFileBuffers exige un handle ouvert en écriture sous Windows.
+        let mut file = File::create(&tmp).map_err(|source| io_err(&tmp, source))?;
+        file.write_all(bytes)
+            .map_err(|source| io_err(&tmp, source))?;
+        file.sync_all().map_err(|source| io_err(&tmp, source))?;
+    }
     std::fs::rename(&tmp, path).map_err(|source| io_err(path, source))?;
     sync_dir(path.parent().unwrap_or(Path::new(".")))
 }
@@ -472,7 +486,7 @@ fn range_sha256(file: &File, path: &Path, offset: u64, len: u64) -> Result<Strin
     let mut at = 0_u64;
     while at < len {
         let take = (plan::IO_CHUNK as u64).min(len - at) as usize;
-        std::os::unix::fs::FileExt::read_exact_at(file, &mut buf[..take], offset + at)
+        crate::safetensor::pread_exact(file, &mut buf[..take], offset + at)
             .map_err(|e| io_err(path, e))?;
         sha.update(&buf[..take]);
         at += take as u64;
@@ -811,7 +825,7 @@ fn ngram_file_sha(path: &Path, segments: &[SegmentRecord]) -> Result<(String, Ve
         let mut at = 0_u64;
         while at < segment.len {
             let take = (plan::IO_CHUNK as u64).min(segment.len - at) as usize;
-            std::os::unix::fs::FileExt::read_exact_at(&file, &mut buf[..take], segment.offset + at)
+            crate::safetensor::pread_exact(&file, &mut buf[..take], segment.offset + at)
                 .map_err(|e| io_err(path, e))?;
             sha.update(&buf[..take]);
             whole.update(&buf[..take]);

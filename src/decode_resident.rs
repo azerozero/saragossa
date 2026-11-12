@@ -44,8 +44,8 @@ use crate::metal_backend::{
 };
 use crate::{InferError, Result};
 use metal::{
-    Buffer, BufferRef, CommandQueue, CompileOptions, ComputeCommandEncoderRef,
-    ComputePipelineState, Device, MTLResourceOptions, MTLSize,
+    Buffer, BufferRef, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
+    MTLResourceOptions, MTLSize,
 };
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;

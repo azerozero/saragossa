@@ -1,6 +1,6 @@
 # Références externes
 
-Ces scripts n'utilisent que des modèles locaux, en lecture seule. Ils forcent
+Les scripts de capture de références n'utilisent que des modèles locaux, en lecture seule. Ils forcent
 le mode hors ligne et exigent `SARAGOSSA_GOLDEN_CAPTURE=1`. Installer les versions
 épinglées dans `common.py` dans un environnement **hors dépôt**, puis définir
 `REF_PYTHON` vers son interpréteur. Aucun script ne crée cet environnement.
@@ -30,9 +30,10 @@ Les scripts résolvent sinon les snapshots uniques dans le cache HF local ; pour
 les deux Qwen LLM, ils cherchent le dossier de même nom sous `~/workspace/ai_model`.
 En cas de plusieurs snapshots, définir explicitement la variable. Les oracles
 Rust utilisent les variables ci-dessus et vérifient les empreintes avant l'inférence.
-Les comparaisons dédiées échouent si une variable est absente, vide ou si le
-répertoire est introuvable, même sans `SARAGOSSA_REQUIRE_REAL_MODELS=1`. Les
-commandes dédiées imposent néanmoins ce garde-fou, commun aux tests réels.
+Le helper unique `local()` saute la comparaison si une variable est absente,
+vide ou si le répertoire est introuvable. Avec `SARAGOSSA_REQUIRE_REAL_MODELS=1`,
+ces préconditions manquantes sont des erreurs explicites. Les commandes dédiées
+imposent ce garde-fou, commun aux tests réels.
 Les comparaisons avec assets locaux sont `#[ignore]`. Le suivi direct des
 templates reste actif et ne lit aucun modèle.
 
@@ -129,11 +130,10 @@ filiation sans modèle. Aucun audio, header capturé ni texte de référence n�
 Les quatre captures mlx-lm ont été fournies le 2026-11-11. L'inventaire
 `tests/fixtures/goldens/logits/inventory.json` est exhaustif ; le test actif
 exige chaque couple `.bin`/`.json` marqué `captured`, son SHA256 et son schéma.
-Supprimer un fichier capturé est un échec. Les deux contrôles float32 marqués
-`pending_capture` peuvent être absents jusqu'à leur première capture ; dès
-qu'un des fichiers existe, le couple complet, son SHA256, son schéma et la
-provenance `float32_control: true` sont vérifiés. Après capture, passer leur
-statut à `captured` pour rendre leur présence obligatoire.
+Supprimer un fichier capturé est un échec. Les deux contrôles float32 sont également marqués `captured` : leur présence,
+le couple complet, son SHA256, son schéma et la provenance
+`float32_control: true` sont obligatoires. Le lecteur conserve la prise en charge
+de `pending_capture` pour un inventaire de campagne avant sa première capture.
 
 | Modèle | État | Octets du couple bin/json |
 |---|---|---:|
@@ -141,10 +141,10 @@ statut à `captured` pour rendre leur présence obligatoire.
 | qwen36_moe | capturé | 52 581 |
 | gemma3 | capturé | 52 885 |
 | gemma4 | capturé | 53 490 |
-| qwen36_moe_f32 | capture opérateur en attente | — |
-| gemma4_f32 | capture opérateur en attente | — |
+| qwen36_moe_f32 | capturé | 52 758 |
+| gemma4_f32 | capturé | 53 841 |
 
-Total logits : **210 945 octets** hors inventaire. Les sorties n'ont pas été
+Total logits : **317 544 octets** hors inventaire. Les sorties n'ont pas été
 recapturées ni modifiées pendant cette correction. La comparaison Rust avec
 les nouvelles références float32 reste à lancer par l'opérateur.
 
@@ -222,8 +222,8 @@ taskpolicy -b cargo test --offline --locked --bin saragossa external_serve_rejec
 # Suivi des écarts avec tokenizers locaux / embedder CPU :
 SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --bin saragossa external_serve_templates_known_differences_are_stable -- --ignored --nocapture
 SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --release --lib external_embedder_known_differences_are_stable -- --ignored --nocapture
-# Oracles stricts séparés : les écarts connus doivent toujours les faire échouer.
-SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --lib external_chat_strict_parity_matches_transformers -- --ignored --nocapture
+# Oracles stricts : templates conformes ; écart E5 encore suivi.
+SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --lib external_chat_strict_parity_matches_transformers -- --nocapture
 SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --bin saragossa external_serve_templates_strict_parity_matches_transformers -- --ignored --nocapture
 SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --release --lib external_embedder_strict_parity_matches_sentence_transformers -- --ignored --nocapture
 SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --release --lib external_whisper_ -- --ignored --nocapture --test-threads=1
@@ -258,26 +258,26 @@ seuils. Les tests de lecture demeurent actifs sans assets locaux.
 
 ## Suivi des ecarts
 
-Les identifiants exacts sont figés dans `KNOWN_DIFFERENCES` de
-`src/golden/chat.rs` (21/28) et `src/serve/state/reference_goldens.rs` (5/8).
-Le test actif `external_chat_known_differences_are_stable` exécute chaque rendu,
-y compris les deux cas que Gemma3 rejette dans la référence. L'API directe
-actuelle retourne toujours une chaîne ; ce rendu est comparé à un résultat
-« rendu » ou « rejet », sans présumer un échec avant l'appel Rust.
+Les corrections de main (PR #159) résolvent les **21 anciens écarts sur
+28 templates** et les **5 anciens écarts sur 8 cas serve**. Les listes
+`KNOWN_DIFFERENCES` de `src/golden/chat.rs` et
+`src/serve/state/reference_goldens.rs` sont désormais vides. Les références
+restent inchangées : l'ordre des clés JSON est conservé pour les outils et
+appels, et les profils Qwen3.8/Qwen3.6 ainsi que le rendu Gemma 4 suivent main.
+Les deux rejets Gemma3 sont comparés comme des erreurs de template attendues.
+Le suivi direct et l'oracle strict sont actifs, sans poids ni tokenizer local.
 
-Le test dédié serve exige les mêmes cinq identifiants divergents, et l'embedder
-exige uniquement `8/query` (requête vide). Un écart qui apparaît **ou disparaît**
-fait échouer le suivi. Les erreurs techniques de serve ne sont pas des écarts
-acceptables : un rejet de rôle n'est équivalent qu'avec la catégorie HTTP de
-requête invalide et le message précis d'alternance des rôles. Un autre rejet
-échoue immédiatement, même sur un cas déjà divergent.
+Le chemin serve appelle `LoadedModel::prompt_encoding`, vérifie les huit cas
+exposés et reste ignoré car il exige les tokenizers locaux. Les erreurs
+techniques ne sont pas des écarts acceptables : un rejet de rôle exige la
+catégorie HTTP et le message précis d'alternance des rôles. Sa parité est
+attendue selon main ; cette fusion sans modèles ne la remesure pas.
 
-Les oracles `strict_parity` séparés exigent zéro écart et restent ignorés avec
-une raison explicite. Les seuils embedder restent 0,9999 / 0,001. Le suivi des
-identifiants ne mesure pas une aggravation à l'intérieur d'un cas déjà divergent ;
-il ne remplace donc pas l'oracle strict. Les corrections moteur sont séparées
-de cette PR. L'adaptateur Anthropic et les réponses HTTP de tool calling ne
-sont pas couverts par ces goldens.
+L'embedder exige toujours uniquement `8/query` (requête vide). Un écart qui
+apparaît **ou disparaît** fait échouer son suivi. Son oracle strict reste
+ignoré et exige zéro écart, avec les seuils inchangés 0,9999 / 0,001.
+L'adaptateur Anthropic et les réponses HTTP de tool calling ne sont pas
+couverts par ces goldens.
 
 ## Résultats de capture et écarts historiques
 
@@ -286,7 +286,7 @@ rejets Gemma3, plus constat d'absence TTS), embedder **33 175 octets**, Whisper
 **4 322 octets**, headers compris. Ces résultats CPU historiques sont conservés ;
 l’inventaire logits ci-dessus remplace l’ancien statut global d’attente.
 
-Le test direct des sources Rust constate **21 écarts sur 28 cas** :
+Avant les corrections de main, le test direct constatait **21 écarts sur 28 cas** :
 
 | Modèle | Écarts | Détail |
 |---|---:|---|
@@ -295,11 +295,11 @@ Le test direct des sources Rust constate **21 écarts sur 28 cas** :
 | Gemma3 | 2/4 | Transformers rejette la conversation avec rôle tool (« Conversation roles must alternate… »), que Rust rend sans validation. Les deux conversations multi-tours correspondent, BOS inclus. |
 | Gemma4 | 6/8 | Thinking=true doit insérer `<|think|>` dans le système (deux cas multi-tours). Les quatre cas outils divergent sur les blocs declaration/call/response et l'enchaînement des tours. Les deux cas multi-tours thinking=false correspondent. |
 
-Ces écarts sont des résultats conservés : aucun rendu du moteur ni texte de
-référence n'a été adapté pour faire passer l'oracle. Les assertions indiquent
-le premier octet divergent et les deux textes complets.
+Ce tableau conserve le diagnostic historique ; ces écarts de rendu sont
+résolus par main. Aucun texte de référence n'a été modifié. Les assertions
+indiquent le premier octet divergent et les deux textes complets.
 
-Le chemin réel `serve::LoadedModel::prompt_encoding` confirme **5 écarts sur
+Le chemin réel `serve::LoadedModel::prompt_encoding` constatait **5 écarts sur
 8 cas exposés par serve** : les quatre conversations outils divergent ; le
 multi-tour Qwen3.6 thinking=false diverge aussi, car serve ajoute un bloc
 think vide à l'historique assistant alors que ce tokenizer ne l'ajoute pas.
@@ -329,7 +329,7 @@ mais avec un découpe bien rare à son âge. » Les deux oracles CPU passent
 (2/2) ; aucun écart texte/tokens n'est observé sur cet extrait. Les horodatages
 restent une référence externe sans équivalent retourné par l'API Rust.
 
-Vérifications effectuées avec `taskpolicy -b` : `cargo fmt --all -- --check`,
+Vérifications historiques avant fusion, effectuées avec `taskpolicy -b` : `cargo fmt --all -- --check`,
 `cargo clippy --all-targets --all-features -- -D warnings` et `cargo build`
 passent. Les cinq tests actifs de lecture/métriques de la bibliothèque et
 celui du chemin serve passent. Les oracles ignorés restent volontairement
@@ -364,8 +364,183 @@ passe avec les avertissements traités comme erreurs.
 Les deux tests serve sans assets passent (lecture et catégorie de rejet), ainsi
 que les quatre tests stdlib de versions Python. Les sept versions épinglées ont
 été vérifiées dans l’environnement de capture existant, sans import de moteur.
-Des lancements négatifs dédiés confirment l’échec sans assets pour serve,
-embedder et Whisper ; l’oracle strict de chat échoue sur les 21 écarts attendus.
+À cette date, des lancements négatifs dédiés confirmaient l’échec sans assets pour serve,
+embedder et Whisper ; l’oracle strict de chat échouait sur les 21 écarts alors attendus.
+Ces constats sont remplacés par le suivi actuel ci-dessus.
 Les comparaisons numériques avec modèles restent à exécuter par l’opérateur.
 Les 65 fichiers de captures/références présents au début de cette correction
 sont identiques octet pour octet ; seul le manifeste d’attente est remplacé.
+
+## Diagnostic couche par couche — Gemma 4 MoE
+
+Ces outils capturent le **pas 0** : un prefill sur les IDs exacts du prompt,
+les activations de toutes ses positions, puis les logits de sa dernière position
+après softcap (avant log-softmax). Aucun tokenizer n'est appelé pour construire
+le prompt. Ils ne génèrent pas de continuation.
+
+Le JSON du golden est un index de provenance ; les `prompt_ids` sont dans le
+payload UTF-8 `.bin` adjacent. L'extraction vérifie son SHA256. Le prompt 0 du
+golden Gemma 4 contient `[53406, 236764, 2185, 520, 236789, 101652]`.
+
+### Exécution locale
+
+Définir les chemins locaux, hors dépôt public :
+
+```sh
+export REF_PYTHON=/chemin/vers/venv-ref/bin/python
+export GOLD_WORKTREE=/chemin/vers/worktree/tool-gold
+export SARAGOSSA_GEMMA4_DIR=/chemin/vers/checkpoint-local
+export DUMP_ROOT="$(mktemp -d /tmp/gemma4-layers.XXXXXX)"
+```
+
+Depuis la racine du worktree de diagnostic, préparer les IDs et le binaire
+(sans inférence ni GPU, sans téléchargement) :
+
+```sh
+"$REF_PYTHON" -I -B tools/goldens/dump_layers_mlx.py \
+  --golden "$GOLD_WORKTREE/tests/fixtures/goldens/logits/gemma4.json" \
+  --prompt-index 0 --write-ids "$DUMP_ROOT/prompt0.json"
+taskpolicy -b cargo build --offline --release --example dump_layers
+```
+
+Lancer ensuite chaque capture sous le verrou de l'opérateur. Le lanceur fourni
+par le dépôt peut exécuter les trois commandes séquentiellement :
+
+```sh
+python3 -I -B tools/gpulock.py run --owner gemma4-layers-mlx --prio 10 -- \
+  "$REF_PYTHON" -I -B tools/goldens/dump_layers_mlx.py \
+  --model "$SARAGOSSA_GEMMA4_DIR" --ids-file "$DUMP_ROOT/prompt0.json" \
+  --out "$DUMP_ROOT/mlx"
+
+python3 -I -B tools/gpulock.py run --owner gemma4-layers-cpu --prio 10 -- \
+  taskpolicy -b target/release/examples/dump_layers \
+  "$SARAGOSSA_GEMMA4_DIR" "$DUMP_ROOT/prompt0.json" "$DUMP_ROOT/cpu" cpu
+
+python3 -I -B tools/gpulock.py run --owner gemma4-layers-metal --prio 10 -- \
+  env SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0 \
+  taskpolicy -b target/release/examples/dump_layers \
+  "$SARAGOSSA_GEMMA4_DIR" "$DUMP_ROOT/prompt0.json" "$DUMP_ROOT/metal" metal
+```
+
+Le backend par défaut du binaire est `metal`. `cpu` n'instancie aucun executor
+Metal. Le chemin Metal capturé est le prefill **per-op par défaut de Gemma 4**,
+identique au choix de `prefill_cache` à cache froid. Le diagnostic court-circuite
+uniquement le prefix cache et les snapshots disque ; il conserve les réglages
+usuels de batching/chunking. Les captures sont agrégées par position si le
+prefill est découpé ou tokenwise. Le chemin résident fusionné optionnel
+`SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` est explicitement refusé, car ses
+sous-étapes ne sont pas instrumentées. Ce diagnostic ne qualifie pas le decode
+entièrement résident.
+
+Côté bibliothèque, `CausalDecoder::dump_gemma4_layers(prompt, directory)` est
+exposé sous la feature existante `devtools`. Les observations sont limitées au
+thread appelant et désactivées hors de cette portée. Les sorties sont copiées,
+sans remplacement des calculs ni changement du dtype. Les modèles autres que
+Gemma 4 MoE sont refusés. MLX utilise `load_model(Path)` sur les shards locaux,
+sans téléchargement ni chargement du tokenizer. Versions exigées :
+`mlx-lm==0.32.2`, `mlx==0.32.4` ; NumPy est utilisé pour le format et la comparaison.
+Les méthodes originales de `gemma4_text.py` et de ses modules sont enveloppées
+en mémoire puis restaurées, sans modification du paquet.
+
+Comparer sur CPU, hors verrou :
+
+```sh
+"$REF_PYTHON" -I -B tools/goldens/compare_layers.py "$DUMP_ROOT/mlx" "$DUMP_ROOT/cpu" \
+  --json "$DUMP_ROOT/mlx-cpu.json"
+"$REF_PYTHON" -I -B tools/goldens/compare_layers.py "$DUMP_ROOT/mlx" "$DUMP_ROOT/metal" \
+  --json "$DUMP_ROOT/mlx-metal.json"
+"$REF_PYTHON" -I -B tools/goldens/compare_layers.py "$DUMP_ROOT/cpu" "$DUMP_ROOT/metal" \
+  --json "$DUMP_ROOT/cpu-metal.json"
+```
+
+Codes de sortie : **0** accord selon les seuils, **1** divergence, **2** capture
+invalide. Un code 1 est attendu lors du diagnostic : lancer les comparaisons
+séparément si le shell utilise `set -e`. Les répertoires et rapports existants
+ne sont jamais écrasés.
+
+### Points de mesure et format
+
+Chaque répertoire contient `index.json` et un fichier par point : float32 IEEE
+754 little-endian, contigu en ordre C, forme `[tokens, largeur]`. Les logits et
+`final_norm` ne gardent que la dernière position, forme `[1, largeur]`. Les
+valeurs BF16 de MLX sont converties **après le calcul**, uniquement pour écrire
+le fichier ; `source_dtype` conserve le dtype observé. `index.json` n'est écrit
+qu'après une capture complète. Une interruption laisse un répertoire incomplet,
+que le comparateur refuse.
+
+| Point | Valeur observée |
+|---|---|
+| `embeddings` | Embeddings après multiplication par l'échelle Gemma |
+| `input` | Entrée de couche |
+| `attention_input` | Après `input_layernorm` |
+| `attention_raw` | Projection O de l'attention, avant norme post-attention |
+| `attention_out` | Après norme post-attention, avant addition résiduelle |
+| `post_attention_residual` | Entrée de couche + `attention_out` ; source du routeur |
+| `dense_input`, `dense_raw`, `dense_out` | Norme d'entrée dense, MLP dense, norme de sortie dense |
+| `router_input`, `router_logits` | Entrée normalisée du routeur, scores avant top-k |
+| `router_indices`, `router_weights` | Experts triés par ID, poids softmax après modulation par expert |
+| `moe_input`, `moe_raw`, `moe_out` | Norme d'entrée experts, somme pondérée des experts, norme de sortie MoE |
+| `ffn_sum` | Addition des branches dense et MoE normalisées |
+| `ffn_out` | Après norme feed-forward commune, avant résiduel |
+| `pre_scalar` | Résiduel post-attention + `ffn_out`, avant `layer_scalar` |
+| `output` | Sortie de couche après `layer_scalar` |
+| `final_norm`, `logits` | Norme finale et tête après softcap, dernière position |
+
+`pre_scalar` côté MLX est la seule expression recalculée pour observation :
+`residual + ffn_out`, dans le dtype original. Elle ne remplace aucune valeur
+consommée par le modèle. Les indices d'experts sont des entiers exactement
+représentables en f32. Le tri affecte uniquement les copies de diagnostic.
+
+### Lecture des résultats
+
+Le comparateur donne, par point et par couche : maximum absolu, erreur relative
+L-inf (`max|diff| / max|référence|`), maximum relatif élémentaire (dénominateur
+borné par `atol`), cosinus global, pire cosinus par position et maximum absolu
+sur la dernière position. Le rapport JSON conserve aussi la position/coordonnée
+du maximum, la première position hors seuil et le nombre d'éléments hors seuil.
+Les NaN/Inf, formes incompatibles, points manquants et prompts différents sont
+refusés, jamais assimilés à un accord.
+
+Par défaut, une différence est significative dès qu'un élément vérifie
+`abs(diff) > 1e-5 + 1e-3 * abs(référence)` ou qu'un cosinus par position est
+inférieur à `0.99999`. Ces seuils **diagnostiques** sont configurables via
+`--atol`, `--rtol`, `--min-cosine` ; ils ne sont pas un contrat d'équivalence BF16.
+Les ensembles d'experts sont comparés exactement, quels que soient ces seuils.
+Un changement d'experts affiche les IDs et la marge entre les scores classés
+k et k+1 pour chaque backend. Le greedy final est affiché séparément.
+
+La première divergence est cherchée dans l'ordre des couches puis dans l'ordre
+des dépendances ci-dessus. Les branches dense, routeur et experts partagent une
+entrée et certaines de leurs opérations sont indépendantes. Une divergence à
+`embeddings` ou `input` peut se propager partout : cela ne démontre pas un défaut
+dans chaque sous-étape suivante. Les sous-opérations internes de l'attention
+(Q/K, RoPE, SDPA) ne sont pas séparées dans cette première instrumentation.
+
+Pour tester la piste BF16, effectuer une capture de contrôle MLX distincte :
+
+```sh
+python3 -I -B tools/gpulock.py run --owner gemma4-layers-mlx-f32 --prio 10 -- \
+  "$REF_PYTHON" -I -B tools/goldens/dump_layers_mlx.py \
+  --model "$SARAGOSSA_GEMMA4_DIR" --ids-file "$DUMP_ROOT/prompt0.json" \
+  --float32 --out "$DUMP_ROOT/mlx-f32"
+"$REF_PYTHON" -I -B tools/goldens/compare_layers.py "$DUMP_ROOT/mlx-f32" "$DUMP_ROOT/cpu"
+```
+
+Ce contrôle convertit les paramètres flottants et les scales en F32, en gardant
+les poids quantifiés empaquetés. Il modifie le dtype de tout le forward, y
+compris les constantes d'échelle : il ne suffit pas à isoler le seul routeur.
+
+### Vérification sans GPU ni modèle réel
+
+```sh
+"$REF_PYTHON" -I -B tools/goldens/test_layers.py
+cargo fmt --all -- --check
+taskpolicy -b cargo clippy --offline --all-targets --all-features -- -D warnings
+taskpolicy -b cargo build --offline
+taskpolicy -b cargo test --offline --lib --no-default-features --features devtools
+```
+
+Les tests Rust utilisent la fixture synthétique Gemma 4 : ils vérifient que la
+capture laisse les logits inchangés, couvre tous les points et positions,
+respecte les frontières résiduelles et refuse l'écrasement. Metal est désactivé
+pour les tests bibliothèque car des tests GPU existants ne sont pas ignorés.

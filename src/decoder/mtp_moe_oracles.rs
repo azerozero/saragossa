@@ -6,6 +6,7 @@
 
 use super::mtp::{MtpLoadContext, MtpMoeQuant};
 use super::*;
+use crate::oracle::cosine;
 use safetensors::SafeTensors;
 use std::path::PathBuf;
 
@@ -37,17 +38,6 @@ fn rms(values: &[f32]) -> f32 {
     (sum / values.len().max(1) as f64).sqrt() as f32
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot = a
-        .iter()
-        .zip(b)
-        .map(|(x, y)| f64::from(*x) * f64::from(*y))
-        .sum::<f64>();
-    let na = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    let nb = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    (dot / (na * nb).max(f64::MIN_POSITIVE)) as f32
-}
-
 fn median(mut values: Vec<f32>) -> f32 {
     values.sort_by(f32::total_cmp);
     values.get(values.len() / 2).copied().unwrap_or(f32::NAN)
@@ -57,6 +47,7 @@ fn dense_of(weight: &LinearWeight) -> Result<Tensor> {
     match weight {
         LinearWeight::Dense(tensor) => Ok(tensor.clone()),
         LinearWeight::DenseBf16(tensor) => tensor.to_tensor(),
+        LinearWeight::DenseShared(tensor) => tensor.to_tensor(),
         LinearWeight::AffineQuantized(tensor) => tensor.dequantize(),
     }
 }

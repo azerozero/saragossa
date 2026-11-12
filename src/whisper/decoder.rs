@@ -300,7 +300,9 @@ impl WhisperDecoder {
         let proj = |linear: &Linear| -> Result<WhisperResidentProj> {
             let tensor = match linear.weight() {
                 crate::LinearWeight::Dense(tensor) => tensor,
-                crate::LinearWeight::AffineQuantized(_) | crate::LinearWeight::DenseBf16(_) => {
+                crate::LinearWeight::AffineQuantized(_)
+                | crate::LinearWeight::DenseBf16(_)
+                | crate::LinearWeight::DenseShared(_) => {
                     return Err(InferError::Config(
                         "décodeur résident: projection non dense".to_string(),
                     ));
@@ -631,7 +633,7 @@ impl WhisperModel {
                 generated.len()
             );
         }
-        let text = self.tokenizer.decode(&generated, true)?;
+        let text = decode_generated_tokens(&self.tokenizer, &generated)?;
         let effective_lang = if lang == "auto" { "auto" } else { lang }.to_string();
         Ok((text.trim().to_string(), effective_lang))
     }
@@ -756,10 +758,39 @@ fn feed_forward(
     fc2.forward_with_runtime(&crate::gelu(&h), runtime)
 }
 
+// Keep Whisper's special-token policy shared with the CPU tokenizer golden.
+fn decode_generated_tokens(tokenizer: &RustTokenizer, generated: &[u32]) -> Result<String> {
+    tokenizer.decode(generated, true)
+}
+
 fn token_id(tokenizer: &RustTokenizer, token: &str) -> Result<u32> {
     tokenizer
         .token_to_id(token)
         .ok_or_else(|| InferError::Config(format!("token Whisper introuvable: {token}")))
+}
+
+#[cfg(test)]
+mod golden_tests {
+    use super::{decode_generated_tokens, RustTokenizer};
+    use crate::tokenizer::golden_tests::{check_family, compare_rows, TestResult};
+
+    #[test]
+    fn whisper() -> TestResult {
+        check_family("whisper", |path, rows| {
+            let tokenizer = RustTokenizer::from_file(path)?;
+            compare_rows(
+                rows,
+                |text, special| {
+                    Ok(if special {
+                        tokenizer.encode_with_special_tokens(text)?
+                    } else {
+                        tokenizer.encode(text)?
+                    })
+                },
+                |ids| Ok(decode_generated_tokens(&tokenizer, ids)?),
+            )
+        })
+    }
 }
 
 #[cfg(test)]

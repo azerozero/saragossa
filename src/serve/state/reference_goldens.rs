@@ -70,10 +70,13 @@ fn external_serve_template_fixtures_parse() -> TestResult {
     Ok(())
 }
 
-fn compare() -> TestResult<Vec<String>> {
+fn compare() -> TestResult<Option<Vec<String>>> {
+    let mut compared = 0;
     let mut failures = Vec::new();
     for (name, env) in CHAT_MODELS {
-        let path = local(env)?;
+        let Some(path) = local(env)? else {
+            return Ok(None);
+        };
         let stem = format!("chat_templates/{name}");
         check_model(&stem, &path)?;
         let loaded = template_model(&path)?;
@@ -83,12 +86,18 @@ fn compare() -> TestResult<Vec<String>> {
             if !case.add_generation_prompt || case.enable_thinking == Some(true) {
                 continue;
             }
-            let mut wire = serde_json::json!({"model":"reference", "messages":case.messages, "tools":case.tools});
-            if let Some(thinking) = case.enable_thinking {
-                wire["chat_template_kwargs"] = serde_json::json!({"enable_thinking":thinking});
-            }
-            let request: ChatCompletionRequest = serde_json::from_value(wire)?;
+            let thinking = case
+                .enable_thinking
+                .map(|b| format!(r#", "chat_template_kwargs":{{"enable_thinking":{b}}}"#))
+                .unwrap_or_default();
+            let wire = format!(
+                r#"{{"model":"reference","messages":{},"tools":{}{thinking}}}"#,
+                case.messages.get(),
+                case.tools.get()
+            );
+            let request = ChatCompletionRequest::parse(wire.as_bytes())?;
             let label = format!("{name}/{}", case.name);
+            compared += 1;
             let mismatch = match (loaded.prompt_encoding(&request), case.token_ids) {
                 (Ok(actual), Some(expected)) => {
                     let expected: Vec<usize> = expected.into_iter().map(|v| v as usize).collect();
@@ -118,7 +127,8 @@ fn compare() -> TestResult<Vec<String>> {
             }
         }
     }
-    Ok(failures)
+    assert_eq!(compared, 8);
+    Ok(Some(failures))
 }
 
 fn is_role_rejection(error: &ServeError, expected: Option<&str>) -> bool {
@@ -145,24 +155,23 @@ fn external_serve_rejection_requires_role_category() {
     assert!(!is_role_rejection(&ServeError::Http(message.into()), None));
 }
 
-const KNOWN_DIFFERENCES: &[&str] = &[
-    "qwen38/tools/generation=True/thinking=False",
-    "qwen36_moe/multi/generation=True/thinking=False",
-    "qwen36_moe/tools/generation=True/thinking=False",
-    "gemma3/tools/generation=True/thinking=None",
-    "gemma4/tools/generation=True/thinking=False",
-];
+// main corrige les cinq anciens écarts du chemin prompt_encoding.
+const KNOWN_DIFFERENCES: &[&str] = &[];
 
 #[test]
-#[ignore = "tokenizers locaux requis; 5/8 écarts serve connus; tools/goldens/README.md#suivi-des-ecarts"]
+#[ignore = "tokenizers locaux requis; 8 cas, parité attendue; tools/goldens/README.md#suivi-des-ecarts"]
 fn external_serve_templates_known_differences_are_stable() -> TestResult {
-    assert_known_differences(&compare()?, KNOWN_DIFFERENCES);
+    if let Some(differences) = compare()? {
+        assert_known_differences(&differences, KNOWN_DIFFERENCES);
+    }
     Ok(())
 }
 
 #[test]
-#[ignore = "parité stricte, tokenizers locaux requis; 5/8 écarts serve connus; tools/goldens/README.md#suivi-des-ecarts"]
+#[ignore = "parité stricte, tokenizers locaux requis; 8 cas, parité attendue; tools/goldens/README.md#suivi-des-ecarts"]
 fn external_serve_templates_strict_parity_matches_transformers() -> TestResult {
-    assert_known_differences(&compare()?, &[]);
+    if let Some(differences) = compare()? {
+        assert_known_differences(&differences, &[]);
+    }
     Ok(())
 }

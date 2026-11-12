@@ -146,6 +146,90 @@ pub(crate) fn tensor_from_safetensor_parts(
     Tensor::from_vec(shape.to_vec(), bytes_to_dense_f32(data, dtype, name)?)
 }
 
+/// Vérifie la plage sur le descripteur qui sera lu, avant toute allocation.
+/// La lecture exacte reste nécessaire en cas de troncature concurrente.
+pub(crate) fn check_file_range(
+    file: &std::fs::File,
+    offset: u64,
+    len_bytes: usize,
+    name: &str,
+) -> Result<()> {
+    let end = u64::try_from(len_bytes)
+        .ok()
+        .and_then(|len| offset.checked_add(len))
+        .ok_or_else(|| InferError::Shape(format!("plage de fichier trop grande pour {name}")))?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| InferError::Config(format!("taille du fichier {name}: {source}")))?
+        .len();
+    if end > file_len {
+        return Err(InferError::Shape(format!(
+            "plage de fichier {name} [{offset}..{end}] hors fichier de {file_len} octets"
+        )));
+    }
+    Ok(())
+}
+
+/// Conversion bornée vers le stockage CPU final, sans payload brut de la
+/// taille du tenseur. Les offsets et tailles proviennent d'un header validé.
+pub(crate) fn read_dense_f32_at(
+    file: &std::fs::File,
+    offset: u64,
+    len_bytes: usize,
+    dtype: Dtype,
+    name: &str,
+) -> Result<Vec<f32>> {
+    if !is_dense_float_dtype(dtype) {
+        return Err(InferError::UnsupportedDtype {
+            name: name.to_string(),
+            dtype,
+        });
+    }
+    let width = dtype.bitsize() / 8;
+    if len_bytes % width != 0 {
+        return Err(InferError::Shape(format!(
+            "taille de payload invalide pour {name}"
+        )));
+    }
+    check_file_range(file, offset, len_bytes, name)?;
+    let mut values = Vec::with_capacity(len_bytes / width);
+    let mut scratch = [0_u8; 64 * 1024];
+    let mut consumed = 0;
+    while consumed < len_bytes {
+        let len = scratch.len().min(len_bytes - consumed);
+        let at = offset
+            .checked_add(consumed as u64)
+            .ok_or_else(|| InferError::Shape(format!("offset trop grand pour {name}")))?;
+        pread_exact(file, &mut scratch[..len], at)
+            .map_err(|source| InferError::Config(format!("lecture {name}: {source}")))?;
+        values.extend(bytes_to_dense_f32(&scratch[..len], dtype, name)?);
+        consumed += len;
+    }
+    Ok(values)
+}
+
+/// Lit les codes dans leur Vec final lorsque le stockage CPU est demandé.
+pub(crate) fn read_u32_at(
+    file: &std::fs::File,
+    offset: u64,
+    len_bytes: usize,
+    name: &str,
+) -> Result<Vec<u32>> {
+    if len_bytes % 4 != 0 {
+        return Err(InferError::Shape(format!(
+            "taille u32 invalide pour {name}"
+        )));
+    }
+    check_file_range(file, offset, len_bytes, name)?;
+    let mut values = vec![0_u32; len_bytes / 4];
+    pread_exact(file, bytemuck::cast_slice_mut(&mut values), offset)
+        .map_err(|source| InferError::Config(format!("lecture {name}: {source}")))?;
+    for value in &mut values {
+        *value = u32::from_le(*value);
+    }
+    Ok(values)
+}
+
 pub(crate) fn bytes_to_dense_f32(bytes: &[u8], dtype: Dtype, name: &str) -> Result<Vec<f32>> {
     match dtype {
         Dtype::F32 => bytes_to_f32(bytes, name),
@@ -160,7 +244,7 @@ pub(crate) fn bytes_to_dense_f32(bytes: &[u8], dtype: Dtype, name: &str) -> Resu
     }
 }
 
-fn is_dense_float_dtype(dtype: Dtype) -> bool {
+pub(crate) fn is_dense_float_dtype(dtype: Dtype) -> bool {
     matches!(
         dtype,
         Dtype::F32 | Dtype::BF16 | Dtype::F16 | Dtype::F8_E4M3 | Dtype::F8_E5M2
@@ -262,6 +346,90 @@ pub(crate) fn apply_fp8_block_scales_in_place(
         let scale_row = &scales[(row / block) * scale_cols..(row / block + 1) * scale_cols];
         for (col, value) in out_row.iter_mut().enumerate() {
             *value *= scale_row[col / block];
+        }
+    }
+    Ok(())
+}
+
+/// Lit exactement une plage du fichier, sans dépendre du curseur partagé.
+/// Sous Windows, `seek_read` peut renvoyer une lecture partielle.
+pub(crate) fn pread_exact(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        read_exact_at_with(buf, offset, |buf, offset| file.seek_read(buf, offset))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn read_exact_at_with(
+    mut buf: &mut [u8],
+    mut offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    while !buf.is_empty() {
+        match read(buf, offset) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                if !buf.is_empty() {
+                    offset = offset.checked_add(n as u64).ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidInput, "offset de lecture hors plage")
+                    })?;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Écrit intégralement une plage, y compris après une écriture partielle.
+#[cfg(feature = "devtools")]
+pub(crate) fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        write_all_at_with(buf, offset, |buf, offset| file.seek_write(buf, offset))
+    }
+}
+
+#[cfg(all(feature = "devtools", any(windows, test)))]
+fn write_all_at_with(
+    mut buf: &[u8],
+    mut offset: u64,
+    mut write: impl FnMut(&[u8], u64) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    while !buf.is_empty() {
+        match write(buf, offset) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                buf = &buf[n..];
+                if !buf.is_empty() {
+                    offset = offset.checked_add(n as u64).ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidInput, "offset d'écriture hors plage")
+                    })?;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -439,8 +607,188 @@ fn f8_to_f32(byte: u8, exponent_bits: u8, mantissa_bits: u8, bias: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positioned_reads_cover_ranges_empty_buffers_and_eof() -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = tempfile::tempfile()?;
+        file.write_all(b"abcdef")?;
+        let mut bytes = [0; 3];
+        pread_exact(&file, &mut bytes, 2)?;
+        assert_eq!(&bytes, b"cde");
+        pread_exact(&file, &mut [], u64::MAX)?;
+        assert_eq!(
+            pread_exact(&file, &mut bytes, 4).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        // Les lecteurs parallèles partagent le fichier mais pas leur offset.
+        std::thread::scope(|scope| {
+            let file = &file;
+            let readers: Vec<_> = (0..6)
+                .map(|offset| {
+                    scope.spawn(move || {
+                        let mut byte = [0];
+                        pread_exact(file, &mut byte, offset).unwrap();
+                        assert_eq!(byte[0], b'a' + offset as u8);
+                    })
+                })
+                .collect();
+            for reader in readers {
+                reader.join().unwrap();
+            }
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn positioned_read_loop_retries_and_advances_after_short_reads() -> std::io::Result<()> {
+        use std::io::ErrorKind;
+        let mut bytes = [0; 3];
+        let mut calls = 0;
+        read_exact_at_with(&mut bytes, 5, |buf, offset| {
+            calls += 1;
+            if calls == 1 {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            buf[0] = offset as u8;
+            Ok(1)
+        })?;
+        assert_eq!(bytes, [5, 6, 7]);
+        assert_eq!(calls, 4);
+        assert_eq!(
+            read_exact_at_with(&mut bytes, 0, |_, _| Ok(0))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_exact_at_with(&mut bytes, u64::MAX, |_, _| Ok(1))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            read_exact_at_with(
+                &mut bytes,
+                0,
+                |_, _| Err(ErrorKind::PermissionDenied.into())
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::PermissionDenied
+        );
+        read_exact_at_with(&mut [], 0, |_, _| {
+            panic!("invariant: aucune lecture pour une plage vide")
+        })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn positioned_writes_handle_partial_writes_and_preserve_other_bytes() -> std::io::Result<()> {
+        use std::io::{ErrorKind, Write};
+        let mut file = tempfile::tempfile()?;
+        file.write_all(b"abcdef")?;
+        pwrite_all(&file, b"XY", 2)?;
+        let mut bytes = [0; 6];
+        pread_exact(&file, &mut bytes, 0)?;
+        assert_eq!(&bytes, b"abXYef");
+        let mut written = Vec::new();
+        let mut calls = 0;
+        write_all_at_with(b"abc", 7, |buf, offset| {
+            calls += 1;
+            if calls == 1 {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            written.push((offset, buf[0]));
+            Ok(1)
+        })?;
+        assert_eq!(written, [(7, b'a'), (8, b'b'), (9, b'c')]);
+        assert_eq!(
+            write_all_at_with(b"a", 0, |_, _| Ok(0)).unwrap_err().kind(),
+            ErrorKind::WriteZero
+        );
+        assert_eq!(
+            write_all_at_with(b"ab", u64::MAX, |_, _| Ok(1))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            write_all_at_with(b"a", 0, |_, _| Err(ErrorKind::PermissionDenied.into()))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        write_all_at_with(b"", 0, |_, _| {
+            panic!("invariant: aucune écriture pour une plage vide")
+        })?;
+        Ok(())
+    }
+
     use safetensors::{serialize, View};
     use std::borrow::Cow;
+
+    #[test]
+    fn bounded_file_reads_match_byte_conversions_across_chunks() -> Result<()> {
+        let file = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+        // Dépasse le scratch de 64 Kio et finit sur un fragment incomplet.
+        // Les formats FP8 refusent les NaN/inf : le motif reste fini dans
+        // tous les dtypes testés, tout en variant à travers la frontière.
+        let bytes: Vec<u8> = (0..65_540).map(|i| (i * 37 % 120) as u8).collect();
+        let mut payload = vec![0; 11];
+        payload.extend_from_slice(&bytes);
+        std::fs::write(file.path(), payload).expect("invariant: fixture écrite");
+        for dtype in [
+            Dtype::F32,
+            Dtype::BF16,
+            Dtype::F16,
+            Dtype::F8_E4M3,
+            Dtype::F8_E5M2,
+        ] {
+            let expected = bytes_to_dense_f32(&bytes, dtype, "fixture")?;
+            let actual = read_dense_f32_at(file.as_file(), 11, bytes.len(), dtype, "fixture")?;
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            read_u32_at(file.as_file(), 11, bytes.len(), "fixture")?,
+            crate::quantization::bytes_to_u32(&bytes, "fixture")?
+        );
+        assert!(read_dense_f32_at(file.as_file(), 11, 3, Dtype::F32, "fixture").is_err());
+        assert!(
+            read_dense_f32_at(file.as_file(), 11, bytes.len() + 4, Dtype::F32, "fixture").is_err()
+        );
+        assert!(read_u32_at(file.as_file(), 11, bytes.len() + 4, "fixture").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn file_ranges_reject_hostile_lengths_and_post_validation_truncation() -> Result<()> {
+        let file = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+        std::fs::write(file.path(), [0_u8; 16]).expect("invariant: fixture écrite");
+        check_file_range(file.as_file(), 8, 8, "fixture")?;
+        for (offset, len) in [(0, usize::MAX - 3), (u64::MAX, 4), (17, 0)] {
+            assert!(matches!(
+                check_file_range(file.as_file(), offset, len, "fixture"),
+                Err(InferError::Shape(_))
+            ));
+            assert!(matches!(
+                read_dense_f32_at(file.as_file(), offset, len, Dtype::F32, "fixture"),
+                Err(InferError::Shape(_))
+            ));
+            assert!(matches!(
+                read_u32_at(file.as_file(), offset, len, "fixture"),
+                Err(InferError::Shape(_))
+            ));
+        }
+        file.as_file().set_len(4).expect("invariant: troncature");
+        assert!(read_dense_f32_at(file.as_file(), 8, 8, Dtype::BF16, "fixture").is_err());
+        assert!(read_u32_at(file.as_file(), 8, 8, "fixture").is_err());
+        Ok(())
+    }
 
     struct F32View {
         shape: Vec<usize>,

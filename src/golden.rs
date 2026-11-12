@@ -189,3 +189,5 @@ pub fn coherence_text(name: &str, text: &str) -> Result<()> {
     assert_eq!(golden, text, "cohérence golden↔mlx {name}: texte divergent");
     Ok(())
 }
+
+mod chat_templates;

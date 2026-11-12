@@ -1,5 +1,6 @@
 //! Génération, préfill et tête MTP du décodeur causal.
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::runtime_flags::mtp_sampled_enabled;
 use crate::sampling::{
     lossless_speculative_sample, lossless_speculative_sample_dense, sample_from_dense_distribution,
@@ -14,6 +15,7 @@ use super::attention_ops::{full_attention_append_kv_rows, full_attention_context
 use super::lookup::NgramLookup;
 use super::mtp::{concat_row_pair, concat_rows};
 use super::mtp_adaptive::AdaptiveDepthController;
+use super::state_snapshot::SnapshotMode;
 use super::*;
 
 fn emit_mtp_committed(
@@ -434,7 +436,13 @@ impl CausalDecoder {
         let position = cache.position;
         let runtime = self.forward_runtime();
         let mut hidden = self.embed_scaled(&[token_id])?;
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("embeddings", &hidden)?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
+            #[cfg(feature = "devtools")]
+            let _capture = crate::devtools::layer_dump::enter_layer(layer_index);
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("input", &hidden)?;
             hidden = layer.forward_cached(
                 &self.config,
                 &hidden,
@@ -442,6 +450,8 @@ impl CausalDecoder {
                 position,
                 runtime,
             )?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("output", &hidden)?;
         }
         cache.position += 1;
         rms_norm(&hidden, &self.final_norm, self.config.rms_eps)
@@ -538,7 +548,7 @@ impl CausalDecoder {
         self.finalize_logits(&logits)
     }
 
-    pub(super) fn finalize_logits(&self, logits: &Tensor) -> Result<Tensor> {
+    pub(crate) fn finalize_logits(&self, logits: &Tensor) -> Result<Tensor> {
         let mut row = logits.last_row()?.to_vec();
         if let Some(softcap) = self.config.final_logit_softcapping {
             if softcap > 0.0 {
@@ -1465,7 +1475,7 @@ impl CausalDecoder {
                 (cache, final_state, Some(mtp_history), reused)
             } else {
                 let (cache, final_state, reused) = with_prefill_kv_reserve(decode_reserve, || {
-                    self.prefill_cache_state_reused(prompt)
+                    self.prefill_cache_state_snapshot_mode(prompt, SnapshotMode::MtpFresh)
                 })?;
                 (cache, final_state, None, reused)
             };
@@ -2212,7 +2222,7 @@ impl CausalDecoder {
 
         let draft_limit = max_draft_tokens.min(draft.info.block_size);
         let (mut cache, mut final_state, target_hidden) =
-            self.prefill_cache_state_with_layer_capture(prompt, &draft.info.target_layer_ids)?;
+            self.prefill_cache_state_with_layer_capture(prompt, draft)?;
         // Réserve l'avance spéculative : un cycle propose jusqu'à `draft_limit` tokens au-delà du
         // dernier token retenu avant de tronquer les rejets ; sans cette marge le KV résident
         // déborde en fin de génération (capacité = prompt + max_new_tokens exactement).
@@ -2319,7 +2329,7 @@ impl CausalDecoder {
         }
 
         let (mut cache, final_state, _) =
-            self.prefill_cache_state_with_layer_capture(prompt, &draft.info.target_layer_ids)?;
+            self.prefill_cache_state_with_layer_capture(prompt, draft)?;
         self.setup_resident_decode_from_prefill(&mut cache, max_new_tokens)?;
         let mut sampler = DeterministicSampler::new(options.seed);
         let mut token = self.sample_token_from_state(&final_state, options, &mut sampler)?;
@@ -2445,7 +2455,7 @@ impl CausalDecoder {
                 ))
             })?;
             let (max_abs, mean_abs) = diff_stats_same_len(reference_slice, resident_slice)?;
-            let attention_kind = if self.config.is_full_attention_layer(layer_index) {
+            let attention_kind = if self.plan.layers[layer_index].is_full() {
                 "full"
             } else {
                 "linear"
@@ -2513,7 +2523,7 @@ impl CausalDecoder {
         input_token: usize,
     ) -> Result<Option<ResidentLinearXrayProbe>> {
         let Some(layer_index) =
-            (0..self.layers.len()).find(|index| !self.config.is_full_attention_layer(*index))
+            (0..self.layers.len()).find(|index| !self.plan.layers[*index].is_full())
         else {
             return Ok(None);
         };
@@ -3235,12 +3245,27 @@ impl CausalDecoder {
     pub(in crate::decoder) fn prefill_cache_state_with_layer_capture(
         &self,
         prompt: &[usize],
-        layer_ids: &[usize],
+        draft: &DFlashDraft,
     ) -> Result<(CausalDecoderCache, Tensor, Tensor)> {
+        let layer_ids = &draft.info.target_layer_ids;
+        let snapshot =
+            self.snapshot_request_dflash(prompt, SnapshotMode::DflashReference, Some(draft))?;
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            if let Some(captures) = state.captures {
+                if captures.layer_ids == *layer_ids && captures.from == 0 {
+                    return Ok((
+                        state.cache,
+                        state.final_state,
+                        Arc::unwrap_or_clone(captures.hidden),
+                    ));
+                }
+            }
+        }
         let (cache, final_states, captures) =
             self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids, usize::MAX, false)?;
         let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
-        Ok((cache, final_state, captures.hidden))
+        self.snapshot_save(&snapshot, &cache, &final_state, None, Some(&captures));
+        Ok((cache, final_state, Arc::unwrap_or_clone(captures.hidden)))
     }
 
     /// Comme [`Self::prefill_cache_state_with_layer_capture`], mais rend les
@@ -3311,7 +3336,7 @@ impl CausalDecoder {
             PrefixCaptures {
                 layer_ids: layer_ids.to_vec(),
                 from: 0,
-                hidden: target_hidden,
+                hidden: target_hidden.into(),
             },
         ))
     }
@@ -3586,6 +3611,51 @@ impl CausalDecoder {
         let (cache, final_state) = self.prefill_cache_state(prompt)?;
         let logits = self.logits_from_final_state(&final_state)?;
         Ok((cache, logits))
+    }
+
+    /// Capture le prefill Gemma 4 MoE dans un répertoire neuf (feature `devtools`).
+    ///
+    /// Utilise le runtime attaché : CPU f32 ou Metal per-op par défaut, sans
+    /// cache de préfixe ni snapshot disque. Aucun poids ni token n'est téléchargé.
+    ///
+    /// # Errors
+    ///
+    /// Refuse un modèle hors Gemma 4 MoE, un prefill résident fusionné, une
+    /// capture incomplète ou un répertoire déjà existant.
+    #[cfg(feature = "devtools")]
+    pub fn dump_gemma4_layers(&self, prompt: &[usize], directory: &Path) -> Result<Tensor> {
+        if prompt.is_empty() || !self.config.is_gemma4 || !self.config.parallel_moe {
+            return Err(InferError::Config(
+                "dump réservé à un prompt Gemma 4 MoE non vide".into(),
+            ));
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if self.forward_runtime().metal_executor().is_some()
+            && crate::runtime_flags::prefill_resident_gemma4_enabled()
+        {
+            return Err(InferError::Config("dump: désactiver SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4 (chemin fusionné non instrumenté)".into()));
+        }
+        let backend = "cpu-f32";
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let backend = if self.forward_runtime().metal_executor().is_some() {
+            "metal-per-op"
+        } else {
+            backend
+        };
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _scratch_buffer_scope = self.scratch_buffer_scope();
+        let capture = crate::devtools::layer_dump::Capture::start(
+            directory,
+            prompt,
+            self.layers.len(),
+            backend,
+        )?;
+        let (_, final_state) = self.prefill_cache_state_uncached_inner(prompt)?;
+        crate::devtools::layer_dump::record("final_norm", &final_state)?;
+        let logits = self.logits_from_final_state(&final_state)?;
+        crate::devtools::layer_dump::record("logits", &logits)?;
+        capture.finish()?;
+        Ok(logits)
     }
 
     /// Préremplit le cache sans consulter ni alimenter le prefix cache.
@@ -3889,6 +3959,18 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor, usize)> {
+        self.prefill_cache_state_snapshot_mode(prompt, SnapshotMode::Ar)
+    }
+
+    fn prefill_cache_state_snapshot_mode(
+        &self,
+        prompt: &[usize],
+        mode: SnapshotMode,
+    ) -> Result<(CausalDecoderCache, Tensor, usize)> {
+        let snapshot = self.snapshot_request(prompt, mode)?;
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            return Ok((state.cache, state.final_state, prompt.len()));
+        }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -3898,6 +3980,7 @@ impl CausalDecoder {
         }
         if prefix_cache_enabled() {
             if let Some(((cache, final_state), reused)) = self.prefix_cache_get(prompt)? {
+                self.snapshot_save(&snapshot, &cache, &final_state, None, None);
                 return Ok((cache, final_state, reused));
             }
         }
@@ -3905,6 +3988,7 @@ impl CausalDecoder {
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, None, None)?;
         }
+        self.snapshot_save(&snapshot, &state.0, &state.1, None, None);
         Ok((state.0, state.1, 0))
     }
 
@@ -3916,7 +4000,13 @@ impl CausalDecoder {
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
-        self.prefill_cache_state_uncached_inner(prompt)
+        let snapshot = self.snapshot_request(prompt, SnapshotMode::Ar)?;
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            return Ok((state.cache, state.final_state));
+        }
+        let state = self.prefill_cache_state_uncached_inner(prompt)?;
+        self.snapshot_save(&snapshot, &state.0, &state.1, None, None);
+        Ok(state)
     }
 
     fn prefill_cache_state_uncached_inner(
@@ -3943,8 +4033,28 @@ impl CausalDecoder {
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
+        let snapshot = self.snapshot_request(prompt, SnapshotMode::MtpCommitted)?;
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            if let Some(history) = state.history {
+                let keep = on_final_state(&state.final_state)?;
+                return Ok((
+                    state.cache,
+                    state.final_state,
+                    if keep {
+                        history
+                    } else {
+                        LayerKvCache::default()
+                    },
+                    prompt.len(),
+                ));
+            }
+            eprintln!("state_snapshot refusé : historique MTP absent; prefill normal");
+        }
         if prefix_cache_enabled() {
             if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt, on_final_state)? {
+                if hit.2.len() == prompt.len().saturating_sub(1) {
+                    self.snapshot_save(&snapshot, &hit.0, &hit.1, Some(&hit.2), None);
+                }
                 return Ok(hit);
             }
         }
@@ -4073,6 +4183,7 @@ impl CausalDecoder {
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, Some(&mtp_history), None)?;
         }
+        self.snapshot_save(&snapshot, &state.0, &state.1, Some(&mtp_history), None);
         Ok((state.0, state.1, mtp_history, 0))
     }
 
@@ -4408,14 +4519,18 @@ impl CausalDecoder {
     /// les captures de `layer_ids` et prolonge état et captures sur le suffixe
     /// par le prefill résident borné par défaut, avec le forward per-op en repli.
     /// Rend `(cache, état final, captures, from)` avec les captures bornées aux
-    /// `keep_rows` dernières positions, y compris avant copie d'un hit exact.
+    /// `keep_rows` dernières positions, partagées pour un hit exact sans troncature.
     #[cfg(feature = "devtools")]
+    #[expect(
+        clippy::type_complexity,
+        reason = "état du cache, état final, captures partagées et position absolue"
+    )]
     pub(super) fn prefix_cache_get_with_captures(
         &self,
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
-    ) -> Result<Option<(CausalDecoderCache, Tensor, Tensor, usize)>> {
+    ) -> Result<Option<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)>> {
         let Some((mut output, cached_len, history, Some(captures))) =
             self.prefix_cache_hit(prompt, false, keep_rows)?
         else {
@@ -4479,10 +4594,45 @@ impl CausalDecoder {
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
-    ) -> Result<(CausalDecoderCache, Tensor, Tensor, usize)> {
+        drafter: Option<&DFlashDraft>,
+    ) -> Result<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)> {
+        let snapshot = if crate::runtime_flags::state_snapshot_dir().is_some() {
+            self.snapshot_request_dflash(
+                prompt,
+                SnapshotMode::Dflash(format!("{layer_ids:?}:{keep_rows}")),
+                drafter,
+            )?
+        } else {
+            None
+        };
+        if let Some(state) = self.snapshot_load(&snapshot) {
+            if let Some(captures) = state.captures {
+                if captures.layer_ids == layer_ids
+                    && (!self.dflash_switch_needs_history() || state.history.is_some())
+                {
+                    let pair = (state.cache, state.final_state);
+                    if prefix_cache_enabled() {
+                        self.prefix_cache_put(
+                            prompt,
+                            &pair,
+                            state.history.as_ref(),
+                            Some(&captures),
+                        )?;
+                    }
+                    return Ok((pair.0, pair.1, captures.hidden, captures.from));
+                }
+            }
+            eprintln!(
+                "state_snapshot refusé : captures ou historique DFlash absents; prefill normal"
+            );
+        }
         let profile = crate::runtime_flags::env_flag("SARAGOSSA_RUST_DFLASH_PROFILE", false);
         let started = Instant::now();
-        if prefix_cache_enabled() {
+        // NOTE: la lecture du cache de préfixe rend les captures mais pas son
+        // historique MTP : un prefill complet garantit une publication DFlash
+        // complète. Après un hit disque, réinsérer aussi cet historique permet
+        // les extensions de préfixe et la bascule vers MTP hors mode instantané.
+        if snapshot.is_none() && prefix_cache_enabled() {
             if let Some(hit) = self.prefix_cache_get_with_captures(prompt, layer_ids, keep_rows)? {
                 if profile {
                     eprintln!(
@@ -4523,6 +4673,13 @@ impl CausalDecoder {
                 started.elapsed().as_millis()
             );
         }
+        self.snapshot_save(
+            &snapshot,
+            &state.0,
+            &state.1,
+            mtp_history.as_ref(),
+            Some(&captures),
+        );
         Ok((state.0, state.1, captures.hidden, captures.from))
     }
 
@@ -4919,7 +5076,7 @@ impl CausalDecoder {
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn restore_prefix_cache_linear_metal(
+    pub(super) fn restore_prefix_cache_linear_metal(
         &self,
         cache: &mut CausalDecoderCache,
         snapshots: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
@@ -5034,7 +5191,13 @@ impl CausalDecoder {
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
         let mut hidden = self.embed_scaled(prompt)?;
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("embeddings", &hidden)?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
+            #[cfg(feature = "devtools")]
+            let _capture = crate::devtools::layer_dump::enter_layer(layer_index);
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("input", &hidden)?;
             hidden = layer.forward_prefill(
                 &self.config,
                 &hidden,
@@ -5042,6 +5205,8 @@ impl CausalDecoder {
                 0,
                 runtime,
             )?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("output", &hidden)?;
         }
         cache.position = prompt.len();
         let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
@@ -5065,7 +5230,13 @@ impl CausalDecoder {
         for chunk in prompt.chunks(chunk_size) {
             let position_offset = cache.position;
             let mut hidden = self.embed_scaled(chunk)?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("embeddings", &hidden)?;
             for (layer_index, layer) in self.layers.iter().enumerate() {
+                #[cfg(feature = "devtools")]
+                let _capture = crate::devtools::layer_dump::enter_layer(layer_index);
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("input", &hidden)?;
                 hidden = layer.forward_prefill(
                     &self.config,
                     &hidden,
@@ -5073,6 +5244,8 @@ impl CausalDecoder {
                     position_offset,
                     runtime,
                 )?;
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("output", &hidden)?;
             }
             cache.position += chunk.len();
             last_hidden = Some(hidden);
@@ -5180,7 +5353,9 @@ impl CausalDecoder {
                 false,
                 chunk_tokens,
             )?
-            .and_then(|(_, _, captures)| captures.map(|captures| captures.hidden)))
+            .and_then(|(_, _, captures)| {
+                captures.map(|captures| Arc::unwrap_or_clone(captures.hidden))
+            }))
     }
 
     /// Oracle de test : logits des lignes `rows` d'un hidden non normé
@@ -5349,7 +5524,7 @@ impl CausalDecoder {
     /// couches `capture_layer_ids` (`[kept, n * hidden]`, cf. le drafter DFlash),
     /// bornées à `keep_rows` et accompagnées de leur position absolue de départ.
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn prefill_resident_cache_hidden_and_captures(
+    pub(in crate::decoder) fn prefill_resident_cache_hidden_and_captures(
         &self,
         prompt: &[usize],
         capture_layer_ids: &[usize],
@@ -5551,13 +5726,13 @@ impl CausalDecoder {
                 && !crate::runtime_flags::gpu_timestamps_enabled();
             let (mut bytes_per_token, mut fixed_bytes) = (0_usize, 0_usize);
             for index in (0..self.layers.len())
-                .filter(|&index| self.config.is_resident_full_attention_layer(index))
+                .filter(|&index| self.plan.layers[index].resident_full)
             {
-                let Ok(kv_dim) = self.config.resident_full_attention_kv_dim(index) else {
+                let Ok(kv_dim) = self.plan.layers[index].resident.kv_dim() else {
                     continue;
                 };
                 let row_bytes = 2 * kv_dim * KV_BYTES_PER_VALUE;
-                let window = self.config.layer_sliding_window(index).filter(|_| {
+                let window = self.plan.layers[index].resident.sliding_window.filter(|_| {
                     chunked
                         && matches!(
                             self.layers.get(index).map(|layer| &layer.attention),
@@ -5853,12 +6028,17 @@ pub(super) fn stitch_captures(
             "captures préfixe/suffixe: couches ou colonnes incompatibles".to_string(),
         ));
     }
-    // Un suffixe déjà tronqué ne doit pas être recollé au préfixe : les
-    // positions intermédiaires manquent. La couverture est vérifiée ci-dessous.
-    let (from, hidden) = if suffix.from > cached_len {
+    // Un suffixe qui couvre la fenêtre suffit : adopter ses captures au lieu
+    // d'empiler le préfixe pour le jeter aussitôt. Un suffixe déjà tronqué ne
+    // doit pas être recollé : les positions intermédiaires manquent. La
+    // couverture reste vérifiée ci-dessous.
+    let (from, hidden) = if suffix_rows >= keep_rows.max(1) || suffix.from > cached_len {
         (suffix.from, suffix.hidden)
     } else {
-        (prefix.from, stack_rows(&prefix.hidden, &suffix.hidden)?)
+        (
+            prefix.from,
+            stack_rows(&prefix.hidden, &suffix.hidden)?.into(),
+        )
     };
     let captures = PrefixCaptures::tail(&prefix.layer_ids, from, hidden, keep_rows)?;
     let (rows, _) = captures.hidden.as_matrix()?;

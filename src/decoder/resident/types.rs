@@ -1,19 +1,18 @@
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use super::super::*;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-impl CausalDecoderConfig {
+impl FullPlan {
     pub(in crate::decoder) fn resident_windowed_full_attn_layer_dims(
         &self,
-        layer_index: usize,
         hidden: usize,
         position: usize,
         eps: f32,
         theta: f32,
     ) -> Result<FullAttnLayerDims> {
-        let mut dims =
-            self.resident_full_attn_layer_dims(layer_index, hidden, position, eps, theta)?;
+        let mut dims = self.resident_full_attn_layer_dims(hidden, position, eps, theta)?;
         dims.window_start = self
-            .layer_sliding_window(layer_index)
+            .sliding_window
             .map_or(0, |window| (position + 1).saturating_sub(window));
         Ok(dims)
     }

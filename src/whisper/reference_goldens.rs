@@ -90,7 +90,9 @@ fn external_whisper_fixtures_parse() -> TestResult {
 }
 
 fn compare(name: &str, env: &str) -> TestResult {
-    let path = local(env)?;
+    let Some(path) = local(env)? else {
+        return Ok(());
+    };
     let stem = format!("whisper/{name}");
     check_model(&stem, &path)?;
     check_audio(&stem)?;

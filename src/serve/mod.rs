@@ -40,6 +40,7 @@ pub(crate) mod mtp;
 mod protocol;
 mod state;
 pub(crate) mod streaming;
+mod tool_output;
 mod warmup;
 
 use std::error::Error;

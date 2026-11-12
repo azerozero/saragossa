@@ -1,0 +1,21 @@
+{"text":""}
+{"text":"café Noël Ångström"}
+{"text":"café Noël Ångström"}
+{"text":"👩‍💻 👨‍👩‍👧‍👦 🏳️‍🌈 👍🏽"}
+{"text":"中文：你好世界。日本語、ひらがな、カタカナ。한국어"}
+{"text":"العربية: مرحبًا بالعالم!"}
+{"text":"Hello, bonjour — 0123456789 € 3.14"}
+{"text":"fn main() {\n    let café = \"☕\";\n    println!(\"{café}\");\n}\n"}
+{"text":"def greet(name):\n    if name:\n        return f\"Bonjour {name}\"\n    return None\n"}
+{"text":"  un   deux    trois  "}
+{"text":"\tune\t\tcolonne\t"}
+{"text":"\r\nligne 1\r\nligne 2\r\n"}
+{"text":" \t\n\r\n  "}
+{"text":"<|im_start|>"}
+{"text":"<start_of_turn>"}
+{"text":"<|endoftext|>"}
+{"text":"avant<|im_start|>user\ntexte<|im_end|>après<start_of_turn>model<end_of_turn><|endoftext|>"}
+{"text":"<tool_call>x</tool_call><tool_response>ok</tool_response><think>oui</think><|audio_start|><tts_text_bos>voix<tts_text_eod><|audio_end|>"}
+{"text":"<|im_start|>system\nRéponds en français.<|im_end|>\n<|im_start|>user\nBonjour 👩‍💻<|im_end|>\n<|im_start|>assistant\nSalut !<|im_end|>\n<|im_start|>user\nÉcris café en Python.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"text":"<start_of_turn>user\nRéponds en français.\n\nBonjour 👩‍💻<end_of_turn>\n<start_of_turn>model\nSalut !<end_of_turn>\n<start_of_turn>user\nÉcris café en Python.<end_of_turn>\n<start_of_turn>model\n"}
+{"text":"<bos><|turn>system\nRéponds en français.<turn|>\n<|turn>user\nBonjour 👩‍💻<turn|>\n<|turn>model\nSalut !<turn|>\n<|turn>user\nÉcris café en Python.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"}

@@ -366,7 +366,12 @@ impl CausalDecoder {
         let decode_reserve = max_new_tokens + draft_limit.max(tree_budget) + 1;
         let (mut cache, final_state, target_hidden, captured_from) =
             crate::metal_backend::with_prefill_kv_reserve(decode_reserve, || {
-                self.prefill_cache_state_with_layer_capture_cached(prompt, layer_ids, keep_rows)
+                self.prefill_cache_state_with_layer_capture_cached(
+                    prompt,
+                    layer_ids,
+                    keep_rows,
+                    Some(draft),
+                )
             })?;
         let (captured_rows, captured_cols) = target_hidden.as_matrix()?;
         if captured_cols != context_cols {
@@ -1059,8 +1064,8 @@ impl CausalDecoder {
     /// glissantes, KV quantifié ou à sinks, chemin en lignes fusionné désactivé,
     /// états linéaires hors du journal arbre pour `rows` lignes.
     fn check_dflash_tree_supported(&self, cache: &CausalDecoderCache, rows: usize) -> Result<()> {
-        let sliding =
-            (0..self.layers.len()).any(|index| self.config.layer_sliding_window(index).is_some());
+        let sliding = (0..self.layers.len())
+            .any(|index| self.plan.layers[index].resident.sliding_window.is_some());
         let full = cache.layers.iter().filter_map(|layer| layer.full.as_ref());
         let refusal = dflash_tree_refusal(
             sliding,

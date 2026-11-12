@@ -212,6 +212,35 @@ fn assert_bit_exact(actual: &Tensor, expected: &Tensor, label: &str) {
     }
 }
 
+#[test]
+fn legacy_prefill_comparison_diagnostics() -> Result<()> {
+    use crate::oracle::assert_panics_with;
+    let expected = Tensor::from_vec(vec![2], vec![0.0, 0.0])?;
+    for value in [2.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let actual = Tensor::from_vec(vec![2], vec![0.0, value])?;
+        assert_panics_with(
+            &format!("prefill[1] actual={value} expected=0 tolérance=0.1"),
+            || {
+                assert_close(&actual, &expected, 0.1, "prefill");
+            },
+        );
+        assert_panics_with(
+            &format!("prefill[1] actual=0 expected={value} tolérance=0.1"),
+            || {
+                assert_close(&expected, &actual, 0.1, "prefill");
+            },
+        );
+    }
+    let actual = Tensor::from_vec(vec![1, 2], vec![f32::NAN, 0.0])?;
+    assert_panics_with(
+        "assertion `left == right` failed: prefill: formes différentes\n  left: [1, 2]\n right: [2]",
+        || assert_close(&actual, &expected, 0.1, "prefill"),
+    );
+    let actual = Tensor::from_vec(vec![2], vec![0.0, f32::INFINITY])?;
+    assert_close(&actual, &expected, f32::INFINITY, "prefill");
+    Ok(())
+}
+
 fn assert_close(actual: &Tensor, expected: &Tensor, tolerance: f32, label: &str) {
     assert_eq!(
         actual.shape(),
@@ -2432,8 +2461,7 @@ fn prefill_resident_capture_tail_matches_full() -> Result<()> {
 
 /// Le hidden complet de l'ancien chemin est l'oracle ; le semis intégré doit
 /// garder ses bits, les états du tronc et les allocations des snapshots.
-fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
-    let executor = MetalExecutor::new()?;
+fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usize) -> Result<()> {
     if private_scratch_enabled() {
         assert_eq!(
             executor
@@ -2600,26 +2628,31 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
     let raw = executor.shared_f32_rows_for_test(expected.data())?;
     let mut expected_k = Vec::new();
     let mut expected_v = Vec::new();
-    for (index, tokens) in tokens[1..].chunks(1024).enumerate() {
-        let (k, v) = executor.mtp_seed_kv_rows(
-            tokens,
-            MtpSeedStates::Raw {
-                rows: &raw,
-                first_row: index * 1024,
-                final_norm: &final_norm,
-            },
-            weights,
-            PrefillAttentionSpec {
-                seq: tokens.len(),
-                ..seed_spec
-            },
-            index * 1024,
-        )?;
-        expected_k.extend_from_slice(k.data());
-        expected_v.extend_from_slice(v.data());
+    {
+        // L'ancien chemin alloue la forme exacte du dernier bloc. Isoler
+        // son scratch pour ne pas masquer une allocation du chemin intégré.
+        let _reference_namespace = install_scratch_namespace(u64::MAX);
+        for (index, tokens) in tokens[1..].chunks(1024).enumerate() {
+            let (k, v) = executor.mtp_seed_kv_rows(
+                tokens,
+                MtpSeedStates::Raw {
+                    rows: &raw,
+                    first_row: index * 1024,
+                    final_norm: &final_norm,
+                },
+                weights,
+                PrefillAttentionSpec {
+                    seq: tokens.len(),
+                    ..seed_spec
+                },
+                index * 1024,
+            )?;
+            expected_k.extend_from_slice(k.data());
+            expected_v.extend_from_slice(v.data());
+        }
     }
     let mut seed = MtpPrefillSeed::new(
-        &executor,
+        executor,
         weights,
         seed_spec,
         &final_norm,
@@ -2638,6 +2671,27 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
         true,
         Some(&mut seed),
     )?;
+    if seq - 1 > 1024 {
+        let scratch = executor.scratch_buffers.lock().expect("scratch de test");
+        for (label, width) in [
+            ("mtp_seed_states_normed", HIDDEN),
+            ("mtp_seed_concat", 2 * HIDDEN),
+            ("mtp_seed_fc", HIDDEN),
+            ("mtp_seed_normed", HIDDEN),
+            ("mtp_seed_embedding", HIDDEN),
+            ("mtp_seed_k", KV_HEADS * HEAD_DIM),
+            ("mtp_seed_k_rope", KV_HEADS * HEAD_DIM),
+            ("mtp_seed_v", KV_HEADS * HEAD_DIM),
+        ] {
+            let lengths: Vec<_> = scratch
+                .entries
+                .keys()
+                .filter(|key| key.namespace == 0 && key.label == label)
+                .map(|key| key.len)
+                .collect();
+            assert_eq!(lengths, [1024 * width], "capacité réutilisée : {label}");
+        }
+    }
     // Même avec scratch privé, seule une ligne de sortie peut être allouée.
     let output_floats = super::resident::FINAL_OUTPUT_FLOATS.with(Cell::get);
     if private_scratch_enabled() {
@@ -2714,6 +2768,19 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
             &[KvSegment::Cpu(&expected_v)],
             seq - 1,
         )?;
+        if actual.format() == crate::decode_resident::KvFormat::Bf16 {
+            // Comparer les octets stockés, pas seulement des floats élargis.
+            for (a, b) in [
+                (actual.keys(), expected.keys()),
+                (actual.values(), expected.values()),
+            ] {
+                assert_eq!(
+                    read_u16_buffer(a.buffer(), (seq - 1) * KV_HEADS * HEAD_DIM)?,
+                    read_u16_buffer(b.buffer(), (seq - 1) * KV_HEADS * HEAD_DIM)?,
+                    "KV bf16 du semis avec capacités réutilisées",
+                );
+            }
+        }
         let (ak, av) = actual.read_rows(0, seq - 1)?;
         let (ek, ev) = expected.read_rows(0, seq - 1)?;
         for (a, b) in [(ak, ek), (av, ev)] {
@@ -2727,22 +2794,33 @@ fn check_mtp_seed_streamed(seq: usize, chunk_rows: usize) -> Result<()> {
 }
 
 #[test]
+fn mtp_seed_partial_903_reuses_capacity_and_preserves_bf16_bytes() -> Result<()> {
+    // Même queue que T=261000 : 261000 - 1 = 254 * 1024 + 903.
+    // Petites matrices synthétiques, aucun fichier de poids.
+    let Some(executor) = test_executor()? else {
+        eprintln!("semis MTP synthétique non exécuté : aucun device Metal");
+        return Ok(());
+    };
+    check_mtp_seed_streamed(&executor, 1024 + 903 + 1, 1500)
+}
+
+#[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_4097_bit_exact() -> Result<()> {
-    check_mtp_seed_streamed(4097, 4096)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_8297_bit_exact() -> Result<()> {
     // Découpage non aligné sur les blocs du semis, avec une queue de 104 lignes.
-    check_mtp_seed_streamed(8297, 1500)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 8297, 1500)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_32768_bit_exact() -> Result<()> {
-    check_mtp_seed_streamed(32768, 4096)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 32768, 4096)
 }
 
 #[test]
@@ -2751,7 +2829,432 @@ fn mtp_seed_streamed_private_scratch_bit_exact() -> Result<()> {
     crate::metal_backend::flags::with_private_scratch_override(true, || {
         assert!(private_scratch_enabled());
         // Le blit final doit rester borné, avec et sans frontière de morceau.
-        check_mtp_seed_streamed(129, 4096)?;
-        check_mtp_seed_streamed(4097, 4096)
+        check_mtp_seed_streamed(&MetalExecutor::new()?, 129, 4096)?;
+        check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096)
     })
+}
+
+/// Les mêmes phases résidentes, avec ou sans alias, doivent conserver les bits
+/// à travers GDN -> attention gatée -> MLP, y compris le morceau court.
+#[test]
+fn prefill_mixed_phase_aliases_match_distinct_storage_bit_exact() -> Result<()> {
+    for private in [false, true] {
+        with_private_scratch_override(private, check_mixed_phase_aliases)?;
+    }
+    Ok(())
+}
+
+fn check_mixed_phase_aliases() -> Result<()> {
+    use super::scratch_phases::test_support::with_phase_allocations;
+
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    const SEQ: usize = 513;
+    const CHUNK: usize = 257;
+    const HIDDEN: usize = 64;
+    const Q_HEADS: usize = 16;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 256;
+    const INTER: usize = 32;
+    const VALUE_DIM: usize = Q_HEADS * HEAD_DIM;
+    const VALUE_HEADS: usize = VALUE_DIM / 128;
+    const CONV_DIM: usize = 2 * 128 + VALUE_DIM;
+    // Les formes Steel/NAX autorisent le découpage dès 257 lignes.
+    // Chemin de production 27B : dk128/dv128, noyau conv 4.
+    let linear_spec = LinearAttentionStepSpec {
+        num_key_heads: 1,
+        num_value_heads: VALUE_HEADS,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel_dim: 4,
+        rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
+    };
+    let dims = LinearAttnResidentDims {
+        in_dim: HIDDEN,
+        conv_dim: CONV_DIM,
+        value_dim: VALUE_DIM,
+        key_dim: 128,
+    };
+
+    let input = deterministic_tensor(SEQ, HIDDEN, 601, 0.5)?;
+    let input_norm = deterministic_norm(HIDDEN, 607)?;
+    let post_norm = deterministic_norm(HIDDEN, 613)?;
+    let gate = Linear::new(deterministic_tensor(INTER, HIDDEN, 617, 0.1)?, None)?;
+    let up = Linear::new(deterministic_tensor(INTER, HIDDEN, 619, 0.1)?, None)?;
+    let down = Linear::new(deterministic_tensor(HIDDEN, INTER, 631, 0.1)?, None)?;
+    let in_proj_qkv = Linear::new(deterministic_tensor(CONV_DIM, HIDDEN, 641, 0.08)?, None)?;
+    let in_proj_z = Linear::new(deterministic_tensor(VALUE_DIM, HIDDEN, 643, 0.08)?, None)?;
+    let in_proj_b = Linear::new(deterministic_tensor(VALUE_HEADS, HIDDEN, 647, 0.08)?, None)?;
+    let in_proj_a = Linear::new(deterministic_tensor(VALUE_HEADS, HIDDEN, 653, 0.08)?, None)?;
+    let out_proj = Linear::new(deterministic_tensor(HIDDEN, VALUE_DIM, 659, 0.05)?, None)?;
+    let conv_weight = Tensor::from_vec(
+        vec![CONV_DIM, 4, 1],
+        deterministic_tensor(CONV_DIM, 4, 661, 0.3)?.data().to_vec(),
+    )?;
+    let a_log = (0..VALUE_HEADS)
+        .map(|i| deterministic_value(665, i, 0.2))
+        .collect::<Vec<_>>();
+    let dt_bias = (0..VALUE_HEADS)
+        .map(|i| deterministic_value(667, i, 0.15))
+        .collect::<Vec<_>>();
+    let norm_weight = deterministic_norm(128, 673)?;
+    let q_norm = deterministic_norm(HEAD_DIM, 677)?;
+    let k_norm = deterministic_norm(HEAD_DIM, 683)?;
+    let q_proj = Linear::new(
+        deterministic_tensor(2 * Q_HEADS * HEAD_DIM, HIDDEN, 691, 0.06)?,
+        None,
+    )?;
+    let k_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 701, 0.06)?,
+        None,
+    )?;
+    let v_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 709, 0.06)?,
+        None,
+    )?;
+    let o_proj = Linear::new(
+        deterministic_tensor(HIDDEN, Q_HEADS * HEAD_DIM, 719, 0.02)?,
+        None,
+    )?;
+    let spec = PrefillAttentionSpec {
+        seq: SEQ,
+        hidden_dim: HIDDEN,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        rope_theta: 10_000_000.0,
+        attn_scalar: HEAD_DIM as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let tail = PrefillMoeTail::Dense {
+        gate_proj: &gate,
+        up_proj: &up,
+        down_proj: &down,
+    };
+    let layers = [
+        PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Linear {
+                weights: LinearAttnResidentWeights {
+                    in_proj_qkv: &in_proj_qkv,
+                    in_proj_z: &in_proj_z,
+                    in_proj_b: &in_proj_b,
+                    in_proj_a: &in_proj_a,
+                    out_proj: &out_proj,
+                    conv_weight: &conv_weight,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    norm_weight: norm_weight.data(),
+                },
+                spec: linear_spec,
+                dims,
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail,
+        },
+        PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Full {
+                q_proj: &q_proj,
+                k_proj: &k_proj,
+                v_proj: &v_proj,
+                o_proj: &o_proj,
+                q_norm: &q_norm,
+                k_norm: &k_norm,
+                gated: true,
+                sinks: None,
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail,
+        },
+    ];
+    assert_eq!(dims.value_dim, Q_HEADS * HEAD_DIM);
+    assert!(executor.prefill_resident_extend_supported(&layers));
+    let run = || {
+        executor.qwen_moe_prefill_resident_with_captures(
+            PrefillInput::Hidden(&input),
+            &layers,
+            spec,
+            None,
+            &[0, 1],
+            usize::MAX,
+            CHUNK,
+            false,
+        )
+    };
+    let (expected, distinct) = with_phase_allocations(true, run);
+    let (expected, expected_caches, expected_captures) = expected?;
+    // Matérialiser avant le second run : aucun résultat ne sert d'oracle
+    // en restant une vue sur un scratch que ce run pourrait écraser.
+    let expected = expected.into_tensor(HIDDEN)?;
+    let (actual, shared) = with_phase_allocations(false, run);
+    let (actual, actual_caches, actual_captures) = actual?;
+    let actual = actual.into_tensor(HIDDEN)?;
+    assert!(actual.data().iter().all(|x| x.is_finite()));
+    assert!(actual.data().iter().any(|&x| x != 0.0));
+    assert_bit_exact(&actual, &expected, "phases mixtes sortie");
+    let (Some(actual_captures), Some(expected_captures)) = (actual_captures, expected_captures)
+    else {
+        return Err(InferError::Config(
+            "captures des deux couches absentes".into(),
+        ));
+    };
+    assert_eq!(actual_captures.from, 0);
+    assert_eq!(expected_captures.from, 0);
+    assert_eq!(actual_captures.hidden.shape(), &[SEQ, 2 * HIDDEN]);
+    assert_bit_exact(
+        &actual_captures.hidden,
+        &expected_captures.hidden,
+        "phases mixtes captures",
+    );
+    match (actual_caches.as_slice(), expected_caches.as_slice()) {
+        (
+            [PrefillResidentLayerCache::Linear { state: a }, PrefillResidentLayerCache::Full { .. }],
+            [PrefillResidentLayerCache::Linear { state: b }, PrefillResidentLayerCache::Full { .. }],
+        ) => {
+            assert_full_kv_bit_exact(&actual_caches, &expected_caches, "phases mixtes K/V")?;
+            assert_eq!(a.conv_len, b.conv_len);
+            assert_eq!(a.ssm_len, b.ssm_len);
+            assert_eq!(a.ssm_bf16, b.ssm_bf16);
+            for (a, b, len, bf16) in [
+                (&a.conv, &b.conv, a.conv_len, false),
+                (&a.ssm, &b.ssm, a.ssm_len, a.ssm_bf16),
+            ] {
+                if bf16 {
+                    assert_eq!(read_u16_buffer(a, len)?, read_u16_buffer(b, len)?);
+                } else {
+                    let bits = |buffer: &BufferRef| -> Result<Vec<u32>> {
+                        Ok(read_f32_buffer(buffer, len)?
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect())
+                    };
+                    assert_eq!(bits(a)?, bits(b)?, "phases mixtes état GDN");
+                }
+            }
+        }
+        _ => return Err(InferError::Config("caches GDN + full attendus".into())),
+    }
+    let mode = if private_scratch_enabled() {
+        metal::MTLStorageMode::Private
+    } else {
+        metal::MTLStorageMode::Shared
+    };
+    assert_eq!(shared.len(), distinct.len());
+    let mut distinct_addresses = std::collections::HashSet::new();
+    for (a, b) in shared.iter().zip(&distinct) {
+        assert_eq!((a.label, a.requested), (b.label, b.requested));
+        assert_eq!(a.buffer.storage_mode(), mode);
+        assert_eq!(b.buffer.storage_mode(), mode);
+        assert!(
+            distinct_addresses.insert(b.buffer.as_ptr() as usize),
+            "oracle sans alias"
+        );
+    }
+    // Chaque chunk alloue les deux couches réelles : Q/contexte/Z, RoPE/
+    // gated, gate/Y, O/down, input/postnorm. Le dernier GDN demande 256 lignes
+    // et reprend le stockage de 257 lignes de l'attention complète.
+    let mut shared_addresses = std::collections::HashSet::new();
+    for (label, width, per_chunk) in [
+        (PHASE_Q_CONTEXT, dims.value_dim, 3),
+        (PHASE_ROPE_GATED, dims.value_dim, 3),
+        (PHASE_GATE, dims.value_dim, 2),
+        (PHASE_OUTPUT, HIDDEN, 4),
+        (PHASE_NORM, HIDDEN, 4),
+    ] {
+        let allocations = shared
+            .iter()
+            .filter(|a| a.label == label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            allocations.len(),
+            2 * per_chunk,
+            "{label}: deux morceaux et deux couches"
+        );
+        let address = allocations[0].buffer.as_ptr();
+        assert!(
+            shared_addresses.insert(address as usize),
+            "phases indépendantes"
+        );
+        for a in &allocations {
+            assert_eq!(a.buffer.as_ptr(), address, "{label}: partage effectif");
+            assert_eq!(a.buffer.length(), (CHUNK * width * 4) as u64);
+        }
+        if width == dims.value_dim {
+            assert_eq!(
+                allocations
+                    .iter()
+                    .filter(|a| a.requested == (CHUNK - 1) * width)
+                    .count(),
+                1,
+                "{label}: dernier GDN court réellement exécuté"
+            );
+        }
+    }
+    eprintln!(
+        "phases mixtes {mode:?}: 257+256 lignes, {} demandes, {} buffers partagés, {} distincts; bits identiques",
+        shared.len(), shared_addresses.len(), distinct_addresses.len(),
+    );
+    Ok(())
+}
+
+#[test]
+fn mtp_seed_quantized_nax_partial_903_bit_exact() -> Result<()> {
+    use super::super::matmul_select::{AffineMatmulKernel, OFFSET_TEST_KERNEL};
+    use super::super::profiling::OFFSET_TEST_DISPATCHES;
+
+    let Some(executor) = test_executor()? else {
+        eprintln!("semis MTP NAX non exécuté : aucun device Metal");
+        return Ok(());
+    };
+    if executor.na_gemm_coop_qb_tiled.is_none() || executor.na_gemm_coop_qb_tiled_gs128.is_none() {
+        eprintln!("semis MTP NAX non exécuté : pipelines NAX indisponibles");
+        return Ok(());
+    }
+    // Forcer seulement le sélecteur de test permet de couvrir les scratchs
+    // de conversion NAX avec des matrices minuscules. Les encodeurs et les
+    // kernels sont ceux de production, identiques pour les deux exécutions.
+    struct RestoreDispatch;
+    impl Drop for RestoreDispatch {
+        fn drop(&mut self) {
+            OFFSET_TEST_KERNEL.with(|slot| slot.set(None));
+            OFFSET_TEST_DISPATCHES.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    let _restore = RestoreDispatch;
+    OFFSET_TEST_KERNEL.with(|slot| slot.set(Some(AffineMatmulKernel::QmmNaFusedTiledU8)));
+    const HIDDEN: usize = 64;
+    const KV_DIM: usize = 128;
+    const ROWS: usize = 1024 + 903;
+    let input = deterministic_tensor(ROWS, HIDDEN, 743, 0.5)?;
+    let hidden = executor.upload_f32_buffer(input.data(), "mtp_nax_test_hidden")?;
+    let embedding = EmbeddingWeight::Dense(deterministic_tensor(97, HIDDEN, 751, 0.5)?);
+    let norm = deterministic_norm(HIDDEN, 757)?;
+    let fc = Linear::new_quantized(
+        deterministic_affine_weight(HIDDEN, 2 * HIDDEN, 761, 0.003)?,
+        None,
+    )?;
+    let k = Linear::new_quantized(
+        deterministic_affine_weight(KV_DIM, HIDDEN, 769, 0.004)?,
+        None,
+    )?;
+    let v = Linear::new_quantized(
+        deterministic_affine_weight(KV_DIM, HIDDEN, 773, 0.005)?,
+        None,
+    )?;
+    let weights = MtpSeedWeights {
+        embed_tokens: &embedding,
+        embed_scale: 1.0,
+        embed_recast_bf16: false,
+        pre_fc_norm_embedding: &norm,
+        pre_fc_norm_hidden: &norm,
+        fc: &fc,
+        input_norm: &norm,
+        k_proj: &k,
+        v_proj: &v,
+        k_norm: &norm,
+    };
+    let spec = PrefillAttentionSpec {
+        seq: ROWS,
+        hidden_dim: HIDDEN,
+        q_heads: 4,
+        kv_heads: 2,
+        head_dim: 64,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        rope_theta: 10_000.0,
+        attn_scalar: 64.0,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let tokens: Vec<_> = (0..ROWS).map(|i| (i * 31 + 7) % 97).collect();
+    for private in [false, true] {
+        crate::metal_backend::flags::with_private_scratch_override(private, || -> Result<()> {
+            let run = |reuse, namespace| -> Result<(Vec<Vec<u32>>, Vec<String>)> {
+                let _namespace = install_scratch_namespace(namespace);
+                let mut seed = MtpPrefillSeed::new(&executor, weights, spec, &norm, &tokens, 1024)?;
+                // Rejouer le semis intégré précédent : seule la garde de
+                // capacité est neutralisée, ni kernels ni découpage changés.
+                seed.reuse_scratch_capacity = reuse;
+                OFFSET_TEST_DISPATCHES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+                let cb = executor.queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                let guard = EncoderEndGuard::new(encoder);
+                seed.encode_chunk(&executor, encoder, &hidden, 0, ROWS)?;
+                guard.end();
+                commit_and_wait(cb)?;
+                seed.complete();
+                let trace = OFFSET_TEST_DISPATCHES
+                    .with(|slot| slot.borrow_mut().take())
+                    .expect("invariant: capture des dispatchs active");
+                let nax: Vec<_> = trace
+                    .into_iter()
+                    .filter(|line| line.starts_with("gemm_nax_"))
+                    .collect();
+                // FC (gs128), puis K|V concaténés (gs64), pour chaque bloc.
+                assert_eq!(
+                    nax,
+                    [
+                        "gemm_nax_coop_qb_tiled_gs128 M=1024 N=64 K=128",
+                        "gemm_nax_coop_qb_tiled M=1024 N=256 K=64",
+                        "gemm_nax_coop_qb_tiled_gs128 M=903 N=64 K=128",
+                        "gemm_nax_coop_qb_tiled M=903 N=256 K=64",
+                    ]
+                );
+                let scratch = executor
+                    .scratch_buffers
+                    .lock()
+                    .expect("invariant: scratch de test");
+                let mut lengths: Vec<_> = scratch
+                    .entries
+                    .keys()
+                    .filter(|key| {
+                        key.namespace == namespace && key.label == "qmm_na_fused_tiled_lhs_bf16"
+                    })
+                    .map(|key| key.len)
+                    .collect();
+                lengths.sort_unstable();
+                let mut expected = vec![1024 * HIDDEN, 1024 * 2 * HIDDEN];
+                if !reuse {
+                    expected.extend([903 * HIDDEN, 903 * 2 * HIDDEN]);
+                }
+                expected.sort_unstable();
+                assert_eq!(lengths, expected, "scratch NAX, réutilisation={reuse}");
+                drop(scratch);
+                let (k, v) = seed.into_rows()?;
+                let bits = [k, v]
+                    .iter()
+                    .map(|rows| {
+                        let values = rows.segment().as_f32().into_owned();
+                        assert_eq!(values.len(), ROWS * KV_DIM);
+                        assert!(values.iter().all(|x| x.is_finite()));
+                        assert!(values.iter().any(|x| *x != 0.0));
+                        values.iter().map(|x| x.to_bits()).collect()
+                    })
+                    .collect();
+                Ok((bits, nax))
+            };
+            // Namespaces distincts : le nouveau chemin ne peut emprunter
+            // aucun buffer, plein ou partiel, à l'ancien.
+            let base = if private { 104 } else { 102 };
+            let old = run(false, base)?;
+            let new = run(true, base + 1)?;
+            assert_eq!(old, new, "semis intégré NAX, scratch privé={private}");
+            Ok(())
+        })?;
+    }
+    Ok(())
 }

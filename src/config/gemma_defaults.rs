@@ -70,40 +70,17 @@ pub(super) fn apply_gemma4_defaults(
 
     let vocab = top_vocab_size.unwrap_or_else(|| serde_json::json!(262_144));
     map.entry("vocab_size".to_string()).or_insert(vocab);
-    for (key, value) in [
-        ("hidden_size", serde_json::json!(1536)),
-        ("num_hidden_layers", serde_json::json!(35)),
-        ("intermediate_size", serde_json::json!(6144)),
-        ("num_attention_heads", serde_json::json!(8)),
-        ("num_key_value_heads", serde_json::json!(1)),
-        ("head_dim", serde_json::json!(256)),
-        ("global_head_dim", serde_json::json!(512)),
-        ("rms_norm_eps", serde_json::json!(1.0e-6)),
-        ("rope_theta", serde_json::json!(1_000_000.0)),
-        ("rope_local_base_freq", serde_json::json!(10_000.0)),
-        ("rope_full_partial_rotary_factor", serde_json::json!(0.25)),
-        ("rope_sliding_partial_rotary_factor", serde_json::json!(1.0)),
-        ("sliding_window", serde_json::json!(512)),
-        ("sliding_window_pattern", serde_json::json!(5)),
-        ("hidden_activation", serde_json::json!("gelu_pytorch_tanh")),
-        ("final_logit_softcapping", serde_json::json!(30.0)),
-        ("tie_word_embeddings", serde_json::json!(true)),
-    ] {
-        map.entry(key.to_string()).or_insert(value);
-    }
 
     if let Some(top_k) = map.get("top_k_experts").cloned() {
         map.entry("num_experts_per_tok".to_string())
             .or_insert(top_k);
     }
 
-    let Some(rope_parameters) = map
+    let rope_parameters = map
         .get("rope_parameters")
         .and_then(|value| value.as_object())
         .cloned()
-    else {
-        return;
-    };
+        .unwrap_or_default();
     if let Some(full) = rope_parameters
         .get("full_attention")
         .and_then(|value| value.as_object())
@@ -130,5 +107,28 @@ pub(super) fn apply_gemma4_defaults(
             map.entry("rope_sliding_partial_rotary_factor".to_string())
                 .or_insert(factor);
         }
+    }
+
+    // Les alias explicites sont résolus avant de compléter les défauts.
+    for (key, value) in [
+        ("hidden_size", serde_json::json!(1536)),
+        ("num_hidden_layers", serde_json::json!(35)),
+        ("intermediate_size", serde_json::json!(6144)),
+        ("num_attention_heads", serde_json::json!(8)),
+        ("num_key_value_heads", serde_json::json!(1)),
+        ("head_dim", serde_json::json!(256)),
+        ("global_head_dim", serde_json::json!(512)),
+        ("rms_norm_eps", serde_json::json!(1.0e-6)),
+        ("rope_theta", serde_json::json!(1_000_000.0)),
+        ("rope_local_base_freq", serde_json::json!(10_000.0)),
+        ("rope_full_partial_rotary_factor", serde_json::json!(0.25)),
+        ("rope_sliding_partial_rotary_factor", serde_json::json!(1.0)),
+        ("sliding_window", serde_json::json!(512)),
+        ("sliding_window_pattern", serde_json::json!(5)),
+        ("hidden_activation", serde_json::json!("gelu_pytorch_tanh")),
+        ("final_logit_softcapping", serde_json::json!(30.0)),
+        ("tie_word_embeddings", serde_json::json!(true)),
+    ] {
+        map.entry(key.to_string()).or_insert(value);
     }
 }

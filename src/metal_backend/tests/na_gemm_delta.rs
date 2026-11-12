@@ -314,8 +314,7 @@ fn na_gemm_src_compiles() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    let options = CompileOptions::new();
-    options.set_fast_math_enabled(true);
+    let options = crate::metal_backend::compile_options(true);
     // NOTE: metal_tensor (MetalPerformancePrimitives) n'existe que sur les
     // SDK récents — les runners CI plus vieux n'ont pas le header ; en prod
     // le chemin NA dégrade proprement (Option → fallback f32), donc on saute.

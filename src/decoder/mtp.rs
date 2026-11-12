@@ -7,14 +7,14 @@
 //! en affine gs64 comme le tronc, normes en `1 + weight`.
 
 use super::*;
-use crate::quantization::bytes_to_u32;
-use crate::safetensor::bytes_to_dense_f32;
+use crate::qwen_loader::{read_shard_header, ShardHeader, ShardTensorEntry};
+#[cfg(test)]
+use crate::safetensor::pread_exact;
+use crate::safetensor::{read_dense_f32_at, read_u32_at};
 use crate::AffineQuantizedTensor;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use safetensors::Dtype;
-use safetensors::{tensor::TensorView, SafeTensors};
 use std::collections::HashMap;
-use std::os::unix::fs::FileExt;
 
 pub(super) struct MtpLoadContext<'a> {
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -65,8 +65,7 @@ pub(super) enum MtpMoeQuant {
 
 const MTP_DENSE_MARKER: &str = "mtp.layers.0.mlp.gate_proj.weight";
 const MTP_MOE_MARKER: &str = "mtp.layers.0.mlp.experts.gate_up_proj";
-/// `down_proj` des experts fusionnés. Avec `MTP_MOE_MARKER`, seuls tenseurs
-/// laissés sur disque jusqu'à leur quantification (`LazySidecar`).
+/// `down_proj` des experts fusionnés, lus expert par expert.
 const MTP_MOE_DOWN: &str = "mtp.layers.0.mlp.experts.down_proj";
 const MTP_QUANT_GROUP: usize = 64;
 
@@ -103,11 +102,9 @@ impl MtpHead {
         moe_quant: MtpMoeQuant,
     ) -> Result<Self> {
         let sidecar = LazySidecar::open(path.as_ref())?;
-        let st = SafeTensors::deserialize(&sidecar.bytes)
-            .map_err(|source| InferError::Config(format!("parse sidecar MTP: {source}")))?;
         // Résout les clés normalisées (sans préfixe `language_model.`) → clé réelle.
         let mut resolve: HashMap<String, String> = HashMap::new();
-        for name in st.names() {
+        for name in sidecar.header.tensors.keys() {
             let normalized = normalize_mtp_sidecar_key(name);
             if let Some(previous) = resolve.insert(normalized.clone(), name.to_string()) {
                 // Deux clés réelles pour une même clé normalisée : laquelle
@@ -117,7 +114,7 @@ impl MtpHead {
                 )));
             }
         }
-        let q_rows = st_view(&st, &resolve, "mtp.layers.0.self_attn.q_proj.weight")?
+        let q_rows = st_view(&sidecar, &resolve, "mtp.layers.0.self_attn.q_proj.weight")?
             .shape()
             .first()
             .copied()
@@ -127,9 +124,9 @@ impl MtpHead {
             resolve.contains_key(MTP_DENSE_MARKER),
             resolve.contains_key(MTP_MOE_MARKER),
         ) {
-            (true, false) => Self::dense_from_tensors(&st, &resolve, config, &dims, context),
+            (true, false) => Self::dense_from_tensors(&sidecar, &resolve, config, &dims, context),
             (false, true) => {
-                Self::moe_from_tensors(&st, &sidecar, &resolve, config, &dims, context, moe_quant)
+                Self::moe_from_tensors(&sidecar, &resolve, config, &dims, context, moe_quant)
             }
             (true, true) => Err(InferError::Config(
                 "sidecar MTP ambigu : MLP dense et experts MoE présents".to_string(),
@@ -143,7 +140,7 @@ impl MtpHead {
     /// Tête 27B : normes, attention et MLP dense, quantifiés ou bf16 tels que
     /// stockés (chemin historique inchangé).
     fn dense_from_tensors(
-        st: &SafeTensors,
+        st: &LazySidecar,
         resolve: &HashMap<String, String>,
         config: &CausalDecoderConfig,
         dims: &MtpDims,
@@ -176,7 +173,6 @@ impl MtpHead {
     /// Tête officielle Qwen3.6-35B-A3B : attention complète avec porte de
     /// sortie et MoE softmax top-k à expert partagé gated, tout en bf16.
     fn moe_from_tensors(
-        st: &SafeTensors,
         sidecar: &LazySidecar,
         resolve: &HashMap<String, String>,
         config: &CausalDecoderConfig,
@@ -190,9 +186,9 @@ impl MtpHead {
                 "tête MTP MoE : attn_output_gate requis".to_string(),
             ));
         }
-        let norms = MtpNorms::load(st, resolve, MtpNormConvention::UnitOffset)?;
+        let norms = MtpNorms::load(sidecar, resolve, MtpNormConvention::UnitOffset)?;
         let linear = |prefix: &str, bits: usize| -> Result<Linear> {
-            quantize_mtp_linear(load_mtp_linear(st, resolve, prefix, context)?, quant, bits)
+            load_mtp_moe_linear(sidecar, resolve, prefix, context, quant, bits)
         };
         // fc et attention en u8 : +18 Mio par draft (≈ 40 µs) contre 1,5 point
         // d'accord perdu en u4 (porte G1, 1200 positions) ; experts et
@@ -210,7 +206,7 @@ impl MtpHead {
             config,
         );
         let (gate_weights, up_weights, down_weights) =
-            load_mtp_fused_experts(st, sidecar, resolve, dims.hidden, quant, context)?;
+            load_mtp_fused_experts(sidecar, resolve, dims.hidden, quant, context)?;
         let expert_count = gate_weights.len();
         if config
             .num_experts
@@ -403,7 +399,7 @@ struct MtpNorms {
 
 impl MtpNorms {
     fn load(
-        st: &SafeTensors,
+        st: &LazySidecar,
         resolve: &HashMap<String, String>,
         convention: MtpNormConvention,
     ) -> Result<Self> {
@@ -483,6 +479,58 @@ fn quantize_mtp_linear(linear: Linear, quant: MtpMoeQuant, bits: usize) -> Resul
     }
 }
 
+/// Quantifie les linéaires MoE par lignes vers leurs buffers définitifs.
+/// Les codes et paramètres suivent exactement la quantification CPU puis
+/// l'arrondi bf16 du transfert historique.
+fn load_mtp_moe_linear(
+    sidecar: &LazySidecar,
+    resolve: &HashMap<String, String>,
+    prefix: &str,
+    context: &MtpLoadContext<'_>,
+    quant: MtpMoeQuant,
+    bits: usize,
+) -> Result<Linear> {
+    if resolve.contains_key(&format!("{prefix}.scales")) {
+        return load_mtp_linear(sidecar, resolve, prefix, context);
+    }
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if let (MtpMoeQuant::Affine, Some(metal)) = (quant, context.metal) {
+        if crate::runtime_flags::single_copy_weights_enabled() {
+            let key = format!("{prefix}.weight");
+            let view = st_view(sidecar, resolve, &key)?;
+            let &[rows, cols] = view.shape() else {
+                return Err(InferError::Shape(format!(
+                    "matrice MTP attendue pour {key}"
+                )));
+            };
+            let weights = quantize_matrices_into_metal(
+                metal,
+                sidecar,
+                ExpertSlices {
+                    offset: sidecar.data_offset(resolve, &key)?,
+                    stride: view.len_bytes(),
+                    rows,
+                    cols,
+                    dtype: view.dtype(),
+                    key: &key,
+                },
+                1,
+                bits,
+            )?;
+            let weight = weights
+                .into_iter()
+                .next()
+                .ok_or_else(|| InferError::Shape(format!("matrice MTP vide pour {key}")))?;
+            return Linear::from_weight(weight, None);
+        }
+    }
+    quantize_mtp_linear(
+        load_mtp_linear(sidecar, resolve, prefix, &MtpLoadContext::cpu())?,
+        quant,
+        bits,
+    )
+}
+
 /// Experts fusionnés au format transformers : `gate_up_proj` `[E, 2I, H]`
 /// (sortie découpée par `chunk(2)` : gate = lignes `0..I`, up = `I..2I`) et
 /// `down_proj` `[E, H, I]`, sans suffixe `.weight`. Convertis expert par
@@ -492,7 +540,6 @@ fn quantize_mtp_linear(linear: Linear, quant: MtpMoeQuant, bits: usize) -> Resul
     reason = "triplet gate/up/down consommé immédiatement par split_experts"
 )]
 fn load_mtp_fused_experts(
-    st: &SafeTensors,
     sidecar: &LazySidecar,
     resolve: &HashMap<String, String>,
     expected_hidden: usize,
@@ -503,9 +550,9 @@ fn load_mtp_fused_experts(
     )]
     context: &MtpLoadContext<'_>,
 ) -> Result<(Vec<LinearWeight>, Vec<LinearWeight>, Vec<LinearWeight>)> {
-    let gate_up = st_view(st, resolve, MTP_MOE_MARKER)?;
+    let gate_up = st_view(sidecar, resolve, MTP_MOE_MARKER)?;
     let down_key = MTP_MOE_DOWN;
-    let down = st_view(st, resolve, down_key)?;
+    let down = st_view(sidecar, resolve, down_key)?;
     let (&[experts, two_inter, hidden], &[down_experts, down_hidden, inter]) =
         (gate_up.shape(), down.shape())
     else {
@@ -521,8 +568,8 @@ fn load_mtp_fused_experts(
         || Some(two_inter) != inter.checked_mul(2)
         || down_experts != experts
         || down_hidden != hidden
-        || gate_up.data().len() % experts != 0
-        || down.data().len() % experts != 0
+        || gate_up.len_bytes() % experts != 0
+        || down.len_bytes() % experts != 0
     {
         return Err(InferError::Dimension(format!(
             "experts MTP incohérents : gate_up={:?}, down={:?}",
@@ -539,8 +586,8 @@ fn load_mtp_fused_experts(
             MtpMoeQuant::Dense => Ok(LinearWeight::Dense(tensor)),
         }
     };
-    let gate_up_stride = gate_up.data().len() / experts;
-    let down_stride = down.data().len() / experts;
+    let gate_up_stride = gate_up.len_bytes() / experts;
+    let down_stride = down.len_bytes() / experts;
     let gate_up_offset = sidecar.data_offset(resolve, MTP_MOE_MARKER)?;
     let down_offset = sidecar.data_offset(resolve, down_key)?;
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -550,7 +597,7 @@ fn load_mtp_fused_experts(
             let half_bytes = gate_up_stride / 2;
             let projection =
                 |offset: usize, stride: usize, rows: usize, cols: usize, dtype, key| {
-                    quantize_experts_into_metal(
+                    quantize_matrices_into_metal(
                         metal,
                         sidecar,
                         ExpertSlices {
@@ -562,6 +609,7 @@ fn load_mtp_fused_experts(
                             key,
                         },
                         experts,
+                        4,
                     )
                 };
             return Ok((
@@ -597,8 +645,13 @@ fn load_mtp_fused_experts(
     let triples = (0..experts)
         .into_par_iter()
         .map(|expert| -> Result<_> {
-            let bytes = sidecar.read(gate_up_offset + expert * gate_up_stride, gate_up_stride)?;
-            let mut rows = bytes_to_dense_f32(&bytes, gate_up.dtype(), MTP_MOE_MARKER)?;
+            let mut rows = read_dense_f32_at(
+                &sidecar.file,
+                (gate_up_offset + expert * gate_up_stride) as u64,
+                gate_up_stride,
+                gate_up.dtype(),
+                MTP_MOE_MARKER,
+            )?;
             // Garde explicite : `split_off` paniquerait sur un expert tronqué.
             let half = inter * hidden;
             if rows.len() != 2 * half {
@@ -611,8 +664,13 @@ fn load_mtp_fused_experts(
             let up_rows = rows.split_off(half);
             let gate = weight(Tensor::from_vec(vec![inter, hidden], rows)?)?;
             let up = weight(Tensor::from_vec(vec![inter, hidden], up_rows)?)?;
-            let bytes = sidecar.read(down_offset + expert * down_stride, down_stride)?;
-            let rows = bytes_to_dense_f32(&bytes, down.dtype(), down_key)?;
+            let rows = read_dense_f32_at(
+                &sidecar.file,
+                (down_offset + expert * down_stride) as u64,
+                down_stride,
+                down.dtype(),
+                down_key,
+            )?;
             let down = weight(Tensor::from_vec(vec![hidden, inter], rows)?)?;
             Ok((gate, up, down))
         })
@@ -640,16 +698,17 @@ struct ExpertSlices<'a> {
     key: &'a str,
 }
 
-/// Quantifie une projection des experts en u4 gs64 directement dans des
+/// Quantifie des matrices en affine gs64 directement dans des
 /// `MTLBuffer` partagés contigus, au format que `contiguous_metal_expert_stacks`
 /// sert sans copie. Passer par des poids CPU puis `move_packed_to_metal_shared`
 /// laissait ≈ 0,6 Go dans l'empreinte : malloc garde les blocs libérés.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn quantize_experts_into_metal(
+fn quantize_matrices_into_metal(
     metal: &crate::MetalExecutor,
     sidecar: &LazySidecar,
     slices: ExpertSlices<'_>,
     experts: usize,
+    bits: usize,
 ) -> Result<Vec<LinearWeight>> {
     let ExpertSlices {
         offset,
@@ -659,15 +718,23 @@ fn quantize_experts_into_metal(
         dtype,
         key,
     } = slices;
-    let (packed_cols, groups) = crate::quantization::affine_layout(rows, cols, MTP_QUANT_GROUP, 4)?;
-    let packed_len = rows * packed_cols;
-    let affine_len = rows * groups;
+    let (packed_cols, groups) =
+        crate::quantization::affine_layout(rows, cols, MTP_QUANT_GROUP, bits)?;
+    let packed_len = rows
+        .checked_mul(packed_cols)
+        .filter(|&len| len > 0)
+        .ok_or_else(|| InferError::Shape(format!("codes MTP invalides pour {key}")))?;
+    let affine_len = rows
+        .checked_mul(groups)
+        .filter(|&len| len > 0)
+        .ok_or_else(|| InferError::Shape(format!("paramètres MTP invalides pour {key}")))?;
     let total = |len: usize| {
         len.checked_mul(experts)
             .ok_or_else(|| InferError::Shape(format!("experts MTP {key} trop grands")))
     };
-    let matrix_bytes = (rows * cols)
-        .checked_mul(dtype.bitsize() / 8)
+    let matrix_bytes = rows
+        .checked_mul(cols)
+        .and_then(|len| len.checked_mul(dtype.bitsize() / 8))
         .filter(|&bytes| bytes > 0)
         .ok_or_else(|| {
             InferError::Dimension(format!("experts MTP {key} : dtype {dtype:?} non supporté"))
@@ -677,37 +744,51 @@ fn quantize_experts_into_metal(
             "experts MTP {key} : matrice [{rows}, {cols}] de {matrix_bytes} octets, stride de {stride}"
         )));
     }
+    let source_end = experts
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(stride))
+        .and_then(|last| last.checked_add(matrix_bytes))
+        .ok_or_else(|| InferError::Shape(format!("plage MTP trop grande pour {key}")))?;
+    crate::safetensor::check_file_range(&sidecar.file, offset as u64, source_end, key)?;
     let (packed, scales, biases) = metal.weight_buffers_affine_with(
         total(packed_len)?,
         total(affine_len)?,
         |packed, scales, biases| {
             packed
-                .par_chunks_mut(packed_len)
-                .zip(scales.par_chunks_mut(affine_len))
-                .zip(biases.par_chunks_mut(affine_len))
+                .par_chunks_mut(packed_cols)
+                .zip(scales.par_chunks_mut(groups))
+                .zip(biases.par_chunks_mut(groups))
                 .enumerate()
-                .try_for_each(|(expert, ((packed, scales), biases))| -> Result<()> {
-                    let bytes = sidecar.read(offset + expert * stride, matrix_bytes)?;
-                    let data = bytes_to_dense_f32(&bytes, dtype, key)?;
-                    let mut scales_f32 = vec![0.0_f32; affine_len];
-                    let mut biases_f32 = vec![0.0_f32; affine_len];
-                    crate::quantization::quantize_affine_into(
-                        &data,
-                        cols,
-                        MTP_QUANT_GROUP,
-                        4,
-                        packed,
-                        &mut scales_f32,
-                        &mut biases_f32,
-                    )?;
-                    for (out, value) in scales.iter_mut().zip(&scales_f32) {
-                        *out = crate::quantization::bf16_bits(*value);
-                    }
-                    for (out, value) in biases.iter_mut().zip(&biases_f32) {
-                        *out = crate::quantization::bf16_bits(*value);
-                    }
-                    Ok(())
-                })
+                .try_for_each_init(
+                    || (vec![0.0_f32; groups], vec![0.0_f32; groups]),
+                    |(scales_f32, biases_f32), (index, ((packed, scales), biases))| -> Result<()> {
+                        let (expert, row) = (index / rows, index % rows);
+                        let row_bytes = matrix_bytes / rows;
+                        let data = read_dense_f32_at(
+                            &sidecar.file,
+                            (offset + expert * stride + row * row_bytes) as u64,
+                            row_bytes,
+                            dtype,
+                            key,
+                        )?;
+                        crate::quantization::quantize_affine_into(
+                            &data,
+                            cols,
+                            MTP_QUANT_GROUP,
+                            bits,
+                            packed,
+                            scales_f32,
+                            biases_f32,
+                        )?;
+                        for (out, value) in scales.iter_mut().zip(scales_f32) {
+                            *out = crate::quantization::bf16_bits(*value);
+                        }
+                        for (out, value) in biases.iter_mut().zip(biases_f32) {
+                            *out = crate::quantization::bf16_bits(*value);
+                        }
+                        Ok(())
+                    },
+                )
         },
     )?;
     (0..experts)
@@ -726,87 +807,106 @@ fn quantize_experts_into_metal(
                 expert * affine_len,
                 affine_len,
                 MTP_QUANT_GROUP,
-                4,
+                bits,
             )
             .map(LinearWeight::AffineQuantized)
         })
         .collect()
 }
 
-/// Sidecar dont les experts fusionnés restent sur disque.
-///
-/// `bytes` a la taille du fichier pour que `SafeTensors` valide le header,
-/// mais seuls le header et les petits tenseurs y sont lus. Les pages des
-/// experts (1,6 Go en bf16 sur le 35B-A3B) ne sont jamais touchées : un
-/// `vec![0; n]` de cette taille vient de `calloc`, en pages zéro paresseuses
-/// hors de l'empreinte physique. Les experts sont lus expert par expert.
-///
-/// NOTE: `read_metadata` seul suffirait à trouver les offsets, mais les
-/// chemins dense et MoE consomment des `TensorView` de `SafeTensors`, qui
-/// exige un buffer de la taille exacte du fichier. Le coût n'est que virtuel.
+/// Seuls le header et le descripteur restent en mémoire ; chaque payload
+/// est lu à son offset, directement dans son stockage final lorsque possible.
 struct LazySidecar {
     file: std::fs::File,
-    bytes: Vec<u8>,
-    /// Tenseur réel → décalage de ses données dans le fichier.
-    offsets: HashMap<String, usize>,
+    header: ShardHeader,
 }
 
 impl LazySidecar {
     fn open(path: &Path) -> Result<Self> {
-        let io =
-            |source: std::io::Error| InferError::Config(format!("lecture sidecar MTP: {source}"));
-        let file = std::fs::File::open(path).map_err(io)?;
-        let len = usize::try_from(file.metadata().map_err(io)?.len())
-            .map_err(|_| InferError::Config("sidecar MTP trop grand".to_string()))?;
-        let mut bytes = vec![0_u8; len];
-        let mut len_bytes = [0_u8; 8];
-        file.read_exact_at(&mut len_bytes, 0).map_err(io)?;
-        let data_start = usize::try_from(u64::from_le_bytes(len_bytes))
-            .ok()
-            .and_then(|header| header.checked_add(8))
-            .filter(|&start| start <= len)
-            .ok_or_else(|| InferError::Config("header sidecar MTP invalide".to_string()))?;
-        file.read_exact_at(&mut bytes[..data_start], 0)
-            .map_err(io)?;
-        let (_, metadata) = SafeTensors::read_metadata(&bytes)
-            .map_err(|source| InferError::Config(format!("parse sidecar MTP: {source}")))?;
-        let mut offsets = HashMap::new();
-        for (name, info) in metadata.tensors() {
-            let (start, end) = info.data_offsets;
-            // `read_metadata` a validé `end` contre la taille du fichier.
-            let start = data_start + start;
-            let end = data_start + end;
-            if !matches!(
-                normalize_mtp_sidecar_key(&name).as_str(),
-                MTP_MOE_MARKER | MTP_MOE_DOWN
-            ) {
-                file.read_exact_at(&mut bytes[start..end], start as u64)
-                    .map_err(io)?;
+        let file = std::fs::File::open(path).map_err(|source| InferError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let header = read_shard_header(path)?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| InferError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+        // Même contrat que safetensors : payloads contigus, sans trous ni
+        // chevauchements, et taille exacte jusqu'à la fin du fichier.
+        let mut entries: Vec<_> = header.tensors.iter().collect();
+        entries.sort_by_key(|(_, entry)| entry.data_offsets);
+        let mut end = 0;
+        for (name, entry) in entries {
+            entry.payload_len(name)?;
+            if entry.data_offsets[0] != end {
+                return Err(InferError::Shape(format!(
+                    "offsets sidecar MTP non contigus pour {name}"
+                )));
             }
-            offsets.insert(name, start);
+            end = entry.data_offsets[1];
         }
-        Ok(Self {
-            file,
-            bytes,
-            offsets,
-        })
+        if header.data_start.checked_add(end as u64) != Some(file_len) {
+            return Err(InferError::Shape(
+                "taille sidecar MTP incohérente".to_string(),
+            ));
+        }
+        Ok(Self { file, header })
     }
 
-    /// Décalage fichier des données du tenseur de clé normalisée `norm_key`.
     fn data_offset(&self, resolve: &HashMap<String, String>, norm_key: &str) -> Result<usize> {
-        resolve
-            .get(norm_key)
-            .and_then(|actual| self.offsets.get(actual))
-            .copied()
-            .ok_or_else(|| InferError::MissingWeight(norm_key.to_string()))
+        let view = st_view(self, resolve, norm_key)?;
+        usize::try_from(view.offset()?)
+            .map_err(|_| InferError::Shape("offset MTP trop grand".to_string()))
     }
 
+    #[cfg(test)]
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         let mut out = vec![0_u8; len];
-        self.file
-            .read_exact_at(&mut out, offset as u64)
-            .map_err(|source| InferError::Config(format!("lecture experts MTP: {source}")))?;
+        pread_exact(&self.file, &mut out, offset as u64)
+            .map_err(|source| InferError::Config(format!("lecture tenseur MTP: {source}")))?;
         Ok(out)
+    }
+}
+
+struct SidecarTensor<'a> {
+    sidecar: &'a LazySidecar,
+    entry: &'a ShardTensorEntry,
+}
+
+impl SidecarTensor<'_> {
+    fn shape(&self) -> &[usize] {
+        &self.entry.shape
+    }
+    fn dtype(&self) -> safetensors::Dtype {
+        self.entry.dtype
+    }
+    fn len_bytes(&self) -> usize {
+        self.entry.data_offsets[1] - self.entry.data_offsets[0]
+    }
+    fn offset(&self) -> Result<u64> {
+        self.sidecar
+            .header
+            .data_start
+            .checked_add(self.entry.data_offsets[0] as u64)
+            .ok_or_else(|| InferError::Shape("offset MTP trop grand".to_string()))
+    }
+    fn dense(&self, name: &str) -> Result<Vec<f32>> {
+        let len = self.entry.payload_len(name)?;
+        read_dense_f32_at(&self.sidecar.file, self.offset()?, len, self.dtype(), name)
+    }
+    fn packed(&self, name: &str) -> Result<Vec<u32>> {
+        let len = self.entry.payload_len(name)?;
+        if self.dtype() != safetensors::Dtype::U32 {
+            return Err(InferError::UnsupportedDtype {
+                name: name.to_string(),
+                dtype: self.dtype(),
+            });
+        }
+        read_u32_at(&self.sidecar.file, self.offset()?, len, name)
     }
 }
 
@@ -857,26 +957,31 @@ fn is_bare_mtp_sidecar_key(key: &str) -> bool {
 
 /// Résout une vue tensor par clé normalisée.
 fn st_view<'a>(
-    st: &'a SafeTensors,
+    st: &'a LazySidecar,
     resolve: &HashMap<String, String>,
     norm_key: &str,
-) -> Result<TensorView<'a>> {
+) -> Result<SidecarTensor<'a>> {
     let actual = resolve
         .get(norm_key)
         .ok_or_else(|| InferError::MissingWeight(norm_key.to_string()))?;
-    st.tensor(actual)
-        .map_err(|source| InferError::Config(format!("MTP tensor {norm_key}: {source}")))
+    let entry = st
+        .header
+        .tensors
+        .get(actual)
+        .ok_or_else(|| InferError::MissingWeight(norm_key.to_string()))?;
+    entry.payload_len(norm_key)?;
+    Ok(SidecarTensor { sidecar: st, entry })
 }
 
 /// Charge une norme `[dim]` selon la convention du sidecar.
 fn load_mtp_norm(
-    st: &SafeTensors,
+    st: &LazySidecar,
     resolve: &HashMap<String, String>,
     key: &str,
     convention: MtpNormConvention,
 ) -> Result<Tensor> {
     let view = st_view(st, resolve, key)?;
-    let data = bytes_to_dense_f32(view.data(), view.dtype(), key)?;
+    let data = view.dense(key)?;
     let tensor = Tensor::from_vec(view.shape().to_vec(), data)?;
     match convention {
         MtpNormConvention::MeanHeuristic => {
@@ -907,7 +1012,7 @@ fn load_mtp_norm(
 
 /// Charge un Linear MTP : quantifié 4-bit gs64 si `.scales` présent, sinon dense bf16.
 fn load_mtp_linear(
-    st: &SafeTensors,
+    st: &LazySidecar,
     resolve: &HashMap<String, String>,
     prefix: &str,
     _context: &MtpLoadContext<'_>,
@@ -928,7 +1033,7 @@ fn load_mtp_linear(
             &scales_key,
         )?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(quant) = mtp_affine_from_native_bf16(
+        if let Some(quant) = mtp_affine_from_file(
             &weight,
             &scales_view,
             &biases_view,
@@ -939,24 +1044,57 @@ fn load_mtp_linear(
         )? {
             return Linear::from_weight(LinearWeight::AffineQuantized(quant), None);
         }
-        let packed = bytes_to_u32(weight.data(), &format!("{prefix}.weight"))?;
+        let packed = weight.packed(&format!("{prefix}.weight"))?;
         let scales = Tensor::from_vec(
             scales_view.shape().to_vec(),
-            bytes_to_dense_f32(scales_view.data(), scales_view.dtype(), &scales_key)?,
+            scales_view.dense(&scales_key)?,
         )?;
         let biases = Tensor::from_vec(
             biases_view.shape().to_vec(),
-            bytes_to_dense_f32(biases_view.data(), biases_view.dtype(), &biases_key)?,
+            biases_view.dense(&biases_key)?,
         )?;
         let quant =
             AffineQuantizedTensor::new(&packed_shape, packed, scales, biases, group_size, 4)?;
         Linear::from_weight(LinearWeight::AffineQuantized(quant), None)
     } else {
-        // Dense bf16 (ex. mtp.fc).
-        let data = bytes_to_dense_f32(weight.data(), weight.dtype(), prefix)?;
-        let dense = Tensor::from_vec(weight.shape().to_vec(), data)?;
-        Linear::new(dense, None)
+        load_mtp_dense_linear(&weight, _context, prefix)
     }
+}
+
+/// Le stockage reste f32 : bf16 natif changerait le kernel du chemin dense.
+fn load_mtp_dense_linear(
+    weight: &SidecarTensor<'_>,
+    _context: &MtpLoadContext<'_>,
+    prefix: &str,
+) -> Result<Linear> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if crate::runtime_flags::single_copy_weights_enabled() {
+        if let Some(metal) = _context.metal {
+            if !matches!(weight.shape(), [rows, cols] if *rows > 0 && *cols > 0) {
+                return Err(InferError::Shape(format!(
+                    "matrice MTP invalide pour {prefix}"
+                )));
+            }
+            let buffer = metal.weight_buffer_dense_f32_file(
+                &weight.sidecar.file,
+                weight.offset()?,
+                weight.entry.payload_len(prefix)?,
+                weight.dtype(),
+                prefix,
+            )?;
+            return Linear::from_weight(
+                LinearWeight::DenseShared(crate::linear::DenseSharedTensor::new(
+                    weight.shape(),
+                    buffer,
+                )?),
+                None,
+            );
+        }
+    }
+    Linear::new(
+        Tensor::from_vec(weight.shape().to_vec(), weight.dense(prefix)?)?,
+        None,
+    )
 }
 
 pub(super) fn load_mtp_draft_lm_head(
@@ -964,13 +1102,11 @@ pub(super) fn load_mtp_draft_lm_head(
     expected_in_dim: usize,
     _context: &MtpLoadContext<'_>,
 ) -> Result<Linear> {
-    let bytes = std::fs::read(path.as_ref())
-        .map_err(|source| InferError::Config(format!("lecture draft lm_head MTP: {source}")))?;
-    let st = SafeTensors::deserialize(&bytes)
-        .map_err(|source| InferError::Config(format!("parse draft lm_head MTP: {source}")))?;
+    let st = LazySidecar::open(path.as_ref())?;
     let resolve: HashMap<String, String> = st
-        .names()
-        .into_iter()
+        .header
+        .tensors
+        .keys()
         .map(|name| (normalize_mtp_draft_lm_head_key(name), name.to_string()))
         .collect();
     let head = load_mtp_draft_linear(&st, &resolve, "lm_head", expected_in_dim, _context)?;
@@ -1005,7 +1141,7 @@ fn normalize_mtp_draft_lm_head_key(key: &str) -> String {
 }
 
 fn load_mtp_draft_linear(
-    st: &SafeTensors,
+    st: &LazySidecar,
     resolve: &HashMap<String, String>,
     prefix: &str,
     expected_in_dim: usize,
@@ -1026,7 +1162,7 @@ fn load_mtp_draft_linear(
             &scales_key,
         )?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some(quant) = mtp_affine_from_native_bf16(
+        if let Some(quant) = mtp_affine_from_file(
             &weight,
             &scales_view,
             &biases_view,
@@ -1037,59 +1173,84 @@ fn load_mtp_draft_linear(
         )? {
             return Linear::from_weight(LinearWeight::AffineQuantized(quant), None);
         }
-        let packed = bytes_to_u32(weight.data(), &format!("{prefix}.weight"))?;
+        let packed = weight.packed(&format!("{prefix}.weight"))?;
         let scales = Tensor::from_vec(
             scales_view.shape().to_vec(),
-            bytes_to_dense_f32(scales_view.data(), scales_view.dtype(), &scales_key)?,
+            scales_view.dense(&scales_key)?,
         )?;
         let biases = Tensor::from_vec(
             biases_view.shape().to_vec(),
-            bytes_to_dense_f32(biases_view.data(), biases_view.dtype(), &biases_key)?,
+            biases_view.dense(&biases_key)?,
         )?;
         let quant =
             AffineQuantizedTensor::new(&packed_shape, packed, scales, biases, group_size, bits)?;
         Linear::from_weight(LinearWeight::AffineQuantized(quant), None)
     } else {
-        let data = bytes_to_dense_f32(weight.data(), weight.dtype(), prefix)?;
-        let dense = Tensor::from_vec(weight.shape().to_vec(), data)?;
-        Linear::new(dense, None)
+        load_mtp_dense_linear(&weight, _context, prefix)
     }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn mtp_affine_from_native_bf16(
-    weight: &TensorView<'_>,
-    scales: &TensorView<'_>,
-    biases: &TensorView<'_>,
+fn mtp_affine_from_file(
+    weight: &SidecarTensor<'_>,
+    scales: &SidecarTensor<'_>,
+    biases: &SidecarTensor<'_>,
     group_size: usize,
     bits: usize,
     context: &MtpLoadContext<'_>,
     prefix: &str,
 ) -> Result<Option<AffineQuantizedTensor>> {
-    if !crate::runtime_flags::single_copy_weights_enabled()
-        || scales.dtype() != Dtype::BF16
-        || biases.dtype() != Dtype::BF16
-    {
+    if !crate::runtime_flags::single_copy_weights_enabled() {
         return Ok(None);
     }
     let Some(metal) = context.metal else {
         return Ok(None);
     };
-    let packed = bytes_to_u32(weight.data(), &format!("{prefix}.weight"))?;
-    let packed_len = packed.len();
-    let scales_len = scales.data().len() / std::mem::size_of::<u16>();
-    let biases_len = biases.data().len() / std::mem::size_of::<u16>();
+    if weight.dtype() != Dtype::U32 {
+        return Err(InferError::UnsupportedDtype {
+            name: format!("{prefix}.weight"),
+            dtype: weight.dtype(),
+        });
+    }
+    let packed_len = weight.entry.payload_len(prefix)? / 4;
+    let packed = metal.weight_buffer_from_u32_file(
+        &weight.sidecar.header.path,
+        weight.offset()?,
+        weight.len_bytes(),
+    )?;
+    if scales.dtype() != Dtype::BF16 || biases.dtype() != Dtype::BF16 {
+        return Ok(Some(AffineQuantizedTensor::new_metal_shared(
+            weight.shape(),
+            packed,
+            0,
+            packed_len,
+            Tensor::from_vec(scales.shape().to_vec(), scales.dense(prefix)?)?,
+            Tensor::from_vec(biases.shape().to_vec(), biases.dense(prefix)?)?,
+            group_size,
+            bits,
+        )?));
+    }
+    let scales_len = scales.entry.payload_len(prefix)? / 2;
+    let biases_len = biases.entry.payload_len(prefix)? / 2;
     Ok(Some(AffineQuantizedTensor::new_metal_shared_bf16(
         weight.shape(),
-        metal.weight_buffer_from_u32(&packed)?,
+        packed,
         0,
         packed_len,
         scales.shape(),
-        metal.weight_buffer_from_bf16_bytes(scales.data())?,
+        metal.weight_buffer_from_bf16_file(
+            &scales.sidecar.header.path,
+            scales.offset()?,
+            scales.len_bytes(),
+        )?,
         0,
         scales_len,
         biases.shape(),
-        metal.weight_buffer_from_bf16_bytes(biases.data())?,
+        metal.weight_buffer_from_bf16_file(
+            &biases.sidecar.header.path,
+            biases.offset()?,
+            biases.len_bytes(),
+        )?,
         0,
         biases_len,
         group_size,
@@ -1214,7 +1375,7 @@ mod tests {
         use super::super::{MtpHead, MtpLoadContext, MtpMoeQuant};
         use crate::decoder::CausalDecoderConfig;
         use crate::{FeedForward, InferError, LinearWeight, Tensor};
-        use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+        use safetensors::{tensor::TensorView, Dtype};
 
         const H: usize = 64;
         const I: usize = 64;
@@ -1376,6 +1537,8 @@ mod tests {
                 LinearWeight::Dense(tensor) => tensor.data().first().copied(),
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 LinearWeight::DenseBf16(tensor) => tensor.row(0).ok()?.first().copied(),
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                LinearWeight::DenseShared(tensor) => tensor.data().first().copied(),
                 LinearWeight::AffineQuantized(_) => None,
             }
         }
@@ -1451,11 +1614,7 @@ mod tests {
             const VOCAB: usize = 8;
 
             fn executor() -> crate::Result<Option<crate::MetalExecutor>> {
-                match crate::MetalExecutor::new() {
-                    Ok(executor) => Ok(Some(executor)),
-                    Err(InferError::Metal(message)) if message.contains("aucun device") => Ok(None),
-                    Err(error) => Err(error),
-                }
+                crate::test_support::metal_executor()
             }
 
             /// Arrondi bf16 au plus proche, égalités au pair, par comparaison
@@ -1790,6 +1949,10 @@ mod tests {
                 model.config.attn_output_gate = true;
                 model.config.num_experts = experts;
                 model.config.num_experts_per_tok = 2;
+                // Cette fixture remplace la config après chargement pour la tête.
+                model.plan = std::sync::Arc::new(crate::decoder::layer_plan::ModelPlan::build(
+                    &model.config,
+                ));
                 match model.with_metal_runtime() {
                     Ok(model) => Ok(Some(model)),
                     Err(InferError::Metal(message)) if message.contains("aucun device") => Ok(None),
@@ -1934,6 +2097,208 @@ mod tests {
                 ]
             }
 
+            #[test]
+            fn direct_file_mtp_and_draft_match_old_buffers() -> crate::Result<()> {
+                use crate::decoder::mtp::{load_mtp_draft_lm_head, load_mtp_linear, LazySidecar};
+                use crate::metal_backend::weight_file_tests::buffer_bytes;
+                let Some(executor) = executor()? else {
+                    return Ok(());
+                };
+                for dtype in [Dtype::BF16, Dtype::F32] {
+                    let mut tensors = optiq_linear("lm_head", 7, 3, 64);
+                    if dtype == Dtype::F32 {
+                        for (_, stored_dtype, _, bytes) in &mut tensors[1..] {
+                            *bytes = crate::safetensor::bytes_to_dense_f32(
+                                bytes,
+                                *stored_dtype,
+                                "fixture",
+                            )?
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect();
+                            *stored_dtype = dtype;
+                        }
+                    }
+                    let tmp = write_sidecar(&tensors);
+                    let sidecar = LazySidecar::open(tmp.path())?;
+                    let resolve = tensors
+                        .iter()
+                        .map(|(name, _, _, _)| (name.clone(), name.clone()))
+                        .collect();
+                    let cpu =
+                        load_mtp_linear(&sidecar, &resolve, "lm_head", &MtpLoadContext::cpu())?;
+                    let loaded = [
+                        load_mtp_linear(
+                            &sidecar,
+                            &resolve,
+                            "lm_head",
+                            &MtpLoadContext::metal(&executor),
+                        )?,
+                        load_mtp_draft_lm_head(tmp.path(), 64, &MtpLoadContext::metal(&executor))?,
+                    ];
+                    for linear in &loaded {
+                        let (got, reference) = (affine(linear), affine(&cpu));
+                        assert_eq!(got.packed_data(), reference.packed_data());
+                        assert_eq!(got.scales_f32(), reference.scales_f32());
+                        assert_eq!(got.biases_f32(), reference.biases_f32());
+                        if single_copy_weights_enabled() {
+                            let (buffer, offset) =
+                                got.packed_metal_view().expect("invariant: codes Metal");
+                            assert_eq!(offset, 0);
+                            let old = executor.weight_buffer_from_u32(reference.packed_data())?;
+                            assert_eq!(buffer_bytes(buffer), buffer_bytes(&old));
+                            assert_eq!(buffer_bytes(buffer), tensors[0].3);
+                            if dtype == Dtype::BF16 {
+                                for (view, tensor) in
+                                    [got.scales_metal_view(), got.biases_metal_view()]
+                                        .into_iter()
+                                        .zip(&tensors[1..])
+                                {
+                                    let (buffer, offset) =
+                                        view.expect("invariant: paramètres Metal");
+                                    assert_eq!(offset, 0);
+                                    let old = executor.weight_buffer_from_bf16_bytes(&tensor.3)?;
+                                    assert_eq!(buffer_bytes(buffer), buffer_bytes(&old));
+                                }
+                            }
+                        } else {
+                            assert!(got.packed_metal_view().is_none());
+                        }
+                    }
+                    // Une lecture réelle après ouverture doit détecter la troncature.
+                    tmp.as_file()
+                        .set_len(sidecar.header.data_start + 1)
+                        .expect("invariant: troncature");
+                    assert!(load_mtp_linear(
+                        &sidecar,
+                        &resolve,
+                        "lm_head",
+                        &MtpLoadContext::metal(&executor)
+                    )
+                    .is_err());
+                }
+                Ok(())
+            }
+
+            #[test]
+            fn direct_file_mtp_dense_and_quantized_linears_match_old_storage() -> crate::Result<()>
+            {
+                use crate::decoder::mtp::{load_mtp_linear, load_mtp_moe_linear, LazySidecar};
+                use crate::metal_backend::weight_file_tests::buffer_bytes;
+                let Some(executor) = executor()? else {
+                    return Ok(());
+                };
+                for dtype in [Dtype::BF16, Dtype::F32, Dtype::F16] {
+                    let mut tensor = bf16_matrix("mtp.fc.weight", 19, 5, 128);
+                    if dtype == Dtype::F32 {
+                        tensor.3 = crate::safetensor::bytes_to_dense_f32(
+                            &tensor.3,
+                            Dtype::BF16,
+                            "fixture",
+                        )?
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    } else if dtype == Dtype::F16 {
+                        tensor.3 = (0..5 * 128)
+                            .flat_map(|i| (0x3000_u16 + (i % 1024) as u16).to_le_bytes())
+                            .collect();
+                    }
+                    tensor.1 = dtype;
+                    let tmp = write_sidecar(&[tensor]);
+                    let sidecar = LazySidecar::open(tmp.path())?;
+                    let resolve = HashMap::from([("mtp.fc.weight".into(), "mtp.fc.weight".into())]);
+                    let cpu =
+                        load_mtp_linear(&sidecar, &resolve, "mtp.fc", &MtpLoadContext::cpu())?;
+                    let direct = load_mtp_linear(
+                        &sidecar,
+                        &resolve,
+                        "mtp.fc",
+                        &MtpLoadContext::metal(&executor),
+                    )?;
+                    if single_copy_weights_enabled() {
+                        let (LinearWeight::DenseShared(got), LinearWeight::Dense(reference)) =
+                            (direct.weight(), cpu.weight())
+                        else {
+                            panic!("stockage f32 partagé attendu");
+                        };
+                        assert_eq!(
+                            buffer_bytes(got.buffer()),
+                            reference
+                                .data()
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<_>>()
+                        );
+                        let resolved =
+                            executor.resolve_linear_weight_buffers(direct.weight(), "fixture")?;
+                        let crate::metal_backend::MetalLinearWeightBuffers::Dense { rhs, .. } =
+                            resolved
+                        else {
+                            panic!("dispatch f32 attendu");
+                        };
+                        assert_eq!(rhs.contents(), got.buffer().contents());
+                    } else {
+                        assert_eq!(direct.weight(), cpu.weight());
+                    }
+                    for bits in [4, 8] {
+                        let mut old = load_mtp_moe_linear(
+                            &sidecar,
+                            &resolve,
+                            "mtp.fc",
+                            &MtpLoadContext::cpu(),
+                            MtpMoeQuant::Affine,
+                            bits,
+                        )?;
+                        if single_copy_weights_enabled() {
+                            old.move_packed_to_metal_shared(&executor)?;
+                        }
+                        let direct = load_mtp_moe_linear(
+                            &sidecar,
+                            &resolve,
+                            "mtp.fc",
+                            &MtpLoadContext::metal(&executor),
+                            MtpMoeQuant::Affine,
+                            bits,
+                        )?;
+                        let (got, reference) = (affine(&direct), affine(&old));
+                        assert_eq!(got.packed_data(), reference.packed_data());
+                        assert_eq!(got.scales_f32(), reference.scales_f32());
+                        assert_eq!(got.biases_f32(), reference.biases_f32());
+                        assert_eq!(views(got).is_some(), single_copy_weights_enabled());
+                        for (actual, expected) in [
+                            (got.packed_metal_view(), reference.packed_metal_view()),
+                            (got.scales_metal_view(), reference.scales_metal_view()),
+                            (got.biases_metal_view(), reference.biases_metal_view()),
+                        ] {
+                            if let (Some((actual, _)), Some((expected, _))) = (actual, expected) {
+                                assert_eq!(buffer_bytes(actual), buffer_bytes(expected));
+                            }
+                        }
+                    }
+                    tmp.as_file()
+                        .set_len(sidecar.header.data_start + 1)
+                        .expect("invariant: troncature");
+                    assert!(load_mtp_linear(
+                        &sidecar,
+                        &resolve,
+                        "mtp.fc",
+                        &MtpLoadContext::metal(&executor)
+                    )
+                    .is_err());
+                    assert!(load_mtp_moe_linear(
+                        &sidecar,
+                        &resolve,
+                        "mtp.fc",
+                        &MtpLoadContext::metal(&executor),
+                        MtpMoeQuant::Affine,
+                        8
+                    )
+                    .is_err());
+                }
+                Ok(())
+            }
+
             /// Tête dense du 27B par `with_mtp_sidecar` : linéaires OptiQ en vues
             /// Metal natives, fc bf16 dense, forward CPU identique au bit près à
             /// la même tête chargée sur le CPU.
@@ -1980,7 +2345,14 @@ mod tests {
                 let model = model.with_mtp_sidecar(tmp.path())?;
                 let head = model.mtp.as_ref().expect("invariant: tête chargée");
                 assert!(matches!(head.layer.mlp, FeedForward::Dense(_)));
-                assert!(matches!(head.fc.weight(), LinearWeight::Dense(_)));
+                assert_eq!(
+                    matches!(head.fc.weight(), LinearWeight::DenseShared(_)),
+                    single_copy
+                );
+                assert_eq!(
+                    matches!(head.fc.weight(), LinearWeight::Dense(_)),
+                    !single_copy
+                );
                 let linears = quantized_linears(head);
                 assert_eq!(linears.len(), 7);
                 for (index, (cpu_linear, linear)) in quantized_linears(&cpu_head)
@@ -2106,13 +2478,33 @@ mod tests {
             corrupt.extend_from_slice(&valid[8 + header_len..]);
             assert!(load_path(write(&corrupt).path()).is_err());
 
+            // Forme et offsets de longueurs différentes : rejet au header,
+            // même si le payload existe intégralement sur disque.
+            let mut metadata: serde_json::Value =
+                serde_json::from_str(header).expect("invariant: header JSON");
+            let entry = metadata
+                .as_object_mut()
+                .expect("invariant: objet")
+                .values_mut()
+                .find(|value| value.get("shape").is_some())
+                .expect("invariant: tenseur");
+            let shape = entry["shape"]
+                .as_array_mut()
+                .expect("invariant: dimensions");
+            shape[0] = serde_json::json!(shape[0].as_u64().expect("invariant: dimension") + 1);
+            let bad = serde_json::to_vec(&metadata).expect("invariant: header sérialisable");
+            let mut corrupt = (bad.len() as u64).to_le_bytes().to_vec();
+            corrupt.extend_from_slice(&bad);
+            corrupt.extend_from_slice(&valid[8 + header_len..]);
+            assert!(load_path(write(&corrupt).path()).is_err());
+
             // Fichier raccourci après l'ouverture, avant la lecture d'un expert.
             let tmp = write(&valid);
             let sidecar = LazySidecar::open(tmp.path()).expect("invariant: sidecar valide");
-            let st = SafeTensors::deserialize(&sidecar.bytes).expect("invariant: header valide");
-            let resolve: std::collections::HashMap<String, String> = st
-                .names()
-                .into_iter()
+            let resolve: std::collections::HashMap<String, String> = sidecar
+                .header
+                .tensors
+                .keys()
                 .map(|name| {
                     (
                         super::super::normalize_mtp_sidecar_key(name),

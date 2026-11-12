@@ -555,12 +555,12 @@ impl AffineQuantizedTensor {
         &self.shape
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn packed_shape(&self) -> &[usize] {
         &self.packed_shape
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn packed_data(&self) -> &[u32] {
         self.packed.data()
     }
@@ -633,12 +633,12 @@ impl AffineQuantizedTensor {
         self.biases.shape()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn scales_f32(&self) -> Cow<'_, [f32]> {
         self.scales.f32_data()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn biases_f32(&self) -> Cow<'_, [f32]> {
         self.biases.f32_data()
     }
@@ -686,17 +686,17 @@ impl AffineQuantizedTensor {
             && self.biases.values_are_bf16_exact()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn packed_len(&self) -> usize {
         self.packed_shape.iter().product()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn scales_len(&self) -> usize {
         self.scales.shape().iter().product()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn biases_len(&self) -> usize {
         self.biases.shape().iter().product()
     }
@@ -1596,6 +1596,24 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn legacy_quantization_comparison_diagnostics() {
+        use crate::oracle::assert_panics_with;
+        assert_close(&[], &[]);
+        for value in [2.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_panics_with(&format!("index=1 left={value} right=0"), || {
+                assert_close(&[0.0, value], &[0.0, 0.0]);
+            });
+            assert_panics_with(&format!("index=1 left=0 right={value}"), || {
+                assert_close(&[0.0, 0.0], &[0.0, value]);
+            });
+        }
+        assert_panics_with(
+            "assertion `left == right` failed\n  left: 1\n right: 0",
+            || assert_close(&[f32::NAN], &[]),
+        );
     }
 
     fn assert_close(left: &[f32], right: &[f32]) {
