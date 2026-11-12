@@ -6678,6 +6678,11 @@ fn mtp_bf16_post_seed_refusal_rebuilds_f32_and_streams_once() -> Result<()> {
                         "{contexts:?}"
                     );
                     assert_eq!(
+                        contexts.iter().filter(|c| c.0 == 1).count(),
+                        1,
+                        "{contexts:?}"
+                    );
+                    assert_eq!(
                         contexts.last().copied(),
                         Some((1, true)),
                         "setup MTP refusé après le premier token, historique bf16 présent"
