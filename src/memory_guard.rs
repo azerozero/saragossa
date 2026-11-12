@@ -3,11 +3,13 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::thread::JoinHandle;
+#[cfg(target_os = "macos")]
+use std::{thread, time::Duration};
 
 use thiserror::Error;
 
@@ -281,6 +283,15 @@ impl MemoryGuard {
     /// Construit une garde depuis les plafonds réels du système.
     #[must_use]
     pub fn from_runtime_flags(enabled: bool, static_cap: Option<u64>, headroom_bytes: u64) -> Self {
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let enabled = {
+            if enabled {
+                log_warn(format_args!(
+                    "garde mémoire désactivée: mesure de mémoire du processus indisponible sur cette plateforme"
+                ));
+            }
+            false
+        };
         Self::from_limits(
             enabled,
             MemoryLimits {
@@ -484,6 +495,7 @@ impl Drop for MemoryPressureWatcher {
 }
 
 /// Démarre un watcher macOS de pression mémoire.
+#[cfg(target_os = "macos")]
 #[must_use]
 pub fn start_memory_pressure_watcher(
     registry: SharedPurgeRegistry,
@@ -550,6 +562,15 @@ pub fn start_memory_pressure_watcher(
     })
 }
 
+/// Le watcher de pression reste propre à macOS ; la garde Linux est prédictive.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn start_memory_pressure_watcher(
+    _registry: SharedPurgeRegistry,
+) -> Option<MemoryPressureWatcher> {
+    None
+}
+
 /// Estime la taille des safetensors top-level d'un modèle.
 #[must_use]
 pub fn estimate_model_bytes(path: &Path) -> u64 {
@@ -608,10 +629,37 @@ fn host_memory_cap_bytes() -> Option<u64> {
     host_memory_bytes().map(|bytes| bytes.saturating_mul(9) / 10)
 }
 
+#[cfg(target_os = "macos")]
 fn host_memory_bytes() -> Option<u64> {
     command_stdout("sysctl", &["-n", "hw.memsize"]).and_then(|text| text.trim().parse().ok())
 }
 
+#[cfg(target_os = "linux")]
+fn host_memory_bytes() -> Option<u64> {
+    proc_kib_field(&fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn host_memory_bytes() -> Option<u64> {
+    None
+}
+
+/// Les compteurs procfs portent l'unité kB mais comptent des kibioctets.
+#[cfg(any(target_os = "linux", test))]
+fn proc_kib_field(text: &str, name: &str) -> Option<u64> {
+    let value = text.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key == name).then_some(value)
+    })?;
+    let mut fields = value.split_whitespace();
+    let kib = fields.next()?.parse::<u64>().ok()?;
+    if fields.next()? != "kB" || fields.next().is_some() {
+        return None;
+    }
+    kib.checked_mul(1024)
+}
+
+#[cfg(target_os = "macos")]
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program).args(args).output().ok()?;
     output
@@ -660,9 +708,14 @@ pub fn process_footprint_bytes() -> Option<u64> {
     (result == KERN_SUCCESS).then_some(info.phys_footprint)
 }
 
-#[cfg(not(target_os = "macos"))]
-/// Lit le `phys_footprint` du process (ce que macOS compte pour la pression
-/// mémoire, buffers Metal compris) ; `None` hors macOS ou si Mach échoue.
+#[cfg(target_os = "linux")]
+/// Lit la mémoire résidente du processus depuis procfs (hors pages échangées).
+pub fn process_footprint_bytes() -> Option<u64> {
+    proc_kib_field(&fs::read_to_string("/proc/self/status").ok()?, "VmRSS")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Aucune mesure de mémoire du processus disponible sur cette plateforme.
 pub fn process_footprint_bytes() -> Option<u64> {
     None
 }
@@ -709,15 +762,12 @@ fn read_memory_pressure_level() -> Result<MemoryPressureLevel, ()> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
-fn read_memory_pressure_level() -> Result<MemoryPressureLevel, ()> {
-    Err(())
-}
-
+#[cfg(target_os = "macos")]
 fn log_info(args: fmt::Arguments<'_>) {
     eprintln!("info: saragossa memory_guard: {args}");
 }
 
+#[cfg(not(target_os = "linux"))]
 fn log_warn(args: fmt::Arguments<'_>) {
     eprintln!("warn: saragossa memory_guard: {args}");
 }
@@ -733,6 +783,45 @@ mod tests {
             limits,
             Arc::new(move || Some(current.load(Ordering::Relaxed))),
         )
+    }
+
+    #[test]
+    fn procfs_memory_fields_validate_keys_units_and_overflow() {
+        let text = "MemTotal:  1234 kB\nMemAvailable: 456 kB\nVmRSS: 78 kB\n";
+        assert_eq!(proc_kib_field(text, "MemTotal"), Some(1234 * 1024));
+        assert_eq!(proc_kib_field(text, "VmRSS"), Some(78 * 1024));
+        assert_eq!(proc_kib_field(text, "Mem"), None);
+        for invalid in [
+            "MemTotal: nope kB",
+            "MemTotal: 1 MB",
+            "MemTotal: 1",
+            "MemTotal: 1 kB extra",
+            "MemTotal: 18446744073709551615 kB",
+        ] {
+            assert_eq!(proc_kib_field(invalid, "MemTotal"), None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_memory_probes_support_a_projection() {
+        let host = host_memory_bytes().expect("invariant: procfs fournit MemTotal");
+        let rss = process_footprint_bytes().expect("invariant: procfs fournit VmRSS");
+        assert!(host > 0 && rss > 0);
+        let guard = MemoryGuard::from_runtime_flags(true, Some(host), 0);
+        assert!(guard.projection(1).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_guard_is_disabled_even_with_an_explicit_cap() {
+        let guard = MemoryGuard::from_runtime_flags(true, Some(1), 0);
+        assert!(!guard.inner.enabled);
+        assert!(guard.projection(u64::MAX).is_none());
+        assert!(guard.check_allocation(u64::MAX).is_ok());
+        assert!(
+            start_memory_pressure_watcher(Arc::new(Mutex::new(PurgeRegistry::new()))).is_none()
+        );
     }
 
     #[test]

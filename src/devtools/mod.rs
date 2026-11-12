@@ -2,6 +2,7 @@
 
 pub mod convert;
 pub mod dflash;
+pub mod kl_ref;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod pairwise;
 

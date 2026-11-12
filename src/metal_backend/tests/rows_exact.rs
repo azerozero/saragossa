@@ -1382,8 +1382,7 @@ fn rows_exact_qmv_contract_cpu_oracle() -> Result<()> {
         library_source.push_str(&instrumented);
     }
     let library = {
-        let options = metal::CompileOptions::new();
-        options.set_fast_math_enabled(true);
+        let options = crate::metal_backend::compile_options(true);
         executor
             .device
             .new_library_with_source(&library_source, &options)

@@ -6,8 +6,6 @@ use crate::{
 };
 use metal::foreign_types::ForeignTypeRef;
 use metal::objc::runtime::{sel_registerName, Object, Sel};
-#[cfg(test)]
-use metal::CompileOptions;
 use metal::{
     Buffer, BufferRef, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
     MTLCommandBufferStatus, MTLPurgeableState, MTLResourceOptions, MTLSize, NSUInteger,
@@ -60,6 +58,8 @@ mod kernel_timing;
 mod lightbatch_duo;
 mod lightbatch_multi;
 mod linear_attention;
+mod state_snapshot;
+pub(crate) use state_snapshot::LinearSnapshotLayout;
 mod linear_attention_encode;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
@@ -86,6 +86,9 @@ mod na_gemm;
 mod nax_rows;
 pub(crate) use self::nax_rows::{NaxRowsAttention, NaxRowsBuffers, NaxRowsDispatch};
 mod pipelines;
+#[cfg(test)]
+pub(crate) use self::flags::with_metal_fast_math_override;
+pub use self::pipelines::compile_options;
 mod prefill;
 #[cfg(test)]
 pub(crate) use self::eligibility::with_qmm_skinny_min_batch_override;
@@ -115,7 +118,7 @@ mod scratch;
 #[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
 mod sparse;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
 mod transfer;
 // Arbre de vérification DFlash : construit par la boucle DFlash (devtools).
@@ -132,7 +135,6 @@ pub(crate) use self::barriers::{
     commit_and_wait, commit_and_wait_with, commit_nonblocking, install_dispatch_barrier_scope,
     post_dispatch_barrier, wait_for_completion, EncoderEndGuard,
 };
-#[cfg(any(test, feature = "devtools"))]
 pub(crate) use self::byte_helpers::read_u16_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
 pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at, write_u8_buffer};

@@ -1369,8 +1369,7 @@ pub(super) fn compile_kernels(
     names: &[&str],
     fast_math: bool,
 ) -> Result<Vec<ComputePipelineState>> {
-    let options = CompileOptions::new();
-    options.set_fast_math_enabled(fast_math);
+    let options = crate::metal_backend::compile_options(fast_math);
     let library = device
         .new_library_with_source(source, &options)
         .map_err(|error| InferError::Metal(format!("compilation kernels {names:?}: {error}")))?;

@@ -106,6 +106,41 @@ Le jeu de prompts est figé dans `kl_eval.py` pour que deux exécutions restent
 comparables. Le remplacer via `--prompts` change les valeurs absolues, pas
 seulement leur bruit : ne comparez que des mesures issues du même jeu.
 
+## Référence KL du moteur Rust
+
+Avec les features `metal,devtools` (actives par défaut), sur deux modèles locaux :
+
+```bash
+saragossa run /chemin/reference --prompt "Bonjour" --max-tokens 32 --kl-record /tmp/kl-ref
+saragossa run /chemin/candidat --kl-compare /tmp/kl-ref
+```
+
+Les mêmes options fonctionnent avec `--model-dir` à la place de `run`.
+`--kl-record` et `--kl-compare` sont exclusifs. Aucun téléchargement : le modèle
+est local. Le répertoire de sortie doit être nouveau ; il contient `ref.json`
+(version 1, prompt, tokens greedy imposés, dimensions, empreintes et transformations)
+et `ref.bin` (log-softmax f32 little-endian, matrice `[n, vocab]`). La ligne `i`
+prédit `forced_ids[i]` après le prompt et `forced_ids[..i]`. Seule la dernière
+position du prefill est évaluée, puis les `n−1` pas de decode GPU résident.
+L'enregistrement fait exactement `--max-tokens` pas, y compris après EOS.
+
+Les logits sont pris après softcapping, avant température/top-k/top-p ; ces
+options de sampling n'affectent pas le diagnostic. Le KV du decode est f32.
+La comparaison relit le prompt et les tokens enregistrés, refuse le repli du
+decode résident, les versions inconnues, vocabulaires différents et fichiers
+tronqués. Le JSON est borné à 1 Mio, le binaire à 256 Mio et les séquences à
+65 536 tokens. L'empreinte SHA-256 de config et celle d'un échantillon de poids
+(embeddings exécutés premier/milieu/dernier et norme finale) sont informatives : ce ne
+sont ni une preuve d'identité de tous les poids ni un contrôle du tokenizer.
+Conserver le même vocabulaire et la même correspondance token/id entre modèles.
+
+`--kl-compare` écrit une ligne JSON : `kl_mean`, `kl_max` en nats,
+`top1_agreement`, `forced_delta_p_mean` (écart signé candidat moins référence),
+`forced_delta_p_max` (maximum absolu), `forced_abs_delta_p_mean` (moyenne absolue
+du token imposé) et `mean_abs_delta_p` (moyenne absolue sur les entrées `[n, vocab]`). Les log-probabilités f32 des deux côtés sont
+renormalisées en f64 pour les métriques. La KL couvre tout le vocabulaire ;
+ce format est propre au moteur, sans compatibilité binaire llama.cpp.
+
 ## Modèles publiés avec ces outils
 
 - [Qwen3.6-27B-mixed-3-4bit-3.85bpw-mlx](https://huggingface.co/destynova002/Qwen3.6-27B-mixed-3-4bit-3.85bpw-mlx)

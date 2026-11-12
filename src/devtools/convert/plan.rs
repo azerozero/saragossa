@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -22,6 +21,7 @@ use crate::qwen_loader::{read_shard_header, ShardHeader};
 use crate::safetensor::{
     apply_fp8_block_scales_in_place, bytes_to_dense_f32, decode_f8_e4m3_into, FP8_SCALE_BLOCK,
 };
+use crate::safetensor::{pread_exact, pwrite_all};
 use crate::{InferError, Result};
 
 #[cfg(not(target_endian = "little"))]
@@ -165,9 +165,12 @@ impl Source {
             )));
         }
         let mut buf = vec![0_u8; len];
-        self.files[tensor.shard]
-            .read_exact_at(&mut buf, tensor.offset + start as u64)
-            .map_err(|source| io_err(&self.headers[tensor.shard].path, source))?;
+        pread_exact(
+            &self.files[tensor.shard],
+            &mut buf,
+            tensor.offset + start as u64,
+        )
+        .map_err(|source| io_err(&self.headers[tensor.shard].path, source))?;
         Ok(buf)
     }
 }
@@ -797,9 +800,7 @@ impl<'a> OutStream<'a> {
                 self.name
             )));
         }
-        self.file
-            .write_all_at(bytes, self.next)
-            .map_err(|source| io_err(self.path, source))?;
+        pwrite_all(self.file, bytes, self.next).map_err(|source| io_err(self.path, source))?;
         self.sha.update(bytes);
         self.next += len;
         Ok(())
@@ -907,8 +908,7 @@ pub(crate) fn write_shard(
     peak: &PeakTracker,
 ) -> Result<Vec<TensorRecord>> {
     let (header, offsets) = build_header(plan)?;
-    file.write_all_at(&header, 0)
-        .map_err(|source| io_err(path, source))?;
+    pwrite_all(file, &header, 0).map_err(|source| io_err(path, source))?;
     let data_start = header.len() as u64;
     let shapes: HashMap<&str, &OutTensor> =
         plan.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -1077,8 +1077,7 @@ pub(crate) fn file_sha256(path: &Path) -> Result<String> {
     let mut offset = 0_u64;
     while offset < len {
         let take = (IO_CHUNK as u64).min(len - offset) as usize;
-        file.read_exact_at(&mut buf[..take], offset)
-            .map_err(|source| io_err(path, source))?;
+        pread_exact(&file, &mut buf[..take], offset).map_err(|source| io_err(path, source))?;
         sha.update(&buf[..take]);
         offset += take as u64;
     }

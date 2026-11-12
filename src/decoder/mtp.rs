@@ -8,13 +8,13 @@
 
 use super::*;
 use crate::qwen_loader::{read_shard_header, ShardHeader, ShardTensorEntry};
+#[cfg(test)]
+use crate::safetensor::pread_exact;
 use crate::safetensor::{read_dense_f32_at, read_u32_at};
 use crate::AffineQuantizedTensor;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use safetensors::Dtype;
 use std::collections::HashMap;
-#[cfg(test)]
-use std::os::unix::fs::FileExt;
 
 pub(super) struct MtpLoadContext<'a> {
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -866,8 +866,7 @@ impl LazySidecar {
     #[cfg(test)]
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         let mut out = vec![0_u8; len];
-        self.file
-            .read_exact_at(&mut out, offset as u64)
+        pread_exact(&self.file, &mut out, offset as u64)
             .map_err(|source| InferError::Config(format!("lecture tenseur MTP: {source}")))?;
         Ok(out)
     }

@@ -1,5 +1,6 @@
 //! Serveur HTTP local minimal pour l'API OpenAI-compatible.
 
+#[cfg(unix)]
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -90,7 +91,7 @@ pub(super) fn serve_unix(
     _read_timeout: Duration,
 ) -> ServeResult<()> {
     Err(ServeError::args(
-        "transport socket Unix indisponible sur cette plateforme",
+        "transport socket Unix indisponible; utilisez --port et --api-key pour TCP",
     ))
 }
 
