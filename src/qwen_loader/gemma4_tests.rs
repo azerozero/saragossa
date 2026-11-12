@@ -428,8 +428,10 @@ fn generates_coherent_french_gemma4_moe() {
         stop_token_ids: assets.stop_token_ids(),
         ..GenerationOptions::default()
     };
+    // NOTE: 80 tokens laissent la phrase atteindre « bleu » ; avec la RoPE
+    // proportionnelle corrigée, Gemma 4 développe la diffusion avant de conclure.
     let output = decoder
-        .generate_greedy_timed_with_options(&prompt_ids, 40, &options)
+        .generate_greedy_timed_with_options(&prompt_ids, 80, &options)
         .expect("invariant: génération Gemma 4 réelle valide");
     let tokens = output
         .tokens
