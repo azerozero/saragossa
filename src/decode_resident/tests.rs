@@ -1131,8 +1131,6 @@ fn cpu_rms_norm_rope_heads_at(
     theta: f32,
 ) -> Vec<f32> {
     let mut out = vec![0.0_f32; num_heads * head_dim];
-    let pairs = rope_dims / 2;
-    let inv = crate::rope::inv_freq(rope_dims, theta);
     for head in 0..num_heads {
         let start = head * head_dim;
         let sumsq: f32 = (0..head_dim)
@@ -1142,20 +1140,9 @@ fn cpu_rms_norm_rope_heads_at(
         let normed: Vec<f32> = (0..head_dim)
             .map(|c| input[start + c] * inv_rms * weight[c])
             .collect();
-        for c in 0..head_dim {
-            out[start + c] = if c < rope_dims {
-                let pair = if c < pairs { c } else { c - pairs };
-                let angle = position as f32 * inv[pair];
-                let (first, second) = (normed[pair], normed[pair + pairs]);
-                if c < pairs {
-                    first * angle.cos() - second * angle.sin()
-                } else {
-                    first * angle.sin() + second * angle.cos()
-                }
-            } else {
-                normed[c]
-            };
-        }
+        out[start..start + head_dim].copy_from_slice(&crate::rope::reference_rotate_half(
+            &normed, rope_dims, head_dim, theta, position,
+        ));
     }
     out
 }
@@ -1201,10 +1188,10 @@ fn run_gemma4_global_attention_decode_case(prefill_len: usize, seed: usize) -> R
         &k_raw, &k_norm, kv_heads, head_dim, rope_dims, position, eps, theta,
     );
     let q_gpu = state.rms_norm_rope_decode(
-        &q_raw, &q_norm, q_heads, head_dim, rope_dims, position, eps, theta,
+        &q_raw, &q_norm, q_heads, head_dim, rope_dims, head_dim, position, eps, theta,
     )?;
     let k_gpu = state.rms_norm_rope_decode(
-        &k_raw, &k_norm, kv_heads, head_dim, rope_dims, position, eps, theta,
+        &k_raw, &k_norm, kv_heads, head_dim, rope_dims, head_dim, position, eps, theta,
     )?;
 
     let mut kv = state.full_attention(prefill_len + 1, q_heads, kv_heads, head_dim, false)?;
@@ -1279,7 +1266,7 @@ fn run_gemma4_sliding_attention_decode_case(position: usize, seed: usize) -> Res
         .map(|i| pseudo(seed + 20_000 + i))
         .collect();
     let q = state.rms_norm_rope_decode(
-        &q_raw, &q_norm, q_heads, head_dim, head_dim, position, eps, theta,
+        &q_raw, &q_norm, q_heads, head_dim, head_dim, head_dim, position, eps, theta,
     )?;
 
     let mut keys = Vec::with_capacity(len * kv_dim);
@@ -1405,10 +1392,10 @@ fn qwen_uniform_attention_decode_resident_is_byte_exact_single_key() -> Result<(
     let k_raw: Vec<f32> = (0..kv_dim).map(|i| pseudo(60_000 + i)).collect();
     let value: Vec<f32> = (0..kv_dim).map(|i| pseudo(70_000 + i)).collect();
     let q = state.rms_norm_rope_decode(
-        &q_raw, &q_norm, q_heads, head_dim, rope_dims, position, eps, theta,
+        &q_raw, &q_norm, q_heads, head_dim, rope_dims, head_dim, position, eps, theta,
     )?;
     let k = state.rms_norm_rope_decode(
-        &k_raw, &k_norm, kv_heads, head_dim, rope_dims, position, eps, theta,
+        &k_raw, &k_norm, kv_heads, head_dim, rope_dims, head_dim, position, eps, theta,
     )?;
 
     let mut kv = state.full_attention(1, q_heads, kv_heads, head_dim, false)?;
@@ -1939,7 +1926,7 @@ fn rms_norm_rope_decode_matches_cpu() -> Result<()> {
         let input: Vec<f32> = (0..dim).map(|i| (i as f32 % 11.0 - 5.0) * 0.1).collect();
         let weight: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 * 0.1).collect();
         let gpu = state.rms_norm_rope_decode(
-            &input, &weight, num_heads, head_dim, rope_dims, position, eps, theta,
+            &input, &weight, num_heads, head_dim, rope_dims, rope_dims, position, eps, theta,
         )?;
 
         let inv = crate::rope::inv_freq(rope_dims, theta);

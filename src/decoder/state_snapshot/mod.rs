@@ -380,10 +380,11 @@ impl CausalDecoder {
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let kv_dtype = format!(
-            "resident_bf16={} quant={:?} prefill_bf16={}",
+            "resident_bf16={} quant={:?} prefill_bf16={} mtp_history_bf16_v1={}",
             Self::resident_kv_bf16(false, prompt.len()),
             crate::runtime_flags::kv_quant_format(),
-            crate::runtime_flags::prefill_kv_bf16_store_enabled()
+            crate::runtime_flags::prefill_kv_bf16_store_enabled(),
+            super::mtp_history::bf16_capacity().is_some()
         );
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let kv_dtype = "f32".to_string();

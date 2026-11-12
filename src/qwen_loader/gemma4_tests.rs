@@ -428,8 +428,10 @@ fn generates_coherent_french_gemma4_moe() {
         stop_token_ids: assets.stop_token_ids(),
         ..GenerationOptions::default()
     };
+    // NOTE: 80 tokens laissent la phrase atteindre « bleu » ; avec la RoPE
+    // proportionnelle corrigée, Gemma 4 développe la diffusion avant de conclure.
     let output = decoder
-        .generate_greedy_timed_with_options(&prompt_ids, 40, &options)
+        .generate_greedy_timed_with_options(&prompt_ids, 80, &options)
         .expect("invariant: génération Gemma 4 réelle valide");
     let tokens = output
         .tokens
@@ -558,4 +560,89 @@ fn first_snapshot_dir(path: &Path) -> Option<PathBuf> {
         .collect::<Vec<_>>();
     dirs.sort();
     dirs.into_iter().next()
+}
+
+#[test]
+#[cfg(feature = "devtools")]
+fn gemma4_layer_dump_is_passive_complete_and_preserves_residual_boundaries(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Poids synthétiques uniquement ; aucun executor Metal, même avec --all-features.
+    let tmp = tempfile::NamedTempFile::new()?;
+    write_gemma4_moe_safetensors(tmp.path());
+    let config = gemma4_moe_config();
+    let model = load_causal_decoder_from_shards(
+        &config,
+        &[tmp.path().to_path_buf()],
+        &catalog_for(tmp.path()),
+    )?;
+    let prompt = [0, 1, 2];
+    let (_, expected) = model.prefill_cache_uncached(&prompt)?;
+    let root = tempfile::tempdir()?;
+    let directory = root.path().join("capture");
+    let actual = model.dump_gemma4_layers(&prompt, &directory)?;
+    assert_eq!(actual, expected, "la capture ne change aucun calcul");
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("index.json"))?)?;
+    assert_eq!(index["prompt_ids"], serde_json::json!(prompt));
+    assert_eq!(index["backend"], "cpu-f32");
+    let entries = index["entries"].as_array().ok_or("entries absent")?;
+    assert_eq!(entries.len(), 2 * 19 + 3);
+    let read = |name: &str| -> std::result::Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let bytes = std::fs::read(directory.join(format!("{name}.f32")))?;
+        assert_eq!(bytes.len() % 4, 0);
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect())
+    };
+    assert_eq!(read("logits")?, expected.data());
+    let scale = crate::CausalDecoderConfig::from(&config)
+        .embed_scale
+        .ok_or("échelle absente")?;
+    let scaled: Vec<_> = EMBED_VALUES.iter().map(|v| v * scale).collect();
+    assert_eq!(read("embeddings")?, scaled);
+    assert_eq!(read("layers.000.input")?, scaled);
+    for entry in entries {
+        let shape = entry["shape"].as_array().ok_or("shape absent")?;
+        let rows = shape[0].as_u64().ok_or("rows absent")?;
+        let cols = shape[1].as_u64().ok_or("cols absent")?;
+        let file = entry["file"].as_str().ok_or("file absent")?;
+        assert_eq!(
+            std::fs::metadata(directory.join(file))?.len(),
+            rows * cols * 4
+        );
+        assert_eq!(
+            rows,
+            if matches!(entry["point"].as_str(), Some("logits" | "final_norm")) {
+                1
+            } else {
+                prompt.len() as u64
+            }
+        );
+    }
+    for layer in 0..config.num_hidden_layers {
+        let prefix = format!("layers.{layer:03}");
+        for (a, b, out) in [
+            ("input", "attention_out", "post_attention_residual"),
+            ("dense_out", "moe_out", "ffn_sum"),
+            ("post_attention_residual", "ffn_out", "pre_scalar"),
+        ] {
+            let sum: Vec<_> = read(&format!("{prefix}.{a}"))?
+                .iter()
+                .zip(read(&format!("{prefix}.{b}"))?)
+                .map(|(a, b)| a + b)
+                .collect();
+            assert_eq!(read(&format!("{prefix}.{out}"))?, sum, "{prefix}.{out}");
+        }
+    }
+    assert!(
+        model.dump_gemma4_layers(&prompt, &directory).is_err(),
+        "refuse l'écrasement"
+    );
+    // Un échec ne doit pas laisser de capture active dans ce thread.
+    assert_eq!(
+        model.dump_gemma4_layers(&prompt, &root.path().join("second"))?,
+        expected
+    );
+    Ok(())
 }

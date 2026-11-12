@@ -1,0 +1,109 @@
+{
+  "dtype": "f32",
+  "shape": [
+    20,
+    384
+  ],
+  "source": {
+    "model": "intfloat/multilingual-e5-small",
+    "path": "${SARAGOSSA_EMBEDDER_DIR}",
+    "snapshot": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+    "sha256": {
+      "config.json": "69137736cab8b8903a07fe8afaafdda25aac55415a12a55d1bffa9f581abf959",
+      "tokenizer.json": "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39"
+    },
+    "versions": {
+      "sentence-transformers": "6.3.0",
+      "transformers": "5.22.2",
+      "torch": "2.15.0"
+    }
+  },
+  "tolerance": "cosine >= 0.9999; max_abs <= 0.001; normalized f32, masked mean pooling",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-11",
+  "payload_sha256": "362c078735b1a2cebca89dfc3c8e3881deb450796e4907b6acfd94de63710d2e",
+  "cases": [
+    {
+      "text": "Bonjour le monde.",
+      "kind": "query"
+    },
+    {
+      "text": "Le chat dort sur le canapé.",
+      "kind": "passage"
+    },
+    {
+      "text": "Où est la gare ?",
+      "kind": "query"
+    },
+    {
+      "text": "Une recherche sémantique multilingue.",
+      "kind": "passage"
+    },
+    {
+      "text": "La pluie tombe à Brest.",
+      "kind": "query"
+    },
+    {
+      "text": "Je ne suis pas d'accord.",
+      "kind": "passage"
+    },
+    {
+      "text": "Été, Noël et cœur : accents français.",
+      "kind": "query"
+    },
+    {
+      "text": "42 kilomètres en 3 heures.",
+      "kind": "passage"
+    },
+    {
+      "text": "",
+      "kind": "query"
+    },
+    {
+      "text": "🙂 Merci !",
+      "kind": "passage"
+    },
+    {
+      "text": "Hello world.",
+      "kind": "query"
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "kind": "passage"
+    },
+    {
+      "text": "How do I reset my password?",
+      "kind": "query"
+    },
+    {
+      "text": "A database transaction must be atomic.",
+      "kind": "passage"
+    },
+    {
+      "text": "This sentence is false.",
+      "kind": "query"
+    },
+    {
+      "text": "fn main() { println!(\"hello\"); }",
+      "kind": "passage"
+    },
+    {
+      "text": "SELECT id FROM users WHERE active = true;",
+      "kind": "query"
+    },
+    {
+      "text": "def square(x): return x * x",
+      "kind": "passage"
+    },
+    {
+      "text": "git diff --stat",
+      "kind": "query"
+    },
+    {
+      "text": "Rust Result<T, E> and Python exceptions.",
+      "kind": "passage"
+    }
+  ],
+  "pooling": "mean",
+  "max_seq_length": 512
+}

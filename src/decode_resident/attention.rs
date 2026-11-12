@@ -157,13 +157,53 @@ impl DecodeResidentState {
         kv_bf16: bool,
         prefix: [&crate::metal_backend::SharedBf16Rows; 2],
     ) -> Result<Option<FullAttentionMetalState>> {
+        self.full_attention_adopting_bf16(
+            capacity,
+            q_heads,
+            kv_heads,
+            head_dim,
+            kv_bf16_dense(kv_bf16),
+            prefix,
+        )
+    }
+
+    /// Adoption de la variante dense (MTP/sinks), qui ignore la quantification
+    /// comme `full_attention_dense`, tout en respectant le f32 forcé.
+    pub(crate) fn full_attention_dense_adopting(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        kv_bf16: bool,
+        prefix: [&crate::metal_backend::SharedBf16Rows; 2],
+    ) -> Result<Option<FullAttentionMetalState>> {
+        self.full_attention_adopting_bf16(
+            capacity,
+            q_heads,
+            kv_heads,
+            head_dim,
+            super::kv_element_bytes(kv_bf16) == GpuElement::Bf16.byte_size(),
+            prefix,
+        )
+    }
+
+    fn full_attention_adopting_bf16(
+        &self,
+        capacity: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        bf16: bool,
+        prefix: [&crate::metal_backend::SharedBf16Rows; 2],
+    ) -> Result<Option<FullAttentionMetalState>> {
         let kv_dim = kv_heads * head_dim;
         let [key_len, value_len] = prefix.map(crate::metal_backend::SharedBf16Rows::len);
         if key_len != value_len || kv_dim == 0 || key_len % kv_dim != 0 {
             return Ok(None);
         }
         let floor = key_len / kv_dim;
-        if !kv_bf16_dense(kv_bf16) || floor > capacity {
+        if !bf16 || floor > capacity {
             return Ok(None);
         }
         let buffers = prefix.map(|view| view.buffer().to_owned());
@@ -579,8 +619,11 @@ impl DecodeResidentState {
         frequencies: &BufferRef,
         eps: f32,
     ) -> Result<()> {
-        // Le second scalaire reste réservé dans l’ABI ; le kernel lit le slot 5.
-        let params: [f32; 2] = [eps, 0.0];
+        // Le second scalaire transmet l’écart entre partenaires rotate-half.
+        let params: [f32; 2] = [
+            eps,
+            crate::metal_backend::rope::rope_half_offset(frequencies),
+        ];
         encoder.set_compute_pipeline_state(&self.rope_decode_kernel);
         encoder.set_buffer(0, Some(input), input_offset);
         encoder.set_buffer(1, Some(weight), 0);
@@ -619,6 +662,7 @@ impl DecodeResidentState {
         num_heads: usize,
         head_dim: usize,
         rope_dims: usize,
+        frequency_dim: usize,
         position: usize,
         eps: f32,
         base_theta: f32,
@@ -641,7 +685,7 @@ impl DecodeResidentState {
         let frequencies = crate::metal_backend::rope::create_rope_frequencies(
             &self.device,
             base_theta,
-            rope_dims,
+            frequency_dim,
         )?;
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -2206,7 +2250,10 @@ impl FullAttentionMetalState {
         let element = self.keys.element();
         let offset = byte_offset(self.len * self.kv_dim(), element, "rope append KV offset")?;
         let dims = rope_dims_param(self.kv_heads, self.head_dim, rope.rope_dims, rope.position)?;
-        let params: [f32; 2] = [rope.eps, rope.theta];
+        let params: [f32; 2] = [
+            rope.eps,
+            crate::metal_backend::rope::rope_half_offset(frequencies),
+        ];
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(k_raw), k_offset);
         encoder.set_buffer(1, Some(k_norm), 0);

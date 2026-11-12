@@ -2461,7 +2461,12 @@ fn prefill_resident_capture_tail_matches_full() -> Result<()> {
 
 /// Le hidden complet de l'ancien chemin est l'oracle ; le semis intégré doit
 /// garder ses bits, les états du tronc et les allocations des snapshots.
-fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usize) -> Result<()> {
+fn check_mtp_seed_streamed(
+    executor: &MetalExecutor,
+    seq: usize,
+    chunk_rows: usize,
+    bf16: bool,
+) -> Result<()> {
     if private_scratch_enabled() {
         assert_eq!(
             executor
@@ -2647,6 +2652,41 @@ fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usi
                 },
                 index * 1024,
             )?;
+            if bf16 {
+                let (compact_k, compact_v) = executor.mtp_seed_bf16_rows(
+                    tokens,
+                    MtpSeedStates::Raw {
+                        rows: &raw,
+                        first_row: index * 1024,
+                        final_norm: &final_norm,
+                    },
+                    weights,
+                    PrefillAttentionSpec {
+                        seq: tokens.len(),
+                        ..seed_spec
+                    },
+                    index * 1024,
+                )?;
+                for (compact, reference) in [(compact_k, &k), (compact_v, &v)] {
+                    let PrefillKvRows::SharedBf16(compact) = compact else {
+                        return Err(InferError::Config("suffixe bf16 partagé attendu".into()));
+                    };
+                    assert!(reference.data().iter().all(|value| value.is_finite()));
+                    let rounded: Vec<u16> = reference
+                        .data()
+                        .iter()
+                        .map(|value| {
+                            let bits = value.to_bits();
+                            (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+                        })
+                        .collect();
+                    assert_eq!(
+                        compact.as_slice(),
+                        rounded,
+                        "suffixe bf16 identique au semis f32"
+                    );
+                }
+            }
             expected_k.extend_from_slice(k.data());
             expected_v.extend_from_slice(v.data());
         }
@@ -2658,6 +2698,7 @@ fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usi
         &final_norm,
         &tokens[1..],
         1024,
+        bf16.then_some(seq + 16),
     )?;
     let (actual, actual_caches, _) = executor.qwen_moe_prefill_resident_with_mtp(
         PrefillInput::Hidden(&input),
@@ -2735,6 +2776,15 @@ fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usi
         }
     }
     let (k, v) = seed.into_rows()?;
+    if bf16 {
+        return check_mtp_bf16_adoption(
+            executor,
+            [k, v],
+            [&expected_k, &expected_v],
+            (seq - 1, seq + 16),
+            (Q_HEADS, KV_HEADS, HEAD_DIM),
+        );
+    }
     let (PrefillKvRows::Shared(k), PrefillKvRows::Shared(v)) = (k, v) else {
         return Err(InferError::Dimension(
             "historique MTP non partagé".to_string(),
@@ -2801,26 +2851,26 @@ fn mtp_seed_partial_903_reuses_capacity_and_preserves_bf16_bytes() -> Result<()>
         eprintln!("semis MTP synthétique non exécuté : aucun device Metal");
         return Ok(());
     };
-    check_mtp_seed_streamed(&executor, 1024 + 903 + 1, 1500)
+    check_mtp_seed_streamed(&executor, 1024 + 903 + 1, 1500, false)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_4097_bit_exact() -> Result<()> {
-    check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096, false)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_8297_bit_exact() -> Result<()> {
     // Découpage non aligné sur les blocs du semis, avec une queue de 104 lignes.
-    check_mtp_seed_streamed(&MetalExecutor::new()?, 8297, 1500)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 8297, 1500, false)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_32768_bit_exact() -> Result<()> {
-    check_mtp_seed_streamed(&MetalExecutor::new()?, 32768, 4096)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 32768, 4096, false)
 }
 
 #[test]
@@ -2829,9 +2879,284 @@ fn mtp_seed_streamed_private_scratch_bit_exact() -> Result<()> {
     crate::metal_backend::flags::with_private_scratch_override(true, || {
         assert!(private_scratch_enabled());
         // Le blit final doit rester borné, avec et sans frontière de morceau.
-        check_mtp_seed_streamed(&MetalExecutor::new()?, 129, 4096)?;
-        check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096)
+        check_mtp_seed_streamed(&MetalExecutor::new()?, 129, 4096, false)?;
+        check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096, false)
     })
+}
+
+/// Les mêmes phases résidentes, avec ou sans alias, doivent conserver les bits
+/// à travers GDN -> attention gatée -> MLP, y compris le morceau court.
+#[test]
+fn prefill_mixed_phase_aliases_match_distinct_storage_bit_exact() -> Result<()> {
+    for private in [false, true] {
+        with_private_scratch_override(private, check_mixed_phase_aliases)?;
+    }
+    Ok(())
+}
+
+fn check_mixed_phase_aliases() -> Result<()> {
+    use super::scratch_phases::test_support::with_phase_allocations;
+
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    const SEQ: usize = 513;
+    const CHUNK: usize = 257;
+    const HIDDEN: usize = 64;
+    const Q_HEADS: usize = 16;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 256;
+    const INTER: usize = 32;
+    const VALUE_DIM: usize = Q_HEADS * HEAD_DIM;
+    const VALUE_HEADS: usize = VALUE_DIM / 128;
+    const CONV_DIM: usize = 2 * 128 + VALUE_DIM;
+    // Les formes Steel/NAX autorisent le découpage dès 257 lignes.
+    // Chemin de production 27B : dk128/dv128, noyau conv 4.
+    let linear_spec = LinearAttentionStepSpec {
+        num_key_heads: 1,
+        num_value_heads: VALUE_HEADS,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel_dim: 4,
+        rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
+    };
+    let dims = LinearAttnResidentDims {
+        in_dim: HIDDEN,
+        conv_dim: CONV_DIM,
+        value_dim: VALUE_DIM,
+        key_dim: 128,
+    };
+
+    let input = deterministic_tensor(SEQ, HIDDEN, 601, 0.5)?;
+    let input_norm = deterministic_norm(HIDDEN, 607)?;
+    let post_norm = deterministic_norm(HIDDEN, 613)?;
+    let gate = Linear::new(deterministic_tensor(INTER, HIDDEN, 617, 0.1)?, None)?;
+    let up = Linear::new(deterministic_tensor(INTER, HIDDEN, 619, 0.1)?, None)?;
+    let down = Linear::new(deterministic_tensor(HIDDEN, INTER, 631, 0.1)?, None)?;
+    let in_proj_qkv = Linear::new(deterministic_tensor(CONV_DIM, HIDDEN, 641, 0.08)?, None)?;
+    let in_proj_z = Linear::new(deterministic_tensor(VALUE_DIM, HIDDEN, 643, 0.08)?, None)?;
+    let in_proj_b = Linear::new(deterministic_tensor(VALUE_HEADS, HIDDEN, 647, 0.08)?, None)?;
+    let in_proj_a = Linear::new(deterministic_tensor(VALUE_HEADS, HIDDEN, 653, 0.08)?, None)?;
+    let out_proj = Linear::new(deterministic_tensor(HIDDEN, VALUE_DIM, 659, 0.05)?, None)?;
+    let conv_weight = Tensor::from_vec(
+        vec![CONV_DIM, 4, 1],
+        deterministic_tensor(CONV_DIM, 4, 661, 0.3)?.data().to_vec(),
+    )?;
+    let a_log = (0..VALUE_HEADS)
+        .map(|i| deterministic_value(665, i, 0.2))
+        .collect::<Vec<_>>();
+    let dt_bias = (0..VALUE_HEADS)
+        .map(|i| deterministic_value(667, i, 0.15))
+        .collect::<Vec<_>>();
+    let norm_weight = deterministic_norm(128, 673)?;
+    let q_norm = deterministic_norm(HEAD_DIM, 677)?;
+    let k_norm = deterministic_norm(HEAD_DIM, 683)?;
+    let q_proj = Linear::new(
+        deterministic_tensor(2 * Q_HEADS * HEAD_DIM, HIDDEN, 691, 0.06)?,
+        None,
+    )?;
+    let k_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 701, 0.06)?,
+        None,
+    )?;
+    let v_proj = Linear::new(
+        deterministic_tensor(KV_HEADS * HEAD_DIM, HIDDEN, 709, 0.06)?,
+        None,
+    )?;
+    let o_proj = Linear::new(
+        deterministic_tensor(HIDDEN, Q_HEADS * HEAD_DIM, 719, 0.02)?,
+        None,
+    )?;
+    let spec = PrefillAttentionSpec {
+        seq: SEQ,
+        hidden_dim: HIDDEN,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        rope_theta: 10_000_000.0,
+        attn_scalar: HEAD_DIM as f32,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let tail = PrefillMoeTail::Dense {
+        gate_proj: &gate,
+        up_proj: &up,
+        down_proj: &down,
+    };
+    let layers = [
+        PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Linear {
+                weights: LinearAttnResidentWeights {
+                    in_proj_qkv: &in_proj_qkv,
+                    in_proj_z: &in_proj_z,
+                    in_proj_b: &in_proj_b,
+                    in_proj_a: &in_proj_a,
+                    out_proj: &out_proj,
+                    conv_weight: &conv_weight,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    norm_weight: norm_weight.data(),
+                },
+                spec: linear_spec,
+                dims,
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail,
+        },
+        PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Full {
+                q_proj: &q_proj,
+                k_proj: &k_proj,
+                v_proj: &v_proj,
+                o_proj: &o_proj,
+                q_norm: &q_norm,
+                k_norm: &k_norm,
+                gated: true,
+                sinks: None,
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail,
+        },
+    ];
+    assert_eq!(dims.value_dim, Q_HEADS * HEAD_DIM);
+    assert!(executor.prefill_resident_extend_supported(&layers));
+    let run = || {
+        executor.qwen_moe_prefill_resident_with_captures(
+            PrefillInput::Hidden(&input),
+            &layers,
+            spec,
+            None,
+            &[0, 1],
+            usize::MAX,
+            CHUNK,
+            false,
+        )
+    };
+    let (expected, distinct) = with_phase_allocations(true, run);
+    let (expected, expected_caches, expected_captures) = expected?;
+    // Matérialiser avant le second run : aucun résultat ne sert d'oracle
+    // en restant une vue sur un scratch que ce run pourrait écraser.
+    let expected = expected.into_tensor(HIDDEN)?;
+    let (actual, shared) = with_phase_allocations(false, run);
+    let (actual, actual_caches, actual_captures) = actual?;
+    let actual = actual.into_tensor(HIDDEN)?;
+    assert!(actual.data().iter().all(|x| x.is_finite()));
+    assert!(actual.data().iter().any(|&x| x != 0.0));
+    assert_bit_exact(&actual, &expected, "phases mixtes sortie");
+    let (Some(actual_captures), Some(expected_captures)) = (actual_captures, expected_captures)
+    else {
+        return Err(InferError::Config(
+            "captures des deux couches absentes".into(),
+        ));
+    };
+    assert_eq!(actual_captures.from, 0);
+    assert_eq!(expected_captures.from, 0);
+    assert_eq!(actual_captures.hidden.shape(), &[SEQ, 2 * HIDDEN]);
+    assert_bit_exact(
+        &actual_captures.hidden,
+        &expected_captures.hidden,
+        "phases mixtes captures",
+    );
+    match (actual_caches.as_slice(), expected_caches.as_slice()) {
+        (
+            [PrefillResidentLayerCache::Linear { state: a }, PrefillResidentLayerCache::Full { .. }],
+            [PrefillResidentLayerCache::Linear { state: b }, PrefillResidentLayerCache::Full { .. }],
+        ) => {
+            assert_full_kv_bit_exact(&actual_caches, &expected_caches, "phases mixtes K/V")?;
+            assert_eq!(a.conv_len, b.conv_len);
+            assert_eq!(a.ssm_len, b.ssm_len);
+            assert_eq!(a.ssm_bf16, b.ssm_bf16);
+            for (a, b, len, bf16) in [
+                (&a.conv, &b.conv, a.conv_len, false),
+                (&a.ssm, &b.ssm, a.ssm_len, a.ssm_bf16),
+            ] {
+                if bf16 {
+                    assert_eq!(read_u16_buffer(a, len)?, read_u16_buffer(b, len)?);
+                } else {
+                    let bits = |buffer: &BufferRef| -> Result<Vec<u32>> {
+                        Ok(read_f32_buffer(buffer, len)?
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect())
+                    };
+                    assert_eq!(bits(a)?, bits(b)?, "phases mixtes état GDN");
+                }
+            }
+        }
+        _ => return Err(InferError::Config("caches GDN + full attendus".into())),
+    }
+    let mode = if private_scratch_enabled() {
+        metal::MTLStorageMode::Private
+    } else {
+        metal::MTLStorageMode::Shared
+    };
+    assert_eq!(shared.len(), distinct.len());
+    let mut distinct_addresses = std::collections::HashSet::new();
+    for (a, b) in shared.iter().zip(&distinct) {
+        assert_eq!((a.label, a.requested), (b.label, b.requested));
+        assert_eq!(a.buffer.storage_mode(), mode);
+        assert_eq!(b.buffer.storage_mode(), mode);
+        assert!(
+            distinct_addresses.insert(b.buffer.as_ptr() as usize),
+            "oracle sans alias"
+        );
+    }
+    // Chaque chunk alloue les deux couches réelles : Q/contexte/Z, RoPE/
+    // gated, gate/Y, O/down, input/postnorm. Le dernier GDN demande 256 lignes
+    // et reprend le stockage de 257 lignes de l'attention complète.
+    let mut shared_addresses = std::collections::HashSet::new();
+    for (label, width, per_chunk) in [
+        (PHASE_Q_CONTEXT, dims.value_dim, 3),
+        (PHASE_ROPE_GATED, dims.value_dim, 3),
+        (PHASE_GATE, dims.value_dim, 2),
+        (PHASE_OUTPUT, HIDDEN, 4),
+        (PHASE_NORM, HIDDEN, 4),
+    ] {
+        let allocations = shared
+            .iter()
+            .filter(|a| a.label == label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            allocations.len(),
+            2 * per_chunk,
+            "{label}: deux morceaux et deux couches"
+        );
+        let address = allocations[0].buffer.as_ptr();
+        assert!(
+            shared_addresses.insert(address as usize),
+            "phases indépendantes"
+        );
+        for a in &allocations {
+            assert_eq!(a.buffer.as_ptr(), address, "{label}: partage effectif");
+            assert_eq!(a.buffer.length(), (CHUNK * width * 4) as u64);
+        }
+        if width == dims.value_dim {
+            assert_eq!(
+                allocations
+                    .iter()
+                    .filter(|a| a.requested == (CHUNK - 1) * width)
+                    .count(),
+                1,
+                "{label}: dernier GDN court réellement exécuté"
+            );
+        }
+    }
+    eprintln!(
+        "phases mixtes {mode:?}: 257+256 lignes, {} demandes, {} buffers partagés, {} distincts; bits identiques",
+        shared.len(), shared_addresses.len(), distinct_addresses.len(),
+    );
+    Ok(())
 }
 
 #[test]
@@ -2910,7 +3235,8 @@ fn mtp_seed_quantized_nax_partial_903_bit_exact() -> Result<()> {
         crate::metal_backend::flags::with_private_scratch_override(private, || -> Result<()> {
             let run = |reuse, namespace| -> Result<(Vec<Vec<u32>>, Vec<String>)> {
                 let _namespace = install_scratch_namespace(namespace);
-                let mut seed = MtpPrefillSeed::new(&executor, weights, spec, &norm, &tokens, 1024)?;
+                let mut seed =
+                    MtpPrefillSeed::new(&executor, weights, spec, &norm, &tokens, 1024, None)?;
                 // Rejouer le semis intégré précédent : seule la garde de
                 // capacité est neutralisée, ni kernels ni découpage changés.
                 seed.reuse_scratch_capacity = reuse;
@@ -2982,4 +3308,94 @@ fn mtp_seed_quantized_nax_partial_903_bit_exact() -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// Oracle ancien semis f32 → KV bf16, identité brute et propriété des buffers.
+fn check_mtp_bf16_adoption(
+    executor: &MetalExecutor,
+    rows: [PrefillKvRows; 2],
+    expected: [&[f32]; 2],
+    (len, capacity): (usize, usize),
+    (q_heads, kv_heads, head_dim): (usize, usize, usize),
+) -> Result<()> {
+    use crate::decode_resident::{DecodeResidentState, KvSegment};
+    let [PrefillKvRows::SharedBf16(k), PrefillKvRows::SharedBf16(v)] = rows else {
+        return Err(InferError::Config("semis MTP bf16 partagé attendu".into()));
+    };
+    let state = DecodeResidentState::new(executor.device().to_owned())?;
+    let cells = len * kv_heads * head_dim;
+    let reference = expected.map(|values| executor.shared_f32_rows_for_test(values));
+    let [rk, rv] = reference;
+    let (rk, rv) = (rk?, rv?);
+    let mut old = state.full_attention_bf16_for_test(capacity, q_heads, kv_heads, head_dim)?;
+    old.seed_segments(&[KvSegment::Shared(&rk)], &[KvSegment::Shared(&rv)], len)?;
+    let snapshots = [k.clone(), v.clone()];
+    for (view, old) in [(&k, old.keys()), (&v, old.values())] {
+        assert_eq!(view.as_slice(), read_u16_buffer(old.buffer(), cells)?);
+        assert_eq!(view.allocation_bytes(), capacity * kv_heads * head_dim * 2);
+    }
+    crate::decode_resident::with_kv_format_override(
+        crate::decode_resident::KvFormat::Bf16,
+        || -> Result<()> {
+            let adopt = |capacity| {
+                state.full_attention_adopting(capacity, q_heads, kv_heads, head_dim, true, [&k, &v])
+            };
+            let mut adopted = adopt(capacity)?.expect("invariant: réserve suffisante et libre");
+            assert_eq!(adopted.keys().buffer().contents(), k.buffer().contents());
+            assert_eq!(adopted.values().buffer().contents(), v.buffer().contents());
+            assert!(adopt(capacity)?.is_none(), "écrivain concurrent refusé");
+            // Le repli copie les bits, sans seconde conversion et sans toucher au préfixe.
+            let mut copied =
+                state.full_attention_bf16_for_test(capacity, q_heads, kv_heads, head_dim)?;
+            copied.seed_segments(
+                &[KvSegment::SharedBf16(&k)],
+                &[KvSegment::SharedBf16(&v)],
+                len,
+            )?;
+            for (copy, reference) in [(copied.keys(), old.keys()), (copied.values(), old.values())]
+            {
+                assert_eq!(
+                    read_u16_buffer(copy.buffer(), cells)?,
+                    read_u16_buffer(reference.buffer(), cells)?
+                );
+            }
+            assert!(adopted.truncate(len - 1).is_err());
+            assert_eq!(snapshots[0].as_slice(), k.as_slice());
+            drop(adopted);
+            assert!(
+                adopt(capacity + 1)?.is_none(),
+                "copie si réserve trop courte"
+            );
+            assert!(adopt(capacity)?.is_some(), "claim libéré au drop");
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_seed_bf16_streamed_bit_exact_and_adopted() -> Result<()> {
+    for private in [false, true] {
+        crate::metal_backend::flags::with_private_scratch_override(private, || -> Result<()> {
+            let executor = MetalExecutor::new()?;
+            // En scratch partagé, le semis intégré exige plusieurs morceaux.
+            // 1025/512 donne trois morceaux (342, 342, 341), tous > 256
+            // pour ouvrir Steel/NAX dès le premier, et un seul bloc MTP.
+            for (seq, chunk) in [(1025, 512), (1928, 1500), (4097, 4096), (8297, 1500)] {
+                check_mtp_seed_streamed(&executor, seq, chunk, true)?;
+            }
+            // Le monobloc n'a une norme finale GPU qu'en scratch privé.
+            if private {
+                check_mtp_seed_streamed(&executor, 129, 4096, true)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "device Metal requis, données synthétiques, contexte long"]
+fn mtp_seed_bf16_streamed_32768_bit_exact() -> Result<()> {
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 32768, 4096, true)
 }

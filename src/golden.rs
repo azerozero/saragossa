@@ -21,6 +21,11 @@ use crate::error::{InferError, Result};
 use crate::runtime_flags::env_flag;
 use std::path::PathBuf;
 
+mod chat;
+mod embedder;
+pub(crate) mod external;
+mod logits;
+
 /// SHA reti (HEAD à la capture) — le fork mlx-rs vendoré est figé sur MLX 0.31.2.
 pub const MLX_SHA: &str = "be456e2";
 /// Date de capture des goldens (ISO).
@@ -43,7 +48,7 @@ pub struct Header {
     pub dtype: String,
     pub shape: Vec<usize>,
     pub tolerance: String,
-    pub source: String,
+    pub source: serde_json::Value,
     pub mlx_sha: String,
     pub captured: String,
 }
@@ -60,7 +65,7 @@ fn write_header(name: &str, dtype: &str, shape: &[usize], tol: &str, source: &st
         dtype: dtype.to_string(),
         shape: shape.to_vec(),
         tolerance: tol.to_string(),
-        source: source.to_string(),
+        source: source.into(),
         mlx_sha: MLX_SHA.to_string(),
         captured: CAPTURED.to_string(),
     };

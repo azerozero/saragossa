@@ -211,6 +211,72 @@ fn eot_lookup_accepts_only_configured_ids() {
 }
 
 #[test]
+fn closed_object_allows_only_model_stops_even_with_higher_whitespace_logits() {
+    let catalog = Arc::new(JsonTokenCatalog::from_token_bytes_for_tests(&[
+        b"{}",
+        b" ",
+        b"\n\n  \n",
+        b"\t",
+        b"\r\n",
+        b"",
+        b"<eos>",
+        b"<end_of_turn>",
+    ]));
+    // Un EOS ou plusieurs fins de tour : la règle ne dépend pas de la famille.
+    for stops in [&[6][..], &[7, 6][..]] {
+        let constraint = JsonTokenConstraint::new(Arc::clone(&catalog), stops, false);
+        constraint.accept_token(0).expect("objet fermé");
+        let mut logits = vec![100.0; 8];
+        for &stop in stops {
+            logits[stop] = -10.0;
+        }
+        constraint
+            .mask_logits(&mut logits)
+            .expect("masque terminal");
+        for (token, logit) in logits.iter().enumerate() {
+            assert_eq!(logit.is_finite(), stops.contains(&token), "token {token}");
+        }
+        for token in 0..6 {
+            assert!(constraint.accept_token(token).is_err(), "token {token}");
+        }
+        for &stop in stops {
+            constraint.accept_token(stop).expect("stop du modèle");
+        }
+    }
+}
+
+#[test]
+fn closing_token_may_include_whitespace_but_next_token_must_stop() {
+    let catalog = Arc::new(JsonTokenCatalog::from_token_bytes_for_tests(&[
+        b"{\n",
+        b"\"key\":",
+        b"{}",
+        b"}\n  ",
+        b" ",
+    ]));
+    let constraint = JsonTokenConstraint::new(catalog, &[EOT], false);
+    for token in [0, 1, 2] {
+        constraint.accept_token(token).expect("préfixe JSON");
+    }
+    assert!(
+        !constraint.is_finished(),
+        "l'objet imbriqué ne ferme pas la racine"
+    );
+    constraint
+        .accept_token(4)
+        .expect("espace avant fermeture racine");
+    constraint
+        .accept_token(3)
+        .expect("fermeture et espaces dans un même token");
+    let mut logits = vec![0.0; EOT + 1];
+    constraint
+        .mask_logits(&mut logits)
+        .expect("masque terminal");
+    assert_eq!(logits.iter().filter(|x| x.is_finite()).count(), 1);
+    assert!(logits[EOT].is_finite());
+}
+
+#[test]
 fn mask_rejects_tokens_that_break_the_prefix() {
     let catalog = Arc::new(JsonTokenCatalog::from_token_bytes_for_tests(&[
         b"{", b"[", b"\"a\"", b":", b"true", b"}",
