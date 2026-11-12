@@ -6233,6 +6233,286 @@ fn mtp_bf16_history_generation_adoption_and_f32_fallback() -> Result<()> {
     })
 }
 
+/// La copie MTP refuse après l'installation du tronc : tous ses claims
+/// doivent être rendus, et le refus doit rester un repli, pas une erreur.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_bf16_busy_claim_memory_guard_cleans_setup() -> Result<()> {
+    use crate::decode_resident::{with_kv_format_override, KvFormat};
+    use crate::metal_backend::InPlaceClaim;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut model, prompt) = mtp_seed_synthetic_model()?;
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || {
+        with_kv_format_override(KvFormat::Bf16, || -> Result<()> {
+            let (mut cache, _, history, _) = with_prefill_kv_reserve(16, || {
+                super::mtp_history::with_storage(Some(prompt.len() + 16), || {
+                    model.prefill_cache_state_with_mtp_history(&prompt, &mut |_| Ok(true))
+                })
+            })?;
+            let keys = history.keys.adoptable_bf16_prefix().expect("semis bf16");
+            let values = history.values.adoptable_bf16_prefix().expect("semis bf16");
+            let claim = InPlaceClaim::try_after([keys, values]).expect("claim MTP libre");
+            // Le tronc f32 impose une copie : estimation et copie passent,
+            // puis la copie MTP sous claim occupé épuise le budget.
+            assert_eq!(cache.layers.len(), 1);
+            assert!(!cache.layers[0].keys.has_bf16());
+            let probes = Arc::new(AtomicUsize::new(0));
+            let observed = probes.clone();
+            const LIMIT: u64 = 1 << 40;
+            model.memory_guard = Some(MemoryGuard::from_limits(
+                true,
+                crate::memory_guard::MemoryLimits {
+                    static_cap: Some(LIMIT),
+                    host_memory: None,
+                    headroom_bytes: 0,
+                    metal_cap: None,
+                },
+                Arc::new(move || {
+                    Some(if observed.fetch_add(1, Ordering::SeqCst) == 2 {
+                        LIMIT
+                    } else {
+                        0
+                    })
+                }),
+            ));
+            assert!(!model.setup_resident_full_decode_with_mtp_history(
+                &mut cache,
+                14,
+                2,
+                true,
+                Some(&history),
+            )?);
+            assert_eq!(probes.load(Ordering::SeqCst), 3);
+            assert!(cache.resident.is_none());
+            for layer in &cache.layers {
+                assert!(layer.full.is_none());
+            }
+            drop(claim);
+            model.memory_guard = None;
+            assert!(model.setup_resident_full_decode_with_mtp_history(
+                &mut cache,
+                14,
+                2,
+                true,
+                Some(&history),
+            )?);
+            Ok(())
+        })
+    })
+}
+
+/// Refus réel de la garde APRÈS semis bf16, à froid et après extension.
+/// Compare le triplet reconstruit et la génération, émission précoce comprise.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_bf16_post_seed_refusal_rebuilds_f32_and_streams_once() -> Result<()> {
+    use crate::decode_resident::{with_kv_format_override, KvFormat};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    assert!(decode_resident_full_enabled());
+    assert!(prefix_cache_enabled());
+    assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
+    assert!(crate::runtime_flags::mtp_early_first_token_enabled());
+    assert!(!crate::runtime_flags::mtp_gpu_block_enabled());
+    let (mut model, prompt) = mtp_seed_synthetic_model()?;
+    let mut extended = prompt.clone();
+    extended.extend_from_slice(&[3, 7, 11]);
+    let options = GenerationOptions::default();
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || {
+        with_kv_format_override(KvFormat::Bf16, || -> Result<()> {
+            for depth in [1, 2] {
+                for warm in [false, true] {
+                    let target = if warm { &extended } else { &prompt };
+                    let reserve = 8 + depth;
+                    model.clear_prefix_cache();
+                    let (reference_cache, reference_state, reference_history, _) =
+                        with_prefill_kv_reserve(reserve, || {
+                            super::mtp_history::with_storage(None, || {
+                                model
+                                    .prefill_cache_state_with_mtp_history(target, &mut |_| Ok(true))
+                            })
+                        })?;
+                    let seed = || -> Result<_> {
+                        if warm {
+                            with_prefill_kv_reserve(reserve + 3, || {
+                                super::mtp_history::with_storage(
+                                    Some(target.len() + reserve),
+                                    || {
+                                        model.prefill_cache_state_with_mtp_history(
+                                            &prompt,
+                                            &mut |_| Ok(true),
+                                        )
+                                    },
+                                )
+                            })?;
+                        }
+                        with_prefill_kv_reserve(reserve, || {
+                            super::mtp_history::with_storage(Some(target.len() + reserve), || {
+                                model
+                                    .prefill_cache_state_with_mtp_history(target, &mut |_| Ok(true))
+                            })
+                        })
+                    };
+                    model.clear_prefix_cache();
+                    let (cache, state, history, reused) = seed()?;
+                    assert_eq!(reused, if warm { prompt.len() } else { 0 });
+                    assert!(history.keys.has_bf16() && history.values.has_bf16());
+                    // Le probe atteste que le refus survient avec l'historique
+                    // compact déjà publié ; le repli f32 ne doit pas le rappeler.
+                    let prefixes = model.prefix_cache.clone();
+                    let refusals = Arc::new(AtomicUsize::new(0));
+                    let observed = refusals.clone();
+                    model.memory_guard = Some(MemoryGuard::from_limits(
+                        true,
+                        crate::memory_guard::MemoryLimits {
+                            static_cap: Some(1),
+                            host_memory: None,
+                            headroom_bytes: 0,
+                            metal_cap: None,
+                        },
+                        Arc::new(move || {
+                            let prefixes = prefixes.lock().expect("préfixe");
+                            assert!(prefixes.entries.iter().any(|entry| entry
+                                .mtp_history
+                                .as_ref()
+                                .is_some_and(|h| h.keys.has_bf16() && h.values.has_bf16())));
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            Some(0)
+                        }),
+                    ));
+                    // Un état sentinelle détecte la conservation accidentelle du
+                    // premier final_state, même si les deux prefills coïncident.
+                    let stale_state = Tensor::row(vec![f32::NAN; state.data().len()])?;
+                    let (rebuilt, final_state, history) = model.prepare_mtp_decode(
+                        target,
+                        8,
+                        depth,
+                        &options,
+                        (cache, stale_state, Some(history)),
+                    )?;
+                    assert_eq!(refusals.load(Ordering::SeqCst), 1);
+                    assert_eq!(final_state.data(), reference_state.data());
+                    assert_eq!(rebuilt.position, reference_cache.position);
+                    for (actual, expected) in rebuilt.layers.iter().zip(&reference_cache.layers) {
+                        assert_eq!(
+                            actual.keys.snapshot_segments(),
+                            expected.keys.snapshot_segments()
+                        );
+                        assert_eq!(
+                            actual.values.snapshot_segments(),
+                            expected.values.snapshot_segments()
+                        );
+                    }
+                    let history = history.expect("historique reconstruit");
+                    assert!(!history.keys.has_bf16() && !history.values.has_bf16());
+                    assert_eq!(
+                        history.keys.snapshot_segments(),
+                        reference_history.keys.snapshot_segments()
+                    );
+                    assert_eq!(
+                        history.values.snapshot_segments(),
+                        reference_history.values.snapshot_segments()
+                    );
+                    drop((rebuilt, history, reference_cache, reference_history));
+                    model.memory_guard = None;
+                    model.clear_prefix_cache();
+                    let ar = model.generate_greedy_cached_with_options(target, 8, &options)?;
+                    model.clear_prefix_cache();
+                    if warm {
+                        with_prefill_kv_reserve(reserve + 3, || {
+                            super::mtp_history::with_storage(Some(target.len() + reserve), || {
+                                model.prefill_cache_state_with_mtp_history(&prompt, &mut |_| {
+                                    Ok(true)
+                                })
+                            })
+                        })?;
+                    }
+                    let prefixes = model.prefix_cache.clone();
+                    let observed = refusals.clone();
+                    let emissions = Arc::new(AtomicUsize::new(0));
+                    let before_setup = emissions.clone();
+                    model.memory_guard = Some(MemoryGuard::from_limits(
+                        true,
+                        crate::memory_guard::MemoryLimits {
+                            static_cap: Some(1),
+                            host_memory: None,
+                            headroom_bytes: 0,
+                            metal_cap: None,
+                        },
+                        Arc::new(move || {
+                            assert_eq!(before_setup.load(Ordering::SeqCst), 1);
+                            assert!(prefixes.lock().expect("préfixe").entries.iter().any(
+                                |entry| entry
+                                    .mtp_history
+                                    .as_ref()
+                                    .is_some_and(|h| h.keys.has_bf16())
+                            ));
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            Some(0)
+                        }),
+                    ));
+                    let mut emitted = Vec::new();
+                    let output = model.generate_greedy_mtp_streaming_with_options(
+                        target,
+                        8,
+                        &options,
+                        depth,
+                        |token| {
+                            emissions.fetch_add(1, Ordering::SeqCst);
+                            emitted.push(token);
+                            true
+                        },
+                    )?;
+                    assert_eq!(refusals.load(Ordering::SeqCst), 2);
+                    assert_eq!(
+                        output.stats.reused_prefix_tokens,
+                        if warm { prompt.len() } else { 0 }
+                    );
+                    assert_eq!(output.tokens, ar, "D{depth}, extension={warm}");
+                    assert_eq!(
+                        emitted, output.tokens,
+                        "chaque position émise une seule fois"
+                    );
+                    let prefixes = model.prefix_cache.lock().expect("préfixe");
+                    let saved = prefixes
+                        .entries
+                        .iter()
+                        .find(|entry| entry.tokens == *target)
+                        .expect("préfixe reconstruit");
+                    assert_eq!(saved.final_state.data(), reference_state.data());
+                    assert!(prefixes.entries.iter().all(|entry| entry
+                        .mtp_history
+                        .as_ref()
+                        .is_none_or(|h| !h.keys.has_bf16() && !h.values.has_bf16())));
+                    drop(prefixes);
+                    model.memory_guard = None;
+                }
+            }
+            Ok(())
+        })
+    })
+}
+
+#[test]
+fn mtp_f32_fallback_discards_all_bf16_prefix_references_cpu() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let state = (model.empty_cache(), Tensor::row(vec![0.0])?);
+    let mut bf16 = LayerKvCache::default();
+    bf16.keys.push_owned_bf16(vec![0x3f80]);
+    bf16.values.push_owned_bf16(vec![0x4000]);
+    // Entrées de branches différentes partageant le même historique compact.
+    model.prefix_cache_put(&[1, 2], &state, Some(&bf16), None)?;
+    model.prefix_cache_put(&[1, 3], &state, Some(&bf16), None)?;
+    let f32 = LayerKvCache::default();
+    model.prefix_cache_put(&[4, 5], &state, Some(&f32), None)?;
+    model.discard_bf16_mtp_prefixes()?;
+    let prefixes = model.prefix_cache.lock().expect("préfixe");
+    assert_eq!(prefixes.entries.len(), 1);
+    assert_eq!(prefixes.entries[0].tokens, [4, 5]);
+    Ok(())
+}
+
 /// Une entrée compacte est un état résident, jamais un oracle f32 de draft.
 #[test]
 fn mtp_bf16_prefix_compatibility_and_shared_accounting_cpu() -> Result<()> {

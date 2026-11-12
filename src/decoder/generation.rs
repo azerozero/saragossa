@@ -1383,6 +1383,91 @@ impl CausalDecoder {
         Ok(spec)
     }
 
+    /// Le repli possède les trois résultats du prefill : aucun état bf16 local
+    /// ni entrée incompatible ne doit survivre à la reconstruction f32.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn prepare_mtp_decode(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        draft_headroom: usize,
+        options: &GenerationOptions,
+        (mut cache, mut final_state, mut mtp_history_cache): (
+            CausalDecoderCache,
+            Tensor,
+            Option<LayerKvCache>,
+        ),
+    ) -> Result<(CausalDecoderCache, Tensor, Option<LayerKvCache>)> {
+        let trace_setup = mtp_setup_trace_enabled();
+        let mut use_resident_full = false;
+        // À T>0 (échantillonné opt-in), l'arène sert au draft résident avec
+        // relecture des logits et à la vérification en lignes ; le KV passe en
+        // bf16 comme pour l'AR échantillonné (`resident_kv_bf16`).
+        let kv_bf16 = Self::resident_kv_bf16(options.temperature > f32::EPSILON, cache.position);
+        if decode_resident_full_enabled()
+            && (options.temperature <= f32::EPSILON || mtp_sampled_enabled())
+            && self.supports_resident_full_decode()
+        {
+            let t_setup = trace_setup.then(Instant::now);
+            use_resident_full = self.setup_resident_full_decode_with_mtp_history(
+                &mut cache,
+                max_new_tokens,
+                draft_headroom,
+                kv_bf16,
+                mtp_history_cache.as_ref(),
+            )?;
+            if let Some(t) = t_setup {
+                eprintln!(
+                    "mtp_setup setup_resident_full_us={} applied={use_resident_full}",
+                    t.elapsed().as_micros()
+                );
+            }
+        }
+        if !use_resident_full
+            && mtp_history_cache
+                .as_ref()
+                .is_some_and(|history| history.keys.has_bf16() || history.values.has_bf16())
+        {
+            // Le setup a décliné après le semis (budget, état linéaire).
+            // Les bits f32 perdus ne se reconstruisent pas par élargissement :
+            // rejouer le prefill avec le contrat f32, sans réémettre le token.
+            drop(cache);
+            drop(mtp_history_cache.take());
+            drop(final_state);
+            self.discard_bf16_mtp_prefixes()?;
+            let (rebuilt, rebuilt_state, history, _) =
+                with_prefill_kv_reserve(max_new_tokens.saturating_add(draft_headroom), || {
+                    super::mtp_history::with_storage(None, || {
+                        self.prefill_cache_state_with_mtp_history(prompt, &mut |_| Ok(true))
+                    })
+                })?;
+            cache = rebuilt;
+            final_state = rebuilt_state;
+            mtp_history_cache = Some(history);
+        }
+        if decode_resident_enabled() && !use_resident_full {
+            self.setup_resident_decode(&mut cache, max_new_tokens, kv_bf16)?;
+        }
+        Ok((cache, final_state, mtp_history_cache))
+    }
+
+    /// Les entrées bf16 peuvent partager les allocations du prefill refusé,
+    /// y compris entre préfixes étendus. Les retirer avant d'allouer le repli.
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    pub(super) fn discard_bf16_mtp_prefixes(&self) -> Result<()> {
+        self.prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?
+            .entries
+            .retain(|entry| {
+                !entry
+                    .mtp_history
+                    .as_ref()
+                    .is_some_and(|history| history.keys.has_bf16() || history.values.has_bf16())
+            });
+        Ok(())
+    }
+
     pub(super) fn generate_greedy_mtp_core(
         &self,
         prompt: &[usize],
@@ -1462,7 +1547,7 @@ impl CausalDecoder {
         let mut first_token = None;
         let mut early_emitted = false;
         let mut early_stop = false;
-        let (mut cache, final_state, mut mtp_history_cache, reused_prefix_tokens) =
+        let (cache, final_state, mtp_history_cache, reused_prefix_tokens) =
             if use_committed_mtp_history {
                 let mut on_final_state = |state: &Tensor| -> Result<bool> {
                     let token = self.sample_token_from_state(state, options, &mut sampler)?;
@@ -1499,56 +1584,17 @@ impl CausalDecoder {
                 use_committed_mtp_history
             );
         }
-        let mut resident_mtp_history_len = mtp_history_cache.as_ref().map_or(0, LayerKvCache::len);
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        {
-            let mut use_resident_full = false;
-            // À T>0 (échantillonné opt-in), l'arène sert au draft résident avec
-            // relecture des logits et à la vérification en lignes ; le KV passe en
-            // bf16 comme pour l'AR échantillonné (`resident_kv_bf16`).
-            let kv_bf16 =
-                Self::resident_kv_bf16(options.temperature > f32::EPSILON, cache.position);
-            if decode_resident_full_enabled()
-                && (options.temperature <= f32::EPSILON || mtp_sampled_enabled())
-                && self.supports_resident_full_decode()
-            {
-                let t_setup = trace_setup.then(Instant::now);
-                use_resident_full = self.setup_resident_full_decode_with_mtp_history(
-                    &mut cache,
-                    max_new_tokens,
-                    draft_headroom,
-                    kv_bf16,
-                    mtp_history_cache.as_ref(),
-                )?;
-                if let Some(t) = t_setup {
-                    eprintln!(
-                        "mtp_setup setup_resident_full_us={} applied={use_resident_full}",
-                        t.elapsed().as_micros()
-                    );
-                }
-            }
-            if !use_resident_full
-                && mtp_history_cache
-                    .as_ref()
-                    .is_some_and(|history| history.keys.has_bf16() || history.values.has_bf16())
-            {
-                // Le setup a décliné après le semis (budget, état linéaire).
-                // Les bits f32 perdus ne se reconstruisent pas par élargissement :
-                // rejouer le prefill avec le contrat f32, sans réémettre le token.
-                drop(cache);
-                let (rebuilt, _, history, _) = with_prefill_kv_reserve(decode_reserve, || {
-                    super::mtp_history::with_storage(None, || {
-                        self.prefill_cache_state_with_mtp_history(prompt, &mut |_| Ok(true))
-                    })
-                })?;
-                cache = rebuilt;
-                resident_mtp_history_len = history.len();
-                mtp_history_cache = Some(history);
-            }
-            if decode_resident_enabled() && !use_resident_full {
-                self.setup_resident_decode(&mut cache, max_new_tokens, kv_bf16)?;
-            }
-        }
+        let (cache, final_state, mtp_history_cache) = self.prepare_mtp_decode(
+            prompt,
+            max_new_tokens,
+            draft_headroom,
+            options,
+            (cache, final_state, mtp_history_cache),
+        )?;
+        let mut cache = cache;
+        let mut mtp_history_cache = mtp_history_cache;
+        let mut resident_mtp_history_len = mtp_history_cache.as_ref().map_or(0, LayerKvCache::len);
         if early_stop {
             // L'appelant a refusé la suite dès le premier token, déjà émis.
             return Ok(SpeculativeOutput {

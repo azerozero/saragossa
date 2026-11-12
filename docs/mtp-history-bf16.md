@@ -18,8 +18,11 @@ Le contrat f32 reste le défaut : CPU, résident désactivé, tête non support�
 échantillonnage sans résident ou `SARAGOSSA_RUST_KV_BF16=0`. Une entrée bf16
 n'est pas réutilisée par un draft exigeant f32. Si le setup refuse le résident
 après le semis bf16, le prefill est rejoué en f32 sans réémettre le premier
-token. Ce repli peut coûter un second prefill. Il ne récupère pas les bits
-perdus par élargissement. La clé des instantanés inclut la version du contrat
+token. Le refus de copie sous claim occupé suit le même repli que le tronc.
+Les états déjà installés, l'historique local et les entrées bf16 du cache de
+préfixe sont libérés avant reconstruction ; l'état final reconstruit accompagne
+le nouvel historique f32. Ce repli peut coûter un second prefill. Il ne récupère
+pas les bits perdus par élargissement. La clé des instantanés inclut la version du contrat
 de stockage ; les formats de blobs f32/bf16 restent inchangés.
 
 Une ancienne entrée f32 reste utilisable en résident bf16 par copie. Le gain
@@ -41,6 +44,7 @@ rtk proxy taskpolicy -b env CARGO_NET_OFFLINE=true cargo test --all-features --l
 rtk proxy taskpolicy -b env CARGO_NET_OFFLINE=true cargo test --all-features --lib -- --exact \
   decoder::mtp_history::tests::storage_scope_restores_and_rejects_rounded_history_for_f32 \
   decoder::tests::mtp_bf16_prefix_compatibility_and_shared_accounting_cpu \
+  decoder::tests::mtp_f32_fallback_discards_all_bf16_prefix_references_cpu \
   decoder::state_snapshot::tests::roundtrip_and_reject_corruption_without_weights \
   decoder::kv_rows::tests::compact_snapshot_preserves_mixed_rows_and_base_without_reserve \
   decoder::kv_rows::tests::snapshot_shares_prefix_and_truncate_copies_only_split_segment \
@@ -77,6 +81,25 @@ rtk proxy taskpolicy -b env CARGO_NET_OFFLINE=true \
 Le troisième test utilise un modèle synthétique : ids AR/MTP D1/D2 à froid,
 préfixe exact et extension, buffers partagés avec le cache, écriture exclusive,
 copie concurrente et refus d'un préfixe bf16 lors du retour au f32 forcé.
+
+Les deux tests suivants couvrent le refus après semis bf16 : claim MTP
+occupé avec budget de copie épuisé et nettoyage du tronc ; reconstruction f32
+à froid et après extension, état final/historique cohérents, ids AR/MTP D1/D2
+et émission unique du premier token. Ils utilisent uniquement des données
+synthétiques et restent ignorés par défaut.
+
+```sh
+rtk proxy env CARGO_NET_OFFLINE=true \
+  SARAGOSSA_RUST_MTP_HISTORY=committed SARAGOSSA_RUST_PREFIX_CACHE=1 \
+  SARAGOSSA_RUST_DECODE_RESIDENT_FULL=1 SARAGOSSA_RUST_KV_BF16=1 \
+  SARAGOSSA_RUST_PREFILL_KV_SHARED=1 SARAGOSSA_RUST_MTP_PREFILL_RESIDENT=1 \
+  SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=0 SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0 \
+  SARAGOSSA_RUST_MTP_EARLY_FIRST_TOKEN=1 \
+  SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE=0 \
+  cargo test --all-features --lib -- --ignored --exact --nocapture \
+  decoder::tests::mtp_bf16_busy_claim_memory_guard_cleans_setup \
+  decoder::tests::mtp_bf16_post_seed_refusal_rebuilds_f32_and_streams_once
+```
 
 ## Modèle local, ids greedy et mémoire
 

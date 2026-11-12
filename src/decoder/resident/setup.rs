@@ -1060,7 +1060,7 @@ impl CausalDecoder {
                 // jamais quantifié (son oracle compare les octets bruts).
                 let t_seed = trace_setup.then(std::time::Instant::now);
                 let kv = if let Some(history) = mtp_history {
-                    resident_full_attention_state(
+                    match resident_full_attention_state(
                         &arena,
                         history,
                         (capacity, history.len()),
@@ -1068,7 +1068,25 @@ impl CausalDecoder {
                         kv_bf16,
                         (true, true),
                         self.memory_guard.as_ref(),
-                    )?
+                    ) {
+                        Ok(kv) => kv,
+                        Err(InferError::MemoryGuard(error)) => {
+                            // Le claim peut être pris après l'estimation. Le
+                            // tronc déjà installé doit rendre ses allocations
+                            // et ses claims avant la reconstruction f32.
+                            for layer_cache in &mut cache.layers {
+                                layer_cache.full = None;
+                            }
+                            cache.resident = None;
+                            if crate::decoder::flags::trace_resident_enabled() {
+                                eprintln!(
+                                    "decode résident MTP setup désactivé: budget mémoire ({error})"
+                                );
+                            }
+                            return Ok(false);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 } else {
                     arena.full_attention_dense(
                         capacity,
