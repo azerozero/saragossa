@@ -49,10 +49,15 @@ pub(crate) struct MtpPrefillSeed<'a> {
     final_norm: &'a Tensor,
     tokens: &'a [usize],
     block_rows: usize,
+    #[cfg(test)]
+    pub(super) reuse_scratch_capacity: bool,
     pending: Buffer,
     filled: usize,
     seeded: usize,
     completed: bool,
+    // Le setup résident vient après le prefill et peut refuser l'arène.
+    // Les replis CPU et les préfixes réutilisés doivent encore lire les f32
+    // d'origine : élargir du bf16 ne préserverait pas ces valeurs.
     output: [Buffer; 2],
 }
 
@@ -76,6 +81,8 @@ impl<'a> MtpPrefillSeed<'a> {
             final_norm,
             tokens,
             block_rows,
+            #[cfg(test)]
+            reuse_scratch_capacity: true,
             pending: metal.private_f32_buffer(
                 checked_len(block_rows, spec.hidden_dim, "semis MTP bloc")?,
                 "mtp_seed_pending",
@@ -119,6 +126,18 @@ impl<'a> MtpPrefillSeed<'a> {
             from += count;
             self.filled += count;
             if self.filled == self.block_rows || self.seeded + self.filled == self.tokens.len() {
+                // Le semis a son propre découpage, indépendant du prefill.
+                // Reprendre les capacités du bloc plein jusque dans les
+                // scratch internes des GEMM, sans changer leurs dimensions.
+                #[cfg(test)]
+                let capacity = if self.reuse_scratch_capacity {
+                    self.block_rows
+                } else {
+                    self.filled
+                };
+                #[cfg(not(test))]
+                let capacity = self.block_rows;
+                let _scratch_rows = enter_scratch_row_capacity(self.filled, capacity);
                 let (k, v) = metal.encode_mtp_seed_kv_rows(
                     encoder,
                     &self.tokens[self.seeded..self.seeded + self.filled],

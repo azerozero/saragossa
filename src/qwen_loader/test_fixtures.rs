@@ -4,7 +4,7 @@ use super::*;
 use safetensors::{serialize, Dtype, View};
 use std::borrow::Cow;
 
-pub(super) fn test_config() -> ModelConfig {
+pub(crate) fn test_config() -> ModelConfig {
     ModelConfig {
         model_type: "qwen3".to_string(),
         hidden_size: 2,
@@ -126,7 +126,7 @@ pub(super) fn write_safetensors_with_mlp(path: &Path) {
 }
 
 /// Renvoie une config Gemma 3 minimale (GeGLU, double norme FFN, embed scale).
-pub(super) fn gemma_test_config() -> ModelConfig {
+pub(crate) fn gemma_test_config() -> ModelConfig {
     ModelConfig {
         model_type: "gemma3_text".to_string(),
         hidden_activation: Some("gelu_pytorch_tanh".to_string()),
