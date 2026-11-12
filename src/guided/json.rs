@@ -100,6 +100,11 @@ impl TokenConstraint for JsonTokenConstraint {
         for (token, logit) in logits.iter_mut().enumerate() {
             let token_allowed = if self.is_eot(token) {
                 final_state
+            } else if final_state && !state.repeat {
+                // La grammaire accepte les espaces dans le token qui ferme
+                // l'objet, mais aucun nouveau token de contenu après lui.
+                // Sinon un logit d'espace supérieur à EOS boucle sans limite.
+                false
             } else {
                 self.catalog
                     .token_bytes(token)
@@ -141,7 +146,7 @@ impl TokenConstraint for JsonTokenConstraint {
                 "structured output JSON: token {token} hors catalogue"
             )));
         };
-        if bytes.is_empty() || !state.advance_bytes(bytes) {
+        if (state.is_final() && !state.repeat) || bytes.is_empty() || !state.advance_bytes(bytes) {
             return Err(InferError::Config(format!(
                 "structured output JSON: token {token} inadmissible"
             )));

@@ -3,7 +3,7 @@
 
 use super::json_tests::tiny_loaded_model;
 use super::*;
-use saragossa::{CausalDecoderConfig, ModelConfig, RustTokenizer, Tensor};
+use saragossa::{CausalDecoderConfig, ModelConfig, RustTokenizer, Tensor, TokenConstraint};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -22,6 +22,106 @@ fn local_tokenizer() -> Option<PathBuf> {
         "93724907d4ed1745d2fe50baadf3b0b01a65abf2/tokenizer.json"
     ));
     path.is_file().then_some(path)
+}
+
+#[test]
+fn gemma3_local_first_json_mask_matches_tokenizer_and_json_parser() {
+    let Some(path) = local_tokenizer() else {
+        eprintln!("SKIP: tokenizer Gemma 3 absent ; définir SARAGOSSA_TOKENIZER_GEMMA3");
+        return;
+    };
+    let tokenizer = RustTokenizer::from_file(&path).expect("invariant: tokenizer local");
+    let reference = tokenizers::Tokenizer::from_file(&path).expect("invariant: tokenizer oracle");
+    let catalog = Arc::new(JsonTokenCatalog::from_tokenizer(&tokenizer).expect("catalogue"));
+    let stops: Vec<usize> = ["<eos>", "<end_of_turn>"]
+        .iter()
+        .map(|s| tokenizer.token_to_id(s).expect("token stop") as usize)
+        .collect();
+    let constraint = JsonTokenConstraint::new(Arc::clone(&catalog), &stops, false);
+    let mut logits = vec![0.0; tokenizer.vocab_size()];
+    constraint.mask_logits(&mut logits).expect("masque initial");
+    let mut allowed = Vec::new();
+    for (id, logit) in logits.iter().enumerate() {
+        let id = id as u32;
+        let surface = reference.id_to_token(id).expect("token du vocabulaire");
+        // Oracle indépendant du catalogue : décodage HF et octets fallback
+        // bruts (un octet UTF-8 isolé ne doit pas devenir U+FFFD).
+        let bytes = if surface.starts_with("<0x") && surface.len() == 6 {
+            vec![u8::from_str_radix(&surface[3..5], 16).expect("octet fallback")]
+        } else {
+            reference
+                .decode(&[id], true)
+                .expect("décodage HF")
+                .into_bytes()
+        };
+        assert_eq!(
+            tokenizer.decode_token_bytes(id).expect("octets"),
+            bytes,
+            "{surface:?}"
+        );
+        let first = bytes
+            .iter()
+            .find(|b| !matches!(b, b' ' | b'\n' | b'\r' | b'\t'));
+        let expected = !bytes.is_empty()
+            && (first.is_none()
+                || (first == Some(&b'{')
+                    && match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        Ok(value) => value.is_object(),
+                        Err(error) => error.is_eof(),
+                    }));
+        assert_eq!(
+            logit.is_finite(),
+            expected,
+            "id={id} surface={surface:?} bytes={bytes:?}"
+        );
+        if expected {
+            allowed.push((id, surface));
+        }
+    }
+    eprintln!(
+        "Gemma premier pas : {} tokens autorisés (oracle HF + serde_json)",
+        allowed.len()
+    );
+    for (id, surface) in &allowed {
+        if surface.contains('{') || surface == "<0x7B>" {
+            eprintln!("  id={id} surface={surface:?}");
+        }
+    }
+    for piece in ["{", "{\"", "▁{", "▁{\"", "{}", "▁{}", "<0x7B>", "<0x20>"] {
+        assert!(
+            logits[tokenizer.token_to_id(piece).expect("token JSON") as usize].is_finite(),
+            "{piece:?}"
+        );
+    }
+    // Certains tokenizers fusionnent l'accolade et le saut de ligne ; Gemma
+    // peut les encoder séparément. Chaque morceau doit rester admissible.
+    for text in ["{\"", "{\n", " {\"", "{\n  \"greeting\":"] {
+        let constraint = JsonTokenConstraint::new(Arc::clone(&catalog), &stops, false);
+        for id in tokenizer.encode(text).expect("encodage préfixe") {
+            let mut logits = vec![0.0; tokenizer.vocab_size()];
+            constraint.mask_logits(&mut logits).expect("masque préfixe");
+            assert!(logits[id as usize].is_finite(), "{text:?}: token {id}");
+            constraint
+                .accept_token(id as usize)
+                .expect("préfixe valide");
+        }
+    }
+    constraint
+        .accept_token(tokenizer.token_to_id("{}").expect("objet vide") as usize)
+        .expect("fermeture racine");
+    let mut logits = vec![100.0; tokenizer.vocab_size()];
+    for &stop in &stops {
+        logits[stop] = -10.0;
+    }
+    constraint
+        .mask_logits(&mut logits)
+        .expect("masque terminal Gemma");
+    let remaining: Vec<_> = logits
+        .iter()
+        .enumerate()
+        .filter_map(|(id, logit)| logit.is_finite().then_some(id))
+        .collect();
+    assert_eq!(remaining, stops, "seuls EOS et EOT restent admissibles");
 }
 
 /// L'embedding identifie le dernier token ; la tête propose son successeur.
@@ -69,6 +169,21 @@ fn scripted_gemma(path: &Path, pieces: &[&str]) -> (LoadedModel, usize) {
             .expect("invariant: token spécial Gemma") as usize;
         head[id * hidden..(id + 1) * hidden].fill(logit);
     }
+    // Après le dernier morceau, les espaces dominent même EOT et bouclent
+    // sur eux-mêmes. Le masque doit les interdire dès la fermeture racine.
+    for piece in ["\n\n", "▁"] {
+        let id = tokenizer.token_to_id(piece).expect("espace Gemma") as usize;
+        assert!(!ids.contains(&id));
+        embedding[id * hidden] = 0.0;
+        embedding[id * hidden + ids.len()] = 1.0;
+        head[id * hidden + ids.len()] = 30.0;
+    }
+    // L'objet vide est un concurrent valide au premier pas, mais ne doit
+    // pas gagner face à un préfixe non vide dont le logit est supérieur.
+    let empty = tokenizer.token_to_id("{}").expect("objet vide Gemma") as usize;
+    if !ids.contains(&empty) {
+        head[empty * hidden] = 4.0;
+    }
     let mut weights = HashMap::new();
     weights.insert(
         "embed_tokens.weight".into(),
@@ -108,22 +223,40 @@ fn gemma3_local_json_object_generation_and_streaming() {
         return;
     };
     for (pieces, expected) in [
+        (vec!["{}"], serde_json::json!({})),
+        (
+            vec!["{\"", "greeting", "\":", "▁\"", "Bonjour", "\"}"],
+            serde_json::json!({"greeting": "Bonjour"}),
+        ),
+        (
+            // Le prompt se termine déjà par le token "\n" : son embedding
+            // doit garder l'état initial. L'octet fallback produit le même
+            // préfixe "{\n" sans aliaser un état du script avec le prompt.
+            vec![
+                "{", "<0x0A>", "\"", "greeting", "\":", "▁\"", "Bonjour", "\"}",
+            ],
+            serde_json::json!({"greeting": "Bonjour"}),
+        ),
         (
             vec!["▁{", "\"", "greeting", "\":", "▁\"", "Bonjour", "\"}"],
-            "Bonjour",
+            serde_json::json!({"greeting": "Bonjour"}),
         ),
         (
             vec![
                 "▁{", "\"", "greeting", "\":", "▁\"", "Bonjour", "<0xC3>", "<0xA9>", "<0x22>",
                 "<0x7D>",
             ],
-            "Bonjouré",
+            serde_json::json!({"greeting": "Bonjouré"}),
         ),
     ] {
         let (mut loaded, length) = scripted_gemma(&path, &pieces);
         // Réutilise le même modèle/catalogue, mais exige un automate neuf par requête.
         for streaming in [false, true] {
-            for budget in [length - 1, length + 2] {
+            let mut budgets = vec![256, length];
+            if length > 1 {
+                budgets.push(length - 1);
+            }
+            for budget in budgets {
                 let request = ChatCompletionRequest::parse(
                     serde_json::json!({
                         "model": "tiny", "temperature": 0, "stream": streaming,
@@ -164,8 +297,11 @@ fn gemma3_local_json_object_generation_and_streaming() {
                     let completion = result.expect("invariant: objet fermé avant EOT");
                     let value: serde_json::Value = serde_json::from_str(&completion.content)
                         .expect("invariant: contenu JSON valide");
-                    assert_eq!(value, serde_json::json!({"greeting": expected}));
+                    assert_eq!(value, expected);
                     assert_eq!(completion.finish_reason, "stop");
+                    assert_eq!(completion.content, completion.content.trim_end());
+                    let usage = serde_json::to_value(completion.usage).expect("usage JSON");
+                    assert_eq!(usage["completion_tokens"], length);
                     assert!(!terminal);
                     if streaming {
                         assert_eq!(deltas, completion.content);
