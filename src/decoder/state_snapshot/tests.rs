@@ -81,7 +81,19 @@ fn roundtrip_and_reject_corruption_without_weights() -> Result<()> {
         cache.layers[0].keys.snapshot_segments()[0].1
     );
     assert_eq!(loaded.final_state.data(), final_state.data());
-    assert_eq!(loaded.history.unwrap().keys.to_vec(), history.keys.to_vec());
+    let restored_history = loaded.history.expect("historique restauré");
+    assert_eq!(
+        restored_history.keys.snapshot_segments(),
+        history.keys.snapshot_segments()
+    );
+    assert_eq!(
+        restored_history.values.snapshot_segments(),
+        history.values.snapshot_segments()
+    );
+    assert!(!super::super::mtp_history::compatible(&restored_history));
+    super::super::mtp_history::with_storage(Some(16), || {
+        assert!(super::super::mtp_history::compatible(&restored_history));
+    });
     assert_eq!(
         loaded.captures.unwrap().hidden.data(),
         captures.hidden.data()

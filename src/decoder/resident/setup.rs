@@ -135,7 +135,7 @@ impl CausalDecoder {
     /// porte de sortie, routeur non softmax, experts non affines), la raison est
     /// tracée et l'arène MTP reste absente.
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn resident_mtp_head_supported(&self, head: &MtpHead) -> bool {
+    pub(in crate::decoder) fn resident_mtp_head_supported(&self, head: &MtpHead) -> bool {
         let FeedForward::Moe(mlp) = &head.layer.mlp else {
             return true;
         };
@@ -489,6 +489,49 @@ impl CausalDecoder {
         slot: u64,
         kv_bf16: bool,
     ) -> Result<bool> {
+        self.setup_resident_full_decode_inner(
+            cache,
+            max_new_tokens,
+            draft_headroom,
+            slot,
+            kv_bf16,
+            None,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(in crate::decoder) fn setup_resident_full_decode_with_mtp_history(
+        &self,
+        cache: &mut CausalDecoderCache,
+        max_new_tokens: usize,
+        draft_headroom: usize,
+        kv_bf16: bool,
+        history: Option<&LayerKvCache>,
+    ) -> Result<bool> {
+        self.setup_resident_full_decode_inner(
+            cache,
+            max_new_tokens,
+            draft_headroom,
+            0,
+            kv_bf16,
+            history,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "setup commun aux slots et au semis MTP"
+    )]
+    fn setup_resident_full_decode_inner(
+        &self,
+        cache: &mut CausalDecoderCache,
+        max_new_tokens: usize,
+        draft_headroom: usize,
+        slot: u64,
+        kv_bf16: bool,
+        mtp_history: Option<&LayerKvCache>,
+    ) -> Result<bool> {
         let Some(metal) = self.resident_metal() else {
             return Ok(false);
         };
@@ -556,6 +599,7 @@ impl CausalDecoder {
             hidden,
             max_new_tokens,
             kv_bf16,
+            mtp_history,
         ) {
             if crate::decoder::flags::trace_resident_enabled() {
                 eprintln!("decode résident full setup désactivé: budget mémoire ({error})");
@@ -1014,13 +1058,51 @@ impl CausalDecoder {
                 };
                 // KV de l'arène MTP : même dtype f32/bf16 résolu que le KV principal,
                 // jamais quantifié (son oracle compare les octets bruts).
-                let kv = arena.full_attention_dense(
-                    capacity,
-                    q_heads,
-                    base_kv_heads,
-                    base_head_dim,
-                    kv_bf16,
-                )?;
+                let t_seed = trace_setup.then(std::time::Instant::now);
+                let kv = if let Some(history) = mtp_history {
+                    match resident_full_attention_state(
+                        &arena,
+                        history,
+                        (capacity, history.len()),
+                        (q_heads, base_kv_heads, base_head_dim),
+                        kv_bf16,
+                        (true, true),
+                        self.memory_guard.as_ref(),
+                    ) {
+                        Ok(kv) => kv,
+                        Err(InferError::MemoryGuard(error)) => {
+                            // Le claim peut être pris après l'estimation. Le
+                            // tronc déjà installé doit rendre ses allocations
+                            // et ses claims avant la reconstruction f32.
+                            for layer_cache in &mut cache.layers {
+                                layer_cache.full = None;
+                            }
+                            cache.resident = None;
+                            if crate::decoder::flags::trace_resident_enabled() {
+                                eprintln!(
+                                    "decode résident MTP setup désactivé: budget mémoire ({error})"
+                                );
+                            }
+                            return Ok(false);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    arena.full_attention_dense(
+                        capacity,
+                        q_heads,
+                        base_kv_heads,
+                        base_head_dim,
+                        kv_bf16,
+                    )?
+                };
+                if let (Some(start), Some(history)) = (t_seed, mtp_history) {
+                    eprintln!(
+                        "mtp_setup seed_mtp_history_us={} history_len={}",
+                        start.elapsed().as_micros(),
+                        history.len(),
+                    );
+                }
                 // devtools est aussi actif par défaut en release. Garder le
                 // coût d'allocation au setup lorsque l'oracle est demandé.
                 #[cfg(feature = "devtools")]
@@ -1146,6 +1228,7 @@ impl CausalDecoder {
         hidden: usize,
         max_new_tokens: usize,
         kv_bf16: bool,
+        mtp_history: Option<&LayerKvCache>,
     ) -> Result<()> {
         let Some(guard) = self.memory_guard.as_ref() else {
             return Ok(());
@@ -1163,7 +1246,13 @@ impl CausalDecoder {
             let kv_dim = self.plan.layers[index].resident.kv_dim()?;
             if self.layer_kv_adoption_allowed(index)
                 && layer_cache.base_rows() == 0
-                && layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16)
+                && layer_adoptable(
+                    layer_cache,
+                    capacity,
+                    kv_dim,
+                    kv_bf16,
+                    self.plan.layers[index].resident.sliding_window.is_some(),
+                )
             {
                 continue;
             }
@@ -1185,7 +1274,7 @@ impl CausalDecoder {
             "index résident",
         )?);
         let mtp_bytes = if self.mtp.is_some() {
-            let mtp_kv_states = 1 + usize::from(
+            let mut mtp_kv_states = 1 + usize::from(
                 cfg!(feature = "devtools")
                     && crate::decoder::flags::env_flag(
                         "SARAGOSSA_RUST_MTP_APPEND_KV_ORACLE",
@@ -1199,9 +1288,15 @@ impl CausalDecoder {
                 &[self.config.num_key_value_heads, mtp_head_dim],
                 "kv_dim MTP résident",
             )?;
+            if mtp_history.is_some_and(|history| {
+                history.base_rows() == 0
+                    && layer_adoptable(history, capacity, mtp_kv_dim, kv_bf16, true)
+            }) {
+                mtp_kv_states -= 1;
+            }
             checked_bytes(
                 &[mtp_kv_states, 2, capacity, mtp_kv_dim],
-                std::mem::size_of::<f32>(),
+                element,
                 "KV MTP résident",
             )?
             .saturating_add(checked_bytes(
@@ -1267,14 +1362,21 @@ fn resident_full_attention_state(
     // recopiée ; adopter exigerait une réserve derrière le buffer de queue.
     let base = layer_cache.base_rows();
     let capacity = arena_rows(layer_cache, capacity)?;
-    let adoptable =
-        adoption_allowed && base == 0 && layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16);
+    let adoptable = adoption_allowed
+        && base == 0
+        && layer_adoptable(layer_cache, capacity, kv_dim, kv_bf16, dense);
     if let (true, Some(key_prefix), Some(value_prefix)) = (
         adoptable,
         layer_cache.keys.adoptable_bf16_prefix(),
         layer_cache.values.adoptable_bf16_prefix(),
     ) {
-        if let Some(mut full) = arena.full_attention_adopting(
+        let adopt = if dense {
+            DecodeResidentState::full_attention_dense_adopting
+        } else {
+            DecodeResidentState::full_attention_adopting
+        };
+        if let Some(mut full) = adopt(
+            arena,
             capacity,
             q_heads,
             kv_heads,
@@ -1339,12 +1441,14 @@ fn layer_adoptable(
     capacity: usize,
     kv_dim: usize,
     kv_bf16: bool,
+    dense: bool,
 ) -> bool {
     let bytes = capacity
         .checked_mul(kv_dim)
         .and_then(|cells| cells.checked_mul(std::mem::size_of::<u16>()))
         .and_then(|bytes| u64::try_from(bytes).ok());
-    crate::decode_resident::kv_bf16_dense(kv_bf16)
+    (crate::decode_resident::kv_bf16_dense(kv_bf16)
+        || (dense && crate::decode_resident::kv_element_bytes(kv_bf16) == 2))
         && bytes.is_some_and(|bytes| {
             [&layer_cache.keys, &layer_cache.values].iter().all(|rows| {
                 rows.adoptable_bf16_prefix()
@@ -1406,7 +1510,7 @@ mod tests {
             &layout,
         )?;
         // Estimation de la garde : couche adoptée, K/V hors budget.
-        assert!(layer_adoptable(&layer_cache, capacity, kv_dim, true));
+        assert!(layer_adoptable(&layer_cache, capacity, kv_dim, true, false));
         // Prolongement en place publié entre l'estimation et l'adoption.
         let claim = crate::metal_backend::InPlaceClaim::try_after([&key, &value])
             .expect("invariant: réserve libre");

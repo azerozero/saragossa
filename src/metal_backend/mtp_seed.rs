@@ -55,9 +55,7 @@ pub(crate) struct MtpPrefillSeed<'a> {
     filled: usize,
     seeded: usize,
     completed: bool,
-    // Le setup résident vient après le prefill et peut refuser l'arène.
-    // Les replis CPU et les préfixes réutilisés doivent encore lire les f32
-    // d'origine : élargir du bf16 ne préserverait pas ces valeurs.
+    bf16: bool,
     output: [Buffer; 2],
 }
 
@@ -69,12 +67,26 @@ impl<'a> MtpPrefillSeed<'a> {
         final_norm: &'a Tensor,
         tokens: &'a [usize],
         block_rows: usize,
+        bf16_capacity: Option<usize>,
     ) -> Result<Self> {
         if tokens.is_empty() || block_rows == 0 {
             return Err(InferError::Dimension("semis MTP vide".to_string()));
         }
         let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "semis MTP kv_dim")?;
-        let len = checked_len(tokens.len(), kv_dim, "semis MTP historique")?;
+        let capacity = bf16_capacity.unwrap_or(tokens.len());
+        if capacity < tokens.len() {
+            return Err(InferError::Dimension(
+                "capacité du semis MTP insuffisante".into(),
+            ));
+        }
+        let len = checked_len(capacity, kv_dim, "semis MTP historique")?;
+        let allocate = |label| {
+            if bf16_capacity.is_some() {
+                metal.uncached_bf16_buffer(len, label)
+            } else {
+                metal.uncached_f32_buffer(len, label)
+            }
+        };
         Ok(Self {
             weights,
             spec,
@@ -90,10 +102,8 @@ impl<'a> MtpPrefillSeed<'a> {
             filled: 0,
             seeded: 0,
             completed: false,
-            output: [
-                metal.uncached_f32_buffer(len, "mtp_history_k")?,
-                metal.uncached_f32_buffer(len, "mtp_history_v")?,
-            ],
+            bf16: bf16_capacity.is_some(),
+            output: [allocate("mtp_history_k")?, allocate("mtp_history_v")?],
         })
     }
 
@@ -153,14 +163,27 @@ impl<'a> MtpPrefillSeed<'a> {
                     self.seeded,
                 )?;
                 for (source, target) in [(&k, &self.output[0]), (&v, &self.output[1])] {
-                    metal.encode_copy_with_offsets(
-                        encoder,
-                        source,
-                        0,
-                        target,
-                        byte_len::<f32>(self.seeded * kv_dim)?,
-                        self.filled * kv_dim,
-                    )?;
+                    // Même f32 calculé, même arrondi RNE que le semis du KV
+                    // résident ; aucune projection ni taille de bloc ne change.
+                    if self.bf16 {
+                        metal.encode_f32_to_bf16_offsets(
+                            encoder,
+                            source,
+                            0,
+                            target,
+                            self.seeded * kv_dim,
+                            self.filled * kv_dim,
+                        )?;
+                    } else {
+                        metal.encode_copy_with_offsets(
+                            encoder,
+                            source,
+                            0,
+                            target,
+                            byte_len::<f32>(self.seeded * kv_dim)?,
+                            self.filled * kv_dim,
+                        )?;
+                    }
                 }
                 self.seeded += self.filled;
                 self.filled = 0;
@@ -185,14 +208,21 @@ impl<'a> MtpPrefillSeed<'a> {
             "semis MTP historique",
         )?;
         let [k, v] = self.output;
-        // SAFETY: buffers f32 partagés propres au semis, taille validée à
+        // SAFETY: buffers partagés propres au semis, dtype et taille validés à
         // l'allocation, GPU terminé par le prefill ; plus aucun écrivain.
         #[expect(unsafe_code, reason = "publication de l'historique MTP figé")]
         unsafe {
-            Ok((
-                PrefillKvRows::Shared(SharedF32Rows::new(k, 0, len)?),
-                PrefillKvRows::Shared(SharedF32Rows::new(v, 0, len)?),
-            ))
+            if self.bf16 {
+                Ok((
+                    PrefillKvRows::SharedBf16(SharedBf16Rows::new(k, 0, len)?),
+                    PrefillKvRows::SharedBf16(SharedBf16Rows::new(v, 0, len)?),
+                ))
+            } else {
+                Ok((
+                    PrefillKvRows::Shared(SharedF32Rows::new(k, 0, len)?),
+                    PrefillKvRows::Shared(SharedF32Rows::new(v, 0, len)?),
+                ))
+            }
         }
     }
 }
@@ -227,6 +257,44 @@ impl MetalExecutor {
             Tensor::from_vec(vec![spec.seq, kv_dim], read_f32_buffer(&k, len)?)?,
             Tensor::from_vec(vec![spec.seq, kv_dim], read_f32_buffer(&v, len)?)?,
         ))
+    }
+
+    /// Variante compacte du même semis f32 pour un suffixe : conversion après
+    /// les projections, avant publication, sans historique f32 de taille prompt.
+    pub(crate) fn mtp_seed_bf16_rows(
+        &self,
+        tokens: &[usize],
+        states: MtpSeedStates<'_>,
+        weights: MtpSeedWeights<'_>,
+        spec: PrefillAttentionSpec,
+        position_offset: usize,
+    ) -> Result<(PrefillKvRows, PrefillKvRows)> {
+        let kv_dim = checked_len(spec.kv_heads, spec.head_dim, "semis MTP kv_dim")?;
+        let len = checked_len(spec.seq, kv_dim, "semis MTP bf16")?;
+        let output = [
+            self.uncached_bf16_buffer(len, "mtp_suffix_k")?,
+            self.uncached_bf16_buffer(len, "mtp_suffix_v")?,
+        ];
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let guard = EncoderEndGuard::new(encoder);
+        let (k, v) =
+            self.encode_mtp_seed_kv_rows(encoder, tokens, states, weights, spec, position_offset)?;
+        for (source, target) in [(&k, &output[0]), (&v, &output[1])] {
+            self.encode_f32_to_bf16(encoder, source, target, len)?;
+        }
+        guard.end();
+        commit_and_wait(command_buffer)?;
+        let [k, v] = output;
+        // SAFETY: buffers bf16 neufs de `len` éléments, command buffer terminé,
+        // aucune écriture ultérieure ; les vues conservent les allocations.
+        #[expect(unsafe_code, reason = "publication du suffixe MTP figé")]
+        unsafe {
+            Ok((
+                PrefillKvRows::SharedBf16(SharedBf16Rows::new(k, 0, len)?),
+                PrefillKvRows::SharedBf16(SharedBf16Rows::new(v, 0, len)?),
+            ))
+        }
     }
 
     fn encode_mtp_seed_kv_rows(

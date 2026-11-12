@@ -2461,7 +2461,12 @@ fn prefill_resident_capture_tail_matches_full() -> Result<()> {
 
 /// Le hidden complet de l'ancien chemin est l'oracle ; le semis intégré doit
 /// garder ses bits, les états du tronc et les allocations des snapshots.
-fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usize) -> Result<()> {
+fn check_mtp_seed_streamed(
+    executor: &MetalExecutor,
+    seq: usize,
+    chunk_rows: usize,
+    bf16: bool,
+) -> Result<()> {
     if private_scratch_enabled() {
         assert_eq!(
             executor
@@ -2647,6 +2652,41 @@ fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usi
                 },
                 index * 1024,
             )?;
+            if bf16 {
+                let (compact_k, compact_v) = executor.mtp_seed_bf16_rows(
+                    tokens,
+                    MtpSeedStates::Raw {
+                        rows: &raw,
+                        first_row: index * 1024,
+                        final_norm: &final_norm,
+                    },
+                    weights,
+                    PrefillAttentionSpec {
+                        seq: tokens.len(),
+                        ..seed_spec
+                    },
+                    index * 1024,
+                )?;
+                for (compact, reference) in [(compact_k, &k), (compact_v, &v)] {
+                    let PrefillKvRows::SharedBf16(compact) = compact else {
+                        return Err(InferError::Config("suffixe bf16 partagé attendu".into()));
+                    };
+                    assert!(reference.data().iter().all(|value| value.is_finite()));
+                    let rounded: Vec<u16> = reference
+                        .data()
+                        .iter()
+                        .map(|value| {
+                            let bits = value.to_bits();
+                            (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+                        })
+                        .collect();
+                    assert_eq!(
+                        compact.as_slice(),
+                        rounded,
+                        "suffixe bf16 identique au semis f32"
+                    );
+                }
+            }
             expected_k.extend_from_slice(k.data());
             expected_v.extend_from_slice(v.data());
         }
@@ -2658,6 +2698,7 @@ fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usi
         &final_norm,
         &tokens[1..],
         1024,
+        bf16.then_some(seq + 16),
     )?;
     let (actual, actual_caches, _) = executor.qwen_moe_prefill_resident_with_mtp(
         PrefillInput::Hidden(&input),
@@ -2735,6 +2776,15 @@ fn check_mtp_seed_streamed(executor: &MetalExecutor, seq: usize, chunk_rows: usi
         }
     }
     let (k, v) = seed.into_rows()?;
+    if bf16 {
+        return check_mtp_bf16_adoption(
+            executor,
+            [k, v],
+            [&expected_k, &expected_v],
+            (seq - 1, seq + 16),
+            (Q_HEADS, KV_HEADS, HEAD_DIM),
+        );
+    }
     let (PrefillKvRows::Shared(k), PrefillKvRows::Shared(v)) = (k, v) else {
         return Err(InferError::Dimension(
             "historique MTP non partagé".to_string(),
@@ -2801,26 +2851,26 @@ fn mtp_seed_partial_903_reuses_capacity_and_preserves_bf16_bytes() -> Result<()>
         eprintln!("semis MTP synthétique non exécuté : aucun device Metal");
         return Ok(());
     };
-    check_mtp_seed_streamed(&executor, 1024 + 903 + 1, 1500)
+    check_mtp_seed_streamed(&executor, 1024 + 903 + 1, 1500, false)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_4097_bit_exact() -> Result<()> {
-    check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096, false)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_8297_bit_exact() -> Result<()> {
     // Découpage non aligné sur les blocs du semis, avec une queue de 104 lignes.
-    check_mtp_seed_streamed(&MetalExecutor::new()?, 8297, 1500)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 8297, 1500, false)
 }
 
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_streamed_32768_bit_exact() -> Result<()> {
-    check_mtp_seed_streamed(&MetalExecutor::new()?, 32768, 4096)
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 32768, 4096, false)
 }
 
 #[test]
@@ -2829,8 +2879,8 @@ fn mtp_seed_streamed_private_scratch_bit_exact() -> Result<()> {
     crate::metal_backend::flags::with_private_scratch_override(true, || {
         assert!(private_scratch_enabled());
         // Le blit final doit rester borné, avec et sans frontière de morceau.
-        check_mtp_seed_streamed(&MetalExecutor::new()?, 129, 4096)?;
-        check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096)
+        check_mtp_seed_streamed(&MetalExecutor::new()?, 129, 4096, false)?;
+        check_mtp_seed_streamed(&MetalExecutor::new()?, 4097, 4096, false)
     })
 }
 
@@ -3185,7 +3235,8 @@ fn mtp_seed_quantized_nax_partial_903_bit_exact() -> Result<()> {
         crate::metal_backend::flags::with_private_scratch_override(private, || -> Result<()> {
             let run = |reuse, namespace| -> Result<(Vec<Vec<u32>>, Vec<String>)> {
                 let _namespace = install_scratch_namespace(namespace);
-                let mut seed = MtpPrefillSeed::new(&executor, weights, spec, &norm, &tokens, 1024)?;
+                let mut seed =
+                    MtpPrefillSeed::new(&executor, weights, spec, &norm, &tokens, 1024, None)?;
                 // Rejouer le semis intégré précédent : seule la garde de
                 // capacité est neutralisée, ni kernels ni découpage changés.
                 seed.reuse_scratch_capacity = reuse;
@@ -3257,4 +3308,94 @@ fn mtp_seed_quantized_nax_partial_903_bit_exact() -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// Oracle ancien semis f32 → KV bf16, identité brute et propriété des buffers.
+fn check_mtp_bf16_adoption(
+    executor: &MetalExecutor,
+    rows: [PrefillKvRows; 2],
+    expected: [&[f32]; 2],
+    (len, capacity): (usize, usize),
+    (q_heads, kv_heads, head_dim): (usize, usize, usize),
+) -> Result<()> {
+    use crate::decode_resident::{DecodeResidentState, KvSegment};
+    let [PrefillKvRows::SharedBf16(k), PrefillKvRows::SharedBf16(v)] = rows else {
+        return Err(InferError::Config("semis MTP bf16 partagé attendu".into()));
+    };
+    let state = DecodeResidentState::new(executor.device().to_owned())?;
+    let cells = len * kv_heads * head_dim;
+    let reference = expected.map(|values| executor.shared_f32_rows_for_test(values));
+    let [rk, rv] = reference;
+    let (rk, rv) = (rk?, rv?);
+    let mut old = state.full_attention_bf16_for_test(capacity, q_heads, kv_heads, head_dim)?;
+    old.seed_segments(&[KvSegment::Shared(&rk)], &[KvSegment::Shared(&rv)], len)?;
+    let snapshots = [k.clone(), v.clone()];
+    for (view, old) in [(&k, old.keys()), (&v, old.values())] {
+        assert_eq!(view.as_slice(), read_u16_buffer(old.buffer(), cells)?);
+        assert_eq!(view.allocation_bytes(), capacity * kv_heads * head_dim * 2);
+    }
+    crate::decode_resident::with_kv_format_override(
+        crate::decode_resident::KvFormat::Bf16,
+        || -> Result<()> {
+            let adopt = |capacity| {
+                state.full_attention_adopting(capacity, q_heads, kv_heads, head_dim, true, [&k, &v])
+            };
+            let mut adopted = adopt(capacity)?.expect("invariant: réserve suffisante et libre");
+            assert_eq!(adopted.keys().buffer().contents(), k.buffer().contents());
+            assert_eq!(adopted.values().buffer().contents(), v.buffer().contents());
+            assert!(adopt(capacity)?.is_none(), "écrivain concurrent refusé");
+            // Le repli copie les bits, sans seconde conversion et sans toucher au préfixe.
+            let mut copied =
+                state.full_attention_bf16_for_test(capacity, q_heads, kv_heads, head_dim)?;
+            copied.seed_segments(
+                &[KvSegment::SharedBf16(&k)],
+                &[KvSegment::SharedBf16(&v)],
+                len,
+            )?;
+            for (copy, reference) in [(copied.keys(), old.keys()), (copied.values(), old.values())]
+            {
+                assert_eq!(
+                    read_u16_buffer(copy.buffer(), cells)?,
+                    read_u16_buffer(reference.buffer(), cells)?
+                );
+            }
+            assert!(adopted.truncate(len - 1).is_err());
+            assert_eq!(snapshots[0].as_slice(), k.as_slice());
+            drop(adopted);
+            assert!(
+                adopt(capacity + 1)?.is_none(),
+                "copie si réserve trop courte"
+            );
+            assert!(adopt(capacity)?.is_some(), "claim libéré au drop");
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_seed_bf16_streamed_bit_exact_and_adopted() -> Result<()> {
+    for private in [false, true] {
+        crate::metal_backend::flags::with_private_scratch_override(private, || -> Result<()> {
+            let executor = MetalExecutor::new()?;
+            // En scratch partagé, le semis intégré exige plusieurs morceaux.
+            // 1025/512 donne trois morceaux (342, 342, 341), tous > 256
+            // pour ouvrir Steel/NAX dès le premier, et un seul bloc MTP.
+            for (seq, chunk) in [(1025, 512), (1928, 1500), (4097, 4096), (8297, 1500)] {
+                check_mtp_seed_streamed(&executor, seq, chunk, true)?;
+            }
+            // Le monobloc n'a une norme finale GPU qu'en scratch privé.
+            if private {
+                check_mtp_seed_streamed(&executor, 129, 4096, true)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "device Metal requis, données synthétiques, contexte long"]
+fn mtp_seed_bf16_streamed_32768_bit_exact() -> Result<()> {
+    check_mtp_seed_streamed(&MetalExecutor::new()?, 32768, 4096, true)
 }
