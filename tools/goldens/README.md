@@ -128,8 +128,12 @@ filiation sans modèle. Aucun audio, header capturé ni texte de référence n�
 
 Les quatre captures mlx-lm ont été fournies le 2026-11-11. L'inventaire
 `tests/fixtures/goldens/logits/inventory.json` est exhaustif ; le test actif
-exige chaque couple `.bin`/`.json`, son SHA256 et son schéma. Supprimer un
-fichier attendu est un échec, jamais un retour à un état d'attente.
+exige chaque couple `.bin`/`.json` marqué `captured`, son SHA256 et son schéma.
+Supprimer un fichier capturé est un échec. Les deux contrôles float32 marqués
+`pending_capture` peuvent être absents jusqu'à leur première capture ; dès
+qu'un des fichiers existe, le couple complet, son SHA256, son schéma et la
+provenance `float32_control: true` sont vérifiés. Après capture, passer leur
+statut à `captured` pour rendre leur présence obligatoire.
 
 | Modèle | État | Octets du couple bin/json |
 |---|---|---:|
@@ -137,10 +141,12 @@ fichier attendu est un échec, jamais un retour à un état d'attente.
 | qwen36_moe | capturé | 52 581 |
 | gemma3 | capturé | 52 885 |
 | gemma4 | capturé | 53 490 |
+| qwen36_moe_f32 | capture opérateur en attente | — |
+| gemma4_f32 | capture opérateur en attente | — |
 
 Total logits : **210 945 octets** hors inventaire. Les sorties n'ont pas été
 recapturées ni modifiées pendant cette correction. La comparaison Rust avec
-les quatre modèles réels reste à lancer par l'opérateur.
+les nouvelles références float32 reste à lancer par l'opérateur.
 
 Commande de capture pour une campagne ultérieure explicitement autorisée
 (elle écrit des références ; ne pas la lancer pour valider les captures actuelles) :
@@ -155,20 +161,55 @@ Commande de capture pour une campagne ultérieure explicitement autorisée
 )
 ```
 
+### Contrôles float32 de Gemma 4 et Qwen3.6 MoE
+
+Les écarts observés face aux captures bf16 sont de **7/96 mismatches greedy
+pour Gemma 4** et **2/96 pour Qwen3.6 MoE**. Le diagnostic couche par couche
+fourni sur `g4rope` rattache ces écarts à la précision bf16 de mlx-lm et aux
+quasi-égalités du routage MoE ; le CPU suit la référence mlx-lm float32.
+Ce constat motive un oracle strict distinct, sans élargir les seuils.
+
+`--float32` appelle `model.set_dtype(mx.float32)` puis évalue les paramètres :
+poids flottants et échelles passent en f32, les poids quantifiés packés sont
+conservés. La provenance contient `float32_control: true`. Les fichiers
+`logits/<model>_f32.bin` et `.json` sont distincts des captures bf16 ; sans
+l'option, le protocole et les noms de capture restent inchangés.
+
+Capture à lancer par l'opérateur, avec les variables locales du tableau :
+
+```sh
+(
+  for model in gemma4 qwen36_moe; do
+    SARAGOSSA_GOLDEN_CAPTURE=1 "$REF_PYTHON" -I -B tools/gpulock.py run \
+      --owner goldens-reference --prio 10 -- \
+      taskpolicy -b "$REF_PYTHON" -I -B tools/goldens/logits.py --model "$model" --float32 || exit "$?"
+  done
+)
+```
+
 Chaque fichier contient six prompts (FR, EN, arithmétique, code, traduction,
 chat avec template), 16 pas greedy même après EOS, IDs de prompt et sortie,
 top-20 IDs et log-probabilités normalisées sur le vocabulaire entier. Les tests
 Rust alimentent le préfixe de référence après chaque pas pour isoler les écarts.
-Ils exigent l'argmax exact et affichent sa marge log-p top1/top2 ; une marge
+Les oracles stricts (qwen38, gemma3 et les deux contrôles float32) exigent
+l'argmax exact et affichent sa marge log-p top1/top2 ; une marge
 ≤ 0,01 est signalée `near_tie`, sans masquer l'échec. La KL est calculée sur
 21 catégories (top-20 référence + masse restante), seuil 0,02 nat ; le maximum
 Δp sur cette partition doit être ≤ 0,02. Ce n'est pas la KL complète du vocabulaire.
 Ces seuils sont provisoires, non validés par une exécution GPU.
 
+Les comparaisons bf16 de Gemma 4 et Qwen3.6 MoE deviennent des rapports
+d'écarts connus : chaque pas affiche `mismatch`, `near_tie`, `KL21` et
+`delta_p`, puis un bilan compte les mismatches et near-ties et donne les
+maxima KL/Δp. Elles échouent si les mismatches dépassent respectivement
+7/96 et 2/96. KL et Δp restent mesurées aux mêmes seuils, mais ne bloquent
+pas ces deux rapports. Les erreurs de lecture, de provenance ou d'exécution
+restent des échecs. Une amélioration du nombre de mismatches est acceptée.
+
 ## Exécuter les comparaisons
 
 Définir les variables du tableau vers les snapshots locaux correspondants.
-Le filtre logits ci-dessous sélectionne exactement les quatre oracles ignorés
+Le filtre logits ci-dessous sélectionne les six comparaisons ignorées
 sur macOS avec la fonctionnalité `metal` explicite. Le verrou est commun aux
 captures et aux comparaisons. `REF_PYTHON` désigne l'interpréteur existant ; le
 script de verrou ne dépend que de la stdlib.
@@ -186,12 +227,31 @@ SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --li
 SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --bin saragossa external_serve_templates_strict_parity_matches_transformers -- --ignored --nocapture
 SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --release --lib external_embedder_strict_parity_matches_sentence_transformers -- --ignored --nocapture
 SARAGOSSA_REQUIRE_REAL_MODELS=1 taskpolicy -b cargo test --offline --locked --release --lib external_whisper_ -- --ignored --nocapture --test-threads=1
-# Comparaison Rust des logits : quatre modèles, GPU, sous verrou.
+# Comparaison Rust des logits : quatre oracles stricts et deux rapports bf16.
 SARAGOSSA_REQUIRE_REAL_MODELS=1 "$REF_PYTHON" -I -B tools/gpulock.py run \
   --owner goldens-reference --prio 10 -- \
   taskpolicy -b cargo test --offline --locked --features metal --lib golden::logits::external_logits_ \
   -- --ignored --nocapture --test-threads=1
 ```
+
+Pour comparer uniquement les nouveaux contrôles stricts float32 après capture :
+
+```sh
+(
+  for model in gemma4 qwen36_moe; do
+    SARAGOSSA_REQUIRE_REAL_MODELS=1 "$REF_PYTHON" -I -B tools/gpulock.py run \
+      --owner goldens-reference --prio 10 -- \
+      taskpolicy -b cargo test --offline --locked --features metal --lib \
+      "golden::logits::external_logits_${model}_f32" \
+      -- --exact --ignored --nocapture --test-threads=1 || exit "$?"
+  done
+)
+```
+
+Pour les rapports bf16, reprendre cette boucle avec
+`"golden::logits::external_logits_${model}"` (sans `_f32`, conserver `--exact`).
+Les comparaisons dédiées exigent les captures, même si l'inventaire indique
+encore `pending_capture` ; seul le test de lecture autorise leur absence.
 
 Aucun écart n'autorise à régénérer une référence depuis Rust ni à modifier les
 seuils. Les tests de lecture demeurent actifs sans assets locaux.
