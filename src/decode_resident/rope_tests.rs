@@ -9,7 +9,7 @@ use crate::metal_backend::rope::create_rope_frequencies;
 use crate::metal_backend::{install_verify_tree_scope, PrefillAttentionSpec, VerifyTree};
 use std::rc::Rc;
 
-const POSITIONS: [usize; 5] = [5, 2051, 32_767, 131_071, 262_143];
+const POSITIONS: [usize; 6] = [1, 5, 2051, 32_767, 131_071, 262_143];
 const HEADS: usize = 2;
 const ROWS: usize = 3;
 
@@ -23,12 +23,13 @@ enum Path {
 }
 
 fn geometries() -> impl Iterator<Item = (usize, usize, usize, f32)> {
-    [128, 256].into_iter().flat_map(|head_dim| {
+    [128, 256, 512].into_iter().flat_map(|head_dim| {
         // RoPE complète, partielle, Gemma global (fd > rope_dims), NoPE.
         [
             (head_dim, head_dim),
             (head_dim / 2, head_dim / 2),
             (head_dim / 2, head_dim),
+            (head_dim / 4, head_dim),
             (0, 0),
             (0, head_dim),
         ]
@@ -65,19 +66,21 @@ fn dims(
 }
 
 fn data(head_dim: usize, rows: usize) -> (Vec<f32>, Vec<f32>) {
-    let input = (0..rows * HEADS * head_dim)
+    let mut input: Vec<f32> = (0..rows * HEADS * head_dim)
         .map(|i| ((i * 17 + 3) % 97) as f32 / 32.0 - 1.5)
         .collect();
+    for row in input.chunks_exact_mut(HEADS * head_dim) {
+        row[..head_dim].fill(0.0);
+        row[0] = 1.0;
+    }
     let weight = (0..head_dim)
         .map(|i| 0.5 + (i % 13) as f32 / 16.0)
         .collect();
     (input, weight)
 }
 
-/// Oracle commun : même table hôte, réduction RMS scalaire et trigonométrie
-/// précise CPU. La queue reste normée et n’est jamais tournée.
+/// RMS scalaire puis oracle indépendant MLX, sans table de production.
 fn reference(input: &[f32], weight: &[f32], dims: FullAttnLayerDims) -> Vec<f32> {
-    let inv = crate::rope::inv_freq(dims.rope_frequency_dim, dims.theta);
     let mut out = input.to_vec();
     for head in out.chunks_exact_mut(dims.head_dim) {
         let sum = head.iter().map(|x| x * x).sum::<f32>();
@@ -85,14 +88,14 @@ fn reference(input: &[f32], weight: &[f32], dims: FullAttnLayerDims) -> Vec<f32>
         for (x, w) in head.iter_mut().zip(weight) {
             *x = *x * inv_rms * w;
         }
-        let half = dims.rope_dims / 2;
-        for (pair, frequency) in inv.iter().take(half).enumerate() {
-            let angle = dims.position as f32 * frequency;
-            let (sin, cos) = angle.sin_cos();
-            let (first, second) = (head[pair], head[pair + half]);
-            head[pair] = first * cos - second * sin;
-            head[pair + half] = first * sin + second * cos;
-        }
+        let rotated = crate::rope::reference_rotate_half(
+            head,
+            dims.rope_dims,
+            dims.rope_frequency_dim,
+            dims.theta,
+            dims.position,
+        );
+        head.copy_from_slice(&rotated);
     }
     out
 }
@@ -290,14 +293,21 @@ fn check_path(path: Path) -> Result<()> {
                     base + offset
                 );
                 assert_precise(&actual[row * width..(row + 1) * width], &expected, &label);
-                // Porte explicite sur la queue, aussi pour NoPE où elle couvre toute la tête.
                 for head in 0..HEADS {
-                    let tail = head * head_dim + rope_dims..(head + 1) * head_dim;
-                    assert_precise(
-                        &actual[row * width + tail.start..row * width + tail.end],
-                        &expected[tail],
-                        &label,
-                    );
+                    let start = row * width + head * head_dim;
+                    let expected_start = head * head_dim;
+                    let half = fd / 2;
+                    for col in 0..head_dim {
+                        let active =
+                            col < rope_dims / 2 || (col >= half && col < half + rope_dims / 2);
+                        if !active {
+                            assert_precise(
+                                &actual[start + col..start + col + 1],
+                                &expected[expected_start + col..expected_start + col + 1],
+                                &label,
+                            );
+                        }
+                    }
                 }
                 if row == 0 && position >= 32_767 {
                     legacy_long_error =

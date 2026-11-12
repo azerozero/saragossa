@@ -436,7 +436,13 @@ impl CausalDecoder {
         let position = cache.position;
         let runtime = self.forward_runtime();
         let mut hidden = self.embed_scaled(&[token_id])?;
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("embeddings", &hidden)?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
+            #[cfg(feature = "devtools")]
+            let _capture = crate::devtools::layer_dump::enter_layer(layer_index);
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("input", &hidden)?;
             hidden = layer.forward_cached(
                 &self.config,
                 &hidden,
@@ -444,6 +450,8 @@ impl CausalDecoder {
                 position,
                 runtime,
             )?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("output", &hidden)?;
         }
         cache.position += 1;
         rms_norm(&hidden, &self.final_norm, self.config.rms_eps)
@@ -3605,6 +3613,51 @@ impl CausalDecoder {
         Ok((cache, logits))
     }
 
+    /// Capture le prefill Gemma 4 MoE dans un répertoire neuf (feature `devtools`).
+    ///
+    /// Utilise le runtime attaché : CPU f32 ou Metal per-op par défaut, sans
+    /// cache de préfixe ni snapshot disque. Aucun poids ni token n'est téléchargé.
+    ///
+    /// # Errors
+    ///
+    /// Refuse un modèle hors Gemma 4 MoE, un prefill résident fusionné, une
+    /// capture incomplète ou un répertoire déjà existant.
+    #[cfg(feature = "devtools")]
+    pub fn dump_gemma4_layers(&self, prompt: &[usize], directory: &Path) -> Result<Tensor> {
+        if prompt.is_empty() || !self.config.is_gemma4 || !self.config.parallel_moe {
+            return Err(InferError::Config(
+                "dump réservé à un prompt Gemma 4 MoE non vide".into(),
+            ));
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if self.forward_runtime().metal_executor().is_some()
+            && crate::runtime_flags::prefill_resident_gemma4_enabled()
+        {
+            return Err(InferError::Config("dump: désactiver SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4 (chemin fusionné non instrumenté)".into()));
+        }
+        let backend = "cpu-f32";
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let backend = if self.forward_runtime().metal_executor().is_some() {
+            "metal-per-op"
+        } else {
+            backend
+        };
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _scratch_buffer_scope = self.scratch_buffer_scope();
+        let capture = crate::devtools::layer_dump::Capture::start(
+            directory,
+            prompt,
+            self.layers.len(),
+            backend,
+        )?;
+        let (_, final_state) = self.prefill_cache_state_uncached_inner(prompt)?;
+        crate::devtools::layer_dump::record("final_norm", &final_state)?;
+        let logits = self.logits_from_final_state(&final_state)?;
+        crate::devtools::layer_dump::record("logits", &logits)?;
+        capture.finish()?;
+        Ok(logits)
+    }
+
     /// Préremplit le cache sans consulter ni alimenter le prefix cache.
     ///
     /// # Errors
@@ -5138,7 +5191,13 @@ impl CausalDecoder {
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
         let mut hidden = self.embed_scaled(prompt)?;
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("embeddings", &hidden)?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
+            #[cfg(feature = "devtools")]
+            let _capture = crate::devtools::layer_dump::enter_layer(layer_index);
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("input", &hidden)?;
             hidden = layer.forward_prefill(
                 &self.config,
                 &hidden,
@@ -5146,6 +5205,8 @@ impl CausalDecoder {
                 0,
                 runtime,
             )?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("output", &hidden)?;
         }
         cache.position = prompt.len();
         let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
@@ -5169,7 +5230,13 @@ impl CausalDecoder {
         for chunk in prompt.chunks(chunk_size) {
             let position_offset = cache.position;
             let mut hidden = self.embed_scaled(chunk)?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("embeddings", &hidden)?;
             for (layer_index, layer) in self.layers.iter().enumerate() {
+                #[cfg(feature = "devtools")]
+                let _capture = crate::devtools::layer_dump::enter_layer(layer_index);
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("input", &hidden)?;
                 hidden = layer.forward_prefill(
                     &self.config,
                     &hidden,
@@ -5177,6 +5244,8 @@ impl CausalDecoder {
                     position_offset,
                     runtime,
                 )?;
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("output", &hidden)?;
             }
             cache.position += chunk.len();
             last_hidden = Some(hidden);

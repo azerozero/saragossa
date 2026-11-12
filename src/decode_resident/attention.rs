@@ -579,8 +579,11 @@ impl DecodeResidentState {
         frequencies: &BufferRef,
         eps: f32,
     ) -> Result<()> {
-        // Le second scalaire reste réservé dans l’ABI ; le kernel lit le slot 5.
-        let params: [f32; 2] = [eps, 0.0];
+        // Le second scalaire transmet l’écart entre partenaires rotate-half.
+        let params: [f32; 2] = [
+            eps,
+            crate::metal_backend::rope::rope_half_offset(frequencies),
+        ];
         encoder.set_compute_pipeline_state(&self.rope_decode_kernel);
         encoder.set_buffer(0, Some(input), input_offset);
         encoder.set_buffer(1, Some(weight), 0);
@@ -619,6 +622,7 @@ impl DecodeResidentState {
         num_heads: usize,
         head_dim: usize,
         rope_dims: usize,
+        frequency_dim: usize,
         position: usize,
         eps: f32,
         base_theta: f32,
@@ -641,7 +645,7 @@ impl DecodeResidentState {
         let frequencies = crate::metal_backend::rope::create_rope_frequencies(
             &self.device,
             base_theta,
-            rope_dims,
+            frequency_dim,
         )?;
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -2206,7 +2210,10 @@ impl FullAttentionMetalState {
         let element = self.keys.element();
         let offset = byte_offset(self.len * self.kv_dim(), element, "rope append KV offset")?;
         let dims = rope_dims_param(self.kv_heads, self.head_dim, rope.rope_dims, rope.position)?;
-        let params: [f32; 2] = [rope.eps, rope.theta];
+        let params: [f32; 2] = [
+            rope.eps,
+            crate::metal_backend::rope::rope_half_offset(frequencies),
+        ];
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(k_raw), k_offset);
         encoder.set_buffer(1, Some(k_norm), 0);

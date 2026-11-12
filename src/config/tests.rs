@@ -587,3 +587,51 @@ fn resolves_top_level_eos_list_into_nested_text_config() {
     let cfg = cfg.resolve().expect("invariant: config valide");
     assert_eq!(cfg.eos_token_ids, vec![248044, 248045]);
 }
+
+#[test]
+fn gemma4_explicit_rope_parameters_precede_defaults() {
+    for model_type in [
+        "gemma4",
+        "gemma4_text",
+        "gemma4_unified",
+        "gemma4_unified_text",
+    ] {
+        for sliding_factor in [None, Some(0.5)] {
+            let mut value = serde_json::json!({
+                "model_type": model_type,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "rope_parameters": {
+                    "full_attention": {"partial_rotary_factor": 0.5, "rope_theta": 500000.0},
+                    "sliding_attention": {"rope_theta": 20000.0}
+                }
+            });
+            if let Some(factor) = sliding_factor {
+                value["rope_parameters"]["sliding_attention"]["partial_rotary_factor"] =
+                    serde_json::json!(factor);
+            }
+            let raw: RawModelConfig =
+                serde_json::from_value(value).expect("invariant: JSON valide");
+            let cfg = raw.resolve().expect("invariant: config Gemma 4 valide");
+            assert_eq!(cfg.rope_full_partial_rotary_factor, Some(0.5));
+            assert_eq!(cfg.rope_theta, 500_000.0);
+            assert_eq!(cfg.rope_full_base_freq, Some(500_000.0));
+            assert_eq!(cfg.rope_local_base_freq, Some(20_000.0));
+            assert_eq!(
+                cfg.rope_sliding_partial_rotary_factor,
+                Some(sliding_factor.unwrap_or(1.0))
+            );
+            assert_eq!(cfg.layer_rope_dims(1), 256);
+            assert_eq!(
+                cfg.layer_rope_dims(0),
+                if sliding_factor.is_some() { 128 } else { 256 }
+            );
+        }
+        let raw: RawModelConfig =
+            serde_json::from_value(serde_json::json!({"model_type": model_type}))
+                .expect("invariant: JSON valide");
+        let cfg = raw.resolve().expect("invariant: défauts Gemma 4 valides");
+        assert_eq!(cfg.rope_full_partial_rotary_factor, Some(0.25));
+        assert_eq!(cfg.rope_local_base_freq, Some(10_000.0));
+        assert_eq!(cfg.rope_sliding_partial_rotary_factor, Some(1.0));
+    }
+}

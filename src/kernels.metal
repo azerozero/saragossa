@@ -8867,21 +8867,24 @@ kernel void rms_norm_rope_heads_f32(
 
     const float inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
     const uint pairs = rope_dims / 2u;
+    // Gemma proportional sépare les partenaires sur la tête entière ;
+    // Qwen partiel conserve la demi-tranche rotative.
+    const uint pair_offset = uint(params.z) / 2u;
     for (uint col = tid; col < head_dim; col += 256u) {
         float value = input[start + col] * inv_rms * weight[col];
-        if (col < rope_dims) {
+        if (col < pairs || (col >= pair_offset && col < pair_offset + pairs)) {
             // Les fréquences hôte partagent les arrondis f32 de la référence CPU.
-            const uint pair = (col < pairs) ? col : (col - pairs);
+            const uint pair = (col < pair_offset) ? col : (col - pair_offset);
             // params.w : position absolue de la première ligne (prefill par morceaux).
             // pos + offset < 2^24 conserve l’identité des positions f32 avec le decode.
             const float angle = (float(pos) + params.w) * inv_freq[pair];
             const float c = precise::cos(angle);
             const float s = precise::sin(angle);
             const float first = input[start + pair] * inv_rms * weight[pair];
-            const float second = input[start + pair + pairs] * inv_rms * weight[pair + pairs];
+            const float second = input[start + pair + pair_offset] * inv_rms * weight[pair + pair_offset];
             // Fast-math peut contracter first*c - second*s en FMA ;
             // cet écart est admis sous la porte CPU de 1e-5.
-            value = (col < pairs) ? (first * c - second * s) : (first * s + second * c);
+            value = (col < pair_offset) ? (first * c - second * s) : (first * s + second * c);
         }
         out[start + col] = value;
     }

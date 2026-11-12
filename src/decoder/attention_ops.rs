@@ -6,7 +6,8 @@ use super::*;
 pub(super) struct RopeParams {
     /// Base angulaire de la couche (locale ou globale Gemma 3, unique ailleurs).
     pub(super) theta: f32,
-    /// Dimension utilisée au dénominateur des fréquences RoPE.
+    /// Dimension utilisée au dénominateur et à l’écart des demi-têtes RoPE.
+    /// Gemma 4 proportional : tête entière ; Qwen partiel : tranche rotative.
     pub(super) frequency_dim: usize,
     /// Échelle multiplicative des positions (`1/factor` du rope_scaling linear
     /// des couches globales Gemma 3 ≥4B) ; `1.0` = positions brutes. `pos × 1.0`
@@ -865,7 +866,7 @@ fn rms_norm_rope_heads_with(x: &Tensor, spec: RmsHeadSpec<'_>) -> Result<Tensor>
                 RopeStyle::Halves => {
                     for pair in 0..pairs {
                         let first_index = head_start + pair;
-                        let second_index = head_start + pairs + pair;
+                        let second_index = head_start + spec.rope.frequency_dim / 2 + pair;
                         let first = out[first_index];
                         let second = out[second_index];
                         let (cos, sin) = rotation[pair];
@@ -923,7 +924,7 @@ pub(super) fn apply_rope_heads_at(
                 RopeStyle::Halves => {
                     for (pair, &(cos, sin)) in rotation.iter().enumerate().take(pairs) {
                         let first_index = head_start + pair;
-                        let second_index = head_start + pairs + pair;
+                        let second_index = head_start + rope.frequency_dim / 2 + pair;
                         let first = x.data()[first_index];
                         let second = x.data()[second_index];
                         out[first_index] = first * cos - second * sin;
