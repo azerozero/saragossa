@@ -14,8 +14,7 @@ use saragossa::runtime_flags::{
     serve_lru_enabled, serve_model_pool_size, serve_prefix_cache_enabled,
 };
 use saragossa::{
-    qwen_assistant_history_content, render_flint_chat, render_gemma4_chat, render_gemma_chat,
-    render_qwen_chatml, CausalDecoder, CausalDecoderPromptState, ChatTemplateMessage,
+    render_flint_chat, render_gemma_chat, CausalDecoder, CausalDecoderPromptState,
     GenerationOptions, JsonTokenCatalog, JsonTokenConstraint, ModelAssets, RuntimePreset,
     TokenConstraint,
 };
@@ -344,19 +343,22 @@ impl ServeState {
             .is_some_and(|loaded| loaded.mtp_active)
     }
 
-    /// Le modèle `model` écrit-il au format flint (`<think>`, `<tool_call>`
-    /// XML) ? Le charge au besoin, comme la complétion qui suit.
-    pub(super) fn model_is_flint(&mut self, model: &str) -> ServeResult<bool> {
+    /// Choisit le parseur commun aux API selon la famille réellement chargée.
+    pub(super) fn output_parser(
+        &mut self,
+        request: &ChatCompletionRequest,
+    ) -> ServeResult<Option<super::tool_output::ToolOutputParser>> {
         let index = self
             .models
             .iter()
-            .position(|slot| slot.id == model)
-            .ok_or_else(|| ServeError::UnknownModel(model.to_string()))?;
+            .position(|slot| slot.id == request.model)
+            .ok_or_else(|| ServeError::UnknownModel(request.model.clone()))?;
         self.ensure_loaded_index(index)?;
-        Ok(self.models[index]
+        let loaded = self.models[index]
             .loaded
             .as_ref()
-            .is_some_and(|loaded| loaded.assets.config.is_flint()))
+            .ok_or_else(|| ServeError::Http("modèle non chargé".into()))?;
+        output_parser_for_config(&loaded.assets.config, request)
     }
 
     fn ensure_loaded_index(&mut self, index: usize) -> ServeResult<()> {
@@ -910,7 +912,10 @@ impl LoadedModel {
     ) -> ServeResult<ServedCompletion> {
         let prompt_tokens = prepared.tokens.len();
         let generated = tokens_to_u32(&output.tokens)?;
-        let decoded = strip_empty_think(self.assets.decode_tokens(&generated, true)?);
+        let decoded = strip_empty_think(super::streaming::decode_completion_tokens(
+            &self.assets,
+            &generated,
+        )?);
         let matched_stop = matched_text_stop(&decoded, &prepared.stop_texts);
         let finish_reason = if output.tokens.len() >= prepared.max_tokens && matched_stop.is_none()
         {
@@ -1190,30 +1195,15 @@ impl LoadedModel {
     }
 
     fn prompt_encoding(&self, request: &ChatCompletionRequest) -> ServeResult<PromptEncoding> {
-        let mut messages = request.template_messages();
-        // flint garde l'historique assistant tel quel : pas de bloc think vide.
-        if !self.assets.config.is_gemma() && !self.assets.config.is_flint() {
-            normalize_qwen_assistant_history(&mut messages);
-        }
-        let thinking = request.enable_thinking()?;
-        let rendered = if self.assets.config.is_flint() {
-            check_thinking(thinking, false)?;
-            let tools: Vec<String> = request
-                .active_tools()?
-                .iter()
-                .map(|tool| tool.json.clone())
-                .collect();
-            render_flint_chat(&messages, &tools, true)
-        } else if self.assets.config.is_gemma4() {
-            check_thinking(thinking, true)?;
-            render_gemma4_chat(&messages, true, false)
-        } else if self.assets.config.is_gemma() {
-            check_thinking(thinking, false)?;
-            render_gemma_chat(&messages, true)
-        } else {
-            check_thinking(thinking, true)?;
-            render_qwen_chatml(&messages, true, false)
-        };
+        let rendered = render_chat_prompt(
+            &self.assets.config,
+            if self.assets.config.model_type.starts_with("qwen") {
+                self.assets.tokenizer.qwen_profile()?
+            } else {
+                saragossa::chat_template::QwenProfile::Qwen36
+            },
+            request,
+        )?;
         let full_tokens = self.encode_full_rendered_prompt(&rendered)?;
         Ok(PromptEncoding {
             tokens: full_tokens,
@@ -1507,16 +1497,6 @@ fn prefix_blocks_usable(flint: bool, resident_extend: bool) -> bool {
     serve_prefix_cache_enabled() && (!flint || resident_extend)
 }
 
-fn normalize_qwen_assistant_history(messages: &mut [ChatTemplateMessage]) {
-    for message in messages {
-        if message.role != "assistant" {
-            continue;
-        }
-        let content = message.content.take().unwrap_or_default();
-        message.content = Some(qwen_assistant_history_content(&content, false));
-    }
-}
-
 fn strip_empty_think(text: String) -> String {
     text.strip_prefix(saragossa::QWEN_EMPTY_THINK_BLOCK)
         .map_or(text.clone(), ToString::to_string)
@@ -1620,9 +1600,89 @@ fn kv_allocations(state: &CausalDecoderPromptState) -> std::collections::HashSet
     seen
 }
 
+pub(super) fn output_parser_for_config(
+    config: &saragossa::ModelConfig,
+    request: &ChatCompletionRequest,
+) -> ServeResult<Option<super::tool_output::ToolOutputParser>> {
+    use super::tool_output::{ToolFamily, ToolOutputParser};
+    let tools = request.active_tools()?;
+    let family = ToolFamily::from_config(config);
+    let has_history = request
+        .messages
+        .iter()
+        .any(|m| m.role == "tool" || m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()));
+    if family.is_none() && (!tools.is_empty() || has_history) {
+        return Err(ServeError::Http(format!(
+            "outils non pris en charge pour la famille {}",
+            config.model_type
+        )));
+    }
+    Ok(family
+        .filter(|f| *f == ToolFamily::Flint || !tools.is_empty())
+        .map(|family| {
+            ToolOutputParser::new(
+                family,
+                tools.iter().map(|t| t.value.clone()).collect(),
+                request.parallel_tool_calls(),
+            )
+        }))
+}
+
+fn render_chat_prompt(
+    config: &saragossa::ModelConfig,
+    profile: saragossa::chat_template::QwenProfile,
+    request: &ChatCompletionRequest,
+) -> ServeResult<String> {
+    let messages = request.template_messages();
+    if config.is_gemma() && !config.is_gemma4() {
+        render_gemma_chat(&messages, true).map_err(|e| ServeError::Http(e.to_string()))?;
+    }
+    output_parser_for_config(config, request)?;
+    let thinking = request.enable_thinking()?;
+    let rendered = if config.is_flint() {
+        check_thinking(thinking, false)?;
+        let tools: Vec<String> = request
+            .active_tools()?
+            .iter()
+            .map(|tool| tool.json.clone())
+            .collect();
+        render_flint_chat(&messages, &tools, true)
+    } else if config.is_gemma4() {
+        check_thinking(thinking, true)?;
+        saragossa::chat_template::render_gemma4_chat_with_tools(
+            &messages,
+            &request
+                .active_tools()?
+                .iter()
+                .map(|t| t.json.clone())
+                .collect::<Vec<_>>(),
+            true,
+            false,
+        )
+    } else if config.is_gemma() {
+        check_thinking(thinking, false)?;
+        render_gemma_chat(&messages, true).map_err(|e| ServeError::Http(e.to_string()))?
+    } else {
+        check_thinking(thinking, true)?;
+        saragossa::chat_template::render_qwen_chatml_profile(
+            &messages,
+            &request
+                .active_tools()?
+                .iter()
+                .map(|t| t.json.clone())
+                .collect::<Vec<_>>(),
+            true,
+            false,
+            profile,
+        )
+    };
+    Ok(rendered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saragossa::ChatTemplateMessage;
 
     #[test]
     fn metal_loader_passes_model_profile_to_executor() {
@@ -1677,17 +1737,37 @@ mod tests {
 
     #[test]
     fn qwen_assistant_history_gets_empty_think_prefix() {
-        let mut messages = vec![
+        let messages = vec![
             ChatTemplateMessage::new("user", "Bonjour"),
             ChatTemplateMessage::new("assistant", "Salut"),
         ];
-
-        normalize_qwen_assistant_history(&mut messages);
-
-        assert_eq!(
-            messages[1].content.as_deref(),
-            Some("<think>\n\n</think>\n\nSalut")
+        let rendered = saragossa::chat_template::render_qwen_chatml_profile(
+            &messages,
+            &[],
+            false,
+            false,
+            saragossa::chat_template::QwenProfile::Qwen38,
         );
+        assert!(rendered.contains("assistant\n<think>\n\n</think>\n\nSalut"));
+        let rendered36 = saragossa::chat_template::render_qwen_chatml_profile(
+            &messages,
+            &[],
+            false,
+            false,
+            saragossa::chat_template::QwenProfile::Qwen36,
+        );
+        assert!(rendered36.contains("assistant\n<think>\n\n</think>\n\nSalut"));
+        let mut history = messages;
+        history.push(ChatTemplateMessage::new("user", "Autre question"));
+        let historical = saragossa::chat_template::render_qwen_chatml_profile(
+            &history,
+            &[],
+            false,
+            false,
+            saragossa::chat_template::QwenProfile::Qwen36,
+        );
+        assert!(historical.contains("assistant\nSalut"));
+        assert!(!historical.contains("<think>"));
     }
 
     #[test]
@@ -1733,3 +1813,11 @@ mod tests {
         assert_eq!(matched.as_deref(), Some("STOP"));
     }
 }
+
+#[cfg(test)]
+#[path = "state/template_tests.rs"]
+mod template_tests;
+
+#[cfg(test)]
+#[path = "state/reference_goldens.rs"]
+mod reference_goldens;

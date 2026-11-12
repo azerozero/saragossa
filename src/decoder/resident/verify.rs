@@ -76,10 +76,7 @@ impl CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(in crate::decoder) fn resident_layer_batch_supported(&self, arena: &ResidentArena) -> bool {
         self.layers.iter().enumerate().all(|(index, layer)| {
-            match (
-                self.config.is_resident_full_attention_layer(index),
-                layer.mlp.as_ref(),
-            ) {
+            match (self.plan.layers[index].resident_full, layer.mlp.as_ref()) {
                 (true, Some(FeedForward::Dense(_))) => {
                     matches!(
                         arena.layers.get(index),
@@ -280,16 +277,17 @@ impl CausalDecoder {
 
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_cache = &mut layers[index];
-                if self.config.is_resident_full_attention_layer(index) {
+                if self.plan.layers[index].resident_full {
                     // Toutes les lignes en un passage, comme le pas D2 fusionné :
                     // ligne par ligne, chaque ligne relisait les poids de la couche.
-                    let dims = self.config.resident_windowed_full_attn_layer_dims(
-                        index,
-                        hidden,
-                        *cache_position,
-                        eps,
-                        theta,
-                    )?;
+                    let dims = self.plan.layers[index]
+                        .resident
+                        .resident_windowed_full_attn_layer_dims(
+                            hidden,
+                            *cache_position,
+                            eps,
+                            theta,
+                        )?;
                     // flint (MoE sigmoïde) est résolu en `FullDense` : seul le
                     // type des buffers résidents choisit la queue MoE shared.
                     if matches!(
@@ -614,10 +612,10 @@ impl CausalDecoder {
             let position = *cache_position + token_pos;
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_cache = &mut layers[index];
-                if self.config.is_resident_full_attention_layer(index) {
-                    let dims = self.config.resident_windowed_full_attn_layer_dims(
-                        index, hidden, position, eps, theta,
-                    )?;
+                if self.plan.layers[index].resident_full {
+                    let dims = self.plan.layers[index]
+                        .resident
+                        .resident_windowed_full_attn_layer_dims(hidden, position, eps, theta)?;
                     if crate::runtime_flags::verify_skip("full_layer") {
                         metal.encode_copy_with_offsets(encoder, current, 0, other, 0, hidden)?;
                     } else {

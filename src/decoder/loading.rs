@@ -307,6 +307,10 @@ pub(in crate::decoder) fn take_embedding_weight(
             Ok(EmbeddingWeight::Dense(tensor))
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
+        DecoderTensor::LinearWeight(LinearWeight::DenseShared(_)) => Err(InferError::Config(
+            format!("projection f32 partagée inattendue pour embedding {key}"),
+        )),
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         DecoderTensor::LinearWeight(LinearWeight::DenseBf16(tensor)) => {
             Ok(EmbeddingWeight::DenseBf16(tensor))
         }

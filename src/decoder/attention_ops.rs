@@ -6,7 +6,8 @@ use super::*;
 pub(super) struct RopeParams {
     /// Base angulaire de la couche (locale ou globale Gemma 3, unique ailleurs).
     pub(super) theta: f32,
-    /// Dimension utilisée au dénominateur des fréquences RoPE.
+    /// Dimension utilisée au dénominateur et à l’écart des demi-têtes RoPE.
+    /// Gemma 4 proportional : tête entière ; Qwen partiel : tranche rotative.
     pub(super) frequency_dim: usize,
     /// Échelle multiplicative des positions (`1/factor` du rope_scaling linear
     /// des couches globales Gemma 3 ≥4B) ; `1.0` = positions brutes. `pos × 1.0`
@@ -54,11 +55,11 @@ pub(super) fn full_attention_from_tensors(
     config: &CausalDecoderConfig,
     tensors: &mut HashMap<String, DecoderTensor>,
     prefix: &str,
-    layer_index: usize,
+    plan: &FullPlan,
 ) -> Result<AttentionBlock> {
     let q_proj = linear_from(tensors, &format!("{prefix}.self_attn.q_proj"))?;
     let k_proj = linear_from(tensors, &format!("{prefix}.self_attn.k_proj"))?;
-    let v_proj = if config.attention_k_eq_v && config.is_gemma4_full_layer(layer_index) {
+    let v_proj = if plan.v_shared_with_k {
         None
     } else {
         Some(linear_from(tensors, &format!("{prefix}.self_attn.v_proj"))?)
@@ -85,9 +86,7 @@ pub(super) fn full_attention_from_tensors(
         None
     };
     let inferred_head_dim = infer_attention_head_dim(config, &q_proj)?;
-    let head_dim = config
-        .layer_head_dim(layer_index)
-        .unwrap_or(inferred_head_dim);
+    let head_dim = plan.head_dim().unwrap_or(inferred_head_dim);
     Ok(AttentionBlock::Full(Box::new(FullAttention {
         q_proj,
         k_proj,
@@ -95,10 +94,10 @@ pub(super) fn full_attention_from_tensors(
         o_proj,
         q_norm,
         k_norm,
-        num_key_value_heads: Some(config.layer_num_key_value_heads(layer_index)),
+        num_key_value_heads: Some(plan.kv_heads),
         head_dim: Some(head_dim),
-        rope_dims: Some(config.layer_rope_dims(layer_index, head_dim)),
-        rope_frequency_dim: Some(config.layer_rope_frequency_dim(layer_index, head_dim)),
+        rope_dims: Some(plan.rope_dims(head_dim)),
+        rope_frequency_dim: Some(plan.rope_frequency_dim(head_dim)),
         value_norm: config.attention_value_norm,
         rope_theta: None,
         rope_position_scale: None,
@@ -867,7 +866,7 @@ fn rms_norm_rope_heads_with(x: &Tensor, spec: RmsHeadSpec<'_>) -> Result<Tensor>
                 RopeStyle::Halves => {
                     for pair in 0..pairs {
                         let first_index = head_start + pair;
-                        let second_index = head_start + pairs + pair;
+                        let second_index = head_start + spec.rope.frequency_dim / 2 + pair;
                         let first = out[first_index];
                         let second = out[second_index];
                         let (cos, sin) = rotation[pair];
@@ -925,7 +924,7 @@ pub(super) fn apply_rope_heads_at(
                 RopeStyle::Halves => {
                     for (pair, &(cos, sin)) in rotation.iter().enumerate().take(pairs) {
                         let first_index = head_start + pair;
-                        let second_index = head_start + pairs + pair;
+                        let second_index = head_start + rope.frequency_dim / 2 + pair;
                         let first = x.data()[first_index];
                         let second = x.data()[second_index];
                         out[first_index] = first * cos - second * sin;

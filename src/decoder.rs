@@ -35,6 +35,8 @@ mod attention;
 mod attention_cache;
 mod attention_ops;
 mod kv_rows;
+pub(crate) mod layer_plan;
+use layer_plan::{FullPlan, LayerPlan, MixerPlan, ModelPlan};
 mod state_snapshot;
 pub(crate) use state_snapshot::SnapshotSources;
 mod tts_prefill;
@@ -70,6 +72,8 @@ mod flint_oracle_tests;
 pub(crate) fn resident_decode_steps_for_test() -> usize {
     resident::RESIDENT_DECODE_STEPS.with(std::cell::Cell::get)
 }
+#[cfg(test)]
+mod layer_plan_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod mtp_moe_oracles;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
@@ -1067,7 +1071,7 @@ impl CausalDecoder {
     ) -> (Vec<usize>, Vec<usize>, Vec<bool>) {
         use crate::metal_backend::InPlaceClaim;
         let attention_layers = (0..self.layers.len())
-            .filter(|&index| self.config.is_resident_full_attention_layer(index))
+            .filter(|&index| self.plan.layers[index].resident_full)
             .count();
         let run = |hold_reserve: bool| {
             // Morceaux forcés : le stockage bf16 exige un prefill par morceaux.
@@ -1264,129 +1268,6 @@ impl From<&ModelConfig> for CausalDecoderConfig {
 }
 
 impl CausalDecoderConfig {
-    fn layer_kind(&self, layer_index: usize) -> Option<&str> {
-        self.layer_types.get(layer_index).map(String::as_str)
-    }
-
-    fn is_gemma4_full_layer(&self, layer_index: usize) -> bool {
-        // GARDE: `full_attention` est aussi un type de couche de qwen3_5_moe
-        // (Qwen3.5/3.6 hybride). Sans le drapeau `is_gemma4`, on traitait ces
-        // couches comme Gemma → RoPE pleine (`rope_dims = head_dim`) au lieu du
-        // RoPE partiel correct, corrompant Q/K et donc l'attention.
-        self.is_gemma4 && self.layer_kind(layer_index) == Some("full_attention")
-    }
-
-    fn is_gemma4_sliding_layer(&self, layer_index: usize) -> bool {
-        self.is_gemma4 && self.layer_kind(layer_index) == Some("sliding_attention")
-    }
-
-    fn is_full_attention_layer(&self, layer_index: usize) -> bool {
-        match self.full_attention_interval {
-            Some(interval) if interval > 0 => (layer_index + 1) % interval == 0,
-            _ => true,
-        }
-    }
-
-    fn is_resident_full_attention_layer(&self, layer_index: usize) -> bool {
-        if self.is_gemma4 {
-            self.is_gemma4_full_layer(layer_index) || self.is_gemma4_sliding_layer(layer_index)
-        } else {
-            self.is_full_attention_layer(layer_index)
-        }
-    }
-
-    /// Indique si une couche est locale (sliding-window) dans le motif Gemma 3.
-    ///
-    /// Gemma 3 alterne couches locales et globales : une couche globale toutes
-    /// les `sliding_window_pattern` couches (la `pattern`-ième), locales sinon.
-    /// Sans motif déclaré, aucune couche n'est locale.
-    fn is_local_sliding_layer(&self, layer_index: usize) -> bool {
-        if !self.layer_types.is_empty() {
-            // NOTE: Hors Gemma 2/3, l'étiquette suffit (flint) ; Gemma 4 passe
-            // par la même étiquette. Seul Gemma 3 garde son motif historique.
-            return (self.is_gemma4 || self.sliding_from_layer_types)
-                && self.layer_kind(layer_index) == Some("sliding_attention");
-        }
-        matches!(
-            self.sliding_window_pattern,
-            Some(pattern) if pattern > 0 && (layer_index + 1) % pattern != 0
-        )
-    }
-
-    fn layer_head_dim(&self, layer_index: usize) -> Result<usize> {
-        let head_dim = if self.is_gemma4_full_layer(layer_index) {
-            self.global_head_dim.or(self.head_dim)
-        } else {
-            self.head_dim
-        };
-        head_dim.ok_or_else(|| InferError::Dimension("head_dim manquant".to_string()))
-    }
-
-    fn layer_num_key_value_heads(&self, layer_index: usize) -> usize {
-        if self.is_gemma4_full_layer(layer_index) {
-            self.num_global_key_value_heads
-                .unwrap_or(self.num_key_value_heads)
-        } else {
-            self.num_key_value_heads
-        }
-    }
-
-    fn layer_rope_dims(&self, layer_index: usize, head_dim: usize) -> usize {
-        if self.is_gemma4_full_layer(layer_index) {
-            self.rope_full_dims.unwrap_or(head_dim)
-        } else if self.is_gemma4_sliding_layer(layer_index) {
-            self.rope_sliding_dims.unwrap_or(head_dim)
-        } else {
-            self.rope_dims.unwrap_or(head_dim)
-        }
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn resident_full_attention_kv_dim(&self, layer_index: usize) -> Result<usize> {
-        let head_dim = self.layer_head_dim(layer_index)?;
-        let kv_heads = self.layer_num_key_value_heads(layer_index);
-        kv_heads
-            .checked_mul(head_dim)
-            .ok_or_else(|| InferError::Dimension("kv_dim résident déborde".to_string()))
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn resident_full_attn_layer_dims(
-        &self,
-        layer_index: usize,
-        hidden: usize,
-        position: usize,
-        eps: f32,
-        theta: f32,
-    ) -> Result<FullAttnLayerDims> {
-        let head_dim = self.layer_head_dim(layer_index)?;
-        Ok(FullAttnLayerDims {
-            hidden,
-            q_heads: self.num_attention_heads,
-            kv_heads: self.layer_num_key_value_heads(layer_index),
-            head_dim,
-            attn_scalar: self.query_pre_attn_scalar.unwrap_or(head_dim as f32),
-            // NoPE (flint) : `rope_dims = 0` garde la QK-RMSNorm du kernel
-            // fusionné et saute la rotation.
-            rope_dims: if self.is_no_rope_layer(layer_index) {
-                0
-            } else {
-                self.layer_rope_dims(layer_index, head_dim)
-            },
-            rope_frequency_dim: self.layer_rope_frequency_dim(layer_index, head_dim),
-            position,
-            window_start: 0,
-            eps,
-            theta: self.layer_rope_theta_override(layer_index).unwrap_or(theta),
-            attn_output_gate: self.attn_output_gate,
-        })
-    }
-
-    /// Indique si la couche saute le RoPE (NoPE) en gardant la QK-RMSNorm.
-    fn is_no_rope_layer(&self, layer_index: usize) -> bool {
-        self.no_rope_layers.contains(&layer_index)
-    }
-
     /// Renvoie la raison pour laquelle les chemins Metal per-op et spéculatifs
     /// ne connaissent pas ce modèle, ou `None` s'ils le couvrent.
     ///
@@ -1408,51 +1289,6 @@ impl CausalDecoderConfig {
         } else {
             None
         }
-    }
-
-    fn layer_rope_frequency_dim(&self, layer_index: usize, head_dim: usize) -> usize {
-        if self.is_gemma4_full_layer(layer_index) {
-            head_dim
-        } else {
-            self.layer_rope_dims(layer_index, head_dim)
-        }
-    }
-
-    /// Renvoie la base RoPE locale d'une couche Gemma 3, ou `None` (base globale).
-    ///
-    /// Les couches locales utilisent `rope_local_base_freq`, les globales
-    /// `rope_theta`. Hors Gemma 3 renvoie `None` → la base unique `rope_theta`
-    /// s'applique (byte-identique).
-    fn layer_rope_theta_override(&self, layer_index: usize) -> Option<f32> {
-        if self.is_gemma4_full_layer(layer_index) {
-            return self.rope_full_base_freq.or(self.rope_theta);
-        }
-        self.rope_local_base_freq
-            .filter(|_| self.is_local_sliding_layer(layer_index))
-    }
-
-    /// Renvoie la fenêtre d'attention d'une couche locale Gemma 3, ou `None`.
-    ///
-    /// Seules les couches locales du motif `sliding_window_pattern` masquent
-    /// leur attention aux `sliding_window` derniers tokens ; les couches
-    /// globales (et tous les modèles non-Gemma) attendent sur tout le contexte.
-    fn layer_sliding_window(&self, layer_index: usize) -> Option<usize> {
-        self.sliding_window
-            .filter(|window| *window > 0 && self.is_local_sliding_layer(layer_index))
-    }
-
-    /// Renvoie l'échelle des positions RoPE d'une couche, ou `None` (positions brutes).
-    ///
-    /// Gemma 3 ≥4B n'étire que les couches globales (linear ×8) : les couches
-    /// locales du motif sliding gardent leurs positions brutes sur
-    /// `rope_local_base_freq`, comme `initialize_rope` de mlx_lm. Sans motif
-    /// sliding (linear historique type Llama 2), l'échelle s'applique partout.
-    fn layer_rope_position_scale(&self, layer_index: usize) -> Option<f32> {
-        if !self.layer_types.is_empty() {
-            return None;
-        }
-        self.rope_position_scale
-            .filter(|_| !self.is_local_sliding_layer(layer_index))
     }
 
     fn linear_attention_config(&self) -> Result<LinearAttentionConfig> {
@@ -1481,6 +1317,7 @@ impl CausalDecoderConfig {
 /// Exécute un modèle causal Qwen en CPU ou Metal.
 pub struct CausalDecoder {
     config: CausalDecoderConfig,
+    plan: Arc<ModelPlan>,
     embed_tokens: EmbeddingWeight,
     layers: Vec<DecoderLayer>,
     final_norm: Tensor,
@@ -1550,28 +1387,29 @@ struct PrefixCacheEntry {
 pub(crate) struct PrefixCaptures {
     pub(crate) layer_ids: Vec<usize>,
     pub(crate) from: usize,
-    /// `[positions, layer_ids.len() * hidden]`.
-    pub(crate) hidden: Tensor,
+    /// `[positions, layer_ids.len() * hidden]`, immuable et partagé avec le
+    /// consommateur DFlash : insérer ou relire une entrée ne recopie pas les f32.
+    pub(crate) hidden: Arc<Tensor>,
 }
 
 impl PrefixCaptures {
-    fn new(layer_ids: &[usize], from: usize, hidden: Tensor) -> Self {
+    fn new(layer_ids: &[usize], from: usize, hidden: impl Into<Arc<Tensor>>) -> Self {
         Self {
             layer_ids: layer_ids.to_vec(),
             from,
-            hidden,
+            hidden: hidden.into(),
         }
     }
 
-    /// Copie seulement la queue demandée, sans cloner le tenseur complet du cache.
+    /// Partage les captures intactes ; une fenêtre plus courte copie uniquement
+    /// sa queue pour ne pas retenir l'allocation complète à travers cette vue.
     fn clone_tail(&self, keep_rows: usize) -> Result<Self> {
-        let (rows, cols) = self.hidden.as_matrix()?;
-        let drop = rows.saturating_sub(keep_rows.max(1));
-        let hidden = Tensor::from_vec(
-            vec![rows - drop, cols],
-            self.hidden.data()[drop * cols..].to_vec(),
-        )?;
-        Ok(Self::new(&self.layer_ids, self.from + drop, hidden))
+        Self::tail(
+            &self.layer_ids,
+            self.from,
+            Arc::clone(&self.hidden),
+            keep_rows,
+        )
     }
 
     /// Garde au plus les `keep_rows` dernières lignes de `hidden` (positions
@@ -1579,9 +1417,10 @@ impl PrefixCaptures {
     pub(crate) fn tail(
         layer_ids: &[usize],
         from: usize,
-        hidden: Tensor,
+        hidden: impl Into<Arc<Tensor>>,
         keep_rows: usize,
     ) -> Result<Self> {
+        let hidden = hidden.into();
         let (rows, cols) = hidden.as_matrix()?;
         let drop = rows.saturating_sub(keep_rows.max(1));
         let hidden = if drop == 0 {
@@ -1591,14 +1430,15 @@ impl PrefixCaptures {
                 vec![rows - drop, cols],
                 hidden.data()[drop * cols..].to_vec(),
             )?
+            .into()
         };
         Ok(Self::new(layer_ids, from + drop, hidden))
     }
 }
 
 impl PrefixCacheEntry {
-    /// Octets de l'entrée, sans les segments KV déjà dans `seen` (partagés avec
-    /// une autre entrée) ; ajoute les siens.
+    /// Occupation de l'entrée, sans les allocations déjà dans `seen` ; ajoute
+    /// les siennes, même si un consommateur externe les détient aussi.
     fn estimated_bytes_unseen(&self, seen: &mut std::collections::HashSet<usize>) -> u64 {
         let mut bytes = self
             .tokens
@@ -1617,10 +1457,11 @@ impl PrefixCacheEntry {
                     .saturating_add(history.values.capacity_bytes_unseen(seen))
             }))
             .saturating_add(self.captures.as_ref().map_or(0, |captures| {
-                captures
-                    .hidden
-                    .len()
-                    .saturating_mul(std::mem::size_of::<f32>())
+                if seen.insert(Arc::as_ptr(&captures.hidden) as usize) {
+                    captures.hidden.capacity_bytes()
+                } else {
+                    0
+                }
             }));
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
@@ -1637,13 +1478,21 @@ impl PrefixCacheEntry {
 }
 
 impl PrefixCache {
-    /// Évince l'entrée la moins récente ; rend les octets réellement libérés,
-    /// sans les segments KV qu'elle partage avec les entrées restantes.
+    /// Évince l'entrée la moins récente ; estime les octets libérables, sans
+    /// les segments KV partagés avec les entrées restantes ni les captures
+    /// encore détenues par une autre entrée ou un consommateur externe.
     fn evict_lru_entry(&mut self) -> Option<u64> {
         let entry = self.entries.pop()?;
         let mut seen = std::collections::HashSet::new();
         for kept in &self.entries {
             kept.estimated_bytes_unseen(&mut seen);
+        }
+        if let Some(captures) = &entry.captures {
+            // Le plafond compte l'allocation partagée, mais la purge ne peut
+            // la libérer tant qu'un autre propriétaire la détient.
+            if Arc::strong_count(&captures.hidden) > 1 {
+                seen.insert(Arc::as_ptr(&captures.hidden) as usize);
+            }
         }
         Some(entry.estimated_bytes_unseen(&mut seen))
     }
@@ -2071,12 +1920,13 @@ impl CausalDecoder {
                 "décodeur sans couche cachée".to_string(),
             ));
         }
+        let plan = Arc::new(ModelPlan::build(&config));
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_index in 0..config.num_hidden_layers {
             layers.push(DecoderLayer::from_tensors(
                 &mut tensors,
-                layer_index,
                 &config,
+                &plan.layers[layer_index],
             )?);
         }
         let final_norm = take_dense(&mut tensors, "norm.weight")?;
@@ -2091,8 +1941,10 @@ impl CausalDecoder {
                 "tenseurs chargés mais non assemblés: {leftovers:?}"
             )));
         }
+        plan.log();
         Ok(Self {
             config,
+            plan,
             embed_tokens,
             layers,
             final_norm,

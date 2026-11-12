@@ -1,0 +1,139 @@
+ModelPlan {
+    layers: [
+        LayerPlan {
+            index: 0,
+            mixer: Full(
+                FullPlan {
+                    head_dim: Some(
+                        4,
+                    ),
+                    kv_heads: 1,
+                    kv_dim: Some(
+                        4,
+                    ),
+                    rope_dims: Some(
+                        2,
+                    ),
+                    rope_frequency_dim: Some(
+                        2,
+                    ),
+                    rope_theta_override: Some(
+                        10000.0,
+                    ),
+                    rope_position_scale: None,
+                    sliding_window: Some(
+                        2,
+                    ),
+                    no_rope: false,
+                    v_shared_with_k: false,
+                    gemma_full: false,
+                    gemma_sliding: true,
+                    local_sliding: true,
+                    q_heads: 1,
+                    query_pre_attn_scalar: Some(
+                        1.0,
+                    ),
+                    attn_output_gate: false,
+                },
+            ),
+            resident_full: true,
+            dense_mlp_expected: None,
+            resident: FullPlan {
+                head_dim: Some(
+                    4,
+                ),
+                kv_heads: 1,
+                kv_dim: Some(
+                    4,
+                ),
+                rope_dims: Some(
+                    2,
+                ),
+                rope_frequency_dim: Some(
+                    2,
+                ),
+                rope_theta_override: Some(
+                    10000.0,
+                ),
+                rope_position_scale: None,
+                sliding_window: Some(
+                    2,
+                ),
+                no_rope: false,
+                v_shared_with_k: false,
+                gemma_full: false,
+                gemma_sliding: true,
+                local_sliding: true,
+                q_heads: 1,
+                query_pre_attn_scalar: Some(
+                    1.0,
+                ),
+                attn_output_gate: false,
+            },
+        },
+        LayerPlan {
+            index: 1,
+            mixer: Full(
+                FullPlan {
+                    head_dim: Some(
+                        8,
+                    ),
+                    kv_heads: 1,
+                    kv_dim: Some(
+                        8,
+                    ),
+                    rope_dims: Some(
+                        2,
+                    ),
+                    rope_frequency_dim: None,
+                    rope_theta_override: Some(
+                        1000000.0,
+                    ),
+                    rope_position_scale: None,
+                    sliding_window: None,
+                    no_rope: false,
+                    v_shared_with_k: true,
+                    gemma_full: true,
+                    gemma_sliding: false,
+                    local_sliding: false,
+                    q_heads: 1,
+                    query_pre_attn_scalar: Some(
+                        1.0,
+                    ),
+                    attn_output_gate: false,
+                },
+            ),
+            resident_full: true,
+            dense_mlp_expected: None,
+            resident: FullPlan {
+                head_dim: Some(
+                    8,
+                ),
+                kv_heads: 1,
+                kv_dim: Some(
+                    8,
+                ),
+                rope_dims: Some(
+                    2,
+                ),
+                rope_frequency_dim: None,
+                rope_theta_override: Some(
+                    1000000.0,
+                ),
+                rope_position_scale: None,
+                sliding_window: None,
+                no_rope: false,
+                v_shared_with_k: true,
+                gemma_full: true,
+                gemma_sliding: false,
+                local_sliding: false,
+                q_heads: 1,
+                query_pre_attn_scalar: Some(
+                    1.0,
+                ),
+                attn_output_gate: false,
+            },
+        },
+    ],
+    attention_sinks: false,
+}

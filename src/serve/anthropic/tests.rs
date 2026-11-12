@@ -48,22 +48,18 @@ fn request_translates_blocks_system_and_stop_sequences() {
     assert_eq!(messages[1].role, "user");
     assert_eq!(messages[1].content.as_deref(), Some("run"));
     assert_eq!(messages[2].role, "tool");
-    assert_eq!(
-        messages[2].content.as_deref(),
-        Some(r#"{"content":"ok","tool_use_id":"toolu_1"}"#)
-    );
+    assert_eq!(messages[2].content.as_deref(), Some("ok"));
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("toolu_1"));
     assert_eq!(messages[3].role, "assistant");
-    let assistant = messages[3]
-        .content
-        .as_deref()
-        .expect("invariant: contenu assistant");
-    assert!(assistant.starts_with("done\n\n<tool_call>"));
-    assert!(assistant.contains(r#""name":"Bash""#));
-    assert!(assistant.contains(r#""command":"pwd""#));
+    assert_eq!(messages[3].content.as_deref(), Some("done"));
+    let call: Value = serde_json::from_str(&messages[3].tool_calls[0]).expect("call");
+    assert_eq!(call["id"], "toolu_2");
+    assert_eq!(call["function"]["name"], "Bash");
+    assert_eq!(call["function"]["arguments"], json!({"command":"pwd"}));
 }
 
 #[test]
-fn request_injects_tools_and_tool_stop_sequence() {
+fn request_preserves_tools_without_injecting_a_generic_prompt_or_stop() {
     let request: AnthropicMessagesRequest = serde_json::from_str(
         r#"{
             "model":"reti-35b",
@@ -86,15 +82,21 @@ fn request_injects_tools_and_tool_stop_sequence() {
         .expect("invariant: requête traduisible");
     let messages = chat.template_messages();
 
-    assert_eq!(messages[0].role, "system");
-    let system = messages[0]
-        .content
-        .as_deref()
-        .expect("invariant: system injecté");
-    assert!(system.contains("<tools>"));
-    assert!(system.contains(r#""name":"Bash""#));
-    assert!(system.contains("<tool_call>"));
-    assert!(chat.stop_texts().contains(&"</tool_call>".to_string()));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content.as_deref(), Some("liste"));
+    let tools = chat.active_tools().expect("tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].value["function"]["name"], "Bash");
+    assert_eq!(
+        tools[0].value["function"]["description"],
+        "Run a shell command"
+    );
+    assert_eq!(
+        tools[0].value["function"]["parameters"]["properties"]["command"]["type"],
+        "string"
+    );
+    assert!(chat.stop_texts().is_empty());
 }
 
 #[test]
@@ -172,45 +174,6 @@ fn response_maps_matched_stop_sequence() {
 }
 
 #[test]
-fn response_maps_tool_call_to_anthropic_tool_use() {
-    let completion = fake_completion(
-        "reti-35b",
-        r#"Je lance l'outil.
-<tool_call>{"name":"Bash","arguments":{"command":"pwd"}}</tool_call>"#,
-        "stop",
-        None,
-        4,
-        8,
-    );
-
-    let value = serde_json::to_value(AnthropicMessageResponse::from_completion(&completion))
-        .expect("invariant: réponse sérialisable");
-
-    assert_eq!(value["stop_reason"], "tool_use");
-    assert!(value["stop_sequence"].is_null());
-    assert_eq!(
-        value["content"][0],
-        json!({"type":"text","text":"Je lance l'outil."})
-    );
-    assert_eq!(value["content"][1]["type"], "tool_use");
-    assert_eq!(value["content"][1]["name"], "Bash");
-    assert_eq!(value["content"][1]["input"], json!({"command": "pwd"}));
-}
-
-#[test]
-fn output_parser_accepts_tool_call_closed_by_stop_sequence() {
-    let output = AssistantOutput::parse(
-        r#"<tool_call>{"name":"Read","arguments":{"file_path":"README.md"}}"#,
-    );
-
-    assert!(output.has_tool_use);
-    let value = serde_json::to_value(&output.blocks[0]).expect("invariant: bloc sérialisable");
-    assert_eq!(value["type"], "tool_use");
-    assert_eq!(value["name"], "Read");
-    assert_eq!(value["input"], json!({"file_path": "README.md"}));
-}
-
-#[test]
 fn sse_events_follow_anthropic_order_and_fields() {
     let completion = fake_completion("reti-35b", "salut", "length", None, 5, 4);
     let mut stream = Vec::new();
@@ -245,42 +208,6 @@ fn sse_events_follow_anthropic_order_and_fields() {
 }
 
 #[test]
-fn sse_events_stream_tool_use_blocks() {
-    let completion = fake_completion(
-        "reti-35b",
-        r#"<tool_call>{"name":"Bash","arguments":{"command":"pwd"}}</tool_call>"#,
-        "stop",
-        None,
-        5,
-        4,
-    );
-    let mut stream = Vec::new();
-
-    send_anthropic_sse(&mut stream, &completion).expect("invariant: SSE sérialisable");
-
-    let events = sse_events(http_body(&stream));
-    assert_eq!(
-        events
-            .iter()
-            .map(|(event, _)| event.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "message_start",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "message_delta",
-            "message_stop"
-        ]
-    );
-    assert_eq!(events[1].1["content_block"]["type"], "tool_use");
-    assert_eq!(events[1].1["content_block"]["name"], "Bash");
-    assert_eq!(events[2].1["delta"]["type"], "input_json_delta");
-    assert_eq!(events[2].1["delta"]["partial_json"], r#"{"command":"pwd"}"#);
-    assert_eq!(events[4].1["delta"]["stop_reason"], "tool_use");
-}
-
-#[test]
 fn live_blocks_stream_text_deltas() {
     let completion = fake_completion("reti-35b", "salut", "stop", None, 5, 2);
     let mut blocks = AnthropicLiveBlocks::new();
@@ -312,69 +239,6 @@ fn live_blocks_stream_text_deltas() {
     );
     assert_eq!(events[1].1["delta"]["text"], "sal");
     assert_eq!(events[2].1["delta"]["text"], "ut");
-}
-
-#[test]
-fn live_blocks_keep_tool_use_structured() {
-    let completion = fake_completion(
-        "reti-35b",
-        r#"<tool_call>{"name":"Bash","arguments":{"command":"pwd"}}</tool_call>"#,
-        "stop",
-        None,
-        5,
-        4,
-    );
-    let mut blocks = AnthropicLiveBlocks::new();
-    let mut stream = Vec::new();
-
-    blocks
-        .push_text_delta(&mut stream, "<tool")
-        .expect("invariant: préfixe tool retenu");
-    blocks
-        .push_text_delta(&mut stream, r#"_call>{"name":"Bash"}"#)
-        .expect("invariant: tool call retenu");
-
-    assert!(stream.is_empty());
-    let has_tool_use = blocks
-        .finish(&mut stream, &completion)
-        .expect("invariant: tool use sérialisable");
-
-    assert!(has_tool_use);
-    let events = sse_events(http_bodyless(&stream));
-    assert_eq!(events[0].1["content_block"]["type"], "tool_use");
-    assert_eq!(events[0].1["content_block"]["name"], "Bash");
-    assert_eq!(events[1].1["delta"]["type"], "input_json_delta");
-    assert_eq!(events[1].1["delta"]["partial_json"], r#"{"command":"pwd"}"#);
-    assert_eq!(events[2].0, "content_block_stop");
-}
-
-#[test]
-fn live_blocks_detect_tool_use_after_preamble() {
-    assert_live_tool_stream_matches_non_stream(
-        r#"Je lance l'outil.
-<tool_call>{"name":"Bash","arguments":{"command":"pwd"}}</tool_call>"#,
-        &[
-            "Je lance l'outil.\n",
-            "<tool",
-            r#"_call>{"name":"Bash","arguments":{"command":"pwd"}}"#,
-        ],
-        "Je lance l'outil.",
-    );
-}
-
-#[test]
-fn live_blocks_strip_think_then_detect_tool_use_after_preamble() {
-    assert_live_tool_stream_matches_non_stream(
-        r#"<think>Je vérifie le bon outil.</think>
-
-Je lance l'outil.
-<tool_call>{"name":"Bash","arguments":{"command":"pwd"}}</tool_call>"#,
-        &[
-            "<think>Je vérifie le bon outil.</think>\n\nJe lance l'outil.\n<tool",
-            r#"_call>{"name":"Bash","arguments":{"command":"pwd"}}"#,
-        ],
-        "Je lance l'outil.",
-    );
 }
 
 #[test]
@@ -418,87 +282,6 @@ fn handler_smoke_returns_anthropic_json_with_mock_completion() {
     );
 }
 
-fn assert_live_tool_stream_matches_non_stream(content: &str, deltas: &[&str], expected_text: &str) {
-    let completion = fake_completion("reti-35b", content, "stop", None, 5, 8);
-    let non_stream = serde_json::to_value(AnthropicMessageResponse::from_completion(&completion))
-        .expect("invariant: réponse non-stream sérialisable");
-    let mut blocks = AnthropicLiveBlocks::new();
-    let mut stream = Vec::new();
-
-    for delta in deltas {
-        blocks
-            .push_text_delta(&mut stream, delta)
-            .expect("invariant: delta Anthropic live sérialisable");
-    }
-    let has_tool_use = blocks
-        .finish(&mut stream, &completion)
-        .expect("invariant: fin Anthropic live sérialisable");
-
-    assert!(has_tool_use);
-    assert_eq!(anthropic_stop_reason(&completion, has_tool_use), "tool_use");
-    assert_eq!(non_stream["stop_reason"], "tool_use");
-    assert_eq!(non_stream["content"][0]["text"], expected_text);
-    assert_eq!(non_stream["content"][1]["type"], "tool_use");
-
-    let body = http_bodyless(&stream);
-    assert!(!body.contains("<tool_call"));
-    assert!(!body.contains("</tool_call>"));
-    assert!(!body.contains("<think>"));
-    let events = sse_events(body);
-    assert_eq!(
-        events
-            .iter()
-            .map(|(event, _)| event.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop"
-        ]
-    );
-    let streamed_text = events
-        .iter()
-        .filter_map(|(_, value)| {
-            if value["delta"]["type"] == "text_delta" {
-                value["delta"]["text"].as_str()
-            } else {
-                None
-            }
-        })
-        .collect::<String>();
-    let tool_start = events
-        .iter()
-        .find(|(_, value)| value["content_block"]["type"] == "tool_use")
-        .expect("invariant: bloc tool_use streamé");
-    let partial_json = events
-        .iter()
-        .find_map(|(_, value)| {
-            if value["delta"]["type"] == "input_json_delta" {
-                value["delta"]["partial_json"].as_str()
-            } else {
-                None
-            }
-        })
-        .expect("invariant: delta JSON outil streamé");
-    let streamed_input: Value =
-        serde_json::from_str(partial_json).expect("invariant: delta outil JSON valide");
-    let non_stream_text = non_stream["content"][0]["text"]
-        .as_str()
-        .expect("invariant: texte non-stream");
-
-    assert_eq!(streamed_text, non_stream_text);
-    assert_eq!(streamed_text, expected_text);
-    assert_eq!(tool_start.1["index"], 1);
-    assert_eq!(
-        tool_start.1["content_block"]["name"],
-        non_stream["content"][1]["name"]
-    );
-    assert_eq!(streamed_input, non_stream["content"][1]["input"]);
-}
-
 fn fake_completion(
     model: &str,
     content: &str,
@@ -521,7 +304,7 @@ fn fake_completion(
 }
 
 fn send_anthropic_sse<S: Write>(stream: &mut S, completion: &ServedCompletion) -> ServeResult<()> {
-    let output = AssistantOutput::parse(&completion.content);
+    let output = AssistantOutput::literal(&completion.content);
     write_headers(
         stream,
         200,
@@ -603,4 +386,307 @@ fn sse_events(body: &str) -> Vec<(String, Value)> {
             (event, value)
         })
         .collect()
+}
+
+#[test]
+fn common_qwen_and_gemma_parser_produce_anthropic_blocks_and_sse() {
+    use super::super::tool_output::ToolFamily;
+    for (family, text) in [
+        (ToolFamily::Qwen, "Texte<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>"),
+        (ToolFamily::Gemma4, "Texte<|tool_call>call:weather{city:<|\"|>Paris<|\"|>}<tool_call|>"),
+    ] {
+        let tools = vec![json!({"type":"function","function":{"name":"weather","parameters":{"properties":{"city":{"type":"string"}}}}})];
+        let completion = fake_completion("test", text, "stop", None, 3, 4);
+        let response = AnthropicMessageResponse::with_parser(&completion, Some(ToolOutputParser::new(family, tools.clone(), true)));
+        let value = serde_json::to_value(response).expect("response");
+        assert_eq!(value["stop_reason"], "tool_use");
+        assert_eq!(value["content"][0]["text"], "Texte");
+        assert_eq!(value["content"][1]["input"], json!({"city":"Paris"}));
+        let mut bytes = Vec::new();
+        let mut sink = AnthropicSse::with_parser(&mut bytes, Some(ToolOutputParser::new(family, tools, true)));
+        for ch in text.chars() { sink.event(CompletionStreamEvent::Delta(&ch.to_string())).expect("delta"); }
+        sink.finish(Ok(completion)).expect("finish");
+        let events = sse_events(std::str::from_utf8(&bytes).expect("utf8"));
+        let tool = events.iter().find(|(_, v)| v["content_block"]["type"] == "tool_use").expect("tool block");
+        let id = tool.1["content_block"]["id"].as_str().expect("id");
+        assert!(!id.is_empty());
+        assert_eq!(tool.1["content_block"]["name"], "weather");
+        assert!(events.iter().any(|(_, v)| v["delta"]["partial_json"] == r#"{"city":"Paris"}"#));
+        assert!(events.iter().any(|(_, v)| v["delta"]["stop_reason"] == "tool_use"));
+        // L'identifiant émis se retrouve intact dans l'historique du tour suivant.
+        let request = json!({"model":"test","max_tokens":5,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":id,"name":"weather","input":{"city":"Paris"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"18"}]}]});
+        let (chat, _, _) = anthropic_chat(&serde_json::to_vec(&request).expect("wire"), None).expect("convert");
+        assert_eq!(chat.messages[1].tool_call_id.as_deref(), Some(id));
+        let call: Value = serde_json::from_str(chat.messages[0].tool_calls.as_ref().expect("calls")[0].get()).expect("call");
+        assert_eq!(call["id"], id);
+    }
+}
+
+#[test]
+fn anthropic_tool_choices_are_explicit() {
+    assert_eq!(
+        anthropic_tool_choice(Some(&json!({"type":"none"}))).expect("none"),
+        Some(json!("none"))
+    );
+    assert!(anthropic_tool_choice(Some(&json!({"type":"any"}))).is_err());
+    assert!(anthropic_tool_choice(Some(&json!({"type":"tool","name":"weather"}))).is_err());
+    assert!(assistant_message(Some(&AnthropicContent::Blocks(vec![
+        json!({"type":"tool_use","name":"x","input":{}})
+    ])))
+    .is_err());
+    assert!(tool_result_text(&json!({"type":"tool_result","content":"18"})).is_err());
+}
+
+fn streamed_blocks(bytes: &[u8]) -> (Value, Value) {
+    let mut blocks: Vec<Value> = Vec::new();
+    let mut inputs: Vec<String> = Vec::new();
+    let mut stop = Value::Null;
+    for (kind, value) in sse_events(http_bodyless(bytes)) {
+        let index = value["index"].as_u64().unwrap_or(0) as usize;
+        match kind.as_str() {
+            "content_block_start" => {
+                assert_eq!(index, blocks.len());
+                blocks.push(value["content_block"].clone());
+                inputs.push(String::new());
+            }
+            "content_block_delta" if value["delta"]["type"] == "text_delta" => {
+                let previous = blocks[index]["text"].as_str().expect("text").to_owned();
+                blocks[index]["text"] =
+                    json!(previous + value["delta"]["text"].as_str().expect("delta"));
+            }
+            "content_block_delta" => {
+                inputs[index].push_str(value["delta"]["partial_json"].as_str().expect("input"))
+            }
+            "content_block_stop" if blocks[index]["type"] == "tool_use" => {
+                blocks[index]["input"] =
+                    serde_json::from_str(&inputs[index]).expect("complete JSON");
+            }
+            "message_delta" => stop = value["delta"]["stop_reason"].clone(),
+            _ => {}
+        }
+    }
+    (json!(blocks), stop)
+}
+
+#[test]
+fn absent_parser_never_interprets_tools_in_either_transport() {
+    for text in [
+        r#"<tool_call>{"name":"weather","arguments":{}}"#,
+        r#"Avant<tool_call>{"name":"weather","arguments":{}}</tool_call>Après"#,
+        "<tool_call><function=weather></function></tool_call>",
+        "<|tool_call>call:weather{}<tool_call|>",
+        "<think>literal</think>texte",
+    ] {
+        let completion = fake_completion("test", text, "stop", None, 1, 2);
+        let response =
+            serde_json::to_value(AnthropicMessageResponse::with_parser(&completion, None))
+                .expect("response");
+        assert_eq!(response["content"], json!([{"type":"text","text":text}]));
+        assert_eq!(response["stop_reason"], "end_turn");
+        for split in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+            let mut bytes = Vec::new();
+            let mut sink = AnthropicSse::with_parser(&mut bytes, None);
+            sink.event(CompletionStreamEvent::Delta(&text[..split]))
+                .expect("delta");
+            sink.event(CompletionStreamEvent::Delta(&text[split..]))
+                .expect("delta");
+            sink.finish(Ok(fake_completion("test", text, "stop", None, 1, 2)))
+                .expect("finish");
+            let (blocks, stop) = streamed_blocks(&bytes);
+            assert_eq!(blocks, response["content"]);
+            assert_eq!(stop, response["stop_reason"]);
+        }
+    }
+}
+
+#[test]
+fn anthropic_preserves_interleaved_text_and_calls_in_both_transports() {
+    use super::super::tool_output::ToolFamily;
+    for (family, call) in [
+        (
+            ToolFamily::Qwen,
+            "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>",
+        ),
+        (
+            ToolFamily::Gemma4,
+            "<|tool_call>call:weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+        ),
+    ] {
+        let tools = vec![
+            json!({"function":{"name":"weather","parameters":{"properties":{"city":{"type":"string"}}}}}),
+        ];
+        let text = format!("Avant {call} Entre {call} Après");
+        let completion = fake_completion("test", &text, "stop", None, 1, 2);
+        let response = serde_json::to_value(AnthropicMessageResponse::with_parser(
+            &completion,
+            Some(ToolOutputParser::new(family, tools.clone(), true)),
+        ))
+        .expect("response");
+        assert_eq!(response["content"].as_array().expect("blocks").len(), 5);
+        assert_eq!(response["content"][0]["text"], "Avant ");
+        assert_eq!(response["content"][2]["text"], " Entre ");
+        assert_eq!(response["content"][4]["text"], " Après");
+        for split in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+            let mut bytes = Vec::new();
+            let mut sink = AnthropicSse::with_parser(
+                &mut bytes,
+                Some(ToolOutputParser::new(family, tools.clone(), true)),
+            );
+            sink.event(CompletionStreamEvent::Delta(&text[..split]))
+                .expect("delta");
+            sink.event(CompletionStreamEvent::Delta(&text[split..]))
+                .expect("delta");
+            sink.finish(Ok(fake_completion("test", &text, "stop", None, 1, 2)))
+                .expect("finish");
+            let (mut blocks, stop) = streamed_blocks(&bytes);
+            for index in [1, 3] {
+                assert!(!blocks[index]["id"].as_str().expect("id").is_empty());
+                blocks[index]["id"] = response["content"][index]["id"].clone();
+            }
+            assert_eq!(blocks, response["content"], "split {split}");
+            assert_eq!(stop, "tool_use");
+        }
+    }
+}
+
+#[test]
+fn none_absent_tools_and_unsupported_families_disable_api_interpretation() {
+    use super::super::state::output_parser_for_config;
+    let text = r#"<tool_call>{"name":"weather","arguments":{}}"#;
+    for family in ["qwen3_5", "qwen3_6", "qwen3_8", "gemma4", "gemma3", "llama"] {
+        let config: saragossa::ModelConfig = serde_json::from_value(json!({"model_type":family,"hidden_size":1,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"rms_norm_eps":0.000001,"rope_theta":10000.0,"vocab_size":1})).expect("config");
+        for tools in [
+            json!([]),
+            json!([{"name":"weather","input_schema":{"type":"object"}}]),
+        ] {
+            let request = json!({"model":"test","max_tokens":10,"messages":[{"role":"user","content":"exemple"}],"tools":tools,"tool_choice":{"type":if tools.as_array().expect("tools").is_empty() {"auto"} else {"none"}}});
+            let (chat, _, _) = anthropic_chat(&serde_json::to_vec(&request).expect("wire"), None)
+                .expect("convert");
+            let completion = fake_completion("test", text, "stop", None, 1, 2);
+            let response = serde_json::to_value(AnthropicMessageResponse::with_parser(
+                &completion,
+                output_parser_for_config(&config, &chat).expect("parser"),
+            ))
+            .expect("response");
+            assert_eq!(response["content"], json!([{"type":"text","text":text}]));
+            let mut bytes = Vec::new();
+            let mut sink = AnthropicSse::with_parser(
+                &mut bytes,
+                output_parser_for_config(&config, &chat).expect("parser"),
+            );
+            for ch in text.chars() {
+                sink.event(CompletionStreamEvent::Delta(&ch.to_string()))
+                    .expect("delta");
+            }
+            sink.finish(Ok(completion)).expect("finish");
+            let (blocks, stop) = streamed_blocks(&bytes);
+            assert_eq!(blocks, response["content"], "{family}");
+            assert_eq!(stop, "end_turn");
+        }
+    }
+}
+
+#[test]
+fn empty_visible_output_has_the_same_block_in_both_transports() {
+    use super::super::tool_output::ToolFamily;
+    for text in ["", "<think>raisonnement</think>"] {
+        let tools = vec![json!({"function":{"name":"weather"}})];
+        let completion = fake_completion("test", text, "stop", None, 1, 2);
+        let response = serde_json::to_value(AnthropicMessageResponse::with_parser(
+            &completion,
+            Some(ToolOutputParser::new(ToolFamily::Qwen, tools.clone(), true)),
+        ))
+        .expect("response");
+        let mut bytes = Vec::new();
+        let mut sink = AnthropicSse::with_parser(
+            &mut bytes,
+            Some(ToolOutputParser::new(ToolFamily::Qwen, tools, true)),
+        );
+        sink.event(CompletionStreamEvent::Delta(text))
+            .expect("delta");
+        sink.finish(Ok(completion)).expect("finish");
+        let (blocks, stop) = streamed_blocks(&bytes);
+        assert_eq!(blocks, response["content"]);
+        assert_eq!(stop, response["stop_reason"]);
+    }
+}
+
+#[test]
+fn complete_anthropic_response_round_trips_interleaved_history() {
+    use super::super::tool_output::ToolFamily;
+    use saragossa::chat_template::{
+        render_flint_chat, render_gemma4_chat_with_tools, render_qwen_chatml_profile, QwenProfile,
+    };
+    for (family, call) in [
+        (
+            ToolFamily::Qwen,
+            "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>",
+        ),
+        (
+            ToolFamily::Gemma4,
+            "<|tool_call>call:weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+        ),
+    ] {
+        let tools = vec![
+            json!({"function":{"name":"weather","parameters":{"properties":{"city":{"type":"string"}}}}}),
+        ];
+        let text = format!("Avant {call} Entre {call} Après");
+        let response = serde_json::to_value(AnthropicMessageResponse::with_parser(
+            &fake_completion("test", &text, "stop", None, 1, 2),
+            Some(ToolOutputParser::new(family, tools, true)),
+        ))
+        .expect("response");
+        assert_eq!(response["content"].as_array().expect("blocks").len(), 5);
+        let request = json!({"model":"test", "max_tokens":10, "messages":[
+            {"role":"user","content":"Météo ?"},
+            response,
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":response["content"][3]["id"],"content":"18"},
+                {"type":"tool_result","tool_use_id":response["content"][1]["id"],"content":"12"}
+            ]}
+        ]});
+        let (chat, _, _) =
+            anthropic_chat(&serde_json::to_vec(&request).expect("wire"), None).expect("convert");
+        let messages = chat.template_messages();
+        let rendered = match family {
+            ToolFamily::Qwen => {
+                render_qwen_chatml_profile(&messages, &[], true, false, QwenProfile::Qwen36)
+            }
+            ToolFamily::Gemma4 => render_gemma4_chat_with_tools(&messages, &[], true, false),
+            ToolFamily::Flint => render_flint_chat(&messages, &[], true),
+        };
+        let open = if family == ToolFamily::Gemma4 {
+            "<|tool_call>"
+        } else {
+            "<tool_call>"
+        };
+        let flint = render_flint_chat(&messages, &[], false);
+        assert!(flint.find("Avant ").expect("before") < flint.find("<tool_call>").expect("call"));
+        assert!(flint.find("<tool_call>").expect("call") < flint.find(" Entre ").expect("between"));
+        assert!(
+            flint.find(" Entre ").expect("between") < flint.rfind("<tool_call>").expect("call")
+        );
+        assert!(flint.rfind("<tool_call>").expect("call") < flint.find(" Après").expect("after"));
+        let positions = [
+            rendered.find("Avant ").expect("before"),
+            rendered.find(open).expect("first call"),
+            rendered.find(" Entre ").expect("between"),
+            rendered.rfind(open).expect("second call"),
+            rendered.find(" Après").expect("after"),
+        ];
+        assert!(positions.windows(2).all(|p| p[0] < p[1]), "{rendered}");
+        assert_eq!(rendered.matches(open).count(), 2);
+        assert_eq!(
+            rendered
+                .matches(if family == ToolFamily::Qwen {
+                    "<|im_start|>assistant"
+                } else if family == ToolFamily::Gemma4 {
+                    "<|turn>model"
+                } else {
+                    "<|assistant|>"
+                })
+                .count(),
+            if family == ToolFamily::Gemma4 { 1 } else { 2 }
+        );
+    }
 }

@@ -1,0 +1,98 @@
+qwen_dense
+Decisions { index: 0, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+Decisions { index: 1, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+qwen_moe
+Decisions { index: 0, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+Decisions { index: 1, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+qwen_hybrid
+Decisions { index: 0, kind: Some("linear_attention"), gemma_full: false, gemma_sliding: false, full: false, resident_full: false, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 1, false)
+Decisions { index: 1, kind: Some("full_attention"), gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (true, false, 2, 1, 1, true)
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: false, resident_full: false, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 1, false)
+qwen_hybrid_moe
+Decisions { index: 0, kind: Some("linear_attention"), gemma_full: false, gemma_sliding: false, full: false, resident_full: false, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 1, false)
+Decisions { index: 1, kind: Some("full_attention"), gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (true, false, 2, 1, 1, true)
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: false, resident_full: false, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 1, false)
+gemma3
+Decisions { index: 0, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: true, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: Some(1176256512), scale_bits: None, window: Some(512), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+Decisions { index: 1, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: true, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: Some(1176256512), scale_bits: None, window: Some(512), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: true, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: Some(1176256512), scale_bits: None, window: Some(512), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+Decisions { index: 3, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: true, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: Some(1176256512), scale_bits: None, window: Some(512), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+Decisions { index: 4, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: true, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: Some(1176256512), scale_bits: None, window: Some(512), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+Decisions { index: 5, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: None, scale_bits: Some(1040187392), window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+Decisions { index: 6, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: true, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: Some(1176256512), scale_bits: None, window: Some(512), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+Decisions { index: 7, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: true, head_dim: Ok(2), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: Some(1176256512), scale_bits: None, window: Some(512), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 2, true)
+gemma4_dense
+Decisions { index: 0, kind: Some("sliding_attention"), gemma_full: false, gemma_sliding: true, full: true, resident_full: true, local: true, head_dim: Ok(4), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: Some(1176256512), scale_bits: None, window: Some(2), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, true, 4, 1, 2, true)
+Decisions { index: 1, kind: Some("full_attention"), gemma_full: true, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(8), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [0, 2, 128], theta_bits: Some(1232348160), scale_bits: None, window: None, no_rope: false, v_shared: true, dense_mlp: None, sinks: false }
+loader (true, false, 8, 1, 2, true)
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: false, local: false, head_dim: Ok(4), kv_heads: 1, rope_dims: [4, 4, 4], rope_frequency_dim: [4, 4, 4], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 4, 1, 4, true)
+gemma4_moe
+Decisions { index: 0, kind: Some("sliding_attention"), gemma_full: false, gemma_sliding: true, full: true, resident_full: true, local: true, head_dim: Ok(4), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [2, 2, 2], theta_bits: Some(1176256512), scale_bits: None, window: Some(2), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, true, 4, 1, 2, true)
+Decisions { index: 1, kind: Some("full_attention"), gemma_full: true, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(8), kv_heads: 1, rope_dims: [2, 2, 2], rope_frequency_dim: [0, 2, 128], theta_bits: Some(1232348160), scale_bits: None, window: None, no_rope: false, v_shared: true, dense_mlp: None, sinks: false }
+loader (true, false, 8, 1, 2, true)
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: false, local: false, head_dim: Ok(4), kv_heads: 1, rope_dims: [4, 4, 4], rope_frequency_dim: [4, 4, 4], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 4, 1, 4, true)
+flint
+Decisions { index: 0, kind: Some("full_attention"), gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(32), kv_heads: 1, rope_dims: [32, 32, 32], rope_frequency_dim: [32, 32, 32], theta_bits: None, scale_bits: None, window: None, no_rope: true, v_shared: false, dense_mlp: Some(true), sinks: true }
+loader (true, false, 32, 1, 32, true)
+Decisions { index: 1, kind: Some("sliding_attention"), gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: true, head_dim: Ok(32), kv_heads: 1, rope_dims: [32, 32, 32], rope_frequency_dim: [32, 32, 32], theta_bits: None, scale_bits: None, window: Some(2), no_rope: false, v_shared: false, dense_mlp: Some(false), sinks: true }
+loader (false, true, 32, 1, 32, true)
+Decisions { index: 2, kind: Some("sliding_attention"), gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: true, head_dim: Ok(32), kv_heads: 1, rope_dims: [32, 32, 32], rope_frequency_dim: [32, 32, 32], theta_bits: None, scale_bits: None, window: Some(2), no_rope: false, v_shared: false, dense_mlp: Some(false), sinks: true }
+loader (false, true, 32, 1, 32, true)
+Decisions { index: 3, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(32), kv_heads: 1, rope_dims: [32, 32, 32], rope_frequency_dim: [32, 32, 32], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: Some(false), sinks: true }
+loader (false, false, 32, 1, 32, true)
+qwen_labels_divergent
+Decisions { index: 0, kind: Some("linear_attention"), gemma_full: false, gemma_sliding: false, full: false, resident_full: false, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 1, false)
+Decisions { index: 1, kind: Some("full_attention"), gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (true, false, 8, 3, 2, true)
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: false, resident_full: false, local: false, head_dim: Ok(2), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 2, 1, 1, false)
+gemma4_partial_options
+Decisions { index: 0, kind: Some("sliding_attention"), gemma_full: false, gemma_sliding: true, full: true, resident_full: true, local: true, head_dim: Ok(4), kv_heads: 1, rope_dims: [4, 4, 4], rope_frequency_dim: [4, 4, 4], theta_bits: Some(1176256512), scale_bits: None, window: Some(2), no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, true, 4, 1, 1, true)
+Decisions { index: 1, kind: Some("full_attention"), gemma_full: true, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Ok(8), kv_heads: 1, rope_dims: [8, 8, 8], rope_frequency_dim: [0, 2, 128], theta_bits: Some(1232348160), scale_bits: None, window: None, no_rope: false, v_shared: true, dense_mlp: None, sinks: false }
+loader (true, false, 8, 1, 2, true)
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: false, local: false, head_dim: Ok(4), kv_heads: 1, rope_dims: [1, 1, 1], rope_frequency_dim: [1, 1, 1], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+loader (false, false, 4, 1, 1, true)
+absent_options None
+Decisions { index: 0, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: true, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 1, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 3, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: true, v_shared: false, dense_mlp: None, sinks: false }
+absent_options Some(0)
+Decisions { index: 0, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: true, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 1, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 3, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: true, v_shared: false, dense_mlp: None, sinks: false }
+absent_options Some(1)
+Decisions { index: 0, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: true, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 1, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 3, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: true, v_shared: false, dense_mlp: None, sinks: false }
+absent_options Some(3)
+Decisions { index: 0, kind: None, gemma_full: false, gemma_sliding: false, full: false, resident_full: false, local: true, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: None, window: None, no_rope: true, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 1, kind: None, gemma_full: false, gemma_sliding: false, full: false, resident_full: false, local: true, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: None, window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 2, kind: None, gemma_full: false, gemma_sliding: false, full: true, resident_full: true, local: false, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: Some(2147483648), window: None, no_rope: false, v_shared: false, dense_mlp: None, sinks: false }
+Decisions { index: 3, kind: None, gemma_full: false, gemma_sliding: false, full: false, resident_full: false, local: true, head_dim: Err("dimension incompatible: head_dim manquant"), kv_heads: 1, rope_dims: [0, 2, 128], rope_frequency_dim: [0, 2, 128], theta_bits: None, scale_bits: None, window: None, no_rope: true, v_shared: false, dense_mlp: None, sinks: false }

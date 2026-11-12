@@ -521,6 +521,17 @@ impl MoeMlp {
             None => router_source.clone(),
         };
         let router_logits = self.router.forward_with_runtime(&router_input, runtime)?;
+        #[cfg(feature = "devtools")]
+        {
+            crate::devtools::layer_dump::record("router_input", &router_input)?;
+            crate::devtools::layer_dump::record("router_logits", &router_logits)?;
+            if crate::devtools::layer_dump::active() {
+                let selections = (0..batch)
+                    .map(|row| self.top_weights(router_logits.row_slice(row)?))
+                    .collect::<Result<Vec<_>>>()?;
+                crate::devtools::layer_dump::record_routing(selections)?;
+            }
+        }
         let (_, expert_count) = router_logits.as_matrix()?;
         if expert_count != self.experts.len() {
             return Err(InferError::Dimension(format!(
@@ -1084,7 +1095,9 @@ mod tests {
     fn quantized_cpu_data_available(linear: &Linear) -> bool {
         match linear.weight() {
             crate::LinearWeight::AffineQuantized(weight) => weight.cpu_data_available(),
-            crate::LinearWeight::Dense(_) | crate::LinearWeight::DenseBf16(_) => false,
+            crate::LinearWeight::Dense(_)
+            | crate::LinearWeight::DenseBf16(_)
+            | crate::LinearWeight::DenseShared(_) => false,
         }
     }
 

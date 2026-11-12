@@ -1168,7 +1168,7 @@ impl MetalExecutor {
         )?;
         let z_buffer = self.private_f32_buffer(
             checked_len(rows, value_dim, "linear-attn batch z")?,
-            "linear_attn_batch_resident_z",
+            super::prefill::PHASE_Q_CONTEXT,
         )?;
         let beta_input_buffer = self.private_f32_buffer(
             checked_len(rows, spec.num_value_heads, "linear-attn batch beta input")?,
@@ -1186,7 +1186,7 @@ impl MetalExecutor {
             self.cached_buffer_from_f32(weights.norm_weight, "linear_attn_norm_weight")?;
         let gated_batch_buffer = self.private_f32_buffer(
             checked_len(rows, value_dim, "linear-attn batch gated")?,
-            "linear_attn_batch_resident_gated",
+            super::prefill::PHASE_ROPE_GATED,
         )?;
         let use_seq_delta_batch = linear_delta_dk128_enabled() && spec.key_head_dim == 128;
         self.encode_matmul_weight(
@@ -1248,7 +1248,7 @@ impl MetalExecutor {
             )?;
             let y_buffer = self.private_f32_buffer(
                 checked_len(rows, value_dim, "linear-attn batch y")?,
-                "linear_attn_batch_resident_y_seq",
+                super::prefill::PHASE_GATE,
             )?;
             if spec.conv_kernel_dim == 4 && spec.value_head_dim == 128 && spec.key_head_dim == 128 {
                 self.encode_linear_attn_conv_norm_gates_k4_dk128_batch(

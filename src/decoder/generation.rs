@@ -436,7 +436,13 @@ impl CausalDecoder {
         let position = cache.position;
         let runtime = self.forward_runtime();
         let mut hidden = self.embed_scaled(&[token_id])?;
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("embeddings", &hidden)?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
+            #[cfg(feature = "devtools")]
+            let _capture = crate::devtools::layer_dump::enter_layer(layer_index);
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("input", &hidden)?;
             hidden = layer.forward_cached(
                 &self.config,
                 &hidden,
@@ -444,6 +450,8 @@ impl CausalDecoder {
                 position,
                 runtime,
             )?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("output", &hidden)?;
         }
         cache.position += 1;
         rms_norm(&hidden, &self.final_norm, self.config.rms_eps)
@@ -2519,7 +2527,7 @@ impl CausalDecoder {
                 ))
             })?;
             let (max_abs, mean_abs) = diff_stats_same_len(reference_slice, resident_slice)?;
-            let attention_kind = if self.config.is_full_attention_layer(layer_index) {
+            let attention_kind = if self.plan.layers[layer_index].is_full() {
                 "full"
             } else {
                 "linear"
@@ -2587,7 +2595,7 @@ impl CausalDecoder {
         input_token: usize,
     ) -> Result<Option<ResidentLinearXrayProbe>> {
         let Some(layer_index) =
-            (0..self.layers.len()).find(|index| !self.config.is_full_attention_layer(*index))
+            (0..self.layers.len()).find(|index| !self.plan.layers[*index].is_full())
         else {
             return Ok(None);
         };
@@ -3317,7 +3325,11 @@ impl CausalDecoder {
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(captures) = state.captures {
                 if captures.layer_ids == *layer_ids && captures.from == 0 {
-                    return Ok((state.cache, state.final_state, captures.hidden));
+                    return Ok((
+                        state.cache,
+                        state.final_state,
+                        Arc::unwrap_or_clone(captures.hidden),
+                    ));
                 }
             }
         }
@@ -3325,7 +3337,7 @@ impl CausalDecoder {
             self.prefill_cache_state_with_layer_capture_all(prompt, layer_ids, usize::MAX, false)?;
         let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
         self.snapshot_save(&snapshot, &cache, &final_state, None, Some(&captures));
-        Ok((cache, final_state, captures.hidden))
+        Ok((cache, final_state, Arc::unwrap_or_clone(captures.hidden)))
     }
 
     /// Comme [`Self::prefill_cache_state_with_layer_capture`], mais rend les
@@ -3396,7 +3408,7 @@ impl CausalDecoder {
             PrefixCaptures {
                 layer_ids: layer_ids.to_vec(),
                 from: 0,
-                hidden: target_hidden,
+                hidden: target_hidden.into(),
             },
         ))
     }
@@ -3671,6 +3683,51 @@ impl CausalDecoder {
         let (cache, final_state) = self.prefill_cache_state(prompt)?;
         let logits = self.logits_from_final_state(&final_state)?;
         Ok((cache, logits))
+    }
+
+    /// Capture le prefill Gemma 4 MoE dans un répertoire neuf (feature `devtools`).
+    ///
+    /// Utilise le runtime attaché : CPU f32 ou Metal per-op par défaut, sans
+    /// cache de préfixe ni snapshot disque. Aucun poids ni token n'est téléchargé.
+    ///
+    /// # Errors
+    ///
+    /// Refuse un modèle hors Gemma 4 MoE, un prefill résident fusionné, une
+    /// capture incomplète ou un répertoire déjà existant.
+    #[cfg(feature = "devtools")]
+    pub fn dump_gemma4_layers(&self, prompt: &[usize], directory: &Path) -> Result<Tensor> {
+        if prompt.is_empty() || !self.config.is_gemma4 || !self.config.parallel_moe {
+            return Err(InferError::Config(
+                "dump réservé à un prompt Gemma 4 MoE non vide".into(),
+            ));
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if self.forward_runtime().metal_executor().is_some()
+            && crate::runtime_flags::prefill_resident_gemma4_enabled()
+        {
+            return Err(InferError::Config("dump: désactiver SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4 (chemin fusionné non instrumenté)".into()));
+        }
+        let backend = "cpu-f32";
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let backend = if self.forward_runtime().metal_executor().is_some() {
+            "metal-per-op"
+        } else {
+            backend
+        };
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let _scratch_buffer_scope = self.scratch_buffer_scope();
+        let capture = crate::devtools::layer_dump::Capture::start(
+            directory,
+            prompt,
+            self.layers.len(),
+            backend,
+        )?;
+        let (_, final_state) = self.prefill_cache_state_uncached_inner(prompt)?;
+        crate::devtools::layer_dump::record("final_norm", &final_state)?;
+        let logits = self.logits_from_final_state(&final_state)?;
+        crate::devtools::layer_dump::record("logits", &logits)?;
+        capture.finish()?;
+        Ok(logits)
     }
 
     /// Préremplit le cache sans consulter ni alimenter le prefix cache.
@@ -4549,14 +4606,18 @@ impl CausalDecoder {
     /// les captures de `layer_ids` et prolonge état et captures sur le suffixe
     /// par le prefill résident borné par défaut, avec le forward per-op en repli.
     /// Rend `(cache, état final, captures, from)` avec les captures bornées aux
-    /// `keep_rows` dernières positions, y compris avant copie d'un hit exact.
+    /// `keep_rows` dernières positions, partagées pour un hit exact sans troncature.
     #[cfg(feature = "devtools")]
+    #[expect(
+        clippy::type_complexity,
+        reason = "état du cache, état final, captures partagées et position absolue"
+    )]
     pub(super) fn prefix_cache_get_with_captures(
         &self,
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
-    ) -> Result<Option<(CausalDecoderCache, Tensor, Tensor, usize)>> {
+    ) -> Result<Option<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)>> {
         let Some((mut output, cached_len, history, Some(captures))) =
             self.prefix_cache_hit(prompt, false, keep_rows)?
         else {
@@ -4621,7 +4682,7 @@ impl CausalDecoder {
         layer_ids: &[usize],
         keep_rows: usize,
         drafter: Option<&DFlashDraft>,
-    ) -> Result<(CausalDecoderCache, Tensor, Tensor, usize)> {
+    ) -> Result<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)> {
         let snapshot = if crate::runtime_flags::state_snapshot_dir().is_some() {
             self.snapshot_request_dflash(
                 prompt,
@@ -5222,7 +5283,13 @@ impl CausalDecoder {
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
         let mut hidden = self.embed_scaled(prompt)?;
+        #[cfg(feature = "devtools")]
+        crate::devtools::layer_dump::record("embeddings", &hidden)?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
+            #[cfg(feature = "devtools")]
+            let _capture = crate::devtools::layer_dump::enter_layer(layer_index);
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("input", &hidden)?;
             hidden = layer.forward_prefill(
                 &self.config,
                 &hidden,
@@ -5230,6 +5297,8 @@ impl CausalDecoder {
                 0,
                 runtime,
             )?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("output", &hidden)?;
         }
         cache.position = prompt.len();
         let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
@@ -5253,7 +5322,13 @@ impl CausalDecoder {
         for chunk in prompt.chunks(chunk_size) {
             let position_offset = cache.position;
             let mut hidden = self.embed_scaled(chunk)?;
+            #[cfg(feature = "devtools")]
+            crate::devtools::layer_dump::record("embeddings", &hidden)?;
             for (layer_index, layer) in self.layers.iter().enumerate() {
+                #[cfg(feature = "devtools")]
+                let _capture = crate::devtools::layer_dump::enter_layer(layer_index);
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("input", &hidden)?;
                 hidden = layer.forward_prefill(
                     &self.config,
                     &hidden,
@@ -5261,6 +5336,8 @@ impl CausalDecoder {
                     position_offset,
                     runtime,
                 )?;
+                #[cfg(feature = "devtools")]
+                crate::devtools::layer_dump::record("output", &hidden)?;
             }
             cache.position += chunk.len();
             last_hidden = Some(hidden);
@@ -5368,7 +5445,9 @@ impl CausalDecoder {
                 false,
                 chunk_tokens,
             )?
-            .and_then(|(_, _, captures)| captures.map(|captures| captures.hidden)))
+            .and_then(|(_, _, captures)| {
+                captures.map(|captures| Arc::unwrap_or_clone(captures.hidden))
+            }))
     }
 
     /// Oracle de test : logits des lignes `rows` d'un hidden non normé
@@ -5739,13 +5818,13 @@ impl CausalDecoder {
                 && !crate::runtime_flags::gpu_timestamps_enabled();
             let (mut bytes_per_token, mut fixed_bytes) = (0_usize, 0_usize);
             for index in (0..self.layers.len())
-                .filter(|&index| self.config.is_resident_full_attention_layer(index))
+                .filter(|&index| self.plan.layers[index].resident_full)
             {
-                let Ok(kv_dim) = self.config.resident_full_attention_kv_dim(index) else {
+                let Ok(kv_dim) = self.plan.layers[index].resident.kv_dim() else {
                     continue;
                 };
                 let row_bytes = 2 * kv_dim * KV_BYTES_PER_VALUE;
-                let window = self.config.layer_sliding_window(index).filter(|_| {
+                let window = self.plan.layers[index].resident.sliding_window.filter(|_| {
                     chunked
                         && matches!(
                             self.layers.get(index).map(|layer| &layer.attention),
@@ -6041,12 +6120,17 @@ pub(super) fn stitch_captures(
             "captures préfixe/suffixe: couches ou colonnes incompatibles".to_string(),
         ));
     }
-    // Un suffixe déjà tronqué ne doit pas être recollé au préfixe : les
-    // positions intermédiaires manquent. La couverture est vérifiée ci-dessous.
-    let (from, hidden) = if suffix.from > cached_len {
+    // Un suffixe qui couvre la fenêtre suffit : adopter ses captures au lieu
+    // d'empiler le préfixe pour le jeter aussitôt. Un suffixe déjà tronqué ne
+    // doit pas être recollé : les positions intermédiaires manquent. La
+    // couverture reste vérifiée ci-dessous.
+    let (from, hidden) = if suffix_rows >= keep_rows.max(1) || suffix.from > cached_len {
         (suffix.from, suffix.hidden)
     } else {
-        (prefix.from, stack_rows(&prefix.hidden, &suffix.hidden)?)
+        (
+            prefix.from,
+            stack_rows(&prefix.hidden, &suffix.hidden)?.into(),
+        )
     };
     let captures = PrefixCaptures::tail(&prefix.layer_ids, from, hidden, keep_rows)?;
     let (rows, _) = captures.hidden.as_matrix()?;

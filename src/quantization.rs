@@ -560,10 +560,7 @@ impl AffineQuantizedTensor {
         &self.packed_shape
     }
 
-    #[cfg(any(
-        all(test, feature = "devtools"),
-        all(target_os = "macos", feature = "metal")
-    ))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn packed_data(&self) -> &[u32] {
         self.packed.data()
     }
@@ -689,26 +686,17 @@ impl AffineQuantizedTensor {
             && self.biases.values_are_bf16_exact()
     }
 
-    #[cfg(any(
-        all(test, feature = "devtools"),
-        all(target_os = "macos", feature = "metal")
-    ))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn packed_len(&self) -> usize {
         self.packed_shape.iter().product()
     }
 
-    #[cfg(any(
-        all(test, feature = "devtools"),
-        all(target_os = "macos", feature = "metal")
-    ))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn scales_len(&self) -> usize {
         self.scales.shape().iter().product()
     }
 
-    #[cfg(any(
-        all(test, feature = "devtools"),
-        all(target_os = "macos", feature = "metal")
-    ))]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
     pub(crate) fn biases_len(&self) -> usize {
         self.biases.shape().iter().product()
     }
