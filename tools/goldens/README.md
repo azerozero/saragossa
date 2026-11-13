@@ -258,14 +258,16 @@ Réarrondir en bf16 un seul composant de la référence float32 (entrée ou
 poids du routeur, attention, MLP, experts ou résiduel) suffit à ramener
 l'accord à 86-90 %.
 
-**Référence Gemma 4 suspecte (13 nov. 2026).** Sur le corpus, mlx-lm donne
-une perplexité d'au moins 533 (Qwen3.8 : 2), avec la cible hors du top-64
-dans 41 % des positions. Le texte enveloppé dans le template de chat ne fait
-pas mieux. Les greedy bruts des goldens bouclent (« The capital of France is
-the capital of France is… »), alors que le chat répond juste. Tant qu'une
-implémentation indépendante (llama.cpp ou transformers sur les poids Google)
-n'a pas tranché, l'oracle Gemma 4 mesure l'accord avec mlx-lm, pas la
-qualité du modèle.
+**Gemma 4 sur texte brut (13 nov. 2026).** Sur le corpus, mlx-lm donne une
+perplexité d'au moins 533 (Qwen3.8 : 2), et les greedy bruts des goldens
+bouclent, alors que le chat répond juste. Arbitré contre les poids Google bf16
+dans transformers 5.22.2 : perplexité d'environ 10⁵ sur le même corpus, sur
+CPU comme sur MPS, et « The capital of France is » → « a bit is a bit is… » ;
+le chat répond « Paris ». C'est donc le modèle instruct qui ne prédit pas le
+texte brut, pas un bug commun à mlx-lm et saragossa. L'oracle Gemma 4 sur ce
+corpus vérifie l'accord avec mlx-lm, pas la qualité ; la perte de
+quantification se mesure en régime chat (tools/quant/README.md, section
+Gemma 4).
 
 Mesure du 13 nov. 2026 (M5 Max) :
 
