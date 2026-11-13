@@ -5,7 +5,8 @@
 Recalcule les tenseurs quantifiés language_model du modèle de base ; recopie
 les autres tenseurs et fichiers du checkpoint MLX u4 fourni comme template.
 La largeur (4 ou 8 bits) de chaque tenseur suit le template ; les experts
-fusionnés gate_up_proj (Gemma 4) sont découpés comme mlx-lm. L'échelle peut être négative. Le meilleur groupe entre min-max et ajustement
+fusionnés gate_up_proj (Gemma 4) sont découpés comme mlx-lm.
+L'échelle peut être négative. Le meilleur groupe entre min-max et ajustement
 est conservé après arrondi BF16, sans changer les kernels ni le format.
 Résultat mesuré : perplexité +1,7 % contre +2,9 % par rapport au BF16,
 forward mlx-lm, 8160 tokens. Cette mesure ne vaut que pour le checkpoint testé.
@@ -158,6 +159,20 @@ def _self_check():
                 assert "lm_head.weight" in str(error)
             assert not dst.exists()
             fit.assert_not_called()
+    # Experts fusionnés Gemma 4 : moitié haute de gate_up_proj = gate, basse = up.
+    mx = ModuleType("mlx.core")
+    mx.split = Mock(return_value=("G", "U"))
+    stem = "language_model.model.layers.2.experts.switch_glu."
+    fused = {"model.language_model.layers.2.experts.gate_up_proj": "GU",
+             "model.language_model.layers.2.experts.down_proj": "D"}
+    assert [bf16_tensor(mx, fused, stem + p) for p in ("gate_proj", "up_proj", "down_proj")] == [
+        "G", "U", "D"]
+    mx.split.assert_called_with("GU", 2, axis=-2)
+    try:
+        bf16_tensor(mx, fused, "language_model.model.layers.2.mlp.up_proj")
+        raise AssertionError("clé absente acceptée")
+    except ValueError:
+        pass
     opt_quant._self_check()
 
 

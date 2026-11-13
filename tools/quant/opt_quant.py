@@ -35,6 +35,8 @@ def fit(x, iters=8, bits=BITS):
     rows = x.size // shape[-1]
     groups = shape[-1] // GROUP
     w = x.astype(mx.float32).reshape(rows, groups, GROUP)
+    if bits not in (4, 8):
+        raise ValueError(f"largeur non prise en charge : {bits} bits (4 ou 8)")
     levels = 2**bits - 1
     w0, s0, b0 = mx.quantize(x, group_size=GROUP, bits=bits, mode="affine")
     s0f, b0f = s0.astype(mx.float32).reshape(rows, groups, 1), b0.astype(mx.float32).reshape(rows, groups, 1)
@@ -67,6 +69,9 @@ def fit(x, iters=8, bits=BITS):
     back = mx.dequantize(packed, scales.astype(mx.float32), biases.astype(mx.float32),
                          group_size=GROUP, bits=bits, mode="affine")
     rmse1 = mx.sqrt(((back.reshape(w.shape) - w) ** 2).mean())
+    # Le meilleur groupe ne peut pas faire pire que le min-max : sinon l'emballage est faux.
+    if rmse1.item() > rmse0.item() * (1 + 1e-3):
+        raise ValueError(f"emballage {bits} bits incohérent : rmse {rmse1.item()} > {rmse0.item()}")
     return packed, scales, biases, rmse0, rmse1
 
 

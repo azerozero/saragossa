@@ -11,6 +11,7 @@ fabriquer des poids, pas à les exécuter.
 | `test_allocation.py` | Tests de la logique d'allocation, sans dépendance à MLX |
 | `convert_ls.py` | Re-quantifie en affine gs64 (4 ou 8 bits, selon le template) par moindres carrés depuis les poids BF16, sans changer le format (+1,7 % de perplexité contre +2,9 % en min-max sur le 27B, sans données de calibration) |
 | `opt_quant.py` | Ajustement d'échelle et de biais par groupe utilisé par `convert_ls.py` |
+| `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) |
 
 ## Méthode
 
@@ -110,10 +111,15 @@ seulement leur bruit : ne comparez que des mesures issues du même jeu.
 
 Le checkpoint `mlx-community/gemma-4-26b-a4b-it-4bit` (attention, experts et
 embeddings en 4 bits ; MLP dense et routeur en 8) perd nettement face aux poids
-Google bf16. Mesure en régime chat : 8 réponses greedy de 192 tokens au plus
-générées par transformers bf16, top-64 par position, KL sur la partition
-top-64 + reste (1 505 positions). Le corpus de texte brut ne convient pas : le
-modèle instruct y a une perplexité d'environ 10⁵, poids officiels compris.
+Google bf16. Mesure en régime chat avec `chat_kl.py` : 8 réponses greedy de
+192 tokens au plus générées par transformers bf16, top-64 par position, KL sur
+la partition top-64 + reste (1 505 positions). Le texte brut ne convient pas :
+sur un extrait de Sherlock Holmes précédé du BOS, les poids officiels dans
+transformers 5.22.2 ont une perplexité d'environ 10⁵, sur CPU comme sur MPS,
+alors qu'ils répondent correctement en chat.
+
+Chaque ligne « + … » modifie un seul groupe de modules par rapport au
+checkpoint mlx-community ; les lignes ne se cumulent pas.
 
 | variante (mlx-lm) | KL | même top-1 | taille |
 |---|---|---|---|
@@ -129,7 +135,7 @@ modèle instruct y a une perplexité d'environ 10⁵, poids officiels compris.
 
 Dans le moteur Rust, q4a8 + moindres carrés donne KL 0,031 et 96,2 % de top-1,
 contre 0,132 et 91,7 % sur le checkpoint mlx-community. Les moindres carrés
-seuls sur le checkpoint mlx-community ne changent rien (KL 0,137) : l'erreur
+seuls sur le checkpoint mlx-community ne changent rien (KL 0,137, dans le bruit) : l'erreur
 dominante vient de la largeur de l'attention, pas de l'arrondi. Coût en
 decode, A/B ABBA sur 5 blocs (prompt de 1 024 tokens, 256 générés, M5 Max) :
 18,35 contre 18,95 tok/s, soit −3,2 %.
@@ -140,6 +146,8 @@ python3 mixed_quant.py --input gemma-4-26B-A4B-it --output gemma4-q4a8-minmax \
     --force-high 'self_attn|embed_tokens|\.mlp\.|router'
 python3 convert_ls.py --src gemma-4-26B-A4B-it --template gemma4-q4a8-minmax \
     --dst gemma4-q4a8-ls
+python3 chat_kl.py ref --model gemma-4-26B-A4B-it --out chatref.json  # transformers
+python3 chat_kl.py eval --model gemma4-q4a8-ls --ref chatref.json
 ```
 
 `convert_ls.py` suit la largeur de chaque tenseur du template (4 ou 8 bits) et
