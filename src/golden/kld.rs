@@ -173,7 +173,16 @@ fn compare(name: &str, env: &str) -> TestResult {
             let (kl, delta) = metrics(values, ids, logprobs);
             kls.push(kl);
             deltas.push(delta);
-            same += usize::from(crate::argmax(values)? == ids[0]);
+            let actual = crate::argmax(values)?;
+            if actual != ids[0] {
+                let margin = logprobs[0] - logprobs[1];
+                eprintln!(
+                    "kld/{name}/{}: greedy={actual}/{} marge_ref={margin:.6}",
+                    kls.len() - 1,
+                    ids[0]
+                );
+            }
+            same += usize::from(actual == ids[0]);
             if position + 1 < chunk.len() {
                 logits = model.next_logits_cached(&mut cache, chunk[position])?;
             }
