@@ -1,4 +1,4 @@
-"""Échelle et biais affines ajustés aux moindres carrés, même format u4 gs64 que MLX.
+"""Échelle et biais affines ajustés aux moindres carrés, même format affine gs64 que MLX (4 ou 8 bits).
 
 Le min-max de MLX cale la grille sur les extrêmes du groupe. Ici, q et (s, b)
 sont réajustés en alternance, puis chaque groupe garde la meilleure des deux
@@ -16,15 +16,17 @@ import struct
 BITS, GROUP = 4, 64
 LEVELS = 2**BITS - 1
 
-def _codes(mx, w, s, b):
+def _codes(mx, w, s, b, levels=LEVELS):
     safe = mx.where(s != 0, s, mx.array(1.0, mx.float32))
-    return mx.where(s != 0, mx.clip(mx.round((w - b) / safe), 0, LEVELS), mx.zeros_like(w))
+    return mx.where(s != 0, mx.clip(mx.round((w - b) / safe), 0, levels), mx.zeros_like(w))
 
 def _bf16(mx, x):
     return x.astype(mx.bfloat16).astype(mx.float32)
 
-def fit(x, iters=8):
-    """x: BF16 [..., cols]. Retourne (poids u32 emballés, échelles bf16, biais bf16, rmse0, rmse1)."""
+def fit(x, iters=8, bits=BITS):
+    """x: BF16 [..., cols]. Retourne (poids u32 emballés, échelles bf16, biais bf16, rmse0, rmse1).
+
+    rmse1 est recalculé par mx.dequantize sur la sortie emballée : il valide aussi l'emballage."""
     import mlx.core as mx
 
     shape = x.shape
@@ -33,11 +35,12 @@ def fit(x, iters=8):
     rows = x.size // shape[-1]
     groups = shape[-1] // GROUP
     w = x.astype(mx.float32).reshape(rows, groups, GROUP)
-    w0, s0, b0 = mx.quantize(x, group_size=GROUP, bits=BITS, mode="affine")
+    levels = 2**bits - 1
+    w0, s0, b0 = mx.quantize(x, group_size=GROUP, bits=bits, mode="affine")
     s0f, b0f = s0.astype(mx.float32).reshape(rows, groups, 1), b0.astype(mx.float32).reshape(rows, groups, 1)
     s, b = s0f, b0f
     for _ in range(iters):
-        q = _codes(mx, w, s, b)
+        q = _codes(mx, w, s, b, levels)
         n = float(GROUP)
         sq, sqq = q.sum(-1, keepdims=True), (q * q).sum(-1, keepdims=True)
         sw, sqw = w.sum(-1, keepdims=True), (q * w).sum(-1, keepdims=True)
@@ -48,19 +51,23 @@ def fit(x, iters=8):
         s, b = mx.where(ok, s1, s), mx.where(ok, b1, b)
         mx.eval(s, b)
     s, b = _bf16(mx, s), _bf16(mx, b)
-    q = _codes(mx, w, s, b)
-    q_ref = _codes(mx, w, s0f, b0f)
+    q = _codes(mx, w, s, b, levels)
+    q_ref = _codes(mx, w, s0f, b0f, levels)
     e1 = ((s * q + b - w) ** 2).sum(-1, keepdims=True)
     e0 = ((s0f * q_ref + b0f - w) ** 2).sum(-1, keepdims=True)
     use = e1 < e0
     s, b, q = mx.where(use, s, s0f), mx.where(use, b, b0f), mx.where(use, q, q_ref)
-    best = mx.minimum(e1, e0)
-    q = q.astype(mx.uint32).reshape(rows, groups * GROUP // 8, 8)
-    shifts = mx.array([4 * i for i in range(8)], mx.uint32)
-    packed = (q << shifts).sum(-1).astype(mx.uint32).reshape(*shape[:-1], shape[-1] // 8)
+    per = 32 // bits
+    q = q.astype(mx.uint32).reshape(rows, groups * GROUP // per, per)
+    shifts = mx.array([bits * i for i in range(per)], mx.uint32)
+    packed = (q << shifts).sum(-1).astype(mx.uint32).reshape(*shape[:-1], shape[-1] // per)
+    scales, biases = s.astype(mx.bfloat16).reshape(*s0.shape), b.astype(mx.bfloat16).reshape(*b0.shape)
     rmse0 = mx.sqrt(e0.mean() / GROUP)
-    rmse1 = mx.sqrt(best.mean() / GROUP)
-    return packed, s.astype(mx.bfloat16).reshape(*s0.shape), b.astype(mx.bfloat16).reshape(*b0.shape), rmse0, rmse1
+    # Échelles en f32 : un résultat bf16 ajouterait son propre arrondi à l'erreur mesurée.
+    back = mx.dequantize(packed, scales.astype(mx.float32), biases.astype(mx.float32),
+                         group_size=GROUP, bits=bits, mode="affine")
+    rmse1 = mx.sqrt(((back.reshape(w.shape) - w) ** 2).mean())
+    return packed, scales, biases, rmse0, rmse1
 
 
 def least_squares(n, sq, sqq, sw, sqw, denominator=None):

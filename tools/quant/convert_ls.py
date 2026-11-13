@@ -1,10 +1,11 @@
-"""Re-quantification u4 affine gs64 par moindres carrés depuis les poids BF16.
+"""Re-quantification affine gs64 par moindres carrés depuis les poids BF16.
 
   VENV_PY -I -B convert_ls.py --src BF16 --template U4 --dst NOUVEAU_DOSSIER
 
 Recalcule les tenseurs quantifiés language_model du modèle de base ; recopie
 les autres tenseurs et fichiers du checkpoint MLX u4 fourni comme template.
-L'échelle peut être négative. Le meilleur groupe entre min-max et ajustement
+La largeur (4 ou 8 bits) de chaque tenseur suit le template ; les experts
+fusionnés gate_up_proj (Gemma 4) sont découpés comme mlx-lm. L'échelle peut être négative. Le meilleur groupe entre min-max et ajustement
 est conservé après arrondi BF16, sans changer les kernels ni le format.
 Résultat mesuré : perplexité +1,7 % contre +2,9 % par rapport au BF16,
 forward mlx-lm, 8160 tokens. Cette mesure ne vaut que pour le checkpoint testé.
@@ -26,6 +27,21 @@ def bf16_key(base):
     if not base.startswith("language_model.model."):
         raise ValueError(f"tenseur BF16 non reconnu : {base}")
     return "model.language_model." + base[len("language_model.model."):] + ".weight"
+
+
+def bf16_tensor(mx, weights, base):
+    """Tenseur BF16 du module quantifié base ; experts fusionnés découpés comme mlx-lm."""
+    key = bf16_key(base)
+    if key in weights:
+        return weights[key]
+    stem, _, proj = base.rpartition(".switch_glu.")
+    fused = "model.language_model." + stem[len("language_model.model."):] + "."
+    if proj == "down_proj" and fused + "down_proj" in weights:
+        return weights[fused + "down_proj"]
+    if proj in ("gate_proj", "up_proj") and fused + "gate_up_proj" in weights:
+        gate, up = mx.split(weights[fused + "gate_up_proj"], 2, axis=-2)
+        return gate if proj == "gate_proj" else up
+    raise ValueError(f"clé BF16 absente : {key}")
 
 
 def validate(src, template, dst):
@@ -57,17 +73,19 @@ def convert(src, template, dst):
     # Tous les shards sont contrôlés avant toute création ou conversion.
     for path in shards:
         for base in quantized_names(mx.load(str(path))):
-            key = bf16_key(base)
-            if key not in weights:
-                raise ValueError(f"clé BF16 absente : {key} ({path.name})")
+            try:
+                bf16_tensor(mx, weights, base)
+            except ValueError as error:
+                raise ValueError(f"{error} ({path.name})") from None
     dst.mkdir(parents=True, exist_ok=False)
     count, err0, err1, total = 0, 0.0, 0.0, 0
     for path in shards:
         shard = mx.load(str(path))
         names = quantized_names(shard)
         for base in names:
-            x = weights[bf16_key(base)]
-            packed, scale, bias, rmse0, rmse1 = opt_quant.fit(x)
+            x = bf16_tensor(mx, weights, base)
+            bits = shard[base + ".weight"].shape[-1] * 32 // x.shape[-1]
+            packed, scale, bias, rmse0, rmse1 = opt_quant.fit(x, bits=bits)
             mx.eval(packed, scale, bias, rmse0, rmse1)
             for suffix, new in ((".weight", packed), (".scales", scale), (".biases", bias)):
                 old = shard[base + suffix]
@@ -86,7 +104,7 @@ def convert(src, template, dst):
         if path.is_file() and path not in shards and path.name != "README.md":
             shutil.copy2(path, dst / path.name)
     (dst / "README.md").write_text(
-        "Checkpoint MLX u4 gs64 : échelles et biais ajustés aux moindres carrés "
+        "Checkpoint MLX affine gs64 : échelles et biais ajustés aux moindres carrés "
         "depuis les tenseurs BF16, format du template conservé.\n")
     print("fini", count, total / 2**30, "Gio", flush=True)
 
@@ -150,7 +168,7 @@ def main():
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--src", type=pathlib.Path, required=True, help="checkpoint BF16")
-    parser.add_argument("--template", type=pathlib.Path, required=True, help="checkpoint MLX u4 gs64")
+    parser.add_argument("--template", type=pathlib.Path, required=True, help="checkpoint MLX affine gs64 (4/8 bits)")
     parser.add_argument("--dst", type=pathlib.Path, required=True, help="destination inexistante")
     args = parser.parse_args()
     convert(args.src, args.template, args.dst)
