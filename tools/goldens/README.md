@@ -233,6 +233,35 @@ maxima KL/Δp. Elles échouent si les mismatches dépassent respectivement
 pas ces deux rapports. Les erreurs de lecture, de provenance ou d'exécution
 restent des échecs. Une amélioration du nombre de mismatches est acceptée.
 
+## KL sur corpus
+
+Protocole inspiré de `llama-perplexity --kl-divergence` et du test par ratio
+du guide de précision vLLM d'AWS Neuron. `kld.py` note 2 048 positions :
+8 morceaux de 512 tokens de `kld/corpus.txt`, un extrait du domaine public
+(Project Gutenberg n°1661, « A Scandal in Bohemia »), dont les 256 dernières
+positions de chaque morceau sont notées. La référence est mlx-lm float32 ;
+chaque position garde le top-64 et la masse restante. Le même script mesure
+mlx-lm bf16 contre cette référence : c'est le bruit propre de la précision
+bf16, stocké dans `kld/<modèle>_meta.json`.
+
+L'oracle Rust (`golden::kld`, prefill de 256 tokens puis decode token par
+token) échoue si la KL moyenne ou le Δp p99 de saragossa dépasse 1,5 fois
+celui de mlx-lm bf16. Ce ratio ne demande aucun seuil absolu choisi à la main.
+
+Mesure du 13 nov. 2026 (M5 Max) :
+
+| modèle | même top-1, saragossa | même top-1, mlx bf16 | KL moy. saragossa | KL moy. mlx bf16 | ratio KL | ratio Δp p99 |
+|---|---|---|---|---|---|---|
+| qwen38 (u4ls) | 99,95 % | 98,88 % | 0,000044 | 0,0016 | 0,03 | 0,18 |
+| gemma3 | 100 % | 97,85 % | 0,0000077 | 0,0016 | 0,005 | 0,08 |
+| qwen36_moe | 98,19 % | 97,71 % | 0,010 | 0,022 | 0,45 | 0,76 |
+| gemma4 | 86,13 % | 79,59 % | 0,22 | 0,45 | 0,48 | 0,84 |
+
+```sh
+SARAGOSSA_GOLDEN_CAPTURE=1 python -I tools/goldens/kld.py --model qwen38
+cargo test --release --all-features --lib golden::kld::external_kld_ -- --ignored --test-threads=1 --nocapture
+```
+
 ## Exécuter les comparaisons
 
 Définir les variables du tableau vers les snapshots locaux correspondants.

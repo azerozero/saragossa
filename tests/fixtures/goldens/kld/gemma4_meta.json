@@ -1,0 +1,30 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    20948
+  ],
+  "source": {
+    "model": "mlx-community/gemma-4-26b-a4b-it-4bit",
+    "path": "${SARAGOSSA_GEMMA4_DIR}",
+    "snapshot": "efbeee6e582ebfd06abc9d65e90839c4b5d2116b",
+    "sha256": {
+      "config.json": "a64883e3afd8e8b76e7370ba1b288f6f2dc9a0e071337c9eddb420b747555209",
+      "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+      "tokenizer_config.json": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df",
+      "chat_template.jinja": "36e3a42e5cf14cd0020e72d92e1fdd9970f59b82170e421f0cbe1bb42bead3f0",
+      "generation_config.json": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+    },
+    "versions": {
+      "transformers": "5.22.2",
+      "tokenizers": "0.23.3",
+      "jinja2": "3.1.6",
+      "mlx": "0.32.4",
+      "mlx-lm": "0.32.2"
+    },
+    "float32_control": true
+  },
+  "tolerance": "ratio au bruit mlx bf16 / f32, voir README",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-13",
+  "payload_sha256": "a2d7ec619937dc004967fb848bc05d7a26dc7a61fb6a36a662a3bca4c84283c4"
+}

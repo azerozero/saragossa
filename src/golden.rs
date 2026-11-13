@@ -24,6 +24,7 @@ use std::path::PathBuf;
 mod chat;
 mod embedder;
 pub(crate) mod external;
+mod kld;
 mod logits;
 
 /// SHA reti (HEAD à la capture) — le fork mlx-rs vendoré est figé sur MLX 0.31.2.
