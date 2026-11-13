@@ -102,6 +102,8 @@ fn summarize(kls: &[f64], deltas: &mut [f64], same: usize) -> Stats {
 fn within_noise(engine: Stats, noise: Stats) -> bool {
     engine.mean_kl <= MAX_NOISE_RATIO * noise.mean_kl
         && engine.p99_delta_p <= MAX_NOISE_RATIO * noise.p99_delta_p
+        // Quand le bruit est énorme (gemma4), les ratios ne bornent presque rien.
+        && engine.same_top >= noise.same_top
 }
 
 #[test]
@@ -137,6 +139,11 @@ fn external_kld_ratio_gate() {
         ..noise
     };
     assert!(!within_noise(worse_delta, noise));
+    let worse_top = Stats {
+        same_top: 0.97,
+        ..noise
+    };
+    assert!(!within_noise(worse_top, noise));
     let logits = [0.0_f32; 4];
     let (kl, delta) = metrics(&logits, &[0, 1], &[0.25_f64.ln(), 0.25_f64.ln()]);
     assert!(kl.abs() < 1e-12 && delta < 1e-12);

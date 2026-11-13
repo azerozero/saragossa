@@ -30,6 +30,14 @@ def chunk_ids(tokenizer):
     return [bos + ids[i * width:(i + 1) * width] for i in range(CHUNKS)]
 
 
+def canonical_embed_scale(mx, model):
+    """√hidden arrondi en bf16, comme transformers (scale.to(weight.dtype)) et
+    mlx-lm Gemma 3 ; mlx-lm Gemma 4 garde un float Python, exact seulement en f32."""
+    for module in model.modules():
+        if isinstance(getattr(module, "embed_scale", None), float):
+            module.embed_scale = mx.array(module.embed_scale, mx.bfloat16).item()
+
+
 def logprobs(mx, model, chunk):
     # La position t prédit le token t + 1 : on note les SCORED derniers tokens.
     logits = model(mx.array([chunk]))[0, CTX - SCORED - 1:CTX - 1].astype(mx.float32)
@@ -56,6 +64,7 @@ def main():
     model, tokenizer = load(path)
     chunks = chunk_ids(tokenizer)
     model.set_dtype(mx.float32)
+    canonical_embed_scale(mx, model)
     mx.eval(model.parameters())
     reference = []  # par position : (ids top-K, logprobs top-K)
     for chunk in chunks:

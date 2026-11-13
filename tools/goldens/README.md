@@ -246,7 +246,14 @@ bf16, stocké dans `kld/<modèle>_meta.json`.
 
 L'oracle Rust (`golden::kld`, prefill de 256 tokens puis decode token par
 token) échoue si la KL moyenne ou le Δp p99 de saragossa dépasse 1,5 fois
-celui de mlx-lm bf16. Ce ratio ne demande aucun seuil absolu choisi à la main.
+celui de mlx-lm bf16, ou si son taux de même top-1 est inférieur à celui de
+mlx-lm bf16. Ce critère ne demande aucun seuil absolu choisi à la main.
+
+Gemma 4 : la référence float32 applique l'échelle d'embedding canonique
+(√hidden arrondi en bf16, comme transformers et mlx-lm Gemma 3 ; mlx-lm
+Gemma 4 garde sinon la valeur exacte en float32). Même ainsi, mlx-lm bf16 et
+float32 ne s'accordent que sur 80 % des top-1, contre 98 à 99 % ailleurs :
+ce modèle est très sensible à la précision et les ratios y bornent peu.
 
 Mesure du 13 nov. 2026 (M5 Max) :
 
@@ -255,7 +262,7 @@ Mesure du 13 nov. 2026 (M5 Max) :
 | qwen38 (u4ls) | 99,95 % | 98,88 % | 0,000044 | 0,0016 | 0,03 | 0,18 |
 | gemma3 | 100 % | 97,85 % | 0,0000077 | 0,0016 | 0,005 | 0,08 |
 | qwen36_moe | 98,19 % | 97,71 % | 0,010 | 0,022 | 0,45 | 0,76 |
-| gemma4 | 86,13 % | 79,59 % | 0,22 | 0,45 | 0,48 | 0,84 |
+| gemma4 | 85,84 % | 80,03 % | 0,23 | 0,43 | 0,52 | 0,88 |
 
 ```sh
 SARAGOSSA_GOLDEN_CAPTURE=1 python -I tools/goldens/kld.py --model qwen38
