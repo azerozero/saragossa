@@ -254,6 +254,18 @@ Gemma 4 : la référence float32 applique l'échelle d'embedding canonique
 Gemma 4 garde sinon la valeur exacte en float32). Même ainsi, mlx-lm bf16 et
 float32 ne s'accordent que sur 80 % des top-1, contre 98 à 99 % ailleurs :
 ce modèle est très sensible à la précision et les ratios y bornent peu.
+Réarrondir en bf16 un seul composant de la référence float32 (entrée ou
+poids du routeur, attention, MLP, experts ou résiduel) suffit à ramener
+l'accord à 86-90 %.
+
+**Référence Gemma 4 suspecte (13 nov. 2026).** Sur le corpus, mlx-lm donne
+une perplexité d'au moins 533 (Qwen3.8 : 2), avec la cible hors du top-64
+dans 41 % des positions. Le texte enveloppé dans le template de chat ne fait
+pas mieux. Les greedy bruts des goldens bouclent (« The capital of France is
+the capital of France is… »), alors que le chat répond juste. Tant qu'une
+implémentation indépendante (llama.cpp ou transformers sur les poids Google)
+n'a pas tranché, l'oracle Gemma 4 mesure l'accord avec mlx-lm, pas la
+qualité du modèle.
 
 Mesure du 13 nov. 2026 (M5 Max) :
 
