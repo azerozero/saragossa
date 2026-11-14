@@ -227,7 +227,7 @@ l'appelant ; elle ne relance pas silencieusement le per-op. Le test
 et vérifie aussi le dispatch qui pourrait déclencher ce repli.
 `gemma4_resident_prefill_token_limit_before_embedding` vérifie l'admission
 à la borne, le refus juste au-delà avant embedding, puis le repli per-op.
-`gemma4_prefill_max_tokens_defaults_and_override` couvre le défaut 3000 et
+`gemma4_prefill_max_tokens_defaults_and_override` couvrait le défaut 3000 de l'époque (4100 aujourd'hui) et
 le parsing de la surcharge.
 
 ### Diagnostic historique par longueur et par variante
@@ -353,7 +353,7 @@ python3 -I -B tools/gpulock.py run --owner gemma4-kl --prio 10 -- \
 
 L'oracle long s'exécute une seule fois, sans benchmark. La borne est relevée
 explicitement à 4128 pour laisser passer l'enveloppe chat ; cela ne modifie
-pas le défaut 3000. Le test échoue si son prompt sort de [4096, 4128] ou si
+pas le défaut 3000 de l'époque. Le test échoue si son prompt sort de [4096, 4128] ou si
 le kernel long d512 n'est pas dispatché. Définir `SARAGOSSA_GEMMA4_DIR` vers
 les poids à qualifier (par exemple le même snapshot 4bit) :
 
@@ -371,8 +371,8 @@ Pour reproduire la série par longueur, reprendre la commande longue en
 remplaçant son filtre par
 `decoder::tests::gemma4_oracles::gemma4_prefill_per_op_kld_resident_N`,
 avec `N` dans `64 128 256 512 1024 2048 3000`. Conserver la surcharge
-à 4128 pour les diagnostics au-delà de 3000. Pour vérifier le défaut livré,
-lancer le point 3000 **sans** cette surcharge. Les échecs numériques de la
+à 4128 pour les diagnostics au-delà de 3000. Pour vérifier le défaut livré
+(4100), voir la section de la décision courante. Les échecs numériques de la
 table sont attendus ; ne pas les confondre avec un refus d'admission.
 
 Les ablations persistantes utilisent la même commande longue, en ajoutant

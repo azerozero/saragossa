@@ -559,12 +559,12 @@ python3 -I -B tools/gpulock.py run --owner gemma4-layers-metal --prio 10 -- \
 ```
 
 Le backend par défaut du binaire est `metal`. `cpu` n'instancie aucun executor
-Metal. Le chemin Metal capturé est le prefill **per-op par défaut de Gemma 4**,
-identique au choix de `prefill_cache` à cache froid. Le diagnostic court-circuite
+Metal. Le chemin Metal capturé est le prefill **per-op**, forcé par
+`SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0`. Le diagnostic court-circuite
 uniquement le prefix cache et les snapshots disque ; il conserve les réglages
 usuels de batching/chunking. Les captures sont agrégées par position si le
-prefill est découpé ou tokenwise. Le chemin résident fusionné optionnel
-`SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` est explicitement refusé, car ses
+prefill est découpé ou tokenwise. Le chemin résident fusionné, par défaut
+jusqu'à 4100 tokens, est explicitement refusé, car ses
 sous-étapes ne sont pas instrumentées. Ce diagnostic ne qualifie pas le decode
 entièrement résident.
 

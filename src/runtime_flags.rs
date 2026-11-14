@@ -2422,10 +2422,11 @@ mod tests {
                 command.env("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", value);
             }
             let output = command.output().expect("invariant: sous-processus de test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Un filtre --exact périmé lancerait 0 test avec un code de sortie nul.
             assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }

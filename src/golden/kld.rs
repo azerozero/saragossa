@@ -251,7 +251,7 @@ fn compare_gemma4_long_reference(name: &str, resident: bool) -> TestResult {
 macro_rules! long_oracle {
     ($test:ident, $name:literal, $resident:literal) => {
         #[test]
-        #[ignore = "oracle MLX long q4a8-ls : poids locaux et verrou GPU, borne >= 4100"]
+        #[ignore = "oracle MLX long q4a8-ls : poids locaux et verrou GPU, borne >= 4100 ; échec top-1 connu à 4100 sur les deux chemins (docs/perf/gemma4-prefill.md)"]
         fn $test() -> TestResult {
             compare_gemma4_long_reference($name, $resident)
         }
