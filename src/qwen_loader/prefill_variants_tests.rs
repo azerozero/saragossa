@@ -17,8 +17,9 @@ fn qwen_moe_prefill_variants_greedy_identity() -> Result<()> {
         crate::runtime_flags::gated_delta_nax_hv32_enabled(),
         "SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1 et NAX linéaire requis"
     );
-    let path = std::env::var_os("SARAGOSSA_TEST_PREFILL_MODEL")
-        .expect("invariant: SARAGOSSA_TEST_PREFILL_MODEL doit désigner le modèle local");
+    let path = std::env::var_os("SARAGOSSA_TEST_PREFILL_MODEL").expect(
+        "précondition du test ignoré : SARAGOSSA_TEST_PREFILL_MODEL doit désigner le modèle local",
+    );
     let assets = ModelAssets::load_local(std::path::Path::new(&path))?;
     let executor = crate::MetalExecutor::new()?;
     let model =
@@ -31,7 +32,8 @@ fn qwen_moe_prefill_variants_greedy_identity() -> Result<()> {
         .unwrap_or(32);
     assert!(steps > 0);
     let text = match std::env::var_os("SARAGOSSA_TEST_PREFILL_PROMPT") {
-        Some(path) => std::fs::read_to_string(path).expect("invariant: corpus demandé lisible"),
+        Some(path) => std::fs::read_to_string(path)
+            .expect("précondition du test ignoré : corpus demandé lisible"),
         None => {
             "Explique les invariants de sécurité mémoire en Rust et donne un exemple de fonction. "
                 .into()

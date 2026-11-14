@@ -826,7 +826,7 @@ impl MetalExecutor {
                 GATED_DELTA_NAX_HK16_HV32,
             );
             if pipeline.is_none() {
-                eprintln!("gated delta NAX indisponible : repli chunk-delta");
+                eprintln!("gated delta NAX hv32 indisponible : repli séquentiel");
             }
             pipeline
         } else {
