@@ -397,6 +397,10 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_qmv_fast_aligned_u3_gs64_f32")?;
         let affine_qmv_fast_u4_gs64_align64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_u4_gs64_align64_f32")?;
+        let affine_qmv_fast_u5_gs64_f32 =
+            pipeline(&library, &device, "affine_qmv_fast_u5_gs64_f32")?;
+        let affine_qmv_fast_aligned_u5_gs64_f32 =
+            pipeline(&library, &device, "affine_qmv_fast_aligned_u5_gs64_f32")?;
         let affine_qmv_fast_u6_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_u6_gs64_f32")?;
         let affine_qmv_fast_aligned_u6_gs64_f32 =
@@ -856,6 +860,8 @@ impl MetalExecutor {
             affine_qmv_fast_aligned_u4_gs64_residual_f32,
             affine_qmv_fast_aligned_u3_gs64_f32,
             affine_qmv_fast_u4_gs64_align64_f32,
+            affine_qmv_fast_u5_gs64_f32,
+            affine_qmv_fast_aligned_u5_gs64_f32,
             affine_qmv_fast_u6_gs64_f32,
             affine_qmv_fast_aligned_u6_gs64_f32,
             affine_qmm_batched_u6_gs64_f32,

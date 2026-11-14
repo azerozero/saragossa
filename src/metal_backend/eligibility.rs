@@ -93,6 +93,18 @@ pub(super) fn can_use_fast_affine_qmv_shape(
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
+pub(super) fn can_use_fast_affine_qmv_u5(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_fast_affine_qmv_u5_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
+        && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
 pub(super) fn can_use_fast_affine_qmv_u6(
     batch: usize,
     in_dim: usize,
@@ -678,6 +690,22 @@ pub(super) fn can_use_fast_affine_qmm2_u3_buffers(
     bits: usize,
 ) -> bool {
     batch == 2 && can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, group_size, bits)
+}
+
+/// Le flux MLX u5 traverse les mots u32 ; gs64 garantit dix mots par groupe.
+pub(super) fn can_use_fast_affine_qmv_u5_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    fast_affine_qmv_enabled(out_dim)
+        && batch > 0
+        && in_dim > 0
+        && bits == FAST_QMV_U5_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % FAST_QMV_GROUP_SIZE == 0
 }
 
 /// Prédicat du qmv 6-bit gs64 pour le talker TTS : même contrat de buffers que

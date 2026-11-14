@@ -14,6 +14,7 @@ pub(super) enum AffineMatmulKernel {
     FastQmvU4Align64,
     FastQmvU2,
     FastQmvU3,
+    FastQmvU5,
     FastQmvU6,
     QmmBatchedU6,
     FastQmvOneU8,
@@ -207,6 +208,8 @@ impl MetalExecutor {
             AffineMatmulKernel::FastQmvU2
         } else if can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::FastQmvU3
+        } else if can_use_fast_affine_qmv_u5_buffers(batch, in_dim, out_dim, group_size, bits) {
+            AffineMatmulKernel::FastQmvU5
         } else if can_use_fast_affine_qmv_u6_buffers(batch, in_dim, out_dim, group_size, bits) {
             select_u6_matmul_kernel(batch, qmm_u6_enabled())
         } else if can_use_fast_affine_qmv_one_u8_buffers(batch, in_dim, out_dim, group_size, bits) {
@@ -285,6 +288,8 @@ impl MetalExecutor {
             AffineMatmulKernel::FastQmvU2
         } else if can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvU3
+        } else if can_use_fast_affine_qmv_u5(batch, in_dim, weight) {
+            AffineMatmulKernel::FastQmvU5
         } else if can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
             select_u6_matmul_kernel(batch, qmm_u6_enabled())
         } else if can_use_fast_affine_qmv_one_u8(batch, in_dim, weight) {

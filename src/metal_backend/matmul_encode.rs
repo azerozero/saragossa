@@ -1014,6 +1014,71 @@ impl MetalExecutor {
         Ok(())
     }
 
+    pub(super) fn encode_affine_qmv_u5_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
+        scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
+        biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        packed_cols: usize,
+        groups: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(out_dim, "qmv u5 out_dim")?,
+            checked_u32(in_dim, "qmv u5 in_dim")?,
+            checked_u32(packed_cols, "qmv u5 packed_cols")?,
+            checked_u32(groups, "qmv u5 groups")?,
+        ];
+        let (pipeline, profile_label, kernel_name) = if out_dim % 2 == 0 {
+            (
+                &self.affine_qmv_fast_aligned_u5_gs64_f32,
+                "affine_qmv_u5_aligned_gs64",
+                "affine_qmv_fast_aligned_u5_gs64_f32",
+            )
+        } else {
+            (
+                &self.affine_qmv_fast_u5_gs64_f32,
+                "affine_qmv_u5_tail_gs64",
+                "affine_qmv_fast_u5_gs64_f32",
+            )
+        };
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, &dims, "qmv_u5_dims")?;
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            profile_label,
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_U5_BITS,
+        ));
+        trace_dispatch_path(kernel_name, batch, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch, "qmv u5 batch")?,
+                checked_nsuint(out_dim.div_ceil(2), "qmv u5 out groups")?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
+    }
+
     pub(super) fn encode_affine_qmv_u6_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,

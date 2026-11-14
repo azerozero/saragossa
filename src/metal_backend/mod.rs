@@ -42,6 +42,7 @@ const MOE_COOP_TILED_BM: usize = 32;
 const MOE_COOP_TILE_M: usize = 16;
 const FAST_QMV_U2_BITS: usize = 2;
 const FAST_QMV_U3_BITS: usize = 3;
+const FAST_QMV_U5_BITS: usize = 5;
 const FAST_QMV_U6_BITS: usize = 6;
 /// Synchronisé avec `U6_QMM_MAX_BATCH` pour découper les lots sans dépassement.
 const U6_QMM_BATCH_TILE: usize = 8;
@@ -226,6 +227,8 @@ pub struct MetalExecutor {
     affine_qmv_fast_aligned_u4_gs64_residual_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmv_fast_u4_gs64_align64_f32: ComputePipelineState,
+    affine_qmv_fast_u5_gs64_f32: ComputePipelineState,
+    affine_qmv_fast_aligned_u5_gs64_f32: ComputePipelineState,
     affine_qmv_fast_u6_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u6_gs64_f32: ComputePipelineState,
     affine_qmm_batched_u6_gs64_f32: ComputePipelineState,

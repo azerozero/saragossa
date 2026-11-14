@@ -1018,6 +1018,90 @@ kernel void affine_qmv_fast_u4_gs64_align64_f32(
     }
 }
 
+// NOTE: MLX compacte huit codes u5 sur cinq octets LSB-first sans padding.
+// Les codes à cheval sur deux u32 doivent conserver leurs bits de poids fort.
+static inline uint unpack_u5_affine(device const uint* packed, uint packed_cols, uint row_base, uint col) {
+    const uint bit_offset = col * 5u;
+    const uint word_col = bit_offset / 32u;
+    const uint shift = bit_offset - (word_col * 32u);
+    uint q = packed[row_base + word_col] >> shift;
+    if ((shift + 5u) > 32u && (word_col + 1u) < packed_cols) {
+        q |= packed[row_base + word_col + 1u] << (32u - shift);
+    }
+    return q & 0x1fu;
+}
+
+kernel void affine_qmv_fast_u5_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint row = tile.y * 2u + simd_gid;
+    const uint b = tile.x;
+    if (row >= out_dim) {
+        return;
+    }
+
+    const uint row_base = row * packed_cols;
+    float acc = 0.0f;
+    for (uint col = simd_lid; col < in_dim; col += 32u) {
+        const uint q = unpack_u5_affine(packed, packed_cols, row_base, col);
+        const uint group = min(col / 64u, groups - 1u);
+        const uint affine_index = row * groups + group;
+        const float scale = scales[affine_index];
+        const float bias = biases[affine_index];
+        acc += lhs[b * in_dim + col] * ((float(q) * scale) + bias);
+    }
+    acc = simd_sum(acc);
+    if (simd_lid == 0u) {
+        out[b * out_dim + row] = acc;
+    }
+}
+
+kernel void affine_qmv_fast_aligned_u5_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint row = tile.y * 2u + simd_gid;
+    const uint b = tile.x;
+
+    const uint row_base = row * packed_cols;
+    float acc = 0.0f;
+    for (uint col = simd_lid; col < in_dim; col += 32u) {
+        const uint q = unpack_u5_affine(packed, packed_cols, row_base, col);
+        const uint group = min(col / 64u, groups - 1u);
+        const uint affine_index = row * groups + group;
+        const float scale = scales[affine_index];
+        const float bias = biases[affine_index];
+        acc += lhs[b * in_dim + col] * ((float(q) * scale) + bias);
+    }
+    acc = simd_sum(acc);
+    if (simd_lid == 0u) {
+        out[b * out_dim + row] = acc;
+    }
+}
+
 static inline uint unpack_u6_affine(device const uint* packed, uint packed_cols, uint row_base, uint col) {
     const uint bit_offset = col * 6u;
     const uint word_col = bit_offset / 32u;
