@@ -248,12 +248,41 @@ fn qmm_na_dequant_budget_preserves_qmv_fallback() -> Result<()> {
     const CHILD: &str = "SARAGOSSA_TEST_DEQUANT_BUDGET";
     if let Ok(cap) = std::env::var(CHILD) {
         let cap: usize = cap.parse().expect("test cap");
-        let weight = test_affine_varied_u8_group(64, 512, 64)?;
-        assert_eq!(can_use_qmm_na_u8(32, 512, &weight), cap >= 65536);
-        if let Some(executor) = test_executor()? {
-            if executor.na_gemm_bf16.is_some() {
+        let executor = test_executor()?;
+        for (weight, fallback) in [
+            (test_affine_varied_u5(64, 512)?, AffineMatmulKernel::FastQmvU5),
+            (test_affine_varied_u6(64, 512)?, AffineMatmulKernel::FastQmvU6),
+            (test_affine_varied_u8_group(64, 512, 64)?, AffineMatmulKernel::FastQmvU8),
+        ] {
+            assert_eq!(can_use_qmm_na_dequant(32, 512, &weight), cap >= 65536);
+            if let Some(executor) = &executor {
+                let uses_na = cap >= 65536 && executor.na_gemm_bf16.is_some();
                 assert_eq!(executor.select_owned_affine_matmul_kernel(32, 512, &weight, false),
-                    if cap >= 65536 { AffineMatmulKernel::QmmNaU8 } else { AffineMatmulKernel::FastQmvU8 });
+                    if uses_na { AffineMatmulKernel::QmmNaDequant } else { fallback });
+                if cap < 65536 {
+                    // Le repli exécute qmv sans scratch de déquantification.
+                    let (_, trace) = offset_dispatch(executor, &weight, 32, false)?;
+                    assert!(trace.iter().any(|v| v.contains("qmv")));
+                    assert!(!trace.iter().any(|v| v.contains("dequant") || v.contains("gemm_nax")));
+
+                    // Forcer le chemin NA contourne le sélecteur, pas sa borne dure.
+                    let lhs = executor.uncached_f32_buffer(32 * 512, "budget_lhs")?;
+                    let output = executor.upload_f32_buffer(&vec![-12345.0; 32 * 64], "budget_out")?;
+                    let mut scratch = Vec::new();
+                    let cb = executor.queue.new_command_buffer();
+                    let encoder = cb.new_compute_command_encoder();
+                    let previous = OFFSET_TEST_KERNEL.with(|v| v.replace(Some(AffineMatmulKernel::QmmNaDequant)));
+                    let result = executor.encode_matmul_weight(
+                        encoder, &mut scratch, &lhs, 32, 512,
+                        &LinearWeight::AffineQuantized(weight), &output,
+                    );
+                    OFFSET_TEST_KERNEL.with(|v| v.set(previous));
+                    encoder.end_encoding();
+                    assert!(matches!(result, Err(InferError::Config(message)) if message.contains("plafond de déquantification")));
+                    assert!(scratch.is_empty());
+                    commit_and_wait(cb)?;
+                    assert_eq!(read_f32_buffer(&output, 32 * 64)?, vec![-12345.0; 32 * 64]);
+                }
             }
         }
         return Ok(());
@@ -268,6 +297,9 @@ fn qmm_na_dequant_budget_preserves_qmv_fallback() -> Result<()> {
             .env("SARAGOSSA_RUST_QMM_NA_MIN_BATCH", "32")
             .env("SARAGOSSA_RUST_QMM_NA_FUSED_TILED", "0")
             .env("SARAGOSSA_RUST_QMV_FAST", "1")
+            .env("SARAGOSSA_RUST_QMV_U5", "1")
+            .env("SARAGOSSA_RUST_QMV_U6", "1")
+            .env("SARAGOSSA_RUST_QMM_U6", "0")
             .output().expect("run budget regression");
         assert!(output.status.success(), "cap={cap}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     }

@@ -1,5 +1,6 @@
 //! Flags runtime du backend Metal.
 
+pub(super) use crate::runtime_flags::qmv_u5_enabled;
 use crate::runtime_flags::{env_flag, gather_fast_mode, qmv_fast_mode};
 
 use super::*;
