@@ -66,8 +66,8 @@ pub(crate) fn prefill_fused_mlp_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_FUSED_MLP", true))
 }
 
-/// Active la linear-attn gated-delta en forme CHUNKÉE (port chunked-DeltaNet) au lieu
-/// du séquentiel token-par-token. Opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`. Exige head_dim=128.
+/// Flag historique retiré. Une demande `SARAGOSSA_RUST_LINEAR_CHUNKED=1`
+/// est refusée par les encodeurs batch : garder le NAX ou le scan par défaut.
 pub(crate) fn linear_chunked_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_CHUNKED", false))

@@ -420,8 +420,6 @@ pub struct MetalExecutor {
     na_gemm_bf16: Option<ComputePipelineState>,
     /// Variante encodeur Whisper plus proche du tiling MLX Steel NAX (BN=128).
     na_gemm_bf16_bn128: Option<ComputePipelineState>,
-    pub(super) chunk_delta_seq_layout: Option<ComputePipelineState>,
-    pub(super) chunk_delta_seq_layout_tc: Option<ComputePipelineState>,
     /// Gated delta NAX de MLX (27B : 16/48 têtes, dk = dv = 128).
     pub(super) gated_delta_nax_hk16_hv48: Option<ComputePipelineState>,
     na_gemm_coop_qb: Option<ComputePipelineState>,

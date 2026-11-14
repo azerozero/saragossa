@@ -796,8 +796,6 @@ impl MetalExecutor {
         let compile_na = |name: &str| compile_na_gemm_named(&device, na_source, name);
         let na_gemm_bf16 = compile_na_gemm(&device, na_source);
         let na_gemm_bf16_bn128 = compile_na("gemm_nax_bf16_bn128");
-        let chunk_delta_seq_layout = compile_na("chunk_delta_seq_layout");
-        let chunk_delta_seq_layout_tc = compile_na("chunk_delta_seq_layout_tc");
         let gated_delta_nax_hk16_hv48 = if crate::runtime_flags::prefill_linear_nax_enabled() {
             let pipeline = compile_gated_delta_nax(&device, GATED_DELTA_NAX_KERNELS);
             if pipeline.is_none() {
@@ -1017,8 +1015,6 @@ impl MetalExecutor {
             dequant_u8_to_bf16_t_gs64,
             na_gemm_bf16,
             na_gemm_bf16_bn128,
-            chunk_delta_seq_layout,
-            chunk_delta_seq_layout_tc,
             gated_delta_nax_hk16_hv48,
             na_gemm_coop_qb,
             na_gemm_coop_qb_gs128,

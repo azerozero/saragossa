@@ -367,6 +367,11 @@ uses the default. Fused NA kernels do not materialize that weight and keep
 their existing selection rules. This currently applies to `QmmNaU8`; u5/u6
 have no full-weight NA dequantization path in this revision.
 
+The retired experimental `SARAGOSSA_RUST_LINEAR_CHUNKED=1` path now returns
+an explicit configuration error: its scalar and tensor-core kernels had
+unsafe decay ratios, tail reads and device synchronization. Remove the flag
+to keep the existing NAX/sequence-scan selection; no default path changes.
+
 ## Features
 
 | Feature | Default | Purpose |

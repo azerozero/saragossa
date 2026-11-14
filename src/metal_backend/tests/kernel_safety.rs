@@ -319,3 +319,32 @@ fn whisper_vec64_supported_threadgroup_matches_exact_oracle() -> Result<()> {
     assert_eq!(read_f32_buffer(&out, 64)?, vec![1.0; 64]);
     Ok(())
 }
+
+#[test]
+fn legacy_chunked_path_is_rejected_without_state_mutation() -> Result<()> {
+    let Some(executor) = test_executor()? else { return Ok(()); };
+    for steps in [1usize, 15, 16, 17] {
+        for decay in [0.0, 1.0e-6, 0.9] {
+            let data = executor.buffer_from_slice(&vec![0.0f32; steps * 384], "chunk_input")?;
+            let gates = executor.buffer_from_slice(&vec![decay; steps], "chunk_decay")?;
+            let state = executor.buffer_from_slice(&vec![1.0f32; 128 * 128], "chunk_state")?;
+            let out = executor.buffer_from_slice(&vec![123.0f32; steps * 128], "chunk_out")?;
+            let cb = executor.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            let result = executor.encode_chunk_delta_seq_layout(
+                enc, &data, &data, &data, &gates, &gates, &state, &out, steps,
+                LinearAttentionStepSpec {
+                    num_key_heads: 1, num_value_heads: 1, key_head_dim: 128,
+                    value_head_dim: 128, conv_kernel_dim: 4, rms_eps: 1.0e-6,
+                    l2_qk_sigmoid_gate: false,
+                },
+            );
+            enc.end_encoding();
+            assert!(matches!(result, Err(InferError::Config(message)) if message.contains("LINEAR_CHUNKED") && message.contains("retiré")), "steps={steps}, decay={decay}");
+            commit_and_wait(cb)?;
+            assert_eq!(read_f32_buffer(&state, 128 * 128)?, vec![1.0; 128 * 128]);
+            assert_eq!(read_f32_buffer(&out, steps * 128)?, vec![123.0; steps * 128]);
+        }
+    }
+    Ok(())
+}
