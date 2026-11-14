@@ -1652,6 +1652,15 @@ pub(crate) fn attention_parallel_threshold() -> usize {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
+/// Active les kernels QMV u5 gs64 alignés et tail. Défaut ON ;
+/// `SARAGOSSA_RUST_QMV_U5=0` rétablit le QMV générique, comme le kill-switch u6.
+/// Lu une fois au premier usage. Le prefill NA garde son flag `SARAGOSSA_RUST_QMM_NA`.
+pub(crate) fn qmv_u5_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMV_U5", true))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn qmv_fast_mode() -> Option<&'static str> {
     static MODE: OnceLock<Option<String>> = OnceLock::new();
     MODE.get_or_init(|| crate::runtime_flags::env_var("SARAGOSSA_RUST_QMV_FAST"))

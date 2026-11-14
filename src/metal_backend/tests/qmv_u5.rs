@@ -35,7 +35,7 @@ fn test_affine_varied_u5(out_dim: usize, in_dim: usize) -> Result<AffineQuantize
 fn affine_qmv_u5_eligibility_without_device() -> Result<()> {
     for (batch, in_dim, out_dim) in [(1, 64, 1), (2, 128, 2), (3, 192, 13), (1, 512, 64)] {
         let weight = test_affine_varied_u5(out_dim, in_dim)?;
-        let enabled = fast_affine_qmv_enabled(out_dim);
+        let enabled = qmv_u5_enabled() && fast_affine_qmv_enabled(out_dim);
         assert_eq!(can_use_fast_affine_qmv_u5(batch, in_dim, &weight), enabled);
         assert_eq!(
             can_use_fast_affine_qmv_u5_buffers(batch, in_dim, out_dim, 64, 5),
@@ -57,6 +57,36 @@ fn affine_qmv_u5_eligibility_without_device() -> Result<()> {
         assert!(!can_use_fast_affine_qmv_u5_buffers(
             batch, in_dim, 13, group_size, bits
         ));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "device Metal requis : routage du kill-switch u5, sans modèle"]
+fn affine_qmv_u5_runtime_flag_routes() -> Result<()> {
+    // Relancer dans deux processus avec SARAGOSSA_RUST_QMV_U5=0 puis =1 :
+    // le OnceLock de production doit être lu, sans override de test.
+    let executor = MetalExecutor::new()?;
+    for (n, k) in [(13, 192), (64, 512)] {
+        let weight = test_affine_varied_u5(n, k)?;
+        let enabled = qmv_u5_enabled() && fast_affine_qmv_enabled(n);
+        assert_eq!(
+            executor.select_owned_affine_matmul_kernel(1, k, &weight, false),
+            if enabled { AffineMatmulKernel::FastQmvU5 } else { AffineMatmulKernel::Fallback }
+        );
+        let input = Tensor::row(varied_row(k, 53))?;
+        let cpu = input.matmul_rhs_t(&weight.dequantize()?)?;
+        let direct = executor.matmul_rhs_t_affine(&input, &weight)?;
+        let linear = LinearWeight::AffineQuantized(weight);
+        let (owned, resident) = routed_affine_outputs(
+            &executor, &linear, input.data(), 1, "qmv_u5_flag",
+        )?;
+        for actual in [direct.data(), &owned, &resident] {
+            assert_all_close_scaled(actual, cpu.data(), "qmv u5 flag/CPU");
+            if !enabled {
+                assert_bits_equal(actual, direct.data(), "qmv u5 repli générique");
+            }
+        }
     }
     Ok(())
 }

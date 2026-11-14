@@ -1494,7 +1494,6 @@ impl MetalExecutor {
         set_u32_bytes(encoder, 4, &dims, "dequant_na_dims")?;
         trace_dispatch_path(name, out_dim, in_dim, packed_cols);
         self.dispatch_1d(encoder, pipeline, total)?;
-        post_dispatch_barrier_buffer(encoder, wt);
         Ok(())
     }
 

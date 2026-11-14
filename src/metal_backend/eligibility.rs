@@ -701,7 +701,8 @@ pub(super) fn can_use_fast_affine_qmv_u5_buffers(
     group_size: usize,
     bits: usize,
 ) -> bool {
-    fast_affine_qmv_enabled(out_dim)
+    qmv_u5_enabled()
+        && fast_affine_qmv_enabled(out_dim)
         && batch > 0
         && in_dim > 0
         && bits == FAST_QMV_U5_BITS
