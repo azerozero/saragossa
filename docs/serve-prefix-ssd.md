@@ -93,12 +93,23 @@ prompts, à conserver dans un emplacement privé choisi par l'opérateur.
 Un seul instantané est admis entre le début de sa préparation et sa publication.
 Avant toute copie ou blit, le moteur estime les blobs (KV, récurrence, historique
 MTP et captures) et leur mémoire temporaire. Il refuse une estimation dépassant
-le budget SSD, l'espace libre actuel ou `SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB`
-(512 Mio par défaut, entier strictement positif). Ce plafond RAM inclut une
+le budget SSD, l'espace libre actuel ou le plafond RAM de staging. Par défaut,
+ce dernier vaut **un quart de la RAM physique**, ou un quart de
+`SARAGOSSA_SERVE_MEMORY_CAP_BYTES` si ce budget explicite est inférieur.
+Si seule une de ces valeurs est connue, elle sert de base ; si aucune n'est
+connue, le repli est 512 Mio. Sur une machine de 128 Gio sans budget explicite,
+le plafond est donc **32 Gio** : il admet les instantanés d'environ 5,3 Go à
+32k tokens et 21,2 Go à 128k, avec leurs temporaires. Un seul staging peut
+occuper ce quart ; le reste demeure disponible pour les autres états moteur.
+`SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB` remplace ce calcul (Mio entiers
+strictement positifs), par exemple `SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB=32768`
+fixe 32 Gio. Ce plafond RAM inclut une
 marge conservatrice de 128 Mio pour les manifestes et métadonnées, ainsi que
 les copies temporaires Metal ; le majorant disque réserve 16 Mio de manifeste.
 Une réservation `MemoryGuard` avec les limites de `serve` reste détenue jusqu'à
-la fin du travail du worker. **La copie admise reste synchrone**. Le contrôle
+la fin du travail du worker. Le plafond de staging ne garantit donc pas
+l'admission si l'empreinte du processus laisse trop peu de mémoire disponible,
+même avec un réglage explicite élevé. **La copie admise reste synchrone**. Le contrôle
 d'espace libre est préventif : une écriture concurrente externe peut encore
 faire échouer la publication.
 Le worker calcule les sommes de contrôle et réalise toutes les écritures de
@@ -147,10 +158,11 @@ cargo build --release --example prefix_ssd
 
 Mesure à **32768 et 131072 tokens exacts** sur le modèle local choisi, sous le
 verrou GPU du dépôt (aucun téléchargement). Définir `MODEL` sur le répertoire
-Qwen3.8-27B-u4ls local. Ces contextes peuvent dépasser le staging par défaut :
-fixer `SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB` dans l'environnement de mesure
-selon la RAM disponible et vérifier `prefix_ssd written` avant d'interpréter
-une reprise. La garde mémoire reste applicable même avec un plafond relevé.
+Qwen3.8-27B-u4ls local. Le staging par défaut sur 128 Gio couvre ces tailles ;
+sur une machine plus petite ou avec un budget mémoire réduit, ajuster au besoin
+`SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB` selon la mémoire disponible.
+Vérifier `prefix_ssd written` avant d'interpréter une reprise. La garde mémoire
+reste applicable même avec un plafond relevé.
 Le dossier de sortie doit être nouveau :
 
 ```sh
@@ -166,7 +178,9 @@ python3 -I -B tools/gpulock.py run --owner prefix-ssd --prio 10 -- \
 Le script démarre trois processus par longueur : sans SSD, SSD vide, puis
 relecture après redémarrage. Il exige l'égalité exacte des 32 identifiants
 produits et une réutilisation dans la phase chaude. Il conserve les JSON et
-journaux, affiche prefill, prefill avec staging, reload et ratio. Les fichiers
+journaux, affiche prefill, prefill avec staging, reload et ratio. Si le binaire
+échoue, le script affiche aussi son journal (stdout et stderr) sur stderr,
+avec la longueur, la phase et le chemin du journal. Les fichiers
 SSD temporaires sont supprimés ensuite. L'oracle MTP désactive un drafter
 DFlash implicite pour mesurer l'historique MTP. Aucun gain sur le vrai modèle
 n'est présumé par les tests synthétiques.

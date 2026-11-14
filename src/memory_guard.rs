@@ -630,17 +630,17 @@ fn host_memory_cap_bytes() -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn host_memory_bytes() -> Option<u64> {
+pub(crate) fn host_memory_bytes() -> Option<u64> {
     command_stdout("sysctl", &["-n", "hw.memsize"]).and_then(|text| text.trim().parse().ok())
 }
 
 #[cfg(target_os = "linux")]
-fn host_memory_bytes() -> Option<u64> {
+pub(crate) fn host_memory_bytes() -> Option<u64> {
     proc_kib_field(&fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn host_memory_bytes() -> Option<u64> {
+pub(crate) fn host_memory_bytes() -> Option<u64> {
     None
 }
 

@@ -504,6 +504,60 @@ fn concurrent_producers_admit_only_one_snapshot() {
 }
 
 #[test]
+fn default_staging_admits_32k_and_128k_on_128_gib_host() {
+    // Tailles seules : aucune allocation de plusieurs Gio ni accès GPU.
+    let host = 128 << 30;
+    let staging = crate::runtime_flags::prefix_ssd_staging_bytes(None, Some(host), None).unwrap();
+    assert_eq!(staging, 32 << 30);
+    let guard = crate::memory_guard::MemoryGuard::from_limits(
+        true,
+        crate::memory_guard::MemoryLimits {
+            static_cap: Some(host * 9 / 10),
+            host_memory: Some(host),
+            headroom_bytes: 2 << 30,
+            metal_cap: None,
+        },
+        Arc::new(|| Some(48 << 30)),
+    );
+    for scale in [1, 4] {
+        // 5,3 Gio à 32k, puis quatre fois plus à 128k ; inclure la marge
+        // manifeste et 1 Gio de temporaires supplémentaires dans le pic RAM.
+        let blobs = (53 * (1u64 << 30) / 10) * scale;
+        let disk = blobs + MAX_MANIFEST_BYTES + 64;
+        let ram = blobs + MAX_MANIFEST_BYTES * 8 + (1 << 30);
+        assert!(check_staging_limits(disk, ram, 32 << 30, staging, 64 << 30).is_ok());
+        let reservation = guard.reserve_allocation(ram).unwrap();
+        drop(reservation);
+    }
+    assert!(check_staging_limits(1, staging + 1, 32 << 30, staging, 64 << 30).is_err());
+}
+
+#[test]
+fn staging_budget_respects_memory_cap_override_and_fallback() {
+    use crate::runtime_flags::prefix_ssd_staging_bytes as limit;
+    assert_eq!(
+        limit(None, Some(128 << 30), Some(64 << 30)).unwrap(),
+        16 << 30
+    );
+    assert_eq!(
+        limit(None, Some(128 << 30), Some(256 << 30)).unwrap(),
+        32 << 30
+    );
+    assert_eq!(limit(None, None, Some(64 << 30)).unwrap(), 16 << 30);
+    assert_eq!(limit(None, None, None).unwrap(), 512 << 20);
+    let explicit = limit(Some("512"), Some(128 << 30), None).unwrap();
+    assert_eq!(explicit, 512 << 20);
+    assert!(check_staging_limits(5 << 30, 6 << 30, 32 << 30, explicit, 64 << 30).is_err());
+    assert_eq!(
+        limit(Some("32768"), Some(16 << 30), Some(8 << 30)).unwrap(),
+        32 << 30
+    );
+    for invalid in ["0", "", "-1", "abc", "18446744073709551615"] {
+        assert!(limit(Some(invalid), Some(128 << 30), None).is_err());
+    }
+}
+
+#[test]
 fn staging_limits_and_memory_guard_refuse_before_copy() {
     assert!(check_staging_limits(11, 20, 10, 30, 100).is_err());
     assert!(check_staging_limits(10, 20, 10, 30, 9).is_err());

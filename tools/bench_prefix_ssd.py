@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 
@@ -31,10 +32,21 @@ def main():
         with tempfile.TemporaryDirectory(prefix=f"ssd-{length}-", dir=args.output) as cache:
             for phase in ("baseline", "cold", "warm"):
                 output = args.output / f"{length}-{phase}.json"
-                with (args.output / f"{length}-{phase}.log").open("wb") as log:
-                    subprocess.run([str(args.binary.resolve()), str(args.model.resolve()), cache,
-                                    str(length), phase, args.mode, str(output.resolve())],
-                                   stdout=log, stderr=log, env=environment, check=True)
+                log_path = args.output / f"{length}-{phase}.log"
+                try:
+                    with log_path.open("wb") as log:
+                        subprocess.run([str(args.binary.resolve()), str(args.model.resolve()), cache,
+                                        str(length), phase, args.mode, str(output.resolve())],
+                                       stdout=log, stderr=log, env=environment, check=True)
+                except subprocess.CalledProcessError:
+                    print(f"Échec à {length} tokens ({phase}) ; journal : {log_path}",
+                          file=sys.stderr, flush=True)
+                    # Relire après fermeture pour inclure tout le stderr, sans
+                    # garder un journal potentiellement volumineux en mémoire.
+                    with log_path.open(encoding="utf-8", errors="replace") as log:
+                        for line in log:
+                            print(line, end="", file=sys.stderr)
+                    raise
                 reports.append(json.loads(output.read_text()))
             if not reports[0]["generated_tokens"] == reports[1]["generated_tokens"] == reports[2]["generated_tokens"]:
                 raise RuntimeError(f"divergence greedy à {length} tokens ; voir les JSON")

@@ -2776,15 +2776,38 @@ impl ServePrefixSsdOptions {
     }
 }
 
-/// Plafond RAM de préparation SSD, en Mio (512 par défaut), indépendant du disque.
+/// Plafond RAM de préparation SSD, indépendant du disque : un quart du minimum
+/// entre RAM physique et budget mémoire explicite de `serve` (512 Mio si tous
+/// deux sont inconnus). `SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB` le remplace en Mio.
+/// La garde mémoire vérifie séparément l'empreinte courante avant toute copie.
 ///
 /// # Errors
 /// Refuse une valeur nulle, mal formée ou dépassant la capacité en octets.
 pub fn serve_prefix_ssd_staging_bytes() -> crate::Result<u64> {
     let value = env_var("SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB");
+    prefix_ssd_staging_bytes(
+        value.as_deref(),
+        crate::memory_guard::host_memory_bytes(),
+        serve_memory_static_cap_bytes(),
+    )
+}
+
+/// Résout le plafond sans accéder à l'environnement ni sonder la machine.
+pub(crate) fn prefix_ssd_staging_bytes(
+    explicit_mib: Option<&str>,
+    host_bytes: Option<u64>,
+    serve_cap_bytes: Option<u64>,
+) -> crate::Result<u64> {
+    let Some(value) = explicit_mib else {
+        // Une seule copie en vol : réserver au plus un quart du budget de base
+        // laisse la majorité aux poids, au cache actif et au décodage.
+        return Ok(host_bytes
+            .into_iter()
+            .chain(serve_cap_bytes)
+            .min()
+            .map_or(512 << 20, |bytes| (bytes / 4).max(1)));
+    };
     let mib = value
-        .as_deref()
-        .unwrap_or("512")
         .parse::<u64>()
         .map_err(|_| crate::InferError::Config("staging SSD : entier invalide".into()))?;
     mib.checked_mul(1 << 20)
