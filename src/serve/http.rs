@@ -1495,25 +1495,30 @@ mod tests {
     }
 
     #[test]
-    fn chat_json_schema_response_format_returns_501() {
-        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
-        let mut state = ServeState::new(&args);
-        let body =
-            br#"{"model":"reti-35b","messages":[],"response_format":{"type":"json_schema"}}"#;
-        let raw = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            str::from_utf8(body).expect("invariant: JSON test UTF-8")
-        );
-        let mut stream = Cursor::new(raw.into_bytes());
-
-        let error = handle_connection(&mut stream, &mut state, None, far_deadline())
-            .expect_err("invariant: json_schema refusé");
-
-        assert!(error.to_string().contains("json_schema"));
-        let response = String::from_utf8(stream.into_inner()).expect("invariant: réponse UTF-8");
-        assert!(response.contains("HTTP/1.1 501 Not Implemented"));
-        assert!(response.contains("json_schema"));
+    fn chat_json_schema_invalid_requests_return_400_before_model_loading() {
+        for format in [
+            serde_json::json!({"type":"json_schema"}),
+            serde_json::json!({"type":"json_schema", "json_schema":{"name":"x", "schema":{"type":"object", "required":42}}}),
+            serde_json::json!({"type":"json_schema", "json_schema":{"name":"x", "schema":{"type":"object", "properties":{"x":{"minimum":0}}}}}),
+            serde_json::json!({"type":"json_schema", "json_schema":{"name":"x", "schema":{"type":"object"}, "strict":"true"}}),
+        ] {
+            let args = ServeArgs::parse(Vec::<String>::new()).expect("args");
+            let mut state = ServeState::new(&args);
+            let body =
+                serde_json::json!({"model":"missing", "messages":[], "response_format":format})
+                    .to_string();
+            let raw = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let mut stream = Cursor::new(raw.into_bytes());
+            handle_connection(&mut stream, &mut state, None, far_deadline())
+                .expect_err("schema refused");
+            let response = String::from_utf8(stream.into_inner()).expect("UTF-8");
+            assert!(response.contains("HTTP/1.1 400 Bad Request"), "{response}");
+            assert!(!response.contains("modèle inconnu"), "{response}");
+        }
     }
 
     #[test]

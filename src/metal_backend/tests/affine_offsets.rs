@@ -142,6 +142,9 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
         (QmvT, 4, 64, 3, 65536, 512),
         (QmvT, 4, 64, 16, 64, 512),
         (Skinny, 4, 64, 7, 64, 512),
+        (Skinny, 3, 64, 7, 64, 512),
+        (Skinny, 3, 64, 9, 96, 1536),
+        (Skinny, 2, 64, 7, 64, 512),
         (QmmNaFusedTiledU4, 4, 64, 17, 2048, 2048),
         (QmmNaFusedTiledU4, 4, 64, 17, 64, 512),
         (QmmNaFusedTiledU4Align64, 4, 64, 17, 64, 576),
@@ -227,7 +230,7 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
                     );
                 }
             }
-            if matches!(kernel, QmmBatchedU6 | FastQmvU5 | FastQmvU6 | QmmNaDequant) {
+            if matches!(kernel, QmmBatchedU6 | FastQmvU5 | FastQmvU6 | QmmNaDequant | Skinny) {
                 // Alignement minimal uint/bfloat, sans alignement vectoriel.
                 let shifted = offset_weight(&metal, &weight, [4, 2, 6], 0xdead)?;
                 assert_eq!(offset_dispatch(&metal, &shifted, m, resident)?, reference);
