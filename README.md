@@ -189,8 +189,7 @@ into shared Metal buffers, one copy. See
 ### Homebrew (Apple Silicon)
 
 ```sh
-brew install azerozero/tap/saragossa          # latest tagged release (stable)
-# brew install --HEAD azerozero/tap/saragossa # build from the main branch
+brew install azerozero/tap/saragossa # prebuilt binary from the latest stable release
 ```
 
 ### From source
