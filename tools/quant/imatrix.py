@@ -100,13 +100,16 @@ def load_bf16(path):
 
 
 @contextmanager
-def capture_calls(modules, observe):
+def capture_calls(modules, observe, with_call_args=False):
     """Patch temporaire de __call__ sur les classes : Python ignore celui d'une instance."""
     names = {id(module): name for name, module in modules.items()}
     def hook(original):
         def call(module, x, *args, **kwargs):
             if id(module) in names:
-                observe(names[id(module)], x)
+                if with_call_args:
+                    observe(names[id(module)], x, *args, **kwargs)
+                else:
+                    observe(names[id(module)], x)
             return original(module, x, *args, **kwargs)
         return call
     with ExitStack() as stack:

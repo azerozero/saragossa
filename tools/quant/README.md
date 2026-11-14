@@ -10,11 +10,94 @@ fabriquer des poids, pas à les exécuter.
 | `kl_eval.py` | Mesure KL(bf16 ‖ quantifié) et l'accord top-1, en teacher forcing |
 | `test_allocation.py` | Tests de la logique d'allocation, sans dépendance à MLX |
 | `convert_ls.py` | Re-quantifie en affine gs64 (3/4/5/6/8 bits, selon le template) par moindres carrés, éventuellement pondérés par l'imatrix |
+| `gptq.py` | Quantification de second ordre, Hessienne complète par module/expert, mêmes largeurs et format que le template |
+| `gptq_capture.py` | Collecte des Hessiennes par lots bornés, routage MoE trié ou non trié |
+| `test_gptq.py` | Auto-tests stdlib et tests CPU GPTQ, MoE, GatedDeltaNet et checkpoint miniature |
 | `opt_quant.py` | Ajustement d'échelle et de biais par groupe utilisé par `convert_ls.py` |
 | `imatrix.py` | Capture BF16 de E[x²] par canal d'entrée, corpus indépendant |
 | `sensitivity.py` | Allocation calibrée 3/4/5/6/8 bits sous budget réel, appelée par `mixed_quant.py` |
 | `test_quant.py` | Auto-tests stdlib et contrôle facultatif MLX CPU sur de petits tenseurs |
 | `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) |
+
+## Qwen3.8-27B : alternative GPTQ à 4,2 bpw
+
+GPTQ collecte `H = XᵀX / N` sur les entrées BF16, puis quantifie colonne par
+colonne en compensant l'erreur dans les colonnes restantes avec le facteur
+supérieur de `H⁻¹`. La normalisation par N ne change pas cette compensation.
+Aucune rétropropagation : les couches GatedDeltaNet restent compatibles.
+L'extraction, le mélange texte/chat et le refus des `PROMPTS` réservés sont
+ceux de `imatrix.py`.
+
+Avec `mlx` et `mlx-lm` compatibles avec `qwen3_5` dans l'environnement Python,
+depuis la racine (et des destinations encore inexistantes) :
+
+```bash
+MODEL_ROOT="/chemin/vers/modeles"
+SRC="$MODEL_ROOT/Qwen3.8-27B-BF16"
+CALIB="/chemin/vers/corpus-independant.txt"  # au moins 65 536 tokens
+IMATRIX="$MODEL_ROOT/qwen38-imatrix.safetensors"
+TEMPLATE="$MODEL_ROOT/Qwen3.8-27B-imatrix42-template"
+DST="$MODEL_ROOT/Qwen3.8-27B-GPTQ42"
+
+python3 -I -B tools/quant/test_gptq.py
+python3 -I -B tools/quant/test_gptq.py --mlx-cpu
+
+# Omettre cette collecte si une imatrix de même provenance existe déjà.
+python3 -I -B tools/quant/imatrix.py --model "$SRC" --calib "$CALIB" \
+    --out "$IMATRIX" --samples 128 --length 512 --chat
+python3 -I -B tools/quant/mixed_quant.py --input "$SRC" --output "$TEMPLATE" \
+    --imatrix "$IMATRIX" --base-bits 3 --target-bpw 4.2 \
+    --high-bits 6 --force-high 'embed|lm_head'
+python3 -I -B tools/quant/gptq.py --src "$SRC" --template "$TEMPLATE" --dst "$DST" \
+    --calib "$CALIB" --samples 128 --length 512 --chat \
+    --dampening 0.01 --act-order --hessian-memory-mib 2048
+```
+
+Le budget est celui de `mixed_quant.py` : **au plus 4,2 bpw langage**, avec
+échelles/biais et tenseurs non quantifiés compris. GPTQ conserve exactement les
+largeurs, formes, dtypes et fichiers d'index du template. L'imatrix ne sert ici
+qu'à l'allocation ; GPTQ recalcule les Hessiennes complètes depuis le corpus.
+`allocation.json` reste le rapport de l'allocation LS du template, pas une mesure
+de qualité GPTQ. `gptq.json` enregistre le SHA-256 du corpus, les paramètres, le
+nombre de lignes observées par expert et les erreurs LS/GPTQ sur la calibration.
+
+`--dampening` ajoute une fraction strictement positive de la moyenne de la
+diagonale à H (défaut 0,01). Les canaux jamais activés sont régularisés avant
+inversion. `--act-order`, désactivé par défaut, visite les colonnes par énergie
+décroissante ; les grilles LS BF16 des **groupes d'origine de 64 colonnes**
+restent fixes. Les codes sont remis dans l'ordre d'origine avant l'emballage,
+sans `g_idx`, permutation des activations ni nouveau kernel côté MLX/saragossa.
+`--block-size` (128 par défaut) regroupe les compensations hors bloc en matmul.
+
+Pour chaque ligne, le résultat emballé GPTQ est comparé aux fits LS uniforme
+et pondéré par `diag(H)` selon l'erreur complète `eᵀHe`. Le meilleur est gardé,
+ce qui protège l'erreur sur la calibration, sans garantir la KL sur d'autres
+textes. Les embeddings, dont l'entrée est un identifiant, utilisent le fit LS
+uniforme. Les tests CPU vérifient aussi une amélioration du candidat GPTQ brut,
+avant tout repli LS, sur des activations corrélées en 3/4/5/6/8 bits.
+
+Chaque expert possède sa propre Hessienne, construite uniquement avec les
+activations qui lui sont routées, y compris celles de `down_proj` et après le
+tri des tokens par mlx-lm. Un module ou expert jamais observé fait échouer la
+conversion : élargir le corpus. Aucune Hessienne partagée ou uniforme implicite.
+Les experts exposés comme linéaires individuels sont capturés séparément aussi.
+
+Le budget `--hessian-memory-mib` borne les **accumulateurs H**, pas la mémoire
+totale. Une matrice exige `4 × colonnes²` octets ; le modèle BF16, les activations,
+les copies de factorisation CPU et les poids de travail s'ajoutent. Une H qui
+dépasse ce budget est refusée. Chaque lot relit tous les extraits en forward
+BF16 avec un état récurrent vierge ; réduire le budget augmente le nombre de
+passes. Les matrices quantifiées intermédiaires sont stockées temporairement
+sur disque, à côté de la destination ; prévoir aussi cet espace et celui du
+checkpoint final. La destination n'apparaît qu'après succès complet.
+
+Les tests ne chargent aucun modèle externe : matrices 6×128, petits experts,
+petite GatedDeltaNet et checkpoint miniature rechargé avec les modules MLX.
+Sur MLX 0.32, le fixture BF16 MoE CPU convertit temporairement les opérandes de
+`gather_mm` en f32, seule précision de ce kernel CPU ; le routage réel SwitchGLU
+est aussi testé directement en f32, trié et non trié. La conversion réelle garde
+le forward BF16 de mlx-lm sur le périphérique par défaut. Aucun résultat 27B ni
+gain KL de cette recette n'est revendiqué.
 
 ## Qwen3.8-27B : recette imatrix à 4,8 bpw
 
