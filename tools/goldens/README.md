@@ -236,7 +236,7 @@ restent des échecs. Une amélioration du nombre de mismatches est acceptée.
 ## KL sur corpus
 
 Protocole inspiré de `llama-perplexity --kl-divergence` et du test par ratio
-du guide de précision vLLM d'AWS Neuron. `kld.py` note 2 048 positions :
+du guide de précision vLLM d'AWS Neuron. Hors Gemma 4 (voir plus bas), `kld.py` note 2 048 positions :
 8 morceaux de 512 tokens de `kld/corpus.txt`, un extrait du domaine public
 (Project Gutenberg n°1661, « A Scandal in Bohemia »), dont les 256 dernières
 positions de chaque morceau sont notées. La référence est mlx-lm float32 ;

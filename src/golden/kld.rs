@@ -102,7 +102,7 @@ fn summarize(kls: &[f64], deltas: &mut [f64], same: usize) -> Stats {
 fn within_noise(engine: Stats, noise: Stats) -> bool {
     engine.mean_kl <= MAX_NOISE_RATIO * noise.mean_kl
         && engine.p99_delta_p <= MAX_NOISE_RATIO * noise.p99_delta_p
-        // Quand le bruit est énorme (gemma4), les ratios ne bornent presque rien.
+        // Un ratio borne mal un bruit déjà élevé ; le top-1 ne doit jamais régresser.
         && engine.same_top >= noise.same_top
 }
 
