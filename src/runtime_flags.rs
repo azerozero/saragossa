@@ -1357,7 +1357,7 @@ pub(crate) fn prefix_extend_resident_min_tokens() -> usize {
     })
 }
 
-/// Récurrence gated delta du prefill linéaire (27B : 16/48 têtes, dk = dv =
+/// Récurrence gated delta du prefill linéaire (16/32 ou 16/48 têtes, dk = dv =
 /// 128, état f32) sur les accélérateurs neuronaux : noyau
 /// `gated_delta_fused_nax` de MLX figé. Défaut ON depuis le 2026-10-25 (M5 Max,
 /// 27B 4 bits) : prefill 32k 588-598 → 630-651 tok/s, TTFT serve 32k 55,8 →

@@ -1603,7 +1603,7 @@ fn nax_d256_head_major_grid_is_bit_identical() -> Result<()> {
     Ok(())
 }
 
-/// Le gated delta NAX de MLX (forme 27B, 16/48 têtes) suit la récurrence
+/// Le gated delta NAX de MLX (16/32 et 16/48 têtes) suit la récurrence
 /// séquentielle `naive_gdn_reference`, y et état final, aux frontières de
 /// morceau et au-delà de 256 tokens, avec un état initial non nul.
 #[test]
@@ -1616,73 +1616,83 @@ fn gated_delta_nax_matches_naive_oracle() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    if executor.gated_delta_nax_hk16_hv48.is_none() {
-        return Ok(());
-    }
-    let config = LinearAttentionConfig {
-        num_key_heads: 16,
-        num_value_heads: 48,
-        key_head_dim: 128,
-        value_head_dim: 128,
-        conv_kernel_dim: 4,
-        rms_eps: 1.0e-6,
-    };
-    let key_dim = config.key_dim()?;
-    let value_dim = config.value_dim()?;
-    let conv_dim = 2 * key_dim + value_dim;
-    let state_len = config.num_value_heads * config.value_head_dim * config.key_head_dim;
-    let mut max_err = 0.0_f32;
-    for (length_index, &steps) in CHUNK_BOUNDARY_LENGTHS.iter().chain(&[300]).enumerate() {
-        let seed = 0x6e41_0000 + length_index as u64;
-        let inputs = synthetic_gdn_inputs(config, steps, seed);
-        let mut rng = DeterministicF32::new(seed ^ 0xc0de);
-        let mut conv_out = rng.fill(steps * conv_dim, -1.0, 1.0);
-        for t in 0..steps {
-            conv_out[t * conv_dim + 2 * key_dim..(t * conv_dim) + 2 * key_dim + value_dim]
-                .copy_from_slice(&inputs.v[t * value_dim..(t + 1) * value_dim]);
-        }
-        let initial_state = rng.fill(state_len, -0.1, 0.1);
-        let mut oracle_state = initial_state.clone();
-        let oracle_y = naive_gdn_reference(
-            &inputs.q,
-            &inputs.k,
-            &inputs.v,
-            &inputs.g,
-            &inputs.beta,
-            steps,
-            config,
-            &mut oracle_state,
-        );
-        let shared_f32 = |data: &[f32]| {
-            executor.device.new_buffer_with_data(
-                data.as_ptr().cast::<std::ffi::c_void>(),
-                (data.len() * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
+    for hv in [32, 48] {
+        let available = if hv == 32 {
+            executor.gated_delta_nax_hk16_hv32.is_some()
+        } else {
+            executor.gated_delta_nax_hk16_hv48.is_some()
         };
-        let conv_out_buf = shared_f32(&conv_out);
-        let q_buf = shared_f32(&inputs.q);
-        let k_buf = shared_f32(&inputs.k);
-        let beta_buf = shared_f32(&inputs.beta);
-        let decay_buf = shared_f32(&inputs.g);
-        let state_buf = shared_f32(&initial_state);
-        let y_buf = executor.device.new_buffer(
-            (steps * value_dim * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let cb = executor.queue.new_command_buffer();
-        let encoder = cb.new_compute_command_encoder();
-        let encoded = executor.encode_gated_delta_nax(
-            encoder,
-            &conv_out_buf,
-            &q_buf,
-            &k_buf,
-            &beta_buf,
-            &decay_buf,
-            &state_buf,
-            &y_buf,
-            steps,
-            LinearAttentionStepSpec {
+        if !available {
+            assert!(
+                !executor.na_library_available_for_test(),
+                "NAX hv{hv} absent sur GPU compatible"
+            );
+            continue;
+        }
+        let config = LinearAttentionConfig {
+            num_key_heads: 16,
+            num_value_heads: hv,
+            key_head_dim: 128,
+            value_head_dim: 128,
+            conv_kernel_dim: 4,
+            rms_eps: 1.0e-6,
+        };
+        let key_dim = config.key_dim()?;
+        let value_dim = config.value_dim()?;
+        let conv_dim = 2 * key_dim + value_dim;
+        let state_len = config.num_value_heads * config.value_head_dim * config.key_head_dim;
+        let mut max_err = 0.0_f32;
+        let extra: &[usize] = if hv == 32 { &[512] } else { &[] };
+        for (length_index, &steps) in CHUNK_BOUNDARY_LENGTHS
+            .iter()
+            .chain(&[300])
+            .chain(extra)
+            .enumerate()
+        {
+            let seed = if steps == 512 {
+                0x6b62 + steps as u64
+            } else {
+                0x6e41_0000 + length_index as u64
+            };
+            let inputs = synthetic_gdn_inputs(config, steps, seed);
+            let mut rng = DeterministicF32::new(seed ^ 0xc0de);
+            let mut conv_out = rng.fill(steps * conv_dim, -1.0, 1.0);
+            for t in 0..steps {
+                conv_out[t * conv_dim + 2 * key_dim..(t * conv_dim) + 2 * key_dim + value_dim]
+                    .copy_from_slice(&inputs.v[t * value_dim..(t + 1) * value_dim]);
+            }
+            let initial_state = rng.fill(state_len, -0.1, 0.1);
+            let mut oracle_state = initial_state.clone();
+            let oracle_y = naive_gdn_reference(
+                &inputs.q,
+                &inputs.k,
+                &inputs.v,
+                &inputs.g,
+                &inputs.beta,
+                steps,
+                config,
+                &mut oracle_state,
+            );
+            let shared_f32 = |data: &[f32]| {
+                executor.device.new_buffer_with_data(
+                    data.as_ptr().cast::<std::ffi::c_void>(),
+                    (data.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let conv_out_buf = shared_f32(&conv_out);
+            let q_buf = shared_f32(&inputs.q);
+            let k_buf = shared_f32(&inputs.k);
+            let beta_buf = shared_f32(&inputs.beta);
+            let decay_buf = shared_f32(&inputs.g);
+            let state_buf = shared_f32(&initial_state);
+            let y_buf = executor.device.new_buffer(
+                (steps * value_dim * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let cb = executor.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            let spec = LinearAttentionStepSpec {
                 num_key_heads: config.num_key_heads,
                 num_value_heads: config.num_value_heads,
                 key_head_dim: config.key_head_dim,
@@ -1690,20 +1700,61 @@ fn gated_delta_nax_matches_naive_oracle() -> Result<()> {
                 conv_kernel_dim: config.conv_kernel_dim,
                 rms_eps: config.rms_eps,
                 l2_qk_sigmoid_gate: false,
-            },
-        );
-        encoder.end_encoding();
-        assert!(encoded?, "gated delta NAX hors périmètre");
-        commit_and_wait(cb)?;
-        let gpu_y = read_f32_buffer(&y_buf, steps * value_dim)?;
-        let gpu_state = read_f32_buffer(&state_buf, state_len)?;
-        for (a, b) in gpu_y.iter().zip(&oracle_y).chain(gpu_state.iter().zip(&oracle_state)) {
-            max_err = max_err.max((a - b).abs());
+            };
+            let encoded = executor.encode_gated_delta_nax(
+                encoder,
+                &conv_out_buf,
+                &q_buf,
+                &k_buf,
+                &beta_buf,
+                &decay_buf,
+                &state_buf,
+                &y_buf,
+                steps,
+                spec,
+            );
+            encoder.end_encoding();
+            assert!(encoded?, "gated delta NAX hors périmètre");
+            commit_and_wait(cb)?;
+            let gpu_y = read_f32_buffer(&y_buf, steps * value_dim)?;
+            let gpu_state = read_f32_buffer(&state_buf, state_len)?;
+            for (a, b) in gpu_y
+                .iter()
+                .zip(&oracle_y)
+                .chain(gpu_state.iter().zip(&oracle_state))
+            {
+                max_err = max_err.max((a - b).abs());
+            }
+            assert_close_eps(&gpu_y, &oracle_y, 5.0e-4);
+            assert_close_eps(&gpu_state, &oracle_state, 5.0e-4);
+            let seq_state_buf = shared_f32(&initial_state);
+            let cb = executor.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            let guard = EncoderEndGuard::new(encoder);
+            executor.encode_linear_attn_gated_delta_seq_dk128(
+                encoder,
+                &conv_out_buf,
+                &q_buf,
+                &k_buf,
+                &beta_buf,
+                &decay_buf,
+                &seq_state_buf,
+                false,
+                &y_buf,
+                steps,
+                spec,
+            )?;
+            guard.end();
+            commit_and_wait(cb)?;
+            let seq_y = read_f32_buffer(&y_buf, steps * value_dim)?;
+            let seq_state = read_f32_buffer(&seq_state_buf, state_len)?;
+            assert_close_eps(&seq_y, &oracle_y, 5.0e-4);
+            assert_close_eps(&seq_state, &oracle_state, 5.0e-4);
+            assert_close_eps(&gpu_y, &seq_y, 5.0e-4);
+            assert_close_eps(&gpu_state, &seq_state, 5.0e-4);
         }
-        assert_close_eps(&gpu_y, &oracle_y, 5.0e-4);
-        assert_close_eps(&gpu_state, &oracle_state, 5.0e-4);
+        eprintln!("gated delta NAX hv{hv}: écart max {max_err:e}");
     }
-    eprintln!("gated delta NAX: écart max {max_err:e}");
     Ok(())
 }
 

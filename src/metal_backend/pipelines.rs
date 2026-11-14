@@ -283,8 +283,9 @@ fn compile_nax_causal_attention(
 pub(super) fn compile_gated_delta_nax(
     device: &Device,
     source: &str,
+    name: &str,
 ) -> Option<ComputePipelineState> {
-    compile_nax_function(device, source, GATED_DELTA_NAX_HK16_HV48, &[(200, false)])
+    compile_nax_function(device, source, name, &[(200, false)])
 }
 
 pub(super) fn compile_nax_function(
@@ -799,7 +800,24 @@ impl MetalExecutor {
         let chunk_delta_seq_layout = compile_na("chunk_delta_seq_layout");
         let chunk_delta_seq_layout_tc = compile_na("chunk_delta_seq_layout_tc");
         let gated_delta_nax_hk16_hv48 = if crate::runtime_flags::prefill_linear_nax_enabled() {
-            let pipeline = compile_gated_delta_nax(&device, GATED_DELTA_NAX_KERNELS);
+            let pipeline = compile_gated_delta_nax(
+                &device,
+                GATED_DELTA_NAX_KERNELS,
+                GATED_DELTA_NAX_HK16_HV48,
+            );
+            if pipeline.is_none() {
+                eprintln!("gated delta NAX indisponible : repli chunk-delta");
+            }
+            pipeline
+        } else {
+            None
+        };
+        let gated_delta_nax_hk16_hv32 = if crate::runtime_flags::prefill_linear_nax_enabled() {
+            let pipeline = compile_gated_delta_nax(
+                &device,
+                GATED_DELTA_NAX_KERNELS,
+                GATED_DELTA_NAX_HK16_HV32,
+            );
             if pipeline.is_none() {
                 eprintln!("gated delta NAX indisponible : repli chunk-delta");
             }
@@ -1019,6 +1037,7 @@ impl MetalExecutor {
             na_gemm_bf16_bn128,
             chunk_delta_seq_layout,
             chunk_delta_seq_layout_tc,
+            gated_delta_nax_hk16_hv32,
             gated_delta_nax_hk16_hv48,
             na_gemm_coop_qb,
             na_gemm_coop_qb_gs128,

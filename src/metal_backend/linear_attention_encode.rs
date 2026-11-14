@@ -2,6 +2,29 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static NAX_TEST_DISABLED: Cell<bool> = const { Cell::new(false) };
+    static NAX_HV32_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_linear_nax_disabled<R>(disabled: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NAX_TEST_DISABLED.with(|v| v.set(self.0));
+        }
+    }
+    let _restore = Restore(NAX_TEST_DISABLED.with(|v| v.replace(disabled)));
+    run()
+}
+
+#[cfg(test)]
+pub(crate) fn linear_nax_hv32_calls() -> usize {
+    NAX_HV32_CALLS.with(Cell::get)
+}
+
 const LINEAR_ATTN_TG_WIDTH: u64 = 32;
 
 /// Disposition des entrées du kernel conv/normes/gates batché : foulée (en
@@ -625,18 +648,23 @@ impl MetalExecutor {
         steps: usize,
         spec: LinearAttentionStepSpec,
     ) -> Result<bool> {
-        let Some(pso) = self.gated_delta_nax_hk16_hv48.as_ref() else {
+        #[cfg(test)]
+        if NAX_TEST_DISABLED.with(Cell::get) {
             return Ok(false);
-        };
-        if (
+        }
+        let pipeline = match (
             spec.num_key_heads,
             spec.num_value_heads,
             spec.key_head_dim,
             spec.value_head_dim,
-        ) != (16, 48, 128, 128)
-        {
+        ) {
+            (16, 32, 128, 128) => &self.gated_delta_nax_hk16_hv32,
+            (16, 48, 128, 128) => &self.gated_delta_nax_hk16_hv48,
+            _ => return Ok(false),
+        };
+        let Some(pso) = pipeline.as_ref() else {
             return Ok(false);
-        }
+        };
         let key_dim = spec.num_key_heads * spec.key_head_dim;
         let conv_dim = 2 * key_dim + spec.num_value_heads * spec.value_head_dim;
         let steps = checked_i32_bytes(steps, "gated delta NAX T")?;
@@ -666,11 +694,15 @@ impl MetalExecutor {
             MTLSize::new(
                 1,
                 checked_nsuint(spec.value_head_dim / 64, "gated delta NAX dv")?,
-                48,
+                checked_nsuint(spec.num_value_heads, "gated delta NAX hv")?,
             ),
             MTLSize::new(32, 4, 1),
         );
         post_dispatch_barrier(encoder);
+        #[cfg(test)]
+        if spec.num_value_heads == 32 {
+            NAX_HV32_CALLS.with(|v| v.set(v.get() + 1));
+        }
         Ok(true)
     }
 
