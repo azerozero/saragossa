@@ -16,6 +16,7 @@ include!("tests/softcap_sampling.rs");
 include!("tests/qmv_u5.rs");
 include!("tests/qmm_u56.rs");
 include!("tests/qmv_bandwidth.rs");
+include!("tests/qmv_bits_probe.rs");
 include!("tests/qmv_align64.rs");
 include!("tests/moe_duo.rs");
 include!("tests/linear_attention.rs");
