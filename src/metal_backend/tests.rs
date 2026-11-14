@@ -12,6 +12,7 @@ include!("tests/na_gemm_delta.rs");
 include!("tests/small_m_qmm.rs");
 include!("tests/coop_moe.rs");
 include!("tests/quant_qmv_sampling.rs");
+include!("tests/softcap_sampling.rs");
 include!("tests/qmv_align64.rs");
 include!("tests/moe_duo.rs");
 include!("tests/linear_attention.rs");

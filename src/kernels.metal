@@ -10690,6 +10690,12 @@ static inline float splitmix_gumbel_f32(ulong rng_state, uint index) {
     return -log(-log(u));
 }
 
+// Match finalize_logits before temperature, truncation or random noise. Fusing
+// at the initial load caps each logit once without another dispatch/readback.
+static inline float sample_softcap_f32(float logit, float cap) {
+    return cap > 0.0f ? cap * precise::tanh(logit / cap) : logit;
+}
+
 kernel void sample_gumbel_blocks_f32(
     device const float* logits [[buffer(0)]],
     device float* partial_values [[buffer(1)]],
@@ -10697,6 +10703,7 @@ kernel void sample_gumbel_blocks_f32(
     constant uint& count [[buffer(3)]],
     constant float& temperature_in [[buffer(4)]],
     constant ulong& rng_state [[buffer(5)]],
+    constant float& softcap [[buffer(6)]],
     uint tid [[thread_index_in_threadgroup]],
     uint group [[threadgroup_position_in_grid]]
 ) {
@@ -10708,7 +10715,7 @@ kernel void sample_gumbel_blocks_f32(
     float value = -3.402823466e38f;
     uint best_idx = 0u;
     if (idx < count) {
-        value = logits[idx] / temperature + splitmix_gumbel_f32(rng_state, idx);
+        value = sample_softcap_f32(logits[idx], softcap) / temperature + splitmix_gumbel_f32(rng_state, idx);
         best_idx = idx;
     }
     values[tid] = value;
@@ -10738,6 +10745,7 @@ kernel void sample_topk_blocks_f32(
     device float* partial_values [[buffer(1)]],
     device uint* partial_indices [[buffer(2)]],
     constant uint2& dims [[buffer(3)]],
+    constant float& softcap [[buffer(4)]],
     uint tid [[thread_index_in_threadgroup]],
     uint group [[threadgroup_position_in_grid]]
 ) {
@@ -10749,7 +10757,7 @@ kernel void sample_topk_blocks_f32(
     threadgroup uint best_indices[256];
 
     const uint idx = group * 256u + tid;
-    values[tid] = (idx < count) ? logits[idx] : -3.402823466e38f;
+    values[tid] = (idx < count) ? sample_softcap_f32(logits[idx], softcap) : -3.402823466e38f;
     indices[tid] = idx;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
