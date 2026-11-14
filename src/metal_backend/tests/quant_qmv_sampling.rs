@@ -2160,32 +2160,32 @@ fn affine_qmm2_u3_gs64_matches_two_qmv_bit_exact() -> Result<()> {
     };
     // 1792 : trois blocs et demi, la boucle qmv à deux blocs finit sur un bloc seul.
     for in_dim in [256_usize, 1792] {
-    let out_dim = 40_usize;
-    let weight = test_affine_mlx_u3(out_dim, in_dim)?;
-    assert!(matches!(
-        executor.select_owned_affine_matmul_kernel(2, in_dim, &weight, false),
-        AffineMatmulKernel::Qmm2
-    ));
-    let row0 = varied_row(in_dim, 71);
-    let row1 = varied_row(in_dim, 73);
-    let reference0 =
-        executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row0.clone())?, &weight)?;
-    let reference1 =
-        executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row1.clone())?, &weight)?;
-    let mut lhs = row0;
-    lhs.extend_from_slice(&row1);
-    let actual = executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![2, in_dim], lhs)?, &weight)?;
+        let out_dim = 40_usize;
+        let weight = test_affine_mlx_u3(out_dim, in_dim)?;
+        assert!(matches!(
+            executor.select_owned_affine_matmul_kernel(2, in_dim, &weight, false),
+            AffineMatmulKernel::Qmm2
+        ));
+        let row0 = varied_row(in_dim, 71);
+        let row1 = varied_row(in_dim, 73);
+        let reference0 =
+            executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row0.clone())?, &weight)?;
+        let reference1 =
+            executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row1.clone())?, &weight)?;
+        let mut lhs = row0;
+        lhs.extend_from_slice(&row1);
+        let actual = executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![2, in_dim], lhs)?, &weight)?;
 
-    assert_bits_equal(
-        &actual.data()[..out_dim],
-        reference0.data(),
-        "qmm2 u3 ligne 0",
-    );
-    assert_bits_equal(
-        &actual.data()[out_dim..],
-        reference1.data(),
-        "qmm2 u3 ligne 1",
-    );
+        assert_bits_equal(
+            &actual.data()[..out_dim],
+            reference0.data(),
+            "qmm2 u3 ligne 0",
+        );
+        assert_bits_equal(
+            &actual.data()[out_dim..],
+            reference1.data(),
+            "qmm2 u3 ligne 1",
+        );
     }
     Ok(())
 }
