@@ -8,8 +8,7 @@ on:
       - "**.txt"
       - "LICENSE*"
       - "NOTICE"
-  # Pas de filtre de chemins ici : « CodeQL Rust » est un check requis par la
-  # ruleset de main, une PR purement documentaire resterait sinon bloquée.
+  # Le filtre est dans les jobs pour toujours produire le check « CodeQL Rust ».
   pull_request:
     branches: [main]
   schedule:
@@ -24,8 +23,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Detect CodeQL changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # Les pushes et analyses planifiées gardent la référence de main à jour.
+      rust: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          # Garder cette liste identique au filtre rust de rust.yml.
+          filters: |
+            rust:
+              - 'src/**'
+              - 'assets/**'
+              - 'tests/**'
+              - 'examples/**'
+              - 'benches/**'
+              - 'build.rs'
+              - 'Cargo.*'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/**'
+              - 'prek.toml'
+              - 'deny.toml'
+              - 'codecov.yml'
+
   analyze:
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     name: CodeQL Rust
+    # NOTE: le run 43614443753 initialise Rust sans traçage, puis extrait avec
+    # --index-traceless-dbs. CodeQL Rust accepte le mode none, sans build manuel.
+    # Envisager ubuntu-latest sans cargo build après validation de la couverture
+    # des modules Metal ; conserver macOS tant que cette équivalence manque.
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -38,8 +76,29 @@ jobs:
       - uses: github/codeql-action/init@v3
         with:
           languages: rust
-      - name: Build with the Metal toolchain
+      - name: Build Rust with Metal support
         run: cargo build --all-features
       - uses: github/codeql-action/analyze@v3
         with:
           category: /language:rust
+
+  analyze-skipped:
+    needs: [changes]
+    if: always() && !cancelled() && needs.changes.outputs.rust != 'true'
+    # Même nom que l'analyse pour satisfaire le check requis des PR sans code.
+    name: CodeQL Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Validate changes before skipping analysis
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          RUST_CHANGED: ${{ needs.changes.outputs.rust }}
+        run: |
+          # Une erreur du filtre ne doit jamais valider le check de sécurité.
+          if [[ "$CHANGES_RESULT" != "success" || "$RUST_CHANGED" != "false" ]]; then
+            echo "::error::Impossible de déterminer les changements Rust."
+            exit 1
+          fi
+          echo "Aucun changement Rust : analyse CodeQL non nécessaire."
