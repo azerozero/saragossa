@@ -75,21 +75,52 @@ pub(super) fn can_use_fast_affine_qmv(
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
+    can_use_fast_affine_qmv_preferred(batch, in_dim, weight, false)
+}
+
+pub(super) fn can_use_fast_affine_qmv_preferred(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+    prefer_fast_affine: bool,
+) -> bool {
     let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
         return false;
     };
-    fast_affine_qmv_enabled(out_dim) && can_use_fast_affine_qmv_shape(batch, in_dim, weight)
+    can_use_fast_affine_qmv_buffers(
+        batch,
+        in_dim,
+        out_dim,
+        weight.group_size(),
+        weight.bits(),
+        prefer_fast_affine,
+    ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
-pub(super) fn can_use_fast_affine_qmv_shape(
+pub(super) fn can_use_fast_affine_qmv_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+    prefer_fast_affine: bool,
+) -> bool {
+    (fast_affine_qmv_enabled(out_dim) || prefer_fast_affine)
+        && batch > 0
+        && bits == FAST_QMV_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 512 == 0
+}
+
+pub(super) fn can_use_fast_affine_qmv_u5(
     batch: usize,
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
-    batch > 0
-        && weight.bits() == FAST_QMV_BITS
-        && weight.group_size() == FAST_QMV_GROUP_SIZE
-        && in_dim % 512 == 0
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_fast_affine_qmv_u5_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
@@ -580,17 +611,27 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_align64(
 }
 
 /// Prédicat du GEMM prefill sur Neural Accelerators (matmul2d bf16) : dé-quant
-/// u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
-/// (prefill). Opt-in (`SARAGOSSA_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
+/// u5/u6/u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
+/// (prefill). Activé par défaut (`SARAGOSSA_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
 /// dispo (`na_gemm_bf16.is_some()`, macOS≥26). bf16 ⇒ non bit-à-bit identique.
-pub(super) fn can_use_qmm_na_u8(
+pub(super) fn can_use_qmm_na_dequant(
     batch: usize,
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
-    qmm_na_enabled()
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    crate::runtime_flags::qmm_na_dequant_allowed()
+        && qmm_na_enabled()
         && batch >= qmm_na_min_batch()
-        && weight.bits() == 8
+        && qmm_na_dequant_fits(
+            in_dim,
+            out_dim,
+            crate::runtime_flags::qmm_na_dequant_max_bytes(),
+        )
+        && matches!(weight.bits(), 5 | 6 | 8)
+        && !(weight.bits() == 6 && qmm_u6_enabled())
         && weight.group_size() == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
@@ -678,6 +719,23 @@ pub(super) fn can_use_fast_affine_qmm2_u3_buffers(
     bits: usize,
 ) -> bool {
     batch == 2 && can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, group_size, bits)
+}
+
+/// Le flux MLX u5 traverse les mots u32 ; gs64 garantit dix mots par groupe.
+pub(super) fn can_use_fast_affine_qmv_u5_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    qmv_u5_enabled()
+        && fast_affine_qmv_enabled(out_dim)
+        && batch > 0
+        && in_dim > 0
+        && bits == FAST_QMV_U5_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % FAST_QMV_GROUP_SIZE == 0
 }
 
 /// Prédicat du qmv 6-bit gs64 pour le talker TTS : même contrat de buffers que
@@ -925,4 +983,27 @@ pub(super) fn qmm_na_min_batch() -> usize {
             .filter(|min| *min >= 2)
             .unwrap_or(32)
     })
+}
+
+/// Borne le scratch bf16 sans allouer le poids ni laisser déborder N*K*2.
+pub(super) fn qmm_na_dequant_fits(in_dim: usize, out_dim: usize, cap: usize) -> bool {
+    in_dim > 0
+        && out_dim > 0
+        && in_dim
+            .checked_mul(out_dim)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<u16>()))
+            .is_some_and(|bytes| bytes <= cap)
+}
+
+#[test]
+fn qmm_na_dequant_budget_bounds_and_overflow() {
+    let cap = 512 * 1024 * 1024;
+    assert!(qmm_na_dequant_fits(16384, 16384, cap));
+    assert!(!qmm_na_dequant_fits(16384, 16385, cap));
+    assert!(!qmm_na_dequant_fits(5120, 248320, cap));
+    assert!(!qmm_na_dequant_fits(usize::MAX, 2, usize::MAX));
+    assert!(!qmm_na_dequant_fits(usize::MAX / 2 + 1, 1, usize::MAX));
+    assert!(!qmm_na_dequant_fits(0, 1, cap));
+    assert!(!qmm_na_dequant_fits(1, 0, cap));
+    assert!(!qmm_na_dequant_fits(1, 1, 0));
 }

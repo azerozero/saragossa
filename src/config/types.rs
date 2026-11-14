@@ -136,7 +136,7 @@ pub struct ModelConfig {
     /// Déclare le softcapping des scores d'attention (Gemma 2, non supporté).
     #[serde(default)]
     pub attn_logit_softcapping: Option<f32>,
-    /// Déclare le softcapping des logits finaux (Gemma 2, non supporté).
+    /// Softcapping des logits finaux (Gemma 4 ; Gemma 2 reste non supporté).
     #[serde(default)]
     pub final_logit_softcapping: Option<f32>,
     /// Décrit le scaling RoPE déclaré (`null`/absent → aucun scaling).

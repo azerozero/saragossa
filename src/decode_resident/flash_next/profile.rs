@@ -44,7 +44,7 @@ pub(crate) struct StepProfiler {
 /// Ligne du rapport : brique, ms par pas, encodeurs par pas.
 #[cfg_attr(
     not(all(test, feature = "devtools")),
-    allow(dead_code, reason = "relevé par le test de profil (devtools)")
+    expect(dead_code, reason = "relevé par le test de profil (devtools)")
 )]
 pub(crate) struct ProfileRow {
     pub(crate) brick: Brick,
@@ -190,7 +190,7 @@ impl StepProfiler {
     /// `SARAGOSSA_RUST_DECODE_PROFILE=1`).
     #[cfg_attr(
         not(all(test, feature = "devtools")),
-        allow(dead_code, reason = "relevé par le test de profil (devtools)")
+        expect(dead_code, reason = "relevé par le test de profil (devtools)")
     )]
     pub(crate) fn report(&self) -> (Vec<ProfileRow>, f64) {
         let steps = self.steps.max(1) as f64;
@@ -210,7 +210,7 @@ impl StepProfiler {
     /// Remet les cumuls à zéro (ex. après le contexte).
     #[cfg_attr(
         not(all(test, feature = "devtools")),
-        allow(dead_code, reason = "relevé par le test de profil (devtools)")
+        expect(dead_code, reason = "relevé par le test de profil (devtools)")
     )]
     pub(crate) fn clear(&mut self) {
         self.total_ns = [0; 7];

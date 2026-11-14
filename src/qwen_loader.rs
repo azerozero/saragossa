@@ -608,7 +608,7 @@ fn validate_affine_quantization(quant: &QuantConfig) -> Result<()> {
         )));
     }
     let (group_size, bits) = quant_params(quant)?;
-    if !matches!(bits, 2 | 3 | 4 | 6 | 8) {
+    if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
         return Err(InferError::Config(format!(
             "quantification affine bits={bits} non supportée"
         )));
@@ -829,7 +829,49 @@ fn load_decoder_tensors_with_context(
 
     tie_lm_head_to_embeddings(config, &mut out);
     bake_gemma_norm_offset(config, &mut out);
+    bake_qwen35_norm_offset(config, &mut out);
     Ok(out)
+}
+
+/// Les checkpoints HF Qwen3.5 stockent les RMSNorm comme `1 + weight`.
+/// MLX intègre déjà cet offset dans `sanitize()` et transpose les convolutions
+/// de `[canaux, 1, noyau]` vers `[canaux, noyau, 1]`. Comme MLX, utiliser ce
+/// layout pour distinguer les poids bruts des exports déjà convertis, quel que
+/// soit leur préfixe ou dtype. Nos kernels acceptent les deux layouts conv1d.
+fn bake_qwen35_norm_offset(config: &ModelConfig, tensors: &mut HashMap<String, DecoderTensor>) {
+    if !matches!(
+        config.model_type.as_str(),
+        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text"
+    ) {
+        return;
+    }
+    let has_hf_conv = tensors.iter().any(|(key, tensor)| {
+        key.ends_with(".linear_attn.conv1d.weight")
+            && matches!(tensor.shape(), [_, 1, kernel] if *kernel > 1)
+    });
+    if !has_hf_conv {
+        return;
+    }
+    for (key, tensor) in tensors.iter_mut() {
+        // La RMSNorm gated de linear_attn utilise directement weight, sans offset.
+        if key != "norm.weight"
+            && ![
+                ".input_layernorm.weight",
+                ".post_attention_layernorm.weight",
+                ".self_attn.q_norm.weight",
+                ".self_attn.k_norm.weight",
+            ]
+            .iter()
+            .any(|suffix| key.ends_with(suffix))
+        {
+            continue;
+        }
+        if let DecoderTensor::Dense(weight) = tensor {
+            if weight.shape().len() == 1 {
+                *weight = weight.map(|value| value + 1.0);
+            }
+        }
+    }
 }
 
 /// Intègre l'offset `1 + weight` des RMSNorm Gemma 2/3 dans les poids.
@@ -1156,6 +1198,8 @@ pub(crate) mod flint_tests;
 pub(crate) mod gemma4_test_fixtures;
 #[cfg(test)]
 mod gemma4_tests;
+#[cfg(test)]
+mod qwen35_sanitize_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod qwen_kv_x3_tests;
 #[cfg(test)]

@@ -35,6 +35,7 @@ pas :
 
 Le radix select travaille en 4 passes de 8 bits, depuis l'octet de poids fort
 des scores f32 (positifs ou nuls).
+
 - À égalité au seuil, le plus petit indice de bloc l'emporte.
 - La compaction suit l'ordre des indices.
 - Contrat : mêmes scores, même sélection que `select_for_query` du CPU,
@@ -45,6 +46,7 @@ des scores f32 (positifs ou nuls).
 
 Les q/k de l'attention QSA et les requêtes de l'indexeur passent par
 `flash_next_rms_norm_rope_f32`.
+
 - L'angle vaut `position·inv_freq` en f32, avec sin et cos précis, comme
   `rope_in_place` du CPU et transformers.
 - Écart au CPU : porte à 1e-5, mesuré ≤ 1,2e-7 à toutes les positions
@@ -109,6 +111,7 @@ scores.
 `oracle_dump.py --long` exécute transformers 5.20.2 en f32 sur CPU, sur les
 4096 premiers tokens de `docs/perf/mtp-pairwise.md` (sha256 `cbbafb0f…`). Il
 exporte :
+
 - les routages et logits du routeur de chaque couche ;
 - les masques et scores de l'indexeur des 12 couches QSA ;
 - leurs résiduels d'entrée complets (`qsa_input`) et leurs sorties aux
@@ -124,7 +127,7 @@ imposés aux quasi-égalités torch, sélection torch imposée pour la sortie.
 | porte | tolérance | résultat (12 couches) |
 |---|---|---|
 | routage propre | égal, ou experts échangés à 1e-5 du seuil torch (règle de l'étape 1) | 1 échange justifié |
-| scores de l'indexeur | 1e-4 relatif à `1 + |torch|` (tolérance de l'étape 1, maintenue par l'arbitrage) | vert |
+| scores de l'indexeur | 1e-4 relatif à `1 + \|torch\|` (tolérance de l'étape 1, maintenue par l'arbitrage) | vert |
 | sélection propre | égale, ou justifiée à 1e-5 | 4 ex æquo justifiés |
 | sortie de couche | 1e-4 | 4e-7 à 3,2e-6 |
 
@@ -135,6 +138,7 @@ deux côtés partagent les mêmes entrées.
 `n2_long_cpu_chain_matches_transformers_on_4k_tokens` reste en contrôle de
 dérive : la chaîne Rust des 48 couches n'est jamais ré-ancrée. La sélection
 torch y est imposée pour suivre la même trajectoire (ablation de l'étape 1).
+
 - Portes : KL ≤ 1e-3 et top-1 identique. Mesuré : KL moyen 2,8e-10, max
   3,4e-8, aucun top-1 différent sur 316 positions.
 - Les scores QSA y dérivent jusqu'à 2,9e-3 (couche 47), et sont relevés sans

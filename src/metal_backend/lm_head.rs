@@ -1,4 +1,9 @@
-//! Projection lm_head et argmax Metal.
+//! Projection lm_head, argmax et échantillonnage Metal.
+//!
+//! Les samplers reçoivent le softcap final du modèle : il est appliqué aux
+//! logits bruts dans leur premier kernel, avant température et filtrage.
+//! `None` ou un cap non positif le désactive, comme `finalize_logits` CPU.
+//! Les chemins argmax et les readbacks de logits bruts restent inchangés.
 
 use super::*;
 
@@ -22,6 +27,7 @@ impl MetalExecutor {
         top_p: f32,
         top_k: usize,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<usize> {
         ensure_biasless(linear, "sample")?;
         let (batch, in_dim) = input.as_matrix()?;
@@ -67,6 +73,7 @@ impl MetalExecutor {
             temperature,
             top_p,
             rng_state,
+            softcap,
         )?;
         encoder_guard.end();
         commit_and_wait(command_buffer)?;
@@ -90,6 +97,7 @@ impl MetalExecutor {
         linear: &Linear,
         temperature: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<usize> {
         ensure_biasless(linear, "sample_gumbel")?;
         let (batch, in_dim) = input.as_matrix()?;
@@ -128,6 +136,7 @@ impl MetalExecutor {
             out_dim,
             temperature,
             rng_state,
+            softcap,
         )?;
         encoder_guard.end();
         commit_and_wait(command_buffer)?;
@@ -449,6 +458,7 @@ impl MetalExecutor {
         top_p: f32,
         top_k: usize,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         let out_dim = self.linear_weight_out_dim(lm_head);
         let logits_buffer = self.private_f32_buffer(out_dim, "sample_logits")?;
@@ -475,6 +485,7 @@ impl MetalExecutor {
             temperature,
             top_p,
             rng_state,
+            softcap,
         )
     }
 
@@ -492,6 +503,7 @@ impl MetalExecutor {
         in_dim: usize,
         temperature: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         let out_dim = self.linear_weight_out_dim(lm_head);
         let logits_buffer = self.private_f32_buffer(out_dim, "sample_gumbel_logits")?;
@@ -516,10 +528,12 @@ impl MetalExecutor {
             out_dim,
             temperature,
             rng_state,
+            softcap,
         )
     }
 
-    /// Encode le `lm_head` dans un buffer partagé pour sampling CPU exact.
+    /// Encode le `lm_head` dans le buffer partagé fourni pour sampling CPU exact.
+    /// L'appelant garde son bail jusqu'à la fin du command buffer et du readback.
     ///
     /// # Errors
     ///
@@ -530,16 +544,19 @@ impl MetalExecutor {
         input_buffer: &BufferRef,
         lm_head: &MetalLinearWeightBuffers,
         in_dim: usize,
-    ) -> Result<(metal::Buffer, usize)> {
+        logits_buffer: &BufferRef,
+    ) -> Result<usize> {
         let out_dim = self.linear_weight_out_dim(lm_head);
-        let logits_buffer = self.uncached_f32_buffer(out_dim, "sample_logits_readback")?;
+        if logits_buffer.length() < byte_len::<f32>(out_dim)? {
+            return Err(InferError::Dimension("buffer readback trop petit".into()));
+        }
         let projected_dim = self.encode_matmul_weight_buffers(
             encoder,
             input_buffer,
             1,
             in_dim,
             lm_head,
-            &logits_buffer,
+            logits_buffer,
             false,
         )?;
         if projected_dim != out_dim {
@@ -547,7 +564,7 @@ impl MetalExecutor {
                 "sample readback projection sort {projected_dim}, attendu {out_dim}"
             )));
         }
-        Ok((logits_buffer, out_dim))
+        Ok(out_dim)
     }
 
     /// Variante en lignes de [`Self::encode_lm_head_logits_readback_buffers`] :
@@ -813,6 +830,7 @@ impl MetalExecutor {
         index_offset: u64,
         (temperature, top_p, top_k): (f32, f32, usize),
         rng_states: &[u64],
+        softcap: Option<f32>,
     ) -> Result<()> {
         if rng_states.is_empty() {
             return Err(InferError::Dimension(
@@ -842,6 +860,7 @@ impl MetalExecutor {
                 temperature,
                 top_p,
                 rng_state,
+                softcap,
             )?;
         }
         Ok(())
@@ -863,6 +882,7 @@ impl MetalExecutor {
         in_dim: usize,
         params: (f32, f32, usize),
         rng_states: &[u64],
+        softcap: Option<f32>,
     ) -> Result<()> {
         let rows = rng_states.len();
         let out_dim = self.linear_weight_out_dim(lm_head);
@@ -895,6 +915,7 @@ impl MetalExecutor {
             0,
             params,
             rng_states,
+            softcap,
         )
     }
 
@@ -1279,6 +1300,7 @@ impl MetalExecutor {
         count: usize,
         temperature: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         let count_u32 = checked_u32(count, "sample Gumbel count")?;
         let partial_count = count.div_ceil(256);
@@ -1292,6 +1314,7 @@ impl MetalExecutor {
         set_u32_bytes(encoder, 3, &[count_u32], "gumbel_count")?;
         set_f32_bytes(encoder, 4, &[temperature], "gumbel_temperature")?;
         set_u64_bytes(encoder, 5, &[rng_state], "gumbel_rng")?;
+        set_f32_bytes(encoder, 6, &[softcap.unwrap_or(0.0)], "gumbel_softcap")?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(checked_nsuint(partial_count, "gumbel partial_count")?, 1, 1),
@@ -1317,6 +1340,7 @@ impl MetalExecutor {
         count: usize,
         temperature: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         self.encode_sample_gumbel_with_offsets(
             encoder,
@@ -1327,6 +1351,7 @@ impl MetalExecutor {
             count,
             temperature,
             rng_state,
+            softcap,
         )
     }
 
@@ -1344,6 +1369,7 @@ impl MetalExecutor {
         temperature: f32,
         top_p: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         self.encode_sample_topk_topp_with_offsets(
             encoder,
@@ -1356,6 +1382,7 @@ impl MetalExecutor {
             temperature,
             top_p,
             rng_state,
+            softcap,
         )
     }
 
@@ -1378,6 +1405,7 @@ impl MetalExecutor {
         temperature: f32,
         top_p: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         if top_k == 0 && top_p >= 1.0 {
             return self.encode_sample_gumbel_with_offsets(
@@ -1389,6 +1417,7 @@ impl MetalExecutor {
                 count,
                 temperature,
                 rng_state,
+                softcap,
             );
         }
         if top_k == 0 || top_k > MAX_SAMPLER_TOP_K || top_k > count {
@@ -1413,6 +1442,7 @@ impl MetalExecutor {
         encoder.set_buffer(1, Some(&partial_values), 0);
         encoder.set_buffer(2, Some(&partial_indices), 0);
         set_u32_bytes(encoder, 3, &dims, "sample_block_dims")?;
+        set_f32_bytes(encoder, 4, &[softcap.unwrap_or(0.0)], "sample_softcap")?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(checked_nsuint(partial_count, "sample partial_count")?, 1, 1),

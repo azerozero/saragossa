@@ -867,13 +867,8 @@ impl MetalExecutor {
                     }
                 }
             }
-            if linear_chunked_enabled()
-                && spec.key_head_dim == 128
-                && spec.value_head_dim == 128
-                && !state.ssm_bf16
-                && self.chunk_delta_seq_layout.is_some()
-            {
-                // Port chunked-DeltaNet : forme chunkée (T/C étapes au lieu de T).
+            if linear_chunked_enabled() {
+                // Refus explicite du flag historique avant toute soumission GPU.
                 self.encode_chunk_delta_seq_layout(
                     encoder,
                     &conv_out_buffer,
@@ -1357,7 +1352,20 @@ impl MetalExecutor {
                     }
                 }
             }
-            if !state.ssm_bf16
+            if linear_chunked_enabled() {
+                self.encode_chunk_delta_seq_layout(
+                    encoder,
+                    &conv_out_buffer,
+                    &q_norm_buffer,
+                    &k_norm_buffer,
+                    &beta_buffer,
+                    &decay_buffer,
+                    &state.ssm,
+                    &y_buffer,
+                    rows,
+                    spec,
+                )?;
+            } else if !state.ssm_bf16
                 && self.encode_gated_delta_nax(
                     encoder,
                     &conv_out_buffer,
@@ -1372,24 +1380,6 @@ impl MetalExecutor {
                 )?
             {
                 // Récurrence faite par le noyau NAX.
-            } else if linear_chunked_enabled()
-                && spec.key_head_dim == 128
-                && spec.value_head_dim == 128
-                && !state.ssm_bf16
-                && self.chunk_delta_seq_layout.is_some()
-            {
-                self.encode_chunk_delta_seq_layout(
-                    encoder,
-                    &conv_out_buffer,
-                    &q_norm_buffer,
-                    &k_norm_buffer,
-                    &beta_buffer,
-                    &decay_buffer,
-                    &state.ssm,
-                    &y_buffer,
-                    rows,
-                    spec,
-                )?;
             } else {
                 self.encode_linear_attn_gated_delta_seq_dk128(
                     encoder,
@@ -3569,7 +3559,6 @@ impl MetalExecutor {
     /// # Errors
     ///
     /// Renvoie une erreur d'allocation ou de soumission Metal.
-    #[allow(dead_code, reason = "câblé au verify spéculatif MTP à l'ÉTAPE 3")]
     pub(crate) fn snapshot_linear_attn_state(
         &self,
         state: &LinearAttentionMetalState,
@@ -3705,7 +3694,6 @@ impl MetalExecutor {
     /// # Errors
     ///
     /// Renvoie une erreur si les longueurs diffèrent ou si le blit échoue.
-    #[allow(dead_code, reason = "câblé au verify spéculatif MTP à l'ÉTAPE 3")]
     pub(crate) fn restore_linear_attn_state(
         &self,
         state: &LinearAttentionMetalState,

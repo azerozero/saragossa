@@ -1247,6 +1247,7 @@ impl FullAttentionMetalState {
                     to_u32(head_dim, "attention rows head_dim")?,
                     to_u32(chunk_len0, "attention rows len")?,
                 ];
+                crate::metal_backend::check_threadgroup_size(flash, 1024, "attention flash rows")?;
                 encoder.set_compute_pipeline_state(flash);
                 encoder.set_buffer(0, Some(q_rows), row_offset);
                 encoder.set_buffer(1, Some(self.keys().buffer()), 0);
@@ -1517,4 +1518,35 @@ fn set_bytes<T: Copy>(encoder: &ComputeCommandEncoderRef, index: u64, values: &[
         std::mem::size_of_val(values) as u64,
         values.as_ptr().cast::<c_void>(),
     );
+}
+
+#[cfg(test)]
+#[test]
+fn flash_rows_rejects_insufficient_threadgroup_limit() -> Result<()> {
+    let Some(state) = super::tests::try_state()? else {
+        return Ok(());
+    };
+    let limited = crate::metal_backend::tests::limited_threadgroup_pipeline(state.device())?;
+    let mut kernels = compile_rows_kernels(state.device(), false)?;
+    kernels.flash_rows = limited.clone();
+    kernels.flash_rows_d256 = limited.clone();
+    kernels.flash_rows_bf16 = limited.clone();
+    kernels.flash_rows_d256_bf16 = limited;
+    for head_dim in [128, 256] {
+        for format in [KvFormat::F32, KvFormat::Bf16] {
+            let mut kv = state.full_attention_format_for_test(2, 1, 1, head_dim, format)?;
+            kv.seed(&vec![0.0; head_dim], &vec![0.0; head_dim], 1)?;
+            let buffer = state.scratch().lease(head_dim, GpuElement::F32)?;
+            let cb = state.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            let buf = buffer.tensor().buffer();
+            let result =
+                kv.encode_attention_decode_rows_chunked(enc, &kernels, buf, buf, 1, None, None);
+            enc.end_encoding();
+            assert!(
+                matches!(result, Err(InferError::Metal(message)) if message.contains("1024") && message.contains("512"))
+            );
+        }
+    }
+    Ok(())
 }

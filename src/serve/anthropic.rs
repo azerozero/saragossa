@@ -221,6 +221,7 @@ impl AnthropicMessagesRequest {
             chat_template_kwargs: None,
             stream_options: None,
             min_p: None,
+            logit_bias: None,
             presence_penalty: None,
             frequency_penalty: None,
             repetition_penalty: None,

@@ -638,6 +638,7 @@ impl CausalDecoder {
                         head,
                         options.temperature,
                         state,
+                        self.config.final_logit_softcapping,
                     )?;
                     sampler.advance();
                     return Ok(token);
@@ -661,6 +662,7 @@ impl CausalDecoder {
                         options.top_p,
                         options.top_k,
                         state,
+                        self.config.final_logit_softcapping,
                     )?;
                     sampler.advance();
                     return Ok(token);
