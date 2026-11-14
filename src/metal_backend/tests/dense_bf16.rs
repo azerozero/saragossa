@@ -70,7 +70,7 @@ fn dense_bf16_qmv_matches_f32() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requiert Metal avec GEMM NA et SARAGOSSA_RUST_DENSE_BF16_GEMM=1 ; poids synthétiques"]
+#[ignore = "requiert Metal avec GEMM NA et SARAGOSSA_RUST_DENSE_BF16_GEMM actif (défaut) ; poids synthétiques"]
 fn dense_bf16_prefill_gemm_matches_f32() -> Result<()> {
     dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_tiled_x2")
 }
