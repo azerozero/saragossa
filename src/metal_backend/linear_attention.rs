@@ -3559,7 +3559,6 @@ impl MetalExecutor {
     /// # Errors
     ///
     /// Renvoie une erreur d'allocation ou de soumission Metal.
-    #[allow(dead_code, reason = "câblé au verify spéculatif MTP à l'ÉTAPE 3")]
     pub(crate) fn snapshot_linear_attn_state(
         &self,
         state: &LinearAttentionMetalState,
@@ -3695,7 +3694,6 @@ impl MetalExecutor {
     /// # Errors
     ///
     /// Renvoie une erreur si les longueurs diffèrent ou si le blit échoue.
-    #[allow(dead_code, reason = "câblé au verify spéculatif MTP à l'ÉTAPE 3")]
     pub(crate) fn restore_linear_attn_state(
         &self,
         state: &LinearAttentionMetalState,

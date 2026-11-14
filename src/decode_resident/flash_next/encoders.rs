@@ -32,7 +32,7 @@ impl Brick {
 
     #[cfg_attr(
         not(all(test, feature = "devtools")),
-        allow(dead_code, reason = "relevé par le test de profil (devtools)")
+        expect(dead_code, reason = "relevé par le test de profil (devtools)")
     )]
     pub(crate) fn label(self) -> &'static str {
         match self {

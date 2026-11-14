@@ -56,58 +56,6 @@ fn check_coop_tiled_shape(bits: usize, max_m: usize, n: usize, k: usize) -> Resu
 }
 
 impl MetalExecutor {
-    /// GEMM quantifié groupé : `out[M_pad,N] = a[M_pad,K] · deq(W_e[N,K])^T`, l'expert e
-    /// de chaque tuile M (16 lignes) lu dans `tile_expert`. Poids empilé `[experts,N,K]`.
-    #[expect(clippy::too_many_arguments, reason = "GEMM groupé : buffers + dims")]
-    #[allow(
-        dead_code,
-        reason = "chemin non-fusé, superseded par la variante gather/scatter fusée"
-    )]
-    fn encode_coop_qb_grouped(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        a_bf16: &BufferRef,
-        weight: &StackedAffineBuffers,
-        out: &BufferRef,
-        tile_expert: &BufferRef,
-        m_padded: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<()> {
-        if weight.bits != 8 || weight.group_size != 64 {
-            return Err(InferError::Config(format!(
-                "coop grouped exige u8 gs64, reçu bits={} gs={}",
-                weight.bits, weight.group_size
-            )));
-        }
-        let pso = self
-            .na_gemm_coop_qb_grouped
-            .as_ref()
-            .ok_or_else(|| InferError::Config("coop_qb_grouped: NA indisponible".into()))?;
-        let mnk = [
-            checked_u32(m_padded, "coop g m")?,
-            checked_u32(n, "coop g n")?,
-            checked_u32(k, "coop g k")?,
-            0,
-        ];
-        encoder.set_compute_pipeline_state(pso);
-        encoder.set_buffer(0, Some(a_bf16), 0);
-        encoder.set_buffer(1, Some(&weight.packed), weight.packed_offset);
-        encoder.set_buffer(2, Some(&weight.scales), weight.scales_offset);
-        encoder.set_buffer(3, Some(&weight.biases), weight.biases_offset);
-        encoder.set_buffer(4, Some(out), 0);
-        encoder.set_buffer(5, Some(tile_expert), 0);
-        encoder.set_bytes(6, 16, mnk.as_ptr().cast::<c_void>());
-        trace_dispatch_path("gemm_nax_coop_qb_grouped", m_padded, n, k);
-        profile_dispatch();
-        encoder.dispatch_thread_groups(
-            MTLSize::new((m_padded / 16) as u64, n.div_ceil(32) as u64, 1),
-            MTLSize::new(32, 1, 1),
-        );
-        post_dispatch_barrier(encoder);
-        Ok(())
-    }
-
     /// GEMM groupé + GATHER fusé (gate/up) : lit `input[token]` f32 via `perm`, zéro a_padded.
     #[expect(
         clippy::too_many_arguments,
@@ -315,77 +263,6 @@ impl MetalExecutor {
         encoder.dispatch_thread_groups(coop_grid(max_m, n, tiled), coop_threads(tiled));
         post_dispatch_barrier(encoder);
         Ok(())
-    }
-
-    #[allow(
-        dead_code,
-        reason = "gather non-fusé, superseded par le gather fusé en kernel"
-    )]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "encodeur Metal chaud: buffers et dimensions correspondent directement au kernel gather"
-    )]
-    fn encode_moe_coop_gather(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        input: &BufferRef,
-        perm: &BufferRef,
-        out_bf16: &BufferRef,
-        m_padded: usize,
-        hidden: usize,
-        top_k: usize,
-    ) -> Result<()> {
-        let pso = self
-            .moe_coop_gather_padded
-            .as_ref()
-            .ok_or_else(|| InferError::Config("moe_coop_gather: indisponible".into()))?;
-        let dims = [
-            checked_u32(m_padded, "gather mpad")?,
-            checked_u32(hidden, "gather hidden")?,
-            checked_u32(top_k, "gather top_k")?,
-            0,
-        ];
-        let n = checked_len(m_padded, hidden, "gather n")?;
-        encoder.set_compute_pipeline_state(pso);
-        encoder.set_buffer(0, Some(input), 0);
-        encoder.set_buffer(1, Some(perm), 0);
-        encoder.set_buffer(2, Some(out_bf16), 0);
-        set_u32_bytes(encoder, 3, &dims, "moe_coop_gather_dims")?;
-        trace_dispatch_path("moe_coop_gather_padded", m_padded, hidden, top_k);
-        self.dispatch_1d(encoder, pso, n)
-    }
-
-    #[allow(
-        dead_code,
-        reason = "scatter non-fusé, superseded par le scatter fusé en kernel"
-    )]
-    fn encode_moe_coop_scatter(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        result: &BufferRef,
-        perm: &BufferRef,
-        scratch: &BufferRef,
-        m_padded: usize,
-        out_dim: usize,
-    ) -> Result<()> {
-        let pso = self
-            .moe_coop_scatter_padded
-            .as_ref()
-            .ok_or_else(|| InferError::Config("moe_coop_scatter: indisponible".into()))?;
-        let dims = [
-            checked_u32(m_padded, "scatter mpad")?,
-            checked_u32(out_dim, "scatter out_dim")?,
-            0,
-            0,
-        ];
-        let n = checked_len(m_padded, out_dim, "scatter n")?;
-        encoder.set_compute_pipeline_state(pso);
-        encoder.set_buffer(0, Some(result), 0);
-        encoder.set_buffer(1, Some(perm), 0);
-        encoder.set_buffer(2, Some(scratch), 0);
-        set_u32_bytes(encoder, 3, &dims, "moe_coop_scatter_dims")?;
-        trace_dispatch_path("moe_coop_scatter_padded", m_padded, out_dim, 0);
-        self.dispatch_1d(encoder, pso, n)
     }
 
     fn encode_moe_g_fill(

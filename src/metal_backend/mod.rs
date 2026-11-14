@@ -437,6 +437,7 @@ pub struct MetalExecutor {
     na_gemm_coop_qb_tiled_u4_x3: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_gate_up_swiglu: Option<ComputePipelineState>,
+    #[cfg(test)]
     na_gemm_coop_qb_grouped: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_gather: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_gate_up_swiglu: Option<ComputePipelineState>,
@@ -447,8 +448,6 @@ pub struct MetalExecutor {
     /// [`MOE_COOP_TILED_BM`] lignes × 64 colonnes.
     na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_scatter_u4_tiled: Option<ComputePipelineState>,
-    moe_coop_gather_padded: Option<ComputePipelineState>,
-    moe_coop_scatter_padded: Option<ComputePipelineState>,
     moe_g_fill_u32: Option<ComputePipelineState>,
     moe_g_histogram: Option<ComputePipelineState>,
     moe_g_offsets: Option<ComputePipelineState>,
