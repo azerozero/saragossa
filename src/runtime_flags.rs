@@ -1679,6 +1679,47 @@ pub(super) fn prefix_cache_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
 }
 
+/// Autorise `QmmNaDequant` dans le talker et le code_predictor TTS.
+/// `SARAGOSSA_TTS_QMM_NA_DEQUANT=1`, défaut OFF : l'arrondi bf16 avant GEMM
+/// fait diverger le golden clone cb0 u6. Lu une fois au premier usage.
+/// Le LLM reste inchangé ; les conditions habituelles, dont
+/// `SARAGOSSA_RUST_QMM_NA`, restent nécessaires même avec cet opt-in.
+pub(crate) fn tts_qmm_na_dequant_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_QMM_NA_DEQUANT", false))
+}
+
+thread_local! {
+    static QMM_NA_DEQUANT_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Restaure la politique de déquantification sur le thread d'origine, même sur erreur.
+#[must_use]
+pub(crate) struct QmmNaDequantScopeGuard {
+    previous: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for QmmNaDequantScopeGuard {
+    fn drop(&mut self) {
+        QMM_NA_DEQUANT_ALLOWED.set(self.previous);
+    }
+}
+
+/// Limite `QmmNaDequant` aux appels encodés dans cette portée TTS.
+/// Une portée imbriquée restaure la politique précédente à sa sortie.
+pub(crate) fn install_tts_qmm_na_dequant_scope(enabled: bool) -> QmmNaDequantScopeGuard {
+    QmmNaDequantScopeGuard {
+        previous: QMM_NA_DEQUANT_ALLOWED.replace(enabled),
+        _thread: std::marker::PhantomData,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn qmm_na_dequant_allowed() -> bool {
+    QMM_NA_DEQUANT_ALLOWED.get()
+}
+
 /// Mémoïsation du préfixe VoiceDesign. Opt-in jusqu'à validation de l'oracle
 /// Metal ; `SARAGOSSA_TTS_PREFILL_CACHE=0` conserve le prefill complet.
 pub(crate) fn tts_prefill_cache_enabled() -> bool {
@@ -2255,6 +2296,26 @@ fn hash_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tts_qmm_na_dequant_scope_restores_policy_and_is_thread_local() {
+        assert!(QMM_NA_DEQUANT_ALLOWED.get());
+        let result = std::panic::catch_unwind(|| {
+            let _tts = install_tts_qmm_na_dequant_scope(false);
+            assert!(!QMM_NA_DEQUANT_ALLOWED.get());
+            assert!(std::thread::spawn(|| QMM_NA_DEQUANT_ALLOWED.get())
+                .join()
+                .unwrap());
+            {
+                let _opt_in = install_tts_qmm_na_dequant_scope(true);
+                assert!(QMM_NA_DEQUANT_ALLOWED.get());
+            }
+            assert!(!QMM_NA_DEQUANT_ALLOWED.get());
+            panic!("sortie anticipée de la portée TTS");
+        });
+        assert!(result.is_err());
+        assert!(QMM_NA_DEQUANT_ALLOWED.get());
+    }
 
     #[cfg(unix)]
     #[test]

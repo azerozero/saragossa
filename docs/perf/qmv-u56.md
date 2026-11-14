@@ -26,7 +26,10 @@ son interrupteur indépendant `SARAGOSSA_RUST_QMM_NA`.
 Le sélecteur owned utilise `QmmNaDequant` pour u5/u6 gs64 à partir de
 `SARAGOSSA_RUST_QMM_NA_MIN_BATCH` (32 par défaut), avec K multiple de 512,
 si la pipeline NAX est disponible et `SARAGOSSA_RUST_QMM_NA` actif.
-La vérification stricte exclut ce chemin. L'opt-in
+La vérification stricte exclut ce chemin. Le talker et le code_predictor
+TTS l'excluent aussi par une portée thread-local, sauf opt-in
+`SARAGOSSA_TTS_QMM_NA_DEQUANT=1` (défaut OFF). Le LLM conserve sa sélection
+par défaut. L'opt-in
 `SARAGOSSA_RUST_QMM_U6=1` conserve la priorité du qmm u6 batché.
 
 Comme pour l'ancien chemin u8, le poids est déquantifié en bf16 transposé,
@@ -57,22 +60,25 @@ et l'API Tensor autonome gardent leurs routes historiques, comme pour u8.
 MLX figées : logits et audio VoiceDesign, entrées ICL, premier code cb0 et
 audio du clone Base. Ils chargent les snapshots HF
 `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit` et
-`mlx-community/Qwen3-TTS-12Hz-1.7B-Base-6bit`. Leur existence conserve
-l'activation par défaut du prefill NA u6, y compris pour TTS. Elle ne
-constitue pas une validation de ces goldens sur cette révision.
+`mlx-community/Qwen3-TTS-12Hz-1.7B-Base-6bit`. La mesure sur poids réels
+montre un échec du premier code cb0 du clone avec `QmmNaDequant` u6,
+alors que les cinq goldens passent avec `SARAGOSSA_RUST_QMM_NA=0`.
+L'arrondi bf16 avant GEMM est donc opt-in pour TTS ; les QMV vectorisés
+restent actifs et aucun golden ni tolérance n'est modifié.
 
 Depuis la racine du dépôt, lancer les cinq oracles (aucun benchmark) :
 
 ```sh
-rtk proxy env SARAGOSSA_REQUIRE_REAL_MODELS=1 SARAGOSSA_REQUIRE_METAL=1 \
+rtk proxy env -u SARAGOSSA_TTS_QMM_NA_DEQUANT -u RETI_TTS_QMM_NA_DEQUANT \
+  SARAGOSSA_REQUIRE_REAL_MODELS=1 SARAGOSSA_REQUIRE_METAL=1 \
   SARAGOSSA_RUST_QMM_NA=1 SARAGOSSA_RUST_QMM_NA_MIN_BATCH=32 \
   SARAGOSSA_RUST_QMM_U6=0 \
   cargo test --lib --features metal tts::tests::golden::golden_ \
   -- --ignored --nocapture --test-threads=1
 ```
 
-Pour comparer au repli sans NA, relancer la même commande avec
-`SARAGOSSA_RUST_QMM_NA=0`. La résolution utilise le cache HF configuré ;
+Pour reproduire la dérive avec NA, ajouter `SARAGOSSA_TTS_QMM_NA_DEQUANT=1`
+avant `cargo`. La résolution utilise le cache HF configuré ;
 `SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR` et `SARAGOSSA_QWEN3_TTS_BASE_DIR`
 permettent de désigner explicitement un snapshot. Le mode
 `SARAGOSSA_REQUIRE_REAL_MODELS=1` fait échouer les préconditions manquantes
@@ -80,7 +86,7 @@ au lieu de sauter silencieusement les tests. Aucun golden talker
 CustomVoice dédié n'est présent. Ces tests ne vérifient pas le dispatch
 NAX : une réussite sans pipeline NAX disponible ne qualifie que le repli.
 Ajouter `SARAGOSSA_RUST_TRACE_DISPATCH_PATH=1` pour vérifier dans la sortie
-les dispatches `dequant_u6_to_bf16_t_gs64` et `gemm_nax` du prefill.
+les dispatches `dequant_u6_to_bf16_t_gs64` et `gemm_nax` du prefill en opt-in.
 
 ## Sonde courte du 14 novembre 2026
 

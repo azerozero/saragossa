@@ -600,7 +600,8 @@ pub(super) fn can_use_qmm_na_dequant(
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
-    qmm_na_enabled()
+    crate::runtime_flags::qmm_na_dequant_allowed()
+        && qmm_na_enabled()
         && batch >= qmm_na_min_batch()
         && matches!(weight.bits(), 5 | 6 | 8)
         && !(weight.bits() == 6 && qmm_u6_enabled())

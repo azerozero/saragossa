@@ -1,4 +1,38 @@
 #[test]
+#[ignore = "device Metal NAX requis : sélection TTS u5/u6/u8, sans modèle"]
+fn tts_qmm_na_dequant_scope_controls_selection() -> Result<()> {
+    use crate::runtime_flags::install_tts_qmm_na_dequant_scope;
+
+    let metal = MetalExecutor::new()?;
+    assert!(metal.na_gemm_bf16.is_some());
+    super::flags::with_qmm_u6_override(false, || -> Result<()> {
+        // N impair exclut les GEMM fusionnés u8 ; les deux branches du
+        // sélecteur owned doivent respecter la portée TTS.
+        for weight in [
+            test_affine_varied_u5(13, 512)?,
+            test_affine_varied_u6(13, 512)?,
+            test_affine_varied_u8(13, 512)?,
+        ] {
+            let select = || {
+                metal.select_owned_affine_matmul_kernel(qmm_na_min_batch(), 512, &weight, false)
+            };
+            assert_eq!(select(), AffineMatmulKernel::QmmNaDequant);
+            {
+                let _tts = install_tts_qmm_na_dequant_scope(false);
+                assert_ne!(select(), AffineMatmulKernel::QmmNaDequant);
+                {
+                    let _opt_in = install_tts_qmm_na_dequant_scope(true);
+                    assert_eq!(select(), AffineMatmulKernel::QmmNaDequant);
+                }
+                assert_ne!(select(), AffineMatmulKernel::QmmNaDequant);
+            }
+            assert_eq!(select(), AffineMatmulKernel::QmmNaDequant);
+        }
+        Ok(())
+    })
+}
+
+#[test]
 #[ignore = "device Metal requis : déquant u5/u6 bf16 transposée, sans modèle"]
 fn dequant_u56_bf16_transpose_matches_cpu() -> Result<()> {
     let metal = MetalExecutor::new()?;
