@@ -8,6 +8,18 @@ fn tools() -> Vec<Value> {
 }
 
 #[test]
+fn replayed_arguments_keep_main_sorted_bytes() {
+    for (family, text) in [
+        (ToolFamily::Qwen, "<tool_call><function=weather><parameter=z>[{\"z\":2,\"a\":1}]</parameter><parameter=a>0</parameter></function></tool_call>"),
+        (ToolFamily::Gemma4, "<|tool_call>call:weather{z:[{z:2,a:1}],a:0}<tool_call|>"),
+    ] {
+        let parsed = ToolOutputParser::new(family, tools(), true).parse(text);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].function.arguments, r#"{"a":0,"z":[{"a":1,"z":2}]}"#);
+    }
+}
+
+#[test]
 fn qwen_and_gemma_calls_stream_at_every_unicode_boundary() {
     for (family, text) in [
         (ToolFamily::Qwen, "Avant <tool_call>\n<function=weather>\n<parameter=city>\nÉvry\n</parameter>\n<parameter=count>\n2\n</parameter>\n</function>\n</tool_call>"),

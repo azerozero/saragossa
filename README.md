@@ -75,7 +75,7 @@ the **single-user latency × Apple Silicon** quadrant:
 | Endpoint | Purpose |
 |---|---|
 | `GET /v1/models` | Served models |
-| `POST /v1/chat/completions` | OpenAI-compatible chat (SSE or not), `response_format: {"type":"json_object"}` |
+| `POST /v1/chat/completions` | OpenAI-compatible chat (SSE or not), `response_format`: `json_object`, `json_schema` |
 | `POST /v1/responses` | Stateless text and function calls (JSON or SSE) |
 | `POST /v1/messages` | Anthropic Messages shim + `tool_use` (drivable by Claude Code) |
 | `POST /v1/audio/transcriptions` | Whisper STT (multipart WAV, opt-in `--stt-model`) |
@@ -274,19 +274,42 @@ The supplied schema guides the prompt and parser but is not a generation guarant
 At the output token limit, the response becomes `incomplete`. Closed items keep
 their status; only the text item still open at truncation becomes `incomplete`.
 
-### Structured output (v1: `json_object`)
+### Structured output (`json_object`, `json_schema`)
 
 `POST /v1/chat/completions` accepts `response_format: {"type":"json_object"}`.
 The output is constrained by a byte-level JSON automaton in the sampler:
 mandatory root object, strings/escapes/numbers/booleans/null and nested
 structures. End-of-turn is only admissible after the root object closes.
 
-In v1, only these guided requests switch to the CPU sampling path (logits read
+Only these guided requests switch to the CPU sampling path (logits read
 back, then masked before sampling). Requests without `response_format`, or with
-`{"type":"text"}`, keep the existing resident/GPU path. The
-`{"type":"json_schema"}` mode returns 501: it is reserved for a later version.
+`{"type":"text"}`, keep the existing resident/GPU path.
 
-v1 limits: the automaton guarantees JSON grammar (surrogate pairs `𐀀`
+For schema-constrained content, use:
+
+```json
+{"response_format":{"type":"json_schema","json_schema":{
+  "name":"greeting", "strict":true,
+  "schema":{"type":"object","properties":{"greeting":{"enum":["Bonjour"]}},
+            "required":["greeting"],"additionalProperties":false}
+}}}
+```
+
+`json_schema` uses llguidance CPU masks in both greedy and sampled generation,
+including SSE. Anthropic Messages accepts the equivalent
+`output_config: {"format":{"type":"json_schema","schema":{...}}}`.
+Invalid or unsupported schemas return HTTP 400. `strict` may be omitted, `true`
+or `false`; all accepted schemas are enforced. This does not enable strict tool
+calling. `stop` is rejected for guided output.
+
+Supported keywords: `type` (including nullable unions), `properties`, `required`,
+scalar `enum`, `items`, `additionalProperties`; `title`, `description`, `default`
+are annotations. The root must have `type: "object"`. Other keywords are rejected,
+including `$ref`, `$defs`, combinators, bounds, `pattern` and `format`.
+See [schema output and dependency decision](docs/serve-json-schema.md) for limits,
+tokenizer handling and the Rust 1.85 version pin.
+
+JSON limits: the automaton guarantees JSON grammar (surrogate pairs `𐀀`
 included) but not a number's magnitude beyond `f64`; in non-streaming mode, an
 object left unclosed at the `max_tokens` budget raises an error rather than
 returning truncated JSON; in SSE, the deltas stay a valid JSON prefix and an

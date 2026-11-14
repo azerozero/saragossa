@@ -6,6 +6,7 @@ use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use saragossa::decoder::{GenerationOutput, GenerationTimings};
+use saragossa::guided::{SchemaTokenCatalog, SchemaTokenConstraint};
 use saragossa::memory_guard::{
     estimate_model_bytes, process_footprint_bytes, process_purge_registry, MemoryGuard,
     MemoryProjection, PurgeOutcome, PurgePressure, PurgeRegistry,
@@ -598,6 +599,7 @@ impl ModelSlot {
                 preset,
                 mtp_active,
                 json_token_catalog: OnceLock::new(),
+                schema_token_catalog: OnceLock::new(),
                 prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),
             });
         }
@@ -621,6 +623,7 @@ struct LoadedModel {
     /// `json_object`/`json_lines` : un déploiement texte pur ne paie jamais le
     /// décodage du vocab entier ni son étape faillible au chargement.
     json_token_catalog: OnceLock<Arc<JsonTokenCatalog>>,
+    schema_token_catalog: OnceLock<Arc<SchemaTokenCatalog>>,
     prefix_cache: BlockAwarePrefixCache,
 }
 
@@ -952,12 +955,14 @@ impl LoadedModel {
         // La fermeture racine termine json_object même lorsqu'elle consomme
         // le dernier token du budget : aucun pas supplémentaire pour EOS
         // n'est alors disponible. Une frontière NDJSON reste prolongeable.
-        let completed_json_object = prepared.response_format == ResponseFormatMode::JsonObject
-            && prepared
-                .options
-                .token_constraint
-                .as_ref()
-                .is_some_and(|constraint| constraint.is_finished());
+        let completed_json_object = matches!(
+            prepared.response_format,
+            ResponseFormatMode::JsonObject | ResponseFormatMode::JsonSchema
+        ) && prepared
+            .options
+            .token_constraint
+            .as_ref()
+            .is_some_and(|constraint| constraint.is_finished());
         let finish_reason = if output.tokens.len() >= prepared.max_tokens
             && matched_stop.is_none()
             && !completed_json_object
@@ -1409,6 +1414,28 @@ impl LoadedModel {
         let stop_token_ids = self.assets.stop_token_ids();
         let token_constraint = match response_format {
             ResponseFormatMode::Text => None,
+            ResponseFormatMode::JsonSchema => {
+                let schema = request
+                    .response_format
+                    .as_ref()
+                    .ok_or_else(|| ServeError::Http("response_format.json_schema requis".into()))?
+                    .compiled_schema()?;
+                if self.schema_token_catalog.get().is_none() {
+                    let catalog = SchemaTokenCatalog::from_tokenizer(
+                        &self.assets.tokenizer,
+                        &stop_token_ids,
+                    )?;
+                    let _ = self.schema_token_catalog.set(Arc::new(catalog));
+                }
+                let catalog = self
+                    .schema_token_catalog
+                    .get()
+                    .ok_or_else(|| ServeError::Http("json_schema: catalogue absent".into()))?;
+                Some(Arc::new(
+                    SchemaTokenConstraint::new(Arc::clone(catalog), &schema)
+                        .map_err(|error| ServeError::Http(error.to_string()))?,
+                ) as Arc<dyn TokenConstraint>)
+            }
             ResponseFormatMode::JsonObject => Some(Arc::new(JsonTokenConstraint::new(
                 self.json_catalog()?,
                 &stop_token_ids,
@@ -1424,7 +1451,9 @@ impl LoadedModel {
             stop_token_ids,
             stop_sequences: if matches!(
                 response_format,
-                ResponseFormatMode::JsonObject | ResponseFormatMode::JsonLines
+                ResponseFormatMode::JsonObject
+                    | ResponseFormatMode::JsonLines
+                    | ResponseFormatMode::JsonSchema
             ) {
                 Vec::new()
             } else {
@@ -1512,12 +1541,15 @@ fn stop_texts_for_response_format(
     let stop_texts = request.stop_texts();
     if matches!(
         response_format,
-        ResponseFormatMode::JsonObject | ResponseFormatMode::JsonLines
+        ResponseFormatMode::JsonObject
+            | ResponseFormatMode::JsonLines
+            | ResponseFormatMode::JsonSchema
     ) && stop_texts.iter().any(|stop| !stop.is_empty())
     {
         let format = match response_format {
             ResponseFormatMode::JsonObject => "json_object",
             ResponseFormatMode::JsonLines => "json_lines",
+            ResponseFormatMode::JsonSchema => "json_schema",
             ResponseFormatMode::Text => "text",
         };
         return Err(ServeError::Http(format!(
