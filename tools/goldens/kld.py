@@ -7,6 +7,10 @@ position garde le top-64 float32 et la masse restante. Le même script mesure
 ensuite mlx-lm bf16 contre cette référence : c'est le bruit propre de la
 référence, dénominateur du ratio vérifié en Rust.
 
+Gemma 4 instruct ne prédit pas le texte brut (README, « Gemma 4 sur texte
+brut ») : ses morceaux sont les 8 prompts de tools/quant/chat_kl.py suivis de la
+réponse greedy de la référence float32, dont les 128 derniers tokens sont notés.
+
 Lancer sous le verrou GPU, SARAGOSSA_GOLDEN_CAPTURE=1, sans téléchargement.
 """
 import argparse
@@ -19,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import LOGITS_PACKAGES, OUT, local_model, provenance, require_versions, write, write_json
 
 CHUNKS, CTX, SCORED, K = 8, 512, 256, 64
+CHAT_MODELS, CHAT_TOKENS, CHAT_SCORED = ("gemma4",), 192, 128
 
 
 def chunk_ids(tokenizer):
@@ -30,6 +35,24 @@ def chunk_ids(tokenizer):
     return [bos + ids[i * width:(i + 1) * width] for i in range(CHUNKS)]
 
 
+def chat_ids(mx, model, tokenizer):
+    from mlx_lm.generate import generate_step
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "quant"))
+    from chat_kl import PROMPTS
+    chunks = []
+    for prompt in PROMPTS:
+        ids = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True)
+        answer = []
+        for token, _ in generate_step(mx.array(ids), model, max_tokens=CHAT_TOKENS):
+            if int(token) in tokenizer.eos_token_ids:
+                break
+            answer.append(int(token))
+        if len(answer) <= CHAT_SCORED:
+            raise RuntimeError(f"réponse trop courte ({len(answer)} tokens) : {prompt}")
+        chunks.append(ids + answer)
+    return chunks
+
+
 def canonical_embed_scale(mx, model):
     """√hidden arrondi en bf16, comme transformers (scale.to(weight.dtype)) et
     mlx-lm Gemma 3 ; mlx-lm Gemma 4 garde un float Python, exact seulement en f32."""
@@ -38,9 +61,9 @@ def canonical_embed_scale(mx, model):
             module.embed_scale = mx.array(module.embed_scale, mx.bfloat16).item()
 
 
-def logprobs(mx, model, chunk):
-    # La position t prédit le token t + 1 : on note les SCORED derniers tokens.
-    logits = model(mx.array([chunk]))[0, CTX - SCORED - 1:CTX - 1].astype(mx.float32)
+def logprobs(mx, model, chunk, scored):
+    # La position t prédit le token t + 1 : on note les `scored` derniers tokens.
+    logits = model(mx.array([chunk]))[0, len(chunk) - scored - 1:len(chunk) - 1].astype(mx.float32)
     return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
 
@@ -62,13 +85,15 @@ def main():
     mx.set_default_device(mx.gpu)
 
     model, tokenizer = load(path)
-    chunks = chunk_ids(tokenizer)
     model.set_dtype(mx.float32)
     canonical_embed_scale(mx, model)
     mx.eval(model.parameters())
+    chat = args.model in CHAT_MODELS
+    chunks = chat_ids(mx, model, tokenizer) if chat else chunk_ids(tokenizer)
+    scored = CHAT_SCORED if chat else SCORED
     reference = []  # par position : (ids top-K, logprobs top-K)
     for chunk in chunks:
-        lp = logprobs(mx, model, chunk)
+        lp = logprobs(mx, model, chunk, scored)
         top = mx.argsort(-lp, axis=-1)[:, :K]
         values = mx.take_along_axis(lp, top, axis=-1)
         mx.eval(top, values)
@@ -80,11 +105,11 @@ def main():
     model, _ = load(path)  # dtype natif du checkpoint, bf16 pour ces modèles
     kls, deltas, same = [], [], []
     for index, chunk in enumerate(chunks):
-        lp = logprobs(mx, model, chunk)
+        lp = logprobs(mx, model, chunk, scored)
         argmax = mx.argmax(lp, axis=-1)
         mx.eval(lp, argmax)
-        for row in range(SCORED):
-            ids, ref = reference[index * SCORED + row]
+        for row in range(scored):
+            ids, ref = reference[index * scored + row]
             p = [math.exp(v) for v in ref]
             q = [math.exp(v) for v in lp[row][mx.array(ids)].tolist()]
             pairs = list(zip(p, q)) + [(max(1 - sum(p), 0.0), max(1 - sum(q), 0.0))]
@@ -98,9 +123,9 @@ def main():
     source["float32_control"] = True
     flat = [x for ids, values in reference for x in (*map(float, ids), *values)]
     write("kld", args.model, struct.pack(f"<{len(flat)}f", *flat), "f32",
-          [CHUNKS * SCORED, 2, K], source, "ratio au bruit mlx bf16 / f32, voir README",
+          [len(chunks) * scored, 2, K], source, "ratio au bruit mlx bf16 / f32, voir README",
           layout="par position : K ids (entiers exacts en f32) puis K logprobs float32")
-    write_json("kld", f"{args.model}_meta", dict(model=args.model, chunks=chunks, scored=SCORED,
+    write_json("kld", f"{args.model}_meta", dict(model=args.model, chunks=chunks, scored=scored,
                top_k=K, mlx_bf16_noise=noise), source, "ratio au bruit mlx bf16 / f32, voir README")
 
 

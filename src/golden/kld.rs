@@ -54,8 +54,8 @@ fn load(name: &str) -> TestResult<Reference> {
             )
         })
         .collect();
-    let width = meta.chunks[0].len();
-    assert!(meta.chunks.iter().all(|c| c.len() == width) && meta.scored < width);
+    // Morceaux de largeur variable en régime chat (gemma4) : voir kld.py.
+    assert!(meta.chunks.iter().all(|c| c.len() > meta.scored));
     Ok(Reference { meta, rows })
 }
 
