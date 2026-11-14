@@ -1,17 +1,11 @@
 name: Release-plz
 
 on:
-  push:
+  workflow_run:
+    workflows: [Rust]
+    types: [completed]
     branches: [main]
-    paths:
-      - "src/**"
-      - "assets/**"
-      - "build.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "release-plz.toml"
-      - ".github/workflows/release-plz.yml"
-  # Permet de préparer une release sans nouveau push correspondant aux filtres.
+  # Relance manuelle, toujours soumise à une CI Rust verte sur main.
   workflow_dispatch:
   pull_request:
     types: [closed]
@@ -24,9 +18,19 @@ permissions:
 jobs:
   release-pr:
     name: Create release PR
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.head_repository.full_name == github.repository
+        && (github.event.workflow_run.event == 'push'
+          || github.event.workflow_run.event == 'workflow_dispatch'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
     concurrency:
       group: release-plz-pr
       cancel-in-progress: false
@@ -38,9 +42,40 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: main
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Verify green main revision
+        id: green-main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          GREEN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          head_sha=$(git rev-parse HEAD)
+          if [[ "$EVENT_NAME" == workflow_run ]]; then
+            # Un ancien succès ne valide pas un main qui a avancé depuis.
+            if [[ "$head_sha" != "$GREEN_SHA" ]]; then
+              echo "Main has advanced; wait for its Rust workflow."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # Le lancement manuel ne contourne pas la validation de main.
+            green_runs=$(gh api --method GET "repos/$REPO/actions/workflows/rust.yml/runs" \
+              -f branch=main -f head_sha="$head_sha" -f status=success \
+              --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")] | length')
+            if [[ "$green_runs" == 0 ]]; then
+              echo "::error::No successful Rust workflow for main at $head_sha"
+              exit 1
+            fi
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.green-main.outputs.ready == 'true'
       - name: Prepare release PR
+        if: steps.green-main.outputs.ready == 'true'
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release-pr

@@ -30,6 +30,8 @@ env:
 jobs:
   gpu-synthetic:
     name: Tests GPU à poids synthétiques
+    # La PR de release ne change que version, changelog et lock après la CI de main.
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-')
     runs-on: macos-15
     timeout-minutes: 60
     steps:
