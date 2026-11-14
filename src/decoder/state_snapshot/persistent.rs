@@ -135,6 +135,7 @@ struct Job {
     priority: bool,
     payload: Payload,
     _permit: Permit,
+    _memory: Option<crate::memory_guard::MemoryReservation>,
 }
 pub(super) struct Permit(Arc<AtomicBool>);
 impl Drop for Permit {
@@ -154,6 +155,8 @@ pub(super) struct Store {
     pub(super) root: PathBuf,
     pub(super) budget: u64,
     priority_tokens: usize,
+    staging_limit: u64,
+    memory_guard: crate::memory_guard::MemoryGuard,
     busy: Arc<AtomicBool>,
     tx: Option<mpsc::SyncSender<Job>>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -166,6 +169,7 @@ struct Disk {
 }
 impl Store {
     fn open(root: &Path, budget: u64, priority_tokens: usize) -> Result<Self> {
+        let staging_limit = crate::runtime_flags::serve_prefix_ssd_staging_bytes()?;
         if budget == 0 {
             return Err(invalid("budget SSD nul"));
         }
@@ -294,11 +298,30 @@ impl Store {
             root,
             budget,
             priority_tokens,
+            staging_limit,
+            memory_guard: crate::memory_guard::MemoryGuard::serve(),
             busy: Arc::new(AtomicBool::new(false)),
             tx: Some(tx),
             worker: Some(worker),
             disk,
         })
+    }
+    /// Vérifie disque et RAM avant le premier blit ou clone de données.
+    pub(super) fn admit_staging(
+        &self,
+        disk_bytes: u64,
+        ram_bytes: u64,
+    ) -> Result<crate::memory_guard::MemoryReservation> {
+        check_staging_limits(
+            disk_bytes,
+            ram_bytes,
+            self.budget,
+            self.staging_limit,
+            io(&self.root, fs2::available_space(&self.root))?,
+        )?;
+        self.memory_guard
+            .reserve_allocation(ram_bytes)
+            .map_err(|error| invalid(error.to_string()))
     }
     pub(super) fn boundaries(&self, maximum: usize, block: usize, minimum: usize) -> Vec<usize> {
         let Ok(disk) = self.disk.try_lock() else {
@@ -325,7 +348,17 @@ impl Store {
             .ok()
             .map(|_| Permit(Arc::clone(&self.busy)))
     }
+    #[cfg(test)]
     pub(super) fn submit(&self, request: &Request, payload: Payload, permit: Permit) -> Result<()> {
+        self.submit_reserved(request, payload, permit, None)
+    }
+    pub(super) fn submit_reserved(
+        &self,
+        request: &Request,
+        payload: Payload,
+        permit: Permit,
+        memory: Option<crate::memory_guard::MemoryReservation>,
+    ) -> Result<()> {
         let name = request
             .root
             .file_name()
@@ -341,6 +374,7 @@ impl Store {
                 priority: request.key.tokens <= self.priority_tokens,
                 payload,
                 _permit: permit,
+                _memory: memory,
             })
             .map_err(|_| invalid("file SSD occupée"))
     }
@@ -482,6 +516,19 @@ impl Disk {
         Ok(())
     }
 }
+fn check_staging_limits(disk: u64, ram: u64, budget: u64, staging: u64, free: u64) -> Result<()> {
+    if disk > budget {
+        return Err(invalid("entrée plus grande que le budget SSD"));
+    }
+    if disk > free {
+        return Err(invalid("espace libre SSD insuffisant"));
+    }
+    if ram > staging {
+        return Err(invalid("plafond RAM de staging SSD dépassé"));
+    }
+    Ok(())
+}
+
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = io(
         path,

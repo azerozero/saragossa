@@ -2667,8 +2667,8 @@ mod tests {
 
 /// Options du second niveau SSD de `serve`, désactivé sans répertoire explicite.
 /// `SARAGOSSA_SERVE_PREFIX_SSD_DIR` désigne un répertoire privé dédié ;
-/// `SARAGOSSA_SERVE_PREFIX_SSD_GIB` borne les octets persistants et l'unique
-/// écriture en vol (32 Gio par défaut). Les préfixes courts, jusqu'à
+/// `SARAGOSSA_SERVE_PREFIX_SSD_GIB` borne les octets persistants (32 Gio par défaut).
+/// Le staging RAM a son propre plafond, voir [`serve_prefix_ssd_staging_bytes`]. Les préfixes courts, jusqu'à
 /// `SARAGOSSA_SERVE_PREFIX_SSD_PRIORITY_TOKENS` (4096), sont évincés après les
 /// autres ; chaque classe suit un LRU. Aucune priorité n'est reçue du réseau.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2717,4 +2717,20 @@ impl ServePrefixSsdOptions {
             .filter(|&bytes| bytes > 0)
             .ok_or_else(|| crate::InferError::Config("budget SSD invalide".into()))
     }
+}
+
+/// Plafond RAM de préparation SSD, en Mio (512 par défaut), indépendant du disque.
+///
+/// # Errors
+/// Refuse une valeur nulle, mal formée ou dépassant la capacité en octets.
+pub fn serve_prefix_ssd_staging_bytes() -> crate::Result<u64> {
+    let value = env_var("SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB");
+    let mib = value
+        .as_deref()
+        .unwrap_or("512")
+        .parse::<u64>()
+        .map_err(|_| crate::InferError::Config("staging SSD : entier invalide".into()))?;
+    mib.checked_mul(1 << 20)
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| crate::InferError::Config("staging SSD : plafond invalide".into()))
 }

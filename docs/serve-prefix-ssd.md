@@ -70,9 +70,16 @@ Les fichiers ne sont pas chiffrés : ils contiennent des états dérivés des
 prompts, à conserver dans un emplacement privé choisi par l'opérateur.
 
 Un seul instantané est admis entre le début de sa préparation et sa publication.
-Le moteur fige les états Metal et copie les octets utiles dans un staging borné
-par le budget SSD. **Cette copie reste synchrone et ajoute de la RAM temporaire**,
-au plus un instantané ; elle ne remplace pas les gardes mémoire du modèle.
+Avant toute copie ou blit, le moteur estime les blobs (KV, récurrence, historique
+MTP et captures) et leur mémoire temporaire. Il refuse une estimation dépassant
+le budget SSD, l'espace libre actuel ou `SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB`
+(512 Mio par défaut, entier strictement positif). Ce plafond RAM inclut une
+marge conservatrice de 128 Mio pour les manifestes et métadonnées, ainsi que
+les copies temporaires Metal ; le majorant disque réserve 16 Mio de manifeste.
+Une réservation `MemoryGuard` avec les limites de `serve` reste détenue jusqu'à
+la fin du travail du worker. **La copie admise reste synchrone**. Le contrôle
+d'espace libre est préventif : une écriture concurrente externe peut encore
+faire échouer la publication.
 Le worker calcule les sommes de contrôle et réalise toutes les écritures de
 blobs, synchronisations et renommages. Il publie un dossier `pending` complet
 par `rename`, après `fsync` des fichiers et dossiers. Un arrêt brutal avant
@@ -103,7 +110,11 @@ cargo build --release --example prefix_ssd
 
 Mesure à **32768 et 131072 tokens exacts** sur le modèle local choisi, sous le
 verrou GPU du dépôt (aucun téléchargement). Définir `MODEL` sur le répertoire
-Qwen3.8-27B-u4ls local. Le dossier de sortie doit être nouveau :
+Qwen3.8-27B-u4ls local. Ces contextes peuvent dépasser le staging par défaut :
+fixer `SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB` dans l'environnement de mesure
+selon la RAM disponible et vérifier `prefix_ssd written` avant d'interpréter
+une reprise. La garde mémoire reste applicable même avec un plafond relevé.
+Le dossier de sortie doit être nouveau :
 
 ```sh
 python3 -I -B tools/gpulock.py run --owner prefix-ssd --prio 10 -- \

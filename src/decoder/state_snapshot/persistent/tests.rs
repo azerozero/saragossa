@@ -228,6 +228,7 @@ fn lru_touch_changes_the_victim() {
             priority: false,
             payload: payload(&model, &third, &state),
             _permit: store.reserve().unwrap(),
+            _memory: None,
         },
     )
     .unwrap();
@@ -373,7 +374,7 @@ fn process_oracle(dflash: bool) {
     if let Some(phase) = phase {
         let root = PathBuf::from(std::env::var_os("SSD_TEST_ROOT").unwrap());
         if phase != "baseline" {
-            configure_prefix_disk_cache(&root.join("cache"), 1 << 20, 0).unwrap();
+            configure_prefix_disk_cache(&root.join("cache"), 64 << 20, 0).unwrap();
         }
         let model = CausalDecoder::from_tensors(
             crate::decoder::tests::test_weights(),
@@ -483,4 +484,30 @@ fn concurrent_producers_admit_only_one_snapshot() {
     });
     assert_eq!(admitted.load(Ordering::Relaxed), 1);
     assert!(store.reserve().is_some());
+}
+
+#[test]
+fn staging_limits_and_memory_guard_refuse_before_copy() {
+    assert!(check_staging_limits(11, 20, 10, 30, 100).is_err());
+    assert!(check_staging_limits(10, 20, 10, 30, 9).is_err());
+    assert!(check_staging_limits(10, 31, 10, 30, 100).is_err());
+    assert!(check_staging_limits(10, 30, 10, 30, 10).is_ok());
+    let root = private_dir();
+    let mut store = Store::open(root.path(), 64 << 20, 0).unwrap();
+    let (model, request, state) = fixture(&store, 1);
+    let (disk, ram) = staging_estimate(&state.cache, &state.final_state, None, None);
+    assert!(disk >= payload(&model, &request, &state).bytes());
+    store.memory_guard = crate::memory_guard::MemoryGuard::from_limits(
+        true,
+        crate::memory_guard::MemoryLimits {
+            static_cap: Some(ram - 1),
+            host_memory: None,
+            headroom_bytes: 0,
+            metal_cap: None,
+        },
+        Arc::new(|| Some(0)),
+    );
+    assert!(store.admit_staging(disk, ram).is_err());
+    assert!(!request.root.exists());
+    assert!(!store.busy.load(Ordering::Acquire));
 }

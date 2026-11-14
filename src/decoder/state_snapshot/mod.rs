@@ -358,6 +358,47 @@ struct Manifest {
     captures: Option<Captures>,
 }
 
+/// Majorant sans copie des blobs et du pic de préparation. Seules les tailles
+/// KV sont lues ; chaque occurrence sérialisée compte, même aliasée.
+fn staging_estimate(
+    cache: &CausalDecoderCache,
+    final_state: &Tensor,
+    history: Option<&LayerKvCache>,
+    captures: Option<&PrefixCaptures>,
+) -> (u64, u64) {
+    let mut blobs = (final_state.data().len() as u64).saturating_mul(4);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let mut scratch = 0u64;
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let scratch = 0u64;
+    for layer in cache.layers.iter().chain(history) {
+        for rows in [&layer.keys, &layer.values] {
+            blobs = blobs.saturating_add(rows.snapshot_bytes());
+        }
+        blobs = blobs.saturating_add(
+            (layer.linear.conv.len() as u64)
+                .saturating_add(layer.linear.ssm.len() as u64)
+                .saturating_mul(4),
+        );
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(state) = layer.linear.metal_state() {
+            let bytes = state.estimated_bytes() as u64;
+            blobs = blobs.saturating_add(bytes);
+            // disk_parts : blit GPU, lecture CPU et conversion temporaire.
+            scratch = scratch.max(bytes.saturating_mul(3));
+        }
+    }
+    if let Some(captures) = captures {
+        blobs = blobs.saturating_add((captures.hidden.data().len() as u64).saturating_mul(4));
+    }
+    let disk = blobs.saturating_add(MAX_MANIFEST_BYTES).saturating_add(64);
+    // Manifeste, métadonnées et réécriture JSON du worker : marge conservatrice.
+    let ram = blobs
+        .saturating_add(scratch)
+        .saturating_add(MAX_MANIFEST_BYTES * 8);
+    (disk, ram)
+}
+
 impl CausalDecoder {
     pub(crate) fn with_snapshot_sources(mut self, sources: SnapshotSources) -> Self {
         self.snapshot_sources = sources.finish_loading();
@@ -634,6 +675,7 @@ impl CausalDecoder {
             return;
         };
         let store = persistent::store().filter(|store| request.root.starts_with(&store.root));
+        let mut reservation = None;
         let permit = if let Some(store) = store {
             if store.contains(request) {
                 return;
@@ -642,6 +684,14 @@ impl CausalDecoder {
                 eprintln!("prefix_ssd skipped reason=writer_busy");
                 return;
             };
+            let (disk_bytes, ram_bytes) = staging_estimate(cache, final_state, history, captures);
+            match store.admit_staging(disk_bytes, ram_bytes) {
+                Ok(memory) => reservation = Some(memory),
+                Err(error) => {
+                    eprintln!("prefix_ssd skipped before_copy: {error}");
+                    return;
+                }
+            }
             Some(permit)
         } else {
             None
@@ -683,7 +733,12 @@ impl CausalDecoder {
             snapshot_calculations_complete()?;
             request.key.sources.iter().try_for_each(Source::verify)?;
             if let (Some(store), Some(permit)) = (store, permit) {
-                return store.submit(request, writer.finish_buffered(&manifest)?, permit);
+                return store.submit_reserved(
+                    request,
+                    writer.finish_buffered(&manifest)?,
+                    permit,
+                    reservation,
+                );
             }
             writer.publish(&manifest)?;
             eprintln!(

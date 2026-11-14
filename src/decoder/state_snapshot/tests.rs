@@ -1070,3 +1070,28 @@ fn unwritable_snapshot_keeps_generation_without_manifest() {
         assert_eq!(log.matches("; sans écriture").count(), 2, "{log}");
     }
 }
+
+#[test]
+fn staging_estimate_counts_aliased_history_and_captures_without_copy() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let (model, _) = fixture(dir.path());
+    let (cache, final_state) = model.prefill_cache_state(&[0, 1])?;
+    let history = &cache.layers[0];
+    let captures = PrefixCaptures::new(&[0], 1, final_state.clone());
+    let (plain_disk, plain_ram) = staging_estimate(&cache, &final_state, None, None);
+    let (disk, ram) = staging_estimate(&cache, &final_state, Some(history), Some(&captures));
+    let history_bytes = history.keys.snapshot_bytes() + history.values.snapshot_bytes();
+    let capture_bytes = (captures.hidden.data().len() * 4) as u64;
+    assert_eq!(disk - plain_disk, history_bytes + capture_bytes);
+    assert_eq!(ram - plain_ram, history_bytes + capture_bytes);
+    assert_eq!(
+        history.keys.snapshot_bytes(),
+        history
+            .keys
+            .snapshot_segments()
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>()
+    );
+    Ok(())
+}
