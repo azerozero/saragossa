@@ -3690,8 +3690,9 @@ impl CausalDecoder {
 
     /// Capture le prefill Gemma 4 MoE dans un répertoire neuf (feature `devtools`).
     ///
-    /// Utilise le runtime attaché : CPU f32 ou Metal per-op par défaut, sans
-    /// cache de préfixe ni snapshot disque. Aucun poids ni token n'est téléchargé.
+    /// Utilise le runtime attaché : CPU f32, ou Metal per-op avec
+    /// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0`, sans cache de préfixe ni
+    /// snapshot disque. Aucun poids ni token n'est téléchargé.
     ///
     /// # Errors
     ///

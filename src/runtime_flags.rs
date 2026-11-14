@@ -1534,10 +1534,12 @@ pub(crate) fn override_prefill_resident_gemma4_for_test(
 
 /// Active le prefill résident Gemma 4.
 ///
-/// Défaut OFF : le KL chat passe, mais le prefill q4a8-ls diverge du per-op
-/// au token greedy 161 sur le corpus 1k et 62 à 4k (oracles sur 200 tokens).
-/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` reste une qualification explicite ;
-/// voir docs/perf/gemma4-prefill.md.
+/// Défaut ON (décision du 2026-11-14) : l'oracle KL de référence qualifie
+/// les deux chemins, avec les mêmes seuils. L'attention per-op CPU f32 et
+/// l'attention résidente GPU ont des arrondis différents : l'identité greedy
+/// à 1k/4k n'est pas le critère de qualité (voir docs/perf/gemma4-prefill.md).
+/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0` rétablit le per-op.
+/// Une erreur d'exécution résidente est propagée, sans repli silencieux.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_gemma4_enabled() -> bool {
     #[cfg(test)]
@@ -1545,7 +1547,7 @@ pub(super) fn prefill_resident_gemma4_enabled() -> bool {
         return forced;
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", true))
 }
 
 /// Active le tail MLP dense du prefill résident (27B hybride `qwen3_5`).
