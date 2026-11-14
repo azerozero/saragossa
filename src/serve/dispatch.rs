@@ -660,6 +660,7 @@ mod tests {
         ] {
             let raw = format!("POST {route} HTTP/1.1\r\nContent-Length: 16777217\r\n\r\n");
             let reply = response(connect(&dispatcher, raw.as_bytes()));
+            settle(&dispatcher);
             assert!(reply.starts_with("HTTP/1.1 400 Bad Request"));
             let body = json_body(&reply);
             assert_eq!(body["error"]["type"], "invalid_request_error");
@@ -698,6 +699,9 @@ mod tests {
             };
             let raw = format!("GET {path} HTTP/1.1\r\n{auth}\r\n");
             let reply = response(connect(&dispatcher, raw.as_bytes()));
+            // La socket se ferme avant que le thread rende son slot : sans
+            // attente, la requête suivante peut dépasser max_connections.
+            settle(&dispatcher);
             assert!(reply.starts_with(&format!("HTTP/1.1 {status} ")), "{reply}");
             let body = json_body(&reply);
             if status == 200 {
