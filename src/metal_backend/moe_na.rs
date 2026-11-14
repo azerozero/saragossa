@@ -883,9 +883,7 @@ impl MetalExecutor {
         // down : GEMM + SCATTER fusé (écrit scratch.down[slot] via perm).
         // DIAGNOSTIC perf : SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM saute les 3 grouped GEMMs
         // (sortie FAUSSE) → le delta vs la version complète = le coût du GEMM routé.
-        let skip_gemm =
-            crate::runtime_flags::env_var(crate::runtime_flags::SNAPSHOT_ABLATION_FLAGS[0])
-                .is_some();
+        let skip_gemm = crate::runtime_flags::moe_coop_skip_gemm();
         let fused_swiglu = !skip_gemm && moe_coop_fused_swiglu_enabled();
         if skip_gemm {
             // Zéro gate/up (0.0f32 = 0u32) pour éviter les dénormaux qui faussent le timing.
@@ -959,9 +957,7 @@ impl MetalExecutor {
         }
         // Expert partagé + combine (même encodeur). DIAGNOSTIC : SKIP_SHARED saute
         // les 3 projections shared (par-token, qmv) → le delta = leur coût.
-        let skip_shared =
-            crate::runtime_flags::env_var(crate::runtime_flags::SNAPSHOT_ABLATION_FLAGS[1])
-                .is_some();
+        let skip_shared = crate::runtime_flags::moe_coop_skip_shared();
         let gate_dim = self.encode_matmul_weight_buffers(
             encoder,
             input_buffer,
