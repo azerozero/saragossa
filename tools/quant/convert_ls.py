@@ -110,23 +110,47 @@ def convert(src, template, dst, imatrix=None, imatrix_blend=False):
     weights = {}
     for path in sources:
         weights.update(mx.load(str(path)))
-    # Tous les shards sont contrôlés avant toute création ou conversion.
+    # mlx-lm peut ranger poids, échelles et biais d'un même module dans des
+    # shards différents (lm_head) : la validation porte sur l'ensemble.
+    owner, merged = {}, {}
     for path in shards:
         shard = mx.load(str(path))
-        for base in quantized_names(shard):
-            try:
-                x = bf16_tensor(mx, weights, base)
-                bits = quantization_spec(config, base)
-                validate_shapes(shard, base, x.shape, bits)
-                importance_for(matrix, base, x.shape[-1])
-            except ValueError as error:
-                raise ValueError(f"{error} ({path.name})") from None
+        merged.update(shard)
+        owner.update((key, path) for key in shard)
+    # Ordre des shards conservé : l'erreur signalée est celle du premier shard fautif.
+    bases = sorted(quantized_names(merged), key=lambda base: (shards.index(owner[base + '.scales']), base))
+    # Tous les modules sont contrôlés avant toute création ou conversion.
+    for base in bases:
+        try:
+            x = bf16_tensor(mx, weights, base)
+            bits = quantization_spec(config, base)
+            validate_shapes(merged, base, x.shape, bits)
+            importance_for(matrix, base, x.shape[-1])
+        except ValueError as error:
+            raise ValueError(f"{error} ({owner[base + '.scales'].name})") from None
+    del merged
+    suffixes = (".weight", ".scales", ".biases")
+    fitted = {}
     dst.mkdir(parents=True, exist_ok=False)
     count, err0, err1, total = 0, 0.0, 0.0, 0
     for path in shards:
         shard = mx.load(str(path))
-        names = quantized_names(shard)
+        names = sorted({base for base in bases
+                        if any(owner[base + suffix] == path for suffix in suffixes)})
         for base in names:
+            if base in fitted:
+                # Ajusté pour un shard précédent : seuls les tenseurs restants sont écrits.
+                remaining = []
+                for key, new in fitted.pop(base):
+                    if owner[key] != path:
+                        remaining.append((key, new))
+                        continue
+                    if new.shape != shard[key].shape or new.dtype != shard[key].dtype:
+                        raise ValueError(f"format incompatible : {key}")
+                    shard[key] = new
+                if remaining:
+                    fitted[base] = remaining
+                continue
             x = bf16_tensor(mx, weights, base)
             bits = quantization_spec(config, base)
             weight = importance_for(matrix, base, x.shape[-1])
@@ -134,11 +158,18 @@ def convert(src, template, dst, imatrix=None, imatrix_blend=False):
             packed, scale, bias, rmse0, rmse1 = opt_quant.fit(
                 x, bits=bits, weight=weight, imatrix_blend=blend)
             mx.eval(packed, scale, bias, rmse0, rmse1)
-            for suffix, new in ((".weight", packed), (".scales", scale), (".biases", bias)):
-                old = shard[base + suffix]
+            later = []
+            for suffix, new in zip(suffixes, (packed, scale, bias)):
+                key = base + suffix
+                if owner[key] != path:
+                    later.append((key, new))
+                    continue
+                old = shard[key]
                 if new.shape != old.shape or new.dtype != old.dtype:
-                    raise ValueError(f"format incompatible : {base}{suffix}")
-                shard[base + suffix] = new
+                    raise ValueError(f"format incompatible : {key}")
+                shard[key] = new
+            if later:
+                fitted[base] = later
             count += 1
             mass = opt_quant.error_mass(x, weight, blend)
             if matrix is not None and weight is None and base.endswith(".embed_tokens"):
@@ -150,6 +181,8 @@ def convert(src, template, dst, imatrix=None, imatrix_blend=False):
         total += sum(v.nbytes for v in shard.values())
         ratio = err1 / err0 if err0 else 0
         print("écrit", out.name, count, f"MSE ls/minmax {ratio:.4f}", flush=True)
+    if fitted:
+        raise ValueError(f"tenseurs ajustés jamais écrits : {sorted(fitted)}")
     for path in template.iterdir():
         if path.is_file() and path not in shards and path.name != "README.md":
             shutil.copy2(path, dst / path.name)
