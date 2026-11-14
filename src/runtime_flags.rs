@@ -1424,6 +1424,14 @@ pub(crate) fn prefill_kv_shared_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_SHARED", true))
 }
 
+/// GEMM NA tuilé des poids bf16 denses au prefill (batch ≥ 64). Défaut ON ;
+/// `SARAGOSSA_RUST_DENSE_BF16_GEMM=0` rétablit le qmv par ligne.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn dense_bf16_gemm_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM", true))
+}
+
 /// Taille cible, en tokens, d'un morceau du prefill résident. Les buffers
 /// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
 /// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est
