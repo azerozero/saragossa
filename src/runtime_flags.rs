@@ -1292,7 +1292,8 @@ pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
 }
 
 /// Stocke en bf16 le K/V full-attention du prefill résident par morceaux,
-/// au lieu du f32. Seulement si le NAX d256 lit déjà ce K/V en bf16 et que
+/// au lieu du f32. Seulement si le NAX causal (d256, ou d128 sans sinks) lit
+/// déjà ce K/V en bf16 et que
 /// l'arène de decode sera bf16 (prompt ≥ [`kv_bf16_greedy_min_tokens`], ni
 /// `SARAGOSSA_RUST_KV_BF16=0` ni KV quantifié) : sorties du prefill et arène
 /// bit-identiques, 2 octets au lieu de 4 par valeur. Défaut ON depuis le
