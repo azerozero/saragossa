@@ -222,6 +222,34 @@ pub(crate) fn scratch_cap_bytes() -> u64 {
     })
 }
 
+/// Plafond du poids bf16 matérialisé par le GEMM NA avec déquantification.
+/// `SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES` est exprimé en octets :
+/// défaut 512 Mio, zéro désactive ce chemin. Une valeur invalide garde le défaut.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn qmm_na_dequant_max_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        qmm_na_dequant_cap_from_env(env_var("SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES").as_deref())
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn qmm_na_dequant_cap_from_env(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(512 * 1024 * 1024)
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[test]
+fn qmm_na_dequant_budget_flag_parsing() {
+    for raw in [None, Some(""), Some("-1"), Some("invalid")] {
+        assert_eq!(qmm_na_dequant_cap_from_env(raw), 512 * 1024 * 1024);
+    }
+    assert_eq!(qmm_na_dequant_cap_from_env(Some("0")), 0);
+    assert_eq!(qmm_na_dequant_cap_from_env(Some(" 65536 ")), 65536);
+}
+
 /// Active le recast bf16 de la sortie d'embedding Qwen. **Défaut ON** :
 /// aligne la sortie d'embedding sur oMLX (accord teacher-forced 98,04 → 99,35 %),
 /// l'arrondi se fait dans le gather résident sans dispatch ajouté (coût decode/prefill nul).

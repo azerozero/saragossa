@@ -200,3 +200,19 @@ impl MetalExecutor {
         })
     }
 }
+
+/// Les réductions d'attention supposent un nombre fixe de simdgroups.
+/// Refuser un pipeline trop petit, sans réduire silencieusement la grille.
+pub(crate) fn check_threadgroup_size(
+    pipeline: &metal::ComputePipelineStateRef,
+    threads: u64,
+    label: &str,
+) -> Result<()> {
+    let limit = pipeline.max_total_threads_per_threadgroup();
+    if threads > limit {
+        return Err(InferError::Metal(format!(
+            "{label}: {threads} threads requis, limite du pipeline {limit}"
+        )));
+    }
+    Ok(())
+}

@@ -600,9 +600,17 @@ pub(super) fn can_use_qmm_na_dequant(
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
     crate::runtime_flags::qmm_na_dequant_allowed()
         && qmm_na_enabled()
         && batch >= qmm_na_min_batch()
+        && qmm_na_dequant_fits(
+            in_dim,
+            out_dim,
+            crate::runtime_flags::qmm_na_dequant_max_bytes(),
+        )
         && matches!(weight.bits(), 5 | 6 | 8)
         && !(weight.bits() == 6 && qmm_u6_enabled())
         && weight.group_size() == FAST_QMV_GROUP_SIZE
@@ -956,4 +964,27 @@ pub(super) fn qmm_na_min_batch() -> usize {
             .filter(|min| *min >= 2)
             .unwrap_or(32)
     })
+}
+
+/// Borne le scratch bf16 sans allouer le poids ni laisser déborder N*K*2.
+pub(super) fn qmm_na_dequant_fits(in_dim: usize, out_dim: usize, cap: usize) -> bool {
+    in_dim > 0
+        && out_dim > 0
+        && in_dim
+            .checked_mul(out_dim)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<u16>()))
+            .is_some_and(|bytes| bytes <= cap)
+}
+
+#[test]
+fn qmm_na_dequant_budget_bounds_and_overflow() {
+    let cap = 512 * 1024 * 1024;
+    assert!(qmm_na_dequant_fits(16384, 16384, cap));
+    assert!(!qmm_na_dequant_fits(16384, 16385, cap));
+    assert!(!qmm_na_dequant_fits(5120, 248320, cap));
+    assert!(!qmm_na_dequant_fits(usize::MAX, 2, usize::MAX));
+    assert!(!qmm_na_dequant_fits(usize::MAX / 2 + 1, 1, usize::MAX));
+    assert!(!qmm_na_dequant_fits(0, 1, cap));
+    assert!(!qmm_na_dequant_fits(1, 0, cap));
+    assert!(!qmm_na_dequant_fits(1, 1, 0));
 }

@@ -581,30 +581,6 @@ impl MetalExecutor {
         Ok(())
     }
 
-    /// Linear-attn gated-delta en forme CHUNKÉE (port chunked-DeltaNet brique 4).
-    /// 1 threadgroup/value_head, boucle sur T/C chunks (16× moins d'étapes séquentielles).
-    /// Exige `value_head_dim == 128` et `key_head_dim == 128`. Opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`.
-    ///
-    /// Correspondance étapes du kernel ↔ équations (section « Forme chunkée » de la
-    /// doc de module `crate::linear_attention`, chunk C=16, `S₀` = état d'entrée) :
-    /// - boucle `gamma[i]` (tid 0) : decays cumulés intra-chunk `γ_i = ∏_{j≤i} g_j` ;
-    /// - 1ʳᵉ passe par colonne `c` : `u[i]  = β_i·(v_i − γ_i·(S₀·k_i))` (delta contre S₀
-    ///   décayé) et `qs[i] = S₀·q_i` (part de lecture venant de l'état d'entrée) ;
-    /// - remplissage `A`/`P` (strided sur les threads) : couplages intra-chunk
-    ///   `A_ij = β_i·(γ_i/γ_j)·(k_i·k_j)` (j<i) et `P_ij = (γ_i/γ_j)·(q_i·k_j)` (j≤i) ;
-    /// - substitution avant : `Δ_i = u_i − Σ_{j<i} A_ij·Δ_j` (résout (I+A)·Δ = u,
-    ///   équivalent au déroulé séquentiel de la delta rule) ;
-    /// - sortie : `y_i = γ_i·qs_i + Σ_{j≤i} P_ij·Δ_j` ;
-    /// - fin de chunk : `S ← γ_last·S₀ + Σ_j (γ_last/γ_j)·Δ_j·k_jᵀ` (état repris par
-    ///   le chunk suivant, GQA : chaque tête de valeur lit q/k de sa tête clé).
-    ///
-    /// Oracle CPU naïf token-par-token : `naive_gdn_reference` dans
-    /// `linear_attention/tests.rs`, comparé ici par
-    /// `chunk_delta_seq_layout_gqa_matches_naive_oracle` (metal_backend/tests.rs).
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si dims non supportées ou NA indisponible.
     #[expect(
         clippy::too_many_arguments,
         reason = "wrapper d'encodage : buffers explicites"
@@ -674,66 +650,30 @@ impl MetalExecutor {
         Ok(true)
     }
 
+    /// Entrée historique conservée pour refuser explicitement LINEAR_CHUNKED.
+    /// Les kernels scalaire et tensor-core ont été retirés : ratios de decays
+    /// instables, queues non masquées et synchronisation device insuffisante.
+    /// Aucun dispatch ni aucune écriture d'état n'est encodé.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "entrée historique de l'encodeur chunké"
+    )]
     pub(super) fn encode_chunk_delta_seq_layout(
         &self,
-        encoder: &ComputeCommandEncoderRef,
-        conv_out_buffer: &BufferRef,
-        q_norm_buffer: &BufferRef,
-        k_norm_buffer: &BufferRef,
-        beta_buffer: &BufferRef,
-        decay_buffer: &BufferRef,
-        ssm_state_buffer: &BufferRef,
-        y_buffer: &BufferRef,
-        steps: usize,
-        spec: LinearAttentionStepSpec,
+        _encoder: &ComputeCommandEncoderRef,
+        _conv_out_buffer: &BufferRef,
+        _q_norm_buffer: &BufferRef,
+        _k_norm_buffer: &BufferRef,
+        _beta_buffer: &BufferRef,
+        _decay_buffer: &BufferRef,
+        _ssm_state_buffer: &BufferRef,
+        _y_buffer: &BufferRef,
+        _steps: usize,
+        _spec: LinearAttentionStepSpec,
     ) -> Result<()> {
-        if spec.key_head_dim != 128 || spec.value_head_dim != 128 {
-            return Err(InferError::Dimension(format!(
-                "chunk-delta layout exige key/value_head_dim=128, reçu k={} v={}",
-                spec.key_head_dim, spec.value_head_dim
-            )));
-        }
-        let repeat = spec
-            .num_value_heads
-            .checked_div(spec.num_key_heads)
-            .ok_or_else(|| InferError::Metal("chunk-delta repeat nul".to_string()))?;
-        // Préfère la variante TENSOR-CORES (KS/QS+state-update sur simdgroup_matrix,
-        // ~3x mono-tête) ; repli sur le scalaire si indisponible.
-        let pso = self
-            .chunk_delta_seq_layout_tc
-            .as_ref()
-            .or(self.chunk_delta_seq_layout.as_ref())
-            .ok_or_else(|| InferError::Config("chunk_delta_seq_layout indisponible".into()))?;
-        let dims = [
-            checked_u32(spec.num_value_heads, "chunk-delta vheads")?,
-            checked_u32(spec.value_head_dim, "chunk-delta vhd")?,
-            checked_u32(repeat, "chunk-delta repeat")?,
-            checked_u32(steps, "chunk-delta steps")?,
-        ];
-        encoder.set_compute_pipeline_state(pso);
-        encoder.set_buffer(0, Some(conv_out_buffer), 0);
-        encoder.set_buffer(1, Some(q_norm_buffer), 0);
-        encoder.set_buffer(2, Some(k_norm_buffer), 0);
-        encoder.set_buffer(3, Some(beta_buffer), 0);
-        encoder.set_buffer(4, Some(decay_buffer), 0);
-        encoder.set_buffer(5, Some(ssm_state_buffer), 0);
-        encoder.set_buffer(6, Some(y_buffer), 0);
-        set_u32_bytes(encoder, 7, &dims, "chunk_delta_layout_dims")?;
-        profile_dispatch();
-        encoder.dispatch_thread_groups(
-            MTLSize::new(
-                checked_nsuint(spec.num_value_heads, "chunk-delta vheads grid")?,
-                1,
-                1,
-            ),
-            MTLSize::new(
-                checked_nsuint(spec.value_head_dim, "chunk-delta vhd tg")?,
-                1,
-                1,
-            ),
-        );
-        post_dispatch_barrier(encoder);
-        Ok(())
+        Err(InferError::Config(
+            "SARAGOSSA_RUST_LINEAR_CHUNKED: chemin retiré (course, bornes et ratios de decay); supprimer le flag pour conserver NAX ou le scan séquentiel".into(),
+        ))
     }
 
     #[expect(
