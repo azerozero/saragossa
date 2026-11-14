@@ -72,7 +72,7 @@ pub(super) struct ChatCompletionRequest {
     /// Filtre min-p : non implémenté, seule la valeur neutre 0 est admise.
     #[serde(default)]
     pub(super) min_p: Option<f32>,
-    /// Biais de logits non implémenté : toute valeur non nulle est refusée.
+    /// Biais de logits non implémenté : seul un objet vide ou null est admis.
     #[serde(default)]
     pub(super) logit_bias: Option<Value>,
     /// Pénalité de présence OpenAI : non implémentée, neutre 0 seulement.
@@ -169,7 +169,11 @@ impl ChatCompletionRequest {
     /// budget plafonné, format de sortie et stop sequences bornées. Rend le
     /// budget effectif.
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
-        if self.logit_bias.is_some() {
+        if self
+            .logit_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.as_object().is_some_and(|object| object.is_empty()))
+        {
             return Err(ServeError::InvalidParameter {
                 param: "logit_bias",
                 message: "le biais de logits n'est pas implémenté",
@@ -1210,12 +1214,29 @@ mod logit_bias_tests {
     use super::*;
 
     #[test]
-    fn omitted_or_null_logit_bias_preserves_validation() {
-        for suffix in ["", ", \"logit_bias\":null"] {
+    fn neutral_logit_bias_preserves_validation() {
+        for suffix in ["", ", \"logit_bias\":null", ", \"logit_bias\":{}"] {
             let body = format!(r#"{{"model":"m", "messages":[], "max_tokens":1{suffix}}}"#);
             let request =
                 ChatCompletionRequest::parse(body.as_bytes()).expect("invariant: JSON valide");
             assert_eq!(request.validate(1).expect("invariant: sans biais"), 1);
+        }
+    }
+
+    #[test]
+    fn nonempty_or_invalid_logit_bias_is_rejected() {
+        for bias in [r#"{"42":-100}"#, r#"{"42":0}"#, "false", "[]", "0", r#""""#] {
+            let body =
+                format!(r#"{{"model":"m", "messages":[], "max_tokens":1, "logit_bias":{bias}}}"#);
+            let request =
+                ChatCompletionRequest::parse(body.as_bytes()).expect("invariant: JSON valide");
+            assert!(matches!(
+                request.validate(1),
+                Err(ServeError::InvalidParameter {
+                    param: "logit_bias",
+                    ..
+                })
+            ));
         }
     }
 }
