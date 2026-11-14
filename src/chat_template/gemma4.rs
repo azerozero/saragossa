@@ -158,8 +158,8 @@ fn format_value(value: &Value, escape_keys: bool) -> String {
         ),
         Value::Object(object) => format!(
             "{{{}}}",
-            object
-                .iter()
+            sorted_entries(object)
+                .into_iter()
                 .map(|(key, value)| {
                     let key = if escape_keys {
                         format!("<|\"|>{key}<|\"|>")
@@ -174,6 +174,14 @@ fn format_value(value: &Value, escape_keys: bool) -> String {
         Value::Null => "None".into(),
         _ => value.to_string(),
     }
+}
+
+fn sorted_entries(object: &serde_json::Map<String, Value>) -> Vec<(&String, &Value)> {
+    // llguidance enables preserve_order globally. Keep the established Gemma
+    // prompt ordering independent of serde_json's selected map implementation.
+    let mut entries: Vec<_> = object.iter().collect();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    entries
 }
 
 fn nonempty(value: &Value) -> bool {
@@ -199,8 +207,8 @@ fn properties(value: &Value) -> String {
     let Some(object) = value.as_object() else {
         return String::new();
     };
-    object
-        .iter()
+    sorted_entries(object)
+        .into_iter()
         .map(|(key, value)| format!("{key}:{}", parameter(value)))
         .collect::<Vec<_>>()
         .join(",")
@@ -220,8 +228,8 @@ fn parameter(value: &Value) -> String {
     }
     if kind == "ARRAY" {
         if let Some(items) = value["items"].as_object().filter(|o| !o.is_empty()) {
-            let items = items
-                .iter()
+            let items = sorted_entries(items)
+                .into_iter()
                 .filter(|(_, v)| !v.is_null())
                 .map(|(key, v)| match key.as_str() {
                     "properties" => format!("properties:{{{}}}", properties(v)),

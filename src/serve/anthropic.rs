@@ -146,6 +146,8 @@ fn parse_anthropic_messages_request(body: &[u8]) -> ServeResult<AnthropicMessage
 #[derive(Clone, Debug, Deserialize)]
 struct AnthropicMessagesRequest {
     model: String,
+    #[serde(default)]
+    output_config: Option<Value>,
     max_tokens: Option<usize>,
     messages: Vec<AnthropicInputMessage>,
     #[serde(default)]
@@ -208,7 +210,11 @@ impl AnthropicMessagesRequest {
             top_p: self.top_p,
             top_k: None,
             stop,
-            response_format: None,
+            response_format: self
+                .output_config
+                .as_ref()
+                .map(super::protocol::ResponseFormat::from_anthropic)
+                .transpose()?,
             user: None,
             tools: Some(convert_tools(&self.tools)?),
             tool_choice: anthropic_tool_choice(self.tool_choice.as_ref())?,

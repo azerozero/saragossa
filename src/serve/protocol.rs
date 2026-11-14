@@ -340,10 +340,13 @@ impl ChatCompletionRequest {
             "text" => Ok(ResponseFormatMode::Text),
             "json_object" => Ok(ResponseFormatMode::JsonObject),
             "json_lines" => Ok(ResponseFormatMode::JsonLines),
-            "json_schema" => Err(ServeError::not_implemented(
-                "response_format json_schema n'est pas encore supporté (v1: json_object, extension saragossa json_lines)",
+            "json_schema" => {
+                format.compiled_schema()?;
+                Ok(ResponseFormatMode::JsonSchema)
+            }
+            _ => Err(ServeError::Http(
+                "response_format.type: type JSON string invalide".into(),
             )),
-            _ => Err(ServeError::Http("response_format.type: type JSON string invalide".into())),
         }
     }
 
@@ -415,6 +418,8 @@ pub(super) enum ResponseFormatMode {
     Text,
     /// Objet JSON racine contraint par le sampler.
     JsonObject,
+    /// Objet racine contraint par un schéma JSON.
+    JsonSchema,
     /// Suite NDJSON saragossa, un objet JSON racine complet par ligne.
     JsonLines,
 }
@@ -425,6 +430,79 @@ pub(super) struct ResponseFormat {
     /// Type demandé (`text`, `json_object`, `json_lines`, `json_schema`).
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    json_schema: Option<SchemaFormat>,
+    #[serde(skip)]
+    compiled: std::sync::OnceLock<std::sync::Arc<saragossa::guided::JsonSchema>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SchemaFormat {
+    name: String,
+    schema: Value,
+    #[serde(default)]
+    strict: Option<bool>,
+}
+
+impl ResponseFormat {
+    pub(super) fn compiled_schema(
+        &self,
+    ) -> ServeResult<std::sync::Arc<saragossa::guided::JsonSchema>> {
+        if let Some(schema) = self.compiled.get() {
+            return Ok(std::sync::Arc::clone(schema));
+        }
+        let format = self
+            .json_schema
+            .as_ref()
+            .ok_or_else(|| ServeError::Http("response_format.json_schema requis".into()))?;
+        if format.name.is_empty()
+            || format.name.len() > 64
+            || !format
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(ServeError::Http(
+                "json_schema.name: 1 à 64 caractères alphanumériques, _ ou - requis".into(),
+            ));
+        }
+        // false/absent retain the same guarantee; unsupported schemas never degrade to text.
+        let _strict = format.strict;
+        let schema = std::sync::Arc::new(
+            saragossa::guided::JsonSchema::compile(&format.schema)
+                .map_err(|error| ServeError::Http(error.to_string()))?,
+        );
+        let _ = self.compiled.set(std::sync::Arc::clone(&schema));
+        Ok(self.compiled.get().map_or(schema, std::sync::Arc::clone))
+    }
+
+    pub(super) fn from_anthropic(config: &Value) -> ServeResult<Self> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| ServeError::Http("output_config: objet requis".into()))?;
+        let format = &config["format"];
+        if object.keys().any(|key| key != "format")
+            || format["type"] != "json_schema"
+            || format
+                .as_object()
+                .is_none_or(|o| o.keys().any(|key| key != "type" && key != "schema"))
+        {
+            return Err(ServeError::Http(
+                "output_config.format: seuls type=json_schema et schema sont supportés".into(),
+            ));
+        }
+        let response = Self {
+            kind: "json_schema".into(),
+            json_schema: Some(SchemaFormat {
+                name: "response".into(),
+                schema: format["schema"].clone(),
+                strict: Some(true),
+            }),
+            compiled: std::sync::OnceLock::new(),
+        };
+        response.compiled_schema()?;
+        Ok(response)
+    }
 }
 
 /// Message OpenAI minimal.
@@ -1237,6 +1315,50 @@ mod logit_bias_tests {
                     ..
                 })
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn schema_cache_and_strict_modes() {
+        for strict in [Value::Null, json!(true), json!(false)] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"test", "messages":[], "response_format":{"type":"json_schema", "json_schema":{
+                    "name":"weather", "strict":strict, "schema":{"type":"object"}
+                }}
+            })).expect("request");
+            assert_eq!(
+                request.response_format_mode().expect("mode"),
+                ResponseFormatMode::JsonSchema
+            );
+            let format = request.response_format.as_ref().expect("format");
+            assert!(std::sync::Arc::ptr_eq(
+                &format.compiled_schema().expect("schema"),
+                &format.compiled_schema().expect("cached")
+            ));
+            assert!(!request.batchable(256));
+        }
+    }
+
+    #[test]
+    fn anthropic_schema_conversion_and_invalid_config() {
+        let format = ResponseFormat::from_anthropic(
+            &json!({"format":{"type":"json_schema", "schema":{"type":"object"}}}),
+        )
+        .expect("format");
+        assert!(format.compiled_schema().is_ok());
+        for config in [
+            json!({}),
+            json!({"format":{"type":"text"}}),
+            json!({"format":{"type":"json_schema", "schema":{"type":"object", "pattern":".*"}}}),
+            json!({"format":{"type":"json_schema", "schema":{"type":"object"}}, "effort":"high"}),
+        ] {
+            assert!(ResponseFormat::from_anthropic(&config).is_err());
         }
     }
 }
