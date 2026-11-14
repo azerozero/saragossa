@@ -5742,9 +5742,9 @@ impl CausalDecoder {
                 cache.position = prompt.len();
                 Ok(Some((cache, final_hidden, captures)))
             }
-            // Erreur d'exécution flint : la propager plutôt que masquer un
-            // kernel cassé derrière un prefill CPU ~500× plus lent.
-            Err(error) if resident_only => Err(error),
+            // Une erreur résidente Gemma 4 ou flint ne doit pas masquer un
+            // kernel cassé derrière un prefill CPU beaucoup plus lent.
+            Err(error) if resident_only || self.config.is_gemma4 => Err(error),
             Err(error) => {
                 if trace_prefill_enabled() {
                     eprintln!("prefill résident fallback: {error}");

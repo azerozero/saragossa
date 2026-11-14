@@ -347,6 +347,7 @@ pub struct MetalExecutor {
     causal_attention_prefill_f32: ComputePipelineState,
     causal_attention_prefill_mid_f32: ComputePipelineState,
     causal_attention_prefill_long_f32: ComputePipelineState,
+    causal_attention_prefill_long_d512_f32: ComputePipelineState,
     windowed_attention_prefill_f32: ComputePipelineState,
     windowed_attention_prefill_mid_f32: ComputePipelineState,
     windowed_attention_prefill_long_f32: ComputePipelineState,

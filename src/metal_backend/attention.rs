@@ -1234,8 +1234,8 @@ impl MetalExecutor {
         // Le kernel court `causal_attention_prefill_f32` reste figé pour seq <=
         // 256. La variante mid garde les scores en threadgroup jusqu'à 2048 pour
         // éviter les trois passes de recalcul du long sur les prompts usuels.
-        // Au-delà, le long reste le fallback non borné ; il exige head_dim <= 256
-        // (une colonne de sortie par thread).
+        // Au-delà, le long reste le fallback non borné ; il accepte head_dim <= 512
+        // (deux colonnes indépendantes par thread).
         let (pipeline, tg_width, grid_heads, grid_rows) = if spec.seq <= 256 {
             (
                 &self.causal_attention_prefill_f32,
@@ -1268,6 +1268,13 @@ impl MetalExecutor {
                 spec.q_heads,
                 spec.seq,
             )
+        } else if spec.head_dim > 256 && spec.head_dim <= 512 {
+            (
+                &self.causal_attention_prefill_long_d512_f32,
+                FULL_ATTN_PREFILL_TG_WIDTH,
+                spec.q_heads,
+                spec.seq,
+            )
         } else if crate::runtime_flags::prefill_attn_batch_long_enabled()
             && prefill_attn_batch_long_supported(spec)
         {
@@ -1291,9 +1298,9 @@ impl MetalExecutor {
                     spec.seq,
                 ),
                 _ => {
-                    if spec.head_dim > 256 {
+                    if spec.head_dim > 512 {
                         return Err(InferError::Dimension(format!(
-                            "prefill causal résident seq={} head_dim={} non supporté (head_dim > 256)",
+                            "prefill causal résident seq={} head_dim={} non supporté (head_dim > 512)",
                             spec.seq, spec.head_dim
                         )));
                     }
@@ -1306,9 +1313,9 @@ impl MetalExecutor {
                 }
             }
         } else {
-            if spec.head_dim > 256 {
+            if spec.head_dim > 512 {
                 return Err(InferError::Dimension(format!(
-                    "prefill causal résident seq={} head_dim={} non supporté (head_dim > 256)",
+                    "prefill causal résident seq={} head_dim={} non supporté (head_dim > 512)",
                     spec.seq, spec.head_dim
                 )));
             }
