@@ -1322,6 +1322,36 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[test]
+    fn affine_u5_matches_mlx_quantize_dequantize_golden() -> Result<()> {
+        // MLX 0.31.2 : quantize(arange(64) % 32 en bf16, group_size=64,
+        // bits=5) choisit scale=-1 et bias=31. Ce golden indépendant évite
+        // qu'un même défaut du packer et du dépaqueteur passe inaperçu.
+        let words = [
+            1_975_416_799,
+            978_769_862,
+            902_792_293,
+            3_343_013_046,
+            4_469_268,
+        ];
+        let weight = AffineQuantizedTensor::new(
+            &[3, 30],
+            words.repeat(18),
+            Tensor::from_vec(vec![3, 3], vec![-1.0; 9])?,
+            Tensor::from_vec(vec![3, 3], vec![31.0; 9])?,
+            64,
+            5,
+        )?;
+        let expected: Vec<f32> = (0..3 * 192).map(|i| (i % 32) as f32).collect();
+        assert_eq!(weight.dequantize()?.data(), expected);
+        for row in 0..3 {
+            assert_eq!(weight.row(row)?, expected[row * 192..(row + 1) * 192]);
+        }
+        let input = Tensor::from_vec(vec![2, 192], vec![1.0; 384])?;
+        assert_eq!(weight.matmul_rhs_t(&input)?.data(), &[2976.0; 6]);
+        Ok(())
+    }
+
     #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]
     fn stable_id_survives_clone_and_cpu_payload_release() {

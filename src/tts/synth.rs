@@ -16,6 +16,9 @@ impl TtsModel {
     /// Renvoie une erreur si la tokenisation, la préparation des embeddings ou le
     /// forward échoue.
     pub fn forward_voicedesign_prefix(&self, text: &str) -> Result<TtsForwardOutput> {
+        let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+            crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+        );
         let prepared = self.prepare_voicedesign_inputs(text)?;
         let (cache, final_state) = self.prefill_talker(&prepared.input)?;
         let logits = self.talker.logits_from_final_state(&final_state)?;

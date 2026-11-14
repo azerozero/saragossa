@@ -7,6 +7,19 @@ use serde_json::{json, Value};
 use super::*;
 
 #[test]
+fn request_ignores_logit_bias() {
+    for bias in [json!({"42": -100}), json!({}), json!(null), json!(false)] {
+        let body = json!({
+            "model": "m", "max_tokens": 1, "messages": [], "logit_bias": bias
+        });
+        let (chat, _, _) = anthropic_chat(body.to_string().as_bytes(), None)
+            .expect("invariant: requête Anthropic valide");
+        assert!(chat.logit_bias.is_none());
+        assert_eq!(chat.validate(1).expect("invariant: champ ignoré"), 1);
+    }
+}
+
+#[test]
 fn request_translates_blocks_system_and_stop_sequences() {
     let request: AnthropicMessagesRequest = serde_json::from_str(
         r#"{

@@ -70,7 +70,10 @@ impl CausalDecoder {
         )?;
         crate::metal_backend::wait_for_completion(&inflight.command_buffer)?;
         if let Some(readback) = inflight.logits_readback {
-            let logits = crate::metal_backend::read_f32_buffer(&readback.buffer, readback.len)?;
+            let logits = crate::metal_backend::read_f32_buffer(
+                readback.lease.tensor().buffer(),
+                readback.len,
+            )?;
             let logits = self.finalize_logits(&Tensor::from_vec(vec![1, readback.len], logits)?)?;
             return sample_token_top_k_top_p(
                 logits.as_row()?,
@@ -200,18 +203,23 @@ impl CausalDecoder {
             hidden,
             self.config.rms_eps,
         )?;
-        let (buffer, len) = metal.encode_lm_head_logits_readback_buffers(
+        let logits = arena
+            .state
+            .scratch()
+            .lease(metal.linear_weight_out_dim(&arena.lm_head), GpuElement::F32)?;
+        let len = metal.encode_lm_head_logits_readback_buffers(
             encoder,
             normed.tensor().buffer(),
             &arena.lm_head,
             hidden,
+            logits.tensor().buffer(),
         )?;
         encoder.end_encoding();
         crate::metal_backend::commit_nonblocking(command_buffer);
         crate::metal_backend::wait_for_completion(command_buffer)?;
         #[cfg(test)]
         REFERENCE_INITIAL_PROJECTIONS.with(|count| count.set(count.get() + 1));
-        let raw = crate::metal_backend::read_f32_buffer(&buffer, len)?;
+        let raw = crate::metal_backend::read_f32_buffer(logits.tensor().buffer(), len)?;
         Ok(self.finalize_logits(&Tensor::row(raw)?)?.data().to_vec())
     }
 
@@ -251,7 +259,7 @@ impl CausalDecoder {
         let readback = inflight
             .logits_readback
             .ok_or_else(|| InferError::Metal("logits résidents absents".into()))?;
-        crate::metal_backend::read_f32_buffer(&readback.buffer, readback.len)
+        crate::metal_backend::read_f32_buffer(readback.lease.tensor().buffer(), readback.len)
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -586,6 +594,7 @@ impl CausalDecoder {
                         hidden,
                         sample.temperature,
                         sample.rng_state,
+                        self.config.final_logit_softcapping,
                     )?;
                 }
                 ResidentSampleMode::OnDevice => {
@@ -600,16 +609,24 @@ impl CausalDecoder {
                         sample.top_p,
                         sample.top_k,
                         sample.rng_state,
+                        self.config.final_logit_softcapping,
                     )?;
                 }
                 ResidentSampleMode::Readback => {
-                    let (buffer, len) = metal.encode_lm_head_logits_readback_buffers(
+                    // Le bail est rendu après wait + lecture CPU, jamais pendant
+                    // qu'un command buffer peut encore écrire ses logits.
+                    let lease = arena
+                        .state
+                        .scratch()
+                        .lease(metal.linear_weight_out_dim(&arena.lm_head), GpuElement::F32)?;
+                    let len = metal.encode_lm_head_logits_readback_buffers(
                         encoder,
                         final_normed.tensor().buffer(),
                         &arena.lm_head,
                         hidden,
+                        lease.tensor().buffer(),
                     )?;
-                    logits_readback = Some(ResidentLogitsReadback { buffer, len });
+                    logits_readback = Some(ResidentLogitsReadback { lease, len });
                 }
             }
         } else {

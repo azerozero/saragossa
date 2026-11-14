@@ -222,6 +222,34 @@ pub(crate) fn scratch_cap_bytes() -> u64 {
     })
 }
 
+/// Plafond du poids bf16 matérialisé par le GEMM NA avec déquantification.
+/// `SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES` est exprimé en octets :
+/// défaut 512 Mio, zéro désactive ce chemin. Une valeur invalide garde le défaut.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn qmm_na_dequant_max_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        qmm_na_dequant_cap_from_env(env_var("SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES").as_deref())
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn qmm_na_dequant_cap_from_env(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(512 * 1024 * 1024)
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[test]
+fn qmm_na_dequant_budget_flag_parsing() {
+    for raw in [None, Some(""), Some("-1"), Some("invalid")] {
+        assert_eq!(qmm_na_dequant_cap_from_env(raw), 512 * 1024 * 1024);
+    }
+    assert_eq!(qmm_na_dequant_cap_from_env(Some("0")), 0);
+    assert_eq!(qmm_na_dequant_cap_from_env(Some(" 65536 ")), 65536);
+}
+
 /// Active le recast bf16 de la sortie d'embedding Qwen. **Défaut ON** :
 /// aligne la sortie d'embedding sur oMLX (accord teacher-forced 98,04 → 99,35 %),
 /// l'arrondi se fait dans le gather résident sans dispatch ajouté (coût decode/prefill nul).
@@ -734,6 +762,19 @@ pub(crate) fn with_qkv_concat_override<R>(enabled: bool, run: impl FnOnce() -> R
 pub(super) fn decode_pipeline_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_PIPELINE", true))
+}
+
+/// Diagnostics MoE figés au premier accès, actifs par présence même pour "0".
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn moe_coop_skip_gemm() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_var(SNAPSHOT_ABLATION_FLAGS[0]).is_some())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn moe_coop_skip_shared() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_var(SNAPSHOT_ABLATION_FLAGS[1]).is_some())
 }
 
 /// Diagnostic C1B (hors chemin prod) : `SARAGOSSA_RUST_ORACLE_DUMP_LOGITS=k` dump sur
@@ -1402,6 +1443,14 @@ pub(crate) fn prefill_kv_shared_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_SHARED", true))
 }
 
+/// GEMM NA tuilé des poids bf16 denses au prefill (batch ≥ 64). Défaut ON ;
+/// `SARAGOSSA_RUST_DENSE_BF16_GEMM=0` rétablit le qmv par ligne.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn dense_bf16_gemm_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM", true))
+}
+
 /// Taille cible, en tokens, d'un morceau du prefill résident. Les buffers
 /// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
 /// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est
@@ -1657,6 +1706,15 @@ pub(crate) fn attention_parallel_threshold() -> usize {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
+/// Active les kernels QMV u5 gs64 alignés et tail. Défaut ON ;
+/// `SARAGOSSA_RUST_QMV_U5=0` rétablit le QMV générique, comme le kill-switch u6.
+/// Lu une fois au premier usage. Le prefill NA garde son flag `SARAGOSSA_RUST_QMM_NA`.
+pub(crate) fn qmv_u5_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMV_U5", true))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn qmv_fast_mode() -> Option<&'static str> {
     static MODE: OnceLock<Option<String>> = OnceLock::new();
     MODE.get_or_init(|| crate::runtime_flags::env_var("SARAGOSSA_RUST_QMV_FAST"))
@@ -1673,6 +1731,47 @@ pub(crate) fn gather_fast_mode() -> Option<&'static str> {
 pub(super) fn prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
+}
+
+/// Autorise `QmmNaDequant` dans le talker et le code_predictor TTS.
+/// `SARAGOSSA_TTS_QMM_NA_DEQUANT=1`, défaut OFF : l'arrondi bf16 avant GEMM
+/// fait diverger le golden clone cb0 u6. Lu une fois au premier usage.
+/// Le LLM reste inchangé ; les conditions habituelles, dont
+/// `SARAGOSSA_RUST_QMM_NA`, restent nécessaires même avec cet opt-in.
+pub(crate) fn tts_qmm_na_dequant_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_QMM_NA_DEQUANT", false))
+}
+
+thread_local! {
+    static QMM_NA_DEQUANT_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Restaure la politique de déquantification sur le thread d'origine, même sur erreur.
+#[must_use]
+pub(crate) struct QmmNaDequantScopeGuard {
+    previous: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for QmmNaDequantScopeGuard {
+    fn drop(&mut self) {
+        QMM_NA_DEQUANT_ALLOWED.set(self.previous);
+    }
+}
+
+/// Limite `QmmNaDequant` aux appels encodés dans cette portée TTS.
+/// Une portée imbriquée restaure la politique précédente à sa sortie.
+pub(crate) fn install_tts_qmm_na_dequant_scope(enabled: bool) -> QmmNaDequantScopeGuard {
+    QmmNaDequantScopeGuard {
+        previous: QMM_NA_DEQUANT_ALLOWED.replace(enabled),
+        _thread: std::marker::PhantomData,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn qmm_na_dequant_allowed() -> bool {
+    QMM_NA_DEQUANT_ALLOWED.get()
 }
 
 /// Mémoïsation du préfixe VoiceDesign. Opt-in jusqu'à validation de l'oracle
@@ -2252,6 +2351,26 @@ fn hash_environment(
 mod tests {
     use super::*;
 
+    #[test]
+    fn tts_qmm_na_dequant_scope_restores_policy_and_is_thread_local() {
+        assert!(QMM_NA_DEQUANT_ALLOWED.get());
+        let result = std::panic::catch_unwind(|| {
+            let _tts = install_tts_qmm_na_dequant_scope(false);
+            assert!(!QMM_NA_DEQUANT_ALLOWED.get());
+            assert!(std::thread::spawn(|| QMM_NA_DEQUANT_ALLOWED.get())
+                .join()
+                .unwrap());
+            {
+                let _opt_in = install_tts_qmm_na_dequant_scope(true);
+                assert!(QMM_NA_DEQUANT_ALLOWED.get());
+            }
+            assert!(!QMM_NA_DEQUANT_ALLOWED.get());
+            panic!("sortie anticipée de la portée TTS");
+        });
+        assert!(result.is_err());
+        assert!(QMM_NA_DEQUANT_ALLOWED.get());
+    }
+
     #[cfg(unix)]
     #[test]
     fn environment_hash_preserves_non_unicode_and_field_boundaries() {
@@ -2323,6 +2442,45 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn moe_ablation_flags_cache_presence_and_legacy_aliases() {
+        const CHILD: &str = "MOE_ABLATION_CACHE_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let expected = expected == "true";
+            assert_eq!(moe_coop_skip_gemm(), expected);
+            assert_eq!(moe_coop_skip_shared(), expected);
+            for flag in &SNAPSHOT_ABLATION_FLAGS[..2] {
+                std::env::set_var(flag, "changed");
+            }
+            assert_eq!(moe_coop_skip_gemm(), expected);
+            assert_eq!(moe_coop_skip_shared(), expected);
+            return;
+        }
+        for value in [None, Some(""), Some("0"), Some("1")] {
+            for legacy in [false, true] {
+                let mut command = std::process::Command::new(
+                    std::env::current_exe().expect("invariant: binaire de test"),
+                );
+                command.args(["--exact", "runtime_flags::tests::moe_ablation_flags_cache_presence_and_legacy_aliases"])
+                    .env(CHILD, value.is_some().to_string());
+                for flag in &SNAPSHOT_ABLATION_FLAGS[..2] {
+                    let alias = flag.replacen("SARAGOSSA_", "RETI_", 1);
+                    command.env_remove(flag).env_remove(&alias);
+                    if let Some(value) = value {
+                        command.env(if legacy { alias.as_str() } else { *flag }, value);
+                    }
+                }
+                let output = command.output().expect("invariant: sous-processus de test");
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
+        }
     }
 
     #[test]

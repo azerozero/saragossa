@@ -2367,6 +2367,70 @@ fn resident_test_model() -> Option<CausalDecoder> {
     }
 }
 
+/// Le cap du modèle doit atteindre le sampler non résident partagé avec MTP.
+/// Le greedy conserve son argmax et n'avance pas le RNG.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn softcap_sampling_decoder_routes_and_greedy() -> Result<()> {
+    let Some(mut model) = resident_test_model() else {
+        return Ok(());
+    };
+    model.config.final_logit_softcapping = Some(30.0);
+    model.lm_head = Linear::new(
+        Tensor::from_vec(
+            vec![3, 4],
+            vec![
+                45.0, 0.0, 0.0, 0.0, 38.0, 0.0, 0.0, 0.0, 31.0, 0.0, 0.0, 0.0,
+            ],
+        )?,
+        None,
+    )?;
+    let state = Tensor::row(vec![1.0, 0.0, 0.0, 0.0])?;
+    let logits = model.logits_from_final_state(&state)?;
+    let options = GenerationOptions {
+        temperature: 2.5,
+        top_k: 2,
+        top_p: 0.9,
+        ..GenerationOptions::default()
+    };
+    let mut differences = 0;
+    for seed in 0..128 {
+        let mut cpu_rng = DeterministicSampler::new(seed);
+        let expected = sample_token_top_k_top_p(
+            logits.as_row()?,
+            options.temperature,
+            options.top_p,
+            options.top_k,
+            &mut cpu_rng,
+        )?;
+        let raw = sample_token_top_k_top_p(
+            &[45.0, 38.0, 31.0],
+            options.temperature,
+            options.top_p,
+            options.top_k,
+            &mut DeterministicSampler::new(seed),
+        )?;
+        differences += usize::from(raw != expected);
+        let mut rng = DeterministicSampler::new(seed);
+        assert_eq!(
+            model.sample_token_from_state(&state, &options, &mut rng)?,
+            expected
+        );
+        assert_eq!(rng.state(), cpu_rng.state());
+    }
+    assert!(differences > 10, "l'oracle doit détecter l'absence de cap");
+    for cap in [None, Some(30.0)] {
+        model.config.final_logit_softcapping = cap;
+        let mut rng = DeterministicSampler::new(123);
+        assert_eq!(
+            model.sample_token_from_state(&state, &GenerationOptions::default(), &mut rng)?,
+            0
+        );
+        assert_eq!(rng.state(), 123);
+    }
+    Ok(())
+}
+
 /// Décode `n` tokens en greedy T=0, chemin résident forcé (`resident`) ou CPU.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn greedy_resident_ab(
@@ -6970,5 +7034,44 @@ fn gemma4_explicit_rope_parameters_reach_decoder() -> Result<()> {
     assert_eq!(sliding.rope_dims(256), 256);
     assert_eq!(sliding.rope_frequency_dim(256), 256);
     assert_eq!(sliding.rope_theta_override, Some(20_000.0));
+    Ok(())
+}
+
+#[test]
+fn prefix_cache_purge_recovers_poisoned_mutex() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let entry = |token| PrefixCacheEntry {
+        tokens: vec![token],
+        cache: model.empty_cache(),
+        final_state: Tensor::row(vec![0.0]).expect("invariant: ligne non vide"),
+        mtp_history: None,
+        captures: None,
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        linear_metal: Vec::new(),
+    };
+    for poisoned in [false, true] {
+        let cache = Mutex::new(PrefixCache {
+            entries: vec![entry(2), entry(1)],
+        });
+        if poisoned {
+            let result = std::panic::catch_unwind(|| {
+                let _guard = cache.lock().expect("invariant: mutex neuf");
+                panic!("empoisonnement volontaire du cache");
+            });
+            assert!(result.is_err());
+            assert!(cache.is_poisoned());
+        }
+        assert!(matches!(purge_prefix_cache(&cache), PurgeOutcome::Purged { bytes } if bytes > 0));
+        {
+            let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+            assert_eq!(guard.entries.len(), 1);
+            assert_eq!(guard.entries[0].tokens, vec![2]);
+        }
+        assert!(matches!(
+            purge_prefix_cache(&cache),
+            PurgeOutcome::Purged { .. }
+        ));
+        assert!(matches!(purge_prefix_cache(&cache), PurgeOutcome::Empty));
+    }
     Ok(())
 }

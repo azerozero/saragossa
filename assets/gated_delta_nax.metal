@@ -3244,4 +3244,3 @@ template <typename InT, int Dk, int Dv, int Hk, int Hv, int C, int Ckpt>
 template [[host_name("gated_delta_fused_nax_f32_dk128_dv128_hk16_hv48_c16")]]
 [[kernel]] decltype(gated_delta_fused_nax<float, 128, 128, 16, 48, 16, 1>)
 gated_delta_fused_nax<float, 128, 128, 16, 48, 16, 1>;
-

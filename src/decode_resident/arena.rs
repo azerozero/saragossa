@@ -89,6 +89,7 @@ impl GpuTensor {
     }
 
     /// Renvoie la taille logique en octets.
+    #[cfg(test)]
     pub(crate) fn byte_len(&self) -> usize {
         self.len * self.element.byte_size()
     }

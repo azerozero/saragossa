@@ -189,8 +189,7 @@ into shared Metal buffers, one copy. See
 ### Homebrew (Apple Silicon)
 
 ```sh
-brew install azerozero/tap/saragossa          # latest tagged release (stable)
-# brew install --HEAD azerozero/tap/saragossa # build from the main branch
+brew install azerozero/tap/saragossa # prebuilt binary from the latest stable release
 ```
 
 ### From source
@@ -358,6 +357,19 @@ The warm cache, model pool and OOM guard are all tunable through environment
 variables — see [`src/runtime_flags.rs`](src/runtime_flags.rs) for the exact
 names and defaults (block size, LRU capacity, pool size, host headroom, static
 memory cap, …).
+
+The NA matmul path that materializes a full bf16 weight is limited to
+512 MiB per weight by `SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES` (bytes).
+Above the limit, selection falls back to qmv before allocating the scratch.
+Set it to `0` to disable this dequantization path; an absent or invalid value
+uses the default. Fused NA kernels do not materialize that weight and keep
+their existing selection rules. This currently applies to `QmmNaU8`; u5/u6
+have no full-weight NA dequantization path in this revision.
+
+The retired experimental `SARAGOSSA_RUST_LINEAR_CHUNKED=1` path now returns
+an explicit configuration error: its scalar and tensor-core kernels had
+unsafe decay ratios, tail reads and device synchronization. Remove the flag
+to keep the existing NAX/sequence-scan selection; no default path changes.
 
 ## Features
 

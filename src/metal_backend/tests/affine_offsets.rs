@@ -95,12 +95,13 @@ fn affine_offsets_alignment_without_device() {
         FastQmvU4Align64,
         FastQmvU2,
         FastQmvU3,
+        FastQmvU5,
         FastQmvU6,
         QmmBatchedU6,
         FastQmvOneU8,
         QmmNaFusedTiledU8,
         QmmNaU8Gs128,
-        QmmNaU8,
+        QmmNaDequant,
         FastQmvU8,
         FastQmvU8Align64,
     ] {
@@ -151,8 +152,12 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
         (FastQmvU2, 2, 64, 1, 64, 512),
         (FastQmvU3, 3, 64, 1, 64, 512),
         (FastQmvU3, 3, 64, 1, 16, 768),
+        (FastQmvU5, 5, 64, 3, 13, 192),
+        (FastQmvU5, 5, 64, 1, 64, 512),
         (FastQmvU6, 6, 64, 1, 13, 512),
         (FastQmvU6, 6, 64, 1, 64, 512),
+        (FastQmvU5, 5, 64, 3, 8, 1024),
+        (FastQmvU6, 6, 64, 3, 8, 1024),
         (QmmBatchedU6, 6, 64, 2, 13, 512),
         (QmmBatchedU6, 6, 64, 7, 64, 512),
         (QmmBatchedU6, 6, 64, 8, 64, 512),
@@ -167,20 +172,23 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
         (QmmNaFusedTiledU8, 8, 64, 17, 64, 512),
         (QmmNaFusedTiledU8, 8, 128, 17, 64, 512),
         (QmmNaU8Gs128, 8, 128, 16, 64, 512),
-        (QmmNaU8, 8, 64, 16, 64, 512),
+        (QmmNaDequant, 8, 64, 16, 64, 512),
+        (QmmNaDequant, 5, 64, 32, 13, 512),
+        (QmmNaDequant, 6, 64, 33, 64, 512),
     ] {
         let weight = match bits {
             2 => test_affine_mlx_u2(n, k)?,
             3 => test_affine_mlx_u3(n, k)?,
             4 => test_affine_varied_group(n, k, gs)?,
+            5 => test_affine_varied_u5(n, k)?,
             6 => test_affine_varied_u6(n, k)?,
             _ => test_affine_varied_u8_group(n, k, gs)?,
         };
         super::matmul_select::OFFSET_TEST_KERNEL.with(|value| value.set(Some(kernel)));
         for resident in [false, true] {
-            // QmmNaU8 est un chemin owned uniquement ; le résident garde son
+            // QmmNaDequant est un chemin owned uniquement ; le résident garde son
             // repli historique. Le tester comme rapide masquerait une régression.
-            if resident && kernel == QmmNaU8 {
+            if resident && kernel == QmmNaDequant {
                 continue;
             }
             let reference = offset_dispatch(&metal, &weight, m, resident)?;
@@ -219,7 +227,7 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
                     );
                 }
             }
-            if kernel == QmmBatchedU6 {
+            if matches!(kernel, QmmBatchedU6 | FastQmvU5 | FastQmvU6 | QmmNaDequant) {
                 // Alignement minimal uint/bfloat, sans alignement vectoriel.
                 let shifted = offset_weight(&metal, &weight, [4, 2, 6], 0xdead)?;
                 assert_eq!(offset_dispatch(&metal, &shifted, m, resident)?, reference);
@@ -369,6 +377,51 @@ fn affine_offsets_residual_bit_exact() -> Result<()> {
         guard.end();
         commit_and_wait(cb)?;
         assert_eq!(read_f32_buffer(&output, 64)?, vec![-12345.0; 64]);
+    }
+    Ok(())
+}
+
+#[test]
+fn fast_qmv_u4_owned_resident_selection_parity() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    for in_dim in [64, 448, 512, 576, 1024, 2048] {
+        for out_dim in [8, 64, 512, 2048] {
+            let weight = test_affine(out_dim, in_dim, 0.01)?;
+            for batch in [0, 1, 2, 4, 8, 16, 33] {
+                for prefer in [false, true] {
+                    let old_predicate = (fast_affine_qmv_enabled(out_dim) || prefer)
+                        && batch > 0
+                        && in_dim % 512 == 0;
+                    assert_eq!(
+                        can_use_fast_affine_qmv_preferred(batch, in_dim, &weight, prefer),
+                        old_predicate
+                    );
+                    assert_eq!(
+                        executor.select_owned_affine_matmul_kernel(batch, in_dim, &weight, prefer),
+                        executor.select_resident_affine_matmul_kernel(
+                            batch, in_dim, out_dim, 64, 4, prefer
+                        ),
+                        "batch={batch}, in={in_dim}, out={out_dim}, prefer={prefer}"
+                    );
+                }
+            }
+            assert!(!can_use_fast_affine_qmv_preferred(
+                1,
+                in_dim + 512,
+                &weight,
+                true
+            ));
+        }
+    }
+    for bits in [2, 3, 4, 5, 6, 8] {
+        for group_size in [32, 64, 128] {
+            assert_eq!(
+                can_use_fast_affine_qmv_buffers(1, 512, 64, group_size, bits, true),
+                bits == 4 && group_size == 64
+            );
+        }
     }
     Ok(())
 }

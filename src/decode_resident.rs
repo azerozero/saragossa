@@ -29,14 +29,6 @@
 //! Réserve **(E)** : ce module EST le jalon 1a.5 (briques minimales + test de
 //! liveness sur des couches synthétiques) à dérisquer avant 1b.
 
-// NOTE: fondation des tranches 1b/1c. Les briques publiques ne sont pour l'instant
-// exercées que par les tests ; la boucle decode résidente (1b) les câblera. Le
-// `dead_code` sera retiré à ce moment-là.
-#![allow(
-    dead_code,
-    reason = "fondation du decode résident (1b/1c) — câblée à la phase suivante"
-)]
-
 use crate::metal_backend::{
     commit_and_wait, read_f32_buffer, LinearAttentionMetalState, LinearAttentionStepSpec,
     LinearAttnResidentDims, MetalExecutor, MetalLinearAttnResidentDenseWeights,

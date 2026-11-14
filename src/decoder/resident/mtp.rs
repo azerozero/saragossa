@@ -1016,12 +1016,18 @@ impl CausalDecoder {
             eps,
         )?;
         let logits_readback = if readback_logits {
-            Some(metal.encode_lm_head_logits_readback_buffers(
+            let lease = arena.state.scratch().lease(
+                metal.linear_weight_out_dim(&mtp.draft_lm_head),
+                GpuElement::F32,
+            )?;
+            let len = metal.encode_lm_head_logits_readback_buffers(
                 encoder,
                 output_hidden,
                 &mtp.draft_lm_head,
                 hidden,
-            )?)
+                lease.tensor().buffer(),
+            )?;
+            Some((lease, len))
         } else {
             metal.encode_lm_head_argmax_buffers(
                 encoder,
@@ -1037,9 +1043,9 @@ impl CausalDecoder {
         crate::metal_backend::commit_and_wait(command_buffer)?;
         mtp.current_is_a = !mtp.current_is_a;
 
-        if let Some((buffer, len)) = logits_readback {
+        if let Some((lease, len)) = logits_readback {
             return Ok(MtpDraftResident::Logits(
-                crate::metal_backend::read_f32_buffer(&buffer, len)?,
+                crate::metal_backend::read_f32_buffer(lease.tensor().buffer(), len)?,
             ));
         }
         let raw = crate::metal_backend::read_u32_buffer(mtp.index.buffer(), 1)?

@@ -6,6 +6,7 @@ mono-ligne.
 
 Avant les corrections ci-dessous, une dérive faisait parfois basculer une
 quasi-égalité top-1/top-2 :
+
 - 1 requête sur 66 sur le 27B (bench concurrents, prompt prose de 32k) ;
 - 2 prompts sur 5 avec DFlash sur le 35B, chemin non exposé (voir
   [mtp-pairwise.md](mtp-pairwise.md), « DFlash 2 sur le 35B-A3B »).
@@ -21,12 +22,14 @@ Deux kernels actifs par défaut ne sont pas bit-identiques au pas mono-ligne.
 
 Avec ces réglages par défaut, le texte reste celui de l'AR, sauf sur une
 quasi-égalité. Deux réglages coupent ces kernels :
+
 - `SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH=32` remplace le skinny par le qmv
   répliqué ;
 - `SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY=0` garde le NAX pour l'échantillonné
   seulement.
 
 Coût mesuré le 3 nov. 2026 (27B, ABBA, M5 Max) :
+
 - skinny coupé : DFlash −49 à −52 % ;
 - NAX greedy coupé : DFlash −25 % à 32k et −36 % à 64k, MTP −6 à −9 %.
 
@@ -34,6 +37,7 @@ Coût mesuré le 3 nov. 2026 (27B, ABBA, M5 Max) :
 
 Le flag rend la vérification greedy exacte sans réglage manuel. Sous la portée
 greedy, il fait trois choses :
+
 - il coupe le préfixe NAX en lignes ;
 - les matmuls u4 gs64 de 3 à 16 lignes passent par le qmv-T au lieu du skinny ;
 - l'arbre DFlash greedy passe à B = 3 nœuds quand `SARAGOSSA_RUST_DFLASH_TREE`
@@ -47,6 +51,7 @@ L'échantillonné et le décodage AR ne changent pas.
 Le qmv-T (`affine_qmvt_*`) calcule `xt` et `sum` une fois par ligne et par
 bloc, puis convertit les poids une fois pour les R lignes. Chaque ligne garde
 le contrat canonique du qmv mono. Il existe en deux variantes :
+
 - device, pour `in_dim` ≤ 8192 (gate, up, qkv) et pour 16 lignes ;
 - threadgroup, pour down (S = 8) et pour les sorties d'au moins 65536, dont le
   lm_head (S = 16).
@@ -94,6 +99,7 @@ texte AR diffère de l'ancien après 834 caractères.
 ### Contrat canonique du qmv u4 gs64
 
 Périmètre : les 15 kernels u4 gs64 de `kernels.metal` :
+
 - qmv non aligné, aligné, résiduel et `align64` ;
 - `qmm2` et `qmm8` ;
 - gather qmv et sa queue ;
@@ -111,6 +117,7 @@ bloc de réduction des prologues rms u3 et u8 (`sumsq` et `sumsq / dim + eps`).
 
 L'oracle `rows_exact_qmv_contract_cpu_oracle` ancre ce contrat sur les
 compilations exercées (fast-math, ce compilateur, ce GPU), pas au-delà :
+
 - partiels par voie égaux à une réplique CPU f32 ;
 - leur `simd_sum` égal au kernel intact ;
 - kernel intact égal au pipeline de production, en aligné et non aligné.
@@ -127,6 +134,7 @@ Le contrat change l'arrondi de l'AR. Bilan O3 (5 nov. 2026, greedy AR,
 | 35B | 4/10 | chat-2 (22), chat-4 (114), chat-6 (163), code4k-2 (6), code4k-3 (80), prose32k-1 (12) |
 
 Les bascules observées sont des quasi-égalités entre candidats. Exemples :
+
 - « on the coast of Blackwood Point » contre « on the Isle of Skye » ;
 - « Rust's String Pattern API » contre « Rust's `Pattern` API ».
 

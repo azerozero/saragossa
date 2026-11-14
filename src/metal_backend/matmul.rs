@@ -327,8 +327,53 @@ impl MetalExecutor {
                 "matmul bf16 x=[{batch},{in_dim}] rhs=[{out_dim},{rhs_in_dim}]"
             )));
         }
-        self.encode_dense_qmv_rhs_bf16(encoder, lhs, rhs, out, batch, out_dim, in_dim)?;
+        if let Some(pso) = self
+            .na_gemm_bf16_nt_tiled_x2
+            .as_ref()
+            .filter(|_| can_use_dense_bf16_gemm(batch, in_dim, out_dim))
+        {
+            self.encode_dense_bf16_gemm(encoder, pso, lhs, rhs, out, batch, out_dim, in_dim)?;
+        } else {
+            self.encode_dense_qmv_rhs_bf16(encoder, lhs, rhs, out, batch, out_dim, in_dim)?;
+        }
         Ok(out_dim)
+    }
+
+    /// GEMM NA tuilé `C[M,N] = A[M,K]·B[N,K]^T`, A f32 scindé hi + lo, B bf16.
+    fn encode_dense_bf16_gemm(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pso: &ComputePipelineState,
+        lhs: &BufferRef,
+        rhs_bf16: &BufferRef,
+        out: &BufferRef,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        let mnk = [
+            checked_u32(batch, "bf16 gemm batch")?,
+            checked_u32(out_dim, "bf16 gemm out_dim")?,
+            checked_u32(in_dim, "bf16 gemm in_dim")?,
+            0,
+        ];
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(lhs), 0);
+        encoder.set_buffer(1, Some(rhs_bf16), 0);
+        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
+        trace_dispatch_path("gemm_nax_bf16_nt_tiled_x2", batch, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
+                checked_nsuint(out_dim / 64, "bf16 gemm out tiles")?,
+                1,
+            ),
+            MTLSize::new(128, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, out);
+        Ok(())
     }
 
     /// QMV dense batch>=1 avec poids bf16 row-major `[out_dim,in_dim]`.
@@ -361,6 +406,7 @@ impl MetalExecutor {
             dims.as_ptr().cast::<std::ffi::c_void>(),
         );
         let threads_per_group = self.qmv_thread_group_size(&self.dense_qmv_rhs_bf16_f32);
+        trace_dispatch_path("dense_qmv_rhs_bf16_f32", batch, out_dim, in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
@@ -642,6 +688,23 @@ impl MetalExecutor {
             )?;
         } else if aligned_weights && can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
             self.encode_affine_qmv_u3_buffers(
+                encoder,
+                &lhs_buffer,
+                &packed_buffer,
+                packed_offset,
+                &scales_buffer,
+                scales_offset,
+                &biases_buffer,
+                biases_offset,
+                &output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                groups,
+            )?;
+        } else if aligned_weights && can_use_fast_affine_qmv_u5(batch, in_dim, weight) {
+            self.encode_affine_qmv_u5_buffers(
                 encoder,
                 &lhs_buffer,
                 &packed_buffer,
@@ -1355,6 +1418,19 @@ impl MetalExecutor {
             }
         }
     }
+}
+
+/// Plancher de lignes du GEMM NA bf16. En dessous (decode, vérification
+/// spéculative), le qmv garde son résultat par ligne indépendant du batch, ce
+/// qui préserve l'identité vérification/AR ; au-dessus (prefill), relire le
+/// poids par ligne bornait le débit à ~20 tok/s sur un 27B BF16.
+const DENSE_BF16_GEMM_MIN_BATCH: usize = 64;
+
+fn can_use_dense_bf16_gemm(batch: usize, in_dim: usize, out_dim: usize) -> bool {
+    batch >= DENSE_BF16_GEMM_MIN_BATCH
+        && in_dim % 64 == 0
+        && out_dim % 64 == 0
+        && crate::runtime_flags::dense_bf16_gemm_enabled()
 }
 
 #[cfg(test)]
