@@ -66,6 +66,18 @@ fn accepts_affine_u3_quantization_config() {
 }
 
 #[test]
+fn accepts_affine_u5_global_quantization_config() -> Result<()> {
+    let quant: QuantConfig = serde_json::from_str(r#"{"group_size":64,"bits":5,"mode":"affine"}"#)
+        .expect("invariant: config affine u5 synthétique valide");
+    validate_affine_quantization(&quant)?;
+    assert_eq!(
+        quant_params_for(&quant, "model.layers.0.self_attn.q_proj.weight")?,
+        (64, 5)
+    );
+    Ok(())
+}
+
+#[test]
 fn accepts_affine_u6_quantization_config() {
     // mlx-community/*-oQ6 : base bits=6, kernels fast_affine_qmv_u6 existants.
     let quant = QuantConfig {

@@ -14,12 +14,13 @@ pub(super) enum AffineMatmulKernel {
     FastQmvU4Align64,
     FastQmvU2,
     FastQmvU3,
+    FastQmvU5,
     FastQmvU6,
     QmmBatchedU6,
     FastQmvOneU8,
     QmmNaFusedTiledU8,
     QmmNaU8Gs128,
-    QmmNaU8,
+    QmmNaDequant,
     FastQmvU8,
     FastQmvU8Align64,
     Fallback,
@@ -57,8 +58,10 @@ thread_local! {
 
 // Appelé après le prédicat qmv u6 : ses contraintes et kill-switches restent
 // communs aux deux kernels, et le decode garde son chemin à une seule ligne.
+// Le qmm scalaire conserve son ancien ordre de somme ; le mode strict réplique
+// le nouveau qmv aligné afin de garder les bits du decode mono-ligne.
 pub(super) fn select_u6_matmul_kernel(batch: usize, batched: bool) -> AffineMatmulKernel {
-    if batch > 1 && batched {
+    if batch > 1 && batched && !super::verify_strict_active() {
         AffineMatmulKernel::QmmBatchedU6
     } else {
         AffineMatmulKernel::FastQmvU6
@@ -207,6 +210,8 @@ impl MetalExecutor {
             AffineMatmulKernel::FastQmvU2
         } else if can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::FastQmvU3
+        } else if can_use_fast_affine_qmv_u5_buffers(batch, in_dim, out_dim, group_size, bits) {
+            AffineMatmulKernel::FastQmvU5
         } else if can_use_fast_affine_qmv_u6_buffers(batch, in_dim, out_dim, group_size, bits) {
             select_u6_matmul_kernel(batch, qmm_u6_enabled())
         } else if can_use_fast_affine_qmv_one_u8_buffers(batch, in_dim, out_dim, group_size, bits) {
@@ -285,6 +290,14 @@ impl MetalExecutor {
             AffineMatmulKernel::FastQmvU2
         } else if can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvU3
+        } else if !strict
+            && self.na_gemm_bf16.is_some()
+            && can_use_qmm_na_dequant(batch, in_dim, weight)
+            && matches!(weight.bits(), 5 | 6)
+        {
+            AffineMatmulKernel::QmmNaDequant
+        } else if can_use_fast_affine_qmv_u5(batch, in_dim, weight) {
+            AffineMatmulKernel::FastQmvU5
         } else if can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
             select_u6_matmul_kernel(batch, qmm_u6_enabled())
         } else if can_use_fast_affine_qmv_one_u8(batch, in_dim, weight) {
@@ -299,9 +312,11 @@ impl MetalExecutor {
             && can_use_qmm_na_u8_gs128(batch, in_dim, weight)
         {
             AffineMatmulKernel::QmmNaU8Gs128
-        } else if !strict && self.na_gemm_bf16.is_some() && can_use_qmm_na_u8(batch, in_dim, weight)
+        } else if !strict
+            && self.na_gemm_bf16.is_some()
+            && can_use_qmm_na_dequant(batch, in_dim, weight)
         {
-            AffineMatmulKernel::QmmNaU8
+            AffineMatmulKernel::QmmNaDequant
         } else if can_use_fast_affine_qmv_u8(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvU8
         } else if can_use_fast_affine_qmv_u8_align64(batch, in_dim, weight) {

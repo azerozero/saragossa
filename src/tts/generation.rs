@@ -139,6 +139,9 @@ impl TtsModel {
         let mut sampler = DeterministicSampler::new(params.seed);
 
         for step in 0..effective_max_frames {
+            let qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+                crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+            );
             let logits = self.talker.logits_from_final_state(&final_state)?;
             let tok0 = sample_talker_token(
                 logits.as_row()?,
@@ -197,6 +200,8 @@ impl TtsModel {
             };
             cb0_history.push(tok0);
             generated.push(codes_frame);
+            // Le callback streaming peut appeler un LLM sur le même thread.
+            drop(qmm_scope);
             on_frame(&generated)?;
             if trace {
                 let last = generated
@@ -271,6 +276,9 @@ impl TtsModel {
         n_groups: usize,
         cp_resident: Option<&mut CausalDecoderCache>,
     ) -> Result<Vec<i32>> {
+        let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+            crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+        );
         let mut codes_frame = vec![tok0];
         if n_groups <= 1 {
             return Ok(codes_frame);
@@ -426,6 +434,9 @@ impl TtsModel {
         let mut repeat_run = 1_usize;
 
         for step in 0..effective_max_frames {
+            let qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+                crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+            );
             // cb0 talker : argmax greedy GPU (quantifié + suppression) on-device,
             // sinon fallback CPU. Réplique greedy_talker_token byte-identique.
             let tok0 = self.talker_cb0(&final_state, suppress_start, eos, &suppress)?;
@@ -479,6 +490,7 @@ impl TtsModel {
             // Hook streaming : permet au décodage codec incrémental d'émettre
             // l'audio du préfixe au fil de la génération (byte-identique par
             // causalité). No-op pour le chemin batch.
+            drop(qmm_scope);
             on_frame(&generated)?;
             if trace {
                 let last = generated
@@ -519,6 +531,9 @@ impl TtsModel {
         target_frame: usize,
         target_group: usize,
     ) -> Result<(Vec<Vec<i32>>, Vec<f32>)> {
+        let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+            crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+        );
         let cfg = &self.assets.model_config.talker_config;
         let prepared = self.prepare_inputs(text)?;
         let n_groups = usize::try_from(cfg.num_code_groups)

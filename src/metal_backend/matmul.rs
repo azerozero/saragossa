@@ -657,6 +657,23 @@ impl MetalExecutor {
                 *packed_cols,
                 groups,
             )?;
+        } else if aligned_weights && can_use_fast_affine_qmv_u5(batch, in_dim, weight) {
+            self.encode_affine_qmv_u5_buffers(
+                encoder,
+                &lhs_buffer,
+                &packed_buffer,
+                packed_offset,
+                &scales_buffer,
+                scales_offset,
+                &biases_buffer,
+                biases_offset,
+                &output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                groups,
+            )?;
         } else if aligned_weights && can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
             let encode = if matches!(
                 select_u6_matmul_kernel(batch, qmm_u6_enabled()),
