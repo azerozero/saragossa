@@ -564,6 +564,8 @@ impl MetalExecutor {
         } else {
             &self.whisper_attn_decode_f32
         };
+        let threads = if use_vec64 { 1024 } else { 256 };
+        check_threadgroup_size(pipeline, threads, "Whisper attention decode")?;
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q), 0);
         encoder.set_buffer(1, Some(keys), 0);
@@ -571,7 +573,6 @@ impl MetalExecutor {
         encoder.set_buffer(3, Some(out), 0);
         encoder.set_bytes(4, 16, dims.as_ptr().cast::<c_void>());
         profile_dispatch();
-        let threads = if use_vec64 { 1024 } else { 256 };
         encoder.dispatch_thread_groups(
             MTLSize::new(checked_nsuint(heads, "attn heads")?, 1, 1),
             MTLSize::new(threads, 1, 1),

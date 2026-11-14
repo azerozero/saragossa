@@ -484,6 +484,7 @@ impl CausalDecoder {
                     hidden,
                     (temperature, top_p, top_k),
                     &rng_states,
+                    self.config.final_logit_softcapping,
                 )?;
                 Some(indices)
             } else {

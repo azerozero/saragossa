@@ -586,6 +586,7 @@ impl CausalDecoder {
                         hidden,
                         sample.temperature,
                         sample.rng_state,
+                        self.config.final_logit_softcapping,
                     )?;
                 }
                 ResidentSampleMode::OnDevice => {
@@ -600,6 +601,7 @@ impl CausalDecoder {
                         sample.top_p,
                         sample.top_k,
                         sample.rng_state,
+                        self.config.final_logit_softcapping,
                     )?;
                 }
                 ResidentSampleMode::Readback => {
