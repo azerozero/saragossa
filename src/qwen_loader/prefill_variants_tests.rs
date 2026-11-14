@@ -13,6 +13,10 @@ fn qwen_moe_prefill_variants_greedy_identity() -> Result<()> {
         !crate::runtime_flags::prefix_cache_enabled(),
         "SARAGOSSA_RUST_PREFIX_CACHE=0 requis"
     );
+    assert!(
+        crate::runtime_flags::gated_delta_nax_hv32_enabled(),
+        "SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1 et NAX linéaire requis"
+    );
     let path = std::env::var_os("SARAGOSSA_TEST_PREFILL_MODEL")
         .expect("invariant: SARAGOSSA_TEST_PREFILL_MODEL doit désigner le modèle local");
     let assets = ModelAssets::load_local(std::path::Path::new(&path))?;

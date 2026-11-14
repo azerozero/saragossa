@@ -1591,11 +1591,21 @@ fn gated_delta_nax_matches_naive_oracle() -> Result<()> {
         return Ok(());
     };
     for hv in [32, 48] {
+        let enabled = if hv == 32 {
+            crate::runtime_flags::gated_delta_nax_hv32_enabled()
+        } else {
+            crate::runtime_flags::prefill_linear_nax_enabled()
+        };
         let available = if hv == 32 {
             executor.gated_delta_nax_hk16_hv32.is_some()
         } else {
             executor.gated_delta_nax_hk16_hv48.is_some()
         };
+        if !enabled {
+            assert!(!available, "NAX hv{hv} compilé malgré le flag désactivé");
+            eprintln!("oracle NAX hv{hv} désactivé par flag");
+            continue;
+        }
         if !available {
             assert!(
                 !executor.na_library_available_for_test(),

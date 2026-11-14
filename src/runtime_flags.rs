@@ -1398,18 +1398,31 @@ pub(crate) fn prefix_extend_resident_min_tokens() -> usize {
     })
 }
 
-/// Récurrence gated delta du prefill linéaire (16/32 ou 16/48 têtes, dk = dv =
+/// Récurrence gated delta du prefill linéaire (16/48 têtes, dk = dv =
 /// 128, état f32) sur les accélérateurs neuronaux : noyau
 /// `gated_delta_fused_nax` de MLX figé. Défaut ON depuis le 2026-10-25 (M5 Max,
 /// 27B 4 bits) : prefill 32k 588-598 → 630-651 tok/s, TTFT serve 32k 55,8 →
 /// 52,2 s ; oracle naïf 3,8e-4. Textes greedy AR identiques à 16k et 32k, celui
 /// de 8k diverge au 1 775e caractère sur 1 783 (fin de phrase, near-tie
 /// présumé). Kill-switch `SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0` (retour au
-/// chunk-delta).
+/// séquentiel). Le cas 16/32 exige aussi `SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_linear_nax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_LINEAR_NAX", true))
+}
+
+/// Active le gated delta NAX expérimental hk16/hv32, dk = dv = 128, état f32.
+/// Opt-in `SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1`, défaut OFF : sur le 35B
+/// à 4 709 tokens, KL forcée 2,3e-3 et accord top-1 98,4 % contre main,
+/// avec divergence greedy malgré les oracles synthétiques. Le remède
+/// d'identité reste à l'étude (docs/perf/moe-bm32-hv32.md).
+/// Le kill-switch global `SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0` reste prioritaire.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn gated_delta_nax_hv32_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    prefill_linear_nax_enabled()
+        && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GATED_DELTA_NAX_HV32", false))
 }
 
 /// Émet le premier token MTP au retour du prefill, avant la mise en place des
@@ -2512,6 +2525,52 @@ mod tests {
         // Un nom hors préfixe canonique n'a pas d'alias : il est lu tel quel.
         assert_eq!(legacy_alias("HF_HOME"), None);
         assert_eq!(legacy_alias("RETI_RUST_TRUC"), None);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn gated_delta_nax_hv32_requires_opt_in() -> std::io::Result<()> {
+        const CHILD: &str = "SARAGOSSA_TEST_NAX_FLAGS_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            assert_eq!(gated_delta_nax_hv32_enabled(), expected == "hv32");
+            assert_eq!(prefill_linear_nax_enabled(), expected != "off");
+            return Ok(());
+        }
+        // Un processus neuf par cas évite de partager les OnceLock ou de
+        // modifier l'environnement global des autres oracles GPU.
+        for (hv32, global, expected) in [
+            (None, None, "hv48"),
+            (Some("0"), None, "hv48"),
+            (Some("1"), None, "hv32"),
+            (Some("1"), Some("0"), "off"),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "runtime_flags::tests::gated_delta_nax_hv32_requires_opt_in",
+                    "--nocapture",
+                ])
+                .env(CHILD, expected);
+            for flag in ["GATED_DELTA_NAX_HV32", "PREFILL_LINEAR_NAX"] {
+                command.env_remove(format!("SARAGOSSA_RUST_{flag}"));
+                command.env_remove(format!("RETI_RUST_{flag}"));
+            }
+            if let Some(value) = hv32 {
+                command.env("SARAGOSSA_RUST_GATED_DELTA_NAX_HV32", value);
+            }
+            if let Some(value) = global {
+                command.env("SARAGOSSA_RUST_PREFILL_LINEAR_NAX", value);
+            }
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "hv32={hv32:?}, global={global:?}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     // Les tests d'env ci-dessous partagent le même processus : un mutex

@@ -7,6 +7,10 @@ fn kb_gated_delta() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
+    assert!(
+        crate::runtime_flags::gated_delta_nax_hv32_enabled(),
+        "SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1 et NAX linéaire requis"
+    );
     let reps = kb_reps();
     for hv in [32_usize, 48] {
         let config = LinearAttentionConfig {

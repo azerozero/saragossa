@@ -1,7 +1,7 @@
 # Prefill MoE BM32 et gated delta hv32
 
-Le GEMM groupé u4 gs64 BM32 est accessible aux routeurs softmax, y compris
-aux experts routés du chemin partagé. Le softmax garde BM16 lorsque
+Le GEMM groupé u4 gs64 BM32 reste activé par défaut et est accessible aux
+routeurs softmax, y compris aux experts routés du chemin partagé. Le softmax garde BM16 lorsque
 `rows × top_k < 16 × experts` : le padding BM32 double sur les petits lots
 uniformes et les sondes mesurent une régression. Le routeur sigmoïde garde
 sa sélection existante. Les overrides de test forcent les deux variantes
@@ -13,8 +13,10 @@ historique `SARAGOSSA_RUST_FLINT_MOE_COOP_TILED=0` couvre aussi le softmax.
 Le gated delta NAX sélectionne les instanciations hk16/hv32 et hk16/hv48,
 dk=dv=128, et dimensionne la grille sur Hv. Les autres formes et les pipelines
 absents suivent le repli existant. L'état bf16 reste hors du chemin NAX.
-hv32 utilise trois produits compensés (hi×hi + hi×lo + lo×hi) dans le
-layout MPP existant : la précision relâchée du
+hv32 est opt-in via `SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1` (défaut OFF).
+hv48 reste activé par défaut comme sur main. Sans opt-in, hv32 suit le
+repli séquentiel existant. hv32 utilise trois produits compensés
+(hi×hi + hi×lo + lo×hi) dans le layout MPP existant : la précision relâchée du
 port hv48 dépasse la borne de 5e-4 sur la sonde à T=512. hv48 conserve
 son mode historique. Le kernel conserve l'écrêtage `log(max(g, 1e-6))` de la variante hv48.
 `SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0` désactive les deux instanciations.
@@ -28,6 +30,7 @@ ils ne téléchargent aucun poids.
 ```sh
 rtk cargo test --release --all-features --lib --no-run
 rtk proxy python3 tools/gpulock.py run --owner prefill-oracles --prio 10 -- \
+  env SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1 \
   cargo test --release --all-features --lib -- --test-threads=1 --nocapture \
   softmax_coop_tiled_padding_boundary \
   gated_delta_nax_matches_naive_oracle \
@@ -44,15 +47,17 @@ La tolérance absolue
 préexistante de 5e-4 est inchangée. Les oracles MoE exigent l'identité des
 bits, avec routages déséquilibrés, experts vides, queues et résidu.
 
-Le modèle est comparé sous les quatre combinaisons BM16/BM32 × repli/NAX.
+Avec l’opt-in explicite, le modèle est comparé sous les quatre combinaisons
+BM16/BM32 × repli/NAX.
 Le cache de préfixe est coupé ; les compteurs doivent prouver les chemins
-utilisés. Les tokens greedy doivent être strictement identiques ; les hidden
-BM32/BM16 également, à récurrence identique.
+utilisés. Ce test exige des tokens greedy strictement identiques sur son
+corpus court ; les hidden BM32/BM16 également, à récurrence identique.
 
 ```sh
 # MODEL désigne le dossier local Qwen3.6-35B-A3B-4bit.
 rtk proxy python3 tools/gpulock.py run --owner prefill-greedy --prio 10 -- \
   env SARAGOSSA_RUST_PREFIX_CACHE=0 SARAGOSSA_RUST_MTP_DECODE=0 \
+  SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1 \
   SARAGOSSA_TEST_PREFILL_MODEL="$MODEL" \
   SARAGOSSA_TEST_PREFILL_PROMPT=tests/fixtures/rowsexact/code4k-1.txt \
   SARAGOSSA_TEST_PREFILL_LENGTHS=512,4096 SARAGOSSA_TEST_PREFILL_STEPS=32 \
@@ -80,7 +85,8 @@ historique ; son oracle CPU court garde sa tolérance de 5e-4.
 
 ```sh
 rtk proxy python3 tools/gpulock.py run --owner prefill-sondes --prio 10 -- \
-  env KB_REPS=5 cargo test --release --all-features --lib -- \
+  env SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1 KB_REPS=5 \
+  cargo test --release --all-features --lib -- \
   --ignored --test-threads=1 --nocapture \
   metal_backend::tests::kb_moe_coop metal_backend::tests::kb_gated_delta
 ```
@@ -107,7 +113,8 @@ for lot in c1 b1 ensemble; do
     --env-a SARAGOSSA_RUST_FLINT_MOE_COOP_TILED=0 \
     --env-a SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0 \
     --env-b "SARAGOSSA_RUST_FLINT_MOE_COOP_TILED=$bm" \
-    --env-b "SARAGOSSA_RUST_PREFILL_LINEAR_NAX=$nax"
+    --env-b "SARAGOSSA_RUST_PREFILL_LINEAR_NAX=$nax" \
+    --env-b "SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=$nax"
   rtk proxy python3 bench/ab.py report ".tmp/ab-prefill-$lot"
 done
 ```
@@ -148,3 +155,45 @@ Les mesures NAX compensées ont une seule répétition : 4,66 ms à T=512,
 6,05 ms à T=4096 et 9,44 ms à T=8192 contre 3,62 / 11,32 / 22,59 ms pour
 seq f32. Elles ne constituent pas un verdict de performance, notamment à
 T=512. L'A/B intégré et les répétitions supplémentaires restent à lancer.
+
+## KL forcée et choix des défauts
+
+La mesure contre main sur Qwen3.6-35B-A3B-4bit utilise un prompt de
+4 709 tokens et 64 tokens de continuation. Les distributions sont comparées
+sur la même continuation imposée, afin d'isoler l'écart numérique avant
+l'amplification d'une divergence greedy.
+
+| Configuration du candidat | KL moyenne | Accord top-1 |
+|---|---:|---:|
+| BM32 et NAX hv32 activés | 2,3e-3 | 98,4 % |
+| BM32 coupé, NAX hv32 activé | 2,3e-3 | 98,4 % |
+| BM32 activé, NAX linéaire coupé | 0 | 100 % |
+
+L'ablation attribue la divergence à NAX hv32. BM32 conserve l'identité
+bit à bit sur ce cas et reste activé par défaut. Les oracles synthétiques
+hv32 et le corpus court ci-dessus passent, mais ne garantissent pas
+l'identité greedy sur ce prompt plus long. hv32 devient donc opt-in ;
+l'analyse d'un remède d'identité est en cours. Aucune tolérance des oracles
+n'est relâchée. hv48 conserve son comportement historique de main.
+
+Les commandes d'oracles, de sondes et d'A/B ci-dessus activent hv32
+explicitement. `SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0` reste prioritaire sur
+cet opt-in et désactive aussi hv48.
+
+### Vérification des défauts après passage en opt-in
+
+Le 14 novembre 2026, sous verrou GPU partagé, le candidat sans override de
+calcul retrouve la référence main (`def0a02`, binaire de la mesure KL) :
+KL moyenne et maximale nulles, accord top-1 de 100 % sur les 64 pas forcés.
+Une génération greedy libre séparée produit les mêmes 64 identifiants de
+tokens que main (`--temperature 0 --max-tokens 64 --ignore-stop-tokens`).
+Le prompt de 4 709 tokens est celui de l'ablation : 300 notes numérotées sur
+l'imprimerie, précédées de « Summarize the following notes. ».
+
+Les oracles sont rejoués avec les défauts (hv48 actif, hv32 absent), avec
+`SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1` (les deux formes actives), puis avec
+le kill-switch global (les deux absentes). Les sept tests ciblés BM32/NAX,
+la sonde hv32 jusqu'à 8 192 tokens et les quatre combinaisons du modèle à
+512/4 096 tokens passent. Les compteurs confirment 30 appels NAX hv32 par
+prefill avec l'opt-in. Les 15 tests de flags passent aussi, dont les cas
+isolés défaut OFF, OFF explicite, opt-in et priorité du kill-switch global.

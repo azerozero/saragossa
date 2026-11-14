@@ -819,7 +819,7 @@ impl MetalExecutor {
         } else {
             None
         };
-        let gated_delta_nax_hk16_hv32 = if crate::runtime_flags::prefill_linear_nax_enabled() {
+        let gated_delta_nax_hk16_hv32 = if crate::runtime_flags::gated_delta_nax_hv32_enabled() {
             let pipeline = compile_gated_delta_nax(
                 &device,
                 GATED_DELTA_NAX_KERNELS,
