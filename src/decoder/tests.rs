@@ -7036,3 +7036,42 @@ fn gemma4_explicit_rope_parameters_reach_decoder() -> Result<()> {
     assert_eq!(sliding.rope_theta_override, Some(20_000.0));
     Ok(())
 }
+
+#[test]
+fn prefix_cache_purge_recovers_poisoned_mutex() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let entry = |token| PrefixCacheEntry {
+        tokens: vec![token],
+        cache: model.empty_cache(),
+        final_state: Tensor::row(vec![0.0]).expect("invariant: ligne non vide"),
+        mtp_history: None,
+        captures: None,
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        linear_metal: Vec::new(),
+    };
+    for poisoned in [false, true] {
+        let cache = Mutex::new(PrefixCache {
+            entries: vec![entry(2), entry(1)],
+        });
+        if poisoned {
+            let result = std::panic::catch_unwind(|| {
+                let _guard = cache.lock().expect("invariant: mutex neuf");
+                panic!("empoisonnement volontaire du cache");
+            });
+            assert!(result.is_err());
+            assert!(cache.is_poisoned());
+        }
+        assert!(matches!(purge_prefix_cache(&cache), PurgeOutcome::Purged { bytes } if bytes > 0));
+        {
+            let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+            assert_eq!(guard.entries.len(), 1);
+            assert_eq!(guard.entries[0].tokens, vec![2]);
+        }
+        assert!(matches!(
+            purge_prefix_cache(&cache),
+            PurgeOutcome::Purged { .. }
+        ));
+        assert!(matches!(purge_prefix_cache(&cache), PurgeOutcome::Empty));
+    }
+    Ok(())
+}
