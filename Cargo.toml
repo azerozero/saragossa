@@ -60,6 +60,7 @@ hound = "3.5"
 md5 = "0.7"
 sha2 = "0.10"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+fs2 = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.29", optional = true }

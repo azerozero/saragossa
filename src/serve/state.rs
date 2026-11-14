@@ -689,6 +689,7 @@ impl LoadedModel {
         session_key: Option<&str>,
         memory_guard: &MemoryGuard,
     ) -> ServeResult<ServedCompletion> {
+        let _disk_session = saragossa::decoder::PrefixDiskSession::enter(session_key);
         let prepared = self.prepare(&request, max_tokens)?;
         let PreparedRequest {
             tokens: prompt_tokens_ids,
@@ -775,6 +776,7 @@ impl LoadedModel {
         memory_guard: &MemoryGuard,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
+        let _disk_session = saragossa::decoder::PrefixDiskSession::enter(session_key);
         let prepared = self.prepare(&request, max_tokens)?;
         let PreparedRequest {
             tokens: prompt_tokens_ids,
@@ -1284,10 +1286,35 @@ impl LoadedModel {
         let block_tokens = self.prefix_cache.block_tokens();
         let full_block_tokens = tokens.len() / block_tokens * block_tokens;
         let root = BlockHash::for_session(session_key);
-        let hit = self
+        let mut hit = self
             .prefix_cache
             .match_prefix(root, tokens)
             .filter(|hit| cheap_extend || hit.tokens.saturating_mul(2) >= full_block_tokens);
+        let minimum = hit
+            .as_ref()
+            .map_or(0, |hit| hit.tokens)
+            .max(if cheap_extend {
+                0
+            } else {
+                full_block_tokens.div_ceil(2).saturating_sub(1)
+            });
+        if let Some(state) = self.decoder.load_persistent_prefix(
+            &tokens[..full_block_tokens],
+            block_tokens,
+            minimum,
+        )? {
+            let boundary = state.position();
+            let metal = self.decoder.snapshot_prompt_state_metal(&state)?;
+            let hash = tokens[..boundary]
+                .chunks_exact(block_tokens)
+                .fold(root, BlockHash::chain);
+            self.remember_prefix_block(root, hash, boundary, &state, memory_guard)?;
+            hit = Some(super::cache::PrefixBlockHit {
+                tokens: boundary,
+                state,
+                metal,
+            });
+        }
         let reused_prefix_tokens = hit.as_ref().map_or(0, |hit| hit.tokens);
 
         // NOTE: une seule frontière mémorisée par prompt, la dernière complète.
@@ -1324,6 +1351,8 @@ impl LoadedModel {
             let hash = tokens[..full_block_tokens]
                 .chunks_exact(block_tokens)
                 .fold(root, BlockHash::chain);
+            self.decoder
+                .persist_prompt(&tokens[..full_block_tokens], &state)?;
             self.remember_prefix_block(root, hash, full_block_tokens, &state, memory_guard)?;
         }
         self.decoder

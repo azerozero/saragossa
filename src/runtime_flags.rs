@@ -2664,3 +2664,57 @@ mod tests {
         assert!(claim_legacy_warning("RETI_TEST_AUTRE"));
     }
 }
+
+/// Options du second niveau SSD de `serve`, désactivé sans répertoire explicite.
+/// `SARAGOSSA_SERVE_PREFIX_SSD_DIR` désigne un répertoire privé dédié ;
+/// `SARAGOSSA_SERVE_PREFIX_SSD_GIB` borne les octets persistants et l'unique
+/// écriture en vol (32 Gio par défaut). Les préfixes courts, jusqu'à
+/// `SARAGOSSA_SERVE_PREFIX_SSD_PRIORITY_TOKENS` (4096), sont évincés après les
+/// autres ; chaque classe suit un LRU. Aucune priorité n'est reçue du réseau.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServePrefixSsdOptions {
+    /// Répertoire privé sous contrôle de l'opérateur.
+    pub directory: Option<std::path::PathBuf>,
+    /// Budget disque en Gio entiers, strictement positif.
+    pub gib: u64,
+    /// Longueur maximale des préfixes prioritaires ; zéro désactive la priorité.
+    pub priority_tokens: usize,
+}
+impl ServePrefixSsdOptions {
+    /// Lit les options ; une valeur mal formée est refusée, jamais ignorée.
+    ///
+    /// # Errors
+    /// Renvoie une erreur pour un entier invalide, nul ou trop grand.
+    pub fn from_env() -> crate::Result<Self> {
+        let number = |name: &str, default: u64| -> crate::Result<u64> {
+            env_var(name).map_or(Ok(default), |value| {
+                value
+                    .parse()
+                    .map_err(|_| crate::InferError::Config(format!("{name}: entier invalide")))
+            })
+        };
+        let options = Self {
+            directory: env_var_os("SARAGOSSA_SERVE_PREFIX_SSD_DIR")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from),
+            gib: number("SARAGOSSA_SERVE_PREFIX_SSD_GIB", 32)?,
+            priority_tokens: usize::try_from(number(
+                "SARAGOSSA_SERVE_PREFIX_SSD_PRIORITY_TOKENS",
+                4096,
+            )?)
+            .map_err(|_| crate::InferError::Config("priorité SSD trop grande".into()))?,
+        };
+        options.bytes()?;
+        Ok(options)
+    }
+    /// Convertit le budget en octets sans débordement.
+    ///
+    /// # Errors
+    /// Refuse zéro et les dépassements de capacité.
+    pub fn bytes(&self) -> crate::Result<u64> {
+        self.gib
+            .checked_mul(1024 * 1024 * 1024)
+            .filter(|&bytes| bytes > 0)
+            .ok_or_else(|| crate::InferError::Config("budget SSD invalide".into()))
+    }
+}

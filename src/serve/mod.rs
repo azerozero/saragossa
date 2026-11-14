@@ -61,6 +61,13 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         return Ok(());
     }
     let mut args = ServeArgs::parse(raw_args).map_err(boxed_error)?;
+    if let Some(root) = &args.prefix_ssd.directory {
+        saragossa::decoder::configure_prefix_disk_cache(
+            root,
+            args.prefix_ssd.bytes()?,
+            args.prefix_ssd.priority_tokens,
+        )?;
+    }
     model_selection::select_if_missing(&mut args).map_err(boxed_error)?;
     model_selection::resolve_models(&mut args).map_err(boxed_error)?;
     saragossa::force_resident_full_linear_decode();

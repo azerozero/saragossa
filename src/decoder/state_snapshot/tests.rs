@@ -789,6 +789,9 @@ fn content_identity_covers_shards_auxiliaries_and_sidecars() {
                 root.join("mtp.safetensors"),
                 draft.join("model.safetensors"),
                 draft.join("config.json"),
+                root.join("tokenizer.json"),
+                root.join("tokenizer_config.json"),
+                root.join("special_tokens_map.json"),
             ];
             for path in &paths {
                 std::fs::write(path, b"synthetic A").unwrap();
