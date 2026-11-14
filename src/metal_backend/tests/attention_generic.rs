@@ -50,6 +50,26 @@ fn causal_attention_generic_shape_scope() {
     ));
 }
 
+#[test]
+fn attention_effective_window_includes_prefix() {
+    let spec = generic_attention_spec(33, 4, 2, 128);
+    for (window, expected) in [
+        (0, Some(0)),
+        (33, Some(33)),
+        (272, Some(272)),
+        (273, None),
+        (274, None),
+        (usize::MAX, None),
+    ] {
+        assert_eq!(
+            PrefillAttentionSpec { window: Some(window), ..spec }
+                .with_effective_window(273)
+                .window,
+            expected,
+        );
+    }
+}
+
 fn assert_attention_close(got: &[f32], want: &[f32], label: &str) -> f32 {
     assert_eq!(got.len(), want.len(), "{label}");
     assert!(
@@ -106,6 +126,81 @@ fn generic_attention_chunk(
     guard.end();
     commit_and_wait(cb)?;
     read_f32_buffer(&out, q.len())
+}
+
+/// Une fenêtre sans effet doit choisir le même kernel, pas seulement le même
+/// masque. Le préfixe d'un morceau compte dans la borne de la fenêtre.
+#[test]
+fn windowed_attention_nax_full_window_and_truncated_window() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    const SEQ: usize = 273;
+    for d in [128, 256] {
+        let spec = generic_attention_spec(SEQ, 4, 2, d);
+        if executor.causal_attention_prefill_nax(spec).is_none() {
+            eprintln!("NAX d{d} absent : oracle fenêtré sauté");
+            continue;
+        }
+        let (q, k, v) = causal_attention_inputs(SEQ, 4, 2, d)?;
+        let qb = executor.upload_f32_buffer(q.data(), "window_q")?;
+        let kb = executor.upload_f32_buffer(k.data(), "window_k")?;
+        let vb = executor.upload_f32_buffer(v.data(), "window_v")?;
+        let out = executor.uncached_f32_buffer(q.len(), "window_out")?;
+        let run = |spec: PrefillAttentionSpec, windowed: bool| -> Result<Vec<f32>> {
+            let cb = executor.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            let guard = EncoderEndGuard::new(enc);
+            if windowed {
+                executor.encode_windowed_attention_prefill(enc, &qb, &kb, &vb, &out, spec)?;
+            } else {
+                executor.encode_causal_attention_prefill(enc, &qb, &kb, &vb, &out, spec)?;
+            }
+            guard.end();
+            commit_and_wait(cb)?;
+            read_f32_buffer(&out, q.len())
+        };
+        let causal = run(spec, false)?;
+        let bits = |values: &[f32]| values.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for window in [SEQ, SEQ + 1] {
+            let full = PrefillAttentionSpec { window: Some(window), ..spec };
+            assert!(executor.causal_attention_prefill_chunk_supported(full));
+            for windowed in [false, true] {
+                assert_eq!(bits(&run(full, windowed)?), bits(&causal));
+            }
+            let tail = tail_rows(&q, 33)?;
+            for mirror in [false, true] {
+                let chunk = PrefillAttentionSpec { seq: 33, ..spec };
+                let expected = generic_attention_chunk(&executor, (&tail, &k, &v), chunk, mirror)?;
+                let got = generic_attention_chunk(
+                    &executor, (&tail, &k, &v),
+                    PrefillAttentionSpec { window: Some(window), ..chunk }, mirror,
+                )?;
+                assert_eq!(bits(&got), bits(&expected));
+            }
+        }
+        for window in [1, SEQ - 1] {
+            let truncated = PrefillAttentionSpec { window: Some(window), ..spec };
+            assert!(!executor.causal_attention_prefill_chunk_supported(truncated));
+            let got = run(truncated, true)?;
+            // La dernière requête ne voit que les dernières `window` clés.
+            let tq = tail_rows(&q, window)?;
+            let tk = tail_rows(&k, window)?;
+            let tv = tail_rows(&v, window)?;
+            let expected = cpu_causal_attention_selected_rows_gqa(
+                &tq, &tk, &tv, 4, 2, &[window - 1],
+            )?;
+            assert_close_eps(&got[(SEQ - 1) * 4 * d..], &expected[0].1, 2.0e-5);
+            assert_ne!(bits(&got), bits(&causal));
+            // Même avec une requête unique, la fenêtre ne couvre pas le KV.
+            let tail = tail_rows(&q, 1)?;
+            assert!(generic_attention_chunk(
+                &executor, (&tail, &k, &v),
+                PrefillAttentionSpec { seq: 1, ..truncated }, false,
+            ).is_err());
+        }
+    }
+    Ok(())
 }
 
 fn generic_attention_oracle(

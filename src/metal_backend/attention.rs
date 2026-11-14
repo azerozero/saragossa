@@ -131,6 +131,17 @@ struct TailMoeSharedScratch {
     output: Buffer,
 }
 
+impl PrefillAttentionSpec {
+    /// Retire seulement un masque qui ne cache aucune clé. `kv_rows` vaut
+    /// position max + 1, préfixe inclus, jamais la seule taille du morceau.
+    pub(super) fn with_effective_window(mut self, kv_rows: usize) -> Self {
+        self.window = self
+            .window
+            .filter(|&window| window == 0 || window < kv_rows);
+        self
+    }
+}
+
 pub(super) fn prefill_attn_batch_long_supported(spec: PrefillAttentionSpec) -> bool {
     spec.seq > 2048
         && matches!(
@@ -1208,6 +1219,7 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
     ) -> Result<()> {
+        let spec = spec.with_effective_window(spec.seq);
         if spec.window.is_some() {
             return Err(InferError::Config(
                 "prefill résident fenêtré réservé à la phase 4".to_string(),
@@ -1366,6 +1378,17 @@ impl MetalExecutor {
             return Err(InferError::Dimension(
                 "prefill fenêtré avec fenêtre vide".to_string(),
             ));
+        }
+        let spec = spec.with_effective_window(spec.seq);
+        if spec.window.is_none() {
+            return self.encode_causal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+            );
         }
         let dims = [
             checked_u32(spec.seq, "attention fenêtrée seq")?,
@@ -1612,6 +1635,7 @@ impl MetalExecutor {
         kv_capacity: usize,
         bf16_kv: Option<[&BufferRef; 2]>,
     ) -> Result<()> {
+        let spec = spec.with_effective_window(kv_rows);
         if kv_rows > kv_capacity
             || !self.encode_steel_causal_attention_prefill(
                 encoder,
@@ -1638,6 +1662,7 @@ impl MetalExecutor {
         &self,
         spec: PrefillAttentionSpec,
     ) -> bool {
+        let spec = spec.with_effective_window(spec.seq);
         crate::runtime_flags::prefill_attn_steel_d256_enabled()
             && spec.window.is_none()
             && prefill_attn_steel_shape_supported(spec)

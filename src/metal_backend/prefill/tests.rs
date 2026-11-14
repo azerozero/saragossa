@@ -726,6 +726,123 @@ fn gemma_windowed_attention_prefill_full_window_is_causal_bit_exact() -> Result<
     Ok(())
 }
 
+/// Le routage et le format KV restent identiques avec une fenêtre sans effet,
+/// en un bloc ou par morceaux ; une fenêtre plus courte garde son repli.
+#[test]
+fn gemma_windowed_attention_prefill_nax_chunked_routing() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    const SEQ: usize = 546;
+    const HIDDEN: usize = 8;
+    const HEAD_DIM: usize = 128;
+
+    let input = deterministic_tensor(SEQ, HIDDEN, 653, 0.25)?;
+    let input_norm = deterministic_norm(HIDDEN, 659)?;
+    let post_norm = deterministic_norm(HIDDEN, 661)?;
+    let q_norm = deterministic_norm(HEAD_DIM, 673)?;
+    let k_norm = deterministic_norm(HEAD_DIM, 677)?;
+    let q_proj = Linear::new(deterministic_tensor(HEAD_DIM, HIDDEN, 683, 0.035)?, None)?;
+    let k_proj = Linear::new(deterministic_tensor(HEAD_DIM, HIDDEN, 691, 0.032)?, None)?;
+    let v_proj = Linear::new(deterministic_tensor(HEAD_DIM, HIDDEN, 701, 0.03)?, None)?;
+    let o_proj = Linear::new(deterministic_tensor(HIDDEN, HEAD_DIM, 709, 0.02)?, None)?;
+    let dense_gate = zero_linear(4, HIDDEN)?;
+    let dense_up = zero_linear(4, HIDDEN)?;
+    let dense_down = zero_linear(HIDDEN, 4)?;
+    let causal_spec = PrefillAttentionSpec {
+        seq: SEQ,
+        hidden_dim: HIDDEN,
+        q_heads: 1,
+        kv_heads: 1,
+        head_dim: HEAD_DIM,
+        rope_dims: HEAD_DIM,
+        rope_frequency_dim: HEAD_DIM,
+        rope_theta: 10_000.0,
+        attn_scalar: 256.0,
+        window: None,
+        k_eq_v: false,
+        value_norm: true,
+        eps: 1.0e-6,
+    };
+    if executor.causal_attention_prefill_nax(causal_spec).is_none() {
+        eprintln!("NAX d128 absent : oracle résident fenêtré sauté");
+        return Ok(());
+    }
+    let run = |executor: &MetalExecutor, attention_spec: PrefillAttentionSpec, chunk, min_rows| {
+        with_prefill_kv_layout_override(chunk, min_rows, || {
+            executor.qwen_moe_prefill_resident(
+                &input,
+                &[PrefillMoeLayer {
+                    input_norm: &input_norm,
+                    attention: PrefillAttentionLayer::Full {
+                        q_proj: &q_proj,
+                        k_proj: &k_proj,
+                        v_proj: &v_proj,
+                        o_proj: &o_proj,
+                        q_norm: &q_norm,
+                        k_norm: &k_norm,
+                        gated: false,
+                        sinks: None,
+                    },
+                    attention_spec,
+                    post_norm: &post_norm,
+                    post_norm_before_residual: true,
+                    tail: PrefillMoeTail::Dense {
+                        gate_proj: &dense_gate,
+                        up_proj: &dense_up,
+                        down_proj: &dense_down,
+                    },
+                }],
+                attention_spec,
+            )
+        })
+    };
+
+    for (chunk, mirror, min_rows) in [
+        (0, false, usize::MAX),
+        (273, false, usize::MAX),
+        (273, true, usize::MAX),
+        (273, false, 0),
+    ] {
+        executor.prefill_kv_bf16_mirror = mirror;
+        let (causal, causal_caches) = run(&executor, causal_spec, chunk, min_rows)?;
+        let (causal_key, causal_value) = full_cache(&causal_caches)?;
+        for window in [SEQ, SEQ + 1] {
+            let (actual, caches) = run(
+                &executor,
+                PrefillAttentionSpec {
+                    window: Some(window),
+                    ..causal_spec
+                },
+                chunk,
+                min_rows,
+            )?;
+            let (key, value) = full_cache(&caches)?;
+            assert_bit_exact(&actual, &causal, "full-window resident output");
+            assert_bit_exact(&key, &causal_key, "full-window resident key");
+            assert_bit_exact(&value, &causal_value, "full-window resident value");
+        }
+        let truncated = PrefillAttentionSpec {
+            window: Some(SEQ - 1),
+            ..causal_spec
+        };
+        let (actual, caches) = run(&executor, truncated, chunk, min_rows)?;
+        // Une vraie fenêtre reste monobloc, même si le découpage est demandé.
+        let (expected, expected_caches) = run(&executor, truncated, 0, usize::MAX)?;
+        let (key, value) = full_cache(&caches)?;
+        let (expected_key, expected_value) = full_cache(&expected_caches)?;
+        assert_bit_exact(&actual, &expected, "truncated resident output");
+        assert_bit_exact(&key, &expected_key, "truncated resident key");
+        assert_bit_exact(&value, &expected_value, "truncated resident value");
+        assert!(actual
+            .data()
+            .iter()
+            .zip(causal.data())
+            .any(|(a, b)| a.to_bits() != b.to_bits()));
+    }
+    Ok(())
+}
+
 /// L'alias Gemma K=V ignore toute projection V distincte avant le cache.
 #[test]
 fn gemma_global_attention_aliases_raw_k_as_v() -> Result<()> {

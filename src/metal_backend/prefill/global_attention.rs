@@ -218,6 +218,13 @@ impl MetalExecutor {
                 if kv_only {
                     return Ok(o_buffer);
                 }
+                // Sans sinks, une fenêtre couvrant le préfixe suit exactement
+                // le même dispatch causal, y compris le NAX par morceaux.
+                let spec = if sinks_buffer.is_none() {
+                    spec.with_effective_window(chunk.start + chunk.rows)
+                } else {
+                    spec
+                };
                 self.run_resident_prefill_section(
                     context,
                     if spec.window.is_some() {

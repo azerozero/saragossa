@@ -560,7 +560,9 @@ impl MetalExecutor {
             && !has_sinks
             && layers.iter().all(|layer| match layer.attention {
                 PrefillAttentionLayer::Full { .. } => self
-                    .causal_attention_prefill_nax(layer.attention_spec)
+                    .causal_attention_prefill_nax(
+                        layer.attention_spec.with_effective_window(spec.seq),
+                    )
                     .is_some(),
                 PrefillAttentionLayer::Linear { .. } => true,
             });
@@ -580,7 +582,7 @@ impl MetalExecutor {
                         || self.attention_prefill_nax_sink_d128.is_some())
             }
             PrefillAttentionLayer::Full { .. } => self
-                .causal_attention_prefill_nax(layer.attention_spec)
+                .causal_attention_prefill_nax(layer.attention_spec.with_effective_window(spec.seq))
                 .is_some(),
             PrefillAttentionLayer::Linear { .. } => true,
         });
