@@ -22,6 +22,48 @@ pub(crate) fn moe_coop_tiled_trace_for_test() -> usize {
     MOE_COOP_TILED_TRACE.with(std::cell::Cell::get)
 }
 
+/// Sous cette densité, le routage uniforme double le padding en BM32.
+/// Les sondes 256/top-8 et 512/top-10 mesurent alors une régression.
+/// À 16 slots/expert, le gain dépend du routage : garder BM32, déjà mesuré
+/// plus rapide sur 256 experts à 512 tokens avec le routage kbench.
+fn softmax_coop_tiled_dense_enough(rows: usize, top_k: usize, experts: usize) -> bool {
+    rows.saturating_mul(top_k) >= experts.saturating_mul(MOE_COOP_TILE_M)
+}
+
+fn coop_tiled_route_enabled(
+    rows: usize,
+    top_k: usize,
+    experts: usize,
+    score: crate::RouterScore,
+) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = flags::flint_moe_coop_tiled_override() {
+        return forced;
+    }
+    flint_moe_coop_tiled_enabled()
+        && (matches!(score, crate::RouterScore::Sigmoid)
+            || softmax_coop_tiled_dense_enough(rows, top_k, experts))
+}
+
+#[cfg(test)]
+#[test]
+fn softmax_coop_tiled_padding_boundary() {
+    for (experts, top_k, last_sparse) in [(256, 8, 511), (512, 10, 819)] {
+        assert!(!softmax_coop_tiled_dense_enough(64, top_k, experts));
+        assert!(!softmax_coop_tiled_dense_enough(
+            last_sparse,
+            top_k,
+            experts
+        ));
+        assert!(softmax_coop_tiled_dense_enough(
+            last_sparse + 1,
+            top_k,
+            experts
+        ));
+        assert!(softmax_coop_tiled_dense_enough(4096, top_k, experts));
+    }
+}
+
 /// Grille des kernels groupés : (tuiles M, tuiles N).
 fn coop_grid(max_m: usize, n: usize, tiled: bool) -> MTLSize {
     if tiled {
@@ -599,9 +641,8 @@ impl MetalExecutor {
         trace_dispatch_path("moe_routed_rows_coop", rows, out_dim, in_dim);
         let total = checked_len(rows, top_k, "moe routed coop total")?;
 
-        // Kernels tuilés : flint (sigmoïde) seulement, cf. `flint_moe_coop_tiled_enabled`.
-        let tiled = matches!(router_score, crate::RouterScore::Sigmoid)
-            && flint_moe_coop_tiled_enabled()
+        // Le grouping et les GEMM sont indépendants de la fonction du routeur.
+        let tiled = coop_tiled_route_enabled(rows, top_k, experts, router_score)
             && self.routed_coop_tiled_ready(&weights.stacked);
         #[cfg(test)]
         if tiled {
@@ -820,9 +861,24 @@ impl MetalExecutor {
             shared_inter,
         )?;
 
-        // Dimensionnement WORST-CASE (zéro readback) : chaque expert padé à 16 lignes.
-        let max_tiles = total.div_ceil(16) + experts;
-        let max_m = checked_len(max_tiles, 16, "moe coop max_m")?;
+        let skip_gemm =
+            crate::runtime_flags::env_var(crate::runtime_flags::SNAPSHOT_ABLATION_FLAGS[0])
+                .is_some();
+        let tiled = !skip_gemm
+            && coop_tiled_route_enabled(rows, top_k, experts, crate::RouterScore::Softmax)
+            && self.routed_coop_tiled_ready(&weights.stacked);
+        #[cfg(test)]
+        if tiled {
+            MOE_COOP_TILED_TRACE.with(|trace| trace.set(trace.get() + 1));
+        }
+        let tile_m = if tiled {
+            MOE_COOP_TILED_BM
+        } else {
+            MOE_COOP_TILE_M
+        };
+        // Pire cas sans readback : au plus une tuile partielle par expert.
+        let max_tiles = total.div_ceil(tile_m) + experts;
+        let max_m = checked_len(max_tiles, tile_m, "moe coop max_m")?;
         const SENTINEL: u32 = 0xFFFF_FFFF;
         // Buffers de grouping GPU.
         let counts = self.private_u32_buffer(experts, "moe_coop_counts")?;
@@ -876,16 +932,13 @@ impl MetalExecutor {
             &tile_expert,
             &cursor,
             experts,
-            MOE_COOP_TILE_M,
+            tile_m,
         )?;
         self.encode_moe_g_perm(encoder, &scratch.indices, &cursor, &perm, total)?;
         // gate/up : GEMM + GATHER fusé (lit input via perm). swiglu padé.
         // down : GEMM + SCATTER fusé (écrit scratch.down[slot] via perm).
         // DIAGNOSTIC perf : SARAGOSSA_RUST_MOE_COOP_SKIP_GEMM saute les 3 grouped GEMMs
         // (sortie FAUSSE) → le delta vs la version complète = le coût du GEMM routé.
-        let skip_gemm =
-            crate::runtime_flags::env_var(crate::runtime_flags::SNAPSHOT_ABLATION_FLAGS[0])
-                .is_some();
         let fused_swiglu = !skip_gemm && moe_coop_fused_swiglu_enabled();
         if skip_gemm {
             // Zéro gate/up (0.0f32 = 0u32) pour éviter les dénormaux qui faussent le timing.
@@ -904,7 +957,7 @@ impl MetalExecutor {
                 inter,
                 hidden,
                 top_k,
-                false,
+                tiled,
             )?;
         } else {
             self.encode_coop_qb_grouped_gather(
@@ -954,7 +1007,7 @@ impl MetalExecutor {
                 max_m,
                 hidden,
                 inter,
-                false,
+                tiled,
             )?;
         }
         // Expert partagé + combine (même encodeur). DIAGNOSTIC : SKIP_SHARED saute
