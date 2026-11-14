@@ -162,7 +162,16 @@ pub(super) struct Store {
     worker: Option<std::thread::JoinHandle<()>>,
     disk: Arc<Mutex<Disk>>,
 }
+const REFUSAL_CAPACITY: usize = 1024;
+const REFUSAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct Refusal {
+    name: std::ffi::OsString,
+    reason: String,
+    expires: Instant,
+}
 struct Disk {
+    refused: std::collections::VecDeque<Refusal>,
     entries: Vec<Entry>,
     write_failed: bool,
     _lock: File,
@@ -207,6 +216,7 @@ impl Store {
         )?;
         io(&lock_path, lock.try_lock_exclusive())?;
         let mut disk = Disk {
+            refused: std::collections::VecDeque::new(),
             entries: Vec::new(),
             write_failed: false,
             _lock: lock,
@@ -309,6 +319,7 @@ impl Store {
     /// Vérifie disque et RAM avant le premier blit ou clone de données.
     pub(super) fn admit_staging(
         &self,
+        request: &Request,
         disk_bytes: u64,
         ram_bytes: u64,
     ) -> Result<crate::memory_guard::MemoryReservation> {
@@ -319,6 +330,22 @@ impl Store {
             self.staging_limit,
             io(&self.root, fs2::available_space(&self.root))?,
         )?;
+        {
+            let disk = self
+                .disk
+                .try_lock()
+                .map_err(|_| invalid("index SSD occupé"))?;
+            let protected = disk
+                .entries
+                .iter()
+                .filter(|entry| entry.priority)
+                .fold(0u64, |sum, entry| sum.saturating_add(entry.bytes));
+            if request.key.tokens > self.priority_tokens
+                && protected.saturating_add(disk_bytes) > self.budget
+            {
+                return Err(invalid("budget réservé aux préfixes prioritaires"));
+            }
+        }
         self.memory_guard
             .reserve_allocation(ram_bytes)
             .map_err(|error| invalid(error.to_string()))
@@ -337,10 +364,24 @@ impl Store {
         lengths.dedup();
         lengths
     }
-    pub(super) fn contains(&self, request: &Request) -> bool {
-        self.disk
-            .try_lock()
-            .is_ok_and(|disk| disk.entries.iter().any(|entry| entry.path == request.root))
+    /// Consulté avant l'estimation et avant toute copie de données.
+    pub(super) fn skip_save(&self, request: &Request) -> bool {
+        let Ok(mut disk) = self.disk.try_lock() else {
+            return true;
+        };
+        if disk.write_failed || disk.entries.iter().any(|entry| entry.path == request.root) {
+            return true;
+        }
+        if let Some(reason) = disk.refusal(&request.root, Instant::now()) {
+            eprintln!("prefix_ssd skipped memo={reason}");
+            return true;
+        }
+        false
+    }
+    pub(super) fn refuse(&self, request: &Request, reason: &str) {
+        if let Ok(mut disk) = self.disk.try_lock() {
+            disk.remember_refusal(&request.root, reason, Instant::now());
+        }
     }
     pub(super) fn reserve(&self) -> Option<Permit> {
         self.busy
@@ -434,6 +475,29 @@ impl Drop for Disk {
     }
 }
 impl Disk {
+    fn refusal(&mut self, path: &Path, now: Instant) -> Option<&str> {
+        self.refused.retain(|entry| entry.expires > now);
+        let name = path.file_name()?;
+        self.refused
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.reason.as_str())
+    }
+    fn remember_refusal(&mut self, path: &Path, reason: &str, now: Instant) {
+        let Some(name) = path.file_name() else {
+            return;
+        };
+        self.refused
+            .retain(|entry| entry.expires > now && entry.name != name);
+        while self.refused.len() >= REFUSAL_CAPACITY {
+            self.refused.pop_front();
+        }
+        self.refused.push_back(Refusal {
+            name: name.to_owned(),
+            reason: reason.chars().take(256).collect(),
+            expires: now + REFUSAL_TTL,
+        });
+    }
     fn evict(&mut self, budget: u64, incoming: u64, priority: bool) -> Result<()> {
         self.entries
             .sort_by_key(|entry| (entry.priority, entry.used));
@@ -458,6 +522,13 @@ impl Disk {
         Ok(())
     }
     fn write(&mut self, root: &Path, budget: u64, job: &Job) -> Result<()> {
+        let result = self.write_inner(root, budget, job);
+        if let Err(error) = &result {
+            self.remember_refusal(&root.join(&job.name), &error.to_string(), Instant::now());
+        }
+        result
+    }
+    fn write_inner(&mut self, root: &Path, budget: u64, job: &Job) -> Result<()> {
         if self.write_failed {
             return Err(invalid("écrivain SSD arrêté après erreur de publication"));
         }

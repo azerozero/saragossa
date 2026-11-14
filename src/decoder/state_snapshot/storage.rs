@@ -115,6 +115,11 @@ pub(super) fn bf16_values(bytes: &[u8]) -> Result<Vec<u16>> {
     Ok(bytemuck::pod_collect_to_vec(bytes))
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static BUFFERED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) struct Writer {
     root: PathBuf,
     generation: String,
@@ -171,6 +176,8 @@ impl Writer {
                 .try_reserve_exact(bytes.len())
                 .map_err(|_| invalid("mémoire de staging SSD insuffisante"))?;
             owned.extend_from_slice(bytes);
+            #[cfg(test)]
+            BUFFERED_BYTES.set(BUFFERED_BYTES.get().saturating_add(bytes.len()));
             buffered.push((relative.clone(), owned));
             return Ok(Blob {
                 file: relative,

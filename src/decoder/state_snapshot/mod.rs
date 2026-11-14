@@ -677,7 +677,7 @@ impl CausalDecoder {
         let store = persistent::store().filter(|store| request.root.starts_with(&store.root));
         let mut reservation = None;
         let permit = if let Some(store) = store {
-            if store.contains(request) {
+            if store.skip_save(request) {
                 return;
             }
             let Some(permit) = store.reserve() else {
@@ -685,9 +685,10 @@ impl CausalDecoder {
                 return;
             };
             let (disk_bytes, ram_bytes) = staging_estimate(cache, final_state, history, captures);
-            match store.admit_staging(disk_bytes, ram_bytes) {
+            match store.admit_staging(request, disk_bytes, ram_bytes) {
                 Ok(memory) => reservation = Some(memory),
                 Err(error) => {
+                    store.refuse(request, &error.to_string());
                     eprintln!("prefix_ssd skipped before_copy: {error}");
                     return;
                 }
@@ -748,6 +749,9 @@ impl CausalDecoder {
             Ok(())
         })();
         if let Err(error) = result {
+            if let Some(store) = store {
+                store.refuse(request, &error.to_string());
+            }
             eprintln!("state_snapshot refusé : {error}; sans écriture");
         }
     }

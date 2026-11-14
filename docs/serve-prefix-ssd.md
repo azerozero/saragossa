@@ -85,6 +85,12 @@ blobs, synchronisations et renommages. Il publie un dossier `pending` complet
 par `rename`, après `fsync` des fichiers et dossiers. Un arrêt brutal avant
 publication laisse un temporaire supprimé au redémarrage.
 
+Les refus sont mémorisés avant toute nouvelle copie : au plus 1024 noms
+hachés et raisons, pendant 60 secondes, sans renouveler le délai sur un hit.
+Cela couvre les plafonds, la priorité et les erreurs du worker. Après une
+erreur de publication, l'écrivain reste arrêté jusqu'au redémarrage : aucun
+hit RAM ne prépare alors un nouvel instantané.
+
 Une file occupée fait abandonner la nouvelle candidature, sans attendre.
 Pendant la publication, un lookup disque indisponible repart au prefill ;
 aucune attente de l'écrivain n'est imposée au moteur. La persistance est donc

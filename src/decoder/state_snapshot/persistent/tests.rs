@@ -507,7 +507,130 @@ fn staging_limits_and_memory_guard_refuse_before_copy() {
         },
         Arc::new(|| Some(0)),
     );
-    assert!(store.admit_staging(disk, ram).is_err());
+    assert!(store.admit_staging(&request, disk, ram).is_err());
     assert!(!request.root.exists());
     assert!(!store.busy.load(Ordering::Acquire));
+}
+
+#[test]
+fn negative_memo_is_bounded_expires_and_covers_worker_refusals() {
+    let root = private_dir();
+    let store = Store::open(root.path(), 1, 0).unwrap();
+    let (model, request, state) = fixture(&store, 1);
+    publish(&store, &request, payload(&model, &request, &state));
+    assert!(store.skip_save(&request));
+    let now = Instant::now();
+    {
+        let mut disk = store.disk.lock().unwrap();
+        assert!(disk
+            .refusal(&request.root, now)
+            .unwrap()
+            .contains("budget SSD"));
+        assert!(disk.refusal(&request.root, now + REFUSAL_TTL).is_none());
+        for index in 0..REFUSAL_CAPACITY + 10 {
+            disk.remember_refusal(&PathBuf::from(format!("entry-{index}")), "priority", now);
+        }
+        assert_eq!(disk.refused.len(), REFUSAL_CAPACITY);
+        assert!(disk.refusal(Path::new("entry-0"), now).is_none());
+        disk.write_failed = true;
+    }
+    assert!(
+        store.skip_save(&request),
+        "écrivain arrêté, même après expiration"
+    );
+}
+
+#[test]
+fn priority_refusal_is_memoized_before_staging() {
+    let root = private_dir();
+    let store = Store::open(root.path(), 64 << 20, 2).unwrap();
+    let (model, first, state) = fixture(&store, 1);
+    publish(&store, &first, payload(&model, &first, &state));
+    let (_, mut candidate, _) = fixture(&store, 2);
+    candidate.key.tokens = 3;
+    let error = store
+        .admit_staging(&candidate, store.budget, 1)
+        .unwrap_err();
+    assert!(error.to_string().contains("prioritaires"));
+    store.refuse(&candidate, &error.to_string());
+    for _ in 0..5 {
+        assert!(store.skip_save(&candidate));
+    }
+    assert!(!candidate.root.exists());
+    assert_eq!(store.disk.lock().unwrap().refused.len(), 1);
+}
+
+#[test]
+fn repeated_persistent_hits_do_not_copy_refused_states() {
+    if let Ok(failure) = std::env::var("SSD_REFUSAL_CHILD") {
+        let root = private_dir();
+        let source = root.path().join("weights");
+        fs::write(&source, b"synthetic identity").unwrap();
+        configure_prefix_disk_cache(
+            &root.path().join("cache"),
+            if failure == "budget" { 1 } else { 64 << 20 },
+            0,
+        )
+        .unwrap();
+        let store = store().unwrap();
+        let model = CausalDecoder::from_tensors(
+            crate::decoder::tests::test_weights(),
+            CausalDecoderConfig::default(),
+        )
+        .unwrap()
+        .with_snapshot_sources(SnapshotSources::capture([source.as_path()]));
+        let _session = PrefixDiskSession::enter(Some("refused"));
+        let state = {
+            let _warmup = crate::runtime_flags::StateSnapshotWarmup::enter();
+            model.prefill_prompt_state_uncached(&[0, 1]).unwrap()
+        };
+        let request = model
+            .snapshot_request(&[0, 1], SnapshotMode::Ar)
+            .unwrap()
+            .unwrap();
+        if failure == "writer" {
+            store.disk.lock().unwrap().write_failed = true;
+        } else if failure == "priority" {
+            store.disk.lock().unwrap().entries.push(Entry {
+                path: store.root.join("protected"),
+                tokens: 1,
+                bytes: store.budget,
+                priority: true,
+                used: SystemTime::now(),
+            });
+        }
+        storage::BUFFERED_BYTES.set(0);
+        for _ in 0..4 {
+            model.persist_prompt(&[0, 1], &state).unwrap();
+        }
+        assert_eq!(
+            storage::BUFFERED_BYTES.get(),
+            0,
+            "aucun octet copié pour {failure}"
+        );
+        assert!(!request.root.exists());
+        if failure != "writer" {
+            let disk = store.disk.lock().unwrap();
+            assert_eq!(disk.refused.len(), 1);
+            assert!(disk.refused[0].reason.contains(if failure == "budget" {
+                "budget"
+            } else {
+                "prioritaires"
+            }));
+        }
+        return;
+    }
+    for failure in ["budget", "priority", "writer"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "decoder::state_snapshot::persistent::tests::repeated_persistent_hits_do_not_copy_refused_states", "--nocapture"])
+            .env("SSD_REFUSAL_CHILD", failure)
+            .env_remove("SARAGOSSA_RUST_STATE_SNAPSHOT")
+            .env_remove("RETI_RUST_STATE_SNAPSHOT")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{failure}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
