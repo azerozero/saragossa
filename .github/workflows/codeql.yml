@@ -11,6 +11,7 @@ on:
   # Le filtre est dans les jobs pour toujours produire le check « CodeQL Rust ».
   pull_request:
     branches: [main]
+  merge_group:
   schedule:
     - cron: "0 6 * * 1"
 
