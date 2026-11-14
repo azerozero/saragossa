@@ -1556,6 +1556,20 @@ impl CausalDecoder {
     }
 }
 
+fn purge_prefix_cache(cache: &Mutex<PrefixCache>) -> PurgeOutcome {
+    let mut cache = match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            eprintln!("warn: saragossa: cache préfixe empoisonné, récupération pour purge");
+            poisoned.into_inner()
+        }
+    };
+    cache
+        .evict_lru_entry()
+        .map(|bytes| PurgeOutcome::Purged { bytes })
+        .unwrap_or(PurgeOutcome::Empty)
+}
+
 impl CausalDecoder {
     fn register_prefix_cache_purgeable(&self) {
         let cache = Arc::downgrade(&self.prefix_cache);
@@ -1565,14 +1579,7 @@ impl CausalDecoder {
                 let Some(cache) = cache.upgrade() else {
                     return PurgeOutcome::Empty;
                 };
-                let outcome = match cache.lock() {
-                    Ok(mut cache) => cache
-                        .evict_lru_entry()
-                        .map(|bytes| PurgeOutcome::Purged { bytes })
-                        .unwrap_or(PurgeOutcome::Empty),
-                    Err(_) => PurgeOutcome::Empty,
-                };
-                outcome
+                purge_prefix_cache(&cache)
             });
         }
     }

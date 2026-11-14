@@ -28,11 +28,6 @@ impl KvEncoding {
         }
     }
 
-    /// Indique un encodage quantifié (codes + échelles).
-    pub(crate) const fn is_quantized(self) -> bool {
-        matches!(self, Self::Q8 | Self::Q4)
-    }
-
     /// Bits par code, `None` pour un encodage dense.
     pub(crate) const fn bits(self) -> Option<usize> {
         match self {

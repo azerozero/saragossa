@@ -762,6 +762,19 @@ pub(super) fn decode_pipeline_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_PIPELINE", true))
 }
 
+/// Diagnostics MoE figés au premier accès, actifs par présence même pour "0".
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn moe_coop_skip_gemm() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_var(SNAPSHOT_ABLATION_FLAGS[0]).is_some())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn moe_coop_skip_shared() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_var(SNAPSHOT_ABLATION_FLAGS[1]).is_some())
+}
+
 /// Diagnostic C1B (hors chemin prod) : `SARAGOSSA_RUST_ORACLE_DUMP_LOGITS=k` dump sur
 /// stderr les `k` plus grands logits (`id:valeur_f32`) à chaque pas de decode
 /// résident, pour classer les near-ties bf16 vs une vraie dégradation. Renvoie
@@ -2429,6 +2442,45 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn moe_ablation_flags_cache_presence_and_legacy_aliases() {
+        const CHILD: &str = "MOE_ABLATION_CACHE_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let expected = expected == "true";
+            assert_eq!(moe_coop_skip_gemm(), expected);
+            assert_eq!(moe_coop_skip_shared(), expected);
+            for flag in &SNAPSHOT_ABLATION_FLAGS[..2] {
+                std::env::set_var(flag, "changed");
+            }
+            assert_eq!(moe_coop_skip_gemm(), expected);
+            assert_eq!(moe_coop_skip_shared(), expected);
+            return;
+        }
+        for value in [None, Some(""), Some("0"), Some("1")] {
+            for legacy in [false, true] {
+                let mut command = std::process::Command::new(
+                    std::env::current_exe().expect("invariant: binaire de test"),
+                );
+                command.args(["--exact", "runtime_flags::tests::moe_ablation_flags_cache_presence_and_legacy_aliases"])
+                    .env(CHILD, value.is_some().to_string());
+                for flag in &SNAPSHOT_ABLATION_FLAGS[..2] {
+                    let alias = flag.replacen("SARAGOSSA_", "RETI_", 1);
+                    command.env_remove(flag).env_remove(&alias);
+                    if let Some(value) = value {
+                        command.env(if legacy { alias.as_str() } else { *flag }, value);
+                    }
+                }
+                let output = command.output().expect("invariant: sous-processus de test");
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
+        }
     }
 
     #[test]

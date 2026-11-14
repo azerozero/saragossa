@@ -33,7 +33,7 @@ de référence et de repli mesurable.
 | `src/serve/` | transport local et API compatible OpenAI |
 | `src/runtime_flags.rs` | source unique des flags et diagnostics runtime |
 | `src/kernels.metal` | kernels Metal généraux |
-| `build.rs` | préparation des assets Metal à la compilation |
+| `build.rs` | copie du préambule figé `assets/steel_attention.metal` dans `OUT_DIR` |
 
 ## Conventions Rust et Metal
 
@@ -61,9 +61,12 @@ cargo audit
 cargo machete
 ```
 
-La compilation Metal exige macOS et la Metal Toolchain. Les tests d'inférence
-qui nécessitent des poids restent ignorés ou activés explicitement; les gates
-ordinaires ne téléchargent et n'exécutent aucun modèle.
+`build.rs` recopie le préambule Metal figé dans `OUT_DIR` pour la feature
+`metal` sur une cible Apple Darwin ; sinon, il écrit un fichier vide. Il ne
+compile aucun shader. Les shaders sont compilés au runtime par
+`new_library_with_source` ; leur exécution exige un appareil Metal compatible.
+Les tests d'inférence qui nécessitent des poids restent ignorés ou activés
+explicitement; les gates ordinaires ne téléchargent et n'exécutent aucun modèle.
 
 Les hooks [`prek.toml`](prek.toml) lancent les contrôles rapides au commit et
 les contrôles de dépendances au push.
@@ -74,6 +77,7 @@ Le flux public est : fork du dépôt, branche courte, pull request vers `main`,
 puis CI verte. Les commits suivent Conventional
 Commits en français et n'ajoutent aucun trailer de paternité automatisé.
 
-`release-plz` prépare les changements de version et le changelog. Seul le
-workflow de release publie le crate; une contribution ordinaire ne modifie pas
-manuellement les tags et ne lance pas `cargo publish`.
+`release-plz` prépare les changements de version, le changelog et les tags Git.
+La distribution passe par les releases GitHub et Homebrew, sans publication
+sur crates.io. Une contribution ordinaire ne modifie pas manuellement les tags
+et ne lance pas `cargo publish`.

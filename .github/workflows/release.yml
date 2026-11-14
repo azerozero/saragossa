@@ -1,0 +1,269 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TARGET: aarch64-apple-darwin
+  ARCHIVE_NAME: saragossa-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+
+jobs:
+  build:
+    name: Build Apple Silicon archive
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Validate release version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          if os.environ["GITHUB_REF_NAME"] != f"v{version}":
+              raise SystemExit(f"Tag does not match Cargo.toml version v{version}")
+          PY
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      # Scanner les sources avant le build pour exclure les artefacts de target/.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: sbom-saragossa.spdx.json
+          output-file: sbom-saragossa.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Build and check CLI
+        run: |
+          test "$(uname -m)" = arm64
+          cargo build --locked --release --target "$TARGET" --bin saragossa --features metal,devtools
+          "target/$TARGET/release/saragossa" --help
+
+      - name: Package binary and checksum
+        run: |
+          mkdir -p staging dist
+          cp "target/$TARGET/release/saragossa" README.md NOTICE staging/
+          cp LICENSE-APACHE staging/LICENSE
+          COPYFILE_DISABLE=1 tar -czf "dist/$ARCHIVE_NAME" -C staging saragossa README.md LICENSE NOTICE
+          mv sbom-saragossa.spdx.json dist/
+          cd dist
+          shasum -a 256 "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256"
+
+      - name: Attest archive provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: dist/*.tar.gz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create release
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: artifacts
+
+      - name: Verify checksums
+        working-directory: artifacts
+        run: sha256sum --check ./*.sha256
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Validate tag and extract changelog
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          if os.environ["GITHUB_REF_NAME"] != f"v{version}":
+              raise SystemExit(f"Tag does not match Cargo.toml version v{version}")
+          changelog = Path("CHANGELOG.md").read_text()
+          section = re.search(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## |\Z)",
+              changelog,
+              re.MULTILINE | re.DOTALL,
+          )
+          if section is None or not section.group(1).strip():
+              raise SystemExit(f"Missing changelog section for {version}")
+          Path("RELEASE_NOTES.md").write_text(section.group(0).strip() + "\n\n")
+          PY
+
+      - name: Prepare checksums and release notes
+        run: |
+          {
+            echo "## SHA256 Checksums"
+            echo '```'
+            cat artifacts/*.sha256
+            echo '```'
+          } > CHECKSUMS.md
+          cat CHECKSUMS.md >> RELEASE_NOTES.md
+
+      # Ce workflow est le seul créateur de la release : release-plz pose le tag.
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          options=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes-file RELEASE_NOTES.md \
+            "${options[@]}" \
+            artifacts/*.tar.gz artifacts/*.sha256 artifacts/sbom-saragossa.spdx.json CHECKSUMS.md
+
+  homebrew:
+    name: Update Homebrew tap
+    if: ${{ !contains(github.ref_name, '-') }}
+    needs: [release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: homebrew-tap-saragossa
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: azerozero/homebrew-tap
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          path: tap
+
+      - name: Download and verify released archive
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ARCHIVE_NAME" --pattern "$ARCHIVE_NAME.sha256" \
+            --dir "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release"
+          sha256sum --check "$ARCHIVE_NAME.sha256"
+
+      - name: Update formula
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA=$(sha256sum "$RUNNER_TEMP/release/$ARCHIVE_NAME" | cut -d' ' -f1)
+          mkdir -p tap/Formula
+          cat > tap/Formula/saragossa.rb << RUBY
+          class Saragossa < Formula
+            desc "Pure-Rust Metal inference engine for Apple Silicon LLMs, STT and TTS"
+            homepage "https://github.com/azerozero/saragossa"
+            version "${VERSION}"
+            url "https://github.com/azerozero/saragossa/releases/download/v#{version}/saragossa-v#{version}-aarch64-apple-darwin.tar.gz"
+            sha256 "${SHA}"
+            license "Apache-2.0"
+
+            depends_on arch: :arm64
+            depends_on :macos
+
+            def install
+              bin.install "saragossa"
+              doc.install "README.md", "LICENSE", "NOTICE"
+            end
+
+            def caveats
+              <<~EOS
+                saragossa compile ses kernels Metal au premier lancement
+                (MTLDevice newLibraryWithSource). Cela requiert la Metal Toolchain :
+
+                  xcodebuild -downloadComponent MetalToolchain
+
+                Les poids de modèle sont résolus depuis Hugging Face au premier run :
+
+                  saragossa run mlx-community/Qwen3-4B-4bit
+                  saragossa list
+                  saragossa serve --model-dir ~/models --api-key local-dev
+              EOS
+            end
+
+            test do
+              assert_match "saragossa", shell_output("#{bin}/saragossa --help 2>&1")
+            end
+          end
+          RUBY
+
+      - name: Commit and push tap update
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/saragossa.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date"
+            exit 0
+          fi
+          git commit -m "chore(saragossa): mettre à jour vers ${GITHUB_REF_NAME#v}"
+          git push
+
+  homebrew-test:
+    name: Test Homebrew install
+    needs: [homebrew]
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Install and test released version
+        run: |
+          brew update
+          brew install azerozero/tap/saragossa
+          saragossa --help
+          INSTALLED=$(brew list --versions saragossa)
+          EXPECTED="saragossa ${GITHUB_REF_NAME#v}"
+          if [[ "$INSTALLED" != "$EXPECTED" ]]; then
+            echo "::error::Version mismatch: installed=$INSTALLED expected=$EXPECTED"
+            exit 1
+          fi
+          brew test azerozero/tap/saragossa
+
+      - name: Test brew reinstall
+        run: |
+          brew reinstall azerozero/tap/saragossa
+          saragossa --help

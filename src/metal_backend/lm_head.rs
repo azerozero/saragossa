@@ -532,7 +532,8 @@ impl MetalExecutor {
         )
     }
 
-    /// Encode le `lm_head` dans un buffer partagé pour sampling CPU exact.
+    /// Encode le `lm_head` dans le buffer partagé fourni pour sampling CPU exact.
+    /// L'appelant garde son bail jusqu'à la fin du command buffer et du readback.
     ///
     /// # Errors
     ///
@@ -543,16 +544,19 @@ impl MetalExecutor {
         input_buffer: &BufferRef,
         lm_head: &MetalLinearWeightBuffers,
         in_dim: usize,
-    ) -> Result<(metal::Buffer, usize)> {
+        logits_buffer: &BufferRef,
+    ) -> Result<usize> {
         let out_dim = self.linear_weight_out_dim(lm_head);
-        let logits_buffer = self.uncached_f32_buffer(out_dim, "sample_logits_readback")?;
+        if logits_buffer.length() < byte_len::<f32>(out_dim)? {
+            return Err(InferError::Dimension("buffer readback trop petit".into()));
+        }
         let projected_dim = self.encode_matmul_weight_buffers(
             encoder,
             input_buffer,
             1,
             in_dim,
             lm_head,
-            &logits_buffer,
+            logits_buffer,
             false,
         )?;
         if projected_dim != out_dim {
@@ -560,7 +564,7 @@ impl MetalExecutor {
                 "sample readback projection sort {projected_dim}, attendu {out_dim}"
             )));
         }
-        Ok((logits_buffer, out_dim))
+        Ok(out_dim)
     }
 
     /// Variante en lignes de [`Self::encode_lm_head_logits_readback_buffers`] :

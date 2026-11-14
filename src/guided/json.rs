@@ -93,7 +93,8 @@ impl JsonTokenConstraint {
 impl TokenConstraint for JsonTokenConstraint {
     fn mask_logits(&self, logits: &mut [f32]) -> Result<()> {
         let state = self.state_snapshot()?;
-        let first_bytes = state.allowed_first_bytes();
+        let mut scratch = state.clone();
+        let first_bytes = state.allowed_first_bytes(&mut scratch);
         let final_state = state.is_final();
         let mut allowed = 0_usize;
 
@@ -110,7 +111,8 @@ impl TokenConstraint for JsonTokenConstraint {
                     .token_bytes(token)
                     .filter(|bytes| !bytes.is_empty())
                     .is_some_and(|bytes| {
-                        first_bytes[usize::from(bytes[0])] && state.can_accept_bytes(bytes)
+                        first_bytes[usize::from(bytes[0])]
+                            && state.can_accept_bytes(bytes, &mut scratch)
                     })
             };
             if token_allowed {
@@ -162,12 +164,30 @@ impl TokenConstraint for JsonTokenConstraint {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct JsonAutomaton {
     mode: Mode,
     stack: Vec<Container>,
     repeat: bool,
     completed_root: bool,
+}
+
+impl Clone for JsonAutomaton {
+    fn clone(&self) -> Self {
+        Self {
+            mode: self.mode,
+            stack: self.stack.clone(),
+            repeat: self.repeat,
+            completed_root: self.completed_root,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.mode = source.mode;
+        self.stack.clone_from(&source.stack);
+        self.repeat = source.repeat;
+        self.completed_root = source.completed_root;
+    }
 }
 
 impl JsonAutomaton {
@@ -187,9 +207,9 @@ impl JsonAutomaton {
         self.repeat && self.completed_root && self.mode == Mode::BeforeRoot && self.stack.is_empty()
     }
 
-    fn can_accept_bytes(&self, bytes: &[u8]) -> bool {
-        let mut state = self.clone();
-        state.advance_bytes(bytes)
+    fn can_accept_bytes(&self, bytes: &[u8], scratch: &mut Self) -> bool {
+        scratch.clone_from(self);
+        scratch.advance_bytes(bytes)
     }
 
     fn advance_bytes(&mut self, bytes: &[u8]) -> bool {
@@ -201,11 +221,11 @@ impl JsonAutomaton {
         true
     }
 
-    fn allowed_first_bytes(&self) -> [bool; 256] {
+    fn allowed_first_bytes(&self, scratch: &mut Self) -> [bool; 256] {
         let mut allowed = [false; 256];
         for byte in u8::MIN..=u8::MAX {
-            let mut state = self.clone();
-            allowed[usize::from(byte)] = state.consume_byte(byte);
+            scratch.clone_from(self);
+            allowed[usize::from(byte)] = scratch.consume_byte(byte);
         }
         allowed
     }
