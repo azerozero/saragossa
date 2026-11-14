@@ -49,6 +49,7 @@ const U6_QMM_BATCH_TILE: usize = 8;
 
 mod attention;
 mod attention_checks;
+pub(crate) use attention_checks::check_threadgroup_size;
 mod barriers;
 mod buffers;
 mod byte_helpers;
@@ -424,8 +425,6 @@ pub struct MetalExecutor {
     na_gemm_bf16: Option<ComputePipelineState>,
     /// Variante encodeur Whisper plus proche du tiling MLX Steel NAX (BN=128).
     na_gemm_bf16_bn128: Option<ComputePipelineState>,
-    pub(super) chunk_delta_seq_layout: Option<ComputePipelineState>,
-    pub(super) chunk_delta_seq_layout_tc: Option<ComputePipelineState>,
     /// Gated delta NAX de MLX (27B : 16/48 têtes, dk = dv = 128).
     pub(super) gated_delta_nax_hk16_hv48: Option<ComputePipelineState>,
     na_gemm_coop_qb: Option<ComputePipelineState>,
@@ -436,6 +435,9 @@ pub struct MetalExecutor {
     /// GEMM tuilé u4 bf16×3 à lhs f32, réservé aux projections sous le
     /// plancher par défaut (petites formes de flint).
     na_gemm_coop_qb_tiled_u4_x3: Option<ComputePipelineState>,
+    /// GEMM tuilé à poids bf16 denses `[N,K]` et lhs f32 scindé hi + lo,
+    /// pour le prefill des modèles BF16.
+    na_gemm_bf16_nt_tiled_x2: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_gate_up_swiglu: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped: Option<ComputePipelineState>,
@@ -648,11 +650,7 @@ impl MetalMoeSharedWeights {
     /// retomber sur le chemin générique quand c'est faux. Le shared passe déjà par
     /// le matmul générique (toute quantification), donc seuls les experts comptent.
     pub(crate) fn coop_compatible(&self) -> bool {
-        let bits = self.stacked.gate.bits;
-        let ok = |b: &StackedAffineBuffers| b.bits == bits && b.group_size == 64;
-        let quant_ok = bits == 8
-            || (bits == FAST_QMV_BITS && moe_coop_u4_enabled() && moe_coop_fused_swiglu_enabled());
-        ok(&self.stacked.gate) && ok(&self.stacked.up) && ok(&self.stacked.down) && quant_ok
+        MetalMoeRoutedWeights::stacked_coop_compatible(&self.stacked)
     }
 }
 
@@ -672,7 +670,15 @@ impl MetalMoeRoutedWeights {
     pub(crate) fn stacked_coop_compatible(stacked: &StackedMoeBuffers) -> bool {
         let bits = stacked.gate.bits;
         let ok = |b: &StackedAffineBuffers| {
-            b.bits == bits && b.group_size == 64 && b.in_dim % b.group_size == 0
+            // Les chargeurs ne masquent ni les groupes quantifiés (64), ni
+            // les fragments K (16), ni les colonnes de sortie N (32).
+            b.bits == bits
+                && b.group_size == 64
+                && b.in_dim > 0
+                && b.out_dim > 0
+                && b.in_dim % 64 == 0
+                && b.in_dim % 16 == 0
+                && b.out_dim % 32 == 0
         };
         let dims_ok = stacked.gate.experts == stacked.up.experts
             && stacked.gate.experts == stacked.down.experts

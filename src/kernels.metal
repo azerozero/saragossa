@@ -7150,9 +7150,8 @@ kernel void affine_qmv_rms_fast_u4_gs64_f32(
     const uint block_size = values_per_thread * 32u;
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
-    if (row_base >= out_dim) {
-        return;
-    }
+    // Tous les simdgroups participent à la barrière, même sans ligne valide.
+    // Les lectures de poids et les écritures sont masquées par out_dim.
 
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
@@ -7298,20 +7297,22 @@ kernel void affine_qmv_rms_fast_u8_gs64_f32(
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
-            const device uint* row_words = ws + row * packed_cols;
-            float accum = 0.0f;
-            for (uint word = 0u; word < words_per_thread; ++word) {
-                const uint packed_word = row_words[word * 32u];
-                const uint group = (simd_lid + word * 32u) / 16u;
-                const float scale = scale_base[row * groups + group];
-                const float bias = bias_base[row * groups + group];
-                const uint base = word * values_per_word;
-                    accum += xt[base] * ((float(packed_word & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+            if (row_base + row < out_dim) {
+                const device uint* row_words = ws + row * packed_cols;
+                float accum = 0.0f;
+                for (uint word = 0u; word < words_per_thread; ++word) {
+                    const uint packed_word = row_words[word * 32u];
+                    const uint group = (simd_lid + word * 32u) / 16u;
+                    const float scale = scale_base[row * groups + group];
+                    const float bias = bias_base[row * groups + group];
+                    const uint base = word * values_per_word;
+                        accum += xt[base] * ((float(packed_word & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+                }
+                result[row] += accum;
             }
-            result[row] += accum;
         }
 
         ws += words_per_block;
@@ -7323,7 +7324,7 @@ kernel void affine_qmv_rms_fast_u8_gs64_f32(
 
     for (uint row = 0u; row < results_per_simdgroup; ++row) {
         const float reduced = simd_sum(result[row]);
-        if (simd_lid == 0u) {
+        if (simd_lid == 0u && row_base + row < out_dim) {
             out[tile.x * out_dim + row_base + row] = reduced;
         }
     }
@@ -7398,20 +7399,22 @@ kernel void affine_qmv_rms_fast_u8_gs128_f32(
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
-            const device uint* row_words = ws + row * packed_cols;
-            float accum = 0.0f;
-            for (uint word = 0u; word < words_per_thread; ++word) {
-                const uint packed_word = row_words[word * 32u];
-                const uint group = (simd_lid + word * 32u) / 32u;
-                const float scale = scale_base[row * groups + group];
-                const float bias = bias_base[row * groups + group];
-                const uint base = word * values_per_word;
-                    accum += xt[base] * ((float(packed_word & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+            if (row_base + row < out_dim) {
+                const device uint* row_words = ws + row * packed_cols;
+                float accum = 0.0f;
+                for (uint word = 0u; word < words_per_thread; ++word) {
+                    const uint packed_word = row_words[word * 32u];
+                    const uint group = (simd_lid + word * 32u) / 32u;
+                    const float scale = scale_base[row * groups + group];
+                    const float bias = bias_base[row * groups + group];
+                    const uint base = word * values_per_word;
+                        accum += xt[base] * ((float(packed_word & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+                }
+                result[row] += accum;
             }
-            result[row] += accum;
         }
 
         ws += words_per_block;
@@ -7423,7 +7426,7 @@ kernel void affine_qmv_rms_fast_u8_gs128_f32(
 
     for (uint row = 0u; row < results_per_simdgroup; ++row) {
         const float reduced = simd_sum(result[row]);
-        if (simd_lid == 0u) {
+        if (simd_lid == 0u && row_base + row < out_dim) {
             out[tile.x * out_dim + row_base + row] = reduced;
         }
     }
@@ -7461,9 +7464,8 @@ kernel void affine_qkv_split_rms_qmv_fast_u4_gs64_f32(
     const uint block_size = values_per_thread * 32u;
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
-    if (row_base >= out_dim) {
-        return;
-    }
+    // Tous les simdgroups participent à la barrière, même sans ligne valide.
+    // Les lectures de poids et les écritures sont masquées par out_dim.
 
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
@@ -7580,9 +7582,8 @@ kernel void affine_qkv_split_rms_qmv_fast_u3_gs64_f32(
     const uint block_size = values_per_thread * 32u;
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
-    if (row_base >= out_dim) {
-        return;
-    }
+    // Tous les simdgroups participent à la barrière, même sans ligne valide.
+    // Les lectures de poids et les écritures sont masquées par out_dim.
 
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
@@ -7973,9 +7974,8 @@ kernel void affine_argmax_qmv_fast_u4_gs64_f32(
     const uint packed_cols = dims.z;
     const uint groups = dims.w;
     const uint row_base = tile.y * 8u + simd_gid * 4u;
-    if (row_base >= out_dim) {
-        return;
-    }
+    // Tous les simdgroups participent à la barrière, même sans ligne valide.
+    // Les lectures de poids et les écritures sont masquées par out_dim.
 
     const uint row_bytes = packed_cols * 4u;
     const uint scale_step_per_thread = 4u;
@@ -8030,7 +8030,7 @@ kernel void affine_argmax_qmv_fast_u4_gs64_f32(
         const uint out_row = row_base + row;
         const float reduced = simd_sum(result[row]);
         if (simd_lid == 0u) {
-            group_values[index] = (out_row < out_dim) ? reduced : -3.402823466e38f;
+            group_values[index] = (out_row < out_dim) ? reduced : -INFINITY;
             group_indices[index] = out_row;
         }
     }
@@ -10252,7 +10252,7 @@ kernel void topk_softmax_serial_f32(
     uint best_indices[16];
     for (uint slot = 0u; slot < topk; ++slot) {
         best_values[slot] = -3.402823466e38f;
-        best_indices[slot] = 0u;
+        best_indices[slot] = 0xffffffffu;
     }
 
     for (uint idx = 0u; idx < count; ++idx) {
@@ -10273,12 +10273,13 @@ kernel void topk_softmax_serial_f32(
     const float max_value = best_values[0];
     float denom = 0.0f;
     for (uint slot = 0u; slot < topk; ++slot) {
-        denom += exp(best_values[slot] - max_value);
+        denom += (best_indices[slot] < count) ? exp(best_values[slot] - max_value) : 0.0f;
     }
     denom = max(denom, 1.0e-20f);
     for (uint slot = 0u; slot < topk; ++slot) {
-        indices[slot] = best_indices[slot];
-        scores[slot] = exp(best_values[slot] - max_value) / denom;
+        // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+        indices[slot] = (best_indices[slot] < count) ? best_indices[slot] : 0u;
+        scores[slot] = (best_indices[slot] < count) ? exp(best_values[slot] - max_value) / denom : 0.0f;
     }
 }
 
@@ -10362,12 +10363,13 @@ kernel void topk_softmax_f32(
         const float max_value = partial_values[0];
         float denom = 0.0f;
         for (uint slot = 0u; slot < topk; ++slot) {
-            denom += exp(partial_values[slot] - max_value);
+            denom += (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) : 0.0f;
         }
         denom = max(denom, 1.0e-20f);
         for (uint slot = 0u; slot < topk; ++slot) {
-            indices[slot] = partial_indices[slot];
-            scores[slot] = exp(partial_values[slot] - max_value) / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (partial_indices[slot] < count) ? partial_indices[slot] : 0u;
+            scores[slot] = (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) / denom : 0.0f;
         }
     }
 }
@@ -10455,12 +10457,13 @@ kernel void topk_sigmoid_f32(
     if (tid == 0u) {
         float denom = 0.0f;
         for (uint slot = 0u; slot < topk; ++slot) {
-            denom += partial_values[slot];
+            denom += (partial_indices[slot] < count) ? partial_values[slot] : 0.0f;
         }
         denom += 1.0e-20f;
         for (uint slot = 0u; slot < topk; ++slot) {
-            indices[slot] = partial_indices[slot];
-            scores[slot] = partial_values[slot] / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (partial_indices[slot] < count) ? partial_indices[slot] : 0u;
+            scores[slot] = (partial_indices[slot] < count) ? partial_values[slot] / denom : 0.0f;
         }
     }
 }
@@ -10536,12 +10539,13 @@ kernel void topk_softmax_wide_f32(
         const float max_value = chosen_values[0];
         float denom = 0.0f;
         for (uint slot = 0u; slot < topk; ++slot) {
-            denom += exp(chosen_values[slot] - max_value);
+            denom += (chosen_indices[slot] < count) ? exp(chosen_values[slot] - max_value) : 0.0f;
         }
         denom = max(denom, 1.0e-20f);
         for (uint slot = 0u; slot < topk; ++slot) {
-            indices[slot] = chosen_indices[slot];
-            scores[slot] = exp(chosen_values[slot] - max_value) / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (chosen_indices[slot] < count) ? chosen_indices[slot] : 0u;
+            scores[slot] = (chosen_indices[slot] < count) ? exp(chosen_values[slot] - max_value) / denom : 0.0f;
         }
     }
 }
@@ -10627,12 +10631,13 @@ kernel void topk8_softmax_256_f32(
         const float max_value = partial_values[0];
         float denom = 0.0f;
         for (uint slot = 0u; slot < 8u; ++slot) {
-            denom += exp(partial_values[slot] - max_value);
+            denom += (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) : 0.0f;
         }
         denom = max(denom, 1.0e-20f);
         for (uint slot = 0u; slot < 8u; ++slot) {
-            indices[slot] = partial_indices[slot];
-            scores[slot] = exp(partial_values[slot] - max_value) / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (partial_indices[slot] < count) ? partial_indices[slot] : 0u;
+            scores[slot] = (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) / denom : 0.0f;
         }
     }
 }
@@ -10728,12 +10733,13 @@ kernel void topk8_softmax_256_rows_f32(
         const float max_value = partial_values[0];
         float denom = 0.0f;
         for (uint slot = 0u; slot < 8u; ++slot) {
-            denom += exp(partial_values[slot] - max_value);
+            denom += (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) : 0.0f;
         }
         denom = max(denom, 1.0e-20f);
         for (uint slot = 0u; slot < 8u; ++slot) {
-            indices[slot] = partial_indices[slot];
-            scores[slot] = exp(partial_values[slot] - max_value) / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (partial_indices[slot] < count) ? partial_indices[slot] : 0u;
+            scores[slot] = (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) / denom : 0.0f;
         }
     }
 }
@@ -10758,7 +10764,7 @@ kernel void topk_softmax_rows_f32(
     uint best_indices[16];
     for (uint slot = 0u; slot < topk; ++slot) {
         best_values[slot] = -3.402823466e38f;
-        best_indices[slot] = 0u;
+        best_indices[slot] = 0xffffffffu;
     }
 
     for (uint idx = 0u; idx < count; ++idx) {
@@ -10779,12 +10785,13 @@ kernel void topk_softmax_rows_f32(
     const float max_value = best_values[0];
     float denom = 0.0f;
     for (uint slot = 0u; slot < topk; ++slot) {
-        denom += exp(best_values[slot] - max_value);
+        denom += (best_indices[slot] < count) ? exp(best_values[slot] - max_value) : 0.0f;
     }
     denom = max(denom, 1.0e-20f);
     for (uint slot = 0u; slot < topk; ++slot) {
-        indices[row_topk + slot] = best_indices[slot];
-        scores[row_topk + slot] = exp(best_values[slot] - max_value) / denom;
+        // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+        indices[row_topk + slot] = (best_indices[slot] < count) ? best_indices[slot] : 0u;
+        scores[row_topk + slot] = (best_indices[slot] < count) ? exp(best_values[slot] - max_value) / denom : 0.0f;
     }
 }
 
@@ -10815,7 +10822,7 @@ kernel void topk_sigmoid_rows_f32(
     uint best_indices[16];
     for (uint slot = 0u; slot < topk; ++slot) {
         best_values[slot] = -3.402823466e38f;
-        best_indices[slot] = 0u;
+        best_indices[slot] = 0xffffffffu;
     }
 
     for (uint idx = 0u; idx < count; ++idx) {
@@ -10835,12 +10842,13 @@ kernel void topk_sigmoid_rows_f32(
 
     float denom = 0.0f;
     for (uint slot = 0u; slot < topk; ++slot) {
-        denom += best_values[slot];
+        denom += (best_indices[slot] < count) ? best_values[slot] : 0.0f;
     }
     denom += 1.0e-20f;
     for (uint slot = 0u; slot < topk; ++slot) {
-        indices[row_topk + slot] = best_indices[slot];
-        scores[row_topk + slot] = best_values[slot] / denom;
+        // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+        indices[row_topk + slot] = (best_indices[slot] < count) ? best_indices[slot] : 0u;
+        scores[row_topk + slot] = (best_indices[slot] < count) ? best_values[slot] / denom : 0.0f;
     }
 }
 
@@ -10861,6 +10869,12 @@ static inline float splitmix_gumbel_f32(ulong rng_state, uint index) {
     return -log(-log(u));
 }
 
+// Match finalize_logits before temperature, truncation or random noise. Fusing
+// at the initial load caps each logit once without another dispatch/readback.
+static inline float sample_softcap_f32(float logit, float cap) {
+    return cap > 0.0f ? cap * precise::tanh(logit / cap) : logit;
+}
+
 kernel void sample_gumbel_blocks_f32(
     device const float* logits [[buffer(0)]],
     device float* partial_values [[buffer(1)]],
@@ -10868,6 +10882,7 @@ kernel void sample_gumbel_blocks_f32(
     constant uint& count [[buffer(3)]],
     constant float& temperature_in [[buffer(4)]],
     constant ulong& rng_state [[buffer(5)]],
+    constant float& softcap [[buffer(6)]],
     uint tid [[thread_index_in_threadgroup]],
     uint group [[threadgroup_position_in_grid]]
 ) {
@@ -10879,7 +10894,7 @@ kernel void sample_gumbel_blocks_f32(
     float value = -3.402823466e38f;
     uint best_idx = 0u;
     if (idx < count) {
-        value = logits[idx] / temperature + splitmix_gumbel_f32(rng_state, idx);
+        value = sample_softcap_f32(logits[idx], softcap) / temperature + splitmix_gumbel_f32(rng_state, idx);
         best_idx = idx;
     }
     values[tid] = value;
@@ -10909,6 +10924,7 @@ kernel void sample_topk_blocks_f32(
     device float* partial_values [[buffer(1)]],
     device uint* partial_indices [[buffer(2)]],
     constant uint2& dims [[buffer(3)]],
+    constant float& softcap [[buffer(4)]],
     uint tid [[thread_index_in_threadgroup]],
     uint group [[threadgroup_position_in_grid]]
 ) {
@@ -10920,7 +10936,7 @@ kernel void sample_topk_blocks_f32(
     threadgroup uint best_indices[256];
 
     const uint idx = group * 256u + tid;
-    values[tid] = (idx < count) ? logits[idx] : -3.402823466e38f;
+    values[tid] = (idx < count) ? sample_softcap_f32(logits[idx], softcap) : -3.402823466e38f;
     indices[tid] = idx;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

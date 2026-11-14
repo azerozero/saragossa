@@ -706,7 +706,8 @@ sur contexte long (22 s sur T7 en MTP committed).
 Plafond mesuré sur MLX (`mx.quantized_matmul`, mêmes formes, `mx.eval` par
 itération) : 48 TFLOPS à M=732, 57 à M=8297, contre 38 / 41 ici : le GEMM
 n'explique plus que ~130 des ~440 ms d'écart sur T2. Écartés après mesure :
-delta chunké (`SARAGOSSA_RUST_LINEAR_CHUNKED=1`, section linéaire 385-417 ms
+delta chunké (`SARAGOSSA_RUST_LINEAR_CHUNKED=1` — chemin retiré
+(fix/kernels-bugs-latents), mesure historique —, section linéaire 385-417 ms
 contre 319-333, texte différent) et plancher de sortie 1024 du GEMM u4 pour
 les k/v_proj (qkv T7 1367 → 691 ms, T2 −20 ms, mais texte greedy T2 différent).
 Pris (21 octobre) : MLP dense fusionné gate+up+SwiGLU

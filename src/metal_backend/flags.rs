@@ -67,11 +67,22 @@ pub(crate) fn prefill_fused_mlp_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_FUSED_MLP", true))
 }
 
-/// Active la linear-attn gated-delta en forme CHUNKÉE (port chunked-DeltaNet) au lieu
-/// du séquentiel token-par-token. Opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`. Exige head_dim=128.
+/// Flag historique retiré. Une demande `SARAGOSSA_RUST_LINEAR_CHUNKED=1`
+/// est refusée dès la construction du backend : garder le NAX ou le scan par défaut.
 pub(crate) fn linear_chunked_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_CHUNKED", false))
+}
+
+/// Refuse le chemin retiré avant tout accès Metal, indépendamment du mode
+/// résident ou per-op et de leurs replis sur erreur d'exécution.
+pub(super) fn validate_linear_chunked_flag() -> Result<()> {
+    if linear_chunked_enabled() {
+        return Err(InferError::Config(
+            "SARAGOSSA_RUST_LINEAR_CHUNKED: chemin retiré (course, bornes et ratios de decay); supprimer le flag pour conserver NAX ou le scan séquentiel".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Active le MoE routé prefill via le kernel `gather_qmm` porté (cooperative_tensor

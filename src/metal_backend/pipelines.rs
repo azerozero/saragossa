@@ -358,7 +358,8 @@ impl MetalExecutor {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si Metal est indisponible ou si la compilation échoue.
+    /// Renvoie une erreur si un flag retiré est activé, si Metal est indisponible
+    /// ou si la compilation échoue.
     pub fn new() -> Result<Self> {
         Self::new_with_kernel_profile(crate::KernelProfile::for_legacy_executor())
     }
@@ -366,8 +367,10 @@ impl MetalExecutor {
     /// Construit un executor dont les choix de kernels restent propres au modèle.
     ///
     /// # Errors
-    /// Renvoie une erreur si le device ou les pipelines Metal sont indisponibles.
+    /// Renvoie une erreur si un flag retiré est activé ou si le device ou les
+    /// pipelines Metal sont indisponibles.
     pub fn new_with_kernel_profile(kernel_profile: crate::KernelProfile) -> Result<Self> {
+        super::flags::validate_linear_chunked_flag()?;
         let device = Device::system_default()
             .ok_or_else(|| InferError::Metal("aucun device Metal disponible".to_string()))?;
         let queue = device.new_command_queue();
@@ -802,8 +805,6 @@ impl MetalExecutor {
         let compile_na = |name: &str| compile_na_gemm_named(&device, na_source, name);
         let na_gemm_bf16 = compile_na_gemm(&device, na_source);
         let na_gemm_bf16_bn128 = compile_na("gemm_nax_bf16_bn128");
-        let chunk_delta_seq_layout = compile_na("chunk_delta_seq_layout");
-        let chunk_delta_seq_layout_tc = compile_na("chunk_delta_seq_layout_tc");
         let gated_delta_nax_hk16_hv48 = if crate::runtime_flags::prefill_linear_nax_enabled() {
             let pipeline = compile_gated_delta_nax(&device, GATED_DELTA_NAX_KERNELS);
             if pipeline.is_none() {
@@ -819,6 +820,7 @@ impl MetalExecutor {
         let na_gemm_coop_qb_tiled_gs128 = compile_na("gemm_nax_coop_qb_tiled_gs128");
         let na_gemm_coop_qb_tiled_u4 = compile_na("gemm_nax_coop_qb_tiled_u4");
         let na_gemm_coop_qb_tiled_u4_x3 = compile_na("gemm_nax_coop_qb_tiled_u4_x3");
+        let na_gemm_bf16_nt_tiled_x2 = compile_na("gemm_nax_bf16_nt_tiled_x2");
         let na_gemm_coop_qb_tiled_u4_align64 = compile_na("gemm_nax_coop_qb_tiled_u4_align64");
         let na_gemm_coop_qb_tiled_u4_gate_up_swiglu =
             compile_na("gemm_nax_coop_qb_tiled_u4_gate_up_swiglu");
@@ -1027,8 +1029,6 @@ impl MetalExecutor {
             dequant_u8_to_bf16_t_gs64,
             na_gemm_bf16,
             na_gemm_bf16_bn128,
-            chunk_delta_seq_layout,
-            chunk_delta_seq_layout_tc,
             gated_delta_nax_hk16_hv48,
             na_gemm_coop_qb,
             na_gemm_coop_qb_gs128,
@@ -1036,6 +1036,7 @@ impl MetalExecutor {
             na_gemm_coop_qb_tiled_gs128,
             na_gemm_coop_qb_tiled_u4,
             na_gemm_coop_qb_tiled_u4_x3,
+            na_gemm_bf16_nt_tiled_x2,
             na_gemm_skinny_u4,
             na_gemm_skinny_u4_x3,
             na_gemm_skinny_u4_x2,
