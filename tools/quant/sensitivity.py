@@ -1,4 +1,4 @@
-"""Allocation 4/6/8 bits au gain d'erreur pondérée par bit stocké, budget langage.
+"""Allocation 4/5/6/8 bits au gain d'erreur pondérée par bit stocké, budget langage.
 
 Sans argument : auto-tests stdlib. Utilisé par mixed_quant.py --target-bpw.
 Le score somme_j E[x_j²] (W_quant - W)² approxime l'erreur de sortie avec une
@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import opt_quant
 from imatrix import importance_for, is_embedding, language_modules
 
-WIDTHS = (4, 6, 8)
+WIDTHS = (4, 5, 6, 8)
 
 
 def storage_bits(size, bits):
@@ -36,8 +36,8 @@ def decision_units(names):
 
 
 def allocate(scores, sizes, total_params, fixed_bits, target_bpw, forced=(), high_bits=6):
-    """Glouton déterministe, promotions 4→6/8 ou 6→8 ; jamais de dépassement."""
-    if (not math.isfinite(target_bpw) or target_bpw <= 0 or high_bits not in (6, 8)
+    """Glouton déterministe, promotions 4→5→6→8 ; jamais de dépassement."""
+    if (not math.isfinite(target_bpw) or target_bpw <= 0 or high_bits not in (5, 6, 8)
             or total_params <= 0 or fixed_bits < 0 or not sizes
             or set(scores) != set(sizes) or not set(forced) <= set(sizes)):
         raise ValueError("budget, modules ou largeur d'épinglage invalides")
@@ -60,17 +60,18 @@ def allocate(scores, sizes, total_params, fixed_bits, target_bpw, forced=(), hig
         best = None
         for members in units:
             old = assignment[members[0]]
-            # Les épinglés sont un minimum ; ils peuvent encore passer de 6 à 8.
-            for new in WIDTHS:
-                if new <= old:
-                    continue
-                cost = sum(sizes[n] * (new - old) for n in members)
-                gain = sum(scores[n][old] - scores[n][new] for n in members)
-                if gain <= 0 or used + cost > budget:
-                    continue
-                candidate = (gain / cost, gain, -cost, tuple(members), new, cost)
-                if best is None or candidate > best:
-                    best = candidate
+            # Les épinglés fixent un minimum ; chaque promotion suit WIDTHS.
+            next_index = WIDTHS.index(old) + 1
+            if next_index == len(WIDTHS):
+                continue
+            new = WIDTHS[next_index]
+            cost = sum(sizes[n] * (new - old) for n in members)
+            gain = sum(scores[n][old] - scores[n][new] for n in members)
+            if gain <= 0 or used + cost > budget:
+                continue
+            candidate = (gain / cost, gain, -cost, tuple(members), new, cost)
+            if best is None or candidate > best:
+                best = candidate
         if best is None:
             break
         _, _, _, members, new, cost = best
@@ -79,8 +80,10 @@ def allocate(scores, sizes, total_params, fixed_bits, target_bpw, forced=(), hig
     return assignment, used / total_params
 
 
-def scan(model, matrix, force_high, target_bpw, high_bits):
+def scan(model, matrix, force_high, target_bpw, high_bits, imatrix_blend=False):
     """Score le fit réellement utilisé par convert_ls, par blocs pour borner la mémoire."""
+    if imatrix_blend and matrix is None:
+        raise ValueError("imatrix_blend exige une imatrix")
     import mlx.core as mx
     from mlx.utils import tree_flatten
 
@@ -90,7 +93,7 @@ def scan(model, matrix, force_high, target_bpw, high_bits):
     total = sum(v.size for v in params.values())
     fixed = sum(v.nbytes * 8 for k, v in params.items() if k.removesuffix(".weight") not in modules)
     forced = {name for name in modules if force_high and re.search(force_high, name)}
-    # Vérifier la faisabilité et toute l'imatrix avant les trois fits par module.
+    # Vérifier la faisabilité et toute l'imatrix avant les quatre fits par module.
     zeros = {name: dict.fromkeys(WIDTHS, 0.0) for name in modules}
     allocate(zeros, sizes, total, fixed, target_bpw, forced, high_bits)
     for name, module in modules.items():
@@ -98,15 +101,22 @@ def scan(model, matrix, force_high, target_bpw, high_bits):
     scores = {}
     for name, module in modules.items():
         columns = module.weight.shape[-1]
-        importance = importance_for(matrix, name, columns, is_embedding(module))
-        mass = sum(importance.tolist()) if importance is not None else columns
+        embedding = is_embedding(module)
+        importance = importance_for(matrix, name, columns, embedding)
         rows = module.weight.reshape(-1, columns)
+        blend = imatrix_blend and importance is not None
         errors = dict.fromkeys(WIDTHS, 0.0)
         for start in range(0, rows.shape[0], 256):
             block = rows[start:start + 256]
+            mass = opt_quant.error_mass(block, importance, blend)
+            # L'entrée one-hot choisit une ligne avec probabilité 1/vocab.
+            # Le dénominateur est celui de la table entière, jamais du bloc.
+            if embedding:
+                mass /= rows.shape[0]
             for bits in WIDTHS:
-                packed, scales, biases, _, rmse = opt_quant.fit(block, bits=bits, weight=importance)
-                errors[bits] += rmse.item() ** 2 * mass * block.shape[0]
+                packed, scales, biases, _, rmse = opt_quant.fit(
+                    block, bits=bits, weight=importance, imatrix_blend=blend)
+                errors[bits] += rmse.item() ** 2 * mass
                 del packed, scales, biases, rmse
         scores[name] = errors
         mx.clear_cache()
@@ -115,27 +125,35 @@ def scan(model, matrix, force_high, target_bpw, high_bits):
     report = dict(target_bpw=target_bpw, actual_bpw=bpw, total_parameters=total,
                   fixed_bits=fixed, scores=scores, sizes=sizes, assignment=assignment,
                   forced=sorted(forced), pinned_bits=high_bits,
-                  metric="sum E[x²] * (W_quant-W)²; embedding uniforme")
+                  widths=list(WIDTHS), imatrix_blend=imatrix_blend,
+                  metric=("sum E[x²] * sqrt(mean_row(W²) + W_ij²) * (W_quant-W)²"
+                          if imatrix_blend else "sum E[x²] * (W_quant-W)²"),
+                  embedding_metric="sum (W_quant-W)² / vocab; fréquence uniforme")
     return assignment, report
 
 
 def _self_check():
-    scores = {"a": {4: 10, 6: 2, 8: 0}, "b": {4: 2, 6: 1, 8: 0}}
+    scores = {"a": {4: 10, 5: 5, 6: 2, 8: 0}, "b": {4: 2, 5: 1.5, 6: 1, 8: 0}}
     sizes = {"a": 64, "b": 64}
     result, bpw = allocate(scores, sizes, 128, 0, 5.5)
     assert result == {"a": 6, "b": 4} and bpw == 5.5
     result, bpw = allocate(scores, sizes, 128, 0, 5.5, {"b"})
     assert result == {"a": 4, "b": 6} and bpw == 5.5
+    result, bpw = allocate(scores, sizes, 128, 0, 5.0, {"b"}, high_bits=5)
+    assert result == {"a": 4, "b": 5} and bpw == 5.0
     # Les tenseurs non quantifiés et les échelles/biais comptent réellement.
     result, bpw = allocate(scores, sizes, 192, 64 * 16, 9)
     assert bpw <= 9 and result == {"a": 6, "b": 4}
     names = ["layer.switch_mlp." + p + "_proj" for p in ("gate", "up", "down")]
-    trio_scores = {n: {4: 10, 6: 2, 8: 0} for n in names}
+    trio_scores = {n: {4: 10, 5: 5, 6: 2, 8: 0} for n in names}
     result, bpw = allocate(trio_scores, dict.fromkeys(names, 64), 192, 0, 6.5, {names[0]})
     assert set(result.values()) == {6} and bpw == 6.5
-    # Un saut direct vers 8 reste possible si 6 n'améliore pas le score.
-    result, bpw = allocate({"a": {4: 10, 6: 12, 8: 0}}, {"a": 64}, 64, 0, 8.5)
-    assert result == {"a": 8} and bpw == 8.5
+    # Chaque pas doit apporter un gain ; pas de saut au-dessus d'un pas nuisible.
+    result, bpw = allocate({"a": {4: 10, 5: 12, 6: 2, 8: 0}}, {"a": 64}, 64, 0, 8.5)
+    assert result == {"a": 4} and bpw == 4.5
+    for width in WIDTHS:
+        result, bpw = allocate({"a": scores["a"]}, {"a": 64}, 64, 0, width + 0.5)
+        assert result == {"a": width} and bpw == width + 0.5
     for target in (4.49, -1, math.nan, math.inf):
         try:
             allocate(scores, sizes, 128, 0, target)

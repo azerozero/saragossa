@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 r"""Quantification mixte par sensibilité au format MLX affine.
 
---target-bpw et --imatrix activent l'allocation 4/6/8 calibrée (sensitivity.py),
+--target-bpw et --imatrix activent l'allocation 4/5/6/8 calibrée (sensitivity.py),
 échelles/biais et modules épinglés inclus dans le budget. Sans ces options,
 la recette historique ci-dessous reste indépendante d'un corpus.
 
@@ -197,8 +197,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--low-bits", type=int, default=None, help="largeur basse (défaut 3 ; 4 avec --target-bpw)")
     parser.add_argument("--high-bits", type=int, default=None, help="largeur haute (défaut 4 ; 6 avec --target-bpw)")
-    parser.add_argument("--target-bpw", type=float, help="budget langage réel, allocation 4/6/8 gs64")
+    parser.add_argument("--target-bpw", type=float, help="budget langage réel, allocation 4/5/6/8 gs64")
     parser.add_argument("--imatrix", type=Path, help="E[x²] par colonne, requise avec --target-bpw")
+    parser.add_argument("--imatrix-blend", action="store_true",
+                        help="pondérer E[x²] par sqrt(moyenne_ligne(W²) + W_ij²) pendant le fit")
     parser.add_argument(
         "--high-fraction",
         type=float,
@@ -246,12 +248,12 @@ def validate(args: argparse.Namespace) -> None:
     if args.target_bpw is not None:
         import math
         if (not math.isfinite(args.target_bpw) or args.target_bpw <= 0
-                or args.low_bits != 4 or args.high_bits not in (6, 8) or args.group_size != 64):
-            raise SystemExit("--target-bpw positif et fini, --low-bits 4, --high-bits 6/8 et --group-size 64 requis")
+                or args.low_bits != 4 or args.high_bits not in (5, 6, 8) or args.group_size != 64):
+            raise SystemExit("--target-bpw positif et fini, --low-bits 4, --high-bits 5/6/8 et --group-size 64 requis")
         if args.imatrix is None or not args.imatrix.is_file():
             raise SystemExit("--target-bpw exige --imatrix FICHIER")
-    elif args.imatrix is not None:
-        raise SystemExit("--imatrix exige --target-bpw")
+    elif args.imatrix is not None or args.imatrix_blend:
+        raise SystemExit("--imatrix et --imatrix-blend exigent --target-bpw")
     if not 0.0 <= args.high_fraction <= 1.0:
         raise SystemExit(f"--high-fraction hors de [0, 1]: {args.high_fraction}")
     if args.low_bits >= args.high_bits:
@@ -336,7 +338,8 @@ def target_template(args):
     matrix = mx.load(str(args.imatrix))
     model, _ = load_bf16(args.input)
     config = json.loads((args.input / "config.json").read_text())
-    assignment, report = scan(model, matrix, args.force_high, args.target_bpw, args.high_bits)
+    assignment, report = scan(model, matrix, args.force_high, args.target_bpw, args.high_bits,
+                              imatrix_blend=args.imatrix_blend)
 
     def predicate(path, module):
         bits = assignment.get(path)

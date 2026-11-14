@@ -4,7 +4,7 @@
 
 Recalcule les tenseurs quantifiés language_model du modèle de base ; recopie
 les autres tenseurs et fichiers du checkpoint MLX u4 fourni comme template.
-La largeur (4, 6 ou 8 bits) de chaque tenseur suit le template ; les experts
+La largeur (4, 5, 6 ou 8 bits) de chaque tenseur suit le template ; les experts
 fusionnés gate_up_proj (Gemma 4) sont découpés comme mlx-lm.
 L'échelle peut être négative. Le meilleur groupe entre min-max et ajustement
 est conservé après arrondi BF16, sans changer les kernels ni le format.
@@ -74,9 +74,9 @@ def quantization_spec(config, base):
     if not isinstance(override, dict):
         raise ValueError(f"configuration quantifiée invalide : {base}")
     spec.update(override)
-    if (spec.get("bits") not in (4, 6, 8) or spec.get("group_size") != 64
+    if (spec.get("bits") not in (4, 5, 6, 8) or spec.get("group_size") != 64
             or spec.get("mode", "affine") != "affine"):
-        raise ValueError(f"format non pris en charge : {base} (affine gs64 4/6/8 requis)")
+        raise ValueError(f"format non pris en charge : {base} (affine gs64 4/5/6/8 requis)")
     return spec["bits"]
 
 
@@ -90,9 +90,18 @@ def validate_shapes(shard, base, shape, bits):
             raise ValueError(f"forme du template incompatible : {base}{suffix}")
 
 
-def convert(src, template, dst, imatrix=None):
+def convert(src, template, dst, imatrix=None, imatrix_blend=False):
     sources, shards = validate(src, template, dst)
+    if imatrix_blend and imatrix is None:
+        raise ValueError("--imatrix-blend exige --imatrix")
     config = json.loads((template / "config.json").read_text())
+    allocation = template / "allocation.json"
+    if allocation.is_file():
+        if imatrix is None:
+            raise ValueError("un template allocation.json exige --imatrix")
+        report = json.loads(allocation.read_text())
+        if report.get("imatrix_blend", False) != imatrix_blend:
+            raise ValueError("--imatrix-blend doit correspondre au mode du template allocation.json")
     # Le refus d'une destination existante précède même l'import de MLX.
     import mlx.core as mx
 
@@ -121,7 +130,9 @@ def convert(src, template, dst, imatrix=None):
             x = bf16_tensor(mx, weights, base)
             bits = quantization_spec(config, base)
             weight = importance_for(matrix, base, x.shape[-1])
-            packed, scale, bias, rmse0, rmse1 = opt_quant.fit(x, bits=bits, weight=weight)
+            blend = imatrix_blend and weight is not None
+            packed, scale, bias, rmse0, rmse1 = opt_quant.fit(
+                x, bits=bits, weight=weight, imatrix_blend=blend)
             mx.eval(packed, scale, bias, rmse0, rmse1)
             for suffix, new in ((".weight", packed), (".scales", scale), (".biases", bias)):
                 old = shard[base + suffix]
@@ -129,7 +140,9 @@ def convert(src, template, dst, imatrix=None):
                     raise ValueError(f"format incompatible : {base}{suffix}")
                 shard[base + suffix] = new
             count += 1
-            mass = sum(weight.tolist()) * (x.size // x.shape[-1]) if weight is not None else x.size
+            mass = opt_quant.error_mass(x, weight, blend)
+            if matrix is not None and weight is None and base.endswith(".embed_tokens"):
+                mass /= x.shape[0]
             err0 += rmse0.item() ** 2 * mass
             err1 += rmse1.item() ** 2 * mass
         out = dst / path.name
@@ -143,7 +156,8 @@ def convert(src, template, dst, imatrix=None):
     (dst / "README.md").write_text(
         "Checkpoint MLX affine gs64 : échelles et biais ajustés aux moindres carrés "
         "depuis les tenseurs BF16, format du template conservé. "
-        + ("Norme pondérée par E[x²].\n" if matrix is not None else "Norme uniforme.\n"))
+        + ("Norme pondérée par E[x²] * sqrt(moyenne_ligne(W²) + W_ij²).\n" if imatrix_blend
+           else "Norme pondérée par E[x²].\n" if matrix is not None else "Norme uniforme.\n"))
     print("fini", count, total / 2**30, "Gio", flush=True)
 
 
@@ -172,6 +186,12 @@ def _self_check():
                 raise AssertionError("destination existante acceptée")
             except FileExistsError:
                 pass
+        assert not dst.exists() and "mlx.core" not in sys.modules
+        try:
+            convert(src, template, dst, imatrix_blend=True)
+            raise AssertionError("blend sans imatrix accepté")
+        except ValueError as error:
+            assert "exige --imatrix" in str(error)
         assert not dst.exists() and "mlx.core" not in sys.modules
         # La clé absente est dans le dernier shard : aucun début de sortie,
         # même si le premier shard et sa clé BF16 sont valides.
@@ -231,7 +251,8 @@ def _self_check():
     opt_quant._self_check()
     config = {"quantization": {"bits": 4, "group_size": 64, base: {"bits": 6}}}
     assert quantization_spec(config, base) == 6
-    for bits in (4, 6, 8):
+    for bits in (4, 5, 6, 8):
+        assert quantization_spec({"quantization": {"bits": bits, "group_size": 64}}, base) == bits
         shard = {base + suffix: Mock(shape=(2, columns)) for suffix, columns in (
             (".weight", 128 * bits // 32), (".scales", 2), (".biases", 2))}
         validate_shapes(shard, base, (2, 128), bits)
@@ -240,7 +261,7 @@ def _self_check():
             raise AssertionError("largeur du template incohérente acceptée")
         except ValueError:
             pass
-    for field, value in (("bits", 5), ("group_size", 32), ("mode", "mxfp4")):
+    for field, value in (("bits", 7), ("group_size", 32), ("mode", "mxfp4")):
         bad = {"quantization": {"bits": 4, "group_size": 64, field: value}}
         try:
             quantization_spec(bad, base)
@@ -256,11 +277,15 @@ def main():
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--src", type=pathlib.Path, required=True, help="checkpoint BF16")
-    parser.add_argument("--template", type=pathlib.Path, required=True, help="checkpoint MLX affine gs64 (4/6/8 bits)")
+    parser.add_argument("--template", type=pathlib.Path, required=True, help="checkpoint MLX affine gs64 (4/5/6/8 bits)")
     parser.add_argument("--dst", type=pathlib.Path, required=True, help="destination inexistante")
     parser.add_argument("--imatrix", type=pathlib.Path, help="importance E[x²] par colonne ; linéaires manquants refusés")
+    parser.add_argument("--imatrix-blend", action="store_true",
+                        help="pondérer E[x²] par sqrt(moyenne_ligne(W²) + W_ij²)")
     args = parser.parse_args()
-    convert(args.src, args.template, args.dst, args.imatrix)
+    if args.imatrix_blend and args.imatrix is None:
+        parser.error("--imatrix-blend exige --imatrix")
+    convert(args.src, args.template, args.dst, args.imatrix, args.imatrix_blend)
 
 
 if __name__ == "__main__":
