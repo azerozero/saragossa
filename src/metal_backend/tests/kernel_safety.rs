@@ -271,12 +271,12 @@ fn qmm_na_dequant_budget_preserves_qmv_fallback() -> Result<()> {
                     let mut scratch = Vec::new();
                     let cb = executor.queue.new_command_buffer();
                     let encoder = cb.new_compute_command_encoder();
-                    let previous = OFFSET_TEST_KERNEL.with(|v| v.replace(Some(AffineMatmulKernel::QmmNaDequant)));
+                    let previous = super::matmul_select::OFFSET_TEST_KERNEL.with(|v| v.replace(Some(AffineMatmulKernel::QmmNaDequant)));
                     let result = executor.encode_matmul_weight(
                         encoder, &mut scratch, &lhs, 32, 512,
                         &LinearWeight::AffineQuantized(weight), &output,
                     );
-                    OFFSET_TEST_KERNEL.with(|v| v.set(previous));
+                    super::matmul_select::OFFSET_TEST_KERNEL.with(|v| v.set(previous));
                     encoder.end_encoding();
                     assert!(matches!(result, Err(InferError::Config(message)) if message.contains("plafond de déquantification")));
                     assert!(scratch.is_empty());
