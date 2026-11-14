@@ -1082,8 +1082,8 @@ pub(crate) fn prefill_attn_batch_mid_30b_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_BATCH_MID_30B", true))
 }
 
-/// Active la variante Steel causale d256 du prefill 35B (16/2 têtes) et 27B
-/// (24/4 têtes, depuis le 2026-10-21).
+/// Active le prefill causal Steel/NAX d128/d256 sans sinks, pour tout GQA
+/// entier. Le nom historique du flag reste le kill-switch global.
 ///
 /// Défaut ON : cette voie reprend le kernel Steel tuilé (Q/K/V en blocs,
 /// softmax online par tuile KV, causalité par tuile diagonale) pour remplacer le
@@ -1098,13 +1098,17 @@ pub(crate) fn prefill_attn_steel_d256_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256", true))
 }
 
-/// Attention causale d256 du prefill (même périmètre que le Steel d256) sur les
-/// accélérateurs neuronaux : kernel NAX dsplit de MLX, Q/K/V bf16, accumulation
-/// f32. Défaut ON depuis le 2026-10-23 (M5 Max, 27B) : attention 26,6 → 6,7 s
+/// Attention causale d128/d256 du prefill sans sinks, pour tout GQA entier, sur les
+/// accélérateurs neuronaux : kernels NAX de MLX (plein d128, dsplit d256),
+/// Q/K/V bf16, accumulation f32. Défaut d256 ON depuis le 2026-10-23
+/// (M5 Max, 27B) : attention 26,6 → 6,7 s
 /// à 32k, TTFT 83 → 63 s ; oracle CPU 2,05e-3. Textes greedy identiques sur 4
 /// contextes sur 7 (4k-32k), les 3 autres divergent sur un near-tie (marges
 /// 0,0001-0,011 contre 2,3 en médiane), même politique que le `batch_long`.
-/// Kill-switch `SARAGOSSA_RUST_PREFILL_ATTN_NAX=0` (retour au Steel f32).
+/// Kill-switch `SARAGOSSA_RUST_PREFILL_ATTN_NAX=0` (Steel f32 en d256, naïf
+/// en d128). La variante d128 compile avec 302=false ; même tolérance oracle
+/// de 1e-3 à entrées bf16 que le d256. Identité greedy d128 non qualifiée
+/// faute de modèle local.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_attn_nax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1288,7 +1292,8 @@ pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
 }
 
 /// Stocke en bf16 le K/V full-attention du prefill résident par morceaux,
-/// au lieu du f32. Seulement si le NAX d256 lit déjà ce K/V en bf16 et que
+/// au lieu du f32. Seulement si le NAX causal (d256, ou d128 sans sinks) lit
+/// déjà ce K/V en bf16 et que
 /// l'arène de decode sera bf16 (prompt ≥ [`kv_bf16_greedy_min_tokens`], ni
 /// `SARAGOSSA_RUST_KV_BF16=0` ni KV quantifié) : sorties du prefill et arène
 /// bit-identiques, 2 octets au lieu de 4 par valeur. Défaut ON depuis le
@@ -1451,8 +1456,9 @@ pub(crate) fn dense_bf16_gemm_enabled() -> bool {
 /// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
 /// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est
 /// découpé en morceaux égaux (au plus cette taille, au moins 512). Les modèles
-/// hors périmètre Steel/NAX d256 (fenêtre glissante, autres têtes) restent en
-/// un seul morceau. `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0` désactive.
+/// hors périmètre Steel/NAX d128/d256 (fenêtre glissante, GQA invalide ou
+/// pipeline absent) restent en un seul morceau.
+/// `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0` désactive.
 /// Avec l'état SSM bf16 (opt-in), l'état est arrondi à chaque frontière de
 /// morceau au lieu d'une fois : dérive non mesurée.
 #[cfg(all(target_os = "macos", feature = "metal"))]

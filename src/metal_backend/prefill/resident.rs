@@ -552,15 +552,20 @@ impl MetalExecutor {
                 PrefillAttentionLayer::Full { sinks: Some(_), .. }
             )
         });
-        // Le miroir ne sert qu'au NAX d256 sans sinks : les couches à sinks
+        // Le miroir ne sert qu'au NAX d128/d256 sans sinks : les couches à sinks
         // (flint) lisent leur K/V dans son format de stockage, le NAX d128
         // avec sinks seulement sur un stockage bf16.
         let bf16_mirror = self.prefill_kv_bf16_mirror
             && chunked
             && !has_sinks
-            && self.causal_attention_prefill_steel_nax_d256.is_some();
+            && layers.iter().all(|layer| match layer.attention {
+                PrefillAttentionLayer::Full { .. } => self
+                    .causal_attention_prefill_nax(layer.attention_spec)
+                    .is_some(),
+                PrefillAttentionLayer::Linear { .. } => true,
+            });
         // Le stockage bf16 vaut pour toutes les couches : il faut un lecteur
-        // bf16 à chacune, le NAX d256 sans sinks ; avec sinks, le flag flint (actif par défaut)
+        // bf16 à chacune, le NAX d128/d256 sans sinks ; avec sinks, le flag flint (actif par défaut)
         // puis le Steel d128 bf16 pour une couche pleine, le naïf bf16
         // (toujours compilé) suffisant à une fenêtrée. L'arène d'un prompt de
         // cette longueur sera bf16 : sans sinks, le NAX lisait déjà ces
@@ -574,9 +579,9 @@ impl MetalExecutor {
                         || self.attention_prefill_steel_sink_d128_kv_bf16.is_some()
                         || self.attention_prefill_nax_sink_d128.is_some())
             }
-            PrefillAttentionLayer::Full { .. } => {
-                self.causal_attention_prefill_steel_nax_d256.is_some()
-            }
+            PrefillAttentionLayer::Full { .. } => self
+                .causal_attention_prefill_nax(layer.attention_spec)
+                .is_some(),
             PrefillAttentionLayer::Linear { .. } => true,
         });
         let bf16_min_rows = self.prefill_kv_bf16_store_min_rows;

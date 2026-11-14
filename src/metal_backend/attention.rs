@@ -10,12 +10,11 @@ const STEEL_ATTN_BK: usize = 32;
 const STEEL_ATTN_BD: usize = 64;
 const STEEL_CAUSAL_ATTN_D256_BQ: usize = 32;
 const STEEL_CAUSAL_ATTN_D256_BK: usize = 64;
-const STEEL_CAUSAL_ATTN_D256_BD: usize = 256;
 const STEEL_SINK_ATTN_D128_BQ: usize = 32;
 const STEEL_SINK_ATTN_D128_BK: usize = 16;
 const STEEL_SINK_ATTN_D128_BD: usize = 128;
 
-/// Instanciation du NAX dsplit d256 : nom Metal, tuiles Q/K, simdgroups
+/// Instanciation du NAX causal : nom Metal, tuiles Q/K, simdgroups
 /// (WM lignes × WN = 2 tranches de D) et ordre de la grille.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct NaxCausalAttnShape {
@@ -54,14 +53,16 @@ pub(super) const NAX_CAUSAL_ATTN_BQ128: NaxCausalAttnShape = NaxCausalAttnShape 
     head_major: false,
 };
 
-/// NAX d128 avec sinks des couches pleines flint (BQ=64, BK=32, WM=4).
-pub(super) const NAX_SINK_ATTN_D128: NaxCausalAttnShape = NaxCausalAttnShape {
+/// NAX d128 (BQ=64, BK=32, WM=4), spécialisé avec ou sans sinks.
+pub(super) const NAX_CAUSAL_ATTN_D128: NaxCausalAttnShape = NaxCausalAttnShape {
     host_name: "steel_attention_nax_bf16_f32out_bq64_bk32_bd128_wm4_wn1",
     block_q: 64,
     block_k: 32,
     simdgroups: 4,
     head_major: false,
 };
+
+pub(super) const NAX_SINK_ATTN_D128: NaxCausalAttnShape = NAX_CAUSAL_ATTN_D128;
 
 impl NaxCausalAttnShape {
     /// Instanciation retenue par les flags `SARAGOSSA_RUST_PREFILL_ATTN_NAX_*`.
@@ -78,7 +79,7 @@ impl NaxCausalAttnShape {
     }
 }
 
-/// Pipeline NAX d256 et la géométrie avec laquelle il doit être dispatché.
+/// Pipeline NAX causal et la géométrie avec laquelle il doit être dispatché.
 #[derive(Debug)]
 pub(super) struct NaxCausalAttention {
     pub(super) pipeline: ComputePipelineState,
@@ -152,17 +153,17 @@ fn prefill_attn_batch_gqa8_d256_supported(spec: PrefillAttentionSpec) -> bool {
     matches!((spec.q_heads, spec.kv_heads, spec.head_dim), (16, 2, 256))
 }
 
-pub(super) fn prefill_attn_steel_d256_supported(spec: PrefillAttentionSpec) -> bool {
-    spec.seq > 256 && prefill_attn_steel_d256_shape_supported(spec)
+pub(super) fn prefill_attn_steel_supported(spec: PrefillAttentionSpec) -> bool {
+    spec.seq > 256 && prefill_attn_steel_shape_supported(spec)
 }
 
-/// Têtes et dimension couvertes par le Steel/NAX d256, quel que soit `seq`.
-fn prefill_attn_steel_d256_shape_supported(spec: PrefillAttentionSpec) -> bool {
-    // NOTE: (24, 24) seulement sous test : le microbench y compare K/V partagé
-    // par six têtes Q et six copies distinctes, à calcul égal.
-    (matches!((spec.q_heads, spec.kv_heads), (16, 2) | (24, 4))
-        || (cfg!(test) && (spec.q_heads, spec.kv_heads) == (24, 24)))
-        && spec.head_dim == STEEL_CAUSAL_ATTN_D256_BD
+/// Formes causales sans fenêtre couvertes par le Steel/NAX, quel que soit `seq`.
+fn prefill_attn_steel_shape_supported(spec: PrefillAttentionSpec) -> bool {
+    spec.window.is_none()
+        && matches!(spec.head_dim, 128 | 256)
+        && spec.q_heads > 0
+        && spec.kv_heads > 0
+        && spec.q_heads % spec.kv_heads == 0
 }
 
 #[expect(
@@ -1598,7 +1599,7 @@ impl MetalExecutor {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si la forme sort du périmètre Steel/NAX d256.
+    /// Renvoie une erreur si la forme sort du périmètre Steel/NAX d128/d256.
     pub(super) fn encode_causal_attention_prefill_chunk(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1625,7 +1626,7 @@ impl MetalExecutor {
             )?
         {
             return Err(InferError::Config(format!(
-                "prefill par morceaux hors périmètre Steel d256 (q={} kv={kv_rows}/{kv_capacity})",
+                "prefill par morceaux hors périmètre Steel/NAX d128/d256 (q={} kv={kv_rows}/{kv_capacity})",
                 spec.seq
             )));
         }
@@ -1639,9 +1640,26 @@ impl MetalExecutor {
     ) -> bool {
         crate::runtime_flags::prefill_attn_steel_d256_enabled()
             && spec.window.is_none()
-            && prefill_attn_steel_d256_shape_supported(spec)
-            && (self.causal_attention_prefill_steel_nax_d256.is_some()
-                || self.causal_attention_prefill_steel_d256_f32.is_some())
+            && prefill_attn_steel_shape_supported(spec)
+            && (self.causal_attention_prefill_nax(spec).is_some()
+                || (spec.head_dim == 256 && self.causal_attention_prefill_steel_d256_f32.is_some()))
+    }
+
+    /// Le lecteur bf16 doit correspondre à la dimension de la couche.
+    pub(super) fn causal_attention_prefill_nax(
+        &self,
+        spec: PrefillAttentionSpec,
+    ) -> Option<&NaxCausalAttention> {
+        if !crate::runtime_flags::prefill_attn_steel_d256_enabled()
+            || !prefill_attn_steel_shape_supported(spec)
+        {
+            return None;
+        }
+        match spec.head_dim {
+            128 => self.causal_attention_prefill_nax_d128.as_ref(),
+            256 => self.causal_attention_prefill_steel_nax_d256.as_ref(),
+            _ => None,
+        }
     }
 
     fn encode_steel_causal_attention_prefill(
@@ -1659,9 +1677,9 @@ impl MetalExecutor {
         // NOTE: le seuil seq > 256 est un choix de perf du prefill en un bloc ;
         // un morceau (kv_rows > seq) passe toujours par le Steel/NAX.
         let in_scope = if kv_rows > spec.seq {
-            prefill_attn_steel_d256_shape_supported(spec)
+            prefill_attn_steel_shape_supported(spec)
         } else {
-            prefill_attn_steel_d256_supported(spec)
+            prefill_attn_steel_supported(spec)
         };
         if !crate::runtime_flags::prefill_attn_steel_d256_enabled() || !in_scope {
             return Ok(false);
@@ -1671,8 +1689,7 @@ impl MetalExecutor {
         let nax_q;
         let nax_kv;
         let (pipeline, block_q, block_k, threads_y, q_in, k_in, v_in, head_major) = match self
-            .causal_attention_prefill_steel_nax_d256
-            .as_ref()
+            .causal_attention_prefill_nax(spec)
         {
             Some(nax) => {
                 let q_len = checked_len(spec.seq, spec.q_heads * spec.head_dim, "nax q")?;
@@ -1707,6 +1724,10 @@ impl MetalExecutor {
                 )
             }
             None => {
+                // Le Steel f32 existant est spécialisé d256 ; d128 reprend le naïf.
+                if spec.head_dim != 256 {
+                    return Ok(false);
+                }
                 let Some(pipeline) = self.causal_attention_prefill_steel_d256_f32.as_ref() else {
                     return Ok(false);
                 };
@@ -1722,15 +1743,9 @@ impl MetalExecutor {
                 )
             }
         };
-        let params = steel_attn_params(
-            spec,
-            block_q,
-            block_k,
-            kv_rows,
-            "steel causal d256 attention",
-        )?;
-        let grid_rows = checked_nsuint(spec.seq.div_ceil(block_q), "steel causal d256 NQ")?;
-        let grid_heads = checked_nsuint(spec.q_heads, "steel causal d256 heads")?;
+        let params = steel_attn_params(spec, block_q, block_k, kv_rows, "steel causal attention")?;
+        let grid_rows = checked_nsuint(spec.seq.div_ceil(block_q), "steel causal NQ")?;
+        let grid_heads = checked_nsuint(spec.q_heads, "steel causal heads")?;
         let grid = if head_major {
             MTLSize::new(grid_heads, grid_rows, 1)
         } else {
