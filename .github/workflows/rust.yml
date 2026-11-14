@@ -95,6 +95,25 @@ jobs:
             exit 1
           fi
 
+  release-build-check:
+    name: Release build (Apple Silicon)
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-')
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      # Même commande que release.yml : échouer avant le merge et le tag.
+      - name: Build and check release CLI
+        run: |
+          test "$(uname -m)" = arm64
+          cargo build --locked --release --target "$TARGET" --bin saragossa --features metal,devtools
+          "target/$TARGET/release/saragossa" --help
+
   rust:
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
@@ -245,7 +264,7 @@ jobs:
   required:
     name: Required checks
     if: always()
-    needs: [changes, prek, rust, cpu, msrv, gitleaks, validate-yaml, coverage]
+    needs: [changes, prek, rust, cpu, msrv, gitleaks, validate-yaml, coverage, release-build-check]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

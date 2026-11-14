@@ -77,6 +77,7 @@ Le flux public est : fork du dépôt, branche courte, pull request vers `main`,
 puis CI verte. Les commits suivent Conventional
 Commits en français et n'ajoutent aucun trailer de paternité automatisé.
 
-`release-plz` prépare les changements de version et le changelog. Seul le
-workflow de release publie le crate; une contribution ordinaire ne modifie pas
-manuellement les tags et ne lance pas `cargo publish`.
+`release-plz` prépare les changements de version, le changelog et les tags Git.
+La distribution passe par les releases GitHub et Homebrew, sans publication
+sur crates.io. Une contribution ordinaire ne modifie pas manuellement les tags
+et ne lance pas `cargo publish`.
