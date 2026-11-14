@@ -1,6 +1,6 @@
 //! Conversion du profil Responses sans stockage vers le chat du moteur.
 
-use saragossa::chat_template::AssistantBlock;
+use saragossa::chat_template::{canonical_json, AssistantBlock};
 use serde_json::{json, Value};
 
 use super::super::error::{ServeError, ServeResult};
@@ -247,9 +247,7 @@ impl Request {
                 }
             }
         }
-        let mut chat = ChatCompletionRequest::parse(
-            &serde_json::to_vec(&chat).map_err(|e| ServeError::json("Responses chat", e))?,
-        )?;
+        let mut chat = ChatCompletionRequest::parse(canonical_json::to_string(&chat).as_bytes())?;
         // Un tour assistant peut alterner texte et appels. Le regrouper avec
         // ses blocs ordonnés garde les retours adjacents pour les templates
         // positionnels, sans déplacer le texte devant les appels.

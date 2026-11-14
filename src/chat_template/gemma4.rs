@@ -1,5 +1,5 @@
 //! Déclarations, appels et résultats dans les tours Gemma 4.
-use super::ChatTemplateMessage;
+use super::{canonical_json::sorted_entries, ChatTemplateMessage};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -176,14 +176,6 @@ fn format_value(value: &Value, escape_keys: bool) -> String {
     }
 }
 
-fn sorted_entries(object: &serde_json::Map<String, Value>) -> Vec<(&String, &Value)> {
-    // llguidance enables preserve_order globally. Keep the established Gemma
-    // prompt ordering independent of serde_json's selected map implementation.
-    let mut entries: Vec<_> = object.iter().collect();
-    entries.sort_unstable_by_key(|(key, _)| *key);
-    entries
-}
-
 fn nonempty(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -324,6 +316,38 @@ fn declaration(function: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tools_and_arguments_keep_main_sorted_bytes_for_client_key_orders() {
+        let expected = concat!(
+            "<bos><|turn>system\n<|tool>declaration:f{description:<|\"|>D<|\"|>,parameters:{properties:{",
+            "a:{type:<|\"|>STRING<|\"|>},z:{items:{properties:{a:{type:<|\"|>STRING<|\"|>},z:{type:<|\"|>INTEGER<|\"|>}},",
+            "required:[<|\"|>z<|\"|>,<|\"|>a<|\"|>],type:<|\"|>OBJECT<|\"|>},type:<|\"|>ARRAY<|\"|>}},",
+            "required:[<|\"|>z<|\"|>,<|\"|>a<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n",
+            "<|turn>model\n<|tool_call>call:f{a:<|\"|>A<|\"|>,z:[{a:<|\"|>é<|\"|>,z:2}]}<tool_call|><|tool_response>"
+        );
+        for tool in [
+            r#"{"name":"f","description":"D","parameters":{"type":"object","required":["z","a"],"properties":{"z":{"type":"array","items":{"type":"object","required":["z","a"],"properties":{"z":{"type":"integer"},"a":{"type":"string"}}}},"a":{"type":"string"}}}}"#,
+            r#"{"description":"D","name":"f","parameters":{"properties":{"a":{"type":"string"},"z":{"items":{"properties":{"a":{"type":"string"},"z":{"type":"integer"}},"required":["z","a"],"type":"object"},"type":"array"}},"required":["z","a"],"type":"object"}}"#,
+        ] {
+            for input in [
+                r#"{"z":[{"z":2,"a":"é"}],"a":"A"}"#,
+                r#"{"a":"A","z":[{"a":"é","z":2}]}"#,
+            ] {
+                // Les API acceptent les arguments objet ou encodés dans une chaîne.
+                for arguments in [input.to_owned(), Value::String(input.into()).to_string()] {
+                    let mut call = ChatTemplateMessage::new("assistant", "");
+                    call.tool_calls.push(format!(
+                        r#"{{"id":"c","function":{{"name":"f","arguments":{arguments}}}}}"#
+                    ));
+                    let actual =
+                        render_gemma4_chat_with_tools(&[call], &[tool.into()], true, false);
+                    assert_eq!(actual.as_bytes(), expected.as_bytes());
+                }
+            }
+        }
+    }
+
     #[test]
     fn resolves_result_name_from_call_id_and_continues_turn() {
         let mut call = ChatTemplateMessage::new("assistant", "");

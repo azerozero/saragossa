@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use saragossa::ChatTemplateMessage;
+use saragossa::{chat_template::canonical_json, ChatTemplateMessage};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -540,7 +540,7 @@ impl WireMessage {
                 .collect::<Vec<_>>()
                 .join(""),
             Some(Value::Null) | None => String::new(),
-            Some(other) => other.to_string(),
+            Some(other) => canonical_json::to_string(other),
         }
     }
 }
@@ -1138,6 +1138,23 @@ mod tests {
             .max_tokens_capped(4096)
             .expect_err("invariant: cap dépassé");
         assert!(error.to_string().contains("plafond serveur 4096"));
+    }
+
+    #[test]
+    fn json_content_fallback_keeps_main_sorted_bytes() {
+        for content in [
+            r#"{"z":[{"z":2,"a":1}],"a":0}"#,
+            r#"{"a":0,"z":[{"a":1,"z":2}]}"#,
+        ] {
+            let body =
+                format!(r#"{{"model":"m","messages":[{{"role":"user","content":{content}}}]}}"#);
+            let request =
+                ChatCompletionRequest::parse(body.as_bytes()).expect("invariant: requête valide");
+            assert_eq!(
+                request.template_messages()[0].content.as_deref(),
+                Some(r#"{"a":0,"z":[{"a":1,"z":2}]}"#)
+            );
+        }
     }
 
     #[test]

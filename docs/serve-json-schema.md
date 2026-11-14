@@ -101,7 +101,24 @@ Default features are disabled: no Lark parser, referencing resolver, rayon
 integration, ahash feature or optional JSON Schema validator. Besides llguidance
 and toktrie, the lockfile gains anyhow, derivre 0.3.8, bytemuck_derive, hashbrown
 0.15.5, heck, strum, strum_macros and syn 3. The remaining dependencies are shared
-with the engine. llguidance enables serde_json's `preserve_order` feature.
+with the engine. llguidance enables serde_json's `preserve_order` feature for
+the entire crate, changing `Value` objects from sorted `BTreeMap` keys to
+insertion-ordered `IndexMap` keys. `chat_template::canonical_json` explicitly
+restores the historical recursive key order wherever these values become prompt
+text: Anthropic tool declarations, arguments and JSON content fallbacks,
+Responses conversion and Chat Completions JSON content fallbacks. Gemma 4 uses
+the same sorted-entry helper for its native tool syntax. Serialized tool-call
+arguments returned to clients also retain their historical order when replayed
+as history.
+Arrays, string escaping and number formatting are unchanged, preserving prompt
+bytes and the token sequences used by the prefix cache.
+
+Raw Chat Completions tools and arguments still preserve the client's source
+order for Qwen/flint through the separate Python-compatible JSON renderer;
+they must not be canonicalized. The schema size check only measures serialized
+length, and compiled grammars are cached per request without a serialized JSON
+cache key, so schema compilation keeps llguidance's property-order semantics.
+
 `cargo deny` checks the actual locked graph without adding license or advisory
 exceptions; duplicate-version warnings are permitted by the existing policy.
 
@@ -126,3 +143,8 @@ Serve tests exercise greedy/sampled generation, SSE and exact/exhausted budgets;
 a local Gemma 3 tokenizer test also exercises split UTF-8 bytes with synthetic
 weights. The SDK e2e matrix checks required content despite a conflicting `{}`
 prompt on both APIs, at temperature 0 and 0.8.
+
+Byte-level regressions compare recursively reordered tool declarations and
+arguments with the sorted output from before `preserve_order`. Run
+`cargo test golden::chat_templates` and `cargo test serve::` without regenerating
+the chat-template goldens.
