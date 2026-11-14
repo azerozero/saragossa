@@ -95,12 +95,13 @@ fn affine_offsets_alignment_without_device() {
         FastQmvU4Align64,
         FastQmvU2,
         FastQmvU3,
+        FastQmvU5,
         FastQmvU6,
         QmmBatchedU6,
         FastQmvOneU8,
         QmmNaFusedTiledU8,
         QmmNaU8Gs128,
-        QmmNaU8,
+        QmmNaDequant,
         FastQmvU8,
         FastQmvU8Align64,
     ] {
@@ -151,8 +152,12 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
         (FastQmvU2, 2, 64, 1, 64, 512),
         (FastQmvU3, 3, 64, 1, 64, 512),
         (FastQmvU3, 3, 64, 1, 16, 768),
+        (FastQmvU5, 5, 64, 3, 13, 192),
+        (FastQmvU5, 5, 64, 1, 64, 512),
         (FastQmvU6, 6, 64, 1, 13, 512),
         (FastQmvU6, 6, 64, 1, 64, 512),
+        (FastQmvU5, 5, 64, 3, 8, 1024),
+        (FastQmvU6, 6, 64, 3, 8, 1024),
         (QmmBatchedU6, 6, 64, 2, 13, 512),
         (QmmBatchedU6, 6, 64, 7, 64, 512),
         (QmmBatchedU6, 6, 64, 8, 64, 512),
@@ -167,20 +172,23 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
         (QmmNaFusedTiledU8, 8, 64, 17, 64, 512),
         (QmmNaFusedTiledU8, 8, 128, 17, 64, 512),
         (QmmNaU8Gs128, 8, 128, 16, 64, 512),
-        (QmmNaU8, 8, 64, 16, 64, 512),
+        (QmmNaDequant, 8, 64, 16, 64, 512),
+        (QmmNaDequant, 5, 64, 32, 13, 512),
+        (QmmNaDequant, 6, 64, 33, 64, 512),
     ] {
         let weight = match bits {
             2 => test_affine_mlx_u2(n, k)?,
             3 => test_affine_mlx_u3(n, k)?,
             4 => test_affine_varied_group(n, k, gs)?,
+            5 => test_affine_varied_u5(n, k)?,
             6 => test_affine_varied_u6(n, k)?,
             _ => test_affine_varied_u8_group(n, k, gs)?,
         };
         super::matmul_select::OFFSET_TEST_KERNEL.with(|value| value.set(Some(kernel)));
         for resident in [false, true] {
-            // QmmNaU8 est un chemin owned uniquement ; le résident garde son
+            // QmmNaDequant est un chemin owned uniquement ; le résident garde son
             // repli historique. Le tester comme rapide masquerait une régression.
-            if resident && kernel == QmmNaU8 {
+            if resident && kernel == QmmNaDequant {
                 continue;
             }
             let reference = offset_dispatch(&metal, &weight, m, resident)?;
@@ -219,7 +227,7 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
                     );
                 }
             }
-            if kernel == QmmBatchedU6 {
+            if matches!(kernel, QmmBatchedU6 | FastQmvU5 | FastQmvU6 | QmmNaDequant) {
                 // Alignement minimal uint/bfloat, sans alignement vectoriel.
                 let shifted = offset_weight(&metal, &weight, [4, 2, 6], 0xdead)?;
                 assert_eq!(offset_dispatch(&metal, &shifted, m, resident)?, reference);

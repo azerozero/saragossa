@@ -428,6 +428,22 @@ impl MetalExecutor {
                 packed_cols,
                 groups,
             )?,
+            AffineMatmulKernel::FastQmvU5 => self.encode_affine_qmv_u5_buffers(
+                encoder,
+                lhs_buffer,
+                packed,
+                packed_offset,
+                scales,
+                scales_offset,
+                biases,
+                biases_offset,
+                output_buffer,
+                batch,
+                in_dim,
+                out_dim,
+                packed_cols,
+                groups,
+            )?,
             AffineMatmulKernel::FastQmvU6 => self.encode_affine_qmv_u6_buffers(
                 encoder,
                 lhs_buffer,
@@ -526,7 +542,7 @@ impl MetalExecutor {
                 groups,
                 8,
             )?,
-            AffineMatmulKernel::Fallback | AffineMatmulKernel::QmmNaU8 => self
+            AffineMatmulKernel::Fallback | AffineMatmulKernel::QmmNaDequant => self
                 .encode_resident_affine_fallback(
                     encoder,
                     lhs_buffer,
