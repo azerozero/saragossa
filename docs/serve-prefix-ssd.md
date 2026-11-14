@@ -1,0 +1,142 @@
+# Cache de préfixe persistant de `serve`
+
+Activation explicite, sans effet sur un serveur lancé sans répertoire SSD :
+
+```sh
+saragossa serve --model qwen="$MODEL" \
+  --prefix-cache-ssd-dir "$CACHE" --prefix-cache-ssd-gib 32 \
+  --prefix-cache-ssd-priority-tokens 4096
+```
+
+`CACHE` est un répertoire **dédié et privé**, créé en mode 0700 s'il est
+absent. Un répertoire existant accessible au groupe ou aux autres est refusé.
+Les variables équivalentes sont `SARAGOSSA_SERVE_PREFIX_SSD_DIR`,
+`SARAGOSSA_SERVE_PREFIX_SSD_GIB` et
+`SARAGOSSA_SERVE_PREFIX_SSD_PRIORITY_TOKENS`. Les options CLI ont priorité.
+Le budget est exprimé en Gio entiers, strictement positifs ; 32 par défaut.
+Un verrou OS exclusif interdit deux serveurs dans le même répertoire et se
+libère après la mort du processus. Ne pas modifier ce répertoire en service.
+
+Le budget porte sur la somme des tailles logiques des fichiers publiés et en
+cours de publication, hors métadonnées du système de fichiers. Il est global
+au serveur, tous modèles et sessions confondus. Le LRU élimine d'abord les
+entrées ordinaires, puis les entrées prioritaires. Les préfixes d'au plus
+4096 tokens sont prioritaires : servir un prompt système seul permet de
+conserver cette frontière. Zéro désactive cette priorité. Elle ne dépend
+d'aucune valeur de priorité reçue du réseau. Une nouvelle entrée ordinaire
+ne déloge pas une entrée prioritaire pour se faire une place.
+
+## Chemins de reprise
+
+Le cache AR de `serve` recherche d'abord sa meilleure frontière en RAM, puis
+une frontière plus longue sur SSD. Seules les longueurs présentes dans l'index
+persistant sont sondées. La frontière retenue retourne en RAM et le suffixe
+suit le chemin d'extension existant. Les états nouvellement préremplis ou
+étendus sont proposés à l'écriture immédiatement : leur éviction RAM ou un
+redémarrage n'impose donc pas de refaire le prefill après publication.
+La taille des blocs, le seuil de rentabilité d'extension et les gardes mémoire
+restent ceux du cache existant.
+
+MTP et DFlash réutilisent les points d'instantané du décodeur : KV du tronc,
+états GatedDeltaNet/conv, dernière ligne cachée, historique MTP committed
+s'il existe et captures DFlash. Leur lookup disque porte sur le prompt exact ;
+leur cache RAM conserve la recherche de préfixe et l'extension existantes.
+Les modes AR, MTP fresh/committed et DFlash ont des clés distinctes.
+Les prompts de warmup et les ablations diagnostiques ne sont pas persistés.
+
+Les sessions sont isolées par SHA-256, sans chemin fourni par une requête.
+L'absence de session conserve un espace partagé. Cette isolation concerne
+le tier disque ; elle ne change pas la politique historique du cache RAM MTP.
+
+## Intégrité et publication
+
+Le format post-prefill version 4 est réutilisé sans conversion de précision.
+La clé inclut les tokens exacts, le format KV, les réglages numériques, le
+binaire, la configuration et les sources du modèle. Les sources comprennent
+**tous les octets des shards**, les sidecars, le tokenizer et sa configuration :
+le hachage intégral existant est plus strict qu'un échantillonnage de poids.
+Il est effectué au chargement et exclu des mesures de reload/prefill. Les
+métadonnées des sources sont revérifiées avant l'écriture et la restauration.
+Changer de build ou de réglages crée une autre identité ; les anciennes entrées
+incompatibles avec le build/format sont supprimées au démarrage.
+
+Chaque blob et le manifeste portent un SHA-256. Avant toute allocation de
+blob, le lecteur valide la clé complète, les dimensions par couche, les
+longueurs, les dtypes et le budget géométrique du modèle. Le manifeste est
+limité à 16 Mio ; la taille totale de l'entrée est limitée au budget SSD.
+Les liens sortant du répertoire et les chemins de blobs arbitraires sont
+refusés. Une entrée invalide est supprimée et le prefill ordinaire reprend.
+Les fichiers ne sont pas chiffrés : ils contiennent des états dérivés des
+prompts, à conserver dans un emplacement privé choisi par l'opérateur.
+
+Un seul instantané est admis entre le début de sa préparation et sa publication.
+Le moteur fige les états Metal et copie les octets utiles dans un staging borné
+par le budget SSD. **Cette copie reste synchrone et ajoute de la RAM temporaire**,
+au plus un instantané ; elle ne remplace pas les gardes mémoire du modèle.
+Le worker calcule les sommes de contrôle et réalise toutes les écritures de
+blobs, synchronisations et renommages. Il publie un dossier `pending` complet
+par `rename`, après `fsync` des fichiers et dossiers. Un arrêt brutal avant
+publication laisse un temporaire supprimé au redémarrage.
+
+Une file occupée fait abandonner la nouvelle candidature, sans attendre.
+Pendant la publication, un lookup disque indisponible repart au prefill ;
+aucune attente de l'écrivain n'est imposée au moteur. La persistance est donc
+best effort sous charge. Attendre `prefix_ssd written` avant d'arrêter le
+serveur pour vérifier une reprise à froid. Une erreur disque est journalisée
+et ne fait pas échouer une génération. Le cache complet n'est ni compressé
+ni mappé sans copie à la lecture ; les buffers Metal sont reconstruits par
+le lecteur d'instantané existant.
+
+## Vérification et mesure
+
+Les tests synthétiques couvrent les bits KV et récurrents, les tokens greedy,
+la reprise dans des processus distincts, les checksums, versions, dtypes,
+modèles incompatibles, tailles hostiles, interruptions, LRU/priorités,
+concurrence et limites d'admission. Les tests existants du format couvrent
+aussi l'historique MTP et les captures DFlash.
+
+```sh
+cargo test --all-features decoder::state_snapshot
+cargo test --all-features serve::args
+cargo build --release --example prefix_ssd
+```
+
+Mesure à **32768 et 131072 tokens exacts** sur le modèle local choisi, sous le
+verrou GPU du dépôt (aucun téléchargement). Définir `MODEL` sur le répertoire
+Qwen3.8-27B-u4ls local. Le dossier de sortie doit être nouveau :
+
+```sh
+python3 -I -B tools/gpulock.py run --owner prefix-ssd --prio 10 -- \
+  python3 -I -B tools/bench_prefix_ssd.py \
+  --model "$MODEL" --mode ar --output /tmp/prefix-ssd-ar
+
+python3 -I -B tools/gpulock.py run --owner prefix-ssd --prio 10 -- \
+  python3 -I -B tools/bench_prefix_ssd.py \
+  --model "$MODEL" --mode mtp --output /tmp/prefix-ssd-mtp
+```
+
+Le script démarre trois processus par longueur : sans SSD, SSD vide, puis
+relecture après redémarrage. Il exige l'égalité exacte des 32 identifiants
+produits et une réutilisation dans la phase chaude. Il conserve les JSON et
+journaux, affiche prefill, prefill avec staging, reload et ratio. Les fichiers
+SSD temporaires sont supprimés ensuite. L'oracle MTP désactive un drafter
+DFlash implicite pour mesurer l'historique MTP. Aucun gain sur le vrai modèle
+n'est présumé par les tests synthétiques.
+
+L'exemple mesure les mêmes APIs de prefill/reprise que `serve`, sans transport
+HTTP ni template chat, avec un prompt synthétique répété. Pour mesurer aussi
+le transport, lancer le serveur avec les options ci-dessus, puis :
+
+```sh
+saragossa bench-serve --model qwen --requests 1 --concurrency 1 \
+  --prompt-tokens 32768 --max-tokens 32 --timeout-secs 1800
+```
+
+Attendre la publication, redémarrer le serveur avec les mêmes options et
+répéter la commande ; recommencer à 131072. Le client HTTP utilise une longueur
+approximative : prendre `prompt_tokens` du journal serveur comme référence.
+Comparer `prefill_ms` et `prefix_ssd hit ... reload_ms`, pas le chargement des
+poids. Le cache de pages de l'OS peut accélérer les relectures : ce protocole
+mesure une reprise serveur, pas un SSD physiquement froid. Pour tester une
+machine après redémarrage OS, conserver un cache opérateur et les mêmes
+réglages/binaire ; ne pas purger les caches système pendant un autre travail.
