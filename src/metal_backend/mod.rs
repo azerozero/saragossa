@@ -416,6 +416,8 @@ pub struct MetalExecutor {
     argmax_finalize_f32: ComputePipelineState,
     talker_greedy_argmax_f32: ComputePipelineState,
     f32_to_bf16: ComputePipelineState,
+    dequant_u5_to_bf16_t_gs64: ComputePipelineState,
+    dequant_u6_to_bf16_t_gs64: ComputePipelineState,
     dequant_u8_to_bf16_t_gs64: ComputePipelineState,
     /// GEMM Neural Accelerators (`matmul2d`, bf16-in/f32-out) ; `None` si la
     /// MetalPerformancePrimitives n'est pas dispo (macOS < 26).

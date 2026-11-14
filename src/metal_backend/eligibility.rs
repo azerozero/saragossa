@@ -592,17 +592,18 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_align64(
 }
 
 /// Prédicat du GEMM prefill sur Neural Accelerators (matmul2d bf16) : dé-quant
-/// u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
-/// (prefill). Opt-in (`SARAGOSSA_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
+/// u5/u6/u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
+/// (prefill). Activé par défaut (`SARAGOSSA_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
 /// dispo (`na_gemm_bf16.is_some()`, macOS≥26). bf16 ⇒ non bit-à-bit identique.
-pub(super) fn can_use_qmm_na_u8(
+pub(super) fn can_use_qmm_na_dequant(
     batch: usize,
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
     qmm_na_enabled()
         && batch >= qmm_na_min_batch()
-        && weight.bits() == 8
+        && matches!(weight.bits(), 5 | 6 | 8)
+        && !(weight.bits() == 6 && qmm_u6_enabled())
         && weight.group_size() == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)

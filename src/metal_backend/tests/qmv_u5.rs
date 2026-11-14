@@ -101,6 +101,8 @@ fn affine_qmv_u5_gs64_matches_cpu_generic_and_routes() -> Result<()> {
         (64, 512, 1),
         (65, 512, 2),
         (256, 1024, 1),
+        (8, 5120, 3),
+        (16, 17408, 2),
     ] {
         let weight = test_affine_varied_u5(out_dim, in_dim)?;
         assert_eq!(
@@ -113,7 +115,8 @@ fn affine_qmv_u5_gs64_matches_cpu_generic_and_routes() -> Result<()> {
         let input = Tensor::from_vec(vec![batch, in_dim], lhs.clone())?;
         let cpu = input.matmul_rhs_t(&weight.dequantize()?)?;
         let generic = generic_affine_reference(&executor, &weight, &lhs, batch, "qmv_u5_generic")?;
-        let kind = if out_dim % 2 == 0 {
+        let aligned = out_dim % 8 == 0 && in_dim % 512 == 0;
+        let kind = if aligned {
             "affine_qmv_u5_aligned_gs64"
         } else {
             "affine_qmv_u5_tail_gs64"
@@ -122,7 +125,13 @@ fn affine_qmv_u5_gs64_matches_cpu_generic_and_routes() -> Result<()> {
         take_dispatch_shapes_for_test();
         let direct = executor.matmul_rhs_t_affine(&input, &weight)?;
         assert_eq!(take_dispatch_shapes_for_test(), [dispatch]);
-        assert_bits_equal(direct.data(), &generic, "qmv u5/générique");
+        // L'affine après 16/32 produits change l'association f32 comme u4.
+        // Même epsilon absolu que l'oracle u4 align64 ; le tail reste bit exact.
+        if aligned {
+            assert_close_eps(direct.data(), &generic, 1.0e-3);
+        } else {
+            assert_bits_equal(direct.data(), &generic, "qmv u5/générique");
+        }
         assert_all_close_scaled(direct.data(), cpu.data(), "qmv u5/CPU");
 
         let owned = LinearWeight::AffineQuantized(weight);
@@ -159,7 +168,7 @@ fn affine_qmv_u5_gs64_matches_cpu_generic_and_routes() -> Result<()> {
             assert_eq!(take_dispatch_shapes_for_test(), [dispatch]);
             let actual = read_f32_buffer(&output, batch * out_dim + 32)?;
             assert!(actual[batch * out_dim..].iter().all(|&x| x == sentinel));
-            assert_bits_equal(&actual[..batch * out_dim], &generic, "route u5/générique");
+            assert_bits_equal(&actual[..batch * out_dim], direct.data(), "route u5/mono");
             assert_all_close_scaled(&actual[..batch * out_dim], cpu.data(), "route u5/CPU");
         }
     }
@@ -173,7 +182,13 @@ fn affine_qmv_u5_offsets_bit_exact() -> Result<()> {
     let _reset = OffsetKernelGuard;
     super::matmul_select::OFFSET_TEST_KERNEL
         .with(|value| value.set(Some(AffineMatmulKernel::FastQmvU5)));
-    for (out_dim, in_dim, batch) in [(1, 64, 1), (2, 128, 2), (13, 192, 3)] {
+    for (out_dim, in_dim, batch) in [
+        (1, 64, 1),
+        (2, 128, 2),
+        (13, 192, 3),
+        (8, 512, 3),
+        (8, 1024, 3),
+    ] {
         let weight = test_affine_varied_u5(out_dim, in_dim)?;
         for resident in [false, true] {
             let reference = offset_dispatch(&executor, &weight, batch, resident)?;

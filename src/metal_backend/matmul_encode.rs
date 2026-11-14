@@ -1037,7 +1037,8 @@ impl MetalExecutor {
             checked_u32(packed_cols, "qmv u5 packed_cols")?,
             checked_u32(groups, "qmv u5 groups")?,
         ];
-        let (pipeline, profile_label, kernel_name) = if out_dim % 2 == 0 {
+        let aligned = out_dim % 8 == 0 && in_dim % 512 == 0;
+        let (pipeline, profile_label, kernel_name) = if aligned {
             (
                 &self.affine_qmv_fast_aligned_u5_gs64_f32,
                 "affine_qmv_u5_aligned_gs64",
@@ -1070,7 +1071,10 @@ impl MetalExecutor {
         encoder.dispatch_thread_groups(
             MTLSize::new(
                 checked_nsuint(batch, "qmv u5 batch")?,
-                checked_nsuint(out_dim.div_ceil(2), "qmv u5 out groups")?,
+                checked_nsuint(
+                    out_dim.div_ceil(if aligned { 8 } else { 2 }),
+                    "qmv u5 out groups",
+                )?,
                 1,
             ),
             MTLSize::new(64, 1, 1),
@@ -1102,7 +1106,8 @@ impl MetalExecutor {
             checked_u32(packed_cols, "qmv u6 packed_cols")?,
             checked_u32(groups, "qmv u6 groups")?,
         ];
-        let (pipeline, profile_label, kernel_name) = if out_dim % 2 == 0 {
+        let aligned = out_dim % 8 == 0 && in_dim % 512 == 0;
+        let (pipeline, profile_label, kernel_name) = if aligned {
             (
                 &self.affine_qmv_fast_aligned_u6_gs64_f32,
                 "affine_qmv_u6_aligned_gs64",
@@ -1135,7 +1140,10 @@ impl MetalExecutor {
         encoder.dispatch_thread_groups(
             MTLSize::new(
                 checked_nsuint(batch, "qmv u6 batch")?,
-                checked_nsuint(out_dim.div_ceil(2), "qmv u6 out groups")?,
+                checked_nsuint(
+                    out_dim.div_ceil(if aligned { 8 } else { 2 }),
+                    "qmv u6 out groups",
+                )?,
                 1,
             ),
             MTLSize::new(64, 1, 1),
@@ -1443,7 +1451,7 @@ impl MetalExecutor {
         clippy::too_many_arguments,
         reason = "helper interne partagé par deux variantes d'encodage Metal"
     )]
-    /// Dé-quantifie un poids u8 gs64 `[out_dim,in_dim]` en bf16 dense TRANSPOSÉ
+    /// Dé-quantifie un poids u5/u6/u8 gs64 `[out_dim,in_dim]` en bf16 dense TRANSPOSÉ
     /// `[in_dim,out_dim]` (= `W^T`, layout `[K,N]` du GEMM NA), dans l'encodeur
     /// partagé. Pour le chemin prefill matmul2d.
     pub(super) fn encode_dequant_qweight_to_bf16_t(
@@ -1459,7 +1467,18 @@ impl MetalExecutor {
         out_dim: usize,
         in_dim: usize,
         packed_cols: usize,
+        bits: usize,
     ) -> Result<()> {
+        let (pipeline, name) = match bits {
+            5 => (&self.dequant_u5_to_bf16_t_gs64, "dequant_u5_to_bf16_t_gs64"),
+            6 => (&self.dequant_u6_to_bf16_t_gs64, "dequant_u6_to_bf16_t_gs64"),
+            8 => (&self.dequant_u8_to_bf16_t_gs64, "dequant_u8_to_bf16_t_gs64"),
+            _ => {
+                return Err(InferError::Config(format!(
+                    "déquant NA : bits={bits} non supporté"
+                )))
+            }
+        };
         let total = checked_len(out_dim, in_dim, "dequant na total")?;
         let dims = [
             checked_u32(out_dim, "dequant na out_dim")?,
@@ -1467,14 +1486,16 @@ impl MetalExecutor {
             checked_u32(packed_cols, "dequant na packed_cols")?,
             0,
         ];
-        encoder.set_compute_pipeline_state(&self.dequant_u8_to_bf16_t_gs64);
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(packed), packed_offset);
         encoder.set_buffer(1, Some(scales), scales_offset);
         encoder.set_buffer(2, Some(biases), biases_offset);
         encoder.set_buffer(3, Some(wt), 0);
         set_u32_bytes(encoder, 4, &dims, "dequant_na_dims")?;
-        trace_dispatch_path("dequant_u8_to_bf16_t_gs64", out_dim, in_dim, packed_cols);
-        self.dispatch_1d(encoder, &self.dequant_u8_to_bf16_t_gs64, total)
+        trace_dispatch_path(name, out_dim, in_dim, packed_cols);
+        self.dispatch_1d(encoder, pipeline, total)?;
+        post_dispatch_barrier_buffer(encoder, wt);
+        Ok(())
     }
 
     pub(crate) fn encode_copy(

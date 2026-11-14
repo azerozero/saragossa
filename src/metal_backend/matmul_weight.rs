@@ -511,7 +511,7 @@ impl MetalExecutor {
                 *out_dim,
                 weight.group_size(),
             )?,
-            AffineMatmulKernel::QmmNaU8 => self.encode_owned_affine_qmm_na_u8(
+            AffineMatmulKernel::QmmNaDequant => self.encode_owned_affine_qmm_na_dequant(
                 encoder,
                 owned_buffers,
                 lhs_buffer,
@@ -526,6 +526,7 @@ impl MetalExecutor {
                 in_dim,
                 *out_dim,
                 *packed_cols,
+                weight.bits(),
             )?,
             AffineMatmulKernel::FastQmvU8 => self.encode_owned_affine_qmv_u8(
                 encoder,
@@ -768,7 +769,7 @@ impl MetalExecutor {
     }
 
     #[inline]
-    fn encode_owned_affine_qmm_na_u8(
+    fn encode_owned_affine_qmm_na_dequant(
         &self,
         encoder: &ComputeCommandEncoderRef,
         owned_buffers: &mut Vec<metal::Buffer>,
@@ -784,9 +785,10 @@ impl MetalExecutor {
         in_dim: usize,
         out_dim: usize,
         packed_cols: usize,
+        bits: usize,
     ) -> Result<()> {
         // PREFILL : GEMM bf16 sur Neural Accelerators (matmul2d). Dé-quant
-        // u8→bf16 transposée du poids + activations bf16 → tensor-cores.
+        // u5/u6/u8→bf16 transposée du poids + activations bf16 → tensor-cores.
         trace_dispatch_path("qmm_na", batch, out_dim, in_dim);
         let wt_bf16 =
             self.private_bf16_buffer(checked_len(in_dim, out_dim, "qmm na wt")?, "qmm_na_wt_bf16")?;
@@ -802,6 +804,7 @@ impl MetalExecutor {
             out_dim,
             in_dim,
             packed_cols,
+            bits,
         )?;
         let lhs_len = checked_len(batch, in_dim, "qmm na lhs")?;
         let lhs_bf16 = self.private_bf16_buffer(lhs_len, "qmm_na_lhs_bf16")?;

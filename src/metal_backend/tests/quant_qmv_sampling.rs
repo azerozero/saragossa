@@ -2551,13 +2551,14 @@ fn affine_embedding_u3_fallback_dequantizes_like_cpu_bit_exact() -> Result<()> {
 }
 
 #[test]
-#[ignore = "GPU Metal : comparaison qmm/qmv u6 strictement bit à bit"]
+#[ignore = "GPU Metal : qmm u6 scalaire bit à bit, qmv aligné epsilon u4"]
 fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
     use super::flags::with_qmm_u6_override;
     use super::profiling::take_dispatch_shapes_for_test;
 
     // Un lancement explicite doit échouer sans device, pas réussir sans calcul.
-    let executor = MetalExecutor::new()?;
+    let mut executor = MetalExecutor::new()?;
+    executor.na_gemm_bf16 = None;
     let assert_exact = |actual: &[f32], expected: &[f32], context: &str| {
         assert_eq!(actual.len(), expected.len(), "{context}");
         for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
@@ -2590,7 +2591,7 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                 .flat_map(|row| varied_row(in_dim, 53 + row))
                 .collect();
             let expected =
-                fast_qmv_u6_reference(&executor, &weight, &lhs, batch, "qmm_u6_qmv_ref")?;
+                generic_affine_reference(&executor, &weight, &lhs, batch, "qmm_u6_qmv_ref")?;
             // Chaque ligne doit détecter un encodeur qui laisse sa sortie à zéro.
             assert!(expected
                 .chunks_exact(out_dim)
@@ -2641,7 +2642,7 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                     assert_eq!(qmm_u6_enabled(), enabled);
                     let kind = if enabled && batch > 1 {
                         "affine_qmm_batched_u6_gs64"
-                    } else if out_dim % 2 == 0 {
+                    } else if out_dim % 8 == 0 && in_dim % 512 == 0 {
                         "affine_qmv_u6_aligned_gs64"
                     } else {
                         "affine_qmv_u6_tail_gs64"
@@ -2674,11 +2675,13 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                         encoder.end_encoding();
                         commit_and_wait(command_buffer)?;
                         assert_eq!(take_dispatch_shapes_for_test(), [dispatch], "{context}");
-                        assert_exact(
-                            &read_f32_buffer(&output, batch * out_dim)?,
-                            &expected,
-                            &context,
-                        );
+                        let actual = read_f32_buffer(&output, batch * out_dim)?;
+                        if kind == "affine_qmv_u6_aligned_gs64" {
+                            // Même association affine et epsilon que u4 align64.
+                            assert_close_eps(&actual, &expected, 1.0e-3);
+                        } else {
+                            assert_exact(&actual, &expected, &context);
+                        }
                     }
 
                     // L'API Tensor alloue sa propre sortie neuve à chaque appel.
@@ -2689,11 +2692,11 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                         [dispatch],
                         "{context}, API Tensor, flag={enabled}"
                     );
-                    assert_exact(
-                        direct.data(),
-                        &expected,
-                        &format!("{context}, API Tensor, flag={enabled}"),
-                    );
+                    if kind == "affine_qmv_u6_aligned_gs64" {
+                        assert_close_eps(direct.data(), &expected, 1.0e-3);
+                    } else {
+                        assert_exact(direct.data(), &expected, &context);
+                    }
                     Ok(())
                 })?;
             }
@@ -2712,6 +2715,8 @@ fn affine_qmv_u6_gs64_matches_generic_and_routes() -> Result<()> {
         (65, 512, 2),
         (256, 1024, 1),
         (2048, 2048, 1),
+        (8, 5120, 3),
+        (16, 17408, 2),
     ] {
         let weight = test_affine_varied_u6(out_dim, in_dim)?;
         let mut lhs = Vec::with_capacity(batch * in_dim);
@@ -2722,17 +2727,21 @@ fn affine_qmv_u6_gs64_matches_generic_and_routes() -> Result<()> {
         let generic =
             generic_affine_reference(&executor, &weight, &lhs, batch, "qmv_u6_generic_ref")?;
         let fast = fast_qmv_u6_reference(&executor, &weight, &lhs, batch, "qmv_u6_fast_ref")?;
-        assert_bits_equal(
-            &fast,
-            &generic,
-            &format!("qmv u6 fast vs generic ({out_dim}x{in_dim}) batch={batch}"),
-        );
+        // Regroupement affine identique à u4 ; epsilon u4 align64 inchangé.
+        if out_dim % 8 == 0 && in_dim % 512 == 0 {
+            assert_close_eps(&fast, &generic, 1.0e-3);
+        } else {
+            assert_bits_equal(&fast, &generic, "qmv u6 tail/générique");
+        }
+        let cpu = Tensor::from_vec(vec![batch, in_dim], lhs.clone())?
+            .matmul_rhs_t(&weight.dequantize()?)?;
+        assert_all_close_scaled(&fast, cpu.data(), "qmv u6/CPU");
 
         let input = Tensor::from_vec(vec![batch, in_dim], lhs.clone())?;
         let direct = executor.matmul_rhs_t_affine(&input, &weight)?;
         assert_bits_equal(
             direct.data(),
-            &generic,
+            &fast,
             &format!("matmul_rhs_t_affine u6 route ({out_dim}x{in_dim}) batch={batch}"),
         );
 
@@ -2754,7 +2763,7 @@ fn affine_qmv_u6_gs64_matches_generic_and_routes() -> Result<()> {
         let routed = read_f32_buffer(&out_buf, batch * out_dim)?;
         assert_bits_equal(
             &routed,
-            &generic,
+            &fast,
             &format!("encode_matmul_weight_buffers u6 route ({out_dim}x{in_dim}) batch={batch}"),
         );
     }
@@ -3611,7 +3620,8 @@ fn fast_qmv_u6_reference(
 
     let command_buffer = executor.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
-    let pipeline = if *out_dim % 2 == 0 {
+    let aligned = *out_dim % 8 == 0 && *weight_in_dim % 512 == 0;
+    let pipeline = if aligned {
         &executor.affine_qmv_fast_aligned_u6_gs64_f32
     } else {
         &executor.affine_qmv_fast_u6_gs64_f32
@@ -3624,7 +3634,7 @@ fn fast_qmv_u6_reference(
     encoder.set_buffer(4, Some(&out_buf), 0);
     encoder.set_bytes(5, 16, dims.as_ptr().cast());
     encoder.dispatch_thread_groups(
-        MTLSize::new(batch as u64, (*out_dim as u64).div_ceil(2), 1),
+        MTLSize::new(batch as u64, (*out_dim as u64).div_ceil(if aligned { 8 } else { 2 }), 1),
         MTLSize::new(64, 1, 1),
     );
     encoder.end_encoding();

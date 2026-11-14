@@ -542,7 +542,7 @@ impl MetalExecutor {
                 groups,
                 8,
             )?,
-            AffineMatmulKernel::Fallback | AffineMatmulKernel::QmmNaU8 => self
+            AffineMatmulKernel::Fallback | AffineMatmulKernel::QmmNaDequant => self
                 .encode_resident_affine_fallback(
                     encoder,
                     lhs_buffer,

@@ -795,6 +795,8 @@ impl MetalExecutor {
         let argmax_finalize_f32 = pipeline(&library, &device, "argmax_finalize_f32")?;
         let talker_greedy_argmax_f32 = pipeline(&library, &device, "talker_greedy_argmax_f32")?;
         let f32_to_bf16 = pipeline(&library, &device, "f32_to_bf16")?;
+        let dequant_u5_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u5_to_bf16_t_gs64")?;
+        let dequant_u6_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u6_to_bf16_t_gs64")?;
         let dequant_u8_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u8_to_bf16_t_gs64")?;
         let na_source = sources.na_gemm.as_ref();
         let compile_na = |name: &str| compile_na_gemm_named(&device, na_source, name);
@@ -1020,6 +1022,8 @@ impl MetalExecutor {
             argmax_finalize_f32,
             talker_greedy_argmax_f32,
             f32_to_bf16,
+            dequant_u5_to_bf16_t_gs64,
+            dequant_u6_to_bf16_t_gs64,
             dequant_u8_to_bf16_t_gs64,
             na_gemm_bf16,
             na_gemm_bf16_bn128,
