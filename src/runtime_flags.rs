@@ -2329,17 +2329,44 @@ pub(crate) fn environment_sha256() -> &'static str {
     HASH.get_or_init(|| hash_environment(std::env::vars_os()))
 }
 
+/// Réglages serve purement opérationnels, sans effet sur le contenu des états.
+/// Liste fermée (suffixes communs à SARAGOSSA_ et RETI_) ; les flags inconnus,
+/// le batching et la géométrie des blocs restent dans l'empreinte par prudence.
+const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
+    "SERVE_LOG_PROMPT_FINGERPRINT",
+    "SERVE_LRU",
+    "SERVE_MAX_CONNECTIONS",
+    "SERVE_QUEUE",
+    "SERVE_MAX_INFLIGHT_BYTES",
+    "SERVE_OOM_GUARD",
+    "SERVE_PREFIX_CACHE_BYTES",
+    "SERVE_PREFIX_CACHE_BLOCKS",
+    "SERVE_PREFIX_BLOCKS_PER_SESSION",
+    "SERVE_MODEL_POOL",
+    "SERVE_MEMORY_CAP_BYTES",
+    "SERVE_MEMORY_HEADROOM_BYTES",
+];
+
+fn snapshot_environment_name(name: &[u8]) -> bool {
+    let Some(suffix) = name
+        .strip_prefix(ENV_PREFIX.as_bytes())
+        .or_else(|| name.strip_prefix(LEGACY_ENV_PREFIX.as_bytes()))
+    else {
+        return false;
+    };
+    !suffix.starts_with(b"SERVE_PREFIX_SSD_")
+        && !SNAPSHOT_OPERATIONAL_SERVE_FLAGS
+            .iter()
+            .any(|flag| suffix == flag.as_bytes())
+}
+
 fn hash_environment(
     variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut variables: Vec<_> = variables
         .into_iter()
-        .filter(|(name, _)| {
-            let name = name.as_encoded_bytes();
-            name.starts_with(ENV_PREFIX.as_bytes())
-                || name.starts_with(LEGACY_ENV_PREFIX.as_bytes())
-        })
+        .filter(|(name, _)| snapshot_environment_name(name.as_encoded_bytes()))
         .collect();
     variables.sort_unstable();
     let mut hash = Sha256::new();
@@ -2358,6 +2385,36 @@ fn hash_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_hash_excludes_only_documented_operational_flags() {
+        let base = vec![("SARAGOSSA_RUST_KV_BF16".into(), "1".into())];
+        let expected = hash_environment(base.clone());
+        for prefix in [ENV_PREFIX, LEGACY_ENV_PREFIX] {
+            for suffix in SNAPSHOT_OPERATIONAL_SERVE_FLAGS.iter().copied().chain([
+                "SERVE_PREFIX_SSD_DIR",
+                "SERVE_PREFIX_SSD_GIB",
+                "SERVE_PREFIX_SSD_PRIORITY_TOKENS",
+                "SERVE_PREFIX_SSD_STAGING_MIB",
+            ]) {
+                for value in ["first", "changed"] {
+                    let mut variables = base.clone();
+                    variables.push((format!("{prefix}{suffix}").into(), value.into()));
+                    assert_eq!(hash_environment(variables), expected, "{prefix}{suffix}");
+                }
+            }
+            for suffix in [
+                "RUST_KV_BF16",
+                "SERVE_BATCH",
+                "SERVE_PREFIX_BLOCK_TOKENS",
+                "SERVE_UNKNOWN",
+            ] {
+                let first = hash_environment([(format!("{prefix}{suffix}").into(), "1".into())]);
+                let second = hash_environment([(format!("{prefix}{suffix}").into(), "2".into())]);
+                assert_ne!(first, second, "{prefix}{suffix}");
+            }
+        }
+    }
 
     #[test]
     fn tts_qmm_na_dequant_scope_restores_policy_and_is_thread_local() {

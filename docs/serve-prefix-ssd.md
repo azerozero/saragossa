@@ -57,8 +57,22 @@ binaire, la configuration et les sources du modèle. Les sources comprennent
 le hachage intégral existant est plus strict qu'un échantillonnage de poids.
 Il est effectué au chargement et exclu des mesures de reload/prefill. Les
 métadonnées des sources sont revérifiées avant l'écriture et la restauration.
-Changer de build ou de réglages crée une autre identité ; les anciennes entrées
-incompatibles avec le build/format sont supprimées au démarrage.
+Changer de build ou de réglages numériques crée une autre identité ; les
+anciennes entrées incompatibles avec le build/format sont supprimées au démarrage.
+L'empreinte exclut `SARAGOSSA_SERVE_PREFIX_SSD_*` et leurs alias `RETI_` :
+changer le répertoire, le budget, la priorité ou le staging ne modifie pas l'état.
+Elle exclut également cette liste fermée de suffixes, pour les deux préfixes
+`SARAGOSSA_` et `RETI_` :
+
+- `SERVE_LOG_PROMPT_FINGERPRINT`, `SERVE_LRU`, `SERVE_MODEL_POOL` ;
+- `SERVE_MAX_CONNECTIONS`, `SERVE_QUEUE`, `SERVE_MAX_INFLIGHT_BYTES` ;
+- `SERVE_OOM_GUARD`, `SERVE_MEMORY_CAP_BYTES`, `SERVE_MEMORY_HEADROOM_BYTES` ;
+- `SERVE_PREFIX_CACHE_BYTES`, `SERVE_PREFIX_CACHE_BLOCKS`,
+  `SERVE_PREFIX_BLOCKS_PER_SESSION`.
+
+Ces variables règlent le transport, les diagnostics ou l'admission des caches.
+Par prudence, tout autre flag moteur reste dans la clé, notamment les variables
+inconnues, le batching et `SERVE_PREFIX_BLOCK_TOKENS`.
 
 Chaque blob et le manifeste portent un SHA-256. Avant toute allocation de
 blob, le lecteur valide la clé complète, les dimensions par couche, les
