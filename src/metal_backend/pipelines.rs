@@ -827,6 +827,8 @@ impl MetalExecutor {
         let na_gemm_skinny_u4 = compile_na("gemm_nax_skinny_u4");
         let na_gemm_skinny_u4_x3 = compile_na("gemm_nax_skinny_u4_x3");
         let na_gemm_skinny_u4_x2 = compile_na("gemm_nax_skinny_u4_x2");
+        let na_gemm_skinny_u3_x2 = compile_na("gemm_nax_skinny_u3_x2");
+        let na_gemm_skinny_u2_x2 = compile_na("gemm_nax_skinny_u2_x2");
         #[cfg(test)]
         let na_gemm_coop_qb_grouped = compile_na("gemm_nax_coop_qb_grouped");
         let na_gemm_coop_qb_grouped_gather = compile_na("gemm_nax_coop_qb_grouped_gather");
@@ -1039,6 +1041,8 @@ impl MetalExecutor {
             na_gemm_skinny_u4,
             na_gemm_skinny_u4_x3,
             na_gemm_skinny_u4_x2,
+            na_gemm_skinny_u3_x2,
+            na_gemm_skinny_u2_x2,
             na_gemm_coop_qb_tiled_u4_align64,
             na_gemm_coop_qb_tiled_u4_gate_up_swiglu,
             #[cfg(test)]

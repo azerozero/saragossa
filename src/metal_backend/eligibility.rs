@@ -228,7 +228,7 @@ pub(super) fn can_use_qmm_skinny_buffers(
         && fast_affine_qmv_enabled(out_dim)
         && batch >= qmm_skinny_min_batch()
         && batch < qmm_na_min_batch()
-        && bits == FAST_QMV_BITS
+        && matches!(bits, 2..=FAST_QMV_BITS)
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && out_dim % 32 == 0

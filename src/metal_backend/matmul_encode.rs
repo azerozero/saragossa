@@ -35,15 +35,20 @@ impl MetalExecutor {
         group_size == FAST_QMV_GROUP_SIZE && self.na_gemm_coop_qb_tiled_u4_align64.is_some()
     }
 
-    pub(super) fn qmm_skinny_available(&self) -> bool {
-        self.qmm_skinny_pipeline().is_some()
+    pub(super) fn qmm_skinny_available(&self, bits: usize) -> bool {
+        self.qmm_skinny_pipeline(bits).is_some()
     }
 
-    fn qmm_skinny_pipeline(&self) -> Option<&ComputePipelineState> {
-        match qmm_skinny_kernel() {
-            SkinnyKernel::Bf16 => self.na_gemm_skinny_u4.as_ref(),
-            SkinnyKernel::X3 => self.na_gemm_skinny_u4_x3.as_ref(),
-            SkinnyKernel::X2 => self.na_gemm_skinny_u4_x2.as_ref(),
+    /// u2 et u3 n'ont que la variante x2 (q exact en bf16, A hi+lo) : la portée
+    /// bf16 du drafter DFlash et le choix x3 ne concernent que le u4.
+    fn qmm_skinny_pipeline(&self, bits: usize) -> Option<&ComputePipelineState> {
+        match (bits, qmm_skinny_kernel()) {
+            (2, _) => self.na_gemm_skinny_u2_x2.as_ref(),
+            (3, _) => self.na_gemm_skinny_u3_x2.as_ref(),
+            (4, SkinnyKernel::Bf16) => self.na_gemm_skinny_u4.as_ref(),
+            (4, SkinnyKernel::X3) => self.na_gemm_skinny_u4_x3.as_ref(),
+            (4, SkinnyKernel::X2) => self.na_gemm_skinny_u4_x2.as_ref(),
+            _ => None,
         }
     }
 
@@ -207,8 +212,10 @@ impl MetalExecutor {
             checked_u32(groups, "qmm skinny groups")?,
         ];
         let batch_u32 = [checked_u32(batch, "qmm skinny batch")?];
+        // Le sélecteur garantit K % 512 == 0 : packed_cols = K·bits/32 est exact.
+        let bits = packed_cols * 32 / in_dim.max(1);
         let pso = self
-            .qmm_skinny_pipeline()
+            .qmm_skinny_pipeline(bits)
             .ok_or_else(|| InferError::Config("qmm skinny NA indisponible".into()))?;
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
@@ -218,15 +225,20 @@ impl MetalExecutor {
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &dims, "qmm_skinny_dims")?;
         set_u32_bytes(encoder, 6, &batch_u32, "qmm_skinny_batch")?;
+        let (profile_name, kernel_name) = match bits {
+            2 => ("qmm_skinny_u2_gs64", "qmm_skinny_u2_gs64_f32"),
+            3 => ("qmm_skinny_u3_gs64", "qmm_skinny_u3_gs64_f32"),
+            _ => ("qmm_skinny_u4_gs64", "qmm_skinny_u4_gs64_f32"),
+        };
         profile_dispatch_shape(DispatchProfileShape::matmul(
-            "qmm_skinny_u4_gs64",
+            profile_name,
             batch,
             in_dim,
             out_dim,
             FAST_QMV_GROUP_SIZE,
-            4,
+            bits,
         ));
-        trace_dispatch_path("qmm_skinny_u4_gs64_f32", batch, out_dim, in_dim);
+        trace_dispatch_path(kernel_name, batch, out_dim, in_dim);
         #[cfg(test)]
         SKINNY_DISPATCHES.with(|count| count.set(count.get() + 1));
         profile_dispatch();
