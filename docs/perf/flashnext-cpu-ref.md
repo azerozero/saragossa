@@ -55,6 +55,7 @@ avec le chemin résident.
 ## Oracles et quasi-égalités
 
 Tolérances :
+
 - par couche : norme relative `‖a−b‖/‖b‖` ≤ 1e-4, mesurée sur l'entrée torch de
   la couche précédente (ablation locale) ;
 - logits : KL(oracle‖rust) ≤ 1e-3, en moyenne comme au maximum par token ;
@@ -64,6 +65,7 @@ Les goldens figent les **scores de l'oracle** : logits du routeur et scores de
 l'indexeur pour chaque requête.
 
 Une quasi-égalité n'est admise que si l'oracle la justifie :
+
 - **Expert échangé** : sa probabilité torch doit être au seuil torch du top-k, à
   1e-5 près. Les échanges sont journalisés.
 - **Bloc QSA échangé** : même règle, avec les scores torch. De plus, les scores
@@ -74,6 +76,7 @@ Un test négatif vérifie qu'un indexeur dont les scores Rust sont tous nuls est
 bien rejeté.
 
 Deux passes sont mesurées :
+
 - **Ablation** : la sélection torch est imposée à toute couche QSA. C'est elle
   qui sert de porte sur les sorties.
 - **Passe chaînée native** : sélection propre de l'indexeur, sur l'entrée Rust
@@ -115,6 +118,7 @@ Les goldens viennent de `tools/flashnext/oracle_dump.py` : couches officielles
 `Qwen4ExpTextDecoderLayer`, experts placés dans le module officiel. Avant
 l'inférence, les tests vérifient `provenance.json`, qui contient une entrée par
 golden :
+
 - l'empreinte du golden ;
 - les empreintes de `config.json` et de chaque fichier de poids réellement
   ouvert (shards, MTP, `ngram/meta.json` et la table qu'il désigne),

@@ -6,6 +6,7 @@ la sortie est **identique au bit près** à l'AR glouton. Elle mesure ensuite ce
 que coûterait une vérification en lignes (D) avant d'en écrire le code.
 
 Bilan :
+
 - la tête MTP, résidente, est validée contre une référence CPU et contre
   transformers (A, B) ;
 - le spéculatif exact en pas mono (C) est vert : identité sur 8 prompts × 3
@@ -69,6 +70,7 @@ permutés, gain absent, gain doublé), et l'accord du draft avec le tronc
 | sortie contre transformers | 1e-4 | 1,05e-5 |
 
 Onze mutations rougissent toutes, dont :
+
 - mauvais expert, mauvais bloc ;
 - gain absent ou doublé ;
 - requêtes QSA seules décalées ;
@@ -85,6 +87,7 @@ Tronc inchangé : ABBA à 1k, −0,13 % [−0,52 ; +0,25].
 ## C. Spéculatif exact en pas mono
 
 Un cycle, à profondeur d :
+
 1. `D_1 = MTP(h_p, y)` sur la ligne vérifiée `p`, puis
    `D_i = MTP(h'_{i-1}, D_{i-1})` ;
 2. `verify([y, D_1 … D_d])` : R = d + 1 pas mono dans **un** command buffer,
@@ -109,6 +112,7 @@ invalide au contraire la session : tout pas et toute troncature sont refusés
 jusqu'à un `reset` ou une reprise réussis. L'erreur d'origine est remontée.
 
 Conventions alignées sur l'AR :
+
 - **arrêt** : comme en AR ;
 - **dernier jeton émis** : jamais consommé par le tronc. Un cycle émet au plus
   le budget restant moins un jeton.
@@ -134,6 +138,7 @@ restauration et la réhabilitation par `reset`.
 Les 24 sorties sont identiques à l'AR, jetons et résiduels compris. L'état
 final du tronc l'est aussi : position, KV, états DeltaNet, indexeur et PLE.
 Cette empreinte d'état est contrôlée sur chacun des cas limites suivants :
+
 - rejet forcé : 0 draft accepté sur 63 cycles ;
 - arrêt sur un draft accepté et sur un draft rejeté ;
 - acceptation complète forcée (drafts = jetons AR), budgets 2 à 8 : les
@@ -150,6 +155,7 @@ Le dernier cycle est désormais réduit à `restant − 2` drafts, pour que le
 dernier jeton émis ne soit pas consommé.
 
 **Oracles de l'historique MTP.**
+
 - **`D_1`.** Le draft `D_1` de chaque cycle est contrôlé contre un rejeu
   séquentiel des paires AR. Aucun écart sur 100 cycles (golden 512) ni sur 80
   cycles (code4k-1). Cet oracle a ses limites :
@@ -237,6 +243,7 @@ aucune option ne dépasse ×1,2 en code à profondeur 3 dans l'hypothèse
 réaliste.
 
 **Formule.** `gain = n / [ρ(R) + m·T_mtp/T_ar + h]`, avec :
+
 - n les jetons par cycle mesurés en C ;
 - m = d + n − 1 pas MTP par cycle (d drafts, puis n − 1 paires reconstruites),
   soit n + 2 à profondeur 3 ;
@@ -249,6 +256,7 @@ Décision sur le code à profondeur 3 : n = 3,20, R = 4.
 
 **Hypothèse réaliste** (chaque facteur est mesuré, sauf le travail du reste, qui
 est sans amortissement faute de kernel en lignes) :
+
 - **matmuls à poids** : ρ(R) strict mesuré par forme, sur des poids distincts
   lus depuis la DRAM ;
 - **hc Down** : temps mono du split-K de production, multiplié par le ρ(R) du
@@ -271,10 +279,12 @@ est sans amortissement faute de kernel en lignes) :
 
 **Hypothèse optimiste** : comme la réaliste, avec deux exceptions supposées et
 non mesurées :
+
 - travail du reste × 1,2 ;
 - argmax de tête par un qmv-T u6 exact, à écrire, au ρ(R) du `q_proj`.
 
 **Borne basse** (kernels en lignes idéaux partout) :
+
 - tout ce qui n'est pas un expert routé est à ρ = 1 : lecture unique et calcul
   gratuit ;
 - experts routés à `Σ_m N_m / 10`, soit les experts distincts lus une fois.
@@ -285,6 +295,7 @@ lit son état une seule fois pour R lignes. L'état fait 36 couches × 48 têtes
 travail × R.
 
 **Options :**
+
 - D complet ;
 - draft sur sous-vocabulaire seul : 32k jetons de vocabulaire de draft, le
   `lm_head` du pas MTP mis à l'échelle 32 000 / 248 320, acceptation supposée
@@ -302,6 +313,7 @@ réaliste.
 contexte : 36 et 48 couches distinctes, donc lues depuis la DRAM comme en
 decode. Chaque mesure est faite sur toutes les couches dans un command buffer,
 après une chauffe, au minimum de 3.
+
 - **DeltaNet.**
   - `T_dn(1)` : les 36 couches résidentes
     (`encode_linear_attn_resident_dense_buffers`), sur leurs vrais états.
@@ -327,6 +339,7 @@ après une chauffe, au minimum de 3.
   réalistes de la re-mesure (commit c96e469).
 
 **(2) Acceptation d'un draft sur sous-vocabulaire.**
+
 - **Sous-vocabulaire.** V_sub = les 32 000 jetons les plus fréquents, ou tous
   les jetons vus s'il y en a moins, plus EOS. Corpus : wikitext `corpus32k`,
   `code4k-2`, `code4k-3` et `chat-1` à `chat-6` (fixtures `rowsexact`), tous
@@ -378,12 +391,14 @@ sont les `ρ_expert(m)` du facteur des experts.
 **Chevauchement des experts** (`tools/flashnext/expert_overlap.py`, golden long,
 48 couches × 4096 positions). Experts distincts parmi les top-10 de R jetons
 consécutifs :
+
 - R = 2 : 16,84 sur 20 ;
 - R = 3 : 22,67 sur 30 ;
 - R = 4 : 27,93 sur 40, de multiplicité N_1 = 19,54, N_2 = 5,55, N_3 = 2,00,
   N_4 = 0,84.
 
 Facteur des experts à R = 4 :
+
 - gate/up 3,47, down 2,94, pondéré 3,29 ;
 - union seule (Σ N_m / 10) : 2,79.
 
@@ -494,6 +509,7 @@ cycle.
 | pour mémoire : C actuel, mesuré | ×0,665 | ×0,53 |
 
 **Changement de poste entre db5635c et e5ef5b6, à déclarer.**
+
 - En db5635c, le MoE réaliste était l'union des experts, au facteur mesuré de
   3,29. En e5ef5b6, il est devenu le kernel en lignes existant, mesuré (s'il
   est exact), soit ×3,84.
@@ -521,6 +537,7 @@ l'acceptation mesurée. La décision ne porte que sur la première ligne.
 | reste DeltaNet in situ nul (borne de son biais) | 2,61 | ×0,92 | ×0,87 | ×0,76 | ×0,62 |
 
 Construction des lignes du tableau :
+
 - **Borne basse** : les experts routés sont pris à 7,92 / 9,76 de la brique MoE,
   leur part dans les micro-bench. Ils sont comptés à Σ N_m / 10 = 2,79, le
   reste de la brique à ρ = 1.
@@ -541,6 +558,7 @@ Construction des lignes du tableau :
   qui exclut un argmax incorrect peut au contraire améliorer l'acceptation.
 
 **Limites des mesures in situ.**
+
 - **DeltaNet.** Le reste (0,89 ms) est une estimation par soustraction, sur des
   entrées synthétiques ; les états avancent entre les répétitions.
   - Les matmuls soustraits sont ceux des poids séparés (`qkv_z`, `beta_gate`,
