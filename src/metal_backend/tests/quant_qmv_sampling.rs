@@ -2582,8 +2582,16 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
         let biases =
             executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), "qmm_u6_biases")?;
         let buffers = executor.resolve_linear_weight_buffers(&owned_weight, "qmm_u6_weight")?;
+        // Les batchs ci-dessous sont des préfixes des mêmes 33 lignes : cet
+        // oracle CPU couvre chaque forme, pas seulement les batchs du test QMV.
+        let cpu = Tensor::from_vec(
+            vec![33, in_dim],
+            (0..33).flat_map(|row| varied_row(in_dim, 53 + row)).collect(),
+        )?
+        .matmul_rhs_t(&weight.dequantize()?)?;
         // Toutes les queues de tuile, plusieurs tuiles et des sorties impaires.
         for batch in [1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 31, 32, 33] {
+            let cpu_expected = &cpu.data()[..batch * out_dim];
             assert!(can_use_fast_affine_qmv_u6_buffers(
                 batch, in_dim, out_dim, 64, 6
             ));
@@ -2677,11 +2685,16 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                         assert_eq!(take_dispatch_shapes_for_test(), [dispatch], "{context}");
                         let actual = read_f32_buffer(&output, batch * out_dim)?;
                         if kind == "affine_qmv_u6_aligned_gs64" {
-                            // Même association affine et epsilon que u4 align64.
+                            // Le kernel vectorisé somme 16/32 produits par lane
+                            // avant scale/bias et la réduction SIMD : l'ordre de
+                            // sommation f32 diffère du générique scalaire. Seule
+                            // cette comparaison utilise 1e-3 (comme u4 align64) ;
+                            // l'oracle CPU ci-dessous garde 1e-5 de l'échelle.
                             assert_close_eps(&actual, &expected, 1.0e-3);
                         } else {
                             assert_exact(&actual, &expected, &context);
                         }
+                        assert_all_close_scaled(&actual, cpu_expected, &context);
                     }
 
                     // L'API Tensor alloue sa propre sortie neuve à chaque appel.
@@ -2693,10 +2706,13 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                         "{context}, API Tensor, flag={enabled}"
                     );
                     if kind == "affine_qmv_u6_aligned_gs64" {
+                        // Même ordre vectorisé que les routes owned/résidente ;
+                        // la comparaison CPU stricte couvre aussi cette API.
                         assert_close_eps(direct.data(), &expected, 1.0e-3);
                     } else {
                         assert_exact(direct.data(), &expected, &context);
                     }
+                    assert_all_close_scaled(direct.data(), cpu_expected, &context);
                     Ok(())
                 })?;
             }
@@ -2727,7 +2743,10 @@ fn affine_qmv_u6_gs64_matches_generic_and_routes() -> Result<()> {
         let generic =
             generic_affine_reference(&executor, &weight, &lhs, batch, "qmv_u6_generic_ref")?;
         let fast = fast_qmv_u6_reference(&executor, &weight, &lhs, batch, "qmv_u6_fast_ref")?;
-        // Regroupement affine identique à u4 ; epsilon u4 align64 inchangé.
+        // Le kernel aligné vectorisé somme 16/32 produits par lane avant
+        // scale/bias puis réduit les lanes SIMD : cet ordre de sommation f32
+        // diffère du générique scalaire. Epsilon absolu 1e-3 comme u4 align64 ;
+        // le CPU juste après garde 1e-5 de l'échelle sur les mêmes N/K/batch.
         if out_dim % 8 == 0 && in_dim % 512 == 0 {
             assert_close_eps(&fast, &generic, 1.0e-3);
         } else {
