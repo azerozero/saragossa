@@ -69,6 +69,14 @@ fn metrics(logits: &[f32], step: &Step) -> (f64, f64) {
     (kl, delta)
 }
 
+/// Seuils calibrés dans tools/goldens/README.md (« Calibration des seuils KL et Δp »).
+const MAX_KL21: f64 = 0.02;
+const MAX_DELTA_P: f64 = 0.05;
+
+fn metric_failure(kl: f64, delta: f64) -> bool {
+    kl > MAX_KL21 || delta > MAX_DELTA_P
+}
+
 const FLOAT32_MODELS: [&str; 2] = ["gemma4", "qwen36_moe"];
 
 fn load_fixture(name: &str, float32: bool) -> TestResult<Fixture> {
@@ -152,7 +160,7 @@ fn external_logits_metrics_detect_tail_and_top_errors() {
     let mut changed = logits;
     changed[20] = 2.0;
     let (kl, delta) = metrics(&changed, &step);
-    assert!(kl > 0.02 && delta > 0.02);
+    assert!(kl > MAX_KL21 && delta > MAX_DELTA_P);
 }
 
 enum Comparison {
@@ -213,12 +221,13 @@ fn compare(name: &str, env: &str, comparison: Comparison) -> TestResult {
             let margin = step.logprobs[0] - step.logprobs[1];
             let mismatch = actual != step.token;
             mismatches += usize::from(mismatch);
-            metric_failures += usize::from(kl > 0.02 || delta > 0.02);
+            let failed = metric_failure(kl, delta);
+            metric_failures += usize::from(failed);
             near_ties += usize::from(margin <= 0.01);
             max_kl = max_kl.max(kl);
             max_delta = max_delta.max(delta);
             eprintln!("{stem}/{case_index}/{index}: greedy={actual}/{} mismatch={mismatch} margin={margin:.6} near_tie={} KL21={kl:.6} delta_p={delta:.6}", step.token, margin <= 0.01);
-            if actual != step.token || kl > 0.02 || delta > 0.02 {
+            if mismatch || failed {
                 failures.push(format!("{case_index}/{index}: greedy={actual}/{} margin={margin} near_tie={} KL21={kl} delta_p={delta}", step.token, margin <= 0.01));
             }
             // Même préfixe : une divergence ne doit pas polluer toutes les mesures suivantes.

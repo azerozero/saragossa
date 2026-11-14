@@ -195,8 +195,35 @@ Les oracles stricts (qwen38, gemma3 et les deux contrôles float32) exigent
 l'argmax exact et affichent sa marge log-p top1/top2 ; une marge
 ≤ 0,01 est signalée `near_tie`, sans masquer l'échec. La KL est calculée sur
 21 catégories (top-20 référence + masse restante), seuil 0,02 nat ; le maximum
-Δp sur cette partition doit être ≤ 0,02. Ce n'est pas la KL complète du vocabulaire.
-Ces seuils sont provisoires, non validés par une exécution GPU.
+Δp sur cette partition doit être ≤ 0,05. Ce n'est pas la KL complète du vocabulaire.
+Les seuils font foi dans `src/golden/logits.rs` (`MAX_KL21`, `MAX_DELTA_P`) ;
+le champ `tolerance` des captures antérieures au 13 nov. 2026 garde l'ancien
+texte provisoire (Δp ≤ 0,02).
+
+### Calibration des seuils KL et Δp
+
+Mesure du 13 nov. 2026. Le seuil Δp provisoire de 0,02 n'avait jamais été
+validé sur GPU. Le gate est par pas, sans échec toléré sur 96 : seul le
+maximum compte. La preuve directe vient des modèles denses conformes :
+
+| comparaison | mismatches | KL21 max | Δp max |
+|---|---|---|---|
+| saragossa / mlx bf16, qwen38 | 0/96 | 0,0017 | 0,028 |
+| saragossa / mlx bf16, gemma3 | 1/96 (near-tie) | 0,0033 | 0,039 |
+
+Ordre de grandeur attendu : avec tous les logits arrondis à ±½ ulp bf16
+(0,0625 pour |logit| ∈ [16, 32[), une probabilité bouge d'au plus δ/2 ≈ 0,031,
+et la comparaison cumule deux chemins bf16 (saragossa et mlx). Le seuil
+`MAX_DELTA_P = 0,05` garde environ 28 % de marge sur le pire mesuré.
+
+Repère indirect : la capture mlx bf16 de Qwen3.6 MoE s'écarte de sa propre
+capture float32 avec Δp p50 0,0045, p95 0,037, max 0,22 et KL21 p95 0,0077
+(82 pas à préfixe commun, `reference_noise.py qwen36_moe`). Ce modèle est un
+MoE à routage bruité. Le script borne par le haut la probabilité f32 des
+70 ids (sur 1 640) absents du top-20 f32, ce qui biaise sa KL vers le bas.
+Gemma 4 n'entre pas dans la calibration (p95 Δp 0,41, quasi-égalités de
+routage). La KL reste à 0,02 : les modèles conformes sont 6 à 12 fois en
+dessous. L'argmax exact reste exigé, near-tie compris.
 
 Les comparaisons bf16 de Gemma 4 et Qwen3.6 MoE deviennent des rapports
 d'écarts connus : chaque pas affiche `mismatch`, `near_tie`, `KL21` et
@@ -205,6 +232,56 @@ maxima KL/Δp. Elles échouent si les mismatches dépassent respectivement
 7/96 et 2/96. KL et Δp restent mesurées aux mêmes seuils, mais ne bloquent
 pas ces deux rapports. Les erreurs de lecture, de provenance ou d'exécution
 restent des échecs. Une amélioration du nombre de mismatches est acceptée.
+
+## KL sur corpus
+
+Protocole inspiré de `llama-perplexity --kl-divergence` et du test par ratio
+du guide de précision vLLM d'AWS Neuron. `kld.py` note 2 048 positions :
+8 morceaux de 512 tokens de `kld/corpus.txt`, un extrait du domaine public
+(Project Gutenberg n°1661, « A Scandal in Bohemia »), dont les 256 dernières
+positions de chaque morceau sont notées. La référence est mlx-lm float32 ;
+chaque position garde le top-64 et la masse restante. Le même script mesure
+mlx-lm bf16 contre cette référence : c'est le bruit propre de la précision
+bf16, stocké dans `kld/<modèle>_meta.json`.
+
+L'oracle Rust (`golden::kld`, prefill de 256 tokens puis decode token par
+token) échoue si la KL moyenne ou le Δp p99 de saragossa dépasse 1,5 fois
+celui de mlx-lm bf16, ou si son taux de même top-1 est inférieur à celui de
+mlx-lm bf16. Ce critère ne demande aucun seuil absolu choisi à la main.
+
+Gemma 4 : la référence float32 applique l'échelle d'embedding canonique
+(√hidden arrondi en bf16, comme transformers et mlx-lm Gemma 3 ; mlx-lm
+Gemma 4 garde sinon la valeur exacte en float32). Même ainsi, mlx-lm bf16 et
+float32 ne s'accordent que sur 80 % des top-1, contre 98 à 99 % ailleurs :
+ce modèle est très sensible à la précision et les ratios y bornent peu.
+Réarrondir en bf16 un seul composant de la référence float32 (entrée ou
+poids du routeur, attention, MLP, experts ou résiduel) suffit à ramener
+l'accord à 86-90 %.
+
+**Gemma 4 sur texte brut (13 nov. 2026).** Sur le corpus, mlx-lm donne une
+perplexité d'au moins 533 (Qwen3.8 : 2), et les greedy bruts des goldens
+bouclent, alors que le chat répond juste. Arbitré contre les poids Google bf16
+dans transformers 5.22.2 : perplexité d'environ 10⁵ sur le même corpus, sur
+CPU comme sur MPS, et « The capital of France is » → « a bit is a bit is… » ;
+le chat répond « Paris ». C'est donc le modèle instruct qui ne prédit pas le
+texte brut, pas un bug commun à mlx-lm et saragossa. L'oracle Gemma 4 sur ce
+corpus vérifie l'accord avec mlx-lm, pas la qualité ; la perte de
+quantification se mesure en régime chat (tools/quant/README.md, section
+Gemma 4).
+
+Mesure du 13 nov. 2026 (M5 Max) :
+
+| modèle | même top-1, saragossa | même top-1, mlx bf16 | KL moy. saragossa | KL moy. mlx bf16 | ratio KL | ratio Δp p99 |
+|---|---|---|---|---|---|---|
+| qwen38 (u4ls) | 99,95 % | 98,88 % | 0,000044 | 0,0016 | 0,03 | 0,18 |
+| gemma3 | 100 % | 97,85 % | 0,0000077 | 0,0016 | 0,005 | 0,08 |
+| qwen36_moe | 98,19 % | 97,71 % | 0,010 | 0,022 | 0,45 | 0,76 |
+| gemma4 | 85,84 % | 80,03 % | 0,23 | 0,43 | 0,52 | 0,88 |
+
+```sh
+SARAGOSSA_GOLDEN_CAPTURE=1 python -I tools/goldens/kld.py --model qwen38
+cargo test --release --all-features --lib golden::kld::external_kld_ -- --ignored --test-threads=1 --nocapture
+```
 
 ## Exécuter les comparaisons
 

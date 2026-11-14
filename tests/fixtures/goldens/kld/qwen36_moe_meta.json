@@ -1,0 +1,30 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    18793
+  ],
+  "source": {
+    "model": "Qwen3.6-35B-A3B-4bit",
+    "path": "${SARAGOSSA_QWEN36_MOE_DIR}",
+    "snapshot": null,
+    "sha256": {
+      "config.json": "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767",
+      "tokenizer.json": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
+      "tokenizer_config.json": "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182",
+      "chat_template.jinja": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+      "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+    },
+    "versions": {
+      "transformers": "5.22.2",
+      "tokenizers": "0.23.3",
+      "jinja2": "3.1.6",
+      "mlx": "0.32.4",
+      "mlx-lm": "0.32.2"
+    },
+    "float32_control": true
+  },
+  "tolerance": "ratio au bruit mlx bf16 / f32, voir README",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-13",
+  "payload_sha256": "f6bcf2dcf2ab2042ea86d1c2d88e4a8e6b49f03a561e78c7151de6b2cb9eec71"
+}

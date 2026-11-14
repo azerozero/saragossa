@@ -1,0 +1,33 @@
+{
+  "dtype": "f32",
+  "shape": [
+    2048,
+    2,
+    64
+  ],
+  "source": {
+    "model": "mlx-community/gemma-3-4b-it-4bit",
+    "path": "${SARAGOSSA_GEMMA3_DIR}",
+    "snapshot": "93724907d4ed1745d2fe50baadf3b0b01a65abf2",
+    "sha256": {
+      "config.json": "5ccdde91da736e6e6f8f138268c620adcbf1219c973b884240b719a54122465b",
+      "tokenizer.json": "4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795",
+      "tokenizer_config.json": "0d95398b39395e5cfb290683a78f3fb0551223c672d8b033333c1a5307473760",
+      "chat_template.json": "fe16baf728db49457cde32802cd7efc0ac8a7a9877dbe22fe3322b2d9dc6ccd9",
+      "generation_config.json": "e04ecb65db447404710114fb282baaac482d22a95e2244ecaab428b81672ba78"
+    },
+    "versions": {
+      "transformers": "5.22.2",
+      "tokenizers": "0.23.3",
+      "jinja2": "3.1.6",
+      "mlx": "0.32.4",
+      "mlx-lm": "0.32.2"
+    },
+    "float32_control": true
+  },
+  "tolerance": "ratio au bruit mlx bf16 / f32, voir README",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-13",
+  "payload_sha256": "bb7e4d1ddfcba1fdda473030f4bc58cbf3d415f76b2a0e6b63972f55713c50f9",
+  "layout": "par position : K ids (entiers exacts en f32) puis K logprobs float32"
+}
