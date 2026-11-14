@@ -14,6 +14,6 @@ regexes = ['''(?i)(value_head_dim|key_head_dim|head_dim)\s*=\s*\d+''']
 [[allowlists]]
 description = "SHA256 des tokenizers des références externes"
 condition = "AND"
-paths = ['''^tests/fixtures/goldens/(chat_templates|embedder|whisper|logits)/[^/]+\.json$''']
+paths = ['''^tests/fixtures/goldens/(chat_templates|embedder|whisper|logits|kld)/[^/]+\.json$''']
 regexTarget = "line"
 regexes = ['''^\s*"tokenizer(_config)?\.json": "[0-9a-f]{64}",?\s*$''']
