@@ -55,3 +55,110 @@ fn topk_corrupt_hidden_never_exports_sentinel() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn qmv_barriers_have_no_lane_dependent_return() {
+    // Une exécution GPU d'une barrière divergente a un comportement indéfini :
+    // contrôler le contrat avant de lancer les oracles de queues partielles.
+    let source = include_str!("../../kernels.metal");
+    for name in [
+        "affine_qmv_rms_fast_u4_gs64_f32",
+        "affine_qmv_rms_fast_u8_gs64_f32",
+        "affine_qmv_rms_fast_u8_gs128_f32",
+        "affine_qkv_split_rms_qmv_fast_u4_gs64_f32",
+        "affine_qkv_split_rms_qmv_fast_u3_gs64_f32",
+        "affine_qkv_split_rms_qmv_fast_u8_gs64_f32",
+        "affine_argmax_qmv_fast_u4_gs64_f32",
+    ] {
+        let body = source.split(&format!("kernel void {name}(")).nth(1).expect("kernel");
+        let prologue = body.split("threadgroup_barrier").next().expect("barrier");
+        assert!(!prologue.contains("return;"), "{name}: sortie avant barrière");
+    }
+}
+
+#[test]
+fn qmv_rms_partial_groups_match_exact_oracle() -> Result<()> {
+    let Some(executor) = test_executor()? else { return Ok(()); };
+    for (pipeline, bits, gs, split) in [
+        (&executor.affine_qmv_rms_fast_u4_gs64_f32, 4, 64, false),
+        (&executor.affine_qmv_rms_fast_u8_gs64_f32, 8, 64, false),
+        (&executor.affine_qmv_rms_fast_u8_gs128_f32, 8, 128, false),
+        (&executor.affine_qkv_split_rms_qmv_fast_u4_gs64_f32, 4, 64, true),
+        (&executor.affine_qkv_split_rms_qmv_fast_u3_gs64_f32, 3, 64, true),
+        (&executor.affine_qkv_split_rms_qmv_fast_u8_gs64_f32, 8, 64, true),
+    ] {
+        for n in 1usize..=17 {
+            let k = 512;
+            let packed_cols = k * bits / 32;
+            let lhs = executor.buffer_from_slice(&vec![1.0f32; k], "tail_lhs")?;
+            let packed = executor.buffer_from_slice(&vec![0u32; n * packed_cols], "tail_packed")?;
+            let scales = executor.buffer_from_f32_as_bf16(&vec![0.0; n * k / gs], "tail_scales")?;
+            let biases = executor.buffer_from_f32_as_bf16(&vec![-1.0; n * k / gs], "tail_biases")?;
+            let out = executor.buffer_from_slice(&vec![123.0f32; n + 8], "tail_out")?;
+            let q = executor.buffer_from_slice(&[123.0f32; 9], "tail_q")?;
+            let gate = executor.buffer_from_slice(&[123.0f32; 9], "tail_gate")?;
+            let cb = executor.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            for (slot, buf) in [&lhs, &lhs, &packed, &scales, &biases, &out].iter().enumerate() {
+                enc.set_buffer(slot as u64, Some(buf), 0);
+            }
+            let dims_slot = if split { 8 } else { 6 };
+            set_u32_bytes(enc, dims_slot, &[n as u32, k as u32, packed_cols as u32, (k / gs) as u32], "tail_dims")?;
+            if split {
+                enc.set_buffer(6, Some(&q), 0);
+                enc.set_buffer(7, Some(&gate), 0);
+                set_u32_bytes(enc, 9, &[1, 1], "tail_q_dims")?;
+            }
+            set_f32_bytes(enc, if split { 10 } else { 7 }, &[0.0], "tail_eps")?;
+            enc.dispatch_thread_groups(MTLSize::new(1, n.div_ceil(8) as u64, 1), MTLSize::new(64, 1, 1));
+            enc.end_encoding();
+            commit_and_wait(cb)?;
+            let result = read_f32_buffer(&out, n + 8)?;
+            for (row, value) in result.iter().enumerate() {
+                let expected = if row < n && (!split || row >= 2) { -512.0 } else { 123.0 };
+                assert_eq!(*value, expected, "bits={bits}, gs={gs}, split={split}, N={n}, row={row}");
+            }
+            if split {
+                assert_eq!(read_f32_buffer(&q, 9)?, [&[-512.0][..], &[123.0; 8]].concat());
+                let first = if n >= 2 { -512.0 } else { 123.0 };
+                assert_eq!(read_f32_buffer(&gate, 9)?, [&[first][..], &[123.0; 8]].concat());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn qmv_argmax_partial_groups_ignore_padding() -> Result<()> {
+    let Some(executor) = test_executor()? else { return Ok(()); };
+    for n in 1usize..=17 {
+        let k = 512;
+        let lhs = executor.buffer_from_slice(&vec![1.0f32; k], "argmax_tail_lhs")?;
+        let packed = executor.buffer_from_slice(&vec![0u32; n * k / 8], "argmax_tail_packed")?;
+        let scales = executor.buffer_from_f32_as_bf16(&vec![0.0; n * k / 64], "argmax_tail_scales")?;
+        let biases = executor.buffer_from_f32_as_bf16(&vec![-1.0; n * k / 64], "argmax_tail_biases")?;
+        let groups = n.div_ceil(8);
+        let values = executor.buffer_from_slice(&vec![123.0f32; groups + 1], "argmax_tail_values")?;
+        let indices = executor.buffer_from_slice(&vec![123u32; groups + 1], "argmax_tail_indices")?;
+        let cb = executor.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&executor.affine_argmax_qmv_fast_u4_gs64_f32);
+        for (slot, buf) in [&lhs, &packed, &scales, &biases, &values, &indices].iter().enumerate() {
+            enc.set_buffer(slot as u64, Some(buf), 0);
+        }
+        set_u32_bytes(enc, 6, &[n as u32, k as u32, (k / 8) as u32, (k / 64) as u32], "argmax_tail_dims")?;
+        enc.dispatch_thread_groups(MTLSize::new(1, groups as u64, 1), MTLSize::new(64, 1, 1));
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let values = read_f32_buffer(&values, groups + 1)?;
+        let indices = read_u32_buffer(&indices, groups + 1)?;
+        for group in 0..groups {
+            assert_eq!(values[group], -512.0, "N={n}");
+            assert_eq!(indices[group], (group * 8) as u32, "N={n}");
+        }
+        assert_eq!(values[groups], 123.0);
+        assert_eq!(indices[groups], 123);
+    }
+    Ok(())
+}

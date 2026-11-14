@@ -6979,9 +6979,8 @@ kernel void affine_qmv_rms_fast_u4_gs64_f32(
     const uint block_size = values_per_thread * 32u;
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
-    if (row_base >= out_dim) {
-        return;
-    }
+    // Tous les simdgroups participent à la barrière, même sans ligne valide.
+    // Les lectures de poids et les écritures sont masquées par out_dim.
 
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
@@ -7127,20 +7126,22 @@ kernel void affine_qmv_rms_fast_u8_gs64_f32(
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
-            const device uint* row_words = ws + row * packed_cols;
-            float accum = 0.0f;
-            for (uint word = 0u; word < words_per_thread; ++word) {
-                const uint packed_word = row_words[word * 32u];
-                const uint group = (simd_lid + word * 32u) / 16u;
-                const float scale = scale_base[row * groups + group];
-                const float bias = bias_base[row * groups + group];
-                const uint base = word * values_per_word;
-                    accum += xt[base] * ((float(packed_word & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+            if (row_base + row < out_dim) {
+                const device uint* row_words = ws + row * packed_cols;
+                float accum = 0.0f;
+                for (uint word = 0u; word < words_per_thread; ++word) {
+                    const uint packed_word = row_words[word * 32u];
+                    const uint group = (simd_lid + word * 32u) / 16u;
+                    const float scale = scale_base[row * groups + group];
+                    const float bias = bias_base[row * groups + group];
+                    const uint base = word * values_per_word;
+                        accum += xt[base] * ((float(packed_word & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+                }
+                result[row] += accum;
             }
-            result[row] += accum;
         }
 
         ws += words_per_block;
@@ -7152,7 +7153,7 @@ kernel void affine_qmv_rms_fast_u8_gs64_f32(
 
     for (uint row = 0u; row < results_per_simdgroup; ++row) {
         const float reduced = simd_sum(result[row]);
-        if (simd_lid == 0u) {
+        if (simd_lid == 0u && row_base + row < out_dim) {
             out[tile.x * out_dim + row_base + row] = reduced;
         }
     }
@@ -7227,20 +7228,22 @@ kernel void affine_qmv_rms_fast_u8_gs128_f32(
         }
 
         for (uint row = 0u; row < results_per_simdgroup; ++row) {
-            const device uint* row_words = ws + row * packed_cols;
-            float accum = 0.0f;
-            for (uint word = 0u; word < words_per_thread; ++word) {
-                const uint packed_word = row_words[word * 32u];
-                const uint group = (simd_lid + word * 32u) / 32u;
-                const float scale = scale_base[row * groups + group];
-                const float bias = bias_base[row * groups + group];
-                const uint base = word * values_per_word;
-                    accum += xt[base] * ((float(packed_word & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
-                    accum += xt[base + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+            if (row_base + row < out_dim) {
+                const device uint* row_words = ws + row * packed_cols;
+                float accum = 0.0f;
+                for (uint word = 0u; word < words_per_thread; ++word) {
+                    const uint packed_word = row_words[word * 32u];
+                    const uint group = (simd_lid + word * 32u) / 32u;
+                    const float scale = scale_base[row * groups + group];
+                    const float bias = bias_base[row * groups + group];
+                    const uint base = word * values_per_word;
+                        accum += xt[base] * ((float(packed_word & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 1u] * ((float((packed_word >> 8u) & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 2u] * ((float((packed_word >> 16u) & 0x000000ffu) * scale) + bias);
+                        accum += xt[base + 3u] * ((float((packed_word >> 24u) & 0x000000ffu) * scale) + bias);
+                }
+                result[row] += accum;
             }
-            result[row] += accum;
         }
 
         ws += words_per_block;
@@ -7252,7 +7255,7 @@ kernel void affine_qmv_rms_fast_u8_gs128_f32(
 
     for (uint row = 0u; row < results_per_simdgroup; ++row) {
         const float reduced = simd_sum(result[row]);
-        if (simd_lid == 0u) {
+        if (simd_lid == 0u && row_base + row < out_dim) {
             out[tile.x * out_dim + row_base + row] = reduced;
         }
     }
@@ -7290,9 +7293,8 @@ kernel void affine_qkv_split_rms_qmv_fast_u4_gs64_f32(
     const uint block_size = values_per_thread * 32u;
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
-    if (row_base >= out_dim) {
-        return;
-    }
+    // Tous les simdgroups participent à la barrière, même sans ligne valide.
+    // Les lectures de poids et les écritures sont masquées par out_dim.
 
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
@@ -7409,9 +7411,8 @@ kernel void affine_qkv_split_rms_qmv_fast_u3_gs64_f32(
     const uint block_size = values_per_thread * 32u;
     const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
-    if (row_base >= out_dim) {
-        return;
-    }
+    // Tous les simdgroups participent à la barrière, même sans ligne valide.
+    // Les lectures de poids et les écritures sont masquées par out_dim.
 
     threadgroup float inv_rms_shared;
     float sumsq = 0.0f;
@@ -7802,9 +7803,8 @@ kernel void affine_argmax_qmv_fast_u4_gs64_f32(
     const uint packed_cols = dims.z;
     const uint groups = dims.w;
     const uint row_base = tile.y * 8u + simd_gid * 4u;
-    if (row_base >= out_dim) {
-        return;
-    }
+    // Tous les simdgroups participent à la barrière, même sans ligne valide.
+    // Les lectures de poids et les écritures sont masquées par out_dim.
 
     const uint row_bytes = packed_cols * 4u;
     const uint scale_step_per_thread = 4u;
@@ -7859,7 +7859,7 @@ kernel void affine_argmax_qmv_fast_u4_gs64_f32(
         const uint out_row = row_base + row;
         const float reduced = simd_sum(result[row]);
         if (simd_lid == 0u) {
-            group_values[index] = (out_row < out_dim) ? reduced : -3.402823466e38f;
+            group_values[index] = (out_row < out_dim) ? reduced : -INFINITY;
             group_indices[index] = out_row;
         }
     }
