@@ -190,8 +190,8 @@ class Matrix:
         body = self.chat_body(response_format={"type": "json_object"})
         body["messages"] = [{"role": "user", "content": 'Return a JSON object with a greeting: "Bonjour".'}]
         value = self.complete(body)
-        obj = json.loads(self.output(value))
-        c.require(type(obj) is dict and obj.get("greeting") == "Bonjour", "objet JSON/contenu attendu")
+        # json_object garantit un objet JSON, pas son contenu : `{}` est conforme.
+        c.require(type(json.loads(self.output(value))) is dict, "objet JSON attendu")
 
     def unsupported_request(self, option):
         if option == "json_schema":
