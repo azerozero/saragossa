@@ -11,6 +11,8 @@ on:
       - "Cargo.lock"
       - "release-plz.toml"
       - ".github/workflows/release-plz.yml"
+  # Permet de préparer une release sans nouveau push correspondant aux filtres.
+  workflow_dispatch:
   pull_request:
     types: [closed]
     branches: [main]
@@ -22,7 +24,7 @@ permissions:
 jobs:
   release-pr:
     name: Create release PR
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
@@ -45,8 +47,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-  publish:
-    name: Publish crate and tag
+  release-tag:
+    name: Tag release
     if: >-
       github.event_name == 'pull_request'
       && github.event.pull_request.merged == true
@@ -54,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
-      group: release-plz-publish
+      group: release-plz-tag
       cancel-in-progress: false
     steps:
       # Passer à block après validation des endpoints release-plz dans les logs d'audit.
@@ -67,10 +69,9 @@ jobs:
           ref: main
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish release
+      - name: Tag release
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
