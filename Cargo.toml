@@ -49,7 +49,7 @@ rayon = "1"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 rustfft = "6"
 hound = "3.5"
-md5 = "0.7"
+md5 = "0.8"
 sha2 = "0.10"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
 
