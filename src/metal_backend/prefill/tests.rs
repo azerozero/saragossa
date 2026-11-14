@@ -1151,6 +1151,19 @@ fn assert_full_kv_bf16_of(
 /// bit-identiques et vaut l'arrondi du K/V f32.
 #[test]
 fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
+    check_prefill_resident_chunks::<16, 2, 256>()
+}
+
+#[test]
+fn prefill_resident_d128_chunked_matches_single_chunk() -> Result<()> {
+    check_prefill_resident_chunks::<32, 4, 128>()
+}
+
+fn check_prefill_resident_chunks<
+    const Q_HEADS: usize,
+    const KV_HEADS: usize,
+    const HEAD_DIM: usize,
+>() -> Result<()> {
     let Some(mut executor) = test_executor()? else {
         return Ok(());
     };
@@ -1161,21 +1174,34 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
     // courant, tous deux en NAX. Sans accélérateur, elles sont sautées.
     if executor.causal_attention_prefill_steel_nax_d256.is_none() {
         executor.causal_attention_prefill_steel_nax_d256 =
-            super::super::pipelines::compile_steel_causal_nax_d256_attention(
+            super::super::pipelines::compile_steel_causal_nax_attention(
                 &executor.device,
                 STEEL_ATTENTION_NAX_KERNELS,
                 super::super::attention::NAX_CAUSAL_ATTN_BQ64,
             );
     }
-    let nax = executor.causal_attention_prefill_steel_nax_d256.is_some();
+    if HEAD_DIM == 128 && executor.causal_attention_prefill_nax_d128.is_none() {
+        executor.causal_attention_prefill_nax_d128 =
+            super::super::pipelines::compile_steel_causal_nax_attention(
+                &executor.device,
+                STEEL_ATTENTION_NAX_KERNELS,
+                super::super::attention::NAX_CAUSAL_ATTN_D128,
+            );
+        if executor.causal_attention_prefill_nax_d128.is_none() {
+            eprintln!("oracle résident d128 sauté : NAX indisponible");
+            return Ok(());
+        }
+    }
+    let nax = if HEAD_DIM == 128 {
+        executor.causal_attention_prefill_nax_d128.is_some()
+    } else {
+        executor.causal_attention_prefill_steel_nax_d256.is_some()
+    };
     if !nax {
         eprintln!("assertions miroir bf16 sautées : NAX indisponible sur ce GPU");
     }
     const SEQ: usize = 1100;
     const HIDDEN: usize = 64;
-    const Q_HEADS: usize = 16;
-    const KV_HEADS: usize = 2;
-    const HEAD_DIM: usize = 256;
     const INTER: usize = 32;
     // Chemin de production 27B : dk128/dv128, noyau conv 4.
     let linear_spec = LinearAttentionStepSpec {
@@ -2001,7 +2027,7 @@ fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
     };
     if executor.causal_attention_prefill_steel_nax_d256.is_none() {
         executor.causal_attention_prefill_steel_nax_d256 =
-            super::super::pipelines::compile_steel_causal_nax_d256_attention(
+            super::super::pipelines::compile_steel_causal_nax_attention(
                 &executor.device,
                 STEEL_ATTENTION_NAX_KERNELS,
                 super::super::attention::NAX_CAUSAL_ATTN_BQ64,

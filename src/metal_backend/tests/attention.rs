@@ -696,7 +696,7 @@ fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
             ..base
         }
     ));
-    assert!(attention::prefill_attn_steel_d256_supported(
+    assert!(attention::prefill_attn_steel_supported(
         PrefillAttentionSpec {
             q_heads: 16,
             kv_heads: 2,
@@ -705,7 +705,7 @@ fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
             ..base
         }
     ));
-    assert!(!attention::prefill_attn_steel_d256_supported(
+    assert!(!attention::prefill_attn_steel_supported(
         PrefillAttentionSpec {
             seq: 256,
             q_heads: 16,
@@ -716,13 +716,13 @@ fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
         }
     ));
     // 27B (24/4/256) : Steel depuis le 2026-10-21, au-delà de 256 tokens seulement.
-    assert!(attention::prefill_attn_steel_d256_supported(
+    assert!(attention::prefill_attn_steel_supported(
         PrefillAttentionSpec { ..base }
     ));
-    assert!(!attention::prefill_attn_steel_d256_supported(
+    assert!(!attention::prefill_attn_steel_supported(
         PrefillAttentionSpec { seq: 256, ..base }
     ));
-    assert!(!attention::prefill_attn_steel_d256_supported(
+    assert!(attention::prefill_attn_steel_supported(
         PrefillAttentionSpec {
             q_heads: 32,
             kv_heads: 4,
@@ -1305,7 +1305,7 @@ fn causal_attention_prefill_nax_d256_matches_cpu_selected_rows() -> Result<()> {
         return Ok(());
     };
     executor.causal_attention_prefill_steel_nax_d256 =
-        pipelines::compile_steel_causal_nax_d256_attention(
+        pipelines::compile_steel_causal_nax_attention(
             &executor.device,
             STEEL_ATTENTION_NAX_KERNELS,
             attention::NAX_CAUSAL_ATTN_BQ64,
@@ -1481,7 +1481,7 @@ fn nax_d256_variants_match_cpu_oracle() -> Result<()> {
             let mut grids = Vec::new();
             for head_major in [false, true] {
                 executor.causal_attention_prefill_steel_nax_d256 =
-                    pipelines::compile_steel_causal_nax_d256_attention(
+                    pipelines::compile_steel_causal_nax_attention(
                         &executor.device,
                         STEEL_ATTENTION_NAX_KERNELS,
                         attention::NaxCausalAttnShape {
@@ -1573,7 +1573,7 @@ fn nax_d256_head_major_grid_is_bit_identical() -> Result<()> {
     let mut outputs = Vec::new();
     for head_major in [false, true] {
         executor.causal_attention_prefill_steel_nax_d256 =
-            pipelines::compile_steel_causal_nax_d256_attention(
+            pipelines::compile_steel_causal_nax_attention(
                 &executor.device,
                 STEEL_ATTENTION_NAX_KERNELS,
                 attention::NaxCausalAttnShape {
