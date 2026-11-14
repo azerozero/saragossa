@@ -4,14 +4,14 @@ use super::attention_ops::*;
 use super::*;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-const RESIDENT_SUPPORTED_BITS: &[usize] = &[2, 3, 4, 6, 8];
+const RESIDENT_SUPPORTED_BITS: &[usize] = &[2, 3, 4, 5, 6, 8];
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn resident_projection_unsupported_bits(projection: &Linear) -> Option<usize> {
     let LinearWeight::AffineQuantized(weight) = projection.weight() else {
         return None;
     };
-    // Chaque largeur listée a un kernel résident (`AffineMatmulKernel::FastQmvU{2,3,4,6,8}`) ;
+    // Chaque largeur listée a un kernel résident (`AffineMatmulKernel::FastQmvU{2,3,4,5,6,8}`) ;
     // les autres retombent sur le per-op avant d'encoder, jamais au milieu.
     (!RESIDENT_SUPPORTED_BITS.contains(&weight.bits())).then_some(weight.bits())
 }
